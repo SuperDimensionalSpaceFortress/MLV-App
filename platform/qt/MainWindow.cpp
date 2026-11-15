@@ -5260,6 +5260,26 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
     GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
 }
 
+// CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: the measured gui-smoke loop's wait. It blocks in the event
+// dispatcher, never in a sleep, so it returns as soon as an event has been dispatched (the render
+// thread's queued frameReady, a prep result, the pace timer), or when its own bounded timer fires.
+// It pushes no RunnerSleep interval: the dispatcher's idle probe already accounts the blocked time
+// as idle, and a frameReady posted during it is dispatched at once instead of after a sleep.
+void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
+{
+    QTimer bound;
+    bound.setSingleShot( true );
+    bound.setTimerType( Qt::PreciseTimer );
+    bound.start( qMax( 0, maxMs ) );
+    qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );
+    if( m_playbackSmokeActive )
+    {
+        ++m_playbackSmokeRunnerEventWaits;
+        if( !bound.isActive() )
+            ++m_playbackSmokeRunnerEventWaitTimeouts;
+    }
+}
+
 // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split's clock (frameReadyEmitStageTime's), and the paint
 // sink's listener while a smoke session is active: an outermost preview paint's [start, end], both read
 // on this clock by the paint's own Scope (PreviewPaintTiming.h).
@@ -10699,7 +10719,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             midSessionExposureChangeApplied = true;
             qApp->processEvents( QEventLoop::AllEvents );
         }
-        sleepGuiThreadForSmokeRunner( 10 );
+        waitGuiThreadForSmokeEvents( 10 );
     }
     const qint64 playedMs = playbackClock.elapsed();
     // ENFORCE-3: a measured Play that did not CONSUME the required source frames -- the engine ended it first
@@ -27137,6 +27157,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs = 0.0;
     m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;
     m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;
+    m_playbackSmokeRunnerEventWaits = 0;
+    m_playbackSmokeRunnerEventWaitTimeouts = 0;
     m_guiHopPrepResultWait.reset();
     m_guiHopEmitToRequestIssue.reset();
     m_guiHopRequestIssues = 0;
@@ -32064,7 +32086,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "avg_prep_result_wait_prepared_present_ms=%17 "
                    "present_ui_signal_latency_own_window_frames=%18 "
                    "avg_present_ui_signal_latency_own_window_ms=%19 "
-                   "present_ui_signal_latency_overwritten_frames=%20" )
+                   "present_ui_signal_latency_overwritten_frames=%20 "
+                   "runner_event_waits=%21 runner_event_wait_timeouts=%22" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( static_cast<qulonglong>( fr.frames ) )
                    .arg( fr.avgWaitMs(), 0, 'f', 3 )
@@ -32087,7 +32110,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                              ? m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs
                                    / static_cast<double>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames )
                              : 0.0, 0, 'f', 3 )
-                   .arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOverwrittenFrames ) );
+                   .arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOverwrittenFrames ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaits ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitTimeouts ) );
     }
 
     /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /

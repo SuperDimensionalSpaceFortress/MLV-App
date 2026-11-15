@@ -1458,6 +1458,9 @@ private:
     double m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs = 0.0;
     uint64_t m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;
     uint64_t m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: the measured gui-smoke loop's bounded event waits.
+    uint64_t m_playbackSmokeRunnerEventWaits = 0;
+    uint64_t m_playbackSmokeRunnerEventWaitTimeouts = 0;
     double m_playbackSmokePresentDrawPresentSumMs = 0.0;
     double m_playbackSmokePresentOverlaysScopesSumMs = 0.0;
     double m_playbackSmokePresentRenderSlotReleaseSumMs = 0.0;
@@ -2067,6 +2070,7 @@ private:
     void closeGuiPresentGap( void );
     void endGuiPresentIdleWait( void );
     void sleepGuiThreadForSmokeRunner( unsigned long ms );
+    void waitGuiThreadForSmokeEvents( int maxMs );
     void finishPresentedFrame( uint64_t displayFrame,
                                RenderFrameThread::ReadyFrame &readyFrame,
                                const PresentationRequestContext &requestContext,

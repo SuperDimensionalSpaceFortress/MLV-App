@@ -268,9 +268,10 @@ TEST(GuiPresentAttributionWiring, GuiBusyGapOpensAfterPresentAndClosesOnTheNextR
 
 TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
 {
-    // Adversary A1 (400865b1): the measured gui-smoke loop is processEvents(AllEvents) then
-    // QThread::msleep( 10 ). That sleep never reaches the dispatcher's aboutToBlock, so it was
-    // charged as GUI busy. Every runner sleep goes through the accounting helper, the gap keeps
+    // Adversary A1 (400865b1): a runner QThread::msleep never reaches the dispatcher's aboutToBlock,
+    // so it was charged as GUI busy. (The measured gui-smoke loop's tail no longer sleeps at all since
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: it waits for events, see MeasuredLoopWaitsForEventsNotASleep.)
+    // Every other runner sleep goes through the accounting helper, the gap keeps
     // it apart, and busy excludes it. The two Play-poll loops of runHeadlessPlaybackProfile are
     // pinned ENFORCE-3 stop statements (tools/repo_hygiene/app_play_scan.py PINNED_STOP_STATEMENTS);
     // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): their sleep goes through the helper too, because a
@@ -1295,10 +1296,11 @@ TEST(CriticalHopSummaryWiring, NewLineFollowsGuiPresentSummaryWithEveryFieldInOr
         QStringLiteral("avg_emit_to_request_issue_ms"), QStringLiteral("avg_upstream_plus_render_per_render_ms"),
         // r1 fix iteration 2 (adversary A2 on df1b864e): appended at the end, nothing before it moves.
         QStringLiteral("avg_prep_result_wait_prepared_present_ms"),
-        // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: Gate 0 appended at the end.
+        // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: Gate 0 then the runner's event waits, appended at the end.
         QStringLiteral("present_ui_signal_latency_own_window_frames"),
         QStringLiteral("avg_present_ui_signal_latency_own_window_ms"),
         QStringLiteral("present_ui_signal_latency_overwritten_frames"),
+        QStringLiteral("runner_event_waits"), QStringLiteral("runner_event_wait_timeouts"),
     };
     int last = -1;
     for (int i = 0; i < fields.size(); ++i)
@@ -1492,8 +1494,8 @@ TEST(CriticalHopSummaryWiring, AdvA2PrepResultWaitCountsAnEarlierPresentStillRun
     const QString present = presentPreparedBody();
     ASSERT_FALSE(present.contains(QStringLiteral("kindBit")));
     const QString finish = finishSmokeBody();
-    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 appends fields after it, so it is no longer the line's last argument
-    // (NewLineFollowsGuiPresentSummaryWithEveryFieldInOrder pins what follows it).
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 appends five fields after it, so it is no longer the line's last argument
+    // (TheFiveNewFieldsAreTheLastFiveOfCriticalHopSummary pins what follows it).
     ASSERT_EQ(1, finish.count(QStringLiteral(".arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 )")));
 }
 
@@ -1610,7 +1612,75 @@ QString functionBlockFrom(const QString & source, const QString & signatureStart
     return QString();
 }
 
+// runGuiPlaybackSmoke's measured `for( ;; )` (the one after measuredState is declared).
+QString measuredSmokeLoop(const QString & source)
+{
+    const QString smoke = functionBody(source,
+        QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
+    return bracedBlockAfter(smoke, QStringLiteral(
+        "playback_frame_range::PlayStopState measuredState = playback_frame_range::PlayStopState::Continue;\n"
+        "    for( ;; )"));
+}
+
 } // namespace
+
+TEST(SmokeRunnerEventWait, MeasuredLoopWaitsForEventsNotASleep)
+{
+    // The measured loop's tail slept 10 ms (QThread::msleep through the accounting helper), so a frameReady
+    // the render thread queued during it waited for the sleep to end (parent card: 7.3 ms of an 18.1 ms
+    // frame_ready_wait). It now waits in the dispatcher, bounded, and returns on the first event.
+    const QString source = mainWindowSource();
+    const QString loop = measuredSmokeLoop(source);
+    ASSERT_FALSE(loop.isEmpty());
+    ASSERT_EQ(1, loop.count(QStringLiteral("waitGuiThreadForSmokeEvents( 10 );")));
+    ASSERT_EQ(0, loop.count(QStringLiteral("sleepGuiThreadForSmokeRunner(")));
+    ASSERT_EQ(0, loop.count(QStringLiteral("msleep(")));
+    // ...as the loop's last statement, after the stop check (the one break stays first).
+    ASSERT_TRUE(loop.endsWith(QStringLiteral("waitGuiThreadForSmokeEvents( 10 );\n    }")));
+    ASSERT_EQ(1, loop.count(QStringLiteral("break;")));
+    ASSERT_TRUE(loop.indexOf(QStringLiteral("break;")) < loop.indexOf(QStringLiteral("waitGuiThreadForSmokeEvents( 10 );")));
+
+    // The rest of runGuiPlaybackSmoke still sleeps through the accounting helper, never raw.
+    const QString smoke = functionBody(source,
+        QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
+    ASSERT_EQ(0, smoke.count(QStringLiteral("QThread::msleep(")));
+    ASSERT_TRUE(smoke.count(QStringLiteral("sleepGuiThreadForSmokeRunner(")) > 0);
+    ASSERT_EQ(1, source.count(QStringLiteral("waitGuiThreadForSmokeEvents( 10 );")));
+
+    // The helper: a bounded precise single-shot timer, then one dispatcher wait. No sleep, no RunnerSleep push.
+    const QString helper = bracedBlockAfter(source, QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
+    ASSERT_FALSE(helper.isEmpty());
+    ASSERT_TRUE(helper.contains(QStringLiteral("bound.setSingleShot( true );")));
+    ASSERT_TRUE(helper.contains(QStringLiteral("bound.setTimerType( Qt::PreciseTimer );")));
+    ASSERT_TRUE(helper.contains(QStringLiteral("bound.start( qMax( 0, maxMs ) );")));
+    ASSERT_TRUE(helper.contains(QStringLiteral(
+        "qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );")));
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("bound.start(")) < helper.indexOf(QStringLiteral("WaitForMoreEvents")));
+    ASSERT_EQ(0, helper.count(QStringLiteral("msleep")));
+    ASSERT_EQ(0, helper.count(QStringLiteral("Sleep(")));
+    ASSERT_EQ(0, helper.count(QStringLiteral("m_guiHopWait.push(")));
+    ASSERT_EQ(0, helper.count(QStringLiteral("m_guiPresentGapRunnerSleepNs")));
+    ASSERT_EQ(0, helper.count(QStringLiteral("noteSmokeRunnerSleepIfActive")));
+    // Waits and timeouts are counted for the smoke session only; a timeout is a timer no longer active on return.
+    const int counted = helper.indexOf(QStringLiteral("if( m_playbackSmokeActive )"));
+    ASSERT_TRUE(counted > helper.indexOf(QStringLiteral("WaitForMoreEvents")));
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaits;")) > counted);
+    ASSERT_TRUE(helper.contains(QStringLiteral(
+        "if( !bound.isActive() )\n            ++m_playbackSmokeRunnerEventWaitTimeouts;")));
+    const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    const int sleepDecl = h.indexOf(QStringLiteral("void sleepGuiThreadForSmokeRunner( unsigned long ms );"));
+    ASSERT_TRUE(sleepDecl > 0);
+    ASSERT_EQ(sleepDecl + static_cast<int>(QStringLiteral("void sleepGuiThreadForSmokeRunner( unsigned long ms );\n    ").size()),
+              h.indexOf(QStringLiteral("void waitGuiThreadForSmokeEvents( int maxMs );")));
+    // Defined right after the sleep helper.
+    const int sleepDef = source.indexOf(QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
+    const int waitDef = source.indexOf(QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
+    ASSERT_TRUE(sleepDef > 0);
+    ASSERT_TRUE(waitDef > sleepDef);
+    ASSERT_EQ(0, source.mid(sleepDef + 1, waitDef - sleepDef - 1).count(QStringLiteral("\nvoid MainWindow::")));
+}
 
 TEST(SmokeRunnerEventWait, Gate0OwnWindowIsSampledBeforeThePresentIsAccounted)
 {
@@ -1652,9 +1722,48 @@ TEST(SmokeRunnerEventWait, Gate0OwnWindowIsSampledBeforeThePresentIsAccounted)
     ASSERT_TRUE(hopReset > 0);
     for (const char * reset : { "m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs = 0.0;",
                                 "m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;",
-                                "m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;" })
+                                "m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;",
+                                "m_playbackSmokeRunnerEventWaits = 0;",
+                                "m_playbackSmokeRunnerEventWaitTimeouts = 0;" })
     {
         const int at = begin.indexOf(QString::fromLatin1(reset));
         if (at <= hopReset) ::minitest::fail(__FILE__, __LINE__, "Gate 0 reset beside the hop reset", reset);
     }
+}
+
+TEST(SmokeRunnerEventWait, TheFiveNewFieldsAreTheLastFiveOfCriticalHopSummary)
+{
+    const QString finish = finishSmokeBody();
+    const QString format = summaryFormat(finish, QStringLiteral("playback_smoke.critical_hop_summary session=%1"));
+    ASSERT_FALSE(format.isEmpty());
+    QStringList keys;
+    const QRegularExpression key(QStringLiteral("([a-z0-9_]+)=%(\\d+)"));
+    for (QRegularExpressionMatchIterator it = key.globalMatch(format); it.hasNext();)
+        keys << it.next().captured(1);
+    ASSERT_EQ(22, static_cast<int>(keys.size()));
+    const QStringList tail = keys.mid(keys.size() - 5);
+    const QStringList expected = {
+        QStringLiteral("present_ui_signal_latency_own_window_frames"),
+        QStringLiteral("avg_present_ui_signal_latency_own_window_ms"),
+        QStringLiteral("present_ui_signal_latency_overwritten_frames"),
+        QStringLiteral("runner_event_waits"),
+        QStringLiteral("runner_event_wait_timeouts"),
+    };
+    ASSERT_TRUE(tail == expected);
+    ASSERT_TRUE(keys.at(16) == QStringLiteral("avg_prep_result_wait_prepared_present_ms"));
+    // Their arguments follow the 17th's, in the same order; the average is over own-window frames only.
+    const int lastOld = finish.indexOf(QStringLiteral(".arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 )"));
+    const int a18 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames ) )"));
+    const int a19 = finish.indexOf(QStringLiteral(
+        "? m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs\n"
+        "                                   / static_cast<double>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames )"));
+    const int a20 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOverwrittenFrames ) )"));
+    const int a21 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaits ) )"));
+    const int a22 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitTimeouts ) );"));
+    ASSERT_TRUE(lastOld > 0);
+    ASSERT_TRUE(a18 > lastOld);
+    ASSERT_TRUE(a19 > a18);
+    ASSERT_TRUE(a20 > a19);
+    ASSERT_TRUE(a21 > a20);
+    ASSERT_TRUE(a22 > a21);
 }
