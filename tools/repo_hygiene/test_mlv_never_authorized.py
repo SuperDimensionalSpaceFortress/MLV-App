@@ -1168,6 +1168,12 @@ HOOKNARO_ROWS = [
     _hnr("a3 CTL forfiles /c string running cmd del of a run-dir summary.md", "PowerShell",
          {"command": 'forfiles /p C:\\mlvtmp /c "cmd /c del ' + _HNR_SUMMARY_R6 + '"'},
          "DENY", "NA-2", (HOOKNARO_R6.lower() + "/summary.md", _NA2_CARVE)),
+    _hnr("a3 CTL a quoted variable as the Bash command word", "Bash",
+         {"command": "\"$SHELL\" -c 'echo x > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
+    _hnr("a3 CTL & on a quoted variable as the PowerShell program", "PowerShell",
+         {"command": "$p='p'+'wsh'; & \"$p\" -c '\"x\" > //server/share/x.txt'"},
+         "DENY", "NA-7", _NA7_OUT),
     _hnr("a3 CTL git -c alias string running rm -rf of a run dir", "Bash",
          {"command": 'git -c alias.x="!f() { rm -rf {BOARD}/.claude-state/fleet-runs/' + HOOKNARO_R13 + '; }; f" x'},
          "DENY", "NA-2", (HOOKNARO_R13.lower(), _NA2_CARVE)),
@@ -9508,9 +9514,9 @@ for _case in CASES:
 class HookNaReadonlyFalsePositiveTableTests(unittest.TestCase):
     """HOOK-NA-READONLY-COMMAND-FALSE-POSITIVES-1: the payload table cannot shrink silently.
 
-    Nine ALLOW subjects (the eight deny payloads; payload 5 has two runs) and forty-five
-    TRUE refusals beside them -- twenty-five from r1 and the payload-8 control, twenty from
-    the r2 adversary pass (a1..a4).  Pinned by count AND by the rule each refusal asserts,
+    Nine ALLOW subjects (the eight deny payloads; payload 5 has two runs) and forty-seven
+    TRUE refusals beside them -- twenty-five from r1 and the payload-8 control, twenty-two
+    from the r2 adversary pass (a1..a4, with siblings).  Pinned by count AND by the rule each refusal asserts,
     so a subject cannot be kept while the refusal next to it is quietly dropped or
     retargeted; and each subject is pinned to ITS OWN payload input and fixture (r2
     advisory A5: a count-and-name check alone let one subject's input be swapped for
@@ -9522,11 +9528,11 @@ class HookNaReadonlyFalsePositiveTableTests(unittest.TestCase):
         allow = [case for case in rows if case["expect"] == "ALLOW"]
         deny = [case for case in rows if case["expect"] == "DENY"]
         self.assertEqual(len(allow), 9, [case["name"] for case in allow])
-        self.assertEqual(len(deny), 45, [case["name"] for case in deny])
+        self.assertEqual(len(deny), 47, [case["name"] for case in deny])
         by_rule = {}
         for case in deny:
             by_rule[case["na"]] = by_rule.get(case["na"], 0) + 1
-        self.assertEqual(by_rule, {"NA-2": 34, "NA-7": 11}, by_rule)
+        self.assertEqual(by_rule, {"NA-2": 34, "NA-7": 13}, by_rule)
         for payload in ("p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"):
             names = [case["name"] for case in rows if case["name"].startswith("hooknaro " + payload + " ")]
             self.assertTrue(any(" CTL " in name for name in names), payload)
