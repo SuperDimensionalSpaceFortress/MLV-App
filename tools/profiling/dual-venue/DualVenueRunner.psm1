@@ -2028,10 +2028,14 @@ function Get-DvDueWakeDeliveryEvidence {
             # playback_smoke record whose first field is session (read whole: ` session=<[0-9]+>`); the empty `id=` / `session=`, no `=`, a doubled
             # space, `4x`, or a start with no session first are each unreadable. A boundary read whole of another session still just closes it.
             $nameEnd = '(?![A-Za-z0-9_])'
+            # r11 (r11 adversary pass 10 A1 on 93fa8621, its input: `playback_smoke.gpu_summary frames=600 session=4` was skipped): a record that names a
+            # session ANYWHERE (a `session` token, with or without =) is a boundary, read whole only as ONE ` session=<[0-9]+>` that is its first field
+            $sessionTokens = { param([string]$x) [regex]::Matches($x, '(?i)(?:^|\s)session(?![A-Za-z0-9_])').Count }
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($l -match ($start + 'playback_smoke\.pace_summary' + $nameEnd)) {
-                    if ($open -and $l -cnotmatch ($start + 'playback_smoke\.pace_summary session=[0-9]+(?:\s|$)')) { $boundaryUnreadable = $true }
-                    $open = ($l -cmatch $paceRx); if ($open) { $paces++ }; continue
+                    $paceWhole = ($l -cmatch ($start + 'playback_smoke\.pace_summary session=[0-9]+(?:\s|$)')) -and ((& $sessionTokens $l) -eq 1)
+                    if ($open -and -not $paceWhole) { $boundaryUnreadable = $true }
+                    $open = $paceWhole -and ($l -cmatch $paceRx); if ($open) { $paces++ }; continue
                 }
                 # r2 adversary pass 6 A2: any playback_smoke record of ANOTHER session (its start, summary, ...) closes the window, so another Play's
                 # wake line never stands in for the measured Play's missing one. r5 (r4 adversary pass 10 advisory A3): measured_session names its
@@ -2039,10 +2043,10 @@ function Get-DvDueWakeDeliveryEvidence {
                 if ($open) {
                     $bid = $null; $isBoundary = $false
                     if ($l -match ($start + 'playback_smoke\.measured_session' + $nameEnd)) {
-                        $isBoundary = $true; if ($l -cmatch ($start + 'playback_smoke\.measured_session id=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
+                        $isBoundary = $true; if ((& $sessionTokens $l) -eq 0 -and $l -cmatch ($start + 'playback_smoke\.measured_session id=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
                     }
-                    elseif ($l -match ($start + 'playback_smoke\.(?:start|summary|conform)' + $nameEnd) -or $l -match ($start + 'playback_smoke\.[A-Za-z0-9_]+\s+session' + $nameEnd)) {
-                        $isBoundary = $true; if ($l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
+                    elseif ($l -match ($start + 'playback_smoke\.(?:start|summary|conform)' + $nameEnd) -or ($l -match ($start + 'playback_smoke\.[A-Za-z0-9_]+' + $nameEnd) -and (& $sessionTokens $l) -gt 0)) {
+                        $isBoundary = $true; if ((& $sessionTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
                     }
                     if ($isBoundary -and $null -eq $bid) { $boundaryUnreadable = $true; $open = $false; continue }
                     if ($isBoundary -and $bid -cne [string]$session) { $open = $false; continue }
@@ -2070,7 +2074,17 @@ function Get-DvDueWakeDeliveryEvidence {
     elseif ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -ceq '1') { $disabledSeen = $true }
     $unpacedRaw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced'
     $unpacedLeg = ($unpacedRaw -is [bool]) -and $unpacedRaw
-    $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind=' })
+    # r11 (r11 adversary pass 10 A2 on 93fa8621, its input: a paced head line ending in a bare `delivery_kind` took the control-line exemption): a line
+    # NAMES delivery_kind with the key in any shape (no `=`, `delivery_kind post`, another case), and every key this reader reads (delivery_kind,
+    # delivery, disabled, armed, fired, post_rescued, post_counts_settled) must appear only as `<key>=`; a key named any other way makes the read
+    # unreadable on both paths (never skipped, never the control exemption)
+    $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind(?![A-Za-z0-9_])' })
+    $keyShapeUnreadable = $false
+    foreach ($c in $candidates) {
+        foreach ($key in @('delivery_kind', 'delivery', 'disabled', 'armed', 'fired', 'post_rescued', 'post_counts_settled')) {
+            if ([regex]::Matches($c, '(?i)(?:^|\s)' + $key + '(?![A-Za-z0-9_])').Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
+        }
+    }
     # r5 (r5 adversary pass 12 A1): a control binary's line (one wake record, no delivery_kind) still carries delivery= (master's
     # playbackDueWakeSummaryLine prints it), so a paced leg whose measured Play armed no wake (delivery=none) is not engaged there either; a
     # repeated or out-of-grammar delivery= on that line is unreadable. A line with no delivery= at all (an older binary) is left unchanged.
@@ -2079,7 +2093,7 @@ function Get-DvDueWakeDeliveryEvidence {
     # r7 (Grok G9): and so is one with the measured session's pace_summary more than once, as on the delivery_kind path below ($paces -ne 1): a line
     # from a later pace window never stands in for the measured Play
     $controlMech = $null
-    $controlMechUnreadable = ($withKind.Count -eq 0 -and $candidates.Count -gt 0 -and ($candidates.Count -gt 1 -or $paces -ne 1))
+    $controlMechUnreadable = ($withKind.Count -eq 0 -and $candidates.Count -gt 0 -and ($candidates.Count -gt 1 -or $paces -ne 1 -or $keyShapeUnreadable))
     # r7 (r7 adversary pass 1 A2): the app's delivery= is "none" alone (reset, no arm this Play) or a "+"-join of distinct mechanisms (the first arm
     # replaces "none", and a later arm appends its mechanism only when the join lacks it; MainWindow.cpp, the arm path), so none+qtimer or a repeated
     # mechanism is unreadable on both paths
@@ -2096,7 +2110,7 @@ function Get-DvDueWakeDeliveryEvidence {
     }
     if ($withKind.Count -gt 0) {
         $mentions = $withKind.Count
-        if ($paces -ne 1 -or $candidates.Count -ne 1) { $unreadableSeen = $true }
+        if ($paces -ne 1 -or $candidates.Count -ne 1 -or $keyShapeUnreadable) { $unreadableSeen = $true }
         else {
             $l = $candidates[0]
             $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')

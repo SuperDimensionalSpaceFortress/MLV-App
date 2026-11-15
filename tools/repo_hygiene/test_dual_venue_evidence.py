@@ -16142,6 +16142,59 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
         v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST, "playback_smoke.start session=4", "playback_smoke.start session="]) + "\n", post)
         self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
+    # r11 pass 10 (r11 adversary on 93fa8621) A1: a record naming a session anywhere but as its one whole first field
+    SESSION_ELSEWHERE_SHAPES = ("playback_smoke.gpu_summary frames=600 session=4", "playback_smoke.cpu_summary frames=600 session=4",
+                                "playback_smoke.prep_summary x=1 session=4", "playback_smoke.recon_release deferred=1 session=4",
+                                "playback_smoke.pace_unpaced x=1 session=4", "playback_smoke.present_gap_summary x=1 session=4",
+                                "playback_smoke.render_manifest frames=600 session=4", "playback_smoke.gpu_summary session=3 session=4",
+                                "playback_smoke.gpu_summary frames=1 SESSION=4", "playback_smoke.gpu_summary frames=1 session",
+                                "playback_smoke.measured_session id=3 session=4", "playback_smoke.pace_summary session=3 session=4")
+
+    def test_r11_p10_a1_its_input_verbatim_another_sessions_record_with_session_not_first_ends_the_window(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        log = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+               "playback_smoke.gpu_summary frames=600 session=4\n"
+               "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        v = self.wake_verdict(log, spec)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"], v)
+
+    def test_r11_p10_a1_class_a_session_named_anywhere_but_whole_and_first_blocks_every_leg(self) -> None:
+        for shape in self.SESSION_ELSEWHERE_SHAPES:
+            for prefix_name, prefix in (("bare", ""), ("crash-forensics prefix", self.PREFIX)):
+                build = (lambda s, p: lambda wake: "\n".join(p + l for l in self.A2_BASE + [s, wake]) + "\n")(shape, prefix)
+                self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape, prefix=prefix_name)
+        # control: a field whose name only ends in session (measured_session=, x_session=) names no session
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        v = self.wake_verdict("\n".join(self.A2_BASE + ["playback_smoke.gate session=3 measured_session=3 x_session=4", self.WAKE_POST]) + "\n", post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    # r11 pass 10 (r11 adversary on 93fa8621) A2: a key the reader reads, named on the wake line in any shape but `<key>=`
+    READ_KEYS = ("delivery_kind", "delivery", "disabled", "armed", "fired", "post_rescued", "post_counts_settled")
+
+    def test_r11_p10_a2_its_input_verbatim_a_bare_delivery_kind_never_takes_the_control_exemption(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+        for tail in ("delivery_kind", "delivery_kind post", "DELIVERY_KIND=send"):
+            with self.subTest(tail=tail):
+                v = self.wake_verdict(head + "playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg " + tail, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_r11_p10_a2_class_a_read_key_in_any_other_shape_is_unreadable_on_every_leg(self) -> None:
+        for key in self.READ_KEYS:
+            for shape in (key, key.upper() + "=1", key + " 1"):
+                build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [wake + " " + s]) + "\n")(shape)
+                for leg, spec, wake in self.LEG_WAKES:
+                    v = self.wake_verdict(build(self.leg_wake(wake)), spec)
+                    with self.subTest(key=key, shape=shape, leg=leg):
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # controls: the app's own lines still read (a sibling key such as x_fired= or rearmed= is not the key)
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST + " rearmed=0 x_fired=9"]) + "\n", post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_CONTROL]) + "\n", {})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
     """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it
