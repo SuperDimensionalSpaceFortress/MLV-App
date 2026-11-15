@@ -7791,7 +7791,8 @@ function Get-AttrCudaMinimalBuildPath {
     persistent is written. Every entry is derived by the caller (SystemRoot, the CUDA bin the job
     resolved, the VS installer dir it found vswhere in); none is a host's user dir. An entry that
     is not an absolute drive path, or that holds ';' or '"', is refused rather than spliced into a
-    PATH it would split. Duplicates (case-insensitive, trailing '\' ignored) keep the first.
+    PATH it would split. Duplicates (case-insensitive, trailing '\' ignored) keep the first. A drive
+    root stays 'C:\', never the drive-relative 'C:'.
     #>
     [CmdletBinding()]
     param(
@@ -7802,12 +7803,15 @@ function Get-AttrCudaMinimalBuildPath {
         throw 'ATTRCUDA_MINIMAL_PATH_NO_SYSTEMROOT -SystemRoot is empty; the Windows system dirs cannot be derived'
     }
     $root = $SystemRoot.Trim() -replace '\\+$', ''
-    $candidates = @(($root + '\System32'), $root, ($root + '\System32\Wbem'), ($root + '\System32\WindowsPowerShell\v1.0')) + @($ToolDirs)
+    $rootEntry = if ($root -match '^[A-Za-z]:$') { $root + '\' } else { $root }
+    $candidates = @(($root + '\System32'), $rootEntry, ($root + '\System32\Wbem'), ($root + '\System32\WindowsPowerShell\v1.0')) + @($ToolDirs)
     $entries = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.List[object]]::new()
     foreach ($candidate in $candidates) {
         if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
         $entry = ([string]$candidate).Trim() -replace '\\+$', ''
+        # a drive root keeps its one '\' ('C:\' stripped to 'C:' would be drive-relative and refused below); a bare 'C:' input is still refused
+        if ($entry -match '^[A-Za-z]:$' -and ([string]$candidate).Trim() -match '\\$') { $entry += '\' }
         if ($entry.Contains(';') -or $entry.Contains('"') -or $entry -notmatch '^[A-Za-z]:\\') {
             throw "ATTRCUDA_MINIMAL_PATH_BAD_ENTRY '$entry' is not an absolute drive path free of ';' and '`"'"
         }

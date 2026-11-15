@@ -76,13 +76,15 @@ $cmdFile = Join-Path $env:TEMP 'amaze_debayer_dll.cmd'
     # before nvcc -- never a bare C1083 at compile time. INCLUDE never reaches a command line (a long one overflowed cmd's 8191-character limit, exit 1):
     # where.exe reads the list from its own environment, first as is (no size limit), then with quotes stripped by DELAYED expansion (& and ! in the
     # value are not re-parsed; past cmd's limit that copy is empty, so a quoted header entry in an over-long INCLUDE is refused typed, never exit 1).
-    # where matches files only, so a DIRECTORY named corecrt.h is not the header. endlocal before nvcc turns delayed expansion off again.
+    # where matches files only, so a DIRECTORY named corecrt.h is not the header. where also appends each PATHEXT extension, so both calls run with
+    # PATHEXT cleared (a corecrt.h.cmd is not the header). One setlocal covers both; endlocal carries only the verdict out and, before nvcc, turns
+    # delayed expansion off and gives PATHEXT back.
     'set "MLV_UCRT_OK=" & if not defined INCLUDE set "INCLUDE=;"',
+    'setlocal EnableDelayedExpansion & set "PATHEXT=" & set "MLV_INC="',
     '"%SystemRoot%\System32\where.exe" /q $INCLUDE:corecrt.h && set "MLV_UCRT_OK=1"',
-    'setlocal EnableDelayedExpansion & set "MLV_INC="',
     'set "MLV_INC=!INCLUDE:"=!"',
-    '"%SystemRoot%\System32\where.exe" /q $MLV_INC:corecrt.h',
-    'endlocal & if not errorlevel 1 set "MLV_UCRT_OK=1"',
+    'if not defined MLV_UCRT_OK ("%SystemRoot%\System32\where.exe" /q $MLV_INC:corecrt.h && set "MLV_UCRT_OK=1")',
+    'endlocal & set "MLV_UCRT_OK=%MLV_UCRT_OK%"',
     'if not defined MLV_UCRT_OK (echo FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT no INCLUDE entry holds corecrt.h after vcvars64& exit /b 9)',
     'echo === building igpu_amaze_debayer_cuda.dll (nvcc -shared --fmad=false, exports via .def) ===',
     "`"$nvcc`" $archArgLine -O3 --fmad=false -shared -allow-unsupported-compiler -Xcompiler `"/MD`" -Xlinker `"/DEF:$def`" -I `"$Dir`" -I `"$gpuRoot`" `"$src`" -o `"$dll`"",

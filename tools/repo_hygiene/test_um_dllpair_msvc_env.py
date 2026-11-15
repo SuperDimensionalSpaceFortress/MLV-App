@@ -107,6 +107,16 @@ class MinimalBuildPathTests(_Pwsh):
         self.assertEqual(out["value"].split(";"), [r"C:\Windows\System32", r"C:\Windows", r"C:\Windows\System32\Wbem",
                                                     r"C:\Windows\System32\WindowsPowerShell\v1.0", r"C:\cuda\bin"])
 
+    def test_adversary_530a447d_a2_a_drive_root_stays_a_drive_root(self) -> None:
+        # adversary pass on 530a447d, A2: trailing-'\' removal turned 'C:\' into 'C:' (drive-relative), which the absolute-path rule then refused.
+        # A drive root keeps its one '\', as a tool dir and as -SystemRoot (whose own entry is a candidate too); it still dedups with 'c:\\'.
+        out = self.json_of(self.build(r"C:\Windows", ["C:\\", "c:\\\\", r"D:\tools\\"]))
+        self.assertEqual(out["value"].split(";")[4:], ["C:\\", r"D:\tools"])
+        out = self.json_of(self.build("C:\\", []))
+        self.assertEqual(out["value"].split(";"), [r"C:\System32", "C:\\", r"C:\System32\Wbem", r"C:\System32\WindowsPowerShell\v1.0"])
+        p = self.build(r"C:\Windows", ["C:"])
+        self.assertIn("THREW ATTRCUDA_MINIMAL_PATH_BAD_ENTRY", p.stdout, p.stdout + p.stderr)
+
     def test_an_entry_that_would_split_or_quote_the_path_is_refused(self) -> None:
         for bad in (r"C:\a;C:\b", 'C:\\a"b'):
             with self.subTest(bad=bad):
@@ -225,15 +235,19 @@ class BackendCmdUcrtCheckTests(_Pwsh):
         lines = re.findall(r"^\s*'((?:[^']|'')*MLV_(?:UCRT_OK|INC)(?:[^']|'')*)',?\s*$", script.read_text(encoding="utf-8"), re.M)
         return [l.replace("''", "'") for l in lines]
 
-    def run_check(self, script: Path, include: str | None, via_env: bool = False) -> subprocess.CompletedProcess:
+    def run_check(self, script: Path, include: str | None, via_env: bool = False, pathext: str | None = None) -> subprocess.CompletedProcess:
         # via_env: INCLUDE arrives in the process environment exactly as given (quotes and '&' included), as vcvars64 leaves it, not via a set line
         cmd = self.tmp / "check.cmd"
         head = [] if via_env else ([f'set "INCLUDE={include}"'] if include is not None else ['set "INCLUDE="'])
-        body = ["@echo off"] + head + self.check_lines(script) + ["echo REACHED_NVCC", "exit /b 0"]
+        # where nvcc would run: PATHEXT is the caller's again and delayed expansion is off (a literal !MLV_INC! is not expanded)
+        tail = ["echo REACHED_NVCC", "echo PATHEXT_AT_NVCC=%PATHEXT%", "echo DELAYED_AT_NVCC=!MLV_INC!", "exit /b 0"]
+        body = ["@echo off"] + head + self.check_lines(script) + tail
         cmd.write_text("\r\n".join(body) + "\r\n", encoding="ascii")
         env = dict(os.environ)
         if via_env:
             env["INCLUDE"] = include or ""
+        if pathext is not None:
+            env["PATHEXT"] = pathext
         return subprocess.run(["cmd.exe", "/d", "/c", str(cmd)], capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
 
     def test_adversary_9f89_a1_a_quoted_entry_with_an_ampersand_still_reaches_the_typed_refusal(self) -> None:
@@ -321,6 +335,36 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                 self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
                 self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
                 self.assertNotIn("REACHED_NVCC", p.stdout)
+
+    def test_adversary_530a447d_a1_a_pathext_suffixed_file_is_not_the_header(self) -> None:
+        # adversary pass on 530a447d, A1: where.exe appends PATHEXT, so ucrt\corecrt.h.cmd (no corecrt.h) set MLV_UCRT_OK=1 and nvcc ran without the
+        # header. PATHEXT is cleared for BOTH where calls inside one setlocal, and endlocal restores it before nvcc. Every PATHEXT extension is tried,
+        # in a plain INCLUDE (first where) and a quoted one (second where, after the quote strip).
+        pathext = ".COM;.EXE;.BAT;.CMD;.VBS;.JS"
+        for ext in (".cmd", ".exe", ".bat", ".com"):
+            root = self.tmp / f"Kits-pathext{ext}" / "ucrt"
+            root.mkdir(parents=True)
+            (root / f"corecrt.h{ext}").write_text("@rem fixture\n", encoding="ascii")
+            for script in BACKEND_SCRIPTS:
+                for name, include in (("plain", f"{INCLUDE_NO_SDK};{root}"), ("quoted", f'{INCLUDE_NO_SDK};"{root}"')):
+                    with self.subTest(script=script.name, ext=ext, case=name):
+                        p = self.run_check(script, include, via_env=True, pathext=pathext)
+                        self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                        self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                        self.assertNotIn("REACHED_NVCC", p.stdout)
+        # the real header beside a suffixed decoy still passes, and PATHEXT is back to its value when nvcc would run
+        both = self.tmp / "Kits-pathext-both" / "ucrt"
+        both.mkdir(parents=True)
+        (both / "corecrt.h.exe").write_text("x\n", encoding="ascii")
+        (both / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        for script in BACKEND_SCRIPTS:
+            for name, include in (("plain", f"{INCLUDE_NO_SDK};{both}"), ("quoted", f'{INCLUDE_NO_SDK};"{both}"')):
+                with self.subTest(script=script.name, case=f"real-{name}"):
+                    p = self.run_check(script, include, via_env=True, pathext=pathext)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("REACHED_NVCC", p.stdout)
+                    self.assertIn(f"PATHEXT_AT_NVCC={pathext}", p.stdout)
+                    self.assertIn("DELAYED_AT_NVCC=!MLV_INC!", p.stdout)
 
     def test_the_check_admits_an_include_whose_ucrt_holds_corecrt(self) -> None:
         root = self.tmp / "Windows Kits (x86)" / "10" / "include" / "10.0.22621.0" / "ucrt"
