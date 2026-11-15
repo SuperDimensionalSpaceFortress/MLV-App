@@ -11,10 +11,11 @@
 #
 # Usage: pwsh -NoProfile -File tools\workstation\test-workstation-state.ps1 [-ScratchRoot <a writable folder>]
 # Exit 0 = every check passed, 1 = at least one failed.
-param([string]$ScratchRoot = '')
+param([string]$ScratchRoot = '', [switch]$KeepGoing)
 
 Set-StrictMode -Version 1.0
-$ErrorActionPreference = 'Stop'
+# -KeepGoing: run every check even when code under test lacks a function (a RED run against older code); each failing statement then shows as FAIL lines.
+$ErrorActionPreference = $(if ($KeepGoing) { 'Continue' } else { 'Stop' })
 $setup = Join-Path $PSScriptRoot 'Setup-MlvWorkstation.ps1'
 if (-not $ScratchRoot) { $ScratchRoot = Join-Path ([IO.Path]::GetTempPath()) ('workstation-state-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
 [void][IO.Directory]::CreateDirectory($ScratchRoot)

@@ -11,10 +11,11 @@
 #
 # Usage: pwsh -NoProfile -File tools\profiling\test-um-run-share-root-access.ps1 [-ScratchRoot <a writable folder>]
 # Exit 0 = every check passed, 1 = at least one failed.
-param([string]$ScratchRoot = '')
+param([string]$ScratchRoot = '', [switch]$KeepGoing)
 
 Set-StrictMode -Version 1.0
-$ErrorActionPreference = 'Stop'
+# -KeepGoing: run every check even when code under test lacks a function (a RED run against older code); each failing statement then shows as an error line.
+$ErrorActionPreference = $(if ($KeepGoing) { 'Continue' } else { 'Stop' })
 $here = $PSScriptRoot
 if (-not $ScratchRoot) { $ScratchRoot = Join-Path ([IO.Path]::GetTempPath()) ('share-root-access-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
 [void][IO.Directory]::CreateDirectory($ScratchRoot)
