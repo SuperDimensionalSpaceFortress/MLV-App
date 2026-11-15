@@ -1711,6 +1711,16 @@ function Test-JsonObject($Value) {
     $Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]
 }
 
+function Get-JsonObjectMember($Object, [string]$Name) {
+    # r8 (adversary-cc9275e3.json A2): ONE member of ONE JSON object, exactly as it was published: $null when $Object is not one object (Test-JsonObject) or has no such member.
+    # Returned with the unary comma, so an array-valued member stays an array for the caller's assignment (a `$(...)` around the read unrolled ["<instant>"] into the instant).
+    if (-not (Test-JsonObject $Object)) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) { if ($Object.Contains($Name)) { return , $Object[$Name] }; return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($null -eq $p) { return $null }
+    , $p.Value
+}
+
 function Get-AdmissionLeaseBatch($Result) {
     # r5 pass 3 (adversary r5 pass 2 A1): from the agent RESULT, never from an admission a caller already read: `$(...)` and a function's return UNROLL a one-element array, so
     # [{label:..,leaseBatch:..}] reached the old reader as the object inside it. The admission is read here by property, which keeps an array an array (MALFORMED below).
@@ -1778,6 +1788,9 @@ function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc, $Starte
         if ($null -eq $st -or $st -gt $at) { return $FloorTs }
         return [long][Math]::Min([double]$ObservedTs, $FloorTs + ($at - $st).TotalSeconds * [Diagnostics.Stopwatch]::Frequency)
     }
+    # r8 (adversary-cc9275e3.json A1, DISTINGUISH): here the agent's clock is not seen ahead, and the end is placed by it. A clock ahead by less than the job-to-observation gap
+    # places it up to that skew late; -ProbeIdleMarginSec (the gap between the agent's bound and the runner's cap) is the skew budget for that case. The only skew-free bound,
+    # the send plus the job's runtime, would charge the job's whole queue and gate wait (an open's lease wait) every time, so it is used only once the skew is seen (above).
     $ts = [Math]::Min($ObservedTs, $nowTs - [long]($ago * [Diagnostics.Stopwatch]::Frequency))
     if ($ts -lt $FloorTs) { $ts = $FloorTs }
     $ts
@@ -2335,8 +2348,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $probeIdleCap = $(if ($null -ne $batchIdleSec) { [int]$batchIdleSec - $ProbeIdleMarginSec } else { 0 })
             # the open's job ended no later than its result was read; r3 adversary pass 2 A1: from THAT instant, so the guard and the BATCH_OPEN log append since are spent too.
             # r4 (adversary r4 A1): the instant the result RETURNED (before the liveness cleanup), moved earlier to the agent's own endedUtc for the open (Get-AgentJobEndTs)
-            # r8 (Grok G12): and its startedUtc, read only from ONE result object (member enumeration on an array would answer from inside it)
-            $idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs $op.result.endedUtc $(if (Test-JsonObject $op.result) { $op.result.startedUtc })
+            # r8 (Grok G12): and its startedUtc, read only from ONE result object (member enumeration on an array would answer from inside it), kept as published (an array stays
+            # one, never unrolled into the instant inside it: adversary-cc9275e3.json A2)
+            $openStartedUtc = Get-JsonObjectMember $op.result 'startedUtc'
+            $idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs $op.result.endedUtc $openStartedUtc
             $attempt = 0
             $launchShort = $false
             while ($pending.Count -gt 0 -and $null -eq $b.endReason) {
@@ -2571,8 +2586,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # when its receipt write is denied) still has the idle anchor moved to that job's end: its own work since is spent from the allowance. The anchor moves only on
                 # the leg job's own result: with none (the child died before its job landed one, or the read failed) nothing shows the agent's idle clock restarted, so it stays.
                 $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $legJobId
-                # r8 (Grok G12): the job's startedUtc too (an agent clock ahead then charges the send plus the job's own runtime), read only from ONE result object
-                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc $(if (Test-JsonObject $jr.result) { $jr.result.startedUtc }) }
+                # r8 (Grok G12): the job's startedUtc too (an agent clock ahead then charges the send plus the job's own runtime), read only from ONE result object and kept as
+                # published (adversary-cc9275e3.json A2: an array-valued startedUtc stays an array, which is no instant: the send alone)
+                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $legStartedUtc = Get-JsonObjectMember $jr.result 'startedUtc'; $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc $legStartedUtc }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
                     # r6 (adversary r6 A2): the row keeps heatAtProbe. r7: this note sits on its own line, because the failing-action body pin

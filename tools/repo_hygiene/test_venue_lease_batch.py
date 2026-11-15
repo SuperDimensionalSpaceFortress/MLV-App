@@ -324,6 +324,8 @@ $legEnded = $(if ($env:FAKE_LEG_ENDED_RAW) { [string]$env:FAKE_LEG_ENDED_RAW } e
 $legJobSec = [int](Pick $env:FAKE_LEG_JOB_SEC $k '0')
 if ($legJobSec -gt 0) { Start-Sleep -Seconds $legJobSec; $now = [DateTimeOffset]::UtcNow; $legEnded = $(if ($env:FAKE_LEG_ENDED_RAW) { [string]$env:FAKE_LEG_ENDED_RAW } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0')).ToString('o') }) }
 $legStarted = $(if ($env:FAKE_LEG_STARTED -eq 'null') { $null } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0') - $legJobSec).ToString('o') })
+# r8 (adversary-cc9275e3.json A2): FAKE_LEG_STARTED=array publishes startedUtc inside a one-element array (no usable instant)
+if ($env:FAKE_LEG_STARTED -eq 'array') { $legStarted = @($legStarted) }
 $res = [ordered]@{ jobId = $jobId; exitCode = 0; startedUtc = $legStarted; endedUtc = $legEnded; admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
 # the agent's renew record at the leg's end: okMaxGapSec from FAKE_LEG_GAPS (default 3 s; 'none' = no record)
 $gap = Pick $env:FAKE_LEG_GAPS $k '3'
@@ -1371,16 +1373,43 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"aheadRuntime": True, "aheadRuntimePastObs": True, "aheadStartedNull": True, "aheadStartedAbsent": True,
                                                   "aheadStartedUnreadable": True, "aheadStartedAfterEnd": True, "aheadStartedArray": True, "pastUnchanged": True})
-        # both callers pass the result's startedUtc, read only from ONE result object
+        # both callers pass the result's startedUtc, read only from ONE result object and kept as published (adversary-cc9275e3.json A2: never through `$(...)`, which unrolls)
         src = RUNNER.read_text(encoding="utf-8")
-        self.assertIn("$op.result.endedUtc $(if (Test-JsonObject $op.result) { $op.result.startedUtc })", src)
-        self.assertIn("$jr.result.endedUtc $(if (Test-JsonObject $jr.result) { $jr.result.startedUtc })", src)
+        self.assertIn("$openStartedUtc = Get-JsonObjectMember $op.result 'startedUtc'", src)
+        self.assertIn("$op.result.endedUtc $openStartedUtc", src)
+        self.assertIn("$legStartedUtc = Get-JsonObjectMember $jr.result 'startedUtc'; $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc $legStartedUtc", src)
+        self.assertNotIn("{ $op.result.startedUtc }", src)
+        self.assertNotIn("{ $jr.result.startedUtc }", src)
+
+    def test_lease_batch_idle_end_r8_adv_a2_a_published_member_is_read_as_it_was_published(self) -> None:
+        # adversary-cc9275e3.json A2: `$(if (Test-JsonObject $r) { $r.startedUtc })` unrolled startedUtc=["<instant>"] into the instant, so an unusable value supplied a runtime.
+        # Get-JsonObjectMember keeps an array an array (then Get-AgentJobEndTs gives the send), for a ConvertFrom-Json object and for a dictionary alike; a scalar is the scalar;
+        # a missing member, or a result that is not one object ([{..}]), is $null.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'Test-JsonObject', 'Get-JsonObjectMember', 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$out = [ordered]@{}\n"
+            "$arr = '{\"startedUtc\":[\"2026-11-14T18:00:00Z\"],\"endedUtc\":\"2026-11-14T18:05:00Z\"}' | ConvertFrom-Json\n"
+            "$v = Get-JsonObjectMember $arr 'startedUtc'; $out['psoArray'] = ($v -is [array]) -and @($v).Count -eq 1\n"
+            "$d = [ordered]@{ startedUtc = @('2026-11-14T18:00:00Z') }; $v = Get-JsonObjectMember $d 'startedUtc'; $out['dictArray'] = ($v -is [array]) -and @($v).Count -eq 1\n"
+            "$s = '{\"startedUtc\":\"2026-11-14T18:00:00Z\"}' | ConvertFrom-Json; $v = Get-JsonObjectMember $s 'startedUtc'; $out['scalar'] = ($null -ne $v) -and -not ($v -is [array])\n"
+            "$out['missing'] = $null -eq (Get-JsonObjectMember $s 'nope')\n"
+            "$w = '[{\"startedUtc\":\"2026-11-14T18:00:00Z\"}]' | ConvertFrom-Json -NoEnumerate; $out['notOneObject'] = $null -eq (Get-JsonObjectMember $w 'startedUtc')\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $now = [Diagnostics.Stopwatch]::GetTimestamp(); $floor = $now - 20 * $f; $obs = $now - 1 * $f; $e = [DateTime]::UtcNow.AddSeconds(5)\n"
+            "$st = Get-JsonObjectMember ([pscustomobject]@{ startedUtc = @($e.AddSeconds(-6).ToString('o')) }) 'startedUtc'\n"
+            "$out['arrayGivesTheSend'] = (Get-AgentJobEndTs $obs $floor ($e.ToString('o')) $st) -eq $floor\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"psoArray": True, "dictArray": True, "scalar": True, "missing": True, "notOneObject": True, "arrayGivesTheSend": True})
 
     def test_lease_batch_idle_end_r8_grok_g12_a_long_leg_under_an_agent_clock_ahead_leaves_the_next_probe_its_allowance(self) -> None:
         # Grok G12, run end to end: agent bound 70, margin 60 (10 s). The first leg's job runs 15 s (longer than the allowance), the agent's clock is 30 s ahead (more than the
         # job-to-observation gap), and the child works 2 s after its job. Charged from the bare send, the next probe's wait was 0; from the send plus the job's own runtime it is
         # about the allowance less the post-job gap (at most 8 s). startedUtc JSON null (the queue-expired shape): the send alone, so 0.
-        for name, env, lo, hi in (("runtime", {}, 2, 8), ("started-null", {"FAKE_LEG_STARTED": "null"}, 0, 0)):
+        # r8 (adversary-cc9275e3.json A2): startedUtc inside a one-element array is no instant either: the send alone, so 0 (the caller's `$(...)` unrolled it into the string inside)
+        for name, env, lo, hi in (("runtime", {}, 2, 8), ("started-null", {"FAKE_LEG_STARTED": "null"}, 0, 0), ("started-array", {"FAKE_LEG_STARTED": "array"}, 0, 0)):
             with self.subTest(case=name):
                 self.setUp()
                 self._tree_with_agent_idle(b"70")
