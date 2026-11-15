@@ -1557,10 +1557,16 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
     # fresh; each is submitted ONCE (an open um-run gave up on is read back by name from the outbox, never resubmitted; a RETRACTED / UNRESOLVED open ends
     # the batch), and claim-first ownership holds anyway. There is no shared submit API to route it through: like the four above, it calls um-run.ps1 directly
     # (um-run is the only writer to a venue share). test_venue_lease_batch.py pins "no JobId twice in one run".
+    # MINI3-CUTOVER-STATE-GAPS-1: tools/profiling/test-um-run-share-root-access.ps1 (the in-process test of um-run's typed SHARE_ACCESS_DENIED) is the sixth.
+    # Re-examined: it is a test harness, not a submitter. It runs um-run.ps1 -Command noop against a scratch or fake root with a stubbed -TestShareRootProbe, and
+    # um-run.ps1 throws SHARE_ACCESS_DENIED / "No agent heartbeat" (the share-root probe and the heartbeat check) BEFORE Invoke-UmRunDrop, so it never mints a JobId,
+    # never claims an inbox slot and never writes a job. It lives under tools/profiling/ (next to the module it exercises) rather than tools/testing/, so the
+    # directory exemption in _um_run_caller_paths does not cover it; it is pinned here by name instead of widening that exemption to every test-*.ps1.
     KNOWN_PRODUCTION_CALLERS = {GENERATOR, ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1",
                                 ROOT / "tools" / "profiling" / "dual-venue" / "Wait-VenueQuiet.ps1",
                                 ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1",
-                                ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeaseBatch.ps1"}
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeaseBatch.ps1",
+                                ROOT / "tools" / "profiling" / "test-um-run-share-root-access.ps1"}
 
     def _production_um_run_references(self) -> set[Path]:
         proc = subprocess.run(
