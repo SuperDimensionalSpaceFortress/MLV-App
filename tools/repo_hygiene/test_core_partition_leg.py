@@ -4358,7 +4358,7 @@ $r.embeddedSummaryMarkerIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (
 $r.malformedMeasuredIdIsNoSession = @(foreach ($t in @('1x', '1.5', '1/old', '', '-1')) { ,(Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Ln 1100 ('playback_smoke.measured_session id=' + $t)), (Sm 31000 '30000.000'), (Ln 31500 'playback_smoke.start session=2 position=0'), (Ln 31600 'playback_smoke.measured_session id=2'), (Sm 33000 '1000.000' 2)) -join "`n") $L.Ticks 1000 1000 0 41000)) })
 # r11 (r10 adversary A1 sibling, the job's :5051/:5052): a first record that starts the marker (or the summary) but is not read whole as id=<n>
 # (session=<n>) is no session; on 205a5b6c it was skipped and the later session 2 anchored
-$r.r11IncompleteMarkerIsNoSession = @(foreach ($t in @('playback_smoke.measured_session', 'playback_smoke.measured_session id', 'playback_smoke.measured_session  id=1', 'playback_smoke.measured_session ID=1')) { ,(Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Ln 1100 $t), (Sm 31000 '30000.000'), (Ln 31500 'playback_smoke.start session=2 position=0'), (Ln 31600 'playback_smoke.measured_session id=2'), (Sm 33000 '1000.000' 2)) -join "`n") $L.Ticks 1000 1000 0 41000)) })
+$r.r11IncompleteMarkerIsNoSession = @(foreach ($t in @('playback_smoke.measured_session', 'playback_smoke.measured_session id', 'playback_smoke.measured_session  id=1', 'playback_smoke.measured_session ID=1', 'playback_smoke.measured_session id=1 id=2')) { ,(Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Ln 1100 $t), (Sm 31000 '30000.000'), (Ln 31500 'playback_smoke.start session=2 position=0'), (Ln 31600 'playback_smoke.measured_session id=2'), (Sm 33000 '1000.000' 2)) -join "`n") $L.Ticks 1000 1000 0 41000)) })
 $r.r11IncompleteSummaryIsNoSession = @(foreach ($t in @('playback_smoke.summary', 'playback_smoke.summary session', 'playback_smoke.summary reason=play-stop session=3')) { ,(Pick (Get-CorePartitionPlaybackStart (@((Ln 2000 'playback_smoke.start session=3 position=0'), (Ln 30000 $t), (Ln 31500 'playback_smoke.start session=4 position=0'), (Sm 40000 '8000.000' 4)) -join "`n") $L.Ticks 1000 1000 0 42000)) })
 $r.malformedSummarySessionIsNoSession = @(foreach ($t in @('3x', '3.5', '3/old', '', '-3')) { ,(Pick (Get-CorePartitionPlaybackStart (@((Ln 2000 'playback_smoke.start session=3 position=0'), (Ln 40000 ('playback_smoke.summary session=' + $t + ' reason=play-stop elapsed_ms=38000.000 presented_frames=1'))) -join "`n") $L.Ticks 1000 1000 0 42000)) })
 # r13b (adversary r13 028f4619 A1): the stamp is trusted only when the app's monotonic elapsed_ms agrees with it, and the stamped gap is under the
@@ -4685,7 +4685,7 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["malformedMeasuredIdIsNoSession"], [[unverified, None, None]] * 5)
         self.assertEqual(r["malformedSummarySessionIsNoSession"], [[unverified, None, None]] * 5)
         # r11 (r10 adversary A1 sibling): a first marker or summary not read whole is no session, never the later session
-        self.assertEqual(r["r11IncompleteMarkerIsNoSession"], [[unverified, None, None]] * 4)
+        self.assertEqual(r["r11IncompleteMarkerIsNoSession"], [[unverified, None, None]] * 5)
         self.assertEqual(r["r11IncompleteSummaryIsNoSession"], [[unverified, None, None]] * 3)
         self.assertEqual(r["unknownSkew"], [unverified, None, 1])
         self.assertEqual(r["noSinkStamp"], [unverified, None, 1])

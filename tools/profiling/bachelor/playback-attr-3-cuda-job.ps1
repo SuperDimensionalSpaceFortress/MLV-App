@@ -2248,9 +2248,11 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     # marker (or, with no marker, a malformed first summary) is unreadable and throws, never its numeric prefix (id=3x was 3) or a later record's id
     # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's name (any case, ending at a non-name character) is the marker, read whole
     # (case-sensitive ` id=`) or as the empty token: `... id`, a doubled space or `ID=` throws unreadable, never skipped for a later marker; same for the summary
+    # r11 pass 11 (A3 sibling, `id=3 id=4`): the marker names the word id once, the summary the word session once (bounded by any non-name character)
+    $wordCount = { param([string]$x, [string]$w) [regex]::Matches($x, '(?i)(?<![A-Za-z0-9_])' + $w + '(?![A-Za-z0-9_])').Count }
     $token = $null
-    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } }
-    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } } }
+    foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $token = $(if ((& $wordCount $line 'id') -eq 1 -and (& $wordCount $line 'session') -eq 0 -and $line -cmatch ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } }
+    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ($line -match ($recordStart + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $token = $(if ((& $wordCount $line 'session') -eq 1 -and $line -cmatch ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } } }
     if ($null -ne $token) {
         if ($token -cmatch '^[0-9]+$') { return $token }
         throw ("the measured playback_smoke session id is unreadable (not one whole decimal id): '" + $token + "'")
@@ -5051,8 +5053,10 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         $recordStart = '^(?:\[[^\]]*\] ){0,3}'
         # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed one is no session (never its numeric prefix)
         # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's (else the summary's) name is read whole or is the empty token (no session)
-        foreach ($ln in $lines) { if ($ln -match ($recordStart + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { if ($ln -match ($recordStart + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } } }
+        # r11 pass 11 (A3 sibling): the marker names the word id once, the summary the word session once
+        $wc = { param([string]$x, [string]$w) [regex]::Matches($x, '(?i)(?<![A-Za-z0-9_])' + $w + '(?![A-Za-z0-9_])').Count }
+        foreach ($ln in $lines) { if ($ln -match ($recordStart + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'id') -eq 1 -and (& $wc $ln 'session') -eq 0) { $mm.Groups[1].Value } else { '' }); break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { if ($ln -match ($recordStart + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'session') -eq 1) { $mm.Groups[1].Value } else { '' }); break } } }
         if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $r }
         $r.session = [int64]$sid
         $stamp = $null
@@ -7526,8 +7530,10 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         # a malformed one (id=3x) is no window, never skipped for a later Play's marker (the Get-CorePartitionPlaybackStart rule)
         # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's (else the summary's) name is read whole or is the empty token (no window)
         $ux = '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] '
-        foreach ($ln in $lines) { if ($ln -match ($ux + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { if ($ln -match ($ux + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success) { $mm.Groups[1].Value } else { '' }); break } } }
+        # r11 pass 11 (A3 sibling): the marker names the word id once, the summary the word session once
+        $wc = { param([string]$x, [string]$w) [regex]::Matches($x, '(?i)(?<![A-Za-z0-9_])' + $w + '(?![A-Za-z0-9_])').Count }
+        foreach ($ln in $lines) { if ($ln -match ($ux + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'id') -eq 1 -and (& $wc $ln 'session') -eq 0) { $mm.Groups[1].Value } else { '' }); break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { if ($ln -match ($ux + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'session') -eq 1) { $mm.Groups[1].Value } else { '' }); break } } }
         if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $null }
         $stamp = $null; $startTh = $null
         $begins = [Collections.Generic.Dictionary[string, string]]::new()

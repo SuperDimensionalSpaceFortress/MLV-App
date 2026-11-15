@@ -804,7 +804,9 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         # starts `playback_smoke.measured_session` (or, with no marker, `playback_smoke.summary`) but has no whole `id=<n>` (`session=<n>`) right after
         # it is unreadable. On 205a5b6c the selector needed the literal `id=` / `session=`, skipped the record and returned the later session 4.
         for shape in ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session  id=3",
-                      "playback_smoke.measured_session ID=3", "playback_smoke.measured_session id:3"):
+                      "playback_smoke.measured_session ID=3", "playback_smoke.measured_session id:3",
+                      # r11 pass 11 A3 sibling (:2252): the word id named twice
+                      "playback_smoke.measured_session id=3 id=4", 'playback_smoke.measured_session id=3 "id=4"'):
             log = f"{shape}\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n"
             with self.subTest(shape=shape):
                 proc = self._run(log)
@@ -812,7 +814,7 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
                 self.assertNotIn("ID=", proc.stdout)
                 self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
         for shape in ("playback_smoke.summary", "playback_smoke.summary session", "playback_smoke.summary reason=play-stop session=3",
-                      "playback_smoke.summary  session=3 reason=play-stop"):
+                      "playback_smoke.summary  session=3 reason=play-stop", "playback_smoke.summary session=3 session=4 reason=play-stop"):
             log = f"{shape}\nplayback_smoke.summary session=4 reason=play-stop\n"
             with self.subTest(summary=shape):
                 proc = self._run(log)

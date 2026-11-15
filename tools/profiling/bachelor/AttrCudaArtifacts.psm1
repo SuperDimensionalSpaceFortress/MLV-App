@@ -3495,7 +3495,10 @@ function Get-AttrCudaSelfHealMetrics {
             $first = [regex]::Match($LogText, $recordStart + '(?i:playback_smoke\.measured_session)(?![A-Za-z0-9_])[^\r\n]*')
             if (-not $first.Success) { return $null }
             $sm = [regex]::Match($first.Value, '^(?:\[[^\]\r\n]*\] ){0,3}playback_smoke\.measured_session id=(\S*)')
-            if (-not $sm.Success -or $sm.Groups[1].Value -cnotmatch '^[0-9]+$') { return $null }
+            # r11 pass 11 (A3 sibling, `id=3 id=4`): the marker names the word id exactly once and no session (bounded by any non-name character)
+            $ids = [regex]::Matches($first.Value, '(?i)(?<![A-Za-z0-9_])id(?![A-Za-z0-9_])').Count
+            $sess = [regex]::Matches($first.Value, '(?i)(?<![A-Za-z0-9_])session(?![A-Za-z0-9_])').Count
+            if (-not $sm.Success -or $ids -ne 1 -or $sess -ne 0 -or $sm.Groups[1].Value -cnotmatch '^[0-9]+$') { return $null }
             $Session = $sm.Groups[1].Value
         }
         $found = $null

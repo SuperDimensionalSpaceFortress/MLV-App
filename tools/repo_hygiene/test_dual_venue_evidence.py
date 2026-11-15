@@ -11514,7 +11514,9 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
         On 205a5b6c the reader required the literal `id=`, skipped it and took the later id=2 marker (the adversary's run: presented_fps=99 read)."""
         prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
         for shape in ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session  id=1",
-                      "playback_smoke.measured_session ID=1", "playback_smoke.measured_session session=1", "playback_smoke.measured_session id:1"):
+                      "playback_smoke.measured_session ID=1", "playback_smoke.measured_session session=1", "playback_smoke.measured_session id:1",
+                      # r11 pass 11 A3 sibling: the word id named twice
+                      "playback_smoke.measured_session id=1 id=2", 'playback_smoke.measured_session id=1 "id=2"'):
             log = (prefix + shape + "\n"
                    + prefix + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n"
                    + prefix + "playback_smoke.measured_session id=2\n"
@@ -16194,6 +16196,38 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
         self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
         v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_CONTROL]) + "\n", {})
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r11_p11_its_inputs_verbatim_a_quoted_or_repeated_mention_is_never_skipped(self) -> None:
+        # r11 pass 11 (r11 adversary on 8317f372) A1 / A2 / A3 verbatim, and advisory A4: a mention is the word bounded by ANY non-name character
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        head = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        base = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+        wake = "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post"
+        for name, log, spec in (("A1", base + 'playback_smoke.gpu_summary "session=4"\n' + wake, post),
+                                ("A2", base + 'playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "delivery_kind=post"', head),
+                                ("A3", base + "playback_smoke.measured_session id=3 id=4\n" + wake, post),
+                                ("A4", base + "playback_due_wake: armed=0 fired=0 disabled=1 delivery=none delivery_kind=post post_rescued=0 post_counts_settled=1", head)):
+            with self.subTest(finding=name):
+                v = self.wake_verdict(log, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # A3 at the FIRST position: a marker naming id twice is unreadable, never id=3
+        self.assertEqual(self.selected("playback_smoke.measured_session id=3 id=4\n" + base + wake), {"session": None, "unreadable": True})
+        self.assertEqual(self.selected("playback_smoke.summary session=3 session=4 reason=play-stop\nplayback_smoke.summary session=4\n"), {"session": None, "unreadable": True})
+
+    def test_r11_p11_class_punctuated_mentions_block_every_leg(self) -> None:
+        for shape in ('playback_smoke.gpu_summary "session=4"', "playback_smoke.gpu_summary x=(session=4)", "playback_smoke.gpu_summary x=1,session=4",
+                      "playback_smoke.gpu_summary session=3 'session=4'", "playback_smoke.measured_session id=3 id=4",
+                      'playback_smoke.measured_session id=3 "id=4"', "playback_smoke.measured_session id=3,id=4"):
+            build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [s, wake]) + "\n")(shape)
+            self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape)
+        for key in self.READ_KEYS:
+            # (a ` (`-led tail is the Qt location suffix Get-DvLogRecordBodies strips by design, so it is not a shape of the record body)
+            for shape in (f'"{key}=1"', f"[{key}=1]", f"'{key}=1'", f",{key}=1"):
+                build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [wake + " " + s]) + "\n")(shape)
+                for leg, spec, wake in self.LEG_WAKES:
+                    v = self.wake_verdict(build(self.leg_wake(wake)), spec)
+                    with self.subTest(key=key, shape=shape, leg=leg):
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):

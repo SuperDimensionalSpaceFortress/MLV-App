@@ -1119,8 +1119,11 @@ function Get-DvSmokeSummaryFields {
         # character, any case) is the marker, read whole (case-sensitive) or not at all: no `id=` right after it (`... id`, a doubled space, `ID=`) is the
         # empty token, so unreadable, never skipped for a later Play's marker. The summary fallback reads the first `playback_smoke.summary` the same way.
         $token = $null
-        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } }
-        if ($null -eq $token) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $token = $(if ($line -cmatch ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } } }
+        # r11 pass 11 (A3, `id=3 id=4`): the marker names the word id exactly once and the summary the word session exactly once (bounded by any
+        # non-name character, so a quoted or repeated one counts); a second mention is the empty token, so unreadable
+        $wordCount = { param([string]$x, [string]$w) [regex]::Matches($x, '(?i)(?<![A-Za-z0-9_])' + $w + '(?![A-Za-z0-9_])').Count }
+        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session(?![A-Za-z0-9_])')) { $token = $(if ((& $wordCount $line 'id') -eq 1 -and (& $wordCount $line 'session') -eq 0 -and $line -cmatch ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } }
+        if ($null -eq $token) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary(?![A-Za-z0-9_])')) { $token = $(if ((& $wordCount $line 'session') -eq 1 -and $line -cmatch ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } } }
         if ($null -ne $token) { if ($token -cmatch '^[0-9]+$') { $session = $token } else { $sessionUnreadable = $true } }
         if ($null -ne $session) {
             $summaryLine = $null
@@ -2030,7 +2033,11 @@ function Get-DvDueWakeDeliveryEvidence {
             $nameEnd = '(?![A-Za-z0-9_])'
             # r11 (r11 adversary pass 10 A1 on 93fa8621, its input: `playback_smoke.gpu_summary frames=600 session=4` was skipped): a record that names a
             # session ANYWHERE (a `session` token, with or without =) is a boundary, read whole only as ONE ` session=<[0-9]+>` that is its first field
-            $sessionTokens = { param([string]$x) [regex]::Matches($x, '(?i)(?:^|\s)session(?![A-Za-z0-9_])').Count }
+            # r11 pass 11 (A1, its input: a quoted `"session=4"`): a mention is the WORD session bounded by any non-name character (a quote, a comma,
+            # a bracket, whitespace), not only by whitespace; `measured_session=` / `x_session=` are other names
+            $sessionTokens = { param([string]$x) [regex]::Matches($x, '(?i)(?<![A-Za-z0-9_])session(?![A-Za-z0-9_])').Count }
+            # r11 pass 11 (A3, its input: `playback_smoke.measured_session id=3 id=4`): a marker names its id exactly once (the word id, bounded the same way)
+            $idTokens = { param([string]$x) [regex]::Matches($x, '(?i)(?<![A-Za-z0-9_])id(?![A-Za-z0-9_])').Count }
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($l -match ($start + 'playback_smoke\.pace_summary' + $nameEnd)) {
                     $paceWhole = ($l -cmatch ($start + 'playback_smoke\.pace_summary session=[0-9]+(?:\s|$)')) -and ((& $sessionTokens $l) -eq 1)
@@ -2043,7 +2050,7 @@ function Get-DvDueWakeDeliveryEvidence {
                 if ($open) {
                     $bid = $null; $isBoundary = $false
                     if ($l -match ($start + 'playback_smoke\.measured_session' + $nameEnd)) {
-                        $isBoundary = $true; if ((& $sessionTokens $l) -eq 0 -and $l -cmatch ($start + 'playback_smoke\.measured_session id=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
+                        $isBoundary = $true; if ((& $sessionTokens $l) -eq 0 -and (& $idTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.measured_session id=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
                     }
                     elseif ($l -match ($start + 'playback_smoke\.(?:start|summary|conform)' + $nameEnd) -or ($l -match ($start + 'playback_smoke\.[A-Za-z0-9_]+' + $nameEnd) -and (& $sessionTokens $l) -gt 0)) {
                         $isBoundary = $true; if ((& $sessionTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
@@ -2054,7 +2061,8 @@ function Get-DvDueWakeDeliveryEvidence {
                 # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable).
                 # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second
                 # one without armed= makes the read unreadable instead of being skipped
-                if ($open -and $l -match ($start + 'playback_due_wake(?:\s|$)')) { $candidates.Add($l) }
+                # r11 pass 11 advisory A4 (`playback_due_wake: armed=0 ... disabled=1` was skipped): the record name ends at any non-name character
+                if ($open -and $l -match ($start + 'playback_due_wake(?![A-Za-z0-9_])')) { $candidates.Add($l) }
             }
         }
     }
@@ -2078,11 +2086,13 @@ function Get-DvDueWakeDeliveryEvidence {
     # NAMES delivery_kind with the key in any shape (no `=`, `delivery_kind post`, another case), and every key this reader reads (delivery_kind,
     # delivery, disabled, armed, fired, post_rescued, post_counts_settled) must appear only as `<key>=`; a key named any other way makes the read
     # unreadable on both paths (never skipped, never the control exemption)
-    $withKind = @($candidates | Where-Object { $_ -match '(?:^|\s)delivery_kind(?![A-Za-z0-9_])' })
+    # r11 pass 11 (A2, its input: a quoted `"delivery_kind=post"`): a mention is the key's WORD bounded by any non-name character, so a quoted or
+    # punctuated key is a mention that is not `<key>=` after whitespace, hence unreadable
+    $withKind = @($candidates | Where-Object { $_ -match '(?<![A-Za-z0-9_])delivery_kind(?![A-Za-z0-9_])' })
     $keyShapeUnreadable = $false
     foreach ($c in $candidates) {
         foreach ($key in @('delivery_kind', 'delivery', 'disabled', 'armed', 'fired', 'post_rescued', 'post_counts_settled')) {
-            if ([regex]::Matches($c, '(?i)(?:^|\s)' + $key + '(?![A-Za-z0-9_])').Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
+            if ([regex]::Matches($c, '(?i)(?<![A-Za-z0-9_])' + $key + '(?![A-Za-z0-9_])').Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
         }
     }
     # r5 (r5 adversary pass 12 A1): a control binary's line (one wake record, no delivery_kind) still carries delivery= (master's
