@@ -1530,6 +1530,10 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     # BACHELOR-THERMAL-GATE-WAIT-1 r6 (merge with #704): a thermal re-probe is a probe launch too, so it passes the same guards and the same launch-time claim and lease check
     $asked = (Test-RunDirWrite (Join-Path $RunDir 'gate.log')) -and (Test-RunDirWrite (Join-Path $RunDir 'quiet') -Directory)
     if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false; heat = 'unknown'; heatText = 'no probe' } }
+    # r8 (adversary-f52a32d6.json A1): the wall instant the wait's END is counted from (-WaitUntilUtc below) is read FIRST, before every cut of the wait (the idle allowance and
+    # the lease room in Get-ProbeLaunchVerdict, the thermal cap below). Each cut then reads its own clock later, so a stall anywhere between here and the dispatch only shortens
+    # the wait (spent); counted from UtcNow read at the dispatch, that stall was added on top of every bound (idle 300 - margin 60, a 90 s pause: 30 s past the agent's bound).
+    $dispatchUtc = [DateTime]::UtcNow
     $lv = Get-ProbeLaunchVerdict $MaxWaitSec; if ($lv.verdict) { return $lv }; $wait = [int]$lv.maxWait
     # adversary r4 pass 2 A2: during a thermal wait the deadline is checked HERE, the last statement before the process starts (the Test-Path and the write guards above can stall on a
     # share): an expired wait dispatches nothing and the caller skips on the reading it already has
@@ -1547,7 +1551,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     # UNC RunDir), buying a probe past the deadline. Nothing but the process start follows the admission; the file is written (still the probe's evidence) after it returns.
     # r5 pass 3 (adversary r5 pass 2 A2): the wait's END is fixed HERE, on this clock, at the dispatch: the child counts -MaxWaitSec from its own start, after the process start,
     # so the allowance passed as a duration was overrun by that startup. Wait-VenueQuiet ends every wait (the queue gate's included) by -WaitUntilUtc too.
-    $qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds($wait).ToString('o'))
+    $qArgs += @('-WaitUntilUtc', $dispatchUtc.AddSeconds($wait).ToString('o'))   # r8 (adversary-f52a32d6.json A1): from the instant read before the cuts
     $startTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r4 pass 2 (adversary A1): the probe's dispatch, the latest instant provably before its agent jobs (the idle anchor)
     $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
     # r6 (adversary r5 A2): the child's result is observed HERE: this is the instant of its reading, taken before the evidence write and the parse below (either can stall on a share,

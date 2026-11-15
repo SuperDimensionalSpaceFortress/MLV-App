@@ -1291,6 +1291,56 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "receipt_plain": "FOUND", "ledger_plain": 1,
         })
 
+    # ---------------------------------------------------------------- r8 (adversary-f52a32d6.json A1): an in-lease probe's wait end is counted from an instant read BEFORE its cuts
+    def test_lease_batch_idle_end_r8_adv_a1_a_stall_before_the_probes_dispatch_never_places_its_wait_end_late(self) -> None:
+        # adversary-f52a32d6.json A1: Invoke-QuietProbe cut the wait at Get-ProbeLaunchVerdict (:1533) and fixed its end at -WaitUntilUtc (:1550) from UtcNow read LATER, so a
+        # stall in between (the thermal admission, scheduling) was added on top of the idle allowance: idle 300, margin 60, a 90 s pause gave an end 30 s past the agent's bound.
+        # Siblings: the lease room cut (:1517, read at the same call) and the thermal cap cut (:1540) are the same stale duration. The function is rebuilt here with a 1 s sleep
+        # after EVERY top-level statement before the probe starts, so a pause sits between any read and any use; the wait end may land early (spent), never more than 0.3 s
+        # past the idle allowance, the lease room or the thermal cap, and -MaxWaitSec is never above the duration the end was cut from.
+        case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            f"Import-Module '{psq(DV / 'VenueThermalGate.psm1')}' -Force -DisableNameChecking\n"
+            "foreach ($n in 'Get-ProbeLaunchVerdict', 'Get-IdleAllowanceSec', 'Get-ThermalElapsedSec') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-QuietProbe' }, $true)\n"
+            "$stmts = @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text })\n"
+            "$cut = 0; while ($cut -lt $stmts.Count -and -not $stmts[$cut].StartsWith('$captured')) { $cut++ }\n"
+            "$body = @(for ($i = 0; $i -lt $stmts.Count; $i++) { $stmts[$i]; if ($i -lt $cut) { 'Start-Sleep -Milliseconds 1000' } }) -join \"`n\"\n"
+            ". ([scriptblock]::Create('function Invoke-QuietProbe(' + (@($fn.Parameters | ForEach-Object { $_.Extent.Text }) -join ', ') + \") {`n\" + $body + \"`n}\"))\n"
+            "function Test-RunDirWrite { $true }; function Get-VenueClaimKeeperLoss { $null }; function L { }\n"
+            "function ConvertFrom-VenueProbeHeatLine { [pscustomobject]@{ heat = 'unknown'; text = ''; thresholdsSource = $null; reason = $null } }\n"
+            "function Invoke-FakeProbe { $global:seenArgs = @($args); $global:LASTEXITCODE = 3 }\n"
+            f"$RunDir = '{psq(case)}'; $QuietScript = '{psq(RUNNER)}'; $Venue = 'bachelor'; $ThresholdPercent = 15; $RecheckSec = 30; $pwshExe = 'Invoke-FakeProbe'\n"
+            "$claimKeeper = $null; $claim = [pscustomobject]@{ expiresUtc = [DateTime]::UtcNow.AddHours(1) }; $ThermalDispatchGraceSec = 1; $ThermalPollSec = 30\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($k in 'idle', 'room', 'thermal') {\n"
+            "    $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "    $idleAnchorTs = $t0Ts; $probeIdleCap = $(if ($k -eq 'idle') { 30 } else { 600 }); $LeaseMarginSec = 60; $legBudget = 600\n"
+            "    $leaseEnd = $t0.AddSeconds($(if ($k -eq 'room') { 60 + 600 + 30 } else { 7200 }))\n"
+            "    $ThermalWaitCapSec = 30; $th = $(if ($k -eq 'thermal') { @{ firstHotUtc = $t0; firstHotTs = $t0Ts; slowProbeSec = 0 } } else { $null })\n"
+            "    $global:seenArgs = @()\n"
+            "    $q = Invoke-QuietProbe 'leg' \"r8-$k\" 600 $th\n"
+            "    $a = @($global:seenArgs); $iu = [Array]::IndexOf($a, '-WaitUntilUtc'); $im = [Array]::IndexOf($a, '-MaxWaitSec')\n"
+            "    if ($iu -lt 0) { $out[$k] = \"no -WaitUntilUtc ($($q | ConvertTo-Json -Compress))\"; continue }\n"
+            "    $until = [DateTime]::Parse($a[$iu + 1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()\n"
+            "    $out[$k] = [ordered]@{ statements = $cut; lateSec = [Math]::Round(($until - $t0.AddSeconds(30)).TotalSeconds, 3); maxWaitSec = [int]$a[$im + 1]; waitSec = $q.maxWaitSec }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        for k in ("idle", "room", "thermal"):
+            with self.subTest(bound=k):
+                g = got[k]
+                self.assertIsInstance(g, dict, g)
+                self.assertGreaterEqual(g["statements"], 8, g)
+                self.assertLessEqual(g["lateSec"], 0.3, f"{k}: a stall before the dispatch placed the probe's wait end past the {k} bound: {g}")
+                self.assertEqual(g["maxWaitSec"], g["waitSec"], g)
+                self.assertLessEqual(g["maxWaitSec"], 30, g)
+
     def test_lease_batch_idle_end_r6_grok_g11_every_idle_end_call_names_its_parameters_in_full(self) -> None:
         # Grok G11 on #817: a call that abbreviates a parameter (-Append for -AppendDetail) binds today by prefix and turns into an ambiguous-parameter error (BATCH_ERROR on a rare
         # path) the day the helper gains another -Append* parameter. Every Set-BatchLeaseIdleEnded call names each parameter exactly as the helper declares it (AST on both sides).

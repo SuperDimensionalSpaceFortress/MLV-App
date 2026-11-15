@@ -351,7 +351,8 @@ class ThermalGateModuleTests(unittest.TestCase):
         after = [l for l in fn[fn.index(marker) + len(marker):].splitlines() if l.strip() and not l.strip().startswith("#")]
         # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 / r6 (hosted CI on 848f6559): only two in-memory statements may sit between the admission and the start, neither of which
         # touches a file or a share: the probe's absolute wait end (-WaitUntilUtc, fixed at the dispatch) and the dispatch's monotonic instant (the idle anchor)
-        in_memory = ("$qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds($wait).ToString('o'))", "$startTs = [Diagnostics.Stopwatch]::GetTimestamp()")
+        # r8 (adversary-f52a32d6.json A1): the end is counted from $dispatchUtc, read before the wait's cuts (still in memory, no file or share)
+        in_memory = ("$qArgs += @('-WaitUntilUtc', $dispatchUtc.AddSeconds($wait).ToString('o'))", "$startTs = [Diagnostics.Stopwatch]::GetTimestamp()")
         while after and after[0].lstrip().startswith(in_memory):
             after.pop(0)
         self.assertTrue(after and after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[:1])
