@@ -26,6 +26,13 @@ function Assert-That([bool]$Condition, [string]$Name, [string]$Detail = '') {
     if ($Condition) { Write-Host "PASS $Name" } else { $script:Fails++; Write-Host "FAIL $Name $Detail" }
 }
 
+# True when the setup script defines the function; otherwise one FAIL line (an older script, or a regression) and the section is skipped.
+function Test-Has([string]$Fn, [string]$Section) {
+    if (Get-Command -Name $Fn -CommandType Function -ErrorAction SilentlyContinue) { return $true }
+    Assert-That $false "$Section`: function $Fn is not defined"
+    return $false
+}
+
 function New-Scratch([string]$Name) {
     $d = Join-Path $ScratchRoot $Name
     [void][IO.Directory]::CreateDirectory($d)
@@ -228,7 +235,7 @@ if ($fnLoaded) {
 }
 
 # ---------------------------------------------------------------- A2, A3: the secret scan covers every staged size and fails closed on an unreadable file
-if ($fnLoaded) {
+if ($fnLoaded -and (Test-Has 'Invoke-StagedSecretScan' 'A2/A3 scan')) {
     $scanStage = New-Scratch 'scan-stage'
     $token = 'gh' + 'p_' + ('A' * 40)
     $atBoundary = Join-Path $scanStage 'boundary.txt'
@@ -268,7 +275,7 @@ Assert-That (-not (Test-Path -LiteralPath (Join-Path $home6 '.claude\.credential
 Assert-That ((Test-Path -LiteralPath (Join-Path $home6 '.codex\AGENTS.md'))) 'A4 import: the non-credential files of the same folder still come across'
 
 # ---------------------------------------------------------------- A5, A6: key-only sshd_config
-if ($fnLoaded) {
+if ($fnLoaded -and (Test-Has 'Set-SshdKeyOnlyConfig' 'A5/A6 sshd')) {
     $sshDir = New-Scratch 'sshd'
     $cfgBad = Join-Path $sshDir 'sshd_config_bad'
     $badText = "PasswordAuthentication yes`r`nPort 22`r`nMatch User obabalola`r`n    PasswordAuthentication yes`r`n"
@@ -291,7 +298,7 @@ if ($fnLoaded) {
 }
 
 # ---------------------------------------------------------------- A7: scheduled tasks carry the path overrides they were registered with
-if ($fnLoaded) {
+if ($fnLoaded -and (Test-Has 'Get-GateTaskArgument' 'A7 tasks')) {
     $spec = @{ Name = 'T'; Script = 'C:\x\y.ps1'; ArgLine = 'Quiet'; Mode = 'Local' }
     $a = Get-GateTaskArgument -Pwsh 'C:\pwsh.exe' -Self "$fnState\Setup-MlvWorkstation.ps1" -Spec $spec
     Assert-That ($a.Contains("-StateRoot `"$fnState`"") -and $a.Contains("-Workspace `"$fnWs`"") -and -not $a.Contains('-MlvTmp')) 'A7 tasks: -StateRoot and -Workspace given to the registering run reach the task command line (and an unset -MlvTmp does not)' $a
@@ -321,7 +328,7 @@ function Get-LeaseHolder([string]$Ws) {
     return [string](($raw | ConvertFrom-Json).holder)
 }
 $me = $env:COMPUTERNAME
-if ($fnLoaded) {
+if ($fnLoaded -and (Test-Has 'Test-GateRunActive' 'A8 lock')) {
     $lockRoot = New-Scratch 'lock-root'
     Assert-That (-not (Test-GateRunActive -Root $lockRoot)) 'A8 lock: no lock file = no gate run active'
     $lk = [IO.FileStream]::new((Join-Path $lockRoot 'gate-active-test.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)

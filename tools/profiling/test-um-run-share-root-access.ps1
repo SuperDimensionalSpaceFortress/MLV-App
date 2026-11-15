@@ -126,7 +126,8 @@ $deepProbe = { param($r) throw $chain }
 Assert-That ((Get-ShareRootAccess -Root $fakeRoot -Probe $deepProbe).State -ceq 'ACCESS_DENIED') 'A12 module: the probe classifies the deep chain as ACCESS_DENIED'
 
 # A13: every SHARE_UNREACHABLE exit of the stage driver asks the share root first (Stop-ShareUnreachable), including the cache probe and Read-Share.
-Invoke-Expression (Get-ScriptFunctionText $nightly 'Stop-ShareUnreachable')
+$s = ''
+try { Invoke-Expression (Get-ScriptFunctionText $nightly 'Stop-ShareUnreachable') } catch { Assert-That $false 'A13 nightly: Stop-ShareUnreachable is not defined' $_.Exception.Message }
 Invoke-Expression (Get-ScriptFunctionText $nightly 'Read-Share')
 $share = $fakeRoot
 $ProbeTimeoutSec = 5
