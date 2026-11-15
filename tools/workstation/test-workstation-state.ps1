@@ -595,6 +595,59 @@ if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContin
     Assert-That ($script:StubCalls.Count -eq 0 -and $a7b.Disk.State -ceq 'Ready') 'r3 A7 meters: a task the owner had ENABLED is left enabled (no Disable or re-register call)' "calls=$($script:StubCalls -join ',')"
 } else { Assert-That $false 'r3 A7: Invoke-MeterInstalls is not defined' }
 
+# ================================================================ adversary pass 5 (head 2c812a47): one section per finding class
+# ---------------------------------------------------------------- p5 A1: credential text is judged by what it says, not by one spelling of a value
+if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinue) -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyContinue)) {
+    $p5a1 = [ordered]@{
+        'a value with a space inside the quotes'      = '{"DB_PASSWORD":"two words"}'
+        'a three character quoted value'             = '{"DB_PASSWORD":"abc"}'
+        'an unquoted cmd set line'                    = "@set DB_PASSWORD=valid-pass-9"
+        'an unquoted dotenv style line'               = "API_KEY=abcd1234efgh"
+        'a key spelled with a JSON unicode escape'    = '{"api\u005fkey":"valid-pass-9"}'
+        'a value spelled with a JSON unicode escape'  = '{"DB_PASSWORD":"valid\u002dpass-9"}'
+    }
+    foreach ($k in $p5a1.Keys) { Assert-That (Test-CredentialText $p5a1[$k]) "p5 A1 Test-CredentialText: $k is a credential" $p5a1[$k] }
+    $p5a1ok = [ordered]@{
+        'ordinary env settings'       = '{"env":{"FOO":"bar","MODEL":"claude","KEYBOARD":"qwerty-layout"}}'
+        'a numeric token limit'       = 'max_tokens = 4096'
+        'a boolean under a key name'  = '{"passwordless": true, "token": null}'
+        'an empty secret value'       = '{"DB_PASSWORD": ""}'
+    }
+    foreach ($k in $p5a1ok.Keys) { Assert-That (-not (Test-CredentialText $p5a1ok[$k])) "p5 A1 Test-CredentialText: $k is not a credential" $p5a1ok[$k] }
+    $p5a1Stage = New-Scratch 'p5-a1-stage'
+    [IO.File]::WriteAllText((Join-Path $p5a1Stage 'login.cmd'), "@set DB_PASSWORD=valid-pass-9`r`n")
+    [IO.File]::WriteAllText((Join-Path $p5a1Stage 'hooks-config.json'), '{"api\u005fkey":"valid-pass-9"}')
+    [IO.File]::WriteAllText((Join-Path $p5a1Stage 'notes.json'), '{"DB_PASSWORD":"two words"}')
+    [void](Invoke-StagedSecretScan -Stage $p5a1Stage)
+    foreach ($n in 'login.cmd', 'hooks-config.json', 'notes.json') { Assert-That (-not (Test-Path -LiteralPath (Join-Path $p5a1Stage $n))) "p5 A1 export scan: $n is removed from the staged bundle" }
+} else { Assert-That $false 'p5 A1: Test-CredentialText / Invoke-StagedSecretScan are not defined' }
+
+# ---------------------------------------------------------------- p5 A2, A3, A4: Import end to end (claims and doctrine copies, newer host files, a host settings.json that was never replaced)
+$homeP5 = New-Scratch 'p5-home'
+$wsP5 = New-Scratch 'p5-ws'
+$repoP5 = Join-Path $wsP5 'MLV-App'
+New-Item -ItemType Directory -Force -Path (Join-Path $homeP5 '.claude') | Out-Null
+[IO.File]::WriteAllText((Join-Path $homeP5 '.claude\settings.json'), '{"env":{"DB_PASSWORD":"local-password"},"path":"C:/Users/obabalola/tool"}')
+[IO.File]::WriteAllText((Join-Path $homeP5 '.claude\CLAUDE.md'), 'NEWER-LOCAL')
+(Get-Item -LiteralPath (Join-Path $homeP5 '.claude\CLAUDE.md')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-1)
+$bundleP5 = New-Scratch 'p5-bundle'
+[IO.File]::WriteAllText((Join-Path $bundleP5 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+New-Item -ItemType Directory -Force -Path (Join-Path $bundleP5 'home-claude') | Out-Null
+[IO.File]::WriteAllText((Join-Path $bundleP5 'home-claude\CLAUDE.md'), 'OLD')
+(Get-Item -LiteralPath (Join-Path $bundleP5 'home-claude\CLAUDE.md')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-5)
+New-Item -ItemType Directory -Force -Path (Join-Path $bundleP5 'project-claude-state\hub-autopilot\claims') | Out-Null
+[IO.File]::WriteAllText((Join-Path $bundleP5 'project-claude-state\hub-autopilot\claims\new.claim'), '{"api_key":"foreign-key-1234"}')
+New-Item -ItemType Directory -Force -Path (Join-Path $bundleP5 'project-codex-state\doctrine') | Out-Null
+[IO.File]::WriteAllText((Join-Path $bundleP5 'project-codex-state\doctrine\last-seen.json'), '{"api_key":"foreign-key-1234"}')
+[IO.File]::WriteAllText((Join-Path $bundleP5 'project-codex-state\doctrine\clean.json'), 'from-bundle')
+$impP5 = Invoke-Setup $homeP5 @('-Phase', 'Import', '-StateRoot', (New-Scratch 'p5-state'), '-Workspace', $wsP5, '-BundlePath', $bundleP5, '-SourceHost', 'NOT-THIS-HOST')
+Assert-That ($impP5.Exit -eq 0) 'p5 import: the bundle imports (exit 0)' "exit=$($impP5.Exit)`n$($impP5.Out)"
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $repoP5 '.claude-state\hub-autopilot\claims\new.claim'))) 'p5 A2 import: a claim file carrying a credential is not copied' $impP5.Out
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $repoP5 '.codex-state\doctrine\last-seen.json'))) 'p5 A2 import: a doctrine file carrying a credential is not copied' $impP5.Out
+Assert-That ((Test-Path -LiteralPath (Join-Path $repoP5 '.codex-state\doctrine\clean.json'))) 'p5 A2 import: a clean doctrine file still comes across'
+Assert-That (([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\CLAUDE.md'))) -ceq 'NEWER-LOCAL') 'p5 A3 import: an OLDER bundle file never replaces a NEWER host file (README: never overwrites a newer local file)' ([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\CLAUDE.md')))
+Assert-That (([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\settings.json'))) -ceq '{"env":{"DB_PASSWORD":"local-password"},"path":"C:/Users/obabalola/tool"}') 'p5 A4 import: with no bundle settings.json, the host''s credential-bearing settings.json is left byte-for-byte as it was' ([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\settings.json')))
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
