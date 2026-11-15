@@ -838,7 +838,7 @@ function Test-CredentialText {
 #   - the file it would replace is a credential-ROLE file (settings.json, config.toml, ...) that names a credential-like key at all.
 # Returns objects { Source; Dest; Reason }. Reads only; a file that cannot be read counts as carrying a credential (fail closed).
 function Get-ImportCredentialSkips {
-    param([string]$SourceDir, [string]$DestDir)
+    param([string]$SourceDir, [string]$DestDir, [long]$MaxScanBytes = 26214400)
     $skips = [System.Collections.Generic.List[object]]::new()
     if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) { return @() }
     $roleRx = [regex]::new('(?i)(' + $CredentialNameWords + ')')
@@ -847,12 +847,15 @@ function Get-ImportCredentialSkips {
         $dest = Join-Path $DestDir $rel
         $reason = ''
         $srcText = $null
-        try { $srcText = [IO.File]::ReadAllText($f.FullName) } catch { $reason = 'bundle file unreadable' }
+        # A file over the scan limit is not read at all and is not copied (fail closed, the same limit the Export scan uses).
+        if ($f.Length -gt $MaxScanBytes) { $reason = 'bundle file larger than the scan limit' }
+        else { try { $srcText = [IO.File]::ReadAllText($f.FullName) } catch { $reason = 'bundle file unreadable' } }
         if (-not $reason -and (Test-CredentialText $srcText)) { $reason = 'bundle file carries a credential' }
         if (-not $reason -and (Test-Path -LiteralPath $dest -PathType Leaf)) {
             $dstText = $null; $dstOk = $true
-            try { $dstText = [IO.File]::ReadAllText($dest) } catch { $dstOk = $false }
-            if (-not $dstOk) { $reason = 'host file unreadable' }
+            if ((Get-Item -LiteralPath $dest -Force).Length -gt $MaxScanBytes) { $dstOk = $false }
+            else { try { $dstText = [IO.File]::ReadAllText($dest) } catch { $dstOk = $false } }
+            if (-not $dstOk) { $reason = 'host file unreadable or larger than the scan limit' }
             elseif (Test-CredentialText $dstText) { $reason = 'host file carries a credential' }
             elseif (($CredentialRoleFiles -contains $f.Name.ToLowerInvariant()) -and $roleRx.IsMatch($dstText)) { $reason = 'host credential-role file names a credential key' }
         }
@@ -872,8 +875,11 @@ function Invoke-ImportRobocopy {
     $xf = @($skips | ForEach-Object { $_.Source })
     $withSkips = @($Extra)
     if ($xf.Count) {
-        # The skip paths join the file-exclusion list the caller already passed as '/XF <names...>' (a second /XF is also valid robocopy).
-        $withSkips += @('/XF') + $xf
+        # The skip paths join the file-exclusion list the caller already passed as '/XF <names...>': inserted right after that first '/XF'
+        # (a caller with no /XF gets one appended).
+        $at = [Array]::IndexOf($withSkips, '/XF')
+        if ($at -ge 0) { $withSkips = @($withSkips[0..$at]) + $xf + @(if ($at + 1 -lt $withSkips.Count) { $withSkips[($at + 1)..($withSkips.Count - 1)] }) }
+        else { $withSkips += @('/XF') + $xf }
     }
     Invoke-Robocopy $From $To @() $withSkips
 }
@@ -904,18 +910,21 @@ function Invoke-PhaseImport {
         # the same exclusion list is applied on the way IN. A hand-made or tampered bundle cannot overwrite this host's auth.json or
         # .credentials.json, and its sign-in stays the owner's (README step 3).
         $inX = @('/XF') + $ExcludeFiles
-        Invoke-Robocopy "$src\home-claude" "$h\.claude" @() (@('/E') + $inX)
-        Invoke-Robocopy "$src\home-bin" "$h\bin" @() (@('/E') + $inX)
-        Invoke-Robocopy "$src\home-codex" "$h\.codex" @() (@('/E') + $inX)
-        Invoke-Robocopy "$src\programdata-fleetdefender" 'C:\ProgramData\FleetDefender' @() (@('/E') + $inX)
+        # r3 A5: the file name is only the first line of defence; these copies also refuse, by CONTENT and ROLE, any file that carries a credential
+        # or would replace a host file that does (Invoke-ImportRobocopy). The claims and doctrine copies keep their own /XC /XN /XO rules.
+        $script:ImportSkippedDest.Clear()
+        Invoke-ImportRobocopy "$src\home-claude" "$h\.claude" (@('/E') + $inX)
+        Invoke-ImportRobocopy "$src\home-bin" "$h\bin" (@('/E') + $inX)
+        Invoke-ImportRobocopy "$src\home-codex" "$h\.codex" (@('/E') + $inX)
+        Invoke-ImportRobocopy "$src\programdata-fleetdefender" 'C:\ProgramData\FleetDefender' (@('/E') + $inX)
         # The claims folder is copied on its own below, never overwriting a claim this host already has (adversary pass 2, A10): a live local claim
         # replaced by a foreign one of the same name would be quarantined for its absent run dir and the running card would lose its claim.
         $claimsSrc = "$src\project-claude-state\hub-autopilot\claims"
-        Invoke-Robocopy "$src\project-claude-state" "$Repo\.claude-state" @() (@('/E', '/XD', $claimsSrc) + $inX)
+        Invoke-ImportRobocopy "$src\project-claude-state" "$Repo\.claude-state" (@('/E', '/XD', $claimsSrc) + $inX)
         Invoke-Robocopy $claimsSrc "$Repo\.claude-state\hub-autopilot\claims" @() (@('/E', '/XC', '/XN', '/XO') + $inX)
         # MINI3-CUTOVER-STATE-GAPS-1 (b): /XO so a fold marker this host already advanced is never overwritten by the older bundle copy.
         Invoke-Robocopy "$src\project-codex-state\doctrine" "$Repo\.codex-state\doctrine" @() (@('/E', '/XO') + $inX)
-        Invoke-Robocopy "$src\reference" "$StateRoot\reference" @() (@('/E') + $inX)
+        Invoke-ImportRobocopy "$src\reference" "$StateRoot\reference" (@('/E') + $inX)
     }
     # MINI3-CUTOVER-STATE-GAPS-1 (a): claims came across without their fleet-runs run dirs. A claim younger than 6 h with no run dir
     # reads 'receipt state none' and blocks its card, so those claims are quarantined, not carried.
@@ -923,10 +932,16 @@ function Invoke-PhaseImport {
         [void](Move-ForeignClaims -ClaimsDir (Join-Path $Repo '.claude-state\hub-autopilot\claims') -Stamp $stamp)
     }
     if ($h -ine $SourceUserProfile) {
+        # r3 A5: when the bundle's settings.json was NOT applied (the host's own credential-bearing one stayed), there is nothing of the bundle to
+        # rewrite, and rewriting the host's file would touch a credential-bearing file the Import just refused to replace.
+        if ($script:ImportSkippedDest -contains "$h\.claude\settings.json") {
+            Write-Log "skipped the settings.json profile rewrite: the bundle's settings.json was not applied (IMPORT_SKIPPED_CREDENTIAL_FILE), the host's file stays as it is"
+        } else {
         Invoke-Step "Rewrite $SourceUserProfile -> $h in ~/.claude/settings.json" {
             $p = "$h\.claude\settings.json"; $t = [IO.File]::ReadAllText($p)
             $t = $t.Replace('C:/Users/obabalola', ($h -replace '\\', '/')).Replace('C:\\Users\\obabalola', ($h -replace '\\', '\\'))
             [IO.File]::WriteAllText($p, $t, [Text.UTF8Encoding]::new($false))
+        }
         }
         Write-Log "profile differs from VIRTUAL-TEN ($SourceUserProfile). The TRACKED $Repo\.claude\settings.json hard-codes C:/Users/obabalola/AppData/Local/Python/bin/python.exe, so project hooks will fail here. Prefer an OS user named obabalola; else fix the project file in a PR." 'MANUAL'
     }
@@ -1066,6 +1081,40 @@ function Get-MeterInstallSpecs {
     )
 }
 
+# r3 A7: what a meter task looked like before its -Install. Existed / WasEnabled (existed and not Disabled) / Xml (kept only for a task that
+# existed Disabled, so its own gated action can be put back). A read that fails counts as "task absent" for Existed but leaves WasEnabled false,
+# so the after-step still disables whatever the install created.
+function Get-MeterTaskSnapshot {
+    param([string]$Name)
+    $t = $null
+    try { $t = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction SilentlyContinue } catch { $t = $null }
+    $snap = @{ Existed = [bool]$t; WasEnabled = $false; Xml = $null }
+    if ($t) {
+        $snap.WasEnabled = ("$($t.State)" -ne 'Disabled')
+        if (-not $snap.WasEnabled) { try { $snap.Xml = [string](Export-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop) } catch { $snap.Xml = $null } }
+    }
+    return $snap
+}
+
+# After the child -Install (any exit code): a task that was not enabled before and is enabled now goes back to Disabled, the rule Invoke-PhaseTasks
+# applies (registered Disabled, enabled only when it was enabled before). A task the owner had enabled is left alone; an unchanged one is a no-op.
+function Restore-MeterTaskState {
+    param([string]$Name, [hashtable]$Before)
+    if ($Before.WasEnabled) { return }
+    $now = $null
+    try { $now = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction SilentlyContinue } catch { $now = $null }
+    if (-not $now -or "$($now.State)" -eq 'Disabled') { return }
+    try {
+        if ($Before.Xml) { [void](Register-ScheduledTask -TaskName $Name -TaskPath '\' -Xml $Before.Xml -Force -ErrorAction Stop) }
+        $again = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction SilentlyContinue
+        if ($again -and "$($again.State)" -ne 'Disabled') { [void](Disable-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop) }
+        Write-Log "METER_TASK_RESTORED_DISABLED $Name (it was $(if ($Before.Existed) { 'Disabled' } else { 'absent' }) before -Install; the install had enabled it outside the gate)" 'WARN'
+    } catch {
+        Write-Log "METER_TASK_LEFT_ENABLED $Name (could not put it back Disabled: $($_.Exception.Message)); disable it by hand: Disable-ScheduledTask -TaskName $Name" 'ERROR'
+        $script:Failures.Add("METER_TASK_LEFT_ENABLED $Name")
+    }
+}
+
 function Invoke-MeterInstalls {
     if ($env:COMPUTERNAME -ieq $SourceHost -and -not $Force) { Write-Log "meter -Install skipped: $SourceHost is the source host (its tasks are live; pass -Force to run it there)"; return }
     # Those -Install scripts register their task ENABLED and not behind this script's gate (they are board-root scripts, outside this PR), so the PAUSED kill
@@ -1076,10 +1125,14 @@ function Invoke-MeterInstalls {
         if (-not (Test-Path -LiteralPath $m.Script -PathType Leaf)) { Write-Log "meter -Install skipped: $($m.Name) script absent ($($m.Script)); run -Phase Import first" 'WARN'; continue }
         if ($WhatIfPreference) { Write-Log "SKIP (WhatIf) meter -Install $($m.Name)"; continue }
         if (-not $pwsh) { Write-Log "meter -Install skipped: pwsh missing ($($m.Name))" 'WARN'; continue }
+        # r3 A7: snapshot the task BEFORE the child -Install (which registers it ENABLED, outside this script's gate); afterwards a task that was not
+        # enabled before is put back Disabled (see Restore-MeterTaskState).
+        $before = Get-MeterTaskSnapshot -Name $m.Name
         Write-Log "DO   meter -Install $($m.Name) ($($m.Script))"
         $out = @(& $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $m.Script -Install 2>&1 | ForEach-Object { "$_" })
         $code = $LASTEXITCODE
         foreach ($o in $out) { if ($o.Trim()) { Write-Log "    $($o.TrimEnd())" } }
+        Restore-MeterTaskState -Name $m.Name -Before $before
         if ($code -eq 0) { Write-Log "meter -Install ok: $($m.Name)" 'OK'; continue }
         if (($out -join "`n") -match 'SBP windowless launcher is absent') {
             Write-Log "METER_INSTALL_UNSUPPORTED_HOST $($m.Name) (its -Install needs the approved SBP windowless launcher, absent on $env:COMPUTERNAME; nothing was written; OPEN: make the board-root -Install work without it)" 'WARN'
