@@ -620,12 +620,18 @@ function Invoke-PhaseQt {
 # Phase: Export (SOURCE machine). Read-only towards tasks, hooks and the repo; writes only under
 # $ExportDir. Secrets, credentials, auth tokens, ssh keys and session transcripts never enter it.
 # ---------------------------------------------------------------------------------------------
+$CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|TOKEN|CREDENTIAL'
+$CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\s]{4,}"|''[^''\s]{4,}'')'
+# Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
+$CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 $SecretPatterns = @(
     'sk-ant-[A-Za-z0-9_\-]{20,}', 'sk-proj-[A-Za-z0-9_\-]{20,}', 'sk-[A-Za-z0-9]{40,}',
     'gh[pousr]_[A-Za-z0-9]{30,}', 'github_pat_[A-Za-z0-9_]{30,}', 'xox[abprs]-[A-Za-z0-9\-]{10,}',
     '-----BEGIN [A-Z ]*PRIVATE KEY-----', '"(access|refresh|id)_?[Tt]oken"\s*:\s*"[^"]{16,}"', 'AKIA[0-9A-Z]{16}',
     # A secret VALUE under a name that says what it is (adversary pass 2, A15): an AWS secret access key has no recognisable shape of its own.
-    '(?i)"?[A-Z0-9_]*(SECRET|PASSWORD|PASSWD|PRIVATE_?KEY)[A-Z0-9_]*"?\s*[:=]\s*"[^"\s]{16,}"'
+    # r3 A4: the name list also covers API/ACCESS/AUTH key, TOKEN and CREDENTIAL; either quote style; a value of 4 or more characters (a short
+    # password is still a password). The same text is the host-side credential test Import applies (Test-CredentialText).
+    $CredentialNameValuePattern
 )
 $ExcludeFiles = @('*.log', '*.err', '*.bak*', '*.tmp', '*.lock', '*.pid', '*.sqlite*', '*.jsonl', '.credentials.json', '.claude.json',
     'auth.json', '*.pem', '*.pfx', '*.p12', '*.key', '*.ppk', 'id_rsa*', 'id_ed25519*', '*_id', '*_id.pub', '*.kdbx', '.env', '*.env',
@@ -669,7 +675,8 @@ function Test-StagedBundleClean {
         $res = Invoke-StagedSecretScan -Stage $Stage
         $clean = ($res.Uncleared.Count -eq 0)
         try { Write-AsciiFile (Join-Path $Stage 'SECRET-SCAN.txt') ("removed $($res.Removed.Count) file(s) that matched a credential pattern or could not be scanned:`r`n" + ($res.Removed -join "`r`n") + "`r`n") }
-        catch { Write-Log "could not write SECRET-SCAN.txt: $($_.Exception.Message)" 'WARN' }
+        # r3 A3: a bundle whose scan report cannot be written is NOT clean, even when every file scanned clean: the report is what the owner reviews before transfer.
+        catch { $clean = $false; Write-Log "could not write SECRET-SCAN.txt (the bundle is NOT clean and will not be archived): $($_.Exception.Message)" 'ERROR' }
         Write-Log "secret scan removed $($res.Removed.Count) file(s) (see SECRET-SCAN.txt; review before transfer)" $(if ($res.Removed.Count) { 'WARN' } else { 'OK' })
         if (-not $clean) { Write-Log "secret scan could not clear $($res.Uncleared.Count) file(s): $($res.Uncleared -join '; ')" 'ERROR' }
         return $clean
@@ -817,6 +824,62 @@ function Move-ForeignClaims {
 # ---------------------------------------------------------------------------------------------
 # Phase: Import (NEW machine). Copies the bundle into place; never touches credentials.
 # ---------------------------------------------------------------------------------------------
+# True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns).
+function Test-CredentialText {
+    param([string]$Text)
+    if (-not $Text) { return $false }
+    return ([regex]::new(($SecretPatterns -join '|'))).IsMatch($Text)
+}
+
+# r3 A5: the full paths of bundle files an Import must NOT copy, judged by CONTENT and ROLE (the file name alone is only the first line of
+# defence, $ExcludeFiles). A bundle file is skipped when
+#   - it carries a credential itself (a handmade or tampered bundle), or
+#   - the file it would replace on this host carries a credential (any name), or
+#   - the file it would replace is a credential-ROLE file (settings.json, config.toml, ...) that names a credential-like key at all.
+# Returns objects { Source; Dest; Reason }. Reads only; a file that cannot be read counts as carrying a credential (fail closed).
+function Get-ImportCredentialSkips {
+    param([string]$SourceDir, [string]$DestDir)
+    $skips = [System.Collections.Generic.List[object]]::new()
+    if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) { return @() }
+    $roleRx = [regex]::new('(?i)(' + $CredentialNameWords + ')')
+    foreach ($f in @(Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        $rel = $f.FullName.Substring($SourceDir.TrimEnd('\').Length).TrimStart('\')
+        $dest = Join-Path $DestDir $rel
+        $reason = ''
+        $srcText = $null
+        try { $srcText = [IO.File]::ReadAllText($f.FullName) } catch { $reason = 'bundle file unreadable' }
+        if (-not $reason -and (Test-CredentialText $srcText)) { $reason = 'bundle file carries a credential' }
+        if (-not $reason -and (Test-Path -LiteralPath $dest -PathType Leaf)) {
+            $dstText = $null; $dstOk = $true
+            try { $dstText = [IO.File]::ReadAllText($dest) } catch { $dstOk = $false }
+            if (-not $dstOk) { $reason = 'host file unreadable' }
+            elseif (Test-CredentialText $dstText) { $reason = 'host file carries a credential' }
+            elseif (($CredentialRoleFiles -contains $f.Name.ToLowerInvariant()) -and $roleRx.IsMatch($dstText)) { $reason = 'host credential-role file names a credential key' }
+        }
+        if ($reason) { $skips.Add([pscustomobject]@{ Source = $f.FullName; Dest = $dest; Reason = $reason }) }
+    }
+    return $skips.ToArray()
+}
+
+# One Import copy that refuses credential-bearing files (r3 A5). Skips are full-path /XF entries; each is logged as IMPORT_SKIPPED_CREDENTIAL_FILE.
+function Invoke-ImportRobocopy {
+    param([string]$From, [string]$To, [string[]]$Extra = @())
+    $skips = @(Get-ImportCredentialSkips -SourceDir $From -DestDir $To)
+    foreach ($s in $skips) {
+        Write-Log "IMPORT_SKIPPED_CREDENTIAL_FILE $($s.Dest) ($($s.Reason); the bundle copy $($s.Source) was not applied)" 'WARN'
+        $script:ImportSkippedDest.Add($s.Dest)
+    }
+    $xf = @($skips | ForEach-Object { $_.Source })
+    $withSkips = @($Extra)
+    if ($xf.Count) {
+        # The skip paths join the file-exclusion list the caller already passed as '/XF <names...>' (a second /XF is also valid robocopy).
+        $withSkips += @('/XF') + $xf
+    }
+    Invoke-Robocopy $From $To @() $withSkips
+}
+
+$script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
+
 function Invoke-PhaseImport {
     if (-not (Test-Path -LiteralPath $BundlePath)) {
         Write-Log "no bundle at ${BundlePath}: run -Phase Export on VIRTUAL-TEN and copy the zip here (README step 4), then re-run -Phase Import" 'MANUAL'

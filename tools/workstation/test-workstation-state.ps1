@@ -506,6 +506,95 @@ if ($fnLoaded -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyCon
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $awsStage 'settings.json')) -and (Test-Path -LiteralPath (Join-Path $awsStage 'benign.json'))) 'A15 scan: an AWS secret access key under its name is removed; ordinary settings stay' "removed=$($res.Removed -join ',')"
 } else { Assert-That $false 'A15: Invoke-StagedSecretScan is not defined' }
 
+# ---------------------------------------------------------------- r3 A3: an unwritable SECRET-SCAN.txt alone stops the export zip
+if ($fnLoaded -and (Get-Command Test-StagedBundleClean -ErrorAction SilentlyContinue)) {
+    $r3a3 = New-Scratch 'r3-a3-stage'
+    [IO.File]::WriteAllText((Join-Path $r3a3 'a.txt'), 'plain, nothing secret')
+    $r3a3Report = Join-Path $r3a3 'SECRET-SCAN.txt'
+    [IO.File]::WriteAllText($r3a3Report, 'clean')
+    (Get-Item -LiteralPath $r3a3Report).Attributes = [IO.FileAttributes]::ReadOnly
+    $r3a3Threw = $false; $r3a3Clean = $true
+    try { $r3a3Clean = Test-StagedBundleClean -Stage $r3a3 } catch { $r3a3Threw = $true } finally { (Get-Item -LiteralPath $r3a3Report -Force).Attributes = [IO.FileAttributes]::Normal }
+    Assert-That (-not $r3a3Threw -and -not $r3a3Clean) 'r3 A3 scan: a CLEAN stage whose SECRET-SCAN.txt cannot be written is NOT clean (isolated: no other dirty file)' "threw=$r3a3Threw clean=$r3a3Clean"
+} else { Assert-That $false 'r3 A3: Test-StagedBundleClean is not defined' }
+
+# ---------------------------------------------------------------- r3 A4: secret NAME list widened; single and double quotes; value minimum 4
+if ($fnLoaded -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyContinue)) {
+    $r3a4 = New-Scratch 'r3-a4-stage'
+    $rows = [ordered]@{
+        'dbpass.json'  = '{"env":{"DB_PASSWORD":"valid-pass-9"}}'
+        'apikey.toml'  = 'api_key = "abcdefghijklmnopqrstuvwx1234567890"'
+        'single.env2'  = "ACCESS_KEY='fake-access-9876'"
+        'authkey.json' = '{"AUTH_KEY": "fake-auth-1234"}'
+        'camel.json'   = '{"apiKey": "fake-camel-5555"}'
+        'tok.json'     = '{"GITHUB_TOKEN": "fake-tok-4321"}'
+        'cred.ini'     = 'DB_CREDENTIAL = "fake-cred-0001"'
+    }
+    foreach ($k in $rows.Keys) { [IO.File]::WriteAllText((Join-Path $r3a4 $k), $rows[$k]) }
+    [IO.File]::WriteAllText((Join-Path $r3a4 'benign.json'), '{"env":{"FOO":"bar","MODEL":"claude","KEYBOARD":"qwerty-layout"}}')
+    $res4 = Invoke-StagedSecretScan -Stage $r3a4
+    foreach ($k in $rows.Keys) { Assert-That (-not (Test-Path -LiteralPath (Join-Path $r3a4 $k))) "r3 A4 scan: $k ($($rows[$k].Substring(0, [Math]::Min(14, $rows[$k].Length)))...) is removed" "removed=$($res4.Removed -join ',')" }
+    Assert-That (Test-Path -LiteralPath (Join-Path $r3a4 'benign.json')) 'r3 A4 scan: ordinary settings with no secret-named key stay' "removed=$($res4.Removed -join ',')"
+} else { Assert-That $false 'r3 A4: Invoke-StagedSecretScan is not defined' }
+
+# ---------------------------------------------------------------- r3 A5: Import never replaces the host's own credential-bearing files (content and role, not file name only)
+$homeA5 = New-Scratch 'r3-a5-home'
+$localSettings = Join-Path $homeA5 '.claude\settings.json'
+$localNotes = Join-Path $homeA5 '.claude\hooks-config.json'
+$localToml = Join-Path $homeA5 '.codex\config.toml'
+[void][IO.Directory]::CreateDirectory((Join-Path $homeA5 '.claude')); [void][IO.Directory]::CreateDirectory((Join-Path $homeA5 '.codex'))
+[IO.File]::WriteAllText($localSettings, '{"env":{"DB_PASSWORD":"local-password"}}')
+[IO.File]::WriteAllText($localNotes, '{"service":{"api_key":"local-api-1234"}}')
+[IO.File]::WriteAllText($localToml, '[auth]' + "`n" + 'token = "local-token-1234"')
+foreach ($p in $localSettings, $localNotes, $localToml) { (Get-Item -LiteralPath $p).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3) }
+$bundleA5 = New-Scratch 'r3-a5-bundle'
+[IO.File]::WriteAllText((Join-Path $bundleA5 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+[void][IO.Directory]::CreateDirectory((Join-Path $bundleA5 'home-claude')); [void][IO.Directory]::CreateDirectory((Join-Path $bundleA5 'home-codex'))
+[IO.File]::WriteAllText((Join-Path $bundleA5 'home-claude\settings.json'), '{"env":{"DB_PASSWORD":"foreign-password"}}')
+[IO.File]::WriteAllText((Join-Path $bundleA5 'home-claude\hooks-config.json'), '{"service":{"api_key":"foreign-api-5678"}}')
+[IO.File]::WriteAllText((Join-Path $bundleA5 'home-claude\CLAUDE.md'), 'owner instructions')
+[IO.File]::WriteAllText((Join-Path $bundleA5 'home-codex\config.toml'), '[auth]' + "`n" + 'token = "foreign-token-5678"')
+$impA5 = Invoke-Setup $homeA5 @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r3-a5-state'), '-Workspace', (New-Scratch 'r3-a5-ws'), '-BundlePath', $bundleA5, '-SourceHost', 'NOT-THIS-HOST')
+Assert-That ($impA5.Exit -eq 0) 'r3 A5 import: the bundle imports (exit 0)' "exit=$($impA5.Exit)`n$($impA5.Out)"
+Assert-That (([IO.File]::ReadAllText($localSettings)) -ceq '{"env":{"DB_PASSWORD":"local-password"}}') 'r3 A5 import: the host''s settings.json (role file with a credential) is not replaced' ([IO.File]::ReadAllText($localSettings))
+Assert-That (([IO.File]::ReadAllText($localNotes)) -ceq '{"service":{"api_key":"local-api-1234"}}') 'r3 A5 import: a host file with an arbitrary name but credential CONTENT is not replaced' ([IO.File]::ReadAllText($localNotes))
+Assert-That (([IO.File]::ReadAllText($localToml)) -match 'local-token-1234') 'r3 A5 import: the host''s ~/.codex/config.toml with a token is not replaced' ([IO.File]::ReadAllText($localToml))
+Assert-That ($impA5.Out.Contains('IMPORT_SKIPPED_CREDENTIAL_FILE')) 'r3 A5 import: each refusal is logged as IMPORT_SKIPPED_CREDENTIAL_FILE' $impA5.Out
+Assert-That ((Test-Path -LiteralPath (Join-Path $homeA5 '.claude\CLAUDE.md')) -and ((Get-Content -LiteralPath (Join-Path $homeA5 '.claude\CLAUDE.md') -Raw).Trim() -ceq 'owner instructions')) 'r3 A5 import: a file with no credential on either side still comes across' $impA5.Out
+
+# ---------------------------------------------------------------- r3 A7: Verify leaves no meter task enabled outside the gate
+if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContinue)) {
+    $SourceHost = 'NOT-THIS-HOST'
+    $markerOf = @{ 'MLV-DiskAutoReclaim' = 'disk-hygiene\installed.marker'; 'MLV-PwshAutoRepin' = 'hub-autopilot\installed.marker' }
+    # Stubs shadow the ScheduledTasks cmdlets for this scope only: nothing here touches a real task. A -Install "enables" its task (the marker file stands for it).
+    function Get-ScheduledTask {
+        [CmdletBinding()] param($TaskName, $TaskPath)
+        $p = $script:StubPrior[$TaskName]
+        if ($p -eq 'ABSENT' -and -not (Test-Path -LiteralPath (Join-Path $script:StubRepo ('.claude-state\' + $markerOf[$TaskName])))) { return $null }
+        $touched = $script:StubTouched.Contains($TaskName)
+        $installed = Test-Path -LiteralPath (Join-Path $script:StubRepo ('.claude-state\' + $markerOf[$TaskName]))
+        $state = if ($touched) { 'Disabled' } elseif ($installed) { 'Ready' } else { $p }
+        return [pscustomobject]@{ TaskName = $TaskName; State = $state }
+    }
+    function Export-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) return '<Task>gated</Task>' }
+    function Register-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath, $Xml, [switch]$Force) [void]$script:StubTouched.Add($TaskName); $script:StubCalls.Add("REGISTER $TaskName") }
+    function Disable-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) [void]$script:StubTouched.Add($TaskName); $script:StubCalls.Add("DISABLE $TaskName") }
+    function Enable-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) $script:StubCalls.Add("ENABLE $TaskName") }
+    function Invoke-A7Run([string]$Name, [hashtable]$Prior) {
+        $wsM = New-MeterRepo $Name $okBody $okBody
+        $script:StubRepo = Join-Path $wsM 'MLV-App'
+        $script:Repo = $script:StubRepo; $Repo = $script:StubRepo
+        $script:StubPrior = $Prior; $script:StubTouched = [Collections.Generic.HashSet[string]]::new(); $script:StubCalls = [Collections.Generic.List[string]]::new()
+        Invoke-MeterInstalls
+        return @{ Disk = (Get-ScheduledTask -TaskName 'MLV-DiskAutoReclaim'); Repin = (Get-ScheduledTask -TaskName 'MLV-PwshAutoRepin') }
+    }
+    $a7 = Invoke-A7Run 'r3-a7-a' @{ 'MLV-DiskAutoReclaim' = 'Disabled'; 'MLV-PwshAutoRepin' = 'ABSENT' }
+    Assert-That ($a7.Disk -and $a7.Disk.State -ceq 'Disabled') 'r3 A7 meters: a task that was Disabled before -Install is Disabled after Verify' "state=$($a7.Disk.State) calls=$($script:StubCalls -join ',')"
+    Assert-That ($a7.Repin -and $a7.Repin.State -ceq 'Disabled') 'r3 A7 meters: a task that was ABSENT before -Install is registered but Disabled after Verify' "state=$($a7.Repin.State) calls=$($script:StubCalls -join ',')"
+    $a7b = Invoke-A7Run 'r3-a7-b' @{ 'MLV-DiskAutoReclaim' = 'Ready'; 'MLV-PwshAutoRepin' = 'Ready' }
+    Assert-That ($script:StubCalls.Count -eq 0 -and $a7b.Disk.State -ceq 'Ready') 'r3 A7 meters: a task the owner had ENABLED is left enabled (no Disable or re-register call)' "calls=$($script:StubCalls -join ',')"
+} else { Assert-That $false 'r3 A7: Invoke-MeterInstalls is not defined' }
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
