@@ -1152,6 +1152,10 @@ class VenueStageNightlyTests(unittest.TestCase):
         # r12: and the call really ran to the deadline (the hash was started and given up on there), never a deadline that failed to parse ending it at once
         self.assertGreater(sec, 3.0, both)
         self.assertIn("could not be hashed: no answer in", out + both, both)
+        # r13 (Grok G20): the wait the hash was given (under the 3.5 s deadline, never the 300 s -ArtifactTimeoutSec), and that the call's end cut it short
+        m = re.search(r"could not be hashed: no answer in ([0-9.]+) s \(the call's end cut the ([0-9.]+) s bound short\)", out)
+        self.assertIsNotNone(m, both)
+        self.assertLess(float(m.group(1)), 3.5, both)
 
     def _r12_seamed_call(self, share: Path, seam: str, args: str, probe: str) -> tuple[str, float, str]:
         ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; & (Get-Module VenueChain) {{ {seam} }}; "
@@ -1201,6 +1205,25 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assert_exit(p, "SHARE_UNREACHABLE")
         self.assertRegex(p.stdout, r"reading [^\r\n]*-build\.json failed: [^\r\n]*another process", p.stdout)
         self.nothing_built_or_submitted()
+
+    def test_r13_g20_a_wait_the_calls_end_clamped_reports_the_wait_it_was_given(self) -> None:
+        # r13 (Grok G20 on #814, VenueChain.psm1:884): Invoke-VenueBoundedRead said "no answer in <TimeoutSec> s" even when -Clock/-EndSec had clamped the wait
+        # (:879), so a 2 s wait under a 20 s bound was reported as 20 s. It reports the wait it actually gave and says the call's end cut it short (as the nightly's
+        # capCut does); an unclamped wait still reports its own -TimeoutSec with no such clause.
+        mod = DRIVER.parent / "VenueChain.psm1"
+        ps = (f"Import-Module '{mod}' -Force -DisableNameChecking; & (Get-Module VenueChain) {{ "
+              "$c = [Diagnostics.Stopwatch]::StartNew(); "
+              "$r = Invoke-VenueBoundedRead -ScriptText 'param($p) [Threading.Thread]::Sleep(8000); 1' -Argument 'x' -TimeoutSec 20 -Clock $c -EndSec 2; "
+              "'CLAMPED=[' + $r.answered + '|' + $r.error + ']'; "
+              "$r = Invoke-VenueBoundedRead -ScriptText 'param($p) [Threading.Thread]::Sleep(8000); 1' -Argument 'x' -TimeoutSec 1.5; "
+              "'PLAIN=[' + $r.answered + '|' + $r.error + ']'; [Environment]::Exit(0) }")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        both = p.stdout + p.stderr
+        m = re.search(r"CLAMPED=\[False\|no answer in ([0-9.]+) s \(the call's end cut the 20 s bound short\)\]", p.stdout)
+        self.assertIsNotNone(m, both)
+        self.assertLessEqual(float(m.group(1)), 2.0, both)
+        self.assertGreater(float(m.group(1)), 1.0, both)
+        self.assertIn("PLAIN=[False|no answer in 1.5 s]", p.stdout, both)
 
     def test_r11_a1_the_nightly_hands_its_deadline_to_the_soundness_read(self) -> None:
         text = DRIVER.read_text(encoding="utf-8")

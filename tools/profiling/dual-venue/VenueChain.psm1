@@ -875,13 +875,15 @@ function Invoke-VenueBoundedRead {
         [void]$ps.AddArgument($Argument)
         $async = $ps.BeginInvoke()
         if ($script:VenueTestPreWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreWaitDelayMs) }
-        $waitSec = $TimeoutSec
-        if ($null -ne $Clock) { $waitSec = [Math]::Max(0.0, [Math]::Min($waitSec, $EndSec - $Clock.Elapsed.TotalSeconds)) }
+        # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
+        $waitSec = $TimeoutSec; $endCut = $false
+        if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
         if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
-            return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $([Math]::Round($TimeoutSec, 2)) s" }
+            return [pscustomobject]@{ answered = $false; value = @()
+                error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
         }
         # r12 fix iteration (adversary A2 on 09421b77): a caller descheduled past its fixed end finds the worker done and WaitOne(0) true; an answer the caller
         # sees only after -EndSec is never acted on (the worker finished, so it is disposed as usual)
