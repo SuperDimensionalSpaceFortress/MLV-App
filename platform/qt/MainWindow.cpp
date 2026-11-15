@@ -4616,6 +4616,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         // CPU-LOOKASSIST-PLAYBACK-COST-1: which pointwise loop ran, on what team, and why not the fast one.
         spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_fast"), cpuRoute.spans.pointwiseFast );
         spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_omp_threads"), cpuRoute.spans.pointwiseOmpThreads );
+        // CPU-S1-PREP-POINTWISE-LEVER-1: last minus first thread to finish its pixel chunks.
+        spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_team_skew_ms"), cpuRoute.spans.pointwiseTeamSkewMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_fast_refusal"),
                               QString::fromLatin1( cpuRoute.spans.pointwiseFastRefusal ) );
         spanTelemetry.insert( QStringLiteral("playback_prep_stage_mask"),
@@ -28559,6 +28561,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         spans.reduceMs += telemetryDoubleValue( timing, "playback_prep_reduce_ms" );
         spans.shExpandMs += telemetryDoubleValue( timing, "playback_prep_sh_expand_ms" );
         spans.pointwiseMs += telemetryDoubleValue( timing, "playback_prep_pointwise_ms" );
+        spans.pointwiseTeamSkewMs += telemetryDoubleValue( timing, "playback_prep_pointwise_team_skew_ms" );
         spans.chromaMs += telemetryDoubleValue( timing, "playback_prep_chroma_ms" );
         spans.sharpenMs += telemetryDoubleValue( timing, "playback_prep_sharpen_ms" );
         spans.medianMs += telemetryDoubleValue( timing, "playback_prep_median_ms" );
@@ -31831,7 +31834,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                             "avg_playback_prep_region_image_magenta_ms=%5 "
                             "avg_playback_prep_region_image_hash_ms=%6 "
                             "avg_playback_prep_region_image_set_pixmap_ms=%7 "
-                            "avg_playback_prep_region_image_release_ms=%8" )
+                            "avg_playback_prep_region_image_release_ms=%8 "
+                            "avg_playback_prep_pointwise_team_skew_ms=%9" )
                 .arg( avgCpuRouteMs( spans.handoffMs ), 0, 'f', 3 )
                 .arg( spans.handoffBorrowedRgb16Frames )
                 .arg( spans.handoffOwnedRgb16Bytes )
@@ -31839,7 +31843,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                 .arg( avgCpuRouteMs( spans.regionImageMagentaMs ), 0, 'f', 3 )
                 .arg( avgCpuRouteMs( spans.regionImageHashMs ), 0, 'f', 3 )
                 .arg( avgCpuRouteMs( spans.regionImageSetPixmapMs ), 0, 'f', 3 )
-                .arg( avgCpuRouteMs( spans.regionImageReleaseMs ), 0, 'f', 3 );
+                .arg( avgCpuRouteMs( spans.regionImageReleaseMs ), 0, 'f', 3 )
+                // CPU-S1-PREP-POINTWISE-LEVER-1: same denominator as avg_playback_prep_pointwise_ms.
+                .arg( avgSmokeMs( spans.pointwiseTeamSkewMs ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.prep_summary session=%1 frames=%2 cpu_route_frames=%3 "

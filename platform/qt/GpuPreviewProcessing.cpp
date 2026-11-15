@@ -4745,16 +4745,24 @@ inline void pointwiseFastPixel(const PointwiseFastView & v,
     }
 }
 
+/* CPU-S1-PREP-POINTWISE-LEVER-1: pixels per dynamic chunk of the pixel loops.
+ * GOMP_SPINCOUNT=0 makes a static region end with its slowest (preempted)
+ * thread; dynamic chunks let the idle threads take the remainder. */
+constexpr int kPointwiseFastChunkPixels = 8192;
+
 /* One frame through the fast path on an explicit team of
  * mlvappEffectivePlaybackWorkerThreadCount() threads: the table fill, then the
- * pixels (independent writes, so the team size cannot change a byte). Out8
- * stores the developed value >> 8. Returns the team size read inside the region. */
+ * pixels (independent writes, so the team size and the chunk order cannot
+ * change a byte). Out8 stores the developed value >> 8. Returns the team size
+ * read inside the region; teamSkewMs (nullable) receives the spread between the
+ * first and the last thread to finish its pixel chunks. */
 template <bool kOut8>
 int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
                      const uint16_t * inputRgb16,
                      uint16_t * output16,
                      uint8_t * output8,
-                     int pixelCount)
+                     int pixelCount,
+                     double * teamSkewMs)
 {
     PointwiseFastTables & tables = mlvThreadExitCache<PointwiseFastTables>();
     PointwiseFastView view;
@@ -4765,9 +4773,13 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
                          && !view.highlightRecon && !view.saturation;
     const int requested = std::max(1, mlvappEffectivePlaybackWorkerThreadCount());
     int team = 1;
+    std::vector<qint64> ends(static_cast<size_t>(requested), -1);
+    QElapsedTimer skewClock;
+    skewClock.start();
     #pragma omp parallel num_threads(requested) if(pixelCount >= 2048)
     {
         if ( omp_get_thread_num() == 0 ) team = omp_get_num_threads();
+        /* Static and WITH its implicit barrier: every pixel reads the tables. */
         #pragma omp for schedule(static)
         for (int index = 0; index < 65536; ++index)
         {
@@ -4775,7 +4787,7 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
         }
         if ( lookAssist )
         {
-            #pragma omp for schedule(static)
+            #pragma omp for schedule(dynamic, kPointwiseFastChunkPixels) nowait
             for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
             {
                 uint16_t developed[3];
@@ -4795,7 +4807,7 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
         }
         else
         {
-            #pragma omp for schedule(static)
+            #pragma omp for schedule(dynamic, kPointwiseFastChunkPixels) nowait
             for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
             {
                 uint16_t developed[3];
@@ -4813,6 +4825,20 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
                 }
             }
         }
+        const int self = omp_get_thread_num();
+        if ( self >= 0 && self < requested ) ends[static_cast<size_t>(self)] = skewClock.nsecsElapsed();
+    }
+    if ( teamSkewMs )
+    {
+        qint64 first = -1;
+        qint64 last = -1;
+        for (const qint64 end : ends)
+        {
+            if ( end < 0 ) continue;
+            if ( first < 0 || end < first ) first = end;
+            if ( end > last ) last = end;
+        }
+        *teamSkewMs = first < 0 ? 0.0 : static_cast<double>(last - first) / 1.0e6;
     }
     return team;
 }
@@ -4858,9 +4884,10 @@ void applyCpuReferenceTimedImpl(const GpuPreviewProcessingConfig & configIn,
     qint64 spanStartNs = clock.nsecsElapsed();
     const char * refusal = allowFast ? gpuPreviewProcessingPointwiseFastRefusal(config) : "reference_oracle";
     int team = 0;
+    double teamSkewMs = 0.0;
     if ( refusal[0] == '\0' )
     {
-        team = pointwiseFastRun<false>(config, inputRgb16, outputRgb16, nullptr, pixelCount);
+        team = pointwiseFastRun<false>(config, inputRgb16, outputRgb16, nullptr, pixelCount, &teamSkewMs);
     }
     else
     {
@@ -4881,6 +4908,7 @@ void applyCpuReferenceTimedImpl(const GpuPreviewProcessingConfig & configIn,
         spans->pointwiseMs = cpuReferenceSpanMs(clock, spanStartNs);
         spans->pointwiseFast = refusal[0] == '\0';
         spans->pointwiseOmpThreads = team;
+        spans->pointwiseTeamSkewMs = teamSkewMs;
         spans->pointwiseFastRefusal = refusal;
     }
 
@@ -4982,9 +5010,10 @@ void gpuPreviewProcessingApplyCpuReferenceTo8(const GpuPreviewProcessingConfig &
      * 16-to-8 conversion applies to the same 16-bit value. */
     const char * refusal = gpuPreviewProcessingPointwiseFastRefusal(config);
     int team = 0;
+    double teamSkewMs = 0.0;
     if ( refusal[0] == '\0' )
     {
-        team = pointwiseFastRun<true>(config, inputRgb16, nullptr, outputRgb8, pixelCount);
+        team = pointwiseFastRun<true>(config, inputRgb16, nullptr, outputRgb8, pixelCount, &teamSkewMs);
     }
     else
     {
@@ -5008,6 +5037,7 @@ void gpuPreviewProcessingApplyCpuReferenceTo8(const GpuPreviewProcessingConfig &
         spans->pointwiseMs = cpuReferenceSpanMs(clock, pointwiseStartNs);
         spans->pointwiseFast = refusal[0] == '\0';
         spans->pointwiseOmpThreads = team;
+        spans->pointwiseTeamSkewMs = teamSkewMs;
         spans->pointwiseFastRefusal = refusal;
     }
 }

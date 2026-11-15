@@ -1644,6 +1644,8 @@ private:
         double reduceMs = 0.0;
         double shExpandMs = 0.0;
         double pointwiseMs = 0.0;
+        // CPU-S1-PREP-POINTWISE-LEVER-1: sum of the pointwise team's finish spread.
+        double pointwiseTeamSkewMs = 0.0;
         double chromaMs = 0.0;
         double sharpenMs = 0.0;
         double medianMs = 0.0;

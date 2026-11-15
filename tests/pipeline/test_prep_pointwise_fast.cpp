@@ -957,6 +957,76 @@ TEST(PrepPointwiseFast, AgxOnLookAssistShapesAreAdmittedAndByteIdenticalAtFullSi
     checkConfig("m16_la_off_agx_on", laOff, frame, kFullWidth, kFullHeight, "");
 }
 
+/* CPU-S1-PREP-POINTWISE-LEVER-1: the pixel loops take dynamic chunks of 8192
+ * pixels. 1808x2268 = 4,100,544 px is not a multiple of 8192, so the partial
+ * last chunk runs; an odd team (3) and the production team (16) both match the
+ * reference byte for byte, and the team skew the pass reports is a finite,
+ * non-negative span (its size is never asserted). */
+TEST(PrepPointwiseFast, DynamicScheduleIsByteIdenticalAtOddAndProductionTeams)
+{
+    ASSERT_TRUE((kFullWidth * kFullHeight) % 8192 != 0);
+    const std::vector<uint16_t> frame = makeSyntheticFrame(kFullWidth, kFullHeight, 0x1243u);
+    const std::vector<uint16_t> blur = makeBlockBlur(frame, kFullWidth, kFullHeight);
+
+    MlvPipelineFixture laOnFixture;
+    openFixture(laOnFixture);
+    const GpuPreviewProcessingConfig laOn = buildLookAssistOnConfig(laOnFixture, blur, kFullWidth, kFullHeight);
+    MlvPipelineFixture cinematicFixture;
+    openFixture(cinematicFixture);
+    const GpuPreviewProcessingConfig cinematic = buildLookAssistOnConfig(
+        cinematicFixture, blur, kFullWidth, kFullHeight, applyM16LookAssistPreset, true);
+
+    struct Shape { const char * label; const GpuPreviewProcessingConfig * config; };
+    for (const Shape & shape : { Shape{ "m16_la_on_agx_off", &laOn }, Shape{ "m16_cinematic_agx_on", &cinematic } })
+    {
+        std::vector<uint16_t> ref(frame.size(), 0);
+        gpuPreviewProcessingApplyCpuReference(*shape.config, frame.data(), ref.data(), kFullWidth, kFullHeight);
+        for (int threads : { 3, 16 })
+        {
+            const std::string tag = std::string(shape.label) + ".team" + std::to_string(threads);
+            const std::string threadText = std::to_string(threads);
+            EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
+            EnvScope forced("MLVAPP_FORCE_THREADS", threadText.c_str());
+            EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
+
+            GpuPreviewProcessingCpuSpans spans;
+            std::vector<uint16_t> out16(frame.size(), 0);
+            gpuPreviewProcessingApplyCpuReferenceTimed(*shape.config, frame.data(), out16.data(),
+                                                       kFullWidth, kFullHeight, &spans);
+            ASSERT_TRUE(spans.pointwiseFast);
+            ASSERT_EQ(threads, spans.pointwiseOmpThreads);
+            ASSERT_TRUE(std::isfinite(spans.pointwiseTeamSkewMs) && spans.pointwiseTeamSkewMs >= 0.0);
+            int first = -1;
+            int worst = maxAbsDiff16(out16, ref, &first);
+            if (worst != 0) failDiff(__FILE__, __LINE__, "dynamic Timed 16-bit == reference", tag, worst, first);
+
+            GpuPreviewProcessingCpuSpans spans8;
+            std::vector<uint16_t> scratch(frame.size(), 0);
+            std::vector<uint8_t> out8(frame.size(), 0);
+            gpuPreviewProcessingApplyCpuReferenceTo8(*shape.config, frame.data(), scratch.data(), out8.data(),
+                                                     kFullWidth, kFullHeight, &spans8);
+            ASSERT_TRUE(!spans8.fused8);
+            ASSERT_TRUE(spans8.pointwiseFast);
+            ASSERT_EQ(threads, spans8.pointwiseOmpThreads);
+            ASSERT_TRUE(std::isfinite(spans8.pointwiseTeamSkewMs) && spans8.pointwiseTeamSkewMs >= 0.0);
+            worst = maxAbsDiff8(out8, ref, &first);
+            if (worst != 0) failDiff(__FILE__, __LINE__, "dynamic To8 16-bit route == reference >> 8", tag, worst, first);
+
+            /* The Out8 instantiation's loop too (the fused entry). */
+            GpuPreviewProcessingCpuSpans spansF;
+            std::vector<uint8_t> fused(frame.size(), 0);
+            gpuPreviewProcessingApplyCpuReferenceTo8(*shape.config, frame.data(), nullptr, fused.data(),
+                                                     kFullWidth, kFullHeight, &spansF);
+            ASSERT_TRUE(spansF.fused8);
+            ASSERT_EQ(threads, spansF.pointwiseOmpThreads);
+            ASSERT_TRUE(std::isfinite(spansF.pointwiseTeamSkewMs) && spansF.pointwiseTeamSkewMs >= 0.0);
+            worst = maxAbsDiff8(fused, ref, &first);
+            if (worst != 0) failDiff(__FILE__, __LINE__, "dynamic fused 8-bit == reference >> 8", tag, worst, first);
+        }
+        std::printf("[PREP-FAST] %s dynamic schedule byte-identical at teams 3,16\n", shape.label);
+    }
+}
+
 TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
 {
     const int w = kMatrixWidth;

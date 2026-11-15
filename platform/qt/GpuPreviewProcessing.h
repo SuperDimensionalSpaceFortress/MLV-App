@@ -326,6 +326,9 @@ struct GpuPreviewProcessingCpuSpans
      * why the fast path was refused (static string, "" when it ran). */
     bool pointwiseFast = false;
     int pointwiseOmpThreads = 0;
+    /* CPU-S1-PREP-POINTWISE-LEVER-1: last minus first thread to finish its
+     * fast-path pixel chunks, ms (0 when the reference loop ran). */
+    double pointwiseTeamSkewMs = 0.0;
     const char * pointwiseFastRefusal = "";
 };
 /* CPU-LOOKASSIST-PLAYBACK-COST-1: the prep route's pointwise pass
