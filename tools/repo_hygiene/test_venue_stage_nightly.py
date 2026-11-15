@@ -1067,7 +1067,7 @@ class VenueStageReuseModuleTests(unittest.TestCase):
                       "Write-Output (\"RESULT=SMOKE_RUNNER_STAGE_OK\" + ' ALREADY=2')",
                       # pass 2 A1: the token concatenated after a separate 'RESULT=' literal
                       "if ($env:EXTRA_OK -eq '1') { Write-Output ('RESULT=' + \"SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=$CacheDirName PATH=x\"); exit 0 }"):
-            lines, census = ok_emissions(text.replace(fresh, extra + "\n" + fresh), "SMOKE_RUNNER_STAGE_OK")
+            lines, census = ok_emissions(text.replace(fresh, extra + "\n" + fresh, 1), "SMOKE_RUNNER_STAGE_OK")
             self.assertEqual((len(lines), census), (2, 3), extra)
 
     def test_a_further_plain_stage_ok_form_is_rendered_and_checked_not_a_count_red(self) -> None:
@@ -1076,10 +1076,14 @@ class VenueStageReuseModuleTests(unittest.TestCase):
         path = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-stage-job.ps1"
         text = path.read_text(encoding="utf-8")
         anchor = 'Write-Output "RESULT=STAGE_OK SOURCE='
-        self.assertEqual(text.count(anchor), 1)
-        extra = '            Write-Output "RESULT=STAGE_OK SOURCE=$SourceCommit FILES=0 CACHE=$Cache REUSED=1"'
-        lines, census = ok_emissions(text.replace(anchor, extra.strip() + "\n" + anchor), "STAGE_OK")
-        self.assertEqual((len(lines), census), (2, 2))
+        extra = 'Write-Output "RESULT=STAGE_OK SOURCE=$SourceCommit FILES=0 CACHE=$Cache REUSED=1"'
+        # both merge orders (pass 3 A1): the job as it is here, and the job once #814 has landed its second form
+        for base in (text, text.replace(anchor, extra + "\n" + anchor, 1)):
+            self.assertGreaterEqual(base.count(anchor), 1)    # never an exact count
+            lines0, census0 = ok_emissions(base, "STAGE_OK")
+            self.assertEqual(len(lines0), census0)
+            lines, census = ok_emissions(base.replace(anchor, extra + "\n" + anchor, 1), "STAGE_OK")
+            self.assertEqual((len(lines), census), (len(lines0) + 1, census0 + 1))
         staged, reason, _ = self.reuse(f"RESULT=STAGE_OK SOURCE={SHA} FILES=0 CACHE=x REUSED=1", "Stage", f"playback-attr-3-cuda-stage-{S12}")
         self.assertEqual((staged, reason), ("True", "staged-already"))
 
