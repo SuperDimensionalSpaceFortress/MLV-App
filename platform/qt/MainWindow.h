@@ -1706,9 +1706,24 @@ private:
         double busyMaxMs = 0.0;
         double otherBusySumMs = 0.0;
         double otherBusyMaxMs = 0.0;
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution; salvaged by CPU-S1-PRESENT-INTERVAL-BOUND-1): the gap
+        // that set busyMaxMs -- its start in ms since the measured Play start, and the frame whose present opened it.
+        double busyMaxAtMs = -1.0;
+        long long busyMaxFrame = -1;
     };
     GuiPresentGapTotals m_guiPresentGaps;
-    QElapsedTimer m_guiPresentGapClock;
+    long long m_guiPresentGapFrame = -1;
+    double m_guiPresentGapStartSinceSmokeMs = -1.0;
+    // CPU-S1-PACE-POST-785-LEVER-1 r2 fix iteration 1 (adversary A1 on 482616a5): the gap clock IS the smoke clock
+    // (mlv_stage_timing_now, the clock m_playbackSmokeStartTime is read on), so a gap's opening instant is placed
+    // against the measured Play start with no second clock and no second baseline read. Same interface as the
+    // QElapsedTimer it replaces (start / nsecsElapsed); only differences between two reads are durations.
+    struct GuiPresentGapClock
+    {
+        void start( void ) {}
+        qint64 nsecsElapsed( void ) const;   // mlv_stage_timing_now() in ns (MainWindow.cpp)
+    };
+    GuiPresentGapClock m_guiPresentGapClock;
     qint64 m_guiPresentGapStartNs = -1;
     gui_present_gap::IdleWaits m_guiPresentGapIdle;
     qint64 m_guiPresentGapRunnerSleepNs = 0;

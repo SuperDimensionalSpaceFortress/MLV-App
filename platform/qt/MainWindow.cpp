@@ -5158,7 +5158,20 @@ void MainWindow::openGuiPresentGap( void )
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
     ++m_guiPresentGapSerial;
     m_guiOtherBusySpans.openGap();
-    m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+    m_guiPresentGapFrame = m_lastDisplayedPlaybackFrame;   // the frame whose present opened the gap
+    // CPU-S1-PACE-POST-785-LEVER-1 fix iteration 2 (adversary A1 on fb4d13fe): the gap's opening instant on the smoke clock,
+    // stamped here once; the close never reads a second clock to place it.
+    // r2 (adversary A1 on 89e3a9d1 and on 482616a5): ONE read of the gap clock arms the gap and places it. The gap
+    // clock is the smoke clock (GuiPresentGapClock), so the zero is m_playbackSmokeStartTime itself: no baseline read.
+    const qint64 gapOpenNs = m_guiPresentGapClock.nsecsElapsed();
+    m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs ) / 1000000.0 - m_playbackSmokeStartTime * 1000.0;
+    m_guiPresentGapStartNs = gapOpenNs;
+}
+
+// The gap clock reads the smoke clock (MainWindow.h GuiPresentGapClock).
+qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const
+{
+    return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );
 }
 
 // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
@@ -5205,6 +5218,13 @@ void MainWindow::closeGuiPresentGap( void )
     gaps.idleSumMs += split.idleMs;
     gaps.runnerSleepSumMs += split.runnerSleepMs;
     gaps.busySumMs += split.busyMs;
+    if( gaps.gaps == 1 || split.busyMs > gaps.busyMaxMs )
+    {
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): where the longest busy gap sat. Its start,
+        // in ms since the measured Play start (stamped at open).
+        gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;
+        gaps.busyMaxFrame = m_guiPresentGapFrame;
+    }
     gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
     gaps.otherBusySumMs += split.otherBusyMs;
     gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
@@ -31970,6 +31990,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         }
         otherBusySplit += QStringLiteral( " avg_gui_other_busy_unattributed_ms=%1" )
                               .arg( avgOver( m_guiOtherBusySpans.unattributedSumMs, gaps.gaps ), 0, 'f', 3 );
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): the gap behind max_gui_busy_ms, appended.
+        otherBusySplit += QStringLiteral( " max_gui_busy_at_ms=%1 max_gui_busy_frame=%2" )
+                              .arg( gaps.busyMaxAtMs, 0, 'f', 3 )
+                              .arg( gaps.busyMaxFrame );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gui_present_summary session=%1 frames=%2 "

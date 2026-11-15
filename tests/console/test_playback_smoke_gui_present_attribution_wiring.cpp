@@ -1384,3 +1384,60 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     ASSERT_EQ(1, calls);
     preview_paint_timing::reset();
 }
+
+// ---- #813 salvage (CPU-S1-PACE-POST-785-LEVER-1, 8c632800): max_gui_busy_at_ms / max_gui_busy_frame -------------
+
+TEST(GuiPresentAttributionWiring, MaxBusyGapFieldsAreAppendedAfterTheUnattributedSplit)
+{
+    const QString finish = finishSmokeBody();
+    ASSERT_FALSE(finish.isEmpty());
+    const int unattributed = finish.indexOf(QStringLiteral("QStringLiteral( \" avg_gui_other_busy_unattributed_ms=%1\" )"));
+    const int freeze = finish.indexOf(QStringLiteral("QStringLiteral( \" max_gui_busy_at_ms=%1 max_gui_busy_frame=%2\" )"));
+    const int format = finish.indexOf(QStringLiteral("\"playback_smoke.gui_present_summary session=%1 frames=%2 \""));
+    const int appended = finish.indexOf(QStringLiteral("+ otherBusySplit;"));
+    ASSERT_TRUE(unattributed > 0);
+    ASSERT_TRUE(freeze > unattributed);   // after avg_gui_other_busy_unattributed_ms, the last field before it
+    ASSERT_TRUE(format > freeze);         // the builder precedes the format, which appends it at the end
+    ASSERT_TRUE(appended > format);
+    for (const char *field : { "max_gui_busy_at_ms=%", "max_gui_busy_frame=%" })
+        ASSERT_EQ(1, finish.count(QLatin1String(field)));
+    // The lever's bucket field is not part of this salvage.
+    ASSERT_FALSE(finish.contains(QStringLiteral("max_gui_other_busy_bucket")));
+    ASSERT_TRUE(finish.contains(QStringLiteral(".arg( gaps.busyMaxAtMs, 0, 'f', 3 )\n                              .arg( gaps.busyMaxFrame );")));
+}
+
+TEST(GuiPresentAttributionWiring, MaxBusyGapStartIsStampedAtOpenOnTheSmokeClock)
+{
+    // Adversary A1 on fb4d13fe (8c632800's history): smoke start 100.000 s, the gap opens at 101.000 s and closes at
+    // 101.020 s, then the GUI thread is descheduled 500 ms before a second clock read at the close: start = 1500 ms,
+    // outside the gap [1000, 1020]. The start is the opening instant, stamped once in openGuiPresentGap, on the smoke
+    // clock itself (r2 fix iteration 1, adversary A1 on 482616a5: no separate baseline read).
+    const QString mw = mainWindowSource();
+    const QString open = bracedBlockAfter(mw, QStringLiteral("void MainWindow::openGuiPresentGap( void )"));
+    const QString close = closeGapBody();
+    ASSERT_FALSE(open.isEmpty());
+    ASSERT_FALSE(close.isEmpty());
+    const int armed = open.indexOf(QStringLiteral("if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;"));
+    const int stamp = open.indexOf(QStringLiteral(
+        "m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs ) / 1000000.0 - m_playbackSmokeStartTime * 1000.0;"));
+    const int start = open.indexOf(QStringLiteral("m_guiPresentGapStartNs = gapOpenNs;"));
+    ASSERT_EQ(1, open.count(QStringLiteral("m_guiPresentGapClock.nsecsElapsed()")));
+    ASSERT_FALSE(open.contains(QStringLiteral("mlv_stage_timing_now()")));
+    ASSERT_TRUE(armed > 0);
+    ASSERT_TRUE(stamp > armed);
+    ASSERT_TRUE(start > stamp);
+    ASSERT_TRUE(open.contains(QStringLiteral("m_guiPresentGapFrame = m_lastDisplayedPlaybackFrame;")));
+    ASSERT_TRUE(close.contains(QStringLiteral("if( gaps.gaps == 1 || split.busyMs > gaps.busyMaxMs )")));
+    ASSERT_TRUE(close.contains(QStringLiteral("gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;")));
+    ASSERT_TRUE(close.contains(QStringLiteral("gaps.busyMaxFrame = m_guiPresentGapFrame;")));
+    ASSERT_TRUE(close.indexOf(QStringLiteral("gaps.busyMaxAtMs =")) < close.indexOf(QStringLiteral("gaps.busyMaxMs = qMax(")));
+    ASSERT_FALSE(close.contains(QStringLiteral("mlv_stage_timing_now()")));
+    const QString begin = beginSmokeBody();
+    ASSERT_TRUE(begin.contains(QStringLiteral("m_playbackSmokeStartTime = mlv_stage_timing_now();")));
+    ASSERT_FALSE(begin.contains(QStringLiteral("m_guiPresentGapClock")));
+    const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(h.contains(QStringLiteral("GuiPresentGapClock m_guiPresentGapClock;")));
+    ASSERT_FALSE(h.contains(QStringLiteral("QElapsedTimer m_guiPresentGapClock;")));
+    const QString clock = bracedBlockAfter(mw, QStringLiteral("qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const"));
+    ASSERT_TRUE(clock.contains(QStringLiteral("return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );")));
+}
