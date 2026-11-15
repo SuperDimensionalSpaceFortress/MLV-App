@@ -305,6 +305,9 @@ if ($JobId -like 'lease-batch-open-*') {
         $lb0 = $adm['leaseBatch']; $w = [string]$env:FAKE_OPEN_LB_WRAP
         if ($w -eq 'array') { $adm['leaseBatch'] = @($lb0) } elseif ($w -eq 'nullplus') { $adm['leaseBatch'] = @($null, $lb0) } elseif ($w -eq 'nested') { $adm['leaseBatch'] = @(,@($lb0)) }
     }
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r10 (adversary-49bf0ddc.json A1): FAKE_OPEN_LB_EMPTY=1 publishes leaseBatch as {} (there, naming no lease); FAKE_OPEN_LABEL overrides the label
+    if ($env:FAKE_OPEN_LB_EMPTY -eq '1') { $adm['leaseBatch'] = [ordered]@{} }
+    if ($env:FAKE_OPEN_LABEL) { $adm['label'] = [string]$env:FAKE_OPEN_LABEL }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
     $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
@@ -324,6 +327,7 @@ if ($JobId -like 'lease-batch-open-*') {
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $openEnded; admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
     # r5 pass 3 (adversary r5 pass 2 A1): FAKE_OPEN_ADM_WRAP=array publishes the whole admission inside a one-element array
     if ($env:FAKE_OPEN_ADM_WRAP -eq 'array') { $res.admission = @($res.admission) }
+    if ($env:FAKE_OPEN_ADM_WRAP -eq 'empty') { $res.admission = @() }   # r10 (adversary-49bf0ddc.json A1): admission:[]
     if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
     if ($mode -eq 'gatehold') {
         # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
@@ -1862,6 +1866,26 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 self.assertEqual((b["endReason"], b["openOutcome"], b["legsAttempted"]), ("OPEN_FAILED", "ERROR", 0), b)
                 self.assertEqual((b["openCancel"]["state"], b["leaseId"]), (want_state, want_lease), b["openCancel"])
                 self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), (want_basis, want_lease), b["ledger"])
+
+    def test_lease_batch_idle_end_r10_adv_49bf0ddc_a1_an_unnamed_or_malformed_lease_is_charged_whatever_the_open_classifies_as(self) -> None:
+        # adversary-49bf0ddc.json A1: the OPEN_FAILED branch (exit, label, or `admission:[]`, which the `$adm` read unrolls to $null) won before the malformed/unnamed branches that
+        # set the unnamed charge, and in the cancel reconcile a cancelled-in-gate label won before a leaseBatch that is there: both closed the token with no ledger row for a
+        # lease the agent may hold under it. Now charged open-lease-unnamed, open to close, with no lease id.
+        for shape, env, extra, want_code, want_cancel in (
+                ("immediate-admission-empty-array", {"FAKE_OPEN_ADM_WRAP": "empty"}, (), 9, None),
+                ("immediate-cancelled-label-empty-leasebatch", {"FAKE_OPEN_LABEL": "cancelled-in-gate", "FAKE_OPEN_LB_EMPTY": "1"}, (), 9, None),
+                ("reconciled-cancelled-label-empty-leasebatch", {"FAKE_OPEN_MODES": "errlanded", "FAKE_OPEN_LABEL": "cancelled-in-gate", "FAKE_OPEN_LB_EMPTY": "1"},
+                 ("-CancelReconcileSec", "3"), 9, "RAN_LEASE_UNNAMED")):
+            with self.subTest(shape=shape):
+                self.setUp()
+                r = self.run_batch(self.specs[:1], *extra, **env)
+                self.assertEqual(r.returncode, want_code, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"], b["leaseId"]), ("OPEN_FAILED", 0, None), b)
+                if want_cancel:
+                    self.assertEqual(b["openCancel"]["state"], want_cancel, b["openCancel"])
+                self.assertIsNotNone(b["ledger"], f"{shape}: a lease the agent may hold under the token was closed with no ledger row")
+                self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), ("open-lease-unnamed", None), b["ledger"])
 
     def test_lease_batch_idle_end_r5_adv_a1_the_lease_batch_reader_takes_one_object_or_none(self) -> None:
         # the class: Get-AdmissionLeaseBatch reads admission.leaseBatch as ONE object (OBJECT), none (ABSENT) or something else that is there (MALFORMED); Get-PublishedIdleBound

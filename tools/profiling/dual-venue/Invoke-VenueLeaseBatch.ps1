@@ -2264,6 +2264,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $script:guardBudget = $openGuard
         $openHit = Test-OpenOutputAlias
         $script:guardBudget = $null
+        # r10 (adversary-49bf0ddc.json A1): an admission or leaseBatch that is there but is not ONE object, or a leaseBatch object that names no usable lease for this token, may be
+        # a lease the agent took under the token: the finally charges it open-lease-unnamed WHATEVER the classification below says. The OPEN_FAILED branch (exit, label, or an
+        # `admission:[]` that the `$adm` read unrolls to $null) used to win first and charge nothing. A usable named lease is the branches' own (they set $b.leaseId).
+        if ($null -ne $op.result -and ($openLb.state -ceq 'MALFORMED' -or ($openLb.state -ceq 'OBJECT' -and (-not [string]::Equals([string]$openLb.value.token, $token, [StringComparison]::Ordinal) -or -not $openLb.value.leaseId)))) { $openLeaseUnnamed = $true }
         if ($op.outcome -ceq 'NOT_SUBMITTED' -and $crossed) {
             $b.endReason = 'DEADLINE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
             Set-Stop 'DEADLINE' 3
@@ -2730,8 +2734,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # r5 (adversary r4 pass 3 A1 sibling): RAN_LEASE_UNNAMED: its admission or leaseBatch is there but is not ONE object (member access would enumerate it), so it may have
             # taken a lease this run cannot name: charged from the open's submit to the close with no lease id, never read as CANCELLED or ENDED from inside an array.
             $cLb = $(if ($cr.state -ceq 'FOUND') { Get-AdmissionLeaseBatch $cr.result } else { Get-AdmissionLeaseBatch $null })   # r5 pass 3: from the result ($ca above is unrolled)
-            $cState = $(if ($cr.state -cne 'FOUND') { 'UNRECONCILED' } elseif ($cLb.state -ceq 'MALFORMED') { 'RAN_LEASE_UNNAMED' } elseif ($null -ne $ca -and [string]$ca.label -ceq 'cancelled-in-gate') { 'CANCELLED' }
-                elseif ($cLb.state -ceq 'OBJECT' -and $cLb.value.leaseId) { 'RAN_BEFORE_CANCEL' } elseif ($cLb.state -ceq 'OBJECT') { 'RAN_LEASE_UNNAMED' } else { 'ENDED' })   # r5 pass 2 (adversary r5 A1): a leaseBatch with no usable lease id
+            # r10 (adversary-49bf0ddc.json A1): a leaseBatch that is THERE is read before the label, so a cancelled-in-gate result carrying one (the agent's post-admission cancel
+            # relabels an admitted job, whose lease it held) is charged as the lease it names, or unnamed: CANCELLED is only a cancel that carries no leaseBatch at all
+            $cState = $(if ($cr.state -cne 'FOUND') { 'UNRECONCILED' } elseif ($cLb.state -ceq 'MALFORMED') { 'RAN_LEASE_UNNAMED' }
+                elseif ($cLb.state -ceq 'OBJECT' -and $cLb.value.leaseId) { 'RAN_BEFORE_CANCEL' } elseif ($cLb.state -ceq 'OBJECT') { 'RAN_LEASE_UNNAMED' }   # r5 pass 2 (adversary r5 A1): a leaseBatch with no usable lease id
+                elseif ($null -ne $ca -and [string]$ca.label -ceq 'cancelled-in-gate') { 'CANCELLED' } else { 'ENDED' })
             if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$cLb.value.leaseId; $leaseStartUtc = $openSubmitUtc }
             if ($cState -ceq 'RAN_LEASE_UNNAMED') { $openLeaseUnnamed = $true }
             $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int](([Diagnostics.Stopwatch]::GetTimestamp() - $tcTs) / [double][Diagnostics.Stopwatch]::Frequency); error =$(if ($cx.error) { $cx.error } else { $cr.error }) }
