@@ -1,3 +1,4 @@
+import functools
 import glob
 import hashlib
 import os
@@ -992,7 +993,23 @@ def _lane_order_problems(scan):
     return problems
 
 
-_lane_scanner_only = pytest.mark.skipif(_LANE_ERROR_MODE_PWSH is None, reason="the launch scanner reads PowerShell's own AST and needs pwsh")
+@functools.lru_cache(maxsize=None)
+def _lane_scanner_host_ready():
+    """True when pwsh exists AND has the CimCmdlets module (Grok G21, r16). The WMI create scanner reads the parameter metadata of Get-CimInstance and
+    Get-CimClass, which ship with pwsh on Windows only; on a pwsh without them (pwsh on Linux or macOS) every scanner test would fail, not skip. Asked once,
+    when the first marked test runs, with the same Get-Command lookup the scanner makes."""
+    if _LANE_ERROR_MODE_PWSH is None:
+        return False
+    probe = "if (@(Get-Command -Name Get-CimInstance, Get-CimClass -CommandType Cmdlet -ErrorAction SilentlyContinue).Count -eq 2) { exit 0 } else { exit 3 }"
+    done = subprocess.run([_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-Command", probe], text=True, capture_output=True, timeout=120)
+    return done.returncode == 0
+
+
+# A string condition, so the pwsh probe runs only when a marked test is collected to run, not when the module is imported.
+_lane_scanner_only = pytest.mark.skipif(
+    "not _lane_scanner_host_ready()",
+    reason="the launch and WMI create scanners read PowerShell's own AST and need pwsh with the CimCmdlets module (it ships with pwsh on Windows only)",
+)
 
 
 def _lane_sources():
@@ -1103,7 +1120,7 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # with or without a leading dash) and none a script block (also when written by a keyed write, a member write, Add or set_Item, through parentheses or a cast); in a file
 # that reads WMI a write to $PSDefaultParameterValues is refused unless its keys are such literals (`Disabled` and a restore from a saved copy stay accepted). A receiver
 # is read through `-as` (the left operand), and a WMI read in the condition of an `if` / ternary receiver does not make it WMI. The tracked listing reads .ps1 / .psm1 in any
-# letter case (`:(icase)` pathspecs).
+# letter case (`:(icase)` pathspecs), with every GIT_* variable but GIT_EXEC_PATH dropped (a hook's GIT_DIR or GIT_LITERAL_PATHSPECS does not reach it; r15 A3, r16 G22).
 # NOT covered, stated plainly: a splatted table or $PSDefaultParameterValues that crosses a file or a scope, is written through an alias (`$m = $PSDefaultParameterValues;
 # $m['x'] = ...`) or through a method other than Add / set_Item / TryAdd; a script block held in a variable and handed to a WMI pipeline as a callback ($p = { $_.Create('x') };
 # `Get-WmiObject -List Win32_Process | ForEach-Object -Process $p`, also -FilterScript $p, -Property $p and a splat or default table value $p: the block's $_ is not seen as WMI);
@@ -1142,6 +1159,9 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # spelling the metadata names in front of each slot. An explicit -InputObject overrides a WMI pipeline only when spelled with three letters or more (`-in` is ambiguous).
 # VALUE MODE IS THE DEFAULT of Test-WmiNode / Test-WmiWord / Test-WmiClassOperand (pass 19 A2): a WMI read only in the condition of an if or a ternary is never the value;
 # the file-wide "does this file read WMI" test is the one explicit exception.
+# THE METADATA IS THE SCANNING HOST'S (r16, Grok G21): the parameter tables above come from the pwsh version that runs the scan, not from a fixed list, so the
+# verdict on a spelling a later pwsh adds can differ by host. Two of them (Get-CimInstance, Get-CimClass) are in CimCmdlets, which ships with pwsh on Windows
+# only: the scanner then exits 3 with one message naming the module, and `_lane_scanner_only` skips the scanner tests on such a host instead of failing them.
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
 WMI_CREATE_ALLOW = {}
@@ -1733,6 +1753,14 @@ function Test-ClassParameterName([string]$Name) {
 # The parameters of the cmdlets whose POSITIONAL operands the scan reads (New-Object's type, ForEach-Object's member name, Set-Alias / New-Alias's name and value),
 # read ONCE from each cmdlet's own metadata (r15, Grok G17): `(Get-Command <cmdlet>).Parameters` holds its own parameters and the common ones, each with its aliases and
 # whether it is a switch. A hand-written list is what missed `-vb` / `-db`. Key: the cmdlet, then a spelling (name or alias), lowercased.
+# THE METADATA IS THE SCANNING HOST'S (Grok G21, r16): it comes from the pwsh that runs this scan, so a parameter or alias a later pwsh adds is read only when the scan
+# runs on that pwsh. Get-CimInstance and Get-CimClass are in the CimCmdlets module, which ships with pwsh on Windows only: without it the scan stops here with ONE
+# message that names the module (exit 3), not with "the term 'Get-CimInstance' is not recognized".
+$missingCim = @(foreach ($name in @('Get-CimInstance', 'Get-CimClass')) { if (-not (Get-Command -Name $name -CommandType Cmdlet -ErrorAction SilentlyContinue)) { $name } })
+if ($missingCim.Count -gt 0) {
+    [Console]::Error.WriteLine("the WMI create scanner needs the CimCmdlets module (it reads the parameter metadata of Get-CimInstance and Get-CimClass); this pwsh $($PSVersionTable.PSVersion) has no $($missingCim -join ', '). CimCmdlets ships with pwsh on Windows only.")
+    exit 3
+}
 $parameterTables = @{}
 foreach ($cmdlet in @('New-Object', 'ForEach-Object', 'Set-Alias', 'New-Alias', 'Get-CimInstance', 'Get-CimClass')) {
     $table = @{}
@@ -2023,13 +2051,44 @@ def _wmi_create_scan(tmp_path, paths):
     return json.loads(done.stdout)
 
 
+# A pwsh with no CimCmdlets, made on any host: module autoloading off, and only the two modules the scanner needs besides CimCmdlets imported by hand.
+_NO_CIM_WRAPPER = """param([Parameter(Mandatory = $true)][string]$Scanner, [Parameter(Mandatory = $true)][string]$ListFile)
+$PSModuleAutoLoadingPreference = 'None'
+Import-Module Microsoft.PowerShell.Utility, Microsoft.PowerShell.Management
+if (Get-Command -Name Get-CimInstance -CommandType Cmdlet -ErrorAction SilentlyContinue) { [Console]::Error.WriteLine('WRAPPER: CimCmdlets is still visible'); exit 9 }
+& $Scanner -ListFile $ListFile
+exit $LASTEXITCODE
+"""
+
+
+@pytest.mark.skipif(_LANE_ERROR_MODE_PWSH is None, reason="the WMI create scanner runs under pwsh")
+def test_wmi_create_scanner_names_the_missing_cimcmdlets_module(tmp_path):
+    """Grok G21 (r16): on a pwsh without CimCmdlets the scanner stops with ONE message that names the module, not "the term 'Get-CimInstance' is not
+    recognized". The module is hidden by turning autoloading off in a wrapper, so the test runs the same on a Windows host that has the module."""
+    scanner, listing, wrapper, script = tmp_path / "wmi-scan.ps1", tmp_path / "wmi-scan-list.txt", tmp_path / "no-cim.ps1", tmp_path / "plain.ps1"
+    scanner.write_text(_WMI_CREATE_SCANNER, encoding="ascii", newline="\n")
+    wrapper.write_text(_NO_CIM_WRAPPER, encoding="ascii", newline="\n")
+    script.write_text("Write-Output 'x'\n", encoding="utf-8", newline="\n")
+    listing.write_text(str(script) + "\n", encoding="utf-8", newline="\n")
+    done = subprocess.run(
+        [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(wrapper), "-Scanner", str(scanner), "-ListFile", str(listing)],
+        text=True, capture_output=True, timeout=300,
+    )
+    lines = [line for line in done.stderr.splitlines() if line.strip()]
+    assert done.returncode == 3, (done.returncode, done.stdout, done.stderr)
+    assert done.stdout.strip() == "", done.stdout
+    assert len(lines) == 1, lines
+    assert "CimCmdlets" in lines[0] and "Get-CimInstance" in lines[0] and "Get-CimClass" in lines[0], lines[0]
+    assert "not recognized" not in done.stderr, done.stderr
+
+
 def _git_env_for(root):
-    """The environment with every repository-local git variable (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE ...) dropped, so `git -C root` reads ROOT's repository
-    and not the one a hook exported (r15, adversary pass 21 A3). The names are what git itself reports, asked with those variables already dropped."""
-    base = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k in ("GIT_EXEC_PATH",)}
-    names = subprocess.run(["git", "rev-parse", "--local-env-vars"], text=True, capture_output=True, check=True, env=base).stdout.split()
-    assert "GIT_DIR" in names and "GIT_INDEX_FILE" in names, names
-    return {k: v for k, v in os.environ.items() if k not in names}
+    """The environment with EVERY `GIT_*` variable dropped except GIT_EXEC_PATH (where git finds its own helpers), so `git -C root` reads ROOT's repository the
+    way a plain shell would: not the repository a hook exported (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE ...: r15, adversary pass 21 A3), and not with the
+    pathspec rules a hook or tool set (GIT_LITERAL_PATHSPECS, GIT_NOGLOB_PATHSPECS, GIT_GLOB_PATHSPECS, GIT_ICASE_PATHSPECS: r16, Grok G22) or a config it
+    injected (GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT / _KEY_n / _VALUE_n, GIT_CONFIG_GLOBAL ...). `root` is unused: the environment is the same for any
+    repository; the parameter names the repository the caller is about to read. NOT dropped: HOME / XDG_CONFIG_HOME (where git finds the global config)."""
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_") or k.upper() == "GIT_EXEC_PATH"}
 
 
 def _tracked_powershell_files(root=ROOT):
@@ -2050,20 +2109,95 @@ def test_tracked_powershell_listing_reads_any_extension_case(tmp_path):
     assert _tracked_powershell_files(tmp_path) == sorted(["lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "sub/deep.PS1"])
 
 
-def test_tracked_powershell_listing_reads_its_own_repository_under_a_hook_git_environment(tmp_path, monkeypatch):
-    """adversary pass 21 A3 (r15): a hook exports GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE; the listing must still read the repository it is asked about, or a
-    decoy index that omits an unsafe file makes the tracked guard pass. SAFETY: every variable names a DECOY under tmp_path, never this repository."""
+_REAL_LISTING = ["Sub/Deep.PS1", "safe.ps1", "unsafe.ps1"]
+
+
+def _real_and_decoy(tmp_path):
+    """Two scratch repositories: REAL tracks `_REAL_LISTING` (one file in a subdirectory, one in upper case) and DECOY tracks only safe.ps1."""
     real, decoy = tmp_path / "real", tmp_path / "decoy"
-    for repo, names in ((real, ("safe.ps1", "unsafe.ps1")), (decoy, ("safe.ps1",))):
+    for repo, names in ((real, _REAL_LISTING), (decoy, ("safe.ps1",))):
         repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, env=_git_env_for(repo))
         for name in names:
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
             (repo / name).write_text("# x\n", encoding="utf-8", newline="\n")
         subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, env=_git_env_for(repo))
-    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
-    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
-    monkeypatch.setenv("GIT_INDEX_FILE", str(decoy / ".git" / "index"))
-    assert _tracked_powershell_files(real) == ["safe.ps1", "unsafe.ps1"]
+    return real, decoy
+
+
+def test_tracked_powershell_listing_reads_its_own_repository_under_a_hook_git_environment(tmp_path, monkeypatch):
+    """adversary pass 21 A3 (r15): a hook exports GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE; the listing must still read the repository it is asked about, or a
+    decoy index that omits an unsafe file makes the tracked guard pass. Grok G22 (r16): the pathspec variables change how the SAME repository is read
+    (GIT_LITERAL_PATHSPECS=1 or GIT_NOGLOB_PATHSPECS=1 lists nothing, GIT_GLOB_PATHSPECS=1 stops `*` at a `/`), and `--local-env-vars` does not name them.
+    SAFETY: every repository variable names a DECOY under tmp_path, never this repository."""
+    real, decoy = _real_and_decoy(tmp_path)
+    with monkeypatch.context() as m:
+        m.setenv("GIT_DIR", str(decoy / ".git"))
+        m.setenv("GIT_WORK_TREE", str(decoy))
+        m.setenv("GIT_INDEX_FILE", str(decoy / ".git" / "index"))
+        assert _tracked_powershell_files(real) == _REAL_LISTING
+    for name in ("GIT_LITERAL_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
+        with monkeypatch.context() as m:
+            m.setenv(name, "1")
+            assert _tracked_powershell_files(real) == _REAL_LISTING, name
+
+
+def _hostile_git_environments(real, decoy):
+    """{case: {variable: value}}: each GIT_* variable git documents (git(1) ENVIRONMENT) that changes where or how `git ls-files` reads, set to a value that would
+    change the listing if it got through. Written out here on purpose, not taken from `git rev-parse --local-env-vars`: that list is what missed the pathspec
+    variables (Grok G22). A variable git adds later goes here; the floor in the test reds when git's own local list names one this table lacks."""
+    decoy_git = decoy / ".git"
+    bare_config = decoy / "bare.gitconfig"
+    bare_config.write_text("[core]\n\tbare = true\n\tworktree = " + decoy.as_posix() + "\n", encoding="utf-8", newline="\n")
+    return {
+        "GIT_DIR": {"GIT_DIR": str(decoy_git)},
+        "GIT_WORK_TREE": {"GIT_WORK_TREE": str(decoy)},
+        "GIT_IMPLICIT_WORK_TREE": {"GIT_IMPLICIT_WORK_TREE": "0"},
+        "GIT_INDEX_FILE": {"GIT_INDEX_FILE": str(decoy_git / "index")},
+        "GIT_COMMON_DIR": {"GIT_COMMON_DIR": str(decoy_git)},
+        "GIT_OBJECT_DIRECTORY": {"GIT_OBJECT_DIRECTORY": str(decoy_git / "objects")},
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": {"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(decoy_git / "objects")},
+        "GIT_NAMESPACE": {"GIT_NAMESPACE": "decoy"},
+        "GIT_CEILING_DIRECTORIES": {"GIT_CEILING_DIRECTORIES": str(real)},
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM": {"GIT_DISCOVERY_ACROSS_FILESYSTEM": "0"},
+        "GIT_PREFIX": {"GIT_PREFIX": "Sub/"},
+        "GIT_GRAFT_FILE": {"GIT_GRAFT_FILE": str(decoy / "grafts")},
+        "GIT_SHALLOW_FILE": {"GIT_SHALLOW_FILE": str(decoy / "shallow")},
+        "GIT_NO_REPLACE_OBJECTS": {"GIT_NO_REPLACE_OBJECTS": "1"},
+        "GIT_REPLACE_REF_BASE": {"GIT_REPLACE_REF_BASE": "refs/decoy/"},
+        "GIT_CONFIG": {"GIT_CONFIG": str(bare_config)},
+        "GIT_CONFIG_GLOBAL": {"GIT_CONFIG_GLOBAL": str(bare_config)},
+        "GIT_CONFIG_SYSTEM": {"GIT_CONFIG_SYSTEM": str(bare_config)},
+        "GIT_CONFIG_NOSYSTEM": {"GIT_CONFIG_NOSYSTEM": "1"},
+        "GIT_CONFIG_PARAMETERS": {"GIT_CONFIG_PARAMETERS": "'core.bare'='true'"},
+        "GIT_CONFIG_COUNT": {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.bare", "GIT_CONFIG_VALUE_0": "true"},
+        "GIT_LITERAL_PATHSPECS": {"GIT_LITERAL_PATHSPECS": "1"},
+        "GIT_GLOB_PATHSPECS": {"GIT_GLOB_PATHSPECS": "1"},
+        "GIT_NOGLOB_PATHSPECS": {"GIT_NOGLOB_PATHSPECS": "1"},
+        "GIT_ICASE_PATHSPECS": {"GIT_ICASE_PATHSPECS": "1"},
+    }
+
+
+def test_tracked_powershell_listing_ignores_every_documented_git_reading_variable(tmp_path, monkeypatch):
+    """Grok G22 prevention (r16): the listing runs once under EACH variable in `_hostile_git_environments`, alone, and must still list REAL's files. SAFETY: every
+    path names a DECOY under tmp_path; the variables are set only inside this test (monkeypatch), never exported to another command."""
+    real, decoy = _real_and_decoy(tmp_path)
+    table = _hostile_git_environments(real, decoy)
+    # A floor: every name git itself calls repository-local is in the table, so a variable a later git adds reds HERE first.
+    local = subprocess.run(["git", "rev-parse", "--local-env-vars"], text=True, capture_output=True, check=True, env=_git_env_for(real)).stdout.split()
+    assert "GIT_DIR" in local and set(local) <= set(table), sorted(set(local) - set(table))
+    wrong = {}
+    for case, assignments in table.items():
+        with monkeypatch.context() as m:
+            for name, value in assignments.items():
+                m.setenv(name, value)
+            try:
+                got = _tracked_powershell_files(real)
+            except subprocess.CalledProcessError as error:
+                got = f"git failed: {error.stderr.strip()}"
+            if got != _REAL_LISTING:
+                wrong[case] = got
+    assert wrong == {}, wrong
 
 
 @_lane_scanner_only
