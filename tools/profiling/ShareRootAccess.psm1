@@ -15,7 +15,9 @@ Set-StrictMode -Version 1.0
 # Win32 codes that mean "this host has no usable credential for the share": 5 ERROR_ACCESS_DENIED,
 # 1326 ERROR_LOGON_FAILURE (unknown user name or bad password), 1219 ERROR_SESSION_CREDENTIAL_CONFLICT.
 $script:DeniedWin32 = @(5, 1219, 1326)
-$script:DeniedText = 'System error (5|1326|1219)\b|Access (to the path .* )?is denied|Logon failure|UnauthorizedAccess|Multiple connections to a server'
+#
+# Classification is by exception TYPE, Win32 code or HRESULT, never by message text (r3 A8): a missing path whose NAME contains
+# 'Access is denied' is a path-not-found, and its message quotes that name.
 
 function Test-ShareAccessDeniedException {
     # True when the exception (or anything in its InnerException chain) is an access-denied class failure.
@@ -27,9 +29,12 @@ function Test-ShareAccessDeniedException {
         if ($e -is [System.Management.Automation.ErrorRecord]) { $e = $e.Exception; continue }
         if ($e -is [UnauthorizedAccessException]) { return $true }
         if ($e -is [System.Security.SecurityException]) { return $true }
-        if ($e -is [System.IO.IOException] -and ($script:DeniedWin32 -contains ([int]($e.HResult -band 0xFFFF)))) { return $true }
         if ($e -is [System.ComponentModel.Win32Exception] -and ($script:DeniedWin32 -contains [int]$e.NativeErrorCode)) { return $true }
-        if ($e -is [Exception] -and ([string]$e.Message) -match $script:DeniedText) { return $true }
+        if ($e -is [Exception]) {
+            # HRESULT_FROM_WIN32: 0x8007xxxx, the low word is the Win32 code. Any exception type can carry it.
+            $h = [int64]$e.HResult -band 0xFFFFFFFFL
+            if ((($h -shr 16) -eq 0x8007) -and ($script:DeniedWin32 -contains [int]($h -band 0xFFFF))) { return $true }
+        }
         $e = if ($e -is [Exception]) { $e.InnerException } else { $null }
         $depth++
     }
