@@ -1132,7 +1132,9 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # class) and never from a string elsewhere (`[System.IO.FileInfo]'Win32_Process'`, `New-Object System.IO.FileInfo 'Win32_Process'`); the create verb is a WHOLE token
 # (a wmic argument that starts with `/` or `-` is a global switch and its value, `/output:C:\create\p.txt`; a method name CreateRestorePoint is not Create); a one-letter
 # parameter that can only be a value parameter (-n Namespace, -f Filter) takes its value; an explicit -InputObject decides what its command receives; `$( )` is unwrapped
-# like parentheses. NOT covered, the price of reading a class only where it is named: a bare positional string that names the process class to a command other than
+# like parentheses; the words of an InvokeMethod call are its string constants (a variable named `$create` or a member `$o.Create` is not the verb); New-Object's type is
+# -TypeName or the first positional, and its argument list is data; a WMI read only in the CONDITION of an if or a ternary is not the value of a binding, a pipeline
+# element or a switch input. NOT covered, the price of reading a class only where it is named: a bare positional string that names the process class to a command other than
 # these (`Get-CimAssociatedInstance Win32_Process`, `Get-Item WMI:\root\cimv2\Win32_Process`).
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
@@ -1259,7 +1261,7 @@ function Get-ReceiverRoots($Expression) {
         else {
             # A command, a longer pipeline, a statement that is not a lone expression, a call, a type or a constant: it contributes every variable in it, and the
             # WMI class it names. The condition of an if or a ternary never reaches here, so a read of the process table there does not make the receiver WMI.
-            if (Test-WmiWord $e) { $roots.Add('#wmi') }
+            if (Test-WmiWord $e $true) { $roots.Add('#wmi') }
             if ($e -is [StatementAst]) {
                 foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { $roots.Add((Get-VarName $v)) }
             }
@@ -1298,7 +1300,7 @@ function Test-InWmiPipeline($Node) {
         # A switch clause (its body, a script-block label or an expression label; not the switch's own input) binds $_ to the switch's input, so it is WMI when the
         # switch reads a WMI value (or $_ of a WMI pipeline around it).
         if ($p.Parent -is [SwitchStatementAst] -and -not [object]::ReferenceEquals($p.Parent.Condition, $p)) {
-            return (Test-WmiNode $p.Parent.Condition)
+            return (Test-WmiNode $p.Parent.Condition $true)
         }
         if ($p -isnot [ScriptBlockExpressionAst]) { continue }
         $cmd = $p.Parent
@@ -1635,6 +1637,17 @@ function Get-VerbText($Node) {
     return (Get-CleanText $Node)
 }
 
+# The words an argument SPELLS: the values of the string constants in it (a comment is no node, a backtick and a splice are already decoded), never a variable's name
+# (`$create` is a variable) nor a member name (`$o.Create`): adversary pass 18 A2.
+function Get-ConstantText($Node) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $Node.FindAll({ param($x) $x -is [StringConstantExpressionAst] }, $true)) {
+        if ($c.Parent -is [MemberExpressionAst] -and [object]::ReferenceEquals($c.Parent.Member, $c)) { continue }
+        $parts.Add([string]$c.Value)
+    }
+    return ($parts -join ' ')
+}
+
 # True when an InvokeMethod argument is DATA, not the method name: an array or a hashtable in the arguments slot of the (name, args) / (name, in-parameters, options)
 # overloads (index 1 after a literal name) or of CimSession.InvokeMethod (index 3 of four). An array at the name position converts to the string and is still read.
 function Test-DataArgument($Arguments, [int]$Index) {
@@ -1672,6 +1685,8 @@ function Test-WmiCommandWord($Command) {
     $isInvoke = $false
     foreach ($m in $meanings) { if ($wmiCommands -contains $m) { $isInvoke = $true } }
     $isNewObject = ($meanings -contains 'new-object')
+    $typeNamed = $false
+    foreach ($e in $elements) { if ($e -is [CommandParameterAst] -and $e.ParameterName.Length -ge 1 -and 'TypeName'.StartsWith($e.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $typeNamed = $true } }
     $positional = 0
     for ($i = 1; $i -lt $elements.Count; $i++) {
         $e = $elements[$i]
@@ -1683,13 +1698,14 @@ function Test-WmiCommandWord($Command) {
             if ($null -eq $value -and -not $isSwitch -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [CommandParameterAst]) { $value = $elements[$i + 1]; $i++ }
             if ($null -ne $value -and (Test-ClassParameterName $n) -and $wmiWord.IsMatch((Get-CleanText $value))) { return $true }
             # New-Object: the TYPE is -TypeName; -ArgumentList is constructor data, not a type.
-            if ($isNewObject -and $null -ne $value -and $n.Length -ge 1 -and 'TypeName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -and $wmiTypeWord.IsMatch((Get-CleanText $value))) { return $true }
+            if ($isNewObject -and $n.Length -ge 1 -and 'TypeName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -and $null -ne $value -and $wmiTypeWord.IsMatch((Get-CleanText $value))) { return $true }
             continue
         }
         $positional++
         if ($isInvoke -and $positional -eq 1 -and $e -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-CleanText $e))) { return $true }
-        # New-Object's first positional operand is the type name (the second is the argument list).
-        if ($isNewObject -and $positional -eq 1 -and $wmiTypeWord.IsMatch((Get-CleanText $e))) { return $true }
+        # New-Object's first positional operand is the type name (the second is the argument list), unless -TypeName already took the type slot: then every positional
+        # operand is constructor data (adversary pass 18 A1).
+        if ($isNewObject -and $positional -eq 1 -and -not $typeNamed -and $wmiTypeWord.IsMatch((Get-CleanText $e))) { return $true }
     }
     return $false
 }
@@ -1784,6 +1800,7 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             if (-not $hit -and $b.Node -is [CommandAst]) { $hit = Test-WmiPipelineInput $b.Node }
             if (-not $hit) {
                 foreach ($v in $b.Right.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
+                    if (Test-InConditionOf $v $b.Right) { continue }
                     $vn = Get-VarName $v
                     if (($vn -eq '_' -or $vn -eq 'psitem') -and (Test-InWmiPipeline $b.Node)) { $hit = $true; break }
                 }
@@ -1862,10 +1879,10 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             elseif ($member -ieq 'InvokeMethod') {
                 # The arguments only, so a comment between them does not count; the receiver or an argument names the WMI class.
                 $arguments = @($n.Arguments)
-                $argText = (@(for ($j = 0; $j -lt $arguments.Count; $j++) { if (-not (Test-DataArgument $arguments $j)) { Get-CleanText $arguments[$j] } }) -join ' ')
+                $argText = (@(for ($j = 0; $j -lt $arguments.Count; $j++) { if (-not (Test-DataArgument $arguments $j)) { Get-ConstantText $arguments[$j] } }) -join ' ')
                 $argsReadWmi = $wmiWord.IsMatch($argText)
                 foreach ($argAst in $arguments) { if (Test-WmiClassOperand $argAst) { $argsReadWmi = $true } }
-                $verbText = (@(for ($j = 0; $j -lt $arguments.Count; $j++) { if (-not (Test-DataArgument $arguments $j)) { Get-CleanText $arguments[$j] } }) -join ' ')
+                $verbText = $argText
                 if (($viaWmi -or $argsReadWmi) -and $verbText -match '(?i)\bcreate\b') { $kind = 'wmi-invoke-method-create' }
                 # On a WMI receiver a method name that is not a literal could be Create, as for Invoke-CimMethod above.
                 elseif ($viaWmi -and ($arguments.Count -lt 1 -or $arguments[0] -isnot [StringConstantExpressionAst])) { $kind = 'wmi-invoke-method-name-not-literal' }
@@ -2280,6 +2297,11 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "new-object-management-class-create": "$c = New-Object System.Management.ManagementClass 'Win32_Process'\n$c.Create('x')",
         "new-object-management-class-parenthesized-create": "(New-Object -TypeName System.Management.ManagementClass -ArgumentList 'Win32_Process').Create('x')",
         "new-object-management-class-by-the-type-name-parameter-with-data": "$c = New-Object -TypeName System.Management.ManagementClass -ArgumentList 'Win32_Process'\n$c.Create('x')",
+        "new-object-argument-list-first-then-the-type-name": "$c = New-Object -ArgumentList 'Win32_Process' -TypeName System.Management.ManagementClass\n$c.Create('x')",
+        "new-object-type-name-parameter-with-a-positional-argument": "$c = New-Object -TypeName System.Management.ManagementClass 'Win32_Process'\n$c.Create('x')",
+        "invoke-method-name-from-a-literal-with-a-variable-argument": "$c = Get-WmiObject -List Win32_Process\n$create = $null\n$c.InvokeMethod('Create', $create)",
+        "wmi-pipeline-item-in-an-if-branch-create": "Get-WmiObject -List Win32_Process | ForEach-Object { $f = $(if ($true) { $_ } else { $null }); $f.Create('x') }",
+        "switch-over-an-if-with-a-wmi-branch-create": "switch ($(if ($true) { Get-CimInstance Win32_Process } else { $null })) { default { $_.Create('x') } }",
         "wmi-value-in-an-if-branch-create": "$f = $(if ($true) { Get-CimInstance Win32_Process } else { $null })\n$f.Create('x')",
         "wmi-value-in-a-ternary-branch-create": "$f = ($true ? (Get-CimInstance Win32_Process) : $null)\n$f.Create('x')",
         "wmi-value-in-an-if-branch-piped-create": "$(if ($true) { Get-CimInstance Win32_Process } else { $null }) | ForEach-Object { $_.Create('x') }",
@@ -2420,6 +2442,14 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "wmi-list-of-the-processor-class": "$c = Get-WmiObject -List Win32_Processor\n$c.Create('y')",
         "cim-instance-in-an-if-condition-of-a-binding": "$f = $(if (Get-CimInstance Win32_Process -Filter 'ProcessId=4') { [System.IO.FileInfo]'scratch.txt' } else { [System.IO.FileInfo]'scratch.txt' })\n$f.Create().Dispose()",
         "cim-instance-in-a-ternary-condition-of-a-binding": "$f = ((Get-CimInstance Win32_Process -Filter 'ProcessId=4') ? [System.IO.FileInfo]'a.txt' : [System.IO.FileInfo]'b.txt')\n$f.Create().Dispose()",
+        # adversary pass 18 on d31f8dc3: a named -TypeName takes the type slot, a variable NAMED create is not the verb, a WMI pipeline item only in a condition is not the value
+        "new-object-type-name-parameter-then-a-positional-argument-list": "$f = New-Object -TypeName System.IO.FileInfo 'ManagementClass'\n$f.Create().Dispose()",
+        "new-object-argument-list-parameter-first-then-the-type-name-parameter": "$f = New-Object -ArgumentList 'wmiclass' -TypeName System.IO.FileInfo\n$f.Create().Dispose()",
+        "invoke-method-argument-variable-named-create": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$create = [object[]]@($null, $null)\n$p.InvokeMethod('GetOwner', $create)",
+        "invoke-method-member-read-argument-named-create": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$o = Get-Item x\n$p.InvokeMethod('GetOwner', $o.Create)",
+        "wmic-argument-variable-named-create": "$create = 'x'\nwmic process get $create",
+        "wmi-pipeline-item-only-in-an-if-condition": "Get-WmiObject -List Win32_Process | ForEach-Object { $f = $(if ($_) { [System.IO.FileInfo]'scratch.txt' } else { [System.IO.FileInfo]'scratch.txt' }); $f.Create().Dispose() }",
+        "switch-over-an-if-with-a-wmi-read-only-in-the-condition": "switch ($(if (Get-CimInstance Win32_Process) { [System.IO.FileInfo]'scratch.txt' } else { [System.IO.FileInfo]'scratch.txt' })) { default { $_.Create().Dispose() } }",
         "cim-instance-in-an-if-condition-piped": "$(if (Get-CimInstance Win32_Process) { [System.IO.FileInfo]'scratch.txt' }) | ForEach-Object { $_.Create().Dispose() }",
         "string-variable-names-the-process-class-and-a-file-is-created": "$name = 'Win32_Process'\n$f = [System.IO.FileInfo]$name\n$f.Create().Dispose()",
         "variable-named-with-a-watched-word": "$ManagementClassServer = '.'\n$svc = Get-WmiObject -List Win32_Service -ComputerName $ManagementClassServer\n$createService = $svc.Create",
