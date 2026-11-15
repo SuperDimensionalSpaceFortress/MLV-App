@@ -3146,6 +3146,76 @@
       "lines": [
         708
       ]
+    },
+    {
+      "path": "platform/qt/GuiHopWaitSplit.h",
+      "anchor": "if ( ! std :: isfinite ( ms ) || ms < 0.0 ) return ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: MeanMs::add input guard -- a non-finite or negative emit-to-request sample (differences of mlv_stage_timing_now readings) is not accumulated. A zero sample is accepted and counted; the guard proves nothing ran.",
+      "lines": [
+        233
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , s . waitMs , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: pure-function unit test with synthetic seconds (no live clock): a zero-length window [5, 5] has a zero wait. 0 is the expected value, not a proof that anything ran.",
+      "lines": [
+        57
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , ms ( s , Kind :: PreparedPresent ) , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: pure-function unit test with synthetic seconds: an interval covering a zero-length window charges it nothing. 0 is the expected value, not a run proof.",
+      "lines": [
+        58
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , s . otherMs , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: pure-function unit test with synthetic seconds: a zero-length window leaves no other time. 0 is the expected value, not a run proof.",
+      "lines": [
+        59
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , ms ( m , Kind :: PreparedPresent ) , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: pure-function unit test with synthetic seconds: a kind outside the split's mask is charged nothing (its time goes to other, asserted next). 0 is the expected value, not a run proof.",
+      "lines": [
+        86
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_TRUE ( s . otherMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: range sanity check on a synthetic split (no live clock): other is never negative. 0.0 satisfies it; the split's content is proved in the same test by the closure assert (parts sum to the wait within 1e-9).",
+      "lines": [
+        109
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_TRUE ( lastMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: the paint listener's reported ms is non-negative (it starts at -1, so this shows it was written). 0.0 satisfies it; that the listener ran is proved by ASSERT_EQ(1, calls) just before it.",
+      "lines": [
+        1383
+      ]
     }
   ]
 }

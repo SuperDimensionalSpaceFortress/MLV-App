@@ -1357,11 +1357,15 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     const int listen = begin.indexOf(QStringLiteral("preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;"));
     ASSERT_TRUE(listen >= 0);
     ASSERT_TRUE(begin.indexOf(QStringLiteral("m_guiHopWait.reset();")) < listen);
-    ASSERT_TRUE(listen < begin.indexOf(QStringLiteral("m_playbackSmokeActive = true;")));
+    ASSERT_TRUE(begin.indexOf(QStringLiteral("m_guiHopEmitToRequestIssue.reset();")) < listen);
+    // Set inside the synchronous begin (no event is processed in it, so nothing feeds the split before it).
+    ASSERT_TRUE(begin.indexOf(QStringLiteral("m_playbackSmokeActive = true;")) < listen);
+    ASSERT_TRUE(listen < begin.indexOf(QStringLiteral("m_playbackSmokeStartTime = mlv_stage_timing_now();")));
     const QString finish = finishSmokeBody();
-    const int inactive = finish.indexOf(QStringLiteral("m_playbackSmokeActive = false;"));
+    const QString endAnchor = QStringLiteral("    m_playbackSmokeActive = false;\n    m_playbackPresentTrace.end();\n");
+    const int inactive = finish.indexOf(endAnchor);
     ASSERT_TRUE(inactive >= 0);
-    ASSERT_EQ(inactive + static_cast<int>(QStringLiteral("m_playbackSmokeActive = false;\n    ").size()),
+    ASSERT_EQ(inactive + static_cast<int>(endAnchor.size()) + 4,
               finish.indexOf(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));
     ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("MainWindow::~MainWindow()"))
                     .contains(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));

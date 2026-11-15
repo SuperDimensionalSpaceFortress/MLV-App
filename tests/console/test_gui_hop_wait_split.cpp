@@ -123,10 +123,11 @@ TEST(GuiHopWaitSplit, RingOverflowMakesAnOldWindowUnattributedNotGuessed)
     const gui_hop_wait::Split old = r.split( 0.999, 1.015 );
     ASSERT_TRUE( old.valid );
     ASSERT_TRUE( old.unattributed );
-    // A window inside the retained span is attributed as usual.
+    // A window inside the retained span is attributed as usual: the sleeps at 1.100 and 1.110, 1 ms each.
     const gui_hop_wait::Split recent = r.split( 1.100, 1.115 );
     ASSERT_FALSE( recent.unattributed );
-    ASSERT_NEAR( 1.0, ms( recent, Kind::RunnerSleep ), 1e-6 );
+    ASSERT_NEAR( 2.0, ms( recent, Kind::RunnerSleep ), 1e-6 );
+    ASSERT_NEAR( 13.0, recent.otherMs, 1e-6 );
 
     gui_hop_wait::Accumulator acc;
     acc.add( old );
@@ -134,7 +135,7 @@ TEST(GuiHopWaitSplit, RingOverflowMakesAnOldWindowUnattributedNotGuessed)
     ASSERT_EQ( 1u, static_cast<unsigned>( acc.frames ) );
     ASSERT_EQ( 1u, static_cast<unsigned>( acc.unattributedFrames ) );
     ASSERT_NEAR( 15.0, acc.avgWaitMs(), 1e-6 );   // the unattributed window is not in the average
-    ASSERT_NEAR( 1.0, acc.avgKindMs( Kind::RunnerSleep ), 1e-6 );
+    ASSERT_NEAR( 2.0, acc.avgKindMs( Kind::RunnerSleep ), 1e-6 );
 
     // An overflowed kind outside the mask does not make the window unattributed.
     ASSERT_FALSE( r.split( 0.999, 1.015, gui_hop_wait::kindBit( Kind::ViewportPaint ) ).unattributed );

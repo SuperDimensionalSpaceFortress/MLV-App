@@ -27102,14 +27102,6 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackLookaheadRequestsIssued = 0;
     m_playbackLookaheadCoveredRequests = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
-    // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split starts empty; preview paints reach it only while
-    // the session is active (cleared where the session ends, and in the destructor).
-    m_guiHopWait.reset();
-    m_guiHopFrameReadyWait.reset();
-    m_guiHopPrepResultWait.reset();
-    m_guiHopEmitToRequestIssue.reset();
-    preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;
-    preview_paint_timing::paintListener().context = &m_guiHopWait;
     m_playbackSmokeActive = true;
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
     m_playbackSmokeFrameLogEnabled =
@@ -27131,6 +27123,15 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeTimelineTelemetry =
         m_playbackSmokeFrameTelemetry
         && playbackSmokeTimelineTelemetryEnabled();
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split starts empty (nothing feeds it before this
+    // synchronous begin returns); preview paints reach it only while the session is active (the
+    // listener is cleared where the session ends, and in the destructor).
+    m_guiHopWait.reset();
+    m_guiHopFrameReadyWait.reset();
+    m_guiHopPrepResultWait.reset();
+    m_guiHopEmitToRequestIssue.reset();
+    preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;
+    preview_paint_timing::paintListener().context = &m_guiHopWait;
     m_playbackSmokeStartPosition = ui->horizontalSliderPosition->value();
     m_playbackSmokeStartCutIn = ui->spinBoxCutIn->value();
     m_playbackSmokeStartCutOut = ui->spinBoxCutOut->value();
@@ -30832,8 +30833,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     }
 
     m_playbackSmokeActive = false;
-    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
     m_playbackPresentTrace.end();
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
 
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
     // gate lines so a receipt carries the footage length the measured window actually played.
