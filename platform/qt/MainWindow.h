@@ -48,6 +48,7 @@
 #include "PlaybackRoutePrewarmPolicy.h"
 #include "PlaybackReconWarmRunPolicy.h"
 #include "GuiPresentGapIdle.h"
+#include "GuiHopWaitSplit.h"
 #include "ReconWorkerSplit.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
@@ -1729,6 +1730,13 @@ private:
         MainWindow *m_window;
         gui_present_gap::OtherBusySpan m_span;
     };
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1: the GUI hop on the CPU route's serial loop, split by the GUI
+    // work inside it (GuiHopWaitSplit.h; playback_smoke.critical_hop_summary). Fed only while a
+    // playback smoke session is active.
+    gui_hop_wait::Recorder m_guiHopWait;
+    gui_hop_wait::Accumulator m_guiHopFrameReadyWait;
+    gui_hop_wait::Accumulator m_guiHopPrepResultWait;
+    gui_hop_wait::MeanMs m_guiHopEmitToRequestIssue;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;

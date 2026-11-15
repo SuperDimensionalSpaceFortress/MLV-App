@@ -1265,3 +1265,122 @@ TEST(PlaybackPrepOwnership, PrepSummaryAppendsTheHandoffFields)
                               "playback_prep_region_image_set_pixmap_ms", "playback_prep_region_image_release_ms" })
         ASSERT_EQ(1, present.count(QStringLiteral("QStringLiteral(\"%1\")").arg(QLatin1String(key))));
 }
+
+// ---- CPU-S1-PRESENT-INTERVAL-BOUND-1 ------------------------------------------------------------------
+
+TEST(CriticalHopSummaryWiring, NewLineFollowsGuiPresentSummaryWithEveryFieldInOrder)
+{
+    const QString finish = finishSmokeBody();
+    ASSERT_FALSE(finish.isEmpty());
+    ASSERT_EQ(1, finish.count(QStringLiteral("\"playback_smoke.critical_hop_summary session=%1 frames=%2 \"")));
+    // Printed right after gui_present_summary (its qInfo is the next one) and before recon_worker_split_summary.
+    const int gui = finish.indexOf(QStringLiteral("playback_smoke.gui_present_summary session=%1"));
+    const int hop = finish.indexOf(QStringLiteral("playback_smoke.critical_hop_summary session=%1"));
+    const int recon = finish.indexOf(QStringLiteral("playback_smoke.recon_worker_split_summary session=%1"));
+    ASSERT_TRUE(gui > 0);
+    ASSERT_TRUE(hop > gui);
+    ASSERT_TRUE(recon > hop);
+    ASSERT_EQ(1, finish.mid(gui, hop - gui).count(QStringLiteral("qInfo()")));
+    const QString format = summaryFormat(finish, QStringLiteral("playback_smoke.critical_hop_summary session=%1"));
+    ASSERT_FALSE(format.isEmpty());
+    const QStringList fields = {
+        QStringLiteral("session"), QStringLiteral("frames"),
+        QStringLiteral("avg_frame_ready_wait_ms"), QStringLiteral("avg_frame_ready_wait_runner_sleep_ms"),
+        QStringLiteral("avg_frame_ready_wait_prepared_present_ms"), QStringLiteral("avg_frame_ready_wait_viewport_paint_ms"),
+        QStringLiteral("avg_frame_ready_wait_other_ms"), QStringLiteral("frame_ready_wait_unattributed_frames"),
+        QStringLiteral("avg_prep_result_wait_ms"), QStringLiteral("avg_prep_result_wait_runner_sleep_ms"),
+        QStringLiteral("avg_prep_result_wait_viewport_paint_ms"), QStringLiteral("avg_prep_result_wait_other_ms"),
+        QStringLiteral("prep_result_wait_unattributed_frames"), QStringLiteral("emit_to_request_frames"),
+        QStringLiteral("avg_emit_to_request_issue_ms"), QStringLiteral("avg_upstream_plus_render_per_render_ms"),
+    };
+    int last = -1;
+    for (int i = 0; i < fields.size(); ++i)
+    {
+        const QString key = QStringLiteral("%1=%%2").arg(fields[i]).arg(i + 1);
+        const int at = format.indexOf(key);
+        if (at <= last) ::minitest::fail(__FILE__, __LINE__, "critical_hop_summary field order", key.toLatin1().constData());
+        last = at;
+    }
+    ASSERT_EQ(fields.size(), static_cast<int>(format.count(QLatin1Char('='))));
+    // S is decode + recon + render busy per render start, from the overlap_summary's own snapshot.
+    ASSERT_TRUE(finish.contains(QStringLiteral("hopOverlap = overlap;")));
+    ASSERT_TRUE(finish.contains(QStringLiteral(
+        "( hopOverlap.decodeBusyMs + hopOverlap.reconBusyMs + hopOverlap.renderBusyMs )\n"
+        "                      / static_cast<double>( hopOverlap.renderStarts )")));
+    // The gui_present_summary format itself is untouched (rename or reorder nothing).
+    const QString gpFormat = summaryFormat(finish, QStringLiteral("playback_smoke.gui_present_summary session=%1"));
+    ASSERT_TRUE(gpFormat.contains(QStringLiteral("avg_gui_other_busy_ms=%13 max_gui_other_busy_ms=%14 gui_idle_source=%15\" )")));
+}
+
+TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
+{
+    const QString source = mainWindowSource();
+    // Runner sleep: [start, end] on the stage clock, only while a session is active.
+    const QString sleep = bracedBlockAfter(source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
+    ASSERT_TRUE(sleep.contains(QStringLiteral("const double hopSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;")));
+    ASSERT_TRUE(sleep.contains(QStringLiteral("m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSleepStartS, mlv_stage_timing_now() );")));
+    ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) > sleep.indexOf(QStringLiteral("QThread::msleep( ms );")));
+
+    // Prepared present: the result's wait split at entry (the avg_playback_prep_result_queue_ms stamp), then the
+    // present's own [entry, exit] interval, from one entry stamp.
+    const QString present = presentPreparedBody();
+    ASSERT_FALSE(present.isEmpty());
+    const int entry = present.indexOf(QStringLiteral("const double prepPresentStart = mlv_stage_timing_now();"));
+    const int prepSplit = present.indexOf(QStringLiteral("m_guiHopPrepResultWait.add( m_guiHopWait.split(\n            result.resultReadyTime, prepPresentStart,"));
+    const int scope = present.indexOf(QStringLiteral("const gui_hop_wait::IntervalScope hopPresentInterval(\n        m_playbackSmokeActive ? &m_guiHopWait : nullptr, gui_hop_wait::Kind::PreparedPresent,\n        prepPresentStart, &guiHopWaitClockNow );"));
+    ASSERT_TRUE(entry >= 0);
+    ASSERT_TRUE(prepSplit > entry);
+    ASSERT_TRUE(scope > prepSplit);
+    ASSERT_TRUE(present.contains(QStringLiteral("if( m_playbackSmokeActive && result.resultReadyTime > 0.0 && prepPresentStart >= result.resultReadyTime )")));
+
+    // drawFrameReady: frame_ready_wait is the m_lastDrawFrameReadyQueueMs window; emit_to_request on an issuing advance.
+    const QString ready = bracedBlockAfter(source, QStringLiteral("void MainWindow::drawFrameReady()"));
+    ASSERT_FALSE(ready.isEmpty());
+    const QString queueBlock = bracedBlockAfter(ready, QStringLiteral(
+        "if( readyFrame.frameReadyEmitStageTime > 0.0\n     && display_start >= readyFrame.frameReadyEmitStageTime )"));
+    ASSERT_TRUE(queueBlock.contains(QStringLiteral("m_lastDrawFrameReadyQueueMs =")));
+    ASSERT_TRUE(queueBlock.contains(QStringLiteral(
+        "if( m_playbackSmokeActive )\n            m_guiHopFrameReadyWait.add( m_guiHopWait.split( readyFrame.frameReadyEmitStageTime, display_start ) );")));
+    const int before = ready.indexOf(QStringLiteral("const uint64_t hopRequestSerialBefore = m_nextRenderRequestSerial;"));
+    const int advance = ready.indexOf(QStringLiteral("timerFrameEvent( predictiveGpuTexNrEarlyAdvance );"));
+    const int issued = ready.indexOf(QStringLiteral("&& m_nextRenderRequestSerial != hopRequestSerialBefore"));
+    const int add = ready.indexOf(QStringLiteral("m_guiHopEmitToRequestIssue.add( ( advance_start - readyFrame.frameReadyEmitStageTime ) * 1000.0 );"));
+    ASSERT_TRUE(before >= 0);
+    ASSERT_TRUE(advance > before);
+    ASSERT_TRUE(issued > advance);
+    ASSERT_TRUE(add > issued);
+
+    // Viewport paint: the shared paint sink's listener, set with the session and cleared where it ends.
+    const QString sink = readRepoFile(QStringLiteral("platform/qt/PreviewPaintTiming.h"));
+    ASSERT_TRUE(sink.contains(QStringLiteral("if( listener.fn ) listener.fn( listener.context, ms );")));
+    const QString begin = beginSmokeBody();
+    const int listen = begin.indexOf(QStringLiteral("preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;"));
+    ASSERT_TRUE(listen >= 0);
+    ASSERT_TRUE(begin.indexOf(QStringLiteral("m_guiHopWait.reset();")) < listen);
+    ASSERT_TRUE(listen < begin.indexOf(QStringLiteral("m_playbackSmokeActive = true;")));
+    const QString finish = finishSmokeBody();
+    const int inactive = finish.indexOf(QStringLiteral("m_playbackSmokeActive = false;"));
+    ASSERT_TRUE(inactive >= 0);
+    ASSERT_EQ(inactive + static_cast<int>(QStringLiteral("m_playbackSmokeActive = false;\n    ").size()),
+              finish.indexOf(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));
+    ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("MainWindow::~MainWindow()"))
+                    .contains(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));
+
+    // The listener reaches the sink only from an outermost Scope; none is called with no listener set.
+    preview_paint_timing::reset();
+    static int calls = 0;
+    static double lastMs = -1.0;
+    preview_paint_timing::paintListener().fn = [](void *, double ms) { ++calls; lastMs = ms; };
+    {
+        const preview_paint_timing::Scope outer;
+        const preview_paint_timing::Scope inner;
+    }
+    ASSERT_EQ(1, calls);
+    ASSERT_TRUE(lastMs >= 0.0);
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();
+    {
+        const preview_paint_timing::Scope unheard;
+    }
+    ASSERT_EQ(1, calls);
+    preview_paint_timing::reset();
+}

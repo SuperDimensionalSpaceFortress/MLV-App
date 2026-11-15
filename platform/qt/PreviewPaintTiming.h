@@ -40,6 +40,21 @@ inline int &scopeDepth()
     return value;
 }
 
+// CPU-S1-PRESENT-INTERVAL-BOUND-1: told each outermost paint's wall ms as the paint ends
+// (playback_smoke.critical_hop_summary's viewport paint intervals). Set only while a playback smoke
+// session is active; null otherwise, so a paint pays one null check.
+struct PaintListener
+{
+    void ( *fn )( void *context, double ms ) = nullptr;
+    void *context = nullptr;
+};
+
+inline PaintListener &paintListener()
+{
+    static PaintListener value;
+    return value;
+}
+
 // Times one paint, from construction to destruction. Only the outermost Scope counts, so a paintGL
 // that opens its own Scope is timed once whether a Paint event (already in a Scope) or a direct
 // grabFramebuffer() reached it (GUI-PAINT-DIRECT-GRAB).
@@ -56,6 +71,8 @@ public:
         ++value.paints;
         value.sumMs += ms;
         if( ms > value.maxMs ) value.maxMs = ms;
+        const PaintListener &listener = paintListener();
+        if( listener.fn ) listener.fn( listener.context, ms );
     }
     Scope( const Scope & ) = delete;
     Scope &operator=( const Scope & ) = delete;

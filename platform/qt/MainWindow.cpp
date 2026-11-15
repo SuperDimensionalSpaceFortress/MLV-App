@@ -2622,6 +2622,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 MainWindow::~MainWindow()
 {
     playback_paint_credit::setSink( nullptr, nullptr );
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
@@ -5227,13 +5228,30 @@ void MainWindow::endGuiPresentIdleWait( void )
 void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 {
     const qint64 startNs = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapClock.nsecsElapsed() : -1;
+    const double hopSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;   // CPU-S1-PRESENT-INTERVAL-BOUND-1
     QElapsedTimer slept;
     slept.start();
     QThread::msleep( ms );
     const qint64 sleptNs = slept.nsecsElapsed();
+    if( m_playbackSmokeActive && hopSleepStartS > 0.0 )
+        m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSleepStartS, mlv_stage_timing_now() );
     if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
         m_guiPresentGapRunnerSleepNs += m_guiPresentGapClock.nsecsElapsed() - startNs;
     GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
+}
+
+// CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split's clock (frameReadyEmitStageTime's), and the paint
+// sink's listener while a smoke session is active: an outermost preview paint of `ms` that ends now.
+static double guiHopWaitClockNow( void )
+{
+    return mlv_stage_timing_now();
+}
+
+static void guiHopWaitNoteViewportPaint( void *context, double ms )
+{
+    const double endS = mlv_stage_timing_now();
+    static_cast<gui_hop_wait::Recorder *>( context )->push(
+        gui_hop_wait::Kind::ViewportPaint, endS - ms / 1000.0, endS );
 }
 
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
@@ -5249,6 +5267,17 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         ( result.resultReadyTime > 0.0 && prepPresentStart >= result.resultReadyTime )
             ? ( prepPresentStart - result.resultReadyTime ) * 1000.0
             : 0.0;
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1: the result's wait for this present (the stamp
+    // avg_playback_prep_result_queue_ms starts from), split by the GUI work inside it; then this
+    // present, [entry, exit], is itself a PreparedPresent interval.
+    if( m_playbackSmokeActive && result.resultReadyTime > 0.0 && prepPresentStart >= result.resultReadyTime )
+        m_guiHopPrepResultWait.add( m_guiHopWait.split(
+            result.resultReadyTime, prepPresentStart,
+            gui_hop_wait::kindBit( gui_hop_wait::Kind::RunnerSleep )
+                | gui_hop_wait::kindBit( gui_hop_wait::Kind::ViewportPaint ) ) );
+    const gui_hop_wait::IntervalScope hopPresentInterval(
+        m_playbackSmokeActive ? &m_guiHopWait : nullptr, gui_hop_wait::Kind::PreparedPresent,
+        prepPresentStart, &guiHopWaitClockNow );
     const double prepElapsedBeforePresentMs =
         ( display_start > 0.0 && prepPresentStart >= display_start )
             ? ( prepPresentStart - display_start ) * 1000.0
@@ -27053,6 +27082,14 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackLookaheadRequestsIssued = 0;
     m_playbackLookaheadCoveredRequests = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split starts empty; preview paints reach it only while
+    // the session is active (cleared where the session ends, and in the destructor).
+    m_guiHopWait.reset();
+    m_guiHopFrameReadyWait.reset();
+    m_guiHopPrepResultWait.reset();
+    m_guiHopEmitToRequestIssue.reset();
+    preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;
+    preview_paint_timing::paintListener().context = &m_guiHopWait;
     m_playbackSmokeActive = true;
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
     m_playbackSmokeFrameLogEnabled =
@@ -30775,6 +30812,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     }
 
     m_playbackSmokeActive = false;
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
     m_playbackPresentTrace.end();
 
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
@@ -31051,10 +31089,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
 
     // PLAYBACK-DECODE-RENDER-OVERLAP-1: the engagement counter. overlap_fraction_of_render is the share of
     // render-busy time some decode/recon ran under (0 = one frame in flight, stages in series).
+    playback_overlap::OverlapSnapshot hopOverlap;   // CPU-S1-PRESENT-INTERVAL-BOUND-1: critical_hop_summary reads this one
     {
         const playback_overlap::OverlapSnapshot overlap =
             m_pRenderThread ? m_pRenderThread->pipelineOverlapSnapshot()
                             : playback_overlap::OverlapSnapshot();
+        hopOverlap = overlap;
         // PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch counters are object-scoped (any thread decodes),
         // so they reach this line on every route. Appended at the end; no tools/ parser anchors on the line's end.
         mlvRawUint16PrefetchStats_t raw = {};
@@ -31955,6 +31995,50 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
                                                         : QStringLiteral("none") )
                + otherBusySplit;
+    }
+
+    /* CPU-S1-PRESENT-INTERVAL-BOUND-1: the CPU route's serial loop is decode + recon + render + the GUI
+     * hop (frameReady emit -> drawFrameReady). frame_ready_wait is that hop's window (the one
+     * avg_present_ui_signal_latency_ms measures) and prep_result_wait the prep result's wait for its present
+     * (the one avg_playback_prep_result_queue_ms measures), each split by the GUI work inside it
+     * (GuiHopWaitSplit.h): the smoke runner's sleep, a prep present, a preview paint, other. Averages are over
+     * the attributed windows (frames= for frame_ready_wait); an unattributed window is only counted.
+     * emit_to_request_issue is the emit to the next request's issue on the early advances that issued one. */
+    {
+        using gui_hop_wait::Kind;
+        const gui_hop_wait::Accumulator &fr = m_guiHopFrameReadyWait;
+        const gui_hop_wait::Accumulator &pr = m_guiHopPrepResultWait;
+        const double upstreamPlusRenderPerRenderMs =
+            hopOverlap.renderStarts > 0
+                ? ( hopOverlap.decodeBusyMs + hopOverlap.reconBusyMs + hopOverlap.renderBusyMs )
+                      / static_cast<double>( hopOverlap.renderStarts )
+                : 0.0;
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.critical_hop_summary session=%1 frames=%2 "
+                   "avg_frame_ready_wait_ms=%3 avg_frame_ready_wait_runner_sleep_ms=%4 "
+                   "avg_frame_ready_wait_prepared_present_ms=%5 avg_frame_ready_wait_viewport_paint_ms=%6 "
+                   "avg_frame_ready_wait_other_ms=%7 frame_ready_wait_unattributed_frames=%8 "
+                   "avg_prep_result_wait_ms=%9 avg_prep_result_wait_runner_sleep_ms=%10 "
+                   "avg_prep_result_wait_viewport_paint_ms=%11 avg_prep_result_wait_other_ms=%12 "
+                   "prep_result_wait_unattributed_frames=%13 emit_to_request_frames=%14 "
+                   "avg_emit_to_request_issue_ms=%15 avg_upstream_plus_render_per_render_ms=%16" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( static_cast<qulonglong>( fr.frames ) )
+                   .arg( fr.avgWaitMs(), 0, 'f', 3 )
+                   .arg( fr.avgKindMs( Kind::RunnerSleep ), 0, 'f', 3 )
+                   .arg( fr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 )
+                   .arg( fr.avgKindMs( Kind::ViewportPaint ), 0, 'f', 3 )
+                   .arg( fr.avgOtherMs(), 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( fr.unattributedFrames ) )
+                   .arg( pr.avgWaitMs(), 0, 'f', 3 )
+                   .arg( pr.avgKindMs( Kind::RunnerSleep ), 0, 'f', 3 )
+                   .arg( pr.avgKindMs( Kind::ViewportPaint ), 0, 'f', 3 )
+                   .arg( pr.avgOtherMs(), 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( pr.unattributedFrames ) )
+                   .arg( static_cast<qulonglong>( m_guiHopEmitToRequestIssue.count ) )
+                   .arg( m_guiHopEmitToRequestIssue.avg(), 0, 'f', 3 )
+                   .arg( upstreamPlusRenderPerRenderMs, 0, 'f', 3 );
     }
 
     /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /
@@ -35302,8 +35386,16 @@ void MainWindow::drawFrameReady()
                     readyFrame.frameReadyEmitStageTime;
                 m_playbackTimelineSourceDrawBeginStageTime = 0.0;
             }
+            const uint64_t hopRequestSerialBefore = m_nextRenderRequestSerial;   // CPU-S1-PRESENT-INTERVAL-BOUND-1
             timerFrameEvent( predictiveGpuTexNrEarlyAdvance );
             const double advance_return = mlv_stage_timing_now();
+            // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop from this frame's frameReady emit to the next
+            // request's issue, on the advances that issued one.
+            if( m_playbackSmokeActive
+             && m_nextRenderRequestSerial != hopRequestSerialBefore
+             && readyFrame.frameReadyEmitStageTime > 0.0
+             && advance_start >= readyFrame.frameReadyEmitStageTime )
+                m_guiHopEmitToRequestIssue.add( ( advance_start - readyFrame.frameReadyEmitStageTime ) * 1000.0 );
             m_lastDrawFrameReadyAdvanceMs =
                 (advance_return - advance_start) * 1000.0;
             predictiveGpuTexNrEarlyAdvanceExecuted = true;
@@ -35449,6 +35541,9 @@ void MainWindow::drawFrameReady()
     {
         m_lastDrawFrameReadyQueueMs =
             (display_start - readyFrame.frameReadyEmitStageTime) * 1000.0;
+        // CPU-S1-PRESENT-INTERVAL-BOUND-1: the same window, split by the GUI work inside it.
+        if( m_playbackSmokeActive )
+            m_guiHopFrameReadyWait.add( m_guiHopWait.split( readyFrame.frameReadyEmitStageTime, display_start ) );
     }
     const bool gpuViewportInstalled = gpuPreviewSurfaceActive();
     const bool zoomFitEnabled = ui->actionZoomFit->isChecked();
