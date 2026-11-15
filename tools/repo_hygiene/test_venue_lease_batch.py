@@ -1255,6 +1255,42 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertTrue(got["atOrAboveFloor"], got)
         self.assertLessEqual(got["lateSec"], 0.3, f"a pause between the clock reads placed the agent job's end late (time handed back to the idle allowance): {got}")
 
+    def test_lease_batch_idle_end_r7_adv_a2_a_receipt_or_ledger_line_that_is_not_one_json_object_is_never_read(self) -> None:
+        # adversary-065db820.json A2: a lease-batch receipt line [null,{token,leaseId,endReason:idle}] reached Read-VenueLeaseBatchReceipt as an array, and member enumeration
+        # answered .token/.leaseId/.endReason from the object inside it: FOUND, then Get-LeaseIdleEnd typed LEASE_IDLE_ENDED (repeated: LEASE_IDLE_CHURN, exit 14). ConvertFrom-Json
+        # also unrolls [{..}] and [[{..}]] to the object inside, so only a line whose text is ONE JSON object ({ first) is a record. Sibling (VenueChain.psm1:1155): the lease
+        # ledger reader, same rule. The plain object line still answers FOUND and the plain ledger line is still read.
+        case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        (case / "share" / "logs").mkdir(parents=True)
+        tok = "0123456789ab"
+        rec = '{"token":"0123456789ab","leaseId":"L1","endReason":"idle","endedUtc":"2026-11-14T18:00:00Z","heldSec":301}'
+        led = '{"venue":"bachelor","token":"0123456789ab","leaseId":"L1","startUtc":"2026-11-14T17:00:00Z","endUtc":"2026-11-14T17:30:00Z"}'
+        script = (
+            f"Import-Module '{psq(DV / 'VenueChain.psm1')}' -Force -DisableNameChecking\n"
+            f"$share = '{psq(case / 'share')}'; $log = Join-Path $share 'logs\\lease-batch-{tok}.jsonl'; $cd = '{psq(case / 'claims')}'\n"
+            "New-Item -ItemType Directory -Force -Path $cd | Out-Null\n"
+            f"$rec = '{psq(rec)}'; $led = '{psq(led)}'\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($k in 'nullThenObject', 'oneElement', 'nested', 'plain') {\n"
+            "    $line = switch ($k) { 'nullThenObject' { \"[null,$rec]\" } 'oneElement' { \"[$rec]\" } 'nested' { \"[[$rec]]\" } 'plain' { $rec } }\n"
+            "    [IO.File]::WriteAllText($log, $line + \"`n\")\n"
+            f"    $out[\"receipt_$k\"] = (Read-VenueLeaseBatchReceipt -AgentShare $share -Token '{tok}' -LeaseId 'L1').state\n"
+            "    $lp = Get-VenueLeaseLedgerPath -Venue 'bachelor' -ClaimDir $cd; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lp) | Out-Null\n"
+            "    $lline = switch ($k) { 'nullThenObject' { \"[null,$led]\" } 'oneElement' { \"[$led]\" } 'nested' { \"[[$led]]\" } 'plain' { $led } }\n"
+            "    [IO.File]::WriteAllText($lp, $lline + \"`n\")\n"
+            "    $out[\"ledger_$k\"] = @(Read-VenueLeaseLedger -Venue 'bachelor' -ClaimDir $cd).Count\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {
+            "receipt_nullThenObject": "ABSENT", "ledger_nullThenObject": 0,
+            "receipt_oneElement": "ABSENT", "ledger_oneElement": 0,
+            "receipt_nested": "ABSENT", "ledger_nested": 0,
+            "receipt_plain": "FOUND", "ledger_plain": 1,
+        })
+
     def test_lease_batch_idle_end_r6_grok_g11_every_idle_end_call_names_its_parameters_in_full(self) -> None:
         # Grok G11 on #817: a call that abbreviates a parameter (-Append for -AppendDetail) binds today by prefix and turns into an ambiguous-parameter error (BATCH_ERROR on a rare
         # path) the day the helper gains another -Append* parameter. Every Set-BatchLeaseIdleEnded call names each parameter exactly as the helper declares it (AST on both sides).
