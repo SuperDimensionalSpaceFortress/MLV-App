@@ -999,6 +999,19 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertNotIn("STAGE_SKIP_ALREADY", [r["outcome"] for r in self.rows()])
         self.nothing_built_or_submitted()
 
+    def test_r12_the_cap_seam_never_moves_the_deadline_later(self) -> None:
+        # r12 fix iteration 2 (adversary A1 on 95274c68, Invoke-VenueStageNightly.ps1:287): -TestSoundnessCapLeftSec SET the deadline to now + its value, so 30 s
+        # under a 10 s -MaxTotalSec moved the cap ~20 s later and a 15 s artifact hash ended STAGE_SKIP_ALREADY (exit 0) past the real cap. The seam may only bring
+        # the deadline nearer: the read runs into the 10 s cap and the call ends STAGE_CAP_EXCEEDED.
+        self.stage_cache()
+        t0 = time.monotonic()
+        p = self.run_driver("-MaxTotalSec", "10", "-TestSoundnessCapLeftSec", "30", "-TestSoundnessCapAt", "first",
+                            "-TestSoundnessArtifactDelayMs", "15000", "-TestSoundnessArtifactDelayAt", "first", probe="5")
+        took = time.monotonic() - t0
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertNotIn("STAGE_SKIP_ALREADY", [r["outcome"] for r in self.rows()])
+        self.assertLess(took, 25.0, p.stdout)
+
     def test_r9_g9_the_artifact_delay_seam_takes_its_read_in_any_case(self) -> None:
         # G9: ValidateSet is case-insensitive, so FINAL and First bind; with -ceq the seam silently dropped the delay. Each spelling delays its read (the call takes
         # the 8 s) and ends with the lowercase run's verdict (test_the_final_verify_artifact_hash_past_the_probe_timeout_with_cap_left_is_stage_ok, STAGE_OK).

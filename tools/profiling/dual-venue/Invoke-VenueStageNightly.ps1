@@ -284,7 +284,8 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     # really ran out during the read (under the 1 s Get-ProbeSec needs for any read); a read that failed with time left is an UNREACHABLE answer the caller types.
     $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
     $atSeam = ($TestSoundnessCapAt -ieq 'first' -and $script:SoundnessReads -eq 0) -or ($TestSoundnessCapAt -ieq 'final' -and $FinalVerify)
-    if ($atSeam -and $TestSoundnessCapLeftSec -ge 0) { $script:Deadline = [DateTime]::UtcNow.AddSeconds($TestSoundnessCapLeftSec) }
+    # r12 fix iteration 2 (adversary A1 on 95274c68): the test-only seam may only bring the deadline NEARER, never move it later than -MaxTotalSec put it
+    if ($atSeam -and $TestSoundnessCapLeftSec -ge 0) { $seamDeadline = [DateTime]::UtcNow.AddSeconds($TestSoundnessCapLeftSec); if ($seamDeadline -lt $script:Deadline) { $script:Deadline = $seamDeadline } }
     # r6 (Grok G6/G7 on #814): the manifest read keeps that probe bound, and the artifact hash (the package zip, exe and dll over SMB) gets its OWN budget, the
     # lease batch plan preflight's (-ArtifactTimeoutSec 300, Invoke-VenueLeaseBatch.ps1), never past what is left of -MaxTotalSec (-CallCapSec). r4/r5 hashed all
     # three inside the one 30 s probe, so a sound build whose package hashed slower than that was SHARE_UNREACHABLE at step 4 (G6) and at the final verify (G7).
