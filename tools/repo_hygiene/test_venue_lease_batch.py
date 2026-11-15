@@ -78,7 +78,8 @@ MIXED_CLOCK_CHECKLIST_LINE = "mixed wall/monotonic clock: every deadline derives
 MIXED_CLOCK_WALL_RX = re.compile(r"\[(?:System\.)?DateTime(?:Offset)?\]::UtcNow\b", re.IGNORECASE)
 MIXED_CLOCK_MONO_RX = re.compile(r"\[(?:System\.)?(?:Diagnostics\.)?Stopwatch\]::GetTimestamp\(\)", re.IGNORECASE)
 MIXED_CLOCK_DEADLINE_RX = re.compile(r"\$\w*(?:deadline|until|gateEnd)\w*\b", re.IGNORECASE)
-MIXED_CLOCK_ANCHOR_RX = re.compile(r"\$(\w+)\s*=\s*\[(?:System\.)?DateTime(?:Offset)?\]::UtcNow(?=\s*(?:;|\}|$))", re.IGNORECASE)
+# r9b (adversary-74e14dda.json A2): and in parentheses, $t0 = ([DateTime]::UtcNow)
+MIXED_CLOCK_ANCHOR_RX = re.compile(r"\$(\w+)\s*=\s*(?:\(\s*)*\[(?:System\.)?DateTime(?:Offset)?\]::UtcNow(?:\s*\))*(?=\s*(?:;|\}|$))", re.IGNORECASE)
 MIXED_CLOCK_WAIT_UNTIL_RX = re.compile(r"""['"]-WaitUntilUtc['"]\s*,|-WaitUntilUtc\s+[\$\(\[]""", re.IGNORECASE)
 KNOWN_WALL_DEADLINES = frozenset({
     ("Invoke-VenueBaseline.ps1", "CAPTURED_WALL", "$deadline = $startedUtc.AddSeconds($MaxTotalSec)"),
@@ -151,7 +152,7 @@ DEVICE_MATRIX_NAMES = (
 
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
 FAKE_QUIET = r"""
-param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0, [string]$WaitUntilUtc = '')
+param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0, [string]$WaitUntilUtc = '', [long]$WaitUntilTs = 0)
 $runDir = Split-Path -Parent $WorkDir
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $countFile = Join-Path $runDir 'fake-quiet-count.txt'
@@ -1445,6 +1446,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "function Invoke-FakeProbe { $global:seenArgs = @($args); $global:LASTEXITCODE = 3 }\n"
             f"$RunDir = '{psq(case)}'; $QuietScript = '{psq(RUNNER)}'; $Venue = 'bachelor'; $ThresholdPercent = 15; $RecheckSec = 30; $pwshExe = 'Invoke-FakeProbe'\n"
             "$claimKeeper = $null; $claim = [pscustomobject]@{ expiresUtc = [DateTime]::UtcNow.AddHours(1) }; $ThermalDispatchGraceSec = 1; $ThermalPollSec = 30; $ThermalWaitCapSec = 30\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency\n"
             "$runs = @(for ($k = 0; $k -lt $cut; $k++) {\n"
             "    $body = @(for ($i = 0; $i -lt $stmts.Count; $i++) { $stmts[$i]; if ($i -eq $k) { '$global:wallStepSec = -60' } }) -join \"`n\"\n"
             "    . ([scriptblock]::Create('function Invoke-QuietProbe(' + $params + \") {`n\" + $body + \"`n}\"))\n"
@@ -1455,7 +1457,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "    $a = @($global:seenArgs); $iu = [Array]::IndexOf($a, '-WaitUntilUtc'); $im = [Array]::IndexOf($a, '-MaxWaitSec')\n"
             "    if ($iu -lt 0) { \"after statement ${k}: no -WaitUntilUtc ($($q | ConvertTo-Json -Compress))\"; continue }\n"
             "    $until = [DateTime]::Parse($a[$iu + 1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()\n"
-            "    [ordered]@{ after = $k; lateSec = [Math]::Round(($until - $t0.AddSeconds(30 - 60)).TotalSeconds, 3); maxWaitSec = [int]$a[$im + 1]; waitSec = $q.maxWaitSec }\n"
+            "    $it = [Array]::IndexOf($a, '-WaitUntilTs'); $tsLate = $(if ($it -ge 0) { [Math]::Round(([long]$a[$it + 1] - ($t0Ts + 30 * $f)) / [double]$f, 3) } else { $null })\n"
+            "    [ordered]@{ after = $k; lateSec = [Math]::Round(($until - $t0.AddSeconds(30 - 60)).TotalSeconds, 3); tsLateSec = $tsLate; maxWaitSec = [int]$a[$im + 1]; waitSec = $q.maxWaitSec }\n"
             "})\n"
             "[ordered]@{ cut = $cut; runs = $runs } | ConvertTo-Json -Compress -Depth 4\n"
         )
@@ -1469,6 +1472,10 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 self.assertIsInstance(g, dict, g)
                 self.assertLessEqual(g["lateSec"], 0.3, f"a 60 s wall-clock step back after statement {g['after']} placed the probe's wait end past the idle bound: {g}")
                 self.assertGreater(g["lateSec"], -5.0, f"the wait end was placed far earlier than the bound (the spent time counted twice?): {g}")
+                # r9b (adversary-74e14dda.json A1): the same end on the monotonic counter, which no wall step moves
+                self.assertIsNotNone(g["tsLateSec"], f"no -WaitUntilTs was passed: {g}")
+                self.assertLessEqual(g["tsLateSec"], 0.3, g)
+                self.assertGreater(g["tsLateSec"], -5.0, g)
                 self.assertEqual(g["maxWaitSec"], g["waitSec"], g)
                 self.assertLessEqual(g["maxWaitSec"], 30, g)
 
@@ -1549,6 +1556,47 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         got = json.loads(out.stdout)
         self.assertGreaterEqual(got["aheadSec"], -0.3, f"a pause between Wait-VenueQuiet's two clock reads put Get-WaitNowUtc behind real time (every deadline ends that late): {got}")
 
+    def test_lease_batch_idle_end_r9_adv_74e14dda_a1_a_suspend_and_a_clock_step_before_the_childs_start_never_move_its_wait_end(self) -> None:
+        # adversary-74e14dda.json A1: the runner placed -WaitUntilUtc (a WALL instant) and -MaxWaitSec 239 (counted from the child's own start), then was suspended 90 s while
+        # this host's clock stepped back 120 s: the child started with its wall clock 30 s behind the caller's reading, so its deadline was min(t0 + 239, wall end) = t0 + 239,
+        # 90 + 239 = 330 s after the caller's end was placed (past an idle bound of 300). -WaitUntilTs carries the end on the monotonic counter the child shares with the runner:
+        # Wait-VenueQuiet's own deadline statements are run here (taken from the script) with that input: the deadline and the gate end are the caller's end, 239 - 90 = 149 s
+        # after the child's start. Not given (0) changes nothing; an end long past ends the wait at once; [long]::MaxValue cannot overflow. LEASE_BATCH_RED_REF=74e14dda: RED, 239.
+        wvq_path = DV / "Wait-VenueQuiet.ps1"
+        script = (
+            ps_parse_source(wvq_path) + "\n"
+            "$st = @($ast.EndBlock.Statements)\n"
+            "$i0 = 0; while ($i0 -lt $st.Count -and -not $st[$i0].Extent.Text.StartsWith('$deadline = $t0.AddSeconds($MaxWaitSec)')) { $i0++ }\n"
+            "$i1 = $i0; while ($i1 -lt $st.Count -and -not ($st[$i1] -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $i1++ }\n"
+            "if ($i0 -ge $st.Count -or $i1 -ge $st.Count) { throw \"deadline statements not found ($i0, $i1)\" }\n"
+            "$block = [scriptblock]::Create((@($st[$i0..($i1 - 1)] | ForEach-Object { $_.Extent.Text }) -join \"`n\"))\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $MaxWaitSec = 239; $MaxGateSec = 2400\n"
+            "$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "$parentTs = $t0Ts - 90 * $f; $parentWall = $t0.AddSeconds(30)\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($k in 'suspendAndStep', 'notGiven', 'longPast', 'maxValue') {\n"
+            "    $WaitUntilUtc = $(if ($k -eq 'notGiven') { '' } else { $parentWall.AddSeconds(239).ToString('o') })\n"
+            "    $WaitUntilTs = switch ($k) { 'suspendAndStep' { $parentTs + [long](239 * $f) } 'notGiven' { [long]0 } 'longPast' { [long]1 } 'maxValue' { [long]::MaxValue } }\n"
+            "    . $block\n"
+            "    $out[$k] = [ordered]@{ deadlineSec = [Math]::Round(($deadline - $t0).TotalSeconds, 3); gateEndSec = [Math]::Round(($gateEnd - $t0).TotalSeconds, 3) }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        for key in ("deadlineSec", "gateEndSec"):
+            with self.subTest(case="suspendAndStep", bound=key):
+                self.assertLessEqual(got["suspendAndStep"][key], 149.3, f"a suspend and a clock step before the child's start moved its wait end past the caller's: {got}")
+                self.assertGreater(got["suspendAndStep"][key], 148.0, got)
+            with self.subTest(case="notGiven", bound=key):
+                self.assertEqual(got["notGiven"][key], 239.0, got)
+            with self.subTest(case="longPast", bound=key):
+                self.assertEqual(got["longPast"][key], -1.0, got)
+            with self.subTest(case="maxValue", bound=key):
+                self.assertLessEqual(got["maxValue"][key], 239.0, got)
+                self.assertGreater(got["maxValue"][key], 200.0, got)
+
     # ---------------------------------------------------------------- r9 (Grok G14 prevention on #817): the mixed wall/monotonic clock lint
     def test_lease_batch_idle_end_r9_grok_g14_mixed_clock_lint_the_dual_venue_scripts_hold_exactly_the_known_wall_deadlines(self) -> None:
         # Every .ps1/.psm1 under tools/profiling/dual-venue: a NEW wall-clock deadline (or -WaitUntilUtc counted from a captured wall instant) fails here; a known one that is
@@ -1584,13 +1632,16 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "case-wait-until.ps1": "$d = [datetime]::utcnow\n$qArgs += @('-WAITUNTILUTC', $D.ADDSECONDS($wait).ToString('o'))\n",
             "case-cge-break.ps1": "$tc = [System.DateTime]::UtcNow\nif ([datetime]::utcnow -cge $TC.addSeconds(5)) { BREAK }\n",
             "offset-anchor.ps1": "$t0 = [DateTimeOffset]::UtcNow\n$gateEnd = $t0.AddSeconds(30)\n",
+            # adversary-74e14dda.json A2: a parenthesized anchor
+            "paren-anchor.ps1": "$t0 = ([DateTime]::UtcNow)\n$deadline = $t0.AddSeconds(30)\nif ([DateTime]::UtcNow -gt $deadline) { break }\n",
             "case-frame.ps1": ("$t0Ts = [diagnostics.stopwatch]::gettimestamp()\n$t0 = [datetime]::utcnow\n"
                                "function Get-WaitNowUtc { $T0.AddSeconds(([System.Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / 1.0) }\n"
                                "if ([DateTime]::UTCNOW -gt $Deadline) { break }\n"),
         })
         want = {"g14-2854b231.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"}, "reconcile-pre-r9.ps1": {"CAPTURED_WALL"}, "wvq-5fc3bf72.ps1": {"FRAME_WALL_READ"},
                 "case-lower-anchor.ps1": {"CAPTURED_WALL"}, "case-upper-var.ps1": {"CAPTURED_WALL"}, "case-wait-until.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"},
-                "case-cge-break.ps1": {"CAPTURED_WALL"}, "offset-anchor.ps1": {"CAPTURED_WALL"}, "case-frame.ps1": {"FRAME_WALL_READ"}}
+                "case-cge-break.ps1": {"CAPTURED_WALL"}, "offset-anchor.ps1": {"CAPTURED_WALL"}, "case-frame.ps1": {"FRAME_WALL_READ"},
+                "paren-anchor.ps1": {"CAPTURED_WALL"}}
         for name, text in red.items():
             with self.subTest(fixture=name):
                 self.assertEqual({rule for (n, rule, _c) in mixed_clock_deadline_hits({name: text})}, want[name])

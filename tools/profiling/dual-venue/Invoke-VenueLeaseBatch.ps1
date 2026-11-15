@@ -1557,6 +1557,9 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     # added to the wall clock read here. The wall clock is read first and the Stopwatch after it (PowerShell evaluates the target before the argument), so a pause between
     # the two only ends the wait sooner.
     $qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $wait - ([Diagnostics.Stopwatch]::GetTimestamp() - $dispatchTs) / [double][Diagnostics.Stopwatch]::Frequency)).ToString('o'))
+    # r9b (adversary-74e14dda.json A1): and the same end on the MONOTONIC counter the child shares with this process (it runs on this host): a suspend after this point and a
+    # step of the wall clock during it moved the -WaitUntilUtc instant and the child's own -MaxWaitSec, but they cannot move this one.
+    $qArgs += @('-WaitUntilTs', [string]($dispatchTs + [long]($wait * [double][Diagnostics.Stopwatch]::Frequency)))
     $startTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r4 pass 2 (adversary A1): the probe's dispatch, the latest instant provably before its agent jobs (the idle anchor)
     $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
     # r6 (adversary r5 A2): the child's result is observed HERE: this is the instant of its reading, taken before the evidence write and the parse below (either can stall on a share,

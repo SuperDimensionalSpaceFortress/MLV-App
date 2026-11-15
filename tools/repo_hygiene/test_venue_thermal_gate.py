@@ -354,6 +354,8 @@ class ThermalGateModuleTests(unittest.TestCase):
         # r8 (adversary-f52a32d6.json A1): the end is counted from $dispatchUtc, read before the wait's cuts (still in memory, no file or share)
         # r9 (Grok G14 on #817): it is the wall clock read at the dispatch plus the wait left on the MONOTONIC clock since $dispatchTs (still in memory, no file or share)
         in_memory = ("$qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $wait - ([Diagnostics.Stopwatch]::GetTimestamp() - $dispatchTs) / [double][Diagnostics.Stopwatch]::Frequency)).ToString('o'))",
+                     # r9b (adversary-74e14dda.json A1): and the same end on the monotonic counter (in memory)
+                     "$qArgs += @('-WaitUntilTs', [string]($dispatchTs + [long]($wait * [double][Diagnostics.Stopwatch]::Frequency)))",
                      "$startTs = [Diagnostics.Stopwatch]::GetTimestamp()")
         while after and after[0].lstrip().startswith(in_memory):
             after.pop(0)

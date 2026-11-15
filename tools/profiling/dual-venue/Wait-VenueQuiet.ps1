@@ -147,6 +147,9 @@ param(
     # -MaxWaitSec runs from this script's own start, which comes after the process started: an in-lease probe given the agent's remaining idle allowance as -MaxWaitSec
     # waited that long past the dispatch plus the startup. Unset: -MaxWaitSec alone, as before. Unreadable: refused (exit 2), never ignored.
     [Parameter(ParameterSetName = 'Live')][string]$WaitUntilUtc = '',
+    # r9b (adversary-74e14dda.json A1): the same end as a Stopwatch timestamp ([Diagnostics.Stopwatch]::GetTimestamp(), QueryPerformanceCounter: ONE counter for every process
+    # on this host), so neither a step of the wall clock nor this script's startup can move it. Only a caller on THIS host may pass it. 0 (the default): not given.
+    [Parameter(ParameterSetName = 'Live')][ValidateRange(0, [long]::MaxValue)][long]$WaitUntilTs = 0,
     [Parameter(ParameterSetName = 'Live')][int]$MaxGateSec = 2400,
     [Parameter(ParameterSetName = 'Live')][int]$GatePollSec = 30,
     [Parameter(ParameterSetName = 'Live')][int]$ReadAttempts = 3,
@@ -287,6 +290,15 @@ if ($WaitUntilUtc) {
     $wu = $wuo.UtcDateTime
     if ($wu -lt $deadline) { $deadline = $wu }
     if ($wu -lt $gateEnd) { $gateEnd = $wu }
+}
+# r9b (adversary-74e14dda.json A1): -WaitUntilUtc is a WALL instant, read in this script's frame at $t0, and -MaxWaitSec runs from $t0: the caller suspended after placing
+# them and this host's clock stepped back meanwhile (90 s, then 120 s back) left both past the caller's end (an idle bound of 300 s overrun to about 330 s). -WaitUntilTs is
+# read against $t0Ts on the one monotonic counter, so the deadline is the caller's end whatever happened between. Placed in Get-WaitNowUtc's frame ($t0 + time since $t0Ts),
+# clamped to [-1 s, -MaxWaitSec] (an end already passed ends the wait at once; DateTime.AddSeconds cannot overflow).
+if ($WaitUntilTs -gt 0) {
+    $wts = $t0.AddSeconds([Math]::Max(-1.0, [Math]::Min([double]$MaxWaitSec, ($WaitUntilTs - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency)))
+    if ($wts -lt $deadline) { $deadline = $wts }
+    if ($wts -lt $gateEnd) { $gateEnd = $wts }
 }
 
 # Both directory counts, retried on a read error. Results go to $script:GateQueued / $script:GateRunning ($null = still unreadable after the last attempt):
