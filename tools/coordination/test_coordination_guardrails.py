@@ -1619,7 +1619,8 @@ function Test-WmiClassOperandCommand($Command) {
     # `-SelectProperties`, `-proga` were read as class operands). When the name may also mean Get-WmiObject / gwmi (no metadata under pwsh 7), or the CIM meanings
     # disagree, the hand list below is used, with every common parameter and alias the metadata names.
     $cimTables = @($watched | ForEach-Object { if ($_ -eq 'get-cimclass') { 'get-cimclass' } elseif ($_ -eq 'get-ciminstance' -or $_ -eq 'gcim') { 'get-ciminstance' } else { '#none' } } | Sort-Object -Unique)
-    $cimTable = if ($cimTables.Count -eq 1 -and $cimTables[0] -ne '#none') { $cimTables[0] } else { $null }
+    # Several CIM meanings (an alias defined twice) use the metadata when EVERY meaning binds the spelling to the same parameter (pass 21 A2); else it is unresolved.
+    $cimTable = if ($cimTables.Count -ge 1 -and $cimTables -notcontains '#none') { $cimTables } else { $null }
     $elements = @($Command.CommandElements)
     $examined = 0
     for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -1631,7 +1632,9 @@ function Test-WmiClassOperandCommand($Command) {
             $isOther = $false
             if ($null -ne $cimTable -and -not $isClass) {
                 # A spelling that binds to no parameter or to several takes no value (fail closed: the element after it is read as an operand).
-                $r = Resolve-CmdletParameter $cimTable $n
+                $bound = @(foreach ($tableName in $cimTable) { Resolve-CmdletParameter $tableName $n })
+                $r = $null
+                if ($bound.Count -eq @($cimTable).Count -and @($bound | ForEach-Object { if ($null -eq $_) { '#null' } else { $_.Name + '|' + $_.Switch } } | Sort-Object -Unique).Count -eq 1) { $r = $bound[0] }
                 if ($null -ne $r -and @('ClassName', 'Query') -contains $r.Name) { $isClass = $true }
                 elseif ($null -ne $r -and -not $r.Switch) { $isOther = $true }
             }
@@ -1675,6 +1678,14 @@ function Get-ConstantText($Node) {
     return ($parts -join ' ')
 }
 
+# True when a type name is an array type: written as one (`[object[]]`), or a name that RESOLVES to an array type (`[array]`, `[System.Array]`): r15, pass 21 A1.
+function Test-ArrayTypeName($TypeName) {
+    if ($TypeName.IsArray) { return $true }
+    $t = $null
+    try { $t = $TypeName.GetReflectionType() } catch { $t = $null }
+    return ($null -ne $t -and ($t.IsArray -or $t -eq [System.Array]))
+}
+
 # True when an InvokeMethod argument is DATA, not the method name: an array or a hashtable in the arguments slot of the (name, args) / (name, in-parameters, options)
 # overloads (index 1 after a literal name) or of CimSession.InvokeMethod (index 3 of four). An array at the name position converts to the string and is still read.
 function Test-DataArgument($Arguments, [int]$Index) {
@@ -1683,7 +1694,7 @@ function Test-DataArgument($Arguments, [int]$Index) {
     # A cast to an ARRAY type is an array whatever it wraps (r15, adversary pass 20 A3: `[object[]]'create'` is a one-element array, not the verb). Every wrapper
     # Get-ValueExpression would strip is looked at for one.
     for ($w = $Arguments[$Index]; $null -ne $w -and $w -isnot [ArrayLiteralAst]; ) {
-        if ($w -is [ConvertExpressionAst] -and $w.Type.TypeName.IsArray) { return $true }
+        if ($w -is [ConvertExpressionAst] -and (Test-ArrayTypeName $w.Type.TypeName)) { return $true }
         $next = $null
         if ($w -is [CommandExpressionAst]) { $next = $w.Expression }
         elseif ($w -is [PipelineAst] -and @($w.PipelineElements).Count -eq 1) { $next = @($w.PipelineElements)[0] }
@@ -1691,7 +1702,7 @@ function Test-DataArgument($Arguments, [int]$Index) {
         elseif ($w -is [ConvertExpressionAst]) { $next = $w.Child }
         elseif ($w -is [SubExpressionAst] -and @($w.SubExpression.Statements).Count -eq 1) { $next = @($w.SubExpression.Statements)[0] }
         elseif ($w -is [BinaryExpressionAst] -and $w.Operator -eq [TokenKind]::As) {
-            if ($w.Right -is [TypeExpressionAst] -and $w.Right.TypeName.IsArray) { return $true }
+            if ($w.Right -is [TypeExpressionAst] -and (Test-ArrayTypeName $w.Right.TypeName)) { return $true }
             $next = $w.Left
         }
         $w = $next
@@ -2012,9 +2023,18 @@ def _wmi_create_scan(tmp_path, paths):
     return json.loads(done.stdout)
 
 
+def _git_env_for(root):
+    """The environment with every repository-local git variable (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE ...) dropped, so `git -C root` reads ROOT's repository
+    and not the one a hook exported (r15, adversary pass 21 A3). The names are what git itself reports, asked with those variables already dropped."""
+    base = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k in ("GIT_EXEC_PATH",)}
+    names = subprocess.run(["git", "rev-parse", "--local-env-vars"], text=True, capture_output=True, check=True, env=base).stdout.split()
+    assert "GIT_DIR" in names and "GIT_INDEX_FILE" in names, names
+    return {k: v for k, v in os.environ.items() if k not in names}
+
+
 def _tracked_powershell_files(root=ROOT):
     listing = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--", ":(icase)*.ps1", ":(icase)*.psm1"], text=True, capture_output=True, check=True,
+        ["git", "-C", str(root), "ls-files", "-z", "--", ":(icase)*.ps1", ":(icase)*.psm1"], text=True, capture_output=True, check=True, env=_git_env_for(root),
     ).stdout
     return sorted(p for p in listing.split("\0") if p)
 
@@ -2028,6 +2048,22 @@ def test_tracked_powershell_listing_reads_any_extension_case(tmp_path):
         target.write_text("# x\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True, capture_output=True)
     assert _tracked_powershell_files(tmp_path) == sorted(["lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "sub/deep.PS1"])
+
+
+def test_tracked_powershell_listing_reads_its_own_repository_under_a_hook_git_environment(tmp_path, monkeypatch):
+    """adversary pass 21 A3 (r15): a hook exports GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE; the listing must still read the repository it is asked about, or a
+    decoy index that omits an unsafe file makes the tracked guard pass. SAFETY: every variable names a DECOY under tmp_path, never this repository."""
+    real, decoy = tmp_path / "real", tmp_path / "decoy"
+    for repo, names in ((real, ("safe.ps1", "unsafe.ps1")), (decoy, ("safe.ps1",))):
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, env=_git_env_for(repo))
+        for name in names:
+            (repo / name).write_text("# x\n", encoding="utf-8", newline="\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, env=_git_env_for(repo))
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(decoy / ".git" / "index"))
+    assert _tracked_powershell_files(real) == ["safe.ps1", "unsafe.ps1"]
 
 
 @_lane_scanner_only
@@ -2413,6 +2449,9 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "p20-a2-computer-name-alias-before-the-process-class": "$h = '.'\n$c = Get-CimInstance -CN $h Win32_Process\n$c.Create('x')",
         "p20-a3-array-cast-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod([object[]]'Create', [object[]]@('x', $null, $null))",
         "p20-a3-array-cast-in-a-cim-session-name-slot": "$session.InvokeMethod('root/cimv2', 'Win32_Process', [string[]]'Create', $null)",
+        # r15, adversary pass 21 on f8ebbb37: companions (an [array] cast at the NAME position is still the verb; a two-meaning CIM alias still reads the class)
+        "p21-a1-array-alias-cast-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod([array]'Create', [object[]]@('x', $null, $null))",
+        "p21-a2-two-cim-meanings-computer-name-alias-before-the-process-class": "Set-Alias readsvc Get-CimInstance\nSet-Alias readsvc Get-CimClass\n$server = '.'\n$c = readsvc -CN $server Win32_Process\n$c.Create('x')",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -2582,6 +2621,12 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "p20-a2-cim-timeout-select-and-progress-aliases": "$t = 5\n$p = 'Name'\n$a = 'SilentlyContinue'\n$svc = Get-CimInstance Win32_Service -OT $t -SelectProperties $p -proga $a\n$createService = $svc.Create",
         "p20-a3-object-array-cast-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwnerSid', [object[]]'create')",
         "p20-a3-string-array-cast-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwnerSid', ([string[]]'create'))",
+        # r15, adversary pass 21 on f8ebbb37, verbatim first: A1 the array type ALIAS ([array], [System.Array], `-as [array]`) is an array cast too; A2 an alias
+        # with two CIM meanings that bind CN / ServerName / OT identically takes the value
+        "p21-a1-array-alias-cast-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwnerSid', [array]'create')",
+        "p21-a1-system-array-cast-and-as-array-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwnerSid', [System.Array]'create')\n$p.InvokeMethod('GetOwnerSid', ('create' -as [array]))",
+        "p21-a2-two-cim-meanings-computer-name-alias": "Set-Alias readsvc Get-CimInstance\nSet-Alias readsvc Get-CimClass\n$server = '.'\n$name = 'svc'\nreadsvc -ClassName Win32_Service -CN $server -PipelineVariable $name | Out-Null",
+        "p21-a2-two-cim-meanings-server-name-and-timeout-aliases": "Set-Alias readsvc Get-CimInstance\nSet-Alias readsvc Get-CimClass\n$server = '.'\n$t = 5\n$name = 'svc'\nreadsvc -ClassName Win32_Service -ServerName $server -OT $t -PipelineVariable $name | Out-Null",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
