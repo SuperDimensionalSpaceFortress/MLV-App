@@ -3146,6 +3146,36 @@
       "lines": [
         708
       ]
+    },
+    {
+      "path": "tests/pipeline/test_prep_pointwise_fast.cpp",
+      "anchor": "ASSERT_TRUE ( std :: isfinite ( spans . pointwiseTeamSkewMs ) && spans . pointwiseTeamSkewMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PREP-POINTWISE-LEVER-1: range sanity check on the fast path's team skew (last minus first thread finish, a QElapsedTimer span) for the Timed 16-bit route: finite and non-negative. 0.0 satisfies it, so it never proves the pass ran; that is proved in the same loop by ASSERT_TRUE(spans.pointwiseFast), ASSERT_EQ(threads, spans.pointwiseOmpThreads) and the max-abs-diff-0 comparison against the reference.",
+      "lines": [
+        998
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_prep_pointwise_fast.cpp",
+      "anchor": "ASSERT_TRUE ( std :: isfinite ( spans8 . pointwiseTeamSkewMs ) && spans8 . pointwiseTeamSkewMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PREP-POINTWISE-LEVER-1: the same finite/non-negative range check on To8's 16-bit route. 0.0 satisfies it, so it is not a run proof; the run is proved by ASSERT_TRUE(spans8.pointwiseFast), the team-size equality and the byte-identity comparison in the same block.",
+      "lines": [
+        1011
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_prep_pointwise_fast.cpp",
+      "anchor": "ASSERT_TRUE ( std :: isfinite ( spansF . pointwiseTeamSkewMs ) && spansF . pointwiseTeamSkewMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PREP-POINTWISE-LEVER-1: the same finite/non-negative range check on the fused 8-bit route. 0.0 satisfies it, so it is not a run proof; the run is proved by ASSERT_TRUE(spansF.fused8), the team-size equality and the byte-identity comparison in the same block.",
+      "lines": [
+        1022
+      ]
     }
   ]
 }
