@@ -1659,7 +1659,11 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         lines = r.stdout.splitlines()
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (adversary A1 on 5fe750fa, Grok G20): the read is given what is left of the 2 s bound on the call's clock, and
         # the message reports that wait (and, when the call's end visibly cut it, says so)
-        self.assertRegex(lines[-1], r"^UNREACHABLE \[\] no answer in (2|1\.9\d) s( \(the call's end cut the [0-9.]+ s bound short\))? inside=[23]$", r.stdout + r.stderr)
+        # r14 (Grok G21 on #814): EXACT form, the clause required. The read is handed the caller's real bound (-TimeoutSec 2) and -EndSec clamps it, so the clause
+        # names the 2 s the caller set, never a remainder ("cut the 1.98 s bound short"); the wait itself is what was left of it on the call clock, under 2.
+        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 2 s bound short\) inside=[23]", lines[-1] if lines else "")
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self.assertTrue(1.0 <= float(m.group(1)) < 2.0, r.stdout + r.stderr)
         self.assertLess(elapsed, 14, f"the stalled read broke the bound: the whole process took {elapsed:.1f}s with a 20 s stuck read and -TimeoutSec 2")
         self.assertEqual(r.returncode, 7)
         self.assertEqual(lines[:-1], [

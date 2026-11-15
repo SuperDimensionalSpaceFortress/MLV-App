@@ -721,7 +721,9 @@ function Get-VenueStagedBuildManifest {
     # Under 1 s of it left (the least a read can be given) there is no read: UNREACHABLE.
     $readSec = $boundEndSec - $readStartSec
     if ($readSec -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $readSec) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
-    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $readSec -Clock $callClock -EndSec $boundEndSec
+    # r14 (Grok G21 on #814): the read is handed the caller's REAL bound (-TimeoutSec) and -EndSec does the clamping, so a cut-short wait names the bound the
+    # operator set ("cut the 2 s bound short"), never the remainder $readSec, which the wait's own later sample is always a little under (the clause fired on every timeout)
+    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec -Clock $callClock -EndSec $boundEndSec
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     if ($null -eq $ProbeScript -and $r.value.Count -gt 0 -and ([string]$r.value[0]).StartsWith('VENUE_PREDICATE_REFUSED:', [StringComparison]::Ordinal)) { throw ([string]$r.value[0]).Substring('VENUE_PREDICATE_REFUSED:'.Length) }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
@@ -785,7 +787,6 @@ function Get-VenueStagedBuildManifest {
                 # r6 (Grok G6/G7 on #814): an explicit hash budget never runs the call past -CallCapSec; under -ArtifactMinSec left of it, no hash (UNREACHABLE)
                 $capLeft = $CallCapSec - $hashStartSec
                 if ($capLeft -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
-                $artSec = [Math]::Min([double]$artSec, $capLeft)
                 $hashEndSec = [Math]::Min($hashEndSec, $CallCapSec)
             }
             if ($artSec -le 0) {
@@ -796,13 +797,11 @@ function Get-VenueStagedBuildManifest {
                 # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
                 if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
-                $artSec = $left
             }
             if ($TestPreHashDelayMs -gt 0) { [Threading.Thread]::Sleep($TestPreHashDelayMs) }
             # r12 (A1 on 7754d16e): what is left of that fixed end is taken again right before the launch; under -ArtifactMinSec of it, no hash (UNREACHABLE)
             $left = $hashEndSec - $callClock.Elapsed.TotalSeconds
             if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left before the hash's end ($([Math]::Round($hashEndSec, 2)) s into the call) to start it ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
-            $artSec = [Math]::Min([double]$artSec, $left)
             # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file (r12: the fixed end, never re-anchored)
             $hashEnd = $hashEndSec
             foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
@@ -811,7 +810,10 @@ function Get-VenueStagedBuildManifest {
             # artifacts. No clock: a few-byte read is never NOTIME. An offline -ArtifactProbeScript still sees the three artifacts only.
             if ($null -eq $ArtifactProbeScript) { $items += @{ label = 'manifest'; name = [IO.Path]::GetFileName($path); path = $path; sha = $sha } }
             $probeText = $(if ($TestArtifactDelayMs -gt 0 -and $null -eq $ArtifactProbeScript) { "param(`$items)`n[Threading.Thread]::Sleep($TestArtifactDelayMs)`n& {" + $probe.ToString() + "`n} `$items" } else { $probe.ToString() })
-            $ar = Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $artSec -Clock $callClock -EndSec $hashEnd
+            # r14 (Grok G21 on #814): the hash is handed its configured budget (-ArtifactTimeoutSec, or -TimeoutSec when it has none) and -EndSec ($hashEnd) clamps it,
+            # as the manifest read above: the clause names the budget the operator set, never a remainder of it (the remainder stores into $artSec went with it; the
+            # fixed end $hashEndSec, clamped to -CallCapSec above, is the only bound the wait takes)
+            $ar = Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $(if ($ArtifactTimeoutSec -gt 0) { [double]$ArtifactTimeoutSec } else { $TimeoutSec }) -Clock $callClock -EndSec $hashEnd
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })

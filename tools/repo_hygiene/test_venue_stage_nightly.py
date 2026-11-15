@@ -1175,6 +1175,9 @@ class VenueStageNightlyTests(unittest.TestCase):
         m = re.search(r"could not be hashed: no answer in ([0-9.]+) s \(the call's end cut the ([0-9.]+) s bound short\)", out)
         self.assertIsNotNone(m, both)
         self.assertLess(float(m.group(1)), 3.5, both)
+        # r14 (Grok G21 on #814, VenueChain.psm1:814): the bound the clause names is the hash's configured budget (-ArtifactTimeoutSec 300), which -EndSec clamped,
+        # never a remainder of it ("cut the 3.4 s bound short")
+        self.assertEqual(m.group(2), "300", both)
 
     def _r12_seamed_call(self, share: Path, seam: str, args: str, probe: str) -> tuple[str, float, str]:
         ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; & (Get-Module VenueChain) {{ {seam} }}; "
