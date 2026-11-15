@@ -209,11 +209,16 @@ function Test-HostCommitGate {
 
 def ok_emissions(text: str, token: str) -> tuple[list[str], int]:
     """SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1 contract pin: the RESULT=<token> lines a job prints as plain double-quoted Write-Output (which the pin renders),
-    and a census of every RESULT=<token> in its code whatever the quoting or writer (adversary A1). A census above the line count is an emission the pin
-    cannot render and check."""
+    and a census of every bare <token> in its code whatever the quoting, writer or concatenation (adversary r1 pass 1 A1 and pass 2 A1). A census above
+    the line count is an emission the pin cannot render and check."""
     code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
     lines = re.findall(r'^\s*Write-Output "(RESULT=' + token + r'(?:\s[^"]*)?)"\s*$', code, re.M)
-    return lines, len(re.findall(r"RESULT=" + token + r"(?![A-Z_])", code))
+    return lines, len(re.findall(r"(?<![A-Z_])" + token + r"(?![A-Z_])", code))
+
+
+def psq(value: object) -> str:
+    """A PowerShell single-quoted literal body: a quote in a temp path (C:\\Temp\\O'Neil) doubles, never ends the string (adversary r1 pass 2 A2)."""
+    return str(value).replace("'", "''")
 
 
 def utc_iso(dt: datetime) -> str:
@@ -982,7 +987,7 @@ class VenueStageReuseModuleTests(unittest.TestCase):
     """The three promoted functions, logic unchanged from the untracked venue-reuse-check.ps1 the lanes copied word for word."""
 
     def ps(self, body: str) -> str:
-        p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", f"Import-Module '{REUSE_MODULE}' -Force; {body}"],
+        p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", f"Import-Module '{psq(REUSE_MODULE)}' -Force; {body}"],
                            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return p.stdout.strip()
@@ -1004,8 +1009,8 @@ class VenueStageReuseModuleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             res = Path(d) / "r.json"
             res.write_text(json.dumps({"jobId": "j", "exitCode": 0, "stdout": f"RESULT=STAGE_OK SOURCE={SHA} FILES=4", "endedUtc": "2026-10-18T00:00:00Z"}), encoding="utf-8")
-            ok = self.ps(f"(Get-StageReuse -ResultPath '{res}' -JobId 'j' -Sha '{SHA}' -Kind Stage).Staged")
-            other = self.ps(f"(Get-StageReuse -ResultPath '{res}' -JobId 'j' -Sha '{OTHER_SHA}' -Kind Stage).Reason")
+            ok = self.ps(f"(Get-StageReuse -ResultPath '{psq(res)}' -JobId 'j' -Sha '{SHA}' -Kind Stage).Staged")
+            other = self.ps(f"(Get-StageReuse -ResultPath '{psq(res)}' -JobId 'j' -Sha '{OTHER_SHA}' -Kind Stage).Reason")
         self.assertEqual(ok, "True")
         self.assertTrue(other.startswith("SOURCE-mismatch"), other)
 
@@ -1016,7 +1021,7 @@ class VenueStageReuseModuleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             res = Path(d) / "r.json"
             res.write_text(json.dumps({"jobId": job, "exitCode": 0, "stdout": stdout, "endedUtc": "2026-11-15T00:00:00Z"}), encoding="utf-8")
-            out = self.ps(f"$r = Get-StageReuse -ResultPath '{res}' -JobId '{job}' -Sha '{sha}' -Kind {kind}; "
+            out = self.ps(f"$r = Get-StageReuse -ResultPath '{psq(res)}' -JobId '{psq(job)}' -Sha '{psq(sha)}' -Kind {kind}; "
                           "[Console]::Out.WriteLine([string]$r.Staged); [Console]::Out.WriteLine([string]$r.Reason); [Console]::Out.WriteLine([string]$r.Line)")
         lines = out.splitlines() + ["", "", ""]
         return lines[0], lines[1], lines[2]
@@ -1059,9 +1064,33 @@ class VenueStageReuseModuleTests(unittest.TestCase):
         for extra in ("if ($env:EXTRA_OK -eq '1') { Write-Output 'RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=smoke-runner-bbbbbbbbbbbbbbbb PATH=x'; exit 0 }",
                       "[Console]::Out.WriteLine(\"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=$CacheDirName\")",
                       "\"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=$CacheDirName\" | Write-Output",
-                      "Write-Output (\"RESULT=SMOKE_RUNNER_STAGE_OK\" + ' ALREADY=2')"):
+                      "Write-Output (\"RESULT=SMOKE_RUNNER_STAGE_OK\" + ' ALREADY=2')",
+                      # pass 2 A1: the token concatenated after a separate 'RESULT=' literal
+                      "if ($env:EXTRA_OK -eq '1') { Write-Output ('RESULT=' + \"SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=$CacheDirName PATH=x\"); exit 0 }"):
             lines, census = ok_emissions(text.replace(fresh, extra + "\n" + fresh), "SMOKE_RUNNER_STAGE_OK")
             self.assertEqual((len(lines), census), (2, 3), extra)
+
+    def test_a_further_plain_stage_ok_form_is_rendered_and_checked_not_a_count_red(self) -> None:
+        # #814 adds 'RESULT=STAGE_OK SOURCE=$SourceCommit FILES=0 CACHE=$Cache REUSED=1' to the stage job; the pin renders it (census == lines) and the
+        # Stage checker accepts it, so whichever PR merges second stays green
+        path = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-stage-job.ps1"
+        text = path.read_text(encoding="utf-8")
+        anchor = 'Write-Output "RESULT=STAGE_OK SOURCE='
+        self.assertEqual(text.count(anchor), 1)
+        extra = '            Write-Output "RESULT=STAGE_OK SOURCE=$SourceCommit FILES=0 CACHE=$Cache REUSED=1"'
+        lines, census = ok_emissions(text.replace(anchor, extra.strip() + "\n" + anchor), "STAGE_OK")
+        self.assertEqual((len(lines), census), (2, 2))
+        staged, reason, _ = self.reuse(f"RESULT=STAGE_OK SOURCE={SHA} FILES=0 CACHE=x REUSED=1", "Stage", f"playback-attr-3-cuda-stage-{S12}")
+        self.assertEqual((staged, reason), ("True", "staged-already"))
+
+    def test_a_quote_in_the_temp_path_reaches_the_checker(self) -> None:
+        # adversary r1 pass 2 A2: a TEMP such as C:\Temp\O'Neil ended the single-quoted -ResultPath literal and the command never parsed
+        with tempfile.TemporaryDirectory(prefix="O'Neil-") as d:
+            res = Path(d) / "r.json"
+            res.write_text(json.dumps({"jobId": self.SMOKE_JOB, "exitCode": 0, "stdout": f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR={RUNNER_DIR} PATH=x"}),
+                           encoding="utf-8")
+            out = self.ps(f"(Get-StageReuse -ResultPath '{psq(res)}' -JobId '{self.SMOKE_JOB}' -Sha '{SHA}' -Kind SmokeRunner).Staged")
+        self.assertEqual(out, "True")
 
     def test_every_emitted_ok_shape_is_accepted_by_its_checker(self) -> None:
         # CONTRACT PIN: every RESULT=..._OK line the three staging jobs can print, rendered with sample values, passes the reuse check that reads it. A new or
@@ -1087,15 +1116,17 @@ class VenueStageReuseModuleTests(unittest.TestCase):
             staged, reason, _ = self.reuse(line, "SmokeRunner", self.SMOKE_JOB)
             self.assertEqual((staged, reason), ("True", "staged-already"), (raw, line))
 
+        # stage and DLL pair: at least one form, never a fixed count, so a further form another PR adds (#814: REUSED=1) is checked here, not a merge-order red;
+        # the census above still reds any form the pin cannot render
         stage = emitted(bachelor / "playback-attr-3-cuda-stage-job.ps1", "STAGE_OK")
-        self.assertEqual(len(stage), 1, stage)
+        self.assertGreaterEqual(len(stage), 1, stage)
         for raw in stage:
             line = render(raw, {"SourceCommit": SHA})
             staged, reason, _ = self.reuse(line, "Stage", f"playback-attr-3-cuda-stage-{S12}")
             self.assertEqual((staged, reason), ("True", "staged-already"), (raw, line))
 
         dll = emitted(ROOT / "tools" / "profiling" / "ultramagnus" / "playback-attr-3-cuda-dll-job.ps1", "DLL_PAIR_OK")
-        self.assertEqual(len(dll), 1, dll)
+        self.assertGreaterEqual(len(dll), 1, dll)
         for raw in dll:
             line = render(raw, {"SourceCommit": SHA})
             with tempfile.TemporaryDirectory() as d:
@@ -1104,7 +1135,7 @@ class VenueStageReuseModuleTests(unittest.TestCase):
                 (outbox / f"{dll_job}.artifacts" / "dll-pair-manifest.json").write_text(json.dumps({"sourceCommit": SHA, "jobId": dll_job}), encoding="utf-8")
                 (outbox / f"{dll_job}.result.json").write_text(json.dumps({"jobId": dll_job, "exitCode": 0, "stdout": line, "endedUtc": "2026-11-15T00:00:00Z"}),
                                                                encoding="utf-8")
-                ok = self.ps(f"(Get-DllPairReuse -Outbox '{outbox}' -JobId '{dll_job}' -Sha '{SHA}').Reusable")
+                ok = self.ps(f"(Get-DllPairReuse -Outbox '{psq(outbox)}' -JobId '{dll_job}' -Sha '{SHA}').Reusable")
             self.assertEqual(ok, "True", (raw, line))
 
 
