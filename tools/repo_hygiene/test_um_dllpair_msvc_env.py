@@ -230,11 +230,49 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 self.assertIn("REACHED_NVCC", p.stdout)
 
+    def test_adversary_63580c71_a1_a_long_include_reaches_the_typed_refusal(self) -> None:
+        # adversary pass on 63580c71, A1: INCLUDE = ('C:\missing;' * 640).TrimEnd(';') (7039 chars) grew past cmd.exe's 8191-character line limit
+        # once ';' became '" "' in the for-list: exit 1, no typed line. The check must never expand INCLUDE onto a command line; 32 KB values too.
+        kit = self.tmp / "Kits-long" / "ucrt"
+        kit.mkdir(parents=True)
+        (kit / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        long_inc = ";".join([r"C:\missing"] * 640)
+        self.assertEqual(len(long_inc), 7039)
+        huge_inc = ";".join([r"C:\missing\a\much\longer\directory\name"] * 800)
+        for script in BACKEND_SCRIPTS:
+            for name, include, via_env in (("adversary-7039", long_inc, False), ("adversary-7039-env", long_inc, True), ("huge-env", huge_inc, True)):
+                with self.subTest(script=script.name, case=name, header=False):
+                    p = self.run_check(script, include, via_env=via_env)
+                    self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                    self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                    self.assertNotIn("REACHED_NVCC", p.stdout)
+            for name, include in (("adversary-7039-quoted", f'{long_inc};"{kit}"'), ("adversary-7039", f"{long_inc};{kit}"), ("huge", f"{huge_inc};{kit}")):
+                with self.subTest(script=script.name, case=name, header=True):
+                    p = self.run_check(script, include, via_env=True)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("REACHED_NVCC", p.stdout)
+            bang = self.tmp / "SDK & Kits!v10!" / "ucrt"
+            if not bang.exists():
+                bang.mkdir(parents=True)
+                (bang / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+            with self.subTest(script=script.name, case="quoted-amp-bang", header=True):
+                # the quote-stripped copy goes through DELAYED expansion: a '!' (and '&') inside the value must survive it, not be re-parsed
+                p = self.run_check(script, f'C:\\missing;"{bang}"', via_env=True)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("REACHED_NVCC", p.stdout)
+            with self.subTest(script=script.name, case="huge-quoted", header=True):
+                # the one shape the check cannot admit: an INCLUDE past cmd's limit whose header entry is QUOTED (the quote-stripped copy is cmd-bound).
+                # It is refused TYPED, never exit 1. vcvars64 builds INCLUDE through cmd set lines, so a post-vcvars INCLUDE this long does not arise.
+                p = self.run_check(script, f'{huge_inc};"{kit}"', via_env=True)
+                self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                self.assertNotIn("REACHED_NVCC", p.stdout)
+
     def test_each_script_checks_after_vcvars_and_before_nvcc(self) -> None:
         for script in BACKEND_SCRIPTS:
             with self.subTest(script=script.name):
                 text = script.read_text(encoding="utf-8")
-                self.assertEqual(len(self.check_lines(script)), 4, script.name)
+                self.assertEqual(len(self.check_lines(script)), 7, script.name)
                 vcvars = text.index('"call `"$vcvars`" >nul"')
                 check = text.index("MLV_UCRT_OK")
                 nvcc = text.index('"`"$nvcc`" $archArgLine')

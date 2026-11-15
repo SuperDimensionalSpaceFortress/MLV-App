@@ -154,10 +154,16 @@ $cmdFile = Join-Path $env:TEMP 'build_backend_dll.cmd'
     '@echo off',
     "call `"$vcvars`" >nul",
     # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: an INCLUDE without the SDK's corecrt.h (an overgrown PATH broke winsdk.bat on 2026-11-15) is exit 9, typed,
-    # before nvcc -- never a bare C1083 at compile time. Quotes are stripped first (a quoted entry holding & would break the for-list), and a DIRECTORY named corecrt.h is not the header.
+    # before nvcc -- never a bare C1083 at compile time. INCLUDE never reaches a command line (a long one overflowed cmd's 8191-character limit, exit 1):
+    # where.exe reads the list from its own environment, first as is (no size limit), then with quotes stripped by DELAYED expansion (& and ! in the
+    # value are not re-parsed; past cmd's limit that copy is empty, so a quoted header entry in an over-long INCLUDE is refused typed, never exit 1).
+    # where matches files only, so a DIRECTORY named corecrt.h is not the header. endlocal before nvcc turns delayed expansion off again.
     'set "MLV_UCRT_OK=" & if not defined INCLUDE set "INCLUDE=;"',
-    'set "MLV_INC=%INCLUDE:"=%"',
-    'for %%I in ("%MLV_INC:;=" "%") do if exist "%%~I\corecrt.h" if not exist "%%~I\corecrt.h\" set "MLV_UCRT_OK=1"',
+    '"%SystemRoot%\System32\where.exe" /q $INCLUDE:corecrt.h && set "MLV_UCRT_OK=1"',
+    'setlocal EnableDelayedExpansion & set "MLV_INC="',
+    'set "MLV_INC=!INCLUDE:"=!"',
+    '"%SystemRoot%\System32\where.exe" /q $MLV_INC:corecrt.h',
+    'endlocal & if not errorlevel 1 set "MLV_UCRT_OK=1"',
     'if not defined MLV_UCRT_OK (echo FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT no INCLUDE entry holds corecrt.h after vcvars64& exit /b 9)',
     'echo === building igpu_recon_cuda.dll (nvcc -shared --fmad=false, exports via .def) ===',
     "`"$nvcc`" $archArgLine -O3 --fmad=false -shared -allow-unsupported-compiler -Xcompiler `"/MD`" -Xlinker `"/DEF:$def`" -I `"$Dir`" -I `"$gpuRoot`" `"$src`" -o `"$dll`"",
