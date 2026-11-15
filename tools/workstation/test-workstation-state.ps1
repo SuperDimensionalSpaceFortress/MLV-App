@@ -243,7 +243,7 @@ if ($fnLoaded -and (Test-Has 'Invoke-StagedSecretScan' 'A2/A3 scan')) {
     $clean = Join-Path $scanStage 'clean.txt'
     [IO.File]::WriteAllText($clean, 'nothing secret here')
     $res = Invoke-StagedSecretScan -Stage $scanStage
-    Assert-That ((Get-Item -LiteralPath $atBoundary -ErrorAction SilentlyContinue) -eq $null -and $res.Removed.Count -eq 1) 'A2 scan: a token inside a file of exactly 5 MiB is found and the file removed' "removed=$($res.Removed -join ',')"
+    Assert-That ($null -eq (Get-Item -LiteralPath $atBoundary -ErrorAction SilentlyContinue) -and $res.Removed.Count -eq 1) 'A2 scan: a token inside a file of exactly 5 MiB is found and the file removed' "removed=$($res.Removed -join ',')"
     Assert-That ((Test-Path -LiteralPath $clean) -and $res.Uncleared.Count -eq 0) 'A2 scan: a clean file is kept and nothing is left uncleared'
     $bigStage = New-Scratch 'scan-stage-big'
     [IO.File]::WriteAllText((Join-Path $bigStage 'big.txt'), ('y' * 2000))

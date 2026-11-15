@@ -81,7 +81,7 @@ foreach ($k in $PSBoundParameters.Keys) { $script:SetupBound[$k] = $true }
 
 $validPhases = @('All', 'Host', 'Packages', 'Ssh', 'Layout', 'Clone', 'Qt', 'Import', 'Tasks', 'Verify', 'Checklist',
     'Export', 'Gate', 'LeaseShow', 'LeaseAcquire', 'LeaseRelease')
-$Phase = @($Phase | ForEach-Object { $_ -split '[,\s]+' } | Where-Object { $_ })
+$Phase = @($Phase | ForEach-Object { ($_ -split ',').Trim() } | Where-Object { $_ })
 foreach ($ph in $Phase) { if ($validPhases -notcontains $ph) { [Console]::Error.WriteLine("Unknown phase '$ph'. Valid: $($validPhases -join ', ')"); exit 64 } }
 # Gate is what the scheduled tasks run, alone. Combined with another phase it would switch off the source-host, elevation and failure-exit guards
 # for that other phase (adversary A16), so the combination is refused outright.
