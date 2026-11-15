@@ -1410,6 +1410,25 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
 
+    def test_r14_a2_a_root_on_another_hosts_volume_is_refused_never_locked(self) -> None:
+        # r14 (adversary A2 on 5fe750fa, AttrCudaArtifacts.psm1:512): a Global\ mutex is host-local, so host B on Z: (mapped to host A's share) and host A on its
+        # local path each took "the" lock and both passed the absent-manifest guard. RED: both seamed calls below returned a held lock. A mapped drive (its
+        # DriveType is Network) and a root whose final volume is none of this host's fixed volumes (a link into a share) are refused, typed, before any lock.
+        def call(seam: str, name: str):
+            return self.run_with_module(
+                f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1 {seam}; 'HELD=' + $l.held }} "
+                "catch { 'REFUSED=' + $_.Exception.Message }\n", name=name)
+        for seam, why in (("-TestDriveType Network", "is Network, not a local fixed drive"), ("-TestLocalVolumeSerials @('0')", "is not a local fixed volume of this host")):
+            with self.subTest(seam=seam):
+                proc = call(seam, f"r14-a2-{seam.split()[0][1:]}.ps1")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL ", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(why, proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("HELD=", proc.stdout, proc.stdout + proc.stderr)
+        # and a root on this host's own fixed volume (the real probe, no seam) still takes its lock
+        proc = call("", "r14-a2-local.ps1")
+        self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
+
     def test_a_manifest_a_lease_batch_pinned_still_reads_as_its_pin_after_a_second_stage(self) -> None:
         # The batch's own guard (Invoke-VenueLeaseBatch.ps1:1258 / :1393) reads Get-VenueStagedBuildManifest and compares it to the
         # sha256 its plan pinned when the lease opened; any other answer is BUILD_MANIFEST_MISMATCH.

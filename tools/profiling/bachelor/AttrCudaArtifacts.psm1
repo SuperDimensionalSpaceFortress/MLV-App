@@ -491,17 +491,35 @@ function Enter-AttrCudaStageLock {
     "STAGE_LOCK_WAIT vol=<serial>;idx=<high>-<low> <sha> waiting up to <n> s (lock <name> ...)", so a
     stager blocked for up to -WaitSec is never silent. Write-Host, not the output stream: the line is
     not part of the returned object.
+    r14 (adversary A2 on 5fe750fa): a Global\ mutex is HOST-local, so it excludes only stagers on
+    THIS host. A root on another host's volume (a mapped drive, or a link into a share) is refused
+    with ATTRCUDA_STAGE_ROOT_NOT_LOCAL, never locked: its other stagers would never see this lock.
+    -TestDriveType and -TestLocalVolumeSerials are test-only seams; production passes neither.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         # r6 fix iteration (adversary A1 on 424df284): the lock key is this sha, so a '<40 hex>\n' (which '$' let through) never names a second lock
         [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
         [int]$WaitSec = 1800,
-        [string]$WaitMarkerPath = ''
+        [string]$WaitMarkerPath = '',
+        [string]$TestDriveType = '',
+        [string[]]$TestLocalVolumeSerials = $null
     )
 
     $id = Get-AttrCudaFileId -Path $Root -FollowLinks
-    $rootId = 'vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
+    # r14 (adversary A2 on 5fe750fa, siblings stage job :69/:376/:515 and Publish-AttrCudaFileMove :2872): host B with Z: mapped to host A's share and host A on
+    # its local path both took "the" lock -- two host-local mutexes -- and both passed the absent-manifest guard; A then cleared B's published artifact. Two checks,
+    # both before any lock: (1) the root's drive letter is a local FIXED drive (a mapped Z: is Network; no drive letter is refused too), and (2) the root's FINAL
+    # volume, read through its links, is one of this host's local fixed volumes (a link on C: into \\host\share lands on the share's volume).
+    $drive = [IO.Path]::GetPathRoot($Root)
+    $driveType = $(if ($TestDriveType) { $TestDriveType } elseif ($drive -match '^[A-Za-z]:\\\z') { [string]([IO.DriveInfo]::new($drive).DriveType) } else { 'NoDriveLetter' })
+    if ($driveType -cne 'Fixed') { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's drive '$drive' is $driveType, not a local fixed drive: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
+    $localSerials = @(if ($null -ne $TestLocalVolumeSerials) { $TestLocalVolumeSerials } else {
+            foreach ($d in [IO.DriveInfo]::GetDrives()) {
+                if ([string]$d.DriveType -ceq 'Fixed' -and $d.IsReady) { try { [string](Get-AttrCudaFileId -Path $d.RootDirectory.FullName -FollowLinks).VolumeSerialNumber } catch { } }
+            } })
+    if ($localSerials -notcontains [string]$id.VolumeSerialNumber) { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume (serial $([string]$id.VolumeSerialNumber), read through its links) is not a local fixed volume of this host: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
+    $rootId ='vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
     # r9 fix iteration (adversary A1 on 9825bfd9): the cache names carry the sha's first 12 hex (playback-attr-3-cuda-<sha12>-build.json and its artifacts), so the lock does too: two
     # commits that share them write the same files and must contend for the same lock (a full-sha key let both into the one name at once)
     $key = $rootId + '|' + $SourceCommit.Substring(0, 12).ToLowerInvariant()
