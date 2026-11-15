@@ -7837,10 +7837,13 @@ function Test-AttrCudaMsvcInclude {
     leaf's sentinel header (ucrt\corecrt.h, um\windows.h, shared\sdkddkver.h), else the reason is
     INCLUDE_<LEAF>_HEADER_MISSING. The probe is Test-Path -LiteralPath on a concatenated string, so
     an entry on a drive that does not exist reads as absent instead of throwing (Join-Path would).
+    QUOTES ARE NOT PATH (adversary A1 on 6c4053d9, r2): every '"' is dropped from an entry before it
+    is trimmed and judged, the same rule as the backend .cmd guards, so a quoted SDK entry passes and
+    an entry that is only quotes is empty.
     #>
     [CmdletBinding()]
     param([AllowEmptyString()][AllowNull()][string]$Include)
-    $entries = @(([string]$Include) -split ';' | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    $entries = @(([string]$Include) -split ';' | ForEach-Object { ([string]$_).Replace('"', '').Trim() } | Where-Object { $_ })
     $detail = "entries=$($entries.Count)"
     if ($entries.Count -eq 0) {
         return [pscustomobject]@{ Ok = $false; Reason = 'INCLUDE_EMPTY'; Detail = "$detail INCLUDE is empty after vcvars64" }

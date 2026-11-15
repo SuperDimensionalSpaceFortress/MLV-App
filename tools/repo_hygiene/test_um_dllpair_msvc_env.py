@@ -150,6 +150,29 @@ class MsvcIncludeTests(_Pwsh):
         self.assertEqual(v["Reason"], "INCLUDE_LACKS_UCRT")
         self.assertIn("entries=2", v["Detail"])
 
+    def test_adversary_6c4053d9_a1_quoted_entries_are_judged_without_their_quotes(self) -> None:
+        # adversary pass on 6c4053d9, A1: Trim() kept the closing quote, so '"<k>\ucrt";"<k>\um";"<k>\shared"' (headers present) read as INCLUDE_LACKS_UCRT and
+        # the job exited 9 at msvcEnvironment before building. Quotes are stripped per entry, the same rule as the backend .cmd guards.
+        amp_root = Path(tempfile.mkdtemp(prefix="kits-", dir=self.tmp)) / "SDK & Kits"
+        for leaf, header in (("ucrt", "corecrt.h"), ("um", "windows.h"), ("shared", "sdkddkver.h")):
+            (amp_root / leaf).mkdir(parents=True)
+            (amp_root / leaf / header).write_text("/* fixture */\n", encoding="ascii")
+        k = self.kits()
+        for name, include in (("adversary-amp", f'"{amp_root}\\ucrt";"{amp_root}\\um";"{amp_root}\\shared"'),
+                              ("kits-quoted-trailing-slash", f'"{k}\\ucrt\\";"{k}\\um";  "{k}\\shared"  ;'),
+                              ("mixed", f'{INCLUDE_NO_SDK};"{k}\\ucrt";{k}\\um;"{k}\\shared"')):
+            with self.subTest(case=name):
+                v = self.verdict(include)
+                self.assertTrue(v["Ok"], v)
+        with self.subTest(case="quoted-no-headers"):
+            bare = self.kits(headers=False)
+            v = self.verdict(f'"{bare}\\ucrt";"{bare}\\um";"{bare}\\shared"')
+            self.assertFalse(v["Ok"], v)
+            self.assertEqual(v["Reason"], "INCLUDE_UCRT_HEADER_MISSING")
+        with self.subTest(case="only-quotes"):
+            v = self.verdict('"";" "')
+            self.assertEqual((v["Ok"], v["Reason"]), (False, "INCLUDE_EMPTY"))
+
     def test_a_full_include_passes(self) -> None:
         k = self.kits()
         v = self.verdict(INCLUDE_NO_SDK + f";{k}\\ucrt;{k}\\um;{k}\\shared;{k}\\winrt")
