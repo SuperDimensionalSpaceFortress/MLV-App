@@ -3492,12 +3492,18 @@ function Get-AttrCudaSelfHealMetrics {
             # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed first marker is no session (never its numeric prefix)
             # r11 (r10 adversary A1 sibling, its run: an incomplete first marker then id=4 read presented_fps=99): the FIRST record starting with the
             # marker's name (any case, ending at a non-name character) is the marker, read whole (case-sensitive ` id=<[0-9]+>`) or no session
-            $first = [regex]::Match($LogText, $recordStart + '(?i:playback_smoke\.measured_session)(?![A-Za-z0-9_])[^\r\n]*')
+            # r12 (r12 adversary B4 on 7e66a3af, its input: `measured_session id=3<CR>id=4`): the record runs to the newline (the job and dual-venue
+            # readers split on `\r?\n`), so a lone CR inside it never hides a second id; only a CRLF's own CR is trimmed. r12 (B3): ASCII name boundary
+            $first = [regex]::Match($LogText, $recordStart + '(?i:playback_smoke\.measured_session)(?!(?-i:[A-Za-z0-9_]))[^\n]*')
             if (-not $first.Success) { return $null }
-            $sm = [regex]::Match($first.Value, '^(?:\[[^\]\r\n]*\] ){0,3}playback_smoke\.measured_session id=(\S*)')
+            $fv = $first.Value.TrimEnd([char]13)
+            $sm = [regex]::Match($fv, '^(?:\[[^\]\r\n]*\] ){0,3}playback_smoke\.measured_session id=(\S*)')
             # r11 pass 11 (A3 sibling, `id=3 id=4`): the marker names the word id exactly once and no session (bounded by any non-name character)
-            $ids = [regex]::Matches($first.Value, '(?i)(?<![A-Za-z0-9_])id(?![A-Za-z0-9_])').Count
-            $sess = [regex]::Matches($first.Value, '(?i)(?<![A-Za-z0-9_])session(?![A-Za-z0-9_])').Count
+            # r12 (r12 adversary B1 on 7e66a3af, its input: `id=3 (C:/id/MainWindow.cpp:1)`): words are counted in the record BODY only; a readable Qt
+            # location ` (<path>:<digits>)` (or `:%2)`) is cut first, and any other ` (` tail is -1, so no session (Get-DvLogRecordBody's rule)
+            $wc = { param([string]$x, [string]$w) $o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?i)(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))').Count }
+            $ids = & $wc $fv 'id'
+            $sess = & $wc $fv 'session'
             if (-not $sm.Success -or $ids -ne 1 -or $sess -ne 0 -or $sm.Groups[1].Value -cnotmatch '^[0-9]+$') { return $null }
             $Session = $sm.Groups[1].Value
         }

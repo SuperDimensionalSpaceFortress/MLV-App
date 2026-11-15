@@ -11528,6 +11528,28 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                 for n in (1, 2, 3):
                     self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
 
+    def test_r12_the_first_marker_is_counted_in_its_body_with_ascii_name_characters_to_its_newline(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r12 (r12 adversary on 7e66a3af, AttrCudaArtifacts.psm1:3499-3501). B1: a valid Qt location
+        `(C:/id/MainWindow.cpp:1)` is not the record's, so its `id` is not a second mention (7e66a3af had no session). B3: a Kelvin sign before `id=2` is
+        not a name character, so it is a second mention. B4: a lone CR inside the marker record no longer ends it, so `id=2` after it is seen."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        summary = prefix + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n"
+        for loc in (" (C:/id/MainWindow.cpp:1)", " (C:/session/MainWindow.cpp:1)", " (C:/id/x%1.cpp:%2)"):
+            with self.subTest(location=loc):
+                got = self.evaluate(["good"], measured_log=prefix + "playback_smoke.measured_session id=1" + loc + "\n" + summary)["good"]
+                self.assertTrue(got["pass"] and got["supplementaryPass"], got["failures"])
+                self.assertEqual(got["metrics"]["selfHealL1FpsRatio"], 0.974)
+        for shape in ("playback_smoke.measured_session id=1 \u212aid=2", "playback_smoke.measured_session id=1 \u212asession=2",
+                      "playback_smoke.measured_session id=1\rid=2", "playback_smoke.measured_session id=1 (id=2)",
+                      "playback_smoke.measured_session id=1 (C:/a/MainWindow.cpp)"):
+            log = (prefix + shape + "\n" + summary + prefix + "playback_smoke.measured_session id=2\n"
+                   + prefix + "playback_smoke.summary session=2 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+            with self.subTest(shape=shape):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertFalse(got["pass"], got)
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
+
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
     """The schema's opt-out shape, the proof leg, and the app side of the capture (a source census: the app is built and run on a venue, never here)."""
@@ -16228,6 +16250,66 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
                     v = self.wake_verdict(build(self.leg_wake(wake)), spec)
                     with self.subTest(key=key, shape=shape, leg=leg):
                         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    # r12 (r12 adversary on 7e66a3af): B2, a record body that lost its tail to the LOCATION_UNREADABLE sentinel (the tail may have named a session or
+    # a key); B3, a non-ASCII letter that IgnoreCase folds into [A-Za-z] (U+212A KELVIN SIGN, U+0130) beside a mention
+    KELVIN = "\u212a"
+    DOTTED_I = "\u0130"
+
+    def test_r12_its_inputs_verbatim_a_sentinel_tail_or_a_folded_neighbour_never_hides_a_mention(self) -> None:
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        head = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        base = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+        wake = "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post"
+        k = self.KELVIN
+        sole_pace = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3 (session=4)\n"
+        for name, log, spec in (("B2", base + "playback_smoke.gpu_summary (session=4)\n" + wake, post),
+                                ("B2 sole pace summary", sole_pace + wake, post),
+                                ("B3", base + f"playback_smoke.gpu_summary {k}session=4\n" + wake, post),
+                                ("B3 marker", base + f"playback_smoke.measured_session id=3 {k}id=4\n" + wake, post),
+                                ("B3 head key", base + "playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "
+                                 + f"{k}delivery_kind=post", head),
+                                ("B3 record name", base + f"playback_due_wake{k} armed=0 fired=0 disabled=1 delivery=none delivery_kind=post post_rescued=0 "
+                                 "post_counts_settled=1", head)):
+            with self.subTest(finding=name):
+                v = self.wake_verdict(log, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # at the FIRST position: a marker or summary whose tail was cut, or that names id / session again beside a folded letter, is unreadable
+        rest = "playback_smoke.summary session=4 reason=play-stop\n"
+        for first in ("playback_smoke.measured_session id=3 (id=4)", f"playback_smoke.measured_session id=3 {k}id=4",
+                      f"playback_smoke.measured_session id=3 {self.DOTTED_I}d=4 {k}session=4", "playback_smoke.measured_session id=3 (C:/a/MainWindow.cpp)",
+                      "playback_smoke.summary session=3 (session=4)", f"playback_smoke.summary session=3 {k}session=4"):
+            with self.subTest(first=first):
+                self.assertEqual(self.selected(first + "\n" + rest), {"session": None, "unreadable": True})
+        # controls: a readable Qt location is not the record's, whatever its path holds
+        for first in ("playback_smoke.measured_session id=3 (C:/id/MainWindow.cpp:1)", "playback_smoke.measured_session id=3 (C:/session/MainWindow.cpp:1)",
+                      "playback_smoke.summary session=3 (C:/session/MainWindow.cpp:1)"):
+            with self.subTest(control=first):
+                self.assertEqual(self.selected(first + "\n" + rest), {"session": "3", "unreadable": False})
+
+    def test_r12_class_every_sentinel_tail_or_folded_neighbour_blocks_every_leg(self) -> None:
+        k, i = self.KELVIN, self.DOTTED_I
+        for shape in ("playback_smoke.gpu_summary (session=4)", "playback_smoke.gpu_summary frames=1 (x)", "playback_smoke.pace_summary session=3 (session=4)",
+                      "playback_smoke.measured_session id=3 (id=4)", f"playback_smoke.gpu_summary {k}session=4", f"playback_smoke.gpu_summary {i}session=4",
+                      f"playback_smoke.gpu_summary session=3 x{k}session=4", f"playback_smoke.measured_session id=3 {k}id=4",
+                      f"playback_smoke.measured_session{k} id=4", f"playback_smoke.start{k} session=4"):
+            build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [s, wake]) + "\n")(shape)
+            self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape)
+        for key in self.READ_KEYS:
+            for shape in (f"({key}=1)", f"{k}{key}=1", f"{i}{key}=1", f"x{k}{key}=1"):
+                build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [wake + " " + s]) + "\n")(shape)
+                for leg, spec, wake in self.LEG_WAKES:
+                    v = self.wake_verdict(build(self.leg_wake(wake)), spec)
+                    with self.subTest(key=key, shape=shape, leg=leg):
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # controls: a readable Qt location on a same-session record or on the wake line is cut, so it names nothing; the legs still read
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for lines in ([self.A2_BASE[0] + " (C:/id/session/MainWindow.cpp:7)"] + self.A2_BASE[1:] + ["playback_smoke.gpu_summary session=3 (C:/session/a.cpp:12)",
+                                                                                                    self.WAKE_POST + " (C:/delivery_kind/fired/MainWindow.cpp:9)"],
+                      self.A2_BASE + [self.WAKE_POST + f" note=x{k}y"]):
+            with self.subTest(control=lines[-1]):
+                v = self.wake_verdict("\n".join(lines) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):

@@ -826,6 +826,47 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ID=4", proc.stdout)
 
+    def test_r12_words_are_counted_in_the_record_body_with_ascii_name_characters(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r12 (r12 adversary on 7e66a3af). B1 (playback-attr-3-cuda-job.ps1:2254/2255): a valid Qt
+        # location `(C:/id/MainWindow.cpp:1)` is not the record's, so the id / session in its path is not a second mention; 7e66a3af threw
+        # unreadable. B3: a Kelvin sign U+212A (or U+0130) beside `id=4` / `session=4` is not a name character, so that is a second mention.
+        summary = "playback_smoke.summary session=3 elapsed_ms=20000 presented_fps=50\n"
+        for log in ("playback_smoke.measured_session id=3 (C:/id/MainWindow.cpp:1)\n" + summary,
+                    "playback_smoke.measured_session id=3 (C:/session/MainWindow.cpp:1)\n" + summary,
+                    "playback_smoke.measured_session id=3 (C:/id/x%1.cpp:%2)\n" + summary,
+                    "playback_smoke.summary session=3 (C:/session/MainWindow.cpp:1)\n",
+                    'playback_smoke.summary session=3 gui_fps_status_text="Playback: 24 fps (59.94 -> 24)" presented_fps=24 (C:/session/MainWindow.cpp:1)\n'):
+            with self.subTest(control=log):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("ID=3", proc.stdout)
+        later = "\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n"
+        for shape in ("playback_smoke.measured_session id=3 \u212aid=4", "playback_smoke.measured_session id=3 \u0130d=4 \u212asession=4",
+                      "playback_smoke.measured_session id=3 (id=4)", "playback_smoke.measured_session id=3 (C:/a/MainWindow.cpp)",
+                      "playback_smoke.measured_session\u212a id=4"):
+            with self.subTest(shape=shape):
+                proc = self._run(shape + later)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        for shape in ("playback_smoke.summary session=3 \u212asession=4", "playback_smoke.summary session=3 (session=4)"):
+            with self.subTest(summary=shape):
+                proc = self._run(shape + "\nplayback_smoke.summary session=4 reason=play-stop\n")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+
+    def test_r12_every_sibling_session_selector_uses_the_one_body_scoped_ascii_counter(self) -> None:
+        # r12 (r12 adversary B1 + B3 siblings :5057-5059, :7534-7536, :7546): the core-partition and utilisation selectors count words with the same
+        # body-scoped, ASCII-boundary counter as Get-MeasuredSmokeSessionId, and no name boundary in the job is left on an IgnoreCase class
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        body = ("$o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \\([0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)? -> "
+                "[0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)?\\)\"') { $o = $x.IndexOf(' (', $o + 2, [StringComparison]::Ordinal) }; if ($o -ge 0) { if ($x.Substring($o) "
+                "-cnotmatch '^ \\(.+:(?:[0-9]+|%2)\\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?i)(?<!(?-i:[A-Za-z0-9_]))' + $w + "
+                "'(?!(?-i:[A-Za-z0-9_]))').Count }")
+        self.assertEqual(text.count("{ param([string]$x, [string]$w) " + body), 3)
+        self.assertNotIn("(?![A-Za-z0-9_])", text)
+        self.assertNotIn("(?<![A-Za-z0-9_])", text)
+
     def test_throws_when_neither_marker_nor_summary_is_present(self) -> None:
         proc = self._run("nothing relevant here\n")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
