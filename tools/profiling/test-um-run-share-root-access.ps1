@@ -35,7 +35,8 @@ function Get-ScriptFunctionText([string]$Path, [string]$Name) {
 }
 
 $denied = { param($r) throw [UnauthorizedAccessException]::new('Access to the path is denied.') }
-$sysErr5 = { param($r) throw [System.IO.IOException]::new('System error 5 has occurred. Access is denied.') }
+# The real shape of System error 5 from a .NET file call: an IOException whose HResult is HRESULT_FROM_WIN32(5), 0x80070005. The message text is not what classifies it (r3 A8).
+$sysErr5 = { param($r) throw [System.IO.IOException]::new('System error 5 has occurred. Access is denied.', [int]0x80070005) }
 $logonFail = { param($r) throw [System.ComponentModel.Win32Exception]::new(1326, 'The user name or password is incorrect.') }
 $notFound = { param($r) throw [System.IO.DirectoryNotFoundException]::new('The network path was not found.') }
 $readable = { param($r) }
@@ -54,6 +55,21 @@ $realRoot = Join-Path $ScratchRoot 'real-root'
 Assert-That ((Get-ShareRootAccess -Root $realRoot).State -ceq 'READABLE') 'module: the default probe reads an existing scratch folder as READABLE'
 Assert-That ((Get-ShareRootAccess -Root (Join-Path $ScratchRoot 'no-such-root')).State -ceq 'UNREACHABLE') 'module: the default probe reads a missing scratch folder as UNREACHABLE'
 Assert-That ((Get-ShareAccessDeniedLine -Root $fakeRoot) -ceq "SHARE_ACCESS_DENIED $fakeRoot") 'module: typed line is "SHARE_ACCESS_DENIED <root>"'
+
+# A8 (r3): the classification comes from the exception type and the Win32 code, never from message text. A missing path whose NAME contains
+# 'Access is denied' is a path-not-found (UNREACHABLE).
+$tricky = Join-Path $ScratchRoot 'no-such-parent\Access is denied'
+Assert-That ((Get-ShareRootAccess -Root $tricky).State -ceq 'UNREACHABLE') 'A8 module: the default probe on a missing path whose name contains "Access is denied" is UNREACHABLE' "state=$((Get-ShareRootAccess -Root $tricky).State)"
+$trickyThrow = { param($r) throw [System.IO.DirectoryNotFoundException]::new("Could not find a part of the path '$r'.") }
+Assert-That ((Get-ShareRootAccess -Root $tricky -Probe $trickyThrow).State -ceq 'UNREACHABLE') 'A8 module: a DirectoryNotFoundException naming "...\Access is denied" is UNREACHABLE'
+$trickyIo = { param($r) throw [System.IO.IOException]::new("The network path '$r' (System error 5) was not found.") }
+Assert-That ((Get-ShareRootAccess -Root '\\h\Logon failure' -Probe $trickyIo).State -ceq 'UNREACHABLE') 'A8 module: an untyped IOException whose text mentions System error 5 / a logon-failure path component is UNREACHABLE'
+$plainText = { param($r) throw [System.Exception]::new('Access is denied.') }
+Assert-That ((Get-ShareRootAccess -Root $fakeRoot -Probe $plainText).State -ceq 'UNREACHABLE') 'A8 module: a plain Exception with only the words "Access is denied" and no code is not classified by its text'
+$hres5 = { param($r) throw [System.Exception]::new('wrapped', [System.IO.IOException]::new('x', [int]0x80070005)) }
+Assert-That ((Get-ShareRootAccess -Root $fakeRoot -Probe $hres5).State -ceq 'ACCESS_DENIED') 'A8 module: an inner IOException with HRESULT 0x80070005 is still ACCESS_DENIED'
+$secErr = { param($r) throw [System.Security.SecurityException]::new('nope') }
+Assert-That ((Get-ShareRootAccess -Root $fakeRoot -Probe $secErr).State -ceq 'ACCESS_DENIED') 'A8 module: a SecurityException is ACCESS_DENIED'
 
 # ---------------------------------------------------------------- 2. um-run.ps1 in process
 function Invoke-UmRunCapture([scriptblock]$Probe, [string]$Root) {
@@ -155,6 +171,19 @@ $s = ''
 try { Stop-ShareUnreachable 'the agent share cache did not answer' } catch { $s = [string]$_.Exception.Message }
 Assert-That ($script:SecSeen -eq 3) 'A16 nightly: the root probe is bounded by the 3 s left of the total cap, not the 300 s -ProbeTimeoutSec' "seen=$($script:SecSeen)"
 Assert-That ($s.EndsWith("|SHARE_ACCESS_DENIED $fakeRoot")) 'A16 nightly: the bounded production path still prints the typed line' "got: $s"
+# A9 (r3): with the total cap already spent (0 s left) NO probe is started; the plain SHARE_UNREACHABLE detail is reported. The old Max(1, ...) floor
+# re-opened a 1 s probe after the deadline.
+$TestShareRootProbe = $null
+function Get-RemainingSec { 0 }
+$script:SecSeen = -1
+$s = ''
+try { Stop-ShareUnreachable 'the agent share cache did not answer' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($script:SecSeen -eq -1) 'A9 nightly: with 0 s left of the total cap the root probe is not started at all' "seen=$($script:SecSeen)"
+Assert-That ($s -ceq 'STOP|SHARE_UNREACHABLE|the agent share cache did not answer|') 'A9 nightly: with the cap spent the plain SHARE_UNREACHABLE detail is reported' "got: $s"
+function Get-RemainingSec { -5 }
+$script:SecSeen = -1
+try { Stop-ShareUnreachable 'x' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($script:SecSeen -eq -1) 'A9 nightly: a NEGATIVE remainder does not become a fresh 1 s probe' "seen=$($script:SecSeen)"
 $nightlyText = [IO.File]::ReadAllText($nightly)
 Assert-That (-not ($nightlyText -match "Stop-Nightly 'SHARE_UNREACHABLE' `"the agent share cache")) 'A13 nightly: the cache-directory probe no longer calls Stop-Nightly SHARE_UNREACHABLE directly'
 

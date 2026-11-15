@@ -234,9 +234,13 @@ function Stop-ShareUnreachable([string]$Detail) {
         if ($TestShareRootProbe) { $state = [string](Get-ShareRootAccess -Root $share -Probe $TestShareRootProbe).State }
         else {
             # Bounded by what is LEFT of the total cap as well as by -ProbeTimeoutSec (adversary pass 2, A16): this probe runs after the cap may have nearly passed.
-            $rbSec = [Math]::Max(1, [Math]::Min([int]$ProbeTimeoutSec, [int](Get-RemainingSec)))
-            $rb = Invoke-Bounded { param($mod, $r) Import-Module -Name $mod -Force -DisableNameChecking; (Get-ShareRootAccess -Root $r).State } @($shareRootModule, $share) $rbSec
-            if ($rb.ok) { $state = [string]$rb.value }
+            # No floor: with under 1 s left (or the cap already passed) the probe is skipped and the plain detail is reported, so the probe can never run past the
+            # cap (adversary pass 3, A9: a Max(1, ...) floor re-opened a 1 s probe after the deadline).
+            $rbSec = [Math]::Min([int]$ProbeTimeoutSec, [int](Get-RemainingSec))
+            if ($rbSec -ge 1) {
+                $rb = Invoke-Bounded { param($mod, $r) Import-Module -Name $mod -Force -DisableNameChecking; (Get-ShareRootAccess -Root $r).State } @($shareRootModule, $share) $rbSec
+                if ($rb.ok) { $state = [string]$rb.value }
+            }
         }
     } catch { $state = '' }
     if ($state -ceq 'ACCESS_DENIED') { Stop-Nightly 'SHARE_UNREACHABLE' "$Detail (the share root $share cannot be read: access denied, not a missing share; store the SMB credential for that host with cmdkey, tools\workstation\README.md step 6b)" -Verbatim @("SHARE_ACCESS_DENIED $share") }
