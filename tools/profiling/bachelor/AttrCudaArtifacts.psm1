@@ -576,9 +576,13 @@ function Enter-AttrCudaStageLock {
         # volume's first mount folder (GetVolumePathNamesForVolumeNameW) plus the GUID final path's rest. -TestNoDosPath (test-only) takes this branch on any volume.
         if ($dosFinal -notmatch '^[A-Za-z]:\\' -and $final -match '^(\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\)(.*)\z') {
             $volumeName = $Matches[1]; $rest = $Matches[2]
-            $mounts = [char[]]::new(32768); $mountsLen = [uint32]0
-            if ([AttrCudaWin32.StageRootVolumeNative]::GetVolumePathNamesForVolumeNameW($volumeName, $mounts, [uint32]32768, [ref]$mountsLen)) {
-                $firstMount = ([string]::new($mounts, 0, [int]$(if ($mountsLen -lt 32768) { $mountsLen } else { 32768 }))).Split([char]0)[0]
+            # r16 fix iteration 2 (adversary A1 on 8dffbff9): the mount list is a MULTI_SZ of any length (700 mount folders need more than 32768 WCHARs, and a
+            # fixed buffer answered ERROR_MORE_DATA, refused). A sizing call with a one-WCHAR buffer reports the length; the list is then read with exactly that.
+            $mountsLen = [uint32]0
+            [void][AttrCudaWin32.StageRootVolumeNative]::GetVolumePathNamesForVolumeNameW($volumeName, [char[]]::new(1), [uint32]1, [ref]$mountsLen)
+            $mounts = [char[]]::new([int]$(if ($mountsLen -gt 1) { $mountsLen } else { 1 }))
+            if ([AttrCudaWin32.StageRootVolumeNative]::GetVolumePathNamesForVolumeNameW($volumeName, $mounts, [uint32]$mounts.Length, [ref]$mountsLen)) {
+                $firstMount = ([string]::new($mounts, 0, $mounts.Length)).Split([char]0)[0]
                 if ($firstMount -match '^[A-Za-z]:\\') { $dosFinal = $firstMount.TrimEnd('\') + '\' + $rest }
             } else { $dosError = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
         }

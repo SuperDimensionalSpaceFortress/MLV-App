@@ -1567,6 +1567,12 @@ class StagedBuildNeverReplacedTests(_PwshCase):
             "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r16-fix1-a1.ps1")
         self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
         self.assertIn(f"ROOT={self.agent}\n", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
+        # r16 fix iteration 2 (adversary A1 on 8dffbff9): the mount list is read with the size a sizing call reported, never a fixed buffer (700 mount folders
+        # overflowed 32768 WCHARs: ERROR_MORE_DATA, refused). This host's volume list needs more than the one-WCHAR sizing buffer, so the row above went through it.
+        body = re.search(r"(?ms)^function Enter-AttrCudaStageLock \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
+        self.assertIn("GetVolumePathNamesForVolumeNameW($volumeName, [char[]]::new(1), [uint32]1, [ref]$mountsLen)", body)
+        self.assertIn("GetVolumePathNamesForVolumeNameW($volumeName, $mounts, [uint32]$mounts.Length, [ref]$mountsLen)", body)
+        self.assertNotIn("32768, [ref]$mountsLen", body)
 
     def test_r16_fix1_a3_a_root_whose_plain_path_names_another_directory_is_refused(self) -> None:
         # r16 fix iteration 1 (adversary A3 on 4118843c, AttrCudaArtifacts.psm1:570): the lock held \\?\...\stage.\agent (a trailing dot only the extended form keeps),

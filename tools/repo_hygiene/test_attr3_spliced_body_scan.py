@@ -175,7 +175,7 @@ _allow("Enter-AttrCudaStageLock",
        "r14 A2/r16 A1: opens the root ONCE (list+read-attributes, no share-delete, kept open); reads its id, GUID and drive-letter final paths and drive type; nothing written",
        ("R1", "Add-Type", 1), ("R4", "AttrCudaWin32.StageRootVolumeNative::CreateFileW", 1), ("R4", "Text.StringBuilder::new", 2),
        ("R4", "AttrCudaWin32.StageRootVolumeNative::GetFinalPathNameByHandleW", 2), ("R4", "AttrCudaWin32.StageRootVolumeNative::GetDriveTypeW", 1),
-       ("R4", "AttrCudaWin32.StageRootVolumeNative::GetVolumePathNamesForVolumeNameW", 1), ("R4", "char[]::new", 1), ("R4", "string::new", 1),
+       ("R4", "AttrCudaWin32.StageRootVolumeNative::GetVolumePathNamesForVolumeNameW", 2), ("R4", "char[]::new", 2), ("R4", "string::new", 1),
        ("R4", "AttrCudaWin32.FileIdNative+FileIdInfo::new", 1), ("R4", "AttrCudaWin32.FileIdNative::GetFileInformationByHandle", 1))
 _allow("Wait-AttrCudaTestHold",
        "test-only seam: writes '<Path>.reached' only when a test passed -Path; production passes none and the body returns before it",
