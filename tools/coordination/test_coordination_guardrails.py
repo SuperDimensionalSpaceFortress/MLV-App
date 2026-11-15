@@ -1118,8 +1118,7 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # the literal-class form is refused); a class or method name built from
 # pieces ('Win32_' + 'Process', -f); reflection; text run through Invoke-Expression or a script block built at run time; a member name handed to another
 # cmdlet (`Select-Object -ExpandProperty Create`, `Get-Member`); a dynamic member READ (`$f = $c.$m; $f.Invoke(...)`: refusing it would also refuse the plain `$obj.$name` property reads of two tracked
-# bachelor scripts, whose variables the file-wide WMI taint over-approximates); a method collection (`$c.psobject.Methods['Create']`); a positional ForEach-Object member name that
-# follows a switch parameter (`-UseNewRunspace Create`), which is read as that parameter's value. A file that does not parse is
+# bachelor scripts, whose variables the file-wide WMI taint over-approximates); a method collection (`$c.psobject.Methods['Create']`). A file that does not parse is
 # scanned as far as its AST goes; a file the parser cannot READ fails the tracked test (it was not scanned).
 # NOT covered, a parenthesized literal command name (distinct from the `& $cmd` form above): `& ('Invoke-CimMethod') -ClassName Win32_Process -MethodName Create`.
 # An alias the file itself defines (Set-Alias / New-Alias / sal / nal, literal name and value, an alias of an alias) is read as the command it names; a name with several meanings is tested as EVERY watched one, and a WMI command name stays one whatever it is aliased to. NOT covered: an alias made any other way (a non-literal name or value, `Import-Alias`, `$ExecutionContext`, `Set-Item alias:`, `New-Item -Path Alias:spawn -Value Invoke-CimMethod`) or defined in another file.
@@ -1136,6 +1135,13 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # -TypeName or the first positional, and its argument list is data; a WMI read only in the CONDITION of an if or a ternary is not the value of a binding, a pipeline
 # element or a switch input. NOT covered, the price of reading a class only where it is named: a bare positional string that names the process class to a command other than
 # these (`Get-CimAssociatedInstance Win32_Process`, `Get-Item WMI:\root\cimv2\Win32_Process`).
+# A PARAMETER TAKES A VALUE ONLY WHEN THE CMDLET SAYS SO (r15, Grok G17 = pass 19 A1, an under-refusal r14 introduced): in front of a positional slot the scan reads
+# (New-Object's type, ForEach-Object's member name, Set-Alias / New-Alias's name and value), whether a parameter takes the next element comes from the cmdlet's own
+# metadata, read once (`(Get-Command <cmdlet>).Parameters`, the common parameters and every alias included); a spelling that binds to no parameter or to several is a
+# SWITCH (fail closed), so `New-Object -vb System.Management.ManagementClass ...` and `ForEach-Object -UseNewRunspace Create` are read. Two generated sweeps put every
+# spelling the metadata names in front of each slot. An explicit -InputObject overrides a WMI pipeline only when spelled with three letters or more (`-in` is ambiguous).
+# VALUE MODE IS THE DEFAULT of Test-WmiNode / Test-WmiWord / Test-WmiClassOperand (pass 19 A2): a WMI read only in the condition of an if or a ternary is never the value;
+# the file-wide "does this file read WMI" test is the one explicit exception.
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
 WMI_CREATE_ALLOW = {}
@@ -1280,7 +1286,9 @@ function Test-InConditionOf($Node, $Root) {
     }
     return $false
 }
-function Test-WmiNode($Node, [bool]$Value = $false) {
+# VALUE MODE IS THE DEFAULT (r15, adversary pass 19 A2): every caller asks what a node's VALUE is, so a call site that forgets the flag can no longer read a condition
+# as the value. The one caller that asks "does the file read WMI ANYWHERE" (a read in a condition is still a read) passes $false explicitly.
+function Test-WmiNode($Node, [bool]$Value = $true) {
     if (Test-WmiWord $Node $Value) { return $true }
     foreach ($v in $Node.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) {
         if ($Value -and (Test-InConditionOf $v $Node)) { continue }
@@ -1313,7 +1321,7 @@ function Test-InWmiPipeline($Node) {
         # The first element receives no pipeline input, but -InputObject still hands it a value (ForEach-Object -InputObject $c -Process { $_ ... }); an explicit
         # -InputObject that is not WMI is this block's $_, so the search does not go on outward.
         if (Test-WmiPipelineInput $cmd) { return $true }
-        if ([object]::ReferenceEquals(@($cmd.Parent.PipelineElements)[0], $cmd) -and $null -eq (Get-ParameterValue $cmd 'InputObject' 1)) { continue }
+        if ([object]::ReferenceEquals(@($cmd.Parent.PipelineElements)[0], $cmd) -and $null -eq (Get-ParameterValue $cmd 'InputObject' 3)) { continue }
         return $false
     }
     return $false
@@ -1527,7 +1535,9 @@ function Get-ForEachMemberName($Command) {
     $elements = @($Command.CommandElements)
     for ($i = 1; $i -lt $elements.Count; $i++) {
         $e = $elements[$i]
-        if ($e -is [CommandParameterAst]) { if ($null -eq $e.Argument) { $i++ }; continue }
+        # A parameter takes the next element only when ForEach-Object's metadata says it takes a value: a switch (-UseNewRunspace, -vb) or a spelling that binds
+        # to no parameter or to several takes none, so the element after it is read as the member name (r15, fail closed; was: every parameter took one).
+        if ($e -is [CommandParameterAst]) { if ((Test-TakesNextElement 'foreach-object' $e) -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [CommandParameterAst]) { $i++ }; continue }
         if ($e -is [ScriptBlockExpressionAst]) { return $null }
         return $e
     }
@@ -1537,8 +1547,13 @@ function Get-ForEachMemberName($Command) {
 # True when the objects a command receives are WMI: an earlier element of its pipeline names a WMI class or starts from a WMI variable, or -InputObject does.
 function Test-WmiPipelineInput($Command) {
     # An explicit -InputObject IS the command's input: what it holds decides, and an earlier WMI element of the pipeline does not override it (adversary pass 15 A4).
-    $inputObject = Get-ParameterValue $Command 'InputObject' 1
+    # Three letters at least (r15, found by the generated ForEach-Object sweep): `-i` and `-in` also start the common InformationAction / InformationVariable, so
+    # PowerShell refuses them as ambiguous; reading them as -InputObject would let a plain value override a WMI pipeline (a narrowing). Same rule in Test-InWmiPipeline.
+    # A shorter spelling still counts when its value IS WMI (fail closed both ways: `ForEach-Object -i $c -MemberName Create` stays refused).
+    $inputObject = Get-ParameterValue $Command 'InputObject' 3
     if ($null -ne $inputObject) { return (Test-WmiNode $inputObject $true) }
+    $looseInput = Get-ParameterValue $Command 'InputObject' 1
+    if ($null -ne $looseInput -and (Test-WmiNode $looseInput $true)) { return $true }
     if ($Command.Parent -is [PipelineAst]) {
         foreach ($element in @($Command.Parent.PipelineElements)) {
             if ([object]::ReferenceEquals($element, $Command)) { break }
@@ -1659,7 +1674,7 @@ function Test-DataArgument($Arguments, [int]$Index) {
 }
 
 # True when the node is, or holds, a command that reads WMI by a tainted class operand.
-function Test-WmiClassOperand($Node, [bool]$Value = $false) {
+function Test-WmiClassOperand($Node, [bool]$Value = $true) {
     foreach ($c in @($Node.FindAll({ param($x) $x -is [CommandAst] }, $true))) {
         if ($Value -and (Test-InConditionOf $c $Node)) { continue }
         if (Test-WmiClassOperandCommand $c) { return $true }
@@ -1676,6 +1691,39 @@ function Test-ClassParameterName([string]$Name) {
     return $false
 }
 
+# The parameters of the cmdlets whose POSITIONAL operands the scan reads (New-Object's type, ForEach-Object's member name, Set-Alias / New-Alias's name and value),
+# read ONCE from each cmdlet's own metadata (r15, Grok G17): `(Get-Command <cmdlet>).Parameters` holds its own parameters and the common ones, each with its aliases and
+# whether it is a switch. A hand-written list is what missed `-vb` / `-db`. Key: the cmdlet, then a spelling (name or alias), lowercased.
+$parameterTables = @{}
+foreach ($cmdlet in @('New-Object', 'ForEach-Object', 'Set-Alias', 'New-Alias')) {
+    $table = @{}
+    foreach ($p in (Get-Command -Name $cmdlet -CommandType Cmdlet).Parameters.Values) {
+        $entry = [pscustomobject]@{ Name = [string]$p.Name; Switch = [bool]$p.SwitchParameter }
+        foreach ($spelling in @(@($p.Name) + @($p.Aliases))) { if ($spelling) { $table[([string]$spelling).ToLowerInvariant()] = $entry } }
+    }
+    $parameterTables[$cmdlet.ToLowerInvariant()] = $table
+}
+# The aliases of the common SWITCHES (vb, db), from the same metadata: on any other command they take no value either.
+$commonSwitchAliases = @(foreach ($p in (Get-Command -Name New-Object -CommandType Cmdlet).Parameters.Values) { if ($p.SwitchParameter -and [System.Management.Automation.Cmdlet]::CommonParameters.Contains($p.Name)) { foreach ($a in @($p.Aliases)) { ([string]$a).ToLowerInvariant() } } })
+
+# The parameter of $Cmdlet a spelling binds to, as PowerShell resolves it: an exact name or alias, else the one parameter every name or alias it is a prefix of belongs
+# to. $null when it binds to none or to more than one: the caller then reads it as a SWITCH (fail closed), so the element after it is still read as an operand.
+function Resolve-CmdletParameter([string]$Cmdlet, [string]$Spelling) {
+    $table = $parameterTables[$Cmdlet]
+    $key = $Spelling.ToLowerInvariant()
+    if ($table.ContainsKey($key)) { return $table[$key] }
+    $hits = @($table.Keys | Where-Object { $_.StartsWith($key, [StringComparison]::Ordinal) } | ForEach-Object { $table[$_] } | Sort-Object -Property Name -Unique)
+    if ($hits.Count -eq 1) { return $hits[0] }
+    return $null
+}
+function Resolve-NewObjectParameter([string]$Spelling) { return (Resolve-CmdletParameter 'new-object' $Spelling) }
+# True when a parameter element of $Cmdlet takes the element after it: it has no colon-form value and it resolves to a parameter that is not a switch.
+function Test-TakesNextElement([string]$Cmdlet, $Parameter) {
+    if ($null -ne $Parameter.Argument) { return $false }
+    $r = Resolve-CmdletParameter $Cmdlet $Parameter.ParameterName
+    return ($null -ne $r -and -not $r.Switch)
+}
+
 # True when one command NAMES a WMI class by its letters: a type name it is given (New-Object System.Management.ManagementClass), the value of a class parameter, or the
 # first positional operand of an Invoke-CimMethod / Invoke-WmiMethod call. An argument of any other command (`New-Object System.IO.FileInfo 'Win32_Process'`,
 # `Write-Output 'Win32_Process'`) is free text: it names nothing and taints nothing (r14, adversary pass 16 A3).
@@ -1685,20 +1733,31 @@ function Test-WmiCommandWord($Command) {
     $isInvoke = $false
     foreach ($m in $meanings) { if ($wmiCommands -contains $m) { $isInvoke = $true } }
     $isNewObject = ($meanings -contains 'new-object')
+    # -TypeName takes the type slot only when the spelling RESOLVES to it in the metadata: an unresolved spelling leaves the first positional the type (fail closed).
     $typeNamed = $false
-    foreach ($e in $elements) { if ($e -is [CommandParameterAst] -and $e.ParameterName.Length -ge 1 -and 'TypeName'.StartsWith($e.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $typeNamed = $true } }
+    if ($isNewObject) { foreach ($e in $elements) { if ($e -is [CommandParameterAst]) { $r = Resolve-NewObjectParameter $e.ParameterName; if ($null -ne $r -and $r.Name -eq 'TypeName') { $typeNamed = $true } } } }
     $positional = 0
     for ($i = 1; $i -lt $elements.Count; $i++) {
         $e = $elements[$i]
         if ($e -is [CommandParameterAst]) {
             $n = $e.ParameterName
-            # A parameter takes the element after it (a switch takes none): its value is not a positional operand.
-            $isSwitch = ($null -eq $e.Argument -and (@($wmiSwitchParameters + 'Strict') | Where-Object { $n.Length -ge 2 -and $_.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) }))
+            # A parameter takes the element after it (a switch takes none): its value is not a positional operand. On New-Object a spelling is a switch when the
+            # metadata says so, and an unknown or ambiguous one is a switch too (fail closed: the next element is then read as the type; r15, Grok G17). A class
+            # parameter always takes its value, so that value is read as a class.
+            $resolved = $null
+            if ($isNewObject) {
+                $resolved = Resolve-NewObjectParameter $n
+                $isSwitch = ($null -eq $e.Argument -and -not (Test-ClassParameterName $n) -and ($null -eq $resolved -or $resolved.Switch))
+            }
+            else {
+                $isSwitch = ($null -eq $e.Argument -and (($commonSwitchAliases -contains $n.ToLowerInvariant()) -or (@($wmiSwitchParameters + 'Strict') | Where-Object { $n.Length -ge 2 -and $_.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) })))
+            }
             $value = $e.Argument
             if ($null -eq $value -and -not $isSwitch -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [CommandParameterAst]) { $value = $elements[$i + 1]; $i++ }
             if ($null -ne $value -and (Test-ClassParameterName $n) -and $wmiWord.IsMatch((Get-CleanText $value))) { return $true }
-            # New-Object: the TYPE is -TypeName; -ArgumentList is constructor data, not a type.
-            if ($isNewObject -and $n.Length -ge 1 -and 'TypeName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase) -and $null -ne $value -and $wmiTypeWord.IsMatch((Get-CleanText $value))) { return $true }
+            # New-Object: the TYPE is -TypeName (any spelling that resolves to it, or a prefix of it); -ArgumentList is constructor data, not a type.
+            $isTypeName = ($null -ne $resolved -and $resolved.Name -eq 'TypeName') -or ($n.Length -ge 1 -and 'TypeName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase))
+            if ($isNewObject -and $isTypeName -and $null -ne $value -and $wmiTypeWord.IsMatch((Get-CleanText $value))) { return $true }
             continue
         }
         $positional++
@@ -1712,7 +1771,7 @@ function Test-WmiCommandWord($Command) {
 
 # True when the node names the WMI process class where a class is named: a type name, a command's class operand, or an argument of a CimSession method that takes a
 # class (EnumerateInstances, QueryInstances, GetInstance, InvokeMethod ...). The letters of a string anywhere else are free text.
-function Test-WmiWord($Node, [bool]$Value = $false) {
+function Test-WmiWord($Node, [bool]$Value = $true) {
     foreach ($x in @($Node.FindAll({ param($y) $y -is [CommandAst] -or $y -is [InvokeMemberExpressionAst] -or $y -is [TypeConstraintAst] -or $y -is [TypeExpressionAst] }, $true))) {
         if ($Value -and (Test-InConditionOf $x $Node)) { continue }
         if ($x -is [CommandAst]) { if (Test-WmiCommandWord $x) { return $true } }
@@ -1753,10 +1812,9 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
         for ($i = 1; $i -lt $elements.Count; $i++) {
             $e = $elements[$i]
             if ($e -is [CommandParameterAst]) {
-                # A switch (Force, PassThru, Confirm, WhatIf, Verbose, Debug, an abbreviation, or the aliases vb, db, cf and wi) takes no value; any other parameter takes the next element.
-                $isSwitch = (@('vb', 'db', 'cf', 'wi') -contains $e.ParameterName.ToLowerInvariant())
-                foreach ($sw in @('Force', 'PassThru', 'Confirm', 'WhatIf', 'Verbose', 'Debug')) { if ($sw.StartsWith($e.ParameterName, [StringComparison]::OrdinalIgnoreCase)) { $isSwitch = $true } }
-                if ($null -eq $e.Argument -and -not $isSwitch) { $i++ }
+                # A parameter takes the next element only when the cmdlet's metadata says it takes a value (r15): a switch (Force, PassThru, Confirm, WhatIf, Verbose,
+                # Debug, any alias or abbreviation) or a spelling that binds to no parameter or to several takes none (fail closed: the next element is an operand).
+                if ((Test-TakesNextElement $(if ($cn -eq 'sal') { 'set-alias' } elseif ($cn -eq 'nal') { 'new-alias' } else { $cn }) $e) -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [CommandParameterAst]) { $i++ }
                 continue
             }
             $positional.Add($e)
@@ -1810,7 +1868,8 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     }
     # $PSDefaultParameterValues can hand any command a -PipelineVariable / -InputObject / -MemberName: in a file that reads WMI, a write to it that is not a
     # hashtable of safe literal keys is refused.
-    $fileReadsWmi = Test-WmiWord $ast
+    # The one explicit exception to value mode: a read anywhere in the file, a condition included, makes the file one that reads WMI.
+    $fileReadsWmi = Test-WmiWord $ast $false
     if ($fileReadsWmi) {
         foreach ($d in @(Get-DefaultParameterValuesSites)) {
             $text = ($d.Extent.Text -replace '\s+', ' ')
@@ -2307,6 +2366,15 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "wmi-value-in-an-if-branch-piped-create": "$(if ($true) { Get-CimInstance Win32_Process } else { $null }) | ForEach-Object { $_.Create('x') }",
         "cim-method-named-create-among-other-names": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'CreateNote' }",
         "foreach-member-name-create-with-a-note-property-name-elsewhere": "Get-CimInstance Win32_Process | Add-Member -NotePropertyName CreateNote -NotePropertyValue 'x' -PassThru | ForEach-Object -MemberName Create -ArgumentList 'x'",
+        # r15, Grok G17 on 9a26b0f3 (= pass 19 A1, an UNDER-refusal): a switch alias in front of New-Object's type took the type as its value; verbatim from the ask.
+        # The generated sweep over every spelling New-Object's metadata names is test_wmi_create_scan_refuses_every_new_object_parameter_spelling_before_the_type.
+        "g17-new-object-verbose-alias-before-the-management-class-type": "$c = New-Object -vb System.Management.ManagementClass 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+        "g17-new-object-debug-alias-before-the-management-class-type": "$c = New-Object -db System.Management.ManagementClass 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+        "g17-new-object-property-then-verbose-alias-before-the-type": "$c = New-Object -Property @{} -vb System.Management.ManagementClass 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+        # r15, pass 19 A2's companions: a REAL WMI value in the branch of the if (not its condition) still makes the -PipelineVariable / splat check fire
+        "a2-wmi-value-in-an-if-branch-with-a-variable-pipeline-variable": "$n = 'w'\nWrite-Output $(if ($true) { Get-CimInstance Win32_Process }) -PipelineVariable $n",
+        "a2-wmi-value-in-an-if-branch-with-a-pipeline-variable-splat": "$h = @{ PipelineVariable = 'w' }\nWrite-Output $(if ($true) { Get-CimInstance Win32_Process }) @h | ForEach-Object { $w.Create('x') }",
+        "a2-wmi-value-in-a-ternary-branch-with-a-variable-pipeline-variable": "$n = 'w'\nWrite-Output ($true ? (Get-CimInstance Win32_Process) : $null) -pv $n",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -2461,6 +2529,12 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "wmi-method-name-contains-create": "Invoke-WmiMethod -Class SystemRestore -Name CreateRestorePoint -ArgumentList 'x', 0, 100",
         "foreach-member-name-contains-create": "$p = Get-CimInstance Win32_Process | Select-Object -First 1\n$p | Add-Member -NotePropertyName CreateNote -NotePropertyValue 'read-only'\n$p | ForEach-Object -MemberName CreateNote",
         "foreach-member-name-contains-invoke-method": "Get-CimInstance Win32_Process | ForEach-Object -MemberName InvokeMethodNote",
+        # r15, adversary pass 19 A2 on 9a26b0f3, verbatim (input and sibling input): a WMI read only in the CONDITION of an if inside an argument is not the value the
+        # -PipelineVariable or the splat check reads. Value mode is now the DEFAULT of Test-WmiNode / Test-WmiWord; the file-wide read is the one explicit exception.
+        "a2-wmi-read-only-in-an-if-condition-with-a-variable-pipeline-variable": "$n = 'plain'\nWrite-Output $(if (Get-CimInstance Win32_Process) { 'ok' }) -PipelineVariable $n",
+        "a2-wmi-read-only-in-an-if-condition-with-a-pipeline-variable-splat": "$h = @{ PipelineVariable = 'plain' }\nWrite-Output $(if (Get-CimInstance Win32_Process) { 'ok' }) @h",
+        "a2-wmi-read-only-in-a-ternary-condition-with-a-variable-pipeline-variable": "$n = 'plain'\nWrite-Output ((Get-CimInstance Win32_Process) ? 'ok' : 'no') -pv $n",
+        "a2-wmi-read-only-in-a-ternary-condition-with-a-pipeline-variable-splat": "$h = @{ PipelineVariable = 'plain' }\nWrite-Output ((Get-CimInstance Win32_Process) ? 'ok' : 'no') @h",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
@@ -2481,6 +2555,122 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
     missing = tmp_path / "cases" / "this-file-does-not-exist.ps1"
     unread = _wmi_create_scan(tmp_path / "scan-missing", [missing])[str(missing)]
     assert unread["unreadable"] is True and all(not scan[str(path)]["unreadable"] for path in files.values()), unread
+
+
+# r15, Grok G17 (prevention): a round that NARROWS what the scanner reads ("New-Object's type is the first positional") must prove that nothing new gets through,
+# not only that the false alarms are gone. The spellings below are GENERATED from the cmdlet's own metadata -- every parameter of New-Object and every common
+# parameter, each name, each alias and (for a switch) each unambiguous prefix, plus an unknown and an ambiguous parameter -- and each one is put in front of the
+# type of a real ManagementClass create. A hand-written alias list is exactly what missed `-vb`.
+_NEW_OBJECT_PARAMETERS_PROBE = r"""
+param([string]$Cmdlet = 'New-Object')
+$ErrorActionPreference = 'Stop'
+$rows = New-Object System.Collections.Generic.List[object]
+foreach ($p in (Get-Command -Name $Cmdlet -CommandType Cmdlet).Parameters.Values) {
+    $rows.Add([pscustomobject]@{ name = [string]$p.Name; aliases = [string[]]@($p.Aliases); switch = [bool]$p.SwitchParameter })
+}
+foreach ($prop in [System.Management.Automation.Internal.CommonParameters].GetProperties()) {
+    $aliases = [string[]]@($prop.GetCustomAttributes([System.Management.Automation.AliasAttribute], $true) | ForEach-Object { $_.AliasNames })
+    $rows.Add([pscustomobject]@{ name = [string]$prop.Name; aliases = $aliases; switch = [bool]($prop.PropertyType -eq [System.Management.Automation.SwitchParameter]) })
+}
+ConvertTo-Json -InputObject $rows.ToArray() -Depth 4 -Compress
+"""
+
+
+def _new_object_parameter_metadata(tmp_path, cmdlet="New-Object"):
+    """{name: {"aliases": set, "switch": bool}} for the cmdlet plus the common parameters, as the host's pwsh reports them."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    probe = tmp_path / "cmdlet-parameters.ps1"
+    probe.write_text(_NEW_OBJECT_PARAMETERS_PROBE, encoding="ascii", newline="\n")
+    done = subprocess.run([_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(probe), "-Cmdlet", cmdlet], text=True, capture_output=True, timeout=120)
+    assert done.returncode == 0, f"the metadata probe failed: {done.stdout!r} {done.stderr!r}"
+    merged = {}
+    for row in json.loads(done.stdout):
+        entry = merged.setdefault(row["name"], {"aliases": set(), "switch": False})
+        entry["aliases"].update(a for a in (row["aliases"] or []) if a)
+        entry["switch"] = entry["switch"] or bool(row["switch"])
+    return merged
+
+
+def _new_object_spellings(metadata, skip=("TypeName",)):
+    """[(label, parameter text)] to put in front of the slot: every spelling the metadata names, a switch's unambiguous prefixes, and fail-closed probes."""
+    owner = {}
+    for name, entry in metadata.items():
+        for spelling in {name, *entry["aliases"]}:
+            owner.setdefault(spelling.lower(), set()).add(name)
+    def resolves_to(prefix):
+        return {n for s, names in owner.items() if s.startswith(prefix.lower()) for n in names}
+    value = {"Property": "@{}", "OutBuffer": "1"}
+    out = []
+    for name, entry in sorted(metadata.items()):
+        if name in skip:
+            continue  # the parameter that IS the slot (-TypeName, -MemberName) or decides the input (-InputObject); their creates are mutants above
+        spellings = {name, *entry["aliases"]}
+        if entry["switch"]:
+            for full in sorted({name, *entry["aliases"]}):
+                spellings.update(full[:k] for k in range(1, len(full)) if resolves_to(full[:k]) == {name})
+            out += [(f"{s}", f"-{s}") for s in sorted(spellings)]
+            out += [(f"{s}-colon", f"-{s}:$true") for s in sorted({name, *entry["aliases"]})]
+            out += [(f"property-then-{s}", f"-Property @{{}} -{s}") for s in sorted(spellings)]
+        else:
+            out += [(f"{s}-value", f"-{s} {value.get(name, chr(39) + 'v' + chr(39))}") for s in sorted(spellings)]
+    # Fail closed: a parameter New-Object does not have, and a prefix that names two parameters, are read as SWITCHES, so the next element is the type.
+    ambiguous = sorted(p for p in ("o", "in", "out", "w", "inf") if len(resolves_to(p)) > 1)
+    assert ambiguous, "no ambiguous prefix left to probe"
+    out += [("unknown", "-NotAParameterOfNewObject")] + [(f"ambiguous-{p}", f"-{p}") for p in ambiguous]
+    return out
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_refuses_every_new_object_parameter_spelling_before_the_type(tmp_path):
+    metadata = _new_object_parameter_metadata(tmp_path / "probe")
+    # The sweep is only as good as the metadata it reads: it must hold the parameters a hand-written list missed, read from the cmdlet, not from this file.
+    assert {"Verbose", "Debug", "Strict", "Property", "ErrorAction", "PipelineVariable"} <= set(metadata), sorted(metadata)
+    assert {"vb"} <= metadata["Verbose"]["aliases"] and {"db"} <= metadata["Debug"]["aliases"], metadata
+    assert metadata["Strict"]["switch"] and metadata["Verbose"]["switch"] and not metadata["Property"]["switch"], metadata
+    spellings = _new_object_spellings(metadata)
+    covered = {text.split()[0].split(":")[0].lstrip("-").lower() for _label, text in spellings}
+    every_alias = {a.lower() for entry in metadata.values() for a in entry["aliases"]}
+    assert every_alias <= covered, f"aliases the sweep does not put before the type: {sorted(every_alias - covered)}"
+    shapes = {
+        "assigned": "$c = New-Object {p} System.Management.ManagementClass 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+        "parenthesized": "(New-Object {p} System.Management.ManagementClass 'Win32_Process').Create('cmd.exe /c exit 0')",
+    }
+    files = {}
+    for shape, template in shapes.items():
+        for index, (label, text) in enumerate(spellings):
+            # numbered: the file system folds case, and `-D` and `-d` are two spellings
+            path = tmp_path / "cases" / f"{shape}-{index:03d}.ps1"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(template.replace("{p}", text) + "\n", encoding="utf-8", newline="\n")
+            files[f"{shape}-{label}"] = path
+    assert len(files) == len(shapes) * len(spellings) and len(spellings) >= 60, len(spellings)
+    scan = _wmi_create_scan(tmp_path / "scan", list(files.values()))
+    unparsed = {name: scan[str(path)]["parseErrors"] for name, path in files.items() if scan[str(path)]["parseErrors"]}
+    assert unparsed == {}, "a generated case must still be valid PowerShell"
+    survivors = sorted(name for name, path in files.items() if not scan[str(path)]["sites"])
+    assert survivors == [], f"these New-Object parameter spellings in front of the type hid a WMI create: {survivors}"
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_refuses_every_foreach_object_parameter_spelling_before_the_member_name(tmp_path):
+    """r15 sibling of G17: Get-ForEachMemberName took the element after EVERY parameter as its value, so a switch (`-UseNewRunspace`, `-vb`) in front of a positional
+    member name hid it (named NOT covered until r15). The spellings are generated from ForEach-Object's own metadata, as for New-Object."""
+    metadata = _new_object_parameter_metadata(tmp_path / "probe", "ForEach-Object")
+    assert {"UseNewRunspace", "Verbose", "MemberName", "InputObject"} <= set(metadata) and metadata["UseNewRunspace"]["switch"], sorted(metadata)
+    spellings = _new_object_spellings(metadata, skip=("MemberName", "InputObject"))
+    template = "Get-WmiObject -List Win32_Process | ForEach-Object {p} Create 'cmd.exe /c exit 0'"
+    files = {}
+    for index, (label, text) in enumerate(spellings):
+        path = tmp_path / "cases" / f"foreach-{index:03d}.ps1"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(template.replace("{p}", text) + "\n", encoding="utf-8", newline="\n")
+        files[f"foreach-{label}"] = path
+    assert len(spellings) >= 60, len(spellings)
+    scan = _wmi_create_scan(tmp_path / "scan", list(files.values()))
+    unparsed = {name: scan[str(path)]["parseErrors"] for name, path in files.items() if scan[str(path)]["parseErrors"]}
+    assert unparsed == {}, "a generated case must still be valid PowerShell"
+    survivors = sorted(name for name, path in files.items() if not scan[str(path)]["sites"])
+    assert survivors == [], f"these ForEach-Object parameter spellings in front of the member name hid a WMI create: {survivors}"
 
 
 # --- LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: the codex lane's children must find the MinGW runtime DLLs ----------
