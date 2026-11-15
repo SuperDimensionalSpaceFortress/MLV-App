@@ -174,7 +174,9 @@ elseif ($kind -eq 'DLLPAIR') {
     $out = "RESULT=STAGE_OK SOURCE=$sha FILES=4 CACHE=$cache ARTIFACTS=x"
 } else {
     New-Item -ItemType Directory -Force -Path (Join-Path $cache "smoke-runner-$('b' * 16)") | Out-Null
-    $out = "RESULT=SMOKE_RUNNER_STAGE_OK CACHE_DIR=smoke-runner-$('b' * 16) PATH=x FILES=8"
+    # already: the job found this exact closure in the cache (attr3-stage-smoke-runner-job.ps1 Complete-AlreadyStaged) and printed its ALREADY=1 form
+    if ($mode -eq 'already') { $out = "RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR=smoke-runner-$('b' * 16) PATH=x" }
+    else { $out = "RESULT=SMOKE_RUNNER_STAGE_OK CACHE_DIR=smoke-runner-$('b' * 16) PATH=x FILES=8" }
 }
 $r = [ordered]@{ jobId = $JobId; exitCode = $code; stdout = $out; stderr = ''; timedOut = $false; cancelled = $false; queueExpired = $false; orphaned = $false
     startedUtc = [DateTime]::UtcNow.ToString('o'); endedUtc = [DateTime]::UtcNow.ToString('o') }
@@ -420,6 +422,15 @@ class VenueStageNightlyTests(unittest.TestCase):
         log = self.calls()
         self.assertLess(log.index(self.calls("COMMITGATE")[0]), log.index(self.calls("ASSEMBLE")[0]))
         self.assert_no_jobid_twice()
+
+    def test_a_smoke_runner_job_that_finds_its_closure_cached_is_staged_not_failed(self) -> None:
+        # SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1: the job prints RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR=... when the cache already holds its
+        # closure (#813 r5 ended SMOKE_RUNNER_STAGE_FAILED on that line although the build was staged). That is a staged runner, never a failure.
+        p = self.run_driver(env={"FAKE_UMRUN_SMOKE": "already"})
+        self.assert_exit(p, "STAGE_OK")
+        self.assertIn(f"attr3-stage-smoke-runner-{S12}-bbbbbbbbbbbb", self.submitted_jobs())
+        self.assertIn(f"smoke-runner result: RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR={RUNNER_DIR}", p.stdout)
+        self.assertEqual(self.rows()[-1]["smokeRunnerCacheDir"], RUNNER_DIR)
 
     # ---------------------------------------------------------------- LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the notAfterUtc each submit hands um-run
     def test_the_stage_job_not_after_is_the_drivers_deadline_and_the_harvested_jobs_get_none(self) -> None:
@@ -988,6 +999,87 @@ class VenueStageReuseModuleTests(unittest.TestCase):
             other = self.ps(f"(Get-StageReuse -ResultPath '{res}' -JobId 'j' -Sha '{OTHER_SHA}' -Kind Stage).Reason")
         self.assertEqual(ok, "True")
         self.assertTrue(other.startswith("SOURCE-mismatch"), other)
+
+    # ---------------------------------------------------------------- SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1
+    SMOKE_JOB = f"attr3-stage-smoke-runner-{S12}-bbbbbbbbbbbb"
+
+    def reuse(self, stdout: str, kind: str, job: str, sha: str = SHA) -> tuple[str, str, str]:
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "r.json"
+            res.write_text(json.dumps({"jobId": job, "exitCode": 0, "stdout": stdout, "endedUtc": "2026-11-15T00:00:00Z"}), encoding="utf-8")
+            out = self.ps(f"$r = Get-StageReuse -ResultPath '{res}' -JobId '{job}' -Sha '{sha}' -Kind {kind}; "
+                          "[Console]::Out.WriteLine([string]$r.Staged); [Console]::Out.WriteLine([string]$r.Reason); [Console]::Out.WriteLine([string]$r.Line)")
+        lines = out.splitlines() + ["", "", ""]
+        return lines[0], lines[1], lines[2]
+
+    def test_smoke_runner_reuse_accepts_the_already_staged_form(self) -> None:
+        # attr3-stage-smoke-runner-job.ps1 Complete-AlreadyStaged prints this when the cache already holds the closure; the checker used to answer
+        # no-RESULT=SMOKE_RUNNER_STAGE_OK-line and the nightly ended SMOKE_RUNNER_STAGE_FAILED (#813 r5).
+        staged, reason, line = self.reuse(f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR={RUNNER_DIR} PATH=x", "SmokeRunner", self.SMOKE_JOB)
+        self.assertEqual((staged, reason), ("True", "staged-already"))
+        self.assertEqual(line, f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR={RUNNER_DIR}")
+        fresh = self.reuse(f"RESULT=SMOKE_RUNNER_STAGE_OK CACHE_DIR={RUNNER_DIR} PATH=x FILES=8", "SmokeRunner", self.SMOKE_JOB)
+        self.assertEqual(fresh[:2], ("True", "staged-already"))
+
+    def test_smoke_runner_reuse_still_refuses_every_other_shape(self) -> None:
+        # the pin is widened by exactly one optional token in one place; the closure check is unchanged
+        other_dir = "smoke-runner-" + "c" * 16
+        for stdout, why in (
+            (f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR={other_dir} PATH=x", "CACHE_DIR-closure-mismatch"),
+            (f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR={RUNNER_DIR} PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+            (f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1  CACHE_DIR={RUNNER_DIR} PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+            (f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 ALREADY=1 CACHE_DIR={RUNNER_DIR} PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+            (f"RESULT=SMOKE_RUNNER_STAGE_OK X=1 CACHE_DIR={RUNNER_DIR} PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+            (f"RESULT=SMOKE_RUNNER_STAGE_OKALREADY=1 CACHE_DIR={RUNNER_DIR} PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+            (f"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR={RUNNER_DIR}0 PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+            (f" RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR={RUNNER_DIR} PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+            (f"RESULT=SMOKE_RUNNER_STAGE_FAILED ALREADY=1 CACHE_DIR={RUNNER_DIR} PATH=x", "no-RESULT=SMOKE_RUNNER_STAGE_OK-line"),
+        ):
+            staged, reason, _ = self.reuse(stdout, "SmokeRunner", self.SMOKE_JOB)
+            self.assertEqual(staged, "False", stdout)
+            self.assertTrue(reason.startswith(why), (stdout, reason))
+
+    def test_every_emitted_ok_shape_is_accepted_by_its_checker(self) -> None:
+        # CONTRACT PIN: every RESULT=..._OK line the three staging jobs can print, rendered with sample values, passes the reuse check that reads it. A new or
+        # changed emitter shape reds this test instead of a venue night (SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1: the ALREADY=1 form had no checker row).
+        bachelor = ROOT / "tools" / "profiling" / "bachelor"
+        dll_job = f"playback-attr-3-cuda-dllpair-{S12}"
+
+        def emitted(path: Path, token: str) -> list[str]:
+            return re.findall(r'^\s*Write-Output "(RESULT=' + token + r'(?:\s[^"]*)?)"\s*$', path.read_text(encoding="utf-8"), re.M)
+
+        def render(line: str, subs: dict[str, str]) -> str:
+            for var, val in subs.items():
+                line = re.sub(r"\$" + var + r"\b", val, line)
+            line = re.sub(r"\$\([^()]*\)", "8", line)        # $($x.Count) and the like
+            return re.sub(r"\$\w+", "x", line)                # any other path / label variable
+
+        smoke = emitted(bachelor / "attr3-stage-smoke-runner-job.ps1", "SMOKE_RUNNER_STAGE_OK")
+        self.assertEqual(len(smoke), 2, smoke)               # the fresh form and the ALREADY=1 form; a third shape needs its own checker row
+        for raw in smoke:
+            line = render(raw, {"CacheDirName": RUNNER_DIR})
+            staged, reason, _ = self.reuse(line, "SmokeRunner", self.SMOKE_JOB)
+            self.assertEqual((staged, reason), ("True", "staged-already"), (raw, line))
+
+        stage = emitted(bachelor / "playback-attr-3-cuda-stage-job.ps1", "STAGE_OK")
+        self.assertEqual(len(stage), 1, stage)
+        for raw in stage:
+            line = render(raw, {"SourceCommit": SHA})
+            staged, reason, _ = self.reuse(line, "Stage", f"playback-attr-3-cuda-stage-{S12}")
+            self.assertEqual((staged, reason), ("True", "staged-already"), (raw, line))
+
+        dll = emitted(ROOT / "tools" / "profiling" / "ultramagnus" / "playback-attr-3-cuda-dll-job.ps1", "DLL_PAIR_OK")
+        self.assertEqual(len(dll), 1, dll)
+        for raw in dll:
+            line = render(raw, {"SourceCommit": SHA})
+            with tempfile.TemporaryDirectory() as d:
+                outbox = Path(d)
+                (outbox / f"{dll_job}.artifacts").mkdir()
+                (outbox / f"{dll_job}.artifacts" / "dll-pair-manifest.json").write_text(json.dumps({"sourceCommit": SHA, "jobId": dll_job}), encoding="utf-8")
+                (outbox / f"{dll_job}.result.json").write_text(json.dumps({"jobId": dll_job, "exitCode": 0, "stdout": line, "endedUtc": "2026-11-15T00:00:00Z"}),
+                                                               encoding="utf-8")
+                ok = self.ps(f"(Get-DllPairReuse -Outbox '{outbox}' -JobId '{dll_job}' -Sha '{SHA}').Reusable")
+            self.assertEqual(ok, "True", (raw, line))
 
 
 @requires_windows_pwsh
