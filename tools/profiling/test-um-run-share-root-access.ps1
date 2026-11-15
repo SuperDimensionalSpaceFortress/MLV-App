@@ -132,6 +132,29 @@ Assert-That ($s -notmatch 'No agent heartbeat') 'nightly: the denied case never 
 $s = Invoke-StubbedUmRun "UMRUN_ERROR No agent heartbeat at $fakeRoot\heartbeat.txt - run install first."
 Assert-That ($s.StartsWith('STOP|SHARE_UNREACHABLE|') -and $s -match 'No agent heartbeat' -and $s -notmatch 'SHARE_ACCESS_DENIED') 'nightly: a readable share with no heartbeat keeps "No agent heartbeat" and no typed line' "got: $s"
 
+# ---------------------------------------------------------------- adversary pass 5 (head 2c812a47)
+# A8: the REAL one-line transport (the `$text` Invoke-UmRun hands to its child) must keep the denied root exactly: an accepted -AgentShare with two
+# internal spaces used to come out with one, naming a different share. Every other check here feeds ChildOut directly and bypasses that transport.
+$a8Dir = Join-Path $ScratchRoot 'a8'
+[void][IO.Directory]::CreateDirectory($a8Dir)
+$a8Root = '\\host\share  name'
+$a8Stub = Join-Path $a8Dir 'um-run-throws.ps1'
+[IO.File]::WriteAllText($a8Stub, "param([Parameter(ValueFromRemainingArguments = `$true)]`$Rest)`nthrow 'SHARE_ACCESS_DENIED $a8Root'`n")
+$a8SavedChild = ${function:Invoke-Child}
+$a8SavedUmRun = $UmRun
+function Invoke-Child {
+    param($Name, $A, $B, $CommandText)
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($CommandText))
+    $o = (& pwsh -NoProfile -NonInteractive -EncodedCommand $enc 2>&1 | Out-String)
+    [pscustomobject]@{ timedOut = $false; exit = $LASTEXITCODE; out = $o; err = '' }
+}
+$UmRun = $a8Stub
+$s = ''
+try { [void](Invoke-UmRun -Step 'stage' -JobFile 'job.ps1' -Side @() -JobId 'J1' -Share $a8Root -JobTimeoutSec 60 -FailToken 'STAGE_FAILED'); $s = 'NOSTOP' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($s.EndsWith("|SHARE_ACCESS_DENIED $a8Root")) 'A8 nightly: the real transport prints the denied root verbatim, internal spaces kept' "got: $s"
+${function:Invoke-Child} = $a8SavedChild
+$UmRun = $a8SavedUmRun
+
 # ---------------------------------------------------------------- adversary pass r2 (head 3f561245)
 # A12: an access-denied exception wrapped deeper than 8 levels is still recognised.
 $inner = [UnauthorizedAccessException]::new('denied')
