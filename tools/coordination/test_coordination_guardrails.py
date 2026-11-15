@@ -1801,16 +1801,35 @@ function Test-DataValue($Node) {
         }
         # A ternary or an if is data when EVERY branch is (r16, adversary pass 23 A2: `($t ? @('create') : @('create'))`); its condition is not its value. A branch
         # is one statement that is data; an if with no else can also give nothing, which is not a verb either.
-        elseif ($w -is [TernaryExpressionAst]) { return ((Test-DataValue $w.IfTrue) -and (Test-DataValue $w.IfFalse)) }
+        # r17, sol r16 B1: a branch that is `$null` or EMPTY gives nothing, which is not a verb either, so `(if ($t) { @('create') } else { $null })` is data.
+        elseif ($w -is [TernaryExpressionAst]) { return ((Test-DataOrNullBranch $w.IfTrue) -and (Test-DataOrNullBranch $w.IfFalse)) }
         elseif ($w -is [IfStatementAst]) {
             $branches = @(@($w.Clauses) | ForEach-Object { $_.Item2 }) + @(if ($null -ne $w.ElseClause) { $w.ElseClause })
-            foreach ($b in $branches) { if (@($b.Statements).Count -ne 1 -or -not (Test-DataValue @($b.Statements)[0])) { return $false } }
+            foreach ($b in $branches) {
+                $statements = @($b.Statements)
+                if ($statements.Count -eq 0) { continue }
+                if ($statements.Count -ne 1 -or -not (Test-DataOrNullBranch $statements[0])) { return $false }
+            }
             return $true
         }
         $w = $next
     }
     return $false
 }
+
+# True when the node is the `$null` literal, through parentheses, `$( )` of one statement and a statement of one expression: `$null`, `($null)`, `$($null)`.
+function Test-NullValue($Node) {
+    for ($w = $Node; $null -ne $w; ) {
+        if ($w -is [VariableExpressionAst]) { return ([string]$w.VariablePath.UserPath -ieq 'null') }
+        if ($w -is [CommandExpressionAst]) { $w = $w.Expression }
+        elseif ($w -is [PipelineAst] -and @($w.PipelineElements).Count -eq 1) { $w = @($w.PipelineElements)[0] }
+        elseif ($w -is [ParenExpressionAst]) { $w = $w.Pipeline }
+        elseif ($w -is [SubExpressionAst] -and @($w.SubExpression.Statements).Count -eq 1) { $w = @($w.SubExpression.Statements)[0] }
+        else { return $false }
+    }
+    return $false
+}
+function Test-DataOrNullBranch($Node) { return ((Test-NullValue $Node) -or (Test-DataValue $Node)) }
 
 # True when the node is, or holds, a command that reads WMI by a tainted class operand.
 function Test-WmiClassOperand($Node, [bool]$Value = $true) {
@@ -2914,6 +2933,50 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
     missing = tmp_path / "cases" / "this-file-does-not-exist.ps1"
     unread = _wmi_create_scan(tmp_path / "scan-missing", [missing])[str(missing)]
     assert unread["unreadable"] is True and all(not scan[str(path)]["unreadable"] for path in files.values()), unread
+
+
+def _scan_cases(tmp_path, cases):
+    """{case name: sites} for each case text scanned as its own file in one pwsh process; a case that does not parse fails (it would prove nothing)."""
+    files = {}
+    for name, text in cases.items():
+        path = tmp_path / "cases" / f"{name}.ps1"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8", newline="\n")
+        files[name] = path
+    scan = _wmi_create_scan(tmp_path / "scan", list(files.values()))
+    unparsed = {name: scan[str(path)]["parseErrors"] for name, path in files.items() if scan[str(path)]["parseErrors"]}
+    assert unparsed == {}, "a case must still be valid PowerShell"
+    return {name: scan[str(path)]["sites"] for name, path in files.items()}
+
+
+_P4 = "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n"
+
+# r17, sol r16 B1: an InvokeMethod argument that can be an array or NOTHING is data, not the method name. Controls first: a branch that can be a STRING still reads.
+_R17_B1_ACCEPTED = {
+    "r17-b1-nullable-if-array-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', $(if ($true) { @('create','domain') } else { $null }))",
+    "r17-b1-nullable-ternary-array-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', ($true ? @('create','domain') : $null))",
+    "r17-b1-nullable-ternary-null-first-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', ($true ? $null : @('create','domain')))",
+    "r17-b1-empty-else-array-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', $(if ($true) { @('create','domain') } else {}))",
+    "r17-b1-empty-then-array-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', $(if ($true) {} else { @('create','domain') }))",
+    "r17-b1-parenthesized-null-branch-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', $(if ($true) { @('create') } else { ($null) }))",
+    "r17-b1-nested-nullable-branch-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', ($true ? ($false ? @('create') : $null) : @('domain')))",
+    "r17-b1-nullable-array-in-the-cim-session-arguments-slot": "$session.InvokeMethod('root/cimv2', 'Win32_Process', 'GetOwner', $(if ($true) { @('create') } else { $null }))",
+    "r17-b1-all-null-branches-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', ($true ? $null : $null))",
+}
+_R17_B1_REFUSED = {
+    "r17-b1-control-string-branch-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', $(if ($true) { 'create' } else { $null }))",
+    "r17-b1-control-ternary-string-branch-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', ($true ? 'create' : $null))",
+    "r17-b1-control-null-method-name": _P4 + "$p.InvokeMethod($null, 'create')",
+}
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_accepts_a_nullable_array_argument_and_refuses_a_nullable_verb(tmp_path):
+    """sol r16 B1: `$(if ($t) { @('create','domain') } else { $null })`, the same as a ternary, and an empty branch are an array or nothing in the arguments slot:
+    never the verb. A branch that can be a string still is read (the controls)."""
+    got = _scan_cases(tmp_path, {**_R17_B1_ACCEPTED, **_R17_B1_REFUSED})
+    assert {n: s for n, s in got.items() if n in _R17_B1_ACCEPTED and s} == {}, "a nullable array argument is data, not the Create verb"
+    assert [n for n in _R17_B1_REFUSED if not got[n]] == [], "a branch that can be the verb is still refused"
 
 
 # r15, Grok G17 (prevention): a round that NARROWS what the scanner reads ("New-Object's type is the first positional") must prove that nothing new gets through,
