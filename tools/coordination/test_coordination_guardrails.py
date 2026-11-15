@@ -2149,7 +2149,10 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     $unreadable = [bool]($errors | Where-Object { $_.ErrorId -eq 'FileReadError' })
     $out[$path] = [ordered]@{ parseErrors = $(if ($errors) { @($errors).Count } else { 0 }); unreadable = $unreadable; sites = $sites.ToArray() }
 }
-$out | ConvertTo-Json -Depth 5 -Compress
+# The result is ASCII-only JSON (r18, sol r16 B3): every non-ASCII character of a path or a site's text is written as \uXXXX (a surrogate pair as two escapes), so
+# the bytes do not depend on the code page pwsh writes its output in and the reader decodes with, and a path comes back as the exact path that was asked for.
+$json = $out | ConvertTo-Json -Depth 5 -Compress
+[regex]::Replace($json, '[^\x00-\x7F]', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ('\u{0:x4}' -f [int][char]$m.Value) })
 """
 
 
@@ -2161,7 +2164,7 @@ def _wmi_create_scan(tmp_path, paths):
     listing.write_text("\n".join(str(p) for p in paths) + "\n", encoding="utf-8", newline="\n")
     done = subprocess.run(
         [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(scanner), "-ListFile", str(listing)],
-        text=True, capture_output=True, timeout=300,
+        text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=300,
     )
     assert done.returncode == 0, f"the WMI create scanner failed: {done.stdout!r} {done.stderr!r}"
     return json.loads(done.stdout)
@@ -3024,6 +3027,21 @@ def test_wmi_create_scan_does_not_read_diagnostic_stream_text_as_an_operand_valu
     got = _scan_cases(tmp_path, {**_R17_B2_ACCEPTED, **_R17_B2_REFUSED})
     assert {n: s for n, s in got.items() if n in _R17_B2_ACCEPTED and s} == {}, "diagnostic-stream text is not an operand value"
     assert [n for n in _R17_B2_REFUSED if not got[n]] == [], "a real value in the operand is still read"
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_returns_a_non_ascii_path_unchanged(tmp_path):
+    """sol r16 B3: the scanner's JSON is read back by Python, and a path with a non-ASCII character is the key of the result. It must come back as the exact path
+    asked for, whatever code page pwsh writes its output in and Python decodes it with (accented file, directory and extension-case names)."""
+    names = ["café.ps1", "Sub/é.PSM1", "répo/plain.ps1", "日本語.ps1"]
+    paths = []
+    for name in names:
+        path = tmp_path / "paths" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# x\n", encoding="utf-8", newline="\n")
+        paths.append(path)
+    scan = _wmi_create_scan(tmp_path / "scan-paths", paths)
+    assert scan.keys() == {str(p) for p in paths}, sorted(scan)
 
 
 # r15, Grok G17 (prevention): a round that NARROWS what the scanner reads ("New-Object's type is the first positional") must prove that nothing new gets through,
