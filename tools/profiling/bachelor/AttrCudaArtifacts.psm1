@@ -523,7 +523,13 @@ function Enter-AttrCudaStageLock {
                     '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetDriveTypeW(string r);') -join "`n")
         }
         # FILE_READ_ATTRIBUTES, share all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory; reparse points followed, as -FollowLinks above)
-        $handle = [AttrCudaWin32.StageRootNative]::CreateFileW($Root, [uint32]0x80, [uint32]7, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
+        # r14 fix iteration 2 (adversary A2 on 6882c873): CreateFileW refuses a path of 260+ characters without the extended-length prefix (where the Win32 long-path
+        # opt-in is off), so a long LOCAL root read as NoLocalVolume. The prefix is added as Get-AttrCudaFileId adds it (from 240 characters); the lexical path is never normalized here.
+        $nativeRoot = $Root
+        if ($nativeRoot.Length -ge 240 -and -not $nativeRoot.StartsWith('\\?\')) {
+            $nativeRoot = $(if ($nativeRoot.StartsWith('\\')) { '\\?\UNC\' + $nativeRoot.Substring(2) } else { '\\?\' + $nativeRoot })
+        }
+        $handle = [AttrCudaWin32.StageRootNative]::CreateFileW($nativeRoot, [uint32]0x80, [uint32]7, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
         try {
             $final = ''
             if (-not $handle.IsInvalid) {

@@ -1440,6 +1440,20 @@ class StagedBuildNeverReplacedTests(_PwshCase):
                 name="r14-a2-unc.ps1")
             self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume", proc.stdout, proc.stdout + proc.stderr)
 
+    def test_r14_fix2_a2_a_long_local_root_still_takes_its_lock(self) -> None:
+        # r14 fix iteration 2 (adversary A2 on 6882c873, AttrCudaArtifacts.psm1:526): the volume check's CreateFileW got the root unprefixed, so a 260+ character
+        # local root (Win32 long-path opt-in off) read as NoLocalVolume and the stage exited 7. The extended-length prefix is added from 240 characters, as
+        # Get-AttrCudaFileId adds it. NOT RED on a host with LongPathsEnabled=1 (pwsh is long-path aware there); a regression pin for the long form everywhere.
+        long_root = str(self.agent) + "\\" + "\\".join(["a" * 50] * 5) + "\\agent"
+        self.assertGreater(len(long_root), 260)
+        os.makedirs("\\\\?\\" + long_root, exist_ok=True)
+        # removed through the extended-length form, so the temp root's own cleanup never meets a long path
+        self.addCleanup(shutil.rmtree, "\\\\?\\" + str(self.agent) + "\\" + "a" * 50, True)
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{long_root}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
+            name="r14-fix2-a2-long.ps1")
+        self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
+
     def test_a_manifest_a_lease_batch_pinned_still_reads_as_its_pin_after_a_second_stage(self) -> None:
         # The batch's own guard (Invoke-VenueLeaseBatch.ps1:1258 / :1393) reads Get-VenueStagedBuildManifest and compares it to the
         # sha256 its plan pinned when the lease opened; any other answer is BUILD_MANIFEST_MISMATCH.
