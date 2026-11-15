@@ -1180,11 +1180,13 @@ $ErrorActionPreference = 'Stop'
 # __SUPERCLASS). Another Win32_ class (Win32_OperatingSystem) is not the process class, so a plain Win32_ prefix is not a match.
 # A WORD is a whole word (r14, adversary pass 15 A3): the names below are not matched inside a longer identifier (`$ManagementClassServer`, `$__classCount`), and the
 # letters are read only where a class is NAMED (Test-WmiWord), never from free text.
-$wmiWord = [regex]::new('(?i)(?<![A-Za-z0-9_])(?:win32(?:_|\[_\])(?:process(?![A-Za-z0-9_])|(?:p|pr|pro|proc|proce|proces)?[*%?\[])|win32[*%?\[]|(?:wmiclass|managementclass|meta_class|__class|__this|__derivation|__dynasty|__superclass)(?![A-Za-z0-9_]))')
+# An identifier character is what PowerShell reads as one: any Unicode letter or decimal digit, or `_` (r16, adversary pass 24 A2: `$ManagementClass<e-acute>` is one
+# identifier, and an ASCII-only boundary matched the watched word inside it).
+$wmiWord = [regex]::new('(?i)(?<![\p{L}\p{Nd}_])(?:win32(?:_|\[_\])(?:process(?![\p{L}\p{Nd}_])|(?:p|pr|pro|proc|proce|proces)?[*%?\[])|win32[*%?\[]|(?:wmiclass|managementclass|meta_class|__class|__this|__derivation|__dynasty|__superclass)(?![\p{L}\p{Nd}_]))')
 $wmiCommands = @('invoke-cimmethod', 'invoke-wmimethod', 'icim', 'iwmi')
 $wmiTypes = '(^|\.)(wmiclass|wmi|ManagementClass)$'
 # The type names a command can be given as text (New-Object System.Management.ManagementClass 'Win32_Process'); a whole word, as in $wmiWord.
-$wmiTypeWord = [regex]::new('(?i)(?<![A-Za-z0-9_])(?:wmiclass|managementclass)(?![A-Za-z0-9_])')
+$wmiTypeWord = [regex]::new('(?i)(?<![\p{L}\p{Nd}_])(?:wmiclass|managementclass)(?![\p{L}\p{Nd}_])')
 $quoteChars = '["' + "'" + [char]0x2018 + [char]0x2019 + [char]0x201A + [char]0x201B + [char]0x201C + [char]0x201D + [char]0x201E + ']'
 $quoteOrEscape = '[#`' + $quoteChars.Substring(1)
 
@@ -1232,10 +1234,17 @@ function Get-OperandText($Node) {
     $start = $Node.Extent.StartOffset
     $chars = $Node.Extent.Text.ToCharArray()
     foreach ($c in $conditions) {
-        if ($c.FindAll({ param($y) $y -is [AssignmentStatementAst] }, $true).Count -gt 0) { continue }
+        if (@($c.FindAll({ param($y) $y -is [AssignmentStatementAst] }, $true)).Count -gt 0) { continue }
         for ($k = $c.Extent.StartOffset - $start; $k -lt $c.Extent.EndOffset - $start -and $k -lt $chars.Length; $k++) { if ($k -ge 0) { $chars[$k] = ' ' } }
     }
     return (Get-CleanSpan (-join $chars) $start $Node.Extent.EndOffset)
+}
+# True when $Node stands inside a condition, below $Root, that Get-OperandText blanks: the condition of an if / elseif / ternary that does not assign.
+function Test-InBlankedCondition($Node, $Root) {
+    for ($c = $Node; $null -ne $c -and -not [object]::ReferenceEquals($c, $Root); $c = $c.Parent) {
+        if ((Test-IsValueCondition $c) -and @($c.FindAll({ param($y) $y -is [AssignmentStatementAst] }, $true)).Count -eq 0) { return $true }
+    }
+    return $false
 }
 # True when the node is the condition of an if / elseif clause or of a ternary.
 function Test-IsValueCondition($Node) {
@@ -1721,7 +1730,8 @@ function Test-WmiClassOperandCommand($Command) {
 # (`where "Name='create'"`) is not the verb `create`; any other node is read as its clean text.
 function Get-VerbText($Node) {
     if ($Node -is [StringConstantExpressionAst]) { return [regex]::Replace([string]$Node.Value, ('''[^'']*''|' + [char]34 + '[^' + [char]34 + ']*' + [char]34), ' ') }
-    return (Get-CleanText $Node)
+    # Any other argument is read by its value text: a condition inside it is not the verb (r16, adversary pass 24 A1: `wmic process get $(if ('create') { ... })`).
+    return (Get-OperandText $Node)
 }
 
 # The words an argument SPELLS: the values of the string constants in it (a comment is no node, a backtick and a splice are already decoded), never a variable's name
@@ -1731,6 +1741,8 @@ function Get-ConstantText($Node) {
     $parts = New-Object System.Collections.Generic.List[string]
     foreach ($c in $Node.FindAll({ param($x) $x -is [StringConstantExpressionAst] }, $true)) {
         if ($c.Parent -is [MemberExpressionAst] -and [object]::ReferenceEquals($c.Parent.Member, $c)) { continue }
+        # A constant in the CONDITION of an if / ternary is not what the argument spells (r16, adversary pass 24 A1), by the rule Get-OperandText uses.
+        if (Test-InBlankedCondition $c $Node) { continue }
         $parts.Add([string]$c.Value)
     }
     return ($parts -join ' ')
@@ -2163,7 +2175,9 @@ def _git_env_for(root):
 
 def _tracked_powershell_files(root=ROOT):
     listing = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--", ":(icase)*.ps1", ":(icase)*.psm1"], text=True, capture_output=True, check=True, env=_git_env_for(root),
+        # git writes the paths as UTF-8 bytes under -z; decode them so, not by the locale (r16, adversary pass 24 A3: cp1252 read cafe-acute.ps1 as mojibake).
+        ["git", "-C", str(root), "ls-files", "-z", "--", ":(icase)*.ps1", ":(icase)*.psm1"], text=True, encoding="utf-8", capture_output=True, check=True,
+        env=_git_env_for(root),
     ).stdout
     return sorted(p for p in listing.split("\0") if p)
 
@@ -2171,12 +2185,13 @@ def _tracked_powershell_files(root=ROOT):
 def test_tracked_powershell_listing_reads_any_extension_case(tmp_path):
     """adversary A4 on cc2d32d8: PowerShell runs unsafe.PS1 and Mod.PSM1 like the lower-case names, so the listing must not skip them."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
-    for name in ("lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "notes.txt", "x.ps1.bak", "sub/deep.PS1"):
+    # r16, adversary pass 24 A3: a non-ASCII name is listed as git spells it (UTF-8), whatever the locale encoding is.
+    for name in ("lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "notes.txt", "x.ps1.bak", "sub/deep.PS1", "café.ps1"):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("# x\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True, capture_output=True)
-    assert _tracked_powershell_files(tmp_path) == sorted(["lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "sub/deep.PS1"])
+    assert _tracked_powershell_files(tmp_path) == sorted(["lower.ps1", "UPPER.PS1", "Mixed.Ps1", "mod.psm1", "Other.PSM1", "sub/deep.PS1", "café.ps1"])
 
 
 _REAL_LISTING = ["Sub/Deep.PS1", "safe.ps1", "unsafe.ps1"]
@@ -2669,6 +2684,11 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "p23-a2-ternary-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod(($t ? 'Create' : 'Terminate'), [object[]]@('x', $null, $null))",
         "p23-a3-wmi-variable-named-like-the-old-marker": "${#wmi} = Get-WmiObject -List Win32_Process\n${#wmi}.Create('x')",
         "p23-a3-wmi-variable-named-like-the-new-marker": "${class:wmi} = Get-WmiObject -List Win32_Process\n${class:wmi}.Create('x')",
+        # r16, adversary pass 24 on b36ff056: companions. A1: a Create assigned IN the condition is kept, and a create in a BRANCH is still the verb. A2: a
+        # separator that is not a letter (a no-break space) still bounds the class name.
+        "p24-a1-create-assigned-in-the-condition-at-the-cim-session-name": "$session.InvokeMethod('root/cimv2', 'Win32_Process', $(if ($m = 'Create') { $m } else { $m }), $null)",
+        "p24-a1-wmic-create-in-an-if-branch": "wmic process call $(if ($true) { 'create' } else { 'create' }) 'cmd.exe'",
+        "p24-a2-process-class-after-a-no-break-space": "$c = Get-WmiObject -Query \"SELECT * FROM Win32_Process\"\n$c.Create('x')",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -2868,6 +2888,12 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "p23-a2-ternary-array-in-the-cim-session-arguments-slot": "$session.InvokeMethod('root/cimv2', 'Win32_Process', 'GetOwner', ($true ? @('create') : @('domain')))",
         "p23-a3-plain-variable-named-like-the-old-marker": "${#wmi} = [System.IO.FileInfo]'scratch.txt'\n${#wmi}.Create().Dispose()\n${script:#wmi} = [System.IO.FileInfo]'b.txt'\n${script:#wmi}.Create().Dispose()",
         "p23-a3-plain-variable-named-like-the-new-marker": "${class:wmi} = [System.IO.FileInfo]'scratch.txt'\n${class:wmi}.Create().Dispose()",
+        # r16, adversary pass 24 on b36ff056, verbatim first. A1: a constant in the CONDITION of an if inside an argument is not the verb (InvokeMethod and wmic).
+        # A2: a watched word inside a longer Unicode identifier is not the word (the boundary is any letter or digit, as PowerShell reads an identifier).
+        "p24-a1-constant-in-an-if-condition-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', $(if ('create') { $null } else { $null }))",
+        "p24-a1-wmic-constant-in-an-if-condition": "wmic process get $(if ('create') { 'ProcessId' } else { 'ProcessId' })",
+        "p24-a2-unicode-identifier-contains-managementclass": "$ManagementClassé = 'System.IO.FileInfo'\n$f = New-Object -TypeName $ManagementClassé -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+        "p24-a2-unicode-identifier-contains-win32-process": "$Win32_Processé = 'Win32_Environment'\n$e = New-CimInstance -ClassName $Win32_Processé -ClientOnly\n$e.Create('x')",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
