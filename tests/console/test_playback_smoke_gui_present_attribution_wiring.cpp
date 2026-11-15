@@ -1793,8 +1793,17 @@ TEST(SmokeRunnerEventWait, AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsU
         "if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waited.nsecsElapsed(), maxMs ) )\n"
         "            ++m_playbackSmokeRunnerEventWaitTimeouts;"));
     ASSERT_TRUE(helper.contains(QStringLiteral("QElapsedTimer waited;")));
-    ASSERT_TRUE(helper.indexOf(QStringLiteral("bound.start(")) < started);
-    ASSERT_TRUE(started < wait);
+    // r1 adversary A1 on b6adb0d2: the GUI thread descheduled between arming the timer (0 ns) and starting the clock
+    // (9 ms), the timer expiring at 10.3 ms, reads waitedNs = 1.3 ms < the 9 ms bound: a timer-ended wait counted as
+    // no timeout. The clock starts BEFORE the timer is armed, so waitedNs is at least the time since arming.
+    const int armed = helper.indexOf(QStringLiteral("bound.start( qMax( 0, maxMs ) );"));
+    ASSERT_TRUE(started >= 0);
+    ASSERT_TRUE(armed > started);
+    ASSERT_EQ(1, helper.count(QStringLiteral("waited.start();")));
+    ASSERT_EQ(1, helper.count(QStringLiteral("bound.start(")));
+    ASSERT_FALSE(smokeEventWaitTimedOut(true, 1300000LL, 10));   // why the order matters: a late clock reads 1.3 ms
+    ASSERT_TRUE(smokeEventWaitTimedOut(true, 10300000LL, 10));   // a clock started before arming reads >= 10.3 ms
+    ASSERT_TRUE(armed < wait);
     ASSERT_TRUE(classify > wait);
     ASSERT_FALSE(helper.contains(QStringLiteral("if( !bound.isActive() )")));
 }

@@ -301,7 +301,9 @@ private:
  * (MainWindow::waitGuiThreadForSmokeEvents) timed out when its timer event was delivered, OR when the wait itself
  * lasted its bound, less the precise timer's 1 ms resolution. On Windows the precise timer's callback POSTS its
  * QTimerEvent and the dispatcher can return on that wake-up before delivering it, so "the timer is still active"
- * alone does not mean an event ended the wait. */
+ * alone does not mean an event ended the wait. waitedNs must be read on a clock started BEFORE the timer was armed
+ * (fix iteration 2, adversary A1 on b6adb0d2): then waitedNs >= the time since arming, and a timer that expired is
+ * always at or past its bound on that clock. */
 inline bool smokeEventWaitTimedOut( bool timerStillActive, long long waitedNs, int maxMs )
 {
     if( !timerStillActive ) return true;

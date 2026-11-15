@@ -5267,12 +5267,14 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 // as idle, and a frameReady posted during it is dispatched at once instead of after a sleep.
 void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
 {
-    QElapsedTimer waited;
     QTimer bound;
     bound.setSingleShot( true );
     bound.setTimerType( Qt::PreciseTimer );
-    bound.start( qMax( 0, maxMs ) );
+    // r1 fix iteration 2 (adversary A1 on b6adb0d2): the clock starts BEFORE the timer is armed, so a deschedule
+    // between the two can only lengthen the measured wait, never hide the timer's expiry.
+    QElapsedTimer waited;
     waited.start();
+    bound.start( qMax( 0, maxMs ) );
     qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );
     if( m_playbackSmokeActive )
     {
