@@ -269,6 +269,10 @@ function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
 
 $HashByName = {
     param($p)
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (Grok G19 class on #814): the worker runspace does not inherit this script's EAP, so it is set here, as VenueChain.psm1's
+    # canonical read sets it: a build.json that exists but cannot be read (a writer holding it open) fails the read with its own error, and Read-Share types it
+    # SHARE_UNREACHABLE. Under the default Continue it came back present=$false: step 4 built as if the cache were empty and the verifies said "hashes MISSING".
+    $ErrorActionPreference = 'Stop'
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return [pscustomobject]@{ present = $false; hash = $null; text = $null } }
     $bytes = [IO.File]::ReadAllBytes($p)
     [pscustomobject]@{ present = $true; hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant(); text = [Text.Encoding]::UTF8.GetString($bytes) }

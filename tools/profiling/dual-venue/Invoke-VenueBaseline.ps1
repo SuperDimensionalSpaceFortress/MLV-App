@@ -293,15 +293,20 @@ if (-not $manifest) {
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (r10's OPEN): the cache name carries only the sha's first 12 hex, so the manifest standing there may be ANOTHER commit's
     # build. ONE read: the bytes hashed are the bytes whose sourceCommit is read (decoded as Assert-AttrCudaBuildManifest decodes them); a manifest that does not declare
     # this commit (compared as the leg job compares it, -ne) is not this commit's staged build, so it is never pinned for the chains.
+    # r13 (Grok G19 on #814): the worker runs under EAP Stop, as VenueChain.psm1's canonical read does, so a manifest that exists but cannot be read (a writer holding
+    # it open, a share error) ends the read with its own error (-not $m.ok: SHARE_UNREACHABLE below). Under the runspace's default Continue the failed byte read went
+    # on, the worker returned nothing, and a staged build it never looked at was reported BUILD_NOT_STAGED.
     $m = Invoke-Bounded {
         param($p)
+        $ErrorActionPreference = 'Stop'
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
         $bytes = [IO.File]::ReadAllBytes($p)
         $declared = try { $j = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true).ReadToEnd() | ConvertFrom-Json -ErrorAction Stop; $q = $j.PSObject.Properties['sourceCommit']; if ($null -eq $q) { '<absent>' } else { [string]$q.Value } } catch { '<unparseable>' }
         [pscustomobject]@{ hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant(); commit = $declared }
     } @($buildJson) $ProbeTimeoutSec
     if ($m.timedOut) { Stop-Baseline 'SHARE_UNREACHABLE' "reading '$buildJson' $($m.error)" }
-    if (-not $m.ok -or -not $m.value) { Stop-Baseline 'BUILD_NOT_STAGED' "no staged build manifest for $($commit.Substring(0, 12)) at '$buildJson'; the hub stages it first (assemble + stage job), this script stages nothing" }
+    if (-not $m.ok) { Stop-Baseline 'SHARE_UNREACHABLE' "reading '$buildJson' failed: $($m.error)" }
+    if (-not $m.value) { Stop-Baseline 'BUILD_NOT_STAGED' "no staged build manifest for $($commit.Substring(0, 12)) at '$buildJson'; the hub stages it first (assemble + stage job), this script stages nothing" }
     if ([string]$m.value.commit -ne $commit) { Stop-Baseline 'BUILD_NOT_STAGED' "the staged build manifest at '$buildJson' declares '$($m.value.commit)', not $commit (the 12-hex cache name holds another build); this commit is not staged, so no chain runs on it; the hub stages it first, this script stages nothing" }
     $manifest = [string]$m.value.hash
 }

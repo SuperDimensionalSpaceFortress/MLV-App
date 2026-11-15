@@ -1180,6 +1180,28 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertIn("STATE=UNREACHABLE", out, both)
         self.assertIn("after the call's end", out, both)
 
+    def test_r13_g19_sibling_a_cache_manifest_that_cannot_be_read_is_share_unreachable(self) -> None:
+        # r13 (Grok G19 class, Invoke-VenueStageNightly.ps1 $HashByName): the by-name manifest read ran on a worker runspace under its default Continue, so a
+        # build.json a writer held open (FileShare.None) failed its byte read silently and came back present=$false: step 4 never asked the soundness read and the
+        # call built as if the cache were empty (and the post-stage verifies printed "hashes MISSING" for a file that is there). Under EAP Stop, as VenueChain.psm1's
+        # canonical read, the read fails with its own error and Read-Share types it SHARE_UNREACHABLE (:503's rule: a read that does not answer builds nothing).
+        import ctypes
+        from ctypes import wintypes
+        bj = self.stage_cache()
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.CreateFileW(str(bj), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value, f"CreateFileW failed: {ctypes.get_last_error()}")
+        try:
+            p = self.run_driver()
+        finally:
+            k32.CloseHandle(h)
+        self.assert_exit(p, "SHARE_UNREACHABLE")
+        self.assertRegex(p.stdout, r"reading [^\r\n]*-build\.json failed: [^\r\n]*another process", p.stdout)
+        self.nothing_built_or_submitted()
+
     def test_r11_a1_the_nightly_hands_its_deadline_to_the_soundness_read(self) -> None:
         text = DRIVER.read_text(encoding="utf-8")
         calls = [l for l in text.splitlines() if "Get-VenueStagedBuildManifest -AgentShare" in l]
