@@ -1075,6 +1075,25 @@ class VenueStageNightlyTests(unittest.TestCase):
         p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         self.assertIn("STATE=STAGED ARTIFACT=[] ERROR=[]", p.stdout, p.stdout + p.stderr)
 
+    def test_r13_a1_the_manifest_read_ends_at_the_bounds_end_not_after_the_time_before_it(self) -> None:
+        # r13 (adversary A1 on 5fe750fa, VenueChain.psm1:720): the hash's implicit end is -TimeoutSec on the call clock (the whole call inside -TimeoutSec), but the
+        # manifest read ended at readStartSec + -TimeoutSec, so time spent before the read moved the call's end later: -TimeoutSec 1 after 1.5 s of preparation
+        # answered NOT_STAGED at ~2.2 s (with or without -CallCapSec 60). The read now ends at the bound's end: no time left is UNREACHABLE at once, and a read
+        # that runs past the bound's end is given up on there.
+        absent = self.case / "a1-absent-root"
+        for label, args, limit in (("no cap", "-TimeoutSec 1 -TestPreReadDelayMs 1500 -TestReadDelayMs 500", 1.9),
+                                   ("cap 60", "-TimeoutSec 1 -CallCapSec 60 -TestPreReadDelayMs 1500 -TestReadDelayMs 500", 1.9),
+                                   ("read past the end", "-TimeoutSec 3 -TestPreReadDelayMs 1500 -TestReadDelayMs 2500", 3.6)):
+            with self.subTest(case=label):
+                ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+                      f"$r = Get-VenueStagedBuildManifest -AgentShare '{absent}' -SourceCommit '{SHA}' -VerifyArtifacts {args}; "
+                      "'STATE=' + $r.state + ' ERROR=[' + $r.error + ']'; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture); "
+                      "Complete-VenueProcess -ExitCode 0")
+                p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                both = p.stdout + p.stderr
+                self.assertIn("STATE=UNREACHABLE", p.stdout, both)
+                self.assertLess(float(re.search(r"SEC=([0-9.]+)", p.stdout).group(1)), limit, both)
+
     def test_r11_g18_the_predicate_source_is_read_inside_the_calls_bounded_read(self) -> None:
         # r10 fix iteration (adversary A1 on a4b659de): the predicate read must never hold a capped call past its cap. r11 (Grok G17/G18 on #814): it is read on
         # every call INSIDE the bounded read, so the cap bounds it. The predicate's module path is pointed at a named pipe this script serves and never writes to:

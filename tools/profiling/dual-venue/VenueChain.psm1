@@ -705,7 +705,6 @@ function Get-VenueStagedBuildManifest {
     # r6 fix iteration (adversary A2 on 424df284): -CallCapSec bounds the WHOLE call, the manifest read too (it bounded only the hash, so a read stuck past the cap
     # answered NOT_STAGED after it). Under 1 s of it (the least a read can be given) there is no read: UNREACHABLE.
     if ($TestPreReadDelayMs -gt 0) { [Threading.Thread]::Sleep($TestPreReadDelayMs) }
-    $readSec = $TimeoutSec
     # r12 (adversary A1 on 7754d16e, sibling :695): the read's end is fixed ONCE on the call clock, when its budget is taken, and the bounded wait ends at it (-Clock/-EndSec):
     # a remainder handed over as a number was counted again from the wait's own later start
     $readStartSec = $callClock.Elapsed.TotalSeconds
@@ -715,9 +714,14 @@ function Get-VenueStagedBuildManifest {
     if ($CallCapSec -gt 0) {
         $capLeft = $CallCapSec - $readStartSec
         if ($capLeft -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2))$(if ($null -ne $CallDeadlineUtc) { ' (-CallDeadlineUtc ' + ([DateTime]$CallDeadlineUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) + ')' }) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
-        $readSec = [Math]::Min($TimeoutSec, $capLeft)
     }
-    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $readSec -Clock $callClock -EndSec ($readStartSec + $readSec)
+    # r13 (adversary A1 on 5fe750fa, siblings Invoke-VenueChain.ps1:354 / Invoke-VenueLeaseBatch.ps1:1250): the read ends at the BOUND's end on the call clock
+    # ($boundEndSec: -TimeoutSec, or -CallCapSec when sooner), the end the hash below is measured against. r12 ended it at $readStartSec + -TimeoutSec, so time
+    # spent before the read (preparing it, a descheduled caller) ran the call past -TimeoutSec: -TimeoutSec 1 after 1.5 s answered NOT_STAGED at ~2.2 s.
+    # Under 1 s of it left (the least a read can be given) there is no read: UNREACHABLE.
+    $readSec = $boundEndSec - $readStartSec
+    if ($readSec -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $readSec) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
+    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $readSec -Clock $callClock -EndSec $boundEndSec
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     if ($null -eq $ProbeScript -and $r.value.Count -gt 0 -and ([string]$r.value[0]).StartsWith('VENUE_PREDICATE_REFUSED:', [StringComparison]::Ordinal)) { throw ([string]$r.value[0]).Substring('VENUE_PREDICATE_REFUSED:'.Length) }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })

@@ -1657,7 +1657,9 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
         elapsed = time.time() - t0
         lines = r.stdout.splitlines()
-        self.assertRegex(lines[-1], r"^UNREACHABLE \[\] no answer in 2 s inside=[23]$", r.stdout + r.stderr)
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (adversary A1 on 5fe750fa, Grok G20): the read is given what is left of the 2 s bound on the call's clock, and
+        # the message reports that wait (and, when the call's end visibly cut it, says so)
+        self.assertRegex(lines[-1], r"^UNREACHABLE \[\] no answer in (2|1\.9\d) s( \(the call's end cut the [0-9.]+ s bound short\))? inside=[23]$", r.stdout + r.stderr)
         self.assertLess(elapsed, 14, f"the stalled read broke the bound: the whole process took {elapsed:.1f}s with a 20 s stuck read and -TimeoutSec 2")
         self.assertEqual(r.returncode, 7)
         self.assertEqual(lines[:-1], [
