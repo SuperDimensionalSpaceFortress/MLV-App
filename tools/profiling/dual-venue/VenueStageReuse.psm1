@@ -56,12 +56,21 @@ function Get-StageReuse {
 }
 
 function Get-DllPairReuse {
+    # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: -JobIdSuffix (opt-in) looks up <JobId>-<suffix> instead, the id
+    # playback-attr-3-cuda-dll-job.ps1 -JobIdSuffix emits, so a sha whose default id holds a FAILED result can be
+    # built again and then reused. Every check below runs against the looked-up id; a failed result is never reusable
+    # under either id. The suffix rule is AttrCudaArtifacts.psm1 Get-AttrCudaDllPairJobId's. JobId names the id looked up.
     param(
         [Parameter(Mandatory = $true)][string]$Outbox,
         [Parameter(Mandatory = $true)][string]$JobId,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Sha
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Sha,
+        [AllowEmptyString()][string]$JobIdSuffix = ''
     )
-    $no = { param($why) [pscustomobject]@{ Reusable = $false; Reason = $why; EndedUtc = $null; Line = $null; ArtifactsDir = $null } }
+    if ($JobIdSuffix -ne '') {
+        if ($JobIdSuffix -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,31}\z') { throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must match [A-Za-z0-9][A-Za-z0-9-]{0,31}; got '$JobIdSuffix'" }
+        $JobId = "$JobId-$JobIdSuffix"
+    }
+    $no = { param($why) [pscustomobject]@{ Reusable = $false; Reason = $why; EndedUtc = $null; Line = $null; ArtifactsDir = $null; JobId = $JobId } }
     $resultPath = Join-Path $Outbox "$JobId.result.json"
     $art = Join-Path $Outbox "$JobId.artifacts"
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { return (& $no 'result-missing') }
@@ -80,7 +89,7 @@ function Get-DllPairReuse {
     try { $man = Get-Content -LiteralPath $mp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return (& $no 'artifacts-manifest-unreadable') }
     if ([string]$man.sourceCommit -cne $Sha) { return (& $no "manifest-sourceCommit-mismatch ($([string]$man.sourceCommit))") }
     if ([string]$man.jobId -cne $JobId) { return (& $no "manifest-jobId-mismatch ($([string]$man.jobId))") }
-    [pscustomobject]@{ Reusable = $true; Reason = 'dll-pair-already-built'; EndedUtc = [string]$r.endedUtc; Line = $m.Value.TrimEnd(); ArtifactsDir = $art }
+    [pscustomobject]@{ Reusable = $true; Reason = 'dll-pair-already-built'; EndedUtc = [string]$r.endedUtc; Line = $m.Value.TrimEnd(); ArtifactsDir = $art; JobId = $JobId }
 }
 
 Export-ModuleMember -Function Test-UmRunJobIdInUseMessage, Get-StageReuse, Get-DllPairReuse

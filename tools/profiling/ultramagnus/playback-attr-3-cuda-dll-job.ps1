@@ -45,7 +45,15 @@
 #
 # Usage:
 #   pwsh -NoProfile -File tools\profiling\ultramagnus\playback-attr-3-cuda-dll-job.ps1 `
-#       -SourceCommit <40-hex> -OutDir <dir> [-CudaArchitectures sm_86]
+#       -SourceCommit <40-hex> -OutDir <dir> [-CudaArchitectures sm_86] [-JobIdSuffix <retry-tag>]
+#
+# RETRY A SPENT JOBID (UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1). The JobId is single-use and derived from
+# the sha alone; -JobIdSuffix r2 emits playback-attr-3-cuda-dllpair-<sha12>-r2 (job AND source zip),
+# which Get-DllPairReuse -JobIdSuffix r2 then finds. The default id is unchanged.
+#
+# MSVC ENVIRONMENT (same card). Before the first build child the job sets its own PATH to a minimal
+# derived set and proves vcvars64 put the SDK's ucrt/um/shared dirs on INCLUDE; otherwise it exits 9
+# at step msvcEnvironment (reason=INCLUDE_LACKS_UCRT, ...), never a bare C1083 at compile time.
 
 [CmdletBinding()]
 param(
@@ -84,7 +92,14 @@ param(
     # present, sha256 bound in the manifest). So by default a nonzero harness code is RECORDED
     # in the manifest (reconBackendScript.exitCode / parityHarnessPassed) and not fatal; pass
     # -RequireParityHarness to make it fatal (exit 13).
-    [switch]$RequireParityHarness
+    [switch]$RequireParityHarness,
+
+    # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: an explicit, opt-in retry suffix. The JobId is single-use
+    # and derived from the sha alone, so a FAILED result under it makes Get-DllPairReuse refuse that
+    # sha for good. Absent: the id is exactly playback-attr-3-cuda-dllpair-<sha12>, as always.
+    # Present: <that>-<suffix> (Get-AttrCudaDllPairJobId holds the rule; a bad suffix throws
+    # DLLPAIR_JOBID_SUFFIX_INVALID before anything is emitted).
+    [string]$JobIdSuffix = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,8 +129,7 @@ if ($architectures -notcontains $RequiredArchitecture) {
     throw "-CudaArchitectures must contain ${RequiredArchitecture}: the measurement host's GPU cannot run cubins built only for a newer architecture. Got: $($architectures -join ',')"
 }
 
-$shortSha = $SourceCommit.Substring(0, 12)
-$JobId = "playback-attr-3-cuda-dllpair-$shortSha"
+$JobId = Get-AttrCudaDllPairJobId -SourceCommit $SourceCommit -JobIdSuffix $JobIdSuffix
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
@@ -157,7 +171,10 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaOwnershipProof',
     'New-AttrCudaOwnedRoot',
     'New-AttrCudaOwnedFileStream',
-    'Remove-AttrCudaInputFileByContent'
+    'Remove-AttrCudaInputFileByContent',
+    # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: the minimal build PATH and the post-vcvars INCLUDE check.
+    'Get-AttrCudaMinimalBuildPath',
+    'Test-AttrCudaMsvcInclude'
 )
 
 # --- job body template (placeholders are substituted below; the body itself never touches
@@ -331,6 +348,55 @@ if (-not (Test-Path -LiteralPath $cudartSource)) {
     Complete-Failed 7 'cudaRuntimePresent' "$CudartName not found in $cudaBin (the package requires the CUDA runtime from the compiling toolkit)"
 }
 $StepLog['cudaRuntimePresent'] = 0
+
+# --- msvcEnvironment: a minimal PATH, then PROVE vcvars64 yields the Windows SDK include dirs -----
+# UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1. The agent's PATH is inherited by every job, and the backend
+# scripts call vcvars64.bat under cmd.exe, which breaks past 8191 characters: on 2026-11-15 a
+# 10583-character agent PATH made winsdk.bat lose powershell.exe and the SDK lookup, INCLUDE lacked
+# ucrt/um/shared, and the build died with a bare C1083 corecrt.h. So this process's OWN PATH (the
+# build children inherit it; nothing persistent is written, the agent and the host are untouched)
+# becomes the four Windows system dirs plus the CUDA bin and the VS installer dir this job resolved
+# above. Stale compiler variables are cleared so the INCLUDE judged is the one vcvars64 produced, and
+# a missing SDK is exit 9 at step msvcEnvironment, before any compile. The backend scripts come
+# from the EXTRACTED source of $SourceCommit, so this holds for an older commit's scripts too.
+$vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
+if (-not (Test-Path -LiteralPath $vcvars)) { Complete-Failed 9 'msvcEnvironment' "reason=VCVARS_MISSING $vcvars" }
+$inheritedPath = [string]$env:PATH
+$inheritedPathEntries = @($inheritedPath -split ';' | Where-Object { $_ }).Count
+try {
+    $env:PATH = Get-AttrCudaMinimalBuildPath -SystemRoot ([Environment]::GetEnvironmentVariable('SystemRoot')) -ToolDirs @($cudaBin, (Split-Path -Parent $vsLocator))
+} catch {
+    Complete-Failed 9 'msvcEnvironment' "reason=MINIMAL_PATH_REFUSED $($_.Exception.Message)"
+}
+$env:INCLUDE = $null
+$env:LIB = $null
+$env:LIBPATH = $null
+# stderr is folded into stdout INSIDE cmd (2>&1 1>nul keeps vcvars' errors and drops its banner),
+# so nothing reaches this process's error stream.
+$msvcProbe = Join-Path $Scratch 'msvc-environment-probe.cmd'
+$msvcProbeLines = @('@echo off', ('call "' + $vcvars + '" 2>&1 1>nul'), 'echo MLV_VCVARS_EXIT=%ERRORLEVEL%', 'set INCLUDE 2>nul', 'set WindowsSdkDir 2>nul', 'set UCRTVersion 2>nul', 'exit /b 0')
+New-Item -ItemType File -Path $msvcProbe -Value (($msvcProbeLines -join "`r`n") + "`r`n") -Force | Out-Null
+$msvcOutput = @(& 'cmd.exe' /d /c $msvcProbe | ForEach-Object { [string]$_ })
+$msvcRc = $LASTEXITCODE
+$includeLine = @($msvcOutput | Where-Object { $_ -match '^INCLUDE=' }) | Select-Object -First 1
+$msvcInclude = $(if ($includeLine) { ([string]$includeLine).Substring(8) } else { '' })
+$msvcVerdict = Test-AttrCudaMsvcInclude -Include $msvcInclude
+$Evidence['msvcEnvironment'] = [ordered]@{
+    inheritedPathLength = $inheritedPath.Length
+    inheritedPathEntries = $inheritedPathEntries
+    buildPath = [string]$env:PATH
+    vcvars = $vcvars
+    probeExitCode = $msvcRc
+    include = $msvcInclude
+    reason = $msvcVerdict.Reason
+}
+$msvcLog = @("inheritedPathLength=$($inheritedPath.Length) inheritedPathEntries=$inheritedPathEntries", "buildPath=$([string]$env:PATH)", "probeExit=$msvcRc") + $msvcOutput
+[void](Publish-AttrCudaText -Path (Join-Path $Pub 'msvc-environment.log') -Value $msvcLog)
+if (-not $msvcVerdict.Ok) {
+    Complete-Failed 9 'msvcEnvironment' "reason=$($msvcVerdict.Reason) $($msvcVerdict.Detail) inheritedPathLength=$($inheritedPath.Length) inheritedPathEntries=$inheritedPathEntries (see msvc-environment.log)"
+}
+$StepLog['msvcEnvironment'] = 0
+Say "MSVC environment ok: INCLUDE $($msvcVerdict.Detail); build PATH $(([string]$env:PATH).Length) chars (inherited $($inheritedPath.Length) chars, $inheritedPathEntries entries)"
 
 # --- build both DLLs with the TRACKED backend scripts, from the extracted source -------------
 # Each backend script ends in `exit <code>`, so it runs in a CHILD shell: invoking it in-process

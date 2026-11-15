@@ -7751,7 +7751,112 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
     }
 }
 
+function Get-AttrCudaDllPairJobId {
+    <#
+    .SYNOPSIS
+    The Ultra-Magnus DLL-pair JobId for a source commit: playback-attr-3-cuda-dllpair-<sha12>, or
+    <that>-<suffix> when an explicit retry suffix is given (UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1).
+    .DESCRIPTION
+    A um-run JobId is single-use, and a FAILED result under the default id makes Get-DllPairReuse
+    refuse that sha for good. The suffix is opt-in and the default is byte-for-byte the old id.
+    The suffix rule is the stage generator's (playback-attr-3-cuda-stage-job.ps1 -JobIdSuffix) with
+    a leading alphanumeric, so the id never ends in '--' and stays inside UmRunDrop's JobId pattern.
+    VenueStageReuse.psm1 Get-DllPairReuse applies the same rule to the id it looks up.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+        [AllowEmptyString()][AllowNull()][string]$JobIdSuffix = ''
+    )
+    $id = 'playback-attr-3-cuda-dllpair-' + $SourceCommit.Substring(0, 12)
+    if ([string]::IsNullOrEmpty($JobIdSuffix)) { return $id }
+    if ($JobIdSuffix -cnotmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,31}\z') {
+        throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must match [A-Za-z0-9][A-Za-z0-9-]{0,31}; got '$JobIdSuffix'"
+    }
+    $id + '-' + $JobIdSuffix
+}
+
+function Get-AttrCudaMinimalBuildPath {
+    <#
+    .SYNOPSIS
+    The PATH a DLL-pair build child runs with: the four Windows system dirs derived from
+    -SystemRoot, then each -ToolDirs entry, and nothing inherited (UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1).
+    .DESCRIPTION
+    vcvars64.bat / winsdk.bat run under cmd.exe, which cannot handle a variable over 8191
+    characters. On 2026-11-15 the Ultra-Magnus agent PATH was 10583 characters (another project's
+    per-run .dotnet\tools dirs), so winsdk.bat lost powershell.exe and the SDK lookup, INCLUDE
+    lacked ucrt/um/shared, and the build died with C1083 corecrt.h. The job therefore replaces its
+    OWN process PATH (the build children inherit it) with this value before vcvars64 runs; nothing
+    persistent is written. Every entry is derived by the caller (SystemRoot, the CUDA bin the job
+    resolved, the VS installer dir it found vswhere in); none is a host's user dir. An entry that
+    is not an absolute drive path, or that holds ';' or '"', is refused rather than spliced into a
+    PATH it would split. Duplicates (case-insensitive, trailing '\' ignored) keep the first.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][AllowNull()][string]$SystemRoot,
+        [AllowEmptyCollection()][AllowNull()][string[]]$ToolDirs = @()
+    )
+    if ([string]::IsNullOrWhiteSpace($SystemRoot)) {
+        throw 'ATTRCUDA_MINIMAL_PATH_NO_SYSTEMROOT -SystemRoot is empty; the Windows system dirs cannot be derived'
+    }
+    $root = $SystemRoot.Trim() -replace '\\+$', ''
+    $candidates = @(($root + '\System32'), $root, ($root + '\System32\Wbem'), ($root + '\System32\WindowsPowerShell\v1.0')) + @($ToolDirs)
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
+        $entry = ([string]$candidate).Trim() -replace '\\+$', ''
+        if ($entry.Contains(';') -or $entry.Contains('"') -or $entry -notmatch '^[A-Za-z]:\\') {
+            throw "ATTRCUDA_MINIMAL_PATH_BAD_ENTRY '$entry' is not an absolute drive path free of ';' and '`"'"
+        }
+        $key = $entry.ToLowerInvariant()
+        if ($seen.Contains($key)) { continue }
+        $seen.Add($key)
+        $entries.Add($entry)
+    }
+    $value = $entries -join ';'
+    if ($value.Length -ge 8191) {
+        throw "ATTRCUDA_MINIMAL_PATH_TOO_LONG the minimal PATH is $($value.Length) characters; cmd.exe needs it under 8191"
+    }
+    $value
+}
+
+function Test-AttrCudaMsvcInclude {
+    <#
+    .SYNOPSIS
+    Judge the INCLUDE vcvars64 produced: it must carry the Windows SDK's ucrt, um and shared include
+    dirs. Returns Ok / Reason / Detail; Reason is INCLUDE_EMPTY or INCLUDE_LACKS_<UCRT|UM|SHARED>.
+    .DESCRIPTION
+    UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1. The DLL-pair job runs this right after vcvars64 and BEFORE
+    any compile, so an environment without the SDK is the typed step msvcEnvironment and never a
+    bare `C1083 corecrt.h` at compile time. ucrt is judged first (corecrt.h is the first header a
+    compile needs). A dir matches only as a whole trailing path segment (\ucrt, not \notucrt).
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyString()][AllowNull()][string]$Include)
+    $entries = @(([string]$Include) -split ';' | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    $detail = "entries=$($entries.Count)"
+    if ($entries.Count -eq 0) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'INCLUDE_EMPTY'; Detail = "$detail INCLUDE is empty after vcvars64" }
+    }
+    foreach ($leaf in @('ucrt', 'um', 'shared')) {
+        $hit = @($entries | Where-Object { $_ -match ('(?i)\\' + $leaf + '\\*$') })
+        if ($hit.Count -eq 0) {
+            return [pscustomobject]@{
+                Ok = $false
+                Reason = 'INCLUDE_LACKS_' + $leaf.ToUpperInvariant()
+                Detail = "$detail no INCLUDE entry ends in \$leaf (vcvars64 did not add the Windows SDK include dirs)"
+            }
+        }
+    }
+    [pscustomobject]@{ Ok = $true; Reason = ''; Detail = $detail }
+}
+
 Export-ModuleMember -Function `
+    Get-AttrCudaDllPairJobId, `
+    Get-AttrCudaMinimalBuildPath, `
+    Test-AttrCudaMsvcInclude, `
     Get-AttrCudaArtifactNames, `
     Get-AttrCudaSelfHealMetricNames, `
     Get-AttrCudaSelfHealMetrics, `
