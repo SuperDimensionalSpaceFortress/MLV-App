@@ -1159,6 +1159,10 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # spelling the metadata names in front of each slot. An explicit -InputObject overrides a WMI pipeline only when spelled with three letters or more (`-in` is ambiguous).
 # VALUE MODE IS THE DEFAULT of Test-WmiNode / Test-WmiWord / Test-WmiClassOperand (pass 19 A2): a WMI read only in the condition of an if or a ternary is never the value;
 # the file-wide "does this file read WMI" test is the one explicit exception.
+# AN OPERAND IS READ BY ITS VALUE (r16, adversary pass 22 A1 and A2, both over-refusals r15 left OPEN): "is this InvokeMethod argument data" has ONE reader
+# (Test-DataValue: an array literal, `@( )`, a hashtable, an array cast, `,x`, -split, a range, a slice, and `+` / `*` with an array on the left), and every
+# class or type read from text (New-Object's type, a class parameter, Invoke-CimMethod's first positional, a class argument of a CimSession method) reads
+# Get-OperandText, where the condition of an if / ternary inside the operand is blanked unless it assigns.
 # THE METADATA IS THE SCANNING HOST'S (r16, Grok G21): the parameter tables above come from the pwsh version that runs the scan, not from a fixed list, so the
 # verdict on a spelling a later pwsh adds can differ by host. Two of them (Get-CimInstance, Get-CimClass) are in CimCmdlets, which ships with pwsh on Windows
 # only: the scanner then exits 3 with one message naming the module, and `_lane_scanner_only` skips the scanner tests on such a host instead of failing them.
@@ -1212,10 +1216,36 @@ function Get-VarName($Variable) {
 
 # The source text of a node as PowerShell reads it: comment tokens inside it are dropped and a backtick escape is removed (Win32_Pro`cess is Win32_Process,
 # "C`Reate" is "CReate"), so a word is matched by what it says, not by how it is spelled. $comments holds the current file's comment tokens.
-function Get-CleanText($Node) {
-    $text = $Node.Extent.Text
+function Get-CleanText($Node) { return (Get-CleanSpan $Node.Extent.Text $Node.Extent.StartOffset $Node.Extent.EndOffset) }
+
+# The text of an OPERAND as its value reads it (r16, adversary pass 22 A2): Get-CleanText with the CONDITION of every if / elseif / ternary inside the operand
+# blanked, so a variable NAMED like a watched word that stands only in a condition (`-TypeName $(if ($ManagementClass) { 'System.IO.FileInfo' } ...)`) is not
+# the type or the class. Blanking keeps every offset, so comments are still dropped where they stand. A condition that ASSIGNS is kept: its variable can be the
+# value (`$(if ($t = 'System.Management.ManagementClass') { $t })`).
+function Get-OperandText($Node) {
+    # A member call with no arguments hands in $null (`@($x.Arguments)` of `$s.EnumerateInstances()`): no text, as Get-CleanText gives.
+    if ($null -eq $Node) { return '' }
+    $conditions = @($Node.FindAll({ param($x) Test-IsValueCondition $x }, $true))
+    if ($conditions.Count -eq 0) { return (Get-CleanText $Node) }
+    $start = $Node.Extent.StartOffset
+    $chars = $Node.Extent.Text.ToCharArray()
+    foreach ($c in $conditions) {
+        if ($c.FindAll({ param($y) $y -is [AssignmentStatementAst] }, $true).Count -gt 0) { continue }
+        for ($k = $c.Extent.StartOffset - $start; $k -lt $c.Extent.EndOffset - $start -and $k -lt $chars.Length; $k++) { if ($k -ge 0) { $chars[$k] = ' ' } }
+    }
+    return (Get-CleanSpan (-join $chars) $start $Node.Extent.EndOffset)
+}
+# True when the node is the condition of an if / elseif clause or of a ternary.
+function Test-IsValueCondition($Node) {
+    $p = $Node.Parent
+    if ($p -is [TernaryExpressionAst]) { return [object]::ReferenceEquals($p.Condition, $Node) }
+    if ($p -is [IfStatementAst]) { foreach ($clause in @($p.Clauses)) { if ([object]::ReferenceEquals($clause.Item1, $Node)) { return $true } } }
+    return $false
+}
+
+# Get-CleanText over a text whose first character stands at offset $start of the file ($end is where it ends).
+function Get-CleanSpan([string]$text, [int]$start, [int]$end) {
     if ($text -notmatch $quoteOrEscape) { return $text }
-    $start = $Node.Extent.StartOffset; $end = $Node.Extent.EndOffset
     $sb = New-Object System.Text.StringBuilder
     $pos = 0
     foreach ($c in $comments) {
@@ -1711,25 +1741,41 @@ function Test-ArrayTypeName($TypeName) {
 function Test-DataArgument($Arguments, [int]$Index) {
     $slot = (($Index -eq 1 -and $Arguments.Count -le 3 -and $Arguments[0] -is [StringConstantExpressionAst]) -or ($Index -eq 3 -and $Arguments.Count -eq 4))
     if (-not $slot) { return $false }
-    # A cast to an ARRAY type is an array whatever it wraps (r15, adversary pass 20 A3: `[object[]]'create'` is a one-element array, not the verb). Every wrapper
-    # Get-ValueExpression would strip is looked at for one.
-    for ($w = $Arguments[$Index]; $null -ne $w -and $w -isnot [ArrayLiteralAst]; ) {
+    return (Test-DataValue $Arguments[$Index])
+}
+
+# True when the VALUE of an expression is an array or a hashtable (r16, adversary pass 22 A1: the ONE reader of "is this operand data", so a new array spelling is
+# added here once). Read through a statement of one expression, parentheses, `$( )` of one statement, a cast and `-as`. An array is: an array literal, `@( )`, a
+# hashtable, a cast or `-as` to an ARRAY type whatever it wraps (`[object[]]'create'`, `[array]`, `[System.Array]`: r15 passes 20 and 21 A3 / A1), a unary comma
+# (`,'create'`), `-split`, a range (`0..1`), `+` or `*` whose LEFT operand is an array (concatenation, repetition: `@('create') + @('domain')`; a string on the
+# left makes a string), and a slice (an index that is a range or several indexes: `@('create', 'domain')[0..1]`).
+function Test-DataValue($Node) {
+    for ($w = $Node; $null -ne $w; ) {
+        if ($w -is [ArrayLiteralAst] -or $w -is [ArrayExpressionAst] -or $w -is [HashtableAst]) { return $true }
         if ($w -is [ConvertExpressionAst] -and (Test-ArrayTypeName $w.Type.TypeName)) { return $true }
+        if ($w -is [UnaryExpressionAst] -and @([TokenKind]::Comma, [TokenKind]::Split, [TokenKind]::Isplit, [TokenKind]::Csplit) -contains $w.TokenKind) { return $true }
         $next = $null
         if ($w -is [CommandExpressionAst]) { $next = $w.Expression }
         elseif ($w -is [PipelineAst] -and @($w.PipelineElements).Count -eq 1) { $next = @($w.PipelineElements)[0] }
         elseif ($w -is [ParenExpressionAst]) { $next = $w.Pipeline }
         elseif ($w -is [ConvertExpressionAst]) { $next = $w.Child }
         elseif ($w -is [SubExpressionAst] -and @($w.SubExpression.Statements).Count -eq 1) { $next = @($w.SubExpression.Statements)[0] }
-        elseif ($w -is [BinaryExpressionAst] -and $w.Operator -eq [TokenKind]::As) {
-            if ($w.Right -is [TypeExpressionAst] -and (Test-ArrayTypeName $w.Right.TypeName)) { return $true }
-            $next = $w.Left
+        elseif ($w -is [BinaryExpressionAst]) {
+            $op = $w.Operator
+            if ($op -eq [TokenKind]::As) {
+                if ($w.Right -is [TypeExpressionAst] -and (Test-ArrayTypeName $w.Right.TypeName)) { return $true }
+                $next = $w.Left
+            }
+            elseif (@([TokenKind]::Split, [TokenKind]::Isplit, [TokenKind]::Csplit, [TokenKind]::DotDot) -contains $op) { return $true }
+            elseif ($op -eq [TokenKind]::Plus -or $op -eq [TokenKind]::Multiply) { $next = $w.Left }
+        }
+        elseif ($w -is [IndexExpressionAst]) {
+            $ix = Get-ValueExpression $w.Index
+            return ($ix -is [ArrayLiteralAst] -or ($ix -is [BinaryExpressionAst] -and $ix.Operator -eq [TokenKind]::DotDot))
         }
         $w = $next
     }
-    # Through a cast, parentheses and `$( )` of one expression (adversary pass 15 A1: `$(@('create'))` is the same array).
-    $v = Get-ValueExpression $Arguments[$Index]
-    return ($v -is [ArrayLiteralAst] -or $v -is [ArrayExpressionAst] -or $v -is [HashtableAst])
+    return $false
 }
 
 # True when the node is, or holds, a command that reads WMI by a tainted class operand.
@@ -1824,17 +1870,18 @@ function Test-WmiCommandWord($Command) {
             }
             $value = $e.Argument
             if ($null -eq $value -and -not $isSwitch -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [CommandParameterAst]) { $value = $elements[$i + 1]; $i++ }
-            if ($null -ne $value -and (Test-ClassParameterName $n) -and $wmiWord.IsMatch((Get-CleanText $value))) { return $true }
+            # Every class or type read below is the operand's VALUE text (Get-OperandText): a condition inside it is not the value (r16, pass 22 A2).
+            if ($null -ne $value -and (Test-ClassParameterName $n) -and $wmiWord.IsMatch((Get-OperandText $value))) { return $true }
             # New-Object: the TYPE is -TypeName (any spelling that resolves to it, or a prefix of it); -ArgumentList is constructor data, not a type.
             $isTypeName = ($null -ne $resolved -and $resolved.Name -eq 'TypeName') -or ($n.Length -ge 1 -and 'TypeName'.StartsWith($n, [StringComparison]::OrdinalIgnoreCase))
-            if ($isNewObject -and $isTypeName -and $null -ne $value -and $wmiTypeWord.IsMatch((Get-CleanText $value))) { return $true }
+            if ($isNewObject -and $isTypeName -and $null -ne $value -and $wmiTypeWord.IsMatch((Get-OperandText $value))) { return $true }
             continue
         }
         $positional++
-        if ($isInvoke -and $positional -eq 1 -and $e -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-CleanText $e))) { return $true }
+        if ($isInvoke -and $positional -eq 1 -and $e -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-OperandText $e))) { return $true }
         # New-Object's first positional operand is the type name (the second is the argument list), unless -TypeName already took the type slot: then every positional
         # operand is constructor data (adversary pass 18 A1).
-        if ($isNewObject -and $positional -eq 1 -and -not $typeNamed -and $wmiTypeWord.IsMatch((Get-CleanText $e))) { return $true }
+        if ($isNewObject -and $positional -eq 1 -and -not $typeNamed -and $wmiTypeWord.IsMatch((Get-OperandText $e))) { return $true }
     }
     return $false
 }
@@ -1847,7 +1894,7 @@ function Test-WmiWord($Node, [bool]$Value = $true) {
         if ($x -is [CommandAst]) { if (Test-WmiCommandWord $x) { return $true } }
         elseif ($x -is [InvokeMemberExpressionAst]) {
             if ($x.Member -is [StringConstantExpressionAst] -and [string]$x.Member.Value -match '(?i)^(enumerate\w*|query\w*|get\w*(instance|class)\w*|invokemethod\w*)$' -and $x.Expression -isnot [TypeExpressionAst]) {
-                foreach ($a in @($x.Arguments)) { if ($a -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-CleanText $a))) { return $true } }
+                foreach ($a in @($x.Arguments)) { if ($a -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-OperandText $a))) { return $true } }
             }
         }
         elseif ($wmiWord.IsMatch($x.TypeName.FullName)) { return $true }
@@ -2586,6 +2633,13 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         # r15, adversary pass 21 on f8ebbb37: companions (an [array] cast at the NAME position is still the verb; a two-meaning CIM alias still reads the class)
         "p21-a1-array-alias-cast-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod([array]'Create', [object[]]@('x', $null, $null))",
         "p21-a2-two-cim-meanings-computer-name-alias-before-the-process-class": "Set-Alias readsvc Get-CimInstance\nSet-Alias readsvc Get-CimClass\n$server = '.'\n$c = readsvc -CN $server Win32_Process\n$c.Create('x')",
+        # r16, adversary pass 22 on 0f501d41: companions. A1: an array operator at the NAME position, or a Create name with array data after it, is still the verb.
+        # A2: a type word in a BRANCH of the operand's if / ternary is still the type, and a condition that ASSIGNS is read (its variable can be the value).
+        "p22-a1-array-concatenation-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod(@('Create') + @('x'), $null)",
+        "p22-a1-create-name-with-concatenated-array-data": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod('Create', (@('cmd.exe /c exit 0') + @($null, $null)))",
+        "p22-a2-type-word-in-an-if-branch-of-the-type-name": "$f = New-Object -TypeName $(if ($true) { 'System.Management.ManagementClass' } else { 'System.IO.FileInfo' }) 'Win32_Process'\n$f.Create('x')",
+        "p22-a2-type-word-in-a-ternary-branch-of-the-positional-type": "$f = New-Object ($x ? 'System.Management.ManagementClass' : 'System.IO.FileInfo') 'Win32_Process'\n$f.Create('x')",
+        "p22-a2-type-word-assigned-in-the-condition-of-the-type-name": "$f = New-Object -TypeName $(if ($t = 'System.Management.ManagementClass') { $t } else { $t }) 'Win32_Process'\n$f.Create('x')",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -2761,6 +2815,20 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "p21-a1-system-array-cast-and-as-array-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwnerSid', [System.Array]'create')\n$p.InvokeMethod('GetOwnerSid', ('create' -as [array]))",
         "p21-a2-two-cim-meanings-computer-name-alias": "Set-Alias readsvc Get-CimInstance\nSet-Alias readsvc Get-CimClass\n$server = '.'\n$name = 'svc'\nreadsvc -ClassName Win32_Service -CN $server -PipelineVariable $name | Out-Null",
         "p21-a2-two-cim-meanings-server-name-and-timeout-aliases": "Set-Alias readsvc Get-CimInstance\nSet-Alias readsvc Get-CimClass\n$server = '.'\n$t = 5\n$name = 'svc'\nreadsvc -ClassName Win32_Service -ServerName $server -OT $t -PipelineVariable $name | Out-Null",
+        # r16, adversary pass 22 on 0f501d41 (r15 OPEN A1, A2), verbatim first. A1: an array built by `+`, `*`, a slice, a unary comma or -split in the arguments
+        # slot of InvokeMethod is data (also the CimSession arguments slot). A2: a variable NAMED like a watched word in the CONDITION of an operand's if / ternary is
+        # not the operand's value, at each place a class or type is read from text (New-Object -TypeName and positional, a class parameter, the first positional of
+        # Invoke-CimMethod, a class argument of a CimSession method).
+        "p22-a1-array-concatenation-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', (@('create') + @('domain')))",
+        "p22-a1-array-repetition-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', (@('create') * 2))",
+        "p22-a1-array-slice-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', @('create', 'domain')[0..1])\n$p.InvokeMethod('GetOwner', @('create', 'domain')[0, 1])",
+        "p22-a1-unary-comma-and-split-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', (,'create'))\n$p.InvokeMethod('GetOwner', ('create domain' -split ' '))",
+        "p22-a1-array-concatenation-in-the-cim-session-arguments-slot": "$session.InvokeMethod('root/cimv2', 'Win32_Process', 'GetOwner', (@('create') + @('domain')))",
+        "p22-a2-wmi-variable-named-managementclass-in-the-type-name-condition": "$ManagementClass = Get-CimInstance Win32_Process\n$f = New-Object -TypeName $(if ($ManagementClass) { 'System.IO.FileInfo' } else { 'System.IO.FileInfo' }) -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+        "p22-a2-variable-named-wmiclass-in-the-positional-type-condition": "$f = New-Object $(if ($wmiclass) { 'System.IO.FileInfo' } else { 'System.IO.FileInfo' }) 'scratch.txt'\n$f.Create().Dispose()\n$g = New-Object -TypeName ($ManagementClass ? 'System.IO.FileInfo' : 'System.IO.FileInfo') 'b.txt'\n$g.Create().Dispose()",
+        "p22-a2-variable-named-win32-process-in-a-class-parameter-condition": "$e = New-CimInstance -ClassName $(if ($Win32_Process) { 'Win32_Environment' } else { 'Win32_Environment' }) -ClientOnly\n$e.Create('x')",
+        "p22-a2-variable-named-win32-process-in-the-invoke-positional-condition": "$r = Invoke-CimMethod $(if ($Win32_Process) { 'Win32_Service' } else { 'Win32_Service' }) -MethodName GetSecurityDescriptor\n$r.Create('x')",
+        "p22-a2-variable-named-win32-process-in-a-cim-session-class-argument-condition": "$r = $session.EnumerateInstances('root/cimv2', $(if ($Win32_Process) { 'Win32_Service' } else { 'Win32_Service' }))\n$r.Create('x')",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
