@@ -5289,6 +5289,21 @@ void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
     qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );
     if( m_smokeEventWaitInFlight == &wait )
         closeSmokeEventWait( wait );
+    else if( wait.counted )
+    {
+        // r2 fix iteration 2 (adversary A1 on fdb754e3): the session ended inside this wait and its summary already
+        // counted it at the finish. Whatever the wait did after that cannot be in that summary, so it is printed
+        // here, once, with the classification of the completed wait: an overrun after the finish is never hidden.
+        const qint64 waitedNs = wait.clock.nsecsElapsed();
+        qInfo().noquote()
+            << QStringLiteral( "playback_smoke.runner_event_wait_after_finish session=%1 waited_at_finish_ms=%2 "
+                               "waited_ms=%3 timed_out=%4 overran=%5" )
+                   .arg( static_cast<qulonglong>( wait.session ) )
+                   .arg( static_cast<double>( wait.countedAtNs ) / 1000000.0, 0, 'f', 3 )
+                   .arg( static_cast<double>( waitedNs ) / 1000000.0, 0, 'f', 3 )
+                   .arg( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) ? 1 : 0 )
+                   .arg( gui_hop_wait::smokeEventWaitOverran( waitedNs, maxMs ) ? 1 : 0 );
+    }
     m_smokeEventWaitInFlight = outer;
 }
 
@@ -5303,6 +5318,8 @@ void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )
     ++m_playbackSmokeRunnerEventWaits;
     // r1 fix iteration 1 (adversary A1): the timer's event can still be undelivered on return (GuiHopWaitSplit.h).
     const qint64 waitedNs = wait.clock.nsecsElapsed();
+    wait.counted = true;
+    wait.countedAtNs = waitedNs;
     if( gui_hop_wait::smokeEventWaitTimedOut( wait.bound->isActive(), waitedNs, wait.maxMs ) )
         ++m_playbackSmokeRunnerEventWaitTimeouts;
     if( gui_hop_wait::smokeEventWaitOverran( waitedNs, wait.maxMs ) )

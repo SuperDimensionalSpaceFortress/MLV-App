@@ -1902,6 +1902,56 @@ TEST(SmokeRunnerEventWait, AdvA1FinalWaitEndedByTheSessionsFinishIsStillCounted)
         "void waitGuiThreadForSmokeEvents( int maxMs );\n    void closeSmokeEventWait( SmokeEventWaitInFlight &wait );")));
 }
 
+TEST(SmokeRunnerEventWait, AdvA1OverrunAfterTheFinishIsPrintedWhenTheWaitReturns)
+{
+    // r2 fix iteration 2, adversary A1 on fdb754e3: --presented-frames 480; the final wait's dispatch finishes the
+    // session at waitedNs = 5 ms (timer active), so the finish's close records neither a timeout nor an overrun and
+    // the summary prints that. The GUI thread is then descheduled 20 ms: the completed wait (>= 25 ms) overran, and
+    // nothing ever said so. The summary cannot carry what happens after it prints; the wait now prints the completed
+    // wait on its own line when it returns.
+    using gui_hop_wait::smokeEventWaitOverran;
+    using gui_hop_wait::smokeEventWaitTimedOut;
+    ASSERT_FALSE(smokeEventWaitTimedOut(true, 5000000LL, 10));    // what the finish's close saw
+    ASSERT_FALSE(smokeEventWaitOverran(5000000LL, 10));
+    ASSERT_TRUE(smokeEventWaitTimedOut(true, 25000000LL, 10));    // the completed wait the new line classifies
+    ASSERT_TRUE(smokeEventWaitOverran(25000000LL, 10));
+
+    const QString source = mainWindowSource();
+    const QString helper = bracedBlockAfter(source, QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
+    ASSERT_FALSE(helper.isEmpty());
+    const int dispatch = helper.indexOf(QStringLiteral("qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );"));
+    const int ownClose = helper.indexOf(QStringLiteral("if( m_smokeEventWaitInFlight == &wait )\n        closeSmokeEventWait( wait );"));
+    const int afterFinish = helper.indexOf(QStringLiteral("else if( wait.counted )"));
+    const int line = helper.indexOf(QStringLiteral(
+        "\"playback_smoke.runner_event_wait_after_finish session=%1 waited_at_finish_ms=%2 \"\n"
+        "                               \"waited_ms=%3 timed_out=%4 overran=%5\""));
+    const int read = helper.indexOf(QStringLiteral("const qint64 waitedNs = wait.clock.nsecsElapsed();"));
+    const int timedOut = helper.indexOf(QStringLiteral(".arg( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) ? 1 : 0 )"));
+    const int overran = helper.indexOf(QStringLiteral(".arg( gui_hop_wait::smokeEventWaitOverran( waitedNs, maxMs ) ? 1 : 0 );"));
+    const int restored = helper.indexOf(QStringLiteral("m_smokeEventWaitInFlight = outer;"));
+    ASSERT_TRUE(dispatch > 0);
+    ASSERT_TRUE(ownClose > dispatch);
+    ASSERT_TRUE(afterFinish > ownClose);   // only a wait the finish closed (closed on return -> the first branch)
+    ASSERT_TRUE(read > afterFinish);       // the completed wait, read after the dispatch returned
+    ASSERT_TRUE(line > read);
+    ASSERT_TRUE(timedOut > line);
+    ASSERT_TRUE(overran > timedOut);
+    ASSERT_TRUE(restored > overran);
+    ASSERT_TRUE(helper.contains(QStringLiteral(".arg( static_cast<qulonglong>( wait.session ) )")));
+    ASSERT_TRUE(helper.contains(QStringLiteral(".arg( static_cast<double>( wait.countedAtNs ) / 1000000.0, 0, 'f', 3 )")));
+    // The close marks the record counted, at the clock reading it classified, only after the session guard.
+    const QString close = bracedBlockAfter(source, QStringLiteral("void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )"));
+    const int guard = close.indexOf(QStringLiteral(
+        "if( !m_playbackSmokeActive || wait.session == 0 || wait.session != m_playbackSmokeSessionId )\n        return;"));
+    const int marked = close.indexOf(QStringLiteral("wait.counted = true;\n    wait.countedAtNs = waitedNs;"));
+    ASSERT_TRUE(guard > 0);
+    ASSERT_TRUE(marked > guard);
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_smoke.runner_event_wait_after_finish")));
+    const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(h.contains(QStringLiteral("bool counted = false;")));
+    ASSERT_TRUE(h.contains(QStringLiteral("qint64 countedAtNs = 0;")));
+}
+
 TEST(CriticalHopSummaryWiring, AdvA2IssueStampFollowsTheRenderFrameHandOffInBothBranches)
 {
     // r2, adversary A2 on e447bc14: emit 100.000 s, issue stamp 100.005 s, the GUI descheduled before

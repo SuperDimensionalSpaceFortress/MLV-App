@@ -1473,6 +1473,8 @@ private:
         const QTimer *bound = nullptr;
         int maxMs = 0;
         uint64_t session = 0;         // 0 = no active session when the wait began: never counted
+        bool counted = false;         // fix iteration 2 (adversary A1 on fdb754e3): closed for its session ...
+        qint64 countedAtNs = 0;       // ... at this point on clock (the finish's, if the session ended inside it)
     };
     SmokeEventWaitInFlight *m_smokeEventWaitInFlight = nullptr;
     double m_playbackSmokePresentDrawPresentSumMs = 0.0;
