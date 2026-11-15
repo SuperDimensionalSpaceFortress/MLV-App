@@ -412,12 +412,15 @@ function Assert-AttrCudaBuildManifest {
     $commitProperty = $manifest.PSObject.Properties['sourceCommit']
     $commit = if ($null -eq $commitProperty) { '' } else { [string]$commitProperty.Value }
     if ($commit -ne $ExpectedSourceCommit) {
+        # VENUE-STAGE-CLAIM-SHAPE-1 >>>
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (Grok G15 on #814): the declared commit also travels as DATA (Exception.Data['declaredCommit']), so the stage
         # job's guard decides replace-or-refuse on the value itself, never by parsing this message (a wording drift on either side failed every one closed)
+        # r17 (CI run 43764890818): bracketed like the region above, so the emitted attribution job stays byte-identical to the pinned baseline outside its brackets
         $commitMismatch = [InvalidOperationException]::new("ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH $Path declares '$commit', expected '$ExpectedSourceCommit'")
         $commitMismatchData = $commitMismatch.Data
         $commitMismatchData['declaredCommit'] = $commit
         throw $commitMismatch
+        # VENUE-STAGE-CLAIM-SHAPE-1 <<<
     }
     $dllPairProperty = $manifest.PSObject.Properties['dllPairManifestSha256']
     $dllPairSha = if ($null -eq $dllPairProperty) { '' } else { ([string]$dllPairProperty.Value).ToLowerInvariant() }

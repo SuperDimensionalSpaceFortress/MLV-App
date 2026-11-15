@@ -4953,7 +4953,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_artifact_preflight_r8b_adv_a1_the_hash_worker_checks_the_minimum_again_after_the_existence_check(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
         start = text.index("# a read that fails ends the read (UNREACHABLE), never \"absent\"")
-        worker = text[start:text.index("Invoke-VenueBoundedRead -ScriptText $probe.ToString()", start)]
+        # r12/r16 (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): the bounded read is handed $probeText (the worker text, optionally behind the test delay), no longer $probe.ToString() itself
+        worker = text[start:text.index("$probeText = $(if ($TestArtifactDelayMs", start)]
         exists, opened = worker.index("Test-Path -LiteralPath $i.path"), worker.index("[IO.File]::Open($i.path")
         checks = [m.start() for m in re.finditer(r"-lt \$i\.minSec\) \{ 'NOTIME:'", worker)]
         self.assertEqual(len(checks), 3, "the minimum is checked before the existence check, again before the open, and again once the file is open (r10 adversary A1)")
@@ -6872,7 +6873,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(got["state"], "UNREACHABLE", got)
-        self.assertIn("to start hashing packageZip", got["error"])
+        # r12 (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1, adversary A1 on 7754d16e): the hash's end is fixed once and what is left of it is taken again right before the launch, so a
+        # bound under the minimum is refused there, before any worker starts (the per-file NOTIME check inside the worker stays, pinned by the r8b test above); no file is hashed either way
+        self.assertRegex(got["error"], r"no time is left before the hash's end \([\d.]+ s into the call\) to start it \([\d.]+ s left, under 2\)")
         # control: the same build with room for every file is STAGED and matches
         script = script.replace(" -ArtifactTimeoutSec 1 -ArtifactMinSec 2", "")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)

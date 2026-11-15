@@ -259,9 +259,12 @@ class StageJobTests(unittest.TestCase):
         self.assertLess(manifest, cleanup, "side-files may only be removed after the publish")
 
     def test_side_files_are_addressed_by_exact_name(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r16 (r14 OPEN A1): the three paths of one side-file are built in ONE helper, New-JobSideFile($Name), used both before and after the stage
+        # lock, so the loop's $name became the helper's $Name. Same call, same exact-name derivation; the pin follows the deliberate rename.
         self.assertIn(
-            'Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $name)', self.text
+            'Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $Name)', self.text
         )
+        self.assertIn("$sideFiles += New-JobSideFile $name ([string]$item.sha256)", self.text)
         self.assertNotIn("Get-ChildItem", self.text)
 
     def test_names_are_derived_from_the_commit_not_taken_from_the_manifest(self) -> None:
