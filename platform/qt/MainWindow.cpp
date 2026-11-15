@@ -5274,22 +5274,39 @@ void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
     QTimer bound;
     bound.setSingleShot( true );
     bound.setTimerType( Qt::PreciseTimer );
+    SmokeEventWaitInFlight wait;
+    wait.bound = &bound;
+    wait.maxMs = maxMs;
+    wait.session = m_playbackSmokeActive ? m_playbackSmokeSessionId : 0;
     // r1 fix iteration 2 (adversary A1 on b6adb0d2): the clock starts BEFORE the timer is armed, so a deschedule
     // between the two can only lengthen the measured wait, never hide the timer's expiry.
-    QElapsedTimer waited;
-    waited.start();
+    wait.clock.start();
     bound.start( qMax( 0, maxMs ) );
+    // r2 fix iteration 1 (adversary A1 on 9f2a3316): registered BEFORE the dispatch, because the dispatch can end the
+    // session (the target stop reaches finishPlaybackSmokeTelemetry from inside it); the finish then counts it.
+    SmokeEventWaitInFlight *const outer = m_smokeEventWaitInFlight;
+    m_smokeEventWaitInFlight = &wait;
     qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );
-    if( m_playbackSmokeActive )
-    {
-        ++m_playbackSmokeRunnerEventWaits;
-        // r1 fix iteration 1 (adversary A1): the timer's event can still be undelivered on return (GuiHopWaitSplit.h).
-        const qint64 waitedNs = waited.nsecsElapsed();
-        if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) )
-            ++m_playbackSmokeRunnerEventWaitTimeouts;
-        if( gui_hop_wait::smokeEventWaitOverran( waitedNs, maxMs ) )
-            ++m_playbackSmokeRunnerEventWaitOverruns;
-    }
+    if( m_smokeEventWaitInFlight == &wait )
+        closeSmokeEventWait( wait );
+    m_smokeEventWaitInFlight = outer;
+}
+
+// Counts one measured wait for the session it began in, once: called on the wait's own return, or by
+// finishPlaybackSmokeTelemetry (while the session is still active) when the session ends inside the dispatch.
+void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )
+{
+    if( m_smokeEventWaitInFlight == &wait )
+        m_smokeEventWaitInFlight = nullptr;
+    if( !m_playbackSmokeActive || wait.session == 0 || wait.session != m_playbackSmokeSessionId )
+        return;
+    ++m_playbackSmokeRunnerEventWaits;
+    // r1 fix iteration 1 (adversary A1): the timer's event can still be undelivered on return (GuiHopWaitSplit.h).
+    const qint64 waitedNs = wait.clock.nsecsElapsed();
+    if( gui_hop_wait::smokeEventWaitTimedOut( wait.bound->isActive(), waitedNs, wait.maxMs ) )
+        ++m_playbackSmokeRunnerEventWaitTimeouts;
+    if( gui_hop_wait::smokeEventWaitOverran( waitedNs, wait.maxMs ) )
+        ++m_playbackSmokeRunnerEventWaitOverruns;
 }
 
 // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split's clock (frameReadyEmitStageTime's), and the paint
@@ -30887,6 +30904,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         }
     }
 
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r2 fix iteration 1 (adversary A1 on 9f2a3316): a measured wait still dispatching
+    // when the session ends (this finish runs inside it) is counted and classified now, before the summary prints it.
+    if( m_smokeEventWaitInFlight )
+        closeSmokeEventWait( *m_smokeEventWaitInFlight );
     m_playbackSmokeActive = false;
     m_playbackPresentTrace.end();
     preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1

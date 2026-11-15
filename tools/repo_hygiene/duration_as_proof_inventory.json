@@ -3158,6 +3158,16 @@
       ]
     },
     {
+      "path": "platform/qt/GuiHopWaitSplit.h",
+      "anchor": "const long long limitNs = ( static_cast < long long > ( maxMs > 0 ? maxMs : 0 ) + 1LL ) * 1000000LL ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r2 (adversary A1 on e447bc14; advisory A2 on 9f2a3316 took the + 1 in long long): smokeEventWaitOverran's limit -- a negative smoke-wait bound argument (maxMs, the caller's constant 10) is clamped to 0 before the precise timer's 1 ms is added. A config-value clamp; whether the wait overran is decided by the measured waitedNs (QElapsedTimer started before the timer is armed) against that limit, and nothing here proves a stage ran.",
+      "lines": [
+        323
+      ]
+    },
+    {
       "path": "tests/console/test_gui_hop_wait_split.cpp",
       "anchor": "ASSERT_NEAR ( 0.0 , s . waitMs , 1 e - 12 ) ;",
       "class": "not_run_proof_structural",

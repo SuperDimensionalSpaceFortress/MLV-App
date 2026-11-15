@@ -1667,12 +1667,18 @@ TEST(SmokeRunnerEventWait, MeasuredLoopWaitsForEventsNotASleep)
     ASSERT_EQ(0, helper.count(QStringLiteral("m_guiHopWait.push(")));
     ASSERT_EQ(0, helper.count(QStringLiteral("m_guiPresentGapRunnerSleepNs")));
     ASSERT_EQ(0, helper.count(QStringLiteral("noteSmokeRunnerSleepIfActive")));
-    // Waits and timeouts are counted for the smoke session only; a timeout is a timer no longer active on return.
-    const int counted = helper.indexOf(QStringLiteral("if( m_playbackSmokeActive )"));
-    ASSERT_TRUE(counted > helper.indexOf(QStringLiteral("WaitForMoreEvents")));
-    ASSERT_TRUE(helper.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaits;")) > counted);
+    // Waits and timeouts are counted for the smoke session only (r2 fix iteration 1: by closeSmokeEventWait, for the
+    // session the wait began in; AdvA1FinalWaitEndedByTheSessionsFinishIsStillCounted).
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("closeSmokeEventWait( wait );")) > helper.indexOf(QStringLiteral("WaitForMoreEvents")));
+    const QString close = bracedBlockAfter(source, QStringLiteral("void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )"));
+    ASSERT_FALSE(close.isEmpty());
+    const int counted = close.indexOf(QStringLiteral(
+        "if( !m_playbackSmokeActive || wait.session == 0 || wait.session != m_playbackSmokeSessionId )\n        return;"));
+    ASSERT_TRUE(counted > 0);
+    ASSERT_TRUE(close.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaits;")) > counted);
     // (The timeout classification itself: AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsUndelivered.)
-    ASSERT_TRUE(helper.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaitTimeouts;")) > counted);
+    ASSERT_TRUE(close.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaitTimeouts;")) > counted);
+    ASSERT_EQ(0, helper.count(QStringLiteral("++m_playbackSmokeRunnerEventWait")));
     const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
     const int sleepDecl = h.indexOf(QStringLiteral("void sleepGuiThreadForSmokeRunner( unsigned long ms );"));
     ASSERT_TRUE(sleepDecl > 0);
@@ -1801,23 +1807,32 @@ TEST(SmokeRunnerEventWait, AdvA1BatchPostedBehindTheExpiredTimerIsCountedAsAnOve
             if (smokeEventWaitOverran(ns, maxMs) && !smokeEventWaitTimedOut(true, ns, maxMs))
                 ::minitest::fail(__FILE__, __LINE__, "an overrun that is not a timeout", "");
 
-    // Wiring: one elapsed read classifies both counters, after the wait; the helper states the bound's real contract.
+    // r2 fix iteration 1 (advisory A2 on 9f2a3316): the bound plus 1 ms is taken in long long, so INT_MAX is defined.
+    ASSERT_FALSE(smokeEventWaitOverran(0LL, 2147483647));
+    ASSERT_FALSE(smokeEventWaitOverran(2147483648LL * 1000000LL, 2147483647));
+    ASSERT_TRUE(smokeEventWaitOverran(2147483648LL * 1000000LL + 1LL, 2147483647));
+
+    // Wiring: one elapsed read classifies both counters, after the wait (r2 fix iteration 1: in closeSmokeEventWait,
+    // which the wait calls on return); the helper states the bound's real contract.
     const QString source = mainWindowSource();
     const QString helper = bracedBlockAfter(source, QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
     ASSERT_FALSE(helper.isEmpty());
+    const QString close = bracedBlockAfter(source, QStringLiteral("void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )"));
+    ASSERT_FALSE(close.isEmpty());
     const int wait = helper.indexOf(QStringLiteral("qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );"));
-    const int read = helper.indexOf(QStringLiteral("const qint64 waitedNs = waited.nsecsElapsed();"));
-    const int timeout = helper.indexOf(QStringLiteral(
-        "if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) )\n"
-        "            ++m_playbackSmokeRunnerEventWaitTimeouts;"));
-    const int overrun = helper.indexOf(QStringLiteral(
-        "if( gui_hop_wait::smokeEventWaitOverran( waitedNs, maxMs ) )\n"
-        "            ++m_playbackSmokeRunnerEventWaitOverruns;"));
     ASSERT_TRUE(wait > 0);
-    ASSERT_TRUE(read > wait);
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("closeSmokeEventWait( wait );")) > wait);
+    const int read = close.indexOf(QStringLiteral("const qint64 waitedNs = wait.clock.nsecsElapsed();"));
+    const int timeout = close.indexOf(QStringLiteral(
+        "if( gui_hop_wait::smokeEventWaitTimedOut( wait.bound->isActive(), waitedNs, wait.maxMs ) )\n"
+        "        ++m_playbackSmokeRunnerEventWaitTimeouts;"));
+    const int overrun = close.indexOf(QStringLiteral(
+        "if( gui_hop_wait::smokeEventWaitOverran( waitedNs, wait.maxMs ) )\n"
+        "        ++m_playbackSmokeRunnerEventWaitOverruns;"));
+    ASSERT_TRUE(read > 0);
     ASSERT_TRUE(timeout > read);
     ASSERT_TRUE(overrun > timeout);
-    ASSERT_EQ(1, helper.count(QStringLiteral("waited.nsecsElapsed()")));
+    ASSERT_EQ(1, close.count(QStringLiteral("nsecsElapsed()")));
     ASSERT_EQ(1, source.count(QStringLiteral("++m_playbackSmokeRunnerEventWaitOverruns;")));
     const int def = source.indexOf(QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
     const QString contract = source.mid(def - 700, 700);
@@ -1828,6 +1843,63 @@ TEST(SmokeRunnerEventWait, AdvA1BatchPostedBehindTheExpiredTimerIsCountedAsAnOve
     const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
     ASSERT_TRUE(h.contains(QStringLiteral(
         "uint64_t m_playbackSmokeRunnerEventWaitTimeouts = 0;\n    uint64_t m_playbackSmokeRunnerEventWaitOverruns = 0;")));
+}
+
+TEST(SmokeRunnerEventWait, AdvA1FinalWaitEndedByTheSessionsFinishIsStillCounted)
+{
+    // r2 fix iteration 1, adversary A1 on 9f2a3316: --presented-frames 480; the final waitGuiThreadForSmokeEvents(10)
+    // dispatches presentation 480, the target stop reaches finishPlaybackSmokeTelemetry INSIDE that dispatch at 24 ms,
+    // the finish clears m_playbackSmokeActive and prints the counters, and the wait returns at 27 ms. The old
+    // after-return `if( m_playbackSmokeActive )` then skipped it: the final wait, its timeout and its overrun were lost.
+    // Now the wait is registered in flight before the dispatch and the finish closes it before the summary prints.
+    using gui_hop_wait::smokeEventWaitOverran;
+    using gui_hop_wait::smokeEventWaitTimedOut;
+    const long long atFinishNs = 24000000LL;   // what the finish's close reads for the adversary's input
+    ASSERT_TRUE(smokeEventWaitTimedOut(true, atFinishNs, 10));
+    ASSERT_TRUE(smokeEventWaitOverran(atFinishNs, 10));
+
+    const QString source = mainWindowSource();
+    const QString helper = bracedBlockAfter(source, QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
+    ASSERT_FALSE(helper.isEmpty());
+    // The wait belongs to the session active when it began (0 = none), and is registered BEFORE the dispatch.
+    const int session = helper.indexOf(QStringLiteral("wait.session = m_playbackSmokeActive ? m_playbackSmokeSessionId : 0;"));
+    const int armed = helper.indexOf(QStringLiteral("bound.start( qMax( 0, maxMs ) );"));
+    const int registered = helper.indexOf(QStringLiteral("m_smokeEventWaitInFlight = &wait;"));
+    const int dispatch = helper.indexOf(QStringLiteral("qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );"));
+    const int ownClose = helper.indexOf(QStringLiteral("if( m_smokeEventWaitInFlight == &wait )\n        closeSmokeEventWait( wait );"));
+    const int restored = helper.indexOf(QStringLiteral("m_smokeEventWaitInFlight = outer;"));
+    ASSERT_TRUE(session > 0);
+    ASSERT_TRUE(armed > session);
+    ASSERT_TRUE(registered > armed);
+    ASSERT_TRUE(dispatch > registered);
+    ASSERT_TRUE(ownClose > dispatch);      // closed on return only if the finish did not close it already
+    ASSERT_TRUE(restored > ownClose);
+    ASSERT_EQ(0, helper.count(QStringLiteral("if( m_playbackSmokeActive )")));
+
+    // The close: unregisters first (so it runs once), then counts only for the still-active session the wait began in.
+    const QString close = bracedBlockAfter(source, QStringLiteral("void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )"));
+    ASSERT_FALSE(close.isEmpty());
+    const int unregister = close.indexOf(QStringLiteral("if( m_smokeEventWaitInFlight == &wait )\n        m_smokeEventWaitInFlight = nullptr;"));
+    const int guard = close.indexOf(QStringLiteral(
+        "if( !m_playbackSmokeActive || wait.session == 0 || wait.session != m_playbackSmokeSessionId )\n        return;"));
+    const int waits = close.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaits;"));
+    ASSERT_TRUE(unregister >= 0);
+    ASSERT_TRUE(guard > unregister);
+    ASSERT_TRUE(waits > guard);
+    ASSERT_EQ(1, source.count(QStringLiteral("++m_playbackSmokeRunnerEventWaits;")));
+
+    // The finish closes an in-flight wait while the session is still active, before the summary that prints it.
+    const QString finish = finishSmokeBody();
+    const int finishClose = finish.indexOf(QStringLiteral(
+        "if( m_smokeEventWaitInFlight )\n        closeSmokeEventWait( *m_smokeEventWaitInFlight );\n    m_playbackSmokeActive = false;"));
+    const int summary = finish.indexOf(QStringLiteral("playback_smoke.critical_hop_summary session=%1"));
+    ASSERT_TRUE(finishClose > 0);
+    ASSERT_TRUE(summary > finishClose);
+    ASSERT_EQ(1, finish.count(QStringLiteral("m_playbackSmokeActive = false;")));
+    const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(h.contains(QStringLiteral("SmokeEventWaitInFlight *m_smokeEventWaitInFlight = nullptr;")));
+    ASSERT_TRUE(h.contains(QStringLiteral(
+        "void waitGuiThreadForSmokeEvents( int maxMs );\n    void closeSmokeEventWait( SmokeEventWaitInFlight &wait );")));
 }
 
 TEST(CriticalHopSummaryWiring, AdvA2IssueStampFollowsTheRenderFrameHandOffInBothBranches)
@@ -1890,19 +1962,23 @@ TEST(SmokeRunnerEventWait, AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsU
     const QString source = mainWindowSource();
     const QString helper = bracedBlockAfter(source, QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
     ASSERT_FALSE(helper.isEmpty());
-    const int started = helper.indexOf(QStringLiteral("waited.start();"));
+    // r2 fix iteration 1 (adversary A1 on 9f2a3316): the clock is the in-flight record's (wait.clock), and the
+    // classification is closeSmokeEventWait's, which the wait calls after its dispatch.
+    const int started = helper.indexOf(QStringLiteral("wait.clock.start();"));
     const int wait = helper.indexOf(QStringLiteral("qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );"));
-    const int classify = helper.indexOf(QStringLiteral(
-        "if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) )\n"
-        "            ++m_playbackSmokeRunnerEventWaitTimeouts;"));   // r2: waitedNs = waited.nsecsElapsed(), read once
-    ASSERT_TRUE(helper.contains(QStringLiteral("QElapsedTimer waited;")));
+    const int classify = helper.indexOf(QStringLiteral("closeSmokeEventWait( wait );"));
+    ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )")).contains(
+        QStringLiteral("if( gui_hop_wait::smokeEventWaitTimedOut( wait.bound->isActive(), waitedNs, wait.maxMs ) )\n"
+                       "        ++m_playbackSmokeRunnerEventWaitTimeouts;")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(
+        QStringLiteral("QElapsedTimer clock;          // started BEFORE the bound is armed")));
     // r1 adversary A1 on b6adb0d2: the GUI thread descheduled between arming the timer (0 ns) and starting the clock
     // (9 ms), the timer expiring at 10.3 ms, reads waitedNs = 1.3 ms < the 9 ms bound: a timer-ended wait counted as
     // no timeout. The clock starts BEFORE the timer is armed, so waitedNs is at least the time since arming.
     const int armed = helper.indexOf(QStringLiteral("bound.start( qMax( 0, maxMs ) );"));
     ASSERT_TRUE(started >= 0);
     ASSERT_TRUE(armed > started);
-    ASSERT_EQ(1, helper.count(QStringLiteral("waited.start();")));
+    ASSERT_EQ(1, helper.count(QStringLiteral("wait.clock.start();")));
     ASSERT_EQ(1, helper.count(QStringLiteral("bound.start(")));
     ASSERT_FALSE(smokeEventWaitTimedOut(true, 1300000LL, 10));   // why the order matters: a late clock reads 1.3 ms
     ASSERT_TRUE(smokeEventWaitTimedOut(true, 10300000LL, 10));   // a clock started before arming reads >= 10.3 ms

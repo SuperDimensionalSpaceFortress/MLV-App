@@ -12,6 +12,7 @@
 #include <QFileDialog>
 #include <QDebug>
 #include <QTimerEvent>
+#include <QTimer>
 #include <QResizeEvent>
 #include <QFileOpenEvent>
 #include <QThreadPool>
@@ -1464,6 +1465,16 @@ private:
     uint64_t m_playbackSmokeRunnerEventWaits = 0;
     uint64_t m_playbackSmokeRunnerEventWaitTimeouts = 0;
     uint64_t m_playbackSmokeRunnerEventWaitOverruns = 0;
+    // r2 fix iteration 1 (adversary A1 on 9f2a3316): the measured wait still dispatching (null outside one). It is
+    // counted once, by whichever comes first: its own return or the session's finish (which can run inside it).
+    struct SmokeEventWaitInFlight
+    {
+        QElapsedTimer clock;          // started BEFORE the bound is armed
+        const QTimer *bound = nullptr;
+        int maxMs = 0;
+        uint64_t session = 0;         // 0 = no active session when the wait began: never counted
+    };
+    SmokeEventWaitInFlight *m_smokeEventWaitInFlight = nullptr;
     double m_playbackSmokePresentDrawPresentSumMs = 0.0;
     double m_playbackSmokePresentOverlaysScopesSumMs = 0.0;
     double m_playbackSmokePresentRenderSlotReleaseSumMs = 0.0;
@@ -2074,6 +2085,7 @@ private:
     void endGuiPresentIdleWait( void );
     void sleepGuiThreadForSmokeRunner( unsigned long ms );
     void waitGuiThreadForSmokeEvents( int maxMs );
+    void closeSmokeEventWait( SmokeEventWaitInFlight &wait );
     void finishPresentedFrame( uint64_t displayFrame,
                                RenderFrameThread::ReadyFrame &readyFrame,
                                const PresentationRequestContext &requestContext,

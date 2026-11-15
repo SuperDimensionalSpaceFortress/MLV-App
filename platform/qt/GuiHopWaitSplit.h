@@ -319,7 +319,8 @@ inline bool smokeEventWaitTimedOut( bool timerStillActive, long long waitedNs, i
  * timeout (smokeEventWaitTimedOut: waited >= the bound). waitedNs is read on the clock started before arming. */
 inline bool smokeEventWaitOverran( long long waitedNs, int maxMs )
 {
-    const long long limitNs = static_cast<long long>( ( maxMs > 0 ? maxMs : 0 ) + 1 ) * 1000000LL;
+    // r2 fix iteration 1 (advisory A2 on 9f2a3316): the + 1 is taken in long long, so INT_MAX cannot overflow.
+    const long long limitNs = ( static_cast<long long>( maxMs > 0 ? maxMs : 0 ) + 1LL ) * 1000000LL;
     return waitedNs > limitNs;
 }
 
