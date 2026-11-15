@@ -510,7 +510,9 @@ function Enter-AttrCudaStageLock {
         [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
         [int]$WaitSec = 1800,
         [string]$WaitMarkerPath = '',
-        [string]$TestRootVolumeType = ''
+        [string]$TestRootVolumeType = '',
+        # r16 fix iteration 1 (test-only): treat the drive-letter final path as absent, so the folder-mount fallback runs on any volume
+        [switch]$TestNoDosPath
     )
 
     # r14 (adversary A2 on 5fe750fa, siblings stage job :69/:376/:515 and Publish-AttrCudaFileMove :2872): host B with Z: mapped to host A's share and host A on
@@ -527,10 +529,12 @@ function Enter-AttrCudaStageLock {
     # mutex for the life of the process. .root is the drive-letter final path: the caller rebuilds every path on it right after the lock.
     # r16 (Grok G23 on #814): the Win32 error of a failed open or a failed GUID-path read is captured at once and named, so a local root this job cannot open (an ACL,
     # a sharing or AV hold) is never reported like a share. The refusal is the same.
-    if (-not ('AttrCudaWin32.StageRootNative' -as [type])) {
-        Add-Type -Namespace AttrCudaWin32 -Name StageRootNative -MemberDefinition (@(
+    # r16 fix iteration 1: StageRootVolumeNative (not r14's StageRootNative), so a process that loaded the older type never lacks GetVolumePathNamesForVolumeNameW
+    if (-not ('AttrCudaWin32.StageRootVolumeNative' -as [type])) {
+        Add-Type -Namespace AttrCudaWin32 -Name StageRootVolumeNative -MemberDefinition (@(
                 '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);',
                 '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle h, System.Text.StringBuilder p, uint n, uint f);',
+                '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool GetVolumePathNamesForVolumeNameW(string v, [Out] char[] names, uint n, out uint len);',
                 '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetDriveTypeW(string r);') -join "`n")
     }
     Initialize-AttrCudaFileIdNative
@@ -542,7 +546,7 @@ function Enter-AttrCudaStageLock {
     }
     # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES (0x81): FILE_READ_ATTRIBUTES alone is exempt from share-mode accounting, so a handle with only it pins nothing --
     # measured: the root renamed under such a handle. With FILE_LIST_DIRECTORY the missing FILE_SHARE_DELETE refuses every later DELETE open (a rename) of the root.
-    $rootHandle = [AttrCudaWin32.StageRootNative]::CreateFileW($nativeRoot, [uint32]0x81, [uint32]3, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
+    $rootHandle = [AttrCudaWin32.StageRootVolumeNative]::CreateFileW($nativeRoot, [uint32]0x81, [uint32]3, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
     $openError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
     $keepHandle = $false
     try {
@@ -554,21 +558,39 @@ function Enter-AttrCudaStageLock {
         $id = ConvertTo-AttrCudaFileIdObject -Info $info
         $buffer = [Text.StringBuilder]::new(32768)
         # VOLUME_NAME_GUID (1)
-        $n = [AttrCudaWin32.StageRootNative]::GetFinalPathNameByHandleW($rootHandle, $buffer, [uint32]32768, [uint32]1)
+        $n = [AttrCudaWin32.StageRootVolumeNative]::GetFinalPathNameByHandleW($rootHandle, $buffer, [uint32]32768, [uint32]1)
         $guidError = $(if ($n -ge 32768) { 122 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() })
         $final = $(if ($n -gt 0 -and $n -lt 32768) { $buffer.ToString() } else { '' })
         $volumeType = $(if ($final -match '^\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\') {
-                switch ([AttrCudaWin32.StageRootNative]::GetDriveTypeW($Matches[0])) { 3 { 'Fixed' } 2 { 'Removable' } 4 { 'Network' } 5 { 'CDRom' } 6 { 'RamDisk' } default { 'Unknown' } }
+                switch ([AttrCudaWin32.StageRootVolumeNative]::GetDriveTypeW($Matches[0])) { 3 { 'Fixed' } 2 { 'Removable' } 4 { 'Network' } 5 { 'CDRom' } 6 { 'RamDisk' } default { 'Unknown' } }
             } else { "NoLocalVolume (no volume GUID path, win32 $guidError)" })
         if ($TestRootVolumeType) { $volumeType = $TestRootVolumeType }
         if ($volumeType -cne 'Fixed') { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is $volumeType, not a local fixed volume of this host: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
-        # VOLUME_NAME_DOS (0): the root's final path by drive letter (or mount folder), through the same handle; '\\?\' is dropped (every caller of it is long-path aware)
+        # VOLUME_NAME_DOS (0): the root's final path by drive letter, through the same handle; '\\?\' is dropped (every caller of it is long-path aware)
         $buffer = [Text.StringBuilder]::new(32768)
-        $n = [AttrCudaWin32.StageRootNative]::GetFinalPathNameByHandleW($rootHandle, $buffer, [uint32]32768, [uint32]0)
+        $n = [AttrCudaWin32.StageRootVolumeNative]::GetFinalPathNameByHandleW($rootHandle, $buffer, [uint32]32768, [uint32]0)
         $dosError = $(if ($n -ge 32768) { 122 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() })
-        $dosFinal = $(if ($n -gt 0 -and $n -lt 32768) { $buffer.ToString() } else { '' })
+        $dosFinal = $(if ($n -gt 0 -and $n -lt 32768 -and -not $TestNoDosPath) { $buffer.ToString() } else { '' })
         if ($dosFinal -cmatch '^\\\\\?\\[A-Za-z]:\\') { $dosFinal = $dosFinal.Substring(4) }
+        # r16 fix iteration 1 (adversary A1 on 4118843c): a fixed volume mounted only in a folder (no drive letter) has no VOLUME_NAME_DOS path; its root is the
+        # volume's first mount folder (GetVolumePathNamesForVolumeNameW) plus the GUID final path's rest. -TestNoDosPath (test-only) takes this branch on any volume.
+        if ($dosFinal -notmatch '^[A-Za-z]:\\' -and $final -match '^(\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\)(.*)\z') {
+            $volumeName = $Matches[1]; $rest = $Matches[2]
+            $mounts = [char[]]::new(32768); $mountsLen = [uint32]0
+            if ([AttrCudaWin32.StageRootVolumeNative]::GetVolumePathNamesForVolumeNameW($volumeName, $mounts, [uint32]32768, [ref]$mountsLen)) {
+                $firstMount = ([string]::new($mounts, 0, [int]$(if ($mountsLen -lt 32768) { $mountsLen } else { 32768 }))).Split([char]0)[0]
+                if ($firstMount -match '^[A-Za-z]:\\') { $dosFinal = $firstMount.TrimEnd('\') + '\' + $rest }
+            } else { $dosError = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+        }
         if ($dosFinal -notmatch '^[A-Za-z]:\\') { throw "ATTRCUDA_STAGE_ROOT_UNRESOLVED the agent root's final path by drive letter could not be read through its open handle (win32 $dosError), so no job path can be bound to the locked root" }
+        # r16 fix iteration 1 (adversary A3 on 4118843c): a path without '\\?\' is normalized by every later open (a trailing dot or space is dropped), so it can
+        # name ANOTHER directory than the handle's (\\?\C:\stage.\agent -> C:\stage\agent). The bound path is used only when it reaches the very object the
+        # handle holds (volume serial and file index); anything else is refused, never locked.
+        $bound = $null
+        try { $bound = Get-AttrCudaFileId -Path $dosFinal -FollowLinks } catch { $bound = $null }
+        if ($null -eq $bound -or $bound.VolumeSerialNumber -ne $id.VolumeSerialNumber -or $bound.FileIndexHigh -ne $id.FileIndexHigh -or $bound.FileIndexLow -ne $id.FileIndexLow) {
+            throw "ATTRCUDA_STAGE_ROOT_UNRESOLVED the agent root's final path '$dosFinal' does not reach the directory the stage lock holds open (a name every later open normalizes differently), so no job path can be bound to the locked root"
+        }
         $keepHandle = $true
     } finally { if (-not $keepHandle) { $rootHandle.Dispose() } }
     $rootId ='vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
@@ -4221,7 +4243,7 @@ function Resolve-AttrCudaSmokeRunLog {
     $fullLogPath = [IO.Path]::GetFullPath($logPath)
     if (-not [string]::IsNullOrWhiteSpace($ContainingRoot)) {
         $root = [IO.Path]::GetFullPath($ContainingRoot)
-        if (-not $fullLogPath.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $fullLogPath.StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
             throw "ATTRCUDA_SMOKE_LOG_OUTSIDE_ROOT $fullLogPath is not under $root"
         }
     }

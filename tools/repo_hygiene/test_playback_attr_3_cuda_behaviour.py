@@ -1289,14 +1289,18 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertEqual(body.count("::CreateFileW("), 1, "the root is opened once")
         self.assertIn("::CreateFileW($nativeRoot, [uint32]0x81, [uint32]3, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)", body)
         self.assertIn("GetFileInformationByHandle($rootHandle.DangerousGetHandle()", body)
-        self.assertNotIn("Get-AttrCudaFileId -Path", body)
+        # (r16 fix iteration 1, A3: the bound drive-letter path is re-read by identity and must equal the handle's; the ROOT is never opened a second time by path)
+        self.assertNotIn("Get-AttrCudaFileId -Path $Root", body)
+        self.assertIn("Get-AttrCudaFileId -Path $dosFinal -FollowLinks", body)
         self.assertIn("rootHandle = $rootHandle", body)
         self.assertNotIn("GetFullPath", body)
         self.assertNotIn("ReleaseMutex", body)
         rebind = text.index("$AgentRoot = [string]$StageLock.root")
         self.assertLess(lock, rebind)
         self.assertLess(rebind, guard)
-        self.assertIn("try { Set-JobPaths } catch {", text[rebind:guard])
+        self.assertIn("$Work = Join-Path $AgentRoot \"work\\$JobId\"", text[rebind:guard])
+        self.assertIn("$sideFiles = @(foreach ($item in $sideFiles) { New-JobSideFile ([string]$item.name) ([string]$item.sha256) })", text[rebind:guard])
+        self.assertEqual(text.count("$Work = Join-Path"), 1, "$Work is assigned once, on the locked root")
 
     def snapshot(self) -> dict:
         return {e.name: (e.read_bytes(), e.stat().st_mtime_ns) for e in sorted(self.cache.iterdir())}
@@ -1553,6 +1557,43 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("ANCESTOR_RENAME_REFUSED", proc.stdout, proc.stdout + proc.stderr)
         self.assertIn("CHILD_CREATED", proc.stdout, proc.stdout + proc.stderr)
         self.assertTrue((root / "cache").is_dir())
+
+    def test_r16_fix1_a1_a_volume_with_no_drive_letter_path_binds_through_its_mount_folder(self) -> None:
+        # r16 fix iteration 1 (adversary A1 on 4118843c, AttrCudaArtifacts.psm1:567): a fixed volume mounted only in a folder has no VOLUME_NAME_DOS final path, and the
+        # lock threw ATTRCUDA_STAGE_ROOT_UNRESOLVED (the stage exited 7). The root is then bound through the volume's mount folder plus the GUID path's rest.
+        # -TestNoDosPath drops the drive-letter answer on this host's own volume, so the fallback runs here; it must bind the same root. RED: no such branch.
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1 -TestNoDosPath; 'HELD=' + $l.held; 'ROOT=' + $l.root }} "
+            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r16-fix1-a1.ps1")
+        self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn(f"ROOT={self.agent}\n", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
+
+    def test_r16_fix1_a3_a_root_whose_plain_path_names_another_directory_is_refused(self) -> None:
+        # r16 fix iteration 1 (adversary A3 on 4118843c, AttrCudaArtifacts.psm1:570): the lock held \\?\...\stage.\agent (a trailing dot only the extended form keeps),
+        # but '\\?\' was dropped from the bound path and every later open normalized it to ...\stage\agent, ANOTHER directory, which the job then wrote under this
+        # lock. The bound path must reach the very object the handle holds; here it cannot, so the root is refused. RED: HELD=True with the other directory's path.
+        dotted = "\\\\?\\" + str(self.tmp) + "\\stage.\\agent"
+        os.makedirs(dotted)
+        (self.tmp / "stage" / "agent").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, "\\\\?\\" + str(self.tmp) + "\\stage.", True)
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{dotted}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held + ' ROOT=' + $l.root }} "
+            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r16-fix1-a3.ps1")
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_UNRESOLVED the agent root's final path", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("HELD=", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r16_fix1_a2_a_drive_root_agent_root_contains_its_own_children(self) -> None:
+        # r16 fix iteration 1 (adversary A2 on 4118843c, stage job :243; siblings the fixture, smoke-runner, reference-frame and dll jobs): rebound to a junction's
+        # drive-root target (D:\), Assert-UnderAgentRoot required the prefix 'D:\\' and refused D:\cache, so a valid stage exited 7. RED: every one refused.
+        for gen in (STAGE_GENERATOR, ROOT / "tools/profiling/bachelor/attr3-stage-fixture-job.ps1", ROOT / "tools/profiling/bachelor/attr3-stage-smoke-runner-job.ps1",
+                    ROOT / "tools/profiling/bachelor/reference-frame-runner-job.ps1", ROOT / "tools/profiling/ultramagnus/playback-attr-3-cuda-dll-job.ps1"):
+            with self.subTest(gen=gen.name):
+                fn = re.search(r"(?ms)^function Assert-UnderAgentRoot\(.*?^\}", gen.read_text(encoding="utf-8")).group(0)
+                probe = self.tmp / f"r16-fix1-a2-{gen.stem}.ps1"
+                probe.write_text(fn + "\n$AgentRoot = 'D:\\'\ntry { Assert-UnderAgentRoot 'D:\\cache' 'Cache'; 'INSIDE' } catch { 'REFUSED' }\n"
+                                 "try { Assert-UnderAgentRoot 'E:\\cache' 'Cache'; 'INSIDE' } catch { 'REFUSED' }\n", encoding="utf-8")
+                proc = _run_pwsh_file(probe)
+                self.assertEqual(proc.stdout.split(), ["INSIDE", "REFUSED"], proc.stdout + proc.stderr)
 
     def test_r14_fix2_a2_a_long_local_root_still_takes_its_lock(self) -> None:
         # r14 fix iteration 2 (adversary A2 on 6882c873, AttrCudaArtifacts.psm1:526): the volume check's CreateFileW got the root unprefixed, so a 260+ character
