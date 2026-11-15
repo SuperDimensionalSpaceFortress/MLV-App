@@ -104,9 +104,33 @@ def _mixed_clock_code(line: str) -> str:
     return s
 
 
+def _mixed_clock_split(stmt: str) -> list[str]:
+    # r10 (adversary-49bf0ddc.json A4): `Start-Sleep -Seconds 90; $deadline = $t0.AddSeconds(240)` is two statements: split at a `;` outside quotes, parentheses and braces
+    # (a `;` inside `{ L "x"; break }` stays, so a comparison keeps its break)
+    parts: list[str] = []
+    depth, quote, start = 0, "", 0
+    for i, ch in enumerate(stmt):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth = max(0, depth - 1)
+        elif ch == ";" and depth == 0:
+            parts.append(stmt[start:i].strip())
+            start = i + 1
+    parts.append(stmt[start:].strip())
+    return [p for p in parts if p]
+
+
 def _mixed_clock_statements(text: str) -> list[str]:
     # r10 (sol r9b 13e99849-A2): PowerShell continues a statement onto the next line after an assignment operator (`$t0 =` then `[DateTime]::UtcNow`) or a trailing
     # backtick; those lines are joined into the one statement they are, so a multiline anchor or deadline reads like the single-line one.
+    # r10 (adversary-49bf0ddc.json A4): and inside an open parenthesis (`$t0 = (` / `[DateTime]::UtcNow` / `)`); a `<# ... #>` block comment is dropped first.
+    text = re.sub(r"<#.*?#>", " ", text, flags=re.S)
     out: list[str] = []
     pending = ""
     for c in (_mixed_clock_code(x) for x in text.splitlines()):
@@ -117,12 +141,12 @@ def _mixed_clock_statements(text: str) -> list[str]:
             pending = ""
         if c.endswith("`"):
             pending = c[:-1].rstrip()
-        elif re.search(r"(?<![=!<>])=$", c):
+        elif re.search(r"(?<![=!<>])=$", c) or (c.count("(") > c.count(")") and re.search(r"=\s*\(", c)):
             pending = c
         else:
-            out.append(c)
+            out.extend(_mixed_clock_split(c))
     if pending:
-        out.append(pending)
+        out.extend(_mixed_clock_split(pending))
     return out
 
 
@@ -1738,12 +1762,17 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             "sol-r9b-multiline.ps1": "$t0 =\n [DateTime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
             "backtick-continuation.ps1": "$t0 = `\n    [DateTime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
             "multiline-commented.ps1": "$t0 =   # the anchor\n    [DateTime]::UtcNow #captured\n$deadline = $t0.AddSeconds(30)\n",
+            # adversary-49bf0ddc.json A4 (its input and two siblings): a parenthesized multiline anchor, a block comment after the anchor, a deadline after `;`
+            "adv-a4-paren-multiline.ps1": "$t0 = (\n [DateTime]::UtcNow\n)\nStart-Sleep -Seconds 90\n$deadline = $t0.AddSeconds(240)\n",
+            "adv-a4-block-comment.ps1": "$t0 = [DateTime]::UtcNow <# captured #>\n$deadline = $t0.AddSeconds(240)\n",
+            "adv-a4-semicolon.ps1": "$t0 = [DateTime]::UtcNow\nStart-Sleep -Seconds 90; $deadline = $t0.AddSeconds(240)\n",
         })
         want = {"g14-2854b231.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"}, "reconcile-pre-r9.ps1": {"CAPTURED_WALL"}, "wvq-5fc3bf72.ps1": {"FRAME_WALL_READ"},
                 "case-lower-anchor.ps1": {"CAPTURED_WALL"}, "case-upper-var.ps1": {"CAPTURED_WALL"}, "case-wait-until.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"},
                 "case-cge-break.ps1": {"CAPTURED_WALL"}, "offset-anchor.ps1": {"CAPTURED_WALL"}, "case-frame.ps1": {"FRAME_WALL_READ"},
                 "paren-anchor.ps1": {"CAPTURED_WALL"}, "sol-r9b-trailing-comment.ps1": {"CAPTURED_WALL"}, "sol-r9b-multiline.ps1": {"CAPTURED_WALL"},
-                "backtick-continuation.ps1": {"CAPTURED_WALL"}, "multiline-commented.ps1": {"CAPTURED_WALL"}}
+                "backtick-continuation.ps1": {"CAPTURED_WALL"}, "multiline-commented.ps1": {"CAPTURED_WALL"},
+                "adv-a4-paren-multiline.ps1": {"CAPTURED_WALL"}, "adv-a4-block-comment.ps1": {"CAPTURED_WALL"}, "adv-a4-semicolon.ps1": {"CAPTURED_WALL"}}
         for name, text in red.items():
             with self.subTest(fixture=name):
                 self.assertEqual({rule for (n, rule, _c) in mixed_clock_deadline_hits({name: text})}, want[name])
