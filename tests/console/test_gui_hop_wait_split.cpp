@@ -145,6 +145,27 @@ TEST(GuiHopWaitSplit, RingOverflowMakesAnOldWindowUnattributedNotGuessed)
     ASSERT_FALSE( fresh.split( 1.0, 5.5 ).unattributed );
 }
 
+TEST(GuiHopWaitSplit, AdvA4HugeSamplesAreRefusedSoNoSumOverflows)
+{
+    // r1 advisory A4 on 6a6d7ef4: MeanMs add(1e308) twice overflowed sumMs to +inf. Samples past kMaxSampleMs are refused.
+    gui_hop_wait::MeanMs mean;
+    mean.add( 1e308 );
+    mean.add( 1e308 );
+    ASSERT_EQ( 0u, static_cast<unsigned>( mean.count ) );
+    ASSERT_TRUE( std::isfinite( mean.avg() ) );
+    mean.add( gui_hop_wait::kMaxSampleMs );   // the bound itself is accepted
+    ASSERT_EQ( 1u, static_cast<unsigned>( mean.count ) );
+    // A window whose width overflows, or is past the bound, is invalid and never accumulated.
+    gui_hop_wait::Recorder r;
+    ASSERT_FALSE( r.split( -1e308, 1e308 ).valid );
+    ASSERT_FALSE( r.split( 0.0, gui_hop_wait::kMaxSampleMs / 1000.0 * 2.0 ).valid );
+    gui_hop_wait::Accumulator acc;
+    acc.add( r.split( -1e308, 1e308 ) );
+    acc.add( r.split( -1e308, 1e308 ) );
+    ASSERT_EQ( 0u, static_cast<unsigned>( acc.frames ) );
+    ASSERT_TRUE( std::isfinite( acc.avgWaitMs() ) );
+}
+
 TEST(GuiHopWaitSplit, BadIntervalsAreIgnoredAndScopesPushOnExit)
 {
     gui_hop_wait::Recorder r;

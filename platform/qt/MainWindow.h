@@ -1752,6 +1752,9 @@ private:
     gui_hop_wait::Accumulator m_guiHopFrameReadyWait;
     gui_hop_wait::Accumulator m_guiHopPrepResultWait;
     gui_hop_wait::MeanMs m_guiHopEmitToRequestIssue;
+    // drawFrame's stamp at a request's hand-off to the render thread, and how many it stamped (smoke only).
+    double m_guiHopLastRequestIssueStageTime = 0.0;
+    uint64_t m_guiHopRequestIssues = 0;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;

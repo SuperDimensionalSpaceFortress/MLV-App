@@ -34,6 +34,9 @@ enum class Kind
 
 constexpr int kKinds = static_cast<int>( Kind::Count );
 constexpr int kRingCapacity = 16;
+// r1 fix iteration 1 (advisory A4 on 6a6d7ef4): a window or sample longer than this (about 11.6 days) is not a
+// GUI hop; it is refused, so no session sum can overflow to infinity.
+constexpr double kMaxSampleMs = 1.0e9;
 
 constexpr unsigned kindBit( Kind kind ) { return 1u << static_cast<unsigned>( kind ); }
 constexpr unsigned kAllKinds = ( 1u << kKinds ) - 1u;
@@ -118,8 +121,10 @@ public:
     {
         Split s;
         if( !std::isfinite( a ) || !std::isfinite( b ) || b < a ) return s;
+        const double waitMs = ( b - a ) * 1000.0;
+        if( !std::isfinite( waitMs ) || waitMs > kMaxSampleMs ) return s;
         s.valid = true;
-        s.waitMs = ( b - a ) * 1000.0;
+        s.waitMs = waitMs;
         for( int k = 0; k < kKinds; ++k )
         {
             if( !( kindMask & ( 1u << k ) ) ) continue;
@@ -230,7 +235,7 @@ struct MeanMs
     double sumMs = 0.0;
     void add( double ms )
     {
-        if( !std::isfinite( ms ) || ms < 0.0 ) return;
+        if( !std::isfinite( ms ) || ms < 0.0 || ms > kMaxSampleMs ) return;
         ++count;
         sumMs += ms;
     }

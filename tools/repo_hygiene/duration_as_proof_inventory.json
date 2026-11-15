@@ -3149,12 +3149,12 @@
     },
     {
       "path": "platform/qt/GuiHopWaitSplit.h",
-      "anchor": "if ( ! std :: isfinite ( ms ) || ms < 0.0 ) return ;",
+      "anchor": "if ( ! std :: isfinite ( ms ) || ms < 0.0 || ms > kMaxSampleMs ) return ;",
       "class": "not_run_proof_structural",
       "clock": "qpc_stage_clock",
-      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: MeanMs::add input guard -- a non-finite or negative emit-to-request sample (differences of mlv_stage_timing_now readings) is not accumulated. A zero sample is accepted and counted; the guard proves nothing ran.",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: MeanMs::add input guard -- a non-finite, negative or over-bound (kMaxSampleMs, advisory A4) emit-to-request sample (differences of mlv_stage_timing_now readings) is not accumulated. A zero sample is accepted and counted; the guard proves nothing ran.",
       "lines": [
-        233
+        238
       ]
     },
     {
@@ -3205,16 +3205,6 @@
       "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: range sanity check on a synthetic split (no live clock): other is never negative. 0.0 satisfies it; the split's content is proved in the same test by the closure assert (parts sum to the wait within 1e-9).",
       "lines": [
         109
-      ]
-    },
-    {
-      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
-      "anchor": "ASSERT_TRUE ( lastMs >= 0.0 ) ;",
-      "class": "not_run_proof_structural",
-      "clock": "other",
-      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1: the paint listener's reported ms is non-negative (it starts at -1, so this shows it was written). 0.0 satisfies it; that the listener ran is proved by ASSERT_EQ(1, calls) just before it.",
-      "lines": [
-        1383
       ]
     }
   ]

@@ -13,6 +13,7 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../platform/qt/GuiPresentGapIdle.h"
+#include "../../platform/qt/GuiHopWaitSplit.h"
 #include "../../platform/qt/PlaybackPrepOwnership.h"
 #include "../../platform/qt/PreviewPaintTiming.h"
 #include "../../platform/qt/ReconWorkerSplit.h"
@@ -1341,10 +1342,11 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     ASSERT_TRUE(queueBlock.contains(QStringLiteral("m_lastDrawFrameReadyQueueMs =")));
     ASSERT_TRUE(queueBlock.contains(QStringLiteral(
         "if( m_playbackSmokeActive )\n            m_guiHopFrameReadyWait.add( m_guiHopWait.split( readyFrame.frameReadyEmitStageTime, display_start ) );")));
-    const int before = ready.indexOf(QStringLiteral("const uint64_t hopRequestSerialBefore = m_nextRenderRequestSerial;"));
+    const int before = ready.indexOf(QStringLiteral("const uint64_t hopRequestIssuesBefore = m_guiHopRequestIssues;"));
     const int advance = ready.indexOf(QStringLiteral("timerFrameEvent( predictiveGpuTexNrEarlyAdvance );"));
-    const int issued = ready.indexOf(QStringLiteral("&& m_nextRenderRequestSerial != hopRequestSerialBefore"));
-    const int add = ready.indexOf(QStringLiteral("m_guiHopEmitToRequestIssue.add( ( advance_start - readyFrame.frameReadyEmitStageTime ) * 1000.0 );"));
+    const int issued = ready.indexOf(QStringLiteral("&& m_guiHopRequestIssues != hopRequestIssuesBefore"));
+    const int add = ready.indexOf(QStringLiteral(
+        "m_guiHopEmitToRequestIssue.add(\n                    ( m_guiHopLastRequestIssueStageTime - readyFrame.frameReadyEmitStageTime ) * 1000.0 );"));
     ASSERT_TRUE(before >= 0);
     ASSERT_TRUE(advance > before);
     ASSERT_TRUE(issued > advance);
@@ -1352,7 +1354,8 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
 
     // Viewport paint: the shared paint sink's listener, set with the session and cleared where it ends.
     const QString sink = readRepoFile(QStringLiteral("platform/qt/PreviewPaintTiming.h"));
-    ASSERT_TRUE(sink.contains(QStringLiteral("if( listener.fn ) listener.fn( listener.context, ms );")));
+    ASSERT_TRUE(sink.contains(QStringLiteral("if( heard ) m_listener.fn( m_listener.context, m_listenerStartS, endS );")));
+    ASSERT_TRUE(beginSmokeBody().contains(QStringLiteral("preview_paint_timing::paintListener().now = &guiHopWaitClockNow;")));
     const QString begin = beginSmokeBody();
     const int listen = begin.indexOf(QStringLiteral("preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;"));
     ASSERT_TRUE(listen >= 0);
@@ -1373,20 +1376,101 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     // The listener reaches the sink only from an outermost Scope; none is called with no listener set.
     preview_paint_timing::reset();
     static int calls = 0;
-    static double lastMs = -1.0;
-    preview_paint_timing::paintListener().fn = [](void *, double ms) { ++calls; lastMs = ms; };
+    static double clockS = 0.0;
+    static double heardStartS = -1.0;
+    static double heardEndS = -1.0;
+    preview_paint_timing::paintListener().fn = [](void *, double startS, double endS) { ++calls; heardStartS = startS; heardEndS = endS; };
+    preview_paint_timing::paintListener().now = []() -> double { clockS += 0.001; return clockS; };
     {
         const preview_paint_timing::Scope outer;
         const preview_paint_timing::Scope inner;
     }
     ASSERT_EQ(1, calls);
-    ASSERT_TRUE(lastMs >= 0.0);
+    ASSERT_NEAR(0.001, heardStartS, 1e-12);   // the outer Scope's two clock reads only
+    ASSERT_NEAR(0.002, heardEndS, 1e-12);
     preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();
     {
         const preview_paint_timing::Scope unheard;
     }
     ASSERT_EQ(1, calls);
     preview_paint_timing::reset();
+}
+
+TEST(CriticalHopSummaryWiring, AdvA1A2EmitToRequestEndsAtTheRequestsOwnIssueStamp)
+{
+    // r1 adversary A1 on 6a6d7ef4: emit 100.000, advance_start 100.005, the request handed to the render thread at
+    // 100.025 -> 25 ms, not the 5 ms advance_start gave. A2: a CUDA early advance whose next frame was already covered
+    // by an active lookahead request advances the serial (drawFrame takes it) and returns without issuing; the serial
+    // inequality counted it. The sample now comes from drawFrame's own stamp at the renderFrame hand-off.
+    const QString source = mainWindowSource();
+    const QString drawFrame = bracedBlockAfter(source, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )"));
+    ASSERT_FALSE(drawFrame.isEmpty());
+    const int serial = drawFrame.indexOf(QStringLiteral("const uint64_t requestSerial = m_nextRenderRequestSerial++;"));
+    const int covered = drawFrame.indexOf(QStringLiteral("QTimer::singleShot( 0, this, &MainWindow::drawFrameReady );"));
+    const int stamp = drawFrame.indexOf(QStringLiteral(
+        "    if( m_playbackSmokeActive )\n    {\n        m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();\n        ++m_guiHopRequestIssues;\n    }\n\n    //Get frame from library"));
+    const int firstIssue = drawFrame.indexOf(QStringLiteral("m_pRenderThread->renderFrame( requestedFrame,"));
+    ASSERT_TRUE(serial >= 0);
+    ASSERT_TRUE(covered > serial);   // the covered-by-lookahead return is before the stamp
+    ASSERT_TRUE(stamp > covered);
+    ASSERT_TRUE(firstIssue > stamp);
+    ASSERT_EQ(2, drawFrame.mid(stamp).count(QStringLiteral("m_pRenderThread->renderFrame( requestedFrame,")));
+    ASSERT_EQ(1, source.count(QStringLiteral("++m_guiHopRequestIssues;")));
+    const QString ready = bracedBlockAfter(source, QStringLiteral("void MainWindow::drawFrameReady()"));
+    ASSERT_FALSE(ready.contains(QStringLiteral("hopRequestSerialBefore")));
+    ASSERT_FALSE(ready.contains(QStringLiteral("m_guiHopEmitToRequestIssue.add( ( advance_start")));
+    ASSERT_TRUE(beginSmokeBody().contains(QStringLiteral("m_guiHopRequestIssues = 0;")));
+
+    // The arithmetic the early advance applies to the A1 input.
+    gui_hop_wait::MeanMs hop;
+    const double emitS = 100.000, issueS = 100.025;
+    hop.add((issueS - emitS) * 1000.0);
+    ASSERT_NEAR(25.0, hop.avg(), 1e-6);
+}
+
+TEST(CriticalHopSummaryWiring, AdvA3APaintDescheduledAfterItEndsKeepsItsOwnInterval)
+{
+    // r1 adversary A3 on 6a6d7ef4: a paint over [100.000, 100.010] (10 ms), the GUI thread descheduled after the paint
+    // and the listener's clock read at 100.510 gave [100.500, 100.510]: 10 ms paint / 505 ms other in the wait
+    // [100.005, 100.520] instead of 5 / 510. The Scope now reads the listener's clock at its own start and as the first
+    // thing at its end, so the interval is the paint's.
+    preview_paint_timing::reset();
+    static gui_hop_wait::Recorder recorder;
+    static int reads = 0;
+    recorder.reset();
+    reads = 0;
+    preview_paint_timing::paintListener().fn = [](void *context, double startS, double endS) {
+        static_cast<gui_hop_wait::Recorder *>(context)->push(gui_hop_wait::Kind::ViewportPaint, startS, endS);
+    };
+    preview_paint_timing::paintListener().now = []() -> double { return ++reads == 1 ? 100.000 : 100.010; };
+    preview_paint_timing::paintListener().context = &recorder;
+    {
+        const preview_paint_timing::Scope paint;
+    }
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();
+    ASSERT_EQ(2, reads);
+    ASSERT_EQ(1, recorder.ring(gui_hop_wait::Kind::ViewportPaint).count());
+    const gui_hop_wait::Split s = recorder.split(100.005, 100.520);
+    ASSERT_NEAR(5.0, s.kindMs[static_cast<int>(gui_hop_wait::Kind::ViewportPaint)], 1e-6);
+    ASSERT_NEAR(510.0, s.otherMs, 1e-6);
+    // A listener that changed inside the paint (a session ended or began) is not told.
+    reads = 0;
+    preview_paint_timing::paintListener().fn = [](void *context, double startS, double endS) {
+        static_cast<gui_hop_wait::Recorder *>(context)->push(gui_hop_wait::Kind::ViewportPaint, startS, endS);
+    };
+    preview_paint_timing::paintListener().now = []() -> double { return ++reads == 1 ? 200.000 : 200.010; };
+    preview_paint_timing::paintListener().context = &recorder;
+    {
+        const preview_paint_timing::Scope paint;
+        preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();
+    }
+    ASSERT_EQ(1, recorder.ring(gui_hop_wait::Kind::ViewportPaint).count());
+    preview_paint_timing::reset();
+    // The MainWindow listener pushes what it is told, and the session sets the clock with it.
+    const QString source = mainWindowSource();
+    const QString note = bracedBlockAfter(source, QStringLiteral("static void guiHopWaitNoteViewportPaint( void *context, double startS, double endS )"));
+    ASSERT_TRUE(note.contains(QStringLiteral("push( gui_hop_wait::Kind::ViewportPaint, startS, endS );")));
+    ASSERT_FALSE(note.contains(QStringLiteral("mlv_stage_timing_now()")));
 }
 
 // ---- #813 salvage (CPU-S1-PACE-POST-785-LEVER-1, 8c632800): max_gui_busy_at_ms / max_gui_busy_frame -------------

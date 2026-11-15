@@ -5261,17 +5261,16 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 }
 
 // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split's clock (frameReadyEmitStageTime's), and the paint
-// sink's listener while a smoke session is active: an outermost preview paint of `ms` that ends now.
+// sink's listener while a smoke session is active: an outermost preview paint's [start, end], both read
+// on this clock by the paint's own Scope (PreviewPaintTiming.h).
 static double guiHopWaitClockNow( void )
 {
     return mlv_stage_timing_now();
 }
 
-static void guiHopWaitNoteViewportPaint( void *context, double ms )
+static void guiHopWaitNoteViewportPaint( void *context, double startS, double endS )
 {
-    const double endS = mlv_stage_timing_now();
-    static_cast<gui_hop_wait::Recorder *>( context )->push(
-        gui_hop_wait::Kind::ViewportPaint, endS - ms / 1000.0, endS );
+    static_cast<gui_hop_wait::Recorder *>( context )->push( gui_hop_wait::Kind::ViewportPaint, startS, endS );
 }
 
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
@@ -7707,6 +7706,15 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             m_playbackTimelineSourceFrameReadyEmitStageTime;
         requestContext.playbackTimelineSourceDrawBeginStageTime =
             m_playbackTimelineSourceDrawBeginStageTime;
+    }
+
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1 r1 fix iteration 1 (adversary A1/A2 on 6a6d7ef4): the instant this request is
+    // handed to the render thread (both branches below issue it; a covered-by-lookahead request returned above
+    // without one). The early advance in drawFrameReady reads this, never the request serial counter.
+    if( m_playbackSmokeActive )
+    {
+        m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();
+        ++m_guiHopRequestIssues;
     }
 
     //Get frame from library
@@ -27130,7 +27138,10 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_guiHopFrameReadyWait.reset();
     m_guiHopPrepResultWait.reset();
     m_guiHopEmitToRequestIssue.reset();
+    m_guiHopRequestIssues = 0;
+    m_guiHopLastRequestIssueStageTime = 0.0;
     preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;
+    preview_paint_timing::paintListener().now = &guiHopWaitClockNow;
     preview_paint_timing::paintListener().context = &m_guiHopWait;
     m_playbackSmokeStartPosition = ui->horizontalSliderPosition->value();
     m_playbackSmokeStartCutIn = ui->spinBoxCutIn->value();
@@ -35411,16 +35422,17 @@ void MainWindow::drawFrameReady()
                     readyFrame.frameReadyEmitStageTime;
                 m_playbackTimelineSourceDrawBeginStageTime = 0.0;
             }
-            const uint64_t hopRequestSerialBefore = m_nextRenderRequestSerial;   // CPU-S1-PRESENT-INTERVAL-BOUND-1
+            const uint64_t hopRequestIssuesBefore = m_guiHopRequestIssues;   // CPU-S1-PRESENT-INTERVAL-BOUND-1
             timerFrameEvent( predictiveGpuTexNrEarlyAdvance );
             const double advance_return = mlv_stage_timing_now();
-            // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop from this frame's frameReady emit to the next
-            // request's issue, on the advances that issued one.
+            // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop from this frame's frameReady emit to the next request's
+            // issue (drawFrame's stamp at its renderFrame hand-off), on the advances that issued one.
             if( m_playbackSmokeActive
-             && m_nextRenderRequestSerial != hopRequestSerialBefore
+             && m_guiHopRequestIssues != hopRequestIssuesBefore
              && readyFrame.frameReadyEmitStageTime > 0.0
-             && advance_start >= readyFrame.frameReadyEmitStageTime )
-                m_guiHopEmitToRequestIssue.add( ( advance_start - readyFrame.frameReadyEmitStageTime ) * 1000.0 );
+             && m_guiHopLastRequestIssueStageTime >= readyFrame.frameReadyEmitStageTime )
+                m_guiHopEmitToRequestIssue.add(
+                    ( m_guiHopLastRequestIssueStageTime - readyFrame.frameReadyEmitStageTime ) * 1000.0 );
             m_lastDrawFrameReadyAdvanceMs =
                 (advance_return - advance_start) * 1000.0;
             predictiveGpuTexNrEarlyAdvanceExecuted = true;
