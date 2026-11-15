@@ -2233,6 +2233,8 @@ class Attr3FootageStageCliEndToEndTests(unittest.TestCase):
             shutil.copy2(ROOT / "tools" / "profiling" / "bachelor" / name, fixture_bachelor / name)
         shutil.copy2(UM_RUN, fixture_profiling / "um-run.ps1")
         shutil.copy2(ROOT / "tools" / "profiling" / "UmRunDrop.psm1", fixture_profiling / "UmRunDrop.psm1")
+        # MINI3-CUTOVER-STATE-GAPS-1: um-run.ps1 probes the share root through ShareRootAccess.psm1 before it reads the heartbeat
+        shutil.copy2(ROOT / "tools" / "profiling" / "ShareRootAccess.psm1", fixture_profiling / "ShareRootAccess.psm1")
         # BACHELOR-THERMAL-GATE-WAIT-1 r14: um-run.ps1 reads the agent's result through dual-venue\VenueRawJson.psm1
         (fixture_profiling / "dual-venue").mkdir()
         shutil.copy2(ROOT / "tools" / "profiling" / "dual-venue" / "VenueRawJson.psm1", fixture_profiling / "dual-venue" / "VenueRawJson.psm1")
