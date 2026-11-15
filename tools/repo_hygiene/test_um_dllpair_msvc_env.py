@@ -217,6 +217,25 @@ class MsvcIncludeTests(_Pwsh):
                 self.assertEqual(self.verdict(f"{k}\\ucrt;{k}\\um;{k}\\shared")["Reason"], f"INCLUDE_{leaf.upper()}_HEADER_MISSING")
                 (Path(k) / leaf / {"um": "windows.h", "shared": "sdkddkver.h"}[leaf]).write_text("/* fixture */\n", encoding="ascii")
 
+    def test_adversary_f7c5a3c0_a1_a_probe_that_throws_is_a_verdict_never_an_exception(self) -> None:
+        # adversary pass on f7c5a3c0, A1: Test-Path inside the Where-Object predicate could throw under ErrorActionPreference=Stop, and the job's
+        # unguarded call then died untyped instead of exit 9 at msvcEnvironment. An access-denied ACL does NOT throw on this host (probe-testpath-throw.ps1
+        # returned True), but a NUL in an entry does (ArgumentException), so it stands for the class: the throwing entry counts as not holding the header.
+        proc = self.pwsh(
+            f"Import-Module '{MODULE}' -Force\n"
+            "$v = Test-AttrCudaMsvcInclude -Include ('C:\\x' + [char]0 + 'y\\ucrt;C:\\x\\um;C:\\x\\shared')\n"
+            "'JSON=' + ($v | ConvertTo-Json -Compress)\n")
+        v = self.json_of(proc)
+        self.assertEqual((v["Ok"], v["Reason"]), (False, "INCLUDE_UCRT_HEADER_MISSING"), v)
+        self.assertIn("probeErrors=1", v["Detail"])
+        # a throwing entry beside a real one does not hide the real header
+        k = self.kits()
+        proc = self.pwsh(
+            f"Import-Module '{MODULE}' -Force\n"
+            f"$v = Test-AttrCudaMsvcInclude -Include ('C:\\x' + [char]0 + 'y\\ucrt;{k}\\ucrt;{k}\\um;{k}\\shared')\n"
+            "'JSON=' + ($v | ConvertTo-Json -Compress)\n")
+        self.assertTrue(self.json_of(proc)["Ok"])
+
     def test_a_header_in_any_matching_entry_suffices_and_a_missing_drive_does_not_throw(self) -> None:
         k = self.kits()
         v = self.verdict(rf"Q:\no-such-drive\ucrt;{k}\ucrt;{k}\um;{k}\shared")
@@ -235,12 +254,39 @@ class BackendCmdUcrtCheckTests(_Pwsh):
         lines = re.findall(r"^\s*'((?:[^']|'')*MLV_(?:UCRT_OK|INC)(?:[^']|'')*)',?\s*$", script.read_text(encoding="utf-8"), re.M)
         return [l.replace("''", "'") for l in lines]
 
-    def run_check(self, script: Path, include: str | None, via_env: bool = False, pathext: str | None = None) -> subprocess.CompletedProcess:
+    def test_adversary_f7c5a3c0_a2_a_bang_in_systemroot_still_finds_where(self) -> None:
+        # adversary pass on f7c5a3c0, A2: inside EnableDelayedExpansion the percent-expanded %SystemRoot% was re-parsed, so SystemRoot=C:\...\Win!OS!
+        # became ...\WinWindows_NT, both where calls ran a missing exe, and a valid corecrt.h was refused at exit 9. where.exe's path is now read into a
+        # variable BEFORE setlocal and used as !MLV_WHERE!, whose value delayed expansion does not re-parse. The fixture copies where.exe there.
+        win = self.tmp / "Win!OS!"
+        (win / "System32").mkdir(parents=True)
+        shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")
+        self.assertFalse((self.tmp / "WinWindows_NT").exists())
+        kit = self.tmp / "Kits-bang-root" / "ucrt"
+        kit.mkdir(parents=True)
+        (kit / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        bare = self.tmp / "Kits-bang-root-bare" / "ucrt"
+        bare.mkdir(parents=True)
+        for script in BACKEND_SCRIPTS:
+            for name, include in (("plain", f"{INCLUDE_NO_SDK};{kit}"), ("quoted", f'{INCLUDE_NO_SDK};"{kit}"')):
+                with self.subTest(script=script.name, case=name, header=True):
+                    p = self.run_check(script, include, via_env=True, system_root=str(win))
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("REACHED_NVCC", p.stdout)
+                    self.assertIn("WHERE_VAR_AT_NVCC=undefined", p.stdout)
+            with self.subTest(script=script.name, case="bare", header=False):
+                p = self.run_check(script, f"{INCLUDE_NO_SDK};{bare}", via_env=True, system_root=str(win))
+                self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+
+    def run_check(self, script: Path, include: str | None, via_env: bool = False, pathext: str | None = None,
+                  system_root: str | None = None) -> subprocess.CompletedProcess:
         # via_env: INCLUDE arrives in the process environment exactly as given (quotes and '&' included), as vcvars64 leaves it, not via a set line
         cmd = self.tmp / "check.cmd"
         head = [] if via_env else ([f'set "INCLUDE={include}"'] if include is not None else ['set "INCLUDE="'])
         # where nvcc would run: PATHEXT is the caller's again and delayed expansion is off (a literal !MLV_INC! is not expanded)
-        tail = ["echo REACHED_NVCC", "echo PATHEXT_AT_NVCC=%PATHEXT%", "echo DELAYED_AT_NVCC=!MLV_INC!", "exit /b 0"]
+        tail = ["echo REACHED_NVCC", "echo PATHEXT_AT_NVCC=%PATHEXT%", "echo DELAYED_AT_NVCC=!MLV_INC!",
+                "if defined MLV_WHERE (echo WHERE_VAR_AT_NVCC=defined) else (echo WHERE_VAR_AT_NVCC=undefined)", "exit /b 0"]
         body = ["@echo off"] + head + self.check_lines(script) + tail
         cmd.write_text("\r\n".join(body) + "\r\n", encoding="ascii")
         env = dict(os.environ)
@@ -248,6 +294,8 @@ class BackendCmdUcrtCheckTests(_Pwsh):
             env["INCLUDE"] = include or ""
         if pathext is not None:
             env["PATHEXT"] = pathext
+        if system_root is not None:
+            env["SYSTEMROOT"] = system_root  # dict(os.environ) keys are upper-case on Windows; a second 'SystemRoot' key would be ambiguous
         return subprocess.run(["cmd.exe", "/d", "/c", str(cmd)], capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
 
     def test_adversary_9f89_a1_a_quoted_entry_with_an_ampersand_still_reaches_the_typed_refusal(self) -> None:
@@ -431,6 +479,15 @@ class EmittedJobWiringTests(unittest.TestCase):
         for var in ("INCLUDE", "LIB", "LIBPATH"):
             self.assertIn(f"$env:{var} = $null", text)
         self.assertRegex(text, r"Complete-Failed 9 'msvcEnvironment' \"reason=")
+
+    def test_adversary_f7c5a3c0_a1_the_judge_and_the_vcvars_probe_never_escape_untyped(self) -> None:
+        # adversary pass on f7c5a3c0, A1 (call site :403 and sibling :379): under ErrorActionPreference=Stop a throw from the INCLUDE judge or from the
+        # vcvars64 Test-Path ended the job untyped. Both are caught and become exit 9 at msvcEnvironment, before the log and the typed refusal.
+        text, _ = self.job_text()
+        self.assertRegex(text, r"try \{\s*\$msvcVerdict = Test-AttrCudaMsvcInclude -Include \$msvcInclude\s*\} catch \{[^}]*'INCLUDE_JUDGE_FAILED'")
+        self.assertRegex(text, r"try \{ \$vcvarsPresent = Test-Path -LiteralPath \$vcvars \} catch \{ Complete-Failed 9 'msvcEnvironment' \"reason=VCVARS_PROBE_FAILED")
+        self.assertNotIn("if (-not (Test-Path -LiteralPath $vcvars)) { Complete-Failed 9", text)
+        self.assertLess(text.index("'INCLUDE_JUDGE_FAILED'"), text.index("Complete-Failed 9 'msvcEnvironment' \"reason=$($msvcVerdict.Reason)"))
 
     def test_adversary_a2_a_log_write_never_preempts_the_typed_exit(self) -> None:
         # adversary A2 (r1): a refused msvc-environment.log write threw before Complete-Failed 9, so the job ended untyped. Every build/probe LOG

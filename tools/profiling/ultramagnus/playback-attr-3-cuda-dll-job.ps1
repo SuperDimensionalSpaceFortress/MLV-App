@@ -376,7 +376,9 @@ $StepLog['cudaRuntimePresent'] = 0
 # a missing SDK is exit 9 at step msvcEnvironment, before any compile. The backend scripts come
 # from the EXTRACTED source of $SourceCommit, so this holds for an older commit's scripts too.
 $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
-if (-not (Test-Path -LiteralPath $vcvars)) { Complete-Failed 9 'msvcEnvironment' "reason=VCVARS_MISSING $vcvars" }
+$vcvarsPresent = $false
+try { $vcvarsPresent = Test-Path -LiteralPath $vcvars } catch { Complete-Failed 9 'msvcEnvironment' "reason=VCVARS_PROBE_FAILED $vcvars $($_.Exception.Message)" }
+if (-not $vcvarsPresent) { Complete-Failed 9 'msvcEnvironment' "reason=VCVARS_MISSING $vcvars" }
 $inheritedPath = [string]$env:PATH
 $inheritedPathEntries = @($inheritedPath -split ';' | Where-Object { $_ }).Count
 try {
@@ -400,7 +402,12 @@ try {
 }
 $includeLine = @($msvcOutput | Where-Object { $_ -match '^INCLUDE=' }) | Select-Object -First 1
 $msvcInclude = $(if ($includeLine) { ([string]$includeLine).Substring(8) } else { '' })
-$msvcVerdict = Test-AttrCudaMsvcInclude -Include $msvcInclude
+try {
+    $msvcVerdict = Test-AttrCudaMsvcInclude -Include $msvcInclude
+} catch {
+    # adversary A1 on f7c5a3c0: the judge never escapes untyped, so even an unforeseen throw is exit 9 at msvcEnvironment
+    $msvcVerdict = [pscustomobject]@{ Ok = $false; Reason = 'INCLUDE_JUDGE_FAILED'; Detail = "the INCLUDE judge threw: $($_.Exception.Message)" }
+}
 $Evidence['msvcEnvironment'] = [ordered]@{
     inheritedPathLength = $inheritedPath.Length
     inheritedPathEntries = $inheritedPathEntries

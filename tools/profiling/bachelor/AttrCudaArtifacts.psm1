@@ -7863,12 +7863,20 @@ function Test-AttrCudaMsvcInclude {
                 Detail = "$detail no INCLUDE entry ends in \$leaf (vcvars64 did not add the Windows SDK include dirs)"
             }
         }
-        $held = @($hit | Where-Object { Test-Path -LiteralPath (($_ -replace '\\+$', '') + '\' + $header) -PathType Leaf })
+        # A PROBE THAT THROWS IS A VERDICT (adversary A1 on f7c5a3c0, r3): under the job's ErrorActionPreference=Stop a Test-Path exception escaped the
+        # predicate and the job died untyped. The entry whose probe threw counts as not holding the header, and the count is in Detail.
+        $held = [System.Collections.Generic.List[object]]::new()
+        $probeErrors = 0
+        foreach ($entry in $hit) {
+            try {
+                if (Test-Path -LiteralPath (($entry -replace '\\+$', '') + '\' + $header) -PathType Leaf) { $held.Add($entry) }
+            } catch { $probeErrors++ }
+        }
         if ($held.Count -eq 0) {
             return [pscustomobject]@{
                 Ok = $false
                 Reason = 'INCLUDE_' + $leaf.ToUpperInvariant() + '_HEADER_MISSING'
-                Detail = "$detail no \$leaf INCLUDE entry holds $header (looked in: $($hit -join ', '))"
+                Detail = "$detail probeErrors=$probeErrors no \$leaf INCLUDE entry holds $header (looked in: $($hit -join ', '))"
             }
         }
     }
