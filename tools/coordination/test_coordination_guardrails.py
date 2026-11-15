@@ -1008,8 +1008,10 @@ def _lane_scanner_host_ready():
 # A string condition, so the pwsh probe runs only when a marked test is collected to run, not when the module is imported.
 _lane_scanner_only = pytest.mark.skipif(
     "not _lane_scanner_host_ready()",
-    reason="the launch and WMI create scanners read PowerShell's own AST and need pwsh with the CimCmdlets module (it ships with pwsh on Windows only)",
+    reason="the WMI create scanner reads PowerShell's own AST and needs pwsh with the CimCmdlets module (it ships with pwsh on Windows only)",
 )
+# The launch-order scanner reads no CIM metadata, so its tests need pwsh only (r16, adversary pass 23 A4: they must not skip on a pwsh without CimCmdlets).
+_launch_scanner_only = pytest.mark.skipif(_LANE_ERROR_MODE_PWSH is None, reason="the launch scanner reads PowerShell's own AST and needs pwsh")
 
 
 def _lane_sources():
@@ -1017,7 +1019,7 @@ def _lane_sources():
     return LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n"), lint.read_text(encoding="utf-8").replace("\r\n", "\n")
 
 
-@_lane_scanner_only
+@_launch_scanner_only
 def test_invoke_lane_sets_the_error_mode_before_it_starts_any_child(tmp_path):
     script, lint = _lane_sources()
     scan = _lane_launch_scan(tmp_path, {"real": (script, lint)})["real"]
@@ -1073,7 +1075,7 @@ def _lane_order_mutants(script, lint, helpers):
     return mutants, not_launches
 
 
-@_lane_scanner_only
+@_launch_scanner_only
 def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_path):
     """Each mutation runs on a temp copy of the script text; the tracked script is never edited."""
     script, lint = _lane_sources()
@@ -1283,6 +1285,8 @@ function Get-WrappedExpression($Pipeline, $Statements) {
 # $($c), $c[0], $c.PSBase, [x]$c, (,$c)[0], @($null, $c)[1], ($t ? $c : $n), ($n ?? $c), $(if ($t) { $c } else { $n }), $($n; $c)). The condition of an if or a
 # ternary is not a receiver. A pipeline of commands, or a statement that is not a lone expression, contributes every variable in it.
 # No depth limit: the work list ends when no wrapper is left, and an AST has no cycles.
+# A root is TAGGED (r16, adversary pass 23 A3): a variable is `v:<name>`, and an expression that names a WMI class is `class:wmi`. A variable may be named anything
+# (`${#wmi}`), so an untagged marker could be spelled by a plain variable; no variable root can start with `class:`.
 function Get-ReceiverRoots($Expression) {
     $roots = New-Object System.Collections.Generic.List[string]
     $work = New-Object System.Collections.Generic.Stack[object]
@@ -1290,7 +1294,7 @@ function Get-ReceiverRoots($Expression) {
     while ($work.Count -gt 0) {
         $e = $work.Pop()
         if ($null -eq $e) { continue }
-        if ($e -is [VariableExpressionAst]) { $roots.Add((Get-VarName $e)) }
+        if ($e -is [VariableExpressionAst]) { $roots.Add('v:' + (Get-VarName $e)) }
         elseif ($e -is [ParenExpressionAst]) { $work.Push($e.Pipeline) }
         elseif ($e -is [ArrayExpressionAst] -or $e -is [SubExpressionAst]) { foreach ($s in @($e.SubExpression.Statements)) { $work.Push($s) } }
         elseif ($e -is [StatementBlockAst]) { foreach ($s in @($e.Statements)) { $work.Push($s) } }
@@ -1303,7 +1307,7 @@ function Get-ReceiverRoots($Expression) {
         elseif ($e -is [IndexExpressionAst]) { $work.Push($e.Target) }
         elseif ($e -is [MemberExpressionAst]) { $work.Push($e.Expression) }
         elseif ($e -is [ConvertExpressionAst]) {
-            if (Test-WmiWord $e.Type) { $roots.Add('#wmi') }
+            if (Test-WmiWord $e.Type) { $roots.Add('class:wmi') }
             $work.Push($e.Child)
         }
         elseif ($e -is [UnaryExpressionAst]) { $work.Push($e.Child) }
@@ -1317,11 +1321,11 @@ function Get-ReceiverRoots($Expression) {
         else {
             # A command, a longer pipeline, a statement that is not a lone expression, a call, a type or a constant: it contributes every variable in it, and the
             # WMI class it names. The condition of an if or a ternary never reaches here, so a read of the process table there does not make the receiver WMI.
-            if (Test-WmiWord $e $true) { $roots.Add('#wmi') }
+            if (Test-WmiWord $e $true) { $roots.Add('class:wmi') }
             if ($e -is [StatementAst]) {
                 # A variable only in the condition of an if or a ternary inside it is not its value either (r15, adversary pass 20 A1:
                 # `(Write-Output $(if ($c) { $x })).Create()` with a WMI $c).
-                foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { if (-not (Test-InConditionOf $v $e)) { $roots.Add((Get-VarName $v)) } }
+                foreach ($v in $e.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true)) { if (-not (Test-InConditionOf $v $e)) { $roots.Add('v:' + (Get-VarName $v)) } }
             }
         }
     }
@@ -1382,8 +1386,11 @@ function Test-InWmiPipeline($Node) {
 # True when the receiver names a WMI class, starts from a WMI variable, or is $_ / $PSItem inside a pipeline that read a WMI class.
 function Test-WmiReceiver($Expression) {
     foreach ($root in @(Get-ReceiverRoots $Expression)) {
-        if ($root -eq '#wmi' -or $wmiVars.ContainsKey($root)) { return $true }
-        if (($root -eq '_' -or $root -eq 'psitem') -and (Test-InWmiPipeline $Expression)) { return $true }
+        if ($root -ceq 'class:wmi') { return $true }
+        if (-not $root.StartsWith('v:', [StringComparison]::Ordinal)) { continue }
+        $name = $root.Substring(2)
+        if ($wmiVars.ContainsKey($name)) { return $true }
+        if (($name -eq '_' -or $name -eq 'psitem') -and (Test-InWmiPipeline $Expression)) { return $true }
     }
     return $false
 }
@@ -1720,12 +1727,19 @@ function Get-VerbText($Node) {
 # The words an argument SPELLS: the values of the string constants in it (a comment is no node, a backtick and a splice are already decoded), never a variable's name
 # (`$create` is a variable) nor a member name (`$o.Create`): adversary pass 18 A2.
 function Get-ConstantText($Node) {
+    if ($null -eq $Node) { return '' }
     $parts = New-Object System.Collections.Generic.List[string]
     foreach ($c in $Node.FindAll({ param($x) $x -is [StringConstantExpressionAst] }, $true)) {
         if ($c.Parent -is [MemberExpressionAst] -and [object]::ReferenceEquals($c.Parent.Member, $c)) { continue }
         $parts.Add([string]$c.Value)
     }
     return ($parts -join ' ')
+}
+
+# The arguments of a member call, one per element; none for `$o.M()`, whose Arguments is $null (r16, adversary pass 23 A1: `@($null)` is ONE null argument, and
+# every reader of it then dereferenced $null and stopped the scan).
+function Get-MemberArguments($Invoke) {
+    if ($null -ne $Invoke.Arguments) { foreach ($a in $Invoke.Arguments) { $a } }
 }
 
 # True when a type name is an array type: written as one (`[object[]]`), or a name that RESOLVES to an array type (`[array]`, `[System.Array]`): r15, pass 21 A1.
@@ -1773,6 +1787,14 @@ function Test-DataValue($Node) {
             $ix = Get-ValueExpression $w.Index
             return ($ix -is [ArrayLiteralAst] -or ($ix -is [BinaryExpressionAst] -and $ix.Operator -eq [TokenKind]::DotDot))
         }
+        # A ternary or an if is data when EVERY branch is (r16, adversary pass 23 A2: `($t ? @('create') : @('create'))`); its condition is not its value. A branch
+        # is one statement that is data; an if with no else can also give nothing, which is not a verb either.
+        elseif ($w -is [TernaryExpressionAst]) { return ((Test-DataValue $w.IfTrue) -and (Test-DataValue $w.IfFalse)) }
+        elseif ($w -is [IfStatementAst]) {
+            $branches = @(@($w.Clauses) | ForEach-Object { $_.Item2 }) + @(if ($null -ne $w.ElseClause) { $w.ElseClause })
+            foreach ($b in $branches) { if (@($b.Statements).Count -ne 1 -or -not (Test-DataValue @($b.Statements)[0])) { return $false } }
+            return $true
+        }
         $w = $next
     }
     return $false
@@ -1780,6 +1802,7 @@ function Test-DataValue($Node) {
 
 # True when the node is, or holds, a command that reads WMI by a tainted class operand.
 function Test-WmiClassOperand($Node, [bool]$Value = $true) {
+    if ($null -eq $Node) { return $false }
     foreach ($c in @($Node.FindAll({ param($x) $x -is [CommandAst] }, $true))) {
         if ($Value -and (Test-InConditionOf $c $Node)) { continue }
         if (Test-WmiClassOperandCommand $c) { return $true }
@@ -1894,7 +1917,7 @@ function Test-WmiWord($Node, [bool]$Value = $true) {
         if ($x -is [CommandAst]) { if (Test-WmiCommandWord $x) { return $true } }
         elseif ($x -is [InvokeMemberExpressionAst]) {
             if ($x.Member -is [StringConstantExpressionAst] -and [string]$x.Member.Value -match '(?i)^(enumerate\w*|query\w*|get\w*(instance|class)\w*|invokemethod\w*)$' -and $x.Expression -isnot [TypeExpressionAst]) {
-                foreach ($a in @($x.Arguments)) { if ($a -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-OperandText $a))) { return $true } }
+                foreach ($a in @(Get-MemberArguments $x)) { if ($a -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-OperandText $a))) { return $true } }
             }
         }
         elseif ($wmiWord.IsMatch($x.TypeName.FullName)) { return $true }
@@ -2054,7 +2077,7 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             }
             elseif ($member -ieq 'InvokeMethod') {
                 # The arguments only, so a comment between them does not count; the receiver or an argument names the WMI class.
-                $arguments = @($n.Arguments)
+                $arguments = @(Get-MemberArguments $n)
                 $argText = (@(for ($j = 0; $j -lt $arguments.Count; $j++) { if (-not (Test-DataArgument $arguments $j)) { Get-ConstantText $arguments[$j] } }) -join ' ')
                 $argsReadWmi = $wmiWord.IsMatch($argText)
                 foreach ($argAst in $arguments) { if (Test-WmiClassOperand $argAst) { $argsReadWmi = $true } }
@@ -2640,6 +2663,12 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "p22-a2-type-word-in-an-if-branch-of-the-type-name": "$f = New-Object -TypeName $(if ($true) { 'System.Management.ManagementClass' } else { 'System.IO.FileInfo' }) 'Win32_Process'\n$f.Create('x')",
         "p22-a2-type-word-in-a-ternary-branch-of-the-positional-type": "$f = New-Object ($x ? 'System.Management.ManagementClass' : 'System.IO.FileInfo') 'Win32_Process'\n$f.Create('x')",
         "p22-a2-type-word-assigned-in-the-condition-of-the-type-name": "$f = New-Object -TypeName $(if ($t = 'System.Management.ManagementClass') { $t } else { $t }) 'Win32_Process'\n$f.Create('x')",
+        # r16, adversary pass 23 on d2b347f3: companions. A1: InvokeMethod with no arguments on a WMI receiver has no literal name (refused, fail closed). A2: a
+        # ternary at the NAME position is still read. A3: a variable that IS WMI keeps its taint whatever it is named, the old marker's spelling included.
+        "p23-a1-invoke-method-with-no-arguments-on-a-wmi-class": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod()",
+        "p23-a2-ternary-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod(($t ? 'Create' : 'Terminate'), [object[]]@('x', $null, $null))",
+        "p23-a3-wmi-variable-named-like-the-old-marker": "${#wmi} = Get-WmiObject -List Win32_Process\n${#wmi}.Create('x')",
+        "p23-a3-wmi-variable-named-like-the-new-marker": "${class:wmi} = Get-WmiObject -List Win32_Process\n${class:wmi}.Create('x')",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -2829,6 +2858,16 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "p22-a2-variable-named-win32-process-in-a-class-parameter-condition": "$e = New-CimInstance -ClassName $(if ($Win32_Process) { 'Win32_Environment' } else { 'Win32_Environment' }) -ClientOnly\n$e.Create('x')",
         "p22-a2-variable-named-win32-process-in-the-invoke-positional-condition": "$r = Invoke-CimMethod $(if ($Win32_Process) { 'Win32_Service' } else { 'Win32_Service' }) -MethodName GetSecurityDescriptor\n$r.Create('x')",
         "p22-a2-variable-named-win32-process-in-a-cim-session-class-argument-condition": "$r = $session.EnumerateInstances('root/cimv2', $(if ($Win32_Process) { 'Win32_Service' } else { 'Win32_Service' }))\n$r.Create('x')",
+        # r16, adversary pass 23 on d2b347f3, verbatim first. A1: a member call with no arguments is scanned, not a crash (InvokeMethod and a CimSession class
+        # method). A2: a ternary or an if whose every branch is an array is data in the arguments slot (also the CimSession slot). A3: a plain variable NAMED like
+        # the receiver marker is a plain variable.
+        "p23-a1-invoke-method-with-no-arguments-on-a-plain-object": "$o = [pscustomobject]@{}\nAdd-Member -InputObject $o -MemberType ScriptMethod -Name InvokeMethod -Value { 'ok' }\n$o.InvokeMethod()",
+        "p23-a1-cim-session-class-method-with-no-arguments": "$r = $session.EnumerateInstances()\n$x = Get-Item x\n$x.Create('y')",
+        "p23-a2-ternary-array-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', ($true ? @('create','domain') : @('create','domain')))",
+        "p23-a2-if-array-in-the-arguments-slot": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', $(if ($true) { @('create', 'domain') } elseif ($false) { ,'create' } else { [object[]]'create' }))",
+        "p23-a2-ternary-array-in-the-cim-session-arguments-slot": "$session.InvokeMethod('root/cimv2', 'Win32_Process', 'GetOwner', ($true ? @('create') : @('domain')))",
+        "p23-a3-plain-variable-named-like-the-old-marker": "${#wmi} = [System.IO.FileInfo]'scratch.txt'\n${#wmi}.Create().Dispose()\n${script:#wmi} = [System.IO.FileInfo]'b.txt'\n${script:#wmi}.Create().Dispose()",
+        "p23-a3-plain-variable-named-like-the-new-marker": "${class:wmi} = [System.IO.FileInfo]'scratch.txt'\n${class:wmi}.Create().Dispose()",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
