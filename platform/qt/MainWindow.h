@@ -1463,6 +1463,7 @@ private:
     // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: the measured gui-smoke loop's bounded event waits.
     uint64_t m_playbackSmokeRunnerEventWaits = 0;
     uint64_t m_playbackSmokeRunnerEventWaitTimeouts = 0;
+    uint64_t m_playbackSmokeRunnerEventWaitOverruns = 0;
     double m_playbackSmokePresentDrawPresentSumMs = 0.0;
     double m_playbackSmokePresentOverlaysScopesSumMs = 0.0;
     double m_playbackSmokePresentRenderSlotReleaseSumMs = 0.0;

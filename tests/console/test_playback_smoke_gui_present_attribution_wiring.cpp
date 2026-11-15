@@ -1301,6 +1301,8 @@ TEST(CriticalHopSummaryWiring, NewLineFollowsGuiPresentSummaryWithEveryFieldInOr
         QStringLiteral("avg_present_ui_signal_latency_own_window_ms"),
         QStringLiteral("present_ui_signal_latency_overwritten_frames"),
         QStringLiteral("runner_event_waits"), QStringLiteral("runner_event_wait_timeouts"),
+        // r2 (adversary A1 on e447bc14): the waits that returned past their bound, appended at the end.
+        QStringLiteral("runner_event_wait_overruns"),
     };
     int last = -1;
     for (int i = 0; i < fields.size(); ++i)
@@ -1724,7 +1726,8 @@ TEST(SmokeRunnerEventWait, Gate0OwnWindowIsSampledBeforeThePresentIsAccounted)
                                 "m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;",
                                 "m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;",
                                 "m_playbackSmokeRunnerEventWaits = 0;",
-                                "m_playbackSmokeRunnerEventWaitTimeouts = 0;" })
+                                "m_playbackSmokeRunnerEventWaitTimeouts = 0;",
+                                "m_playbackSmokeRunnerEventWaitOverruns = 0;" })
     {
         const int at = begin.indexOf(QString::fromLatin1(reset));
         if (at <= hopReset) ::minitest::fail(__FILE__, __LINE__, "Gate 0 reset beside the hop reset", reset);
@@ -1740,14 +1743,16 @@ TEST(SmokeRunnerEventWait, TheFiveNewFieldsAreTheLastFiveOfCriticalHopSummary)
     const QRegularExpression key(QStringLiteral("([a-z0-9_]+)=%(\\d+)"));
     for (QRegularExpressionMatchIterator it = key.globalMatch(format); it.hasNext();)
         keys << it.next().captured(1);
-    ASSERT_EQ(22, static_cast<int>(keys.size()));
-    const QStringList tail = keys.mid(keys.size() - 5);
+    // r2 (adversary A1 on e447bc14): a sixth field, runner_event_wait_overruns, is appended after the five.
+    ASSERT_EQ(23, static_cast<int>(keys.size()));
+    const QStringList tail = keys.mid(keys.size() - 6);
     const QStringList expected = {
         QStringLiteral("present_ui_signal_latency_own_window_frames"),
         QStringLiteral("avg_present_ui_signal_latency_own_window_ms"),
         QStringLiteral("present_ui_signal_latency_overwritten_frames"),
         QStringLiteral("runner_event_waits"),
         QStringLiteral("runner_event_wait_timeouts"),
+        QStringLiteral("runner_event_wait_overruns"),
     };
     ASSERT_TRUE(tail == expected);
     ASSERT_TRUE(keys.at(16) == QStringLiteral("avg_prep_result_wait_prepared_present_ms"));
@@ -1759,13 +1764,68 @@ TEST(SmokeRunnerEventWait, TheFiveNewFieldsAreTheLastFiveOfCriticalHopSummary)
         "                                   / static_cast<double>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames )"));
     const int a20 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOverwrittenFrames ) )"));
     const int a21 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaits ) )"));
-    const int a22 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitTimeouts ) );"));
+    const int a22 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitTimeouts ) )"));
+    const int a23 = finish.indexOf(QStringLiteral(".arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitOverruns ) );"));
     ASSERT_TRUE(lastOld > 0);
     ASSERT_TRUE(a18 > lastOld);
     ASSERT_TRUE(a19 > a18);
     ASSERT_TRUE(a20 > a19);
     ASSERT_TRUE(a21 > a20);
     ASSERT_TRUE(a22 > a21);
+    ASSERT_TRUE(a23 > a22);
+}
+
+TEST(SmokeRunnerEventWait, AdvA1BatchPostedBehindTheExpiredTimerIsCountedAsAnOverrun)
+{
+    // r2, adversary A1 on e447bc14 (DISTINGUISHED, not bounded): waitGuiThreadForSmokeEvents(10), timer armed at 0 ms,
+    // the GUI resumes at 11 ms with the expired timer's QTimerEvent posted first and a 16 ms playbackPrepResultReady
+    // callback posted second. On Qt 6.10.2/Windows both are delivered by one sendPostedEvents loop that checks no
+    // interrupt or deadline, so the wait returns at ~27 ms. Before r2 nothing told that wait from an 11 ms timeout.
+    using gui_hop_wait::smokeEventWaitOverran;
+    using gui_hop_wait::smokeEventWaitTimedOut;
+    const long long adversaryNs = 27000000LL;
+    ASSERT_TRUE(smokeEventWaitOverran(adversaryNs, 10));
+    ASSERT_TRUE(smokeEventWaitTimedOut(false, adversaryNs, 10));   // an overrun is also a timeout
+    ASSERT_TRUE(smokeEventWaitTimedOut(true, adversaryNs, 10));
+    ASSERT_TRUE(smokeEventWaitOverran(11000001LL, 10));            // past the bound plus the timer's 1 ms
+    ASSERT_FALSE(smokeEventWaitOverran(11000000LL, 10));
+    ASSERT_FALSE(smokeEventWaitOverran(10300000LL, 10));           // an ordinary timeout
+    ASSERT_FALSE(smokeEventWaitOverran(400000LL, 10));             // an event inside the bound
+    ASSERT_TRUE(smokeEventWaitOverran(1000001LL, 0));
+    ASSERT_FALSE(smokeEventWaitOverran(1000000LL, -5));
+    // Every overrun is a timeout, at any bound.
+    for (int maxMs : { 0, 1, 2, 10, 33 })
+        for (long long ns : { 0LL, 999999LL, 1000001LL, 9000000LL, 11000001LL, 34000001LL, 50000000LL })
+            if (smokeEventWaitOverran(ns, maxMs) && !smokeEventWaitTimedOut(true, ns, maxMs))
+                ::minitest::fail(__FILE__, __LINE__, "an overrun that is not a timeout", "");
+
+    // Wiring: one elapsed read classifies both counters, after the wait; the helper states the bound's real contract.
+    const QString source = mainWindowSource();
+    const QString helper = bracedBlockAfter(source, QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
+    ASSERT_FALSE(helper.isEmpty());
+    const int wait = helper.indexOf(QStringLiteral("qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );"));
+    const int read = helper.indexOf(QStringLiteral("const qint64 waitedNs = waited.nsecsElapsed();"));
+    const int timeout = helper.indexOf(QStringLiteral(
+        "if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) )\n"
+        "            ++m_playbackSmokeRunnerEventWaitTimeouts;"));
+    const int overrun = helper.indexOf(QStringLiteral(
+        "if( gui_hop_wait::smokeEventWaitOverran( waitedNs, maxMs ) )\n"
+        "            ++m_playbackSmokeRunnerEventWaitOverruns;"));
+    ASSERT_TRUE(wait > 0);
+    ASSERT_TRUE(read > wait);
+    ASSERT_TRUE(timeout > read);
+    ASSERT_TRUE(overrun > timeout);
+    ASSERT_EQ(1, helper.count(QStringLiteral("waited.nsecsElapsed()")));
+    ASSERT_EQ(1, source.count(QStringLiteral("++m_playbackSmokeRunnerEventWaitOverruns;")));
+    const int def = source.indexOf(QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
+    const QString contract = source.mid(def - 700, 700);
+    ASSERT_TRUE(contract.contains(QStringLiteral("The bound's contract")));
+    ASSERT_TRUE(contract.contains(QStringLiteral("counted as an overrun")));
+    // No dispatcher interrupt(): it cannot split a posted batch, and it would reach any nested loop.
+    ASSERT_EQ(0, helper.count(QStringLiteral("interrupt(")));
+    const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(h.contains(QStringLiteral(
+        "uint64_t m_playbackSmokeRunnerEventWaitTimeouts = 0;\n    uint64_t m_playbackSmokeRunnerEventWaitOverruns = 0;")));
 }
 
 TEST(SmokeRunnerEventWait, AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsUndelivered)
@@ -1790,8 +1850,8 @@ TEST(SmokeRunnerEventWait, AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsU
     const int started = helper.indexOf(QStringLiteral("waited.start();"));
     const int wait = helper.indexOf(QStringLiteral("qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );"));
     const int classify = helper.indexOf(QStringLiteral(
-        "if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waited.nsecsElapsed(), maxMs ) )\n"
-        "            ++m_playbackSmokeRunnerEventWaitTimeouts;"));
+        "if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) )\n"
+        "            ++m_playbackSmokeRunnerEventWaitTimeouts;"));   // r2: waitedNs = waited.nsecsElapsed(), read once
     ASSERT_TRUE(helper.contains(QStringLiteral("QElapsedTimer waited;")));
     // r1 adversary A1 on b6adb0d2: the GUI thread descheduled between arming the timer (0 ns) and starting the clock
     // (9 ms), the timer expiring at 10.3 ms, reads waitedNs = 1.3 ms < the 9 ms bound: a timer-ended wait counted as

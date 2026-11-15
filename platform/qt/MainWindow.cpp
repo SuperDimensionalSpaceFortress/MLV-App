@@ -5265,6 +5265,10 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 // thread's queued frameReady, a prep result, the pace timer), or when its own bounded timer fires.
 // It pushes no RunnerSleep interval: the dispatcher's idle probe already accounts the blocked time
 // as idle, and a frameReady posted during it is dispatched at once instead of after a sleep.
+// The bound's contract (r2, adversary A1 on e447bc14): the wait returns at the end of the first dispatch pass that
+// delivers an event or the timer. That pass delivers every event posted before it (the timer's expiry is itself a
+// posted event on Windows), so the wait can return past maxMs by that batch's handlers -- as the loop-top
+// processEvents( AllEvents ) always could. Such a wait is counted as an overrun (and as a timeout), never hidden.
 void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
 {
     QTimer bound;
@@ -5280,8 +5284,11 @@ void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
     {
         ++m_playbackSmokeRunnerEventWaits;
         // r1 fix iteration 1 (adversary A1): the timer's event can still be undelivered on return (GuiHopWaitSplit.h).
-        if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waited.nsecsElapsed(), maxMs ) )
+        const qint64 waitedNs = waited.nsecsElapsed();
+        if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) )
             ++m_playbackSmokeRunnerEventWaitTimeouts;
+        if( gui_hop_wait::smokeEventWaitOverran( waitedNs, maxMs ) )
+            ++m_playbackSmokeRunnerEventWaitOverruns;
     }
 }
 
@@ -27164,6 +27171,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;
     m_playbackSmokeRunnerEventWaits = 0;
     m_playbackSmokeRunnerEventWaitTimeouts = 0;
+    m_playbackSmokeRunnerEventWaitOverruns = 0;
     m_guiHopPrepResultWait.reset();
     m_guiHopEmitToRequestIssue.reset();
     m_guiHopRequestIssues = 0;
@@ -32092,7 +32100,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "present_ui_signal_latency_own_window_frames=%18 "
                    "avg_present_ui_signal_latency_own_window_ms=%19 "
                    "present_ui_signal_latency_overwritten_frames=%20 "
-                   "runner_event_waits=%21 runner_event_wait_timeouts=%22" )
+                   "runner_event_waits=%21 runner_event_wait_timeouts=%22 "
+                   "runner_event_wait_overruns=%23" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( static_cast<qulonglong>( fr.frames ) )
                    .arg( fr.avgWaitMs(), 0, 'f', 3 )
@@ -32117,7 +32126,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                              : 0.0, 0, 'f', 3 )
                    .arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOverwrittenFrames ) )
                    .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaits ) )
-                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitTimeouts ) );
+                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitTimeouts ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitOverruns ) );
     }
 
     /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /

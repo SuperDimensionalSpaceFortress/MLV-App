@@ -311,6 +311,18 @@ inline bool smokeEventWaitTimedOut( bool timerStillActive, long long waitedNs, i
     return waitedNs >= boundNs;
 }
 
+/* CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r2 (adversary A1 on e447bc14, DISTINGUISHED): the wait's bound cannot split a
+ * dispatch pass. On Qt 6.10.2/Windows the precise timer's expiry is a POSTED QTimerEvent (qt_fast_timer_proc ->
+ * postEvent), and QCoreApplicationPrivate::sendPostedEvents delivers every event posted before it in one loop with no
+ * interrupt or deadline check, so a 16 ms callback posted behind the expired timer runs before the wait returns. The
+ * wait OVERRAN when it returned past its bound plus the precise timer's 1 ms resolution; every overrun is also a
+ * timeout (smokeEventWaitTimedOut: waited >= the bound). waitedNs is read on the clock started before arming. */
+inline bool smokeEventWaitOverran( long long waitedNs, int maxMs )
+{
+    const long long limitNs = static_cast<long long>( ( maxMs > 0 ? maxMs : 0 ) + 1 ) * 1000000LL;
+    return waitedNs > limitNs;
+}
+
 /* (adversary A2 on cf09566f): a present's legacy uiLat (m_lastDrawFrameReadyQueueMs, read at present accounting)
  * was overwritten when ANOTHER request's drawFrameReady wrote it after this present's own did -- even with an equal
  * value -- or when its value differs from the present's own window. */
