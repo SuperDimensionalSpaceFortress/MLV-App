@@ -1381,6 +1381,30 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertNotIn("{ $op.result.startedUtc }", src)
         self.assertNotIn("{ $jr.result.startedUtc }", src)
 
+    def test_lease_batch_idle_end_r8_adv_5fc3bf72_a2_wait_venue_quiet_times_every_deadline_on_the_monotonic_clock(self) -> None:
+        # adversary-5fc3bf72.json A2: Wait-VenueQuiet compared [DateTime]::UtcNow with its deadline and gate end, so this host's clock stepping BACK 120 s mid-wait stretched a
+        # 240 s gate wait to about 360 s (past the agent's idle bound) while waitedSec said 240. Every deadline check and waitedSec now reads Get-WaitNowUtc: $t0 plus the
+        # Stopwatch time since it. Run with a $t0 far from the wall clock (a step of years), it still answers $t0 + the monotonic elapsed time.
+        wvq_path = RUNNER.parent / "Wait-VenueQuiet.ps1"
+        wvq = wvq_path.read_text(encoding="utf-8")
+        for line in wvq.splitlines():
+            if "UtcNow" in line and ("$deadline" in line or "$gateEnd" in line or "- $t0)" in line or "$now = " in line):
+                self.fail(f"a deadline check still reads the wall clock: {line.strip()}")
+        for frag in ("if ((Get-WaitNowUtc).AddSeconds($delay) -gt $deadline) { return }", "        $now = Get-WaitNowUtc\n",
+                     "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }"):
+            self.assertEqual(wvq.replace("\r\n", "\n").count(frag), 1, frag)
+        self.assertEqual(wvq.count("(Get-WaitNowUtc) - $t0).TotalSeconds"), 3)
+        self.assertLess(wvq.index("$t0 = [DateTime]::UtcNow"), wvq.index("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()"))
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(wvq_path)}', [ref]$null, [ref]$null)\n"
+            ". ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-WaitNowUtc' }, $true).Extent.Text))\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $t0 = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc); $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp() - 5 * $f\n"
+            "[Math]::Round(((Get-WaitNowUtc) - $t0).TotalSeconds, 1)\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertLess(abs(float(out.stdout.strip()) - 5.0), 0.5, out.stdout)
+
     def test_lease_batch_idle_end_r8_adv_a2_a_published_member_is_read_as_it_was_published(self) -> None:
         # adversary-cc9275e3.json A2: `$(if (Test-JsonObject $r) { $r.startedUtc })` unrolled startedUtc=["<instant>"] into the instant, so an unusable value supplied a runtime.
         # Get-JsonObjectMember keeps an array an array (then Get-AgentJobEndTs gives the send), for a ConvertFrom-Json object and for a dictionary alike; a scalar is the scalar;
