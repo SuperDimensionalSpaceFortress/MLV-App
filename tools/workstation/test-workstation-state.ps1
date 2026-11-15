@@ -328,26 +328,33 @@ function Get-LeaseHolder([string]$Ws) {
     return [string](($raw | ConvertFrom-Json).holder)
 }
 $me = $env:COMPUTERNAME
-if ($fnLoaded -and (Test-Has 'Test-GateRunActive' 'A8 lock')) {
-    $lockRoot = New-Scratch 'lock-root'
-    Assert-That (-not (Test-GateRunActive -Root $lockRoot)) 'A8 lock: no lock file = no gate run active'
-    $lk = [IO.FileStream]::new((Join-Path $lockRoot 'gate-active-test.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
-    $activeWhileHeld = Test-GateRunActive -Root $lockRoot
-    $lk.Dispose()
-    Assert-That ($activeWhileHeld -and -not (Test-GateRunActive -Root $lockRoot)) 'A8 lock: a lock held open is active; once released (or stale) it is not'
+$lockRoot = New-Scratch 'lock-root'
+if ($fnLoaded -and (Test-Has 'Open-GateLock' 'A1/A8 lock')) {
+    $s1 = Open-GateLock -Root $lockRoot -Mode Shared
+    $s2 = Open-GateLock -Root $lockRoot -Mode Shared
+    $x1 = Open-GateLock -Root $lockRoot -Mode Exclusive
+    Assert-That ($s1 -and $s2 -and -not $x1) 'A1 lock: any number of Lease-gated runs may hold the lock shared, and an exclusive (release) request is refused while one does'
+    $s1.Dispose(); $s2.Dispose()
+    $x2 = Open-GateLock -Root $lockRoot -Mode Exclusive
+    $s3 = Open-GateLock -Root $lockRoot -Mode Shared
+    Assert-That ($x2 -and -not $s3) 'A1 lock: with no gate running the exclusive lock is granted, and while it is held a gate cannot take the shared one'
+    $x2.Dispose()
+    $s4 = Open-GateLock -Root $lockRoot -Mode Shared
+    Assert-That ($null -ne $s4) 'A1 lock: released means free again (no stale lock)'
+    $s4.Dispose()
 }
 $wsL1 = New-LeaseWorkspace 'ws-lease1' $me
 $stL1 = New-Scratch 'state-lease1'
-$lockFile = Join-Path $stL1 'gate-active-held.lock'
-$held = [IO.FileStream]::new($lockFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
-try { $rel1 = Invoke-Setup (New-Scratch 'home-l1') @('-Phase', 'LeaseRelease', '-StateRoot', $stL1, '-Workspace', $wsL1) } finally { $held.Dispose() }
-Assert-That ($rel1.Exit -eq 4 -and (Get-LeaseHolder $wsL1) -ceq $me) 'A8 release: with a Lease-gated task running the release is refused (exit 4) and the lease is unchanged' "exit=$($rel1.Exit) holder=$(Get-LeaseHolder $wsL1)`n$($rel1.Out)"
-$rel2 = Invoke-Setup (New-Scratch 'home-l2') @('-Phase', 'LeaseRelease', '-StateRoot', $stL1, '-Workspace', $wsL1)
+$stL1other = New-Scratch 'state-lease1-other'
+$held = if ($fnLoaded -and (Test-Has 'Open-GateLock' 'A2 lock')) { Open-GateLock -Root $lockRoot -Mode Shared } else { $null }
+try { $rel1 = Invoke-Setup (New-Scratch 'home-l1') @('-Phase', 'LeaseRelease', '-StateRoot', $stL1other, '-LockRoot', $lockRoot, '-Workspace', $wsL1) } finally { if ($held) { $held.Dispose() } }
+Assert-That ($rel1.Exit -eq 4 -and (Get-LeaseHolder $wsL1) -ceq $me) 'A8/A2 release: with a Lease-gated task running (even under a DIFFERENT -StateRoot) the release is refused (exit 4) and the lease is unchanged' "exit=$($rel1.Exit) holder=$(Get-LeaseHolder $wsL1)`n$($rel1.Out)"
+$rel2 = Invoke-Setup (New-Scratch 'home-l2') @('-Phase', 'LeaseRelease', '-StateRoot', $stL1, '-LockRoot', $lockRoot, '-Workspace', $wsL1)
 Assert-That ($rel2.Exit -eq 0 -and (Get-LeaseHolder $wsL1) -ceq '') 'A8 release: with nothing running the release goes through' "exit=$($rel2.Exit) holder=$(Get-LeaseHolder $wsL1)`n$($rel2.Out)"
 $wsL3 = New-LeaseWorkspace 'ws-lease3' 'SOME-OTHER-HOST'
-$rel3 = Invoke-Setup (New-Scratch 'home-l3') @('-Phase', 'LeaseRelease', '-Force', '-StateRoot', (New-Scratch 'state-lease3'), '-Workspace', $wsL3)
+$rel3 = Invoke-Setup (New-Scratch 'home-l3') @('-Phase', 'LeaseRelease', '-Force', '-StateRoot', (New-Scratch 'state-lease3'), '-LockRoot', $lockRoot, '-Workspace', $wsL3)
 Assert-That ($rel3.Exit -eq 3 -and (Get-LeaseHolder $wsL3) -ceq 'SOME-OTHER-HOST') 'A15 release: -Force without -LeaseReason on another host''s lease is refused (exit 3), lease unchanged' "exit=$($rel3.Exit)`n$($rel3.Out)"
-$rel4 = Invoke-Setup (New-Scratch 'home-l4') @('-Phase', 'LeaseRelease', '-Force', '-LeaseReason', 'host gone', '-StateRoot', (New-Scratch 'state-lease4'), '-Workspace', $wsL3)
+$rel4 = Invoke-Setup (New-Scratch 'home-l4') @('-Phase', 'LeaseRelease', '-Force', '-LeaseReason', 'host gone', '-StateRoot', (New-Scratch 'state-lease4'), '-LockRoot', $lockRoot, '-Workspace', $wsL3)
 Assert-That ($rel4.Exit -eq 0 -and (Get-LeaseHolder $wsL3) -ceq '') 'A15 release: -Force with a reason releases it' "exit=$($rel4.Exit)`n$($rel4.Out)"
 
 # ---------------------------------------------------------------- A8 + A9: Gate (lease-gated run, WhatIf, source of the marker)
@@ -361,11 +368,12 @@ $gLocal = Invoke-Setup (New-Scratch 'home-g2') @('-Phase', 'Gate', '-GateMode', 
 Assert-That ($gLocal.Exit -eq 0 -and (Test-Path -LiteralPath $gateMarker)) 'A9 gate: without -WhatIf the target runs' "exit=$($gLocal.Exit)"
 [IO.File]::Delete($gateMarker)
 $wsG3 = New-LeaseWorkspace 'ws-g3' $me
-$gLease = Invoke-Setup (New-Scratch 'home-g3') @('-Phase', 'Gate', '-GateMode', 'Lease', '-GateScript', $gateTarget, '-StateRoot', $stG, '-Workspace', $wsG3)
-Assert-That ($gLease.Exit -eq 0 -and (Test-Path -LiteralPath $gateMarker) -and @(Get-ChildItem -LiteralPath $stG -Filter 'gate-active-*.lock' -ErrorAction SilentlyContinue).Count -eq 0) 'A8 gate: a Lease-gated run on the holder runs the target and leaves no lock behind' "exit=$($gLease.Exit)`n$($gLease.Out)"
+$gLease = Invoke-Setup (New-Scratch 'home-g3') @('-Phase', 'Gate', '-GateMode', 'Lease', '-GateScript', $gateTarget, '-StateRoot', $stG, '-LockRoot', $lockRoot, '-Workspace', $wsG3)
+$freeAfter = if ($fnLoaded -and (Get-Command Open-GateLock -ErrorAction SilentlyContinue)) { $xa = Open-GateLock -Root $lockRoot -Mode Exclusive; $ok = [bool]$xa; if ($xa) { $xa.Dispose() }; $ok } else { $false }
+Assert-That ($gLease.Exit -eq 0 -and (Test-Path -LiteralPath $gateMarker) -and $freeAfter) 'A8 gate: a Lease-gated run on the holder runs the target and leaves the gate lock free' "exit=$($gLease.Exit)`n$($gLease.Out)"
 [IO.File]::Delete($gateMarker)
 $wsG4 = New-LeaseWorkspace 'ws-g4' 'SOME-OTHER-HOST'
-$gOther = Invoke-Setup (New-Scratch 'home-g4') @('-Phase', 'Gate', '-GateMode', 'Lease', '-GateScript', $gateTarget, '-StateRoot', $stG, '-Workspace', $wsG4)
+$gOther = Invoke-Setup (New-Scratch 'home-g4') @('-Phase', 'Gate', '-GateMode', 'Lease', '-GateScript', $gateTarget, '-StateRoot', $stG, '-LockRoot', $lockRoot, '-Workspace', $wsG4)
 Assert-That ($gOther.Exit -eq 0 -and -not (Test-Path -LiteralPath $gateMarker)) 'A8 gate: a Lease-gated run on a host that does not hold the lease skips the target' "exit=$($gOther.Exit)`n$($gOther.Out)"
 
 # ---------------------------------------------------------------- A9: Ssh -WhatIf creates nothing under the profile
@@ -380,6 +388,123 @@ foreach ($combo in 'Host,Gate', 'All,Gate', 'Gate,Verify') {
     $gc = Invoke-Setup (New-Scratch 'home-combo') @('-Phase', $combo, '-WhatIf', '-StateRoot', (New-Scratch 'state-combo'), '-Workspace', (New-Scratch 'ws-combo'))
     Assert-That ($gc.Exit -eq 64 -and $gc.Out -match "must be run alone") "A16 phases: -Phase $combo is refused (exit 64)" "exit=$($gc.Exit)`n$($gc.Out)"
 }
+
+# ================================================================ adversary pass 2 (head b4824e4b): one section per finding class
+# ---------------------------------------------------------------- A1: a release in flight stops a Lease-gated run from starting
+if ($fnLoaded -and (Get-Command Open-GateLock -ErrorAction SilentlyContinue)) {
+    $wsX = New-LeaseWorkspace 'ws-gx' $me
+    [IO.File]::Delete($gateMarker) 2>$null
+    $xh = Open-GateLock -Root $lockRoot -Mode Exclusive
+    try { $gBusy = Invoke-Setup (New-Scratch 'home-gx') @('-Phase', 'Gate', '-GateMode', 'Lease', '-GateScript', $gateTarget, '-StateRoot', (New-Scratch 'state-gx'), '-LockRoot', $lockRoot, '-Workspace', $wsX) } finally { if ($xh) { $xh.Dispose() } }
+    Assert-That ($gBusy.Exit -eq 0 -and -not (Test-Path -LiteralPath $gateMarker)) 'A1 gate: while a release holds the lock exclusively a Lease-gated run does not start its target' "exit=$($gBusy.Exit)`n$($gBusy.Out)"
+} else { Assert-That $false 'A1 gate: Open-GateLock is not defined' }
+
+# ---------------------------------------------------------------- A3: hidden files are scanned, listed and quarantined too
+if ($fnLoaded -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyContinue)) {
+    $hidStage = New-Scratch 'scan-stage-hidden'
+    $hid = Join-Path $hidStage 'config.json'
+    [IO.File]::WriteAllText($hid, ('gh' + 'p_' + ('A' * 40)))
+    (Get-Item -LiteralPath $hid -Force).Attributes = [IO.FileAttributes]::Hidden
+    $res = Invoke-StagedSecretScan -Stage $hidStage
+    Assert-That (-not (Test-Path -LiteralPath $hid) -and $res.Removed.Count -eq 1) 'A3 scan: a Hidden staged file holding a token is found and removed' "removed=$($res.Removed -join ',')"
+    $hidClaims = Join-Path (New-Scratch 'fn-ws-hid') 'claims'
+    [void][IO.Directory]::CreateDirectory($hidClaims)
+    $hc = Join-Path $hidClaims 'hidden-foreign.claim'
+    [IO.File]::WriteAllText($hc, '{"utc":"' + [DateTime]::UtcNow.AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ') + '","runDir":"' + ((Join-Path $ScratchRoot 'absent-hidden-run') -replace '\\', '\\') + '"}')
+    (Get-Item -LiteralPath $hc -Force).Attributes = [IO.FileAttributes]::Hidden
+    $mv = @(Move-ForeignClaims -ClaimsDir $hidClaims -Stamp 'TH')
+    Assert-That ($mv.Count -eq 1) 'A3 claims: a Hidden foreign claim is quarantined too' "moved=$($mv -join ',')"
+} else { Assert-That $false 'A3: Invoke-StagedSecretScan is not defined' }
+
+# ---------------------------------------------------------------- A4: an uncleared file or an unwritable report means NOT clean, and never throws
+if ($fnLoaded -and (Get-Command Test-StagedBundleClean -ErrorAction SilentlyContinue)) {
+    $dirtyStage = New-Scratch 'scan-stage-dirty'
+    $held4 = Join-Path $dirtyStage 'notes.txt'
+    [IO.File]::WriteAllText($held4, ('gh' + 'p_' + ('A' * 40)))
+    $report = Join-Path $dirtyStage 'SECRET-SCAN.txt'
+    [IO.File]::WriteAllText($report, 'clean')
+    (Get-Item -LiteralPath $report).Attributes = [IO.FileAttributes]::ReadOnly
+    $rd = [IO.File]::Open($held4, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $threw = $false; $clean4 = $true
+    try { $clean4 = Test-StagedBundleClean -Stage $dirtyStage } catch { $threw = $true } finally { $rd.Dispose(); (Get-Item -LiteralPath $report -Force).Attributes = [IO.FileAttributes]::Normal }
+    Assert-That (-not $threw -and -not $clean4) 'A4 scan: a readable-but-undeletable secret file and a read-only report give "not clean" (no bundle), without throwing'
+    $okStage = New-Scratch 'scan-stage-ok'
+    [IO.File]::WriteAllText((Join-Path $okStage 'a.txt'), 'plain')
+    Assert-That (Test-StagedBundleClean -Stage $okStage) 'A4 scan: a clean stage is clean'
+} else { Assert-That $false 'A4: Test-StagedBundleClean is not defined' }
+
+# ---------------------------------------------------------------- A5: the run stamp is unique per process
+if ($fnLoaded) { Assert-That ($stamp -match 'Z-\d+$') 'A5 stamp: includes the process id, so two runs in one second do not share a stage folder or ZIP name' "stamp=$stamp" }
+
+# ---------------------------------------------------------------- A6: Include directives are refused
+if ($fnLoaded -and (Get-Command Set-SshdKeyOnlyConfig -ErrorAction SilentlyContinue)) {
+    $incCfg = Join-Path (New-Scratch 'sshd-inc') 'sshd_config'
+    $incText = "Include C:/ProgramData/ssh/site.conf`r`nPasswordAuthentication yes`r`n"
+    [IO.File]::WriteAllText($incCfg, $incText)
+    $threw = $false
+    try { Set-SshdKeyOnlyConfig -ConfigPath $incCfg -BackupDir (Join-Path (Split-Path $incCfg) 'bk') -Stamp 'I' -Validate { 0 } } catch { $threw = ($_.Exception.Message -match 'includes other files') }
+    Assert-That ($threw -and ([IO.File]::ReadAllText($incCfg) -ceq $incText)) 'A6 sshd: a config with an Include is refused and left unchanged'
+} else { Assert-That $false 'A6: Set-SshdKeyOnlyConfig is not defined' }
+
+# ---------------------------------------------------------------- A7: a pagefile maximum below the 8 GB initial size is refused at binding
+$pf1 = Invoke-Setup (New-Scratch 'home-pf1') @('-Phase', 'LeaseShow', '-PagefileMaxGB', '1', '-StateRoot', (New-Scratch 'state-pf1'), '-Workspace', (New-Scratch 'ws-pf1'))
+Assert-That ($pf1.Exit -ne 0 -and $pf1.Out -match 'PagefileMaxGB') 'A7 pagefile: -PagefileMaxGB 1 (below the 8 GB initial size) is refused at parameter binding' "exit=$($pf1.Exit)`n$($pf1.Out)"
+$pf8 = Invoke-Setup (New-Scratch 'home-pf8') @('-Phase', 'LeaseShow', '-PagefileMaxGB', '8', '-StateRoot', (New-Scratch 'state-pf8'), '-Workspace', (New-Scratch 'ws-pf8'))
+Assert-That ($pf8.Exit -eq 0) 'A7 pagefile: -PagefileMaxGB 8 is accepted' "exit=$($pf8.Exit)`n$($pf8.Out)"
+
+# ---------------------------------------------------------------- A8, A9: claim runDir and utc edge cases
+if ($fnLoaded) {
+    $edgeDir = Join-Path (New-Scratch 'fn-ws-edge') 'claims'
+    [void][IO.Directory]::CreateDirectory($edgeDir)
+    $oneH = [DateTime]::UtcNow.AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+    [IO.File]::WriteAllText((Join-Path $edgeDir 'drive-rel.claim'), '{"utc":"' + $oneH + '","runDir":"C:missing-run"}')
+    [IO.File]::WriteAllText((Join-Path $edgeDir 'root-rel.claim'), '{"utc":"' + $oneH + '","runDir":"\\missing-run"}')
+    [IO.File]::WriteAllText((Join-Path $edgeDir 'noz-old.claim'), '{"utc":"' + [DateTime]::UtcNow.AddHours(-25).ToString('yyyy-MM-ddTHH:mm:ss') + '","runDir":"' + ((Join-Path $ScratchRoot 'absent-edge') -replace '\\', '\\') + '"}')
+    [IO.File]::WriteAllText((Join-Path $edgeDir 'noz-new.claim'), '{"utc":"' + [DateTime]::UtcNow.AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ss') + '","runDir":"' + ((Join-Path $ScratchRoot 'absent-edge') -replace '\\', '\\') + '"}')
+    $mvE = @(Move-ForeignClaims -ClaimsDir $edgeDir -Stamp 'TE')
+    Assert-That ((Test-Path -LiteralPath (Join-Path $edgeDir 'drive-rel.claim')) -and (Test-Path -LiteralPath (Join-Path $edgeDir 'root-rel.claim'))) 'A8 claims: drive-relative (C:x) and root-relative (\x) runDirs are malformed and stay'
+    Assert-That ((Test-Path -LiteralPath (Join-Path $edgeDir 'noz-old.claim')) -and $mvE.Count -eq 1 -and $mvE[0] -ceq 'noz-new.claim') 'A9 claims: an offset-free utc is read as UTC (a 25 h old claim stays whatever the host zone; a 1 h old one is quarantined)' "moved=$($mvE -join ',')"
+}
+
+# ---------------------------------------------------------------- A10: Import never replaces a claim the host already has
+$home10 = New-Scratch 'home10'
+$ws10 = New-Scratch 'ws10'
+$liveRun10 = New-Scratch 'live-run10'
+$localClaims10 = Join-Path $ws10 'MLV-App\.claude-state\hub-autopilot\claims'
+[void][IO.Directory]::CreateDirectory($localClaims10)
+$localClaim = Join-Path $localClaims10 'CARD--sonnet--r1.claim'
+$localJson = '{"utc":"' + [DateTime]::UtcNow.AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ') + '","runDir":"' + ($liveRun10 -replace '\\', '\\') + '","card":"LOCAL"}'
+[IO.File]::WriteAllText($localClaim, $localJson)
+$bundle10 = New-Scratch 'bundle10'
+[IO.File]::WriteAllText((Join-Path $bundle10 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+[void][IO.Directory]::CreateDirectory((Join-Path $bundle10 'home-claude'))
+[IO.File]::WriteAllText((Join-Path $bundle10 'home-claude\settings.json'), '{}')
+$bc10 = Join-Path $bundle10 'project-claude-state\hub-autopilot\claims'
+[void][IO.Directory]::CreateDirectory($bc10)
+[IO.File]::WriteAllText((Join-Path $bc10 'CARD--sonnet--r1.claim'), '{"utc":"' + [DateTime]::UtcNow.AddMinutes(-1).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ') + '","runDir":"' + ((Join-Path $ScratchRoot 'absent-foreign10') -replace '\\', '\\') + '","card":"FOREIGN"}')
+$imp10 = Invoke-Setup $home10 @('-Phase', 'Import', '-StateRoot', (New-Scratch 'state10'), '-Workspace', $ws10, '-BundlePath', $bundle10, '-SourceHost', 'NOT-THIS-HOST')
+Assert-That ($imp10.Exit -eq 0 -and (Test-Path -LiteralPath $localClaim) -and ([IO.File]::ReadAllText($localClaim) -ceq $localJson)) 'A10 import: a same-named bundle claim never replaces a live local claim' "exit=$($imp10.Exit)`n$($imp10.Out)"
+
+# ---------------------------------------------------------------- A11: PAUSED stops the meter installs
+$wsP = New-MeterRepo 'ws-meter-paused' $okBody $okBody
+$stP = New-Scratch 'state-paused'
+[IO.File]::WriteAllText((Join-Path $stP 'PAUSED'), '')
+$mP = Invoke-Setup (New-Scratch 'home-paused') (@('-Phase', 'Verify', '-StateRoot', $stP, '-Workspace', $wsP, '-SourceHost', 'NOT-THIS-HOST') + $okPaths)
+Assert-That ($mP.Exit -eq 0 -and $mP.Out.Contains('METER_INSTALL_SKIPPED_PAUSED') -and -not (Test-Path -LiteralPath (Join-Path $wsP 'MLV-App\.claude-state\disk-hygiene\installed.marker'))) 'A11 meters: with PAUSED present no meter -Install runs' "exit=$($mP.Exit)`n$($mP.Out)"
+
+# ---------------------------------------------------------------- A12: LeaseAcquire -Force needs a non-blank reason
+$wsA12 = New-LeaseWorkspace 'ws-a12' 'SOME-OTHER-HOST'
+$a12 = Invoke-Setup (New-Scratch 'home-a12') @('-Phase', 'LeaseAcquire', '-Force', '-LeaseReason', '   ', '-StateRoot', (New-Scratch 'state-a12'), '-LockRoot', $lockRoot, '-Workspace', $wsA12)
+Assert-That ($a12.Exit -eq 3 -and (Get-LeaseHolder $wsA12) -ceq 'SOME-OTHER-HOST') 'A12 acquire: -Force with a blank -LeaseReason is refused (exit 3), lease unchanged' "exit=$($a12.Exit)`n$($a12.Out)"
+
+# ---------------------------------------------------------------- A15: a secret VALUE under a secret-looking NAME is caught
+if ($fnLoaded -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyContinue)) {
+    $awsStage = New-Scratch 'scan-stage-aws'
+    [IO.File]::WriteAllText((Join-Path $awsStage 'settings.json'), '{"env":{"AWS_SECRET_ACCESS_KEY":"' + ('A' * 40) + '"}}')
+    [IO.File]::WriteAllText((Join-Path $awsStage 'benign.json'), '{"env":{"FOO":"bar","MODEL":"claude"}}')
+    $res = Invoke-StagedSecretScan -Stage $awsStage
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $awsStage 'settings.json')) -and (Test-Path -LiteralPath (Join-Path $awsStage 'benign.json'))) 'A15 scan: an AWS secret access key under its name is removed; ordinary settings stay' "removed=$($res.Removed -join ',')"
+} else { Assert-That $false 'A15: Invoke-StagedSecretScan is not defined' }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"

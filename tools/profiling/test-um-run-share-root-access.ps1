@@ -144,6 +144,17 @@ Assert-That ($s -ceq 'STOP|SHARE_UNREACHABLE|x|') 'A13 nightly: an unreachable (
 $TestShareRootProbe = $denied
 try { [void](Read-Share 'cache\build.json' { } @()) } catch { $s = [string]$_.Exception.Message }
 Assert-That ($s.StartsWith('STOP|SHARE_UNREACHABLE|reading cache\build.json failed') -and $s.EndsWith("|SHARE_ACCESS_DENIED $fakeRoot")) 'A13 nightly: Read-Share (a by-name read on a denied share) prints the typed line too' "got: $s"
+# A16 (pass 2): the production probe is bounded by what is left of -MaxTotalSec, not only by -ProbeTimeoutSec, and still prints the typed line.
+$TestShareRootProbe = $null
+$shareRootModule = Join-Path $here 'ShareRootAccess.psm1'
+$ProbeTimeoutSec = 300
+function Get-RemainingSec { 3 }
+$script:SecSeen = -1
+function Invoke-Bounded { param($Script, $ArgList, $Sec) $script:SecSeen = $Sec; [pscustomobject]@{ ok = $true; timedOut = $false; value = 'ACCESS_DENIED'; error = $null } }
+$s = ''
+try { Stop-ShareUnreachable 'the agent share cache did not answer' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($script:SecSeen -eq 3) 'A16 nightly: the root probe is bounded by the 3 s left of the total cap, not the 300 s -ProbeTimeoutSec' "seen=$($script:SecSeen)"
+Assert-That ($s.EndsWith("|SHARE_ACCESS_DENIED $fakeRoot")) 'A16 nightly: the bounded production path still prints the typed line' "got: $s"
 $nightlyText = [IO.File]::ReadAllText($nightly)
 Assert-That (-not ($nightlyText -match "Stop-Nightly 'SHARE_UNREACHABLE' `"the agent share cache")) 'A13 nightly: the cache-directory probe no longer calls Stop-Nightly SHARE_UNREACHABLE directly'
 

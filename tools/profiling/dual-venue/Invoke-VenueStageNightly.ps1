@@ -233,7 +233,9 @@ function Stop-ShareUnreachable([string]$Detail) {
     try {
         if ($TestShareRootProbe) { $state = [string](Get-ShareRootAccess -Root $share -Probe $TestShareRootProbe).State }
         else {
-            $rb = Invoke-Bounded { param($mod, $r) Import-Module -Name $mod -Force -DisableNameChecking; (Get-ShareRootAccess -Root $r).State } @($shareRootModule, $share) $ProbeTimeoutSec
+            # Bounded by what is LEFT of the total cap as well as by -ProbeTimeoutSec (adversary pass 2, A16): this probe runs after the cap may have nearly passed.
+            $rbSec = [Math]::Max(1, [Math]::Min([int]$ProbeTimeoutSec, [int](Get-RemainingSec)))
+            $rb = Invoke-Bounded { param($mod, $r) Import-Module -Name $mod -Force -DisableNameChecking; (Get-ShareRootAccess -Root $r).State } @($shareRootModule, $share) $rbSec
             if ($rb.ok) { $state = [string]$rb.value }
         }
     } catch { $state = '' }

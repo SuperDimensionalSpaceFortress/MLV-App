@@ -46,7 +46,9 @@ param(
     [string]$CodexPinVersion = '0.160.1',
     # Capped at 16 TB (the Windows per-file limit): the MB value (GB * 1024) must fit the uint32 the pagefile setting takes, or the step would
     # fail AFTER it had turned automatic pagefile management off (adversary A10).
-    [ValidateRange(0, 16384)][int]$PagefileMaxGB = 0,
+    # 0 = leave as is; otherwise 8..16384. The initial size is 8192 MB, so a maximum below 8 GB is an invalid initial/maximum pair that would be rejected AFTER
+    # automatic management was switched off (adversary pass 2, A7); the upper bound keeps the MB value inside uint32.
+    [ValidateScript({ if ($_ -eq 0 -or ($_ -ge 8 -and $_ -le 16384)) { $true } else { throw "PagefileMaxGB must be 0 (leave as is) or between 8 and 16384, got $_" } })][int]$PagefileMaxGB = 0,
     [switch]$NoPowerChanges,
     [switch]$NoDefenderExclusions,
     [switch]$ReplaceTasks,
@@ -62,6 +64,9 @@ param(
     [switch]$Force,
     # Where this script keeps its logs, backups and the gate copy. Overridable so tests stay in a scratch folder.
     [string]$StateRoot = 'C:\ProgramData\MlvWorkstation',
+    # Where the gate/lease-release exclusion lock lives. A machine-wide place that does NOT follow -StateRoot, so two runs with different state roots
+    # still exclude each other (adversary pass 2, A2). Tests point it at a scratch folder.
+    [string]$LockRoot = 'C:\ProgramData\MlvWorkstation-locks',
     # The two venue heartbeat files -Phase Verify must be able to read (fail closed otherwise, README step 6b).
     # Overridable so tests can point them at scratch files; production never passes these.
     [string]$UltraMagnusHeartbeatPath = '\\Ultra-Magnus\g\Temp\mlv-gpu-profile\agent\heartbeat.txt',
@@ -140,7 +145,9 @@ $TaskSpecs = @(
 $script:Cmdlet = $PSCmdlet
 $script:Failures = [System.Collections.Generic.List[string]]::new()
 $script:Manual = [System.Collections.Generic.List[string]]::new()
-$stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+# The process id makes the stamp unique between two runs in the same second (they would share a stage folder, a ZIP name, lease temp files and backups;
+# adversary pass 2, A5).
+$stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + "-$PID"
 $logDir = Join-Path $StateRoot 'logs'
 try { [void][IO.Directory]::CreateDirectory($logDir) } catch { $logDir = Join-Path $env:TEMP 'MlvWorkstation-logs'; [void][IO.Directory]::CreateDirectory($logDir) }
 $isGate = ($Phase -contains 'Gate')
@@ -436,6 +443,10 @@ function Set-SshdOption {
 function Set-SshdKeyOnlyConfig {
     param([string]$ConfigPath, [string]$BackupDir, [string]$Stamp, [scriptblock]$Validate = $null)
     [string[]]$lines = @(Get-Content -LiteralPath $ConfigPath)
+    # An Include pulls in files this function does not read (a global PasswordAuthentication yes placed there, or a Match rule, still wins; adversary pass 2,
+    # A6), so a config that includes anything is refused rather than judged by its main file alone.
+    $inc = [Array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match '^\s*Include(\s|=)' })
+    if ($inc -ge 0) { throw "sshd_config line $($inc + 1) ('$($lines[$inc].Trim())') includes other files, which this script does not inspect; inline them by hand and re-run -Phase Ssh. Nothing was changed." }
     $firstMatch = [Array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match '^\s*Match\s' })
     if ($firstMatch -ge 0) {
         for ($i = $firstMatch; $i -lt $lines.Count; $i++) {
@@ -612,7 +623,9 @@ function Invoke-PhaseQt {
 $SecretPatterns = @(
     'sk-ant-[A-Za-z0-9_\-]{20,}', 'sk-proj-[A-Za-z0-9_\-]{20,}', 'sk-[A-Za-z0-9]{40,}',
     'gh[pousr]_[A-Za-z0-9]{30,}', 'github_pat_[A-Za-z0-9_]{30,}', 'xox[abprs]-[A-Za-z0-9\-]{10,}',
-    '-----BEGIN [A-Z ]*PRIVATE KEY-----', '"(access|refresh|id)_?[Tt]oken"\s*:\s*"[^"]{16,}"', 'AKIA[0-9A-Z]{16}'
+    '-----BEGIN [A-Z ]*PRIVATE KEY-----', '"(access|refresh|id)_?[Tt]oken"\s*:\s*"[^"]{16,}"', 'AKIA[0-9A-Z]{16}',
+    # A secret VALUE under a name that says what it is (adversary pass 2, A15): an AWS secret access key has no recognisable shape of its own.
+    '(?i)"?[A-Z0-9_]*(SECRET|PASSWORD|PASSWD|PRIVATE_?KEY)[A-Z0-9_]*"?\s*[:=]\s*"[^"\s]{16,}"'
 )
 $ExcludeFiles = @('*.log', '*.err', '*.bak*', '*.tmp', '*.lock', '*.pid', '*.sqlite*', '*.jsonl', '.credentials.json', '.claude.json',
     'auth.json', '*.pem', '*.pfx', '*.p12', '*.key', '*.ppk', 'id_rsa*', 'id_ed25519*', '*_id', '*_id.pub', '*.kdbx', '.env', '*.env',
@@ -631,7 +644,8 @@ function Invoke-StagedSecretScan {
     $rx = [regex]::new(($SecretPatterns -join '|'))
     $removed = [System.Collections.Generic.List[string]]::new()
     $uncleared = [System.Collections.Generic.List[string]]::new()
-    foreach ($f in @(Get-ChildItem -LiteralPath $Stage -Recurse -File)) {
+    # -Force: robocopy copies Hidden and System files, and Get-ChildItem hides them by default (adversary pass 2, A3).
+    foreach ($f in @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)) {
         $rel = $f.FullName.Substring($Stage.Length).TrimStart('\')
         $why = ''
         if ($f.Length -gt $MaxScanBytes) { $why = 'larger than the scan limit' }
@@ -645,6 +659,24 @@ function Invoke-StagedSecretScan {
         catch { $uncleared.Add("$rel ($why; could not be removed)") }
     }
     return @{ Removed = $removed.ToArray(); Uncleared = $uncleared.ToArray() }
+}
+
+# Scan + report, returning $true only when every staged file is clean or was removed. Fail closed (adversary pass 2, A4): any throw, an uncleared file,
+# or a report that cannot be written reads as NOT clean, so the caller never goes on to zip a stage that still holds a credential.
+function Test-StagedBundleClean {
+    param([string]$Stage)
+    try {
+        $res = Invoke-StagedSecretScan -Stage $Stage
+        $clean = ($res.Uncleared.Count -eq 0)
+        try { Write-AsciiFile (Join-Path $Stage 'SECRET-SCAN.txt') ("removed $($res.Removed.Count) file(s) that matched a credential pattern or could not be scanned:`r`n" + ($res.Removed -join "`r`n") + "`r`n") }
+        catch { Write-Log "could not write SECRET-SCAN.txt: $($_.Exception.Message)" 'WARN' }
+        Write-Log "secret scan removed $($res.Removed.Count) file(s) (see SECRET-SCAN.txt; review before transfer)" $(if ($res.Removed.Count) { 'WARN' } else { 'OK' })
+        if (-not $clean) { Write-Log "secret scan could not clear $($res.Uncleared.Count) file(s): $($res.Uncleared -join '; ')" 'ERROR' }
+        return $clean
+    } catch {
+        Write-Log "secret scan failed: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
 }
 
 function Invoke-PhaseExport {
@@ -718,17 +750,16 @@ function Invoke-PhaseExport {
         Write-AsciiFile (Join-Path $ref 'unpushed-worktree-branches.tsv') (($rows -join "`r`n") + "`r`n")
         Write-Log "unpushed or diverged worktree branches: $($rows.Count - 1) (reference\unpushed-worktree-branches.tsv)" $(if ($rows.Count -gt 1) { 'WARN' } else { 'OK' })
     }
-    $script:ScanFailed = $false
+    # Fail closed: the flag starts TRUE and only a scan that returns clean clears it, so a throw anywhere in the step can never reach the zip.
+    $script:ScanFailed = $true
     Invoke-Step 'Secret scan: drop any staged file that looks like it holds a credential (or cannot be scanned)' {
-        $res = Invoke-StagedSecretScan -Stage $stage
-        Write-AsciiFile (Join-Path $stage 'SECRET-SCAN.txt') ("removed $($res.Removed.Count) file(s) that matched a credential pattern or could not be scanned:`r`n" + ($res.Removed -join "`r`n") + "`r`n")
-        Write-Log "secret scan removed $($res.Removed.Count) file(s) (see SECRET-SCAN.txt; review before transfer)" $(if ($res.Removed.Count) { 'WARN' } else { 'OK' })
-        if ($res.Uncleared.Count) { $script:ScanFailed = $true; throw "secret scan could not clear $($res.Uncleared.Count) file(s), so no bundle is written: $($res.Uncleared -join '; ')" }
+        $script:ScanFailed = -not (Test-StagedBundleClean -Stage $stage)
+        if ($script:ScanFailed) { throw 'secret scan could not clear every staged file, so no bundle is written' }
     }
     $zip = Join-Path $ExportDir "mlv-migrate-bundle-$stamp.zip"
-    if ($script:ScanFailed) { Write-Log 'bundle NOT written: the secret scan could not clear every staged file (fail closed)' 'ERROR'; return }
+    if ($script:ScanFailed -and -not $WhatIfPreference) { Write-Log 'bundle NOT written: the secret scan could not clear every staged file (fail closed)' 'ERROR'; return }
     Invoke-Step "Write MANIFEST.txt and zip to $zip" {
-        $files = Get-ChildItem -LiteralPath $stage -Recurse -File
+        $files = Get-ChildItem -LiteralPath $stage -Recurse -File -Force
         $sum = ($files | Measure-Object Length -Sum).Sum
         Write-AsciiFile (Join-Path $stage 'MANIFEST.txt') ("mlv-migrate-bundle v1`r`nsource=$env:COMPUTERNAME user=$env:USERNAME profile=$env:USERPROFILE created=$stamp`r`nfiles=$($files.Count) bytes=$sum`r`n")
         $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
@@ -754,16 +785,19 @@ function Move-ForeignClaims {
     if (-not (Test-Path -LiteralPath $ClaimsDir -PathType Container)) { Write-Log "no claims folder at $ClaimsDir (nothing to quarantine)"; return }
     $dest = Join-Path $ClaimsDir "migrated-foreign-$Stamp"
     $keptMalformed = 0
-    foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.claim' -File)) {
+    foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.claim' -File -Force)) {
         $o = $null
         try { $o = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json -ErrorAction Stop } catch { $o = $null }
         $pRun = if ($o -is [pscustomobject]) { $o.PSObject.Properties['runDir'] } else { $null }
         $pUtc = if ($o -is [pscustomobject]) { $o.PSObject.Properties['utc'] } else { $null }
         # Malformed = no runDir/utc, a runDir that is not a string (an object would stringify to a path that never exists, adversary A11) or is
-        # not an absolute path (a relative one would be judged against this process's working directory).
-        if (-not $pRun -or -not $pUtc -or $pRun.Value -isnot [string] -or -not "$($pRun.Value)".Trim() -or -not [IO.Path]::IsPathRooted("$($pRun.Value)")) { $keptMalformed++; continue }
+        # not a FULLY QUALIFIED path (a relative one, and the drive-relative C:x and root-relative \x forms that IsPathRooted accepts, would be judged against
+        # this process's working directory; adversary pass 2, A8).
+        if (-not $pRun -or -not $pUtc -or $pRun.Value -isnot [string] -or -not "$($pRun.Value)".Trim() -or -not [IO.Path]::IsPathFullyQualified("$($pRun.Value)")) { $keptMalformed++; continue }
         $when = $null
-        if ($pUtc.Value -is [datetime]) { $when = ([datetime]$pUtc.Value).ToUniversalTime() }
+        # ConvertFrom-Json turns a UTC string into a DateTime; an offset-free one comes back Kind=Unspecified, which ToUniversalTime() would shift by the host's
+        # zone offset. The claim writer's utc is UTC by contract, so Unspecified is read as UTC (adversary pass 2, A9).
+        if ($pUtc.Value -is [datetime]) { $dtv = [datetime]$pUtc.Value; $when = $(if ($dtv.Kind -eq [DateTimeKind]::Unspecified) { [DateTime]::SpecifyKind($dtv, [DateTimeKind]::Utc) } else { $dtv.ToUniversalTime() }) }
         else {
             $dto = [DateTimeOffset]::MinValue
             if ([DateTimeOffset]::TryParse("$($pUtc.Value)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) { $when = $dto.UtcDateTime }
@@ -811,7 +845,11 @@ function Invoke-PhaseImport {
         Invoke-Robocopy "$src\home-bin" "$h\bin" @() (@('/E') + $inX)
         Invoke-Robocopy "$src\home-codex" "$h\.codex" @() (@('/E') + $inX)
         Invoke-Robocopy "$src\programdata-fleetdefender" 'C:\ProgramData\FleetDefender' @() (@('/E') + $inX)
-        Invoke-Robocopy "$src\project-claude-state" "$Repo\.claude-state" @() (@('/E') + $inX)
+        # The claims folder is copied on its own below, never overwriting a claim this host already has (adversary pass 2, A10): a live local claim
+        # replaced by a foreign one of the same name would be quarantined for its absent run dir and the running card would lose its claim.
+        $claimsSrc = "$src\project-claude-state\hub-autopilot\claims"
+        Invoke-Robocopy "$src\project-claude-state" "$Repo\.claude-state" @() (@('/E', '/XD', $claimsSrc) + $inX)
+        Invoke-Robocopy $claimsSrc "$Repo\.claude-state\hub-autopilot\claims" @() (@('/E', '/XC', '/XN', '/XO') + $inX)
         # MINI3-CUTOVER-STATE-GAPS-1 (b): /XO so a fold marker this host already advanced is never overwritten by the older bundle copy.
         Invoke-Robocopy "$src\project-codex-state\doctrine" "$Repo\.codex-state\doctrine" @() (@('/E', '/XO') + $inX)
         Invoke-Robocopy "$src\reference" "$StateRoot\reference" @() (@('/E') + $inX)
@@ -840,7 +878,7 @@ function Invoke-PhaseImport {
 function Get-GateTaskArgument {
     param([string]$Pwsh, [string]$Self, [hashtable]$Spec)
     $arg = "--headless `"$Pwsh`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Self`" -Phase Gate -GateMode $($Spec.Mode) -GateScript `"$($Spec.Script)`""
-    foreach ($k in 'StateRoot', 'Workspace', 'MlvTmp') {
+    foreach ($k in 'StateRoot', 'Workspace', 'MlvTmp', 'LockRoot') {
         if ($script:SetupBound.ContainsKey($k)) { $arg += " -$k `"$(Get-Variable -Name $k -ValueOnly)`"" }
     }
     if ($Spec.ArgLine) { $arg += " -GateArgLine `"$($Spec.ArgLine)`"" }
@@ -883,14 +921,15 @@ function Invoke-PhaseGate {
     if (-not $GateScript -or -not (Test-Path -LiteralPath $GateScript)) { Write-Log "$tag skipped: target missing ($GateScript)" 'WARN'; exit 0 }
     # -WhatIf is a dry run: the target is never invoked (adversary A9).
     if ($WhatIfPreference) { Write-Log "SKIP (WhatIf) $tag would run $GateScript"; exit 0 }
-    # One-host-active (adversary A8): while a Lease-gated target runs, this host holds a lock file that -Phase LeaseRelease refuses to pass, so the
-    # lease cannot be handed to another host under a running target. The lock is taken BEFORE the lease is read, so a release cannot slip in between
-    # the holder check and the launch. DeleteOnClose: a crashed run leaves no stale lock.
+    # One-host-active (adversary A8, pass 2 A1/A2): a Lease-gated run holds the gate lock SHARED for its whole life; -Phase LeaseRelease on the holder
+    # takes it EXCLUSIVE around its check AND its push. File sharing makes the two mutually exclusive with nothing in between: a release cannot slip in
+    # between a gate's lease read and its launch, and a gate cannot start while a release is in flight (it skips). The lock lives under -LockRoot, a fixed
+    # machine-wide folder that does not follow -StateRoot. A crashed run leaves nothing: the OS drops the handle.
     $lock = $null
     try {
         if ($GateMode -eq 'Lease') {
-            [void][IO.Directory]::CreateDirectory($StateRoot)
-            $lock = [IO.FileStream]::new((Join-Path $StateRoot ('gate-active-' + [guid]::NewGuid().ToString('N') + '.lock')), [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
+            $lock = Open-GateLock -Root $LockRoot -Mode Shared
+            if (-not $lock) { Write-Log "$tag skipped: a lease release is in progress on this host (gate lock busy)" 'WARN'; exit 0 }
             $l = Get-HubLease
             if ($l.Error) { Write-Log "$tag skipped: lease unreadable, failing closed ($($l.Error))" 'WARN'; exit 0 }
             if ($l.Holder -ine $env:COMPUTERNAME) { Write-Log "$tag skipped: lease holder is '$($l.Holder)', not $env:COMPUTERNAME"; exit 0 }
@@ -911,16 +950,17 @@ function Invoke-PhaseGate {
     exit $rc
 }
 
-# True while any Lease-gated Gate run on this host is inside its target (see Invoke-PhaseGate). A lock file nobody holds open is stale and is removed.
-function Test-GateRunActive {
-    param([string]$Root)
-    $active = $false
-    foreach ($f in @(Get-ChildItem -LiteralPath $Root -Filter 'gate-active-*.lock' -File -ErrorAction SilentlyContinue)) {
-        try { [IO.FileStream]::new($f.FullName, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose).Dispose() }
-        catch [System.IO.IOException] { $active = $true }
-        catch { }
-    }
-    return $active
+# The gate lock (see Invoke-PhaseGate). Shared = a Lease-gated run is inside its target; Exclusive = a lease release is in flight. Returns the open
+# FileStream (the caller disposes it) or $null when the other kind holds it. Any error other than a sharing violation is thrown, not read as "free".
+function Open-GateLock {
+    param([string]$Root, [ValidateSet('Shared', 'Exclusive')][string]$Mode)
+    [void][IO.Directory]::CreateDirectory($Root)
+    $p = Join-Path $Root 'gate.lock'
+    if (-not (Test-Path -LiteralPath $p)) { try { [IO.File]::WriteAllText($p, '') } catch { } }
+    try {
+        if ($Mode -eq 'Shared') { return [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) }
+        return [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [System.IO.IOException] { return $null }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -965,6 +1005,9 @@ function Get-MeterInstallSpecs {
 
 function Invoke-MeterInstalls {
     if ($env:COMPUTERNAME -ieq $SourceHost -and -not $Force) { Write-Log "meter -Install skipped: $SourceHost is the source host (its tasks are live; pass -Force to run it there)"; return }
+    # Those -Install scripts register their task ENABLED and not behind this script's gate (they are board-root scripts, outside this PR), so the PAUSED kill
+    # switch is the only control: while it is present nothing is installed (adversary pass 2, A11).
+    if (Test-Path -LiteralPath (Join-Path $StateRoot 'PAUSED')) { Write-Log "METER_INSTALL_SKIPPED_PAUSED the PAUSED kill switch is present in $StateRoot; delete it and re-run -Phase Verify to install the meters" 'WARN'; return }
     $pwsh = Get-PwshPath
     foreach ($m in (Get-MeterInstallSpecs)) {
         if (-not (Test-Path -LiteralPath $m.Script -PathType Leaf)) { Write-Log "meter -Install skipped: $($m.Name) script absent ($($m.Script)); run -Phase Import first" 'WARN'; continue }
@@ -1102,17 +1145,22 @@ foreach ($p in $run) {
             if ($cur.Holder -and -not $Force) {
                 Write-Log "held by $($cur.Holder). Release it there first (-Phase LeaseRelease on $($cur.Holder)), or pass -Force -LeaseReason '<why>' if that host is gone." 'ERROR'; exit 3
             }
-            if ($cur.Holder -and -not $LeaseReason) { Write-Log '-Force needs -LeaseReason' 'ERROR'; exit 3 }
+            if ($cur.Holder -and -not "$LeaseReason".Trim()) { Write-Log '-Force needs a non-blank -LeaseReason' 'ERROR'; exit 3 }
             Invoke-Step "Acquire hub lease for $env:COMPUTERNAME" { Set-HubLease -Holder $env:COMPUTERNAME -Current $cur -Reason $(if ($LeaseReason) { $LeaseReason } else { 'acquire' }) }
         }
         'LeaseRelease' {
-            $cur = Show-HubLease
-            if ($cur.Error) { Write-Log 'cannot read the lease' 'ERROR'; exit 2 }
-            if (-not $cur.Holder) { Write-Log 'already released' 'OK'; break }
-            if ($cur.Holder -ine $env:COMPUTERNAME -and -not $Force) { Write-Log "held by $($cur.Holder), not this host; pass -Force -LeaseReason to override" 'ERROR'; exit 3 }
-            if ($cur.Holder -ine $env:COMPUTERNAME -and -not $LeaseReason.Trim()) { Write-Log '-Force needs -LeaseReason (releasing another host''s lease)' 'ERROR'; exit 3 }
-            if ($cur.Holder -ieq $env:COMPUTERNAME -and (Test-GateRunActive -Root $StateRoot)) { Write-Log 'a Lease-gated task is running on this host; releasing now would hand the lease over under it. Wait for it to end, or create the PAUSED file first and re-run.' 'ERROR'; exit 4 }
-            Invoke-Step "Release hub lease (was $($cur.Holder))" { Set-HubLease -Holder '' -Current $cur -Reason $(if ($LeaseReason) { $LeaseReason } else { 'release' }) }
+            # The gate lock is held EXCLUSIVE across the holder check and the push (adversary pass 2, A1/A2): no Lease-gated run can be mid-flight, or
+            # start, until the lease has moved. Busy = a Lease-gated task is inside its target on this host.
+            $xlock = Open-GateLock -Root $LockRoot -Mode Exclusive
+            if (-not $xlock) { Write-Log 'a Lease-gated task is running on this host (gate lock busy); releasing now would hand the lease over under it. Wait for it to end, then re-run.' 'ERROR'; exit 4 }
+            try {
+                $cur = Show-HubLease
+                if ($cur.Error) { Write-Log 'cannot read the lease' 'ERROR'; exit 2 }
+                if (-not $cur.Holder) { Write-Log 'already released' 'OK'; break }
+                if ($cur.Holder -ine $env:COMPUTERNAME -and -not $Force) { Write-Log "held by $($cur.Holder), not this host; pass -Force -LeaseReason to override" 'ERROR'; exit 3 }
+                if ($cur.Holder -ine $env:COMPUTERNAME -and -not "$LeaseReason".Trim()) { Write-Log '-Force needs a non-blank -LeaseReason (releasing another host''s lease)' 'ERROR'; exit 3 }
+                Invoke-Step "Release hub lease (was $($cur.Holder))" { Set-HubLease -Holder '' -Current $cur -Reason $(if ($LeaseReason) { $LeaseReason } else { 'release' }) }
+            } finally { $xlock.Dispose() }
         }
     }
 }
