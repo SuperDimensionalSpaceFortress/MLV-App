@@ -172,9 +172,10 @@ _allow("Enter-AttrCudaStageLock",
        "WriteAllText only for test-only -WaitMarkerPath",
        ("R4", "Threading.Mutex::new", 1), ("R4", "IO.File::WriteAllText", 1), ("R1", "Write-Host", 1))
 _allow("Enter-AttrCudaStageLock",
-       "r14 A2: defines StageRootNative; opens the root read-attributes only to ask its final path by volume GUID and that volume's drive type; nothing written",
-       ("R1", "Add-Type", 1), ("R4", "AttrCudaWin32.StageRootNative::CreateFileW", 1), ("R4", "Text.StringBuilder::new", 1),
-       ("R4", "AttrCudaWin32.StageRootNative::GetFinalPathNameByHandleW", 1), ("R4", "AttrCudaWin32.StageRootNative::GetDriveTypeW", 1))
+       "r14 A2/r16 A1: opens the root ONCE (list+read-attributes, no share-delete, kept open); reads its id, GUID and drive-letter final paths and drive type; nothing written",
+       ("R1", "Add-Type", 1), ("R4", "AttrCudaWin32.StageRootNative::CreateFileW", 1), ("R4", "Text.StringBuilder::new", 2),
+       ("R4", "AttrCudaWin32.StageRootNative::GetFinalPathNameByHandleW", 2), ("R4", "AttrCudaWin32.StageRootNative::GetDriveTypeW", 1),
+       ("R4", "AttrCudaWin32.FileIdNative+FileIdInfo::new", 1), ("R4", "AttrCudaWin32.FileIdNative::GetFileInformationByHandle", 1))
 _allow("Wait-AttrCudaTestHold",
        "test-only seam: writes '<Path>.reached' only when a test passed -Path; production passes none and the body returns before it",
        ("R4", "IO.File::WriteAllText", 1))

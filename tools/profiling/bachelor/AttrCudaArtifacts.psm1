@@ -476,7 +476,7 @@ function Enter-AttrCudaStageLock {
     one root, each with its own -MutexName and both admitted, both passed the stage job's
     absent-manifest guard; B published, then A replaced B's artifacts, deleted B's sound manifest and
     failed. The lock is named for the PHYSICAL identity of the agent root (volume serial and file
-    index, read with Get-AttrCudaFileId -FollowLinks, so C:\ProgramData\MlvAgent and an alias of it
+    index, read off the root's one open handle with links followed, so C:\ProgramData\MlvAgent and an alias of it
     through a junction are one root) and the sha -- never a caller-chosen name or a lexical path:
     Global\MlvAttrCudaStage-<sha256 of "vol=<serial>;idx=<high>-<low>|<sha12, lower>">. Every stager of
     that sha -- r9: of any sha with the same 12-hex cache-name prefix -- into that root's cache, in any
@@ -497,6 +497,12 @@ function Enter-AttrCudaStageLock {
     The check reads the root's FINAL path by volume GUID name: only a volume mounted on this host
     has one, and its drive type must be FIXED. -TestRootVolumeType is a test-only seam; production
     passes none.
+    r16 (r14 OPEN A1): the root is opened ONCE (no FILE_SHARE_DELETE, links followed); the identity,
+    the volume check and the final path all come from that handle, which is returned as rootHandle
+    for the caller to keep open beside the mutex. root is the drive-letter final path: the caller
+    rebuilds every path on it right after the lock, so a junction retargeted later moves nothing.
+    r16 (Grok G23): a root that cannot be opened says "NoLocalVolume (open failed, win32 <n>)", one
+    with no volume GUID path "NoLocalVolume (no volume GUID path, win32 <n>)".
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -507,42 +513,64 @@ function Enter-AttrCudaStageLock {
         [string]$TestRootVolumeType = ''
     )
 
-    $id = Get-AttrCudaFileId -Path $Root -FollowLinks
     # r14 (adversary A2 on 5fe750fa, siblings stage job :69/:376/:515 and Publish-AttrCudaFileMove :2872): host B with Z: mapped to host A's share and host A on
     # its local path both took "the" lock -- two host-local mutexes -- and both passed the absent-manifest guard; A then cleared B's published artifact. So the root
     # is refused, before any lock, unless its FINAL volume (links followed: a link on C: into \\host\share lands on the share) is a local fixed volume of this host.
     # r14 fix iteration 1 (adversary A2 + A3 on f7408e9f): never by volume serial (two hosts' volumes can share one, and a volume mounted only in a folder has no drive
     # letter to enumerate). The root is opened (links followed) and its FINAL path asked for by VOLUME GUID name (GetFinalPathNameByHandleW, VOLUME_NAME_GUID): only a
     # volume mounted on THIS host has one -- a handle on a share has none and the call fails -- and that volume's own drive type must be FIXED (GetDriveTypeW).
-    $volumeType = $TestRootVolumeType
-    if (-not $volumeType) {
-        if (-not ('AttrCudaWin32.StageRootNative' -as [type])) {
-            Add-Type -Namespace AttrCudaWin32 -Name StageRootNative -MemberDefinition (@(
-                    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);',
-                    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle h, System.Text.StringBuilder p, uint n, uint f);',
-                    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetDriveTypeW(string r);') -join "`n")
+    # r16 (r14 OPEN A1, adversary on 6882c873; siblings stage job :376/:515/:527, Publish-AttrCudaFileMove, Assert-AttrCudaWritableFileSlot): the identity, the volume
+    # check and the job's later file operations each resolved the root's path again, so a junction retargeted between them made the lock name one physical root while
+    # the job wrote another. The root is now opened ONCE: FILE_READ_ATTRIBUTES, share READ|WRITE but never DELETE (so neither the root nor any ancestor of it can be
+    # renamed while the handle is open, and a junction can only be set on an empty directory), FILE_FLAG_BACKUP_SEMANTICS, links followed. The identity, the volume
+    # GUID final path and the drive-letter final path are all read from THAT handle, and the handle is returned (rootHandle) for the caller to keep open beside the
+    # mutex for the life of the process. .root is the drive-letter final path: the caller rebuilds every path on it right after the lock.
+    # r16 (Grok G23 on #814): the Win32 error of a failed open or a failed GUID-path read is captured at once and named, so a local root this job cannot open (an ACL,
+    # a sharing or AV hold) is never reported like a share. The refusal is the same.
+    if (-not ('AttrCudaWin32.StageRootNative' -as [type])) {
+        Add-Type -Namespace AttrCudaWin32 -Name StageRootNative -MemberDefinition (@(
+                '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);',
+                '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle h, System.Text.StringBuilder p, uint n, uint f);',
+                '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetDriveTypeW(string r);') -join "`n")
+    }
+    Initialize-AttrCudaFileIdNative
+    # r14 fix iteration 2 (adversary A2 on 6882c873): CreateFileW refuses a path of 260+ characters without the extended-length prefix (where the Win32 long-path
+    # opt-in is off), so a long LOCAL root read as NoLocalVolume. The prefix is added as Get-AttrCudaFileId adds it (from 240 characters); the lexical path is never normalized here.
+    $nativeRoot = $Root
+    if ($nativeRoot.Length -ge 240 -and -not $nativeRoot.StartsWith('\\?\')) {
+        $nativeRoot = $(if ($nativeRoot.StartsWith('\\')) { '\\?\UNC\' + $nativeRoot.Substring(2) } else { '\\?\' + $nativeRoot })
+    }
+    # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES (0x81): FILE_READ_ATTRIBUTES alone is exempt from share-mode accounting, so a handle with only it pins nothing --
+    # measured: the root renamed under such a handle. With FILE_LIST_DIRECTORY the missing FILE_SHARE_DELETE refuses every later DELETE open (a rename) of the root.
+    $rootHandle = [AttrCudaWin32.StageRootNative]::CreateFileW($nativeRoot, [uint32]0x81, [uint32]3, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
+    $openError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $keepHandle = $false
+    try {
+        if ($rootHandle.IsInvalid) { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume (open failed, win32 $openError), not a local fixed volume of this host: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
+        $info = [AttrCudaWin32.FileIdNative+FileIdInfo]::new()
+        if (-not [AttrCudaWin32.FileIdNative]::GetFileInformationByHandle($rootHandle.DangerousGetHandle(), [ref]$info)) {
+            throw "ATTRCUDA_FILE_ID_UNAVAILABLE GetFileInformationByHandle failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
         }
-        # FILE_READ_ATTRIBUTES, share all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory; reparse points followed, as -FollowLinks above)
-        # r14 fix iteration 2 (adversary A2 on 6882c873): CreateFileW refuses a path of 260+ characters without the extended-length prefix (where the Win32 long-path
-        # opt-in is off), so a long LOCAL root read as NoLocalVolume. The prefix is added as Get-AttrCudaFileId adds it (from 240 characters); the lexical path is never normalized here.
-        $nativeRoot = $Root
-        if ($nativeRoot.Length -ge 240 -and -not $nativeRoot.StartsWith('\\?\')) {
-            $nativeRoot = $(if ($nativeRoot.StartsWith('\\')) { '\\?\UNC\' + $nativeRoot.Substring(2) } else { '\\?\' + $nativeRoot })
-        }
-        $handle = [AttrCudaWin32.StageRootNative]::CreateFileW($nativeRoot, [uint32]0x80, [uint32]7, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
-        try {
-            $final = ''
-            if (-not $handle.IsInvalid) {
-                $buffer = [Text.StringBuilder]::new(32768)
-                $n = [AttrCudaWin32.StageRootNative]::GetFinalPathNameByHandleW($handle, $buffer, [uint32]32768, [uint32]1)
-                if ($n -gt 0 -and $n -lt 32768) { $final = $buffer.ToString() }
-            }
-        } finally { $handle.Dispose() }
+        $id = ConvertTo-AttrCudaFileIdObject -Info $info
+        $buffer = [Text.StringBuilder]::new(32768)
+        # VOLUME_NAME_GUID (1)
+        $n = [AttrCudaWin32.StageRootNative]::GetFinalPathNameByHandleW($rootHandle, $buffer, [uint32]32768, [uint32]1)
+        $guidError = $(if ($n -ge 32768) { 122 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() })
+        $final = $(if ($n -gt 0 -and $n -lt 32768) { $buffer.ToString() } else { '' })
         $volumeType = $(if ($final -match '^\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\') {
                 switch ([AttrCudaWin32.StageRootNative]::GetDriveTypeW($Matches[0])) { 3 { 'Fixed' } 2 { 'Removable' } 4 { 'Network' } 5 { 'CDRom' } 6 { 'RamDisk' } default { 'Unknown' } }
-            } else { 'NoLocalVolume' })
-    }
-    if ($volumeType -cne 'Fixed') { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is $volumeType, not a local fixed volume of this host: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
+            } else { "NoLocalVolume (no volume GUID path, win32 $guidError)" })
+        if ($TestRootVolumeType) { $volumeType = $TestRootVolumeType }
+        if ($volumeType -cne 'Fixed') { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is $volumeType, not a local fixed volume of this host: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
+        # VOLUME_NAME_DOS (0): the root's final path by drive letter (or mount folder), through the same handle; '\\?\' is dropped (every caller of it is long-path aware)
+        $buffer = [Text.StringBuilder]::new(32768)
+        $n = [AttrCudaWin32.StageRootNative]::GetFinalPathNameByHandleW($rootHandle, $buffer, [uint32]32768, [uint32]0)
+        $dosError = $(if ($n -ge 32768) { 122 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() })
+        $dosFinal = $(if ($n -gt 0 -and $n -lt 32768) { $buffer.ToString() } else { '' })
+        if ($dosFinal -cmatch '^\\\\\?\\[A-Za-z]:\\') { $dosFinal = $dosFinal.Substring(4) }
+        if ($dosFinal -notmatch '^[A-Za-z]:\\') { throw "ATTRCUDA_STAGE_ROOT_UNRESOLVED the agent root's final path by drive letter could not be read through its open handle (win32 $dosError), so no job path can be bound to the locked root" }
+        $keepHandle = $true
+    } finally { if (-not $keepHandle) { $rootHandle.Dispose() } }
     $rootId ='vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
     # r9 fix iteration (adversary A1 on 9825bfd9): the cache names carry the sha's first 12 hex (playback-attr-3-cuda-<sha12>-build.json and its artifacts), so the lock does too: two
     # commits that share them write the same files and must contend for the same lock (a full-sha key let both into the one name at once)
@@ -561,7 +589,7 @@ function Enter-AttrCudaStageLock {
         if ($WaitMarkerPath) { [IO.File]::WriteAllText($WaitMarkerPath, $name) }
         try { $held = $mutex.WaitOne($WaitSec * 1000) } catch [Threading.AbandonedMutexException] { $held = $true }
     }
-    [pscustomobject]@{ name = $name; held = $held; waited = $waited; mutex = $mutex }
+    [pscustomobject]@{ name = $name; held = $held; waited = $waited; mutex = $mutex; root = $dosFinal; rootHandle = $rootHandle }
 }
 
 function Wait-AttrCudaTestHold {

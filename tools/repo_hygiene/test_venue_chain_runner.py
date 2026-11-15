@@ -1650,7 +1650,11 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-1.result.json' -Value '{{}}'; st @('dve-1'); st @('dve-1', 'dve-2')\n"
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-2.result.json' -Value '{{}}'; st @('dve-1', 'dve-2')\n"
             "$t0 = [DateTime]::UtcNow\n"
+            f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 5 -CallCapSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
+            "$capped = \"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
+            "$t0 = [DateTime]::UtcNow\n"
             f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
+            "$capped\n"
             "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
             "Complete-VenueProcess -ExitCode 7\nexit 7\n", encoding="utf-8")
         t0 = time.time()
@@ -1661,12 +1665,18 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         # the message reports that wait (and, when the call's end visibly cut it, says so)
         # r14 (Grok G21 on #814): EXACT form, the clause required. The read is handed the caller's real bound (-TimeoutSec 2) and -EndSec clamps it, so the clause
         # names the 2 s the caller set, never a remainder ("cut the 1.98 s bound short"); the wait itself is what was left of it on the call clock, under 2.
-        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 2 s bound short\) inside=[23]", lines[-1] if lines else "")
+        # r16 (Grok G22 on #814): the clause means "a cap cut the bound short", so it is printed only when the clamp came from something other than the bound itself.
+        # -TimeoutSec 5 -CallCapSec 2: the cap set the read's end, so the clause names the 5 s bound it cut (EXACT form). Plain -TimeoutSec 2: the end is the bound's
+        # own end, so a timeout is a plain timeout and carries NO clause (r14's pin required the clause here, on every timeout).
+        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 5 s bound short\) inside=[23]", lines[-2] if len(lines) > 1 else "")
         self.assertIsNotNone(m, r.stdout + r.stderr)
         self.assertTrue(1.0 <= float(m.group(1)) < 2.0, r.stdout + r.stderr)
-        self.assertLess(elapsed, 14, f"the stalled read broke the bound: the whole process took {elapsed:.1f}s with a 20 s stuck read and -TimeoutSec 2")
+        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s inside=[23]", lines[-1] if lines else "")
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self.assertTrue(1.0 <= float(m.group(1)) <= 2.0, r.stdout + r.stderr)
+        self.assertLess(elapsed, 16, f"a stalled read broke its bound: the whole process took {elapsed:.1f}s with two 20 s stuck reads, each bounded at 2 s")
         self.assertEqual(r.returncode, 7)
-        self.assertEqual(lines[:-1], [
+        self.assertEqual(lines[:-2], [
             "n=2[dve-1|dve-2]",  # every printed id, in order, distinct (the client may have submitted a health probe job before the leg job)
             "n=0[]", "n=0[]",    # nothing printed = no id
             "n=1[]", "n=1[]", "n=1[]", "n=1[]",   # an id that is not a plain file name (it becomes a file name on the venue share) stays as ONE empty entry: named, never looked up

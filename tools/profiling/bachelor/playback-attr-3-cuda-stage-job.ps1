@@ -193,7 +193,7 @@ $ManifestSha256 = '__MANIFEST_SHA256__'
 $Expected = __EXPECTED_LITERAL__
 $Cache = Join-Path $AgentRoot 'cache'
 $Inbox = Join-Path $AgentRoot 'inbox'
-$Work = Join-Path $AgentRoot "work\$JobId"
+# $Work is assigned once, after the stage lock, on the locked root (r16); nothing before the lock uses it.
 $Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
 # OWNER-FOOTAGE-NO-HARDLINK-2: the creator record of everything this job makes under $AgentRoot. No
 # delete below ever adopts a name because it looks like this job's.
@@ -247,9 +247,20 @@ function Assert-UnderAgentRoot([string]$Path, [string]$Label) {
 foreach ($check in @(
     @{ path = $Cache; label = 'Cache' },
     @{ path = $Inbox; label = 'Inbox' },
-    @{ path = $Work; label = 'Work' },
     @{ path = $Pub; label = 'Pub' }
 )) { Assert-UnderAgentRoot $check.path $check.label }
+
+# r16 (r14 OPEN A1, adversary on 6882c873): one side-file's inbox, cache and partial paths, built on the CURRENT $Inbox / $Cache. Used in artifactNameSafety on
+# the lexical root, and again right after the stage lock on the locked root's final path, so the two can never be built two ways.
+function New-JobSideFile([string]$Name, [string]$Sha256) {
+    [ordered]@{
+        name = $Name
+        path = (Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $Name) -Label "inbox/$Name")
+        cachePath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $Name) -Label "cache/$Name")
+        partialPath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache "$Name.partial") -Label "cache/$Name.partial")
+        sha256 = $Sha256
+    }
+}
 
 Say "START source=$SourceCommit files=$($Expected.Count)"
 
@@ -276,13 +287,7 @@ try {
         if ($canonicalNames -cnotcontains $name) {
             throw "baked artifact name '$name' is not one of the canonical names for ${SourceCommit}: $($canonicalNames -join ', ')"
         }
-        $sideFiles += [ordered]@{
-            name = $name
-            path = (Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $name) -Label "inbox/$name")
-            cachePath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $name) -Label "cache/$name")
-            partialPath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache "$name.partial") -Label "cache/$name.partial")
-            sha256 = [string]$item.sha256
-        }
+        $sideFiles += New-JobSideFile $name ([string]$item.sha256)
     }
     $manifestSide = Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $ManifestName) -Label "inbox/$ManifestName"
     $manifestCachePath = Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $ManifestName) -Label "cache/$ManifestName"
@@ -383,6 +388,30 @@ if (-not $StageLock.held) {
     Complete-Failed 7 'stagedBuildGuard' "another stager of $SourceCommit into $AgentRoot held $($StageLock.name) for $StageLockWaitSec s; nothing is staged"
 }
 if ($StageLock.waited) { Say "STAGE_LOCK_WAITED another stager of $SourceCommit held $($StageLock.name); the cache is read again under it" }
+# r16 (r14 OPEN A1, adversary on 6882c873; siblings :515/:527 and Publish-AttrCudaFileMove / Assert-AttrCudaWritableFileSlot under them): the lock names the root the
+# ONE handle Enter-AttrCudaStageLock opened and still holds ($StageLock.rootHandle: no FILE_SHARE_DELETE, so neither the root nor an ancestor can be renamed while this
+# job runs). Every path is rebuilt on that root's final path now, before the guard reads the cache: a junction in the lexical -AgentRoot retargeted later moves nothing.
+# $Work is assigned here only (nothing before the lock uses it), once, at top level.
+$AgentRoot = [string]$StageLock.root
+$Cache = Join-Path $AgentRoot 'cache'
+$Inbox = Join-Path $AgentRoot 'inbox'
+$Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
+$OwnedJournal = Join-Path $AgentRoot '.attrcuda-owned.jsonl'
+$Work = Join-Path $AgentRoot "work\$JobId"
+try {
+    foreach ($check in @(
+        @{ path = $Cache; label = 'Cache' },
+        @{ path = $Inbox; label = 'Inbox' },
+        @{ path = $Work; label = 'Work' },
+        @{ path = $Pub; label = 'Pub' }
+    )) { Assert-UnderAgentRoot $check.path $check.label }
+    $sideFiles = @(foreach ($item in $sideFiles) { New-JobSideFile ([string]$item.name) ([string]$item.sha256) })
+    $manifestSide = Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $ManifestName) -Label "inbox/$ManifestName"
+    $manifestCachePath = Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $ManifestName) -Label "cache/$ManifestName"
+    $manifestPartialPath = Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache "$ManifestName.partial") -Label "cache/$ManifestName.partial"
+} catch {
+    Complete-Failed 7 'stagedBuildGuard' "the job paths could not be rebuilt on the locked root $AgentRoot, so nothing is staged: $($_.Exception.Message)"
+}
 if (Test-Path -LiteralPath $manifestCachePath) {
     $stagedSha = ''
     $unsound = ''

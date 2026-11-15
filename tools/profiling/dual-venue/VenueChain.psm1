@@ -725,7 +725,10 @@ function Get-VenueStagedBuildManifest {
     if ($readSec -lt $script:VenueMinReadSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $readSec) * 100.0) / 100.0) s left, under $script:VenueMinReadSec)"; contentProblem = $null } }
     # r14 (Grok G21 on #814): the read is handed the caller's REAL bound (-TimeoutSec) and -EndSec does the clamping, so a cut-short wait names the bound the
     # operator set ("cut the 2 s bound short"), never the remainder $readSec, which the wait's own later sample is always a little under (the clause fired on every timeout)
-    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec -Clock $callClock -EndSec $boundEndSec
+    # r16 (Grok G22 on #814): the read's end is the bound's OWN end unless -CallCapSec lowered it under -TimeoutSec; only then did something cut the bound short
+    # (-EndIsBoundEnd off), so a plain timeout carries no clause
+    $readCapped = ($CallCapSec -gt 0 -and $CallCapSec -lt $TimeoutSec)
+    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec -Clock $callClock -EndSec $boundEndSec -EndIsBoundEnd:(-not $readCapped)
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     if ($null -eq $ProbeScript -and $r.value.Count -gt 0 -and ([string]$r.value[0]).StartsWith('VENUE_PREDICATE_REFUSED:', [StringComparison]::Ordinal)) { throw ([string]$r.value[0]).Substring('VENUE_PREDICATE_REFUSED:'.Length) }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
@@ -783,13 +786,15 @@ function Get-VenueStagedBuildManifest {
             # (hashEnd = elapsed + remainder), so a caller descheduled in between moved the end past the cap.
             $hashStartSec = $callClock.Elapsed.TotalSeconds
             $hashEndSec = $boundEndSec
+            # r16 (Grok G22 on #814): did -CallCapSec lower the hash's end? Implicit budget: exactly when it lowered the bound's end; explicit: set below
+            $hashCapped = $readCapped
             $artSec = $ArtifactTimeoutSec
-            if ($artSec -gt 0) { $hashEndSec = $hashStartSec + $artSec }
+            if ($artSec -gt 0) { $hashEndSec = $hashStartSec + $artSec; $hashCapped = $false }
             if ($artSec -gt 0 -and $CallCapSec -gt 0) {
                 # r6 (Grok G6/G7 on #814): an explicit hash budget never runs the call past -CallCapSec; under -ArtifactMinSec left of it, no hash (UNREACHABLE)
                 $capLeft = $CallCapSec - $hashStartSec
                 if ($capLeft -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
-                $hashEndSec = [Math]::Min($hashEndSec, $CallCapSec)
+                if ($CallCapSec -lt $hashEndSec) { $hashEndSec = $CallCapSec; $hashCapped = $true }
             }
             if ($artSec -le 0) {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
@@ -815,7 +820,7 @@ function Get-VenueStagedBuildManifest {
             # r14 (Grok G21 on #814): the hash is handed its configured budget (-ArtifactTimeoutSec, or -TimeoutSec when it has none) and -EndSec ($hashEnd) clamps it,
             # as the manifest read above: the clause names the budget the operator set, never a remainder of it (the remainder stores into $artSec went with it; the
             # fixed end $hashEndSec, clamped to -CallCapSec above, is the only bound the wait takes)
-            $ar = Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $(if ($ArtifactTimeoutSec -gt 0) { [double]$ArtifactTimeoutSec } else { $TimeoutSec }) -Clock $callClock -EndSec $hashEnd
+            $ar = Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $(if ($ArtifactTimeoutSec -gt 0) { [double]$ArtifactTimeoutSec } else { $TimeoutSec }) -Clock $callClock -EndSec $hashEnd -EndIsBoundEnd:(-not $hashCapped)
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
@@ -877,8 +882,10 @@ function Invoke-VenueBoundedRead {
     # r7 (sol r6 B1): -TimeoutSec keeps its fraction (a caller's exact remainder), so no bound is rounded up past the caller's deadline or down under its minimum
     # r12 (adversary A1 on 7754d16e, sibling :836): -Clock/-EndSec, the caller's fixed end on its own clock. The wait is min(-TimeoutSec, EndSec - Clock), sampled right
     # before it (after the worker started), so time spent creating the worker is never added past the caller's end. No -Clock: -TimeoutSec from the wait, as before.
+    # r16 (Grok G22 on #814): -EndIsBoundEnd says -EndSec is the end of -TimeoutSec ITSELF (measured from an earlier start on the caller's clock), not a cap the
+    # caller set under it; a wait it shortens is then a plain timeout and the "cut ... short" clause is not printed. Absent: any shortening by -EndSec is named.
     param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec,
-        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0)
+        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd)
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
@@ -894,7 +901,7 @@ function Invoke-VenueBoundedRead {
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
             return [pscustomobject]@{ answered = $false; value = @()
-                error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
+                error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut -and -not $EndIsBoundEnd) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
         }
         # r12 fix iteration (adversary A2 on 09421b77): a caller descheduled past its fixed end finds the worker done and WaitOne(0) true; an answer the caller
         # sees only after -EndSec is never acted on (the worker finished, so it is disposed as usual)

@@ -1258,6 +1258,20 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertGreater(float(m.group(1)), 1.0, both)
         self.assertIn("PLAIN=[False|no answer in 1.5 s]", p.stdout, both)
 
+    def test_r16_g22_the_end_cut_clause_is_a_cap_never_the_bound_itself(self) -> None:
+        # r16 (Grok G22 on #814, VenueChain.psm1:891): the clause fired whenever the wait's end was under -TimeoutSec, which a read measured from its own end always
+        # is, so every plain timeout said "the call's end cut ... short". It is printed only when -CallCapSec lowered the end. The hash: an explicit budget with no cap
+        # (-ArtifactTimeoutSec 2) and the implicit one (what is left of -TimeoutSec 3) time out with NO clause; the capped hash (-CallCapSec, the 300 s budget) still
+        # names it (test_r11_a1_the_deadline_handed_over_is_the_calls_end). RED: both rows below carried the clause.
+        for args, bound in (("-TimeoutSec 20 -ArtifactTimeoutSec 2", "2"), ("-TimeoutSec 3", "3")):
+            with self.subTest(args=args):
+                out, sec, both = self._r11_timed_call(self._r11_sound_share(f"r16-g22-{bound}"), args)
+                self.assertIn("STATE=UNREACHABLE", out, both)
+                self.assertRegex(out, r"ERROR=\[the cached artifacts could not be hashed: no answer in [0-9.]+ s\]", both)
+                self.assertNotIn("bound short", out, both)
+        out, sec, both = self._r11_timed_call(self._r11_sound_share("r16-g22-capped"), "-TimeoutSec 20 -ArtifactTimeoutSec 300 -CallCapSec 3")
+        self.assertRegex(out, r"ERROR=\[the cached artifacts could not be hashed: no answer in [0-9.]+ s \(the call's end cut the 300 s bound short\)\]", both)
+
     def test_r11_a1_the_nightly_hands_its_deadline_to_the_soundness_read(self) -> None:
         text = DRIVER.read_text(encoding="utf-8")
         calls = [l for l in text.splitlines() if "Get-VenueStagedBuildManifest -AgentShare" in l]

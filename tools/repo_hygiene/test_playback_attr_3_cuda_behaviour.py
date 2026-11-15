@@ -1148,6 +1148,42 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("STATE=STAGED CONTENT=[] ARTIFACT=[]", proc.stdout, proc.stdout + proc.stderr)
         self.assertEqual(list(self.inbox.iterdir()), [], "inputs were left in the inbox")
 
+    def test_r16_a1_a_junction_retargeted_after_the_lock_never_moves_the_job_to_another_root(self) -> None:
+        # r16 (r14 OPEN A1, adversary on 6882c873, AttrCudaArtifacts.psm1:510; siblings stage job :376/:515/:527, Publish-AttrCudaFileMove, Assert-AttrCudaWritableFileSlot):
+        # the lock named the physical root the junction reached at the identity sample, but every later file operation went through the LEXICAL -AgentRoot. Retargeted
+        # while A held (after its partials), A's renames resolved into stage-b: the slot check removed stage-b's artifact, the rename found no partial (exit 21).
+        # Fixed: the root is opened ONCE, the lock and the identity come from that handle, and the job rebinds every path to its final path right after the lock.
+        stage_b = self.tmp / "stage-b"
+        (stage_b / "agent" / "inbox").mkdir(parents=True)
+        (stage_b / "agent" / "cache").mkdir(parents=True)
+        alias = self.tmp.parent / (self.tmp.name + "-retarget")
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(self.tmp)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        self.addCleanup(lambda: os.rmdir(alias) if os.path.lexists(alias) else None)
+        job = self.emit("ad005766", suffix="retarget", agent_root=alias / self.agent.name)
+        exe_name = f"MLVApp-playback-attr-3-cuda-{SHA_FIXTURE[:12]}.exe"
+        decoy = stage_b / "agent" / "cache" / exe_name
+        decoy.write_bytes(b"stage-b's own artifact; no job of stage-a may touch it")
+        hold = self.tmp / "hold-retarget"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldAfterPartialsPath", str(hold)]
+        a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached its publication")
+            os.rmdir(alias)
+            mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(stage_b)], capture_output=True, text=True)
+            self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        finally:
+            hold.write_text("", encoding="utf-8")
+            out, err = a.communicate(timeout=180)
+        self.assertEqual(a.returncode, 0, f"{out}\n{err}")
+        self.assertEqual(decoy.read_bytes(), b"stage-b's own artifact; no job of stage-a may touch it", "a stage-a job removed stage-b's artifact")
+        self.assertEqual(sorted(e.name for e in (stage_b / "agent" / "cache").iterdir()), [exe_name], "a stage-a job wrote into stage-b's cache")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-ad005766" / self.manifest_name).read_bytes()).hexdigest())
+        self.assertEqual(list(self.inbox.iterdir()), [], "the inputs were left in stage-a's inbox")
+
     def test_r8_an_unsound_staged_manifest_is_gone_before_the_repair_renames_an_artifact_in(self) -> None:
         # r8 (adversary A1 on 0c0eafd7): a cached manifest with its artifacts absent is unsound and is replaced. Left standing until the new manifest's publish,
         # a reader that hashed the REPAIRED artifacts against it found it sound and pinned it, and the publish then replaced it (BUILD_MANIFEST_MISMATCH later).
@@ -1248,9 +1284,19 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertNotIn("ReleaseMutex", text)
         # adversary A1 on 3bec2622: the name is the root's PHYSICAL identity and the sha, never a lexical path or a caller's name
         body = re.search(r"(?ms)^function Enter-AttrCudaStageLock \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
-        self.assertIn("Get-AttrCudaFileId -Path $Root -FollowLinks", body)
+        # r16 (r14 OPEN A1): the identity is read off the ONE handle the volume check and the final path come from (links followed, never FILE_SHARE_DELETE),
+        # never by a second path open (Get-AttrCudaFileId -Path $Root -FollowLinks was one); the stage job rebinds every path to .root right after the lock
+        self.assertEqual(body.count("::CreateFileW("), 1, "the root is opened once")
+        self.assertIn("::CreateFileW($nativeRoot, [uint32]0x81, [uint32]3, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)", body)
+        self.assertIn("GetFileInformationByHandle($rootHandle.DangerousGetHandle()", body)
+        self.assertNotIn("Get-AttrCudaFileId -Path", body)
+        self.assertIn("rootHandle = $rootHandle", body)
         self.assertNotIn("GetFullPath", body)
         self.assertNotIn("ReleaseMutex", body)
+        rebind = text.index("$AgentRoot = [string]$StageLock.root")
+        self.assertLess(lock, rebind)
+        self.assertLess(rebind, guard)
+        self.assertIn("try { Set-JobPaths } catch {", text[rebind:guard])
 
     def snapshot(self) -> dict:
         return {e.name: (e.read_bytes(), e.stat().st_mtime_ns) for e in sorted(self.cache.iterdir())}
@@ -1439,6 +1485,74 @@ class StagedBuildNeverReplacedTests(_PwshCase):
                 f"try {{ $l = Enter-AttrCudaStageLock -Root '{unc}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
                 name="r14-a2-unc.ps1")
             self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r16_g23_a_root_that_cannot_be_opened_is_named_apart_from_a_share(self) -> None:
+        # r16 (Grok G23 on #814): a root CreateFileW could not open (an ACL, a sharing or AV hold) got the same "is NoLocalVolume" message as a share. Each failure now
+        # carries its own Win32 error; the refusal is the same. Here: an absent root (win32 2, ERROR_FILE_NOT_FOUND) and a root held open by another handle that shares
+        # nothing (win32 32, ERROR_SHARING_VIOLATION).
+        if os.name != "nt":
+            self.skipTest("the held case takes a share-none directory handle through kernel32")
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+
+        def call(root: Path, name: str):
+            return self.run_with_module(
+                f"try {{ $l = Enter-AttrCudaStageLock -Root '{root}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
+                name=name)
+        proc = call(self.agent / "absent", "r16-g23-absent.ps1")
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume (open failed, win32 2), not a local fixed volume",
+                      proc.stdout, proc.stdout + proc.stderr)
+        held = self.agent / "held"
+        held.mkdir()
+        h = k32.CreateFileW(str(held), 0x80000000, 0, None, 3, 0x02000000, None)
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value, ctypes.get_last_error())
+        try:
+            proc = call(held, "r16-g23-held.ps1")
+        finally:
+            k32.CloseHandle(h)
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume (open failed, win32 32), not a local fixed volume",
+                      proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r16_g23_a_root_with_no_volume_guid_path_names_its_win32_error(self) -> None:
+        # r16 (Grok G23 on #814): the second message. A handle on SMB (the loopback admin share) opens but has no volume GUID final path: "NoLocalVolume (no volume GUID
+        # path, win32 <n>)", never "open failed". Skipped where the loopback share is not reachable.
+        agent = str(self.agent)
+        unc = rf"\\localhost\{agent[0]}$" + agent[2:]
+        if not (re.match(r"^[A-Za-z]:\\", agent) and os.path.isdir(unc)):
+            self.skipTest("the loopback admin share is not reachable on this host")
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{unc}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
+            name="r16-g23-unc.ps1")
+        self.assertRegex(proc.stdout, r"REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume \(no volume GUID path, win32 [1-9]\d*\), not a local fixed volume",
+                         proc.stdout + proc.stderr)
+
+    def test_r16_a1_the_lock_returns_the_roots_final_path_and_keeps_its_handle(self) -> None:
+        # r16 (r14 OPEN A1): reached through a junction, the lock's .root is the physical root's drive-letter final path (the junction resolved), and the handle it
+        # holds counts in share accounting and shares no delete, so neither the root nor an ancestor of it can be renamed while the lock is held. RED on the first
+        # cut of r16 (FILE_READ_ATTRIBUTES only, which share modes never see): the root renamed under the lock.
+        anc = self.tmp / "anc"
+        root = anc / "root"
+        root.mkdir(parents=True)
+        alias = self.tmp.parent / (self.tmp.name + "-rootalias")
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(anc)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        self.addCleanup(lambda: os.rmdir(alias) if os.path.lexists(alias) else None)
+        proc = self.run_with_module(
+            f"$l = Enter-AttrCudaStageLock -Root '{alias / 'root'}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1\n"
+            "'ROOT=' + $l.root\n'OPEN=' + (-not $l.rootHandle.IsInvalid -and -not $l.rootHandle.IsClosed)\n"
+            f"try {{ Rename-Item -LiteralPath '{root}' -NewName 'root-renamed'; 'ROOT_RENAMED' }} catch {{ 'ROOT_RENAME_REFUSED' }}\n"
+            f"try {{ Rename-Item -LiteralPath '{anc}' -NewName 'anc-renamed'; 'ANCESTOR_RENAMED' }} catch {{ 'ANCESTOR_RENAME_REFUSED' }}\n"
+            "New-Item -ItemType Directory -Path (Join-Path $l.root 'cache') | Out-Null; 'CHILD_CREATED'\n",
+            name="r16-a1-root.ps1")
+        self.assertIn(f"ROOT={root}\n", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
+        self.assertIn("OPEN=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("ROOT_RENAME_REFUSED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("ANCESTOR_RENAME_REFUSED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("CHILD_CREATED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertTrue((root / "cache").is_dir())
 
     def test_r14_fix2_a2_a_long_local_root_still_takes_its_lock(self) -> None:
         # r14 fix iteration 2 (adversary A2 on 6882c873, AttrCudaArtifacts.psm1:526): the volume check's CreateFileW got the root unprefixed, so a 260+ character
