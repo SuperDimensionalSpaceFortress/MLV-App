@@ -33,9 +33,28 @@ _spec.loader.exec_module(ob)
 # HERMETIC AGAINST A GIT HOOK: a hook (the lane pre-push guard runs this file's card-validator tests from one) is started with GIT_DIR, GIT_WORK_TREE and
 # GIT_INDEX_FILE exported for the repository being pushed; every fixture repository below is addressed with `git -C <tmp>`, which an inherited GIT_DIR overrides
 # ("fatal: this operation must be run in a work tree"), so the tests failed only under the hook and the guard refused a push of a valid card (r13). The
-# variables that LOCATE a repository are dropped from this process; none of them is a setting these tests rely on.
-for _locator in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"):
-    os.environ.pop(_locator, None)
+# variables git itself reports as repository-local (`git rev-parse --local-env-vars`) are dropped for the duration of each TEST by the autouse fixture below, through
+# monkeypatch, so they are restored afterwards: an import-time os.environ.pop (r13) also changed the environment of every OTHER module in the pytest session, even
+# when -k deselected everything here (Grok G16a). The list is read once, here, without touching the environment; none of these is a setting the tests rely on.
+_GIT_LOCAL_ENV_VARS_FALLBACK = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY",
+                                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE")
+
+
+def _read_git_local_env_vars() -> tuple[str, ...]:
+    try:
+        out = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, timeout=60, check=True).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return _GIT_LOCAL_ENV_VARS_FALLBACK
+    return tuple(out) or _GIT_LOCAL_ENV_VARS_FALLBACK
+
+
+_GIT_LOCAL_ENV_VARS = _read_git_local_env_vars()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_git_environment(monkeypatch):
+    for name in _GIT_LOCAL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false"]
 
@@ -4207,3 +4226,75 @@ def test_the_markup_class_table_covers_every_inline_class_and_both_verdicts():
     assert classes >= {"span", "escape", "entity", "html", "autolink", "link", "image", "reference", "emphasis", "hard", "bracket"}
     assert {r[3] for r in _MARKUP_CLASS_TABLE} == {"ACCEPTED", "REFUSED"}
     assert len({r[0] for r in _MARKUP_CLASS_TABLE}) == len(_MARKUP_CLASS_TABLE)
+
+
+# ---- G16: this file is hermetic against a git hook's environment, and the tracked tests below pin it (r14) ----
+# SAFETY: every subprocess below points the git variables only at a DECOY repository built under tmp_path -- never at the repository
+# under test. Running this file's own tests with GIT_DIR on a real repository once wrote core.bare=true into the shared board config.
+# The names of these tests deliberately contain neither "card_validator" nor "fused_field_key": the subprocess runs exactly that -k subset
+# of this same file, and a match would make the subset run itself.
+_HERMETIC_SUBSET = "card_validator or fused_field_key"
+
+
+def _decoy_repository(tmp_path: Path) -> Path:
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    git(decoy, "init", "-q")
+    (decoy / "payload.txt").write_text("decoy payload\n", encoding="utf-8")
+    git(decoy, "add", "payload.txt")
+    git(decoy, "commit", "-q", "-m", "decoy commit")
+    return decoy
+
+
+def _decoy_digest(decoy: Path) -> dict[str, str]:
+    """sha256 of the decoy's HEAD, config, index and every file under refs/ (and packed-refs), keyed by relative path."""
+    gitdir = decoy / ".git"
+    names = ["HEAD", "config", "index", "packed-refs"]
+    names += sorted(p.relative_to(gitdir).as_posix() for p in (gitdir / "refs").rglob("*") if p.is_file())
+    import hashlib
+    return {n: hashlib.sha256((gitdir / n).read_bytes()).hexdigest() for n in names if (gitdir / n).is_file()}
+
+
+def _run_subset_under_decoy_git_variables(tmp_path: Path, only_git_dir: bool = False) -> tuple[subprocess.CompletedProcess, dict[str, str], dict[str, str]]:
+    """Run the card subset in a subprocess with the git locator variables a hook exports, pointed at a decoy. `only_git_dir` exports GIT_DIR alone:
+    the work tree is then each fixture's own cwd, so an unguarded fixture's `git add` / `git commit` succeed AGAINST THE DECOY and change it."""
+    decoy = _decoy_repository(tmp_path)
+    before = _decoy_digest(decoy)
+    env = {**os.environ, "GIT_DIR": str(decoy / ".git")}
+    if not only_git_dir:
+        env.update({"GIT_WORK_TREE": str(decoy), "GIT_INDEX_FILE": str(decoy / ".git" / "index")})
+    proc = subprocess.run([sys.executable, "-m", "pytest", str(Path(__file__).resolve()), "-k", _HERMETIC_SUBSET, "-q", "-p", "no:cacheprovider",
+                           f"--basetemp={tmp_path / 'inner-basetemp'}"], capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=900)
+    return proc, before, _decoy_digest(decoy)
+
+
+def test_hermetic_the_card_subset_passes_with_git_variables_pointed_at_another_repository(tmp_path):
+    proc, _before, _after = _run_subset_under_decoy_git_variables(tmp_path)
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-1000:]
+    assert re.search(r"\d+ passed", proc.stdout), proc.stdout[-1000:]
+
+
+def test_hermetic_the_card_subset_leaves_the_decoy_repository_byte_identical(tmp_path):
+    proc, before, after = _run_subset_under_decoy_git_variables(tmp_path, only_git_dir=True)
+    assert re.search(r"\d+ (passed|failed)", proc.stdout), "the subset did not run any test:\n" + proc.stdout[-1500:] + proc.stderr[-500:]
+    assert before and set(before) >= {"HEAD", "config", "index"}
+    assert after == before, f"a fixture wrote into the repository the git variables named: {sorted(k for k in before if before[k] != after.get(k))}"
+
+
+def test_hermetic_collecting_this_file_does_not_change_the_environment_for_another_module(tmp_path):
+    decoy = _decoy_repository(tmp_path)
+    probe = tmp_path / "test_zz_environment_probe.py"
+    probe.write_text("import os\n\n\ndef test_probe_env_keeps_git_dir():\n    assert os.environ.get('GIT_DIR') == " + repr(str(decoy / ".git")) + "\n",
+                     encoding="utf-8")
+    env = {**os.environ, "GIT_DIR": str(decoy / ".git")}
+    # this file is collected FIRST, then the probe module runs alone (-k deselects every test here): a module-level pop would already have run.
+    proc = subprocess.run([sys.executable, "-m", "pytest", str(Path(__file__).resolve()), str(probe), "-k", "probe_env", "-q", "-p", "no:cacheprovider",
+                           f"--rootdir={tmp_path}", f"--basetemp={tmp_path / 'inner-basetemp'}"], capture_output=True, text=True, env=env,
+                          cwd=str(tmp_path), timeout=300)
+    assert proc.returncode == 0 and re.search(r"1 passed", proc.stdout), proc.stdout[-2000:] + proc.stderr[-1000:]
+
+
+def test_hermetic_the_dropped_names_are_exactly_what_git_reports_as_repository_local():
+    reported = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True).stdout.split()
+    assert reported and "GIT_DIR" in reported and "GIT_INDEX_FILE" in reported and "GIT_WORK_TREE" in reported
+    assert set(_GIT_LOCAL_ENV_VARS) == set(reported)
