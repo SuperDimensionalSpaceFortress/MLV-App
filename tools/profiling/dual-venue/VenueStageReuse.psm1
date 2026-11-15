@@ -3,7 +3,8 @@
 # ORIGIN. The three functions below are copied, logic unchanged, from the untracked lane helper tools\venue-reuse-check.ps1, which lanes copied word for
 # word from run dir to run dir (LOOK-FULLSCREEN-PARITY-1 r3/r4 -> RECON-WARM-RUN-1 -> FIRST-AMAZE-AT-PLAY-1 -> FIRST-PRESENT-WARM-OUTPUT-REUSE-1 ->
 # PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r1, .claude-state\fleet-runs\lane-PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1-r1-20261018T1115Z\tools\
-# venue-reuse-check.ps1 lines 7-75). Only this header is new; the bodies are byte-for-byte the lane copy.
+# venue-reuse-check.ps1 lines 7-75). Only this header is new; the bodies are byte-for-byte the lane copy, except the SmokeRunner OK pin, which also takes the
+# job's ALREADY=1 form (SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1).
 #
 # WHAT THEY ANSWER, READ-ONLY. A stage / DLL-pair JobId is single-use (UmRunDrop refuses a reused one with UMRUN_JOBID_IN_USE) and is derived from the build sha
 # only. These functions read ONE outbox result.json (and, for a DLL pair, its artifacts manifest) BY NAME and say whether that earlier result was a clean run
@@ -46,7 +47,9 @@ function Get-StageReuse {
         $jm = [regex]::Match($JobId, '^attr3-stage-smoke-runner-([0-9a-f]{12})-([0-9a-f]{12})$')
         if (-not $jm.Success) { return (& $no 'smoke-jobId-shape') }
         if ($jm.Groups[1].Value -cne $Sha.Substring(0, 12)) { return (& $no "smoke-jobId-sha12-mismatch ($($jm.Groups[1].Value))") }
-        $m = [regex]::Match($stdout, '(?m)^RESULT=SMOKE_RUNNER_STAGE_OK CACHE_DIR=(smoke-runner-[0-9a-f]{16})(?=\s|$)')
+        # SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1: the job prints two OK forms, the fresh one and, when the cache already holds the closure,
+        # 'RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR=...' (attr3-stage-smoke-runner-job.ps1 Complete-AlreadyStaged). Exactly those two.
+        $m = [regex]::Match($stdout, '(?m)^RESULT=SMOKE_RUNNER_STAGE_OK(?: ALREADY=1)? CACHE_DIR=(smoke-runner-[0-9a-f]{16})(?=\s|$)')
         if (-not $m.Success) { return (& $no 'no-RESULT=SMOKE_RUNNER_STAGE_OK-line') }
         if (-not $m.Groups[1].Value.StartsWith('smoke-runner-' + $jm.Groups[2].Value, [StringComparison]::Ordinal)) { return (& $no "CACHE_DIR-closure-mismatch ($($m.Groups[1].Value))") }
         $line = $m.Value
