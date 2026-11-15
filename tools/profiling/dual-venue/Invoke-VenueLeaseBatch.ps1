@@ -1757,7 +1757,7 @@ function Get-IdleBoundConfigRefusal([int]$IdleSec, [string]$Source) {
     $null
 }
 
-function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc) {
+function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc, $StartedUtc = $null) {
     # r4 (adversary r4 A1): the agent's idle clock restarts when ITS job ended, which is before this runner saw the result (um-run's return, the leg child's own receipt work, the
     # open's liveness cleanup). The monotonic anchor is moved EARLIER by how long ago the agent says the job ended, never later than the instant it was observed and never before
     # the job was sent ($FloorTs). An agent clock behind this host's only shortens the allowance.
@@ -1770,7 +1770,14 @@ function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc) {
     if ($null -eq $at) { return $FloorTs }
     $nowTs = [Diagnostics.Stopwatch]::GetTimestamp()
     $ago = ([DateTime]::UtcNow - $at).TotalSeconds
-    if ($ago -lt 0) { return $FloorTs }
+    if ($ago -lt 0) {
+        # r8 (Grok G12 on #817): an agent clock AHEAD says nothing about when, but its own endedUtc - startedUtc is a duration on ONE clock (the skew cancels), and the job cannot
+        # end before it was sent plus that duration: the floor is the send plus the job's own runtime, never past the observation. Charging the bare send spent the whole leg
+        # from the idle allowance across one second of skew. No usable startedUtc (absent, unreadable, the queue-expired result's $null) or a negative runtime: the send alone.
+        $st = ConvertTo-AgentUtc $StartedUtc
+        if ($null -eq $st -or $st -gt $at) { return $FloorTs }
+        return [long][Math]::Min([double]$ObservedTs, $FloorTs + ($at - $st).TotalSeconds * [Diagnostics.Stopwatch]::Frequency)
+    }
     $ts = [Math]::Min($ObservedTs, $nowTs - [long]($ago * [Diagnostics.Stopwatch]::Frequency))
     if ($ts -lt $FloorTs) { $ts = $FloorTs }
     $ts
@@ -2328,7 +2335,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $probeIdleCap = $(if ($null -ne $batchIdleSec) { [int]$batchIdleSec - $ProbeIdleMarginSec } else { 0 })
             # the open's job ended no later than its result was read; r3 adversary pass 2 A1: from THAT instant, so the guard and the BATCH_OPEN log append since are spent too.
             # r4 (adversary r4 A1): the instant the result RETURNED (before the liveness cleanup), moved earlier to the agent's own endedUtc for the open (Get-AgentJobEndTs)
-            $idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs $op.result.endedUtc
+            # r8 (Grok G12): and its startedUtc, read only from ONE result object (member enumeration on an array would answer from inside it)
+            $idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs $op.result.endedUtc $(if (Test-JsonObject $op.result) { $op.result.startedUtc })
             $attempt = 0
             $launchShort = $false
             while ($pending.Count -gt 0 -and $null -eq $b.endReason) {
@@ -2563,7 +2571,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # when its receipt write is denied) still has the idle anchor moved to that job's end: its own work since is spent from the allowance. The anchor moves only on
                 # the leg job's own result: with none (the child died before its job landed one, or the read failed) nothing shows the agent's idle clock restarted, so it stays.
                 $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $legJobId
-                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc }
+                # r8 (Grok G12): the job's startedUtc too (an agent clock ahead then charges the send plus the job's own runtime), read only from ONE result object
+                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc $(if (Test-JsonObject $jr.result) { $jr.result.startedUtc }) }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
                     # r6 (adversary r6 A2): the row keeps heatAtProbe. r7: this note sits on its own line, because the failing-action body pin

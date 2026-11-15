@@ -319,7 +319,12 @@ New-Item -ItemType Directory -Force -Path $outbox | Out-Null
 # r6 (adversary-848f6559.json A2): FAKE_LEG_ENDED_AHEAD_SEC per call = the agent's clock runs that far ahead (its endedUtc lies in this host's future); FAKE_LEG_ENDED_RAW = an
 # endedUtc that is no instant at all
 $legEnded = $(if ($env:FAKE_LEG_ENDED_RAW) { [string]$env:FAKE_LEG_ENDED_RAW } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0')).ToString('o') })
-$res = [ordered]@{ jobId = $jobId; exitCode = 0; endedUtc = $legEnded; admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
+# r8 (Grok G12): FAKE_LEG_JOB_SEC per call = the leg job's own runtime on the agent's clock: the child sleeps that long first, and startedUtc is that much before endedUtc (same
+# skew). FAKE_LEG_STARTED=null publishes startedUtc as JSON null (the queue-expired result's shape)
+$legJobSec = [int](Pick $env:FAKE_LEG_JOB_SEC $k '0')
+if ($legJobSec -gt 0) { Start-Sleep -Seconds $legJobSec; $now = [DateTimeOffset]::UtcNow; $legEnded = $(if ($env:FAKE_LEG_ENDED_RAW) { [string]$env:FAKE_LEG_ENDED_RAW } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0')).ToString('o') }) }
+$legStarted = $(if ($env:FAKE_LEG_STARTED -eq 'null') { $null } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0') - $legJobSec).ToString('o') })
+$res = [ordered]@{ jobId = $jobId; exitCode = 0; startedUtc = $legStarted; endedUtc = $legEnded; admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
 # the agent's renew record at the leg's end: okMaxGapSec from FAKE_LEG_GAPS (default 3 s; 'none' = no record)
 $gap = Pick $env:FAKE_LEG_GAPS $k '3'
 if ($gap -ne 'none') { $res.admission['leaseRenew'] = [ordered]@{ intervalSec = 60; ok = 5; okMaxGapSec = [double]$gap; staleSec = 120 } }
@@ -1340,6 +1345,51 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 self.assertLessEqual(g["lateSec"], 0.3, f"{k}: a stall before the dispatch placed the probe's wait end past the {k} bound: {g}")
                 self.assertEqual(g["maxWaitSec"], g["waitSec"], g)
                 self.assertLessEqual(g["maxWaitSec"], 30, g)
+
+    # ---------------------------------------------------------------- r8 (Grok G12 on #817): an agent clock ahead charges the send plus the job's own runtime, not the bare send
+    def test_lease_batch_idle_end_r8_grok_g12_get_agent_job_end_ts_ahead_floor_is_the_send_plus_the_jobs_runtime(self) -> None:
+        # Get-AgentJobEndTs returned the bare send whenever the agent's endedUtc lay in this host's future, so one second of skew past the job-to-observation gap charged the whole
+        # job to the idle allowance. endedUtc - startedUtc is a duration on the agent's one clock (the skew cancels) and the job cannot end before send + that: the floor is that,
+        # never past the observation. startedUtc absent, JSON null (the queue-expired result), unreadable, or after endedUtc: the send alone. A clock behind is unchanged.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $now = [Diagnostics.Stopwatch]::GetTimestamp(); $floor = $now - 20 * $f; $obs = $now - 1 * $f\n"
+            "$e = [DateTime]::UtcNow.AddSeconds(5); $es = $e.ToString('o')\n"
+            "$out = [ordered]@{}\n"
+            "$r = Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-6).ToString('o')); $out['aheadRuntime'] = [Math]::Abs($r - ($floor + 6 * $f)) -lt 0.01 * $f\n"
+            "$out['aheadRuntimePastObs'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-60).ToString('o'))) -eq $obs\n"
+            "$out['aheadStartedNull'] = (Get-AgentJobEndTs $obs $floor $es $null) -eq $floor\n"
+            "$out['aheadStartedAbsent'] = (Get-AgentJobEndTs $obs $floor $es) -eq $floor\n"
+            "$out['aheadStartedUnreadable'] = (Get-AgentJobEndTs $obs $floor $es 'not-a-time') -eq $floor\n"
+            "$out['aheadStartedAfterEnd'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(3).ToString('o'))) -eq $floor\n"
+            "$out['aheadStartedArray'] = (Get-AgentJobEndTs $obs $floor $es @($e.AddSeconds(-6).ToString('o'))) -eq $floor\n"
+            "$p = Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-6).ToString('o')) ([DateTime]::UtcNow.AddSeconds(-8).ToString('o')); $out['pastUnchanged'] = ($p -ge $floor) -and ($p -le $now - 5 * $f)\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"aheadRuntime": True, "aheadRuntimePastObs": True, "aheadStartedNull": True, "aheadStartedAbsent": True,
+                                                  "aheadStartedUnreadable": True, "aheadStartedAfterEnd": True, "aheadStartedArray": True, "pastUnchanged": True})
+        # both callers pass the result's startedUtc, read only from ONE result object
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("$op.result.endedUtc $(if (Test-JsonObject $op.result) { $op.result.startedUtc })", src)
+        self.assertIn("$jr.result.endedUtc $(if (Test-JsonObject $jr.result) { $jr.result.startedUtc })", src)
+
+    def test_lease_batch_idle_end_r8_grok_g12_a_long_leg_under_an_agent_clock_ahead_leaves_the_next_probe_its_allowance(self) -> None:
+        # Grok G12, run end to end: agent bound 70, margin 60 (10 s). The first leg's job runs 15 s (longer than the allowance), the agent's clock is 30 s ahead (more than the
+        # job-to-observation gap), and the child works 2 s after its job. Charged from the bare send, the next probe's wait was 0; from the send plus the job's own runtime it is
+        # about the allowance less the post-job gap (at most 8 s). startedUtc JSON null (the queue-expired shape): the send alone, so 0.
+        for name, env, lo, hi in (("runtime", {}, 2, 8), ("started-null", {"FAKE_LEG_STARTED": "null"}, 0, 0)):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", FAKE_LEG_JOB_SEC="15,0", FAKE_LEG_ENDED_AHEAD_SEC="30", FAKE_LEG_TAIL_SLEEP="2", **env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertGreaterEqual(waits[1], lo, f"{name}: the next probe's wait after a long leg under a clock ahead: {waits}")
+                self.assertLessEqual(waits[1], hi, f"{name}: the next probe's wait after a long leg under a clock ahead: {waits}")
 
     def test_lease_batch_idle_end_r6_grok_g11_every_idle_end_call_names_its_parameters_in_full(self) -> None:
         # Grok G11 on #817: a call that abbreviates a parameter (-Append for -AppendDetail) binds today by prefix and turns into an ambiguous-parameter error (BATCH_ERROR on a rare
