@@ -1164,7 +1164,8 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # AN OPERAND IS READ BY ITS VALUE (r16, adversary pass 22 A1 and A2, both over-refusals r15 left OPEN): "is this InvokeMethod argument data" has ONE reader
 # (Test-DataValue: an array literal, `@( )`, a hashtable, an array cast, `,x`, -split, a range, a slice, and `+` / `*` with an array on the left), and every
 # class or type read from text (New-Object's type, a class parameter, Invoke-CimMethod's first positional, a class argument of a CimSession method) reads
-# Get-OperandText, where the condition of an if / ternary inside the operand is blanked unless it assigns.
+# Get-OperandText, where the condition of an if / ternary inside the operand, and a pipeline that ends in a diagnostic command (Write-Verbose, Write-Debug,
+# Write-Warning, Write-Information, Write-Host, Write-Progress, Write-Error: r18, sol r16 B2), are blanked unless they assign.
 # THE METADATA IS THE SCANNING HOST'S (r16, Grok G21): the parameter tables above come from the pwsh version that runs the scan, not from a fixed list, so the
 # verdict on a spelling a later pwsh adds can differ by host. Two of them (Get-CimInstance, Get-CimClass) are in CimCmdlets, which ships with pwsh on Windows
 # only: the scanner then exits 3 with one message naming the module, and `_lane_scanner_only` skips the scanner tests on such a host instead of failing them.
@@ -1246,8 +1247,22 @@ function Test-InBlankedCondition($Node, $Root) {
     }
     return $false
 }
-# True when the node is the condition of an if / elseif clause or of a ternary.
+# The commands whose text goes to a DIAGNOSTIC stream (verbose, debug, warning, information, host, progress, error), never to the success stream a `$( )` operand
+# takes its value from (r18, sol r16 B2). A module-qualified spelling (Microsoft.PowerShell.Utility\Write-Verbose) is the same command.
+$diagnosticCommands = @('write-verbose', 'write-debug', 'write-warning', 'write-information', 'write-host', 'write-progress', 'write-error')
+# True when the node is a pipeline that ENDS in a diagnostic command: `Write-Verbose 'x'` and `'x' | Write-Verbose` hand nothing on to the operand's value.
+function Test-IsDiagnosticPipeline($Node) {
+    if ($Node -isnot [PipelineAst]) { return $false }
+    $last = @($Node.PipelineElements)[-1]
+    if ($last -isnot [CommandAst]) { return $false }
+    $name = $last.GetCommandName()
+    if ([string]::IsNullOrEmpty($name)) { return $false }
+    return ($diagnosticCommands -contains (($name -split '\\')[-1]).ToLowerInvariant())
+}
+# True when the node is NOT part of the operand's value: the condition of an if / elseif clause or of a ternary, or a pipeline that ends in a diagnostic command.
+# Every caller keeps the node when it holds an assignment (its variable can be the value).
 function Test-IsValueCondition($Node) {
+    if (Test-IsDiagnosticPipeline $Node) { return $true }
     $p = $Node.Parent
     if ($p -is [TernaryExpressionAst]) { return [object]::ReferenceEquals($p.Condition, $Node) }
     if ($p -is [IfStatementAst]) { foreach ($clause in @($p.Clauses)) { if ([object]::ReferenceEquals($clause.Item1, $Node)) { return $true } } }
@@ -2977,6 +2992,38 @@ def test_wmi_create_scan_accepts_a_nullable_array_argument_and_refuses_a_nullabl
     got = _scan_cases(tmp_path, {**_R17_B1_ACCEPTED, **_R17_B1_REFUSED})
     assert {n: s for n, s in got.items() if n in _R17_B1_ACCEPTED and s} == {}, "a nullable array argument is data, not the Create verb"
     assert [n for n in _R17_B1_REFUSED if not got[n]] == [], "a branch that can be the verb is still refused"
+
+
+# r17, sol r16 B2: text that goes only to a DIAGNOSTIC stream (Write-Verbose, Write-Debug, Write-Warning, Write-Information, Write-Host) is not the operand's value.
+_R17_B2_ACCEPTED = {
+    "r17-b2-write-verbose-in-the-new-object-type": "$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r17-b2-write-debug-in-the-new-object-type": "$f = New-Object -TypeName $(Write-Debug 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r17-b2-write-warning-in-the-new-object-type": "$f = New-Object -TypeName $(Write-Warning 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r17-b2-write-information-in-the-new-object-type": "$f = New-Object -TypeName $(Write-Information 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r17-b2-write-host-in-the-new-object-type": "$f = New-Object -TypeName $(Write-Host 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r17-b2-qualified-write-verbose-in-the-new-object-type": "$f = New-Object -TypeName $(Microsoft.PowerShell.Utility\\Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r17-b2-piped-into-write-verbose-in-the-new-object-type": "$f = New-Object -TypeName $('ManagementClass' | Write-Verbose; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r17-b2-write-verbose-in-a-wmic-argument": "wmic process get $(Write-Verbose 'create'; 'ProcessId')",
+    "r17-b2-write-verbose-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', $(Write-Verbose 'create'; @($null, $null)))",
+}
+_R17_B2_REFUSED = {
+    "r17-b2-control-write-output-in-the-new-object-type": "$f = New-Object -TypeName $(Write-Output 'System.Management.ManagementClass') 'Win32_Process'\n$f.Create()",
+    "r17-b2-control-assignment-inside-write-verbose": "$f = New-Object -TypeName $(Write-Verbose ($t = 'System.Management.ManagementClass'); $t) 'Win32_Process'\n$f.Create()",
+    "r17-b2-control-write-verbose-then-the-type": "$f = New-Object -TypeName $(Write-Verbose 'x'; 'System.Management.ManagementClass') 'Win32_Process'\n$f.Create()",
+    "r17-b2-control-write-verbose-then-the-wmic-verb": "wmic process $(Write-Verbose 'x'; 'call') create 'calc'",
+    "r17-b2-control-write-verbose-then-the-invoke-method-verb": _P4 + "$p.InvokeMethod($(Write-Verbose 'x'; 'create'), $null)",
+    # A method name that is not a plain literal is refused whatever it holds (fail closed), so a diagnostic command in it does not make it one.
+    "r17-b2-control-computed-invoke-method-name": _P4 + "$p.InvokeMethod($(Write-Verbose 'create'; 'GetOwner'), $null)",
+}
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_does_not_read_diagnostic_stream_text_as_an_operand_value(tmp_path):
+    """sol r16 B2: `-TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo')` is a FileInfo; the diagnostic text is not its type, and `$f.Create()` is
+    not a WMI create. Output to the success stream, an assignment inside the diagnostic command, and the real value after it still read (the controls)."""
+    got = _scan_cases(tmp_path, {**_R17_B2_ACCEPTED, **_R17_B2_REFUSED})
+    assert {n: s for n, s in got.items() if n in _R17_B2_ACCEPTED and s} == {}, "diagnostic-stream text is not an operand value"
+    assert [n for n in _R17_B2_REFUSED if not got[n]] == [], "a real value in the operand is still read"
 
 
 # r15, Grok G17 (prevention): a round that NARROWS what the scanner reads ("New-Object's type is the first positional") must prove that nothing new gets through,
