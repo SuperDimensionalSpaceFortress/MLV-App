@@ -110,10 +110,34 @@ public:
         if( k < 0 || k >= kKinds ) return;
         m_rings[k].push( startS, endS );
     }
+    // r1 fix iteration 2 (adversary A1 on df1b864e): an interval still OPEN when a window closes inside it (a present
+    // whose own finishPresentedFrame drains the next frame's drawFrameReady before it returns) covers the window from
+    // its start; it is pushed as a closed interval only when it ends. Nested opens of one kind keep the outermost start.
+    // False (nothing opened, so the caller must not close) for a bad kind or a start that is not finite.
+    bool open( Kind kind, double startS )
+    {
+        const int k = static_cast<int>( kind );
+        if( k < 0 || k >= kKinds || !std::isfinite( startS ) ) return false;
+        if( m_openDepth[k]++ == 0 ) m_openStartS[k] = startS;
+        return true;
+    }
+    void close( Kind kind, double startS, double endS )
+    {
+        const int k = static_cast<int>( kind );
+        if( k < 0 || k >= kKinds ) return;
+        if( m_openDepth[k] > 0 ) --m_openDepth[k];
+        m_rings[k].push( startS, endS );
+    }
+    int openDepth( Kind kind ) const { return m_openDepth[static_cast<int>( kind )]; }
     const Ring &ring( Kind kind ) const { return m_rings[static_cast<int>( kind )]; }
     void reset( void )
     {
         for( Ring &r : m_rings ) r.reset();
+        for( int k = 0; k < kKinds; ++k )
+        {
+            m_openDepth[k] = 0;
+            m_openStartS[k] = 0.0;
+        }
     }
 
     // The window [a, b] split by the kinds in kindMask (a kind outside the mask is charged to other).
@@ -133,9 +157,9 @@ public:
         }
         if( b == a ) return s;
 
-        // Every retained interval clipped to the window: its ends cut the window into pieces, and each
-        // piece goes to the first kind in kChargeOrder covering it (fixed arrays, no allocation).
-        double points[2 * kKinds * kRingCapacity + 2];
+        // Every retained interval (and an open one, up to b) clipped to the window: its ends cut the window into
+        // pieces, and each piece goes to the first kind in kChargeOrder covering it (fixed arrays, no allocation).
+        double points[2 * kKinds * ( kRingCapacity + 1 ) + 2];
         int n = 0;
         points[n++] = a;
         points[n++] = b;
@@ -151,8 +175,10 @@ public:
                 points[n++] = lo;
                 points[n++] = hi;
             }
+            if( m_openDepth[k] > 0 && m_openStartS[k] < b )
+                points[n++] = m_openStartS[k] > a ? m_openStartS[k] : a;
         }
-        for( int i = 1; i < n; ++i )   // insertion sort: n <= 98
+        for( int i = 1; i < n; ++i )   // insertion sort: n <= 104
         {
             const double v = points[i];
             int j = i - 1;
@@ -169,12 +195,11 @@ public:
             const double lo = points[i];
             const double hi = points[i + 1];
             if( hi <= lo ) continue;
-            const double mid = lo + ( hi - lo ) * 0.5;
             for( const Kind kind : kChargeOrder )
             {
                 const int k = static_cast<int>( kind );
                 if( !( kindMask & ( 1u << k ) ) ) continue;
-                if( covers( m_rings[k], mid ) )
+                if( covers( k, lo, hi ) )
                 {
                     const double ms = ( hi - lo ) * 1000.0;
                     s.kindMs[k] += ms;
@@ -189,14 +214,20 @@ public:
     }
 
 private:
-    static bool covers( const Ring &r, double t )
+    // Whether kind k covers the piece [lo, hi]. Every interval end is a cut point, so an interval either holds the
+    // whole piece or none of its interior: compare the ends, never a midpoint (r1 fix iteration 2, advisory A4 on
+    // df1b864e: a one-ulp piece's midpoint rounds onto its start and a strict test missed it).
+    bool covers( int k, double lo, double hi ) const
     {
+        const Ring &r = m_rings[k];
         for( int i = 0; i < r.count(); ++i )
-            if( r.at( i ).startS < t && t < r.at( i ).endS ) return true;
-        return false;
+            if( r.at( i ).startS <= lo && hi <= r.at( i ).endS ) return true;
+        return m_openDepth[k] > 0 && m_openStartS[k] <= lo;
     }
 
     Ring m_rings[kKinds];
+    int m_openDepth[kKinds] = {};
+    double m_openStartS[kKinds] = {};
 };
 
 // Session sums of attributed windows; an unattributed window is only counted.
@@ -243,16 +274,18 @@ struct MeanMs
     void reset( void ) { *this = MeanMs(); }
 };
 
-// Pushes [startS, clock()] as `kind` when it leaves scope; a null recorder records nothing.
+// Opens `kind` at startS on construction (a window closing while it runs is covered from startS) and pushes
+// [startS, clock()] as a closed interval when it leaves scope; a null recorder records nothing.
 class IntervalScope
 {
 public:
     using Clock = double ( * )( void );
     IntervalScope( Recorder *recorder, Kind kind, double startS, Clock clock )
-        : m_recorder( recorder ), m_kind( kind ), m_startS( startS ), m_clock( clock ) {}
+        : m_recorder( recorder && clock && recorder->open( kind, startS ) ? recorder : nullptr ),
+          m_kind( kind ), m_startS( startS ), m_clock( clock ) {}
     ~IntervalScope()
     {
-        if( m_recorder && m_clock ) m_recorder->push( m_kind, m_startS, m_clock() );
+        if( m_recorder ) m_recorder->close( m_kind, m_startS, m_clock() );
     }
     IntervalScope( const IntervalScope & ) = delete;
     IntervalScope &operator=( const IntervalScope & ) = delete;

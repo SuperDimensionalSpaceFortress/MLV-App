@@ -5288,12 +5288,10 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             : 0.0;
     // CPU-S1-PRESENT-INTERVAL-BOUND-1: the result's wait for this present (the stamp
     // avg_playback_prep_result_queue_ms starts from), split by the GUI work inside it; then this
-    // present, [entry, exit], is itself a PreparedPresent interval.
+    // present, [entry, exit], is itself a PreparedPresent interval. Every kind splits the wait: an earlier
+    // present still running when this result became ready is GUI work in it (r1 fix iteration 2, adversary A2).
     if( m_playbackSmokeActive && result.resultReadyTime > 0.0 && prepPresentStart >= result.resultReadyTime )
-        m_guiHopPrepResultWait.add( m_guiHopWait.split(
-            result.resultReadyTime, prepPresentStart,
-            gui_hop_wait::kindBit( gui_hop_wait::Kind::RunnerSleep )
-                | gui_hop_wait::kindBit( gui_hop_wait::Kind::ViewportPaint ) ) );
+        m_guiHopPrepResultWait.add( m_guiHopWait.split( result.resultReadyTime, prepPresentStart ) );
     const gui_hop_wait::IntervalScope hopPresentInterval(
         m_playbackSmokeActive ? &m_guiHopWait : nullptr, gui_hop_wait::Kind::PreparedPresent,
         prepPresentStart, &guiHopWaitClockNow );
@@ -27143,6 +27141,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;
     preview_paint_timing::paintListener().now = &guiHopWaitClockNow;
     preview_paint_timing::paintListener().context = &m_guiHopWait;
+    preview_paint_timing::paintListener().generation = preview_paint_timing::nextPaintListenerGeneration();
     m_playbackSmokeStartPosition = ui->horizontalSliderPosition->value();
     m_playbackSmokeStartCutIn = ui->spinBoxCutIn->value();
     m_playbackSmokeStartCutOut = ui->spinBoxCutOut->value();
@@ -32058,7 +32057,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "avg_prep_result_wait_ms=%9 avg_prep_result_wait_runner_sleep_ms=%10 "
                    "avg_prep_result_wait_viewport_paint_ms=%11 avg_prep_result_wait_other_ms=%12 "
                    "prep_result_wait_unattributed_frames=%13 emit_to_request_frames=%14 "
-                   "avg_emit_to_request_issue_ms=%15 avg_upstream_plus_render_per_render_ms=%16" )
+                   "avg_emit_to_request_issue_ms=%15 avg_upstream_plus_render_per_render_ms=%16 "
+                   "avg_prep_result_wait_prepared_present_ms=%17" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( static_cast<qulonglong>( fr.frames ) )
                    .arg( fr.avgWaitMs(), 0, 'f', 3 )
@@ -32074,7 +32074,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( static_cast<qulonglong>( pr.unattributedFrames ) )
                    .arg( static_cast<qulonglong>( m_guiHopEmitToRequestIssue.count ) )
                    .arg( m_guiHopEmitToRequestIssue.avg(), 0, 'f', 3 )
-                   .arg( upstreamPlusRenderPerRenderMs, 0, 'f', 3 );
+                   .arg( upstreamPlusRenderPerRenderMs, 0, 'f', 3 )
+                   .arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 );
     }
 
     /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /

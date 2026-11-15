@@ -3189,6 +3189,36 @@
     },
     {
       "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , s . otherMs , 1 e - 6 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1 r1 fix iteration 2 (adversary A1): pure-function unit test with synthetic seconds: a window wholly inside a still-open present leaves no other time. 0 is the expected value, not a run proof.",
+      "lines": [
+        214
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , ms ( after , Kind :: PreparedPresent ) , 1 e - 6 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1 r1 fix iteration 2 (adversary A1): pure-function unit test with synthetic seconds: once the present has closed, a later window is charged none of it. 0 is the expected value, not a run proof.",
+      "lines": [
+        236
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . otherMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CPU-S1-PRESENT-INTERVAL-BOUND-1 r1 fix iteration 2 (advisory A4): pure-function unit test with synthetic seconds: a one-ulp window covered by a sleep leaves exactly no other time. 0 is the expected value, not a run proof.",
+      "lines": [
+        260
+      ]
+    },
+    {
+      "path": "tests/console/test_gui_hop_wait_split.cpp",
       "anchor": "ASSERT_NEAR ( 0.0 , ms ( m , Kind :: PreparedPresent ) , 1 e - 12 ) ;",
       "class": "not_run_proof_structural",
       "clock": "other",

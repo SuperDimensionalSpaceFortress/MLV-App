@@ -1293,6 +1293,8 @@ TEST(CriticalHopSummaryWiring, NewLineFollowsGuiPresentSummaryWithEveryFieldInOr
         QStringLiteral("avg_prep_result_wait_viewport_paint_ms"), QStringLiteral("avg_prep_result_wait_other_ms"),
         QStringLiteral("prep_result_wait_unattributed_frames"), QStringLiteral("emit_to_request_frames"),
         QStringLiteral("avg_emit_to_request_issue_ms"), QStringLiteral("avg_upstream_plus_render_per_render_ms"),
+        // r1 fix iteration 2 (adversary A2 on df1b864e): appended at the end, nothing before it moves.
+        QStringLiteral("avg_prep_result_wait_prepared_present_ms"),
     };
     int last = -1;
     for (int i = 0; i < fields.size(); ++i)
@@ -1327,7 +1329,7 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     const QString present = presentPreparedBody();
     ASSERT_FALSE(present.isEmpty());
     const int entry = present.indexOf(QStringLiteral("const double prepPresentStart = mlv_stage_timing_now();"));
-    const int prepSplit = present.indexOf(QStringLiteral("m_guiHopPrepResultWait.add( m_guiHopWait.split(\n            result.resultReadyTime, prepPresentStart,"));
+    const int prepSplit = present.indexOf(QStringLiteral("m_guiHopPrepResultWait.add( m_guiHopWait.split( result.resultReadyTime, prepPresentStart ) );"));
     const int scope = present.indexOf(QStringLiteral("const gui_hop_wait::IntervalScope hopPresentInterval(\n        m_playbackSmokeActive ? &m_guiHopWait : nullptr, gui_hop_wait::Kind::PreparedPresent,\n        prepPresentStart, &guiHopWaitClockNow );"));
     ASSERT_TRUE(entry >= 0);
     ASSERT_TRUE(prepSplit > entry);
@@ -1471,6 +1473,56 @@ TEST(CriticalHopSummaryWiring, AdvA3APaintDescheduledAfterItEndsKeepsItsOwnInter
     const QString note = bracedBlockAfter(source, QStringLiteral("static void guiHopWaitNoteViewportPaint( void *context, double startS, double endS )"));
     ASSERT_TRUE(note.contains(QStringLiteral("push( gui_hop_wait::Kind::ViewportPaint, startS, endS );")));
     ASSERT_FALSE(note.contains(QStringLiteral("mlv_stage_timing_now()")));
+}
+
+TEST(CriticalHopSummaryWiring, AdvA2PrepResultWaitCountsAnEarlierPresentStillRunning)
+{
+    // r1 adversary A2 on df1b864e: prep_result_wait was split by runner sleep and viewport paint only, so an earlier
+    // present [100.000, 100.050] running when this result became ready (100.010) was charged to other: the present
+    // entered at 100.060 had 50 ms other. It is 40 ms prepared_present + 10 ms other, and the line reports it.
+    gui_hop_wait::Recorder recorder;
+    recorder.push(gui_hop_wait::Kind::PreparedPresent, 100.000, 100.050);
+    const gui_hop_wait::Split s = recorder.split(100.010, 100.060);
+    ASSERT_NEAR(40.0, s.kindMs[static_cast<int>(gui_hop_wait::Kind::PreparedPresent)], 1e-6);
+    ASSERT_NEAR(10.0, s.otherMs, 1e-6);
+    const QString present = presentPreparedBody();
+    ASSERT_FALSE(present.contains(QStringLiteral("kindBit")));
+    const QString finish = finishSmokeBody();
+    ASSERT_TRUE(finish.contains(QStringLiteral(".arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 );")));
+}
+
+TEST(CriticalHopSummaryWiring, AdvA3BAListenerReinstalledInsideAPaintIsNotTold)
+{
+    // r1 advisory A3 on df1b864e: a session that ended and a new one that began inside one paint re-install the same
+    // fn/now/context tuple, so the paint (started under the old session) was told. Each installation has a generation.
+    preview_paint_timing::reset();
+    static int calls = 0;
+    calls = 0;
+    const auto fn = [](void *, double, double) { ++calls; };
+    const auto now = []() -> double { return 1.0; };
+    preview_paint_timing::paintListener().fn = fn;
+    preview_paint_timing::paintListener().now = now;
+    preview_paint_timing::paintListener().generation = preview_paint_timing::nextPaintListenerGeneration();
+    {
+        const preview_paint_timing::Scope paint;
+        preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();
+        preview_paint_timing::paintListener().fn = fn;
+        preview_paint_timing::paintListener().now = now;
+        preview_paint_timing::paintListener().generation = preview_paint_timing::nextPaintListenerGeneration();
+    }
+    ASSERT_EQ(0, calls);
+    {
+        const preview_paint_timing::Scope paint;   // the same installation throughout: told
+    }
+    ASSERT_EQ(1, calls);
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();
+    preview_paint_timing::reset();
+    const QString begin = beginSmokeBody();
+    const int context = begin.indexOf(QStringLiteral("preview_paint_timing::paintListener().context = &m_guiHopWait;"));
+    const int generation = begin.indexOf(QStringLiteral(
+        "preview_paint_timing::paintListener().generation = preview_paint_timing::nextPaintListenerGeneration();"));
+    ASSERT_TRUE(context >= 0);
+    ASSERT_TRUE(generation > context);
 }
 
 // ---- #813 salvage (CPU-S1-PACE-POST-785-LEVER-1, 8c632800): max_gui_busy_at_ms / max_gui_busy_frame -------------

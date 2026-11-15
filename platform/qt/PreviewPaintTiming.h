@@ -46,17 +46,27 @@ inline int &scopeDepth()
 // descheduled after the paint never moves the interval (r1 fix iteration 1, adversary A3 on 6a6d7ef4: the
 // start was end - ms, with end read after the totals). Set only while a playback smoke session is active;
 // null otherwise, so a paint pays one null check.
+// generation names one installation: the same fn/now/context re-installed by a new session inside a paint is
+// a different listener, so that paint is not told (r1 fix iteration 2, advisory A3 on df1b864e).
 struct PaintListener
 {
     void ( *fn )( void *context, double startS, double endS ) = nullptr;
     double ( *now )( void ) = nullptr;
     void *context = nullptr;
+    unsigned long long generation = 0;
 };
 
 inline PaintListener &paintListener()
 {
     static PaintListener value;
     return value;
+}
+
+// A fresh generation per installation (never 0, the cleared listener's).
+inline unsigned long long nextPaintListenerGeneration()
+{
+    static unsigned long long counter = 0;
+    return ++counter;
 }
 
 // Times one paint, from construction to destruction. Only the outermost Scope counts, so a paintGL
@@ -83,7 +93,7 @@ public:
         // Heard only by the listener that saw the start (a session that ended or began inside the paint is not told).
         const PaintListener &listener = paintListener();
         const bool heard = m_listener.fn && listener.fn == m_listener.fn && listener.context == m_listener.context
-                        && listener.now == m_listener.now;
+                        && listener.now == m_listener.now && listener.generation == m_listener.generation;
         const double endS = heard ? m_listener.now() : 0.0;
         const double ms = static_cast<double>( m_timer.nsecsElapsed() ) / 1000000.0;
         Totals &value = totals();

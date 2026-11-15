@@ -196,3 +196,66 @@ TEST(GuiHopWaitSplit, BadIntervalsAreIgnoredAndScopesPushOnExit)
     ASSERT_EQ( 2u, static_cast<unsigned>( mean.count ) );
     ASSERT_NEAR( 13.0, mean.avg(), 1e-12 );
 }
+
+TEST(GuiHopWaitSplit, AdvA1AnOpenPresentCoversAWindowThatClosesInsideIt)
+{
+    // r1 adversary A1 on df1b864e: present A enters at 100.000 and, before it returns, its finishPresentedFrame drains
+    // the next frame's drawFrameReady (emitted 100.010, display_start 100.050). A's interval was pushed only at its
+    // exit, so the window was 40 ms other; A is open over all of it: 40 ms prepared_present.
+    gui_hop_wait::Recorder r;
+    static double clockNow = 0.0;
+    const auto clock = []() -> double { return clockNow; };
+    {
+        const gui_hop_wait::IntervalScope presentA( &r, Kind::PreparedPresent, 100.000, clock );
+        ASSERT_EQ( 1, r.openDepth( Kind::PreparedPresent ) );
+        const gui_hop_wait::Split s = r.split( 100.010, 100.050 );
+        ASSERT_TRUE( s.valid );
+        ASSERT_NEAR( 40.0, ms( s, Kind::PreparedPresent ), 1e-6 );
+        ASSERT_NEAR( 0.0, s.otherMs, 1e-6 );
+        // A nested present B [100.020, 100.030] closes inside A: A (the outermost start) still covers the window.
+        {
+            clockNow = 100.030;
+            const gui_hop_wait::IntervalScope presentB( &r, Kind::PreparedPresent, 100.020, clock );
+            ASSERT_EQ( 2, r.openDepth( Kind::PreparedPresent ) );
+        }
+        ASSERT_EQ( 1, r.openDepth( Kind::PreparedPresent ) );
+        const gui_hop_wait::Split nested = r.split( 100.010, 100.050 );
+        ASSERT_NEAR( 40.0, ms( nested, Kind::PreparedPresent ), 1e-6 );
+        ASSERT_NEAR( 0.0, closure( nested ), 1e-9 );
+        // A runner sleep inside the open present still outranks it.
+        r.push( Kind::RunnerSleep, 100.040, 100.045 );
+        const gui_hop_wait::Split slept = r.split( 100.010, 100.050 );
+        ASSERT_NEAR( 5.0, ms( slept, Kind::RunnerSleep ), 1e-6 );
+        ASSERT_NEAR( 35.0, ms( slept, Kind::PreparedPresent ), 1e-6 );
+        clockNow = 100.060;
+    }
+    ASSERT_EQ( 0, r.openDepth( Kind::PreparedPresent ) );
+    ASSERT_EQ( 2, r.ring( Kind::PreparedPresent ).count() );
+    // Closed: A is [100.000, 100.060], so a window after it is other.
+    const gui_hop_wait::Split after = r.split( 100.070, 100.080 );
+    ASSERT_NEAR( 0.0, ms( after, Kind::PreparedPresent ), 1e-6 );
+    ASSERT_NEAR( 10.0, after.otherMs, 1e-6 );
+    // A scope whose start is not finite opens nothing, so its exit cannot close another scope's interval.
+    {
+        const gui_hop_wait::IntervalScope presentC( &r, Kind::PreparedPresent, 200.000, clock );
+        {
+            const gui_hop_wait::IntervalScope bad( &r, Kind::PreparedPresent, std::numeric_limits<double>::quiet_NaN(), clock );
+        }
+        ASSERT_EQ( 1, r.openDepth( Kind::PreparedPresent ) );
+        clockNow = 200.010;
+    }
+    ASSERT_EQ( 0, r.openDepth( Kind::PreparedPresent ) );
+}
+
+TEST(GuiHopWaitSplit, AdvA4AOneUlpIntervalIsStillCharged)
+{
+    // r1 advisory A4 on df1b864e: the piece [1.0, nextafter(1.0)]'s midpoint rounds onto 1.0 and the strict
+    // start < mid test missed it, so a covered piece went to other. Coverage now compares the piece's ends.
+    gui_hop_wait::Recorder r;
+    const double hi = std::nextafter( 1.0, 2.0 );
+    r.push( Kind::RunnerSleep, 1.0, hi );
+    const gui_hop_wait::Split s = r.split( 1.0, hi );
+    ASSERT_TRUE( s.valid );
+    ASSERT_TRUE( ms( s, Kind::RunnerSleep ) > 0.0 );
+    ASSERT_EQ( 0.0, s.otherMs );
+}
