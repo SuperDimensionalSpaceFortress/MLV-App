@@ -99,13 +99,18 @@ param(
     [string]$NowUtc = '',
     # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
     # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
-    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0
+    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
+    # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe Stop-ShareUnreachable uses (ShareRootAccess.psm1); throwing means the
+    # root cannot be read. Production passes none.
+    [scriptblock]$TestShareRootProbe = $null
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueStageReuse.psm1') -Force -DisableNameChecking
+$shareRootModule = Join-Path $here '..\ShareRootAccess.psm1'
+Import-Module $shareRootModule -Force -DisableNameChecking
 Import-Module (Join-Path $here '..\bachelor\AttrCudaArtifacts.psm1') -Force -DisableNameChecking
 
 $ExitCodes = [ordered]@{
@@ -220,11 +225,27 @@ function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [int]$Sec) {
     finally { $ps.Dispose() }
 }
 
+function Stop-ShareUnreachable([string]$Detail) {
+    # MINI3-CUTOVER-STATE-GAPS-1 (adversary A13): Test-Path answers $false for a share ROOT this host has no SMB credential for (System error 5), exactly as for a
+    # missing cache, so every SHARE_UNREACHABLE exit asks the root first (one attribute read, bounded, never a listing) and prints the typed line verbatim when
+    # it is denied. The exit stays SHARE_UNREACHABLE (41); a readable or unreachable root keeps its own detail text only.
+    $state = ''
+    try {
+        if ($TestShareRootProbe) { $state = [string](Get-ShareRootAccess -Root $share -Probe $TestShareRootProbe).State }
+        else {
+            $rb = Invoke-Bounded { param($mod, $r) Import-Module -Name $mod -Force -DisableNameChecking; (Get-ShareRootAccess -Root $r).State } @($shareRootModule, $share) $ProbeTimeoutSec
+            if ($rb.ok) { $state = [string]$rb.value }
+        }
+    } catch { $state = '' }
+    if ($state -ceq 'ACCESS_DENIED') { Stop-Nightly 'SHARE_UNREACHABLE' "$Detail (the share root $share cannot be read: access denied, not a missing share; store the SMB credential for that host with cmdkey, tools\workstation\README.md step 6b)" -Verbatim @("SHARE_ACCESS_DENIED $share") }
+    Stop-Nightly 'SHARE_UNREACHABLE' $Detail
+}
+
 function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
     # A bounded by-name read; a share that does not answer ends the call SHARE_UNREACHABLE.
     $b = Invoke-Bounded $Script $ArgList $ProbeTimeoutSec
-    if ($b.timedOut) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What : $($b.error)" }
-    if (-not $b.ok) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What failed: $($b.error)" }
+    if ($b.timedOut) { Stop-ShareUnreachable "reading $What : $($b.error)" }
+    if (-not $b.ok) { Stop-ShareUnreachable "reading $What failed: $($b.error)" }
     $b.value
 }
 
@@ -389,7 +410,7 @@ function Assert-VenueFree([string]$Before) {
 }
 Assert-VenueFree 'before anything was built'
 $reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $ProbeTimeoutSec
-if (-not $reach.ok -or $reach.value -ne $true) { Stop-Nightly 'SHARE_UNREACHABLE' "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
+if (-not $reach.ok -or $reach.value -ne $true) { Stop-ShareUnreachable "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
 
 # ------------------------------------------------------------------ 4. idempotency: what the cache already holds, by name --------------------------------------------------
 $script:WorkDir = Join-Path $BuildRoot ('runs\' + $startedUtc.ToString('yyyyMMddTHHmmssZ') + "-$s12")

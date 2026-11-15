@@ -22,7 +22,8 @@ function Test-ShareAccessDeniedException {
     param([Parameter(Mandatory = $true)][AllowNull()][object]$Exception)
     $e = $Exception
     $depth = 0
-    while ($null -ne $e -and $depth -lt 8) {
+    # 64 levels: an ordinary wrapper chain is a handful deep; the bound only exists so a cyclic chain cannot spin.
+    while ($null -ne $e -and $depth -lt 64) {
         if ($e -is [System.Management.Automation.ErrorRecord]) { $e = $e.Exception; continue }
         if ($e -is [UnauthorizedAccessException]) { return $true }
         if ($e -is [System.Security.SecurityException]) { return $true }

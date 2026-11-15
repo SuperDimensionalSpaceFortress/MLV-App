@@ -115,6 +115,36 @@ Assert-That ($s -notmatch 'No agent heartbeat') 'nightly: the denied case never 
 $s = Invoke-StubbedUmRun "UMRUN_ERROR No agent heartbeat at $fakeRoot\heartbeat.txt - run install first."
 Assert-That ($s.StartsWith('STOP|SHARE_UNREACHABLE|') -and $s -match 'No agent heartbeat' -and $s -notmatch 'SHARE_ACCESS_DENIED') 'nightly: a readable share with no heartbeat keeps "No agent heartbeat" and no typed line' "got: $s"
 
+# ---------------------------------------------------------------- adversary pass r2 (head 3f561245)
+# A12: an access-denied exception wrapped deeper than 8 levels is still recognised.
+$inner = [UnauthorizedAccessException]::new('denied')
+$chain = $inner
+for ($i = 0; $i -lt 20; $i++) { $chain = [System.Exception]::new("wrapper $i", $chain) }
+Assert-That (Test-ShareAccessDeniedException -Exception $chain) 'A12 module: an UnauthorizedAccessException 20 wrappers deep is ACCESS_DENIED'
+$deepProbe = { param($r) throw $chain }
+Assert-That ((Get-ShareRootAccess -Root $fakeRoot -Probe $deepProbe).State -ceq 'ACCESS_DENIED') 'A12 module: the probe classifies the deep chain as ACCESS_DENIED'
+
+# A13: every SHARE_UNREACHABLE exit of the stage driver asks the share root first (Stop-ShareUnreachable), including the cache probe and Read-Share.
+Invoke-Expression (Get-ScriptFunctionText $nightly 'Stop-ShareUnreachable')
+Invoke-Expression (Get-ScriptFunctionText $nightly 'Read-Share')
+$share = $fakeRoot
+$ProbeTimeoutSec = 5
+function Invoke-Bounded { param($Script, $ArgList, $Sec) [pscustomobject]@{ ok = $false; timedOut = $false; value = $null; error = 'stub: not found' } }
+$TestShareRootProbe = $denied
+try { Stop-ShareUnreachable 'the agent share cache did not answer' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($s.StartsWith('STOP|SHARE_UNREACHABLE|the agent share cache did not answer') -and $s.EndsWith("|SHARE_ACCESS_DENIED $fakeRoot")) 'A13 nightly: a denied root at the cache probe prints SHARE_ACCESS_DENIED <root> verbatim and keeps SHARE_UNREACHABLE' "got: $s"
+$TestShareRootProbe = $readable
+try { Stop-ShareUnreachable 'the agent share cache did not answer' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($s -ceq 'STOP|SHARE_UNREACHABLE|the agent share cache did not answer|') 'A13 nightly: a readable root keeps the plain SHARE_UNREACHABLE detail, no typed line' "got: $s"
+$TestShareRootProbe = $notFound
+try { Stop-ShareUnreachable 'x' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($s -ceq 'STOP|SHARE_UNREACHABLE|x|') 'A13 nightly: an unreachable (not denied) root keeps the plain detail' "got: $s"
+$TestShareRootProbe = $denied
+try { [void](Read-Share 'cache\build.json' { } @()) } catch { $s = [string]$_.Exception.Message }
+Assert-That ($s.StartsWith('STOP|SHARE_UNREACHABLE|reading cache\build.json failed') -and $s.EndsWith("|SHARE_ACCESS_DENIED $fakeRoot")) 'A13 nightly: Read-Share (a by-name read on a denied share) prints the typed line too' "got: $s"
+$nightlyText = [IO.File]::ReadAllText($nightly)
+Assert-That (-not ($nightlyText -match "Stop-Nightly 'SHARE_UNREACHABLE' `"the agent share cache")) 'A13 nightly: the cache-directory probe no longer calls Stop-Nightly SHARE_UNREACHABLE directly'
+
 Write-Host ("RESULT fails={0}" -f $script:Fails)
 if ($script:Fails -gt 0) { exit 1 }
 exit 0
