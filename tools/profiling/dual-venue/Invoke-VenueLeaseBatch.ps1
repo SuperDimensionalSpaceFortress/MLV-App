@@ -1775,36 +1775,17 @@ function Get-IdleBoundConfigRefusal([int]$IdleSec, [string]$Source) {
     $null
 }
 
-function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc, $StartedUtc = $null) {
+function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs) {
     # r4 (adversary r4 A1): the agent's idle clock restarts when ITS job ended, which is before this runner saw the result (um-run's return, the leg child's own receipt work, the
-    # open's liveness cleanup). The monotonic anchor is moved EARLIER by how long ago the agent says the job ended, never later than the instant it was observed and never before
-    # the job was sent ($FloorTs). An agent clock behind this host's only shortens the allowance.
-    # r6 (adversary-848f6559.json A2): an endedUtc that says nothing usable about when the job ended (unreadable, absent, or in this host's future: an agent clock AHEAD, `ago`
-    # negative) gives the FLOOR, the job's send, never the observed instant: the job may have been over for as long as it took to come back, and that time is spent. A clock
-    # ahead by less than the job-to-observation gap still reads a positive `ago` and places the end up to that skew late (bounded by the skew, never past the observation).
-    # r7 (adversary-cc90eef2.json A1): the MONOTONIC clock is read first and the wall clock after it. A pause between the two reads then only makes `ago` longer, which places
-    # the end earlier (spent); read the other way round, the pause was added to the anchor and handed back to the idle allowance.
-    $at = ConvertTo-AgentUtc $EndedUtc
-    if ($null -eq $at) { return $FloorTs }
-    $nowTs = [Diagnostics.Stopwatch]::GetTimestamp()
-    $ago = ([DateTime]::UtcNow - $at).TotalSeconds
-    if ($ago -lt 0) {
-        # r8 (Grok G12 on #817): an agent clock AHEAD says nothing about when, but its own endedUtc - startedUtc is a duration on ONE clock (the skew cancels), and the job cannot
-        # end before it was sent plus that duration: the floor is the send plus the job's own runtime, never past the observation. Charging the bare send spent the whole leg
-        # from the idle allowance across one second of skew. No usable startedUtc (absent, unreadable, the queue-expired result's $null) or a negative runtime: the send alone.
-        # DISTINGUISH (adversary-5fc3bf72.json A1 = 2854b231 A2 = 9a56fa7a A1): a step FORWARD of the agent's clock during the job inflates that runtime, up to the observation
-        # (the pre-r4 anchor, the bound here). No runner-side reading can tell such a step from a long job: removing it needs an agent-published monotonic runtime
-        # (successor BACHELOR-AGENT-REDEPLOY-IDLESEC-1). The only skew-proof floor is the bare send, which is what G12 replaced on purpose.
-        $st = ConvertTo-AgentUtc $StartedUtc
-        if ($null -eq $st -or $st -gt $at) { return $FloorTs }
-        return [long][Math]::Min([double]$ObservedTs, $FloorTs + ($at - $st).TotalSeconds * [Diagnostics.Stopwatch]::Frequency)
-    }
-    # r8 (adversary-cc9275e3.json A1, DISTINGUISH): here the agent's clock is not seen ahead, and the end is placed by it. A clock ahead by less than the job-to-observation gap
-    # places it up to that skew late; -ProbeIdleMarginSec (the gap between the agent's bound and the runner's cap) is the skew budget for that case. The only skew-free bound,
-    # the send plus the job's runtime, would charge the job's whole queue and gate wait (an open's lease wait) every time, so it is used only once the skew is seen (above).
-    $ts = [Math]::Min($ObservedTs, $nowTs - [long]($ago * [Diagnostics.Stopwatch]::Frequency))
-    if ($ts -lt $FloorTs) { $ts = $FloorTs }
-    $ts
+    # open's liveness cleanup), so the anchor is never the observed instant.
+    # r10 (sol r9b 9a56fa7a-A1; supersedes the r4/r6/r7/r8 placement from endedUtc and endedUtc - startedUtc): the agent times its idle release on ITS wall clock and starts it
+    # AFTER the job ends (ultra-magnus-agent.ps1: `lastActivity = Get-Date` after Invoke-QueuedJob and at the park, `(Get-Date) - $b.lastActivity` in Update-LeaseBatchHold),
+    # so a step of that clock DURING the job leaves the release at the job's real end plus idleSec, while every agent stamp the runner can read moves with the step: a +90 s
+    # correction during a 100 s job placed the end 80 s late and the next wait 20 s past the release. No agent wall-clock difference is evidence of when the job ended. The
+    # earliest end this host's monotonic clock can prove is the job's send ($FloorTs, never after the observation), so that is the anchor: the job's queue, runtime and the
+    # child's own work after it are all spent from the allowance. Giving back a long job's runtime needs an agent-published monotonic runtime (successor
+    # BACHELOR-AGENT-REDEPLOY-IDLESEC-1).
+    [long][Math]::Min($ObservedTs, $FloorTs)
 }
 
 function Set-BatchLeaseIdleEnded($B, $Ie, [string]$LegName, [string]$DetailTail, [string]$LogWhy, [switch]$AppendDetail) {
@@ -2359,10 +2340,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $probeIdleCap = $(if ($null -ne $batchIdleSec) { [int]$batchIdleSec - $ProbeIdleMarginSec } else { 0 })
             # the open's job ended no later than its result was read; r3 adversary pass 2 A1: from THAT instant, so the guard and the BATCH_OPEN log append since are spent too.
             # r4 (adversary r4 A1): the instant the result RETURNED (before the liveness cleanup), moved earlier to the agent's own endedUtc for the open (Get-AgentJobEndTs)
-            # r8 (Grok G12): and its startedUtc, read only from ONE result object (member enumeration on an array would answer from inside it), kept as published (an array stays
-            # one, never unrolled into the instant inside it: adversary-cc9275e3.json A2)
-            $openStartedUtc = Get-JsonObjectMember $op.result 'startedUtc'
-            $idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs $op.result.endedUtc $openStartedUtc
+            # r10 (sol r9b 9a56fa7a-A1): from the open's submit, never from its endedUtc/startedUtc (agent wall-clock stamps a step during the job moves)
+            $idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs
             $attempt = 0
             $launchShort = $false
             while ($pending.Count -gt 0 -and $null -eq $b.endReason) {
@@ -2597,9 +2576,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # when its receipt write is denied) still has the idle anchor moved to that job's end: its own work since is spent from the allowance. The anchor moves only on
                 # the leg job's own result: with none (the child died before its job landed one, or the read failed) nothing shows the agent's idle clock restarted, so it stays.
                 $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $legJobId
-                # r8 (Grok G12): the job's startedUtc too (an agent clock ahead then charges the send plus the job's own runtime), read only from ONE result object and kept as
-                # published (adversary-cc9275e3.json A2: an array-valued startedUtc stays an array, which is no instant: the send alone)
-                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $legStartedUtc = Get-JsonObjectMember $jr.result 'startedUtc'; $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc $legStartedUtc }
+                # r10 (sol r9b 9a56fa7a-A1): from the leg's launch, never from the job's endedUtc/startedUtc (agent wall-clock stamps a step during the job moves)
+                if ($jr.state -ceq 'FOUND' -and $null -ne $jr.result) { $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
                     # r6 (adversary r6 A2): the row keeps heatAtProbe. r7: this note sits on its own line, because the failing-action body pin

@@ -89,17 +89,48 @@ KNOWN_WALL_DEADLINES = frozenset({
 
 
 def _mixed_clock_code(line: str) -> str:
+    # r10 (sol r9b 13e99849-A2): a PowerShell comment is a `#` outside a quoted string at the line start or after whitespace, with or without a space after it
+    # (`$t0 = [DateTime]::UtcNow #captured`); the r9 strip wanted `# ` and kept `#captured`, so the anchor read missed it. A `#` inside a string or a word stays.
     s = line.strip()
-    if s.startswith("#"):
-        return ""
-    return re.sub(r"\s+#\s.*$", "", s)
+    quote = ""
+    for i, ch in enumerate(s):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "#" and (i == 0 or s[i - 1].isspace()):
+            return s[:i].rstrip()
+    return s
+
+
+def _mixed_clock_statements(text: str) -> list[str]:
+    # r10 (sol r9b 13e99849-A2): PowerShell continues a statement onto the next line after an assignment operator (`$t0 =` then `[DateTime]::UtcNow`) or a trailing
+    # backtick; those lines are joined into the one statement they are, so a multiline anchor or deadline reads like the single-line one.
+    out: list[str] = []
+    pending = ""
+    for c in (_mixed_clock_code(x) for x in text.splitlines()):
+        if not c:
+            continue
+        if pending:
+            c = f"{pending} {c}"
+            pending = ""
+        if c.endswith("`"):
+            pending = c[:-1].rstrip()
+        elif re.search(r"(?<![=!<>])=$", c):
+            pending = c
+        else:
+            out.append(c)
+    if pending:
+        out.append(pending)
+    return out
 
 
 def mixed_clock_deadline_hits(files: dict[str, str]) -> set[tuple[str, str, str]]:
     """(file, rule, code line) for every mixed wall/monotonic deadline in the given {file name: text}."""
     hits: set[tuple[str, str, str]] = set()
     for name, text in files.items():
-        code = [c for c in (_mixed_clock_code(x) for x in text.splitlines()) if c]
+        code = _mixed_clock_statements(text)
         anchors = {m.group(1).lower() for c in code for m in MIXED_CLOCK_ANCHOR_RX.finditer(c)}
         # a FRAME: a function or statement that adds the Stopwatch time since an anchor to it (Get-WaitNowUtc), on a line that is not itself an anchor read
         framed = {a for a in anchors if any(re.search(rf"\${a}\b", c, re.I) and MIXED_CLOCK_MONO_RX.search(c) and not MIXED_CLOCK_ANCHOR_RX.search(c) for c in code)}
@@ -1334,7 +1365,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout)
-        self.assertGreaterEqual(got["statements"], 3, got)
+        # r10 (sol r9b 9a56fa7a-A1): the helper reads no clock at all now (the send, floored at the observation), so its body may be one statement; the pause bound still holds
+        self.assertGreaterEqual(got["statements"], 1, got)
         self.assertTrue(got["atOrAboveFloor"], got)
         self.assertLessEqual(got["lateSec"], 0.3, f"a pause between the clock reads placed the agent job's end late (time handed back to the idle allowance): {got}")
 
@@ -1484,14 +1516,16 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # Get-AgentJobEndTs returned the bare send whenever the agent's endedUtc lay in this host's future, so one second of skew past the job-to-observation gap charged the whole
         # job to the idle allowance. endedUtc - startedUtc is a duration on the agent's one clock (the skew cancels) and the job cannot end before send + that: the floor is that,
         # never past the observation. startedUtc absent, JSON null (the queue-expired result), unreadable, or after endedUtc: the send alone. A clock behind is unchanged.
+        # r10 (sol r9b 9a56fa7a-A1) SUPERSEDES the send-plus-runtime floor: endedUtc - startedUtc is a difference on the agent's wall clock, which a step during the job inflates
+        # (a +90 s correction in a 100 s job read 190 s). Every input below now gives the send (the helper no longer takes the agent's stamps; extra arguments are ignored).
         script = (
             f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
             "foreach ($n in 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
             "$f = [Diagnostics.Stopwatch]::Frequency; $now = [Diagnostics.Stopwatch]::GetTimestamp(); $floor = $now - 20 * $f; $obs = $now - 1 * $f\n"
             "$e = [DateTime]::UtcNow.AddSeconds(5); $es = $e.ToString('o')\n"
             "$out = [ordered]@{}\n"
-            "$r = Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-6).ToString('o')); $out['aheadRuntime'] = [Math]::Abs($r - ($floor + 6 * $f)) -lt 0.01 * $f\n"
-            "$out['aheadRuntimePastObs'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-60).ToString('o'))) -eq $obs\n"
+            "$out['aheadRuntimeIsTheSend'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-6).ToString('o'))) -eq $floor\n"
+            "$out['aheadLongRuntimeIsTheSend'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-60).ToString('o'))) -eq $floor\n"
             "$out['aheadStartedNull'] = (Get-AgentJobEndTs $obs $floor $es $null) -eq $floor\n"
             "$out['aheadStartedAbsent'] = (Get-AgentJobEndTs $obs $floor $es) -eq $floor\n"
             "$out['aheadStartedUnreadable'] = (Get-AgentJobEndTs $obs $floor $es 'not-a-time') -eq $floor\n"
@@ -1502,15 +1536,70 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         )
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(json.loads(out.stdout), {"aheadRuntime": True, "aheadRuntimePastObs": True, "aheadStartedNull": True, "aheadStartedAbsent": True,
+        self.assertEqual(json.loads(out.stdout), {"aheadRuntimeIsTheSend": True, "aheadLongRuntimeIsTheSend": True, "aheadStartedNull": True, "aheadStartedAbsent": True,
                                                   "aheadStartedUnreadable": True, "aheadStartedAfterEnd": True, "aheadStartedArray": True, "pastUnchanged": True})
-        # both callers pass the result's startedUtc, read only from ONE result object and kept as published (adversary-cc9275e3.json A2: never through `$(...)`, which unrolls)
+        # r10: neither caller passes an agent stamp any more (the r10 grid test pins both call lines); none unrolls one either
         src = RUNNER.read_text(encoding="utf-8")
-        self.assertIn("$openStartedUtc = Get-JsonObjectMember $op.result 'startedUtc'", src)
-        self.assertIn("$op.result.endedUtc $openStartedUtc", src)
-        self.assertIn("$legStartedUtc = Get-JsonObjectMember $jr.result 'startedUtc'; $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs $jr.result.endedUtc $legStartedUtc", src)
+        self.assertNotIn("$openStartedUtc", src)
+        self.assertNotIn("$legStartedUtc", src)
         self.assertNotIn("{ $op.result.startedUtc }", src)
         self.assertNotIn("{ $jr.result.startedUtc }", src)
+
+    # ---------------------------------------------------------------- r10 (sol r9b 9a56fa7a-A1): an agent-clock step during a job never returns spent idle time
+    def test_lease_batch_idle_end_r10_sol_9a56fa7a_a1_an_agent_clock_step_during_a_job_never_extends_the_next_idle_allowance(self) -> None:
+        # The agent times its idle release on ITS wall clock and starts that clock AFTER the job ends (ultra-magnus-agent.ps1: `lastActivity = Get-Date` in the inbox loop's
+        # finally after Invoke-QueuedJob and at the park in Exit-HeavySlot, compared by `(Get-Date) - $b.lastActivity` in Update-LeaseBatchHold), so a step of that clock
+        # DURING the job does not move the release: it is the job's real end plus idleSec. The runner placed the end from endedUtc (and, ahead, endedUtc - startedUtc), both
+        # agent-wall-clock readings, so a forward step put the anchor late and handed spent time back. sol's input: send 12:00:00Z, agent +30 s (startedUtc 12:00:30Z), a real
+        # 100 s job with a +90 s correction (endedUtc 12:03:40Z), observed at send+180, idleSec 300, margin 60, ProbeMaxWaitSec 600: the next wait ended at send+420, past the
+        # release at send+400. For EVERY offset/step/queue on the grid, the next wait must end no later than the release less the margin, and the anchor no later than the true end.
+        agent = AGENT.read_text(encoding="utf-8")
+        self.assertIn("Exit-HeavySlot\n                if ($null -ne $script:LeaseBatch) { $script:LeaseBatch.lastActivity = Get-Date }", agent.replace("\r\n", "\n"))
+        self.assertIn("$idle = ((Get-Date) - $b.lastActivity).TotalSeconds", agent)
+        script = (
+            f"{ps_parse_source(RUNNER)}\n"
+            "foreach ($n in 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs', 'Get-IdleAllowanceSec') { $d = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($d) { . ([scriptblock]::Create($d.Extent.Text)) } }\n"
+            "$f = [double][Diagnostics.Stopwatch]::Frequency; $idleSec = 300; $margin = 60; $probeIdleCap = $idleSec - $margin; $obsSec = 180\n"
+            "$bad = [System.Collections.Generic.List[string]]::new(); $n = 0; $sol = $null\n"
+            "foreach ($offset in @(-60, 0, 30, 120)) { foreach ($step in @(-120, -30, 0, 30, 50, 79, 90, 150)) { foreach ($queue in @(0, 40)) {\n"
+            "  $nowTs = [Diagnostics.Stopwatch]::GetTimestamp(); $nowUtc = [DateTime]::UtcNow\n"
+            "  $sendTs = $nowTs - [long]($obsSec * $f); $sendUtc = $nowUtc.AddSeconds(-$obsSec); $realEnd = $queue + 100\n"
+            "  $startedUtc = $sendUtc.AddSeconds($queue + $offset).ToString('o'); $endedUtc = $sendUtc.AddSeconds($realEnd + $offset + $step).ToString('o')\n"
+            "  $idleAnchorTs = Get-AgentJobEndTs $nowTs $sendTs $endedUtc $startedUtc\n"
+            "  $waitEnd = $obsSec + [Math]::Min(600, (Get-IdleAllowanceSec)); $lateSec = ($idleAnchorTs - ($sendTs + [long]($realEnd * $f))) / $f; $n++\n"
+            "  if ($offset -eq 30 -and $step -eq 90 -and $queue -eq 0) { $sol = [ordered]@{ waitEndSec = $waitEnd; releaseSec = $realEnd + $idleSec; anchorLateSec = [Math]::Round($lateSec, 2) } }\n"
+            "  if ($waitEnd -gt $realEnd + $idleSec - $margin -or $lateSec -gt 0.5) { $bad.Add(\"offset=$offset step=$step queue=$queue waitEnd=$waitEnd release=$($realEnd + $idleSec) late=$([Math]::Round($lateSec, 1))\") }\n"
+            "} } }\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-AgentJobEndTs' }, $true)\n"
+            "[ordered]@{ cases = $n; bad = @($bad); sol = $sol; readsAgentOrWallClock = [bool](((@($fn.Parameters | ForEach-Object { $_.Extent.Text }) + @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text })) -join \"`n\") -match 'UtcNow|Get-Date|ConvertTo-AgentUtc|EndedUtc|StartedUtc') } | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["cases"], 64, got)
+        self.assertLessEqual(got["sol"]["waitEndSec"], got["sol"]["releaseSec"] - 60, f"sol's input: the next wait runs past the agent's idle release less the margin: {got['sol']}")
+        self.assertEqual(got["bad"], [], "an agent-clock step the runner cannot see moved the idle anchor past the job's true end")
+        self.assertFalse(got["readsAgentOrWallClock"], "the job-end anchor reads an agent wall-clock stamp (or this host's wall clock): a step of either moves it")
+        # both callers hand the anchor only monotonic instants: the open (its result's return, floored at its submit) and a leg (its child's return, floored at its launch)
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("$idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs\n", src.replace("\r\n", "\n"))
+        self.assertIn("{ $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs }", src)
+        self.assertNotRegex(src, r"Get-AgentJobEndTs [^\n]*(?:endedUtc|startedUtc)")
+
+    def test_lease_batch_idle_end_r10_sol_9a56fa7a_a1_a_forward_agent_step_under_the_observation_gap_is_spent_end_to_end(self) -> None:
+        # the ago >= 0 branch of the same class, run end to end: agent bound 70, margin 60 (10 s). The leg child works 6 s after its job and the agent's endedUtc reads 3 s late
+        # (a forward step smaller than the job-to-observation gap, so `ago` stays positive): placed from endedUtc the next probe waited about 7 s; from the leg's launch at most 4.
+        # Control: the same leg with no step. The open sibling is the same helper (the grid test above pins both call sites); the fake open's job ends at its return.
+        for name, env, which in (("leg-step", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_ENDED_AHEAD_SEC": "3"}, 1),
+                                 ("leg-no-step", {"FAKE_LEG_TAIL_SLEEP": "6"}, 1)):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", **env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertLessEqual(waits[which], 4, f"{name}: a forward agent-clock step handed spent time back to the idle allowance: {waits}")
 
     def test_lease_batch_idle_end_r8_adv_5fc3bf72_a2_wait_venue_quiet_times_every_deadline_on_the_monotonic_clock(self) -> None:
         # adversary-5fc3bf72.json A2: Wait-VenueQuiet compared [DateTime]::UtcNow with its deadline and gate end, so this host's clock stepping BACK 120 s mid-wait stretched a
@@ -1638,10 +1727,19 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                                "function Get-WaitNowUtc { $T0.AddSeconds(([System.Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / 1.0) }\n"
                                "if ([DateTime]::UTCNOW -gt $Deadline) { break }\n"),
         })
+        # r10 (sol r9b 13e99849-A2, its two strings verbatim): a trailing comment with no space after `#`, and a multiline assignment (the operator ends the line); the
+        # single-line control (case-lower-anchor above) stays detected. Siblings of the same shape: a backtick continuation, and a comment on the multiline anchor.
+        red.update({
+            "sol-r9b-trailing-comment.ps1": "$t0 = [DateTime]::UtcNow #captured\n$deadline = $t0.AddSeconds(30)\n",
+            "sol-r9b-multiline.ps1": "$t0 =\n [DateTime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
+            "backtick-continuation.ps1": "$t0 = `\n    [DateTime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
+            "multiline-commented.ps1": "$t0 =   # the anchor\n    [DateTime]::UtcNow #captured\n$deadline = $t0.AddSeconds(30)\n",
+        })
         want = {"g14-2854b231.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"}, "reconcile-pre-r9.ps1": {"CAPTURED_WALL"}, "wvq-5fc3bf72.ps1": {"FRAME_WALL_READ"},
                 "case-lower-anchor.ps1": {"CAPTURED_WALL"}, "case-upper-var.ps1": {"CAPTURED_WALL"}, "case-wait-until.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"},
                 "case-cge-break.ps1": {"CAPTURED_WALL"}, "offset-anchor.ps1": {"CAPTURED_WALL"}, "case-frame.ps1": {"FRAME_WALL_READ"},
-                "paren-anchor.ps1": {"CAPTURED_WALL"}}
+                "paren-anchor.ps1": {"CAPTURED_WALL"}, "sol-r9b-trailing-comment.ps1": {"CAPTURED_WALL"}, "sol-r9b-multiline.ps1": {"CAPTURED_WALL"},
+                "backtick-continuation.ps1": {"CAPTURED_WALL"}, "multiline-commented.ps1": {"CAPTURED_WALL"}}
         for name, text in red.items():
             with self.subTest(fixture=name):
                 self.assertEqual({rule for (n, rule, _c) in mixed_clock_deadline_hits({name: text})}, want[name])
@@ -1691,7 +1789,10 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # job-to-observation gap), and the child works 2 s after its job. Charged from the bare send, the next probe's wait was 0; from the send plus the job's own runtime it is
         # about the allowance less the post-job gap (at most 8 s). startedUtc JSON null (the queue-expired shape): the send alone, so 0.
         # r8 (adversary-cc9275e3.json A2): startedUtc inside a one-element array is no instant either: the send alone, so 0 (the caller's `$(...)` unrolled it into the string inside)
-        for name, env, lo, hi in (("runtime", {}, 2, 8), ("started-null", {"FAKE_LEG_STARTED": "null"}, 0, 0), ("started-array", {"FAKE_LEG_STARTED": "array"}, 0, 0)):
+        # r10 (sol r9b 9a56fa7a-A1) SUPERSEDES the "runtime" case: the job's runtime as the agent's stamps tell it is an agent wall-clock difference a step during the job inflates,
+        # so a long leg is charged from its launch: the 15 s job and the 2 s tail exceed the 10 s allowance and the next probe's wait is 0 (giving the runtime back needs an
+        # agent-published monotonic runtime, successor BACHELOR-AGENT-REDEPLOY-IDLESEC-1).
+        for name, env, lo, hi in (("runtime", {}, 0, 0),("started-null", {"FAKE_LEG_STARTED": "null"}, 0, 0), ("started-array", {"FAKE_LEG_STARTED": "array"}, 0, 0)):
             with self.subTest(case=name):
                 self.setUp()
                 self._tree_with_agent_idle(b"70")
