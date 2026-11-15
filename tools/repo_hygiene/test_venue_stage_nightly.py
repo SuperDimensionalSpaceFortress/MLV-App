@@ -1179,6 +1179,17 @@ class VenueStageNightlyTests(unittest.TestCase):
         # never a remainder of it ("cut the 3.4 s bound short")
         self.assertEqual(m.group(2), "300", both)
 
+    def test_r14_a1_the_least_accepted_bound_still_reads(self) -> None:
+        # r14 fix iteration 1 (adversary A1 on f7408e9f, VenueChain.psm1:723, sibling :716): -TimeoutSec 1 and -CallCapSec 1 are the least the call accepts, and
+        # the read refused under 1 s left, so ANY preparation time made them UNREACHABLE ("0.99 s left, under 1") before a read. RED: UNREACHABLE for both.
+        absent = self.case / "r14-a1-no-cache"
+        for args in ("-TimeoutSec 1", "-TimeoutSec 5 -CallCapSec 1"):
+            with self.subTest(args=args):
+                ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; "
+                      f"$r = Get-VenueStagedBuildManifest -AgentShare '{absent}' -SourceCommit '{SHA}' {args}; 'STATE=' + $r.state + ' ERROR=[' + $r.error + ']'")
+                p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                self.assertIn("STATE=NOT_STAGED ERROR=[]", p.stdout, p.stdout + p.stderr)
+
     def _r12_seamed_call(self, share: Path, seam: str, args: str, probe: str) -> tuple[str, float, str]:
         ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; & (Get-Module VenueChain) {{ {seam} }}; "
               "$sw = [Diagnostics.Stopwatch]::StartNew(); "

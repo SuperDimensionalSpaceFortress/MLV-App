@@ -494,7 +494,9 @@ function Enter-AttrCudaStageLock {
     r14 (adversary A2 on 5fe750fa): a Global\ mutex is HOST-local, so it excludes only stagers on
     THIS host. A root on another host's volume (a mapped drive, or a link into a share) is refused
     with ATTRCUDA_STAGE_ROOT_NOT_LOCAL, never locked: its other stagers would never see this lock.
-    -TestDriveType and -TestLocalVolumeSerials are test-only seams; production passes neither.
+    The check reads the root's FINAL path by volume GUID name: only a volume mounted on this host
+    has one, and its drive type must be FIXED. -TestRootVolumeType is a test-only seam; production
+    passes none.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -502,23 +504,39 @@ function Enter-AttrCudaStageLock {
         [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
         [int]$WaitSec = 1800,
         [string]$WaitMarkerPath = '',
-        [string]$TestDriveType = '',
-        [string[]]$TestLocalVolumeSerials = $null
+        [string]$TestRootVolumeType = ''
     )
 
     $id = Get-AttrCudaFileId -Path $Root -FollowLinks
     # r14 (adversary A2 on 5fe750fa, siblings stage job :69/:376/:515 and Publish-AttrCudaFileMove :2872): host B with Z: mapped to host A's share and host A on
-    # its local path both took "the" lock -- two host-local mutexes -- and both passed the absent-manifest guard; A then cleared B's published artifact. Two checks,
-    # both before any lock: (1) the root's drive letter is a local FIXED drive (a mapped Z: is Network; no drive letter is refused too), and (2) the root's FINAL
-    # volume, read through its links, is one of this host's local fixed volumes (a link on C: into \\host\share lands on the share's volume).
-    $drive = [IO.Path]::GetPathRoot($Root)
-    $driveType = $(if ($TestDriveType) { $TestDriveType } elseif ($drive -match '^[A-Za-z]:\\\z') { [string]([IO.DriveInfo]::new($drive).DriveType) } else { 'NoDriveLetter' })
-    if ($driveType -cne 'Fixed') { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's drive '$drive' is $driveType, not a local fixed drive: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
-    $localSerials = @(if ($null -ne $TestLocalVolumeSerials) { $TestLocalVolumeSerials } else {
-            foreach ($d in [IO.DriveInfo]::GetDrives()) {
-                if ([string]$d.DriveType -ceq 'Fixed' -and $d.IsReady) { try { [string](Get-AttrCudaFileId -Path $d.RootDirectory.FullName -FollowLinks).VolumeSerialNumber } catch { } }
-            } })
-    if ($localSerials -notcontains [string]$id.VolumeSerialNumber) { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume (serial $([string]$id.VolumeSerialNumber), read through its links) is not a local fixed volume of this host: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
+    # its local path both took "the" lock -- two host-local mutexes -- and both passed the absent-manifest guard; A then cleared B's published artifact. So the root
+    # is refused, before any lock, unless its FINAL volume (links followed: a link on C: into \\host\share lands on the share) is a local fixed volume of this host.
+    # r14 fix iteration 1 (adversary A2 + A3 on f7408e9f): never by volume serial (two hosts' volumes can share one, and a volume mounted only in a folder has no drive
+    # letter to enumerate). The root is opened (links followed) and its FINAL path asked for by VOLUME GUID name (GetFinalPathNameByHandleW, VOLUME_NAME_GUID): only a
+    # volume mounted on THIS host has one -- a handle on a share has none and the call fails -- and that volume's own drive type must be FIXED (GetDriveTypeW).
+    $volumeType = $TestRootVolumeType
+    if (-not $volumeType) {
+        if (-not ('AttrCudaWin32.StageRootNative' -as [type])) {
+            Add-Type -Namespace AttrCudaWin32 -Name StageRootNative -MemberDefinition (@(
+                    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);',
+                    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle h, System.Text.StringBuilder p, uint n, uint f);',
+                    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetDriveTypeW(string r);') -join "`n")
+        }
+        # FILE_READ_ATTRIBUTES, share all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory; reparse points followed, as -FollowLinks above)
+        $handle = [AttrCudaWin32.StageRootNative]::CreateFileW($Root, [uint32]0x80, [uint32]7, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)
+        try {
+            $final = ''
+            if (-not $handle.IsInvalid) {
+                $buffer = [Text.StringBuilder]::new(32768)
+                $n = [AttrCudaWin32.StageRootNative]::GetFinalPathNameByHandleW($handle, $buffer, [uint32]32768, [uint32]1)
+                if ($n -gt 0 -and $n -lt 32768) { $final = $buffer.ToString() }
+            }
+        } finally { $handle.Dispose() }
+        $volumeType = $(if ($final -match '^\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\') {
+                switch ([AttrCudaWin32.StageRootNative]::GetDriveTypeW($Matches[0])) { 3 { 'Fixed' } 2 { 'Removable' } 4 { 'Network' } 5 { 'CDRom' } 6 { 'RamDisk' } default { 'Unknown' } }
+            } else { 'NoLocalVolume' })
+    }
+    if ($volumeType -cne 'Fixed') { throw "ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is $volumeType, not a local fixed volume of this host: the stage lock is a host-local Global\ mutex and cannot exclude a stager on another host" }
     $rootId ='vol=' + [string]$id.VolumeSerialNumber + ';idx=' + [string]$id.FileIndexHigh + '-' + [string]$id.FileIndexLow
     # r9 fix iteration (adversary A1 on 9825bfd9): the cache names carry the sha's first 12 hex (playback-attr-3-cuda-<sha12>-build.json and its artifacts), so the lock does too: two
     # commits that share them write the same files and must contend for the same lock (a full-sha key let both into the one name at once)

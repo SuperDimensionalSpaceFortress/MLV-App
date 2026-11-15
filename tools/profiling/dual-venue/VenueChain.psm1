@@ -713,14 +713,16 @@ function Get-VenueStagedBuildManifest {
     $boundEndSec = $(if ($CallCapSec -gt 0) { [Math]::Min($TimeoutSec, $CallCapSec) } else { $TimeoutSec })
     if ($CallCapSec -gt 0) {
         $capLeft = $CallCapSec - $readStartSec
-        if ($capLeft -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2))$(if ($null -ne $CallDeadlineUtc) { ' (-CallDeadlineUtc ' + ([DateTime]$CallDeadlineUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) + ')' }) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
+        # r14 fix iteration 1 (adversary A1 on f7408e9f, sibling :723): the floor is $script:VenueMinReadSec (0.5 s), never 1: -TimeoutSec / -CallCapSec 1 (the least
+        # they accept) less ANY preparation time was under 1 s, so the minimum bound could never read at all
+        if ($capLeft -lt $script:VenueMinReadSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2))$(if ($null -ne $CallDeadlineUtc) { ' (-CallDeadlineUtc ' + ([DateTime]$CallDeadlineUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) + ')' }) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $script:VenueMinReadSec)"; contentProblem = $null } }
     }
     # r13 (adversary A1 on 5fe750fa, siblings Invoke-VenueChain.ps1:354 / Invoke-VenueLeaseBatch.ps1:1250): the read ends at the BOUND's end on the call clock
     # ($boundEndSec: -TimeoutSec, or -CallCapSec when sooner), the end the hash below is measured against. r12 ended it at $readStartSec + -TimeoutSec, so time
     # spent before the read (preparing it, a descheduled caller) ran the call past -TimeoutSec: -TimeoutSec 1 after 1.5 s answered NOT_STAGED at ~2.2 s.
     # Under 1 s of it left (the least a read can be given) there is no read: UNREACHABLE.
     $readSec = $boundEndSec - $readStartSec
-    if ($readSec -lt 1.0) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $readSec) * 100.0) / 100.0) s left, under 1)"; contentProblem = $null } }
+    if ($readSec -lt $script:VenueMinReadSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $readSec) * 100.0) / 100.0) s left, under $script:VenueMinReadSec)"; contentProblem = $null } }
     # r14 (Grok G21 on #814): the read is handed the caller's REAL bound (-TimeoutSec) and -EndSec does the clamping, so a cut-short wait names the bound the
     # operator set ("cut the 2 s bound short"), never the remainder $readSec, which the wait's own later sample is always a little under (the clause fired on every timeout)
     $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec -Clock $callClock -EndSec $boundEndSec
@@ -845,6 +847,9 @@ function Get-VenueStagedArtifactNames {
 }
 
 $script:VenueAbandonedReads = 0
+# r14 fix iteration 1 (adversary A1 on f7408e9f): the least time a staged-manifest read may START with. Under 1, so the least bound the call accepts
+# (-TimeoutSec 1, -CallCapSec 1) still reads once its preparation took a few ms; the read itself is handed the caller's bound and ends at -EndSec.
+$script:VenueMinReadSec = 0.5
 # Test-only seams (r12 fix iteration, adversary A1/A2 on 09421b77), set from a test through the module scope; production leaves both 0. The first stalls the
 # caller between the two clock samples -CallDeadlineUtc is taken from, the second between a bounded read's launch and its wait (a descheduled caller).
 $script:VenueTestDeadlineSampleDelayMs = 0
