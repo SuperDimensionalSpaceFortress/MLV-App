@@ -1417,15 +1417,17 @@ TEST(CriticalHopSummaryWiring, AdvA1A2EmitToRequestEndsAtTheRequestsOwnIssueStam
     ASSERT_FALSE(drawFrame.isEmpty());
     const int serial = drawFrame.indexOf(QStringLiteral("const uint64_t requestSerial = m_nextRenderRequestSerial++;"));
     const int covered = drawFrame.indexOf(QStringLiteral("QTimer::singleShot( 0, this, &MainWindow::drawFrameReady );"));
+    // r2 (adversary A2 on e447bc14): the stamp follows each branch's renderFrame hand-off (AdvA2IssueStamp... below).
     const int stamp = drawFrame.indexOf(QStringLiteral(
-        "    if( m_playbackSmokeActive )\n    {\n        m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();\n        ++m_guiHopRequestIssues;\n    }\n\n    //Get frame from library"));
+        "        if( m_playbackSmokeActive )\n        {\n            m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();\n"
+        "            ++m_guiHopRequestIssues;\n        }"));
     const int firstIssue = drawFrame.indexOf(QStringLiteral("m_pRenderThread->renderFrame( requestedFrame,"));
     ASSERT_TRUE(serial >= 0);
     ASSERT_TRUE(covered > serial);   // the covered-by-lookahead return is before the stamp
-    ASSERT_TRUE(stamp > covered);
-    ASSERT_TRUE(firstIssue > stamp);
-    ASSERT_EQ(2, drawFrame.mid(stamp).count(QStringLiteral("m_pRenderThread->renderFrame( requestedFrame,")));
-    ASSERT_EQ(1, source.count(QStringLiteral("++m_guiHopRequestIssues;")));
+    ASSERT_TRUE(firstIssue > covered);
+    ASSERT_TRUE(stamp > firstIssue);
+    ASSERT_EQ(2, drawFrame.mid(covered).count(QStringLiteral("m_pRenderThread->renderFrame( requestedFrame,")));
+    ASSERT_EQ(2, source.count(QStringLiteral("++m_guiHopRequestIssues;")));
     const QString ready = bracedBlockAfter(source, QStringLiteral("void MainWindow::drawFrameReady()"));
     ASSERT_FALSE(ready.contains(QStringLiteral("hopRequestSerialBefore")));
     ASSERT_FALSE(ready.contains(QStringLiteral("m_guiHopEmitToRequestIssue.add( ( advance_start")));
@@ -1826,6 +1828,47 @@ TEST(SmokeRunnerEventWait, AdvA1BatchPostedBehindTheExpiredTimerIsCountedAsAnOve
     const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
     ASSERT_TRUE(h.contains(QStringLiteral(
         "uint64_t m_playbackSmokeRunnerEventWaitTimeouts = 0;\n    uint64_t m_playbackSmokeRunnerEventWaitOverruns = 0;")));
+}
+
+TEST(CriticalHopSummaryWiring, AdvA2IssueStampFollowsTheRenderFrameHandOffInBothBranches)
+{
+    // r2, adversary A2 on e447bc14: emit 100.000 s, issue stamp 100.005 s, the GUI descheduled before
+    // queuePresentationRequest until 100.025 s, renderFrame called at 100.025 s. The stamp before the hand-off
+    // gave 5 ms; stamped after renderFrame returns it is >= 25 ms, the hand-off included.
+    const QString source = mainWindowSource();
+    const QString drawFrame = bracedBlockAfter(source, QStringLiteral("void MainWindow::drawFrame( bool updateTimecodeLabel )"));
+    ASSERT_FALSE(drawFrame.isEmpty());
+    const QString renderCall = QStringLiteral(
+        "m_pRenderThread->renderFrame( requestedFrame,\n"
+        "                                      renderOutputMode,\n"
+        "                                      m_renderThreadUsingGpuBilinearDebayer,\n"
+        "                                      m_renderThreadUsingGpuAmazeDebayer,\n"
+        "                                      requestSerial,\n"
+        "                                      requestContext,\n"
+        "                                      presentationPreparation );\n");
+    const QString stamp = QStringLiteral(
+        "        if( m_playbackSmokeActive )\n        {\n            m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();\n"
+        "            ++m_guiHopRequestIssues;\n        }\n");
+    ASSERT_EQ(2, drawFrame.count(renderCall));
+    ASSERT_EQ(2, drawFrame.count(renderCall + stamp));        // each hand-off is immediately followed by its stamp
+    ASSERT_EQ(2, drawFrame.count(QStringLiteral("m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();")));
+    // Nothing stamps before the hand-off any more.
+    const int library = drawFrame.indexOf(QStringLiteral("//Get frame from library"));
+    ASSERT_TRUE(library > 0);
+    ASSERT_EQ(0, drawFrame.left(library).count(QStringLiteral("m_guiHopLastRequestIssueStageTime")));
+    for (int at = drawFrame.indexOf(QStringLiteral("queuePresentationRequest( requestContext );")); at >= 0;
+         at = drawFrame.indexOf(QStringLiteral("queuePresentationRequest( requestContext );"), at + 1))
+    {
+        const int call = drawFrame.indexOf(renderCall, at);
+        const int stampAt = drawFrame.indexOf(stamp, at);
+        if (!(call > at && stampAt > call)) ::minitest::fail(__FILE__, __LINE__, "stamp after hand-off", "");
+    }
+    // The consumer reads that stamp (MainWindow.cpp drawFrameReady early advance).
+    ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("void MainWindow::drawFrameReady()")).contains(QStringLiteral(
+        "( m_guiHopLastRequestIssueStageTime - readyFrame.frameReadyEmitStageTime ) * 1000.0 );")));
+    gui_hop_wait::MeanMs hop;
+    hop.add((100.025 - 100.000) * 1000.0);
+    ASSERT_TRUE(hop.avg() >= 25.0 - 1e-6);
 }
 
 TEST(SmokeRunnerEventWait, AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsUndelivered)

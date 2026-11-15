@@ -7741,11 +7741,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
     // CPU-S1-PRESENT-INTERVAL-BOUND-1 r1 fix iteration 1 (adversary A1/A2 on 6a6d7ef4): the instant this request is
     // handed to the render thread (both branches below issue it; a covered-by-lookahead request returned above
     // without one). The early advance in drawFrameReady reads this, never the request serial counter.
-    if( m_playbackSmokeActive )
-    {
-        m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();
-        ++m_guiHopRequestIssues;
-    }
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r2 (adversary A2 on e447bc14): stamped AFTER renderFrame returns in each
+    // branch, so a deschedule between queuePresentationRequest and the hand-off is inside the measured hop.
 
     //Get frame from library
     if( ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
@@ -7759,6 +7756,11 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                                       requestSerial,
                                       requestContext,
                                       presentationPreparation );
+        if( m_playbackSmokeActive )
+        {
+            m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();
+            ++m_guiHopRequestIssues;
+        }
         if( timelineAdvanceForRequest )
         {
             m_playbackTimelineIssuedRequestSerial = requestSerial;
@@ -7785,6 +7787,11 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                                       requestSerial,
                                       requestContext,
                                       presentationPreparation );
+        if( m_playbackSmokeActive )
+        {
+            m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();
+            ++m_guiHopRequestIssues;
+        }
         if( timelineAdvanceForRequest )
         {
             m_playbackTimelineIssuedRequestSerial = requestSerial;
@@ -35495,7 +35502,8 @@ void MainWindow::drawFrameReady()
             timerFrameEvent( predictiveGpuTexNrEarlyAdvance );
             const double advance_return = mlv_stage_timing_now();
             // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop from this frame's frameReady emit to the next request's
-            // issue (drawFrame's stamp at its renderFrame hand-off), on the advances that issued one.
+            // issue (drawFrame's stamp at its renderFrame hand-off), on the advances that issued one. r2 (adversary
+            // A2 on e447bc14): that stamp is taken after renderFrame returns, so the hop includes the hand-off.
             if( m_playbackSmokeActive
              && m_guiHopRequestIssues != hopRequestIssuesBefore
              && readyFrame.frameReadyEmitStageTime > 0.0
