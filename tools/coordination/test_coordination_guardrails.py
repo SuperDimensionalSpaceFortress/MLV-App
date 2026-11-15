@@ -1183,11 +1183,11 @@ $ErrorActionPreference = 'Stop'
 # letters are read only where a class is NAMED (Test-WmiWord), never from free text.
 # An identifier character is what PowerShell reads as one: any Unicode letter or decimal digit, or `_` (r16, adversary pass 24 A2: `$ManagementClass<e-acute>` is one
 # identifier, and an ASCII-only boundary matched the watched word inside it).
-$wmiWord = [regex]::new('(?i)(?<![\p{L}\p{Nd}_])(?:win32(?:_|\[_\])(?:process(?![\p{L}\p{Nd}_?])|(?:p|pr|pro|proc|proce|proces)?[*%?\[])|win32[*%?\[]|(?:wmiclass|managementclass|meta_class|__class|__this|__derivation|__dynasty|__superclass)(?![\p{L}\p{Nd}_?]))')
+$wmiWord = [regex]::new('(?i)(?<![\p{L}\p{Nd}_?])(?:win32(?:_|\[_\])(?:process(?![\p{L}\p{Nd}_?])|(?:p|pr|pro|proc|proce|proces)?[*%?\[])|win32[*%?\[]|(?:wmiclass|managementclass|meta_class|__class|__this|__derivation|__dynasty|__superclass)(?![\p{L}\p{Nd}_?]))')
 $wmiCommands = @('invoke-cimmethod', 'invoke-wmimethod', 'icim', 'iwmi')
 $wmiTypes = '(^|\.)(wmiclass|wmi|ManagementClass)$'
 # The type names a command can be given as text (New-Object System.Management.ManagementClass 'Win32_Process'); a whole word, as in $wmiWord.
-$wmiTypeWord = [regex]::new('(?i)(?<![\p{L}\p{Nd}_])(?:wmiclass|managementclass)(?![\p{L}\p{Nd}_?])')
+$wmiTypeWord = [regex]::new('(?i)(?<![\p{L}\p{Nd}_?])(?:wmiclass|managementclass)(?![\p{L}\p{Nd}_?])')
 $quoteChars = '["' + "'" + [char]0x2018 + [char]0x2019 + [char]0x201A + [char]0x201B + [char]0x201C + [char]0x201D + [char]0x201E + ']'
 $quoteOrEscape = '[#`' + $quoteChars.Substring(1)
 
@@ -1250,14 +1250,26 @@ function Test-InBlankedCondition($Node, $Root) {
 # The commands whose text goes to a DIAGNOSTIC stream (verbose, debug, warning, information, host, progress, error), never to the success stream a `$( )` operand
 # takes its value from (r18, sol r16 B2). A module-qualified spelling (Microsoft.PowerShell.Utility\Write-Verbose) is the same command.
 $diagnosticCommands = @('write-verbose', 'write-debug', 'write-warning', 'write-information', 'write-host', 'write-progress', 'write-error')
+# True when a command in the node, or around it, merges a stream INTO the success stream (`4>&1`, `6>&1`, `*>&1`, `2>&1`): the merged text is part of the value.
+# A redirection to a file or `$null` (`4>$null`, `*> log.txt`) merges nothing (r19 fix 2, pass 27 A2).
+function Test-MergesIntoSuccess($Node) {
+    $holders = @($Node.FindAll({ param($x) $x -is [CommandBaseAst] }, $true))
+    for ($p = $Node; $null -ne $p; $p = $p.Parent) { if ($p -is [CommandBaseAst]) { $holders += $p } }
+    foreach ($h in $holders) {
+        foreach ($r in @($h.Redirections)) {
+            if ($r -is [MergingRedirectionAst] -and $r.ToStream -eq [RedirectionStream]::Output) { return $true }
+        }
+    }
+    return $false
+}
 # True when the node is a pipeline that ENDS in a diagnostic command: `Write-Verbose 'x'` and `'x' | Write-Verbose` hand nothing on to the operand's value.
 function Test-IsDiagnosticPipeline($Node) {
     if ($Node -isnot [PipelineAst]) { return $false }
     # r19, adversary pass 26 A1: a REDIRECTION on the pipeline (`6>&1`, `4>&1`, `*>&1`) can merge the diagnostic stream into the success stream, and a file that rebinds a
     # diagnostic command (a function, or an alias, of that name) hands its text on: in both the text is the value again.
     if ($diagnosticShadowed) { return $false }
-    if (@($Node.FindAll({ param($x) $x -is [RedirectionAst] }, $true)).Count -gt 0) { return $false }
-    $last = @($Node.PipelineElements)[-1]
+    if (Test-MergesIntoSuccess $Node) { return $false }
+    $last =@($Node.PipelineElements)[-1]
     if ($last -isnot [CommandAst]) { return $false }
     $name = $last.GetCommandName()
     if ([string]::IsNullOrEmpty($name)) { return $false }
@@ -1984,9 +1996,27 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     $comments = @($tokens | Where-Object { $_.Kind -eq [TokenKind]::Comment })
     # True when the file defines a FUNCTION named like a diagnostic command, or a command that defines or sets an ALIAS and spells one (Set-Alias, New-Alias, sal, nal,
     # Set-Item / New-Item on Alias:): the diagnostic name may then give its text to the success stream (r19, adversary pass 26 A1).
-    $diagnosticNamePattern = '(?i)write-(verbose|debug|warning|information|host|progress|error)'
-    $diagnosticShadowed = (@($ast.FindAll({ param($x) $x -is [FunctionDefinitionAst] -and $x.Name -match $diagnosticNamePattern }, $true)).Count -gt 0) -or
-        (@($ast.FindAll({ param($x) $x -is [CommandAst] -and $x.Extent.Text -match $diagnosticNamePattern -and $x.Extent.Text -match '(?i)alias|\bsal\b|\bnal\b' }, $true)).Count -gt 0)
+    # The test reads NAMES (r19 fix 2, pass 27 A1, A4): a function name with its backtick escapes and scope prefix removed is the diagnostic command's whole name; an
+    # alias-making command is read by its COMMAND name, and counts when its alias name is not a plain literal (it can be anything) or is a diagnostic name.
+    $diagnosticNamePattern = '(?i)^(?:[a-z]+:)?(?:.*\\)?write-(?:verbose|debug|warning|information|host|progress|error)$'
+    $diagnosticShadowed = $false
+    foreach ($fn in @($ast.FindAll({ param($x) $x -is [FunctionDefinitionAst] }, $true))) {
+        if (($fn.Name -replace '`', '') -match $diagnosticNamePattern) { $diagnosticShadowed = $true }
+    }
+    foreach ($ac in @($ast.FindAll({ param($x) $x -is [CommandAst] }, $true))) {
+        $acn = $ac.GetCommandName()
+        if ($null -eq $acn) { continue }
+        $acn = (($acn -replace '^.*[\\/]', '').ToLowerInvariant())
+        if (@('set-alias', 'new-alias', 'sal', 'nal') -contains $acn) {
+            # The alias name may be named or positional, so EVERY operand is read: a computed one (a variable, an expression) can be anything, a literal one is compared.
+            foreach ($ae in @($ac.CommandElements | Select-Object -Skip 1)) {
+                $av = if ($ae -is [CommandParameterAst]) { $ae.Argument } else { $ae }
+                if ($null -eq $av) { continue }
+                if ($av -isnot [StringConstantExpressionAst] -or (([string]$av.Value -replace '`', '') -match $diagnosticNamePattern)) { $diagnosticShadowed = $true }
+            }
+        }
+        elseif (@('import-alias', 'ipal', 'set-item', 'si', 'new-item', 'ni') -contains $acn -and (Get-CleanText $ac) -match '(?i)alias') { $diagnosticShadowed = $true }
+    }
     $assignments =@($ast.FindAll({ param($x) $x -is [AssignmentStatementAst] }, $true))
     $foreachAsts = @($ast.FindAll({ param($x) $x -is [ForEachStatementAst] }, $true))
     $parameterAsts = @($ast.FindAll({ param($x) $x -is [ParameterAst] }, $true))
@@ -3093,6 +3123,39 @@ def test_wmi_create_scan_r19_pass_26_a1_a2_a3(tmp_path):
     missed = [n for n in refused if not got[n]]
     false_alarms = sorted(n for n, s in got.items() if n in accepted and s)
     assert (missed, false_alarms) == ([], []), "missed (a real value or an unchanged control must be refused), false alarms (data must be accepted)"
+
+
+# r19 fix 2, adversary pass 27: B1 an alias name spelled with a backtick or computed is still a rebinding; A2 a redirection to a FILE or `$null` merges nothing into the
+# value; A3 `?` is an identifier character on the LEFT of a watched word too; A4 the rebinding test reads command and function NAMES, not free text.
+_R19B_REFUSED = {
+    "r19b-a1-alias-name-with-a-backtick": "Set-Alias Write-Verb`ose Write-Output\n$c = New-Object -TypeName $(Write-Verbose 'System.Management.ManagementClass') -ArgumentList 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+    "r19b-a1-alias-name-computed": "Set-Alias ('Write-' + 'Verbose') Write-Output\n$c = New-Object -TypeName $(Write-Verbose 'System.Management.ManagementClass') -ArgumentList 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+    "r19b-a1-function-name-with-a-backtick": "function Write-Verb`ose { param($Message) $Message }\n$c = New-Object -TypeName $(Write-Verbose 'System.Management.ManagementClass') -ArgumentList 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+    "r19b-a1-function-with-a-scope-prefix": "function global:Write-Verbose { param($Message) $Message }\n$c = New-Object -TypeName $(Write-Verbose 'System.Management.ManagementClass') -ArgumentList 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+    "r19b-a1-merge-on-an-enclosing-script-block": "$c = New-Object -TypeName $(& { Write-Verbose 'System.Management.ManagementClass' } 4>&1) -ArgumentList 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+    "r19b-a2-control-merge-after-a-file-redirection": "$c = New-Object -TypeName $(Write-Verbose 'System.Management.ManagementClass' 3>$null 4>&1) -ArgumentList 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')",
+}
+_R19B_ACCEPTED = {
+    "r19b-a2-write-verbose-to-null-in-the-type": "$f = New-Object -TypeName $(Write-Verbose 'ManagementClass' 4>$null; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r19b-a2-write-verbose-to-null-in-a-wmic-argument": "wmic process get $(Write-Verbose 'create' 4>$null; 'ProcessId')",
+    "r19b-a2-write-verbose-to-null-in-the-arguments-slot": _P4 + "$p.InvokeMethod('GetOwner', $(Write-Verbose 'create' 4>$null; $null))",
+    "r19b-a2-write-host-to-a-file": "$f = New-Object -TypeName $(Write-Host 'ManagementClass' *> 'log.txt'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r19b-a3-variable-with-a-question-mark-before-managementclass": "$x?ManagementClass = 'System.IO.FileInfo'\n$f = New-Object -TypeName $x?ManagementClass -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r19b-a3-variable-with-a-question-mark-before-win32-process": "$x?Win32_Process = 'Win32_Environment'\n$e = New-CimInstance -ClassName $x?Win32_Process -ClientOnly\n$e.Create('x')",
+    "r19b-a4-function-named-longer-than-write-verbose": "function Write-VerboseExtra {}\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r19b-a4-alias-text-in-an-unrelated-command": "Write-Output 'alias Write-Verbose' | Out-Null\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r19b-a4-set-alias-of-another-name": "Set-Alias ll Get-ChildItem\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+}
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_r19_pass_27_a1_a2_a3_a4(tmp_path):
+    """adversary pass 27: the rebinding test reads names (escaped, computed, scoped, longer), only a merge into the success stream restores a diagnostic command's
+    text, and `?` bounds a watched word on the left as on the right."""
+    got = _scan_cases(tmp_path, {**_R19B_ACCEPTED, **_R19B_REFUSED})
+    missed = [n for n in _R19B_REFUSED if not got[n]]
+    false_alarms = sorted(n for n in _R19B_ACCEPTED if got[n])
+    assert (missed, false_alarms) == ([], []), "missed (must be refused), false alarms (must be accepted)"
 
 
 # r15, Grok G17 (prevention): a round that NARROWS what the scanner reads ("New-Object's type is the first positional") must prove that nothing new gets through,
