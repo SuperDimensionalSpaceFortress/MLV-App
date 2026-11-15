@@ -4250,7 +4250,10 @@ function Resolve-AttrCudaSmokeRunLog {
     $fullLogPath = [IO.Path]::GetFullPath($logPath)
     if (-not [string]::IsNullOrWhiteSpace($ContainingRoot)) {
         $root = [IO.Path]::GetFullPath($ContainingRoot)
+        # VENUE-STAGE-CLAIM-SHAPE-1 >>>
+        # r17 (CI run 43764890818): a drive-root containing root ('C:\') already ends in the separator, so appending one more made nothing contained; bracketed so the emitted job stays byte-identical to the pinned baseline outside it
         if (-not $fullLogPath.StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        # VENUE-STAGE-CLAIM-SHAPE-1 <<<
             throw "ATTRCUDA_SMOKE_LOG_OUTSIDE_ROOT $fullLogPath is not under $root"
         }
     }

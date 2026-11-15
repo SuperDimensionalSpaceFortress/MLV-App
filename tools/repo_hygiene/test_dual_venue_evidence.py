@@ -518,7 +518,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # replaces the baseline's bare parse and null check (the second pinned block).
     # r17 (CI run 43764890818): a fourth region, in the same function, carries the commit-mismatch throw as an exception with the declared commit as DATA (r12, Grok G15);
     # it replaces the baseline's one-line throw (the third pinned block).
-    CLAIM_SHAPE_REGIONS = 4
+    # r19 (CI run 43764890818): a fifth region, in Resolve-AttrCudaSmokeRunLog, contains a log under a drive-root containing root (the baseline's `$root + '\'` never matched
+    # 'C:\\' + '\\'); it replaces the baseline's one-line containment test (the fourth pinned block).
+    CLAIM_SHAPE_REGIONS = 5
     CLAIM_SHAPE_REPLACED_BASELINE = (("$manifestChecks = @(\n"
                                       "    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },\n"
                                       "    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },\n"
@@ -526,7 +528,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                                       ")\n"),
                                      ("    $manifest = [IO.File]::ReadAllText($Path) | ConvertFrom-Json\n"
                                       "    if ($null -eq $manifest) { throw \"ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE $Path\" }\n"),
-                                     ("        throw \"ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH $Path declares '$commit', expected '$ExpectedSourceCommit'\"\n"))
+                                     ("        throw \"ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH $Path declares '$commit', expected '$ExpectedSourceCommit'\"\n"),
+                                     ("        if (-not $fullLogPath.StartsWith($root + '\\', [StringComparison]::OrdinalIgnoreCase)) {\n"))
 
     @classmethod
     def without_claim_shape_replaced_baseline(cls, text: str) -> str:
