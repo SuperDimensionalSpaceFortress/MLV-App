@@ -1452,6 +1452,12 @@ private:
     double m_playbackSmokeRenderWorkSumMs = 0.0;
     double m_playbackSmokeQueueWaitSumMs = 0.0;
     double m_playbackSmokePresentUiSignalLatencySumMs = 0.0;
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 (Gate 0): uiLat sampled from each present's OWN window
+    // (displayStart - frameReadyEmitStageTime), and how many presents a later drawFrameReady had
+    // overwritten m_lastDrawFrameReadyQueueMs for (the legacy sum reads that member).
+    double m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs = 0.0;
+    uint64_t m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;
+    uint64_t m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;
     double m_playbackSmokePresentDrawPresentSumMs = 0.0;
     double m_playbackSmokePresentOverlaysScopesSumMs = 0.0;
     double m_playbackSmokePresentRenderSlotReleaseSumMs = 0.0;

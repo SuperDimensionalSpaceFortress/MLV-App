@@ -1295,6 +1295,10 @@ TEST(CriticalHopSummaryWiring, NewLineFollowsGuiPresentSummaryWithEveryFieldInOr
         QStringLiteral("avg_emit_to_request_issue_ms"), QStringLiteral("avg_upstream_plus_render_per_render_ms"),
         // r1 fix iteration 2 (adversary A2 on df1b864e): appended at the end, nothing before it moves.
         QStringLiteral("avg_prep_result_wait_prepared_present_ms"),
+        // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: Gate 0 appended at the end.
+        QStringLiteral("present_ui_signal_latency_own_window_frames"),
+        QStringLiteral("avg_present_ui_signal_latency_own_window_ms"),
+        QStringLiteral("present_ui_signal_latency_overwritten_frames"),
     };
     int last = -1;
     for (int i = 0; i < fields.size(); ++i)
@@ -1488,7 +1492,9 @@ TEST(CriticalHopSummaryWiring, AdvA2PrepResultWaitCountsAnEarlierPresentStillRun
     const QString present = presentPreparedBody();
     ASSERT_FALSE(present.contains(QStringLiteral("kindBit")));
     const QString finish = finishSmokeBody();
-    ASSERT_TRUE(finish.contains(QStringLiteral(".arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 );")));
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 appends fields after it, so it is no longer the line's last argument
+    // (NewLineFollowsGuiPresentSummaryWithEveryFieldInOrder pins what follows it).
+    ASSERT_EQ(1, finish.count(QStringLiteral(".arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 )")));
 }
 
 TEST(CriticalHopSummaryWiring, AdvA3BAListenerReinstalledInsideAPaintIsNotTold)
@@ -1580,4 +1586,75 @@ TEST(GuiPresentAttributionWiring, MaxBusyGapStartIsStampedAtOpenOnTheSmokeClock)
     ASSERT_FALSE(h.contains(QStringLiteral("QElapsedTimer m_guiPresentGapClock;")));
     const QString clock = bracedBlockAfter(mw, QStringLiteral("qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const"));
     ASSERT_TRUE(clock.contains(QStringLiteral("return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );")));
+}
+
+// ---- CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 ----------------------------------------------------------------
+
+namespace
+{
+
+// The balanced { ... } block of the function whose definition starts at `signatureStart` (its
+// parameter list may span lines): the first '{' after it. Empty when the signature is missing.
+QString functionBlockFrom(const QString & source, const QString & signatureStart)
+{
+    const int at = source.indexOf(signatureStart);
+    if (at < 0) return QString();
+    const int open = source.indexOf(QLatin1Char('{'), at);
+    if (open < 0) return QString();
+    int depth = 0;
+    for (int i = open; i < source.length(); ++i)
+    {
+        if (source.at(i) == QLatin1Char('{')) ++depth;
+        else if (source.at(i) == QLatin1Char('}') && --depth == 0) return source.mid(open, i - open + 1);
+    }
+    return QString();
+}
+
+} // namespace
+
+TEST(SmokeRunnerEventWait, Gate0OwnWindowIsSampledBeforeThePresentIsAccounted)
+{
+    // Gate 0: the legacy uiLat (avg_present_ui_signal_latency_ms) sums m_lastDrawFrameReadyQueueMs at present
+    // accounting -- the LATEST drawFrameReady's window. On the prep route a later drawFrameReady can overwrite it
+    // before this present. The own window is this present's displayStart minus its frame's emit stamp.
+    const QString source = mainWindowSource();
+    const QString finish = functionBlockFrom(source, QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"));
+    ASSERT_FALSE(finish.isEmpty());
+    const int gate = finish.indexOf(QStringLiteral(
+        "if( m_playbackSmokeActive\n     && displayStart > 0.0\n     && readyFrame.frameReadyEmitStageTime > 0.0\n"
+        "     && displayStart >= readyFrame.frameReadyEmitStageTime )"));
+    const int own = finish.indexOf(QStringLiteral(
+        "const double ownWindowMs = ( displayStart - readyFrame.frameReadyEmitStageTime ) * 1000.0;"));
+    const int sum = finish.indexOf(QStringLiteral("m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs += ownWindowMs;"));
+    const int frames = finish.indexOf(QStringLiteral("++m_playbackSmokePresentUiSignalLatencyOwnWindowFrames;"));
+    const int overwritten = finish.indexOf(QStringLiteral(
+        "if( fabs( ownWindowMs - m_lastDrawFrameReadyQueueMs ) > 1e-6 )\n            ++m_playbackSmokePresentUiSignalLatencyOverwrittenFrames;"));
+    const int note = finish.indexOf(QStringLiteral("notePlaybackSmokePresentedFrame( displayFrame, readyFrame, requestContext );"));
+    ASSERT_TRUE(gate > 0);
+    ASSERT_TRUE(own > gate);
+    ASSERT_TRUE(sum > own);
+    ASSERT_TRUE(frames > own);
+    ASSERT_TRUE(overwritten > own);
+    ASSERT_TRUE(note > overwritten);
+    ASSERT_EQ(1, finish.count(QStringLiteral("notePlaybackSmokePresentedFrame(")));
+    // displayStart is drawFrameReady's display_start (carried on the prep task), the same stamp the legacy
+    // window and the frame_ready_wait split end at.
+    ASSERT_TRUE(source.contains(QStringLiteral("task.displayStart = display_start;")));
+    // The legacy definition is untouched (the slip histogram reads it).
+    ASSERT_TRUE(notePresentedFrameBody().contains(QStringLiteral(
+        "const double presentUiSignalLatencyMs = m_lastDrawFrameReadyQueueMs;")));
+    ASSERT_TRUE(notePresentedFrameBody().contains(QStringLiteral(
+        "m_playbackSmokePresentUiSignalLatencySumMs += presentUiSignalLatencyMs;")));
+
+    // Reset with the other critical-hop state, inside the synchronous begin.
+    const QString begin = beginSmokeBody();
+    const int hopReset = begin.indexOf(QStringLiteral("m_guiHopFrameReadyWait.reset();"));
+    ASSERT_TRUE(hopReset > 0);
+    for (const char * reset : { "m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs = 0.0;",
+                                "m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;",
+                                "m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;" })
+    {
+        const int at = begin.indexOf(QString::fromLatin1(reset));
+        if (at <= hopReset) ::minitest::fail(__FILE__, __LINE__, "Gate 0 reset beside the hop reset", reset);
+    }
 }

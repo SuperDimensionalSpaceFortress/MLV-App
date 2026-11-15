@@ -27134,6 +27134,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     // listener is cleared where the session ends, and in the destructor).
     m_guiHopWait.reset();
     m_guiHopFrameReadyWait.reset();
+    m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs = 0.0;
+    m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;
+    m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;
     m_guiHopPrepResultWait.reset();
     m_guiHopEmitToRequestIssue.reset();
     m_guiHopRequestIssues = 0;
@@ -32058,7 +32061,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "avg_prep_result_wait_viewport_paint_ms=%11 avg_prep_result_wait_other_ms=%12 "
                    "prep_result_wait_unattributed_frames=%13 emit_to_request_frames=%14 "
                    "avg_emit_to_request_issue_ms=%15 avg_upstream_plus_render_per_render_ms=%16 "
-                   "avg_prep_result_wait_prepared_present_ms=%17" )
+                   "avg_prep_result_wait_prepared_present_ms=%17 "
+                   "present_ui_signal_latency_own_window_frames=%18 "
+                   "avg_present_ui_signal_latency_own_window_ms=%19 "
+                   "present_ui_signal_latency_overwritten_frames=%20" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( static_cast<qulonglong>( fr.frames ) )
                    .arg( fr.avgWaitMs(), 0, 'f', 3 )
@@ -32075,7 +32081,13 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( static_cast<qulonglong>( m_guiHopEmitToRequestIssue.count ) )
                    .arg( m_guiHopEmitToRequestIssue.avg(), 0, 'f', 3 )
                    .arg( upstreamPlusRenderPerRenderMs, 0, 'f', 3 )
-                   .arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 );
+                   .arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames ) )
+                   .arg( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames > 0
+                             ? m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs
+                                   / static_cast<double>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames )
+                             : 0.0, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOverwrittenFrames ) );
     }
 
     /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /
@@ -34937,6 +34949,20 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             ? prepRegionTotalMs - prepRegionAttributedMs
             : 0.0 );
     m_lastPresentedStageTimingTelemetry = readyFrame.stageTimingTelemetry;
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 (Gate 0): this present's own frameReady -> drawFrameReady
+    // window, beside the legacy uiLat (m_lastDrawFrameReadyQueueMs, which a later drawFrameReady may
+    // have overwritten before this present).
+    if( m_playbackSmokeActive
+     && displayStart > 0.0
+     && readyFrame.frameReadyEmitStageTime > 0.0
+     && displayStart >= readyFrame.frameReadyEmitStageTime )
+    {
+        const double ownWindowMs = ( displayStart - readyFrame.frameReadyEmitStageTime ) * 1000.0;
+        m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs += ownWindowMs;
+        ++m_playbackSmokePresentUiSignalLatencyOwnWindowFrames;
+        if( fabs( ownWindowMs - m_lastDrawFrameReadyQueueMs ) > 1e-6 )
+            ++m_playbackSmokePresentUiSignalLatencyOverwrittenFrames;
+    }
     notePlaybackSmokePresentedFrame( displayFrame, readyFrame, requestContext );
     // HARDENING (default-off): m_contactSheetOptionsPresent is only ever true inside
     // runGuiPlaybackSmoke's own --contact-sheet-dir/--contact-sheet-frames block, so this call
