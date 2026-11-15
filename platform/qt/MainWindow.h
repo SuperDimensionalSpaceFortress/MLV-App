@@ -1150,6 +1150,8 @@ private:
     double m_lastPlayToFirstFrameMs = 0.0;
     bool m_gpuTexNrImmediateDrainActive = false;
     double m_lastDrawFrameReadyQueueMs = 0.0;
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r1 (adversary A2): the request serial of the drawFrameReady that last wrote it.
+    uint64_t m_lastDrawFrameReadyQueueSerial = 0;
     double m_lastDrawFrameReadyAdvanceMs = 0.0;
     double m_lastDrawFrameReadySceneMs = 0.0;
     double m_lastDrawFrameReadyImageMs = 0.0;

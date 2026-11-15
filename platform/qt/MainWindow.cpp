@@ -5267,15 +5267,18 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 // as idle, and a frameReady posted during it is dispatched at once instead of after a sleep.
 void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
 {
+    QElapsedTimer waited;
     QTimer bound;
     bound.setSingleShot( true );
     bound.setTimerType( Qt::PreciseTimer );
     bound.start( qMax( 0, maxMs ) );
+    waited.start();
     qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );
     if( m_playbackSmokeActive )
     {
         ++m_playbackSmokeRunnerEventWaits;
-        if( !bound.isActive() )
+        // r1 fix iteration 1 (adversary A1): the timer's event can still be undelivered on return (GuiHopWaitSplit.h).
+        if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waited.nsecsElapsed(), maxMs ) )
             ++m_playbackSmokeRunnerEventWaitTimeouts;
     }
 }
@@ -34985,7 +34988,9 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         const double ownWindowMs = ( displayStart - readyFrame.frameReadyEmitStageTime ) * 1000.0;
         m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs += ownWindowMs;
         ++m_playbackSmokePresentUiSignalLatencyOwnWindowFrames;
-        if( fabs( ownWindowMs - m_lastDrawFrameReadyQueueMs ) > 1e-6 )
+        // r1 fix iteration 1 (adversary A2): another request's write counts even with an equal value.
+        if( gui_hop_wait::presentUiLatencyOverwritten( ownWindowMs, m_lastDrawFrameReadyQueueMs,
+                                                     m_lastDrawFrameReadyQueueSerial, readyFrame.requestSerial ) )
             ++m_playbackSmokePresentUiSignalLatencyOverwrittenFrames;
     }
     notePlaybackSmokePresentedFrame( displayFrame, readyFrame, requestContext );
@@ -35618,6 +35623,7 @@ void MainWindow::drawFrameReady()
             true );
     }
     m_lastDrawFrameReadyQueueMs = 0.0;
+    m_lastDrawFrameReadyQueueSerial = readyFrame.requestSerial;   // Gate 0: who wrote it (A2)
     /* m_lastDrawFrameReadyAdvanceMs is reset above, before the early advance,
      * so its early measurement is not zeroed before the smoke accounting. */
     m_lastDrawFrameReadySceneMs = 0.0;

@@ -297,6 +297,27 @@ private:
     Clock m_clock;
 };
 
+/* CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r1 fix iteration 1 (adversary A1 on cf09566f): a bounded smoke event wait
+ * (MainWindow::waitGuiThreadForSmokeEvents) timed out when its timer event was delivered, OR when the wait itself
+ * lasted its bound, less the precise timer's 1 ms resolution. On Windows the precise timer's callback POSTS its
+ * QTimerEvent and the dispatcher can return on that wake-up before delivering it, so "the timer is still active"
+ * alone does not mean an event ended the wait. */
+inline bool smokeEventWaitTimedOut( bool timerStillActive, long long waitedNs, int maxMs )
+{
+    if( !timerStillActive ) return true;
+    const long long boundNs = static_cast<long long>( maxMs > 1 ? maxMs - 1 : 0 ) * 1000000LL;
+    return waitedNs >= boundNs;
+}
+
+/* (adversary A2 on cf09566f): a present's legacy uiLat (m_lastDrawFrameReadyQueueMs, read at present accounting)
+ * was overwritten when ANOTHER request's drawFrameReady wrote it after this present's own did -- even with an equal
+ * value -- or when its value differs from the present's own window. */
+inline bool presentUiLatencyOverwritten( double ownWindowMs, double legacyMs,
+                                         unsigned long long legacyWriterSerial, unsigned long long presentSerial )
+{
+    return legacyWriterSerial != presentSerial || std::fabs( ownWindowMs - legacyMs ) > 1e-6;
+}
+
 } // namespace gui_hop_wait
 
 #endif // GUIHOPWAITSPLIT_H

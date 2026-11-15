@@ -1667,8 +1667,8 @@ TEST(SmokeRunnerEventWait, MeasuredLoopWaitsForEventsNotASleep)
     const int counted = helper.indexOf(QStringLiteral("if( m_playbackSmokeActive )"));
     ASSERT_TRUE(counted > helper.indexOf(QStringLiteral("WaitForMoreEvents")));
     ASSERT_TRUE(helper.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaits;")) > counted);
-    ASSERT_TRUE(helper.contains(QStringLiteral(
-        "if( !bound.isActive() )\n            ++m_playbackSmokeRunnerEventWaitTimeouts;")));
+    // (The timeout classification itself: AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsUndelivered.)
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("++m_playbackSmokeRunnerEventWaitTimeouts;")) > counted);
     const QString h = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
     const int sleepDecl = h.indexOf(QStringLiteral("void sleepGuiThreadForSmokeRunner( unsigned long ms );"));
     ASSERT_TRUE(sleepDecl > 0);
@@ -1698,7 +1698,7 @@ TEST(SmokeRunnerEventWait, Gate0OwnWindowIsSampledBeforeThePresentIsAccounted)
     const int sum = finish.indexOf(QStringLiteral("m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs += ownWindowMs;"));
     const int frames = finish.indexOf(QStringLiteral("++m_playbackSmokePresentUiSignalLatencyOwnWindowFrames;"));
     const int overwritten = finish.indexOf(QStringLiteral(
-        "if( fabs( ownWindowMs - m_lastDrawFrameReadyQueueMs ) > 1e-6 )\n            ++m_playbackSmokePresentUiSignalLatencyOverwrittenFrames;"));
+        "++m_playbackSmokePresentUiSignalLatencyOverwrittenFrames;"));
     const int note = finish.indexOf(QStringLiteral("notePlaybackSmokePresentedFrame( displayFrame, readyFrame, requestContext );"));
     ASSERT_TRUE(gate > 0);
     ASSERT_TRUE(own > gate);
@@ -1766,4 +1766,68 @@ TEST(SmokeRunnerEventWait, TheFiveNewFieldsAreTheLastFiveOfCriticalHopSummary)
     ASSERT_TRUE(a20 > a19);
     ASSERT_TRUE(a21 > a20);
     ASSERT_TRUE(a22 > a21);
+}
+
+TEST(SmokeRunnerEventWait, AdvA1TimerEndedWaitIsATimeoutEvenWhenItsTimerEventIsUndelivered)
+{
+    // r1 adversary A1 on cf09566f: on Windows (Qt 6.10.2) the precise timer's callback POSTS its QTimerEvent and the
+    // dispatcher can return on that wake-up before delivering it, so bound.isActive() is still true after a wait the
+    // timer ended: waits=1, timeouts=0. The wait's own elapsed time decides too (the timer's 1 ms resolution allowed).
+    using gui_hop_wait::smokeEventWaitTimedOut;
+    // The adversary's input: maxMs 10, no event before 10 ms, the timer event posted but not delivered.
+    ASSERT_TRUE(smokeEventWaitTimedOut(true, 10300000LL, 10));
+    ASSERT_TRUE(smokeEventWaitTimedOut(true, 9200000LL, 10));     // a multimedia timer can fire under 1 ms early
+    ASSERT_TRUE(smokeEventWaitTimedOut(false, 10100000LL, 10));   // the timer event was delivered
+    ASSERT_TRUE(smokeEventWaitTimedOut(false, 400000LL, 10));     // delivered is a timeout whatever the clock says
+    // An event (the queued frameReady) ended it well inside the bound.
+    ASSERT_FALSE(smokeEventWaitTimedOut(true, 400000LL, 10));
+    ASSERT_FALSE(smokeEventWaitTimedOut(true, 8900000LL, 10));
+    ASSERT_FALSE(smokeEventWaitTimedOut(true, 0LL, 10));
+
+    const QString source = mainWindowSource();
+    const QString helper = bracedBlockAfter(source, QStringLiteral("void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )"));
+    ASSERT_FALSE(helper.isEmpty());
+    const int started = helper.indexOf(QStringLiteral("waited.start();"));
+    const int wait = helper.indexOf(QStringLiteral("qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );"));
+    const int classify = helper.indexOf(QStringLiteral(
+        "if( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waited.nsecsElapsed(), maxMs ) )\n"
+        "            ++m_playbackSmokeRunnerEventWaitTimeouts;"));
+    ASSERT_TRUE(helper.contains(QStringLiteral("QElapsedTimer waited;")));
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("bound.start(")) < started);
+    ASSERT_TRUE(started < wait);
+    ASSERT_TRUE(classify > wait);
+    ASSERT_FALSE(helper.contains(QStringLiteral("if( !bound.isActive() )")));
+}
+
+TEST(SmokeRunnerEventWait, AdvA2EqualValuedOverwriteByAnotherRequestIsCounted)
+{
+    // r1 adversary A2 on cf09566f: request 101 (emit 100.0, displayStart 100.0078125) and request 102 (emit
+    // 100.015625, displayStart 100.0234375) both queue 7.8125 ms; 102's drawFrameReady overwrites the member before
+    // 101 is presented. The numeric difference is 0, so the overwrite was missed. The writer's request serial decides.
+    using gui_hop_wait::presentUiLatencyOverwritten;
+    const double ownA = (100.0078125 - 100.0) * 1000.0;
+    const double legacyB = (100.0234375 - 100.015625) * 1000.0;
+    ASSERT_NEAR(ownA, legacyB, 1e-9);
+    ASSERT_TRUE(presentUiLatencyOverwritten(ownA, legacyB, 102u, 101u));
+    ASSERT_FALSE(presentUiLatencyOverwritten(ownA, ownA, 101u, 101u));   // its own drawFrameReady wrote it last
+    ASSERT_TRUE(presentUiLatencyOverwritten(7.8125, 9.0, 102u, 101u));
+    ASSERT_TRUE(presentUiLatencyOverwritten(7.8125, 9.0, 101u, 101u));   // a different value is never its own
+
+    const QString source = mainWindowSource();
+    const QString ready = bracedBlockAfter(source, QStringLiteral("void MainWindow::drawFrameReady()"));
+    ASSERT_FALSE(ready.isEmpty());
+    // Every write of the member names its writer: the reset at the top of the accounting, then the window itself.
+    ASSERT_EQ(1, ready.count(QStringLiteral("m_lastDrawFrameReadyQueueMs = 0.0;")));
+    ASSERT_TRUE(ready.contains(QStringLiteral(
+        "m_lastDrawFrameReadyQueueMs = 0.0;\n    m_lastDrawFrameReadyQueueSerial = readyFrame.requestSerial;")));
+    ASSERT_EQ(2, source.count(QStringLiteral("m_lastDrawFrameReadyQueueMs =")));
+    ASSERT_EQ(1, source.count(QStringLiteral("m_lastDrawFrameReadyQueueSerial =")));
+    const QString finish = functionBlockFrom(source, QStringLiteral("void MainWindow::finishPresentedFrame( uint64_t displayFrame,"));
+    ASSERT_TRUE(finish.contains(QStringLiteral(
+        "if( gui_hop_wait::presentUiLatencyOverwritten( ownWindowMs, m_lastDrawFrameReadyQueueMs,\n"
+        "                                                     m_lastDrawFrameReadyQueueSerial, readyFrame.requestSerial ) )\n"
+        "            ++m_playbackSmokePresentUiSignalLatencyOverwrittenFrames;")));
+    ASSERT_FALSE(finish.contains(QStringLiteral("fabs( ownWindowMs - m_lastDrawFrameReadyQueueMs )")));
+    ASSERT_TRUE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h"))
+                    .contains(QStringLiteral("uint64_t m_lastDrawFrameReadyQueueSerial = 0;")));
 }
