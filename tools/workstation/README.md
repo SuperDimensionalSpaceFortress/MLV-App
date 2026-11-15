@@ -15,9 +15,10 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
 | `Ssh` | new | sshd (key-only, pwsh default shell, port 22 from LAN + Tailscale), keys for GitHub and BACHELOR |
 | `Clone` | new | MLV-App (`fork` = SuperDimensionalSpaceFortress, `origin` = ilia3101, master tracks fork/master), doctrine bus |
 | `Qt` | new | Qt 6.10.2 win64_mingw + MinGW 13.1 via the repo's hash-locked aqtinstall |
-| `Import` | new | unpacks the transfer bundle into `~\.claude`, `~\bin`, `~\.codex`, FleetDefender, `.claude-state` |
+| `Import` | new | unpacks the transfer bundle into `~\.claude`, `~\bin`, `~\.codex`, FleetDefender, `.claude-state`, `.codex-state\doctrine` (never overwrites a newer local file); moves hub claims whose run dir is absent here and that are under 24 h old to `claims\migrated-foreign-<stamp>` |
 | `Tasks` | new | registers 8 scheduled tasks, **disabled**, behind the gate |
-| `Verify`, `Checklist` | either | read-only report; owner-only checklist |
+| `Verify` | either | report, plus two checks that change the exit code. **Share preflight, fail closed:** both `\\Ultra-Magnus\g\Temp\mlv-gpu-profile\agent\heartbeat.txt` and `\\bachelor\mlv-agent\heartbeat.txt` must be readable, else `SHARE_PREFLIGHT_FAILED <path> (<host> share; ...step 6b)` and exit 1 (README step 6b). **Meter installs:** runs `-Install` of `MLV-DiskAutoReclaim` and `MLV-PwshAutoRepin` (not on the source host without `-Force`, not under `-WhatIf`); a host without the SBP launcher reports `METER_INSTALL_UNSUPPORTED_HOST` and goes on |
+| `Checklist` | either | owner-only checklist (printed, never scripted) |
 | `Export` | VIRTUAL-TEN | sanitized bundle under `C:\mlvtmp\migrate-out` (read-only towards its tasks and hooks) |
 | `LeaseShow/Acquire/Release` | either | the hub lease |
 

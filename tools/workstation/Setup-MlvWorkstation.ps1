@@ -57,7 +57,13 @@ param(
     # The machine being migrated FROM. New-machine phases refuse to run there (they would rewrite its live
     # tasks, sshd and settings) unless -Force.
     [string]$SourceHost = 'VIRTUAL-TEN',
-    [switch]$Force
+    [switch]$Force,
+    # Where this script keeps its logs, backups and the gate copy. Overridable so tests stay in a scratch folder.
+    [string]$StateRoot = 'C:\ProgramData\MlvWorkstation',
+    # The two venue heartbeat files -Phase Verify must be able to read (fail closed otherwise, README step 6b).
+    # Overridable so tests can point them at scratch files; production never passes these.
+    [string]$UltraMagnusHeartbeatPath = '\\Ultra-Magnus\g\Temp\mlv-gpu-profile\agent\heartbeat.txt',
+    [string]$BachelorHeartbeatPath = '\\bachelor\mlv-agent\heartbeat.txt'
 )
 
 Set-StrictMode -Version 1.0
@@ -71,7 +77,7 @@ foreach ($ph in $Phase) { if ($validPhases -notcontains $ph) { Write-Error "Unkn
 # Store/MSIX pwsh (under WindowsApps) cannot set the LocalMachine execution policy and fails the Windows
 # capability cmdlets with "Class not registered" (PC-MINI3 2026-11-13). Re-run under the MSI pwsh when present.
 $msiPwsh = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
-if ($PSHOME -like '*\WindowsApps\*' -and (Test-Path -LiteralPath $msiPwsh)) {
+if ($PSHOME -like '*\WindowsApps\*' -and (Test-Path -LiteralPath $msiPwsh) -and $MyInvocation.InvocationName -ne '.') {
     $q = { param($v) "'" + ("$v" -replace "'", "''") + "'" }
     $argText = foreach ($k in $PSBoundParameters.Keys) {
         $v = $PSBoundParameters[$k]
@@ -95,7 +101,6 @@ $DoctrineRepo = Join-Path $Workspace 'softwarefactory-fleet-doctrine'
 $ForkUrl = 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git'
 $UpstreamUrl = 'https://github.com/ilia3101/MLV-App.git'
 $DoctrineUrl = 'https://github.com/layibabalola/softwarefactory-fleet-doctrine.git'
-$StateRoot = 'C:\ProgramData\MlvWorkstation'
 $QtRoot = 'C:\Qt'
 $MingwDir = Join-Path $QtRoot 'Tools\mingw1310_64'
 $LeaseRemote = 'fork'
@@ -609,6 +614,9 @@ function Invoke-PhaseExport {
             Invoke-Robocopy "$cs\$d" "$stage\project-claude-state\$d" @() (@('/E') + $common)
         }
         Invoke-Robocopy "$cs\fleet-runs\hub-tools" "$stage\project-claude-state\fleet-runs\hub-tools" @('*.ps1', '*.py', '*.json', '*.md', '*.vbs') (@('/LEV:1') + $common)
+        # MINI3-CUTOVER-STATE-GAPS-1 (b): the doctrine fold marker (.codex-state\doctrine\last-seen.json). Without it the new host's fold
+        # meter reads reason=last-seen-missing. Only that folder: the rest of .codex-state is per-host session state.
+        Invoke-Robocopy "$Repo\.codex-state\doctrine" "$stage\project-codex-state\doctrine" @() (@('/E') + $common)
         # Reference only (never installed blindly): ssh client config, codex config, task XML, inventory.
         Invoke-Robocopy "$h\.ssh" $ref @('config') @('/LEV:1')
         Invoke-Robocopy "$h\.codex" $ref @('config.toml') @('/LEV:1')
@@ -672,6 +680,44 @@ function Invoke-PhaseExport {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Foreign hub claims (MINI3-CUTOVER-STATE-GAPS-1 gap a). A claim is a one-line JSON file {utc, runDir, ...} in
+# hub-autopilot\claims. The export carries the claims but not the fleet-runs run dirs they name, so on the new host
+# every claim younger than the dispatch preflight's 6 h window reads 'receipt state none' and blocks its card.
+# Rule: a claim whose runDir does not exist here AND whose utc is under 24 h old moves to claims\migrated-foreign-<stamp>
+# (moved, never deleted: the file is the evidence). A malformed claim, a claim older than 24 h and a claim whose
+# runDir exists all stay where they are.
+# ---------------------------------------------------------------------------------------------
+function Move-ForeignClaims {
+    param([string]$ClaimsDir, [string]$Stamp, [int]$MaxAgeHours = 24)
+    $moved = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $ClaimsDir -PathType Container)) { Write-Log "no claims folder at $ClaimsDir (nothing to quarantine)"; return }
+    $dest = Join-Path $ClaimsDir "migrated-foreign-$Stamp"
+    $keptMalformed = 0
+    foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter '*.claim' -File)) {
+        $o = $null
+        try { $o = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json -ErrorAction Stop } catch { $o = $null }
+        $pRun = if ($o -is [pscustomobject]) { $o.PSObject.Properties['runDir'] } else { $null }
+        $pUtc = if ($o -is [pscustomobject]) { $o.PSObject.Properties['utc'] } else { $null }
+        if (-not $pRun -or -not $pUtc -or -not "$($pRun.Value)".Trim()) { $keptMalformed++; continue }
+        $when = $null
+        if ($pUtc.Value -is [datetime]) { $when = ([datetime]$pUtc.Value).ToUniversalTime() }
+        else {
+            $dto = [DateTimeOffset]::MinValue
+            if ([DateTimeOffset]::TryParse("$($pUtc.Value)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) { $when = $dto.UtcDateTime }
+        }
+        if ($null -eq $when) { $keptMalformed++; continue }
+        $ageH = ((Get-Date).ToUniversalTime() - $when).TotalHours
+        if ($ageH -ge $MaxAgeHours) { continue }
+        if (Test-Path -LiteralPath "$($pRun.Value)") { continue }
+        [void][IO.Directory]::CreateDirectory($dest)
+        Move-Item -LiteralPath $f.FullName -Destination (Join-Path $dest $f.Name)
+        $moved.Add($f.Name)
+    }
+    Write-Log "foreign claims quarantined: $($moved.Count) -> $dest ; malformed claims left in place: $keptMalformed" $(if ($moved.Count) { 'WARN' } else { 'OK' })
+    return $moved.ToArray()
+}
+
+# ---------------------------------------------------------------------------------------------
 # Phase: Import (NEW machine). Copies the bundle into place; never touches credentials.
 # ---------------------------------------------------------------------------------------------
 function Invoke-PhaseImport {
@@ -699,7 +745,14 @@ function Invoke-PhaseImport {
         Invoke-Robocopy "$src\home-codex" "$h\.codex" @() @('/E')
         Invoke-Robocopy "$src\programdata-fleetdefender" 'C:\ProgramData\FleetDefender' @() @('/E')
         Invoke-Robocopy "$src\project-claude-state" "$Repo\.claude-state" @() @('/E')
+        # MINI3-CUTOVER-STATE-GAPS-1 (b): /XO so a fold marker this host already advanced is never overwritten by the older bundle copy.
+        Invoke-Robocopy "$src\project-codex-state\doctrine" "$Repo\.codex-state\doctrine" @() @('/E', '/XO')
         Invoke-Robocopy "$src\reference" "$StateRoot\reference" @() @('/E')
+    }
+    # MINI3-CUTOVER-STATE-GAPS-1 (a): claims came across without their fleet-runs run dirs. A claim younger than 6 h with no run dir
+    # reads 'receipt state none' and blocks its card, so those claims are quarantined, not carried.
+    Invoke-Step 'Quarantine foreign hub claims (run dir absent on this host, under 24 h old)' {
+        [void](Move-ForeignClaims -ClaimsDir (Join-Path $Repo '.claude-state\hub-autopilot\claims') -Stamp $stamp)
     }
     if ($h -ine $SourceUserProfile) {
         Invoke-Step "Rewrite $SourceUserProfile -> $h in ~/.claude/settings.json" {
@@ -768,7 +821,62 @@ function Invoke-PhaseGate {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Phase: Verify (read-only report)
+# Share preflight (MINI3-CUTOVER-STATE-GAPS-1). Every venue job, staged build and Bachelor heartbeat read goes through two SMB
+# shares, and a host with no stored credential reads both as 'not there' (System error 5). Verify therefore fails closed unless
+# both heartbeat files can be read. Inline Test-Path on purpose: this script is copied to C:\MlvSetup and run before the repo is
+# cloned, so it cannot import a repo module. It names each heartbeat file by path and never lists a share.
+# ---------------------------------------------------------------------------------------------
+function Test-ShareHeartbeatPreflight {
+    param([string]$UltraMagnusPath, [string]$BachelorPath)
+    $failed = [System.Collections.Generic.List[string]]::new()
+    foreach ($row in @(@{ Path = $UltraMagnusPath; HostName = 'Ultra-Magnus' }, @{ Path = $BachelorPath; HostName = 'bachelor' })) {
+        $ok = $false
+        try { $ok = [bool](Test-Path -LiteralPath $row.Path -PathType Leaf -ErrorAction Stop) } catch { $ok = $false }
+        if ($ok) { Write-Log "share preflight OK: $($row.Path)" 'OK'; continue }
+        Write-Log "SHARE_PREFLIGHT_FAILED $($row.Path) ($($row.HostName) share; tools\workstation\README.md step 6b)" 'ERROR'
+        $failed.Add($row.Path)
+    }
+    return $failed.ToArray()
+}
+
+# ---------------------------------------------------------------------------------------------
+# Meter installs (MINI3-CUTOVER-STATE-GAPS-1 gap c). The import copies the meter scripts but not the scheduled-task registration
+# or the pins their -Install writes, so on the new host disk-auto-reclaim reads 'no sweep pin' and pwsh-pin reads 'registered none'.
+# Only these two meters: the board-driving tasks are registered by -Phase Tasks, lease-gated.
+# Both scripts live in the board-root .claude-state (gitignored, not part of this repo). On a host without the approved SBP
+# windowless launcher their -Install throws before writing anything; that is reported as METER_INSTALL_UNSUPPORTED_HOST and
+# Verify goes on. Making -Install work without the launcher is a board-root edit and is OPEN, not part of this change.
+# ---------------------------------------------------------------------------------------------
+function Get-MeterInstallSpecs {
+    return @(
+        @{ Name = 'MLV-DiskAutoReclaim'; Script = (Join-Path $Repo '.claude-state\disk-hygiene\disk-reclaim-task.ps1') }
+        @{ Name = 'MLV-PwshAutoRepin'; Script = (Join-Path $Repo '.claude-state\hub-autopilot\pwsh-autorepin.ps1') }
+    )
+}
+
+function Invoke-MeterInstalls {
+    if ($env:COMPUTERNAME -ieq $SourceHost -and -not $Force) { Write-Log "meter -Install skipped: $SourceHost is the source host (its tasks are live; pass -Force to run it there)"; return }
+    $pwsh = Get-PwshPath
+    foreach ($m in (Get-MeterInstallSpecs)) {
+        if (-not (Test-Path -LiteralPath $m.Script -PathType Leaf)) { Write-Log "meter -Install skipped: $($m.Name) script absent ($($m.Script)); run -Phase Import first" 'WARN'; continue }
+        if ($WhatIfPreference) { Write-Log "SKIP (WhatIf) meter -Install $($m.Name)"; continue }
+        if (-not $pwsh) { Write-Log "meter -Install skipped: pwsh missing ($($m.Name))" 'WARN'; continue }
+        Write-Log "DO   meter -Install $($m.Name) ($($m.Script))"
+        $out = @(& $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $m.Script -Install 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+        foreach ($o in $out) { if ($o.Trim()) { Write-Log "    $($o.TrimEnd())" } }
+        if ($code -eq 0) { Write-Log "meter -Install ok: $($m.Name)" 'OK'; continue }
+        if (($out -join "`n") -match 'SBP windowless launcher is absent') {
+            Write-Log "METER_INSTALL_UNSUPPORTED_HOST $($m.Name) (its -Install needs the approved SBP windowless launcher, absent on $env:COMPUTERNAME; nothing was written; OPEN: make the board-root -Install work without it)" 'WARN'
+            continue
+        }
+        Write-Log "METER_INSTALL_FAILED $($m.Name) exit=$code" 'ERROR'
+        $script:Failures.Add("METER_INSTALL_FAILED $($m.Name)")
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Phase: Verify (read-only report, plus the share preflight and the two meter installs)
 # ---------------------------------------------------------------------------------------------
 function Invoke-PhaseVerify {
     Update-SessionPath
@@ -805,6 +913,10 @@ function Invoke-PhaseVerify {
     Write-Log "PAUSED kill switch: $(Test-Path (Join-Path $StateRoot 'PAUSED'))"
     [void](Show-HubLease)
     if (Get-Command gh -ErrorAction SilentlyContinue) { & gh auth status *> $null; Write-Log "gh auth: $(if ($LASTEXITCODE -eq 0) { 'signed in' } else { 'NOT signed in' })" }
+    Write-Log '--- venue shares (fail closed: README step 6b)'
+    foreach ($bad in @(Test-ShareHeartbeatPreflight -UltraMagnusPath $UltraMagnusHeartbeatPath -BachelorPath $BachelorHeartbeatPath)) { $script:Failures.Add("SHARE_PREFLIGHT_FAILED $bad") }
+    Write-Log '--- meter installs (disk-auto-reclaim pin, pwsh auto-repin)'
+    Invoke-MeterInstalls
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -835,6 +947,9 @@ function Invoke-PhaseChecklist {
         $script:Manual | ForEach-Object { Write-Host "  - $_" -ForegroundColor Cyan }
     }
 }
+
+# Dot-sourcing (". Setup-MlvWorkstation.ps1 -StateRoot <scratch>") loads the functions and stops here, so tests can call them.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 # ---------------------------------------------------------------------------------------------
 # Main
