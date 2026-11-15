@@ -16311,6 +16311,68 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
                 v = self.wake_verdict("\n".join(lines) + "\n", post)
                 self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
+    # r12 pass 13 (r12 adversary on bbfe69d1) A1: a pace_summary not read whole BEFORE the measured window was first seen
+    EARLY_PACE_SHAPES = ("playback_smoke.pace_summary  session=3", "playback_smoke.pace_summary session=", "playback_smoke.pace_summary session=3x",
+                         "playback_smoke.pace_summary", "playback_smoke.pace_summary (session=3)", "PLAYBACK_SMOKE.PACE_SUMMARY session=3",
+                         "playback_smoke.pace_summary session=2 session=3")
+
+    def test_r12_p13_a1_its_input_verbatim_an_unreadable_pace_before_the_measured_one_is_never_skipped(self) -> None:
+        log = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 elapsed_ms=20000\nplayback_smoke.pace_summary  session=3\n"
+               "playback_smoke.pace_summary session=3\n"
+               "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        v = self.wake_verdict(log, {"generatorArgs": {"dueWakeDeliveryPost": True}})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"], v)
+
+    def test_r12_p13_a1_class_every_unreadable_pace_before_the_measured_window_blocks_every_leg(self) -> None:
+        for shape in self.EARLY_PACE_SHAPES:
+            build = (lambda s: lambda wake: "\n".join(self.A2_BASE[:2] + [s, self.A2_BASE[2], wake]) + "\n")(shape)
+            self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape)
+        # controls: a readable pace of another session before the window; an unreadable pace after another session's boundary closed the window
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for lines in (self.A2_BASE[:2] + ["playback_smoke.pace_summary session=2", self.A2_BASE[2], self.WAKE_POST],
+                      self.A2_BASE + [self.WAKE_POST, "playback_smoke.start session=4", "playback_smoke.pace_summary  session=4"]):
+            with self.subTest(control=lines):
+                v = self.wake_verdict("\n".join(lines) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    # r12 pass 13 (r12 adversary on bbfe69d1) A2: under the tr-TR culture `I` does not fold onto `i` for -match / (?i), so an upper-case marker,
+    # record name or key was skipped. Each call is a fresh pwsh whose culture is set before the first reader call.
+    def tr_wake_verdict(self, log: str, spec: dict) -> dict:
+        return self.ps("[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n$s = $env:DVE_SPEC | ConvertFrom-Json\n"
+                       "(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress", log, spec)
+
+    def tr_selected(self, log: str) -> dict:
+        return self.ps("[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n$r = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n"
+                       "[ordered]@{ session = $r.session; unreadable = $r.sessionUnreadable } | ConvertTo-Json -Compress", log)
+
+    def test_r12_p13_a2_its_input_verbatim_under_tr_tr_an_upper_case_marker_or_key_is_never_skipped(self) -> None:
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        log = ("PLAYBACK_SMOKE.MEASURED_SESSION id=3\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 elapsed_ms=20000\n"
+               "playback_smoke.pace_summary session=4\n"
+               "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        v = self.tr_wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+        self.assertEqual(self.tr_selected(log), {"session": None, "unreadable": True})
+        self.assertEqual(self.tr_selected("PLAYBACK_SMOKE.SUMMARY session=3\nplayback_smoke.summary session=4\n"), {"session": None, "unreadable": True})
+        base = "\n".join(self.A2_BASE) + "\n"
+        for name, wake in (("DELIVERY_KIND=post", "playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg DELIVERY_KIND=post"),
+                           ("DISABLED=1", self.WAKE_SEND + " DISABLED=1")):
+            with self.subTest(head=name):
+                v = self.tr_wake_verdict(base + wake, {})
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_r12_p13_a2_class_under_tr_tr_every_upper_case_boundary_or_wake_record_blocks_every_leg(self) -> None:
+        for shape in ("PLAYBACK_SMOKE.MEASURED_SESSION id=4", "playback_smoke.gpu_summary SESSION=4", "PLAYBACK_DUE_WAKE armed=1 fired=1"):
+            for leg, spec, wake in self.LEG_WAKES:
+                v = self.tr_wake_verdict("\n".join(self.A2_BASE + [shape, self.leg_wake(wake)]) + "\n", spec)
+                with self.subTest(shape=shape, leg=leg):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # control: the app's own lower-case lines read the same under tr-TR
+        v = self.tr_wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST]) + "\n", {"generatorArgs": {"dueWakeDeliveryPost": True}})
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
     """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it

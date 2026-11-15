@@ -861,11 +861,36 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
         body = ("$o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \\([0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)? -> "
                 "[0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)?\\)\"') { $o = $x.IndexOf(' (', $o + 2, [StringComparison]::Ordinal) }; if ($o -ge 0) { if ($x.Substring($o) "
-                "-cnotmatch '^ \\(.+:(?:[0-9]+|%2)\\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?i)(?<!(?-i:[A-Za-z0-9_]))' + $w + "
-                "'(?!(?-i:[A-Za-z0-9_]))').Count }")
+                "-cnotmatch '^ \\(.+:(?:[0-9]+|%2)\\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + "
+                "'(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }")
         self.assertEqual(text.count("{ param([string]$x, [string]$w) " + body), 3)
         self.assertNotIn("(?![A-Za-z0-9_])", text)
         self.assertNotIn("(?<![A-Za-z0-9_])", text)
+        # r12 pass 13 (A2 siblings :2258/:2259, :5063/:5064, :7541/:7542, :7552; AttrCudaArtifacts :3497): no session selector matches a record name
+        # with -match or (?i), which follow the process culture (tr-TR skipped an upper-case marker)
+        for prefix in ("$recordStart + 'playback_smoke", "$ux + 'playback_smoke"):
+            self.assertNotIn("-match (" + prefix, text)
+        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant'))"), 7)
+        artifacts = (ATTRIBUTION_GENERATOR.parent / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
+        region = artifacts[artifacts.index("    $sessionLine = {"):artifacts.index("    $telemetry = {")]
+        self.assertNotIn("'(?i", region)  # no inline (?i) / (?i: regex literal (the comments may name it)
+        self.assertEqual(region.count("'IgnoreCase, CultureInvariant'"), 2)
+
+    def test_r12_p13_under_tr_tr_an_upper_case_first_marker_is_unreadable_never_a_later_one(self) -> None:
+        # r12 pass 13 A2 sibling (Get-MeasuredSmokeSessionId :2258/:2259): the session pick runs in a fresh pwsh whose culture is tr-TR
+        for log in ("PLAYBACK_SMOKE.MEASURED_SESSION id=3\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n",
+                    "PLAYBACK_SMOKE.SUMMARY session=3\nplayback_smoke.summary session=4 reason=play-stop\n",
+                    "playback_smoke.measured_session id=3 ID=4\nplayback_smoke.summary session=3 reason=play-stop\n"):
+            with self.subTest(log=log):
+                tmp = tempfile.TemporaryDirectory(prefix="measured-session-id-tr-")
+                self.addCleanup(tmp.cleanup)
+                script = Path(tmp.name) / "probe.ps1"
+                script.write_text("$ErrorActionPreference = 'Stop'\n[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n" + self._function_text() + "\n"
+                                  "Write-Output ('ID=' + (Get-MeasuredSmokeSessionId '" + log.replace("'", "''") + "'))\n", encoding="utf-8")
+                proc = _run_pwsh_file(script)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
 
     def test_throws_when_neither_marker_nor_summary_is_present(self) -> None:
         proc = self._run("nothing relevant here\n")

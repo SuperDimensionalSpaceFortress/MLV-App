@@ -1124,18 +1124,19 @@ function Get-DvSmokeSummaryFields {
         # r12 (r12 adversary B3 on 7e66a3af, its input: a Kelvin sign U+212A before `id=4`): a name character is ASCII [A-Za-z0-9_] matched CASE-SENSITIVELY
         # ($script:DvNameChar); under (?i) .NET folds U+212A / U+0130 into [A-Za-z], which hid the mention. r12 (B2, its input: a first marker
         # `id=3 (id=4)`): a body that ends in the LOCATION_UNREADABLE sentinel lost its tail, so it is not read whole (the empty token, unreadable)
-        $wordCount = { param([string]$x, [string]$w) [regex]::Matches($x, '(?i)(?<!' + $script:DvNameChar + ')' + $w + '(?!' + $script:DvNameChar + ')').Count }
+        # r12 (pass 13 A2): case-insensitive reads are culture-invariant ($script:DvCi), never -match or (?i)
+        $wordCount = { param([string]$x, [string]$w) [regex]::Matches($x, '(?<!' + $script:DvNameChar + ')' + $w + '(?!' + $script:DvNameChar + ')', $script:DvCi).Count }
         $located = { param([string]$x) -not $x.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) }
-        foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.measured_session(?!' + $script:DvNameChar + ')')) { $token = $(if ((& $located $line) -and (& $wordCount $line 'id') -eq 1 -and (& $wordCount $line 'session') -eq 0 -and $line -cmatch ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } }
-        if ($null -eq $token) { foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary(?!' + $script:DvNameChar + ')')) { $token = $(if ((& $located $line) -and (& $wordCount $line 'session') -eq 1 -and $line -cmatch ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } } }
+        foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.measured_session(?!' + $script:DvNameChar + ')'), $script:DvCi)) { $token = $(if ((& $located $line) -and (& $wordCount $line 'id') -eq 1 -and (& $wordCount $line 'session') -eq 0 -and $line -cmatch ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } }
+        if ($null -eq $token) { foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.summary(?!' + $script:DvNameChar + ')'), $script:DvCi)) { $token = $(if ((& $located $line) -and (& $wordCount $line 'session') -eq 1 -and $line -cmatch ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } } }
         if ($null -ne $token) { if ($token -cmatch '^[0-9]+$') { $session = $token } else { $sessionUnreadable = $true } }
         if ($null -ne $session) {
             $summaryLine = $null
-            foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
+            foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $summaryLine = $line } }
             if ($null -ne $summaryLine) {
                 foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
             }
-            foreach ($line in $lines) { if ($line -match ($rs + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)')) { $conformLine = $line } }
+            foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $conformLine = $line } }
         }
         # Master isolates an automation run's settings store (the venue's persisted settings are never read or rewritten).
         # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
@@ -2044,15 +2045,20 @@ function Get-DvDueWakeDeliveryEvidence {
             # session ANYWHERE (a `session` token, with or without =) is a boundary, read whole only as ONE ` session=<[0-9]+>` that is its first field
             # r11 pass 11 (A1, its input: a quoted `"session=4"`): a mention is the WORD session bounded by any non-name character (a quote, a comma,
             # a bracket, whitespace), not only by whitespace; `measured_session=` / `x_session=` are other names
-            $sessionTokens = { param([string]$x) [regex]::Matches($x, '(?i)' + $nameStart + 'session' + $nameEnd).Count }
+            # r12 (pass 13 A2): every case-insensitive read here is culture-invariant ($ci / $script:DvCi), never -match or (?i)
+            $ci = { param([string]$x, [string]$p) [regex]::IsMatch($x, $p, $script:DvCi) }
+            $sessionTokens = { param([string]$x) [regex]::Matches($x, $nameStart + 'session' + $nameEnd, $script:DvCi).Count }
             # r11 pass 11 (A3, its input: `playback_smoke.measured_session id=3 id=4`): a marker names its id exactly once (the word id, bounded the same way)
-            $idTokens = { param([string]$x) [regex]::Matches($x, '(?i)' + $nameStart + 'id' + $nameEnd).Count }
+            $idTokens = { param([string]$x) [regex]::Matches($x, $nameStart + 'id' + $nameEnd, $script:DvCi).Count }
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($l -match ($start + 'playback_smoke\.pace_summary' + $nameEnd)) {
+                if (& $ci $l ($start + 'playback_smoke\.pace_summary' + $nameEnd)) {
                     $paceWhole = (& $located $l) -and ($l -cmatch ($start + 'playback_smoke\.pace_summary session=[0-9]+(?:\s|$)')) -and ((& $sessionTokens $l) -eq 1)
                     # r12 (B2, its input: the sole pace_summary `session=3 (session=4)`): a pace_summary not read whole whose visible text opens the
                     # measured session's window is unreadable too, not only one inside an open window
-                    if (-not $paceWhole -and ($open -or $l -cmatch $paceRx)) { $boundaryUnreadable = $true }
+                    # r12 (pass 13 A1 on bbfe69d1, its input: `pace_summary  session=3` then `pace_summary session=3`): so is one BEFORE the measured
+                    # window was first seen ($paces 0), whatever its text; it may have been the measured Play's own pace, so the later one cannot be
+                    # shown to be the only measured window. Only a pace after the window closed is another Play's.
+                    if (-not $paceWhole -and ($open -or $paces -eq 0 -or $l -cmatch $paceRx)) { $boundaryUnreadable = $true }
                     $open = $paceWhole -and ($l -cmatch $paceRx); if ($open) { $paces++ }; continue
                 }
                 # r2 adversary pass 6 A2: any playback_smoke record of ANOTHER session (its start, summary, ...) closes the window, so another Play's
@@ -2060,12 +2066,12 @@ function Get-DvDueWakeDeliveryEvidence {
                 # session with id=, not session=, and closes the window the same way
                 if ($open) {
                     $bid = $null; $isBoundary = $false
-                    if ($l -match ($start + 'playback_smoke\.measured_session' + $nameEnd)) {
+                    if (& $ci $l ($start + 'playback_smoke\.measured_session' + $nameEnd)) {
                         $isBoundary = $true; if ((& $located $l) -and (& $sessionTokens $l) -eq 0 -and (& $idTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.measured_session id=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
                     }
                     # r12 (B2): any playback_smoke record whose body lost its tail to the sentinel may have named a session there, so it is a boundary
                     # not read whole
-                    elseif ($l -match ($start + 'playback_smoke\.(?:start|summary|conform)' + $nameEnd) -or ($l -match ($start + 'playback_smoke\.' + $script:DvNameChar + '+' + $nameEnd) -and ((& $sessionTokens $l) -gt 0 -or -not (& $located $l)))) {
+                    elseif ((& $ci $l ($start + 'playback_smoke\.(?:start|summary|conform)' + $nameEnd)) -or ((& $ci $l ($start + 'playback_smoke\.' + $script:DvNameChar + '+' + $nameEnd)) -and ((& $sessionTokens $l) -gt 0 -or -not (& $located $l)))) {
                         $isBoundary = $true; if ((& $located $l) -and (& $sessionTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
                     }
                     if ($isBoundary -and $null -eq $bid) { $boundaryUnreadable = $true; $open = $false; continue }
@@ -2075,7 +2081,7 @@ function Get-DvDueWakeDeliveryEvidence {
                 # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second
                 # one without armed= makes the read unreadable instead of being skipped
                 # r11 pass 11 advisory A4 (`playback_due_wake: armed=0 ... disabled=1` was skipped): the record name ends at any non-name character
-                if ($open -and $l -match ($start + 'playback_due_wake' + $nameEnd)) { $candidates.Add($l) }
+                if ($open -and (& $ci $l ($start + 'playback_due_wake' + $nameEnd))) { $candidates.Add($l) }
             }
         }
     }
@@ -2102,14 +2108,15 @@ function Get-DvDueWakeDeliveryEvidence {
     # r11 pass 11 (A2, its input: a quoted `"delivery_kind=post"`): a mention is the key's WORD bounded by any non-name character, so a quoted or
     # punctuated key is a mention that is not `<key>=` after whitespace, hence unreadable
     # r12 (r12 adversary B3, its input: `delivery=native-msg Kdelivery_kind=post`): the key boundary is the ASCII, case-sensitive $script:DvNameChar
-    $withKind = @($candidates | Where-Object { $_ -match ('(?<!' + $script:DvNameChar + ')delivery_kind(?!' + $script:DvNameChar + ')') })
+    # r12 (pass 13 A2): culture-invariant ($script:DvCi), so a tr-TR `DELIVERY_KIND=post` is a mention too
+    $withKind = @($candidates | Where-Object { [regex]::IsMatch($_, ('(?<!' + $script:DvNameChar + ')delivery_kind(?!' + $script:DvNameChar + ')'), $script:DvCi) })
     $keyShapeUnreadable = $false
     foreach ($c in $candidates) {
         # r12 (r12 adversary B2, its input: a sent-head wake line ending ` (delivery_kind=1)`): a wake record whose body lost its tail to the
         # LOCATION_UNREADABLE sentinel may have named a key there, so its key shape is unreadable on both paths
         if ($c.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $keyShapeUnreadable = $true }
         foreach ($key in @('delivery_kind', 'delivery', 'disabled', 'armed', 'fired', 'post_rescued', 'post_counts_settled')) {
-            if ([regex]::Matches($c, '(?i)(?<!' + $script:DvNameChar + ')' + $key + '(?!' + $script:DvNameChar + ')').Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
+            if ([regex]::Matches($c, '(?<!' + $script:DvNameChar + ')' + $key + '(?!' + $script:DvNameChar + ')', $script:DvCi).Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
         }
     }
     # r5 (r5 adversary pass 12 A1): a control binary's line (one wake record, no delivery_kind) still carries delivery= (master's
@@ -2405,6 +2412,11 @@ $script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
 # matched case-sensitively even inside a (?i) pattern or a PowerShell -match. Under IgnoreCase .NET folds U+212A (Kelvin sign) and U+0130 into [A-Za-z],
 # so `Ksession=4` hid the session mention; the inline (?-i:...) keeps every non-ASCII neighbour a non-name character.
 $script:DvNameChar = '(?-i:[A-Za-z0-9_])'
+# r12 (r12 adversary pass 13 A2 on bbfe69d1, its input: tr-TR culture and a first `PLAYBACK_SMOKE.MEASURED_SESSION id=3`): every case-insensitive
+# read of a record name, an identity word or a read key uses these options, never -match or (?i). Those take the CURRENT culture, where tr-TR folds
+# `I` to the dotless `ı`, so an upper-case marker or key was skipped (a later Play's marker chosen, DELIVERY_KIND= / DISABLED= ignored).
+# The same options as the PATH-refusal rule's $script:DvCultureFreeIgnoreCase (r9 B2 above), under a short name for these readers.
+$script:DvCi = $script:DvCultureFreeIgnoreCase
 
 # r10 (ADV-A1, Dot 6550442583; r8 adversary on 894ef15c): the ONE parenthesis the app writes inside a record body. PlaybackConformPolicy.h
 # playbackFpsStatusText appends ` (<clip> -> <rate>)` (each number QString::number(x, 'g', 5)) to the status text when a clip is conformed, and the
