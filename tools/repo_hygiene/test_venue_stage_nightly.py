@@ -67,9 +67,10 @@ def names(sha: str = SHA) -> dict[str, str]:
 
 # ---- stubs. Every one appends "<ROLE> k=v ..." to $env:FAKE_CALLS. --------------------------------------------------------------------------------------------
 FAKE_DLLGEN = r"""
-[CmdletBinding()] param([string]$SourceCommit, [string]$OutDir)
-Add-Content -LiteralPath $env:FAKE_CALLS -Value "DLLGEN sha=$SourceCommit out=$OutDir"
+[CmdletBinding()] param([string]$SourceCommit, [string]$OutDir, [string]$JobIdSuffix = '')
+Add-Content -LiteralPath $env:FAKE_CALLS -Value "DLLGEN sha=$SourceCommit out=$OutDir suffix=$JobIdSuffix"
 $id = "playback-attr-3-cuda-dllpair-$($SourceCommit.Substring(0, 12))"
+if ($JobIdSuffix) { $id = "$id-$JobIdSuffix" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 Set-Content -LiteralPath (Join-Path $OutDir "$id.job.ps1") -Value '# fixture dll job'
 Set-Content -LiteralPath (Join-Path $OutDir "$id-source.zip") -Value 'fixture zip'
@@ -589,6 +590,32 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertEqual(self.calls("DLLGEN"), [])
         self.assertFalse(any("dllpair" in c for c in self.submissions()), self.submissions())
         self.assertIn(f"dll={art}", self.calls("ASSEMBLE")[0])
+
+    def test_a_suffixed_dll_pair_is_harvested_through_read_share_and_never_resubmitted(self) -> None:
+        # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1 r2 (Grok G3 on #819): the end-to-end path. The default id holds a FAILED result (it refuses that sha's pair for
+        # good) and <default>-r2 holds a clean pair. `-DllJobIdSuffix r2` must reach Get-DllPairReuse through Read-Share and $DllReuseByName
+        # (Invoke-VenueStageNightly.ps1 :546 / :560) as (base id, suffix): a swapped or dropped argument looks up the failed default id (DLLPAIR_FAILED)
+        # or a doubled <default>-r2-r2 (result-missing, so a resubmit). Either reds this case.
+        base = f"playback-attr-3-cuda-dllpair-{S12}"
+        failed = self.share / "outbox" / f"{base}.result.json"
+        failed.write_text(json.dumps({"jobId": base, "exitCode": 9, "stdout": "FAIL step=msvcEnvironment exit=9 reason=INCLUDE_LACKS_UCRT",
+                                      "timedOut": False, "endedUtc": "2026-11-14T10:00:00Z"}), encoding="utf-8")
+        failed_bytes = failed.read_bytes()
+        jid = f"{base}-r2"
+        art = self.share / "outbox" / f"{jid}.artifacts"
+        art.mkdir(parents=True)
+        (art / "dll-pair-manifest.json").write_text(json.dumps({"sourceCommit": SHA, "jobId": jid}), encoding="utf-8")
+        (self.share / "outbox" / f"{jid}.result.json").write_text(json.dumps({"jobId": jid, "exitCode": 0, "stdout": f"RESULT=DLL_PAIR_OK SOURCE={SHA} ARCH=sm_86",
+                                                                              "timedOut": False, "endedUtc": "2026-11-15T03:00:00Z"}), encoding="utf-8")
+        p = self.run_driver("-DllJobIdSuffix", "r2")
+        self.assert_exit(p, "STAGE_OK")
+        self.assertEqual(self.calls("DLLGEN"), [], "a harvested pair is never regenerated")
+        self.assertFalse(any("dllpair" in c for c in self.submissions()), self.submissions())
+        self.assertIn(f"dll={art}", self.calls("ASSEMBLE")[0])
+        self.assertIn(f"DLL pair harvested: RESULT=DLL_PAIR_OK SOURCE={SHA}", p.stdout)
+        r = self.rows()[-1]
+        self.assertEqual((r["jobIds"]["dllPair"], r["steps"]["dllPair"]), (jid, "harvested"), r)
+        self.assertEqual(failed.read_bytes(), failed_bytes, "the failed default id's result is never rewritten")
 
     # ---------------------------------------------------------------- idempotency
     def test_an_already_staged_sha_is_skipped_with_no_build_and_no_submission(self) -> None:
