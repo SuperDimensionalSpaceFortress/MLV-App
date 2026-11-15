@@ -42,7 +42,9 @@ that applies and say which ones you tried:
 4. Identity and concurrency: two ids made in the same second, same millisecond, or in parallel processes; reused pids; two writers to
    the same file; a reader between the write and the rename; a lock that is not held across the check and the act.
 5. Clock and time: local vs UTC, a timestamp parsed without its offset, DST transitions (spring-forward gap, fall-back repeat), a
-   clock step backwards, timestamps from another host, a JSON reader that turns ISO strings into local times.
+   clock step backwards, timestamps from another host, a JSON reader that turns ISO strings into local times. And always check:
+   mixed wall/monotonic clock: every deadline derives from a Stopwatch, never from a wall instant read before blocking work
+   (a wall instant captured, then a share read, a lock or a sleep, then a deadline counted from it moves by any clock step between).
 6. Partial failure mid-operation: an exception thrown at each statement in turn of a multi-step operation (between a side effect and
    its record, or the reverse); what every catch, finally and cleanup path then does with a state it did not expect; a retry that
    repeats a side effect.

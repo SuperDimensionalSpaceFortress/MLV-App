@@ -1530,10 +1530,12 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     # BACHELOR-THERMAL-GATE-WAIT-1 r6 (merge with #704): a thermal re-probe is a probe launch too, so it passes the same guards and the same launch-time claim and lease check
     $asked = (Test-RunDirWrite (Join-Path $RunDir 'gate.log')) -and (Test-RunDirWrite (Join-Path $RunDir 'quiet') -Directory)
     if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false; heat = 'unknown'; heatText = 'no probe' } }
-    # r8 (adversary-f52a32d6.json A1): the wall instant the wait's END is counted from (-WaitUntilUtc below) is read FIRST, before every cut of the wait (the idle allowance and
+    # r8 (adversary-f52a32d6.json A1): the instant the wait's END is counted from (-WaitUntilUtc below) is read FIRST, before every cut of the wait (the idle allowance and
     # the lease room in Get-ProbeLaunchVerdict, the thermal cap below). Each cut then reads its own clock later, so a stall anywhere between here and the dispatch only shortens
     # the wait (spent); counted from UtcNow read at the dispatch, that stall was added on top of every bound (idle 300 - margin 60, a 90 s pause: 30 s past the agent's bound).
-    $dispatchUtc = [DateTime]::UtcNow
+    # r9 (Grok G14 on #817): that instant is MONOTONIC. Read off the wall clock, a step back of this host's clock between here and the dispatch moved the end that much later
+    # in the child's frame (a 60 s step: 60 s past the idle bound). The end is placed at the dispatch as the wall clock read there plus what is left of the wait.
+    $dispatchTs = [Diagnostics.Stopwatch]::GetTimestamp()
     $lv = Get-ProbeLaunchVerdict $MaxWaitSec; if ($lv.verdict) { return $lv }; $wait = [int]$lv.maxWait
     # adversary r4 pass 2 A2: during a thermal wait the deadline is checked HERE, the last statement before the process starts (the Test-Path and the write guards above can stall on a
     # share): an expired wait dispatches nothing and the caller skips on the reading it already has
@@ -1551,7 +1553,10 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     # UNC RunDir), buying a probe past the deadline. Nothing but the process start follows the admission; the file is written (still the probe's evidence) after it returns.
     # r5 pass 3 (adversary r5 pass 2 A2): the wait's END is fixed HERE, on this clock, at the dispatch: the child counts -MaxWaitSec from its own start, after the process start,
     # so the allowance passed as a duration was overrun by that startup. Wait-VenueQuiet ends every wait (the queue gate's included) by -WaitUntilUtc too.
-    $qArgs += @('-WaitUntilUtc', $dispatchUtc.AddSeconds($wait).ToString('o'))   # r8 (adversary-f52a32d6.json A1): from the instant read before the cuts
+    # r8 (adversary-f52a32d6.json A1): counted from the instant read before the cuts. r9 (Grok G14): as the wait less the MONOTONIC time spent since that instant, floored at 0,
+    # added to the wall clock read here. The wall clock is read first and the Stopwatch after it (PowerShell evaluates the target before the argument), so a pause between
+    # the two only ends the wait sooner.
+    $qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $wait - ([Diagnostics.Stopwatch]::GetTimestamp() - $dispatchTs) / [double][Diagnostics.Stopwatch]::Frequency)).ToString('o'))
     $startTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r4 pass 2 (adversary A1): the probe's dispatch, the latest instant provably before its agent jobs (the idle anchor)
     $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
     # r6 (adversary r5 A2): the child's result is observed HERE: this is the instant of its reading, taken before the evidence write and the parse below (either can stall on a share,
@@ -2728,10 +2733,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ($openSent -and ($null -eq $op -or ($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME' -and $op.outcome -cne 'RETRACTED'))) {
             $cx = Request-VenueJobCancel -AgentShare $AgentShare -JobId $b.openJobId
             LogBest "BATCH_OPEN_CANCEL batch=$batchNo job=$($b.openJobId) requested=$($cx.state)$(if ($cx.error) { " error=$($cx.error)" }) (read by name for up to ${CancelReconcileSec}s before the lease is closed and the claim released)"
-            $tc = [DateTime]::UtcNow; $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null
+            # r9 (Grok G14 prevention, mixed-clock lint): the reconcile window is timed on the MONOTONIC clock (a step back of the wall clock stretched it, the claim held meanwhile)
+            $tcTs = [Diagnostics.Stopwatch]::GetTimestamp(); $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null
             while ($true) {
                 $cr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
-                if ($cr.state -ceq 'FOUND' -or [DateTime]::UtcNow.AddSeconds($cPoll) -ge $tc.AddSeconds($CancelReconcileSec)) { break }
+                if ($cr.state -ceq 'FOUND' -or (([Diagnostics.Stopwatch]::GetTimestamp() - $tcTs) / [double][Diagnostics.Stopwatch]::Frequency) + $cPoll -ge $CancelReconcileSec) { break }
                 Start-Sleep -Seconds $cPoll
             }
             $ca = $(if ($cr.state -ceq 'FOUND') { $cr.result.admission } else { $null })
@@ -2744,7 +2750,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 elseif ($cLb.state -ceq 'OBJECT' -and $cLb.value.leaseId) { 'RAN_BEFORE_CANCEL' } elseif ($cLb.state -ceq 'OBJECT') { 'RAN_LEASE_UNNAMED' } else { 'ENDED' })   # r5 pass 2 (adversary r5 A1): a leaseBatch with no usable lease id
             if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$cLb.value.leaseId; $leaseStartUtc = $openSubmitUtc }
             if ($cState -ceq 'RAN_LEASE_UNNAMED') { $openLeaseUnnamed = $true }
-            $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int]([DateTime]::UtcNow - $tc).TotalSeconds; error = $(if ($cx.error) { $cx.error } else { $cr.error }) }
+            $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int](([Diagnostics.Stopwatch]::GetTimestamp() - $tcTs) / [double][Diagnostics.Stopwatch]::Frequency); error =$(if ($cx.error) { $cx.error } else { $cr.error }) }
             LogBest "BATCH_OPEN_RECONCILED batch=$batchNo state=$cState result=$($cr.state) label=$($b.openCancel.resultLabel) requested=$($cx.state) waitedSec=$($b.openCancel.waitedSec)"
             if ($cState -ceq 'UNRECONCILED') { $stopReason = 'OPEN_CANCEL_UNRECONCILED'; $exitCode = 11 }
         }

@@ -162,10 +162,11 @@ param(
 $ErrorActionPreference = 'Stop'
 # LEASE-BATCH-IDLE-END-UNSEEN-1 r6 (adversary-848f6559.json A3): every clock this script waits on is UTC. Local DateTimes compare by ticks only, so across a DST change a deadline
 # read as local time moved by an hour against the local clock (an expired -WaitUntilUtc read an hour late, a near one an hour early).
-$t0 = [DateTime]::UtcNow
-# r8 (adversary-5fc3bf72.json A2): every deadline check reads Get-WaitNowUtc, $t0 plus the MONOTONIC time since it (read after $t0, so a pause between the two only ends the
-# wait sooner). Read off the wall clock, a step back of this host's clock mid-wait stretched the gate past -MaxWaitSec and the caller's -WaitUntilUtc (a 120 s step: 360 s, not 240).
+# r8 (adversary-5fc3bf72.json A2): every deadline check reads Get-WaitNowUtc, $t0 plus the MONOTONIC time since $t0Ts. Read off the wall clock, a step back of this host's
+# clock mid-wait stretched the gate past -MaxWaitSec and the caller's -WaitUntilUtc (a 120 s step: 360 s, not 240). r9 (adversary-2854b231.json A1): $t0Ts is read FIRST and
+# $t0 after it, so a pause between the two puts Get-WaitNowUtc ahead of real time (the wait ends sooner); read the other way round, the pause was added to every deadline.
 $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()
+$t0 = [DateTime]::UtcNow
 function Get-WaitNowUtc { $t0.AddSeconds(([Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency) }
 
 function Get-VenueQuietDecision {

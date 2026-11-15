@@ -61,6 +61,77 @@ ABSENT = object()   # a staged build manifest field left out (stage(): dllPairMa
 DOCUMENTED_DOS_DEVICE_STEMS = frozenset(["CON", "PRN", "AUX", "NUL"] + [f"{p}{d}" for p in ("COM", "LPT") for d in "123456789\u00b9\u00b2\u00b3"])
 
 
+# r9 (Grok G14 prevention on #817): the mixed wall/monotonic clock lint. Three findings on this card (cc90eef2-A1, 5fc3bf72-A2, G14) were one class: a [DateTime]::UtcNow
+# read that a deadline (or a -WaitUntilUtc end) was later counted from, so a step of this host's clock, or blocking work after the read, moved the end. Rules, per code line:
+#   WAIT_UNTIL      a -WaitUntilUtc value must be placed in its own statement from a fresh [DateTime]::UtcNow AND a Stopwatch read (the monotonic time spent), never from a
+#                   captured wall instant.
+#   CAPTURED_WALL   a captured wall instant ($x = [DateTime]::UtcNow) with no Stopwatch frame in its file must not be extended (.AddSeconds/.AddMinutes/...) into a deadline-like
+#                   variable, a comparison or a -WaitUntilUtc.
+#   FRAME_WALL_READ in a file whose wall anchor IS paired with a Stopwatch frame (Get-WaitNowUtc), a deadline-like variable must never be read against [DateTime]::UtcNow.
+# KNOWN_WALL_DEADLINES is the exact pre-existing set (batch-level deadlines in hours and one cancel reconcile window, outside the in-lease wait chain): a new hit fails the lint,
+# and a fixed one fails it too until it is removed here (a ratchet, never a growing allowlist).
+# the standing adversary checklist line (Grok G14 prevention): the tracked portable template, row 5 (clock and time)
+ADVERSARY_CHECKLIST = ROOT / "tools" / "coordination" / "quality_lift" / "adversary-pass-prompt.md"
+MIXED_CLOCK_CHECKLIST_LINE = "mixed wall/monotonic clock: every deadline derives from a Stopwatch, never from a wall instant read before blocking work"
+MIXED_CLOCK_DEADLINE_RX = re.compile(r"\$\w*(?:[Dd]eadline|[Uu]ntil|[Gg]ateEnd)\w*\b")
+MIXED_CLOCK_ANCHOR_RX = re.compile(r"\$(\w+)\s*=\s*\[DateTime\]::UtcNow(?=\s*(?:;|\}|$))")
+MIXED_CLOCK_WAIT_UNTIL_RX = re.compile(r"""['"]-WaitUntilUtc['"]\s*,|-WaitUntilUtc\s+[\$\(\[]""")
+KNOWN_WALL_DEADLINES = frozenset({
+    ("Invoke-VenueBaseline.ps1", "CAPTURED_WALL", "$deadline = $startedUtc.AddSeconds($MaxTotalSec)"),
+    ("Invoke-VenueChain.ps1", "CAPTURED_WALL", "$deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } else { $t0.AddHours(6) })"),
+    ("Invoke-VenueLeaseBatch.ps1", "CAPTURED_WALL", "$deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } else { $t0.AddHours(6) })"),
+})
+
+
+def _mixed_clock_code(line: str) -> str:
+    s = line.strip()
+    if s.startswith("#"):
+        return ""
+    return re.sub(r"\s+#\s.*$", "", s)
+
+
+def mixed_clock_deadline_hits(files: dict[str, str]) -> set[tuple[str, str, str]]:
+    """(file, rule, code line) for every mixed wall/monotonic deadline in the given {file name: text}."""
+    hits: set[tuple[str, str, str]] = set()
+    for name, text in files.items():
+        code = [c for c in (_mixed_clock_code(x) for x in text.splitlines()) if c]
+        anchors = {m.group(1) for c in code for m in MIXED_CLOCK_ANCHOR_RX.finditer(c)}
+        # a FRAME: a function or statement that adds the Stopwatch time since an anchor to it (Get-WaitNowUtc), on a line that is not itself an anchor read
+        framed = {a for a in anchors if any(re.search(rf"\${a}\b", c) and "Stopwatch]::GetTimestamp()" in c and not MIXED_CLOCK_ANCHOR_RX.search(c) for c in code)}
+        for c in code:
+            if MIXED_CLOCK_WAIT_UNTIL_RX.search(c):
+                fresh = "[DateTime]::UtcNow" in c and "Stopwatch]::GetTimestamp()" in c
+                if not fresh or any(re.search(rf"\${a}\.Add\w*\(", c) for a in anchors):
+                    hits.add((name, "WAIT_UNTIL", c))
+            for a in anchors - framed:
+                # extended into a deadline-like variable, a -WaitUntilUtc, or a comparison that ends a wait (break / return / continue on the same line)
+                if re.search(rf"\${a}\.Add(?:Seconds|Minutes|Hours|Milliseconds)\(", c) and (
+                        re.match(rf"\s*{MIXED_CLOCK_DEADLINE_RX.pattern}\s*=", c) or MIXED_CLOCK_WAIT_UNTIL_RX.search(c)
+                        or (re.search(r"\s-[gl][te]\s", c) and re.search(r"\b(?:break|return|continue)\b", c))):
+                    hits.add((name, "CAPTURED_WALL", c))
+            if framed and "[DateTime]::UtcNow" in c and MIXED_CLOCK_DEADLINE_RX.search(c):
+                hits.add((name, "FRAME_WALL_READ", c))
+    return hits
+
+
+# r9b: LEASE_BATCH_RED_REF=<commit> makes the r9 clock behaviour tests parse the dual-venue script from that commit instead of the working tree (git show, captured into
+# a PowerShell variable and parsed in memory with Parser::ParseInput; nothing is copied to disk). It is the RED half of their RED/GREEN proof
+# (LEASE_BATCH_RED_REF=2854b231 is the r8 head). Unset, as in CI and every normal run, they parse the working tree.
+RED_REF_RX = re.compile(r"[0-9A-Za-z][0-9A-Za-z._/-]{0,99}")
+
+
+def ps_parse_source(path: Path) -> str:
+    """A PowerShell statement that sets $ast to the parsed script at `path`: the working tree, or the LEASE_BATCH_RED_REF commit's blob."""
+    ref = os.environ.get("LEASE_BATCH_RED_REF", "").strip()
+    if not ref:
+        return f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(path)}', [ref]$null, [ref]$null)"
+    if not RED_REF_RX.fullmatch(ref):
+        raise ValueError(f"LEASE_BATCH_RED_REF is not a commit name: {ref!r}")
+    rel = path.resolve().relative_to(ROOT).as_posix()
+    return (f"$src = (& git -C '{psq(ROOT)}' show '{psq(ref)}:{psq(rel)}') -join \"`n\"; if ($LASTEXITCODE -ne 0 -or -not $src) {{ throw 'git show {psq(ref)}:{psq(rel)} failed' }}\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)")
+
+
 def documented_dos_device(name: str) -> bool:
     """True when the documented reserved set names this component: the stem before the first dot, with the spaces Win32 drops before an extension removed, compared case-insensitively."""
     return name.split(".", 1)[0].rstrip(" ").upper() in DOCUMENTED_DOS_DEVICE_STEMS
@@ -1348,6 +1419,55 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 self.assertEqual(g["maxWaitSec"], g["waitSec"], g)
                 self.assertLessEqual(g["maxWaitSec"], 30, g)
 
+    # ---------------------------------------------------------------- r9 (Grok G14 on #817): the probe's wait end is counted on the MONOTONIC clock from its anchor
+    def test_lease_batch_idle_end_r9_grok_g14_a_wall_clock_step_back_before_the_probes_dispatch_never_places_its_wait_end_late(self) -> None:
+        # Grok G14: r8 counted -WaitUntilUtc from $dispatchUtc = [DateTime]::UtcNow, read before the cuts (which can block on a share), so this host's clock stepping BACK S between
+        # that read and the dispatch put the end S later in the child's frame (Wait-VenueQuiet compares it with its own wall clock): a 60 s step ran the wait 60 s past the idle
+        # allowance. The function is rebuilt with every [DateTime]::UtcNow read in it going through a fake wall clock that steps back 60 s after ONE top-level statement; each
+        # statement before the one that places -WaitUntilUtc is tried in turn, wherever the anchor sits. In the stepped frame the idle bound is t0 + 30 - 60: the end may land
+        # early (spent), never more than 0.3 s past it. Only the child's own startup, after the dispatch, stays exposed (disclosed). LEASE_BATCH_RED_REF=2854b231: RED, ~60 s late.
+        case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        script = (
+            ps_parse_source(RUNNER) + "\n"
+            f"Import-Module '{psq(DV / 'VenueThermalGate.psm1')}' -Force -DisableNameChecking\n"
+            "foreach ($n in 'Get-ProbeLaunchVerdict', 'Get-IdleAllowanceSec', 'Get-ThermalElapsedSec') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-QuietProbe' }, $true)\n"
+            "$stmts = @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text.Replace('[DateTime]::UtcNow', '(Get-FakeWallUtc)') })\n"
+            "$params = @($fn.Parameters | ForEach-Object { $_.Extent.Text }) -join ', '\n"
+            "$cut = 0; while ($cut -lt $stmts.Count -and -not $stmts[$cut].Contains(\"'-WaitUntilUtc'\")) { $cut++ }\n"
+            "function Get-FakeWallUtc { [DateTime]::UtcNow.AddSeconds($global:wallStepSec) }\n"
+            "function Test-RunDirWrite { $true }; function Get-VenueClaimKeeperLoss { $null }; function L { }\n"
+            "function ConvertFrom-VenueProbeHeatLine { [pscustomobject]@{ heat = 'unknown'; text = ''; thresholdsSource = $null; reason = $null } }\n"
+            "function Invoke-FakeProbe { $global:seenArgs = @($args); $global:LASTEXITCODE = 3 }\n"
+            f"$RunDir = '{psq(case)}'; $QuietScript = '{psq(RUNNER)}'; $Venue = 'bachelor'; $ThresholdPercent = 15; $RecheckSec = 30; $pwshExe = 'Invoke-FakeProbe'\n"
+            "$claimKeeper = $null; $claim = [pscustomobject]@{ expiresUtc = [DateTime]::UtcNow.AddHours(1) }; $ThermalDispatchGraceSec = 1; $ThermalPollSec = 30; $ThermalWaitCapSec = 30\n"
+            "$runs = @(for ($k = 0; $k -lt $cut; $k++) {\n"
+            "    $body = @(for ($i = 0; $i -lt $stmts.Count; $i++) { $stmts[$i]; if ($i -eq $k) { '$global:wallStepSec = -60' } }) -join \"`n\"\n"
+            "    . ([scriptblock]::Create('function Invoke-QuietProbe(' + $params + \") {`n\" + $body + \"`n}\"))\n"
+            "    $global:wallStepSec = 0; $global:seenArgs = @()\n"
+            "    $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "    $idleAnchorTs = $t0Ts; $probeIdleCap = 30; $LeaseMarginSec = 60; $legBudget = 600; $leaseEnd = $t0.AddSeconds(7200)\n"
+            "    $q = Invoke-QuietProbe 'leg' \"r9-g14-$k\" 600 $null\n"
+            "    $a = @($global:seenArgs); $iu = [Array]::IndexOf($a, '-WaitUntilUtc'); $im = [Array]::IndexOf($a, '-MaxWaitSec')\n"
+            "    if ($iu -lt 0) { \"after statement ${k}: no -WaitUntilUtc ($($q | ConvertTo-Json -Compress))\"; continue }\n"
+            "    $until = [DateTime]::Parse($a[$iu + 1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()\n"
+            "    [ordered]@{ after = $k; lateSec = [Math]::Round(($until - $t0.AddSeconds(30 - 60)).TotalSeconds, 3); maxWaitSec = [int]$a[$im + 1]; waitSec = $q.maxWaitSec }\n"
+            "})\n"
+            "[ordered]@{ cut = $cut; runs = $runs } | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertGreaterEqual(got["cut"], 8, got)
+        self.assertEqual(len(got["runs"]), got["cut"], got)
+        for g in got["runs"]:
+            with self.subTest(step_after_statement=g["after"] if isinstance(g, dict) else g):
+                self.assertIsInstance(g, dict, g)
+                self.assertLessEqual(g["lateSec"], 0.3, f"a 60 s wall-clock step back after statement {g['after']} placed the probe's wait end past the idle bound: {g}")
+                self.assertGreater(g["lateSec"], -5.0, f"the wait end was placed far earlier than the bound (the spent time counted twice?): {g}")
+                self.assertEqual(g["maxWaitSec"], g["waitSec"], g)
+                self.assertLessEqual(g["maxWaitSec"], 30, g)
+
     # ---------------------------------------------------------------- r8 (Grok G12 on #817): an agent clock ahead charges the send plus the job's own runtime, not the bare send
     def test_lease_batch_idle_end_r8_grok_g12_get_agent_job_end_ts_ahead_floor_is_the_send_plus_the_jobs_runtime(self) -> None:
         # Get-AgentJobEndTs returned the bare send whenever the agent's endedUtc lay in this host's future, so one second of skew past the job-to-observation gap charged the whole
@@ -1394,7 +1514,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                      "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }"):
             self.assertEqual(wvq.replace("\r\n", "\n").count(frag), 1, frag)
         self.assertEqual(wvq.count("(Get-WaitNowUtc) - $t0).TotalSeconds"), 3)
-        self.assertLess(wvq.index("$t0 = [DateTime]::UtcNow"), wvq.index("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()"))
+        # r9 (adversary-2854b231.json A1): the MONOTONIC anchor is read first and the wall clock after it (a pause between them puts Get-WaitNowUtc ahead, never behind)
+        self.assertLess(wvq.index("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()"), wvq.index("$t0 = [DateTime]::UtcNow"))
         script = (
             f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(wvq_path)}', [ref]$null, [ref]$null)\n"
             ". ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-WaitNowUtc' }, $true).Extent.Text))\n"
@@ -1404,6 +1525,75 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertLess(abs(float(out.stdout.strip()) - 5.0), 0.5, out.stdout)
+
+    def test_lease_batch_idle_end_r9_adv_2854b231_a1_a_pause_between_wait_venue_quiets_two_clock_reads_never_puts_its_clock_behind(self) -> None:
+        # adversary-2854b231.json A1 (r8 OPEN, introduced by 2854b231): Wait-VenueQuiet read $t0 (wall) BEFORE $t0Ts (Stopwatch), so a pause P between the two put Get-WaitNowUtc
+        # P BEHIND real time and every deadline it checks (the caller's -WaitUntilUtc included) ended P late. The two top-level anchor statements are taken from the script in the
+        # order it has them, with a 1.5 s sleep between them: Get-WaitNowUtc may run ahead of the wall clock (the wait ends sooner), never more than 0.3 s behind it.
+        # LEASE_BATCH_RED_REF=2854b231: RED, about 1.5 s behind.
+        wvq_path = DV / "Wait-VenueQuiet.ps1"
+        script = (
+            ps_parse_source(wvq_path) + "\n"
+            "$top = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and @('$t0', '$t0Ts') -ccontains $_.Left.Extent.Text } | ForEach-Object { $_.Extent.Text })\n"
+            "if ($top.Count -ne 2) { throw \"expected the two top-level anchor statements, found $($top.Count)\" }\n"
+            ". ([scriptblock]::Create($top[0] + \"`nStart-Sleep -Milliseconds 1500`n\" + $top[1]))\n"
+            ". ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-WaitNowUtc' }, $true).Extent.Text))\n"
+            "[ordered]@{ order = @($top | ForEach-Object { ($_ -split '=')[0].Trim() }); aheadSec = [Math]::Round(((Get-WaitNowUtc) - [DateTime]::UtcNow).TotalSeconds, 3) } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertGreaterEqual(got["aheadSec"], -0.3, f"a pause between Wait-VenueQuiet's two clock reads put Get-WaitNowUtc behind real time (every deadline ends that late): {got}")
+
+    # ---------------------------------------------------------------- r9 (Grok G14 prevention on #817): the mixed wall/monotonic clock lint
+    def test_lease_batch_idle_end_r9_grok_g14_mixed_clock_lint_the_dual_venue_scripts_hold_exactly_the_known_wall_deadlines(self) -> None:
+        # Every .ps1/.psm1 under tools/profiling/dual-venue: a NEW wall-clock deadline (or -WaitUntilUtc counted from a captured wall instant) fails here; a known one that is
+        # fixed fails too until it leaves KNOWN_WALL_DEADLINES (a ratchet). The lease room ($leaseEnd - [DateTime]::UtcNow) compares an agent-published wall instant with this
+        # host's wall clock, which no rule here covers: successor LEASE-END-MONOTONIC-ROOM-1.
+        files = {p.name: p.read_text(encoding="utf-8") for p in sorted(DV.iterdir()) if p.is_file() and p.suffix in (".ps1", ".psm1")}
+        self.assertIn(RUNNER.name, files)
+        self.assertIn("Wait-VenueQuiet.ps1", files)
+        hits = mixed_clock_deadline_hits(files)
+        self.assertEqual(sorted(hits - KNOWN_WALL_DEADLINES), [], "a new mixed wall/monotonic deadline: derive it from a Stopwatch, never from a wall instant read before blocking work")
+        self.assertEqual(sorted(KNOWN_WALL_DEADLINES - hits), [], "a known wall deadline is gone: remove it from KNOWN_WALL_DEADLINES (the ratchet only shrinks)")
+
+    def test_lease_batch_idle_end_r9_grok_g14_mixed_clock_lint_is_red_on_each_shape_this_card_fixed(self) -> None:
+        # The lint on inline fixtures: the 2854b231 probe anchor (G14), the pre-r9 open-cancel reconcile window, the pre-r8 Wait-VenueQuiet deadline read (5fc3bf72-A2), each
+        # flagged; the shapes that replaced them, clean.
+        red = {
+            "g14-2854b231.ps1": ("$dispatchUtc = [DateTime]::UtcNow\n"
+                                 "$lv = Get-ProbeLaunchVerdict $MaxWaitSec; $wait = [int]$lv.maxWait\n"
+                                 "$qArgs += @('-WaitUntilUtc', $dispatchUtc.AddSeconds($wait).ToString('o'))   # r8 (adversary-f52a32d6.json A1): from the instant read before the cuts\n"),
+            "reconcile-pre-r9.ps1": ("$tc = [DateTime]::UtcNow; $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null\n"
+                                     "while ($true) {\n"
+                                     "    if ($cr.state -ceq 'FOUND' -or [DateTime]::UtcNow.AddSeconds($cPoll) -ge $tc.AddSeconds($CancelReconcileSec)) { break }\n"
+                                     "}\n"),
+            "wvq-5fc3bf72.ps1": ("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()\n"
+                                 "$t0 = [DateTime]::UtcNow\n"
+                                 "function Get-WaitNowUtc { $t0.AddSeconds(([Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency) }\n"
+                                 "if ([DateTime]::UtcNow.AddSeconds($RecheckSec) -gt $deadline) { break }\n"),
+        }
+        want = {"g14-2854b231.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"}, "reconcile-pre-r9.ps1": {"CAPTURED_WALL"}, "wvq-5fc3bf72.ps1": {"FRAME_WALL_READ"}}
+        for name, text in red.items():
+            with self.subTest(fixture=name):
+                self.assertEqual({rule for (n, rule, _c) in mixed_clock_deadline_hits({name: text})}, want[name])
+        green = {
+            "g14-r9.ps1": ("$dispatchTs = [Diagnostics.Stopwatch]::GetTimestamp()\n"
+                           "$qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $wait - ([Diagnostics.Stopwatch]::GetTimestamp() - $dispatchTs) / [double][Diagnostics.Stopwatch]::Frequency)).ToString('o'))\n"),
+            "reconcile-r9.ps1": ("$tcTs = [Diagnostics.Stopwatch]::GetTimestamp(); $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null\n"
+                                 "    if ($cr.state -ceq 'FOUND' -or (([Diagnostics.Stopwatch]::GetTimestamp() - $tcTs) / [double][Diagnostics.Stopwatch]::Frequency) + $cPoll -ge $CancelReconcileSec) { break }\n"),
+            "wvq-r8.ps1": ("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()\n"
+                           "$t0 = [DateTime]::UtcNow\n"
+                           "function Get-WaitNowUtc { $t0.AddSeconds(([Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency) }\n"
+                           "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }\n"),
+        }
+        for name, text in green.items():
+            with self.subTest(fixture=name):
+                self.assertEqual(mixed_clock_deadline_hits({name: text}), set())
+
+    def test_lease_batch_idle_end_r9_grok_g14_the_adversary_checklist_carries_the_mixed_clock_line(self) -> None:
+        # Grok G14 prevention, second half: the standing adversary checklist line, so a cross-provider pass asks the question on every diff
+        self.assertIn(MIXED_CLOCK_CHECKLIST_LINE, ADVERSARY_CHECKLIST.read_text(encoding="utf-8"))
 
     def test_lease_batch_idle_end_r8_adv_a2_a_published_member_is_read_as_it_was_published(self) -> None:
         # adversary-cc9275e3.json A2: `$(if (Test-JsonObject $r) { $r.startedUtc })` unrolled startedUtc=["<instant>"] into the instant, so an unusable value supplied a runtime.

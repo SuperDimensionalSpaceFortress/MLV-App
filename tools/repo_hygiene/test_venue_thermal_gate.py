@@ -352,7 +352,9 @@ class ThermalGateModuleTests(unittest.TestCase):
         # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 / r6 (hosted CI on 848f6559): only two in-memory statements may sit between the admission and the start, neither of which
         # touches a file or a share: the probe's absolute wait end (-WaitUntilUtc, fixed at the dispatch) and the dispatch's monotonic instant (the idle anchor)
         # r8 (adversary-f52a32d6.json A1): the end is counted from $dispatchUtc, read before the wait's cuts (still in memory, no file or share)
-        in_memory = ("$qArgs += @('-WaitUntilUtc', $dispatchUtc.AddSeconds($wait).ToString('o'))", "$startTs = [Diagnostics.Stopwatch]::GetTimestamp()")
+        # r9 (Grok G14 on #817): it is the wall clock read at the dispatch plus the wait left on the MONOTONIC clock since $dispatchTs (still in memory, no file or share)
+        in_memory = ("$qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $wait - ([Diagnostics.Stopwatch]::GetTimestamp() - $dispatchTs) / [double][Diagnostics.Stopwatch]::Frequency)).ToString('o'))",
+                     "$startTs = [Diagnostics.Stopwatch]::GetTimestamp()")
         while after and after[0].lstrip().startswith(in_memory):
             after.pop(0)
         self.assertTrue(after and after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[:1])
