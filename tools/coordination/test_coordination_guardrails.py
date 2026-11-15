@@ -1126,6 +1126,14 @@ def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_p
 # NOT covered, a write that reaches a splatted table through a nested index or an array wrapper (`@($h)[0]['PipelineVariable'] = 'w'`, `$h[0]['k'] = ...`): only `( )`, `$( )` of one statement, a cast and `-as` are read through.
 # A class named by a selector is read: the process class name with a wildcard or a character class (`Win32_Proc*`, `Win32[_]Proces[s]`), and a WQL meta_class / __CLASS / __THIS / __DERIVATION / __DYNASTY / __SUPERCLASS query; an assignment in parentheses is read as its target (`($h = @{})['k'] = 'w'`, `($PSDefaultParameterValues = @{})[...]`). NOT covered: a selector on another property (`__RELPATH`, `__PATH`), and `1 | ForEach-Object -InputObject { $_ } -Process { $_ }`, which recurses and fails the tracked test instead of being scanned (adversary pass 11 A2).
 # A CLASS OPERAND is read by what it is, not by its letters (adversary pass 13 A1): the class operand of Get-WmiObject / gwmi / Get-CimClass / Get-CimInstance / gcim (also through a file alias; -Class / -ClassName / -Query in any abbreviation, or positional) that is not a plain literal name, or holds `*` `?` `[` or a WQL `%`, taints the command as WMI whatever its letters (`Win?2_Process`, `Win3[2]_Process`, `*Process`, `*`); a read with no class operand (`Get-WmiObject -List`) taints too. The values of -Filter, -Namespace, -ComputerName, -Property and the common parameters are not class operands. NOT covered: a class operand that is a plain literal Win32_ name other than the process class but reaches the process class by inheritance (`-List Win32_Perf*` is read, `-List CIM_Process` is not), and a read by a command other than these five (`Get-CimAssociatedInstance`, `[wmisearcher]`, `Get-WmiObject` through `& $cmd`). A colon-form value of a non-class parameter (`-Verbose:$false`) and a -PipelineVariable value are not class operands. The create verb is read where the verb stands (pass 14 A2): the data inside quotes of a wmic word (`where "Name='create'"`) and an array or hashtable in the arguments slot of an InvokeMethod call (`InvokeMethod('GetOwner', @('create'))`) are not the verb; an array at the name position still is.
+# A WORD IS A WHOLE WORD, AND A CLASS IS READ WHERE IT IS NAMED (r14, adversary passes 15 and 16): the watched words are not matched inside a longer identifier
+# (`$ManagementClassServer`); the letters of the process class are read only at a class operand (of the five reads, of a class parameter -Class / -ClassName /
+# -ResultClassName / -Query on any command, the first positional of Invoke-CimMethod / Invoke-WmiMethod, a type name, an argument of a CimSession method that takes a
+# class) and never from a string elsewhere (`[System.IO.FileInfo]'Win32_Process'`, `New-Object System.IO.FileInfo 'Win32_Process'`); the create verb is a WHOLE token
+# (a wmic argument that starts with `/` or `-` is a global switch and its value, `/output:C:\create\p.txt`; a method name CreateRestorePoint is not Create); a one-letter
+# parameter that can only be a value parameter (-n Namespace, -f Filter) takes its value; an explicit -InputObject decides what its command receives; `$( )` is unwrapped
+# like parentheses. NOT covered, the price of reading a class only where it is named: a bare positional string that names the process class to a command other than
+# these (`Get-CimAssociatedInstance Win32_Process`, `Get-Item WMI:\root\cimv2\Win32_Process`).
 # The ONE sanctioned launcher lives under .claude-state and is not tracked, so today the allow list is empty. An entry is {repo-relative posix path: reason},
 # added only in review for a script that must call the create itself; an entry that stops matching a site fails the test, so the list cannot go stale.
 WMI_CREATE_ALLOW = {}
@@ -1136,9 +1144,13 @@ $ErrorActionPreference = 'Stop'
 # The ways a script can name the process class: the class name, a prefix of it followed by a wildcard or a character class (Win32_Proc*, Win32_P%, Win32[_]Proces[s],
 # Win32*), the type names, and a WQL schema selector that finds a class by a property instead of its name (meta_class, __CLASS, __THIS, __DERIVATION, __DYNASTY,
 # __SUPERCLASS). Another Win32_ class (Win32_OperatingSystem) is not the process class, so a plain Win32_ prefix is not a match.
-$wmiWord = [regex]::new('(?i)win32(?:_|\[_\])(?:process|(?:p|pr|pro|proc|proce|proces)?[*%?\[])|win32[*%?\[]|wmiclass|managementclass|meta_class|__class|__this|__derivation|__dynasty|__superclass')
+# A WORD is a whole word (r14, adversary pass 15 A3): the names below are not matched inside a longer identifier (`$ManagementClassServer`, `$__classCount`), and the
+# letters are read only where a class is NAMED (Test-WmiWord), never from free text.
+$wmiWord = [regex]::new('(?i)(?<![A-Za-z0-9_])(?:win32(?:_|\[_\])(?:process|(?:p|pr|pro|proc|proce|proces)?[*%?\[])|win32[*%?\[]|(?:wmiclass|managementclass|meta_class|__class|__this|__derivation|__dynasty|__superclass)(?![A-Za-z0-9_]))')
 $wmiCommands = @('invoke-cimmethod', 'invoke-wmimethod', 'icim', 'iwmi')
 $wmiTypes = '(^|\.)(wmiclass|wmi|ManagementClass)$'
+# The type names a command can be given as text (New-Object System.Management.ManagementClass 'Win32_Process'); a whole word, as in $wmiWord.
+$wmiTypeWord = [regex]::new('(?i)(?<![A-Za-z0-9_])(?:wmiclass|managementclass)(?![A-Za-z0-9_])')
 $quoteChars = '["' + "'" + [char]0x2018 + [char]0x2019 + [char]0x201A + [char]0x201B + [char]0x201C + [char]0x201D + [char]0x201E + ']'
 $quoteOrEscape = '[#`' + $quoteChars.Substring(1)
 
@@ -1512,14 +1524,16 @@ function Get-ForEachMemberName($Command) {
 
 # True when the objects a command receives are WMI: an earlier element of its pipeline names a WMI class or starts from a WMI variable, or -InputObject does.
 function Test-WmiPipelineInput($Command) {
+    # An explicit -InputObject IS the command's input: what it holds decides, and an earlier WMI element of the pipeline does not override it (adversary pass 15 A4).
+    $inputObject = Get-ParameterValue $Command 'InputObject' 1
+    if ($null -ne $inputObject) { return (Test-WmiNode $inputObject) }
     if ($Command.Parent -is [PipelineAst]) {
         foreach ($element in @($Command.Parent.PipelineElements)) {
             if ([object]::ReferenceEquals($element, $Command)) { break }
             if (Test-WmiNode $element) { return $true }
         }
     }
-    $inputObject = Get-ParameterValue $Command 'InputObject' 1
-    return ($null -ne $inputObject -and (Test-WmiNode $inputObject))
+    return $false
 }
 
 # Everything a command's name may mean once the file's aliases are followed (a cycle ends because a name is listed once). The alias map only ADDS meanings: the raw
@@ -1542,6 +1556,8 @@ $wmiReadCommands = @('get-wmiobject', 'gwmi', 'get-cimclass', 'get-ciminstance',
 # -Class / -ClassName / -Query (any abbreviation, one letter or more) hold the class. The parameters below take a value that is never the class (-Filter, -Namespace, the
 # common parameters ...); the value of one is skipped. A switch (-List) or an unknown parameter takes none, so the element after it is read as an operand.
 $wmiClassParameters = @('Class', 'ClassName', 'Query')
+# Switches of the five reads (and the common ones): they take no value. Only used to tell whether a ONE-letter abbreviation is unambiguously a value parameter.
+$wmiSwitchParameters = @('List', 'Recurse', 'Amended', 'DirectRead', 'AsJob', 'EnableAllPrivileges', 'KeyOnly', 'Shallow', 'Verbose', 'Debug', 'WhatIf', 'Confirm')
 $wmiOtherValueParameters = @('Namespace', 'ComputerName', 'Credential', 'Authentication', 'Authority', 'Impersonation', 'ThrottleLimit', 'Filter', 'Property', 'Locale', 'CimSession', 'OperationTimeoutSec', 'ResourceUri', 'QueryDialect', 'MethodName', 'PropertyName', 'QualifierName', 'PipelineVariable', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer')
 
 function Test-WmiClassOperandText($Operand, [bool]$IsQuery) {
@@ -1549,7 +1565,21 @@ function Test-WmiClassOperandText($Operand, [bool]$IsQuery) {
     if ($Operand -isnot [StringConstantExpressionAst]) { return $true }
     $value = [string]$Operand.Value
     if ($IsQuery) { $value = [regex]::Replace($value, '(?i)\bselect\s+\*', 'select') }
-    return ($value -match '[*?\[%]')
+    # A plain literal is the class when it spells the process class (the letters are read HERE, at the operand, and nowhere else).
+    return ($value -match '[*?\[%]') -or $wmiWord.IsMatch($value)
+}
+
+# True when a ONE-letter parameter abbreviation can only be a parameter that takes a non-class value: every parameter of the five reads (and the common ones) that
+# starts with the letter is such a value parameter (-n is Namespace, -f is Filter, -t is ThrottleLimit). A letter that also starts a switch (-l: List, Locale) or a class
+# parameter is not (adversary pass 15 A2: -n was read as a class operand).
+function Test-OneLetterValueParameter([string]$Letter) {
+    $hits = 0
+    foreach ($p in @($wmiClassParameters + $wmiOtherValueParameters + $wmiSwitchParameters)) {
+        if (-not $p.StartsWith($Letter, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($wmiOtherValueParameters -notcontains $p) { return $false }
+        $hits++
+    }
+    return ($hits -gt 0)
 }
 
 # True when this one command reads WMI by a class operand that is tainted (see above).
@@ -1570,6 +1600,7 @@ function Test-WmiClassOperandCommand($Command) {
                 foreach ($op in $wmiOtherValueParameters) { if ($op.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)) { $isOther = $true } }
                 if (@('ea', 'wa', 'ia', 'ev', 'wv', 'iv', 'ov', 'ob', 'pv') -contains $n.ToLowerInvariant()) { $isOther = $true }
             }
+            elseif (-not $isClass -and $n.Length -eq 1) { $isOther = Test-OneLetterValueParameter $n }
             if ($null -ne $e.Argument) {
                 # A colon-form value belongs to its parameter: only a class parameter's is a class operand (`-Verbose:$false`, `-List:$true`, `-Filter:$f` are not).
                 if (-not $isClass) { continue }
@@ -1599,10 +1630,8 @@ function Get-VerbText($Node) {
 function Test-DataArgument($Arguments, [int]$Index) {
     $slot = (($Index -eq 1 -and $Arguments.Count -le 3 -and $Arguments[0] -is [StringConstantExpressionAst]) -or ($Index -eq 3 -and $Arguments.Count -eq 4))
     if (-not $slot) { return $false }
-    $v = $Arguments[$Index]
-    while ($v -is [ConvertExpressionAst] -or $v -is [ParenExpressionAst]) {
-        if ($v -is [ConvertExpressionAst]) { $v = $v.Child } else { $v = Get-WrappedExpression $v.Pipeline $null }
-    }
+    # Through a cast, parentheses and `$( )` of one expression (adversary pass 15 A1: `$(@('create'))` is the same array).
+    $v = Get-ValueExpression $Arguments[$Index]
     return ($v -is [ArrayLiteralAst] -or $v -is [ArrayExpressionAst] -or $v -is [HashtableAst])
 }
 
@@ -1614,9 +1643,50 @@ function Test-WmiClassOperand($Node) {
     return $false
 }
 
-# True when the node names the WMI process class in any spelling the scanner knows (the letters), or reads a class by a tainted operand.
+# The parameters that hold a CLASS on any command (-Class, -ClassName, -ResultClassName, -Query, in any abbreviation of at least two letters, or -c / -q): the value of
+# one is a class operand whatever the command is.
+function Test-ClassParameterName([string]$Name) {
+    foreach ($full in @('Class', 'ClassName', 'ResultClassName', 'Query')) {
+        if ($Name.Length -ge 1 -and $full.StartsWith($Name, [StringComparison]::OrdinalIgnoreCase) -and ($Name.Length -ge 2 -or $Name -match '(?i)^[cq]$')) { return $true }
+    }
+    return $false
+}
+
+# True when one command NAMES a WMI class by its letters: a type name it is given (New-Object System.Management.ManagementClass), the value of a class parameter, or the
+# first positional operand of an Invoke-CimMethod / Invoke-WmiMethod call. An argument of any other command (`New-Object System.IO.FileInfo 'Win32_Process'`,
+# `Write-Output 'Win32_Process'`) is free text: it names nothing and taints nothing (r14, adversary pass 16 A3).
+function Test-WmiCommandWord($Command) {
+    $meanings = @(Get-CommandMeanings $Command)
+    $elements = @($Command.CommandElements)
+    $isInvoke = $false
+    foreach ($m in $meanings) { if ($wmiCommands -contains $m) { $isInvoke = $true } }
+    $positional = 0
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $e = $elements[$i]
+        if ($e -is [CommandParameterAst]) {
+            $value = if ($null -ne $e.Argument) { $e.Argument } elseif ($i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [CommandParameterAst]) { $elements[$i + 1] } else { $null }
+            if ($null -ne $value -and (Test-ClassParameterName $e.ParameterName) -and $wmiWord.IsMatch((Get-CleanText $value))) { return $true }
+            continue
+        }
+        $positional++
+        if ($isInvoke -and $positional -eq 1 -and $e -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-CleanText $e))) { return $true }
+        if ($meanings -contains 'new-object' -and $wmiTypeWord.IsMatch((Get-CleanText $e))) { return $true }
+    }
+    return $false
+}
+
+# True when the node names the WMI process class where a class is named: a type name, a command's class operand, or an argument of a CimSession method that takes a
+# class (EnumerateInstances, QueryInstances, GetInstance, InvokeMethod ...). The letters of a string anywhere else are free text.
 function Test-WmiWord($Node) {
-    if ($wmiWord.IsMatch((Get-CleanText $Node))) { return $true }
+    foreach ($x in @($Node.FindAll({ param($y) $y -is [CommandAst] -or $y -is [InvokeMemberExpressionAst] -or $y -is [TypeConstraintAst] -or $y -is [TypeExpressionAst] }, $true))) {
+        if ($x -is [CommandAst]) { if (Test-WmiCommandWord $x) { return $true } }
+        elseif ($x -is [InvokeMemberExpressionAst]) {
+            if ($x.Member -is [StringConstantExpressionAst] -and [string]$x.Member.Value -match '(?i)^(enumerate\w*|query\w*|get\w*(instance|class)\w*|invokemethod\w*)$' -and $x.Expression -isnot [TypeExpressionAst]) {
+                foreach ($a in @($x.Arguments)) { if ($a -isnot [ScriptBlockExpressionAst] -and $wmiWord.IsMatch((Get-CleanText $a))) { return $true } }
+            }
+        }
+        elseif ($wmiWord.IsMatch($x.TypeName.FullName)) { return $true }
+    }
     return (Test-WmiClassOperand $Node)
 }
 
@@ -1735,19 +1805,24 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
                 if ($wmiCommands -contains $cand) {
                     $method = Get-MethodName $n
                     if ($null -eq $method) { $kind = 'wmi-method-name-not-literal' }
-                    elseif ($method -match '(?i)create') { $kind = 'wmi-create' }
+                    # A method name is the verb as a WHOLE name: CreateRestorePoint is not Create (adversary pass 15 A4). Several operands are joined by a space.
+                    elseif ($method -match '(?i)(^|\s)create(\s|$)') { $kind = 'wmi-create' }
                 }
                 elseif ($cand -eq 'wmic') {
-                    # The argument elements only: a comment inside the command is not an argument.
-                    $words = @($n.CommandElements | Select-Object -Skip 1 | ForEach-Object { Get-VerbText $_ })
-                    if (($words -join ' ') -match '(?i)\bcreate\b') { $kind = 'wmic-create' }
+                    # The argument elements only: a comment inside the command is not an argument. The verb is a whole token of an argument that is not a switch: an
+                    # argument that starts with `/` or `-` is a global switch with its value (`/output:C:\create\p.txt`, `/node:create`), not the verb (adversary pass 15 A2).
+                    foreach ($arg in @($n.CommandElements | Select-Object -Skip 1)) {
+                        $verbWords = Get-VerbText $arg
+                        if ($verbWords -match '^\s*[/-]') { continue }
+                        foreach ($token in @($verbWords -split '[\s,;()]+')) { if ($token -ieq 'create') { $kind = 'wmic-create' } }
+                    }
                 }
                 elseif (@('foreach-object', 'foreach', '%') -contains $cand) {
                     # ForEach-Object calls the named method on each input: no script block and no `.Create(` is needed.
                     $memberName = Get-ForEachMemberName $n
                     if ($null -ne $memberName -and (Test-WmiPipelineInput $n)) {
                         if ($memberName -isnot [StringConstantExpressionAst]) { $kind = 'wmi-foreach-member-not-literal' }
-                        elseif ([string]$memberName.Value -match '(?i)create|invokemethod') { $kind = 'wmi-foreach-member-create' }
+                        elseif ([string]$memberName.Value -match '(?i)^\s*(create|invokemethod)\s*$') { $kind = 'wmi-foreach-member-create' }
                         # A member name is a wildcard pattern: 'Cr?ate' and 'Cr*' name Create.
                         elseif ([string]$memberName.Value -match '[*?\[]') { $kind = 'wmi-foreach-member-wildcard' }
                     }
@@ -1767,7 +1842,7 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
             elseif ($member -ieq 'InvokeMethod') {
                 # The arguments only, so a comment between them does not count; the receiver or an argument names the WMI class.
                 $arguments = @($n.Arguments)
-                $argText = (@($arguments | ForEach-Object { Get-CleanText $_ }) -join ' ')
+                $argText = (@(for ($j = 0; $j -lt $arguments.Count; $j++) { if (-not (Test-DataArgument $arguments $j)) { Get-CleanText $arguments[$j] } }) -join ' ')
                 $argsReadWmi = $wmiWord.IsMatch($argText)
                 foreach ($argAst in $arguments) { if (Test-WmiClassOperand $argAst) { $argsReadWmi = $true } }
                 $verbText = (@(for ($j = 0; $j -lt $arguments.Count; $j++) { if (-not (Test-DataArgument $arguments $j)) { Get-CleanText $arguments[$j] } }) -join ' ')
@@ -2171,6 +2246,21 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "splat-select-calculated-property-by-keyed-write": "$h = @{}\n$h['Property'] = @{ n = 'p'; e = { $_.Create('x') } }\nGet-WmiObject -List Win32_Process | Select-Object @h",
         "as-cast-receiver": "$c = Get-WmiObject -List Win32_Process\n($c -as [object]).Create('x')",
         "as-cast-receiver-invoke-method": "$c = Get-WmiObject -List Win32_Process\n($c -as [object]).InvokeMethod('Create', [object[]]@('x', $null, $null))",
+        # r14, the class "a word that merely CONTAINS a watched word": the verb is matched as a whole token and the class is read from an operand, so the real creates
+        # next to each accepted case below are still refused
+        "wmic-verb-after-a-node-switch": "wmic /node:server process call create 'git --version'",
+        "wmic-verb-after-an-output-switch-with-a-create-directory": "wmic /output:C:\\create\\process.txt process call create 'git --version'",
+        "wmic-verb-after-a-dash-form-switch": "wmic -node:server process call create 'git --version'",
+        "wmi-class-after-a-one-letter-namespace-abbreviation": "$c = Get-WmiObject -n root/cimv2 -List Win32_Process\n$c.Create('x')",
+        "wmi-wildcard-class-after-a-one-letter-namespace-abbreviation": "$ns = 'root/cimv2'\n$c = Get-WmiObject -n $ns -List 'Win?2_Process'\n$c.Create('x')",
+        "wmi-class-after-a-one-letter-filter-abbreviation": "$c = Get-CimInstance -f 'ProcessId=4' -ClassName Win32_Process\n$c.Create('x')",
+        "invoke-method-subexpression-array-at-the-name-position": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod($(@('Create')), [object[]]@('x', $null, $null))",
+        "invoke-method-name-and-subexpression-array-both-say-create": "$c = Get-WmiObject -List Win32_Process\n$c.InvokeMethod('Create', $(@('create')))",
+        "foreach-explicit-wmi-inputobject-after-a-plain-pipeline-element": "Get-Item x | ForEach-Object -InputObject (Get-WmiObject -List Win32_Process) -Process { $_.Create('x') }",
+        "new-object-management-class-create": "$c = New-Object System.Management.ManagementClass 'Win32_Process'\n$c.Create('x')",
+        "new-object-management-class-parenthesized-create": "(New-Object -TypeName System.Management.ManagementClass -ArgumentList 'Win32_Process').Create('x')",
+        "cim-method-named-create-among-other-names": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'CreateNote' }",
+        "foreach-member-name-create-with-a-note-property-name-elsewhere": "Get-CimInstance Win32_Process | Add-Member -NotePropertyName CreateNote -NotePropertyValue 'x' -PassThru | ForEach-Object -MemberName Create -ArgumentList 'x'",
     }
     not_sites = {
         "line-comment": "# Invoke-CimMethod -ClassName Win32_Process -MethodName Create; [wmiclass]'Win32_Process'",
@@ -2288,6 +2378,26 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
         "wmic-single-quoted-filter-value-says-create": "wmic process where 'Name=\"create\"' get ProcessId",
         "invoke-method-array-argument-says-create": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', [object[]]@('create', 'domain'))",
         "invoke-method-hashtable-argument-says-create": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', @{ verb = 'create' })",
+        # r14 (adversary passes 15 and 16 on 6689d450 / 070a94c6), the class "a word or identifier that merely CONTAINS a watched word": the verb is a whole token, the
+        # class is read from a class operand and never from free text, an identifier is not a word, and an explicit -InputObject decides what its block's $_ is
+        "wmic-output-switch-path-has-a-create-directory": "wmic /output:C:\\create\\process.txt process get ProcessId",
+        "wmic-node-switch-value-says-create": "wmic /node:create process get ProcessId",
+        "wmic-dash-form-node-switch-value-says-create": "wmic -node:create process get ProcessId",
+        "wmi-list-with-a-one-letter-namespace-abbreviation": "$ns = 'root/cimv2'\n$svc = Get-WmiObject -List Win32_Service -n $ns\n$createService = $svc.Create",
+        "cim-read-with-a-one-letter-filter-abbreviation": "$f = \"State='Running'\"\n$svc = Get-CimInstance Win32_Service -f $f\n$createService = $svc.Create",
+        "file-info-string-names-the-process-class": "$f = [System.IO.FileInfo]'Win32_Process'\n$f.Create().Dispose()",
+        "file-info-ctor-string-names-the-process-class": "$f = [System.IO.FileInfo]::new('Win32_Process')\n$f.Create().Dispose()",
+        "new-object-file-info-names-the-process-class": "$f = New-Object System.IO.FileInfo 'Win32_Process'\n$f.Create().Dispose()",
+        "string-variable-names-the-process-class-and-a-file-is-created": "$name = 'Win32_Process'\n$f = [System.IO.FileInfo]$name\n$f.Create().Dispose()",
+        "variable-named-with-a-watched-word": "$ManagementClassServer = '.'\n$svc = Get-WmiObject -List Win32_Service -ComputerName $ManagementClassServer\n$createService = $svc.Create",
+        "variable-named-with-a-class-selector-word": "$__classCount = 3\n$o = Get-Item x\n$o.Create($__classCount)",
+        "explicit-plain-inputobject-after-a-wmi-pipeline-element": "Get-WmiObject -List Win32_Process | ForEach-Object -InputObject ([System.IO.FileInfo]'scratch.txt') -Process { $_.Create().Dispose() }",
+        "invoke-method-subexpression-array-argument-says-create": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', $(@('create', 'domain')))",
+        "invoke-method-parenthesized-subexpression-array-says-create": "$p = Get-WmiObject Win32_Process -Filter 'ProcessId=4'\n$p.InvokeMethod('GetOwner', ($(@('create', 'domain'))))",
+        "cim-method-name-contains-create": "Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{ Description = 'Before update'; RestorePointType = 0; EventType = 100 }",
+        "wmi-method-name-contains-create": "Invoke-WmiMethod -Class SystemRestore -Name CreateRestorePoint -ArgumentList 'x', 0, 100",
+        "foreach-member-name-contains-create": "$p = Get-CimInstance Win32_Process | Select-Object -First 1\n$p | Add-Member -NotePropertyName CreateNote -NotePropertyValue 'read-only'\n$p | ForEach-Object -MemberName CreateNote",
+        "foreach-member-name-contains-invoke-method": "Get-CimInstance Win32_Process | ForEach-Object -MemberName InvokeMethodNote",
     }
     files = {}
     for name, text in {**mutants, **not_sites}.items():
@@ -2302,7 +2412,8 @@ def test_wmi_create_scan_refuses_each_direct_create_spelling(tmp_path):
     survivors = [name for name in mutants if not scan[str(files[name])]["sites"]]
     assert survivors == [], f"these direct WMI creates were not refused: {survivors}"
     false_alarms = {name: scan[str(files[name])]["sites"] for name in not_sites if scan[str(files[name])]["sites"]}
-    assert false_alarms == {}, "a comment, a string, a read of the process table, GetOwner, Terminate and [scriptblock]::Create are not a WMI process create"
+    assert false_alarms == {}, ("a comment, a string, a read of the process table, GetOwner, Terminate and [scriptblock]::Create are not a WMI process create; "
+                                f"refused: {sorted(false_alarms)}")
     # adversary A7: a file the parser cannot read is reported as unreadable, not as a clean file with no sites
     missing = tmp_path / "cases" / "this-file-does-not-exist.ps1"
     unread = _wmi_create_scan(tmp_path / "scan-missing", [missing])[str(missing)]
