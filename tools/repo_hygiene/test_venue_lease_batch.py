@@ -73,9 +73,13 @@ DOCUMENTED_DOS_DEVICE_STEMS = frozenset(["CON", "PRN", "AUX", "NUL"] + [f"{p}{d}
 # the standing adversary checklist line (Grok G14 prevention): the tracked portable template, row 5 (clock and time)
 ADVERSARY_CHECKLIST = ROOT / "tools" / "coordination" / "quality_lift" / "adversary-pass-prompt.md"
 MIXED_CLOCK_CHECKLIST_LINE = "mixed wall/monotonic clock: every deadline derives from a Stopwatch, never from a wall instant read before blocking work"
-MIXED_CLOCK_DEADLINE_RX = re.compile(r"\$\w*(?:[Dd]eadline|[Uu]ntil|[Gg]ateEnd)\w*\b")
-MIXED_CLOCK_ANCHOR_RX = re.compile(r"\$(\w+)\s*=\s*\[DateTime\]::UtcNow(?=\s*(?:;|\}|$))")
-MIXED_CLOCK_WAIT_UNTIL_RX = re.compile(r"""['"]-WaitUntilUtc['"]\s*,|-WaitUntilUtc\s+[\$\(\[]""")
+# r9b (adversary-9a56fa7a.json A2): PowerShell names are case-insensitive ([datetime]::utcnow, $DEADLINE, .addseconds, -WAITUNTILUTC, -cge), so every pattern here is too.
+# [DateTimeOffset]::UtcNow and [System.DateTime]::UtcNow are the same wall clock.
+MIXED_CLOCK_WALL_RX = re.compile(r"\[(?:System\.)?DateTime(?:Offset)?\]::UtcNow\b", re.IGNORECASE)
+MIXED_CLOCK_MONO_RX = re.compile(r"\[(?:System\.)?(?:Diagnostics\.)?Stopwatch\]::GetTimestamp\(\)", re.IGNORECASE)
+MIXED_CLOCK_DEADLINE_RX = re.compile(r"\$\w*(?:deadline|until|gateEnd)\w*\b", re.IGNORECASE)
+MIXED_CLOCK_ANCHOR_RX = re.compile(r"\$(\w+)\s*=\s*\[(?:System\.)?DateTime(?:Offset)?\]::UtcNow(?=\s*(?:;|\}|$))", re.IGNORECASE)
+MIXED_CLOCK_WAIT_UNTIL_RX = re.compile(r"""['"]-WaitUntilUtc['"]\s*,|-WaitUntilUtc\s+[\$\(\[]""", re.IGNORECASE)
 KNOWN_WALL_DEADLINES = frozenset({
     ("Invoke-VenueBaseline.ps1", "CAPTURED_WALL", "$deadline = $startedUtc.AddSeconds($MaxTotalSec)"),
     ("Invoke-VenueChain.ps1", "CAPTURED_WALL", "$deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } else { $t0.AddHours(6) })"),
@@ -95,21 +99,21 @@ def mixed_clock_deadline_hits(files: dict[str, str]) -> set[tuple[str, str, str]
     hits: set[tuple[str, str, str]] = set()
     for name, text in files.items():
         code = [c for c in (_mixed_clock_code(x) for x in text.splitlines()) if c]
-        anchors = {m.group(1) for c in code for m in MIXED_CLOCK_ANCHOR_RX.finditer(c)}
+        anchors = {m.group(1).lower() for c in code for m in MIXED_CLOCK_ANCHOR_RX.finditer(c)}
         # a FRAME: a function or statement that adds the Stopwatch time since an anchor to it (Get-WaitNowUtc), on a line that is not itself an anchor read
-        framed = {a for a in anchors if any(re.search(rf"\${a}\b", c) and "Stopwatch]::GetTimestamp()" in c and not MIXED_CLOCK_ANCHOR_RX.search(c) for c in code)}
+        framed = {a for a in anchors if any(re.search(rf"\${a}\b", c, re.I) and MIXED_CLOCK_MONO_RX.search(c) and not MIXED_CLOCK_ANCHOR_RX.search(c) for c in code)}
         for c in code:
             if MIXED_CLOCK_WAIT_UNTIL_RX.search(c):
-                fresh = "[DateTime]::UtcNow" in c and "Stopwatch]::GetTimestamp()" in c
-                if not fresh or any(re.search(rf"\${a}\.Add\w*\(", c) for a in anchors):
+                fresh = bool(MIXED_CLOCK_WALL_RX.search(c) and MIXED_CLOCK_MONO_RX.search(c))
+                if not fresh or any(re.search(rf"\${a}\.Add\w*\(", c, re.I) for a in anchors):
                     hits.add((name, "WAIT_UNTIL", c))
             for a in anchors - framed:
                 # extended into a deadline-like variable, a -WaitUntilUtc, or a comparison that ends a wait (break / return / continue on the same line)
-                if re.search(rf"\${a}\.Add(?:Seconds|Minutes|Hours|Milliseconds)\(", c) and (
-                        re.match(rf"\s*{MIXED_CLOCK_DEADLINE_RX.pattern}\s*=", c) or MIXED_CLOCK_WAIT_UNTIL_RX.search(c)
-                        or (re.search(r"\s-[gl][te]\s", c) and re.search(r"\b(?:break|return|continue)\b", c))):
+                if re.search(rf"\${a}\.Add(?:Seconds|Minutes|Hours|Milliseconds|Ticks)\(", c, re.I) and (
+                        re.match(rf"\s*{MIXED_CLOCK_DEADLINE_RX.pattern}\s*=", c, re.I) or MIXED_CLOCK_WAIT_UNTIL_RX.search(c)
+                        or (re.search(r"\s-[ci]?[gl][te]\s", c, re.I) and re.search(r"\b(?:break|return|continue)\b", c, re.I))):
                     hits.add((name, "CAPTURED_WALL", c))
-            if framed and "[DateTime]::UtcNow" in c and MIXED_CLOCK_DEADLINE_RX.search(c):
+            if framed and MIXED_CLOCK_WALL_RX.search(c) and MIXED_CLOCK_DEADLINE_RX.search(c):
                 hits.add((name, "FRAME_WALL_READ", c))
     return hits
 
@@ -1573,7 +1577,20 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                                  "function Get-WaitNowUtc { $t0.AddSeconds(([Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency) }\n"
                                  "if ([DateTime]::UtcNow.AddSeconds($RecheckSec) -gt $deadline) { break }\n"),
         }
-        want = {"g14-2854b231.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"}, "reconcile-pre-r9.ps1": {"CAPTURED_WALL"}, "wvq-5fc3bf72.ps1": {"FRAME_WALL_READ"}}
+        # adversary-9a56fa7a.json A2: PowerShell is case-insensitive, so are these (its input, and the sibling spellings it named)
+        red.update({
+            "case-lower-anchor.ps1": "$t0 = [datetime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
+            "case-upper-var.ps1": "$T0 = [DATETIME]::UTCNOW\n$DEADLINE = $t0.addseconds(30)\n",
+            "case-wait-until.ps1": "$d = [datetime]::utcnow\n$qArgs += @('-WAITUNTILUTC', $D.ADDSECONDS($wait).ToString('o'))\n",
+            "case-cge-break.ps1": "$tc = [System.DateTime]::UtcNow\nif ([datetime]::utcnow -cge $TC.addSeconds(5)) { BREAK }\n",
+            "offset-anchor.ps1": "$t0 = [DateTimeOffset]::UtcNow\n$gateEnd = $t0.AddSeconds(30)\n",
+            "case-frame.ps1": ("$t0Ts = [diagnostics.stopwatch]::gettimestamp()\n$t0 = [datetime]::utcnow\n"
+                               "function Get-WaitNowUtc { $T0.AddSeconds(([System.Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / 1.0) }\n"
+                               "if ([DateTime]::UTCNOW -gt $Deadline) { break }\n"),
+        })
+        want = {"g14-2854b231.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"}, "reconcile-pre-r9.ps1": {"CAPTURED_WALL"}, "wvq-5fc3bf72.ps1": {"FRAME_WALL_READ"},
+                "case-lower-anchor.ps1": {"CAPTURED_WALL"}, "case-upper-var.ps1": {"CAPTURED_WALL"}, "case-wait-until.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"},
+                "case-cge-break.ps1": {"CAPTURED_WALL"}, "offset-anchor.ps1": {"CAPTURED_WALL"}, "case-frame.ps1": {"FRAME_WALL_READ"}}
         for name, text in red.items():
             with self.subTest(fixture=name):
                 self.assertEqual({rule for (n, rule, _c) in mixed_clock_deadline_hits({name: text})}, want[name])

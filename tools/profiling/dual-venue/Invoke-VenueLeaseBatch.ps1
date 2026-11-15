@@ -1789,6 +1789,9 @@ function Get-AgentJobEndTs([long]$ObservedTs, [long]$FloorTs, $EndedUtc, $Starte
         # r8 (Grok G12 on #817): an agent clock AHEAD says nothing about when, but its own endedUtc - startedUtc is a duration on ONE clock (the skew cancels), and the job cannot
         # end before it was sent plus that duration: the floor is the send plus the job's own runtime, never past the observation. Charging the bare send spent the whole leg
         # from the idle allowance across one second of skew. No usable startedUtc (absent, unreadable, the queue-expired result's $null) or a negative runtime: the send alone.
+        # DISTINGUISH (adversary-5fc3bf72.json A1 = 2854b231 A2 = 9a56fa7a A1): a step FORWARD of the agent's clock during the job inflates that runtime, up to the observation
+        # (the pre-r4 anchor, the bound here). No runner-side reading can tell such a step from a long job: removing it needs an agent-published monotonic runtime
+        # (successor BACHELOR-AGENT-REDEPLOY-IDLESEC-1). The only skew-proof floor is the bare send, which is what G12 replaced on purpose.
         $st = ConvertTo-AgentUtc $StartedUtc
         if ($null -eq $st -or $st -gt $at) { return $FloorTs }
         return [long][Math]::Min([double]$ObservedTs, $FloorTs + ($at - $st).TotalSeconds * [Diagnostics.Stopwatch]::Frequency)
