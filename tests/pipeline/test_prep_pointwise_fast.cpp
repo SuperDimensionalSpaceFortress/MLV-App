@@ -18,7 +18,8 @@
 //  F4  opt-in (MLVAPP_PREP_POINTWISE_FAST_BENCH=1, never in CI): reference vs
 //      fast on a std::thread, as the prep thread runs it, for Look Assist on with
 //      AgX off and for the three AgX-on shapes. Printed, never asserted.
-// No assertion here reads a duration.
+// No assertion here bounds a duration (the team skew is only checked to be
+// finite and non-negative).
 #include "../common/minitest.h"
 
 #include "mlv_pipeline_fixture.h"
@@ -42,6 +43,13 @@
 #include <thread>
 #include <vector>
 #include <omp.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace {
 
@@ -988,13 +996,15 @@ TEST(PrepPointwiseFast, DynamicScheduleIsByteIdenticalAtOddAndProductionTeams)
             EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
             EnvScope forced("MLVAPP_FORCE_THREADS", threadText.c_str());
             EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
+            /* Adversary 605e7a49-A2: OMP_THREAD_LIMIT may grant fewer threads. */
+            const int team = std::min(threads, omp_get_thread_limit());
 
             GpuPreviewProcessingCpuSpans spans;
             std::vector<uint16_t> out16(frame.size(), 0);
             gpuPreviewProcessingApplyCpuReferenceTimed(*shape.config, frame.data(), out16.data(),
                                                        kFullWidth, kFullHeight, &spans);
             ASSERT_TRUE(spans.pointwiseFast);
-            ASSERT_EQ(threads, spans.pointwiseOmpThreads);
+            ASSERT_EQ(team, spans.pointwiseOmpThreads);
             ASSERT_TRUE(std::isfinite(spans.pointwiseTeamSkewMs) && spans.pointwiseTeamSkewMs >= 0.0);
             int first = -1;
             int worst = maxAbsDiff16(out16, ref, &first);
@@ -1007,7 +1017,7 @@ TEST(PrepPointwiseFast, DynamicScheduleIsByteIdenticalAtOddAndProductionTeams)
                                                      kFullWidth, kFullHeight, &spans8);
             ASSERT_TRUE(!spans8.fused8);
             ASSERT_TRUE(spans8.pointwiseFast);
-            ASSERT_EQ(threads, spans8.pointwiseOmpThreads);
+            ASSERT_EQ(team, spans8.pointwiseOmpThreads);
             ASSERT_TRUE(std::isfinite(spans8.pointwiseTeamSkewMs) && spans8.pointwiseTeamSkewMs >= 0.0);
             worst = maxAbsDiff8(out8, ref, &first);
             if (worst != 0) failDiff(__FILE__, __LINE__, "dynamic To8 16-bit route == reference >> 8", tag, worst, first);
@@ -1018,13 +1028,71 @@ TEST(PrepPointwiseFast, DynamicScheduleIsByteIdenticalAtOddAndProductionTeams)
             gpuPreviewProcessingApplyCpuReferenceTo8(*shape.config, frame.data(), nullptr, fused.data(),
                                                      kFullWidth, kFullHeight, &spansF);
             ASSERT_TRUE(spansF.fused8);
-            ASSERT_EQ(threads, spansF.pointwiseOmpThreads);
+            ASSERT_EQ(team, spansF.pointwiseOmpThreads);
             ASSERT_TRUE(std::isfinite(spansF.pointwiseTeamSkewMs) && spansF.pointwiseTeamSkewMs >= 0.0);
             worst = maxAbsDiff8(fused, ref, &first);
             if (worst != 0) failDiff(__FILE__, __LINE__, "dynamic fused 8-bit == reference >> 8", tag, worst, first);
         }
         std::printf("[PREP-FAST] %s dynamic schedule byte-identical at teams 3,16\n", shape.label);
     }
+}
+
+#ifdef _WIN32
+/* Peak committed bytes of this process (PROCESS_MEMORY_COUNTERS.PeakPagefileUsage). */
+SIZE_T peakCommitBytes()
+{
+    PROCESS_MEMORY_COUNTERS counters;
+    std::memset(&counters, 0, sizeof(counters));
+    counters.cb = sizeof(counters);
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)) ? counters.PeakPagefileUsage : 0;
+}
+#endif
+
+/* Adversary 605e7a49-A1: MLVAPP_FORCE_THREADS bypasses the playback cap, so the
+ * requested team can be INT_MAX. A 1x1 frame runs the region serially; the team
+ * skew must not allocate anything sized by the request (16 GiB of timestamps at
+ * INT_MAX), and every route still writes the reference's output. */
+TEST(PrepPointwiseFast, ForcedHugeTeamRequestAllocatesNothingForTheSkew)
+{
+    MlvPipelineFixture fixture;
+    openFixture(fixture);
+    const GpuPreviewProcessingConfig config = buildConfig(fixture, [](processingObject_t * p) { applyLookAssistOff(p); });
+    ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(config)));
+    const std::vector<uint16_t> frame = { 0, 0, 0 };
+    std::vector<uint16_t> ref(3, 0x5A5A);
+    gpuPreviewProcessingApplyCpuReference(config, frame.data(), ref.data(), 1, 1);
+
+    EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
+    EnvScope forced("MLVAPP_FORCE_THREADS", "2147483647");
+    EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
+#ifdef _WIN32
+    const SIZE_T peakBefore = peakCommitBytes();
+    ASSERT_TRUE(peakBefore > 0);
+#endif
+    GpuPreviewProcessingCpuSpans spans;
+    std::vector<uint16_t> out16(3, 0x5A5A);
+    gpuPreviewProcessingApplyCpuReferenceTimed(config, frame.data(), out16.data(), 1, 1, &spans);
+    std::vector<uint16_t> scratch(3, 0x5A5A);
+    std::vector<uint8_t> out8(3, 0x5A);
+    GpuPreviewProcessingCpuSpans spans8;
+    gpuPreviewProcessingApplyCpuReferenceTo8(config, frame.data(), scratch.data(), out8.data(), 1, 1, &spans8);
+    std::vector<uint8_t> fused(3, 0x5A);
+    GpuPreviewProcessingCpuSpans spansF;
+    gpuPreviewProcessingApplyCpuReferenceTo8(config, frame.data(), nullptr, fused.data(), 1, 1, &spansF);
+#ifdef _WIN32
+    const SIZE_T peakAfter = peakCommitBytes();
+    /* 256 MiB is far above anything a 1x1 frame needs and far below the 16 GiB
+     * a request-sized timestamp array takes. */
+    if (peakAfter > peakBefore + (SIZE_T(256) << 20))
+        ::minitest::fail(__FILE__, __LINE__, "no request-sized allocation",
+                         "peak commit grew by " + std::to_string((peakAfter - peakBefore) >> 20) + " MiB");
+#endif
+    ASSERT_TRUE(spans.pointwiseFast && spans8.pointwiseFast && spansF.pointwiseFast && spansF.fused8);
+    ASSERT_EQ(1, spans.pointwiseOmpThreads);
+    int first = -1;
+    if (maxAbsDiff16(out16, ref, &first) != 0) failDiff(__FILE__, __LINE__, "Timed 16-bit == reference", "1x1", 1, first);
+    if (maxAbsDiff8(out8, ref, &first) != 0) failDiff(__FILE__, __LINE__, "To8 16-bit route == reference >> 8", "1x1", 1, first);
+    if (maxAbsDiff8(fused, ref, &first) != 0) failDiff(__FILE__, __LINE__, "fused 8-bit == reference >> 8", "1x1", 1, first);
 }
 
 TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)

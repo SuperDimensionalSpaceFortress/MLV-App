@@ -4773,10 +4773,13 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
                          && !view.highlightRecon && !view.saturation;
     const int requested = std::max(1, mlvappEffectivePlaybackWorkerThreadCount());
     int team = 1;
-    std::vector<qint64> ends(static_cast<size_t>(requested), -1);
+    /* Each thread's finish time folds into a min and a max: nothing is sized by
+     * `requested`, which MLVAPP_FORCE_THREADS can set to INT_MAX. */
+    qint64 firstEnd = std::numeric_limits<qint64>::max();
+    qint64 lastEnd = -1;
     QElapsedTimer skewClock;
     skewClock.start();
-    #pragma omp parallel num_threads(requested) if(pixelCount >= 2048)
+    #pragma omp parallel num_threads(requested) if(pixelCount >= 2048) reduction(min:firstEnd) reduction(max:lastEnd)
     {
         if ( omp_get_thread_num() == 0 ) team = omp_get_num_threads();
         /* Static and WITH its implicit barrier: every pixel reads the tables. */
@@ -4825,20 +4828,14 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
                 }
             }
         }
-        const int self = omp_get_thread_num();
-        if ( self >= 0 && self < requested ) ends[static_cast<size_t>(self)] = skewClock.nsecsElapsed();
+        const qint64 end = skewClock.nsecsElapsed();
+        firstEnd = end;
+        lastEnd = end;
     }
     if ( teamSkewMs )
     {
-        qint64 first = -1;
-        qint64 last = -1;
-        for (const qint64 end : ends)
-        {
-            if ( end < 0 ) continue;
-            if ( first < 0 || end < first ) first = end;
-            if ( end > last ) last = end;
-        }
-        *teamSkewMs = first < 0 ? 0.0 : static_cast<double>(last - first) / 1.0e6;
+        *teamSkewMs = ( lastEnd < 0 || firstEnd > lastEnd )
+            ? 0.0 : static_cast<double>(lastEnd - firstEnd) / 1.0e6;
     }
     return team;
 }
