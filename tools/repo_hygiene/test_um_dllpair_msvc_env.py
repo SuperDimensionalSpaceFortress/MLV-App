@@ -199,20 +199,42 @@ class BackendCmdUcrtCheckTests(_Pwsh):
     so a standalone run (over SSH, no job around it) also never meets C1083 first. The cmd lines are taken from each script's text and run in cmd.exe."""
 
     def check_lines(self, script: Path) -> list[str]:
-        lines = re.findall(r"^\s*'((?:[^']|'')*MLV_UCRT_OK(?:[^']|'')*)',?\s*$", script.read_text(encoding="utf-8"), re.M)
+        lines = re.findall(r"^\s*'((?:[^']|'')*MLV_(?:UCRT_OK|INC)(?:[^']|'')*)',?\s*$", script.read_text(encoding="utf-8"), re.M)
         return [l.replace("''", "'") for l in lines]
 
-    def run_check(self, script: Path, include: str | None) -> subprocess.CompletedProcess:
+    def run_check(self, script: Path, include: str | None, via_env: bool = False) -> subprocess.CompletedProcess:
+        # via_env: INCLUDE arrives in the process environment exactly as given (quotes and '&' included), as vcvars64 leaves it, not via a set line
         cmd = self.tmp / "check.cmd"
-        body = ["@echo off"] + ([f'set "INCLUDE={include}"'] if include is not None else ['set "INCLUDE="']) + self.check_lines(script) + ["echo REACHED_NVCC", "exit /b 0"]
+        head = [] if via_env else ([f'set "INCLUDE={include}"'] if include is not None else ['set "INCLUDE="'])
+        body = ["@echo off"] + head + self.check_lines(script) + ["echo REACHED_NVCC", "exit /b 0"]
         cmd.write_text("\r\n".join(body) + "\r\n", encoding="ascii")
-        return subprocess.run(["cmd.exe", "/d", "/c", str(cmd)], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        env = dict(os.environ)
+        if via_env:
+            env["INCLUDE"] = include or ""
+        return subprocess.run(["cmd.exe", "/d", "/c", str(cmd)], capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
+
+    def test_adversary_9f89_a1_a_quoted_entry_with_an_ampersand_still_reaches_the_typed_refusal(self) -> None:
+        # adversary pass on 9f89f0a1, A1: INCLUDE=C:\missing;"C:\SDK & Kits\ucrt" broke the for-list ('& was unexpected') before the exit-9 guard
+        amp = self.tmp / "SDK & Kits" / "ucrt"
+        amp.mkdir(parents=True)
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name, header=False):
+                p = self.run_check(script, f'C:\\missing;"{amp}"', via_env=True)
+                self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                self.assertNotIn("REACHED_NVCC", p.stdout)
+        (amp / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name, header=True):
+                p = self.run_check(script, f'C:\\missing;"{amp}"', via_env=True)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("REACHED_NVCC", p.stdout)
 
     def test_each_script_checks_after_vcvars_and_before_nvcc(self) -> None:
         for script in BACKEND_SCRIPTS:
             with self.subTest(script=script.name):
                 text = script.read_text(encoding="utf-8")
-                self.assertEqual(len(self.check_lines(script)), 3, script.name)
+                self.assertEqual(len(self.check_lines(script)), 4, script.name)
                 vcvars = text.index('"call `"$vcvars`" >nul"')
                 check = text.index("MLV_UCRT_OK")
                 nvcc = text.index('"`"$nvcc`" $archArgLine')
