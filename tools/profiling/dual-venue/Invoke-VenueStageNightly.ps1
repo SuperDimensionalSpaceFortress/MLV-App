@@ -57,7 +57,8 @@
 #   3  capacity: DISK_FLOOR_REFUSED | HOST_COMMIT_REFUSED | BUILD_GUARD_REFUSED (the refusal text is printed verbatim)
 #   40 AGENT_BUSY (a live claim or queued ticket, another driver holds the venue lock, or um-run RETRACTED a job the agent never claimed)
 #   41 SHARE_UNREACHABLE (the share did not answer by name inside -ProbeTimeoutSec, the agent has no heartbeat, or the share stalled through placement:
-#      UMRUN_NOT_AFTER_PLACEMENT_STALL, the job never visible)
+#      UMRUN_NOT_AFTER_PLACEMENT_STALL, the job never visible). A share ROOT this host cannot read (System error 5, no SMB credential) prints the typed
+#      line `SHARE_ACCESS_DENIED <unc root>` first, then exits 41 too; 'No agent heartbeat' is kept for a readable share whose heartbeat is missing.
 #   42 SOURCE_COMMIT_UNRESOLVED   43 GATE_UNAVAILABLE   44 DLLPAIR_FAILED   45 ASSEMBLE_FAILED   46 STAGE_FAILED   47 STAGE_VERIFY_MISMATCH
 #   48 SMOKE_RUNNER_STAGE_FAILED  49 STAGE_UNRESOLVED (um-run stopped while the agent may still own the job; not retried)  50 STAGE_CAP_EXCEEDED (-MaxTotalSec ran out)
 #   51 RECEIPT_IO_FAILED (the receipt could not be read for the night check, the reservation could not be persisted -- staging did not start -- or the closing
@@ -515,6 +516,9 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if (Test-UmRunJobIdInUseMessage -Message $msg -JobId $JobId) { return 'IN_USE' }
     if ($msg -match '^UNRESOLVED:') { Stop-Nightly 'STAGE_UNRESOLVED' "um-run $Step ($JobId): $msg (not retried in this call)" }
     if ($msg -match '^RETRACTED:') { Stop-Nightly 'AGENT_BUSY' "um-run $Step ($JobId) was never claimed: $msg" }
+    # MINI3-CUTOVER-STATE-GAPS-1: um-run throws the typed 'SHARE_ACCESS_DENIED <root>' when the share ROOT cannot be read (System error 5: this host has no SMB
+    # credential for it). It is printed verbatim FIRST, so no 'No agent heartbeat' text can come before it, and it keeps the SHARE_UNREACHABLE exit (41).
+    if ($msg -match '^SHARE_ACCESS_DENIED (\S.*)$') { $deniedRoot = $Matches[1].Trim(); Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step : the share root $deniedRoot cannot be read (access denied, not a missing heartbeat): store the SMB credential for that host with cmdkey, tools\workstation\README.md step 6b" -Verbatim @("SHARE_ACCESS_DENIED $deniedRoot") }
     if ($msg -match '^No agent heartbeat') { Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step : $msg" }
     # r2: the drop refuses a cap (this call's deadline) that passed before its claim, before any share write; r3/r4: or during placement, before the job's
     # rename. r5 (Grok G5): the text says what holds in every case: the job was never made visible.
