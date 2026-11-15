@@ -1140,6 +1140,33 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertGreater(sec, 3.0, both)
         self.assertIn("could not be hashed: no answer in", out + both, both)
 
+    def _r12_seamed_call(self, share: Path, seam: str, args: str, probe: str) -> tuple[str, float, str]:
+        ps = (f"Import-Module '{DRIVER.parent / 'VenueChain.psm1'}' -Force -DisableNameChecking; & (Get-Module VenueChain) {{ {seam} }}; "
+              "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+              f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' {args} {probe}; "
+              "'STATE=' + $r.state + ' ERROR=[' + $r.error + ']'; 'SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture)")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        m = re.search(r"SEC=([0-9.]+)", p.stdout)
+        self.assertIsNotNone(m, p.stdout + p.stderr)
+        return p.stdout, float(m.group(1)), p.stdout + p.stderr
+
+    def test_r12_a1_a_stall_between_the_deadline_samples_never_moves_the_end_later(self) -> None:
+        # r12 fix iteration (adversary A1 on 09421b77, VenueChain.psm1:655): the deadline's remainder was taken from UtcNow, then the call clock read AFTER it, so a
+        # caller descheduled between the two added the stall to the cap. A 3 s stall there under a 4 s deadline: RED STAGED at ~6 s, past the deadline.
+        out, sec, both = self._r12_seamed_call(self._r11_sound_share("r12-a1-share"), "$script:VenueTestDeadlineSampleDelayMs = 3000",
+                                               "-VerifyArtifacts -TimeoutSec 20 -ArtifactTimeoutSec 300 -CallCapSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(4))",
+                                               "-ArtifactProbeScript { param($items) [Threading.Thread]::Sleep(3000) }")
+        self.assertIn("STATE=UNREACHABLE", out, both)
+        self.assertLess(sec, 4.6, both)
+
+    def test_r12_a2_an_answer_that_lands_after_the_fixed_end_is_never_acted_on(self) -> None:
+        # r12 fix iteration (adversary A2 on 09421b77, VenueChain.psm1:870): a caller descheduled between the launch and the wait found the worker done, WaitOne(0)
+        # was true and the late answer was accepted. Every bounded read is stalled 5 s there under a 4 s cap: RED STAGED at ~5 s; now UNREACHABLE, past its end.
+        out, sec, both = self._r12_seamed_call(self._r11_sound_share("r12-a2-share"), "$script:VenueTestPreWaitDelayMs = 5000",
+                                               "-TimeoutSec 20 -CallCapSec 4", "")
+        self.assertIn("STATE=UNREACHABLE", out, both)
+        self.assertIn("after the call's end", out, both)
+
     def test_r11_a1_the_nightly_hands_its_deadline_to_the_soundness_read(self) -> None:
         text = DRIVER.read_text(encoding="utf-8")
         calls = [l for l in text.splitlines() if "Get-VenueStagedBuildManifest -AgentShare" in l]

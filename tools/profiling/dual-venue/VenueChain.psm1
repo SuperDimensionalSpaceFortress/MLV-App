@@ -652,7 +652,11 @@ function Get-VenueStagedBuildManifest {
     if ($null -ne $CallDeadlineUtc) {
         # r12: the deadline left at the clock's start (a deadline already past is a cap of 0.001 s: UNREACHABLE below, never "no cap")
         # (PowerShell hands a [Nullable[DateTime]] parameter over as the DateTime itself: no .Value)
-        $dlCap = (([DateTime]$CallDeadlineUtc).ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds + $callClock.Elapsed.TotalSeconds
+        # r12 fix iteration (adversary A1 on 09421b77): the call clock is read FIRST and the wall clock after it, so a caller descheduled between the two samples
+        # can only shorten the cap (the remainder is taken later), never add the stall to it
+        $dlElapsed = $callClock.Elapsed.TotalSeconds
+        if ($script:VenueTestDeadlineSampleDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestDeadlineSampleDelayMs) }
+        $dlCap = (([DateTime]$CallDeadlineUtc).ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds + $dlElapsed
         $dlCap = [Math]::Min(86400.0, [Math]::Max(0.001, $dlCap))
         $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $dlCap) } else { $dlCap })
     }
@@ -835,6 +839,10 @@ function Get-VenueStagedArtifactNames {
 }
 
 $script:VenueAbandonedReads = 0
+# Test-only seams (r12 fix iteration, adversary A1/A2 on 09421b77), set from a test through the module scope; production leaves both 0. The first stalls the
+# caller between the two clock samples -CallDeadlineUtc is taken from, the second between a bounded read's launch and its wait (a descheduled caller).
+$script:VenueTestDeadlineSampleDelayMs = 0
+$script:VenueTestPreWaitDelayMs = 0
 
 function Complete-VenueProcess {
     <#
@@ -866,6 +874,7 @@ function Invoke-VenueBoundedRead {
         [void]$ps.AddScript($ScriptText)
         [void]$ps.AddArgument($Argument)
         $async = $ps.BeginInvoke()
+        if ($script:VenueTestPreWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreWaitDelayMs) }
         $waitSec = $TimeoutSec
         if ($null -ne $Clock) { $waitSec = [Math]::Max(0.0, [Math]::Min($waitSec, $EndSec - $Clock.Elapsed.TotalSeconds)) }
         if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
@@ -873,6 +882,11 @@ function Invoke-VenueBoundedRead {
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
             return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $([Math]::Round($TimeoutSec, 2)) s" }
+        }
+        # r12 fix iteration (adversary A2 on 09421b77): a caller descheduled past its fixed end finds the worker done and WaitOne(0) true; an answer the caller
+        # sees only after -EndSec is never acted on (the worker finished, so it is disposed as usual)
+        if ($null -ne $Clock -and ($late = $Clock.Elapsed.TotalSeconds - $EndSec) -gt 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($late, 2)) s after the call's end is never acted on" }
         }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
     } catch {

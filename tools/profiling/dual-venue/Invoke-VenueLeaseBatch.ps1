@@ -1239,7 +1239,8 @@ function Get-InputContentRefusal {
             # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (adversary A1 on 7754d16e, sibling :1239): the share's END goes over too, as an instant taken with the remainder
             # (-CallDeadlineUtc), so nothing between this sample and the call's own clock start moves the read's end past the budget's
             $shareDeadline = $null
-            if ($null -ne $script:guardBudget) { $share = [Math]::Min(330.0, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds); $shareDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $share)) }
+            # r12 fix iteration (adversary A1 on 09421b77, sibling): the wall clock is read BEFORE the budget clock, so a stall between them only moves the end earlier
+            if ($null -ne $script:guardBudget) { $shareNowUtc = [DateTime]::UtcNow; $share = [Math]::Min(330.0, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds); $shareDeadline = $shareNowUtc.AddSeconds([Math]::Max(0.0, $share)) }
             if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; noRoom = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             # r5 (key3 r4 B1): no artifact hash while no claim is held (a budget with artifactsOff); the manifest itself is still re-read and compared
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
