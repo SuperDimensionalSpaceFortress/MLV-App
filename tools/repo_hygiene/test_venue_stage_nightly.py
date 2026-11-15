@@ -207,6 +207,15 @@ function Test-HostCommitGate {
 """
 
 
+def ok_emissions(text: str, token: str) -> tuple[list[str], int]:
+    """SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1 contract pin: the RESULT=<token> lines a job prints as plain double-quoted Write-Output (which the pin renders),
+    and a census of every RESULT=<token> in its code whatever the quoting or writer (adversary A1). A census above the line count is an emission the pin
+    cannot render and check."""
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    lines = re.findall(r'^\s*Write-Output "(RESULT=' + token + r'(?:\s[^"]*)?)"\s*$', code, re.M)
+    return lines, len(re.findall(r"RESULT=" + token + r"(?![A-Z_])", code))
+
+
 def utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f0Z")
 
@@ -1039,6 +1048,21 @@ class VenueStageReuseModuleTests(unittest.TestCase):
             self.assertEqual(staged, "False", stdout)
             self.assertTrue(reason.startswith(why), (stdout, reason))
 
+    def test_the_contract_census_sees_an_emission_the_pin_cannot_render(self) -> None:
+        # adversary A1 (SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1 r1, advisory): a single-quoted OK line inserted before the fresh emission was invisible to the
+        # pin. Each writer form below is one more RESULT=<token> than the pin renders, so the contract test reds on it.
+        text = (ROOT / "tools" / "profiling" / "bachelor" / "attr3-stage-smoke-runner-job.ps1").read_text(encoding="utf-8")
+        fresh = 'Write-Output "RESULT=SMOKE_RUNNER_STAGE_OK CACHE_DIR='
+        self.assertEqual(text.count(fresh), 1)
+        lines, census = ok_emissions(text, "SMOKE_RUNNER_STAGE_OK")
+        self.assertEqual((len(lines), census), (2, 2))
+        for extra in ("if ($env:EXTRA_OK -eq '1') { Write-Output 'RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=smoke-runner-bbbbbbbbbbbbbbbb PATH=x'; exit 0 }",
+                      "[Console]::Out.WriteLine(\"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=$CacheDirName\")",
+                      "\"RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=2 CACHE_DIR=$CacheDirName\" | Write-Output",
+                      "Write-Output (\"RESULT=SMOKE_RUNNER_STAGE_OK\" + ' ALREADY=2')"):
+            lines, census = ok_emissions(text.replace(fresh, extra + "\n" + fresh), "SMOKE_RUNNER_STAGE_OK")
+            self.assertEqual((len(lines), census), (2, 3), extra)
+
     def test_every_emitted_ok_shape_is_accepted_by_its_checker(self) -> None:
         # CONTRACT PIN: every RESULT=..._OK line the three staging jobs can print, rendered with sample values, passes the reuse check that reads it. A new or
         # changed emitter shape reds this test instead of a venue night (SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1: the ALREADY=1 form had no checker row).
@@ -1046,7 +1070,9 @@ class VenueStageReuseModuleTests(unittest.TestCase):
         dll_job = f"playback-attr-3-cuda-dllpair-{S12}"
 
         def emitted(path: Path, token: str) -> list[str]:
-            return re.findall(r'^\s*Write-Output "(RESULT=' + token + r'(?:\s[^"]*)?)"\s*$', path.read_text(encoding="utf-8"), re.M)
+            lines, census = ok_emissions(path.read_text(encoding="utf-8"), token)
+            self.assertEqual(len(lines), census, f"{path.name}: a RESULT={token} emission the contract pin cannot render; give it a checker row")
+            return lines
 
         def render(line: str, subs: dict[str, str]) -> str:
             for var, val in subs.items():
