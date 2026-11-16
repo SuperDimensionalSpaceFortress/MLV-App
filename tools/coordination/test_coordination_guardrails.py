@@ -2003,9 +2003,23 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
     foreach ($fn in @($ast.FindAll({ param($x) $x -is [FunctionDefinitionAst] }, $true))) {
         if (($fn.Name -replace '`', '') -match $diagnosticNamePattern) { $diagnosticShadowed = $true }
     }
+    # r20 (HUB RULING, convergence bound; adversary pass 28 A3, A4): ONE rule that generalises toward refusal. Any way the file can rebind a command by writing the
+    # Function: or Alias: provider (Set-Item / New-Item / Set-Content / Rename-Item / Copy-Item / Move-Item ... on that drive, or after changing into it, or with a computed
+    # path), evaluating text as code, making an alias whose VALUE is itself an alias-making or provider-writing command (`Set-Alias maker Set-Alias`), calling a command
+    # with no static name (`& $w ...`), or assigning `${function:x}` / `${alias:x}`, sets $diagnosticShadowed. The flag only stops the blanking of diagnostic text, so it can
+    # only ADD refusals: every operand is then read at face value.
+    $makerNames = @('set-alias', 'new-alias', 'sal', 'nal', 'import-alias', 'ipal')
+    $writerNames = @('set-item', 'si', 'new-item', 'ni', 'set-content', 'sc', 'add-content', 'ac', 'rename-item', 'rni', 'ren', 'copy-item', 'cpi', 'cp', 'copy', 'move-item', 'mi', 'move', 'mv', 'clear-item', 'cli', 'remove-item', 'ri', 'rm', 'del', 'erase', 'rd', 'rmdir', 'set-location', 'sl', 'cd', 'chdir', 'push-location', 'pushd', 'new-psdrive', 'ndr', 'mount')
+    $evaluatorNames = @('invoke-expression', 'iex')
+    $rebindNames = @($makerNames) + @($writerNames) + @($evaluatorNames)
     foreach ($ac in @($ast.FindAll({ param($x) $x -is [CommandAst] }, $true))) {
         $acn = $ac.GetCommandName()
-        if ($null -eq $acn) { continue }
+        if ($null -eq $acn) {
+            # A command whose name is computed (`& $w ...`) can be anything, a script block call (`& { }`) cannot rebind by itself.
+            $first = if ($ac.CommandElements.Count -gt 0) { $ac.CommandElements[0] } else { $null }
+            if ($first -isnot [ScriptBlockExpressionAst]) { $diagnosticShadowed = $true }
+            continue
+        }
         $acn = (($acn -replace '^.*[\\/]', '').ToLowerInvariant())
         if (@('set-alias', 'new-alias', 'sal', 'nal') -contains $acn) {
             # The alias name may be named or positional, so EVERY operand is read: a computed one (a variable, an expression) can be anything, a literal one is compared.
@@ -2013,9 +2027,25 @@ foreach ($path in @(Get-Content -LiteralPath $ListFile -Encoding UTF8 | Where-Ob
                 $av = if ($ae -is [CommandParameterAst]) { $ae.Argument } else { $ae }
                 if ($null -eq $av) { continue }
                 if ($av -isnot [StringConstantExpressionAst] -or (([string]$av.Value -replace '`', '') -match $diagnosticNamePattern)) { $diagnosticShadowed = $true }
+                # An operand that is itself an alias-making, provider-writing or evaluating command makes an alias of a rebinder (A3): the name it gets is a rebinder too.
+                elseif ($rebindNames -contains ((([string]$av.Value -replace '`', '') -replace '^.*[\\/]', '').ToLowerInvariant())) { $diagnosticShadowed = $true }
             }
         }
-        elseif (@('import-alias', 'ipal', 'set-item', 'si', 'new-item', 'ni') -contains $acn -and (Get-CleanText $ac) -match '(?i)alias') { $diagnosticShadowed = $true }
+        elseif (@('import-alias', 'ipal') -contains $acn) { $diagnosticShadowed = $true }
+        elseif ($evaluatorNames -contains $acn) { $diagnosticShadowed = $true }
+        elseif (@('new-psdrive', 'ndr', 'mount') -contains $acn) { $diagnosticShadowed = $true }
+        elseif ($writerNames -contains $acn) {
+            # A writer rebinds only through the Function: or Alias: drive; a path it names with those words, or a computed operand (a path it builds), counts (A4).
+            if ((Get-CleanText $ac) -match '(?i)(function|alias)\s*:') { $diagnosticShadowed = $true }
+            foreach ($we in @($ac.CommandElements | Select-Object -Skip 1)) {
+                $wv = if ($we -is [CommandParameterAst]) { $we.Argument } else { $we }
+                if ($null -eq $wv) { continue }
+                if ($wv -isnot [StringConstantExpressionAst] -and $wv -isnot [ConstantExpressionAst] -and $wv -isnot [ScriptBlockExpressionAst]) { $diagnosticShadowed = $true }
+            }
+        }
+    }
+    foreach ($dv in @($ast.FindAll({ param($x) $x -is [VariableExpressionAst] }, $true))) {
+        if (@('function', 'alias') -contains $dv.VariablePath.DriveName) { $diagnosticShadowed = $true }
     }
     $assignments =@($ast.FindAll({ param($x) $x -is [AssignmentStatementAst] }, $true))
     $foreachAsts = @($ast.FindAll({ param($x) $x -is [ForEachStatementAst] }, $true))
@@ -3155,6 +3185,54 @@ def test_wmi_create_scan_r19_pass_27_a1_a2_a3_a4(tmp_path):
     got = _scan_cases(tmp_path, {**_R19B_ACCEPTED, **_R19B_REFUSED})
     missed = [n for n in _R19B_REFUSED if not got[n]]
     false_alarms = sorted(n for n in _R19B_ACCEPTED if got[n])
+    assert (missed, false_alarms) == ([], []), "missed (must be refused), false alarms (must be accepted)"
+
+
+# r20, adversary pass 28 A3 and A4 (HUB RULING, convergence bound: generalise toward REFUSAL). One rule: a file that WRITES the Function: or Alias: provider (Set-Item,
+# New-Item, Set-Content, Rename-Item, Copy-Item ..., `${function:x} = ...`), changes into one of them, evaluates text as code, or makes an alias whose VALUE is an
+# alias-making or provider-writing command, may rebind a diagnostic command anywhere, so no diagnostic text is blanked: every operand reads at face value.
+_R20_TAIL = "\n$c = New-Object -TypeName $(Write-Verbose 'System.Management.ManagementClass') -ArgumentList 'Win32_Process'\n$c.Create('cmd.exe /c exit 0')"
+_R20_REFUSED = {
+    "r20-a3-alias-of-set-alias": "Set-Alias maker Set-Alias\nmaker Write-Verbose Write-Output" + _R20_TAIL,
+    "r20-a3-alias-of-sal": "Set-Alias maker sal\nmaker Write-Verbose Write-Output" + _R20_TAIL,
+    "r20-a3-new-alias-of-new-alias": "New-Alias -Name maker -Value New-Alias\nmaker Write-Verbose Write-Output" + _R20_TAIL,
+    "r20-a3-alias-of-set-item": "Set-Alias -Value Set-Item -Name putter\nputter Function:Write-Verbose -Value { param($m) $m }" + _R20_TAIL,
+    "r20-a3-alias-of-a-module-qualified-writer": "sal maker Microsoft.PowerShell.Utility\\Set-Alias\nmaker Write-Verbose Write-Output" + _R20_TAIL,
+    "r20-a4-set-item-on-the-function-drive": "Set-Item Function:Write-Verbose -Value { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-si-on-the-function-drive": "si Function:Write-Verbose { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-new-item-on-the-function-drive": "New-Item -Path Function:\\Write-Verbose -Value { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-ni-on-the-alias-drive": "ni alias:Write-Verbose -Value Write-Output" + _R20_TAIL,
+    "r20-a4-set-content-on-the-function-drive": "Set-Content -Path Function:Write-Verbose -Value { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-rename-item-into-the-function-drive": "Rename-Item Function:Write-Output Write-Verbose" + _R20_TAIL,
+    "r20-a4-copy-item-on-the-function-drive": "Copy-Item Function:Write-Output Function:Write-Verbose" + _R20_TAIL,
+    "r20-a4-function-drive-variable-assignment": "${function:Write-Verbose} = { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-alias-drive-variable-assignment": "${alias:Write-Verbose} = 'Write-Output'" + _R20_TAIL,
+    "r20-a4-set-location-into-the-function-drive": "Set-Location Function:\nSet-Item Write-Verbose { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-cd-into-the-alias-drive": "cd alias:\nsi Write-Verbose Write-Output" + _R20_TAIL,
+    "r20-a4-computed-provider-path": "$p = 'Function:Write-' + 'Verbose'\nSet-Item $p -Value { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-call-operator-on-a-writer": "& 'Set-Item' Function:Write-Verbose -Value { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-writer-named-by-a-variable": "$w = 'Set-Item'\n& $w Function:Write-Verbose -Value { param($Message) $Message }" + _R20_TAIL,
+    "r20-a4-invoke-expression-defines-the-function": "Invoke-Expression 'function Write-Verbose { param($Message) $Message }'" + _R20_TAIL,
+    "r20-a4-iex-defines-the-alias": "iex 'Set-Alias Write-Verbose Write-Output'" + _R20_TAIL,
+}
+_R20_ACCEPTED = {
+    "r20-control-set-item-on-a-file": "Set-Item ./scratch.txt -Value 'x'\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r20-control-set-content-on-a-file": "Set-Content -Path scratch.txt -Value 'x'\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r20-control-copy-item-between-files": "Copy-Item a.txt b.txt\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r20-control-alias-of-a-harmless-command": "Set-Alias ll Get-ChildItem\nll\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r20-control-function-word-in-free-text": "Write-Output 'Function:Write-Verbose'\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r20-control-scope-qualified-variable": "$script:x = 1\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+    "r20-control-location-change-to-a-folder": "Set-Location ./scratch\n$f = New-Object -TypeName $(Write-Verbose 'ManagementClass'; 'System.IO.FileInfo') -ArgumentList 'scratch.txt'\n$f.Create().Dispose()",
+}
+
+
+@_lane_scanner_only
+def test_wmi_create_scan_r20_pass_28_a3_a4_provider_writes_and_alias_makers(tmp_path):
+    """adversary pass 28 A3 (an alias of an alias-making command rebinds Write-Verbose) and A4 (`Set-Item Function:Write-Verbose` rebinds it with no alias text): one
+    rule, any such write disables the diagnostic-stream blanking, so the real WMI create is refused. Controls: harmless file writes and a harmless alias still blank."""
+    got = _scan_cases(tmp_path, {**_R20_ACCEPTED, **_R20_REFUSED})
+    missed = [n for n in _R20_REFUSED if not got[n]]
+    false_alarms = sorted(n for n in _R20_ACCEPTED if got[n])
     assert (missed, false_alarms) == ([], []), "missed (must be refused), false alarms (must be accepted)"
 
 
