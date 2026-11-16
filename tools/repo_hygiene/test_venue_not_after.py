@@ -1357,6 +1357,15 @@ class MetaReplaceDeniedTests(unittest.TestCase):
             deep = '{"a":' * depth + "0" + "}" * depth
             for spelling, first in (("same", '"nonce":"foreign"'), ("escaped", '"\\u006eonce":"foreign"'), ("folded", '"NONCE":"foreign"')):
                 cases.append({"k": f"dup-{spelling}-{depth}", "text": '{' + first + ',"nonce":"' + n + '","x":' + deep + '}'})
+        # r11 adversary pass A1 (introduced): a claim the fallback reader counts two nonces in and then fails on later (a torn or malformed tail) answered "unambiguous" because
+        # the catch discarded the count already seen; the two nonces are still two nonces. RED before the fix: unambiguous was True.
+        for k, text in (
+            ("dup-torn-bad-value", '{"nonce":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333","x":]}'),
+            ("dup-torn-folded-bad-value", '{"NONCE":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333","x":]}'),
+            ("dup-torn-truncated", '{"nonce":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333","x":{"a":'),
+            ("dup-torn-stray-token", '{"nonce":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333"} }'),
+        ):
+            cases.append({"k": k, "text": text})
         for depth in (0, 100):
             cases.append({"k": f"single-{depth}", "text": '{"nonce":"' + n + '","x":' + '{"a":' * depth + "0" + "}" * depth + '}'})
         cases_file = self.tmp / "deep-claim-cases.json"

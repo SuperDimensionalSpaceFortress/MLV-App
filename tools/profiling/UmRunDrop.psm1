@@ -716,10 +716,10 @@ function Test-UmRunClaimNonceUnambiguous {
     }
     # System.Text.Json refused the text: count the root object's property names with the lexer ConvertFrom-Json uses (depth 1 under a root object are its own properties)
     $reader = $null
+    $n = 0   # outside the try: r11 adversary A1, a reader that fails AFTER counting two nonces (a torn or malformed tail) must not discard what it already saw
     try {
         $reader = [Newtonsoft.Json.JsonTextReader]::new([IO.StringReader]::new($Text))
         $reader.MaxDepth = $null   # r11 sol r10 B1: no depth limit (its default of 64 threw on a claim ConvertFrom-Json accepts); the reader is iterative, so depth costs no stack
-        $n = 0
         $rootIsObject = $false
         while ($reader.Read()) {
             if ($reader.Depth -eq 0) { $rootIsObject = ($reader.TokenType -eq [Newtonsoft.Json.JsonToken]::StartObject) }
@@ -727,7 +727,7 @@ function Test-UmRunClaimNonceUnambiguous {
         }
         return ($n -le 1)
     } catch {
-        return $true
+        return ($n -le 1)
     } finally {
         if ($null -ne $reader) { $reader.Close() }
     }
