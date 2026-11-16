@@ -2013,6 +2013,52 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertGreaterEqual(float(out.stdout.strip().splitlines()[-1]), 0.95, out.stdout)
         self.assertLess(float(out.stdout.strip().splitlines()[-1]), 5.0, out.stdout)
 
+    def test_r27_a_manifest_retired_during_the_artifact_hashes_is_refused_by_both_readers(self) -> None:
+        # r27 (adversary pass-29 A1 on 7f1886f1, playback-attr-3-cuda-job.ps1:2605 + sibling reference-frame-runner-job.ps1:495): a reader authenticated M0,
+        # then a repairing stager retired build.json and renamed the repaired artifacts in while the reader hashed them; the reader recorded
+        # artifacts-verified / buildVerify=0 with no build.json present. Each job's REAL verification block runs here with its hash call retiring the manifest
+        # at the first artifact hash: the block must refuse (it re-authenticates the manifest last).
+        for job, start, end in (
+            (ATTRIBUTION_GENERATOR, "$buildManifest = Assert-AttrCudaBuildManifest -Path $buildManifestPath",
+             "Write-JobTrace 'step build-manifest-artifacts-verified'"),
+            (ROOT / "tools" / "profiling" / "bachelor" / "reference-frame-runner-job.ps1",
+             "$buildManifest = Assert-AttrCudaBuildManifest -Path (Join-Path $Cache $BuildManifestName)",
+             "} catch {\n    Complete-Failed 208 'buildVerify'"),
+        ):
+            with self.subTest(job=job.name):
+                out = _run_manifest_retired_mid_read(job.read_text(encoding="utf-8"), start, end, self.tmp / job.stem)
+                self.assertNotEqual(out.returncode, 0, f"{job.name} verified its artifacts after build.json was retired:\n{out.stdout}{out.stderr}")
+                self.assertIn("BUILD_MANIFEST_RETIRED_FIXTURE", out.stdout + out.stderr)
+
+
+def _run_manifest_retired_mid_read(job_text: str, start: str, end: str, work: Path) -> "subprocess.CompletedProcess[str]":
+    """Run a job's manifest + artifact verification block (start inclusive, end exclusive) with the first artifact hash retiring build.json (r27 A1)."""
+    text = job_text.replace("\r\n", "\n")
+    block = text[text.index(start):text.index(end, text.index(start))]
+    work.mkdir(parents=True, exist_ok=True)
+    cache = work / "cache"
+    cache.mkdir(exist_ok=True)
+    for leaf in ("build.json", "pkg.zip", "app.exe", "recon.dll"):
+        (cache / leaf).write_bytes(b"x")
+    harness = (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$Cache = '{cache}'\n"
+        "$BuildManifestName = 'build.json'; $buildManifestName = 'build.json'; $buildManifestPath = Join-Path $Cache 'build.json'\n"
+        "$BuildManifestSha256 = 'a' * 64; $SourceCommit = 'b' * 40\n"
+        "$BasePackageZip = 'pkg.zip'; $PackageZipName = 'pkg.zip'; $ExeName = 'app.exe'; $ReconName = 'recon.dll'\n"
+        "function Assert-AttrCudaBuildManifest { param($Path, $ExpectedSha256, $ExpectedSourceCommit)\n"
+        "    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw \"BUILD_MANIFEST_RETIRED_FIXTURE $Path\" }\n"
+        "    [pscustomobject]@{ pendingSymbolPresence = $true; dllPairManifestSha256 = 'c' * 64 } }\n"
+        "function Get-AttrCudaBuildManifestClaimSha256 { param($Manifest, $Label) 'd' * 64 }\n"
+        "function Invoke-RetireFixture { $p = Join-Path $Cache 'build.json'; if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force } }\n"
+        "function Get-Sha { param($Path, $Step) Invoke-RetireFixture; ('d' * 64).ToUpperInvariant() }\n"
+        "function Get-ShaLower { param($Path) Invoke-RetireFixture; 'd' * 64 }\n"
+        + block + "\n[Console]::Out.WriteLine('VERIFIED_WITHOUT_MANIFEST')\n"
+    )
+    script = work / "harness.ps1"
+    script.write_text(harness, encoding="utf-8")
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+
 
 # --------------------------------------------------------------------------------------------
 # (f) ATTR3-FIXTURE-STAGE-1: -ClipPath becomes optional for a fixture id, gated on

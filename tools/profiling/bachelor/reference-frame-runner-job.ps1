@@ -493,6 +493,9 @@ try {
         $artifactHashes[$check.label] = Get-ShaLower $check.path
         if ($artifactHashes[$check.label] -ne $check.expectedSha.ToLowerInvariant()) { throw "hash mismatch (vs build manifest $BuildManifestName) for $($check.path)" }
     }
+    # r27 (adversary pass-29 A1 on 7f1886f1): the manifest is re-authenticated LAST, after every artifact hash; a stager's repair retires build.json before it
+    # renames artifacts, so a read that overlapped it finds no manifest (or other bytes) here and buildVerify fails, never 0
+    [void](Assert-AttrCudaBuildManifest -Path (Join-Path $Cache $BuildManifestName) -ExpectedSha256 $BuildManifestSha256 -ExpectedSourceCommit $SourceCommit)
 } catch {
     Complete-Failed 208 'buildVerify' $_.Exception.Message
 }
