@@ -1140,8 +1140,9 @@ function Get-DvSmokeSummaryFields {
         }
         # Master isolates an automation run's settings store (the venue's persisted settings are never read or rewritten).
         # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
-        $iso = @($lines | Where-Object { $_ -match ($rs + 'interaction_trace event=automation\.pacing_isolated(\s|$)') })
-        $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { $_ -notmatch 'settings_store=run_scoped(\s|$)' }).Count -eq 0)
+        # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR `INTERACTION_TRACE` record is read as every other culture reads it
+        $iso = @($lines | Where-Object { [regex]::IsMatch($_, ($rs + 'interaction_trace event=automation\.pacing_isolated(\s|$)'), $script:DvCi) })
+        $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { -not [regex]::IsMatch($_, 'settings_store=run_scoped(\s|$)', $script:DvCi) }).Count -eq 0)
     }
     [pscustomobject]@{ session = $session; sessionUnreadable = $sessionUnreadable; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
 }
@@ -1482,7 +1483,9 @@ function Get-DvScaleEvidence {
         if ($null -eq $effective) {
             foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
                 # r3 (r2 adversary pass 6 A3): the clamp record only where it starts the record body
-                if ($line -match ($script:DvRecordStart + 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)')) { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
+                # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR upper-case clamp record is read as every other culture reads it
+                $clampMatch = [regex]::Match($line, ($script:DvRecordStart + 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)'), $script:DvCi)
+                if ($clampMatch.Success) { $effective = [int64]$clampMatch.Groups['e'].Value; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
             }
         }
     }
@@ -1611,8 +1614,11 @@ function Get-DvLookLabelEvidence {
     $m = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         foreach ($line in ($LogText -split "`r?`n")) {
-            if ($line -match 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)') {
-                $m = $Matches.Clone()
+            # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR upper-case look_label record is read as every other culture reads it
+            $labelMatch = [regex]::Match($line, 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)', $script:DvCi)
+            if ($labelMatch.Success) {
+                $m = @{}
+                foreach ($g in 'shown', 'expected', 'surface', 'sif', 'wait') { $m[$g] = $labelMatch.Groups[$g].Value }
             }
         }
     }
@@ -2258,7 +2264,9 @@ function Get-DvLookAssistEvidence {
             foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
                 # r3 (r2 adversary pass 6 A3): the visual_state record only where it starts the record body (logInteractionEvent writes
                 # `interaction_trace event=<name> ...`), never an `event=gui_smoke.visual_state` text inside another record
-                if ($line -match ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_state(\s|$)')) {
+                # r13 (r12 adversary A1): culture-invariant ($script:DvCi), so a tr-TR `INTERACTION_TRACE event=gui_smoke.visual_state look_assist_enabled=0`
+                # record answers (and refuses the leg) as it does in every other culture, never skipped
+                if ([regex]::IsMatch($line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_state(\s|$)'), $script:DvCi)) {
                     $found = $line
                     foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)')) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
                 }
@@ -2388,7 +2396,8 @@ function Get-DvSmokeSessionLineRead {
             $pattern = $script:DvRecordStart + 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
             # r4 (r3 adversary A2 on #726): the marker is matched on each line's record body, so a later line whose build path holds
             # `playback_smoke.<Marker> session=<n>` is never selected
-            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match $pattern) { $found = $line } }
+            # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi)
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ([regex]::IsMatch($line, $pattern, $script:DvCi)) { $found = $line } }
         }
     }
     if ($null -ne $found) {

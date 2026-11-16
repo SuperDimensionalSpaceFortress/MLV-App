@@ -3807,7 +3807,8 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
 $sourceFramesRecordStart = '^(?:\[[^\]]*\] ){0,3}'
 $sourceFramesSummaryLine = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
-    if ($candidateLine -match ($sourceFramesRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+    # r13 (r12 adversary A1 sibling): culture-invariant, so a tr-TR upper-case summary record is read as every other culture reads it
+    if ([regex]::IsMatch($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant')) {
         $sourceFramesSummaryLine = $candidateLine
     }
 }
@@ -3818,7 +3819,8 @@ $sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFrame
 # consistent with the summary) moves the PACE rule off the native fps; absent = the verdict above stands. The 20 s floor is never relaxed.
 $sourceFramesConformLine = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
-    if ($candidateLine -match ($sourceFramesRecordStart + 'playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+    # r13 (r12 adversary A1 sibling): culture-invariant, as the summary pick above
+    if ([regex]::IsMatch($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant')) {
         $sourceFramesConformLine = $candidateLine
     }
 }

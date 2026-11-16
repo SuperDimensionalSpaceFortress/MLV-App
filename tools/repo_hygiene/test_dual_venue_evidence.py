@@ -16373,6 +16373,64 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
         v = self.tr_wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST]) + "\n", {"generatorArgs": {"dueWakeDeliveryPost": True}})
         self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
 
+    # r13 (r12 adversary A1 on 3a96e53e): the record-name reads pass 13 A2 did not reach were still culture-sensitive -match, so under tr-TR an
+    # upper-case `INTERACTION_TRACE event=gui_smoke.visual_state look_assist_enabled=0` was skipped and the look leg read HONOURED. Each call is a fresh
+    # pwsh whose culture is set before the first reader call; each row is the same log read the same way under the invariant culture.
+    TR = "[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n"
+
+    def test_r13_a1_its_input_verbatim_under_tr_tr_an_upper_case_visual_state_record_answers_and_refuses(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        log = ("interaction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=cinematic\n"
+               "INTERACTION_TRACE event=gui_smoke.visual_state look_assist_enabled=0 look_assist_flavor=cinematic")
+        for culture in (self.TR, ""):
+            with self.subTest(culture=culture or "invariant"):
+                v = self.ps(culture + "$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvLookAssistEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                            log, spec)
+                self.assertTrue(v["requested"], v)
+                self.assertEqual((v["reported"], v["verdict"], v["blocks"]), ("0", "NOT_HONOURED", True), v)
+
+    def test_r13_a1_class_under_tr_tr_every_upper_case_record_name_is_read_as_the_invariant_culture_reads_it(self) -> None:
+        base = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 presented_frames=600\n"
+        rows = {
+            # Get-DvSmokeSummaryFields (DualVenueRunner.psm1 pacing_isolated): an upper-case record that says the store is NOT run-scoped refuses isolation
+            "pacing_isolated refuses": (base + "interaction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+                                        "INTERACTION_TRACE event=automation.pacing_isolated settings_store=venue\n",
+                                        "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated reads": (base + "INTERACTION_TRACE EVENT=AUTOMATION.PACING_ISOLATED SETTINGS_STORE=RUN_SCOPED\n",
+                                      "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", True),
+            # Get-DvScaleEvidence (the clamp record)
+            "scale clamp": ("PLAYBACK_SCALE_CLAMPED_FOR_GPU_TEXTURE_ROUTE requested=2 EFFECTIVE=1\n",
+                            "(Get-DvScaleEvidence -Spec ('{\"scaleFactor\":2}' | ConvertFrom-Json) -Backend cuda -LogText $env:DVE_LOG).effectiveScale", 1),
+            # Get-DvLookLabelEvidence
+            "look label": ('GUI_SMOKE.LOOK_LABEL shown="Cinematic" expected="Cinematic" surface=fullscreen_gpu_window SHOW_IN_FULLSCREEN=1 WAIT_MS=5\n',
+                           "(Get-DvLookLabelEvidence -LogText $env:DVE_LOG).lookLabelShown", True),
+            # Get-DvSmokeSessionLineRead (any marker of the measured session)
+            "session line": (base + "PLAYBACK_SMOKE.GPU_SUMMARY SESSION=3 worker_threads=8\n",
+                             "[bool](Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker gpu_summary).found", True),
+        }
+        for name, (log, expr, want) in rows.items():
+            script = "[ordered]@{ v = (" + expr + ") } | ConvertTo-Json -Compress"
+            invariant = self.ps(script, log)["v"]
+            self.assertEqual(invariant, want, name)
+            with self.subTest(row=name):
+                self.assertEqual(self.ps(self.TR + script, log)["v"], invariant, name)
+
+    def test_r13_a1_sibling_the_jobs_anchored_summary_and_conform_picks_are_culture_invariant_under_tr_tr(self) -> None:
+        job = GENERATOR.read_text(encoding="utf-8")
+        start = job.index("$sourceFramesRecordStart = '")
+        summary_loop = job[job.index("$sourceFramesSummaryLine = $null", start):job.index("# SESSION-ANCHOR-1 <<<", start)]
+        conform_loop = job[job.index("$sourceFramesConformLine = $null", start):job.index("$sourceFramesVerdict = Get-AttrCudaConformAwareSourceFramesVerdict", start)]
+        self.assertNotIn("-match", summary_loop + conform_loop)
+        record_start = job[start:job.index("\n", start)]
+        log = ("playback_smoke.measured_session id=3\nPLAYBACK_SMOKE.SUMMARY SESSION=3 presented_frames=600\n"
+               "PLAYBACK_SMOKE.CONFORM SESSION=3 active=1\n")
+        script = ("$rawLog = $env:DVE_LOG\n$measuredSmokeSessionId = '3'\n" + record_start + "\n" + summary_loop + "\n" + conform_loop + "\n"
+                  "[ordered]@{ summary = $sourceFramesSummaryLine; conform = $sourceFramesConformLine } | ConvertTo-Json -Compress")
+        want = {"summary": "PLAYBACK_SMOKE.SUMMARY SESSION=3 presented_frames=600", "conform": "PLAYBACK_SMOKE.CONFORM SESSION=3 active=1"}
+        for culture in (self.TR, ""):
+            with self.subTest(culture=culture or "invariant"):
+                self.assertEqual(self.ps(culture + script, log), want)
+
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
     """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it
