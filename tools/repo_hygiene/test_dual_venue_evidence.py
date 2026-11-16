@@ -3263,7 +3263,8 @@ class EvidenceFactory(RunnerHarness):
             i = l.find(" (")
             if i < 0:
                 return l
-            return l[:i] if re.search(r":(\d+|%2)\)$", l) and l.rfind(":") > i + 2 else None
+            # r18 (r18 adversary advisory A3): ASCII digits only, like the module's 0-9 walk (Python's \d also takes Arabic-Indic digits)
+            return l[:i] if re.search(r":([0-9]+|%2)\)$", l) and l.rfind(":") > i + 2 else None
         iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l)]
         return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
                 "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
@@ -16020,6 +16021,9 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         for store, want in (("settings_store=run_scoped (C:/settings_store/MainWindow.cpp:1)", True),
                             ("settings_store=run_scoped (C:/a%1.cpp:%2)", True),   # r16 pass 2 advisory A2: the old writer's `:%2)` ending
                             ("settings_store=run_scoped (settings_store=venue)", False),
+                            # r18 adversary advisory A3: a line number in Arabic-Indic digits is no `:<digits>)` (the module's ASCII 0-9 walk)
+                            ("settings_store=run_scoped (C:/a.cpp:\u0661)", False),
+                            ("settings_store=run_scoped (C:/a.cpp:1\u0661)", False),
                             ("settings_store=run_scoped", True)):
             with self.subTest(store=store):
                 log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated " + store +
