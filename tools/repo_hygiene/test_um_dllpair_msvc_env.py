@@ -371,6 +371,46 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                 self.assertIn("REACHED_NVCC", p.stdout)
                 self.assertIn(f"CWD_AT_NVCC={Path.cwd()}", p.stdout)
 
+    def test_adversary_a256baf1_a1_a_relative_include_entry_resolves_against_the_callers_directory(self) -> None:
+        # adversary pass on a256baf1, A1: the check ran where.exe from a pushd'd System32, so a RELATIVE INCLUDE entry (.\SDK\ucrt) was looked up under
+        # System32 and a readable header was refused at exit 9, although nvcc/cl resolve that entry against the caller's directory. where.exe is now run
+        # directly from the batch by its absolute path (one parse, so % and ! in SystemRoot are literal) and the caller's directory never changes.
+        build = self.tmp / "Build"
+        for leaf in ("ucrt", "um", "shared"):
+            (build / "SDK" / leaf).mkdir(parents=True)
+        (build / "SDK" / "ucrt" / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        bare = self.tmp / "BuildBare"
+        (bare / "SDK" / "ucrt").mkdir(parents=True)
+        win = self.tmp / "Win%OS%"
+        (win / "System32").mkdir(parents=True)
+        shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")
+        for script in BACKEND_SCRIPTS:
+            for root_name, root in (("real-root", None), ("pct-root", str(win))):
+                for name, include in (("plain", r"C:\VS\include;.\SDK\ucrt;.\SDK\um;.\SDK\shared"), ("quoted", r'C:\VS\include;".\SDK\ucrt"')):
+                    with self.subTest(script=script.name, root=root_name, case=name, header=True):
+                        p = self.run_check(script, include, via_env=True, system_root=root, cwd=build)
+                        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                        self.assertIn("REACHED_NVCC", p.stdout)
+                        self.assertIn(f"CWD_AT_NVCC={build}", p.stdout)
+            with self.subTest(script=script.name, case="relative-no-header", header=False):
+                p = self.run_check(script, r"C:\VS\include;.\SDK\ucrt", via_env=True, cwd=bare)
+                self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+
+    def test_the_check_leaves_no_file_behind_in_temp(self) -> None:
+        # the where.exe hit list is a temp file; it is deleted on every path that reaches the end of the check
+        temp = self.tmp / "Temp & !x!"
+        temp.mkdir()
+        kit = self.tmp / "Kits-temp" / "ucrt"
+        kit.mkdir(parents=True)
+        (kit / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        for script in BACKEND_SCRIPTS:
+            for name, include, rc in (("with-header", f"{INCLUDE_NO_SDK};{kit}", 0), ("without-header", INCLUDE_NO_SDK, 9)):
+                with self.subTest(script=script.name, case=name):
+                    p = self.run_check(script, include, via_env=True, extra_env={"TEMP": str(temp), "TMP": str(temp)})
+                    self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
+                    self.assertEqual(list(temp.iterdir()), [], p.stdout + p.stderr)
+
     def test_an_unusable_systemroot_is_a_typed_refusal_not_a_search_from_the_callers_directory(self) -> None:
         # the check runs where.exe from the pushd'd System32. When that directory cannot be entered the check must not fall through to a where.exe in the
         # caller's current directory (a planted one); it is exit 9, typed.
@@ -388,7 +428,8 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                 self.assertNotIn("REACHED_NVCC", p.stdout)
 
     def run_check(self, script: Path, include: str | None, via_env: bool = False, pathext: str | None = None,
-                  system_root: str | None = None, v_on: bool = False, cwd: Path | None = None) -> subprocess.CompletedProcess:
+                  system_root: str | None = None, v_on: bool = False, cwd: Path | None = None,
+                  extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         # via_env: INCLUDE arrives in the process environment exactly as given (quotes and '&' included), as vcvars64 leaves it, not via a set line
         cmd = self.tmp / "check.cmd"
         head = [] if via_env else ([f'set "INCLUDE={include}"'] if include is not None else ['set "INCLUDE="'])
@@ -402,6 +443,7 @@ class BackendCmdUcrtCheckTests(_Pwsh):
             env["INCLUDE"] = include or ""
         if pathext is not None:
             env["PATHEXT"] = pathext
+        env.update(extra_env or {})
         if system_root is not None:
             env["SYSTEMROOT"] = system_root  # dict(os.environ) keys are upper-case on Windows; a second 'SystemRoot' key would be ambiguous
         # v_on: cmd /v:on stands in for HKCU\Software\Microsoft\Command Processor\DelayedExpansion=1 (delayed expansion ON by default)
