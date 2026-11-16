@@ -19,9 +19,10 @@ GRAMMAR (what this test reads)
      `query-only` or `sanctioned-launcher` and nothing else; `sanctioned-launcher` is accepted only for a file named Start-HiddenDetached.ps1.
   5. The allowlist is checked too: a malformed or duplicate row, a path that is not spelled the way git lists it, a path that is not a tracked .ps1 / .psm1, a
      reason outside the two words, and a STALE row (the file no longer names a refused name) each fail the test.
-  6. Defence in depth: every `query-only` file is also run through tests/coordination/Test-LaunchSites.ps1, the repository's PowerShell-AST launch-site scanner,
-     and a Win32_Process Create site (its rule D2: Invoke-CimMethod / Invoke-WmiMethod with Create, a .Create(...) call on a WMI class, a [wmiclass] cast)
-     fails the test. That layer needs pwsh and is skipped without it; the deny-by-default layer needs only Python and git.
+  6. Defence in depth: every `query-only` file is also run through tests/coordination/Test-LaunchSites.ps1, the repository's PowerShell-AST launch-site scanner.
+     Every `detached` site it reports (rule D2, a WMI Create: Invoke-CimMethod / Invoke-WmiMethod with Create, a .Create(...) call on a WMI class, a [wmiclass] cast;
+     rule D1, a hidden Start-Process) fails the test unless its exact text is pinned in HIDDEN_START_PROCESS_SITES (seven sites in four files today). No site text is classified,
+     because every text test leaked (adversary passes 1-3). That layer needs pwsh and is skipped without it; the deny-by-default layer needs only Python and git.
 
 NOT covered (declared, not promised)
   - A name built from pieces: `'Win32_' + 'Process'`, `-f`, `[string]::Join`, `$env:` values, reflection, and an expansion that evaluates to nothing spliced
@@ -62,11 +63,31 @@ _QUOTES = "'\"‘’‚‛“”„"
 
 # The class name, a wildcard / character-class prefix of it, and wmic (which also begins `wmiclass`). Applied to text already reduced by _readable().
 _REFUSED = re.compile(r"win32_process|win32(?:_|\[_\])(?:p(?:r(?:o(?:c(?:e(?:s)?)?)?)?)?)?[*?%\[]|win32[*?%\[]|wmic", re.IGNORECASE)
-# The AST scanner reports two kinds of `detached` site: D1, a hidden Start-Process (its text starts with the command), and D2, a WMI Create. A site is a WMI create
-# unless it is a D1 shape that names none of the create words. The D2 words are NOT what identifies a D2 site (adversary pass 2 A1: the scanner reported
-# `$p."Cr`Eate"('cmd.exe')` and a text filter on the word "create" dropped it): anything that is not a D1 shape counts.
-_D1_SITE = re.compile(r"^\s*(?:[\w.]+\\)?(?:start-process|saps|start)\b", re.IGNORECASE)
-_D2_WORDS = re.compile(r"create|win32_process|wmiclass|managementclass|invoke-(?:cim|wmi)method|\bicim\b|\biwmi\b", re.IGNORECASE)
+# The AST scanner reports two kinds of `detached` site: D1, a hidden Start-Process, and D2, a WMI Create, and the site text is the only thing that tells them apart.
+# A text test for either kind leaked three times (adversary passes 1-3: a Create hidden in a quoted or escaped member name, a Create inside a Start-Process
+# statement, and over-refusals of `& Start-Process` and of a "create" argument). So no text is classified: a `detached` site in a `query-only` file is a problem
+# unless its EXACT text is pinned here as a hidden Start-Process that is not a WMI create. The pin is exact, so the pinned statement cannot grow a Create without
+# failing; a pin whose site has gone is stale and fails too. A new hidden Start-Process in a query-only file is refused until someone pins it (an over-refusal).
+HIDDEN_START_PROCESS_SITES = {
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": (
+        'Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs -RedirectStandardOutput $presentMonStdoutPath '
+        '-RedirectStandardError $presentMonStderrPath -PassThru -WindowStyle Hidden',
+        "Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList @('--session_name', $SessionName, '--terminate_existing_session', '--no_csv') "
+        "-PassThru -WindowStyle Hidden",
+        'Start-Process -FilePath $candidate.exe -ArgumentList $depsArgs -PassThru -WindowStyle Hidden',
+        'Start-Process -FilePath $contactSheetPyExe -ArgumentList $composeArgs -PassThru -WindowStyle Hidden',
+    ),
+    "tools/profiling/install-ultra-magnus-agent.ps1": (
+        'Start-Process $psExe -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-WindowStyle","Hidden","-File",$AgentScript) -WindowStyle Hidden',
+    ),
+    "tools/profiling/ultra-magnus-agent.ps1": (
+        'Start-Process -FilePath $psExe -ArgumentList @("-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $jobPathArgument) '
+        '-RedirectStandardOutput $outFile -RedirectStandardError $errFile -WindowStyle Hidden -PassThru',
+    ),
+    "tools/testing/test-ultra-magnus-agent-heavy-slot-fifo.ps1": (
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'exit 0' -WindowStyle Hidden -PassThru",
+    ),
+}
 
 
 # Every character PowerShell reads as a quote: ' " and the typographic U+2018 U+2019 U+201A U+201B (single) and U+201C U+201D U+201E (double). Quotes spliced into a
@@ -174,9 +195,11 @@ def unsorted_rows(text):
     return [f"allowlist line {n}: {p} is out of order (after {q})" for (_, q), (n, p) in zip(paths, paths[1:]) if p < q]
 
 
-def create_site_problems(root, query_only):
-    """Defence in depth: the AST scanner's WMI create sites (rule D2) in the `query-only` files, [problem text]. Raises when the scanner itself fails: a
-    layer that cannot scan never passes."""
+def create_site_problems(root, query_only, pinned=None):
+    """Defence in depth: every `detached` site the AST scanner reports in the `query-only` files (rule D2 WMI creates and rule D1 hidden Start-Process alike) that is
+    not an exactly pinned hidden Start-Process, and every pin whose site is gone: [problem text]. Raises when the scanner itself fails: a layer that cannot scan
+    never passes."""
+    pinned = HIDDEN_START_PROCESS_SITES if pinned is None else pinned
     sources = {rel: _decode_for_scanner((Path(root) / rel).read_bytes()) for rel in query_only}
     if not sources:
         return []
@@ -186,9 +209,17 @@ def create_site_problems(root, query_only):
     found = json.loads(done.stdout)
     problems = []
     for rel in sorted(sources):
+        seen = set()
         for site in found[rel]:
-            if site["kind"] == "detached" and (not _D1_SITE.match(site["text"]) or _D2_WORDS.search(site["text"])):
-                problems.append(f"{rel}:{site['line']}: a `query-only` file has a WMI Create site: {site['text'][:160]!r}")
+            if site["kind"] != "detached":
+                continue
+            if site["text"] in pinned.get(rel, ()):
+                seen.add(site["text"])
+            else:
+                problems.append(f"{rel}:{site['line']}: a `query-only` file has a WMI Create site (or an unpinned hidden Start-Process): {site['text'][:160]!r}")
+        for text in pinned.get(rel, ()):
+            if text not in seen:
+                problems.append(f"{rel}: pinned hidden Start-Process site no longer found, update HIDDEN_START_PROCESS_SITES: {text[:120]!r}")
     return problems
 
 
@@ -230,10 +261,27 @@ def test_red_an_unsorted_allowlist_is_refused():
 # RED / GREEN fixtures: written under a throwaway tempfile directory, never in the repository tree
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+def _outside_the_repository(path):
+    """adversary pass 3 A4: tempfile follows TMPDIR / TEMP, which can name a directory inside this checkout. A fixture is never written into the repository tree
+    unless git ignores that directory (a lane's TEMP is a gitignored folder under its worktree on purpose, so there the fixtures are not tree files)."""
+    resolved = Path(path).resolve()
+    if resolved == ROOT.resolve() or ROOT.resolve() in resolved.parents:
+        ignored = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", str(resolved)], capture_output=True, env=_git_env()).returncode == 0
+        assert ignored, f"the temp directory {resolved} is inside the repository tree {ROOT} and git does not ignore it"
+    return path
+
+
+def test_red_a_temp_directory_inside_the_repository_is_refused():
+    for inside in (ROOT, ROOT / "x", ROOT / "tests" / "coordination" / "y"):
+        with pytest.raises(AssertionError, match="inside the repository tree"):
+            _outside_the_repository(str(inside))
+    assert _outside_the_repository(tempfile.gettempdir()) == tempfile.gettempdir()
+
+
 @pytest.fixture()
 def tree():
     with tempfile.TemporaryDirectory(prefix="wmi-allowlist-") as raw:
-        root = Path(raw)
+        root = Path(_outside_the_repository(raw))
 
         def put(rel, content):
             target = root / rel
@@ -440,13 +488,31 @@ def test_red_the_create_layer_reads_a_script_in_every_encoding_a_bom_names(tree,
     assert problems and all("WMI Create site" in p for p in problems), (encoding, problems)
 
 
+HIDDEN = "Start-Process $psExe -ArgumentList @('-File', $f) -WindowStyle Hidden"
+
+
 @_needs_pwsh
-def test_the_hidden_start_process_site_is_not_a_wmi_create_site(tree):
-    """The two hidden Start-Process sites in the real tree (rule D1) are `detached` sites too; they are not WMI creates."""
-    rel = tree("tools/new/probe.ps1", "Start-Process $psExe -ArgumentList @('-File', $f) -WindowStyle Hidden\n")
-    assert create_site_problems(tree.root, [rel]) == []
-    rel = tree("tools/new/probe2.ps1", "Start-Process $psExe -ArgumentList @('-File', $f) -WindowStyle Hidden\n$p = Get-WmiObject -List Win32_Process\n$p.Create('x')\n")
-    assert len(create_site_problems(tree.root, [rel])) == 1
+def test_an_exactly_pinned_hidden_start_process_site_is_accepted_and_a_stale_pin_is_refused(tree):
+    """The two hidden Start-Process sites in the real tree (rule D1) are `detached` sites too; they are not WMI creates, and are accepted only by exact text."""
+    rel = tree("tools/new/probe.ps1", HIDDEN + "\n")
+    assert create_site_problems(tree.root, [rel], pinned={rel: (HIDDEN,)}) == []
+    stale = create_site_problems(tree.root, [rel], pinned={rel: (HIDDEN, HIDDEN + " -PassThru")})
+    assert len(stale) == 1 and "pinned hidden Start-Process site no longer found" in stale[0], stale
+
+
+@_needs_pwsh
+@pytest.mark.parametrize("source", [
+    pytest.param(HIDDEN + "\n$p = Get-WmiObject -List Win32_Process\n$p.Create('x')\n", id="create-after-a-pinned-site"),
+    pytest.param("$p = Get-WmiObject -List Win32_Process\nStart-Process ($p.\"Cr`Eate\"(\"cmd.exe\")) -WindowStyle Hidden\n", id="create-inside-start-process"),
+    pytest.param("& Start-Process notepad.exe -WindowStyle Hidden\n", id="call-operator-start-process"),
+    pytest.param("Start-Process notepad.exe -ArgumentList \"create\" -WindowStyle Hidden\n", id="create-word-in-an-argument"),
+    pytest.param(HIDDEN + " -PassThru\n", id="pinned-site-edited"),
+])
+def test_red_a_detached_site_that_is_not_exactly_pinned_is_refused(tree, source):
+    """adversary pass 3 A1-A3: a text test for a Create inside a Start-Process, for `&`, or for the word create leaked both ways; only an exact pin is accepted."""
+    rel = tree("tools/new/probe.ps1", source)
+    problems = create_site_problems(tree.root, [rel], pinned={rel: (HIDDEN,)})
+    assert problems and any("a `query-only` file has a WMI Create site" in p for p in problems), problems
 
 
 @_needs_pwsh
