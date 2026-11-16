@@ -3312,7 +3312,8 @@ class EvidenceFactory(RunnerHarness):
                     while k >= 0 and (l[k] == "_" or ("A" <= l[k] <= "Z") or ("a" <= l[k] <= "z") or ("0" <= l[k] <= "9")):
                         k -= 1
                     c = l.find('"', q + 2)
-                    if k < q - 1 and (k < 0 or l[k] == " ") and c >= 0 and (c == len(l) - 1 or l[c + 1] == " "):
+                    # r21 adversary A1: a span holding `=` is no quoted value (quoted text never supplies a field)
+                    if k < q - 1 and (k < 0 or l[k] == " ") and c >= 0 and (c == len(l) - 1 or l[c + 1] == " ") and "=" not in l[q + 2:c]:
                         i = c + 1
                     else:
                         i = q + 2
@@ -16241,6 +16242,8 @@ class QuotedValueIsNeverALocationTests(unittest.TestCase):
             "path quote readable": ('a=1 (C:/b k="x (y" id=9 x/M.cpp:12)', "a=1"),
             # a key that does not start the line or follow a space opens no quoted value
             "glued key": ('a=1 x,k="v (w)" b=2', "a=1 x,k=\"v" + sentinel),
+            # r21 adversary A1 on bdb3ec8c: a quoted span holding `=` is no quoted value, so its key=value text never reaches a reader
+            "quoted fields": ('playback_due_wake armed=1 note="diagnostic ( fired=1 delivery_kind=post end)"', 'playback_due_wake armed=1 note="diagnostic' + sentinel),
         }
         got = self.bodies([line for line, _ in cases.values()])
         for (name, (line, want)), body in zip(cases.items(), got):
@@ -16257,6 +16260,16 @@ class QuotedValueIsNeverALocationTests(unittest.TestCase):
         for v in out:
             self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
             self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"])
+
+    def test_r21_a1_quoted_text_never_supplies_the_delivery_evidence(self) -> None:
+        # r21 adversary A1 on bdb3ec8c, its input verbatim: on bdb3ec8c the posted arm read observed=post, HONOURED, from fields inside note="..."
+        log = ("playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\nplayback_due_wake armed=1 note=\"diagnostic ( fired=1 "
+               "post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post end)\"")
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [({"generatorArgs": {"dueWakeDeliveryPost": True}}, log), ({}, log)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["observed"], out[0]["verdict"], out[0]["blocks"]), (None, "NOT_HONOURED", True), out[0])
+        # the head arm reads no delivery_kind from the quote either (the control-line path; never observed=post)
+        self.assertIsNone(out[1]["observed"], out[1])
 
     def test_the_python_isolation_mirror_reads_a_quoted_parenthesis_like_the_module(self) -> None:
         text = Path(__file__).read_text(encoding="utf-8")

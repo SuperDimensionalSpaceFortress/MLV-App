@@ -2603,7 +2603,10 @@ function Get-DvLocationOpenIndex {
             while ($k -ge 0 -and (($Line[$k] -ge [char]'A' -and $Line[$k] -le [char]'Z') -or ($Line[$k] -ge [char]'a' -and $Line[$k] -le [char]'z') -or ($Line[$k] -ge [char]'0' -and $Line[$k] -le [char]'9') -or $Line[$k] -ceq [char]'_')) { $k-- }
             if ($k -lt $q - 1 -and ($k -lt 0 -or $Line[$k] -ceq [char]' ')) {
                 $c = $Line.IndexOf('"', $q + 2, [StringComparison]::Ordinal)
-                if ($c -ge 0 -and ($c -eq $n - 1 -or $Line[$c + 1] -ceq [char]' ')) { $i = $c + 1; continue }
+                # r21 adversary A1 on bdb3ec8c (its input: `playback_due_wake armed=1 note="diagnostic ( fired=1 ... delivery_kind=post end)"` was
+                # HONOURED): a span that holds an `=` is no quoted value, so text inside a quote never supplies a `<key>=` field to any reader; its
+                # ` (` stays the location candidate and the record is refused as before r21
+                if ($c -ge 0 -and ($c -eq $n - 1 -or $Line[$c + 1] -ceq [char]' ') -and $Line.IndexOf('=', $q + 2, $c - $q - 2, [StringComparison]::Ordinal) -lt 0) { $i = $c + 1; continue }
             }
             $i = $q + 2
             continue
