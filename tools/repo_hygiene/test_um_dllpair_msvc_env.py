@@ -305,7 +305,8 @@ class BackendCmdUcrtCheckTests(_Pwsh):
     def test_adversary_f7c5a3c0_a2_a_bang_in_systemroot_still_finds_where(self) -> None:
         # adversary pass on f7c5a3c0, A2: inside EnableDelayedExpansion the percent-expanded %SystemRoot% was re-parsed, so SystemRoot=C:\...\Win!OS!
         # became ...\WinWindows_NT, both where calls ran a missing exe, and a valid corecrt.h was refused at exit 9. where.exe's path is now read into a
-        # variable BEFORE setlocal (r10 replaced that with a pushd into System32; see the 48fb6bf9 tests). The fixture copies where.exe there.
+        # variable BEFORE setlocal; that MLV_WHERE design was retired (48fb6bf9 A1+A2, then a256baf1 A1: where.exe is now run directly by its absolute
+        # path, so no SystemRoot-derived string is ever re-parsed). The fixture copies where.exe under the odd SystemRoot, which must still be found.
         win = self.tmp / "Win!OS!"
         (win / "System32").mkdir(parents=True)
         shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")
@@ -330,7 +331,8 @@ class BackendCmdUcrtCheckTests(_Pwsh):
     def test_adversary_48fb6bf9_a1_a_percent_in_systemroot_still_finds_where(self) -> None:
         # adversary pass on 48fb6bf9, A1: SystemRoot=C:\...\Win%OS% was stored literally in MLV_WHERE, but the FOR /F command string is re-parsed by a child
         # cmd, which expanded %OS% (to Windows_NT), ran a missing C:\WinWindows_NT\System32\where.exe, and refused a valid corecrt.h at exit 9. No path derived
-        # from SystemRoot reaches a re-parsed command line now: the check pushd's into System32 and runs .\where.exe, then pops the directory back.
+        # from SystemRoot reaches a re-parsed command line now: the check runs where.exe DIRECTLY by its absolute path (a256baf1 A1 replaced the
+        # r10 pushd-into-System32 form, which changed the caller's directory) and the caller's directory never changes.
         win = self.tmp / "Win%OS%"
         (win / "System32").mkdir(parents=True)
         shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")
@@ -372,7 +374,7 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                 self.assertIn(f"CWD_AT_NVCC={Path.cwd()}", p.stdout)
 
     def test_adversary_a256baf1_a1_a_relative_include_entry_resolves_against_the_callers_directory(self) -> None:
-        # adversary pass on a256baf1, A1: the check ran where.exe from a pushd'd System32, so a RELATIVE INCLUDE entry (.\SDK\ucrt) was looked up under
+        # adversary pass on a256baf1, A1: the check (then) ran where.exe from a pushd'd System32, so a RELATIVE INCLUDE entry (.\SDK\ucrt) was looked up under
         # System32 and a readable header was refused at exit 9, although nvcc/cl resolve that entry against the caller's directory. where.exe is now run
         # directly from the batch by its absolute path (one parse, so % and ! in SystemRoot are literal) and the caller's directory never changes.
         build = self.tmp / "Build"
@@ -412,8 +414,8 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                     self.assertEqual(list(temp.iterdir()), [], p.stdout + p.stderr)
 
     def test_an_unusable_systemroot_is_a_typed_refusal_not_a_search_from_the_callers_directory(self) -> None:
-        # the check runs where.exe from the pushd'd System32. When that directory cannot be entered the check must not fall through to a where.exe in the
-        # caller's current directory (a planted one); it is exit 9, typed.
+        # the check runs "%SystemRoot%\System32\where.exe" by its absolute path (no pushd). When that file is absent the check must not fall through to a
+        # where.exe found in the caller's current directory (a planted one); it is exit 9, typed (SYSTEMROOT_UNUSABLE).
         planted = self.tmp / "planted-cwd"
         planted.mkdir()
         shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", planted / "where.exe")
@@ -710,6 +712,74 @@ class EmittedJobWiringTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("SAY LOG_NOT_WRITTEN msvc-environment.log ATTRCUDA_SLOT_NOT_WRITABLE fixture lock", p.stdout)
         self.assertIn("AFTER", p.stdout)
+
+    def _launch_probe(self, text: str, which: str, stub_body: str, host: str) -> subprocess.CompletedProcess:
+        """Run the EMITTED job's real launch block for `which` (recon|amaze) against a stub backend script, under `host` (pwsh|powershell).
+
+        The probe is assembled from the emitted text itself: Test-BackendMsvcRefusal and the block from the `$archLabel = ` line (which defines
+        $psExe and builds $reconCommand / $amazeCommand) to the first use of the produced DLL. Only Say / Complete-Failed / Publish-JobLog are stubbed."""
+        fn = re.search(r"(?ms)^function Test-BackendMsvcRefusal\b.*?^\}", text)
+        self.assertIsNotNone(fn)
+        start = text.index("$archLabel = ")
+        if which == "recon":
+            block = text[start:text.index("$reconDll = Join-Path")]
+        else:
+            block = text[start:text.index("Say \"BUILD recon backend")] + text[text.index("Say \"BUILD amaze backend"):text.index("$amazeDll = Join-Path")]
+        tmp = Path(tempfile.mkdtemp(prefix="um-launch-", dir=self.tmp))
+        stub = tmp / "stub backend.ps1"
+        stub.write_text(stub_body, encoding="ascii")
+        probe = tmp / "probe.ps1"
+        probe.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "function Say([string]$m) { Write-Output \"SAY $m\" }\n"
+            "function Complete-Failed([int]$Code, [string]$Step, [string]$Message) { Write-Output \"TYPED_EXIT $Code $Step $Message\"; exit $Code }\n"
+            "function Publish-JobLog([string]$Path, $Value) { }\n"
+            "$CudaArchitectures = @('sm_86')\n"
+            f"$Backend = '{tmp}'\n"
+            f"$Pub = '{tmp}'\n"
+            "$ParityVectors = ''\n"
+            f"$ReconScript = '{stub}'\n"
+            f"$AmazeScript = '{stub}'\n"
+            + fn.group(0) + "\n" + block + "\nWrite-Output \"NOT_TYPED rc=$LASTEXITCODE\"\nexit 0\n", encoding="ascii")
+        exe = shutil.which("pwsh" if host == "pwsh" else "powershell")
+        if exe is None:
+            self.skipTest(f"{host} is not on PATH")
+        return subprocess.run([exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(probe)],
+                              capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+
+    def test_adversary_fable_key3_r10_b1_a_backend_refusal_exit_9_reaches_the_job_as_9(self) -> None:
+        # fable key3 on 55b38806, B1: the job launches each backend script with -Command, which reports a script's `exit N` as 1, so
+        # Test-BackendMsvcRefusal ($Rc -eq 9) never fired and the job ended exit 11 / 12 with msvcEnvironment recorded as passed. Drive a stub backend
+        # that prints the FAIL line and ends `exit 9` through the REAL launch form (the emitted block), for recon AND amaze, under pwsh AND powershell.
+        text, _ = self.job_text()
+        refusal = "Write-Output 'FAIL step=msvcEnvironment reason=NO_UCRT_IN_INCLUDE'\nexit 9\n"
+        for host in ("pwsh", "powershell"):
+            for which in ("recon", "amaze"):
+                with self.subTest(host=host, backend=which):
+                    p = self._launch_probe(text, which, refusal, host)
+                    self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                    self.assertRegex(p.stdout, r"TYPED_EXIT 9 msvcEnvironment reason=BACKEND_REFUSED ")
+                    self.assertNotIn("NOT_TYPED", p.stdout)
+
+    def test_adversary_fable_key3_r10_b1_the_scripts_other_exit_codes_are_delivered_too(self) -> None:
+        # the same launch form must deliver EVERY code the script ends with (the parity-harness code feeds -RequireParityHarness, exit 13), and a
+        # script that throws must never read as success
+        text, _ = self.job_text()
+        for host in ("pwsh", "powershell"):
+            for which in ("recon", "amaze"):
+                # powershell.exe 5.1 is left out of the throw case: under the job's ErrorActionPreference=Stop it turns ANY stderr line of the child
+                # (the throw's message) into a terminating NativeCommandError before an exit code exists. That is how the job already treated a
+                # stderr-writing backend on 5.1, independent of exit-code delivery, and is recorded in the PR body, not widened here.
+                for body, want in (("exit 0\n", "NOT_TYPED rc=0"), ("exit 13\n", "NOT_TYPED rc=13"), ("exit 9\n", "NOT_TYPED rc=9"),
+                                   ("throw 'boom'\n", "NOT_TYPED rc=1"),
+                                   # a parameter that does not bind leaves $LASTEXITCODE null: fail closed (70), never `exit $null` = 0
+                                   ("param([int]$Dir)\nexit 0\n", "NOT_TYPED rc=70")):
+                    if host == "powershell" and body.startswith(("throw", "param")):
+                        continue
+                    with self.subTest(host=host, backend=which, body=body.strip()):
+                        p = self._launch_probe(text, which, body, host)
+                        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                        self.assertIn(want, p.stdout)
 
     def test_the_minimal_path_entries_are_derived_never_a_hosts_user_dirs(self) -> None:
         text, _ = self.job_text()

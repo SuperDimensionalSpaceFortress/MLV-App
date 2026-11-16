@@ -443,6 +443,12 @@ $reconCommand = "& $(ConvertTo-PsSingleQuoted $ReconScript) -Dir $(ConvertTo-PsS
 if (-not [string]::IsNullOrWhiteSpace($ParityVectors)) {
     $reconCommand += " -Vectors $(ConvertTo-PsSingleQuoted $ParityVectors)"
 }
+# `-Command` reports a script's own `exit N` as 1, not N, so the child is told to exit with the script's code: without this tail the exit 9
+# msvcEnvironment refusal (Test-BackendMsvcRefusal) and the parity-harness code (-RequireParityHarness) never reached this job (fable key3 r10 B1).
+# FAIL CLOSED, as reference-frame-runner-job.ps1 does: a statement-terminating error in the command (a parameter that does not bind) leaves
+# $LASTEXITCODE null, and `exit $null` is exit 0 -- a build that never ran must not read as one that passed. 70 = the command produced no exit code.
+$backendExitTail = '; if ($null -eq $LASTEXITCODE) { exit 70 }; exit $LASTEXITCODE'
+$reconCommand += $backendExitTail
 Say "BUILD recon backend arch=$archLabel"
 $reconOutput = @(& $psExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $reconCommand 2>&1 | ForEach-Object { [string]$_ })
 $reconRc = $LASTEXITCODE
@@ -461,7 +467,7 @@ $StepLog['reconBackendBuild'] = 0
 Say "BUILD amaze backend arch=$archLabel"
 # amaze-debayer-dll.ps1 has no -CudaArchitectures parameter; its -Arch takes the same tokens as
 # a comma-separated list, which is how the requested set reaches it unchanged.
-$amazeCommand = "& $(ConvertTo-PsSingleQuoted $AmazeScript) -Dir $(ConvertTo-PsSingleQuoted $Backend) -Arch $(ConvertTo-PsSingleQuoted $archLabel)"
+$amazeCommand = "& $(ConvertTo-PsSingleQuoted $AmazeScript) -Dir $(ConvertTo-PsSingleQuoted $Backend) -Arch $(ConvertTo-PsSingleQuoted $archLabel)$backendExitTail"
 $amazeOutput = @(& $psExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $amazeCommand 2>&1 | ForEach-Object { [string]$_ })
 $amazeRc = $LASTEXITCODE
 Publish-JobLog $amazeLog $amazeOutput

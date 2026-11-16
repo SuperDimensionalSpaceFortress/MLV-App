@@ -160,7 +160,7 @@ $cmdFile = Join-Path $env:TEMP 'build_backend_dll.cmd'
     # where matches files only, so a DIRECTORY named corecrt.h is not the header. where also appends each PATHEXT extension, so both calls run with
     # PATHEXT cleared (a corecrt.h.cmd is not the header). A NAME IS NOT A READABLE HEADER (adversary A1 on 8f761e39): where finds a file another process
     # holds exclusively without opening it, so each hit is TYPEd to nul and counts only if that open succeeds; a locked corecrt.h is exit 9, not C1083.
-    # The loops run with delayed expansion OFF so a '!' in a found path reaches `type` unchanged; only the quote-strip copy is made with it ON. The three
+    # The loops run with delayed expansion OFF so a '!' in a found path reaches `type` unchanged; only the quote-strip copy is made with it ON. The four
     # setlocals unwind in one line, which carries only the verdict out and, before nvcc, gives PATHEXT and the delayed-expansion default back.
     # NO PATH DERIVED FROM SystemRoot REACHES A RE-PARSED COMMAND LINE (adversary A1+A2 on 48fb6bf9): a FOR /F command string is parsed again by a child cmd,
     # which expands a literal %OS% in C:\Win%OS%, and a line read under delayed expansion ON (the registry default) expands !OS! in C:\Win!OS!. So the first
