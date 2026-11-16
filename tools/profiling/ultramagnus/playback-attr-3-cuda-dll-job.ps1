@@ -375,7 +375,9 @@ $StepLog['cudaRuntimePresent'] = 0
 # above. Stale compiler variables are cleared so the INCLUDE judged is the one vcvars64 produced, and
 # a missing SDK is exit 9 at step msvcEnvironment, before any compile. The backend scripts come
 # from the EXTRACTED source of $SourceCommit, so this holds for an older commit's scripts too.
-$vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
+# Built by concatenation, not Join-Path: vswhere can name a root on a drive that is not mounted (Q:\VS), and Join-Path throws DriveNotFound for it under
+# ErrorActionPreference=Stop BEFORE the try below, so the job ended untyped (adversary A2 on 8f761e39). The Test-Path below reports it as exit 9.
+$vcvars = ([string]$vsRoot).TrimEnd('\', '/') + '\VC\Auxiliary\Build\vcvars64.bat'
 $vcvarsPresent = $false
 try { $vcvarsPresent = Test-Path -LiteralPath $vcvars } catch { Complete-Failed 9 'msvcEnvironment' "reason=VCVARS_PROBE_FAILED $vcvars $($_.Exception.Message)" }
 if (-not $vcvarsPresent) { Complete-Failed 9 'msvcEnvironment' "reason=VCVARS_MISSING $vcvars" }

@@ -77,15 +77,19 @@ $cmdFile = Join-Path $env:TEMP 'amaze_debayer_dll.cmd'
     # where.exe reads the list from its own environment, first as is (no size limit), then with quotes stripped by DELAYED expansion (& and ! in the
     # value are not re-parsed; past cmd's limit that copy is empty, so a quoted header entry in an over-long INCLUDE is refused typed, never exit 1).
     # where matches files only, so a DIRECTORY named corecrt.h is not the header. where also appends each PATHEXT extension, so both calls run with
-    # PATHEXT cleared (a corecrt.h.cmd is not the header). One setlocal covers both; endlocal carries only the verdict out and, before nvcc, turns
-    # delayed expansion off and gives PATHEXT back. where.exe's path is read BEFORE setlocal and used as !MLV_WHERE!: a '!' in %SystemRoot% expanded
-    # inside delayed expansion would be re-parsed (C:\Win!OS! -> C:\WinWindows_NT), but a delayed-expanded value is not.
+    # PATHEXT cleared (a corecrt.h.cmd is not the header). A NAME IS NOT A READABLE HEADER (adversary A1 on 8f761e39): where finds a file another process
+    # holds exclusively without opening it, so each hit is TYPEd to nul and counts only if that open succeeds; a locked corecrt.h is exit 9, not C1083.
+    # The loops run with delayed expansion OFF so a '!' in a found path reaches `type` unchanged; only the quote-strip copy is made with it ON. The three
+    # setlocals unwind in one line, which carries only the verdict out and, before nvcc, gives PATHEXT and the delayed-expansion default back. where.exe's
+    # path is read BEFORE any setlocal and used as %MLV_WHERE% under delayed expansion OFF (C:\Win!OS! is not re-parsed).
     'set "MLV_UCRT_OK=" & set "MLV_WHERE=%SystemRoot%\System32\where.exe" & if not defined INCLUDE set "INCLUDE=;"',
-    'setlocal EnableDelayedExpansion & set "PATHEXT=" & set "MLV_INC="',
-    '"!MLV_WHERE!" /q $INCLUDE:corecrt.h && set "MLV_UCRT_OK=1"',
+    'setlocal DisableDelayedExpansion & set "PATHEXT=" & set "MLV_INC="',
+    'for /f "usebackq delims=" %%F in (`"%MLV_WHERE%" $INCLUDE:corecrt.h 2^>nul`) do if /i "%%~nxF"=="corecrt.h" type "%%F" >nul 2>&1 && set "MLV_UCRT_OK=1"',
+    'setlocal EnableDelayedExpansion & set "MLV_INC="',
     'set "MLV_INC=!INCLUDE:"=!"',
-    'if not defined MLV_UCRT_OK ("!MLV_WHERE!" /q $MLV_INC:corecrt.h && set "MLV_UCRT_OK=1")',
-    'endlocal & set "MLV_UCRT_OK=%MLV_UCRT_OK%" & set "MLV_WHERE="',
+    'setlocal DisableDelayedExpansion & rem MLV_INC is copied into this scope, which reads no variable by !name!',
+    'if not defined MLV_UCRT_OK for /f "usebackq delims=" %%F in (`"%MLV_WHERE%" $MLV_INC:corecrt.h 2^>nul`) do if /i "%%~nxF"=="corecrt.h" type "%%F" >nul 2>&1 && set "MLV_UCRT_OK=1"',
+    'endlocal & endlocal & endlocal & set "MLV_UCRT_OK=%MLV_UCRT_OK%" & set "MLV_WHERE="',
     'if not defined MLV_UCRT_OK (echo FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT no INCLUDE entry holds corecrt.h after vcvars64& exit /b 9)',
     'echo === building igpu_amaze_debayer_cuda.dll (nvcc -shared --fmad=false, exports via .def) ===',
     "`"$nvcc`" $archArgLine -O3 --fmad=false -shared -allow-unsupported-compiler -Xcompiler `"/MD`" -Xlinker `"/DEF:$def`" -I `"$Dir`" -I `"$gpuRoot`" `"$src`" -o `"$dll`"",

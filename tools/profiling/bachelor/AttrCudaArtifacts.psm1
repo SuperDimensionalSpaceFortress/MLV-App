@@ -7802,6 +7802,10 @@ function Get-AttrCudaMinimalBuildPath {
     if ([string]::IsNullOrWhiteSpace($SystemRoot)) {
         throw 'ATTRCUDA_MINIMAL_PATH_NO_SYSTEMROOT -SystemRoot is empty; the Windows system dirs cannot be derived'
     }
+    # a bare drive ('C:') is drive-relative, so it is refused here as it is in -ToolDirs (adversary A3 on 8f761e39); 'C:\' is the drive root and stays valid
+    if ($SystemRoot.Trim() -match '^[A-Za-z]:$') {
+        throw "ATTRCUDA_MINIMAL_PATH_BAD_ENTRY '$($SystemRoot.Trim())' is a drive-relative -SystemRoot, not an absolute drive path"
+    }
     $root = $SystemRoot.Trim() -replace '\\+$', ''
     $rootEntry = if ($root -match '^[A-Za-z]:$') { $root + '\' } else { $root }
     $candidates = @(($root + '\System32'), $rootEntry, ($root + '\System32\Wbem'), ($root + '\System32\WindowsPowerShell\v1.0')) + @($ToolDirs)
@@ -7867,9 +7871,18 @@ function Test-AttrCudaMsvcInclude {
         # predicate and the job died untyped. The entry whose probe threw counts as not holding the header, and the count is in Detail.
         $held = [System.Collections.Generic.List[object]]::new()
         $probeErrors = 0
+        # A HEADER IS HELD ONLY IF IT CAN BE READ (adversary A1 on 8f761e39): Test-Path reads attributes, which another process's exclusive open does not block,
+        # so a locked corecrt.h passed here and the compile died with a bare C1083 (generic exit 11). The file is opened for reading, sharing read/write/delete
+        # as a compiler does; a directory, a lock or a denied ACL throws and counts in probeErrors. The open resolves the path as Test-Path does.
         foreach ($entry in $hit) {
             try {
-                if (Test-Path -LiteralPath (($entry -replace '\\+$', '') + '\' + $header) -PathType Leaf) { $held.Add($entry) }
+                $candidate = ($entry -replace '\\+$', '') + '\' + $header
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    $stream = [System.IO.File]::Open($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($candidate),
+                        [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite,Delete')
+                    $stream.Dispose()
+                    $held.Add($entry)
+                }
             } catch { $probeErrors++ }
         }
         if ($held.Count -eq 0) {

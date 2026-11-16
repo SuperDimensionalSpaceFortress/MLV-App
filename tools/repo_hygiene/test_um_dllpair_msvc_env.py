@@ -11,6 +11,8 @@ Fixtures only: no UNC path, no agent share, no real job. The functions under tes
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import json
 import os
 import re
@@ -37,6 +39,23 @@ INCLUDE_NO_SDK = (r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildToo
                   r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\VS\include")
 KITS = r"C:\Program Files (x86)\Windows Kits\10\include\10.0.22621.0"
 INCLUDE_FULL = INCLUDE_NO_SDK + f";{KITS}\\ucrt;{KITS}\\um;{KITS}\\shared;{KITS}\\winrt;{KITS}\\cppwinrt"
+
+
+@contextlib.contextmanager
+def exclusive_lock(path: Path):
+    """Hold `path` open with share mode 0 (FileShare.None), as another process would: its name still resolves and its attributes still read, but no
+    other open succeeds. Windows only; the callers are all under requires_windows_pwsh."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = k32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)  # GENERIC_READ, share 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), f"could not lock {path}")
+    try:
+        yield
+    finally:
+        k32.CloseHandle(handle)
 
 
 def overgrown_path() -> str:
@@ -116,6 +135,15 @@ class MinimalBuildPathTests(_Pwsh):
         self.assertEqual(out["value"].split(";"), [r"C:\System32", "C:\\", r"C:\System32\Wbem", r"C:\System32\WindowsPowerShell\v1.0"])
         p = self.build(r"C:\Windows", ["C:"])
         self.assertIn("THREW ATTRCUDA_MINIMAL_PATH_BAD_ENTRY", p.stdout, p.stdout + p.stderr)
+
+    def test_adversary_8f761e39_a3_a_bare_drive_system_root_is_refused_like_a_bare_drive_tool_dir(self) -> None:
+        # adversary pass on 8f761e39, A3 (advisory, introduced): -SystemRoot 'C:' was admitted and produced C:\System32;C:\;... although 'C:' in -ToolDirs is
+        # refused. A bare drive is drive-relative (the process's current dir on that drive), so it is refused as -SystemRoot too; 'C:\' stays valid.
+        for bare in ("C:", " c: "):
+            with self.subTest(system_root=bare):
+                p = self.build(bare, [])
+                self.assertIn("THREW ATTRCUDA_MINIMAL_PATH_BAD_ENTRY", p.stdout, p.stdout + p.stderr)
+        self.assertEqual(self.json_of(self.build("C:\\", []))["value"].split(";")[1], "C:\\")
 
     def test_an_entry_that_would_split_or_quote_the_path_is_refused(self) -> None:
         for bad in (r"C:\a;C:\b", 'C:\\a"b'):
@@ -235,6 +263,26 @@ class MsvcIncludeTests(_Pwsh):
             f"$v = Test-AttrCudaMsvcInclude -Include ('C:\\x' + [char]0 + 'y\\ucrt;{k}\\ucrt;{k}\\um;{k}\\shared')\n"
             "'JSON=' + ($v | ConvertTo-Json -Compress)\n")
         self.assertTrue(self.json_of(proc)["Ok"])
+
+    def test_adversary_8f761e39_a1_a_header_another_process_holds_exclusively_is_not_a_usable_header(self) -> None:
+        # adversary pass on 8f761e39, A1: Test-Path reads attributes, which an exclusive open does not block, so a corecrt.h held with FileShare.None passed
+        # the judge and the compile then died with a bare C1083 (generic exit 11). The judge now OPENS the header for reading, sharing read/write/delete, so a
+        # header nobody else can read is the typed INCLUDE_<LEAF>_HEADER_MISSING (the open's failure is counted in probeErrors).
+        for leaf, header in (("ucrt", "corecrt.h"), ("um", "windows.h"), ("shared", "sdkddkver.h")):
+            with self.subTest(leaf=leaf):
+                k = self.kits()
+                include = f"{k}\\ucrt;{k}\\um;{k}\\shared"
+                self.assertTrue(self.verdict(include)["Ok"])
+                with exclusive_lock(Path(k) / leaf / header):
+                    v = self.verdict(include)
+                self.assertEqual((v["Ok"], v["Reason"]), (False, f"INCLUDE_{leaf.upper()}_HEADER_MISSING"), v)
+                self.assertIn("probeErrors=1", v["Detail"])
+                self.assertTrue(self.verdict(include)["Ok"], "the lock is released, so the same INCLUDE passes again")
+        # a locked header beside a readable one in another entry does not hide the readable one
+        k = self.kits()
+        spare = self.kits()
+        with exclusive_lock(Path(k) / "ucrt" / "corecrt.h"):
+            self.assertTrue(self.verdict(f"{k}\\ucrt;{spare}\\ucrt;{k}\\um;{k}\\shared")["Ok"])
 
     def test_a_header_in_any_matching_entry_suffices_and_a_missing_drive_does_not_throw(self) -> None:
         k = self.kits()
@@ -357,7 +405,7 @@ class BackendCmdUcrtCheckTests(_Pwsh):
         for script in BACKEND_SCRIPTS:
             with self.subTest(script=script.name):
                 text = script.read_text(encoding="utf-8")
-                self.assertEqual(len(self.check_lines(script)), 7, script.name)
+                self.assertEqual(len(self.check_lines(script)), 9, script.name)
                 vcvars = text.index('"call `"$vcvars`" >nul"')
                 check = text.index("MLV_UCRT_OK")
                 nvcc = text.index('"`"$nvcc`" $archArgLine')
@@ -413,6 +461,40 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                     self.assertIn("REACHED_NVCC", p.stdout)
                     self.assertIn(f"PATHEXT_AT_NVCC={pathext}", p.stdout)
                     self.assertIn("DELAYED_AT_NVCC=!MLV_INC!", p.stdout)
+
+    def test_adversary_8f761e39_a1_a_header_another_process_holds_exclusively_is_refused_at_exit_9(self) -> None:
+        # adversary pass on 8f761e39, A1 (siblings build-backend-dll.ps1:166,168 and amaze-debayer-dll.ps1:85,87): where /q finds a name without opening
+        # it, so a corecrt.h held with FileShare.None set MLV_UCRT_OK=1 and nvcc ran into a bare C1083. The check now TYPEs each hit (opens it for reading),
+        # so an unreadable header is exit 9 at msvcEnvironment, in a plain and in a quoted INCLUDE.
+        for script in BACKEND_SCRIPTS:
+            root = self.tmp / f"Kits-locked-{script.stem}" / "ucrt"
+            root.mkdir(parents=True)
+            header = root / "corecrt.h"
+            header.write_text("/* fixture */\n", encoding="ascii")
+            for name, include in (("plain", f"{INCLUDE_NO_SDK};{root}"), ("quoted", f'{INCLUDE_NO_SDK};"{root}"')):
+                with self.subTest(script=script.name, case=name, locked=True):
+                    with exclusive_lock(header):
+                        p = self.run_check(script, include, via_env=True)
+                    self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                    self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                    self.assertNotIn("REACHED_NVCC", p.stdout)
+                with self.subTest(script=script.name, case=name, locked=False):
+                    p = self.run_check(script, include, via_env=True)
+                    self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                    self.assertIn("REACHED_NVCC", p.stdout)
+
+    def test_a_locked_header_beside_a_readable_one_still_passes(self) -> None:
+        for script in BACKEND_SCRIPTS:
+            locked = self.tmp / f"Kits-lockedfirst-{script.stem}" / "ucrt"
+            good = self.tmp / f"Kits-goodsecond-{script.stem}" / "ucrt"
+            for d in (locked, good):
+                d.mkdir(parents=True)
+                (d / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+            with self.subTest(script=script.name):
+                with exclusive_lock(locked / "corecrt.h"):
+                    p = self.run_check(script, f"{INCLUDE_NO_SDK};{locked};{good}", via_env=True)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("REACHED_NVCC", p.stdout)
 
     def test_the_check_admits_an_include_whose_ucrt_holds_corecrt(self) -> None:
         root = self.tmp / "Windows Kits (x86)" / "10" / "include" / "10.0.22621.0" / "ucrt"
@@ -533,6 +615,32 @@ class EmittedJobWiringTests(unittest.TestCase):
         self.assertIn("$cudaBin", line[0])
         for leak in ("Users\\", ".dotnet", "obabalola", "AppData"):
             self.assertNotIn(leak, line[0])
+
+
+@requires_windows_pwsh
+class VcvarsPathDerivationTests(_Pwsh):
+    """Adversary A2 on 8f761e39: the vcvars64 path is derived BEFORE the try that types its failures, so it must not be able to throw."""
+
+    def vcvars_line(self) -> str:
+        lines = [l for l in DLL_GENERATOR.read_text(encoding="utf-8").splitlines() if l.startswith("$vcvars = ")]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0]
+
+    def test_adversary_8f761e39_a2_an_unavailable_drive_in_the_vs_root_does_not_throw(self) -> None:
+        # vswhere answers a nonempty installationPath on a drive that is not mounted (Q:\VS); Join-Path throws DriveNotFound for it under
+        # ErrorActionPreference=Stop, before the try that turns a missing vcvars into exit 9 at msvcEnvironment. The path is built by string concatenation, so
+        # the later Test-Path (inside that try) is what reports it, typed. Sibling Join-Path sites in OTHER scripts are pre-existing and out of this card.
+        self.assertNotIn("Join-Path $vsRoot 'VC\\Auxiliary\\Build\\vcvars64.bat'", DLL_GENERATOR.read_text(encoding="utf-8"))
+        line = self.vcvars_line()
+        for root, want in ((r"Q:\VS", r"Q:\VS\VC\Auxiliary\Build\vcvars64.bat"), ("Q:\\VS\\", r"Q:\VS\VC\Auxiliary\Build\vcvars64.bat"),
+                           (r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools", r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")):
+            with self.subTest(vs_root=root):
+                out = self.json_of(self.pwsh(f"$vsRoot = '{root}'\n{line}\n'JSON=' + (@{{ vcvars = $vcvars }} | ConvertTo-Json -Compress)\n"))
+                self.assertEqual(out["vcvars"], want)
+        probe = self.json_of(self.pwsh(f"$vsRoot = 'Q:\\VS'\n{line}\n"
+                                       "$present = $true\ntry { $present = Test-Path -LiteralPath $vcvars } catch { $present = 'threw' }\n"
+                                       "'JSON=' + (@{ present = $present } | ConvertTo-Json -Compress)\n"))
+        self.assertIn(probe["present"], (False, "threw"))
 
 
 SCANNER = ROOT / "tools" / "repo_hygiene" / "attr3_publish_write_scan.ps1"
