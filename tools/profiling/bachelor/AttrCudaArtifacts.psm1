@@ -7873,14 +7873,13 @@ function Test-AttrCudaMsvcInclude {
         $probeErrors = 0
         # A HEADER IS HELD ONLY IF IT CAN BE READ (adversary A1 on 8f761e39): Test-Path reads attributes, which another process's exclusive open does not block,
         # so a locked corecrt.h passed here and the compile died with a bare C1083 (generic exit 11). The file is opened for reading, sharing read/write/delete
-        # as a compiler does; a directory, a lock or a denied ACL throws and counts in probeErrors. The open resolves the path as Test-Path does.
+        # as a compiler does (Get-Content, an allowlisted cmdlet: the publish-write scanner admits no .NET file open); a lock or a denied ACL throws under
+        # -ErrorAction Stop and counts in probeErrors, and Test-Path -PathType Leaf has already refused a directory.
         foreach ($entry in $hit) {
             try {
                 $candidate = ($entry -replace '\\+$', '') + '\' + $header
                 if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                    $stream = [System.IO.File]::Open($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($candidate),
-                        [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite,Delete')
-                    $stream.Dispose()
+                    Get-Content -LiteralPath $candidate -TotalCount 1 -ErrorAction Stop | Out-Null
                     $held.Add($entry)
                 }
             } catch { $probeErrors++ }
