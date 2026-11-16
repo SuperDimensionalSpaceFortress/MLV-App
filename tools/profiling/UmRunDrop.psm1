@@ -574,6 +574,241 @@ function Assert-UmRunSideFileName {
 $script:UmRunNotAfterPlacementStallSec = 15
 $script:UmRunNotAfterPlacementRetries = 3
 
+# VENUE-UMRUN-MOVE-ACCESS-DENIED-1: the not-after re-publish replaces this call's own claim in one renaming Move. On NTFS and SMB a destination that another handle
+# holds open without FileShare.Delete (an antivirus or backup scan, an indexer), that is read-only, or that an ACL refuses all come back as the same
+# UnauthorizedAccessException ("Access to the path is denied."), and a lost lease (receipts 24474d73, cf1d6841) was the price of the first one. So the Move is tried at most
+# UmRunMoveAttempts times, UmRunMoveBackoffMs * attempt ms apart (250 + 500 + 750 + 1000 + 1250 = 3.75 s in all, inside the 15 s placement stall bound above, which still
+# measures the whole pass), and a refusal that outlasts them is typed UMRUN_MOVE_ACCESS_DENIED with the source, destination, attempts and cause.
+$script:UmRunMoveAttempts = 6
+$script:UmRunMoveBackoffMs = 250
+
+function ConvertTo-UmRunOpenProbe {
+    <#
+    .SYNOPSIS
+    What an exclusive open of the destination answered, from the exception it threw: OPEN_ACCESS_DENIED (an ACL), OPEN_SHARING_VIOLATION (only a real sharing or
+    lock violation, ERROR_SHARING_VIOLATION 32 / ERROR_LOCK_VIOLATION 33), CHANGED_DURING_PROBE (the file or its folder was not there: FileNotFoundException and
+    DirectoryNotFoundException are IOExceptions too and must not read as a sharing violation, adversary A3), else OPEN_FAILED.
+    #>
+    param([Parameter(Mandatory = $true)][System.Exception]$Exception)
+    $e = $Exception
+    if ($e -is [System.Management.Automation.MethodInvocationException] -and $null -ne $e.InnerException) { $e = $e.InnerException }
+    if ($e -is [IO.FileNotFoundException] -or $e -is [IO.DirectoryNotFoundException]) { return 'CHANGED_DURING_PROBE' }
+    if ($e -is [UnauthorizedAccessException]) { return 'OPEN_ACCESS_DENIED' }
+    if ($e -is [IO.IOException]) {
+        $code = $e.HResult -band 0xFFFF
+        if ($code -eq 32 -or $code -eq 33) { return 'OPEN_SHARING_VIOLATION' }
+    }
+    return 'OPEN_FAILED'
+}
+
+function Get-UmRunMoveDenial {
+    <#
+    .SYNOPSIS
+    Is this exception from a replacing Move a refusal of the destination (access denied, or a sharing or lock violation)? $null when it is anything else
+    (a missing source, a full disk): those are rethrown unchanged. Otherwise { transient; cause; probe; exception }: transient is $false only where waiting
+    cannot help (the destination is a directory or read-only); probe says what an exclusive open of the destination answered, so a later
+    UMRUN_MOVE_ACCESS_DENIED says "another handle" or "an ACL" instead of leaving a guess. Reads only; it never changes the destination.
+    #>
+    param([Parameter(Mandatory = $true)][System.Exception]$Exception, [Parameter(Mandatory = $true)][string]$Destination, [string]$Source = '')
+    $e = $Exception
+    if ($null -ne $e.InnerException) { $e = $e.InnerException }   # a .NET method call arrives wrapped in a MethodInvocationException
+    $denied = $e -is [UnauthorizedAccessException]
+    $locked = ($e -is [IO.IOException]) -and ((($e.HResult -band 0xFFFF) -eq 32) -or (($e.HResult -band 0xFFFF) -eq 33))   # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+    if (-not ($denied -or $locked)) { return $null }
+    $cause = 'DESTINATION_HELD_OR_ACL'
+    $transient = $true
+    $probe = 'NOT_PROBED'
+    # adversary A2: the probes are diagnosis only. The destination can vanish or change between any two of them (another process, the agent's sweep), and a
+    # probe that threw would replace the denial this was asked about, so any failure here leaves the answer transient and says so.
+    try {
+        if (Test-Path -LiteralPath $Destination -PathType Container) {
+            $cause = 'DESTINATION_IS_DIRECTORY'; $transient = $false
+        } elseif (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            if (([IO.File]::GetAttributes($Destination) -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+                $cause = 'DESTINATION_READ_ONLY'; $transient = $false
+            } else {
+                try {
+                    $h = [IO.File]::Open($Destination, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+                    $h.Dispose()
+                    $probe = 'OPEN_OK'
+                } catch {
+                    $probe = ConvertTo-UmRunOpenProbe -Exception $_.Exception
+                    if ($probe -ceq 'CHANGED_DURING_PROBE') { throw }   # the destination went away between the probes: the outer net names it
+                }
+            }
+        } else {
+            $cause = 'DESTINATION_ABSENT'
+        }
+    } catch {
+        $cause = 'DESTINATION_CHANGED_DURING_PROBE'; $transient = $true; $probe = 'NOT_PROBED'
+    }
+    # adversary pass 6 A3: a rename needs the SOURCE free as well as the destination. When the destination answered cleanly (OPEN_OK) the cause may still be the source: another
+    # handle on it that denies Delete sharing, or an ACL on it. An exclusive open of the source says so; the caller has already let go of its own handle on it. Diagnosis only:
+    # a source that vanished or a probe that fails leaves the destination's answer standing.
+    # r7 adversary A2: an exclusive open fails on ANY other handle, a harmless reader that shares Delete included, so a failing destination probe does not clear the source.
+    # When both fail they are both named (neither probe can tell a reader from a blocker); a clean destination with a failing source names the source alone.
+    if ($Source -and $cause -ceq 'DESTINATION_HELD_OR_ACL' -and $probe -cne 'NOT_PROBED') {
+        $srcProbe = ''
+        $srcOpened = $false
+        try {
+            $sh = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+            $sh.Dispose()
+            $srcOpened = $true
+        } catch {
+            $sp = ConvertTo-UmRunOpenProbe -Exception $_.Exception
+            if ($sp -ceq 'OPEN_SHARING_VIOLATION' -or $sp -ceq 'OPEN_ACCESS_DENIED') { $srcProbe = $sp }
+        }
+        if ($srcProbe) {
+            if ($probe -ceq 'OPEN_OK') { $cause = 'SOURCE_HELD_OR_ACL'; $probe = $srcProbe }
+            else { $cause = 'SOURCE_AND_DESTINATION_HELD_OR_ACL'; $probe = "DESTINATION=$probe SOURCE=$srcProbe" }
+        } elseif ($srcOpened -and $probe -ceq 'OPEN_OK') {
+            # r8 adversary A2: an exclusive READ open needs no Delete right, and a rename needs it on the source (and the replace on the destination), so when both opens succeed
+            # the denial is a missing Delete right on one of them (an ACL), not "the destination": name both sides rather than blame the one that answered cleanly.
+            $cause = 'SOURCE_OR_DESTINATION_ACL'; $probe = 'DESTINATION=OPEN_OK SOURCE=OPEN_OK'
+        }
+    }
+    [pscustomobject]@{ transient = $transient; cause = $cause; probe = $probe; exception = ('{0}: {1}' -f $e.GetType().Name, ($e.Message -replace '\s+', ' ')) }
+}
+
+function Read-UmRunClaim {
+    <#
+    .SYNOPSIS
+    The claim file at -Path parsed as JSON, root array NOT enumerated (a one-element root array stays an array and so is never mistaken for the object inside
+    it). Throws when it cannot be read or does not parse; $null when it parses to the JSON null.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $text = Get-Content -LiteralPath $Path -Raw -Encoding ascii -ErrorAction Stop
+    # r8 adversary A1: a claim whose nonce is stated twice is ambiguous (the parser keeps the LAST), so it is never read as anyone's: it throws, which the ownership probe reads as UNKNOWN
+    if (-not (Test-UmRunClaimNonceUnambiguous -Text $text)) { throw "the claim at $Path states its nonce more than once, so its owner is unproven" }
+    $text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+}
+
+function Test-UmRunClaimNonceUnambiguous {
+    <#
+    .SYNOPSIS
+    r8 adversary A1: ConvertFrom-Json collapses a repeated key to its last value (in an object and in a dictionary, spelled alike or with escapes), so the parsed claim
+    cannot show that `nonce` was stated twice. This reads the raw text with System.Text.Json, which enumerates every property of the root object, and answers $false when two
+    or more of them are named `nonce` ignoring case (an escaped spelling decodes to the same name). Text System.Text.Json rejects but ConvertFrom-Json accepts (a raw control
+    character inside a name, say) is counted with the reader ConvertFrom-Json itself uses (Newtonsoft.Json), so the same claim is never read as unambiguous just because
+    one parser is stricter than the other. A root that is not an object (an array, a scalar), an empty text and text neither reader parses answer $true: the ownership
+    predicate refuses the first by itself and the parse that follows refuses the last (it throws), so this answer never admits a claim on its own.
+    #>
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
+    $doc = $null
+    try {
+        # r11 sol r10 B1: both readers default to a depth limit of 64 while ConvertFrom-Json accepts 1024, so a claim nested past 64 made each of them throw, the guard read
+        # "neither parsed it" as unambiguous, and the parse that followed collapsed the repeated nonce to the last one. The limit here is the downstream parser's own (1024);
+        # past it the second reader below has none, so the repeated nonce is still counted and ConvertFrom-Json (which refuses that depth) never gets the text.
+        $opt = [System.Text.Json.JsonDocumentOptions]::new()
+        $opt.MaxDepth = 1024
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
+        if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $true }
+        $n = 0
+        foreach ($prop in $doc.RootElement.EnumerateObject()) {
+            if ([string]::Equals($prop.Name, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $n++ }
+        }
+        return ($n -le 1)
+    } catch {
+        $null = $_
+    } finally {
+        if ($null -ne $doc) { $doc.Dispose() }
+    }
+    # System.Text.Json refused the text: count the root object's property names with the lexer ConvertFrom-Json uses (depth 1 under a root object are its own properties)
+    $reader = $null
+    $n = 0   # outside the try: r11 adversary A1, a reader that fails AFTER counting two nonces (a torn or malformed tail) must not discard what it already saw
+    try {
+        $reader = [Newtonsoft.Json.JsonTextReader]::new([IO.StringReader]::new($Text))
+        $reader.MaxDepth = $null   # r11 sol r10 B1: no depth limit (its default of 64 threw on a claim ConvertFrom-Json accepts); the reader is iterative, so depth costs no stack
+        $rootIsObject = $false
+        while ($reader.Read()) {
+            if ($reader.Depth -eq 0) { $rootIsObject = ($reader.TokenType -eq [Newtonsoft.Json.JsonToken]::StartObject) }
+            if ($rootIsObject -and $reader.Depth -eq 1 -and $reader.TokenType -eq [Newtonsoft.Json.JsonToken]::PropertyName -and [string]::Equals([string]$reader.Value, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $n++ }
+        }
+        return ($n -le 1)
+    } catch {
+        return ($n -le 1)
+    } finally {
+        if ($null -ne $reader) { $reader.Close() }
+    }
+}
+
+function Test-UmRunClaimIsOwn {
+    <#
+    .SYNOPSIS
+    Is -Claim (from Read-UmRunClaim) a JSON object whose `nonce` is a string identical to -Nonce, character for character? Ordinal on purpose: PowerShell's -ceq and
+    -eq compare with the current culture, which ignores characters such as a NUL, so a nonce with one inserted would read as ours (adversary A1 on 49b03793).
+    #>
+    param($Claim, [Parameter(Mandatory = $true)][string]$Nonce)
+    # adversary pass 6 A1: a caller's session may default ConvertFrom-Json to -AsHashtable, which yields a dictionary for the same JSON object; both shapes are one object
+    # here, with one rule. An array or scalar root is neither.
+    $value = $null
+    if ($Claim -is [System.Collections.IDictionary]) {
+        # r7 adversary A4: the property name is matched without regard to case on both shapes (a PSCustomObject's lookup is, a dictionary's key lookup may not be)
+        # r8 adversary A3: the entries are enumerated through the IDictionary interface itself, never `$Claim.Keys`: a JSON property named `Keys` is a dictionary KEY and
+        # shadows the member, so an own claim carrying one read as "not ours" (a false JOBID_IN_USE, and a rollback that kept the owned claim).
+        # r8 adversary A2: more than one key that matches `nonce` ignoring case is ambiguous (the order of the properties would pick the answer), so it is never ours.
+        $found = 0
+        $en = [System.Collections.IDictionary].GetMethod('GetEnumerator').Invoke($Claim, @())
+        while ($en.MoveNext()) {
+            $k = $en.Key
+            if ($k -is [string] -and [string]::Equals($k, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $value = $en.Value; $found++ }
+        }
+        if ($found -ne 1) { return $false }
+    } elseif ($Claim -is [pscustomobject]) {
+        $p = $Claim.PSObject.Properties['nonce']
+        if ($null -eq $p) { return $false }
+        $value = $p.Value
+    } else {
+        return $false
+    }
+    if ($value -isnot [string]) { return $false }
+    return [string]::Equals([string]$value, $Nonce, [StringComparison]::Ordinal)
+}
+
+function Get-UmRunClaimOwnership {
+    <#
+    .SYNOPSIS
+    Whose is the claim at -Path? OWN when it parses as a JSON object carrying exactly -Nonce; OTHER when it parses as anything else (another submission's
+    object, an array, a scalar: this call always wrote an object with its nonce); UNKNOWN when it cannot be read or parses to nothing (a held or torn
+    claim). UNKNOWN is never "ours": a caller must not replace the claim on it (adversary A1).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Nonce)
+    try {
+        $claim = Read-UmRunClaim -Path $Path
+    } catch {
+        return 'UNKNOWN'
+    }
+    if ($null -eq $claim) { return 'UNKNOWN' }
+    if (Test-UmRunClaimIsOwn -Claim $claim -Nonce $Nonce) { return 'OWN' }
+    return 'OTHER'
+}
+
+function Test-UmRunMetaDelivered {
+    <#
+    .SYNOPSIS
+    Does the claim at -Path already hold exactly -ExpectedText (the re-publish's own bytes)? Then a Move that read as denied has in effect landed (a lost reply
+    over SMB), and nothing is re-published or refused. An unreadable destination is never "delivered".
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$ExpectedText)
+    $text = Read-UmRunMetaText -Path $Path
+    return ($null -ne $text) -and [string]::Equals($text, $ExpectedText, [StringComparison]::Ordinal)
+}
+
+function Read-UmRunMetaText {
+    <#
+    .SYNOPSIS
+    The text at -Path (ASCII, shared for read, write and delete), or $null when it cannot be read at all. Never throws: "could not read" is not "read something else".
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try { $sr = [IO.StreamReader]::new($fs, [Text.Encoding]::ASCII); return $sr.ReadToEnd() } finally { $fs.Dispose() }
+    } catch {
+        return $null
+    }
+}
+
 function Invoke-UmRunDrop {
     <#
     .SYNOPSIS
@@ -650,7 +885,13 @@ function Invoke-UmRunDrop {
         [scriptblock]$TestHookAfterMetaTmpWritten = $null,
         # Test-only (r4): invoked with the not-after re-publish's temp file's path immediately after it is written, before its
         # read-back -- lets a test stall the clock inside the re-publish, tear the write, or plant another submission's claim.
-        [scriptblock]$TestHookAfterNotAfterRepublishTmpWritten = $null
+        [scriptblock]$TestHookAfterNotAfterRepublishTmpWritten = $null,
+        # Test-only (VENUE-UMRUN-MOVE-ACCESS-DENIED-1): invoked with the attempt number (1-based) and the claim's path at the top of every pass of the
+        # re-publish's replacing-rename loop, before that pass reads or moves anything -- lets a test hold, rewrite or release the claim between passes.
+        [scriptblock]$TestHookBeforeMetaReplaceAttempt = $null,
+        # Test-only (adversary pass 6 A2): invoked with the re-publish temp's path and the attempt number after the temp was verified and before it is moved -- the gap a
+        # rewrite would need to win. Production never sets it.
+        [scriptblock]$TestHookAfterMetaSourceVerified = $null
     )
 
     if ($JobId -and $JobId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw "UMRUN_JOBID_INVALID '$JobId'" }
@@ -944,6 +1185,7 @@ function Invoke-UmRunDrop {
                             # r6 (Dot 77250bdf): the re-publish temp IS the claim's own nonce temp name ($metaTmp above, which that claim's rename
                             # already moved away), never a new derivation, so the Move and the cleanup below touch only a name this call created.
                             $repubTmp = $metaTmp
+                            $srcStream = $null
                             try {
                                 Set-Content -LiteralPath $repubTmp -Value $metaJson -Encoding ascii -NoNewline
                                 if ($TestHookAfterNotAfterRepublishTmpWritten) { & $TestHookAfterNotAfterRepublishTmpWritten $repubTmp }
@@ -952,13 +1194,112 @@ function Invoke-UmRunDrop {
                                 }
                                 # Only this call's OWN claim is ever replaced (the rollback's nonce rule, the same single-rename-width race), and in
                                 # one atomic replacing rename, so metadata for this JobId never stops existing.
-                                $current = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json
-                                if ($null -eq $current -or $current.nonce -ne $nonce) {
-                                    throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
+                                # VENUE-UMRUN-MOVE-ACCESS-DENIED-1: a refused rename is retried (bounded, backed off) and, if it outlasts the attempts, refused TYPED. Retry-safe:
+                                # only this temp is re-moved over only this call's own claim, the job is not yet visible, and a destination that already holds exactly these
+                                # bytes counts as delivered. On EVERY pass (the first too: a claim another handle holds is the same transient shape as a held rename, adversary
+                                # A5) (a) the delivered check, then (b) the claim's owner is read: OTHER refuses, UNKNOWN (held or torn: ownership unproven) moves nothing this
+                                # pass, and only OWN may be replaced (adversary A1). A temp the first rename already consumed is the delivered case too, never a missing-source
+                                # error (adversary A3).
+                                $moveAttempt = 0
+                                $moveDenial = $null
+                                while ($true) {
+                                    $moveAttempt++
+                                    if ($TestHookBeforeMetaReplaceAttempt) { & $TestHookBeforeMetaReplaceAttempt $moveAttempt $metaFinal }
+                                    if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
+                                    $claimOwner = Get-UmRunClaimOwnership -Path $metaFinal -Nonce $nonce
+                                    if ($claimOwner -ceq 'OTHER') {
+                                        throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
+                                    }
+                                    # adversary pass 4 A1: a retry moves the same temp name, so what is about to be moved is verified again on every pass after the first (the first
+                                    # was verified just above). Ordinal: -ne is culture-aware and ignores a NUL. Changed bytes refuse; a temp that cannot be read moves nothing this pass.
+                                    $srcReadable = $true
+                                    $srcReadErr = $null
+                                    if ($null -ne $srcStream) { $srcStream.Dispose(); $srcStream = $null }
+                                    if ($claimOwner -ceq 'OWN') {
+                                        $srcText = $null
+                                        # adversary pass 6 A2: the verifying read STAYS OPEN until the move has happened. It shares Read and Delete only, so the rename is allowed but no writer can
+                                        # open the file in the gap between "verified" and "moved" (a close-then-move left that gap, and on a retry the same temp name is moved again). The first
+                                        # pass is held the same way: its read-back above closes before the move. Ordinal compare: -ne is culture-aware and ignores a NUL.
+                                        try {
+                                            $srcStream = [IO.File]::Open($repubTmp, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete))
+                                            $srcText = ([IO.StreamReader]::new($srcStream, [Text.Encoding]::ASCII, $false, 1024, $true)).ReadToEnd()
+                                        } catch {
+                                            $srcText = $null; $srcReadErr = $_
+                                            if ($null -ne $srcStream) { $srcStream.Dispose(); $srcStream = $null }
+                                        }
+                                        # sol r3 B1: the claim read fine (OWN), so a source failure must never be reported as an ownership refusal. A temp that is GONE (and the delivered
+                                        # check above was false) keeps its own missing-source failure; one that is held or torn is retried and, if it outlasts the attempts, refused as
+                                        # SOURCE_UNREADABLE carrying the read error.
+                                        if ([string]::IsNullOrEmpty($srcText)) {
+                                            $srcReadable = $false
+                                            $srcInner = $(if ($null -ne $srcReadErr) { $srcReadErr.Exception.InnerException } else { $null })
+                                            if ($null -ne $srcInner -and ($srcInner -is [IO.FileNotFoundException] -or $srcInner -is [IO.DirectoryNotFoundException])) {
+                                                # r11 adversary pass 11 A1: the first rename can land late AFTER this pass's delivered check (line above the owner read) and before this open, which
+                                                # also leaves the temp gone; a claim that already holds exactly these bytes is delivered, never a missing-source failure
+                                                if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
+                                                throw $srcReadErr
+                                            }
+                                        }
+                                        elseif (-not [string]::Equals($srcText, $metaJson, [StringComparison]::Ordinal)) {
+                                            throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json's re-publish temporary changed between its verification and the move; refusing to publish it"
+                                        }
+                                    }
+                                    if ($claimOwner -ceq 'OWN' -and $srcReadable) {
+                                        if ($TestHookAfterMetaSourceVerified) { & $TestHookAfterMetaSourceVerified $repubTmp $moveAttempt }
+                                        try {
+                                            [IO.File]::Move($repubTmp, $metaFinal, $true)
+                                            $srcStream.Dispose(); $srcStream = $null
+                                            break
+                                        } catch {
+                                            # our own hold on the source is released before diagnosing, so a probe of the source sees only another handle's
+                                            if ($null -ne $srcStream) { $srcStream.Dispose(); $srcStream = $null }
+                                            $moveDenial = Get-UmRunMoveDenial -Exception $_.Exception -Destination $metaFinal -Source $repubTmp
+                                            # adversary pass 3 A1: this probe's own transient access error must never replace the classified denial (a probe that cannot answer reads as "source still there")
+                                            $sourceGone = $false
+                                            try { $sourceGone = -not (Test-Path -LiteralPath $repubTmp -ErrorAction Stop) } catch { $sourceGone = $false }
+                                            if ($null -eq $moveDenial -and -not $sourceGone) { throw }
+                                            if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
+                                            if ($null -eq $moveDenial) { throw }
+                                            if (-not $moveDenial.transient -or $moveAttempt -ge $script:UmRunMoveAttempts) {
+                                                throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=$($moveDenial.cause) probe=$($moveDenial.probe) exception=$($moveDenial.exception); the not-after re-publish did not replace this submission's claim and the job was not made visible"
+                                            }
+                                        }
+                                    } elseif ($moveAttempt -ge $script:UmRunMoveAttempts) {
+                                        # r11 adversary pass 11 A1 (sibling): a late landing after this last pass's delivered check is delivered, not an unprovable or unreadable claim
+                                        if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
+                                        $prior = $(if ($null -ne $moveDenial) { " priorCause=$($moveDenial.cause) priorProbe=$($moveDenial.probe)" } else { '' })
+                                        if (-not $srcReadable) {
+                                            $srcWhy = $(if ($null -ne $srcReadErr) { ($srcReadErr.Exception.Message -replace '\s+', ' ') } else { 'the temporary read back empty' })
+                                            throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=SOURCE_UNREADABLE probe=NOT_PROBED$prior exception=$srcWhy; the re-publish temporary could not be read back to verify it before moving it, so it was not moved; the not-after re-publish did not replace this submission's claim and the job was not made visible"
+                                        }
+                                        throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=OWNERSHIP_UNPROVEN probe=NOT_PROBED$prior exception=the claim could not be read back to prove it is still this submission's own, so it was not replaced; the not-after re-publish did not replace this submission's claim and the job was not made visible"
+                                    }
+                                    Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $moveAttempt)
                                 }
-                                [IO.File]::Move($repubTmp, $metaFinal, $true)
+                                # r7 adversary A1: the verifying hold lets the temp be renamed (it shares Delete), so a file swapped in at the same pathname would be what the Move
+                                # published. What LANDED is read back here, still before the job is visible, and bytes that are not the verified ones refuse (the rollback below
+                                # removes the claim: it carries this call's nonce).
+                                # r8 adversary A1: a claim that cannot be read is NOT proof of anything, and a swapped-in file held with Delete sharing only is exactly unreadable, so
+                                # it refuses too. A holder that lets go is waited out (bounded, the same attempts and back-off as the move); what never read back is never made visible.
+                                $landedText = $null
+                                for ($landedRead = 1; $landedRead -le $script:UmRunMoveAttempts; $landedRead++) {
+                                    $landedText = Read-UmRunMetaText -Path $metaFinal
+                                    if ($null -ne $landedText) { break }
+                                    if ($landedRead -lt $script:UmRunMoveAttempts) { Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $landedRead) }
+                                }
+                                if ($null -eq $landedText) {
+                                    throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json could not be read back after the not-after re-publish ($($script:UmRunMoveAttempts) attempts), so the bytes that landed are unproven; the job was not made visible"
+                                }
+                                if (-not [string]::Equals($landedText, $metaJson, [StringComparison]::Ordinal)) {
+                                    throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json does not hold the verified bytes after the not-after re-publish (the re-publish temporary was replaced by another file between its verification and the move); the job was not made visible"
+                                }
                             } finally {
-                                if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
+                                # adversary pass 3 A1 (sibling): a cleanup probe that throws in a finally would replace the typed refusal (or a success) in flight
+                                # (the delete line itself stays exact: test_dual_venue_owner_footage_gate pins it)
+                                try {
+                                    if ($null -ne $srcStream) { $srcStream.Dispose(); $srcStream = $null }
+                                    if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
+                                } catch { $null = $_ }
                             }
                             $notAfterText = $republished
                         }
@@ -1020,9 +1361,21 @@ function Invoke-UmRunDrop {
             $ownsClaim = $true
             $readSucceeded = $false
             try {
-                $currentMeta = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json
-                $readSucceeded = $true
-                $ownsClaim = ($null -ne $currentMeta) -and ($currentMeta.nonce -eq $nonce)
+                # adversary pass 4 A2: the rollback's read keeps the CALLER's error preference (as before this card), so a claim that cannot be read still reads as "no proof
+                # either way" under Stop and as nothing (preserved) under Continue; only the root array is no longer enumerated (Read-UmRunClaim's -ErrorAction Stop is for the
+                # ownership probe, which wants the error).
+                # r8 adversary A1: the raw text is kept so a claim stating its nonce twice (the parser keeps the last) is never read as ours
+                # (judged BEFORE the parse: in object mode ConvertFrom-Json throws on two keys that differ only in case, and that throw must not read as "no proof either way" and delete the claim)
+                $currentText = Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii
+                if (-not (Test-UmRunClaimNonceUnambiguous -Text $currentText)) {
+                    $readSucceeded = $true
+                    $ownsClaim = $false
+                } else {
+                    $currentMeta = $null
+                    if ($null -ne $currentText) { $currentMeta = $currentText | ConvertFrom-Json -NoEnumerate }
+                    $readSucceeded = $true
+                    $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
+                }
             } catch {
                 $readSucceeded = $false
             }
@@ -1050,4 +1403,4 @@ function Invoke-UmRunDrop {
     Write-Output "UMRUN_NONCE=$nonce"
 }
 
-Export-ModuleMember -Function Assert-UmRunSideFileName, Test-UmRunTrackedFixtureSource, Get-UmRunFixtureAdmission, Resolve-UmRunRealDirectory, Get-UmRunShareNowUtc, Get-UmRunHeartbeatJobTag, Get-UmRunAgentLiveness, Invoke-UmRunDrop
+Export-ModuleMember -Function Assert-UmRunSideFileName, Test-UmRunTrackedFixtureSource, Get-UmRunFixtureAdmission, Resolve-UmRunRealDirectory, Get-UmRunShareNowUtc, Get-UmRunHeartbeatJobTag, Get-UmRunAgentLiveness, Invoke-UmRunDrop, Read-UmRunClaim, Test-UmRunClaimIsOwn, Test-UmRunClaimNonceUnambiguous
