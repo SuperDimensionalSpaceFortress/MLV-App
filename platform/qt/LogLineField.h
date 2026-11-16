@@ -106,6 +106,25 @@ inline QString prepRouteLine( qulonglong session, bool prepConflatedMoveActive )
         .arg( prepConflatedMoveActive ? 1 : 0 );
 }
 
+// CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the OpenMP team sizes of one playback session, written once at play start. Integers the app
+// derived only (no env text), so the dual-venue runner reads the partition from this record (Get-DvTeamPartitionEvidence).
+// partition is "off" unless a knob is set, then "<recon request>+<prep request>"; recon_omp / prep_omp are the requests (0 = unset:
+// that thread keeps its own team); recon_cpu_cores / prep_pointwise are the counts the recon side's cpu_cores and the prep
+// pointwise team use.
+inline QString ompTeamsLine( qulonglong session, int reconRequest, int reconCpuCores, int prepRequest, int prepPointwise,
+                             int prefetchDecoders, int logicalCpus, bool overrideActive )
+{
+    const QString partition = ( reconRequest > 0 || prepRequest > 0 )
+        ? QStringLiteral( "%1+%2" ).arg( qMax( 0, reconRequest ) ).arg( qMax( 0, prepRequest ) )
+        : QStringLiteral( "off" );
+    return QStringLiteral( "playback_smoke.omp_teams session=%1 partition=%2 recon_omp=%3 recon_cpu_cores=%4 prep_omp=%5 "
+                           "prep_pointwise=%6 prefetch_decoders=%7 logical_cpus=%8 override=%9" )
+        .arg( QString::number( session ), partition, QString::number( qMax( 0, reconRequest ) ),
+              QString::number( reconCpuCores ), QString::number( qMax( 0, prepRequest ) ), QString::number( prepPointwise ),
+              QString::number( qMax( 0, prefetchDecoders ) ), QString::number( logicalCpus ),
+              QString::number( overrideActive ? 1 : 0 ) );
+}
+
 } // namespace log_line_field
 
 #endif // LOGLINEFIELD_H

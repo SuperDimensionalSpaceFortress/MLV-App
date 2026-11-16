@@ -84,6 +84,64 @@ inline int mlvappEffectivePlaybackWorkerThreadCount()
     return qBound(1, workerThreads, cap);
 }
 
+/* CPU-S1-FS-SPIKE-TEAM-PARTITION-1: an opt-in, default-OFF asymmetric split of the playback
+ * OpenMP teams (bench knob). MLVAPP_PLAYBACK_RECON_OMP_THREADS sizes the recon side (the
+ * render thread, the cpu_cores llrawproc reads, and the Phase-3 recon worker) and
+ * MLVAPP_PLAYBACK_PREP_OMP_THREADS sizes the playback prep thread's team. A value is read only
+ * when it is a positive decimal integer (digits only); anything else is unset. It is clamped to
+ * [1, mlvappEffectivePlaybackWorkerThreadCount()] and is INERT while MLVAPP_FORCE_THREADS or
+ * MLVAPP_FORCE_SINGLETHREAD is active, so deterministic test runs keep their exact count.
+ * Returns the request, 0 when it is unset or inert. */
+inline int mlvappPlaybackTeamRequestFromValue(const QByteArray &raw)
+{
+    if (raw.isEmpty()) {
+        return 0;
+    }
+    qint64 value = 0;
+    for (const char c : raw) {
+        if (c < '0' || c > '9') {
+            return 0;
+        }
+        if (value < 1000000) {
+            value = value * 10 + (c - '0');
+        }
+    }
+    return value > 0 ? static_cast<int>(qMin<qint64>(value, 1000000)) : 0;
+}
+
+inline int mlvappPlaybackTeamRequest(const char *name)
+{
+    if (mlvappWorkerThreadOverrideActive()) {
+        return 0;
+    }
+    const int requested = mlvappPlaybackTeamRequestFromValue(qgetenv(name));
+    return requested > 0 ? qBound(1, requested, mlvappEffectivePlaybackWorkerThreadCount()) : 0;
+}
+
+inline int mlvappPlaybackReconTeamRequest()
+{
+    return mlvappPlaybackTeamRequest("MLVAPP_PLAYBACK_RECON_OMP_THREADS");
+}
+
+inline int mlvappPlaybackPrepTeamRequest()
+{
+    return mlvappPlaybackTeamRequest("MLVAPP_PLAYBACK_PREP_OMP_THREADS");
+}
+
+/* The recon / prep team size: the request when it is set, otherwise exactly
+ * mlvappEffectivePlaybackWorkerThreadCount() (so an unset knob changes nothing). */
+inline int mlvappPlaybackReconWorkerThreadCount()
+{
+    const int requested = mlvappPlaybackReconTeamRequest();
+    return requested > 0 ? requested : mlvappEffectivePlaybackWorkerThreadCount();
+}
+
+inline int mlvappPlaybackPrepWorkerThreadCount()
+{
+    const int requested = mlvappPlaybackPrepTeamRequest();
+    return requested > 0 ? requested : mlvappEffectivePlaybackWorkerThreadCount();
+}
+
 inline int mlvappPlaybackOpenMpThreadTargetFor(int workerThreads, int currentOpenMpMaxThreads)
 {
     if (workerThreads <= 0) {
