@@ -1101,10 +1101,17 @@ function Invoke-UmRunDrop {
                                     # adversary pass 4 A1: a retry moves the same temp name, so what is about to be moved is verified again on every pass after the first (the first
                                     # was verified just above). Ordinal: -ne is culture-aware and ignores a NUL. Changed bytes refuse; a temp that cannot be read moves nothing this pass.
                                     $srcReadable = $true
+                                    $srcReadErr = $null
                                     if ($moveAttempt -gt 1 -and $claimOwner -ceq 'OWN') {
                                         $srcText = $null
-                                        try { $srcText = Get-Content -LiteralPath $repubTmp -Raw -Encoding ascii -ErrorAction Stop } catch { $srcText = $null }
-                                        if ($null -eq $srcText) { $srcReadable = $false }
+                                        try { $srcText = Get-Content -LiteralPath $repubTmp -Raw -Encoding ascii -ErrorAction Stop } catch { $srcText = $null; $srcReadErr = $_ }
+                                        # sol r3 B1: the claim read fine (OWN), so a source failure must never be reported as an ownership refusal. A temp that is GONE (and the delivered
+                                        # check above was false) keeps its own missing-source failure, exactly as before the pass-4 read; one that is held or torn is retried and, if it
+                                        # outlasts the attempts, refused as SOURCE_UNREADABLE carrying the read error.
+                                        if ($null -eq $srcText) {
+                                            $srcReadable = $false
+                                            if ($null -ne $srcReadErr -and $srcReadErr.Exception -is [System.Management.Automation.ItemNotFoundException]) { throw $srcReadErr }
+                                        }
                                         elseif (-not [string]::Equals($srcText, $metaJson, [StringComparison]::Ordinal)) {
                                             throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json's re-publish temporary changed between the replace attempts; refusing to publish it"
                                         }
@@ -1127,6 +1134,10 @@ function Invoke-UmRunDrop {
                                         }
                                     } elseif ($moveAttempt -ge $script:UmRunMoveAttempts) {
                                         $prior = $(if ($null -ne $moveDenial) { " priorCause=$($moveDenial.cause) priorProbe=$($moveDenial.probe)" } else { '' })
+                                        if (-not $srcReadable) {
+                                            $srcWhy = $(if ($null -ne $srcReadErr) { ($srcReadErr.Exception.Message -replace '\s+', ' ') } else { 'the temporary read back empty' })
+                                            throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=SOURCE_UNREADABLE probe=NOT_PROBED$prior exception=$srcWhy; the re-publish temporary could not be read back to verify it before moving it, so it was not moved; the not-after re-publish did not replace this submission's claim and the job was not made visible"
+                                        }
                                         throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=OWNERSHIP_UNPROVEN probe=NOT_PROBED$prior exception=the claim could not be read back to prove it is still this submission's own, so it was not replaced; the not-after re-publish did not replace this submission's claim and the job was not made visible"
                                     }
                                     Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $moveAttempt)

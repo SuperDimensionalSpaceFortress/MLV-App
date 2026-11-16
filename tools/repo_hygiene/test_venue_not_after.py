@@ -651,6 +651,11 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             # adversary pass 4 A1: 'mutateSource' rewrites the re-publish temp (the source the retry will move) with `notAfterUtc` renamed, nonce and jobId intact
             "    if ($c.repub.seam.mutateSource) { $t1 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
             "      [IO.File]::WriteAllText($t1.FullName, [IO.File]::ReadAllText($t1.FullName).Replace('notAfterUtc', 'notBeforeUtc')) }\n"
+            # sol r3 B1: 'deleteSource' removes the re-publish temp before pass 2 (the retry's source is gone); 'lockSource' opens it with FileShare.None for the rest of the run (unreadable)
+            "    if ($c.repub.seam.deleteSource) { $t2 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      Remove-Item -LiteralPath $t2.FullName -Force }\n"
+            "    if ($c.repub.seam.lockSource) { $t3 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      $state.src = [IO.File]::Open($t3.FullName, 'Open', 'Read', 'None') }\n"
             "    if ($c.repub.seam.land) { $state.h.Dispose(); $t = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $d, $true) }\n"
             "    if ($c.repub.seam.release) { $state.h.Dispose() } } } }\n"
             "$threw = ''; $lines = @()\n"
@@ -1166,6 +1171,29 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"mutateSource": True, "release": True}})
         self.assertTrue(r["threw"].startswith("UMRUN_JOB_METADATA_VERIFY_FAILED"), r)
         self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes never reached the published claim")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_whose_source_vanished_keeps_the_missing_source_failure_not_an_ownership_refusal(self) -> None:
+        # sol r3 B1 (introduced by adversary pass 4 A1): first replacement denied, then the re-publish temp is gone before pass 2 while the claim still carries THIS
+        # submission's nonce (owner OWN). The source read's failure was swallowed, so every later pass skipped the move and the drop ended after the whole back-off with
+        # cause=OWNERSHIP_UNPROVEN, a false diagnosis (the claim was read fine). RED before the fix: threw UMRUN_MOVE_ACCESS_DENIED ... cause=OWNERSHIP_UNPROVEN.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"deleteSource": True}})
+        self.assertNotEqual(r["threw"], "", r)
+        self.assertFalse(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED"), r["threw"])
+        self.assertNotIn("OWNERSHIP_UNPROVEN", r["threw"])
+        self.assertIn(".meta.tmp", r["threw"], "the failure names the missing source")
+        self.assertRegex(r["threw"], r"(?i)does not exist|could not find")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_whose_source_cannot_be_read_refuses_typed_as_source_unreadable_not_ownership_unproven(self) -> None:
+        # sol r3 B1, unreadable shape: the temp is held with no sharing from pass 2 on, the claim reads as this submission's own. Nothing is moved (an unread source is
+        # never published), and the refusal names the source, with the read error, instead of blaming the ownership read. RED before the fix: cause=OWNERSHIP_UNPROVEN.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"lockSource": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=SOURCE_UNREADABLE", r["threw"])
+        self.assertNotIn("OWNERSHIP_UNPROVEN", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+        self.assertIn("priorCause=DESTINATION_HELD_OR_ACL", r["threw"], "the first denial's diagnosis is not lost")
         self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
 
     def test_a_rollback_keeps_a_claim_it_could_not_read_under_a_continue_preference(self) -> None:
