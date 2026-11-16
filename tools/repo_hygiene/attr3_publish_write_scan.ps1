@@ -251,6 +251,7 @@ $allowedInstance = @('Add', 'Contains', 'ContainsKey', 'Kill', 'Replace', 'Start
 $rootVariables = @('Work', 'Pub', 'Cache', 'AgentRoot', 'Root')
 $canonicalWork = @("Join-Path `$AgentRoot `"work\`$JobId`"", "Join-Path 'C:\mlvtmp' `$JobId")
 $allowedEnv = @('TEMP', 'TMP')
+$buildEnvCleared = @('INCLUDE', 'LIB', 'LIBPATH')   # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: only ever cleared (= $null); see R5
 
 $violations = [System.Collections.Generic.List[object]]::new()
 $scanned = [System.Collections.Generic.List[string]]::new()
@@ -1784,6 +1785,26 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
             continue
         }
         if ($v.scope -ieq 'script' -and $rootVariables -notcontains $v.name) { continue }
+        # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: the DLL-pair job sets its own process PATH (the build children inherit it) to the module's minimal
+        # build PATH, and clears the compiler variables vcvars64 appends to. Neither is a write: PATH is allowed ONLY as a plain '=' of exactly one
+        # call to Get-AttrCudaMinimalBuildPath, and INCLUDE / LIB / LIBPATH ONLY as a plain '=' of $null; any other right-hand side stays R5.
+        if ($v.scope -ieq 'env' -and $buildEnvCleared -contains $v.name) {
+            if ($a.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or $a.Right.Extent.Text -cne '$null') {
+                Add-Violation $Source $a 'R5' "`$env:$($v.name) may only be cleared (= `$null)"
+            }
+            continue
+        }
+        if ($v.scope -ieq 'env' -and $v.name -ieq 'PATH') {
+            $rhs = $a.Right
+            $call = $null
+            if ($rhs -is [System.Management.Automation.Language.PipelineAst] -and $rhs.PipelineElements.Count -eq 1 -and
+                $rhs.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) { $call = $rhs.PipelineElements[0] }
+            if ($a.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or $null -eq $call -or
+                $call.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -or $call.GetCommandName() -cne 'Get-AttrCudaMinimalBuildPath') {
+                Add-Violation $Source $a 'R5' "`$env:PATH may only be assigned (=) one call to Get-AttrCudaMinimalBuildPath"
+            }
+            continue
+        }
         if ($v.scope -ieq 'env' -and $allowedEnv -contains $v.name) {
             $visiting = [System.Collections.Generic.HashSet[string]]::new()
             if ($a.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals -or -not (Test-Provable $a.Right $root $visiting)) {
