@@ -3396,11 +3396,13 @@ class EvidenceFactory(RunnerHarness):
         return reasons
 
 
-@requires_windows_pwsh
 class IsolationMirrorSelectsRecordsByTheirBodyTests(unittest.TestCase):
     """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r19 adversary advisory A2 on af002fce, its input verbatim): the Python isolation mirror
     (EvidenceFactory.derive_block) SELECTS a pacing_isolated record by its body, as Get-DvPlaybackEvidence does, so a Qt location path that holds the
-    marker never adds a record (the production parser reads settingsIsolated=true on this log)."""
+    marker never adds a record (the production parser reads settingsIsolated=true on this log). Pure Python (no pwsh), so it runs on every OS.
+    r20: r19 inserted this class between `@requires_windows_pwsh` and EvidenceBoundReceiptTests, which moved that skip off EvidenceBoundReceiptTests
+    and ran its pwsh leg tests on ubuntu (hosted CI run 43917107820: no offline receipt); the skip is back on EvidenceBoundReceiptTests and
+    PwshHarnessClassesCarryTheWindowsSkipTests pins it for every harness class."""
 
     def test_a2_a_location_path_holding_the_marker_adds_no_isolation_record(self) -> None:
         log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
@@ -3415,6 +3417,41 @@ class IsolationMirrorSelectsRecordsByTheirBodyTests(unittest.TestCase):
             self.assertIs(EvidenceFactory.derive_block(ev)["settingsIsolated"], True)
 
 
+class PwshHarnessClassesCarryTheWindowsSkipTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r20 (hosted CI red on dce22027, run 43917107820): a class inserted between
+    `@requires_windows_pwsh` and the class below it takes that skip, so the class below ran its pwsh leg tests on ubuntu. Every concrete TestCase
+    built on a pwsh harness (RunnerHarness, EvidenceFactory, ModuleMutationMixin, IdentityProbeMixin) names the skip itself. Read from the source
+    (skipIf with a false condition leaves no mark on Windows), so the pin holds on every OS."""
+
+    PWSH_BASES = frozenset({"RunnerHarness", "ModuleMutationMixin", "IdentityProbeMixin"})
+
+    @classmethod
+    def unskipped_harness_classes(cls, source: str) -> list[str]:
+        classes = [n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)]
+        bases = {n.name: {b.id for b in n.bases if isinstance(b, ast.Name)} for n in classes}
+        pwsh = set(cls.PWSH_BASES)
+        grew = True
+        while grew:                                   # EvidenceFactory(RunnerHarness) is a harness too, transitively
+            grew = False
+            for name, names in bases.items():
+                if name not in pwsh and names & pwsh:
+                    pwsh.add(name)
+                    grew = True
+        return [n.name for n in classes
+                if "TestCase" in {b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", "") for b in n.bases}
+                and bases[n.name] & pwsh
+                and not any(isinstance(d, ast.Name) and d.id == "requires_windows_pwsh" for d in n.decorator_list)]
+
+    def test_every_pwsh_harness_test_class_names_the_windows_skip(self) -> None:
+        self.assertEqual(self.unskipped_harness_classes(Path(__file__).read_text(encoding="utf-8")), [])
+
+    def test_the_r19_shape_a_class_inserted_under_the_skip_is_caught(self) -> None:
+        r19 = ("class EvidenceFactory(RunnerHarness):\n    pass\n\n\n@requires_windows_pwsh\nclass Mirror(unittest.TestCase):\n    pass\n\n\n"
+               "class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):\n    pass\n")
+        self.assertEqual(self.unskipped_harness_classes(r19), ["EvidenceBoundReceiptTests"])
+
+
+@requires_windows_pwsh
 class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
     """sol r2 BLOCKER: a hand-built production PASS (format-only hashes, self-asserted booleans, a consent blob with ZERO records, no
     evidence at all) validated. Now nothing validates unless it re-derives from a committed blob or a hashed file."""
