@@ -474,9 +474,18 @@ while ($true) {
                     try {
                         # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 adversary pass 5 A1: the read keeps the CALLER's error preference and defaults (as before this card; the module
                         # rollback does the same), so a claim that cannot be read is never read as ours under a Continue default; only the root array is not enumerated.
-                        $currentMeta = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json -NoEnumerate
-                        $readSucceeded = $true
-                        $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
+                        # r8 adversary A1: the raw text is kept so a claim stating its nonce twice (the parser keeps the last) is never read as ours; judged BEFORE the parse, because
+                        # in object mode ConvertFrom-Json throws on two keys that differ only in case and that throw must not read as "no proof either way" and delete the claim
+                        $currentText = Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii
+                        if (-not (Test-UmRunClaimNonceUnambiguous -Text $currentText)) {
+                            $readSucceeded = $true
+                            $ownsClaim = $false
+                        } else {
+                            $currentMeta = $null
+                            if ($null -ne $currentText) { $currentMeta = $currentText | ConvertFrom-Json -NoEnumerate }
+                            $readSucceeded = $true
+                            $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
+                        }
                     } catch {
                         $readSucceeded = $false
                     }

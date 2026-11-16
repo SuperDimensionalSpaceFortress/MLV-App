@@ -1328,6 +1328,44 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         for k in ("dup-case-own-first", "dup-case-own-last"):
             self.assertFalse(got[k + "/dict"], f"{k}: an ambiguous nonce key is never ours: {got}")   # r8 adversary A2
 
+    def test_a_claim_that_states_its_nonce_twice_is_never_replaced_whichever_spelling_repeats_it(self) -> None:
+        # r8 adversary A1 (introduced): ConvertFrom-Json collapses a repeated key to its LAST value, so the case-folding ambiguity guard saw one key and a claim with a
+        # foreign nonce first and this submission's second read as ours and was replaced. The raw text is now read with System.Text.Json (every property, escapes decoded).
+        # RED before the fix: threw == "" and the claim was replaced.
+        for name, text in {
+            "same spelling": '{"jobId":"job-x","nonce":"22222222222242228222222222222222","nonce":"<N>"}',
+            "escaped first spelling": '{"jobId":"job-x","\\u006eonce":"22222222222242228222222222222222","nonce":"<N>"}',
+            "folded spelling": '{"jobId":"job-x","NONCE":"22222222222242228222222222222222","nonce":"<N>"}',
+        }.items():
+            with self.subTest(claim=name):
+                for stale in self.inbox.iterdir():
+                    stale.unlink()
+                r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": text, "release": True}})
+                self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+                self.assertIn("cause=OWNERSHIP_UNPROVEN", r["threw"])
+                self.assertIn("22222222222242228222222222222222", r["meta"], "the ambiguous claim was left as it was, not replaced and not removed")
+                self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_denied_rename_that_both_exclusive_opens_survive_names_both_sides(self) -> None:
+        # r8 adversary A2 (introduced): an exclusive READ open needs no Delete right, so with an ACL that withholds Delete from the source (or the destination) both diagnostic
+        # opens succeed and the refusal blamed the healthy destination. Fed directly: an access-denied Move over two plain files nobody holds. RED before the fix:
+        # cause=DESTINATION_HELD_OR_ACL probe=OPEN_OK.
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DROP_MODULE}' -Force\n"
+            f"$d = Join-Path '{self.tmp}' 'denial-dest.json'; $s = Join-Path '{self.tmp}' 'denial-src.tmp'\n"
+            "[IO.File]::WriteAllText($d, '{}'); [IO.File]::WriteAllText($s, '{}')\n"
+            "$e = [UnauthorizedAccessException]::new('Access to the path is denied.')\n"
+            "$r = & (Get-Module UmRunDrop) { param($x, $dst, $src) Get-UmRunMoveDenial -Exception $x -Destination $dst -Source $src } $e $d $s\n"
+            "ConvertTo-Json -Compress -InputObject ([ordered]@{ cause = $r.cause; probe = $r.probe; transient = $r.transient })\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["cause"], "SOURCE_OR_DESTINATION_ACL", got)
+        self.assertEqual(got["probe"], "DESTINATION=OPEN_OK SOURCE=OPEN_OK", got)
+        self.assertTrue(got["transient"], got)
+
     def test_a_rollback_keeps_a_claim_it_could_not_read_under_a_continue_preference(self) -> None:
         # adversary pass 4 A2 (introduced): the rollback's read became a terminating one, so under -ErrorAction Continue a claim another submission holds (readable by
         # no one, deletable by anyone) read as "no proof either way" and was deleted; the base's non-terminating read yielded nothing and preserved it. RED before the

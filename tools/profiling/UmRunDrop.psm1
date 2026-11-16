@@ -649,9 +649,11 @@ function Get-UmRunMoveDenial {
     # When both fail they are both named (neither probe can tell a reader from a blocker); a clean destination with a failing source names the source alone.
     if ($Source -and $cause -ceq 'DESTINATION_HELD_OR_ACL' -and $probe -cne 'NOT_PROBED') {
         $srcProbe = ''
+        $srcOpened = $false
         try {
             $sh = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
             $sh.Dispose()
+            $srcOpened = $true
         } catch {
             $sp = ConvertTo-UmRunOpenProbe -Exception $_.Exception
             if ($sp -ceq 'OPEN_SHARING_VIOLATION' -or $sp -ceq 'OPEN_ACCESS_DENIED') { $srcProbe = $sp }
@@ -659,6 +661,10 @@ function Get-UmRunMoveDenial {
         if ($srcProbe) {
             if ($probe -ceq 'OPEN_OK') { $cause = 'SOURCE_HELD_OR_ACL'; $probe = $srcProbe }
             else { $cause = 'SOURCE_AND_DESTINATION_HELD_OR_ACL'; $probe = "DESTINATION=$probe SOURCE=$srcProbe" }
+        } elseif ($srcOpened -and $probe -ceq 'OPEN_OK') {
+            # r8 adversary A2: an exclusive READ open needs no Delete right, and a rename needs it on the source (and the replace on the destination), so when both opens succeed
+            # the denial is a missing Delete right on one of them (an ACL), not "the destination": name both sides rather than blame the one that answered cleanly.
+            $cause = 'SOURCE_OR_DESTINATION_ACL'; $probe = 'DESTINATION=OPEN_OK SOURCE=OPEN_OK'
         }
     }
     [pscustomobject]@{ transient = $transient; cause = $cause; probe = $probe; exception = ('{0}: {1}' -f $e.GetType().Name, ($e.Message -replace '\s+', ' ')) }
@@ -671,7 +677,54 @@ function Read-UmRunClaim {
     it). Throws when it cannot be read or does not parse; $null when it parses to the JSON null.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
-    (Get-Content -LiteralPath $Path -Raw -Encoding ascii -ErrorAction Stop) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+    $text = Get-Content -LiteralPath $Path -Raw -Encoding ascii -ErrorAction Stop
+    # r8 adversary A1: a claim whose nonce is stated twice is ambiguous (the parser keeps the LAST), so it is never read as anyone's: it throws, which the ownership probe reads as UNKNOWN
+    if (-not (Test-UmRunClaimNonceUnambiguous -Text $text)) { throw "the claim at $Path states its nonce more than once, so its owner is unproven" }
+    $text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+}
+
+function Test-UmRunClaimNonceUnambiguous {
+    <#
+    .SYNOPSIS
+    r8 adversary A1: ConvertFrom-Json collapses a repeated key to its last value (in an object and in a dictionary, spelled alike or with escapes), so the parsed claim
+    cannot show that `nonce` was stated twice. This reads the raw text with System.Text.Json, which enumerates every property of the root object, and answers $false when two
+    or more of them are named `nonce` ignoring case (an escaped spelling decodes to the same name). Text System.Text.Json rejects but ConvertFrom-Json accepts (a raw control
+    character inside a name, say) is counted with the reader ConvertFrom-Json itself uses (Newtonsoft.Json), so the same claim is never read as unambiguous just because
+    one parser is stricter than the other. A root that is not an object (an array, a scalar), an empty text and text neither reader parses answer $true: the ownership
+    predicate refuses the first by itself and the parse that follows refuses the last (it throws), so this answer never admits a claim on its own.
+    #>
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
+    $doc = $null
+    try {
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+        if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $true }
+        $n = 0
+        foreach ($prop in $doc.RootElement.EnumerateObject()) {
+            if ([string]::Equals($prop.Name, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $n++ }
+        }
+        return ($n -le 1)
+    } catch {
+        $null = $_
+    } finally {
+        if ($null -ne $doc) { $doc.Dispose() }
+    }
+    # System.Text.Json refused the text: count the root object's property names with the lexer ConvertFrom-Json uses (depth 1 under a root object are its own properties)
+    $reader = $null
+    try {
+        $reader = [Newtonsoft.Json.JsonTextReader]::new([IO.StringReader]::new($Text))
+        $n = 0
+        $rootIsObject = $false
+        while ($reader.Read()) {
+            if ($reader.Depth -eq 0) { $rootIsObject = ($reader.TokenType -eq [Newtonsoft.Json.JsonToken]::StartObject) }
+            if ($rootIsObject -and $reader.Depth -eq 1 -and $reader.TokenType -eq [Newtonsoft.Json.JsonToken]::PropertyName -and [string]::Equals([string]$reader.Value, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $n++ }
+        }
+        return ($n -le 1)
+    } catch {
+        return $true
+    } finally {
+        if ($null -ne $reader) { $reader.Close() }
+    }
 }
 
 function Test-UmRunClaimIsOwn {
@@ -1298,9 +1351,18 @@ function Invoke-UmRunDrop {
                 # adversary pass 4 A2: the rollback's read keeps the CALLER's error preference (as before this card), so a claim that cannot be read still reads as "no proof
                 # either way" under Stop and as nothing (preserved) under Continue; only the root array is no longer enumerated (Read-UmRunClaim's -ErrorAction Stop is for the
                 # ownership probe, which wants the error).
-                $currentMeta = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json -NoEnumerate
-                $readSucceeded = $true
-                $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
+                # r8 adversary A1: the raw text is kept so a claim stating its nonce twice (the parser keeps the last) is never read as ours
+                # (judged BEFORE the parse: in object mode ConvertFrom-Json throws on two keys that differ only in case, and that throw must not read as "no proof either way" and delete the claim)
+                $currentText = Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii
+                if (-not (Test-UmRunClaimNonceUnambiguous -Text $currentText)) {
+                    $readSucceeded = $true
+                    $ownsClaim = $false
+                } else {
+                    $currentMeta = $null
+                    if ($null -ne $currentText) { $currentMeta = $currentText | ConvertFrom-Json -NoEnumerate }
+                    $readSucceeded = $true
+                    $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
+                }
             } catch {
                 $readSucceeded = $false
             }
@@ -1328,4 +1390,4 @@ function Invoke-UmRunDrop {
     Write-Output "UMRUN_NONCE=$nonce"
 }
 
-Export-ModuleMember -Function Assert-UmRunSideFileName, Test-UmRunTrackedFixtureSource, Get-UmRunFixtureAdmission, Resolve-UmRunRealDirectory, Get-UmRunShareNowUtc, Get-UmRunHeartbeatJobTag, Get-UmRunAgentLiveness, Invoke-UmRunDrop, Read-UmRunClaim, Test-UmRunClaimIsOwn
+Export-ModuleMember -Function Assert-UmRunSideFileName, Test-UmRunTrackedFixtureSource, Get-UmRunFixtureAdmission, Resolve-UmRunRealDirectory, Get-UmRunShareNowUtc, Get-UmRunHeartbeatJobTag, Get-UmRunAgentLiveness, Invoke-UmRunDrop, Read-UmRunClaim, Test-UmRunClaimIsOwn, Test-UmRunClaimNonceUnambiguous
