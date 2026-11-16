@@ -94,12 +94,15 @@ struct PlaybackDueWake::Impl
     // r3 (r2 adversary pass 7 A3): the time the LAST sleepForSmokeRunner spent running sent messages (GUI work, traced as Running,
     // not RunnerSleep); the caller takes it out of the sleep it accounts (lastRunnerSleepDispatchNs)
     qint64 runnerSleepDispatchNs = 0;
-    // r13 (r13 adversary A1): each of those dispatches as [start, end] ns from the sleep's start (lastRunnerSleepDispatchSpansNs)
-    std::vector<std::pair<qint64, qint64>> runnerSleepDispatchSpans;
+    // r13 (r13 adversary A1): each of those dispatches as [start, end]. r15 (r14 adversary A1): in seconds on the CALLER's clock,
+    // read right around the dispatch (lastRunnerSleepDispatchSpansS), never an offset from a second origin stamp
+    std::vector<std::pair<double, double>> runnerSleepDispatchSpans;
     quint64 runnerSleepsWokenOther = 0;
     // r2 G3: runner sleeps whose message wait failed (WAIT_FAILED); the rest of the interval was a plain msleep
     quint64 runnerSleepWaitFailed = 0;
     bool failRunnerSleepWaitForTest = false;
+    // r15 (r14 adversary A1): test seam, a GUI-thread deschedule at the sleep's entry (0 in production)
+    int runnerSleepStartDelayMsForTest = 0;
 #ifdef Q_OS_WIN
     std::vector<MSG> heldWakes;
 #endif
@@ -792,9 +795,12 @@ bool PlaybackDueWake::sendsNotify() const
     return d->delivery == Delivery::NativeMessage && d->mode == PlaybackDueWakeDeliveryMode::SendNotify;
 }
 
-PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long ms )
+PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long ms, double ( *nowS )() )
 {
 #ifdef Q_OS_WIN
+    // r15 (r14 adversary A1): the dispatch spans are stamped on the caller's clock (\a nowS; the wake's own when null) at the
+    // dispatch itself, so a deschedule anywhere before it (the caller's stamps, this entry) never moves a span
+    const auto spanNowS = [this, nowS]() { return nowS ? nowS() : static_cast<double>( d->nowNs() ) / 1000000000.0; };
     d->runnerSleepDispatchNs = 0;
     d->runnerSleepDispatchSpans.clear();
     if( !sendsNotify() ) return RunnerSleep::NotHandled;
@@ -803,6 +809,7 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     // was. MWMO_INPUTAVAILABLE: a sent message already pending at the call returns at once (never a missed wake)
     // r1 adversary pass 1 A5: always a finite wait (INFINITE is 0xFFFFFFFF; a larger unsigned long would truncate)
     const DWORD waitMs = ms >= static_cast<unsigned long>( INFINITE ) ? INFINITE - 1 : static_cast<DWORD>( ms );
+    if( d->runnerSleepStartDelayMsForTest > 0 ) QThread::msleep( static_cast<unsigned long>( d->runnerSleepStartDelayMsForTest ) );
     // r1 adversary pass 2 A2: the wait may also return for a system event with no sent message queued; only a queued sent
     // message ends the sleep early (and is counted), anything else sleeps out the rest of the requested time
     QElapsedTimer slept;
@@ -833,15 +840,18 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
             // (lastRunnerSleepDispatchNs), which takes it out of the runner sleep it accounts
             const size_t heldBefore = d->heldWakes.size();
             noteRunnerSleep( false );
-            const qint64 dispatchStartNs = slept.nsecsElapsed();
+            // r15 (r14 adversary A1): the span is the caller-clock reads on both sides of the dispatch (it encloses the dispatch
+            // and its duration clock); its length, not a separate offset, is what the duration account takes out
+            const double dispatchStartS = spanNowS();
             QElapsedTimer dispatchClock;
             dispatchClock.start();
             d->inRunnerSleepDispatch = true;
             dispatchPendingSentMessages();
             d->inRunnerSleepDispatch = false;
             const qint64 dispatchSpentNs = dispatchClock.nsecsElapsed();
+            const double dispatchEndS = spanNowS();
             d->runnerSleepDispatchNs += dispatchSpentNs;
-            d->runnerSleepDispatchSpans.emplace_back( dispatchStartNs, dispatchStartNs + dispatchSpentNs );
+            d->runnerSleepDispatchSpans.emplace_back( dispatchStartS, std::max( dispatchStartS, dispatchEndS ) );
             if( d->heldWakes.size() > heldBefore )
             {
                 ++d->runnerSleepsWokenBySent;
@@ -858,6 +868,7 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     return RunnerSleep::Slept;
 #else
     Q_UNUSED( ms );
+    Q_UNUSED( nowS );
     return RunnerSleep::NotHandled;
 #endif
 }
@@ -867,7 +878,7 @@ qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const
     return d->runnerSleepDispatchNs;
 }
 
-std::vector<std::pair<qint64, qint64>> PlaybackDueWake::lastRunnerSleepDispatchSpansNs() const
+std::vector<std::pair<double, double>> PlaybackDueWake::lastRunnerSleepDispatchSpansS() const
 {
     return d->runnerSleepDispatchSpans;
 }
@@ -922,6 +933,11 @@ quint64 PlaybackDueWake::runnerSleepWaitFailures() const
 void PlaybackDueWake::setRunnerSleepWaitFailsForTest( bool fails )
 {
     d->failRunnerSleepWaitForTest = fails;
+}
+
+void PlaybackDueWake::setRunnerSleepStartDelayMsForTest( int ms )
+{
+    d->runnerSleepStartDelayMsForTest = ms > 0 ? ms : 0;
 }
 
 const char *PlaybackDueWake::deliveryKindName() const

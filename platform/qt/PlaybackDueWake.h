@@ -472,15 +472,20 @@ public:
      *  (runnerSleepsWokenOther, once per interruption) and the sleep goes on for the rest of \a ms, so the cadence never shortens.
      *  r2 G3: a failed wait (WAIT_FAILED) sleeps the rest of \a ms with QThread::msleep (counted runnerSleepWaitFailures). */
     enum class RunnerSleep { NotHandled, Slept, WokenBySent };
-    RunnerSleep sleepForSmokeRunner( unsigned long ms );
+    /*! r15 (r14 adversary A1): \a nowS is the caller's clock in seconds (MainWindow passes the stage clock); the dispatch spans
+     *  (lastRunnerSleepDispatchSpansS) are read on it. Null: the wake's own clock. */
+    RunnerSleep sleepForSmokeRunner( unsigned long ms, double ( *nowS )() = nullptr );
     /*! r3 (r2 adversary pass 7 A3): the nanoseconds the LAST sleepForSmokeRunner spent dispatching sent messages (0 when it
      *  dispatched none, or returned NotHandled). That dispatch is GUI work: the trace says Running while it runs, and the caller
      *  takes this time out of the runner sleep it accounts (MainWindow::sleepGuiThreadForSmokeRunner). */
     qint64 lastRunnerSleepDispatchNs() const;
     /*! HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r13 (r13 adversary A1): WHERE the LAST sleepForSmokeRunner ran those
-     *  dispatches, each as [start, end] nanoseconds from that call's start, in order (empty when it dispatched none). The caller
-     *  splits the runner-sleep interval it records around them, so a dispatch is never timed as sleep at the wrong position. */
-    std::vector<std::pair<qint64, qint64>> lastRunnerSleepDispatchSpansNs() const;
+     *  dispatches, each as [start, end], in order (empty when it dispatched none). The caller splits the runner-sleep interval
+     *  it records around them, so a dispatch is never timed as sleep at the wrong position.
+     *  r15 (r14 adversary A1 on a27f3d88): ABSOLUTE seconds on the clock that call was given (its \a nowS), each read right
+     *  around its dispatch. Before r15 they were offsets from the sleep's own timer start, which the caller added to an origin
+     *  it had stamped earlier, so a GUI deschedule between the two stamps shifted every span early. */
+    std::vector<std::pair<double, double>> lastRunnerSleepDispatchSpansS() const;
     /*! GUI thread: fire the wakes the runner sleep held (through the gate), then dispatch the pending SENT messages (the
      *  wake's window procedure runs here), and nothing else -- posted messages stay queued for the caller's next processEvents. */
     void dispatchSentMessages();
@@ -496,6 +501,9 @@ public:
     quint64 runnerSleepWaitFailures() const;
     /*! Test hook: make the runner sleep's message wait return WAIT_FAILED (the OS failure cannot be injected otherwise). */
     void setRunnerSleepWaitFailsForTest( bool fails );
+    /*! Test hook, r15 (r14 adversary A1): the runner sleep is descheduled this long at its entry, before its wait starts (the
+     *  window in which a caller-side origin stamp and the sleep's own clock used to disagree). 0 (production): no pause. */
+    void setRunnerSleepStartDelayMsForTest( int ms );
 
 private:
     struct Impl;

@@ -5257,9 +5257,10 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
     // FULLSCREEN-S1S2-PRESENT-GAP-1: with the sent wake (the default) the sleep is a QS_SENDMESSAGE wait the wake ends early,
     // as the application's own QS_ALLINPUT wait would (PlaybackDueWake::sleepForSmokeRunner); every other delivery, and no
     // wake at all, sleeps exactly as before. The woken wake runs after this sleep is accounted, never inside it.
-    const double hopDueWakeSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;   // r13: the dispatch spans' origin
-    const PlaybackDueWake::RunnerSleep runnerSleep =
-        m_playbackDueWake ? m_playbackDueWake->sleepForSmokeRunner( ms ) : PlaybackDueWake::RunnerSleep::NotHandled;
+    // r15 (r14 adversary A1 on a27f3d88): the dispatch spans are read on this stage clock inside the sleep, right around each
+    // dispatch, so no origin stamped here (before a possible deschedule) places them
+    const PlaybackDueWake::RunnerSleep runnerSleep = m_playbackDueWake
+        ? m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); } ) : PlaybackDueWake::RunnerSleep::NotHandled;
     if( runnerSleep == PlaybackDueWake::RunnerSleep::NotHandled )
     {
         if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( true );
@@ -5275,18 +5276,18 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
     // interval ends when the sleep ends, before the woken wake runs below. The sent messages the sleep dispatched are GUI
     // work, so they are taken out of this third sleep account too.
     // r13 (r13 adversary A1 on 04c1337b): at their actual position -- one RunnerSleep interval per slept segment, split
-    // around each dispatch span (lastRunnerSleepDispatchSpansNs, from the due-wake sleep's start). No dispatch (the common
-    // case) is the plain [start, now] interval.
+    // around each dispatch span (lastRunnerSleepDispatchSpansS: absolute seconds on this stage clock, r15). No dispatch (the
+    // common case) is the plain [start, now] interval.
     if( m_playbackSmokeActive && hopSleepStartS > 0.0 )
     {
         const double hopSleepEndS = mlv_stage_timing_now();
         double hopSegmentStartS = hopSleepStartS;
-        if( dispatchNs > 0 && hopDueWakeSleepStartS > 0.0 )
+        if( dispatchNs > 0 )
         {
-            for( const std::pair<qint64, qint64> &span : m_playbackDueWake->lastRunnerSleepDispatchSpansNs() )
+            for( const std::pair<double, double> &span : m_playbackDueWake->lastRunnerSleepDispatchSpansS() )
             {
-                const double spanStartS = std::min( hopSleepEndS, hopDueWakeSleepStartS + static_cast<double>( span.first ) * 1e-9 );
-                const double spanEndS = std::min( hopSleepEndS, hopDueWakeSleepStartS + static_cast<double>( span.second ) * 1e-9 );
+                const double spanStartS = std::min( hopSleepEndS, span.first );
+                const double spanEndS = std::min( hopSleepEndS, span.second );
                 if( spanStartS > hopSegmentStartS )
                     m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSegmentStartS, spanStartS );
                 hopSegmentStartS = std::max( hopSegmentStartS, spanEndS );

@@ -1024,7 +1024,8 @@ TEST(GpuPresentTailTiming, RefusalsAbandonTheWindowAndRunnerSleepsReachIt)
     // work, so its time (lastRunnerSleepDispatchNs) is taken out of BOTH sleep accounts. In source order: the stopwatch starts,
     // both sleeps run, the dispatch time is read, the one elapsed read subtracts it, and that read reaches the tail window.
     const int startAt = helper.indexOf(QStringLiteral("slept.start();"));
-    const int sentSleepAt = helper.indexOf(QStringLiteral("m_playbackDueWake->sleepForSmokeRunner( ms )"));
+    // r15 (r14 adversary A1): the sleep is given the stage clock its dispatch spans are read on
+    const int sentSleepAt = helper.indexOf(QStringLiteral("m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); } )"));
     const int sleepAt = helper.indexOf(QStringLiteral("QThread::msleep( ms );"));
     const int dispatchAt = helper.indexOf(QStringLiteral("m_playbackDueWake->lastRunnerSleepDispatchNs()"));
     const int readAt = helper.indexOf(QStringLiteral(

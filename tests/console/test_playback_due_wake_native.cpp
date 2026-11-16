@@ -2137,7 +2137,7 @@ TEST(PlaybackDueWakeSend, TheRunnerSleepIsTheSentWaitWithTheMsleepKeptForEveryOt
     const QString helper = functionBody( source, QStringLiteral( "void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )" ),
                                          QStringLiteral( "void MainWindow::presentPlaybackPreparedFrame(" ) );
     ASSERT_FALSE( helper.isEmpty() );
-    const int sent = helper.indexOf( QStringLiteral( "m_playbackDueWake->sleepForSmokeRunner( ms )" ) );
+    const int sent = helper.indexOf( QStringLiteral( "m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); } )" ) );
     const int notHandled = helper.indexOf( QStringLiteral( "if( runnerSleep == PlaybackDueWake::RunnerSleep::NotHandled )" ) );
     const int msleep = helper.indexOf( QStringLiteral( "QThread::msleep( ms );" ) );
     const int accounted = helper.indexOf( QStringLiteral( "GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );" ) );
@@ -2339,6 +2339,55 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     // a sleep that dispatched nothing returns 0
     ASSERT_TRUE( wake.sleepForSmokeRunner( 5 ) == PlaybackDueWake::RunnerSleep::Slept );
     ASSERT_EQ( static_cast<qint64>( 0 ), wake.lastRunnerSleepDispatchNs() );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeSend, R15A1_ADescheduleBeforeTheSleepStartsNeverShiftsTheDispatchSpan)
+{
+    // r14 adversary A1 on a27f3d88, its input: SendNotify delivery, a 150 ms runner sleep, the GUI thread descheduled 20 ms
+    // between the caller's origin stamp and the sleep's own timer start, a foreign handler dispatched inside the sleep. The
+    // caller placed the excluded span at origin + offset, 20 ms before the handler really ran.
+#ifdef Q_OS_WIN
+    PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
+    ASSERT_TRUE( wake.sendsNotify() );
+    R3A3Foreign foreign;
+    foreign.wake = &wake;
+    g_r3a3Foreign = &foreign;
+    static const wchar_t *kClass = L"MlvR15A1ForeignHandler";
+    WNDCLASSW wc {};
+    wc.lpfnWndProc = r3a3ForeignProc;
+    wc.hInstance = GetModuleHandleW( nullptr );
+    wc.lpszClassName = kClass;
+    RegisterClassW( &wc );
+    const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
+    ASSERT_TRUE( window != nullptr );
+    wake.setGuiTraceActive( true );
+    wake.setRunnerSleepStartDelayMsForTest( 20 );
+    std::atomic<bool> sent { false };
+    std::thread sender( [window, &sent]() {
+        Sleep( 50 );
+        sent = SendNotifyMessageW( window, kR3A3ForeignMessage, 0, 0 ) != 0;
+    } );
+    // r15: the caller hands the sleep its own clock (seconds); the spans come back on it, with no origin of the caller's
+    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 150, []() { return dueWakeQpcNowMs() / 1000.0; } );
+    sender.join();
+    wake.setRunnerSleepStartDelayMsForTest( 0 );
+    wake.setGuiTraceActive( false );
+    g_r3a3Foreign = nullptr;
+    DestroyWindow( window );
+    ASSERT_TRUE( sent.load() );
+    ASSERT_EQ( 1, foreign.calls );
+    ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
+    const std::vector<std::pair<double, double>> spans = wake.lastRunnerSleepDispatchSpansS();
+    ASSERT_EQ( static_cast<size_t>( 1 ), spans.size() );
+    const double spanStartMs = spans[0].first * 1000.0;
+    const double spanEndMs = spans[0].second * 1000.0;
+    // the excluded span is where the handler ran: it starts at (just before) the handler and covers its >= 30 ms of work
+    ASSERT_TRUE( spanStartMs <= foreign.handlerStartMs + 0.5 );
+    ASSERT_TRUE( foreign.handlerStartMs - spanStartMs < 5.0 );
+    ASSERT_TRUE( spanEndMs >= foreign.handlerStartMs + 29.0 );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif
