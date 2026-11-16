@@ -1233,7 +1233,12 @@ function Invoke-UmRunDrop {
                                         if ([string]::IsNullOrEmpty($srcText)) {
                                             $srcReadable = $false
                                             $srcInner = $(if ($null -ne $srcReadErr) { $srcReadErr.Exception.InnerException } else { $null })
-                                            if ($null -ne $srcInner -and ($srcInner -is [IO.FileNotFoundException] -or $srcInner -is [IO.DirectoryNotFoundException])) { throw $srcReadErr }
+                                            if ($null -ne $srcInner -and ($srcInner -is [IO.FileNotFoundException] -or $srcInner -is [IO.DirectoryNotFoundException])) {
+                                                # r11 adversary pass 11 A1: the first rename can land late AFTER this pass's delivered check (line above the owner read) and before this open, which
+                                                # also leaves the temp gone; a claim that already holds exactly these bytes is delivered, never a missing-source failure
+                                                if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
+                                                throw $srcReadErr
+                                            }
                                         }
                                         elseif (-not [string]::Equals($srcText, $metaJson, [StringComparison]::Ordinal)) {
                                             throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json's re-publish temporary changed between its verification and the move; refusing to publish it"
@@ -1260,6 +1265,8 @@ function Invoke-UmRunDrop {
                                             }
                                         }
                                     } elseif ($moveAttempt -ge $script:UmRunMoveAttempts) {
+                                        # r11 adversary pass 11 A1 (sibling): a late landing after this last pass's delivered check is delivered, not an unprovable or unreadable claim
+                                        if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
                                         $prior = $(if ($null -ne $moveDenial) { " priorCause=$($moveDenial.cause) priorProbe=$($moveDenial.probe)" } else { '' })
                                         if (-not $srcReadable) {
                                             $srcWhy = $(if ($null -ne $srcReadErr) { ($srcReadErr.Exception.Message -replace '\s+', ' ') } else { 'the temporary read back empty' })

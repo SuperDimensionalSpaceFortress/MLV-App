@@ -638,6 +638,19 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             # first rename is refused); pass 2 may rewrite the claim in place ('write'), let the first rename land late ('land': release, then move the temp over
             # the claim) and/or let go ('release').
             "$state = @{}\n"
+            # r11 adversary pass 11 A1: 'landAfterOwnership' = N lets the first rename land LATE, in the gap after pass N's delivered check and claim-owner read and before its
+            # source open (no hook sits there, so the module's Get-UmRunClaimOwnership is wrapped): the hold is released, then the temp is moved over the claim. 'ownerUnknown'
+            # makes the wrapper answer UNKNOWN on every pass (a claim the drop cannot read), so the late landing meets the final attempt's refusal branches.
+            "if ($c.repub.seam.landAfterOwnership) { $state.own = 0; $state.h = $null; & (Get-Module UmRunDrop) { param($st, $unknownAlways, $lastAttempt)\n"
+            "  $script:DvSt = $st; $script:DvUnknown = $unknownAlways; $script:DvLast = $lastAttempt; $script:DvOrig = ${function:Get-UmRunClaimOwnership}\n"
+            "  function script:Get-UmRunClaimOwnership { param([string]$Path, [string]$Nonce)\n"
+            "    $r = & $script:DvOrig -Path $Path -Nonce $Nonce\n"
+            "    if ($script:DvUnknown) { $r = 'UNKNOWN' }\n"
+            "    $script:DvSt.own = 1 + [int]$script:DvSt.own\n"
+            "    if ($script:DvSt.own -eq $script:DvLast) {\n"
+            "      if ($null -ne $script:DvSt.h) { $script:DvSt.h.Dispose(); $script:DvSt.h = $null }\n"
+            "      $t = Get-ChildItem -LiteralPath (Split-Path -Parent $Path) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $Path, $true) }\n"
+            "    $r } } $state ([bool]$c.repub.seam.ownerUnknown) ([int]$c.repub.seam.landAfterOwnership) }\n"
             "if ($null -ne $c.repub.seam) { $p.TestHookBeforeMetaReplaceAttempt = { param($a, $d)\n"
             # adversary pass 6 A3: 'holdSource' holds the re-publish TEMP (reads allowed, no Delete sharing) from pass 1 on instead of the claim, so the destination is healthy;
             # 'noHold' takes no handle at all (the first rename is not denied)
@@ -1144,6 +1157,24 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         self.assertEqual(r["threw"], "", r)
         self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
         self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"])
+
+    def test_a_first_rename_that_lands_between_the_ownership_read_and_the_source_open_is_delivered(self) -> None:
+        # r11 adversary pass 11 A1 (introduced): the late landing of pass 1's rename can fall AFTER pass 2's delivered check and claim-owner read (OWN, the claim already
+        # carries these bytes and this nonce) and BEFORE its source open; the temp is then gone, the open throws FileNotFoundException, and that was rethrown with no
+        # delivered recheck, so the drop refused (and rolled back) a claim that had been delivered. RED before the fix: threw FileNotFoundException.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"landAfterOwnership": 2}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"])
+
+    def test_a_first_rename_that_lands_during_the_final_attempt_of_an_unprovable_claim_is_delivered(self) -> None:
+        # r11 adversary pass 11 A1, sibling branches (the final attempt's OWNERSHIP_UNPROVEN and SOURCE_UNREADABLE refusals): the claim could not be proven ours on any
+        # pass, and the first rename lands late during the LAST one, after its delivered check. The refusal must recheck delivery before it throws. RED before the fix:
+        # threw UMRUN_MOVE_ACCESS_DENIED ... cause=OWNERSHIP_UNPROVEN over a claim that holds exactly the republished bytes.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"noHold": True, "ownerUnknown": True, "landAfterOwnership": self.ATTEMPTS}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
         self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"])
 
     def test_the_denial_classifier_survives_the_destination_vanishing_while_it_probes(self) -> None:
