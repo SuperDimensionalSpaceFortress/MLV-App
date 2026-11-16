@@ -668,12 +668,21 @@ $CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords +
 # r10 pass 7 A1: a STRONG key takes ANY value that is not itself a boolean or null word: '$hunter2', '@hunter2', 'false-password', 'null-secret' and a multi-word
 # YAML passphrase are credentials (a false positive costs one dropped file named in SECRET-SCAN.txt; a miss ships a secret). The boolean test is for the
 # WHOLE word (followed by a space, quote, comma, semicolon or the end), not a prefix. TOKEN keys keep the code-looking-start guard and the 4+ not-all-digits rule.
-$CredentialBoolGuard = '(?!(?:true|false|null|none|nil|undefined)(?=[\s"'',;]|$))'
+# r12 A2: "the WHOLE word" means the word ends the VALUE: only blanks, then a quote, comma, semicolon, '#' comment, line break or the end may follow it. A space
+# followed by more text ('@set DB_PASSWORD=false hunter2', a cmd multi-word value) is a value that merely starts with a boolean word, so it is still a credential.
+$CredentialBoolGuard = '(?!(?:true|false|null|none|nil|undefined)(?=[ \t]*(?:[#;,"'']|\r|\n|$)))'
 $CredentialTokenGuard = '(?![\$\(%@\{\[<])' + $CredentialBoolGuard
 $CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialBoolGuard + '[^\s"'',;]+'
 $CredentialUnquotedTokenPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialTokenGuard + '(?!\d+\b)[^\s"'',;]{4,}'
 $CredentialYamlPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+(?!(?:true|false|null|none|nil|undefined|~)[ \t]*(?:#[^\r\n]*)?\r?$)[^\s#][^\r\n]*'
 $CredentialYamlTokenPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialTokenGuard + '(?!~)(?!\d+\b)[^\s"'',;#]{4,}[ \t]*(?:#[^\r\n]*)?\r?$'
+# r12 A1: a YAML / JSON FLOW mapping ('{password: hunter2}', 'svc: { api_key: x }', '{name: svc, password: hunter2}'): the key follows a '{' or a ',' on the same line, not the
+# start of the line, so the block-style YAML patterns above never see it. An unquoted value that is a boolean / null word ending at the next ',' '}' ']' or '#' is not a
+# value ('{has_password: true, n: 1}'); a quoted value is the name/value pattern's job. A STRONG key takes any other value (fail closed, like the block form); a TOKEN key
+# keeps the code-looking-start guard and the 4+ characters, not-all-digits rule.
+$CredentialFlowBoolGuard = '(?!(?:true|false|null|none|nil|undefined|~)[ \t]*(?:[,}\]#]|\r|\n|$))'
+$CredentialFlowPattern = '(?i)[{,][ \t]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]*' + $CredentialFlowBoolGuard + '[^\s,}\]#"''][^,}\r\n]*'
+$CredentialFlowTokenPattern = '(?i)[{,][ \t]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]*(?![\$\(%@\{\[<])' + $CredentialFlowBoolGuard + '(?!\d+\b)[^\s"'',;}\]#]{4,}'
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 $SecretPatterns = @(
@@ -683,7 +692,7 @@ $SecretPatterns = @(
     # A secret VALUE under a name that says what it is (adversary pass 2, A15): an AWS secret access key has no recognisable shape of its own.
     # r3 A4: the name list also covers API/ACCESS/AUTH key, TOKEN and CREDENTIAL; either quote style; a value of 4 or more characters (a short
     # password is still a password). The same text is the host-side credential test Import applies (Test-CredentialText).
-    $CredentialNameValuePattern, $CredentialUnquotedPattern, $CredentialUnquotedTokenPattern, $CredentialYamlPattern, $CredentialYamlTokenPattern
+    $CredentialNameValuePattern, $CredentialUnquotedPattern, $CredentialUnquotedTokenPattern, $CredentialYamlPattern, $CredentialYamlTokenPattern, $CredentialFlowPattern, $CredentialFlowTokenPattern
 )
 $script:SecretRegex = [regex]::new(($SecretPatterns -join '|'))
 
@@ -723,6 +732,16 @@ $ExcludeDirs = @('.git', 'node_modules', '__pycache__', 'worktrees', 'ssh', 'ope
 # unreadable file used to be scanned as empty text and then archived). A file that cannot be removed is reported as Uncleared, and the
 # caller refuses to write the bundle.
 # p5 A9: the verdict on ONE staged file, shared by the scan and by the post-archive re-check: '' = clean, else the reason it must not ship.
+# r12 A4: the path of $Full below $Root. Both are normalised first (GetFullPath: '..' and '.' parts, doubled separators): Get-ChildItem returns normalised FullName values,
+# so a Substring by the length of an un-normalised root (-StateRoot C:\x\..\x) cut the wrong number of characters and mapped a file to a different folder.
+function Get-RelativeUnder {
+    param([string]$Root, [string]$Full)
+    $r = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $f = [IO.Path]::GetFullPath($Full)
+    if (-not $f.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "path $Full is not below $Root" }
+    return $f.Substring($r.Length).TrimStart('\')
+}
+
 function Get-StagedFileVerdict {
     param([System.IO.FileInfo]$File, [long]$MaxScanBytes = 26214400)
     return (Get-StagedFileVerdictDetail -File $File -MaxScanBytes $MaxScanBytes).Why
@@ -746,7 +765,7 @@ function Get-StagedCredentialHits {
     $hits = [System.Collections.Generic.List[string]]::new()
     foreach ($f in @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)) {
         $why = Get-StagedFileVerdict -File $f -MaxScanBytes $MaxScanBytes
-        if ($why) { $hits.Add("$($f.FullName.Substring($Stage.Length).TrimStart('\')) ($why)") }
+        if ($why) { $hits.Add("$(Get-RelativeUnder $Stage $f.FullName) ($why)") }
     }
     return $hits.ToArray()
 }
@@ -793,7 +812,7 @@ function Invoke-StagedSecretScan {
     $typed = [System.Collections.Generic.List[string]]::new()
     # -Force: robocopy copies Hidden and System files, and Get-ChildItem hides them by default (adversary pass 2, A3).
     foreach ($f in @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)) {
-        $rel = $f.FullName.Substring($Stage.Length).TrimStart('\')
+        $rel = Get-RelativeUnder $Stage $f.FullName
         $v = Get-StagedFileVerdictDetail -File $f -MaxScanBytes $MaxScanBytes
         $why = $v.Why
         if (-not $why) { continue }
@@ -988,10 +1007,11 @@ function Move-ForeignClaims {
 function Get-ImportCredentialSkips {
     param([string]$SourceDir, [string]$DestDir, [long]$MaxScanBytes = 26214400)
     $skips = [System.Collections.Generic.List[object]]::new()
+    $SourceDir = [IO.Path]::GetFullPath($SourceDir); $DestDir = [IO.Path]::GetFullPath($DestDir)   # r12 A4: '..' parts would shift every relative path
     if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) { return @() }
     $roleRx = [regex]::new('(?i)(' + $CredentialNameWords + ')')
     foreach ($f in @(Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force -ErrorAction SilentlyContinue)) {
-        $rel = $f.FullName.Substring($SourceDir.TrimEnd('\').Length).TrimStart('\')
+        $rel = Get-RelativeUnder $SourceDir $f.FullName
         $dest = Join-Path $DestDir $rel
         $reason = ''
         $srcText = $null
@@ -1042,11 +1062,16 @@ function Copy-ImportFileLocked {
         try { $fs = [IO.File]::Open($Dest, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $created = $true }
         catch [System.IO.IOException] { if (-not [IO.File]::Exists($Dest)) { throw } }
         if ($created) {
-            try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() }
+            # r12 A5: the timestamps are set THROUGH the handle that is still held (nothing can save into the file between the write and its timestamp, and a later
+            # import's /XO rule reads the file's real time). The old order released the lock first and set the time by path, which backdated an editor's save.
+            try {
+                $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
+                [IO.File]::SetCreationTimeUtc($fs.SafeFileHandle, $Source.CreationTimeUtc)
+                [IO.File]::SetLastWriteTimeUtc($fs.SafeFileHandle, $Source.LastWriteTimeUtc)
+                if ($script:ImportAfterWriteHook) { & $script:ImportAfterWriteHook $Dest }
+            }
             catch { $fs.Dispose(); $fs = $null; Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue; throw }
             $fs.Dispose(); $fs = $null
-            [IO.File]::SetCreationTimeUtc($Dest, $Source.CreationTimeUtc)
-            [IO.File]::SetLastWriteTimeUtc($Dest, $Source.LastWriteTimeUtc)
             $keepAttr = $Source.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)
             if ($keepAttr) { [IO.File]::SetAttributes($Dest, ([IO.File]::GetAttributes($Dest) -bor $keepAttr)) }
             return @{ Result = 'created' }
@@ -1065,8 +1090,9 @@ function Copy-ImportFileLocked {
         [void]$fs.Seek(0, [IO.SeekOrigin]::Begin)
         $fs.SetLength(0)
         $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
+        [IO.File]::SetLastWriteTimeUtc($fs.SafeFileHandle, $Source.LastWriteTimeUtc)   # r12 A5: through the held handle, before the lock is released
+        if ($script:ImportAfterWriteHook) { & $script:ImportAfterWriteHook $Dest }
         $fs.Dispose(); $fs = $null
-        [IO.File]::SetLastWriteTimeUtc($Dest, $Source.LastWriteTimeUtc)
         return @{ Result = 'replaced' }
     } finally { if ($fs) { $fs.Dispose() } }
 }
@@ -1079,6 +1105,9 @@ function Copy-ImportFileLocked {
 #       IMPORT_DEST_CHANGED_SKIPPED <path> and the run fails (exit 1).
 function Invoke-ImportRobocopy {
     param([string]$From, [string]$To, [string[]]$Extra = @())
+    # r12 A4: every path is normalised once, here: the tree walk below slices FullName values (always normalised) by the length of $From, and the /XF /XD paths are compared
+    # with those same FullName values, so a '..' or '.' part in -StateRoot or the bundle path must not survive.
+    $From = [IO.Path]::GetFullPath($From); $To = [IO.Path]::GetFullPath($To)
     $skips = @(Get-ImportCredentialSkips -SourceDir $From -DestDir $To)
     foreach ($s in $skips) {
         Write-Log "IMPORT_SKIPPED_CREDENTIAL_FILE $($s.Dest) ($($s.Reason); the bundle copy $($s.Source) was not applied)" 'WARN'
@@ -1092,8 +1121,8 @@ function Invoke-ImportRobocopy {
             $mode = ''
             switch -Regex ($tok.ToUpperInvariant()) { '^/(E|S)$' { $recurse = $true } '^/XN$' { $exN = $true } '^/XO$' { $exO = $true } '^/XC$' { $exC = $true } '^/XF$' { $mode = 'F' } '^/XD$' { $mode = 'D' } }
         }
-        elseif ($mode -eq 'F') { if ($tok -match '[\\:]') { $xfPaths.Add($tok.TrimEnd('\')) } else { $xfNames.Add($tok) } }
-        elseif ($mode -eq 'D') { $xdPaths.Add($tok.TrimEnd('\')) }
+        elseif ($mode -eq 'F') { if ($tok -match '[\\:]') { $xfPaths.Add([IO.Path]::GetFullPath($tok).TrimEnd('\')) } else { $xfNames.Add($tok) } }
+        elseif ($mode -eq 'D') { $xdPaths.Add($(if ($tok -match '[\\:]') { [IO.Path]::GetFullPath($tok).TrimEnd('\') } else { $tok })) }
     }
     # Test seam: runs between the inspection above and the replace below (the window an editor can save a credential into). Null in every real run.
     if ($script:ImportBeforeReplaceHook) { & $script:ImportBeforeReplaceHook $From $To }
@@ -1105,7 +1134,7 @@ function Invoke-ImportRobocopy {
     $stack.Push($root)
     while ($stack.Count) {
         $dir = $stack.Pop()
-        $rel = $dir.Substring($root.Length).TrimStart('\')
+        $rel = $(if ($dir -ieq $root) { '' } else { Get-RelativeUnder $root $dir })
         $destDir = $(if ($rel) { Join-Path $To $rel } else { $To })
         try { [void][IO.Directory]::CreateDirectory($destDir) }
         catch { $n.failed++; Write-Log "IMPORT_COPY_FAILED $destDir :: $($_.Exception.Message)" 'ERROR'; $script:Failures.Add("IMPORT_COPY_FAILED $destDir"); continue }
@@ -1149,6 +1178,45 @@ $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
 $script:ImportSettingsApplied = $false
 # Test seam for r11 S-B2 (see Invoke-ImportRobocopy): a scriptblock called with (From, To) between the inspection and the replace. Always $null in a real run.
 $script:ImportBeforeReplaceHook = $null
+# Test seams for r12 A3 / A5: a scriptblock called with the destination path (a) after Copy-ImportFileLocked wrote the bytes and set the timestamps, while the host file is still
+# locked; (b) after the settings.json profile rewrite read the file, before it writes. Both stand for an editor saving into the host file; always $null in a real run.
+$script:ImportAfterWriteHook = $null
+$script:ImportSettingsRewriteHook = $null
+
+# r12 A3: the settings.json profile rewrite (VIRTUAL-TEN profile -> this profile) as ONE locked read-judge-write on the host file, the same discipline as
+# Copy-ImportFileLocked: the file is opened exclusively (FileShare.None), read, judged by Test-CredentialText, and written back through the SAME handle. It used to be
+# ReadAllText then WriteAllText, so an editor saving a credential between the two had it overwritten with the older clean text.
+# Returns @{ Result = 'rewritten'|'changed'; Why }. 'changed' (cannot be locked, larger than the scan limit, carries a credential) leaves the file as it is and records the
+# typed IMPORT_DEST_CHANGED_SKIPPED <path> failure.
+function Update-ImportedSettingsLocked {
+    param([string]$Path, [string]$FromProfile, [string]$ToProfile, [long]$MaxScanBytes = 26214400)
+    $fs = $null
+    $why = ''
+    try {
+        try { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+        catch { $why = "host file cannot be locked for the rewrite ($($_.Exception.Message))" }
+        if (-not $why) {
+            if ($fs.Length -gt $MaxScanBytes) { $why = 'host file larger than the scan limit' }
+            else {
+                $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8, $true, 4096, $true)
+                try { $text = $rd.ReadToEnd() } finally { $rd.Dispose() }
+                if (Test-CredentialText $text) { $why = 'host file carries a credential' }
+            }
+        }
+        if (-not $why) {
+            if ($script:ImportSettingsRewriteHook) { & $script:ImportSettingsRewriteHook $Path }
+            $new = $text.Replace(($FromProfile -replace '\\', '/'), ($ToProfile -replace '\\', '/')).Replace(($FromProfile -replace '\\', '\\'), ($ToProfile -replace '\\', '\\'))
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes($new)
+            [void]$fs.Seek(0, [IO.SeekOrigin]::Begin)
+            $fs.SetLength(0)
+            $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
+            return @{ Result = 'rewritten' }
+        }
+    } finally { if ($fs) { $fs.Dispose() } }
+    Write-Log "IMPORT_DEST_CHANGED_SKIPPED $Path ($why; the settings.json profile rewrite was not applied, the host file was left as it is)" 'ERROR'
+    $script:Failures.Add("IMPORT_DEST_CHANGED_SKIPPED $Path")
+    return @{ Result = 'changed'; Why = $why }
+}
 
 # r10 pass 7 A2: read the file ONCE, judge those bytes, and write those same bytes (a host editor saving a credential between a check and a Copy-Item
 # can no longer put it into the backup). $true = written; $false = carries a credential, unreadable, or could not be written (nothing is left behind).
@@ -1246,9 +1314,8 @@ function Invoke-PhaseImport {
             Write-Log "skipped the settings.json profile rewrite: the bundle's settings.json was not applied (absent from the bundle, older than the host's, or IMPORT_SKIPPED_CREDENTIAL_FILE), the host's file stays as it is"
         } else {
         Invoke-Step "Rewrite $SourceUserProfile -> $h in ~/.claude/settings.json" {
-            $p = "$h\.claude\settings.json"; $t = [IO.File]::ReadAllText($p)
-            $t = $t.Replace('C:/Users/obabalola', ($h -replace '\\', '/')).Replace('C:\\Users\\obabalola', ($h -replace '\\', '\\'))
-            [IO.File]::WriteAllText($p, $t, [Text.UTF8Encoding]::new($false))
+            # r12 A3: one locked read-judge-write (Update-ImportedSettingsLocked); a file it cannot lock, or that gained a credential, stays as it is with a typed failure.
+            [void](Update-ImportedSettingsLocked -Path "$h\.claude\settings.json" -FromProfile $SourceUserProfile -ToProfile $h)
         }
         }
         Write-Log "profile differs from VIRTUAL-TEN ($SourceUserProfile). The TRACKED $Repo\.claude\settings.json hard-codes C:/Users/obabalola/AppData/Local/Python/bin/python.exe, so project hooks will fail here. Prefer an OS user named obabalola; else fix the project file in a PR." 'MANUAL'

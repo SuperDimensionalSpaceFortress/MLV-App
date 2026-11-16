@@ -1036,6 +1036,117 @@ Assert-That ($b2e.Out.Contains("IMPORT_DEST_CHANGED_SKIPPED $b2eSvc")) 'r11 S-B2
 Assert-That ($b2e.Exit -eq 1 -and ([IO.File]::ReadAllText($b2eSvc)) -ceq '{}') 'r11 S-B2 import (end to end): the run fails (exit 1) and the held host file is untouched' "exit=$($b2e.Exit)"
 Assert-That (Test-Path -LiteralPath (Join-Path $b2eHome '.claude\CLAUDE.md')) 'r11 S-B2 import (end to end): the other files still come across after one is skipped' $b2e.Out
 
+# ================================================================ r12 (head 15c4ee5e): adversary pass 8, A1-A5
+# ---------------------------------------------------------------- r12 A1: a YAML / JSON FLOW mapping ({password: hunter2}) is a credential line; A2: a boolean word is a whole value, not a prefix
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r12 A1')) {
+    $r12Hit = [ordered]@{
+        'A1 flow mapping {password: hunter2}'            = '{password: hunter2}'
+        'A1 flow mapping, secret after another pair'     = '{name: svc, password: hunter2}'
+        'A1 flow mapping nested in a block line'         = 'service: { api_key: abc123def }'
+        'A1 flow mapping, TOKEN key'                     = '{token: abcd1234efgh}'
+        'A2 cmd set DB_PASSWORD=false <words>'           = '@set DB_PASSWORD=false hunter2'
+        'A2 cmd set DB_PASSWORD=null <words>'            = '@set DB_PASSWORD=null secretphrase'
+        'A2 cmd set AUTH_TOKEN=null <words>'             = 'set AUTH_TOKEN=null secretphrase'
+        'A2 dotenv DB_PASSWORD=true <words>'             = 'DB_PASSWORD=true hunter2'
+    }
+    $r12Ok = [ordered]@{
+        'A1 flow mapping, boolean value'                 = '{password: false}'
+        'A1 flow mapping, boolean flag key'              = '{name: svc, has_password: true, other: 1}'
+        'A1 flow mapping, null value'                    = '{secret: null}'
+        'A1 flow mapping, no secret key'                 = '{name: svc, port: 8080}'
+        'A2 bare boolean'                                = 'DB_PASSWORD=false'
+        'A2 boolean then a comment'                      = 'DB_PASSWORD=false # off'
+        'A2 boolean then the next line'                  = "DB_PASSWORD=false`nOTHER=1"
+        'A2 boolean then a semicolon'                    = 'DB_PASSWORD=null;'
+    }
+    foreach ($k in $r12Hit.Keys) { Assert-That (Test-CredentialText $r12Hit[$k]) "r12 $k is a credential (Test-CredentialText)" $r12Hit[$k] }
+    foreach ($k in $r12Ok.Keys) { Assert-That (-not (Test-CredentialText $r12Ok[$k])) "r12 $k is not a credential" $r12Ok[$k] }
+    # the same line through the Export stage scan, the Import bundle guard and the Import host guard
+    $a1Stage = New-Scratch 'r12-a1-stage'
+    [IO.File]::WriteAllText((Join-Path $a1Stage 'service.yaml'), '{password: hunter2}')
+    Assert-That (@(Get-StagedCredentialHits -Stage $a1Stage).Count -eq 1) 'r12 A1 export: a staged service.yaml holding {password: hunter2} is a hit'
+    $a1Src = New-Scratch 'r12-a1-src'; $a1Dst = New-Scratch 'r12-a1-dst'
+    [IO.File]::WriteAllText((Join-Path $a1Src 'bundle.yaml'), '{password: hunter2}')
+    [IO.File]::WriteAllText((Join-Path $a1Src 'host.yaml'), 'clean: 1')
+    [IO.File]::WriteAllText((Join-Path $a1Dst 'host.yaml'), '{password: hunter2}')
+    $a1Skips = @(Get-ImportCredentialSkips -SourceDir $a1Src -DestDir $a1Dst)
+    Assert-That (@($a1Skips | Where-Object { $_.Source -like '*bundle.yaml' }).Count -eq 1 -and @($a1Skips | Where-Object { $_.Source -like '*host.yaml' -and $_.Reason -like 'host file carries a credential' }).Count -eq 1) 'r12 A1 import: a flow-mapping credential in the bundle file or in the host file is skipped' (($a1Skips | ForEach-Object Reason) -join ';')
+}
+
+# ---------------------------------------------------------------- r12 A3: the settings.json profile rewrite is one locked read-judge-write on the host file
+if ($fnLoaded -and (Test-Has 'Update-ImportedSettingsLocked' 'r12 A3')) {
+    $a3 = New-Scratch 'r12-a3'; $a3Settings = Join-Path $a3 'settings.json'
+    [IO.File]::WriteAllText($a3Settings, '{"path":"C:/Users/obabalola/tool","p2":"C:\\Users\\obabalola\\x"}')
+    $script:A3HookWrote = $null
+    # the seam runs after the file was read and before it is written: an editor saves a credential into the host file in that window
+    $script:ImportSettingsRewriteHook = { param($Path) try { [IO.File]::WriteAllText($Path, '{"env":{"DB_PASSWORD":"owner-hunter2"}}'); $script:A3HookWrote = $true } catch { $script:A3HookWrote = $false } }
+    $script:Failures.Clear()
+    try { $a3r = Update-ImportedSettingsLocked -Path $a3Settings -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice' } finally { $script:ImportSettingsRewriteHook = $null }
+    Assert-That ($script:A3HookWrote -eq $false) 'r12 A3 import: an editor save between the read and the write of the profile rewrite is refused (the host file is locked)' "hookWrote=$($script:A3HookWrote)"
+    Assert-That (([IO.File]::ReadAllText($a3Settings)) -ceq '{"path":"C:/Users/alice/tool","p2":"C:\\Users\\alice\\x"}') 'r12 A3 import: the rewrite itself is applied' ([IO.File]::ReadAllText($a3Settings))
+    Assert-That ($a3r.Result -ceq 'rewritten') 'r12 A3 import: the result is rewritten' "$($a3r.Result)"
+    # a credential already there: never rewritten, typed line, failure
+    $a3Cred = '{"env":{"DB_PASSWORD":"owner-hunter2"},"path":"C:/Users/obabalola/tool"}'
+    [IO.File]::WriteAllText($a3Settings, $a3Cred); $script:Failures.Clear()
+    $a3r = Update-ImportedSettingsLocked -Path $a3Settings -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice'
+    Assert-That ($a3r.Result -ceq 'changed' -and ([IO.File]::ReadAllText($a3Settings)) -ceq $a3Cred) 'r12 A3 import: a settings.json that carries a credential is left as it is' "$($a3r.Result)"
+    Assert-That (@($script:Failures | Where-Object { $_ -ceq "IMPORT_DEST_CHANGED_SKIPPED $a3Settings" }).Count -eq 1) 'r12 A3 import: the skip is the typed IMPORT_DEST_CHANGED_SKIPPED <path> failure' ($script:Failures -join ',')
+    # held open by another process: cannot be locked, left as it is
+    [IO.File]::WriteAllText($a3Settings, '{"path":"C:/Users/obabalola/tool"}'); $script:Failures.Clear()
+    $a3Hold = [IO.File]::Open($a3Settings, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try { $a3r = Update-ImportedSettingsLocked -Path $a3Settings -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice' } finally { $a3Hold.Dispose() }
+    Assert-That ($a3r.Result -ceq 'changed' -and ([IO.File]::ReadAllText($a3Settings)) -ceq '{"path":"C:/Users/obabalola/tool"}' -and $script:Failures.Count -eq 1) 'r12 A3 import: a settings.json another process holds open is skipped and fails the run' "$($a3r.Result) $($script:Failures -join ',')"
+    $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r12 A4: a -StateRoot / bundle path with '..' or '.' parts maps every file to its OWN destination
+if ($fnLoaded -and (Test-Has 'Invoke-ImportRobocopy' 'r12 A4')) {
+    $a4 = New-Scratch 'r12-a4'; [void](New-Scratch 'r12-a4\st')
+    $a4Src = Join-Path $a4 'src'; $a4Dst = Join-Path $a4 'dst'
+    foreach ($d in 'hooks', 'claims') { [void][IO.Directory]::CreateDirectory((Join-Path $a4Src $d)) }
+    [IO.File]::WriteAllText((Join-Path $a4Src 'hooks\service.json'), '{"v":"bundle-service"}')
+    [IO.File]::WriteAllText((Join-Path $a4Src 'claims\c1.json'), '{"v":"claim"}')
+    [IO.File]::WriteAllText((Join-Path $a4Src 'top.json'), '{"v":"top"}')
+    $a4From = "$a4\st\..\src"; $a4To = "$a4\st\..\dst"
+    $script:Failures.Clear()
+    Invoke-ImportRobocopy -From $a4From -To $a4To -Extra @('/E', '/XO', '/XD', "$a4\st\..\src\claims")
+    Assert-That (Test-Path -LiteralPath (Join-Path $a4Dst 'hooks\service.json')) 'r12 A4 import: hooks\service.json lands in dst\hooks (not dst) when the paths carry ..' ((Get-ChildItem -LiteralPath $a4Dst -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object FullName) -join ';')
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $a4Dst 'service.json'))) 'r12 A4 import: no file is flattened into the destination root'
+    Assert-That (Test-Path -LiteralPath (Join-Path $a4Dst 'top.json')) 'r12 A4 import: a top-level file still lands in the destination root'
+    Assert-That (@(Get-ChildItem -LiteralPath $a4Dst -Recurse -File -Filter 'c1.json' -ErrorAction SilentlyContinue).Count -eq 0) 'r12 A4 import: an /XD directory given with .. parts is still excluded' ((Get-ChildItem -LiteralPath $a4Dst -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object FullName) -join ';')
+    # host guard: a host file that carries a credential is found under the right name
+    [void][IO.Directory]::CreateDirectory((Join-Path $a4Dst 'hooks'))
+    [IO.File]::WriteAllText((Join-Path $a4Dst 'hooks\service.json'), '{"api_key":"host-owned-key"}')
+    $a4Skips = @(Get-ImportCredentialSkips -SourceDir $a4From -DestDir $a4To)
+    Assert-That (@($a4Skips | Where-Object { $_.Dest -like '*\dst\hooks\service.json' -and $_.Reason -like 'host file carries a credential' }).Count -eq 1) 'r12 A4 import: the host credential guard maps hooks\service.json to dst\hooks\service.json' (($a4Skips | ForEach-Object { "$($_.Dest) $($_.Reason)" }) -join ';')
+    # export side: the typed path is the path inside the bundle
+    $a4Stage = Join-Path $a4 'stage'; [void][IO.Directory]::CreateDirectory((Join-Path $a4Stage 'hooks'))
+    [IO.File]::WriteAllText((Join-Path $a4Stage 'hooks\a.yaml'), 'password: hunter2')
+    $a4Hits = @(Get-StagedCredentialHits -Stage "$a4\st\..\stage")
+    Assert-That ($a4Hits.Count -eq 1 -and $a4Hits[0] -like 'hooks\a.yaml *') 'r12 A4 export: Get-StagedCredentialHits names hooks\a.yaml when -Stage carries ..' ($a4Hits -join ';')
+    $a4Scan = Invoke-StagedSecretScan -Stage "$a4\st\..\stage"
+    Assert-That (@($a4Scan.Typed).Count -eq 1 -and $a4Scan.Typed[0] -ceq 'EXPORT_CREDENTIAL_HIT hooks\a.yaml:1') 'r12 A4 export: the typed EXPORT_CREDENTIAL_HIT line names hooks\a.yaml when -Stage carries ..' ($a4Scan.Typed -join ';')
+    $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r12 A5: a copied file keeps the destination locked until its timestamps are set (no editor save is backdated)
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r12 A5')) {
+    $a5 = New-Scratch 'r12-a5'
+    $a5Src = Join-Path $a5 'src.txt'
+    [IO.File]::WriteAllText($a5Src, 'BUNDLE-B'); (Get-Item -LiteralPath $a5Src).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(-30)
+    foreach ($mode in 'replace', 'create') {
+        $a5Dst = Join-Path $a5 "dst-$mode.txt"
+        if ($mode -eq 'replace') { [IO.File]::WriteAllText($a5Dst, 'old'); (Get-Item -LiteralPath $a5Dst).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2) }
+        $script:A5Blocked = $null
+        # the seam stands for the editor: it saves into the destination as soon as the copy has written the bytes
+        $script:ImportAfterWriteHook = { param($Dest) try { [IO.File]::WriteAllText($Dest, 'LOCAL-NEW'); $script:A5Blocked = $false } catch { $script:A5Blocked = $true } }
+        try { $a5r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($a5Src)) -Dest $a5Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false } finally { $script:ImportAfterWriteHook = $null }
+        Assert-That ($script:A5Blocked -eq $true) "r12 A5 import ($mode): an editor save right after the bytes are written is refused (the lock is held until the timestamps are set)" "blocked=$($script:A5Blocked)"
+        Assert-That (([IO.File]::ReadAllText($a5Dst)) -ceq 'BUNDLE-B') "r12 A5 import ($mode): the destination holds the bundle bytes" ([IO.File]::ReadAllText($a5Dst))
+        Assert-That ([IO.File]::GetLastWriteTimeUtc($a5Dst) -eq [IO.File]::GetLastWriteTimeUtc($a5Src)) "r12 A5 import ($mode): the destination carries the bundle timestamp" "$([IO.File]::GetLastWriteTimeUtc($a5Dst).ToString('o'))"
+    }
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

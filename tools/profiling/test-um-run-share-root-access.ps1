@@ -170,7 +170,16 @@ try { Invoke-Expression (Get-ScriptFunctionText $nightly 'Stop-ShareUnreachable'
 Invoke-Expression (Get-ScriptFunctionText $nightly 'Read-Share')
 $share = $fakeRoot
 $ProbeTimeoutSec = 5
-function Invoke-Bounded { param($Script, $ArgList, $Sec) [pscustomobject]@{ ok = $false; timedOut = $false; value = $null; error = 'stub: not found' } }
+$shareRootModule = Join-Path $here 'ShareRootAccess.psm1'
+# r12 A6: the share-root probe (production and seam) runs through Invoke-Bounded, so this stub runs that one worker in process; every other by-name read is "not found".
+function Invoke-Bounded {
+    param($Script, $ArgList, $Sec)
+    if ($Script.ToString() -match 'Get-ShareRootAccess') {
+        try { $v = @(& ([scriptblock]::Create($Script.ToString())) @ArgList); return [pscustomobject]@{ ok = $true; timedOut = $false; value = $(if ($v.Count) { $v[0] } else { $null }); error = $null } }
+        catch { return [pscustomobject]@{ ok = $false; timedOut = $false; value = $null; error = $_.Exception.Message } }
+    }
+    [pscustomobject]@{ ok = $false; timedOut = $false; value = $null; error = 'stub: not found' }
+}
 $TestShareRootProbe = $denied
 try { Stop-ShareUnreachable 'the agent share cache did not answer' } catch { $s = [string]$_.Exception.Message }
 Assert-That ($s.StartsWith('STOP|SHARE_UNREACHABLE|the agent share cache did not answer') -and $s.EndsWith("|SHARE_ACCESS_DENIED $fakeRoot")) 'A13 nightly: a denied root at the cache probe prints SHARE_ACCESS_DENIED <root> verbatim and keeps SHARE_UNREACHABLE' "got: $s"
@@ -209,6 +218,44 @@ try { Stop-ShareUnreachable 'x' } catch { $s = [string]$_.Exception.Message }
 Assert-That ($script:SecSeen -eq -1) 'A9 nightly: a NEGATIVE remainder does not become a fresh 1 s probe' "seen=$($script:SecSeen)"
 $nightlyText = [IO.File]::ReadAllText($nightly)
 Assert-That (-not ($nightlyText -match "Stop-Nightly 'SHARE_UNREACHABLE' `"the agent share cache")) 'A13 nightly: the cache-directory probe no longer calls Stop-Nightly SHARE_UNREACHABLE directly'
+
+# A6 (pass 8): the -TestShareRootProbe seam is bounded exactly like the production probe: by -ProbeTimeoutSec and by what is left of -MaxTotalSec. It used to run
+# synchronously outside Invoke-Bounded, so a seam callback could run past both limits. The REAL Invoke-Bounded is lifted here (the checks above stub it).
+Invoke-Expression (Get-ScriptFunctionText $nightly 'Invoke-Bounded')
+$a6Marker = Join-Path $ScratchRoot 'a6-probe-ran.txt'
+$a6Slow = [scriptblock]::Create('param($r) Start-Sleep -Seconds 8; throw [UnauthorizedAccessException]::new(''Access to the path is denied.'')')
+$a6Mark = [scriptblock]::Create("param(`$r) [IO.File]::WriteAllText('$a6Marker', 'ran'); throw [UnauthorizedAccessException]::new('Access to the path is denied.')")
+$ProbeTimeoutSec = 1
+function Get-RemainingSec { 100 }
+$TestShareRootProbe = $a6Slow
+$s = ''
+$a6Sw = [Diagnostics.Stopwatch]::StartNew()
+try { Stop-ShareUnreachable 'a6 slow seam' } catch { $s = [string]$_.Exception.Message }
+$a6Sw.Stop()
+Assert-That ($a6Sw.Elapsed.TotalSeconds -lt 5) 'A6 nightly: a slow -TestShareRootProbe is abandoned after -ProbeTimeoutSec (1 s), not run to its end (8 s)' "elapsed=$([int]$a6Sw.Elapsed.TotalSeconds)s"
+Assert-That ($s -ceq 'STOP|SHARE_UNREACHABLE|a6 slow seam|') 'A6 nightly: a seam probe that does not answer in time reports the plain SHARE_UNREACHABLE detail' "got: $s"
+$ProbeTimeoutSec = 300
+function Get-RemainingSec { 1 }
+$a6Sw = [Diagnostics.Stopwatch]::StartNew()
+$s = ''
+$TestShareRootProbe = $a6Slow
+try { Stop-ShareUnreachable 'a6 budget seam' } catch { $s = [string]$_.Exception.Message }
+$a6Sw.Stop()
+Assert-That ($a6Sw.Elapsed.TotalSeconds -lt 5) 'A6 nightly: a slow seam probe is bounded by the 1 s left of -MaxTotalSec, not by the 300 s -ProbeTimeoutSec' "elapsed=$([int]$a6Sw.Elapsed.TotalSeconds)s"
+function Get-RemainingSec { 0 }
+if (Test-Path -LiteralPath $a6Marker) { Remove-Item -LiteralPath $a6Marker -Force }
+$TestShareRootProbe = $a6Mark
+$s = ''
+try { Stop-ShareUnreachable 'a6 spent cap' } catch { $s = [string]$_.Exception.Message }
+Assert-That (-not (Test-Path -LiteralPath $a6Marker)) 'A6 nightly: with the total cap spent (0 s left) the seam probe is not started either'
+Assert-That ($s -ceq 'STOP|SHARE_UNREACHABLE|a6 spent cap|') 'A6 nightly: with the cap spent the plain detail is reported' "got: $s"
+function Get-RemainingSec { 100 }
+$ProbeTimeoutSec = 30
+$TestShareRootProbe = $denied
+$s = ''
+try { Stop-ShareUnreachable 'a6 denied seam' } catch { $s = [string]$_.Exception.Message }
+Assert-That ($s.StartsWith('STOP|SHARE_UNREACHABLE|a6 denied seam') -and $s.EndsWith("|SHARE_ACCESS_DENIED $fakeRoot")) 'A6 nightly: a seam probe that answers in time still prints the typed line' "got: $s"
+$TestShareRootProbe = $null
 
 Write-Host ("RESULT fails={0}" -f $script:Fails)
 if ($script:Fails -gt 0) { exit 1 }
