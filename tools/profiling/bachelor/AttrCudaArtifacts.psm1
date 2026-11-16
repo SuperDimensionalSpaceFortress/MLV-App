@@ -8003,7 +8003,8 @@ function Get-AttrCudaDllPairJobId {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+        # r27 merge: \z, never $ ('$' matches before a final newline; VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r6 A1 anchors every sha40 parameter so)
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
         [AllowEmptyString()][AllowNull()][string]$JobIdSuffix = ''
     )
     $id = 'playback-attr-3-cuda-dllpair-' + $SourceCommit.Substring(0, 12)
