@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -5369,9 +5370,20 @@ def _holder_exempted(d, p):
     census holds, and the disposition lists no per-pid exempt row (cwdExemptOwner is the service-owner exemption only). An exempted pid never
     reaches cwdUnknown, so the holder's own row there, typed script-unreadable (never cwd-unreadable, the exemptible kind), proves it was not."""
     rows = [u for u in d["cwdUnknown"] if u.startswith(f"{p.pid} ")]
-    in_unknown = len(rows) == 1 and " script-unreadable " in rows[0] and " cwd-unreadable " not in rows[0]
+    # The row is "<pid> <name> <why> created=... file=<path>": the third token is the why; the path (a pytest basetemp) may contain any words.
+    in_unknown = len(rows) == 1 and rows[0].split()[2] == "script-unreadable"
     as_owner = any(str(o).startswith(f"{p.pid} ") for o in d["cwdExemptOwner"])
     return (not in_unknown) or as_owner
+
+
+def test_holder_exempted_reads_the_why_token_not_words_in_the_file_path():
+    """Adversary advisory A1 on 447d8429: a basetemp containing ' cwd-unreadable ' made a correct script-unreadable row read as exempted."""
+    p = types.SimpleNamespace(pid=1234)
+    row = "1234 pwsh.exe script-unreadable created=2026-11-16T12:00:00.0000000Z file=C:\\tmp\\case cwd-unreadable suffix\\chain-run\\tools\\arms.ps1"
+    assert not _holder_exempted({"cwdUnknown": [row], "cwdExemptOwner": []}, p)
+    assert _holder_exempted({"cwdUnknown": [], "cwdExemptOwner": []}, p)
+    assert _holder_exempted({"cwdUnknown": [row.replace(" script-unreadable ", " cwd-unreadable ")], "cwdExemptOwner": []}, p)
+    assert _holder_exempted({"cwdUnknown": [row], "cwdExemptOwner": ["1234 pwsh.exe exempt=service-sid:S-1-5-18"]}, p)
 
 
 @pytest.mark.parametrize("whatif", [True, False], ids=["whatif", "real-retirement"])
@@ -5426,15 +5438,17 @@ def test_full_gate_holder_first_refusal_stands_when_a_foreign_older_pytest_child
     wt = tmp / "wt-locked-foreign-older"
     sd = _chain_scripts(tmp, str(wt))
     foreign = _spawn_proven_alive(tmp, "foreign-older", cwd=tmp)       # both children start before the worktree exists
-    p = _spawn_chain_proven_alive(sd, cwd=tmp)
-    _add_wt(main, wt)
+    p = None
     arms = sd / "arms.ps1"
     try:
+        p = _spawn_chain_proven_alive(sd, cwd=tmp)
+        _add_wt(main, wt)       # inside the try: a failure here must still stop both children (adversary advisory A2 on 447d8429)
         d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _cwd_unreadable_for(foreign.pid) + _locked(arms))
         _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
         assert foreign.poll() is None, f"FIXTURE ERROR: foreign child {foreign.pid} exited before the scan finished"
     finally:
-        _stop(p)
+        if p is not None:
+            _stop(p)
         _stop(foreign)
     _assert_refused_naming(d, p, arms)
     assert not _holder_exempted(d, p), json.dumps(d)
