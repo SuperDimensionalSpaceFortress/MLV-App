@@ -11442,6 +11442,15 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                 if case not in ("l4-counters-only", "skipped-l2"):
                     self.assertEqual(sorted(expected), failed, f"{case} breaks exactly its own fact: {got['failures']}")
 
+    def test_r19_a1_sibling_a_location_tail_never_supplies_a_session_record_field(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r18 adversary A1 sibling AttrCudaArtifacts.psm1:3513/:3516): the self-heal session record
+        is read as its body (the Get-DvLogRecordBody rule): a readable Qt location's path never supplies presented_fps, and an unreadable tail is no record."""
+        head = "playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201"
+        out = self.evaluate(["good"], measured_log=head + " (C:/b presented_fps=99 x/MainWindow.cpp:1)\n")
+        self.assertEqual(out["good"]["metrics"]["selfHealL1FpsRatio"], 0.974, "the location path supplied presented_fps")
+        out = self.evaluate(["good"], measured_log=head + " (settings_store=venue)\n")
+        self.assertIsNone(out["good"]["metrics"]["selfHealL1FpsRatio"], "an unreadable tail still gave a record")
+
     def test_an_unreadable_counter_is_could_not_check_never_zero(self) -> None:
         """r10 (CoS #437, Dot c503450a): an L3 gpu_summary whose CUDA and preview counters are absent, empty or not decimal counts, a reuse summary
         whose refused count is empty, and a fault row with no cuda_code each FAIL exactly their criteria with a typed COULD-NOT-CHECK reason in the

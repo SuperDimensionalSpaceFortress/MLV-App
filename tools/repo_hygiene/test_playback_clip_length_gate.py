@@ -1176,6 +1176,48 @@ class SourceFramesOracleParityTests(unittest.TestCase):
         self.assertEqual(self._run_job_block(block.replace(needle, "", 1), summary + "\n" + own)[0], 29,
                          "job conform-wiring mutation 'conform line not passed on' survived")
 
+    def test_r19_a1_the_source_frame_gate_reads_the_record_body_never_a_location_tail(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r18 adversary A1 on 1d2d2850): the job's anchored summary and conform picks are read as
+        their record BODY by the Get-DvLogRecordBody rule (DualVenueRunner.psm1): the first ` (` that is not the summary's in-place conform group starts
+        the Qt location, a readable `:<digits>)` / `:%2)` tail is cut, and any other tail makes the record unreadable (no pick, so the oracle refuses).
+        A key=value inside the location path never supplies a field. The module oracle reads a handed-in line the same way (the class fix)."""
+        block = self._job_oracle_block()
+
+        def line(**extra: object) -> str:
+            return _summary_line(**{**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, **extra}).replace("session=0", "session=7", 1)
+
+        # the adversary's input, its summary as the app writes it: 1 of 600 source frames advanced, the location path holding source_advanced=600
+        short = line(source_advanced=1, required_source_frames=600, native_fps=60, pace_fps=60)
+        located = " (C:/build source_advanced=600 x/MainWindow.cpp:1)"
+        code, receipt = self._run_job_block(block, short + located)
+        self.assertEqual(code, 29, "a location tail supplied source_advanced over the record's own value")
+        self.assertEqual(receipt["sourceFrames"]["sourceAdvanced"], 1)
+        good = line()
+        self.assertEqual(self._run_job_block(block, good + " (C:/b x/MainWindow.cpp:25848)")[0], 0, "a readable location keeps the body")
+        self.assertEqual(self._run_job_block(block, good + " (C:/b %1 x/MainWindow.cpp:%2)")[0], 0, "the old writer's :%2) ending keeps the body")
+        self.assertEqual(self._run_job_block(block, good + " (settings_store=venue)")[0], 29, "an unreadable tail is no readable summary")
+        # the app's own conform group inside gui_fps_status_text is stepped over in its place, and the location after it is still cut
+        # (_summary_line keeps the C++ literal's escaped quotes, \"; the app writes plain quotes)
+        status = re.sub(r'gui_fps_status_text=\\?"0\\?"', lambda _m: 'gui_fps_status_text="Playback: 24 fps (59.94 -> 24)"', good, count=1)
+        self.assertNotEqual(status, good, "the summary format moved; update this test")
+        self.assertEqual(self._run_job_block(block, status + " (C:/b source_advanced=1 x/M.cpp:1)")[0], 0)
+        # the conform sibling (job :3829): a location that says conform_active=1 never proves a conform the record denies
+        hfr = _summary_line(**{**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, "source_advanced": 1200, "required_source_frames": 1199,
+                               "native_fps": "59.940", "pace_fps": "24.000"}).replace("session=0", "session=7", 1)
+        forged = _conform_line("7", conform_active=0) + " (C:/b conform_active=1 x/MainWindow.cpp:1)"
+        code, receipt = self._run_job_block(block, hfr + "\n" + forged)
+        self.assertEqual((code, receipt["sourceFrames"]["paceRule"]), (29, "native"), "a location tail proved a conform")
+        self.assertEqual(self._run_job_block(block, hfr + "\n" + _conform_line("7") + " (C:/b x/MainWindow.cpp:9)")[0], 0)
+        self.assertEqual(self._run_job_block(block, hfr + "\n" + _conform_line("7") + " (settings_store=venue)")[0], 29, "an unreadable conform tail proves nothing")
+        # the module oracle on a raw line handed to it directly (every caller, not only the job's pick)
+        proc = _pwsh(
+            f"Import-Module {_q(self.MODULE)} -Force -DisableNameChecking; "
+            f"$a = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine {_q(short + located)} -ExpectedRunNonce {_q(RUN_NONCE)}; "
+            f"$b = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine {_q(hfr)} -ExpectedRunNonce {_q(RUN_NONCE)} -ConformLine {_q(forged)}; "
+            "[pscustomobject]@{ a = [bool]$a.invalid; aAdvanced = $a.sourceAdvanced; b = [bool]$b.invalid; bRule = $b.paceRule } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), {"a": True, "aAdvanced": 1, "b": True, "bRule": "native"})
+
     def test_the_job_calls_the_embedded_oracle_before_any_backend_verdict(self) -> None:
         job = JOB_GENERATOR.read_text(encoding="utf-8")
         self.assertIn("'Get-AttrCudaSourceFramesVerdict'", job)       # embedded into the emitted job

@@ -3817,6 +3817,12 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
         $sourceFramesSummaryLine = $candidateLine
     }
 }
+# r19 (r18 adversary A1 on 1d2d2850, its input: a summary whose Qt location `(C:/build source_advanced=600 x/MainWindow.cpp:1)` outvoted the record's own
+# source_advanced=1): each picked record is reduced to its BODY by DualVenueRunner.psm1's Get-DvLogRecordBody rule before any field is read. The first ` (`
+# that is not the summary's in-place conform group (`gui_fps_status_text="Playback: <n> fps (<a> -> <b>)"`) starts the location; a readable
+# ` (<path>:<digits>)` / `:%2)` tail is cut, and any other tail makes the record unreadable ($null: no pick, so the oracle refuses)
+function Get-SourceFramesRecordBody([string]$x) { $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $x.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -lt 0) { return $x }; if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return $null }; $x.Substring(0, $o) }
+if ($null -ne $sourceFramesSummaryLine) { $sourceFramesSummaryLine = Get-SourceFramesRecordBody $sourceFramesSummaryLine }
 # SESSION-ANCHOR-1 <<<
 $sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce
 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>
@@ -3829,6 +3835,8 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
         $sourceFramesConformLine = $candidateLine
     }
 }
+# r19 (r18 adversary A1 sibling :3829): the conform record is read as its body too, so a location that says conform_active=1 never proves a conform
+if ($null -ne $sourceFramesConformLine) { $sourceFramesConformLine = Get-SourceFramesRecordBody $sourceFramesConformLine }
 $sourceFramesVerdict = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce -ConformLine $sourceFramesConformLine
 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<
 $sourceFramesWrapped = [bool]$sourceFramesVerdict.wrapped

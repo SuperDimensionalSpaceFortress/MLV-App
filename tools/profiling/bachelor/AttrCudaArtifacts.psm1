@@ -3510,8 +3510,21 @@ function Get-AttrCudaSelfHealMetrics {
             $Session = $sm.Groups[1].Value
         }
         $found = $null
-        foreach ($lm in [regex]::Matches($LogText, $recordStart + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
+        $foundRecord = $null
+        foreach ($lm in [regex]::Matches($LogText, $recordStart + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value; $foundRecord = $lm }
         if ($null -eq $found) { return $null }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r18 adversary A1 sibling :3513 / :3516): the fields come from the record BODY (Get-DvLogRecordBody's
+        # rule): the first ` (` of the record that is not the summary's in-place conform group starts the Qt location; a readable ` (<path>:<digits>)` / `:%2)`
+        # tail is cut, any other tail is no record ($null), so a key=value inside the location path never supplies a field
+        $rec = $foundRecord.Value
+        $p = [regex]::Matches($rec, ' \(')
+        $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 })
+        if ($o -ge 0 -and $rec.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $rec.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }
+        if ($o -ge 0) {
+            if ($rec.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return $null }
+            $restAt = $foundRecord.Groups['rest'].Index - $foundRecord.Index
+            $found = $(if ($o -gt $restAt) { $rec.Substring($restAt, $o - $restAt) } else { '' })
+        }
         $fields = @{}
         foreach ($kv in [regex]::Matches($found, '([A-Za-z0-9_]+)=(\S*)')) { $fields[$kv.Groups[1].Value] = $kv.Groups[2].Value }
         $fields
@@ -7679,6 +7692,21 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
     $conformReductionMargin = 0.005   # a conform lowers playback_fps below the source rate AND the engine pace below native_fps by more than this fraction
     $conformPrintTolerance = 0.0005   # the source rate and native_fps print one value to 3 decimals, so they agree within half a print unit
     $inv = [Globalization.CultureInfo]::InvariantCulture
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r18 adversary A1 on 1d2d2850, siblings :7568 / :7684 / :7697): a handed-in summary or conform line is
+    # read as its record BODY by DualVenueRunner.psm1's Get-DvLogRecordBody rule before any key=value read, so a Qt location path never supplies a field: the
+    # first ` (` that is not the summary's in-place conform group starts the location; a readable ` (<path>:<digits>)` / `:%2)` tail is cut, and any other
+    # tail makes the line unreadable (empty: no summary, or no conform line, so absence never helps). The baseline oracle below is handed the body.
+    $recordBodies = @()
+    foreach ($rawRecord in @($SummaryLine, $ConformLine)) {
+        $b = [string]$rawRecord
+        $p = [regex]::Matches($b, ' \(')
+        $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 })
+        if ($o -ge 0 -and $b.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $b.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }
+        if ($o -ge 0) { $b = $(if ($b.Substring($o) -cmatch '^ \(.+:(?:[0-9]+|%2)\)$') { $b.Substring(0, $o) } else { '' }) }
+        $recordBodies += $b
+    }
+    $SummaryLine = $recordBodies[0]
+    $ConformLine = $recordBodies[1]
     $fields = @{}
     if (-not [string]::IsNullOrWhiteSpace($SummaryLine)) {
         foreach ($match in [regex]::Matches($SummaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$match.Groups['k'].Value] = $match.Groups['v'].Value }
