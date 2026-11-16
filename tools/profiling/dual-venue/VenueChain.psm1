@@ -654,21 +654,31 @@ function Get-VenueStagedBuildManifest {
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
     $callClock = [Diagnostics.Stopwatch]::StartNew()
-    if ($null -ne $CallBudgetClock) {
-        # r22: what is left of the caller's budget, on the caller's own monotonic clock (a budget already spent is a cap of 0.001 s: UNREACHABLE below, never "no cap")
-        $bdCap = [Math]::Min(86400.0, [Math]::Max(0.001, $CallBudgetEndSec - $CallBudgetClock.Elapsed.TotalSeconds))
-        $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $bdCap) } else { $bdCap })
-    }
-    if ($null -ne $CallDeadlineUtc) {
-        # r12: the deadline left at the clock's start (a deadline already past is a cap of 0.001 s: UNREACHABLE below, never "no cap")
+    if ($script:VenueTestPostClockStartDelayMs -gt 0) { $stallMs = $script:VenueTestPostClockStartDelayMs; $script:VenueTestPostClockStartDelayMs = 0; [Threading.Thread]::Sleep($stallMs) }
+    if ($null -ne $CallBudgetClock -or $null -ne $CallDeadlineUtc) {
+        # r12: the caller's end as what is left of it when this call's clock starts (a deadline or budget already past is a cap of 0.001 s: UNREACHABLE below, never "no cap")
         # (PowerShell hands a [Nullable[DateTime]] parameter over as the DateTime itself: no .Value)
-        # r12 fix iteration (adversary A1 on 09421b77): the call clock is read FIRST and the wall clock after it, so a caller descheduled between the two samples
-        # can only shorten the cap (the remainder is taken later), never add the stall to it
-        $dlElapsed = $callClock.Elapsed.TotalSeconds
-        if ($script:VenueTestDeadlineSampleDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestDeadlineSampleDelayMs) }
-        $dlCap = (([DateTime]$CallDeadlineUtc).ToUniversalTime() - [DateTime]::UtcNow.AddSeconds($script:VenueTestUtcStepSec)).TotalSeconds + $dlElapsed
-        $dlCap = [Math]::Min(86400.0, [Math]::Max(0.001, $dlCap))
-        $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $dlCap) } else { $dlCap })
+        # r22 (sol r21 blocker): -CallBudgetClock/-CallBudgetEndSec is the caller's own monotonic budget (a Stopwatch and its end on it): no wall clock is read for it at all.
+        # r22 fix iteration 1 (adversary pass-24 A1 on e3e61e8e, sibling of r12's own sample): the left-over is taken on the CALLER's clock, so it is a remainder AT THE SAMPLE, and the cap is
+        # held against this call's clock, which has run since its start: the cap is that remainder plus what this clock read at the same instant. The two reads are two instants, so they
+        # are BRACKETED: this clock, the caller's, this clock again. A caller descheduled before the first read is charged once (it is in both); a stall INSIDE the bracket (over
+        # 50 ms between its two reads of this clock) is a sample of no instant, so the bracket is taken again (up to 5 times; the last keeps the first read, which only shortens).
+        $sampleTry = 0
+        do {
+            $sampleTry++
+            $sampleElapsed = $callClock.Elapsed.TotalSeconds
+            if ($script:VenueTestDeadlineSampleDelayMs -gt 0) { $stallMs = $script:VenueTestDeadlineSampleDelayMs; $script:VenueTestDeadlineSampleDelayMs = 0; [Threading.Thread]::Sleep($stallMs) }
+            $bdLeft = $(if ($null -ne $CallBudgetClock) { $CallBudgetEndSec - $CallBudgetClock.Elapsed.TotalSeconds } else { $null })
+            $dlLeft = $(if ($null -ne $CallDeadlineUtc) { (([DateTime]$CallDeadlineUtc).ToUniversalTime() - [DateTime]::UtcNow.AddSeconds($script:VenueTestUtcStepSec)).TotalSeconds } else { $null })
+        } while (($callClock.Elapsed.TotalSeconds - $sampleElapsed) -gt 0.05 -and $sampleTry -lt 5)
+        if ($null -ne $bdLeft) {
+            $bdCap = [Math]::Min(86400.0, [Math]::Max(0.001, $bdLeft + $sampleElapsed))
+            $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $bdCap) } else { $bdCap })
+        }
+        if ($null -ne $dlLeft) {
+            $dlCap = [Math]::Min(86400.0, [Math]::Max(0.001, $dlLeft + $sampleElapsed))
+            $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $dlCap) } else { $dlCap })
+        }
     }
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
@@ -869,6 +879,9 @@ $script:VenueMinReadSec = 0.5
 # caller between the two clock samples -CallDeadlineUtc is taken from, the second between a bounded read's launch and its wait (a descheduled caller).
 $script:VenueTestDeadlineSampleDelayMs = 0
 $script:VenueTestPreWaitDelayMs = 0
+# Test-only (r22 fix iteration 1, adversary pass-24 A1 on e3e61e8e): ONE stall right after the call's own clock starts and before the caller's budget or deadline is sampled, as a callee
+# descheduled there is. It clears itself once used, and so does -VenueTestDeadlineSampleDelayMs (a deschedule happens once, and the sample is then taken again). Production leaves both 0.
+$script:VenueTestPostClockStartDelayMs = 0
 # Test-only (r22, sol r21 blocker / adversary pass-23 A1): the wall clock Get-VenueStagedBuildManifest's -CallDeadlineUtc is read against is stepped forward this many seconds, as an
 # NTP/VM-resume step between a caller's own wall-clock sample and this call's is. Production leaves it 0. The lease batch no longer hands a monotonic budget over as an instant at
 # all (-CallBudgetClock/-CallBudgetEndSec), so a step cannot reach its call; -CallDeadlineUtc stays for the nightly, whose own cap is a UTC deadline end to end.

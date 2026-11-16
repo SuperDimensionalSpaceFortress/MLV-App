@@ -6853,6 +6853,41 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(got["nightly"], "UNREACHABLE", f"the seam no longer steps -CallDeadlineUtc: {got}")
         self.assertIn("no time is left of -CallCapSec", got["nightlyError"], got)
 
+    # r22 fix iteration 1 (adversary pass-24 A1 on e3e61e8e, VenueChain.psm1:659): the budget's remainder was taken on the CALLER's clock and held against the call's own clock, which had run
+    # since its start, so a stall after that start and before the sample was charged twice: a 3 s stall under a 4 s end left a cap of 1 s with 3 s already on the call's clock, and a healthy
+    # read was refused with 1 s truly left. RED on e3e61e8e (seam only): UNREACHABLE, no read, for both the budget and the UTC deadline. The stall INSIDE the bracket is taken again.
+    def _r22_stall_run(self, seam: str, budget_args: str) -> dict:
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"& (Get-Module VenueChain) {{ {seam} }}\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript {{ param($p) ('a' * 64) }} {budget_args}\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; error = [string]$r.error; sec = $sw.Elapsed.TotalSeconds }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_r22_a1_fix1_a_stall_after_the_call_clock_starts_is_charged_once_to_the_budget(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestPostClockStartDelayMs = 3000", "-CallBudgetClock $sw -CallBudgetEndSec 6.0")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall under a 6 s budget end (3 s truly left) was charged twice: {got}")
+
+    def test_r22_a1_fix1_a_stall_after_the_call_clock_starts_is_charged_once_to_a_utc_deadline(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestPostClockStartDelayMs = 3000", "-CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(6))")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall under a 6 s deadline (3 s truly left) was charged twice: {got}")
+
+    def test_r22_a1_fix1_a_stall_between_the_two_samples_is_sampled_again_for_the_budget(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestDeadlineSampleDelayMs = 3000", "-CallBudgetClock $sw -CallBudgetEndSec 6.0")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall between the call clock read and the budget read (3 s truly left) refused the read: {got}")
+
+    def test_r22_a1_fix1_a_stall_between_the_two_samples_is_sampled_again_for_a_utc_deadline(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestDeadlineSampleDelayMs = 3000", "-CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(6))")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall between the call clock read and the wall clock read (3 s truly left) refused the read: {got}")
+
+    def test_r22_a1_fix1_control_a_stall_that_really_spends_the_budget_stays_the_typed_refusal(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestPostClockStartDelayMs = 3000", "-CallBudgetClock $sw -CallBudgetEndSec 2.0")
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertIn("no time is left of -CallCapSec", got["error"], got)
+
     def test_r22_a1_control_a_caller_stall_before_the_call_never_moves_the_budgets_end_later(self) -> None:
         # r12's property on the monotonic path: the end is fixed ON THE CALLER'S CLOCK, so a caller descheduled between its sample and the call (3 s here, under a 4 s end) leaves the
         # call what is left (about 1 s), never the whole share counted again from the call's own later start: the stuck 3 s read is given up on at the end, not waited for.
