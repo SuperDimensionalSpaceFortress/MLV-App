@@ -862,7 +862,8 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         # r14 (hosted CI on 116db0cb, attr3_publish_write_scan R3/R4): every ' (' position comes from [regex]::Matches (no IndexOf /
         # StringComparison::Ordinal), and the template's copy is a function it defines (no `&` on a script block); the two generator copies stay blocks
         body = ("$p = [regex]::Matches($x, ' \\('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch "
-                "'^ \\([0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)?\\)\"') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; "
+                "'^ \\([0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)?\\)\"' -and $x.Substring(0, $o) -cmatch "
+                "'(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text=\"Playback: [0-9]+(?:\\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; "
                 "if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \\(.+:(?:[0-9]+|%2)\\)$') { return -1 }; $x = $x.Substring(0, $o) }; "
                 "[regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }")
         self.assertEqual(text.count(body), 3)
@@ -903,6 +904,64 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertNotIn("ID=", proc.stdout)
                 self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+
+    def test_r18_a1_the_conform_group_is_stepped_over_only_after_the_status_field(self) -> None:
+        # r18 (r18 adversary A1 on 3945c36c, playback-attr-3-cuda-job.ps1:2258 + siblings :5067 :7545): a ` (<n> -> <n>)"` group that does not follow
+        # `gui_fps_status_text="Playback: <n> fps` is no conform group, so the ` (` is the location and an unreadable one; 3945c36c returned ID=3
+        later = "\nplayback_smoke.summary session=3 presented_fps=50\n"
+        for shape in ('playback_smoke.measured_session id=3 (1 -> 2)"', 'playback_smoke.measured_session id=3 x="Playback: 24 fps (1 -> 2)"',
+                      'playback_smoke.measured_session id=3 xgui_fps_status_text="Playback: 24 fps (1 -> 2)"',
+                      'playback_smoke.summary session=3 (1 -> 2)"',
+                      'playback_smoke.summary session=3 gui_fps_status_text="Playback: ' + "9" * 70 + ' fps (1 -> 2)"'):
+            with self.subTest(shape=shape):
+                proc = self._run(shape + later)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        # controls: the group in its place, with and without a location after it
+        for log in ('playback_smoke.summary session=3 gui_fps_status_text="Playback: 24 fps (59.94 -> 24)" presented_fps=24\n',
+                    'playback_smoke.summary session=3 gui_fps_status_text="Playback: 23.9 fps (59.94 -> 23.976)" x=1 (C:/a/MainWindow.cpp:9)\n'):
+            with self.subTest(control=log):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("ID=3", proc.stdout)
+
+    def _sibling_probe(self, body: str) -> subprocess.CompletedProcess:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        parts = []
+        for name in ("ConvertFrom-CorePartitionNumber", "Get-CorePartitionPlaybackStart", "Get-UtilSamplePlayWindow"):
+            start = text.index("\nfunction " + name + "(") + 1
+            parts.append(text[start:text.index("\nfunction ", start)])
+        tmp = tempfile.TemporaryDirectory(prefix="measured-session-sib-")
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "probe.ps1"
+        script.write_text("$ErrorActionPreference = 'Stop'\n" + "\n".join(parts) + "\n" + body, encoding="utf-8")
+        return _run_pwsh_file(script)
+
+    def test_r18_a1_a2_siblings_the_core_partition_and_util_window_selectors(self) -> None:
+        # r18 (r18 adversary A1 siblings :5067/:7545; A2 :7554 + sibling :5073): the core-partition start and the utilisation Play window take no session
+        # from a marker whose ` (<n> -> <n>)"` is not the status group, and no start stamp from a start record that names the word session twice
+        p = "[2026-11-13T00:00:0{0}.000Z] [INFO] [0x1] "
+        begin = p.format(0) + "interaction_trace event=play.toggled.begin checked=1"
+        summary = "[2026-11-13T00:00:21.000Z] [INFO] [0x1] playback_smoke.summary session=3 elapsed_ms=20000"
+        def log(start: str, marker: str) -> str:
+            return "\n".join((begin, p.format(1) + start, "[2026-11-13T00:00:01.001Z] [INFO] [0x1] " + marker, summary))
+        cases = {
+            "good": log("playback_smoke.start session=3", "playback_smoke.measured_session id=3"),
+            "a1": log("playback_smoke.start session=3", 'playback_smoke.measured_session id=3 (1 -> 2)"'),
+            "a2": log("playback_smoke.start session=3 session=4", "playback_smoke.measured_session id=3"),
+        }
+        body = ""
+        for key, value in cases.items():
+            literal = "'" + value.replace("'", "''") + "'"
+            body += (f"$c = Get-CorePartitionPlaybackStart {literal} 1 1 1 0 $null; $w = Get-UtilSamplePlayWindow {literal}\n"
+                     f"Write-Output ('{key} session=' + $c.session + ' startTicks=' + $c.playbackStartUtcTicks + ' window=' + $(if ($null -eq $w) {{ 'NULL' }} else {{ 'SET' }}))\n")
+        proc = self._sibling_probe(body)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = {ln.split(" ", 1)[0]: ln for ln in proc.stdout.splitlines() if ln.strip()}
+        self.assertRegex(lines["good"], r"^good session=3 startTicks=[0-9]+ window=SET$")
+        self.assertEqual(lines["a1"], "a1 session= startTicks= window=NULL")
+        self.assertEqual(lines["a2"], "a2 session=3 startTicks= window=NULL")
 
     def test_throws_when_neither_marker_nor_summary_is_present(self) -> None:
         proc = self._run("nothing relevant here\n")
