@@ -127,6 +127,9 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    `IMPORT_TEMP_NOT_DELETED`, `IMPORT_PARTIAL_NOT_DELETED` and `IMPORT_BACKUP_NOT_DELETED` each name a
    file Import could not remove. `CLONE_REMOTE_MISMATCH` and `CLONE_DOCTRINE_REMOTE_MISMATCH` mean an
    existing checkout's remote names another repository. Nothing is fetched; fix the remote by hand.
+   (r17: a push url that names another repository is the same mismatch.) `LEASE_OBJECT_FAILED` means
+   git could not build the lease commit (an empty `-GitName`, say), and `LEASE_PUSH_URL_DIFFERS` means the
+   lease remote pushes somewhere other than where it reads. In both cases nothing is pushed.
 
 5. **Do the owner-only checklist** (`-Phase Checklist` prints it). Then go through the cut-over phases.
 

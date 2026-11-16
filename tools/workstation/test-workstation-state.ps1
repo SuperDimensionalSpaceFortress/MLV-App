@@ -2014,6 +2014,63 @@ if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r17 p18 A4')) {
     Assert-That ($p18after -ceq $p18sha) 'r17 p18 A4 lease: nothing is pushed, the remote lease branch is not deleted' "after='$p18after' before='$p18sha'"
 }
 
+# ================================================================ r17 fix iteration 2 (head b9c22015): adversary pass 19, A3 A5 A6 (A1 A2 A4 A7 are hub-deferred classes, DISTINGUISH in the PR)
+# A3: a space inside a query value or a userinfo part never ends the redaction in free text (git's error text quoting the URL)
+if ($fnLoaded -and (Test-Has 'ConvertTo-RedactedUrlText' 'r17 p19 A3')) {
+    foreach ($t in @("fatal: unable to access 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git?access_token=first SECOND_SECRET/': The requested URL returned error: 403",
+            "remote is https://al ice:p ass@github.com/o/r.git, expected x", "a`nhttps://github.com/o/r.git#frag=ONE TWO_SECRET`nnext line stays")) {
+        $got = ConvertTo-RedactedUrlText $t
+        Assert-That (-not ($got -match 'first|SECOND_SECRET|ice:p|p ass|ONE|TWO_SECRET')) "r17 p19 A3 sink: no query or userinfo text survives a space in: $($t -replace "`n", ' / ')" $got
+    }
+    Assert-That ((ConvertTo-RedactedUrlText "a`nhttps://h/x?t=1`nnext line stays") -ceq "a`nhttps://h/x?***`nnext line stays") 'r17 p19 A3 sink control: only the rest of the URL''s own line is dropped'
+}
+# A5: a bundle file that grows past the scan limit after the inspection is skipped by the locked copy (judged on the bytes it read); nothing is written
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r17 p19 A5') -and (Test-Has 'Get-StagedFileVerdictDetail' 'r17 p19 A5')) {
+    $p19src = Join-Path (New-Scratch 'r17-p19-a5') 'service.txt'; [IO.File]::WriteAllText($p19src, 'x')
+    $p19fi = [IO.FileInfo]::new($p19src); [void]$p19fi.Length   # the inspection-time FileInfo, 1 byte
+    [IO.File]::WriteAllText($p19src, ('x' * 4097))   # grows past a 4096-byte limit before the copy reads it
+    $p19dst = Join-Path (New-Scratch 'r17-p19-a5-host') 'service.txt'
+    $p19r = Copy-ImportFileLocked -Source $p19fi -Dest $p19dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false -MaxScanBytes 4096
+    Assert-That ($p19r.Result -ceq 'source-credential' -and $p19r.Why -match 'larger than the scan limit' -and -not (Test-Path -LiteralPath $p19dst)) 'r17 p19 A5 import: a bundle file grown past the limit is skipped and nothing is written' "$($p19r.Result) $($p19r.Why)"
+    $p19e = Join-Path (New-Scratch 'r17-p19-a5-stage') 'service.txt'; [IO.File]::WriteAllText($p19e, 'x'); $p19efi = [IO.FileInfo]::new($p19e); [void]$p19efi.Length
+    [IO.File]::WriteAllText($p19e, ('x' * 4097))
+    Assert-That ((Get-StagedFileVerdictDetail -File $p19efi -MaxScanBytes 4096).Why -ceq 'larger than the scan limit') 'r17 p19 A5 sibling export: a staged file grown past the limit before the read is still oversized'
+}
+# A6: a lease remote whose push url names another repository is refused (LEASE_PUSH_URL_DIFFERS) and nothing is pushed there; Clone refuses the same push url
+if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r17 p19 A6') -and (Test-Has 'Invoke-PhaseClone' 'r17 p19 A6')) {
+    $p19a6 = New-Scratch 'r17-p19-a6'
+    $p19main = Join-Path $p19a6 'main.git'; $p19other = Join-Path $p19a6 'other.git'
+    & git init -q --bare $p19main 2>$null; & git init -q --bare $p19other 2>$null
+    $p19r6 = Join-Path $p19a6 'repo'; [void][IO.Directory]::CreateDirectory($p19r6); & git -C $p19r6 init -q 2>$null
+    & git -C $p19r6 remote add fork $p19main; & git -C $p19r6 remote set-url --push fork $p19other
+    $savedRepo = $script:Repo; $savedTemp = $env:TEMP; $savedLog = $script:LogFile; $savedName = $GitName; $savedEmail = $GitEmail
+    $script:Repo = $p19r6; $Repo = $p19r6; $env:TEMP = New-Scratch 'r17-p19-a6-temp'; $script:LogFile = Join-Path $p19a6 'lease.log'
+    $GitName = 'r17 test'; $script:GitName = 'r17 test'; $GitEmail = 'r17@example.invalid'; $script:GitEmail = 'r17@example.invalid'   # a valid identity: the push url check is what must refuse
+    $p19err = ''
+    $p19ident = @{}; foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { $p19ident[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, 'r17 test') }   # identity pinned (env outranks -c user.name)
+    try { Set-HubLease -Holder 'TEST-HOST' -Current @{ Exists = $false; Sha = ''; Holder = '' } -Reason 'r17 p19 A6' *>&1 | Out-Null } catch { $p19err = $_.Exception.Message }
+    finally {
+        $script:Repo = $savedRepo; $Repo = $savedRepo; $env:TEMP = $savedTemp; $script:LogFile = $savedLog; $GitName = $savedName; $script:GitName = $savedName; $GitEmail = $savedEmail; $script:GitEmail = $savedEmail
+        foreach ($n in $p19ident.Keys) { [Environment]::SetEnvironmentVariable($n, $p19ident[$n]) }
+    }
+    $p19pushed = ("$(& git -C $p19other rev-parse --verify --quiet $LeaseRef 2>$null)").Trim()
+    Assert-That ($p19err -match 'LEASE_PUSH_URL_DIFFERS' -and -not $p19pushed) 'r17 p19 A6 lease: a push url naming another repository is refused and nothing is pushed there' "err=$p19err pushed='$p19pushed'"
+    # Clone: fork's fetch url is right, its push url names another repository
+    $p19cws = New-Scratch 'r17-p19-a6-clone'
+    $p19crepo = Join-Path $p19cws 'MLV-App'; [void][IO.Directory]::CreateDirectory($p19crepo); & git -C $p19crepo init -q 2>$null
+    & git -C $p19crepo remote add fork $ForkUrl; & git -C $p19crepo remote set-url --push fork 'https://github.com/other/MLV-App.git'
+    $p19cdoc = Join-Path $p19cws 'doctrine'; [void][IO.Directory]::CreateDirectory($p19cdoc); & git -C $p19cdoc init -q 2>$null; & git -C $p19cdoc remote add origin $DoctrineUrl
+    $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo; $savedLog = $script:LogFile
+    $script:Repo = $p19crepo; $Repo = $p19crepo; $script:DoctrineRepo = $p19cdoc; $DoctrineRepo = $p19cdoc; $script:LogFile = Join-Path $p19cws 'clone.log'
+    $script:Failures.Clear()
+    # no network: should an older script go on to fetch, git refuses the https transport at once
+    $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')
+    try { Invoke-PhaseClone *>&1 | Out-Null } catch { } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
+    $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH* fork pushurl' }).Count -eq 1) 'r17 p19 A6 clone: a fork push url naming another repository is refused typed CLONE_REMOTE_MISMATCH (before any fetch)' ($script:Failures -join ',')
+    $script:Failures.Clear()
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

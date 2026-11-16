@@ -162,10 +162,12 @@ $script:LogFile = if ($isGate) { Join-Path $logDir 'gate.log' } else { Join-Path
 # to the LAST '@' before the path (an unencoded '@' in a password leaks nothing), then everything after a '?' or '#' of a URL is dropped and printed '?***'.
 # r17 pass 18 A1: no character but whitespace ends either span (a quote in a password, 'p''ass', or in a query value, 'abc''def', used to stop the match and print the rest);
 # in free text a URL ends at whitespace, so the userinfo span is every non-space character up to the last '@' of that word (over-redaction is the safe side).
+# r17 pass 19 A3: a space does not end a URL either (a query value 'first SECOND_SECRET' quoted in git's error text): the userinfo span is everything up to the last '@'
+# before the first '/' on that line, and after a URL's first '?' or '#' the REST OF THE LINE is dropped ('?***'). Only a line break ends a span.
 function ConvertTo-RedactedUrlText {
     param([string]$Text)
-    $s = [regex]::Replace("$Text", '(?i)([a-z][a-z0-9+.\-]*://)\S*@', '$1***@')
-    return ([regex]::Replace($s, '(?i)([a-z][a-z0-9+.\-]*://[^\s?#]*)[?#]\S*', '$1?***'))
+    $s = [regex]::Replace("$Text", '(?im)([a-z][a-z0-9+.\-]*://)[^/\r\n]*@', '$1***@')
+    return ([regex]::Replace($s, '(?im)([a-z][a-z0-9+.\-]*://[^\r\n?#]*)[?#][^\r\n]*', '$1?***'))
 }
 
 function Write-Log {
@@ -313,14 +315,24 @@ function Set-HubLease {
     $msg = "hub-lease: holder=$(if ($Holder) { $Holder } else { '<released>' }) by $env:COMPUTERNAME"
     $commitArgs = @('-C', $Repo, '-c', "user.name=$GitName", '-c', "user.email=$GitEmail", 'commit-tree', $tree, '-m', $msg)
     if ($Current.Exists) { $commitArgs += @('-p', $Current.Sha) }
-    $commit = ("$(Invoke-GitTraceScrubbed { & git @commitArgs })").Trim()
+    $commitOut = @(Invoke-GitTraceScrubbed { & git @commitArgs 2>&1 })
+    $commit = (@($commitOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join '').Trim()
+    $commitErr = (@($commitOut | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join ' ').Trim()   # git's own reason, for the typed line
     # r17 pass 18 A4: every object the push publishes is proven first. A failed hash-object / write-tree / commit-tree (an empty -GitName, say: commit-tree exits 128
     # with empty stdout) used to leave '' here, and pushing ':<LeaseRef>' DELETES the lease branch while the log said the lease was acquired. Now it is typed and nothing is pushed.
     $objRx = '^[0-9a-f]{40}([0-9a-f]{24})?$'
     foreach ($o in @(@('hash-object', $blob), @('write-tree', $tree), @('commit-tree', $commit))) {
-        if ("$($o[1])" -notmatch $objRx) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_OBJECT_FAILED git $($o[0]) gave no object id ('$($o[1])'); nothing was pushed, the lease ref is unchanged" }
+        if ("$($o[1])" -notmatch $objRx) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_OBJECT_FAILED git $($o[0]) gave no object id ('$($o[1])'$(if ($o[0] -eq 'commit-tree' -and $commitErr) { "; git: $commitErr" })); nothing was pushed, the lease ref is unchanged" }
     }
     if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_OBJECT_FAILED git commit-tree exited $LASTEXITCODE; nothing was pushed, the lease ref is unchanged" }
+    # r17 pass 19 A6: Get-HubLease reads the lease through the remote's FETCH url and a push goes to its PUSH url(s); a remote whose pushurl names another repository would
+    # report the lease acquired while the fork stays unheld. Every push url must name the fetch url's repository, else LEASE_PUSH_URL_DIFFERS and nothing is pushed.
+    $leaseFetchUrl = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $LeaseRemote 2>$null }) -join '').Trim()
+    $leasePushUrls = @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $LeaseRemote 2>$null } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    if (-not $leaseFetchUrl -or $leasePushUrls.Count -eq 0 -or @($leasePushUrls | Where-Object { -not (Test-GitRemoteUrlSame $_ $leaseFetchUrl) }).Count -gt 0) {
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+        throw "LEASE_PUSH_URL_DIFFERS remote '$LeaseRemote' reads from $(Get-RedactedRemoteUrl $leaseFetchUrl) but pushes to $((@($leasePushUrls | ForEach-Object { Get-RedactedRemoteUrl $_ })) -join ', '); nothing was pushed, the lease ref is unchanged"
+    }
     $expect = if ($Current.Exists) { $Current.Sha } else { '' }
     [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'push', '--porcelain', "--force-with-lease=${LeaseRef}:$expect", $LeaseRemote, "${commit}:$LeaseRef"))
     Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
@@ -661,6 +673,13 @@ function Invoke-PhaseClone {
                     $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0])")
                     # r15 pass 14 A2: the URL is printed with any user:password part redacted (the log and the console never carry a credential)
                     throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' is $(Get-RedactedRemoteUrl $have), expected $($want[1]) (nothing was fetched; fix the remote by hand and re-run -Phase Clone)"
+                }
+                # r17 pass 19 A6 sibling: a push url (remote.<name>.pushurl) that names another repository is the same mismatch
+                foreach ($pu in @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $want[0] 2>$null } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })) {
+                    if (-not (Test-GitRemoteUrlSame $pu $want[1])) {
+                        $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0]) pushurl")
+                        throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' pushes to $(Get-RedactedRemoteUrl $pu), expected $($want[1]) (nothing was fetched; fix the push url by hand and re-run -Phase Clone)"
+                    }
                 }
             }
             if ($remotes -notcontains 'fork') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'fork', $ForkUrl)) }
@@ -1141,6 +1160,8 @@ function Get-StagedFileVerdictDetail {
     if ($File.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
     $t = $null
     try { $t = [IO.File]::ReadAllText($File.FullName) } catch { return @{ Why = 'unreadable'; Line = 0 } }
+    # r17 pass 19 A5 sibling: a file that grew past the limit between the length check and the read is judged on what was read
+    if ($t.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
     $line = Get-CredentialHitLine $t
     if ($line -gt 0) { return @{ Why = 'credential pattern'; Line = $line } }
     return @{ Why = ''; Line = 0 }
@@ -1539,6 +1560,8 @@ function Test-ImportReplaces {
 function Copy-ImportFileLocked {
     param([System.IO.FileInfo]$Source, [string]$Dest, [bool]$ExcludeNewer, [bool]$ExcludeOlder, [bool]$ExcludeChanged, [long]$MaxScanBytes = 26214400)
     $bytes = [IO.File]::ReadAllBytes($Source.FullName)
+    # r17 pass 19 A5: the size limit is judged on the bytes actually read (a bundle file that grew past it after the inspection is skipped, as the inspection would have)
+    if ($bytes.Length -gt $MaxScanBytes) { return @{ Result = 'source-credential'; Why = 'bundle file larger than the scan limit' } }
     $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true)
     try { $srcText = $sr.ReadToEnd() } finally { $sr.Dispose() }
     if (Test-CredentialText $srcText) { return @{ Result = 'source-credential'; Why = 'bundle file carries a credential' } }
