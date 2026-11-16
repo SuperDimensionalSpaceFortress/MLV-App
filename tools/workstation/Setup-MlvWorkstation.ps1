@@ -158,8 +158,19 @@ try { [void][IO.Directory]::CreateDirectory($logDir) } catch { $logDir = Join-Pa
 $isGate = ($Phase -contains 'Gate')
 $script:LogFile = if ($isGate) { Join-Path $logDir 'gate.log' } else { Join-Path $logDir "setup-$stamp.log" }
 
+# r17 F2: the URL redaction rule (Get-RedactedRemoteUrl calls it). In any text, a 'scheme://<userinfo>@' part is replaced by 'scheme://***@' with the userinfo running
+# to the LAST '@' before the path (an unencoded '@' in a password leaks nothing), then everything after a '?' or '#' of a URL is dropped and printed '?***'.
+function ConvertTo-RedactedUrlText {
+    param([string]$Text)
+    $s = [regex]::Replace("$Text", '(?i)([a-z][a-z0-9+.\-]*://)[^/\s''"<>]*@', '$1***@')
+    return ([regex]::Replace($s, '(?i)([a-z][a-z0-9+.\-]*://[^\s''"<>?#]*)[?#][^\s''"<>]*', '$1?***'))
+}
+
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'MANUAL', 'OK')][string]$Level = 'INFO')
+    # r17 F2: the one sink for the console and the setup log; no line it writes carries a URL's userinfo or query string, whichever caller printed the URL
+    # (a remote-mismatch refusal, a native command line, git's own error text quoting a remote)
+    $Message = ConvertTo-RedactedUrlText $Message
     $line = '{0} [{1}] {2}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $Level, $Message
     if (-not $isGate) {
         $color = @{ INFO = 'Gray'; WARN = 'Yellow'; ERROR = 'Red'; MANUAL = 'Cyan'; OK = 'Green' }[$Level]
@@ -183,6 +194,25 @@ function Invoke-Step {
     }
 }
 
+# r17 F3 (sol B5; catalogue T-01; card SETUP-MLVWS-GIT-TRACE-SCRUB-1 folded here): the ONE route for a native child that may run git. Every GIT_TRACE* variable
+# (GIT_TRACE, GIT_TRACE2, GIT_TRACE2_EVENT, GIT_TRACE2_PERF, GIT_TRACE_PACKET, GIT_TRACE_PERFORMANCE, GIT_TRACE_SETUP, GIT_TRACE_CURL, GIT_TRACE_PACK_ACCESS,
+# GIT_TRACE_SHALLOW, GIT_TRACE_REFS, GIT_TRACE_FSMONITOR and any other GIT_TRACE* name) is removed from the process environment the child inherits, so a trace
+# destination that names a tracked file is never appended to (Export promises it never modifies a source file); the parent's values are restored in a finally.
+# [Environment] is used, not Remove-Item Env:, so -WhatIf cannot leave the variables in place. The script block's output (and $LASTEXITCODE) pass through unchanged.
+# Its locals carry a '__gitTrace' prefix: the script block runs in a child of THIS scope (PowerShell scoping is dynamic), so a plain name ($k, $saved) would shadow a
+# caller's variable of the same name inside the block.
+function Invoke-GitTraceScrubbed {
+    param([scriptblock]$__gitTraceBlock)
+    $__gitTraceSaved = @{}
+    foreach ($__gitTraceKey in @([Environment]::GetEnvironmentVariables('Process').Keys)) { if ("$__gitTraceKey" -match '^(?i)GIT_TRACE') { $__gitTraceSaved["$__gitTraceKey"] = [Environment]::GetEnvironmentVariable("$__gitTraceKey", 'Process') } }
+    try {
+        foreach ($__gitTraceKey in @($__gitTraceSaved.Keys)) { [Environment]::SetEnvironmentVariable($__gitTraceKey, $null, 'Process') }
+        & $__gitTraceBlock
+    } finally {
+        foreach ($__gitTraceKey in @($__gitTraceSaved.Keys)) { [Environment]::SetEnvironmentVariable($__gitTraceKey, $__gitTraceSaved[$__gitTraceKey], 'Process') }
+    }
+}
+
 function Invoke-Native {
     # Runs a native command, logs its output, throws on a non-zero exit unless -AllowFail.
     param([string]$Exe, [string[]]$Arguments, [switch]$AllowFail, [int[]]$OkCodes = @(0))
@@ -190,7 +220,7 @@ function Invoke-Native {
     # -OkCodes are consulted (robocopy's normal exit 1 included). This function owns exit-code handling, so it turns that off for its own scope.
     $PSNativeCommandUseErrorActionPreference = $false
     Write-Log ("  > {0} {1}" -f $Exe, ($Arguments -join ' '))
-    $out = & $Exe @Arguments 2>&1
+    $out = Invoke-GitTraceScrubbed { & $Exe @Arguments 2>&1 }   # r17 F3: no inherited GIT_TRACE* destination
     $code = $LASTEXITCODE
     foreach ($o in @($out)) { if ("$o".Trim()) { Write-Log ("    {0}" -f "$o".TrimEnd()) } }
     if ($OkCodes -notcontains $code -and -not $AllowFail) { throw "$Exe exited $code" }
@@ -236,16 +266,16 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
 # ---------------------------------------------------------------------------------------------
 function Get-HubLease {
     if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) { return @{ Error = "repo missing at $Repo" } }
-    $ls = & git -C $Repo ls-remote $LeaseRemote $LeaseRef 2>&1
+    $ls = Invoke-GitTraceScrubbed { & git -C $Repo ls-remote $LeaseRemote $LeaseRef 2>&1 }   # r17 F3: every native git call drops GIT_TRACE*
     if ($LASTEXITCODE -ne 0) { return @{ Error = "ls-remote failed: $($ls -join ' ')" } }
     $line = @($ls | Where-Object { "$_" -match '^[0-9a-f]{40}\s' }) | Select-Object -First 1
     if (-not $line) { return @{ Error = $null; Exists = $false; Sha = ''; Holder = ''; Data = $null } }
     $sha = ("$line" -split '\s+')[0]
     # r15 pass 14 A4 sibling: under -WhatIf the fetch (a write to the local lease ref and the object store) is not run; the lease is reported unread
     if ($WhatIfPreference) { return @{ Error = 'WhatIf: the lease content is not fetched (a dry run writes nothing)' } }
-    & git -C $Repo fetch --quiet --no-tags $LeaseRemote "+${LeaseRef}:refs/hub-lease-local/mlv-app" 2>&1 | Out-Null
+    Invoke-GitTraceScrubbed { & git -C $Repo fetch --quiet --no-tags $LeaseRemote "+${LeaseRef}:refs/hub-lease-local/mlv-app" 2>&1 } | Out-Null
     if ($LASTEXITCODE -ne 0) { return @{ Error = 'fetch of lease ref failed' } }
-    $raw = & git -C $Repo show "${sha}:$LeaseFile" 2>&1
+    $raw = Invoke-GitTraceScrubbed { & git -C $Repo show "${sha}:$LeaseFile" 2>&1 }
     if ($LASTEXITCODE -ne 0) { return @{ Error = "lease commit $sha has no $LeaseFile" } }
     try { $data = ($raw -join "`n") | ConvertFrom-Json } catch { return @{ Error = "lease JSON unreadable at $sha" } }
     return @{ Error = $null; Exists = $true; Sha = $sha; Holder = [string]$data.holder; Data = $data }
@@ -264,16 +294,16 @@ function Set-HubLease {
     }
     $tmp = Join-Path $env:TEMP "hub-lease-$stamp.json"
     [IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json) + "`n", [Text.Encoding]::ASCII)
-    $blob = (& git -C $Repo hash-object -w --no-filters $tmp).Trim()
+    $blob = ("$(Invoke-GitTraceScrubbed { & git -C $Repo hash-object -w --no-filters $tmp })").Trim()
     # A private temp index, not mktree on stdin: pwsh appends CRLF to piped native input, which would
     # land a carriage return in the tree entry name. The repo's real index and worktree are untouched.
     $idx = Join-Path $env:TEMP "hub-lease-index-$stamp"
     $oldIdx = $env:GIT_INDEX_FILE
     try {
         $env:GIT_INDEX_FILE = $idx
-        & git -C $Repo update-index --add --cacheinfo "100644,$blob,$LeaseFile"
+        Invoke-GitTraceScrubbed { & git -C $Repo update-index --add --cacheinfo "100644,$blob,$LeaseFile" }
         if ($LASTEXITCODE -ne 0) { throw 'update-index failed' }
-        $tree = (& git -C $Repo write-tree).Trim()
+        $tree = ("$(Invoke-GitTraceScrubbed { & git -C $Repo write-tree })").Trim()
     } finally {
         $env:GIT_INDEX_FILE = $oldIdx
         Remove-Item -LiteralPath $idx -ErrorAction SilentlyContinue
@@ -281,7 +311,7 @@ function Set-HubLease {
     $msg = "hub-lease: holder=$(if ($Holder) { $Holder } else { '<released>' }) by $env:COMPUTERNAME"
     $commitArgs = @('-C', $Repo, '-c', "user.name=$GitName", '-c', "user.email=$GitEmail", 'commit-tree', $tree, '-m', $msg)
     if ($Current.Exists) { $commitArgs += @('-p', $Current.Sha) }
-    $commit = (& git @commitArgs).Trim()
+    $commit = ("$(Invoke-GitTraceScrubbed { & git @commitArgs })").Trim()
     $expect = if ($Current.Exists) { $Current.Sha } else { '' }
     [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'push', '--porcelain', "--force-with-lease=${LeaseRef}:$expect", $LeaseRemote, "${commit}:$LeaseRef"))
     Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
@@ -399,14 +429,14 @@ function Invoke-PhasePackages {
     Update-SessionPath
 
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        $have = (& py list 2>&1) -join "`n"
+        $have = (Invoke-GitTraceScrubbed { & py list 2>&1 }) -join "`n"
         if ($have -notmatch '3\.14') { Invoke-Step 'py install 3.14 (matches VIRTUAL-TEN python 3.14)' { [void](Invoke-Native -Exe 'py' -Arguments @('install', '3.14') -AllowFail) } }
     } else { Write-Log 'py launcher not on PATH yet; open a new shell and re-run -Phase Packages' 'WARN' }
     Update-SessionPath
 
     if (Get-Command npm -ErrorAction SilentlyContinue) {
         foreach ($pkg in '@anthropic-ai/claude-code', '@openai/codex') {
-            $present = (& npm ls -g --depth 0 $pkg 2>&1) -join "`n"
+            $present = (Invoke-GitTraceScrubbed { & npm ls -g --depth 0 $pkg 2>&1 }) -join "`n"
             if ($present -match [regex]::Escape($pkg) + '@') { Write-Log "present: npm -g $pkg" 'OK' }
             else { Invoke-Step "npm install -g $pkg" { [void](Invoke-Native -Exe 'npm' -Arguments @('install', '-g', $pkg)) } }
         }
@@ -612,12 +642,12 @@ function Invoke-PhaseClone {
     } else { Write-Log "present: $Repo" 'OK' }
     if (Test-Path -LiteralPath (Join-Path $Repo '.git')) {
         Invoke-Step 'MLV-App remotes, fetch, master tracks fork/master' {
-            $remotes = @(& git -C $Repo remote)
+            $remotes = @(Invoke-GitTraceScrubbed { & git -C $Repo remote })
             # r15 pass 13 A5: an EXISTING remote must name the intended repository (fork = $ForkUrl, origin = $UpstreamUrl). A remote that names another repository (the
             # two swapped, say) is refused typed CLONE_REMOTE_MISMATCH before anything is fetched or tracked; it is never silently accepted or rewritten.
             foreach ($want in @(@('fork', $ForkUrl), @('origin', $UpstreamUrl))) {
                 if ($remotes -notcontains $want[0]) { continue }
-                $have = (@(& git -C $Repo remote get-url $want[0]) -join '').Trim()
+                $have = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $want[0] }) -join '').Trim()
                 if (-not (Test-GitRemoteUrlSame $have $want[1])) {
                     $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0])")
                     # r15 pass 14 A2: the URL is printed with any user:password part redacted (the log and the console never carry a credential)
@@ -639,7 +669,7 @@ function Invoke-PhaseClone {
         }
     } else {
         # r15 pass 13 A5: an existing doctrine checkout must BE the doctrine repository (its 'origin' names $DoctrineUrl); any other checkout is a typed failure
-        $dHave = (@(& git -C $DoctrineRepo remote get-url origin 2>$null) -join '').Trim()
+        $dHave = (@(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url origin 2>$null }) -join '').Trim()
         if (Test-GitRemoteUrlSame $dHave $DoctrineUrl) { Write-Log "present: $DoctrineRepo" 'OK' }
         else {
             Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$(Get-RedactedRemoteUrl $dHave)', expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
@@ -649,9 +679,12 @@ function Invoke-PhaseClone {
 }
 
 # r15 pass 14 A2: a remote URL as it may be printed: every 'scheme://<userinfo>@' part (a user, a user:password, a token) is replaced by 'scheme://***@'.
+# r17 F2 (opus key3 B2 = sol B3 = fable B2): the userinfo runs to the LAST '@' before the path ('https://alice:p@ssw0rd@github.com/...' prints 'https://***@github.com/...',
+# not '***@ssw0rd@'), and everything after a '?' or '#' (a query-string token, a fragment) is dropped and printed '?***'. It works on any text (a log line, a
+# git error that quotes the URL), so Write-Log applies it to every line it writes. An scp-like 'git@github.com:o/r.git' has no scheme and no secret; it is unchanged.
 function Get-RedactedRemoteUrl {
     param([string]$Url)
-    return ([regex]::Replace("$Url", '(?i)([a-z][a-z0-9+.\-]*://)[^/@\s]*@', '$1***@'))
+    return (ConvertTo-RedactedUrlText $Url)   # the one rule, defined beside Write-Log (it runs before this point of the script is reached)
 }
 
 # r15 pass 13 A5: true when two git remote URLs name the same repository: compared case-insensitively after the GitHub ssh forms ('git@github.com:o/r',
@@ -662,7 +695,8 @@ function Test-GitRemoteUrlSame {
         param($u)
         $s = "$u".Trim()
         $s = $s -replace '^(?i)git@github\.com:', 'https://github.com/' -replace '^(?i)ssh://git@github\.com/', 'https://github.com/'
-        $s = $s -replace '^(?i)([a-z][a-z0-9+.\-]*://)[^/@\s]*@', '$1'   # r15 pass 14 A2: a user / token part does not change which repository a URL names
+        $s = $s -replace '^(?i)([a-z][a-z0-9+.\-]*://)[^/\s]*@', '$1'   # r15 pass 14 A2: a user / token part does not change which repository a URL names (r17 F2: up to the last '@')
+        $s = $s -replace '[?#].*$', ''   # r17 F2: nor does a query string or a fragment
         $s = $s -replace '/+$', '' -replace '(?i)\.git$', ''
         return $s.ToLowerInvariant()
     }
@@ -1308,20 +1342,20 @@ function Invoke-PhaseExport {
         $v = [System.Collections.Generic.List[string]]::new()
         $v.Add("host=$env:COMPUTERNAME exported=$stamp")
         foreach ($c in @(@('git', '--version'), @('gh', '--version'), @('node', '--version'), @('npm', '--version'), @('py', '-3', '--version'), @('claude', '--version'), @('codex', '--version'))) {
-            try { $o = (& $c[0] $c[1..($c.Count - 1)] 2>&1 | Select-Object -First 1); $v.Add("$($c[0]): $o") } catch { $v.Add("$($c[0]): (missing)") }
+            try { $o = (Invoke-GitTraceScrubbed { & $c[0] $c[1..($c.Count - 1)] 2>&1 } | Select-Object -First 1); $v.Add("$($c[0]): $o") } catch { $v.Add("$($c[0]): (missing)") }   # r17 F3
         }
         $v.Add("pwsh: $($PSVersionTable.PSVersion)")
         Write-AsciiFile (Join-Path $ref 'toolchain-versions.txt') (($v -join "`r`n") + "`r`n")
     }
     Invoke-Step 'Census: worktree branches whose tip is not on the fork (push these before cut-over)' {
         $forkRefs = @{}
-        foreach ($l in @(& git -C $Repo ls-remote $LeaseRemote 'refs/heads/*' 2>$null)) {
+        foreach ($l in @(Invoke-GitTraceScrubbed { & git -C $Repo ls-remote $LeaseRemote 'refs/heads/*' 2>$null })) {   # r17 F3: Export never lets git append to a trace file
             $p = "$l" -split '\s+'; if ($p.Count -ge 2) { $forkRefs[$p[1] -replace '^refs/heads/', ''] = $p[0] }
         }
         $rows = [System.Collections.Generic.List[string]]::new()
         $rows.Add("status`tbranch`tlocal_sha`tworktree")
         $wt = ''; $sha = ''
-        foreach ($l in @(& git -C $Repo worktree list --porcelain)) {
+        foreach ($l in @(Invoke-GitTraceScrubbed { & git -C $Repo worktree list --porcelain })) {
             if ($l -like 'worktree *') { $wt = $l.Substring(9) }
             elseif ($l -like 'HEAD *') { $sha = $l.Substring(5) }
             elseif ($l -like 'branch *') {
@@ -1434,7 +1468,8 @@ function Test-CredentialNamePresent {
 #   - it carries a credential itself (a handmade or tampered bundle), or
 #   - the file it would replace on this host carries a credential (any name), or
 #   - the file it would replace is a credential-ROLE file (settings.json, config.toml, ...) that names a credential-like key at all.
-# Returns objects { Source; Dest; Reason }. Reads only; a file that cannot be read counts as carrying a credential (fail closed).
+# Returns objects { Source; Dest; Reason }. Reads only; a file that cannot be read counts as carrying a credential (fail closed), except (r17 F1) a host file
+# another process HOLDS (an IOException, a sharing or lock violation): that one record is IMPORT_DEST_CHANGED_SKIPPED <path> from the locked copy, a failure (exit 1).
 function Get-ImportCredentialSkips {
     param([string]$SourceDir, [string]$DestDir, [long]$MaxScanBytes = 26214400)
     $skips = [System.Collections.Generic.List[object]]::new()
@@ -1451,10 +1486,19 @@ function Get-ImportCredentialSkips {
         else { try { $srcText = [IO.File]::ReadAllText($f.FullName) } catch { $reason = 'bundle file unreadable' } }
         if (-not $reason -and (Test-CredentialText $srcText)) { $reason = 'bundle file carries a credential' }
         if (-not $reason -and (Test-Path -LiteralPath $dest -PathType Leaf)) {
-            $dstText = $null; $dstOk = $true
+            $dstText = $null; $dstOk = $true; $dstHeld = $false
             if ((Get-Item -LiteralPath $dest -Force).Length -gt $MaxScanBytes) { $dstOk = $false }
-            else { try { $dstText = [IO.File]::ReadAllText($dest) } catch { $dstOk = $false } }
-            if (-not $dstOk) { $reason = 'host file unreadable or larger than the scan limit' }
+            else {
+                # r17 F1 (opus key3 B1 = sol B4 = fable B1): an IOException here is a host file another process HOLDS with a share mode that denies readers (a sharing or
+                # lock violation; FileShare.None, or a writer that denies Read). It is NOT classed as carrying a credential: it is left to Copy-ImportFileLocked, which
+                # opens it exclusively and, when the copy rules would replace it, returns 'changed' (IMPORT_DEST_CHANGED_SKIPPED <path>, a recorded failure, exit 1, the
+                # host file untouched); a held file the rules would keep is never opened there. Every other read failure (access denied) still fails closed below.
+                try { $dstText = [IO.File]::ReadAllText($dest) }
+                catch [System.IO.IOException] { $dstHeld = $true }
+                catch { $dstOk = $false }
+            }
+            if ($dstHeld) { }
+            elseif (-not $dstOk) { $reason = 'host file unreadable or larger than the scan limit' }
             elseif (Test-CredentialText $dstText) { $reason = 'host file carries a credential' }
             elseif (($CredentialRoleFiles -contains $f.Name.ToLowerInvariant()) -and ($roleRx.IsMatch($dstText) -or (Test-CredentialNamePresent $dstText))) { $reason = 'host credential-role file names a credential key' }
         }
@@ -2210,7 +2254,7 @@ function Invoke-MeterInstalls {
         $out = @(); $code = 1
         # p5 A5: the restore runs in finally, so a failing log write (or any throw) between the install and here still puts the task back.
         try {
-            $out = @(& $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $m.Script -Install 2>&1 | ForEach-Object { "$_" })
+            $out = @(Invoke-GitTraceScrubbed { & $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $m.Script -Install 2>&1 } | ForEach-Object { "$_" })   # r17 F3: the child inherits no GIT_TRACE*
             $code = $LASTEXITCODE
             foreach ($o in $out) { if ($o.Trim()) { Write-Log "    $($o.TrimEnd())" } }
         } finally { Restore-MeterTaskState -Name $m.Name -Before $before }
@@ -2247,7 +2291,7 @@ function Invoke-PhaseVerify {
     $ak = 'C:\ProgramData\ssh\administrators_authorized_keys'
     $keys = try { if (Test-Path -LiteralPath $ak) { @(Get-Content -LiteralPath $ak -ErrorAction Stop | Where-Object { $_ -match '^\s*ssh-' }).Count } else { 0 } } catch { 'unreadable (not elevated)' }
     Write-Log "administrators_authorized_keys: $keys real key(s)" $(if ($keys -is [int] -and $keys -gt 0) { 'OK' } else { 'WARN' })
-    Write-Log "LongPathsEnabled=$((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled)  git core.longpaths=$(& git config --get core.longpaths 2>$null)"
+    Write-Log "LongPathsEnabled=$((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled)  git core.longpaths=$(Invoke-GitTraceScrubbed { & git config --get core.longpaths 2>$null })"
     $os = Get-CimInstance Win32_OperatingSystem
     $ram = [double](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
     $pfMax = [double](@(Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | Measure-Object -Property MaximumSize -Sum).Sum) / 1024
@@ -2261,7 +2305,7 @@ function Invoke-PhaseVerify {
     }
     Write-Log "PAUSED kill switch: $(Test-Path (Join-Path $StateRoot 'PAUSED'))"
     [void](Show-HubLease)
-    if (Get-Command gh -ErrorAction SilentlyContinue) { & gh auth status *> $null; Write-Log "gh auth: $(if ($LASTEXITCODE -eq 0) { 'signed in' } else { 'NOT signed in' })" }
+    if (Get-Command gh -ErrorAction SilentlyContinue) { Invoke-GitTraceScrubbed { & gh auth status *> $null }; Write-Log "gh auth: $(if ($LASTEXITCODE -eq 0) { 'signed in' } else { 'NOT signed in' })" }
     Write-Log '--- venue shares (fail closed: README step 6b)'
     foreach ($bad in @(Test-ShareHeartbeatPreflight -UltraMagnusPath $UltraMagnusHeartbeatPath -BachelorPath $BachelorHeartbeatPath)) { $script:Failures.Add("SHARE_PREFLIGHT_FAILED $bad") }
     Write-Log '--- meter installs (disk-auto-reclaim pin, pwsh auto-repin)'

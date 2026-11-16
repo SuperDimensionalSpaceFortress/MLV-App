@@ -1835,6 +1835,124 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r16 p16 A1 A2') -and (Test-H
     }
 }
 
+# ================================================================ r17 (head 4e015891): the three key blockers all r16 seats agree on (opus key3 B1 B2, sol B3 B4 B5, fable B1 B2)
+# F1: a host file Import must replace but cannot READ, because another process holds it with a share mode that denies readers, is the typed changed-destination failure
+#     (IMPORT_DEST_CHANGED_SKIPPED <path>, recorded, exit 1, host bytes untouched). The r11 test above holds FileShare.Read only, which is why this escaped.
+foreach ($f1 in @(@('readwrite-share-none', [IO.FileAccess]::ReadWrite, [IO.FileShare]::None), @('writer-denies-read', [IO.FileAccess]::Write, [IO.FileShare]::Write))) {
+    $f1Home = New-Scratch "r17-f1-$($f1[0])-home"
+    $f1Svc = Join-Path $f1Home '.claude\hooks\service.json'
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $f1Svc))
+    [IO.File]::WriteAllText($f1Svc, '{"v":"host-old"}'); (Get-Item -LiteralPath $f1Svc).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+    $f1Bundle = New-Scratch "r17-f1-$($f1[0])-bundle"
+    [IO.File]::WriteAllText((Join-Path $f1Bundle 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    [void][IO.Directory]::CreateDirectory((Join-Path $f1Bundle 'home-claude\hooks'))
+    [IO.File]::WriteAllText((Join-Path $f1Bundle 'home-claude\hooks\service.json'), '{"v":"bundle-service"}')
+    [IO.File]::WriteAllText((Join-Path $f1Bundle 'home-claude\CLAUDE.md'), 'owner instructions')
+    $f1Hold = [IO.File]::Open($f1Svc, [IO.FileMode]::Open, $f1[1], $f1[2])
+    try { $f1r = Invoke-Setup $f1Home @('-Phase', 'Import', '-StateRoot', (New-Scratch "r17-f1-$($f1[0])-state"), '-Workspace', (New-Scratch "r17-f1-$($f1[0])-ws"), '-BundlePath', $f1Bundle, '-SourceHost', 'NOT-THIS-HOST') } finally { $f1Hold.Dispose() }
+    Assert-That ($f1r.Out.Contains("IMPORT_DEST_CHANGED_SKIPPED $f1Svc")) "r17 F1 import (held $($f1[0])): the held host file is reported IMPORT_DEST_CHANGED_SKIPPED <path>" $f1r.Out
+    Assert-That (-not ($f1r.Out -match "IMPORT_SKIPPED_CREDENTIAL_FILE [^\r\n]*hooks\\service\.json")) "r17 F1 import (held $($f1[0])): it is not mis-recorded as a credential skip" $f1r.Out
+    Assert-That ($f1r.Exit -eq 1) "r17 F1 import (held $($f1[0])): the run fails (exit 1)" "exit=$($f1r.Exit)"
+    Assert-That (([IO.File]::ReadAllText($f1Svc)) -ceq '{"v":"host-old"}') "r17 F1 import (held $($f1[0])): the held host file's bytes are unchanged" ([IO.File]::ReadAllText($f1Svc))
+}
+if ($fnLoaded -and (Test-Has 'Get-ImportCredentialSkips' 'r17 F1') -and (Test-Has 'Invoke-ImportRobocopy' 'r17 F1')) {
+    # in-process: the inspection does not class a held host file as carrying a credential; a held file the copy rules would KEEP (host newer, /XO) is not a failure
+    $f1uSrc = New-Scratch 'r17-f1u-bundle'; $f1uDst = New-Scratch 'r17-f1u-host'
+    [IO.File]::WriteAllText((Join-Path $f1uSrc 'svc.json'), '{"v":"bundle"}'); [IO.File]::WriteAllText((Join-Path $f1uSrc 'keep.json'), '{"v":"bundle-older"}')
+    (Get-Item -LiteralPath (Join-Path $f1uSrc 'keep.json')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-5)
+    [IO.File]::WriteAllText((Join-Path $f1uDst 'svc.json'), '{"v":"host"}'); (Get-Item -LiteralPath (Join-Path $f1uDst 'svc.json')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+    [IO.File]::WriteAllText((Join-Path $f1uDst 'keep.json'), '{"v":"host-newer"}')
+    $h1 = [IO.File]::Open((Join-Path $f1uDst 'svc.json'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $h2 = [IO.File]::Open((Join-Path $f1uDst 'keep.json'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $script:Failures.Clear(); $script:ImportSkippedDest.Clear()
+    $savedLog = $script:LogFile; $script:LogFile = Join-Path $f1uDst '..\r17-f1u.log'
+    try {
+        $f1uSk = @(Get-ImportCredentialSkips -SourceDir $f1uSrc -DestDir $f1uDst)
+        Invoke-ImportRobocopy -From $f1uSrc -To $f1uDst -Extra @('/E', '/XO') *>&1 | Out-Null
+    } finally { $h1.Dispose(); $h2.Dispose(); $script:LogFile = $savedLog }
+    Assert-That ($f1uSk.Count -eq 0) 'r17 F1 inspection: a held host file is not classed as carrying a credential' (($f1uSk | ForEach-Object Reason) -join ';')
+    Assert-That (@($script:Failures | Where-Object { $_ -ceq "IMPORT_DEST_CHANGED_SKIPPED $(Join-Path $f1uDst 'svc.json')" }).Count -eq 1) 'r17 F1 copy: the held host file the rules would replace is a recorded IMPORT_DEST_CHANGED_SKIPPED failure' ($script:Failures -join ',')
+    Assert-That (@($script:Failures | Where-Object { $_ -like '*keep.json*' }).Count -eq 0) 'r17 F1 control: a held host file the rules would keep (host newer, /XO) is not a failure' ($script:Failures -join ',')
+    Assert-That (([IO.File]::ReadAllText((Join-Path $f1uDst 'svc.json'))) -ceq '{"v":"host"}' -and ([IO.File]::ReadAllText((Join-Path $f1uDst 'keep.json'))) -ceq '{"v":"host-newer"}') 'r17 F1 copy: both held host files are untouched'
+    # control: a host file that was READ and really carries a credential keeps today's skip
+    $f1cSrc = New-Scratch 'r17-f1c-bundle'; $f1cDst = New-Scratch 'r17-f1c-host'
+    [IO.File]::WriteAllText((Join-Path $f1cSrc 'svc.json'), '{"v":"bundle"}')
+    [IO.File]::WriteAllText((Join-Path $f1cDst 'svc.json'), '{"api_key":"synthetic-local-key"}'); (Get-Item -LiteralPath (Join-Path $f1cDst 'svc.json')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+    $f1cSk = @(Get-ImportCredentialSkips -SourceDir $f1cSrc -DestDir $f1cDst)
+    Assert-That (@($f1cSk | Where-Object { $_.Reason -ceq 'host file carries a credential' }).Count -eq 1) 'r17 F1 control: a readable host file that carries a credential is still a credential skip' (($f1cSk | ForEach-Object Reason) -join ';')
+    $script:Failures.Clear(); $script:ImportSkippedDest.Clear()
+}
+
+# F2: a remote URL is printed with userinfo redacted up to the LAST '@' of the authority and everything after '?' or '#' dropped ('?***')
+if ($fnLoaded -and (Test-Has 'Get-RedactedRemoteUrl' 'r17 F2') -and (Test-Has 'Test-GitRemoteUrlSame' 'r17 F2')) {
+    $f2 = [ordered]@{
+        'https://github.com/other/repo.git?access_token=OWNER_HUNTER2'                       = 'https://github.com/other/repo.git?***'
+        'https://alice:p@ssw0rd@github.com/SuperDimensionalSpaceFortress/MLV-App.git'         = 'https://***@github.com/SuperDimensionalSpaceFortress/MLV-App.git'
+        'https://x-access-token:TOK@github.com/o/r.git#frag=TOK2'                            = 'https://***@github.com/o/r.git?***'
+        'git@github.com:o/r.git'                                                             = 'git@github.com:o/r.git'
+    }
+    foreach ($k in $f2.Keys) { $got = Get-RedactedRemoteUrl $k; Assert-That ($got -ceq $f2[$k]) "r17 F2 url: $k prints as $($f2[$k])" $got }
+    Assert-That (Test-GitRemoteUrlSame 'https://alice:p@ssw0rd@github.com/SuperDimensionalSpaceFortress/MLV-App.git' 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git') 'r17 F2 url: a password with an unencoded @ does not change the repository the URL names'
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://alice:p@ssw0rd@github.com/other/MLV-App.git' 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git')) 'r17 F2 url control: another owner is still another repository'
+    # the setup log sink: no line it writes carries a query token or a password, whoever printed it
+    $f2Log = Join-Path (New-Scratch 'r17-f2-sink') 'sink.log'
+    $savedLog = $script:LogFile; $script:LogFile = $f2Log
+    try { Write-Log 'x https://u:SINK_PW@h.example/r.git?access_token=SINK_TOK y' *>&1 | Out-Null } finally { $script:LogFile = $savedLog }
+    $f2LogText = [IO.File]::ReadAllText($f2Log)
+    Assert-That (-not ($f2LogText -match 'SINK_PW|SINK_TOK')) 'r17 F2 sink: Write-Log never stores a URL credential or query token' $f2LogText
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r17 F2')) {
+    $f2Remotes = @('https://github.com/other/repo.git?access_token=OWNER_HUNTER2', 'https://alice:p@ssw0rd@github.com/other/MLV-App.git', 'https://x-access-token:TOK1SECRET@github.com/o/r.git#frag=TOK2SECRET')
+    $f2i = 0
+    foreach ($u in $f2Remotes) {
+        $f2i++
+        $f2ws = New-Scratch "r17-f2-clone-$f2i"
+        $f2repo = Join-Path $f2ws 'MLV-App'; [void][IO.Directory]::CreateDirectory($f2repo); & git -C $f2repo init -q 2>$null
+        & git -C $f2repo remote add fork $u
+        $savedRepo = $script:Repo; $script:Repo = $f2repo; $Repo = $f2repo
+        $f2doc = Join-Path $f2ws 'doctrine'; [void][IO.Directory]::CreateDirectory($f2doc); & git -C $f2doc init -q 2>$null; & git -C $f2doc remote add origin $DoctrineUrl
+        $savedDoc = $script:DoctrineRepo; $script:DoctrineRepo = $f2doc; $DoctrineRepo = $f2doc
+        $savedLog = $script:LogFile; $script:LogFile = Join-Path $f2ws 'clone.log'
+        $script:Failures.Clear()
+        $f2out = ''
+        try { $f2out = (Invoke-PhaseClone *>&1 | Out-String) } catch { $f2out += $_.Exception.Message }
+        $f2log = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+        $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog
+        Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH*' }).Count -ge 1) "r17 F2 clone ($f2i): the mismatching fork remote is refused typed" ($script:Failures -join ',')
+        Assert-That (-not (($f2log + $f2out) -match 'OWNER_HUNTER2|ssw0rd|TOK1SECRET|TOK2SECRET|alice')) "r17 F2 clone ($f2i): the console and the setup log carry no credential text from the remote URL" ($f2log + $f2out)
+        $script:Failures.Clear()
+    }
+}
+
+# F3: every native git call runs with each GIT_TRACE* variable removed from the child environment (a trace path naming a tracked file is never appended to); the parent's
+#     values are restored afterwards
+if ($fnLoaded -and (Test-Has 'Invoke-Native' 'r17 F3')) {
+    $f3repo = New-Scratch 'r17-f3-repo'
+    & git -C $f3repo init -q 2>$null
+    [IO.File]::WriteAllText((Join-Path $f3repo 'README.md'), "tracked readme`n"); [IO.File]::WriteAllText((Join-Path $f3repo 'NOTES.md'), "tracked notes`n")
+    & git -C $f3repo add README.md NOTES.md 2>$null; & git -C $f3repo -c user.name=t -c user.email=t@example.invalid commit -q -m fixture 2>$null
+    $f3a = Join-Path $f3repo 'README.md'; $f3b = Join-Path $f3repo 'NOTES.md'
+    $f3before = [IO.File]::ReadAllText($f3a) + '|' + [IO.File]::ReadAllText($f3b)
+    $f3saved = @{}; foreach ($n in 'GIT_TRACE', 'GIT_TRACE2_EVENT', 'GIT_TRACE_PERFORMANCE') { $f3saved[$n] = [Environment]::GetEnvironmentVariable($n) }
+    $savedLog = $script:LogFile; $script:LogFile = Join-Path (New-Scratch 'r17-f3-log') 'f3.log'
+    $f3env = ''
+    try {
+        [Environment]::SetEnvironmentVariable('GIT_TRACE', $f3a); [Environment]::SetEnvironmentVariable('GIT_TRACE2_EVENT', $f3b); [Environment]::SetEnvironmentVariable('GIT_TRACE_PERFORMANCE', $f3a)
+        [void](Invoke-Native -Exe 'git' -Arguments @('-C', $f3repo, 'status', '--porcelain') *>&1)
+        if (Test-Has 'Invoke-GitTraceScrubbed' 'r17 F3') {
+            [void](Invoke-GitTraceScrubbed { & git -C $f3repo worktree list --porcelain } *>&1)
+            [void](Invoke-GitTraceScrubbed { & git -C $f3repo ls-remote . 'refs/heads/*' 2>$null })
+        }
+        $f3env = "$([Environment]::GetEnvironmentVariable('GIT_TRACE'))|$([Environment]::GetEnvironmentVariable('GIT_TRACE2_EVENT'))"
+    } finally {
+        foreach ($n in $f3saved.Keys) { [Environment]::SetEnvironmentVariable($n, $f3saved[$n]) }
+        $script:LogFile = $savedLog
+    }
+    $f3after = [IO.File]::ReadAllText($f3a) + '|' + [IO.File]::ReadAllText($f3b)
+    Assert-That ($f3after -ceq $f3before) 'r17 F3 git: GIT_TRACE / GIT_TRACE2_EVENT naming tracked files are never appended to by the setup script''s native git calls' $f3after
+    Assert-That ($f3env -ceq "$f3a|$f3b") 'r17 F3 git: the parent environment''s GIT_TRACE* values are restored after the call' $f3env
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

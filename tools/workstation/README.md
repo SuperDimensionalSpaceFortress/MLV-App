@@ -15,7 +15,7 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
 | `Ssh` | new | sshd (key-only, pwsh default shell, port 22 from LAN + Tailscale), keys for GitHub and BACHELOR |
 | `Clone` | new | MLV-App (`fork` = SuperDimensionalSpaceFortress, `origin` = ilia3101, master tracks fork/master), doctrine bus |
 | `Qt` | new | Qt 6.10.2 win64_mingw + MinGW 13.1 via the repo's hash-locked aqtinstall |
-| `Import` | new | unpacks the transfer bundle into `~\.claude`, `~\bin`, `~\.codex`, FleetDefender, `.claude-state`, `.codex-state\doctrine` (never overwrites a newer local file); **never copies a credential:** a bundle file that carries a credential or is over 25 MiB, and a bundle file that would replace a host file carrying a credential (any name) or a credential-role file (`settings.json`, `config.toml`, ...) naming a credential key, is skipped and logged `IMPORT_SKIPPED_CREDENTIAL_FILE`; a host file it cannot lock exclusively, or that gained a credential between inspection and replace, is kept and reported with a typed `IMPORT_DEST_CHANGED_SKIPPED <path>` line, and the step then fails (exit 1); the `settings.json` profile rewrite is skipped when that file was skipped; moves hub claims whose run dir is absent here and that are under 24 h old to `claims\migrated-foreign-<stamp>` |
+| `Import` | new | unpacks the transfer bundle into `~\.claude`, `~\bin`, `~\.codex`, FleetDefender, `.claude-state`, `.codex-state\doctrine` (never overwrites a newer local file); **never copies a credential:** a bundle file that carries a credential or is over 25 MiB, and a bundle file that would replace a host file carrying a credential (any name) or a credential-role file (`settings.json`, `config.toml`, ...) naming a credential key, is skipped and logged `IMPORT_SKIPPED_CREDENTIAL_FILE`; a host file it cannot lock exclusively (including one another process holds with a share mode that denies readers, `FileShare.None` or a writer that denies Read: that file is never classed as carrying a credential), or that gained a credential between inspection and replace, is kept and reported with a typed `IMPORT_DEST_CHANGED_SKIPPED <path>` line, and the step then fails (exit 1); the `settings.json` profile rewrite is skipped when that file was skipped; moves hub claims whose run dir is absent here and that are under 24 h old to `claims\migrated-foreign-<stamp>` |
 | `Tasks` | new | registers 8 scheduled tasks, **disabled**, behind the gate |
 | `Verify` | either | report, plus two checks that change the exit code. **Share preflight, fail closed:** both `\\Ultra-Magnus\g\Temp\mlv-gpu-profile\agent\heartbeat.txt` and `\\bachelor\mlv-agent\heartbeat.txt` must be readable, else `SHARE_PREFLIGHT_FAILED <path> (<host> share; ...step 6b)` and exit 1 (README step 6b). **Meter installs:** runs `-Install` of `MLV-DiskAutoReclaim` and `MLV-PwshAutoRepin` (not on the source host without `-Force`, not under `-WhatIf`). A meter task that was Disabled or absent before its `-Install` is put back Disabled afterwards (`METER_TASK_RESTORED_DISABLED`; `METER_TASK_LEFT_ENABLED` and exit 1 if that fails), one the owner had enabled is left alone; a host without the SBP launcher reports `METER_INSTALL_UNSUPPORTED_HOST` and goes on |
 | `Checklist` | either | owner-only checklist (printed, never scripted) |
@@ -96,7 +96,18 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    that carries a credential: it opens each host file it would replace exclusively, judges those bytes and
    writes through the same handle. A host file another process holds open, or one that gained a credential
    since the inspection, stays as it is (`IMPORT_DEST_CHANGED_SKIPPED <path>`, exit 1): close what holds it
-   and re-run `-Phase Import` (it is idempotent).
+   and re-run `-Phase Import` (it is idempotent). That holds for every share mode (r17): a holder that
+   denies readers (`FileShare.None`, or a writer that denies Read) gives the same typed line and exit 1,
+   never a quiet `IMPORT_SKIPPED_CREDENTIAL_FILE` warning with exit 0. A held host file that the copy
+   rules would keep anyway (it is newer, `/XO`) is not opened and is not a failure. A host file Import
+   cannot read for any other reason (access denied, over 25 MiB) still counts as carrying a credential.
+
+   **Remote URLs and git tracing (r17).** Every line the script prints or logs redacts a URL's user part
+   up to the last `@` before the host, so an unencoded `@` in a password leaks nothing. It also drops
+   everything after a `?` or `#` and prints `?***` (a query-string token, a fragment). Every native git
+   call (and every child that may run git) starts with each `GIT_TRACE*` variable removed from its
+   environment. A trace destination that names a tracked file is never appended to; the shell's own
+   values are put back afterwards.
 
    **The credential rule is deny by default on the key NAME (r15).** A file is a hit when a secret-named
    key (password / passwd, secret, credential, api / private / access / auth key, token; a part `auth`,
