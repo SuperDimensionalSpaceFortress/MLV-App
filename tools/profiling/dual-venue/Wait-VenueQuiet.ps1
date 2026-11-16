@@ -113,7 +113,9 @@
 #
 # ONE DEADLINE: -MaxWaitSec runs from the start and bounds every queue-gate wait too (a re-probe does not get a fresh gate clock). A gate wait ends at the
 # earlier of -MaxGateSec and that deadline (GATE_BUSY, exit 3). Only a probe already submitted can run past it, bounded by um-run.ps1's own timeouts and by
-# -MaxAdmissionWaitSec (default 7200, range 1..86400), which is forwarded to um-run.ps1 as its heavy-slot admission ceiling: the venue chain passes its
+# -MaxAdmissionWaitSec (default 7200, range 1..86400), which is forwarded to um-run.ps1 as its heavy-slot admission ceiling. A caller's ABSOLUTE end (-WaitUntilUtc /
+# -WaitUntilTs) is also asked before each probe is written and submitted: past it no probe is submitted (`GATE_CUTOFF ...`, exit 3; after a measured busy probe, that reading's
+# verdict), even on an empty queue (r11, adversary-d38e2ab8.json A1). The venue chain passes its
 # -ProbeAdmissionWaitSec here, and sizes the claim ticket's probe-phase staleAfterSec from that same value, so the bound the ticket assumes is the bound the probe honours.
 # A read error on the agent share is retried -ReadAttempts times in all, backing off -ReadBackoffSec * attempt, inside the same deadline, before it is
 # GATE_UNREADABLE; each retry prints a `GATE_READ_RETRY` line, never a `queued=0 running=0` line.
@@ -129,7 +131,7 @@
 # directory) are exit 2 before anything is created. HOST ECHO: the probe job reports $env:COMPUTERNAME; if it is not the venue's expectedHost in venues.json
 # (case-insensitive; a missing host counts) the gate prints `HOST_MISMATCH ...` and exits 5 BEFORE any QUIET / COOLDOWN_UNMET line, so an alias of another
 # host's share (acknowledged with -AllowShareOverride) can never yield a verdict for the named venue.
-# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET, including one that took the FOREIGN_FLOOR early exit (read stdout); 3 GATE_BUSY (the queue never cleared); 4 GATE_UNREADABLE (the agent share could not be
+# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET, including one that took the FOREIGN_FLOOR early exit (read stdout); 3 GATE_BUSY (the queue never cleared, or GATE_CUTOFF: the caller's absolute end passed before a probe was submitted); 4 GATE_UNREADABLE (the agent share could not be
 # read -- typed line `GATE_UNREADABLE ...` then `DECISION UNKNOWN`, never an empty-queue line; no probe is submitted); 5 HOST_MISMATCH (the probe was
 # answered by a host that is not the venue's); 6 VENUE_QUIET_UNKNOWN (the venue was not measured: typed line `VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=<t>%
 # waitedSec=<n> reason=<probe-failed|no-VENUE_QUIET-line|invalid-samples>`, never a QUIET / COOLDOWN_UNMET line); 2 a usage error (including a -SamplesJson that is
@@ -300,6 +302,13 @@ if ($WaitUntilTs -gt 0) {
     if ($wts -lt $deadline) { $deadline = $wts }
     if ($wts -lt $gateEnd) { $gateEnd = $wts }
 }
+# r11 (adversary-d38e2ab8.json A1): the caller's ABSOLUTE end alone (the earlier of -WaitUntilUtc and -WaitUntilTs; $null when neither is given). The clamps above end a busy gate
+# and the re-probe loop, but an empty queue returned CLEAR before any expiry check and a probe was then written and submitted past the caller's end (an in-lease probe sent
+# after the agent's idle bound). Past this cutoff no probe is submitted: only one already submitted may run past it. -MaxWaitSec alone keeps its at-least-one-probe reading.
+$waitCutoff = $null
+if ($WaitUntilUtc) { $waitCutoff = $wu }
+if ($WaitUntilTs -gt 0 -and ($null -eq $waitCutoff -or $wts -lt $waitCutoff)) { $waitCutoff = $wts }
+function Test-WaitCutoffPassed { $null -ne $waitCutoff -and (Get-WaitNowUtc) -ge $waitCutoff }
 
 # Both directory counts, retried on a read error. Results go to $script:GateQueued / $script:GateRunning ($null = still unreadable after the last attempt):
 # like GateState they are not the function's output, because its GATE_READ_RETRY lines are written to the pipeline.
@@ -1600,10 +1609,14 @@ while ($true) {
     Wait-QueueGate 'quiet-probe'
     if ($script:GateState -ceq 'UNREADABLE') { Write-Gate 'DECISION UNKNOWN mean=UNKNOWN'; exit 4 }
     if ($script:GateState -cne 'CLEAR') { exit 3 }
+    # r11 (adversary-d38e2ab8.json A1): asked after the gate's CLEAR and again as the last statement before um-run (the job-file write can stall on a UNC -WorkDir). Past the
+    # caller's cutoff a busy probe already measured ends on its own reading (break: COOLDOWN_UNMET / UNKNOWN, as at the recheck below); none measured yet ends GATE_CUTOFF, exit 3.
+    if (Test-WaitCutoffPassed) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-write: the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
     $jobId = 'venue-quiet-probe-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
     $jobFile = Join-Path $WorkDir "$jobId.job.ps1"
     [IO.File]::WriteAllText($jobFile, $probeText, [Text.UTF8Encoding]::new($false))
     $probe = $null; $why = $null; $whyKind = $null; $rawPath = $null; $rawErr = $null
+    if (Test-WaitCutoffPassed) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-submit job=$jobId (written, not submitted): the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
     try {
         $out = @(& $umRun -ScriptPath $jobFile -JobId $jobId -AgentShare $agentShare -TimeoutSec 120 -MaxQueueWaitSec 300 -MaxClaimedWaitSec 120 -MaxAdmissionWaitSec $MaxAdmissionWaitSec 6>$null)
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }

@@ -711,6 +711,53 @@ exit $LASTEXITCODE
         self.assertLessEqual(self.waited(text), 6, text)
         self.assert_nothing_dispatched(share)
 
+    def test_r11_adv_d38e2ab8_a1_a_clear_queue_after_the_absolute_cutoff_submits_no_probe(self) -> None:
+        # adversary-d38e2ab8.json A1: the cutoffs clamp $deadline / $gateEnd (Wait-VenueQuiet.ps1 :285-301), but the queue gate returned CLEAR on an empty queue BEFORE any
+        # expiry check, and the main loop then wrote and submitted a probe (:1602-1608) after the caller's end: an in-lease probe sent past the agent's idle bound. Sol's input:
+        # -MaxWaitSec 240 -MaxGateSec 240 with an expired -WaitUntilUtc and -WaitUntilTs 1, a readable share with an empty inbox and running\. Only a probe ALREADY submitted may
+        # run past the cutoff: an expired one writes no job, submits none, and ends GATE_CUTOFF (exit 3, the GATE_BUSY code every caller reads as "no probe ran").
+        past = utc_iso(datetime.now(timezone.utc) - timedelta(seconds=5))
+        for name, extra in (("wait-until-utc", ["-WaitUntilUtc", past]), ("wait-until-ts", ["-WaitUntilTs", "1"]), ("both", ["-WaitUntilUtc", past, "-WaitUntilTs", "1"])):
+            with self.subTest(cutoff=name):
+                share = self.case / f"empty-share-{name}"
+                (share / "inbox").mkdir(parents=True)
+                (share / "running").mkdir()
+                work = self.case / f"quiet-work-{name}"
+                argv = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(QUIET), "-Venue", "bachelor", "-WorkDir", str(work), "-AgentShare", str(share),
+                        "-AllowShareOverride", "-MaxWaitSec", "240", "-MaxGateSec", "240", "-GatePollSec", "1", "-ReadAttempts", "1", "-ReadBackoffSec", "0", *extra]
+                p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    out, err = p.communicate(timeout=60)
+                    hung = False
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    out, err = p.communicate()
+                    hung = True
+                text = out + err
+                submitted = sorted(q.name for q in (share / "inbox").iterdir())
+                written = sorted(q.name for q in work.glob("venue-quiet-probe-*.job.ps1")) if work.exists() else []
+                self.assertFalse(hung, f"still running 60 s after an expired cutoff (a probe was submitted and waited on the agent): inbox={submitted} {text}")
+                self.assertEqual(submitted, [], f"a probe job was submitted after the cutoff: {text}")
+                self.assertEqual(written, [], f"a probe job was written after the cutoff: {text}")
+                self.assertEqual(p.returncode, 3, text)
+                self.assertRegex(text, r"(?m)^GATE quiet-probe bachelor queued=0 running=0 ", "the queue gate must have read the empty queue (CLEAR), else this case is not the one A1 names")
+                self.assertRegex(text, r"(?m)^GATE_CUTOFF quiet-probe bachelor waitedSec=\d+ ", text)
+                self.assertFalse((share / "outbox").exists())
+
+    def test_r11_adv_d38e2ab8_a1_every_probe_submission_is_behind_the_cutoff_check(self) -> None:
+        # the class (A1's siblings :1602, :1605, :1608): the cutoff is asked right after the gate's CLEAR (before the job file is written) and again as the last statement before
+        # um-run is called, so a stalled job-file write (a UNC -WorkDir) cannot carry a submission past it; a busy probe already measured ends on its own reading (break), none
+        # measured yet ends exit 3. The relative -MaxWaitSec deadline keeps its one-probe-at-least behaviour (an older caller passing -MaxWaitSec 0 still gets one reading).
+        import re
+        src = QUIET.read_text(encoding="utf-8")
+        loop = src[src.index("    Wait-QueueGate 'quiet-probe'"):]
+        write_at = loop.index("[IO.File]::WriteAllText($jobFile")
+        call_at = loop.index("& $umRun -ScriptPath $jobFile")
+        checks = [m.start() for m in re.finditer(re.escape("if (Test-WaitCutoffPassed) {"), loop)]
+        self.assertTrue(any(c < write_at for c in checks), "no cutoff check between the gate's CLEAR and the job-file write")
+        self.assertTrue(any(write_at < c < call_at for c in checks), "no cutoff check between the job-file write and the um-run submission")
+        self.assertEqual(loop.count("& $umRun "), 1, "a second submission site needs its own cutoff check")
+
     def test_r6_adv_a3_no_wait_in_the_probe_script_reads_a_local_clock(self) -> None:
         # the class (A3's siblings :277, :278, :289, :306, :1628): outside the probe job's own text, the script reads no local clock (Get-Date, [DateTime]::Now, LocalDateTime,
         # ToLocalTime), so no deadline, gate end, retry check or recheck can compare local DateTimes again
