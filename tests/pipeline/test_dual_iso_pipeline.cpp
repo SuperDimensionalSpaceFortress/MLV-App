@@ -7786,6 +7786,186 @@ TEST(DualIsoPipeline, MixChromaFastRouteFull20IsByteIdenticalToLegacyFixtureClip
     }
 }
 
+namespace {
+
+// Restores MLVAPP_DISABLE_AVX2_DUALISO_HQ and the HQ dispatch on every exit.
+class ScopedDualIsoHqScalarDispatch
+{
+public:
+    ScopedDualIsoHqScalarDispatch()
+        : had_value_(qEnvironmentVariableIsSet("MLVAPP_DISABLE_AVX2_DUALISO_HQ"))
+        , old_value_(qgetenv("MLVAPP_DISABLE_AVX2_DUALISO_HQ"))
+    {
+    }
+    ~ScopedDualIsoHqScalarDispatch()
+    {
+        if (had_value_)
+        {
+            qputenv("MLVAPP_DISABLE_AVX2_DUALISO_HQ", old_value_);
+        }
+        else
+        {
+            qunsetenv("MLVAPP_DISABLE_AVX2_DUALISO_HQ");
+        }
+        dualisoHqReinitDispatchForTesting();
+    }
+    int set_scalar(bool scalar)
+    {
+        if (scalar)
+        {
+            qputenv("MLVAPP_DISABLE_AVX2_DUALISO_HQ", QByteArrayLiteral("1"));
+        }
+        else
+        {
+            qunsetenv("MLVAPP_DISABLE_AVX2_DUALISO_HQ");
+        }
+        return dualisoHqReinitDispatchForTesting();
+    }
+
+private:
+    bool had_value_;
+    QByteArray old_value_;
+};
+
+struct Full20TeamConfig
+{
+    const char * name;
+    int interp_method;
+    int use_alias_map;
+    int playback_preview_scale_factor;
+};
+
+bool full20_run_at_team(const struct raw_info & raw,
+                        const std::vector<uint16_t> & source,
+                        const Full20TeamConfig & config,
+                        int team,
+                        std::vector<uint16_t> * image)
+{
+    OpenMpThreadCountScope threads(team);
+    *image = source;
+    dualiso_full20bit_scratch_t scratch = {};
+    int iso_pattern = 0;
+    int auto_correction = -1;
+    double ev_correction = 1.0;
+    int black_delta = -1;
+    // AMaZE's own pthread split stays at 4 on every team, so only the OpenMP
+    // team changes between runs.
+    const int rc = diso_get_full20bit(raw,
+                                      image->data(),
+                                      0,
+                                      100,
+                                      200,
+                                      &iso_pattern,
+                                      &auto_correction,
+                                      &ev_correction,
+                                      &black_delta,
+                                      config.interp_method,
+                                      config.use_alias_map,
+                                      1,
+                                      1,
+                                      config.playback_preview_scale_factor,
+                                      4,
+                                      &scratch);
+    free_dualiso_full20bit_scratch(&scratch);
+    return rc == 1;
+}
+
+} // namespace
+
+// CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (ported from CPU-S1-FS-SPIKE-DUALISO-DYNSCHED-1's
+// test, test file only): the partition sizes the recon worker's OpenMP team, so the
+// dual-ISO full20 recon must not depend on the team. Teams 6, 10, 12 and 16 are
+// byte-identical to team 1 on both fixture clips, on the AVX2 and the scalar HQ
+// dispatch, for the s1 playback shape (mean23, no alias map, scale 1), the fused
+// scale-2 shape and the export shape (AMaZE with the alias map).
+TEST(DualIsoPipeline, Full20OutputIsByteIdenticalAcrossPartitionTeams)
+{
+#ifndef _OPENMP
+    SKIP_TEST("built without OpenMP");
+#else
+    ScopedMixChromaProbeEnv probe_env;
+    probe_env.set(nullptr);
+    ScopedDualIsoHqScalarDispatch dispatch;
+    const char * clips[2][2] = {
+        { "tests/fixtures/clips/tiny_dual_iso.mlv", "tests/fixtures/receipts/tiny_dual_iso_hq.marxml" },
+        { "tests/fixtures/clips/large_dual_iso.mlv", "tests/fixtures/receipts/large_dual_iso_hq.marxml" },
+    };
+    const Full20TeamConfig configs[] = {
+        { "s1-playback-mean23-meshguard", 1, 0, 1 },
+        { "mean23-scale2-fused", 1, 0, 2 },
+        { "export-amaze-aliasmap", 0, 1, 1 },
+    };
+    const int teams[] = { 6, 10, 12, 16 };
+    int compared = 0;
+    for (const auto & clip : clips)
+    {
+        MlvPipelineFixture fixture;
+        QString error_message;
+        ASSERT_TRUE(fixture.openClipFile(repo_file_path(QString::fromLatin1(clip[0])), &error_message));
+        ASSERT_TRUE(fixture.loadReceipt(QString::fromLatin1(clip[1]), &error_message));
+        ASSERT_TRUE(fixture.applyReceipt(&error_message));
+        struct raw_info raw = fixture.video()->RAWI.raw_info;
+        raw.width = fixture.width();
+        raw.height = fixture.height();
+        raw.pitch = raw.width;
+        raw.active_area.x1 = 0;
+        raw.active_area.y1 = 0;
+        raw.active_area.x2 = raw.width;
+        raw.active_area.y2 = raw.height;
+        ASSERT_TRUE(raw.width > 0 && raw.height > 0);
+        for (uint64_t frame = 0; frame < 2; frame++)
+        {
+            std::vector<uint16_t> source(static_cast<size_t>(raw.width) * static_cast<size_t>(raw.height));
+            if (getMlvRawFrameUint16(fixture.video(), frame, source.data()) != 0)
+            {
+                ASSERT_TRUE(frame > 0);
+                break;
+            }
+            for (int scalar = 0; scalar <= 1; scalar++)
+            {
+                const int avx2 = dispatch.set_scalar(scalar != 0);
+                if (!scalar && !avx2)
+                {
+                    continue;  // host has no AVX2: the scalar pass covers it
+                }
+                for (const auto & config : configs)
+                {
+                    std::vector<uint16_t> team1;
+                    ASSERT_TRUE(full20_run_at_team(raw, source, config, 1, &team1));
+                    ASSERT_TRUE(team1 != source);  // the recon ran and changed the frame
+                    for (const int team : teams)
+                    {
+                        std::vector<uint16_t> image;
+                        ASSERT_TRUE(full20_run_at_team(raw, source, config, team, &image));
+                        ASSERT_EQ(team1.size(), image.size());
+                        size_t diff = 0;
+                        for (size_t i = 0; i < image.size(); i++)
+                        {
+                            diff += image[i] != team1[i] ? 1 : 0;
+                        }
+                        std::fprintf(stderr,
+                                     "[full20-partition-teams] clip=%s frame=%llu w=%d h=%d dispatch=%s config=%s "
+                                     "team=%d differing_pixels=%zu\n",
+                                     clip[0],
+                                     static_cast<unsigned long long>(frame),
+                                     raw.width,
+                                     raw.height,
+                                     avx2 ? "avx2" : "scalar",
+                                     config.name,
+                                     team,
+                                     diff);
+                        ASSERT_EQ(static_cast<size_t>(0), diff);
+                        ASSERT_EQ(0, std::memcmp(image.data(), team1.data(), image.size() * sizeof(uint16_t)));
+                        compared++;
+                    }
+                }
+            }
+        }
+    }
+    ASSERT_TRUE(compared >= 2 * 3 * 4);
+#endif
+}
+
 TEST(DualIsoPipeline, AmazeWorkerFailuresAreTransactional)
 {
     struct ScopedAmazeFailureReset

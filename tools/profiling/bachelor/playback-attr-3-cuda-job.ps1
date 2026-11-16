@@ -470,6 +470,11 @@ param(
     # GUI thread's slot release waits for the recon backend mutex, as before r7), the isolation arm of a same-binary A/B. Absent: nothing is set and the
     # emitted job is the text it was before this parameter.
     [switch]$DisableReconReleaseDeferred,
+    # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the asymmetric playback OpenMP team partition (MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and
+    # MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> in the app's env list). Both or neither; 0 (the default) passes nothing and the emitted job is the text it was
+    # before these parameters.
+    [ValidateRange(0, 16)][int]$ReconOmpThreads = 0,
+    [ValidateRange(0, 16)][int]$PrepOmpThreads = 0,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -6460,6 +6465,20 @@ if ($DisableReconReleaseDeferred) {
     })
 }
 
+# CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the team-partition arm adds MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> at the same
+# env-list site, only when asked, both or neither. The anchor must match exactly once, or the generator throws (the runner also requires the app's own
+# playback_smoke.omp_teams record to report recon_omp=<r> prep_omp=<p> before the leg counts).
+if (($ReconOmpThreads -gt 0) -ne ($PrepOmpThreads -gt 0)) { throw "DUAL_VENUE_TEAM_PARTITION_HALF -ReconOmpThreads ($ReconOmpThreads) and -PrepOmpThreads ($PrepOmpThreads) are both set or neither" }
+if ($ReconOmpThreads -gt 0) {
+    $teamPartitionEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($teamPartitionEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_TEAM_PARTITION_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_RECON_OMP_THREADS / MLVAPP_PLAYBACK_PREP_OMP_THREADS to' }
+    $text = $teamPartitionEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_RECON_OMP_THREADS=$ReconOmpThreads'," + $m.Groups['nl'].Value +
+            $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_PREP_OMP_THREADS=$PrepOmpThreads'," + $m.Groups['nl'].Value
+    })
+}
+
 # PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
 # above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
 #   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
@@ -7905,6 +7924,8 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
     prepConflatedMove = [bool]$PrepConflatedMove
     disableReconReleaseDeferred = [bool]$DisableReconReleaseDeferred
+    reconOmpThreads = $(if ($ReconOmpThreads -gt 0) { $ReconOmpThreads } else { $null })
+    prepOmpThreads = $(if ($PrepOmpThreads -gt 0) { $PrepOmpThreads } else { $null })
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })

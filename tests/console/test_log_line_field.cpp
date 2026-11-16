@@ -92,6 +92,20 @@ TEST(LogLineField, TheRecordFoldKeepsOneLine)
     ASSERT_TRUE(log_line_field::prepRouteLine(7, true) == QStringLiteral("playback_smoke.prep_route session=7 prep_conflated_move_active=1"));
 }
 
+// CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the play-start OpenMP team record (integers only).
+TEST(LogLineField, TheOmpTeamsRecordNamesEachTeam)
+{
+    ASSERT_TRUE(log_line_field::ompTeamsLine(4, 0, 16, 0, 16, 2, 20, false)
+                == QStringLiteral("playback_smoke.omp_teams session=4 partition=off recon_omp=0 recon_cpu_cores=16 prep_omp=0 "
+                                  "prep_pointwise=16 prefetch_decoders=2 logical_cpus=20 override=0"));
+    ASSERT_TRUE(log_line_field::ompTeamsLine(9, 12, 12, 6, 6, 2, 20, false)
+                == QStringLiteral("playback_smoke.omp_teams session=9 partition=12+6 recon_omp=12 recon_cpu_cores=12 prep_omp=6 "
+                                  "prep_pointwise=6 prefetch_decoders=2 logical_cpus=20 override=0"));
+    ASSERT_TRUE(log_line_field::ompTeamsLine(1, 12, 12, 0, 16, 0, 20, true)
+                == QStringLiteral("playback_smoke.omp_teams session=1 partition=12+0 recon_omp=12 recon_cpu_cores=12 prep_omp=0 "
+                                  "prep_pointwise=16 prefetch_decoders=0 logical_cpus=20 override=1"));
+}
+
 TEST(LogLineField, ALocationPathHoldingAnArgMarkerIsWrittenVerbatim)
 {
     // r5 (sol r4 B1 on #726): the chained `.arg(file).arg(line)` substituted the line number into a path holding `%1` and left `:%2)`, so the

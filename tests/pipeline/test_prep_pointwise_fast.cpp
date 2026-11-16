@@ -26,6 +26,7 @@
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/PlaybackPrepCpuRoute.h"
 #include "../../src/processing/raw_processing.h"
+#include "../../src/batch/WorkerThreadCount.h"
 
 #include <QByteArray>
 #include <QString>
@@ -1120,6 +1121,63 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
     ASSERT_EQ(static_cast<int>(sizeof(cases) / sizeof(cases[0])), checked);
     if (!stageMismatches.empty())
         ::minitest::fail(__FILE__, __LINE__, "each case enables only its own stages", stageMismatches);
+}
+
+/* CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the prep partition sizes the pointwise fast path's team
+ * (mlvappPlaybackPrepWorkerThreadCount) and the prep thread's own team (rgb16to8 on the To8
+ * route). Both outputs are byte-identical to the reference at teams 1, 6 and 16 (forced, so the
+ * team is exact on any host), and MLVAPP_PLAYBACK_PREP_OMP_THREADS=6 with no override reaches the
+ * fast path as the clamped count with the same bytes. */
+TEST(PrepPointwiseFast, PrepTeamPartitionIsByteIdenticalAtTeams1And6And16)
+{
+    MlvPipelineFixture fixture;
+    openFixture(fixture);
+    const std::vector<uint16_t> frame = makeSyntheticFrame(kMatrixWidth, kMatrixHeight, 0x7EA3u);
+    const std::vector<uint16_t> blur = makeBlockBlur(frame, kMatrixWidth, kMatrixHeight);
+    const GpuPreviewProcessingConfig laOn = buildLookAssistOnConfig(fixture, blur, kMatrixWidth, kMatrixHeight);
+    std::vector<uint16_t> ref(frame.size(), 0);
+    gpuPreviewProcessingApplyCpuReference(laOn, frame.data(), ref.data(), kMatrixWidth, kMatrixHeight);
+    EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
+    EnvScope prepUnset("MLVAPP_PLAYBACK_PREP_OMP_THREADS", nullptr);
+    for (int threads : { 1, 6, 16 })
+    {
+        const std::string threadText = std::to_string(threads);
+        EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
+        EnvScope forced("MLVAPP_FORCE_THREADS", threadText.c_str());
+        OmpThreads scope(threads);
+        GpuPreviewProcessingCpuSpans spans;
+        std::vector<uint16_t> out16(frame.size(), 0);
+        gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), out16.data(), kMatrixWidth, kMatrixHeight, &spans);
+        ASSERT_TRUE(spans.pointwiseFast);
+        ASSERT_EQ(threads, spans.pointwiseOmpThreads);
+        int first = -1;
+        int worst = maxAbsDiff16(out16, ref, &first);
+        if (worst != 0) failDiff(__FILE__, __LINE__, "partition Timed 16-bit == reference", "team" + threadText, worst, first);
+        GpuPreviewProcessingCpuSpans spans8;
+        std::vector<uint16_t> scratch(frame.size(), 0);
+        std::vector<uint8_t> out8(frame.size(), 0);
+        gpuPreviewProcessingApplyCpuReferenceTo8(laOn, frame.data(), scratch.data(), out8.data(),
+                                                 kMatrixWidth, kMatrixHeight, &spans8);
+        ASSERT_EQ(threads, spans8.pointwiseOmpThreads);
+        worst = maxAbsDiff8(out8, ref, &first);
+        if (worst != 0) failDiff(__FILE__, __LINE__, "partition To8 == reference >> 8", "team" + threadText, worst, first);
+    }
+    {
+        EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
+        EnvScope forced("MLVAPP_FORCE_THREADS", nullptr);
+        EnvScope prep("MLVAPP_PLAYBACK_PREP_OMP_THREADS", "6");
+        const int expected = std::min(6, mlvappEffectivePlaybackWorkerThreadCount());
+        ASSERT_EQ(expected, mlvappPlaybackPrepWorkerThreadCount());
+        GpuPreviewProcessingCpuSpans spans;
+        std::vector<uint16_t> out16(frame.size(), 0);
+        gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), out16.data(), kMatrixWidth, kMatrixHeight, &spans);
+        ASSERT_TRUE(spans.pointwiseFast);
+        ASSERT_EQ(expected, spans.pointwiseOmpThreads);
+        int first = -1;
+        const int worst = maxAbsDiff16(out16, ref, &first);
+        if (worst != 0) failDiff(__FILE__, __LINE__, "prep knob 6 == reference", "knob6", worst, first);
+    }
+    std::printf("[PREP-FAST] partition teams 1,6,16 and knob 6 byte-identical\n");
 }
 
 TEST(PrepPointwiseFast, KillSwitchRestoresTheReferenceLoop)

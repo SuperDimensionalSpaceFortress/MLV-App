@@ -1641,6 +1641,13 @@ function Get-DvInheritedWorkerOverrides {
         $rows.Add(@('env_disable_playback_thread_cap', 'MLVAPP_DISABLE_PLAYBACK_THREAD_CAP', $unsetOrZero))
     }
     $rows.Add(@('env_omp_num_threads', 'OMP_NUM_THREADS', $unsetOrZero))
+    # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: generatorArgs.reconOmpThreads / prepOmpThreads = n -> the job sets the variable to n; absent = unset (or 0, which the
+    # app reads as unset: WorkerThreadCount.h mlvappPlaybackTeamRequestFromValue). A build before this card writes neither field, so neither is read.
+    $ga = Get-DvProp $Spec 'generatorArgs'
+    foreach ($team in @(@('reconOmpThreads', 'env_playback_recon_omp_threads', 'MLVAPP_PLAYBACK_RECON_OMP_THREADS'), @('prepOmpThreads', 'env_playback_prep_omp_threads', 'MLVAPP_PLAYBACK_PREP_OMP_THREADS'))) {
+        $want = ConvertTo-DvInt64 (Get-DvProp $ga $team[0])
+        $rows.Add(@($team[1], $team[2], $(if ($null -ne $want -and $want -ge 1) { @([string]$want) } else { $unsetOrZero })))
+    }
     # generatorArgs.rawPrefetchDecoders: 0 = the job sets MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1, k = MLVAPP_RAW_UINT16_PREFETCH_DECODERS=k, absent = neither (playback-attr-3-cuda-job.ps1)
     $rows.Add(@('env_disable_raw_uint16_prefetch', 'MLVAPP_DISABLE_RAW_UINT16_PREFETCH', $(if ($null -ne $decoders -and $decoders -eq 0) { @('1') } else { $unsetOrZero })))
     $rows.Add(@('env_raw_uint16_prefetch_decoders', 'MLVAPP_RAW_UINT16_PREFETCH_DECODERS', $(if ($decoders -ge 1) { @([string]$decoders) } else { @('unset') })))
@@ -1913,6 +1920,75 @@ function Get-DvReconReleaseDeferredEvidence {
         elseif ($observed -eq 0) { $verdict = 'NOT_HONOURED'; $reason = 'RECON_RELEASE_DEFERRED_INHERITED: the leg does not ask for the kill switch but the app reports deferred_enabled=0 (the variable came from the launcher''s environment), so this run is not the head arm' }
     }
     [ordered]@{ requested = $requested; observed = $observed; counts = $counts; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
+function Get-DvTeamPartitionEvidence {
+    <#
+    .SYNOPSIS
+    CPU-S1-FS-SPIKE-TEAM-PARTITION-1: did a leg that asks for the asymmetric playback OpenMP team partition (generatorArgs.reconOmpThreads = r and
+    generatorArgs.prepOmpThreads = p, both or neither, integers 1..16; the job sets MLVAPP_PLAYBACK_RECON_OMP_THREADS=r and MLVAPP_PLAYBACK_PREP_OMP_THREADS=p)
+    run partitioned at exactly r+p? Read ONLY from the app's own `playback_smoke.omp_teams session=<n> partition=<off|r+p> recon_omp=<n> recon_cpu_cores=<n>
+    prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> override=<0|1>` record for the MEASURED session (integers the app derived, no env
+    text), matched as a whole line, never from the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is true when the leg asked and there
+    is no such record (a binary before this card emits none), the record is unreadable, not unique or internally inconsistent, or it reports anything but
+    partition=r+p, recon_omp=r, prep_omp=p and override=0; or when the spec names only one of the two. A leg that does not ask blocks only when the app reports
+    a partition (the control arm inherited a variable: TEAM_PARTITION_INHERITED) or a record is present but unreadable; with no record (a control binary
+    before this card, which reads neither variable), or a clean partition=off, it is unchanged. observed is the record's partition text ('off' or 'r+p') or
+    $null. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $ga = Get-DvProp $Spec 'generatorArgs'
+    $rawRecon = Get-DvProp $ga 'reconOmpThreads'
+    $rawPrep = Get-DvProp $ga 'prepOmpThreads'
+    $isTeam = { param($v) ($v -is [int] -or $v -is [long]) -and $v -ge 1 -and $v -le 16 }
+    $named = ($null -ne $rawRecon) -or ($null -ne $rawPrep)
+    $requested = $named
+    $requestedText = $(if ((& $isTeam $rawRecon) -and (& $isTeam $rawPrep)) { "$rawRecon+$rawPrep" } else { $null })
+    $observed = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    $records = 0
+    $mentions = 0
+    $consistent = $false
+    $override = $null
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $n = '(?:0|[1-9][0-9]{0,8})'
+            $p = '(?:[1-9][0-9]{0,8})'
+            $fields = "partition=(?<part>off|$n\+$n) recon_omp=(?<r>$n) recon_cpu_cores=$p prep_omp=(?<q>$n) prep_pointwise=$p prefetch_decoders=$n logical_cpus=$p override=(?<o>[01])"
+            $whole = Get-DvCanonicalRecordPattern -Marker 'playback_smoke.omp_teams' -Session ([regex]::Escape([string]$session)) -Fields $fields
+            foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.omp_teams' -Session ([string]$session) -Fields $fields)) { continue }
+                $mentions++
+                $m = [regex]::Match($l, $whole)
+                if ($m.Success) {
+                    $records++
+                    $part = $m.Groups['part'].Value
+                    $r = $m.Groups['r'].Value; $q = $m.Groups['q'].Value
+                    $consistent = $(if ($part -ceq 'off') { $r -ceq '0' -and $q -ceq '0' } else { $part -ceq "$r+$q" })
+                    $observed = $part
+                    $override = [int]$m.Groups['o'].Value
+                }
+            }
+        }
+    }
+    if ($records -ne 1 -or $mentions -ne 1 -or -not $consistent) { $observed = $null; $override = $null }
+    $unreadable = 'the team partition is unreadable: the measured session''s playback_smoke.omp_teams record is not exactly one whole, self-consistent line of the form playback_smoke.omp_teams session=<n> partition=<off|r+p> recon_omp=<n> recon_cpu_cores=<n> prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> override=<0|1>, or there is more than one'
+    if ($requested) {
+        $verdict = 'NOT_HONOURED'
+        if ($null -eq $requestedText) { $reason = "TEAM_PARTITION_SPEC_INVALID: the spec's reconOmpThreads '$rawRecon' and prepOmpThreads '$rawPrep' are not both integers from 1 to 16 (both or neither)" }
+        elseif ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the run log has no playback_smoke.omp_teams record for the measured session, so the binary does not report its OpenMP teams' }
+        elseif ($null -eq $observed) { $reason = $unreadable }
+        elseif ($override -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says override=1 (MLVAPP_FORCE_THREADS / MLVAPP_FORCE_SINGLETHREAD make the partition inert)' }
+        elseif ($observed -cne $requestedText) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.omp_teams says partition=$observed, not the $requestedText the leg names" }
+        else { $verdict = 'HONOURED' }
+    }
+    elseif ($mentions -gt 0) {
+        if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
+        elseif ($observed -cne 'off') { $verdict = 'NOT_HONOURED'; $reason = "TEAM_PARTITION_INHERITED: the leg names no partition but the app reports partition=$observed (a variable came from the launcher's environment), so this run is not the control arm" }
+    }
+    [ordered]@{ requested = $requestedText; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED'); named = $named }
 }
 
 # The flavors the app can apply (src/batch/LookAssistAnalysis.cpp lookAssistFlavorName). The app's `look_assist_flavor=none` (nothing applied) is not among them.
@@ -4099,6 +4175,21 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedReconRelease) { $invalid.Add('RECON_RELEASE_DEFERRED_NOT_FROM_EVIDENCE: the receipt carries a reconReleaseDeferred block but its committed leg spec names no disableReconReleaseDeferred') }
+            # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: a leg that asks for the team partition the app did not report at exactly r+p (or whose report is unreadable, or
+            # absent because the binary emits none), or a control leg whose app reports a partition, is no measurement of its arm; the receipt's own
+            # teamPartition block is re-derived like the reconReleaseDeferred block.
+            $teamPartitionVerdict = Get-DvTeamPartitionEvidence -Spec $spec -LogText $ev.logText
+            if ($teamPartitionVerdict.blocks) { $invalid.Add("TEAM_PARTITION_NOT_HONOURED: $($teamPartitionVerdict.reason); a run whose OpenMP team partition is not the one its leg names (r+p when it asks, otherwise off) is no measurement of that arm") }
+            $storedTeamPartition = Get-DvProp $Receipt 'teamPartition'
+            if ($teamPartitionVerdict.named) {
+                if ($null -eq $storedTeamPartition) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no teamPartition block (requested / observed / verdict) and its committed spec names a reconOmpThreads / prepOmpThreads') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedTeamPartition $f) $teamPartitionVerdict[$f])) { $invalid.Add("TEAM_PARTITION_NOT_FROM_EVIDENCE: teamPartition.$f is not what the hashed run log and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedTeamPartition) { $invalid.Add('TEAM_PARTITION_NOT_FROM_EVIDENCE: the receipt carries a teamPartition block but its committed leg spec names no reconOmpThreads / prepOmpThreads') }
         }
 
         # ---- the CONFORM ARM the run played under: re-derived from the HASHED run log and the COMMITTED spec (HFR-NATIVE-60FPS-FULLRES-1) ----
@@ -4917,6 +5008,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
