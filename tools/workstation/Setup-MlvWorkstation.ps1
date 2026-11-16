@@ -654,12 +654,17 @@ $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACC
 # p5 A1: a secret-named key with a QUOTED value of any length, spaces included (a three character or two word password is still a password), or an
 # UNQUOTED '=' assignment (cmd 'set X=y', dotenv, ini) whose value is 4+ non-space characters that is not a boolean, null or a number and does not
 # start like code ($var, (expr), %var%, @splat). The key may not follow a '$', word character or '-' (so '$Token = Get-Token' in a script is not a hit).
+# A QUOTED value is still a hit wherever the key stands ('$Tok = ''x''' too), and Export then ends non-zero naming the file (r11 F-B1); the detector is never narrowed to make a staged file pass.
 # r10 A1: the key words split in two. A STRONG word (password, secret, a key, a credential) says what the value is, so ANY non-empty unquoted value
 # counts, one character or all digits included ('DB_PASSWORD=123456'); TOKEN also names counters ('max_tokens = 4096'), so a TOKEN key keeps the 4+
 # characters, not-all-digits rule. A YAML 'key: value' line is judged too (for a STRONG key the whole rest of the line is the value, so a prose line such as
 # 'Password: see the owner' is a hit by design: fail closed).
 $CredentialStrongWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|CREDENTIAL'
-$CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\r\n]+"|''[^''\r\n]+'')'
+# r11 S-B1: a TOML basic ("""...""") or literal ('''...''') triple-quoted string is a quoted value too, on one line or across lines (the value may start on the line
+# after the opening delimiter, and may itself begin with a quote). An EMPTY triple-quoted string (the closing delimiter is the next thing after the opening one,
+# whitespace aside) is not a value.
+$CredentialTomlTripleValue = '"""(?!\s*""")\s*\S|' + "'''" + '(?!\s*' + "'''" + ')\s*\S'
+$CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\r\n]+"|''[^''\r\n]+''|' + $CredentialTomlTripleValue + ')'
 # r10 pass 7 A1: a STRONG key takes ANY value that is not itself a boolean or null word: '$hunter2', '@hunter2', 'false-password', 'null-secret' and a multi-word
 # YAML passphrase are credentials (a false positive costs one dropped file named in SECRET-SCAN.txt; a miss ships a secret). The boolean test is for the
 # WHOLE word (followed by a space, quote, comma, semicolon or the end), not a prefix. TOKEN keys keep the code-looking-start guard and the 4+ not-all-digits rule.
@@ -687,13 +692,23 @@ $script:SecretRegex = [regex]::new(($SecretPatterns -join '|'))
 # test both call this one function.
 function Test-CredentialText {
     param([string]$Text)
-    if (-not $Text) { return $false }
-    if ($script:SecretRegex.IsMatch($Text)) { return $true }
-    if ($Text.Contains('\u')) {
-        $decoded = [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
-        if ($script:SecretRegex.IsMatch($decoded)) { return $true }
+    return ((Get-CredentialHitLine $Text) -gt 0)
+}
+
+# r11 F-B1: the 1-based line of the first credential match in the text (judged as written, then with JSON \uXXXX escapes decoded), 0 when there is none.
+# Test-CredentialText is exactly "this is greater than 0", so the Export report and every guard always agree. Never returns the matched text.
+function Get-CredentialHitLine {
+    param([string]$Text)
+    if (-not $Text) { return 0 }
+    $m = $script:SecretRegex.Match($Text)
+    if (-not $m.Success -and $Text.Contains('\u')) {
+        $Text = [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+        $m = $script:SecretRegex.Match($Text)
     }
-    return $false
+    if (-not $m.Success) { return 0 }
+    $line = 1
+    for ($i = 0; $i -lt $m.Index; $i++) { if ($Text[$i] -eq "`n") { $line++ } }
+    return $line
 }
 $ExcludeFiles = @('*.log', '*.err', '*.bak*', '*.tmp', '*.lock', '*.pid', '*.sqlite*', '*.jsonl', '.credentials.json', '.claude.json',
     'auth.json', '*.pem', '*.pfx', '*.p12', '*.key', '*.ppk', 'id_rsa*', 'id_ed25519*', '*_id', '*_id.pub', '*.kdbx', '.env', '*.env',
@@ -710,11 +725,18 @@ $ExcludeDirs = @('.git', 'node_modules', '__pycache__', 'worktrees', 'ssh', 'ope
 # p5 A9: the verdict on ONE staged file, shared by the scan and by the post-archive re-check: '' = clean, else the reason it must not ship.
 function Get-StagedFileVerdict {
     param([System.IO.FileInfo]$File, [long]$MaxScanBytes = 26214400)
-    if ($File.Length -gt $MaxScanBytes) { return 'larger than the scan limit' }
+    return (Get-StagedFileVerdictDetail -File $File -MaxScanBytes $MaxScanBytes).Why
+}
+
+# r11 F-B1: the same verdict plus the line of the first credential match (0 when the reason is not a credential match). Never carries the matched text.
+function Get-StagedFileVerdictDetail {
+    param([System.IO.FileInfo]$File, [long]$MaxScanBytes = 26214400)
+    if ($File.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
     $t = $null
-    try { $t = [IO.File]::ReadAllText($File.FullName) } catch { return 'unreadable' }
-    if ($t -and (Test-CredentialText $t)) { return 'credential pattern' }
-    return ''
+    try { $t = [IO.File]::ReadAllText($File.FullName) } catch { return @{ Why = 'unreadable'; Line = 0 } }
+    $line = Get-CredentialHitLine $t
+    if ($line -gt 0) { return @{ Why = 'credential pattern'; Line = $line } }
+    return @{ Why = ''; Line = 0 }
 }
 
 # Read-only: the relative paths of staged files that are NOT clean right now (the archive step runs this again after tar, because a file can change
@@ -766,15 +788,23 @@ function Invoke-StagedSecretScan {
     param([string]$Stage, [long]$MaxScanBytes = 26214400)
     $removed = [System.Collections.Generic.List[string]]::new()
     $uncleared = [System.Collections.Generic.List[string]]::new()
+    # r11 F-B1: one typed line per file the scan took out of the stage. A credential match is EXPORT_CREDENTIAL_HIT <relative path>:<line> (the line of the
+    # first match, never the matched text); a file that was too large or unreadable is EXPORT_SCAN_DROPPED <relative path> (<why>).
+    $typed = [System.Collections.Generic.List[string]]::new()
     # -Force: robocopy copies Hidden and System files, and Get-ChildItem hides them by default (adversary pass 2, A3).
     foreach ($f in @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)) {
         $rel = $f.FullName.Substring($Stage.Length).TrimStart('\')
-        $why = Get-StagedFileVerdict -File $f -MaxScanBytes $MaxScanBytes
+        $v = Get-StagedFileVerdictDetail -File $f -MaxScanBytes $MaxScanBytes
+        $why = $v.Why
         if (-not $why) { continue }
-        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed.Add("$rel ($why)") }
+        try {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+            $removed.Add("$rel ($why)")
+            $typed.Add($(if ($v.Line -gt 0) { "EXPORT_CREDENTIAL_HIT ${rel}:$($v.Line)" } else { "EXPORT_SCAN_DROPPED $rel ($why)" }))
+        }
         catch { $uncleared.Add("$rel ($why; could not be removed)") }
     }
-    return @{ Removed = $removed.ToArray(); Uncleared = $uncleared.ToArray() }
+    return @{ Removed = $removed.ToArray(); Uncleared = $uncleared.ToArray(); Typed = $typed.ToArray() }
 }
 
 # Scan + report, returning $true only when every staged file is clean or was removed. Fail closed (adversary pass 2, A4): any throw, an uncleared file,
@@ -784,10 +814,15 @@ function Test-StagedBundleClean {
     try {
         $res = Invoke-StagedSecretScan -Stage $Stage
         $clean = ($res.Uncleared.Count -eq 0)
-        try { Write-AsciiFile (Join-Path $Stage 'SECRET-SCAN.txt') ("removed $($res.Removed.Count) file(s) that matched a credential pattern or could not be scanned:`r`n" + ($res.Removed -join "`r`n") + "`r`n") }
+        # r11 F-B1: SECRET-SCAN.txt carries the same typed lines the run prints (path and line, never the matched value).
+        $lacks = $(if ($res.Typed.Count) { ' (this bundle LACKS them and Export ends non-zero)' } else { '' })
+        try { Write-AsciiFile (Join-Path $Stage 'SECRET-SCAN.txt') ("removed $($res.Removed.Count) file(s) that matched a credential pattern or could not be scanned${lacks}:`r`n" + ($res.Typed -join "`r`n") + "`r`n") }
         # r3 A3: a bundle whose scan report cannot be written is NOT clean, even when every file scanned clean: the report is what the owner reviews before transfer.
         catch { $clean = $false; Write-Log "could not write SECRET-SCAN.txt (the bundle is NOT clean and will not be archived): $($_.Exception.Message)" 'ERROR' }
         Write-Log "secret scan removed $($res.Removed.Count) file(s) (see SECRET-SCAN.txt; review before transfer)" $(if ($res.Removed.Count) { 'WARN' } else { 'OK' })
+        # r11 F-B1: a file the scan took out of the stage is a file the bundle lacks, so the run fails (exit 1) with one typed line per file. The bundle itself
+        # is still written WITHOUT those files; nothing narrows the detector to make a match go away.
+        foreach ($t in $res.Typed) { Write-Log $t 'ERROR'; $script:Failures.Add($t) }
         if (-not $clean) { Write-Log "secret scan could not clear $($res.Uncleared.Count) file(s): $($res.Uncleared -join '; ')" 'ERROR' }
         return $clean
     } catch {
@@ -817,7 +852,9 @@ function Invoke-PhaseExport {
         Invoke-Robocopy "$h\.codex" "$stage\home-codex" @('AGENTS.md') (@('/LEV:1') + $common)
         Invoke-Robocopy "$h\.codex\rules" "$stage\home-codex\rules" @() (@('/E') + $common)
         Invoke-Robocopy 'C:\ProgramData\FleetDefender' "$stage\programdata-fleetdefender" @('*.ps1', 'policy.json') (@('/LEV:1') + $common)
-        # Project .claude-state: tooling, memory, checkpoints. Run dirs, evidence and worktrees stay behind.
+        # Project .claude-state: tooling, memory, checkpoints. Run dirs, evidence and worktrees stay behind. The secret scan below judges every staged file; one it
+        # takes out (a script with `$Token = '<literal>'`, a ledger line that quotes a synthetic password) is a file the bundle LACKS, so Export ends non-zero with an
+        # EXPORT_CREDENTIAL_HIT <path>:<line> line per file (r11 F-B1) rather than shipping the gap with exit 0.
         Invoke-Robocopy $cs "$stage\project-claude-state" @('*.md') (@('/LEV:1') + $common)
         # disk-hygiene: its scripts only; its retire-* subfolders are archives of old worktrees (~0.9 GB).
         Invoke-Robocopy "$cs\disk-hygiene" "$stage\project-claude-state\disk-hygiene" @('*.ps1', '*.json', '*.md', '*.vbs') (@('/LEV:1') + $common)
@@ -975,7 +1012,71 @@ function Get-ImportCredentialSkips {
     return $skips.ToArray()
 }
 
-# One Import copy that refuses credential-bearing files (r3 A5). Skips are full-path /XF entries; each is logged as IMPORT_SKIPPED_CREDENTIAL_FILE.
+# r11 S-B2: would robocopy's rules (the /XO /XN /XC switches the caller passed) replace Dest with Source? newer = Source is newer than Dest (/XN excludes it),
+# older = Source is older (/XO excludes it), changed = the same timestamp with a different size (/XC excludes it). Equal time and size is the same file.
+function Test-ImportReplaces {
+    param([System.IO.FileInfo]$Source, [System.IO.FileInfo]$Dest, [bool]$ExcludeNewer, [bool]$ExcludeOlder, [bool]$ExcludeChanged)
+    $s = $Source.LastWriteTimeUtc; $d = $Dest.LastWriteTimeUtc
+    if ($s -gt $d) { return (-not $ExcludeNewer) }
+    if ($s -lt $d) { return (-not $ExcludeOlder) }
+    if ($Source.Length -ne $Dest.Length) { return (-not $ExcludeChanged) }
+    return $false
+}
+
+# r11 S-B2: the ONE place an Import copy writes a host file. The credential check and the replace act on the SAME bytes, because the host file is opened
+# exclusively (FileShare.None) and that handle is held across the re-read, the credential check and the write:
+#   - destination absent: created with FileMode.CreateNew (it cannot overwrite a file that appeared a moment ago; that falls through to the existing-file path);
+#   - destination present: replaced only when the copy rules say so, and only while locked and judged clean; a destination that cannot be locked, or that now
+#     carries a credential (or is a credential-role file naming a credential key), is NOT replaced (Result 'changed').
+# The bundle bytes are read once and judged too. Returns @{ Result = 'created'|'replaced'|'kept'|'changed'|'source-credential'; Why }.
+function Copy-ImportFileLocked {
+    param([System.IO.FileInfo]$Source, [string]$Dest, [bool]$ExcludeNewer, [bool]$ExcludeOlder, [bool]$ExcludeChanged, [long]$MaxScanBytes = 26214400)
+    $bytes = [IO.File]::ReadAllBytes($Source.FullName)
+    $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true)
+    try { $srcText = $sr.ReadToEnd() } finally { $sr.Dispose() }
+    if (Test-CredentialText $srcText) { return @{ Result = 'source-credential'; Why = 'bundle file carries a credential' } }
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Dest))
+    $fs = $null
+    try {
+        $created = $false
+        try { $fs = [IO.File]::Open($Dest, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $created = $true }
+        catch [System.IO.IOException] { if (-not [IO.File]::Exists($Dest)) { throw } }
+        if ($created) {
+            try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() }
+            catch { $fs.Dispose(); $fs = $null; Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue; throw }
+            $fs.Dispose(); $fs = $null
+            [IO.File]::SetCreationTimeUtc($Dest, $Source.CreationTimeUtc)
+            [IO.File]::SetLastWriteTimeUtc($Dest, $Source.LastWriteTimeUtc)
+            $keepAttr = $Source.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)
+            if ($keepAttr) { [IO.File]::SetAttributes($Dest, ([IO.File]::GetAttributes($Dest) -bor $keepAttr)) }
+            return @{ Result = 'created' }
+        }
+        # Cheap pre-check without a lock: a destination the rules would not replace is never opened (a running hook may hold it).
+        if (-not (Test-ImportReplaces -Source $Source -Dest ([IO.FileInfo]::new($Dest)) -ExcludeNewer $ExcludeNewer -ExcludeOlder $ExcludeOlder -ExcludeChanged $ExcludeChanged)) { return @{ Result = 'kept' } }
+        try { $fs = [IO.File]::Open($Dest, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+        catch { return @{ Result = 'changed'; Why = "host file cannot be locked for the replace ($($_.Exception.Message))" } }
+        # From here the host file is ours alone: the timestamps, the content and the write below are one atomic view of it.
+        if (-not (Test-ImportReplaces -Source $Source -Dest ([IO.FileInfo]::new($Dest)) -ExcludeNewer $ExcludeNewer -ExcludeOlder $ExcludeOlder -ExcludeChanged $ExcludeChanged)) { return @{ Result = 'kept' } }
+        if ($fs.Length -gt $MaxScanBytes) { return @{ Result = 'changed'; Why = 'host file larger than the scan limit' } }
+        $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8, $true, 4096, $true)
+        try { $dstText = $rd.ReadToEnd() } finally { $rd.Dispose() }
+        if (Test-CredentialText $dstText) { return @{ Result = 'changed'; Why = 'host file carries a credential' } }
+        if (($CredentialRoleFiles -contains $Source.Name.ToLowerInvariant()) -and ([regex]::new('(?i)(' + $CredentialNameWords + ')')).IsMatch($dstText)) { return @{ Result = 'changed'; Why = 'host credential-role file names a credential key' } }
+        [void]$fs.Seek(0, [IO.SeekOrigin]::Begin)
+        $fs.SetLength(0)
+        $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
+        $fs.Dispose(); $fs = $null
+        [IO.File]::SetLastWriteTimeUtc($Dest, $Source.LastWriteTimeUtc)
+        return @{ Result = 'replaced' }
+    } finally { if ($fs) { $fs.Dispose() } }
+}
+
+# One Import copy that refuses credential-bearing files (r3 A5) and replaces nothing it has not judged under a lock (r11 S-B2). Reads the same switches the
+# robocopy calls used (/E /S /XF <names or full paths> /XD <full paths> /XO /XN /XC); robocopy itself no longer writes a host file here.
+#   inspection (Get-ImportCredentialSkips): the bundle files and host files that already carry a credential are skipped up front, each logged as
+#       IMPORT_SKIPPED_CREDENTIAL_FILE;
+#   copy (Copy-ImportFileLocked): a host file that cannot be locked, or that gained a credential since the inspection, is skipped with
+#       IMPORT_DEST_CHANGED_SKIPPED <path> and the run fails (exit 1).
 function Invoke-ImportRobocopy {
     param([string]$From, [string]$To, [string[]]$Extra = @())
     $skips = @(Get-ImportCredentialSkips -SourceDir $From -DestDir $To)
@@ -983,20 +1084,71 @@ function Invoke-ImportRobocopy {
         Write-Log "IMPORT_SKIPPED_CREDENTIAL_FILE $($s.Dest) ($($s.Reason); the bundle copy $($s.Source) was not applied)" 'WARN'
         $script:ImportSkippedDest.Add($s.Dest)
     }
-    $xf = @($skips | ForEach-Object { $_.Source })
-    $withSkips = @($Extra)
-    if ($xf.Count) {
-        # The skip paths join the file-exclusion list the caller already passed as '/XF <names...>': inserted right after that first '/XF'
-        # (a caller with no /XF gets one appended).
-        $at = [Array]::IndexOf($withSkips, '/XF')
-        if ($at -ge 0) { $withSkips = @($withSkips[0..$at]) + $xf + @(if ($at + 1 -lt $withSkips.Count) { $withSkips[($at + 1)..($withSkips.Count - 1)] }) }
-        else { $withSkips += @('/XF') + $xf }
+    if (-not (Test-Path -LiteralPath $From)) { Write-Log "  (absent, skipped) $From" 'WARN'; return }
+    $xfNames = [System.Collections.Generic.List[string]]::new(); $xfPaths = [System.Collections.Generic.List[string]]::new(); $xdPaths = [System.Collections.Generic.List[string]]::new()
+    $recurse = $false; $exN = $false; $exO = $false; $exC = $false; $mode = ''
+    foreach ($tok in $Extra) {
+        if ($tok.StartsWith('/')) {
+            $mode = ''
+            switch -Regex ($tok.ToUpperInvariant()) { '^/(E|S)$' { $recurse = $true } '^/XN$' { $exN = $true } '^/XO$' { $exO = $true } '^/XC$' { $exC = $true } '^/XF$' { $mode = 'F' } '^/XD$' { $mode = 'D' } }
+        }
+        elseif ($mode -eq 'F') { if ($tok -match '[\\:]') { $xfPaths.Add($tok.TrimEnd('\')) } else { $xfNames.Add($tok) } }
+        elseif ($mode -eq 'D') { $xdPaths.Add($tok.TrimEnd('\')) }
     }
-    Invoke-Robocopy $From $To @() $withSkips
+    # Test seam: runs between the inspection above and the replace below (the window an editor can save a credential into). Null in every real run.
+    if ($script:ImportBeforeReplaceHook) { & $script:ImportBeforeReplaceHook $From $To }
+    $skipSet = @{}
+    foreach ($s in $skips) { $skipSet[$s.Source.ToLowerInvariant()] = $true }
+    $n = @{ created = 0; replaced = 0; kept = 0; skipped = 0; failed = 0 }
+    $root = $From.TrimEnd('\')
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    $stack.Push($root)
+    while ($stack.Count) {
+        $dir = $stack.Pop()
+        $rel = $dir.Substring($root.Length).TrimStart('\')
+        $destDir = $(if ($rel) { Join-Path $To $rel } else { $To })
+        try { [void][IO.Directory]::CreateDirectory($destDir) }
+        catch { $n.failed++; Write-Log "IMPORT_COPY_FAILED $destDir :: $($_.Exception.Message)" 'ERROR'; $script:Failures.Add("IMPORT_COPY_FAILED $destDir"); continue }
+        foreach ($e in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+            if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }   # /XJ
+            if ($e.PSIsContainer) {
+                $skipDir = $false
+                foreach ($x in $xdPaths) { if ($x -match '[\\:]') { if ($e.FullName.TrimEnd('\') -ieq $x) { $skipDir = $true } } elseif ($e.Name -like $x) { $skipDir = $true } }
+                if ($recurse -and -not $skipDir) { $stack.Push($e.FullName) }
+                continue
+            }
+            $skipFile = $skipSet.ContainsKey($e.FullName.ToLowerInvariant())
+            foreach ($x in $xfNames) { if ($e.Name -like $x) { $skipFile = $true } }
+            foreach ($x in $xfPaths) { if ($e.FullName -ieq $x) { $skipFile = $true } }
+            if ($skipFile) { continue }
+            $dest = Join-Path $destDir $e.Name
+            try { $r = Copy-ImportFileLocked -Source $e -Dest $dest -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
+            catch { $n.failed++; Write-Log "IMPORT_COPY_FAILED $dest :: $($_.Exception.Message)" 'ERROR'; $script:Failures.Add("IMPORT_COPY_FAILED $dest"); continue }
+            switch ($r.Result) {
+                'created' { $n.created++ }
+                'replaced' { $n.replaced++ }
+                'kept' { $n.kept++ }
+                'source-credential' {
+                    $n.skipped++
+                    Write-Log "IMPORT_SKIPPED_CREDENTIAL_FILE $dest ($($r.Why); the bundle copy $($e.FullName) was not applied)" 'WARN'
+                    $script:ImportSkippedDest.Add($dest)
+                }
+                'changed' {
+                    $n.skipped++
+                    Write-Log "IMPORT_DEST_CHANGED_SKIPPED $dest ($($r.Why); the host file was left as it is, the bundle copy $($e.FullName) was not applied)" 'ERROR'
+                    $script:ImportSkippedDest.Add($dest)
+                    $script:Failures.Add("IMPORT_DEST_CHANGED_SKIPPED $dest")
+                }
+            }
+        }
+    }
+    Write-Log "  import copy $From -> $To : created $($n.created), replaced $($n.replaced), kept $($n.kept) (older or the same), skipped $($n.skipped), failed $($n.failed)"
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
 $script:ImportSettingsApplied = $false
+# Test seam for r11 S-B2 (see Invoke-ImportRobocopy): a scriptblock called with (From, To) between the inspection and the replace. Always $null in a real run.
+$script:ImportBeforeReplaceHook = $null
 
 # r10 pass 7 A2: read the file ONCE, judge those bytes, and write those same bytes (a host editor saving a credential between a check and a Copy-Item
 # can no longer put it into the backup). $true = written; $false = carries a credential, unreadable, or could not be written (nothing is left behind).

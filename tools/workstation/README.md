@@ -84,8 +84,19 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    **What the bundle leaves out:** `.credentials.json`, `.claude.json`, `auth.json`, every ssh key,
    `*token*` / `*secret*` / `*credential*` files, session transcripts, `history.jsonl`, sqlite stores,
    logs, hook state dot-files, `identity\`, run directories and worktrees. Any staged file whose text
-   matches a token pattern (Anthropic, OpenAI, GitHub, Slack, AWS, private key, `access_token`) is
-   deleted from the bundle and listed in `SECRET-SCAN.txt`.
+   matches a token pattern (Anthropic, OpenAI, GitHub, Slack, AWS, private key, `access_token`) or
+   holds a secret-named key with a quoted value (TOML `"""` and `'''` strings included) is deleted
+   from the bundle, **and Export then ends with exit 1**: it prints one
+   `EXPORT_CREDENTIAL_HIT <path in the bundle>:<line>` line per file (never the matched value) and writes
+   the same lines to `SECRET-SCAN.txt`. A file too large or unreadable to scan is
+   `EXPORT_SCAN_DROPPED <path> (<why>)`. The zip is still written, **without those files**: a file the
+   bundle lacks is a file the new host keeps stale, so read the list. A false positive (a script line
+   `$Token = '<literal>'`, a ledger line quoting a synthetic password) is not fixed by loosening the
+   detector: carry that file by hand, or reword the line, then re-export. Import never replaces a host file
+   that carries a credential: it opens each host file it would replace exclusively, judges those bytes and
+   writes through the same handle. A host file another process holds open, or one that gained a credential
+   since the inspection, stays as it is (`IMPORT_DEST_CHANGED_SKIPPED <path>`, exit 1): close what holds it
+   and re-run `-Phase Import` (it is idempotent).
 
 5. **Do the owner-only checklist** (`-Phase Checklist` prints it). Then go through the cut-over phases.
 

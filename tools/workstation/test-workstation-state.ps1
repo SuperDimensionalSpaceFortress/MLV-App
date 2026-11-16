@@ -899,6 +899,143 @@ if ($fnLoaded -and (Test-Has 'Invoke-Native' 'r10 A5 native')) {
     Assert-That (-not $a5threw2 -and $a5code2 -eq 128) 'r10 A5 native: -OkCodes is honoured even when $PSNativeCommandUseErrorActionPreference is $true' "threw=$a5threw2 code=$a5code2"
 }
 
+# ================================================================ r11 (head 0eb956f3): S-B1 triple-quoted TOML, F-B1 typed Export refusal, S-B2 locked Import replace
+# ---------------------------------------------------------------- r11 S-B1: TOML basic and literal triple-quoted strings, single line and multiline
+$q3 = '"' * 3
+$s3 = "'" * 3
+$r11Toml = [ordered]@{
+    'S-B1 TOML basic triple-quoted, one line'       = 'api_key = ' + $q3 + 'synthetic-secret-1234' + $q3
+    'S-B1 TOML literal triple-quoted, one line'     = 'api_key = ' + $s3 + 'synthetic-secret-1234' + $s3
+    'S-B1 TOML basic triple-quoted, multiline'      = 'api_key = ' + $q3 + "`n" + 'synthetic-secret-1234' + "`n" + $q3
+    'S-B1 TOML literal triple-quoted, multiline'    = 'api_key = ' + $s3 + "`n" + 'synthetic-secret-1234' + "`n" + $s3
+    'S-B1 TOML multiline value that starts with a quote' = 'password = ' + $q3 + "`n" + '"synthetic-secret-1234"' + "`n" + $q3
+    'S-B1 TOML quoted key, CRLF, token name'        = '"auth_token" = ' + $s3 + "`r`n" + 'synthetic-secret-1234' + "`r`n" + $s3
+    'S-B1 TOML table entry, no spaces round ='      = "[auth]`ntoken=" + $q3 + 'synthetic-secret-1234' + $q3
+}
+$r11TomlOk = [ordered]@{
+    'S-B1 control: an empty basic triple-quoted value'   = 'api_key = ' + $q3 + $q3
+    'S-B1 control: an empty literal triple-quoted value' = 'api_key = ' + $s3 + $s3
+    'S-B1 control: a triple-quoted value under a non-secret key' = 'description = ' + $q3 + 'synthetic text' + $q3
+}
+if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinue)) {
+    foreach ($k in $r11Toml.Keys) { Assert-That (Test-CredentialText $r11Toml[$k]) "r11 $k is a credential (Test-CredentialText)" $r11Toml[$k] }
+    foreach ($k in $r11TomlOk.Keys) { Assert-That (-not (Test-CredentialText $r11TomlOk[$k])) "r11 $k is not a credential" $r11TomlOk[$k] }
+} else { Assert-That $false 'r11 S-B1: Test-CredentialText is not defined' }
+# the same detector is behind every consumer: the Export scan, the archive re-check, the Import bundle/host guard and the backup copy
+if ($fnLoaded -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyContinue)) {
+    $sb1Stage = New-Scratch 'r11-sb1-stage'
+    $sb1Names = @{}
+    $i = 0
+    foreach ($k in $r11Toml.Keys) { $i++; $n = "toml$i.toml"; $sb1Names[$k] = $n; [IO.File]::WriteAllText((Join-Path $sb1Stage $n), $r11Toml[$k]) }
+    [void](Invoke-StagedSecretScan -Stage $sb1Stage)
+    foreach ($k in $r11Toml.Keys) { Assert-That (-not (Test-Path -LiteralPath (Join-Path $sb1Stage $sb1Names[$k]))) "r11 $k`: removed by the Export scan" }
+}
+if ($fnLoaded -and (Get-Command Get-ArchiveCredentialHits -ErrorAction SilentlyContinue)) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $sb1Zip = Join-Path (New-Scratch 'r11-sb1-zip') 'toml.zip'
+    $zf = [IO.Compression.ZipFile]::Open($sb1Zip, 'Create')
+    try { $e = $zf.CreateEntry('./service.toml'); $sw = [IO.StreamWriter]::new($e.Open()); $sw.Write($r11Toml['S-B1 TOML basic triple-quoted, multiline']); $sw.Dispose() } finally { $zf.Dispose() }
+    Assert-That (@(Get-ArchiveCredentialHits -Zip $sb1Zip).Count -eq 1) 'r11 S-B1: a triple-quoted TOML credential inside the archive is a hit (archive re-check)'
+}
+if ($fnLoaded -and (Get-Command Get-ImportCredentialSkips -ErrorAction SilentlyContinue)) {
+    $sb1Src = New-Scratch 'r11-sb1-isrc'; $sb1Dst = New-Scratch 'r11-sb1-idst'
+    [IO.File]::WriteAllText((Join-Path $sb1Src 'bundle.toml'), $r11Toml['S-B1 TOML literal triple-quoted, one line'])
+    [IO.File]::WriteAllText((Join-Path $sb1Src 'host.toml'), '[x]')
+    [IO.File]::WriteAllText((Join-Path $sb1Dst 'host.toml'), $r11Toml['S-B1 TOML basic triple-quoted, one line'])
+    $sb1Skips = @(Get-ImportCredentialSkips -SourceDir $sb1Src -DestDir $sb1Dst)
+    Assert-That (@($sb1Skips | Where-Object { $_.Source -like '*bundle.toml' -and $_.Reason -like 'bundle file carries a credential' }).Count -eq 1) 'r11 S-B1: Import refuses a bundle file with a triple-quoted TOML credential' (($sb1Skips | ForEach-Object Reason) -join ';')
+    Assert-That (@($sb1Skips | Where-Object { $_.Source -like '*host.toml' -and $_.Reason -like 'host file carries a credential' }).Count -eq 1) 'r11 S-B1: Import keeps a host file with a triple-quoted TOML credential' (($sb1Skips | ForEach-Object Reason) -join ';')
+}
+if ($fnLoaded -and (Get-Command Copy-CleanBackupFile -ErrorAction SilentlyContinue)) {
+    $sb1Bk = New-Scratch 'r11-sb1-bk'
+    $sb1Settings = Join-Path (New-Scratch 'r11-sb1-bkhome') 'config.toml'
+    [IO.File]::WriteAllText($sb1Settings, $r11Toml['S-B1 TOML literal triple-quoted, multiline'])
+    Assert-That ((Copy-CleanBackupFile -Path $sb1Settings -DestinationDir $sb1Bk) -eq $false -and -not (Test-Path -LiteralPath (Join-Path $sb1Bk 'config.toml'))) 'r11 S-B1: the backup never copies a file with a triple-quoted TOML credential'
+}
+
+# ---------------------------------------------------------------- r11 F-B1: Export never exits 0 with a bundle that lacks a staged file; one typed line per dropped file, never the value
+function New-ExportFixture([string]$Name, [bool]$WithHits) {
+    $ws = New-Scratch "$Name-ws"
+    $repo = Join-Path $ws 'MLV-App'
+    $cs = Join-Path $repo '.claude-state'
+    [void][IO.Directory]::CreateDirectory((Join-Path $cs 'hub-autopilot'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $cs 'kernel'))
+    [IO.File]::WriteAllText((Join-Path $cs 'hub-autopilot\clean.ps1'), "Write-Output 'ok'`r`n")
+    if ($WithHits) {
+        $gate = @(1..21 | ForEach-Object { "# filler line $_" }) + @('$AhgToken = ''TYPED_REFUSAL_STRING_R11''', '# end')
+        [IO.File]::WriteAllText((Join-Path $cs 'hub-autopilot\approved-head-gate.ps1'), (($gate -join "`r`n") + "`r`n"))
+        $led = @(1..6 | ForEach-Object { "ledger row $_" }) + @('ruling quotes {"password":"demoValue42"} as a synthetic value', 'ledger row 8')
+        [IO.File]::WriteAllText((Join-Path $cs 'kernel\subject-ledger.md'), (($led -join "`n") + "`n"))
+    } else {
+        [IO.File]::WriteAllText((Join-Path $cs 'kernel\subject-ledger.md'), "ledger row 1`n")
+    }
+    & git -C $repo init --quiet 2>&1 | Out-Null
+    return $ws
+}
+$fb1Out = New-Scratch 'r11-fb1-out'
+$fb1 = Invoke-Setup (New-Scratch 'r11-fb1-home') @('-Phase', 'Export', '-StateRoot', (New-Scratch 'r11-fb1-state'), '-Workspace', (New-ExportFixture 'r11-fb1' $true), '-ExportDir', $fb1Out)
+Assert-That ($fb1.Exit -ne 0) 'r11 F-B1 export: a staged file that matches the credential scan ends Export NON-ZERO (never exit 0 with a bundle that lacks it)' "exit=$($fb1.Exit)`n$($fb1.Out)"
+Assert-That ($fb1.Out -match 'EXPORT_CREDENTIAL_HIT project-claude-state\\hub-autopilot\\approved-head-gate\.ps1:22\b') 'r11 F-B1 export: a typed EXPORT_CREDENTIAL_HIT line names the first file and the line of the match' $fb1.Out
+Assert-That ($fb1.Out -match 'EXPORT_CREDENTIAL_HIT project-claude-state\\kernel\\subject-ledger\.md:7\b') 'r11 F-B1 export: a typed EXPORT_CREDENTIAL_HIT line for the second file too (one line per file)' $fb1.Out
+Assert-That (-not $fb1.Out.Contains('TYPED_REFUSAL_STRING_R11') -and -not $fb1.Out.Contains('demoValue42')) 'r11 F-B1 export: the matched value never reaches the output'
+$fb1Stage = @(Get-ChildItem -LiteralPath $fb1Out -Directory -Filter 'bundle-*' -ErrorAction SilentlyContinue | Select-Object -First 1)
+$fb1Report = if ($fb1Stage.Count) { Join-Path $fb1Stage[0].FullName 'SECRET-SCAN.txt' } else { '' }
+$fb1ReportText = if ($fb1Report -and (Test-Path -LiteralPath $fb1Report)) { [IO.File]::ReadAllText($fb1Report) } else { '' }
+Assert-That ($fb1ReportText -match 'EXPORT_CREDENTIAL_HIT project-claude-state\\hub-autopilot\\approved-head-gate\.ps1:22\b' -and $fb1ReportText -match 'EXPORT_CREDENTIAL_HIT project-claude-state\\kernel\\subject-ledger\.md:7\b') 'r11 F-B1 export: SECRET-SCAN.txt lists the same typed lines' $fb1ReportText
+Assert-That (-not $fb1ReportText.Contains('TYPED_REFUSAL_STRING_R11') -and -not $fb1ReportText.Contains('demoValue42')) 'r11 F-B1 export: SECRET-SCAN.txt never carries the matched value'
+$fb1c = Invoke-Setup (New-Scratch 'r11-fb1c-home') @('-Phase', 'Export', '-StateRoot', (New-Scratch 'r11-fb1c-state'), '-Workspace', (New-ExportFixture 'r11-fb1c' $false), '-ExportDir', (New-Scratch 'r11-fb1c-out'))
+Assert-That ($fb1c.Exit -eq 0 -and $fb1c.Out -notmatch 'EXPORT_CREDENTIAL_HIT') 'r11 F-B1 export (control): a stage with no match still exits 0 with no typed hit' "exit=$($fb1c.Exit)`n$($fb1c.Out)"
+if ($fnLoaded -and (Get-Command Test-StagedBundleClean -ErrorAction SilentlyContinue)) {
+    $fb1Stage2 = New-Scratch 'r11-fb1-fn-stage'
+    [IO.File]::WriteAllText((Join-Path $fb1Stage2 'one.ps1'), "# a`n`$AhgToken = 'TYPED_REFUSAL_STRING_R11'`n")
+    $script:Failures.Clear()
+    [void](Test-StagedBundleClean -Stage $fb1Stage2)
+    Assert-That (@($script:Failures | Where-Object { $_ -ceq 'EXPORT_CREDENTIAL_HIT one.ps1:2' }).Count -eq 1) 'r11 F-B1 scan: Test-StagedBundleClean records EXPORT_CREDENTIAL_HIT <relative path>:<line> as a failure of the run' ($script:Failures -join ',')
+    $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r11 S-B2: Import replaces a host file only through an exclusive handle that also judged its bytes
+if ($fnLoaded -and (Test-Has 'Invoke-ImportRobocopy' 'r11 S-B2')) {
+    $b2Src = New-Scratch 'r11-b2-src'; $b2Dst = New-Scratch 'r11-b2-dst'
+    foreach ($d in 'hooks') { [void][IO.Directory]::CreateDirectory((Join-Path $b2Src $d)); [void][IO.Directory]::CreateDirectory((Join-Path $b2Dst $d)) }
+    $newer = [DateTime]::UtcNow.AddMinutes(10); $older = [DateTime]::UtcNow.AddDays(-3)
+    foreach ($f in @(@('hooks\service.json', '{"v":"bundle-service"}', '{}', $older), @('hooks\other.json', '{"v":"bundle-other"}', '{"v":"host-other"}', $older), @('hooks\keep.json', '{"v":"bundle-old"}', '{"v":"host-newer"}', [DateTime]::UtcNow.AddDays(1)), @('hooks\fresh.json', '{"v":"bundle-fresh"}', $null, $null))) {
+        [IO.File]::WriteAllText((Join-Path $b2Src $f[0]), $f[1]); (Get-Item -LiteralPath (Join-Path $b2Src $f[0])).LastWriteTimeUtc = $(if ($f[0] -like '*keep*') { [DateTime]::UtcNow.AddDays(-5) } else { $newer })
+        if ($null -ne $f[2]) { [IO.File]::WriteAllText((Join-Path $b2Dst $f[0]), $f[2]); (Get-Item -LiteralPath (Join-Path $b2Dst $f[0])).LastWriteTimeUtc = $f[3] }
+    }
+    $svc = Join-Path $b2Dst 'hooks\service.json'
+    # the seam runs between the inspection pass and the replace: an editor saves a credential into the host file in that window
+    $script:ImportBeforeReplaceHook = { param($From, $To) [IO.File]::WriteAllText((Join-Path $To 'hooks\service.json'), '{"api_key":"synthetic-local-key"}') }
+    $script:Failures.Clear(); $script:ImportSkippedDest.Clear()
+    $logBefore = if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile).Length } else { 0 }
+    try { Invoke-ImportRobocopy -From $b2Src -To $b2Dst -Extra @('/E', '/XO', '/XF', '*.log') } finally { $script:ImportBeforeReplaceHook = $null }
+    $b2Log = [IO.File]::ReadAllText($script:LogFile).Substring($logBefore)
+    Assert-That (([IO.File]::ReadAllText($svc)) -ceq '{"api_key":"synthetic-local-key"}') 'r11 S-B2 import: a host file that gained a credential after inspection is NOT replaced by the newer bundle copy' ([IO.File]::ReadAllText($svc))
+    Assert-That ($b2Log.Contains("IMPORT_DEST_CHANGED_SKIPPED $svc")) 'r11 S-B2 import: the skip is the typed line IMPORT_DEST_CHANGED_SKIPPED <path>' $b2Log
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'IMPORT_DEST_CHANGED_SKIPPED*' }).Count -eq 1) 'r11 S-B2 import: the skip is a failure of the run (non-zero step result)' ($script:Failures -join ',')
+    Assert-That ($script:ImportSkippedDest -contains $svc) 'r11 S-B2 import: the skipped destination is remembered (a skipped settings.json is never read as applied)'
+    Assert-That (([IO.File]::ReadAllText((Join-Path $b2Dst 'hooks\other.json'))) -ceq '{"v":"bundle-other"}') 'r11 S-B2 import: an unchanged clean host file is still replaced by the newer bundle copy' ([IO.File]::ReadAllText((Join-Path $b2Dst 'hooks\other.json')))
+    Assert-That ([IO.File]::GetLastWriteTimeUtc((Join-Path $b2Dst 'hooks\other.json')) -eq [IO.File]::GetLastWriteTimeUtc((Join-Path $b2Src 'hooks\other.json'))) 'r11 S-B2 import: a replaced file keeps the bundle copy''s timestamp (the /XO rule needs it)'
+    Assert-That (([IO.File]::ReadAllText((Join-Path $b2Dst 'hooks\keep.json'))) -ceq '{"v":"host-newer"}') 'r11 S-B2 import: an OLDER bundle copy never replaces a newer host file' ([IO.File]::ReadAllText((Join-Path $b2Dst 'hooks\keep.json')))
+    Assert-That (([IO.File]::ReadAllText((Join-Path $b2Dst 'hooks\fresh.json'))) -ceq '{"v":"bundle-fresh"}') 'r11 S-B2 import: a file the host lacks is created' ([IO.File]::ReadAllText((Join-Path $b2Dst 'hooks\fresh.json')))
+    $script:Failures.Clear(); $script:ImportSkippedDest.Clear()
+}
+# end to end: a host file another process holds open cannot be locked, so it is skipped with the typed line and the run fails (it used to end in a robocopy exit 8)
+$b2eHome = New-Scratch 'r11-b2e-home'
+$b2eSvc = Join-Path $b2eHome '.claude\hooks\service.json'
+[void][IO.Directory]::CreateDirectory((Split-Path -Parent $b2eSvc))
+[IO.File]::WriteAllText($b2eSvc, '{}'); (Get-Item -LiteralPath $b2eSvc).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+$b2eBundle = New-Scratch 'r11-b2e-bundle'
+[IO.File]::WriteAllText((Join-Path $b2eBundle 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+[void][IO.Directory]::CreateDirectory((Join-Path $b2eBundle 'home-claude\hooks'))
+[IO.File]::WriteAllText((Join-Path $b2eBundle 'home-claude\hooks\service.json'), '{"v":"bundle-service"}')
+[IO.File]::WriteAllText((Join-Path $b2eBundle 'home-claude\CLAUDE.md'), 'owner instructions')
+$b2eHold = [IO.File]::Open($b2eSvc, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try { $b2e = Invoke-Setup $b2eHome @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r11-b2e-state'), '-Workspace', (New-Scratch 'r11-b2e-ws'), '-BundlePath', $b2eBundle, '-SourceHost', 'NOT-THIS-HOST') } finally { $b2eHold.Dispose() }
+Assert-That ($b2e.Out.Contains("IMPORT_DEST_CHANGED_SKIPPED $b2eSvc")) 'r11 S-B2 import (end to end): a host file another process holds open is skipped with IMPORT_DEST_CHANGED_SKIPPED <path>' $b2e.Out
+Assert-That ($b2e.Exit -eq 1 -and ([IO.File]::ReadAllText($b2eSvc)) -ceq '{}') 'r11 S-B2 import (end to end): the run fails (exit 1) and the held host file is untouched' "exit=$($b2e.Exit)"
+Assert-That (Test-Path -LiteralPath (Join-Path $b2eHome '.claude\CLAUDE.md')) 'r11 S-B2 import (end to end): the other files still come across after one is skipped' $b2e.Out
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
