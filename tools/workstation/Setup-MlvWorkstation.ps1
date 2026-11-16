@@ -712,7 +712,9 @@ function Invoke-PhaseQt {
 # Phase: Export (SOURCE machine). Read-only towards tasks, hooks and the repo; writes only under
 # $ExportDir. Secrets, credentials, auth tokens, ssh keys and session transcripts never enter it.
 # ---------------------------------------------------------------------------------------------
-$CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|TOKEN|CREDENTIAL'
+# r16 (adversary pass 16 A1 sibling): a separator RUN ('[_.\-]*') may stand inside a compound name word, as the classifier allows (its role guards also call
+# Test-CredentialNamePresent, which asks the classifier itself; this regex is never the narrower of the two)
+$CredentialNameWords = 'SECRET|PASS[_.\-]*W(?:OR)?D|PRIVATE[_.\-]*KEY|API[_.\-]*KEY|ACCESS[_.\-]*KEY|AUTH[_.\-]*KEY|TOKEN|CREDENTIAL'
 # r14 (hub ruling on adversary pass 10 A1-A3; replaces the r3..r12 per-format regex set: p5 A1, r10 A1, r11 S-B1, r12 A1/A2, r12 pass 9 B1/B2).
 # Every pass since r10 found three more spellings of the same detector, so the per-format patterns (a quoted name/value pattern, an unquoted '=' pattern,
 # two YAML patterns, two flow patterns, two netrc patterns, an npmrc pattern) are gone. There is ONE shape-agnostic rule, Get-CredentialKeyValueHitIndex:
@@ -750,7 +752,14 @@ $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACC
 # r15 pass 13 A2: between the name and its separator up to three CLOSING characters may stand (a quote, ']', ')', '}'), so a subscripted or braced script key is a key
 # too: '${env:DB_PASSWORD} = ''x''', '$config[''password''] = ''x''', '$c["token"]="x"', '(password) = x'. (Blanks may stand before and after them.)
 # r15 pass 14 A1: any whitespace, line breaks included, may stand between the name (and its closers) and the separator ('{"password"\n:"hunter2"}' is valid JSON).
-$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-]*)((?:\s*["''\]\)\}]){0,3})\s*(:|=(?!=))'
+# r16 (adversary pass 16 A1): the candidate name list is built from the classifier's own words with a RUN of separators ('[_.\-]*') allowed between ANY two letters,
+# because Get-CredentialKeyClass strips every '_', '.' and '-' before it decides ('api__key', 'private..key', 'pass--word' are strong there). The old candidate
+# regexes allowed at most one separator, and only at one place, so such a key was never even offered to the classifier. A wider candidate set is always safe: the
+# classifier still decides every candidate ('a_u_t_h' is offered and rejected, as 'author' is).
+# r16 (adversary pass 16 A2): any number of CLOSING characters may stand between the name and its separator ('$c[(("password"))] = "x"' has four); the r15 bound of
+# three let a fourth closer hide the key. The run is linear (each step needs one closer), so it cannot backtrack catastrophically.
+$CredentialNameCore = (@('password', 'passwd', 'secret', 'credential', 'apikey', 'privatekey', 'accesskey', 'auth', 'token', 'pwd') | ForEach-Object { (@($_.ToCharArray()) | ForEach-Object { [string]$_ }) -join '[_.\-]*' }) -join '|'
+$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:' + $CredentialNameCore + ')[A-Za-z0-9_.\-]*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
 # r15 (hub ruling on adversary pass 12 A1-A3, DENY BY DEFAULT on the key name): the value span regexes, the quoted-run regexes and the netrc record tokenizer of
 # r14 are gone (they stripped quotes, braces, comments and CDATA before the exemption test). What is left is the CLOSED exemption list, compared against the whole
@@ -777,7 +786,8 @@ $SecretPatterns = @(
 # r15 (pass 12 A2): the element's RAW content, from just after its opening tag to its matching closing tag (or to the end of the text when it is never closed), is
 # its value. Nothing is removed first: a comment, a CDATA section ('<![CDATA[<!--hunter2-->]]>') or a child element is content, so it is never empty. This regex
 # finds the OPENING tag of a secret-named element (Get-CredentialXmlHitIndex finds its close); a self-closing tag ('<password/>') has no content at all.
-$script:CredentialXmlOpenRegex = [regex]::new('(?i)<([A-Za-z0-9_.\-:]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-:]*)(?=[\s/>])[^<>]*>')
+# r16 (adversary pass 16 A1 sibling): the same separator-run name list ($CredentialNameCore) as the key/value rule ('<api__key>x</api__key>')
+$script:CredentialXmlOpenRegex = [regex]::new('(?i)<([A-Za-z0-9_.\-:]*?(?:' + $CredentialNameCore + ')[A-Za-z0-9_.\-:]*)(?=[\s/>])[^<>]*>')
 $script:SecretShapeRegex = [regex]::new(($SecretPatterns -join '|'))
 
 # '' = not a secret-named key; 'strong' = the key says its value is a secret; 'count' = a TOKEN key that names a count ('max_tokens').

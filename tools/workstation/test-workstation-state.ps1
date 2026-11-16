@@ -1813,6 +1813,28 @@ if ($fnLoaded -and (Test-Has 'Copy-CleanBackupFile' 'r16 p15 A4 sibling')) {
     Assert-That ((Copy-CleanBackupFile -Path $p15a4Src -DestinationDir $p15bk) -eq $true -and ([IO.File]::ReadAllText((Join-Path $p15bk 'service.ps1'))) -ceq ('x' * 8192)) 'r16 p15 A4 sibling backup: a clean file is still written byte for byte through the owned handle'
 }
 
+# ================================================================ r16 fix iteration 2 (head 2912c48a): adversary pass 16, A1 A2 (A3 is listed OPEN in the PR comment)
+# A1: a run of separators inside a name word ('api__key') is a secret-named key to the classifier, so every candidate regex offers it (key/value and XML forms)
+# A2: any number of closing characters may stand between a name and its separator
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r16 p16 A1 A2') -and (Test-Has 'Get-CredentialKeyClass' 'r16 p16 A1 A2')) {
+    $p16 = [ordered]@{
+        'p16 A1 a JSON key with a doubled underscore (api__key)'        = '{"api__key":"hunter2"}'
+        'p16 A1 a JSON key with a doubled dot (private..key)'           = '{"private..key":"hunter2"}'
+        'p16 A1 an XML element with a doubled underscore (api__key)'    = '<api__key>hunter2</api__key>'
+        'p16 A1 a separator run inside password (pass--word)'           = 'pass--word = hunter2'
+        'p16 A2 a subscript with four closers before the ='             = '$c = @{}; $c[(("password"))] = "hunter2"'
+        'p16 A2 a subscript with five closers before the = (and more)'  = '$c[((("token")))] = "hunter2"'
+    }
+    foreach ($k in $p16.Keys) { Assert-That ((Test-CredentialText $p16[$k]) -and (Get-CredentialHitLine $p16[$k]) -gt 0) "r16 $k is a credential" $p16[$k] }
+    Assert-That ((Get-CredentialKeyClass 'api__key') -ceq 'strong' -and (Get-CredentialKeyClass 'private..key') -ceq 'strong') 'r16 p16 A1 control: the classifier calls api__key and private..key strong'
+    Assert-That (-not (Test-CredentialText '{"author":"Layi","a_u_t_h":"x-is-not-a-key"}')) 'r16 p16 A1 control: a wider candidate set still leaves the classifier the decision (author, a_u_t_h are not secret-named)'
+    if (Test-Has 'Get-StagedCredentialHits' 'r16 p16 A1') {
+        $p16Stage = New-Scratch 'r16-p16-a1-stage'
+        [IO.File]::WriteAllText((Join-Path $p16Stage 'service.json'), $p16['p16 A1 a JSON key with a doubled underscore (api__key)'])
+        Assert-That (@(Get-StagedCredentialHits -Stage $p16Stage).Count -eq 1) 'r16 p16 A1 export: the stage guard refuses a staged service.json with api__key' ((Get-StagedCredentialHits -Stage $p16Stage) -join ';')
+    }
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
