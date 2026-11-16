@@ -2431,7 +2431,7 @@ $script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
 $script:DvNameChar = '(?-i:[A-Za-z0-9_])'
 # r12 (r12 adversary pass 13 A2 on bbfe69d1, its input: tr-TR culture and a first `PLAYBACK_SMOKE.MEASURED_SESSION id=3`): every case-insensitive
 # read of a record name, an identity word or a read key uses these options, never -match or (?i). Those take the CURRENT culture, where tr-TR folds
-# `I` to the dotless `ı`, so an upper-case marker or key was skipped (a later Play's marker chosen, DELIVERY_KIND= / DISABLED= ignored).
+# `I` to the dotless i (U+0131), so an upper-case marker or key was skipped (a later Play's marker chosen, DELIVERY_KIND= / DISABLED= ignored).
 # The same options as the PATH-refusal rule's $script:DvCultureFreeIgnoreCase (r9 B2 above), under a short name for these readers.
 $script:DvCi = $script:DvCultureFreeIgnoreCase
 
