@@ -2129,7 +2129,7 @@ function Get-DvDueWakeDeliveryEvidence {
     # unreadable on both paths (never skipped, never the control exemption)
     # r11 pass 11 (A2, its input: a quoted `"delivery_kind=post"`): a mention is the key's WORD bounded by any non-name character, so a quoted or
     # punctuated key is a mention that is not `<key>=` after whitespace, hence unreadable
-    # r12 (r12 adversary B3, its input: `delivery=native-msg Kdelivery_kind=post`): the key boundary is the ASCII, case-sensitive $script:DvNameChar
+    # r12 (r12 adversary B3, its input: `delivery=native-msg <U+212A>delivery_kind=post`): the key boundary is the ASCII, case-sensitive $script:DvNameChar
     # r12 (pass 13 A2): culture-invariant ($script:DvCi), so a tr-TR `DELIVERY_KIND=post` is a mention too
     $withKind = @($candidates | Where-Object { [regex]::IsMatch($_, ('(?<!' + $script:DvNameChar + ')delivery_kind(?!' + $script:DvNameChar + ')'), $script:DvCi) })
     $keyShapeUnreadable = $false
@@ -2435,7 +2435,7 @@ function Get-DvSmokeSessionLineRead {
 $script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
 # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r12 (r12 adversary B3 on 7e66a3af): ONE name character of a record name, key or identity word, ASCII and
 # matched case-sensitively even inside a (?i) pattern or a PowerShell -match. Under IgnoreCase .NET folds U+212A (Kelvin sign) and U+0130 into [A-Za-z],
-# so `Ksession=4` hid the session mention; the inline (?-i:...) keeps every non-ASCII neighbour a non-name character.
+# so `<U+212A>session=4` hid the session mention; the inline (?-i:...) keeps every non-ASCII neighbour a non-name character.
 $script:DvNameChar = '(?-i:[A-Za-z0-9_])'
 # r12 (r12 adversary pass 13 A2 on bbfe69d1, its input: tr-TR culture and a first `PLAYBACK_SMOKE.MEASURED_SESSION id=3`): every case-insensitive
 # read of a record name, an identity word or a read key uses these options, never -match or (?i). Those take the CURRENT culture, where tr-TR folds
