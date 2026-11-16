@@ -171,7 +171,7 @@ $hitId = [guid]::NewGuid().ToString('N')
     # command turns delayed expansion off, and where.exe is run DIRECTLY by the batch, by its absolute path (one parse, a value is not re-scanned), with its hit
     # list written to a temp file that the FOR /F then READS (a file name is not a command string). The current directory never changes (adversary A1 on
     # a256baf1: a pushd into System32 made a relative INCLUDE entry resolve there). A System32 without where.exe is exit 9 typed (SYSTEMROOT_UNUSABLE).
-    'setlocal DisableDelayedExpansion & set "MLV_UCRT_OK=" & set "MLV_INC=" & set "MLV_HITS=%TEMP%\mlv_ucrt_hits___MLV_HIT_ID__.txt" & if not exist "%SystemRoot%\System32\where.exe" (echo FAIL step=msvcEnvironment reason=SYSTEMROOT_UNUSABLE SystemRoot System32 has no where.exe& exit /b 9)',
+    'setlocal DisableDelayedExpansion & set "MLV_UCRT_OK=" & set "MLV_INC=" & set "MLV_HITS=%TEMP%\mlv_ucrt_hits___MLV_HIT_ID__.txt" & if not exist "%SystemRoot%\System32\where.exe" (echo FAIL step=msvcEnvironment reason=SYSTEMROOT_UNUSABLE SystemRoot System32 has no where.exe& exit /b 9)'.Replace('__MLV_HIT_ID__', $hitId),
     'setlocal DisableDelayedExpansion & set "PATHEXT=" & set "MLV_INC=" & if not defined INCLUDE set "INCLUDE=;"',
     '"%SystemRoot%\System32\where.exe" $INCLUDE:corecrt.h >"%MLV_HITS%" 2>nul && for /f "usebackq delims=" %%F in ("%MLV_HITS%") do if /i "%%~nxF"=="corecrt.h" type "%%F" >nul 2>&1 && set "MLV_UCRT_OK=1"',
     'setlocal EnableDelayedExpansion & set "MLV_INC="',
@@ -187,7 +187,7 @@ $hitId = [guid]::NewGuid().ToString('N')
     "cl /nologo /EHsc /O2 /I `"$Dir`" /I `"$gpuRoot`" `"$testsrc`" /Fe:`"$testexe`" /Fo:`"$Dir\dll_test.obj`" opengl32.lib user32.lib gdi32.lib",
     'if errorlevel 1 exit /b 12',
     'exit /b 0'
-) | ForEach-Object { $_.Replace('__MLV_HIT_ID__', $hitId) } | Set-Content -Encoding ASCII $cmdFile
+) | Set-Content -Encoding ASCII $cmdFile
 
 Write-Host "build: $src -> $dll  ;  $testsrc -> $testexe  (arch=$archLabel)"
 & cmd /c "`"$cmdFile`"" 2>&1 | ForEach-Object { Write-Host $_ }

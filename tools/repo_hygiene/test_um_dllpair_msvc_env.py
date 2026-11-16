@@ -300,7 +300,9 @@ class BackendCmdUcrtCheckTests(_Pwsh):
     so a standalone run (over SSH, no job around it) also never meets C1083 first. The cmd lines are taken from each script's text and run in cmd.exe."""
 
     def check_lines(self, script: Path) -> list[str]:
-        lines = re.findall(r"^\s*'((?:[^']|'')*MLV_(?:UCRT_OK|INC)(?:[^']|'')*)',?\s*$", script.read_text(encoding="utf-8"), re.M)
+        # the guard line carries `.Replace('__MLV_HIT_ID__', $hitId)` after its closing quote (adversary pass on 257f96eb, A1: that line only)
+        lines = re.findall(r"^\s*'((?:[^']|'')*MLV_(?:UCRT_OK|INC)(?:[^']|'')*)'(?:\.Replace\('__MLV_HIT_ID__', \$hitId\))?,?\s*$",
+                           script.read_text(encoding="utf-8"), re.M)
         # the script writes a per-run GUID over this token (adversary pass 13); the fixture uses a fixed id so a test can name the hit file
         return [l.replace("''", "'").replace("__MLV_HIT_ID__", HIT_ID) for l in lines]
 
@@ -427,7 +429,11 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                 self.assertNotIn("%RANDOM%", text)
                 self.assertEqual(text.count("mlv_ucrt_hits___MLV_HIT_ID__.txt"), 1)
                 self.assertIn("$hitId = [guid]::NewGuid().ToString('N')", text)
-                self.assertIn("ForEach-Object { $_.Replace('__MLV_HIT_ID__', $hitId) } | Set-Content -Encoding ASCII $cmdFile", text)
+                # the substitution is on the one literal guard line only; no Replace runs over the whole generated text (257f96eb A1)
+                self.assertEqual(len(re.findall(r"exit /b 9\)'\.Replace\('__MLV_HIT_ID__', \$hitId\),$", text, re.M)), 1)
+                self.assertEqual(text.count(".Replace("), 1)
+                self.assertNotIn("ForEach-Object { $_.Replace", text)
+                self.assertIn(") | Set-Content -Encoding ASCII $cmdFile", text)
                 self.assertLess(text.index("$hitId = [guid]::NewGuid()"), text.index("@(\n    '@echo off'"))
                 # the hit file is only read when where itself succeeded, and removed with /f /q at the end
                 self.assertEqual(text.count('2>nul && for /f'), 2)
@@ -448,6 +454,33 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                         if rc == 9:
                             self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
                         self.assertEqual(list(temp.iterdir()), [], p.stdout + p.stderr)
+
+    def test_adversary_257f96eb_a1_a_dir_that_contains_the_hit_token_is_never_rewritten(self) -> None:
+        # adversary pass on 257f96eb, A1 (introduced): `ForEach-Object { $_.Replace('__MLV_HIT_ID__', $hitId) }` ran over EVERY generated line, so a -Dir
+        # such as C:\src\__MLV_HIT_ID__\tools\gpu\backend had its nvcc / cl / .def / output paths rewritten to GUID paths and the build failed exit 11. The
+        # substitution now sits on the ONE literal guard line, which interpolates no caller text, so no path can ever carry the token through it. This test
+        # runs each script's real cmd-building block (hitId through Set-Content) with every interpolated variable holding the token.
+        token_dir = r"C:\src\__MLV_HIT_ID__\tools\gpu\backend"
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name):
+                text = script.read_text(encoding="utf-8")
+                block = re.search(r"\$hitId = \[guid\]::NewGuid\(\).*?Set-Content -Encoding ASCII \$cmdFile", text, re.S)
+                self.assertIsNotNone(block, "the cmd-building block (hitId .. Set-Content) is missing")
+                out = self.tmp / ("out-" + script.stem)
+                out.mkdir()
+                prelude = (
+                    "$Dir = $env:T_DIR\n$gpuRoot = \"$Dir\\..\"\n$vcvars = 'C:\\vc\\vcvars64.bat'\n$nvcc = 'C:\\cuda\\bin\\nvcc.exe'\n"
+                    "$archArgLine = '-gencode=arch=compute_86,code=sm_86'\n$def = \"$Dir\\x.def\"\n$src = \"$Dir\\x.cu\"\n$dll = \"$Dir\\x.dll\"\n"
+                    "$testsrc = \"$Dir\\t.cpp\"\n$testexe = \"$Dir\\t.exe\"\n$cmdFile = Join-Path $env:T_OUT 'x.cmd'\n")
+                p = self.pwsh(prelude + block.group(0) + "\nWrite-Output 'BUILT'\n", env={"T_DIR": token_dir, "T_OUT": str(out)})
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                cmd_text = (out / "x.cmd").read_text(encoding="ascii")
+                self.assertIn(f'-Xlinker "/DEF:{token_dir}\\x.def" -I "{token_dir}" -I "{token_dir}\\.." "{token_dir}\\x.cu" -o "{token_dir}\\x.dll"', cmd_text)
+                self.assertIn(f'cl /nologo /EHsc /O2 /I "{token_dir}" /I "{token_dir}\\.." "{token_dir}\\t.cpp" /Fe:"{token_dir}\\t.exe"', cmd_text)
+                hit_lines = [l for l in cmd_text.splitlines() if "mlv_ucrt_hits_" in l and "MLV_HITS=" in l and l.startswith("setlocal")]
+                self.assertEqual(len(hit_lines), 1, cmd_text)
+                self.assertRegex(hit_lines[0], r'set "MLV_HITS=%TEMP%\\mlv_ucrt_hits_[0-9a-f]{32}\.txt"')
+                self.assertNotIn("__MLV_HIT_ID__", hit_lines[0])
 
     def test_an_unusable_systemroot_is_a_typed_refusal_not_a_search_from_the_callers_directory(self) -> None:
         # the check runs "%SystemRoot%\System32\where.exe" by its absolute path (no pushd). When that file is absent the check must not fall through to a
