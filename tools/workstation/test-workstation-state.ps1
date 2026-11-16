@@ -1953,6 +1953,67 @@ if ($fnLoaded -and (Test-Has 'Invoke-Native' 'r17 F3')) {
     Assert-That ($f3env -ceq "$f3a|$f3b") 'r17 F3 git: the parent environment''s GIT_TRACE* values are restored after the call' $f3env
 }
 
+# ================================================================ r17 fix iteration 1 (head ea753a21): adversary pass 18, A1 A3 A4 (A2 is the hub-deferred detector class, DISTINGUISH in the PR)
+# A1: a quote in a password or a query value never ends the redaction span (the single-URL form and the free-text log sink)
+if ($fnLoaded -and (Test-Has 'Get-RedactedRemoteUrl' 'r17 p18 A1') -and (Test-Has 'ConvertTo-RedactedUrlText' 'r17 p18 A1')) {
+    $p18a1 = [ordered]@{
+        "https://alice:p'ass@github.com/other/repo.git"          = 'https://***@github.com/other/repo.git'
+        "https://github.com/o/r.git?access_token=abc'def"        = 'https://github.com/o/r.git?***'
+        'https://al ice:p ass@github.com/o/r.git'                = 'https://***@github.com/o/r.git'
+    }
+    foreach ($k in $p18a1.Keys) { $got = Get-RedactedRemoteUrl $k; Assert-That ($got -ceq $p18a1[$k]) "r17 p18 A1 url: $k prints as $($p18a1[$k])" $got }
+    foreach ($t in @("remote 'fork' is https://alice:p'ass@github.com/other/repo.git, expected x", "fatal: 'https://github.com/o/r.git?access_token=abc'def' not found")) {
+        $got = ConvertTo-RedactedUrlText $t
+        Assert-That (-not ($got -match "p'ass|alice|abc|def'")) "r17 p18 A1 sink: no credential text survives in: $t" $got
+    }
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r17 p18 A1')) {
+    $p18ws = New-Scratch 'r17-p18-a1-clone'
+    $p18repo = Join-Path $p18ws 'MLV-App'; [void][IO.Directory]::CreateDirectory($p18repo); & git -C $p18repo init -q 2>$null
+    & git -C $p18repo remote add fork "https://alice:p'ass@github.com/other/repo.git"
+    $savedRepo = $script:Repo; $script:Repo = $p18repo; $Repo = $p18repo
+    $p18doc = Join-Path $p18ws 'doctrine'; [void][IO.Directory]::CreateDirectory($p18doc); & git -C $p18doc init -q 2>$null; & git -C $p18doc remote add origin $DoctrineUrl
+    $savedDoc = $script:DoctrineRepo; $script:DoctrineRepo = $p18doc; $DoctrineRepo = $p18doc
+    $savedLog = $script:LogFile; $script:LogFile = Join-Path $p18ws 'clone.log'
+    $script:Failures.Clear(); $p18out = ''
+    try { $p18out = (Invoke-PhaseClone *>&1 | Out-String) } catch { $p18out += $_.Exception.Message }
+    $p18log = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+    $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH*' }).Count -ge 1 -and -not (($p18log + $p18out) -match "p'ass|alice")) 'r17 p18 A1 clone: a quoted password in a mismatching remote is refused and never printed' ($p18log + $p18out)
+    $script:Failures.Clear()
+}
+# A3: an AST census, so a native call site added later cannot escape the scrub: every '& git', '& $c[0]' (the version probes), '& $Exe', '& $pwsh' and '& $GateScript' in the
+# setup script stands inside an Invoke-GitTraceScrubbed script block. (The Store-pwsh self re-run at the top re-runs this same script, which scrubs its own calls.)
+$p18ast = [System.Management.Automation.Language.Parser]::ParseFile($setup, [ref]$null, [ref]$null)
+$p18cmds = @($p18ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.InvocationOperator -eq 'Ampersand' -and ($n.CommandElements[0].Extent.Text -in @('git', '$c[0]', '$Exe', '$pwsh', '$GateScript')) }, $true))
+$p18bare = @($p18cmds | Where-Object {
+        $p = $_.Parent; $inside = $false
+        while ($p) { if ($p -is [System.Management.Automation.Language.CommandAst] -and $p.GetCommandName() -ceq 'Invoke-GitTraceScrubbed') { $inside = $true; break }; $p = $p.Parent }
+        -not $inside
+    } | ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Extent.Text)" })
+Assert-That ($p18cmds.Count -ge 15 -and $p18bare.Count -eq 0) "r17 p18 A3 census: every native git / git-capable child call ($($p18cmds.Count) found) runs inside Invoke-GitTraceScrubbed" ($p18bare -join ' | ')
+# A4: a failed lease object (commit-tree refuses an empty -GitName) is typed LEASE_OBJECT_FAILED and NOTHING is pushed; it used to push ':<LeaseRef>', deleting the lease branch
+if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r17 p18 A4')) {
+    $p18a4 = New-Scratch 'r17-p18-a4'
+    $p18bare4 = Join-Path $p18a4 'remote.git'; & git init -q --bare $p18bare4 2>$null
+    $p18r4 = Join-Path $p18a4 'repo'; [void][IO.Directory]::CreateDirectory($p18r4); & git -C $p18r4 init -q 2>$null
+    [IO.File]::WriteAllText((Join-Path $p18r4 $LeaseFile), '{"holder":""}'); & git -C $p18r4 add $LeaseFile 2>$null; & git -C $p18r4 -c user.name=t -c user.email=t@example.invalid commit -q -m lease 2>$null
+    & git -C $p18r4 remote add fork $p18bare4; & git -C $p18r4 push -q fork "HEAD:$LeaseRef" 2>$null
+    $p18sha = ("$(& git -C $p18r4 rev-parse HEAD)").Trim()
+    $savedRepo = $script:Repo; $savedName = $GitName; $savedTemp = $env:TEMP; $savedLog = $script:LogFile
+    $script:Repo = $p18r4; $Repo = $p18r4; $GitName = ''; $script:GitName = ''; $env:TEMP = New-Scratch 'r17-p18-a4-temp'; $script:LogFile = Join-Path $p18a4 'lease.log'
+    $savedIdent = @{}; foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { $savedIdent[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, $null) }
+    $p18err = ''
+    try { Set-HubLease -Holder 'TEST-HOST' -Current @{ Exists = $true; Sha = $p18sha; Holder = '' } -Reason 'r17 p18 A4' *>&1 | Out-Null } catch { $p18err = $_.Exception.Message }
+    finally {
+        $script:Repo = $savedRepo; $Repo = $savedRepo; $GitName = $savedName; $script:GitName = $savedName; $env:TEMP = $savedTemp; $script:LogFile = $savedLog
+        foreach ($n in $savedIdent.Keys) { [Environment]::SetEnvironmentVariable($n, $savedIdent[$n]) }
+    }
+    $p18after = ("$(& git -C $p18bare4 rev-parse --verify --quiet $LeaseRef 2>$null)").Trim()
+    Assert-That ($p18err -match 'LEASE_OBJECT_FAILED') 'r17 p18 A4 lease: a commit-tree that fails (empty -GitName) is typed LEASE_OBJECT_FAILED' $p18err
+    Assert-That ($p18after -ceq $p18sha) 'r17 p18 A4 lease: nothing is pushed, the remote lease branch is not deleted' "after='$p18after' before='$p18sha'"
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

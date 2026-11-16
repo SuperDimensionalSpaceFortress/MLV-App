@@ -160,10 +160,12 @@ $script:LogFile = if ($isGate) { Join-Path $logDir 'gate.log' } else { Join-Path
 
 # r17 F2: the URL redaction rule (Get-RedactedRemoteUrl calls it). In any text, a 'scheme://<userinfo>@' part is replaced by 'scheme://***@' with the userinfo running
 # to the LAST '@' before the path (an unencoded '@' in a password leaks nothing), then everything after a '?' or '#' of a URL is dropped and printed '?***'.
+# r17 pass 18 A1: no character but whitespace ends either span (a quote in a password, 'p''ass', or in a query value, 'abc''def', used to stop the match and print the rest);
+# in free text a URL ends at whitespace, so the userinfo span is every non-space character up to the last '@' of that word (over-redaction is the safe side).
 function ConvertTo-RedactedUrlText {
     param([string]$Text)
-    $s = [regex]::Replace("$Text", '(?i)([a-z][a-z0-9+.\-]*://)[^/\s''"<>]*@', '$1***@')
-    return ([regex]::Replace($s, '(?i)([a-z][a-z0-9+.\-]*://[^\s''"<>?#]*)[?#][^\s''"<>]*', '$1?***'))
+    $s = [regex]::Replace("$Text", '(?i)([a-z][a-z0-9+.\-]*://)\S*@', '$1***@')
+    return ([regex]::Replace($s, '(?i)([a-z][a-z0-9+.\-]*://[^\s?#]*)[?#]\S*', '$1?***'))
 }
 
 function Write-Log {
@@ -312,6 +314,13 @@ function Set-HubLease {
     $commitArgs = @('-C', $Repo, '-c', "user.name=$GitName", '-c', "user.email=$GitEmail", 'commit-tree', $tree, '-m', $msg)
     if ($Current.Exists) { $commitArgs += @('-p', $Current.Sha) }
     $commit = ("$(Invoke-GitTraceScrubbed { & git @commitArgs })").Trim()
+    # r17 pass 18 A4: every object the push publishes is proven first. A failed hash-object / write-tree / commit-tree (an empty -GitName, say: commit-tree exits 128
+    # with empty stdout) used to leave '' here, and pushing ':<LeaseRef>' DELETES the lease branch while the log said the lease was acquired. Now it is typed and nothing is pushed.
+    $objRx = '^[0-9a-f]{40}([0-9a-f]{24})?$'
+    foreach ($o in @(@('hash-object', $blob), @('write-tree', $tree), @('commit-tree', $commit))) {
+        if ("$($o[1])" -notmatch $objRx) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_OBJECT_FAILED git $($o[0]) gave no object id ('$($o[1])'); nothing was pushed, the lease ref is unchanged" }
+    }
+    if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_OBJECT_FAILED git commit-tree exited $LASTEXITCODE; nothing was pushed, the lease ref is unchanged" }
     $expect = if ($Current.Exists) { $Current.Sha } else { '' }
     [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'push', '--porcelain', "--force-with-lease=${LeaseRef}:$expect", $LeaseRemote, "${commit}:$LeaseRef"))
     Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
@@ -684,7 +693,10 @@ function Invoke-PhaseClone {
 # git error that quotes the URL), so Write-Log applies it to every line it writes. An scp-like 'git@github.com:o/r.git' has no scheme and no secret; it is unchanged.
 function Get-RedactedRemoteUrl {
     param([string]$Url)
-    return (ConvertTo-RedactedUrlText $Url)   # the one rule, defined beside Write-Log (it runs before this point of the script is reached)
+    # r17 pass 18 A1: the value is ONE URL, so a space in it ends nothing: userinfo runs to the last '@' of the whole value, and everything after its first '?' or '#' goes
+    $u = [regex]::Replace("$Url", '(?is)^(\s*[a-z][a-z0-9+.\-]*://).*@', '$1***@')
+    $u = [regex]::Replace($u, '(?s)^([^?#]*)[?#].*$', '$1?***')
+    return (ConvertTo-RedactedUrlText $u)   # the one free-text rule, defined beside Write-Log (it runs before this point of the script is reached)
 }
 
 # r15 pass 13 A5: true when two git remote URLs name the same repository: compared case-insensitively after the GitHub ssh forms ('git@github.com:o/r',
@@ -2087,7 +2099,7 @@ function Invoke-PhaseGate {
         # Reset first: under StrictMode reading an unset $LASTEXITCODE throws, which made a target with no native call (and no exit) end the gate with
         # exit 1; and a stale code left by the lease's git calls must not be taken for the target's.
         $global:LASTEXITCODE = 0
-        & $GateScript @splat
+        Invoke-GitTraceScrubbed { & $GateScript @splat }   # r17 pass 18 A3 sibling: the gate target's git calls inherit no GIT_TRACE* destination
         $rc = [int]$global:LASTEXITCODE
         Write-Log "$tag exit=$rc"
     } finally { if ($lock) { $lock.Dispose() } }
@@ -2277,7 +2289,7 @@ function Invoke-PhaseVerify {
     foreach ($c in @(@('git', '--version', 'git'), @('gh', '--version', 'gh'), @('node', '--version', 'node'), @('npm', '--version', 'npm'),
             @('py', '-3 --version', 'python'), @('claude', '--version', 'claude'), @('codex', '--version', 'codex'))) {
         $cmd = Get-Command $c[0] -ErrorAction SilentlyContinue
-        $o = if ($cmd) { try { (& $c[0] ($c[1] -split ' ') 2>&1 | Select-Object -First 1) } catch { 'error' } } else { 'MISSING' }
+        $o = if ($cmd) { try { (Invoke-GitTraceScrubbed { & $c[0] ($c[1] -split ' ') 2>&1 } | Select-Object -First 1) } catch { 'error' } } else { 'MISSING' }   # r17 pass 18 A3: no GIT_TRACE* either
         Write-Log ("{0,-7} {1}   [{2}]" -f $c[0], $o, $ReferenceVersions[$c[2]]) $(if ($o -eq 'MISSING') { 'WARN' } else { 'INFO' })
     }
     Write-Log ("pwsh    {0}   [{1}]" -f $(if (Get-PwshPath) { ((Get-Item (Get-PwshPath)).VersionInfo.ProductVersion -split ' ')[0] } else { 'MISSING' }), $ReferenceVersions.pwsh)
