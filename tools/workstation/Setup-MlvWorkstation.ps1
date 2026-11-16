@@ -621,7 +621,11 @@ function Invoke-PhaseQt {
 # $ExportDir. Secrets, credentials, auth tokens, ssh keys and session transcripts never enter it.
 # ---------------------------------------------------------------------------------------------
 $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|TOKEN|CREDENTIAL'
-$CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\s]{4,}"|''[^''\s]{4,}'')'
+# p5 A1: a secret-named key with a QUOTED value of any length, spaces included (a three character or two word password is still a password), or an
+# UNQUOTED '=' assignment (cmd 'set X=y', dotenv, ini) whose value is 4+ non-space characters that is not a boolean, null or a number and does not
+# start like code ($var, (expr), %var%, @splat). The key may not follow a '$', word character or '-' (so '$Token = Get-Token' in a script is not a hit).
+$CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\r\n]+"|''[^''\r\n]+'')'
+$CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*(?![\$\(%@\{\[<])(?!(?:true|false|null|none|nil|undefined)\b)(?!\d+\b)[^\s"'',;]{4,}'
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 $SecretPatterns = @(
@@ -631,8 +635,23 @@ $SecretPatterns = @(
     # A secret VALUE under a name that says what it is (adversary pass 2, A15): an AWS secret access key has no recognisable shape of its own.
     # r3 A4: the name list also covers API/ACCESS/AUTH key, TOKEN and CREDENTIAL; either quote style; a value of 4 or more characters (a short
     # password is still a password). The same text is the host-side credential test Import applies (Test-CredentialText).
-    $CredentialNameValuePattern
+    $CredentialNameValuePattern, $CredentialUnquotedPattern
 )
+$script:SecretRegex = [regex]::new(($SecretPatterns -join '|'))
+
+# True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
+# judged as written AND with its JSON \uXXXX escapes decoded (p5 A1: '{"api_key":"x"}' says api_key). The Export scan and the Import host-side
+# test both call this one function.
+function Test-CredentialText {
+    param([string]$Text)
+    if (-not $Text) { return $false }
+    if ($script:SecretRegex.IsMatch($Text)) { return $true }
+    if ($Text.Contains('\u')) {
+        $decoded = [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+        if ($script:SecretRegex.IsMatch($decoded)) { return $true }
+    }
+    return $false
+}
 $ExcludeFiles = @('*.log', '*.err', '*.bak*', '*.tmp', '*.lock', '*.pid', '*.sqlite*', '*.jsonl', '.credentials.json', '.claude.json',
     'auth.json', '*.pem', '*.pfx', '*.p12', '*.key', '*.ppk', 'id_rsa*', 'id_ed25519*', '*_id', '*_id.pub', '*.kdbx', '.env', '*.env',
     '*token*', '*secret*', '*credential*', '*.sbp-*', 'context-window-pct.tmp',
@@ -647,7 +666,6 @@ $ExcludeDirs = @('.git', 'node_modules', '__pycache__', 'worktrees', 'ssh', 'ope
 # caller refuses to write the bundle.
 function Invoke-StagedSecretScan {
     param([string]$Stage, [long]$MaxScanBytes = 26214400)
-    $rx = [regex]::new(($SecretPatterns -join '|'))
     $removed = [System.Collections.Generic.List[string]]::new()
     $uncleared = [System.Collections.Generic.List[string]]::new()
     # -Force: robocopy copies Hidden and System files, and Get-ChildItem hides them by default (adversary pass 2, A3).
@@ -658,7 +676,7 @@ function Invoke-StagedSecretScan {
         else {
             $t = $null
             try { $t = [IO.File]::ReadAllText($f.FullName) } catch { $why = 'unreadable' }
-            if (-not $why -and $t -and $rx.IsMatch($t)) { $why = 'credential pattern' }
+            if (-not $why -and $t -and (Test-CredentialText $t)) { $why = 'credential pattern' }
         }
         if (-not $why) { continue }
         try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed.Add("$rel ($why)") }
@@ -824,13 +842,6 @@ function Move-ForeignClaims {
 # ---------------------------------------------------------------------------------------------
 # Phase: Import (NEW machine). Copies the bundle into place; never touches credentials.
 # ---------------------------------------------------------------------------------------------
-# True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns).
-function Test-CredentialText {
-    param([string]$Text)
-    if (-not $Text) { return $false }
-    return ([regex]::new(($SecretPatterns -join '|'))).IsMatch($Text)
-}
-
 # r3 A5: the full paths of bundle files an Import must NOT copy, judged by CONTENT and ROLE (the file name alone is only the first line of
 # defence, $ExcludeFiles). A bundle file is skipped when
 #   - it carries a credential itself (a handmade or tampered bundle), or
@@ -885,6 +896,7 @@ function Invoke-ImportRobocopy {
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
+$script:ImportSettingsApplied = $false
 
 function Invoke-PhaseImport {
     if (-not (Test-Path -LiteralPath $BundlePath)) {
@@ -913,18 +925,26 @@ function Invoke-PhaseImport {
         # r3 A5: the file name is only the first line of defence; these copies also refuse, by CONTENT and ROLE, any file that carries a credential
         # or would replace a host file that does (Invoke-ImportRobocopy). The claims and doctrine copies keep their own /XC /XN /XO rules.
         $script:ImportSkippedDest.Clear()
-        Invoke-ImportRobocopy "$src\home-claude" "$h\.claude" (@('/E') + $inX)
-        Invoke-ImportRobocopy "$src\home-bin" "$h\bin" (@('/E') + $inX)
-        Invoke-ImportRobocopy "$src\home-codex" "$h\.codex" (@('/E') + $inX)
-        Invoke-ImportRobocopy "$src\programdata-fleetdefender" 'C:\ProgramData\FleetDefender' (@('/E') + $inX)
+        # p5 A3: every Import copy carries /XO (README: an Import never replaces a NEWER file this host already has with an older bundle copy).
+        # p5 A4: remember whether the bundle's settings.json is going to be APPLIED (it exists, is not skipped, and is not older than the host's file).
+        $bundleSettings = "$src\home-claude\settings.json"
+        $hostSettings = "$h\.claude\settings.json"
+        $hostSettingsBefore = if (Test-Path -LiteralPath $hostSettings -PathType Leaf) { (Get-Item -LiteralPath $hostSettings -Force).LastWriteTimeUtc } else { $null }
+        Invoke-ImportRobocopy "$src\home-claude" "$h\.claude" (@('/E', '/XO') + $inX)
+        $script:ImportSettingsApplied = (Test-Path -LiteralPath $bundleSettings -PathType Leaf) -and -not ($script:ImportSkippedDest -contains $hostSettings) -and
+            (($null -eq $hostSettingsBefore) -or ((Get-Item -LiteralPath $bundleSettings -Force).LastWriteTimeUtc -ge $hostSettingsBefore))
+        Invoke-ImportRobocopy "$src\home-bin" "$h\bin" (@('/E', '/XO') + $inX)
+        Invoke-ImportRobocopy "$src\home-codex" "$h\.codex" (@('/E', '/XO') + $inX)
+        Invoke-ImportRobocopy "$src\programdata-fleetdefender" 'C:\ProgramData\FleetDefender' (@('/E', '/XO') + $inX)
         # The claims folder is copied on its own below, never overwriting a claim this host already has (adversary pass 2, A10): a live local claim
         # replaced by a foreign one of the same name would be quarantined for its absent run dir and the running card would lose its claim.
         $claimsSrc = "$src\project-claude-state\hub-autopilot\claims"
-        Invoke-ImportRobocopy "$src\project-claude-state" "$Repo\.claude-state" (@('/E', '/XD', $claimsSrc) + $inX)
-        Invoke-Robocopy $claimsSrc "$Repo\.claude-state\hub-autopilot\claims" @() (@('/E', '/XC', '/XN', '/XO') + $inX)
+        Invoke-ImportRobocopy "$src\project-claude-state" "$Repo\.claude-state" (@('/E', '/XO', '/XD', $claimsSrc) + $inX)
+        # p5 A2: the claims and doctrine copies go through the same content guard as every other Import copy.
+        Invoke-ImportRobocopy $claimsSrc "$Repo\.claude-state\hub-autopilot\claims" (@('/E', '/XC', '/XN', '/XO') + $inX)
         # MINI3-CUTOVER-STATE-GAPS-1 (b): /XO so a fold marker this host already advanced is never overwritten by the older bundle copy.
-        Invoke-Robocopy "$src\project-codex-state\doctrine" "$Repo\.codex-state\doctrine" @() (@('/E', '/XO') + $inX)
-        Invoke-ImportRobocopy "$src\reference" "$StateRoot\reference" (@('/E') + $inX)
+        Invoke-ImportRobocopy "$src\project-codex-state\doctrine" "$Repo\.codex-state\doctrine" (@('/E', '/XO') + $inX)
+        Invoke-ImportRobocopy "$src\reference" "$StateRoot\reference" (@('/E', '/XO') + $inX)
     }
     # MINI3-CUTOVER-STATE-GAPS-1 (a): claims came across without their fleet-runs run dirs. A claim younger than 6 h with no run dir
     # reads 'receipt state none' and blocks its card, so those claims are quarantined, not carried.
@@ -934,8 +954,8 @@ function Invoke-PhaseImport {
     if ($h -ine $SourceUserProfile) {
         # r3 A5: when the bundle's settings.json was NOT applied (the host's own credential-bearing one stayed), there is nothing of the bundle to
         # rewrite, and rewriting the host's file would touch a credential-bearing file the Import just refused to replace.
-        if ($script:ImportSkippedDest -contains "$h\.claude\settings.json") {
-            Write-Log "skipped the settings.json profile rewrite: the bundle's settings.json was not applied (IMPORT_SKIPPED_CREDENTIAL_FILE), the host's file stays as it is"
+        if (-not $script:ImportSettingsApplied) {
+            Write-Log "skipped the settings.json profile rewrite: the bundle's settings.json was not applied (absent from the bundle, older than the host's, or IMPORT_SKIPPED_CREDENTIAL_FILE), the host's file stays as it is"
         } else {
         Invoke-Step "Rewrite $SourceUserProfile -> $h in ~/.claude/settings.json" {
             $p = "$h\.claude\settings.json"; $t = [IO.File]::ReadAllText($p)
