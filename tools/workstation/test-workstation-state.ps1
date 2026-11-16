@@ -1147,6 +1147,73 @@ if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r12 A5')) {
     }
 }
 
+# ================================================================ r12 iteration 2 (head e88c1414): adversary pass 9, B1-B3
+# B1: a boolean word is a whole value only when a blank / line end / ' #' comment follows it; CMD ';' and a glued '#' are content.
+# B2: netrc and npmrc record shapes. B3: Import rewrites settings.json only when the copy actually applied the bundle's file.
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r12 B1')) {
+    $r12bHit = [ordered]@{
+        'B1 cmd set DB_PASSWORD=false;hunter2'         = '@set DB_PASSWORD=false;hunter2'
+        'B1 cmd set AUTH_TOKEN=false;hunter2'          = '@set AUTH_TOKEN=false;hunter2'
+        'B1 yaml auth_token: false;hunter2'            = 'auth_token: false;hunter2'
+        'B1 yaml password: false#hunter2'              = 'password: false#hunter2'
+        'B1 flow {password: false#hunter2}'            = '{password: false#hunter2}'
+        'B1 flow {token: false#hunter2}'               = '{token: false#hunter2}'
+        'B2 netrc one line'                            = 'machine example.org login alice password hunter2'
+        'B2 netrc default entry'                       = 'default login alice password hunter2'
+        'B2 netrc several lines'                       = "machine example.org`n  login alice`n  password hunter2`n"
+        'B2 npmrc _auth'                               = '_auth=YWxpY2U6aHVudGVyMg=='
+        'B2 npmrc scoped _auth'                        = '//registry.example.org/:_auth=YWxpY2U6aHVudGVyMg=='
+    }
+    $r12bOk = [ordered]@{
+        'B1 cmd boolean then semicolon at the end'     = 'DB_PASSWORD=null;'
+        'B1 yaml boolean with a spaced comment'        = 'password: false # off'
+        'B1 flow boolean with a spaced comment'        = '{password: false # off'
+        'B1 yaml token boolean'                        = 'auth_token: false'
+        'B2 netrc without a password'                  = 'machine example.org login alice'
+        'B2 prose that mentions a password'            = 'Rotate the password every 90 days; see the runbook.'
+        'B2 npmrc registry only'                       = 'registry=https://registry.example.org/'
+        'B2 author key is not _auth'                   = 'author=Layi'
+    }
+    foreach ($k in $r12bHit.Keys) { Assert-That (Test-CredentialText $r12bHit[$k]) "r12 $k is a credential (Test-CredentialText)" $r12bHit[$k] }
+    foreach ($k in $r12bOk.Keys) { Assert-That (-not (Test-CredentialText $r12bOk[$k])) "r12 $k is not a credential" $r12bOk[$k] }
+    # the .netrc / .npmrc shapes through the Export stage scan and the Import guards (an older host .npmrc must not be replaced by a newer clean bundle copy)
+    $b2Stage = New-Scratch 'r12-b2-stage'
+    [IO.File]::WriteAllText((Join-Path $b2Stage '.netrc'), 'machine example.org login alice password hunter2')
+    Assert-That (@(Get-StagedCredentialHits -Stage $b2Stage).Count -eq 1) 'r12 B2 export: a staged .netrc record is a hit'
+    $b2Src = New-Scratch 'r12-b2-src'; $b2Dst = New-Scratch 'r12-b2-dst'
+    [IO.File]::WriteAllText((Join-Path $b2Src '.npmrc'), 'registry=https://registry.example.org/')
+    [IO.File]::WriteAllText((Join-Path $b2Dst '.npmrc'), '_auth=YWxpY2U6aHVudGVyMg==')
+    $b2Skips = @(Get-ImportCredentialSkips -SourceDir $b2Src -DestDir $b2Dst)
+    Assert-That (@($b2Skips | Where-Object { $_.Source -like '*.npmrc' -and $_.Reason -like 'host file carries a credential' }).Count -eq 1) 'r12 B2 import: an older host .npmrc holding _auth is not replaced' (($b2Skips | ForEach-Object Reason) -join ';')
+}
+# B3: end to end. The bundle's settings.json and the host's have the SAME timestamp and size but different bytes: the copy reports 'kept', so the bundle's file was not applied
+# and the profile rewrite must leave the host's file alone. (The old predicate compared a timestamp sampled before the copy and rewrote the retained host file.)
+$b3Home = New-Scratch 'r12-b3-home'
+$b3Host = Join-Path $b3Home '.claude\settings.json'
+[void][IO.Directory]::CreateDirectory((Split-Path -Parent $b3Host))
+[IO.File]::WriteAllText($b3Host, '{"path":"C:/Users/obabalola/host"}')
+$b3Bundle = New-Scratch 'r12-b3-bundle'
+[IO.File]::WriteAllText((Join-Path $b3Bundle 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+[void][IO.Directory]::CreateDirectory((Join-Path $b3Bundle 'home-claude'))
+$b3Bs = Join-Path $b3Bundle 'home-claude\settings.json'
+[IO.File]::WriteAllText($b3Bs, '{"path":"C:/Users/obabalola/from"}')
+$b3Time = [DateTime]::UtcNow.AddHours(-2)
+(Get-Item -LiteralPath $b3Host).LastWriteTimeUtc = $b3Time; (Get-Item -LiteralPath $b3Bs).LastWriteTimeUtc = $b3Time
+$b3 = Invoke-Setup $b3Home @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r12-b3-state'), '-Workspace', (New-Scratch 'r12-b3-ws'), '-BundlePath', $b3Bundle, '-SourceHost', 'NOT-THIS-HOST')
+Assert-That (([IO.File]::ReadAllText($b3Host)) -ceq '{"path":"C:/Users/obabalola/host"}') 'r12 B3 import (end to end): a settings.json the copy KEPT (same timestamp and size) is not rewritten by the profile rewrite' "$([IO.File]::ReadAllText($b3Host))`n$($b3.Out)"
+# B3 control: a newer bundle settings.json IS applied and rewritten
+$b3Newer = New-Scratch 'r12-b3n-home'
+$b3nHost = Join-Path $b3Newer '.claude\settings.json'
+[void][IO.Directory]::CreateDirectory((Split-Path -Parent $b3nHost))
+[IO.File]::WriteAllText($b3nHost, '{"path":"C:/Users/obabalola/host"}'); (Get-Item -LiteralPath $b3nHost).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-3)
+$b3nB = New-Scratch 'r12-b3n-bundle'
+[IO.File]::WriteAllText((Join-Path $b3nB 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+[void][IO.Directory]::CreateDirectory((Join-Path $b3nB 'home-claude'))
+[IO.File]::WriteAllText((Join-Path $b3nB 'home-claude\settings.json'), '{"path":"C:/Users/obabalola/from"}')
+$b3n = Invoke-Setup $b3Newer @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r12-b3n-state'), '-Workspace', (New-Scratch 'r12-b3n-ws'), '-BundlePath', $b3nB, '-SourceHost', 'NOT-THIS-HOST')
+$b3nText = [IO.File]::ReadAllText($b3nHost)
+Assert-That ($b3nText -ceq ('{"path":"' + ($b3Newer -replace '\\', '/') + '/from"}')) 'r12 B3 import (end to end, control): a newer bundle settings.json is applied and its profile rewritten' "$b3nText`n$($b3n.Out)"
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

@@ -670,19 +670,27 @@ $CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords +
 # WHOLE word (followed by a space, quote, comma, semicolon or the end), not a prefix. TOKEN keys keep the code-looking-start guard and the 4+ not-all-digits rule.
 # r12 A2: "the WHOLE word" means the word ends the VALUE: only blanks, then a quote, comma, semicolon, '#' comment, line break or the end may follow it. A space
 # followed by more text ('@set DB_PASSWORD=false hunter2', a cmd multi-word value) is a value that merely starts with a boolean word, so it is still a credential.
-$CredentialBoolGuard = '(?!(?:true|false|null|none|nil|undefined)(?=[ \t]*(?:[#;,"'']|\r|\n|$)))'
+# r12 pass 9 B1: narrower still. The word ends the value only when it is followed by (an optional ';' or ',' and) blanks and a line end, by blanks and a '#' COMMENT (a '#'
+# glued to the word is content), or by a closing quote. 'false;hunter2' (cmd) and 'false#hunter2' are values that merely start with a boolean word.
+$CredentialBoolGuard = '(?!(?:true|false|null|none|nil|undefined)(?=[;,]?[ \t]*(?:\r|\n|$)|[ \t]+#|["'']))'
 $CredentialTokenGuard = '(?![\$\(%@\{\[<])' + $CredentialBoolGuard
 $CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialBoolGuard + '[^\s"'',;]+'
 $CredentialUnquotedTokenPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialTokenGuard + '(?!\d+\b)[^\s"'',;]{4,}'
-$CredentialYamlPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+(?!(?:true|false|null|none|nil|undefined|~)[ \t]*(?:#[^\r\n]*)?\r?$)[^\s#][^\r\n]*'
-$CredentialYamlTokenPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialTokenGuard + '(?!~)(?!\d+\b)[^\s"'',;#]{4,}[ \t]*(?:#[^\r\n]*)?\r?$'
+$CredentialYamlPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+(?!(?:true|false|null|none|nil|undefined|~)(?:[ \t]+#[^\r\n]*|[ \t]*)\r?$)[^\s#][^\r\n]*'
+$CredentialYamlTokenPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialTokenGuard + '(?!~)(?!\d+\b)[^\s"''#]{4,}[ \t]*(?:#[^\r\n]*)?\r?$'
 # r12 A1: a YAML / JSON FLOW mapping ('{password: hunter2}', 'svc: { api_key: x }', '{name: svc, password: hunter2}'): the key follows a '{' or a ',' on the same line, not the
 # start of the line, so the block-style YAML patterns above never see it. An unquoted value that is a boolean / null word ending at the next ',' '}' ']' or '#' is not a
 # value ('{has_password: true, n: 1}'); a quoted value is the name/value pattern's job. A STRONG key takes any other value (fail closed, like the block form); a TOKEN key
 # keeps the code-looking-start guard and the 4+ characters, not-all-digits rule.
-$CredentialFlowBoolGuard = '(?!(?:true|false|null|none|nil|undefined|~)[ \t]*(?:[,}\]#]|\r|\n|$))'
+$CredentialFlowBoolGuard = '(?!(?:true|false|null|none|nil|undefined|~)(?:[ \t]*[,}\]]|[ \t]+#|[ \t]*(?:\r|\n|$)))'
 $CredentialFlowPattern = '(?i)[{,][ \t]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]*' + $CredentialFlowBoolGuard + '[^\s,}\]#"''][^,}\r\n]*'
 $CredentialFlowTokenPattern = '(?i)[{,][ \t]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]*(?![\$\(%@\{\[<])' + $CredentialFlowBoolGuard + '(?!\d+\b)[^\s"'',;}\]#]{4,}'
+# r12 pass 9 B2: record shapes with no 'name = value' or 'name: value' form. netrc: 'machine example.org login alice password hunter2' on one line, or 'machine' / 'login' then a
+# line that starts with 'password <value>' (within 6 lines of 200 characters, so a long prose file with a stray word 'login' is not scanned to its end). npmrc: '_auth=<base64>'
+# (also '//registry/:_auth=...'); the other npmrc secrets (_authToken, _password) already match the TOKEN / PASSWORD words. The prose sentence 'rotate the password every 90 days' is not a hit.
+$CredentialNetrcLinePattern = '(?i)(?<![\w\-])(?:machine[ \t]+\S+[^\r\n]*?|(?:default[ \t]+)?login[ \t]+\S+[ \t]+)\bpassword[ \t]+[^\s"'',;]+'
+$CredentialNetrcBlockPattern = '(?im)(?<![\w\-])(?:machine|login)[ \t]+\S+[ \t]*\r?\n(?:[^\r\n]{0,200}\r?\n){0,6}?[ \t]*password[ \t]+[^\s"'',;:=]+'
+$CredentialNpmAuthPattern = '(?i)(?<![A-Z0-9])_auth[ \t]*=[ \t]*[^\s"'',;]+'
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 $SecretPatterns = @(
@@ -692,7 +700,8 @@ $SecretPatterns = @(
     # A secret VALUE under a name that says what it is (adversary pass 2, A15): an AWS secret access key has no recognisable shape of its own.
     # r3 A4: the name list also covers API/ACCESS/AUTH key, TOKEN and CREDENTIAL; either quote style; a value of 4 or more characters (a short
     # password is still a password). The same text is the host-side credential test Import applies (Test-CredentialText).
-    $CredentialNameValuePattern, $CredentialUnquotedPattern, $CredentialUnquotedTokenPattern, $CredentialYamlPattern, $CredentialYamlTokenPattern, $CredentialFlowPattern, $CredentialFlowTokenPattern
+    $CredentialNameValuePattern, $CredentialUnquotedPattern, $CredentialUnquotedTokenPattern, $CredentialYamlPattern, $CredentialYamlTokenPattern, $CredentialFlowPattern, $CredentialFlowTokenPattern,
+    $CredentialNetrcLinePattern, $CredentialNetrcBlockPattern, $CredentialNpmAuthPattern
 )
 $script:SecretRegex = [regex]::new(($SecretPatterns -join '|'))
 
@@ -1154,8 +1163,8 @@ function Invoke-ImportRobocopy {
             try { $r = Copy-ImportFileLocked -Source $e -Dest $dest -ExcludeNewer $exN -ExcludeOlder $exO -ExcludeChanged $exC }
             catch { $n.failed++; Write-Log "IMPORT_COPY_FAILED $dest :: $($_.Exception.Message)" 'ERROR'; $script:Failures.Add("IMPORT_COPY_FAILED $dest"); continue }
             switch ($r.Result) {
-                'created' { $n.created++ }
-                'replaced' { $n.replaced++ }
+                'created' { $n.created++; $script:ImportAppliedDest.Add($dest) }
+                'replaced' { $n.replaced++; $script:ImportAppliedDest.Add($dest) }
                 'kept' { $n.kept++ }
                 'source-credential' {
                     $n.skipped++
@@ -1175,6 +1184,9 @@ function Invoke-ImportRobocopy {
 }
 
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
+# r12 pass 9 B3: every destination a copy actually wrote ('created' or 'replaced' by Copy-ImportFileLocked), normalised paths. The settings.json profile rewrite reads this, not a
+# timestamp sampled before the copy: a file the copy KEPT (a newer or an identical host file) is the host's own and is never rewritten.
+$script:ImportAppliedDest = [System.Collections.Generic.List[string]]::new()
 $script:ImportSettingsApplied = $false
 # Test seam for r11 S-B2 (see Invoke-ImportRobocopy): a scriptblock called with (From, To) between the inspection and the replace. Always $null in a real run.
 $script:ImportBeforeReplaceHook = $null
@@ -1279,13 +1291,12 @@ function Invoke-PhaseImport {
         # or would replace a host file that does (Invoke-ImportRobocopy). The claims and doctrine copies keep their own /XC /XN /XO rules.
         $script:ImportSkippedDest.Clear()
         # p5 A3: every Import copy carries /XO (README: an Import never replaces a NEWER file this host already has with an older bundle copy).
-        # p5 A4: remember whether the bundle's settings.json is going to be APPLIED (it exists, is not skipped, and is not older than the host's file).
-        $bundleSettings = "$src\home-claude\settings.json"
-        $hostSettings = "$h\.claude\settings.json"
-        $hostSettingsBefore = if (Test-Path -LiteralPath $hostSettings -PathType Leaf) { (Get-Item -LiteralPath $hostSettings -Force).LastWriteTimeUtc } else { $null }
+        # p5 A4 / r12 pass 9 B3: remember whether the bundle's settings.json was APPLIED, from what the copy actually did (it wrote the file: 'created' or 'replaced'), not from a
+        # timestamp sampled before the copy (a newer or an identical host file the copy KEPT would then have been rewritten).
+        $script:ImportAppliedDest.Clear()
+        $hostSettings = [IO.Path]::GetFullPath("$h\.claude\settings.json")
         Invoke-ImportRobocopy "$src\home-claude" "$h\.claude" (@('/E', '/XO') + $inX)
-        $script:ImportSettingsApplied = (Test-Path -LiteralPath $bundleSettings -PathType Leaf) -and -not ($script:ImportSkippedDest -contains $hostSettings) -and
-            (($null -eq $hostSettingsBefore) -or ((Get-Item -LiteralPath $bundleSettings -Force).LastWriteTimeUtc -ge $hostSettingsBefore))
+        $script:ImportSettingsApplied = @($script:ImportAppliedDest | Where-Object { $_ -ieq $hostSettings }).Count -gt 0
         Invoke-ImportRobocopy "$src\home-bin" "$h\bin" (@('/E', '/XO') + $inX)
         Invoke-ImportRobocopy "$src\home-codex" "$h\.codex" (@('/E', '/XO') + $inX)
         Invoke-ImportRobocopy "$src\programdata-fleetdefender" 'C:\ProgramData\FleetDefender' (@('/E', '/XO') + $inX)
