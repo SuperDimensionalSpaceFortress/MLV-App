@@ -1988,6 +1988,19 @@ function Get-DvDueWakeDelivered {
     'delivered'
 }
 
+function ConvertTo-DvSessionKey {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r15 (r14 adversary A2 on a27f3d88): a session id as its canonical decimal, so `03`, `003` and `3` are
+    one session. Only one plain ASCII decimal [0-9]+ is an id; anything else is $null (no session), never a numeric prefix. String arithmetic, so an id
+    longer than any integer type is still compared exactly.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Id)
+    if ($null -eq $Id -or $Id -cnotmatch '^[0-9]+$') { return $null }
+    $t = $Id.TrimStart('0')
+    if ($t.Length -eq 0) { '0' } else { $t }
+}
+
 function Get-DvDueWakeDeliveryEvidence {
     <#
     .SYNOPSIS
@@ -2042,7 +2055,11 @@ function Get-DvDueWakeDeliveryEvidence {
             # Get-DvLogRecordBody), never as text inside another record's line. r3: the one shared anchor ($script:DvRecordStart), which the session
             # selector above (Get-DvSmokeSummaryFields) now uses too (r2 adversary pass 7 A2)
             $start = $script:DvRecordStart
-            $paceRx = $start + 'playback_smoke\.pace_summary session=' + [regex]::Escape([string]$session) + '(?:\s|$)'
+            # r15 (r14 adversary A2): session ids are compared as canonical decimals (ConvertTo-DvSessionKey), never as strings, so a boundary that
+            # spells the measured session `03` is that session (it neither closes its window nor fails to open it)
+            $sessionKey = ConvertTo-DvSessionKey ([string]$session)
+            $paceIdRx = $start + 'playback_smoke\.pace_summary session=(?<s>[0-9]+)(?:\s|$)'
+            $isMeasuredPace = { param([string]$x) ($x -cmatch $paceIdRx) -and ((ConvertTo-DvSessionKey $Matches['s']) -ceq $sessionKey) }
             $open = $false
             # r11 (r10 adversary A2 on 205a5b6c): a session boundary inside the open window that is not read whole ENDS the measured Play and marks
             # the read unreadable (DUE_WAKE_SESSION_BOUNDARY_UNREADABLE below, every leg), so the wake after it is never credited to the measured Play.
@@ -2072,8 +2089,8 @@ function Get-DvDueWakeDeliveryEvidence {
                     # r12 (pass 13 A1 on bbfe69d1, its input: `pace_summary  session=3` then `pace_summary session=3`): so is one BEFORE the measured
                     # window was first seen ($paces 0), whatever its text; it may have been the measured Play's own pace, so the later one cannot be
                     # shown to be the only measured window. Only a pace after the window closed is another Play's.
-                    if (-not $paceWhole -and ($open -or $paces -eq 0 -or $l -cmatch $paceRx)) { $boundaryUnreadable = $true }
-                    $open = $paceWhole -and ($l -cmatch $paceRx); if ($open) { $paces++ }; continue
+                    if (-not $paceWhole -and ($open -or $paces -eq 0 -or (& $isMeasuredPace $l))) { $boundaryUnreadable = $true }
+                    $open = $paceWhole -and (& $isMeasuredPace $l); if ($open) { $paces++ }; continue
                 }
                 # r2 adversary pass 6 A2: any playback_smoke record of ANOTHER session (its start, summary, ...) closes the window, so another Play's
                 # wake line never stands in for the measured Play's missing one. r5 (r4 adversary pass 10 advisory A3): measured_session names its
@@ -2089,7 +2106,7 @@ function Get-DvDueWakeDeliveryEvidence {
                         $isBoundary = $true; if ((& $located $l) -and (& $sessionTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
                     }
                     if ($isBoundary -and $null -eq $bid) { $boundaryUnreadable = $true; $open = $false; continue }
-                    if ($isBoundary -and $bid -cne [string]$session) { $open = $false; continue }
+                    if ($isBoundary -and (ConvertTo-DvSessionKey $bid) -cne $sessionKey) { $open = $false; continue }
                 }
                 # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable).
                 # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second

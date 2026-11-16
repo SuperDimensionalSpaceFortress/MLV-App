@@ -15918,6 +15918,42 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
             self.assertNotRegex(code, r"\(\?:\^\|\\s\)" + field + "=", f"{field}= is parsed only inside Get-DvDueWakeDelivered")
             self.assertNotIn(field + "=", (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8"))
 
+    def test_r15_a2_an_equivalent_decimal_session_spelling_is_the_same_session(self) -> None:
+        # r15 (r14 adversary A2 on a27f3d88, its input verbatim): `measured_session id=03` inside session 3's window is session 3, never another
+        # session, so it does not close the window and the inherited posted delivery after it blocks the head leg (before r15 the ids were compared as
+        # strings: NOT_REQUESTED blocks=false). Siblings: the start / summary / conform / gpu_summary / pace_summary `session=03` boundaries, and a
+        # measured session selected as 03 whose pace_summary says 3. Session ids are compared as canonical decimals; another session still closes.
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        wake = ("playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        a2 = ("playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\nplayback_smoke.measured_session id=03\n" + wake +
+              "\nplayback_smoke.summary session=3 presented_frames=600")
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        cases, labels = [(cell, a2)], ["A2 verbatim"]
+        for rec in ("start", "summary", "conform", "gpu_summary", "pace_summary"):
+            cases.append((cell, head + f"playback_smoke.{rec} session=03 presented_frames=600\n" + wake + "\n"))
+            labels.append(f"{rec} session=03")
+        for sel, pace in (("03", "3"), ("3", "003"), ("00", "0")):
+            cases.append((cell, f"playback_smoke.measured_session id={sel}\nplayback_smoke.pace_summary session={pace}\n" + wake + "\n"))
+            labels.append(f"selected {sel}, pace {pace}")
+        # unchanged: a boundary of ANOTHER session (04, 30) still closes the window, so a later Play's line is never the measured one
+        for other in ("id=04", "id=30"):
+            cases.append((cell, head + f"playback_smoke.measured_session {other}\n" + wake + "\n"))
+            labels.append(f"other: measured_session {other}")
+        cases.append((cell, head + "playback_smoke.start session=30\n" + wake + "\n"))
+        labels.append("other: start session=30")
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases))
+        for name, v in zip(labels, out):
+            with self.subTest(case=name):
+                if name.startswith("other: "):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+                else:
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    if not name.startswith("pace_summary"):
+                        self.assertIn("DUE_WAKE_DELIVERY_INHERITED", v["reason"])
+
 
 @requires_windows_pwsh
 class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
