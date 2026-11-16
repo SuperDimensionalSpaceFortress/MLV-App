@@ -1098,7 +1098,18 @@ function Invoke-UmRunDrop {
                                     if ($claimOwner -ceq 'OTHER') {
                                         throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
                                     }
-                                    if ($claimOwner -ceq 'OWN') {
+                                    # adversary pass 4 A1: a retry moves the same temp name, so what is about to be moved is verified again on every pass after the first (the first
+                                    # was verified just above). Ordinal: -ne is culture-aware and ignores a NUL. Changed bytes refuse; a temp that cannot be read moves nothing this pass.
+                                    $srcReadable = $true
+                                    if ($moveAttempt -gt 1 -and $claimOwner -ceq 'OWN') {
+                                        $srcText = $null
+                                        try { $srcText = Get-Content -LiteralPath $repubTmp -Raw -Encoding ascii -ErrorAction Stop } catch { $srcText = $null }
+                                        if ($null -eq $srcText) { $srcReadable = $false }
+                                        elseif (-not [string]::Equals($srcText, $metaJson, [StringComparison]::Ordinal)) {
+                                            throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json's re-publish temporary changed between the replace attempts; refusing to publish it"
+                                        }
+                                    }
+                                    if ($claimOwner -ceq 'OWN' -and $srcReadable) {
                                         try {
                                             [IO.File]::Move($repubTmp, $metaFinal, $true)
                                             break
@@ -1187,7 +1198,10 @@ function Invoke-UmRunDrop {
             $ownsClaim = $true
             $readSucceeded = $false
             try {
-                $currentMeta = Read-UmRunClaim -Path $metaFinal
+                # adversary pass 4 A2: the rollback's read keeps the CALLER's error preference (as before this card), so a claim that cannot be read still reads as "no proof
+                # either way" under Stop and as nothing (preserved) under Continue; only the root array is no longer enumerated (Read-UmRunClaim's -ErrorAction Stop is for the
+                # ownership probe, which wants the error).
+                $currentMeta = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json -NoEnumerate
                 $readSucceeded = $true
                 $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
             } catch {

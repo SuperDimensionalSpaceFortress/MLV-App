@@ -628,6 +628,8 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "    if ($c.repub.fault -eq 'hold' -or $c.repub.fault -eq 'readonly') {\n"
             "      if ($c.repub.equal) { [IO.File]::WriteAllText($metaPath, [IO.File]::ReadAllText($tmpPath)) }\n"
             "      if ($c.repub.fault -eq 'readonly') { [IO.File]::SetAttributes($metaPath, [IO.FileAttributes]::ReadOnly) }\n"
+            # adversary pass 4 A2: repub.foreign first replaces the claim with another submission's (a different nonce) before the hold
+            "      if ($c.repub.foreign) { [IO.File]::WriteAllText($metaPath, '{\"jobId\":\"job-x\",\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}') }\n"
             "      if ($c.repub.fault -eq 'hold') {\n"
             "        Add-Type -TypeDefinition 'public static class DvLockHolder { public static System.IO.FileStream Hold(string p, System.IO.FileShare s, int ms) { var fs = new System.IO.FileStream(p, System.IO.FileMode.Open, System.IO.FileAccess.Read, s); System.Threading.Tasks.Task.Delay(ms).ContinueWith(t => fs.Dispose()); return fs; } }'\n"
             "        $null = [DvLockHolder]::Hold($metaPath, [IO.FileShare]$c.repub.share, [int]$c.repub.ms) } } } } }\n"
@@ -646,9 +648,13 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "      $text = [IO.File]::ReadAllText($t0.FullName).Replace('notAfterUtc', 'notAfter' + [char]0 + 'Utc') }\n"
             "    if ($null -ne $text) { $w = [IO.File]::Open($d, 'Open', 'Write', 'ReadWrite'); $b = [Text.Encoding]::ASCII.GetBytes([string]$text)\n"
             "      $w.SetLength(0); $w.Write($b, 0, $b.Length); $w.Dispose() }\n"
+            # adversary pass 4 A1: 'mutateSource' rewrites the re-publish temp (the source the retry will move) with `notAfterUtc` renamed, nonce and jobId intact
+            "    if ($c.repub.seam.mutateSource) { $t1 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      [IO.File]::WriteAllText($t1.FullName, [IO.File]::ReadAllText($t1.FullName).Replace('notAfterUtc', 'notBeforeUtc')) }\n"
             "    if ($c.repub.seam.land) { $state.h.Dispose(); $t = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $d, $true) }\n"
             "    if ($c.repub.seam.release) { $state.h.Dispose() } } } }\n"
             "$threw = ''; $lines = @()\n"
+            "if ($c.repub.continuePref) { $ErrorActionPreference = 'Continue' }\n"   # adversary pass 4 A2: the caller's preference (the accepted -ErrorAction Continue invocation)
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
             "$meta = $(if (Test-Path -LiteralPath $metaPath) { try { [IO.File]::ReadAllText($metaPath) } catch { '<UNREADABLE>' } } else { '' })\n"
             "$dropAt = $(if ($null -ne $c.dropAt) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$c.dropAt).UtcDateTime } elseif ($null -ne $sim) { $sim.now.UtcDateTime } else { $null })\n"
@@ -1152,6 +1158,23 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         self.assertEqual(r["threw"], "", r)
         self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
         self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+
+    def test_a_retry_never_moves_a_source_that_changed_since_it_was_verified(self) -> None:
+        # adversary pass 4 A1 (introduced): the temp is verified once, before the first Move; a refused Move is retried on the same name, so bytes written to it during
+        # the back-off (same jobId and nonce, no `notAfterUtc`) were published unverified while the drop reported the intended deadline. RED before the fix: the
+        # changed bytes were moved over the claim and the job became visible behind them.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"mutateSource": True, "release": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_JOB_METADATA_VERIFY_FAILED"), r)
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes never reached the published claim")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_rollback_keeps_a_claim_it_could_not_read_under_a_continue_preference(self) -> None:
+        # adversary pass 4 A2 (introduced): the rollback's read became a terminating one, so under -ErrorAction Continue a claim another submission holds (readable by
+        # no one, deletable by anyone) read as "no proof either way" and was deleted; the base's non-terminating read yielded nothing and preserved it. RED before the
+        # fix: job-x.meta.json (the foreign claim) was gone after the refusal.
+        r = self._drop(fault="hold", share="Delete", ms=60000, foreign=True, continuePref=True)
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("job-x.meta.json", r["names"], "another submission's claim is not deleted by this one's rollback")
 
     def test_the_replacing_rename_line_is_unchanged_and_still_the_only_three_argument_move(self) -> None:
         # the owner-footage route guard pins that exact line (test_dual_venue_owner_footage_gate.ROUTE_DELETE_ALLOWED); the retry wraps it, never rewrites it
