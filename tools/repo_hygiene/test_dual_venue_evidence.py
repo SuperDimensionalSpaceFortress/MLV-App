@@ -3298,15 +3298,36 @@ class EvidenceFactory(RunnerHarness):
         man_sha = manifest.get("smokeRunLog", {}).get("sha256", "")
         # r16 (r15 adversary A1 and advisory A2): read each record as its body, like Get-DvLogRecordBody: a trailing ` (<path>:<digits>)` is the Qt location
         # and strips; any other ` (` tail is unreadable (None), so that record is never read whole
+        # r21 (bench MINI3-1 r3 FINDING, the module's Get-DvLocationOpenIndex): a ` (` inside a `<key>="<text>"` value (closed by the first `"`, which is
+        # followed by a space or ends the line) is never the location; the location is the first ` (` outside one
+        def loc(l: str) -> int:
+            i = 0
+            while True:
+                p = l.find(" (", i)
+                if p < 0:
+                    return -1
+                q = l.find('="', i)
+                if 0 <= q < p:
+                    k = q - 1
+                    while k >= 0 and (l[k] == "_" or ("A" <= l[k] <= "Z") or ("a" <= l[k] <= "z") or ("0" <= l[k] <= "9")):
+                        k -= 1
+                    c = l.find('"', q + 2)
+                    if k < q - 1 and (k < 0 or l[k] == " ") and c >= 0 and (c == len(l) - 1 or l[c + 1] == " "):
+                        i = c + 1
+                    else:
+                        i = q + 2
+                    continue
+                return p
+
         def body(l: str) -> str | None:
-            i = l.find(" (")
+            i = loc(l)
             if i < 0:
                 return l
             # r18 (r18 adversary advisory A3): ASCII digits only, like the module's 0-9 walk (Python's \d also takes Arabic-Indic digits)
             return l[:i] if re.search(r":([0-9]+|%2)\)$", l) and l.rfind(":") > i + 2 else None
         # r19 (r19 adversary advisory A2): the record is SELECTED by its body too (the text before its first ` (`), so a location path holding the
         # marker never adds a record; a selected record with an unreadable tail is still None (never read whole)
-        iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l.split(" (", 1)[0])]
+        iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l if loc(l) < 0 else l[:loc(l)])]
         return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
                 "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
                 "wrapped": int(f["wrapped"]) != 0, "wrapCount": int(f["wrap_count"]),
@@ -16146,6 +16167,101 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                     (ev / "result.json").write_text("{}", encoding="utf-8")
                     (ev / "summary.json").write_text("{}", encoding="utf-8")
                     self.assertIs(EvidenceFactory.derive_block(ev)["settingsIsolated"], want)
+
+
+@requires_windows_pwsh
+class QuotedValueIsNeverALocationTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r21 (bench HFR-NATIVE-M16-1457-VENUE-EVIDENCE-MINI3-1 r3 FINDING, PR 811 comment 6929981460):
+    the app writes ` (` inside its own double-quoted values (session_reason="preview scale 1 (full resolution)" on the in-window record
+    playback_smoke.gpu_dualiso_recon_scale_summary). On f4a952e3 Get-DvLogRecordBody read that span as an unparsable Qt location, the body became
+    `... (LOCATION_UNREADABLE)`, and the r12 B2 boundary rule refused every cuda s1 leg as DUE_WAKE_SESSION_BOUNDARY_UNREADABLE although its measured
+    line shows a delivered wake. By class, a ` (` inside a `<key>="<text>"` value is never a location; an unreadable tail OUTSIDE one still refuses."""
+
+    # Copied verbatim from the bench r3 run log of leg 01 (H f4a952e3, m16-1457-native-fullscreen-s1, cuda), receipt
+    # a4b1e24c-ce2a-4c8a-8633-4c0c43916f50: legs\evidence\a4b1e24c-ce2a-4c8a-8633-4c0c43916f50\logs\smoke-run.log lines 87, 2679, 2680 and 2697.
+    BENCH_MEASURED = "[2026-11-16T20:02:10.427Z] [INFO] [0x26928] playback_smoke.measured_session id=1"
+    BENCH_PACE = ("[2026-11-16T20:02:35.636Z] [INFO] [0x26928] playback_smoke.pace_summary session=1 first_present_ms=213.544 paced_elapsed_ms=25002.415 "
+                  "timeline_fps_after_first_present=59.874 presented_fps_after_first_present=59.914 pace_fps=59.940 first_present_catchup_frames=1")
+    BENCH_WAKE = (
+        "[2026-11-16T20:02:35.637Z] [INFO] [0x26928] playback_due_wake armed=1499 fired=1482 advanced=1436 rearmed=0 busy_deferred=46 late_p50_ms=0.389 "
+        "late_p95_ms=0.713 hires=1 disabled=0 delivery=native-msg unpresented_deferred=0 post_stamped=1482 due_to_post_p50_lo_ms=0.311 "
+        "due_to_post_p50_hi_ms=0.335 due_to_post_p95_lo_ms=0.539 due_to_post_p95_hi_ms=0.574 post_to_receive_p50_lo_ms=0.045 post_to_receive_p50_hi_ms=0.070 "
+        "post_to_receive_p95_lo_ms=0.138 post_to_receive_p95_hi_ms=0.183 post_call_p50_ms=0.016 post_call_p95_ms=0.058 samples_binned=0 post_unsplit=0 "
+        "post_refused=0 post_failed=0 post_rescued=0 post_counts_settled=1 late_exact=1 late_underflow=0 late_overflow=0 late_range_ms=-20.000:80.000 "
+        "due_to_post_lo_exact=1 due_to_post_lo_underflow=0 due_to_post_lo_overflow=0 due_to_post_lo_range_ms=-20.000:80.000 due_to_post_hi_exact=1 "
+        "due_to_post_hi_underflow=0 due_to_post_hi_overflow=0 due_to_post_hi_range_ms=-20.000:80.000 post_to_receive_lo_exact=1 post_to_receive_lo_underflow=0 "
+        "post_to_receive_lo_overflow=0 post_to_receive_lo_range_ms=-20.000:80.000 post_to_receive_hi_exact=1 post_to_receive_hi_underflow=0 "
+        "post_to_receive_hi_overflow=0 post_to_receive_hi_range_ms=-20.000:80.000 post_call_exact=1 post_call_underflow=0 post_call_overflow=0 "
+        "post_call_range_ms=-20.000:80.000 stranded=13 stranded_asleep=0 stranded_runner_sleep=0 stranded_awake=10 stranded_unknown=3 post_asleep=1400 "
+        "post_runner_sleep=0 post_awake=82 post_state_unknown=0 runner_sleep_woken=0 runner_sleep_woken_other=0 runner_sleep_wait_failed=0 "
+        "post_to_awake_p50_ms=0.020 post_to_awake_p95_ms=0.062 awake_to_receive_p50_ms=0.021 awake_to_receive_p95_ms=0.074 reentrant_deferred=0 "
+        "delivery_kind=send post_to_awake_exact=1 post_to_awake_underflow=0 post_to_awake_overflow=0 post_to_awake_range_ms=-20.000:80.000 "
+        "awake_to_receive_exact=1 awake_to_receive_underflow=0 awake_to_receive_overflow=0 awake_to_receive_range_ms=-20.000:80.000")
+    BENCH_SCALE = ("[2026-11-16T20:02:35.643Z] [INFO] [0x26928] playback_smoke.gpu_dualiso_recon_scale_summary session=1 reduced_recon_frames=0 "
+                   "full_recon_frames=0 recon_scale_last=0 session_scale=1 session_reason=\"preview scale 1 (full resolution)\" fallback_reason_last=\"\" "
+                   "clip_dims_busy_refusals=0 retained_outstanding=2")
+
+    def log(self, scale_line: str) -> str:
+        return "\n".join([self.BENCH_MEASURED, self.BENCH_PACE, self.BENCH_WAKE, scale_line]) + "\n"
+
+    def bodies(self, lines: list[str]) -> list:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "lines.json"
+            path.write_text(json.dumps(lines), encoding="utf-8")
+            proc, out = run_pwsh_json("$ls = Get-Content -Raw -LiteralPath $env:DVE_LINES -Encoding utf8 | ConvertFrom-Json\n"
+                                      "@($ls | ForEach-Object { Get-DvLogRecordBody -Line ([string]$_) }) | ConvertTo-Json -Compress -AsArray", DVE_LINES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def test_the_bench_s1_record_keeps_its_body_and_the_head_leg_is_not_refused(self) -> None:
+        located = self.BENCH_SCALE + " (C:/build/platform/qt/MainWindow.cpp:32062)"
+        self.assertEqual(self.bodies([self.BENCH_SCALE, located]), [self.BENCH_SCALE, self.BENCH_SCALE])
+        # the bench leg (paced head arm, no generatorArgs): the measured line's sent wake was delivered (fired 1482, post_rescued 0, settled 1)
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [({}, self.log(self.BENCH_SCALE)), ({}, self.log(located)),
+                                                                               ({"generatorArgs": {"dueWakeDeliveryPost": True}}, self.log(self.BENCH_SCALE))])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual([(v["observed"], v["verdict"], v["blocks"]) for v in out[:2]], [("send", "NOT_REQUESTED", False)] * 2, out)
+        # the posted arm reading the same sent line is refused for its route, never for an unreadable boundary
+        self.assertEqual((out[2]["verdict"], out[2]["blocks"]), ("NOT_HONOURED", True), out[2])
+        self.assertIn("ROUTE_NOT_ENGAGED", out[2]["reason"])
+
+    def test_an_unreadable_tail_outside_a_quoted_value_still_refuses(self) -> None:
+        sentinel = " (LOCATION_UNREADABLE)"
+        cases = {
+            # a real unreadable location after the quoted value
+            "bad location": (self.BENCH_SCALE + " (C:/b x/MainWindow.cpp:%3)", self.BENCH_SCALE + sentinel),
+            # the r12 B2 shape: a session named in a parenthesised tail outside any quoted value
+            "session tail": (self.BENCH_SCALE + " (session=4)", self.BENCH_SCALE + sentinel),
+            # a closing quote followed by a non-space closes nothing, so the span is no quoted value and its ` (` is the location candidate
+            "glued quote": (self.BENCH_SCALE.replace('(full resolution)" ', '(full resolution)"x '), None),
+            # an opener with no closer is no quoted value
+            "unclosed": ('playback_smoke.gpu_summary session=1 reason="a (b', 'playback_smoke.gpu_summary session=1 reason="a' + sentinel),
+            # a ` (` before any quoted value is the location, whatever a quote in its path does later
+            "path quote": ('a=1 (C:/b k="x (y" id=9 x/M.cpp:%3)', "a=1" + sentinel),
+            "path quote readable": ('a=1 (C:/b k="x (y" id=9 x/M.cpp:12)', "a=1"),
+            # a key that does not start the line or follow a space opens no quoted value
+            "glued key": ('a=1 x,k="v (w)" b=2', "a=1 x,k=\"v" + sentinel),
+        }
+        got = self.bodies([line for line, _ in cases.values()])
+        for (name, (line, want)), body in zip(cases.items(), got):
+            with self.subTest(case=name):
+                if want is None:
+                    self.assertTrue(body.endswith(sentinel), body)
+                else:
+                    self.assertEqual(body, want)
+        # and in the measured window, the boundary refusal stands for every leg
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [
+            (spec, self.log(line)) for spec in ({}, {"generatorArgs": {"dueWakeDeliveryPost": True}})
+            for line in (cases["bad location"][0], cases["session tail"][0], cases["glued quote"][0])])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for v in out:
+            self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+            self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"])
+
+    def test_the_python_isolation_mirror_reads_a_quoted_parenthesis_like_the_module(self) -> None:
+        text = Path(__file__).read_text(encoding="utf-8")
+        self.assertIn("def loc(l: str) -> int:", text)
+        self.assertIn("l if loc(l) < 0 else l[:loc(l)]", text)
 
 
 @requires_windows_pwsh

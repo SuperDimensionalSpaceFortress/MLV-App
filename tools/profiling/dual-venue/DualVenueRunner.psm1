@@ -2574,6 +2574,47 @@ function Test-DvConformStatusGroupAt {
     $script:DvConformStatusMeasured.IsMatch($before.Substring($k + $script:DvConformStatusKey.Length))
 }
 
+function Get-DvLocationOpenIndex {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r21 (bench HFR-NATIVE-M16-1457-VENUE-EVIDENCE-MINI3-1 r3, receipt a4b1e24c-ce2a-4c8a-8633-4c0c43916f50:
+    every cuda s1 leg's `playback_smoke.gpu_dualiso_recon_scale_summary ... session_reason="preview scale 1 (full resolution)" ...` lost its tail to
+    LOCATION_UNREADABLE, so the due-wake reader refused it as DUE_WAKE_SESSION_BOUNDARY_UNREADABLE): the index of the ` (` that starts the Qt location,
+    or -1 when the line has none. By CLASS, a ` (` inside a double-quoted value is never a location: the app writes free text with spaces and
+    parentheses only as `<key>="<text>"` (MainWindow.cpp: session_reason, fallback_reason_last, gui_fps_status_text, screen, model, ...). A quoted value
+    opens at `="` whose key ([A-Za-z0-9_]+) starts the line or follows a space, and closes at the FIRST `"` after it, which must be followed by a space
+    or end the line; a `"` followed by anything else closes nothing, and then the opener is not a quoted value (its ` (` stays a location candidate, the
+    reading before r21). An opener with no closer is not a quoted value either. The r10 conform group (Test-DvConformStatusGroupAt) is still stepped over
+    once in its place. The scan is linear: each IndexOf result is reused until the scan passes it.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
+    $n = $Line.Length
+    $i = 0
+    $p = -2
+    $q = -2
+    $conformSkipped = $false
+    while ($i -lt $n) {
+        if ($p -ne -1 -and $p -lt $i) { $p = $Line.IndexOf(' (', $i, [StringComparison]::Ordinal) }
+        if ($p -lt 0) { return -1 }
+        if ($q -ne -1 -and $q -lt $i) { $q = $Line.IndexOf('="', $i, [StringComparison]::Ordinal) }
+        if ($q -ge 0 -and $q -lt $p) {
+            # is $q a value opener: a non-empty ASCII key that starts the line or follows a space
+            $k = $q - 1
+            while ($k -ge 0 -and (($Line[$k] -ge [char]'A' -and $Line[$k] -le [char]'Z') -or ($Line[$k] -ge [char]'a' -and $Line[$k] -le [char]'z') -or ($Line[$k] -ge [char]'0' -and $Line[$k] -le [char]'9') -or $Line[$k] -ceq [char]'_')) { $k-- }
+            if ($k -lt $q - 1 -and ($k -lt 0 -or $Line[$k] -ceq [char]' ')) {
+                $c = $Line.IndexOf('"', $q + 2, [StringComparison]::Ordinal)
+                if ($c -ge 0 -and ($c -eq $n - 1 -or $Line[$c + 1] -ceq [char]' ')) { $i = $c + 1; continue }
+            }
+            $i = $q + 2
+            continue
+        }
+        # r10 (ADV-A1, Dot 6550442583): the conform group the app writes INSIDE its own status field, stepped over once
+        if (-not $conformSkipped -and (Test-DvConformStatusGroupAt -Line $Line -Index $p)) { $conformSkipped = $true; $i = $p + 2; continue }
+        return $p
+    }
+    -1
+}
+
 function Get-DvLogRecordBody {
     <#
     .SYNOPSIS
@@ -2595,15 +2636,12 @@ function Get-DvLogRecordBody {
     path of at least one character gives the body; any other tail (no line number, text after the `)`, an empty path, a message that held a marker on the
     old writer) gives the body plus ' (LOCATION_UNREADABLE)', which refuses a whole-line match and supplies no field or marker. It may refuse; it never
     forges. The scan is linear: one IndexOf and one right-to-left walk over the digits, no regex (the r4 regex was super-linear on repeated ` (`).
+    r21 (bench MINI3-1 r3 FINDING): the app also writes ` (` inside its own double-quoted values (session_reason="preview scale 1 (full resolution)" on
+    playback_smoke.gpu_dualiso_recon_scale_summary), so the location starts at the first ` (` OUTSIDE a `<key>="<text>"` value (Get-DvLocationOpenIndex).
     #>
     param([AllowNull()][AllowEmptyString()][string]$Line)
     if ([string]::IsNullOrEmpty($Line)) { return $Line }
-    $open = $Line.IndexOf(' (', [StringComparison]::Ordinal)
-    # r10 (ADV-A1, Dot 6550442583): the first ` (` is the location's only when it is not the conform group the app writes INSIDE its own status field
-    # (see the r10 note above). That group is skipped once (one gui_fps_status_text per summary line); the next ` (` is the location.
-    if ($open -ge 0 -and (Test-DvConformStatusGroupAt -Line $Line -Index $open)) {
-        $open = $Line.IndexOf(' (', $open + 2, [StringComparison]::Ordinal)
-    }
+    $open = Get-DvLocationOpenIndex -Line $Line
     if ($open -lt 0) { return $Line }
     $body = $Line.Substring(0, $open)
     $end = $Line.Length - 1
