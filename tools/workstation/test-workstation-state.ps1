@@ -634,6 +634,25 @@ if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContin
     Assert-That ($p5a5thrown -and (@($p5a5calls | Where-Object { $_ -like 'DISABLE*' -or $_ -like 'REGISTER*' }).Count -ge 1)) 'p5 A5 meters: a log write that throws after the install still restores the task (restore is in finally)' ($p5a5calls -join ',')
 } else { Assert-That $false 'r3 A7: Invoke-MeterInstalls is not defined' }
 
+# r15 (hub ruling on adversary pass 12, DENY BY DEFAULT on the key name): the only value exemptions are the closed literal list ('', '""', "''", 'null', '~', '[]', '{}',
+# '***', '${NAME}', '<words>', an empty XML element). The earlier rounds' "is not a credential" samples below that relied on a retired exemption (an unquoted boolean, a
+# token count, a quoted placeholder, a sequence of exempt elements, a trailing comment or ';', an empty TOML triple quote, a comment-only XML element or block, a netrc
+# '""') are now asserted to REFUSE (accepted over-refusal, forced by the ruling); every other sample must still pass. The retired samples are named here by label.
+$script:R15RetiredOkLabels = @(
+    'a numeric token limit', 'a boolean under a key name',
+    'a YAML boolean under a password key', 'a boolean under a password key', 'a numeric token limit (still benign)', 'a YAML token count',
+    'S-B1 control: an empty basic triple-quoted value', 'S-B1 control: an empty literal triple-quoted value',
+    'A1 flow mapping, boolean value', 'A1 flow mapping, boolean flag key', 'A2 bare boolean', 'A2 boolean then a comment', 'A2 boolean then the next line', 'A2 boolean then a semicolon',
+    'B1 cmd boolean then semicolon at the end', 'B1 yaml boolean with a spaced comment', 'B1 flow boolean with a spaced comment', 'B1 yaml token boolean',
+    'a block key with only a comment after it', 'a ${...} placeholder', 'a netrc empty quoted password', 'a flow boolean on the next line',
+    'p11 a sequence of exempt elements', 'p11 a block boolean followed by a sibling key', 'p11 an XML comment only'
+)
+function Assert-CredentialOkOrRetired {
+    param([string]$Prefix, [string]$Label, [string]$Text)
+    if ($script:R15RetiredOkLabels -ccontains $Label) { Assert-That (Test-CredentialText $Text) "$Prefix $Label is REFUSED under the r15 deny-by-default rule (its earlier exemption is retired)" $Text }
+    else { Assert-That (-not (Test-CredentialText $Text)) "$Prefix $Label is not a credential" $Text }
+}
+
 # ================================================================ adversary pass 5 (head 2c812a47): one section per finding class
 # ---------------------------------------------------------------- p5 A1: credential text is judged by what it says, not by one spelling of a value
 if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinue) -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyContinue)) {
@@ -652,7 +671,7 @@ if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinu
         'a boolean under a key name'  = '{"passwordless": true, "token": null}'
         'an empty secret value'       = '{"DB_PASSWORD": ""}'
     }
-    foreach ($k in $p5a1ok.Keys) { Assert-That (-not (Test-CredentialText $p5a1ok[$k])) "p5 A1 Test-CredentialText: $k is not a credential" $p5a1ok[$k] }
+    foreach ($k in $p5a1ok.Keys) { Assert-CredentialOkOrRetired 'p5 A1 Test-CredentialText:' $k $p5a1ok[$k] }
     $p5a1Stage = New-Scratch 'p5-a1-stage'
     [IO.File]::WriteAllText((Join-Path $p5a1Stage 'login.cmd'), "@set DB_PASSWORD=valid-pass-9`r`n")
     [IO.File]::WriteAllText((Join-Path $p5a1Stage 'hooks-config.json'), '{"api\u005fkey":"valid-pass-9"}')
@@ -778,7 +797,7 @@ if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinu
         'a numeric token limit (still benign)'   = "max_tokens = 4096`n"
         'a YAML token count'                     = "token_count: 12`n"
     }
-    foreach ($k in $r10a1ok.Keys) { Assert-That (-not (Test-CredentialText $r10a1ok[$k])) "r10 A1 Test-CredentialText: $k is not a credential" $r10a1ok[$k] }
+    foreach ($k in $r10a1ok.Keys) { Assert-CredentialOkOrRetired 'r10 A1 Test-CredentialText:' $k $r10a1ok[$k] }
 } else { Assert-That $false 'r10 A1: Test-CredentialText is not defined' }
 
 # ---------------------------------------------------------------- r10 A2: Import never copies a credential-bearing host file into its backup folder
@@ -919,7 +938,7 @@ $r11TomlOk = [ordered]@{
 }
 if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinue)) {
     foreach ($k in $r11Toml.Keys) { Assert-That (Test-CredentialText $r11Toml[$k]) "r11 $k is a credential (Test-CredentialText)" $r11Toml[$k] }
-    foreach ($k in $r11TomlOk.Keys) { Assert-That (-not (Test-CredentialText $r11TomlOk[$k])) "r11 $k is not a credential" $r11TomlOk[$k] }
+    foreach ($k in $r11TomlOk.Keys) { Assert-CredentialOkOrRetired 'r11' $k $r11TomlOk[$k] }
 } else { Assert-That $false 'r11 S-B1: Test-CredentialText is not defined' }
 # the same detector is behind every consumer: the Export scan, the archive re-check, the Import bundle/host guard and the backup copy
 if ($fnLoaded -and (Get-Command Invoke-StagedSecretScan -ErrorAction SilentlyContinue)) {
@@ -1060,7 +1079,7 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r12 A1')) {
         'A2 boolean then a semicolon'                    = 'DB_PASSWORD=null;'
     }
     foreach ($k in $r12Hit.Keys) { Assert-That (Test-CredentialText $r12Hit[$k]) "r12 $k is a credential (Test-CredentialText)" $r12Hit[$k] }
-    foreach ($k in $r12Ok.Keys) { Assert-That (-not (Test-CredentialText $r12Ok[$k])) "r12 $k is not a credential" $r12Ok[$k] }
+    foreach ($k in $r12Ok.Keys) { Assert-CredentialOkOrRetired 'r12' $k $r12Ok[$k] }
     # the same line through the Export stage scan, the Import bundle guard and the Import host guard
     $a1Stage = New-Scratch 'r12-a1-stage'
     [IO.File]::WriteAllText((Join-Path $a1Stage 'service.yaml'), '{password: hunter2}')
@@ -1177,7 +1196,7 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r12 B1')) {
         'B2 author key is not _auth'                   = 'author=Layi'
     }
     foreach ($k in $r12bHit.Keys) { Assert-That (Test-CredentialText $r12bHit[$k]) "r12 $k is a credential (Test-CredentialText)" $r12bHit[$k] }
-    foreach ($k in $r12bOk.Keys) { Assert-That (-not (Test-CredentialText $r12bOk[$k])) "r12 $k is not a credential" $r12bOk[$k] }
+    foreach ($k in $r12bOk.Keys) { Assert-CredentialOkOrRetired 'r12' $k $r12bOk[$k] }
     # the .netrc / .npmrc shapes through the Export stage scan and the Import guards (an older host .npmrc must not be replaced by a newer clean bundle copy)
     $b2Stage = New-Scratch 'r12-b2-stage'
     [IO.File]::WriteAllText((Join-Path $b2Stage '.netrc'), 'machine example.org login alice password hunter2')
@@ -1267,7 +1286,7 @@ $r14Ok = [ordered]@{
 }
 if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r14 A1-A3')) {
     foreach ($k in $r14Hit.Keys) { Assert-That (Test-CredentialText $r14Hit[$k]) "r14 $k is a credential (Test-CredentialText)" $r14Hit[$k] }
-    foreach ($k in $r14Ok.Keys) { Assert-That (-not (Test-CredentialText $r14Ok[$k])) "r14 $k is not a credential" $r14Ok[$k] }
+    foreach ($k in $r14Ok.Keys) { Assert-CredentialOkOrRetired 'r14' $k $r14Ok[$k] }
     Assert-That ((Get-CredentialHitLine "# a`n# b`npassword:`n  hunter2`n") -eq 3) 'r14 A1 Get-CredentialHitLine: a block credential is reported on the line of its key'
     # every guard site calls the one detector: Export stage scan + typed line, archive re-check, Import bundle guard, Import host guard, the locked copy, the settings rewrite, the backup
     $r14Samples = [ordered]@{ A1 = $r14Hit['A1 YAML block password (value on the next line)']; A2 = $r14Hit['A2 netrc quoted value, several lines']; A3 = $r14Hit['A3 cmd DB_PASSWORD=false"hunter2'] }
@@ -1376,7 +1395,9 @@ if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r14 p11 A4')) {
     $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v1"}') }
     $script:ImportAfterSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v2"}') }
     try { $p11r2 = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($p11Src)) -Dest $p11Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false } catch { $p11r2 = @{ Result = "threw: $($_.Exception.Message)" } } finally { $script:ImportBeforeSwapHook = $null; $script:ImportAfterSwapHook = $null }
-    Assert-That (([IO.File]::ReadAllText($p11Dst)) -ceq '{"api_key":"owner-v2"}' -and $p11r2.Result -ceq 'changed') 'r14 p11 A5 import: a save after the swap is the newest and is kept (no unconditional rollback)' "$($p11r2.Result) $([IO.File]::ReadAllText($p11Dst))"
+    # r15 (pass 12 A4/A5 hub ruling): the rollback now swaps under its lock and finds the newer save in its aside, puts it back and refuses typed IMPORT_ROLLBACK_DEST_CHANGED
+    # (forced companion: r14 returned 'changed' here without a typed refusal)
+    Assert-That (([IO.File]::ReadAllText($p11Dst)) -ceq '{"api_key":"owner-v2"}' -and ($p11r2.Result -ceq 'changed' -or $p11r2.Result -like 'threw: IMPORT_ROLLBACK_DEST_CHANGED*')) 'r14 p11 A5 import: a save after the swap is the newest and is kept (no unconditional rollback)' "$($p11r2.Result) $([IO.File]::ReadAllText($p11Dst))"
     Assert-That (@(Get-ChildItem -LiteralPath (Split-Path -Parent $p11Dst) -Force).Count -eq 1) 'r14 p11 A5 import: no temp or backup file is left beside the host file' ((Get-ChildItem -LiteralPath (Split-Path -Parent $p11Dst) -Force | ForEach-Object Name) -join ';')
     # A5: a save before the swap only: it is put back
     [IO.File]::WriteAllText($p11Dst, '{"v":"host"}'); (Get-Item -LiteralPath $p11Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 14, 12, 0, 0, [DateTimeKind]::Utc)
@@ -1412,6 +1433,206 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseSsh' 'r14 A6')) {
     $a6StartIdx = [array]::LastIndexOf([string[]]$a6.Calls, 'START sshd'); $a6StopIdx = [array]::LastIndexOf([string[]]$a6.Calls, 'STOP sshd')
     Assert-That ($a6StopIdx -gt $a6StartIdx) 'r14 A6 ssh: a Write-Log throw after the firewall step still stops sshd (password-enabled sshd does not stay up)' ($a6.Calls -join ',')
     Assert-That ($a6.Calls -contains 'SETSERVICE sshd Manual') 'r14 A6 ssh: the fail-closed path also takes sshd off automatic start (a reboot does not bring the password config back up)' ($a6.Calls -join ',')
+}
+
+# ================================================================ r15 (head 1ebadcaf): adversary pass 12, A1-A6
+# A1-A3 by the hub ruling (DENY BY DEFAULT on the key NAME; doctrine bus 0fc7511 and d6d115b). A secret-named key with ANY value refuses; the value is the RAW text to
+# the end of its record, nothing stripped; the only exemptions are the closed literal list ('', '""', "''", 'null', '~', '[]', '{}', '***', '${NAME}', '<words>', an
+# XML element with no content). Over-refusal is accepted and asserted below.
+# NOT COVERED by this section (and not by the rule): a key name built from pieces at run time ('$k = "pass" + "word"'), a value produced by run-time evaluation, and a
+# secret under a key whose name says nothing (only the known token shapes catch those).
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r15 A1-A3') -and (Test-Has 'Get-CredentialHitLine' 'r15 A1-A3')) {
+    $r15Hit = [ordered]@{
+        'p12 A1 a brace inside a quoted sequence element'      = '{"password":["{hunter2}"]}'
+        'p12 A1 text after an empty sequence'                  = 'DB_PASSWORD=[]hunter2'
+        'p12 A1 text after an empty mapping'                   = 'DB_PASSWORD={}hunter2'
+        'p12 A2 an XML comment inside CDATA'                   = '<password><![CDATA[<!--hunter2-->]]></password>'
+        'p12 A3 netrc with a quoted multi-word login'          = 'machine h login "alice smith" password hunter2'
+    }
+    foreach ($k in $r15Hit.Keys) {
+        Assert-That ((Test-CredentialText $r15Hit[$k]) -and (Get-CredentialHitLine $r15Hit[$k]) -gt 0) "r15 $k is a credential (Test-CredentialText and Get-CredentialHitLine)" $r15Hit[$k]
+    }
+    # the closed exemption list still passes (the rule is not 'refuse everything')
+    $r15Ok = [ordered]@{
+        'an empty line value'                                  = 'DB_PASSWORD='
+        'an empty double-quoted value'                         = 'password: ""'
+        'an empty single-quoted value'                         = "password: ''"
+        'a JSON null'                                          = '{"token": null}'
+        'a YAML ~'                                             = 'password: ~'
+        'an empty sequence'                                    = 'password: []'
+        'an empty mapping'                                     = '{"password": {}}'
+        'three asterisks'                                      = 'password: ***'
+        'an env reference'                                     = 'password: ${DB_PASSWORD}'
+        'a placeholder'                                        = 'DB_PASSWORD=<your password>'
+        'an XML element with no content'                       = '<password></password>'
+        'a self-closing XML element'                           = '<password/>'
+        'a block key with nothing after it'                    = "password:`n"
+        'a key that is not secret-named'                       = 'author: Layi'
+        'a password word with no netrc keyword in the text'    = 'reset the password here'
+    }
+    foreach ($k in $r15Ok.Keys) { Assert-That (-not (Test-CredentialText $r15Ok[$k])) "r15 $k is exempt (closed list)" $r15Ok[$k] }
+    # the r14-and-earlier value exemptions that the closed list retires now REFUSE (accepted over-refusal)
+    $r15Retired = [ordered]@{
+        'a boolean'                                            = 'password_required: true'
+        'a token count'                                        = 'max_tokens = 4096'
+        'a mapping under an auth key'                          = 'auth: { type: x }'
+        'a script variable assigned from code'                 = '$Token = Get-Token'
+        'a quoted env reference'                               = 'password: "${DB_PASSWORD}"'
+        'an XML comment only'                                  = '<password><!-- set by hand --></password>'
+        'an empty value followed by a comment'                 = 'password: "" # set later'
+    }
+    foreach ($k in $r15Retired.Keys) { Assert-That (Test-CredentialText $r15Retired[$k]) "r15 retired exemption: $k now refuses" $r15Retired[$k] }
+
+    # ---- the GENERATED must-refuse sweep (doctrine d6d115b): every wrapper composition (depth 1-3) of the value 'hunter2', in every form, with a comment line before,
+    # after or not at all. The cases are generated here, never hand-listed; EVERY one must refuse through Test-CredentialText AND Get-CredentialHitLine.
+    $r15Wrap = [ordered]@{
+        'bare'      = { param($s) $s }
+        '"..."'     = { param($s) '"' + $s + '"' }
+        "'...'"     = { param($s) "'" + $s + "'" }
+        '[..]'      = { param($s) '[' + $s + ']' }
+        '{..}'      = { param($s) '{' + $s + '}' }
+        '[] prefix' = { param($s) '[]' + $s }
+        '{} prefix' = { param($s) '{}' + $s }
+        '"" prefix' = { param($s) '""' + $s }
+        '<!--..-->' = { param($s) '<!--' + $s + '-->' }
+        'CDATA'     = { param($s) '<![CDATA[' + $s + ']]>' }
+    }
+    $r15Values = [System.Collections.Generic.List[object]]::new()
+    $level = @(@{ Name = 'hunter2'; Value = 'hunter2'; Depth = 0 })
+    foreach ($d in 1..3) {
+        $next = @()
+        foreach ($base in $level) {
+            foreach ($wn in $r15Wrap.Keys) {
+                $nv = @{ Name = "$wn($($base.Name))"; Value = (& $r15Wrap[$wn] $base.Value); Depth = $d }
+                $next += $nv
+                $r15Values.Add($nv)
+            }
+        }
+        $level = $next
+    }
+    $r15Forms = [ordered]@{
+        'line ='                  = { param($v) "DB_PASSWORD=$v" }
+        'line :'                  = { param($v) "password: $v" }
+        'block'                   = { param($v) "password:`n  $v" }
+        'block, comment between'  = { param($v) "password:`n# note`n  $v" }
+        'flow JSON'               = { param($v) "{`"password`": $v}" }
+        'flow YAML'               = { param($v) "{password: $v, user: x}" }
+        'sequence'                = { param($v) "{`"password`": [$v]}" }
+        'XML element'             = { param($v) "<password>$v</password>" }
+        'netrc, quoted login'     = { param($v) "machine h login `"alice smith`" password $v" }
+    }
+    $r15Comments = [ordered]@{ 'no comment' = { param($t) $t }; 'comment before' = { param($t) "# note`n" + $t }; 'comment after' = { param($t) $t + "`n# note" } }
+    $r15Total = 0
+    foreach ($fn in $r15Forms.Keys) {
+        $miss = [System.Collections.Generic.List[string]]::new()
+        $n = 0
+        foreach ($val in $r15Values) {
+            foreach ($cn in $r15Comments.Keys) {
+                if ($val.Depth -eq 3 -and $cn -ne 'no comment') { continue }   # depth 3 without comment lines keeps the sweep inside a few seconds per form
+                $text = & $r15Comments[$cn] (& $r15Forms[$fn] $val.Value)
+                $n++
+                if (-not (Test-CredentialText $text) -or (Get-CredentialHitLine $text) -le 0) { $miss.Add("$($val.Name) / $cn") }
+            }
+        }
+        $r15Total += $n
+        Assert-That ($miss.Count -eq 0) "r15 generated sweep, $fn form: all $n wrapped values refuse" ("misses=$($miss.Count): " + (($miss | Select-Object -First 12) -join '; '))
+    }
+    Assert-That ($r15Total -ge 9000) "r15 generated sweep: the sweep ran ($r15Total cases)" "$r15Total"
+    # every guard site calls the one detector: one finding input per guard (export stage scan, archive re-check, Import bundle + host guard, locked copy, settings rewrite, backup)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    foreach ($id in 'p12 A1 a brace inside a quoted sequence element', 'p12 A2 an XML comment inside CDATA', 'p12 A3 netrc with a quoted multi-word login') {
+        $t = $r15Hit[$id]; $tag = $id.Substring(4, 2)
+        $st = New-Scratch "r15-$tag-stage"; [IO.File]::WriteAllText((Join-Path $st 'service.json'), $t)
+        Assert-That (@(Get-StagedCredentialHits -Stage $st).Count -eq 1) "r15 $id export: the staged file is a hit"
+        $zp = Join-Path (New-Scratch "r15-$tag-zip") 'b.zip'
+        $zf = [IO.Compression.ZipFile]::Open($zp, 'Create')
+        try { $e = $zf.CreateEntry('home-claude/machine/service.json'); $sw = [IO.StreamWriter]::new($e.Open()); $sw.Write($t); $sw.Dispose() } finally { $zf.Dispose() }
+        Assert-That (@(Get-ArchiveCredentialHits -Zip $zp).Count -eq 1) "r15 $id export: the archive re-check is a hit"
+        $is = New-Scratch "r15-$tag-isrc"; $idd = New-Scratch "r15-$tag-idst"
+        $cs = Join-Path $is 'locked-src.json'; [IO.File]::WriteAllText($cs, $t)
+        $cr = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($cs)) -Dest (Join-Path $idd 'locked-new.json') -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+        Assert-That ($cr.Result -ceq 'source-credential') "r15 $id import: the locked copy refuses the bundle file" "$($cr.Result)"
+        $ss = Join-Path (New-Scratch "r15-$tag-set") 'settings.json'; [IO.File]::WriteAllText($ss, $t)
+        $script:Failures.Clear()
+        $ur = Update-ImportedSettingsLocked -Path $ss -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice'
+        Assert-That ($ur.Result -ceq 'changed' -and ([IO.File]::ReadAllText($ss)) -ceq $t) "r15 $id import: the settings.json rewrite leaves it alone" "$($ur.Result)"
+        Assert-That ((Copy-CleanBackupFile -Path $ss -DestinationDir (New-Scratch "r15-$tag-bk")) -eq $false) "r15 $id import: the backup never copies it"
+        $script:Failures.Clear()
+    }
+}
+
+# ---------------------------------------------------------------- r15 A4 / A5: the rollback runs under a lock held through its File.Replace and judges the displaced file by bytes AND time
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r15 A4')) {
+    $r15d = New-Scratch 'r15-a4a5'
+    $r15Src = Join-Path $r15d 'bundle\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $r15Src))
+    $r15Dst = Join-Path $r15d 'host\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $r15Dst))
+    function Reset-R15Fixture {
+        [IO.File]::WriteAllText($r15Src, '{"v":"bundle"}'); (Get-Item -LiteralPath $r15Src).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 11, 0, 0, [DateTimeKind]::Utc)
+        Get-ChildItem -LiteralPath (Split-Path -Parent $r15Dst) -Force | Remove-Item -Force
+        [IO.File]::WriteAllText($r15Dst, '{"v":"old"}'); (Get-Item -LiteralPath $r15Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 10, 0, 0, [DateTimeKind]::Utc)
+    }
+    $t12 = [DateTime]::new(2026, 11, 16, 12, 0, 0, [DateTimeKind]::Utc); $t13 = [DateTime]::new(2026, 11, 16, 13, 0, 0, [DateTimeKind]::Utc)
+    # A4 (the finding's input): owner-v1 at 12:00 before the first swap; after the swap an IDENTICAL-bytes save of the bundle text at 13:00
+    Reset-R15Fixture
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"v":"owner-v1"}'); [IO.File]::SetLastWriteTimeUtc($Dest, $t12) }
+    $script:ImportAfterSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"v":"bundle"}'); [IO.File]::SetLastWriteTimeUtc($Dest, $t13) }
+    $a4msg = ''
+    try { $a4r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($r15Src)) -Dest $r15Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false; $a4msg = "result=$($a4r.Result)" } catch { $a4msg = $_.Exception.Message } finally { $script:ImportBeforeSwapHook = $null; $script:ImportAfterSwapHook = $null }
+    Assert-That (([IO.File]::ReadAllText($r15Dst)) -ceq '{"v":"bundle"}' -and [IO.File]::GetLastWriteTimeUtc($r15Dst) -eq $t13) 'r15 A4 import: an identical-bytes save with a newer time after the swap is kept (never replaced by the older save)' "$a4msg | $([IO.File]::ReadAllText($r15Dst)) $([IO.File]::GetLastWriteTimeUtc($r15Dst).ToString('o'))"
+    Assert-That ($a4msg -like 'IMPORT_ROLLBACK_DEST_CHANGED*') 'r15 A4 import: the rollback refuses typed IMPORT_ROLLBACK_DEST_CHANGED' $a4msg
+    # A5 (the finding's input): owner-v1 before the swap; while the rollback holds its lock, another process saves owner-v2 by an in-place write (refused by the
+    # lock) or by a rename-over save (lands, and must be put back)
+    Reset-R15Fixture
+    $script:R15Blocked = $null
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"v":"owner-v1"}'); [IO.File]::SetLastWriteTimeUtc($Dest, $t12) }
+    $script:ImportBeforeRollbackHook = { param($Dest) try { [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v2"}'); $script:R15Blocked = $false } catch { $script:R15Blocked = $true } }
+    $a5msg = ''
+    try { $a5r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($r15Src)) -Dest $r15Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false; $a5msg = "result=$($a5r.Result)" } catch { $a5msg = $_.Exception.Message } finally { $script:ImportBeforeSwapHook = $null; $script:ImportBeforeRollbackHook = $null }
+    Assert-That ($script:R15Blocked -eq $true) 'r15 A5 import: an in-place save while the rollback runs is refused by the rollback''s lock (the lock is held through the Replace)' "blocked=$($script:R15Blocked) $a5msg"
+    Assert-That (([IO.File]::ReadAllText($r15Dst)) -ceq '{"v":"owner-v1"}' -and $a5msg -ceq 'result=changed') 'r15 A5 import: with the in-place save refused, the interleaved save is put back (result changed)' "$a5msg | $([IO.File]::ReadAllText($r15Dst))"
+    Reset-R15Fixture
+    $script:R15Moved = $null
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"v":"owner-v1"}'); [IO.File]::SetLastWriteTimeUtc($Dest, $t12) }
+    $script:ImportBeforeRollbackHook = { param($Dest) $tmpSave = "$Dest.editor-save"; [IO.File]::WriteAllText($tmpSave, '{"api_key":"owner-v2"}'); try { [IO.File]::Move($tmpSave, $Dest, $true); $script:R15Moved = $true } catch { $script:R15Moved = "move failed: $($_.Exception.Message)" } }
+    $a5bmsg = ''
+    try { $a5b = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($r15Src)) -Dest $r15Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false; $a5bmsg = "result=$($a5b.Result)" } catch { $a5bmsg = $_.Exception.Message } finally { $script:ImportBeforeSwapHook = $null; $script:ImportBeforeRollbackHook = $null }
+    if ($script:R15Moved -eq $true) {
+        Assert-That (([IO.File]::ReadAllText($r15Dst)) -ceq '{"api_key":"owner-v2"}') 'r15 A5 import: a rename-over save that lands during the rollback is kept (put back), never overwritten by the older save' "$a5bmsg | $([IO.File]::ReadAllText($r15Dst))"
+        Assert-That ($a5bmsg -like 'IMPORT_ROLLBACK_DEST_CHANGED*') 'r15 A5 import: that rollback refuses typed IMPORT_ROLLBACK_DEST_CHANGED' $a5bmsg
+    } else {
+        Assert-That (([IO.File]::ReadAllText($r15Dst)) -ceq '{"v":"owner-v1"}') 'r15 A5 import: a rename-over save refused by the lock loses nothing (the interleaved save is put back)' "moved=$($script:R15Moved) $a5bmsg"
+    }
+    Assert-That (@(Get-ChildItem -LiteralPath (Split-Path -Parent $r15Dst) -Force | Where-Object { $_.Name -like '*.mlvimport-*' }).Count -eq 0) 'r15 A5 import: no rollback temp, backup or aside file is left beside the host file' ((Get-ChildItem -LiteralPath (Split-Path -Parent $r15Dst) -Force | ForEach-Object Name) -join ';')
+}
+
+# ---------------------------------------------------------------- r15 A6: a delete that is refused is never reported as done (export archive, rollback backup)
+if ($fnLoaded -and (Test-Has 'Remove-RejectedArchive' 'r15 A6') -and (Test-Has 'Remove-FileVerified' 'r15 A6')) {
+    $a6d = New-Scratch 'r15-a6'
+    $a6zip = Join-Path $a6d 'mlv-migrate-bundle-r15.zip'; [IO.File]::WriteAllText($a6zip, 'password: hunter2')
+    $a6h = [IO.File]::Open($a6zip, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)   # the finding's reader: FileShare.Read, kept open through cleanup
+    $a6msg = ''
+    $script:Failures.Clear()
+    try { Remove-RejectedArchive -Zip $a6zip -Late @('home-claude/machine/service.yaml (credential pattern in the archive)') } catch { $a6msg = $_.Exception.Message } finally { $a6h.Dispose() }
+    Assert-That ($a6msg -like 'EXPORT_CREDENTIAL_ZIP_NOT_DELETED *' -and $a6msg.Contains($a6zip) -and -not $a6msg.Contains('archive was deleted')) 'r15 A6 export: an archive whose delete is refused fails typed EXPORT_CREDENTIAL_ZIP_NOT_DELETED with its path (never "deleted")' $a6msg
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'EXPORT_CREDENTIAL_ZIP_NOT_DELETED*' }).Count -eq 1) 'r15 A6 export: the typed failure is recorded in the run failures (exit 1)' ($script:Failures -join ',')
+    $a6zip2 = Join-Path $a6d 'mlv-migrate-bundle-r15b.zip'; [IO.File]::WriteAllText($a6zip2, 'password: hunter2')
+    $a6msg2 = ''
+    try { Remove-RejectedArchive -Zip $a6zip2 -Late @('x') } catch { $a6msg2 = $_.Exception.Message }
+    Assert-That (-not (Test-Path -LiteralPath $a6zip2) -and $a6msg2 -like '*archive was deleted*') 'r15 A6 export (control): an archive that can be deleted is gone and reported deleted' $a6msg2
+    $script:Failures.Clear()
+    # the rollback backup cleanup: a backup another process holds open is a typed failure, never kept silently
+    if (Test-Has 'Copy-ImportFileLocked' 'r15 A6 backup') {
+        $b6 = New-Scratch 'r15-a6-bak'
+        $b6Src = Join-Path $b6 'bundle\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $b6Src))
+        $b6Dst = Join-Path $b6 'host\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $b6Dst))
+        [IO.File]::WriteAllText($b6Src, '{"v":"bundle"}'); (Get-Item -LiteralPath $b6Src).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 11, 0, 0, [DateTimeKind]::Utc)
+        [IO.File]::WriteAllText($b6Dst, '{"v":"old"}'); (Get-Item -LiteralPath $b6Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 10, 0, 0, [DateTimeKind]::Utc)
+        $script:R15BakHandle = $null
+        $script:ImportAfterSwapHook = { param($Dest) $bk = @(Get-ChildItem -LiteralPath (Split-Path -Parent $Dest) -Force -Filter '*.mlvimport-*.bak')[0]; $script:R15BakHandle = [IO.File]::Open($bk.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) }
+        $b6msg = ''
+        try { $b6r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($b6Src)) -Dest $b6Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false; $b6msg = "result=$($b6r.Result)" } catch { $b6msg = $_.Exception.Message } finally { $script:ImportAfterSwapHook = $null; if ($script:R15BakHandle) { $script:R15BakHandle.Dispose() } }
+        Assert-That ($b6msg -like 'IMPORT_ROLLBACK_BACKUP_NOT_DELETED *') 'r15 A6 import: a rollback backup that cannot be removed is a typed failure IMPORT_ROLLBACK_BACKUP_NOT_DELETED <path>, not a silent success' $b6msg
+    }
 }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))

@@ -682,27 +682,39 @@ $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACC
 # A secret-named key is any key whose letters (case-insensitive, any separator: '_', '-', '.', camelCase) say password / passwd / pass_word, secret,
 # credential, api_key / apikey, private_key, access_key, auth_key, token, or that has a part 'auth', 'authorization' or 'pwd' ('_auth', 'x-auth', 'AuthHeader';
 # not 'author').
-# Quoting never ends a value: text after a closing quote is part of the value ('""hunter2', '"x"y'), and a quote inside an unquoted value is content
-# ('false"hunter2'). The ONLY exemptions are named here and judge the WHOLE value:
-#   - an explicit empty value ('k=', 'k: ""', "k = ''", 'k = """"""', 'k: []', 'k: {}', or a block key with no later value line);
-#   - a whole-value placeholder: '${NAME}', '<words>', '***' (three or more asterisks), quoted or not;
-#   - an UNQUOTED whole boolean / null word: true, false, null, none, nil, undefined, '~' ('false"hunter2', 'false;hunter2', 'false hunter2' are NOT whole words;
-#     a trailing ';' or ',' and a ' #' comment are not part of a value);
-#   - a TOKEN key's unquoted all-digit value, which is a count ('max_tokens = 4096', 'token_count: 12'); a PASSWORD-class key has no such exemption;
-#   - a mapping value ('auth: { type: x }'), whose own pairs are judged where they stand;
-#   - a script variable assigned from code ('$Token = Get-Token', '$env:GH_TOKEN = $t'): only a QUOTED literal there is a stored value ('$Tok = ''x''' is a hit).
+# r15 (hub ruling on adversary pass 12 A1-A3; doctrine bus 0fc7511 'spelling-chase-scanner-needs-a-deny-by-default-name' and d6d115b 'scanner-narrowing-needs-a-
+# generated-must-refuse-sweep'): DENY BY DEFAULT on the key NAME. Five passes in a row drew three new spellings each, because r14 still STRIPPED the value
+# (quotes, braces inside a sequence, comments, CDATA) before its exemption test and so judged a value that was not the one written. Now:
+#   1. a text is refused when a secret-named key appears in it with ANY value. The value is the RAW text from the separator to the end of the record: the line form
+#      to the end of the line; the block form ('k:' alone) through the next non-blank, non-comment line plus every following more-indented line; a flow
+#      mapping / sequence element up to its ',' or the enclosing close; an XML element up to its matching close tag. A quoted run or a container is followed
+#      across line breaks to its close. Nothing is stripped before the exemption test.
+#   2. the ONLY exemptions (Test-CredentialValueExempt) are a closed literal list compared against that whole raw value after trimming outer whitespace only:
+#      the empty string, '""', "''", 'null', '~', '[]', '{}', '***', an anchored '${NAME}' env reference and an anchored '<words>' placeholder; for XML an element
+#      with no content at all. Anything else refuses: '[]hunter2', '""hunter2', '"x"', 'false', '4096' under 'max_tokens', '{ type: x }' under 'auth', and a
+#      script variable assigned from code ('$Token = Get-Token'). Over-refusal is accepted (a dropped file is named in SECRET-SCAN.txt).
+#   3. netrc: a netrc-shaped text in which 'password' / 'passwd' is followed by ANY further token refuses (no record tokenizer).
+#   4. tools/workstation/test-workstation-state.ps1 carries a GENERATED must-refuse sweep over every wrapper combination and form.
+#   NOT covered: a key name built from pieces at run time ('$k = "pass" + "word"'), a value produced by run-time evaluation, and a secret under a key whose name
+#   says nothing (only the known token shapes in $SecretPatterns catch those).
+# The r14 exemption list that r15 retires (kept here as the record of what changed): an unquoted boolean / null word (true, false, none, nil, undefined); a TOKEN
+# key's all-digit count ('max_tokens = 4096'); a mapping value ('auth: { type: x }'); a script variable assigned from code ('$Token = Get-Token'); a quoted placeholder
+# ('"${NAME}"'); three or more asterisks ('****'). Quoting never ends a value: text after a closing quote is part of the value ('""hunter2', '"x"y').
 # A prose line such as 'Password: see the owner' is a hit by design (fail closed: a false positive costs one dropped file named in SECRET-SCAN.txt; a miss ships a
 # secret). The detector is never narrowed to make a staged file pass (r11 F-B1). Every guard site (the Export stage scan and its typed EXPORT_CREDENTIAL_HIT line,
 # the archive re-check, the Import bundle and host guards, the locked copy, the settings.json rewrite and the backup copy) calls Test-CredentialText /
 # Get-CredentialHitLine, which call this rule and nothing else besides the known token shapes below.
 $CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-]*)(["'']?)[ \t]*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
-$script:CredentialPlainSpanRegex = [regex]::new('\G[^\r\n]*?(?=[ \t]#|\r|\n|$)')
-$script:CredentialFlowSpanRegex = [regex]::new('\G[^\r\n,}\]]*?(?=[ \t]#|[\r\n,}\]]|$)')
-$script:CredentialDqRegex = [regex]::new('\G"(?:[^"\\\r\n]|\\.)*"')
-$script:CredentialSqRegex = [regex]::new("\G'[^'\r\n]*'")
-$script:CredentialNetrcTokenRegex = [regex]::new('(?m)(?<c>^[ \t]*#[^\r\n]*)|(?<t>\S+)')
-$script:CredentialPlaceholderRegex = [regex]::new('^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z][A-Za-z0-9 _.\-]*>|\*{3,})$')
+# r15 (hub ruling on adversary pass 12 A1-A3, DENY BY DEFAULT on the key name): the value span regexes, the quoted-run regexes and the netrc record tokenizer of
+# r14 are gone (they stripped quotes, braces, comments and CDATA before the exemption test). What is left is the CLOSED exemption list, compared against the whole
+# RAW value after trimming outer whitespace only (Test-CredentialValueExempt), and the two netrc regexes (Get-CredentialNetrcHitIndex).
+$script:CredentialExemptLiterals = @('""', "''", 'null', '~', '[]', '{}', '***')
+$script:CredentialPlaceholderRegex = [regex]::new('^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z_ -]+>)$')
+# a netrc-shaped text: it carries a whitespace-delimited netrc keyword that opens or names a record ('machine', 'default', 'login', 'macdef')
+$script:CredentialNetrcShapeRegex = [regex]::new('(?i)(?<!\S)(?:machine|default|login|macdef)(?!\S)')
+# in a netrc-shaped text, the token 'password' (or 'passwd') followed by ANY further token (any line, comments included) is a credential
+$script:CredentialNetrcPasswordRegex = [regex]::new('(?i)(?<!\S)(?:password|passwd)(?!\S)\s+\S')
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 # Known token SHAPES: a secret by its own form, whatever key (if any) it stands under. These are not spellings of the key/value rule above.
@@ -714,11 +726,15 @@ $SecretPatterns = @(
     '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"''<>]+:[^\s/@"''<>]+@'
 )
 # r14: the XML element form of the key/value rule ('<password>hunter2</password>', '<DbPassword>x</DbPassword>'); the attribute form 'password="x"' is the line form.
-# r14 pass 11 A3: the element's whole content is its value, CDATA sections and child elements included (markup, CDATA delimiters and comments are removed before judging).
-$script:CredentialXmlRegex = [regex]::new('(?i)<([A-Za-z0-9_.\-:]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-:]*)(?:\s[^<>]*)?>([\s\S]*?)</\1\s*>')
+# r15 (pass 12 A2): the element's RAW content, from just after its opening tag to its matching closing tag (or to the end of the text when it is never closed), is
+# its value. Nothing is removed first: a comment, a CDATA section ('<![CDATA[<!--hunter2-->]]>') or a child element is content, so it is never empty. This regex
+# finds the OPENING tag of a secret-named element (Get-CredentialXmlHitIndex finds its close); a self-closing tag ('<password/>') has no content at all.
+$script:CredentialXmlOpenRegex = [regex]::new('(?i)<([A-Za-z0-9_.\-:]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-:]*)(?=[\s/>])[^<>]*>')
 $script:SecretShapeRegex = [regex]::new(($SecretPatterns -join '|'))
 
-# '' = not a secret-named key; 'strong' = the key says its value is a secret; 'count' = a TOKEN key (its unquoted all-digit value is a count, not a secret).
+# '' = not a secret-named key; 'strong' = the key says its value is a secret; 'count' = a TOKEN key that names a count ('max_tokens').
+# r15: both non-empty classes are secret-named and meet the SAME closed exemption list; a count key's number ('max_tokens = 4096') is no longer exempt (accepted
+# over-refusal: the file is dropped and named in SECRET-SCAN.txt). The class is kept so the report and a later narrowing can still tell the two apart.
 function Get-CredentialKeyClass {
     param([string]$Key)
     $flat = ($Key -replace '[_.\-]', '').ToLowerInvariant()
@@ -731,63 +747,56 @@ function Get-CredentialKeyClass {
     return 'strong'
 }
 
-# The text of an unquoted value that starts at $At: up to the line end or a ' #' comment (and, inside a flow mapping, a ',' '}' or ']'), trailing blanks and ONE
-# trailing ';' or ',' removed. A quote is content here (quoting never ends a value).
-function Get-CredentialPlainSpan {
-    param([string]$Text, [int]$At, [bool]$Flow)
-    if ($At -ge $Text.Length) { return '' }
-    $rx = $(if ($Flow) { $script:CredentialFlowSpanRegex } else { $script:CredentialPlainSpanRegex })
-    $s = $rx.Match($Text, $At).Value.TrimEnd()
-    if ($s.EndsWith(';') -or $s.EndsWith(',')) { $s = $s.Substring(0, $s.Length - 1).TrimEnd() }
-    return $s
-}
-
-# The value that starts at $At. Returns @{ Kind = 'empty' | 'container' | 'quoted' | 'plain'; Value }.
-function Read-CredentialValueAt {
+# r15 (hub ruling on adversary pass 12 A1-A3: DENY BY DEFAULT on the key NAME). This replaces Get-CredentialPlainSpan and Read-CredentialValueAt, which judged a
+# value they had rewritten first: they stripped the quotes ('"x"' judged as 'x'), the braces inside a sequence ('["{hunter2}"]' judged as '[""]', pass 12 A1), a
+# trailing ' #' comment, a trailing ';' or ',', and they returned an empty container without looking at what followed it ('[]hunter2', '{}hunter2', pass 12 A1).
+# Nothing is stripped now. The value of a secret-named key is the RAW text from just after its separator to the end of the record, and only that raw text (outer
+# whitespace trimmed, nothing else) meets the closed exemption list in Test-CredentialValueExempt.
+#
+# Get-CredentialRawValueEnd: the index just past the raw value that starts at $At. The scan walks the text once and tracks:
+#   - a double-quoted run (a backslash escapes the next character) and a single-quoted run. A quote opens a run wherever it stands (also after other text), and a
+#     run may cross line breaks; an unterminated run takes the rest of the text, which is never exempt (fail closed).
+#   - the depth of '[' and '{' outside a quoted run. A container may cross line breaks; an unclosed container takes the rest of the text (fail closed).
+# At depth 0 and outside a quoted run the value ends at a line break. Inside a flow mapping or flow sequence ($Flow) it also ends at a ',' and at a ']' or '}'
+# that closes the ENCLOSING container. Nothing else ends a value: text after a closing quote, after an empty container or after a comment marker ('""hunter2',
+# '[]hunter2', '{}hunter2', '"" # note') is part of it, so such a value is never one of the exempt literals.
+function Get-CredentialRawValueEnd {
     param([string]$Text, [int]$At, [bool]$Flow)
     $n = $Text.Length
-    if ($At -ge $n) { return @{ Kind = 'empty'; Value = '' } }
-    $c = $Text[$At]
-    foreach ($q3 in '"""', "'''") {
-        if ($At + 3 -le $n -and $Text.Substring($At, 3) -ceq $q3) {
-            $close = $Text.IndexOf($q3, $At + 3, [StringComparison]::Ordinal)
-            if ($close -lt 0) { return @{ Kind = 'plain'; Value = $Text.Substring($At) } }   # unterminated: everything after it is the value
-            $tail = Get-CredentialPlainSpan $Text ($close + 3) $Flow
-            if ($tail.Trim()) { return @{ Kind = 'plain'; Value = $Text.Substring($At, $close + 3 - $At) + $tail } }
-            return @{ Kind = 'quoted'; Value = $Text.Substring($At + 3, $close - $At - 3) }
+    $i = $At
+    $depth = 0
+    $quote = [char]0
+    while ($i -lt $n) {
+        $c = $Text[$i]
+        if ($quote -ne [char]0) {
+            if ($quote -eq [char]'"' -and $c -eq [char]'\' -and $i + 1 -lt $n) { $i += 2; continue }
+            if ($c -eq $quote) { $quote = [char]0 }
+            $i++
+            continue
         }
-    }
-    if ($c -eq '"' -or $c -eq "'") {
-        $qm = $(if ($c -eq '"') { $script:CredentialDqRegex } else { $script:CredentialSqRegex }).Match($Text, $At)
-        if ($qm.Success) {
-            $tail = Get-CredentialPlainSpan $Text ($At + $qm.Length) $Flow
-            if (-not $tail.Trim()) { return @{ Kind = 'quoted'; Value = $qm.Value.Substring(1, $qm.Length - 2) } }
-            return @{ Kind = 'plain'; Value = $qm.Value + $tail }   # quoting never ends a value ('""hunter2')
+        if ($c -eq [char]'"' -or $c -eq [char]"'") { $quote = $c; $i++; continue }
+        if ($c -eq [char]'[' -or $c -eq [char]'{') { $depth++; $i++; continue }
+        if ($c -eq [char]']' -or $c -eq [char]'}') {
+            if ($depth -gt 0) { $depth--; $i++; continue }
+            if ($Flow) { return $i }   # the close of the enclosing flow container
+            $i++
+            continue
         }
-        return @{ Kind = 'plain'; Value = (Get-CredentialPlainSpan $Text $At $Flow) }   # no closing quote on the line
-    }
-    if ($c -eq '{') {
-        $close = $Text.IndexOf('}', $At + 1)
-        $inside = $(if ($close -lt 0) { $Text.Substring($At + 1) } else { $Text.Substring($At + 1, $close - $At - 1) })
-        if (-not $inside.Trim()) { return @{ Kind = 'empty'; Value = '' } }
-        if ($inside -match '[:=]') { return @{ Kind = 'container'; Value = '' } }   # a mapping: its pairs are judged where they stand
-        return @{ Kind = 'plain'; Value = '{' + $inside + '}' }   # '{hunter2}' is a scalar
-    }
-    if ($c -eq '[') {
-        # r14 pass 11 A1: a sequence is judged as a WHOLE: every element must be exempt ('["","hunter2"]' is a hit). Mappings inside it are judged where they stand.
-        $close = $Text.IndexOf(']', $At + 1)
-        $inside = $(if ($close -lt 0) { $Text.Substring($At + 1) } else { $Text.Substring($At + 1, $close - $At - 1) })
-        $inside = [regex]::Replace($inside, '\{[^{}]*\}', '')
-        foreach ($piece in ($inside -split ',')) {
-            $e = $piece.Trim()
-            if (-not $e) { continue }
-            $kind = 'plain'
-            if ($e.Length -ge 2 -and ($e[0] -eq '"' -or $e[0] -eq "'") -and $e[$e.Length - 1] -eq $e[0]) { $kind = 'quoted'; $e = $e.Substring(1, $e.Length - 2) }
-            if (-not (Test-CredentialValueExempt -Value @{ Kind = $kind; Value = $e } -Class 'strong')) { return @{ Kind = 'plain'; Value = $piece } }
+        if ($depth -eq 0) {
+            if ($c -eq [char]"`n" -or $c -eq [char]"`r") { return $i }
+            if ($Flow -and $c -eq [char]',') { return $i }
         }
-        return @{ Kind = 'empty'; Value = '' }
+        $i++
     }
-    return @{ Kind = 'plain'; Value = (Get-CredentialPlainSpan $Text $At $Flow) }
+    return $n
+}
+
+# True when the raw text ends at a line break (or at the end of the text) from $At on: only blanks and tabs stand between.
+function Test-CredentialAtLineEnd {
+    param([string]$Text, [int]$At)
+    $i = $At
+    while ($i -lt $Text.Length -and ($Text[$i] -eq [char]' ' -or $Text[$i] -eq [char]"`t")) { $i++ }
+    return ($i -ge $Text.Length -or $Text[$i] -eq [char]"`r" -or $Text[$i] -eq [char]"`n")
 }
 
 # The index of the first character of the next line (after $From, which is at a line break or the end) that is neither blank nor a '#' comment; -1 when none.
@@ -825,8 +834,11 @@ function Get-CredentialIndentedBlock {
         $p = $e
         if (-not $line.Trim()) { continue }
         $ind = $line.Length - $line.TrimStart(' ', "`t").Length
-        if ($ind -le $KeyIndent) { break }
-        if (-not $KeepComments -and $line.TrimStart().StartsWith('#')) { continue }
+        # r15 (pass 12, deny by default): a '#' comment line never ends the block, at any indent ('password: ""\n# note\n  hunter2' keeps 'hunter2' in the value),
+        # and with -KeepComments it is part of the raw value (the r15 caller always passes $true: nothing is stripped before the exemption test)
+        $isComment = $line.TrimStart().StartsWith('#')
+        if ($ind -le $KeyIndent -and -not $isComment) { break }
+        if (-not $KeepComments -and $isComment) { continue }
         $parts.Add($line.Trim())
     }
     return ($parts -join ' ')
@@ -848,16 +860,16 @@ function Test-CredentialFlowContext {
     return (($seg.Split('{').Count - 1) -gt ($seg.Split('}').Count - 1))
 }
 
-# The whole-value exemptions named above, and nothing else.
+# r15 (hub ruling, pass 12): the CLOSED exemption list, and nothing else. $Raw is the whole raw value as written (Get-CredentialRawValueEnd, the block lines, or an
+# XML element's content); only its outer whitespace is trimmed. Exempt: the empty string, '""', "''", 'null', '~', '[]', '{}', '***' (each compared exactly,
+# case-sensitive), an env reference '${NAME}' and a placeholder '<words>' (each anchored over the whole value). Everything else is a credential, including any text
+# after an empty container ('[]hunter2'), a quoted literal ('"x"'), a boolean ('false'), a number ('4096') and a mapping ('{ type: x }'). Over-refusal is accepted.
 function Test-CredentialValueExempt {
-    param([hashtable]$Value, [string]$Class)
-    $s = $Value.Value.Trim()
-    if (-not $s) { return $true }
-    if ($script:CredentialPlaceholderRegex.IsMatch($s)) { return $true }
-    if ($Value.Kind -eq 'quoted') { return $false }
-    if ($s -match '^(?i:true|false|null|none|nil|undefined|~)$') { return $true }
-    if ($Class -eq 'count' -and $s -match '^[0-9]+$') { return $true }
-    return $false
+    param([string]$Raw)
+    $s = $(if ($null -eq $Raw) { '' } else { $Raw.Trim() })
+    if ($s.Length -eq 0) { return $true }
+    if ($script:CredentialExemptLiterals -ccontains $s) { return $true }
+    return $script:CredentialPlaceholderRegex.IsMatch($s)
 }
 
 # The one key/value rule: the index of the first secret-named key that carries a value, -1 when there is none.
@@ -870,75 +882,70 @@ function Get-CredentialKeyValueHitIndex {
         if (-not $class) { continue }
         $keyStart = $m.Groups[1].Index
         $sep = $m.Groups[3].Value
-        $from = [Math]::Max(0, $keyStart - 64)
-        $isVar = $Text.Substring($from, $keyStart - $from) -match '\$(?:[A-Za-z_][A-Za-z0-9_]*:)?$'
+        # r15: a script variable ('$Token = Get-Token') is no longer exempt (deny by default: the ONLY exemptions are the closed literal list)
         $flow = Test-CredentialFlowContext -Text $Text -KeyStart $keyStart -Sep $sep
         $p = $m.Index + $m.Length
-        $blank = $p
         while ($p -lt $n -and ($Text[$p] -eq ' ' -or $Text[$p] -eq "`t")) { $p++ }
-        $lineEnd = $Text.IndexOfAny([char[]]"`r`n", [Math]::Min($p, $n))
-        if ($lineEnd -lt 0) { $lineEnd = $n }
-        $rest = $Text.Substring($p, $lineEnd - $p)
-        $ls0 = $Text.LastIndexOf("`n", [Math]::Max(0, $keyStart - 1)) + 1
-        if ($keyStart -eq 0) { $ls0 = 0 }
-        $keyIndent = 0
-        while ($ls0 + $keyIndent -lt $n -and ($Text[$ls0 + $keyIndent] -eq ' ' -or $Text[$ls0 + $keyIndent] -eq "`t")) { $keyIndent++ }
-        $v = $null
+        # r15 LINE form (and flow / sequence form): the raw text from the separator to the end of the record (a line break at depth 0; in a flow container also a ','
+        # or the enclosing close); a quoted run or a container that crosses line breaks is followed to its close.
+        $end = Get-CredentialRawValueEnd -Text $Text -At $p -Flow $flow
+        $raw = $Text.Substring($p, $end - $p)
         if ($sep -eq ':') {
-            # r14 pass 11 A2: a YAML block scalar ('|', '>-') is ONE string, judged whole (every more-indented line after the key; only empty or a placeholder is exempt)
-            if ($rest -match '^[|>][0-9+\-]*[ \t]*(?:[ \t]#.*)?$') {
-                $blk = Get-CredentialIndentedBlock -Text $Text -From $lineEnd -KeyIndent $keyIndent -KeepComments $true
-                $v = @{ Kind = 'quoted'; Value = $blk }
+            $ls0 = $(if ($keyStart -eq 0) { 0 } else { $Text.LastIndexOf("`n", $keyStart - 1) + 1 })
+            $keyIndent = 0
+            while ($ls0 + $keyIndent -lt $n -and ($Text[$ls0 + $keyIndent] -eq ' ' -or $Text[$ls0 + $keyIndent] -eq "`t")) { $keyIndent++ }
+            # r15 BLOCK form: nothing after 'k:' on its line. The value is the raw text from that line break through the first later line that is neither blank nor a
+            # '#' comment (at ANY indent; the comment lines between are part of the raw value) and the record that line opens.
+            if (-not $raw.Trim() -and (Test-CredentialAtLineEnd -Text $Text -At $end)) {
+                $q = Get-CredentialNextValueLine $Text $end
+                if ($q -ge 0) {
+                    $qEnd = Get-CredentialRawValueEnd -Text $Text -At $q -Flow $flow
+                    $raw = $Text.Substring($end, $qEnd - $end)
+                    $end = $qEnd
+                }
             }
-            # block form: nothing on the key's line or a ' #' comment: the value is the next non-blank, non-comment line
-            elseif (-not $rest.Trim() -or ($p -gt $blank -and $rest.StartsWith('#'))) {
-                $p = Get-CredentialNextValueLine $Text $lineEnd
-                if ($p -lt 0) { continue }
+            # r15: outside a flow container every following line more indented than the key is part of the value too (a block scalar 'password: |', a plain
+            # continuation 'password: ""\n  hunter2'), comment lines included and never ending it
+            if (-not $flow) {
+                $more = Get-CredentialIndentedBlock -Text $Text -From $end -KeyIndent $keyIndent -KeepComments $true
+                if ($more.Trim()) { $raw = $raw + "`n" + $more }
             }
-        } elseif (-not $rest.Trim()) { continue }   # 'k=' with nothing after it is an explicit empty value
-        if (-not $v) { $v = Read-CredentialValueAt -Text $Text -At $p -Flow $flow }
-        # r14 pass 11 A2: a plain YAML scalar continues on every following line that is more indented than the key ('password: false\n  hunter2' is 'false hunter2')
-        if ($sep -eq ':' -and -not $flow -and $v.Kind -eq 'plain') {
-            $le = $Text.IndexOfAny([char[]]"`r`n", [Math]::Min($p, $n)); if ($le -lt 0) { $le = $n }
-            $more = Get-CredentialIndentedBlock -Text $Text -From $le -KeyIndent $keyIndent -KeepComments $false
-            if ($more.Trim()) { $v = @{ Kind = 'plain'; Value = ($v.Value + ' ' + $more).Trim() } }
         }
-        if ($v.Kind -eq 'empty' -or $v.Kind -eq 'container') { continue }
-        if ($isVar -and $v.Kind -ne 'quoted') { continue }
-        if (Test-CredentialValueExempt -Value $v -Class $class) { continue }
+        # 'k=' with nothing after it on its line is the empty raw value (exempt); 'k=' then a value on a later line is not a key/value record in an '=' format.
+        if (Test-CredentialValueExempt $raw) { continue }
         return $keyStart
     }
     return -1
 }
 
-# A netrc record: 'machine <host>' or 'default' (or a record that starts at 'login <user>'), then netrc keyword/value pairs (login, account, port, password) in any
-# order, across any number of lines and '#' comment lines. A 'password <value>' pair in such a record is a hit unless the value is empty ('""') or a placeholder; a quote
-# never ends the value. Any other word ends the record, so prose that merely mentions a password is not one.
+# r15 (hub ruling on pass 12 A3): netrc WITHOUT a record tokenizer. The r14 tokenizer split a quoted multi-word login ('login "alice smith"') on its blank, read
+# 'smith"' as a word that ends the record and so ignored the 'password hunter2' after it. The decision now needs no record at all: a NETRC-SHAPED text (one that
+# carries a whitespace-delimited 'machine', 'default', 'login' or 'macdef' token anywhere) in which the token 'password' or 'passwd' is followed by ANY further
+# token (on any later line, a '#' comment or a quoted '""' included) is a credential. Over-refusal is accepted: prose that says 'login' and then 'password x' is a
+# hit. Returns the index of that 'password' token, -1 when there is none.
 function Get-CredentialNetrcHitIndex {
     param([string]$Text)
-    if ($Text -notmatch '(?i)(?<![\w\-])password(?![\w\-])') { return -1 }
-    $inRecord = $false; $expect = ''; $pwAt = -1
-    foreach ($t in $script:CredentialNetrcTokenRegex.Matches($Text)) {
-        if ($t.Groups['c'].Success) { continue }
-        $w = $t.Value
-        if ($expect) {
-            if ($expect -ceq 'password') {
-                $val = $w
-                if ($val.Length -ge 2 -and ($val[0] -eq '"' -or $val[0] -eq "'") -and $val[$val.Length - 1] -eq $val[0]) { $val = $val.Substring(1, $val.Length - 2) }
-                if ($val.Trim() -and -not $script:CredentialPlaceholderRegex.IsMatch($val.Trim())) { return $pwAt }
-            }
-            $expect = ''
-            continue
-        }
-        switch ($w.ToLowerInvariant()) {
-            'machine' { $inRecord = $true; $expect = 'host' }
-            'default' { $inRecord = $true }
-            'login' { $inRecord = $true; $expect = 'login' }
-            'account' { if ($inRecord) { $expect = 'account' } }
-            'port' { if ($inRecord) { $expect = 'port' } }
-            'password' { if ($inRecord) { $expect = 'password'; $pwAt = $t.Index } }
-            default { $inRecord = $false }
-        }
+    if (-not $script:CredentialNetrcShapeRegex.IsMatch($Text)) { return -1 }
+    $pw = $script:CredentialNetrcPasswordRegex.Match($Text)
+    if ($pw.Success) { return $pw.Index }
+    return -1
+}
+
+# r15 (pass 12 A2): the XML element form. For every OPENING tag of a secret-named element (namespace prefix ignored) that is not self-closing, the value is the RAW
+# content from just after that tag to the first matching closing tag '</name>' (or to the end of the text when it is never closed). Nothing is removed first: a
+# comment, a CDATA section or a child element is content. Exempt only when that content is empty after trimming outer whitespace (an element with no content at
+# all) or one of the closed literals of Test-CredentialValueExempt. Returns the index of the opening tag, -1 when there is none.
+function Get-CredentialXmlHitIndex {
+    param([string]$Text)
+    foreach ($xm in $script:CredentialXmlOpenRegex.Matches($Text)) {
+        $name = $xm.Groups[1].Value
+        if (-not (Get-CredentialKeyClass ($name -replace '^.*:', ''))) { continue }
+        if ($xm.Value.EndsWith('/>')) { continue }   # '<password/>', '<password x="1" />': no content at all (its attributes are judged by the line form)
+        $start = $xm.Index + $xm.Length
+        $close = [regex]::new('(?i)</' + [regex]::Escape($name) + '\s*>').Match($Text, $start)
+        $content = $(if ($close.Success) { $Text.Substring($start, $close.Index - $start) } else { $Text.Substring($start) })
+        if (Test-CredentialValueExempt $content) { continue }
+        return $xm.Index
     }
     return -1
 }
@@ -949,16 +956,8 @@ function Get-CredentialHitIndex {
     $best = -1
     $m = $script:SecretShapeRegex.Match($Text)
     if ($m.Success) { $best = $m.Index }
-    $xml = -1
-    foreach ($xm in $script:CredentialXmlRegex.Matches($Text)) {
-        $class = Get-CredentialKeyClass ($xm.Groups[1].Value -replace '^.*:', '')
-        if (-not $class) { continue }
-        $xv = [regex]::Replace($xm.Groups[2].Value, '<!--[\s\S]*?-->', '')
-        $xv = $xv -replace '<!\[CDATA\[', '' -replace '\]\]>', ''
-        $xv = [regex]::Replace($xv, '<[^<>]*>', ' ')
-        if (Test-CredentialValueExempt -Value @{ Kind = 'plain'; Value = $xv } -Class $class) { continue }
-        $xml = $xm.Index; break
-    }
+    # r15: the XML element form (Get-CredentialXmlHitIndex) judges the element's RAW content; the comment, CDATA and markup strip of r14 (pass 12 A2) is gone
+    $xml = Get-CredentialXmlHitIndex $Text
     foreach ($i in @((Get-CredentialKeyValueHitIndex $Text), (Get-CredentialNetrcHitIndex $Text), $xml)) {
         if ($i -ge 0 -and ($best -lt 0 -or $i -lt $best)) { $best = $i }
     }
@@ -1119,6 +1118,33 @@ function Test-StagedBundleClean {
     }
 }
 
+# r15 (pass 12 A6): delete a file and PROVE it is gone. Remove-Item runs with -ErrorAction Stop. When the delete is refused (another process holds the file open),
+# the file is renamed aside to '<name>.undeleted-<id>' so it no longer stands at its usable name (the transfer name of a bundle, the name of a backup), and the
+# result says where it is. It is never reported as deleted unless Test-Path is false afterwards. Returns @{ Deleted; Path (where it is now, '' when deleted); Why }.
+function Remove-FileVerified {
+    param([string]$Path)
+    $why = ''
+    try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { $why = $_.Exception.Message }
+    if (-not (Test-Path -LiteralPath $Path)) { return @{ Deleted = $true; Path = ''; Why = '' } }
+    if (-not $why) { $why = 'the file is still present after Remove-Item' }
+    $aside = $Path + '.undeleted-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    try {
+        [IO.File]::Move($Path, $aside)
+        if (-not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $aside)) { return @{ Deleted = $false; Path = $aside; Why = "$why (renamed aside)" } }
+    } catch { $why = "$why; the rename aside failed too: $($_.Exception.Message)" }
+    return @{ Deleted = $false; Path = $Path; Why = $why }
+}
+
+# r15 (pass 12 A6): an archive that fails the post-archive secret scan is deleted, and the delete is proven (Remove-FileVerified). Always throws: the plain
+# message when the archive is gone, or the typed EXPORT_CREDENTIAL_ZIP_NOT_DELETED <path> (recorded in the run's failures too) when it still exists anywhere.
+function Remove-RejectedArchive {
+    param([string]$Zip, [string[]]$Late)
+    $r = Remove-FileVerified $Zip
+    if ($r.Deleted) { throw "the archive (or a staged file it was made from) fails the secret scan, so the archive was deleted: $($Late -join '; ')" }
+    $script:Failures.Add("EXPORT_CREDENTIAL_ZIP_NOT_DELETED $($r.Path)")
+    throw "EXPORT_CREDENTIAL_ZIP_NOT_DELETED $($r.Path) (the archive fails the secret scan and could NOT be deleted: $($r.Why); delete it by hand and never transfer it): $($Late -join '; ')"
+}
+
 function Invoke-PhaseExport {
     $stage = Join-Path $ExportDir "bundle-$stamp"
     $ref = Join-Path $stage 'reference'
@@ -1210,10 +1236,9 @@ function Invoke-PhaseExport {
         # the archive may hold it, so the archive is deleted and the run fails (the bundle is never offered).
         # r10 A3: judge the ARCHIVE'S OWN entries (what would be offered), not the stage, which can change again between tar and this check.
         $late = @(Get-ArchiveCredentialHits -Zip $zip) + @(Get-StagedCredentialHits -Stage $stage)
-        if ($late.Count) {
-            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-            throw "the archive (or a staged file it was made from) fails the secret scan, so the archive was deleted: $($late -join '; ')"
-        }
+        # r15 (pass 12 A6): the delete is PROVEN (Remove-RejectedArchive): a refused delete renames the archive aside and fails typed EXPORT_CREDENTIAL_ZIP_NOT_DELETED
+        # with its path; it is never reported as deleted while it still exists.
+        if ($late.Count) { Remove-RejectedArchive -Zip $zip -Late $late }
         $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
         Write-AsciiFile "$zip.sha256" "$hash  $(Split-Path -Leaf $zip)`r`n"
         Write-Log "bundle $zip sha256=$hash files=$($files.Count) bytes=$sum" 'OK'
@@ -1339,7 +1364,14 @@ function Copy-ImportFileLocked {
                 [IO.File]::SetLastWriteTimeUtc($fs.SafeFileHandle, $Source.LastWriteTimeUtc)
                 if ($script:ImportAfterWriteHook) { & $script:ImportAfterWriteHook $Dest }
             }
-            catch { $fs.Dispose(); $fs = $null; Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue; throw }
+            catch {
+                $orig = $_
+                $fs.Dispose(); $fs = $null
+                # r15 (pass 12 A6 sibling): the half-written new file's removal is proven; one that cannot be removed fails typed with its path
+                $rm = Remove-FileVerified $Dest
+                if (-not $rm.Deleted) { throw "IMPORT_PARTIAL_NOT_DELETED $($rm.Path) ($($rm.Why)) after: $($orig.Exception.Message)" }
+                throw $orig
+            }
             $fs.Dispose(); $fs = $null
             $keepAttr = $Source.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)
             if ($keepAttr) { [IO.File]::SetAttributes($Dest, ([IO.File]::GetAttributes($Dest) -bor $keepAttr)) }
@@ -1419,7 +1451,11 @@ function Set-ImportFileContentAtomic {
         if ($script:ImportWriteFaultHook) { & $script:ImportWriteFaultHook $Dest }
         $ts.Write($Bytes, $half, $Bytes.Length - $half)
         $ts.Flush($true)
-        if ($null -ne $WriteTimeUtc) { [IO.File]::SetLastWriteTimeUtc($ts.SafeFileHandle, [datetime]$WriteTimeUtc) }   # (PowerShell unwraps the Nullable: no .Value)
+        # r15 (pass 12 A4): this run's file is identified by its SHA-256 AND its last-write time, so the time is always set explicitly through the handle (the bundle
+        # time when one is given, else now) and recorded; the rollback below compares both.
+        $ourTime = $(if ($null -ne $WriteTimeUtc) { [datetime]$WriteTimeUtc } else { [DateTime]::UtcNow })   # (PowerShell unwraps the Nullable: no .Value)
+        [IO.File]::SetLastWriteTimeUtc($ts.SafeFileHandle, $ourTime)
+        $ourHash = Get-ImportBytesHash $Bytes
         $ts.Dispose(); $ts = $null
         if ($script:ImportAfterWriteHook) { & $script:ImportAfterWriteHook $Dest }
         # r14 pass 11 A4: the judged identity is the bytes AND the last-write time, read under the lock (an identical save with a newer time is a newer file)
@@ -1428,9 +1464,14 @@ function Set-ImportFileContentAtomic {
         if ($script:ImportBeforeSwapHook) { & $script:ImportBeforeSwapHook $Dest }
         [IO.File]::Replace($tmp, $Dest, $bak, $true)
     } catch {
+        $orig = $_
         if ($ts) { $ts.Dispose() }
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-        throw
+        # r15 (pass 12 A6 sibling): the temp file's removal is proven; one that cannot be removed fails typed with its path
+        if (Test-Path -LiteralPath $tmp) {
+            $rm = Remove-FileVerified $tmp
+            if (-not $rm.Deleted) { throw "IMPORT_TEMP_NOT_DELETED $($rm.Path) ($($rm.Why)) after: $($orig.Exception.Message)" }
+        }
+        throw $orig
     }
     if ($script:ImportAfterSwapHook) { & $script:ImportAfterSwapHook $Dest }
     # r14 pass 11 A5: every step after the swap is guarded; an error never deletes the backup (the host's previous file survives in it, named in the error).
@@ -1439,26 +1480,47 @@ function Set-ImportFileContentAtomic {
         $wasTime = [IO.File]::GetLastWriteTimeUtc($bak)
     } catch { throw "IMPORT_REPLACE_UNVERIFIED $Dest (the previous host file is kept at $bak and could not be read back: $($_.Exception.Message))" }
     if ((Get-ImportBytesHash $was) -ceq (Get-ImportBytesHash $JudgedBytes) -and $wasTime -eq $judgedTime) {
-        Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+        # r15 (pass 12 A6): the backup's removal is proven (Remove-FileVerified); one that cannot be removed fails typed with its path, never silently kept
+        $rm = Remove-FileVerified $bak
+        if (-not $rm.Deleted) { throw "IMPORT_ROLLBACK_BACKUP_NOT_DELETED $($rm.Path) (the previous host file of $Dest could not be removed: $($rm.Why))" }
         return 'replaced'
     }
-    # Someone saved between the release and the swap. Put their file back ONLY while the host path still holds exactly this run's bytes, under an exclusive lock; a save
-    # that landed after the swap is newer still and is kept (the superseded backup is then removed).
+    # Someone saved between the release and the swap; their file is in $bak. r15 (pass 12 A4 / A5): put it back with ONE File.Replace(backup, dest, aside) done
+    # UNDER a lock that is never released before that Replace. The lock (FileShare Read|Delete) blocks every in-place writer and still lets File.Replace swap the
+    # path. What stood at the host path at the instant of the Replace lands in the aside, so nothing can be overwritten unseen: the aside must be THIS run's file,
+    # by its SHA-256 AND its last-write time ($ourHash / $ourTime). When either differs (an identical-bytes save with a newer time, or a rename-over save the lock
+    # cannot block), that newer save is put back at once and the rollback refuses typed IMPORT_ROLLBACK_DEST_CHANGED; the older interleaved save is kept and named.
     $h = $null
+    $aside = "$base.aside"
     try {
-        try { $h = [IO.File]::Open($Dest, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+        try { $h = [IO.File]::Open($Dest, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)) }
         catch { throw "IMPORT_REPLACE_UNVERIFIED $Dest (an interleaved save is kept at $bak; the host file could not be locked to restore it: $($_.Exception.Message))" }
-        $now = Read-ImportHeldBytes $h
-        if ((Get-ImportBytesHash $now) -cne (Get-ImportBytesHash $Bytes)) {
-            $h.Dispose(); $h = $null
-            Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
-            return 'changed'
-        }
+        if ($script:ImportBeforeRollbackHook) { & $script:ImportBeforeRollbackHook $Dest }
+        [IO.File]::Replace($bak, $Dest, $aside, $true)   # while $h is still held
         $h.Dispose(); $h = $null
-        [IO.File]::Replace($bak, $Dest, [NullString]::Value, $true)   # (PowerShell would pass $null as '' to a .NET string: no backup is wanted here)
+        try {
+            $asideBytes = [IO.File]::ReadAllBytes($aside)
+            $asideTime = [IO.File]::GetLastWriteTimeUtc($aside)
+        } catch { throw "IMPORT_REPLACE_UNVERIFIED $Dest (the interleaved save was restored; the file it displaced is kept at $aside and could not be read back: $($_.Exception.Message))" }
+        if ((Get-ImportBytesHash $asideBytes) -cne $ourHash -or $asideTime -ne $ourTime) {
+            $older = "$base.older"
+            try { [IO.File]::Replace($aside, $Dest, $older, $true) }
+            catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a save landed while the rollback ran and is kept at $aside; putting it back failed: $($_.Exception.Message); the older interleaved save is at $Dest)" }
+            # the displaced file is the older interleaved save read above (bytes AND time): superseded by the newer save, it is removed (proven). Anything else is kept.
+            $olderNote = "the older interleaved save is kept at $older"
+            try {
+                if ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($older))) -ceq (Get-ImportBytesHash $was) -and [IO.File]::GetLastWriteTimeUtc($older) -eq $wasTime) {
+                    $rm = Remove-FileVerified $older
+                    $olderNote = $(if ($rm.Deleted) { 'the older interleaved save it superseded was removed' } else { "the older interleaved save could NOT be removed and is at $($rm.Path) ($($rm.Why))" })
+                }
+            } catch { $olderNote = "$olderNote (it could not be read back: $($_.Exception.Message))" }
+            throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a save landed while the rollback ran; it was put back at $Dest; $olderNote)"
+        }
+        $rm = Remove-FileVerified $aside
+        if (-not $rm.Deleted) { throw "IMPORT_ROLLBACK_BACKUP_NOT_DELETED $($rm.Path) (this run's displaced copy of $Dest could not be removed: $($rm.Why))" }
         return 'changed'
     } catch {
-        if ($_.Exception.Message -like 'IMPORT_REPLACE_UNVERIFIED*') { throw }
+        if ($_.Exception.Message -match '^IMPORT_[A-Z_]+ ') { throw }
         throw "IMPORT_REPLACE_UNVERIFIED $Dest (an interleaved save is kept at $bak; restoring it failed: $($_.Exception.Message))"
     } finally { if ($h) { $h.Dispose() } }
 }
@@ -1558,6 +1620,9 @@ $script:ImportWriteFaultHook = $null
 # Both stand for an editor saving in that instant. Always $null in a real run.
 $script:ImportBeforeSwapHook = $null
 $script:ImportAfterSwapHook = $null
+# Test seam for r15 (pass 12 A5): called with the destination path while the rollback holds its lock on the host file, right before the rollback's File.Replace. It stands
+# for an editor saving in that instant (an in-place write is refused by the lock; a rename-over save lands and must be put back). Always $null in a real run.
+$script:ImportBeforeRollbackHook = $null
 
 # r12 A3: the settings.json profile rewrite (VIRTUAL-TEN profile -> this profile) as ONE locked read-judge-write on the host file, the same discipline as
 # Copy-ImportFileLocked: the file is opened exclusively (FileShare.None), read, judged by Test-CredentialText, and written back through the SAME handle. It used to be
@@ -1615,7 +1680,14 @@ function Copy-CleanBackupFile {
         [IO.File]::WriteAllBytes($dest, $bytes)
         return $true
     } catch {
-        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        # r15 (pass 12 A6 sibling): a partly written backup copy is removed and the removal is proven; one that cannot be removed is a typed failure of the run
+        if (Test-Path -LiteralPath $dest) {
+            $rm = Remove-FileVerified $dest
+            if (-not $rm.Deleted) {
+                Write-Log "IMPORT_BACKUP_NOT_DELETED $($rm.Path) ($($rm.Why))" 'ERROR'
+                $script:Failures.Add("IMPORT_BACKUP_NOT_DELETED $($rm.Path)")
+            }
+        }
         return $false
     }
 }
