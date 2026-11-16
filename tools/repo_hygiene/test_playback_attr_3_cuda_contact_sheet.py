@@ -870,7 +870,9 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         # with -match or (?i), which follow the process culture (tr-TR skipped an upper-case marker)
         for prefix in ("$recordStart + 'playback_smoke", "$ux + 'playback_smoke"):
             self.assertNotIn("-match (" + prefix, text)
-        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant'))"), 7)
+        # r13 (r12 adversary A1 siblings :3810/:3821): the anchored summary and conform re-picks are the eighth and ninth
+        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant'))"), 9)
+        self.assertNotIn("-match ($sourceFramesRecordStart", text)
         artifacts = (ATTRIBUTION_GENERATOR.parent / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
         region = artifacts[artifacts.index("    $sessionLine = {"):artifacts.index("    $telemetry = {")]
         self.assertNotIn("'(?i", region)  # no inline (?i) / (?i: regex literal (the comments may name it)
