@@ -1239,6 +1239,14 @@ $r14Hit = [ordered]@{
     'class: an XML element'                                = '<configuration><DbPassword>hunter2</DbPassword></configuration>'
     'class: a URL with a user and a password'              = 'url = https://alice:hunter2@example.org/repo.git'
     'class: an all-digit value under a plain TOKEN key'    = 'GH_TOKEN=123456'
+    'p11 A1 a sequence whose later element is a secret'    = '{"password":["","hunter2"]}'
+    'p11 A1 a sequence that starts with false'             = 'password: [false, hunter2]'
+    'p11 A1 a sequence that starts with a placeholder'     = '{"password":["${DB_PASSWORD}", "hunter2"]}'
+    'p11 A2 a block scalar whose first line is false'      = "password: |`n  false`n  hunter2`n"
+    'p11 A2 a plain scalar continued on the next line'     = "password:`n  false`n  hunter2`n"
+    'p11 A2 a line value continued on the next line'       = "password: false`n  hunter2`n"
+    'p11 A3 an XML CDATA value'                            = '<password><![CDATA[hunter2]]></password>'
+    'p11 A3 an XML value inside a child element'           = '<password><value>hunter2</value></password>'
 }
 $r14Ok = [ordered]@{
     'a block key with nothing after it'                    = "password:`n"
@@ -1252,6 +1260,10 @@ $r14Ok = [ordered]@{
     'author is not auth'                                   = 'author: Layi'
     'an empty XML element'                                 = '<password></password>'
     'a URL with a user only'                               = 'url = ssh://git@github.com/org/repo.git'
+    'p11 an empty sequence'                                = 'password: []'
+    'p11 a sequence of exempt elements'                    = '{"password":["", false]}'
+    'p11 a block boolean followed by a sibling key'        = "password:`n  false`nother: 1`n"
+    'p11 an XML comment only'                              = '<password><!-- set by hand --></password>'
 }
 if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r14 A1-A3')) {
     foreach ($k in $r14Hit.Keys) { Assert-That (Test-CredentialText $r14Hit[$k]) "r14 $k is a credential (Test-CredentialText)" $r14Hit[$k] }
@@ -1345,6 +1357,32 @@ if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r14 A5')) {
         Assert-That (@(Get-ChildItem -LiteralPath (Split-Path -Parent $a5s) -Force).Count -eq 2) 'r14 A5 import: no temp or backup file is left beside settings.json' ((Get-ChildItem -LiteralPath (Split-Path -Parent $a5s) -Force | ForEach-Object Name) -join ';')
     }
     $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r14 pass 11 A4 / A5: a save between the lock release and the swap, or after the swap, is never lost
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r14 p11 A4')) {
+    $p11 = New-Scratch 'r14-p11'
+    $p11Src = Join-Path $p11 'bundle\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $p11Src))
+    [IO.File]::WriteAllText($p11Src, '{"v":"bundle"}'); (Get-Item -LiteralPath $p11Src).LastWriteTimeUtc = [DateTime]::new(2026, 11, 15, 12, 0, 0, [DateTimeKind]::Utc)
+    $p11Dst = Join-Path $p11 'host\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $p11Dst))
+    $p11Newer = [DateTime]::new(2026, 11, 16, 12, 0, 0, [DateTimeKind]::Utc)
+    # A4: an editor saves IDENTICAL bytes with a newer time in the instant between the lock release and the swap
+    [IO.File]::WriteAllText($p11Dst, '{"v":"host"}'); (Get-Item -LiteralPath $p11Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 14, 12, 0, 0, [DateTimeKind]::Utc)
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"v":"host"}'); [IO.File]::SetLastWriteTimeUtc($Dest, [DateTime]::new(2026, 11, 16, 12, 0, 0, [DateTimeKind]::Utc)) }
+    try { $p11r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($p11Src)) -Dest $p11Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false } catch { $p11r = @{ Result = "threw: $($_.Exception.Message)" } } finally { $script:ImportBeforeSwapHook = $null }
+    Assert-That (([IO.File]::ReadAllText($p11Dst)) -ceq '{"v":"host"}' -and [IO.File]::GetLastWriteTimeUtc($p11Dst) -eq $p11Newer -and $p11r.Result -ceq 'changed') 'r14 p11 A4 import: a newer save with identical bytes in the swap window is kept (result changed)' "$($p11r.Result) $([IO.File]::ReadAllText($p11Dst)) $([IO.File]::GetLastWriteTimeUtc($p11Dst).ToString('o'))"
+    # A5: one save before the swap (owner-v1), a second after it (owner-v2): the newest save survives, nothing rolls it back
+    [IO.File]::WriteAllText($p11Dst, '{"v":"host"}'); (Get-Item -LiteralPath $p11Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 14, 12, 0, 0, [DateTimeKind]::Utc)
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v1"}') }
+    $script:ImportAfterSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v2"}') }
+    try { $p11r2 = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($p11Src)) -Dest $p11Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false } catch { $p11r2 = @{ Result = "threw: $($_.Exception.Message)" } } finally { $script:ImportBeforeSwapHook = $null; $script:ImportAfterSwapHook = $null }
+    Assert-That (([IO.File]::ReadAllText($p11Dst)) -ceq '{"api_key":"owner-v2"}' -and $p11r2.Result -ceq 'changed') 'r14 p11 A5 import: a save after the swap is the newest and is kept (no unconditional rollback)' "$($p11r2.Result) $([IO.File]::ReadAllText($p11Dst))"
+    Assert-That (@(Get-ChildItem -LiteralPath (Split-Path -Parent $p11Dst) -Force).Count -eq 1) 'r14 p11 A5 import: no temp or backup file is left beside the host file' ((Get-ChildItem -LiteralPath (Split-Path -Parent $p11Dst) -Force | ForEach-Object Name) -join ';')
+    # A5: a save before the swap only: it is put back
+    [IO.File]::WriteAllText($p11Dst, '{"v":"host"}'); (Get-Item -LiteralPath $p11Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 14, 12, 0, 0, [DateTimeKind]::Utc)
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v1"}') }
+    try { $p11r3 = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($p11Src)) -Dest $p11Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false } catch { $p11r3 = @{ Result = "threw: $($_.Exception.Message)" } } finally { $script:ImportBeforeSwapHook = $null }
+    Assert-That (([IO.File]::ReadAllText($p11Dst)) -ceq '{"api_key":"owner-v1"}' -and $p11r3.Result -ceq 'changed') 'r14 p11 A5 import: a save in the swap window is put back (result changed)' "$($p11r3.Result) $([IO.File]::ReadAllText($p11Dst))"
 }
 
 # ---------------------------------------------------------------- r14 A6: SSH fails closed even when a log write throws after sshd was started and its firewall opened

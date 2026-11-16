@@ -714,7 +714,8 @@ $SecretPatterns = @(
     '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"''<>]+:[^\s/@"''<>]+@'
 )
 # r14: the XML element form of the key/value rule ('<password>hunter2</password>', '<DbPassword>x</DbPassword>'); the attribute form 'password="x"' is the line form.
-$script:CredentialXmlRegex = [regex]::new('(?i)<([A-Za-z0-9_.\-:]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-:]*)(?:\s[^<>]*)?>([^<]*)</\1\s*>')
+# r14 pass 11 A3: the element's whole content is its value, CDATA sections and child elements included (markup, CDATA delimiters and comments are removed before judging).
+$script:CredentialXmlRegex = [regex]::new('(?i)<([A-Za-z0-9_.\-:]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-:]*)(?:\s[^<>]*)?>([\s\S]*?)</\1\s*>')
 $script:SecretShapeRegex = [regex]::new(($SecretPatterns -join '|'))
 
 # '' = not a secret-named key; 'strong' = the key says its value is a secret; 'count' = a TOKEN key (its unquoted all-digit value is a count, not a secret).
@@ -773,10 +774,18 @@ function Read-CredentialValueAt {
         return @{ Kind = 'plain'; Value = '{' + $inside + '}' }   # '{hunter2}' is a scalar
     }
     if ($c -eq '[') {
-        $j = $At + 1
-        while ($j -lt $n -and [char]::IsWhiteSpace($Text[$j])) { $j++ }
-        if ($j -ge $n -or $Text[$j] -eq ']') { return @{ Kind = 'empty'; Value = '' } }
-        return (Read-CredentialValueAt -Text $Text -At $j -Flow $true)   # a sequence: its first element is the value
+        # r14 pass 11 A1: a sequence is judged as a WHOLE: every element must be exempt ('["","hunter2"]' is a hit). Mappings inside it are judged where they stand.
+        $close = $Text.IndexOf(']', $At + 1)
+        $inside = $(if ($close -lt 0) { $Text.Substring($At + 1) } else { $Text.Substring($At + 1, $close - $At - 1) })
+        $inside = [regex]::Replace($inside, '\{[^{}]*\}', '')
+        foreach ($piece in ($inside -split ',')) {
+            $e = $piece.Trim()
+            if (-not $e) { continue }
+            $kind = 'plain'
+            if ($e.Length -ge 2 -and ($e[0] -eq '"' -or $e[0] -eq "'") -and $e[$e.Length - 1] -eq $e[0]) { $kind = 'quoted'; $e = $e.Substring(1, $e.Length - 2) }
+            if (-not (Test-CredentialValueExempt -Value @{ Kind = $kind; Value = $e } -Class 'strong')) { return @{ Kind = 'plain'; Value = $piece } }
+        }
+        return @{ Kind = 'empty'; Value = '' }
     }
     return @{ Kind = 'plain'; Value = (Get-CredentialPlainSpan $Text $At $Flow) }
 }
@@ -798,6 +807,29 @@ function Get-CredentialNextValueLine {
         return $q
     }
     return -1
+}
+
+# r14 pass 11 A2: the text of the lines after $From (a line break or the end) that are more indented than the key ($KeyIndent), up to the first non-blank line that is
+# not; blank lines are skipped, and '#' comment lines too unless -KeepComments (a block scalar's '#' is content). Joined with blanks.
+function Get-CredentialIndentedBlock {
+    param([string]$Text, [int]$From, [int]$KeyIndent, [bool]$KeepComments)
+    $n = $Text.Length
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $p = $From
+    while ($p -lt $n) {
+        $nl = $Text.IndexOf("`n", $p)
+        if ($nl -lt 0) { break }
+        $s = $nl + 1
+        $e = $Text.IndexOf("`n", $s); if ($e -lt 0) { $e = $n }
+        $line = $Text.Substring($s, $e - $s).TrimEnd("`r")
+        $p = $e
+        if (-not $line.Trim()) { continue }
+        $ind = $line.Length - $line.TrimStart(' ', "`t").Length
+        if ($ind -le $KeyIndent) { break }
+        if (-not $KeepComments -and $line.TrimStart().StartsWith('#')) { continue }
+        $parts.Add($line.Trim())
+    }
+    return ($parts -join ' ')
 }
 
 # True when the key at $KeyStart stands inside a flow mapping: the previous non-blank character (line breaks included) is '{', or a ',' (for '=' only when a '{'
@@ -847,14 +879,30 @@ function Get-CredentialKeyValueHitIndex {
         $lineEnd = $Text.IndexOfAny([char[]]"`r`n", [Math]::Min($p, $n))
         if ($lineEnd -lt 0) { $lineEnd = $n }
         $rest = $Text.Substring($p, $lineEnd - $p)
+        $ls0 = $Text.LastIndexOf("`n", [Math]::Max(0, $keyStart - 1)) + 1
+        if ($keyStart -eq 0) { $ls0 = 0 }
+        $keyIndent = 0
+        while ($ls0 + $keyIndent -lt $n -and ($Text[$ls0 + $keyIndent] -eq ' ' -or $Text[$ls0 + $keyIndent] -eq "`t")) { $keyIndent++ }
+        $v = $null
         if ($sep -eq ':') {
-            # block form: nothing on the key's line, a ' #' comment, or a YAML block scalar indicator ('|', '>-'): the value is the next non-blank, non-comment line
-            if (-not $rest.Trim() -or ($p -gt $blank -and $rest.StartsWith('#')) -or $rest -match '^[|>][0-9+\-]*[ \t]*(?:[ \t]#.*)?$') {
+            # r14 pass 11 A2: a YAML block scalar ('|', '>-') is ONE string, judged whole (every more-indented line after the key; only empty or a placeholder is exempt)
+            if ($rest -match '^[|>][0-9+\-]*[ \t]*(?:[ \t]#.*)?$') {
+                $blk = Get-CredentialIndentedBlock -Text $Text -From $lineEnd -KeyIndent $keyIndent -KeepComments $true
+                $v = @{ Kind = 'quoted'; Value = $blk }
+            }
+            # block form: nothing on the key's line or a ' #' comment: the value is the next non-blank, non-comment line
+            elseif (-not $rest.Trim() -or ($p -gt $blank -and $rest.StartsWith('#'))) {
                 $p = Get-CredentialNextValueLine $Text $lineEnd
                 if ($p -lt 0) { continue }
             }
         } elseif (-not $rest.Trim()) { continue }   # 'k=' with nothing after it is an explicit empty value
-        $v = Read-CredentialValueAt -Text $Text -At $p -Flow $flow
+        if (-not $v) { $v = Read-CredentialValueAt -Text $Text -At $p -Flow $flow }
+        # r14 pass 11 A2: a plain YAML scalar continues on every following line that is more indented than the key ('password: false\n  hunter2' is 'false hunter2')
+        if ($sep -eq ':' -and -not $flow -and $v.Kind -eq 'plain') {
+            $le = $Text.IndexOfAny([char[]]"`r`n", [Math]::Min($p, $n)); if ($le -lt 0) { $le = $n }
+            $more = Get-CredentialIndentedBlock -Text $Text -From $le -KeyIndent $keyIndent -KeepComments $false
+            if ($more.Trim()) { $v = @{ Kind = 'plain'; Value = ($v.Value + ' ' + $more).Trim() } }
+        }
         if ($v.Kind -eq 'empty' -or $v.Kind -eq 'container') { continue }
         if ($isVar -and $v.Kind -ne 'quoted') { continue }
         if (Test-CredentialValueExempt -Value $v -Class $class) { continue }
@@ -905,7 +953,10 @@ function Get-CredentialHitIndex {
     foreach ($xm in $script:CredentialXmlRegex.Matches($Text)) {
         $class = Get-CredentialKeyClass ($xm.Groups[1].Value -replace '^.*:', '')
         if (-not $class) { continue }
-        if (Test-CredentialValueExempt -Value @{ Kind = 'plain'; Value = $xm.Groups[2].Value } -Class $class) { continue }
+        $xv = [regex]::Replace($xm.Groups[2].Value, '<!--[\s\S]*?-->', '')
+        $xv = $xv -replace '<!\[CDATA\[', '' -replace '\]\]>', ''
+        $xv = [regex]::Replace($xv, '<[^<>]*>', ' ')
+        if (Test-CredentialValueExempt -Value @{ Kind = 'plain'; Value = $xv } -Class $class) { continue }
         $xml = $xm.Index; break
     }
     foreach ($i in @((Get-CredentialKeyValueHitIndex $Text), (Get-CredentialNetrcHitIndex $Text), $xml)) {
@@ -1371,20 +1422,45 @@ function Set-ImportFileContentAtomic {
         if ($null -ne $WriteTimeUtc) { [IO.File]::SetLastWriteTimeUtc($ts.SafeFileHandle, [datetime]$WriteTimeUtc) }   # (PowerShell unwraps the Nullable: no .Value)
         $ts.Dispose(); $ts = $null
         if ($script:ImportAfterWriteHook) { & $script:ImportAfterWriteHook $Dest }
+        # r14 pass 11 A4: the judged identity is the bytes AND the last-write time, read under the lock (an identical save with a newer time is a newer file)
+        $judgedTime = [IO.File]::GetLastWriteTimeUtc($Held.SafeFileHandle)
         $Held.Dispose()   # File.Replace cannot swap a file this run still holds open
+        if ($script:ImportBeforeSwapHook) { & $script:ImportBeforeSwapHook $Dest }
         [IO.File]::Replace($tmp, $Dest, $bak, $true)
     } catch {
         if ($ts) { $ts.Dispose() }
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         throw
     }
-    $was = [IO.File]::ReadAllBytes($bak)
-    if ((Get-ImportBytesHash $was) -cne (Get-ImportBytesHash $JudgedBytes)) {
-        [IO.File]::Replace($bak, $Dest, $null, $true)
-        return 'changed'
+    if ($script:ImportAfterSwapHook) { & $script:ImportAfterSwapHook $Dest }
+    # r14 pass 11 A5: every step after the swap is guarded; an error never deletes the backup (the host's previous file survives in it, named in the error).
+    try {
+        $was = [IO.File]::ReadAllBytes($bak)
+        $wasTime = [IO.File]::GetLastWriteTimeUtc($bak)
+    } catch { throw "IMPORT_REPLACE_UNVERIFIED $Dest (the previous host file is kept at $bak and could not be read back: $($_.Exception.Message))" }
+    if ((Get-ImportBytesHash $was) -ceq (Get-ImportBytesHash $JudgedBytes) -and $wasTime -eq $judgedTime) {
+        Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+        return 'replaced'
     }
-    Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
-    return 'replaced'
+    # Someone saved between the release and the swap. Put their file back ONLY while the host path still holds exactly this run's bytes, under an exclusive lock; a save
+    # that landed after the swap is newer still and is kept (the superseded backup is then removed).
+    $h = $null
+    try {
+        try { $h = [IO.File]::Open($Dest, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+        catch { throw "IMPORT_REPLACE_UNVERIFIED $Dest (an interleaved save is kept at $bak; the host file could not be locked to restore it: $($_.Exception.Message))" }
+        $now = Read-ImportHeldBytes $h
+        if ((Get-ImportBytesHash $now) -cne (Get-ImportBytesHash $Bytes)) {
+            $h.Dispose(); $h = $null
+            Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+            return 'changed'
+        }
+        $h.Dispose(); $h = $null
+        [IO.File]::Replace($bak, $Dest, [NullString]::Value, $true)   # (PowerShell would pass $null as '' to a .NET string: no backup is wanted here)
+        return 'changed'
+    } catch {
+        if ($_.Exception.Message -like 'IMPORT_REPLACE_UNVERIFIED*') { throw }
+        throw "IMPORT_REPLACE_UNVERIFIED $Dest (an interleaved save is kept at $bak; restoring it failed: $($_.Exception.Message))"
+    } finally { if ($h) { $h.Dispose() } }
 }
 
 # One Import copy that refuses credential-bearing files (r3 A5) and replaces nothing it has not judged under a lock (r11 S-B2). Reads the same switches the
@@ -1478,6 +1554,10 @@ $script:ImportSettingsRewriteHook = $null
 # Test seam for r14 A5 (Set-ImportFileContentAtomic): a scriptblock called with the destination path halfway through writing the replacement; a throw stands for the write
 # failing (a full disk). Always $null in a real run.
 $script:ImportWriteFaultHook = $null
+# Test seams for r14 pass 11 A4 / A5: called with the destination path (a) after the host file's lock is released and before File.Replace, (b) right after File.Replace.
+# Both stand for an editor saving in that instant. Always $null in a real run.
+$script:ImportBeforeSwapHook = $null
+$script:ImportAfterSwapHook = $null
 
 # r12 A3: the settings.json profile rewrite (VIRTUAL-TEN profile -> this profile) as ONE locked read-judge-write on the host file, the same discipline as
 # Copy-ImportFileLocked: the file is opened exclusively (FileShare.None), read, judged by Test-CredentialText, and written back through the SAME handle. It used to be
