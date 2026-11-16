@@ -1880,6 +1880,25 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("DLLPAIR_UNBOUND", second.stdout)
         self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
 
+    def test_r22_the_test_only_hold_never_sleeps_past_its_max_sec(self) -> None:
+        # r22 (VENUE-STAGE-TEST-HOLD-DEADLINE-1, sol r21 hardening, AttrCudaArtifacts.psm1:637-640): the last 100 ms sleep is cut to what is left of -MaxSec, so the hold returns by -MaxSec
+        # (a stopwatch cannot pin a 100 ms overshoot on a loaded host, so the clamp is pinned in the function's own text and the behaviour by its coarse bound and its marker)
+        text = MODULE.read_text(encoding="utf-8")
+        body = text[text.index("function Wait-AttrCudaTestHold"):text.index("function Get-AttrCudaGitBlobHashFromBytes")]
+        self.assertIn("$napMs = [int](($MaxSec - $clock.Elapsed.TotalSeconds) * 1000.0); if ($napMs -gt 100) { $napMs = 100 }", body)
+        self.assertIn("Start-Sleep -Milliseconds $napMs", body)
+        self.assertNotIn("Start-Sleep -Milliseconds 100", body)
+        hold = self.tmp / "never-created.flag"
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$t = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"Wait-AttrCudaTestHold -Path '{hold}' -MaxSec 1\n"
+                  "[Console]::Out.WriteLine($t.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture))\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(Path(str(hold) + ".reached").exists(), "the hold did not mark that it was reached")
+        self.assertGreaterEqual(float(out.stdout.strip().splitlines()[-1]), 0.95, out.stdout)
+        self.assertLess(float(out.stdout.strip().splitlines()[-1]), 5.0, out.stdout)
+
 
 # --------------------------------------------------------------------------------------------
 # (f) ATTR3-FIXTURE-STAGE-1: -ClipPath becomes optional for a fixture id, gated on

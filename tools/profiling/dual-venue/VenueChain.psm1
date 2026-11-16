@@ -644,11 +644,21 @@ function Get-VenueStagedBuildManifest {
         [ValidateRange(0, 600000)][int]$TestPreHashDelayMs = 0,
         # r12 (adversary A1 on 7754d16e, sibling Invoke-VenueStageNightly.ps1:287/:300): the caller's own deadline as an instant. -CallCapSec becomes at most what is left
         # of it when this call's clock starts, so a delay between the caller's sample and this call never moves the call's end later. $null = none.
-        [Nullable[DateTime]]$CallDeadlineUtc = $null)
+        [Nullable[DateTime]]$CallDeadlineUtc = $null,
+        # r22 (sol r21 blocker = adversary pass-23 A1 on a8e76648): a caller whose budget is MONOTONIC (the lease batch's guard budget, a Stopwatch) hands it over as that Stopwatch and its
+        # end on it, never as a UTC instant: turning the remainder into an instant and back with a second UtcNow read let a forward wall-clock step (NTP, a VM resume) between the two
+        # reads read as the budget spent. -CallCapSec becomes at most what is left of (-CallBudgetEndSec - -CallBudgetClock.Elapsed) when this call's clock starts, so a delay
+        # between the caller's sample and this call still never moves the end later, and no wall-clock read sits between the two monotonic clocks. $null / 0 = none.
+        [Diagnostics.Stopwatch]$CallBudgetClock = $null, [double]$CallBudgetEndSec = 0)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
     $callClock = [Diagnostics.Stopwatch]::StartNew()
+    if ($null -ne $CallBudgetClock) {
+        # r22: what is left of the caller's budget, on the caller's own monotonic clock (a budget already spent is a cap of 0.001 s: UNREACHABLE below, never "no cap")
+        $bdCap = [Math]::Min(86400.0, [Math]::Max(0.001, $CallBudgetEndSec - $CallBudgetClock.Elapsed.TotalSeconds))
+        $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $bdCap) } else { $bdCap })
+    }
     if ($null -ne $CallDeadlineUtc) {
         # r12: the deadline left at the clock's start (a deadline already past is a cap of 0.001 s: UNREACHABLE below, never "no cap")
         # (PowerShell hands a [Nullable[DateTime]] parameter over as the DateTime itself: no .Value)
@@ -656,7 +666,7 @@ function Get-VenueStagedBuildManifest {
         # can only shorten the cap (the remainder is taken later), never add the stall to it
         $dlElapsed = $callClock.Elapsed.TotalSeconds
         if ($script:VenueTestDeadlineSampleDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestDeadlineSampleDelayMs) }
-        $dlCap = (([DateTime]$CallDeadlineUtc).ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds + $dlElapsed
+        $dlCap = (([DateTime]$CallDeadlineUtc).ToUniversalTime() - [DateTime]::UtcNow.AddSeconds($script:VenueTestUtcStepSec)).TotalSeconds + $dlElapsed
         $dlCap = [Math]::Min(86400.0, [Math]::Max(0.001, $dlCap))
         $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $dlCap) } else { $dlCap })
     }
@@ -715,7 +725,7 @@ function Get-VenueStagedBuildManifest {
         $capLeft = $CallCapSec - $readStartSec
         # r14 fix iteration 1 (adversary A1 on f7408e9f, sibling :723): the floor is $script:VenueMinReadSec (0.5 s), never 1: -TimeoutSec / -CallCapSec 1 (the least
         # they accept) less ANY preparation time was under 1 s, so the minimum bound could never read at all
-        if ($capLeft -lt $script:VenueMinReadSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2))$(if ($null -ne $CallDeadlineUtc) { ' (-CallDeadlineUtc ' + ([DateTime]$CallDeadlineUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) + ')' }) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $script:VenueMinReadSec)"; contentProblem = $null } }
+        if ($capLeft -lt $script:VenueMinReadSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2))$(if ($null -ne $CallDeadlineUtc) { ' (-CallDeadlineUtc ' + ([DateTime]$CallDeadlineUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) + ')' })$(if ($null -ne $CallBudgetClock) { ' (-CallBudgetEndSec ' + [Math]::Round($CallBudgetEndSec, 2).ToString([Globalization.CultureInfo]::InvariantCulture) + ' on the caller''s clock)' }) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $script:VenueMinReadSec)"; contentProblem = $null } }
     }
     # r13 (adversary A1 on 5fe750fa, siblings Invoke-VenueChain.ps1:354 / Invoke-VenueLeaseBatch.ps1:1250): the read ends at the BOUND's end on the call clock
     # ($boundEndSec: -TimeoutSec, or -CallCapSec when sooner), the end the hash below is measured against. r12 ended it at $readStartSec + -TimeoutSec, so time
@@ -859,6 +869,10 @@ $script:VenueMinReadSec = 0.5
 # caller between the two clock samples -CallDeadlineUtc is taken from, the second between a bounded read's launch and its wait (a descheduled caller).
 $script:VenueTestDeadlineSampleDelayMs = 0
 $script:VenueTestPreWaitDelayMs = 0
+# Test-only (r22, sol r21 blocker / adversary pass-23 A1): the wall clock Get-VenueStagedBuildManifest's -CallDeadlineUtc is read against is stepped forward this many seconds, as an
+# NTP/VM-resume step between a caller's own wall-clock sample and this call's is. Production leaves it 0. The lease batch no longer hands a monotonic budget over as an instant at
+# all (-CallBudgetClock/-CallBudgetEndSec), so a step cannot reach its call; -CallDeadlineUtc stays for the nightly, whose own cap is a UTC deadline end to end.
+$script:VenueTestUtcStepSec = 0
 
 function Complete-VenueProcess {
     <#

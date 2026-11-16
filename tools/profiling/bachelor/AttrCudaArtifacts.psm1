@@ -637,7 +637,11 @@ function Wait-AttrCudaTestHold {
     if ([string]::IsNullOrEmpty($Path)) { return }
     [IO.File]::WriteAllText("$Path.reached", '')
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    while (-not (Test-Path -LiteralPath $Path) -and $clock.Elapsed.TotalSeconds -lt $MaxSec) { Start-Sleep -Milliseconds 100 }
+    # r22 (VENUE-STAGE-TEST-HOLD-DEADLINE-1, sol r21 hardening): the last sleep is cut to what is left of -MaxSec, so the hold never returns later than -MaxSec (plus the one Test-Path)
+    while (-not (Test-Path -LiteralPath $Path) -and $clock.Elapsed.TotalSeconds -lt $MaxSec) {
+        $napMs = [int](($MaxSec - $clock.Elapsed.TotalSeconds) * 1000.0); if ($napMs -gt 100) { $napMs = 100 }; if ($napMs -lt 1) { $napMs = 1 }
+        Start-Sleep -Milliseconds $napMs
+    }
 }
 
 function Get-AttrCudaGitBlobHashFromBytes {
