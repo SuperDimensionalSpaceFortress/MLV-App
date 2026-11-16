@@ -1900,8 +1900,12 @@ TEST(LookLabelWiring, LabelReadsTheGradesStateAndUpdatesOnEveryChange)
     // Once per change: nothing is pushed when neither the text nor the fullscreen state changed.
     ASSERT_TRUE(update.contains(QStringLiteral(
         "if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;")));
-    ASSERT_TRUE(update.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( overlayText )")));
-    ASSERT_TRUE(update.contains(QStringLiteral("ui->graphicsView->setLookLabel(")));
+    // LOOK-LABEL-PLAYBACK-INFO-1: the corner push is factored into pushLookLabelOverlay (look line + info lines), which the
+    // change path calls once.
+    ASSERT_TRUE(update.contains(QStringLiteral("pushLookLabelOverlay();")));
+    const QString push = functionBody(mw, QStringLiteral("void MainWindow::pushLookLabelOverlay( void )"));
+    ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, !ui->actionPlay->isChecked() )")));
+    ASSERT_TRUE(push.contains(QStringLiteral("ui->graphicsView->setLookLabel(")));
     ASSERT_TRUE(update.contains(QStringLiteral("m_pLookLabelStatus->setText( text )")));
 
     // Every change path re-derives it: flavor, the switch (click and programmatic), fullscreen, the setting,

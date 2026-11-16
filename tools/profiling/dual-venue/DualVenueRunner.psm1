@@ -1602,9 +1602,11 @@ function Get-DvLookLabelEvidence {
             }
         }
     }
+    # r1 adversary A4: a counter past Int32 (or Int64) never throws here: it reads as Int64, or null when even that overflows.
+    $toCount = { param([string]$Digits) $n = [long]0; if ([long]::TryParse($Digits, [ref]$n)) { $n } else { $null } }
     $playing = $null
     if ($null -ne $p) {
-        $playing = [ordered]@{ shownText = [string]$p['shown']; infoShownText = [string]$p['infoShown']; surface = [string]$p['surface']; samples = [int]$p['samples'] }
+        $playing = [ordered]@{ shownText = [string]$p['shown']; infoShownText = [string]$p['infoShown']; surface = [string]$p['surface']; samples = (& $toCount ([string]$p['samples'])) }
     }
     if ($null -eq $m) {
         return [ordered]@{ source = 'absent from the run log'; lookLabelShown = $false; shownText = $null; expectedText = $null; surface = $null
@@ -1626,7 +1628,7 @@ function Get-DvLookLabelEvidence {
         expectedText = $expected
         surface = $surface
         showInFullscreen = ([int]$m['sif'] -eq 1)
-        waitMs = [int]$m['wait']
+        waitMs = (& $toCount ([string]$m['wait']))
         reason = $reason
         infoShownText = $(if ($infoPresent) { [string]$m['infoShown'] } else { $null })
         infoExpectedText = $(if ($infoPresent) { [string]$m['infoExpected'] } else { $null })

@@ -158,6 +158,9 @@ inline QString compose( const Facts &facts, const Toggles &toggles, bool include
     if( toggles.dualIso ) lineB << dualIsoField( facts );
     if( toggles.resolution ) lineB << resolutionField( facts );
     lineB.removeAll( QString() );
+    // r1 adversary A5: a field never adds a line of its own (a newline inside one reads as a space).
+    for( QString &field : lineA ) field.replace( QLatin1Char( '\n' ), QLatin1Char( ' ' ) );
+    for( QString &field : lineB ) field.replace( QLatin1Char( '\n' ), QLatin1Char( ' ' ) );
 
     QStringList lines;
     if( !lineA.isEmpty() ) lines << lineA.join( sep );

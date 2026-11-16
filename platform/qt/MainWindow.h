@@ -874,6 +874,27 @@ private:
     QString m_lookLabelOverlayText;         // what the corner surface was asked to draw (look line + info lines)
     bool m_lookLabelOverlayGpuWindow = false;
     playback_info_label::Toggles m_playbackInfoToggles;
+    // r1 adversary A1: the rate the label shows, a snapshot written ONLY at the fps meter's 250 ms gate and its reset.
+    double m_playbackInfoFpsShown = 0.0;
+    // r1 adversary A1/A3: the info inputs last relabelled for (refreshPlaybackInfoOnInputChange compares them, ints only).
+    struct PlaybackInfoInputs
+    {
+        int pipelineStatus = -1;
+        bool scopeCaveat = false;
+        int requestedScale = 0;
+        int presentedScale = 0;
+        bool requestContextValid = false;
+        int requestContextScale = 0;
+        bool gpuAmaze = false;
+        bool gpuBilinear = false;
+        bool operator==( const PlaybackInfoInputs &o ) const
+        {
+            return pipelineStatus == o.pipelineStatus && scopeCaveat == o.scopeCaveat && requestedScale == o.requestedScale
+                && presentedScale == o.presentedScale && requestContextValid == o.requestContextValid
+                && requestContextScale == o.requestContextScale && gpuAmaze == o.gpuAmaze && gpuBilinear == o.gpuBilinear;
+        }
+    };
+    PlaybackInfoInputs m_playbackInfoInputs;
     QString m_lookLabelPlayingShown;        // the last drawn corner text sampled at the fps hook while playing
     QString m_lookLabelPlayingSurface;
     int m_lookLabelPlayingSamples = 0;
@@ -2319,6 +2340,8 @@ private:
     playback_info_label::Facts playbackInfoFacts( void );
     // The presented pipeline status and the scope caveat, shared by the toolbar indicator and the info label.
     void presentedGpuPlaybackPipelineStatus( GpuPlaybackPipelineStatus &status, bool &scopePerformanceCaveat ) const;
+    // r1 adversary A1/A3: relabels only when a pipeline/scale/debayer input changed (int compares; safe per presented frame).
+    void refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus status, bool scopePerformanceCaveat );
     void setPlaybackInfoToggle( bool playback_info_label::Toggles::*field, bool on );
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );

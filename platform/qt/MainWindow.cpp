@@ -2956,6 +2956,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             }
             const bool fpsWasMeasured = m_playbackFpsEmaFrameMs > 0.0;
             m_playbackFpsEmaFrameMs = 0.0;
+            m_playbackInfoFpsShown = 0.0;
             m_lastPlaybackFpsStatusUpdateTime = QTime();
             lastDrawTime = QTime();
             // LOOK-LABEL-PLAYBACK-INFO-1: once per reset of a measured rate (this branch runs every idle tick).
@@ -3111,6 +3112,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 m_lastPlaybackFpsStatusUpdateTime = nowTime;
                 // LOOK-LABEL-PLAYBACK-INFO-1: the corner label's rate, on the same 250 ms gate (<= 4 Hz; re-rasterised
                 // only when the string changes), and the receipt's sample of what the corner drew while playing.
+                // r1 (adversary A1): the snapshot every other hook composes, so none of them shows a newer rate.
+                m_playbackInfoFpsShown = smoothedFps;
                 if( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) updatePlaybackInfoLabel();
                 if( m_lookLabelFullscreenShown && ui->actionPlay->isChecked() )
                 {
@@ -24196,6 +24199,9 @@ void MainWindow::updatePlaybackQualityIndicator( void )
     GpuPlaybackPipelineStatus gpuPlaybackPipelineStatus = GpuPlaybackPipelineStatus::Cpu;
     bool scopePerformanceCaveat = false;
     presentedGpuPlaybackPipelineStatus( gpuPlaybackPipelineStatus, scopePerformanceCaveat );
+    // LOOK-LABEL-PLAYBACK-INFO-1 r1 (adversary A1): before the cache-hit return, and only on an info-input change -- the cache
+    // below also holds Auto's per-frame decision stats, so relabelling past it ran once per frame.
+    refreshPlaybackInfoOnInputChange( gpuPlaybackPipelineStatus, scopePerformanceCaveat );
 
     const PlaybackQualityIndicatorCache currentCache =
     {
@@ -24526,7 +24532,21 @@ void MainWindow::updatePlaybackQualityIndicator( void )
 
     m_playbackQualityIndicatorCache = currentCache;
     m_playbackQualityIndicatorCacheValid = true;
-    // LOOK-LABEL-PLAYBACK-INFO-1: a changed pipeline or scale relabels the info lines (after the cache-hit return: change-only).
+}
+
+void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus status, bool scopePerformanceCaveat )
+{
+    PlaybackInfoInputs inputs;
+    inputs.pipelineStatus = static_cast<int>( status );
+    inputs.scopeCaveat = scopePerformanceCaveat;
+    inputs.requestedScale = playbackScaleFactorPolicyDecision();
+    inputs.presentedScale = m_lastPresentedPlaybackScaleFactorActive;
+    inputs.requestContextValid = m_lastPresentedRequestContextValid;
+    inputs.requestContextScale = m_lastPresentedRequestContext.playbackScaleFactor;
+    inputs.gpuAmaze = m_lastPresentedFrameUsedGpuAmazeDebayer;
+    inputs.gpuBilinear = m_lastPresentedFrameUsedGpuBilinearDebayer;
+    if( inputs == m_playbackInfoInputs ) return;
+    m_playbackInfoInputs = inputs;
     updatePlaybackInfoLabel();
 }
 
@@ -32856,9 +32876,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     else m_playbackPrepRgb8Pool.clear( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
+    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
     // LOOK-LABEL-PLAYBACK-INFO-1: playing <-> stopped changes the fps form ("--/24 fps" vs "24 fps").
     updatePlaybackInfoLabel();
-    if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
     // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
     cancelPlaybackDueWake();
@@ -33554,6 +33574,7 @@ void MainWindow::on_checkBoxRawFixEnable_clicked(bool checked)
     resetMlvCache( m_pMlvObject );
     resetMlvCachedFrame( m_pMlvObject );
     m_frameChanged = true;
+    updatePlaybackInfoLabel();   // LOOK-LABEL-PLAYBACK-INFO-1 r1 (adversary A2): "Dual-ISO on" needs RAW corrections on
 
     //Set GUI elements
     ui->FocusPixelsLabel->setEnabled( checked );
@@ -33737,12 +33758,14 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     facts.debayer = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();
     facts.debayerOnGpu = m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer;
     facts.playing = ui->actionPlay->isChecked();
-    facts.achievedFps = m_playbackFpsEmaFrameMs > 0.0 ? 1000.0 / m_playbackFpsEmaFrameMs : 0.0;
+    // r1 adversary A1: the gate's snapshot, never the live meter, so no hook shows a new rate faster than the 250 ms gate.
+    facts.achievedFps = m_playbackInfoFpsShown;
     facts.clipFps = getMlvFramerate( m_pMlvObject );
     facts.playbackRate = getPlaybackFramerate();
     facts.dropFrame = ui->actionDropFrameMode->isChecked();
     facts.dualIsoClip = llrpGetDualIsoValidity( m_pMlvObject ) != DISO_INVALID;
-    facts.dualIsoOn = llrpGetDualIsoMode( m_pMlvObject ) != 0;
+    // r1 adversary A2: with RAW corrections off llrawproc never runs, so the selected mode is not applied.
+    facts.dualIsoOn = llrpGetFixRawMode( m_pMlvObject ) != 0 && llrpGetDualIsoMode( m_pMlvObject ) != 0;
     facts.width = static_cast<int>( getMlvWidth( m_pMlvObject ) );
     facts.height = static_cast<int>( getMlvHeight( m_pMlvObject ) );
     return facts;
@@ -34505,6 +34528,10 @@ void MainWindow::recordPresentedFrame( const RenderFrameThread::ReadyFrame &read
     {
         updatePlaybackQualityIndicator();
     }
+    // LOOK-LABEL-PLAYBACK-INFO-1 r1 (adversary A3): a CPU fallback clears the GPU-debayer flag under an unchanged pipeline status,
+    // which the indicator's cache never sees. Int compares per frame; relabels only on a change. The scope caveat is the
+    // indicator's (it owns that input).
+    refreshPlaybackInfoOnInputChange( gpuPlaybackPipelineStatus, m_playbackInfoInputs.scopeCaveat );
 }
 
 bool MainWindow::isFrameSettledForAnalysis( int frameIndex,

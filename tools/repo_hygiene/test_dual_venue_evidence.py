@@ -5825,6 +5825,14 @@ class LookLabelEvidenceTests(unittest.TestCase):
         self.assertEqual(v["playing"], {"shownText": "Look: Cinematic", "infoShownText": "GPU display GPU Tex NR - Full / 23.9/24 fps - DF on",
                                         "surface": "fullscreen_gpu_window", "samples": 88})
 
+    def test_r1_a4_a_huge_samples_count_never_throws(self) -> None:
+        # r1 adversary A4 (06898800): samples past Int32 must not throw: the block is informational and never blocks a leg.
+        v = self.evidence('gui_smoke.look_label_playing shown="Look: Off" info_shown="" surface=none samples=2147483648\n')
+        self.assertEqual(v["playing"]["samples"], 2147483648)
+        line = self.line("Look: Off", "Look: Off", "windowed_status_bar").replace("wait_ms=17", "wait_ms=2147483648")
+        v = self.evidence(line + "\n")
+        self.assertEqual(v["waitMs"], 2147483648)
+
     def test_info_never_blocks_or_changes_look_label_shown(self) -> None:
         line = self.line("Look: Off", "Look: Off", "windowed_status_bar") + ' info_shown="" info_expected="" info_fields=none'
         v = self.evidence(line + "\n")

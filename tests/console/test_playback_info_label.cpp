@@ -302,3 +302,66 @@ TEST(PlaybackInfoLabel, MainWindowWiring)
     ASSERT_TRUE(facts.contains(QStringLiteral("m_pChosenDebayer->text()")));
     ASSERT_FALSE(facts.contains(QStringLiteral("playbackDebayerLabel(")));
 }
+
+// r1 adversary A1 (06898800): the toolbar indicator runs per frame in Auto mode (its cache holds the per-frame decision stats),
+// so a hook there composed the live fps EMA ~25 times a second. The rate shown is a snapshot taken ONLY at the fps meter's
+// 250 ms gate (and its reset), so no hook can change the fps text faster than 4 Hz, and the indicator relabels only when an
+// info input changed (int compares, before its cache-hit return), never unconditionally.
+TEST(PlaybackInfoLabel, R1A1FpsShownOnlyFromTheGateSnapshot)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.achievedFps = m_playbackInfoFpsShown;")));
+    ASSERT_FALSE(facts.contains(QStringLiteral("m_playbackFpsEmaFrameMs")));
+    // Written at the gate (beside m_pFpsStatus) and at the reset, nowhere else.
+    ASSERT_EQ(2, static_cast<int>(source.count(QStringLiteral("m_playbackInfoFpsShown = "))));
+    ASSERT_TRUE(source.contains(QStringLiteral("m_playbackInfoFpsShown = smoothedFps;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("m_playbackInfoFpsShown = 0.0;")));
+    const QString indicator = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackQualityIndicator("));
+    const int keyAt = indicator.indexOf(QStringLiteral("refreshPlaybackInfoOnInputChange( gpuPlaybackPipelineStatus, scopePerformanceCaveat );"));
+    const int cacheHitAt = indicator.indexOf(QStringLiteral("if( m_playbackQualityIndicatorCacheValid"));
+    ASSERT_TRUE(keyAt >= 0);
+    ASSERT_TRUE(keyAt < cacheHitAt);
+    ASSERT_FALSE(indicator.contains(QStringLiteral("updatePlaybackInfoLabel();")));
+}
+
+// r1 adversary A3 (06898800): a CPU AMaZE fallback (CA correction) clears the presented GPU-debayer flag without changing the
+// aggregate pipeline status, so the indicator cache hit kept "AMaZE (GPU)". Every presented frame compares the info inputs
+// (the debayer flags, the presented scale and its request) and relabels only on a change.
+TEST(PlaybackInfoLabel, R1A3PresentedFrameRelabelsOnAnInfoInputChange)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString record = functionBody(source, QStringLiteral("void MainWindow::recordPresentedFrame("));
+    ASSERT_TRUE(record.contains(QStringLiteral("refreshPlaybackInfoOnInputChange( gpuPlaybackPipelineStatus, m_playbackInfoInputs.scopeCaveat );")));
+    const QString key = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedFrameUsedGpuAmazeDebayer")));
+    ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedFrameUsedGpuBilinearDebayer")));
+    ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedPlaybackScaleFactorActive")));
+    ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactor")));
+    ASSERT_TRUE(key.contains(QStringLiteral("playbackScaleFactorPolicyDecision()")));
+    ASSERT_TRUE(key.contains(QStringLiteral("updatePlaybackInfoLabel();")));
+}
+
+// r1 adversary A2 (06898800): with RAW corrections off (fix_raw=0) llrawproc never runs, so the selected Dual-ISO mode is not
+// applied: "Dual-ISO on" only while both are on, and the RAW corrections switch relabels.
+TEST(PlaybackInfoLabel, R1A2DualIsoOnNeedsRawCorrections)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
+    ASSERT_TRUE(facts.contains(QStringLiteral(
+        "facts.dualIsoOn = llrpGetFixRawMode( m_pMlvObject ) != 0 && llrpGetDualIsoMode( m_pMlvObject ) != 0;")));
+    const QString rawFix = functionBody(source, QStringLiteral("void MainWindow::on_checkBoxRawFixEnable_clicked("));
+    ASSERT_TRUE(rawFix.contains(QStringLiteral("updatePlaybackInfoLabel();")));
+}
+
+// r1 adversary A5 (06898800, advisory): a field holding a newline must not add a line: compose stays at two lines.
+TEST(PlaybackInfoLabel, R1A5FieldNewlinesNeverAddLines)
+{
+    playback_info_label::Facts f = ownerFacts();
+    f.processingBadge = QStringLiteral("A\nB\nC");
+    f.debayer = QStringLiteral("X\nY");
+    const QString text = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+    ASSERT_EQ(2, static_cast<int>(text.split(QLatin1Char('\n')).size()));
+    ASSERT_TRUE(text.startsWith(QStringLiteral("GPU display A B C")));
+    ASSERT_TRUE(text.contains(QStringLiteral("X Y (GPU)")));
+}
