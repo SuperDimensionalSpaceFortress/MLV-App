@@ -36,8 +36,10 @@ _spec.loader.exec_module(ob)
 # variables git itself reports as repository-local (`git rev-parse --local-env-vars`) are dropped for the duration of each TEST by the autouse fixture below, through
 # monkeypatch, so they are restored afterwards: an import-time os.environ.pop (r13) also changed the environment of every OTHER module in the pytest session, even
 # when -k deselected everything here (Grok G16a). The list is read once, here, without touching the environment; none of these is a setting the tests rely on.
-_GIT_LOCAL_ENV_VARS_FALLBACK = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY",
-                                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE")
+# The fallback (used only when `git rev-parse --local-env-vars` cannot run) is that command's own 15-name report from git 2.56, so a failed probe does not leave GIT_CONFIG_COUNT and the rest (r23 advisory A1).
+_GIT_LOCAL_ENV_VARS_FALLBACK = ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR",
+                                "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE",
+                                "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_COMMON_DIR")
 
 
 def _read_git_local_env_vars() -> tuple[str, ...]:
