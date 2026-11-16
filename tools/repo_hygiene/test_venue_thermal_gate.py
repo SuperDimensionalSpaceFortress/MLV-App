@@ -349,7 +349,17 @@ class ThermalGateModuleTests(unittest.TestCase):
         self.assertNotIn("*> $out", fn, "the redirect opens the output file after the admission")
         marker = "return [pscustomobject]@{ expiredBeforeDispatch = $true }\n    }\n"
         after = [l for l in fn[fn.index(marker) + len(marker):].splitlines() if l.strip() and not l.strip().startswith("#")]
-        self.assertTrue(after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[0])
+        # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 / r6 (hosted CI on 848f6559): only two in-memory statements may sit between the admission and the start, neither of which
+        # touches a file or a share: the probe's absolute wait end (-WaitUntilUtc, fixed at the dispatch) and the dispatch's monotonic instant (the idle anchor)
+        # r8 (adversary-f52a32d6.json A1): the end is counted from $dispatchUtc, read before the wait's cuts (still in memory, no file or share)
+        # r9 (Grok G14 on #817): it is the wall clock read at the dispatch plus the wait left on the MONOTONIC clock since $dispatchTs (still in memory, no file or share)
+        in_memory = ("$qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $wait - ([Diagnostics.Stopwatch]::GetTimestamp() - $dispatchTs) / [double][Diagnostics.Stopwatch]::Frequency)).ToString('o'))",
+                     # r9b (adversary-74e14dda.json A1): and the same end on the monotonic counter (in memory)
+                     "$qArgs += @('-WaitUntilTs', [string]($dispatchTs + [long]($wait * [double][Diagnostics.Stopwatch]::Frequency)))",
+                     "$startTs = [Diagnostics.Stopwatch]::GetTimestamp()")
+        while after and after[0].lstrip().startswith(in_memory):
+            after.pop(0)
+        self.assertTrue(after and after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[:1])
         self.assertIn("Set-Content -LiteralPath $out -Value $captured", fn)
 
     def test_r6p1_a2_only_a_launched_row_is_a_heavy_predecessor_and_an_unknown_status_is_a_barrier(self) -> None:
@@ -955,6 +965,25 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertEqual(self.log().count(" THERMAL_WAIT leg=01-fx-a-spec "), 2)
         self.assertIn("heat=hot (throttled 9/60, mean 70.0 C)", self.log())
 
+    def test_lease_batch_idle_end_r5_adv_p2_a2_the_thermal_poll_sleep_never_runs_past_the_idle_allowance(self) -> None:
+        # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 2 (adversary-ff81d798.json A2): the in-lease poll sleep was -ThermalPollSec, bounded by the thermal cap and the room only, so
+        # a poll longer than the agent's idle allowance let the agent release the lease under every hot wait. Agent bound 300 (the script default), -ProbeIdleMarginSec 290
+        # (a 10 s allowance), -ThermalPollSec 30: the re-probe follows the first hot reading within the allowance, not 30 s later.
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "120", "-ThermalPollSec", "30", "-ProbeIdleMarginSec", "290", FAKE_HEAT="9,0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["legs"][0]["status"], b["thermalWaits"]), ("RAN", 1), b)
+        lines = self.log().splitlines()
+        at = [i for i, l in enumerate(lines) if " THERMAL_WAIT leg=01-fx-a-spec " in l]
+        self.assertEqual(len(at), 1, lines)
+        nxt = next(l for l in lines[at[0] + 1:] if " QUIET leg=01-fx-a-spec " in l)
+        from datetime import datetime
+
+        def ts(line: str) -> datetime:
+            return datetime.fromisoformat(line.split(" ", 1)[0].replace("Z", "+00:00"))
+        gap = (ts(nxt) - ts(lines[at[0]])).total_seconds()
+        self.assertLess(gap, 20, f"the poll sleep ran past the agent's idle allowance: {gap:.0f} s\n{lines[at[0]]}\n{nxt}")
+
     def test_cap_skip_requeues_the_hot_leg_and_runs_the_next_one_first(self) -> None:
         r = self.run_batch(self.specs[:2], "-ThermalWaitCapSec", "2", FAKE_HEAT="HOT_UNTIL_SKIP")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1176,7 +1205,7 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
     def test_adversary_r4_a2_a_stalled_quiet_log_after_the_first_hot_reading_counts_against_the_cap(self) -> None:
         # the first hot reading is when its probe RETURNED, not when the runner got around to stamping it after the QUIET log line: a 6 s stall there (cap 4) used to be
         # left out of the wait (waitSec 0), so another sleep and another probe were allowed; now the cap is already spent and the leg is skipped with that one probe
-        r, b = self._expired_wait_run(('L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease', 'Start-Sleep -Seconds 3; L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease'), FAKE_HEAT="9")
+        r, b = self._expired_wait_run(('LogBest "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease', 'Start-Sleep -Seconds 3; LogBest "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease'), FAKE_HEAT="9")
         self._assert_typed_skip_without_another_probe(r, b, marker=False)
 
     def test_adversary_r4p2_a2_a_stall_inside_the_probe_function_before_its_dispatch_starts_no_further_probe(self) -> None:
@@ -1198,7 +1227,7 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
         # hot twice (a wait of 1-2 s), then clear: the leg launches, which ends the thermal wait, and returns VENUE_NOT_QUIESCENT; the retry log stalls past the old deadline.
         # A1: the retry's probe used to inherit the finished wait (firstHotUtc kept): dispatched with no admission and a quiet wait clamped to 0 (maxWaitSec=0).
         # A5: the retry's fresh gate used to overwrite the leg's thermalWaitSec with 0, so the final receipt lost the wait it had come after.
-        self._mirror_with_bad_sidecar(runner_patches=(('L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT', 'Start-Sleep -Seconds 6; L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT'),))
+        self._mirror_with_bad_sidecar(runner_patches=(('LogBest "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT', 'Start-Sleep -Seconds 6; LogBest "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT'),))
         r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "4", "-ThermalPollSec", "1", "-ThermalRequeueMax", "0", FAKE_HEAT="9,9,0", FAKE_LEG_OUTCOMES="VENUE_NOT_QUIESCENT,PASS")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         quiet = [l for l in self.log().splitlines() if " QUIET leg=" in l]

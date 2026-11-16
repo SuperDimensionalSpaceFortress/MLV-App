@@ -3884,7 +3884,8 @@ function Set-LeaseCoverageAtLaunch {
 function Get-LeaseBatchAdmission {
     # The admission's leaseBatch block for the batch's current job.
     param([Parameter(Mandatory = $true)]$Batch, [bool]$Reused)
-    return [pscustomobject]@{ token = $Batch.token; leaseId = $Batch.lease.id; seq = $Batch.seq; reused = $Reused; untilEpoch = $Batch.lease.active.until; remainingSec = (Get-QuietLeaseRemainingSec -Lease $Batch.lease); renewOkMaxGapSec = (Get-QuietLeaseRenewOkGapSec -Lease $Batch.lease) }
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r3: idleSec is this agent's effective LeaseBatchIdleSec, so a runner bounds its no-job waits by the bound actually running
+    return [pscustomobject]@{ token = $Batch.token; leaseId = $Batch.lease.id; seq = $Batch.seq; reused = $Reused; untilEpoch = $Batch.lease.active.until; remainingSec = (Get-QuietLeaseRemainingSec -Lease $Batch.lease); renewOkMaxGapSec = (Get-QuietLeaseRenewOkGapSec -Lease $Batch.lease); idleSec = $LeaseBatchIdleSec }
 }
 
 function Open-LeaseBatch {

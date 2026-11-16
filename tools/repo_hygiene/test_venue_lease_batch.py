@@ -61,6 +61,137 @@ ABSENT = object()   # a staged build manifest field left out (stage(): dllPairMa
 DOCUMENTED_DOS_DEVICE_STEMS = frozenset(["CON", "PRN", "AUX", "NUL"] + [f"{p}{d}" for p in ("COM", "LPT") for d in "123456789\u00b9\u00b2\u00b3"])
 
 
+# r9 (Grok G14 prevention on #817): the mixed wall/monotonic clock lint. Three findings on this card (cc90eef2-A1, 5fc3bf72-A2, G14) were one class: a [DateTime]::UtcNow
+# read that a deadline (or a -WaitUntilUtc end) was later counted from, so a step of this host's clock, or blocking work after the read, moved the end. Rules, per code line:
+#   WAIT_UNTIL      a -WaitUntilUtc value must be placed in its own statement from a fresh [DateTime]::UtcNow AND a Stopwatch read (the monotonic time spent), never from a
+#                   captured wall instant.
+#   CAPTURED_WALL   a captured wall instant ($x = [DateTime]::UtcNow) with no Stopwatch frame in its file must not be extended (.AddSeconds/.AddMinutes/...) into a deadline-like
+#                   variable, a comparison or a -WaitUntilUtc.
+#   FRAME_WALL_READ in a file whose wall anchor IS paired with a Stopwatch frame (Get-WaitNowUtc), a deadline-like variable must never be read against [DateTime]::UtcNow.
+# KNOWN_WALL_DEADLINES is the exact pre-existing set (batch-level deadlines in hours and one cancel reconcile window, outside the in-lease wait chain): a new hit fails the lint,
+# and a fixed one fails it too until it is removed here (a ratchet, never a growing allowlist).
+# the standing adversary checklist line (Grok G14 prevention): the tracked portable template, row 5 (clock and time)
+ADVERSARY_CHECKLIST = ROOT / "tools" / "coordination" / "quality_lift" / "adversary-pass-prompt.md"
+MIXED_CLOCK_CHECKLIST_LINE = "mixed wall/monotonic clock: every deadline derives from a Stopwatch, never from a wall instant read before blocking work"
+# r9b (adversary-9a56fa7a.json A2): PowerShell names are case-insensitive ([datetime]::utcnow, $DEADLINE, .addseconds, -WAITUNTILUTC, -cge), so every pattern here is too.
+# [DateTimeOffset]::UtcNow and [System.DateTime]::UtcNow are the same wall clock.
+MIXED_CLOCK_WALL_RX = re.compile(r"\[(?:System\.)?DateTime(?:Offset)?\]::UtcNow\b", re.IGNORECASE)
+MIXED_CLOCK_MONO_RX = re.compile(r"\[(?:System\.)?(?:Diagnostics\.)?Stopwatch\]::GetTimestamp\(\)", re.IGNORECASE)
+MIXED_CLOCK_DEADLINE_RX = re.compile(r"\$\w*(?:deadline|until|gateEnd)\w*\b", re.IGNORECASE)
+# r9b (adversary-74e14dda.json A2): and in parentheses, $t0 = ([DateTime]::UtcNow)
+MIXED_CLOCK_ANCHOR_RX = re.compile(r"\$(\w+)\s*=\s*(?:\(\s*)*\[(?:System\.)?DateTime(?:Offset)?\]::UtcNow(?:\s*\))*(?=\s*(?:;|\}|$))", re.IGNORECASE)
+MIXED_CLOCK_WAIT_UNTIL_RX = re.compile(r"""['"]-WaitUntilUtc['"]\s*,|-WaitUntilUtc\s+[\$\(\[]""", re.IGNORECASE)
+KNOWN_WALL_DEADLINES = frozenset({
+    ("Invoke-VenueBaseline.ps1", "CAPTURED_WALL", "$deadline = $startedUtc.AddSeconds($MaxTotalSec)"),
+    ("Invoke-VenueChain.ps1", "CAPTURED_WALL", "$deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } else { $t0.AddHours(6) })"),
+    ("Invoke-VenueLeaseBatch.ps1", "CAPTURED_WALL", "$deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } else { $t0.AddHours(6) })"),
+})
+
+
+def _mixed_clock_code(line: str) -> str:
+    # r10 (sol r9b 13e99849-A2): a PowerShell comment is a `#` outside a quoted string at the line start or after whitespace, with or without a space after it
+    # (`$t0 = [DateTime]::UtcNow #captured`); the r9 strip wanted `# ` and kept `#captured`, so the anchor read missed it. A `#` inside a string or a word stays.
+    s = line.strip()
+    quote = ""
+    for i, ch in enumerate(s):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "#" and (i == 0 or s[i - 1].isspace()):
+            return s[:i].rstrip()
+    return s
+
+
+def _mixed_clock_split(stmt: str) -> list[str]:
+    # r10 (adversary-49bf0ddc.json A4): `Start-Sleep -Seconds 90; $deadline = $t0.AddSeconds(240)` is two statements: split at a `;` outside quotes, parentheses and braces
+    # (a `;` inside `{ L "x"; break }` stays, so a comparison keeps its break)
+    parts: list[str] = []
+    depth, quote, start = 0, "", 0
+    for i, ch in enumerate(stmt):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth = max(0, depth - 1)
+        elif ch == ";" and depth == 0:
+            parts.append(stmt[start:i].strip())
+            start = i + 1
+    parts.append(stmt[start:].strip())
+    return [p for p in parts if p]
+
+
+def _mixed_clock_statements(text: str) -> list[str]:
+    # r10 (sol r9b 13e99849-A2): PowerShell continues a statement onto the next line after an assignment operator (`$t0 =` then `[DateTime]::UtcNow`) or a trailing
+    # backtick; those lines are joined into the one statement they are, so a multiline anchor or deadline reads like the single-line one.
+    # r10 (adversary-49bf0ddc.json A4): and inside an open parenthesis (`$t0 = (` / `[DateTime]::UtcNow` / `)`); a `<# ... #>` block comment is dropped first.
+    text = re.sub(r"<#.*?#>", " ", text, flags=re.S)
+    out: list[str] = []
+    pending = ""
+    for c in (_mixed_clock_code(x) for x in text.splitlines()):
+        if not c:
+            continue
+        if pending:
+            c = f"{pending} {c}"
+            pending = ""
+        if c.endswith("`"):
+            pending = c[:-1].rstrip()
+        elif re.search(r"(?<![=!<>])=$", c) or (c.count("(") > c.count(")") and re.search(r"=\s*\(", c)):
+            pending = c
+        else:
+            out.extend(_mixed_clock_split(c))
+    if pending:
+        out.extend(_mixed_clock_split(pending))
+    return out
+
+
+def mixed_clock_deadline_hits(files: dict[str, str]) -> set[tuple[str, str, str]]:
+    """(file, rule, code line) for every mixed wall/monotonic deadline in the given {file name: text}."""
+    hits: set[tuple[str, str, str]] = set()
+    for name, text in files.items():
+        code = _mixed_clock_statements(text)
+        anchors = {m.group(1).lower() for c in code for m in MIXED_CLOCK_ANCHOR_RX.finditer(c)}
+        # a FRAME: a function or statement that adds the Stopwatch time since an anchor to it (Get-WaitNowUtc), on a line that is not itself an anchor read
+        framed = {a for a in anchors if any(re.search(rf"\${a}\b", c, re.I) and MIXED_CLOCK_MONO_RX.search(c) and not MIXED_CLOCK_ANCHOR_RX.search(c) for c in code)}
+        for c in code:
+            if MIXED_CLOCK_WAIT_UNTIL_RX.search(c):
+                fresh = bool(MIXED_CLOCK_WALL_RX.search(c) and MIXED_CLOCK_MONO_RX.search(c))
+                if not fresh or any(re.search(rf"\${a}\.Add\w*\(", c, re.I) for a in anchors):
+                    hits.add((name, "WAIT_UNTIL", c))
+            for a in anchors - framed:
+                # extended into a deadline-like variable, a -WaitUntilUtc, or a comparison that ends a wait (break / return / continue on the same line)
+                if re.search(rf"\${a}\.Add(?:Seconds|Minutes|Hours|Milliseconds|Ticks)\(", c, re.I) and (
+                        re.match(rf"\s*{MIXED_CLOCK_DEADLINE_RX.pattern}\s*=", c, re.I) or MIXED_CLOCK_WAIT_UNTIL_RX.search(c)
+                        or (re.search(r"\s-[ci]?[gl][te]\s", c, re.I) and re.search(r"\b(?:break|return|continue)\b", c, re.I))):
+                    hits.add((name, "CAPTURED_WALL", c))
+            if framed and MIXED_CLOCK_WALL_RX.search(c) and MIXED_CLOCK_DEADLINE_RX.search(c):
+                hits.add((name, "FRAME_WALL_READ", c))
+    return hits
+
+
+# r9b: LEASE_BATCH_RED_REF=<commit> makes the r9 clock behaviour tests parse the dual-venue script from that commit instead of the working tree (git show, captured into
+# a PowerShell variable and parsed in memory with Parser::ParseInput; nothing is copied to disk). It is the RED half of their RED/GREEN proof
+# (LEASE_BATCH_RED_REF=2854b231 is the r8 head). Unset, as in CI and every normal run, they parse the working tree.
+RED_REF_RX = re.compile(r"[0-9A-Za-z][0-9A-Za-z._/-]{0,99}")
+
+
+def ps_parse_source(path: Path) -> str:
+    """A PowerShell statement that sets $ast to the parsed script at `path`: the working tree, or the LEASE_BATCH_RED_REF commit's blob."""
+    ref = os.environ.get("LEASE_BATCH_RED_REF", "").strip()
+    if not ref:
+        return f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(path)}', [ref]$null, [ref]$null)"
+    if not RED_REF_RX.fullmatch(ref):
+        raise ValueError(f"LEASE_BATCH_RED_REF is not a commit name: {ref!r}")
+    rel = path.resolve().relative_to(ROOT).as_posix()
+    return (f"$src = (& git -C '{psq(ROOT)}' show '{psq(ref)}:{psq(rel)}') -join \"`n\"; if ($LASTEXITCODE -ne 0 -or -not $src) {{ throw 'git show {psq(ref)}:{psq(rel)} failed' }}\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)")
+
+
 def documented_dos_device(name: str) -> bool:
     """True when the documented reserved set names this component: the stem before the first dot, with the spaces Win32 drops before an extension removed, compared case-insensitively."""
     return name.split(".", 1)[0].rstrip(" ").upper() in DOCUMENTED_DOS_DEVICE_STEMS
@@ -76,7 +207,7 @@ DEVICE_MATRIX_NAMES = (
 
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
 FAKE_QUIET = r"""
-param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
+param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0, [string]$WaitUntilUtc = '', [long]$WaitUntilTs = 0)
 $runDir = Split-Path -Parent $WorkDir
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $countFile = Join-Path $runDir 'fake-quiet-count.txt'
@@ -85,12 +216,55 @@ Set-Content -LiteralPath $countFile -Value ($n + 1)
 $modes = @(([string]$env:FAKE_QUIET_MODES) -split ',' | Where-Object { $_ })
 if ($modes.Count -eq 0) { $modes = @('QUIET') }
 $mode = $modes[[Math]::Min($n, $modes.Count - 1)]
-Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} QUIET {1} maxWait={2}" -f [DateTime]::UtcNow.Ticks, $mode, $MaxWaitSec)
+# r5 pass 3: until= is -WaitUntilUtc as passed ('-' when absent), before maxWait= (which _in_lease_waits reads as the line's last field)
+Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} QUIET {1} until={3} maxWait={2}" -f [DateTime]::UtcNow.Ticks, $mode, $MaxWaitSec, $(if ($WaitUntilUtc) { $WaitUntilUtc } else { '-' }))
+# r4 pass 2 (adversary A1): FAKE_QUIET_SLOW_SEC = the probe child's own time around its agent jobs (a slow gate-log append), which the runner cannot see
+if ($env:FAKE_QUIET_SLOW_SEC) { Start-Sleep -Seconds ([int]$env:FAKE_QUIET_SLOW_SEC) }
 switch ($mode) {
     'QUIET' { "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'COOLDOWN' { "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'FOREIGN' { 'FOREIGN_FLOOR owners=explorer:1,textinputhost:2,bloody7:3 floorMean=32.0% waitedSec=1 probes=3'; "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
+    'PASTDEADLINE' {
+        # LEASE-BATCH-IDLE-END-UNSEEN-1 A1: a probe that returns QUIET only after the run's deadline (FAKE_DEADLINE_UTC): the time the runner spends between the probe and the leg's launch
+        $until = [DateTime]::Parse($env:FAKE_DEADLINE_UTC, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal).AddSeconds(1)
+        while ([DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+        "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
+    }
+    'IDLE' {
+        # LEASE-BATCH-IDLE-END-UNSEEN-1: the wait outlasted the agent's idle bound (it submitted no job for 300 s): the agent released the parked batch lease and wrote its receipt line
+        # (endReason=idle, ultra-magnus-agent.ps1 Close-LeaseBatch), and the probe still reads QUIET.
+        $stq = Get-Content -LiteralPath (Join-Path $env:FAKE_SHARE 'fake-agent-state.json') -Raw | ConvertFrom-Json
+        $lg = Join-Path $env:FAKE_SHARE 'logs'
+        New-Item -ItemType Directory -Force -Path $lg | Out-Null
+        Add-Content -LiteralPath (Join-Path $lg "lease-batch-$($stq.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $stq.token; leaseId = $stq.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
+        "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
+    }
+    'IDLEBUSY' {
+        # r3 adversary pass 2 A2: the agent released the lease idle while the gate stayed busy (no job ran): the idle line, and a GATE_BUSY probe
+        $stq = Get-Content -LiteralPath (Join-Path $env:FAKE_SHARE 'fake-agent-state.json') -Raw | ConvertFrom-Json
+        $lg = Join-Path $env:FAKE_SHARE 'logs'
+        New-Item -ItemType Directory -Force -Path $lg | Out-Null
+        Add-Content -LiteralPath (Join-Path $lg "lease-batch-$($stq.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $stq.token; leaseId = $stq.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
+        'GATE_BUSY quiet-probe waitedSec=1'; exit 3
+    }
+    { $_ -in 'IDLEFOREIGN', 'FOREIGNIDLE', 'NOTOKENIDLE', 'FOREIGNEND' } {
+        # r2 (sol key r1 BLOCKER, receipt token binding): lines in THIS batch's receipt file for THIS lease that another token wrote, or no token at all. IDLEFOREIGN: a foreign
+        # closed line, then the agent's own idle line. FOREIGNIDLE / NOTOKENIDLE: a lone idle line under another token / under none. FOREIGNEND: a lone foreign non-idle line.
+        $stq = Get-Content -LiteralPath (Join-Path $env:FAKE_SHARE 'fake-agent-state.json') -Raw | ConvertFrom-Json
+        $lg = Join-Path $env:FAKE_SHARE 'logs'
+        New-Item -ItemType Directory -Force -Path $lg | Out-Null
+        $rf = Join-Path $lg "lease-batch-$($stq.token).jsonl"
+        $at = [DateTimeOffset]::UtcNow.ToString('o')
+        $rows = switch ($mode) {
+            'IDLEFOREIGN' { [ordered]@{ token = 'ffffffffffff'; leaseId = $stq.leaseId; endReason = 'closed' }, [ordered]@{ token = $stq.token; leaseId = $stq.leaseId; endedUtc = $at; endReason = 'idle' } }
+            'FOREIGNIDLE' { , [ordered]@{ token = 'ffffffffffff'; leaseId = $stq.leaseId; endedUtc = $at; endReason = 'idle' } }
+            'NOTOKENIDLE' { , [ordered]@{ leaseId = $stq.leaseId; endedUtc = $at; endReason = 'idle' } }
+            'FOREIGNEND' { , [ordered]@{ token = 'ffffffffffff'; leaseId = $stq.leaseId; endReason = 'foreign' } }
+        }
+        foreach ($row in $rows) { Add-Content -LiteralPath $rf -Value ($row | ConvertTo-Json -Compress) }
+        "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
+    }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed"; exit 6 }
     'STEAL' {
         # r5b (Grok G1): another owner's claim replaces the run's mid-batch (another nonce; its owner pid is dead, so the next batch may break it). The probe
@@ -137,11 +311,27 @@ if ($JobId -like 'lease-batch-open-*') {
     $lid = "lease-$($n + 1)"
     # r13 (adversary r12 A1): FAKE_OPEN_LEASE_ID answers with that exact lease id (a timestamp-shaped one, which ConvertFrom-Json turns into a DateTime)
     if ($env:FAKE_OPEN_LEASE_ID) { $lid = $env:FAKE_OPEN_LEASE_ID }
+    # r5 pass 2 (adversary r5 A1): FAKE_OPEN_LEASE_ID_NUM answers with a JSON NUMBER lease id (VenueRawJson then clears every identity in the reading)
+    if ($env:FAKE_OPEN_LEASE_ID_NUM) { $lid = [int]$env:FAKE_OPEN_LEASE_ID_NUM }
     $adm = [ordered]@{ gate = 'fake'; mode = 'lease'; label = 'clear'; heavySlotHeld = "1:$(1001 + $n)"; slot = 'C:\t\.heavy-slots\1'; leaseMinutes = 45; waitedSec = 7; leaseRequests = 2
         leaseRefusals = @([ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' }) }
     # r12 (adversary A2): FAKE_OPEN_TOKEN_SHY=1 answers with the batch's token plus a soft hyphen (U+00AD): culture-aware equality says it is the same token, ordinal says it is not
     $tokOut = $(if ($env:FAKE_OPEN_TOKEN_SHY -eq '1') { $token + [string][char]0x00AD } else { $token })
     if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $tokOut; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r3 pass 2 (adversary A2): FAKE_IDLE_SEC is the running agent's own idle bound, published as admission.leaseBatch.idleSec
+    # r4 (Grok G7): 'str:<s>' publishes a string, 'dbl:<d>' a double, 'null' a JSON null; anything else an int
+    if ($mode -ne 'nobatch' -and $env:FAKE_IDLE_SEC) {
+        $iv = [string]$env:FAKE_IDLE_SEC
+        $adm['leaseBatch']['idleSec'] = $(if ($iv -like 'str:*') { $iv.Substring(4) } elseif ($iv -like 'dbl:*') { [double]$iv.Substring(4) } elseif ($iv -eq 'null') { $null } else { [int]$iv })
+    }
+    # r5 (adversary r4 pass 3 A1): FAKE_OPEN_LB_WRAP publishes the leaseBatch inside an array: array ([{..}]) | nullplus ([null, {..}]) | nested ([[{..}]])
+    if ($mode -ne 'nobatch' -and $env:FAKE_OPEN_LB_WRAP) {
+        $lb0 = $adm['leaseBatch']; $w = [string]$env:FAKE_OPEN_LB_WRAP
+        if ($w -eq 'array') { $adm['leaseBatch'] = @($lb0) } elseif ($w -eq 'nullplus') { $adm['leaseBatch'] = @($null, $lb0) } elseif ($w -eq 'nested') { $adm['leaseBatch'] = @(,@($lb0)) }
+    }
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r10 (adversary-49bf0ddc.json A1): FAKE_OPEN_LB_EMPTY=1 publishes leaseBatch as {} (there, naming no lease); FAKE_OPEN_LABEL overrides the label
+    if ($env:FAKE_OPEN_LB_EMPTY -eq '1') { $adm['leaseBatch'] = [ordered]@{} }
+    if ($env:FAKE_OPEN_LABEL) { $adm['label'] = [string]$env:FAKE_OPEN_LABEL }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
     $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
@@ -156,7 +346,12 @@ if ($JobId -like 'lease-batch-open-*') {
         $now = [DateTimeOffset]::UtcNow
     }
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
-    $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    # r6 (adversary-848f6559.json A2): FAKE_OPEN_ENDED_AHEAD_SEC = the agent's clock runs that far ahead of this host's (the open's endedUtc lies in the host's future)
+    $openEnded = $now.AddSeconds($(if ($env:FAKE_OPEN_ENDED_AHEAD_SEC) { [int]$env:FAKE_OPEN_ENDED_AHEAD_SEC } else { 0 })).ToString('o')
+    $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $openEnded; admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    # r5 pass 3 (adversary r5 pass 2 A1): FAKE_OPEN_ADM_WRAP=array publishes the whole admission inside a one-element array
+    if ($env:FAKE_OPEN_ADM_WRAP -eq 'array') { $res.admission = @($res.admission) }
+    if ($env:FAKE_OPEN_ADM_WRAP -eq 'empty') { $res.admission = @() }   # r10 (adversary-49bf0ddc.json A1): admission:[]
     if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
     if ($mode -eq 'gatehold') {
         # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
@@ -168,6 +363,14 @@ if ($JobId -like 'lease-batch-open-*') {
         New-Item -ItemType Directory -Force -Path $outbox | Out-Null
         $res | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $outbox "$JobId.result.json")
         throw "UNRESOLVED: $JobId was held unlaunched in the agent's heavy-slot admission gate (fake) for the full -MaxAdmissionWaitSec"
+    }
+    if ($mode -eq 'errlanded') {
+        # r5 (adversary r4 pass 3 A1 sibling): the agent ran the open and its result landed by name, but um-run itself failed (outcome ERROR): the batch's finally cancels the open
+        # and reconciles it by name (RAN_BEFORE_CANCEL when its admission names the lease)
+        $outbox = Join-Path $AgentShare 'outbox'
+        New-Item -ItemType Directory -Force -Path $outbox | Out-Null
+        $res | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $outbox "$JobId.result.json")
+        throw "fake um-run failure after $JobId's result landed"
     }
     if ($env:FAKE_OPEN_VIA_REAL_UMRUN -eq '1') {
         # r14 (adversary r13 A1): the open's result reaches the runner through the REAL um-run.ps1 reader, the way it does in production: the agent's result file is staged in the outbox
@@ -220,6 +423,8 @@ $jobId = "dve-$leaf-$Venue-cpu-2026102300000$k$(if ($LeaseBatch) { "-lb$LeaseBat
 # r3: FAKE_LEG_MODES per call: ok | exit3 (died without a receipt) | hang (still running at lease end: it starts a grandchild, records both pids, and sleeps)
 $legMode = Pick $env:FAKE_LEG_MODES $k 'ok'
 if ($legMode -eq 'exit3') { exit 3 }
+# r6 (adversary-848f6559.json A1 sibling): exit3late = the child works 6 s and dies without its agent job ever landing a result (no evidence the agent's idle clock restarted)
+if ($legMode -eq 'exit3late') { Start-Sleep -Seconds 6; exit 3 }
 if ($legMode -eq 'hang') {
     $gc = Start-Process -FilePath ([Environment]::ProcessPath) -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 300' -PassThru -NoNewWindow
     Add-Content -LiteralPath (Join-Path $share 'fake-leg-pids.txt') -Value "$PID $($gc.Id) $jobId"
@@ -228,6 +433,17 @@ if ($legMode -eq 'hang') {
     exit 0
 }
 $lose =@(([string]$env:FAKE_LEG_LOSE) -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ })
+# LEASE-BATCH-IDLE-END-UNSEEN-1: FAKE_LEG_IDLE_END=1 is the idle release landing AFTER the runner's pre-launch read (the agent wrote its endReason=idle line for the batch lease while the leg's job
+# was being admitted, so the job took a fresh lease under the token: pair it with FAKE_LEG_LOSE for that call)
+if ($env:FAKE_LEG_IDLE_END -in 'foreign-then-idle', 'foreign') {
+    # r2 (sol key r1 BLOCKER): a line ANOTHER token wrote for this lease lands first (closed before the agent's own idle line; or idle, alone)
+    New-Item -ItemType Directory -Force -Path (Join-Path $share 'logs') | Out-Null
+    Add-Content -LiteralPath (Join-Path $share "logs\lease-batch-$($st.token).jsonl") -Value (([ordered]@{ token = 'ffffffffffff'; leaseId = $st.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); endReason = $(if ($env:FAKE_LEG_IDLE_END -eq 'foreign') { 'idle' } else { 'closed' }) }) | ConvertTo-Json -Compress)
+}
+if ($env:FAKE_LEG_IDLE_END -in '1', 'foreign-then-idle') {
+    New-Item -ItemType Directory -Force -Path (Join-Path $share 'logs') | Out-Null
+    Add-Content -LiteralPath (Join-Path $share "logs\lease-batch-$($st.token).jsonl") -Value (([ordered]@{ schema = 'mlv-agent-lease-batch.v1'; token = $st.token; leaseId = $st.leaseId; endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); heldSec = 301; endReason = 'idle'; why = 'no job for 301s > 300s'; jobsRun = 1 }) | ConvertTo-Json -Compress)
+}
 # r12 (adversary A2): FAKE_LEG_LEASE_SHY=1 reports the batch's lease id plus a soft hyphen (U+00AD): culture-aware equality says it is the same lease, ordinal says it is not
 $lid = $(if ($lose -contains ($k + 1)) { 'lease-somebody-else' } elseif ($env:FAKE_LEG_LEASE_SHY -eq '1') { $st.leaseId + [string][char]0x00AD } elseif ($env:FAKE_LEG_LEASE_ID) { $env:FAKE_LEG_LEASE_ID } else { $st.leaseId })
 # r13 (adversary r12 A1): FAKE_LEG_LEASE_ID reports that exact lease id (a different spelling of the batch's instant), instead of the batch's own
@@ -235,7 +451,17 @@ $now = [DateTimeOffset]::UtcNow
 $remain = [int](Pick $env:FAKE_LEG_REMAIN $k '2600')
 $outbox = Join-Path $share 'outbox'
 New-Item -ItemType Directory -Force -Path $outbox | Out-Null
-$res = [ordered]@{ jobId = $jobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
+# r6 (adversary-848f6559.json A2): FAKE_LEG_ENDED_AHEAD_SEC per call = the agent's clock runs that far ahead (its endedUtc lies in this host's future); FAKE_LEG_ENDED_RAW = an
+# endedUtc that is no instant at all
+$legEnded = $(if ($env:FAKE_LEG_ENDED_RAW) { [string]$env:FAKE_LEG_ENDED_RAW } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0')).ToString('o') })
+# r8 (Grok G12): FAKE_LEG_JOB_SEC per call = the leg job's own runtime on the agent's clock: the child sleeps that long first, and startedUtc is that much before endedUtc (same
+# skew). FAKE_LEG_STARTED=null publishes startedUtc as JSON null (the queue-expired result's shape)
+$legJobSec = [int](Pick $env:FAKE_LEG_JOB_SEC $k '0')
+if ($legJobSec -gt 0) { Start-Sleep -Seconds $legJobSec; $now = [DateTimeOffset]::UtcNow; $legEnded = $(if ($env:FAKE_LEG_ENDED_RAW) { [string]$env:FAKE_LEG_ENDED_RAW } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0')).ToString('o') }) }
+$legStarted = $(if ($env:FAKE_LEG_STARTED -eq 'null') { $null } else { $now.AddSeconds([int](Pick $env:FAKE_LEG_ENDED_AHEAD_SEC $k '0') - $legJobSec).ToString('o') })
+# r8 (adversary-cc9275e3.json A2): FAKE_LEG_STARTED=array publishes startedUtc inside a one-element array (no usable instant)
+if ($env:FAKE_LEG_STARTED -eq 'array') { $legStarted = @($legStarted) }
+$res = [ordered]@{ jobId = $jobId; exitCode = 0; startedUtc = $legStarted; endedUtc = $legEnded; admission = [ordered]@{ mode = 'lease'; label = 'clear'; leaseBatch = [ordered]@{ token = $LeaseBatch; leaseId = $lid; seq = $k + 2; reused = $true; untilEpoch = $now.ToUnixTimeSeconds() + $remain } } }
 # the agent's renew record at the leg's end: okMaxGapSec from FAKE_LEG_GAPS (default 3 s; 'none' = no record)
 $gap = Pick $env:FAKE_LEG_GAPS $k '3'
 if ($gap -ne 'none') { $res.admission['leaseRenew'] = [ordered]@{ intervalSec = 60; ok = 5; okMaxGapSec = [double]$gap; staleSec = 120 } }
@@ -245,6 +471,10 @@ $nRef = [int](Pick $env:FAKE_LEG_REFUSALS $k '0')
 if ($nRef -gt 0) { $res.admission['leaseRefusals'] = @(1..$nRef | ForEach-Object { [ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' } }) }
 $stop = Pick $env:FAKE_LEG_STOPS $k 'none'
 if ($stop -ne 'none') { $res.exitCode = 124; $res.admission['slotContinuity'] = 'lost'; $res.admission['leaseStop'] = [ordered]@{ reason = $stop; why = 'fake' } }
+# r5 (adversary r4 pass 3 A1 sibling): FAKE_LEG_LB_WRAP per call: array publishes the leg's leaseBatch (this batch's lease) inside a one-element array | none
+if ((Pick $env:FAKE_LEG_LB_WRAP $k 'none') -eq 'array') { $res.admission['leaseBatch'] = @($res.admission['leaseBatch']) }
+# r5 pass 3 (adversary r5 pass 2 A1): FAKE_LEG_ADM_WRAP per call: array publishes the leg's whole admission inside a one-element array | none
+if ((Pick $env:FAKE_LEG_ADM_WRAP $k 'none') -eq 'array') { $res['admission'] = @($res['admission']) }
 # r5b: FAKE_LEG_MODES 'unresolved' = um-run said UNRESOLVED for the leg's job (um-run.ps1:480-501): no agent result lands by name, and Invoke-VenueLeg still
 # writes its receipt (DVE_OUTCOME=UNRESOLVED) and exits 0
 if ($legMode -ne 'unresolved') { $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json") }
@@ -257,6 +487,10 @@ $rp = Join-Path $rdir "$id.json"; Set-Content -LiteralPath $rp -Value '{}'
 $edir = Join-Path (Join-Path (Split-Path -Parent $rroot) 'evidence') $id; New-Item -ItemType Directory -Force -Path $edir | Out-Null
 $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
+# r4 (adversary r4 A1): FAKE_LEG_TAIL_SLEEP = the leg child's own work after its agent job ended (its receipt, its evidence), before it exits
+if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SLEEP) }
+# r6 (adversary-848f6559.json A1): FAKE_LEG_EXIT per call = the child exits with that code AFTER its agent job's result landed (a receipt write denied, Invoke-VenueLeg.ps1:314)
+$legExit = [int](Pick $env:FAKE_LEG_EXIT $k '0'); if ($legExit -ne 0) { exit $legExit }
 "DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
 "DVE_RECEIPT_PATH=$rp"
 exit 0
@@ -322,6 +556,18 @@ def psq(value: object) -> str:
     """`value` for the inside of a PowerShell single-quoted literal: every embedded single-quote character (the ASCII one and the four typographic ones PowerShell also accepts) is
     doubled, so a temp dir or a message that carries an apostrophe cannot end the literal."""
     return "".join(c * 2 if c in PS_SINGLE_QUOTES else c for c in str(value))
+
+
+_WALL_CLOCK_READ = re.compile(r"UtcNow|Get-Date|\[DateTime\]::Now|\[datetime\]::Now", re.IGNORECASE)
+_WAIT_TIMING_NAME = re.compile(r"\$deadline\b|\$gateEnd\b|\$waitCutoff\b|\$now\b|waitedSec|-\s*\$t0\b|\$wu\b|\$wts\b", re.IGNORECASE)
+
+
+def wvq_wall_clock_timing_lines(text: str) -> list[str]:
+    """Code lines of Wait-VenueQuiet.ps1 that read the wall clock (UtcNow, Get-Date, [DateTime]::Now) on the same line as a deadline, the gate end, the caller's cutoff, `$now`, `$t0`
+    arithmetic or a waitedSec report. Those must all read Get-WaitNowUtc ($t0 plus the Stopwatch time since $t0Ts). Comment lines are skipped; a HH:mm:ss log stamp or a job id
+    on a line with none of those names is not timing and is not flagged."""
+    return [ln.strip() for ln in text.replace("\r\n", "\n").splitlines()
+            if not ln.strip().startswith("#") and _WALL_CLOCK_READ.search(ln) and _WAIT_TIMING_NAME.search(ln)]
 
 
 def leg_receipt_root_guard_ps(leg: Path, root: str, offline: bool = False) -> str:
@@ -712,6 +958,1119 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         res = batch_result(r.stdout)
         self.assertEqual((res["ran"], res["counted"]), (2, 1))
 
+    # ---------------------------------------------------------------- LEASE-BATCH-IDLE-END-UNSEEN-1: the agent's idle release of the parked batch lease
+    def test_an_idle_end_of_the_lease_during_a_quiet_wait_ends_the_batch_before_the_leg_launches(self) -> None:
+        # ledger QUEUED 2026-11-05T20:06:29Z (venue-42012aec): the agent released the idle batch lease (no job for 301 s > 300 s) while the leg's quiet probe waited, the runner kept counting
+        # its room, and the leg then ran on a fresh lease under the token: LEASE_LOST, a clean leg thrown away. The runner now reads the agent's receipt after the probe.
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        t1, t2 = b1["token"], b2["token"]
+        self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", "QUIET:IDLE", f"CLOSE:{t1}", f"OPEN:{t2}", "QUIET:QUIET", f"LEG:fx-b:{t2}", f"CLOSE:{t2}"])
+        self.assertEqual((b1["endReason"], b1["legsAttempted"], b1["legsRan"], b1["legsCounted"]), ("LEASE_IDLE_ENDED", 1, 1, 1), b1)
+        self.assertNotIn("LEASE_LOST", [l.get("class") for b in (b1, b2) for l in b["legs"]], "an idle end is never typed LEASE_LOST")
+        self.assertEqual((b2["endReason"], b2["legsRan"], b2["legsCounted"]), ("ALL_LEGS_DONE", 1, 1), "the leg goes to the next batch and counts there")
+        self.assertEqual(b1["agent"]["endReason"], "idle", "the agent's own receipt for the lease is attached")
+        self.assertIn("the agent released lease lease-1 as idle", b1["endDetail"])
+        # the room accounting stops at the idle end: the lease's end is clamped to the agent's endedUtc, and no later line of batch 1 counts room
+        ended = datetime.fromisoformat(b1["agent"]["endedUtc"].replace("Z", "+00:00"))
+        lease_end = datetime.fromisoformat(b1["leaseEndUtc"].replace("Z", "+00:00"))
+        self.assertLessEqual(lease_end, ended + timedelta(seconds=1), (b1["leaseEndUtc"], b1["agent"]["endedUtc"]))
+        lines = (self.run_dir / "batch.log").read_text(encoding="utf-8").splitlines()
+        at = next(i for i, l in enumerate(lines) if " LEASE_IDLE_ENDED batch=1 " in l)
+        self.assertFalse([l for l in lines[at + 1:] if "batch=1 " in l and "roomSec=" in l and " BATCH_END " not in l], lines[at:])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"]), (2, 2))
+
+    def test_lease_batch_idle_end_r2_adv_a2_the_idle_clamp_is_the_agents_instant_on_any_host_offset(self) -> None:
+        # adversary r2 pass 2 A2 / opus r1 H1: the clamp cast ConvertFrom-Json's endedUtc (an offset stamp becomes a Local DateTime) through [string], dropping the zone, so on a
+        # host west or east of UTC leaseEndUtc moved by the host's offset. The fake agent stamps endedUtc with '+00:00' at the probe; the clamp must land on that instant.
+        before = datetime.now(timezone.utc)
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
+        after = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        lease_end = datetime.fromisoformat(b1["leaseEndUtc"].replace("Z", "+00:00"))
+        self.assertTrue(before - timedelta(seconds=5) <= lease_end <= after + timedelta(seconds=5), (b1["leaseEndUtc"], before, after))
+
+    def test_a_leg_that_finished_after_the_agent_idled_its_lease_is_typed_idle_ended_not_lease_lost(self) -> None:
+        # the idle release landing after the pre-launch read: the leg's job took a fresh lease under the token (not the batch's), and the agent's receipt for the batch lease says idle
+        r = self.run_batch(self.specs[:2], FAKE_LEG_LOSE="1", FAKE_LEG_IDLE_END="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_IDLE_ENDED", 1, 0), b1)
+        self.assertEqual((b1["legs"][0]["class"], b1["legs"][0]["counted"], b1["legs"][0]["onLease"]), ("LEASE_IDLE_ENDED", False, False), b1["legs"][0])
+        # r4 (adversary r4 A2 sibling of Grok G9): this site types the end through the same helper: the lease's end clamped to the agent's endedUtc and the LEASE_IDLE_ENDED line
+        self._assert_idle_end_clamped_and_logged(b1)
+
+    def _assert_idle_end_clamped_and_logged(self, b: dict) -> None:
+        rows = [json.loads(l) for l in (self.share / "logs" / f"lease-batch-{b['token']}.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        idle = [x for x in rows if x.get("endReason") == "idle" and x.get("token") == b["token"]]
+        self.assertEqual(len(idle), 1, rows)
+        ended = datetime.fromisoformat(idle[0]["endedUtc"].replace("Z", "+00:00"))
+        lease_end = datetime.fromisoformat(b["leaseEndUtc"].replace("Z", "+00:00"))
+        self.assertLess(abs((lease_end - ended).total_seconds()), 1.0, (b["leaseEndUtc"], idle[0]["endedUtc"]))
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(f" LEASE_IDLE_ENDED batch={b['batch']} ", log)
+
+    def test_a_leg_never_launches_after_the_run_deadline_passed_between_its_probe_and_its_launch(self) -> None:
+        # adversary A1 (adversary-7ce11cb9.json): the launch guard checked the claim and the lease's room only, so the receipt read after a probe (or any slow guard) could carry the
+        # run past -DeadlineUtc and the leg still launched. The launch is the dispatch: a passed deadline starts nothing (DEADLINE, exit 3, the leg goes unrun).
+        dl = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=25))
+        r = self.run_batch(self.specs[:1], "-DeadlineUtc", dl, FAKE_QUIET_MODES="PASTDEADLINE", FAKE_DEADLINE_UTC=dl)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        b = self.batches()[0]
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("DEADLINE", 0, 0), b)
+        self.assertNotIn("LEG:fx-a", " ".join(k.rsplit(":", 1)[0] for k in self.kinds()), self.kinds())
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (3, "DEADLINE", 0, 1))
+
+    def test_a_lost_lease_with_no_idle_receipt_is_still_lease_lost(self) -> None:
+        # control: the typed idle end needs the agent's endReason=idle line for THIS lease; another end reason on it leaves LEASE_LOST as it was
+        r = self.run_batch(self.specs[:2], FAKE_LEG_LOSE="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["endReason"], b1["legs"][0]["class"], b1["agent"]["endReason"]), ("LEASE_LOST", "LEASE_LOST", "closed"), b1)
+
+    # ---------------------------------------------------------------- r2 (sol key r1 BLOCKER): a receipt line is this batch's only when its token AND lease id are this batch's
+    def test_r2_a_foreign_token_line_before_the_agents_own_idle_line_does_not_hide_the_idle_end(self) -> None:
+        # sol r1 repro: a foreign-token closed line for this lease, then the agent's idle line under this token. The reader returned the first lease match, so no idle end was seen
+        # and the next leg launched on an ended lease.
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLEFOREIGN,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        t1, t2 = b1["token"], b2["token"]
+        self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", "QUIET:IDLEFOREIGN", f"CLOSE:{t1}", f"OPEN:{t2}", "QUIET:QUIET", f"LEG:fx-b:{t2}", f"CLOSE:{t2}"])
+        self.assertEqual((b1["endReason"], b1["legsAttempted"], b1["legsRan"]), ("LEASE_IDLE_ENDED", 1, 1), b1)
+        self.assertEqual((b1["agent"]["token"], b1["agent"]["endReason"]), (t1, "idle"), b1["agent"])
+
+    def test_r2_an_idle_line_under_another_token_or_none_is_no_idle_end_of_this_batch(self) -> None:
+        for mode in ("FOREIGNIDLE", "NOTOKENIDLE"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES=f"QUIET,{mode},QUIET")
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                [b1] = self.batches()
+                t1 = b1["token"]
+                self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", f"QUIET:{mode}", f"LEG:fx-b:{t1}", f"CLOSE:{t1}"])
+                self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("ALL_LEGS_DONE", 2, 2), b1)
+                self.assertEqual((b1["agent"]["token"], b1["agent"]["endReason"]), (t1, "closed"), b1["agent"])
+
+    def test_r2_the_batch_attaches_only_its_own_tokens_receipt_line(self) -> None:
+        # the class sweep's third consumer (the receipt attached after the close): a foreign-token line for this lease came first and was attached as the agent's receipt
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,FOREIGNEND,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b1] = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsRan"]), ("ALL_LEGS_DONE", 2), b1)
+        self.assertEqual((b1["agent"]["token"], b1["agent"]["endReason"]), (b1["token"], "closed"), b1["agent"])
+
+    # ---------------------------------------------------------------- r3 (Grok CoS G1 on #817): the probe's wait vs the agent's idle bound, and the churn it caused
+    def _in_lease_waits(self) -> list[int]:
+        return [int(l.rsplit("maxWait=", 1)[1]) for l in self.events_raw() if " QUIET " in l]
+
+    def test_lease_batch_idle_end_r3_grok_g1_consecutive_zero_leg_idle_ends_stop_the_run_typed(self) -> None:
+        # G1: a venue whose probe outlasts the agent's idle bound every time ended batch after batch LEASE_IDLE_ENDED with no leg, each one a fresh lease (a ledger and budget charge),
+        # until the deadline. Batch 1 runs fx-a and idles on fx-b's probe (a leg was attempted: no churn yet); batches 2 and 3 open, idle and launch nothing: the second consecutive
+        # zero-leg idle end stops the run typed (LEASE_IDLE_CHURN, exit 14), three leases in all, fx-b NOT_RUN, never a fourth open.
+        dl = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=120))
+        r = self.run_batch(self.specs[:2], "-DeadlineUtc", dl, FAKE_QUIET_MODES="QUIET,IDLE,IDLE,IDLE,IDLE,IDLE,IDLE,IDLE")
+        self.assertEqual(r.returncode, 14, r.stdout + r.stderr)
+        bs = self.batches()
+        self.assertEqual(len(bs), 3, [(b["endReason"], b["legsAttempted"]) for b in bs])
+        t1, t2, t3 = (b["token"] for b in bs)
+        self.assertEqual(self.kinds(), [f"OPEN:{t1}", "QUIET:QUIET", f"LEG:fx-a:{t1}", "QUIET:IDLE", f"CLOSE:{t1}", f"OPEN:{t2}", "QUIET:IDLE", f"CLOSE:{t2}",
+                                        f"OPEN:{t3}", "QUIET:IDLE", f"CLOSE:{t3}"])
+        self.assertEqual([(b["endReason"], b["legsAttempted"]) for b in bs], [("LEASE_IDLE_ENDED", 1), ("LEASE_IDLE_ENDED", 0), ("LEASE_IDLE_ENDED", 0)])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"], res["notRun"]), (14, "LEASE_IDLE_CHURN", 1, 1, 1))
+        self.assertIn("LEASE_IDLE_CHURN", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_lease_batch_idle_end_r3_grok_g1_one_zero_leg_idle_end_between_legs_is_no_churn(self) -> None:
+        # control: a zero-leg idle end followed by a batch that launches a leg resets the count, so the run finishes (exit 0, 3 leases): only CONSECUTIVE zero-leg idle ends stop it
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="QUIET,IDLE,IDLE,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        bs = self.batches()
+        self.assertEqual([(b["endReason"], b["legsAttempted"]) for b in bs], [("LEASE_IDLE_ENDED", 1), ("LEASE_IDLE_ENDED", 0), ("ALL_LEGS_DONE", 1)])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (0, None, 2, 0))
+
+    def test_lease_batch_idle_end_r3_grok_g1_the_in_lease_probe_wait_stays_under_the_agents_idle_bound(self) -> None:
+        # G1: -ProbeMaxWaitSec (600 by default) let one probe wait twice the agent's idle bound (LeaseBatchIdleSec 300) with no job, so the lease idled out under it. The in-lease
+        # wait is cut to the agent's bound less -ProbeIdleMarginSec (60 by default): 240 s, with the lease's room far larger. -CooldownSec does NOT cut this wait (r4, Grok G6: a cooldown
+        # at or above the bound less the margin is refused before any lease instead, see test_lease_batch_idle_end_r4_grok_g6_*).
+        # r3 pass 2 (adversary A1): counted from the last agent job seen to end, so a probe a few seconds after the open or a leg gets a few seconds less than the bound
+        def within(waits: list[int], top: int) -> bool:
+            return len(waits) == 2 and all(top - 15 <= w <= top for w in waits)
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(within(self._in_lease_waits(), 240), self.events_raw())
+        self.setUp()
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", "-ProbeIdleMarginSec", "100")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(within(self._in_lease_waits(), 200), self.events_raw())
+        # a shorter -ProbeMaxWaitSec is kept as it is
+        self.setUp()
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "30")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self._in_lease_waits(), [30, 30], self.events_raw())
+
+    def _tree_with_agent_idle(self, idle: bytes) -> None:
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        agent = AGENT.read_bytes()
+        self.assertEqual(agent.count(b"[int]$LeaseBatchIdleSec = 300,"), 1, "the agent's idle bound moved: update this fixture")
+        (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec = " + idle + b","))
+        self.runner = tree / "dual-venue" / RUNNER.name
+
+    def test_lease_batch_idle_end_r3_grok_g1_the_idle_bound_is_read_from_the_agent_script_not_a_second_copy(self) -> None:
+        # the bound has ONE home, the agent's own param default (LeaseBatchIdleSec): a copy of the tree whose agent says 200 cuts the wait to about 200 - 60 = 140
+        self._tree_with_agent_idle(b"200")
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertTrue(len(waits) == 2 and all(125 <= w <= 140 for w in waits), self.events_raw())
+        self.assertNotRegex(RUNNER.read_text(encoding="utf-8"), r"(?i)IdleSec\s*=\s*300\b", "the runner keeps no second copy of the agent's 300 s")
+
+    def test_lease_batch_idle_end_r3_adv_a2_the_running_agents_published_idle_bound_wins_over_the_script_default(self) -> None:
+        # adversary r3 A2 (adversary-55df4367.json): an agent started with -LeaseBatchIdleSec 100 releases after 100 s whatever its script's default says. The agent publishes its
+        # effective bound (admission.leaseBatch.idleSec, Get-LeaseBatchAdmission) and the runner bounds its waits by it: about 100 - 60 = 40, never the default's 240.
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", FAKE_IDLE_SEC="100")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertTrue(len(waits) == 2 and all(25 <= w <= 40 for w in waits), self.events_raw())
+        # and the agent publishes it
+        self.assertIn("idleSec = $LeaseBatchIdleSec", AGENT.read_text(encoding="utf-8")[AGENT.read_text(encoding="utf-8").index("function Get-LeaseBatchAdmission"):][:900])
+
+    def test_lease_batch_idle_end_r3_adv_a1_busy_gate_retries_share_one_idle_allowance(self) -> None:
+        # adversary r3 A1: a GATE_BUSY probe runs no agent job, so the agent's idle clock keeps running across the retries; each retry used to get a fresh full allowance. Agent
+        # bound 70, margin 60: one 10 s allowance from the open, spent by the retries (2 s sleeps), never renewed by a busy probe; the QUIET probe after a leg starts a new one.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", "-ClaimPollSec", "2", FAKE_QUIET_MODES="BUSY,BUSY,BUSY,BUSY,QUIET,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 6, self.events_raw())
+        self.assertLessEqual(waits[0], 10, waits)
+        self.assertTrue(all(b <= a for a, b in zip(waits[:4], waits[1:5])), f"a busy retry got a fresh allowance: {waits}")
+        self.assertLessEqual(waits[4], 10 - 6, f"three 2 s busy sleeps spent at least 6 s of the allowance: {waits}")
+        self.assertGreaterEqual(waits[5], 5, f"a leg's job restarts the allowance: {waits}")
+
+    def _patch_tree_runner(self, old: str, new: str) -> None:
+        text = self.runner.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, "the runner line moved: update this fixture")
+        self.runner.write_text(text.replace(old, new), encoding="utf-8")
+
+    def test_lease_batch_idle_end_r3_adv_p2_a1_the_idle_allowance_starts_at_the_opens_read_not_after_its_log(self) -> None:
+        # adversary r3 pass 2 A1 (adversary-4c198b23.json): the anchor was taken after the BATCH_OPEN log append, so a stalled append was not spent from the allowance. Agent bound
+        # 70, margin 60 (a 10 s allowance), a 6 s stall before BATCH_OPEN: the first probe may wait at most about 4 s, never the full 10.
+        self._tree_with_agent_idle(b"70")
+        self._patch_tree_runner('            L "BATCH_OPEN batch=$batchNo', '            Start-Sleep -Seconds 6; L "BATCH_OPEN batch=$batchNo')
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 1, self.events_raw())
+        self.assertLessEqual(waits[0], 4, f"the stalled open log was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r3_adv_p2_a2_a_room_short_end_after_an_idle_release_is_typed_idle_ended(self) -> None:
+        # adversary r3 pass 2 A2: the idle release landed while a busy probe's sleep ran (the post-probe read missed it: simulated by a first read that finds nothing), the loop top
+        # then ended the batch LEASE_REMAINING_SHORT and the churn count was reset. The batch end now reads the agent's receipt first: LEASE_IDLE_ENDED, the leg runs in batch 2.
+        self._tree_with_agent_idle(b"300")
+        self._patch_tree_runner("    if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }\n    $ar = Read-VenueLeaseBatchReceipt",
+                                "    if ([string]::IsNullOrWhiteSpace($LeaseId)) { return $null }\n    $script:ieReads++; if ($script:ieReads -eq 1) { return $null }\n    $ar = Read-VenueLeaseBatchReceipt")
+        # -RecheckSec 30 with 75 s of lease: the busy probe leaves under one recheck of room after the leg budget, so the batch ends room-short right there (no further probe)
+        r = self.run_batch(self.specs[:1], "-ClaimPollSec", "20", "-RecheckSec", "30", FAKE_QUIET_MODES="IDLEBUSY,QUIET", FAKE_LEASE_REMAIN="75,2700")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsAttempted"]), ("LEASE_IDLE_ENDED", 0), b1)
+        self.assertIn("as idle", b1["endDetail"])
+        self.assertEqual((b2["endReason"], b2["legsRan"]), ("ALL_LEGS_DONE", 1), b2)
+        # r4 (Grok G9; adversary r4 A2): this retype is the same end as the in-loop one, so it carries every field that one sets: leaseEndUtc clamped to the agent's endedUtc
+        # (to the second) and the LEASE_IDLE_ENDED batch=1 line in batch.log (on 253ac155 it set only the reason and the detail)
+        self._assert_idle_end_clamped_and_logged(b1)
+
+    def test_lease_batch_idle_end_r4_grok_g9_lease_idle_ended_is_typed_in_one_helper(self) -> None:
+        # Grok G9 prevention: a second site that sets an existing end reason by hand drifts from the first. The literal assignment appears once, inside Set-BatchLeaseIdleEnded,
+        # and every site that finds the agent's idle release calls it (the probe's receipt read, the room-short batch end, a leg that ran off the lease: RETRY and RAN).
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(text.count("endReason = 'LEASE_IDLE_ENDED'"), 1)
+        start = text.index("function Set-BatchLeaseIdleEnded")
+        body = text[start:text.index("\n}\n", start)]
+        self.assertIn("endReason = 'LEASE_IDLE_ENDED'", body)
+        self.assertIn("ConvertTo-AgentUtc $Ie.endedUtc", body)
+        self.assertIn('LogBest "LEASE_IDLE_ENDED batch=', body)
+        self.assertEqual(text.count("Set-BatchLeaseIdleEnded $b "), 4, "the probe read, the room-short end, and the RETRY and RAN off-lease ends")
+
+    # ---------------------------------------------------------------- r4 (Grok G6 on #817): the run's own in-lease waits vs the agent's idle bound, refused before any lease
+    def test_lease_batch_idle_end_r4_grok_g6_a_cooldown_or_margin_past_the_idle_bound_is_refused_before_any_lease(self) -> None:
+        # -CooldownSec sleeps inside the lease with no job and is not bounded by the idle allowance: at or above the bound less the margin (300 - 60 = 240 with the agent script's
+        # default), the agent releases the lease under every cooldown. -ProbeIdleMarginSec at or above the bound leaves every probe no wait. Refused typed (exit 15) before
+        # anything is submitted: no open, no batch receipt. On 253ac155 these ran (exit 0).
+        for extra in (("-CooldownSec", "240"), ("-CooldownSec", "3600"), ("-ProbeIdleMarginSec", "300"), ("-ProbeIdleMarginSec", "1800")):
+            with self.subTest(extra=extra):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], *extra)
+                self.assertEqual(r.returncode, 15, r.stdout + r.stderr)
+                self.assertIn("BATCH_REFUSED IDLE_BOUND_CONFIG_REFUSED", r.stderr)
+                self.assertIn(extra[0], r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing was submitted")
+                self.assertFalse((self.run_dir / "batches.jsonl").exists())
+
+    def test_lease_batch_idle_end_r4_grok_g6_a_config_just_under_the_idle_bound_runs(self) -> None:
+        # control: one second under each refusal runs (exit 0)
+        for extra in (("-CooldownSec", "239"), ("-ProbeIdleMarginSec", "299")):
+            with self.subTest(extra=extra):
+                self.setUp()
+                r = self.run_batch(self.specs[:1], *extra)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(self.batches()[0]["endReason"], "ALL_LEGS_DONE")
+
+    def test_lease_batch_idle_end_r4_grok_g6_the_running_agents_tighter_bound_is_checked_once_the_lease_is_in_hand(self) -> None:
+        # the running agent publishes 100: -CooldownSec 40 (= 100 - 60) passes the pre-lease check against the script default (300) but not the bound the run uses. No probe or
+        # leg runs on the lease, the lease is closed, the run stops IDLE_BOUND_CONFIG_REFUSED (exit 15). The same for -ProbeIdleMarginSec 100.
+        for extra in (("-CooldownSec", "40"), ("-ProbeIdleMarginSec", "100")):
+            with self.subTest(extra=extra):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], *extra, FAKE_IDLE_SEC="100")
+                self.assertEqual(r.returncode, 15, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"]), ("IDLE_BOUND_CONFIG_REFUSED", 0), b)
+                self.assertIn("published by the running agent", b["endDetail"])
+                self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["notRun"]), (15, "IDLE_BOUND_CONFIG_REFUSED", 2))
+
+    # ---------------------------------------------------------------- r4 (Grok G7 on #817): a published idleSec that is there but invalid fails closed
+    def test_lease_batch_idle_end_r4_grok_g7_an_invalid_published_idle_bound_fails_closed_not_to_the_script_default(self) -> None:
+        # only an ABSENT field (an agent that predates it) falls back to the agent script's default; 0, a string, a double, a JSON null, a negative or an out-of-range value from
+        # the RUNNING agent means its bound is unknown: AGENT_IDLE_BOUND_UNKNOWN (exit 10), nothing runs, the lease is closed. On 253ac155 each fell back to 300 and ran.
+        for val in ("0", "str:100", "dbl:100.0", "null", "-5", "86401"):
+            with self.subTest(idleSec=val):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_IDLE_SEC=val)
+                self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"]), ("AGENT_IDLE_BOUND_UNKNOWN", 0), b)
+                self.assertIn("published admission.leaseBatch.idleSec=", b["endDetail"])
+                self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+
+    # ---------------------------------------------------------------- r5 (adversary r4 pass 3 A1): a leaseBatch that is not ONE object names no lease and no idle bound
+    def test_lease_batch_idle_end_r5_adv_a1_an_array_wrapped_lease_batch_is_not_batch_capable(self) -> None:
+        # adversary-493c4fff.json A1: admission.leaseBatch published as [{..}] (and [null, {..}], [[{..}]]) passed the capability check through member enumeration (.token and
+        # .leaseId answered from inside the array) while Get-PublishedIdleBound read the array's own properties: idleSec ABSENT, the script default 300, and the legs ran although the
+        # agent published idleSec 0. Now nothing runs (AGENT_NOT_BATCH_CAPABLE, exit 10), the close releases the token, and the lease it may hold is charged open to close, unnamed.
+        real = str(RUNNER.parent.parent / "um-run.ps1")
+        # r5 pass 3 (adversary r5 pass 2 A1): and the whole ADMISSION in a one-element array, which `$(...)` unrolled to the object inside before the reader saw it
+        cases = [("array", {"FAKE_OPEN_LB_WRAP": "array"}), ("nullplus", {"FAKE_OPEN_LB_WRAP": "nullplus"}), ("nested", {"FAKE_OPEN_LB_WRAP": "nested"}),
+                 ("array-real-umrun", {"FAKE_OPEN_LB_WRAP": "array", "FAKE_OPEN_VIA_REAL_UMRUN": "1", "FAKE_REAL_UMRUN": real}), ("admission-array", {"FAKE_OPEN_ADM_WRAP": "array"})]
+        for wrap, extra in cases:
+            with self.subTest(wrap=wrap):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_IDLE_SEC="0", **extra)
+                self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"], b["leaseId"]), ("AGENT_NOT_BATCH_CAPABLE", 0, None), b)
+                self.assertIn("not one admission.leaseBatch object", b["endDetail"])
+                self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+                self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), ("open-lease-unnamed", None), b["ledger"])
+                res = batch_result(r.stdout)
+                self.assertEqual((res["stopReason"], res["notRun"]), ("AGENT_NOT_BATCH_CAPABLE", 2))
+
+    def test_lease_batch_idle_end_r5_adv_p2_a1_a_lease_batch_with_no_usable_identity_is_charged_unnamed(self) -> None:
+        # adversary-ff81d798.json A1: the open's result {"leaseBatch":{"token":..,"leaseId":1,..}} reaches the runner through the real um-run.ps1 reader, whose VenueRawJson clears
+        # every identity of a reading that holds a non-string one. The leaseBatch is still ONE object, so the r5 MALFORMED charge did not fire: AGENT_NOT_BATCH_CAPABLE with no
+        # ledger row for a lease the agent took. It is charged open-lease-unnamed now; only an ABSENT leaseBatch (the nobatch agent) charges nothing.
+        real = str(RUNNER.parent.parent / "um-run.ps1")
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_LEASE_ID_NUM="1", FAKE_OPEN_VIA_REAL_UMRUN="1", FAKE_REAL_UMRUN=real)
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["leaseId"]), ("AGENT_NOT_BATCH_CAPABLE", 0, None), b)
+        self.assertIn("names no usable lease for token", b["endDetail"])
+        self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+        self.assertIsNotNone(b["ledger"], b)
+        self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), ("open-lease-unnamed", None), b["ledger"])
+        # control: an agent with no lease batches parks no lease, so nothing is charged
+        self.setUp()
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_MODES="nobatch")
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["ledger"]), ("AGENT_NOT_BATCH_CAPABLE", None), b)
+
+    def test_lease_batch_idle_end_r5_adv_p2_a2_the_in_lease_cooldown_never_sleeps_past_the_idle_allowance(self) -> None:
+        # adversary-ff81d798.json A2 sibling: the cooldown slept the full -CooldownSec after the leg child had already spent part of the allowance after its job ended. Agent
+        # bound 70, margin 60 (10 s), -CooldownSec 9 (accepted: under 10), the child works 6 s after its job: the cooldown is cut to at most about 4 s, and the cut is logged.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", "-CooldownSec", "9", FAKE_LEG_TAIL_SLEEP="6")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        m = re.search(r"COOLDOWN 9 s \(inside the lease\) cut to (\d+) s by the agent's idle allowance", log)
+        self.assertIsNotNone(m, [l for l in log.splitlines() if "COOLDOWN" in l])
+        self.assertLessEqual(int(m.group(1)), 4, m.group(0))
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertNotIn('Start-Sleep -Seconds $CooldownSec', src)
+
+    def test_lease_batch_idle_end_r5_adv_p3_a2_an_in_lease_probes_wait_ends_at_an_instant_fixed_at_its_dispatch(self) -> None:
+        # adversary-6e3937c6.json A2: the runner passed the idle allowance as -MaxWaitSec, which Wait-VenueQuiet counts from its OWN start, after the process start, so the
+        # queue-gate wait (no agent job) outlived the allowance by the startup. Every probe now also gets -WaitUntilUtc, the dispatch instant plus that wait on the runner's
+        # clock, and Wait-VenueQuiet ends every wait (the gate's included) by it. Agent bound 70, margin 60 (10 s): the in-lease probe's end lies inside the allowance.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rows = [l for l in self.events_raw() if " QUIET " in l]
+        self.assertGreaterEqual(len(rows), 1, self.events_raw())
+        for l in rows:
+            ticks, until, wait = int(l.split(" ", 1)[0]), l.split(" until=", 1)[1].split(" ", 1)[0], int(l.rsplit("maxWait=", 1)[1])
+            self.assertNotEqual(until, "-", f"no -WaitUntilUtc was passed: {l}")
+            end = datetime.fromisoformat(until.replace("Z", "+00:00"))
+            seen = datetime(1, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+            self.assertLessEqual(wait, 10, l)
+            self.assertLessEqual((end - seen).total_seconds(), wait + 0.5, f"the probe's end is past its dispatch plus its wait: {l}")
+        # the probe script ends every wait, the queue gate's included, by -WaitUntilUtc
+        wvq = (RUNNER.parent / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        for line in ("[Parameter(ParameterSetName = 'Live')][string]$WaitUntilUtc = '',", "    if ($wu -lt $deadline) { $deadline = $wu }", "    if ($wu -lt $gateEnd) { $gateEnd = $wu }"):
+            self.assertEqual(wvq.count(line), 1, line)
+        self.assertLess(wvq.index("$gateEnd = $t0.AddSeconds("), wvq.index("    if ($wu -lt $gateEnd) { $gateEnd = $wu }"))
+        self.assertLess(wvq.index("    if ($wu -lt $gateEnd) { $gateEnd = $wu }"), wvq.index("function Wait-QueueGate"))
+
+    # ---------------------------------------------------------------- r6 (adversary-848f6559.json A1/A2): the idle anchor after an agent job comes from that job's own result
+    def test_lease_batch_idle_end_r6_adv_a1_a_leg_that_exits_nonzero_after_its_job_still_spends_its_post_job_work(self) -> None:
+        # adversary-848f6559.json A1: a leg child that exits nonzero (the real Invoke-VenueLeg.ps1:314 exits 2 when its receipt write is denied) took the LEG_FAILED path, which skipped
+        # the move of the anchor to the job's endedUtc, so the child's 6 s after its job were never spent. Agent bound 70, margin 60 (10 s): the next probe waits at most about 4 s.
+        # Sibling: a child that dies 6 s in with NO result landed (exit3late) gives no evidence the agent's idle clock restarted, so the anchor stays where it was.
+        for name, env in (("exit2-after-its-job", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_EXIT": "2,0"}), ("exit3-no-result", {"FAKE_LEG_MODES": "exit3late,ok"})):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", **env)
+                self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual(b["legs"][0]["status"], "LEG_FAILED", b["legs"][0])
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertLessEqual(waits[1], 4, f"the failed leg child's time after its job was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r6_adv_a2_an_agent_clock_ahead_or_an_unreadable_end_falls_back_to_the_jobs_send(self) -> None:
+        # adversary-848f6559.json A2: an agent clock AHEAD of this host's gives a negative `ago`, and Get-AgentJobEndTs kept the observation instant: the time the job had already
+        # been over was never spent. With no usable endedUtc (ahead, or not an instant) the only safe bound is the job's send. Agent bound 70, margin 60 (10 s).
+        #   open: um-run returns 6 s after the send, the agent's clock 30 s ahead: the first probe waits at most about 4 s (it waited about 10).
+        #   leg (the :2574 sibling): the child works 6 s after its job, the agent's clock 30 s ahead, or endedUtc 'not-a-time': the next probe waits at most about 4 s.
+        for name, env, which in (("open-ahead", {"FAKE_OPEN_SLEEP": "6", "FAKE_OPEN_ENDED_AHEAD_SEC": "30"}, 0),
+                                 ("leg-ahead", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_ENDED_AHEAD_SEC": "30"}, 1),
+                                 ("leg-unreadable", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_ENDED_RAW": "not-a-time"}, 1)):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", **env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertLessEqual(waits[which], 4, f"{name}: the time since the job's send was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r6_adv_a2_get_agent_job_end_ts_never_keeps_the_observation_on_an_unusable_end(self) -> None:
+        # the helper itself, with the adversary's input: endedUtc 5 s in this host's future (ago < 0), unreadable, absent: the floor (the send). A usable end in the past moves the
+        # anchor earlier, never before the floor and never after the observation.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $now = [Diagnostics.Stopwatch]::GetTimestamp(); $floor = $now - 20 * $f; $obs = $now - 1 * $f\n"
+            "$out = [ordered]@{}\n"
+            "$out['ahead'] = (Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(5).ToString('o'))) -eq $floor\n"
+            "$out['unreadable'] = (Get-AgentJobEndTs $obs $floor 'not-a-time') -eq $floor\n"
+            "$out['absent'] = (Get-AgentJobEndTs $obs $floor $null) -eq $floor\n"
+            "$p = Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-6).ToString('o')); $out['past'] = ($p -ge $floor) -and ($p -le $now - 5 * $f)\n"
+            "$out['beforeFloor'] = (Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-60).ToString('o'))) -eq $floor\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"ahead": True, "unreadable": True, "absent": True, "past": True, "beforeFloor": True})
+
+    def test_lease_batch_idle_end_r7_adv_a1_a_pause_between_the_two_clock_reads_never_places_the_end_late(self) -> None:
+        # adversary-cc90eef2.json A1: Get-AgentJobEndTs read the wall clock (`ago`) and THEN the monotonic one (`nowTs`), so a scheduling pause between the two reads was added to
+        # the anchor: the job's end landed that pause late and the idle allowance got that time back (a 6 s pause granted 3 s past an exhausted allowance). The helper is rebuilt
+        # here with a 1.5 s sleep after EVERY statement of its body (whatever order the reads are in, a pause sits between them), the job ended 2 s before the call. The anchor
+        # may land earlier than the true end (spent, conservative), never more than 0.3 s later. Siblings: every Get-AgentJobEndTs caller (:2324 open, :2559 leg) and every
+        # Get-IdleAllowanceSec reader (:1517 probe wait, :2469 thermal sleep, :2638 cooldown) read the anchor this helper places; no other wall-to-monotonic conversion exists.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "$fa = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'ConvertTo-AgentUtc' }, $true); . ([scriptblock]::Create($fa.Extent.Text))\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-AgentJobEndTs' }, $true)\n"
+            "$stmts = @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text })\n"
+            "$text = 'function Get-AgentJobEndTs(' + (@($fn.Parameters | ForEach-Object { $_.Extent.Text }) -join ', ') + \") {`n\" + ($stmts -join \"`nStart-Sleep -Milliseconds 1500`n\") + \"`n}\"\n"
+            ". ([scriptblock]::Create($text))\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "$trueEnd = $t0Ts - 2 * $f; $floor = $t0Ts - 100 * $f\n"
+            "$a = Get-AgentJobEndTs $t0Ts $floor ($t0.AddSeconds(-2).ToString('o'))\n"
+            "[ordered]@{ statements = $stmts.Count; lateSec = [Math]::Round(($a - $trueEnd) / [double]$f, 3); atOrAboveFloor = ($a -ge $floor) } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        # r10 (sol r9b 9a56fa7a-A1): the helper reads no clock at all now (the send, floored at the observation), so its body may be one statement; the pause bound still holds
+        self.assertGreaterEqual(got["statements"], 1, got)
+        self.assertTrue(got["atOrAboveFloor"], got)
+        self.assertLessEqual(got["lateSec"], 0.3, f"a pause between the clock reads placed the agent job's end late (time handed back to the idle allowance): {got}")
+
+    def test_lease_batch_idle_end_r7_adv_a2_a_receipt_or_ledger_line_that_is_not_one_json_object_is_never_read(self) -> None:
+        # adversary-065db820.json A2: a lease-batch receipt line [null,{token,leaseId,endReason:idle}] reached Read-VenueLeaseBatchReceipt as an array, and member enumeration
+        # answered .token/.leaseId/.endReason from the object inside it: FOUND, then Get-LeaseIdleEnd typed LEASE_IDLE_ENDED (repeated: LEASE_IDLE_CHURN, exit 14). ConvertFrom-Json
+        # also unrolls [{..}] and [[{..}]] to the object inside, so only a line whose text is ONE JSON object ({ first) is a record. Sibling (VenueChain.psm1:1155): the lease
+        # ledger reader, same rule. The plain object line still answers FOUND and the plain ledger line is still read.
+        case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        (case / "share" / "logs").mkdir(parents=True)
+        tok = "0123456789ab"
+        rec = '{"token":"0123456789ab","leaseId":"L1","endReason":"idle","endedUtc":"2026-11-14T18:00:00Z","heldSec":301}'
+        led = '{"venue":"bachelor","token":"0123456789ab","leaseId":"L1","startUtc":"2026-11-14T17:00:00Z","endUtc":"2026-11-14T17:30:00Z"}'
+        script = (
+            f"Import-Module '{psq(DV / 'VenueChain.psm1')}' -Force -DisableNameChecking\n"
+            f"$share = '{psq(case / 'share')}'; $log = Join-Path $share 'logs\\lease-batch-{tok}.jsonl'; $cd = '{psq(case / 'claims')}'\n"
+            "New-Item -ItemType Directory -Force -Path $cd | Out-Null\n"
+            f"$rec = '{psq(rec)}'; $led = '{psq(led)}'\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($k in 'nullThenObject', 'oneElement', 'nested', 'plain') {\n"
+            "    $line = switch ($k) { 'nullThenObject' { \"[null,$rec]\" } 'oneElement' { \"[$rec]\" } 'nested' { \"[[$rec]]\" } 'plain' { $rec } }\n"
+            "    [IO.File]::WriteAllText($log, $line + \"`n\")\n"
+            f"    $out[\"receipt_$k\"] = (Read-VenueLeaseBatchReceipt -AgentShare $share -Token '{tok}' -LeaseId 'L1').state\n"
+            "    $lp = Get-VenueLeaseLedgerPath -Venue 'bachelor' -ClaimDir $cd; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $lp) | Out-Null\n"
+            "    $lline = switch ($k) { 'nullThenObject' { \"[null,$led]\" } 'oneElement' { \"[$led]\" } 'nested' { \"[[$led]]\" } 'plain' { $led } }\n"
+            "    [IO.File]::WriteAllText($lp, $lline + \"`n\")\n"
+            "    $out[\"ledger_$k\"] = @(Read-VenueLeaseLedger -Venue 'bachelor' -ClaimDir $cd).Count\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {
+            "receipt_nullThenObject": "ABSENT", "ledger_nullThenObject": 0,
+            "receipt_oneElement": "ABSENT", "ledger_oneElement": 0,
+            "receipt_nested": "ABSENT", "ledger_nested": 0,
+            "receipt_plain": "FOUND", "ledger_plain": 1,
+        })
+
+    # ---------------------------------------------------------------- r8 (adversary-f52a32d6.json A1): an in-lease probe's wait end is counted from an instant read BEFORE its cuts
+    def test_lease_batch_idle_end_r8_adv_a1_a_stall_before_the_probes_dispatch_never_places_its_wait_end_late(self) -> None:
+        # adversary-f52a32d6.json A1: Invoke-QuietProbe cut the wait at Get-ProbeLaunchVerdict (:1533) and fixed its end at -WaitUntilUtc (:1550) from UtcNow read LATER, so a
+        # stall in between (the thermal admission, scheduling) was added on top of the idle allowance: idle 300, margin 60, a 90 s pause gave an end 30 s past the agent's bound.
+        # Siblings: the lease room cut (:1517, read at the same call) and the thermal cap cut (:1540) are the same stale duration. The function is rebuilt here with a 1 s sleep
+        # after EVERY top-level statement before the probe starts, so a pause sits between any read and any use; the wait end may land early (spent), never more than 0.3 s
+        # past the idle allowance, the lease room or the thermal cap, and -MaxWaitSec is never above the duration the end was cut from.
+        case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            f"Import-Module '{psq(DV / 'VenueThermalGate.psm1')}' -Force -DisableNameChecking\n"
+            "foreach ($n in 'Get-ProbeLaunchVerdict', 'Get-IdleAllowanceSec', 'Get-ThermalElapsedSec') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-QuietProbe' }, $true)\n"
+            "$stmts = @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text })\n"
+            "$cut = 0; while ($cut -lt $stmts.Count -and -not $stmts[$cut].StartsWith('$captured')) { $cut++ }\n"
+            "$body = @(for ($i = 0; $i -lt $stmts.Count; $i++) { $stmts[$i]; if ($i -lt $cut) { 'Start-Sleep -Milliseconds 1000' } }) -join \"`n\"\n"
+            ". ([scriptblock]::Create('function Invoke-QuietProbe(' + (@($fn.Parameters | ForEach-Object { $_.Extent.Text }) -join ', ') + \") {`n\" + $body + \"`n}\"))\n"
+            "function Test-RunDirWrite { $true }; function Get-VenueClaimKeeperLoss { $null }; function L { }\n"
+            "function ConvertFrom-VenueProbeHeatLine { [pscustomobject]@{ heat = 'unknown'; text = ''; thresholdsSource = $null; reason = $null } }\n"
+            "function Invoke-FakeProbe { $global:seenArgs = @($args); $global:LASTEXITCODE = 3 }\n"
+            f"$RunDir = '{psq(case)}'; $QuietScript = '{psq(RUNNER)}'; $Venue = 'bachelor'; $ThresholdPercent = 15; $RecheckSec = 30; $pwshExe = 'Invoke-FakeProbe'\n"
+            "$claimKeeper = $null; $claim = [pscustomobject]@{ expiresUtc = [DateTime]::UtcNow.AddHours(1) }; $ThermalDispatchGraceSec = 1; $ThermalPollSec = 30\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($k in 'idle', 'room', 'thermal') {\n"
+            "    $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "    $idleAnchorTs = $t0Ts; $probeIdleCap = $(if ($k -eq 'idle') { 30 } else { 600 }); $LeaseMarginSec = 60; $legBudget = 600\n"
+            "    $leaseEnd = $t0.AddSeconds($(if ($k -eq 'room') { 60 + 600 + 30 } else { 7200 }))\n"
+            "    $ThermalWaitCapSec = 30; $th = $(if ($k -eq 'thermal') { @{ firstHotUtc = $t0; firstHotTs = $t0Ts; slowProbeSec = 0 } } else { $null })\n"
+            "    $global:seenArgs = @()\n"
+            "    $q = Invoke-QuietProbe 'leg' \"r8-$k\" 600 $th\n"
+            "    $a = @($global:seenArgs); $iu = [Array]::IndexOf($a, '-WaitUntilUtc'); $im = [Array]::IndexOf($a, '-MaxWaitSec')\n"
+            "    if ($iu -lt 0) { $out[$k] = \"no -WaitUntilUtc ($($q | ConvertTo-Json -Compress))\"; continue }\n"
+            "    $until = [DateTime]::Parse($a[$iu + 1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()\n"
+            "    $out[$k] = [ordered]@{ statements = $cut; lateSec = [Math]::Round(($until - $t0.AddSeconds(30)).TotalSeconds, 3); maxWaitSec = [int]$a[$im + 1]; waitSec = $q.maxWaitSec }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        for k in ("idle", "room", "thermal"):
+            with self.subTest(bound=k):
+                g = got[k]
+                self.assertIsInstance(g, dict, g)
+                self.assertGreaterEqual(g["statements"], 8, g)
+                self.assertLessEqual(g["lateSec"], 0.3, f"{k}: a stall before the dispatch placed the probe's wait end past the {k} bound: {g}")
+                self.assertEqual(g["maxWaitSec"], g["waitSec"], g)
+                self.assertLessEqual(g["maxWaitSec"], 30, g)
+
+    # ---------------------------------------------------------------- r9 (Grok G14 on #817): the probe's wait end is counted on the MONOTONIC clock from its anchor
+    def test_lease_batch_idle_end_r9_grok_g14_a_wall_clock_step_back_before_the_probes_dispatch_never_places_its_wait_end_late(self) -> None:
+        # Grok G14: r8 counted -WaitUntilUtc from $dispatchUtc = [DateTime]::UtcNow, read before the cuts (which can block on a share), so this host's clock stepping BACK S between
+        # that read and the dispatch put the end S later in the child's frame (Wait-VenueQuiet compares it with its own wall clock): a 60 s step ran the wait 60 s past the idle
+        # allowance. The function is rebuilt with every [DateTime]::UtcNow read in it going through a fake wall clock that steps back 60 s after ONE top-level statement; each
+        # statement before the one that places -WaitUntilUtc is tried in turn, wherever the anchor sits. In the stepped frame the idle bound is t0 + 30 - 60: the end may land
+        # early (spent), never more than 0.3 s past it. Only the child's own startup, after the dispatch, stays exposed (disclosed). LEASE_BATCH_RED_REF=2854b231: RED, ~60 s late.
+        case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        script = (
+            ps_parse_source(RUNNER) + "\n"
+            f"Import-Module '{psq(DV / 'VenueThermalGate.psm1')}' -Force -DisableNameChecking\n"
+            "foreach ($n in 'Get-ProbeLaunchVerdict', 'Get-IdleAllowanceSec', 'Get-ThermalElapsedSec') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-QuietProbe' }, $true)\n"
+            "$stmts = @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text.Replace('[DateTime]::UtcNow', '(Get-FakeWallUtc)') })\n"
+            "$params = @($fn.Parameters | ForEach-Object { $_.Extent.Text }) -join ', '\n"
+            "$cut = 0; while ($cut -lt $stmts.Count -and -not $stmts[$cut].Contains(\"'-WaitUntilUtc'\")) { $cut++ }\n"
+            "function Get-FakeWallUtc { [DateTime]::UtcNow.AddSeconds($global:wallStepSec) }\n"
+            "function Test-RunDirWrite { $true }; function Get-VenueClaimKeeperLoss { $null }; function L { }\n"
+            "function ConvertFrom-VenueProbeHeatLine { [pscustomobject]@{ heat = 'unknown'; text = ''; thresholdsSource = $null; reason = $null } }\n"
+            "function Invoke-FakeProbe { $global:seenArgs = @($args); $global:LASTEXITCODE = 3 }\n"
+            f"$RunDir = '{psq(case)}'; $QuietScript = '{psq(RUNNER)}'; $Venue = 'bachelor'; $ThresholdPercent = 15; $RecheckSec = 30; $pwshExe = 'Invoke-FakeProbe'\n"
+            "$claimKeeper = $null; $claim = [pscustomobject]@{ expiresUtc = [DateTime]::UtcNow.AddHours(1) }; $ThermalDispatchGraceSec = 1; $ThermalPollSec = 30; $ThermalWaitCapSec = 30\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency\n"
+            "$runs = @(for ($k = 0; $k -lt $cut; $k++) {\n"
+            "    $body = @(for ($i = 0; $i -lt $stmts.Count; $i++) { $stmts[$i]; if ($i -eq $k) { '$global:wallStepSec = -60' } }) -join \"`n\"\n"
+            "    . ([scriptblock]::Create('function Invoke-QuietProbe(' + $params + \") {`n\" + $body + \"`n}\"))\n"
+            "    $global:wallStepSec = 0; $global:seenArgs = @()\n"
+            "    $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "    $idleAnchorTs = $t0Ts; $probeIdleCap = 30; $LeaseMarginSec = 60; $legBudget = 600; $leaseEnd = $t0.AddSeconds(7200)\n"
+            "    $q = Invoke-QuietProbe 'leg' \"r9-g14-$k\" 600 $null\n"
+            "    $a = @($global:seenArgs); $iu = [Array]::IndexOf($a, '-WaitUntilUtc'); $im = [Array]::IndexOf($a, '-MaxWaitSec')\n"
+            "    if ($iu -lt 0) { \"after statement ${k}: no -WaitUntilUtc ($($q | ConvertTo-Json -Compress))\"; continue }\n"
+            "    $until = [DateTime]::Parse($a[$iu + 1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()\n"
+            "    $it = [Array]::IndexOf($a, '-WaitUntilTs'); $tsLate = $(if ($it -ge 0) { [Math]::Round(([long]$a[$it + 1] - ($t0Ts + 30 * $f)) / [double]$f, 3) } else { $null })\n"
+            "    [ordered]@{ after = $k; lateSec = [Math]::Round(($until - $t0.AddSeconds(30 - 60)).TotalSeconds, 3); tsLateSec = $tsLate; maxWaitSec = [int]$a[$im + 1]; waitSec = $q.maxWaitSec }\n"
+            "})\n"
+            "[ordered]@{ cut = $cut; runs = $runs } | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=240)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertGreaterEqual(got["cut"], 8, got)
+        self.assertEqual(len(got["runs"]), got["cut"], got)
+        for g in got["runs"]:
+            with self.subTest(step_after_statement=g["after"] if isinstance(g, dict) else g):
+                self.assertIsInstance(g, dict, g)
+                self.assertLessEqual(g["lateSec"], 0.3, f"a 60 s wall-clock step back after statement {g['after']} placed the probe's wait end past the idle bound: {g}")
+                self.assertGreater(g["lateSec"], -5.0, f"the wait end was placed far earlier than the bound (the spent time counted twice?): {g}")
+                # r9b (adversary-74e14dda.json A1): the same end on the monotonic counter, which no wall step moves
+                self.assertIsNotNone(g["tsLateSec"], f"no -WaitUntilTs was passed: {g}")
+                self.assertLessEqual(g["tsLateSec"], 0.3, g)
+                self.assertGreater(g["tsLateSec"], -5.0, g)
+                self.assertEqual(g["maxWaitSec"], g["waitSec"], g)
+                self.assertLessEqual(g["maxWaitSec"], 30, g)
+
+    # ---------------------------------------------------------------- r8 (Grok G12 on #817): an agent clock ahead charges the send plus the job's own runtime, not the bare send
+    def test_lease_batch_idle_end_r8_grok_g12_get_agent_job_end_ts_ahead_floor_is_the_send_plus_the_jobs_runtime(self) -> None:
+        # Get-AgentJobEndTs returned the bare send whenever the agent's endedUtc lay in this host's future, so one second of skew past the job-to-observation gap charged the whole
+        # job to the idle allowance. endedUtc - startedUtc is a duration on the agent's one clock (the skew cancels) and the job cannot end before send + that: the floor is that,
+        # never past the observation. startedUtc absent, JSON null (the queue-expired result), unreadable, or after endedUtc: the send alone. A clock behind is unchanged.
+        # r10 (sol r9b 9a56fa7a-A1) SUPERSEDES the send-plus-runtime floor: endedUtc - startedUtc is a difference on the agent's wall clock, which a step during the job inflates
+        # (a +90 s correction in a 100 s job read 190 s). Every input below now gives the send (the helper no longer takes the agent's stamps; extra arguments are ignored).
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $now = [Diagnostics.Stopwatch]::GetTimestamp(); $floor = $now - 20 * $f; $obs = $now - 1 * $f\n"
+            "$e = [DateTime]::UtcNow.AddSeconds(5); $es = $e.ToString('o')\n"
+            "$out = [ordered]@{}\n"
+            "$out['aheadRuntimeIsTheSend'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-6).ToString('o'))) -eq $floor\n"
+            "$out['aheadLongRuntimeIsTheSend'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(-60).ToString('o'))) -eq $floor\n"
+            "$out['aheadStartedNull'] = (Get-AgentJobEndTs $obs $floor $es $null) -eq $floor\n"
+            "$out['aheadStartedAbsent'] = (Get-AgentJobEndTs $obs $floor $es) -eq $floor\n"
+            "$out['aheadStartedUnreadable'] = (Get-AgentJobEndTs $obs $floor $es 'not-a-time') -eq $floor\n"
+            "$out['aheadStartedAfterEnd'] = (Get-AgentJobEndTs $obs $floor $es ($e.AddSeconds(3).ToString('o'))) -eq $floor\n"
+            "$out['aheadStartedArray'] = (Get-AgentJobEndTs $obs $floor $es @($e.AddSeconds(-6).ToString('o'))) -eq $floor\n"
+            "$p = Get-AgentJobEndTs $obs $floor ([DateTime]::UtcNow.AddSeconds(-6).ToString('o')) ([DateTime]::UtcNow.AddSeconds(-8).ToString('o')); $out['pastUnchanged'] = ($p -ge $floor) -and ($p -le $now - 5 * $f)\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"aheadRuntimeIsTheSend": True, "aheadLongRuntimeIsTheSend": True, "aheadStartedNull": True, "aheadStartedAbsent": True,
+                                                  "aheadStartedUnreadable": True, "aheadStartedAfterEnd": True, "aheadStartedArray": True, "pastUnchanged": True})
+        # r10: neither caller passes an agent stamp any more (the r10 grid test pins both call lines); none unrolls one either
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertNotIn("$openStartedUtc", src)
+        self.assertNotIn("$legStartedUtc", src)
+        self.assertNotIn("{ $op.result.startedUtc }", src)
+        self.assertNotIn("{ $jr.result.startedUtc }", src)
+
+    # ---------------------------------------------------------------- r10 (sol r9b 9a56fa7a-A1): an agent-clock step during a job never returns spent idle time
+    def test_lease_batch_idle_end_r10_sol_9a56fa7a_a1_an_agent_clock_step_during_a_job_never_extends_the_next_idle_allowance(self) -> None:
+        # The agent times its idle release on ITS wall clock and starts that clock AFTER the job ends (ultra-magnus-agent.ps1: `lastActivity = Get-Date` in the inbox loop's
+        # finally after Invoke-QueuedJob and at the park in Exit-HeavySlot, compared by `(Get-Date) - $b.lastActivity` in Update-LeaseBatchHold), so a step of that clock
+        # DURING the job does not move the release: it is the job's real end plus idleSec. The runner placed the end from endedUtc (and, ahead, endedUtc - startedUtc), both
+        # agent-wall-clock readings, so a forward step put the anchor late and handed spent time back. sol's input: send 12:00:00Z, agent +30 s (startedUtc 12:00:30Z), a real
+        # 100 s job with a +90 s correction (endedUtc 12:03:40Z), observed at send+180, idleSec 300, margin 60, ProbeMaxWaitSec 600: the next wait ended at send+420, past the
+        # release at send+400. For EVERY offset/step/queue on the grid, the next wait must end no later than the release less the margin, and the anchor no later than the true end.
+        agent = AGENT.read_text(encoding="utf-8")
+        self.assertIn("Exit-HeavySlot\n                if ($null -ne $script:LeaseBatch) { $script:LeaseBatch.lastActivity = Get-Date }", agent.replace("\r\n", "\n"))
+        self.assertIn("$idle = ((Get-Date) - $b.lastActivity).TotalSeconds", agent)
+        script = (
+            f"{ps_parse_source(RUNNER)}\n"
+            "foreach ($n in 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs', 'Get-IdleAllowanceSec') { $d = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($d) { . ([scriptblock]::Create($d.Extent.Text)) } }\n"
+            "$f = [double][Diagnostics.Stopwatch]::Frequency; $idleSec = 300; $margin = 60; $probeIdleCap = $idleSec - $margin; $obsSec = 180\n"
+            "$bad = [System.Collections.Generic.List[string]]::new(); $n = 0; $sol = $null\n"
+            "foreach ($offset in @(-60, 0, 30, 120)) { foreach ($step in @(-120, -30, 0, 30, 50, 79, 90, 150)) { foreach ($queue in @(0, 40)) {\n"
+            "  $nowTs = [Diagnostics.Stopwatch]::GetTimestamp(); $nowUtc = [DateTime]::UtcNow\n"
+            "  $sendTs = $nowTs - [long]($obsSec * $f); $sendUtc = $nowUtc.AddSeconds(-$obsSec); $realEnd = $queue + 100\n"
+            "  $startedUtc = $sendUtc.AddSeconds($queue + $offset).ToString('o'); $endedUtc = $sendUtc.AddSeconds($realEnd + $offset + $step).ToString('o')\n"
+            "  $idleAnchorTs = Get-AgentJobEndTs $nowTs $sendTs $endedUtc $startedUtc\n"
+            "  $waitEnd = $obsSec + [Math]::Min(600, (Get-IdleAllowanceSec)); $lateSec = ($idleAnchorTs - ($sendTs + [long]($realEnd * $f))) / $f; $n++\n"
+            "  if ($offset -eq 30 -and $step -eq 90 -and $queue -eq 0) { $sol = [ordered]@{ waitEndSec = $waitEnd; releaseSec = $realEnd + $idleSec; anchorLateSec = [Math]::Round($lateSec, 2) } }\n"
+            "  if ($waitEnd -gt $realEnd + $idleSec - $margin -or $lateSec -gt 0.5) { $bad.Add(\"offset=$offset step=$step queue=$queue waitEnd=$waitEnd release=$($realEnd + $idleSec) late=$([Math]::Round($lateSec, 1))\") }\n"
+            "} } }\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-AgentJobEndTs' }, $true)\n"
+            "[ordered]@{ cases = $n; bad = @($bad); sol = $sol; readsAgentOrWallClock = [bool](((@($fn.Parameters | ForEach-Object { $_.Extent.Text }) + @($fn.Body.EndBlock.Statements | ForEach-Object { $_.Extent.Text })) -join \"`n\") -match 'UtcNow|Get-Date|ConvertTo-AgentUtc|EndedUtc|StartedUtc') } | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["cases"], 64, got)
+        self.assertLessEqual(got["sol"]["waitEndSec"], got["sol"]["releaseSec"] - 60, f"sol's input: the next wait runs past the agent's idle release less the margin: {got['sol']}")
+        self.assertEqual(got["bad"], [], "an agent-clock step the runner cannot see moved the idle anchor past the job's true end")
+        self.assertFalse(got["readsAgentOrWallClock"], "the job-end anchor reads an agent wall-clock stamp (or this host's wall clock): a step of either moves it")
+        # both callers hand the anchor only monotonic instants: the open (its result's return, floored at its submit) and a leg (its child's return, floored at its launch)
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("$idleAnchorTs = Get-AgentJobEndTs $(if ($null -ne $openResultTs) { $openResultTs } else { $openReadTs }) $openSubmitTs\n", src.replace("\r\n", "\n"))
+        self.assertIn("{ $idleAnchorTs = Get-AgentJobEndTs $legReturnTs $tLegTs }", src)
+        self.assertNotRegex(src, r"Get-AgentJobEndTs [^\n]*(?:endedUtc|startedUtc)")
+
+    def test_lease_batch_idle_end_r10_sol_9a56fa7a_a1_a_forward_agent_step_under_the_observation_gap_is_spent_end_to_end(self) -> None:
+        # the ago >= 0 branch of the same class, run end to end: agent bound 70, margin 60 (10 s). The leg child works 6 s after its job and the agent's endedUtc reads 3 s late
+        # (a forward step smaller than the job-to-observation gap, so `ago` stays positive): placed from endedUtc the next probe waited about 7 s; from the leg's launch at most 4.
+        # Control: the same leg with no step. The open sibling is the same helper (the grid test above pins both call sites); the fake open's job ends at its return.
+        for name, env, which in (("leg-step", {"FAKE_LEG_TAIL_SLEEP": "6", "FAKE_LEG_ENDED_AHEAD_SEC": "3"}, 1),
+                                 ("leg-no-step", {"FAKE_LEG_TAIL_SLEEP": "6"}, 1)):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", **env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertLessEqual(waits[which], 4, f"{name}: a forward agent-clock step handed spent time back to the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r8_adv_5fc3bf72_a2_wait_venue_quiet_times_every_deadline_on_the_monotonic_clock(self) -> None:
+        # adversary-5fc3bf72.json A2: Wait-VenueQuiet compared [DateTime]::UtcNow with its deadline and gate end, so this host's clock stepping BACK 120 s mid-wait stretched a
+        # 240 s gate wait to about 360 s (past the agent's idle bound) while waitedSec said 240. Every deadline check and waitedSec now reads Get-WaitNowUtc: $t0 plus the
+        # Stopwatch time since it. Run with a $t0 far from the wall clock (a step of years), it still answers $t0 + the monotonic elapsed time.
+        wvq_path = RUNNER.parent / "Wait-VenueQuiet.ps1"
+        wvq = wvq_path.read_text(encoding="utf-8")
+        self.assertEqual(wvq_wall_clock_timing_lines(wvq), [], "a deadline check or waitedSec still reads the wall clock")
+        # r13 (hosted CI, run 43789411276): the lint above must go RED on a body with a wall-clock deadline left in it, whichever spelling it uses.
+        for what, old, new in (
+            ("the caller's cutoff gate on Get-Date", "(Get-WaitNowUtc) -ge $waitCutoff", "(Get-Date).ToUniversalTime() -ge $waitCutoff"),
+            ("the gate poll's $now on Get-Date", "        $now = Get-WaitNowUtc\n", "        $now = (Get-Date).ToUniversalTime()\n"),
+            ("the re-probe deadline on UtcNow", "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }",
+             "if ([DateTime]::UtcNow.AddSeconds($RecheckSec) -gt $deadline) { break }"),
+            ("the read-retry deadline on Get-Date", "if ((Get-WaitNowUtc).AddSeconds($delay) -gt $deadline) { return }",
+             "if ((Get-Date).AddSeconds($delay) -gt $deadline) { return }"),
+            ("a waitedSec report on UtcNow", "waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) probes=", "waitedSec=$([int]([DateTime]::UtcNow - $t0).TotalSeconds) probes="),
+        ):
+            norm = wvq.replace("\r\n", "\n")
+            self.assertIn(old, norm, what)
+            self.assertNotEqual(wvq_wall_clock_timing_lines(norm.replace(old, new, 1)), [], f"the lint missed: {what}")
+        for frag in ("if ((Get-WaitNowUtc).AddSeconds($delay) -gt $deadline) { return }", "        $now = Get-WaitNowUtc\n",
+                     "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }",
+                     "(Get-WaitNowUtc) -ge $waitCutoff }"):
+            self.assertEqual(wvq.replace("\r\n", "\n").count(frag), 1, frag)
+        # r13: the monotonic `waitedSec=` form occurs once per REPORT, not once per deadline. Pin WHAT each occurrence guards (a count alone went stale when r11/r12 added the three
+        # GATE_CUTOFF phases): the three end-of-wait reports, then the three cutoff refusals by phase. A new report line must be added here on purpose.
+        mono = [ln for ln in wvq.replace("\r\n", "\n").splitlines() if not ln.strip().startswith("#") and "(Get-WaitNowUtc) - $t0).TotalSeconds" in ln]
+        tags = []
+        for ln in mono:
+            m = re.search(r'Write-Gate "(\$verdict|[A-Z_]+)', ln)
+            self.assertIsNotNone(m, ln)
+            tag = m.group(1)
+            if tag == "GATE_CUTOFF":
+                tag += ":" + re.search(r"phase=([a-z-]+)", ln).group(1)
+            tags.append(tag)
+        self.assertEqual(sorted(tags), sorted([
+            "GATE_CUTOFF:before-write", "GATE_CUTOFF:before-submit", "GATE_CUTOFF:after-probe",
+            "VENUE_QUIET_UNKNOWN", "FOREIGN_FLOOR", "$verdict",
+        ]), mono)
+        # every other waitedSec report (GATE_BUSY) subtracts $t0 from $now, which is itself Get-WaitNowUtc (asserted above): no third spelling
+        for ln in wvq.replace("\r\n", "\n").splitlines():
+            if not ln.strip().startswith("#") and "waitedSec=$(" in ln and ln not in mono:
+                self.assertIn("waitedSec=$([int]($now - $t0).TotalSeconds)", ln)
+        # r9 (adversary-2854b231.json A1): the MONOTONIC anchor is read first and the wall clock after it (a pause between them puts Get-WaitNowUtc ahead, never behind)
+        self.assertLess(wvq.index("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()"), wvq.index("$t0 = [DateTime]::UtcNow"))
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(wvq_path)}', [ref]$null, [ref]$null)\n"
+            ". ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-WaitNowUtc' }, $true).Extent.Text))\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $t0 = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc); $t0Ts = [Diagnostics.Stopwatch]::GetTimestamp() - 5 * $f\n"
+            "[Math]::Round(((Get-WaitNowUtc) - $t0).TotalSeconds, 1)\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertLess(abs(float(out.stdout.strip()) - 5.0), 0.5, out.stdout)
+
+    def test_lease_batch_idle_end_r9_adv_2854b231_a1_a_pause_between_wait_venue_quiets_two_clock_reads_never_puts_its_clock_behind(self) -> None:
+        # adversary-2854b231.json A1 (r8 OPEN, introduced by 2854b231): Wait-VenueQuiet read $t0 (wall) BEFORE $t0Ts (Stopwatch), so a pause P between the two put Get-WaitNowUtc
+        # P BEHIND real time and every deadline it checks (the caller's -WaitUntilUtc included) ended P late. The two top-level anchor statements are taken from the script in the
+        # order it has them, with a 1.5 s sleep between them: Get-WaitNowUtc may run ahead of the wall clock (the wait ends sooner), never more than 0.3 s behind it.
+        # LEASE_BATCH_RED_REF=2854b231: RED, about 1.5 s behind.
+        wvq_path = DV / "Wait-VenueQuiet.ps1"
+        script = (
+            ps_parse_source(wvq_path) + "\n"
+            "$top = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and @('$t0', '$t0Ts') -ccontains $_.Left.Extent.Text } | ForEach-Object { $_.Extent.Text })\n"
+            "if ($top.Count -ne 2) { throw \"expected the two top-level anchor statements, found $($top.Count)\" }\n"
+            ". ([scriptblock]::Create($top[0] + \"`nStart-Sleep -Milliseconds 1500`n\" + $top[1]))\n"
+            ". ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-WaitNowUtc' }, $true).Extent.Text))\n"
+            "[ordered]@{ order = @($top | ForEach-Object { ($_ -split '=')[0].Trim() }); aheadSec = [Math]::Round(((Get-WaitNowUtc) - [DateTime]::UtcNow).TotalSeconds, 3) } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertGreaterEqual(got["aheadSec"], -0.3, f"a pause between Wait-VenueQuiet's two clock reads put Get-WaitNowUtc behind real time (every deadline ends that late): {got}")
+
+    def test_lease_batch_idle_end_r9_adv_74e14dda_a1_a_suspend_and_a_clock_step_before_the_childs_start_never_move_its_wait_end(self) -> None:
+        # adversary-74e14dda.json A1: the runner placed -WaitUntilUtc (a WALL instant) and -MaxWaitSec 239 (counted from the child's own start), then was suspended 90 s while
+        # this host's clock stepped back 120 s: the child started with its wall clock 30 s behind the caller's reading, so its deadline was min(t0 + 239, wall end) = t0 + 239,
+        # 90 + 239 = 330 s after the caller's end was placed (past an idle bound of 300). -WaitUntilTs carries the end on the monotonic counter the child shares with the runner:
+        # Wait-VenueQuiet's own deadline statements are run here (taken from the script) with that input: the deadline and the gate end are the caller's end, 239 - 90 = 149 s
+        # after the child's start. Not given (0) changes nothing; an end long past ends the wait at once; [long]::MaxValue cannot overflow. LEASE_BATCH_RED_REF=74e14dda: RED, 239.
+        wvq_path = DV / "Wait-VenueQuiet.ps1"
+        script = (
+            ps_parse_source(wvq_path) + "\n"
+            "$st = @($ast.EndBlock.Statements)\n"
+            "$i0 = 0; while ($i0 -lt $st.Count -and -not $st[$i0].Extent.Text.StartsWith('$deadline = $t0.AddSeconds($MaxWaitSec)')) { $i0++ }\n"
+            "$i1 = $i0; while ($i1 -lt $st.Count -and -not ($st[$i1] -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $i1++ }\n"
+            "if ($i0 -ge $st.Count -or $i1 -ge $st.Count) { throw \"deadline statements not found ($i0, $i1)\" }\n"
+            "$block = [scriptblock]::Create((@($st[$i0..($i1 - 1)] | ForEach-Object { $_.Extent.Text }) -join \"`n\"))\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $MaxWaitSec = 239; $MaxGateSec = 2400\n"
+            "$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp(); $t0 = [DateTime]::UtcNow\n"
+            "$parentTs = $t0Ts - 90 * $f; $parentWall = $t0.AddSeconds(30)\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($k in 'suspendAndStep', 'notGiven', 'longPast', 'maxValue') {\n"
+            "    $WaitUntilUtc = $(if ($k -eq 'notGiven') { '' } else { $parentWall.AddSeconds(239).ToString('o') })\n"
+            "    $WaitUntilTs = switch ($k) { 'suspendAndStep' { $parentTs + [long](239 * $f) } 'notGiven' { [long]0 } 'longPast' { [long]1 } 'maxValue' { [long]::MaxValue } }\n"
+            "    . $block\n"
+            "    $out[$k] = [ordered]@{ deadlineSec = [Math]::Round(($deadline - $t0).TotalSeconds, 3); gateEndSec = [Math]::Round(($gateEnd - $t0).TotalSeconds, 3) }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        for key in ("deadlineSec", "gateEndSec"):
+            with self.subTest(case="suspendAndStep", bound=key):
+                self.assertLessEqual(got["suspendAndStep"][key], 149.3, f"a suspend and a clock step before the child's start moved its wait end past the caller's: {got}")
+                self.assertGreater(got["suspendAndStep"][key], 148.0, got)
+            with self.subTest(case="notGiven", bound=key):
+                self.assertEqual(got["notGiven"][key], 239.0, got)
+            with self.subTest(case="longPast", bound=key):
+                self.assertEqual(got["longPast"][key], -1.0, got)
+            with self.subTest(case="maxValue", bound=key):
+                self.assertLessEqual(got["maxValue"][key], 239.0, got)
+                self.assertGreater(got["maxValue"][key], 200.0, got)
+
+    # ---------------------------------------------------------------- r9 (Grok G14 prevention on #817): the mixed wall/monotonic clock lint
+    def test_lease_batch_idle_end_r9_grok_g14_mixed_clock_lint_the_dual_venue_scripts_hold_exactly_the_known_wall_deadlines(self) -> None:
+        # Every .ps1/.psm1 under tools/profiling/dual-venue: a NEW wall-clock deadline (or -WaitUntilUtc counted from a captured wall instant) fails here; a known one that is
+        # fixed fails too until it leaves KNOWN_WALL_DEADLINES (a ratchet). The lease room ($leaseEnd - [DateTime]::UtcNow) compares an agent-published wall instant with this
+        # host's wall clock, which no rule here covers: successor LEASE-END-MONOTONIC-ROOM-1.
+        files = {p.name: p.read_text(encoding="utf-8") for p in sorted(DV.iterdir()) if p.is_file() and p.suffix in (".ps1", ".psm1")}
+        self.assertIn(RUNNER.name, files)
+        self.assertIn("Wait-VenueQuiet.ps1", files)
+        hits = mixed_clock_deadline_hits(files)
+        self.assertEqual(sorted(hits - KNOWN_WALL_DEADLINES), [], "a new mixed wall/monotonic deadline: derive it from a Stopwatch, never from a wall instant read before blocking work")
+        self.assertEqual(sorted(KNOWN_WALL_DEADLINES - hits), [], "a known wall deadline is gone: remove it from KNOWN_WALL_DEADLINES (the ratchet only shrinks)")
+
+    def test_lease_batch_idle_end_r9_grok_g14_mixed_clock_lint_is_red_on_each_shape_this_card_fixed(self) -> None:
+        # The lint on inline fixtures: the 2854b231 probe anchor (G14), the pre-r9 open-cancel reconcile window, the pre-r8 Wait-VenueQuiet deadline read (5fc3bf72-A2), each
+        # flagged; the shapes that replaced them, clean.
+        red = {
+            "g14-2854b231.ps1": ("$dispatchUtc = [DateTime]::UtcNow\n"
+                                 "$lv = Get-ProbeLaunchVerdict $MaxWaitSec; $wait = [int]$lv.maxWait\n"
+                                 "$qArgs += @('-WaitUntilUtc', $dispatchUtc.AddSeconds($wait).ToString('o'))   # r8 (adversary-f52a32d6.json A1): from the instant read before the cuts\n"),
+            "reconcile-pre-r9.ps1": ("$tc = [DateTime]::UtcNow; $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null\n"
+                                     "while ($true) {\n"
+                                     "    if ($cr.state -ceq 'FOUND' -or [DateTime]::UtcNow.AddSeconds($cPoll) -ge $tc.AddSeconds($CancelReconcileSec)) { break }\n"
+                                     "}\n"),
+            "wvq-5fc3bf72.ps1": ("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()\n"
+                                 "$t0 = [DateTime]::UtcNow\n"
+                                 "function Get-WaitNowUtc { $t0.AddSeconds(([Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency) }\n"
+                                 "if ([DateTime]::UtcNow.AddSeconds($RecheckSec) -gt $deadline) { break }\n"),
+        }
+        # adversary-9a56fa7a.json A2: PowerShell is case-insensitive, so are these (its input, and the sibling spellings it named)
+        red.update({
+            "case-lower-anchor.ps1": "$t0 = [datetime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
+            "case-upper-var.ps1": "$T0 = [DATETIME]::UTCNOW\n$DEADLINE = $t0.addseconds(30)\n",
+            "case-wait-until.ps1": "$d = [datetime]::utcnow\n$qArgs += @('-WAITUNTILUTC', $D.ADDSECONDS($wait).ToString('o'))\n",
+            "case-cge-break.ps1": "$tc = [System.DateTime]::UtcNow\nif ([datetime]::utcnow -cge $TC.addSeconds(5)) { BREAK }\n",
+            "offset-anchor.ps1": "$t0 = [DateTimeOffset]::UtcNow\n$gateEnd = $t0.AddSeconds(30)\n",
+            # adversary-74e14dda.json A2: a parenthesized anchor
+            "paren-anchor.ps1": "$t0 = ([DateTime]::UtcNow)\n$deadline = $t0.AddSeconds(30)\nif ([DateTime]::UtcNow -gt $deadline) { break }\n",
+            "case-frame.ps1": ("$t0Ts = [diagnostics.stopwatch]::gettimestamp()\n$t0 = [datetime]::utcnow\n"
+                               "function Get-WaitNowUtc { $T0.AddSeconds(([System.Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / 1.0) }\n"
+                               "if ([DateTime]::UTCNOW -gt $Deadline) { break }\n"),
+        })
+        # r10 (sol r9b 13e99849-A2, its two strings verbatim): a trailing comment with no space after `#`, and a multiline assignment (the operator ends the line); the
+        # single-line control (case-lower-anchor above) stays detected. Siblings of the same shape: a backtick continuation, and a comment on the multiline anchor.
+        red.update({
+            "sol-r9b-trailing-comment.ps1": "$t0 = [DateTime]::UtcNow #captured\n$deadline = $t0.AddSeconds(30)\n",
+            "sol-r9b-multiline.ps1": "$t0 =\n [DateTime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
+            "backtick-continuation.ps1": "$t0 = `\n    [DateTime]::UtcNow\n$deadline = $t0.AddSeconds(30)\n",
+            "multiline-commented.ps1": "$t0 =   # the anchor\n    [DateTime]::UtcNow #captured\n$deadline = $t0.AddSeconds(30)\n",
+            # adversary-49bf0ddc.json A4 (its input and two siblings): a parenthesized multiline anchor, a block comment after the anchor, a deadline after `;`
+            "adv-a4-paren-multiline.ps1": "$t0 = (\n [DateTime]::UtcNow\n)\nStart-Sleep -Seconds 90\n$deadline = $t0.AddSeconds(240)\n",
+            "adv-a4-block-comment.ps1": "$t0 = [DateTime]::UtcNow <# captured #>\n$deadline = $t0.AddSeconds(240)\n",
+            "adv-a4-semicolon.ps1": "$t0 = [DateTime]::UtcNow\nStart-Sleep -Seconds 90; $deadline = $t0.AddSeconds(240)\n",
+        })
+        want = {"g14-2854b231.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"}, "reconcile-pre-r9.ps1": {"CAPTURED_WALL"}, "wvq-5fc3bf72.ps1": {"FRAME_WALL_READ"},
+                "case-lower-anchor.ps1": {"CAPTURED_WALL"}, "case-upper-var.ps1": {"CAPTURED_WALL"}, "case-wait-until.ps1": {"WAIT_UNTIL", "CAPTURED_WALL"},
+                "case-cge-break.ps1": {"CAPTURED_WALL"}, "offset-anchor.ps1": {"CAPTURED_WALL"}, "case-frame.ps1": {"FRAME_WALL_READ"},
+                "paren-anchor.ps1": {"CAPTURED_WALL"}, "sol-r9b-trailing-comment.ps1": {"CAPTURED_WALL"}, "sol-r9b-multiline.ps1": {"CAPTURED_WALL"},
+                "backtick-continuation.ps1": {"CAPTURED_WALL"}, "multiline-commented.ps1": {"CAPTURED_WALL"},
+                "adv-a4-paren-multiline.ps1": {"CAPTURED_WALL"}, "adv-a4-block-comment.ps1": {"CAPTURED_WALL"}, "adv-a4-semicolon.ps1": {"CAPTURED_WALL"}}
+        for name, text in red.items():
+            with self.subTest(fixture=name):
+                self.assertEqual({rule for (n, rule, _c) in mixed_clock_deadline_hits({name: text})}, want[name])
+        green = {
+            "g14-r9.ps1": ("$dispatchTs = [Diagnostics.Stopwatch]::GetTimestamp()\n"
+                           "$qArgs += @('-WaitUntilUtc', [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $wait - ([Diagnostics.Stopwatch]::GetTimestamp() - $dispatchTs) / [double][Diagnostics.Stopwatch]::Frequency)).ToString('o'))\n"),
+            "reconcile-r9.ps1": ("$tcTs = [Diagnostics.Stopwatch]::GetTimestamp(); $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null\n"
+                                 "    if ($cr.state -ceq 'FOUND' -or (([Diagnostics.Stopwatch]::GetTimestamp() - $tcTs) / [double][Diagnostics.Stopwatch]::Frequency) + $cPoll -ge $CancelReconcileSec) { break }\n"),
+            "wvq-r8.ps1": ("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()\n"
+                           "$t0 = [DateTime]::UtcNow\n"
+                           "function Get-WaitNowUtc { $t0.AddSeconds(([Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency) }\n"
+                           "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }\n"),
+        }
+        for name, text in green.items():
+            with self.subTest(fixture=name):
+                self.assertEqual(mixed_clock_deadline_hits({name: text}), set())
+
+    def test_lease_batch_idle_end_r9_grok_g14_the_adversary_checklist_carries_the_mixed_clock_line(self) -> None:
+        # Grok G14 prevention, second half: the standing adversary checklist line, so a cross-provider pass asks the question on every diff
+        self.assertIn(MIXED_CLOCK_CHECKLIST_LINE, ADVERSARY_CHECKLIST.read_text(encoding="utf-8"))
+
+    def test_lease_batch_idle_end_r8_adv_a2_a_published_member_is_read_as_it_was_published(self) -> None:
+        # adversary-cc9275e3.json A2: `$(if (Test-JsonObject $r) { $r.startedUtc })` unrolled startedUtc=["<instant>"] into the instant, so an unusable value supplied a runtime.
+        # Get-JsonObjectMember keeps an array an array (then Get-AgentJobEndTs gives the send), for a ConvertFrom-Json object and for a dictionary alike; a scalar is the scalar;
+        # a missing member, or a result that is not one object ([{..}]), is $null.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'Test-JsonObject', 'Get-JsonObjectMember', 'ConvertTo-AgentUtc', 'Get-AgentJobEndTs') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$out = [ordered]@{}\n"
+            "$arr = '{\"startedUtc\":[\"2026-11-14T18:00:00Z\"],\"endedUtc\":\"2026-11-14T18:05:00Z\"}' | ConvertFrom-Json\n"
+            "$v = Get-JsonObjectMember $arr 'startedUtc'; $out['psoArray'] = ($v -is [array]) -and @($v).Count -eq 1\n"
+            "$d = [ordered]@{ startedUtc = @('2026-11-14T18:00:00Z') }; $v = Get-JsonObjectMember $d 'startedUtc'; $out['dictArray'] = ($v -is [array]) -and @($v).Count -eq 1\n"
+            "$s = '{\"startedUtc\":\"2026-11-14T18:00:00Z\"}' | ConvertFrom-Json; $v = Get-JsonObjectMember $s 'startedUtc'; $out['scalar'] = ($null -ne $v) -and -not ($v -is [array])\n"
+            "$out['missing'] = $null -eq (Get-JsonObjectMember $s 'nope')\n"
+            "$w = '[{\"startedUtc\":\"2026-11-14T18:00:00Z\"}]' | ConvertFrom-Json -NoEnumerate; $out['notOneObject'] = $null -eq (Get-JsonObjectMember $w 'startedUtc')\n"
+            "$f = [Diagnostics.Stopwatch]::Frequency; $now = [Diagnostics.Stopwatch]::GetTimestamp(); $floor = $now - 20 * $f; $obs = $now - 1 * $f; $e = [DateTime]::UtcNow.AddSeconds(5)\n"
+            "$st = Get-JsonObjectMember ([pscustomobject]@{ startedUtc = @($e.AddSeconds(-6).ToString('o')) }) 'startedUtc'\n"
+            "$out['arrayGivesTheSend'] = (Get-AgentJobEndTs $obs $floor ($e.ToString('o')) $st) -eq $floor\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"psoArray": True, "dictArray": True, "scalar": True, "missing": True, "notOneObject": True, "arrayGivesTheSend": True})
+
+    def test_lease_batch_idle_end_r8_grok_g12_a_long_leg_under_an_agent_clock_ahead_leaves_the_next_probe_its_allowance(self) -> None:
+        # Grok G12, run end to end: agent bound 70, margin 60 (10 s). The first leg's job runs 15 s (longer than the allowance), the agent's clock is 30 s ahead (more than the
+        # job-to-observation gap), and the child works 2 s after its job. Charged from the bare send, the next probe's wait was 0; from the send plus the job's own runtime it is
+        # about the allowance less the post-job gap (at most 8 s). startedUtc JSON null (the queue-expired shape): the send alone, so 0.
+        # r8 (adversary-cc9275e3.json A2): startedUtc inside a one-element array is no instant either: the send alone, so 0 (the caller's `$(...)` unrolled it into the string inside)
+        # r10 (sol r9b 9a56fa7a-A1) SUPERSEDES the "runtime" case: the job's runtime as the agent's stamps tell it is an agent wall-clock difference a step during the job inflates,
+        # so a long leg is charged from its launch: the 15 s job and the 2 s tail exceed the 10 s allowance and the next probe's wait is 0 (giving the runtime back needs an
+        # agent-published monotonic runtime, successor BACHELOR-AGENT-REDEPLOY-IDLESEC-1).
+        for name, env, lo, hi in (("runtime", {}, 0, 0),("started-null", {"FAKE_LEG_STARTED": "null"}, 0, 0), ("started-array", {"FAKE_LEG_STARTED": "array"}, 0, 0)):
+            with self.subTest(case=name):
+                self.setUp()
+                self._tree_with_agent_idle(b"70")
+                r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", FAKE_LEG_JOB_SEC="15,0", FAKE_LEG_ENDED_AHEAD_SEC="30", FAKE_LEG_TAIL_SLEEP="2", **env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                waits = self._in_lease_waits()
+                self.assertEqual(len(waits), 2, self.events_raw())
+                self.assertGreaterEqual(waits[1], lo, f"{name}: the next probe's wait after a long leg under a clock ahead: {waits}")
+                self.assertLessEqual(waits[1], hi, f"{name}: the next probe's wait after a long leg under a clock ahead: {waits}")
+
+    def test_lease_batch_idle_end_r6_grok_g11_every_idle_end_call_names_its_parameters_in_full(self) -> None:
+        # Grok G11 on #817: a call that abbreviates a parameter (-Append for -AppendDetail) binds today by prefix and turns into an ambiguous-parameter error (BATCH_ERROR on a rare
+        # path) the day the helper gains another -Append* parameter. Every Set-BatchLeaseIdleEnded call names each parameter exactly as the helper declares it (AST on both sides).
+        # Mutation: a copy whose RETRY site says -Append is caught.
+        def offenders(path: Path) -> list:
+            script = (
+                f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(path)}', [ref]$null, [ref]$null)\n"
+                "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Set-BatchLeaseIdleEnded' }, $true)\n"
+                "$declared = @($fn.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })\n"
+                "$calls = @($ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -and $x.GetCommandName() -eq 'Set-BatchLeaseIdleEnded' }, $true))\n"
+                "$bad = @(foreach ($c in $calls) { foreach ($e in $c.CommandElements) { if ($e -is [System.Management.Automation.Language.CommandParameterAst] -and $declared -cnotcontains $e.ParameterName) { \"$($c.Extent.StartLineNumber):-$($e.ParameterName)\" } } })\n"
+                "[ordered]@{ calls = $calls.Count; declared = $declared; bad = $bad } | ConvertTo-Json -Compress\n"
+            )
+            out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            return json.loads(out.stdout)
+        r = offenders(RUNNER)
+        self.assertEqual(r["calls"], 4, r)
+        self.assertIn("AppendDetail", r["declared"])
+        self.assertEqual(r["bad"], [], "a Set-BatchLeaseIdleEnded call abbreviates (or misspells) a parameter")
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(src.count("'a leg ran off the lease: uncounted' -AppendDetail; break }"), 2, "the RETRY and RAN off-lease ends append with the full name")
+        mut = self.case / "mutant-g11.ps1"
+        mut.write_text(src.replace("'a leg ran off the lease: uncounted' -AppendDetail; break }", "'a leg ran off the lease: uncounted' -Append; break }", 1), encoding="utf-8")
+        self.assertEqual(len(offenders(mut)["bad"]), 1, "the mutant's -Append must be caught")
+
+    def test_lease_batch_idle_end_r5_adv_a1_a_leg_whose_lease_batch_is_array_wrapped_is_not_on_the_lease(self) -> None:
+        # the :2526 sibling: a leg result whose leaseBatch is [{.. this batch's lease ..}] gave jobLease through member enumeration, so the leg counted on the lease. It names no
+        # lease now: not on this batch's lease (LEASE_LOST, never counted), as a leg on another lease is (the FAKE_LEG_LOSE case).
+        # r5 pass 3 (adversary r5 pass 2 A1): the leg's whole admission in a one-element array ($ja was unrolled to the object inside it): the same
+        for knob in ("FAKE_LEG_LB_WRAP", "FAKE_LEG_ADM_WRAP"):
+            with self.subTest(knob=knob):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], **{knob: "array,none"})
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                b1, b2 = self.batches()
+                self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"]), ("LEASE_LOST", 1, 0), b1)
+                self.assertEqual((b1["legs"][0]["counted"], b1["legs"][0]["onLease"], b1["legs"][0]["jobLease"]), (False, False, None), b1["legs"][0])
+                self.assertEqual((b2["legsRan"], b2["legsCounted"]), (1, 1))
+                res = batch_result(r.stdout)
+                self.assertEqual((res["ran"], res["counted"]), (2, 1))
+
+    def test_lease_batch_idle_end_r5_adv_a1_an_open_reconciled_by_name_with_an_array_wrapped_lease_batch_is_charged_unnamed(self) -> None:
+        # the :2646 sibling: the open's um-run failed after the agent ran it (its result landed by name), so the finally reconciles it. Its leaseBatch [{..}] read as
+        # RAN_BEFORE_CANCEL with the lease id enumerated out of the array; it is RAN_LEASE_UNNAMED now, charged open to close with no lease id. Control: one object is still
+        # RAN_BEFORE_CANCEL on its own lease.
+        # r5 pass 2 (adversary r5 A1): a numeric lease id (VenueRawJson clears every identity of that reading) leaves an OBJECT with no lease id: RAN_LEASE_UNNAMED too, never ENDED
+        for shape, env, want_state, want_lease, want_basis in (("array", {"FAKE_OPEN_LB_WRAP": "array"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
+                                                               ("numericLeaseId", {"FAKE_OPEN_LEASE_ID_NUM": "1"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
+                                                               ("admissionArray", {"FAKE_OPEN_ADM_WRAP": "array"}, "RAN_LEASE_UNNAMED", None, "open-lease-unnamed"),
+                                                               ("object", {}, "RAN_BEFORE_CANCEL", "lease-1", "open-to-close")):
+            with self.subTest(shape=shape):
+                self.setUp()
+                r = self.run_batch(self.specs[:1], "-CancelReconcileSec", "3", FAKE_OPEN_MODES="errlanded", **env)
+                self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["openOutcome"], b["legsAttempted"]), ("OPEN_FAILED", "ERROR", 0), b)
+                self.assertEqual((b["openCancel"]["state"], b["leaseId"]), (want_state, want_lease), b["openCancel"])
+                self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), (want_basis, want_lease), b["ledger"])
+
+    def test_lease_batch_idle_end_r10_adv_49bf0ddc_a1_an_unnamed_or_malformed_lease_is_charged_whatever_the_open_classifies_as(self) -> None:
+        # adversary-49bf0ddc.json A1: the OPEN_FAILED branch (exit, label, or `admission:[]`, which the `$adm` read unrolls to $null) won before the malformed/unnamed branches that
+        # set the unnamed charge, and in the cancel reconcile a cancelled-in-gate label won before a leaseBatch that is there: both closed the token with no ledger row for a
+        # lease the agent may hold under it. Now charged open-lease-unnamed, open to close, with no lease id.
+        for shape, env, extra, want_code, want_cancel in (
+                ("immediate-admission-empty-array", {"FAKE_OPEN_ADM_WRAP": "empty"}, (), 9, None),
+                ("immediate-cancelled-label-empty-leasebatch", {"FAKE_OPEN_LABEL": "cancelled-in-gate", "FAKE_OPEN_LB_EMPTY": "1"}, (), 9, None),
+                ("reconciled-cancelled-label-empty-leasebatch", {"FAKE_OPEN_MODES": "errlanded", "FAKE_OPEN_LABEL": "cancelled-in-gate", "FAKE_OPEN_LB_EMPTY": "1"},
+                 ("-CancelReconcileSec", "3"), 9, "RAN_LEASE_UNNAMED")):
+            with self.subTest(shape=shape):
+                self.setUp()
+                r = self.run_batch(self.specs[:1], *extra, **env)
+                self.assertEqual(r.returncode, want_code, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"], b["leaseId"]), ("OPEN_FAILED", 0, None), b)
+                if want_cancel:
+                    self.assertEqual(b["openCancel"]["state"], want_cancel, b["openCancel"])
+                self.assertIsNotNone(b["ledger"], f"{shape}: a lease the agent may hold under the token was closed with no ledger row")
+                self.assertEqual((b["ledger"]["basis"], b["ledger"]["leaseId"]), ("open-lease-unnamed", None), b["ledger"])
+
+    def test_lease_batch_idle_end_r5_adv_a1_the_lease_batch_reader_takes_one_object_or_none(self) -> None:
+        # the class: Get-AdmissionLeaseBatch reads admission.leaseBatch as ONE object (OBJECT), none (ABSENT) or something else that is there (MALFORMED); Get-PublishedIdleBound
+        # reads a non-object leaseBatch INVALID (never ABSENT), and Get-LeaseEndUtc places no lease end from one. An admission that is itself an array is MALFORMED too.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'Test-JsonObject', 'Get-AdmissionLeaseBatch', 'Get-PublishedIdleBound', 'Get-LeaseEndUtc') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            "$lb = '{\"token\":\"0123456789ab\",\"leaseId\":\"L1\",\"untilEpoch\":1794681900,\"remainingSec\":2700,\"idleSec\":0}'\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($c in @(@('object', $lb), @('array', \"[$lb]\"), @('nullplus', \"[null,$lb]\"), @('nested', \"[[$lb]]\"), @('string', '\"x\"'), @('null', 'null'))) {\n"
+            "  $r = ('{\"exitCode\":0,\"endedUtc\":\"2026-11-14T18:00:00Z\",\"admission\":{\"label\":\"clear\",\"leaseBatch\":' + $c[1] + '}}') | ConvertFrom-Json\n"
+            "  $out[$c[0]] = @((Get-AdmissionLeaseBatch $r).state, (Get-PublishedIdleBound $r.admission.leaseBatch).state, ($null -ne (Get-LeaseEndUtc $r))) -join '|'\n"
+            "}\n"
+            # r5 pass 3 (adversary r5 pass 2 A1): an admission that is itself a one-element array, read from the RESULT (never unrolled to the object inside it first)
+            "$out['admissionArray'] = (Get-AdmissionLeaseBatch ('{\"exitCode\":0,\"admission\":[{\"label\":\"clear\",\"leaseBatch\":' + $lb + '}]}' | ConvertFrom-Json)).state\n"
+            "$out['absent'] = (Get-AdmissionLeaseBatch ('{\"admission\":{\"label\":\"clear\"}}' | ConvertFrom-Json)).state\n"
+            "$out['dict'] = (Get-AdmissionLeaseBatch ([pscustomobject]@{ admission = [pscustomobject]@{ leaseBatch = [ordered]@{ token = 't'; leaseId = 'L1' } } })).state\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {
+            "object": "OBJECT|INVALID|True", "array": "MALFORMED|INVALID|False", "nullplus": "MALFORMED|INVALID|False", "nested": "MALFORMED|INVALID|False",
+            "string": "MALFORMED|INVALID|False", "null": "ABSENT|ABSENT|False", "admissionArray": "MALFORMED", "absent": "ABSENT", "dict": "OBJECT"})
+        # and no reader in the runner reads a leaseBatch by member access (which enumerates a collection): every one goes through Get-AdmissionLeaseBatch
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"\$\w+(?:\.\w+)*\.leaseBatch\b", src), [])
+        self.assertEqual(src.count("Get-AdmissionLeaseBatch $"), 5)
+        # r5 pass 3: every caller hands it the RESULT, never an admission already read (unrolled) out of it
+        for call in ("Get-AdmissionLeaseBatch $Result)", "Get-AdmissionLeaseBatch $op.result", "Get-AdmissionLeaseBatch $jr.result)", "Get-AdmissionLeaseBatch $cr.result }", "Get-AdmissionLeaseBatch $null"):
+            self.assertEqual(src.count(call), 1, call)
+
+    # ---------------------------------------------------------------- r4 (adversary r4 A1): the idle anchor is the agent job's end, not when this runner got round to it
+    def test_lease_batch_idle_end_r4_adv_a1_the_idle_allowance_starts_before_the_opens_liveness_cleanup(self) -> None:
+        # adversary-253ac155.json A1: the anchor was sampled after Stop-VenueJobLiveness -Remove, so a slow cleanup was not spent from the allowance. Agent bound 70, margin 60
+        # (10 s), a 6 s stall in that cleanup: the first probe may wait at most about 4 s.
+        self._tree_with_agent_idle(b"70")
+        self._patch_tree_runner("        if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME' -or $op.outcome -ceq 'RETRACTED'",
+                                "        Start-Sleep -Seconds 6; if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME' -or $op.outcome -ceq 'RETRACTED'")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 1, self.events_raw())
+        self.assertLessEqual(waits[0], 4, f"the open's liveness cleanup was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r4_adv_p2_a1_a_measuring_probe_moves_the_idle_anchor_only_to_its_dispatch(self) -> None:
+        # adversary-d23711a7.json A1: a measuring probe set the anchor at its RETURN (QUIET) or one -RecheckSec before it (COOLDOWN_UNMET), so the child's own time after its last
+        # agent job (a slow gate-log append) was not spent. Agent bound 70, margin 60 (10 s); the first probe's child takes 6 s and reads COOLDOWN_UNMET: the retry may wait at
+        # most about 10 - 6 = 4 s (anchored at the dispatch), not about 8 (anchored one second before the return).
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600", FAKE_QUIET_MODES="COOLDOWN,QUIET", FAKE_QUIET_SLOW_SEC="6")
+        waits = self._in_lease_waits()
+        self.assertGreaterEqual(len(waits), 2, self.events_raw() + [r.stdout, r.stderr])
+        self.assertLessEqual(waits[1], 4, f"the probe child's time after its dispatch was not spent from the idle allowance: {waits}")
+        src = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("{ $idleAnchorTs = [Math]::Max($idleAnchorTs, $q.startTs) }", src)
+        self.assertNotIn("$idleAnchorTs = $q.endTs", src)
+
+    def test_lease_batch_idle_end_r4_adv_p2_a2_the_log_lines_before_an_idle_typing_are_best_effort(self) -> None:
+        # adversary-d23711a7.json A2: a throwing L just before Set-BatchLeaseIdleEnded (the LEG RAN and RETRY_IN_LEASE lines) or before the probe's receipt read (the QUIET line)
+        # turned a typed idle end into BATCH_ERROR (exit 12). Those three lines are LogBest: a log failure is counted, the typed end stands.
+        src = RUNNER.read_text(encoding="utf-8")
+        for line in ('LogBest "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease', 'LogBest "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT',
+                     'LogBest "LEG $($leg.name) RAN batch=$batchNo'):
+            self.assertEqual(src.count(line), 1, line)
+            self.assertNotIn(" L " + line[len("LogBest "):], src)
+
+    def test_lease_batch_idle_end_r4_adv_a1_the_idle_allowance_after_a_leg_starts_at_its_jobs_end(self) -> None:
+        # the sibling at the leg: the anchor was the leg child's return, after its own receipt work. Agent bound 70, margin 60, the child works 6 s after its job ended: the
+        # next probe may wait at most about 4 s (the job's endedUtc), not about 10.
+        self._tree_with_agent_idle(b"70")
+        r = self.run_batch(self.specs[:2], "-ProbeMaxWaitSec", "600", FAKE_LEG_TAIL_SLEEP="6")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = self._in_lease_waits()
+        self.assertEqual(len(waits), 2, self.events_raw())
+        self.assertLessEqual(waits[1], 4, f"the leg child's work after its job was not spent from the idle allowance: {waits}")
+
+    def test_lease_batch_idle_end_r3_adv_a1_a_long_claim_poll_sleep_stops_just_past_the_agents_idle_bound(self) -> None:
+        # adversary r3 A1: the busy sleep used the loop top's room and -ClaimPollSec only, so a long poll slept far past the idle release (into a room-short end that hid it).
+        # Agent bound 12, margin 5, -ClaimPollSec 120: the sleep after the busy probe ends within a few seconds past 12 s, not 120 s later.
+        self._tree_with_agent_idle(b"12")
+        r = self.run_batch(self.specs[:1], "-ProbeMaxWaitSec", "600", "-ProbeIdleMarginSec", "5", "-ClaimPollSec", "120", FAKE_QUIET_MODES="BUSY,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ticks = [int(l.split(" ", 1)[0]) for l in self.events_raw() if " QUIET " in l]
+        self.assertEqual(len(ticks), 2, self.events_raw())
+        self.assertLess((ticks[1] - ticks[0]) / 1e7, 40, f"the busy sleep ran past the agent's idle bound: {(ticks[1] - ticks[0]) / 1e7:.1f} s")
+
+    def test_lease_batch_idle_end_r3_grok_g1_an_unreadable_idle_bound_launches_nothing_on_the_lease(self) -> None:
+        # fail closed: an agent script whose LeaseBatchIdleSec has no readable default gives no bound, so no probe or leg runs on the lease (AGENT_IDLE_BOUND_UNKNOWN, exit 10);
+        # the lease is still closed and the claim released
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        agent = AGENT.read_bytes()
+        (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec,"))
+        self.runner = tree / "dual-venue" / RUNNER.name
+        r = self.run_batch(self.specs[:2])
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"]), ("AGENT_IDLE_BOUND_UNKNOWN", 0), b)
+        self.assertEqual(self.kinds(), [f"OPEN:{b['token']}", f"CLOSE:{b['token']}"])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["notRun"]), (10, "AGENT_IDLE_BOUND_UNKNOWN", 2))
+
+    def test_r2_a_leg_off_the_lease_reads_only_its_own_tokens_idle_line(self) -> None:
+        # the in-flight consumer: a foreign closed line before the agent's idle line still types LEASE_IDLE_ENDED; a lone foreign idle line is no idle end (LEASE_LOST)
+        for mode, want in (("foreign-then-idle", "LEASE_IDLE_ENDED"), ("foreign", "LEASE_LOST")):
+            with self.subTest(mode=mode):
+                self.setUp()
+                r = self.run_batch(self.specs[:2], FAKE_LEG_LOSE="1", FAKE_LEG_IDLE_END=mode)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                b1 = self.batches()[0]
+                self.assertEqual((b1["endReason"], b1["legs"][0]["class"], b1["legs"][0]["counted"]), (want, want, False), b1)
+
     def test_r12_adversary_a2_a_job_lease_that_differs_only_by_an_ignorable_character_is_another_lease(self) -> None:
         # adversary r11 A2 on e5ff0114 (sibling Invoke-VenueLeaseBatch.ps1:2013): jobLease -ceq $b.leaseId is culture-aware, so lease-1 + U+00AD read as the batch's own lease
         # and a leg that ran on ANOTHER lease was counted. Ordinal equality: it is LEASE_LOST and uncounted, exactly like a different lease id.
@@ -729,7 +2088,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
     def test_r12_adversary_a2_the_agents_batch_receipt_is_found_by_the_exact_lease_id_only(self) -> None:
         # sibling VenueChain.psm1:1087: [string]$rec.leaseId -ceq $LeaseId was culture-aware, and an empty or whitespace lease id matched a record with no lease id
         (self.share / "logs").mkdir()
-        lines = [{"leaseId": "L1" + chr(0xAD), "endReason": "other"}, {"endReason": "noid"}, {"leaseId": "L1", "endReason": "closed"}]
+        # r2: every line carries this batch's token (the reader binds token AND lease id), so only the lease id differs here
+        lines = [{"token": "0123456789ab", "leaseId": "L1" + chr(0xAD), "endReason": "other"}, {"token": "0123456789ab", "endReason": "noid"}, {"token": "0123456789ab", "leaseId": "L1", "endReason": "closed"}]
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines), encoding="utf-8")
         script = (
             f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
@@ -780,7 +2140,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
     def test_r13_adversary_a1_the_agents_batch_receipt_and_the_lease_ledger_keep_the_lease_id_as_written(self) -> None:
         # siblings VenueChain.psm1 Read-VenueLeaseBatchReceipt / Read-VenueLeaseLedger: a timestamp-shaped lease id was a DateTime, so '...:00.0Z' was FOUND for '...:00Z' and the ledger row's id was reformatted
         (self.share / "logs").mkdir()
-        lines = [{"leaseId": "2026-10-30T10:00:00.0Z", "endReason": "other"}, {"leaseId": "2026-10-30T10:00:00Z", "endReason": "closed"}]
+        lines = [{"token": "0123456789ab", "leaseId": "2026-10-30T10:00:00.0Z", "endReason": "other"}, {"token": "0123456789ab", "leaseId": "2026-10-30T10:00:00Z", "endReason": "closed"}]
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
         claim_dir = self.share / "claims"
         script = (
@@ -2016,7 +3376,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         (self.share / "logs").mkdir()
         (self.share / "outbox" / "j1.result.json").write_text(json.dumps({"jobId": "j1", "admission": {"leaseBatch": {"leaseId": "L1"}}}), encoding="utf-8")
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text(
-            json.dumps({"leaseId": "L0", "endReason": "idle"}) + "\n" + json.dumps({"leaseId": "L1", "endReason": "closed"}) + "\n", encoding="utf-8")
+            json.dumps({"token": "0123456789ab", "leaseId": "L0", "endReason": "idle"}) + "\n" + json.dumps({"token": "0123456789ab", "leaseId": "L1", "endReason": "closed"}) + "\n", encoding="utf-8")
         script = (
             f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             f"$s = '{psq(self.share)}'\n"
@@ -2027,6 +3387,50 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"found": "L1", "absent": "ABSENT", "bad": "UNKNOWN", "rec": "closed", "none": "ABSENT", "nofile": "ABSENT"})
+
+    def test_r2_the_batch_receipt_line_is_bound_to_the_requested_token_and_lease(self) -> None:
+        # sol key r1 BLOCKER (VenueChain.psm1 Read-VenueLeaseBatchReceipt): the first leaseId match won whatever its token. Fail closed: a token that is missing, not a string, another
+        # token, or this token with another spelling (case, a soft hyphen) names no line of this batch; nor does a lease id that is not a string.
+        (self.share / "logs").mkdir()
+        t = "0123456789ab"
+        lines = [
+            {"token": "ffffffffffff", "leaseId": "L1", "endReason": "closed"}, {"token": t, "leaseId": "L1", "endReason": "idle"},
+            {"leaseId": "L2", "endReason": "idle"}, {"token": None, "leaseId": "L3", "endReason": "idle"}, {"token": [t], "leaseId": "L4", "endReason": "idle"},
+            {"token": 123456789012, "leaseId": "L5", "endReason": "idle"}, {"token": t.upper(), "leaseId": "L6", "endReason": "idle"},
+            {"token": t + chr(0xAD), "leaseId": "L7", "endReason": "idle"}, {"token": t, "leaseId": ["L8"], "endReason": "idle"},
+            {"token": "ffffffffffff", "leaseId": "L9", "endReason": "idle"},
+        ]
+        (self.share / "logs" / f"lease-batch-{t}.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines), encoding="utf-8")
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'\n"
+            f"$rd = {{ param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '{t}' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }}\n"
+            "$o = [ordered]@{}; foreach ($id in 'L1','L2','L3','L4','L5','L6','L7','L8','L9') { $o[$id] = & $rd $id }; $o | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        want = {"L1": "FOUND:idle"} | {f"L{i}": "ABSENT:" for i in range(2, 10)}
+        self.assertEqual(json.loads(out.stdout), want)
+
+    def test_r2_adversary_a1_a_non_string_identity_spelled_like_the_request_neither_answers_nor_hides_the_agents_line(self) -> None:
+        # adversary r2 A1 on 92c08033 (adversary-92c08033.json): an all-digit token written as a JSON NUMBER became the text '123456789012' and matched the request, so a
+        # closed line hid the agent's own idle line. Siblings: a numeric lease id 1 for -LeaseId '1', an array ["L1"] for -LeaseId '["L1"]'.
+        (self.share / "logs").mkdir()
+        t = "123456789012"
+        lines = [
+            {"token": 123456789012, "leaseId": "L1", "endReason": "closed"}, {"token": t, "leaseId": "L1", "endReason": "idle", "endedUtc": "2026-11-14T18:05:01Z", "heldSec": 301},
+            {"token": t, "leaseId": 1, "endReason": "idle"}, {"token": t, "leaseId": ["L1"], "endReason": "idle"},
+        ]
+        (self.share / "logs" / f"lease-batch-{t}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'\n"
+            f"$rd = {{ param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '{t}' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }}\n"
+            "[ordered]@{ L1 = (& $rd 'L1'); one = (& $rd '1'); arr = (& $rd '[\"L1\"]') } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"L1": "FOUND:idle", "one": "ABSENT:", "arr": "ABSENT:"})
 
 
 # LEASE-BATCH-MULTI-BUILD-1: a wrapper around fake-leg.ps1 that records the build, backend and spec each leg was called with, then runs the fake leg unchanged.
@@ -2598,6 +4002,33 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(batch_result(r.stdout)["ran"], 4)
         self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (simulated result-line append failure)", r.stderr)
+
+    def test_lease_batch_idle_end_r2_adv_a1_a_log_failure_at_the_idle_end_keeps_the_typed_stop_and_the_leg(self) -> None:
+        # adversary r2 pass 2 A1 (adversary-bd508a0e.json): the LEASE_IDLE_ENDED line was logged with L, which rethrows a batch.log append failure, so the typed end became
+        # BATCH_ERROR/12 and the pending leg NOT_RUN. The line is best effort: the batch ends LEASE_IDLE_ENDED and the leg runs in the next batch.
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'LEASE_IDLE_ENDED*') { throw [IO.IOException]::new('simulated: batch.log held') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        e = dict(e, FAKE_QUIET_MODES="QUIET,IDLE,QUIET")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=180, env=e)
+        res = batch_result(r.stdout)
+        # r3 (Grok G5): the stop reason is pinned (this slot compared it with itself): the idle end is a batch end, never a run stop, so the run ends with none
+        self.assertEqual((r.returncode, res["stopReason"], res["ran"], res["notRun"]), (0, None, 4, 0), r.stdout + r.stderr)
+        self.assertEqual(self.batches()[0]["endReason"], "LEASE_IDLE_ENDED", self.batches()[0])
+        self.assertIn("BATCH_LOG_FAILED", r.stderr)
+
+    def test_lease_batch_idle_end_r2_adv_a1_sibling_a_log_failure_at_the_launch_deadline_keeps_deadline_exit_3(self) -> None:
+        dl = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=25))
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'DEADLINE batch=*phase=launch*') { throw [IO.IOException]::new('simulated: batch.log held') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave", "-DeadlineUtc", dl)
+        args[args.index("-File") + 1] = str(runner)
+        e = dict(e, FAKE_QUIET_MODES="PASTDEADLINE", FAKE_DEADLINE_UTC=dl)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=180, env=e)
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"], res["ran"]), (3, "DEADLINE", 0), r.stdout + r.stderr)
+        self.assertEqual(self.batches()[0]["endReason"], "DEADLINE", self.batches()[0])
 
     def test_r7_sol_a_final_result_append_that_fails_is_counted_in_the_logwritefailures_the_result_line_reports(self) -> None:
         # sol r6b blocker: logWriteFailures was serialized into the result line BEFORE the final append was attempted, so an IOException on that append left the live
@@ -8676,8 +10107,8 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         script = (
             f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-LeaseEndUtc' }, $true)\n"
-            ". ([scriptblock]::Create($fn.Extent.Text))\n"
+            # r6: and the readers it calls since r5 (Get-AdmissionLeaseBatch, Test-JsonObject); without them every shape read $null (hosted CI on 848f6559)
+            "foreach ($n in 'Test-JsonObject', 'Get-AdmissionLeaseBatch', 'Get-LeaseEndUtc') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
             f"$until = {until}\n"
             "function Delta($ended) {\n"
             "  $r = Get-LeaseEndUtc ([pscustomobject]@{ endedUtc = $ended; admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ untilEpoch = $until } } })\n"
@@ -8731,6 +10162,61 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         self.assertIn("AssumeUniversal", fn)
         self.assertIn("AdjustToUniversal", fn)
         self.assertNotIn("::Parse(", fn, "a zone-less string must go through TryParse with AssumeUniversal, never a bare Parse")
+
+    # ---- r3 (Grok G4 on #817): the idle clamp's guards that a UTC CI host can fail (the behavioural A2 case goes red only off UTC)
+    def test_lease_batch_idle_end_r3_grok_g4_the_idle_clamp_reads_endedutc_through_the_helper_never_string(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        at = text.index("$ie = Get-LeaseIdleEnd $token")
+        self.assertIn("Set-BatchLeaseIdleEnded $b $ie ", text[at:text.index("break", at)], "r4 (Grok G9): the probe's idle end is typed through the one helper")
+        # r4 (Grok G9): the clamp lives in Set-BatchLeaseIdleEnded, shared by every site that types LEASE_IDLE_ENDED
+        at = text.index("function Set-BatchLeaseIdleEnded")
+        clamp = text[at:text.index("\n}\n", at)]
+        self.assertIn("$ieAt = ConvertTo-AgentUtc $Ie.endedUtc", clamp, "the idle clamp takes the agent's instant from ConvertTo-AgentUtc")
+        self.assertIsNone(re.search(r"(?i)\[string\]\s*\$ie\w*\.endedUtc", text), "[string] drops a DateTime's zone (and its fraction): the agent's endedUtc never goes through it")
+        self.assertNotIn("TryParse", clamp, "the clamp parses nothing itself: ConvertTo-AgentUtc is the one reader")
+        fn = text[text.index("function ConvertTo-AgentUtc"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIsNone(re.search(r"\[string\]\s*\$Value", fn), "the helper never casts its input through [string]")
+        for needle in ("$Value -is [DateTime]", "[DateTimeKind]::Unspecified", ".ToUniversalTime()", "$Value -is [DateTimeOffset]", ".UtcDateTime", "$Value -isnot [string]",
+                       "AssumeUniversal", "AdjustToUniversal"):
+            self.assertIn(needle, fn)
+
+    def test_lease_batch_idle_end_r3_grok_g4_convertto_agentutc_gives_the_exact_utc_instant_for_every_shape(self) -> None:
+        # adversarial direct case on the runner's own function (AST): every shape ConvertFrom-Json or a caller can hand it lands on the same instant, TO THE TICK and of Kind Utc.
+        # Exact ticks are what make this red on a UTC host too: a [string] round trip drops the fractional second whatever the host's offset is.
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'ConvertTo-AgentUtc' }, $true)\n"
+            ". ([scriptblock]::Create($fn.Extent.Text))\n"
+            "function Show($v) { $r = ConvertTo-AgentUtc $v; if ($null -eq $r) { $null } elseif ($r -isnot [DateTime]) { 'type:' + $r.GetType().Name } else { '{0}|{1}' -f $r.Kind, $r.Ticks } }\n"
+            "$utc = [DateTime]::SpecifyKind([DateTime]::new(2026, 10, 25, 1, 19, 14).AddTicks(7209943), [DateTimeKind]::Utc)\n"
+            "[ordered]@{\n"
+            "  want = '{0}|{1}' -f [DateTimeKind]::Utc, $utc.Ticks\n"
+            "  utcKind = Show $utc\n"
+            "  localKind = Show $utc.ToLocalTime()\n"
+            "  unspecifiedKind = Show ([DateTime]::SpecifyKind($utc, [DateTimeKind]::Unspecified))\n"
+            "  offsetMinus5 = Show ([DateTimeOffset]::new($utc).ToOffset([TimeSpan]::FromHours(-5)))\n"
+            "  offsetPlus530 = Show ([DateTimeOffset]::new($utc).ToOffset([TimeSpan]::FromMinutes(330)))\n"
+            "  stringOffset = Show '2026-10-25T03:19:14.7209943+02:00'\n"
+            "  stringZ = Show '2026-10-25T01:19:14.7209943Z'\n"
+            "  stringNoZone = Show '2026-10-25T01:19:14.7209943'\n"
+            "  json = Show (('{\"t\": \"2026-10-25T01:19:14.7209943Z\"}' | ConvertFrom-Json).t)\n"
+            "  jsonOffset = Show (('{\"t\": \"2026-10-24T20:19:14.7209943-05:00\"}' | ConvertFrom-Json).t)\n"
+            "  null = Show $null\n"
+            "  garbage = Show 'not a time'\n"
+            "  number = Show 42\n"
+            "  array = Show @('2026-10-25T01:19:14.7209943Z')\n"
+            "} | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        for shape in ("utcKind", "localKind", "unspecifiedKind", "offsetMinus5", "offsetPlus530", "stringOffset", "stringZ", "stringNoZone", "json", "jsonOffset"):
+            with self.subTest(shape=shape):
+                self.assertEqual(got[shape], got["want"], f"{shape}: {got}")
+        for shape in ("null", "garbage", "number", "array"):
+            with self.subTest(shape=shape):
+                self.assertIsNone(got[shape], f"{shape} is no instant: {got}")
 
 
 if __name__ == "__main__":
