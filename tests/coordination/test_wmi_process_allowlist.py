@@ -13,7 +13,8 @@ GRAMMAR (what this test reads)
      So `Win32_Pro`cess`, `Win32_Pro"cess"` and `Win32_Pro` + a typographic quote pair + `cess` read as the plain name. Comments, strings and here-strings are NOT
      skipped: a name in any reading counts.
   3. Refused name (case-insensitive substring): `win32_process` (this also reads Win32_Processor, Win32_ProcessStartup and Win32_ProcessTrace), `wmic` (this also
-     reads `wmiclass`, the [wmiclass] cast), and a wildcard or character-class prefix of the class name (`Win32_Proc*`, `Win32[_]Process`, `Win32_P%`, `Win32*`).
+     reads `wmiclass`, the [wmiclass] cast), and a wildcard or character class that stands in the TAIL of the class name after a literal `Win32` (`Win32_Proc*`,
+     `Win32[_]Process`, `Win32_P%`, `Win32*`; the regex _REFUSED lists exactly these shapes).
   4. A file that names one is refused unless tools/coordination/wmi-process-allowlist.txt holds a row `<repo-relative path> | <reason>` for it. The reason is
      `query-only` or `sanctioned-launcher` and nothing else; `sanctioned-launcher` is accepted only for a file named Start-HiddenDetached.ps1.
   5. The allowlist is checked too: a malformed or duplicate row, a path that is not spelled the way git lists it, a path that is not a tracked .ps1 / .psm1, a
@@ -25,6 +26,9 @@ GRAMMAR (what this test reads)
 NOT covered (declared, not promised)
   - A name built from pieces: `'Win32_' + 'Process'`, `-f`, `[string]::Join`, `$env:` values, reflection, and an expansion that evaluates to nothing spliced
     inside the word (`Win32_Pro$()cess`, `Win32_Pro${e}cess`). The name is never literal in the file.
+  - A wildcard or character class anywhere before the tail: `Win3[2]_Process`, `Win?2_Process`, `W[i]n32_Process`, `Win3*`, `*Process`, `Win32_Pro[c]ess` is read
+    (its class stands in the tail) but `Win3[2]_Pro[c]ess` is not. The name is never literal in the file, and a pattern that can match it cannot be told from any
+    other glob without parsing the command that receives it.
   - Text produced at run time and then evaluated: Invoke-Expression, [scriptblock]::Create, a decoded -EncodedCommand payload, a downloaded script.
   - A class reached without naming it: a WQL meta_class / __CLASS / __DERIVATION selector, `Get-CimClass *`, `Get-WmiObject -List` with no name.
   - Files that are not .ps1 / .psm1: .cmd, .bat, .py, .cs, .psd1, .ps1xml, workflow YAML, and untracked or gitignored files (the lane scripts under
@@ -58,8 +62,11 @@ _QUOTES = "'\"‘’‚‛“”„"
 
 # The class name, a wildcard / character-class prefix of it, and wmic (which also begins `wmiclass`). Applied to text already reduced by _readable().
 _REFUSED = re.compile(r"win32_process|win32(?:_|\[_\])(?:p(?:r(?:o(?:c(?:e(?:s)?)?)?)?)?)?[*?%\[]|win32[*?%\[]|wmic", re.IGNORECASE)
-# A site the AST scanner reports as `detached` that is a WMI create (rule D2) and not a hidden Start-Process (rule D1).
-_D2_SITE = re.compile(r"create|win32_process|wmiclass|managementclass|invoke-(?:cim|wmi)method|\bicim\b|\biwmi\b", re.IGNORECASE)
+# The AST scanner reports two kinds of `detached` site: D1, a hidden Start-Process (its text starts with the command), and D2, a WMI Create. A site is a WMI create
+# unless it is a D1 shape that names none of the create words. The D2 words are NOT what identifies a D2 site (adversary pass 2 A1: the scanner reported
+# `$p."Cr`Eate"('cmd.exe')` and a text filter on the word "create" dropped it): anything that is not a D1 shape counts.
+_D1_SITE = re.compile(r"^\s*(?:[\w.]+\\)?(?:start-process|saps|start)\b", re.IGNORECASE)
+_D2_WORDS = re.compile(r"create|win32_process|wmiclass|managementclass|invoke-(?:cim|wmi)method|\bicim\b|\biwmi\b", re.IGNORECASE)
 
 
 # Every character PowerShell reads as a quote: ' " and the typographic U+2018 U+2019 U+201A U+201B (single) and U+201C U+201D U+201E (double). Quotes spliced into a
@@ -70,8 +77,17 @@ _DROPPED = str.maketrans("", "", "`\x00" + _QUOTES)
 _READINGS = ("utf-8", "cp1252", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
 
 
+def _unicode_escape(match):
+    try:
+        return chr(int(match.group(1), 16))
+    except (ValueError, OverflowError):
+        return match.group(0)
+
+
 def _readable(text):
-    """The text a reader sees once PowerShell's own spellings are undone: a backtick-newline continuation, backticks, quotes of every kind, NUL."""
+    """The text a reader sees once PowerShell's own spellings are undone: a `u{hex} escape (PowerShell 7, in a double-quoted string), a backtick-newline
+    continuation, backticks, quotes of every kind, NUL."""
+    text = re.sub(r"`u\{([0-9A-Fa-f]{1,6})\}", _unicode_escape, text)
     return re.sub(r"`(?:\r\n|\n|\r)", "", text).translate(_DROPPED)
 
 
@@ -171,7 +187,7 @@ def create_site_problems(root, query_only):
     problems = []
     for rel in sorted(sources):
         for site in found[rel]:
-            if site["kind"] == "detached" and _D2_SITE.search(site["text"]):
+            if site["kind"] == "detached" and (not _D1_SITE.match(site["text"]) or _D2_WORDS.search(site["text"])):
                 problems.append(f"{rel}:{site['line']}: a `query-only` file has a WMI Create site: {site['text'][:160]!r}")
     return problems
 
@@ -244,6 +260,10 @@ NAMING_SPELLINGS = [
     pytest.param(b"Get-CimInstance Win32_Pro`\ncess\n", id="backtick-newline"),
     pytest.param(b'Get-CimInstance Win32_Pro"cess"\n', id="spliced-quotes"),
     pytest.param(b'Get-CimInstance "Win32_""Process"\n', id="adjacent-quotes"),
+    # adversary pass 2 A2: PowerShell 7 reads `u{hex} in a double-quoted string as that character
+    pytest.param(b'Invoke-CimMethod -ClassName "Win32_Pro`u{0063}ess" -MethodName Create\n', id="unicode-escape-lower"),
+    pytest.param(b'Invoke-CimMethod -ClassName "`u{0057}in32_Process" -MethodName Create\n', id="unicode-escape-first-letter"),
+    pytest.param(b'Invoke-CimMethod -ClassName "Win32_Pro`u{63}`u{000065}ss" -MethodName Create\n', id="unicode-escape-two"),
     pytest.param(b"Get-WmiObject -List Win32_Proc*\n", id="wildcard-prefix"),
     pytest.param(b"Get-WmiObject -List Win32[_]Process\n", id="char-class-underscore"),
     pytest.param(b"Get-WmiObject -List Win32_Pro[c]ess\n", id="char-class-letter"),
@@ -394,6 +414,10 @@ CREATE_SPELLINGS = [
     pytest.param("([wmiclass]'Win32_Process').Create('cmd.exe')\n", id="wmiclass-create"),
     pytest.param("$c = Get-WmiObject -List Win32_Process\n$c.Create('cmd.exe')\n", id="variable-create"),
     pytest.param("(Get-CimClass -ClassName Win32_Process) | Invoke-CimMethod -MethodName Create -Arguments @{ CommandLine = 'x' }\n", id="pipeline-create"),
+    # adversary pass 2 A1: the scanner reports these; a filter on the word "create" in the site text dropped them
+    pytest.param("$p = Get-WmiObject -List Win32_Process\n$p.\"Cr`Eate\"('cmd.exe')\n", id="escaped-member-name"),
+    pytest.param("$p = Get-WmiObject -List Win32_Process\n$p.'Create'('cmd.exe')\n", id="quoted-member-name"),
+    pytest.param("$p = Get-WmiObject -List Win32_Process\n$p.\"`u{0043}reate\"('cmd.exe')\n", id="unicode-escaped-member-name"),
 ]
 
 
@@ -414,6 +438,15 @@ def test_red_the_create_layer_reads_a_script_in_every_encoding_a_bom_names(tree,
     rel = tree("tools/new/probe.ps1", raw)
     problems = create_site_problems(tree.root, [rel])
     assert problems and all("WMI Create site" in p for p in problems), (encoding, problems)
+
+
+@_needs_pwsh
+def test_the_hidden_start_process_site_is_not_a_wmi_create_site(tree):
+    """The two hidden Start-Process sites in the real tree (rule D1) are `detached` sites too; they are not WMI creates."""
+    rel = tree("tools/new/probe.ps1", "Start-Process $psExe -ArgumentList @('-File', $f) -WindowStyle Hidden\n")
+    assert create_site_problems(tree.root, [rel]) == []
+    rel = tree("tools/new/probe2.ps1", "Start-Process $psExe -ArgumentList @('-File', $f) -WindowStyle Hidden\n$p = Get-WmiObject -List Win32_Process\n$p.Create('x')\n")
+    assert len(create_site_problems(tree.root, [rel])) == 1
 
 
 @_needs_pwsh
