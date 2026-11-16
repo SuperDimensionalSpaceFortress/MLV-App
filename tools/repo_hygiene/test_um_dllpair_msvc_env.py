@@ -413,6 +413,42 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                     self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
                     self.assertEqual(list(temp.iterdir()), [], p.stdout + p.stderr)
 
+    def test_adversary_e7f54e32_a1_a_stale_read_only_hit_file_is_never_read_as_this_checks_hits(self) -> None:
+        # adversary pass on e7f54e32, A1: the hit-list name is %TEMP%\mlv_ucrt_hits_%RANDOM%%RANDOM%.txt. With RANDOM defined in the environment (7 -> 77) the
+        # name is predictable, and a read-only file already there made `where ... >file` fail while the unconditional `& for /f` still read the STALE list: a
+        # corecrt.h that is NOT on INCLUDE would count as found (the adversary's trace). Measured on this host: cmd abandons the rest of the line when the
+        # redirect fails, so the stale list is not read, but a REAL header on INCLUDE was then refused (false exit 9) and the stale file was left behind.
+        # The file is removed (del /f) before each where, the loop runs only when where itself succeeded (&&), and the final delete is /f too, so no stale
+        # list is ever consumed or left behind, and a stale file cannot turn a good INCLUDE into a refusal.
+        temp = self.tmp / "Temp-stale"
+        temp.mkdir()
+        old_sdk = self.tmp / "OldSDK" / "ucrt"
+        old_sdk.mkdir(parents=True)
+        (old_sdk / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        real = self.tmp / "RealSDK" / "ucrt"
+        real.mkdir(parents=True)
+        (real / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        stale = temp / "mlv_ucrt_hits_77.txt"
+        for script in BACKEND_SCRIPTS:
+            for name, include, rc in (("header-outside-include", INCLUDE_NO_SDK, 9), ("header-on-include", f"{INCLUDE_NO_SDK};{real}", 0)):
+                with self.subTest(script=script.name, case=name):
+                    if stale.exists():
+                        os.chmod(stale, 0o666)
+                        stale.unlink()
+                    stale.write_text(f"{old_sdk / 'corecrt.h'}\r\n", encoding="ascii")
+                    os.chmod(stale, 0o444)
+                    p = self.run_check(script, include, via_env=True, extra_env={"TEMP": str(temp), "TMP": str(temp), "RANDOM": "7"})
+                    self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
+                    if rc == 9:
+                        self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                        self.assertNotIn("REACHED_NVCC", p.stdout)
+                    else:
+                        self.assertIn("REACHED_NVCC", p.stdout)
+                    if stale.exists():  # a leftover from a failed check: clear it so the next case starts from the fixture, and fail this one
+                        os.chmod(stale, 0o666)
+                        stale.unlink()
+                        self.fail("the stale hit file was left behind")
+
     def test_an_unusable_systemroot_is_a_typed_refusal_not_a_search_from_the_callers_directory(self) -> None:
         # the check runs "%SystemRoot%\System32\where.exe" by its absolute path (no pushd). When that file is absent the check must not fall through to a
         # where.exe found in the caller's current directory (a planted one); it is exit 9, typed (SYSTEMROOT_UNUSABLE).
