@@ -1,0 +1,28 @@
+# Allowlist for tests/coordination/test_wmi_process_allowlist.py (DOCTRINE-OUTBOX-WMI-SCANNER-DENY-BY-DEFAULT-1).
+#
+# A tracked .ps1 / .psm1 whose text names Win32_Process or wmic (any case, in code, strings or comments) is refused unless it has a row here.
+# A row is one line:  <repo-relative path with forward slashes> | <reason>
+#   query-only          the file only READS (Get-CimInstance / Get-WmiObject, or a read method such as GetOwner); it never calls Create. The test
+#                       also runs tests/coordination/Test-LaunchSites.ps1 (rule D2) over every query-only file and refuses a Create site.
+#   sanctioned-launcher the file is Start-HiddenDetached.ps1, the one sanctioned WMI launcher shape (no tracked copy exists today).
+# A row whose file is gone, is not a tracked .ps1 / .psm1, or no longer names Win32_Process / wmic is STALE and fails the test: delete the row.
+# A WMI Create in a file must NOT get a row. Launch through hub-tools\Start-HiddenDetached.ps1 instead (trap card
+# doctrine-outbox/20261114-wmi-create-child-inherits-gpfault-error-box.md). Blank lines and lines starting with # are ignored.
+tests/coordination/Test-LaunchSites.ps1 | query-only
+tools/coordination/Retire-LaneWorktree.ps1 | query-only
+tools/coordination/autopilot/board-ff.ps1 | query-only
+tools/coordination/board-health-sweep.ps1 | query-only
+tools/coordination/build-guard.ps1 | query-only
+tools/coordination/invoke-mlv-exclusive.ps1 | query-only
+tools/profiling/bachelor/AttrCudaArtifacts.psm1 | query-only
+tools/profiling/bachelor/playback-attr-3-cuda-job.ps1 | query-only
+tools/profiling/bachelor/ultra-magnus-agent.ps1 | query-only
+tools/profiling/dual-venue/Wait-VenueQuiet.ps1 | query-only
+tools/profiling/install-ultra-magnus-agent.ps1 | query-only
+tools/profiling/run-local-cuda-playback-dng-smoke.ps1 | query-only
+tools/profiling/run-release-cuda-playback-ab.ps1 | query-only
+tools/profiling/run-release-gui-smoke.ps1 | query-only
+tools/profiling/ultra-magnus-agent.ps1 | query-only
+tools/testing/test-ultra-magnus-agent-heavy-slot-fifo.ps1 | query-only
+tools/testing/test-ultra-magnus-agent-quiet-lease.ps1 | query-only
+tools/testing/test-ultra-magnus-agent-timeout.ps1 | query-only
