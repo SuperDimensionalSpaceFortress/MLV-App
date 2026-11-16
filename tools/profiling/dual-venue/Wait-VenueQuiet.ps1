@@ -116,6 +116,8 @@
 # -MaxAdmissionWaitSec (default 7200, range 1..86400), which is forwarded to um-run.ps1 as its heavy-slot admission ceiling. A caller's ABSOLUTE end (-WaitUntilUtc /
 # -WaitUntilTs) is also asked before each probe is written and submitted: past it no probe this script WAITED for is submitted (a re-probe, or a first probe after the gate
 # polled or retried: `GATE_CUTOFF ...`, exit 3; after a measured busy probe, that reading's verdict), even when the queue then reads empty (r11, adversary-d38e2ab8.json A1).
+# It is asked once more when such a probe answers: an answer that arrives past the cutoff (um-run stalled after the last check) is not published (`GATE_CUTOFF ...
+# phase=after-probe`, the same ends; r12, adversary-7fdbd64d.json A2).
 # The first probe of a gate that is CLEAR at its first read is the caller's own dispatch and is submitted (adversary-7fdbd64d.json A1: a zero wait keeps one reading). The venue chain passes its
 # -ProbeAdmissionWaitSec here, and sizes the claim ticket's probe-phase staleAfterSec from that same value, so the bound the ticket assumes is the bound the probe honours.
 # A read error on the agent share is retried -ReadAttempts times in all, backing off -ReadBackoffSec * attempt, inside the same deadline, before it is
@@ -132,7 +134,7 @@
 # directory) are exit 2 before anything is created. HOST ECHO: the probe job reports $env:COMPUTERNAME; if it is not the venue's expectedHost in venues.json
 # (case-insensitive; a missing host counts) the gate prints `HOST_MISMATCH ...` and exits 5 BEFORE any QUIET / COOLDOWN_UNMET line, so an alias of another
 # host's share (acknowledged with -AllowShareOverride) can never yield a verdict for the named venue.
-# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET, including one that took the FOREIGN_FLOOR early exit (read stdout); 3 GATE_BUSY (the queue never cleared, or GATE_CUTOFF: the caller's absolute end passed before a probe was submitted); 4 GATE_UNREADABLE (the agent share could not be
+# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET, including one that took the FOREIGN_FLOOR early exit (read stdout); 3 GATE_BUSY (the queue never cleared, or GATE_CUTOFF: the caller's absolute end passed before a probe was submitted, or before a waited-for probe answered); 4 GATE_UNREADABLE (the agent share could not be
 # read -- typed line `GATE_UNREADABLE ...` then `DECISION UNKNOWN`, never an empty-queue line; no probe is submitted); 5 HOST_MISMATCH (the probe was
 # answered by a host that is not the venue's); 6 VENUE_QUIET_UNKNOWN (the venue was not measured: typed line `VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=<t>%
 # waitedSec=<n> reason=<probe-failed|no-VENUE_QUIET-line|invalid-samples>`, never a QUIET / COOLDOWN_UNMET line); 2 a usage error (including a -SamplesJson that is
@@ -1640,6 +1642,11 @@ while ($true) {
         Write-Gate "HOST_MISMATCH $jobId $Venue probe host='$([string]$probe.host)' is not expectedHost '$expectedHost': no verdict is printed for '$Venue' $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
         exit 5
     }
+    # r12 (adversary-7fdbd64d.json A2): the two checks above end before um-run is entered, and um-run's own I/O (a heartbeat read, the job's placement) can stall past the
+    # caller's cutoff and still publish the job. So the cutoff is asked a third time, on this host's monotonic clock, when the probe's answer is back: a probe this script WAITED
+    # for whose answer arrives past the cutoff is NOT this gate's measurement. It ends as the before-write check does (after a measured busy probe, that earlier reading's
+    # verdict; none measured, GATE_CUTOFF exit 3). Its raw line above is kept as evidence. The caller's own first probe (7fdbd64d A1) is published whenever it ends.
+    if (Test-WaitCutoffRefusesProbe) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=after-probe job=$jobId (submitted, its reading not published): the caller's -WaitUntilUtc/-WaitUntilTs passed before the probe answered"; if ($null -ne $last) { break }; exit 3 }
     $samples = $(if ($null -ne $probe) { @($probe.samples) } else { @() })
     $d =Get-VenueQuietDecision -Samples $samples -Threshold $ThresholdPercent
     # BUSIEST FAST CORE: always evaluated for a v2 probe (or any probe once enforcing) so the line can be logged; it changes the decision only under -PerCoreEnforce, only for a

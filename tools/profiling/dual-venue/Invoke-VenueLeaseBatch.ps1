@@ -2392,6 +2392,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $probeEndTs = $q.endTs; $probeEndUtc = $q.endUtc
                 # r3 pass 2 (adversary A1): a probe that MEASURED ran agent jobs, which restart the agent's idle clock: QUIET just after its last sample, COOLDOWN_UNMET within one
                 # -RecheckSec of its end (it re-probes every -RecheckSec). A busy gate (GATE_BUSY) ran none: the anchor stays where it was.
+                # r12 (adversary-7fdbd64d.json A2): a GATE_CUTOFF phase=after-probe did run one agent job, but leaving the anchor earlier than that job only shortens the
+                # allowance the runner counts (the agent's idle clock restarted later), so it is the safe side of the agent's bound.
                 # r4 pass 2 (adversary A1): the probe's return is AFTER its last agent job ended by however long the child took to finish (a gate-log append, its exit), which the
                 # runner cannot see. The only instant provably no later than that job's end is the probe's dispatch: a measuring probe moves the anchor there, never past it.
                 if ($q.verdict -ceq 'QUIET' -or $q.verdict -ceq 'COOLDOWN_UNMET') { $idleAnchorTs = [Math]::Max($idleAnchorTs, $q.startTs) }
