@@ -1077,6 +1077,8 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r12 A1')) {
 if ($fnLoaded -and (Test-Has 'Update-ImportedSettingsLocked' 'r12 A3')) {
     $a3 = New-Scratch 'r12-a3'; $a3Settings = Join-Path $a3 'settings.json'
     [IO.File]::WriteAllText($a3Settings, '{"path":"C:/Users/obabalola/tool","p2":"C:\\Users\\obabalola\\x"}')
+    # r14 A4: the rewrite only touches a file the Import copy wrote and nobody changed since; this direct call stands for that copy, so it records the identity first
+    if (Get-Command Register-ImportAppliedIdentity -ErrorAction SilentlyContinue) { Register-ImportAppliedIdentity -Path $a3Settings }
     $script:A3HookWrote = $null
     # the seam runs after the file was read and before it is written: an editor saves a credential into the host file in that window
     $script:ImportSettingsRewriteHook = { param($Path) try { [IO.File]::WriteAllText($Path, '{"env":{"DB_PASSWORD":"owner-hunter2"}}'); $script:A3HookWrote = $true } catch { $script:A3HookWrote = $false } }
@@ -1213,6 +1215,166 @@ $b3nB = New-Scratch 'r12-b3n-bundle'
 $b3n = Invoke-Setup $b3Newer @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r12-b3n-state'), '-Workspace', (New-Scratch 'r12-b3n-ws'), '-BundlePath', $b3nB, '-SourceHost', 'NOT-THIS-HOST')
 $b3nText = [IO.File]::ReadAllText($b3nHost)
 Assert-That ($b3nText -ceq ('{"path":"' + ($b3Newer -replace '\\', '/') + '/from"}')) 'r12 B3 import (end to end, control): a newer bundle settings.json is applied and its profile rewritten' "$b3nText`n$($b3n.Out)"
+
+# ================================================================ r14 (head 67ec50ca): adversary pass 10, A1-A6
+# A1-A3 (one class): a secret-named key followed by ANY non-empty value is a credential, in a line, block (next non-blank, non-comment line) or flow form, and in a netrc
+# record; quoting never ends a value; only an empty value, a whole-value placeholder, or an unquoted whole boolean / null word is exempt.
+$r14Hit = [ordered]@{
+    'A1 YAML block password (value on the next line)'      = "password:`n  hunter2`n"
+    'A1 YAML block api_key'                                = "api_key:`n  abc123def`n"
+    'A1 flow mapping across a line break'                  = "{password:`n hunter2}"
+    'A1 YAML block with comment and blank lines between'   = "password:`n  # set by hand`n`n  hunter2`n"
+    'A1 YAML block scalar indicator'                       = "password: |`n  hunter2`n"
+    'A1 YAML block, CRLF'                                  = "api_key:`r`n  abc123def`r`n"
+    'A2 netrc quoted value, one line'                      = 'machine example.org login alice password "hunter2"'
+    'A2 netrc quoted value, several lines'                 = "machine example.org`nlogin alice`npassword `"hunter2`"`n"
+    'A2 netrc, eight comment lines between the lines'      = "machine example.org`n" + ((1..8 | ForEach-Object { "# comment $_" }) -join "`n") + "`nlogin alice`n" + ((1..8 | ForEach-Object { "# note $_" }) -join "`n") + "`npassword hunter2`n"
+    'A3 cmd DB_PASSWORD=false"hunter2'                     = '@set DB_PASSWORD=false"hunter2'
+    'A3 cmd AUTH_TOKEN=false"hunter2'                      = '@set AUTH_TOKEN=false"hunter2'
+    "A3 cmd DB_PASSWORD=none'hunter2"                      = "@set DB_PASSWORD=none'hunter2"
+    'A3 cmd an empty quote pair then text'                 = '@set DB_PASSWORD=""hunter2'
+    'A3 yaml password: true"hunter2'                       = 'password: true"hunter2'
+    'class: a pwd key'                                     = 'pwd=hunter2'
+    'class: an auth key'                                   = 'auth: hunter2'
+    'class: an XML element'                                = '<configuration><DbPassword>hunter2</DbPassword></configuration>'
+    'class: a URL with a user and a password'              = 'url = https://alice:hunter2@example.org/repo.git'
+    'class: an all-digit value under a plain TOKEN key'    = 'GH_TOKEN=123456'
+}
+$r14Ok = [ordered]@{
+    'a block key with nothing after it'                    = "password:`n"
+    'a block key with only a comment after it'             = "password:`n# nothing here`n"
+    'an empty quoted YAML value'                           = 'password: ""'
+    'a ${...} placeholder'                                 = 'password: "${DB_PASSWORD}"'
+    'a <...> placeholder'                                  = 'DB_PASSWORD=<your password>'
+    'a *** placeholder'                                    = 'password: ***'
+    'a netrc empty quoted password'                        = 'machine example.org login alice password ""'
+    'a flow boolean on the next line'                      = "{password:`n false}"
+    'author is not auth'                                   = 'author: Layi'
+    'an empty XML element'                                 = '<password></password>'
+    'a URL with a user only'                               = 'url = ssh://git@github.com/org/repo.git'
+}
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r14 A1-A3')) {
+    foreach ($k in $r14Hit.Keys) { Assert-That (Test-CredentialText $r14Hit[$k]) "r14 $k is a credential (Test-CredentialText)" $r14Hit[$k] }
+    foreach ($k in $r14Ok.Keys) { Assert-That (-not (Test-CredentialText $r14Ok[$k])) "r14 $k is not a credential" $r14Ok[$k] }
+    Assert-That ((Get-CredentialHitLine "# a`n# b`npassword:`n  hunter2`n") -eq 3) 'r14 A1 Get-CredentialHitLine: a block credential is reported on the line of its key'
+    # every guard site calls the one detector: Export stage scan + typed line, archive re-check, Import bundle guard, Import host guard, the locked copy, the settings rewrite, the backup
+    $r14Samples = [ordered]@{ A1 = $r14Hit['A1 YAML block password (value on the next line)']; A2 = $r14Hit['A2 netrc quoted value, several lines']; A3 = $r14Hit['A3 cmd DB_PASSWORD=false"hunter2'] }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    foreach ($id in $r14Samples.Keys) {
+        $t = $r14Samples[$id]
+        $st = New-Scratch "r14-$id-stage"; [IO.File]::WriteAllText((Join-Path $st 'service.yaml'), $t)
+        Assert-That (@(Get-StagedCredentialHits -Stage $st).Count -eq 1) "r14 $id export: the staged file is a hit (Get-StagedCredentialHits)"
+        $sc = Invoke-StagedSecretScan -Stage $st
+        Assert-That (-not (Test-Path -LiteralPath (Join-Path $st 'service.yaml')) -and @($sc.Typed | Where-Object { $_ -like 'EXPORT_CREDENTIAL_HIT service.yaml:*' }).Count -eq 1) "r14 $id export: the scan removes it with a typed EXPORT_CREDENTIAL_HIT line" (@($sc.Typed) -join ';')
+        $zp = Join-Path (New-Scratch "r14-$id-zip") 'b.zip'
+        $zf = [IO.Compression.ZipFile]::Open($zp, 'Create')
+        try { $e = $zf.CreateEntry('home-claude/machine/service.yaml'); $sw = [IO.StreamWriter]::new($e.Open()); $sw.Write($t); $sw.Dispose() } finally { $zf.Dispose() }
+        Assert-That (@(Get-ArchiveCredentialHits -Zip $zp).Count -eq 1) "r14 $id export: the archive re-check is a hit"
+        $is = New-Scratch "r14-$id-isrc"; $id_ = New-Scratch "r14-$id-idst"
+        [IO.File]::WriteAllText((Join-Path $is 'bundle.yaml'), $t); [IO.File]::WriteAllText((Join-Path $is 'host.yaml'), 'clean: 1'); [IO.File]::WriteAllText((Join-Path $id_ 'host.yaml'), $t)
+        $sk = @(Get-ImportCredentialSkips -SourceDir $is -DestDir $id_)
+        Assert-That (@($sk | Where-Object { $_.Source -like '*bundle.yaml' -and $_.Reason -eq 'bundle file carries a credential' }).Count -eq 1 -and @($sk | Where-Object { $_.Source -like '*host.yaml' -and $_.Reason -eq 'host file carries a credential' }).Count -eq 1) "r14 $id import: the bundle guard and the host guard both refuse it" (($sk | ForEach-Object Reason) -join ';')
+        $cs = Join-Path $is 'locked-src.yaml'; [IO.File]::WriteAllText($cs, $t)
+        $cr = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($cs)) -Dest (Join-Path $id_ 'locked-new.yaml') -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+        Assert-That ($cr.Result -ceq 'source-credential' -and -not (Test-Path -LiteralPath (Join-Path $id_ 'locked-new.yaml'))) "r14 $id import: the locked copy refuses the bundle file" "$($cr.Result)"
+        $hs = Join-Path $is 'clean-src.yaml'; [IO.File]::WriteAllText($hs, 'clean: 2'); (Get-Item -LiteralPath $hs).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(5)
+        $hd = Join-Path $id_ 'locked-host.yaml'; [IO.File]::WriteAllText($hd, $t); (Get-Item -LiteralPath $hd).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2)
+        $script:Failures.Clear()
+        $cr2 = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($hs)) -Dest $hd -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+        Assert-That ($cr2.Result -ceq 'changed' -and ([IO.File]::ReadAllText($hd)) -ceq $t) "r14 $id import: the locked copy never replaces a host file that carries it" "$($cr2.Result)"
+        $ss = Join-Path (New-Scratch "r14-$id-set") 'settings.json'; [IO.File]::WriteAllText($ss, $t)
+        $ur = Update-ImportedSettingsLocked -Path $ss -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice'
+        Assert-That ($ur.Result -ceq 'changed' -and ([IO.File]::ReadAllText($ss)) -ceq $t) "r14 $id import: the settings.json rewrite leaves a host file that carries it alone" "$($ur.Result)"
+        $bk = New-Scratch "r14-$id-bk"
+        Assert-That ((Copy-CleanBackupFile -Path $ss -DestinationDir $bk) -eq $false -and -not (Test-Path -LiteralPath (Join-Path $bk 'settings.json'))) "r14 $id import: the backup never copies it"
+        $script:Failures.Clear()
+    }
+}
+
+# ---------------------------------------------------------------- r14 A4: the settings.json rewrite refuses a host file that changed after the copy wrote it (an editor's newer save is kept)
+if ($fnLoaded -and (Test-Has 'Update-ImportedSettingsLocked' 'r14 A4') -and (Test-Has 'Copy-ImportFileLocked' 'r14 A4')) {
+    $a4d = New-Scratch 'r14-a4'
+    $a4Src = Join-Path $a4d 'bundle-settings.json'; $a4Dst = Join-Path $a4d 'host\settings.json'
+    [IO.File]::WriteAllText($a4Src, '{"path":"C:/Users/obabalola/from"}'); (Get-Item -LiteralPath $a4Src).LastWriteTimeUtc = [DateTime]::new(2026, 11, 15, 12, 0, 0, [DateTimeKind]::Utc)
+    $a4r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($a4Src)) -Dest $a4Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+    Assert-That ($a4r.Result -ceq 'created') 'r14 A4 import: the bundle settings.json is applied (created)' "$($a4r.Result)"
+    # after the copy released its lock and before the rewrite: an editor saves newer host settings
+    [IO.File]::WriteAllText($a4Dst, '{"path":"C:/Users/obabalola/host"}')
+    $script:Failures.Clear()
+    $a4u = Update-ImportedSettingsLocked -Path $a4Dst -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice'
+    Assert-That (([IO.File]::ReadAllText($a4Dst)) -ceq '{"path":"C:/Users/obabalola/host"}') 'r14 A4 import: an editor save newer than the copy is preserved byte for byte (not rewritten)' ([IO.File]::ReadAllText($a4Dst))
+    Assert-That ($a4u.Result -ceq 'changed' -and @($script:Failures | Where-Object { $_ -ceq "IMPORT_DEST_CHANGED_SKIPPED $a4Dst" }).Count -eq 1) 'r14 A4 import: the refusal is the typed IMPORT_DEST_CHANGED_SKIPPED <path> failure' "$($a4u.Result) $($script:Failures -join ',')"
+    # control: no save in between, the rewrite applies
+    $a4Dst2 = Join-Path $a4d 'host2\settings.json'
+    [void](Copy-ImportFileLocked -Source ([IO.FileInfo]::new($a4Src)) -Dest $a4Dst2 -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false)
+    $a4u2 = Update-ImportedSettingsLocked -Path $a4Dst2 -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice'
+    Assert-That ($a4u2.Result -ceq 'rewritten' -and ([IO.File]::ReadAllText($a4Dst2)) -ceq '{"path":"C:/Users/alice/from"}') 'r14 A4 import (control): the file the copy wrote, unchanged since, is rewritten' "$($a4u2.Result) $([IO.File]::ReadAllText($a4Dst2))"
+    $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r14 A5: a replace whose write fails leaves the host file's bytes and timestamp as they were (never truncate first)
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r14 A5')) {
+    $a5d = New-Scratch 'r14-a5'
+    $a5Src = Join-Path $a5d 'bundle\service.ps1'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $a5Src))
+    [IO.File]::WriteAllText($a5Src, ('#' * 8192)); (Get-Item -LiteralPath $a5Src).LastWriteTimeUtc = [DateTime]::new(2026, 11, 15, 12, 0, 0, [DateTimeKind]::Utc)
+    $a5Dst = Join-Path $a5d 'host\service.ps1'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $a5Dst))
+    $a5Time = [DateTime]::new(2026, 11, 14, 12, 0, 0, [DateTimeKind]::Utc)
+    [IO.File]::WriteAllText($a5Dst, '# OWNER'); (Get-Item -LiteralPath $a5Dst).LastWriteTimeUtc = $a5Time
+    # the seam stands for the disk: it throws while the replacement bytes are being written (insufficient space)
+    $script:ImportWriteFaultHook = { param($Dest) throw 'simulated write failure: insufficient disk space' }
+    $a5threw = $false
+    try { [void](Copy-ImportFileLocked -Source ([IO.FileInfo]::new($a5Src)) -Dest $a5Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false) } catch { $a5threw = $true } finally { $script:ImportWriteFaultHook = $null }
+    Assert-That $a5threw 'r14 A5 import: a replace whose write fails is an error (IMPORT_COPY_FAILED in the caller), not a success'
+    Assert-That (([IO.File]::ReadAllText($a5Dst)) -ceq '# OWNER') 'r14 A5 import: the host file keeps its original bytes after a failed replace' ([IO.File]::ReadAllText($a5Dst)).Substring(0, [Math]::Min(20, ([IO.File]::ReadAllText($a5Dst)).Length))
+    Assert-That ([IO.File]::GetLastWriteTimeUtc($a5Dst) -eq $a5Time) 'r14 A5 import: the host file keeps its original timestamp (a later /XO import still repairs it)' ([IO.File]::GetLastWriteTimeUtc($a5Dst).ToString('o'))
+    Assert-That (@(Get-ChildItem -LiteralPath (Split-Path -Parent $a5Dst) -Force).Count -eq 1) 'r14 A5 import: no temp file is left beside the host file' ((Get-ChildItem -LiteralPath (Split-Path -Parent $a5Dst) -Force | ForEach-Object Name) -join ';')
+    # control: the same replace without the fault lands the bundle bytes and the bundle timestamp
+    $a5ok = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($a5Src)) -Dest $a5Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+    Assert-That ($a5ok.Result -ceq 'replaced' -and ([IO.File]::ReadAllText($a5Dst)) -ceq ('#' * 8192) -and [IO.File]::GetLastWriteTimeUtc($a5Dst) -eq [IO.File]::GetLastWriteTimeUtc($a5Src) -and @(Get-ChildItem -LiteralPath (Split-Path -Parent $a5Dst) -Force).Count -eq 1) 'r14 A5 import (control): an unfaulted replace lands the bundle bytes and timestamp and leaves no temp file' "$($a5ok.Result)"
+    # the settings.json rewrite: same rule
+    if (Test-Has 'Update-ImportedSettingsLocked' 'r14 A5 settings') {
+        $a5sSrc = Join-Path $a5d 'bundle\settings.json'; [IO.File]::WriteAllText($a5sSrc, '{"path":"C:/Users/obabalola/tool"}')
+        $a5s = Join-Path $a5d 'host\settings.json'
+        [void](Copy-ImportFileLocked -Source ([IO.FileInfo]::new($a5sSrc)) -Dest $a5s -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false)
+        $a5sTime = [IO.File]::GetLastWriteTimeUtc($a5s)
+        $script:ImportWriteFaultHook = { param($Dest) throw 'simulated write failure: insufficient disk space' }
+        $a5sThrew = $false
+        try { $a5sr = Update-ImportedSettingsLocked -Path $a5s -FromProfile 'C:\Users\obabalola' -ToProfile 'C:\Users\alice' } catch { $a5sThrew = $true } finally { $script:ImportWriteFaultHook = $null }
+        Assert-That (([IO.File]::ReadAllText($a5s)) -ceq '{"path":"C:/Users/obabalola/tool"}' -and [IO.File]::GetLastWriteTimeUtc($a5s) -eq $a5sTime) 'r14 A5 import: a settings.json rewrite whose write fails leaves the bytes and timestamp as they were' ([IO.File]::ReadAllText($a5s))
+        Assert-That ($a5sThrew -or ($a5sr -and $a5sr.Result -cne 'rewritten')) 'r14 A5 import: the failed rewrite is not reported as rewritten'
+        Assert-That (@(Get-ChildItem -LiteralPath (Split-Path -Parent $a5s) -Force).Count -eq 2) 'r14 A5 import: no temp or backup file is left beside settings.json' ((Get-ChildItem -LiteralPath (Split-Path -Parent $a5s) -Force | ForEach-Object Name) -join ';')
+    }
+    $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r14 A6: SSH fails closed even when a log write throws after sshd was started and its firewall opened
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseSsh' 'r14 A6')) {
+    function Invoke-R14A6 {
+        $script:A6Calls = [System.Collections.Generic.List[string]]::new()
+        # every cmdlet the phase calls is a local stub (no service, firewall, registry or ProgramData is touched)
+        function Get-WindowsCapability { [CmdletBinding()] param($Online, $Name) [pscustomobject]@{ Name = 'OpenSSH.Server~~~~0.0.1.0'; State = 'Installed' } }
+        function Set-Service { [CmdletBinding()] param($Name, $StartupType) $script:A6Calls.Add("SETSERVICE $Name $StartupType") }
+        function Start-Service { [CmdletBinding()] param($Name) $script:A6Calls.Add("START $Name") }
+        function Stop-Service { [CmdletBinding()] param($Name, [switch]$Force) $script:A6Calls.Add("STOP $Name") }
+        function Restart-Service { [CmdletBinding()] param($Name) $script:A6Calls.Add("RESTART $Name") }
+        function Get-NetFirewallRule { [CmdletBinding()] param($Name) [pscustomobject]@{ Name = $Name } }
+        function New-NetFirewallRule { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments)]$Rest) $script:A6Calls.Add('NEWFIREWALL') }
+        function Set-NetFirewallRule { [CmdletBinding()] param($Name, $Enabled, $Profile, $RemoteAddress) $script:A6Calls.Add("FIREWALL $Name") }
+        function Get-PwshPath { $null }
+        function Set-SshdKeyOnlyConfig { [CmdletBinding()] param($ConfigPath, $BackupDir, $Stamp) throw 'r14 A6 test: the hardening step must not be reached' }
+        function Invoke-Native { [CmdletBinding()] param($Exe, $Arguments, [switch]$AllowFail, $OkCodes) throw 'r14 A6 test: no native command runs' }
+        # the setup log is held by another process from the step after the firewall on: every log append throws
+        function Write-Log { param([string]$Message, [string]$Level = 'INFO') if ($script:A6Calls -contains 'FIREWALL OpenSSH-Server-In-TCP') { throw 'the setup log is locked by another process' } }
+        $threw = $false
+        try { Invoke-PhaseSsh } catch { $threw = $true }
+        return @{ Threw = $threw; Calls = @($script:A6Calls) }
+    }
+    $a6 = Invoke-R14A6
+    Assert-That ($a6.Calls -contains 'START sshd' -and $a6.Calls -contains 'FIREWALL OpenSSH-Server-In-TCP') 'r14 A6 ssh: the fixture reached the state of the finding (sshd started, firewall opened)' ($a6.Calls -join ',')
+    $a6StartIdx = [array]::LastIndexOf([string[]]$a6.Calls, 'START sshd'); $a6StopIdx = [array]::LastIndexOf([string[]]$a6.Calls, 'STOP sshd')
+    Assert-That ($a6StopIdx -gt $a6StartIdx) 'r14 A6 ssh: a Write-Log throw after the firewall step still stops sshd (password-enabled sshd does not stay up)' ($a6.Calls -join ',')
+    Assert-That ($a6.Calls -contains 'SETSERVICE sshd Manual') 'r14 A6 ssh: the fail-closed path also takes sshd off automatic start (a reboot does not bring the password config back up)' ($a6.Calls -join ',')
+}
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"

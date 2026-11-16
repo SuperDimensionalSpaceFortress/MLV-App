@@ -513,7 +513,13 @@ function Invoke-PhaseSsh {
         }
     }
 
+    # r14 A6: SSH fails closed whatever throws (a Write-Log append included). From the moment this phase starts sshd until the key-only config has landed, a finally
+    # that does not depend on logging stops sshd and takes it off automatic start; the hardening step sets the flag only after it succeeded.
+    $script:SshdStartAttempted = $false
+    $script:SshKeyOnlyLanded = $false
+    try {
     Invoke-Step 'sshd and ssh-agent: automatic start, running' {
+        $script:SshdStartAttempted = $true
         Set-Service sshd -StartupType Automatic; Start-Service sshd
         Set-Service ssh-agent -StartupType Automatic; Start-Service ssh-agent
     }
@@ -548,6 +554,7 @@ function Invoke-PhaseSsh {
             try {
                 Set-SshdKeyOnlyConfig -ConfigPath $cfg -BackupDir (Join-Path $StateRoot 'backups') -Stamp $stamp
                 Restart-Service sshd
+                $script:SshKeyOnlyLanded = $true   # r14 A6: only now may sshd stay up
             } catch {
                 # Fail closed (adversary A6): sshd was started and its firewall rule opened above with the stock config, which allows passwords.
                 # If the hardening did not land, the service does not stay up on that config.
@@ -556,6 +563,18 @@ function Invoke-PhaseSsh {
             }
         }
     } else { Write-Log "sshd_config not created yet ($cfg); start sshd once and re-run -Phase Ssh" 'WARN' }
+    } finally {
+        if ($script:SshdStartAttempted -and -not $script:SshKeyOnlyLanded) {
+            # no logging before the stop: a log that cannot be written must not keep password-enabled sshd running (r14 A6)
+            $stopErr = ''
+            try { Stop-Service sshd -Force -ErrorAction Stop } catch { $stopErr = $_.Exception.Message }
+            try { Set-Service sshd -StartupType Manual -ErrorAction Stop } catch { if (-not $stopErr) { $stopErr = $_.Exception.Message } }
+            try {
+                if ($stopErr) { Write-Log "could not fully stop sshd after the key-only config did not land: $stopErr" 'ERROR' }
+                else { Write-Log 'sshd STOPPED and set to Manual start because the key-only config did not land; fix the cause and re-run -Phase Ssh' 'ERROR' }
+            } catch { }
+        }
+    }
     if (-not $AuthorizedKey) { Write-Log 'SSH is key-only and no source key is installed yet: paste the VIRTUAL-TEN public key (README step 3)' 'MANUAL' }
 
     $sshDir = Join-Path $env:USERPROFILE '.ssh'
@@ -651,59 +670,249 @@ function Invoke-PhaseQt {
 # $ExportDir. Secrets, credentials, auth tokens, ssh keys and session transcripts never enter it.
 # ---------------------------------------------------------------------------------------------
 $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|TOKEN|CREDENTIAL'
-# p5 A1: a secret-named key with a QUOTED value of any length, spaces included (a three character or two word password is still a password), or an
-# UNQUOTED '=' assignment (cmd 'set X=y', dotenv, ini) whose value is 4+ non-space characters that is not a boolean, null or a number and does not
-# start like code ($var, (expr), %var%, @splat). The key may not follow a '$', word character or '-' (so '$Token = Get-Token' in a script is not a hit).
-# A QUOTED value is still a hit wherever the key stands ('$Tok = ''x''' too), and Export then ends non-zero naming the file (r11 F-B1); the detector is never narrowed to make a staged file pass.
-# r10 A1: the key words split in two. A STRONG word (password, secret, a key, a credential) says what the value is, so ANY non-empty unquoted value
-# counts, one character or all digits included ('DB_PASSWORD=123456'); TOKEN also names counters ('max_tokens = 4096'), so a TOKEN key keeps the 4+
-# characters, not-all-digits rule. A YAML 'key: value' line is judged too (for a STRONG key the whole rest of the line is the value, so a prose line such as
-# 'Password: see the owner' is a hit by design: fail closed).
-$CredentialStrongWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|CREDENTIAL'
-# r11 S-B1: a TOML basic ("""...""") or literal ('''...''') triple-quoted string is a quoted value too, on one line or across lines (the value may start on the line
-# after the opening delimiter, and may itself begin with a quote). An EMPTY triple-quoted string (the closing delimiter is the next thing after the opening one,
-# whitespace aside) is not a value.
-$CredentialTomlTripleValue = '"""(?!\s*""")\s*\S|' + "'''" + '(?!\s*' + "'''" + ')\s*\S'
-$CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\r\n]+"|''[^''\r\n]+''|' + $CredentialTomlTripleValue + ')'
-# r10 pass 7 A1: a STRONG key takes ANY value that is not itself a boolean or null word: '$hunter2', '@hunter2', 'false-password', 'null-secret' and a multi-word
-# YAML passphrase are credentials (a false positive costs one dropped file named in SECRET-SCAN.txt; a miss ships a secret). The boolean test is for the
-# WHOLE word (followed by a space, quote, comma, semicolon or the end), not a prefix. TOKEN keys keep the code-looking-start guard and the 4+ not-all-digits rule.
-# r12 A2: "the WHOLE word" means the word ends the VALUE: only blanks, then a quote, comma, semicolon, '#' comment, line break or the end may follow it. A space
-# followed by more text ('@set DB_PASSWORD=false hunter2', a cmd multi-word value) is a value that merely starts with a boolean word, so it is still a credential.
-# r12 pass 9 B1: narrower still. The word ends the value only when it is followed by (an optional ';' or ',' and) blanks and a line end, by blanks and a '#' COMMENT (a '#'
-# glued to the word is content), or by a closing quote. 'false;hunter2' (cmd) and 'false#hunter2' are values that merely start with a boolean word.
-$CredentialBoolGuard = '(?!(?:true|false|null|none|nil|undefined)(?=[;,]?[ \t]*(?:\r|\n|$)|[ \t]+#|["'']))'
-$CredentialTokenGuard = '(?![\$\(%@\{\[<])' + $CredentialBoolGuard
-$CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialBoolGuard + '[^\s"'',;]+'
-$CredentialUnquotedTokenPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialTokenGuard + '(?!\d+\b)[^\s"'',;]{4,}'
-$CredentialYamlPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+(?!(?:true|false|null|none|nil|undefined|~)(?:[ \t]+#[^\r\n]*|[ \t]*)\r?$)[^\s#][^\r\n]*'
-$CredentialYamlTokenPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialTokenGuard + '(?!~)(?!\d+\b)[^\s"''#]{4,}[ \t]*(?:#[^\r\n]*)?\r?$'
-# r12 A1: a YAML / JSON FLOW mapping ('{password: hunter2}', 'svc: { api_key: x }', '{name: svc, password: hunter2}'): the key follows a '{' or a ',' on the same line, not the
-# start of the line, so the block-style YAML patterns above never see it. An unquoted value that is a boolean / null word ending at the next ',' '}' ']' or '#' is not a
-# value ('{has_password: true, n: 1}'); a quoted value is the name/value pattern's job. A STRONG key takes any other value (fail closed, like the block form); a TOKEN key
-# keeps the code-looking-start guard and the 4+ characters, not-all-digits rule.
-$CredentialFlowBoolGuard = '(?!(?:true|false|null|none|nil|undefined|~)(?:[ \t]*[,}\]]|[ \t]+#|[ \t]*(?:\r|\n|$)))'
-$CredentialFlowPattern = '(?i)[{,][ \t]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]*' + $CredentialFlowBoolGuard + '[^\s,}\]#"''][^,}\r\n]*'
-$CredentialFlowTokenPattern = '(?i)[{,][ \t]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]*(?![\$\(%@\{\[<])' + $CredentialFlowBoolGuard + '(?!\d+\b)[^\s"'',;}\]#]{4,}'
-# r12 pass 9 B2: record shapes with no 'name = value' or 'name: value' form. netrc: 'machine example.org login alice password hunter2' on one line, or 'machine' / 'login' then a
-# line that starts with 'password <value>' (within 6 lines of 200 characters, so a long prose file with a stray word 'login' is not scanned to its end). npmrc: '_auth=<base64>'
-# (also '//registry/:_auth=...'); the other npmrc secrets (_authToken, _password) already match the TOKEN / PASSWORD words. The prose sentence 'rotate the password every 90 days' is not a hit.
-$CredentialNetrcLinePattern = '(?i)(?<![\w\-])(?:machine[ \t]+\S+[^\r\n]*?|(?:default[ \t]+)?login[ \t]+\S+[ \t]+)\bpassword[ \t]+[^\s"'',;]+'
-$CredentialNetrcBlockPattern = '(?im)(?<![\w\-])(?:machine|login)[ \t]+\S+[ \t]*\r?\n(?:[^\r\n]{0,200}\r?\n){0,6}?[ \t]*password[ \t]+[^\s"'',;:=]+'
-$CredentialNpmAuthPattern = '(?i)(?<![A-Z0-9])_auth[ \t]*=[ \t]*[^\s"'',;]+'
+# r14 (hub ruling on adversary pass 10 A1-A3; replaces the r3..r12 per-format regex set: p5 A1, r10 A1, r11 S-B1, r12 A1/A2, r12 pass 9 B1/B2).
+# Every pass since r10 found three more spellings of the same detector, so the per-format patterns (a quoted name/value pattern, an unquoted '=' pattern,
+# two YAML patterns, two flow patterns, two netrc patterns, an npmrc pattern) are gone. There is ONE shape-agnostic rule, Get-CredentialKeyValueHitIndex:
+#   a text is refused when a SECRET-NAMED KEY is followed by ANY NON-EMPTY VALUE, in
+#     - a line form:  'k=v', 'k = v', 'k: v', 'set k=v', '"k": "v"', 'k = """v"""' (TOML triple quotes, across lines);
+#     - a block form: 'k:' then the next non-blank, non-comment line, at any indent, with any number of comment and blank lines between ('password:\n  hunter2',
+#                     'password: |\n  hunter2', 'password: # note\n  hunter2');
+#     - a flow form:  '{k: v}', '{a: 1, k: v}', 'svc: { k: v }', and across line breaks ('{password:\n hunter2}');
+#   plus a netrc record ('machine h login u password v', the same across lines, with any number of comment lines between; Get-CredentialNetrcHitIndex).
+# A secret-named key is any key whose letters (case-insensitive, any separator: '_', '-', '.', camelCase) say password / passwd / pass_word, secret,
+# credential, api_key / apikey, private_key, access_key, auth_key, token, or that has a part 'auth', 'authorization' or 'pwd' ('_auth', 'x-auth', 'AuthHeader';
+# not 'author').
+# Quoting never ends a value: text after a closing quote is part of the value ('""hunter2', '"x"y'), and a quote inside an unquoted value is content
+# ('false"hunter2'). The ONLY exemptions are named here and judge the WHOLE value:
+#   - an explicit empty value ('k=', 'k: ""', "k = ''", 'k = """"""', 'k: []', 'k: {}', or a block key with no later value line);
+#   - a whole-value placeholder: '${NAME}', '<words>', '***' (three or more asterisks), quoted or not;
+#   - an UNQUOTED whole boolean / null word: true, false, null, none, nil, undefined, '~' ('false"hunter2', 'false;hunter2', 'false hunter2' are NOT whole words;
+#     a trailing ';' or ',' and a ' #' comment are not part of a value);
+#   - a TOKEN key's unquoted all-digit value, which is a count ('max_tokens = 4096', 'token_count: 12'); a PASSWORD-class key has no such exemption;
+#   - a mapping value ('auth: { type: x }'), whose own pairs are judged where they stand;
+#   - a script variable assigned from code ('$Token = Get-Token', '$env:GH_TOKEN = $t'): only a QUOTED literal there is a stored value ('$Tok = ''x''' is a hit).
+# A prose line such as 'Password: see the owner' is a hit by design (fail closed: a false positive costs one dropped file named in SECRET-SCAN.txt; a miss ships a
+# secret). The detector is never narrowed to make a staged file pass (r11 F-B1). Every guard site (the Export stage scan and its typed EXPORT_CREDENTIAL_HIT line,
+# the archive re-check, the Import bundle and host guards, the locked copy, the settings.json rewrite and the backup copy) calls Test-CredentialText /
+# Get-CredentialHitLine, which call this rule and nothing else besides the known token shapes below.
+$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-]*)(["'']?)[ \t]*(:|=(?!=))'
+$script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
+$script:CredentialPlainSpanRegex = [regex]::new('\G[^\r\n]*?(?=[ \t]#|\r|\n|$)')
+$script:CredentialFlowSpanRegex = [regex]::new('\G[^\r\n,}\]]*?(?=[ \t]#|[\r\n,}\]]|$)')
+$script:CredentialDqRegex = [regex]::new('\G"(?:[^"\\\r\n]|\\.)*"')
+$script:CredentialSqRegex = [regex]::new("\G'[^'\r\n]*'")
+$script:CredentialNetrcTokenRegex = [regex]::new('(?m)(?<c>^[ \t]*#[^\r\n]*)|(?<t>\S+)')
+$script:CredentialPlaceholderRegex = [regex]::new('^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z][A-Za-z0-9 _.\-]*>|\*{3,})$')
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
+# Known token SHAPES: a secret by its own form, whatever key (if any) it stands under. These are not spellings of the key/value rule above.
 $SecretPatterns = @(
     'sk-ant-[A-Za-z0-9_\-]{20,}', 'sk-proj-[A-Za-z0-9_\-]{20,}', 'sk-[A-Za-z0-9]{40,}',
     'gh[pousr]_[A-Za-z0-9]{30,}', 'github_pat_[A-Za-z0-9_]{30,}', 'xox[abprs]-[A-Za-z0-9\-]{10,}',
     '-----BEGIN [A-Z ]*PRIVATE KEY-----', '"(access|refresh|id)_?[Tt]oken"\s*:\s*"[^"]{16,}"', 'AKIA[0-9A-Z]{16}',
-    # A secret VALUE under a name that says what it is (adversary pass 2, A15): an AWS secret access key has no recognisable shape of its own.
-    # r3 A4: the name list also covers API/ACCESS/AUTH key, TOKEN and CREDENTIAL; either quote style; a value of 4 or more characters (a short
-    # password is still a password). The same text is the host-side credential test Import applies (Test-CredentialText).
-    $CredentialNameValuePattern, $CredentialUnquotedPattern, $CredentialUnquotedTokenPattern, $CredentialYamlPattern, $CredentialYamlTokenPattern, $CredentialFlowPattern, $CredentialFlowTokenPattern,
-    $CredentialNetrcLinePattern, $CredentialNetrcBlockPattern, $CredentialNpmAuthPattern
+    # r14: a URL that carries a user AND a password ('https://alice:hunter2@example.org', the .git-credentials shape)
+    '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"''<>]+:[^\s/@"''<>]+@'
 )
-$script:SecretRegex = [regex]::new(($SecretPatterns -join '|'))
+# r14: the XML element form of the key/value rule ('<password>hunter2</password>', '<DbPassword>x</DbPassword>'); the attribute form 'password="x"' is the line form.
+$script:CredentialXmlRegex = [regex]::new('(?i)<([A-Za-z0-9_.\-:]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-:]*)(?:\s[^<>]*)?>([^<]*)</\1\s*>')
+$script:SecretShapeRegex = [regex]::new(($SecretPatterns -join '|'))
+
+# '' = not a secret-named key; 'strong' = the key says its value is a secret; 'count' = a TOKEN key (its unquoted all-digit value is a count, not a secret).
+function Get-CredentialKeyClass {
+    param([string]$Key)
+    $flat = ($Key -replace '[_.\-]', '').ToLowerInvariant()
+    if ($flat -match 'password|passwd|secret|credential|apikey|privatekey|accesskey|authkey') { return 'strong' }
+    $parts = @(($Key -creplace '(?<=[a-z0-9])(?=[A-Z])', '_').ToLowerInvariant() -split '[_.\-]+' | Where-Object { $_ })
+    foreach ($p in $parts) { if ($p -ceq 'auth' -or $p -ceq 'pwd' -or $p -ceq 'authorization') { return 'strong' } }
+    if (-not $flat.Contains('token')) { return '' }
+    # a TOKEN key that names a count ('max_tokens', 'token_count', 'token_limit', 'num_tokens', 'token_budget') may hold a number; any other TOKEN key ('GH_TOKEN') is strong
+    if ($flat -match 'tokens|count|limit|max|min|budget|num|size|usage|used') { return 'count' }
+    return 'strong'
+}
+
+# The text of an unquoted value that starts at $At: up to the line end or a ' #' comment (and, inside a flow mapping, a ',' '}' or ']'), trailing blanks and ONE
+# trailing ';' or ',' removed. A quote is content here (quoting never ends a value).
+function Get-CredentialPlainSpan {
+    param([string]$Text, [int]$At, [bool]$Flow)
+    if ($At -ge $Text.Length) { return '' }
+    $rx = $(if ($Flow) { $script:CredentialFlowSpanRegex } else { $script:CredentialPlainSpanRegex })
+    $s = $rx.Match($Text, $At).Value.TrimEnd()
+    if ($s.EndsWith(';') -or $s.EndsWith(',')) { $s = $s.Substring(0, $s.Length - 1).TrimEnd() }
+    return $s
+}
+
+# The value that starts at $At. Returns @{ Kind = 'empty' | 'container' | 'quoted' | 'plain'; Value }.
+function Read-CredentialValueAt {
+    param([string]$Text, [int]$At, [bool]$Flow)
+    $n = $Text.Length
+    if ($At -ge $n) { return @{ Kind = 'empty'; Value = '' } }
+    $c = $Text[$At]
+    foreach ($q3 in '"""', "'''") {
+        if ($At + 3 -le $n -and $Text.Substring($At, 3) -ceq $q3) {
+            $close = $Text.IndexOf($q3, $At + 3, [StringComparison]::Ordinal)
+            if ($close -lt 0) { return @{ Kind = 'plain'; Value = $Text.Substring($At) } }   # unterminated: everything after it is the value
+            $tail = Get-CredentialPlainSpan $Text ($close + 3) $Flow
+            if ($tail.Trim()) { return @{ Kind = 'plain'; Value = $Text.Substring($At, $close + 3 - $At) + $tail } }
+            return @{ Kind = 'quoted'; Value = $Text.Substring($At + 3, $close - $At - 3) }
+        }
+    }
+    if ($c -eq '"' -or $c -eq "'") {
+        $qm = $(if ($c -eq '"') { $script:CredentialDqRegex } else { $script:CredentialSqRegex }).Match($Text, $At)
+        if ($qm.Success) {
+            $tail = Get-CredentialPlainSpan $Text ($At + $qm.Length) $Flow
+            if (-not $tail.Trim()) { return @{ Kind = 'quoted'; Value = $qm.Value.Substring(1, $qm.Length - 2) } }
+            return @{ Kind = 'plain'; Value = $qm.Value + $tail }   # quoting never ends a value ('""hunter2')
+        }
+        return @{ Kind = 'plain'; Value = (Get-CredentialPlainSpan $Text $At $Flow) }   # no closing quote on the line
+    }
+    if ($c -eq '{') {
+        $close = $Text.IndexOf('}', $At + 1)
+        $inside = $(if ($close -lt 0) { $Text.Substring($At + 1) } else { $Text.Substring($At + 1, $close - $At - 1) })
+        if (-not $inside.Trim()) { return @{ Kind = 'empty'; Value = '' } }
+        if ($inside -match '[:=]') { return @{ Kind = 'container'; Value = '' } }   # a mapping: its pairs are judged where they stand
+        return @{ Kind = 'plain'; Value = '{' + $inside + '}' }   # '{hunter2}' is a scalar
+    }
+    if ($c -eq '[') {
+        $j = $At + 1
+        while ($j -lt $n -and [char]::IsWhiteSpace($Text[$j])) { $j++ }
+        if ($j -ge $n -or $Text[$j] -eq ']') { return @{ Kind = 'empty'; Value = '' } }
+        return (Read-CredentialValueAt -Text $Text -At $j -Flow $true)   # a sequence: its first element is the value
+    }
+    return @{ Kind = 'plain'; Value = (Get-CredentialPlainSpan $Text $At $Flow) }
+}
+
+# The index of the first character of the next line (after $From, which is at a line break or the end) that is neither blank nor a '#' comment; -1 when none.
+function Get-CredentialNextValueLine {
+    param([string]$Text, [int]$From)
+    $n = $Text.Length
+    $p = $From
+    while ($p -lt $n) {
+        $nl = $Text.IndexOf("`n", $p)
+        if ($nl -lt 0) { return -1 }
+        $p = $nl + 1
+        $q = $p
+        while ($q -lt $n -and ($Text[$q] -eq ' ' -or $Text[$q] -eq "`t" -or $Text[$q] -eq "`r")) { $q++ }
+        if ($q -ge $n) { return -1 }
+        if ($Text[$q] -eq "`n") { $p = $q; continue }
+        if ($Text[$q] -eq '#') { $p = $q; continue }
+        return $q
+    }
+    return -1
+}
+
+# True when the key at $KeyStart stands inside a flow mapping: the previous non-blank character (line breaks included) is '{', or a ',' (for '=' only when a '{'
+# opened earlier on that line is still open: a TOML inline table, not a cmd / CSV ',KEY=value,more' line).
+function Test-CredentialFlowContext {
+    param([string]$Text, [int]$KeyStart, [string]$Sep)
+    $i = $KeyStart - 1
+    if ($i -ge 0 -and ($Text[$i] -eq '"' -or $Text[$i] -eq "'")) { $i-- }
+    while ($i -ge 0 -and [char]::IsWhiteSpace($Text[$i])) { $i-- }
+    if ($i -lt 0) { return $false }
+    if ($Text[$i] -eq '{') { return $true }
+    if ($Text[$i] -ne ',') { return $false }
+    if ($Sep -eq ':') { return $true }
+    $ls = $Text.LastIndexOf("`n", $i) + 1
+    $seg = $Text.Substring($ls, $i - $ls)
+    return (($seg.Split('{').Count - 1) -gt ($seg.Split('}').Count - 1))
+}
+
+# The whole-value exemptions named above, and nothing else.
+function Test-CredentialValueExempt {
+    param([hashtable]$Value, [string]$Class)
+    $s = $Value.Value.Trim()
+    if (-not $s) { return $true }
+    if ($script:CredentialPlaceholderRegex.IsMatch($s)) { return $true }
+    if ($Value.Kind -eq 'quoted') { return $false }
+    if ($s -match '^(?i:true|false|null|none|nil|undefined|~)$') { return $true }
+    if ($Class -eq 'count' -and $s -match '^[0-9]+$') { return $true }
+    return $false
+}
+
+# The one key/value rule: the index of the first secret-named key that carries a value, -1 when there is none.
+function Get-CredentialKeyValueHitIndex {
+    param([string]$Text)
+    $n = $Text.Length
+    foreach ($m in $script:CredentialKeyRegex.Matches($Text)) {
+        $key = $m.Groups[1].Value
+        $class = Get-CredentialKeyClass $key
+        if (-not $class) { continue }
+        $keyStart = $m.Groups[1].Index
+        $sep = $m.Groups[3].Value
+        $from = [Math]::Max(0, $keyStart - 64)
+        $isVar = $Text.Substring($from, $keyStart - $from) -match '\$(?:[A-Za-z_][A-Za-z0-9_]*:)?$'
+        $flow = Test-CredentialFlowContext -Text $Text -KeyStart $keyStart -Sep $sep
+        $p = $m.Index + $m.Length
+        $blank = $p
+        while ($p -lt $n -and ($Text[$p] -eq ' ' -or $Text[$p] -eq "`t")) { $p++ }
+        $lineEnd = $Text.IndexOfAny([char[]]"`r`n", [Math]::Min($p, $n))
+        if ($lineEnd -lt 0) { $lineEnd = $n }
+        $rest = $Text.Substring($p, $lineEnd - $p)
+        if ($sep -eq ':') {
+            # block form: nothing on the key's line, a ' #' comment, or a YAML block scalar indicator ('|', '>-'): the value is the next non-blank, non-comment line
+            if (-not $rest.Trim() -or ($p -gt $blank -and $rest.StartsWith('#')) -or $rest -match '^[|>][0-9+\-]*[ \t]*(?:[ \t]#.*)?$') {
+                $p = Get-CredentialNextValueLine $Text $lineEnd
+                if ($p -lt 0) { continue }
+            }
+        } elseif (-not $rest.Trim()) { continue }   # 'k=' with nothing after it is an explicit empty value
+        $v = Read-CredentialValueAt -Text $Text -At $p -Flow $flow
+        if ($v.Kind -eq 'empty' -or $v.Kind -eq 'container') { continue }
+        if ($isVar -and $v.Kind -ne 'quoted') { continue }
+        if (Test-CredentialValueExempt -Value $v -Class $class) { continue }
+        return $keyStart
+    }
+    return -1
+}
+
+# A netrc record: 'machine <host>' or 'default' (or a record that starts at 'login <user>'), then netrc keyword/value pairs (login, account, port, password) in any
+# order, across any number of lines and '#' comment lines. A 'password <value>' pair in such a record is a hit unless the value is empty ('""') or a placeholder; a quote
+# never ends the value. Any other word ends the record, so prose that merely mentions a password is not one.
+function Get-CredentialNetrcHitIndex {
+    param([string]$Text)
+    if ($Text -notmatch '(?i)(?<![\w\-])password(?![\w\-])') { return -1 }
+    $inRecord = $false; $expect = ''; $pwAt = -1
+    foreach ($t in $script:CredentialNetrcTokenRegex.Matches($Text)) {
+        if ($t.Groups['c'].Success) { continue }
+        $w = $t.Value
+        if ($expect) {
+            if ($expect -ceq 'password') {
+                $val = $w
+                if ($val.Length -ge 2 -and ($val[0] -eq '"' -or $val[0] -eq "'") -and $val[$val.Length - 1] -eq $val[0]) { $val = $val.Substring(1, $val.Length - 2) }
+                if ($val.Trim() -and -not $script:CredentialPlaceholderRegex.IsMatch($val.Trim())) { return $pwAt }
+            }
+            $expect = ''
+            continue
+        }
+        switch ($w.ToLowerInvariant()) {
+            'machine' { $inRecord = $true; $expect = 'host' }
+            'default' { $inRecord = $true }
+            'login' { $inRecord = $true; $expect = 'login' }
+            'account' { if ($inRecord) { $expect = 'account' } }
+            'port' { if ($inRecord) { $expect = 'port' } }
+            'password' { if ($inRecord) { $expect = 'password'; $pwAt = $t.Index } }
+            default { $inRecord = $false }
+        }
+    }
+    return -1
+}
+
+# The index of the first credential in the text (a known token shape, the key/value rule, or a netrc record), -1 when there is none.
+function Get-CredentialHitIndex {
+    param([string]$Text)
+    $best = -1
+    $m = $script:SecretShapeRegex.Match($Text)
+    if ($m.Success) { $best = $m.Index }
+    $xml = -1
+    foreach ($xm in $script:CredentialXmlRegex.Matches($Text)) {
+        $class = Get-CredentialKeyClass ($xm.Groups[1].Value -replace '^.*:', '')
+        if (-not $class) { continue }
+        if (Test-CredentialValueExempt -Value @{ Kind = 'plain'; Value = $xm.Groups[2].Value } -Class $class) { continue }
+        $xml = $xm.Index; break
+    }
+    foreach ($i in @((Get-CredentialKeyValueHitIndex $Text), (Get-CredentialNetrcHitIndex $Text), $xml)) {
+        if ($i -ge 0 -and ($best -lt 0 -or $i -lt $best)) { $best = $i }
+    }
+    return $best
+}
 
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
 # judged as written AND with its JSON \uXXXX escapes decoded (p5 A1: '{"api_key":"x"}' says api_key). The Export scan and the Import host-side
@@ -718,15 +927,15 @@ function Test-CredentialText {
 function Get-CredentialHitLine {
     param([string]$Text)
     if (-not $Text) { return 0 }
-    $m = $script:SecretRegex.Match($Text)
-    if (-not $m.Success -and $Text.Contains('\u')) {
+    # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
+    $idx = Get-CredentialHitIndex $Text
+    if ($idx -lt 0 -and $Text.Contains('\u')) {
         $Text = [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
-        $m = $script:SecretRegex.Match($Text)
+        $idx = Get-CredentialHitIndex $Text
     }
-    if (-not $m.Success) { return 0 }
-    $line = 1
-    for ($i = 0; $i -lt $m.Index; $i++) { if ($Text[$i] -eq "`n") { $line++ } }
-    return $line
+    if ($idx -lt 0) { return 0 }
+    # the line of the KEY (a block-form value sits on a later line; the report names where the secret-named key stands)
+    return ($Text.Substring(0, $idx).Split("`n").Count)
 }
 $ExcludeFiles = @('*.log', '*.err', '*.bak*', '*.tmp', '*.lock', '*.pid', '*.sqlite*', '*.jsonl', '.credentials.json', '.claude.json',
     'auth.json', '*.pem', '*.pfx', '*.p12', '*.key', '*.ppk', 'id_rsa*', 'id_ed25519*', '*_id', '*_id.pub', '*.kdbx', '.env', '*.env',
@@ -1083,6 +1292,7 @@ function Copy-ImportFileLocked {
             $fs.Dispose(); $fs = $null
             $keepAttr = $Source.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)
             if ($keepAttr) { [IO.File]::SetAttributes($Dest, ([IO.File]::GetAttributes($Dest) -bor $keepAttr)) }
+            Register-ImportAppliedIdentity -Path $Dest -Bytes $bytes -WriteTimeUtc $Source.LastWriteTimeUtc   # r14 A4: what the copy wrote, for the settings rewrite
             return @{ Result = 'created' }
         }
         # Cheap pre-check without a lock: a destination the rules would not replace is never opened (a running hook may hold it).
@@ -1092,18 +1302,89 @@ function Copy-ImportFileLocked {
         # From here the host file is ours alone: the timestamps, the content and the write below are one atomic view of it.
         if (-not (Test-ImportReplaces -Source $Source -Dest ([IO.FileInfo]::new($Dest)) -ExcludeNewer $ExcludeNewer -ExcludeOlder $ExcludeOlder -ExcludeChanged $ExcludeChanged)) { return @{ Result = 'kept' } }
         if ($fs.Length -gt $MaxScanBytes) { return @{ Result = 'changed'; Why = 'host file larger than the scan limit' } }
-        $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8, $true, 4096, $true)
-        try { $dstText = $rd.ReadToEnd() } finally { $rd.Dispose() }
+        $orig = Read-ImportHeldBytes $fs
+        $dstText = ConvertFrom-ImportBytes $orig
         if (Test-CredentialText $dstText) { return @{ Result = 'changed'; Why = 'host file carries a credential' } }
         if (($CredentialRoleFiles -contains $Source.Name.ToLowerInvariant()) -and ([regex]::new('(?i)(' + $CredentialNameWords + ')')).IsMatch($dstText)) { return @{ Result = 'changed'; Why = 'host credential-role file names a credential key' } }
-        [void]$fs.Seek(0, [IO.SeekOrigin]::Begin)
-        $fs.SetLength(0)
-        $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
-        [IO.File]::SetLastWriteTimeUtc($fs.SafeFileHandle, $Source.LastWriteTimeUtc)   # r12 A5: through the held handle, before the lock is released
-        if ($script:ImportAfterWriteHook) { & $script:ImportAfterWriteHook $Dest }
-        $fs.Dispose(); $fs = $null
+        # r14 A5: never truncate first. The bundle bytes go to a sibling temp file carrying the bundle timestamp (r12 A5: the timestamp is set before the file takes the host
+        # name, so no editor save can be backdated), and File.Replace swaps it in; a write that fails leaves the host file's bytes and timestamp as they were.
+        $swap = Set-ImportFileContentAtomic -Dest $Dest -Bytes $bytes -WriteTimeUtc $Source.LastWriteTimeUtc -Held $fs -JudgedBytes $orig
+        $fs = $null
+        if ($swap -ceq 'changed') { return @{ Result = 'changed'; Why = 'host file was saved while the replace ran (that save was put back)' } }
+        Register-ImportAppliedIdentity -Path $Dest -Bytes $bytes -WriteTimeUtc $Source.LastWriteTimeUtc   # r14 A4
         return @{ Result = 'replaced' }
     } finally { if ($fs) { $fs.Dispose() } }
+}
+
+# r14 A5: all bytes of a host file this run holds open (from the start), without closing the handle.
+function Read-ImportHeldBytes {
+    param([IO.FileStream]$Stream)
+    [void]$Stream.Seek(0, [IO.SeekOrigin]::Begin)
+    $ms = [IO.MemoryStream]::new()
+    $Stream.CopyTo($ms)
+    return , $ms.ToArray()
+}
+
+# The text of a file's bytes as Import judges it (UTF-8, a byte order mark honoured).
+function ConvertFrom-ImportBytes {
+    param([byte[]]$Bytes)
+    $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.Encoding]::UTF8, $true)
+    try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+}
+
+function Get-ImportBytesHash {
+    param([byte[]]$Bytes)
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))
+}
+
+# r14 A4: the identity (SHA-256 and last-write time) of what an Import copy wrote to a host file, keyed by its normalised path. The settings.json rewrite only touches a
+# file whose identity still matches (an editor's newer save is kept). Without -Bytes the file is read as it stands now.
+$script:ImportAppliedIdentity = @{}
+function Register-ImportAppliedIdentity {
+    param([string]$Path, [byte[]]$Bytes = $null, [Nullable[DateTime]]$WriteTimeUtc = $null)
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($null -eq $Bytes) { $Bytes = [IO.File]::ReadAllBytes($full); $WriteTimeUtc = [IO.File]::GetLastWriteTimeUtc($full) }
+    $script:ImportAppliedIdentity[$full.ToLowerInvariant()] = @{ Hash = (Get-ImportBytesHash $Bytes); WriteTimeUtc = $WriteTimeUtc }
+}
+
+# r14 A5: replace the content of a host file this run holds locked (FileShare.None) WITHOUT truncating it first:
+#   1. the new bytes are written in full to a sibling temp file (CreateNew) and flushed; its last-write time is set when one is given. A failure here (a full disk)
+#      removes the temp file and throws; the host file was never written, so its bytes and timestamp are as they were (the next /XO import still repairs it).
+#   2. the lock is released and File.Replace swaps the temp file in, keeping the old host file as a backup (one step; a failure throws with the host file intact).
+#   3. the backup must be the bytes judged under the lock; when it is not, someone saved in the instant between 2's release and the swap, and their file is put back
+#      ('changed'). Otherwise the backup is removed ('replaced').
+# Test seams (always $null in a real run): ImportWriteFaultHook runs halfway through writing the temp file (a throw stands for the disk failing);
+# ImportAfterWriteHook runs once the bytes and the timestamp are written, while the host file is still locked (it stands for an editor saving).
+function Set-ImportFileContentAtomic {
+    param([string]$Dest, [byte[]]$Bytes, [Nullable[DateTime]]$WriteTimeUtc, [IO.FileStream]$Held, [byte[]]$JudgedBytes)
+    $dir = Split-Path -Parent $Dest
+    $base = Join-Path $dir ('.' + (Split-Path -Leaf $Dest) + '.mlvimport-' + $PID + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $tmp = "$base.tmp"; $bak = "$base.bak"
+    $ts = $null
+    try {
+        $ts = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $half = [int][Math]::Floor($Bytes.Length / 2)
+        $ts.Write($Bytes, 0, $half)
+        if ($script:ImportWriteFaultHook) { & $script:ImportWriteFaultHook $Dest }
+        $ts.Write($Bytes, $half, $Bytes.Length - $half)
+        $ts.Flush($true)
+        if ($null -ne $WriteTimeUtc) { [IO.File]::SetLastWriteTimeUtc($ts.SafeFileHandle, [datetime]$WriteTimeUtc) }   # (PowerShell unwraps the Nullable: no .Value)
+        $ts.Dispose(); $ts = $null
+        if ($script:ImportAfterWriteHook) { & $script:ImportAfterWriteHook $Dest }
+        $Held.Dispose()   # File.Replace cannot swap a file this run still holds open
+        [IO.File]::Replace($tmp, $Dest, $bak, $true)
+    } catch {
+        if ($ts) { $ts.Dispose() }
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    $was = [IO.File]::ReadAllBytes($bak)
+    if ((Get-ImportBytesHash $was) -cne (Get-ImportBytesHash $JudgedBytes)) {
+        [IO.File]::Replace($bak, $Dest, $null, $true)
+        return 'changed'
+    }
+    Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+    return 'replaced'
 }
 
 # One Import copy that refuses credential-bearing files (r3 A5) and replaces nothing it has not judged under a lock (r11 S-B2). Reads the same switches the
@@ -1194,6 +1475,9 @@ $script:ImportBeforeReplaceHook = $null
 # locked; (b) after the settings.json profile rewrite read the file, before it writes. Both stand for an editor saving into the host file; always $null in a real run.
 $script:ImportAfterWriteHook = $null
 $script:ImportSettingsRewriteHook = $null
+# Test seam for r14 A5 (Set-ImportFileContentAtomic): a scriptblock called with the destination path halfway through writing the replacement; a throw stands for the write
+# failing (a full disk). Always $null in a real run.
+$script:ImportWriteFaultHook = $null
 
 # r12 A3: the settings.json profile rewrite (VIRTUAL-TEN profile -> this profile) as ONE locked read-judge-write on the host file, the same discipline as
 # Copy-ImportFileLocked: the file is opened exclusively (FileShare.None), read, judged by Test-CredentialText, and written back through the SAME handle. It used to be
@@ -1204,25 +1488,32 @@ function Update-ImportedSettingsLocked {
     param([string]$Path, [string]$FromProfile, [string]$ToProfile, [long]$MaxScanBytes = 26214400)
     $fs = $null
     $why = ''
+    # r14 A4: the identity of what the Import copy wrote to this file (Register-ImportAppliedIdentity); none = the copy did not write it, so it is not rewritten.
+    $expect = $script:ImportAppliedIdentity[([IO.Path]::GetFullPath($Path)).ToLowerInvariant()]
     try {
         try { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
         catch { $why = "host file cannot be locked for the rewrite ($($_.Exception.Message))" }
         if (-not $why) {
             if ($fs.Length -gt $MaxScanBytes) { $why = 'host file larger than the scan limit' }
             else {
-                $rd = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8, $true, 4096, $true)
-                try { $text = $rd.ReadToEnd() } finally { $rd.Dispose() }
+                $orig = Read-ImportHeldBytes $fs
+                $text = ConvertFrom-ImportBytes $orig
                 if (Test-CredentialText $text) { $why = 'host file carries a credential' }
+                # r14 A4: re-read under the lock, right before the rewrite: the bytes and the last-write time must still be what the copy wrote. An editor's save after
+                # the copy released its lock (a newer host file) is kept, and the refusal is typed.
+                elseif (-not $expect) { $why = 'no record of the Import copy writing this file' }
+                elseif ((Get-ImportBytesHash $orig) -cne $expect.Hash -or [IO.File]::GetLastWriteTimeUtc($fs.SafeFileHandle) -ne $expect.WriteTimeUtc) { $why = 'host file changed after the Import copy wrote it (the newer save is kept)' }
             }
         }
         if (-not $why) {
             if ($script:ImportSettingsRewriteHook) { & $script:ImportSettingsRewriteHook $Path }
             $new = $text.Replace(($FromProfile -replace '\\', '/'), ($ToProfile -replace '\\', '/')).Replace(($FromProfile -replace '\\', '\\'), ($ToProfile -replace '\\', '\\'))
             $bytes = [Text.UTF8Encoding]::new($false).GetBytes($new)
-            [void]$fs.Seek(0, [IO.SeekOrigin]::Begin)
-            $fs.SetLength(0)
-            $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
-            return @{ Result = 'rewritten' }
+            # r14 A5: never truncate first (Set-ImportFileContentAtomic): a write that fails leaves the bytes and the timestamp as they were, and throws.
+            $swap = Set-ImportFileContentAtomic -Dest ([IO.Path]::GetFullPath($Path)) -Bytes $bytes -WriteTimeUtc $null -Held $fs -JudgedBytes $orig
+            $fs = $null
+            if ($swap -ceq 'replaced') { return @{ Result = 'rewritten' } }
+            $why = 'host file was saved while the rewrite ran (that save was put back)'
         }
     } finally { if ($fs) { $fs.Dispose() } }
     Write-Log "IMPORT_DEST_CHANGED_SKIPPED $Path ($why; the settings.json profile rewrite was not applied, the host file was left as it is)" 'ERROR'
@@ -1294,6 +1585,7 @@ function Invoke-PhaseImport {
         # p5 A4 / r12 pass 9 B3: remember whether the bundle's settings.json was APPLIED, from what the copy actually did (it wrote the file: 'created' or 'replaced'), not from a
         # timestamp sampled before the copy (a newer or an identical host file the copy KEPT would then have been rewritten).
         $script:ImportAppliedDest.Clear()
+        $script:ImportAppliedIdentity.Clear()   # r14 A4
         $hostSettings = [IO.Path]::GetFullPath("$h\.claude\settings.json")
         Invoke-ImportRobocopy "$src\home-claude" "$h\.claude" (@('/E', '/XO') + $inX)
         $script:ImportSettingsApplied = @($script:ImportAppliedDest | Where-Object { $_ -ieq $hostSettings }).Count -gt 0
