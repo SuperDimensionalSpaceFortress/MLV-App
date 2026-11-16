@@ -176,7 +176,7 @@ if (-not (Test-Path -LiteralPath $dllPairManifestPath)) {
 }
 $dllPairManifest = Get-Content -Raw -LiteralPath $dllPairManifestPath | ConvertFrom-Json
 $dllPairManifestSha256 = Get-ShaLower $dllPairManifestPath
-if ($dllPairManifest.sourceCommit -ne $SourceCommit) {
+if (-not [string]::Equals([string]$dllPairManifest.sourceCommit, $SourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
     Complete-Failed 4 'dllPairBinding' "DLL pair was built from $($dllPairManifest.sourceCommit), not $SourceCommit"
 }
 if ($dllPairManifest.pendingSymbolPresence -isnot [bool]) {

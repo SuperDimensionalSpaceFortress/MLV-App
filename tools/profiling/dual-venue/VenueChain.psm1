@@ -760,7 +760,7 @@ function Get-VenueStagedBuildManifest {
             $dll = @($facts | Where-Object { $_.StartsWith('D:') }) | Select-Object -First 1
             $sym = @($facts | Where-Object { $_.StartsWith('S:') }) | Select-Object -First 1
             $problem = $(if ($facts -contains 'UNPARSEABLE') { 'ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE the staged manifest is not JSON' }
-                elseif ($commit.Substring(2) -ne $SourceCommit) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
+                elseif (-not [string]::Equals($commit.Substring(2), $SourceCommit, [StringComparison]::OrdinalIgnoreCase)) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
                 elseif ($dll.Substring(2) -notmatch '^[0-9a-f]{64}$') { "ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND the staged manifest carries no well-formed dllPairManifestSha256 (got '$($dll.Substring(2))')" }
                 elseif ($sym -ne 'S:bool') { 'ATTRCUDA_BUILD_MANIFEST_SYMBOL_PRESENCE_INVALID the staged manifest pendingSymbolPresence is not a boolean' }
                 elseif ($badArt = @('packageZip', 'exe', 'dll' | Where-Object { $facts -cnotcontains "A:$_=ok" })) { "ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING the staged manifest carries no 64-hex sha256 for $($badArt -join ', ') (the leg job hashes the cached artifact against it)" }

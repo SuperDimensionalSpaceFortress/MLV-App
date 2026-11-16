@@ -528,7 +528,10 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                                       ")\n"),
                                      ("    $manifest = [IO.File]::ReadAllText($Path) | ConvertFrom-Json\n"
                                       "    if ($null -eq $manifest) { throw \"ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE $Path\" }\n"),
-                                     ("        throw \"ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH $Path declares '$commit', expected '$ExpectedSourceCommit'\"\n"),
+                                     # r24 (adversary pass-25 A1 on 63887a9c): the fourth region now opens before the `if` line (the commit is compared ordinally), so the baseline's if line and
+                                     # throw are one pinned block
+                                     ("    if ($commit -ne $ExpectedSourceCommit) {\n"
+                                      "        throw \"ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH $Path declares '$commit', expected '$ExpectedSourceCommit'\"\n"),
                                      ("        if (-not $fullLogPath.StartsWith($root + '\\', [StringComparison]::OrdinalIgnoreCase)) {\n"))
 
     @classmethod

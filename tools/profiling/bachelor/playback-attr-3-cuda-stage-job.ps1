@@ -92,7 +92,10 @@ if (-not (Test-Path -LiteralPath $buildManifestPath)) {
     throw "build manifest not found: $buildManifestPath (the assembler writes it LAST; its absence means that build did not complete)"
 }
 $buildManifest = Get-Content -Raw -LiteralPath $buildManifestPath | ConvertFrom-Json
-if ($buildManifest.sourceCommit -ne $SourceCommit) {
+# r24 (adversary pass-25 A1 on 63887a9c): ordinal, never -ne/-ceq (PowerShell string operators, the case-sensitive ones too, are culture comparisons that ignore U+200B and
+# other format characters): equal length and an OrdinalIgnoreCase StartsWith is ordinal equality.
+$declaredBuildCommit = [string]$buildManifest.sourceCommit
+if ($declaredBuildCommit.Length -ne $SourceCommit.Length -or -not $declaredBuildCommit.StartsWith($SourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
     throw "build manifest sourceCommit=$($buildManifest.sourceCommit) does not match -SourceCommit $SourceCommit"
 }
 if ($buildManifest.pendingSymbolPresence -isnot [bool]) {
@@ -325,7 +328,8 @@ $StepLog['sideFileHashes'] = 0
 # The manifest's own claims must still agree with the baked set: identical bytes cannot
 # disagree, so this fails only if the baking itself was wrong -- which is worth knowing.
 $arrivedManifest = Get-Content -Raw -LiteralPath $manifestSide | ConvertFrom-Json
-if ($arrivedManifest.sourceCommit -ne $SourceCommit) {
+$arrivedCommit = [string]$arrivedManifest.sourceCommit
+if ($arrivedCommit.Length -ne $SourceCommit.Length -or -not $arrivedCommit.StartsWith($SourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
     Complete-Failed 5 'manifestBinding' "arrived manifest sourceCommit=$($arrivedManifest.sourceCommit) does not match $SourceCommit"
 }
 if ($arrivedManifest.pendingSymbolPresence -isnot [bool]) {
@@ -464,7 +468,13 @@ if (Test-Path -LiteralPath $manifestCachePath) {
             Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit (COMMIT_MISMATCH) names no commit, so it is not replaced: $unsound"
         }
         $cachedCommit = $declaredCommit
-        if ($cachedCommit -match '^[0-9a-fA-F]{40}\z' -and $cachedCommit.Substring(0, 12) -ieq $SourceCommit.Substring(0, 12) -and $cachedCommit -ine $SourceCommit) {
+        # r24 (adversary pass-25 A1 on 63887a9c): ordinal compares, and a declaration that is not plainly ANOTHER prefix is refused, never replaced. -ieq/-ine are culture comparisons
+        # that ignore U+200B, so a declaration that only culture-matched this commit's 12 hex (or was a ZWSP-laden copy of another commit's) was not "40-hex" and fell through to
+        # the replace path below. The declaration's hex digits alone (every other character dropped, so no zero-width, format or separator character can hide a prefix) are read
+        # against this name's 12 hex: a declaration whose digits start with them and that is not this commit is somebody's build under this name, whatever its length or shape.
+        $declaredHexDigits = $cachedCommit -replace '[^0-9a-fA-F]', ''
+        $isThisCommit = ($cachedCommit.Length -eq $SourceCommit.Length -and $cachedCommit.StartsWith($SourceCommit, [StringComparison]::OrdinalIgnoreCase))
+        if ($declaredHexDigits.StartsWith($SourceCommit.Substring(0, 12), [StringComparison]::OrdinalIgnoreCase) -and -not $isThisCommit) {
             Write-Output "STAGE_REFUSED_STAGED_OTHER_COMMIT sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) stagedCommit=$cachedCommit incoming=$($ManifestSha256.Substring(0, 8))"
             Complete-Failed 7 'stagedBuildGuard' "the cache name of $SourceCommit holds the build of $cachedCommit (the same 12-hex prefix); another commit's build is never replaced, so nothing is staged"
         }

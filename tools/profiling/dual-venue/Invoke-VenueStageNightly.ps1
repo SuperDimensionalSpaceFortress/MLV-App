@@ -448,7 +448,7 @@ foreach ($line in $receiptLines) {
     } elseif ($rid -and $reservations.Contains($rid)) {
         $reservations[$rid].endedAs = [string]$prev.outcome
     }
-    if ([string]$prev.outcome -ceq 'STAGE_OK' -and [string]$prev.sourceCommit -cne $commit -and -not $built) { $built = $prev }
+    if ([string]$prev.outcome -ceq 'STAGE_OK' -and -not [string]::Equals([string]$prev.sourceCommit, $commit, [StringComparison]::Ordinal) -and -not $built) { $built = $prev }
 }
 $script:Row.reconciled = @(foreach ($x in @($reservations.Values | Where-Object { -not $_.endedAs })) {
     [ordered]@{ reservationId = $x.reservationId; sourceCommit = $x.sourceCommit; utc = $x.utc; state = 'incomplete' }
@@ -456,7 +456,7 @@ $script:Row.reconciled = @(foreach ($x in @($reservations.Values | Where-Object 
 if ($built) {
     Stop-Nightly 'NIGHT_ALREADY_BUILT' "night $nightKey already staged $([string]$built.sourceCommit) on $Venue at $(Format-RowUtc $built.utc); at most one build per night"
 }
-$holder = @($reservations.Values | Where-Object { $_.sourceCommit -cne $commit }) | Select-Object -First 1
+$holder = @($reservations.Values | Where-Object { -not [string]::Equals([string]$_.sourceCommit, $commit, [StringComparison]::Ordinal) }) | Select-Object -First 1
 if ($holder) {
     $how = $(if ($holder.endedAs) { "ended $($holder.endedAs)" } else { 'never completed (no row closes it: its call died, or its closing row was lost)' })
     Stop-Nightly 'NIGHT_RESERVED' "night $nightKey on $Venue is held by reservation $($holder.reservationId) for $($holder.sourceCommit) at $($holder.utc), which $how; at most one commit per night, so $commit is not staged tonight (the hub inspects the $Venue cache)"
@@ -497,7 +497,7 @@ $cached = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
 $cachedWellFormed = $false
 if ($cached.present) {
     $cj = try { $cached.text | ConvertFrom-Json } catch { $null }
-    $cachedWellFormed = ($null -ne $cj) -and ([string]$cj.sourceCommit -ceq $commit)
+    $cachedWellFormed = ($null -ne $cj) -and [string]::Equals([string]$cj.sourceCommit, $commit, [StringComparison]::Ordinal)
 }
 $missingArtifacts = @(foreach ($n in @($names.exeName, $names.reconName, $names.packageZipName)) { if (-not (Read-Share "$cache\$n" $PathByName @((Join-Path $cache $n), 'file'))) { $n } })
 $runnerPresent = [bool](Read-Share "$cache\$runnerDirName" $PathByName @((Join-Path $cache $runnerDirName), 'dir'))
@@ -666,7 +666,7 @@ if ($buildInCache) {
     if (Test-Path -LiteralPath $localJson -PathType Leaf) {
         $lj = try { [IO.File]::ReadAllText($localJson) | ConvertFrom-Json } catch { $null }
         $allLocal = @($names.exeName, $names.reconName, $names.packageZipName | Where-Object { -not (Test-Path -LiteralPath (Join-Path $buildDir $_) -PathType Leaf) }).Count -eq 0
-        if ($lj -and [string]$lj.sourceCommit -ceq $commit -and $allLocal) { $local = (Get-FileHash -LiteralPath $localJson -Algorithm SHA256).Hash.ToLowerInvariant() }
+        if ($lj -and [string]::Equals([string]$lj.sourceCommit, $commit, [StringComparison]::Ordinal) -and $allLocal) { $local = (Get-FileHash -LiteralPath $localJson -Algorithm SHA256).Hash.ToLowerInvariant() }
     }
     if ($local) {
         # an earlier call assembled this sha here but never got it into the cache: stage those bytes, do not assemble again
@@ -686,7 +686,7 @@ if ($buildInCache) {
         $guard = @($a.out -split "`r?`n" | Where-Object { $_ -match '^(BUILD_MEM_REFUSED|BUILD_SLOT_BUSY|BUILD_HEAVY_SLOT_REQUEUE)\b' })
         if ($a.exit -eq 3 -and $guard.Count -gt 0) { Stop-Nightly 'BUILD_GUARD_REFUSED' 'the build guard refused the assemble' -Verbatim $guard }
         $ok = [regex]::Match($a.out, '(?m)^RESULT=ASSEMBLE_OK SOURCE=([0-9a-f]{40}) .*MANIFEST_SHA256=([0-9a-f]{64})')
-        if ($a.exit -ne 0 -or -not $ok.Success -or $ok.Groups[1].Value -cne $commit) {
+        if ($a.exit -ne 0 -or -not $ok.Success -or -not [string]::Equals($ok.Groups[1].Value, $commit, [StringComparison]::Ordinal)) {
             $fail = Get-LastLine $a.out '^RESULT=ASSEMBLE_FAILED'
             Stop-Nightly 'ASSEMBLE_FAILED' "the assembler exit $($a.exit) $(if ($fail) { $fail.Trim() } else { 'printed no RESULT=ASSEMBLE_OK for this sha' }) (see $($script:WorkDir)\assemble.log)"
         }

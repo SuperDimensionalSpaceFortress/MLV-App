@@ -219,7 +219,7 @@ function Assert-AttrCudaSourceArchive {
     }
     if (-not [string]::IsNullOrWhiteSpace($ExpectedCommit)) {
         $comment = Get-AttrCudaZipArchiveComment -Path $ArchivePath
-        if ($comment -ne $ExpectedCommit) {
+        if (-not [string]::Equals([string]$comment, $ExpectedCommit, [StringComparison]::OrdinalIgnoreCase)) {
             throw "ATTRCUDA_ARCHIVE_COMMIT_MISMATCH $ArchivePath declares commit '$comment', expected '$ExpectedCommit'"
         }
     }
@@ -411,8 +411,10 @@ function Assert-AttrCudaBuildManifest {
     # VENUE-STAGE-CLAIM-SHAPE-1 <<<
     $commitProperty = $manifest.PSObject.Properties['sourceCommit']
     $commit = if ($null -eq $commitProperty) { '' } else { [string]$commitProperty.Value }
-    if ($commit -ne $ExpectedSourceCommit) {
-        # VENUE-STAGE-CLAIM-SHAPE-1 >>>
+    # VENUE-STAGE-CLAIM-SHAPE-1 >>>
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r24 (adversary pass-25 A1 on 63887a9c): a commit is compared ORDINALLY. PowerShell's -ne on strings is a culture comparison that ignores
+    # U+200B and other format characters, so a manifest declaring a commit's 40 hex with a zero-width space in it compared EQUAL to that commit and was staged and believed.
+    if (-not [string]::Equals($commit, $ExpectedSourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (Grok G15 on #814): the declared commit also travels as DATA (Exception.Data['declaredCommit']), so the stage
         # job's guard decides replace-or-refuse on the value itself, never by parsing this message (a wording drift on either side failed every one closed)
         # r17 (CI run 43764890818): bracketed like the region above, so the emitted attribution job stays byte-identical to the pinned baseline outside its brackets
@@ -420,7 +422,7 @@ function Assert-AttrCudaBuildManifest {
         $commitMismatchData = $commitMismatch.Data
         $commitMismatchData['declaredCommit'] = $commit
         throw $commitMismatch
-        # VENUE-STAGE-CLAIM-SHAPE-1 <<<
+    # VENUE-STAGE-CLAIM-SHAPE-1 <<<
     }
     $dllPairProperty = $manifest.PSObject.Properties['dllPairManifestSha256']
     $dllPairSha = if ($null -eq $dllPairProperty) { '' } else { ([string]$dllPairProperty.Value).ToLowerInvariant() }

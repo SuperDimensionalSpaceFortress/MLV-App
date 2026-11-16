@@ -292,7 +292,7 @@ if (-not $manifest) {
     $buildJson = "$cache\playback-attr-3-cuda-$($commit.Substring(0, 12))-build.json"
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (r10's OPEN): the cache name carries only the sha's first 12 hex, so the manifest standing there may be ANOTHER commit's
     # build. ONE read: the bytes hashed are the bytes whose sourceCommit is read (decoded as Assert-AttrCudaBuildManifest decodes them); a manifest that does not declare
-    # this commit (compared as the leg job compares it, -ne) is not this commit's staged build, so it is never pinned for the chains.
+    # this commit (compared as the leg job compares it, ordinally) is not this commit's staged build, so it is never pinned for the chains.
     # r13 (Grok G19 on #814): the worker runs under EAP Stop, as VenueChain.psm1's canonical read does, so a manifest that exists but cannot be read (a writer holding
     # it open, a share error) ends the read with its own error (-not $m.ok: SHARE_UNREACHABLE below). Under the runspace's default Continue the failed byte read went
     # on, the worker returned nothing, and a staged build it never looked at was reported BUILD_NOT_STAGED.
@@ -307,7 +307,7 @@ if (-not $manifest) {
     if ($m.timedOut) { Stop-Baseline 'SHARE_UNREACHABLE' "reading '$buildJson' $($m.error)" }
     if (-not $m.ok) { Stop-Baseline 'SHARE_UNREACHABLE' "reading '$buildJson' failed: $($m.error)" }
     if (-not $m.value) { Stop-Baseline 'BUILD_NOT_STAGED' "no staged build manifest for $($commit.Substring(0, 12)) at '$buildJson'; the hub stages it first (assemble + stage job), this script stages nothing" }
-    if ([string]$m.value.commit -ne $commit) { Stop-Baseline 'BUILD_NOT_STAGED' "the staged build manifest at '$buildJson' declares '$($m.value.commit)', not $commit (the 12-hex cache name holds another build); this commit is not staged, so no chain runs on it; the hub stages it first, this script stages nothing" }
+    if (-not [string]::Equals([string]$m.value.commit, $commit, [StringComparison]::OrdinalIgnoreCase)) { Stop-Baseline 'BUILD_NOT_STAGED' "the staged build manifest at '$buildJson' declares '$($m.value.commit)', not $commit (the 12-hex cache name holds another build); this commit is not staged, so no chain runs on it; the hub stages it first, this script stages nothing" }
     $manifest = [string]$m.value.hash
 }
 Out-Line "BASELINE_BUILD sourceCommit=$commit buildManifestSha256=$manifest"

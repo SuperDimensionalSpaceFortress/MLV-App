@@ -1454,6 +1454,99 @@ class StagedBuildNeverReplacedTests(_PwshCase):
                 self.assertIn("ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH", second.stdout)
                 self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
 
+    # r24 (adversary pass-25 A1 on 63887a9c): PowerShell -eq/-ne/-ieq/-ine on strings are CULTURE comparisons that ignore U+200B and other format characters, so a manifest whose
+    # sourceCommit is a commit's 40 hex with a zero-width space in it compared EQUAL to that commit at every commit check; B was staged with such a manifest, and staging another
+    # commit with B's 12-hex cache name saw a "mismatch" whose declaration was not 40-hex plain, skipped the OTHER_COMMIT refusal and replaced B's build. A commit is compared
+    # ORDINALLY, and a declaration that is not plainly another prefix is refused, never replaced.
+    ZW = "​"
+
+    def _zw_declarations(self) -> dict:
+        return {"zwsp-after-the-prefix": SHA_FIXTURE[:12] + self.ZW + SHA_FIXTURE[12:],
+                "zwsp-inside-the-prefix": SHA_FIXTURE[:5] + self.ZW + SHA_FIXTURE[5:],
+                "zwsp-leading": self.ZW + SHA_FIXTURE,
+                "zwsp-trailing": SHA_FIXTURE + self.ZW,
+                "soft-hyphen": SHA_FIXTURE[:12] + "­" + SHA_FIXTURE[12:]}
+
+    def test_r24_a1_assert_compares_the_manifest_commit_ordinally(self) -> None:
+        for label, declared in self._zw_declarations().items():
+            with self.subTest(declared=label):
+                bj = self.tmp / f"r24-assert-{label}.json"
+                bj.write_text(json.dumps({"sourceCommit": declared, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True}), encoding="utf-8")
+                p = self.run_with_module(
+                    f"try {{ Assert-AttrCudaBuildManifest -Path '{bj}' -ExpectedSha256 '{hashlib.sha256(bj.read_bytes()).hexdigest()}' -ExpectedSourceCommit '{SHA_FIXTURE}' | Out-Null; 'NO_THROW' }} "
+                    "catch { 'HAS=' + $_.Exception.Data.Contains('declaredCommit'); 'MSG=' + $_.Exception.Message }\n",
+                    name=f"r24-assert-{label}.ps1")
+                self.assertNotIn("NO_THROW", p.stdout, f"a manifest declaring {label!r} compared EQUAL to the commit: {p.stdout}{p.stderr}")
+                self.assertIn("HAS=True", p.stdout, p.stdout + p.stderr)
+                self.assertIn("MSG=ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ", p.stdout, p.stdout + p.stderr)
+        for label, declared in (("exact", SHA_FIXTURE), ("upper-case", SHA_FIXTURE.upper())):
+            with self.subTest(control=label):
+                bj = self.tmp / f"r24-assert-control-{label}.json"
+                bj.write_text(json.dumps({"sourceCommit": declared, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True}), encoding="utf-8")
+                p = self.run_with_module(
+                    f"try {{ Assert-AttrCudaBuildManifest -Path '{bj}' -ExpectedSha256 '{hashlib.sha256(bj.read_bytes()).hexdigest()}' -ExpectedSourceCommit '{SHA_FIXTURE}' | Out-Null; 'NO_THROW' }} "
+                    "catch { 'MSG=' + $_.Exception.Message }\n",
+                    name=f"r24-assert-control-{label}.ps1")
+                self.assertIn("NO_THROW", p.stdout, p.stdout + p.stderr)
+
+    def test_r24_a1_the_generator_refuses_a_build_manifest_whose_commit_only_culture_matches(self) -> None:
+        for label, declared in self._zw_declarations().items():
+            with self.subTest(declared=label):
+                build = self.tmp / f"r24-build-{label}"
+                staging = self.tmp / f"r24-staging-{label}"
+                staging.mkdir(parents=True)
+                names = _fake_build_dir(build, SHA_FIXTURE, rebuild_tag="ad005766")
+                manifest = json.loads((build / names["manifest"]).read_text(encoding="utf-8"))
+                manifest["sourceCommit"] = declared
+                (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                script = self.tmp / f"r24-generate-{label}.ps1"
+                script.write_text("$ErrorActionPreference = 'Stop'\n"
+                                  f"& '{STAGE_GENERATOR}' -SourceCommit '{SHA_FIXTURE}' -BuildDir '{build}' -OutDir '{staging}' -AgentRoot '{self.agent}' | ConvertTo-Json -Depth 5\n",
+                                  encoding="utf-8")
+                gen = _run_pwsh_file(script)
+                self.assertNotEqual(gen.returncode, 0, f"the generator accepted a build manifest declaring {label!r} as the commit: {gen.stdout}")
+                self.assertIn("does not match -SourceCommit", gen.stdout + gen.stderr)
+
+    def test_r24_a1_a_declaration_that_is_not_plainly_another_prefix_is_refused_never_replaced(self) -> None:
+        # A resident manifest whose declared commit is not a plain 40-hex but matches the incoming commit's 12-hex cache name (ordinally, or by culture once ignorable
+        # characters are dropped) is somebody's build under this name: STAGE_REFUSED_STAGED_OTHER_COMMIT, exit 7, the cache byte for byte. ("not-a-sha", an absent
+        # commit and a 40-hex of another prefix are still this name's own corrupt build: test_r12_g15_this_names_own_corrupt_commit_is_replaced.)
+        declarations = dict(self._zw_declarations())
+        declarations["zwsp-after-the-prefix-other-tail"] = SHA_FIXTURE[:12] + self.ZW + "1" * 28
+        declarations["zwsp-inside-the-prefix-other-tail"] = SHA_FIXTURE[:5] + self.ZW + SHA_FIXTURE[5:12] + "1" * 28
+        declarations["39-hex-same-prefix"] = SHA_FIXTURE[:12] + "1" * 27
+        declarations["the-prefix-alone"] = SHA_FIXTURE[:12]
+        for i, (label, declared) in enumerate(declarations.items()):
+            with self.subTest(declared=label):
+                for e in list(self.cache.iterdir()):
+                    shutil.rmtree(e) if e.is_dir() else e.unlink()
+                first = self.stage("ad005766", suffix=f"r24first{i}")
+                self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+                m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+                m["sourceCommit"] = declared
+                (self.cache / self.manifest_name).write_text(json.dumps(m, indent=2), encoding="utf-8")
+                before = self.snapshot()
+
+                second = self.stage("f8fc75a2", suffix=f"r24second{i}")
+
+                self.assertEqual(second.returncode, 7, f"{label}: {second.stdout}\n{second.stderr}")
+                self.assertRegex(second.stdout, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_COMMIT sha={SHA_FIXTURE[:12]} staged=[0-9a-f]{{8}} ")
+                self.assertEqual(self.snapshot(), before, f"{label}: a staged build under this name was replaced")
+
+    def test_r24_a1_no_commit_string_is_compared_by_culture_in_the_stage_chain(self) -> None:
+        # The class: -eq/-ne/-ieq/-ine on a string is a culture comparison, and so are -ceq/-cne (PowerShell 7: "d4bd...<U+200B>..." -ceq "d4bd..." is True; only the case
+        # is checked). Every commit compare in the stage chain is ordinal: [string]::Equals(..., Ordinal or OrdinalIgnoreCase), or (where the publish-write scanner
+        # allowlists no static) equal Length and an OrdinalIgnoreCase StartsWith.
+        tools = ROOT / "tools" / "profiling"
+        files = [tools / "bachelor" / "AttrCudaArtifacts.psm1", tools / "bachelor" / "playback-attr-3-cuda-stage-job.ps1", tools / "bachelor" / "playback-attr-3-cuda-assemble.ps1",
+                 tools / "bachelor" / "playback-attr-3-cuda-job.ps1", tools / "bachelor" / "reference-frame-runner-job.ps1",
+                 tools / "dual-venue" / "VenueChain.psm1", tools / "dual-venue" / "Invoke-VenueBaseline.ps1", tools / "dual-venue" / "Invoke-VenueStageNightly.ps1",
+                 tools / "dual-venue" / "Invoke-VenueLeaseBatch.ps1"]
+        culture = re.compile(r"(?m)^(?!\s*#)[^\n]*?(?:(?:[sS]ourceCommit|ExpectedCommit|\$commit\b|\$cachedCommit|\$declaredCommit)(?!\.Length)[\w.\[\]()]*\s+-[ic]?(?:eq|ne)\b|-[ic]?(?:eq|ne)\s+\$(?:SourceCommit|ExpectedSourceCommit|ExpectedCommit|commit|cachedCommit)\b(?!\.Length))[^\n]*")
+        hits = [f"{f.name}:{text.count(chr(10), 0, m.start()) + 1}: {m.group(0).strip()[:140]}"
+                for f in files for text in [f.read_text(encoding="utf-8")] for m in culture.finditer(text)]
+        self.assertEqual(hits, [], "a commit string is compared by culture (it ignores U+200B and other format characters):\n" + "\n".join(hits))
+
     def test_r9_the_stage_lock_is_one_for_every_sha_that_shares_the_cache_names(self) -> None:
         # r9 fix iteration (adversary A1 on 9825bfd9): the lock was keyed on the full sha, so two commits with the same 12 hex (the same cache files) never
         # contended; it is keyed on the 12 hex the cache names carry. Another 12 is another lock.

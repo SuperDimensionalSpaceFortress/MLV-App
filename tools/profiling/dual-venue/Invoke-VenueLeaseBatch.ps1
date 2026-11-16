@@ -1464,7 +1464,7 @@ $script:guardedInputs = [System.Collections.Generic.List[object]]::new()
 if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
 foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend }) }
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
-if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
+if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { [string]::Equals([string]$_.sourceCommit, [string]$b.Key, [StringComparison]::Ordinal) })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
 # r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-WriteDestinationHit
 # r8 pass 2 (adversary r8 A1): an input with no accepted identity was skipped by every destination check (renamed away and re-linked, it was written through). One that will not identify
 # is asked again (a save-as-rename's moment), at most three times, and one that still will not is refused here, before any claim, in its unresolved type.
