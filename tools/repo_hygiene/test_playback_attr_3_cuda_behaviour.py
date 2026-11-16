@@ -1932,6 +1932,8 @@ class StagedBuildNeverReplacedTests(_PwshCase):
             "function Get-Sha([string]$Path, [string]$Label) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant() }\n"
             "function Write-JobTrace([string]$Text) { }\n"
             f"$buildManifest = Assert-AttrCudaBuildManifest -Path $bj -ExpectedSha256 ((Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant()) -ExpectedSourceCommit '{SHA_FIXTURE}'\n"
+            # r27 (A1): the leg block now re-authenticates the manifest last, through the job's own three names; bind them to the same build.json
+            f"$buildManifestPath = $bj; $BuildManifestSha256 = (Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant(); $SourceCommit = '{SHA_FIXTURE}'\n"
             "$leg = try { & {\n" + self.leg_manifest_check_text() + "\n}; 'accept' } catch { 'refuse' }\n"
             "'LEG=' + $leg\n"
             f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
