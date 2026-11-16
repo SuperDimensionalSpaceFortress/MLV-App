@@ -16100,6 +16100,23 @@ class TeamPartitionEvidenceTests(unittest.TestCase):
         v = self.verdict({}, self.log(self.OFF_RECORD().replace("max_active_levels=1", "max_active_levels=0")))
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), "a control leg's clean off record is unchanged at any level")
 
+    def test_adversary_r7_a1_dynamic_or_serialized_runtime_cannot_shrink_a_one_plus_one_request(self) -> None:
+        # r7 pass A1 on 25262f79: dynamic=1 and max_active_levels=0 were refused for EVERY request, but neither can take a team below one thread, so a 1+1 request
+        # that the app reports as 1+1 (cores 1, pointwise 1, override 0) is the partition the leg names. A request wider than one on either side still refuses.
+        one = {"generatorArgs": {"reconOmpThreads": 1, "prepOmpThreads": 1}}
+        for name, extra in (("dynamic", {"dynamic": "1"}), ("levels 0", {"levels": "0"}), ("dynamic and levels 0", {"dynamic": "1", "levels": "0"})):
+            with self.subTest(case=name):
+                v = self.verdict(one, self.log(self.record("1+1", recon="1", prep="1", cores="1", pointwise="1", **extra)))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), ("1+1", "HONOURED", False), v)
+        wide = (("recon 12 dynamic", self.ON, self.record(dynamic="1")),
+                ("recon 12 levels 0", self.ON, self.record("1+1", recon="1", prep="1", cores="12", pointwise="6", levels="0")),
+                ("1+6 dynamic", {"generatorArgs": {"reconOmpThreads": 1, "prepOmpThreads": 6}}, self.record("1+6", recon="1", prep="6", cores="1", pointwise="6", dynamic="1")),
+                ("6+1 levels 0", {"generatorArgs": {"reconOmpThreads": 6, "prepOmpThreads": 1}}, self.record("6+1", recon="1", prep="1", cores="6", pointwise="1", levels="0")))
+        for name, spec, rec in wide:
+            with self.subTest(case=name):
+                v = self.verdict(spec, self.log(rec))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
     def shape_refusal(self, spec: dict):
         proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n@{ r = (Get-DvLegSpecShapeRefusal -Spec $s) } | ConvertTo-Json -Compress",
                                   DVE_SPEC=json.dumps(spec))

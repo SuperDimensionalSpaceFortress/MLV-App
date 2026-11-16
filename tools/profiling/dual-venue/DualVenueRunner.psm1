@@ -2002,8 +2002,10 @@ function Get-DvTeamPartitionEvidence {
         elseif ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the run log has no playback_smoke.omp_teams record for the measured session, so the binary does not report its OpenMP teams' }
         elseif ($null -eq $rec) { $reason = $unreadable }
         elseif ($rec.override -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says override=1 (MLVAPP_FORCE_THREADS / MLVAPP_FORCE_SINGLETHREAD make the partition inert)' }
-        elseif ($rec.dynamic -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says dynamic=1 (OpenMP may shrink any team below its request, so the split is not the one the leg names)' }
-        elseif ($rec.levels -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says max_active_levels=0 (OpenMP serializes every team to one thread, so the split is not the one the leg names)' }
+        # r7 pass A1 on 25262f79: dynamic=1 and max_active_levels=0 can only take a team DOWN TO one thread, so they refuse only a request wider than one on a side
+        # (a 1+1 request reported as 1+1 is the split the leg names; the partition text, effective teams and counts below still have to match it exactly).
+        elseif ($rec.dynamic -ne 0 -and ([long]$rawRecon -gt 1 -or [long]$rawPrep -gt 1)) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says dynamic=1 (OpenMP may shrink any team below its request, so the split is not the one the leg names)' }
+        elseif ($rec.levels -eq 0 -and ([long]$rawRecon -gt 1 -or [long]$rawPrep -gt 1)) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says max_active_levels=0 (OpenMP serializes every team to one thread, so the split is not the one the leg names)' }
         elseif ($rec.part -cne $requestedText) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.omp_teams says partition=$($rec.part), not the $requestedText the leg names" }
         elseif ($observed -cne $requestedText -or $rec.cores -ne [long]$rawRecon -or $rec.pointwise -ne [long]$rawPrep) { $reason = "ROUTE_NOT_ENGAGED: the measured session's effective teams are $observed (recon_cpu_cores=$($rec.cores) prep_pointwise=$($rec.pointwise) thread_limit=$($rec.limit)), not the $requestedText the leg names" }
         else { $verdict = 'HONOURED' }
