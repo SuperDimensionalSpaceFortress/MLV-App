@@ -432,11 +432,26 @@ function Invoke-PhasePackages {
 # p5 A7: OpenSSH accepts '=' as well as whitespace between a keyword and its argument, and a quoted keyword. Every recognizer below uses these.
 $SshdMatchKeywordRx = '^\s*"?Match"?(\s|=)'
 $SshdIncludeKeywordRx = '^\s*"?Include"?(\s|=)'
-$SshdPasswordYesRx = '^\s*"?(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)"?(\s+|\s*=\s*)"?yes\b'
+# r10 A6: sshd treats these keywords as ONE option and the FIRST value wins: DSAAuthentication is PubkeyAuthentication, ChallengeResponseAuthentication and
+# SkeyAuthentication are KbdInteractiveAuthentication. A rewrite of the canonical name alone leaves an earlier alias in force, and a Match block may
+# re-open password / keyboard-interactive (yes or true) or close public-key (no or false) with any of the spellings.
+$SshdAliases = @{
+    'PubkeyAuthentication'         = @('DSAAuthentication')
+    'KbdInteractiveAuthentication' = @('ChallengeResponseAuthentication', 'SkeyAuthentication')
+}
+$SshdPasswordYesRx = '^\s*"?(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|SkeyAuthentication)"?(\s+|\s*=\s*)"?(yes|true)\b'
+$SshdPubkeyNoRx = '^\s*"?(PubkeyAuthentication|DSAAuthentication)"?(\s+|\s*=\s*)"?(no|false)\b'
 function Set-SshdOption {
     param([string[]]$Lines, [string]$Name, [string]$Value)
     $matchIdx = [Array]::FindIndex($Lines, [Predicate[string]] { param($l) $l -match $SshdMatchKeywordRx })
     $end = if ($matchIdx -ge 0) { $matchIdx } else { $Lines.Count }
+    # r10 A6: comment out every ACTIVE global alias line of this option, so the first effective value is the one written below.
+    if ($SshdAliases.ContainsKey($Name)) {
+        $aliasRx = '^\s*"?(' + ($SshdAliases[$Name] -join '|') + ')"?(\s|=)'
+        for ($i = 0; $i -lt $end; $i++) {
+            if ($Lines[$i] -match $aliasRx) { $Lines[$i] = '# replaced by Setup-MlvWorkstation (alias of ' + $Name + '): ' + $Lines[$i].Trim() }
+        }
+    }
     for ($i = 0; $i -lt $end; $i++) {
         if ($Lines[$i] -match "^\s*#?\s*`"?$Name`"?(\s|=)") { $Lines[$i] = "$Name $Value"; return , $Lines }
     }
@@ -459,6 +474,9 @@ function Set-SshdKeyOnlyConfig {
         for ($i = $firstMatch; $i -lt $lines.Count; $i++) {
             if ($lines[$i] -match $SshdPasswordYesRx) {
                 throw "sshd_config line $($i + 1) ('$($lines[$i].Trim())') re-enables password authentication inside a Match block; key-only is the rule, so remove it by hand and re-run -Phase Ssh. Nothing was changed."
+            }
+            if ($lines[$i] -match $SshdPubkeyNoRx) {
+                throw "sshd_config line $($i + 1) ('$($lines[$i].Trim())') disables public-key authentication inside a Match block; key-only is the rule, so remove it by hand and re-run -Phase Ssh. Nothing was changed."
             }
         }
     }
@@ -631,8 +649,17 @@ $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACC
 # p5 A1: a secret-named key with a QUOTED value of any length, spaces included (a three character or two word password is still a password), or an
 # UNQUOTED '=' assignment (cmd 'set X=y', dotenv, ini) whose value is 4+ non-space characters that is not a boolean, null or a number and does not
 # start like code ($var, (expr), %var%, @splat). The key may not follow a '$', word character or '-' (so '$Token = Get-Token' in a script is not a hit).
+# r10 A1: the key words split in two. A STRONG word (password, secret, a key, a credential) says what the value is, so ANY non-empty unquoted value
+# counts, one character or all digits included ('DB_PASSWORD=123456'); TOKEN also names counters ('max_tokens = 4096'), so a TOKEN key keeps the 4+
+# characters, not-all-digits rule. A YAML 'key: value' line is judged too, but only as a whole line holding ONE bare word (a line of prose such
+# as 'Password: see the owner' is not a value).
+$CredentialStrongWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|CREDENTIAL'
 $CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\r\n]+"|''[^''\r\n]+'')'
-$CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*(?![\$\(%@\{\[<])(?!(?:true|false|null|none|nil|undefined)\b)(?!\d+\b)[^\s"'',;]{4,}'
+$CredentialValueGuard = '(?![\$\(%@\{\[<])(?!(?:true|false|null|none|nil|undefined)\b)'
+$CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialValueGuard + '[^\s"'',;]+'
+$CredentialUnquotedTokenPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialValueGuard + '(?!\d+\b)[^\s"'',;]{4,}'
+$CredentialYamlPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialValueGuard + '(?!~)[^\s"'',;#]+[ \t]*(?:#[^\r\n]*)?\r?$'
+$CredentialYamlTokenPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialValueGuard + '(?!~)(?!\d+\b)[^\s"'',;#]{4,}[ \t]*(?:#[^\r\n]*)?\r?$'
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 $SecretPatterns = @(
@@ -642,7 +669,7 @@ $SecretPatterns = @(
     # A secret VALUE under a name that says what it is (adversary pass 2, A15): an AWS secret access key has no recognisable shape of its own.
     # r3 A4: the name list also covers API/ACCESS/AUTH key, TOKEN and CREDENTIAL; either quote style; a value of 4 or more characters (a short
     # password is still a password). The same text is the host-side credential test Import applies (Test-CredentialText).
-    $CredentialNameValuePattern, $CredentialUnquotedPattern
+    $CredentialNameValuePattern, $CredentialUnquotedPattern, $CredentialUnquotedTokenPattern, $CredentialYamlPattern, $CredentialYamlTokenPattern
 )
 $script:SecretRegex = [regex]::new(($SecretPatterns -join '|'))
 
@@ -690,6 +717,30 @@ function Get-StagedCredentialHits {
         $why = Get-StagedFileVerdict -File $f -MaxScanBytes $MaxScanBytes
         if ($why) { $hits.Add("$($f.FullName.Substring($Stage.Length).TrimStart('\')) ($why)") }
     }
+    return $hits.ToArray()
+}
+
+# r10 A3: the verdict on what the ARCHIVE holds (read from the zip itself, nothing extracted to disk). The stage can change between the scan, the moment
+# tar reads a file and a re-scan of the stage, so only the archive's own entries say what would be offered. Unreadable or oversized counts as a hit.
+function Get-ArchiveCredentialHits {
+    param([string]$Zip, [long]$MaxScanBytes = 26214400)
+    $hits = [System.Collections.Generic.List[string]]::new()
+    $arc = $null
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $arc = [System.IO.Compression.ZipFile]::OpenRead($Zip)
+        foreach ($e in $arc.Entries) {
+            if ($e.FullName.EndsWith('/') -or $e.FullName.EndsWith('\')) { continue }
+            if ($e.Length -gt $MaxScanBytes) { $hits.Add("$($e.FullName) (larger than the scan limit)"); continue }
+            $t = $null
+            try {
+                $sr = [IO.StreamReader]::new($e.Open(), [Text.Encoding]::UTF8, $true)
+                try { $t = $sr.ReadToEnd() } finally { $sr.Dispose() }
+            } catch { $hits.Add("$($e.FullName) (unreadable)"); continue }
+            if ($t -and (Test-CredentialText $t)) { $hits.Add("$($e.FullName) (credential pattern in the archive)") }
+        }
+    } catch { $hits.Add("$Zip (archive unreadable: $($_.Exception.Message))") }
+    finally { if ($arc) { $arc.Dispose() } }
     return $hits.ToArray()
 }
 
@@ -823,10 +874,11 @@ function Invoke-PhaseExport {
         [void](Invoke-Native -Exe $tar -Arguments @('-a', '-c', '-f', $zip, '-C', $stage, '.'))
         # p5 A9: a staged file can change between the scan and the moment tar reads it. Judge the stage again now the archive exists; a hit means
         # the archive may hold it, so the archive is deleted and the run fails (the bundle is never offered).
-        $late = @(Get-StagedCredentialHits -Stage $stage)
+        # r10 A3: judge the ARCHIVE'S OWN entries (what would be offered), not the stage, which can change again between tar and this check.
+        $late = @(Get-ArchiveCredentialHits -Zip $zip) + @(Get-StagedCredentialHits -Stage $stage)
         if ($late.Count) {
             Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-            throw "staged file(s) changed after the secret scan and now fail it, so the archive was deleted: $($late -join '; ')"
+            throw "the archive (or a staged file it was made from) fails the secret scan, so the archive was deleted: $($late -join '; ')"
         }
         $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
         Write-AsciiFile "$zip.sha256" "$hash  $(Split-Path -Leaf $zip)`r`n"
@@ -962,7 +1014,16 @@ function Invoke-PhaseImport {
     $h = $env:USERPROFILE
     Invoke-Step 'Back up existing ~/.claude CLAUDE.md and settings.json' {
         $b = Join-Path $StateRoot "backups\home-claude-$stamp"; [void][IO.Directory]::CreateDirectory($b)
-        foreach ($f in 'CLAUDE.md', 'settings.json') { $p = Join-Path "$h\.claude" $f; if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $b } }
+        foreach ($f in 'CLAUDE.md', 'settings.json') {
+            $p = Join-Path "$h\.claude" $f
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            # r10 A2: a host file that carries a credential is never copied (the backup would be a second, durable copy of it, and Import
+            # never replaces such a file anyway, so there is nothing to roll back). An unreadable file counts as carrying one.
+            $carries = $true
+            try { $carries = Test-CredentialText ([IO.File]::ReadAllText($p)) } catch { $carries = $true }
+            if ($carries) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential or cannot be read; no copy was made)" 'WARN'; continue }
+            Copy-Item -LiteralPath $p -Destination $b
+        }
     }
     Invoke-Step 'Copy bundle into ~/.claude, ~/bin, ~/.codex, ProgramData\FleetDefender, MLV-App\.claude-state' {
         # Import never touches credentials (adversary A4): the export never stages the credential-shaped names, but a bundle is only a folder, so
@@ -1186,7 +1247,11 @@ function Get-MeterTaskSnapshot {
     $snap = @{ Existed = [bool]$t; WasEnabled = $false; Xml = $null; Unreadable = $unreadable }
     if ($t) {
         $snap.WasEnabled = ("$($t.State)" -ne 'Disabled')
-        if (-not $snap.WasEnabled) { try { $snap.Xml = [string](Export-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop) } catch { $snap.Xml = $null } }
+        # r10 A4: the definition is saved for EVERY existing task, enabled or not. The install re-registers the task with its own action, outside the
+        # gate; without the saved XML an enabled task's gated action would be gone for good. A definition that cannot be saved makes the task
+        # unreadable (the install is not run over it).
+        try { $snap.Xml = [string](Export-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop) } catch { $snap.Xml = $null }
+        if (-not $snap.Xml) { $snap.Unreadable = $true }
     }
     return $snap
 }
@@ -1195,7 +1260,21 @@ function Get-MeterTaskSnapshot {
 # applies (registered Disabled, enabled only when it was enabled before). A task the owner had enabled is left alone; an unchanged one is a no-op.
 function Restore-MeterTaskState {
     param([string]$Name, [hashtable]$Before)
-    if ($Before.WasEnabled) { return }
+    if ($Before.WasEnabled) {
+        # r10 A4: the owner had it enabled and it stays enabled, but the install may have replaced its definition (its own action, outside the gate):
+        # when the definition differs from the one saved before, the saved one is registered again (it carries its own Enabled setting).
+        $curXml = $null
+        try { $curXml = [string](Export-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop) } catch { $curXml = $null }
+        if ($curXml -and ($curXml -ceq $Before.Xml)) { return }
+        try {
+            [void](Register-ScheduledTask -TaskName $Name -TaskPath '\' -Xml $Before.Xml -Force -ErrorAction Stop)
+            Write-Log "METER_TASK_DEFINITION_RESTORED $Name (the install had replaced its definition; the saved one is back)" 'WARN'
+        } catch {
+            Write-Log "METER_TASK_DEFINITION_REPLACED $Name (could not put its saved definition back: $($_.Exception.Message)); re-register it by hand from the gated XML" 'ERROR'
+            $script:Failures.Add("METER_TASK_DEFINITION_REPLACED $Name")
+        }
+        return
+    }
     $now = $null
     $readFailed = $false
     try { $now = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop }
@@ -1215,8 +1294,11 @@ function Restore-MeterTaskState {
     if (-not $now -or "$($now.State)" -eq 'Disabled') { return }
     try {
         if ($Before.Xml) { [void](Register-ScheduledTask -TaskName $Name -TaskPath '\' -Xml $Before.Xml -Force -ErrorAction Stop) }
-        $again = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction SilentlyContinue
-        if ($again -and "$($again.State)" -ne 'Disabled') { [void](Disable-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop) }
+        # r10 A5: Disable runs whatever a re-read says (idempotent; a read that fails is not "already Disabled"), and the result is then READ with
+        # -ErrorAction Stop: a task that cannot be read back, or is not Disabled, is a failure of the run, not a success line.
+        [void](Disable-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop)
+        $again = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop
+        if ("$($again.State)" -ne 'Disabled') { throw "state is $($again.State) after Disable" }
         Write-Log "METER_TASK_RESTORED_DISABLED $Name (it was $(if ($Before.Existed) { 'Disabled' } else { 'absent' }) before -Install; the install had enabled it outside the gate)" 'WARN'
     } catch {
         Write-Log "METER_TASK_LEFT_ENABLED $Name (could not put it back Disabled: $($_.Exception.Message)); disable it by hand: Disable-ScheduledTask -TaskName $Name" 'ERROR'

@@ -576,6 +576,11 @@ if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContin
         # p5 A5: StubFailMode 'before' = the read fails until the install ran, 'after' = it fails once the install ran (a read error that is not "no such task").
         $installedNow = Test-Path -LiteralPath (Join-Path $script:StubRepo ('.claude-state\' + $markerOf[$TaskName]))
         if (($script:StubFailMode -ceq 'before' -and -not $installedNow) -or ($script:StubFailMode -ceq 'after' -and $installedNow -and -not $script:StubTouched.Contains($TaskName))) { throw 'Access is denied reading the scheduled task' }
+        # r10 A5: the FIRST read after the install works, every later one (until the task is touched) fails.
+        if ($script:StubSecondReadFails -and $installedNow -and -not $script:StubTouched.Contains($TaskName)) {
+            $script:StubPostReads[$TaskName] = 1 + [int]$script:StubPostReads[$TaskName]
+            if ($script:StubPostReads[$TaskName] -ge 2) { throw 'RPC server unavailable reading the scheduled task' }
+        }
         $p = $script:StubPrior[$TaskName]
         if ($p -eq 'ABSENT' -and -not (Test-Path -LiteralPath (Join-Path $script:StubRepo ('.claude-state\' + $markerOf[$TaskName])))) { return $null }
         $touched = $script:StubTouched.Contains($TaskName)
@@ -583,16 +588,24 @@ if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContin
         $state = if ($touched) { 'Disabled' } elseif ($installed) { 'Ready' } else { $p }
         return [pscustomobject]@{ TaskName = $TaskName; State = $state }
     }
-    function Export-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) return '<Task>gated</Task>' }
+    function Export-ScheduledTask {
+        [CmdletBinding()] param($TaskName, $TaskPath)
+        if ($script:StubExportFail) { throw 'cannot export the task definition' }
+        # r10 A4: once the install ran, the task definition differs (the install re-registered it with its own action).
+        if ($script:StubXmlAfter -and (Test-Path -LiteralPath (Join-Path $script:StubRepo ('.claude-state\' + $markerOf[$TaskName])))) { return '<Task>install-registered</Task>' }
+        return '<Task>gated</Task>'
+    }
     function Register-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath, $Xml, [switch]$Force) [void]$script:StubTouched.Add($TaskName); $script:StubCalls.Add("REGISTER $TaskName") }
     function Disable-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) [void]$script:StubTouched.Add($TaskName); $script:StubCalls.Add("DISABLE $TaskName") }
     function Enable-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) $script:StubCalls.Add("ENABLE $TaskName") }
     $script:StubFailMode = 'none'
+    $script:StubXmlAfter = $false; $script:StubExportFail = $false; $script:StubSecondReadFails = $false; $script:StubPostReads = @{}
     function Invoke-A7Run([string]$Name, [hashtable]$Prior, [string]$FailMode = 'none', [string]$Body = '') {
         $mBody = if ($Body) { $Body } else { $okBody }
         $wsM = New-MeterRepo $Name $mBody $mBody
         $script:StubRepo = Join-Path $wsM 'MLV-App'
         $script:Repo = $script:StubRepo; $Repo = $script:StubRepo
+        $script:StubPostReads = @{}
         $script:StubFailMode = $FailMode; $script:Failures.Clear()
         $script:StubPrior = $Prior; $script:StubTouched = [Collections.Generic.HashSet[string]]::new(); $script:StubCalls = [Collections.Generic.List[string]]::new()
         Invoke-MeterInstalls
@@ -742,6 +755,96 @@ $script:AutoScratchLock = $true
 $p5a6gLog = Join-Path $p5a6gState 'logs\gate.log'
 $p5a6g.Out = $p5a6g.Out + "`n" + $(if (Test-Path -LiteralPath $p5a6gLog) { [IO.File]::ReadAllText($p5a6gLog) } else { '' })
 Assert-That ($p5a6g.Exit -eq 4 -and $p5a6g.Out -match 'LOCKROOT_NOT_MACHINE_WIDE') 'p5 A6 gate: the same refusal on a Lease-gated run (it would otherwise hold a lock no release can see)' "exit=$($p5a6g.Exit)`n$($p5a6g.Out)"
+
+# ================================================================ adversary pass 6 (head da472094, r10): one section per finding class
+# ---------------------------------------------------------------- r10 A1: more credential spellings (YAML colon, short and numeric values under a secret name)
+if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinue)) {
+    $r10a1 = [ordered]@{
+        'a YAML password line'                   = "password: hunter2`n"
+        'a YAML key under a list dash'           = "- api_key: abcd1234`n"
+        'a three character unquoted password'    = "DB_PASSWORD=abc`n"
+        'an all-digit unquoted password'         = "DB_PASSWORD=123456`n"
+        'an ini password with spaces round ='    = "db_password = 7`n"
+    }
+    foreach ($k in $r10a1.Keys) { Assert-That (Test-CredentialText $r10a1[$k]) "r10 A1 Test-CredentialText: $k is a credential" $r10a1[$k] }
+    $r10a1ok = [ordered]@{
+        'a prose line about a password'          = "Password: see the owner for the sign-in details`n"
+        'a boolean under a password key'         = "password_required = true`n"
+        'a numeric token limit (still benign)'   = "max_tokens = 4096`n"
+        'a YAML token count'                     = "token_count: 12`n"
+    }
+    foreach ($k in $r10a1ok.Keys) { Assert-That (-not (Test-CredentialText $r10a1ok[$k])) "r10 A1 Test-CredentialText: $k is not a credential" $r10a1ok[$k] }
+} else { Assert-That $false 'r10 A1: Test-CredentialText is not defined' }
+
+# ---------------------------------------------------------------- r10 A2: Import never copies a credential-bearing host file into its backup folder
+# (the host settings.json in $homeP5 carries DB_PASSWORD; $impP5 above imported over it)
+$r10a2Backups = Join-Path (New-Scratch 'p5-state') 'backups'
+$r10a2Hits = @(Get-ChildItem -LiteralPath $r10a2Backups -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { ([IO.File]::ReadAllText($_.FullName)) -match 'local-password' })
+Assert-That ($r10a2Hits.Count -eq 0) 'r10 A2 import: the credential-bearing host settings.json is not copied into backups\' (($r10a2Hits | ForEach-Object FullName) -join ';')
+Assert-That ($impP5.Out.Contains('IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE')) 'r10 A2 import: the skipped backup is logged as IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE' $impP5.Out
+Assert-That (@(Get-ChildItem -LiteralPath $r10a2Backups -Recurse -File -Force -Filter 'CLAUDE.md' -ErrorAction SilentlyContinue).Count -ge 1) 'r10 A2 import: a clean file (CLAUDE.md) is still backed up'
+
+# ---------------------------------------------------------------- r10 A3: the archive is judged by what it CONTAINS (the stage can change between scan, tar and re-check)
+if ($fnLoaded -and (Test-Has 'Get-ArchiveCredentialHits' 'r10 A3 export')) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $a3Dir = New-Scratch 'r10-a3'
+    $a3Clean = Join-Path $a3Dir 'clean.zip'; $a3Dirty = Join-Path $a3Dir 'dirty.zip'
+    foreach ($z in @(@($a3Clean, '{}'), @($a3Dirty, '{"api_key":"foreign-key-1234"}'))) {
+        $zf = [IO.Compression.ZipFile]::Open($z[0], 'Create')
+        try { $e = $zf.CreateEntry('./hooks-config.json'); $sw = [IO.StreamWriter]::new($e.Open()); $sw.Write($z[1]); $sw.Dispose() } finally { $zf.Dispose() }
+    }
+    Assert-That (@(Get-ArchiveCredentialHits -Zip $a3Clean).Count -eq 0) 'r10 A3 export: an archive with only clean entries has no hits'
+    Assert-That (@(Get-ArchiveCredentialHits -Zip $a3Dirty).Count -eq 1) 'r10 A3 export: an archive entry that carries a credential is a hit, whatever the stage holds now'
+    Assert-That (@(Get-ArchiveCredentialHits -Zip (Join-Path $a3Dir 'absent.zip')).Count -ge 1) 'r10 A3 export: an archive that cannot be read is a hit (fail closed)'
+}
+
+# ---------------------------------------------------------------- r10 A4: a meter task the owner ENABLED gets its own definition back when the install replaced it
+if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContinue)) {
+    $script:StubXmlAfter = $true
+    $r10a4 = Invoke-A7Run 'r10-a4-a' @{ 'MLV-DiskAutoReclaim' = 'Ready'; 'MLV-PwshAutoRepin' = 'Ready' }
+    Assert-That (@($script:StubCalls | Where-Object { $_ -like 'REGISTER MLV-DiskAutoReclaim*' }).Count -ge 1) 'r10 A4 meters: an enabled task whose definition the install replaced is re-registered from the saved XML' ($script:StubCalls -join ',')
+    Assert-That (@($script:StubCalls | Where-Object { $_ -like 'DISABLE*' }).Count -eq 0) 'r10 A4 meters: restoring an enabled task does not disable it' ($script:StubCalls -join ',')
+    $script:StubXmlAfter = $false
+    $null = Invoke-A7Run 'r10-a4-b' @{ 'MLV-DiskAutoReclaim' = 'Ready'; 'MLV-PwshAutoRepin' = 'Ready' }
+    Assert-That ($script:StubCalls.Count -eq 0) 'r10 A4 meters: an enabled task the install left unchanged is not touched' ($script:StubCalls -join ',')
+    $script:StubExportFail = $true
+    $null = Invoke-A7Run 'r10-a4-c' @{ 'MLV-DiskAutoReclaim' = 'Ready'; 'MLV-PwshAutoRepin' = 'Ready' }
+    $script:StubExportFail = $false
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $script:StubRepo '.claude-state\disk-hygiene\installed.marker'))) 'r10 A4 meters: an enabled task whose definition cannot be saved is not installed over'
+    # ---- r10 A5: a Disable that the second post-install read hides is still performed, and verified
+    $script:StubSecondReadFails = $true
+    try { $null = Invoke-A7Run 'r10-a5-a' @{ 'MLV-DiskAutoReclaim' = 'Disabled'; 'MLV-PwshAutoRepin' = 'ABSENT' } } catch { Write-Host "r10 A5 meters: the run threw: $($_.Exception.Message)" }
+    $script:StubSecondReadFails = $false
+    Assert-That (@($script:StubCalls | Where-Object { $_ -like 'DISABLE MLV-PwshAutoRepin*' }).Count -ge 1) 'r10 A5 meters: the task is Disabled even when the read after the register fails' ($script:StubCalls -join ',')
+}
+
+# ---------------------------------------------------------------- r10 A6: sshd keyword aliases (first value wins) and Match overrides that re-open another door
+if ($fnLoaded -and (Get-Command Set-SshdKeyOnlyConfig -ErrorAction SilentlyContinue)) {
+    $dA6 = New-Scratch 'r10-a6-a'
+    $cfgA6 = Join-Path $dA6 'sshd_config'
+    [IO.File]::WriteAllText($cfgA6, "DSAAuthentication no`r`nPubkeyAuthentication yes`r`nPasswordAuthentication yes`r`nChallengeResponseAuthentication yes`r`nKbdInteractiveAuthentication no`r`n")
+    Set-SshdKeyOnlyConfig -ConfigPath $cfgA6 -BackupDir (Join-Path $dA6 'bk') -Stamp 'R10' -Validate { 0 }
+    $a6Lines = @([IO.File]::ReadAllLines($cfgA6))
+    $a6Active = @($a6Lines | Where-Object { $_ -notmatch '^\s*#' })
+    $a6FirstPub = ($a6Active | Where-Object { $_ -match '^\s*(PubkeyAuthentication|DSAAuthentication)\s' } | Select-Object -First 1)
+    $a6FirstKbd = ($a6Active | Where-Object { $_ -match '^\s*(KbdInteractiveAuthentication|ChallengeResponseAuthentication|SkeyAuthentication)\s' } | Select-Object -First 1)
+    Assert-That ($a6FirstPub -ceq 'PubkeyAuthentication yes') 'r10 A6 sshd: the first effective public-key line (aliases included) is PubkeyAuthentication yes' ($a6Lines -join '|')
+    Assert-That ($a6FirstKbd -ceq 'KbdInteractiveAuthentication no') 'r10 A6 sshd: the first effective keyboard-interactive line (aliases included) is KbdInteractiveAuthentication no' ($a6Lines -join '|')
+    $a6Refuse = [ordered]@{
+        'SkeyAuthentication yes inside a Match'          = "PasswordAuthentication no`r`nMatch User x`r`n    SkeyAuthentication yes`r`n"
+        'PubkeyAuthentication no inside a Match'         = "PasswordAuthentication no`r`nMatch User x`r`n    PubkeyAuthentication no`r`n"
+        'DSAAuthentication no inside a Match'            = "PasswordAuthentication no`r`nMatch User x`r`n    DSAAuthentication no`r`n"
+        'KbdInteractiveAuthentication true inside Match' = "PasswordAuthentication no`r`nMatch User x`r`n    KbdInteractiveAuthentication true`r`n"
+    }
+    foreach ($k in $a6Refuse.Keys) {
+        $d = New-Scratch 'r10-a6-refuse'
+        $cfg = Join-Path $d 'sshd_config'
+        [IO.File]::WriteAllText($cfg, $a6Refuse[$k])
+        $threw = $false
+        try { Set-SshdKeyOnlyConfig -ConfigPath $cfg -BackupDir (Join-Path $d 'bk') -Stamp 'R10' -Validate { 0 } } catch { $threw = $true }
+        Assert-That ($threw -and ([IO.File]::ReadAllText($cfg) -ceq $a6Refuse[$k])) "r10 A6 sshd: $k is refused and the file is left unchanged"
+    }
+} else { Assert-That $false 'r10 A6: Set-SshdKeyOnlyConfig is not defined' }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
