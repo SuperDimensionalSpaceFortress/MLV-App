@@ -102,7 +102,12 @@ param(
     [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
     # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe Stop-ShareUnreachable uses (ShareRootAccess.psm1); throwing means the
     # root cannot be read. Production passes none.
-    [scriptblock]$TestShareRootProbe = $null
+    # (r16 merge of #826: this seam and -DllJobIdSuffix below are independent parameters; both are kept, neither side's behaviour is dropped.)
+    [scriptblock]$TestShareRootProbe = $null,
+    # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: an explicit, opt-in retry suffix for the single-use DLL-pair JobId. A FAILED result under the default id
+    # (playback-attr-3-cuda-dllpair-<sha12>) refuses that sha's DLL pair for good; -DllJobIdSuffix r2 harvests or builds <that>-r2 instead, through the
+    # generator's -JobIdSuffix and Get-DllPairReuse -JobIdSuffix. Absent: the default id, exactly as before.
+    [ValidatePattern('^(?:(?=.{1,32}\z)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)?\z')][string]$DllJobIdSuffix = ''
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -262,7 +267,7 @@ $HashByName = {
     [pscustomobject]@{ present = $true; hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant(); text = [Text.Encoding]::UTF8.GetString($bytes) }
 }
 $PathByName = { param($p, $kind) if ($kind -eq 'dir') { Test-Path -LiteralPath $p -PathType Container } else { Test-Path -LiteralPath $p -PathType Leaf } }
-$DllReuseByName = { param($mod, $outbox, $id, $sha) Import-Module -Name $mod -Force; Get-DllPairReuse -Outbox $outbox -JobId $id -Sha $sha }
+$DllReuseByName = { param($mod, $outbox, $id, $sha, $suffix) Import-Module -Name $mod -Force; Get-DllPairReuse -Outbox $outbox -JobId $id -Sha $sha -JobIdSuffix $suffix }
 $StageReuseByName = { param($mod, $path, $id, $sha, $kind) Import-Module -Name $mod -Force; Get-StageReuse -ResultPath $path -JobId $id -Sha $sha -Kind $kind }
 
 function Get-RemainingSec { [int][Math]::Floor(($script:Deadline - [DateTime]::UtcNow).TotalSeconds) }
@@ -344,14 +349,17 @@ $s12 = $names.shortSha
 $cache = "$share\cache"
 $cacheBuildJson = Join-Path $cache $names.buildManifestName
 $buildDir = Join-Path $BuildRoot "build-$s12"
-$dllId = "playback-attr-3-cuda-dllpair-$s12"
+$dllBaseId = Get-AttrCudaDllPairJobId -SourceCommit $commit
+$dllId = Get-AttrCudaDllPairJobId -SourceCommit $commit -JobIdSuffix $DllJobIdSuffix
+$dllGenArgs = @('-SourceCommit', $commit)
+if ($DllJobIdSuffix) { $dllGenArgs += @('-JobIdSuffix', $DllJobIdSuffix) }
 $stageDefaultId = "playback-attr-3-cuda-stage-$s12"
 # The ONLY leaf names this driver ever hands um-run as side files: this sha's build package (the DLL-pair source zip and the four artifacts the stage job verifies).
 $PackageSideNames = @("$dllId-source.zip", $names.packageZipName, $names.exeName, $names.reconName, $names.buildManifestName)
 
 if ($WhatIf) {
     Out-Line "STAGE_NIGHTLY_PLAN venue=$Venue sourceCommit=$commit nightKey=$nightKey agentShare=$share agentRoot=$agentRoot buildRoot=$BuildRoot receiptFile=$ReceiptFile maxTotalSec=$MaxTotalSec (plan only: nothing is built, submitted, probed or written)"
-    Out-Line "STAGE_NIGHTLY_PLAN_STEP 1/4 dll-pair harvest $dllShare\outbox\$dllId.artifacts when that single-use JobId already built this sha, else $DllGen -SourceCommit $commit then $UmRun -JobId $dllId -AgentShare $dllShare"
+    Out-Line "STAGE_NIGHTLY_PLAN_STEP 1/4 dll-pair harvest $dllShare\outbox\$dllId.artifacts when that single-use JobId already built this sha, else $DllGen $($dllGenArgs -join ' ') then $UmRun -JobId $dllId -AgentShare $dllShare"
     Out-Line "STAGE_NIGHTLY_PLAN_STEP 2/4 assemble $Assembler -SourceCommit $commit -DllPairDir <the DLL-pair artifacts> -OutDir $buildDir (build-guard; skipped when the cache already holds this sha)"
     Out-Line "STAGE_NIGHTLY_PLAN_STEP 3/4 stage $StageGen -AgentRoot $agentRoot [-JobIdSuffix n<yyyyMMddHHmm> when $stageDefaultId is spent and the cache does not hold the manifest] then $UmRun -AgentShare $share; verify $cacheBuildJson by name"
     Out-Line "STAGE_NIGHTLY_PLAN_STEP 4/4 smoke-runner $SmokeGen -AgentRoot $agentRoot then $UmRun -AgentShare $share (skipped when $cache\<CACHE_DIR_NAME> exists)"
@@ -568,21 +576,21 @@ if ($buildInCache) {
     $t0 = [DateTime]::UtcNow
     $script:Row.jobIds.dllPair = $dllId
     $dllOutbox = "$dllShare\outbox"
-    $pair = Read-Share "$dllOutbox\$dllId.result.json" $DllReuseByName @($reuseModule, $dllOutbox, $dllId, $commit)
+    $pair = Read-Share "$dllOutbox\$dllId.result.json" $DllReuseByName @($reuseModule, $dllOutbox, $dllBaseId, $commit, $DllJobIdSuffix)
     if ($pair.Reusable) {
         $script:Row.steps.dllPair = 'harvested'
         Say "DLL pair harvested: $($pair.Line) (ended $($pair.EndedUtc)); not re-submitted"
     } elseif ($pair.Reason -cne 'result-missing') {
-        Stop-Nightly 'DLLPAIR_FAILED' "the single-use JobId $dllId already has a result that is not a clean DLL pair for $commit ($($pair.Reason)); not re-submitted"
+        Stop-Nightly 'DLLPAIR_FAILED' "the single-use JobId $dllId already has a result that is not a clean DLL pair for $commit ($($pair.Reason)); not re-submitted (a retry under a fresh id takes -DllJobIdSuffix)"
     } else {
         $dllOut = Join-Path $script:WorkDir 'dllpair'
-        $gen = Invoke-Child 'dllpair-gen' $DllGen @('-SourceCommit', $commit, '-OutDir', $dllOut)
+        $gen = Invoke-Child 'dllpair-gen' $DllGen ($dllGenArgs + @('-OutDir', $dllOut))
         if ($gen.timedOut) { Stop-Nightly 'STAGE_CAP_EXCEEDED' 'the DLL-pair generator outlived the cap' }
         $dllJob = Join-Path $dllOut "$dllId.job.ps1"; $dllZip = Join-Path $dllOut "$dllId-source.zip"
         if ($gen.exit -ne 0 -or -not (Test-Path -LiteralPath $dllJob -PathType Leaf) -or -not (Test-Path -LiteralPath $dllZip -PathType Leaf)) { Stop-Nightly 'DLLPAIR_FAILED' "the DLL-pair generator exit $($gen.exit) did not emit $dllId.job.ps1 + -source.zip (see $($script:WorkDir)\dllpair-gen.log)" }
         $u = Invoke-UmRun 'dllpair' $dllJob @($dllZip) $dllId $dllShare 3600 'DLLPAIR_FAILED' -LaterHarvest
         if ($u -ceq 'IN_USE') { Stop-Nightly 'DLLPAIR_FAILED' "$dllId became in use between the by-name check and the submission; not re-submitted" }
-        $pair = Read-Share "$dllOutbox\$dllId.result.json" $DllReuseByName @($reuseModule, $dllOutbox, $dllId, $commit)
+        $pair = Read-Share "$dllOutbox\$dllId.result.json" $DllReuseByName @($reuseModule, $dllOutbox, $dllBaseId, $commit, $DllJobIdSuffix)
         if (-not $pair.Reusable) { Stop-Nightly 'DLLPAIR_FAILED' "the DLL-pair job ended but its result is not a clean pair for $commit ($($pair.Reason))" }
         $script:Row.steps.dllPair = 'built'
         Say "DLL pair built: $($pair.Line)"

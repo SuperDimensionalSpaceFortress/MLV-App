@@ -1,0 +1,13 @@
+---
+target: specs/mlv-app/cards.md
+kind: trap
+source_commit: PENDING
+law4: attested
+---
+## mlv-app/wmi-create-child-inherits-gpfault-error-box
+rule: route every detached launch that goes through a WMI process-create call (Win32_Process Create, Invoke-CimMethod, Invoke-WmiMethod) through ONE launcher that sets SEM_NOGPFAULTERRORBOX (0x2) before the real child starts: it creates a stub that ORs 0x8003 into its own error mode, starts the unchanged command line with one CreateProcess that does not pass CREATE_DEFAULT_ERROR_MODE, waits, returns the exit code, so it and all it starts inherit 0x8003. Never call the WMI create directly from a script, and never rely on the child to set its own mode (a native crash can come first). Outside this remedy: a hop that passes CREATE_DEFAULT_ERROR_MODE, a child that resets its own mode.
+mechanism: a WMI-created process is not a child of the caller: its parent is the WMI provider host and it starts at error mode 0x8001, no 0x2, so a crash raises the modal "Application Error" box on the interactive desktop. Seen 2026-11-13 17:21:15 CST: console_tests.exe, Qt6Core.dll, 0xc0000005.
+applies: mlv-app
+check: py -3 -m pytest tools/coordination/test_coordination_guardrails.py -k "error_mode" covers Invoke-Lane's own block, not a WMI child; tests/coordination/test_doctrine_outbox.py -k test_every_committed_outbox_item_passes_the_card_validator covers this card's shape. The clause "no direct WMI create" has NO mechanical guard yet: pending card DOCTRINE-OUTBOX-WMI-SCANNER-DENY-BY-DEFAULT-1. Stub half measured 2026-11-14 (0x8001 plain, 0x8003 stub): board-local, not pushed.
+supersedes: none
+evidence: measured
