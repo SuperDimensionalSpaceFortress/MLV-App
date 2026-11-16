@@ -114,8 +114,9 @@
 # ONE DEADLINE: -MaxWaitSec runs from the start and bounds every queue-gate wait too (a re-probe does not get a fresh gate clock). A gate wait ends at the
 # earlier of -MaxGateSec and that deadline (GATE_BUSY, exit 3). Only a probe already submitted can run past it, bounded by um-run.ps1's own timeouts and by
 # -MaxAdmissionWaitSec (default 7200, range 1..86400), which is forwarded to um-run.ps1 as its heavy-slot admission ceiling. A caller's ABSOLUTE end (-WaitUntilUtc /
-# -WaitUntilTs) is also asked before each probe is written and submitted: past it no probe is submitted (`GATE_CUTOFF ...`, exit 3; after a measured busy probe, that reading's
-# verdict), even on an empty queue (r11, adversary-d38e2ab8.json A1). The venue chain passes its
+# -WaitUntilTs) is also asked before each probe is written and submitted: past it no probe this script WAITED for is submitted (a re-probe, or a first probe after the gate
+# polled or retried: `GATE_CUTOFF ...`, exit 3; after a measured busy probe, that reading's verdict), even when the queue then reads empty (r11, adversary-d38e2ab8.json A1).
+# The first probe of a gate that is CLEAR at its first read is the caller's own dispatch and is submitted (adversary-7fdbd64d.json A1: a zero wait keeps one reading). The venue chain passes its
 # -ProbeAdmissionWaitSec here, and sizes the claim ticket's probe-phase staleAfterSec from that same value, so the bound the ticket assumes is the bound the probe honours.
 # A read error on the agent share is retried -ReadAttempts times in all, backing off -ReadBackoffSec * attempt, inside the same deadline, before it is
 # GATE_UNREADABLE; each retry prints a `GATE_READ_RETRY` line, never a `queued=0 running=0` line.
@@ -304,11 +305,14 @@ if ($WaitUntilTs -gt 0) {
 }
 # r11 (adversary-d38e2ab8.json A1): the caller's ABSOLUTE end alone (the earlier of -WaitUntilUtc and -WaitUntilTs; $null when neither is given). The clamps above end a busy gate
 # and the re-probe loop, but an empty queue returned CLEAR before any expiry check and a probe was then written and submitted past the caller's end (an in-lease probe sent
-# after the agent's idle bound). Past this cutoff no probe is submitted: only one already submitted may run past it. -MaxWaitSec alone keeps its at-least-one-probe reading.
+# after the agent's idle bound). Past this cutoff no probe is submitted that this script WAITED for: a re-probe, or a first probe after the gate polled or retried a read.
+# adversary-7fdbd64d.json A1: the FIRST probe on a gate whose first read is CLEAR is the caller's own dispatch (its bounds were asked at the dispatch) and is submitted, so a zero
+# relative wait (-ProbeMaxWaitSec 0: the cutoff IS the dispatch) keeps its one measurement, as -MaxWaitSec 0 always did.
 $waitCutoff = $null
 if ($WaitUntilUtc) { $waitCutoff = $wu }
 if ($WaitUntilTs -gt 0 -and ($null -eq $waitCutoff -or $wts -lt $waitCutoff)) { $waitCutoff = $wts }
-function Test-WaitCutoffPassed { $null -ne $waitCutoff -and (Get-WaitNowUtc) -ge $waitCutoff }
+$script:GateWaited = $false   # set by Wait-QueueGate / Read-GateCounts before any sleep
+function Test-WaitCutoffRefusesProbe { $null -ne $waitCutoff -and ($null -ne $last -or $script:GateWaited) -and (Get-WaitNowUtc) -ge $waitCutoff }
 
 # Both directory counts, retried on a read error. Results go to $script:GateQueued / $script:GateRunning ($null = still unreadable after the last attempt):
 # like GateState they are not the function's output, because its GATE_READ_RETRY lines are written to the pipeline.
@@ -320,6 +324,7 @@ function Read-GateCounts([string]$Name) {
         $delay = $ReadBackoffSec * $attempt
         if ((Get-WaitNowUtc).AddSeconds($delay) -gt $deadline) { return }   # no time left for another try: report what is known
         Write-Gate "GATE_READ_RETRY $Name $Venue attempt=$($attempt + 1)/$ReadAttempts inboxReadable=$($null -ne $script:GateQueued) runningReadable=$($null -ne $script:GateRunning) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
+        $script:GateWaited = $true
         if ($delay -gt 0) { Start-Sleep -Seconds $delay }
     }
 }
@@ -337,6 +342,7 @@ function Wait-QueueGate([string]$Name) {
         $now = Get-WaitNowUtc
         if ($now -gt $gateEnd) { Write-Gate "GATE_BUSY $Name waitedSec=$([int]($now - $t0).TotalSeconds)"; $script:GateState = 'BUSY'; return }
         # (the poll never sleeps past the end of the gate, so the wait ends when the deadline does)
+        $script:GateWaited = $true
         Start-Sleep -Milliseconds ([int][Math]::Max(10.0, [Math]::Min([double]($GatePollSec * 1000), ($gateEnd - $now).TotalMilliseconds + 10)))
     }
 }
@@ -1611,12 +1617,13 @@ while ($true) {
     if ($script:GateState -cne 'CLEAR') { exit 3 }
     # r11 (adversary-d38e2ab8.json A1): asked after the gate's CLEAR and again as the last statement before um-run (the job-file write can stall on a UNC -WorkDir). Past the
     # caller's cutoff a busy probe already measured ends on its own reading (break: COOLDOWN_UNMET / UNKNOWN, as at the recheck below); none measured yet ends GATE_CUTOFF, exit 3.
-    if (Test-WaitCutoffPassed) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-write: the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
+    # (7fdbd64d A1: never the first probe of a gate that cleared at its first read; see Test-WaitCutoffRefusesProbe)
+    if (Test-WaitCutoffRefusesProbe) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-write: the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
     $jobId = 'venue-quiet-probe-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
     $jobFile = Join-Path $WorkDir "$jobId.job.ps1"
     [IO.File]::WriteAllText($jobFile, $probeText, [Text.UTF8Encoding]::new($false))
     $probe = $null; $why = $null; $whyKind = $null; $rawPath = $null; $rawErr = $null
-    if (Test-WaitCutoffPassed) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-submit job=$jobId (written, not submitted): the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
+    if (Test-WaitCutoffRefusesProbe) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-submit job=$jobId (written, not submitted): the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
     try {
         $out = @(& $umRun -ScriptPath $jobFile -JobId $jobId -AgentShare $agentShare -TimeoutSec 120 -MaxQueueWaitSec 300 -MaxClaimedWaitSec 120 -MaxAdmissionWaitSec $MaxAdmissionWaitSec 6>$null)
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
