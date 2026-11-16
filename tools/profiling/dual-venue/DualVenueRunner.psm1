@@ -1145,10 +1145,13 @@ function Get-DvSmokeSummaryFields {
         # r13 (r13 adversary A2 on 04c1337b): each record names settings_store as one whole token, and that one token is run_scoped. A longer key that
         # ends in it (`not_settings_store=run_scoped`) is no settings_store, and two settings_store tokens (`settings_store=venue settings_store=run_scoped`)
         # do not say which store ran, so either refuses isolation
+        # r15 (r15 adversary A2 on d991b0af, its input: `settings_store=run_scoped "settings_store=venue"`): a mention is the WORD settings_store bounded
+        # by any non-name character ($script:DvNameChar), so a quoted or punctuated declaration counts; exactly one mention, and it is that whole token
         $runScoped = {
             param([string]$x)
+            $mentions = [regex]::Matches($x, '(?<!' + $script:DvNameChar + ')settings_store(?!' + $script:DvNameChar + ')', $script:DvCi).Count
             $stores = [regex]::Matches($x, '(?<!\S)settings_store=(?<v>\S*)', $script:DvCi)
-            ($stores.Count -eq 1) -and [string]::Equals($stores[0].Groups['v'].Value, 'run_scoped', [StringComparison]::OrdinalIgnoreCase)
+            ($mentions -eq 1) -and ($stores.Count -eq 1) -and [string]::Equals($stores[0].Groups['v'].Value, 'run_scoped', [StringComparison]::OrdinalIgnoreCase)
         }
         $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { -not (& $runScoped $_) }).Count -eq 0)
     }
@@ -1988,19 +1991,6 @@ function Get-DvDueWakeDelivered {
     'delivered'
 }
 
-function ConvertTo-DvSessionKey {
-    <#
-    .SYNOPSIS
-    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r15 (r14 adversary A2 on a27f3d88): a session id as its canonical decimal, so `03`, `003` and `3` are
-    one session. Only one plain ASCII decimal [0-9]+ is an id; anything else is $null (no session), never a numeric prefix. String arithmetic, so an id
-    longer than any integer type is still compared exactly.
-    #>
-    param([AllowNull()][AllowEmptyString()][string]$Id)
-    if ($null -eq $Id -or $Id -cnotmatch '^[0-9]+$') { return $null }
-    $t = $Id.TrimStart('0')
-    if ($t.Length -eq 0) { '0' } else { $t }
-}
-
 function Get-DvDueWakeDeliveryEvidence {
     <#
     .SYNOPSIS
@@ -2056,10 +2046,11 @@ function Get-DvDueWakeDeliveryEvidence {
             # selector above (Get-DvSmokeSummaryFields) now uses too (r2 adversary pass 7 A2)
             $start = $script:DvRecordStart
             # r15 (r14 adversary A2): session ids are compared as canonical decimals (ConvertTo-DvSessionKey), never as strings, so a boundary that
-            # spells the measured session `03` is that session (it neither closes its window nor fails to open it)
-            $sessionKey = ConvertTo-DvSessionKey ([string]$session)
+            # spells the measured session `03` is that session (it neither closes its window nor fails to open it). r15 (r15 adversary A1 on d991b0af):
+            # the module's one ConvertTo-DvSessionKey (-Sign/-Digits), never a second definition; every id here is one ASCII [0-9]+
+            $sessionKey = ConvertTo-DvSessionKey -Sign '' -Digits ([string]$session)
             $paceIdRx = $start + 'playback_smoke\.pace_summary session=(?<s>[0-9]+)(?:\s|$)'
-            $isMeasuredPace = { param([string]$x) ($x -cmatch $paceIdRx) -and ((ConvertTo-DvSessionKey $Matches['s']) -ceq $sessionKey) }
+            $isMeasuredPace = { param([string]$x) ($x -cmatch $paceIdRx) -and ((ConvertTo-DvSessionKey -Sign '' -Digits $Matches['s']) -ceq $sessionKey) }
             $open = $false
             # r11 (r10 adversary A2 on 205a5b6c): a session boundary inside the open window that is not read whole ENDS the measured Play and marks
             # the read unreadable (DUE_WAKE_SESSION_BOUNDARY_UNREADABLE below, every leg), so the wake after it is never credited to the measured Play.
@@ -2106,7 +2097,7 @@ function Get-DvDueWakeDeliveryEvidence {
                         $isBoundary = $true; if ((& $located $l) -and (& $sessionTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
                     }
                     if ($isBoundary -and $null -eq $bid) { $boundaryUnreadable = $true; $open = $false; continue }
-                    if ($isBoundary -and (ConvertTo-DvSessionKey $bid) -cne $sessionKey) { $open = $false; continue }
+                    if ($isBoundary -and (ConvertTo-DvSessionKey -Sign '' -Digits $bid) -cne $sessionKey) { $open = $false; continue }
                 }
                 # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable).
                 # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second

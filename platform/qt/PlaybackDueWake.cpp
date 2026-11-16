@@ -840,18 +840,16 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
             // (lastRunnerSleepDispatchNs), which takes it out of the runner sleep it accounts
             const size_t heldBefore = d->heldWakes.size();
             noteRunnerSleep( false );
-            // r15 (r14 adversary A1): the span is the caller-clock reads on both sides of the dispatch (it encloses the dispatch
-            // and its duration clock); its length, not a separate offset, is what the duration account takes out
+            // r15 (r14 adversary A1): the span is the caller-clock reads on both sides of the dispatch. r15 (r15 adversary A3 on
+            // d991b0af): its length IS the duration account (lastRunnerSleepDispatchNs), never a second timer, so the scalar,
+            // present-gap and hop accounts all take out the same interval
             const double dispatchStartS = spanNowS();
-            QElapsedTimer dispatchClock;
-            dispatchClock.start();
             d->inRunnerSleepDispatch = true;
             dispatchPendingSentMessages();
             d->inRunnerSleepDispatch = false;
-            const qint64 dispatchSpentNs = dispatchClock.nsecsElapsed();
-            const double dispatchEndS = spanNowS();
-            d->runnerSleepDispatchNs += dispatchSpentNs;
-            d->runnerSleepDispatchSpans.emplace_back( dispatchStartS, std::max( dispatchStartS, dispatchEndS ) );
+            const double dispatchEndS = std::max( dispatchStartS, spanNowS() );
+            d->runnerSleepDispatchNs += static_cast<qint64>( std::llround( ( dispatchEndS - dispatchStartS ) * 1000000000.0 ) );
+            d->runnerSleepDispatchSpans.emplace_back( dispatchStartS, dispatchEndS );
             if( d->heldWakes.size() > heldBefore )
             {
                 ++d->runnerSleepsWokenBySent;

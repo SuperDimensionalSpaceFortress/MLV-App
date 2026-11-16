@@ -2393,6 +2393,74 @@ TEST(PlaybackDueWakeSend, R15A1_ADescheduleBeforeTheSleepStartsNeverShiftsTheDis
 #endif
 }
 
+#ifdef Q_OS_WIN
+namespace {
+// r15 adversary A3: the caller's clock jumps 20 ms once the handler ends (a GUI deschedule between the dispatch's end and the
+// span's end read)
+std::atomic<int> g_r15A3SkewMs { 0 };
+int g_r15A3Calls = 0;
+constexpr UINT kR15A3ForeignMessage = WM_USER + 0x53;
+LRESULT CALLBACK r15A3ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
+{
+    if( message == kR15A3ForeignMessage )
+    {
+        ++g_r15A3Calls;
+        QElapsedTimer busy;
+        busy.start();
+        volatile quint64 spin = 0;
+        while( busy.elapsed() < 30 ) ++spin;
+        g_r15A3SkewMs = 20;
+        return 0;
+    }
+    return DefWindowProcW( hwnd, message, wParam, lParam );
+}
+double r15A3CallerNowS()
+{
+    return ( dueWakeQpcNowMs() + static_cast<double>( g_r15A3SkewMs.load() ) ) / 1000.0;
+}
+}
+#endif
+
+TEST(PlaybackDueWakeSend, R15A3_TheDurationAccountIsTheDispatchSpansLength)
+{
+    // r15 adversary A3 on d991b0af, its input: the dispatch's duration came from its own timer while its span came from the
+    // caller's clock read after it, so a deschedule before that read made the span 20 ms longer than the time the scalar and
+    // present-gap accounts took out. The duration account is now the span's own length, so all three exclude one interval.
+#ifdef Q_OS_WIN
+    PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
+    ASSERT_TRUE( wake.sendsNotify() );
+    static const wchar_t *kClass = L"MlvR15A3ForeignHandler";
+    WNDCLASSW wc {};
+    wc.lpfnWndProc = r15A3ForeignProc;
+    wc.hInstance = GetModuleHandleW( nullptr );
+    wc.lpszClassName = kClass;
+    RegisterClassW( &wc );
+    const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
+    ASSERT_TRUE( window != nullptr );
+    g_r15A3SkewMs = 0;
+    g_r15A3Calls = 0;
+    std::atomic<bool> sent { false };
+    std::thread sender( [window, &sent]() {
+        Sleep( 10 );
+        sent = SendNotifyMessageW( window, kR15A3ForeignMessage, 0, 0 ) != 0;
+    } );
+    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 120, &r15A3CallerNowS );
+    sender.join();
+    DestroyWindow( window );
+    ASSERT_TRUE( sent.load() );
+    ASSERT_EQ( 1, g_r15A3Calls );
+    ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
+    const std::vector<std::pair<double, double>> spans = wake.lastRunnerSleepDispatchSpansS();
+    ASSERT_EQ( static_cast<size_t>( 1 ), spans.size() );
+    const double spanNs = ( spans[0].second - spans[0].first ) * 1000000000.0;
+    ASSERT_TRUE( spanNs >= 49000000.0 );                               // the handler's 30 ms plus the 20 ms jump
+    ASSERT_TRUE( std::fabs( spanNs - static_cast<double>( wake.lastRunnerSleepDispatchNs() ) ) < 1000.0 );
+    g_r15A3SkewMs = 0;
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
 TEST(PlaybackDueWakeSend, R2A1_AStaleSentWakeInTheRunnerSleepIsNotHeldCountedOrAllowedToEndTheSleep)
 {
     // r2 adversary pass 5 A1, its input verbatim: SendNotify; arm(0.5); the sent message published without pumping; cancel();

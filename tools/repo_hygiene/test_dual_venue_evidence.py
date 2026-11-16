@@ -3265,7 +3265,10 @@ class EvidenceFactory(RunnerHarness):
                 "manifestRunNonce": manifest.get("smokeRunLog", {}).get("runNonce"), "logSha256": log_sha,
                 "logShaBound": declared == log_sha and (not man_sha or man_sha.lower() == log_sha),
                 # r13 (r13 adversary A2 sibling): one whole settings_store token per record, and it is run_scoped
-                "settingsIsolated": bool(iso) and all([v.lower() for v in re.findall(r"(?<!\S)settings_store=(\S*)", l, re.I)] == ["run_scoped"] for l in iso),
+                # r15 (r15 adversary A2): and the word settings_store is mentioned exactly once (a quoted second declaration counts)
+                "settingsIsolated": bool(iso) and all([v.lower() for v in re.findall(r"(?<!\S)settings_store=(\S*)", l, re.I)] == ["run_scoped"]
+                                                      and len(re.findall(r"(?<!(?-i:[A-Za-z0-9_]))settings_store(?!(?-i:[A-Za-z0-9_]))", l, re.I)) == 1
+                                                      for l in iso),
                 "fixtureRehearsal": summary.get("fixtureRehearsal"), "clipId": summary.get("clipId")}
 
     @staticmethod
@@ -15953,6 +15956,40 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                     self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
                     if not name.startswith("pace_summary"):
                         self.assertIn("DUE_WAKE_DELIVERY_INHERITED", v["reason"])
+
+    def test_r15_pass_a1_a_canonical_record_of_another_session_is_still_skipped_by_the_lever_readers(self) -> None:
+        # r15 adversary A1 on d991b0af, its input verbatim: a second ConvertTo-DvSessionKey definition replaced the module's -Sign/-Digits one, so
+        # Test-DvRecordMentionsSession keyed every session as $null and session 4's canonical prep_route was a duplicate mention of session 3.
+        # The recon_release sibling reads through the same predicate. One definition only, and both readers skip another session's record.
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(module.count("function ConvertTo-DvSessionKey {"), 1)
+        prep = ("playback_smoke.measured_session id=3\nplayback_smoke.prep_route session=3 prep_conflated_move_active=1\n"
+                "playback_smoke.prep_route session=4 prep_conflated_move_active=1\nplayback_smoke.summary session=3")
+        rr = " deferred=10 sync=0 drained=10 max_depth=2 outstanding_at_stop=0"
+        recon = ("playback_smoke.measured_session id=3\nplayback_smoke.recon_release session=3 deferred_enabled=0" + rr +
+                 "\nplayback_smoke.recon_release session=4 deferred_enabled=0" + rr + "\nplayback_smoke.summary session=3")
+        proc, out = run_pwsh_evidence_cases("Get-DvPrepConflatedMoveEvidence", [({"generatorArgs": {"prepConflatedMove": True}}, prep)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["verdict"], out[0]["blocks"]), ("HONOURED", False), out[0])
+        proc, out = run_pwsh_evidence_cases("Get-DvReconReleaseDeferredEvidence", [({"generatorArgs": {"disableReconReleaseDeferred": True}}, recon)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["verdict"], out[0]["blocks"]), ("HONOURED", False), out[0])
+
+    def test_r15_pass_a2_a_quoted_second_settings_store_declaration_refuses_isolation(self) -> None:
+        # r15 adversary A2 on d991b0af, its input verbatim: the whitespace-bounded matcher skipped the quoted `"settings_store=venue"` and accepted the
+        # run_scoped one. A mention is the word settings_store bounded by any non-name character; exactly one, and it is the whole run_scoped token.
+        base = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated {}\nplayback_smoke.summary session=3\n"
+        for name, store, want in (("A2 verbatim", 'settings_store=run_scoped "settings_store=venue"', False),
+                                  ("quoted first", '"settings_store=venue" settings_store=run_scoped', False),
+                                  ("bracketed", "[settings_store=venue] settings_store=run_scoped", False),
+                                  ("bare key mention", "settings_store=run_scoped settings_store", False),
+                                  ("one whole token", "site=x settings_store=run_scoped", True),
+                                  ("a longer key is another name", "settings_store=run_scoped x_settings_store=venue", True)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated | ConvertTo-Json -Compress",
+                                          DVE_LOG=base.format(store))
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertIs(out, want)
 
 
 @requires_windows_pwsh
