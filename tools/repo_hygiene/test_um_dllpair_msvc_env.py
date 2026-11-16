@@ -31,6 +31,7 @@ PWSH = shutil.which("pwsh")
 GIT = shutil.which("git")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or os.name != "nt", "needs pwsh on Windows")
 
+HIT_ID = "77"  # stands in for the per-run GUID the backend scripts substitute for __MLV_HIT_ID__
 SHA = "a" * 40
 S12 = SHA[:12]
 
@@ -300,7 +301,8 @@ class BackendCmdUcrtCheckTests(_Pwsh):
 
     def check_lines(self, script: Path) -> list[str]:
         lines = re.findall(r"^\s*'((?:[^']|'')*MLV_(?:UCRT_OK|INC)(?:[^']|'')*)',?\s*$", script.read_text(encoding="utf-8"), re.M)
-        return [l.replace("''", "'") for l in lines]
+        # the script writes a per-run GUID over this token (adversary pass 13); the fixture uses a fixed id so a test can name the hit file
+        return [l.replace("''", "'").replace("__MLV_HIT_ID__", HIT_ID) for l in lines]
 
     def test_adversary_f7c5a3c0_a2_a_bang_in_systemroot_still_finds_where(self) -> None:
         # adversary pass on f7c5a3c0, A2: inside EnableDelayedExpansion the percent-expanded %SystemRoot% was re-parsed, so SystemRoot=C:\...\Win!OS!
@@ -413,41 +415,39 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                     self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
                     self.assertEqual(list(temp.iterdir()), [], p.stdout + p.stderr)
 
-    def test_adversary_e7f54e32_a1_a_stale_read_only_hit_file_is_never_read_as_this_checks_hits(self) -> None:
-        # adversary pass on e7f54e32, A1: the hit-list name is %TEMP%\mlv_ucrt_hits_%RANDOM%%RANDOM%.txt. With RANDOM defined in the environment (7 -> 77) the
-        # name is predictable, and a read-only file already there made `where ... >file` fail while the unconditional `& for /f` still read the STALE list: a
-        # corecrt.h that is NOT on INCLUDE would count as found (the adversary's trace). Measured on this host: cmd abandons the rest of the line when the
-        # redirect fails, so the stale list is not read, but a REAL header on INCLUDE was then refused (false exit 9) and the stale file was left behind.
-        # The file is removed (del /f) before each where, the loop runs only when where itself succeeded (&&), and the final delete is /f too, so no stale
-        # list is ever consumed or left behind, and a stale file cannot turn a good INCLUDE into a refusal.
-        temp = self.tmp / "Temp-stale"
-        temp.mkdir()
-        old_sdk = self.tmp / "OldSDK" / "ucrt"
-        old_sdk.mkdir(parents=True)
-        (old_sdk / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
-        real = self.tmp / "RealSDK" / "ucrt"
-        real.mkdir(parents=True)
-        (real / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
-        stale = temp / "mlv_ucrt_hits_77.txt"
+    def test_adversary_pass_13_the_hit_file_name_comes_from_a_per_run_guid_never_from_random(self) -> None:
+        # adversary passes 12-13 (e7f54e32 A1, 89a52b7c A1-A3): the hit list was %TEMP%\mlv_ucrt_hits_%RANDOM%%RANDOM%.txt. %RANDOM% is read from the
+        # inherited environment, so (A1) RANDOM=x" & exit /b 23 & rem closed the quoted SET and ran `exit /b 23` before the guard; (A2) RANDOM=7 made the
+        # name the same for two concurrent backends, one consuming the other's hits; (e7f54e32 A1) a read-only file at the predictable name made the
+        # redirect fail, which abandons the rest of the line, so a real header on INCLUDE was refused. Each script now writes a GUID it generates itself
+        # over __MLV_HIT_ID__ in the .cmd text: the name is unguessable, unshared and not environment-derived, so the whole class is gone.
         for script in BACKEND_SCRIPTS:
-            for name, include, rc in (("header-outside-include", INCLUDE_NO_SDK, 9), ("header-on-include", f"{INCLUDE_NO_SDK};{real}", 0)):
-                with self.subTest(script=script.name, case=name):
-                    if stale.exists():
-                        os.chmod(stale, 0o666)
-                        stale.unlink()
-                    stale.write_text(f"{old_sdk / 'corecrt.h'}\r\n", encoding="ascii")
-                    os.chmod(stale, 0o444)
-                    p = self.run_check(script, include, via_env=True, extra_env={"TEMP": str(temp), "TMP": str(temp), "RANDOM": "7"})
-                    self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
-                    if rc == 9:
-                        self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
-                        self.assertNotIn("REACHED_NVCC", p.stdout)
-                    else:
-                        self.assertIn("REACHED_NVCC", p.stdout)
-                    if stale.exists():  # a leftover from a failed check: clear it so the next case starts from the fixture, and fail this one
-                        os.chmod(stale, 0o666)
-                        stale.unlink()
-                        self.fail("the stale hit file was left behind")
+            with self.subTest(script=script.name, part="text"):
+                text = script.read_text(encoding="utf-8")
+                self.assertNotIn("%RANDOM%", text)
+                self.assertEqual(text.count("mlv_ucrt_hits___MLV_HIT_ID__.txt"), 1)
+                self.assertIn("$hitId = [guid]::NewGuid().ToString('N')", text)
+                self.assertIn("ForEach-Object { $_.Replace('__MLV_HIT_ID__', $hitId) } | Set-Content -Encoding ASCII $cmdFile", text)
+                self.assertLess(text.index("$hitId = [guid]::NewGuid()"), text.index("@(\n    '@echo off'"))
+                # the hit file is only read when where itself succeeded, and removed with /f /q at the end
+                self.assertEqual(text.count('2>nul && for /f'), 2)
+                self.assertIn('del /f /q "%MLV_HITS%" 2>nul & endlocal', text)
+
+    def test_adversary_pass_13_a1_a_hostile_random_value_cannot_run_a_command_before_the_guard(self) -> None:
+        kit = self.tmp / "Kits-random" / "ucrt"
+        kit.mkdir(parents=True)
+        (kit / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        for script in BACKEND_SCRIPTS:
+            for random_value in ('x" & exit /b 23 & rem ', "7"):
+                for name, include, rc in (("header", f"{INCLUDE_NO_SDK};{kit}", 0), ("no-header", INCLUDE_NO_SDK, 9)):
+                    with self.subTest(script=script.name, random=random_value, case=name):
+                        temp = Path(tempfile.mkdtemp(prefix="um-rnd-", dir=self.tmp))
+                        p = self.run_check(script, include, via_env=True, extra_env={"TEMP": str(temp), "TMP": str(temp), "RANDOM": random_value})
+                        self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
+                        self.assertEqual(("REACHED_NVCC" in p.stdout), rc == 0, p.stdout + p.stderr)
+                        if rc == 9:
+                            self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+                        self.assertEqual(list(temp.iterdir()), [], p.stdout + p.stderr)
 
     def test_an_unusable_systemroot_is_a_typed_refusal_not_a_search_from_the_callers_directory(self) -> None:
         # the check runs "%SystemRoot%\System32\where.exe" by its absolute path (no pushd). When that file is absent the check must not fall through to a
