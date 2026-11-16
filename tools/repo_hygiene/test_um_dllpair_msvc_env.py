@@ -305,7 +305,7 @@ class BackendCmdUcrtCheckTests(_Pwsh):
     def test_adversary_f7c5a3c0_a2_a_bang_in_systemroot_still_finds_where(self) -> None:
         # adversary pass on f7c5a3c0, A2: inside EnableDelayedExpansion the percent-expanded %SystemRoot% was re-parsed, so SystemRoot=C:\...\Win!OS!
         # became ...\WinWindows_NT, both where calls ran a missing exe, and a valid corecrt.h was refused at exit 9. where.exe's path is now read into a
-        # variable BEFORE setlocal and used as %MLV_WHERE% (delayed expansion is off there), whose value is not re-parsed. The fixture copies where.exe there.
+        # variable BEFORE setlocal (r10 replaced that with a pushd into System32; see the 48fb6bf9 tests). The fixture copies where.exe there.
         win = self.tmp / "Win!OS!"
         (win / "System32").mkdir(parents=True)
         shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")
@@ -321,20 +321,80 @@ class BackendCmdUcrtCheckTests(_Pwsh):
                     p = self.run_check(script, include, via_env=True, system_root=str(win))
                     self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                     self.assertIn("REACHED_NVCC", p.stdout)
-                    self.assertIn("WHERE_VAR_AT_NVCC=undefined", p.stdout)
+                    self.assertIn(f"CWD_AT_NVCC={Path.cwd()}", p.stdout)
             with self.subTest(script=script.name, case="bare", header=False):
                 p = self.run_check(script, f"{INCLUDE_NO_SDK};{bare}", via_env=True, system_root=str(win))
                 self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
                 self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
 
+    def test_adversary_48fb6bf9_a1_a_percent_in_systemroot_still_finds_where(self) -> None:
+        # adversary pass on 48fb6bf9, A1: SystemRoot=C:\...\Win%OS% was stored literally in MLV_WHERE, but the FOR /F command string is re-parsed by a child
+        # cmd, which expanded %OS% (to Windows_NT), ran a missing C:\WinWindows_NT\System32\where.exe, and refused a valid corecrt.h at exit 9. No path derived
+        # from SystemRoot reaches a re-parsed command line now: the check pushd's into System32 and runs .\where.exe, then pops the directory back.
+        win = self.tmp / "Win%OS%"
+        (win / "System32").mkdir(parents=True)
+        shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")
+        self.assertFalse((self.tmp / "WinWindows_NT").exists())
+        kit = self.tmp / "Kits-pct-root" / "ucrt"
+        kit.mkdir(parents=True)
+        (kit / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        bare = self.tmp / "Kits-pct-root-bare" / "ucrt"
+        bare.mkdir(parents=True)
+        for script in BACKEND_SCRIPTS:
+            for v_on in (False, True):
+                for name, include in (("plain", f"{INCLUDE_NO_SDK};{kit}"), ("quoted", f'{INCLUDE_NO_SDK};"{kit}"')):
+                    with self.subTest(script=script.name, case=name, v_on=v_on, header=True):
+                        p = self.run_check(script, include, via_env=True, system_root=str(win), v_on=v_on)
+                        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                        self.assertIn("REACHED_NVCC", p.stdout)
+                        self.assertIn(f"CWD_AT_NVCC={Path.cwd()}", p.stdout)
+                with self.subTest(script=script.name, case="bare", v_on=v_on, header=False):
+                    p = self.run_check(script, f"{INCLUDE_NO_SDK};{bare}", via_env=True, system_root=str(win), v_on=v_on)
+                    self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                    self.assertIn("FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT", p.stdout)
+
+    def test_adversary_48fb6bf9_a2_a_bang_in_systemroot_survives_delayed_expansion_on_by_default(self) -> None:
+        # adversary pass on 48fb6bf9, A2: with HKCU\Software\Microsoft\Command Processor\DelayedExpansion=1 (or cmd /v:on) the first check line ran under
+        # delayed expansion, so SystemRoot=C:\...\Win!OS! was expanded to ...\WinWindows_NT BEFORE the later setlocal disabled it, and where.exe was missed.
+        # The check's first command now disables delayed expansion before any SystemRoot read. cmd /v:on stands in for the registry default.
+        win = self.tmp / "Win!OS!"
+        (win / "System32").mkdir(parents=True)
+        shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")
+        self.assertFalse((self.tmp / "WinWindows_NT").exists())
+        kit = self.tmp / "Kits-bang-root-von" / "ucrt"
+        kit.mkdir(parents=True)
+        (kit / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name, header=True):
+                p = self.run_check(script, f"{INCLUDE_NO_SDK};{kit}", via_env=True, system_root=str(win), v_on=True)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("REACHED_NVCC", p.stdout)
+                self.assertIn(f"CWD_AT_NVCC={Path.cwd()}", p.stdout)
+
+    def test_an_unusable_systemroot_is_a_typed_refusal_not_a_search_from_the_callers_directory(self) -> None:
+        # the check runs where.exe from the pushd'd System32. When that directory cannot be entered the check must not fall through to a where.exe in the
+        # caller's current directory (a planted one); it is exit 9, typed.
+        planted = self.tmp / "planted-cwd"
+        planted.mkdir()
+        shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", planted / "where.exe")
+        kit = self.tmp / "Kits-no-sysroot" / "ucrt"
+        kit.mkdir(parents=True)
+        (kit / "corecrt.h").write_text("/* fixture */\n", encoding="ascii")
+        for script in BACKEND_SCRIPTS:
+            with self.subTest(script=script.name):
+                p = self.run_check(script, f"{INCLUDE_NO_SDK};{kit}", via_env=True, system_root=str(self.tmp / "no-such-root"), cwd=planted)
+                self.assertEqual(p.returncode, 9, p.stdout + p.stderr)
+                self.assertIn("FAIL step=msvcEnvironment reason=SYSTEMROOT_UNUSABLE", p.stdout)
+                self.assertNotIn("REACHED_NVCC", p.stdout)
+
     def run_check(self, script: Path, include: str | None, via_env: bool = False, pathext: str | None = None,
-                  system_root: str | None = None) -> subprocess.CompletedProcess:
+                  system_root: str | None = None, v_on: bool = False, cwd: Path | None = None) -> subprocess.CompletedProcess:
         # via_env: INCLUDE arrives in the process environment exactly as given (quotes and '&' included), as vcvars64 leaves it, not via a set line
         cmd = self.tmp / "check.cmd"
         head = [] if via_env else ([f'set "INCLUDE={include}"'] if include is not None else ['set "INCLUDE="'])
         # where nvcc would run: PATHEXT is the caller's again and delayed expansion is off (a literal !MLV_INC! is not expanded)
         tail = ["echo REACHED_NVCC", "echo PATHEXT_AT_NVCC=%PATHEXT%", "echo DELAYED_AT_NVCC=!MLV_INC!",
-                "if defined MLV_WHERE (echo WHERE_VAR_AT_NVCC=defined) else (echo WHERE_VAR_AT_NVCC=undefined)", "exit /b 0"]
+                "echo CWD_AT_NVCC=%CD%", "exit /b 0"]
         body = ["@echo off"] + head + self.check_lines(script) + tail
         cmd.write_text("\r\n".join(body) + "\r\n", encoding="ascii")
         env = dict(os.environ)
@@ -344,7 +404,9 @@ class BackendCmdUcrtCheckTests(_Pwsh):
             env["PATHEXT"] = pathext
         if system_root is not None:
             env["SYSTEMROOT"] = system_root  # dict(os.environ) keys are upper-case on Windows; a second 'SystemRoot' key would be ambiguous
-        return subprocess.run(["cmd.exe", "/d", "/c", str(cmd)], capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL)
+        # v_on: cmd /v:on stands in for HKCU\Software\Microsoft\Command Processor\DelayedExpansion=1 (delayed expansion ON by default)
+        args = ["cmd.exe", "/d"] + (["/v:on"] if v_on else []) + ["/c", str(cmd)]
+        return subprocess.run(args, capture_output=True, text=True, timeout=60, env=env, stdin=subprocess.DEVNULL, cwd=cwd)
 
     def test_adversary_9f89_a1_a_quoted_entry_with_an_ampersand_still_reaches_the_typed_refusal(self) -> None:
         # adversary pass on 9f89f0a1, A1: INCLUDE=C:\missing;"C:\SDK & Kits\ucrt" broke the for-list ('& was unexpected') before the exit-9 guard
