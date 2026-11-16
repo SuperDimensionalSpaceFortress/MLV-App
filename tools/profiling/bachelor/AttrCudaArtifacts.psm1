@@ -614,9 +614,13 @@ function Enter-AttrCudaStageLock {
     try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
     if (-not $held) {
         $waited = $true
-        Write-Host ('STAGE_LOCK_WAIT ' + $rootId + ' ' + $SourceCommit.ToLowerInvariant() + ' waiting up to ' + [string]$WaitSec + ' s (lock ' + $name + ' is held by another stager of this sha into this agent root)')
+        # r20 (adversary pass 21 A2 on f28b4f7e): WaitOne takes an Int32 of milliseconds, so $WaitSec * 1000 past 2147483647 (a -WaitSec of 2147484 or more) made the native
+        # wait refuse its argument and the call THROW, and a negative one threw too (only -1, "forever", is a valid negative timeout). The wait is clamped to
+        # [0, Int32.MaxValue] ms (about 24.8 days): the typed held/waited answer is kept, and 1800 s (production) is unchanged.
+        $waitMs = $(if ($WaitSec -le 0) { 0 } elseif ($WaitSec -ge 2147483) { [int]::MaxValue } else { $WaitSec * 1000 })
+        Write-Host ('STAGE_LOCK_WAIT ' + $rootId + ' ' + $SourceCommit.ToLowerInvariant() + ' waiting up to ' + [string]($waitMs / 1000) + ' s (lock ' + $name + ' is held by another stager of this sha into this agent root)')
         if ($WaitMarkerPath) { [IO.File]::WriteAllText($WaitMarkerPath, $name) }
-        try { $held = $mutex.WaitOne($WaitSec * 1000) } catch [Threading.AbandonedMutexException] { $held = $true }
+        try { $held = $mutex.WaitOne($waitMs) } catch [Threading.AbandonedMutexException] { $held = $true }
     }
     [pscustomobject]@{ name = $name; held = $held; waited = $waited; mutex = $mutex; root = $dosFinal; rootHandle = $rootHandle }
 }

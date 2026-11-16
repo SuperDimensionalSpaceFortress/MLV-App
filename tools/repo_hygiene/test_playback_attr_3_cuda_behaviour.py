@@ -1615,6 +1615,61 @@ class StagedBuildNeverReplacedTests(_PwshCase):
             name="r14-fix2-a2-long.ps1")
         self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
 
+    def test_r20_a2_a_contended_wait_in_seconds_that_overflows_int32_milliseconds_returns_a_typed_result(self) -> None:
+        # r20 (adversary pass 21 A2 on f28b4f7e, AttrCudaArtifacts.psm1:619): a contended wait did $mutex.WaitOne($WaitSec * 1000). An accepted -WaitSec of 2147484
+        # or more is 2147484000+ ms, past Int32, so the native wait refused the argument and the call THREW instead of answering held=false/true; a negative one
+        # threw the same way (only -1 is a valid negative timeout, and it means "forever"). RED: REFUSED=... for every row below. The wait is clamped to
+        # [0, Int32.MaxValue] ms and the typed held/waited result is kept. Production passes 1800, so its behaviour is unchanged.
+        holders: list[subprocess.Popen] = []
+
+        def hold(seconds: int, tag: str) -> subprocess.Popen:
+            # the previous row's holder (still asleep when its call threw, i.e. when RED) never leaks its lock into this row
+            for old in holders:
+                old.kill()
+                old.communicate()
+            holders.clear()
+            marker = self.tmp / f"r20-a2-{tag}.held"
+            holder = self.tmp / f"r20-a2-holder-{tag}.ps1"
+            holder.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{MODULE}' -Force\n"
+                f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+                f"$l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1\n"
+                "if (-not $l.held) { 'NOT_HELD'; exit 3 }\n"
+                f"[IO.File]::WriteAllText('{marker}', 'x')\n"
+                f"Start-Sleep -Seconds {seconds}\n", encoding="utf-8")
+            proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(holder)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            holders.append(proc)
+            self.addCleanup(lambda: (proc.kill(), proc.communicate()))
+            for _ in range(600):
+                if marker.exists() or proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            self.assertTrue(marker.exists(), f"the holder never took the lock (exit {proc.poll()})")
+            return proc
+
+        def call(wait: str, name: str):
+            return self.run_with_module(
+                f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec {wait}; 'HELD=' + $l.held + ' WAITED=' + $l.waited }} "
+                "catch { 'REFUSED=' + $_.Exception.Message }\n", name=name)
+        # too long for Int32 ms: the holder ends after ten seconds (its abandoned mutex is taken over), so the wait ends with the lock held
+        # (-WaitSec is [int], so a value past Int32 is already refused at parameter binding, before any lock: not a row here)
+        for wait, tag in (("2147484", "first-over"), ("2147483647", "int-max")):
+            with self.subTest(wait=wait):
+                hold(10, tag)
+                proc = call(wait, f"r20-a2-{tag}.ps1")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("REFUSED=", proc.stdout, proc.stdout + proc.stderr)
+        # a negative wait is "do not wait": busy -> held=false, typed, no throw (the holder is still alive)
+        with self.subTest(wait="-5"):
+            hold(30, "negative")
+            proc = call("-5", "r20-a2-negative.ps1")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("HELD=False WAITED=True", proc.stdout, proc.stdout + proc.stderr)
+            self.assertNotIn("REFUSED=", proc.stdout, proc.stdout + proc.stderr)
+
     def test_a_manifest_a_lease_batch_pinned_still_reads_as_its_pin_after_a_second_stage(self) -> None:
         # The batch's own guard (Invoke-VenueLeaseBatch.ps1:1258 / :1393) reads Get-VenueStagedBuildManifest and compares it to the
         # sha256 its plan pinned when the lease opened; any other answer is BUILD_MANIFEST_MISMATCH.
