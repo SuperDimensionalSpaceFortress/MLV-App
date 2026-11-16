@@ -1585,20 +1585,33 @@ function Get-DvLookLabelEvidence {
     (windowed); `expectedText` is what the app derived from the look in force; `surface` is fullscreen_gpu_window / fullscreen_cpu_viewport / windowed_status_bar / none.
     `lookLabelShown` is true only when the surface is not none and it shows the expected, non-empty text. Informational: it never blocks a leg (a build without the
     line reports lookLabelShown=false with source 'absent from the run log'). Pure.
+    LOOK-LABEL-PLAYBACK-INFO-1: also the playback-info lines drawn under the look line -- infoShownText / infoExpectedText / infoFields, from the fields the app
+    appends after wait_ms= (null on a build that does not print them) -- and a `playing` block from the LAST gui_smoke.look_label_playing line (what the corner
+    drew while playing; null when absent). Informational only: neither ever blocks a leg nor changes lookLabelShown.
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $m = $null
+    $p = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         foreach ($line in ($LogText -split "`r?`n")) {
-            if ($line -match 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)') {
+            if ($line -match 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?') {
                 $m = $Matches.Clone()
+            }
+            elseif ($line -match 'gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\d+)') {
+                $p = $Matches.Clone()
             }
         }
     }
+    $playing = $null
+    if ($null -ne $p) {
+        $playing = [ordered]@{ shownText = [string]$p['shown']; infoShownText = [string]$p['infoShown']; surface = [string]$p['surface']; samples = [int]$p['samples'] }
+    }
     if ($null -eq $m) {
         return [ordered]@{ source = 'absent from the run log'; lookLabelShown = $false; shownText = $null; expectedText = $null; surface = $null
-                           showInFullscreen = $null; waitMs = $null; reason = 'the run log has no gui_smoke.look_label line' }
+                           showInFullscreen = $null; waitMs = $null; reason = 'the run log has no gui_smoke.look_label line'
+                           infoShownText = $null; infoExpectedText = $null; infoFields = $null; playing = $playing }
     }
+    $infoPresent = $m.ContainsKey('infoFields') -and $null -ne $m['infoFields']
     $shown = [string]$m['shown']
     $expected = [string]$m['expected']
     $surface = [string]$m['surface']
@@ -1615,6 +1628,10 @@ function Get-DvLookLabelEvidence {
         showInFullscreen = ([int]$m['sif'] -eq 1)
         waitMs = [int]$m['wait']
         reason = $reason
+        infoShownText = $(if ($infoPresent) { [string]$m['infoShown'] } else { $null })
+        infoExpectedText = $(if ($infoPresent) { [string]$m['infoExpected'] } else { $null })
+        infoFields = $(if ($infoPresent) { [string]$m['infoFields'] } else { $null })
+        playing = $playing
     }
 }
 

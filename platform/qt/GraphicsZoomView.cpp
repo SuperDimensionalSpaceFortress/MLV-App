@@ -47,11 +47,40 @@ bool GraphicsZoomView::isZoomEnabled()
 }
 
 //LOOK-FULLSCREEN-PARITY-1: set the corner look label ("" hides it); repaints once
+//LOOK-LABEL-PLAYBACK-INFO-1: only the union of the old and new label rects, never the whole viewport -- unless a handed-over
+//frame is still waiting for its paint: paintEvent credits that frame as on screen (r28-r30), so that paint must draw all of it.
 void GraphicsZoomView::setLookLabel(const QString &text)
 {
     if( m_lookLabelText == text ) return;
+    const QRect before = refreshLookLabelPixmap();
     m_lookLabelText = text;
-    viewport()->update();
+    const QRect after = refreshLookLabelPixmap();
+    const QRect dirty = before.united( after );
+    if( m_pixmapPendingSerial != m_pixmapPaintedSerial || dirty.isEmpty() ) viewport()->update();
+    else viewport()->update( dirty );
+}
+
+QRect GraphicsZoomView::refreshLookLabelPixmap()
+{
+    if( m_lookLabelText.isEmpty() ) return QRect();
+    const qreal dpr = viewport()->devicePixelRatioF();
+    const QSize deviceSize( qRound( viewport()->width() * dpr ), qRound( viewport()->height() * dpr ) );
+    const int fontPx = look_label::fontPixels( deviceSize.height() );
+    if( m_lookLabelPixmapText != m_lookLabelText || m_lookLabelPixmapFontPx != fontPx || m_lookLabelPixmapDpr != dpr )
+    {
+        m_lookLabelPixmap = QPixmap::fromImage( renderLookLabelOverlayImage( m_lookLabelText, fontPx ) );
+        m_lookLabelPixmap.setDevicePixelRatio( dpr );
+        m_lookLabelPixmapText = m_lookLabelText;
+        m_lookLabelPixmapFontPx = fontPx;
+        m_lookLabelPixmapDpr = dpr;
+    }
+    if( m_lookLabelPixmap.isNull() ) return QRect();
+    const QRect deviceRect = look_label::overlayRect( deviceSize, m_lookLabelPixmap.size(),
+                                                      look_label::marginPixels( fontPx ) );
+    if( deviceRect.isEmpty() ) return QRect();
+    // Logical pixels, widened by one so a fractional dpr never leaves an undrawn edge.
+    return QRectF( deviceRect.x() / dpr, deviceRect.y() / dpr, deviceRect.width() / dpr, deviceRect.height() / dpr )
+        .toAlignedRect().adjusted( -1, -1, 1, 1 );
 }
 
 //Blit the cached look label in the viewport's bottom-right corner. The frame's own repaints
@@ -65,15 +94,7 @@ void GraphicsZoomView::drawForeground(QPainter *painter, const QRectF &rect)
     const qreal dpr = viewport()->devicePixelRatioF();
     const QSize deviceSize( qRound( viewport()->width() * dpr ), qRound( viewport()->height() * dpr ) );
     const int fontPx = look_label::fontPixels( deviceSize.height() );
-    if( m_lookLabelPixmapText != m_lookLabelText || m_lookLabelPixmapFontPx != fontPx || m_lookLabelPixmapDpr != dpr )
-    {
-        m_lookLabelPixmap = QPixmap::fromImage( renderLookLabelOverlayImage( m_lookLabelText, fontPx ) );
-        m_lookLabelPixmap.setDevicePixelRatio( dpr );
-        m_lookLabelPixmapText = m_lookLabelText;
-        m_lookLabelPixmapFontPx = fontPx;
-        m_lookLabelPixmapDpr = dpr;
-    }
-    if( m_lookLabelPixmap.isNull() ) return;
+    if( refreshLookLabelPixmap().isEmpty() ) return;
     const QRect deviceRect = look_label::overlayRect( deviceSize, m_lookLabelPixmap.size(),
                                                       look_label::marginPixels( fontPx ) );
     if( deviceRect.isEmpty() ) return;

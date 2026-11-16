@@ -75,6 +75,9 @@ protected:
     void setPipetteCursor();
     void drawForeground(QPainter *painter, const QRectF &rect) override;
     void scrollContentsBy(int dx, int dy) override;
+    // LOOK-LABEL-PLAYBACK-INFO-1: brings the cached label pixmap up to date with m_lookLabelText and returns where it
+    // sits, in viewport (logical) pixels; empty when there is no label.
+    QRect refreshLookLabelPixmap(void);
     QString m_lookLabelText;
     QString m_lookLabelPixmapText;
     int m_lookLabelPixmapFontPx = 0;

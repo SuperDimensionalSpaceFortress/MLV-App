@@ -33,6 +33,7 @@
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "LookAssistAnalysisPump.h"
 #include "LookLabelPolicy.h"                        // look_label::LabelGrade member below (r16)
+#include "PlaybackInfoLabelPolicy.h"                // playback_info_label::Toggles member below
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
@@ -866,6 +867,16 @@ private:
     QString m_lookLabelText;                // the text both labels show (updateLookLabel)
     bool m_lookLabelFullscreenShown = false;
     bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
+    // LOOK-LABEL-PLAYBACK-INFO-1 (updatePlaybackInfoLabel): the info lines, the corner text actually pushed, the twin.
+    QLabel *m_pPlaybackInfoStatus = nullptr;
+    QString m_playbackInfoText;             // overlay form (with fps)
+    QString m_playbackInfoStatusText;       // status-bar twin form (no fps)
+    QString m_lookLabelOverlayText;         // what the corner surface was asked to draw (look line + info lines)
+    bool m_lookLabelOverlayGpuWindow = false;
+    playback_info_label::Toggles m_playbackInfoToggles;
+    QString m_lookLabelPlayingShown;        // the last drawn corner text sampled at the fps hook while playing
+    QString m_lookLabelPlayingSurface;
+    int m_lookLabelPlayingSamples = 0;
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
     // Phase 4F-toolbar: Playback Quality dropdown on the main toolbar. The
     // button is a second view onto the same Playback Quality QActions used
@@ -2299,6 +2310,16 @@ private:
     // The look label text actually on screen now, and where ("fullscreen_gpu_window",
     // "fullscreen_cpu_viewport", "windowed_status_bar" or "none"): the receipt's lookLabelShown.
     QString lookLabelShownText( QString *surface );
+    // LOOK-LABEL-PLAYBACK-INFO-1: the info lines under the fullscreen look label (pipeline, scale, debayer, fps, Dual-ISO,
+    // resolution) and their status-bar twin (no fps). Change-only: composes only while the overlay is shown or the twin is
+    // visible, and pushes only when a text or the overlay route changed.
+    void updatePlaybackInfoLabel( void );
+    // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
+    void pushLookLabelOverlay( void );
+    playback_info_label::Facts playbackInfoFacts( void );
+    // The presented pipeline status and the scope caveat, shared by the toolbar indicator and the info label.
+    void presentedGpuPlaybackPipelineStatus( GpuPlaybackPipelineStatus &status, bool &scopePerformanceCaveat ) const;
+    void setPlaybackInfoToggle( bool playback_info_label::Toggles::*field, bool on );
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );

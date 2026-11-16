@@ -53,6 +53,25 @@ public:
         }
     }
 
+    /*! \brief LOOK-LABEL-PLAYBACK-INFO-1: the fullscreen info label's word: "Full", "Half",
+     *  "Quarter", "Eighth", else "1/N". */
+    static QString fractionWord( int scaleFactor )
+    {
+        switch( scaleFactor )
+        {
+            case 1:
+                return QCoreApplication::translate( "PlaybackScaleLabel", "Full" );
+            case 2:
+                return QCoreApplication::translate( "PlaybackScaleLabel", "Half" );
+            case 4:
+                return QCoreApplication::translate( "PlaybackScaleLabel", "Quarter" );
+            case 8:
+                return QCoreApplication::translate( "PlaybackScaleLabel", "Eighth" );
+            default:
+                return QCoreApplication::translate( "PlaybackScaleLabel", "1/%1" ).arg( scaleFactor );
+        }
+    }
+
     /*! \brief Toolbar playback-quality indicator text (SCALE-LABEL-INDICATOR-PIN-1):
      *  requested == active -> shortLabel(requested); otherwise "<requested>-><active>"
      *  with both sides in shortLabel words. Callers pass active == requested when the

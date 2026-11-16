@@ -5805,6 +5805,36 @@ class LookLabelEvidenceTests(unittest.TestCase):
         app = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
         self.assertIn('gui_smoke.look_label shown=\\"%1\\" expected=\\"%2\\" surface=%3 show_in_fullscreen=%4 wait_ms=%5', app)
 
+    # LOOK-LABEL-PLAYBACK-INFO-1: the info lines are appended after wait_ms=, and the playing sample is its own line. Both informational.
+    def test_an_old_line_without_info_fields_still_parses(self) -> None:
+        v = self.evidence(self.line("Look: Cinematic", "Look: Cinematic", "fullscreen_gpu_window") + "\n")
+        self.assertEqual((v["lookLabelShown"], v["shownText"], v["waitMs"]), (True, "Look: Cinematic", 17))
+        self.assertEqual((v["infoShownText"], v["infoExpectedText"], v["infoFields"], v["playing"]), (None, None, None, None))
+
+    def test_a_new_line_parses_every_info_field_and_the_playing_block(self) -> None:
+        # ASCII separators here: the harness passes the log through an environment variable, which does not keep U+00B7 on Windows.
+        info = "GPU display GPU Tex NR - Full - AMaZE (GPU) / 24 fps - DF on - Dual-ISO on - 1920x1080"
+        line = (self.line("Look: Cinematic", "Look: Cinematic", "fullscreen_gpu_window")
+                + f' info_shown="{info}" info_expected="{info}" info_fields=pipeline,scale,debayer,fps,dual_iso,resolution')
+        playing = ('gui_smoke.look_label_playing shown="Look: Cinematic" info_shown="GPU display GPU Tex NR - Full / 23.9/24 fps - DF on"'
+                   ' surface=fullscreen_gpu_window samples=88')
+        v = self.evidence(line + "\n" + playing + "\n")
+        self.assertEqual((v["lookLabelShown"], v["shownText"], v["expectedText"], v["waitMs"]), (True, "Look: Cinematic", "Look: Cinematic", 17))
+        self.assertEqual((v["infoShownText"], v["infoExpectedText"], v["infoFields"]),
+                         (info, info, "pipeline,scale,debayer,fps,dual_iso,resolution"))
+        self.assertEqual(v["playing"], {"shownText": "Look: Cinematic", "infoShownText": "GPU display GPU Tex NR - Full / 23.9/24 fps - DF on",
+                                        "surface": "fullscreen_gpu_window", "samples": 88})
+
+    def test_info_never_blocks_or_changes_look_label_shown(self) -> None:
+        line = self.line("Look: Off", "Look: Off", "windowed_status_bar") + ' info_shown="" info_expected="" info_fields=none'
+        v = self.evidence(line + "\n")
+        self.assertEqual((v["lookLabelShown"], v["infoShownText"], v["infoFields"]), (True, "", "none"))
+        v = self.evidence('gui_smoke.look_label_playing shown="" info_shown="" surface=none samples=0\n')
+        self.assertEqual((v["lookLabelShown"], v["source"], v["playing"]["samples"]), (False, "absent from the run log", 0))
+        app = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertIn('info_shown=\\"%6\\" info_expected=\\"%7\\" info_fields=%8', app)
+        self.assertIn('gui_smoke.look_label_playing shown=\\"%1\\" info_shown=\\"%2\\" surface=%3 samples=%4', app)
+
 
 @requires_windows_pwsh
 class LookAssistEvidenceTests(unittest.TestCase):
