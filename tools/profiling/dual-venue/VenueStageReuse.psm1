@@ -3,7 +3,8 @@
 # ORIGIN. The three functions below are copied, logic unchanged, from the untracked lane helper tools\venue-reuse-check.ps1, which lanes copied word for
 # word from run dir to run dir (LOOK-FULLSCREEN-PARITY-1 r3/r4 -> RECON-WARM-RUN-1 -> FIRST-AMAZE-AT-PLAY-1 -> FIRST-PRESENT-WARM-OUTPUT-REUSE-1 ->
 # PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r1, .claude-state\fleet-runs\lane-PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1-r1-20261018T1115Z\tools\
-# venue-reuse-check.ps1 lines 7-75). Only this header is new; the bodies are byte-for-byte the lane copy.
+# venue-reuse-check.ps1 lines 7-75). Only this header is new; the bodies are byte-for-byte the lane copy, except the SmokeRunner OK pin, which also takes the
+# job's ALREADY=1 form (SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1).
 #
 # WHAT THEY ANSWER, READ-ONLY. A stage / DLL-pair JobId is single-use (UmRunDrop refuses a reused one with UMRUN_JOBID_IN_USE) and is derived from the build sha
 # only. These functions read ONE outbox result.json (and, for a DLL pair, its artifacts manifest) BY NAME and say whether that earlier result was a clean run
@@ -49,7 +50,9 @@ function Get-StageReuse {
         $jm = [regex]::Match($JobId, '^attr3-stage-smoke-runner-([0-9a-f]{12})-([0-9a-f]{12})$')
         if (-not $jm.Success) { return (& $no 'smoke-jobId-shape') }
         if ($jm.Groups[1].Value -cne $Sha.Substring(0, 12)) { return (& $no "smoke-jobId-sha12-mismatch ($($jm.Groups[1].Value))") }
-        $m = [regex]::Match($stdout, '(?m)^RESULT=SMOKE_RUNNER_STAGE_OK CACHE_DIR=(smoke-runner-[0-9a-f]{16})(?=\s|$)')
+        # SMOKE-RUNNER-STAGE-OK-ALREADY-TOKEN-1: the job prints two OK forms, the fresh one and, when the cache already holds the closure,
+        # 'RESULT=SMOKE_RUNNER_STAGE_OK ALREADY=1 CACHE_DIR=...' (attr3-stage-smoke-runner-job.ps1 Complete-AlreadyStaged). Exactly those two.
+        $m = [regex]::Match($stdout, '(?m)^RESULT=SMOKE_RUNNER_STAGE_OK(?: ALREADY=1)? CACHE_DIR=(smoke-runner-[0-9a-f]{16})(?=\s|$)')
         if (-not $m.Success) { return (& $no 'no-RESULT=SMOKE_RUNNER_STAGE_OK-line') }
         if (-not $m.Groups[1].Value.StartsWith('smoke-runner-' + $jm.Groups[2].Value, [StringComparison]::Ordinal)) { return (& $no "CACHE_DIR-closure-mismatch ($($m.Groups[1].Value))") }
         $line = $m.Value
@@ -59,12 +62,22 @@ function Get-StageReuse {
 }
 
 function Get-DllPairReuse {
+    # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: -JobIdSuffix (opt-in) looks up <JobId>-<suffix> instead, the id
+    # playback-attr-3-cuda-dll-job.ps1 -JobIdSuffix emits, so a sha whose default id holds a FAILED result can be
+    # built again and then reused. Every check below runs against the looked-up id; a failed result is never reusable
+    # under either id. The suffix rule is AttrCudaArtifacts.psm1 Get-AttrCudaDllPairJobId's. JobId names the id looked up.
     param(
         [Parameter(Mandatory = $true)][string]$Outbox,
         [Parameter(Mandatory = $true)][string]$JobId,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$Sha
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$Sha,
+        [AllowEmptyString()][string]$JobIdSuffix = ''
     )
-    $no = { param($why) [pscustomobject]@{ Reusable = $false; Reason = $why; EndedUtc = $null; Line = $null; ArtifactsDir = $null } }
+    # r27 merge: a length test, never -ne '' (a culture comparison: '<U+200B>' -ne '' is false, which would skip the suffix check below and look up the default id)
+    if (-not [string]::IsNullOrEmpty($JobIdSuffix)) {
+        if ($JobIdSuffix -cnotmatch '^(?=.{1,32}\z)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\z') { throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must be 1-32 characters of alphanumeric runs joined by single hyphens; got '$JobIdSuffix'" }
+        $JobId = "$JobId-$JobIdSuffix"
+    }
+    $no = { param($why) [pscustomobject]@{ Reusable = $false; Reason = $why; EndedUtc = $null; Line = $null; ArtifactsDir = $null; JobId = $JobId } }
     $resultPath = Join-Path $Outbox "$JobId.result.json"
     $art = Join-Path $Outbox "$JobId.artifacts"
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { return (& $no 'result-missing') }
@@ -84,7 +97,7 @@ function Get-DllPairReuse {
     # r24 (adversary pass-26 A2): ordinal, never -cne (a culture comparison that ignores U+200B; the case-sensitive operators included)
     if (-not [string]::Equals([string]$man.sourceCommit, $Sha, [StringComparison]::Ordinal)) { return (& $no "manifest-sourceCommit-mismatch ($([string]$man.sourceCommit))") }
     if (-not [string]::Equals([string]$man.jobId, $JobId, [StringComparison]::Ordinal)) { return (& $no "manifest-jobId-mismatch ($([string]$man.jobId))") }
-    [pscustomobject]@{ Reusable = $true; Reason = 'dll-pair-already-built'; EndedUtc = [string]$r.endedUtc; Line = $m.Value.TrimEnd(); ArtifactsDir = $art }
+    [pscustomobject]@{ Reusable = $true; Reason = 'dll-pair-already-built'; EndedUtc = [string]$r.endedUtc; Line = $m.Value.TrimEnd(); ArtifactsDir = $art; JobId = $JobId }
 }
 
 Export-ModuleMember -Function Test-UmRunJobIdInUseMessage, Get-StageReuse, Get-DllPairReuse

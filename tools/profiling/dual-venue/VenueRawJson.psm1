@@ -9,7 +9,7 @@
 # FAIL CLOSED (r14, adversary r13 A2/A3/A4, Dot I1). The raw id is recovered EXACTLY or not at all. Callers read `.leaseId` / `.token`, which PowerShell matches without regard to case, so
 # the property name is matched the same way here (a `LeaseId` is the lease id); two identity properties that differ only by case, a one-element root array (which ConvertFrom-Json
 # unwraps to its element, so no restoration shape applies), text System.Text.Json rejects but ConvertFrom-Json accepted (single quotes, ...) and any shape disagreement between the two
-# parses are NOT exact. A reading that is not exact has NO identity anywhere in it (every leaseId / token is $null, never a converted or guessed one), and says so: callers that
+# parses, and an identity that is not a JSON string or null (a number, boolean, array or object), are NOT exact. A reading that is not exact has NO identity anywhere in it (every leaseId / token is $null, never a converted or guessed one), and says so: callers that
 # group receipts (Read-VenueLegHeatHistory) treat it as a barrier that still needs its on-lease proof, and every ordinal comparison of an absent id simply fails.
 
 function Test-VenueIdentityName {
@@ -33,7 +33,9 @@ function Restore-VenueRawIdentity {
                 if ($seen.ContainsKey($p.Name)) { $ok = $false; continue }
                 $seen[$p.Name] = $true
                 $vk = $p.Value.ValueKind
-                $prop.Value = $(if ($vk -eq [System.Text.Json.JsonValueKind]::String) { $p.Value.GetString() } elseif ($vk -eq [System.Text.Json.JsonValueKind]::Null) { $null } else { $p.Value.GetRawText() })
+                # LEASE-BATCH-IDLE-END-UNSEEN-1 r2 (adversary A1): an identity is a JSON string (or null). A number, boolean, array or object is no identity at all, never its raw TEXT
+                # (an all-digit token 123456789012 read as '123456789012' matched the batch's token): the reading is not exact, so every identity in it is cleared.
+                if ($vk -eq [System.Text.Json.JsonValueKind]::String) { $prop.Value = $p.Value.GetString() } elseif ($vk -eq [System.Text.Json.JsonValueKind]::Null) { $prop.Value = $null } else { $ok = $false }
             } elseif (-not (Restore-VenueRawIdentity -Obj $prop.Value -Element $p.Value)) { $ok = $false }
         }
         return $ok

@@ -76,6 +76,22 @@ class RawIdentityReaderTests(unittest.TestCase):
         got = read("{'leaseId': '2026-10-30T10:00:00Z', 'token': 't'}")
         self.assertEqual((got["exact"], got["leaseId"], got["leaseType"], got["token"]), (False, None, "null", None), got)
 
+    def test_lease_batch_idle_end_r2_adversary_a1_an_identity_that_is_not_a_json_string_is_not_exact_and_carries_no_identity(self) -> None:
+        # adversary r2 A1 on 92c08033: a number, boolean, array or object under token / leaseId was written back as its raw TEXT ('123456789012', '["L1"]'), so it passed a
+        # scalar-string check and could equal a requested id. The writer only ever emits strings: anything else is no identity, at any depth.
+        for value in (123456789012, 1, True, False, ["L1"], {"id": "L1"}):
+            for name in ("token", "leaseId"):
+                with self.subTest(name=name, value=value):
+                    other = "leaseId" if name == "token" else "token"
+                    got = read(json.dumps({name: value, other: "s"}))
+                    self.assertEqual((got["exact"], got["leaseId"], got["token"]), (False, None, None), got)
+                    nested = read(json.dumps({"admission": {"leaseBatch": {name: value, other: "s"}}}))
+                    self.assertEqual((nested["exact"], nested["leaseId"], nested["token"]), (False, None, None), nested)
+
+    def test_lease_batch_idle_end_r2_a_null_identity_stays_an_exact_reading_with_no_identity(self) -> None:
+        got = read(json.dumps({"leaseId": None, "token": "t"}))
+        self.assertEqual((got["exact"], got["leaseId"], got["token"]), (True, None, "t"), got)
+
     def test_a_reading_without_identity_fields_is_exact(self) -> None:
         got = read('{"exitCode": 0, "stdout": "x"}')
         self.assertEqual((got["exact"], got["leaseId"]), (True, None), got)

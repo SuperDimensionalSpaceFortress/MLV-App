@@ -150,9 +150,36 @@ function Write-CudaBackendArchitectureSidecar {
 # nvcc -shared emits the .dll AND the import .lib/.exp automatically.
 # --fmad=false for IEEE float parity with the CPU oracle (same as parity probe).
 $cmdFile = Join-Path $env:TEMP 'build_backend_dll.cmd'
+# The where.exe hit list is a temp file named by a per-run GUID that THIS script generates and writes into the .cmd text (adversary pass 13: a name built
+# from cmd's RANDOM variable was predictable when RANDOM is defined in the environment, was shared by concurrent backends, and the variable itself was
+# expanded from the inherited environment). A name no other process can know or share needs no pre-existing-file, directory or concurrency handling.
+$hitId = [guid]::NewGuid().ToString('N')
 @(
     '@echo off',
     "call `"$vcvars`" >nul",
+    # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: an INCLUDE without the SDK's corecrt.h (an overgrown PATH broke winsdk.bat on 2026-11-15) is exit 9, typed,
+    # before nvcc -- never a bare C1083 at compile time. INCLUDE never reaches a command line (a long one overflowed cmd's 8191-character limit, exit 1):
+    # where.exe reads the list from its own environment, first as is (no size limit), then with quotes stripped by DELAYED expansion (& and ! in the
+    # value are not re-parsed; past cmd's limit that copy is empty, so a quoted header entry in an over-long INCLUDE is refused typed, never exit 1).
+    # where matches files only, so a DIRECTORY named corecrt.h is not the header. where also appends each PATHEXT extension, so both calls run with
+    # PATHEXT cleared (a corecrt.h.cmd is not the header). A NAME IS NOT A READABLE HEADER (adversary A1 on 8f761e39): where finds a file another process
+    # holds exclusively without opening it, so each hit is TYPEd to nul and counts only if that open succeeds; a locked corecrt.h is exit 9, not C1083.
+    # The loops run with delayed expansion OFF so a '!' in a found path reaches `type` unchanged; only the quote-strip copy is made with it ON. The four
+    # setlocals unwind in one line, which carries only the verdict out and, before nvcc, gives PATHEXT and the delayed-expansion default back.
+    # NO PATH DERIVED FROM SystemRoot REACHES A RE-PARSED COMMAND LINE (adversary A1+A2 on 48fb6bf9): a FOR /F command string is parsed again by a child cmd,
+    # which expands a literal %OS% in C:\Win%OS%, and a line read under delayed expansion ON (the registry default) expands !OS! in C:\Win!OS!. So the first
+    # command turns delayed expansion off, and where.exe is run DIRECTLY by the batch, by its absolute path (one parse, a value is not re-scanned), with its hit
+    # list written to a temp file that the FOR /F then READS (a file name is not a command string). The current directory never changes (adversary A1 on
+    # a256baf1: a pushd into System32 made a relative INCLUDE entry resolve there). A System32 without where.exe is exit 9 typed (SYSTEMROOT_UNUSABLE).
+    'setlocal DisableDelayedExpansion & set "MLV_UCRT_OK=" & set "MLV_INC=" & set "MLV_HITS=%TEMP%\mlv_ucrt_hits___MLV_HIT_ID__.txt" & if not exist "%SystemRoot%\System32\where.exe" (echo FAIL step=msvcEnvironment reason=SYSTEMROOT_UNUSABLE SystemRoot System32 has no where.exe& exit /b 9)'.Replace('__MLV_HIT_ID__', $hitId),
+    'setlocal DisableDelayedExpansion & set "PATHEXT=" & set "MLV_INC=" & if not defined INCLUDE set "INCLUDE=;"',
+    '"%SystemRoot%\System32\where.exe" $INCLUDE:corecrt.h >"%MLV_HITS%" 2>nul && for /f "usebackq delims=" %%F in ("%MLV_HITS%") do if /i "%%~nxF"=="corecrt.h" type "%%F" >nul 2>&1 && set "MLV_UCRT_OK=1"',
+    'setlocal EnableDelayedExpansion & set "MLV_INC="',
+    'set "MLV_INC=!INCLUDE:"=!"',
+    'setlocal DisableDelayedExpansion & rem MLV_INC is copied into this scope, which reads no variable by !name!',
+    'if not defined MLV_UCRT_OK "%SystemRoot%\System32\where.exe" $MLV_INC:corecrt.h >"%MLV_HITS%" 2>nul && for /f "usebackq delims=" %%F in ("%MLV_HITS%") do if /i "%%~nxF"=="corecrt.h" type "%%F" >nul 2>&1 && set "MLV_UCRT_OK=1"',
+    'del /f /q "%MLV_HITS%" 2>nul & endlocal & endlocal & endlocal & endlocal & set "MLV_UCRT_OK=%MLV_UCRT_OK%"',
+    'if not defined MLV_UCRT_OK (echo FAIL step=msvcEnvironment reason=INCLUDE_LACKS_UCRT no INCLUDE entry holds corecrt.h after vcvars64& exit /b 9)',
     'echo === building igpu_recon_cuda.dll (nvcc -shared --fmad=false, exports via .def) ===',
     "`"$nvcc`" $archArgLine -O3 --fmad=false -shared -allow-unsupported-compiler -Xcompiler `"/MD`" -Xlinker `"/DEF:$def`" -I `"$Dir`" -I `"$gpuRoot`" `"$src`" -o `"$dll`"",
     'if errorlevel 1 exit /b 11',

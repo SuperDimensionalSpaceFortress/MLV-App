@@ -496,6 +496,7 @@ HEADERS += MainWindow.h \
     GraphicsZoomView.h \
     PreviewPaintTiming.h \
     GuiPresentGapIdle.h \
+    GuiHopWaitSplit.h \
     DarkStyle.h \
     JumpSlider.h \
     AudioPlayback.h \

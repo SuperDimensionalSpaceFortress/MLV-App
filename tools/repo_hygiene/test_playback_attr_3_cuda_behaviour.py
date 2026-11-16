@@ -5955,6 +5955,9 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Initialize-AttrCudaFileIdNative",
             "ConvertTo-AttrCudaFileIdObject",
             "Get-AttrCudaFileId",
+            # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1: the minimal build PATH and the post-vcvars INCLUDE check.
+            "Get-AttrCudaMinimalBuildPath",
+            "Test-AttrCudaMsvcInclude",
         ),
         ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-stage-job.ps1": (
             "Get-AttrCudaArtifactNames",
