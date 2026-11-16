@@ -8,8 +8,10 @@ new spelling. This guard changes the SHAPE: it denies the NAME by default and le
 GRAMMAR (what this test reads)
   1. Files: every git-tracked file whose name ends in .ps1 or .psm1, in any letter case (`git ls-files`, the index, with every GIT_* variable but GIT_EXEC_PATH
      dropped so a hook's GIT_DIR cannot point it at another repository).
-  2. Text: the file's bytes with NUL bytes, backticks, quote characters and a backtick-newline continuation removed, read as Latin-1. So UTF-16 / UTF-32 with or
-     without a BOM, `Win32_Pro`cess` and `Win32_Pro"cess"` read as the plain name. Comments, strings and here-strings are NOT skipped: a name anywhere counts.
+  2. Text: the file's bytes read under every code in _READINGS (UTF-8, cp1252, UTF-16 and UTF-32 of either byte order, with or without a BOM, and a NUL-stripped
+     Latin-1), each with backticks, a backtick-newline continuation, NULs and every quote PowerShell recognises (' " and the typographic U+2018..U+201E) removed.
+     So `Win32_Pro`cess`, `Win32_Pro"cess"` and `Win32_Pro` + a typographic quote pair + `cess` read as the plain name. Comments, strings and here-strings are NOT
+     skipped: a name in any reading counts.
   3. Refused name (case-insensitive substring): `win32_process` (this also reads Win32_Processor, Win32_ProcessStartup and Win32_ProcessTrace), `wmic` (this also
      reads `wmiclass`, the [wmiclass] cast), and a wildcard or character-class prefix of the class name (`Win32_Proc*`, `Win32[_]Process`, `Win32_P%`, `Win32*`).
   4. A file that names one is refused unless tools/coordination/wmi-process-allowlist.txt holds a row `<repo-relative path> | <reason>` for it. The reason is
@@ -21,12 +23,16 @@ GRAMMAR (what this test reads)
      fails the test. That layer needs pwsh and is skipped without it; the deny-by-default layer needs only Python and git.
 
 NOT covered (declared, not promised)
-  - A name built from pieces: `'Win32_' + 'Process'`, `-f`, `[string]::Join`, `$env:` values, reflection. The name is never literal in the file.
+  - A name built from pieces: `'Win32_' + 'Process'`, `-f`, `[string]::Join`, `$env:` values, reflection, and an expansion that evaluates to nothing spliced
+    inside the word (`Win32_Pro$()cess`, `Win32_Pro${e}cess`). The name is never literal in the file.
   - Text produced at run time and then evaluated: Invoke-Expression, [scriptblock]::Create, a decoded -EncodedCommand payload, a downloaded script.
   - A class reached without naming it: a WQL meta_class / __CLASS / __DERIVATION selector, `Get-CimClass *`, `Get-WmiObject -List` with no name.
   - Files that are not .ps1 / .psm1: .cmd, .bat, .py, .cs, .psd1, .ps1xml, workflow YAML, and untracked or gitignored files (the lane scripts under
     .claude-state are guarded board-side).
-  - Encodings that hide ASCII: UTF-7, a code page that does not keep ASCII bytes, a ZIP or gzip inside a tracked file.
+  - Encodings that hide ASCII: UTF-7, a code page that does not keep ASCII bytes (EBCDIC), a ZIP or gzip inside a tracked file. The AST layer reads a file by its
+    BOM only (UTF-32, UTF-16, else UTF-8): a BOM-less UTF-16 file is refused by name but its body is not parsed (PowerShell does not run it as text either).
+  - tests/coordination/test_retire_lane_worktree.py decodes a script as UTF-8 with replacement, so its own launch census misses a UTF-32 script (adversary pass 1 A4,
+    already true on the base): this guard's name rule still refuses such a file, the census is not changed here.
   - A `query-only` row for a file that does call Create in a way the AST scanner (rule D2) cannot see, for example a method name assembled at run time. The row
     is a person's claim and the AST layer a second look, not a proof.
   - Whether a `sanctioned-launcher` file still has the sanctioned shape: no copy is tracked today, so the row exists only so the shape has a place to go.
@@ -48,6 +54,7 @@ SITE_SCANNER = Path(__file__).resolve().with_name("Test-LaunchSites.ps1")
 REASONS = ("query-only", "sanctioned-launcher")
 LAUNCHER_NAME = "Start-HiddenDetached.ps1"
 PWSH = shutil.which("pwsh")
+_QUOTES = "'\"‘’‚‛“”„"
 
 # The class name, a wildcard / character-class prefix of it, and wmic (which also begins `wmiclass`). Applied to text already reduced by _readable().
 _REFUSED = re.compile(r"win32_process|win32(?:_|\[_\])(?:p(?:r(?:o(?:c(?:e(?:s)?)?)?)?)?)?[*?%\[]|win32[*?%\[]|wmic", re.IGNORECASE)
@@ -55,15 +62,27 @@ _REFUSED = re.compile(r"win32_process|win32(?:_|\[_\])(?:p(?:r(?:o(?:c(?:e(?:s)?
 _D2_SITE = re.compile(r"create|win32_process|wmiclass|managementclass|invoke-(?:cim|wmi)method|\bicim\b|\biwmi\b", re.IGNORECASE)
 
 
-def _readable(raw):
-    """The text a reader sees once PowerShell's own spellings are undone: NUL bytes (UTF-16 / UTF-32), a backtick-newline continuation, backticks, quotes."""
-    text = raw.replace(b"\x00", b"").decode("latin-1")
-    text = re.sub(r"`\r?\n", "", text)
-    return text.replace("`", "").replace("'", "").replace('"', "")
+# Every character PowerShell reads as a quote: ' " and the typographic U+2018 U+2019 U+201A U+201B (single) and U+201C U+201D U+201E (double). Quotes spliced into a
+# word are removed from it (`Win32_Pro"cess"`, `Win32_Pro` + U+201C + `cess` + U+201D), as is a backtick; NUL is dropped so a UTF-16 / UTF-32 text without a BOM reads plainly.
+_DROPPED = str.maketrans("", "", "`\x00" + _QUOTES)
+# The codes a file's bytes can be read as. A script is judged under EVERY one: a name any reading shows is a name (over-refusal is advisory, a miss is not).
+# cp1252 is how Windows PowerShell reads a file with no BOM, and it holds the typographic quotes at 0x82 0x84 0x91-0x94.
+_READINGS = ("utf-8", "cp1252", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+
+
+def _readable(text):
+    """The text a reader sees once PowerShell's own spellings are undone: a backtick-newline continuation, backticks, quotes of every kind, NUL."""
+    return re.sub(r"`(?:\r\n|\n|\r)", "", text).translate(_DROPPED)
+
+
+def _readings(raw):
+    yield raw.replace(b"\x00", b"").decode("latin-1")
+    for code in _READINGS:
+        yield raw.decode(code, errors="replace")
 
 
 def names_the_process_class(raw):
-    return _REFUSED.search(_readable(raw)) is not None
+    return any(_REFUSED.search(_readable(text)) is not None for text in _readings(raw))
 
 
 def _git_env():
@@ -125,9 +144,18 @@ def deny_by_default_problems(root, tracked, allow_text):
 
 
 def _decode_for_scanner(raw):
+    """The text PowerShell runs: a BOM names the code (UTF-32 first, its BOM starts with UTF-16's), else UTF-8. Adversary pass 1 A2: UTF-32 read as UTF-16 hid a Create."""
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return raw.decode("utf-32", errors="replace")
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16", errors="replace")
     return raw.decode("utf-8-sig", errors="replace")
+
+
+def unsorted_rows(text):
+    """[problem] for every allowlist row that is not after the row before it in plain code-point order: a reviewer reads one row per file in a stable place."""
+    paths = [(number, line.split("|")[0].strip()) for number, line in enumerate(text.splitlines(), 1) if line.strip() and not line.strip().startswith("#")]
+    return [f"allowlist line {n}: {p} is out of order (after {q})" for (_, q), (n, p) in zip(paths, paths[1:]) if p < q]
 
 
 def create_site_problems(root, query_only):
@@ -168,10 +196,18 @@ def test_no_query_only_file_has_a_wmi_create_site():
     assert problems == [], "\n".join(problems)
 
 
-def test_the_allowlist_is_sorted_so_a_review_sees_one_row_per_file():
-    paths = [p for p, _ in (line.split(" | ") for line in ALLOWLIST.read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#"))]
-    assert len(paths) == len(set(paths)), "a file is listed twice"
-    assert paths, "the seeded allowlist is empty"
+def test_the_real_allowlist_is_sorted_with_one_row_per_file():
+    text = ALLOWLIST.read_text(encoding="utf-8")
+    assert parse_allowlist(text)[0], "the seeded allowlist is empty"
+    assert unsorted_rows(text) == []
+
+
+def test_red_an_unsorted_allowlist_is_refused():
+    rows = ["a/one.ps1 | query-only", "b/two.ps1 | query-only", "c/three.ps1 | query-only"]
+    assert unsorted_rows("# note\n" + "\n".join(rows) + "\n") == []
+    assert unsorted_rows("\n".join(reversed(rows)) + "\n") == ["allowlist line 2: b/two.ps1 is out of order (after c/three.ps1)",
+                                                                "allowlist line 3: a/one.ps1 is out of order (after b/two.ps1)"]
+    assert unsorted_rows("a/one.ps1 | query-only\nA/Upper.ps1 | query-only\n") == ["allowlist line 2: A/Upper.ps1 is out of order (after a/one.ps1)"]
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -216,7 +252,15 @@ NAMING_SPELLINGS = [
     pytest.param("Get-CimInstance Win32_Process\n".encode("utf-16-le"), id="utf16-le-no-bom"),
     pytest.param("Get-CimInstance Win32_Process\n".encode("utf-16-be"), id="utf16-be-no-bom"),
     pytest.param("Get-CimInstance Win32_Process\n".encode("utf-32"), id="utf32-bom"),
+    pytest.param("Get-CimInstance Win32_Process\n".encode("utf-32-be"), id="utf32-be-no-bom"),
     pytest.param(b"\xef\xbb\xbfGet-CimInstance Win32_Process\n", id="utf8-bom"),
+    # adversary pass 1 A1: PowerShell reads the typographic quotes U+2018..U+201E as quote characters, so they splice a word like the ASCII ones
+    *[pytest.param(f"Invoke-CimMethod -ClassName Win32_Pro{q}cess{q} -MethodName Create\n".encode("utf-8"), id=f"smart-quote-u{ord(q):04x}") for q in _QUOTES],
+    pytest.param(f"Invoke-CimMethod -ClassName Win32_Pro“cess”\n".encode("cp1252"), id="smart-quote-cp1252-double"),
+    pytest.param(f"Invoke-CimMethod -ClassName Win32_Pro‘cess’\n".encode("cp1252"), id="smart-quote-cp1252-single"),
+    pytest.param(f"Invoke-CimMethod -ClassName Win32_Pro„cess„\n".encode("cp1252"), id="smart-quote-cp1252-low-double"),
+    pytest.param(f"Invoke-CimMethod -ClassName Win32_Pro“cess”\n".encode("utf-16"), id="smart-quote-utf16"),
+    pytest.param(f"Invoke-CimMethod -ClassName Win32_Pro“cess”\n".encode("utf-32"), id="smart-quote-utf32"),
 ]
 
 
@@ -359,6 +403,17 @@ def test_red_a_query_only_file_that_starts_calling_create_is_refused(tree, sourc
     rel = tree("tools/new/probe.ps1", source)
     problems = create_site_problems(tree.root, [rel])
     assert problems and all(p.startswith(f"{rel}:") and "WMI Create site" in p for p in problems), problems
+
+
+@_needs_pwsh
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16", "utf-16-be-bom", "utf-32", "utf-32-be-bom"])
+def test_red_the_create_layer_reads_a_script_in_every_encoding_a_bom_names(tree, encoding):
+    """adversary pass 1 A2: the UTF-32 BOM begins with the UTF-16 BOM, so UTF-32 text was read as UTF-16 and its Create was never seen."""
+    source = "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='cmd.exe'}\n"
+    raw = {"utf-16-be-bom": b"\xfe\xff" + source.encode("utf-16-be"), "utf-32-be-bom": b"\x00\x00\xfe\xff" + source.encode("utf-32-be")}.get(encoding) or source.encode(encoding)
+    rel = tree("tools/new/probe.ps1", raw)
+    problems = create_site_problems(tree.root, [rel])
+    assert problems and all("WMI Create site" in p for p in problems), (encoding, problems)
 
 
 @_needs_pwsh
