@@ -1104,7 +1104,9 @@ function Invoke-UmRunDrop {
                                             break
                                         } catch {
                                             $moveDenial = Get-UmRunMoveDenial -Exception $_.Exception -Destination $metaFinal
-                                            $sourceGone = -not (Test-Path -LiteralPath $repubTmp)
+                                            # adversary pass 3 A1: this probe's own transient access error must never replace the classified denial (a probe that cannot answer reads as "source still there")
+                                            $sourceGone = $false
+                                            try { $sourceGone = -not (Test-Path -LiteralPath $repubTmp -ErrorAction Stop) } catch { $sourceGone = $false }
                                             if ($null -eq $moveDenial -and -not $sourceGone) { throw }
                                             if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
                                             if ($null -eq $moveDenial) { throw }
@@ -1119,7 +1121,11 @@ function Invoke-UmRunDrop {
                                     Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $moveAttempt)
                                 }
                             } finally {
-                                if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
+                                # adversary pass 3 A1 (sibling): a cleanup probe that throws in a finally would replace the typed refusal (or a success) in flight
+                                # (the delete line itself stays exact: test_dual_venue_owner_footage_gate pins it)
+                                try {
+                                    if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
+                                } catch { $null = $_ }
                             }
                             $notAfterText = $republished
                         }

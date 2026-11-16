@@ -583,6 +583,13 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             f"Import-Module '{DROP_MODULE}' -Force\n"
             f"Import-Module '{RUNNER_MODULE}' -Force -DisableNameChecking\n"
             "$c = [Console]::In.ReadToEnd() | ConvertFrom-Json\n"
+            # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 (adversary pass 3 A1): repub.testPathThrows shadows Test-Path inside the drop module so that a probe of the
+            # re-publish temporary (a *.meta.tmp) raises the same access error the Move did; every other path answers as the real cmdlet.
+            "$global:DvProbeArmed = $false\n"
+            "if ($c.repub.testPathThrows) { & (Get-Module UmRunDrop) { function script:Test-Path { [CmdletBinding()] param([string]$LiteralPath, [string]$PathType)\n"
+            # armed only once the re-publish temporary exists (TestHookAfterNotAfterRepublishTmpWritten): the claim phase's own earlier cleanup probe is another site
+            "  if ($global:DvProbeArmed -and $LiteralPath -like '*.meta.tmp') { throw [UnauthorizedAccessException]::new('Access to the path is denied. (probe)') }\n"
+            "  if ($PathType) { Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType } else { Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath } } } }\n"
             f"$log = '{self.log}'\n"
             "$sim = $null\n"
             "$copier = { param($s, $d) Add-Content -LiteralPath $log -Value $d; Copy-Item -LiteralPath $s -Destination $d\n"
@@ -611,6 +618,7 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "  $seen.atUtc = $sim.now.UtcDateTime.ToString('o'); $seen.meta = [IO.File]::ReadAllText($metaPath) } }\n"
             "if ($null -ne $c.repub) { $p.TestHookAfterNotAfterRepublishTmpWritten = { param($tmpPath) $seen.repubCalls = 1 + [int]$seen.repubCalls\n"
             "  if ($seen.repubCalls -eq 1) {\n"
+            "    if ($c.repub.testPathThrows) { $global:DvProbeArmed = $true }\n"
             "    if ($null -ne $c.repub.advance) { $sim.now = $sim.now.AddSeconds([double]$c.repub.advance) }\n"
             "    if ($c.repub.fault -eq 'corrupt') { [IO.File]::WriteAllText($tmpPath, '{\"torn\":') }\n"
             "    if ($c.repub.fault -eq 'steal') { [IO.File]::WriteAllText($metaPath, [string]$c.repub.other) }\n"
@@ -1125,6 +1133,25 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         answer = json.loads(p.stdout.strip().splitlines()[-1])
         self.assertTrue(answer["transient"], answer)
         self.assertTrue(answer["cause"].startswith("DESTINATION_"), answer)
+
+    def test_a_probe_of_the_temporary_that_throws_does_not_replace_the_typed_refusal(self) -> None:
+        # adversary pass 3 A1 (introduced): the Move's catch probes `Test-Path $repubTmp`; under $ErrorActionPreference = 'Stop' a transient access error from
+        # that probe escaped the catch and replaced the classified denial (no delivered recheck, no retry, no typed refusal). The finally's cleanup probe of the
+        # same temporary is the same shape and would replace whatever is in flight. RED before the fix: threw the probe's own UnauthorizedAccessException.
+        r = self._drop(fault="hold", share="Read", ms=60000, testPathThrows=True)
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn(f"attempts={self.ATTEMPTS}", r["threw"], "the probe's failure did not cut the retry short")
+        self.assertIn("cause=DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertNotIn("(probe)", r["threw"], "the probe's own error is not the headline")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_probe_of_the_temporary_that_throws_does_not_break_a_retry_that_succeeds(self) -> None:
+        # adversary pass 3 A1, success shape: the claim is held for a moment, the retry replaces it, and the finally's cleanup probe of the (consumed) temporary
+        # throws. The drop must still report success. RED before the fix: threw the probe's error from the finally after the job's metadata was published.
+        r = self._drop(fault="hold", share="Read", ms=600, testPathThrows=True)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
 
     def test_the_replacing_rename_line_is_unchanged_and_still_the_only_three_argument_move(self) -> None:
         # the owner-footage route guard pins that exact line (test_dual_venue_owner_footage_gate.ROUTE_DELETE_ALLOWED); the retry wraps it, never rewrites it
