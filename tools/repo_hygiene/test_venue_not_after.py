@@ -613,10 +613,19 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "  if ($seen.repubCalls -eq 1) {\n"
             "    if ($null -ne $c.repub.advance) { $sim.now = $sim.now.AddSeconds([double]$c.repub.advance) }\n"
             "    if ($c.repub.fault -eq 'corrupt') { [IO.File]::WriteAllText($tmpPath, '{\"torn\":') }\n"
-            "    if ($c.repub.fault -eq 'steal') { [IO.File]::WriteAllText($metaPath, [string]$c.repub.other) } } } }\n"
+            "    if ($c.repub.fault -eq 'steal') { [IO.File]::WriteAllText($metaPath, [string]$c.repub.other) }\n"
+            # VENUE-UMRUN-MOVE-ACCESS-DENIED-1: the destination refuses the replacing rename. 'hold' keeps a handle on the claim that denies Delete
+            # (share: 'None' reads nothing else, 'Read' lets the nonce read through) and lets go after 'ms' ms; 'equal' first writes the temp's own text
+            # there (the rename already landed); 'readonly' sets the attribute.
+            "    if ($c.repub.fault -eq 'hold' -or $c.repub.fault -eq 'readonly') {\n"
+            "      if ($c.repub.equal) { [IO.File]::WriteAllText($metaPath, [IO.File]::ReadAllText($tmpPath)) }\n"
+            "      if ($c.repub.fault -eq 'readonly') { [IO.File]::SetAttributes($metaPath, [IO.FileAttributes]::ReadOnly) }\n"
+            "      if ($c.repub.fault -eq 'hold') {\n"
+            "        Add-Type -TypeDefinition 'public static class DvLockHolder { public static System.IO.FileStream Hold(string p, System.IO.FileShare s, int ms) { var fs = new System.IO.FileStream(p, System.IO.FileMode.Open, System.IO.FileAccess.Read, s); System.Threading.Tasks.Task.Delay(ms).ContinueWith(t => fs.Dispose()); return fs; } }'\n"
+            "        $null = [DvLockHolder]::Hold($metaPath, [IO.FileShare]$c.repub.share, [int]$c.repub.ms) } } } } }\n"
             "$threw = ''; $lines = @()\n"
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
-            "$meta = $(if (Test-Path -LiteralPath $metaPath) { [IO.File]::ReadAllText($metaPath) } else { '' })\n"
+            "$meta = $(if (Test-Path -LiteralPath $metaPath) { try { [IO.File]::ReadAllText($metaPath) } catch { '<UNREADABLE>' } } else { '' })\n"
             "$dropAt = $(if ($null -ne $c.dropAt) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$c.dropAt).UtcDateTime } elseif ($null -ne $sim) { $sim.now.UtcDateTime } else { $null })\n"
             "$judge = $null\n"
             "if ($null -ne $b -and $null -ne $dropAt) {\n"
@@ -938,6 +947,69 @@ class RepublishRefusalTests(unittest.TestCase):
         self.assertNotIn("atUtc", r["seen"], "the job never reached its rename")
         self.assertEqual(r["names"], ["job-x.meta.json"], "only the other submission's claim: no job, no temporary")
         self.assertEqual(r["meta"], other, "byte for byte the other submission's claim")
+
+
+@requires_windows_pwsh
+class MetaReplaceDeniedTests(unittest.TestCase):
+    """VENUE-UMRUN-MOVE-ACCESS-DENIED-1: two Bachelor legs (receipts 24474d73 at 22:13Z, cf1d6841 at 22:44Z) ended UNRESOLVED with
+    `um-run ended in an unexpected error: Exception calling "Move" with "3" argument(s): "Access to the path is denied."`, and a third lost a lease the
+    same way. The only three-argument Move on the submit path is the not-after re-publish's replacing rename of this call's own claim
+    (UmRunDrop.psm1, [IO.File]::Move($repubTmp, $metaFinal, $true)). On NTFS the same UnauthorizedAccessException comes back whether the destination is held
+    open without FileShare.Delete (an antivirus or backup scan, the agent's own read), read-only, or an ACL refusal, so the drop retries a bounded number of
+    times for the transient shapes and otherwise refuses TYPED, naming source, destination, attempts and the cause. Same real-drop fixture as
+    RepublishRefusalTests: the claim is held through TestHookAfterNotAfterRepublishTmpWritten, so no new production seam is needed to reproduce it."""
+    ANCHOR = DropRelativeNotAfterTests.ANCHOR
+    setUp = DropRelativeNotAfterTests.setUp
+    names = DropRelativeNotAfterTests.names
+    drop = DropRelativeNotAfterTests.drop
+    ATTEMPTS = 6
+
+    def _drop(self, **repub) -> dict:
+        return self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub=repub)
+
+    def test_a_claim_held_for_a_moment_is_retried_and_the_drop_succeeds_once(self) -> None:
+        # RED before the fix: the first rename is denied and the drop threw `Exception calling "Move" with "3" argument(s)`, the job never visible
+        r = self._drop(fault="hold", share="Read", ms=600)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"], "the job placed once, no temporary left")
+        self.assertEqual([l for l in r["lines"] if l.startswith("submitted ")], [f"submitted job-x -> {self.inbox / 'job-x.job.ps1'}"], "never twice")
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("job not-after:")]), 1, r["lines"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"], "the retried rename published the same value")
+
+    def test_a_claim_that_stays_held_refuses_typed_with_source_destination_and_attempts_and_the_job_never_becomes_visible(self) -> None:
+        r = self._drop(fault="hold", share="Read", ms=60000)
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertNotIn('Exception calling "Move"', r["threw"], "typed, not the raw .NET text as the headline")
+        self.assertIn(f"attempts={self.ATTEMPTS}", r["threw"])
+        self.assertRegex(r["threw"], r"source=\S*job-x\.[0-9a-f]{32}\.meta\.tmp ")
+        self.assertIn(f"destination={self.inbox / 'job-x.meta.json'} ", r["threw"])
+        self.assertIn("cause=DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertIn("probe=OPEN_SHARING_VIOLATION", r["threw"], "an exclusive open of the destination says the cause is another handle, not an ACL")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+        self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+        self.assertFalse([n for n in r["names"] if n.endswith(".tmp")], "no temporary left: " + repr(r["names"]))
+
+    def test_a_read_only_claim_is_a_permanent_refusal_and_is_not_retried(self) -> None:
+        r = self._drop(fault="readonly")
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("attempts=1 ", r["threw"], "a read-only destination never gets better by waiting")
+        self.assertIn("cause=DESTINATION_READ_ONLY", r["threw"])
+        self.assertNotIn("job-x.job.ps1", r["names"])
+
+    def test_a_denied_rename_whose_destination_already_holds_the_new_claim_counts_as_delivered(self) -> None:
+        # the rename landed (a lost reply over SMB) but the call still read as denied: the destination holds exactly the temp's text, so nothing is
+        # re-published and nothing is refused
+        r = self._drop(fault="hold", share="Read", ms=60000, equal=True)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+
+    def test_the_replacing_rename_line_is_unchanged_and_still_the_only_three_argument_move(self) -> None:
+        # the owner-footage route guard pins that exact line (test_dual_venue_owner_footage_gate.ROUTE_DELETE_ALLOWED); the retry wraps it, never rewrites it
+        code = DROP_MODULE.read_text(encoding="utf-8")
+        self.assertEqual(code.count("[IO.File]::Move($repubTmp, $metaFinal, $true)"), 1)
+        self.assertEqual(len(re.findall(r"\[(?:System\.)?IO\.File\]::Move\(", code)), 1)
+        self.assertTrue("UMRUN_MOVE_ACCESS_DENIED" in code, "the typed token is in the module")
 
 
 @requires_windows_pwsh

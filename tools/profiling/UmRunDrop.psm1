@@ -574,6 +574,70 @@ function Assert-UmRunSideFileName {
 $script:UmRunNotAfterPlacementStallSec = 15
 $script:UmRunNotAfterPlacementRetries = 3
 
+# VENUE-UMRUN-MOVE-ACCESS-DENIED-1: the not-after re-publish replaces this call's own claim in one renaming Move. On NTFS and SMB a destination that another handle
+# holds open without FileShare.Delete (an antivirus or backup scan, an indexer), that is read-only, or that an ACL refuses all come back as the same
+# UnauthorizedAccessException ("Access to the path is denied."), and a lost lease (receipts 24474d73, cf1d6841) was the price of the first one. So the Move is tried at most
+# UmRunMoveAttempts times, UmRunMoveBackoffMs * attempt ms apart (250 + 500 + 750 + 1000 + 1250 = 3.75 s in all, inside the 15 s placement stall bound above, which still
+# measures the whole pass), and a refusal that outlasts them is typed UMRUN_MOVE_ACCESS_DENIED with the source, destination, attempts and cause.
+$script:UmRunMoveAttempts = 6
+$script:UmRunMoveBackoffMs = 250
+
+function Get-UmRunMoveDenial {
+    <#
+    .SYNOPSIS
+    Is this exception from a replacing Move a refusal of the destination (access denied, or a sharing or lock violation)? $null when it is anything else
+    (a missing source, a full disk): those are rethrown unchanged. Otherwise { transient; cause; probe; exception }: transient is $false only where waiting
+    cannot help (the destination is a directory or read-only); probe says what an exclusive open of the destination answered, so a later
+    UMRUN_MOVE_ACCESS_DENIED says "another handle" or "an ACL" instead of leaving a guess. Reads only; it never changes the destination.
+    #>
+    param([Parameter(Mandatory = $true)][System.Exception]$Exception, [Parameter(Mandatory = $true)][string]$Destination)
+    $e = $Exception
+    if ($null -ne $e.InnerException) { $e = $e.InnerException }   # a .NET method call arrives wrapped in a MethodInvocationException
+    $denied = $e -is [UnauthorizedAccessException]
+    $locked = ($e -is [IO.IOException]) -and ((($e.HResult -band 0xFFFF) -eq 32) -or (($e.HResult -band 0xFFFF) -eq 33))   # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+    if (-not ($denied -or $locked)) { return $null }
+    $cause = 'DESTINATION_HELD_OR_ACL'
+    $transient = $true
+    $probe = 'NOT_PROBED'
+    if (Test-Path -LiteralPath $Destination -PathType Container) {
+        $cause = 'DESTINATION_IS_DIRECTORY'; $transient = $false
+    } elseif (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        if (([IO.File]::GetAttributes($Destination) -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+            $cause = 'DESTINATION_READ_ONLY'; $transient = $false
+        } else {
+            try {
+                $h = [IO.File]::Open($Destination, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+                $h.Dispose()
+                $probe = 'OPEN_OK'
+            } catch [UnauthorizedAccessException] {
+                $probe = 'OPEN_ACCESS_DENIED'
+            } catch [IO.IOException] {
+                $probe = 'OPEN_SHARING_VIOLATION'
+            } catch {
+                $probe = 'OPEN_FAILED'
+            }
+        }
+    } else {
+        $cause = 'DESTINATION_ABSENT'
+    }
+    [pscustomobject]@{ transient = $transient; cause = $cause; probe = $probe; exception = ('{0}: {1}' -f $e.GetType().Name, ($e.Message -replace '\s+', ' ')) }
+}
+
+function Test-UmRunMetaDelivered {
+    <#
+    .SYNOPSIS
+    Does the claim at -Path already hold exactly -ExpectedText (the re-publish's own bytes)? Then a Move that read as denied has in effect landed (a lost reply
+    over SMB), and nothing is re-published or refused. An unreadable destination is never "delivered".
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$ExpectedText)
+    try {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try { $sr = [IO.StreamReader]::new($fs, [Text.Encoding]::ASCII); return ($sr.ReadToEnd() -ceq $ExpectedText) } finally { $fs.Dispose() }
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-UmRunDrop {
     <#
     .SYNOPSIS
@@ -956,7 +1020,30 @@ function Invoke-UmRunDrop {
                                 if ($null -eq $current -or $current.nonce -ne $nonce) {
                                     throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
                                 }
-                                [IO.File]::Move($repubTmp, $metaFinal, $true)
+                                # VENUE-UMRUN-MOVE-ACCESS-DENIED-1: a refused rename is retried (bounded, backed off) and, if it outlasts the attempts, refused TYPED. Retry-safe:
+                                # only this temp is re-moved over only this call's own claim (the nonce is read again before every retry), the job is not yet visible, and a
+                                # destination that already holds exactly these bytes counts as delivered.
+                                $moveAttempt = 0
+                                while ($true) {
+                                    $moveAttempt++
+                                    try {
+                                        [IO.File]::Move($repubTmp, $metaFinal, $true)
+                                        break
+                                    } catch {
+                                        $moveDenial = Get-UmRunMoveDenial -Exception $_.Exception -Destination $metaFinal
+                                        if ($null -eq $moveDenial) { throw }
+                                        if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
+                                        if (-not $moveDenial.transient -or $moveAttempt -ge $script:UmRunMoveAttempts) {
+                                            throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=$($moveDenial.cause) probe=$($moveDenial.probe) exception=$($moveDenial.exception); the not-after re-publish did not replace this submission's claim and the job was not made visible"
+                                        }
+                                    }
+                                    Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $moveAttempt)
+                                    $claimNow = $null
+                                    try { $claimNow = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json } catch { $claimNow = $null }
+                                    if ($null -ne $claimNow -and $claimNow.nonce -ne $nonce) {
+                                        throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
+                                    }
+                                }
                             } finally {
                                 if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
                             }
