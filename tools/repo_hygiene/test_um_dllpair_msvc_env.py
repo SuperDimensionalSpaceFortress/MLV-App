@@ -305,7 +305,7 @@ class BackendCmdUcrtCheckTests(_Pwsh):
     def test_adversary_f7c5a3c0_a2_a_bang_in_systemroot_still_finds_where(self) -> None:
         # adversary pass on f7c5a3c0, A2: inside EnableDelayedExpansion the percent-expanded %SystemRoot% was re-parsed, so SystemRoot=C:\...\Win!OS!
         # became ...\WinWindows_NT, both where calls ran a missing exe, and a valid corecrt.h was refused at exit 9. where.exe's path is now read into a
-        # variable BEFORE setlocal and used as !MLV_WHERE!, whose value delayed expansion does not re-parse. The fixture copies where.exe there.
+        # variable BEFORE setlocal and used as %MLV_WHERE% (delayed expansion is off there), whose value is not re-parsed. The fixture copies where.exe there.
         win = self.tmp / "Win!OS!"
         (win / "System32").mkdir(parents=True)
         shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", win / "System32" / "where.exe")

@@ -322,7 +322,8 @@ $cacheBuildJson = Join-Path $cache $names.buildManifestName
 $buildDir = Join-Path $BuildRoot "build-$s12"
 $dllBaseId = Get-AttrCudaDllPairJobId -SourceCommit $commit
 $dllId = Get-AttrCudaDllPairJobId -SourceCommit $commit -JobIdSuffix $DllJobIdSuffix
-$dllGenArgs = @('-SourceCommit', $commit) + $(if ($DllJobIdSuffix) { @('-JobIdSuffix', $DllJobIdSuffix) } else { @() })
+$dllGenArgs = @('-SourceCommit', $commit)
+if ($DllJobIdSuffix) { $dllGenArgs += @('-JobIdSuffix', $DllJobIdSuffix) }
 $stageDefaultId = "playback-attr-3-cuda-stage-$s12"
 # The ONLY leaf names this driver ever hands um-run as side files: this sha's build package (the DLL-pair source zip and the four artifacts the stage job verifies).
 $PackageSideNames = @("$dllId-source.zip", $names.packageZipName, $names.exeName, $names.reconName, $names.buildManifestName)

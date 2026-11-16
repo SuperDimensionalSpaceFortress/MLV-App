@@ -67,8 +67,12 @@ def names(sha: str = SHA) -> dict[str, str]:
 
 # ---- stubs. Every one appends "<ROLE> k=v ..." to $env:FAKE_CALLS. --------------------------------------------------------------------------------------------
 FAKE_DLLGEN = r"""
-[CmdletBinding()] param([string]$SourceCommit, [string]$OutDir, [string]$JobIdSuffix = '')
-Add-Content -LiteralPath $env:FAKE_CALLS -Value "DLLGEN sha=$SourceCommit out=$OutDir suffix=$JobIdSuffix"
+[CmdletBinding(PositionalBinding=$false)] param([string]$SourceCommit, [string]$OutDir, [string]$JobIdSuffix = '')
+# NIGHTLY-DLLGEN-ARGV-PIN-1: no positional binding (a stray argument is a binding error, never swallowed) and the process's own argv is recorded verbatim after
+# the script path, '|'-joined, so a test pins the exact argument list the driver handed the generator (an empty-string element shows as '||').
+$raw = [Environment]::GetCommandLineArgs(); $fi = [array]::IndexOf($raw, '-File')
+$argvTail = $(if ($fi -ge 0 -and $raw.Count -gt $fi + 2) { $raw[($fi + 2)..($raw.Count - 1)] } else { @() })
+Add-Content -LiteralPath $env:FAKE_CALLS -Value "DLLGEN sha=$SourceCommit out=$OutDir suffix=$JobIdSuffix argv=$($argvTail -join '|')"
 $id = "playback-attr-3-cuda-dllpair-$($SourceCommit.Substring(0, 12))"
 if ($JobIdSuffix) { $id = "$id-$JobIdSuffix" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -594,7 +598,7 @@ class VenueStageNightlyTests(unittest.TestCase):
     def test_a_suffixed_dll_pair_is_harvested_through_read_share_and_never_resubmitted(self) -> None:
         # UM-DLLPAIR-VCVARS-PATH-OVERFLOW-1 r2 (Grok G3 on #819): the end-to-end path. The default id holds a FAILED result (it refuses that sha's pair for
         # good) and <default>-r2 holds a clean pair. `-DllJobIdSuffix r2` must reach Get-DllPairReuse through Read-Share and $DllReuseByName
-        # (Invoke-VenueStageNightly.ps1 :546 / :560) as (base id, suffix): a swapped or dropped argument looks up the failed default id (DLLPAIR_FAILED)
+        # (Invoke-VenueStageNightly.ps1 :547 / :561) as (base id, suffix): a swapped or dropped argument looks up the failed default id (DLLPAIR_FAILED)
         # or a doubled <default>-r2-r2 (result-missing, so a resubmit). Either reds this case.
         base = f"playback-attr-3-cuda-dllpair-{S12}"
         failed = self.share / "outbox" / f"{base}.result.json"
@@ -616,6 +620,32 @@ class VenueStageNightlyTests(unittest.TestCase):
         r = self.rows()[-1]
         self.assertEqual((r["jobIds"]["dllPair"], r["steps"]["dllPair"]), (jid, "harvested"), r)
         self.assertEqual(failed.read_bytes(), failed_bytes, "the failed default id's result is never rewritten")
+
+    def dllgen_argv(self) -> list[str]:
+        # NIGHTLY-DLLGEN-ARGV-PIN-1: the exact argument list (after the script path) the driver handed the DLL-pair generator, as the stub recorded it.
+        calls = self.calls("DLLGEN")
+        self.assertEqual(len(calls), 1, calls)
+        return calls[0].split(" argv=", 1)[1].split("|")
+
+    def test_dllgen_argv_without_a_suffix_is_exactly_source_commit_and_out_dir(self) -> None:
+        # fable key3 r8 B1 (refuted by execution, closed anyway): no -DllJobIdSuffix means no -JobIdSuffix and no stray (empty) element before -OutDir.
+        p = self.run_driver()
+        self.assert_exit(p, "STAGE_OK")
+        argv = self.dllgen_argv()
+        self.assertEqual(argv[:2], ["-SourceCommit", SHA], argv)
+        self.assertEqual(len(argv), 4, argv)
+        self.assertEqual(argv[2], "-OutDir", argv)
+        self.assertTrue(argv[3].endswith("dllpair"), argv)
+
+    def test_dllgen_argv_with_a_suffix_is_exactly_source_commit_job_id_suffix_and_out_dir(self) -> None:
+        p = self.run_driver("-DllJobIdSuffix", "r2")
+        self.assert_exit(p, "STAGE_OK")
+        argv = self.dllgen_argv()
+        self.assertEqual(argv[:4], ["-SourceCommit", SHA, "-JobIdSuffix", "r2"], argv)
+        self.assertEqual(len(argv), 6, argv)
+        self.assertEqual(argv[4], "-OutDir", argv)
+        self.assertTrue(argv[5].endswith("dllpair"), argv)
+        self.assertIn(f"playback-attr-3-cuda-dllpair-{S12}-r2", self.submitted_jobs())
 
     # ---------------------------------------------------------------- idempotency
     def test_an_already_staged_sha_is_skipped_with_no_build_and_no_submission(self) -> None:

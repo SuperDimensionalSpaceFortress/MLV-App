@@ -415,11 +415,11 @@ $Evidence['msvcEnvironment'] = [ordered]@{
     inheritedPathEntries = $inheritedPathEntries
     buildPath = [string]$env:PATH
     vcvars = $vcvars
-    probeExitCode = $msvcRc
+    probeCmdExitCode = $msvcRc   # the probe .cmd's own exit (always 0, 'exit /b 0'); vcvars64's code is MLV_VCVARS_EXIT= in msvc-environment.log
     include = $msvcInclude
     reason = $msvcVerdict.Reason
 }
-$msvcLog = @("inheritedPathLength=$($inheritedPath.Length) inheritedPathEntries=$inheritedPathEntries", "buildPath=$([string]$env:PATH)", "probeExit=$msvcRc") + $msvcOutput
+$msvcLog = @("inheritedPathLength=$($inheritedPath.Length) inheritedPathEntries=$inheritedPathEntries", "buildPath=$([string]$env:PATH)", "probeCmdExit=$msvcRc") + $msvcOutput
 Publish-JobLog (Join-Path $Pub 'msvc-environment.log') $msvcLog
 if (-not $msvcVerdict.Ok) {
     Complete-Failed 9 'msvcEnvironment' "reason=$($msvcVerdict.Reason) $($msvcVerdict.Detail) inheritedPathLength=$($inheritedPath.Length) inheritedPathEntries=$inheritedPathEntries (see msvc-environment.log)"
