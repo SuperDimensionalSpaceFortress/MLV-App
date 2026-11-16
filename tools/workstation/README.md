@@ -98,6 +98,25 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    since the inspection, stays as it is (`IMPORT_DEST_CHANGED_SKIPPED <path>`, exit 1): close what holds it
    and re-run `-Phase Import` (it is idempotent).
 
+   **The credential rule is deny by default on the key NAME (r15).** A file is a hit when a secret-named
+   key (password / passwd, secret, credential, api / private / access / auth key, token; a part `auth`,
+   `pwd` or `authorization`; any separator or camelCase; braced or subscripted script keys such as
+   `${env:DB_PASSWORD}` and `$config['password']` too) appears with ANY value. The value is the raw text
+   to the end of its record, nothing stripped first. Only these values are exempt: empty, `""`, `''`,
+   `null`, `~`, `[]`, `{}`, `***`, `${NAME}`, `<words>`, and an XML element with no content. Everything
+   else is a hit, including `true` / `false`, a number under `max_tokens`, a mapping under `auth`, and
+   `$Token = Get-Token`. Expect more files in `SECRET-SCAN.txt` than before: that is the accepted cost.
+   A netrc-shaped file (`machine` / `default` / `login` / `macdef`) where `password` is followed by
+   anything is a hit. The rule does not catch a key name built at run time or a value computed at run time.
+
+   **Typed failures added in r15:** `EXPORT_CREDENTIAL_ZIP_NOT_DELETED <path>` means an archive that
+   failed the post-archive scan could not be deleted, because something holds it open. Delete it by hand
+   and never transfer it. `IMPORT_ROLLBACK_DEST_CHANGED <path>` means a save landed while Import was
+   putting back an interleaved save. The newest save stays at the path. `IMPORT_ROLLBACK_BACKUP_NOT_DELETED`,
+   `IMPORT_TEMP_NOT_DELETED`, `IMPORT_PARTIAL_NOT_DELETED` and `IMPORT_BACKUP_NOT_DELETED` each name a
+   file Import could not remove. `CLONE_REMOTE_MISMATCH` and `CLONE_DOCTRINE_REMOTE_MISMATCH` mean an
+   existing checkout's remote names another repository. Nothing is fetched; fix the remote by hand.
+
 5. **Do the owner-only checklist** (`-Phase Checklist` prints it). Then go through the cut-over phases.
 
 ## Owner-only checklist (never scripted)
