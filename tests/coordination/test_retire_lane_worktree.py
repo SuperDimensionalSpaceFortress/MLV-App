@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -5359,6 +5360,38 @@ def _assert_refused_naming(d, p, path):
     assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u and str(path).lower() in u.lower() for u in d["cwdUnknown"]), json.dumps(d)
 
 
+def _assert_holder_not_exempt(d, p):
+    """The creation-time exemption is about THIS holder, never the runner-wide total: `cwdExempt` counts every older pid with an unreadable cwd in the
+    census, and the disposition lists no per-pid exempt row (cwdExemptOwner is the service-owner exemption only), so a total `== 0` flakes when a
+    foreign pytest child is exempted. An exempted pid never reaches cwdUnknown, so the holder's row there, typed script-unreadable (never
+    cwd-unreadable, which is the exemptible kind), is the proof that it was not exempted; it is also not an owner exemption."""
+    rows = [u for u in d["cwdUnknown"] if u.startswith(f"{p.pid} ")]
+    assert len(rows) == 1 and " script-unreadable " in rows[0] and " cwd-unreadable " not in rows[0], json.dumps(d)
+    assert not any(str(o).startswith(f"{p.pid} ") for o in d["cwdExemptOwner"]), json.dumps(d)
+
+
+def _holder_exempted(d, p):
+    """True when THIS holder was exempted (by creation time or as a service owner). The tests below used to assert the whole census's total
+    `cwdExempt == 0`, which flaked when a foreign pytest child was exempted. `cwdExempt` counts every older pid with an unreadable cwd the
+    census holds, and the disposition lists no per-pid exempt row (cwdExemptOwner is the service-owner exemption only). An exempted pid never
+    reaches cwdUnknown, so the holder's own row there, typed script-unreadable (never cwd-unreadable, the exemptible kind), proves it was not."""
+    rows = [u for u in d["cwdUnknown"] if u.startswith(f"{p.pid} ")]
+    # The row is "<pid> <name> <why> created=... file=<path>": the third token is the why; the path (a pytest basetemp) may contain any words.
+    in_unknown = len(rows) == 1 and rows[0].split()[2] == "script-unreadable"
+    as_owner = any(str(o).startswith(f"{p.pid} ") for o in d["cwdExemptOwner"])
+    return (not in_unknown) or as_owner
+
+
+def test_holder_exempted_reads_the_why_token_not_words_in_the_file_path():
+    """Adversary advisory A1 on 447d8429: a basetemp containing ' cwd-unreadable ' made a correct script-unreadable row read as exempted."""
+    p = types.SimpleNamespace(pid=1234)
+    row = "1234 pwsh.exe script-unreadable created=2026-11-16T12:00:00.0000000Z file=C:\\tmp\\case cwd-unreadable suffix\\chain-run\\tools\\arms.ps1"
+    assert not _holder_exempted({"cwdUnknown": [row], "cwdExemptOwner": []}, p)
+    assert _holder_exempted({"cwdUnknown": [], "cwdExemptOwner": []}, p)
+    assert _holder_exempted({"cwdUnknown": [row.replace(" script-unreadable ", " cwd-unreadable ")], "cwdExemptOwner": []}, p)
+    assert _holder_exempted({"cwdUnknown": [row], "cwdExemptOwner": ["1234 pwsh.exe exempt=service-sid:S-1-5-18"]}, p)
+
+
 @pytest.mark.parametrize("whatif", [True, False], ids=["whatif", "real-retirement"])
 def test_full_gate_refuses_a_live_holder_whose_sibling_script_is_locked(repo, whatif):
     """R1: through Invoke-RetireLaneWorktree, known cwd, real live holder, real FileShare.None handle on a sibling. Refused, naming pid and file."""
@@ -5385,7 +5418,7 @@ def test_full_gate_gives_an_unreadable_script_no_creation_time_exemption(repo):
     finally:
         _stop(p)
     _assert_refused_naming(d, p, arms)
-    assert d["cwdExempt"] == 0, json.dumps(d)
+    assert not _holder_exempted(d, p), json.dumps(d)
 
 
 def test_full_gate_an_unreadable_cwd_does_not_hide_an_unreadable_script(repo):
@@ -5399,7 +5432,34 @@ def test_full_gate_an_unreadable_cwd_does_not_hide_an_unreadable_script(repo):
     finally:
         _stop(p)
     _assert_refused_naming(d, p, arms)
-    assert d["cwdExempt"] == 0, json.dumps(d)
+    assert not _holder_exempted(d, p), json.dumps(d)
+
+
+def test_full_gate_holder_first_refusal_stands_when_a_foreign_older_pytest_child_is_exempt(repo):
+    """CI-FLAKE-RETIRE-FULL-GATE-CWDEXEMPT-COUNT-1 (hosted Tests run 43924116125, attempt 1). ONLY_PYTEST_CHILDREN keeps every direct child of
+    pytest, not only this test's holder, so on a busy runner a second child older than the worktree with an unreadable cwd is exempted by creation
+    time and the TOTAL `cwdExempt` reads 1 while the holder's own verdict is right. Reproduced here on purpose: a foreign older child, the same
+    unreadable script. The holder-specific asserts must hold, and the total must count the foreign child (so a total `== 0` assert is the flake)."""
+    tmp, main = repo
+    wt = tmp / "wt-locked-foreign-older"
+    sd = _chain_scripts(tmp, str(wt))
+    foreign = _spawn_proven_alive(tmp, "foreign-older", cwd=tmp)       # both children start before the worktree exists
+    p = None
+    arms = sd / "arms.ps1"
+    try:
+        p = _spawn_chain_proven_alive(sd, cwd=tmp)
+        _add_wt(main, wt)       # inside the try: a failure here must still stop both children (adversary advisory A2 on 447d8429)
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _cwd_unreadable_for(foreign.pid) + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+        assert foreign.poll() is None, f"FIXTURE ERROR: foreign child {foreign.pid} exited before the scan finished"
+    finally:
+        if p is not None:
+            _stop(p)
+        _stop(foreign)
+    _assert_refused_naming(d, p, arms)
+    assert not _holder_exempted(d, p), json.dumps(d)
+    assert not any(u.startswith(f"{foreign.pid} ") for u in d["cwdUnknown"]), json.dumps(d)    # exempted, so never listed as unknown
+    assert d["cwdExempt"] >= 1, json.dumps(d)                                                   # the total counts it: the old `== 0` fails here
 
 
 def test_full_gate_names_every_holder_that_reaches_the_same_locked_script(repo):
