@@ -243,6 +243,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *RELEASE_SYNC_LEGS)
 # CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
 CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
+# CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A5 on 84d66a4b): the H arm's six -teampart twins of the display matrix, keyed to the cell each one twins
+# (legId and generatorArgs.reconOmpThreads 12 / prepOmpThreads 6 are the only differences); TeamPartitionLegSpecTests pins their shape.
+TEAMPART_LEGS = {f"legs/m16-1243-display-{mode}-s{scale}-teampart.json": f"legs/m16-1243-display-{mode}-s{scale}.json"
+                 for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *TEAMPART_LEGS)
 # GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the M16-1457 native full-screen s1 pair taken from #420 (590b0df0, card HFR-NATIVE-60FPS-FULLRES-1) without its conform
 # arm (generatorArgs.playbackConform is not in this base's schema): the Look Assist OFF arm that hung foregrounding (-nola, a classic leg) and its Look Assist
 # ON Cinematic control. Capture-free paced cuda speed legs at scale 1; LegSpecSchemaTests pins the pair.
@@ -7799,9 +7804,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS;
                 # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS; -missdump: the warm-reuse miss dump on,
-                # MISSDUMP_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump)?$", path.name)
+                # MISSDUMP_LEGS; -teampart: the OpenMP team partition on, TEAMPART_LEGS, CPU-S1-FS-SPIKE-TEAM-PARTITION-1)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump|-teampart)?$", path.name)
                 self.assertNotIn("prepConflatedMove", spec.get("generatorArgs") or {}, path.name)
+                self.assertEqual("reconOmpThreads" in (spec.get("generatorArgs") or {}), spec["legId"].endswith("-teampart"), path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -8151,6 +8157,9 @@ NO_PACE_TWIN_BY_DESIGN = {
        for mode in ("fullscreen", "windowed")},
     **{f"m16-1457-conform-{mode}-s1": "conform look cell; its pace claim is the configured-rate conform pace proof, not a timed figure, and no PR cites a measured fps from it, so a capture-free conform twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed")},
+    # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A5 on 84d66a4b): the six team-partition arms of the display matrix.
+    **{f"m16-1243-display-{mode}-s{scale}-teampart": "team-partition A/B arm: its figures compare it with its display-matrix cell on the same contact-sheet schedule, so a capture-free twin waits for the first PR that cites an absolute figure from it"
+       for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
 }
 
 
@@ -15970,11 +15979,6 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                                  "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
 
 
-# CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the H arm's six -teampart twins of the display matrix.
-TEAMPART_LEGS = {f"legs/m16-1243-display-{mode}-s{scale}-teampart.json": f"legs/m16-1243-display-{mode}-s{scale}.json"
-                 for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)}
-
-
 class TeamPartitionLegSpecTests(unittest.TestCase):
     """CPU-S1-FS-SPIKE-TEAM-PARTITION-1: each -teampart twin differs from its display-matrix cell only in legId and the two partition keys (12 + 6, the
     pre-registered P-thread split of Bachelor's 12 P + 8 E logical CPUs less 2 prefetch decoders), so no receipted cell changes a byte."""
@@ -16034,9 +16038,15 @@ class TeamPartitionLegSpecTests(unittest.TestCase):
         # the app emits the record the gate reads, once per smoke session (LogLineField.h, pinned by console_tests LogLineField.TheOmpTeamsRecordNamesEachTeam)
         llf = (ROOT / "platform" / "qt" / "LogLineField.h").read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertIn('"playback_smoke.omp_teams session=%1 partition=%2 recon_omp=%3 recon_cpu_cores=%4 prep_omp=%5 "\n'
-                      '                           "prep_pointwise=%6 prefetch_decoders=%7 logical_cpus=%8 override=%9"', llf)
+                      '                           "prep_pointwise=%6 prefetch_decoders=%7 logical_cpus=%8 thread_limit=%9 dynamic=%10 override=%11"', llf)
+        # A1 on 84d66a4b: recon_omp / prep_omp are the EFFECTIVE teams, capped by the max team and the OpenMP thread limit the app reads at play start
+        self.assertIn("QString::number( ompEffectiveTeam( reconRequest, maxThreads, threadLimit ) )", llf)
+        self.assertIn("QString::number( ompEffectiveTeam( prepRequest, maxThreads, threadLimit ) )", llf)
         mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
         self.assertEqual(mw.count("<< log_line_field::ompTeamsLine( static_cast<qulonglong>( m_playbackSmokeSessionId ),"), 1)
+        for read in ("const int teamsMaxThreads = omp_get_max_threads();", "const int teamsThreadLimit = omp_get_thread_limit();",
+                     "const bool teamsDynamic = omp_get_dynamic() != 0;"):
+            self.assertEqual(mw.count(read), 1, read)
 
 
 @requires_windows_pwsh
@@ -16059,9 +16069,63 @@ class TeamPartitionEvidenceTests(unittest.TestCase):
         return "\n".join(["playback_smoke.measured_session id=3", start or cls.START, *records, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
 
     @staticmethod
-    def record(partition: str = "12+6", recon: str = "12", prep: str = "6", session: int = 3, override: str = "0", cores: str = "12", pointwise: str = "6") -> str:
+    def record(partition: str = "12+6", recon: str = "12", prep: str = "6", session: int = 3, override: str = "0", cores: str = "12", pointwise: str = "6",
+               limit: str = "2147483647", dynamic: str = "0") -> str:
         return (f"playback_smoke.omp_teams session={session} partition={partition} recon_omp={recon} recon_cpu_cores={cores} prep_omp={prep}"
-                f" prep_pointwise={pointwise} prefetch_decoders=2 logical_cpus=20 override={override}")
+                f" prep_pointwise={pointwise} prefetch_decoders=2 logical_cpus=20 thread_limit={limit} dynamic={dynamic} override={override}")
+
+    def shape_refusal(self, spec: dict):
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n@{ r = (Get-DvLegSpecShapeRefusal -Spec $s) } | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out["r"]
+
+    def test_adversary_a1_an_inherited_thread_limit_or_dynamic_team_is_not_the_partition(self) -> None:
+        # A1 on 84d66a4b: OMP_THREAD_LIMIT=1 shrank every team to 1 while the record repeated 12+6; the app now writes the EFFECTIVE teams and the limit.
+        for name, rec in (("thread limit 1", self.record(recon="1", prep="1", limit="1")),
+                          ("thread limit 8", self.record(recon="8", prep="6", limit="8")),
+                          ("dynamic teams", self.record(dynamic="1"))):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(rec))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        v = self.verdict(self.ON, self.log(self.record(recon="1", prep="1", limit="1")))
+        self.assertEqual(v["observed"], "1+1", "observed is the effective split, not the request")
+        v = self.verdict(self.ON, self.log(self.record(limit="12")))
+        self.assertEqual((v["observed"], v["verdict"]), ("12+6", "HONOURED"), "a limit at the request still runs the request")
+
+    def test_adversary_a2_contradictory_effective_counts_fail_closed(self) -> None:
+        # A2 on 84d66a4b: recon_cpu_cores=1 prep_pointwise=1 under partition=12+6 read HONOURED.
+        for name, rec in (("both counts 1", self.record(cores="1", pointwise="1")), ("cores 16", self.record(cores="16")),
+                          ("pointwise 16", self.record(pointwise="16")),
+                          ("off with differing counts", self.record("off", "0", "0", cores="16", pointwise="12")),
+                          ("effective above request", self.record(recon="13"))):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(rec))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+
+    def test_adversary_a3_a_present_null_key_is_named_and_refused(self) -> None:
+        # A3 on 84d66a4b: {"reconOmpThreads": null} read as a control leg (named=false, blocks=false) and passed the shape check.
+        for ga in ({"reconOmpThreads": None}, {"prepOmpThreads": None}, {"reconOmpThreads": None, "prepOmpThreads": None},
+                   {"reconOmpThreads": 12, "prepOmpThreads": None}):
+            with self.subTest(generatorArgs=ga):
+                v = self.verdict({"generatorArgs": ga}, self.log(self.record()))
+                self.assertEqual((v["named"], v["verdict"], v["blocks"]), (True, "NOT_HONOURED", True), v)
+                self.assertIn("TEAM_PARTITION_SPEC_INVALID", v["reason"])
+                self.assertIsNotNone(self.shape_refusal({"schema": "mlv-app/dual-venue-leg/v1", "legId": "x", "generatorArgs": ga}))
+
+    def test_adversary_a4_a_whole_number_double_is_refused_before_the_lease(self) -> None:
+        # A4 on 84d66a4b: 12.0 / 6.0 passed the shape check and became INVALID after the run. The repo's convention (look.contactSheetFrames) refuses a
+        # JSON number with a fraction as no whole number BEFORE a lease opens, so it is refused there, with the same rule the evidence applies.
+        for ga in ({"reconOmpThreads": 12.0, "prepOmpThreads": 6.0}, {"reconOmpThreads": 1.0, "prepOmpThreads": 16.0}, {"reconOmpThreads": 12, "prepOmpThreads": "6"},
+                   {"reconOmpThreads": 0, "prepOmpThreads": 6}, {"reconOmpThreads": 17, "prepOmpThreads": 6}, {"reconOmpThreads": True, "prepOmpThreads": 6},
+                   {"reconOmpThreads": 12}, {"prepOmpThreads": 6}):
+            with self.subTest(generatorArgs=ga):
+                refusal = self.shape_refusal({"schema": "mlv-app/dual-venue-leg/v1", "legId": "x", "generatorArgs": ga})
+                self.assertIsNotNone(refusal, ga)
+                self.assertIn("generatorArgs.", refusal)
+        for ga in ({"reconOmpThreads": 12, "prepOmpThreads": 6}, {"reconOmpThreads": 1, "prepOmpThreads": 16}, {"telemetryArm": "LIGHT"}):
+            with self.subTest(accepted=ga):
+                self.assertIsNone(self.shape_refusal({"schema": "mlv-app/dual-venue-leg/v1", "legId": "x", "generatorArgs": ga}))
 
     OFF_RECORD = staticmethod(lambda session=3: TeamPartitionEvidenceTests.record("off", "0", "0", session=session, cores="16", pointwise="16"))
 

@@ -1938,10 +1938,19 @@ function Get-DvTeamPartitionEvidence {
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
     $ga = Get-DvProp $Spec 'generatorArgs'
+    # adversary A3 on 84d66a4b: a PRESENT key, null included, names the partition (absent is the only "not asked for"), so a malformed spec is refused,
+    # never read as a control leg. adversary A4: the leg's shape check (Get-DvLegSpecShapeRefusal) refuses anything but a JSON int 1..16 before a lease
+    # opens; this reader applies the same rule, so the two never disagree.
+    $hasKey = {
+        param($o, [string]$k)
+        if ($null -eq $o) { return $false }
+        if ($o -is [System.Collections.IDictionary]) { return $o.Contains($k) }
+        return ($null -ne $o.PSObject.Properties[$k])
+    }
     $rawRecon = Get-DvProp $ga 'reconOmpThreads'
     $rawPrep = Get-DvProp $ga 'prepOmpThreads'
     $isTeam = { param($v) ($v -is [int] -or $v -is [long]) -and $v -ge 1 -and $v -le 16 }
-    $named = ($null -ne $rawRecon) -or ($null -ne $rawPrep)
+    $named = (& $hasKey $ga 'reconOmpThreads') -or (& $hasKey $ga 'prepOmpThreads')
     $requested = $named
     $requestedText = $(if ((& $isTeam $rawRecon) -and (& $isTeam $rawPrep)) { "$rawRecon+$rawPrep" } else { $null })
     $observed = $null
@@ -1950,13 +1959,14 @@ function Get-DvTeamPartitionEvidence {
     $records = 0
     $mentions = 0
     $consistent = $false
-    $override = $null
+    $rec = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
             $n = '(?:0|[1-9][0-9]{0,8})'
             $p = '(?:[1-9][0-9]{0,8})'
-            $fields = "partition=(?<part>off|$n\+$n) recon_omp=(?<r>$n) recon_cpu_cores=$p prep_omp=(?<q>$n) prep_pointwise=$p prefetch_decoders=$n logical_cpus=$p override=(?<o>[01])"
+            $fields = "partition=(?<part>off|(?<pr>$n)\+(?<pp>$n)) recon_omp=(?<r>$n) recon_cpu_cores=(?<rc>$p) prep_omp=(?<q>$n) prep_pointwise=(?<qp>$p)" +
+                " prefetch_decoders=$n logical_cpus=$p thread_limit=(?<tl>[1-9][0-9]{0,9}) dynamic=(?<dy>[01]) override=(?<o>[01])"
             $whole = Get-DvCanonicalRecordPattern -Marker 'playback_smoke.omp_teams' -Session ([regex]::Escape([string]$session)) -Fields $fields
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.omp_teams' -Session ([string]$session) -Fields $fields)) { continue }
@@ -1964,24 +1974,34 @@ function Get-DvTeamPartitionEvidence {
                 $m = [regex]::Match($l, $whole)
                 if ($m.Success) {
                     $records++
-                    $part = $m.Groups['part'].Value
-                    $r = $m.Groups['r'].Value; $q = $m.Groups['q'].Value
-                    $consistent = $(if ($part -ceq 'off') { $r -ceq '0' -and $q -ceq '0' } else { $part -ceq "$r+$q" })
-                    $observed = $part
-                    $override = [int]$m.Groups['o'].Value
+                    $rec = [ordered]@{ part = $m.Groups['part'].Value; reconReq = $m.Groups['pr'].Value; prepReq = $m.Groups['pp'].Value
+                                       recon = [long]$m.Groups['r'].Value; prep = [long]$m.Groups['q'].Value; cores = [long]$m.Groups['rc'].Value
+                                       pointwise = [long]$m.Groups['qp'].Value; limit = [decimal]$m.Groups['tl'].Value
+                                       dynamic = [int]$m.Groups['dy'].Value; override = [int]$m.Groups['o'].Value }
+                    # adversary A2 on 84d66a4b: the record is read whole. off = no team effective (0 / 0) and both counts the one playback count; r+p = each
+                    # effective team at most its request and each named side's count exactly its request.
+                    $consistent = $(if ($rec.part -ceq 'off') { $rec.recon -eq 0 -and $rec.prep -eq 0 -and $rec.cores -eq $rec.pointwise }
+                                    else {
+                                        $rr = [long]$rec.reconReq; $pq = [long]$rec.prepReq
+                                        ($rr -gt 0 -or $pq -gt 0) -and $rec.recon -le $rr -and $rec.prep -le $pq -and ($rr -eq 0 -or $rec.cores -eq $rr) -and ($pq -eq 0 -or $rec.pointwise -eq $pq)
+                                    })
                 }
             }
         }
     }
-    if ($records -ne 1 -or $mentions -ne 1 -or -not $consistent) { $observed = $null; $override = $null }
-    $unreadable = 'the team partition is unreadable: the measured session''s playback_smoke.omp_teams record is not exactly one whole, self-consistent line of the form playback_smoke.omp_teams session=<n> partition=<off|r+p> recon_omp=<n> recon_cpu_cores=<n> prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> override=<0|1>, or there is more than one'
+    if ($records -ne 1 -or $mentions -ne 1 -or -not $consistent) { $rec = $null }
+    # observed is the EFFECTIVE split ("off", or "<recon_omp>+<prep_omp>"), never the request text (adversary A1 on 84d66a4b)
+    if ($null -ne $rec) { $observed = $(if ($rec.part -ceq 'off') { 'off' } else { "$($rec.recon)+$($rec.prep)" }) }
+    $unreadable = 'the team partition is unreadable: the measured session''s playback_smoke.omp_teams record is not exactly one whole, self-consistent line of the form playback_smoke.omp_teams session=<n> partition=<off|r+p> recon_omp=<n> recon_cpu_cores=<n> prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> thread_limit=<n> dynamic=<0|1> override=<0|1>, or there is more than one'
     if ($requested) {
         $verdict = 'NOT_HONOURED'
-        if ($null -eq $requestedText) { $reason = "TEAM_PARTITION_SPEC_INVALID: the spec's reconOmpThreads '$rawRecon' and prepOmpThreads '$rawPrep' are not both integers from 1 to 16 (both or neither)" }
+        if ($null -eq $requestedText) { $reason = "TEAM_PARTITION_SPEC_INVALID: the spec's reconOmpThreads ($(ConvertTo-Json -InputObject $rawRecon -Compress)) and prepOmpThreads ($(ConvertTo-Json -InputObject $rawPrep -Compress)) are not both whole numbers from 1 to 16 (both or neither)" }
         elseif ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the run log has no playback_smoke.omp_teams record for the measured session, so the binary does not report its OpenMP teams' }
-        elseif ($null -eq $observed) { $reason = $unreadable }
-        elseif ($override -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says override=1 (MLVAPP_FORCE_THREADS / MLVAPP_FORCE_SINGLETHREAD make the partition inert)' }
-        elseif ($observed -cne $requestedText) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.omp_teams says partition=$observed, not the $requestedText the leg names" }
+        elseif ($null -eq $rec) { $reason = $unreadable }
+        elseif ($rec.override -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says override=1 (MLVAPP_FORCE_THREADS / MLVAPP_FORCE_SINGLETHREAD make the partition inert)' }
+        elseif ($rec.dynamic -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says dynamic=1 (OpenMP may shrink any team below its request, so the split is not the one the leg names)' }
+        elseif ($rec.part -cne $requestedText) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.omp_teams says partition=$($rec.part), not the $requestedText the leg names" }
+        elseif ($observed -cne $requestedText -or $rec.cores -ne [long]$rawRecon -or $rec.pointwise -ne [long]$rawPrep) { $reason = "ROUTE_NOT_ENGAGED: the measured session's effective teams are $observed (recon_cpu_cores=$($rec.cores) prep_pointwise=$($rec.pointwise) thread_limit=$($rec.limit)), not the $requestedText the leg names" }
         else { $verdict = 'HONOURED' }
     }
     elseif ($mentions -gt 0) {
@@ -2611,6 +2631,18 @@ function Get-DvLegSpecShapeRefusal {
             if ($null -ne $switchProp -and $switchProp.Value -isnot [bool]) {
                 return "generatorArgs.$switchName must be JSON true or false (it is $(ConvertTo-Json -InputObject $switchProp.Value -Compress -Depth 3))"
             }
+        }
+        # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A3 and A4 on 84d66a4b): a PRESENT team-partition key is a whole number from 1 to 16 -- a JSON int, the
+        # convention look.contactSheetFrames uses (a JSON number with a fraction, 12.0 included, parses to a double and is no whole number here), never null --
+        # and the two keys come together. Refused here, before a lease opens, for the leg and every batch preflight alike; absent stays "not asked for".
+        $teamProps = @($genArgsProp.Value.PSObject.Properties['reconOmpThreads'], $genArgsProp.Value.PSObject.Properties['prepOmpThreads'])
+        foreach ($teamProp in $teamProps) {
+            if ($null -ne $teamProp -and -not (($teamProp.Value -is [int] -or $teamProp.Value -is [long]) -and $teamProp.Value -ge 1 -and $teamProp.Value -le 16)) {
+                return "generatorArgs.$($teamProp.Name) must be a whole number from 1 to 16 (it is $(ConvertTo-Json -InputObject $teamProp.Value -Compress -Depth 3))"
+            }
+        }
+        if (($null -eq $teamProps[0]) -ne ($null -eq $teamProps[1])) {
+            return 'generatorArgs.reconOmpThreads and generatorArgs.prepOmpThreads are both set or neither (the team partition names both teams)'
         }
     }
     # r9 (adversary r8 cc8061a2 A1, Dot pr-721, hub ACK 6564543250): legType is ONE string of the schema's enum, compared case-sensitively as the validator
