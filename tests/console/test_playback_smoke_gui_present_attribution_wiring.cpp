@@ -303,7 +303,11 @@ TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
         source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
     ASSERT_FALSE(helper.isEmpty());
     ASSERT_EQ(1, helper.count(QStringLiteral("QThread::msleep( ms );")));
-    ASSERT_TRUE(helper.contains(QStringLiteral("m_guiPresentGapRunnerSleepNs +=")));
+    // r17 (r16 adversary A1): the gap's runner sleep is charged per slept segment, in the segment charger
+    ASSERT_TRUE(helper.contains(QStringLiteral("chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );")));
+    const QString segment = bracedBlockAfter(
+        source, QStringLiteral("void MainWindow::chargeSmokeRunnerSleepSegment( double startS, double endS )"));
+    ASSERT_TRUE(segment.contains(QStringLiteral("m_guiPresentGapRunnerSleepNs +=")));
 
     const QString close = closeGapBody();
     ASSERT_FALSE(close.isEmpty());
@@ -1328,29 +1332,24 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     const QString source = mainWindowSource();
     // Runner sleep: [start, end] on the stage clock, only while a session is active.
     const QString sleep = bracedBlockAfter(source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
-    ASSERT_TRUE(sleep.contains(QStringLiteral("const double hopSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;")));
-    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r13 (the merge with #811's due-wake sleep): the interval ends when the
-    // sleep ends, before the woken wake runs, and the sent messages the sleep dispatched are taken out of it at their actual
-    // position (r13 adversary A1 on 04c1337b): one interval per slept segment, split around each dispatch span.
-    ASSERT_TRUE(sleep.contains(QStringLiteral("const double hopSleepEndS = mlv_stage_timing_now();")));
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r13 (the merge with #811's due-wake sleep): one RunnerSleep interval
+    // per slept segment, none for a dispatch inside the sleep (r13 adversary A1 on 04c1337b), on the stage clock (r15, r14
+    // adversary A1 on a27f3d88). r17 (r16 adversary A1 on 522f72c6): each segment is pushed the moment it ends -- by the sent
+    // wait's sink BEFORE the dispatch that ends it, so a prep result presented in that dispatch splits its hop wait with the
+    // segment already recorded -- and the msleep's one segment right after it. Nothing is pushed after the sleep returns.
     ASSERT_TRUE(sleep.contains(QStringLiteral(
-        "for( const std::pair<double, double> &span : m_playbackDueWake->lastRunnerSleepDispatchSpansS() )")));
-    ASSERT_TRUE(sleep.contains(QStringLiteral(
-        "m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSegmentStartS, spanStartS );")));
-    ASSERT_TRUE(sleep.contains(QStringLiteral("hopSegmentStartS = std::max( hopSegmentStartS, spanEndS );")));
-    ASSERT_TRUE(sleep.contains(QStringLiteral(
-        "m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSegmentStartS, hopSleepEndS );")));
-    ASSERT_EQ(2, sleep.count(QStringLiteral("m_guiHopWait.push(")));
-    ASSERT_EQ(0, sleep.count(QStringLiteral("hopSleepEndS - static_cast<double>( dispatchNs )")));
-    // r15 (r14 adversary A1 on a27f3d88): the spans are absolute stage-clock seconds read inside the sleep around each
-    // dispatch, so no caller-side origin places them (a deschedule before the sleep's own timer shifted every span early)
-    ASSERT_TRUE(sleep.contains(QStringLiteral("m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); } )")));
+        "m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); }, &MainWindow::chargeSmokeRunnerSleepSegmentSink, this )")));
+    ASSERT_EQ(0, sleep.count(QStringLiteral("m_guiHopWait.push(")));
+    ASSERT_EQ(0, sleep.count(QStringLiteral("lastRunnerSleepDispatchSpansS()")));
     ASSERT_EQ(0, sleep.count(QStringLiteral("hopDueWakeSleepStartS")));
-    ASSERT_TRUE(sleep.contains(QStringLiteral("const double spanStartS = std::min( hopSleepEndS, span.first );")));
-    ASSERT_TRUE(sleep.contains(QStringLiteral("const double spanEndS = std::min( hopSleepEndS, span.second );")));
-    ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) > sleep.indexOf(QStringLiteral("QThread::msleep( ms );")));
-    ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) > sleep.indexOf(QStringLiteral("const qint64 dispatchNs =")));
-    ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) < sleep.indexOf(QStringLiteral("m_playbackDueWake->dispatchSentMessages();")));
+    ASSERT_TRUE(sleep.indexOf(QStringLiteral("chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );"))
+                > sleep.indexOf(QStringLiteral("QThread::msleep( ms );")));
+    ASSERT_TRUE(sleep.indexOf(QStringLiteral("chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );"))
+                < sleep.indexOf(QStringLiteral("m_playbackDueWake->dispatchSentMessages();")));
+    const QString segment = bracedBlockAfter(source, QStringLiteral("void MainWindow::chargeSmokeRunnerSleepSegment( double startS, double endS )"));
+    ASSERT_EQ(1, segment.count(QStringLiteral("m_guiHopWait.push(")));
+    ASSERT_TRUE(segment.contains(QStringLiteral(
+        "if( m_playbackSmokeActive ) m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );")));
 
     // Prepared present: the result's wait split at entry (the avg_playback_prep_result_queue_ms stamp), then the
     // present's own [entry, exit] interval, from one entry stamp.

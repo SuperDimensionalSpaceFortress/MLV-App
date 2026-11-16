@@ -13,6 +13,8 @@
 
 #include "../../platform/qt/PlaybackDueWake.h"
 #include "../../platform/qt/PlaybackDueWakeSamples.h"
+#include "../../platform/qt/GuiHopWaitSplit.h"
+#include "../../platform/qt/GpuPresentTailWindow.h"
 
 #include <QCoreApplication>
 #include <QRegularExpression>
@@ -2137,10 +2139,12 @@ TEST(PlaybackDueWakeSend, TheRunnerSleepIsTheSentWaitWithTheMsleepKeptForEveryOt
     const QString helper = functionBody( source, QStringLiteral( "void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )" ),
                                          QStringLiteral( "void MainWindow::presentPlaybackPreparedFrame(" ) );
     ASSERT_FALSE( helper.isEmpty() );
-    const int sent = helper.indexOf( QStringLiteral( "m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); } )" ) );
+    const int sent = helper.indexOf( QStringLiteral(
+        "m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); }, &MainWindow::chargeSmokeRunnerSleepSegmentSink, this )" ) );
     const int notHandled = helper.indexOf( QStringLiteral( "if( runnerSleep == PlaybackDueWake::RunnerSleep::NotHandled )" ) );
     const int msleep = helper.indexOf( QStringLiteral( "QThread::msleep( ms );" ) );
-    const int accounted = helper.indexOf( QStringLiteral( "GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );" ) );
+    // r17 (r16 adversary A1): the msleep's one segment is charged before the woken wake runs (the sent wait charged its own)
+    const int accounted = helper.indexOf( QStringLiteral( "chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );" ) );
     const int dispatch = helper.indexOf( QStringLiteral( "m_playbackDueWake->dispatchSentMessages();" ) );
     ASSERT_TRUE( sent > 0 && notHandled > sent && msleep > notHandled && accounted > msleep && dispatch > accounted );
     ASSERT_EQ( 1, source.count( QStringLiteral( "\" runner_sleep_woken=%1\"" ) ) );
@@ -2284,12 +2288,12 @@ TEST(PlaybackDueWakeSend, R3A3_AForeignHandlerInTheRunnerSleepIsGuiWorkNotRunner
     // r2 adversary pass 7 A3, its input: SendNotify delivery, trace on, a runner sleep; another thread sends a message to a
     // GUI-thread window whose handler does real work. The handler ran while the trace still said RunnerSleep, so its time was
     // charged to the runner sleep and a wake posted in it was classed asleep. Now the dispatch is traced Running and its time
-    // is returned (lastRunnerSleepDispatchNs) for the caller to take out of the sleep it accounts.
+    // is returned (lastRunnerSleepDispatchNs). r17 (r16 adversary A1): the caller's accounts take only the slept segments the
+    // sleep hands its sink, so the dispatch is outside every one of them (R17A1_* below); no account subtracts it afterwards.
     const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "? m_playbackDueWake->lastRunnerSleepDispatchNs() : 0;" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "const qint64 sleptNs = std::max<qint64>( 0, slept.nsecsElapsed() - dispatchNs );" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
-        "m_guiPresentGapRunnerSleepNs += std::max<qint64>( 0, m_guiPresentGapClock.nsecsElapsed() - startNs - dispatchNs );" ) ) );
+    ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "? m_playbackDueWake->lastRunnerSleepDispatchNs() : 0;" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "&MainWindow::chargeSmokeRunnerSleepSegmentSink, this )" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "if( m_guiPresentGapStartNs >= 0 ) m_guiPresentGapRunnerSleepNs += segmentNs;" ) ) );
 #ifdef Q_OS_WIN
     PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
     ASSERT_TRUE( wake.sendsNotify() );
@@ -2530,4 +2534,189 @@ TEST(PlaybackDueWakeSend, G3_AFailedRunnerSleepWaitSleepsTheRestOfTheIntervalAnd
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// r17 (r16 adversary A1 on 522f72c6), its input verbatim: "SendNotify mode, smoke active, gap/tail already open; valid prep
+// result ready at 1.001s; sleepGuiThreadForSmokeRunner(10) enters at 1.002s; at 1.006s SendNotifyMessageW(helperHwnd,
+// WM_USER+0x53, 0, 0) invokes a GUI-thread handler calling QCoreApplication::processEvents(AllEvents); queued prep result
+// presents and opens the next gap/tail at 1.008s; sleep returns at 1.012s." The whole sleep was charged after it returned, so
+// the old gap closed in the dispatch without its 4 ms, the prep result's hop wait missed them, and the new gap/tail got all 8.
+
+namespace
+{
+// The windows a sleep segment can be charged to: [0] the gap/tail open when the sleep began, [1] the one the in-sleep present
+// opened. The hop recorder is MainWindow's m_guiHopWait.
+struct R17A1Windows
+{
+    int open = 0;
+    double chargedS[2] = { 0.0, 0.0 };
+    int segments[2] = { 0, 0 };
+    gui_hop_wait::Recorder hop;
+};
+void r17A1Charge( void *context, double startS, double endS )
+{
+    R17A1Windows *w = static_cast<R17A1Windows *>( context );
+    w->chargedS[w->open] += endS - startS;
+    ++w->segments[w->open];
+    w->hop.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );
+}
+}
+
+TEST(PlaybackDueWakeSend, R17A1_EachRunnerSleepSegmentIsChargedToTheWindowItRanInBeforeAnInSleepDispatchClosesIt)
+{
+    R17A1Windows w;
+    PlaybackRunnerSleepSegments segments( 1.002 );                     // sleepGuiThreadForSmokeRunner(10) enters
+    double startS = 0.0;
+    double endS = 0.0;
+    // 1.006: the sent message's dispatch begins -- the segment it ends is charged now, while the old gap/tail is open
+    ASSERT_TRUE( segments.dispatchBegins( 1.006, &startS, &endS ) );
+    r17A1Charge( &w, startS, endS );
+    // inside the dispatch: the queued prep result (ready at 1.001) presents; its hop wait [1.001, 1.006] is split now
+    // (presentPlaybackPreparedFrame), then the old gap closes and the next gap/tail opens at 1.008
+    const gui_hop_wait::Split prepWait = w.hop.split( 1.001, 1.006 );
+    w.open = 1;
+    segments.dispatchEnded( 1.008 );
+    ASSERT_TRUE( segments.sleepEnds( 1.012, &startS, &endS ) );         // the sleep returns
+    r17A1Charge( &w, startS, endS );
+    ASSERT_TRUE( std::fabs( w.chargedS[0] - 0.004 ) < 1e-9 );          // the old gap: the 4 ms before the dispatch
+    ASSERT_TRUE( std::fabs( w.chargedS[1] - 0.004 ) < 1e-9 );          // the new gap/tail: only the 4 ms after it
+    ASSERT_EQ( 1, w.segments[0] );
+    ASSERT_EQ( 1, w.segments[1] );
+    ASSERT_TRUE( prepWait.valid );
+    ASSERT_TRUE( std::fabs( prepWait.kindMs[static_cast<int>( gui_hop_wait::Kind::RunnerSleep )] - 4.0 ) < 1e-6 );
+    // the hop recorder holds the whole non-dispatch sleep, 8 ms, and none of the 2 ms dispatch
+    const gui_hop_wait::Split whole = w.hop.split( 1.002, 1.012 );
+    ASSERT_TRUE( std::fabs( whole.kindMs[static_cast<int>( gui_hop_wait::Kind::RunnerSleep )] - 8.0 ) < 1e-6 );
+    // empty segments are never handed out: a dispatch at the sleep's entry, and a sleep that ends with its dispatch
+    PlaybackRunnerSleepSegments atEntry( 2.0 );
+    ASSERT_FALSE( atEntry.dispatchBegins( 2.0, &startS, &endS ) );
+    atEntry.dispatchEnded( 2.003 );
+    ASSERT_FALSE( atEntry.sleepEnds( 2.003, &startS, &endS ) );
+    // a GPU present-tail window takes the same segments: the one open at each charge (GpuPresentTailWindow::runnerSlept)
+    GpuPresentTailWindow oldTail;
+    GpuPresentTailWindow newTail;
+    oldTail.open( 1000, 0.0, 0.0 );
+    oldTail.runnerSlept( 4000000 );
+    GpuPresentTailTiming oldTiming;
+    oldTail.close( 1008000000, false, oldTiming );
+    newTail.open( 1008000000, 0.0, 0.0 );
+    newTail.runnerSlept( 4000000 );
+    GpuPresentTailTiming newTiming;
+    newTail.close( 1012000000, false, newTiming );
+    ASSERT_TRUE( std::fabs( oldTiming.runner_sleep_ms - 4.0 ) < 1e-9 );
+    ASSERT_TRUE( std::fabs( newTiming.runner_sleep_ms - 4.0 ) < 1e-9 );
+}
+
+#ifdef Q_OS_WIN
+namespace {
+R17A1Windows *g_r17A1Windows = nullptr;
+double g_r17A1HandlerStartMs = 0.0;
+double g_r17A1HandlerEndMs = 0.0;
+constexpr UINT kR17A1ForeignMessage = WM_USER + 0x53;
+LRESULT CALLBACK r17A1ForeignProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
+{
+    if( message == kR17A1ForeignMessage )
+    {
+        // the handler presents: the gap/tail the sleep began in closes and the next one opens
+        g_r17A1HandlerStartMs = dueWakeQpcNowMs();
+        Sleep( 2 );
+        if( g_r17A1Windows ) g_r17A1Windows->open = 1;
+        g_r17A1HandlerEndMs = dueWakeQpcNowMs();
+        return 0;
+    }
+    return DefWindowProcW( hwnd, message, wParam, lParam );
+}
+double r17A1NowS()
+{
+    return dueWakeQpcNowMs() / 1000.0;
+}
+}
+#endif
+
+TEST(PlaybackDueWakeSend, R17A1_TheSentWaitHandsEachSegmentToTheSinkBeforeItsDispatchRuns)
+{
+#ifdef Q_OS_WIN
+    PlaybackDueWake wake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::SendNotify );
+    ASSERT_TRUE( wake.sendsNotify() );
+    static const wchar_t *kClass = L"MlvR17A1ForeignHandler";
+    WNDCLASSW wc {};
+    wc.lpfnWndProc = r17A1ForeignProc;
+    wc.hInstance = GetModuleHandleW( nullptr );
+    wc.lpszClassName = kClass;
+    RegisterClassW( &wc );
+    const HWND window = CreateWindowExW( 0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr );
+    ASSERT_TRUE( window != nullptr );
+    R17A1Windows w;
+    g_r17A1Windows = &w;
+    std::atomic<bool> sent { false };
+    std::thread sender( [window, &sent]() {
+        Sleep( 20 );
+        sent = SendNotifyMessageW( window, kR17A1ForeignMessage, 0, 0 ) != 0;
+    } );
+    const double enteredMs = dueWakeQpcNowMs();
+    const PlaybackDueWake::RunnerSleep slept = wake.sleepForSmokeRunner( 80, &r17A1NowS, &r17A1Charge, &w );
+    const double returnedMs = dueWakeQpcNowMs();
+    sender.join();
+    g_r17A1Windows = nullptr;
+    DestroyWindow( window );
+    ASSERT_TRUE( sent.load() );
+    ASSERT_TRUE( slept == PlaybackDueWake::RunnerSleep::Slept );
+    // one segment per window: the old one was charged before the handler closed it, the new one only after it opened
+    ASSERT_EQ( 1, w.segments[0] );
+    ASSERT_EQ( 1, w.segments[1] );
+    ASSERT_TRUE( w.chargedS[0] * 1000.0 <= g_r17A1HandlerStartMs - enteredMs + 0.5 );
+    ASSERT_TRUE( w.chargedS[0] * 1000.0 >= 10.0 );                     // the ~20 ms before the send
+    ASSERT_TRUE( w.chargedS[1] * 1000.0 <= returnedMs - g_r17A1HandlerEndMs + 0.5 );
+    ASSERT_TRUE( w.chargedS[1] * 1000.0 >= 30.0 );                     // the rest of the 80 ms
+    // the two segments and the dispatch tile the sleep: the dispatch account is exactly what the segments leave out
+    const std::vector<std::pair<double, double>> spans = wake.lastRunnerSleepDispatchSpansS();
+    ASSERT_EQ( static_cast<size_t>( 1 ), spans.size() );
+    ASSERT_TRUE( spans[0].first * 1000.0 <= g_r17A1HandlerStartMs + 0.5 );
+    ASSERT_TRUE( spans[0].second * 1000.0 >= g_r17A1HandlerEndMs - 0.5 );
+    // a sleep no dispatch cuts is one segment, charged to the window open at its end; NotHandled hands out none
+    R17A1Windows plain;
+    ASSERT_TRUE( wake.sleepForSmokeRunner( 15, &r17A1NowS, &r17A1Charge, &plain ) == PlaybackDueWake::RunnerSleep::Slept );
+    ASSERT_EQ( 1, plain.segments[0] );
+    ASSERT_TRUE( plain.chargedS[0] * 1000.0 >= 12.0 );
+    PlaybackDueWake postWake( nullptr, []() {}, PlaybackDueWakeDeliveryMode::Post );
+    R17A1Windows none;
+    ASSERT_TRUE( postWake.sleepForSmokeRunner( 1, &r17A1NowS, &r17A1Charge, &none ) == PlaybackDueWake::RunnerSleep::NotHandled );
+    ASSERT_EQ( 0, none.segments[0] );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeSend, R17A1_TheRunnerSleepChargesEverySegmentThroughOneSinkAndNothingAfterTheSleep)
+{
+    // the wiring: the sent wait hands its sink the segment BEFORE the dispatch, and MainWindow charges every account (present
+    // gap, hop recorder, GPU present tail) in that one sink -- never once more after the sleep returned
+    const QString wakeSource = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const QString sleep = functionBody( wakeSource, QStringLiteral( "PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner(" ),
+                                        QStringLiteral( "qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const" ) );
+    ASSERT_FALSE( sleep.isEmpty() );
+    const int cut = sleep.indexOf( QStringLiteral( "segmentEnded = segments.dispatchBegins( dispatchStartS, &segmentStartS, &segmentEndS );" ) );
+    const int charged = sleep.indexOf( QStringLiteral( "chargeSegment( segmentEnded, segmentStartS, segmentEndS );" ), cut );
+    const int dispatch = sleep.indexOf( QStringLiteral( "dispatchPendingSentMessages();" ), charged );
+    const int resumed = sleep.indexOf( QStringLiteral( "segments.dispatchEnded( dispatchEndS );" ), dispatch );
+    const int last = sleep.indexOf( QStringLiteral( "segmentEnded = segments.sleepEnds( spanNowS(), &segmentStartS, &segmentEndS );" ), resumed );
+    ASSERT_TRUE( cut > 0 && charged > cut && dispatch > charged && resumed > dispatch && last > resumed );
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    const QString helper = functionBody( mainWindow, QStringLiteral( "void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )" ),
+                                         QStringLiteral( "void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )" ) );
+    ASSERT_FALSE( helper.isEmpty() );
+    ASSERT_TRUE( helper.contains( QStringLiteral(
+        "m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); }, &MainWindow::chargeSmokeRunnerSleepSegmentSink, this )" ) ) );
+    ASSERT_EQ( 0, helper.count( QStringLiteral( "lastRunnerSleepDispatchSpansS()" ) ) );
+    ASSERT_EQ( 0, helper.count( QStringLiteral( "lastRunnerSleepDispatchNs()" ) ) );
+    ASSERT_EQ( 0, helper.count( QStringLiteral( "m_guiPresentGapRunnerSleepNs +=" ) ) );
+    ASSERT_EQ( 0, helper.count( QStringLiteral( "m_guiHopWait.push(" ) ) );
+    ASSERT_EQ( 0, helper.count( QStringLiteral( "noteSmokeRunnerSleepIfActive(" ) ) );
+    const QString segment = functionBody( mainWindow, QStringLiteral( "void MainWindow::chargeSmokeRunnerSleepSegment( double startS, double endS )" ),
+                                          QStringLiteral( "void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )" ) );
+    ASSERT_FALSE( segment.isEmpty() );
+    ASSERT_EQ( 1, segment.count( QStringLiteral( "m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );" ) ) );
+    ASSERT_EQ( 1, segment.count( QStringLiteral( "if( m_guiPresentGapStartNs >= 0 ) m_guiPresentGapRunnerSleepNs += segmentNs;" ) ) );
+    ASSERT_EQ( 1, segment.count( QStringLiteral( "GpuDisplayWindow::noteSmokeRunnerSleepIfActive( segmentNs );" ) ) );
 }

@@ -311,6 +311,34 @@ inline PlaybackDueWakeSplitBounds playbackDueWakeSplitBounds( double dueAtMs, do
                                         receiveMs - firstStampMs, returnStampMs - firstStampMs };
 }
 
+/*! HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r17 (r16 adversary A1 on 522f72c6): one runner sleep cut into its SLEPT
+ *  segments at every dispatch inside it. A dispatch can run a handler that presents (closing the GUI present gap and the GPU
+ *  present-tail window the sleep began in, and opening the next), so a segment is handed out the moment it ends -- at the
+ *  dispatch's start, before the dispatch runs -- and the caller charges it to the windows open then. Charging the whole
+ *  sleep after it returned put every segment in the window open at the end. Pure: the caller passes every clock reading. */
+struct PlaybackRunnerSleepSegments
+{
+    explicit PlaybackRunnerSleepSegments( double sleepStartS ) : segmentStartS( sleepStartS ) {}
+    /*! A dispatch begins at \a atS: the segment that just ended, [*startS, *endS]; false when it is empty. */
+    bool dispatchBegins( double atS, double *startS, double *endS ) { return take( atS, startS, endS ); }
+    /*! The dispatch begun last ended at \a atS: the next slept segment starts there (never before the last one ended). */
+    void dispatchEnded( double atS ) { if( atS > segmentStartS ) segmentStartS = atS; }
+    /*! The sleep returns at \a atS: its last slept segment; false when it is empty. */
+    bool sleepEnds( double atS, double *startS, double *endS ) { return take( atS, startS, endS ); }
+
+    double segmentStartS;
+
+private:
+    bool take( double atS, double *startS, double *endS )
+    {
+        if( !( atS > segmentStartS ) ) return false;
+        *startS = segmentStartS;
+        *endS = atS;
+        segmentStartS = atS;
+        return true;
+    }
+};
+
 class PlaybackDueWake
 {
 public:
@@ -472,9 +500,16 @@ public:
      *  (runnerSleepsWokenOther, once per interruption) and the sleep goes on for the rest of \a ms, so the cadence never shortens.
      *  r2 G3: a failed wait (WAIT_FAILED) sleeps the rest of \a ms with QThread::msleep (counted runnerSleepWaitFailures). */
     enum class RunnerSleep { NotHandled, Slept, WokenBySent };
+    /*! r17 (r16 adversary A1 on 522f72c6): the sink a runner sleep hands each SLEPT segment to, [startS, endS] on its \a nowS
+     *  clock, the moment the segment ends: right BEFORE each dispatch inside the sleep (a handler in it can present, closing
+     *  the gap / tail window the segment ran in and opening the next) and at the sleep's end. The caller charges the segment
+     *  to the windows open when the sink is called, which are the windows it ran in. */
+    typedef void ( *RunnerSleepSegmentSink )( void *context, double startS, double endS );
     /*! r15 (r14 adversary A1): \a nowS is the caller's clock in seconds (MainWindow passes the stage clock); the dispatch spans
-     *  (lastRunnerSleepDispatchSpansS) are read on it. Null: the wake's own clock. */
-    RunnerSleep sleepForSmokeRunner( unsigned long ms, double ( *nowS )() = nullptr );
+     *  (lastRunnerSleepDispatchSpansS) are read on it. Null: the wake's own clock. r17: \a segmentSink (with \a segmentContext)
+     *  receives every slept segment (PlaybackRunnerSleepSegments); never called for NotHandled. */
+    RunnerSleep sleepForSmokeRunner( unsigned long ms, double ( *nowS )() = nullptr,
+                                     RunnerSleepSegmentSink segmentSink = nullptr, void *segmentContext = nullptr );
     /*! r3 (r2 adversary pass 7 A3): the nanoseconds the LAST sleepForSmokeRunner spent dispatching sent messages (0 when it
      *  dispatched none, or returned NotHandled). That dispatch is GUI work: the trace says Running while it runs, and the caller
      *  takes this time out of the runner sleep it accounts (MainWindow::sleepGuiThreadForSmokeRunner). */

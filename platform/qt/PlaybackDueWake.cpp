@@ -795,7 +795,8 @@ bool PlaybackDueWake::sendsNotify() const
     return d->delivery == Delivery::NativeMessage && d->mode == PlaybackDueWakeDeliveryMode::SendNotify;
 }
 
-PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long ms, double ( *nowS )() )
+PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long ms, double ( *nowS )(),
+                                                                  RunnerSleepSegmentSink segmentSink, void *segmentContext )
 {
 #ifdef Q_OS_WIN
     // r15 (r14 adversary A1): the dispatch spans are stamped on the caller's clock (\a nowS; the wake's own when null) at the
@@ -804,6 +805,16 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
     d->runnerSleepDispatchNs = 0;
     d->runnerSleepDispatchSpans.clear();
     if( !sendsNotify() ) return RunnerSleep::NotHandled;
+    // r17 (r16 adversary A1 on 522f72c6): each slept segment goes to the caller's sink as it ends -- before a dispatch below
+    // can close the window it ran in -- and the last one at the sleep's end (every return below)
+    PlaybackRunnerSleepSegments segments( spanNowS() );
+    const auto chargeSegment = [segmentSink, segmentContext]( bool ended, double startS, double endS )
+    {
+        if( ended && segmentSink ) segmentSink( segmentContext, startS, endS );
+    };
+    double segmentStartS = 0.0;
+    double segmentEndS = 0.0;
+    bool segmentEnded = false;
     noteRunnerSleep( true );
     // QS_SENDMESSAGE only: the sent wake ends the sleep; posted messages, timers and input leave the runner's cadence as it
     // was. MWMO_INPUTAVAILABLE: a sent message already pending at the call returns at once (never a missed wake)
@@ -844,10 +855,13 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
             // d991b0af): its length IS the duration account (lastRunnerSleepDispatchNs), never a second timer, so the scalar,
             // present-gap and hop accounts all take out the same interval
             const double dispatchStartS = spanNowS();
+            segmentEnded = segments.dispatchBegins( dispatchStartS, &segmentStartS, &segmentEndS );
+            chargeSegment( segmentEnded, segmentStartS, segmentEndS );
             d->inRunnerSleepDispatch = true;
             dispatchPendingSentMessages();
             d->inRunnerSleepDispatch = false;
             const double dispatchEndS = std::max( dispatchStartS, spanNowS() );
+            segments.dispatchEnded( dispatchEndS );
             d->runnerSleepDispatchNs += static_cast<qint64>( std::llround( ( dispatchEndS - dispatchStartS ) * 1000000000.0 ) );
             d->runnerSleepDispatchSpans.emplace_back( dispatchStartS, dispatchEndS );
             if( d->heldWakes.size() > heldBefore )
@@ -863,10 +877,14 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
         if( slept.hasExpired( static_cast<qint64>( waitMs ) ) ) break;
     }
     noteRunnerSleep( false );
+    segmentEnded = segments.sleepEnds( spanNowS(), &segmentStartS, &segmentEndS );
+    chargeSegment( segmentEnded, segmentStartS, segmentEndS );
     return RunnerSleep::Slept;
 #else
     Q_UNUSED( ms );
     Q_UNUSED( nowS );
+    Q_UNUSED( segmentSink );
+    Q_UNUSED( segmentContext );
     return RunnerSleep::NotHandled;
 #endif
 }

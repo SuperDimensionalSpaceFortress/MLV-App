@@ -2110,6 +2110,9 @@ private:
     void openGuiPresentGap( void );
     void closeGuiPresentGap( void );
     void endGuiPresentIdleWait( void );
+    // r17 (r16 adversary A1 on 522f72c6): one slept segment of a runner sleep, charged to the windows open when it ended
+    void chargeSmokeRunnerSleepSegment( double startS, double endS );
+    static void chargeSmokeRunnerSleepSegmentSink( void *context, double startS, double endS );
     void sleepGuiThreadForSmokeRunner( unsigned long ms );
     void waitGuiThreadForSmokeEvents( int maxMs );
     void closeSmokeEventWait( SmokeEventWaitInFlight &wait );

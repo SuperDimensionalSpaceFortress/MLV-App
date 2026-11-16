@@ -5242,63 +5242,55 @@ void MainWindow::endGuiPresentIdleWait( void )
         m_guiPresentGapIdle.ended( m_guiPresentGapClock.nsecsElapsed() );
 }
 
+// HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r17 (r16 adversary A1 on 522f72c6): one SLEPT segment of a runner sleep,
+// [startS, endS] on the stage clock (the gap clock and the hop split's clock), charged the moment it ended to every timing window
+// open now -- the windows it ran in, since only a dispatch inside the sleep can close or open one, and a segment is handed out
+// BEFORE its dispatch runs (PlaybackRunnerSleepSegments). Charging the whole sleep after it returned let a present in the
+// dispatch close the old gap / tail without its sleep (and split the prep result's hop wait without it), then put every
+// segment in the window that present opened.
+void MainWindow::chargeSmokeRunnerSleepSegment( double startS, double endS )
+{
+    if( !( endS > startS ) ) return;
+    const qint64 segmentNs = static_cast<qint64>( std::llround( ( endS - startS ) * 1000000000.0 ) );
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1 (#824): the hop split's RunnerSleep interval, only inside a smoke session
+    if( m_playbackSmokeActive ) m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );
+    // the open present gap's runner sleep (avg_gui_present_gap_runner_sleep_ms), never its busy
+    if( m_guiPresentGapStartNs >= 0 ) m_guiPresentGapRunnerSleepNs += segmentNs;
+    // PLAYBACK-PRESENT-TAIL-TIMING-1 r3 (B1): GpuDisplayWindow's open present-tail window
+    GpuDisplayWindow::noteSmokeRunnerSleepIfActive( segmentNs );
+}
+
+void MainWindow::chargeSmokeRunnerSleepSegmentSink( void *context, double startS, double endS )
+{
+    static_cast<MainWindow *>( context )->chargeSmokeRunnerSleepSegment( startS, endS );
+}
+
 // A smoke runner's sleep on the GUI thread is neither GUI work nor dispatcher idle: inside an
-// open gap it is reported on its own (avg_gui_present_gap_runner_sleep_ms), never as busy. No
-// gap opens or closes during the sleep (both run on this thread). PLAYBACK-PRESENT-TAIL-TIMING-1
-// r3 (B1): likewise inside GpuDisplayWindow's open present-tail window.
+// open gap it is reported on its own (avg_gui_present_gap_runner_sleep_ms), never as busy.
+// PLAYBACK-PRESENT-TAIL-TIMING-1 r3 (B1): likewise inside GpuDisplayWindow's open present-tail window.
+// r17 (r16 adversary A1): every slept segment is charged as it ends (chargeSmokeRunnerSleepSegment), nothing after the sleep.
 void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 {
-    const qint64 startNs = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapClock.nsecsElapsed() : -1;
-    const double hopSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;   // CPU-S1-PRESENT-INTERVAL-BOUND-1
-    QElapsedTimer slept;
-    slept.start();
     // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the due wake's GUI trace records this sleep (a wake posted in it
     // waits for its end, whatever the dispatcher does)
     // FULLSCREEN-S1S2-PRESENT-GAP-1: with the sent wake (the default) the sleep is a QS_SENDMESSAGE wait the wake ends early,
     // as the application's own QS_ALLINPUT wait would (PlaybackDueWake::sleepForSmokeRunner); every other delivery, and no
     // wake at all, sleeps exactly as before. The woken wake runs after this sleep is accounted, never inside it.
     // r15 (r14 adversary A1 on a27f3d88): the dispatch spans are read on this stage clock inside the sleep, right around each
-    // dispatch, so no origin stamped here (before a possible deschedule) places them
+    // dispatch. r3 (r2 adversary pass 7 A3): a sent message the sleep dispatched ran GUI work, not the runner's sleep, so no
+    // account takes it: r17, the sleep hands this window only its slept segments, each before the dispatch that ends it.
     const PlaybackDueWake::RunnerSleep runnerSleep = m_playbackDueWake
-        ? m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); } ) : PlaybackDueWake::RunnerSleep::NotHandled;
+        ? m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); }, &MainWindow::chargeSmokeRunnerSleepSegmentSink, this )
+        : PlaybackDueWake::RunnerSleep::NotHandled;
     if( runnerSleep == PlaybackDueWake::RunnerSleep::NotHandled )
     {
+        // nothing is dispatched inside a plain msleep: one segment, [start, end]
+        const double sleepStartS = mlv_stage_timing_now();
         if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( true );
         QThread::msleep( ms );
         if( m_playbackDueWake ) m_playbackDueWake->noteRunnerSleep( false );
+        chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );
     }
-    // r3 (r2 adversary pass 7 A3): a sent message the sleep dispatched ran GUI work, not the runner's sleep; its time is taken
-    // out of both sleep accounts (0 when nothing was dispatched, or the delivery is not the sent wake)
-    const qint64 dispatchNs = ( runnerSleep != PlaybackDueWake::RunnerSleep::NotHandled && m_playbackDueWake )
-        ? m_playbackDueWake->lastRunnerSleepDispatchNs() : 0;
-    const qint64 sleptNs = std::max<qint64>( 0, slept.nsecsElapsed() - dispatchNs );
-    // CPU-S1-PRESENT-INTERVAL-BOUND-1 (#824) on top of the due wake's sleep (#811 r13 merge): the hop split's RunnerSleep
-    // interval ends when the sleep ends, before the woken wake runs below. The sent messages the sleep dispatched are GUI
-    // work, so they are taken out of this third sleep account too.
-    // r13 (r13 adversary A1 on 04c1337b): at their actual position -- one RunnerSleep interval per slept segment, split
-    // around each dispatch span (lastRunnerSleepDispatchSpansS: absolute seconds on this stage clock, r15). No dispatch (the
-    // common case) is the plain [start, now] interval.
-    if( m_playbackSmokeActive && hopSleepStartS > 0.0 )
-    {
-        const double hopSleepEndS = mlv_stage_timing_now();
-        double hopSegmentStartS = hopSleepStartS;
-        if( dispatchNs > 0 )
-        {
-            for( const std::pair<double, double> &span : m_playbackDueWake->lastRunnerSleepDispatchSpansS() )
-            {
-                const double spanStartS = std::min( hopSleepEndS, span.first );
-                const double spanEndS = std::min( hopSleepEndS, span.second );
-                if( spanStartS > hopSegmentStartS )
-                    m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSegmentStartS, spanStartS );
-                hopSegmentStartS = std::max( hopSegmentStartS, spanEndS );
-            }
-        }
-        if( hopSleepEndS > hopSegmentStartS )
-            m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSegmentStartS, hopSleepEndS );
-    }
-    if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
-        m_guiPresentGapRunnerSleepNs += std::max<qint64>( 0, m_guiPresentGapClock.nsecsElapsed() - startNs - dispatchNs );
-    GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
     // the sent wake that ended the sleep runs now (its window procedure; posted messages wait for the runner's processEvents)
     if( runnerSleep == PlaybackDueWake::RunnerSleep::WokenBySent && m_playbackDueWake ) m_playbackDueWake->dispatchSentMessages();
 }
