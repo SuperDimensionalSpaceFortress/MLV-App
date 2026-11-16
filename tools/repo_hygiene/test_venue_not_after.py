@@ -615,6 +615,7 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "if ($null -ne $sim) { $p.TestHookBeforeJobVisible = { $seen.calls = 1 + [int]$seen.calls\n"
             "  if ($null -ne $c.advance.metaEvery) { $sim.now = $sim.now.AddSeconds([double]$c.advance.metaEvery) }\n"
             "  elseif ($seen.calls -eq 1 -and $null -ne $c.advance.meta) { $sim.now = $sim.now.AddSeconds([double]$c.advance.meta) }\n"
+            "  if ($null -ne $state.sw) { $state.sw.Dispose(); $state.sw = $null }\n"   # r8 A1: the swapped-in claim's holder lets go at visibility
             "  $seen.atUtc = $sim.now.UtcDateTime.ToString('o'); $seen.meta = [IO.File]::ReadAllText($metaPath) } }\n"
             "if ($null -ne $c.repub) { $p.TestHookAfterNotAfterRepublishTmpWritten = { param($tmpPath) $seen.repubCalls = 1 + [int]$seen.repubCalls\n"
             "  if ($seen.repubCalls -eq 1) {\n"
@@ -672,7 +673,9 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             # r7 A1: 'swapAfterVerify' = N renames the verified temp aside (the hold shares Delete, so that is allowed) and puts a changed file at the SAME pathname
             "if ($c.repub.seam.swapAfterVerify) { $p.TestHookAfterMetaSourceVerified = { param($sp, $at)\n"
             "  if ($at -eq [int]$c.repub.seam.swapAfterVerify) {\n"
-            "    try { [IO.File]::Move($sp, $sp + '.held'); [IO.File]::WriteAllText($sp, [IO.File]::ReadAllText($sp + '.held').Replace('notAfterUtc', 'notBeforeUtc')); $seen.swapped = $true } catch { $seen.swapped = $false } } } }\n"
+            "    try { [IO.File]::Move($sp, $sp + '.held'); [IO.File]::WriteAllText($sp, [IO.File]::ReadAllText($sp + '.held').Replace('notAfterUtc', 'notBeforeUtc')); $seen.swapped = $true } catch { $seen.swapped = $false }\n"
+            # r8 A1: 'holdLanded' keeps the swapped-in file open (Read, sharing Delete only) so the Move still publishes it but nobody else can read it; it is let go at visibility
+            "    if ($c.repub.seam.holdLanded) { $state.sw = [IO.File]::Open($sp, 'Open', 'Read', 'Delete') } } } }\n"
             "$threw = ''; $lines = @()\n"
             "if ($c.repub.continuePref) { $ErrorActionPreference = 'Continue' }\n"   # adversary pass 4 A2: the caller's preference (the accepted -ErrorAction Continue invocation)
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
@@ -1250,6 +1253,17 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         # r7 adversary A1, first pass: no denial is needed to open the gap
         self._swap_case(1, {"noHold": True})
 
+    def test_a_swapped_source_held_unreadable_is_refused_not_published(self) -> None:
+        # r8 adversary A1 (introduced): the landed read-back returned nothing for a claim another handle holds (Read, sharing Delete only), and "unreadable proves nothing"
+        # skipped the refusal, so a swapped-in file with no `notAfterUtc` became visible once its holder let go. An unread claim now refuses after the bounded attempts.
+        # RED before the fix: the job was made visible and the claim carried notBeforeUtc.
+        for at, extra in ((2, {"release": True}), (1, {"noHold": True})):
+            with self.subTest(pass_=at):
+                self._swap_case(at, {**extra, "holdLanded": True})
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"swapAfterVerify": 1, "noHold": True, "holdLanded": True}})
+        self.assertIn("could not be read back", r["threw"])
+        self.assertNotIn("job-x.job.ps1", r["names"])
+
     def _swap_case(self, at: int, extra: dict) -> None:
         r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"swapAfterVerify": at, **extra}})
         self.assertTrue(r["seen"].get("swapped"), "the pathname swap got through (the hold allows the rename)")
@@ -1285,7 +1299,17 @@ class MetaReplaceDeniedTests(unittest.TestCase):
             "    @{ k = 'number'; t = '{\"nonce\":5}' },\n"
             "    @{ k = 'nonce-missing'; t = '{\"jobId\":\"j\"}' },\n"
             "    @{ k = 'array'; t = ('[{\"nonce\":\"' + $n + '\"}]') },\n"
-            "    @{ k = 'scalar'; t = '\"x\"' })) {\n"
+            "    @{ k = 'scalar'; t = '\"x\"' },\n"
+            # r8 adversary A3: a JSON property named Keys is a dictionary KEY and shadows `$dict.Keys` (an own claim carrying one read as not ours); null and a list too
+            "    @{ k = 'keys-empty-list'; t = ('{\"jobId\":\"j\",\"nonce\":\"' + $n + '\",\"Keys\":[]}') },\n"
+            "    @{ k = 'keys-null'; t = ('{\"nonce\":\"' + $n + '\",\"Keys\":null}') },\n"
+            "    @{ k = 'keys-names'; t = ('{\"nonce\":\"' + $n + '\",\"Keys\":[\"jobId\"]}') },\n"
+            "    @{ k = 'keys-foreign'; t = '{\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"Keys\":[\"nonce\"]}' },\n"
+            # r8 adversary A2: two keys that differ only in case (ConvertFrom-Json builds an object only for -AsHashtable, so the dictionary shape alone): ambiguous, never ours,
+            # in either order, whichever of them carries this submission's nonce
+            "    @{ k = 'dup-case-own-first'; d = $true; t = ('{\"NONCE\":\"' + $n + '\",\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}') },\n"
+            "    @{ k = 'dup-case-own-last'; d = $true; t = ('{\"NONCE\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"' + $n + '\"}') })) {\n"
+            "    if ($case.d -and -not $h) { continue }\n"
             "    $claim = & $parse $case.t $h\n"
             "    [ordered]@{ k = ($case.k + $(if ($h) { '/dict' } else { '/obj' })); own = [bool](Test-UmRunClaimIsOwn -Claim $claim -Nonce $n) } } }\n"
             "ConvertTo-Json -Compress -InputObject @($rows)\n"
@@ -1298,6 +1322,11 @@ class MetaReplaceDeniedTests(unittest.TestCase):
             self.assertTrue(got["own-upper/" + shape], f"the property name is matched without regard to case, as a {shape}: {got}")   # r7 adversary A4
             for k in ("other", "nul", "number", "nonce-missing", "array", "scalar"):
                 self.assertFalse(got[k + "/" + shape], f"{k} is not ours as a {shape}: {got}")
+            for k in ("keys-empty-list", "keys-null", "keys-names"):
+                self.assertTrue(got[k + "/" + shape], f"an own claim with a Keys property is ours as a {shape}: {got}")   # r8 adversary A3
+            self.assertFalse(got["keys-foreign/" + shape], f"a foreign claim with a Keys property is not ours as a {shape}: {got}")
+        for k in ("dup-case-own-first", "dup-case-own-last"):
+            self.assertFalse(got[k + "/dict"], f"{k}: an ambiguous nonce key is never ours: {got}")   # r8 adversary A2
 
     def test_a_rollback_keeps_a_claim_it_could_not_read_under_a_continue_preference(self) -> None:
         # adversary pass 4 A2 (introduced): the rollback's read became a terminating one, so under -ErrorAction Continue a claim another submission holds (readable by

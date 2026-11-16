@@ -686,11 +686,16 @@ function Test-UmRunClaimIsOwn {
     $value = $null
     if ($Claim -is [System.Collections.IDictionary]) {
         # r7 adversary A4: the property name is matched without regard to case on both shapes (a PSCustomObject's lookup is, a dictionary's key lookup may not be)
-        $found = $false
-        foreach ($k in @($Claim.Keys)) {
-            if ($k -is [string] -and [string]::Equals($k, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $value = $Claim[$k]; $found = $true; break }
+        # r8 adversary A3: the entries are enumerated through the IDictionary interface itself, never `$Claim.Keys`: a JSON property named `Keys` is a dictionary KEY and
+        # shadows the member, so an own claim carrying one read as "not ours" (a false JOBID_IN_USE, and a rollback that kept the owned claim).
+        # r8 adversary A2: more than one key that matches `nonce` ignoring case is ambiguous (the order of the properties would pick the answer), so it is never ours.
+        $found = 0
+        $en = [System.Collections.IDictionary].GetMethod('GetEnumerator').Invoke($Claim, @())
+        while ($en.MoveNext()) {
+            $k = $en.Key
+            if ($k -is [string] -and [string]::Equals($k, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $value = $en.Value; $found++ }
         }
-        if (-not $found) { return $false }
+        if ($found -ne 1) { return $false }
     } elseif ($Claim -is [pscustomobject]) {
         $p = $Claim.PSObject.Properties['nonce']
         if ($null -eq $p) { return $false }
@@ -1207,9 +1212,19 @@ function Invoke-UmRunDrop {
                                 }
                                 # r7 adversary A1: the verifying hold lets the temp be renamed (it shares Delete), so a file swapped in at the same pathname would be what the Move
                                 # published. What LANDED is read back here, still before the job is visible, and bytes that are not the verified ones refuse (the rollback below
-                                # removes the claim: it carries this call's nonce). A claim that cannot be read at all proves nothing and does not refuse.
-                                $landedText = Read-UmRunMetaText -Path $metaFinal
-                                if ($null -ne $landedText -and -not [string]::Equals($landedText, $metaJson, [StringComparison]::Ordinal)) {
+                                # removes the claim: it carries this call's nonce).
+                                # r8 adversary A1: a claim that cannot be read is NOT proof of anything, and a swapped-in file held with Delete sharing only is exactly unreadable, so
+                                # it refuses too. A holder that lets go is waited out (bounded, the same attempts and back-off as the move); what never read back is never made visible.
+                                $landedText = $null
+                                for ($landedRead = 1; $landedRead -le $script:UmRunMoveAttempts; $landedRead++) {
+                                    $landedText = Read-UmRunMetaText -Path $metaFinal
+                                    if ($null -ne $landedText) { break }
+                                    if ($landedRead -lt $script:UmRunMoveAttempts) { Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $landedRead) }
+                                }
+                                if ($null -eq $landedText) {
+                                    throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json could not be read back after the not-after re-publish ($($script:UmRunMoveAttempts) attempts), so the bytes that landed are unproven; the job was not made visible"
+                                }
+                                if (-not [string]::Equals($landedText, $metaJson, [StringComparison]::Ordinal)) {
                                     throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json does not hold the verified bytes after the not-after re-publish (the re-publish temporary was replaced by another file between its verification and the move); the job was not made visible"
                                 }
                             } finally {
