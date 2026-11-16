@@ -513,6 +513,42 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     PM_INTERNAL_GAP_OPEN = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>"
     PM_INTERNAL_GAP_CLOSE = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
     PM_INTERNAL_GAP_REGIONS = 7
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (CI run 43580040634): the ONE claim-shape predicate (Get-AttrCudaBuildManifestClaimSha256). Two regions in every job: its
+    # splice, and $manifestChecks reading each digest through it. The second REPLACES the baseline's member-access block (test_playback_attr_3_cuda_behaviour
+    # test_every_claim_reader_calls_the_one_predicate forbids keeping it), so that exact baseline block is pinned below and taken out of the baseline, once, before the
+    # comparison: any other change to the baseline side still fails it.
+    CLAIM_SHAPE_OPEN = "VENUE-STAGE-CLAIM-SHAPE-1 >>>"
+    CLAIM_SHAPE_CLOSE = "VENUE-STAGE-CLAIM-SHAPE-1 <<<"
+    # r7 (adversary A1 on ef28cd37): a third region, in the embedded Assert-AttrCudaBuildManifest, types every parse failure ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE; it
+    # replaces the baseline's bare parse and null check (the second pinned block).
+    # r17 (CI run 43764890818): a fourth region, in the same function, carries the commit-mismatch throw as an exception with the declared commit as DATA (r12, Grok G15);
+    # it replaces the baseline's one-line throw (the third pinned block).
+    # r19 (CI run 43764890818): a fifth region, in Resolve-AttrCudaSmokeRunLog, contains a log under a drive-root containing root (the baseline's `$root + '\'` never matched
+    # 'C:\\' + '\\'); it replaces the baseline's one-line containment test (the fourth pinned block).
+    # r27 (adversary pass-30 A1 on 7879786f): a sixth region, after the $manifestChecks hash loop, re-authenticates the build manifest LAST (pass-29 A1); it is a pure
+    # addition, so no baseline block is taken out for it.
+    CLAIM_SHAPE_REGIONS = 6
+    CLAIM_SHAPE_REPLACED_BASELINE = (("$manifestChecks = @(\n"
+                                      "    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },\n"
+                                      "    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },\n"
+                                      "    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }\n"
+                                      ")\n"),
+                                     ("    $manifest = [IO.File]::ReadAllText($Path) | ConvertFrom-Json\n"
+                                      "    if ($null -eq $manifest) { throw \"ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE $Path\" }\n"),
+                                     # r24 (adversary pass-25 A1 on 63887a9c): the fourth region now opens before the `if` line (the commit is compared ordinally), so the baseline's if line and
+                                     # throw are one pinned block
+                                     ("    if ($commit -ne $ExpectedSourceCommit) {\n"
+                                      "        throw \"ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH $Path declares '$commit', expected '$ExpectedSourceCommit'\"\n"),
+                                     ("        if (-not $fullLogPath.StartsWith($root + '\\', [StringComparison]::OrdinalIgnoreCase)) {\n"))
+
+    @classmethod
+    def without_claim_shape_replaced_baseline(cls, text: str) -> str:
+        """The baseline job with each block a VENUE-STAGE-CLAIM-SHAPE-1 region replaces taken out (each must be there exactly once)."""
+        text = lf(text)
+        for block in cls.CLAIM_SHAPE_REPLACED_BASELINE:
+            assert text.count(block) == 1, f"a baseline block VENUE-STAGE-CLAIM-SHAPE-1 replaces moved: update CLAIM_SHAPE_REPLACED_BASELINE ({block.splitlines()[0]!r})"
+            text = text.replace(block, "", 1)
+        return text
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -527,7 +563,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
                     "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
-                    "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE)}
+                    "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE),
+                    "claim-shape": (cls.CLAIM_SHAPE_OPEN, cls.CLAIM_SHAPE_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -559,7 +596,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         new = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
         old = self.generate(self.baseline_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1", f"old-{name}.job.ps1", extra)
         stripped, new_counts = self.strip_regions(new.read_text(encoding="utf-8"))
-        old_stripped, old_counts = self.strip_regions(old.read_text(encoding="utf-8"))
+        old_stripped, old_counts = self.strip_regions(self.without_claim_shape_replaced_baseline(old.read_text(encoding="utf-8")))
+        self.assertEqual((new_counts["claim-shape"], old_counts["claim-shape"]), (self.CLAIM_SHAPE_REGIONS, 0), "the default job carries exactly the pinned number of bracketed VENUE-STAGE-CLAIM-SHAPE-1 regions; the baseline predates them")
         self.assertEqual(new_counts["leg-terminals"], 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
         self.assertEqual(old_counts["leg-terminals"], 4, "the baseline carries the same four")
         self.assertEqual(new_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the default job carries exactly the pinned number of bracketed DVE-PRESENTMON-EVIDENCE-1 regions")
@@ -8825,7 +8863,7 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # Every card's lines sit inside its own sentinel regions (pinned by GeneratorByteIdentityAndVariantTests); outside them the job is still the
                 # base generator's bytes, and the base carries the same regions as the new job (it is the pinned KEEPALIVE-FAILURE-PUBLISH-LAST-1 generator).
                 kept, new_counts = GeneratorByteIdentityAndVariantTests.strip_regions(new.decode("utf-8"))
-                old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(old.decode("utf-8"))
+                old_kept, old_counts = GeneratorByteIdentityAndVariantTests.strip_regions(GeneratorByteIdentityAndVariantTests.without_claim_shape_replaced_baseline(old.decode("utf-8")))
                 self.assertGreater(new_counts["session-locked"], 0)
                 # PLAYBACK-VSYNC-DEFAULT-1's regions: present in the new job and in the base generator (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 commit), at their pinned count.
                 self.assertEqual((new_counts.pop("playback-vsync"), old_counts.pop("playback-vsync")),
@@ -8845,6 +8883,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1's regions: in the new job only (the base predates the app-swap-window temporal arm), at their pinned count.
                 self.assertEqual((new_counts.pop("pm-internal-gap"), old_counts.pop("pm-internal-gap")),
                                  (GeneratorByteIdentityAndVariantTests.PM_INTERNAL_GAP_REGIONS, 0), name)
+                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5: the claim-shape predicate's regions, in every new job (cuda and cpu); the base predates them.
+                self.assertEqual((new_counts.pop("claim-shape"), old_counts.pop("claim-shape")),
+                                 (GeneratorByteIdentityAndVariantTests.CLAIM_SHAPE_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

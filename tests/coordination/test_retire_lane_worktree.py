@@ -4503,6 +4503,12 @@ UNRESOLVED_EXECUTED_SITES = {
          "Get-JobNotAfterVerdict and Read-JobNotAfterSidecar (it refuses unless both are found; the name match is -eq, case-insensitive, like "
          "PowerShell's own function lookup) parsed from the tracked tools/profiling/bachelor/ultra-magnus-agent.ps1 (:722 and :832), which the "
          "census scans in its own file. Dot-sourcing a definition only defines the function, which is then called on the same bounded worker runspace"),
+        (". ([scriptblock]::Create((Get-VenueClaimShapeSource -Path '",
+         "VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (Grok G17 on #814): inside the worker text Get-VenueStagedBuildManifest builds ($readText), run on the "
+         "bounded read's own runspace. Get-VenueClaimShapeSource is this module's own function (its text is embedded in that worker), and it returns the "
+         "verbatim text of one function, Get-AttrCudaBuildManifestClaimSha256, extracted by a regex from the tracked tools/profiling/bachelor/AttrCudaArtifacts.psm1 "
+         "($script:VenueClaimShapeModulePath, a literal Join-Path under $PSScriptRoot), which the census scans in its own file. Dot-sourcing it only defines that "
+         "predicate, which the read then calls on its manifest claims; nothing here launches a process"),
     ],
     "tools/profiling/dual-venue/Wait-VenueQuiet.ps1": [
         ("[void]$pp.AddScript($IdentityWorkerPrelude)",

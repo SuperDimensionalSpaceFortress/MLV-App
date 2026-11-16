@@ -117,7 +117,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     # Either the owner-clip id pattern (resolved via tools/gates/resolve_consented_clip.py,
@@ -1036,6 +1036,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# PRESENTMON-BACHELOR-CUDA-INTERN
     'Get-AttrCudaSwapWindowRecord',
     'Get-AttrCudaPlaybackTemporalCoverage'
 )) +"`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: the ONE claim-shape predicate every reader of a cached build's artifact claim calls ($manifestChecks below),
+# spliced inside its own sentinel brackets for the same byte-identity reason as the splices above (r5: CI run 43580040634).
+$embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-STAGE-CLAIM-SHAPE-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaBuildManifestClaimSha256'
+)) +"`r`n# VENUE-STAGE-CLAIM-SHAPE-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -2582,11 +2587,16 @@ $buildManifest = Assert-AttrCudaBuildManifest -Path $buildManifestPath -Expected
 # manifest, whose bytes are now authenticated above.
 $pendingSymbolPresence = [bool]$buildManifest.pendingSymbolPresence
 $dllPairManifestSha256 = ([string]$buildManifest.dllPairManifestSha256).ToLowerInvariant()
+# VENUE-STAGE-CLAIM-SHAPE-1 >>>
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): each digest is read through the ONE claim-shape predicate (embedded
+# above), never by member access: member enumeration turned a nested [["<hex>"]] into a digest here while the stage job's guard refused it.
+# A claim of any other shape is '' and refused below as a missing sha256.
 $manifestChecks = @(
-    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },
-    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },
-    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }
+    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'packageZip') },
+    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'exe') },
+    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'dll') }
 )
+# VENUE-STAGE-CLAIM-SHAPE-1 <<<
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1: each cached artifact is hashed ONCE per job. The digest that
 # just matched the authenticated manifest is kept and reused below as the expected value for the
 # deployed copies -- the deployed-copy comparison further down still catches any change since.
@@ -2597,6 +2607,12 @@ foreach ($check in $manifestChecks) {
     $manifestHashes[$check.label] = Get-Sha $check.path "manifest-$($check.label)-hash"
     if ($manifestHashes[$check.label] -ne $check.expectedSha.ToUpperInvariant()) { throw "hash mismatch (vs build manifest $buildManifestName) for $($check.path)" }
 }
+# VENUE-STAGE-CLAIM-SHAPE-1 >>>
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r27 (adversary pass-29 A1 on 7f1886f1): the manifest is re-authenticated LAST, after every artifact hash. A stager
+# repairing this sha retires build.json first, renames the repaired artifacts in, and publishes the new manifest last, so a read that authenticated M0 and then
+# hashed artifacts mid-repair finds no build.json (or other bytes) here and is refused, never recorded as verified (VenueChain's reader already checks last).
+[void](Assert-AttrCudaBuildManifest -Path $buildManifestPath -ExpectedSha256 $BuildManifestSha256 -ExpectedSourceCommit $SourceCommit)
+# VENUE-STAGE-CLAIM-SHAPE-1 <<<
 Write-JobTrace 'step build-manifest-artifacts-verified'
 if (-not (Test-Path -LiteralPath (Join-Path $Cache $PresentMonName))) { throw "cache missing $PresentMonName" }
 # ATTR3-SMOKE-RUNNER-DEPS-1 round 3 (NARROW BY REDESIGN): the runner alone is not launchable --

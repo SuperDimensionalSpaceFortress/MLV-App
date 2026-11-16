@@ -63,7 +63,7 @@ param(
     # Print the planned legs and stop: nothing is generated, probed or submitted, and no venue, commit or build is needed.
     [Parameter(ParameterSetName = 'Set')][switch]$PlanOnly,
     [Parameter(ParameterSetName = 'Leg', Mandatory = $true)][Parameter(ParameterSetName = 'Set')][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
-    [Parameter(ParameterSetName = 'Leg', Mandatory = $true)][Parameter(ParameterSetName = 'Set')][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    [Parameter(ParameterSetName = 'Leg', Mandatory = $true)][Parameter(ParameterSetName = 'Set')][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
     # In set mode, only the cells of this backend are run (default: every backend the set lists).
     [ValidateSet('cuda', 'cpu')][string]$Backend = '',
     # Run only the health probe (and P6) and stop: records the venue's state without running the leg.
