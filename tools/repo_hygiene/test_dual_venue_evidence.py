@@ -520,7 +520,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # it replaces the baseline's one-line throw (the third pinned block).
     # r19 (CI run 43764890818): a fifth region, in Resolve-AttrCudaSmokeRunLog, contains a log under a drive-root containing root (the baseline's `$root + '\'` never matched
     # 'C:\\' + '\\'); it replaces the baseline's one-line containment test (the fourth pinned block).
-    CLAIM_SHAPE_REGIONS = 5
+    # r27 (adversary pass-30 A1 on 7879786f): a sixth region, after the $manifestChecks hash loop, re-authenticates the build manifest LAST (pass-29 A1); it is a pure
+    # addition, so no baseline block is taken out for it.
+    CLAIM_SHAPE_REGIONS = 6
     CLAIM_SHAPE_REPLACED_BASELINE = (("$manifestChecks = @(\n"
                                       "    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },\n"
                                       "    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },\n"
