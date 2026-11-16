@@ -4334,6 +4334,12 @@ ENCODED_LAUNCH_SITES = {
         ('"-EncodedCommand", (New-HeavySlotSentinelCommand',
          "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree"),
     ],
+    "tools/workstation/Setup-MlvWorkstation.ps1": [
+        ("-EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($call)))",
+         "MINI3-CUTOVER-STATE-GAPS-1: the owner-run workstation setup re-running itself under the MSI pwsh when the Store pwsh is detected: a "
+         "synchronous child (`& $msiPwsh ...` then `exit $LASTEXITCODE`), not detached; it installs workstation tooling, takes no lane worktree "
+         "and is never a lane driver the retire guard has to find"),
+    ],
 }
 # MLV-VM-HEAVY-SLOT-ADOPT-1 r3b: sites the scanner reports as `encoded` that launch nothing. Unlike the inventories above, these
 # match the WHOLE site text exactly (not a substring), so a launch built around the same expression is still a site to classify.

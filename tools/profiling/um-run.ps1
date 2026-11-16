@@ -155,7 +155,10 @@ param(
     # make a correct client look early. Deliberately NOT handed $claimedAt itself: a client whose
     # claim is anchored wrongly must not be able to vouch for its own claim instant. Production never
     # passes this.
-    [scriptblock]$TestHookAroundQueueDeadlineClaim = $null
+    [scriptblock]$TestHookAroundQueueDeadlineClaim = $null,
+    # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe (ShareRootAccess.psm1), invoked with -AgentShare;
+    # throwing means the root cannot be read. Production never passes this.
+    [scriptblock]$TestShareRootProbe = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -172,10 +175,17 @@ Import-Module (Join-Path $PSScriptRoot 'UmRunDrop.psm1') -Force
 # BACHELOR-THERMAL-GATE-WAIT-1 r14 (adversary r13 A1): the result's lease ids and tokens reach the caller as the raw strings the agent wrote (ConvertFrom-Json made a timestamp-shaped
 # leaseId a DateTime, so the batch runner held '10/30/2026 10:00:00' for the lease its leg results name '2026-10-30T10:00:00Z' and uncounted valid work as LEASE_LOST)
 Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueRawJson.psm1') -DisableNameChecking
+Import-Module (Join-Path $PSScriptRoot 'ShareRootAccess.psm1') -Force -DisableNameChecking
 $inbox   =Join-Path $AgentShare "inbox"
 $outbox  = Join-Path $AgentShare "outbox"
 $running = Join-Path $AgentShare "running"
 $hb      = Join-Path $AgentShare "heartbeat.txt"
+
+# MINI3-CUTOVER-STATE-GAPS-1: a share root this host cannot read (System error 5: no SMB credential stored for it) made Test-Path say $false
+# and this script print a misleading 'No agent heartbeat'. The typed line comes first, before any heartbeat message. Only the root is probed,
+# by name (never processed\ or outbox\); a readable root with no heartbeat still falls through to 'No agent heartbeat' below.
+$rootAccess = Get-ShareRootAccess -Root $AgentShare -Probe $TestShareRootProbe
+if ($rootAccess.State -ceq 'ACCESS_DENIED') { throw (Get-ShareAccessDeniedLine -Root $AgentShare) }
 
 # Liveness gate: never submit into a dead agent (mirrors the bridge Monitor lesson).
 if (-not (Test-Path $hb)) { throw "No agent heartbeat at $hb - run install-ultra-magnus-agent.ps1 on the host first." }
