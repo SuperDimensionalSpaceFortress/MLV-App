@@ -3263,7 +3263,7 @@ class EvidenceFactory(RunnerHarness):
             i = l.find(" (")
             if i < 0:
                 return l
-            return l[:i] if re.search(r":\d+\)$", l) and l.rfind(":") > i + 2 else None
+            return l[:i] if re.search(r":(\d+|%2)\)$", l) and l.rfind(":") > i + 2 else None
         iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l)]
         return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
                 "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
@@ -16018,6 +16018,7 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
         # r16 adversary advisory A2: derive_block (the independent mirror) counted settings_store on the raw located line, so a real Qt location
         # holding the word refused isolation where the module accepts. It reads the body: a real location strips, an unreadable tail refuses.
         for store, want in (("settings_store=run_scoped (C:/settings_store/MainWindow.cpp:1)", True),
+                            ("settings_store=run_scoped (C:/a%1.cpp:%2)", True),   # r16 pass 2 advisory A2: the old writer's `:%2)` ending
                             ("settings_store=run_scoped (settings_store=venue)", False),
                             ("settings_store=run_scoped", True)):
             with self.subTest(store=store):
