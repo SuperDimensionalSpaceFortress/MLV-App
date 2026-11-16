@@ -1142,7 +1142,15 @@ function Get-DvSmokeSummaryFields {
         # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
         # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR `INTERACTION_TRACE` record is read as every other culture reads it
         $iso = @($lines | Where-Object { [regex]::IsMatch($_, ($rs + 'interaction_trace event=automation\.pacing_isolated(\s|$)'), $script:DvCi) })
-        $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { -not [regex]::IsMatch($_, 'settings_store=run_scoped(\s|$)', $script:DvCi) }).Count -eq 0)
+        # r13 (r13 adversary A2 on 04c1337b): each record names settings_store as one whole token, and that one token is run_scoped. A longer key that
+        # ends in it (`not_settings_store=run_scoped`) is no settings_store, and two settings_store tokens (`settings_store=venue settings_store=run_scoped`)
+        # do not say which store ran, so either refuses isolation
+        $runScoped = {
+            param([string]$x)
+            $stores = [regex]::Matches($x, '(?<!\S)settings_store=(?<v>\S*)', $script:DvCi)
+            ($stores.Count -eq 1) -and [string]::Equals($stores[0].Groups['v'].Value, 'run_scoped', [StringComparison]::OrdinalIgnoreCase)
+        }
+        $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { -not (& $runScoped $_) }).Count -eq 0)
     }
     [pscustomobject]@{ session = $session; sessionUnreadable = $sessionUnreadable; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
 }

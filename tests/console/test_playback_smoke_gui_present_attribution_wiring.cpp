@@ -1330,13 +1330,21 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     const QString sleep = bracedBlockAfter(source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
     ASSERT_TRUE(sleep.contains(QStringLiteral("const double hopSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;")));
     // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r13 (the merge with #811's due-wake sleep): the interval ends when the
-    // sleep ends, before the woken wake runs, and takes out the sent messages the sleep dispatched (dispatchNs), as the other
-    // two sleep accounts do.
+    // sleep ends, before the woken wake runs, and the sent messages the sleep dispatched are taken out of it at their actual
+    // position (r13 adversary A1 on 04c1337b): one interval per slept segment, split around each dispatch span.
     ASSERT_TRUE(sleep.contains(QStringLiteral("const double hopSleepEndS = mlv_stage_timing_now();")));
     ASSERT_TRUE(sleep.contains(QStringLiteral(
-        "m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSleepStartS,\n"
-        "                           std::max( hopSleepStartS, hopSleepEndS - static_cast<double>( dispatchNs ) * 1e-9 ) );")));
-    ASSERT_EQ(1, sleep.count(QStringLiteral("m_guiHopWait.push(")));
+        "for( const std::pair<qint64, qint64> &span : m_playbackDueWake->lastRunnerSleepDispatchSpansNs() )")));
+    ASSERT_TRUE(sleep.contains(QStringLiteral(
+        "m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSegmentStartS, spanStartS );")));
+    ASSERT_TRUE(sleep.contains(QStringLiteral("hopSegmentStartS = std::max( hopSegmentStartS, spanEndS );")));
+    ASSERT_TRUE(sleep.contains(QStringLiteral(
+        "m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSegmentStartS, hopSleepEndS );")));
+    ASSERT_EQ(2, sleep.count(QStringLiteral("m_guiHopWait.push(")));
+    ASSERT_EQ(0, sleep.count(QStringLiteral("hopSleepEndS - static_cast<double>( dispatchNs )")));
+    // the spans' origin is stamped right before the due wake's sleep starts
+    ASSERT_TRUE(sleep.indexOf(QStringLiteral("const double hopDueWakeSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;"))
+                < sleep.indexOf(QStringLiteral("m_playbackDueWake->sleepForSmokeRunner( ms )")));
     ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) > sleep.indexOf(QStringLiteral("QThread::msleep( ms );")));
     ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) > sleep.indexOf(QStringLiteral("const qint64 dispatchNs =")));
     ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) < sleep.indexOf(QStringLiteral("m_playbackDueWake->dispatchSentMessages();")));

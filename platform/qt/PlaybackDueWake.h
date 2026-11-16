@@ -40,6 +40,8 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <utility>
+#include <vector>
 
 class QObject;
 
@@ -475,6 +477,10 @@ public:
      *  dispatched none, or returned NotHandled). That dispatch is GUI work: the trace says Running while it runs, and the caller
      *  takes this time out of the runner sleep it accounts (MainWindow::sleepGuiThreadForSmokeRunner). */
     qint64 lastRunnerSleepDispatchNs() const;
+    /*! HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r13 (r13 adversary A1): WHERE the LAST sleepForSmokeRunner ran those
+     *  dispatches, each as [start, end] nanoseconds from that call's start, in order (empty when it dispatched none). The caller
+     *  splits the runner-sleep interval it records around them, so a dispatch is never timed as sleep at the wrong position. */
+    std::vector<std::pair<qint64, qint64>> lastRunnerSleepDispatchSpansNs() const;
     /*! GUI thread: fire the wakes the runner sleep held (through the gate), then dispatch the pending SENT messages (the
      *  wake's window procedure runs here), and nothing else -- posted messages stay queued for the caller's next processEvents. */
     void dispatchSentMessages();

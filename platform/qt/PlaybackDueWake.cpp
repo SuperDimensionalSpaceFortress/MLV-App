@@ -94,6 +94,8 @@ struct PlaybackDueWake::Impl
     // r3 (r2 adversary pass 7 A3): the time the LAST sleepForSmokeRunner spent running sent messages (GUI work, traced as Running,
     // not RunnerSleep); the caller takes it out of the sleep it accounts (lastRunnerSleepDispatchNs)
     qint64 runnerSleepDispatchNs = 0;
+    // r13 (r13 adversary A1): each of those dispatches as [start, end] ns from the sleep's start (lastRunnerSleepDispatchSpansNs)
+    std::vector<std::pair<qint64, qint64>> runnerSleepDispatchSpans;
     quint64 runnerSleepsWokenOther = 0;
     // r2 G3: runner sleeps whose message wait failed (WAIT_FAILED); the rest of the interval was a plain msleep
     quint64 runnerSleepWaitFailed = 0;
@@ -794,6 +796,7 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
 {
 #ifdef Q_OS_WIN
     d->runnerSleepDispatchNs = 0;
+    d->runnerSleepDispatchSpans.clear();
     if( !sendsNotify() ) return RunnerSleep::NotHandled;
     noteRunnerSleep( true );
     // QS_SENDMESSAGE only: the sent wake ends the sleep; posted messages, timers and input leave the runner's cadence as it
@@ -830,12 +833,15 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
             // (lastRunnerSleepDispatchNs), which takes it out of the runner sleep it accounts
             const size_t heldBefore = d->heldWakes.size();
             noteRunnerSleep( false );
+            const qint64 dispatchStartNs = slept.nsecsElapsed();
             QElapsedTimer dispatchClock;
             dispatchClock.start();
             d->inRunnerSleepDispatch = true;
             dispatchPendingSentMessages();
             d->inRunnerSleepDispatch = false;
-            d->runnerSleepDispatchNs += dispatchClock.nsecsElapsed();
+            const qint64 dispatchSpentNs = dispatchClock.nsecsElapsed();
+            d->runnerSleepDispatchNs += dispatchSpentNs;
+            d->runnerSleepDispatchSpans.emplace_back( dispatchStartNs, dispatchStartNs + dispatchSpentNs );
             if( d->heldWakes.size() > heldBefore )
             {
                 ++d->runnerSleepsWokenBySent;
@@ -859,6 +865,11 @@ PlaybackDueWake::RunnerSleep PlaybackDueWake::sleepForSmokeRunner( unsigned long
 qint64 PlaybackDueWake::lastRunnerSleepDispatchNs() const
 {
     return d->runnerSleepDispatchNs;
+}
+
+std::vector<std::pair<qint64, qint64>> PlaybackDueWake::lastRunnerSleepDispatchSpansNs() const
+{
+    return d->runnerSleepDispatchSpans;
 }
 
 void PlaybackDueWake::dispatchSentMessages()

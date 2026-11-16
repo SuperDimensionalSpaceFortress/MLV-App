@@ -3264,7 +3264,8 @@ class EvidenceFactory(RunnerHarness):
                 "expectedRunNonce": result.get("evidence", {}).get("runNonce"), "observedRunNonce": f.get("run_nonce"),
                 "manifestRunNonce": manifest.get("smokeRunLog", {}).get("runNonce"), "logSha256": log_sha,
                 "logShaBound": declared == log_sha and (not man_sha or man_sha.lower() == log_sha),
-                "settingsIsolated": bool(iso) and all(re.search(r"settings_store=run_scoped(\s|$)", l) for l in iso),
+                # r13 (r13 adversary A2 sibling): one whole settings_store token per record, and it is run_scoped
+                "settingsIsolated": bool(iso) and all([v.lower() for v in re.findall(r"(?<!\S)settings_store=(\S*)", l, re.I)] == ["run_scoped"] for l in iso),
                 "fixtureRehearsal": summary.get("fixtureRehearsal"), "clipId": summary.get("clipId")}
 
     @staticmethod
@@ -16398,6 +16399,15 @@ class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
                                         "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
             "pacing_isolated reads": (base + "INTERACTION_TRACE EVENT=AUTOMATION.PACING_ISOLATED SETTINGS_STORE=RUN_SCOPED\n",
                                       "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", True),
+            # r13 (r13 adversary A2 on 04c1337b, its input verbatim): a longer key ending in settings_store, or two settings_store tokens, refuses isolation
+            "pacing_isolated a2 verbatim": (base + "INTERACTION_TRACE event=automation.pacing_isolated settings_store=venue not_settings_store=run_scoped\n",
+                                            "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated suffix key": (base + "interaction_trace event=automation.pacing_isolated not_settings_store=run_scoped\n",
+                                           "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated two stores": (base + "interaction_trace event=automation.pacing_isolated settings_store=venue settings_store=run_scoped\n",
+                                           "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated one store": (base + "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry settings_store=run_scoped persisted_fps_override=0\n",
+                                          "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", True),
             # Get-DvScaleEvidence (the clamp record)
             "scale clamp": ("PLAYBACK_SCALE_CLAMPED_FOR_GPU_TEXTURE_ROUTE requested=2 EFFECTIVE=1\n",
                             "(Get-DvScaleEvidence -Spec ('{\"scaleFactor\":2}' | ConvertFrom-Json) -Backend cuda -LogText $env:DVE_LOG).effectiveScale", 1),
