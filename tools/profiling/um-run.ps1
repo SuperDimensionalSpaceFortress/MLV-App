@@ -472,7 +472,9 @@ while ($true) {
                     $ownsClaim = $true
                     $readSucceeded = $false
                     try {
-                        $currentMeta = Read-UmRunClaim -Path $metaFinal
+                        # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 adversary pass 5 A1: the read keeps the CALLER's error preference and defaults (as before this card; the module
+                        # rollback does the same), so a claim that cannot be read is never read as ours under a Continue default; only the root array is not enumerated.
+                        $currentMeta = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json -NoEnumerate
                         $readSucceeded = $true
                         $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
                     } catch {

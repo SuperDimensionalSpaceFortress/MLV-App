@@ -1973,6 +1973,32 @@ class UmRunEndToEndTests(_Share):
         self.assertTrue((self.inbox / "demo.meta.json").exists(),
                          "a surfaced retraction cleanup failure must mean the metadata really was left behind")
 
+    def test_a_retraction_keeps_another_submissions_claim_it_cannot_read_under_a_continue_default(self) -> None:
+        # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 adversary pass 5 A1 (introduced): the retraction's nonce read became Read-UmRunClaim, whose -ErrorAction Stop ignores a
+        # caller's Get-Content:ErrorAction = Continue default, so another submission's claim (held readable by nobody, deletable by anyone) read as "no proof either
+        # way" and was deleted; the base's read honoured Continue, yielded nothing and left it. RED before the fix: demo.meta.json was gone.
+        foreign = '{"jobId":"demo","nonce":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+        meta = _q(self.inbox / 'demo.meta.json')
+        hook = ("{ [IO.File]::WriteAllText(" + meta + ", '" + foreign + "'); $script:umrunTestLock = [IO.File]::Open(" + meta + ", 'Open', 'Read', 'Delete') }")
+        wrapper = self.tmp / "run-with-retraction-foreign-claim-continue-hook.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "$global:PSDefaultParameterValues['Get-Content:ErrorAction'] = 'Continue'\n"
+            f"$hook = {hook}\n"
+            "try {\n"
+            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
+            "-TimeoutSec 1 -PollSeconds 1 -MaxQueueWaitSec 0 -JobId 'demo' "
+            "-TestHookAfterRetractionRename $hook\n"
+            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
+            "} catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+                               capture_output=True, text=True, timeout=30)
+        combined = proc.stdout + proc.stderr
+        self.assertTrue((self.inbox / "demo.meta.json").exists(), "another submission's claim is not deleted by this one's retraction\n" + combined)
+        self.assertIn("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", (self.inbox / "demo.meta.json").read_text(encoding="ascii"), combined)
+
     def test_a_retraction_job_temp_cleanup_failure_is_surfaced_not_silently_swallowed(self) -> None:
         # The other half: a failed removal of this client's OWN renamed-out job temporary (the
         # withdrawn job's bytes, moved aside during retraction) used to be silently swallowed too.
