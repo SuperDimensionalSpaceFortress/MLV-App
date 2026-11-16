@@ -6999,10 +6999,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # spelling of the same cap (330.0, [double]330, 330.00) is the contract
         text = RUNNER.read_text(encoding="utf-8")
         guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
-        m = re.search(r"\$share = \[Math\]::Min\((\[double\]\s*)?(\d+(?:\.\d+)?)\s*,\s*\$script:guardBudget\.sec\s*-\s*\$script:guardBudget\.clock\.Elapsed\.TotalSeconds\)", guard)
-        self.assertIsNotNone(m, "the guard's share is Min(<cap>, <budget> - <elapsed>)")
-        self.assertEqual(float(m.group(2)), 330.0, "the cap is the preflight's own 30 s + 300 s bounds")
-        self.assertTrue(m.group(1) or "." in m.group(2), "the cap is a double: an integer first operand takes the Int32 overload and rounds the room (2.3 s -> 2)")
+        # r26 (CI heavy 1/11, run 43883120765): since r22/r23 the budget's elapsed time is sampled ONCE, in the same guarded statement, into a variable the share and the share's end
+        # (`$shareEndSec = $shareAtSec + ...`) both read, so the two cannot disagree: `$share = Min(<cap>, <budget> - <that one sample>)`. The share is still not a second clock read.
+        m = re.search(r"if \(\$null -ne \$script:guardBudget\) \{\s*\$(?P<at>\w+) = \$script:guardBudget\.clock\.Elapsed\.TotalSeconds\s*;\s*"
+                      r"\$share = \[Math\]::Min\((?P<dbl>\[double\]\s*)?(?P<cap>\d+(?:\.\d+)?)\s*,\s*\$script:guardBudget\.sec\s*-\s*\$(?P=at)\)", guard)
+        self.assertIsNotNone(m, "the guard's share is Min(<cap>, <budget> - <one sample of the budget's elapsed seconds>), sampled in the same `if ($null -ne $script:guardBudget) { ... }` block")
+        self.assertEqual(float(m.group("cap")), 330.0, "the cap is the preflight's own 30 s + 300 s bounds")
+        self.assertTrue(m.group("dbl") or "." in m.group("cap"), "the cap is a double: an integer first operand takes the Int32 overload and rounds the room (2.3 s -> 2)")
+        # the one sample: assigned exactly once in the guard, from the budget's own Stopwatch, and the share's end reads that same variable (no second clock read for either)
+        at = m.group("at")
+        self.assertEqual(len(re.findall(r"\$" + at + r" = \$script:guardBudget\.clock\.Elapsed\.TotalSeconds", guard)), 1, "the elapsed sample is assigned once")
+        self.assertRegex(guard, r"\$shareEndSec = \$" + at + r" \+ \[Math\]::Max\(0\.0, \$share\)", "the share's end is the same sample plus the share")
         self.assertIn("-TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", text, "the preflight's bounds the cap is the sum of")
 
     def test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand(self) -> None:
