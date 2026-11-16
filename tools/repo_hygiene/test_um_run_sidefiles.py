@@ -1999,6 +1999,27 @@ class UmRunEndToEndTests(_Share):
         self.assertTrue((self.inbox / "demo.meta.json").exists(), "another submission's claim is not deleted by this one's retraction\n" + combined)
         self.assertIn("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", (self.inbox / "demo.meta.json").read_text(encoding="ascii"), combined)
 
+    def test_a_retraction_still_removes_its_own_claim_under_an_as_hashtable_default(self) -> None:
+        # adversary pass 6 A1 (introduced): the ownership predicate accepted only a PSCustomObject, so a caller whose session defaults ConvertFrom-Json to -AsHashtable
+        # (a dictionary out) made this submission's own exact nonce read as "not ours" and the retraction left its own claim behind (the base removed it).
+        # RED before the fix: demo.meta.json was still in the inbox.
+        wrapper = self.tmp / "run-with-retraction-as-hashtable-default.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "$global:PSDefaultParameterValues['ConvertFrom-Json:AsHashtable'] = $true\n"
+            "try {\n"
+            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
+            "-TimeoutSec 1 -PollSeconds 1 -MaxQueueWaitSec 0 -JobId 'demo'\n"
+            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
+            "} catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+                               capture_output=True, text=True, timeout=30)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("THREW RETRACTED:", combined, combined)
+        self.assertFalse((self.inbox / "demo.meta.json").exists(), "this submission's own claim is removed by its own retraction\n" + combined)
+
     def test_a_retraction_job_temp_cleanup_failure_is_surfaced_not_silently_swallowed(self) -> None:
         # The other half: a failed removal of this client's OWN renamed-out job temporary (the
         # withdrawn job's bytes, moved aside during retraction) used to be silently swallowed too.

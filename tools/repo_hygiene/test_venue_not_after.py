@@ -638,7 +638,11 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             # the claim) and/or let go ('release').
             "$state = @{}\n"
             "if ($null -ne $c.repub.seam) { $p.TestHookBeforeMetaReplaceAttempt = { param($a, $d)\n"
-            "  if ($a -eq 1) { $state.h = [IO.File]::Open($d, 'Open', 'Read', 'ReadWrite') }\n"
+            # adversary pass 6 A3: 'holdSource' holds the re-publish TEMP (reads allowed, no Delete sharing) from pass 1 on instead of the claim, so the destination is healthy;
+            # 'noHold' takes no handle at all (the first rename is not denied)
+            "  if ($a -eq 1 -and $c.repub.seam.holdSource) { $t4 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "    $state.h = [IO.File]::Open($t4.FullName, 'Open', 'Read', 'Read') }\n"
+            "  elseif ($a -eq 1 -and -not $c.repub.seam.noHold) { $state.h = [IO.File]::Open($d, 'Open', 'Read', 'ReadWrite') }\n"
             "  if ($a -eq 2) {\n"
             # 'write' is the claim's new text; <N> stands for this submission's real nonce; 'mutateTmp' writes the re-publish temp's own text with a NUL
             # inside the property name notAfterUtc (the bytes the drop expects, but not identical to them)
@@ -658,6 +662,11 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "      $state.src = [IO.File]::Open($t3.FullName, 'Open', 'Read', 'None') }\n"
             "    if ($c.repub.seam.land) { $state.h.Dispose(); $t = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $d, $true) }\n"
             "    if ($c.repub.seam.release) { $state.h.Dispose() } } } }\n"
+            # adversary pass 6 A2: 'rewriteAfterVerify' = N rewrites the re-publish temp (notAfterUtc -> notBeforeUtc) in the gap between pass N's verifying read and its
+            # Move (TestHookAfterMetaSourceVerified); seen.rewrote says whether the rewrite got through. Set at top level, not from inside another hook.
+            "if ($c.repub.seam.rewriteAfterVerify) { $p.TestHookAfterMetaSourceVerified = { param($sp, $at)\n"
+            "  if ($at -eq [int]$c.repub.seam.rewriteAfterVerify) {\n"
+            "    try { [IO.File]::WriteAllText($sp, [IO.File]::ReadAllText($sp).Replace('notAfterUtc', 'notBeforeUtc')); $seen.rewrote = $true } catch { $seen.rewrote = $false } } } }\n"
             "$threw = ''; $lines = @()\n"
             "if ($c.repub.continuePref) { $ErrorActionPreference = 'Continue' }\n"   # adversary pass 4 A2: the caller's preference (the accepted -ErrorAction Continue invocation)
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
@@ -1195,6 +1204,64 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
         self.assertIn("priorCause=DESTINATION_HELD_OR_ACL", r["threw"], "the first denial's diagnosis is not lost")
         self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_cannot_have_its_verified_source_rewritten_before_the_move(self) -> None:
+        # adversary pass 6 A2 (introduced): the retry verified the temp with a read that closed, then moved it, so bytes written in that gap (same jobId and nonce, no
+        # `notAfterUtc`) were published while the drop reported the intended deadline. The verifying read now stays open (read and delete sharing only, so no writer
+        # can open the file) until the move has happened. RED before the fix: the rewrite got through and job-x.meta.json carried notBeforeUtc.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"release": True, "rewriteAfterVerify": 2}})
+        self.assertFalse(r["seen"].get("rewrote"), "the rewrite was refused while the verified source was held")
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes never reached the published claim")
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertIn("notAfterUtc", r["meta"])
+
+    def test_the_first_pass_move_has_the_same_verified_source_hold(self) -> None:
+        # adversary pass 6 A2, sibling: the first pass verified the temp with a read-back that closed before its Move (no denial needed to open the gap).
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"noHold": True, "rewriteAfterVerify": 1}})
+        self.assertFalse(r["seen"].get("rewrote"), "the rewrite was refused while the verified source was held")
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes never reached the published claim")
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+
+    def test_a_denial_caused_by_a_held_source_is_named_as_the_source_not_the_destination(self) -> None:
+        # adversary pass 6 A3 (introduced): the temp is held open (reads allowed, no Delete sharing) through every attempt, so its rename is refused while the destination
+        # is healthy; the classifier probed only the destination and reported cause=DESTINATION_HELD_OR_ACL probe=OPEN_OK. RED before the fix.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"holdSource": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=SOURCE_HELD_OR_ACL", r["threw"])
+        self.assertNotIn("cause=DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_the_claim_ownership_predicate_accepts_a_dictionary_claim_exactly_as_it_accepts_an_object(self) -> None:
+        # adversary pass 6 A1 (introduced): the predicate accepted only a PSCustomObject, so a caller whose session defaults ConvertFrom-Json to -AsHashtable made this
+        # submission's own claim read as "not ours". Same ordinal nonce rule on both shapes; a root array, a scalar and a non-string nonce are never ours.
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DROP_MODULE}' -Force\n"
+            "$n = 'a' * 32\n"
+            "$parse = { param($t, [bool]$h) if ($h) { $t | ConvertFrom-Json -NoEnumerate -AsHashtable } else { $t | ConvertFrom-Json -NoEnumerate } }\n"
+            "$rows = foreach ($h in @($false, $true)) {\n"
+            "  foreach ($case in @(\n"
+            "    @{ k = 'own'; t = ('{\"jobId\":\"j\",\"nonce\":\"' + $n + '\"}') },\n"
+            "    @{ k = 'other'; t = '{\"jobId\":\"j\",\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}' },\n"
+            "    @{ k = 'nul'; t = ('{\"nonce\":\"' + $n + '\\u0000\"}') },\n"
+            "    @{ k = 'number'; t = '{\"nonce\":5}' },\n"
+            "    @{ k = 'nonce-missing'; t = '{\"jobId\":\"j\"}' },\n"
+            "    @{ k = 'array'; t = ('[{\"nonce\":\"' + $n + '\"}]') },\n"
+            "    @{ k = 'scalar'; t = '\"x\"' })) {\n"
+            "    $claim = & $parse $case.t $h\n"
+            "    [ordered]@{ k = ($case.k + $(if ($h) { '/dict' } else { '/obj' })); own = [bool](Test-UmRunClaimIsOwn -Claim $claim -Nonce $n) } } }\n"
+            "ConvertTo-Json -Compress -InputObject @($rows)\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = {row["k"]: row["own"] for row in json.loads(p.stdout.strip().splitlines()[-1])}
+        for shape in ("obj", "dict"):
+            self.assertTrue(got["own/" + shape], f"an own claim is ours as a {shape}: {got}")
+            for k in ("other", "nul", "number", "nonce-missing", "array", "scalar"):
+                self.assertFalse(got[k + "/" + shape], f"{k} is not ours as a {shape}: {got}")
 
     def test_a_rollback_keeps_a_claim_it_could_not_read_under_a_continue_preference(self) -> None:
         # adversary pass 4 A2 (introduced): the rollback's read became a terminating one, so under -ErrorAction Continue a claim another submission holds (readable by
