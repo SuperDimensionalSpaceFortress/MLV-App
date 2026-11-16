@@ -1635,6 +1635,89 @@ if ($fnLoaded -and (Test-Has 'Remove-RejectedArchive' 'r15 A6') -and (Test-Has '
     }
 }
 
+# ================================================================ r15 iteration 2 (head 859af4c1): adversary pass 13, A1-A5
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r15 p13 A1-A2')) {
+    $p13Hit = [ordered]@{
+        'A1 a block value after a CR-only line break (JSON)'   = '{"password":' + "`r" + '"hunter2"}'
+        'A1 a YAML block value after a CR-only line break'     = "password:`r  hunter2`r"
+        'A1 a block value after a NEL line break'              = "password:$([char]0x85)  hunter2"
+        'A1 a block value after an LS line break'              = "password:$([char]0x2028)  hunter2"
+        'A2 a braced PowerShell env key'                       = '${env:DB_PASSWORD} = ''hunter2'''
+        'A2 a subscripted script key'                          = '$config[''password''] = ''hunter2'''
+        'A2 a double-quoted subscript'                         = '$c["token"]="hunter2"'
+    }
+    foreach ($k in $p13Hit.Keys) { Assert-That ((Test-CredentialText $p13Hit[$k]) -and (Get-CredentialHitLine $p13Hit[$k]) -gt 0) "r15 p13 $k is a credential" $p13Hit[$k] }
+    Assert-That ((Get-CredentialHitLine ("# a`r# b`rpassword:`r  hunter2`r")) -eq 3) 'r15 p13 A1 Get-CredentialHitLine: a CR-only file reports the line of the key' "$(Get-CredentialHitLine ("# a`r# b`rpassword:`r  hunter2`r"))"
+    # the generated sweep again, over every line-separator form (CR, CRLF, NEL, LS) for the forms that span lines; depth 1-2 wrappers
+    $p13Breaks = [ordered]@{ 'CR' = "`r"; 'CRLF' = "`r`n"; 'NEL' = [string][char]0x85; 'LS' = [string][char]0x2028 }
+    $p13Miss = [System.Collections.Generic.List[string]]::new(); $p13N = 0
+    foreach ($bn in $p13Breaks.Keys) {
+        foreach ($fn in 'block', 'block, comment between', 'flow JSON') {
+            foreach ($val in @($r15Values | Where-Object { $_.Depth -le 2 })) {
+                foreach ($cn in $r15Comments.Keys) {
+                    $text = (& $r15Comments[$cn] (& $r15Forms[$fn] $val.Value)).Replace("`n", $p13Breaks[$bn])
+                    if ($fn -eq 'flow JSON') { $text = $text.Replace('{"password": ', '{"password":' + $p13Breaks[$bn]) }
+                    $p13N++
+                    if (-not (Test-CredentialText $text) -or (Get-CredentialHitLine $text) -le 0) { $p13Miss.Add("$bn / $fn / $($val.Name) / $cn") }
+                }
+            }
+        }
+    }
+    Assert-That ($p13Miss.Count -eq 0 -and $p13N -ge 3000) "r15 p13 A1 generated sweep over CR / CRLF / NEL / LS: all $p13N cases refuse" ("misses=$($p13Miss.Count): " + (($p13Miss | Select-Object -First 12) -join '; '))
+}
+
+# ---------------------------------------------------------------- r15 p13 A3: the credential-ROLE guard of Import is never narrower than the detector's name list
+if ($fnLoaded -and (Test-Has 'Get-ImportCredentialSkips' 'r15 p13 A3') -and (Test-Has 'Test-CredentialNamePresent' 'r15 p13 A3')) {
+    foreach ($nm in 'api.key', 'pass_word', 'auth', 'pwd', 'private.key', 'dbPassword') { Assert-That (Test-CredentialNamePresent ('{"' + $nm + '":""}')) "r15 p13 A3 Test-CredentialNamePresent: '$nm' with an exempt value is a credential name" }
+    Assert-That (-not (Test-CredentialNamePresent '{"theme":"light","author":"x"}')) 'r15 p13 A3 Test-CredentialNamePresent (control): no secret-named word'
+    $p13a3 = New-Scratch 'r15-p13-a3'
+    $p13Src = Join-Path $p13a3 'bundle'; $p13Dst = Join-Path $p13a3 'host'
+    [void][IO.Directory]::CreateDirectory($p13Src); [void][IO.Directory]::CreateDirectory($p13Dst)
+    [IO.File]::WriteAllText((Join-Path $p13Src 'settings.json'), '{"theme":"light"}'); (Get-Item -LiteralPath (Join-Path $p13Src 'settings.json')).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 11, 0, 0, [DateTimeKind]::Utc)
+    [IO.File]::WriteAllText((Join-Path $p13Dst 'settings.json'), '{"api.key":""}'); (Get-Item -LiteralPath (Join-Path $p13Dst 'settings.json')).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 10, 0, 0, [DateTimeKind]::Utc)
+    $p13sk = @(Get-ImportCredentialSkips -SourceDir $p13Src -DestDir $p13Dst)
+    Assert-That (@($p13sk | Where-Object { $_.Reason -eq 'host credential-role file names a credential key' }).Count -eq 1) 'r15 p13 A3 import: a host settings.json naming api.key (exempt value) is skipped by the role guard' (($p13sk | ForEach-Object Reason) -join ';')
+    $p13cr = Copy-ImportFileLocked -Source ([IO.FileInfo]::new((Join-Path $p13Src 'settings.json'))) -Dest (Join-Path $p13Dst 'settings.json') -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+    Assert-That ($p13cr.Result -ceq 'changed' -and ([IO.File]::ReadAllText((Join-Path $p13Dst 'settings.json'))) -ceq '{"api.key":""}') 'r15 p13 A3 import: the locked copy never replaces it either' "$($p13cr.Result)"
+    $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r15 p13 A4: a save that landed after the swap stays LIVE; the rollback never replaces it
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r15 p13 A4')) {
+    Reset-R15Fixture
+    $script:P13RollbackRan = $false
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v1"}'); [IO.File]::SetLastWriteTimeUtc($Dest, $t12) }
+    $script:ImportAfterSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"api_key":"owner-v2"}'); [IO.File]::SetLastWriteTimeUtc($Dest, $t13) }
+    $script:ImportBeforeRollbackHook = { param($Dest) $script:P13RollbackRan = $true }
+    $p13a4 = ''
+    try { $p13r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($r15Src)) -Dest $r15Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false; $p13a4 = "result=$($p13r.Result)" } catch { $p13a4 = $_.Exception.Message } finally { $script:ImportBeforeSwapHook = $null; $script:ImportAfterSwapHook = $null; $script:ImportBeforeRollbackHook = $null }
+    # the finding's owner-v3: a later save after the rollback decided; it must simply land and stay (nothing of this run touches the path again)
+    [IO.File]::WriteAllText($r15Dst, '{"api_key":"owner-v3"}')
+    Assert-That ($p13a4 -like 'IMPORT_ROLLBACK_DEST_CHANGED*' -and -not $script:P13RollbackRan) 'r15 p13 A4 import: a save after the swap is detected under the lock BEFORE any rollback Replace (typed IMPORT_ROLLBACK_DEST_CHANGED, no Replace)' "$a4msg | ran=$($script:P13RollbackRan) | $p13a4"
+    Assert-That (([IO.File]::ReadAllText($r15Dst)) -ceq '{"api_key":"owner-v3"}' -and @(Get-ChildItem -LiteralPath (Split-Path -Parent $r15Dst) -Force | Where-Object { $_.Name -like '*.mlvimport-*' }).Count -eq 0) 'r15 p13 A4 import: the newest save is live at the host path and no rollback file is left' ((Get-ChildItem -LiteralPath (Split-Path -Parent $r15Dst) -Force | ForEach-Object Name) -join ';')
+}
+
+# ---------------------------------------------------------------- r15 p13 A5: Clone refuses an existing checkout whose remotes name other repositories
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r15 p13 A5') -and (Test-Has 'Test-GitRemoteUrlSame' 'r15 p13 A5')) {
+    Assert-That (Test-GitRemoteUrlSame 'git@github.com:SuperDimensionalSpaceFortress/MLV-App.git' 'https://github.com/superdimensionalspacefortress/MLV-App/') 'r15 p13 A5 url: ssh and https forms of one repository are the same'
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://github.com/ilia3101/MLV-App.git' 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git')) 'r15 p13 A5 url: two repositories differ'
+    $p13ws = New-Scratch 'r15-p13-a5'
+    $p13repo = Join-Path $p13ws 'MLV-App'; $p13doc = Join-Path $p13ws 'softwarefactory-fleet-doctrine'
+    foreach ($r in $p13repo, $p13doc) { [void][IO.Directory]::CreateDirectory($r); & git -C $r init -q 2>$null }
+    & git -C $p13repo remote add fork 'https://github.com/ilia3101/MLV-App.git'
+    & git -C $p13repo remote add origin 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git'
+    & git -C $p13doc remote add origin 'https://github.com/example/unrelated.git'
+    $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo
+    $script:Repo = $p13repo; $Repo = $p13repo; $script:DoctrineRepo = $p13doc; $DoctrineRepo = $p13doc
+    $script:Failures.Clear()
+    try { Invoke-PhaseClone } catch { }
+    $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH*' }).Count -ge 1) 'r15 p13 A5 clone: swapped fork/origin remotes are refused typed CLONE_REMOTE_MISMATCH' ($script:Failures -join ',')
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_DOCTRINE_REMOTE_MISMATCH*' }).Count -eq 1) 'r15 p13 A5 clone: an unrelated checkout at the doctrine path is refused typed CLONE_DOCTRINE_REMOTE_MISMATCH' ($script:Failures -join ',')
+    Assert-That (-not ((@(& git -C $p13repo branch -vv 2>$null) -join ' ') -match 'fork/master')) 'r15 p13 A5 clone: master is not set to track the wrong fork/master'
+    $script:Failures.Clear()
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

@@ -611,6 +611,16 @@ function Invoke-PhaseClone {
     if (Test-Path -LiteralPath (Join-Path $Repo '.git')) {
         Invoke-Step 'MLV-App remotes, fetch, master tracks fork/master' {
             $remotes = @(& git -C $Repo remote)
+            # r15 pass 13 A5: an EXISTING remote must name the intended repository (fork = $ForkUrl, origin = $UpstreamUrl). A remote that names another repository (the
+            # two swapped, say) is refused typed CLONE_REMOTE_MISMATCH before anything is fetched or tracked; it is never silently accepted or rewritten.
+            foreach ($want in @(@('fork', $ForkUrl), @('origin', $UpstreamUrl))) {
+                if ($remotes -notcontains $want[0]) { continue }
+                $have = (@(& git -C $Repo remote get-url $want[0]) -join '').Trim()
+                if (-not (Test-GitRemoteUrlSame $have $want[1])) {
+                    $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0])")
+                    throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' is $have, expected $($want[1]) (nothing was fetched; fix the remote by hand and re-run -Phase Clone)"
+                }
+            }
             if ($remotes -notcontains 'fork') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'fork', $ForkUrl)) }
             if ($remotes -notcontains 'origin') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'origin', $UpstreamUrl)) }
             [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', 'core.longpaths', 'true'))
@@ -624,7 +634,30 @@ function Invoke-PhaseClone {
             $code = Invoke-Native -Exe 'git' -Arguments @('clone', $DoctrineUrl, $DoctrineRepo) -AllowFail
             if ($code -ne 0) { Write-Log 'doctrine bus clone failed (private repo?): run "gh auth login", then re-run -Phase Clone' 'MANUAL' }
         }
-    } else { Write-Log "present: $DoctrineRepo" 'OK' }
+    } else {
+        # r15 pass 13 A5: an existing doctrine checkout must BE the doctrine repository (its 'origin' names $DoctrineUrl); any other checkout is a typed failure
+        $dHave = (@(& git -C $DoctrineRepo remote get-url origin 2>$null) -join '').Trim()
+        if (Test-GitRemoteUrlSame $dHave $DoctrineUrl) { Write-Log "present: $DoctrineRepo" 'OK' }
+        else {
+            Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$dHave', expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
+            $script:Failures.Add("CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo")
+        }
+    }
+}
+
+# r15 pass 13 A5: true when two git remote URLs name the same repository: compared case-insensitively after the GitHub ssh forms ('git@github.com:o/r',
+# 'ssh://git@github.com/o/r') are written as 'https://github.com/o/r' and a trailing '.git' or '/' is dropped. An empty URL never matches.
+function Test-GitRemoteUrlSame {
+    param([string]$A, [string]$B)
+    $norm = {
+        param($u)
+        $s = "$u".Trim()
+        $s = $s -replace '^(?i)git@github\.com:', 'https://github.com/' -replace '^(?i)ssh://git@github\.com/', 'https://github.com/'
+        $s = $s -replace '/+$', '' -replace '(?i)\.git$', ''
+        return $s.ToLowerInvariant()
+    }
+    $x = & $norm $A; $y = & $norm $B
+    return ($x.Length -gt 0 -and $x -ceq $y)
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -704,12 +737,16 @@ $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACC
 # secret). The detector is never narrowed to make a staged file pass (r11 F-B1). Every guard site (the Export stage scan and its typed EXPORT_CREDENTIAL_HIT line,
 # the archive re-check, the Import bundle and host guards, the locked copy, the settings.json rewrite and the backup copy) calls Test-CredentialText /
 # Get-CredentialHitLine, which call this rule and nothing else besides the known token shapes below.
-$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-]*)(["'']?)[ \t]*(:|=(?!=))'
+# r15 pass 13 A2: between the name and its separator up to three CLOSING characters may stand (a quote, ']', ')', '}'), so a subscripted or braced script key is a key
+# too: '${env:DB_PASSWORD} = ''x''', '$config[''password''] = ''x''', '$c["token"]="x"', '(password) = x'. (Blanks may stand before and after them.)
+$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-]*)((?:[ \t]*["''\]\)\}]){0,3})[ \t]*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
 # r15 (hub ruling on adversary pass 12 A1-A3, DENY BY DEFAULT on the key name): the value span regexes, the quoted-run regexes and the netrc record tokenizer of
 # r14 are gone (they stripped quotes, braces, comments and CDATA before the exemption test). What is left is the CLOSED exemption list, compared against the whole
 # RAW value after trimming outer whitespace only (Test-CredentialValueExempt), and the two netrc regexes (Get-CredentialNetrcHitIndex).
 $script:CredentialExemptLiterals = @('""', "''", 'null', '~', '[]', '{}', '***')
+# r15 pass 13 A1: every line separator form, rewritten to one '\n' at the detector's entry (Get-CredentialHitLine)
+$script:CredentialLineBreakRegex = [regex]::new("\r\n|\r|\u0085| | ")
 $script:CredentialPlaceholderRegex = [regex]::new('^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z_ -]+>)$')
 # a netrc-shaped text: it carries a whitespace-delimited netrc keyword that opens or names a record ('machine', 'default', 'login', 'macdef')
 $script:CredentialNetrcShapeRegex = [regex]::new('(?i)(?<!\S)(?:machine|default|login|macdef)(?!\S)')
@@ -977,10 +1014,15 @@ function Test-CredentialText {
 function Get-CredentialHitLine {
     param([string]$Text)
     if (-not $Text) { return 0 }
+    # r15 pass 13 A1: every line separator is ONE '\n' before any rule runs ('\r\n', a lone '\r' as in '{"password":\r"hunter2"}', NEL U+0085, LS U+2028, PS U+2029).
+    # The rules below (block form, indented lines, next value line, the hit line) all walk '\n'; a CR-only file used to look like one line and its block value was
+    # never found. This rewrites separators only, never a value's characters, so the raw-value rule still judges the text as written.
+    $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
     # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
     $idx = Get-CredentialHitIndex $Text
     if ($idx -lt 0 -and $Text.Contains('\u')) {
         $Text = [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+        $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
         $idx = Get-CredentialHitIndex $Text
     }
     if ($idx -lt 0) { return 0 }
@@ -1292,6 +1334,27 @@ function Move-ForeignClaims {
 # ---------------------------------------------------------------------------------------------
 # Phase: Import (NEW machine). Copies the bundle into place; never touches credentials.
 # ---------------------------------------------------------------------------------------------
+# r15 pass 13 A3: true when the text NAMES a secret-named key anywhere, whatever its value (an exempt '' included): any word the key classifier
+# (Get-CredentialKeyClass, the same name list the detector uses: 'api.key', 'pass_word', 'auth', 'pwd', 'private.key', camelCase, any separator) calls secret-named,
+# judged as written and with JSON \uXXXX escapes decoded. The credential-ROLE guard of Import (Get-ImportCredentialSkips and the locked copy) uses this together with
+# $CredentialNameWords, so the role guard is never narrower than the detector's own name list.
+function Test-CredentialNamePresent {
+    param([string]$Text)
+    if (-not $Text) { return $false }
+    $texts = @($Text)
+    if ($Text.Contains('\u')) { $texts += [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }) }
+    foreach ($t in $texts) {
+        $seen = @{}
+        foreach ($w in [regex]::Matches($t, '[A-Za-z0-9_.\-]+')) {
+            $v = $w.Value
+            if ($seen.ContainsKey($v)) { continue }
+            $seen[$v] = $true
+            if (Get-CredentialKeyClass $v) { return $true }
+        }
+    }
+    return $false
+}
+
 # r3 A5: the full paths of bundle files an Import must NOT copy, judged by CONTENT and ROLE (the file name alone is only the first line of
 # defence, $ExcludeFiles). A bundle file is skipped when
 #   - it carries a credential itself (a handmade or tampered bundle), or
@@ -1319,7 +1382,7 @@ function Get-ImportCredentialSkips {
             else { try { $dstText = [IO.File]::ReadAllText($dest) } catch { $dstOk = $false } }
             if (-not $dstOk) { $reason = 'host file unreadable or larger than the scan limit' }
             elseif (Test-CredentialText $dstText) { $reason = 'host file carries a credential' }
-            elseif (($CredentialRoleFiles -contains $f.Name.ToLowerInvariant()) -and $roleRx.IsMatch($dstText)) { $reason = 'host credential-role file names a credential key' }
+            elseif (($CredentialRoleFiles -contains $f.Name.ToLowerInvariant()) -and ($roleRx.IsMatch($dstText) -or (Test-CredentialNamePresent $dstText))) { $reason = 'host credential-role file names a credential key' }
         }
         if ($reason) { $skips.Add([pscustomobject]@{ Source = $f.FullName; Dest = $dest; Reason = $reason }) }
     }
@@ -1388,7 +1451,7 @@ function Copy-ImportFileLocked {
         $orig = Read-ImportHeldBytes $fs
         $dstText = ConvertFrom-ImportBytes $orig
         if (Test-CredentialText $dstText) { return @{ Result = 'changed'; Why = 'host file carries a credential' } }
-        if (($CredentialRoleFiles -contains $Source.Name.ToLowerInvariant()) -and ([regex]::new('(?i)(' + $CredentialNameWords + ')')).IsMatch($dstText)) { return @{ Result = 'changed'; Why = 'host credential-role file names a credential key' } }
+        if (($CredentialRoleFiles -contains $Source.Name.ToLowerInvariant()) -and (([regex]::new('(?i)(' + $CredentialNameWords + ')')).IsMatch($dstText) -or (Test-CredentialNamePresent $dstText))) { return @{ Result = 'changed'; Why = 'host credential-role file names a credential key' } }
         # r14 A5: never truncate first. The bundle bytes go to a sibling temp file carrying the bundle timestamp (r12 A5: the timestamp is set before the file takes the host
         # name, so no editor save can be backdated), and File.Replace swaps it in; a write that fails leaves the host file's bytes and timestamp as they were.
         $swap = Set-ImportFileContentAtomic -Dest $Dest -Bytes $bytes -WriteTimeUtc $Source.LastWriteTimeUtc -Held $fs -JudgedBytes $orig
@@ -1495,17 +1558,38 @@ function Set-ImportFileContentAtomic {
     try {
         try { $h = [IO.File]::Open($Dest, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)) }
         catch { throw "IMPORT_REPLACE_UNVERIFIED $Dest (an interleaved save is kept at $bak; the host file could not be locked to restore it: $($_.Exception.Message))" }
+        # r15 pass 13 A4: BEFORE any Replace, prove under the lock what it would displace. When the host path no longer holds this run's file (bytes AND time), a save
+        # landed after the swap: it is the newest and stays live; the interleaved save in $bak is older and superseded (removed, proven). Nothing is replaced.
+        $cur = Read-ImportHeldBytes $h
+        $curTime = [IO.File]::GetLastWriteTimeUtc($h.SafeFileHandle)
+        if ((Get-ImportBytesHash $cur) -cne $ourHash -or $curTime -ne $ourTime) {
+            $h.Dispose(); $h = $null
+            $rm = Remove-FileVerified $bak
+            $bakNote = $(if ($rm.Deleted) { 'the older interleaved save it superseded was removed' } else { "the older interleaved save could NOT be removed and is at $($rm.Path) ($($rm.Why))" })
+            throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a save landed after the swap and is kept live; $bakNote)"
+        }
         if ($script:ImportBeforeRollbackHook) { & $script:ImportBeforeRollbackHook $Dest }
-        [IO.File]::Replace($bak, $Dest, $aside, $true)   # while $h is still held
+        [IO.File]::Replace($bak, $Dest, $aside, $true)   # while $h is still held: nothing can have changed the host path since the check above
         $h.Dispose(); $h = $null
         try {
             $asideBytes = [IO.File]::ReadAllBytes($aside)
             $asideTime = [IO.File]::GetLastWriteTimeUtc($aside)
         } catch { throw "IMPORT_REPLACE_UNVERIFIED $Dest (the interleaved save was restored; the file it displaced is kept at $aside and could not be read back: $($_.Exception.Message))" }
         if ((Get-ImportBytesHash $asideBytes) -cne $ourHash -or $asideTime -ne $ourTime) {
+            # belt and braces (the lock refuses in-place and rename-over saves, so this is not expected): a save displaced into the aside is put back, again only after
+            # proving UNDER A LOCK that the host path still holds the interleaved save just restored; a newer save there stays live and the aside is kept and named.
             $older = "$base.older"
-            try { [IO.File]::Replace($aside, $Dest, $older, $true) }
-            catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a save landed while the rollback ran and is kept at $aside; putting it back failed: $($_.Exception.Message); the older interleaved save is at $Dest)" }
+            $h2 = $null
+            try {
+                try { $h2 = [IO.File]::Open($Dest, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)) }
+                catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a save landed while the rollback ran and is kept at $aside; the host file could not be locked to put it back: $($_.Exception.Message))" }
+                $cur2 = Read-ImportHeldBytes $h2
+                if ((Get-ImportBytesHash $cur2) -cne (Get-ImportBytesHash $was) -or [IO.File]::GetLastWriteTimeUtc($h2.SafeFileHandle) -ne $wasTime) {
+                    throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (two saves landed while the rollback ran: the newest stays live at $Dest and the other is kept at $aside)"
+                }
+                try { [IO.File]::Replace($aside, $Dest, $older, $true) }   # while $h2 is still held
+                catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a save landed while the rollback ran and is kept at $aside; putting it back failed: $($_.Exception.Message); the older interleaved save is at $Dest)" }
+            } finally { if ($h2) { $h2.Dispose() } }
             # the displaced file is the older interleaved save read above (bytes AND time): superseded by the newer save, it is removed (proven). Anything else is kept.
             $olderNote = "the older interleaved save is kept at $older"
             try {
