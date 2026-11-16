@@ -558,6 +558,18 @@ def psq(value: object) -> str:
     return "".join(c * 2 if c in PS_SINGLE_QUOTES else c for c in str(value))
 
 
+_WALL_CLOCK_READ = re.compile(r"UtcNow|Get-Date|\[DateTime\]::Now|\[datetime\]::Now", re.IGNORECASE)
+_WAIT_TIMING_NAME = re.compile(r"\$deadline\b|\$gateEnd\b|\$waitCutoff\b|\$now\b|waitedSec|-\s*\$t0\b|\$wu\b|\$wts\b", re.IGNORECASE)
+
+
+def wvq_wall_clock_timing_lines(text: str) -> list[str]:
+    """Code lines of Wait-VenueQuiet.ps1 that read the wall clock (UtcNow, Get-Date, [DateTime]::Now) on the same line as a deadline, the gate end, the caller's cutoff, `$now`, `$t0`
+    arithmetic or a waitedSec report. Those must all read Get-WaitNowUtc ($t0 plus the Stopwatch time since $t0Ts). Comment lines are skipped; a HH:mm:ss log stamp or a job id
+    on a line with none of those names is not timing and is not flagged."""
+    return [ln.strip() for ln in text.replace("\r\n", "\n").splitlines()
+            if not ln.strip().startswith("#") and _WALL_CLOCK_READ.search(ln) and _WAIT_TIMING_NAME.search(ln)]
+
+
 def leg_receipt_root_guard_ps(leg: Path, root: str, offline: bool = False) -> str:
     """PowerShell (to follow an Import-Module of DualVenueRunner.psm1) that runs the REAL receipt-root admission of Invoke-VenueLeg.ps1 on `root`: its own three statements, from
     `$rrCert = ...` (certify) through the refusal to `$ReceiptRoot = $rrCert` (replace the raw value). Prints `ACCEPTED <the root the leg would write to>` or `REFUSED <message>`."""
@@ -1635,13 +1647,43 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # Stopwatch time since it. Run with a $t0 far from the wall clock (a step of years), it still answers $t0 + the monotonic elapsed time.
         wvq_path = RUNNER.parent / "Wait-VenueQuiet.ps1"
         wvq = wvq_path.read_text(encoding="utf-8")
-        for line in wvq.splitlines():
-            if "UtcNow" in line and ("$deadline" in line or "$gateEnd" in line or "- $t0)" in line or "$now = " in line):
-                self.fail(f"a deadline check still reads the wall clock: {line.strip()}")
+        self.assertEqual(wvq_wall_clock_timing_lines(wvq), [], "a deadline check or waitedSec still reads the wall clock")
+        # r13 (hosted CI, run 43789411276): the lint above must go RED on a body with a wall-clock deadline left in it, whichever spelling it uses.
+        for what, old, new in (
+            ("the caller's cutoff gate on Get-Date", "(Get-WaitNowUtc) -ge $waitCutoff", "(Get-Date).ToUniversalTime() -ge $waitCutoff"),
+            ("the gate poll's $now on Get-Date", "        $now = Get-WaitNowUtc\n", "        $now = (Get-Date).ToUniversalTime()\n"),
+            ("the re-probe deadline on UtcNow", "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }",
+             "if ([DateTime]::UtcNow.AddSeconds($RecheckSec) -gt $deadline) { break }"),
+            ("the read-retry deadline on Get-Date", "if ((Get-WaitNowUtc).AddSeconds($delay) -gt $deadline) { return }",
+             "if ((Get-Date).AddSeconds($delay) -gt $deadline) { return }"),
+            ("a waitedSec report on UtcNow", "waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) probes=", "waitedSec=$([int]([DateTime]::UtcNow - $t0).TotalSeconds) probes="),
+        ):
+            norm = wvq.replace("\r\n", "\n")
+            self.assertIn(old, norm, what)
+            self.assertNotEqual(wvq_wall_clock_timing_lines(norm.replace(old, new, 1)), [], f"the lint missed: {what}")
         for frag in ("if ((Get-WaitNowUtc).AddSeconds($delay) -gt $deadline) { return }", "        $now = Get-WaitNowUtc\n",
-                     "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }"):
+                     "if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }",
+                     "(Get-WaitNowUtc) -ge $waitCutoff }"):
             self.assertEqual(wvq.replace("\r\n", "\n").count(frag), 1, frag)
-        self.assertEqual(wvq.count("(Get-WaitNowUtc) - $t0).TotalSeconds"), 3)
+        # r13: the monotonic `waitedSec=` form occurs once per REPORT, not once per deadline. Pin WHAT each occurrence guards (a count alone went stale when r11/r12 added the three
+        # GATE_CUTOFF phases): the three end-of-wait reports, then the three cutoff refusals by phase. A new report line must be added here on purpose.
+        mono = [ln for ln in wvq.replace("\r\n", "\n").splitlines() if not ln.strip().startswith("#") and "(Get-WaitNowUtc) - $t0).TotalSeconds" in ln]
+        tags = []
+        for ln in mono:
+            m = re.search(r'Write-Gate "(\$verdict|[A-Z_]+)', ln)
+            self.assertIsNotNone(m, ln)
+            tag = m.group(1)
+            if tag == "GATE_CUTOFF":
+                tag += ":" + re.search(r"phase=([a-z-]+)", ln).group(1)
+            tags.append(tag)
+        self.assertEqual(sorted(tags), sorted([
+            "GATE_CUTOFF:before-write", "GATE_CUTOFF:before-submit", "GATE_CUTOFF:after-probe",
+            "VENUE_QUIET_UNKNOWN", "FOREIGN_FLOOR", "$verdict",
+        ]), mono)
+        # every other waitedSec report (GATE_BUSY) subtracts $t0 from $now, which is itself Get-WaitNowUtc (asserted above): no third spelling
+        for ln in wvq.replace("\r\n", "\n").splitlines():
+            if not ln.strip().startswith("#") and "waitedSec=$(" in ln and ln not in mono:
+                self.assertIn("waitedSec=$([int]($now - $t0).TotalSeconds)", ln)
         # r9 (adversary-2854b231.json A1): the MONOTONIC anchor is read first and the wall clock after it (a pause between them puts Get-WaitNowUtc ahead, never behind)
         self.assertLess(wvq.index("$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()"), wvq.index("$t0 = [DateTime]::UtcNow"))
         script = (
