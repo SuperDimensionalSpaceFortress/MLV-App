@@ -61,6 +61,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_smoke_foreground_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_processed8_liveness_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_gui_hop_wait_split.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_fullscreen_wiring.cpp \
     $$REPO_ROOT/tests/console/test_gui_smoke_display_select_wiring.cpp \
     $$REPO_ROOT/tests/console/test_display_device_mapping.cpp \
@@ -156,6 +157,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \
+    $$REPO_ROOT/platform/qt/GuiHopWaitSplit.h \
     $$REPO_ROOT/platform/qt/PlaybackNativePaceGuard.h \
     $$REPO_ROOT/platform/qt/PlaybackDueWake.h \
     $$REPO_ROOT/platform/qt/PlaybackDueWakeSamples.h \

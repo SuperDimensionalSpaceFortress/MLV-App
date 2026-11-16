@@ -2622,6 +2622,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 MainWindow::~MainWindow()
 {
     playback_paint_credit::setSink( nullptr, nullptr );
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
@@ -5158,7 +5159,20 @@ void MainWindow::openGuiPresentGap( void )
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
     ++m_guiPresentGapSerial;
     m_guiOtherBusySpans.openGap();
-    m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+    m_guiPresentGapFrame = m_lastDisplayedPlaybackFrame;   // the frame whose present opened the gap
+    // CPU-S1-PACE-POST-785-LEVER-1 fix iteration 2 (adversary A1 on fb4d13fe): the gap's opening instant on the smoke clock,
+    // stamped here once; the close never reads a second clock to place it.
+    // r2 (adversary A1 on 89e3a9d1 and on 482616a5): ONE read of the gap clock arms the gap and places it. The gap
+    // clock is the smoke clock (GuiPresentGapClock), so the zero is m_playbackSmokeStartTime itself: no baseline read.
+    const qint64 gapOpenNs = m_guiPresentGapClock.nsecsElapsed();
+    m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs ) / 1000000.0 - m_playbackSmokeStartTime * 1000.0;
+    m_guiPresentGapStartNs = gapOpenNs;
+}
+
+// The gap clock reads the smoke clock (MainWindow.h GuiPresentGapClock).
+qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const
+{
+    return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );
 }
 
 // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
@@ -5205,6 +5219,13 @@ void MainWindow::closeGuiPresentGap( void )
     gaps.idleSumMs += split.idleMs;
     gaps.runnerSleepSumMs += split.runnerSleepMs;
     gaps.busySumMs += split.busyMs;
+    if( gaps.gaps == 1 || split.busyMs > gaps.busyMaxMs )
+    {
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): where the longest busy gap sat. Its start,
+        // in ms since the measured Play start (stamped at open).
+        gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;
+        gaps.busyMaxFrame = m_guiPresentGapFrame;
+    }
     gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
     gaps.otherBusySumMs += split.otherBusyMs;
     gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
@@ -5228,6 +5249,7 @@ void MainWindow::endGuiPresentIdleWait( void )
 void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 {
     const qint64 startNs = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapClock.nsecsElapsed() : -1;
+    const double hopSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;   // CPU-S1-PRESENT-INTERVAL-BOUND-1
     QElapsedTimer slept;
     slept.start();
     // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1: the due wake's GUI trace records this sleep (a wake posted in it
@@ -5248,11 +5270,100 @@ void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
     const qint64 dispatchNs = ( runnerSleep != PlaybackDueWake::RunnerSleep::NotHandled && m_playbackDueWake )
         ? m_playbackDueWake->lastRunnerSleepDispatchNs() : 0;
     const qint64 sleptNs = std::max<qint64>( 0, slept.nsecsElapsed() - dispatchNs );
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1 (#824) on top of the due wake's sleep (#811 r13 merge): the hop split's RunnerSleep
+    // interval ends when the sleep ends, before the woken wake runs below. The sent messages the sleep dispatched are GUI
+    // work, so their time (dispatchNs) is taken out of this third sleep account too: the interval keeps its start and its
+    // length is the slept time (0 dispatch, the common case, is the plain [start, now] interval).
+    if( m_playbackSmokeActive && hopSleepStartS > 0.0 )
+    {
+        const double hopSleepEndS = mlv_stage_timing_now();
+        m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSleepStartS,
+                           std::max( hopSleepStartS, hopSleepEndS - static_cast<double>( dispatchNs ) * 1e-9 ) );
+    }
     if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
         m_guiPresentGapRunnerSleepNs += std::max<qint64>( 0, m_guiPresentGapClock.nsecsElapsed() - startNs - dispatchNs );
     GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
     // the sent wake that ended the sleep runs now (its window procedure; posted messages wait for the runner's processEvents)
     if( runnerSleep == PlaybackDueWake::RunnerSleep::WokenBySent && m_playbackDueWake ) m_playbackDueWake->dispatchSentMessages();
+}
+
+// CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1: the measured gui-smoke loop's wait. It blocks in the event
+// dispatcher, never in a sleep, so it returns as soon as an event has been dispatched (the render
+// thread's queued frameReady, a prep result, the pace timer), or when its own bounded timer fires.
+// It pushes no RunnerSleep interval: the dispatcher's idle probe already accounts the blocked time
+// as idle, and a frameReady posted during it is dispatched at once instead of after a sleep.
+// The bound's contract (r2, adversary A1 on e447bc14): the wait returns at the end of the first dispatch pass that
+// delivers an event or the timer. That pass delivers every event posted before it (the timer's expiry is itself a
+// posted event on Windows), so the wait can return past maxMs by that batch's handlers -- as the loop-top
+// processEvents( AllEvents ) always could. Such a wait is counted as an overrun (and as a timeout), never hidden.
+void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
+{
+    QTimer bound;
+    bound.setSingleShot( true );
+    bound.setTimerType( Qt::PreciseTimer );
+    SmokeEventWaitInFlight wait;
+    wait.bound = &bound;
+    wait.maxMs = maxMs;
+    wait.session = m_playbackSmokeActive ? m_playbackSmokeSessionId : 0;
+    // r1 fix iteration 2 (adversary A1 on b6adb0d2): the clock starts BEFORE the timer is armed, so a deschedule
+    // between the two can only lengthen the measured wait, never hide the timer's expiry.
+    wait.clock.start();
+    bound.start( qMax( 0, maxMs ) );
+    // r2 fix iteration 1 (adversary A1 on 9f2a3316): registered BEFORE the dispatch, because the dispatch can end the
+    // session (the target stop reaches finishPlaybackSmokeTelemetry from inside it); the finish then counts it.
+    SmokeEventWaitInFlight *const outer = m_smokeEventWaitInFlight;
+    m_smokeEventWaitInFlight = &wait;
+    qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );
+    if( m_smokeEventWaitInFlight == &wait )
+        closeSmokeEventWait( wait );
+    else if( wait.counted )
+    {
+        // r2 fix iteration 2 (adversary A1 on fdb754e3): the session ended inside this wait and its summary already
+        // counted it at the finish. Whatever the wait did after that cannot be in that summary, so it is printed
+        // here, once, with the classification of the completed wait: an overrun after the finish is never hidden.
+        const qint64 waitedNs = wait.clock.nsecsElapsed();
+        qInfo().noquote()
+            << QStringLiteral( "playback_smoke.runner_event_wait_after_finish session=%1 waited_at_finish_ms=%2 "
+                               "waited_ms=%3 timed_out=%4 overran=%5" )
+                   .arg( static_cast<qulonglong>( wait.session ) )
+                   .arg( static_cast<double>( wait.countedAtNs ) / 1000000.0, 0, 'f', 3 )
+                   .arg( static_cast<double>( waitedNs ) / 1000000.0, 0, 'f', 3 )
+                   .arg( gui_hop_wait::smokeEventWaitTimedOut( bound.isActive(), waitedNs, maxMs ) ? 1 : 0 )
+                   .arg( gui_hop_wait::smokeEventWaitOverran( waitedNs, maxMs ) ? 1 : 0 );
+    }
+    m_smokeEventWaitInFlight = outer;
+}
+
+// Counts one measured wait for the session it began in, once: called on the wait's own return, or by
+// finishPlaybackSmokeTelemetry (while the session is still active) when the session ends inside the dispatch.
+void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )
+{
+    if( m_smokeEventWaitInFlight == &wait )
+        m_smokeEventWaitInFlight = nullptr;
+    if( !m_playbackSmokeActive || wait.session == 0 || wait.session != m_playbackSmokeSessionId )
+        return;
+    ++m_playbackSmokeRunnerEventWaits;
+    // r1 fix iteration 1 (adversary A1): the timer's event can still be undelivered on return (GuiHopWaitSplit.h).
+    const qint64 waitedNs = wait.clock.nsecsElapsed();
+    wait.counted = true;
+    wait.countedAtNs = waitedNs;
+    if( gui_hop_wait::smokeEventWaitTimedOut( wait.bound->isActive(), waitedNs, wait.maxMs ) )
+        ++m_playbackSmokeRunnerEventWaitTimeouts;
+    if( gui_hop_wait::smokeEventWaitOverran( waitedNs, wait.maxMs ) )
+        ++m_playbackSmokeRunnerEventWaitOverruns;
+}
+
+// CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split's clock (frameReadyEmitStageTime's), and the paint
+// sink's listener while a smoke session is active: an outermost preview paint's [start, end], both read
+// on this clock by the paint's own Scope (PreviewPaintTiming.h).
+static double guiHopWaitClockNow( void )
+{
+    return mlv_stage_timing_now();
+}
+
+static void guiHopWaitNoteViewportPaint( void *context, double startS, double endS )
+{
+    static_cast<gui_hop_wait::Recorder *>( context )->push( gui_hop_wait::Kind::ViewportPaint, startS, endS );
 }
 
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
@@ -5270,6 +5381,15 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         ( result.resultReadyTime > 0.0 && prepPresentStart >= result.resultReadyTime )
             ? ( prepPresentStart - result.resultReadyTime ) * 1000.0
             : 0.0;
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1: the result's wait for this present (the stamp
+    // avg_playback_prep_result_queue_ms starts from), split by the GUI work inside it; then this
+    // present, [entry, exit], is itself a PreparedPresent interval. Every kind splits the wait: an earlier
+    // present still running when this result became ready is GUI work in it (r1 fix iteration 2, adversary A2).
+    if( m_playbackSmokeActive && result.resultReadyTime > 0.0 && prepPresentStart >= result.resultReadyTime )
+        m_guiHopPrepResultWait.add( m_guiHopWait.split( result.resultReadyTime, prepPresentStart ) );
+    const gui_hop_wait::IntervalScope hopPresentInterval(
+        m_playbackSmokeActive ? &m_guiHopWait : nullptr, gui_hop_wait::Kind::PreparedPresent,
+        prepPresentStart, &guiHopWaitClockNow );
     const double prepElapsedBeforePresentMs =
         ( display_start > 0.0 && prepPresentStart >= display_start )
             ? ( prepPresentStart - display_start ) * 1000.0
@@ -7681,6 +7801,12 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             m_playbackTimelineSourceDrawBeginStageTime;
     }
 
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1 r1 fix iteration 1 (adversary A1/A2 on 6a6d7ef4): the instant this request is
+    // handed to the render thread (both branches below issue it; a covered-by-lookahead request returned above
+    // without one). The early advance in drawFrameReady reads this, never the request serial counter.
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r2 (adversary A2 on e447bc14): stamped AFTER renderFrame returns in each
+    // branch, so a deschedule between queuePresentationRequest and the hand-off is inside the measured hop.
+
     //Get frame from library
     if( ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
     {
@@ -7693,6 +7819,11 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                                       requestSerial,
                                       requestContext,
                                       presentationPreparation );
+        if( m_playbackSmokeActive )
+        {
+            m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();
+            ++m_guiHopRequestIssues;
+        }
         if( timelineAdvanceForRequest )
         {
             m_playbackTimelineIssuedRequestSerial = requestSerial;
@@ -7719,6 +7850,11 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                                       requestSerial,
                                       requestContext,
                                       presentationPreparation );
+        if( m_playbackSmokeActive )
+        {
+            m_guiHopLastRequestIssueStageTime = mlv_stage_timing_now();
+            ++m_guiHopRequestIssues;
+        }
         if( timelineAdvanceForRequest )
         {
             m_playbackTimelineIssuedRequestSerial = requestSerial;
@@ -10665,7 +10801,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             midSessionExposureChangeApplied = true;
             qApp->processEvents( QEventLoop::AllEvents );
         }
-        sleepGuiThreadForSmokeRunner( 10 );
+        waitGuiThreadForSmokeEvents( 10 );
     }
     const qint64 playedMs = playbackClock.elapsed();
     // ENFORCE-3: a measured Play that did not CONSUME the required source frames -- the engine ended it first
@@ -27193,6 +27329,25 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeTimelineTelemetry =
         m_playbackSmokeFrameTelemetry
         && playbackSmokeTimelineTelemetryEnabled();
+    // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split starts empty (nothing feeds it before this
+    // synchronous begin returns); preview paints reach it only while the session is active (the
+    // listener is cleared where the session ends, and in the destructor).
+    m_guiHopWait.reset();
+    m_guiHopFrameReadyWait.reset();
+    m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs = 0.0;
+    m_playbackSmokePresentUiSignalLatencyOwnWindowFrames = 0;
+    m_playbackSmokePresentUiSignalLatencyOverwrittenFrames = 0;
+    m_playbackSmokeRunnerEventWaits = 0;
+    m_playbackSmokeRunnerEventWaitTimeouts = 0;
+    m_playbackSmokeRunnerEventWaitOverruns = 0;
+    m_guiHopPrepResultWait.reset();
+    m_guiHopEmitToRequestIssue.reset();
+    m_guiHopRequestIssues = 0;
+    m_guiHopLastRequestIssueStageTime = 0.0;
+    preview_paint_timing::paintListener().fn = &guiHopWaitNoteViewportPaint;
+    preview_paint_timing::paintListener().now = &guiHopWaitClockNow;
+    preview_paint_timing::paintListener().context = &m_guiHopWait;
+    preview_paint_timing::paintListener().generation = preview_paint_timing::nextPaintListenerGeneration();
     m_playbackSmokeStartPosition = ui->horizontalSliderPosition->value();
     m_playbackSmokeStartCutIn = ui->spinBoxCutIn->value();
     m_playbackSmokeStartCutOut = ui->spinBoxCutOut->value();
@@ -30893,10 +31048,15 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         }
     }
 
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r2 fix iteration 1 (adversary A1 on 9f2a3316): a measured wait still dispatching
+    // when the session ends (this finish runs inside it) is counted and classified now, before the summary prints it.
+    if( m_smokeEventWaitInFlight )
+        closeSmokeEventWait( *m_smokeEventWaitInFlight );
     m_playbackSmokeActive = false;
     m_playbackPresentTrace.end();
     // FULLSCREEN-S1S2-PRESENT-GAP-1 (r2: after the present trace's end, which PlaybackPresentTraceWiring pins next to the flag)
     if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( false );
+    preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
 
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
     // gate lines so a receipt carries the footage length the measured window actually played.
@@ -31172,10 +31332,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
 
     // PLAYBACK-DECODE-RENDER-OVERLAP-1: the engagement counter. overlap_fraction_of_render is the share of
     // render-busy time some decode/recon ran under (0 = one frame in flight, stages in series).
+    playback_overlap::OverlapSnapshot hopOverlap;   // CPU-S1-PRESENT-INTERVAL-BOUND-1: critical_hop_summary reads this one
     {
         const playback_overlap::OverlapSnapshot overlap =
             m_pRenderThread ? m_pRenderThread->pipelineOverlapSnapshot()
                             : playback_overlap::OverlapSnapshot();
+        hopOverlap = overlap;
         // PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch counters are object-scoped (any thread decodes),
         // so they reach this line on every route. Appended at the end; no tools/ parser anchors on the line's end.
         mlvRawUint16PrefetchStats_t raw = {};
@@ -32051,6 +32213,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         }
         otherBusySplit += QStringLiteral( " avg_gui_other_busy_unattributed_ms=%1" )
                               .arg( avgOver( m_guiOtherBusySpans.unattributedSumMs, gaps.gaps ), 0, 'f', 3 );
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): the gap behind max_gui_busy_ms, appended.
+        otherBusySplit += QStringLiteral( " max_gui_busy_at_ms=%1 max_gui_busy_frame=%2" )
+                              .arg( gaps.busyMaxAtMs, 0, 'f', 3 )
+                              .arg( gaps.busyMaxFrame );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gui_present_summary session=%1 frames=%2 "
@@ -32076,6 +32242,66 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
                                                         : QStringLiteral("none") )
                + otherBusySplit;
+    }
+
+    /* CPU-S1-PRESENT-INTERVAL-BOUND-1: the CPU route's serial loop is decode + recon + render + the GUI
+     * hop (frameReady emit -> drawFrameReady). frame_ready_wait is that hop's window (the one
+     * avg_present_ui_signal_latency_ms measures) and prep_result_wait the prep result's wait for its present
+     * (the one avg_playback_prep_result_queue_ms measures), each split by the GUI work inside it
+     * (GuiHopWaitSplit.h): the smoke runner's sleep, a prep present, a preview paint, other. Averages are over
+     * the attributed windows (frames= for frame_ready_wait); an unattributed window is only counted.
+     * emit_to_request_issue is the emit to the next request's issue on the early advances that issued one. */
+    {
+        using gui_hop_wait::Kind;
+        const gui_hop_wait::Accumulator &fr = m_guiHopFrameReadyWait;
+        const gui_hop_wait::Accumulator &pr = m_guiHopPrepResultWait;
+        const double upstreamPlusRenderPerRenderMs =
+            hopOverlap.renderStarts > 0
+                ? ( hopOverlap.decodeBusyMs + hopOverlap.reconBusyMs + hopOverlap.renderBusyMs )
+                      / static_cast<double>( hopOverlap.renderStarts )
+                : 0.0;
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.critical_hop_summary session=%1 frames=%2 "
+                   "avg_frame_ready_wait_ms=%3 avg_frame_ready_wait_runner_sleep_ms=%4 "
+                   "avg_frame_ready_wait_prepared_present_ms=%5 avg_frame_ready_wait_viewport_paint_ms=%6 "
+                   "avg_frame_ready_wait_other_ms=%7 frame_ready_wait_unattributed_frames=%8 "
+                   "avg_prep_result_wait_ms=%9 avg_prep_result_wait_runner_sleep_ms=%10 "
+                   "avg_prep_result_wait_viewport_paint_ms=%11 avg_prep_result_wait_other_ms=%12 "
+                   "prep_result_wait_unattributed_frames=%13 emit_to_request_frames=%14 "
+                   "avg_emit_to_request_issue_ms=%15 avg_upstream_plus_render_per_render_ms=%16 "
+                   "avg_prep_result_wait_prepared_present_ms=%17 "
+                   "present_ui_signal_latency_own_window_frames=%18 "
+                   "avg_present_ui_signal_latency_own_window_ms=%19 "
+                   "present_ui_signal_latency_overwritten_frames=%20 "
+                   "runner_event_waits=%21 runner_event_wait_timeouts=%22 "
+                   "runner_event_wait_overruns=%23" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( static_cast<qulonglong>( fr.frames ) )
+                   .arg( fr.avgWaitMs(), 0, 'f', 3 )
+                   .arg( fr.avgKindMs( Kind::RunnerSleep ), 0, 'f', 3 )
+                   .arg( fr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 )
+                   .arg( fr.avgKindMs( Kind::ViewportPaint ), 0, 'f', 3 )
+                   .arg( fr.avgOtherMs(), 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( fr.unattributedFrames ) )
+                   .arg( pr.avgWaitMs(), 0, 'f', 3 )
+                   .arg( pr.avgKindMs( Kind::RunnerSleep ), 0, 'f', 3 )
+                   .arg( pr.avgKindMs( Kind::ViewportPaint ), 0, 'f', 3 )
+                   .arg( pr.avgOtherMs(), 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( pr.unattributedFrames ) )
+                   .arg( static_cast<qulonglong>( m_guiHopEmitToRequestIssue.count ) )
+                   .arg( m_guiHopEmitToRequestIssue.avg(), 0, 'f', 3 )
+                   .arg( upstreamPlusRenderPerRenderMs, 0, 'f', 3 )
+                   .arg( pr.avgKindMs( Kind::PreparedPresent ), 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames ) )
+                   .arg( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames > 0
+                             ? m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs
+                                   / static_cast<double>( m_playbackSmokePresentUiSignalLatencyOwnWindowFrames )
+                             : 0.0, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_playbackSmokePresentUiSignalLatencyOverwrittenFrames ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaits ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitTimeouts ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeRunnerEventWaitOverruns ) );
     }
 
     /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /
@@ -34937,6 +35163,22 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             ? prepRegionTotalMs - prepRegionAttributedMs
             : 0.0 );
     m_lastPresentedStageTimingTelemetry = readyFrame.stageTimingTelemetry;
+    // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 (Gate 0): this present's own frameReady -> drawFrameReady
+    // window, beside the legacy uiLat (m_lastDrawFrameReadyQueueMs, which a later drawFrameReady may
+    // have overwritten before this present).
+    if( m_playbackSmokeActive
+     && displayStart > 0.0
+     && readyFrame.frameReadyEmitStageTime > 0.0
+     && displayStart >= readyFrame.frameReadyEmitStageTime )
+    {
+        const double ownWindowMs = ( displayStart - readyFrame.frameReadyEmitStageTime ) * 1000.0;
+        m_playbackSmokePresentUiSignalLatencyOwnWindowSumMs += ownWindowMs;
+        ++m_playbackSmokePresentUiSignalLatencyOwnWindowFrames;
+        // r1 fix iteration 1 (adversary A2): another request's write counts even with an equal value.
+        if( gui_hop_wait::presentUiLatencyOverwritten( ownWindowMs, m_lastDrawFrameReadyQueueMs,
+                                                     m_lastDrawFrameReadyQueueSerial, readyFrame.requestSerial ) )
+            ++m_playbackSmokePresentUiSignalLatencyOverwrittenFrames;
+    }
     notePlaybackSmokePresentedFrame( displayFrame, readyFrame, requestContext );
     // HARDENING (default-off): m_contactSheetOptionsPresent is only ever true inside
     // runGuiPlaybackSmoke's own --contact-sheet-dir/--contact-sheet-frames block, so this call
@@ -35424,8 +35666,18 @@ void MainWindow::drawFrameReady()
                     readyFrame.frameReadyEmitStageTime;
                 m_playbackTimelineSourceDrawBeginStageTime = 0.0;
             }
+            const uint64_t hopRequestIssuesBefore = m_guiHopRequestIssues;   // CPU-S1-PRESENT-INTERVAL-BOUND-1
             timerFrameEvent( predictiveGpuTexNrEarlyAdvance );
             const double advance_return = mlv_stage_timing_now();
+            // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop from this frame's frameReady emit to the next request's
+            // issue (drawFrame's stamp at its renderFrame hand-off), on the advances that issued one. r2 (adversary
+            // A2 on e447bc14): that stamp is taken after renderFrame returns, so the hop includes the hand-off.
+            if( m_playbackSmokeActive
+             && m_guiHopRequestIssues != hopRequestIssuesBefore
+             && readyFrame.frameReadyEmitStageTime > 0.0
+             && m_guiHopLastRequestIssueStageTime >= readyFrame.frameReadyEmitStageTime )
+                m_guiHopEmitToRequestIssue.add(
+                    ( m_guiHopLastRequestIssueStageTime - readyFrame.frameReadyEmitStageTime ) * 1000.0 );
             m_lastDrawFrameReadyAdvanceMs =
                 (advance_return - advance_start) * 1000.0;
             predictiveGpuTexNrEarlyAdvanceExecuted = true;
@@ -35559,6 +35811,7 @@ void MainWindow::drawFrameReady()
             true );
     }
     m_lastDrawFrameReadyQueueMs = 0.0;
+    m_lastDrawFrameReadyQueueSerial = readyFrame.requestSerial;   // Gate 0: who wrote it (A2)
     /* m_lastDrawFrameReadyAdvanceMs is reset above, before the early advance,
      * so its early measurement is not zeroed before the smoke accounting. */
     m_lastDrawFrameReadySceneMs = 0.0;
@@ -35571,6 +35824,9 @@ void MainWindow::drawFrameReady()
     {
         m_lastDrawFrameReadyQueueMs =
             (display_start - readyFrame.frameReadyEmitStageTime) * 1000.0;
+        // CPU-S1-PRESENT-INTERVAL-BOUND-1: the same window, split by the GUI work inside it.
+        if( m_playbackSmokeActive )
+            m_guiHopFrameReadyWait.add( m_guiHopWait.split( readyFrame.frameReadyEmitStageTime, display_start ) );
     }
     const bool gpuViewportInstalled = gpuPreviewSurfaceActive();
     const bool zoomFitEnabled = ui->actionZoomFit->isChecked();
