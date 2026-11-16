@@ -583,6 +583,13 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             f"Import-Module '{DROP_MODULE}' -Force\n"
             f"Import-Module '{RUNNER_MODULE}' -Force -DisableNameChecking\n"
             "$c = [Console]::In.ReadToEnd() | ConvertFrom-Json\n"
+            # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 (adversary pass 3 A1): repub.testPathThrows shadows Test-Path inside the drop module so that a probe of the
+            # re-publish temporary (a *.meta.tmp) raises the same access error the Move did; every other path answers as the real cmdlet.
+            "$global:DvProbeArmed = $false\n"
+            "if ($c.repub.testPathThrows) { & (Get-Module UmRunDrop) { function script:Test-Path { [CmdletBinding()] param([string]$LiteralPath, [string]$PathType)\n"
+            # armed only once the re-publish temporary exists (TestHookAfterNotAfterRepublishTmpWritten): the claim phase's own earlier cleanup probe is another site
+            "  if ($global:DvProbeArmed -and $LiteralPath -like '*.meta.tmp') { throw [UnauthorizedAccessException]::new('Access to the path is denied. (probe)') }\n"
+            "  if ($PathType) { Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType } else { Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath } } } }\n"
             f"$log = '{self.log}'\n"
             "$sim = $null\n"
             "$copier = { param($s, $d) Add-Content -LiteralPath $log -Value $d; Copy-Item -LiteralPath $s -Destination $d\n"
@@ -608,15 +615,84 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "if ($null -ne $sim) { $p.TestHookBeforeJobVisible = { $seen.calls = 1 + [int]$seen.calls\n"
             "  if ($null -ne $c.advance.metaEvery) { $sim.now = $sim.now.AddSeconds([double]$c.advance.metaEvery) }\n"
             "  elseif ($seen.calls -eq 1 -and $null -ne $c.advance.meta) { $sim.now = $sim.now.AddSeconds([double]$c.advance.meta) }\n"
+            "  if ($null -ne $state.sw) { $state.sw.Dispose(); $state.sw = $null }\n"   # r8 A1: the swapped-in claim's holder lets go at visibility
             "  $seen.atUtc = $sim.now.UtcDateTime.ToString('o'); $seen.meta = [IO.File]::ReadAllText($metaPath) } }\n"
             "if ($null -ne $c.repub) { $p.TestHookAfterNotAfterRepublishTmpWritten = { param($tmpPath) $seen.repubCalls = 1 + [int]$seen.repubCalls\n"
             "  if ($seen.repubCalls -eq 1) {\n"
+            "    if ($c.repub.testPathThrows) { $global:DvProbeArmed = $true }\n"
             "    if ($null -ne $c.repub.advance) { $sim.now = $sim.now.AddSeconds([double]$c.repub.advance) }\n"
             "    if ($c.repub.fault -eq 'corrupt') { [IO.File]::WriteAllText($tmpPath, '{\"torn\":') }\n"
-            "    if ($c.repub.fault -eq 'steal') { [IO.File]::WriteAllText($metaPath, [string]$c.repub.other) } } } }\n"
+            "    if ($c.repub.fault -eq 'steal') { [IO.File]::WriteAllText($metaPath, [string]$c.repub.other) }\n"
+            # VENUE-UMRUN-MOVE-ACCESS-DENIED-1: the destination refuses the replacing rename. 'hold' keeps a handle on the claim that denies Delete
+            # (share: 'None' reads nothing else, 'Read' lets the nonce read through) and lets go after 'ms' ms; 'equal' first writes the temp's own text
+            # there (the rename already landed); 'readonly' sets the attribute.
+            "    if ($c.repub.fault -eq 'hold' -or $c.repub.fault -eq 'readonly') {\n"
+            "      if ($c.repub.equal) { [IO.File]::WriteAllText($metaPath, [IO.File]::ReadAllText($tmpPath)) }\n"
+            "      if ($c.repub.fault -eq 'readonly') { [IO.File]::SetAttributes($metaPath, [IO.FileAttributes]::ReadOnly) }\n"
+            # adversary pass 4 A2: repub.foreign first replaces the claim with another submission's (a different nonce) before the hold
+            "      if ($c.repub.foreign) { [IO.File]::WriteAllText($metaPath, '{\"jobId\":\"job-x\",\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}') }\n"
+            "      if ($c.repub.fault -eq 'hold') {\n"
+            "        Add-Type -TypeDefinition 'public static class DvLockHolder { public static System.IO.FileStream Hold(string p, System.IO.FileShare s, int ms) { var fs = new System.IO.FileStream(p, System.IO.FileMode.Open, System.IO.FileAccess.Read, s); System.Threading.Tasks.Task.Delay(ms).ContinueWith(t => fs.Dispose()); return fs; } }'\n"
+            "        $null = [DvLockHolder]::Hold($metaPath, [IO.FileShare]$c.repub.share, [int]$c.repub.ms) } } } } }\n"
+            # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 (adversary A1/A3): repub.seam drives TestHookBeforeMetaReplaceAttempt. Pass 1 takes a handle that denies Delete (so the
+            # first rename is refused); pass 2 may rewrite the claim in place ('write'), let the first rename land late ('land': release, then move the temp over
+            # the claim) and/or let go ('release').
+            "$state = @{}\n"
+            # r11 adversary pass 11 A1: 'landAfterOwnership' = N lets the first rename land LATE, in the gap after pass N's delivered check and claim-owner read and before its
+            # source open (no hook sits there, so the module's Get-UmRunClaimOwnership is wrapped): the hold is released, then the temp is moved over the claim. 'ownerUnknown'
+            # makes the wrapper answer UNKNOWN on every pass (a claim the drop cannot read), so the late landing meets the final attempt's refusal branches.
+            "if ($c.repub.seam.landAfterOwnership) { $state.own = 0; $state.h = $null; & (Get-Module UmRunDrop) { param($st, $unknownAlways, $lastAttempt)\n"
+            "  $script:DvSt = $st; $script:DvUnknown = $unknownAlways; $script:DvLast = $lastAttempt; $script:DvOrig = ${function:Get-UmRunClaimOwnership}\n"
+            "  function script:Get-UmRunClaimOwnership { param([string]$Path, [string]$Nonce)\n"
+            "    $r = & $script:DvOrig -Path $Path -Nonce $Nonce\n"
+            "    if ($script:DvUnknown) { $r = 'UNKNOWN' }\n"
+            "    $script:DvSt.own = 1 + [int]$script:DvSt.own\n"
+            "    if ($script:DvSt.own -eq $script:DvLast) {\n"
+            "      if ($null -ne $script:DvSt.h) { $script:DvSt.h.Dispose(); $script:DvSt.h = $null }\n"
+            "      $t = Get-ChildItem -LiteralPath (Split-Path -Parent $Path) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $Path, $true) }\n"
+            "    $r } } $state ([bool]$c.repub.seam.ownerUnknown) ([int]$c.repub.seam.landAfterOwnership) }\n"
+            "if ($null -ne $c.repub.seam) { $p.TestHookBeforeMetaReplaceAttempt = { param($a, $d)\n"
+            # adversary pass 6 A3: 'holdSource' holds the re-publish TEMP (reads allowed, no Delete sharing) from pass 1 on instead of the claim, so the destination is healthy;
+            # 'noHold' takes no handle at all (the first rename is not denied)
+            "  if ($a -eq 1 -and $c.repub.seam.holdSource) { $t4 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "    $state.h = [IO.File]::Open($t4.FullName, 'Open', 'Read', 'Read') }\n"
+            "  elseif ($a -eq 1 -and -not $c.repub.seam.noHold) { $state.h = [IO.File]::Open($d, 'Open', 'Read', 'ReadWrite') }\n"
+            # r7 A2: 'readDest' also keeps a harmless reader (Read, sharing Read and Delete) on the claim through every attempt: an exclusive probe of the destination fails on it
+            "  if ($a -eq 1 -and $c.repub.seam.readDest) { $state.rd = [IO.File]::Open($d, 'Open', 'Read', ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)) }\n"
+            "  if ($a -eq 2) {\n"
+            # 'write' is the claim's new text; <N> stands for this submission's real nonce; 'mutateTmp' writes the re-publish temp's own text with a NUL
+            # inside the property name notAfterUtc (the bytes the drop expects, but not identical to them)
+            "    $text = $c.repub.seam.write\n"
+            "    if ($null -ne $text) { $text = ([string]$text).Replace('<N>', [string]([IO.File]::ReadAllText($d) | ConvertFrom-Json).nonce) }\n"
+            "    if ($c.repub.seam.mutateTmp) { $t0 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      $text = [IO.File]::ReadAllText($t0.FullName).Replace('notAfterUtc', 'notAfter' + [char]0 + 'Utc') }\n"
+            "    if ($null -ne $text) { $w = [IO.File]::Open($d, 'Open', 'Write', 'ReadWrite'); $b = [Text.Encoding]::ASCII.GetBytes([string]$text)\n"
+            "      $w.SetLength(0); $w.Write($b, 0, $b.Length); $w.Dispose() }\n"
+            # adversary pass 4 A1: 'mutateSource' rewrites the re-publish temp (the source the retry will move) with `notAfterUtc` renamed, nonce and jobId intact
+            "    if ($c.repub.seam.mutateSource) { $t1 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      [IO.File]::WriteAllText($t1.FullName, [IO.File]::ReadAllText($t1.FullName).Replace('notAfterUtc', 'notBeforeUtc')) }\n"
+            # sol r3 B1: 'deleteSource' removes the re-publish temp before pass 2 (the retry's source is gone); 'lockSource' opens it with FileShare.None for the rest of the run (unreadable)
+            "    if ($c.repub.seam.deleteSource) { $t2 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      Remove-Item -LiteralPath $t2.FullName -Force }\n"
+            "    if ($c.repub.seam.lockSource) { $t3 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      $state.src = [IO.File]::Open($t3.FullName, 'Open', 'Read', 'None') }\n"
+            "    if ($c.repub.seam.land) { $state.h.Dispose(); $t = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $d, $true) }\n"
+            "    if ($c.repub.seam.release) { $state.h.Dispose() } } } }\n"
+            # adversary pass 6 A2: 'rewriteAfterVerify' = N rewrites the re-publish temp (notAfterUtc -> notBeforeUtc) in the gap between pass N's verifying read and its
+            # Move (TestHookAfterMetaSourceVerified); seen.rewrote says whether the rewrite got through. Set at top level, not from inside another hook.
+            "if ($c.repub.seam.rewriteAfterVerify) { $p.TestHookAfterMetaSourceVerified = { param($sp, $at)\n"
+            "  if ($at -eq [int]$c.repub.seam.rewriteAfterVerify) {\n"
+            "    try { [IO.File]::WriteAllText($sp, [IO.File]::ReadAllText($sp).Replace('notAfterUtc', 'notBeforeUtc')); $seen.rewrote = $true } catch { $seen.rewrote = $false } } } }\n"
+            # r7 A1: 'swapAfterVerify' = N renames the verified temp aside (the hold shares Delete, so that is allowed) and puts a changed file at the SAME pathname
+            "if ($c.repub.seam.swapAfterVerify) { $p.TestHookAfterMetaSourceVerified = { param($sp, $at)\n"
+            "  if ($at -eq [int]$c.repub.seam.swapAfterVerify) {\n"
+            "    try { [IO.File]::Move($sp, $sp + '.held'); [IO.File]::WriteAllText($sp, [IO.File]::ReadAllText($sp + '.held').Replace('notAfterUtc', 'notBeforeUtc')); $seen.swapped = $true } catch { $seen.swapped = $false }\n"
+            # r8 A1: 'holdLanded' keeps the swapped-in file open (Read, sharing Delete only) so the Move still publishes it but nobody else can read it; it is let go at visibility
+            "    if ($c.repub.seam.holdLanded) { $state.sw = [IO.File]::Open($sp, 'Open', 'Read', 'Delete') } } } }\n"
             "$threw = ''; $lines = @()\n"
+            "if ($c.repub.continuePref) { $ErrorActionPreference = 'Continue' }\n"   # adversary pass 4 A2: the caller's preference (the accepted -ErrorAction Continue invocation)
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
-            "$meta = $(if (Test-Path -LiteralPath $metaPath) { [IO.File]::ReadAllText($metaPath) } else { '' })\n"
+            "$meta = $(if (Test-Path -LiteralPath $metaPath) { try { [IO.File]::ReadAllText($metaPath) } catch { '<UNREADABLE>' } } else { '' })\n"
             "$dropAt = $(if ($null -ne $c.dropAt) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$c.dropAt).UtcDateTime } elseif ($null -ne $sim) { $sim.now.UtcDateTime } else { $null })\n"
             "$judge = $null\n"
             "if ($null -ne $b -and $null -ne $dropAt) {\n"
@@ -938,6 +1014,451 @@ class RepublishRefusalTests(unittest.TestCase):
         self.assertNotIn("atUtc", r["seen"], "the job never reached its rename")
         self.assertEqual(r["names"], ["job-x.meta.json"], "only the other submission's claim: no job, no temporary")
         self.assertEqual(r["meta"], other, "byte for byte the other submission's claim")
+
+
+@requires_windows_pwsh
+class MetaReplaceDeniedTests(unittest.TestCase):
+    """VENUE-UMRUN-MOVE-ACCESS-DENIED-1: two Bachelor legs (receipts 24474d73 at 22:13Z, cf1d6841 at 22:44Z) ended UNRESOLVED with
+    `um-run ended in an unexpected error: Exception calling "Move" with "3" argument(s): "Access to the path is denied."`, and a third lost a lease the
+    same way. The only three-argument Move on the submit path is the not-after re-publish's replacing rename of this call's own claim
+    (UmRunDrop.psm1, [IO.File]::Move($repubTmp, $metaFinal, $true)). On NTFS the same UnauthorizedAccessException comes back whether the destination is held
+    open without FileShare.Delete (an antivirus or backup scan, the agent's own read), read-only, or an ACL refusal, so the drop retries a bounded number of
+    times for the transient shapes and otherwise refuses TYPED, naming source, destination, attempts and the cause. Same real-drop fixture as
+    RepublishRefusalTests: the claim is held through TestHookAfterNotAfterRepublishTmpWritten, so no new production seam is needed to reproduce it."""
+    ANCHOR = DropRelativeNotAfterTests.ANCHOR
+    setUp = DropRelativeNotAfterTests.setUp
+    names = DropRelativeNotAfterTests.names
+    drop = DropRelativeNotAfterTests.drop
+    ATTEMPTS = 6
+
+    def _drop(self, **repub) -> dict:
+        return self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub=repub)
+
+    def test_a_claim_held_for_a_moment_is_retried_and_the_drop_succeeds_once(self) -> None:
+        # RED before the fix: the first rename is denied and the drop threw `Exception calling "Move" with "3" argument(s)`, the job never visible
+        r = self._drop(fault="hold", share="Read", ms=600)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"], "the job placed once, no temporary left")
+        self.assertEqual([l for l in r["lines"] if l.startswith("submitted ")], [f"submitted job-x -> {self.inbox / 'job-x.job.ps1'}"], "never twice")
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("job not-after:")]), 1, r["lines"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"], "the retried rename published the same value")
+
+    def test_a_claim_that_stays_held_refuses_typed_with_source_destination_and_attempts_and_the_job_never_becomes_visible(self) -> None:
+        r = self._drop(fault="hold", share="Read", ms=60000)
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertNotIn('Exception calling "Move"', r["threw"], "typed, not the raw .NET text as the headline")
+        self.assertIn(f"attempts={self.ATTEMPTS}", r["threw"])
+        self.assertRegex(r["threw"], r"source=.*job-x\.[0-9a-f]{32}\.meta\.tmp destination=", "a temp path with a space in it still matches (adversary A5)")
+        self.assertIn(f"destination={self.inbox / 'job-x.meta.json'} ", r["threw"])
+        self.assertIn("cause=DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertIn("probe=OPEN_SHARING_VIOLATION", r["threw"], "an exclusive open of the destination says the cause is another handle, not an ACL")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+        self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+        self.assertFalse([n for n in r["names"] if n.endswith(".tmp")], "no temporary left: " + repr(r["names"]))
+
+    def test_a_read_only_claim_is_a_permanent_refusal_and_is_not_retried(self) -> None:
+        r = self._drop(fault="readonly")
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("attempts=1 ", r["threw"], "a read-only destination never gets better by waiting")
+        self.assertIn("cause=DESTINATION_READ_ONLY", r["threw"])
+        self.assertNotIn("job-x.job.ps1", r["names"])
+
+    def test_a_denied_rename_whose_destination_already_holds_the_new_claim_counts_as_delivered(self) -> None:
+        # the rename landed (a lost reply over SMB) but the call still read as denied: the destination holds exactly the temp's text, so nothing is
+        # re-published and nothing is refused
+        r = self._drop(fault="hold", share="Read", ms=60000, equal=True)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+
+    def test_a_retry_that_finds_another_submissions_claim_refuses_and_never_replaces_it(self) -> None:
+        # adversary A1 (introduced): after the first denial another submission's claim (a different nonce) is at the path; the retry must refuse, never
+        # carry on to replace it. The handle is held throughout, so only the ownership read stands between the retry and a refusal of the wrong kind.
+        other = '{"jobId":"job-x","nonce":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","notAfterUtc":"2026-10-24T09:00:00.0000000Z"}'
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": other}})
+        self.assertIn("UMRUN_JOBID_IN_USE inbox\\job-x.meta.json is no longer this submission's own claim (nonce mismatch)", r["threw"], r)
+        self.assertFalse(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED"), r["threw"])
+        self.assertEqual(r["meta"], other, "byte for byte the other submission's claim")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_that_cannot_read_the_claim_back_does_not_replace_it_and_refuses_typed(self) -> None:
+        # adversary A1: a claim this call cannot read back (torn bytes, or `[]` / null, which ConvertFrom-Json turns into nothing) proves nothing about
+        # ownership, so the retry must not move over it. The handle is released, so a move WOULD have succeeded. RED before the fix: the drop reported
+        # success (threw == "") and replaced the claim.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": "{\"torn\":", "release": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=OWNERSHIP_UNPROVEN", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+        self.assertIn("priorCause=DESTINATION_HELD_OR_ACL", r["threw"], "the first denial's diagnosis is not lost")
+        self.assertNotIn("job-x.job.ps1", r["names"])
+        self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+
+    def test_a_claim_that_is_not_exactly_this_submissions_object_is_never_replaced_whatever_it_parses_to(self) -> None:
+        # adversary A1/A2 on 49b03793: PowerShell's -ceq is culture-aware (a NUL is ignorable), and ConvertFrom-Json enumerates a root array, so a
+        # one-element array, a nonce array and a nonce with a NUL after it all read as ours and the retry replaced them. RED before the fix: threw == "".
+        cases = {
+            "root array holding the real nonce": '[{"jobId":"job-x","nonce":"<N>"}]',
+            "nonce is an array": '{"jobId":"job-x","nonce":["<N>"]}',
+            "nonce with a NUL after it": '{"jobId":"job-x","nonce":"<N>\\u0000"}',
+            "empty root array": "[]",
+        }
+        for name, text in cases.items():
+            with self.subTest(claim=name):
+                for stale in self.inbox.iterdir():
+                    stale.unlink()
+                r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": text, "release": True}})
+                self.assertIn("UMRUN_JOBID_IN_USE inbox\\job-x.meta.json is no longer this submission's own claim (nonce mismatch)", r["threw"], r)
+                self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+                self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+
+    def test_a_claim_that_equals_the_expected_bytes_only_to_the_culture_is_not_delivered(self) -> None:
+        # adversary A1: the republication text with a NUL inside `notAfterUtc` compares equal under -ceq and the drop made the job visible with a claim whose
+        # deadline the agent cannot read. Ordinal now: not delivered, so the claim (which still carries this submission's own nonce) is replaced by the real bytes.
+        # RED before the fix: the NUL claim stood and the job became visible behind it.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"mutateTmp": True, "release": True}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertNotIn("\x00", r["meta"], "the published claim is exactly the re-publish text, no NUL in `notAfterUtc`")
+        self.assertEqual(parse_o(json.loads(r["meta"])["notAfterUtc"]), self.ANCHOR + timedelta(seconds=30 + 7560), "a deadline the agent can read")
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+
+    def test_a_claim_another_handle_holds_exclusively_for_a_moment_is_retried_before_the_rename_too(self) -> None:
+        # adversary A5: the ownership read that precedes the rename read the held claim unguarded and threw before any retry existed (a raw sharing error).
+        # FileShare.None also denies that read, so the whole pass is retried. RED before the fix: threw a raw read error, no UMRUN_MOVE_ACCESS_DENIED.
+        r = self._drop(fault="hold", share="None", ms=600)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+
+    def test_the_open_probe_names_a_vanished_destination_not_a_sharing_violation(self) -> None:
+        # adversary A3: FileNotFoundException and DirectoryNotFoundException are IOExceptions; only ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33)
+        # are a held file. RED before the fix: the function does not exist (the old probe called every IOException a sharing violation).
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{DROP_MODULE}' -Force -PassThru\n"
+            "$rows = & $m { @(\n"
+            "  [ordered]@{ k = 'file'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.FileNotFoundException]::new('gone'))) },\n"
+            "  [ordered]@{ k = 'dir'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.DirectoryNotFoundException]::new('gone'))) },\n"
+            "  [ordered]@{ k = 'acl'; v = (ConvertTo-UmRunOpenProbe -Exception ([UnauthorizedAccessException]::new('denied'))) },\n"
+            "  [ordered]@{ k = 'sharing'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.IOException]::new('busy', [int]0x80070020))) },\n"
+            "  [ordered]@{ k = 'lock'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.IOException]::new('locked', [int]0x80070021))) },\n"
+            "  [ordered]@{ k = 'other'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.IOException]::new('disk', [int]0x8007045D))) } ) }\n"
+            "ConvertTo-Json -Compress -InputObject $rows\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = {row["k"]: row["v"] for row in json.loads(p.stdout.strip().splitlines()[-1])}
+        self.assertEqual(got, {"file": "CHANGED_DURING_PROBE", "dir": "CHANGED_DURING_PROBE", "acl": "OPEN_ACCESS_DENIED", "sharing": "OPEN_SHARING_VIOLATION",
+                               "lock": "OPEN_SHARING_VIOLATION", "other": "OPEN_FAILED"})
+
+    def test_a_first_rename_that_lands_late_is_delivered_not_a_missing_source_error(self) -> None:
+        # adversary A3: pass 1 is denied, then the rename lands (a lost reply over SMB) and the temp is gone; pass 2 must see the claim holds exactly the new
+        # bytes. RED before the fix: pass 2 moved the consumed temp and threw FileNotFoundException.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"land": True}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"])
+
+    def test_a_first_rename_that_lands_between_the_ownership_read_and_the_source_open_is_delivered(self) -> None:
+        # r11 adversary pass 11 A1 (introduced): the late landing of pass 1's rename can fall AFTER pass 2's delivered check and claim-owner read (OWN, the claim already
+        # carries these bytes and this nonce) and BEFORE its source open; the temp is then gone, the open throws FileNotFoundException, and that was rethrown with no
+        # delivered recheck, so the drop refused (and rolled back) a claim that had been delivered. RED before the fix: threw FileNotFoundException.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"landAfterOwnership": 2}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"])
+
+    def test_a_first_rename_that_lands_during_the_final_attempt_of_an_unprovable_claim_is_delivered(self) -> None:
+        # r11 adversary pass 11 A1, sibling branches (the final attempt's OWNERSHIP_UNPROVEN and SOURCE_UNREADABLE refusals): the claim could not be proven ours on any
+        # pass, and the first rename lands late during the LAST one, after its delivered check. The refusal must recheck delivery before it throws. RED before the fix:
+        # threw UMRUN_MOVE_ACCESS_DENIED ... cause=OWNERSHIP_UNPROVEN over a claim that holds exactly the republished bytes.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"noHold": True, "ownerUnknown": True, "landAfterOwnership": self.ATTEMPTS}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"])
+
+    def test_the_denial_classifier_survives_the_destination_vanishing_while_it_probes(self) -> None:
+        # adversary A2: Test-Path said Leaf, then the file was gone before GetAttributes. The classifier must answer (transient, cause named), never throw
+        # and replace the denial it was asked about. The race is forced by shadowing Test-Path inside the module; the destination really is absent.
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{DROP_MODULE}' -Force -PassThru\n"
+            "$gone = Join-Path ([IO.Path]::GetTempPath()) ('dv-gone-' + [guid]::NewGuid().ToString('N') + '.json')\n"
+            "& $m { param($g) function script:Test-Path { param([string]$LiteralPath, [string]$PathType) $PathType -eq 'Leaf' }\n"
+            "  $r = Get-UmRunMoveDenial -Exception ([UnauthorizedAccessException]::new('Access to the path is denied.')) -Destination $g\n"
+            "  ConvertTo-Json -Compress -InputObject ([ordered]@{ transient = $r.transient; cause = $r.cause }) } $gone\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        answer = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertTrue(answer["transient"], answer)
+        self.assertTrue(answer["cause"].startswith("DESTINATION_"), answer)
+
+    def test_a_probe_of_the_temporary_that_throws_does_not_replace_the_typed_refusal(self) -> None:
+        # adversary pass 3 A1 (introduced): the Move's catch probes `Test-Path $repubTmp`; under $ErrorActionPreference = 'Stop' a transient access error from
+        # that probe escaped the catch and replaced the classified denial (no delivered recheck, no retry, no typed refusal). The finally's cleanup probe of the
+        # same temporary is the same shape and would replace whatever is in flight. RED before the fix: threw the probe's own UnauthorizedAccessException.
+        r = self._drop(fault="hold", share="Read", ms=60000, testPathThrows=True)
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn(f"attempts={self.ATTEMPTS}", r["threw"], "the probe's failure did not cut the retry short")
+        self.assertIn("cause=DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertNotIn("(probe)", r["threw"], "the probe's own error is not the headline")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_probe_of_the_temporary_that_throws_does_not_break_a_retry_that_succeeds(self) -> None:
+        # adversary pass 3 A1, success shape: the claim is held for a moment, the retry replaces it, and the finally's cleanup probe of the (consumed) temporary
+        # throws. The drop must still report success. RED before the fix: threw the probe's error from the finally after the job's metadata was published.
+        r = self._drop(fault="hold", share="Read", ms=600, testPathThrows=True)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+
+    def test_a_retry_never_moves_a_source_that_changed_since_it_was_verified(self) -> None:
+        # adversary pass 4 A1 (introduced): the temp is verified once, before the first Move; a refused Move is retried on the same name, so bytes written to it during
+        # the back-off (same jobId and nonce, no `notAfterUtc`) were published unverified while the drop reported the intended deadline. RED before the fix: the
+        # changed bytes were moved over the claim and the job became visible behind them.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"mutateSource": True, "release": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_JOB_METADATA_VERIFY_FAILED"), r)
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes never reached the published claim")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_whose_source_vanished_keeps_the_missing_source_failure_not_an_ownership_refusal(self) -> None:
+        # sol r3 B1 (introduced by adversary pass 4 A1): first replacement denied, then the re-publish temp is gone before pass 2 while the claim still carries THIS
+        # submission's nonce (owner OWN). The source read's failure was swallowed, so every later pass skipped the move and the drop ended after the whole back-off with
+        # cause=OWNERSHIP_UNPROVEN, a false diagnosis (the claim was read fine). RED before the fix: threw UMRUN_MOVE_ACCESS_DENIED ... cause=OWNERSHIP_UNPROVEN.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"deleteSource": True}})
+        self.assertNotEqual(r["threw"], "", r)
+        self.assertFalse(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED"), r["threw"])
+        self.assertNotIn("OWNERSHIP_UNPROVEN", r["threw"])
+        self.assertIn(".meta.tmp", r["threw"], "the failure names the missing source")
+        self.assertRegex(r["threw"], r"(?i)does not exist|could not find")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_whose_source_cannot_be_read_refuses_typed_as_source_unreadable_not_ownership_unproven(self) -> None:
+        # sol r3 B1, unreadable shape: the temp is held with no sharing from pass 2 on, the claim reads as this submission's own. Nothing is moved (an unread source is
+        # never published), and the refusal names the source, with the read error, instead of blaming the ownership read. RED before the fix: cause=OWNERSHIP_UNPROVEN.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"lockSource": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=SOURCE_UNREADABLE", r["threw"])
+        self.assertNotIn("OWNERSHIP_UNPROVEN", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+        self.assertIn("priorCause=DESTINATION_HELD_OR_ACL", r["threw"], "the first denial's diagnosis is not lost")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_cannot_have_its_verified_source_rewritten_before_the_move(self) -> None:
+        # adversary pass 6 A2 (introduced): the retry verified the temp with a read that closed, then moved it, so bytes written in that gap (same jobId and nonce, no
+        # `notAfterUtc`) were published while the drop reported the intended deadline. The verifying read now stays open (read and delete sharing only, so no writer
+        # can open the file) until the move has happened. RED before the fix: the rewrite got through and job-x.meta.json carried notBeforeUtc.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"release": True, "rewriteAfterVerify": 2}})
+        self.assertFalse(r["seen"].get("rewrote"), "the rewrite was refused while the verified source was held")
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes never reached the published claim")
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertIn("notAfterUtc", r["meta"])
+
+    def test_the_first_pass_move_has_the_same_verified_source_hold(self) -> None:
+        # adversary pass 6 A2, sibling: the first pass verified the temp with a read-back that closed before its Move (no denial needed to open the gap).
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"noHold": True, "rewriteAfterVerify": 1}})
+        self.assertFalse(r["seen"].get("rewrote"), "the rewrite was refused while the verified source was held")
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes never reached the published claim")
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+
+    def test_a_denial_caused_by_a_held_source_is_named_as_the_source_not_the_destination(self) -> None:
+        # adversary pass 6 A3 (introduced): the temp is held open (reads allowed, no Delete sharing) through every attempt, so its rename is refused while the destination
+        # is healthy; the classifier probed only the destination and reported cause=DESTINATION_HELD_OR_ACL probe=OPEN_OK. RED before the fix.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"holdSource": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=SOURCE_HELD_OR_ACL", r["threw"])
+        self.assertNotIn("cause=DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_source_swapped_by_pathname_after_verification_is_refused_not_published(self) -> None:
+        # r7 adversary A1 (introduced): the verifying hold permits the rename (it shares Delete), so the verified temp can be moved aside and a changed file put at the
+        # same pathname; the Move then published the pathname, not the verified bytes. The bytes that LANDED are now read back, before the job is visible, and a
+        # mismatch refuses and rolls the claim back. RED before the fix: the swapped bytes were published and the job became visible behind them.
+        self._swap_case(2, {"release": True})
+
+    def test_a_source_swapped_by_pathname_on_the_first_pass_is_refused_not_published(self) -> None:
+        # r7 adversary A1, first pass: no denial is needed to open the gap
+        self._swap_case(1, {"noHold": True})
+
+    def test_a_swapped_source_held_unreadable_is_refused_not_published(self) -> None:
+        # r8 adversary A1 (introduced): the landed read-back returned nothing for a claim another handle holds (Read, sharing Delete only), and "unreadable proves nothing"
+        # skipped the refusal, so a swapped-in file with no `notAfterUtc` became visible once its holder let go. An unread claim now refuses after the bounded attempts.
+        # RED before the fix: the job was made visible and the claim carried notBeforeUtc.
+        for at, extra in ((2, {"release": True}), (1, {"noHold": True})):
+            with self.subTest(pass_=at):
+                self._swap_case(at, {**extra, "holdLanded": True})
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"swapAfterVerify": 1, "noHold": True, "holdLanded": True}})
+        self.assertIn("could not be read back", r["threw"])
+        self.assertNotIn("job-x.job.ps1", r["names"])
+
+    def _swap_case(self, at: int, extra: dict) -> None:
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"swapAfterVerify": at, **extra}})
+        self.assertTrue(r["seen"].get("swapped"), "the pathname swap got through (the hold allows the rename)")
+        self.assertTrue(r["threw"].startswith("UMRUN_JOB_METADATA_VERIFY_FAILED"), r)
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes were rolled back, not left as the claim")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_held_source_and_a_harmless_destination_reader_name_both_sides(self) -> None:
+        # r7 adversary A2 (introduced): the temp is held with no Delete sharing (the real blocker) and the claim has a harmless reader (it shares Delete), so the exclusive
+        # destination probe fails too and the refusal blamed only the destination. Neither probe can tell a harmless reader from a blocker, so both sides are named.
+        # RED before the fix: cause=DESTINATION_HELD_OR_ACL.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"holdSource": True, "readDest": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=SOURCE_AND_DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertIn("SOURCE=OPEN_SHARING_VIOLATION", r["threw"])
+        self.assertIn("DESTINATION=OPEN_SHARING_VIOLATION", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+
+    def test_the_claim_ownership_predicate_accepts_a_dictionary_claim_exactly_as_it_accepts_an_object(self) -> None:
+        # adversary pass 6 A1 (introduced): the predicate accepted only a PSCustomObject, so a caller whose session defaults ConvertFrom-Json to -AsHashtable made this
+        # submission's own claim read as "not ours". Same ordinal nonce rule on both shapes; a root array, a scalar and a non-string nonce are never ours.
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DROP_MODULE}' -Force\n"
+            "$n = 'a' * 32\n"
+            "$parse = { param($t, [bool]$h) if ($h) { $t | ConvertFrom-Json -NoEnumerate -AsHashtable } else { $t | ConvertFrom-Json -NoEnumerate } }\n"
+            "$rows = foreach ($h in @($false, $true)) {\n"
+            "  foreach ($case in @(\n"
+            "    @{ k = 'own'; t = ('{\"jobId\":\"j\",\"nonce\":\"' + $n + '\"}') },\n"
+            "    @{ k = 'own-upper'; t = ('{\"NONCE\":\"' + $n + '\"}') },\n"
+            "    @{ k = 'other'; t = '{\"jobId\":\"j\",\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}' },\n"
+            "    @{ k = 'nul'; t = ('{\"nonce\":\"' + $n + '\\u0000\"}') },\n"
+            "    @{ k = 'number'; t = '{\"nonce\":5}' },\n"
+            "    @{ k = 'nonce-missing'; t = '{\"jobId\":\"j\"}' },\n"
+            "    @{ k = 'array'; t = ('[{\"nonce\":\"' + $n + '\"}]') },\n"
+            "    @{ k = 'scalar'; t = '\"x\"' },\n"
+            # r8 adversary A3: a JSON property named Keys is a dictionary KEY and shadows `$dict.Keys` (an own claim carrying one read as not ours); null and a list too
+            "    @{ k = 'keys-empty-list'; t = ('{\"jobId\":\"j\",\"nonce\":\"' + $n + '\",\"Keys\":[]}') },\n"
+            "    @{ k = 'keys-null'; t = ('{\"nonce\":\"' + $n + '\",\"Keys\":null}') },\n"
+            "    @{ k = 'keys-names'; t = ('{\"nonce\":\"' + $n + '\",\"Keys\":[\"jobId\"]}') },\n"
+            "    @{ k = 'keys-foreign'; t = '{\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"Keys\":[\"nonce\"]}' },\n"
+            # r8 adversary A2: two keys that differ only in case (ConvertFrom-Json builds an object only for -AsHashtable, so the dictionary shape alone): ambiguous, never ours,
+            # in either order, whichever of them carries this submission's nonce
+            "    @{ k = 'dup-case-own-first'; d = $true; t = ('{\"NONCE\":\"' + $n + '\",\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}') },\n"
+            "    @{ k = 'dup-case-own-last'; d = $true; t = ('{\"NONCE\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"' + $n + '\"}') })) {\n"
+            "    if ($case.d -and -not $h) { continue }\n"
+            "    $claim = & $parse $case.t $h\n"
+            "    [ordered]@{ k = ($case.k + $(if ($h) { '/dict' } else { '/obj' })); own = [bool](Test-UmRunClaimIsOwn -Claim $claim -Nonce $n) } } }\n"
+            "ConvertTo-Json -Compress -InputObject @($rows)\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = {row["k"]: row["own"] for row in json.loads(p.stdout.strip().splitlines()[-1])}
+        for shape in ("obj", "dict"):
+            self.assertTrue(got["own/" + shape], f"an own claim is ours as a {shape}: {got}")
+            self.assertTrue(got["own-upper/" + shape], f"the property name is matched without regard to case, as a {shape}: {got}")   # r7 adversary A4
+            for k in ("other", "nul", "number", "nonce-missing", "array", "scalar"):
+                self.assertFalse(got[k + "/" + shape], f"{k} is not ours as a {shape}: {got}")
+            for k in ("keys-empty-list", "keys-null", "keys-names"):
+                self.assertTrue(got[k + "/" + shape], f"an own claim with a Keys property is ours as a {shape}: {got}")   # r8 adversary A3
+            self.assertFalse(got["keys-foreign/" + shape], f"a foreign claim with a Keys property is not ours as a {shape}: {got}")
+        for k in ("dup-case-own-first", "dup-case-own-last"):
+            self.assertFalse(got[k + "/dict"], f"{k}: an ambiguous nonce key is never ours: {got}")   # r8 adversary A2
+
+    def test_a_claim_that_states_its_nonce_twice_is_never_replaced_whichever_spelling_repeats_it(self) -> None:
+        # r8 adversary A1 (introduced): ConvertFrom-Json collapses a repeated key to its LAST value, so the case-folding ambiguity guard saw one key and a claim with a
+        # foreign nonce first and this submission's second read as ours and was replaced. The raw text is now read with System.Text.Json (every property, escapes decoded).
+        # RED before the fix: threw == "" and the claim was replaced.
+        for name, text in {
+            "same spelling": '{"jobId":"job-x","nonce":"22222222222242228222222222222222","nonce":"<N>"}',
+            "escaped first spelling": '{"jobId":"job-x","\\u006eonce":"22222222222242228222222222222222","nonce":"<N>"}',
+            "folded spelling": '{"jobId":"job-x","NONCE":"22222222222242228222222222222222","nonce":"<N>"}',
+        }.items():
+            with self.subTest(claim=name):
+                for stale in self.inbox.iterdir():
+                    stale.unlink()
+                r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": text, "release": True}})
+                self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+                self.assertIn("cause=OWNERSHIP_UNPROVEN", r["threw"])
+                self.assertIn("22222222222242228222222222222222", r["meta"], "the ambiguous claim was left as it was, not replaced and not removed")
+                self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_claim_stating_its_nonce_twice_is_never_ours_however_deep_it_nests(self) -> None:
+        # r11 (sol r10 B1, introduced): both inspection parsers (System.Text.Json and the Newtonsoft fallback) stop at a default depth of 64 and the guard read "neither
+        # parser parsed it" as unambiguous, while ConvertFrom-Json (depth 1024) accepted the same text and kept the LAST nonce: a claim with a foreign nonce first, this
+        # submission's second and a value nested 64+ deep read as OWN, so it was replaced and (rollback, retraction) deleted. RED before the fix at depths 64, 65, 100,
+        # 1000, 1100 and 2000, in every spelling; depths 0 and 63 were already refused. The single-nonce controls must stay ours (the fix refuses ambiguity, not depth).
+        n = "a" * 32
+        cases = []
+        for depth in (0, 63, 64, 65, 100, 1000, 1100, 2000):
+            deep = '{"a":' * depth + "0" + "}" * depth
+            for spelling, first in (("same", '"nonce":"foreign"'), ("escaped", '"\\u006eonce":"foreign"'), ("folded", '"NONCE":"foreign"')):
+                cases.append({"k": f"dup-{spelling}-{depth}", "text": '{' + first + ',"nonce":"' + n + '","x":' + deep + '}'})
+        # r11 adversary pass A1 (introduced): a claim the fallback reader counts two nonces in and then fails on later (a torn or malformed tail) answered "unambiguous" because
+        # the catch discarded the count already seen; the two nonces are still two nonces. RED before the fix: unambiguous was True.
+        for k, text in (
+            ("dup-torn-bad-value", '{"nonce":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333","x":]}'),
+            ("dup-torn-folded-bad-value", '{"NONCE":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333","x":]}'),
+            ("dup-torn-truncated", '{"nonce":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333","x":{"a":'),
+            ("dup-torn-stray-token", '{"nonce":"22222222222242228222222222222222","nonce":"33333333333343338333333333333333"} }'),
+        ):
+            cases.append({"k": k, "text": text})
+        for depth in (0, 100):
+            cases.append({"k": f"single-{depth}", "text": '{"nonce":"' + n + '","x":' + '{"a":' * depth + "0" + "}" * depth + '}'})
+        cases_file = self.tmp / "deep-claim-cases.json"
+        cases_file.write_text(json.dumps(cases), encoding="ascii")
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DROP_MODULE}' -Force\n"
+            "$n = 'a' * 32\n"
+            f"$cases = [IO.File]::ReadAllText('{cases_file}') | ConvertFrom-Json\n"
+            "$rows = foreach ($c in $cases) {\n"
+            "  $unamb = [bool](Test-UmRunClaimNonceUnambiguous -Text $c.text)\n"
+            f"  $f = Join-Path '{self.tmp}' ('claim-' + $c.k + '.json'); [IO.File]::WriteAllText($f, $c.text, [Text.Encoding]::ASCII)\n"
+            "  $own = & (Get-Module UmRunDrop) { param($p, $nn) Get-UmRunClaimOwnership -Path $p -Nonce $nn } $f $n\n"
+            "  [ordered]@{ k = $c.k; unambiguous = $unamb; own = [string]$own } }\n"
+            "ConvertTo-Json -Compress -InputObject @($rows)\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = {row["k"]: row for row in json.loads(p.stdout.strip().splitlines()[-1])}
+        for c in cases:
+            row = got[c["k"]]
+            if c["k"].startswith("dup-"):
+                self.assertFalse(row["unambiguous"], f"{c['k']}: a claim stating its nonce twice is ambiguous at any depth: {row}")
+                self.assertNotEqual(row["own"], "OWN", f"{c['k']}: an ambiguous claim is never ours: {row}")
+            else:
+                self.assertTrue(row["unambiguous"], f"{c['k']}: a claim with one nonce is unambiguous at any depth: {row}")
+                self.assertEqual(row["own"], "OWN", f"{c['k']}: an own claim stays ours: {row}")
+
+    def test_a_denied_rename_that_both_exclusive_opens_survive_names_both_sides(self) -> None:
+        # r8 adversary A2 (introduced): an exclusive READ open needs no Delete right, so with an ACL that withholds Delete from the source (or the destination) both diagnostic
+        # opens succeed and the refusal blamed the healthy destination. Fed directly: an access-denied Move over two plain files nobody holds. RED before the fix:
+        # cause=DESTINATION_HELD_OR_ACL probe=OPEN_OK.
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DROP_MODULE}' -Force\n"
+            f"$d = Join-Path '{self.tmp}' 'denial-dest.json'; $s = Join-Path '{self.tmp}' 'denial-src.tmp'\n"
+            "[IO.File]::WriteAllText($d, '{}'); [IO.File]::WriteAllText($s, '{}')\n"
+            "$e = [UnauthorizedAccessException]::new('Access to the path is denied.')\n"
+            "$r = & (Get-Module UmRunDrop) { param($x, $dst, $src) Get-UmRunMoveDenial -Exception $x -Destination $dst -Source $src } $e $d $s\n"
+            "ConvertTo-Json -Compress -InputObject ([ordered]@{ cause = $r.cause; probe = $r.probe; transient = $r.transient })\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["cause"], "SOURCE_OR_DESTINATION_ACL", got)
+        self.assertEqual(got["probe"], "DESTINATION=OPEN_OK SOURCE=OPEN_OK", got)
+        self.assertTrue(got["transient"], got)
+
+    def test_a_rollback_keeps_a_claim_it_could_not_read_under_a_continue_preference(self) -> None:
+        # adversary pass 4 A2 (introduced): the rollback's read became a terminating one, so under -ErrorAction Continue a claim another submission holds (readable by
+        # no one, deletable by anyone) read as "no proof either way" and was deleted; the base's non-terminating read yielded nothing and preserved it. RED before the
+        # fix: job-x.meta.json (the foreign claim) was gone after the refusal.
+        r = self._drop(fault="hold", share="Delete", ms=60000, foreign=True, continuePref=True)
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("job-x.meta.json", r["names"], "another submission's claim is not deleted by this one's rollback")
+
+    def test_the_replacing_rename_line_is_unchanged_and_still_the_only_three_argument_move(self) -> None:
+        # the owner-footage route guard pins that exact line (test_dual_venue_owner_footage_gate.ROUTE_DELETE_ALLOWED); the retry wraps it, never rewrites it
+        code = DROP_MODULE.read_text(encoding="utf-8")
+        self.assertEqual(code.count("[IO.File]::Move($repubTmp, $metaFinal, $true)"), 1)
+        self.assertEqual(len(re.findall(r"\[(?:System\.)?IO\.File\]::Move\(", code)), 1)
+        self.assertTrue("UMRUN_MOVE_ACCESS_DENIED" in code, "the typed token is in the module")
 
 
 @requires_windows_pwsh

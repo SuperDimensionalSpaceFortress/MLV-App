@@ -4763,7 +4763,8 @@ int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
     const bool lookAssist = view.shadowsHighlights && view.inLoopContrast && view.cameraMatrix
                          && view.gamutCompression && view.vibrance
                          && !view.highlightRecon && !view.saturation;
-    const int requested = std::max(1, mlvappEffectivePlaybackWorkerThreadCount());
+    // CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the prep-side count (the playback count unless MLVAPP_PLAYBACK_PREP_OMP_THREADS is set).
+    const int requested = std::max(1, mlvappPlaybackPrepWorkerThreadCount());
     int team = 1;
     #pragma omp parallel num_threads(requested) if(pixelCount >= 2048)
     {

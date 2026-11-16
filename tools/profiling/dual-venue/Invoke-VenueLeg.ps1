@@ -533,6 +533,10 @@ try {
         # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the due wake's isolation arm (posted, as before r1), for any leg; judged below by the app's
         # own playback_due_wake delivery_kind readback. Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['dueWakeDeliveryPost'] -and $spec.generatorArgs.dueWakeDeliveryPost -is [bool] -and $spec.generatorArgs.dueWakeDeliveryPost) { $gen['DueWakeDeliveryPost'] = $true }
+        # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the asymmetric OpenMP team partition (both or neither; the generator refuses one alone), for any leg; judged below by
+        # the app's own playback_smoke.omp_teams readback.
+        if ($spec.generatorArgs.PSObject.Properties['reconOmpThreads']) { $gen['ReconOmpThreads'] = [int]$spec.generatorArgs.reconOmpThreads }
+        if ($spec.generatorArgs.PSObject.Properties['prepOmpThreads']) { $gen['PrepOmpThreads'] = [int]$spec.generatorArgs.prepOmpThreads }
         # CUDA-HEADROOM-UTIL-SAMPLER-1: the opt-in GPU/CPU utilisation sampler around the measured launch, for any leg (fail open: it never changes the verdict). Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['utilSample'] -and $spec.generatorArgs.utilSample -is [bool] -and $spec.generatorArgs.utilSample) { $gen['UtilSample'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
@@ -1038,6 +1042,15 @@ $dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ru
 if ($dueWakeDeliveryVerdict.requested) { $receipt['dueWakeDelivery'] = [ordered]@{ requested = $true; observed = $dueWakeDeliveryVerdict.observed; verdict = $dueWakeDeliveryVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $dueWakeDeliveryVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DUE_WAKE_DELIVERY_NOT_HONOURED: $($dueWakeDeliveryVerdict.reason). A run whose due-wake delivery is not the one its leg names (post when it asks, otherwise send) is no measurement of that arm"
+    $outcome = 'INVALID'
+}
+# CPU-S1-FS-SPIKE-TEAM-PARTITION-1, FAIL CLOSED: a leg that asks for the OpenMP team partition counts only when the measured session's own
+# playback_smoke.omp_teams record reports partition=r+p (recon_omp=r, prep_omp=p, override=0); a value in the launcher's env block is a request, not
+# engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask blocks only when the app reports one.
+$teamPartitionVerdict = Get-DvTeamPartitionEvidence -Spec $spec -LogText $runLogText
+if ($teamPartitionVerdict.named) { $receipt['teamPartition'] = [ordered]@{ requested = $teamPartitionVerdict.requested; observed = $teamPartitionVerdict.observed; verdict = $teamPartitionVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $teamPartitionVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but TEAM_PARTITION_NOT_HONOURED: $($teamPartitionVerdict.reason). A run whose OpenMP team partition is not the one its leg names (r+p when it asks, otherwise off) is no measurement of that arm"
     $outcome = 'INVALID'
 }
 # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does

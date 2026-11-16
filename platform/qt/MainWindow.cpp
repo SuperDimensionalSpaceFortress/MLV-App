@@ -3041,8 +3041,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( m_frameChanged )
     {
         m_countTimeDown = 3; //3 secs
+        // CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the recon-side count (the playback count unless the recon knob is set).
         const int cores = ui->actionPlay->isChecked()
-            ? mlvappEffectivePlaybackWorkerThreadCount()
+            ? mlvappPlaybackReconWorkerThreadCount()
             : mlvappEffectiveWorkerThreadCount();
         setMlvCpuCores( m_pMlvObject, cores );
     }
@@ -3168,7 +3169,7 @@ void MainWindow::timerEvent(QTimerEvent *t)
             if( m_countTimeDown == 0 )
             {
                 const int cores = ui->actionPlay->isChecked()
-                    ? mlvappEffectivePlaybackWorkerThreadCount()
+                    ? mlvappPlaybackReconWorkerThreadCount()   // CPU-S1-FS-SPIKE-TEAM-PARTITION-1
                     : mlvappEffectiveWorkerThreadCount();
                 setMlvCpuCores( m_pMlvObject, cores );
             }
@@ -5020,6 +5021,10 @@ void MainWindow::playbackPrepThreadLoop( void )
             continue;
         }
 
+        // CPU-S1-FS-SPIKE-TEAM-PARTITION-1: only when MLVAPP_PLAYBACK_PREP_OMP_THREADS is set is this thread's
+        // OpenMP team sized (lower-only; rgb16to8, the reference pointwise and the box downsample read it). Unset: no call.
+        const int prepTeamRequest = mlvappPlaybackPrepTeamRequest();
+        if( prepTeamRequest > 0 ) (void)mlvappApplyPlaybackOpenMpThreadCount( prepTeamRequest );
         PlaybackPrepResult result = buildPlaybackPrepResult( task, &threadState );
         result.workerQueueMs = task.workerQueueMs;
         result.workerTotalMs = ( mlv_stage_timing_now() - workerStart ) * 1000.0;
@@ -27675,7 +27680,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                "env_quality_mode=%29 env_gpu_playback_recon=%30 "
                "env_gpu_playback_recon_texture_present=%31 "
                "auto_target_fps=%32 auto_reason_start=%33 "
-               "env_raw_uint16_prefetch_decoders=%34 env_playback_conform=%35" )
+               "env_raw_uint16_prefetch_decoders=%34 env_playback_conform=%35 "
+               "env_playback_recon_omp_threads=%36 env_playback_prep_omp_threads=%37" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeStartPosition )
                .arg( m_playbackSmokeStartCutIn )
@@ -27714,13 +27720,48 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                    playbackQualityAutoDecisionReasonName(
                        m_playbackQualityAutoDecisionReason ) ) )
                .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) )
-               .arg( envValueForLog( "MLVAPP_PLAYBACK_CONFORM" ) );
+               .arg( envValueForLog( "MLVAPP_PLAYBACK_CONFORM" ) )
+               .arg( envValueForLog( "MLVAPP_PLAYBACK_RECON_OMP_THREADS" ) )
+               .arg( envValueForLog( "MLVAPP_PLAYBACK_PREP_OMP_THREADS" ) );
 
     // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: the prep route's engagement on a line of its own that carries no env-derived
     // text; the dual-venue runner reads engagement from this line only, never from the start line's env_* fields.
     qInfo().noquote()
         << log_line_field::prepRouteLine( static_cast<qulonglong>( m_playbackSmokeSessionId ),
                                           playbackPrepConflatedMoveActive() );
+
+    // CPU-S1-FS-SPIKE-TEAM-PARTITION-1: each playback team's size at play start (always on; integers only).
+    {
+        mlvRawUint16PrefetchStats_t teamsRaw = {};
+        if( m_pMlvObject ) getMlvRawUint16PrefetchStats( m_pMlvObject, &teamsRaw );
+        // The GUI thread never sizes its own team, so its max is the process's initial team (OMP_NUM_THREADS or every CPU), which is
+        // what the recon worker and the prep thread start from; the thread limit, the max active levels and dynamic adjustment are what
+        // can shrink them.
+#ifdef _OPENMP
+        const int teamsMaxThreads = omp_get_max_threads();
+        const int teamsThreadLimit = omp_get_thread_limit();
+        const int teamsMaxActiveLevels = omp_get_max_active_levels();
+        const bool teamsDynamic = omp_get_dynamic() != 0;
+#else
+        const int teamsMaxThreads = 1;
+        const int teamsThreadLimit = 1;
+        const int teamsMaxActiveLevels = 1;
+        const bool teamsDynamic = false;
+#endif
+        qInfo().noquote()
+            << log_line_field::ompTeamsLine( static_cast<qulonglong>( m_playbackSmokeSessionId ),
+                                             mlvappPlaybackReconTeamRequest(),
+                                             mlvappPlaybackReconWorkerThreadCount(),
+                                             mlvappPlaybackPrepTeamRequest(),
+                                             mlvappPlaybackPrepWorkerThreadCount(),
+                                             static_cast<int>( teamsRaw.decoders ),
+                                             QThread::idealThreadCount(),
+                                             teamsMaxThreads,
+                                             teamsThreadLimit,
+                                             teamsMaxActiveLevels,
+                                             teamsDynamic,
+                                             mlvappPlaybackTeamOverrideActive() );
+    }
 
     // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
     // request this same play-start already made above (setPlaybackDisplayRequiredExecutionState

@@ -113,7 +113,12 @@
 #
 # ONE DEADLINE: -MaxWaitSec runs from the start and bounds every queue-gate wait too (a re-probe does not get a fresh gate clock). A gate wait ends at the
 # earlier of -MaxGateSec and that deadline (GATE_BUSY, exit 3). Only a probe already submitted can run past it, bounded by um-run.ps1's own timeouts and by
-# -MaxAdmissionWaitSec (default 7200, range 1..86400), which is forwarded to um-run.ps1 as its heavy-slot admission ceiling: the venue chain passes its
+# -MaxAdmissionWaitSec (default 7200, range 1..86400), which is forwarded to um-run.ps1 as its heavy-slot admission ceiling. A caller's ABSOLUTE end (-WaitUntilUtc /
+# -WaitUntilTs) is also asked before each probe is written and submitted: past it no probe this script WAITED for is submitted (a re-probe, or a first probe after the gate
+# polled or retried: `GATE_CUTOFF ...`, exit 3; after a measured busy probe, that reading's verdict), even when the queue then reads empty (r11, adversary-d38e2ab8.json A1).
+# It is asked once more when such a probe answers: an answer that arrives past the cutoff (um-run stalled after the last check) is not published (`GATE_CUTOFF ...
+# phase=after-probe`, the same ends; r12, adversary-7fdbd64d.json A2).
+# The first probe of a gate that is CLEAR at its first read is the caller's own dispatch and is submitted (adversary-7fdbd64d.json A1: a zero wait keeps one reading). The venue chain passes its
 # -ProbeAdmissionWaitSec here, and sizes the claim ticket's probe-phase staleAfterSec from that same value, so the bound the ticket assumes is the bound the probe honours.
 # A read error on the agent share is retried -ReadAttempts times in all, backing off -ReadBackoffSec * attempt, inside the same deadline, before it is
 # GATE_UNREADABLE; each retry prints a `GATE_READ_RETRY` line, never a `queued=0 running=0` line.
@@ -129,7 +134,7 @@
 # directory) are exit 2 before anything is created. HOST ECHO: the probe job reports $env:COMPUTERNAME; if it is not the venue's expectedHost in venues.json
 # (case-insensitive; a missing host counts) the gate prints `HOST_MISMATCH ...` and exits 5 BEFORE any QUIET / COOLDOWN_UNMET line, so an alias of another
 # host's share (acknowledged with -AllowShareOverride) can never yield a verdict for the named venue.
-# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET, including one that took the FOREIGN_FLOOR early exit (read stdout); 3 GATE_BUSY (the queue never cleared); 4 GATE_UNREADABLE (the agent share could not be
+# Exit codes: 0 QUIET or a measured COOLDOWN_UNMET, including one that took the FOREIGN_FLOOR early exit (read stdout); 3 GATE_BUSY (the queue never cleared, or GATE_CUTOFF: the caller's absolute end passed before a probe was submitted, or before a waited-for probe answered); 4 GATE_UNREADABLE (the agent share could not be
 # read -- typed line `GATE_UNREADABLE ...` then `DECISION UNKNOWN`, never an empty-queue line; no probe is submitted); 5 HOST_MISMATCH (the probe was
 # answered by a host that is not the venue's); 6 VENUE_QUIET_UNKNOWN (the venue was not measured: typed line `VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=<t>%
 # waitedSec=<n> reason=<probe-failed|no-VENUE_QUIET-line|invalid-samples>`, never a QUIET / COOLDOWN_UNMET line); 2 a usage error (including a -SamplesJson that is
@@ -143,6 +148,13 @@ param(
     [Parameter(ParameterSetName = 'Live')][switch]$AllowShareOverride,
     [Parameter(ParameterSetName = 'Live')][int]$RecheckSec = 90,
     [Parameter(ParameterSetName = 'Live')][int]$MaxWaitSec = 1800,
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 (adversary r5 pass 2 A2): an absolute end (UTC, ISO 8601) for every wait below, as the CALLER's clock placed it at the dispatch.
+    # -MaxWaitSec runs from this script's own start, which comes after the process started: an in-lease probe given the agent's remaining idle allowance as -MaxWaitSec
+    # waited that long past the dispatch plus the startup. Unset: -MaxWaitSec alone, as before. Unreadable: refused (exit 2), never ignored.
+    [Parameter(ParameterSetName = 'Live')][string]$WaitUntilUtc = '',
+    # r9b (adversary-74e14dda.json A1): the same end as a Stopwatch timestamp ([Diagnostics.Stopwatch]::GetTimestamp(), QueryPerformanceCounter: ONE counter for every process
+    # on this host), so neither a step of the wall clock nor this script's startup can move it. Only a caller on THIS host may pass it. 0 (the default): not given.
+    [Parameter(ParameterSetName = 'Live')][ValidateRange(0, [long]::MaxValue)][long]$WaitUntilTs = 0,
     [Parameter(ParameterSetName = 'Live')][int]$MaxGateSec = 2400,
     [Parameter(ParameterSetName = 'Live')][int]$GatePollSec = 30,
     [Parameter(ParameterSetName = 'Live')][int]$ReadAttempts = 3,
@@ -156,7 +168,14 @@ param(
     [double]$ThresholdPercent = 20.0
 )
 $ErrorActionPreference = 'Stop'
-$t0 = Get-Date
+# LEASE-BATCH-IDLE-END-UNSEEN-1 r6 (adversary-848f6559.json A3): every clock this script waits on is UTC. Local DateTimes compare by ticks only, so across a DST change a deadline
+# read as local time moved by an hour against the local clock (an expired -WaitUntilUtc read an hour late, a near one an hour early).
+# r8 (adversary-5fc3bf72.json A2): every deadline check reads Get-WaitNowUtc, $t0 plus the MONOTONIC time since $t0Ts. Read off the wall clock, a step back of this host's
+# clock mid-wait stretched the gate past -MaxWaitSec and the caller's -WaitUntilUtc (a 120 s step: 360 s, not 240). r9 (adversary-2854b231.json A1): $t0Ts is read FIRST and
+# $t0 after it, so a pause between the two puts Get-WaitNowUtc ahead of real time (the wait ends sooner); read the other way round, the pause was added to every deadline.
+$t0Ts = [Diagnostics.Stopwatch]::GetTimestamp()
+$t0 = [DateTime]::UtcNow
+function Get-WaitNowUtc { $t0.AddSeconds(([Diagnostics.Stopwatch]::GetTimestamp() - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency) }
 
 function Get-VenueQuietDecision {
     # PURE: the decision from the samples alone. Exactly 3 finite samples in [0, 100] are needed; anything else (a $null = a failed read) is UNKNOWN.
@@ -263,6 +282,39 @@ function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist, [string]
 # queue busy again cannot stretch the whole wait past -MaxWaitSec. The share is read up to -ReadAttempts times (see Read-GateCounts) before it is unreadable.
 $deadline = $t0.AddSeconds($MaxWaitSec)
 $gateEnd = $t0.AddSeconds([Math]::Min($MaxGateSec, $MaxWaitSec))
+# LEASE-BATCH-IDLE-END-UNSEEN-1 r5 pass 3 (adversary r5 pass 2 A2): and never past the caller's -WaitUntilUtc
+# r6 (adversary-848f6559.json A3): compared as UTC, as $t0 is (it was LocalDateTime). r6 (Grok G10 on #817): read with TryParseExact, so only an ISO 8601 date and time with
+# seconds is an instant ('o', the form the batch runner sends, or seconds with an optional fraction, each with Z or an offset; no offset reads as UTC); TryParse with the
+# invariant culture also took 11/14/2026 and a long date, which the USAGE line said it refused.
+$wuFormats = [string[]]@('o', "yyyy'-'MM'-'dd'T'HH':'mm':'ssK", "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'FFFFFFFK")
+if ($WaitUntilUtc) {
+    $wuo = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParseExact($WaitUntilUtc, $wuFormats, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$wuo)) {
+        Write-Output "USAGE -WaitUntilUtc '$WaitUntilUtc' is not an ISO 8601 instant"; exit 2
+    }
+    $wu = $wuo.UtcDateTime
+    if ($wu -lt $deadline) { $deadline = $wu }
+    if ($wu -lt $gateEnd) { $gateEnd = $wu }
+}
+# r9b (adversary-74e14dda.json A1): -WaitUntilUtc is a WALL instant, read in this script's frame at $t0, and -MaxWaitSec runs from $t0: the caller suspended after placing
+# them and this host's clock stepped back meanwhile (90 s, then 120 s back) left both past the caller's end (an idle bound of 300 s overrun to about 330 s). -WaitUntilTs is
+# read against $t0Ts on the one monotonic counter, so the deadline is the caller's end whatever happened between. Placed in Get-WaitNowUtc's frame ($t0 + time since $t0Ts),
+# clamped to [-1 s, -MaxWaitSec] (an end already passed ends the wait at once; DateTime.AddSeconds cannot overflow).
+if ($WaitUntilTs -gt 0) {
+    $wts = $t0.AddSeconds([Math]::Max(-1.0, [Math]::Min([double]$MaxWaitSec, ($WaitUntilTs - $t0Ts) / [double][Diagnostics.Stopwatch]::Frequency)))
+    if ($wts -lt $deadline) { $deadline = $wts }
+    if ($wts -lt $gateEnd) { $gateEnd = $wts }
+}
+# r11 (adversary-d38e2ab8.json A1): the caller's ABSOLUTE end alone (the earlier of -WaitUntilUtc and -WaitUntilTs; $null when neither is given). The clamps above end a busy gate
+# and the re-probe loop, but an empty queue returned CLEAR before any expiry check and a probe was then written and submitted past the caller's end (an in-lease probe sent
+# after the agent's idle bound). Past this cutoff no probe is submitted that this script WAITED for: a re-probe, or a first probe after the gate polled or retried a read.
+# adversary-7fdbd64d.json A1: the FIRST probe on a gate whose first read is CLEAR is the caller's own dispatch (its bounds were asked at the dispatch) and is submitted, so a zero
+# relative wait (-ProbeMaxWaitSec 0: the cutoff IS the dispatch) keeps its one measurement, as -MaxWaitSec 0 always did.
+$waitCutoff = $null
+if ($WaitUntilUtc) { $waitCutoff = $wu }
+if ($WaitUntilTs -gt 0 -and ($null -eq $waitCutoff -or $wts -lt $waitCutoff)) { $waitCutoff = $wts }
+$script:GateWaited = $false   # set by Wait-QueueGate / Read-GateCounts before any sleep
+function Test-WaitCutoffRefusesProbe { $null -ne $waitCutoff -and ($null -ne $last -or $script:GateWaited) -and (Get-WaitNowUtc) -ge $waitCutoff }
 
 # Both directory counts, retried on a read error. Results go to $script:GateQueued / $script:GateRunning ($null = still unreadable after the last attempt):
 # like GateState they are not the function's output, because its GATE_READ_RETRY lines are written to the pipeline.
@@ -272,8 +324,9 @@ function Read-GateCounts([string]$Name) {
         $script:GateRunning = Get-GateCount "$agentShare\running" '' $false $setAsideRecordPattern
         if (($null -ne $script:GateQueued -and $null -ne $script:GateRunning) -or $attempt -ge $ReadAttempts) { return }
         $delay = $ReadBackoffSec * $attempt
-        if ((Get-Date).AddSeconds($delay) -gt $deadline) { return }   # no time left for another try: report what is known
+        if ((Get-WaitNowUtc).AddSeconds($delay) -gt $deadline) { return }   # no time left for another try: report what is known
         Write-Gate "GATE_READ_RETRY $Name $Venue attempt=$($attempt + 1)/$ReadAttempts inboxReadable=$($null -ne $script:GateQueued) runningReadable=$($null -ne $script:GateRunning) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
+        $script:GateWaited = $true
         if ($delay -gt 0) { Start-Sleep -Seconds $delay }
     }
 }
@@ -288,9 +341,10 @@ function Wait-QueueGate([string]$Name) {
         }
         Write-Gate "GATE $Name $Venue queued=$q running=$r $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
         if ($q -eq 0 -and $r -eq 0) { $script:GateState = 'CLEAR'; return }
-        $now = Get-Date
+        $now = Get-WaitNowUtc
         if ($now -gt $gateEnd) { Write-Gate "GATE_BUSY $Name waitedSec=$([int]($now - $t0).TotalSeconds)"; $script:GateState = 'BUSY'; return }
         # (the poll never sleeps past the end of the gate, so the wait ends when the deadline does)
+        $script:GateWaited = $true
         Start-Sleep -Milliseconds ([int][Math]::Max(10.0, [Math]::Min([double]($GatePollSec * 1000), ($gateEnd - $now).TotalMilliseconds + 10)))
     }
 }
@@ -1563,10 +1617,15 @@ while ($true) {
     Wait-QueueGate 'quiet-probe'
     if ($script:GateState -ceq 'UNREADABLE') { Write-Gate 'DECISION UNKNOWN mean=UNKNOWN'; exit 4 }
     if ($script:GateState -cne 'CLEAR') { exit 3 }
+    # r11 (adversary-d38e2ab8.json A1): asked after the gate's CLEAR and again as the last statement before um-run (the job-file write can stall on a UNC -WorkDir). Past the
+    # caller's cutoff a busy probe already measured ends on its own reading (break: COOLDOWN_UNMET / UNKNOWN, as at the recheck below); none measured yet ends GATE_CUTOFF, exit 3.
+    # (7fdbd64d A1: never the first probe of a gate that cleared at its first read; see Test-WaitCutoffRefusesProbe)
+    if (Test-WaitCutoffRefusesProbe) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-write: the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
     $jobId = 'venue-quiet-probe-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
     $jobFile = Join-Path $WorkDir "$jobId.job.ps1"
     [IO.File]::WriteAllText($jobFile, $probeText, [Text.UTF8Encoding]::new($false))
     $probe = $null; $why = $null; $whyKind = $null; $rawPath = $null; $rawErr = $null
+    if (Test-WaitCutoffRefusesProbe) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=before-submit job=$jobId (written, not submitted): the caller's -WaitUntilUtc/-WaitUntilTs passed, no probe submitted"; if ($null -ne $last) { break }; exit 3 }
     try {
         $out = @(& $umRun -ScriptPath $jobFile -JobId $jobId -AgentShare $agentShare -TimeoutSec 120 -MaxQueueWaitSec 300 -MaxClaimedWaitSec 120 -MaxAdmissionWaitSec $MaxAdmissionWaitSec 6>$null)
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
@@ -1583,6 +1642,11 @@ while ($true) {
         Write-Gate "HOST_MISMATCH $jobId $Venue probe host='$([string]$probe.host)' is not expectedHost '$expectedHost': no verdict is printed for '$Venue' $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
         exit 5
     }
+    # r12 (adversary-7fdbd64d.json A2): the two checks above end before um-run is entered, and um-run's own I/O (a heartbeat read, the job's placement) can stall past the
+    # caller's cutoff and still publish the job. So the cutoff is asked a third time, on this host's monotonic clock, when the probe's answer is back: a probe this script WAITED
+    # for whose answer arrives past the cutoff is NOT this gate's measurement. It ends as the before-write check does (after a measured busy probe, that earlier reading's
+    # verdict; none measured, GATE_CUTOFF exit 3). Its raw line above is kept as evidence. The caller's own first probe (7fdbd64d A1) is published whenever it ends.
+    if (Test-WaitCutoffRefusesProbe) { Write-Gate "GATE_CUTOFF quiet-probe $Venue waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) phase=after-probe job=$jobId (submitted, its reading not published): the caller's -WaitUntilUtc/-WaitUntilTs passed before the probe answered"; if ($null -ne $last) { break }; exit 3 }
     $samples = $(if ($null -ne $probe) { @($probe.samples) } else { @() })
     $d =Get-VenueQuietDecision -Samples $samples -Threshold $ThresholdPercent
     # BUSIEST FAST CORE: always evaluated for a v2 probe (or any probe once enforcing) so the line can be logged; it changes the decision only under -PerCoreEnforce, only for a
@@ -1611,17 +1675,17 @@ while ($true) {
             break
         }
     }
-    if ((Get-Date).AddSeconds($RecheckSec) -gt $deadline) { break }
+    if ((Get-WaitNowUtc).AddSeconds($RecheckSec) -gt $deadline) { break }
     Start-Sleep -Seconds $RecheckSec
 }
 # UNKNOWN is not a measured busy venue: it gets its own typed verdict and exit code (6), so a caller can never read it as COOLDOWN_UNMET (exit 0, proceed).
 if ($last.decision.state -ceq 'UNKNOWN') {
-    Write-Gate "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) reason=$($last.whyKind)$(if ($last.why) { " note=$($last.why)" })"
+    Write-Gate "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) reason=$($last.whyKind)$(if ($last.why) { " note=$($last.why)" })"
     exit 6
 }
-if ($null -ne $foreignFloor) { Write-Gate "FOREIGN_FLOOR owners=$($foreignFloor.owners -join ',') floorMean=$(Format-Mean $foreignFloor.floorMean) waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) probes=$($foreignFloor.probes)" }
+if ($null -ne $foreignFloor) { Write-Gate "FOREIGN_FLOOR owners=$($foreignFloor.owners -join ',') floorMean=$(Format-Mean $foreignFloor.floorMean) waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds) probes=$($foreignFloor.probes)" }
 $verdict = $(if ($last.decision.state -ceq 'QUIET') { 'QUIET' } else { 'COOLDOWN_UNMET' })
-Write-Gate "$verdict mean=$(Format-Mean $last.decision.mean) threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
+Write-Gate "$verdict mean=$(Format-Mean $last.decision.mean) threshold=$ThresholdPercent% waitedSec=$([int]((Get-WaitNowUtc) - $t0).TotalSeconds)"
 $topIdMap = $(if ($null -ne $last.probe) { Get-IdentityRowMap $last.probe } else { $null })
 if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate (("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) + $(if ($null -ne $topIdMap -and $null -ne $p.pid -and $topIdMap.ContainsKey("$($p.pid)")) { Get-IdentSuffix $topIdMap["$($p.pid)"] $true } else { '' })) } }
 if ($null -ne $last.probe) { Write-AttributionLines $last.probe }

@@ -629,6 +629,24 @@ class UmRunDropModuleTests(_Share):
                          "rollback must never delete a claim it does not own")
         self.assertEqual((self.inbox / "demo.job.ps1").read_text(encoding="utf-8"), "Write-Output concurrent")
 
+    def test_rollback_keeps_a_claim_that_states_its_nonce_twice_even_when_it_nests_past_the_inspection_depth(self) -> None:
+        # r11 (sol r10 B1, introduced): the claim at the rollback carries a foreign nonce first, this call's own nonce second and a value nested 65 deep. Both inspection
+        # parsers stopped at depth 64 and the guard answered "unambiguous", so ConvertFrom-Json (depth 1024, last nonce wins) proved it OWN and the rollback deleted it.
+        # RED before the fix: demo.meta.json was gone.
+        meta = _q(self.inbox / 'demo.meta.json')
+        hook = (
+            "{ $p = " + meta + "; $own = ([IO.File]::ReadAllText($p) | ConvertFrom-Json).nonce; "
+            "$deep = ('{\"a\":' * 65) + '0' + ('}' * 65); "
+            "[IO.File]::WriteAllText($p, '{\"nonce\":\"foreign\",\"nonce\":\"' + $own + '\",\"x\":' + $deep + '}'); "
+            "[IO.File]::WriteAllText(" + _q(self.inbox / 'demo.job.ps1') + ", 'Write-Output concurrent') }"
+        )
+        proc = self.drop(OBSERVING, side=[], job_timeout_sec=3600, before_job_visible=hook)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("THREW UMRUN_JOBID_IN_USE", combined, combined)
+        self.assertIn("no longer this submission's own claim", combined, combined)
+        self.assertTrue((self.inbox / "demo.meta.json").exists(), "an ambiguous claim is not deleted by the rollback\n" + combined)
+        self.assertIn('"nonce":"foreign"', (self.inbox / "demo.meta.json").read_text(encoding="ascii"), combined)
+
     def test_bytes_altered_on_the_share_are_refused_and_nothing_is_placed(self) -> None:
         proc = self.drop(CORRUPTING)
         self.assertIn("THREW UMRUN_SIDEFILE_VERIFY_FAILED", proc.stdout, proc.stdout + proc.stderr)
@@ -1972,6 +1990,82 @@ class UmRunEndToEndTests(_Share):
         self.assertIn("may outlive this refused submission", combined, combined)
         self.assertTrue((self.inbox / "demo.meta.json").exists(),
                          "a surfaced retraction cleanup failure must mean the metadata really was left behind")
+
+    def test_a_retraction_keeps_another_submissions_claim_it_cannot_read_under_a_continue_default(self) -> None:
+        # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 adversary pass 5 A1 (introduced): the retraction's nonce read became Read-UmRunClaim, whose -ErrorAction Stop ignores a
+        # caller's Get-Content:ErrorAction = Continue default, so another submission's claim (held readable by nobody, deletable by anyone) read as "no proof either
+        # way" and was deleted; the base's read honoured Continue, yielded nothing and left it. RED before the fix: demo.meta.json was gone.
+        foreign = '{"jobId":"demo","nonce":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+        meta = _q(self.inbox / 'demo.meta.json')
+        hook = ("{ [IO.File]::WriteAllText(" + meta + ", '" + foreign + "'); $script:umrunTestLock = [IO.File]::Open(" + meta + ", 'Open', 'Read', 'Delete') }")
+        wrapper = self.tmp / "run-with-retraction-foreign-claim-continue-hook.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "$global:PSDefaultParameterValues['Get-Content:ErrorAction'] = 'Continue'\n"
+            f"$hook = {hook}\n"
+            "try {\n"
+            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
+            "-TimeoutSec 1 -PollSeconds 1 -MaxQueueWaitSec 0 -JobId 'demo' "
+            "-TestHookAfterRetractionRename $hook\n"
+            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
+            "} catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+                               capture_output=True, text=True, timeout=30)
+        combined = proc.stdout + proc.stderr
+        self.assertTrue((self.inbox / "demo.meta.json").exists(), "another submission's claim is not deleted by this one's retraction\n" + combined)
+        self.assertIn("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", (self.inbox / "demo.meta.json").read_text(encoding="ascii"), combined)
+
+    def test_a_retraction_still_removes_its_own_claim_under_an_as_hashtable_default(self) -> None:
+        # adversary pass 6 A1 (introduced): the ownership predicate accepted only a PSCustomObject, so a caller whose session defaults ConvertFrom-Json to -AsHashtable
+        # (a dictionary out) made this submission's own exact nonce read as "not ours" and the retraction left its own claim behind (the base removed it).
+        # RED before the fix: demo.meta.json was still in the inbox.
+        wrapper = self.tmp / "run-with-retraction-as-hashtable-default.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "$global:PSDefaultParameterValues['ConvertFrom-Json:AsHashtable'] = $true\n"
+            "try {\n"
+            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
+            "-TimeoutSec 1 -PollSeconds 1 -MaxQueueWaitSec 0 -JobId 'demo'\n"
+            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
+            "} catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+                               capture_output=True, text=True, timeout=30)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("THREW RETRACTED:", combined, combined)
+        self.assertFalse((self.inbox / "demo.meta.json").exists(), "this submission's own claim is removed by its own retraction\n" + combined)
+
+    def test_a_retraction_keeps_a_claim_that_states_its_nonce_twice_even_when_it_nests_past_the_inspection_depth(self) -> None:
+        # r11 (sol r10 B1, introduced), the retraction sibling of the rollback test: foreign nonce first, this submission's own second, a value nested 65 deep. The guard
+        # read it as unambiguous (both inspection parsers stop at depth 64), ConvertFrom-Json kept the last nonce, and the retraction deleted another claim.
+        # RED before the fix: demo.meta.json was gone.
+        meta = _q(self.inbox / 'demo.meta.json')
+        hook = (
+            "{ $p = " + meta + "; $own = ([IO.File]::ReadAllText($p) | ConvertFrom-Json).nonce; "
+            "$deep = ('{\"a\":' * 65) + '0' + ('}' * 65); "
+            "[IO.File]::WriteAllText($p, '{\"nonce\":\"foreign\",\"nonce\":\"' + $own + '\",\"x\":' + $deep + '}') }"
+        )
+        wrapper = self.tmp / "run-with-retraction-deep-duplicate-nonce-hook.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$hook = {hook}\n"
+            "try {\n"
+            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
+            "-TimeoutSec 1 -PollSeconds 1 -MaxQueueWaitSec 0 -JobId 'demo' "
+            "-TestHookAfterRetractionRename $hook\n"
+            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
+            "} catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+                               capture_output=True, text=True, timeout=60)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("THREW RETRACTED:", combined, combined)
+        self.assertTrue((self.inbox / "demo.meta.json").exists(), "an ambiguous claim is not deleted by the retraction\n" + combined)
+        self.assertIn('"nonce":"foreign"', (self.inbox / "demo.meta.json").read_text(encoding="ascii"), combined)
 
     def test_a_retraction_job_temp_cleanup_failure_is_surfaced_not_silently_swallowed(self) -> None:
         # The other half: a failed removal of this client's OWN renamed-out job temporary (the

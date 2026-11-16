@@ -1071,11 +1071,21 @@ function Stop-VenueJobLiveness {
     $out
 }
 
+function Read-VenueJsonObjectLine([string]$Line) {
+    # LEASE-BATCH-IDLE-END-UNSEEN-1 r7 (adversary-065db820.json A2): one JSONL line as ONE JSON object, or $null. A line that is an array ([null,{..}]) reached the readers below
+    # as a collection, and member enumeration answered .token/.leaseId/.endReason from the object inside it; ConvertFrom-Json also unrolls [{..}] and [[{..}]] to that object,
+    # so the TEXT must open with '{' and the parse must be one PSCustomObject.
+    if ([string]::IsNullOrWhiteSpace($Line) -or -not $Line.TrimStart().StartsWith('{')) { return $null }
+    $o = try { ConvertFrom-VenueJsonRawIdentity -Text $Line } catch { $null }
+    if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
+    $null
+}
+
 function Read-VenueLeaseBatchReceipt {
     <#
     .SYNOPSIS
-    The venue agent's own receipt for one batch lease (ultra-magnus-agent.ps1 lease-batch item 5): the line of <AgentShare>\logs\lease-batch-<Token>.jsonl whose leaseId is
-    -LeaseId, read by NAME on one bounded worker.
+    The venue agent's own receipt for one batch lease (ultra-magnus-agent.ps1 lease-batch item 5): the line of <AgentShare>\logs\lease-batch-<Token>.jsonl whose token is
+    -Token AND whose leaseId is -LeaseId (both scalar strings, ordinal), read by NAME on one bounded worker. A line with a missing, non-string or other token is never this batch's.
     .OUTPUTS
     [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); record; error }
     #>
@@ -1086,9 +1096,11 @@ function Read-VenueLeaseBatchReceipt {
     $lines = @($r.value | ForEach-Object { [string]$_ } | Where-Object { $_ })
     if ($lines.Count -eq 1 -and $lines[0] -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; record = $null; error = $null } }
     foreach ($line in $lines) {
-        $rec = try { ConvertFrom-VenueJsonRawIdentity -Text $line } catch { $null }
+        $rec = Read-VenueJsonObjectLine $line
         # r12 (adversary r11 A2): ordinal on the exact lease id (-ceq is culture-aware); an empty or whitespace-only -LeaseId names no lease, so it matches no line
-        if ($null -ne $rec -and -not [string]::IsNullOrWhiteSpace($LeaseId) -and [string]::Equals([string]$rec.leaseId, $LeaseId, [StringComparison]::Ordinal)) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
+        # r2 (sol key r1 BLOCKER, PR 817): the line must also be THIS token's, a scalar string compared ordinally, so a foreign or token-less line neither answers nor hides the agent's own
+        if ($null -ne $rec -and -not [string]::IsNullOrWhiteSpace($LeaseId) -and $rec.token -is [string] -and [string]::Equals($rec.token, $Token, [StringComparison]::Ordinal) -and
+            $rec.leaseId -is [string] -and [string]::Equals($rec.leaseId, $LeaseId, [StringComparison]::Ordinal)) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
     }
     [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
 }
@@ -1150,7 +1162,7 @@ function Read-VenueLeaseLedger {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
     $since = $(if ($null -ne $SinceUtc) { ConvertTo-VenueUtc $SinceUtc } else { [DateTime]::MinValue })
     @(foreach ($line in [IO.File]::ReadAllLines($path)) {
-            $r = try { ConvertFrom-VenueJsonRawIdentity -Text $line } catch { $null }
+            $r = Read-VenueJsonObjectLine $line
             if ($null -eq $r) { continue }
             $s = ConvertTo-VenueUtc $r.startUtc; $e = ConvertTo-VenueUtc $r.endUtc
             if ($null -ne $s -and $null -ne $e -and $e -gt $s -and $e -gt $since) { [pscustomobject]@{ startUtc = $s; endUtc = $e; leaseId = [string]$r.leaseId } }

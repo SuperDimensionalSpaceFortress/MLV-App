@@ -45,12 +45,23 @@ the receipt: nvcc version and `nvidia-smi` on Ultra-Magnus; `qmake -version` and
 
 ```powershell
 pwsh -NoProfile -File tools\profiling\ultramagnus\playback-attr-3-cuda-dll-job.ps1 `
-    -SourceCommit <40-hex-sha> -OutDir <staging-dir> [-CudaArchitectures sm_86]
+    -SourceCommit <40-hex-sha> -OutDir <staging-dir> [-CudaArchitectures sm_86] [-JobIdSuffix r2]
 ```
 
 Writes `<jobId>-source.zip` (a `git archive` of the commit) and `<jobId>.job.ps1`
-(`jobId = playback-attr-3-cuda-dllpair-<sha12>`). Drop both into the Ultra-Magnus agent inbox
-(`G:\Temp\mlv-gpu-profile\agent\inbox`). On that host the job:
+(`jobId = playback-attr-3-cuda-dllpair-<sha12>`, or `...-<sha12>-<suffix>` with `-JobIdSuffix`).
+Drop both into the Ultra-Magnus agent inbox (`G:\Temp\mlv-gpu-profile\agent\inbox`).
+
+The JobId is single-use. A failed result under the default id makes `Get-DllPairReuse` refuse that
+sha for good. To build the same sha again, give an explicit `-JobIdSuffix` (the nightly driver's
+`-DllJobIdSuffix`), then reuse it with `Get-DllPairReuse -JobIdSuffix <suffix>`.
+
+Before the first build child, the job sets its own process PATH to a minimal derived set: the
+Windows system dirs, the CUDA bin and the VS installer dir. An inherited agent PATH over cmd.exe's
+8191-character limit broke vcvars64's SDK lookup on 2026-11-15. The job then proves that vcvars64
+put the SDK's `ucrt`, `um` and `shared` dirs on INCLUDE. If it did not, the job exits **9** at step
+`msvcEnvironment` (`reason=INCLUDE_LACKS_UCRT`, ...), so a bare `C1083 corecrt.h` at compile time
+is never the first signal. On that host the job:
 
 0. **verifies the source archive before expanding it.** The generator prints
    `sourceArchiveSha256` and bakes it in; the job refuses at **exit 8** unless the arriving bytes

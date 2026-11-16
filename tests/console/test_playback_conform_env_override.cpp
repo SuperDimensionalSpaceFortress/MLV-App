@@ -175,5 +175,8 @@ TEST(PlaybackConformEnvOverride, TelemetryCarriesTheOverride)
     ASSERT_TRUE(startEnd > start);
     const QString startLine = source.mid(start, startEnd - start + 1);
     ASSERT_TRUE(startLine.contains(QStringLiteral("env_playback_conform=%35")));
-    ASSERT_TRUE(startLine.contains(QStringLiteral(".arg( envValueForLog( \"MLVAPP_PLAYBACK_CONFORM\" ) );")));
+    // CPU-S1-FS-SPIKE-TEAM-PARTITION-1: no longer the start line's last argument (the two team-partition env fields follow it)
+    ASSERT_TRUE(startLine.contains(QStringLiteral(".arg( envValueForLog( \"MLVAPP_PLAYBACK_CONFORM\" ) )\n")));
+    ASSERT_TRUE(startLine.contains(QStringLiteral("env_playback_recon_omp_threads=%36 env_playback_prep_omp_threads=%37")));
+    ASSERT_TRUE(startLine.contains(QStringLiteral(".arg( envValueForLog( \"MLVAPP_PLAYBACK_PREP_OMP_THREADS\" ) );")));
 }
