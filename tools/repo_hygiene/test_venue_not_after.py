@@ -1346,6 +1346,45 @@ class MetaReplaceDeniedTests(unittest.TestCase):
                 self.assertIn("22222222222242228222222222222222", r["meta"], "the ambiguous claim was left as it was, not replaced and not removed")
                 self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
 
+    def test_a_claim_stating_its_nonce_twice_is_never_ours_however_deep_it_nests(self) -> None:
+        # r11 (sol r10 B1, introduced): both inspection parsers (System.Text.Json and the Newtonsoft fallback) stop at a default depth of 64 and the guard read "neither
+        # parser parsed it" as unambiguous, while ConvertFrom-Json (depth 1024) accepted the same text and kept the LAST nonce: a claim with a foreign nonce first, this
+        # submission's second and a value nested 64+ deep read as OWN, so it was replaced and (rollback, retraction) deleted. RED before the fix at depths 64, 65, 100,
+        # 1000, 1100 and 2000, in every spelling; depths 0 and 63 were already refused. The single-nonce controls must stay ours (the fix refuses ambiguity, not depth).
+        n = "a" * 32
+        cases = []
+        for depth in (0, 63, 64, 65, 100, 1000, 1100, 2000):
+            deep = '{"a":' * depth + "0" + "}" * depth
+            for spelling, first in (("same", '"nonce":"foreign"'), ("escaped", '"\\u006eonce":"foreign"'), ("folded", '"NONCE":"foreign"')):
+                cases.append({"k": f"dup-{spelling}-{depth}", "text": '{' + first + ',"nonce":"' + n + '","x":' + deep + '}'})
+        for depth in (0, 100):
+            cases.append({"k": f"single-{depth}", "text": '{"nonce":"' + n + '","x":' + '{"a":' * depth + "0" + "}" * depth + '}'})
+        cases_file = self.tmp / "deep-claim-cases.json"
+        cases_file.write_text(json.dumps(cases), encoding="ascii")
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DROP_MODULE}' -Force\n"
+            "$n = 'a' * 32\n"
+            f"$cases = [IO.File]::ReadAllText('{cases_file}') | ConvertFrom-Json\n"
+            "$rows = foreach ($c in $cases) {\n"
+            "  $unamb = [bool](Test-UmRunClaimNonceUnambiguous -Text $c.text)\n"
+            f"  $f = Join-Path '{self.tmp}' ('claim-' + $c.k + '.json'); [IO.File]::WriteAllText($f, $c.text, [Text.Encoding]::ASCII)\n"
+            "  $own = & (Get-Module UmRunDrop) { param($p, $nn) Get-UmRunClaimOwnership -Path $p -Nonce $nn } $f $n\n"
+            "  [ordered]@{ k = $c.k; unambiguous = $unamb; own = [string]$own } }\n"
+            "ConvertTo-Json -Compress -InputObject @($rows)\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = {row["k"]: row for row in json.loads(p.stdout.strip().splitlines()[-1])}
+        for c in cases:
+            row = got[c["k"]]
+            if c["k"].startswith("dup-"):
+                self.assertFalse(row["unambiguous"], f"{c['k']}: a claim stating its nonce twice is ambiguous at any depth: {row}")
+                self.assertNotEqual(row["own"], "OWN", f"{c['k']}: an ambiguous claim is never ours: {row}")
+            else:
+                self.assertTrue(row["unambiguous"], f"{c['k']}: a claim with one nonce is unambiguous at any depth: {row}")
+                self.assertEqual(row["own"], "OWN", f"{c['k']}: an own claim stays ours: {row}")
+
     def test_a_denied_rename_that_both_exclusive_opens_survive_names_both_sides(self) -> None:
         # r8 adversary A2 (introduced): an exclusive READ open needs no Delete right, so with an ACL that withholds Delete from the source (or the destination) both diagnostic
         # opens succeed and the refusal blamed the healthy destination. Fed directly: an access-denied Move over two plain files nobody holds. RED before the fix:

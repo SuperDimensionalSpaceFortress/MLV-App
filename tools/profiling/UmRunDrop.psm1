@@ -697,7 +697,12 @@ function Test-UmRunClaimNonceUnambiguous {
     if ([string]::IsNullOrWhiteSpace($Text)) { return $true }
     $doc = $null
     try {
-        $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+        # r11 sol r10 B1: both readers default to a depth limit of 64 while ConvertFrom-Json accepts 1024, so a claim nested past 64 made each of them throw, the guard read
+        # "neither parsed it" as unambiguous, and the parse that followed collapsed the repeated nonce to the last one. The limit here is the downstream parser's own (1024);
+        # past it the second reader below has none, so the repeated nonce is still counted and ConvertFrom-Json (which refuses that depth) never gets the text.
+        $opt = [System.Text.Json.JsonDocumentOptions]::new()
+        $opt.MaxDepth = 1024
+        $doc = [System.Text.Json.JsonDocument]::Parse($Text, $opt)
         if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $true }
         $n = 0
         foreach ($prop in $doc.RootElement.EnumerateObject()) {
@@ -713,6 +718,7 @@ function Test-UmRunClaimNonceUnambiguous {
     $reader = $null
     try {
         $reader = [Newtonsoft.Json.JsonTextReader]::new([IO.StringReader]::new($Text))
+        $reader.MaxDepth = $null   # r11 sol r10 B1: no depth limit (its default of 64 threw on a claim ConvertFrom-Json accepts); the reader is iterative, so depth costs no stack
         $n = 0
         $rootIsObject = $false
         while ($reader.Read()) {
