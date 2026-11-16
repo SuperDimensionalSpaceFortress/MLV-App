@@ -213,3 +213,42 @@ TEST(WorkerThreadCount, PlaybackTeamKnobsAreInertUnderAThreadOverride)
     ASSERT_EQ(1, mlvappPlaybackReconWorkerThreadCount());
     ASSERT_EQ(1, mlvappPlaybackPrepWorkerThreadCount());
 }
+
+// Adversary pass 2 A2 on 95d5498e: MLVAPP_FORCE_SINGLETHREAD=true activates single-thread mode (ForceSingleThread.cpp envTruthy) though it is
+// no integer, so the knobs must be inert under it too, and an unset knob still changes nothing.
+TEST(WorkerThreadCount, PlaybackTeamKnobsAreInertUnderAnyTruthySingleThreadValue)
+{
+    EnvGuard forceThreads("MLVAPP_FORCE_THREADS");
+    EnvGuard forceSingle("MLVAPP_FORCE_SINGLETHREAD");
+    EnvGuard recon("MLVAPP_PLAYBACK_RECON_OMP_THREADS");
+    EnvGuard prep("MLVAPP_PLAYBACK_PREP_OMP_THREADS");
+    qunsetenv("MLVAPP_FORCE_THREADS");
+    qunsetenv("MLVAPP_FORCE_SINGLETHREAD");
+    qunsetenv("MLVAPP_PLAYBACK_RECON_OMP_THREADS");
+    qunsetenv("MLVAPP_PLAYBACK_PREP_OMP_THREADS");
+    const int unsetCount = mlvappEffectivePlaybackWorkerThreadCount();
+    qputenv("MLVAPP_PLAYBACK_RECON_OMP_THREADS", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_PLAYBACK_PREP_OMP_THREADS", QByteArrayLiteral("1"));
+    for (const QByteArray &truthy : {QByteArrayLiteral("true"), QByteArrayLiteral("TRUE"), QByteArrayLiteral("yes"), QByteArrayLiteral("on"),
+                                     QByteArrayLiteral(" 1 "), QByteArrayLiteral("00"), QByteArrayLiteral("-0"), QByteArrayLiteral("x")}) {
+        qputenv("MLVAPP_FORCE_SINGLETHREAD", truthy);
+        ASSERT_TRUE(mlvappForceSingleThreadEnvTruthy(truthy));
+        ASSERT_TRUE(mlvappPlaybackTeamOverrideActive());
+        ASSERT_EQ(0, mlvappPlaybackReconTeamRequest());
+        ASSERT_EQ(0, mlvappPlaybackPrepTeamRequest());
+        const int playbackCount = mlvappEffectivePlaybackWorkerThreadCount();
+        ASSERT_EQ(playbackCount, mlvappPlaybackReconWorkerThreadCount());
+        ASSERT_EQ(playbackCount, mlvappPlaybackPrepWorkerThreadCount());
+    }
+    for (const QByteArray &inert : {QByteArray(), QByteArrayLiteral("0"), QByteArrayLiteral(" 0 "), QByteArrayLiteral("false"), QByteArrayLiteral("FALSE"),
+                                    QByteArrayLiteral("off"), QByteArrayLiteral("No")}) {
+        ASSERT_TRUE(!mlvappForceSingleThreadEnvTruthy(inert));
+    }
+    qputenv("MLVAPP_FORCE_SINGLETHREAD", QByteArrayLiteral("off"));
+    ASSERT_TRUE(!mlvappPlaybackTeamOverrideActive());
+    ASSERT_EQ(1, mlvappPlaybackReconTeamRequest());
+    ASSERT_EQ(1, mlvappPlaybackPrepTeamRequest());
+    qunsetenv("MLVAPP_FORCE_SINGLETHREAD");
+    ASSERT_EQ(1, mlvappPlaybackReconTeamRequest());
+    ASSERT_TRUE(unsetCount >= 1);
+}

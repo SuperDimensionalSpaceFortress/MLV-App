@@ -16038,15 +16038,22 @@ class TeamPartitionLegSpecTests(unittest.TestCase):
         # the app emits the record the gate reads, once per smoke session (LogLineField.h, pinned by console_tests LogLineField.TheOmpTeamsRecordNamesEachTeam)
         llf = (ROOT / "platform" / "qt" / "LogLineField.h").read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertIn('"playback_smoke.omp_teams session=%1 partition=%2 recon_omp=%3 recon_cpu_cores=%4 prep_omp=%5 "\n'
-                      '                           "prep_pointwise=%6 prefetch_decoders=%7 logical_cpus=%8 thread_limit=%9 dynamic=%10 override=%11"', llf)
-        # A1 on 84d66a4b: recon_omp / prep_omp are the EFFECTIVE teams, capped by the max team and the OpenMP thread limit the app reads at play start
-        self.assertIn("QString::number( ompEffectiveTeam( reconRequest, maxThreads, threadLimit ) )", llf)
-        self.assertIn("QString::number( ompEffectiveTeam( prepRequest, maxThreads, threadLimit ) )", llf)
+                      '                           "prep_pointwise=%6 prefetch_decoders=%7 logical_cpus=%8 thread_limit=%9 max_active_levels=%10 "\n'
+                      '                           "dynamic=%11 override=%12"', llf)
+        # A1 on 84d66a4b (and pass 2 A1 on 95d5498e): recon_omp / prep_omp are the EFFECTIVE teams, capped by the max team, the OpenMP thread limit and the
+        # max active levels the app reads at play start
+        self.assertIn("QString::number( ompEffectiveTeam( reconRequest, maxThreads, threadLimit, maxActiveLevels ) )", llf)
+        self.assertIn("QString::number( ompEffectiveTeam( prepRequest, maxThreads, threadLimit, maxActiveLevels ) )", llf)
         mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
         self.assertEqual(mw.count("<< log_line_field::ompTeamsLine( static_cast<qulonglong>( m_playbackSmokeSessionId ),"), 1)
         for read in ("const int teamsMaxThreads = omp_get_max_threads();", "const int teamsThreadLimit = omp_get_thread_limit();",
-                     "const bool teamsDynamic = omp_get_dynamic() != 0;"):
-            self.assertEqual(mw.count(read), 1, read)
+                     "const int teamsMaxActiveLevels = omp_get_max_active_levels();", "const bool teamsDynamic = omp_get_dynamic() != 0;",
+                     "teamsMaxActiveLevels,\n                                             teamsDynamic,\n"
+                     "                                             mlvappPlaybackTeamOverrideActive() );"):
+            self.assertEqual(mw.replace("\r\n", "\n").count(read), 1, read)
+        # pass 2 A2 on 95d5498e: the knobs are inert under ForceSingleThread.cpp's truthy rule, not only the integer read
+        wtc = (ROOT / "src" / "batch" / "WorkerThreadCount.h").read_text(encoding="utf-8")
+        self.assertIn("if (mlvappPlaybackTeamOverrideActive()) {\n        return 0;", wtc.replace("\r\n", "\n"))
 
 
 @requires_windows_pwsh
@@ -16070,9 +16077,28 @@ class TeamPartitionEvidenceTests(unittest.TestCase):
 
     @staticmethod
     def record(partition: str = "12+6", recon: str = "12", prep: str = "6", session: int = 3, override: str = "0", cores: str = "12", pointwise: str = "6",
-               limit: str = "2147483647", dynamic: str = "0") -> str:
+               limit: str = "2147483647", dynamic: str = "0", levels: str = "1") -> str:
         return (f"playback_smoke.omp_teams session={session} partition={partition} recon_omp={recon} recon_cpu_cores={cores} prep_omp={prep}"
-                f" prep_pointwise={pointwise} prefetch_decoders=2 logical_cpus=20 thread_limit={limit} dynamic={dynamic} override={override}")
+                f" prep_pointwise={pointwise} prefetch_decoders=2 logical_cpus=20 thread_limit={limit} max_active_levels={levels} dynamic={dynamic}"
+                f" override={override}")
+
+    def test_adversary_pass2_a1_a3_serialized_or_limit_contradicting_teams_are_not_the_partition(self) -> None:
+        # pass 2 A1 on 95d5498e: OMP_MAX_ACTIVE_LEVELS=0 serializes both teams; the app now writes max_active_levels and the effective 1+1.
+        v = self.verdict(self.ON, self.log(self.record(recon="1", prep="1", levels="0")))
+        self.assertEqual((v["observed"], v["verdict"], v["blocks"]), ("1+1", "NOT_HONOURED", True), v)
+        # ... and a record that claims the request under levels 0, or above its own thread_limit (pass 2 A3), is self-contradicting: unreadable.
+        for name, rec in (("levels 0 but 12+6", self.record(levels="0")), ("thread limit 1 but 12+6", self.record(limit="1")),
+                          ("thread limit 8 but recon 12", self.record(limit="8")), ("levels field missing", self.record().replace(" max_active_levels=1", "")),
+                          ("levels not a number", self.record(levels="x"))):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(rec))
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_HONOURED", True, None), v)
+        for levels in ("1", "2", "2147483647"):
+            with self.subTest(levels=levels):
+                v = self.verdict(self.ON, self.log(self.record(levels=levels)))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), ("12+6", "HONOURED", False), v)
+        v = self.verdict({}, self.log(self.OFF_RECORD().replace("max_active_levels=1", "max_active_levels=0")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), "a control leg's clean off record is unchanged at any level")
 
     def shape_refusal(self, spec: dict):
         proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n@{ r = (Get-DvLegSpecShapeRefusal -Spec $s) } | ConvertTo-Json -Compress",

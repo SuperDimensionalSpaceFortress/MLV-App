@@ -109,9 +109,28 @@ inline int mlvappPlaybackTeamRequestFromValue(const QByteArray &raw)
     return value > 0 ? static_cast<int>(qMin<qint64>(value, 1000000)) : 0;
 }
 
+/* Adversary pass 2 A2 on 95d5498e: MLVAPP_FORCE_SINGLETHREAD is ACTIVE by ForceSingleThread.cpp's envTruthy rule (trimmed; anything but
+ * empty, "0", "false", "off" or "no", case-insensitive), so "true" activates single-thread mode while the integer read in
+ * mlvappWorkerThreadOverrideActive() says no override. The team knobs are inert under either reading. (mlvappWorkerThreadOverrideActive
+ * itself is unchanged: its callers predate this card.) */
+inline bool mlvappForceSingleThreadEnvTruthy(const QByteArray &raw)
+{
+    const QByteArray value = raw.trimmed();
+    if (value.isEmpty() || value == "0") {
+        return false;
+    }
+    return value.compare("false", Qt::CaseInsensitive) != 0 && value.compare("off", Qt::CaseInsensitive) != 0
+        && value.compare("no", Qt::CaseInsensitive) != 0;
+}
+
+inline bool mlvappPlaybackTeamOverrideActive()
+{
+    return mlvappWorkerThreadOverrideActive() || mlvappForceSingleThreadEnvTruthy(qgetenv("MLVAPP_FORCE_SINGLETHREAD"));
+}
+
 inline int mlvappPlaybackTeamRequest(const char *name)
 {
-    if (mlvappWorkerThreadOverrideActive()) {
+    if (mlvappPlaybackTeamOverrideActive()) {
         return 0;
     }
     const int requested = mlvappPlaybackTeamRequestFromValue(qgetenv(name));

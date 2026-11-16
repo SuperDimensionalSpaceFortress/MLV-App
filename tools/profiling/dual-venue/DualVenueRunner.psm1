@@ -1928,7 +1928,7 @@ function Get-DvTeamPartitionEvidence {
     CPU-S1-FS-SPIKE-TEAM-PARTITION-1: did a leg that asks for the asymmetric playback OpenMP team partition (generatorArgs.reconOmpThreads = r and
     generatorArgs.prepOmpThreads = p, both or neither, integers 1..16; the job sets MLVAPP_PLAYBACK_RECON_OMP_THREADS=r and MLVAPP_PLAYBACK_PREP_OMP_THREADS=p)
     run partitioned at exactly r+p? Read ONLY from the app's own `playback_smoke.omp_teams session=<n> partition=<off|r+p> recon_omp=<n> recon_cpu_cores=<n>
-    prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> override=<0|1>` record for the MEASURED session (integers the app derived, no env
+    prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> thread_limit=<n> max_active_levels=<n> dynamic=<0|1> override=<0|1>` record for the MEASURED session (integers the app derived, no env
     text), matched as a whole line, never from the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is true when the leg asked and there
     is no such record (a binary before this card emits none), the record is unreadable, not unique or internally inconsistent, or it reports anything but
     partition=r+p, recon_omp=r, prep_omp=p and override=0; or when the spec names only one of the two. A leg that does not ask blocks only when the app reports
@@ -1966,7 +1966,7 @@ function Get-DvTeamPartitionEvidence {
             $n = '(?:0|[1-9][0-9]{0,8})'
             $p = '(?:[1-9][0-9]{0,8})'
             $fields = "partition=(?<part>off|(?<pr>$n)\+(?<pp>$n)) recon_omp=(?<r>$n) recon_cpu_cores=(?<rc>$p) prep_omp=(?<q>$n) prep_pointwise=(?<qp>$p)" +
-                " prefetch_decoders=$n logical_cpus=$p thread_limit=(?<tl>[1-9][0-9]{0,9}) dynamic=(?<dy>[01]) override=(?<o>[01])"
+                " prefetch_decoders=$n logical_cpus=$p thread_limit=(?<tl>[1-9][0-9]{0,9}) max_active_levels=(?<ml>(?:0|[1-9][0-9]{0,9})) dynamic=(?<dy>[01]) override=(?<o>[01])"
             $whole = Get-DvCanonicalRecordPattern -Marker 'playback_smoke.omp_teams' -Session ([regex]::Escape([string]$session)) -Fields $fields
             foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if (-not (Test-DvRecordMentionsSession -Body $l -Marker 'playback_smoke.omp_teams' -Session ([string]$session) -Fields $fields)) { continue }
@@ -1976,14 +1976,17 @@ function Get-DvTeamPartitionEvidence {
                     $records++
                     $rec = [ordered]@{ part = $m.Groups['part'].Value; reconReq = $m.Groups['pr'].Value; prepReq = $m.Groups['pp'].Value
                                        recon = [long]$m.Groups['r'].Value; prep = [long]$m.Groups['q'].Value; cores = [long]$m.Groups['rc'].Value
-                                       pointwise = [long]$m.Groups['qp'].Value; limit = [decimal]$m.Groups['tl'].Value
+                                       pointwise = [long]$m.Groups['qp'].Value; limit = [decimal]$m.Groups['tl'].Value; levels = [decimal]$m.Groups['ml'].Value
                                        dynamic = [int]$m.Groups['dy'].Value; override = [int]$m.Groups['o'].Value }
                     # adversary A2 on 84d66a4b: the record is read whole. off = no team effective (0 / 0) and both counts the one playback count; r+p = each
-                    # effective team at most its request and each named side's count exactly its request.
+                    # effective team at most its request and each named side's count exactly its request. Pass 2 on 95d5498e (A1, A3): each effective team
+                    # is also at most thread_limit, and at most 1 when max_active_levels=0 (OpenMP then runs every region on one thread).
+                    $cap = $(if ($rec.levels -eq 0) { [decimal]1 } else { $rec.limit })
                     $consistent = $(if ($rec.part -ceq 'off') { $rec.recon -eq 0 -and $rec.prep -eq 0 -and $rec.cores -eq $rec.pointwise }
                                     else {
                                         $rr = [long]$rec.reconReq; $pq = [long]$rec.prepReq
-                                        ($rr -gt 0 -or $pq -gt 0) -and $rec.recon -le $rr -and $rec.prep -le $pq -and ($rr -eq 0 -or $rec.cores -eq $rr) -and ($pq -eq 0 -or $rec.pointwise -eq $pq)
+                                        ($rr -gt 0 -or $pq -gt 0) -and $rec.recon -le $rr -and $rec.prep -le $pq -and ($rr -eq 0 -or $rec.cores -eq $rr) -and ($pq -eq 0 -or $rec.pointwise -eq $pq) -and
+                                            $rec.recon -le $cap -and $rec.prep -le $cap
                                     })
                 }
             }
@@ -1992,7 +1995,7 @@ function Get-DvTeamPartitionEvidence {
     if ($records -ne 1 -or $mentions -ne 1 -or -not $consistent) { $rec = $null }
     # observed is the EFFECTIVE split ("off", or "<recon_omp>+<prep_omp>"), never the request text (adversary A1 on 84d66a4b)
     if ($null -ne $rec) { $observed = $(if ($rec.part -ceq 'off') { 'off' } else { "$($rec.recon)+$($rec.prep)" }) }
-    $unreadable = 'the team partition is unreadable: the measured session''s playback_smoke.omp_teams record is not exactly one whole, self-consistent line of the form playback_smoke.omp_teams session=<n> partition=<off|r+p> recon_omp=<n> recon_cpu_cores=<n> prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> thread_limit=<n> dynamic=<0|1> override=<0|1>, or there is more than one'
+    $unreadable = 'the team partition is unreadable: the measured session''s playback_smoke.omp_teams record is not exactly one whole, self-consistent line of the form playback_smoke.omp_teams session=<n> partition=<off|r+p> recon_omp=<n> recon_cpu_cores=<n> prep_omp=<n> prep_pointwise=<n> prefetch_decoders=<n> logical_cpus=<n> thread_limit=<n> max_active_levels=<n> dynamic=<0|1> override=<0|1>, or there is more than one'
     if ($requested) {
         $verdict = 'NOT_HONOURED'
         if ($null -eq $requestedText) { $reason = "TEAM_PARTITION_SPEC_INVALID: the spec's reconOmpThreads ($(ConvertTo-Json -InputObject $rawRecon -Compress)) and prepOmpThreads ($(ConvertTo-Json -InputObject $rawPrep -Compress)) are not both whole numbers from 1 to 16 (both or neither)" }
@@ -2000,6 +2003,7 @@ function Get-DvTeamPartitionEvidence {
         elseif ($null -eq $rec) { $reason = $unreadable }
         elseif ($rec.override -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says override=1 (MLVAPP_FORCE_THREADS / MLVAPP_FORCE_SINGLETHREAD make the partition inert)' }
         elseif ($rec.dynamic -ne 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says dynamic=1 (OpenMP may shrink any team below its request, so the split is not the one the leg names)' }
+        elseif ($rec.levels -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.omp_teams says max_active_levels=0 (OpenMP serializes every team to one thread, so the split is not the one the leg names)' }
         elseif ($rec.part -cne $requestedText) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.omp_teams says partition=$($rec.part), not the $requestedText the leg names" }
         elseif ($observed -cne $requestedText -or $rec.cores -ne [long]$rawRecon -or $rec.pointwise -ne [long]$rawPrep) { $reason = "ROUTE_NOT_ENGAGED: the measured session's effective teams are $observed (recon_cpu_cores=$($rec.cores) prep_pointwise=$($rec.pointwise) thread_limit=$($rec.limit)), not the $requestedText the leg names" }
         else { $verdict = 'HONOURED' }

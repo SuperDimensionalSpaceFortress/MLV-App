@@ -27453,14 +27453,17 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
         mlvRawUint16PrefetchStats_t teamsRaw = {};
         if( m_pMlvObject ) getMlvRawUint16PrefetchStats( m_pMlvObject, &teamsRaw );
         // The GUI thread never sizes its own team, so its max is the process's initial team (OMP_NUM_THREADS or every CPU), which is
-        // what the recon worker and the prep thread start from; the thread limit and dynamic adjustment are what can shrink them.
+        // what the recon worker and the prep thread start from; the thread limit, the max active levels and dynamic adjustment are what
+        // can shrink them.
 #ifdef _OPENMP
         const int teamsMaxThreads = omp_get_max_threads();
         const int teamsThreadLimit = omp_get_thread_limit();
+        const int teamsMaxActiveLevels = omp_get_max_active_levels();
         const bool teamsDynamic = omp_get_dynamic() != 0;
 #else
         const int teamsMaxThreads = 1;
         const int teamsThreadLimit = 1;
+        const int teamsMaxActiveLevels = 1;
         const bool teamsDynamic = false;
 #endif
         qInfo().noquote()
@@ -27473,8 +27476,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                                              QThread::idealThreadCount(),
                                              teamsMaxThreads,
                                              teamsThreadLimit,
+                                             teamsMaxActiveLevels,
                                              teamsDynamic,
-                                             mlvappWorkerThreadOverrideActive() );
+                                             mlvappPlaybackTeamOverrideActive() );
     }
 
     // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
