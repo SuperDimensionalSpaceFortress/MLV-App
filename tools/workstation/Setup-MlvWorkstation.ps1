@@ -241,6 +241,8 @@ function Get-HubLease {
     $line = @($ls | Where-Object { "$_" -match '^[0-9a-f]{40}\s' }) | Select-Object -First 1
     if (-not $line) { return @{ Error = $null; Exists = $false; Sha = ''; Holder = ''; Data = $null } }
     $sha = ("$line" -split '\s+')[0]
+    # r15 pass 14 A4 sibling: under -WhatIf the fetch (a write to the local lease ref and the object store) is not run; the lease is reported unread
+    if ($WhatIfPreference) { return @{ Error = 'WhatIf: the lease content is not fetched (a dry run writes nothing)' } }
     & git -C $Repo fetch --quiet --no-tags $LeaseRemote "+${LeaseRef}:refs/hub-lease-local/mlv-app" 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { return @{ Error = 'fetch of lease ref failed' } }
     $raw = & git -C $Repo show "${sha}:$LeaseFile" 2>&1
@@ -602,7 +604,7 @@ function Invoke-PhaseSsh {
 # Phase: Clone
 # ---------------------------------------------------------------------------------------------
 function Invoke-PhaseClone {
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Log 'git missing: run -Phase Packages first' 'ERROR'; return }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Log 'CLONE_PREREQ_MISSING git missing: run -Phase Packages first' 'ERROR'; $script:Failures.Add('CLONE_PREREQ_MISSING git'); return }   # r15 pass 14 A5 sibling: a failure (exit 1)
     if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) {
         Invoke-Step "Clone MLV-App fork into $Repo (remote 'fork' = SuperDimensionalSpaceFortress, 'origin' = ilia3101, as on VIRTUAL-TEN)" {
             [void](Invoke-Native -Exe 'git' -Arguments @('-c', 'core.longpaths=true', 'clone', '--origin', 'fork', $ForkUrl, $Repo))
@@ -618,7 +620,8 @@ function Invoke-PhaseClone {
                 $have = (@(& git -C $Repo remote get-url $want[0]) -join '').Trim()
                 if (-not (Test-GitRemoteUrlSame $have $want[1])) {
                     $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0])")
-                    throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' is $have, expected $($want[1]) (nothing was fetched; fix the remote by hand and re-run -Phase Clone)"
+                    # r15 pass 14 A2: the URL is printed with any user:password part redacted (the log and the console never carry a credential)
+                    throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' is $(Get-RedactedRemoteUrl $have), expected $($want[1]) (nothing was fetched; fix the remote by hand and re-run -Phase Clone)"
                 }
             }
             if ($remotes -notcontains 'fork') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'fork', $ForkUrl)) }
@@ -639,10 +642,16 @@ function Invoke-PhaseClone {
         $dHave = (@(& git -C $DoctrineRepo remote get-url origin 2>$null) -join '').Trim()
         if (Test-GitRemoteUrlSame $dHave $DoctrineUrl) { Write-Log "present: $DoctrineRepo" 'OK' }
         else {
-            Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$dHave', expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
+            Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$(Get-RedactedRemoteUrl $dHave)', expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
             $script:Failures.Add("CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo")
         }
     }
+}
+
+# r15 pass 14 A2: a remote URL as it may be printed: every 'scheme://<userinfo>@' part (a user, a user:password, a token) is replaced by 'scheme://***@'.
+function Get-RedactedRemoteUrl {
+    param([string]$Url)
+    return ([regex]::Replace("$Url", '(?i)([a-z][a-z0-9+.\-]*://)[^/@\s]*@', '$1***@'))
 }
 
 # r15 pass 13 A5: true when two git remote URLs name the same repository: compared case-insensitively after the GitHub ssh forms ('git@github.com:o/r',
@@ -653,6 +662,7 @@ function Test-GitRemoteUrlSame {
         param($u)
         $s = "$u".Trim()
         $s = $s -replace '^(?i)git@github\.com:', 'https://github.com/' -replace '^(?i)ssh://git@github\.com/', 'https://github.com/'
+        $s = $s -replace '^(?i)([a-z][a-z0-9+.\-]*://)[^/@\s]*@', '$1'   # r15 pass 14 A2: a user / token part does not change which repository a URL names
         $s = $s -replace '/+$', '' -replace '(?i)\.git$', ''
         return $s.ToLowerInvariant()
     }
@@ -668,7 +678,7 @@ function Invoke-PhaseQt {
     $make = Join-Path $MingwDir 'bin\mingw32-make.exe'
     if ((Test-Path -LiteralPath $qmake) -and (Test-Path -LiteralPath $make)) { Write-Log "present: Qt $QtVersion and MinGW 13.1" 'OK'; return }
     $req = Join-Path $Repo '.github\requirements\aqtinstall.txt'
-    if (-not (Test-Path -LiteralPath $req)) { Write-Log "missing ${req}: run -Phase Clone first" 'ERROR'; return }
+    if (-not (Test-Path -LiteralPath $req)) { Write-Log "QT_PREREQ_MISSING missing ${req}: run -Phase Clone first" 'ERROR'; $script:Failures.Add("QT_PREREQ_MISSING $req"); return }   # r15 pass 14 A5 sibling: a failure (exit 1)
     Update-SessionPath
     $venv = Join-Path $MlvTmp 'venv-aqt'
     $vpy = Join-Path $venv 'Scripts\python.exe'
@@ -739,7 +749,8 @@ $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACC
 # Get-CredentialHitLine, which call this rule and nothing else besides the known token shapes below.
 # r15 pass 13 A2: between the name and its separator up to three CLOSING characters may stand (a quote, ']', ')', '}'), so a subscripted or braced script key is a key
 # too: '${env:DB_PASSWORD} = ''x''', '$config[''password''] = ''x''', '$c["token"]="x"', '(password) = x'. (Blanks may stand before and after them.)
-$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-]*)((?:[ \t]*["''\]\)\}]){0,3})[ \t]*(:|=(?!=))'
+# r15 pass 14 A1: any whitespace, line breaks included, may stand between the name (and its closers) and the separator ('{"password"\n:"hunter2"}' is valid JSON).
+$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:pass[_.\-]?w(?:or)?d|secret|credential|api[_.\-]?key|private[_.\-]?key|access[_.\-]?key|auth|token|pwd)[A-Za-z0-9_.\-]*)((?:\s*["''\]\)\}]){0,3})\s*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
 # r15 (hub ruling on adversary pass 12 A1-A3, DENY BY DEFAULT on the key name): the value span regexes, the quoted-run regexes and the netrc record tokenizer of
 # r14 are gone (they stripped quotes, braces, comments and CDATA before the exemption test). What is left is the CLOSED exemption list, compared against the whole
@@ -1789,14 +1800,15 @@ function Invoke-PhaseImport {
             [void](Invoke-Native -Exe (Join-Path $env:SystemRoot 'System32\tar.exe') -Arguments @('-x', '-f', $BundlePath, '-C', $src))
         }
     }
-    if (-not $WhatIfPreference -and -not (Test-Path -LiteralPath (Join-Path $src 'MANIFEST.txt'))) { Write-Log "not a migrate bundle (no MANIFEST.txt): $src" 'ERROR'; return }
+    # r15 pass 14 A5: a refused Import is a FAILURE of the run (exit 1), never a quiet return that ends 'done' with exit 0
+    if (-not $WhatIfPreference -and -not (Test-Path -LiteralPath (Join-Path $src 'MANIFEST.txt'))) { Write-Log "IMPORT_BUNDLE_INVALID not a migrate bundle (no MANIFEST.txt): $src" 'ERROR'; $script:Failures.Add("IMPORT_BUNDLE_INVALID $src"); return }
     # p5 A9: from here on the bundle is read from a private snapshot (only this run writes it): the credential scan and the copy then see the same bytes,
     # whatever happens to the bundle folder in between. Removed again after the copy.
     $importSnapshot = $null
     if (-not $WhatIfPreference) {
         $importSnapshot = Join-Path $StateRoot "import-snapshot-$stamp"
         Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot) }
-        if (Test-Path -LiteralPath $importSnapshot -PathType Container) { $src = $importSnapshot } else { Write-Log 'the bundle snapshot could not be made; nothing was imported' 'ERROR'; return }
+        if (Test-Path -LiteralPath $importSnapshot -PathType Container) { $src = $importSnapshot } else { Write-Log 'IMPORT_SNAPSHOT_FAILED the bundle snapshot could not be made; nothing was imported' 'ERROR'; $script:Failures.Add('IMPORT_SNAPSHOT_FAILED'); return }
     }
     $h = $env:USERPROFILE
     Invoke-Step 'Back up existing ~/.claude CLAUDE.md and settings.json' {
@@ -1880,7 +1892,7 @@ function Get-GateTaskArgument {
 
 function Invoke-PhaseTasks {
     $pwsh = Get-PwshPath
-    if (-not $pwsh) { Write-Log 'pwsh missing: run -Phase Packages first' 'ERROR'; return }
+    if (-not $pwsh) { Write-Log 'TASKS_PREREQ_MISSING pwsh missing: run -Phase Packages first' 'ERROR'; $script:Failures.Add('TASKS_PREREQ_MISSING pwsh'); return }   # r15 pass 14 A5 sibling: a failure (exit 1)
     $self = Join-Path $StateRoot 'Setup-MlvWorkstation.ps1'
     if ($PSCommandPath -and ($PSCommandPath -ine $self)) {
         Invoke-Step "Install gate runner copy at $self" { [void][IO.Directory]::CreateDirectory($StateRoot); Copy-Item -LiteralPath $PSCommandPath -Destination $self -Force }
@@ -2248,6 +2260,8 @@ foreach ($p in $run) {
         'Gate' { Invoke-PhaseGate }
         'LeaseShow' { [void](Show-HubLease) }
         'LeaseAcquire' {
+            # r15 pass 14 A4: a dry run reads no lease (a lease read is a git fetch, which changes the local lease ref and the object store) and writes none
+            if ($WhatIfPreference) { Write-Log 'SKIP (WhatIf) LeaseAcquire: the lease is neither read (that is a git fetch) nor written'; break }
             $cur = Show-HubLease
             if ($cur.Error) { Write-Log 'cannot read the lease; refusing to acquire blind' 'ERROR'; exit 2 }
             if ($cur.Holder -ieq $env:COMPUTERNAME) { Write-Log "already held by $env:COMPUTERNAME" 'OK'; break }

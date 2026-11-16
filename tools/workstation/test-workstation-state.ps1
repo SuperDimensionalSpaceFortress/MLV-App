@@ -1718,6 +1718,39 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r15 p13 A5') -and (Test-Has 'T
     $script:Failures.Clear()
 }
 
+# ================================================================ r15 fix iteration 2 (head af16ed54): adversary pass 14, A1 A2 A4 A5 (A3 is listed OPEN in the PR body)
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r15 p14 A1')) {
+    $p14a1 = '{"password"' + "`n" + ':"hunter2"}'
+    Assert-That ((Test-CredentialText $p14a1) -and (Get-CredentialHitLine $p14a1) -eq 1) 'r15 p14 A1 a JSON key whose separator is on the next line is a credential (reported on the key line)' $p14a1
+    Assert-That (Test-CredentialText ("password`r`n  =  hunter2")) 'r15 p14 A1 an ini key whose = is on the next line (CRLF) is a credential'
+}
+if ($fnLoaded -and (Test-Has 'Get-RedactedRemoteUrl' 'r15 p14 A2') -and (Test-Has 'Invoke-PhaseClone' 'r15 p14 A2')) {
+    Assert-That ((Get-RedactedRemoteUrl 'https://alice:hunter2@github.com/ilia3101/MLV-App.git') -ceq 'https://***@github.com/ilia3101/MLV-App.git') 'r15 p14 A2 url: the user:password part is redacted' (Get-RedactedRemoteUrl 'https://alice:hunter2@github.com/ilia3101/MLV-App.git')
+    Assert-That (Test-GitRemoteUrlSame 'https://x-token:abc@github.com/SuperDimensionalSpaceFortress/MLV-App.git' 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git') 'r15 p14 A2 url: a token part does not change the repository'
+    $p14ws = New-Scratch 'r15-p14-a2'
+    $p14repo = Join-Path $p14ws 'MLV-App'; [void][IO.Directory]::CreateDirectory($p14repo); & git -C $p14repo init -q 2>$null
+    & git -C $p14repo remote add fork 'https://alice:hunter2@github.com/ilia3101/MLV-App.git'
+    $savedRepo = $script:Repo; $script:Repo = $p14repo; $Repo = $p14repo
+    # the doctrine path holds a checkout of the right repository, so the phase never clones (no network in this test)
+    $p14doc = Join-Path $p14ws 'doctrine'; [void][IO.Directory]::CreateDirectory($p14doc); & git -C $p14doc init -q 2>$null; & git -C $p14doc remote add origin $DoctrineUrl
+    $savedDoc = $script:DoctrineRepo; $script:DoctrineRepo = $p14doc; $DoctrineRepo = $p14doc
+    $savedLog = $script:LogFile; $script:LogFile = Join-Path $p14ws 'clone.log'
+    $script:Failures.Clear()
+    $p14out = ''
+    try { $p14out = (Invoke-PhaseClone *>&1 | Out-String) } catch { $p14out += $_.Exception.Message }
+    $p14log = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+    $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH*' }).Count -ge 1 -and $p14log -match 'CLONE_REMOTE_MISMATCH') 'r15 p14 A2 clone: the wrong fork remote is refused (and logged)' ($script:Failures -join ',')
+    Assert-That (-not ($p14log + $p14out).Contains('hunter2')) 'r15 p14 A2 clone: the refusal never prints or stores the remote URL''s password' ($p14log + $p14out)
+    $script:Failures.Clear()
+}
+# A4: -Phase LeaseAcquire -WhatIf reads no lease (a lease read is a git fetch) and writes none
+$p14a4 = Invoke-Setup (New-Scratch 'r15-p14-a4-home') @('-Phase', 'LeaseAcquire', '-WhatIf', '-StateRoot', (New-Scratch 'r15-p14-a4-state'), '-Workspace', (New-Scratch 'r15-p14-a4-ws'))
+Assert-That ($p14a4.Out -match 'SKIP \(WhatIf\) LeaseAcquire' -and $p14a4.Out -notmatch 'cannot read the lease') 'r15 p14 A4 lease: -Phase LeaseAcquire -WhatIf skips the lease read and write (no git fetch)' "exit=$($p14a4.Exit)`n$($p14a4.Out)"
+# A5: an Import whose bundle has no MANIFEST.txt is a FAILURE of the run (exit 1), not a quiet 'done'
+$p14a5 = Invoke-Setup (New-Scratch 'r15-p14-a5-home') @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r15-p14-a5-state'), '-Workspace', (New-Scratch 'r15-p14-a5-ws'), '-BundlePath', (New-Scratch 'r15-p14-a5-empty-bundle'), '-SourceHost', 'NOT-THIS-HOST')
+Assert-That ($p14a5.Exit -eq 1 -and $p14a5.Out -match 'IMPORT_BUNDLE_INVALID') 'r15 p14 A5 import: a bundle without MANIFEST.txt fails the run (exit 1, IMPORT_BUNDLE_INVALID)' "exit=$($p14a5.Exit)`n$($p14a5.Out)"
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
