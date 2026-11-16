@@ -11,6 +11,7 @@
 #include <QtGlobal>
 
 #include <cmath>
+#include <limits>
 
 namespace gui_present_gap
 {
@@ -88,6 +89,16 @@ inline const char *otherBusySpanName( OtherBusySpan span )
     case OtherBusySpan::Count: break;
     }
     return "unknown";
+}
+
+// CPU-S1-PACE-POST-785-LEVER-1: max_gui_other_busy_bucket's value -- a span name, "unattributed"
+// (-1, OtherBusySpans::dominantBucket), or "none" when no gap closed (-2 or any other value).
+inline const char *otherBusyBucketName( int bucket )
+{
+    if( bucket == -1 ) return "unattributed";
+    if( bucket >= 0 && bucket < static_cast<int>( OtherBusySpan::Count ) )
+        return otherBusySpanName( static_cast<OtherBusySpan>( bucket ) );
+    return "none";
 }
 
 // One clock reading of the four quantities a span needs.
@@ -177,6 +188,53 @@ public:
         const double rest = otherBusyMs - charged;
         unattributedSumMs += rest > 0.0 ? rest : 0.0;
         return rest > 0.0 ? rest : 0.0;
+    }
+
+    // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): the bucket that holds most of the open gap's
+    // other busy, as closeGap would charge it -- a span index, or -1 when the unattributed rest is the
+    // largest (ties go to the named span). Read before closeGap, which clears the gap's spans.
+    int dominantBucket( double otherBusyMs ) const
+    {
+        // closeGap's own charging, run on a copy of this gap's spans (no second copy of its rules).
+        OtherBusySpans probe;
+        for( int i = 0; i < kCount; ++i ) probe.gapMs[i] = gapMs[i];
+        const double rest = probe.closeGap( otherBusyMs );
+        // r2 fix iteration 2 (adversary A1 on 1a6d7fd5): closeGap's rest is a subtraction (budget less the summed charges),
+        // so a measured tie can land an ulp apart (0.3 + 0.6 charged of 1.5 leaves 0.6000000000000001 against 0.6). Every
+        // comparison here treats charges within one clock tick (1 ns) or a few ulps of the gap's charged total as a tie:
+        // ties go to the named span over the rest, and to the first named span over a later one.
+        // r3 (adversary A1 on 9c18b971): a tolerance compared in double ms still leaked at its own boundary (a 1 ns tie came
+        // out 1 ns + 1 ulp apart). Every charge is now rounded to whole gap-clock ticks (ns) and compared as an integer: a
+        // difference of at most tieNs ticks (1, or 8 ulps of the gap's charged total at sizes where 1 ns is below an ulp;
+        // kMaxSpanMs = 1e12 ms = 1e18 ns, and six such terms sum below INT64_MAX) is a tie. A charge that is not a positive
+        // finite number is 0 ticks and one past kMaxSpanMs is capped there, so llround never sees NaN, infinity or an overflow.
+        const auto ticks = []( double ms ) -> long long
+        {
+            if( !( ms > 0.0 ) || !std::isfinite( ms ) ) return 0;
+            return std::llround( ( ms < kMaxSpanMs ? ms : kMaxSpanMs ) * 1000000.0 );
+        };
+        // r3 fix iteration 1 (adversary A1 on 9f942b1e): chaining ties span to span is not transitive (1000000 and 1000001
+        // tie, 1000001 and a 1000002 rest tie, yet the kept 1000000 lost to the rest). Every bucket is now compared with ONE
+        // anchor -- the largest charge in ticks, the rest included -- and the bucket is the first named span within tieNs of
+        // it (a positive charge), else -1 (the rest alone is the largest).
+        const long long restNs = ticks( rest );
+        long long ns[kCount] = {};
+        long long totalNs = restNs;
+        long long anchorNs = restNs;
+        for( int i = 0; i < kCount; ++i )
+        {
+            ns[i] = ticks( probe.sumMs[i] );
+            totalNs += ns[i];
+            if( ns[i] > anchorNs ) anchorNs = ns[i];
+        }
+        const long long ulpNs =
+            std::llround( 8.0 * std::numeric_limits<double>::epsilon() * static_cast<double>( totalNs ) );
+        const long long tieNs = ulpNs > 1 ? ulpNs : 1;
+        for( int i = 0; i < kCount; ++i )
+        {
+            if( ns[i] > 0 && ns[i] >= anchorNs - tieNs ) return i;
+        }
+        return -1;
     }
 
     // A gap opened: spans of a previous gap that never closed are not carried into it.

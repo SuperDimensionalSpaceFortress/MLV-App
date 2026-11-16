@@ -444,6 +444,9 @@ public:
      * frameNumber in activeGeneration, lookahead or not (not yet acquired). */
     bool hasReadyFrameForPlaybackTarget( uint32_t frameNumber,
                                          uint64_t activeGeneration );
+    /* CPU-S1-PACE-POST-785-LEVER-1 r4 fix iteration 2 (adversary A3 on c7953c66): the frame slot count the thread runs
+     * (MLVAPP_PHASE3_FRAME_SLOT_COUNT or 4), for the CPU-route lookahead's slot budget (PlaybackLookaheadCpuRoute.h). */
+    static int playbackFrameSlotCount( void ) { return configuredFrameSlotCount(); }
     int prunePlaybackLookaheadOutsideForwardWindow( int activePlaybackTarget,
                                                     uint64_t activeGeneration,
                                                     int cutInFrame,
@@ -466,6 +469,11 @@ public:
     double lastFrameReadyEmitStageTime( void ) const;
     void setPhase3Mode( Phase3Mode mode ) noexcept;
     Phase3Mode phase3Mode( void ) const noexcept;
+    //! CPU-S1-PACE-POST-785-LEVER-1: queued lookahead requests a drop-frame request erased (monotonic).
+    uint64_t playbackLookaheadDroppedQueuedCount( void ) const noexcept
+    {
+        return m_playbackLookaheadDroppedQueued.load( std::memory_order_relaxed );
+    }
     void stop( void );
     void lock( void );
     void unlock( void );
@@ -719,6 +727,7 @@ private:
     int m_renderingSlotIndex;
     int m_presentingSlotIndex;
     std::atomic<Phase3Mode> m_phase3Mode;
+    std::atomic<uint64_t> m_playbackLookaheadDroppedQueued{ 0 };
     FrameSlotStorage m_frameSlots;
     FastPlaybackScaleCache m_playbackScaleCache;
     BilinearPlaybackScaleCache m_playbackBilinearScaleCache;

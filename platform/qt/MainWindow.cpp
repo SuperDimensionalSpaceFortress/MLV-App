@@ -1560,6 +1560,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "ScopesLabel.h"
 #include "avir/avirthreadpool.h"
 #include "PlaybackPrepCpuRoute.h"
+#include "PlaybackLookaheadCpuRoute.h"
 #include "../../src/processing/ThreadExitCache.h"
 #include "MoveToTrash.h"
 #include "OverwriteListDialog.h"
@@ -2785,12 +2786,23 @@ static int mlvappPlaybackRenderLookaheadEnvFrames()
     return lookaheadFrames;
 }
 
-// PLAYBACK-DECODE-RENDER-OVERLAP-1: the lookahead is on by default on the CUDA texture route only, so the
+// PLAYBACK-DECODE-RENDER-OVERLAP-1: the lookahead is on by default on the CUDA texture route, so the
 // decode + dual-ISO of N+1 runs while N renders and presents (two frames in flight, not one).
+// CPU-S1-PACE-POST-785-LEVER-1: and at depth 1 on the admitted CPU route (PlaybackLookaheadCpuRoute.h).
 int MainWindow::playbackRenderLookaheadFrames() const
 {
     return playback_overlap::effectiveLookaheadFrames( mlvappPlaybackRenderLookaheadEnvFrames(),
-                                                       m_playbackLookaheadTextureRouteAdmitted );
+                                                       m_playbackLookaheadTextureRouteAdmitted,
+                                                       m_playbackLookaheadCpuRouteAdmitted );
+}
+
+// CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): the forward window the lookahead prune keeps. The texture route keeps the depth
+// unchanged; the CPU route keeps the frames queuePlaybackLookaheadRequests may have placed past +depth.
+int MainWindow::playbackLookaheadPruneWindowFrames() const
+{
+    return playback_lookahead_cpu::lookaheadWindowFrames(
+        playbackRenderLookaheadFrames(),
+        m_playbackLookaheadCpuRouteAdmitted && !m_playbackLookaheadTextureRouteAdmitted );
 }
 
 int MainWindow::currentPlaybackAdvanceTarget()
@@ -3981,10 +3993,14 @@ void MainWindow::queuePlaybackLookaheadRequests(
     if( depth <= 0 ) return;
     if( !m_pRenderThread || !m_pMlvObject || !m_fileLoaded ) return;
     if( !ui->actionPlay->isChecked() || !baseContext.playbackActive ) return;
-    if( !baseContext.gpuPlaybackReconTexturePresentRequested
-     || !baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted ) return;
-    if( !mainWindowGpuTextureRouteAdmitsPlaybackScale(
-            baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() ) ) return;
+    // CPU-S1-PACE-POST-785-LEVER-1: the texture route's own checks, unchanged, OR the admitted CPU
+    // route (drawFrame computed m_playbackLookaheadCpuRouteAdmitted for this request).
+    const bool textureRouteAdmits =
+        baseContext.gpuPlaybackReconTexturePresentRequested
+        && baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted
+        && mainWindowGpuTextureRouteAdmitsPlaybackScale(
+               baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() );
+    if( !textureRouteAdmits && !m_playbackLookaheadCpuRouteAdmitted ) return;
 
     const int totalFrames = getMlvFrames( m_pMlvObject );
     if( totalFrames <= 1 ) return;
@@ -3994,10 +4010,25 @@ void MainWindow::queuePlaybackLookaheadRequests(
     const int cutOutFrame =
         qBound( cutInFrame, ui->spinBoxCutOut->value() - 1, totalFrames - 1 );
     const int loopSpan = cutOutFrame - cutInFrame + 1;
+    // CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): on the CPU route lookahead k asks for the frame the drop-frame engine is
+    // predicted to present next, floor( position + k x stride ), not one it will skip. The texture route keeps
+    // requestedFrame + k.
+    const bool cpuRouteLookahead = !textureRouteAdmits;
+    const double cpuRoutePositionFraction =
+        ( cpuRouteLookahead && ui->actionDropFrameMode->isChecked() )
+            ? m_newPosDropMode - static_cast<double>( requestedFrame )
+            : 0.0;
 
     for( int offset = 1; offset <= depth; ++offset )
     {
-        int lookaheadFrame = requestedFrame + offset;
+        // r4 fix iteration 1 (adversary A2 on 05511dac): the CPU frame is the one the drop-frame engine itself reaches,
+        // through its own Loop wrap and end-of-cut clamp (advanceDropFrameTick), never the cut's unreturned last frame.
+        int lookaheadFrame = cpuRouteLookahead
+            ? playback_lookahead_cpu::cpuRouteLookaheadFrame( requestedFrame, offset, cpuRoutePositionFraction,
+                                                              m_playbackDropFrameStride.strideFrames(),
+                                                              ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
+                                                              ui->actionLoop->isChecked(), playbackConformActive() )
+            : requestedFrame + offset;
         if( lookaheadFrame > cutOutFrame )
         {
             if( !ui->actionLoop->isChecked() || loopSpan <= 0 ) break;
@@ -4043,6 +4074,11 @@ void MainWindow::queuePlaybackLookaheadRequests(
                                       lookaheadContext,
                                       presentationPreparation );
         ++m_playbackLookaheadRequestsIssued;
+        // CPU-S1-PACE-POST-785-LEVER-1 (adversary A1 on e35b8030): lookahead_route is the route a request was issued on,
+        // latched here and never at admission (a one-frame loop admits the route and queues nothing).
+        if( m_playbackSmokeActive )
+            m_playbackLookaheadSessionRoute =
+                playback_overlap::lookaheadRouteName( textureRouteAdmits, !textureRouteAdmits );
         if( interactiveTraceEnabled() )
         {
             logInteractionEvent(
@@ -5157,7 +5193,20 @@ void MainWindow::openGuiPresentGap( void )
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
     ++m_guiPresentGapSerial;
     m_guiOtherBusySpans.openGap();
-    m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+    m_guiPresentGapFrame = m_lastDisplayedPlaybackFrame;   // the frame whose present opened the gap
+    // CPU-S1-PACE-POST-785-LEVER-1 fix iteration 2 (adversary A1 on fb4d13fe): the gap's opening instant on the smoke clock,
+    // stamped here once; the close never reads a second clock to place it.
+    // r2 (adversary A1 on 89e3a9d1 and on 482616a5): ONE read of the gap clock arms the gap and places it. The gap
+    // clock is the smoke clock (GuiPresentGapClock), so the zero is m_playbackSmokeStartTime itself: no baseline read.
+    const qint64 gapOpenNs = m_guiPresentGapClock.nsecsElapsed();
+    m_guiPresentGapStartSinceSmokeMs = static_cast<double>( gapOpenNs ) / 1000000.0 - m_playbackSmokeStartTime * 1000.0;
+    m_guiPresentGapStartNs = gapOpenNs;
+}
+
+// The gap clock reads the smoke clock (MainWindow.h GuiPresentGapClock).
+qint64 MainWindow::GuiPresentGapClock::nsecsElapsed( void ) const
+{
+    return static_cast<qint64>( mlv_stage_timing_now() * 1000000000.0 );
 }
 
 // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
@@ -5204,6 +5253,14 @@ void MainWindow::closeGuiPresentGap( void )
     gaps.idleSumMs += split.idleMs;
     gaps.runnerSleepSumMs += split.runnerSleepMs;
     gaps.busySumMs += split.busyMs;
+    if( gaps.gaps == 1 || split.busyMs > gaps.busyMaxMs )
+    {
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): where the longest busy gap sat. Its start,
+        // in ms since the measured Play start (stamped at open); the bucket is read before closeGap clears the spans.
+        gaps.busyMaxAtMs = m_guiPresentGapStartSinceSmokeMs;
+        gaps.busyMaxFrame = m_guiPresentGapFrame;
+        gaps.busyMaxBucket = m_guiOtherBusySpans.dominantBucket( split.otherBusyMs );
+    }
     gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
     gaps.otherBusySumMs += split.otherBusyMs;
     gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
@@ -7521,6 +7578,40 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         && requestContext.gpuPlaybackReconAmazeTexturePresentAdmitted
         && mainWindowGpuTextureRouteAdmitsPlaybackScale(
                requestContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() );
+    // CPU-S1-PACE-POST-785-LEVER-1: the CPU route's lookahead admission (PlaybackLookaheadCpuRoute.h),
+    // on the request's route inputs; #774's borrow predicate decides the CPU prep route.
+    {
+        PlaybackLookaheadCpuRouteInputs cpuRoute;
+        cpuRoute.playing = ui->actionPlay->isChecked();
+        cpuRoute.fileLoaded = m_fileLoaded && m_pMlvObject && m_pRenderThread;
+        cpuRoute.dropFrameMode = ui->actionDropFrameMode->isChecked();
+        cpuRoute.phase3DecodeReconProcess =
+            requestedPhase3Mode == Phase3Mode::DecodeReconProcess
+            && !phase3LiveFallbackActive()
+            && !phase3KillSwitchActive( requestedPhase3Mode );
+        cpuRoute.textureRouteRequested = requestContext.gpuPlaybackReconTexturePresentRequested;
+        cpuRoute.gpuBilinearDebayer = m_renderThreadUsingGpuBilinearDebayer;
+        cpuRoute.gpuAmazeDebayer = m_renderThreadUsingGpuAmazeDebayer;
+        cpuRoute.prepRoute.playing = ui->actionPlay->isChecked();
+        cpuRoute.prepRoute.displayPreviewCachingAllowed = !playbackPolicyActive();
+        cpuRoute.prepRoute.cpuPreviewProcessingActive =
+            requestContext.renderThreadUsingCpuPreviewProcessing
+            && requestContext.gpuPreviewProcessingConfig.enabled;
+        cpuRoute.prepRoute.outputProcessed8 = renderOutputMode == RenderFrameThread::OutputProcessed8;
+        cpuRoute.prepRoute.gpu16PreviewActive = mainWindowUsesGpu16PreviewPresentation( renderPolicy );
+        cpuRoute.prepRoute.gpuPreviewProcessingActive = mainWindowUsesGpuPreviewProcessing( renderPolicy );
+        cpuRoute.prepRoute.gpuAmazeTexturePresentCandidate = requestContext.gpuAmazeTexturePresentRequested;
+        cpuRoute.prepRoute.gpuPlaybackReconTexturePresentCandidate =
+            requestContext.gpuPlaybackReconTexturePresentRequested;
+        cpuRoute.prepRoute.gpuPlaybackReconTextureNoReadbackCandidate =
+            requestContext.gpuPlaybackReconTexturePresentRequested;
+        cpuRoute.frameSlotCount = RenderFrameThread::playbackFrameSlotCount();   // r4 fix iteration 2 (adversary A3)
+        m_playbackLookaheadCpuRouteAdmitted = playbackLookaheadCpuRouteAdmits( cpuRoute );
+        // CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): sample the drop-frame engine's advance on the admitted CPU route; any
+        // other route starts the next CPU-route session from stride 1.
+        if( m_playbackLookaheadCpuRouteAdmitted ) m_playbackDropFrameStride.noteTarget( requestedFrame, m_newPosDropMode );
+        else m_playbackDropFrameStride.reset();
+    }
     if( playbackRenderLookaheadFrames() > 0
      && ui->actionPlay->isChecked()
      && m_pRenderThread
@@ -7540,8 +7631,10 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                     requestContext.presentationGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    playbackRenderLookaheadFrames(),
+                    playbackLookaheadPruneWindowFrames(),
                     ui->actionLoop->isChecked() );
+            if( m_playbackSmokeActive && prunedPlaybackLookahead > 0 )
+                m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookahead );
             if( prunedPlaybackLookahead > 0 && interactiveTraceEnabled() )
             {
                 logInteractionEvent(
@@ -27052,6 +27145,11 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
 
     m_playbackLookaheadRequestsIssued = 0;
     m_playbackLookaheadCoveredRequests = 0;
+    m_playbackLookaheadSessionRoute = "none";
+    m_playbackLookaheadPresented = 0;
+    m_playbackLookaheadPruned = 0;
+    m_playbackLookaheadDroppedQueuedStart =
+        m_pRenderThread ? m_pRenderThread->playbackLookaheadDroppedQueuedCount() : 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
     m_playbackSmokeActive = true;
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
@@ -27568,6 +27666,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokeLastPresentedTime = now;
     m_playbackSmokeLastPresentedFrame = static_cast<int>( displayFrame );
     ++m_playbackSmokePresentedFrames;
+    if( requestContext.playbackLookaheadRequest ) ++m_playbackLookaheadPresented;   // CPU-S1-PACE-POST-785-LEVER-1
     const auto avgSmokeMs = [this]( double sum ) -> double
     {
         return m_playbackSmokePresentedFrames > 0
@@ -31112,7 +31211,18 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( overlap.decodeBusyMs, 0, 'f', 3 )
                    .arg( overlap.reconBusyMs, 0, 'f', 3 )
                    .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) )
-            + rawPrefetchFields;
+            + rawPrefetchFields
+            // CPU-S1-PACE-POST-785-LEVER-1: appended after every existing field (tools parse them).
+            + QStringLiteral( " lookahead_route=%1 lookahead_presented=%2 lookahead_pruned=%3 "
+                              "lookahead_dropped_queued=%4" )
+                  .arg( QLatin1String( m_playbackLookaheadSessionRoute ) )
+                  .arg( static_cast<qulonglong>( m_playbackLookaheadPresented ) )
+                  .arg( static_cast<qulonglong>( m_playbackLookaheadPruned ) )
+                  .arg( static_cast<qulonglong>(
+                      m_pRenderThread
+                          ? m_pRenderThread->playbackLookaheadDroppedQueuedCount()
+                                - m_playbackLookaheadDroppedQueuedStart
+                          : 0 ) );
     }
 
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: where the lost frames went (PlaybackSlipHistogram.h). Slips and class
@@ -31930,6 +32040,11 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         }
         otherBusySplit += QStringLiteral( " avg_gui_other_busy_unattributed_ms=%1" )
                               .arg( avgOver( m_guiOtherBusySpans.unattributedSumMs, gaps.gaps ), 0, 'f', 3 );
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): the gap behind max_gui_busy_ms, appended.
+        otherBusySplit += QStringLiteral( " max_gui_busy_at_ms=%1 max_gui_busy_frame=%2 max_gui_other_busy_bucket=%3" )
+                              .arg( gaps.busyMaxAtMs, 0, 'f', 3 )
+                              .arg( gaps.busyMaxFrame )
+                              .arg( QLatin1String( gui_present_gap::otherBusyBucketName( gaps.busyMaxBucket ) ) );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gui_present_summary session=%1 frames=%2 "
@@ -34962,8 +35077,10 @@ void MainWindow::drawFrameReady()
                     activeGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    playbackRenderLookaheadFrames(),
+                    playbackLookaheadPruneWindowFrames(),
                     ui->actionLoop->isChecked() );
+            if( m_playbackSmokeActive && prunedPlaybackLookaheadBeforeAcquire > 0 )
+                m_playbackLookaheadPruned += static_cast<uint64_t>( prunedPlaybackLookaheadBeforeAcquire );
             if( prunedPlaybackLookaheadBeforeAcquire > 0 && interactiveTraceEnabled() )
             {
                 logInteractionEvent(

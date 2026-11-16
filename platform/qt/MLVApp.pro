@@ -405,6 +405,7 @@ HEADERS += MainWindow.h \
            PlaybackWorkerJoin.h \
            PlaybackPrepInFlightGate.h \
            PlaybackPrepOwnership.h \
+           PlaybackLookaheadCpuRoute.h \
            ClipOpenAbortPolicy.h \
            PlaybackPresentTrace.h \
            PlaybackSlotRelease.h \

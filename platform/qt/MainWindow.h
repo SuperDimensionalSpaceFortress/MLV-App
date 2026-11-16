@@ -39,6 +39,7 @@
 #include "PlaybackDueWakeSamples.h"
 #include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPrepOwnership.h"
+#include "PlaybackLookaheadCpuRoute.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -1351,7 +1352,19 @@ private:
     bool m_playbackLookaheadTextureRouteAdmitted = false;
     uint64_t m_playbackLookaheadRequestsIssued = 0;
     uint64_t m_playbackLookaheadCoveredRequests = 0;
+    // CPU-S1-PACE-POST-785-LEVER-1: the last drawFrame() request was on the admitted CPU route
+    // (PlaybackLookaheadCpuRoute.h), where the lookahead runs at depth 1. The route latched while
+    // playing in this smoke session, and the appended overlap_summary counters.
+    bool m_playbackLookaheadCpuRouteAdmitted = false;
+    const char *m_playbackLookaheadSessionRoute = "none";
+    uint64_t m_playbackLookaheadPresented = 0;
+    uint64_t m_playbackLookaheadPruned = 0;
+    uint64_t m_playbackLookaheadDroppedQueuedStart = 0;
+    // CPU-LOOKAHEAD-PRUNE-WASTE-1 (r4): the drop-frame engine's target-to-target advance, which places the CPU
+    // route's lookahead on the frame the engine is predicted to present next (playback_lookahead_cpu).
+    playback_lookahead_cpu::DropFrameStride m_playbackDropFrameStride;
     int playbackRenderLookaheadFrames() const;
+    int playbackLookaheadPruneWindowFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
     bool conformTargetPresentOutstanding();
@@ -1705,9 +1718,26 @@ private:
         double busyMaxMs = 0.0;
         double otherBusySumMs = 0.0;
         double otherBusyMaxMs = 0.0;
+        // CPU-S1-PACE-POST-785-LEVER-1 (FREEZE attribution): the gap that set busyMaxMs -- its
+        // start in ms since the measured Play start, the frame whose present opened it, and the
+        // other-busy bucket that held most of it (-1 = unattributed, -2 = no gap yet).
+        double busyMaxAtMs = -1.0;
+        long long busyMaxFrame = -1;
+        int busyMaxBucket = -2;
     };
     GuiPresentGapTotals m_guiPresentGaps;
-    QElapsedTimer m_guiPresentGapClock;
+    long long m_guiPresentGapFrame = -1;
+    double m_guiPresentGapStartSinceSmokeMs = -1.0;
+    // CPU-S1-PACE-POST-785-LEVER-1 r2 fix iteration 1 (adversary A1 on 482616a5): the gap clock IS the smoke clock
+    // (mlv_stage_timing_now, the clock m_playbackSmokeStartTime is read on), so a gap's opening instant is placed
+    // against the measured Play start with no second clock and no second baseline read. Same interface as the
+    // QElapsedTimer it replaces (start / nsecsElapsed); only differences between two reads are durations.
+    struct GuiPresentGapClock
+    {
+        void start( void ) {}
+        qint64 nsecsElapsed( void ) const;   // mlv_stage_timing_now() in ns (MainWindow.cpp)
+    };
+    GuiPresentGapClock m_guiPresentGapClock;
     qint64 m_guiPresentGapStartNs = -1;
     gui_present_gap::IdleWaits m_guiPresentGapIdle;
     qint64 m_guiPresentGapRunnerSleepNs = 0;
