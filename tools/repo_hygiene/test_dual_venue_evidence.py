@@ -3265,7 +3265,9 @@ class EvidenceFactory(RunnerHarness):
                 return l
             # r18 (r18 adversary advisory A3): ASCII digits only, like the module's 0-9 walk (Python's \d also takes Arabic-Indic digits)
             return l[:i] if re.search(r":([0-9]+|%2)\)$", l) and l.rfind(":") > i + 2 else None
-        iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l)]
+        # r19 (r19 adversary advisory A2): the record is SELECTED by its body too (the text before its first ` (`), so a location path holding the
+        # marker never adds a record; a selected record with an unreadable tail is still None (never read whole)
+        iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l.split(" (", 1)[0])]
         return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
                 "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
                 "wrapped": int(f["wrapped"]) != 0, "wrapCount": int(f["wrap_count"]),
@@ -3395,6 +3397,24 @@ class EvidenceFactory(RunnerHarness):
 
 
 @requires_windows_pwsh
+class IsolationMirrorSelectsRecordsByTheirBodyTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r19 adversary advisory A2 on af002fce, its input verbatim): the Python isolation mirror
+    (EvidenceFactory.derive_block) SELECTS a pacing_isolated record by its body, as Get-DvPlaybackEvidence does, so a Qt location path that holds the
+    marker never adds a record (the production parser reads settingsIsolated=true on this log)."""
+
+    def test_a2_a_location_path_holding_the_marker_adds_no_isolation_record(self) -> None:
+        log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               "playback_smoke.summary session=3 source_advanced=600 required_source_frames=600 native_fps=60 pace_fps=60 fps_override=0 wrapped=0 wrap_count=0\n"
+               "trace (C:/build interaction_trace event=automation.pacing_isolated settings_store=run_scoped x/MainWindow.cpp:1)\n")
+        with tempfile.TemporaryDirectory(prefix="iso-mirror-") as d:
+            ev = Path(d)
+            (ev / "logs").mkdir()
+            (ev / "logs" / "smoke-run.log").write_bytes(log.encode("utf-8"))
+            (ev / "result.json").write_text("{}", encoding="utf-8")
+            (ev / "summary.json").write_text("{}", encoding="utf-8")
+            self.assertIs(EvidenceFactory.derive_block(ev)["settingsIsolated"], True)
+
+
 class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
     """sol r2 BLOCKER: a hand-built production PASS (format-only hashes, self-asserted booleans, a consent blob with ZERO records, no
     evidence at all) validated. Now nothing validates unless it re-derives from a committed blob or a hashed file."""
