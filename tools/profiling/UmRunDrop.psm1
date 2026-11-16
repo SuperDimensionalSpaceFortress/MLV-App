@@ -645,13 +645,20 @@ function Get-UmRunMoveDenial {
     # adversary pass 6 A3: a rename needs the SOURCE free as well as the destination. When the destination answered cleanly (OPEN_OK) the cause may still be the source: another
     # handle on it that denies Delete sharing, or an ACL on it. An exclusive open of the source says so; the caller has already let go of its own handle on it. Diagnosis only:
     # a source that vanished or a probe that fails leaves the destination's answer standing.
-    if ($Source -and $cause -ceq 'DESTINATION_HELD_OR_ACL' -and $probe -ceq 'OPEN_OK') {
+    # r7 adversary A2: an exclusive open fails on ANY other handle, a harmless reader that shares Delete included, so a failing destination probe does not clear the source.
+    # When both fail they are both named (neither probe can tell a reader from a blocker); a clean destination with a failing source names the source alone.
+    if ($Source -and $cause -ceq 'DESTINATION_HELD_OR_ACL' -and $probe -cne 'NOT_PROBED') {
+        $srcProbe = ''
         try {
             $sh = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
             $sh.Dispose()
         } catch {
-            $srcProbe = ConvertTo-UmRunOpenProbe -Exception $_.Exception
-            if ($srcProbe -ceq 'OPEN_SHARING_VIOLATION' -or $srcProbe -ceq 'OPEN_ACCESS_DENIED') { $cause = 'SOURCE_HELD_OR_ACL'; $probe = $srcProbe }
+            $sp = ConvertTo-UmRunOpenProbe -Exception $_.Exception
+            if ($sp -ceq 'OPEN_SHARING_VIOLATION' -or $sp -ceq 'OPEN_ACCESS_DENIED') { $srcProbe = $sp }
+        }
+        if ($srcProbe) {
+            if ($probe -ceq 'OPEN_OK') { $cause = 'SOURCE_HELD_OR_ACL'; $probe = $srcProbe }
+            else { $cause = 'SOURCE_AND_DESTINATION_HELD_OR_ACL'; $probe = "DESTINATION=$probe SOURCE=$srcProbe" }
         }
     }
     [pscustomobject]@{ transient = $transient; cause = $cause; probe = $probe; exception = ('{0}: {1}' -f $e.GetType().Name, ($e.Message -replace '\s+', ' ')) }
@@ -678,8 +685,12 @@ function Test-UmRunClaimIsOwn {
     # here, with one rule. An array or scalar root is neither.
     $value = $null
     if ($Claim -is [System.Collections.IDictionary]) {
-        if (-not $Claim.Contains('nonce')) { return $false }
-        $value = $Claim['nonce']
+        # r7 adversary A4: the property name is matched without regard to case on both shapes (a PSCustomObject's lookup is, a dictionary's key lookup may not be)
+        $found = $false
+        foreach ($k in @($Claim.Keys)) {
+            if ($k -is [string] -and [string]::Equals($k, 'nonce', [StringComparison]::OrdinalIgnoreCase)) { $value = $Claim[$k]; $found = $true; break }
+        }
+        if (-not $found) { return $false }
     } elseif ($Claim -is [pscustomobject]) {
         $p = $Claim.PSObject.Properties['nonce']
         if ($null -eq $p) { return $false }
@@ -716,11 +727,21 @@ function Test-UmRunMetaDelivered {
     over SMB), and nothing is re-published or refused. An unreadable destination is never "delivered".
     #>
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$ExpectedText)
+    $text = Read-UmRunMetaText -Path $Path
+    return ($null -ne $text) -and [string]::Equals($text, $ExpectedText, [StringComparison]::Ordinal)
+}
+
+function Read-UmRunMetaText {
+    <#
+    .SYNOPSIS
+    The text at -Path (ASCII, shared for read, write and delete), or $null when it cannot be read at all. Never throws: "could not read" is not "read something else".
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
     try {
         $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-        try { $sr = [IO.StreamReader]::new($fs, [Text.Encoding]::ASCII); return [string]::Equals($sr.ReadToEnd(), $ExpectedText, [StringComparison]::Ordinal) } finally { $fs.Dispose() }
+        try { $sr = [IO.StreamReader]::new($fs, [Text.Encoding]::ASCII); return $sr.ReadToEnd() } finally { $fs.Dispose() }
     } catch {
-        return $false
+        return $null
     }
 }
 
@@ -1183,6 +1204,13 @@ function Invoke-UmRunDrop {
                                         throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=OWNERSHIP_UNPROVEN probe=NOT_PROBED$prior exception=the claim could not be read back to prove it is still this submission's own, so it was not replaced; the not-after re-publish did not replace this submission's claim and the job was not made visible"
                                     }
                                     Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $moveAttempt)
+                                }
+                                # r7 adversary A1: the verifying hold lets the temp be renamed (it shares Delete), so a file swapped in at the same pathname would be what the Move
+                                # published. What LANDED is read back here, still before the job is visible, and bytes that are not the verified ones refuse (the rollback below
+                                # removes the claim: it carries this call's nonce). A claim that cannot be read at all proves nothing and does not refuse.
+                                $landedText = Read-UmRunMetaText -Path $metaFinal
+                                if ($null -ne $landedText -and -not [string]::Equals($landedText, $metaJson, [StringComparison]::Ordinal)) {
+                                    throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json does not hold the verified bytes after the not-after re-publish (the re-publish temporary was replaced by another file between its verification and the move); the job was not made visible"
                                 }
                             } finally {
                                 # adversary pass 3 A1 (sibling): a cleanup probe that throws in a finally would replace the typed refusal (or a success) in flight

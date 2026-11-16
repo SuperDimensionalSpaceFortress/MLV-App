@@ -643,6 +643,8 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "  if ($a -eq 1 -and $c.repub.seam.holdSource) { $t4 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
             "    $state.h = [IO.File]::Open($t4.FullName, 'Open', 'Read', 'Read') }\n"
             "  elseif ($a -eq 1 -and -not $c.repub.seam.noHold) { $state.h = [IO.File]::Open($d, 'Open', 'Read', 'ReadWrite') }\n"
+            # r7 A2: 'readDest' also keeps a harmless reader (Read, sharing Read and Delete) on the claim through every attempt: an exclusive probe of the destination fails on it
+            "  if ($a -eq 1 -and $c.repub.seam.readDest) { $state.rd = [IO.File]::Open($d, 'Open', 'Read', ([IO.FileShare]::Read -bor [IO.FileShare]::Delete)) }\n"
             "  if ($a -eq 2) {\n"
             # 'write' is the claim's new text; <N> stands for this submission's real nonce; 'mutateTmp' writes the re-publish temp's own text with a NUL
             # inside the property name notAfterUtc (the bytes the drop expects, but not identical to them)
@@ -667,6 +669,10 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "if ($c.repub.seam.rewriteAfterVerify) { $p.TestHookAfterMetaSourceVerified = { param($sp, $at)\n"
             "  if ($at -eq [int]$c.repub.seam.rewriteAfterVerify) {\n"
             "    try { [IO.File]::WriteAllText($sp, [IO.File]::ReadAllText($sp).Replace('notAfterUtc', 'notBeforeUtc')); $seen.rewrote = $true } catch { $seen.rewrote = $false } } } }\n"
+            # r7 A1: 'swapAfterVerify' = N renames the verified temp aside (the hold shares Delete, so that is allowed) and puts a changed file at the SAME pathname
+            "if ($c.repub.seam.swapAfterVerify) { $p.TestHookAfterMetaSourceVerified = { param($sp, $at)\n"
+            "  if ($at -eq [int]$c.repub.seam.swapAfterVerify) {\n"
+            "    try { [IO.File]::Move($sp, $sp + '.held'); [IO.File]::WriteAllText($sp, [IO.File]::ReadAllText($sp + '.held').Replace('notAfterUtc', 'notBeforeUtc')); $seen.swapped = $true } catch { $seen.swapped = $false } } } }\n"
             "$threw = ''; $lines = @()\n"
             "if ($c.repub.continuePref) { $ErrorActionPreference = 'Continue' }\n"   # adversary pass 4 A2: the caller's preference (the accepted -ErrorAction Continue invocation)
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
@@ -1234,6 +1240,34 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
         self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
 
+    def test_a_source_swapped_by_pathname_after_verification_is_refused_not_published(self) -> None:
+        # r7 adversary A1 (introduced): the verifying hold permits the rename (it shares Delete), so the verified temp can be moved aside and a changed file put at the
+        # same pathname; the Move then published the pathname, not the verified bytes. The bytes that LANDED are now read back, before the job is visible, and a
+        # mismatch refuses and rolls the claim back. RED before the fix: the swapped bytes were published and the job became visible behind them.
+        self._swap_case(2, {"release": True})
+
+    def test_a_source_swapped_by_pathname_on_the_first_pass_is_refused_not_published(self) -> None:
+        # r7 adversary A1, first pass: no denial is needed to open the gap
+        self._swap_case(1, {"noHold": True})
+
+    def _swap_case(self, at: int, extra: dict) -> None:
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"swapAfterVerify": at, **extra}})
+        self.assertTrue(r["seen"].get("swapped"), "the pathname swap got through (the hold allows the rename)")
+        self.assertTrue(r["threw"].startswith("UMRUN_JOB_METADATA_VERIFY_FAILED"), r)
+        self.assertNotIn("notBeforeUtc", r["meta"], "the changed bytes were rolled back, not left as the claim")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_held_source_and_a_harmless_destination_reader_name_both_sides(self) -> None:
+        # r7 adversary A2 (introduced): the temp is held with no Delete sharing (the real blocker) and the claim has a harmless reader (it shares Delete), so the exclusive
+        # destination probe fails too and the refusal blamed only the destination. Neither probe can tell a harmless reader from a blocker, so both sides are named.
+        # RED before the fix: cause=DESTINATION_HELD_OR_ACL.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"holdSource": True, "readDest": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=SOURCE_AND_DESTINATION_HELD_OR_ACL", r["threw"])
+        self.assertIn("SOURCE=OPEN_SHARING_VIOLATION", r["threw"])
+        self.assertIn("DESTINATION=OPEN_SHARING_VIOLATION", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+
     def test_the_claim_ownership_predicate_accepts_a_dictionary_claim_exactly_as_it_accepts_an_object(self) -> None:
         # adversary pass 6 A1 (introduced): the predicate accepted only a PSCustomObject, so a caller whose session defaults ConvertFrom-Json to -AsHashtable made this
         # submission's own claim read as "not ours". Same ordinal nonce rule on both shapes; a root array, a scalar and a non-string nonce are never ours.
@@ -1245,6 +1279,7 @@ class MetaReplaceDeniedTests(unittest.TestCase):
             "$rows = foreach ($h in @($false, $true)) {\n"
             "  foreach ($case in @(\n"
             "    @{ k = 'own'; t = ('{\"jobId\":\"j\",\"nonce\":\"' + $n + '\"}') },\n"
+            "    @{ k = 'own-upper'; t = ('{\"NONCE\":\"' + $n + '\"}') },\n"
             "    @{ k = 'other'; t = '{\"jobId\":\"j\",\"nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}' },\n"
             "    @{ k = 'nul'; t = ('{\"nonce\":\"' + $n + '\\u0000\"}') },\n"
             "    @{ k = 'number'; t = '{\"nonce\":5}' },\n"
@@ -1260,6 +1295,7 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         got = {row["k"]: row["own"] for row in json.loads(p.stdout.strip().splitlines()[-1])}
         for shape in ("obj", "dict"):
             self.assertTrue(got["own/" + shape], f"an own claim is ours as a {shape}: {got}")
+            self.assertTrue(got["own-upper/" + shape], f"the property name is matched without regard to case, as a {shape}: {got}")   # r7 adversary A4
             for k in ("other", "nul", "number", "nonce-missing", "array", "scalar"):
                 self.assertFalse(got[k + "/" + shape], f"{k} is not ours as a {shape}: {got}")
 
