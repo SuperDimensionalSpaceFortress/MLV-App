@@ -630,7 +630,13 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "if ($null -ne $c.repub.seam) { $p.TestHookBeforeMetaReplaceAttempt = { param($a, $d)\n"
             "  if ($a -eq 1) { $state.h = [IO.File]::Open($d, 'Open', 'Read', 'ReadWrite') }\n"
             "  if ($a -eq 2) {\n"
-            "    if ($null -ne $c.repub.seam.write) { $w = [IO.File]::Open($d, 'Open', 'Write', 'ReadWrite'); $b = [Text.Encoding]::ASCII.GetBytes([string]$c.repub.seam.write)\n"
+            # 'write' is the claim's new text; <N> stands for this submission's real nonce; 'mutateTmp' writes the re-publish temp's own text with a NUL
+            # inside the property name notAfterUtc (the bytes the drop expects, but not identical to them)
+            "    $text = $c.repub.seam.write\n"
+            "    if ($null -ne $text) { $text = ([string]$text).Replace('<N>', [string]([IO.File]::ReadAllText($d) | ConvertFrom-Json).nonce) }\n"
+            "    if ($c.repub.seam.mutateTmp) { $t0 = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1\n"
+            "      $text = [IO.File]::ReadAllText($t0.FullName).Replace('notAfterUtc', 'notAfter' + [char]0 + 'Utc') }\n"
+            "    if ($null -ne $text) { $w = [IO.File]::Open($d, 'Open', 'Write', 'ReadWrite'); $b = [Text.Encoding]::ASCII.GetBytes([string]$text)\n"
             "      $w.SetLength(0); $w.Write($b, 0, $b.Length); $w.Dispose() }\n"
             "    if ($c.repub.seam.land) { $state.h.Dispose(); $t = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $d, $true) }\n"
             "    if ($c.repub.seam.release) { $state.h.Dispose() } } } }\n"
@@ -1029,16 +1035,70 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         # adversary A1: a claim this call cannot read back (torn bytes, or `[]` / null, which ConvertFrom-Json turns into nothing) proves nothing about
         # ownership, so the retry must not move over it. The handle is released, so a move WOULD have succeeded. RED before the fix: the drop reported
         # success (threw == "") and replaced the claim.
-        for torn in ("{\"torn\":", "[]"):
-            with self.subTest(claim=torn):
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": "{\"torn\":", "release": True}})
+        self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+        self.assertIn("cause=OWNERSHIP_UNPROVEN", r["threw"])
+        self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+        self.assertIn("priorCause=DESTINATION_HELD_OR_ACL", r["threw"], "the first denial's diagnosis is not lost")
+        self.assertNotIn("job-x.job.ps1", r["names"])
+        self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+
+    def test_a_claim_that_is_not_exactly_this_submissions_object_is_never_replaced_whatever_it_parses_to(self) -> None:
+        # adversary A1/A2 on 49b03793: PowerShell's -ceq is culture-aware (a NUL is ignorable), and ConvertFrom-Json enumerates a root array, so a
+        # one-element array, a nonce array and a nonce with a NUL after it all read as ours and the retry replaced them. RED before the fix: threw == "".
+        cases = {
+            "root array holding the real nonce": '[{"jobId":"job-x","nonce":"<N>"}]',
+            "nonce is an array": '{"jobId":"job-x","nonce":["<N>"]}',
+            "nonce with a NUL after it": '{"jobId":"job-x","nonce":"<N>\\u0000"}',
+            "empty root array": "[]",
+        }
+        for name, text in cases.items():
+            with self.subTest(claim=name):
                 for stale in self.inbox.iterdir():
                     stale.unlink()
-                r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": torn, "release": True}})
-                self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
-                self.assertIn("cause=OWNERSHIP_UNPROVEN", r["threw"])
-                self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
-                self.assertNotIn("job-x.job.ps1", r["names"])
+                r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": text, "release": True}})
+                self.assertIn("UMRUN_JOBID_IN_USE inbox\\job-x.meta.json is no longer this submission's own claim (nonce mismatch)", r["threw"], r)
+                self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
                 self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+
+    def test_a_claim_that_equals_the_expected_bytes_only_to_the_culture_is_not_delivered(self) -> None:
+        # adversary A1: the republication text with a NUL inside `notAfterUtc` compares equal under -ceq and the drop made the job visible with a claim whose
+        # deadline the agent cannot read. Ordinal now: not delivered, so the claim (which still carries this submission's own nonce) is replaced by the real bytes.
+        # RED before the fix: the NUL claim stood and the job became visible behind it.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"mutateTmp": True, "release": True}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertNotIn("\x00", r["meta"], "the published claim is exactly the re-publish text, no NUL in `notAfterUtc`")
+        self.assertEqual(parse_o(json.loads(r["meta"])["notAfterUtc"]), self.ANCHOR + timedelta(seconds=30 + 7560), "a deadline the agent can read")
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+
+    def test_a_claim_another_handle_holds_exclusively_for_a_moment_is_retried_before_the_rename_too(self) -> None:
+        # adversary A5: the ownership read that precedes the rename read the held claim unguarded and threw before any retry existed (a raw sharing error).
+        # FileShare.None also denies that read, so the whole pass is retried. RED before the fix: threw a raw read error, no UMRUN_MOVE_ACCESS_DENIED.
+        r = self._drop(fault="hold", share="None", ms=600)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+
+    def test_the_open_probe_names_a_vanished_destination_not_a_sharing_violation(self) -> None:
+        # adversary A3: FileNotFoundException and DirectoryNotFoundException are IOExceptions; only ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33)
+        # are a held file. RED before the fix: the function does not exist (the old probe called every IOException a sharing violation).
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{DROP_MODULE}' -Force -PassThru\n"
+            "$rows = & $m { @(\n"
+            "  [ordered]@{ k = 'file'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.FileNotFoundException]::new('gone'))) },\n"
+            "  [ordered]@{ k = 'dir'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.DirectoryNotFoundException]::new('gone'))) },\n"
+            "  [ordered]@{ k = 'acl'; v = (ConvertTo-UmRunOpenProbe -Exception ([UnauthorizedAccessException]::new('denied'))) },\n"
+            "  [ordered]@{ k = 'sharing'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.IOException]::new('busy', [int]0x80070020))) },\n"
+            "  [ordered]@{ k = 'lock'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.IOException]::new('locked', [int]0x80070021))) },\n"
+            "  [ordered]@{ k = 'other'; v = (ConvertTo-UmRunOpenProbe -Exception ([IO.IOException]::new('disk', [int]0x8007045D))) } ) }\n"
+            "ConvertTo-Json -Compress -InputObject $rows\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = {row["k"]: row["v"] for row in json.loads(p.stdout.strip().splitlines()[-1])}
+        self.assertEqual(got, {"file": "CHANGED_DURING_PROBE", "dir": "CHANGED_DURING_PROBE", "acl": "OPEN_ACCESS_DENIED", "sharing": "OPEN_SHARING_VIOLATION",
+                               "lock": "OPEN_SHARING_VIOLATION", "other": "OPEN_FAILED"})
 
     def test_a_first_rename_that_lands_late_is_delivered_not_a_missing_source_error(self) -> None:
         # adversary A3: pass 1 is denied, then the rename lands (a lost reply over SMB) and the temp is gone; pass 2 must see the claim holds exactly the new

@@ -472,9 +472,9 @@ while ($true) {
                     $ownsClaim = $true
                     $readSucceeded = $false
                     try {
-                        $currentMeta = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json
+                        $currentMeta = Read-UmRunClaim -Path $metaFinal
                         $readSucceeded = $true
-                        $ownsClaim = ($null -ne $currentMeta) -and ($currentMeta.nonce -eq $nonce)
+                        $ownsClaim = ($null -ne $currentMeta) -and (Test-UmRunClaimIsOwn -Claim $currentMeta -Nonce $nonce)
                     } catch {
                         $readSucceeded = $false
                     }
