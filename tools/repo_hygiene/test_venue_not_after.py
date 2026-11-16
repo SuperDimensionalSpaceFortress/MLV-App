@@ -623,6 +623,17 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "      if ($c.repub.fault -eq 'hold') {\n"
             "        Add-Type -TypeDefinition 'public static class DvLockHolder { public static System.IO.FileStream Hold(string p, System.IO.FileShare s, int ms) { var fs = new System.IO.FileStream(p, System.IO.FileMode.Open, System.IO.FileAccess.Read, s); System.Threading.Tasks.Task.Delay(ms).ContinueWith(t => fs.Dispose()); return fs; } }'\n"
             "        $null = [DvLockHolder]::Hold($metaPath, [IO.FileShare]$c.repub.share, [int]$c.repub.ms) } } } } }\n"
+            # VENUE-UMRUN-MOVE-ACCESS-DENIED-1 (adversary A1/A3): repub.seam drives TestHookBeforeMetaReplaceAttempt. Pass 1 takes a handle that denies Delete (so the
+            # first rename is refused); pass 2 may rewrite the claim in place ('write'), let the first rename land late ('land': release, then move the temp over
+            # the claim) and/or let go ('release').
+            "$state = @{}\n"
+            "if ($null -ne $c.repub.seam) { $p.TestHookBeforeMetaReplaceAttempt = { param($a, $d)\n"
+            "  if ($a -eq 1) { $state.h = [IO.File]::Open($d, 'Open', 'Read', 'ReadWrite') }\n"
+            "  if ($a -eq 2) {\n"
+            "    if ($null -ne $c.repub.seam.write) { $w = [IO.File]::Open($d, 'Open', 'Write', 'ReadWrite'); $b = [Text.Encoding]::ASCII.GetBytes([string]$c.repub.seam.write)\n"
+            "      $w.SetLength(0); $w.Write($b, 0, $b.Length); $w.Dispose() }\n"
+            "    if ($c.repub.seam.land) { $state.h.Dispose(); $t = Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Filter '*.meta.tmp' | Select-Object -First 1; [IO.File]::Move($t.FullName, $d, $true) }\n"
+            "    if ($c.repub.seam.release) { $state.h.Dispose() } } } }\n"
             "$threw = ''; $lines = @()\n"
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
             "$meta = $(if (Test-Path -LiteralPath $metaPath) { try { [IO.File]::ReadAllText($metaPath) } catch { '<UNREADABLE>' } } else { '' })\n"
@@ -981,7 +992,7 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
         self.assertNotIn('Exception calling "Move"', r["threw"], "typed, not the raw .NET text as the headline")
         self.assertIn(f"attempts={self.ATTEMPTS}", r["threw"])
-        self.assertRegex(r["threw"], r"source=\S*job-x\.[0-9a-f]{32}\.meta\.tmp ")
+        self.assertRegex(r["threw"], r"source=.*job-x\.[0-9a-f]{32}\.meta\.tmp destination=", "a temp path with a space in it still matches (adversary A5)")
         self.assertIn(f"destination={self.inbox / 'job-x.meta.json'} ", r["threw"])
         self.assertIn("cause=DESTINATION_HELD_OR_ACL", r["threw"])
         self.assertIn("probe=OPEN_SHARING_VIOLATION", r["threw"], "an exclusive open of the destination says the cause is another handle, not an ACL")
@@ -1003,6 +1014,57 @@ class MetaReplaceDeniedTests(unittest.TestCase):
         self.assertEqual(r["threw"], "", r)
         self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
         self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+
+    def test_a_retry_that_finds_another_submissions_claim_refuses_and_never_replaces_it(self) -> None:
+        # adversary A1 (introduced): after the first denial another submission's claim (a different nonce) is at the path; the retry must refuse, never
+        # carry on to replace it. The handle is held throughout, so only the ownership read stands between the retry and a refusal of the wrong kind.
+        other = '{"jobId":"job-x","nonce":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","notAfterUtc":"2026-10-24T09:00:00.0000000Z"}'
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": other}})
+        self.assertIn("UMRUN_JOBID_IN_USE inbox\\job-x.meta.json is no longer this submission's own claim (nonce mismatch)", r["threw"], r)
+        self.assertFalse(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED"), r["threw"])
+        self.assertEqual(r["meta"], other, "byte for byte the other submission's claim")
+        self.assertNotIn("job-x.job.ps1", r["names"], "the job never reached its rename")
+
+    def test_a_retry_that_cannot_read_the_claim_back_does_not_replace_it_and_refuses_typed(self) -> None:
+        # adversary A1: a claim this call cannot read back (torn bytes, or `[]` / null, which ConvertFrom-Json turns into nothing) proves nothing about
+        # ownership, so the retry must not move over it. The handle is released, so a move WOULD have succeeded. RED before the fix: the drop reported
+        # success (threw == "") and replaced the claim.
+        for torn in ("{\"torn\":", "[]"):
+            with self.subTest(claim=torn):
+                for stale in self.inbox.iterdir():
+                    stale.unlink()
+                r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"write": torn, "release": True}})
+                self.assertTrue(r["threw"].startswith("UMRUN_MOVE_ACCESS_DENIED "), r)
+                self.assertIn("cause=OWNERSHIP_UNPROVEN", r["threw"])
+                self.assertIn(f"attempts={self.ATTEMPTS} ", r["threw"])
+                self.assertNotIn("job-x.job.ps1", r["names"])
+                self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+
+    def test_a_first_rename_that_lands_late_is_delivered_not_a_missing_source_error(self) -> None:
+        # adversary A3: pass 1 is denied, then the rename lands (a lost reply over SMB) and the temp is gone; pass 2 must see the claim holds exactly the new
+        # bytes. RED before the fix: pass 2 moved the consumed temp and threw FileNotFoundException.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"seam": {"land": True}})
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"])
+        self.assertEqual(len([l for l in r["lines"] if l.startswith("submitted ")]), 1, r["lines"])
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"])
+
+    def test_the_denial_classifier_survives_the_destination_vanishing_while_it_probes(self) -> None:
+        # adversary A2: Test-Path said Leaf, then the file was gone before GetAttributes. The classifier must answer (transient, cause named), never throw
+        # and replace the denial it was asked about. The race is forced by shadowing Test-Path inside the module; the destination really is absent.
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{DROP_MODULE}' -Force -PassThru\n"
+            "$gone = Join-Path ([IO.Path]::GetTempPath()) ('dv-gone-' + [guid]::NewGuid().ToString('N') + '.json')\n"
+            "& $m { param($g) function script:Test-Path { param([string]$LiteralPath, [string]$PathType) $PathType -eq 'Leaf' }\n"
+            "  $r = Get-UmRunMoveDenial -Exception ([UnauthorizedAccessException]::new('Access to the path is denied.')) -Destination $g\n"
+            "  ConvertTo-Json -Compress -InputObject ([ordered]@{ transient = $r.transient; cause = $r.cause }) } $gone\n"
+        )
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        answer = json.loads(p.stdout.strip().splitlines()[-1])
+        self.assertTrue(answer["transient"], answer)
+        self.assertTrue(answer["cause"].startswith("DESTINATION_"), answer)
 
     def test_the_replacing_rename_line_is_unchanged_and_still_the_only_three_argument_move(self) -> None:
         # the owner-footage route guard pins that exact line (test_dual_venue_owner_footage_gate.ROUTE_DELETE_ALLOWED); the retry wraps it, never rewrites it

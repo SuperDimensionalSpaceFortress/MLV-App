@@ -599,28 +599,52 @@ function Get-UmRunMoveDenial {
     $cause = 'DESTINATION_HELD_OR_ACL'
     $transient = $true
     $probe = 'NOT_PROBED'
-    if (Test-Path -LiteralPath $Destination -PathType Container) {
-        $cause = 'DESTINATION_IS_DIRECTORY'; $transient = $false
-    } elseif (Test-Path -LiteralPath $Destination -PathType Leaf) {
-        if (([IO.File]::GetAttributes($Destination) -band [IO.FileAttributes]::ReadOnly) -ne 0) {
-            $cause = 'DESTINATION_READ_ONLY'; $transient = $false
-        } else {
-            try {
-                $h = [IO.File]::Open($Destination, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
-                $h.Dispose()
-                $probe = 'OPEN_OK'
-            } catch [UnauthorizedAccessException] {
-                $probe = 'OPEN_ACCESS_DENIED'
-            } catch [IO.IOException] {
-                $probe = 'OPEN_SHARING_VIOLATION'
-            } catch {
-                $probe = 'OPEN_FAILED'
+    # adversary A2: the probes are diagnosis only. The destination can vanish or change between any two of them (another process, the agent's sweep), and a
+    # probe that threw would replace the denial this was asked about, so any failure here leaves the answer transient and says so.
+    try {
+        if (Test-Path -LiteralPath $Destination -PathType Container) {
+            $cause = 'DESTINATION_IS_DIRECTORY'; $transient = $false
+        } elseif (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            if (([IO.File]::GetAttributes($Destination) -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+                $cause = 'DESTINATION_READ_ONLY'; $transient = $false
+            } else {
+                try {
+                    $h = [IO.File]::Open($Destination, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+                    $h.Dispose()
+                    $probe = 'OPEN_OK'
+                } catch [UnauthorizedAccessException] {
+                    $probe = 'OPEN_ACCESS_DENIED'
+                } catch [IO.IOException] {
+                    $probe = 'OPEN_SHARING_VIOLATION'
+                } catch {
+                    $probe = 'OPEN_FAILED'
+                }
             }
+        } else {
+            $cause = 'DESTINATION_ABSENT'
         }
-    } else {
-        $cause = 'DESTINATION_ABSENT'
+    } catch {
+        $cause = 'DESTINATION_CHANGED_DURING_PROBE'; $transient = $true; $probe = 'NOT_PROBED'
     }
     [pscustomobject]@{ transient = $transient; cause = $cause; probe = $probe; exception = ('{0}: {1}' -f $e.GetType().Name, ($e.Message -replace '\s+', ' ')) }
+}
+
+function Get-UmRunClaimOwnership {
+    <#
+    .SYNOPSIS
+    Whose is the claim at -Path? OWN when it parses as a JSON object carrying exactly -Nonce; OTHER when it parses as anything else (another submission's
+    object, an array, a scalar: this call always wrote an object with its nonce); UNKNOWN when it cannot be read or does not parse to anything (a held or torn
+    claim). UNKNOWN is never "ours": a caller must not replace the claim on it (adversary A1).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Nonce)
+    try {
+        $claim = (Get-Content -LiteralPath $Path -Raw -Encoding ascii -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return 'UNKNOWN'
+    }
+    if ($null -eq $claim) { return 'UNKNOWN' }
+    if ($claim -is [pscustomobject] -and $null -ne $claim.PSObject.Properties['nonce'] -and [string]$claim.nonce -ceq $Nonce) { return 'OWN' }
+    return 'OTHER'
 }
 
 function Test-UmRunMetaDelivered {
@@ -714,7 +738,10 @@ function Invoke-UmRunDrop {
         [scriptblock]$TestHookAfterMetaTmpWritten = $null,
         # Test-only (r4): invoked with the not-after re-publish's temp file's path immediately after it is written, before its
         # read-back -- lets a test stall the clock inside the re-publish, tear the write, or plant another submission's claim.
-        [scriptblock]$TestHookAfterNotAfterRepublishTmpWritten = $null
+        [scriptblock]$TestHookAfterNotAfterRepublishTmpWritten = $null,
+        # Test-only (VENUE-UMRUN-MOVE-ACCESS-DENIED-1): invoked with the attempt number (1-based) and the claim's path at the top of every pass of the
+        # re-publish's replacing-rename loop, before that pass reads or moves anything -- lets a test hold, rewrite or release the claim between passes.
+        [scriptblock]$TestHookBeforeMetaReplaceAttempt = $null
     )
 
     if ($JobId -and $JobId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw "UMRUN_JOBID_INVALID '$JobId'" }
@@ -1021,28 +1048,40 @@ function Invoke-UmRunDrop {
                                     throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
                                 }
                                 # VENUE-UMRUN-MOVE-ACCESS-DENIED-1: a refused rename is retried (bounded, backed off) and, if it outlasts the attempts, refused TYPED. Retry-safe:
-                                # only this temp is re-moved over only this call's own claim (the nonce is read again before every retry), the job is not yet visible, and a
-                                # destination that already holds exactly these bytes counts as delivered.
+                                # only this temp is re-moved over only this call's own claim, the job is not yet visible, and a destination that already holds exactly these
+                                # bytes counts as delivered. Before every retry (a) the delivered check, then (b) the claim's owner is read again: OTHER refuses, UNKNOWN (held
+                                # or torn: ownership unproven) moves nothing this pass, and only OWN may be replaced (adversary A1). A temp the first rename already
+                                # consumed is the delivered case too, never a missing-source error (adversary A3).
                                 $moveAttempt = 0
                                 while ($true) {
                                     $moveAttempt++
-                                    try {
-                                        [IO.File]::Move($repubTmp, $metaFinal, $true)
-                                        break
-                                    } catch {
-                                        $moveDenial = Get-UmRunMoveDenial -Exception $_.Exception -Destination $metaFinal
-                                        if ($null -eq $moveDenial) { throw }
+                                    if ($TestHookBeforeMetaReplaceAttempt) { & $TestHookBeforeMetaReplaceAttempt $moveAttempt $metaFinal }
+                                    $claimOwner = 'OWN'   # pass 1: the nonce was read from the claim just above
+                                    if ($moveAttempt -gt 1) {
                                         if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
-                                        if (-not $moveDenial.transient -or $moveAttempt -ge $script:UmRunMoveAttempts) {
-                                            throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=$($moveDenial.cause) probe=$($moveDenial.probe) exception=$($moveDenial.exception); the not-after re-publish did not replace this submission's claim and the job was not made visible"
+                                        $claimOwner = Get-UmRunClaimOwnership -Path $metaFinal -Nonce $nonce
+                                        if ($claimOwner -ceq 'OTHER') {
+                                            throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
                                         }
                                     }
-                                    Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $moveAttempt)
-                                    $claimNow = $null
-                                    try { $claimNow = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json } catch { $claimNow = $null }
-                                    if ($null -ne $claimNow -and $claimNow.nonce -ne $nonce) {
-                                        throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
+                                    if ($claimOwner -ceq 'OWN') {
+                                        try {
+                                            [IO.File]::Move($repubTmp, $metaFinal, $true)
+                                            break
+                                        } catch {
+                                            $moveDenial = Get-UmRunMoveDenial -Exception $_.Exception -Destination $metaFinal
+                                            $sourceGone = -not (Test-Path -LiteralPath $repubTmp)
+                                            if ($null -eq $moveDenial -and -not $sourceGone) { throw }
+                                            if (Test-UmRunMetaDelivered -Path $metaFinal -ExpectedText $metaJson) { break }
+                                            if ($null -eq $moveDenial) { throw }
+                                            if (-not $moveDenial.transient -or $moveAttempt -ge $script:UmRunMoveAttempts) {
+                                                throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=$($moveDenial.cause) probe=$($moveDenial.probe) exception=$($moveDenial.exception); the not-after re-publish did not replace this submission's claim and the job was not made visible"
+                                            }
+                                        }
+                                    } elseif ($moveAttempt -ge $script:UmRunMoveAttempts) {
+                                        throw "UMRUN_MOVE_ACCESS_DENIED source=$repubTmp destination=$metaFinal attempts=$moveAttempt cause=OWNERSHIP_UNPROVEN probe=NOT_PROBED exception=the claim could not be read back to prove it is still this submission's own, so it was not replaced; the not-after re-publish did not replace this submission's claim and the job was not made visible"
                                     }
+                                    Start-Sleep -Milliseconds ($script:UmRunMoveBackoffMs * $moveAttempt)
                                 }
                             } finally {
                                 if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
