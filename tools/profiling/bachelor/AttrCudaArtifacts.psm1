@@ -506,6 +506,9 @@ function Enter-AttrCudaStageLock {
     rebuilds every path on it right after the lock, so a junction retargeted later moves nothing.
     r16 (Grok G23): a root that cannot be opened says "NoLocalVolume (open failed, win32 <n>)", one
     with no volume GUID path "NoLocalVolume (no volume GUID path, win32 <n>)".
+    r21 (pass-22 A1): a root on a volume with no drive letter (mounted only in a folder) is refused with
+    ATTRCUDA_STAGE_ROOT_FOLDER_MOUNT_REFUSED, never bound through the mount folder's pathname (a
+    remount after the identity check would move every later open to another volume).
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -514,7 +517,7 @@ function Enter-AttrCudaStageLock {
         [int]$WaitSec = 1800,
         [string]$WaitMarkerPath = '',
         [string]$TestRootVolumeType = '',
-        # r16 fix iteration 1 (test-only): treat the drive-letter final path as absent, so the folder-mount fallback runs on any volume
+        # r16 fix iteration 1 (test-only): treat the drive-letter final path as absent, so the folder-mount refusal (r21) is reached on any volume
         [switch]$TestNoDosPath
     )
 
@@ -532,18 +535,22 @@ function Enter-AttrCudaStageLock {
     # mutex for the life of the process. .root is the drive-letter final path: the caller rebuilds every path on it right after the lock.
     # r16 (Grok G23 on #814): the Win32 error of a failed open or a failed GUID-path read is captured at once and named, so a local root this job cannot open (an ACL,
     # a sharing or AV hold) is never reported like a share. The refusal is the same.
-    # r16 fix iteration 1: StageRootVolumeNative (not r14's StageRootNative), so a process that loaded the older type never lacks GetVolumePathNamesForVolumeNameW
+    # r16 fix iteration 1: StageRootVolumeNative (not r14's StageRootNative), so a process that loaded the older type never lacks a member. r21: the
+    # mount-folder member went with the mount-folder branch; a process that loaded r16's wider type simply has an unused member.
     if (-not ('AttrCudaWin32.StageRootVolumeNative' -as [type])) {
         Add-Type -Namespace AttrCudaWin32 -Name StageRootVolumeNative -MemberDefinition (@(
                 '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);',
                 '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle h, System.Text.StringBuilder p, uint n, uint f);',
-                '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool GetVolumePathNamesForVolumeNameW(string v, [Out] char[] names, uint n, out uint len);',
                 '[DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetDriveTypeW(string r);') -join "`n")
     }
     Initialize-AttrCudaFileIdNative
     # r14 fix iteration 2 (adversary A2 on 6882c873): CreateFileW refuses a path of 260+ characters without the extended-length prefix (where the Win32 long-path
-    # opt-in is off), so a long LOCAL root read as NoLocalVolume. The prefix is added as Get-AttrCudaFileId adds it (from 240 characters); the lexical path is never normalized here.
+    # opt-in is off), so a long LOCAL root read as NoLocalVolume. The prefix is added as Get-AttrCudaFileId adds it (from 240 characters).
+    # r21 (pass-20 A1; sol blocker 3 on d59e9bb7): the extended-length form does no dot-segment reduction, so a root that is long ONLY because of '.\' segments got the
+    # prefix on the unreduced text and read as absent. A path without the prefix is reduced to its full path BEFORE the length test and the prefix (a '\\?\' root is
+    # taken exactly as given, as every open of it takes it); a root the .NET full-path reduction rejects is kept as given and fails the open as before.
     $nativeRoot = $Root
+    if (-not $nativeRoot.StartsWith('\\?\')) { try { $nativeRoot = [IO.Path]::GetFullPath($nativeRoot) } catch { $nativeRoot = $Root } }
     if ($nativeRoot.Length -ge 240 -and -not $nativeRoot.StartsWith('\\?\')) {
         $nativeRoot = $(if ($nativeRoot.StartsWith('\\')) { '\\?\UNC\' + $nativeRoot.Substring(2) } else { '\\?\' + $nativeRoot })
     }
@@ -575,19 +582,12 @@ function Enter-AttrCudaStageLock {
         $dosError = $(if ($n -ge 32768) { 122 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() })
         $dosFinal = $(if ($n -gt 0 -and $n -lt 32768 -and -not $TestNoDosPath) { $buffer.ToString() } else { '' })
         if ($dosFinal -cmatch '^\\\\\?\\[A-Za-z]:\\') { $dosFinal = $dosFinal.Substring(4) }
-        # r16 fix iteration 1 (adversary A1 on 4118843c): a fixed volume mounted only in a folder (no drive letter) has no VOLUME_NAME_DOS path; its root is the
-        # volume's first mount folder (GetVolumePathNamesForVolumeNameW) plus the GUID final path's rest. -TestNoDosPath (test-only) takes this branch on any volume.
-        if ($dosFinal -notmatch '^[A-Za-z]:\\' -and $final -match '^(\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\)(.*)\z') {
-            $volumeName = $Matches[1]; $rest = $Matches[2]
-            # r16 fix iteration 2 (adversary A1 on 8dffbff9): the mount list is a MULTI_SZ of any length (700 mount folders need more than 32768 WCHARs, and a
-            # fixed buffer answered ERROR_MORE_DATA, refused). A sizing call with a one-WCHAR buffer reports the length; the list is then read with exactly that.
-            $mountsLen = [uint32]0
-            [void][AttrCudaWin32.StageRootVolumeNative]::GetVolumePathNamesForVolumeNameW($volumeName, [char[]]::new(1), [uint32]1, [ref]$mountsLen)
-            $mounts = [char[]]::new([int]$(if ($mountsLen -gt 1) { $mountsLen } else { 1 }))
-            if ([AttrCudaWin32.StageRootVolumeNative]::GetVolumePathNamesForVolumeNameW($volumeName, $mounts, [uint32]$mounts.Length, [ref]$mountsLen)) {
-                $firstMount = ([string]::new($mounts, 0, $mounts.Length)).Split([char]0)[0]
-                if ($firstMount -match '^[A-Za-z]:\\') { $dosFinal = $firstMount.TrimEnd('\') + '\' + $rest }
-            } else { $dosError = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+        # r21 (pass-22 A1; sol blocker 1 on d59e9bb7; siblings stage job :395/:544/:553-556, psm1 :1725/:2975): r16 bound a root on a volume with no drive letter through
+        # the volume's first mount-folder PATHNAME, so a remount after the identity check moved every later open to another volume. That branch is removed: such a
+        # root is refused here, typed, nothing locked and nothing written (the stage job exits 7 on any lock throw). Production roots are drive-letter paths
+        # (C:\mlvtmp\mlv-agent on Bachelor, G:\Temp\mlv-gpu-profile\agent on Ultra-Magnus). -TestNoDosPath (test-only) reaches this shape on any volume.
+        if ($dosFinal -notmatch '^[A-Za-z]:\\' -and $final -match '^\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\') {
+            throw "ATTRCUDA_STAGE_ROOT_FOLDER_MOUNT_REFUSED the agent root's volume has no drive-letter path (win32 $dosError): a root reached only through a mount folder is not bound, because a remount after this check would move every later open to another volume; use a drive-letter root"
         }
         if ($dosFinal -notmatch '^[A-Za-z]:\\') { throw "ATTRCUDA_STAGE_ROOT_UNRESOLVED the agent root's final path by drive letter could not be read through its open handle (win32 $dosError), so no job path can be bound to the locked root" }
         # r16 fix iteration 1 (adversary A3 on 4118843c): a path without '\\?\' is normalized by every later open (a trailing dot or space is dropped), so it can
@@ -617,7 +617,7 @@ function Enter-AttrCudaStageLock {
         # r20 (adversary pass 21 A2 on f28b4f7e): WaitOne takes an Int32 of milliseconds, so $WaitSec * 1000 past 2147483647 (a -WaitSec of 2147484 or more) made the native
         # wait refuse its argument and the call THROW, and a negative one threw too (only -1, "forever", is a valid negative timeout). The wait is clamped to
         # [0, Int32.MaxValue] ms (about 24.8 days): the typed held/waited answer is kept, and 1800 s (production) is unchanged.
-        $waitMs = $(if ($WaitSec -le 0) { 0 } elseif ($WaitSec -ge 2147483) { [int]::MaxValue } else { $WaitSec * 1000 })
+        $waitMs = $(if ($WaitSec -le 0) { 0 } elseif ($WaitSec -gt 2147483) { [int]::MaxValue } else { $WaitSec * 1000 })
         Write-Host ('STAGE_LOCK_WAIT ' + $rootId + ' ' + $SourceCommit.ToLowerInvariant() + ' waiting up to ' + [string]($waitMs / 1000) + ' s (lock ' + $name + ' is held by another stager of this sha into this agent root)')
         if ($WaitMarkerPath) { [IO.File]::WriteAllText($WaitMarkerPath, $name) }
         try { $held = $mutex.WaitOne($waitMs) } catch [Threading.AbandonedMutexException] { $held = $true }

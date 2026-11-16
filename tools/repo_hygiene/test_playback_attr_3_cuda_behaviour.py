@@ -1293,7 +1293,13 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertNotIn("Get-AttrCudaFileId -Path $Root", body)
         self.assertIn("Get-AttrCudaFileId -Path $dosFinal -FollowLinks", body)
         self.assertIn("rootHandle = $rootHandle", body)
-        self.assertNotIn("GetFullPath", body)
+        # r21 (pass-20 A1): GetFullPath reduces the text handed to the ONE CreateFileW (dot segments, before the length test and the '\\?\' prefix) and nothing else:
+        # the identity, the lock key and the name come from the handle, never from a normalized lexical path
+        self.assertEqual(body.count("GetFullPath"), 1)
+        self.assertIn("$nativeRoot = [IO.Path]::GetFullPath($nativeRoot)", body)
+        self.assertLess(body.index("GetFullPath"), body.index("$nativeRoot.Length -ge 240"))
+        self.assertLess(body.index("$nativeRoot.Length -ge 240"), body.index("::CreateFileW($nativeRoot"))
+        self.assertNotRegex(body, r"(?m)^\s*\$(key|name|rootId)\b[^\n]*(GetFullPath|\$nativeRoot)")
         self.assertNotIn("ReleaseMutex", body)
         rebind = text.index("$AgentRoot = [string]$StageLock.root")
         self.assertLess(lock, rebind)
@@ -1558,21 +1564,26 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         self.assertIn("CHILD_CREATED", proc.stdout, proc.stdout + proc.stderr)
         self.assertTrue((root / "cache").is_dir())
 
-    def test_r16_fix1_a1_a_volume_with_no_drive_letter_path_binds_through_its_mount_folder(self) -> None:
-        # r16 fix iteration 1 (adversary A1 on 4118843c, AttrCudaArtifacts.psm1:567): a fixed volume mounted only in a folder has no VOLUME_NAME_DOS final path, and the
-        # lock threw ATTRCUDA_STAGE_ROOT_UNRESOLVED (the stage exited 7). The root is then bound through the volume's mount folder plus the GUID path's rest.
-        # -TestNoDosPath drops the drive-letter answer on this host's own volume, so the fallback runs here; it must bind the same root. RED: no such branch.
+    def test_r21_a1_a_volume_with_no_drive_letter_path_is_refused_not_bound_through_its_mount_folder(self) -> None:
+        # r21 (pass-22 A1; sol blocker 1 on d59e9bb7; supersedes r16 fix iterations 1+2, which bound such a root through the volume's first mount folder): a root on a
+        # volume with no drive letter (no VOLUME_NAME_DOS final path) was bound through a mount-folder PATHNAME, so a remount after the identity check moved every
+        # later open to another volume. It is refused at the lock step, typed (the stage job exits 7 on any lock throw), nothing locked and nothing written.
+        # -TestNoDosPath drops the drive-letter answer on this host's own volume, so the folder-mount shape is reached here with no real remount. RED: HELD=True.
+        # Production roots are drive-letter paths (C:\mlvtmp\mlv-agent on Bachelor, G:\Temp\mlv-gpu-profile\agent on Ultra-Magnus): the no-seam row still locks.
         proc = self.run_with_module(
             f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1 -TestNoDosPath; 'HELD=' + $l.held; 'ROOT=' + $l.root }} "
-            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r16-fix1-a1.ps1")
-        self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
-        self.assertIn(f"ROOT={self.agent}\n", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
-        # r16 fix iteration 2 (adversary A1 on 8dffbff9): the mount list is read with the size a sizing call reported, never a fixed buffer (700 mount folders
-        # overflowed 32768 WCHARs: ERROR_MORE_DATA, refused). This host's volume list needs more than the one-WCHAR sizing buffer, so the row above went through it.
+            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r21-a1.ps1")
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_FOLDER_MOUNT_REFUSED the agent root's volume has no drive-letter path", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("HELD=", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("ROOT=", proc.stdout, proc.stdout + proc.stderr)
+        # the mount-folder binding is gone, not merely unreached
         body = re.search(r"(?ms)^function Enter-AttrCudaStageLock \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
-        self.assertIn("GetVolumePathNamesForVolumeNameW($volumeName, [char[]]::new(1), [uint32]1, [ref]$mountsLen)", body)
-        self.assertIn("GetVolumePathNamesForVolumeNameW($volumeName, $mounts, [uint32]$mounts.Length, [ref]$mountsLen)", body)
-        self.assertNotIn("32768, [ref]$mountsLen", body)
+        self.assertNotIn("GetVolumePathNamesForVolumeNameW", body)
+        self.assertNotIn("$firstMount", body)
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held + ' ROOT=' + $l.root }} "
+            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r21-a1-drive-letter.ps1")
+        self.assertIn(f"HELD=True ROOT={self.agent}", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
 
     def test_r16_fix1_a3_a_root_whose_plain_path_names_another_directory_is_refused(self) -> None:
         # r16 fix iteration 1 (adversary A3 on 4118843c, AttrCudaArtifacts.psm1:570): the lock held \\?\...\stage.\agent (a trailing dot only the extended form keeps),
@@ -1615,6 +1626,21 @@ class StagedBuildNeverReplacedTests(_PwshCase):
             name="r14-fix2-a2-long.ps1")
         self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
 
+    def test_r21_a3_a_long_root_that_is_long_only_because_of_dot_segments_is_accepted_like_its_canonical_spelling(self) -> None:
+        # r21 (pass-20 A1; sol blocker 3 on d59e9bb7, AttrCudaArtifacts.psm1:545-552): a root of 240+ characters that is long ONLY because of '.\' segments got the
+        # '\\?\' prefix on the UNREDUCED text, and the extended-length form does no dot-segment reduction, so CreateFileW read it as absent and the lock refused
+        # ATTRCUDA_STAGE_ROOT_NOT_LOCAL (NoLocalVolume, open failed). The path is reduced with GetFullPath before the length test and the prefix. RED: REFUSED.
+        real = self.agent / "dotted-real"
+        real.mkdir()
+        dotted = str(self.agent) + "\\" + ".\\" * 130 + "dotted-real"
+        self.assertGreater(len(dotted), 260)
+        for label, root in (("canonical", str(real)), ("dot segments", dotted)):
+            with self.subTest(root=label):
+                proc = self.run_with_module(
+                    f"try {{ $l = Enter-AttrCudaStageLock -Root '{root}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held + ' ROOT=' + $l.root }} "
+                    "catch { 'REFUSED=' + $_.Exception.Message }\n", name=f"r21-a3-{label.split()[0]}.ps1")
+                self.assertIn(f"HELD=True ROOT={real}", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
+
     def test_r20_a2_a_contended_wait_in_seconds_that_overflows_int32_milliseconds_returns_a_typed_result(self) -> None:
         # r20 (adversary pass 21 A2 on f28b4f7e, AttrCudaArtifacts.psm1:619): a contended wait did $mutex.WaitOne($WaitSec * 1000). An accepted -WaitSec of 2147484
         # or more is 2147484000+ ms, past Int32, so the native wait refused the argument and the call THREW instead of answering held=false/true; a negative one
@@ -1655,13 +1681,16 @@ class StagedBuildNeverReplacedTests(_PwshCase):
                 "catch { 'REFUSED=' + $_.Exception.Message }\n", name=name)
         # too long for Int32 ms: the holder ends after ten seconds (its abandoned mutex is taken over), so the wait ends with the lock held
         # (-WaitSec is [int], so a value past Int32 is already refused at parameter binding, before any lock: not a row here)
-        for wait, tag in (("2147484", "first-over"), ("2147483647", "int-max")):
+        # r21 (pass-22 A2; sol blocker 2 on d59e9bb7): 2147483 s is 2147483000 ms, which fits Int32, so it is the LAST unclamped value (the threshold was -ge). The
+        # wait the lock announces (STAGE_LOCK_WAIT ... waiting up to <n> s) is the clamped one: 2147483 for 2147483, 2147483.647 (Int32.MaxValue ms) past it.
+        for wait, tag, announced in (("2147483", "last-fit", "2147483"), ("2147484", "first-over", "2147483.647"), ("2147483647", "int-max", "2147483.647")):
             with self.subTest(wait=wait):
                 hold(10, tag)
                 proc = call(wait, f"r20-a2-{tag}.ps1")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
                 self.assertNotIn("REFUSED=", proc.stdout, proc.stdout + proc.stderr)
+                self.assertRegex(proc.stdout, rf"STAGE_LOCK_WAIT \S+ \S+ waiting up to {re.escape(announced)} s \(", proc.stdout + proc.stderr)
         # a negative wait is "do not wait": busy -> held=false, typed, no throw (the holder is still alive)
         with self.subTest(wait="-5"):
             hold(30, "negative")
