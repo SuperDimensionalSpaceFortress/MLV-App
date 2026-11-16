@@ -859,11 +859,17 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         # r12 (r12 adversary B1 + B3 siblings :5057-5059, :7534-7536, :7546): the core-partition and utilisation selectors count words with the same
         # body-scoped, ASCII-boundary counter as Get-MeasuredSmokeSessionId, and no name boundary in the job is left on an IgnoreCase class
         text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
-        body = ("$o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \\([0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)? -> "
-                "[0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)?\\)\"') { $o = $x.IndexOf(' (', $o + 2, [StringComparison]::Ordinal) }; if ($o -ge 0) { if ($x.Substring($o) "
-                "-cnotmatch '^ \\(.+:(?:[0-9]+|%2)\\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + "
-                "'(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }")
-        self.assertEqual(text.count("{ param([string]$x, [string]$w) " + body), 3)
+        # r14 (hosted CI on 116db0cb, attr3_publish_write_scan R3/R4): every ' (' position comes from [regex]::Matches (no IndexOf /
+        # StringComparison::Ordinal), and the template's copy is a function it defines (no `&` on a script block); the two generator copies stay blocks
+        body = ("$p = [regex]::Matches($x, ' \\('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch "
+                "'^ \\([0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)?\\)\"') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; "
+                "if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \\(.+:(?:[0-9]+|%2)\\)$') { return -1 }; $x = $x.Substring(0, $o) }; "
+                "[regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }")
+        self.assertEqual(text.count(body), 3)
+        self.assertEqual(text.count("{ param([string]$x, [string]$w) " + body), 2)
+        self.assertEqual(text.count("function Get-MeasuredRecordWordCount([string]$x, [string]$w) { " + body), 1)
+        self.assertNotIn("& $wordCount", text)
+        self.assertNotIn("$x.IndexOf(' (', ", text)
         self.assertNotIn("(?![A-Za-z0-9_])", text)
         self.assertNotIn("(?<![A-Za-z0-9_])", text)
         # r12 pass 13 (A2 siblings :2258/:2259, :5063/:5064, :7541/:7542, :7552; AttrCudaArtifacts :3497): no session selector matches a record name
@@ -871,7 +877,11 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         for prefix in ("$recordStart + 'playback_smoke", "$ux + 'playback_smoke"):
             self.assertNotIn("-match (" + prefix, text)
         # r13 (r12 adversary A1 siblings :3810/:3821): the anchored summary and conform re-picks are the eighth and ninth
-        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant'))"), 9)
+        # r14 (scan R4): the four in the emitted template (:2258/:2259, :3811/:3823) read [regex]::Matches(...).Count; the five generator ones keep IsMatch
+        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant'))"), 5)
+        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant').Count -gt 0)"), 4)
+        self.assertEqual(text.count("[regex]::IsMatch($line, ($recordStart"), 0)
+        self.assertEqual(text.count("[regex]::IsMatch($candidateLine"), 0)
         self.assertNotIn("-match ($sourceFramesRecordStart", text)
         artifacts = (ATTRIBUTION_GENERATOR.parent / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
         region = artifacts[artifacts.index("    $sessionLine = {"):artifacts.index("    $telemetry = {")]

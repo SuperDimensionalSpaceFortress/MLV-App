@@ -2253,10 +2253,12 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     # readable Qt location ` (<path>:<digits>)` (or the old writer's `:%2)`), from the first ` (` that is not the summary's conform group, is cut
     # first (DualVenueRunner.psm1 Get-DvLogRecordBody); any other ` (` tail is -1, so unreadable (that reader's LOCATION_UNREADABLE). r12 (B3, a Kelvin
     # sign U+212A before `id=4`): a name character is ASCII [A-Za-z0-9_] matched case-sensitively, (?-i:...), even inside (?i) and -match
-    $wordCount = { param([string]$x, [string]$w) $o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"') { $o = $x.IndexOf(' (', $o + 2, [StringComparison]::Ordinal) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
+    # r14 (hosted CI on 116db0cb, attr3_publish_write_scan R3/R4): the template may call `&` only on a child executable and only allowlisted .NET
+    # members, so the counter is a function defined here (a known template function) and every ' (' position comes from [regex]::Matches
+    function Get-MeasuredRecordWordCount([string]$x, [string]$w) { $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
     $token = $null
-    foreach ($line in ($RawLog -split "`r?`n")) { if ([regex]::IsMatch($line, ($recordStart + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $token = $(if ((& $wordCount $line 'id') -eq 1 -and (& $wordCount $line 'session') -eq 0 -and $line -cmatch ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } }
-    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ([regex]::IsMatch($line, ($recordStart + 'playback_smoke\.summary(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $token = $(if ((& $wordCount $line 'session') -eq 1 -and $line -cmatch ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } } }
+    foreach ($line in ($RawLog -split "`r?`n")) { if ([regex]::Matches($line, ($recordStart + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant').Count -gt 0) { $token = $(if ((Get-MeasuredRecordWordCount $line 'id') -eq 1 -and (Get-MeasuredRecordWordCount $line 'session') -eq 0 -and $line -cmatch ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } }
+    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ([regex]::Matches($line, ($recordStart + 'playback_smoke\.summary(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant').Count -gt 0) { $token = $(if ((Get-MeasuredRecordWordCount $line 'session') -eq 1 -and $line -cmatch ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } } }
     if ($null -ne $token) {
         if ($token -cmatch '^[0-9]+$') { return $token }
         throw ("the measured playback_smoke session id is unreadable (not one whole decimal id): '" + $token + "'")
@@ -3808,7 +3810,8 @@ $sourceFramesRecordStart = '^(?:\[[^\]]*\] ){0,3}'
 $sourceFramesSummaryLine = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     # r13 (r12 adversary A1 sibling): culture-invariant, so a tr-TR upper-case summary record is read as every other culture reads it
-    if ([regex]::IsMatch($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant')) {
+    # r14 (hosted CI, scan R4): [regex]::Matches(...).Count, the allowlisted member, not regex::IsMatch
+    if ([regex]::Matches($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant').Count -gt 0) {
         $sourceFramesSummaryLine = $candidateLine
     }
 }
@@ -3820,7 +3823,7 @@ $sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFrame
 $sourceFramesConformLine = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     # r13 (r12 adversary A1 sibling): culture-invariant, as the summary pick above
-    if ([regex]::IsMatch($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant')) {
+    if ([regex]::Matches($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant').Count -gt 0) {
         $sourceFramesConformLine = $candidateLine
     }
 }
@@ -5061,7 +5064,7 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's (else the summary's) name is read whole or is the empty token (no session)
         # r11 pass 11 (A3 sibling): the marker names the word id once, the summary the word session once
         # r12 (r12 adversary B1 + B3 siblings): counted in the record body only (a readable Qt location cut, any other ` (` tail -1), ASCII name characters
-        $wc = { param([string]$x, [string]$w) $o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"') { $o = $x.IndexOf(' (', $o + 2, [StringComparison]::Ordinal) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
+        $wc = { param([string]$x, [string]$w) $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
         foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($recordStart + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'id') -eq 1 -and (& $wc $ln 'session') -eq 0) { $mm.Groups[1].Value } else { '' }); break } }
         if ($null -eq $sid) { foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($recordStart + 'playback_smoke\.summary(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'session') -eq 1) { $mm.Groups[1].Value } else { '' }); break } } }
         if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $r }
@@ -7539,7 +7542,7 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         $ux = '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] '
         # r11 pass 11 (A3 sibling): the marker names the word id once, the summary the word session once
         # r12 (r12 adversary B1 + B3 siblings): counted in the record body only (a readable Qt location cut, any other ` (` tail -1), ASCII name characters
-        $wc = { param([string]$x, [string]$w) $o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"') { $o = $x.IndexOf(' (', $o + 2, [StringComparison]::Ordinal) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
+        $wc = { param([string]$x, [string]$w) $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
         foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($ux + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'id') -eq 1 -and (& $wc $ln 'session') -eq 0) { $mm.Groups[1].Value } else { '' }); break } }
         if ($null -eq $sid) { foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($ux + 'playback_smoke\.summary(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'session') -eq 1) { $mm.Groups[1].Value } else { '' }); break } } }
         if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $null }

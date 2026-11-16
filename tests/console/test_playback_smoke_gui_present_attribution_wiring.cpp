@@ -1395,7 +1395,13 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     const QString endAnchor = QStringLiteral("    m_playbackSmokeActive = false;\n    m_playbackPresentTrace.end();\n");
     const int inactive = finish.indexOf(endAnchor);
     ASSERT_TRUE(inactive >= 0);
-    ASSERT_EQ(inactive + static_cast<int>(endAnchor.size()) + 4,
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r14 (hosted CI on 116db0cb): the merge with #824 keeps #811's due-wake trace end
+    // between the flag drop and the listener reset; nothing else sits between them.
+    const QString dueWakeEnd = QStringLiteral(
+        "    // FULLSCREEN-S1S2-PRESENT-GAP-1 (r2: after the present trace's end, which PlaybackPresentTraceWiring pins next to the flag)\n"
+        "    if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( false );\n");
+    ASSERT_EQ(inactive + static_cast<int>(endAnchor.size()), finish.indexOf(dueWakeEnd));
+    ASSERT_EQ(inactive + static_cast<int>(endAnchor.size()) + static_cast<int>(dueWakeEnd.size()) + 4,
               finish.indexOf(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));
     ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("MainWindow::~MainWindow()"))
                     .contains(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));
