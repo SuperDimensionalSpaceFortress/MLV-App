@@ -78,6 +78,8 @@ param(
 
 Set-StrictMode -Version 1.0
 $ErrorActionPreference = 'Stop'
+# r10 pass 7 A5: every direct native call below (sshd -t, git, schtasks) checks $LASTEXITCODE itself; a caller's $true here would throw first.
+$PSNativeCommandUseErrorActionPreference = $false
 # Which parameters this run was given (Get-GateTaskArgument hands the path overrides on to the scheduled tasks).
 $script:SetupBound = @{}
 foreach ($k in $PSBoundParameters.Keys) { $script:SetupBound[$k] = $true }
@@ -184,6 +186,9 @@ function Invoke-Step {
 function Invoke-Native {
     # Runs a native command, logs its output, throws on a non-zero exit unless -AllowFail.
     param([string]$Exe, [string[]]$Arguments, [switch]$AllowFail, [int[]]$OkCodes = @(0))
+    # r10 pass 7 A5: a caller (or profile) with $PSNativeCommandUseErrorActionPreference = $true would make a non-zero exit throw before -AllowFail and
+    # -OkCodes are consulted (robocopy's normal exit 1 included). This function owns exit-code handling, so it turns that off for its own scope.
+    $PSNativeCommandUseErrorActionPreference = $false
     Write-Log ("  > {0} {1}" -f $Exe, ($Arguments -join ' '))
     $out = & $Exe @Arguments 2>&1
     $code = $LASTEXITCODE
@@ -651,15 +656,19 @@ $CredentialNameWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACC
 # start like code ($var, (expr), %var%, @splat). The key may not follow a '$', word character or '-' (so '$Token = Get-Token' in a script is not a hit).
 # r10 A1: the key words split in two. A STRONG word (password, secret, a key, a credential) says what the value is, so ANY non-empty unquoted value
 # counts, one character or all digits included ('DB_PASSWORD=123456'); TOKEN also names counters ('max_tokens = 4096'), so a TOKEN key keeps the 4+
-# characters, not-all-digits rule. A YAML 'key: value' line is judged too, but only as a whole line holding ONE bare word (a line of prose such
-# as 'Password: see the owner' is not a value).
+# characters, not-all-digits rule. A YAML 'key: value' line is judged too (for a STRONG key the whole rest of the line is the value, so a prose line such as
+# 'Password: see the owner' is a hit by design: fail closed).
 $CredentialStrongWords = 'SECRET|PASSWORD|PASSWD|PRIVATE[_\-]?KEY|API[_\-]?KEY|ACCESS[_\-]?KEY|AUTH[_\-]?KEY|CREDENTIAL'
 $CredentialNameValuePattern = '(?i)["'']?[A-Z0-9_\-]*(' + $CredentialNameWords + ')[A-Z0-9_\-]*["'']?\s*[:=]\s*(?:"[^"\r\n]+"|''[^''\r\n]+'')'
-$CredentialValueGuard = '(?![\$\(%@\{\[<])(?!(?:true|false|null|none|nil|undefined)\b)'
-$CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialValueGuard + '[^\s"'',;]+'
-$CredentialUnquotedTokenPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialValueGuard + '(?!\d+\b)[^\s"'',;]{4,}'
-$CredentialYamlPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialValueGuard + '(?!~)[^\s"'',;#]+[ \t]*(?:#[^\r\n]*)?\r?$'
-$CredentialYamlTokenPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialValueGuard + '(?!~)(?!\d+\b)[^\s"'',;#]{4,}[ \t]*(?:#[^\r\n]*)?\r?$'
+# r10 pass 7 A1: a STRONG key takes ANY value that is not itself a boolean or null word: '$hunter2', '@hunter2', 'false-password', 'null-secret' and a multi-word
+# YAML passphrase are credentials (a false positive costs one dropped file named in SECRET-SCAN.txt; a miss ships a secret). The boolean test is for the
+# WHOLE word (followed by a space, quote, comma, semicolon or the end), not a prefix. TOKEN keys keep the code-looking-start guard and the 4+ not-all-digits rule.
+$CredentialBoolGuard = '(?!(?:true|false|null|none|nil|undefined)(?=[\s"'',;]|$))'
+$CredentialTokenGuard = '(?![\$\(%@\{\[<])' + $CredentialBoolGuard
+$CredentialUnquotedPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialBoolGuard + '[^\s"'',;]+'
+$CredentialUnquotedTokenPattern = '(?i)(?<![\$\w\-.])[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*[ \t]*=[ \t]*' + $CredentialTokenGuard + '(?!\d+\b)[^\s"'',;]{4,}'
+$CredentialYamlPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*(' + $CredentialStrongWords + ')[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+(?!(?:true|false|null|none|nil|undefined|~)[ \t]*(?:#[^\r\n]*)?\r?$)[^\s#][^\r\n]*'
+$CredentialYamlTokenPattern = '(?im)^[ \t\-]*["'']?[A-Z0-9_\-]*TOKEN[A-Z0-9_\-]*["'']?[ \t]*:[ \t]+' + $CredentialTokenGuard + '(?!~)(?!\d+\b)[^\s"'',;#]{4,}[ \t]*(?:#[^\r\n]*)?\r?$'
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 $SecretPatterns = @(
@@ -989,6 +998,25 @@ function Invoke-ImportRobocopy {
 $script:ImportSkippedDest = [System.Collections.Generic.List[string]]::new()
 $script:ImportSettingsApplied = $false
 
+# r10 pass 7 A2: read the file ONCE, judge those bytes, and write those same bytes (a host editor saving a credential between a check and a Copy-Item
+# can no longer put it into the backup). $true = written; $false = carries a credential, unreadable, or could not be written (nothing is left behind).
+function Copy-CleanBackupFile {
+    param([string]$Path, [string]$DestinationDir)
+    $dest = Join-Path $DestinationDir (Split-Path -Leaf $Path)
+    try {
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true)
+        try { $text = $sr.ReadToEnd() } finally { $sr.Dispose() }
+        if (Test-CredentialText $text) { return $false }
+        [void][IO.Directory]::CreateDirectory($DestinationDir)
+        [IO.File]::WriteAllBytes($dest, $bytes)
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
 function Invoke-PhaseImport {
     if (-not (Test-Path -LiteralPath $BundlePath)) {
         Write-Log "no bundle at ${BundlePath}: run -Phase Export on VIRTUAL-TEN and copy the zip here (README step 4), then re-run -Phase Import" 'MANUAL'
@@ -1018,11 +1046,8 @@ function Invoke-PhaseImport {
             $p = Join-Path "$h\.claude" $f
             if (-not (Test-Path -LiteralPath $p)) { continue }
             # r10 A2: a host file that carries a credential is never copied (the backup would be a second, durable copy of it, and Import
-            # never replaces such a file anyway, so there is nothing to roll back). An unreadable file counts as carrying one.
-            $carries = $true
-            try { $carries = Test-CredentialText ([IO.File]::ReadAllText($p)) } catch { $carries = $true }
-            if ($carries) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential or cannot be read; no copy was made)" 'WARN'; continue }
-            Copy-Item -LiteralPath $p -Destination $b
+            # never replaces such a file anyway, so there is nothing to roll back). One read: the bytes judged are the bytes written.
+            if (-not (Copy-CleanBackupFile -Path $p -DestinationDir $b)) { Write-Log "IMPORT_BACKUP_SKIPPED_CREDENTIAL_FILE $p (it carries a credential or cannot be read; no copy was made)" 'WARN' }
         }
     }
     Invoke-Step 'Copy bundle into ~/.claude, ~/bin, ~/.codex, ProgramData\FleetDefender, MLV-App\.claude-state' {
@@ -1104,7 +1129,17 @@ function Invoke-PhaseTasks {
     }
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     foreach ($t in $TaskSpecs) {
-        $existing = Get-ScheduledTask -TaskName $t.Name -TaskPath '\' -ErrorAction SilentlyContinue
+        # r10 pass 7 A3: "no such task" and "could not read the task" are different answers; an unreadable task may be an enabled one, and
+        # registering over it would leave it Disabled with no failure recorded, so it is skipped and the run fails.
+        $existing = $null
+        $unreadable = $false
+        try { $existing = Get-ScheduledTask -TaskName $t.Name -TaskPath '\' -ErrorAction Stop }
+        catch { $existing = $null; if (-not (Test-ScheduledTaskNotFound $_)) { $unreadable = $true } }
+        if ($unreadable) {
+            Write-Log "TASK_STATE_UNREADABLE $($t.Name) (could not read the task, so it was not registered or replaced)" 'ERROR'
+            $script:Failures.Add("TASK_STATE_UNREADABLE $($t.Name)")
+            continue
+        }
         if ($existing -and -not $ReplaceTasks) { Write-Log "task exists, left as is: $($t.Name) state=$($existing.State) (pass -ReplaceTasks to rewrite; its enabled state is kept)" 'OK'; continue }
         $wasEnabled = [bool]($existing -and $existing.State -ne 'Disabled')
         $arg = Get-GateTaskArgument -Pwsh $pwsh -Self $self -Spec $t
@@ -1468,6 +1503,8 @@ foreach ($p in $run) {
             # The gate lock is held EXCLUSIVE across the holder check and the push (adversary pass 2, A1/A2): no Lease-gated run can be mid-flight, or
             # start, until the lease has moved. Busy = a Lease-gated task is inside its target on this host.
             if (-not (Test-LockRootIsMachineWide)) { Write-Log "LOCKROOT_NOT_MACHINE_WIDE: $LockRoot is not the machine-wide gate lock folder, so this release could not exclude a running gate" 'ERROR'; exit 4 }
+            # r10 pass 7 A4: a dry run takes no gate lock (it would make a scheduled Lease-gated task skip as busy) and reads no lease (that is a git fetch).
+            if ($WhatIfPreference) { Write-Log 'SKIP (WhatIf) LeaseRelease: no gate lock was taken and no lease was read'; break }
             $xlock = Open-GateLock -Root $LockRoot -Mode Exclusive
             if (-not $xlock) { Write-Log 'a Lease-gated task is running on this host (gate lock busy); releasing now would hand the lease over under it. Wait for it to end, then re-run.' 'ERROR'; exit 4 }
             try {

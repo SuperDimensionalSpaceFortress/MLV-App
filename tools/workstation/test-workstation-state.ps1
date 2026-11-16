@@ -765,10 +765,15 @@ if ($fnLoaded -and (Get-Command Test-CredentialText -ErrorAction SilentlyContinu
         'a three character unquoted password'    = "DB_PASSWORD=abc`n"
         'an all-digit unquoted password'         = "DB_PASSWORD=123456`n"
         'an ini password with spaces round ='    = "db_password = 7`n"
+        'a multi-word YAML passphrase'           = "password: correct horse battery staple`n"
+        'a cmd value that starts with a dollar'  = "@set DB_PASSWORD=`$hunter2`n"
+        'a value that starts with an at sign'    = "DB_PASSWORD=@hunter2`n"
+        'a value that only STARTS like false'    = "DB_PASSWORD=false-password`n"
+        'a value that only STARTS like null'     = "DB_PASSWORD=null-secret`n"
     }
     foreach ($k in $r10a1.Keys) { Assert-That (Test-CredentialText $r10a1[$k]) "r10 A1 Test-CredentialText: $k is a credential" $r10a1[$k] }
     $r10a1ok = [ordered]@{
-        'a prose line about a password'          = "Password: see the owner for the sign-in details`n"
+        'a YAML boolean under a password key'    = "password_required: true`n"
         'a boolean under a password key'         = "password_required = true`n"
         'a numeric token limit (still benign)'   = "max_tokens = 4096`n"
         'a YAML token count'                     = "token_count: 12`n"
@@ -845,6 +850,54 @@ if ($fnLoaded -and (Get-Command Set-SshdKeyOnlyConfig -ErrorAction SilentlyConti
         Assert-That ($threw -and ([IO.File]::ReadAllText($cfg) -ceq $a6Refuse[$k])) "r10 A6 sshd: $k is refused and the file is left unchanged"
     }
 } else { Assert-That $false 'r10 A6: Set-SshdKeyOnlyConfig is not defined' }
+
+# ================================================================ adversary pass 7 (head 9ef92a95, r10 second iteration)
+# ---------------------------------------------------------------- r10 A2: the backup writes exactly the bytes that were judged (one read, then a write of those bytes)
+if ($fnLoaded -and (Test-Has 'Copy-CleanBackupFile' 'r10 A2 backup')) {
+    $a2Dir = New-Scratch 'r10-a2'
+    $a2Dirty = Join-Path $a2Dir 'settings.json'; $a2Clean = Join-Path $a2Dir 'CLAUDE.md'
+    [IO.File]::WriteAllText($a2Dirty, '{"env":{"DB_PASSWORD":"local-password"}}'); [IO.File]::WriteAllText($a2Clean, 'owner instructions')
+    $a2Dest = New-Scratch 'r10-a2-bk'
+    Assert-That ((Copy-CleanBackupFile -Path $a2Dirty -DestinationDir $a2Dest) -eq $false -and -not (Test-Path -LiteralPath (Join-Path $a2Dest 'settings.json'))) 'r10 A2 backup: a file that carries a credential is not written to the backup folder'
+    Assert-That ((Copy-CleanBackupFile -Path $a2Clean -DestinationDir $a2Dest) -eq $true -and ([IO.File]::ReadAllText((Join-Path $a2Dest 'CLAUDE.md')) -ceq 'owner instructions')) 'r10 A2 backup: a clean file is written byte for byte'
+    Assert-That ((Copy-CleanBackupFile -Path (Join-Path $a2Dir 'absent.json') -DestinationDir $a2Dest) -eq $false) 'r10 A2 backup: an unreadable (absent) file is not written'
+}
+
+# ---------------------------------------------------------------- r10 A3: -Phase Tasks never replaces a task whose state it could not read
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseTasks' 'r10 A3 tasks')) {
+    $script:T3Calls = [Collections.Generic.List[string]]::new()
+    function Get-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) Write-Error 'RPC server unavailable reading the scheduled task' }
+    function New-ScheduledTaskPrincipal { param([Parameter(ValueFromRemainingArguments)]$a) 'principal' }
+    function New-ScheduledTaskAction { param([Parameter(ValueFromRemainingArguments)]$a) 'action' }
+    function New-ScheduledTaskTrigger { param([Parameter(ValueFromRemainingArguments)]$a) 'trigger' }
+    function New-ScheduledTaskSettingsSet { param([Parameter(ValueFromRemainingArguments)]$a) 'settings' }
+    function Register-ScheduledTask { param($TaskName, [Parameter(ValueFromRemainingArguments)]$a) $script:T3Calls.Add("REGISTER $TaskName") }
+    function Enable-ScheduledTask { param($TaskName, [Parameter(ValueFromRemainingArguments)]$a) $script:T3Calls.Add("ENABLE $TaskName") }
+    $script:Failures.Clear()
+    Invoke-PhaseTasks
+    Assert-That ($script:T3Calls.Count -eq 0) 'r10 A3 tasks: a task whose state cannot be read is not registered over' ($script:T3Calls -join ',')
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'TASK_STATE_UNREADABLE*' }).Count -ge 1) 'r10 A3 tasks: the unreadable task is a failure of the run (exit 1)' ($script:Failures -join ',')
+    $script:Failures.Clear()
+}
+
+# ---------------------------------------------------------------- r10 A4: a dry-run LeaseRelease takes no gate lock and reads no lease
+$a4Locks = New-Scratch 'r10-a4-locks'
+$a4 = Invoke-Setup (New-Scratch 'r10-a4-home') @('-Phase', 'LeaseRelease', '-WhatIf', '-LockRoot', $a4Locks, '-StateRoot', (New-Scratch 'r10-a4-state'), '-Workspace', (New-Scratch 'r10-a4-ws'))
+Assert-That (@(Get-ChildItem -LiteralPath $a4Locks -Recurse -Force -ErrorAction SilentlyContinue).Count -eq 0) 'r10 A4 release: -WhatIf creates nothing under the gate lock folder (no lock was taken)' "exit=$($a4.Exit)`n$($a4.Out)"
+Assert-That ($a4.Exit -eq 0 -and $a4.Out -match 'SKIP \(WhatIf\) LeaseRelease') 'r10 A4 release: -WhatIf says it skipped the release (exit 0)' "exit=$($a4.Exit)`n$($a4.Out)"
+
+# ---------------------------------------------------------------- r10 A5: native exit codes stay under Invoke-Native's control whatever the caller's preference
+if ($fnLoaded -and (Test-Has 'Invoke-Native' 'r10 A5 native')) {
+    $savedNative = $global:PSNativeCommandUseErrorActionPreference
+    $global:PSNativeCommandUseErrorActionPreference = $true
+    $a5threw = $false; $a5code = $null
+    try { $a5code = Invoke-Native -Exe 'git' -Arguments @('rev-parse', '--verify', 'refs/heads/r10-no-such-branch-anywhere') -AllowFail } catch { $a5threw = $true }
+    $a5threw2 = $false; $a5code2 = $null
+    try { $a5code2 = Invoke-Native -Exe 'git' -Arguments @('rev-parse', '--verify', 'refs/heads/r10-no-such-branch-anywhere') -OkCodes @(0, 128) } catch { $a5threw2 = $true }
+    $global:PSNativeCommandUseErrorActionPreference = $savedNative
+    Assert-That (-not $a5threw -and $a5code -eq 128) 'r10 A5 native: -AllowFail returns the exit code even when $PSNativeCommandUseErrorActionPreference is $true' "threw=$a5threw code=$a5code"
+    Assert-That (-not $a5threw2 -and $a5code2 -eq 128) 'r10 A5 native: -OkCodes is honoured even when $PSNativeCommandUseErrorActionPreference is $true' "threw=$a5threw2 code=$a5code2"
+}
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
