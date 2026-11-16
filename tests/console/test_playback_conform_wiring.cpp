@@ -199,8 +199,10 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         ASSERT_TRUE(invalidate > 0);
         const QString invalidateBody = src.mid(invalidate, src.indexOf(QStringLiteral("\n}\n"), invalidate) - invalidate);
         ASSERT_TRUE(invalidateBody.contains(QStringLiteral("    m_lastPresentedPlaybackFrame = -1;\n    m_lastDisplayedPlaybackFrame = -1;")));
-        // the record, the clear, the accepted-pending paint check, the paint check, the gate's displayed input
-        ASSERT_EQ(5, countOccurrences(src, QStringLiteral("m_lastDisplayedPlaybackFrame")));
+        // the record, the clear, the accepted-pending paint check, the paint check, the gate's displayed input, and
+        // (CPU-S1-PACE-POST-785-LEVER-1, read-only) openGuiPresentGap's max_gui_busy_frame stamp
+        ASSERT_EQ(6, countOccurrences(src, QStringLiteral("m_lastDisplayedPlaybackFrame")));
+        ASSERT_TRUE(src.contains(QStringLiteral("    m_guiPresentGapFrame = m_lastDisplayedPlaybackFrame;   // the frame whose present opened the gap")));
         // fix iteration 1 (adversary A1 on e052947c): a GL surface's deferred paint -- the frame is displayed only once the surface that
         // was handed its serial has painted it (bounded by kConformPaintWaitMs)
         ASSERT_TRUE(src.indexOf(QStringLiteral("    m_lastDisplayedPlaybackSerial = static_cast<quint64>( readyFrame.requestSerial );"), finish) > finish);
