@@ -3257,7 +3257,14 @@ class EvidenceFactory(RunnerHarness):
         log_sha = hashlib.sha256(log).hexdigest()
         declared = result.get("evidence", {}).get("runLogSnapshot", {}).get("sha256", "").lower()
         man_sha = manifest.get("smokeRunLog", {}).get("sha256", "")
-        iso = [l for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l)]
+        # r16 (r15 adversary A1 and advisory A2): read each record as its body, like Get-DvLogRecordBody: a trailing ` (<path>:<digits>)` is the Qt location
+        # and strips; any other ` (` tail is unreadable (None), so that record is never read whole
+        def body(l: str) -> str | None:
+            i = l.find(" (")
+            if i < 0:
+                return l
+            return l[:i] if re.search(r":\d+\)$", l) and l.rfind(":") > i + 2 else None
+        iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l)]
         return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
                 "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
                 "wrapped": int(f["wrapped"]) != 0, "wrapCount": int(f["wrap_count"]),
@@ -3266,7 +3273,7 @@ class EvidenceFactory(RunnerHarness):
                 "logShaBound": declared == log_sha and (not man_sha or man_sha.lower() == log_sha),
                 # r13 (r13 adversary A2 sibling): one whole settings_store token per record, and it is run_scoped
                 # r15 (r15 adversary A2): and the word settings_store is mentioned exactly once (a quoted second declaration counts)
-                "settingsIsolated": bool(iso) and all([v.lower() for v in re.findall(r"(?<!\S)settings_store=(\S*)", l, re.I)] == ["run_scoped"]
+                "settingsIsolated": bool(iso) and all(l is not None and [v.lower() for v in re.findall(r"(?<!\S)settings_store=(\S*)", l, re.I)] == ["run_scoped"]
                                                       and len(re.findall(r"(?<!(?-i:[A-Za-z0-9_]))settings_store(?!(?-i:[A-Za-z0-9_]))", l, re.I)) == 1
                                                       for l in iso),
                 "fixtureRehearsal": summary.get("fixtureRehearsal"), "clipId": summary.get("clipId")}
@@ -15990,6 +15997,40 @@ class DueWakeDeliveryEvidenceTests(unittest.TestCase):
                                           DVE_LOG=base.format(store))
                 self.assertIsNotNone(out, proc.stdout + proc.stderr)
                 self.assertIs(out, want)
+
+    def test_r16_pass_a1_a_parenthesised_second_settings_store_declaration_refuses_isolation(self) -> None:
+        # r16 adversary A1 on c24d5ee5, its input verbatim: ` (settings_store=venue)` is no Qt location (no `:<digits>)` end), so Get-DvLogRecordBody keeps
+        # the text before it and appends the LOCATION_UNREADABLE sentinel; the isolation reader then saw ONE declaration (run_scoped) and accepted the
+        # record. A record that ends in the sentinel lost its tail, so it is never read whole: not isolated. A real location suffix still strips.
+        base = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated {}\nplayback_smoke.summary session=3\n"
+        for name, store, want in (("A1 verbatim", "settings_store=run_scoped (settings_store=venue)", False),
+                                  ("unreadable tail without a store word", "settings_store=run_scoped (not-a-location)", False),
+                                  ("a real Qt location", "settings_store=run_scoped (C:/settings_store/MainWindow.cpp:1)", True),
+                                  ("a real Qt location, no path store word", "settings_store=run_scoped (C:/src/MainWindow.cpp:1)", True),
+                                  ("no suffix", "settings_store=run_scoped", True)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated | ConvertTo-Json -Compress",
+                                          DVE_LOG=base.format(store))
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertIs(out, want)
+
+    def test_r16_pass_a1_the_python_mirror_reads_the_record_body_like_the_module(self) -> None:
+        # r16 adversary advisory A2: derive_block (the independent mirror) counted settings_store on the raw located line, so a real Qt location
+        # holding the word refused isolation where the module accepts. It reads the body: a real location strips, an unreadable tail refuses.
+        for store, want in (("settings_store=run_scoped (C:/settings_store/MainWindow.cpp:1)", True),
+                            ("settings_store=run_scoped (settings_store=venue)", False),
+                            ("settings_store=run_scoped", True)):
+            with self.subTest(store=store):
+                log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated " + store +
+                       "\nplayback_smoke.summary session=3 source_advanced=1200 required_source_frames=600 native_fps=59.94 pace_fps=59.94 "
+                       "fps_override=0 wrapped=0 wrap_count=0\n")
+                with tempfile.TemporaryDirectory() as td:
+                    ev = Path(td)
+                    (ev / "logs").mkdir()
+                    (ev / "logs" / "smoke-run.log").write_bytes(log.encode("utf-8"))
+                    (ev / "result.json").write_text("{}", encoding="utf-8")
+                    (ev / "summary.json").write_text("{}", encoding="utf-8")
+                    self.assertIs(EvidenceFactory.derive_block(ev)["settingsIsolated"], want)
 
 
 @requires_windows_pwsh

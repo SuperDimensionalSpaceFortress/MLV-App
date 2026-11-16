@@ -1147,9 +1147,12 @@ function Get-DvSmokeSummaryFields {
         # do not say which store ran, so either refuses isolation
         # r15 (r15 adversary A2 on d991b0af, its input: `settings_store=run_scoped "settings_store=venue"`): a mention is the WORD settings_store bounded
         # by any non-name character ($script:DvNameChar), so a quoted or punctuated declaration counts; exactly one mention, and it is that whole token
+        # r16 (r15 adversary A1 on c24d5ee5, its input: `settings_store=run_scoped (settings_store=venue)`): a record that ends in the LOCATION_UNREADABLE
+        # sentinel lost its tail, and the tail may have named the store, so such a record is never read whole: not isolated (as the session readers do)
         $runScoped = {
             param([string]$x)
-            $mentions = [regex]::Matches($x, '(?<!' + $script:DvNameChar + ')settings_store(?!' + $script:DvNameChar + ')', $script:DvCi).Count
+            if ($x.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { return $false }
+            $mentions =[regex]::Matches($x, '(?<!' + $script:DvNameChar + ')settings_store(?!' + $script:DvNameChar + ')', $script:DvCi).Count
             $stores = [regex]::Matches($x, '(?<!\S)settings_store=(?<v>\S*)', $script:DvCi)
             ($mentions -eq 1) -and ($stores.Count -eq 1) -and [string]::Equals($stores[0].Groups['v'].Value, 'run_scoped', [StringComparison]::OrdinalIgnoreCase)
         }
