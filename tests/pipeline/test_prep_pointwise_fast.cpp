@@ -72,6 +72,34 @@ struct OmpThreads
     int previous;
 };
 
+/* CPU-S1-FS-SPIKE-TEAM-PARTITION-1 r3 (sol H3; adversary pass 2 A4 / pass 3 A1): the OpenMP limits a
+ * test inherits from its environment. dyn-var and max-active-levels-var can be set through the API,
+ * so they are pinned for the scope (dynamic off, at least one active level) and restored after.
+ * OMP_THREAD_LIMIT is read once when the runtime starts and no API lifts it (unsetting the variable
+ * in-process changes nothing), so a team the runtime cannot give is expected at its cap
+ * (ompTeamExpected) and the caller reports that it was capped. */
+struct OmpRuntimeLimitsScope
+{
+    OmpRuntimeLimitsScope() : dynamic(omp_get_dynamic()), levels(omp_get_max_active_levels())
+    {
+        omp_set_dynamic(0);
+        if (levels < 1) omp_set_max_active_levels(1);
+    }
+    ~OmpRuntimeLimitsScope()
+    {
+        omp_set_dynamic(dynamic);
+        omp_set_max_active_levels(levels);
+    }
+    int dynamic;
+    int levels;
+};
+
+int ompTeamExpected(int requested)
+{
+    const int limit = omp_get_thread_limit();
+    return (limit > 0 && limit < requested) ? limit : requested;
+}
+
 void openFixture(MlvPipelineFixture & fixture)
 {
     QString error_message;
@@ -314,7 +342,11 @@ void checkConfig(const std::string & label, const GpuPreviewProcessingConfig & c
         EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
         EnvScope forced("MLVAPP_FORCE_THREADS", threadText.c_str());
         EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
+        OmpRuntimeLimitsScope limits;
         OmpThreads scope(threads);
+        const int team = ompTeamExpected(threads);
+        if (team != threads)
+            std::printf("[PREP-FAST] %s: team %d capped to %d by omp_get_thread_limit()\n", tag.c_str(), threads, team);
 
         GpuPreviewProcessingCpuSpans spans;
         std::vector<uint16_t> out16(frame.size(), 0);
@@ -323,7 +355,7 @@ void checkConfig(const std::string & label, const GpuPreviewProcessingConfig & c
             ::minitest::fail(__FILE__, __LINE__, "fast-path refusal", tag + " expected=\"" + expectedRefusal
                              + "\" got=\"" + spans.pointwiseFastRefusal + "\"");
         ASSERT_EQ(admitted, spans.pointwiseFast);
-        ASSERT_EQ(threads, spans.pointwiseOmpThreads);
+        ASSERT_EQ(team, spans.pointwiseOmpThreads);
         int first = -1;
         int worst = maxAbsDiff16(out16, ref, &first);
         if (worst != 0) failDiff(__FILE__, __LINE__, "Timed 16-bit == reference", tag, worst, first);
@@ -335,7 +367,7 @@ void checkConfig(const std::string & label, const GpuPreviewProcessingConfig & c
                                                  width, height, &spans8);
         ASSERT_TRUE(!spans8.fused8);
         ASSERT_EQ(admitted, spans8.pointwiseFast);
-        ASSERT_EQ(threads, spans8.pointwiseOmpThreads);
+        ASSERT_EQ(team, spans8.pointwiseOmpThreads);
         worst = maxAbsDiff8(out8, ref, &first);
         if (worst != 0) failDiff(__FILE__, __LINE__, "To8 16-bit route == reference >> 8", tag, worst, first);
 
@@ -347,7 +379,7 @@ void checkConfig(const std::string & label, const GpuPreviewProcessingConfig & c
                                                      width, height, &spansF);
             ASSERT_TRUE(spansF.fused8);
             ASSERT_EQ(admitted, spansF.pointwiseFast);
-            ASSERT_EQ(threads, spansF.pointwiseOmpThreads);
+            ASSERT_EQ(team, spansF.pointwiseOmpThreads);
             worst = maxAbsDiff8(fused, ref, &first);
             if (worst != 0) failDiff(__FILE__, __LINE__, "fused 8-bit == reference >> 8", tag, worst, first);
         }
@@ -1139,17 +1171,21 @@ TEST(PrepPointwiseFast, PrepTeamPartitionIsByteIdenticalAtTeams1And6And16)
     gpuPreviewProcessingApplyCpuReference(laOn, frame.data(), ref.data(), kMatrixWidth, kMatrixHeight);
     EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
     EnvScope prepUnset("MLVAPP_PLAYBACK_PREP_OMP_THREADS", nullptr);
+    OmpRuntimeLimitsScope limits;
+    std::string capped;   /* teams the runtime's thread limit could not give (r3: skip, never a false failure) */
     for (int threads : { 1, 6, 16 })
     {
         const std::string threadText = std::to_string(threads);
         EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
         EnvScope forced("MLVAPP_FORCE_THREADS", threadText.c_str());
         OmpThreads scope(threads);
+        const int team = ompTeamExpected(threads);
+        if (team != threads) capped += " team" + threadText + "->" + std::to_string(team);
         GpuPreviewProcessingCpuSpans spans;
         std::vector<uint16_t> out16(frame.size(), 0);
         gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), out16.data(), kMatrixWidth, kMatrixHeight, &spans);
         ASSERT_TRUE(spans.pointwiseFast);
-        ASSERT_EQ(threads, spans.pointwiseOmpThreads);
+        ASSERT_EQ(team, spans.pointwiseOmpThreads);
         int first = -1;
         int worst = maxAbsDiff16(out16, ref, &first);
         if (worst != 0) failDiff(__FILE__, __LINE__, "partition Timed 16-bit == reference", "team" + threadText, worst, first);
@@ -1158,7 +1194,7 @@ TEST(PrepPointwiseFast, PrepTeamPartitionIsByteIdenticalAtTeams1And6And16)
         std::vector<uint8_t> out8(frame.size(), 0);
         gpuPreviewProcessingApplyCpuReferenceTo8(laOn, frame.data(), scratch.data(), out8.data(),
                                                  kMatrixWidth, kMatrixHeight, &spans8);
-        ASSERT_EQ(threads, spans8.pointwiseOmpThreads);
+        ASSERT_EQ(team, spans8.pointwiseOmpThreads);
         worst = maxAbsDiff8(out8, ref, &first);
         if (worst != 0) failDiff(__FILE__, __LINE__, "partition To8 == reference >> 8", "team" + threadText, worst, first);
     }
@@ -1168,15 +1204,21 @@ TEST(PrepPointwiseFast, PrepTeamPartitionIsByteIdenticalAtTeams1And6And16)
         EnvScope prep("MLVAPP_PLAYBACK_PREP_OMP_THREADS", "6");
         const int expected = std::min(6, mlvappEffectivePlaybackWorkerThreadCount());
         ASSERT_EQ(expected, mlvappPlaybackPrepWorkerThreadCount());
+        const int team = ompTeamExpected(expected);
+        if (team != expected) capped += " knob6->" + std::to_string(team);
         GpuPreviewProcessingCpuSpans spans;
         std::vector<uint16_t> out16(frame.size(), 0);
         gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), out16.data(), kMatrixWidth, kMatrixHeight, &spans);
         ASSERT_TRUE(spans.pointwiseFast);
-        ASSERT_EQ(expected, spans.pointwiseOmpThreads);
+        ASSERT_EQ(team, spans.pointwiseOmpThreads);
         int first = -1;
         const int worst = maxAbsDiff16(out16, ref, &first);
         if (worst != 0) failDiff(__FILE__, __LINE__, "prep knob 6 == reference", "knob6", worst, first);
     }
+    if (!capped.empty())
+        SKIP_TEST("bytes matched, but omp_get_thread_limit()=" + std::to_string(omp_get_thread_limit())
+                  + " (OMP_THREAD_LIMIT, fixed at runtime start) capped" + capped
+                  + ", so the exact teams this test pins were not exercised");
     std::printf("[PREP-FAST] partition teams 1,6,16 and knob 6 byte-identical\n");
 }
 
