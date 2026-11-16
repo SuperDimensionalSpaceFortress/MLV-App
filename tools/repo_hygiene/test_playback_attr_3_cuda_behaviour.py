@@ -1541,11 +1541,32 @@ class StagedBuildNeverReplacedTests(_PwshCase):
         files = [tools / "bachelor" / "AttrCudaArtifacts.psm1", tools / "bachelor" / "playback-attr-3-cuda-stage-job.ps1", tools / "bachelor" / "playback-attr-3-cuda-assemble.ps1",
                  tools / "bachelor" / "playback-attr-3-cuda-job.ps1", tools / "bachelor" / "reference-frame-runner-job.ps1",
                  tools / "dual-venue" / "VenueChain.psm1", tools / "dual-venue" / "Invoke-VenueBaseline.ps1", tools / "dual-venue" / "Invoke-VenueStageNightly.ps1",
-                 tools / "dual-venue" / "Invoke-VenueLeaseBatch.ps1"]
+                 tools / "dual-venue" / "Invoke-VenueLeaseBatch.ps1", tools / "dual-venue" / "VenueStageReuse.psm1", tools / "dual-venue" / "New-VenueFlavorPair.ps1"]
         culture = re.compile(r"(?m)^(?!\s*#)[^\n]*?(?:(?:[sS]ourceCommit|ExpectedCommit|\$commit\b|\$cachedCommit|\$declaredCommit)(?!\.Length)[\w.\[\]()]*\s+-[ic]?(?:eq|ne)\b|-[ic]?(?:eq|ne)\s+\$(?:SourceCommit|ExpectedSourceCommit|ExpectedCommit|commit|cachedCommit)\b(?!\.Length))[^\n]*")
         hits = [f"{f.name}:{text.count(chr(10), 0, m.start()) + 1}: {m.group(0).strip()[:140]}"
                 for f in files for text in [f.read_text(encoding="utf-8")] for m in culture.finditer(text)]
         self.assertEqual(hits, [], "a commit string is compared by culture (it ignores U+200B and other format characters):\n" + "\n".join(hits))
+
+    def test_r24_a2_the_dll_pair_reuse_compares_the_declared_commit_and_job_id_ordinally(self) -> None:
+        # adversary pass-26 A2 (VenueStageReuse.psm1:84, pre-existing, same class as pass-25 A1): -cne is a culture comparison, so a reused DLL pair's manifest declaring the
+        # commit (or its job id) with a trailing U+200B read as the requested one and the pair was reused.
+        reuse = ROOT / "tools" / "profiling" / "dual-venue" / "VenueStageReuse.psm1"
+        job_id = f"playback-attr-3-cuda-dllpair-{SHA_FIXTURE[:12]}"
+
+        def reusable(tag: str, declared_commit: str, declared_job: str) -> str:
+            outbox = self.tmp / f"r24-outbox-{tag}"
+            (outbox / f"{job_id}.artifacts").mkdir(parents=True)
+            (outbox / f"{job_id}.result.json").write_text(json.dumps({"jobId": job_id, "exitCode": 0, "stdout": f"RESULT=DLL_PAIR_OK SOURCE={SHA_FIXTURE}\n"}), encoding="utf-8")
+            (outbox / f"{job_id}.artifacts" / "dll-pair-manifest.json").write_text(json.dumps({"sourceCommit": declared_commit, "jobId": declared_job}), encoding="utf-8")
+            script = self.tmp / f"r24-reuse-{tag}.ps1"
+            script.write_text(f"Import-Module '{reuse}' -Force\n(Get-DllPairReuse -Outbox '{outbox}' -JobId '{job_id}' -Sha '{SHA_FIXTURE}').Reusable\n", encoding="utf-8")
+            proc = _run_pwsh_file(script)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout.strip()
+
+        self.assertEqual(reusable("plain", SHA_FIXTURE, job_id), "True")
+        self.assertEqual(reusable("zwsp-commit", SHA_FIXTURE + self.ZW, job_id), "False", "a manifest declaring the commit with a U+200B was reused")
+        self.assertEqual(reusable("zwsp-job", SHA_FIXTURE, job_id + self.ZW), "False", "a manifest declaring the job id with a U+200B was reused")
 
     def test_r9_the_stage_lock_is_one_for_every_sha_that_shares_the_cache_names(self) -> None:
         # r9 fix iteration (adversary A1 on 9825bfd9): the lock was keyed on the full sha, so two commits with the same 12 hex (the same cache files) never

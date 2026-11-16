@@ -69,7 +69,7 @@ function Get-DllPairReuse {
     $art = Join-Path $Outbox "$JobId.artifacts"
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { return (& $no 'result-missing') }
     try { $raw = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop; $r = $raw | ConvertFrom-Json -ErrorAction Stop } catch { return (& $no 'result-unreadable') }
-    if ([string]$r.jobId -cne $JobId) { return (& $no "jobId-mismatch ($([string]$r.jobId))") }
+    if (-not [string]::Equals([string]$r.jobId, $JobId, [StringComparison]::Ordinal)) { return (& $no "jobId-mismatch ($([string]$r.jobId))") }
     $code = 0
     if (-not [int]::TryParse([string]$r.exitCode, [ref]$code) -or $code -ne 0) { return (& $no "exitCode-not-0 ($([string]$r.exitCode))") }
     foreach ($flag in 'timedOut', 'cancelled', 'queueExpired', 'orphaned') {
@@ -81,8 +81,9 @@ function Get-DllPairReuse {
     $mp = Join-Path $art 'dll-pair-manifest.json'
     if (-not (Test-Path -LiteralPath $mp -PathType Leaf)) { return (& $no 'artifacts-manifest-missing') }
     try { $man = Get-Content -LiteralPath $mp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return (& $no 'artifacts-manifest-unreadable') }
-    if ([string]$man.sourceCommit -cne $Sha) { return (& $no "manifest-sourceCommit-mismatch ($([string]$man.sourceCommit))") }
-    if ([string]$man.jobId -cne $JobId) { return (& $no "manifest-jobId-mismatch ($([string]$man.jobId))") }
+    # r24 (adversary pass-26 A2): ordinal, never -cne (a culture comparison that ignores U+200B; the case-sensitive operators included)
+    if (-not [string]::Equals([string]$man.sourceCommit, $Sha, [StringComparison]::Ordinal)) { return (& $no "manifest-sourceCommit-mismatch ($([string]$man.sourceCommit))") }
+    if (-not [string]::Equals([string]$man.jobId, $JobId, [StringComparison]::Ordinal)) { return (& $no "manifest-jobId-mismatch ($([string]$man.jobId))") }
     [pscustomobject]@{ Reusable = $true; Reason = 'dll-pair-already-built'; EndedUtc = [string]$r.endedUtc; Line = $m.Value.TrimEnd(); ArtifactsDir = $art }
 }
 
