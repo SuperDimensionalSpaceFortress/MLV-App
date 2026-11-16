@@ -67,6 +67,9 @@ param(
     # Where the gate/lease-release exclusion lock lives. A machine-wide place that does NOT follow -StateRoot, so two runs with different state roots
     # still exclude each other (adversary pass 2, A2). Tests point it at a scratch folder.
     [string]$LockRoot = 'C:\ProgramData\MlvWorkstation-locks',
+    # p5 A6: a -LockRoot other than the machine-wide default is a scratch/test seam; Gate (Lease) and LeaseRelease refuse it unless this switch says so.
+    # A registered task never carries -LockRoot or this switch, so every task and every release on a host uses the same lock.
+    [switch]$AllowScratchLockRoot,
     # The two venue heartbeat files -Phase Verify must be able to read (fail closed otherwise, README step 6b).
     # Overridable so tests can point them at scratch files; production never passes these.
     [string]$UltraMagnusHeartbeatPath = '\\Ultra-Magnus\g\Temp\mlv-gpu-profile\agent\heartbeat.txt',
@@ -426,12 +429,16 @@ function Invoke-PhasePackages {
 # ---------------------------------------------------------------------------------------------
 # Phase: Ssh (inbound key-only sshd with pwsh shell; outbound keys for GitHub and BACHELOR)
 # ---------------------------------------------------------------------------------------------
+# p5 A7: OpenSSH accepts '=' as well as whitespace between a keyword and its argument, and a quoted keyword. Every recognizer below uses these.
+$SshdMatchKeywordRx = '^\s*"?Match"?(\s|=)'
+$SshdIncludeKeywordRx = '^\s*"?Include"?(\s|=)'
+$SshdPasswordYesRx = '^\s*"?(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)"?(\s+|\s*=\s*)"?yes\b'
 function Set-SshdOption {
     param([string[]]$Lines, [string]$Name, [string]$Value)
-    $matchIdx = [Array]::FindIndex($Lines, [Predicate[string]] { param($l) $l -match '^\s*Match\s' })
+    $matchIdx = [Array]::FindIndex($Lines, [Predicate[string]] { param($l) $l -match $SshdMatchKeywordRx })
     $end = if ($matchIdx -ge 0) { $matchIdx } else { $Lines.Count }
     for ($i = 0; $i -lt $end; $i++) {
-        if ($Lines[$i] -match "^\s*#?\s*$Name\s") { $Lines[$i] = "$Name $Value"; return , $Lines }
+        if ($Lines[$i] -match "^\s*#?\s*`"?$Name`"?(\s|=)") { $Lines[$i] = "$Name $Value"; return , $Lines }
     }
     return , (@("$Name $Value") + $Lines)
 }
@@ -445,12 +452,12 @@ function Set-SshdKeyOnlyConfig {
     [string[]]$lines = @(Get-Content -LiteralPath $ConfigPath)
     # An Include pulls in files this function does not read (a global PasswordAuthentication yes placed there, or a Match rule, still wins; adversary pass 2,
     # A6), so a config that includes anything is refused rather than judged by its main file alone.
-    $inc = [Array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match '^\s*Include(\s|=)' })
+    $inc = [Array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match $SshdIncludeKeywordRx })
     if ($inc -ge 0) { throw "sshd_config line $($inc + 1) ('$($lines[$inc].Trim())') includes other files, which this script does not inspect; inline them by hand and re-run -Phase Ssh. Nothing was changed." }
-    $firstMatch = [Array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match '^\s*Match\s' })
+    $firstMatch = [Array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match $SshdMatchKeywordRx })
     if ($firstMatch -ge 0) {
         for ($i = $firstMatch; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^\s*(PasswordAuthentication|KbdInteractiveAuthentication)(\s+|\s*=\s*)"?yes\b') {
+            if ($lines[$i] -match $SshdPasswordYesRx) {
                 throw "sshd_config line $($i + 1) ('$($lines[$i].Trim())') re-enables password authentication inside a Match block; key-only is the rule, so remove it by hand and re-run -Phase Ssh. Nothing was changed."
             }
         }
@@ -664,6 +671,37 @@ $ExcludeDirs = @('.git', 'node_modules', '__pycache__', 'worktrees', 'ssh', 'ope
 # above) is read and matched; a file that matches, that is larger than the limit, or that cannot be read is removed (fail closed: an
 # unreadable file used to be scanned as empty text and then archived). A file that cannot be removed is reported as Uncleared, and the
 # caller refuses to write the bundle.
+# p5 A9: the verdict on ONE staged file, shared by the scan and by the post-archive re-check: '' = clean, else the reason it must not ship.
+function Get-StagedFileVerdict {
+    param([System.IO.FileInfo]$File, [long]$MaxScanBytes = 26214400)
+    if ($File.Length -gt $MaxScanBytes) { return 'larger than the scan limit' }
+    $t = $null
+    try { $t = [IO.File]::ReadAllText($File.FullName) } catch { return 'unreadable' }
+    if ($t -and (Test-CredentialText $t)) { return 'credential pattern' }
+    return ''
+}
+
+# Read-only: the relative paths of staged files that are NOT clean right now (the archive step runs this again after tar, because a file can change
+# between the scan and the moment tar reads it; adversary pass 5, A9).
+function Get-StagedCredentialHits {
+    param([string]$Stage, [long]$MaxScanBytes = 26214400)
+    $hits = [System.Collections.Generic.List[string]]::new()
+    foreach ($f in @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)) {
+        $why = Get-StagedFileVerdict -File $f -MaxScanBytes $MaxScanBytes
+        if ($why) { $hits.Add("$($f.FullName.Substring($Stage.Length).TrimStart('\')) ($why)") }
+    }
+    return $hits.ToArray()
+}
+
+# p5 A9: a private copy of a bundle FOLDER. Import scans and then copies; between the two a writer could swap the file, so both work from this
+# snapshot, which only this run can write to. Returns the snapshot path.
+function New-ImportSnapshot {
+    param([string]$From, [string]$To)
+    [void][IO.Directory]::CreateDirectory($To)
+    Invoke-Robocopy $From $To @() @('/E', '/COPY:DAT')
+    return $To
+}
+
 function Invoke-StagedSecretScan {
     param([string]$Stage, [long]$MaxScanBytes = 26214400)
     $removed = [System.Collections.Generic.List[string]]::new()
@@ -671,13 +709,7 @@ function Invoke-StagedSecretScan {
     # -Force: robocopy copies Hidden and System files, and Get-ChildItem hides them by default (adversary pass 2, A3).
     foreach ($f in @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Force)) {
         $rel = $f.FullName.Substring($Stage.Length).TrimStart('\')
-        $why = ''
-        if ($f.Length -gt $MaxScanBytes) { $why = 'larger than the scan limit' }
-        else {
-            $t = $null
-            try { $t = [IO.File]::ReadAllText($f.FullName) } catch { $why = 'unreadable' }
-            if (-not $why -and $t -and (Test-CredentialText $t)) { $why = 'credential pattern' }
-        }
+        $why = Get-StagedFileVerdict -File $f -MaxScanBytes $MaxScanBytes
         if (-not $why) { continue }
         try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed.Add("$rel ($why)") }
         catch { $uncleared.Add("$rel ($why; could not be removed)") }
@@ -789,6 +821,13 @@ function Invoke-PhaseExport {
         Write-AsciiFile (Join-Path $stage 'MANIFEST.txt') ("mlv-migrate-bundle v1`r`nsource=$env:COMPUTERNAME user=$env:USERNAME profile=$env:USERPROFILE created=$stamp`r`nfiles=$($files.Count) bytes=$sum`r`n")
         $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
         [void](Invoke-Native -Exe $tar -Arguments @('-a', '-c', '-f', $zip, '-C', $stage, '.'))
+        # p5 A9: a staged file can change between the scan and the moment tar reads it. Judge the stage again now the archive exists; a hit means
+        # the archive may hold it, so the archive is deleted and the run fails (the bundle is never offered).
+        $late = @(Get-StagedCredentialHits -Stage $stage)
+        if ($late.Count) {
+            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+            throw "staged file(s) changed after the secret scan and now fail it, so the archive was deleted: $($late -join '; ')"
+        }
         $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
         Write-AsciiFile "$zip.sha256" "$hash  $(Split-Path -Leaf $zip)`r`n"
         Write-Log "bundle $zip sha256=$hash files=$($files.Count) bytes=$sum" 'OK'
@@ -912,6 +951,14 @@ function Invoke-PhaseImport {
         }
     }
     if (-not $WhatIfPreference -and -not (Test-Path -LiteralPath (Join-Path $src 'MANIFEST.txt'))) { Write-Log "not a migrate bundle (no MANIFEST.txt): $src" 'ERROR'; return }
+    # p5 A9: from here on the bundle is read from a private snapshot (only this run writes it): the credential scan and the copy then see the same bytes,
+    # whatever happens to the bundle folder in between. Removed again after the copy.
+    $importSnapshot = $null
+    if (-not $WhatIfPreference) {
+        $importSnapshot = Join-Path $StateRoot "import-snapshot-$stamp"
+        Invoke-Step "Snapshot the bundle to $importSnapshot (the scan and the copy read the same bytes)" { [void](New-ImportSnapshot -From $src -To $importSnapshot) }
+        if (Test-Path -LiteralPath $importSnapshot -PathType Container) { $src = $importSnapshot } else { Write-Log 'the bundle snapshot could not be made; nothing was imported' 'ERROR'; return }
+    }
     $h = $env:USERPROFILE
     Invoke-Step 'Back up existing ~/.claude CLAUDE.md and settings.json' {
         $b = Join-Path $StateRoot "backups\home-claude-$stamp"; [void][IO.Directory]::CreateDirectory($b)
@@ -946,6 +993,9 @@ function Invoke-PhaseImport {
         Invoke-ImportRobocopy "$src\project-codex-state\doctrine" "$Repo\.codex-state\doctrine" (@('/E', '/XO') + $inX)
         Invoke-ImportRobocopy "$src\reference" "$StateRoot\reference" (@('/E', '/XO') + $inX)
     }
+    if ($importSnapshot -and (Test-Path -LiteralPath $importSnapshot)) {
+        try { Remove-Item -LiteralPath $importSnapshot -Recurse -Force -ErrorAction Stop } catch { Write-Log "could not remove the import snapshot $importSnapshot : $($_.Exception.Message)" 'WARN' }
+    }
     # MINI3-CUTOVER-STATE-GAPS-1 (a): claims came across without their fleet-runs run dirs. A claim younger than 6 h with no run dir
     # reads 'receipt state none' and blocks its card, so those claims are quarantined, not carried.
     Invoke-Step 'Quarantine foreign hub claims (run dir absent on this host, under 24 h old)' {
@@ -976,7 +1026,8 @@ function Invoke-PhaseImport {
 function Get-GateTaskArgument {
     param([string]$Pwsh, [string]$Self, [hashtable]$Spec)
     $arg = "--headless `"$Pwsh`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Self`" -Phase Gate -GateMode $($Spec.Mode) -GateScript `"$($Spec.Script)`""
-    foreach ($k in 'StateRoot', 'Workspace', 'MlvTmp', 'LockRoot') {
+    # 'LockRoot' is deliberately NOT carried (p5 A6): the gate lock is the one machine-wide default for every task and every release.
+    foreach ($k in 'StateRoot', 'Workspace', 'MlvTmp') {
         if ($script:SetupBound.ContainsKey($k)) { $arg += " -$k `"$(Get-Variable -Name $k -ValueOnly)`"" }
     }
     if ($Spec.ArgLine) { $arg += " -GateArgLine `"$($Spec.ArgLine)`"" }
@@ -1013,8 +1064,17 @@ function Invoke-PhaseTasks {
 # ---------------------------------------------------------------------------------------------
 # Phase: Gate (what the scheduled tasks run)
 # ---------------------------------------------------------------------------------------------
+# p5 A6: the lock a Lease-gated run holds and the one a release takes must be the same file. A -LockRoot that differs from the machine-wide default
+# is allowed only with the explicit -AllowScratchLockRoot seam (tests); anything else would let a release run under a gate holding another lock.
+function Test-LockRootIsMachineWide {
+    $default = 'C:\ProgramData\MlvWorkstation-locks'
+    if ($LockRoot.TrimEnd('\') -ieq $default) { return $true }
+    return [bool]$AllowScratchLockRoot
+}
+
 function Invoke-PhaseGate {
     $tag = "gate[$GateMode] $(Split-Path -Leaf $GateScript)"
+    if ($GateMode -eq 'Lease' -and -not (Test-LockRootIsMachineWide)) { Write-Log "$tag refused: LOCKROOT_NOT_MACHINE_WIDE ($LockRoot is not the machine-wide gate lock folder)" 'ERROR'; exit 4 }
     if (Test-Path -LiteralPath (Join-Path $StateRoot 'PAUSED')) { Write-Log "$tag skipped: PAUSED file present"; exit 0 }
     if (-not $GateScript -or -not (Test-Path -LiteralPath $GateScript)) { Write-Log "$tag skipped: target missing ($GateScript)" 'WARN'; exit 0 }
     # -WhatIf is a dry run: the target is never invoked (adversary A9).
@@ -1101,14 +1161,29 @@ function Get-MeterInstallSpecs {
     )
 }
 
+# True for the error Get-ScheduledTask raises when the named task does not exist (and only that one).
+function Test-ScheduledTaskNotFound {
+    param($ErrorRecord)
+    if (-not $ErrorRecord) { return $false }
+    $id = "$($ErrorRecord.FullyQualifiedErrorId)"
+    return ($ErrorRecord.CategoryInfo.Category -eq 'ObjectNotFound') -or ($id -match 'CmdletizationQuery_NotFound|ObjectNotFound|No MSFT_ScheduledTask objects found')
+}
+
 # r3 A7: what a meter task looked like before its -Install. Existed / WasEnabled (existed and not Disabled) / Xml (kept only for a task that
 # existed Disabled, so its own gated action can be put back). A read that fails counts as "task absent" for Existed but leaves WasEnabled false,
 # so the after-step still disables whatever the install created.
 function Get-MeterTaskSnapshot {
     param([string]$Name)
     $t = $null
-    try { $t = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction SilentlyContinue } catch { $t = $null }
-    $snap = @{ Existed = [bool]$t; WasEnabled = $false; Xml = $null }
+    # p5 A5: "no such task" and "could not read the task" are different answers. An unreadable task is NOT taken for an absent one (it may be one the
+    # owner had enabled): Unreadable = $true, and the install is not run for it (Invoke-MeterInstalls).
+    $unreadable = $false
+    try { $t = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop }
+    catch {
+        $t = $null
+        if (-not (Test-ScheduledTaskNotFound $_)) { $unreadable = $true }
+    }
+    $snap = @{ Existed = [bool]$t; WasEnabled = $false; Xml = $null; Unreadable = $unreadable }
     if ($t) {
         $snap.WasEnabled = ("$($t.State)" -ne 'Disabled')
         if (-not $snap.WasEnabled) { try { $snap.Xml = [string](Export-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop) } catch { $snap.Xml = $null } }
@@ -1122,7 +1197,21 @@ function Restore-MeterTaskState {
     param([string]$Name, [hashtable]$Before)
     if ($Before.WasEnabled) { return }
     $now = $null
-    try { $now = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction SilentlyContinue } catch { $now = $null }
+    $readFailed = $false
+    try { $now = Get-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop }
+    catch { $now = $null; if (-not (Test-ScheduledTaskNotFound $_)) { $readFailed = $true } }
+    if ($readFailed) {
+        # p5 A5: the state after the install cannot be read, so it is not assumed absent: disable it (idempotent, and it was not enabled before) and
+        # report; a disable that also fails is a failure of this run (exit 1).
+        try {
+            [void](Disable-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop)
+            Write-Log "METER_TASK_STATE_UNREADABLE $Name (could not read it after -Install; it was Disabled to be safe)" 'WARN'
+        } catch {
+            Write-Log "METER_TASK_LEFT_ENABLED $Name (state unreadable after -Install and Disable failed: $($_.Exception.Message)); disable it by hand: Disable-ScheduledTask -TaskName $Name" 'ERROR'
+            $script:Failures.Add("METER_TASK_LEFT_ENABLED $Name")
+        }
+        return
+    }
     if (-not $now -or "$($now.State)" -eq 'Disabled') { return }
     try {
         if ($Before.Xml) { [void](Register-ScheduledTask -TaskName $Name -TaskPath '\' -Xml $Before.Xml -Force -ErrorAction Stop) }
@@ -1148,11 +1237,20 @@ function Invoke-MeterInstalls {
         # r3 A7: snapshot the task BEFORE the child -Install (which registers it ENABLED, outside this script's gate); afterwards a task that was not
         # enabled before is put back Disabled (see Restore-MeterTaskState).
         $before = Get-MeterTaskSnapshot -Name $m.Name
+        if ($before.Unreadable) {
+            # p5 A5: the install registers its task ENABLED outside the gate; without a readable "before" its effect could not be undone correctly.
+            Write-Log "METER_INSTALL_SKIPPED_STATE_UNREADABLE $($m.Name) (the task state could not be read before -Install, so nothing was installed)" 'ERROR'
+            $script:Failures.Add("METER_INSTALL_SKIPPED_STATE_UNREADABLE $($m.Name)")
+            continue
+        }
         Write-Log "DO   meter -Install $($m.Name) ($($m.Script))"
-        $out = @(& $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $m.Script -Install 2>&1 | ForEach-Object { "$_" })
-        $code = $LASTEXITCODE
-        foreach ($o in $out) { if ($o.Trim()) { Write-Log "    $($o.TrimEnd())" } }
-        Restore-MeterTaskState -Name $m.Name -Before $before
+        $out = @(); $code = 1
+        # p5 A5: the restore runs in finally, so a failing log write (or any throw) between the install and here still puts the task back.
+        try {
+            $out = @(& $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $m.Script -Install 2>&1 | ForEach-Object { "$_" })
+            $code = $LASTEXITCODE
+            foreach ($o in $out) { if ($o.Trim()) { Write-Log "    $($o.TrimEnd())" } }
+        } finally { Restore-MeterTaskState -Name $m.Name -Before $before }
         if ($code -eq 0) { Write-Log "meter -Install ok: $($m.Name)" 'OK'; continue }
         if (($out -join "`n") -match 'SBP windowless launcher is absent') {
             Write-Log "METER_INSTALL_UNSUPPORTED_HOST $($m.Name) (its -Install needs the approved SBP windowless launcher, absent on $env:COMPUTERNAME; nothing was written; OPEN: make the board-root -Install work without it)" 'WARN'
@@ -1287,6 +1385,7 @@ foreach ($p in $run) {
         'LeaseRelease' {
             # The gate lock is held EXCLUSIVE across the holder check and the push (adversary pass 2, A1/A2): no Lease-gated run can be mid-flight, or
             # start, until the lease has moved. Busy = a Lease-gated task is inside its target on this host.
+            if (-not (Test-LockRootIsMachineWide)) { Write-Log "LOCKROOT_NOT_MACHINE_WIDE: $LockRoot is not the machine-wide gate lock folder, so this release could not exclude a running gate" 'ERROR'; exit 4 }
             $xlock = Open-GateLock -Root $LockRoot -Mode Exclusive
             if (-not $xlock) { Write-Log 'a Lease-gated task is running on this host (gate lock busy); releasing now would hand the lease over under it. Wait for it to end, then re-run.' 'ERROR'; exit 4 }
             try {

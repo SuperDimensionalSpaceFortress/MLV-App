@@ -40,10 +40,14 @@ function New-Scratch([string]$Name) {
 }
 
 # Runs Setup-MlvWorkstation.ps1 as a child process under a scratch USERPROFILE. Returns @{ Exit; Out }.
+$script:AutoScratchLock = $true
 function Invoke-Setup([string]$Home_, [string[]]$SetupArgs) {
     $saved = $env:USERPROFILE
     try {
         $env:USERPROFILE = $Home_
+        # p5 A6: a non-default -LockRoot is refused unless the run passes the explicit test seam -AllowScratchLockRoot; the helper adds it
+        # (tests use scratch lock folders) except where a test turns $script:AutoScratchLock off to prove the refusal.
+        if ($script:AutoScratchLock -and ($SetupArgs -contains '-LockRoot') -and ($SetupArgs -notcontains '-AllowScratchLockRoot')) { $SetupArgs = @($SetupArgs) + '-AllowScratchLockRoot' }
         $out = @(& $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $setup @SetupArgs 2>&1 | ForEach-Object { "$_" })
         return @{ Exit = $LASTEXITCODE; Out = ($out -join "`n") }
     } finally { $env:USERPROFILE = $saved }
@@ -569,6 +573,9 @@ if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContin
     # Stubs shadow the ScheduledTasks cmdlets for this scope only: nothing here touches a real task. A -Install "enables" its task (the marker file stands for it).
     function Get-ScheduledTask {
         [CmdletBinding()] param($TaskName, $TaskPath)
+        # p5 A5: StubFailMode 'before' = the read fails until the install ran, 'after' = it fails once the install ran (a read error that is not "no such task").
+        $installedNow = Test-Path -LiteralPath (Join-Path $script:StubRepo ('.claude-state\' + $markerOf[$TaskName]))
+        if (($script:StubFailMode -ceq 'before' -and -not $installedNow) -or ($script:StubFailMode -ceq 'after' -and $installedNow -and -not $script:StubTouched.Contains($TaskName))) { throw 'Access is denied reading the scheduled task' }
         $p = $script:StubPrior[$TaskName]
         if ($p -eq 'ABSENT' -and -not (Test-Path -LiteralPath (Join-Path $script:StubRepo ('.claude-state\' + $markerOf[$TaskName])))) { return $null }
         $touched = $script:StubTouched.Contains($TaskName)
@@ -580,12 +587,16 @@ if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContin
     function Register-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath, $Xml, [switch]$Force) [void]$script:StubTouched.Add($TaskName); $script:StubCalls.Add("REGISTER $TaskName") }
     function Disable-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) [void]$script:StubTouched.Add($TaskName); $script:StubCalls.Add("DISABLE $TaskName") }
     function Enable-ScheduledTask { [CmdletBinding()] param($TaskName, $TaskPath) $script:StubCalls.Add("ENABLE $TaskName") }
-    function Invoke-A7Run([string]$Name, [hashtable]$Prior) {
-        $wsM = New-MeterRepo $Name $okBody $okBody
+    $script:StubFailMode = 'none'
+    function Invoke-A7Run([string]$Name, [hashtable]$Prior, [string]$FailMode = 'none', [string]$Body = '') {
+        $mBody = if ($Body) { $Body } else { $okBody }
+        $wsM = New-MeterRepo $Name $mBody $mBody
         $script:StubRepo = Join-Path $wsM 'MLV-App'
         $script:Repo = $script:StubRepo; $Repo = $script:StubRepo
+        $script:StubFailMode = $FailMode; $script:Failures.Clear()
         $script:StubPrior = $Prior; $script:StubTouched = [Collections.Generic.HashSet[string]]::new(); $script:StubCalls = [Collections.Generic.List[string]]::new()
         Invoke-MeterInstalls
+        $script:StubFailMode = 'none'   # the post-run reads below are the test's own and must not hit the injected read failure
         return @{ Disk = (Get-ScheduledTask -TaskName 'MLV-DiskAutoReclaim'); Repin = (Get-ScheduledTask -TaskName 'MLV-PwshAutoRepin') }
     }
     $a7 = Invoke-A7Run 'r3-a7-a' @{ 'MLV-DiskAutoReclaim' = 'Disabled'; 'MLV-PwshAutoRepin' = 'ABSENT' }
@@ -593,6 +604,21 @@ if ($fnLoaded -and (Get-Command Invoke-MeterInstalls -ErrorAction SilentlyContin
     Assert-That ($a7.Repin -and $a7.Repin.State -ceq 'Disabled') 'r3 A7 meters: a task that was ABSENT before -Install is registered but Disabled after Verify' "state=$($a7.Repin.State) calls=$($script:StubCalls -join ',')"
     $a7b = Invoke-A7Run 'r3-a7-b' @{ 'MLV-DiskAutoReclaim' = 'Ready'; 'MLV-PwshAutoRepin' = 'Ready' }
     Assert-That ($script:StubCalls.Count -eq 0 -and $a7b.Disk.State -ceq 'Ready') 'r3 A7 meters: a task the owner had ENABLED is left enabled (no Disable or re-register call)' "calls=$($script:StubCalls -join ',')"
+    # ---- p5 A5: an unreadable task is not an absent one, and the restore does not depend on the log write succeeding
+    $p5a5a = Invoke-A7Run 'p5-a5-a' @{ 'MLV-DiskAutoReclaim' = 'Ready'; 'MLV-PwshAutoRepin' = 'Ready' } 'before'
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $script:StubRepo '.claude-state\disk-hygiene\installed.marker'))) 'p5 A5 meters: a task whose state cannot be read BEFORE the install is not installed over (it may be one the owner enabled)'
+    Assert-That (($script:Failures | Where-Object { $_ -like 'METER_INSTALL_SKIPPED_STATE_UNREADABLE*' }).Count -ge 1) 'p5 A5 meters: the unreadable-before skip is a failure of the run (exit 1), not a silent skip' ($script:Failures -join ',')
+    $null = Invoke-A7Run 'p5-a5-b' @{ 'MLV-DiskAutoReclaim' = 'Disabled'; 'MLV-PwshAutoRepin' = 'ABSENT' } 'after'
+    Assert-That (($script:StubCalls | Where-Object { $_ -like 'DISABLE*' }).Count -ge 1) 'p5 A5 meters: a task that cannot be read after the install is Disabled anyway (not assumed absent)' ($script:StubCalls -join ',')
+    $script:StubFailMode = 'none'
+    $origWriteLog = ${function:Write-Log}
+    function Write-Log { param([string]$Message, [string]$Level = 'INFO') if ($Message.StartsWith('    ')) { throw 'log file is locked' } }
+    $p5a5thrown = $false
+    $talkBody = 'param([switch]$Install) if ($Install) { [IO.File]::WriteAllText((Join-Path $PSScriptRoot "installed.marker"), "ran -Install"); Write-Output "installed"; exit 0 } exit 5'
+    try { $null = Invoke-A7Run 'p5-a5-c' @{ 'MLV-DiskAutoReclaim' = 'Disabled'; 'MLV-PwshAutoRepin' = 'ABSENT' } 'none' $talkBody } catch { $p5a5thrown = $true }
+    $p5a5calls = @($script:StubCalls)
+    ${function:Write-Log} = $origWriteLog
+    Assert-That ($p5a5thrown -and (@($p5a5calls | Where-Object { $_ -like 'DISABLE*' -or $_ -like 'REGISTER*' }).Count -ge 1)) 'p5 A5 meters: a log write that throws after the install still restores the task (restore is in finally)' ($p5a5calls -join ',')
 } else { Assert-That $false 'r3 A7: Invoke-MeterInstalls is not defined' }
 
 # ================================================================ adversary pass 5 (head 2c812a47): one section per finding class
@@ -647,6 +673,75 @@ Assert-That (-not (Test-Path -LiteralPath (Join-Path $repoP5 '.codex-state\doctr
 Assert-That ((Test-Path -LiteralPath (Join-Path $repoP5 '.codex-state\doctrine\clean.json'))) 'p5 A2 import: a clean doctrine file still comes across'
 Assert-That (([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\CLAUDE.md'))) -ceq 'NEWER-LOCAL') 'p5 A3 import: an OLDER bundle file never replaces a NEWER host file (README: never overwrites a newer local file)' ([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\CLAUDE.md')))
 Assert-That (([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\settings.json'))) -ceq '{"env":{"DB_PASSWORD":"local-password"},"path":"C:/Users/obabalola/tool"}') 'p5 A4 import: with no bundle settings.json, the host''s credential-bearing settings.json is left byte-for-byte as it was' ([IO.File]::ReadAllText((Join-Path $homeP5 '.claude\settings.json')))
+
+# ---------------------------------------------------------------- p5 A7: sshd_config keyword grammar (OpenSSH takes '=' as the delimiter and quoted keywords)
+if ($fnLoaded -and (Get-Command Set-SshdKeyOnlyConfig -ErrorAction SilentlyContinue)) {
+    $p5a7 = [ordered]@{
+        'Match=User with a password-enabling rule'    = "PubkeyAuthentication yes`r`nPasswordAuthentication no`r`nMatch=User obabalola`r`n    PasswordAuthentication yes`r`n"
+        'a quoted Match keyword'                       = "PasswordAuthentication no`r`n`"Match`" User obabalola`r`n    PasswordAuthentication yes`r`n"
+        'a quoted Include keyword'                     = "PasswordAuthentication no`r`n`"Include`" C:/ProgramData/ssh/site.conf`r`n"
+        'Include=path'                                 = "PasswordAuthentication no`r`nInclude=C:/ProgramData/ssh/site.conf`r`n"
+        'a quoted password keyword inside a Match'     = "PasswordAuthentication no`r`nMatch User x`r`n    `"PasswordAuthentication`" = `"yes`"`r`n"
+        'ChallengeResponseAuthentication inside Match' = "PasswordAuthentication no`r`nMatch User x`r`n    ChallengeResponseAuthentication yes`r`n"
+    }
+    foreach ($k in $p5a7.Keys) {
+        $d = New-Scratch 'p5-sshd'
+        $cfg = Join-Path $d 'sshd_config'
+        [IO.File]::WriteAllText($cfg, $p5a7[$k])
+        $threw = $false
+        try { Set-SshdKeyOnlyConfig -ConfigPath $cfg -BackupDir (Join-Path $d 'bk') -Stamp 'P5' -Validate { 0 } } catch { $threw = $true }
+        Assert-That ($threw -and ([IO.File]::ReadAllText($cfg) -ceq $p5a7[$k])) "p5 A7 sshd: $k is refused and the file is left unchanged"
+    }
+    $dOk = New-Scratch 'p5-sshd-ok'
+    $cfgOk2 = Join-Path $dOk 'sshd_config'
+    [IO.File]::WriteAllText($cfgOk2, "PasswordAuthentication=yes`r`nMatch User x`r`n    PasswordAuthentication no`r`n")
+    Set-SshdKeyOnlyConfig -ConfigPath $cfgOk2 -BackupDir (Join-Path $dOk 'bk') -Stamp 'P5' -Validate { 0 }
+    $okLines = @([IO.File]::ReadAllLines($cfgOk2))
+    Assert-That (($okLines | Where-Object { $_ -match '^PasswordAuthentication=yes' }).Count -eq 0 -and $okLines -contains 'PasswordAuthentication no') 'p5 A7 sshd: a global PasswordAuthentication=yes (= delimiter) is replaced by key-only' ($okLines -join '|')
+} else { Assert-That $false 'p5 A7: Set-SshdKeyOnlyConfig is not defined' }
+
+# ---------------------------------------------------------------- p5 A9: scan and use see the same bytes (Import reads a private snapshot; Export re-checks the stage after tar)
+if ($fnLoaded -and (Get-Command New-ImportSnapshot -ErrorAction SilentlyContinue) -and (Get-Command Get-StagedCredentialHits -ErrorAction SilentlyContinue)) {
+    $a9Bundle = New-Scratch 'p5-a9-bundle'
+    [IO.File]::WriteAllText((Join-Path $a9Bundle 'hooks-config.json'), '{}')
+    $a9Snap = New-ImportSnapshot -From $a9Bundle -To (Join-Path (New-Scratch 'p5-a9-snaps') 'snap')
+    [IO.File]::WriteAllText((Join-Path $a9Bundle 'hooks-config.json'), '{"api_key":"foreign-key-1234"}')
+    Assert-That (([IO.File]::ReadAllText((Join-Path $a9Snap 'hooks-config.json'))) -ceq '{}') 'p5 A9 import: a bundle file replaced AFTER the snapshot does not change what the scan and the copy read'
+    $a9Stage = New-Scratch 'p5-a9-stage'
+    [IO.File]::WriteAllText((Join-Path $a9Stage 'a.json'), '{}')
+    Assert-That (@(Get-StagedCredentialHits -Stage $a9Stage).Count -eq 0) 'p5 A9 export: a clean stage has no hits'
+    [IO.File]::WriteAllText((Join-Path $a9Stage 'a.json'), '{"api_key":"foreign-key-1234"}')
+    Assert-That (@(Get-StagedCredentialHits -Stage $a9Stage).Count -eq 1) 'p5 A9 export: a staged file that turned into a credential after the scan is a hit the archive step refuses'
+    $a9Home = New-Scratch 'p5-a9-home'
+    $a9State = New-Scratch 'p5-a9-state'
+    $a9B = New-Scratch 'p5-a9-b'
+    [IO.File]::WriteAllText((Join-Path $a9B 'MANIFEST.txt'), 'mlv-migrate-bundle v1')
+    New-Item -ItemType Directory -Force -Path (Join-Path $a9B 'home-claude') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $a9B 'home-claude\CLAUDE.md'), 'from-bundle')
+    $a9Imp = Invoke-Setup $a9Home @('-Phase', 'Import', '-StateRoot', $a9State, '-Workspace', (New-Scratch 'p5-a9-ws'), '-BundlePath', $a9B, '-SourceHost', 'NOT-THIS-HOST')
+    Assert-That ($a9Imp.Exit -eq 0 -and $a9Imp.Out -match 'Snapshot the bundle' -and (Test-Path -LiteralPath (Join-Path $a9Home '.claude\CLAUDE.md'))) 'p5 A9 import: Import copies from a snapshot and still lands the file' "exit=$($a9Imp.Exit)`n$($a9Imp.Out)"
+    Assert-That (@(Get-ChildItem -LiteralPath $a9State -Directory -Filter 'import-snapshot-*' -ErrorAction SilentlyContinue).Count -eq 0) 'p5 A9 import: the snapshot is removed after the copy'
+} else { Assert-That $false 'p5 A9: New-ImportSnapshot / Get-StagedCredentialHits are not defined' }
+
+# ---------------------------------------------------------------- p5 A6: the gate lock is machine-wide, so a caller string cannot give Gate and LeaseRelease different locks
+if ($fnLoaded -and (Test-Has 'Get-GateTaskArgument' 'p5 A6 tasks')) {
+    $savedBound = $script:SetupBound
+    $script:SetupBound = @{ StateRoot = $true; Workspace = $true; LockRoot = $true }
+    $p5a6arg = Get-GateTaskArgument -Pwsh 'C:\pwsh.exe' -Self 'C:\s.ps1' -Spec @{ Name = 'T'; Script = 'C:\x\y.ps1'; ArgLine = ''; Mode = 'Lease' }
+    $script:SetupBound = $savedBound
+    Assert-That (-not $p5a6arg.Contains('-LockRoot')) 'p5 A6 tasks: a registered task never carries -LockRoot (every task and every release uses the one machine-wide lock)' $p5a6arg
+}
+$p5a6ws = New-Scratch 'p5-a6-ws'
+$script:AutoScratchLock = $false   # these calls must NOT get the -AllowScratchLockRoot test seam
+$p5a6 = Invoke-Setup (New-Scratch 'p5-a6-home') @('-Phase', 'LeaseRelease', '-LockRoot', (New-Scratch 'p5-a6-locks'), '-StateRoot', (New-Scratch 'p5-a6-state'), '-Workspace', $p5a6ws)
+Assert-That ($p5a6.Exit -eq 4 -and $p5a6.Out -match 'LOCKROOT_NOT_MACHINE_WIDE') 'p5 A6 release: a non-default -LockRoot without the test seam is refused (exit 4, LOCKROOT_NOT_MACHINE_WIDE) before the lease is read' "exit=$($p5a6.Exit)`n$($p5a6.Out)"
+$p5a6gState = New-Scratch 'p5-a6g-state'
+$p5a6g = Invoke-Setup (New-Scratch 'p5-a6g-home') @('-Phase', 'Gate', '-GateMode', 'Lease', '-GateScript', $PSCommandPath, '-LockRoot', (New-Scratch 'p5-a6g-locks'), '-StateRoot', $p5a6gState, '-Workspace', $p5a6ws)
+$script:AutoScratchLock = $true
+# a Gate run logs to <StateRoot>\logs\gate.log only (no console), so the typed refusal is read from there
+$p5a6gLog = Join-Path $p5a6gState 'logs\gate.log'
+$p5a6g.Out = $p5a6g.Out + "`n" + $(if (Test-Path -LiteralPath $p5a6gLog) { [IO.File]::ReadAllText($p5a6gLog) } else { '' })
+Assert-That ($p5a6g.Exit -eq 4 -and $p5a6g.Out -match 'LOCKROOT_NOT_MACHINE_WIDE') 'p5 A6 gate: the same refusal on a Lease-gated run (it would otherwise hold a lock no release can see)' "exit=$($p5a6g.Exit)`n$($p5a6g.Out)"
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
