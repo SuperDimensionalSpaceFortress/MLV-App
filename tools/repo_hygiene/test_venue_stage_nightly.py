@@ -1910,5 +1910,94 @@ class StageNotAfterTypedExitTests(unittest.TestCase):
         self.assertIn("RETURNED OK", p.stdout)
 
 
+@requires_windows_pwsh
+class NonFiniteBudgetEndpointTests(unittest.TestCase):
+    """VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03): a caller-budget endpoint that is not a
+    finite number (NaN, +Inf, -Inf) is REFUSED with the typed VENUE_BUDGET_ENDPOINT_NONFINITE before any read starts, at every site that takes one
+    (Get-VenueStagedBuildManifest -CallBudgetEndSec, Invoke-VenueBoundedRead -EndSec). RED on 89bb7c35: a NaN endpoint went through [Math]::Max/[Math]::Min,
+    replaced -CallCapSec 1 with NaN, and the read ran to -TimeoutSec 5 (STAGED after 1.5 s); Invoke-VenueBoundedRead took -EndSec NaN as no end at all."""
+
+    SHA64 = "a" * 64
+    ENDPOINTS = (("nan", "[double]::NaN"), ("posinf", "[double]::PositiveInfinity"), ("neginf", "[double]::NegativeInfinity"))
+
+    def run_ps(self, body: str) -> tuple[str, str]:
+        mod = DV / "VenueChain.psm1"
+        ps = f"Import-Module '{psq(mod)}' -Force -DisableNameChecking; & (Get-Module VenueChain) {{ {body} }}; [Environment]::Exit(0)"
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+        return p.stdout, p.stdout + p.stderr
+
+    def rows(self, out: str) -> dict[str, tuple[str, float]]:
+        got = {}
+        for m in re.finditer(r"(?m)^ROW=([a-z0-9-]+)\|(.*?)\|SEC=([0-9.]+)\r?$", out):
+            got[m.group(1)] = (m.group(2), float(m.group(3)))
+        return got
+
+    def test_staged_manifest_refuses_a_non_finite_call_budget_end_and_never_widens_the_cap(self) -> None:
+        cases = [(f"{label}-cap1", f"-CallCapSec 1 -CallBudgetEndSec ({expr})") for label, expr in self.ENDPOINTS]
+        # the budget alone (no explicit cap): NaN erased the budget itself on 89bb7c35 (-CallCapSec became NaN = no cap)
+        cases.append(("nan-cap0", "-CallBudgetEndSec ([double]::NaN)"))
+        body = "".join(
+            f"$sw = [Diagnostics.Stopwatch]::StartNew(); "
+            f"try {{ $r = Get-VenueStagedBuildManifest -AgentShare 'C:\\unused' -SourceCommit ('a' * 40) -TimeoutSec 5 {args} "
+            f"-CallBudgetClock ([Diagnostics.Stopwatch]::StartNew()) -ProbeScript {{ param($p) [Threading.Thread]::Sleep(1500); ('a' * 64) }}; $o = 'STATE=' + $r.state }} "
+            f"catch {{ $o = 'THROW=' + ($_.Exception.Message -replace '\\s+', ' ') }}; "
+            f"'ROW={label}|' + $o + '|SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture); "
+            for label, args in cases)
+        out, both = self.run_ps(body)
+        got = self.rows(out)
+        for label, _ in cases:
+            with self.subTest(endpoint=label):
+                self.assertIn(label, got, both)
+                what, sec = got[label]
+                self.assertTrue(what.startswith("THROW=VENUE_BUDGET_ENDPOINT_NONFINITE "), (label, what, both))
+                self.assertIn("-CallBudgetEndSec", what, both)
+                self.assertNotIn("STATE=STAGED", what, both)
+                # refused before the read: the 1.5 s probe never ran
+                self.assertLess(sec, 1.0, (label, what, both))
+
+    def test_staged_manifest_cap_and_timeout_refuse_non_finite_values_at_binding(self) -> None:
+        # the sweep's claim for the two seconds parameters that are not endpoints: [ValidateRange] on a [double] already refuses NaN and +/-Inf at binding
+        cases = [(f"{param.lower()}-{label}", f"-{param} ({expr})") for param in ("CallCapSec", "TimeoutSec") for label, expr in self.ENDPOINTS]
+        body = "".join(
+            f"$sw = [Diagnostics.Stopwatch]::StartNew(); "
+            f"try {{ $r = Get-VenueStagedBuildManifest -AgentShare 'C:\\unused' -SourceCommit ('a' * 40) {args} "
+            f"-ProbeScript {{ param($p) [Threading.Thread]::Sleep(1500); ('a' * 64) }}; $o = 'STATE=' + $r.state }} "
+            f"catch {{ $o = 'THROW=' + ($_.Exception.Message -replace '\\s+', ' ') }}; "
+            f"'ROW={label}|' + $o + '|SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture); "
+            for label, args in cases)
+        out, both = self.run_ps(body)
+        got = self.rows(out)
+        for label, _ in cases:
+            with self.subTest(value=label):
+                self.assertIn(label, got, both)
+                what, sec = got[label]
+                self.assertTrue(what.startswith("THROW="), (label, what, both))
+                self.assertIn("Cannot validate argument on parameter", what, both)
+                self.assertLess(sec, 1.0, (label, what, both))
+
+    def test_bounded_read_refuses_a_non_finite_end_and_never_widens_the_wait(self) -> None:
+        body = "".join(
+            f"$sw = [Diagnostics.Stopwatch]::StartNew(); "
+            f"try {{ $r = Invoke-VenueBoundedRead -ScriptText 'param($p) [Threading.Thread]::Sleep(1500); 1' -Argument 'x' -TimeoutSec 5 "
+            f"-Clock ([Diagnostics.Stopwatch]::StartNew()) -EndSec ({expr}); $o = 'ANSWERED=' + $r.answered + ' ' + $r.error }} "
+            f"catch {{ $o = 'THROW=' + ($_.Exception.Message -replace '\\s+', ' ') }}; "
+            f"'ROW={label}|' + $o + '|SEC=' + $sw.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture); "
+            for label, expr in self.ENDPOINTS)
+        out, both = self.run_ps(body)
+        got = self.rows(out)
+        for label, _ in self.ENDPOINTS:
+            with self.subTest(endpoint=label):
+                self.assertIn(label, got, both)
+                what, sec = got[label]
+                self.assertTrue(what.startswith("THROW=VENUE_BUDGET_ENDPOINT_NONFINITE "), (label, what, both))
+                self.assertIn("-EndSec", what, both)
+                self.assertNotIn("ANSWERED=True", what, both)
+                self.assertLess(sec, 1.0, (label, what, both))
+        # a finite end still clamps as before (control: no regression of the r13 behaviour)
+        out, both = self.run_ps("$r = Invoke-VenueBoundedRead -ScriptText 'param($p) [Threading.Thread]::Sleep(3000); 1' -Argument 'x' -TimeoutSec 5 "
+                                "-Clock ([Diagnostics.Stopwatch]::StartNew()) -EndSec 1; 'CTRL=' + $r.answered")
+        self.assertIn("CTRL=False", out, both)
+
+
 if __name__ == "__main__":
     unittest.main()

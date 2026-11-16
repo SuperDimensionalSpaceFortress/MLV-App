@@ -653,6 +653,11 @@ function Get-VenueStagedBuildManifest {
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
+    # r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03): a -CallBudgetEndSec that is not a finite number (NaN, +Inf, -Inf) is REFUSED, typed,
+    # before the call's clock starts and before any read. NaN passed through [Math]::Max/[Math]::Min and replaced a finite -CallCapSec (or, on a PowerShell that let the
+    # assignment through, erased it: the read ran to -TimeoutSec). A non-finite endpoint never widens, and never silently narrows, the call's bound. -TimeoutSec and
+    # -CallCapSec need no such check: their [ValidateRange] already refuses NaN and +/-Inf at binding.
+    if (-not [double]::IsFinite($CallBudgetEndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -CallBudgetEndSec is $($CallBudgetEndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a bound wider than -CallCapSec or -TimeoutSec" }
     $callClock = [Diagnostics.Stopwatch]::StartNew()
     if ($script:VenueTestPostClockStartDelayMs -gt 0) { $stallMs = $script:VenueTestPostClockStartDelayMs; $script:VenueTestPostClockStartDelayMs = 0; [Threading.Thread]::Sleep($stallMs) }
     if ($null -ne $CallBudgetClock -or $null -ne $CallDeadlineUtc) {
@@ -913,6 +918,10 @@ function Invoke-VenueBoundedRead {
     # caller set under it; a wait it shortens is then a plain timeout and the "cut ... short" clause is not printed. Absent: any shortening by -EndSec is named.
     param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec,
         [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd)
+    # r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03, sibling of Get-VenueStagedBuildManifest -CallBudgetEndSec): an -EndSec that is not a
+    # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
+    # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
+    if (-not [double]::IsFinite($EndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -EndSec is $($EndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a wait wider than the caller's end" }
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
