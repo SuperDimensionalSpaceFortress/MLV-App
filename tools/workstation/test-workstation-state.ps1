@@ -1751,6 +1751,68 @@ Assert-That ($p14a4.Out -match 'SKIP \(WhatIf\) LeaseAcquire' -and $p14a4.Out -n
 $p14a5 = Invoke-Setup (New-Scratch 'r15-p14-a5-home') @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r15-p14-a5-state'), '-Workspace', (New-Scratch 'r15-p14-a5-ws'), '-BundlePath', (New-Scratch 'r15-p14-a5-empty-bundle'), '-SourceHost', 'NOT-THIS-HOST')
 Assert-That ($p14a5.Exit -eq 1 -and $p14a5.Out -match 'IMPORT_BUNDLE_INVALID') 'r15 p14 A5 import: a bundle without MANIFEST.txt fails the run (exit 1, IMPORT_BUNDLE_INVALID)' "exit=$($p14a5.Exit)`n$($p14a5.Out)"
 
+# ================================================================ r16 fix iteration 1 (head 850ba3c1): adversary pass 15, A1-A4
+# A1: an '=' whose value stands on the next line (PowerShell continues the assignment) is a credential, at every guard (all call the one detector)
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r16 p15 A1')) {
+    $p15a1 = [ordered]@{
+        'the adversary input ($password = then the quoted value on the next line)' = "`$password =`n'hunter2'`n"
+        'the same with CRLF line ends'                                              = "`$password =`r`n'hunter2'"
+        'an ini key whose value follows a comment line'                             = "DB_PASSWORD=`n# note`nhunter2"
+    }
+    foreach ($k in $p15a1.Keys) { Assert-That ((Test-CredentialText $p15a1[$k]) -and (Get-CredentialHitLine $p15a1[$k]) -eq 1) "r16 p15 A1 $k is a credential (reported on the key line)" $p15a1[$k] }
+    Assert-That (-not (Test-CredentialText 'DB_PASSWORD=')) 'r16 p15 A1 control: k= at the very end of the text is still the empty value (exempt)'
+    if (Test-Has 'Copy-ImportFileLocked' 'r16 p15 A1') {
+        $p15a1Dir = New-Scratch 'r16-p15-a1'
+        $p15a1Src = Join-Path $p15a1Dir 'connect.ps1'; [IO.File]::WriteAllText($p15a1Src, $p15a1['the adversary input ($password = then the quoted value on the next line)'])
+        $p15a1Dst = Join-Path (New-Scratch 'r16-p15-a1-host') 'connect.ps1'
+        $p15a1r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($p15a1Src)) -Dest $p15a1Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+        Assert-That ($p15a1r.Result -ceq 'source-credential' -and -not (Test-Path -LiteralPath $p15a1Dst)) 'r16 p15 A1 import: the locked copy refuses that bundle file and writes nothing' "$($p15a1r.Result)"
+    }
+}
+# A2: the Import role guard sees a camelCase secret-named key even after its benign lowercase twin (the seen set is case-sensitive)
+if ($fnLoaded -and (Test-Has 'Test-CredentialNamePresent' 'r16 p15 A2') -and (Test-Has 'Get-ImportCredentialSkips' 'r16 p15 A2') -and (Test-Has 'Copy-ImportFileLocked' 'r16 p15 A2')) {
+    foreach ($pair in @(@('authheader', 'authHeader'), @('pwdheader', 'pwdHeader'), @('authorizationheader', 'authorizationHeader'))) {
+        $txt = '{"' + $pair[0] + '":"","' + $pair[1] + '":""}'
+        Assert-That (Test-CredentialNamePresent $txt) "r16 p15 A2 name guard: '$($pair[1])' after its lowercase twin '$($pair[0])' still names a credential key" $txt
+        $tag = $pair[1].ToLowerInvariant()
+        $sDir = New-Scratch "r16-p15-a2-$tag-bundle"; $dDir = New-Scratch "r16-p15-a2-$tag-host"
+        $sFile = Join-Path $sDir 'settings.json'; $dFile = Join-Path $dDir 'settings.json'
+        [IO.File]::WriteAllText($dFile, $txt); (Get-Item -LiteralPath $dFile).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-2)
+        [IO.File]::WriteAllText($sFile, '{}')
+        $sk = @(Get-ImportCredentialSkips -SourceDir $sDir -DestDir $dDir)
+        Assert-That (@($sk | Where-Object { $_.Reason -ceq 'host credential-role file names a credential key' }).Count -eq 1) "r16 p15 A2 import skips: a host settings.json naming '$($pair[1])' is kept" (($sk | ForEach-Object Reason) -join ';')
+        $cr = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($sFile)) -Dest $dFile -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false
+        Assert-That ($cr.Result -ceq 'changed' -and ([IO.File]::ReadAllText($dFile)) -ceq $txt) "r16 p15 A2 locked copy: a host settings.json naming '$($pair[1])' is not replaced" "$($cr.Result)"
+    }
+}
+# A3: an Import whose bundle path does not exist FAILS the run (exit 1, IMPORT_BUNDLE_MISSING); it used to end 'done' with exit 0
+$p15a3 = Invoke-Setup (New-Scratch 'r16-p15-a3-home') @('-Phase', 'Import', '-StateRoot', (New-Scratch 'r16-p15-a3-state'), '-Workspace', (New-Scratch 'r16-p15-a3-ws'), '-BundlePath', (Join-Path (New-Scratch 'r16-p15-a3') 'absent-bundle.zip'), '-SourceHost', 'NOT-THIS-HOST')
+Assert-That ($p15a3.Exit -eq 1 -and $p15a3.Out -match 'IMPORT_BUNDLE_MISSING') 'r16 p15 A3 import: a missing bundle fails the run (exit 1, IMPORT_BUNDLE_MISSING)' "exit=$($p15a3.Exit)`n$($p15a3.Out)"
+# A4: a failed create never deletes a file another process saved at the destination after the handle was released. The seam: Remove-FileVerified is wrapped so that,
+# when it is asked to delete the destination by PATHNAME, the owner's save lands there first (the window the old code had). The fixed code deletes through the held handle
+# and never asks; either way the owner's save must survive, and with no owner save the half-written file must be gone.
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r16 p15 A4') -and (Test-Has 'Remove-FileVerified' 'r16 p15 A4')) {
+    $p15a4Src = Join-Path (New-Scratch 'r16-p15-a4') 'service.ps1'; [IO.File]::WriteAllText($p15a4Src, ('x' * 8192))
+    $script:P15A4Dest = Join-Path (New-Scratch 'r16-p15-a4-host') 'service.ps1'
+    $script:P15A4SavedRv = ${function:Remove-FileVerified}
+    $script:P15A4OwnerSaved = $false
+    ${function:Remove-FileVerified} = { param([string]$Path) if ($Path -ceq $script:P15A4Dest) { [IO.File]::WriteAllText($Path, "`$password='owner-v2'"); $script:P15A4OwnerSaved = $true }; & $script:P15A4SavedRv $Path }
+    $script:ImportAfterWriteHook = { param($Dest) throw 'r16 p15 A4 simulated I/O failure' }
+    $p15a4Err = ''
+    try { [void](Copy-ImportFileLocked -Source ([IO.FileInfo]::new($p15a4Src)) -Dest $script:P15A4Dest -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false) } catch { $p15a4Err = $_.Exception.Message }
+    finally { $script:ImportAfterWriteHook = $null; ${function:Remove-FileVerified} = $script:P15A4SavedRv }
+    $p15a4Ok = $(if ($script:P15A4OwnerSaved) { (Test-Path -LiteralPath $script:P15A4Dest) -and ([IO.File]::ReadAllText($script:P15A4Dest)) -ceq "`$password='owner-v2'" } else { -not (Test-Path -LiteralPath $script:P15A4Dest) })
+    Assert-That ($p15a4Ok -and $p15a4Err -match 'simulated I/O failure') 'r16 p15 A4 import: a failed create removes only its own half-written file (an owner save at that path is never deleted)' "ownerSaved=$($script:P15A4OwnerSaved) exists=$(Test-Path -LiteralPath $script:P15A4Dest) err=$p15a4Err"
+}
+# A4 sibling: the backup copy deletes only what it wrote; an unreadable source leaves a file already standing at the backup name alone
+if ($fnLoaded -and (Test-Has 'Copy-CleanBackupFile' 'r16 p15 A4 sibling')) {
+    $p15bk = New-Scratch 'r16-p15-a4-bk'
+    [IO.File]::WriteAllText((Join-Path $p15bk 'absent.json'), 'owner file')
+    $p15bkR = Copy-CleanBackupFile -Path (Join-Path (New-Scratch 'r16-p15-a4-bksrc') 'absent.json') -DestinationDir $p15bk
+    Assert-That ($p15bkR -eq $false -and (Test-Path -LiteralPath (Join-Path $p15bk 'absent.json')) -and ([IO.File]::ReadAllText((Join-Path $p15bk 'absent.json'))) -ceq 'owner file') 'r16 p15 A4 sibling backup: an unreadable source deletes nothing at the backup name' "result=$p15bkR"
+    Assert-That ((Copy-CleanBackupFile -Path $p15a4Src -DestinationDir $p15bk) -eq $true -and ([IO.File]::ReadAllText((Join-Path $p15bk 'service.ps1'))) -ceq ('x' * 8192)) 'r16 p15 A4 sibling backup: a clean file is still written byte for byte through the owned handle'
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

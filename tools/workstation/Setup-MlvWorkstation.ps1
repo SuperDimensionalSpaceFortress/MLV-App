@@ -959,7 +959,18 @@ function Get-CredentialKeyValueHitIndex {
                 if ($more.Trim()) { $raw = $raw + "`n" + $more }
             }
         }
-        # 'k=' with nothing after it on its line is the empty raw value (exempt); 'k=' then a value on a later line is not a key/value record in an '=' format.
+        # r16 (adversary pass 15 A1, deny by default): 'k=' with nothing after it on its line takes the next line that is neither blank nor a '#' comment as its value,
+        # exactly like the ':' block form. PowerShell continues an assignment across the line break ('$password =' then "'hunter2'" assigns hunter2), so the old reading
+        # ('k=' then a later line is not a key/value record) let that through. 'k=' at the very end of the text (no later value line) is still the empty raw value
+        # (exempt). Over-refusal is accepted: an ini 'password=' followed by an unrelated 'user=bob' line is now refused (the file is named in SECRET-SCAN.txt).
+        if ($sep -ne ':' -and -not $raw.Trim() -and (Test-CredentialAtLineEnd -Text $Text -At $end)) {
+            $q = Get-CredentialNextValueLine $Text $end
+            if ($q -ge 0) {
+                $qEnd = Get-CredentialRawValueEnd -Text $Text -At $q -Flow $flow
+                $raw = $Text.Substring($end, $qEnd - $end)
+                $end = $qEnd
+            }
+        }
         if (Test-CredentialValueExempt $raw) { continue }
         return $keyStart
     }
@@ -1188,6 +1199,47 @@ function Remove-FileVerified {
     return @{ Deleted = $false; Path = $Path; Why = $why }
 }
 
+# r16 (adversary pass 15 A4): a file this run CREATES and may have to take back is opened through a handle that also holds DELETE access (New-OwnedFileStream), and a
+# failed write removes it THROUGH THAT HANDLE (Remove-OwnedFileByHandle: SetFileInformationByHandle FileDispositionInfo, deleted when the handle closes). The old
+# cleanup released the handle and then deleted by PATHNAME, so a file another process saved at that path in the gap (an owner's credential-bearing save) was deleted
+# instead and reported Deleted=true. The handle is never released before the delete is marked, and the share mode is None, so the deleted file is always ours.
+function New-OwnedFileStream {
+    param([string]$Path, [IO.FileMode]$Mode)
+    $rights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::Synchronize
+    return [System.IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($Path), $Mode, $rights, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $null)
+}
+
+# Marks the file behind $Stream for deletion and closes the handle. Returns '' when the delete is marked (the OS removes the file as the handle closes; no other handle
+# can exist under share mode None), else the reason it could not be marked (the file then stays, and the caller fails typed with its path).
+function Remove-OwnedFileByHandle {
+    param([IO.FileStream]$Stream)
+    $why = ''
+    try {
+        if (-not ('MlvOwnedFileDisposition' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class MlvOwnedFileDisposition {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_DISPOSITION_INFO { [MarshalAs(UnmanagedType.U1)] public bool DeleteFile; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int fileInformationClass, ref FILE_DISPOSITION_INFO info, int bufferSize);
+    public static void MarkForDelete(SafeFileHandle handle) {
+        FILE_DISPOSITION_INFO info = new FILE_DISPOSITION_INFO();
+        info.DeleteFile = true;
+        if (!SetFileInformationByHandle(handle, 4, ref info, Marshal.SizeOf(typeof(FILE_DISPOSITION_INFO)))) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+    }
+}
+'@
+        }
+        [MlvOwnedFileDisposition]::MarkForDelete($Stream.SafeFileHandle)
+    } catch { $why = $_.Exception.Message }
+    finally { $Stream.Dispose() }
+    return $why
+}
+
 # r15 (pass 12 A6): an archive that fails the post-archive secret scan is deleted, and the delete is proven (Remove-FileVerified). Always throws: the plain
 # message when the archive is gone, or the typed EXPORT_CREDENTIAL_ZIP_NOT_DELETED <path> (recorded in the run's failures too) when it still exists anywhere.
 function Remove-RejectedArchive {
@@ -1355,11 +1407,12 @@ function Test-CredentialNamePresent {
     $texts = @($Text)
     if ($Text.Contains('\u')) { $texts += [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }) }
     foreach ($t in $texts) {
-        $seen = @{}
+        # r16 (adversary pass 15 A2): the seen set is CASE-SENSITIVE (ordinal). The classifier splits camelCase, so 'authHeader' (auth + header: secret-named) and
+        # 'authheader' (one word: not) get different answers; a case-insensitive @{} table skipped the camelCase spelling after its benign lowercase twin.
+        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($w in [regex]::Matches($t, '[A-Za-z0-9_.\-]+')) {
             $v = $w.Value
-            if ($seen.ContainsKey($v)) { continue }
-            $seen[$v] = $true
+            if (-not $seen.Add($v)) { continue }
             if (Get-CredentialKeyClass $v) { return $true }
         }
     }
@@ -1427,7 +1480,8 @@ function Copy-ImportFileLocked {
     $fs = $null
     try {
         $created = $false
-        try { $fs = [IO.File]::Open($Dest, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $created = $true }
+        # r16 A4: created through a handle that can also delete it (New-OwnedFileStream), so a failed write takes back exactly this file
+        try { $fs = New-OwnedFileStream -Path $Dest -Mode ([IO.FileMode]::CreateNew); $created = $true }
         catch [System.IO.IOException] { if (-not [IO.File]::Exists($Dest)) { throw } }
         if ($created) {
             # r12 A5: the timestamps are set THROUGH the handle that is still held (nothing can save into the file between the write and its timestamp, and a later
@@ -1440,10 +1494,12 @@ function Copy-ImportFileLocked {
             }
             catch {
                 $orig = $_
-                $fs.Dispose(); $fs = $null
-                # r15 (pass 12 A6 sibling): the half-written new file's removal is proven; one that cannot be removed fails typed with its path
-                $rm = Remove-FileVerified $Dest
-                if (-not $rm.Deleted) { throw "IMPORT_PARTIAL_NOT_DELETED $($rm.Path) ($($rm.Why)) after: $($orig.Exception.Message)" }
+                # r15 (pass 12 A6 sibling): the half-written new file's removal is proven; one that cannot be removed fails typed with its path.
+                # r16 (adversary pass 15 A4): removed THROUGH the held handle (Remove-OwnedFileByHandle), never by pathname after the handle is released, so a file another
+                # process saves at $Dest can never be the one deleted.
+                $held = $fs; $fs = $null
+                $rmWhy = Remove-OwnedFileByHandle $held
+                if ($rmWhy) { throw "IMPORT_PARTIAL_NOT_DELETED $Dest ($rmWhy) after: $($orig.Exception.Message)" }
                 throw $orig
             }
             $fs.Dispose(); $fs = $null
@@ -1766,21 +1822,28 @@ function Update-ImportedSettingsLocked {
 function Copy-CleanBackupFile {
     param([string]$Path, [string]$DestinationDir)
     $dest = Join-Path $DestinationDir (Split-Path -Leaf $Path)
+    $ws = $null
     try {
         $bytes = [IO.File]::ReadAllBytes($Path)
         $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true)
         try { $text = $sr.ReadToEnd() } finally { $sr.Dispose() }
         if (Test-CredentialText $text) { return $false }
         [void][IO.Directory]::CreateDirectory($DestinationDir)
-        [IO.File]::WriteAllBytes($dest, $bytes)
+        # r16 (adversary pass 15 A4 sibling): written through a handle that can also delete it (New-OwnedFileStream), so a failed write takes back exactly this file
+        $ws = New-OwnedFileStream -Path $dest -Mode ([IO.FileMode]::Create)
+        $ws.Write($bytes, 0, $bytes.Length); $ws.Flush()
+        $ws.Dispose(); $ws = $null
         return $true
     } catch {
-        # r15 (pass 12 A6 sibling): a partly written backup copy is removed and the removal is proven; one that cannot be removed is a typed failure of the run
-        if (Test-Path -LiteralPath $dest) {
-            $rm = Remove-FileVerified $dest
-            if (-not $rm.Deleted) {
-                Write-Log "IMPORT_BACKUP_NOT_DELETED $($rm.Path) ($($rm.Why))" 'ERROR'
-                $script:Failures.Add("IMPORT_BACKUP_NOT_DELETED $($rm.Path)")
+        # r15 (pass 12 A6 sibling): a partly written backup copy is removed and the removal is proven; one that cannot be removed is a typed failure of the run.
+        # r16 (adversary pass 15 A4 sibling): removed THROUGH the held handle, never by pathname: a failure before this run opened $dest (an unreadable source) deletes
+        # nothing, and a file another process saved at $dest after a release can never be the one deleted.
+        if ($ws) {
+            $held = $ws; $ws = $null
+            $rmWhy = Remove-OwnedFileByHandle $held
+            if ($rmWhy) {
+                Write-Log "IMPORT_BACKUP_NOT_DELETED $dest ($rmWhy)" 'ERROR'
+                $script:Failures.Add("IMPORT_BACKUP_NOT_DELETED $dest")
             }
         }
         return $false
@@ -1790,6 +1853,9 @@ function Copy-CleanBackupFile {
 function Invoke-PhaseImport {
     if (-not (Test-Path -LiteralPath $BundlePath)) {
         Write-Log "no bundle at ${BundlePath}: run -Phase Export on VIRTUAL-TEN and copy the zip here (README step 4), then re-run -Phase Import" 'MANUAL'
+        # r16 (adversary pass 15 A3): nothing was imported, so the run FAILS (exit 1, typed IMPORT_BUNDLE_MISSING), like the r15 IMPORT_BUNDLE_INVALID refusal below; it
+        # used to return quietly and end 'done' with exit 0. A -WhatIf preview imports nothing in any case and stays a plain notice.
+        if (-not $WhatIfPreference) { Write-Log "IMPORT_BUNDLE_MISSING $BundlePath" 'ERROR'; $script:Failures.Add("IMPORT_BUNDLE_MISSING $BundlePath") }
         return
     }
     $src = $BundlePath
