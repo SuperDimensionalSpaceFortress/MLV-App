@@ -1419,6 +1419,36 @@ class R5BaseWindowTests(unittest.TestCase):
                 with self.subTest(note_len=n):
                     self.assertLessEqual(render_roadmap._budget_size(render_roadmap.render(data)), ROADMAP_BUDGET_BYTES)
 
+    def owner_variants(self) -> dict[str, tuple]:
+        """Owner rows of a tooling kind (master never counted them): none, parked (owed), resolved, queued."""
+        stamp = self.STAMP
+        return {
+            "none": (),
+            "parked": (row("OWNER-P", "parked", stamp, kind="hub-tooling", origin="owner", notes="waiting"),),
+            "resolved": (row("OWNER-R", "parked", stamp, kind="hub-tooling", origin="owner", notes="done", resolution="done"),),
+            "queued": (row("OWNER-Q", "queued", stamp, kind="hub-tooling", origin="owner"),),
+        }
+
+    def test_r6_the_b596_board_is_master_s_file_with_every_owner_row_shape(self) -> None:
+        # review-pr835-opus-r4 / review-pr835-sol-r4 blocker repro (sol INV-11): 300 queued product rows and one 596-char scope note
+        # fit at master (19999 CRLF bytes) and rendered 20089 at 08a1edd4, the bare tier having carried the longer owner-aware header.
+        base = self.board(596)
+        self.assertEqual(render_roadmap._budget_size(master_render(base)), 19999)
+        for name, extra in self.owner_variants().items():
+            data = self.board(596, *extra)
+            with self.subTest(owner_rows=name):
+                text = render_roadmap.render(data)
+                self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+                self.assertEqual(text, master_render(base))
+
+    def test_r6_any_base_fitting_board_plus_owner_rows_stays_within_budget(self) -> None:
+        for n in range(300, 900, 7):
+            if render_roadmap._budget_size(master_render(self.board(n))) > ROADMAP_BUDGET_BYTES:
+                continue
+            for name, extra in self.owner_variants().items():
+                with self.subTest(note_len=n, owner_rows=name):
+                    self.assertLessEqual(render_roadmap._budget_size(render_roadmap.render(self.board(n, *extra))), ROADMAP_BUDGET_BYTES)
+
     def test_the_header_text_is_master_s_in_the_bare_tier_only(self) -> None:
         data = self.board(100)
         self.assertTrue(render_roadmap._render(data, 0, collapsed=True, bare=True).startswith(MASTER_HEADER))
