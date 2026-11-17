@@ -2011,7 +2011,7 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         # r3: the chunk can now be shorter than the sampling interval (it follows the no-progress window), so a sample is taken only once the
         # configured -HostLoadSampleIntervalMs has passed since the last one; the host-load cadence is unchanged.
         if (([int64]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds - $hostLoadLastSampleAtMs) -lt $HostLoadSampleIntervalMs) {
-            if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch) {
+            if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds))) {
                 $noProgressStalled = $true
                 break
             }
@@ -2021,7 +2021,7 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         $newSample = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectProcess $process `
             -SkipEvidenceCollection
         $hostLoadDuringSamples.Add($newSample)
-        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch) {
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds))) {
             $noProgressStalled = $true
             break
         }
@@ -2039,7 +2039,7 @@ else {
         if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
             break
         }
-        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch) {
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds))) {
             $noProgressStalled = $true
             break
         }

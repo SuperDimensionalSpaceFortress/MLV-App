@@ -232,6 +232,67 @@ $sw.Restart(); Stop-GuiSmokeLogProgressWatch -Watch $w; $stopMs = [int]$sw.Elaps
         self.assertLess(out["ms"], 5000, "four polls with a hung probe must cost about 4 x 300 ms, not the probe's 40 s")
         self.assertLess(out["stopMs"], 5000)
 
+    # adversary 57a7a5c9 A1: toggling read access to one log (total 2000 / 1000 / 2000 ...) must not read as growth -- restoration is not progress.
+    def test_denying_and_restoring_read_access_cannot_manufacture_progress(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'toggle'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 1000) -NoNewline
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-2.log') -Value ('y' * 1000) -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000
+[void](Test-GuiSmokeLogProgressStalled -Watch $w)
+$held = $null; $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $flip = 0
+while ($sw.ElapsedMilliseconds -lt 7000 -and -not $tripped) {
+    if (([int]($sw.ElapsedMilliseconds / 400)) -ne $flip) {
+        $flip = [int]($sw.ElapsedMilliseconds / 400)
+        if ($held) { $held.Dispose(); $held = $null } else { $held = [IO.File]::Open((Join-Path $dir 'mlvapp-2.log'), 'Open', 'ReadWrite', 'None') }
+    }
+    Start-Sleep -Milliseconds 100
+    if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
+}
+if ($held) { $held.Dispose() }
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ tripped = $tripped } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["tripped"], "a log whose read access is toggled while its content never changes is a stalled leg")
+
+    # adversary 57a7a5c9 A3: the first sign of a log arms the watch even when that log cannot be read at the first look.
+    def test_a_log_unreadable_from_the_first_look_still_arms_the_watch(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'lockedfirst'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value 'first line'
+$held = [IO.File]::Open($log, 'Open', 'ReadWrite', 'None')
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000
+$sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
+while ($sw.ElapsedMilliseconds -lt 6000 -and -not $tripped) { Start-Sleep -Milliseconds 150; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
+$held.Dispose(); Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ tripped = $tripped } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["tripped"], "an app that logged once and is now unreadable-and-silent must not keep the whole job budget")
+
+    # adversary 57a7a5c9 A2 (+ advisory A4): a hung probe is waited on ONCE, and never past what is left of the process budget.
+    def test_probe_wait_is_bounded_by_the_remaining_budget_and_a_hung_probe_is_not_waited_on_twice(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'budget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Seconds 40; 5' -ProbeWaitMs 1000
+$sw = [Diagnostics.Stopwatch]::StartNew()
+[void](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 50)
+$cappedMs = [int]$sw.ElapsedMilliseconds
+$w2 = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Seconds 40; 5' -ProbeWaitMs 400
+$sw.Restart()
+1..5 | ForEach-Object { [void](Test-GuiSmokeLogProgressStalled -Watch $w2) }
+$fiveMs = [int]$sw.ElapsedMilliseconds
+Stop-GuiSmokeLogProgressWatch -Watch $w; Stop-GuiSmokeLogProgressWatch -Watch $w2
+[pscustomobject]@{ cappedMs = $cappedMs; fiveMs = $fiveMs } | ConvertTo-Json -Compress
+""")
+        self.assertLess(out["cappedMs"], 500, "a probe wait must not exceed the budget the caller has left")
+        self.assertLess(out["fiveMs"], 1200, "five polls of one hung probe cost about one 400 ms wait, not five")
+        source = RUNNER.read_text(encoding="utf-8")
+        calls = source.count("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch")
+        self.assertGreaterEqual(calls, 2)
+        self.assertEqual(calls, source.count("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs"),
+                         "every runner call hands the remaining process budget to the probe wait")
+
     def test_runner_checks_the_log_between_chunks_and_receipt_carries_the_outcome(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
         loop_start = source.index("$hostLoadDuringSamples.Add($newSample)")

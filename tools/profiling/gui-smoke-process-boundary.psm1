@@ -77,24 +77,25 @@ function Get-GuiSmokeNoProgressChunkMs {
 # The directory read and the file opens, run on a worker runspace so a stalled share cannot hold the caller (adversary 797947a7 A4).
 $script:GuiSmokeLogLengthProbe = @'
 param($LogRoot)
-$total = [int64]0
-$seen = $false
 foreach ($file in @(Get-ChildItem -LiteralPath $LogRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)) {
+    $length = [int64]-1
     try {
         $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
             ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-        try { $total += [int64]$stream.Length; $seen = $true } finally { $stream.Dispose() }
+        try { $length = [int64]$stream.Length } finally { $stream.Dispose() }
     }
     catch { }
+    '{0}|{1}' -f $file.Name, $length
 }
-if ($seen) { $total }
 '@
 
-# A watch over the app's own log files (mlvapp-*.log in the run's log directory). It is armed by the FIRST sign of a log, so the time
-# before the app writes anything (loading the input, Qt start-up) stays bounded by the overall budget only. Progress is GROWTH of the
-# summed file length, read through an opened handle (a directory listing can report a stale size for a file the app still holds).
-# A log that vanishes, is held unreadable, or makes the total shrink is not progress. A probe that has not answered within -ProbeWaitMs is
-# left running and counts as no new information; the caller never waits on it again. Call Stop-GuiSmokeLogProgressWatch when done.
+# A watch over the app's own log files (mlvapp-*.log in the run's log directory). It is armed by the FIRST sign of a log (a log that is
+# listed but cannot be opened still arms it), so the time before the app writes anything (loading the input, Qt start-up) stays bounded by
+# the overall budget only. Progress is GROWTH of a file beyond its own high-water length (read through an opened handle: a directory listing
+# can report a stale size for a file the app still holds) or the first sighting of a new log name. A log that vanishes, is held unreadable,
+# shrinks, or returns to a length it already had is never progress, so toggling read access cannot manufacture it (adversary 57a7a5c9 A1).
+# A probe that has not answered within its wait is left running and counts as no new information; it is waited on ONCE, never again, and
+# never past the process budget the caller has left. Call Stop-GuiSmokeLogProgressWatch when done.
 function New-GuiSmokeLogProgressWatch {
     [CmdletBinding()]
     param(
@@ -118,8 +119,9 @@ function New-GuiSmokeLogProgressWatch {
         Runspace = $runspace
         Pending = $null
         Handle = $null
+        Hung = $false
         Armed = $false
-        LastLength = [int64]-1
+        Files = @{}
         Quiet = [System.Diagnostics.Stopwatch]::StartNew()
     }
 }
@@ -139,7 +141,10 @@ function Test-GuiSmokeLogProgressStalled {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [object]$Watch
+        [object]$Watch,
+        # what is left of the caller's whole process budget: the probe is never waited on longer than this (adversary 57a7a5c9 A2)
+        [ValidateRange(0, 3600000)]
+        [int]$BudgetRemainingMs = 3600000
     )
 
     if ($null -eq $Watch.Pending) {
@@ -148,32 +153,50 @@ function Test-GuiSmokeLogProgressStalled {
         [void]$shell.AddScript($Watch.ProbeScript).AddArgument($Watch.LogRoot)
         $Watch.Pending = $shell
         $Watch.Handle = $shell.BeginInvoke()
+        $Watch.Hung = $false
     }
-    $length = $null
-    if ($Watch.Handle.AsyncWaitHandle.WaitOne($Watch.ProbeWaitMs)) {
-        try {
-            $answer = @($Watch.Pending.EndInvoke($Watch.Handle))
-            if ($answer.Count -gt 0 -and $null -ne $answer[0]) { $length = [int64]$answer[0] }
-        }
-        catch { }
+    # a probe that already outran its wait is only looked at (0 ms), never waited on again
+    $waitMs = if ($Watch.Hung) { 0 } else { [Math]::Min([int]$Watch.ProbeWaitMs, $BudgetRemainingMs) }
+    $entries = $null
+    if ($Watch.Handle.AsyncWaitHandle.WaitOne($waitMs)) {
+        try { $entries = @($Watch.Pending.EndInvoke($Watch.Handle)) } catch { $entries = @() }
         try { $Watch.Pending.Dispose() } catch { }
         $Watch.Pending = $null
         $Watch.Handle = $null
+        $Watch.Hung = $false
     }
-    if ($null -ne $length) {
+    else {
+        $Watch.Hung = $true
+    }
+    if ($null -ne $entries -and $entries.Count -gt 0) {
+        $progress = $false
+        foreach ($entry in $entries) {
+            $text = [string]$entry
+            $cut = $text.LastIndexOf('|')
+            if ($cut -lt 0) { continue }
+            $name = $text.Substring(0, $cut)
+            $parsed = [int64]0
+            $length = if ([int64]::TryParse($text.Substring($cut + 1), [ref]$parsed)) { $parsed } else { [int64]-1 }
+            if (-not $Watch.Files.ContainsKey($name)) {
+                # the first sighting of a log (readable or not) arms the watch and is itself a sign of life
+                $Watch.Files[$name] = [Math]::Max([int64]0, $length)
+                $progress = $true
+            }
+            elseif ($length -gt [int64]$Watch.Files[$name]) {
+                $Watch.Files[$name] = $length
+                $progress = $true
+            }
+            # unreadable (-1), shorter, or an already-seen length: not progress, and the high-water mark is never lowered
+        }
         if (-not $Watch.Armed) {
             $Watch.Armed = $true
-            $Watch.LastLength = $length
             $Watch.Quiet.Restart()
             return $false
         }
-        if ($length -gt $Watch.LastLength) {
-            $Watch.LastLength = $length
+        if ($progress) {
             $Watch.Quiet.Restart()
             return $false
         }
-        # shrinkage (a log removed) is never progress; the baseline follows it so a later real growth still counts
-        $Watch.LastLength = $length
     }
     if (-not $Watch.Armed) { return $false }
     return ($Watch.Quiet.ElapsedMilliseconds -ge $Watch.WindowMs)
