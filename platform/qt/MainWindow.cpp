@@ -2954,7 +2954,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 m_pFpsStatus->setText( playbackFpsText );
                 m_lastPlaybackFpsStatusText = playbackFpsText;
             }
-            const bool fpsWasMeasured = m_playbackFpsEmaFrameMs > 0.0;
+            // LOOK-LABEL-PLAYBACK-INFO-1: whether the corner label showed a rate the reset now withdraws.
+            const bool fpsWasMeasured = m_playbackInfoFpsShown > 0.0;
             m_playbackFpsEmaFrameMs = 0.0;
             m_playbackInfoFpsShown = 0.0;
             m_lastPlaybackFpsStatusUpdateTime = QTime();
