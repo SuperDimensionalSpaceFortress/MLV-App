@@ -111,6 +111,10 @@ param(
     # place that reads [DateTime]::UtcNow) is this many seconds EARLIER, as after a backward NTP correction, a VM resume or a manual clock set. The budget
     # arithmetic reads the monotonic Stopwatch, so it must not notice; a wall-clock budget is re-granted by exactly this much. Production passes none.
     [ValidateRange(0, 86400)][double]$TestClockStepBackSec = 0,
+    # Test-only (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1 r1, adversary A1 on c253316d): the wall clock the soundness read's -CallDeadlineUtc is read against inside VenueChain.psm1
+    # is stepped this many seconds (negative = backward) BETWEEN the hand-off projection (Sync-NightlyDeadline) and the module's own sample, as a correction landing in that
+    # gap does. It moves no clock of this script's. Production passes none.
+    [ValidateRange(-86400, 86400)][double]$TestWallStepAfterSyncSec = 0,
     # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe Stop-ShareUnreachable uses (ShareRootAccess.psm1); throwing means the
     # root cannot be read. Production passes none.
     # (r16 merge of #826: this seam and -DllJobIdSuffix below are independent parameters; both are kept, neither side's behaviour is dropped.)
@@ -373,8 +377,12 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     $script:SoundnessReads++
     $delayMs =$(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
     $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ieq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ieq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
+    # r1 fix iteration 1 (adversary A1 on c253316d): the UTC instant is read back against the MODULE's own wall clock, so a correction landing between this projection and
+    # that read moves what the module sees. The read is therefore ALSO handed the monotonic budget itself (-CallBudgetClock/-CallBudgetEndSec, the form the lease batch
+    # uses): the module takes the least of -CallCapSec, that and the instant, and no wall clock can move the second. -CallDeadlineUtc stays as the cross-process contract.
     Sync-NightlyDeadline
-    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -CallDeadlineUtc $script:Deadline -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
+    if ($TestWallStepAfterSyncSec -ne 0) { & (Get-Module VenueChain) { param($s) $script:VenueTestUtcStepSec = $s } $TestWallStepAfterSyncSec }
+    $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -CallDeadlineUtc $script:Deadline -CallBudgetClock $script:Sw -CallBudgetEndSec $script:BudgetSec -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
     $leftAfter = (Get-NightlyLeftSec)
     if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); $notDone" }
     # r9 fix iteration (adversary A1 on be203fe6): the module bounds the read by -CallCapSec on its OWN clock, started when it is called, so a scheduling delay

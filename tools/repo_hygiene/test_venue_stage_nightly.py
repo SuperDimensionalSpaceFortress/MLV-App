@@ -1691,6 +1691,19 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertNotIn("STAGE_SKIP_ALREADY", [r["outcome"] for r in self.rows()])
         self.nothing_built_or_submitted()
 
+    def test_a_backward_step_between_the_hand_off_and_the_modules_sample_never_re_grants_the_soundness_read(self) -> None:
+        # adversary A1 on c253316d: Sync-NightlyDeadline projects the monotonic budget into a UTC instant, and VenueChain.psm1 reads it back against ITS wall clock. A
+        # correction landing in that gap (-TestWallStepAfterSyncSec -60) made the module see 60 s more than was left, and the stale -CallCapSec (sampled before the
+        # 12 s scheduling delay) was all that bounded the stuck read: it ran 17 s from a point with 5 s left. The hand-off now also carries the Stopwatch and its end
+        # (-CallBudgetClock/-CallBudgetEndSec, the lease batch's form), which no wall clock can move, so the read ends at the 20 s cap.
+        self.stage_cache()
+        p = self.run_driver("-MaxTotalSec", "20", "-TestSoundnessPostCapDelayMs", "12000", "-TestSoundnessReadDelayMs", "600000", "-TestWallStepAfterSyncSec", "-60",
+                            "-TestSoundnessCapAt", "first", probe="20", timeout=200)
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        total = self.result(p.stdout)["timings"]["totalSec"]
+        self.assertLess(total, 24.0, f"the call ran {total} s under a 20 s cap: the step re-granted the read\n{p.stdout}")
+        self.nothing_built_or_submitted()
+
     def test_a_backward_clock_step_never_hands_a_child_a_later_bound_than_the_true_remaining_budget(self) -> None:
         # (c) the assembler's heavy-slot bound is an absolute instant in the (stepped) wall clock: now + what is left on the monotonic clock. The original
         # start + 600 s instant is 3600 s LATER than that in the stepped clock, which is the extra wait a child would be given.
@@ -1735,6 +1748,10 @@ class SoundnessReadCapNeverZeroTests(unittest.TestCase):
         self.assertIsNotNone(left, "the one helper every budget site reads")
         self.assertNotIn("Get-WallUtc", left.group(1))
         self.assertGreaterEqual(code.count("Get-NightlyLeftSec"), 10)
+        # adversary A1 on c253316d: every soundness read is also handed the monotonic budget (a wall clock stepping between the UTC projection and the module's sample cannot move it)
+        calls = [l for l in code.splitlines() if "Get-VenueStagedBuildManifest -AgentShare" in l]
+        self.assertTrue(calls)
+        self.assertTrue(all("-CallBudgetClock $script:Sw -CallBudgetEndSec $script:BudgetSec" in l for l in calls), calls)
 
     def test_r9_g13_the_soundness_read_refusals_name_what_was_submitted_per_path(self) -> None:
         # Grok G13: the final verify runs after the stage job was submitted, so its refusals never say "nothing was submitted"; step 4 and step 8 still do.
