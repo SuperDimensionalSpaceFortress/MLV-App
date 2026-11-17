@@ -2161,7 +2161,9 @@ if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r20 INV-1')) {
     Assert-That (-not (Test-GitRemoteUrlSame '/srv/git/Lease' '/srv/git/lease')) 'r20 INV-1 url: POSIX local paths that differ in case are two repositories'
     Assert-That (-not (Test-GitRemoteUrlSame 'https://nas.example/repos/Lease.git' 'https://nas.example/repos/lease.git')) 'r20 INV-1 url: https paths on a non-GitHub host compare ordinally'
     Assert-That (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r20 INV-1 url control: an identical URL is the same repository'
-    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r20 INV-1 url control: the scp-like and ssh:// spellings of one path are the same repository'
+    # r21 (sol r20 B1; hub ruling 20261117T0822Z): the r20 control here was WRONG and is flipped. Git sends git-upload-pack 'repos/lease.git' (home-relative) for the scp-like
+    # form and git-upload-pack '/repos/lease.git' (absolute) for the ssh:// form: two repositories.
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'ssh://git@nas.example/repos/lease.git')) 'r21 B1 url (flips the r20 control): a home-relative scp-like path and an absolute ssh:// path are two repositories'
     Assert-That (Test-GitRemoteUrlSame 'ssh://git@NAS.Example/repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r20 INV-1 url control: a host name differing only in case is the same repository'
     Assert-That (Test-GitRemoteUrlSame 'git@GitHub.com:Owner/Repo.git' 'https://github.com/owner/repo') 'r20 INV-1 url control: github.com keeps its case-insensitive, .git-optional rule'
 }
@@ -2169,12 +2171,17 @@ if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r20 INV-1')) {
     foreach ($r20pair in @(
             @('ssh://git@nas.example/repos/Lease.git', 'ssh://git@nas.example/repos/lease.git'),
             @('git@nas.example:repos/Lease.git', 'git@nas.example:repos/lease.git'),
-            @('ssh://git@nas.example/repos/lease.git', 'ssh://git@nas.example/repos/lease'))) {
-        $r20ws = New-Scratch ('r20-inv1-' + [Math]::Abs($r20pair[1].GetHashCode()))
+            @('ssh://git@nas.example/repos/lease.git', 'ssh://git@nas.example/repos/lease'),
+            @('git@nas.example:repos/lease.git', 'ssh://git@nas.example/repos/lease.git'),   # r21 B1: home-relative scp-like fetch, absolute ssh:// push
+            @('nas.example:repos/lease.git', 'ssh://nas.example/repos/lease.git'),           # r21 B1: the user-less pair
+            @('ssh://git@nas.example/repos/lease.git', 'git@nas.example:repos/lease.git'),   # r21 B1: the reverse direction
+            @('ssh://git@nas.example:2222/repos/lease.git', 'ssh://git@nas.example/repos/lease.git'))) {   # r21 B1: a port is never normalised away
+        $r20key = [Math]::Abs(($r20pair[0] + '|' + $r20pair[1]).GetHashCode())   # r21: keyed on BOTH urls (pairs that share a push url used to share one scratch repository)
+        $r20ws = New-Scratch ('r20-inv1-' + $r20key)
         $r20repo = Join-Path $r20ws 'repo'; [void][IO.Directory]::CreateDirectory($r20repo); & git -C $r20repo init -q 2>$null
         & git -C $r20repo remote add fork $r20pair[0]; & git -C $r20repo remote set-url --push fork $r20pair[1]   # configuration only: no network is touched
         $savedRepo = $script:Repo; $savedTemp = $env:TEMP; $savedLog = $script:LogFile; $savedName = $GitName; $savedEmail = $GitEmail
-        $script:Repo = $r20repo; $Repo = $r20repo; $env:TEMP = New-Scratch ('r20-inv1-temp-' + [Math]::Abs($r20pair[1].GetHashCode())); $script:LogFile = Join-Path $r20ws 'lease.log'
+        $script:Repo = $r20repo; $Repo = $r20repo; $env:TEMP = New-Scratch ('r20-inv1-temp-' + $r20key); $script:LogFile = Join-Path $r20ws 'lease.log'
         $GitName = 'r20 test'; $script:GitName = 'r20 test'; $GitEmail = 'r20@example.invalid'; $script:GitEmail = 'r20@example.invalid'
         $r20ident = @{}; foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { $r20ident[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, 'r20 test') }
         $r20err = ''
@@ -2185,6 +2192,24 @@ if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r20 INV-1')) {
         }
         Assert-That ($r20err -match 'LEASE_PUSH_URL_DIFFERS') "r20 INV-1 lease: fetch $($r20pair[0]) / push $($r20pair[1]) is refused before any push" $r20err
     }
+}
+# r21 B1 (sol r20): normalise to (user, host, the server path as Git sends it to git-upload-pack). scp-like 'host:/p' is absolute '/p'; scp-like 'host:p' and 'host:~/p' are
+# home-relative '~/p'; ssh://host/p is absolute '/p'; ssh://host/~/p is home-relative '~/p'. A port, a '~user' form or anything else not mapped with certainty is UNEQUAL
+# unless the two strings are identical (the guard refuses).
+if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r21 B1')) {
+    Assert-That (-not (Test-GitRemoteUrlSame 'nas.example:repos/lease.git' 'ssh://nas.example/repos/lease.git')) 'r21 B1 url: the user-less home-relative scp-like / absolute ssh:// pair is two repositories'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/lease.git' 'git@nas.example:repos/lease.git')) 'r21 B1 url: the pair is unequal in the other argument order too'
+    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:/repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r21 B1 url control: an absolute scp-like path and the ssh:// form send the same absolute path to git-upload-pack'
+    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'ssh://git@nas.example/~/repos/lease.git') 'r21 B1 url control: a home-relative scp-like path equals ssh://host/~/path'
+    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'git@nas.example:~/repos/lease.git') 'r21 B1 url control: scp-like host:path equals host:~/path (both home-relative)'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:/repos/lease.git' 'ssh://git@nas.example/~/repos/lease.git')) 'r21 B1 url: an absolute path is not a home-relative one'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://git@nas.example:2222/repos/lease.git' 'ssh://git@nas.example/repos/lease.git')) 'r21 B1 url: a port form is unequal to the portless form'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://git@nas.example:22/repos/lease.git' 'git@nas.example:/repos/lease.git')) 'r21 B1 url: a port form is unequal to the scp-like form even for port 22'
+    Assert-That (Test-GitRemoteUrlSame 'ssh://git@nas.example:2222/repos/lease.git' 'ssh://git@nas.example:2222/repos/lease.git') 'r21 B1 url control: an identical port form is the same'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:~alice/repos/lease.git' 'ssh://git@nas.example/~alice/repos/lease.git')) 'r21 B1 url: a ~user form compares unequal to another spelling'
+    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:~alice/repos/lease.git' 'git@nas.example:~alice/repos/lease.git') 'r21 B1 url control: an identical ~user form is the same'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'git@nas.example:~/repos/Lease.git')) 'r21 B1 url: a home-relative path still compares ordinally'
+    Assert-That (Test-GitRemoteUrlSame 'git@github.com:Owner/Repo.git' 'ssh://git@github.com/owner/repo') 'r21 B1 url control: github.com ssh spellings still name one repository'
 }
 # r20 adversary pass 23 A2: an apostrophe in the USER part of 'https://user:password@host' does not hide the credential
 if ($fnLoaded -and (Test-Has 'Get-CredentialHitLine' 'r20 p23 A2')) {

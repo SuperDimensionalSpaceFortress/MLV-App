@@ -733,9 +733,11 @@ function Get-RedactedRemoteUrl {
 # r15 pass 13 A5: true when two git remote URLs name the same repository (r20: exactly; see below). An empty or unparseable URL never matches.
 #
 # r20 (sol r19 INV-1; hub ruling): the lease reads one repository and pushes to another when this says two URLs are the same, so equality is EXACT on the repository: the PATH
-# compares ordinally (case-sensitive) and a '.git' suffix or a trailing slash is significant. Only the scheme spelling (scp-like 'host:path' = 'ssh://host/path'; a scp-like
-# path is read as absolute, so 'host:/p' is '//p' and is not 'host:p') and the host name (case-insensitive) are normalised, and the ssh user is kept (a relative scp-like path
-# is relative to that user's home). A spelling that cannot be normalised with certainty (another scheme, a port, a query) compares UNEQUAL: the lease guard then refuses.
+# compares ordinally (case-sensitive) and a '.git' suffix or a trailing slash is significant. The host name (case-insensitive) is normalised and the ssh user is kept.
+# r21 (sol r20 B1; hub ruling 20261117T0822Z, which withdrew the r20 scp = ssh:// control): an ssh URL is normalised to (user, host, the server path AS GIT SENDS IT to
+# git-upload-pack). scp-like 'host:/p' is the absolute '/p' and equals 'ssh://host/p'; scp-like 'host:p' and 'host:~/p' are home-relative '~/p' and equal 'ssh://host/~/p'
+# but NOT 'ssh://host/p' (Git sends 'p' for the first and '/p' for the second: two repositories). A spelling that cannot be normalised with certainty (another scheme, a port,
+# a '~user' path, a query) compares UNEQUAL unless the two strings are identical: the lease guard then refuses.
 # Two documented exceptions: github.com (case-insensitive owner/repo, '.git' optional, https and 'git@' ssh the same repository) and a Windows drive or UNC local path (NTFS
 # is case-insensitive; separators and a trailing slash do not change it). Any other local path (a POSIX path, 'file://') is ordinal.
 function Test-GitRemoteUrlSame {
@@ -743,7 +745,7 @@ function Test-GitRemoteUrlSame {
     $norm = {
         param($u)
         $s = "$u".Trim()
-        $scheme = ''; $user = ''; $hostName = ''; $path = ''
+        $scheme = ''; $user = ''; $hostName = ''; $path = ''; $uncertain = $false
         $mUrl = [regex]::Match($s, '^(?i)(?!file://)([a-z][a-z0-9+.\-]*)://([^/]*)(.*)$')
         # scp-like [user@]host:path (git: no '/' before the first ':'); a host of one letter is a Windows drive ('C:/repos'), never a host
         $mScp = [regex]::Match($s, '^(?:([^/\\\s]+)@)?([^/\\\s:@]{2,}):(.*)$')
@@ -751,8 +753,18 @@ function Test-GitRemoteUrlSame {
             $scheme = $mUrl.Groups[1].Value.ToLowerInvariant(); $auth = $mUrl.Groups[2].Value; $path = $mUrl.Groups[3].Value
             $at = $auth.LastIndexOf('@')
             if ($at -ge 0) { $user = $auth.Substring(0, $at); $hostName = $auth.Substring($at + 1) } else { $hostName = $auth }
+            # r21 B1: ssh://host/~/p is home-relative '~/p' (Git strips the slash); ssh://host/p is absolute '/p'; ssh://host/~user/p is not mapped with certainty
+            if ($scheme -eq 'ssh') {
+                if ($path -match '^/~/') { $path = $path.Substring(1) } elseif ($path -match '^/~') { $uncertain = $true }
+            }
         } elseif ($mScp.Success -and $s -notmatch '^(?i)file:') {
-            $scheme = 'ssh'; $user = $mScp.Groups[1].Value; $hostName = $mScp.Groups[2].Value; $path = '/' + $mScp.Groups[3].Value
+            # r21 B1 (sol r20): the server path is what Git sends to git-upload-pack. scp-like 'host:/p' is the absolute '/p'; 'host:p' and 'host:~/p' are both home-relative
+            # and are kept as '~/p', NEVER given a leading '/' (that made 'host:p' equal to the absolute 'ssh://host/p'); 'host:~user/p' is not mapped with certainty.
+            $scheme = 'ssh'; $user = $mScp.Groups[1].Value; $hostName = $mScp.Groups[2].Value; $sp = $mScp.Groups[3].Value
+            if ($sp.StartsWith('/')) { $path = $sp }
+            elseif ($sp -match '^~/') { $path = $sp }
+            elseif ($sp.StartsWith('~')) { $uncertain = $true }
+            elseif ($sp) { $path = '~/' + $sp }
         } else {
             # r19 pass 21 A2: a LOCAL path names a directory exactly: '.git', '?x' and '#x' are part of it, so 'C:/repos/lease' and 'C:/repos/lease.git' are two repositories.
             if ($s -match '^(?:[a-zA-Z]:[\\/]|\\\\)') { return (($s -replace '\\', '/') -replace '/+$', '').ToLowerInvariant() }   # a drive or UNC path: separators, case, trailing slash
@@ -760,14 +772,17 @@ function Test-GitRemoteUrlSame {
         }
         $hostName = $hostName.ToLowerInvariant()
         if (-not $hostName -or $hostName -match '[\s]') { return '' }
+        # r21 B1: an ssh spelling not mapped with certainty (a '~user' path, a port or an IPv6 literal in the host part) is equal only to the identical string: the guard refuses
+        if ($scheme -eq 'ssh' -and ($uncertain -or $hostName.Contains(':'))) { return "raw:$s" }
         # github.com: documented case-insensitive and '.git'-optional; https (any userinfo is a token) and the 'git@' ssh forms name one repository
         if ($hostName -ceq 'github.com' -and (($scheme -in @('http', 'https')) -or ($scheme -in @('ssh') -and $user -ceq 'git'))) {
-            $gp = ($path -replace '[?#].*$', '').Trim('/') -replace '(?i)\.git$', ''
+            $gp = (($path -replace '[?#].*$', '') -replace '^~/', '').Trim('/') -replace '(?i)\.git$', ''
             if (-not $gp) { return '' }
             return ('https://github.com/' + $gp).ToLowerInvariant()
         }
-        if (-not $path -or $path -eq '/') { return '' }
-        if ($scheme -eq 'ssh') { return "ssh://$user@$hostName$path" }
+        if (-not $path -or $path -eq '/' -or $path -eq '~/') { return '' }
+        # r21 B1: the key keeps the two path kinds apart: an absolute path starts with '/', a home-relative one with '~/' (they never compare equal)
+        if ($scheme -eq 'ssh') { return "ssh://$user@$hostName|$path" }
         if ($scheme -in @('http', 'https')) { return "${scheme}://$hostName$path" }   # a user / token part does not change which repository an https URL names
         return "${scheme}://$user@$hostName$path"   # any other scheme: kept whole (user included); equal only when spelled identically
     }
