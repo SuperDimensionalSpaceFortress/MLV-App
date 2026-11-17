@@ -2390,6 +2390,21 @@ $script:DvCanonicalFlavorToken = [regex]::new('\A[a-z0-9_]+\z', [System.Text.Reg
 # folds U+212A (Kelvin sign) to `k`, which hid a masked conflicting key; a whitespace-only `(^|\s)` start missed `,look_assist_flavor=classic`.
 $script:DvLookKeyStart = '(?<!(?-i:[A-Za-z0-9_]))'
 
+function Get-DvLookKeyTokens {
+    <#
+    .SYNOPSIS
+    r26 adversary pass 2 A1 on eed44c40: every token one look_assist key names in a record body, for the AMBIGUITY counts of Get-DvLookAssistEvidence.
+    A mention is the key in any case ($script:DvCi) bounded on both sides by non-name characters (ASCII, case-sensitive: $script:DvLookKeyStart and the
+    lookahead below). A mention followed by a plain `=` yields its value (`\S*`, empty included); any other mention -- a masked `=` (U+001A), a space,
+    a colon, nothing -- yields the mask token, UNREADABLE and never an applied flavor. So a malformed key is a token, never absent; it never proves one.
+    #>
+    param([AllowEmptyString()][string]$Body, [Parameter(Mandatory)][ValidatePattern('^[a-z_]+$')][string]$Key)
+    $mask = [string]$script:DvQuotedEqualsMask
+    foreach ($m in [regex]::Matches($Body, ($script:DvLookKeyStart + $Key + '(?!(?-i:[A-Za-z0-9_]))(?<eq>=(?<v>\S*))?'), $script:DvCi)) {
+        if ($m.Groups['eq'].Success) { $m.Groups['v'].Value } else { $mask }
+    }
+}
+
 function Test-DvLookFlavorSame {
     <#
     .SYNOPSIS
@@ -2446,9 +2461,11 @@ function Get-DvLookAssistEvidence {
                     # r26 adversary A1 + A2 on 2f131c49 (inputs: `... diagnostic=' <U+212A>look_assist_flavor=classic` and `... ,look_assist_flavor=classic`):
                     # a key counts wherever it is bounded by a NON-name character ($script:DvLookKeyStart: ASCII, case-sensitive even under $script:DvCi, so the
                     # Kelvin sign is no name character and a comma, quote or any other punctuation starts a key), never only after whitespace
-                    foreach ($ft in [regex]::Matches($line, ($script:DvLookKeyStart + 'look_assist_flavor=(?<f>\S*)'), $script:DvCi)) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
-                    $maskedFlavorKey = [regex]::IsMatch($line, ($script:DvLookKeyStart + 'look_assist_flavor\x1A'), $script:DvCi)
-                    if ($maskedFlavorKey) { [void]$flavorsSeen.Add([string]$script:DvQuotedEqualsMask) }
+                    # r26 adversary pass 2 A1 on eed44c40 (inputs: `look_assist_flavor =classic`, a bare `look_assist_flavor`, `LOOK_ASSIST_FLAVOR:classic`,
+                    # `diagnostic='look_assist_flavor classic end'`): EVERY bounded mention of the key is a token (Get-DvLookKeyTokens); one not followed by
+                    # a plain `=` is UNREADABLE (the mask token), never absent
+                    $lineFlavorTokens = @(Get-DvLookKeyTokens -Body $line -Key 'look_assist_flavor')
+                    foreach ($ft in $lineFlavorTokens) { [void]$flavorsSeen.Add($ft) }
                     # r26 (sol r25 B1 on 620182b3, its input: an earlier `... diagnostic="harmless (text)" x (look_assist_flavor=classic` record, cut to
                     # LOCATION_UNREADABLE, then an intact cinematic record): a visual_state record that LOST ITS TAIL may have named any flavor there, so it
                     # adds an UNREADABLE flavor token ($script:DvLocationUnreadable holds spaces, so no `\S*` token ever equals it) and no flavor is proven,
@@ -2457,8 +2474,7 @@ function Get-DvLookAssistEvidence {
                     # it was cut short -- opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1: the UNQUOTED reject reason `transform (upside down) enabled`
                     # (GpuPreviewProcessing.cpp) opens a ` (` that Get-DvLocationOpenIndex takes for the location, and with a readable `:<line>)` tail the
                     # flavor vanished with no sentinel at all. An app build that writes no flavor key proves no flavor either way (exactFlavor below).
-                    $hasFlavorKey = $maskedFlavorKey -or [regex]::IsMatch($line, ($script:DvLookKeyStart + 'look_assist_flavor='), $script:DvCi)
-                    if ($line.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) -or -not $hasFlavorKey) { [void]$flavorsSeen.Add($script:DvLocationUnreadable) }
+                    if ($line.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) -or $lineFlavorTokens.Count -eq 0) { [void]$flavorsSeen.Add($script:DvLocationUnreadable) }
                 }
             }
         }
@@ -2486,10 +2502,9 @@ function Get-DvLookAssistEvidence {
                 $exactFlavor = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value })
                 # r26 adversary A1 + A2 on 2f131c49: every ambiguity count takes a key bounded by any non-name character ($script:DvLookKeyStart), plain
                 # or masked; the proof ($exactFlavor) stays the app's own whitespace-bounded lower-case token, so a wider count only ever adds tokens
-                $flavorTokens = @([regex]::Matches($found, ($script:DvLookKeyStart + 'look_assist_flavor=(?<f>\S*)'), $script:DvCi) | ForEach-Object { $_.Groups['f'].Value }) +
-                                @([regex]::Matches($found, ($script:DvLookKeyStart + 'look_assist_flavor\x1A'), $script:DvCi) | ForEach-Object { $maskToken })
-                $enabledTokens = @([regex]::Matches($found, ($script:DvLookKeyStart + 'look_assist_enabled=(?<v>\S*)'), $script:DvCi) | ForEach-Object { $_.Groups['v'].Value }) +
-                                 @([regex]::Matches($found, ($script:DvLookKeyStart + 'look_assist_enabled\x1A'), $script:DvCi) | ForEach-Object { $maskToken })
+                # r26 adversary pass 2 A1 on eed44c40: every bounded mention of either key, whatever follows it (Get-DvLookKeyTokens)
+                $flavorTokens = @(Get-DvLookKeyTokens -Body $found -Key 'look_assist_flavor')
+                $enabledTokens = @(Get-DvLookKeyTokens -Body $found -Key 'look_assist_enabled')
                 # r26 (sol r25 B2): distinct ORDINALLY (Select-Object -Unique compares linguistically, so `cinematic` and `cinematic<U+200B>` were one
                 # value), and the one value must be an ASCII-canonical applied flavor (Test-DvAppliedLookFlavor), never a -ccontains match
                 $lastFlavors = @([System.Collections.Generic.HashSet[string]]::new([string[]]@($flavorTokens), [StringComparer]::Ordinal))
