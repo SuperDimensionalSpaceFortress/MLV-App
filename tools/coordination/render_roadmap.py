@@ -87,16 +87,18 @@ TOKEN_TRAILING_PUNCT = ".,;:)]}'\""
 # It is exactly as many budget bytes as the header it replaced (970): a longer header moves every board's tier boundary, and a board
 # pushed from an owner-aware tier into the bare one is read by textual day instead of UTC day (adversary r2 A2). The stale "whose 16 rows
 # had mostly landed" history sentence is what paid for the longer freshness text.
+# What the drift detector (board-local roadmap-tracked-drift.ps1) really compares: card names, priorities and the WORDS of the scope notes above
+# the open table (whitespace-normalised). Not the parked notes, not state or kind, not the generated stamp or the Drain section (r3 sol D-06).
 HEADER = """\
 # MLV-App product roadmap
 
 Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`,
-the live dispatch surface. That file sits under `.claude-state/hub-autopilot/`,
+the dispatch surface. That file sits under `.claude-state/hub-autopilot/`,
 gitignored, absent from hosted checkouts, so this is the only place a reviewer
 without local state sees the open backlog. Where they disagree, `card-queue.json`
-wins: re-render, do not edit by hand. The hub renders a live copy to
+wins: re-render, do not edit by hand. The hub renders a copy to
 `.claude-state/heartbeat/roadmap-live.md` every hour. When its
-open cards, priorities or notes differ from the live queue and it is 7 or more days old,
+open cards, priorities or pre-table note words differ from the queue and it is 7 or more days old,
 a drift detector files a refresh card. `--check` is a manual tool; no CI job runs it.
 
 Only rows with `kind` of `product` or `playback` are shown, plus owner asks

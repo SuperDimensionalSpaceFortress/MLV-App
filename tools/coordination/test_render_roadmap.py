@@ -258,8 +258,11 @@ class OutputShapeTests(unittest.TestCase):
         self.assertIn("7 or more days old", text)
         self.assertIn("refresh card", text)
         self.assertIn("`--check` is a manual tool", text)
-        # the drift detector compares open rows and scope notes only (not the generated stamp, the Drain section or a state-only change)
-        self.assertIn("open cards, priorities or notes differ", text)
+        # the drift detector compares card names, priorities and the WORDS of the scope notes above the open table (whitespace-normalised): not the
+        # generated stamp, the Drain section, a state-only change or the parked notes (r3 sol blocker D-06: "notes differ" claimed all of them)
+        # (the header must not use the word "scope": a queue without scope notes renders none, see ScopeNoteTests)
+        self.assertIn("open cards, priorities or pre-table note words differ", text)
+        self.assertNotIn("or notes differ", text)
 
     def test_the_bare_tier_header_drops_the_false_claim_at_master_s_byte_count(self) -> None:
         # The bare tier is held to master's byte count (the 20000-byte window): its true sentence is the same 40 bytes as the false one it replaces.
