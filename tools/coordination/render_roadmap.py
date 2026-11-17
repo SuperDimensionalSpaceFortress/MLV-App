@@ -286,12 +286,20 @@ def drain_line(data: dict) -> str:
         _drain_line(len(open_rows), landed_total, queued_total))
 
 
+def _budget_size(text: str) -> int:
+    """The size the budget is held to: the file as a CRLF checkout (core.autocrlf=true) has it, the larger of the two line-break
+    forms. test_roadmap_queue_parity.py measures docs/roadmap.md by st_size, so a board that fits only as LF text (r4 pass 1 A1:
+    19972 LF bytes, 20039 CRLF) failed that test on a Windows checkout. Text holds no bare CR (cells and notes are printable)."""
+    return len(text.replace("\n", "\r\n").encode("utf-8"))
+
+
 def render(data: dict) -> str:
     """The roadmap text. Each owner list starts at OWNER_LIST_MAX rows and all of them shrink, one row at a time, while the file is
-    over ROADMAP_BUDGET_BYTES; product and playback rows are never dropped (a file over budget at cap 0 is over on product alone)."""
+    over ROADMAP_BUDGET_BYTES (_budget_size); product and playback rows are never dropped (a file over budget at cap 0 is over on
+    product alone)."""
     for cap in range(OWNER_LIST_MAX, -1, -1):
         text = _render(data, cap)
-        if len(text.encode("utf-8")) <= ROADMAP_BUDGET_BYTES:
+        if _budget_size(text) <= ROADMAP_BUDGET_BYTES:
             return text
     # (r3 A1 on 6c9167ce, hub ruling: FIX) cap 0 is still over budget, yet its count lines, the "(incl. N ...)" suffix and the
     # owner rows' drain counts still cost bytes. Collapse: render the board as the base did (product/playback rows only, an owner
@@ -600,6 +608,9 @@ def main(argv: list[str] | None = None) -> int:
             on_disk = args.out.read_bytes().decode("utf-8").replace("\r\n", "\n")
         except OSError:
             print("render_roadmap: %s is missing" % args.out, file=sys.stderr)
+            return 1
+        except UnicodeDecodeError:   # (r4 advisory A3) bytes that are not UTF-8 differ from the render: a comparison status, not a traceback
+            print("render_roadmap: %s is stale (not valid UTF-8); re-run without --check" % args.out, file=sys.stderr)
             return 1
         if on_disk != text:
             print("render_roadmap: %s is stale; re-run without --check" % args.out, file=sys.stderr)

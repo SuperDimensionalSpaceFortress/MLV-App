@@ -772,7 +772,7 @@ class R2AdversaryTests(unittest.TestCase):
 
     def test_a3_112_parked_owner_rows_with_100_char_notes_fit_the_budget(self) -> None:
         text = render_roadmap.render(self.adversary_a3_board())
-        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
         owed = text.split("## Parked owner asks")[1].split("## Parked with reason")[0]
         self.assertEqual(sum(1 for l in owed.splitlines() if l.startswith("- OWNER-")), render_roadmap.OWNER_LIST_MAX)
         self.assertIn("- ... and %d more owner asks parked (card-queue.json)" % (112 - render_roadmap.OWNER_LIST_MAX), owed)
@@ -794,7 +794,7 @@ class R2AdversaryTests(unittest.TestCase):
                 for i in range(400)]
         rows.append(row("PRODUCT-1", "queued", "2026-10-21T00:00:00Z"))
         text = render_roadmap.render(self.board(*rows))
-        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
         cards = table_cards(text)
         self.assertIn("PRODUCT-1", cards)   # a product row is never dropped
         self.assertEqual(sum(1 for c in cards if c.startswith("OWNER-")), render_roadmap.OWNER_LIST_MAX)
@@ -806,7 +806,7 @@ class R2AdversaryTests(unittest.TestCase):
         rows = [row("OWNER-%03d" % i, "parked", "2026-10-20T00:00:00Z", kind="factory", origin="owner", notes="x" * 140,
                     resolution=render_roadmap.RESOLUTIONS[i % 5]) for i in range(400)]
         text = render_roadmap.render(self.board(*rows))
-        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
         self.assertIn("- 400 owner asks of another kind are closed with a resolution "
                       "(done 80, duplicate 80, superseded 80, no_go 80, refused 80; card-queue.json)", text)
 
@@ -830,7 +830,7 @@ class R2Pass4Tests(R2AdversaryTests):
     def test_p4_a2_owner_lines_never_push_the_file_over_budget(self) -> None:
         resolved = [row("OWNER-%03d" % i, "parked", "2026-10-20T00:00:00Z", origin="owner", resolution="done", notes="x" * 100)
                     for i in range(140)]
-        self.assertLessEqual(len(render_roadmap.render(self.board(*resolved)).encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertLessEqual(render_roadmap._budget_size(render_roadmap.render(self.board(*resolved))), ROADMAP_BUDGET_BYTES)
         self.assertIn("more owner asks closed with a resolution (card-queue.json)", render_roadmap.render(self.board(*resolved)))
         self.assert_rejected(self.board(*[row("OWNER-%03d" % i, "queued", "2026-10-20T00:00:00Z", kind="qa-" + "x" * 800,
                                               origin="owner", notes="x" * 100) for i in range(25)]), "kind")
@@ -841,7 +841,7 @@ class R2Pass4Tests(R2AdversaryTests):
         big += [row(("P%03d-" % i) + "C" * 115, "parked", "2026-10-20T00:00:00Z", origin="owner", resolution="no_go", notes="x" * 300)
                 for i in range(150)]
         text = render_roadmap.render(self.board(*big))
-        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
         for i in range(5):
             self.assertIn("PRODUCT-%d" % i, table_cards(text))   # a product row is never dropped to fit
 
@@ -917,6 +917,7 @@ class R3Tests(unittest.TestCase):
     A1 owner rows add zero bytes once cap 0 is over budget; A2 every string in the queue must be UTF-8; A3 no whitespace in a stamp."""
 
     STAMP = "2026-10-20T00:00:00Z"
+    _boundary_n: "int | None" = None   # boundary_note_length(), derived once
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -952,14 +953,34 @@ class R3Tests(unittest.TestCase):
                 return exc.code
 
     # A1 (introduced, major): at cap 0 the owner count lines, the "(incl. N ...)" suffix and the owner stats still added bytes.
+    def boundary_note_length(self) -> int:
+        """The longest scope note that keeps the 300-product-row board within 2 bytes of the budget as the budget is measured (r4: the
+        CRLF form). Before r4 the note was 700 characters, which put the LF text at 19998 bytes; derived now, not hard-coded."""
+        if R3Tests._boundary_n is not None:
+            return R3Tests._boundary_n
+        rows = [row("PRODUCT-%03d" % i, "queued", self.STAMP) for i in range(300)]
+        data = self.board(*rows)
+
+        def size(n: int) -> int:
+            data["scope_notes"] = [{"title": "S", "text": "x" * n}]
+            return render_roadmap._budget_size(render_roadmap.render(data))
+
+        n = 700 - max(0, size(700) - (ROADMAP_BUDGET_BYTES - 2))
+        while size(n) > ROADMAP_BUDGET_BYTES - 2:
+            n -= 1
+        while size(n + 1) <= ROADMAP_BUDGET_BYTES - 2:
+            n += 1
+        R3Tests._boundary_n = n
+        return n
+
     def a1_board(self, *extra: dict) -> dict:
         rows = [row("PRODUCT-%03d" % i, "queued", self.STAMP) for i in range(300)]
         data = self.board(*rows, *extra)
-        data["scope_notes"] = [{"title": "S", "text": "x" * 700}]
+        data["scope_notes"] = [{"title": "S", "text": "x" * self.boundary_note_length()}]
         return data
 
     def size(self, data: dict) -> int:
-        return len(render_roadmap.render(data).encode("utf-8"))
+        return render_roadmap._budget_size(render_roadmap.render(data))   # r4: the CRLF form, the larger one the budget is held to
 
     def test_a1_the_adversary_baseline_is_at_the_boundary(self) -> None:
         base = self.size(self.a1_board())
@@ -978,7 +999,7 @@ class R3Tests(unittest.TestCase):
         for name, owner in variants.items():
             with self.subTest(variant=name):
                 text = render_roadmap.render(self.a1_board(owner))
-                self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+                self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
                 self.assertNotIn("owner ask", text.split("## Parked owner asks")[0].split("## Drain")[1])   # no (incl. ...) suffix
                 self.assertNotIn("more owner asks", text)
                 self.assertEqual(sum(1 for c in table_cards(text) if c.startswith("PRODUCT-")), 300)   # product rows never drop
@@ -1092,7 +1113,7 @@ class R3Pass7Tests(R3Tests):
     # A1: in the collapsed state a closed owner ask (parked or merged, any kind) must not reach the drain counts either.
     def p7_board(self, *extra: dict) -> dict:
         data = self.a1_board(*extra)
-        data["scope_notes"] = [{"title": "S", "text": "x" * 701}]
+        data["scope_notes"] = [{"title": "S", "text": "x" * (self.boundary_note_length() + 1)}]
         return data
 
     def p7_owners(self, **extra) -> list:
@@ -1243,6 +1264,42 @@ class R4DepthTests(unittest.TestCase):
     def test_a1_live_shaped_rows_are_nowhere_near_the_bound(self) -> None:
         self.assertEqual(self.load_code(json.dumps(load_fixture()))[0], 0)
         self.assertLessEqual(render_roadmap.MAX_NESTING, 100)   # a bound that would not stop the 3,000-deep input is no bound
+
+
+class R4BudgetTests(unittest.TestCase):
+    """OWNER-ASK-PARK-GUARD-1 r4 pass 1 A1 (review-adversary-OWNER-ASK-PARK-GUARD-1-r4-7304a0c2). test_roadmap_queue_parity.py holds
+    docs/roadmap.md to 20000 bytes by st_size, so a Windows checkout (core.autocrlf=true) counts every line break as two bytes. The
+    render budget is measured on that larger CRLF form, so the file is within budget in either checkout format."""
+
+    def crlf_size(self, text: str) -> int:
+        return len(text.replace("\n", "\r\n").encode("utf-8"))
+
+    def adversary_board(self) -> dict:
+        rows = [row("OWNER-%03d" % i, "parked", "2026-10-20T00:00:00Z", kind="hub-tooling", origin="owner", notes="n" * 100)
+                for i in range(112)]
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z", "rows": rows,
+                "scope_notes": [{"title": "S", "text": "x" * 8000}]}
+
+    def test_a1_the_adversary_board_fits_the_budget_in_a_crlf_checkout(self) -> None:
+        text = render_roadmap.render(self.adversary_board())
+        self.assertLessEqual(self.crlf_size(text), ROADMAP_BUDGET_BYTES)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+
+    def test_a3_check_on_an_output_that_is_not_utf8_is_a_comparison_status(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        q = Path(tmp.name) / "q.json"
+        q.write_text(json.dumps({"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z", "rows": []}), encoding="utf-8")
+        out = Path(tmp.name) / "roadmap.md"
+        out.write_bytes(b"\xff")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out), "--check"]), 1)
+
+    def test_a1_the_budget_measure_is_the_crlf_size(self) -> None:
+        for text in ("a\nb\n", "no break", "ae\xe9\n\n"):
+            with self.subTest(text=text):
+                self.assertEqual(render_roadmap._budget_size(text), self.crlf_size(text))
+
 
 
 if __name__ == "__main__":
