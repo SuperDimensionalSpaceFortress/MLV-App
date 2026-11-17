@@ -33987,7 +33987,12 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
 int MainWindow::presentedPlaybackScaleShown( void ) const
 {
     const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;
-    if( !telemetryBoolValue( telemetry, "playback_prep_cpu_route_active" ) ) return m_lastPresentedPlaybackScaleFactorActive;
+    if( !telemetryBoolValue( telemetry, "playback_prep_cpu_route_active" ) )
+    {
+        // r13 (adversary pass 16 A1 on deb5a42b): an unreduced CPU-debayered frame is shown at the size the render achieved.
+        const int unreduced = presentedPlaybackUnreducedCpuDebayerScale();
+        return unreduced > 0 ? unreduced : m_lastPresentedPlaybackScaleFactorActive;
+    }
     return playback_info_label::presentedScaleOfCpuPrepRoute( m_lastPresentedPlaybackScaleFactorActive,
                                                              telemetryIntValue( telemetry, "render_thread_source_width" ),
                                                              telemetryIntValue( telemetry, "render_thread_rendered_width" ),
@@ -34003,9 +34008,24 @@ int MainWindow::presentedPlaybackScaleShown( void ) const
 int MainWindow::presentedPlaybackDebayerScale( void ) const
 {
     const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;
-    if( !telemetryBoolValue( telemetry, "playback_prep_cpu_route_active" ) ) return 0;
+    // r13 (adversary pass 16 A1 on deb5a42b): and an unreduced CPU-debayered frame the CPU prep did not take (GPU prep)
+    if( !telemetryBoolValue( telemetry, "playback_prep_cpu_route_active" ) ) return presentedPlaybackUnreducedCpuDebayerScale();
     return playback_info_label::debayerScaleOfCpuPrepRoute( telemetryIntValue( telemetry, "render_thread_source_width" ),
                                                             telemetryIntValue( telemetry, "render_thread_rendered_width" ) );
+}
+
+// LOOK-LABEL-PLAYBACK-INFO-1 r13 (adversary pass 16 A1 on deb5a42b): an OutputDebayered16 frame the CPU debayered (no CPU
+// processed stage, no GPU recon, no GPU debayer) and the CPU prep did not take reports the requested scale, though GPU preview
+// processing presents it as rendered; its own sizes say the scale it was debayered and shown at (0 = not such a frame).
+int MainWindow::presentedPlaybackUnreducedCpuDebayerScale( void ) const
+{
+    const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;
+    return playback_info_label::unreducedCpuDebayerScale(
+        telemetryBoolValue( telemetry, "processed16_stage_measured" ),
+        telemetryBoolValue( telemetry, "gpu_playback_recon_used" ),
+        m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer,
+        telemetryIntValue( telemetry, "render_thread_source_width" ),
+        telemetryIntValue( telemetry, "render_thread_rendered_width" ) );
 }
 
 int MainWindow::presentedPlaybackRouteCode( void ) const

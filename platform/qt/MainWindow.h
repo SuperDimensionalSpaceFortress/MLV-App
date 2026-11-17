@@ -2383,6 +2383,8 @@ private:
     int presentedPlaybackScaleShown( void ) const;
     // r13 adversary pass 15 A1: the scale a CPU prep frame was debayered at (the render's achieved size; 0 = not a prep frame).
     int presentedPlaybackDebayerScale( void ) const;
+    // r13 adversary pass 16 A1: an unreduced CPU-debayered frame's achieved scale (0 = not such a frame).
+    int presentedPlaybackUnreducedCpuDebayerScale( void ) const;
     // The presented pipeline status and the scope caveat, shared by the toolbar indicator and the info label.
     void presentedGpuPlaybackPipelineStatus( GpuPlaybackPipelineStatus &status, bool &scopePerformanceCaveat ) const;
     // r1 adversary A1/A3: relabels only when a pipeline/scale/debayer input changed (int compares; safe per presented frame).

@@ -258,6 +258,16 @@ inline int debayerScaleOfCpuPrepRoute( int sourceWidth, int renderedWidth )
     return ( achieved == 1 || achieved == 2 || achieved == 4 || achieved == 8 ) ? achieved : 0;
 }
 
+/*! \brief r13 (adversary pass 16 A1 on deb5a42b): a CPU-debayered OutputDebayered16 frame that the CPU prep did not take (GPU
+ *  preview processing presents the RGB16 as rendered) is shown, and was debayered, at the size the render achieved; the render
+ *  thread reports the requested scale for it. Only for such a frame: no CPU processed stage, no GPU recon, no GPU debayer.
+ *  0 = not such a frame or unreadable sizes (the caller keeps the render's report). */
+inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuRecon, bool gpuDebayer, int sourceWidth, int renderedWidth )
+{
+    if( processedStageMeasured || gpuRecon || gpuDebayer ) return 0;
+    return debayerScaleOfCpuPrepRoute( sourceWidth, renderedWidth );
+}
+
 /*! \brief r13 (keys B1, hardening H-a): the facts of the presented frame that decide whether its CPU route tag
  *  (render_thread_phase4b_path) names what ran. MainWindow::presentedPlaybackRouteCode reads them from that frame's own
  *  telemetry; a processed-8 cache hit replays the tag the engine stored with the frame (video_mlv.c resets it to 0 on the

@@ -1161,3 +1161,51 @@ TEST(PlaybackInfoLabel, R13P15A2APlayToggleClearsThePreviousPlaysStall)
     ASSERT_TRUE(source.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
     ASSERT_TRUE(source.contains(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;")));
 }
+
+// r13 adversary pass 16 A1 (deb5a42b): ordinary 1920x1088 AMaZE receipt, Don't Switch Debayer, MLVAPP_EXPERIMENTAL_GL_VIEWPORT=1,
+// GPU preview processing, CPU debayer backends, GPU recon texture route off, MLVAPP_PLAYBACK_SCALE_FACTOR=2,
+// MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE=1. OutputDebayered16 debayers full-size CPU AMaZE and the GPU prep presents it at 1920
+// wide, but the render thread reports the requested 2 and the frame is not on the CPU prep route: both surfaces read "Half" and
+// "AMaZE->Scaled". Such a frame is shown, and was debayered, at the size the render achieved: "Half->Full" and "AMaZE".
+TEST(PlaybackInfoLabel, R13P16A1GpuPrepFrameDebayeredFullSizeNamesFullAndTheSelectedDebayer)
+{
+    // the finding's frame: no CPU processed stage, no GPU recon, no GPU debayer, rendered 1920 of 1920 -> 1
+    ASSERT_EQ(1, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 1920));
+    // a reduced recon consumed by the render (960 of 1920) -> 2
+    ASSERT_EQ(2, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 960));
+    // any other frame keeps the render's report (0): a CPU processed frame, the GPU recon, a GPU debayer, unreadable sizes
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(true, false, false, 1920, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, true, false, 1920, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, true, 1920, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, false, 0, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 0));
+    for (int scale : {2, 4}) {
+        playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+        f.processingBadge = QStringLiteral("GPU Preview");
+        f.gpuDisplay = true;
+        f.dualIsoClip = false;
+        f.requestedScale = scale;
+        const int shown = playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 1920);
+        f.presentedScale = shown > 0 ? shown : scale;
+        f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, scale, f.requestedScale, f.presentedScale);
+        f.debayerScale = shown;
+        ASSERT_QSTR_EQ(QString(PlaybackScaleLabel::fractionWord(scale)) + QStringLiteral("->Full"), playback_info_label::scaleField(f));
+        ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+        const QString overlay = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+        ASSERT_FALSE(overlay.contains(QStringLiteral("->Scaled")));
+    }
+    // the wiring: the shown scale and the debayer scale both read the one accessor for a frame off the CPU prep route
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString unreduced = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackUnreducedCpuDebayerScale("));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("playback_info_label::unreducedCpuDebayerScale(")));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"processed16_stage_measured\" ),")));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"gpu_playback_recon_used\" ),")));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer,")));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_source_width\" ),")));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_rendered_width\" ) );")));
+    const QString shownBody = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackScaleShown("));
+    ASSERT_TRUE(shownBody.contains(QStringLiteral("const int unreduced = presentedPlaybackUnreducedCpuDebayerScale();")));
+    ASSERT_TRUE(shownBody.contains(QStringLiteral("return unreduced > 0 ? unreduced : m_lastPresentedPlaybackScaleFactorActive;")));
+    const QString debayerBody = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackDebayerScale("));
+    ASSERT_TRUE(debayerBody.contains(QStringLiteral("return presentedPlaybackUnreducedCpuDebayerScale();")));
+}
