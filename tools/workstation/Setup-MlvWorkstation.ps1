@@ -184,10 +184,39 @@ function ConvertTo-RedactedUrlText {
     return ([regex]::Replace($s, '(?im)([a-z][a-z0-9+.\-]*://[^\r\n?#]*)[?#][^\r\n]*', '$1?***'))
 }
 
+# MINI3-CUTOVER-CREDENTIAL-DETECTOR-DENY-BY-DEFAULT-1 S3: the secret PARTS of every url this run hands to git or prints. Git can echo a url WITHOUT its scheme (a file://
+# clone that fails prints "fatal: '/C:/r.git?token=x' does not appear to be a git repository"), and ConvertTo-RedactedUrlText keys on 'scheme://', so it saw no url at
+# all and the token reached the log and the console. Register-UrlSecretParts records, for each 'scheme://' url in a text: the text after its first '?' or '#' (to the end
+# of the line), and the userinfo before the authority's last '@' when it holds a ':' (user:password: the whole userinfo and the password) or the scheme is http(s) (a token
+# used as the user). Write-Log replaces every recorded part with '***' in every line, whatever framing it stands in. A part shorter than 6 characters is not recorded (it
+# would blank ordinary words in the log); such a short token is redacted only where its url keeps its scheme.
+$script:UrlSecretParts = [System.Collections.Generic.List[string]]::new()
+function Add-UrlSecretPart([string]$Part) {
+    if ("$Part".Length -ge 6 -and -not $script:UrlSecretParts.Contains($Part)) { $script:UrlSecretParts.Add($Part) }
+}
+function Register-UrlSecretParts {
+    param([string]$Text)
+    foreach ($m in [regex]::Matches("$Text", '(?i)([a-z][a-z0-9+.\-]*)://([^\r\n]*)')) {
+        $rest = $m.Groups[2].Value
+        $q = $rest.IndexOfAny([char[]]@('?', '#'))
+        if ($q -ge 0) { Add-UrlSecretPart $rest.Substring($q + 1).TrimEnd(); Add-UrlSecretPart $rest.Substring($q).TrimEnd() }
+        $sl = $rest.IndexOfAny([char[]]@('/', '?', '#'))
+        $auth = $(if ($sl -ge 0) { $rest.Substring(0, $sl) } else { $rest })
+        $at = $auth.LastIndexOf('@')
+        if ($at -le 0) { continue }
+        $ui = $auth.Substring(0, $at)
+        $colon = $ui.IndexOf(':')
+        if ($colon -ge 0) { Add-UrlSecretPart $ui; Add-UrlSecretPart $ui.Substring($colon + 1) }
+        elseif ($m.Groups[1].Value -match '^(?i)https?$') { Add-UrlSecretPart $ui }
+    }
+}
+
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'MANUAL', 'OK')][string]$Level = 'INFO')
     # r17 F2: the one sink for the console and the setup log; no line it writes carries a URL's userinfo or query string, whichever caller printed the URL
     # (a remote-mismatch refusal, a native command line, git's own error text quoting a remote)
+    # DENY-BY-DEFAULT-1 S3: first every registered url secret part, wherever it stands (git's echo of a url without its scheme included); longest first
+    foreach ($p in @($script:UrlSecretParts | Sort-Object Length -Descending)) { $Message = $Message.Replace($p, '***') }
     $Message = ConvertTo-RedactedUrlText $Message
     $line = '{0} [{1}] {2}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $Level, $Message
     if (-not $isGate) {
@@ -237,6 +266,7 @@ function Invoke-Native {
     # r10 pass 7 A5: a caller (or profile) with $PSNativeCommandUseErrorActionPreference = $true would make a non-zero exit throw before -AllowFail and
     # -OkCodes are consulted (robocopy's normal exit 1 included). This function owns exit-code handling, so it turns that off for its own scope.
     $PSNativeCommandUseErrorActionPreference = $false
+    foreach ($a in @($Arguments)) { Register-UrlSecretParts $a }   # DENY-BY-DEFAULT-1 S3: before the command line and before anything the child echoes back
     Write-Log ("  > {0} {1}" -f $Exe, ($Arguments -join ' '))
     $out = Invoke-GitTraceScrubbed { & $Exe @Arguments 2>&1 }   # r17 F3: no inherited GIT_TRACE* destination
     $code = $LASTEXITCODE
@@ -790,6 +820,7 @@ function Invoke-PhaseSsh {
 # Phase: Clone
 # ---------------------------------------------------------------------------------------------
 function Invoke-PhaseClone {
+    foreach ($u in @($ForkUrl, $UpstreamUrl, $DoctrineUrl)) { Register-UrlSecretParts $u }   # DENY-BY-DEFAULT-1 S3: before any message names one of them
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Log 'CLONE_PREREQ_MISSING git missing: run -Phase Packages first' 'ERROR'; $script:Failures.Add('CLONE_PREREQ_MISSING git'); return }   # r15 pass 14 A5 sibling: a failure (exit 1)
     if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) {
         Invoke-Step "Clone MLV-App fork into $Repo (remote 'fork' = SuperDimensionalSpaceFortress, 'origin' = ilia3101, as on VIRTUAL-TEN)" {
@@ -894,6 +925,7 @@ function Invoke-PhaseClone {
 # git error that quotes the URL), so Write-Log applies it to every line it writes. An scp-like 'git@github.com:o/r.git' has no scheme and no secret; it is unchanged.
 function Get-RedactedRemoteUrl {
     param([string]$Url)
+    Register-UrlSecretParts $Url   # DENY-BY-DEFAULT-1 S3: a url printed once is redacted in every later line too (git may echo it without its scheme)
     # r26 (fable key3 r25 B1): the authority rule (Test-UrlAuthorityPlain). An authority that is not [userinfo@]host[:port], or an '@' anywhere after the authority (path,
     # query or fragment), prints as 'scheme://***' and nothing more: no host the url does not contact, and no tail of a password that held a '/'.
     $mA = [regex]::Match("$Url", '(?is)^(\s*[a-z][a-z0-9+.\-]*://)(.*)$')
@@ -1057,6 +1089,10 @@ $CredentialNameWords = 'SECRET|PASS[_.\-]*W(?:OR)?D|PRIVATE[_.\-]*KEY|API[_.\-]*
 #      script variable assigned from code ('$Token = Get-Token'). Over-refusal is accepted (a dropped file is named in SECRET-SCAN.txt).
 #   3. netrc: a netrc-shaped text in which 'password' / 'passwd' is followed by ANY further token refuses (no record tokenizer).
 #   4. tools/workstation/test-workstation-state.ps1 carries a GENERATED must-refuse sweep over every wrapper combination and form.
+#   5. MINI3-CUTOVER-CREDENTIAL-DETECTOR-DENY-BY-DEFAULT-1: a key NAME is judged as a reader decodes it. The second pass decodes every escape form a reader decodes in a
+#      key (ConvertFrom-CredentialEscapes: YAML/JSON/TOML, XML character references, PowerShell backtick, octal, Python \N{}, URL %NN), and a key that still holds an
+#      escape it could not decode is secret-named (deny by default). An XML element whose key= / name= attribute VALUE is secret-named and that carries any other
+#      non-exempt attribute or content is a hit (Get-CredentialXmlAttrPairHitIndex). The generated sweep covers every escape form and the attribute pair.
 #   NOT covered: a key name built from pieces at run time ('$k = "pass" + "word"'), a value produced by run-time evaluation, and a secret under a key whose name
 #   says nothing (only the known token shapes in $SecretPatterns catch those).
 # The r14 exemption list that r15 retires (kept here as the record of what changed): an unquoted boolean / null word (true, false, none, nil, undefined); a TOKEN
@@ -1255,13 +1291,27 @@ function Test-CredentialValueExempt {
     return $script:CredentialPlaceholderRegex.IsMatch($s)
 }
 
+# DENY-BY-DEFAULT-1 S1 (deny by default): an escape that is still in the text after ConvertFrom-CredentialEscapes could not be decoded (an out-of-range '\U0011FFFF',
+# '&#99999999;' or '`u{110FFFF}', an unknown '\N{NAME}', a '\x' or octal form with no valid digits). A key that holds one is secret-named whatever its letters say
+# (Get-CredentialKeyValueHitIndex -Residual, Get-CredentialXmlAttrPairHitIndex -Residual), so no spelling a reader might still decode to 'password' can hide a key.
+# Only the DECODED copy is judged this way (Get-CredentialHitLine): in the raw text every escape is still present and the rule would refuse an accented key.
+$script:CredentialResidualIntro = '(?:\\N\{[^}\n]*\}|(?<!\\)\\[xuUN0-7]|&#|`u\{[0-9A-Fa-f]*\}?)'
+$script:CredentialResidualUnit = '(?:\\N\{[^}\n]*\}|`u\{[0-9A-Fa-f]*\}?|[^\s"''=:,{}\[\]()<>])'
+$script:CredentialResidualIntroRegex = [regex]::new($script:CredentialResidualIntro)
+$script:CredentialResidualKeyRegex = [regex]::new('(?<![^\s"''{\[,(<>?&;])(' + $script:CredentialResidualUnit + '*?' + $script:CredentialResidualIntro + $script:CredentialResidualUnit + '*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))')
+
 # The one key/value rule: the index of the first secret-named key that carries a value, -1 when there is none.
+# DENY-BY-DEFAULT-1: with -Residual a key that holds an undecodable escape ($script:CredentialResidualKeyRegex) is a candidate too, and always secret-named.
 function Get-CredentialKeyValueHitIndex {
-    param([string]$Text)
+    param([string]$Text, [bool]$Residual = $false)
     $n = $Text.Length
-    foreach ($m in $script:CredentialKeyRegex.Matches($Text)) {
+    $cands = [System.Collections.Generic.List[object]]::new()
+    foreach ($m in $script:CredentialKeyRegex.Matches($Text)) { $cands.Add([pscustomobject]@{ M = $m; Residual = $false }) }
+    if ($Residual) { foreach ($m in $script:CredentialResidualKeyRegex.Matches($Text)) { $cands.Add([pscustomobject]@{ M = $m; Residual = $true }) } }
+    foreach ($cand in $cands) {
+        $m = $cand.M
         $key = $m.Groups[1].Value
-        $class = Get-CredentialKeyClass $key
+        $class = $(if ($cand.Residual) { 'strong' } else { Get-CredentialKeyClass $key })
         if (-not $class) { continue }
         $keyStart = $m.Groups[1].Index
         $sep = $m.Groups[3].Value
@@ -1368,15 +1418,49 @@ function Get-CredentialTableHitIndex {
     return -1
 }
 
+# DENY-BY-DEFAULT-1 S2: the XML ATTRIBUTE PAIR. A .NET config ('<add key="password" value="x" />', '<add name="Db" connectionString="..." />'), a settings file
+# ('<setting name="ApiToken" serializeAs="String"><value>x</value></setting>') or a Java properties XML ('<entry key="db.password">x</entry>') puts the secret NAME in
+# an attribute VALUE, where the key-name rule never looks. A start tag is a hit when one of its naming attributes ($CredentialXmlNameAttrs: key, name, id, property,
+# variable, setting, param, parameter, field) has a value that is secret-named (Get-CredentialKeyClass, blanks removed first: 'DB Password'), or, with -Residual, holds an
+# undecodable escape, AND either another attribute's value is not on the closed exemption list (deny by default: any other attribute, 'serializeAs="String"' included) or
+# the element is not self-closing and its raw content up to its matching close tag is not exempt. Over-refusal is accepted ('<input type="password" name="pw">').
+# A 'Password=' or 'Pwd=' inside any attribute value (a connection string) is the key/value rule's line form already.
+$script:CredentialXmlStartTagRegex = [regex]::new('<([A-Za-z_][A-Za-z0-9_.\-:]*)((?:\s+[A-Za-z_:][A-Za-z0-9_.\-:]*\s*=\s*(?:"[^"]*"|''[^'']*''))+)\s*(/?)>')
+$script:CredentialXmlAttrRegex = [regex]::new('([A-Za-z_:][A-Za-z0-9_.\-:]*)\s*=\s*(?:"([^"]*)"|''([^'']*)'')')
+$script:CredentialXmlNameAttrs = @('key', 'name', 'id', 'property', 'variable', 'setting', 'param', 'parameter', 'field')
+function Get-CredentialXmlAttrPairHitIndex {
+    param([string]$Text, [bool]$Residual = $false)
+    foreach ($tm in $script:CredentialXmlStartTagRegex.Matches($Text)) {
+        $attrs = @(foreach ($am in $script:CredentialXmlAttrRegex.Matches($tm.Groups[2].Value)) {
+                [pscustomobject]@{ N = ($am.Groups[1].Value -replace '^.*:', '').ToLowerInvariant(); V = $(if ($am.Groups[2].Success) { $am.Groups[2].Value } else { $am.Groups[3].Value }) }
+            })
+        $named = $false
+        foreach ($a in $attrs) {
+            if ($script:CredentialXmlNameAttrs -notcontains $a.N) { continue }
+            if ((Get-CredentialKeyClass ($a.V -replace '\s', '')) -or ($Residual -and $script:CredentialResidualIntroRegex.IsMatch($a.V))) { $named = $true }
+        }
+        if (-not $named) { continue }
+        foreach ($a in $attrs) { if ($script:CredentialXmlNameAttrs -notcontains $a.N -and -not (Test-CredentialValueExempt $a.V)) { return $tm.Index } }
+        if ($tm.Groups[3].Value -ne '/') {
+            $start = $tm.Index + $tm.Length
+            $close = [regex]::new('(?i)</' + [regex]::Escape($tm.Groups[1].Value) + '\s*>').Match($Text, $start)
+            $content = $(if ($close.Success) { $Text.Substring($start, $close.Index - $start) } else { $Text.Substring($start) })
+            if (-not (Test-CredentialValueExempt $content)) { return $tm.Index }
+        }
+    }
+    return -1
+}
+
 # The index of the first credential in the text (a known token shape, the key/value rule, or a netrc record), -1 when there is none.
+# DENY-BY-DEFAULT-1: -Residual (the decoded copy only) also treats a key holding an undecodable escape as secret-named; the XML attribute pair rule always runs.
 function Get-CredentialHitIndex {
-    param([string]$Text)
+    param([string]$Text, [bool]$Residual = $false)
     $best = -1
     $m = $script:SecretShapeRegex.Match($Text)
     if ($m.Success) { $best = $m.Index }
     # r15: the XML element form (Get-CredentialXmlHitIndex) judges the element's RAW content; the comment, CDATA and markup strip of r14 (pass 12 A2) is gone
     $xml = Get-CredentialXmlHitIndex $Text
-    foreach ($i in @((Get-CredentialKeyValueHitIndex $Text), (Get-CredentialNetrcHitIndex $Text), $xml, (Get-CredentialTableHitIndex $Text))) {
+    foreach ($i in @((Get-CredentialKeyValueHitIndex -Text $Text -Residual $Residual), (Get-CredentialNetrcHitIndex $Text), $xml, (Get-CredentialTableHitIndex $Text), (Get-CredentialXmlAttrPairHitIndex -Text $Text -Residual $Residual))) {
         if ($i -ge 0 -and ($best -lt 0 -or $i -lt $best)) { $best = $i }
     }
     return $best
@@ -1386,18 +1470,52 @@ function Get-CredentialHitIndex {
 # Only \uXXXX used to be decoded, so '"\U00000070assword" = "hunter2"' and '"\x70assword": hunter2' named no secret. A \U value that is not a Unicode scalar is left as written.
 # r25 (adversary pass 29 A2): a YAML or TOML double-quoted scalar also takes a backslash at the end of a line as an escaped line break: the break and the leading blanks of the
 # next line are dropped ('"pass\<newline>  word"' is 'password'). The text has one '\n' per separator by the time it gets here (Get-CredentialHitLine).
-function Test-CredentialEscapesPresent([string]$Text) { return ("$Text" -match '\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|/|\n)') }
+# MINI3-CUTOVER-CREDENTIAL-DETECTOR-DENY-BY-DEFAULT-1 S1 (doctrine bus 0fc7511 + d6d115b: fix the CLASS, not one more spelling): every escape form a reader of a file
+# Export may ship decodes in a KEY is decoded on the COPY that the second pass judges: YAML/JSON/TOML '\xNN' '\uNNNN' '\UNNNNNNNN' '\/' and the escaped line break;
+# XML/HTML character references '&#NNN;' and '&#xNN;' (an attribute value is decoded by every XML reader: '<add key="pass&#119;ord" .../>'); PowerShell '`u{NN}' and
+# '`<letter>' (an unknown backtick escape is the letter itself: "pass`word" is 'password'; the special '`0 `a `b `e `f `n `r `t `v' stay as written); C / Python octal
+# '\NNN' and Python '\N{LATIN SMALL LETTER W}' (also CAPITAL, DIGIT ZERO..NINE, LOW LINE, HYPHEN-MINUS, FULL STOP, SOLIDUS); URL '%NN'. The octal and '%NN' forms are
+# decoded only to a name character ([A-Za-z0-9_.-]), so a path or a query value is not rewritten into line breaks. The decode repeats (at most 4 times) until nothing
+# changes, so a nested spelling ('&#92;x77' is '\x77' is 'w') is decoded too. What is still an escape after that cannot be decoded and is judged deny by default
+# ($script:CredentialResidualKeyRegex). Over-decoding is safe: the copy only adds hits, the raw text was judged first.
+$script:CredentialPyNames = @{ 'LOW LINE' = '_'; 'HYPHEN-MINUS' = '-'; 'FULL STOP' = '.'; 'SOLIDUS' = '/' }
+$credDigitNames = @('ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE')
+for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyNames['DIGIT ' + $credDigitNames[$credDigit]] = [string]$credDigit }
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})')
+function Test-CredentialEscapesPresent([string]$Text) { return ("$Text" -match '\\[uUxN0-7/\n]|&#|`|%[0-9A-Fa-f]{2}') }
 function ConvertFrom-CredentialEscapes([string]$Text) {
-    return [regex]::Replace("$Text", '\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2})|(/)|(\n[ \t]*))', [System.Text.RegularExpressions.MatchEvaluator]{
+    $eval = [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
-        if ($m.Groups[5].Success) { return '' }
-        if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
-        if ($m.Groups[3].Success) { return [string][char][Convert]::ToInt32($m.Groups[3].Value, 16) }
-        if ($m.Groups[4].Success) { return '/' }
-        $codePoint = [Convert]::ToInt64($m.Groups[2].Value, 16)
+        $g = $m.Groups
+        if ($g['nl'].Success) { return '' }
+        if ($g['sl'].Success) { return '/' }
+        if ($g['x'].Success) { return [string][char][Convert]::ToInt32($g['x'].Value, 16) }
+        if ($g['psl'].Success) { if ('0abefnrtv'.Contains($g['psl'].Value)) { return $m.Value }; return $g['psl'].Value }
+        if ($g['nm'].Success) {
+            $nm = $g['nm'].Value.ToUpperInvariant()
+            $lm = [regex]::Match($nm, '^LATIN (SMALL|CAPITAL) LETTER ([A-Z])$')
+            if ($lm.Success) { if ($lm.Groups[1].Value -eq 'SMALL') { return $lm.Groups[2].Value.ToLowerInvariant() }; return $lm.Groups[2].Value }
+            if ($script:CredentialPyNames.ContainsKey($nm)) { return $script:CredentialPyNames[$nm] }
+            return $m.Value
+        }
+        if ($g['oct'].Success -or $g['pct'].Success) {
+            $c = $(if ($g['oct'].Success) { [Convert]::ToInt32($g['oct'].Value, 8) } else { [Convert]::ToInt32($g['pct'].Value, 16) })
+            $ch = [string][char]$c
+            if ($ch -cmatch '^[A-Za-z0-9_.\-]$') { return $ch }
+            return $m.Value
+        }
+        $codePoint = $(if ($g['u4'].Success) { [Convert]::ToInt64($g['u4'].Value, 16) } elseif ($g['u8'].Success) { [Convert]::ToInt64($g['u8'].Value, 16) } elseif ($g['dec'].Success) { [Convert]::ToInt64($g['dec'].Value, 10) } elseif ($g['hex'].Success) { [Convert]::ToInt64($g['hex'].Value, 16) } else { [Convert]::ToInt64($g['psu'].Value, 16) })
+        if ($g['u4'].Success) { return [string][char][int]$codePoint }   # r23: a lone \uD800 stays one UTF-16 unit, as before
         if ($codePoint -gt 0x10FFFF -or ($codePoint -ge 0xD800 -and $codePoint -le 0xDFFF)) { return $m.Value }
         return [char]::ConvertFromUtf32([int]$codePoint)
-    })
+    }
+    $s = "$Text"
+    for ($k = 0; $k -lt 4; $k++) {
+        $next = $script:CredentialEscapeRegex.Replace($s, $eval)
+        if ($next -ceq $s) { break }
+        $s = $next
+    }
+    return $s
 }
 
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
@@ -1422,9 +1540,9 @@ function Get-CredentialHitLine {
     # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
     $idx = Get-CredentialHitIndex $Text
     if ($idx -lt 0 -and (Test-CredentialEscapesPresent $Text)) {
-        $Text = ConvertFrom-CredentialEscapes $Text   # r23 (pass 27 A1): \u, \U, \x and \/ escapes, not only \u
+        $Text = ConvertFrom-CredentialEscapes $Text   # r23 (pass 27 A1): \u, \U, \x and \/ escapes, not only \u; DENY-BY-DEFAULT-1: every form a reader decodes in a key
         $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
-        $idx = Get-CredentialHitIndex $Text
+        $idx = Get-CredentialHitIndex -Text $Text -Residual $true   # DENY-BY-DEFAULT-1: a key still holding an undecodable escape is secret-named
     }
     if ($idx -lt 0) { return 0 }
     # the line of the KEY (a block-form value sits on a later line; the report names where the secret-named key stands)
@@ -1796,7 +1914,12 @@ function Test-CredentialNamePresent {
     param([string]$Text)
     if (-not $Text) { return $false }
     $texts = @($Text)
-    if (Test-CredentialEscapesPresent $Text) { $texts += ConvertFrom-CredentialEscapes $Text }   # r23 (pass 27 A1 sibling): the same decoder as the content guard
+    if (Test-CredentialEscapesPresent $Text) {
+        $dec = ConvertFrom-CredentialEscapes $Text   # r23 (pass 27 A1 sibling): the same decoder as the content guard (DENY-BY-DEFAULT-1: every escape form it decodes)
+        # DENY-BY-DEFAULT-1 sibling: a key in the decoded copy that still holds an undecodable escape names a secret, as in the content guard (deny by default)
+        if ($script:CredentialResidualKeyRegex.IsMatch($dec)) { return $true }
+        $texts += $dec
+    }
     foreach ($t in $texts) {
         # r16 (adversary pass 15 A2): the seen set is CASE-SENSITIVE (ordinal). The classifier splits camelCase, so 'authHeader' (auth + header: secret-named) and
         # 'authheader' (one word: not) get different answers; a case-insensitive @{} table skipped the camelCase spelling after its benign lowercase twin.

@@ -2670,6 +2670,168 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r26 clone')) {
 }
 foreach ($n in @($r22envSaved.Keys)) { [Environment]::SetEnvironmentVariable($n, $r22envSaved[$n]) }
 
+# ---------------------------------------------------------------- MINI3-CUTOVER-CREDENTIAL-DETECTOR-DENY-BY-DEFAULT-1 (filed from #829 r16 adversary pass 17 A1-A3)
+# S1: a secret-named key written with ESCAPES a reader decodes (YAML/JSON/TOML \xNN \uNNNN \UNNNNNNNN, XML &#NNN; &#xNN;, PowerShell `u{NN} and `<letter>, C/Python
+#     octal \NNN and \N{NAME}, URL %NN) is the same key. An escape that cannot be decoded in a key position counts as secret-named (deny by default).
+# S2: a .NET config element that puts the secret NAME in a key= / name= attribute VALUE and the secret in another attribute ('<add key="password" value="x" />').
+# S3: a Clone-phase message never carries a url's query token, also when git echoes the url WITHOUT its scheme ('fatal: ''/C:/r.git?token=x'' does not appear ...').
+# Every case is GENERATED (doctrine d6d115b) over the same value wrappers as the r15 sweep; the fakes are 'hunter2' and 'fake-token-000N'.
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Test-Has 'Get-CredentialHitLine' 'DENY-BY-DEFAULT-1')) {
+    $ddBt = [string][char]0x60
+    # one encoder per escape form: the escaped spelling of ONE character, or $null when the form cannot spell it (it is then left as written)
+    $ddEnc = [ordered]@{
+        'yaml \xNN'        = { param($c) '\x{0:x2}' -f [int]$c }
+        'json \uNNNN'      = { param($c) '\u{0:x4}' -f [int]$c }
+        'toml \UNNNNNNNN'  = { param($c) '\U{0:x8}' -f [int]$c }
+        'xml &#NNN;'       = { param($c) '&#{0};' -f [int]$c }
+        'xml &#xNN;'       = { param($c) '&#x{0:x};' -f [int]$c }
+        'ps `u{NN}'        = { param($c) $ddBt + ('u{{{0:x}}}' -f [int]$c) }
+        'ps `letter'       = { param($c) if ('0abefnrtv'.Contains([string]$c)) { $null } else { $ddBt + [string]$c } }
+        'octal \NNN'       = { param($c) '\' + [Convert]::ToString([int]$c, 8).PadLeft(3, '0') }
+        'python \N{NAME}'  = { param($c) if ($c -cmatch '[a-z]') { '\N{LATIN SMALL LETTER ' + ([string]$c).ToUpperInvariant() + '}' } elseif ($c -eq [char]'_') { '\N{LOW LINE}' } else { $null } }
+        'url %NN'          = { param($c) '%{0:X2}' -f [int]$c }
+    }
+    # the secret names, each with the index of the ONE letter the 'one letter' variant escapes
+    $ddNames = @(@('password', 4), @('token', 2), @('api_key', 4), @('secret', 2))
+    $ddKeyForms = [ordered]@{
+        'YAML double-quoted' = { param($k, $v) '"' + $k + '": ' + $v }
+        'JSON'               = { param($k, $v) '{"' + $k + '": ' + $v + '}' }
+        'TOML'               = { param($k, $v) '"' + $k + '" = ' + $v }
+        'ini line'           = { param($k, $v) $k + '=' + $v }
+        'PS hashtable'       = { param($k, $v) '@{ "' + $k + '" = ' + $v + ' }' }
+        'XML attribute pair' = { param($k, $v) $q = $(if ($v.Contains('"')) { "'" } else { '"' }); '<add key=' + $q + $k + $q + ' value=' + $q + $v + $q + ' />' }
+        'query string'       = { param($k, $v) 'https://h.example/cb?' + $k + '=' + $v }
+    }
+    $ddValues = [System.Collections.Generic.List[object]]::new()
+    $ddValues.Add(@{ Name = 'hunter2'; Value = 'hunter2' })
+    foreach ($wn in $r15Wrap.Keys) { $ddValues.Add(@{ Name = "$wn(hunter2)"; Value = (& $r15Wrap[$wn] 'hunter2') }) }
+    $ddTotal = 0
+    foreach ($en in $ddEnc.Keys) {
+        $ddMiss = [System.Collections.Generic.List[string]]::new(); $ddN = 0
+        foreach ($nm in $ddNames) {
+            $chars = $nm[0].ToCharArray()
+            $one = (@(for ($i = 0; $i -lt $chars.Length; $i++) { if ($i -eq $nm[1]) { $e = & $ddEnc[$en] $chars[$i]; if ($null -eq $e) { [string]$chars[$i] } else { $e } } else { [string]$chars[$i] } }) -join '')
+            $all = (@(foreach ($c in $chars) { $e = & $ddEnc[$en] $c; if ($null -eq $e) { [string]$c } else { $e } }) -join '')
+            foreach ($key in @($one, $all)) {
+                if ($key -ceq $nm[0]) { continue }
+                foreach ($fn in $ddKeyForms.Keys) {
+                    foreach ($val in $ddValues) {
+                        $text = & $ddKeyForms[$fn] $key $val.Value
+                        $ddN++
+                        if (-not (Test-CredentialText $text) -or (Get-CredentialHitLine $text) -le 0) { $ddMiss.Add("$fn / $key / $($val.Name)") }
+                    }
+                }
+            }
+        }
+        $ddTotal += $ddN
+        Assert-That ($ddMiss.Count -eq 0) "DENY-BY-DEFAULT-1 S1 generated sweep, $en escapes: all $ddN escaped key spellings refuse" ("misses=$($ddMiss.Count): " + (($ddMiss | Select-Object -First 8) -join '; '))
+    }
+    Assert-That ($ddTotal -ge 5000) "DENY-BY-DEFAULT-1 S1 generated sweep: the sweep ran ($ddTotal cases)" "$ddTotal"
+    # S1 deny by default: an escape that cannot be decoded, standing in a key, makes the key secret-named
+    $ddResidual = [ordered]@{
+        'an out-of-range \U escape'              = '"pass\U0011FFFFord": hunter2'
+        'an unknown \N{NAME} escape'             = '"pass\N{NO SUCH CHARACTER}ord": hunter2'
+        'an out-of-range XML character ref'      = '<add key="pass&#99999999;ord" value="hunter2" />'
+        'an out-of-range PS `u{} escape'         = ('$c[' + "'pass" + $ddBt + "u{110FFFF}ord'] = 'hunter2'")
+        'a \x escape with no hex digits'         = 'pass\xZZord=hunter2'
+    }
+    foreach ($k in $ddResidual.Keys) { Assert-That ((Test-CredentialText $ddResidual[$k]) -and (Get-CredentialHitLine $ddResidual[$k]) -gt 0) "DENY-BY-DEFAULT-1 S1 residual: $k in a key refuses" $ddResidual[$k] }
+    # S2: the XML attribute pair, generated over the attribute names, both quote styles, the attribute order and both element shapes
+    $ddS2Miss = [System.Collections.Generic.List[string]]::new(); $ddS2N = 0
+    foreach ($nameAttr in @('key', 'name', 'Key', 'Name')) {
+        foreach ($valAttr in @('value', 'Value', 'connectionString', 'serializedValue')) {
+            foreach ($secret in @('password', 'DbPassword', 'ApiKey', 'GitHubToken', 'Pwd', 'client_secret', 'DB Password')) {
+                foreach ($q in @('"', "'")) {
+                    foreach ($order in @('name first', 'value first')) {
+                        foreach ($shape in @('self-closing', 'open and close')) {
+                            $na = $nameAttr + '=' + $q + $secret + $q; $va = $valAttr + '=' + $q + 'hunter2' + $q
+                            $attrs = $(if ($order -eq 'name first') { "$na $va" } else { "$va $na" })
+                            $el = $(if ($shape -eq 'self-closing') { "<add $attrs />" } else { "<add $attrs></add>" })
+                            $text = "<configuration>`n  <appSettings>`n    $el`n  </appSettings>`n</configuration>"
+                            $ddS2N++
+                            if (-not (Test-CredentialText $text) -or (Get-CredentialHitLine $text) -le 0) { $ddS2Miss.Add($el) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Assert-That ($ddS2Miss.Count -eq 0 -and $ddS2N -ge 800) "DENY-BY-DEFAULT-1 S2 generated sweep: all $ddS2N XML key/value attribute pairs refuse" ("misses=$($ddS2Miss.Count): " + (($ddS2Miss | Select-Object -First 8) -join '; '))
+    $ddS2Hit = [ordered]@{
+        'a settings element whose value is a child element' = '<setting name="ApiToken" serializeAs="String"><value>hunter2</value></setting>'
+        'a Java properties XML entry'                       = '<entry key="db.password">hunter2</entry>'
+        'a connection string Password='                     = '<add name="Main" connectionString="Server=s;Database=d;User Id=u;Password=hunter2;" />'
+        'a connection string Pwd='                          = '<add name="Main" connectionString="Server=s;Uid=u;Pwd=hunter2" />'
+        'a connection string with spaces round ='           = '<add name="Main" connectionString="Server=s; Password = hunter2" />'
+        'a connection string key spelled with a char ref'   = '<add name="Main" connectionString="Server=s;Pass&#119;ord=hunter2" />'
+        'a key attribute spelled with a char ref'           = '<add key="pass&#119;ord" value="hunter2" />'
+        'a key attribute spelled with a hex char ref'       = '<add key="pass&#x77;ord" value="hunter2" />'
+    }
+    foreach ($k in $ddS2Hit.Keys) { Assert-That ((Test-CredentialText $ddS2Hit[$k]) -and (Get-CredentialHitLine $ddS2Hit[$k]) -gt 0) "DENY-BY-DEFAULT-1 S2: $k refuses" $ddS2Hit[$k] }
+    # must-pass: decodable escapes that name nothing secret, paths, and XML pairs whose name is not secret or whose value is on the closed exemption list
+    $ddOk = [ordered]@{
+        'a JSON key with a decoded accent'          = '{"caf\u00e9": "x"}'
+        'a JSON value with a decoded accent'        = '{"name": "caf\u00e9"}'
+        'a Windows path value'                      = 'path: C:\Users\me\x64\tools'
+        'a JSON Windows path value'                 = '{"path": "C:\\Users\\x"}'
+        'a percent-encoded query value'             = 'url: https://x.example/?q=a%20b'
+        'a PowerShell string with escapes'          = ('$x = "line' + $ddBt + 'nnext' + $ddBt + 'tend"')
+        'an appSettings pair that is not secret'    = '<add key="Theme" value="dark" />'
+        'an appSettings secret with an empty value' = '<add key="password" value="" />'
+        'a secret name with no other attribute'     = '<add name="password" />'
+        'an appSettings secret with an env ref'     = '<add key="ApiKey" value="${API_KEY}" />'
+        'a connection string with no password'      = '<add name="Main" connectionString="Server=s;Database=d;Integrated Security=true" />'
+        'an appSettings block of plain settings'    = "<appSettings>`n  <add key=`"LogLevel`" value=`"Information`" />`n</appSettings>"
+    }
+    foreach ($k in $ddOk.Keys) { Assert-That (-not (Test-CredentialText $ddOk[$k])) "DENY-BY-DEFAULT-1 must-pass: $k is not a credential" $ddOk[$k] }
+    # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
+        $ddRole = [ordered]@{
+            'a PowerShell backtick spelling'   = ('{"pass' + $ddBt + 'word": ""}')
+            'an XML character reference'       = '<add key="pass&#119;ord" value="" />'
+            'an octal spelling'                = '{"pass\167ord": ""}'
+            'an undecodable \U escape'         = '{"pass\U0011FFFFord": ""}'
+        }
+        foreach ($k in $ddRole.Keys) { Assert-That (Test-CredentialNamePresent $ddRole[$k]) "DENY-BY-DEFAULT-1 role guard: $k names a secret" $ddRole[$k] }
+        Assert-That (-not (Test-CredentialNamePresent '{"theme": "dark", "path": "C:\\Users\\x", "name": "caf\u00e9"}')) 'DENY-BY-DEFAULT-1 role guard must-pass: plain keys, a JSON path and an accent name no secret'
+    }
+    # every guard site calls the one detector: the export stage scan and the archive re-check refuse an S1 and an S2 file
+    foreach ($ddG in @(@('s1', '{"pass\u0077ord": "hunter2"}'), @('s1x', '<add key="pass&#119;ord" value="hunter2" />'), @('s2', '<add key="password" value="hunter2" />'))) {
+        $st = New-Scratch "dd-$($ddG[0])-stage"; [IO.File]::WriteAllText((Join-Path $st 'app.config'), $ddG[1])
+        Assert-That (@(Get-StagedCredentialHits -Stage $st).Count -eq 1) "DENY-BY-DEFAULT-1 $($ddG[0]) export: the staged file is a hit" $ddG[1]
+        $zp = Join-Path (New-Scratch "dd-$($ddG[0])-zip") 'b.zip'
+        $zf = [IO.Compression.ZipFile]::Open($zp, 'Create')
+        try { $e = $zf.CreateEntry('home-claude/machine/app.config'); $sw = [IO.StreamWriter]::new($e.Open()); $sw.Write($ddG[1]); $sw.Dispose() } finally { $zf.Dispose() }
+        Assert-That (@(Get-ArchiveCredentialHits -Zip $zp).Count -eq 1) "DENY-BY-DEFAULT-1 $($ddG[0]) archive re-check: the zip entry is a hit" $ddG[1]
+    }
+}
+# S3: a Clone whose url carries a query token: neither the console nor the setup log ever holds the token, also where git echoes the url without its scheme
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
+    $ddCases = @(
+        @{ N = 1; Url = ('file:///' + ((New-Scratch 'dd-s3-absent') -replace '\\', '/') + '/absent.git?token=fake-token-0001'); Tok = 'fake-token-0001' },
+        @{ N = 2; Url = 'https://127.0.0.1:1/o/r.git?token=fake-token-0002'; Tok = 'fake-token-0002' },
+        @{ N = 3; Url = 'https://127.0.0.1:1/o/r.git#token=fake-token-0003'; Tok = 'fake-token-0003' }
+    )
+    foreach ($ddc in $ddCases) {
+        $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
+        $ddrepo = Join-Path $ddws 'MLV-App'
+        $dddoc = Join-Path $ddws 'doctrine'; [void][IO.Directory]::CreateDirectory($dddoc); & git -C $dddoc init -q 2>$null; & git -C $dddoc remote add origin $DoctrineUrl 2>$null
+        $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo; $savedLog = $script:LogFile; $savedFork = $ForkUrl
+        $script:Repo = $ddrepo; $Repo = $ddrepo; $script:DoctrineRepo = $dddoc; $DoctrineRepo = $dddoc; $script:LogFile = Join-Path $ddws 'clone.log'
+        $script:ForkUrl = $ddc.Url; $ForkUrl = $ddc.Url
+        $script:Failures.Clear()
+        $ddout = ''
+        # file:// is allowed so git really opens case 1 and echoes its url without the scheme; https is not (no network)
+        $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')
+        try { $ddout = (Invoke-PhaseClone *>&1 | Out-String) } catch { $ddout += $_.Exception.Message } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
+        $ddlog = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+        $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog; $script:ForkUrl = $savedFork; $ForkUrl = $savedFork
+        Assert-That ($ddlog.Length -gt 0 -and $ddlog -notmatch [regex]::Escape($ddc.Tok)) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the setup log never holds the url's query token" $ddlog
+        Assert-That ($ddout -notmatch [regex]::Escape($ddc.Tok)) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the console never shows the url's query token" $ddout
+        $script:Failures.Clear()
+    }
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
