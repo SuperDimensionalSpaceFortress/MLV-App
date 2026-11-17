@@ -233,6 +233,55 @@ $sw.Restart(); Stop-GuiSmokeLogProgressWatch -Watch $w; $stopMs = [int]$sw.Elaps
         self.assertLess(out["ms"], 5000, "four polls with a hung probe must cost about 4 x 300 ms, not the probe's 40 s")
         self.assertLess(out["stopMs"], 5000)
 
+    # adversary 9fdf9e1a A1 (r5): a log that is listed but whose open BLOCKS (a stalled share) still arms the watch, so the leg ends on its
+    # no-progress window and not on the whole process budget. The probe announces every listed log before it opens any.
+    def test_a_listed_log_whose_open_blocks_still_arms_the_watch_and_ends_the_leg(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'openblocks'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value 'first line'
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeOpenDelayMs 40000 -ProbeWaitMs 300
+$sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $armedAt = -1
+while ($sw.ElapsedMilliseconds -lt 9000 -and -not $tripped) {
+    if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
+    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$sw.ElapsedMilliseconds }
+    Start-Sleep -Milliseconds 150
+}
+$stillPending = ($null -ne $w.Pending)
+$ms = [int]$sw.ElapsedMilliseconds
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ tripped = $tripped; armed = [bool]$w.Armed; stillPending = $stillPending; ms = $ms } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["armed"], "the announced log arms the watch although its open never returns")
+        self.assertTrue(out["tripped"], "a leg whose only log cannot be opened ends on the no-progress window")
+        self.assertTrue(out["stillPending"], "the probe is still blocked on the open: the verdict did not wait for it")
+        self.assertLess(out["ms"], 8000)
+
+    # adversary 9fdf9e1a A2 (r5): a growth the probe has reported is credited at the poll that sees it, not when the whole batch (here held up
+    # by a second slow open) ends, so a stalled log is not given a second no-progress window from the batch's end.
+    def test_a_reported_growth_is_credited_when_seen_not_when_the_batch_ends(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'creditwhenseen'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$a = Join-Path $dir 'mlvapp-1.log'; $b = Join-Path $dir 'mlvapp-2.log'
+Set-Content -LiteralPath $a -Value ('x' * 1000) -NoNewline
+Set-Content -LiteralPath $b -Value ('y' * 1000) -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 3000 -ProbeWaitMs 300
+$sw = [Diagnostics.Stopwatch]::StartNew()
+do { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 100 } while (($null -ne $w.Pending -or -not $w.Armed) -and $sw.ElapsedMilliseconds -lt 8000)
+$w.ProbeOpenDelayMs = 2000
+Add-Content -LiteralPath $a -Value 'z' -NoNewline
+$growth = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
+while ($growth.ElapsedMilliseconds -lt 12000 -and -not $tripped) {
+    if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
+    Start-Sleep -Milliseconds 100
+}
+$stalledAfterMs = [int]$growth.ElapsedMilliseconds
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ tripped = $tripped; stalledAfterMs = $stalledAfterMs } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["tripped"])
+        # a is read at about 2 s and b at about 4 s: credited when seen the verdict is about 2 s + the 3 s window = 5 s, credited when the batch ends it is 4 s + 3 s = 7 s
+        self.assertLess(out["stalledAfterMs"], 6200,"the growth must be credited at the poll that sees it, not at the end of the batch")
+
     # adversary 57a7a5c9 A1: toggling read access to one log (total 2000 / 1000 / 2000 ...) must not read as growth -- restoration is not progress.
     def test_denying_and_restoring_read_access_cannot_manufacture_progress(self) -> None:
         out = run_ps(r"""

@@ -4683,7 +4683,8 @@ def test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_o
     probe = t[start:t.index("\n        }\n        $Watch.Hung = $false", start)]
     # (-File is not listed: Get-ChildItem's own -File switch is in the probe; a pwsh -File launch needs pwsh, which is)
     for launch in ("Start-Process", "-EncodedCommand", "-Command", "Invoke-Expression", "iex", "Create(", "AddScript", "cmd", "pwsh",
-                   "Invoke-Command", "&", "Out-File", "Set-Content", "Remove-Item"):
+                   "Invoke-Command", "&", "Out-File", "Set-Content", "Remove-Item", "WriteAll", ".Write(", "Delete(", "SetLength",
+                   "FileAccess]::Write", "FileAccess]::ReadWrite", "FileMode]::Create", "FileMode]::Truncate", "FileMode]::Append"):
         assert launch not in probe, f"the log probe now carries {launch!r}: it must only list and read"
     assert "Get-ChildItem -LiteralPath $using:probeRoot" in probe and "[System.IO.FileAccess]::Read" in probe
     runner = (REPO / "tools/profiling/run-release-gui-smoke.ps1").read_text(encoding="utf-8")
@@ -4709,7 +4710,10 @@ def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_e
     # (3) the scriptblock reads only under the log root it is handed
     body = probe.split("\n", 1)[1]
     writers = [v for v in ("Start-Process", "-EncodedCommand", "-Command", "Out-File", "Set-Content", "Add-Content", "Remove-Item", "Move-Item",
-                           "Copy-Item", "New-Item", "pwsh", "&") if v in body]
+                           "Copy-Item", "New-Item", "Clear-Content", "Rename-Item", "pwsh", "&",
+                           # r5 (adversary 9fdf9e1a A3): a .NET write the cmdlet names above do not cover
+                           "WriteAll", ".Write(", "Delete(", "SetLength", "FileAccess]::Write", "FileAccess]::ReadWrite", "FileMode]::Create",
+                           "FileMode]::Truncate", "FileMode]::Append", "FileMode]::OpenOrCreate") if v in body]
     assert not writers and "Get-ChildItem -LiteralPath $using:probeRoot" in body and "[System.IO.FileAccess]::Read" in body, f"the probe must only list and read: {writers}"
     # (4) the wait is $job.Finished.WaitOne(ms) bounded by the absolute end (entry stopwatch + budget)
     assert "$Watch.Pending.Finished.WaitOne($waitMs)" in code and "[Math]::Min([int]$Watch.ProbeWaitMs, $leftMs)" in code, "the wait is Finished.WaitOne bounded by what is left"

@@ -85,7 +85,8 @@ function Get-GuiSmokeNoProgressChunkMs {
 # (adversary 797947a7 A4). Its body is a LITERAL scriptblock below, not a string built at run time: nothing here is an executed string, and the
 # module stays free of the runspace-object and script-string shapes the smoke-runner closure census (AttrCudaArtifacts.psm1) flags in every
 # closure file -- the pinned dual-venue baseline generator carries that census without any new exclusion (test_dual_venue_evidence byte identity).
-# -ProbeDelayMs is a test seam (data only): the probe sleeps that long before it reads, so a probe that hangs can be simulated.
+# -ProbeDelayMs and -ProbeOpenDelayMs are test seams (data only): the probe sleeps that long before it lists, or before each file open, so a
+# probe that hangs on the share (or on one log) can be simulated.
 function New-GuiSmokeLogProgressWatch {
     [CmdletBinding()]
     param(
@@ -96,6 +97,8 @@ function New-GuiSmokeLogProgressWatch {
         [int]$WindowMs,
         [ValidateRange(0, 3600000)]
         [int]$ProbeDelayMs = 0,
+        [ValidateRange(0, 3600000)]
+        [int]$ProbeOpenDelayMs = 0,
         [ValidateRange(50, 5000)]
         [int]$ProbeWaitMs = 1000
     )
@@ -104,6 +107,7 @@ function New-GuiSmokeLogProgressWatch {
         LogRoot = $LogRoot
         WindowMs = $WindowMs
         ProbeDelayMs = $ProbeDelayMs
+        ProbeOpenDelayMs = $ProbeOpenDelayMs
         ProbeWaitMs = $ProbeWaitMs
         Pending = $null
         Hung = $false
@@ -141,9 +145,14 @@ function Test-GuiSmokeLogProgressStalled {
     if ($null -eq $Watch.Pending -and $BudgetRemainingMs -gt 0) {
         $probeRoot = [string]$Watch.LogRoot
         $probeDelayMs = [int]$Watch.ProbeDelayMs
+        $probeOpenDelayMs = [int]$Watch.ProbeOpenDelayMs
         $Watch.Pending = 1 | ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {
             if ($using:probeDelayMs -gt 0) { Start-Sleep -Milliseconds $using:probeDelayMs }
-            foreach ($file in @(Get-ChildItem -LiteralPath $using:probeRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)) {
+            $listed = @(Get-ChildItem -LiteralPath $using:probeRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)
+            # every listed log is announced (length -2) BEFORE any open, so a log whose open then blocks still arms the watch
+            foreach ($file in $listed) { '{0}|-2' -f $file.Name }
+            foreach ($file in $listed) {
+                if ($using:probeOpenDelayMs -gt 0) { Start-Sleep -Milliseconds $using:probeOpenDelayMs }
                 $length = [int64]-1
                 try {
                     $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
@@ -161,18 +170,22 @@ function Test-GuiSmokeLogProgressStalled {
         # re-derived from the absolute end just before the wait; a probe that already outran its wait is only looked at (0 ms), never waited on again
         $leftMs = [int][Math]::Max([int64]0, [int64]$BudgetRemainingMs - [int64]$entryClock.ElapsedMilliseconds)
         $waitMs = if ($Watch.Hung) { 0 } else { [Math]::Min([int]$Watch.ProbeWaitMs, $leftMs) }
-        if ($Watch.Pending.Finished.WaitOne($waitMs)) {
-            $landed = @()
-            try { $landed = @(Receive-Job -Job $Watch.Pending -ErrorAction SilentlyContinue) } catch { $landed = @() }
+        $finished = $Watch.Pending.Finished.WaitOne($waitMs)
+        # r5 (adversary 9fdf9e1a A1, A2): what the probe has emitted SO FAR is taken at every poll, finished or not, so a log whose open blocks
+        # cannot hide the entries before it: a listed log arms the watch at once and a growth is credited at the poll that sees it, not when the
+        # whole batch ends.
+        $landed = @()
+        try { $landed = @(Receive-Job -Job $Watch.Pending -ErrorAction SilentlyContinue) } catch { $landed = @() }
+        if ($finished) {
             try { Remove-Job -Job $Watch.Pending -Force -ErrorAction SilentlyContinue } catch { }
             $Watch.Pending = $null
             $Watch.Hung = $false
-            # a result that lands once the budget is spent is ignored: the caller's loop is ending on the whole budget, not on this log
-            if ([int64]$entryClock.ElapsedMilliseconds -lt [int64]$BudgetRemainingMs) { $entries = $landed }
         }
         else {
             $Watch.Hung = $true
         }
+        # a result that lands once the budget is spent is ignored: the caller's loop is ending on the whole budget, not on this log
+        if ([int64]$entryClock.ElapsedMilliseconds -lt [int64]$BudgetRemainingMs) { $entries = $landed }
     }
     if ($null -ne $entries -and $entries.Count -gt 0) {
         $progress = $false
@@ -183,9 +196,19 @@ function Test-GuiSmokeLogProgressStalled {
             $name = $text.Substring(0, $cut)
             $parsed = [int64]0
             $length = if ([int64]::TryParse($text.Substring($cut + 1), [ref]$parsed)) { $parsed } else { [int64]-1 }
-            if (-not $Watch.Files.ContainsKey($name)) {
+            if ($length -eq -2) {
+                # listed, not yet read (the probe announces every listed log before it opens any): arms the watch, is not progress, and a name
+                # already known is left as it is
+                if (-not $Watch.Files.ContainsKey($name)) { $Watch.Files[$name] = [int64]-2 }
+            }
+            elseif (-not $Watch.Files.ContainsKey($name)) {
                 # the first sighting of a log arms the watch (below). r4 (adversary b0a33ba9 A1): a log unreadable at that first look is UNKNOWN
                 # (-1), never length 0; a log readable at first sight is a sign of life.
+                $Watch.Files[$name] = [Math]::Max([int64]-1, $length)
+                if ($length -ge 0) { $progress = $true }
+            }
+            elseif ([int64]$Watch.Files[$name] -eq -2) {
+                # the first read of a log announced earlier: the same first-sighting rule (unreadable is UNKNOWN, readable is a sign of life)
                 $Watch.Files[$name] = [Math]::Max([int64]-1, $length)
                 if ($length -ge 0) { $progress = $true }
             }
