@@ -1904,7 +1904,7 @@ TEST(LookLabelWiring, LabelReadsTheGradesStateAndUpdatesOnEveryChange)
     // change path calls once.
     ASSERT_TRUE(update.contains(QStringLiteral("pushLookLabelOverlay();")));
     const QString push = functionBody(mw, QStringLiteral("void MainWindow::pushLookLabelOverlay( void )"));
-    ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, !ui->actionPlay->isChecked() )")));
+    ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
     ASSERT_TRUE(push.contains(QStringLiteral("ui->graphicsView->setLookLabel(")));
     ASSERT_TRUE(update.contains(QStringLiteral("m_pLookLabelStatus->setText( text )")));
 

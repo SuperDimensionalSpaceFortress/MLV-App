@@ -876,6 +876,7 @@ private:
     playback_info_label::Toggles m_playbackInfoToggles;
     // r1 adversary A1: the rate the label shows, a snapshot written ONLY at the fps meter's 250 ms gate and its reset.
     double m_playbackInfoFpsShown = 0.0;
+    bool m_playbackInfoInputsDirty = false;  // an info input changed while playing; the fps gate relabels (r1 pass-3 A2)
     // r1 adversary A1/A3: the info inputs last relabelled for (refreshPlaybackInfoOnInputChange compares them, ints only).
     struct PlaybackInfoInputs
     {

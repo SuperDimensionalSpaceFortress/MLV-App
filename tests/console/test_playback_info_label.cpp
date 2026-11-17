@@ -288,7 +288,7 @@ TEST(PlaybackInfoLabel, MainWindowWiring)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
     ASSERT_TRUE(push.contains(QStringLiteral("m_lookLabelText + QStringLiteral( \"\\n\" ) + m_playbackInfoText")));
-    ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, !ui->actionPlay->isChecked() )")));
+    ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
     const QString update = functionBody(source, QStringLiteral("void MainWindow::updateLookLabel("));
     ASSERT_TRUE(update.contains(QStringLiteral("pushLookLabelOverlay();")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_lookLabelFullscreenShown && m_playbackInfoToggles.fps")));
@@ -340,6 +340,32 @@ TEST(PlaybackInfoLabel, R1A3PresentedFrameRelabelsOnAnInfoInputChange)
     ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactor")));
     ASSERT_TRUE(key.contains(QStringLiteral("playbackScaleFactorPolicyDecision()")));
     ASSERT_TRUE(key.contains(QStringLiteral("updatePlaybackInfoLabel();")));
+}
+
+// r1 pass-3 A1 (a472a49f): while playing the GPU window only stores a changed label (the next frame paints it), but a
+// withdrawal (the label hidden, or the measured rate reset because frames stopped) must repaint at once: no frame may come.
+TEST(PlaybackInfoLabel, R1P3A1WithdrawalRepaintsAtOnce)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    ASSERT_TRUE(push.contains(QStringLiteral(
+        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoFpsShown <= 0.0;")));
+    ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
+}
+
+// r1 pass-3 A2 (a472a49f): a presented-frame input that flips every frame (GPU AMaZE on/off) relabelled per frame. While
+// playing, an input change only marks the info dirty; the fps meter's 250 ms gate relabels, so changes stay at most 4 Hz.
+TEST(PlaybackInfoLabel, R1P3A2PlayingInputChangeWaitsForTheGate)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString key = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    const int dirtyAt = key.indexOf(QStringLiteral("if( ui->actionPlay->isChecked() ) { m_playbackInfoInputsDirty = true; return; }"));
+    ASSERT_TRUE(dirtyAt >= 0);
+    ASSERT_TRUE(dirtyAt < key.indexOf(QStringLiteral("updatePlaybackInfoLabel();")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "if( m_playbackInfoInputsDirty || ( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) ) updatePlaybackInfoLabel();")));
+    const QString update = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_TRUE(update.contains(QStringLiteral("m_playbackInfoInputsDirty = false;")));
 }
 
 // r1 adversary A2 (06898800): with RAW corrections off (fix_raw=0) llrawproc never runs, so the selected Dual-ISO mode is not

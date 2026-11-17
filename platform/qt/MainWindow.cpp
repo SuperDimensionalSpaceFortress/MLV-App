@@ -3115,7 +3115,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 // only when the string changes), and the receipt's sample of what the corner drew while playing.
                 // r1 (adversary A1): the snapshot every other hook composes, so none of them shows a newer rate.
                 m_playbackInfoFpsShown = smoothedFps;
-                if( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) updatePlaybackInfoLabel();
+                if( m_playbackInfoInputsDirty || ( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) ) updatePlaybackInfoLabel();
                 if( m_lookLabelFullscreenShown && ui->actionPlay->isChecked() )
                 {
                     m_lookLabelPlayingShown = lookLabelShownText( &m_lookLabelPlayingSurface );
@@ -24548,6 +24548,8 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.gpuBilinear = m_lastPresentedFrameUsedGpuBilinearDebayer;
     if( inputs == m_playbackInfoInputs ) return;
     m_playbackInfoInputs = inputs;
+    // r1 pass-3 A2: while playing, the fps meter's 250 ms gate relabels, so a per-frame flip stays at most 4 Hz.
+    if( ui->actionPlay->isChecked() ) { m_playbackInfoInputsDirty = true; return; }
     updatePlaybackInfoLabel();
 }
 
@@ -33726,7 +33728,9 @@ void MainWindow::pushLookLabelOverlay( void )
     // One corner label: the GPU window when it is the preview, else the CPU viewport.
     const bool gpuWindow = GpuDisplayWindow::isActive();
     m_lookLabelOverlayGpuWindow = gpuWindow;
-    GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, !ui->actionPlay->isChecked() );
+    // r1 pass-3 A1: a withdrawal (label hidden, measured rate reset) repaints at once, since no frame may follow it.
+    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoFpsShown <= 0.0;
+    GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow );
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
 }
 
@@ -33777,6 +33781,7 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
 // playing from the fps meter's 250 ms gate (timerFrameEvent), so it runs at most 4 Hz and re-rasterises only on a new string.
 void MainWindow::updatePlaybackInfoLabel( void )
 {
+    m_playbackInfoInputsDirty = false;
     const bool twinVisible = m_pPlaybackInfoStatus && m_pPlaybackInfoStatus->isVisible();
     if( !m_lookLabelFullscreenShown && !twinVisible
      && m_playbackInfoText.isEmpty() && m_lookLabelOverlayText.isEmpty() ) return;
