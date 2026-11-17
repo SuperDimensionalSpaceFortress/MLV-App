@@ -37,7 +37,7 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, TextIO
 
@@ -715,6 +715,40 @@ def _worker_record(path: Path) -> dict | None:
     return record if ok else None
 
 
+WORKER_WATCH_SLICE_SECONDS = 0.2
+
+
+def late_workers(
+    procs: Sequence[subprocess.Popen[bytes]], deadline: float, monotonic: Callable[[], float] = time.monotonic
+) -> set[int]:
+    """The 1-based numbers of workers not seen to have exited BEFORE ``deadline`` (on ``monotonic``).
+
+    A worker is in time only when a look at it, taken before the deadline, found it gone. A worker
+    first seen gone at or after the deadline is late (a wait that ran out, or a parent that was held
+    up while launching, cannot tell an early exit from a late one), and one still running then is late
+    too: the caller kills it. Every look is at most ``WORKER_WATCH_SLICE_SECONDS`` after the last.
+    """
+    pending = set(range(1, len(procs) + 1))
+    late: set[int] = set()
+    while pending:
+        now = monotonic()
+        for number in sorted(pending):
+            if procs[number - 1].poll() is not None:
+                pending.discard(number)
+                if now >= deadline:
+                    late.add(number)
+        if not pending:
+            break
+        if now >= deadline:
+            late |= pending
+            break
+        try:
+            procs[min(pending) - 1].wait(timeout=min(WORKER_WATCH_SLICE_SECONDS, deadline - now))
+        except subprocess.TimeoutExpired:
+            pass
+    return late
+
+
 def run_parallel(
     members: list[unittest.TestCase],
     profile: str,
@@ -808,29 +842,28 @@ def run_parallel(
                 log,
             ))
             logs.append(home / "log.txt")
-        expired: set[int] = set()
-        for number, (proc, _log) in enumerate(procs, start=1):
-            try:
-                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                expired.add(number)  # the wait ran out: a worker that exits a moment later was still late
-                break
+        watch.check()  # a budget already spent when the workers launch is reported at once
+        late = late_workers([proc for proc, _log in procs], deadline)
         for number, (proc, log) in enumerate(procs, start=1):
             killed = proc.poll() is None
             if killed:
                 proc.kill()
                 proc.wait()
-            if killed or number in expired:
+            if killed or number in late:
                 problems.append(
                     f"worker {number}/{len(procs)} timed out after {limit:g} s" + (" and was killed" if killed else "")
                 )
             log.close()
             codes.append(proc.returncode)
-        for number, (path, code) in enumerate(zip(logs, codes, strict=True), start=1):
+        for path in logs:
+            records.append(_worker_record(path.with_name("result.json")))
+        for record in records:
+            if record:
+                merged.update({key: float(value) for key, value in record["seconds"].items()})
+        watch.check()  # a share crossed since the last poll is reported before any worker log
+        for number, (path, code, record) in enumerate(zip(logs, codes, records, strict=True), start=1):
             print(f"===== worker {number}/{len(logs)} exit {code} =====", flush=True)
             print(path.read_text(encoding="utf-8", errors="replace"), end="", flush=True)
-            record = _worker_record(path.with_name("result.json"))
-            records.append(record)
             if code not in (0, 1, 5):
                 problems.append(f"worker {number}/{len(logs)} exited {code}")
             elif record is None:
@@ -853,14 +886,10 @@ def run_parallel(
             f"the workers' ids are not exactly the shard's: {len(missing)} missing, {len(extra)} extra, "
             f"{len(accounted) - len(set(accounted))} repeated"
         )
-    for record in records:
-        if record:
-            merged.update({key: float(value) for key, value in record["seconds"].items()})
     if manifest is not None and not problems:
         write_manifest(manifest, ran)
     total = clock() - begin
     if merged:
-        watch.check()
         print("\n".join(slowest_block(profile, index, of, total, merged)), file=out, flush=True)
     for problem in problems:
         print(f"ERROR: {problem}", file=sys.stderr)

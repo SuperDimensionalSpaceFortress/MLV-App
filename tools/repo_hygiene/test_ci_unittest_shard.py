@@ -1159,32 +1159,48 @@ class ShardExitCodeTests(unittest.TestCase):
             self.assertIn("creationflags", kwargs)
             self.assertEqual(kwargs["creationflags"], no_window_flags())
 
-    # r3 adversary A2: a wait that expired is a timeout even when the worker exits a moment later.
-    def test_a_worker_that_exits_as_the_wait_expires_still_fails_the_shard(self) -> None:
-        root, tests, tag = self._fixture()
-        real = subprocess.Popen
+    # r3 adversary A2 (pass 1) and A1 (pass 2): a worker is in time only if its exit was seen BEFORE the
+    # deadline; the deadline starts before the first launch, so a slow launch or a late look counts.
+    @staticmethod
+    def _late(polls: list[list[int | None]], times: list[float], deadline: float = 1.0) -> set[int]:
+        class FakeProc:
+            def __init__(self, seq: list[int | None]) -> None:
+                self._seq = list(seq)
 
-        class RacyPopen:
-            """The worker finishes (cleanly) at the very moment the parent's deadline passes."""
-
-            def __init__(self, *args: object, **kwargs: object) -> None:
-                self._proc = real(*args, **kwargs)
-                self._raised = False
+            def poll(self) -> int | None:
+                return self._seq.pop(0) if len(self._seq) > 1 else self._seq[0]
 
             def wait(self, timeout: float | None = None) -> int:
-                self._proc.wait()
-                if not self._raised:
-                    self._raised = True
-                    raise subprocess.TimeoutExpired("worker", timeout)
-                return self._proc.returncode
+                raise subprocess.TimeoutExpired("fake", timeout)
 
-            def __getattr__(self, name: str) -> object:
-                return getattr(self._proc, name)
+        ticks = iter(times)
+        return shard.late_workers([FakeProc(seq) for seq in polls], deadline, lambda: next(ticks))
 
-        with mock.patch.object(shard.subprocess, "Popen", RacyPopen):
-            code, out, err, _manifest = self._parallel(root, tests, tag, 1)
-        self.assertEqual(code, 1, out)
-        self.assertIn("timed out", err)
+    def test_a_worker_seen_to_exit_before_the_deadline_is_in_time(self) -> None:
+        self.assertEqual(self._late([[0], [0]], [0.5]), set())
+
+    def test_a_worker_whose_exit_is_first_seen_after_the_deadline_is_late(self) -> None:
+        # launching took longer than the whole budget: both children are already gone when the parent looks
+        self.assertEqual(self._late([[0], [0]], [3.0]), {1, 2})
+
+    def test_a_wait_that_ran_out_is_a_timeout_even_if_the_worker_exits_a_moment_later(self) -> None:
+        self.assertEqual(self._late([[None, 0]], [0.5, 1.5]), {1})
+
+    def test_a_worker_still_running_at_the_deadline_is_late_and_the_others_are_not(self) -> None:
+        self.assertEqual(self._late([[0], [None]], [0.5, 2.0]), {2})
+
+    # r3 adversary A2 (pass 2): a budget already crossed when the workers launch is reported before any log.
+    def test_a_budget_already_crossed_at_launch_warns_before_the_worker_logs(self) -> None:
+        root, tests, tag = self._fixture()
+        code, out, err, _manifest = self._parallel(
+            root, tests, tag, 3, environ={shard.JOB_START_ENV: str(time.time() - 1700.0)}  # 94 % of the 30 min cap
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        lines = out.splitlines()
+        warned = [number for number, line in enumerate(lines) if line.startswith("SHARD_BUDGET_WARN")]
+        first_log = next(number for number, line in enumerate(lines) if line.startswith("===== worker 1/"))
+        self.assertEqual(len(warned), 1, out)
+        self.assertLess(warned[0], first_log, "the warning came only after the workers had finished")
 
     # r3 adversary A3: a class or module fixture that skips never starts its tests; serial passes, so must parallel.
     def test_a_fixture_level_skip_is_accounted_for_and_the_manifest_matches_serial(self) -> None:
