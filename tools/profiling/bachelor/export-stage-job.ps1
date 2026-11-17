@@ -276,8 +276,11 @@ try {
     $avgUtility = Get-Mean ($cpuUtilitySamples | Where-Object { $null -ne $_ })
     $cpuTimeUnknown = $cpuTimeSamples.Count -lt 3
     $avgTime = if ($cpuTimeUnknown) { $null } else { Get-Mean $cpuTimeSamples }
-    $quiescence = [ordered]@{ cpuUtilitySamples = $cpuUtilitySamples; cpuUtilityMean = $avgUtility; cpuTimeSamples = $cpuTimeSamples; cpuTimeMean = $avgTime
-                              cpuTimeUnknown = $cpuTimeUnknown; cpuTimeUnknownReason = $cpuTimeUnknownReason; cpuThresholdPercent = $cpuThresholdPercent; topCpuProcesses = $topCpuProcesses }
+    # r2: the playback summary's own field names (utilityMeanPercent / timeMeanPercent / timeUnknown / thresholdPercent / pass): the leg batch reads cpuQuiescence.timeMeanPercent
+    # (Get-VenueLegPreLoadMean); the first export spelling (cpuTimeMean) read UNKNOWN on every leg.
+    $quiescence = [ordered]@{ utilitySamples = $cpuUtilitySamples; utilityMeanPercent = $avgUtility; timeSamples = $cpuTimeSamples; timeMeanPercent = $avgTime
+                              timeUnknown = $cpuTimeUnknown; timeUnknownReason = $cpuTimeUnknownReason; thresholdPercent = $cpuThresholdPercent
+                              pass = (-not $cpuTimeUnknown -and $avgTime -le $cpuThresholdPercent); topCpuProcesses = $topCpuProcesses }
     Write-JobTrace "step quiescence-check done cpuTimeMean=$avgTime cpuTimeUnknown=$cpuTimeUnknown"
     if ($cpuTimeUnknown -or -not ($avgTime -le $cpuThresholdPercent)) {
         Write-ExportSummary 'VENUE_NOT_QUIESCENT' @{ cpuQuiescence = $quiescence; executableSha256 = $manifestHashes['exe'] }
@@ -396,7 +399,8 @@ function Get-ExportEmbedding {
     $blocks = [System.Collections.Generic.List[string]]::new()
     $unresolved = [System.Collections.Generic.List[string]]::new()
     $pending = [System.Collections.Generic.Queue[string]]::new()
-    $callPattern = '\b((?:[A-Z][a-z]+)-AttrCuda[A-Za-z0-9]*)\b'
+    # r2: (?:[A-Z][a-z]+)+ so a two-word verb (ConvertTo-, ConvertFrom-) is followed too; the one-word form left ConvertTo-AttrCudaFileIdObject out and the venue job died on it.
+    $callPattern = '\b((?:[A-Z][a-z]+)+-AttrCuda[A-Za-z0-9]*)\b'
     foreach ($n in @($SeedEmbedded) + @([regex]::Matches($template + "`n" + $SharedText, $callPattern) | ForEach-Object { $_.Groups[1].Value })) { $pending.Enqueue($n) }
     while ($pending.Count -gt 0) {
         $n = $pending.Dequeue()

@@ -509,7 +509,7 @@ class ExportJobGeneratorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         d = json.loads(proc.stdout)
         template = d["template"]
-        called = set(re.findall(r"\b((?:[A-Z][a-z]+)-(?:AttrCuda|GuiSmoke)[A-Za-z0-9]*)\b", template))
+        called = set(re.findall(r"\b((?:[A-Z][a-z]+)+-(?:AttrCuda|GuiSmoke)[A-Za-z0-9]*)\b", template))
         embedded = set(d["embedded"])
         self.assertTrue(called, "the template calls the shared helpers")
         self.assertEqual(called - embedded - {"Test-GuiSmokeClipLength"}, set(), "a helper the job calls is not embedded")
@@ -527,6 +527,38 @@ class ExportJobGeneratorTests(unittest.TestCase):
         # the published set is the five records only: the job never copies an exported frame or .mov to the share
         self.assertIn("Remove-ExportOutput", template)
         self.assertNotRegex(template, r"Publish-AttrCudaFileCopy -Source \$outputs", "an exported output is never published")
+
+    def test_the_embedding_closure_follows_a_two_word_verb_and_is_complete(self) -> None:
+        """r2 (venue evidence, 12 of 12 export legs INVALID): the closure scan matched only one-word verbs, so ConvertTo-AttrCudaFileIdObject (called by the embedded
+        Get-AttrCudaFileId) was never embedded and the venue job died at its first file-id read with 'ConvertTo-AttrCudaFileIdObject is not recognized' (agent exit 1,
+        no summary.json, so no pre-load mean). Every AttrCuda function an embedded function calls, whatever its verb, is embedded or listed unresolved."""
+        script = (f"$d = & '{EXPORT_JOB}' -DescribeTemplate\n"
+                  f"Import-Module '{EXPORT_JOB.parent / 'AttrCudaArtifacts.psm1'}' -Force\n"
+                  "$have = @($d.embedded) + @($d.unresolved)\n"
+                  "$missing = [System.Collections.Generic.List[string]]::new()\n"
+                  "foreach ($n in @($d.embedded)) {\n"
+                  f"  $t = $null; foreach ($m in '{EXPORT_JOB.parent / 'AttrCudaArtifacts.psm1'}', '{EXPORT_JOB.parent / 'AttrCudaOwnerFootage.psm1'}') {{ try {{ $t = Get-AttrCudaEmbeddedFunctionSource -ModulePath $m -Name @($n); break }} catch {{ $t = $null }} }}\n"
+                  "  if ($null -eq $t) { continue }\n"
+                  "  foreach ($c in [regex]::Matches($t, '\\b((?:[A-Z][a-z]+)+-AttrCuda[A-Za-z0-9]*)\\b')) { if ($have -cnotcontains $c.Groups[1].Value) { $missing.Add(\"$n -> $($c.Groups[1].Value)\") } }\n"
+                  "}\n"
+                  "[ordered]@{ missing = @($missing); embedded = @($d.embedded) } | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout)
+        self.assertEqual(got["missing"], [], got["missing"])
+        self.assertIn("ConvertTo-AttrCudaFileIdObject", got["embedded"], "Get-AttrCudaFileId's callee must ride with it")
+
+    def test_the_quiescence_record_carries_the_names_the_leg_batch_reads(self) -> None:
+        """r2: the leg batch reads cpuQuiescence.timeMeanPercent from summary.json (VenueChain.psm1 Get-VenueLegPreLoadMean, the playback job's name); an export
+        summary that spells it cpuTimeMean reads UNKNOWN and every leg is QUIET_PRELOAD_UNKNOWN, never counted."""
+        proc = run_pwsh(["-Command", f"$d = & '{EXPORT_JOB}' -DescribeTemplate; $d.template"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        template = proc.stdout
+        for field in ("utilitySamples", "utilityMeanPercent", "timeSamples", "timeMeanPercent", "timeUnknown", "thresholdPercent", "pass"):
+            self.assertTrue(re.search(rf"\b{field}\s*=", template), field)
+        for old in ("cpuTimeMean = $avgTime", "cpuUtilityMean = $avgUtility", "cpuTimeSamples = $cpuTimeSamples", "cpuTimeUnknown = $cpuTimeUnknown",
+                    "cpuThresholdPercent = $cpuThresholdPercent"):
+            self.assertFalse(old in template, f"the export quiescence record must use the playback summary's field names, not {old}")
 
     def test_the_time_budget_fits_the_shipped_legs_and_long_windows(self) -> None:
         """adversary r1 A1: the export's budget is identity read + the app's re-read + the export wait; the shipped M16-1243 legs (two parts, 3.4 GB,
