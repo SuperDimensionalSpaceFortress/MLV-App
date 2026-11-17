@@ -36,8 +36,8 @@ CHECKER_PATH = REPO_ROOT / "tools" / "coordination" / "check_roadmap_queue_parit
 # OWNER-ASK-PARK-GUARD-1: an owner ask of another kind is on the table too, its kind cell reading "<kind> (owner)".
 # (r2, adversary advisory A4 on 8ba4f8ab) any owner kind cell counts, a blank kind included ("|  (owner) |"): the cell only has to end in "(owner)".
 # (r10, advisory A4) the gaps between cells are spaces or tabs only: `\s` also matched a newline, so a row broken between cells still read as a row.
-# (r10 adversary advisory A1) the owner kind is what the renderer's KIND_RX allows (ASCII letters, digits, space, '.', '_', '-'): `[^|\n]` also matched U+2028 and U+0085.
-ROADMAP_ROW_RX = re.compile(r"^\|[ \t]*\d+[ \t]*\|[ \t]*(\S+)[ \t]*\|[ \t]*(product|playback|[A-Za-z0-9 _.-]*?\(owner\))[ \t]*\|", re.MULTILINE)
+# (r10 adversary advisories A1, pass 2 A2) the owner kind is the renderer's KIND_RX ([A-Za-z0-9][A-Za-z0-9 _.-]{0,39}, or blank) then " (owner)": `[^|\n]` also matched U+2028 and U+0085.
+ROADMAP_ROW_RX = re.compile(r"^\|[ \t]*\d+[ \t]*\|[ \t]*(\S+)[ \t]*\|[ \t]*(product|playback|(?:[A-Za-z0-9][A-Za-z0-9 _.-]{0,39})?[ ]\(owner\))[ \t]*\|", re.MULTILINE)
 GENERATED_FROM_RX = re.compile(r"^generated_from: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", re.MULTILINE)
 # docs/22 working tier is 25000 soft; the rendered roadmap grows with the open backlog.
 ROADMAP_BUDGET_BYTES = 20000
@@ -118,6 +118,11 @@ class RoadmapQueueParityTests(unittest.TestCase):
             with self.subTest(broken=broken):
                 self.assertEqual(ROADMAP_ROW_RX.findall(broken), [])
         self.assertEqual(ROADMAP_ROW_RX.findall("|\t3\t|\tOWNER-1\t|\tproduct\t| queued |"), [("OWNER-1", "product")])
+        for kind in ("q" * 41, "-qa", "_qa", ".qa", "qa|x"):   # pass 2 A2: a kind the renderer's KIND_RX refuses is no row
+            with self.subTest(kind=kind):
+                self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | %s (owner) | queued | 2026-10-20 | - |" % kind), [])
+        self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa(owner) | queued | 2026-10-20 | - |"), [])   # the renderer always writes " (owner)"
+        self.assertEqual([k for _c, k in ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | %s (owner) | queued |" % ("q" * 40))], ["q" * 40 + " (owner)"])
         for sep in (" ", " ", "\x85", "\x0b", "\x0c", "\r"):   # adversary advisory A1: no other line break inside the kind cell
             with self.subTest(sep=repr(sep)):
                 self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa%s(owner) | queued | 2026-10-20 | - |\n" % sep), [])

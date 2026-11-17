@@ -1569,17 +1569,40 @@ class R10LastTierTests(unittest.TestCase):
         self.assertEqual(render_roadmap._render_base(data), master_render(data))
 
     # A3: generated_utc 0001-01-06T23:30:00-01:00 is UTC 0001-01-07 (window start 0001-01-01, accepted); the base's textual day, 01-06, minus six days overflows.
+    # Pass 2 A1 (adversary r10-ce695fd6): where the base cannot be rendered (A3) and the owner-aware tiers are over budget too, the file must not be
+    # written over budget with exit 0 (a board with no product rows at all cannot be "over on product alone"): a typed refusal, exit 2, like _load's.
     def test_a3_an_accepted_year_one_offset_stamp_is_a_status_never_a_traceback(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         q, out = Path(tmp.name) / "q.json", Path(tmp.name) / "roadmap.md"
-        for note_len in (9059, 9060, 9061):
+        for note_len in (8000, 9059):   # fits in an owner-aware tier: written, checked
             q.write_text(json.dumps(self.data([], note_len, "0001-01-06T23:30:00-01:00")), encoding="utf-8")
             with self.subTest(note_len=note_len), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out)]), 0)
                 self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out), "--check"]), 0)
-        text = render_roadmap.render(self.data([], 9061, "0001-01-06T23:30:00-01:00"))
-        self.assertIn("0001-01-07", text)   # the window is the UTC one the loader validated
+                self.assertLessEqual(render_roadmap._budget_size(out.read_bytes().decode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertIn("0001-01-07", render_roadmap.render(self.data([], 9059, "0001-01-06T23:30:00-01:00")))   # the UTC window the loader validated
+
+    def test_pass2_a1_an_over_budget_board_with_no_base_rendering_is_refused_with_exit_2(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        q, out = Path(tmp.name) / "q.json", Path(tmp.name) / "roadmap.md"
+        for note_len in (9060, 9061, 12000):
+            q.write_text(json.dumps(self.data([], note_len, "0001-01-06T23:30:00-01:00")), encoding="utf-8")
+            for extra in ([], ["--check"]):
+                err = io.StringIO()
+                with self.subTest(note_len=note_len, extra=extra), contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as caught:
+                        render_roadmap.main(["--card-queue", str(q), "--out", str(out), *extra])
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn("20000", err.getvalue())
+                    self.assertFalse(out.exists(), "nothing is written when the board is refused")
+
+    def test_pass2_a1_a_base_that_can_be_rendered_over_budget_is_still_product_alone(self) -> None:
+        # the documented exception stays: product rows are never dropped, so a board over budget on them alone is rendered, not refused
+        data = self.data(self.products(), 4000)
+        self.assertGreater(render_roadmap._budget_size(master_render(data)), ROADMAP_BUDGET_BYTES)
+        self.assertEqual(len(table_cards(render_roadmap.render(data))), 300)
 
 
 class R4BudgetTests(unittest.TestCase):

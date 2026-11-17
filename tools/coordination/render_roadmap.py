@@ -321,12 +321,22 @@ def render(data: dict) -> str:
     # (r10 A1) It is taken only when it fits. Master lists every parked product-kind owner ask, uncapped and unlabelled: 112 of them made
     # the file 23006 bytes. Then the same algorithm runs on the board without its closed owner asks (the collapsed tier counts none of them
     # either, and they stay in card-queue.json), and when even that is over budget the collapsed text stands: product rows are never dropped.
-    # (r10 A3) A candidate is None when the base's textual window leaves the date range: never a traceback.
+    # (r10 A3) A candidate is None when the base's textual window leaves the date range: never a traceback. (r10 pass 2 A1) With no base
+    # file to compare against, "over budget on product alone" cannot be told from an owner-aware overhead, so the board is refused (exit 2,
+    # as _load refuses the same window) instead of written over budget.
     owner_free = dict(data, rows=[r for r in data["rows"] if r.get("origin") != OWNER or r["state"] not in CLOSED_STATES])
+    base_available = False
     for candidate in (data, owner_free):
         text = _render_base(candidate)
-        if text is not None and _budget_size(text) <= ROADMAP_BUDGET_BYTES:
+        if text is None:
+            continue
+        base_available = True
+        if _budget_size(text) <= ROADMAP_BUDGET_BYTES:
             return text
+    if not base_available:
+        _die("this board is over the %d-byte budget in every owner-aware tier, and its generated_utc %r reads as a day whose %d-day window "
+             "starts before 0001-01-01 as written, so the base file it would otherwise fall back to cannot be rendered" % (
+                 ROADMAP_BUDGET_BYTES, data["generated_utc"], WINDOW_DAYS))
     return collapsed
 
 
