@@ -759,13 +759,50 @@ def late_workers(
     return late
 
 
+def worker_launch_kwargs() -> dict[str, object]:
+    """The ``Popen`` keywords every worker is launched with: the hidden window, and on POSIX its own
+    process group, so ending the worker can end what its tests launched (``terminate``)."""
+    kwargs: dict[str, object] = {"creationflags": no_window_flags()}
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+TREE_KILL_SECONDS = 10.0
+
+
+def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Best effort: end every process ``proc`` started (a bounded test's child and grandchild).
+
+    ``taskkill /T`` on Windows, the worker's process group elsewhere. A failure here is not an error:
+    ``terminate`` still kills the worker itself, and the first reading of that is the one reported.
+    """
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int):
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)], stdin=subprocess.DEVNULL, capture_output=True,
+                timeout=TREE_KILL_SECONDS, creationflags=no_window_flags(), check=False,
+            )
+        else:
+            import signal
+
+            os.killpg(pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def terminate(proc: subprocess.Popen[bytes], *, reap: bool = True) -> str | None:
-    """Kill ``proc`` (and reap it when ``reap``); the error text when the OS refuses, else ``None``.
+    """Kill ``proc`` and its process tree (and reap it when ``reap``); the error text when the OS refuses
+    to kill the worker itself, else ``None``.
 
     Callers end every owned worker through this, so one worker that cannot be killed (an ``OSError``
     such as ``PermissionError``) never stops the kill of the others; a worker that could not be killed
     is not waited on (that wait would never return).
     """
+    _kill_tree(proc)
     try:
         proc.kill()
         if reap:
@@ -927,10 +964,14 @@ def run_parallel(
                 log.close()
                 problems.append(f"worker {number}/{len(groups)} not launched: the deadline passed while launching")
                 continue
-            proc = subprocess.Popen(
-                command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                creationflags=no_window_flags(),
-            )
+            try:
+                proc = subprocess.Popen(
+                    command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log,
+                    stderr=subprocess.STDOUT, **worker_launch_kwargs(),
+                )
+            except BaseException:
+                log.close()  # not yet in procs: the cleanup below would never close it before the rmtree
+                raise
             procs.append((proc, log))
             logs.append(home / "log.txt")
             killer.add(proc)  # from here the deadline is enforced even while the next launch blocks

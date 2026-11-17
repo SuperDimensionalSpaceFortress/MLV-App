@@ -1466,6 +1466,81 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(sorted(killer.failed), [1])
         self.assertGreaterEqual(first.kill_calls, 2, "the watchdog retries a worker it could not kill")
 
+    # r6 adversary pass 8 A1: killing only the worker leaves what its tests launched (a bounded test's
+    # child and grandchild) running; ending a worker must end its whole process tree.
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        if os.name == "nt":
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                return bool(ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        # a zombie (killed, not yet reaped by init) is not running
+        status = Path(f"/proc/{pid}/stat")
+        return not (status.exists() and status.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+
+    def test_ending_a_worker_ends_the_process_tree_it_started(self) -> None:
+        tree = (
+            "import subprocess, sys, time\n"
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+            "print(c.pid, flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-c", tree], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, **shard.worker_launch_kwargs()
+        )
+        self.addCleanup(worker.stdout.close)
+        grandchild = int(worker.stdout.readline())
+
+        def last_resort() -> None:  # a red run must not leave a sleeper behind
+            if self._pid_alive(grandchild):
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/PID", str(grandchild)], capture_output=True, creationflags=no_window_flags())
+                else:
+                    os.kill(grandchild, 9)
+
+        self.addCleanup(last_resort)
+        self.addCleanup(worker.kill)
+        self.assertIsNone(shard.terminate(worker))
+        deadline = time.monotonic() + 15.0
+        while self._pid_alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(self._pid_alive(grandchild), "the worker's own child survived the worker's termination")
+
+    # r6 adversary pass 8 A2: a log opened for a worker whose launch then fails is closed, not leaked.
+    def test_a_launch_that_fails_closes_the_log_it_opened(self) -> None:
+        root, tests, tag = self._fixture()
+        handles: list[object] = []
+
+        def failing_popen(*args: object, **kwargs: object) -> object:
+            handles.append(kwargs["stdout"])
+            raise FileNotFoundError("python vanished")
+
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=failing_popen),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(FileNotFoundError),
+        ):
+            shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        self.assertEqual(len(handles), 1)
+        self.assertTrue(handles[0].closed, "the log handle of the worker whose launch failed was left open")
+
     # r4 adversary A2 (pass 4): a worker whose only class skips in a fixture but whose cleanup fails
     # runs no test; serial fails it (exit 1 with the others' tests run), so the parallel shard must too.
     _GOOD = "import unittest\nclass FxGoodTests(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
