@@ -33988,16 +33988,21 @@ int MainWindow::presentedPlaybackScaleShown( void ) const
                                                              telemetryIntValue( telemetry, "playback_prep_reduced_factor" ) );
 }
 
+// LOOK-LABEL-PLAYBACK-INFO-1 r13 (keys B1, H-a): the guards live in the pure playback_info_label::presentedRouteOfFrame, so
+// each one is tested by behaviour; a processed-8 cache hit replays the stored tag, which the engine resets to 0 on the scale-1
+// CPU 8-bit routes that never write it (video_mlv.c), so a cached direct-8 frame never replays an older proxy code.
 int MainWindow::presentedPlaybackRouteCode( void ) const
 {
-    if( !m_lastPresentedRequestContextValid ) return 0;
-    if( m_lastPresentedPlaybackScaleFactorActive != 1 ) return 0;
-    if( m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer ) return 0;
     const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;
-    if( !telemetryBoolValue( telemetry, "processed16_stage_measured" ) ) return 0;
-    if( telemetryBoolValue( telemetry, "processed8_direct_path_active" ) ) return 0;
-    if( telemetryBoolValue( telemetry, "gpu_playback_recon_used" ) ) return 0;
-    return telemetryIntValue( telemetry, "render_thread_phase4b_path" );
+    playback_info_label::PresentedRouteFacts route;
+    route.contextValid = m_lastPresentedRequestContextValid;
+    route.activeScale = m_lastPresentedPlaybackScaleFactorActive;
+    route.gpuDebayer = m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer;
+    route.processedStageMeasured = telemetryBoolValue( telemetry, "processed16_stage_measured" );
+    route.direct8 = telemetryBoolValue( telemetry, "processed8_direct_path_active" );
+    route.gpuRecon = telemetryBoolValue( telemetry, "gpu_playback_recon_used" );
+    route.routeTag = telemetryIntValue( telemetry, "render_thread_phase4b_path" );
+    return playback_info_label::presentedRouteOfFrame( route );
 }
 
 // LOOK-LABEL-PLAYBACK-INFO-1: change-only. Composes only while the fullscreen overlay is shown or the twin is visible (windowed

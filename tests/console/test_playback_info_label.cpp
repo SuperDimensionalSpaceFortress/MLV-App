@@ -934,3 +934,161 @@ TEST(PlaybackInfoLabel, R7P11A1APlayToggleDropsThePreviousPlaysRate)
     f.achievedFps = 0.0;
     ASSERT_QSTR_EQ(QStringLiteral("--/24 fps"), playback_info_label::fpsField(f));
 }
+
+namespace
+{
+
+// The DEFINITION of a C function (video_mlv.c forward-declares some, and a declaration ends in ';' before any '{').
+QString definitionBody(const QString &source, const QString &signature)
+{
+    int at = source.indexOf(signature);
+    while ( at >= 0 ) {
+        const int brace = source.indexOf(QLatin1Char('{'), at);
+        const int semi = source.indexOf(QLatin1Char(';'), at);
+        if ( brace >= 0 && ( semi < 0 || brace < semi ) ) {
+            const int end = source.indexOf(QStringLiteral("\n}\n"), at);
+            return source.mid(at, end > at ? end - at : -1);
+        }
+        at = source.indexOf(signature, at + signature.size());
+    }
+    ASSERT_TRUE(false);
+    return QString();
+}
+
+// The presented facts of a CPU 8-bit frame at Full scale that passes every route guard.
+playback_info_label::PresentedRouteFacts cpuScale1RouteFacts(int routeTag)
+{
+    playback_info_label::PresentedRouteFacts r;
+    r.contextValid = true;
+    r.activeScale = 1;
+    r.gpuDebayer = false;
+    r.processedStageMeasured = true;
+    r.direct8 = false;
+    r.gpuRecon = false;
+    r.routeTag = routeTag;
+    return r;
+}
+
+playback_info_label::Facts cpuFullScaleFacts(const QString &selected)
+{
+    playback_info_label::Facts f = ownerFacts();
+    f.gpuDisplay = false;
+    f.processingBadge = QStringLiteral("CPU");
+    f.debayer = selected;
+    f.debayerOnGpu = false;
+    f.gpuDebayer = QString();
+    f.requestedScale = 1;
+    f.presentedScale = 1;
+    f.presentedValid = true;
+    return f;
+}
+
+} // namespace
+
+// r13 keys B1 (opus key3, fable, sol on 866b3422), catalogue row L-07 (label-truth): M16 HQ Dual-ISO clip, Full scale, Preview
+// Resolution Auto. Play: the x1 proxy writes route 6 on the render thread. Set Preview Resolution Full: the proxy no longer
+// engages and direct-8 renders each frame at full resolution with the selected AMaZE, but the scale-1 direct-8 render never
+// wrote the thread-local tag, so each frame was stored in the processed-8 cache with the stale 6. Enter fullscreen: the same-frame
+// redraw is a cache hit (processed8_direct_path_active=false, processed16_stage_measured=true), the cache replays 6, and both
+// surfaces read "AMaZE->Bilinear (Half proxy)" over a full-resolution AMaZE frame. The engine is not linked into console_tests,
+// so the engine half is pinned as source text (the reset on each scale-1 8-bit route, before the cache lookup and the render that
+// the stores read) and the label half runs on the replayed facts: the cache now replays route 0, and the label names AMaZE.
+TEST(PlaybackInfoLabel, R13B1CachedDirect8FrameReplaysRouteZeroNotAnOlderProxy)
+{
+    const QString engine = readRepoFile(QStringLiteral("src/mlv/video_mlv.c"));
+    const QString reset = QStringLiteral("g_mlv_phase4bv2_path_taken = 0;");
+    // (1) the playback entry clears the tag at scale 1 before the cache lookup and before the direct-8 render and store
+    const QString entry = definitionBody(engine, QStringLiteral("static void getMlvProcessedFrame8_with_scale("));
+    const int guardAt = entry.indexOf(QStringLiteral("if (normalizedScale <= 1)\n    {\n        ") + reset);
+    ASSERT_TRUE(guardAt >= 0);
+    const int lookupAt = entry.indexOf(QStringLiteral("mlv_processed_frame_8bit_cache_try_copy("));
+    const int renderAt = entry.indexOf(QStringLiteral("mlv_render_processed_frame8_direct_with_processing(video,"));
+    const int storeAt = entry.indexOf(QStringLiteral("const int stored_phase4b_path = mlv_phase4bv2_last_path_taken();"));
+    ASSERT_TRUE(lookupAt > guardAt);
+    ASSERT_TRUE(renderAt > guardAt);
+    ASSERT_TRUE(storeAt > renderAt);
+    // (2) the direct-8 render clears it in its scale-1 branch, before the full-resolution debayer (the prefetch worker stores
+    // its own thread's tag after calling it, so the entry reset alone would not cover the worker)
+    const QString direct = definitionBody(engine, QStringLiteral("static int mlv_render_processed_frame8_direct_with_processing(mlvObject_t * video,"));
+    const int scale1At = direct.indexOf(QStringLiteral("get_mlv_raw_frame_debayered(video,"));
+    ASSERT_TRUE(scale1At >= 0);
+    const int elseAt = direct.lastIndexOf(QStringLiteral("else\n    {"), scale1At);
+    ASSERT_TRUE(elseAt >= 0);
+    ASSERT_TRUE(direct.mid(elseAt, scale1At - elseAt).contains(reset));
+    // (3) the class sibling: the reconned-raw scale-1 render (its caller stores the tag too) clears it before its debayer
+    const QString reconned = definitionBody(engine, QStringLiteral("static int mlv_render_processed_frame8_direct_with_processing_from_reconned_raw("));
+    const int eqAt = reconned.indexOf(QStringLiteral("if (eff_scale == 1)"));
+    const int basicAt = reconned.indexOf(QStringLiteral("debayerBasicU16RecordingKernelMilliseconds("), eqAt);
+    ASSERT_TRUE(eqAt >= 0);
+    ASSERT_TRUE(basicAt > eqAt);
+    ASSERT_TRUE(reconned.mid(eqAt, basicAt - eqAt).contains(reset));
+    // (4) the scale > 1 routes keep their tag (it picks the x4/x8 Cubic resize): the entry reset is guarded by scale
+    ASSERT_FALSE(entry.mid(0, guardAt).contains(reset));
+
+    // the replayed facts of the fullscreen redraw: a cache hit at Full scale, direct-8 flag clear, processed stage measured
+    playback_info_label::PresentedRouteFacts replay = cpuScale1RouteFacts(0);
+    playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+    f.dualIsoClip = true;
+    f.dualIsoOn = true;
+    f.presentedRoute = playback_info_label::presentedRouteOfFrame(replay);
+    ASSERT_EQ(0, f.presentedRoute);
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+    const QString overlay = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+    const QString twin = playback_info_label::compose(f, playback_info_label::Toggles(), false);
+    ASSERT_FALSE(overlay.contains(QStringLiteral("proxy")));
+    ASSERT_FALSE(twin.contains(QStringLiteral("proxy")));
+    ASSERT_TRUE(overlay.section(QLatin1Char('\n'), 0, 0).endsWith(dot() + QStringLiteral("AMaZE")));
+    ASSERT_TRUE(twin.section(QLatin1Char('\n'), 0, 0).endsWith(dot() + QStringLiteral("AMaZE")));
+    // the label trusts a replayed tag that passes every guard, which is why the engine must replay 0: the pre-r13 replay of 6
+    replay.routeTag = 6;
+    f.presentedRoute = playback_info_label::presentedRouteOfFrame(replay);
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE->Bilinear (Half proxy)"), playback_info_label::debayerField(f));
+}
+
+// r13 hardening H-a (key3 H2): R12A1PresentedRouteIsReadFromThePresentedFrame pinned only processed16_stage_measured and the
+// tag key; deleting the direct-8, GPU-recon or scale guard kept it green. The guards now live in the pure presentedRouteOfFrame,
+// and each one fails a case below when it is deleted; the MainWindow accessor is pinned to feed each guard its own telemetry key.
+TEST(PlaybackInfoLabel, R13HaEveryPresentedRouteGuardIsLoadBearing)
+{
+    // a fresh x1 proxy frame passes every guard and names its route
+    ASSERT_EQ(6, playback_info_label::presentedRouteOfFrame(cpuScale1RouteFacts(6)));
+    ASSERT_EQ(9, playback_info_label::presentedRouteOfFrame(cpuScale1RouteFacts(9)));
+    // each guard alone withdraws the route
+    playback_info_label::PresentedRouteFacts r = cpuScale1RouteFacts(6);
+    r.direct8 = true;                           // a foreground direct-8 frame: full resolution, the selected debayer
+    ASSERT_EQ(0, playback_info_label::presentedRouteOfFrame(r));
+    r = cpuScale1RouteFacts(6);
+    r.gpuRecon = true;                          // the GPU playback recon produced it
+    ASSERT_EQ(0, playback_info_label::presentedRouteOfFrame(r));
+    for (int scale : {0, 2, 4, 8}) {             // the x1 proxy cores run only at scale 1
+        r = cpuScale1RouteFacts(6);
+        r.activeScale = scale;
+        ASSERT_EQ(0, playback_info_label::presentedRouteOfFrame(r));
+    }
+    r = cpuScale1RouteFacts(6);
+    r.gpuDebayer = true;                        // GPU AMaZE or GPU bilinear debayered it
+    ASSERT_EQ(0, playback_info_label::presentedRouteOfFrame(r));
+    r = cpuScale1RouteFacts(6);
+    r.processedStageMeasured = false;           // the CPU processed stage did not run (OutputDebayered16)
+    ASSERT_EQ(0, playback_info_label::presentedRouteOfFrame(r));
+    r = cpuScale1RouteFacts(6);
+    r.contextValid = false;                     // no presented request context
+    ASSERT_EQ(0, playback_info_label::presentedRouteOfFrame(r));
+    // the label for the direct-8 case names the selected debayer
+    r = cpuScale1RouteFacts(6);
+    r.direct8 = true;
+    playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("LMMSE"));
+    f.presentedRoute = playback_info_label::presentedRouteOfFrame(r);
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE"), playback_info_label::debayerField(f));
+    // the wiring: each guard reads its own key of the presented frame's telemetry, and the accessor returns the pure decision
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString route = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackRouteCode("));
+    ASSERT_TRUE(route.contains(QStringLiteral("route.contextValid = m_lastPresentedRequestContextValid;")));
+    ASSERT_TRUE(route.contains(QStringLiteral("route.activeScale = m_lastPresentedPlaybackScaleFactorActive;")));
+    ASSERT_TRUE(route.contains(QStringLiteral("route.gpuDebayer = m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer;")));
+    ASSERT_TRUE(route.contains(QStringLiteral("route.processedStageMeasured = telemetryBoolValue( telemetry, \"processed16_stage_measured\" );")));
+    ASSERT_TRUE(route.contains(QStringLiteral("route.direct8 = telemetryBoolValue( telemetry, \"processed8_direct_path_active\" );")));
+    ASSERT_TRUE(route.contains(QStringLiteral("route.gpuRecon = telemetryBoolValue( telemetry, \"gpu_playback_recon_used\" );")));
+    ASSERT_TRUE(route.contains(QStringLiteral("route.routeTag = telemetryIntValue( telemetry, \"render_thread_phase4b_path\" );")));
+    ASSERT_TRUE(route.contains(QStringLiteral("return playback_info_label::presentedRouteOfFrame( route );")));
+}

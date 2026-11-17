@@ -242,6 +242,32 @@ inline int presentedScaleOfCpuPrepRoute( int renderActiveScale, int sourceWidth,
     return ( scale == 1 || scale == 2 || scale == 4 || scale == 8 ) ? scale : renderActiveScale;
 }
 
+/*! \brief r13 (keys B1, hardening H-a): the facts of the presented frame that decide whether its CPU route tag
+ *  (render_thread_phase4b_path) names what ran. MainWindow::presentedPlaybackRouteCode reads them from that frame's own
+ *  telemetry; a processed-8 cache hit replays the tag the engine stored with the frame (video_mlv.c resets it to 0 on the
+ *  scale-1 CPU 8-bit routes that never write it, so a cached direct-8 frame replays 0, never an older proxy code). */
+struct PresentedRouteFacts
+{
+    bool contextValid = false;          // the presented request context is known
+    int activeScale = 0;                // the presented frame's active scale (the x1 proxy cores run only at 1)
+    bool gpuDebayer = false;            // GPU AMaZE or GPU bilinear debayered the frame
+    bool processedStageMeasured = false; // the CPU processed stage ran for this frame
+    bool direct8 = false;               // the direct-8 path rendered it (full resolution, the selected debayer)
+    bool gpuRecon = false;              // the GPU playback recon produced it
+    int routeTag = 0;                   // render_thread_phase4b_path of the frame
+};
+
+inline int presentedRouteOfFrame( const PresentedRouteFacts &f )
+{
+    if( !f.contextValid ) return 0;
+    if( f.activeScale != 1 ) return 0;
+    if( f.gpuDebayer ) return 0;
+    if( !f.processedStageMeasured ) return 0;
+    if( f.direct8 ) return 0;
+    if( f.gpuRecon ) return 0;
+    return f.routeTag;
+}
+
 /*! \brief One-line form for a log or receipt field: '\n' -> " / ", '"' -> '\''. */
 inline QString logForm( const QString &text )
 {

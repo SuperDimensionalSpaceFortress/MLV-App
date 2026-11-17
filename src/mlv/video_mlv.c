@@ -7555,6 +7555,13 @@ static int mlv_render_processed_frame8_direct_with_processing(mlvObject_t * vide
     }
     else
     {
+        /* LOOK-LABEL-PLAYBACK-INFO-1 r13 (keys B1): this full-resolution
+         * render never writes the thread-local route tag, and both callers
+         * (the foreground entry and the processed8 prefetch worker) store the
+         * tag with the frame, so clear it: a cached direct8 frame replays
+         * route 0, never an older proxy code. Telemetry only (scale 1: the
+         * presentation resampler returns Nearest before it reads the tag). */
+        g_mlv_phase4bv2_path_taken = 0;
         get_mlv_raw_frame_debayered(video,
                                     frameIndex,
                                     raw_frame,
@@ -7886,6 +7893,10 @@ static int mlv_render_processed_frame8_direct_with_processing_from_reconned_raw(
          * producer, so avoid the full CPU AMaZE fallback that otherwise
          * dominates the path; the displayed pixels still come from the CUDA
          * AMaZE/device-Bayer presenter. */
+        /* LOOK-LABEL-PLAYBACK-INFO-1 r13 (keys B1, class sweep): this scale-1
+         * render never writes the thread-local route tag and its caller
+         * stores the tag with the frame, so clear it (telemetry only). */
+        g_mlv_phase4bv2_path_taken = 0;
         debayerBasicU16RecordingKernelMilliseconds(unprocessed_frame, reconnedRawFrame, full_w, full_h,
                         threads, bit_shift);
     }
@@ -8398,6 +8409,22 @@ static void getMlvProcessedFrame8_with_scale(mlvObject_t * video,
         video->playback_scale_factor_active = normalizedScale;
     }
     processingSetPlaybackPreviewScaleFactor(normalizedScale);
+
+    /* LOOK-LABEL-PLAYBACK-INFO-1 r13 (keys B1): the route tag is thread-local
+     * and only the CPU processed cores write it (the x1 proxy writes 6/7/9/10).
+     * At scale 1 the direct8 render (get_mlv_raw_frame_debayered) never writes
+     * it, so a proxy code left by an earlier frame on this thread was stored
+     * with a full-resolution direct8 frame below and replayed on its cache
+     * hit, and the playback label read "(Half proxy)" over that frame. Clear
+     * it before the cache lookup and any render, as the 16-bit entry does.
+     * Telemetry only: at scale <= 1 the presentation resampler returns Nearest
+     * before it reads the tag (PlaybackScaling.h
+     * playbackChoosePresentationScaleResampler), so no pixel changes. Scale > 1
+     * is left as it was: there the tag picks the x4/x8 Cubic resize. */
+    if (normalizedScale <= 1)
+    {
+        g_mlv_phase4bv2_path_taken = 0;
+    }
 
     /* Phase 4B: size the output by *effective* scale, not full sensor.
      * The downstream direct8 path reads playback_scale_factor_active to
