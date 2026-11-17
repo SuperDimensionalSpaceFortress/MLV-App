@@ -878,7 +878,8 @@ TEST(PlaybackInfoLabel, R12P13A2NewPlayRateWaitsForAnIntervalInsideThisPlay)
     ema = playback_fps_meter::smoothedFrameMs(ema, interval);
     ASSERT_TRUE(ema > 39.9 && ema < 40.1);
     // no previous draw at all: nothing to measure
-    ASSERT_EQ(0, playback_fps_meter::meterIntervalMs(false, false, 123));
+    interval = playback_fps_meter::meterIntervalMs(false, false, 123);
+    ASSERT_EQ(0, interval);
     // the wiring: the first draw after a toggle consumes the flag, drops the average and feeds meterIntervalMs
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const int drawAt = source.indexOf(QStringLiteral("const bool firstDrawOfPlay = m_playbackFpsMeterNewPlay;"));
