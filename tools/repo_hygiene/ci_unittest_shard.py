@@ -884,6 +884,8 @@ def run_parallel(
                 problems.append(f"worker {number}/{len(logs)} wrote no readable result (exit {code})")
             elif code != 1 and not record["ok"]:
                 problems.append(f"worker {number}/{len(logs)} recorded a failed run but exited {code}")
+            elif code == 5 and record["tests_run"] != 0:  # 5 is "no tests ran", never the exit of a run that ran some
+                problems.append(f"worker {number}/{len(logs)} exited 5 after running {record['tests_run']} tests")
     finally:
         watch.stop()
         for proc, log in procs:  # an exception above must not leave a worker running

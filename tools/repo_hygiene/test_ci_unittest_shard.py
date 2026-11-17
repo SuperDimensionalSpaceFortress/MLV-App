@@ -1367,6 +1367,41 @@ class ShardExitCodeTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn(f"recorded a failed run but exited {exit_code}", err.getvalue())
 
+    # r4 adversary A1 (pass 5): exit 5 means "no tests ran"; a child that ran tests and still exits 5
+    # (an atexit hook calling os._exit(5), say) must not pass just because its record says ok.
+    def test_a_worker_that_ran_tests_and_exits_five_fails_the_shard(self) -> None:
+        root, tests, tag = self._fixture()
+
+        class AtExitFivePopen:
+            def __init__(self, command: list[str], **kwargs: object) -> None:
+                spec = json.loads(Path(command[command.index("--worker-spec") + 1]).read_text(encoding="utf-8"))
+                ids = [test.id() for test in tests if f"{type(test).__module__}.{type(test).__qualname__}" in spec["classes"]]
+                record = {"ids": ids, "skipped_ids": [], "seconds": {}, "tests_run": len(ids), "ok": True}
+                Path(spec["result"]).write_text(json.dumps(record), encoding="utf-8")
+                self.returncode = 5
+
+            def poll(self) -> int:
+                return 5
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 5
+
+            def kill(self) -> None:
+                pass
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.subprocess, "Popen", AtExitFivePopen),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={}, timeout=120.0,
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("exited 5 after running", err.getvalue())
+
     def test_a_worker_result_without_a_boolean_ok_is_unreadable(self) -> None:
         path = Path(tempfile.mkdtemp(prefix="fxw-")) / "result.json"
         self.addCleanup(shutil.rmtree, path.parent, True)
