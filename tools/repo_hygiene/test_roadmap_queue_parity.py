@@ -36,8 +36,9 @@ CHECKER_PATH = REPO_ROOT / "tools" / "coordination" / "check_roadmap_queue_parit
 # OWNER-ASK-PARK-GUARD-1: an owner ask of another kind is on the table too, its kind cell reading "<kind> (owner)".
 # (r2, adversary advisory A4 on 8ba4f8ab) any owner kind cell counts, a blank kind included ("|  (owner) |"): the cell only has to end in "(owner)".
 # (r10, advisory A4) the gaps between cells are spaces or tabs only: `\s` also matched a newline, so a row broken between cells still read as a row.
+# (r11, sol r10 hardening) the card cell is `[^\s|]+`, one pipe-free token as the renderer's loader requires: `\S+` read "OWNER|EXTRA" as a card.
 # (r10 adversary advisories A1, pass 2 A2) the owner kind is the renderer's KIND_RX ([A-Za-z0-9][A-Za-z0-9 _.-]{0,39}, or blank) then " (owner)": `[^|\n]` also matched U+2028 and U+0085.
-ROADMAP_ROW_RX = re.compile(r"^\|[ \t]*\d+[ \t]*\|[ \t]*(\S+)[ \t]*\|[ \t]*(product|playback|(?:[A-Za-z0-9][A-Za-z0-9 _.-]{0,39})?[ ]\(owner\))[ \t]*\|", re.MULTILINE)
+ROADMAP_ROW_RX = re.compile(r"^\|[ \t]*\d+[ \t]*\|[ \t]*([^\s|]+)[ \t]*\|[ \t]*(product|playback|(?:[A-Za-z0-9][A-Za-z0-9 _.-]{0,39})?[ ]\(owner\))[ \t]*\|", re.MULTILINE)
 GENERATED_FROM_RX = re.compile(r"^generated_from: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", re.MULTILINE)
 # docs/22 working tier is 25000 soft; the rendered roadmap grows with the open backlog.
 ROADMAP_BUDGET_BYTES = 20000
@@ -126,6 +127,13 @@ class RoadmapQueueParityTests(unittest.TestCase):
         for sep in (" ", " ", "\x85", "\x0b", "\x0c", "\r"):   # adversary advisory A1: no other line break inside the kind cell
             with self.subTest(sep=repr(sep)):
                 self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa%s(owner) | queued | 2026-10-20 | - |\n" % sep), [])
+
+    def test_r11_the_card_cell_is_one_pipe_free_token(self) -> None:
+        # ROADMAP-PARITY-CARD-DELIMITER-1 (sol r10 hardening): the renderer's loader refuses a card with a pipe, so no such line is a row
+        for line in ("| 3 | OWNER|EXTRA | qa (owner) | queued | 2026-10-20 | - |", "| 3 | A|B|C | product | queued | 2026-10-20 | - |"):
+            with self.subTest(line=line):
+                self.assertEqual(ROADMAP_ROW_RX.findall(line), [])
+        self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa (owner) | queued | 2026-10-20 | - |"), [("OWNER-1", "qa (owner)")])
 
     def test_no_duplicate_card_ids_on_the_roadmap(self) -> None:
         ids = [card_id for card_id, _kind in _roadmap_rows()]

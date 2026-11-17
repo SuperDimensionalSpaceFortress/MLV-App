@@ -1598,6 +1598,36 @@ class R10LastTierTests(unittest.TestCase):
                     self.assertIn("20000", err.getvalue())
                     self.assertFalse(out.exists(), "nothing is written when the board is refused")
 
+    # r11 (review-pr835-sol-r10-20261117T1421Z A1): the last tier printed a displayed resolved product owner park as '- X (P3): waiting', with
+    # no owner designation and no resolution, so done, refused and superseded were indistinguishable. Class: a fallback tier that displays an
+    # owner park must say what the tiers above it say (`_render`: '- X (P3, owner ask, <resolution>): <note>'), or leave the row out.
+    def resolved_park(self, resolution: str) -> dict:
+        return row("X", "parked", self.STAMP, origin="owner", resolution=resolution, notes="waiting")
+
+    def test_r11_a1_a_resolved_product_owner_park_in_the_last_tier_keeps_its_resolution(self) -> None:
+        for resolution in render_roadmap.RESOLUTIONS:
+            data = self.data(self.products() + [self.resolved_park(resolution)], 540)
+            with self.subTest(resolution=resolution):
+                text = render_roadmap.render(data)
+                self.assertTrue(text.startswith(MASTER_HEADER), "this board must land in the last tier")
+                self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+                self.assertIn("- X (P3, owner ask, %s): waiting\n" % resolution, text)
+
+    def test_r11_a1_at_the_boundary_a_resolved_owner_park_is_shown_with_its_resolution_or_not_at_all(self) -> None:
+        # the repro board (300 queued product rows, a 590-char scope note) is 19989 CRLF bytes at master with the row unlabelled; labelled it
+        # is over, so the row is left out (counted nowhere, as the collapsed tier leaves it), never shown without what the hub resolved it as
+        for note_len in range(520, 620):
+            if render_roadmap._budget_size(master_render(self.data(self.products(), note_len))) > ROADMAP_BUDGET_BYTES:
+                continue   # over budget on product rows alone: rendered as they are (pass2 A1), outside this test
+            for resolution in ("done", "refused", "superseded"):
+                data = self.data(self.products() + [self.resolved_park(resolution)], note_len)
+                with self.subTest(note_len=note_len, resolution=resolution):
+                    text = render_roadmap.render(data)
+                    self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+                    for line in text.splitlines():
+                        if line.startswith("- X "):
+                            self.assertIn("owner ask, %s" % resolution, line)
+
     def test_pass2_a1_a_base_that_can_be_rendered_over_budget_is_still_product_alone(self) -> None:
         # the documented exception stays: product rows are never dropped, so a board over budget on them alone is rendered, not refused
         data = self.data(self.products(), 4000)

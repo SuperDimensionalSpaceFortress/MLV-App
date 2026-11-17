@@ -344,7 +344,8 @@ def _render_base(data: dict) -> "str | None":
     """fork/master's render, verbatim apart from the helpers it inlined: no origin, resolution or owner section, days read as stamp[:10]
     (not as UTC instants), the base header. A last render tier, so a board that fit the budget at the base fits here. (r10 A2) Rows tied on
     priority, stamp and card end on _canonical, so input order never decides; master left them in input order. (r10 A3) None when the
-    7-day window, read from generated_utc's text, starts before 0001-01-01 (the loader checks the UTC reading, which can be a day later)."""
+    7-day window, read from generated_utc's text, starts before 0001-01-01 (the loader checks the UTC reading, which can be a day later).
+    (r11 A1) The one line it adds to master's: a parked owner ask closed with a resolution carries `owner ask, <resolution>` like the upper tiers."""
     def day(stamp: str) -> date:
         return datetime.strptime(stamp[:10], "%Y-%m-%d").date()
 
@@ -399,7 +400,11 @@ def _render_base(data: dict) -> "str | None":
     out.append("| total | %d | %d |" % (landed_total, queued_total))
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "", "## Parked with reason", "", *scope]
     for r in parked:
-        out.append("- %s (P%s): %s" % (r["card"], r["priority"], _note(r)))
+        # (r11 A1) a parked owner ask with a structured resolution says so, as `_render` does: done, refused and superseded must not read the
+        # same. An owed one has no resolution to lose and stays master's line (r7 A1). When the label pushes the board over budget the
+        # caller's next candidate leaves the closed owner asks out; a row is never shown without the resolution it was closed with.
+        label = ", owner ask, %s" % _resolution(r) if r.get("origin") == OWNER and _resolution(r) else ""
+        out.append("- %s (P%s%s): %s" % (r["card"], r["priority"], label, _note(r)))
     if not parked:
         out.append("- (none parked)")
     return "\n".join(out) + "\n"
