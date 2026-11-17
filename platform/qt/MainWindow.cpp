@@ -24394,7 +24394,7 @@ void MainWindow::updatePlaybackQualityIndicator( void )
         envHq,
         envPreviewOverride,
         aggressivePreviewActive,
-        m_lastPresentedPlaybackScaleFactorActive,
+        presentedPlaybackScaleShown(),   // LOOK-LABEL-PLAYBACK-INFO-1 r12 (pass 14 A1): the scale the label below shows, so a prep factor change relabels
         m_lastPresentedRequestContextValid,
         m_lastPresentedRequestContext.playbackScaleFactorPolicy,   // r3 (A1): the label below matches on the asked scale
         phase3Tier,

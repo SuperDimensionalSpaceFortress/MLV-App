@@ -1027,7 +1027,7 @@ private:
         bool envHq = false;
         int envPreviewOverride = -2;
         bool aggressivePreviewActive = false;
-        int lastPresentedPlaybackScaleFactorActive = -1;
+        int lastPresentedPlaybackScaleFactorActive = -1;   // r12 (pass 14 A1): presentedPlaybackScaleShown(), the scale the label shows
         bool lastPresentedRequestContextValid = false;
         int lastPresentedRequestScaleFactor = -1;
         int phase3Tier = -1;

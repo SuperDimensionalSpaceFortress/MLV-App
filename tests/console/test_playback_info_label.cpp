@@ -860,6 +860,28 @@ TEST(PlaybackInfoLabel, R12P13A1CpuPrepFrameNamesTheScaleItWasShownAt)
     ASSERT_FALSE(indicator.contains(QStringLiteral("const int activeScale = m_lastPresentedPlaybackScaleFactorActive;")));
 }
 
+// r12 adversary pass 14 A1 (b8b8f430): Quality mode, MLVAPP_PLAYBACK_SCALE_FACTOR=2, CPU prep, Zoom Fit off then on. Both frames
+// report active scale 2 and render 1920 wide; the prep factor goes 1 -> 2. The indicator cache compared the raw active scale (2
+// both times) and returned before the corrected accessor ran, so the toolbar kept "Half res->Full res" over a Half frame.
+// The cache keys on the scale the indicator shows, the same accessor its label reads.
+TEST(PlaybackInfoLabel, R12P14A1IndicatorCacheKeysOnTheShownScale)
+{
+    // the two frames of the finding: same raw report, different shown scale
+    ASSERT_EQ(1, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 1));
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 2));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString indicator = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackQualityIndicator("));
+    const int cacheAt = indicator.indexOf(QStringLiteral("const PlaybackQualityIndicatorCache currentCache"));
+    ASSERT_TRUE(cacheAt >= 0);
+    const int cacheEnd = indicator.indexOf(QStringLiteral("};"), cacheAt);
+    ASSERT_TRUE(cacheEnd > cacheAt);
+    const QString cache = indicator.mid(cacheAt, cacheEnd - cacheAt);
+    ASSERT_TRUE(cache.contains(QStringLiteral("presentedPlaybackScaleShown(),")));
+    ASSERT_FALSE(cache.contains(QStringLiteral("m_lastPresentedPlaybackScaleFactorActive")));
+    // the cache compare still reads that field, so a shown-scale change misses the cache and relabels
+    ASSERT_TRUE(indicator.contains(QStringLiteral("currentCache.lastPresentedPlaybackScaleFactorActive")));
+}
+
 // r12 adversary pass 13 A2 (c58f5bd8): previous Play EMA 40 ms, last draw at .000, Stop at .100, Play at .450, first new draw at
 // .458. The first draw smoothed the 458 ms cross-Play gap into the old average (81.8 ms, 12.2 fps), so the relabel near .700
 // showed a rate though only one draw belonged to this Play. The first draw of a Play feeds no interval; the next one seeds it.
