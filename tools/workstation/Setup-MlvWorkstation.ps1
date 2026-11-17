@@ -1055,7 +1055,8 @@ $SecretPatterns = @(
     # r14: a URL that carries a user AND a password ('https://alice:hunter2@example.org', the .git-credentials shape)
     # r19 pass 22 A3: an apostrophe is a legal password character ('https://alice:p''ass@host/'), so only '"', '<', '>' and blanks end the password run
     # r20 pass 23 A2: the same holds for the user part ('https://o''brien:hunter2@host/')
-    '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"<>]+:[^\s/@"<>]+@'
+    # r25 pass 30 A3: a double quote (raw, or '\"' inside a JSON string) is a legal user or password character too ('https://alice:p"ass@host/'): git's own parser takes it
+    '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@<>]+:[^\s/@<>]+@'
 )
 # r14: the XML element form of the key/value rule ('<password>hunter2</password>', '<DbPassword>x</DbPassword>'); the attribute form 'password="x"' is the line form.
 # r15 (pass 12 A2): the element's RAW content, from just after its opening tag to its matching closing tag (or to the end of the text when it is never closed), is
@@ -1299,7 +1300,7 @@ function Get-CredentialXmlHitIndex {
 # secret by its own key). A body of blank and '#' comment lines holds nothing. Returns the index of the header, -1 when there is none.
 # r19 pass 22 A2: a quoted name part may hold brackets ('["secret[primary]"]'), so a quoted run is one unit of the header name
 # r23 (adversary pass 27 A2): an INI header may end in a ';' comment too ('[auth] ; connection settings'); only '#' was allowed, so that table was never seen
-$script:CredentialTableHeaderRegex = [regex]::new('(?m)^[ \t]*\[{1,2}[ \t]*((?:"[^"\r\n]*"|''[^''\r\n]*''|[^\[\]\r\n"''])+?)[ \t]*\]{1,2}[ \t]*(?:[#;][^\n]*)?$')
+$script:CredentialTableHeaderRegex = [regex]::new('(?m)^[ \t]*\[{1,2}[ \t]*((?:"(?:[^"\\\r\n]|\\[^\r\n])*"|''[^''\r\n]*''|[^\[\]\r\n"''])+?)[ \t]*\]{1,2}[ \t]*(?:[#;][^\n]*)?$')
 function Get-CredentialTableHitIndex {
     param([string]$Text)
     $heads = @($script:CredentialTableHeaderRegex.Matches($Text))
@@ -2019,22 +2020,28 @@ function Set-ImportFileContentAtomic {
                 # save held open at that instant stayed unrestored while the message said it had been put back). Unreadable now takes the restore path below, whose Replace fails
                 # typed when the file really is held and names both files.
                 $olderIsWas = $false
-                try { $olderIsWas = ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($older))) -ceq (Get-ImportBytesHash $was) -and [IO.File]::GetLastWriteTimeUtc($older) -eq $wasTime) } catch { $olderIsWas = $false }
+                $olderHash = $null; $olderTime = $null   # r25 pass 30 A1: the identity of the file the restore below will put back (kept to verify what the terminal Replace displaces)
+                try { $olderHash = Get-ImportBytesHash ([IO.File]::ReadAllBytes($older)); $olderTime = [IO.File]::GetLastWriteTimeUtc($older); $olderIsWas = ($olderHash -ceq (Get-ImportBytesHash $was) -and $olderTime -eq $wasTime) } catch { $olderIsWas = $false; $olderHash = $null }
                 if (-not $olderIsWas) {
                     $undo = "$base.undo"
                     if ($script:ImportBeforeUndoHook) { & $script:ImportBeforeUndoHook $Dest }   # r25 test seam: a save in the instant before this Replace
                     try { [IO.File]::Replace($older, $Dest, $undo, $true) }
                     catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a newer save landed while the rollback ran and is kept at $older; putting it back failed: $($_.Exception.Message); an older save is at $Dest)" }
-                    # r25 (adversary pass 29 A3): this Replace is itself a window. What it displaced (now at $undo) must be the interleaved save read above (bytes AND time);
-                    # anything else is a save that landed after the check, i.e. the NEWEST, and it goes back to the host path at once. Nothing is deleted: the save the second
-                    # Replace displaces is kept at $undo2 and named.
-                    $undoIsWas = $false
-                    try { $undoIsWas = ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($undo))) -ceq (Get-ImportBytesHash $was) -and [IO.File]::GetLastWriteTimeUtc($undo) -eq $wasTime) } catch { $undoIsWas = $false }
-                    if (-not $undoIsWas) {
+                    # r25 (adversary pass 29 A3, pass 30 A1): this Replace is itself a window. What it displaced (now at $undo) must be the file that stood at the host path just
+                    # before it: the one the Replace above put there, which is the $aside content ($asideBytes / $asideTime, read above; NOT $was, which is a different file).
+                    # Anything else is a save that landed after the check, i.e. the NEWEST, and it goes back to the host path at once. Nothing is deleted: the file the second
+                    # Replace displaces is kept at $undo2 and named, and it is verified against the identity of what was restored ($olderHash / $olderTime): when it is not that
+                    # file, a still newer save landed in the instant of the restore and the message says so instead of claiming the newest is live.
+                    $undoIsPrev = $false
+                    try { $undoIsPrev = ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($undo))) -ceq (Get-ImportBytesHash $asideBytes) -and [IO.File]::GetLastWriteTimeUtc($undo) -eq $asideTime) } catch { $undoIsPrev = $false }
+                    if (-not $undoIsPrev) {
                         $undo2 = "$base.undo2"
                         try { [IO.File]::Replace($undo, $Dest, $undo2, $true) }
                         catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a newest save landed in the instant of the restore and is kept at $undo; putting it back failed: $($_.Exception.Message); an older save is at $Dest)" }
-                        throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (saves landed while the rollback ran: the newest is live at $Dest again; the older save it displaced is kept at $undo2)"
+                        $undo2IsRestored = $false
+                        try { $undo2IsRestored = ($null -ne $olderHash -and (Get-ImportBytesHash ([IO.File]::ReadAllBytes($undo2))) -ceq $olderHash -and [IO.File]::GetLastWriteTimeUtc($undo2) -eq $olderTime) } catch { $undo2IsRestored = $false }
+                        if ($undo2IsRestored) { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (saves landed while the rollback ran: the newest is live at $Dest again; the older save it displaced is kept at $undo2)" }
+                        throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (saves landed while the rollback ran: a further save landed in the instant of the restore; the file the restore displaced is kept at $undo2 and was NOT verified to be older than the live file at $Dest)"
                     }
                     throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (saves landed while the rollback ran: the newest is live at $Dest; the older save it displaced is kept at $undo)"
                 }

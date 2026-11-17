@@ -2480,6 +2480,13 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r25 p29 detector')) {
     Assert-That (Test-CredentialText ('"pass\' + "`r`n" + '   word": hunter2')) 'r25 p29 A2 detector: the same split key with a CRLF is a credential' ''
     Assert-That (-not (Test-CredentialText 'machine example.org login alice')) 'r25 p29 control: a netrc record with no password is not a credential' ''
     Assert-That (-not (Test-CredentialText ('"pat\' + "`n" + '   h": C:/work'))) 'r25 p29 control: an escaped line break that spells a plain key is not a credential' ''
+    # r25 (adversary pass 30 on b621d213, A2/A3): an escaped quote inside a quoted table-header name, and a quote inside a URL user or password
+    Assert-That (Test-CredentialText ('["password\"primary"]' + "`n" + 'key = "hunter2"')) 'r25 p30 A2 detector: a TOML table ["password\"primary"] (escaped quote in the name) with a value is a credential' ''
+    Assert-That (Test-CredentialText ('[["password\"primary"]]' + "`n" + 'key = "hunter2"')) 'r25 p30 A2 detector: the array-of-tables spelling [["password\"primary"]] is a credential' ''
+    Assert-That (Test-CredentialText '{"endpoint":"https://alice:p\"ass@example.org/repo"}') 'r25 p30 A3 detector: a JSON url whose password holds an escaped quote is a credential' ''
+    Assert-That (Test-CredentialText 'endpoint = https://alice:p"ass@example.org/repo') 'r25 p30 A3 detector: a raw url whose password holds a quote is a credential' ''
+    Assert-That (Test-CredentialText 'endpoint = https://al"ice:hunter2@example.org/repo') 'r25 p30 A3 detector: a raw url whose user holds a quote is a credential' ''
+    Assert-That (-not (Test-CredentialText '{"endpoint":"https://example.org/repo","contact":"a@example.org"}')) 'r25 p30 control: a url with no user and password next to an email is not a credential' ''
 }
 # r25 (adversary pass 29 A3): a save that lands in the instant before the newest-save restore Replace is the NEWEST; it must be live at the end, never left in the .undo file
 if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r25 p29 A3')) {
