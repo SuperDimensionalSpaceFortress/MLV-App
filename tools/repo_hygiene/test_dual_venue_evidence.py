@@ -16608,10 +16608,19 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
             vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic='look_assist_flavor=classic",
             vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' look_assist_enabled=0",
             vs + "look_assist_enabled=0 look_assist_flavor=cinematic note=' look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic",
+            # r25 pass 2 A1 on a37b59c9, its input verbatim and the variants it names: the masked-key match was case-sensitive, so an upper- or mixed-case
+            # masked key was absent again (flavor=cinematic, HONOURED, lookAssistOn true). The key counts in any case, masked or plain, in the answering
+            # record and in an earlier one; only the lower-case token proves a flavor (an upper-case key alone proves none, as before r25)
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' LOOK_ASSIST_FLAVOR=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' LOOK_ASSIST_ENABLED=0",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' look_ASSIST_flavor=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic LOOK_ASSIST_FLAVOR=classic",
+            vs + "look_assist_enabled=0 look_assist_flavor=cinematic note=' Look_Assist_Flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic",
+            vs + "look_assist_enabled=1 LOOK_ASSIST_FLAVOR=cinematic",
             # controls: a closed quoted span that names no look key, and a record with no quote, still prove cinematic
             vs + "look_assist_enabled=1 look_assist_flavor=cinematic note='a b'",
             vs + "look_assist_enabled=1 look_assist_flavor=cinematic"])
-        self.assertEqual(got, ["|HONOURED", "|HONOURED", "|HONOURED", "|HONOURED", "cinematic|HONOURED", "cinematic|HONOURED"], got)
+        self.assertEqual(got, ["|HONOURED"] * 10 + ["cinematic|HONOURED", "cinematic|HONOURED"], got)
 
 
 @requires_windows_pwsh

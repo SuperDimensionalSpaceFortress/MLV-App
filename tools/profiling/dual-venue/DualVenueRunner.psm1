@@ -2412,11 +2412,13 @@ function Get-DvLookAssistEvidence {
                 # record answers (and refuses the leg) as it does in every other culture, never skipped
                 if ([regex]::IsMatch($line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_state(\s|$)'), $script:DvCi)) {
                     $found = $line
-                    foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)')) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
                     # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r25 (r25 adversary A1 on 217e0726, its input: `look_assist_flavor=cinematic
                     # diagnostic=' look_assist_flavor=classic`): a flavor key with a MASKED `=` (ConvertTo-DvQuoteMaskedBody) is UNREADABLE, never absent: it
-                    # is a flavor token of its own (the mask character, never an applied flavor), so the record names more than one flavor and none is proven
-                    if ([regex]::IsMatch($line, '(?<![A-Za-z0-9_])look_assist_flavor\x1A')) { [void]$flavorsSeen.Add([string]$script:DvQuotedEqualsMask) }
+                    # is a flavor token of its own (the mask character, never an applied flavor), so the record names more than one flavor and none is proven.
+                    # r25 pass 2 A1 (a37b59c9, its input: `... diagnostic=' LOOK_ASSIST_FLAVOR=classic`): the key is counted in ANY case ($script:DvCi), plain
+                    # or masked, so a differently cased flavor key is a token too (counting only ever adds tokens: it never proves a flavor, see $exactFlavor below)
+                    foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)', $script:DvCi)) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
+                    if ([regex]::IsMatch($line, '(?<![A-Za-z0-9_])look_assist_flavor\x1A', $script:DvCi)) { [void]$flavorsSeen.Add([string]$script:DvQuotedEqualsMask) }
                 }
             }
         }
@@ -2438,14 +2440,17 @@ function Get-DvLookAssistEvidence {
                 # pass 4 A2: two contradictory look_assist_enabled tokens in the answering record are no unambiguous `on` -- no flavor is proven from that record.
                 # r25 (r25 adversary A1 on 217e0726): a flavor or enabled key with a MASKED `=` in the answering record is a token of its own (UNREADABLE,
                 # never absent), so it makes the record name two values and no flavor is proven from it, as a second plain token does (pass 4 A1 / A2)
+                # r25 pass 2 A1 (a37b59c9): the ambiguity counts take the key in ANY case ($script:DvCi), plain or masked; the flavor itself is still proven
+                # only by the app's own lower-case `look_assist_flavor=` token ($exactFlavor), so a differently cased key adds a token and never supplies one
                 $maskToken = [string]$script:DvQuotedEqualsMask
-                $flavorTokens = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value }) +
-                                @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_flavor\x1A') | ForEach-Object { $maskToken })
-                $enabledTokens = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)') | ForEach-Object { $_.Groups['v'].Value }) +
-                                 @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_enabled\x1A') | ForEach-Object { $maskToken })
+                $exactFlavor = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value })
+                $flavorTokens = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)', $script:DvCi) | ForEach-Object { $_.Groups['f'].Value }) +
+                                @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_flavor\x1A', $script:DvCi) | ForEach-Object { $maskToken })
+                $enabledTokens = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)', $script:DvCi) | ForEach-Object { $_.Groups['v'].Value }) +
+                                 @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_enabled\x1A', $script:DvCi) | ForEach-Object { $maskToken })
                 $lastFlavors = @($flavorTokens | Select-Object -Unique)
                 $enabledValues = @($enabledTokens | Select-Object -Unique)
-                if ($flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
+                if ($exactFlavor.Count -ge 1 -and $flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
                 # r24 (r24 adversary pass 2 A2 sibling): ORDINAL, so look_assist_enabled=<U+0661> or 1<U+200B> is never on
                 if (-not [string]::Equals($reported, '1', [StringComparison]::Ordinal)) { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
