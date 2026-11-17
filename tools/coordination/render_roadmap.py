@@ -315,18 +315,77 @@ def render(data: dict) -> str:
     text = _render(data, 0, collapsed=True)
     if _budget_size(text) <= ROADMAP_BUDGET_BYTES:
         return text
-    # (r4 pass 2 A1) the owner section's own heading and placeholder cost bytes the base never spent: a product-only board that fit
-    # the budget at base (19999 CRLF bytes) was 20143 here. Last tier: no owner section, so the file is the base's, byte for byte.
-    return _render(data, 0, collapsed=True, bare=True)
+    # (r4 pass 2 A1, r7 A1) the owner section, the owner-aware header and the UTC-instant day reading all cost bytes the base never spent:
+    # a product-only board that fit the budget at base (19999 CRLF bytes) was 20143, then 20001 with a closed owner ask, then 20001 with
+    # an offset merged_utc. Last tier: the base's own algorithm, so the file is the base's, byte for byte, for every input it accepted.
+    return _render_base(data)
+
+
+def _render_base(data: dict) -> str:
+    """fork/master's render, verbatim apart from the helpers it inlined: no origin, resolution or owner section, days read as stamp[:10]
+    (not as UTC instants), the base header. The last render tier, so a board that fit the budget at the base fits here."""
+    def day(stamp: str) -> date:
+        return datetime.strptime(stamp[:10], "%Y-%m-%d").date()
+
+    def landed_stamp(r: dict) -> str:
+        if r.get("merged_utc"):
+            return r["merged_utc"]
+        stamps = [r["source_ledger_stamp"]]
+        if r.get("pinned_utc"):
+            stamps.append(r["pinned_utc"])
+        stamps += DECLARED_RX.findall(r.get("evidence") or "")
+        return max(stamps)
+
+    def sort_key(r: dict) -> tuple:
+        return (r["priority"], r["source_ledger_stamp"], r["card"])
+
+    rows = [r for r in data["rows"] if r["kind"] in KINDS]
+    open_rows = sorted((r for r in rows if r["state"] not in CLOSED_STATES), key=sort_key)
+    parked = sorted((r for r in rows if r["state"] == "parked"), key=sort_key)
+    last = day(data["generated_utc"])
+    days = [last - timedelta(days=WINDOW_DAYS - 1 - i) for i in range(WINDOW_DAYS)]
+    landed = {d: 0 for d in days}
+    queued = {d: 0 for d in days}
+    for r in rows:
+        d = day(r["source_ledger_stamp"])
+        if d in queued:
+            queued[d] += 1
+        if r["state"] == "merged":
+            d = day(landed_stamp(r))
+            if d in landed:
+                landed[d] += 1
+    landed_total, queued_total = sum(landed.values()), sum(queued.values())
+    scope = _scope_notes(data)
+    out = [HEADER_BASE, "generated_from: %s" % data["generated_utc"], "", "## Open product and playback cards", "", *scope]
+    out.append("| P | card | kind | state | queued since | order_chain |")
+    out.append("|---|---|---|---|---|---|")
+    for r in open_rows:
+        out.append("| %s | %s | %s | %s | %s | %s |" % (
+            r["priority"], r["card"], r["kind"], r["state"], r["source_ledger_stamp"][:10], _chain(r)))
+    if not open_rows:
+        out.append("| - | (none open) | - | - | - | - |")
+    out += ["", "## Drain", "", "product+playback open: %d" % len(open_rows),
+            "", "Window: the %d UTC days ending %s (the last day is partial)." % (WINDOW_DAYS, last.isoformat()),
+            "Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp "
+            "(approximate: a lower bound on the merge time, not a measurement); "
+            "queued = rows of any state by `source_ledger_stamp`.", "",
+            "| day (UTC) | landed | queued |", "|---|---|---|"]
+    for d in days:
+        out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
+    out.append("| total | %d | %d |" % (landed_total, queued_total))
+    out += ["", _drain_line(len(open_rows), landed_total, queued_total), "", "## Parked with reason", "", *scope]
+    for r in parked:
+        out.append("- %s (P%s): %s" % (r["card"], r["priority"], _note(r)))
+    if not parked:
+        out.append("- (none parked)")
+    return "\n".join(out) + "\n"
 
 
 # The one owner line in the collapsed state; never longer than "- (no owner ask is parked)", so it adds no byte to the board.
 OWNER_COLLAPSED_LINE = "- (see card-queue.json)"
 
 
-def _render(data: dict, cap: int, collapsed: bool = False, bare: bool = False) -> str:
-    if bare:   # (r7 A1) master has no origin or resolution: every product/playback row, a closed owner ask included, is a plain row to it
-        data = dict(data, rows=[{k: v for k, v in r.items() if k not in ("origin", "resolution")} for r in data["rows"] if r["kind"] in KINDS])
+def _render(data: dict, cap: int, collapsed: bool = False) -> str:
     open_rows, parked, days, landed, queued = _stats(data, collapsed)
     if collapsed:   # (r3 A1) no parked owner ask is listed anywhere: OWNER_COLLAPSED_LINE stands for all of them
         parked = [r for r in parked if r.get("origin") != OWNER]
@@ -335,7 +394,7 @@ def _render(data: dict, cap: int, collapsed: bool = False, bare: bool = False) -
     landed_total, queued_total = sum(landed.values()), sum(queued.values())
 
     scope = _scope_notes(data)
-    out = [HEADER_BASE if bare else HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "", *scope]
+    out = [HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "", *scope]
     out.append("| P | card | kind | state | queued since | order_chain |")
     out.append("|---|---|---|---|---|---|")
     other_kind_seen = 0
@@ -370,20 +429,19 @@ def _render(data: dict, cap: int, collapsed: bool = False, bare: bool = False) -
     generated_at = _instant(generated)
     other_parked = [r for r in parked if not _undelivered_owner_ask(r)]
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), ""]
-    if not bare:   # (r4 pass 2 A1) the bare tier has no owner section at all: its bytes are the base's, heading included
-        out += ["## Parked owner asks", ""]
-        for r in owner_parked[:cap]:   # r2 A3: the longest-parked `cap` (OWNER_LIST_MAX unless the budget is short), then one count line
-            since = _parked_since(r)
-            age = max(0, math.floor((generated_at - _instant(since)) / 86400))   # elapsed whole days between exact instants, not a date difference
-            out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
-                r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
-        if len(owner_parked) > cap:
-            out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - cap))
-        if collapsed and any(r.get("origin") == OWNER for r in data["rows"]):
-            out.append(OWNER_COLLAPSED_LINE)   # (r3 A1) the one owner line: no list, no count, no suffix
-        elif not owner_parked:
-            out.append("- (no owner ask is parked)")
-        out.append("")
+    out += ["## Parked owner asks", ""]
+    for r in owner_parked[:cap]:   # r2 A3: the longest-parked `cap` (OWNER_LIST_MAX unless the budget is short), then one count line
+        since = _parked_since(r)
+        age = max(0, math.floor((generated_at - _instant(since)) / 86400))   # elapsed whole days between exact instants, not a date difference
+        out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
+            r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
+    if len(owner_parked) > cap:
+        out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - cap))
+    if collapsed and any(r.get("origin") == OWNER for r in data["rows"]):
+        out.append(OWNER_COLLAPSED_LINE)   # (r3 A1) the one owner line: no list, no count, no suffix
+    elif not owner_parked:
+        out.append("- (no owner ask is parked)")
+    out.append("")
     out += ["## Parked with reason", "", *scope]
     # every owner row here carries a resolution (an unresolved one is owed, above). One of another kind is tooling churn: counted, not listed.
     closed_other = [r for r in other_parked if r.get("origin") == OWNER and r["kind"] not in KINDS]

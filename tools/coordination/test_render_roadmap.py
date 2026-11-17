@@ -1400,7 +1400,7 @@ class R5BaseWindowTests(unittest.TestCase):
         # the embedded copy is the oracle: pin it to the renderer on a board where the owner features add nothing
         data = load_fixture()
         data["rows"] = [r for r in data["rows"] if r.get("origin") != "owner" and r["kind"] in ("product", "playback")]
-        self.assertEqual(render_roadmap._render(data, 0, collapsed=True, bare=True), master_render(data))
+        self.assertEqual(render_roadmap._render_base(data), master_render(data))
 
     def test_a_board_that_fit_at_master_still_fits_and_is_master_s_file(self) -> None:
         window = self.sweep()
@@ -1462,6 +1462,26 @@ class R5BaseWindowTests(unittest.TestCase):
         self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
         self.assertEqual(text, master_render(data))
 
+    def test_r7_a1b_offset_stamps_are_read_as_the_base_read_them_in_the_last_tier(self) -> None:
+        # review-adversary-OWNER-ASK-PARK-GUARD-1-r7-a3143544 A1: merged_utc=2026-10-16T23:30:00-01:00 is 2026-10-17 as a UTC instant here and
+        # 2026-10-16 as the base's stamp[:10]; the drain line then differed, 19989 CRLF bytes at base and 20001 here. The last tier is the
+        # base's algorithm, so it reads days as the base did.
+        stamp = "2026-09-01T00:00:00Z"
+        rows = [row("PRODUCT-%03d" % i, "queued", stamp) for i in range(300)]
+        rows += [row("MERGED-%d" % i, "merged", stamp, merged_utc="2026-10-16T23:30:00-01:00") for i in range(4)]
+        data = {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z", "rows": rows,
+                "scope_notes": [{"title": "S", "text": "x" * 593}]}
+        self.assertEqual(render_roadmap._budget_size(master_render(data)), 19989)
+        text = render_roadmap.render(data)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+        self.assertEqual(text, master_render(data))
+
+    def test_r7_a1b_the_last_tier_is_master_s_file_on_the_fixture_with_odd_stamps(self) -> None:
+        data = load_fixture()
+        data["rows"] = [r for r in data["rows"] if r["kind"] in ("product", "playback")]
+        data["rows"][0] = dict(data["rows"][0], pinned_utc="2026-10-21T23:30:00-01:00", evidence="declared@2026-10-22T00:00:00Z")
+        self.assertEqual(render_roadmap._render_base(data), master_render(data))
+
     def test_r7_a1_any_base_fitting_board_with_product_owner_asks_stays_within_budget(self) -> None:
         # sibling shapes (the finding's siblings): product-kind owner asks that are queued, parked (owed), parked with a resolution or merged
         # are plain product rows to master, so a board that fit at master must fit here whatever the owner-aware tiers do with them
@@ -1489,7 +1509,7 @@ class R5BaseWindowTests(unittest.TestCase):
 
     def test_the_header_text_is_master_s_in_the_bare_tier_only(self) -> None:
         data = self.board(100)
-        self.assertTrue(render_roadmap._render(data, 0, collapsed=True, bare=True).startswith(MASTER_HEADER))
+        self.assertTrue(render_roadmap._render_base(data).startswith(MASTER_HEADER))
         self.assertFalse(render_roadmap._render(data, 25).startswith(MASTER_HEADER))   # the owner-aware header says owner asks are shown
 
 
