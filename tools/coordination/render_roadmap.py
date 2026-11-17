@@ -93,15 +93,15 @@ HEADER = """\
 Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`,
 the live dispatch surface. That file lives under `.claude-state/hub-autopilot/`,
 gitignored, absent from hosted checkouts, so this file is the only place a reviewer
-without local state can see the open backlog. Where the two disagree, `card-queue.json`
+without local state sees the open backlog. Where they disagree, `card-queue.json`
 wins: re-render, do not edit by hand. The hub renders a live copy to
-`.claude-state/heartbeat/roadmap-live.md` every hour. When this file differs from the live
-queue and is 7 or more days old, a drift detector files a refresh card.
+`.claude-state/heartbeat/roadmap-live.md` every hour. When its open rows or notes differ from
+the live queue and it is 7 or more days old, a drift detector files a refresh card.
 `--check` is a manual tool; no CI job runs it.
 
 Only rows with `kind` of `product` or `playback` are shown, plus owner asks
 (`origin` = `owner`) of any kind. Hub-tooling, factory, hygiene and ci-flake cards are
-tooling churn and are not counted here. Unclassified rows are not counted either, even when
+tooling churn, not counted here. Unclassified rows are not counted either, even if
 the card name says PLAYBACK, unless the owner asked.
 """
 # The bare (last) render tier is master's file for every board without a resolved owner park (a resolved one is labelled with its
