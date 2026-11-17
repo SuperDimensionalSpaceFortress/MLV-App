@@ -90,10 +90,32 @@ QString caseArm(const QString & body, const QString & name)
     return body.mid(start, end - start);
 }
 
+// Adversary A2 on 1cc7a52d: a commented-out setter ("/* setMlvUseRcdDebayer( mlvObject ); */") must not count, so the
+// arm's comments are stripped before the setter is looked for.
+QString stripComments(QString text)
+{
+    text.remove(QRegularExpression(QStringLiteral("/\\*.*?\\*/"), QRegularExpression::DotMatchesEverythingOption));
+    text.remove(QRegularExpression(QStringLiteral("//[^\\n]*")));
+    return text;
+}
+
 bool armCalls(const QString & body, const QString & name, const QString & setter)
 {
-    const QString arm = caseArm(body, name);
-    return !arm.isEmpty() && arm.contains(setter);
+    const QString arm = stripComments(caseArm(body, name));
+    return arm.contains(setter);
+}
+
+TEST(ExportReceiptDebayerWiring, ACommentedOutSetterDoesNotCount)
+{
+    const QString live = QStringLiteral(
+        "case ReceiptSettings::RCD:      setMlvUseRcdDebayer( mlvObject );       break;\n        default: break;");
+    const QString block = QStringLiteral(
+        "case ReceiptSettings::RCD: /* setMlvUseRcdDebayer( mlvObject ); */ break;\n        default: break;");
+    const QString line = QStringLiteral(
+        "case ReceiptSettings::RCD:\n            // setMlvUseRcdDebayer( m_pMlvObject );\n            break;\n        default: break;");
+    ASSERT_TRUE(armCalls(live, QStringLiteral("RCD"), QStringLiteral("setMlvUseRcdDebayer(")));
+    ASSERT_FALSE(armCalls(block, QStringLiteral("RCD"), QStringLiteral("setMlvUseRcdDebayer(")));
+    ASSERT_FALSE(armCalls(line, QStringLiteral("RCD"), QStringLiteral("setMlvUseRcdDebayer(")));
 }
 
 // The enumerators of ReceiptSettings::DebayerAlgorithm, read from the header (never hard-coded).
