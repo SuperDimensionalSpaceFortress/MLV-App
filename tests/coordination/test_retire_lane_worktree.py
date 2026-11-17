@@ -4746,6 +4746,9 @@ def _gui_smoke_log_probe_purity_problems(body: str) -> list:
     # r6 (adversary 2d33c39f A2): a computed member name, [System.IO.File]::('Write'+'AllText')(...) or $o.$name(...), is invisible to the member allowlist
     if re.search(r"(?:::|\.)\s*[(\$'\"]", body):
         problems.append("computed member access")
+    # r8 (sol r6 hardening): a property assignment ($file.IsReadOnly = $true, $file.LastWriteTimeUtc = ..., += too) writes through a member with no call at all
+    if re.search(r"[\w\]\)}](?:\.\w+|::\w+)+\s*[-+*/%]?=(?!=)", body):
+        problems.append("property assignment")
     return problems
 
 
@@ -4770,6 +4773,13 @@ def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_wr
         "in memory writer": "$sink = [IO.StringWriter]::new(); $sink.WriteLine('x')\n",
         "computed static member": "[System.IO.File]::('Write'+'AllText')($file.FullName, 'overwritten')\n",
         "computed instance member": "$name = 'Write'; $stream.$name([byte[]]@(1), 0, 1)\n",
+        # r8 (sol r6 hardening, adversary A1): a property assignment mutates a listed file with no call, no type and no constructor at all
+        "property assignment read-only flag": "$file.IsReadOnly = $true\n",
+        "property assignment last write time": "$file.LastWriteTimeUtc = '2020-01-01T00:00:00Z'\n",
+        "compound property assignment": "$file.Attributes += 'Hidden'\n",
+        "nested property assignment": "$file.Directory.Attributes = 'Hidden'\n",
+        "parenthesised property assignment": "($file).IsReadOnly = $true\n",
+        "static property assignment": "[System.IO.File]::Foo = 1\n",
     }
     for label, injected in mutations.items():
         mutated = body.replace(anchor, anchor + injected, 1)

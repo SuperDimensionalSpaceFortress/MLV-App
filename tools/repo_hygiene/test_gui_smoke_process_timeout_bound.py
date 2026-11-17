@@ -689,5 +689,92 @@ $r = Wait-GuiSmokeProcessBounded -Process $p -StandardOutputTask $done -Standard
         self.assertEqual("process_no_progress", confirmed["outcome"])
 
 
+GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+BUDGET_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class OwnerInputLoadingAllowanceSurvivesTheLegDeadline(unittest.TestCase):
+    """r7 (sol r6 B-04): the leg-derived hard deadline (leg budget + 120 s) discarded the size-derived loading allowance an owner-input leg is accepted with.
+
+    Get-AttrCudaLegTimeBudget accepts a 24 GiB input at 32 MB/s with a 1152 s app read allowance (smokeProcessTimeoutMs 1285000), but the job forwarded only
+    -ProcessTimeoutMs, so the runner's hard limit came out at its derived 187000 ms + 120000 ms = 307000 ms and a healthy load finishing at 400 s was killed.
+    The generator now forwards -LegHardLimitAllowanceMs (setup/teardown 120 s + the app read allowance) when the runner committed at -SourceCommit declares it."""
+
+    _BUDGET = r"""
+Import-Module $env:GS_BUDGET -Force
+$b = Get-AttrCudaLegTimeBudget -InputBytes 25769803776 -ColdReadMBps 32 -ReadMargin 1.5 -PlaySeconds 40
+$legBudgetMs = 187000   # the runner's own derived leg budget for a 40 s play (sol r6 repro)
+"""
+
+    def test_a_24_gib_owner_input_keeps_its_accepted_read_allowance_in_the_hard_deadline(self) -> None:
+        out = run_ps(self._BUDGET + r"""
+$allow = Get-AttrCudaLegHardLimitAllowanceMs -AppReadAllowanceSec $b.appReadAllowanceSec
+$limit = Get-GuiSmokeLegHardLimitMs -LegBudgetMs $legBudgetMs -JobTimeoutMs $b.smokeProcessTimeoutMs -AllowanceMs $allow
+[pscustomobject]@{ read = $b.appReadAllowanceSec; job = $b.smokeProcessTimeoutMs; allow = $allow; limit = $limit
+  today = Get-GuiSmokeLegHardLimitMs -LegBudgetMs $legBudgetMs -JobTimeoutMs $b.smokeProcessTimeoutMs } | ConvertTo-Json -Compress
+""", GS_BUDGET=str(BUDGET_MODULE))
+        self.assertEqual(1152, out["read"])
+        self.assertEqual(307000, out["today"], "without the allowance the runner derives 307 s: the defect sol reproduced")
+        self.assertGreaterEqual(out["limit"], 400000, "a healthy load that completes at 400 s is inside the accepted read allowance")
+        self.assertGreaterEqual(out["limit"], 1152000, "the whole accepted app read allowance is kept")
+        self.assertEqual(out["job"], out["limit"], "and the deadline still never exceeds the job's own process timeout")
+        self.assertEqual(120000 + 1152000, out["allow"], "120 s setup/teardown plus the read allowance")
+
+    def test_a_fixture_leg_and_every_ceiling_clamped_leg_stay_bounded(self) -> None:
+        out = run_ps(r"""
+Import-Module $env:GS_BUDGET -Force
+$fx = Get-AttrCudaLegTimeBudget -InputBytes 0 -PlaySeconds 40
+$clamp = Get-AttrCudaLegTimeBudget -InputBytes 314572800000 -ColdReadMBps 100 -ReadMargin 1.5 -PlaySeconds 40 -ShareSmokeCeiling
+$huge = Get-AttrCudaLegHardLimitAllowanceMs -AppReadAllowanceSec 7200
+[pscustomobject]@{
+  fixtureAllow = Get-AttrCudaLegHardLimitAllowanceMs -AppReadAllowanceSec $fx.appReadAllowanceSec
+  fixtureArgs = Get-AttrCudaLegHardLimitArgs -RunnerAcceptsAllowance $true -AppReadAllowanceSec $fx.appReadAllowanceSec
+  clampRead = $clamp.appReadAllowanceSec; clampJob = $clamp.smokeProcessTimeoutMs
+  clampLimit = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 187000 -JobTimeoutMs $clamp.smokeProcessTimeoutMs -AllowanceMs (Get-AttrCudaLegHardLimitAllowanceMs -AppReadAllowanceSec $clamp.appReadAllowanceSec)
+  huge = $huge
+} | ConvertTo-Json -Compress
+""", GS_BUDGET=str(BUDGET_MODULE))
+        self.assertEqual(0, out["fixtureAllow"], "no input to read: the runner's own 120 s default stands")
+        self.assertEqual("", out["fixtureArgs"], "a fixture leg's emitted job text is unchanged (byte identity)")
+        self.assertEqual(3467, out["clampRead"], "300000 MB at 100 MB/s x1.5 = 4500 s is over the ceiling, so the read allowance is the ceiling's remainder")
+        self.assertEqual(3600000, out["clampJob"])
+        self.assertLessEqual(out["clampLimit"], 3600000, "never above the 3600000 ms safety ceiling")
+        self.assertLessEqual(out["huge"], 3600000, "the allowance respects the runner's -LegHardLimitAllowanceMs range")
+
+    def test_the_forwarded_argument_is_emitted_only_for_a_runner_that_declares_it(self) -> None:
+        out = run_ps(r"""
+Import-Module $env:GS_BUDGET -Force
+[pscustomobject]@{
+  declared = Get-AttrCudaLegHardLimitArgs -RunnerAcceptsAllowance $true -AppReadAllowanceSec 1152
+  undeclared = Get-AttrCudaLegHardLimitArgs -RunnerAcceptsAllowance $false -AppReadAllowanceSec 1152
+  noRead = Get-AttrCudaLegHardLimitArgs -RunnerAcceptsAllowance $true -AppReadAllowanceSec 0
+} | ConvertTo-Json -Compress
+""", GS_BUDGET=str(BUDGET_MODULE))
+        self.assertEqual(" -LegHardLimitAllowanceMs 1272000", out["declared"])
+        self.assertEqual("", out["undeclared"], "a runner committed before r6 would reject the parameter and the leg would die at launch")
+        self.assertEqual("", out["noRead"])
+
+    def test_the_setup_allowance_the_generator_adds_is_the_runners_own_default(self) -> None:
+        module_text = MODULE.read_text(encoding="utf-8")
+        budget_text = BUDGET_MODULE.read_text(encoding="utf-8")
+        runner_default = re.search(r"\$allowance = if \(\$AllowanceMs -gt 0\) \{ \$AllowanceMs \} else \{ (\d+) \}", module_text)
+        generator_default = re.search(r"\[int64\]\$SetupTeardownAllowanceMs = (\d+)", budget_text)
+        self.assertTrue(runner_default and generator_default)
+        self.assertEqual(runner_default.group(1), generator_default.group(1), "one setup/teardown allowance, not two drifting numbers")
+
+    def test_the_generator_forwards_it_gated_on_the_committed_runner_and_expands_to_nothing_otherwise(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        self.assertRegex(text, r"\$runnerAcceptsLegHardLimitAllowance = \(\$LASTEXITCODE -eq 0\) -and\s*\(\$smokeRunnerCommittedText -match '\\\[int\\\]\\\$LegHardLimitAllowanceMs\\b'\)",
+                         "decided from the runner bytes committed at -SourceCommit, like the verified-clip-binding probe")
+        self.assertIn("-ProcessTimeoutMs $SmokeProcessTimeoutMs__LEG_HARD_LIMIT_ARGS__ -ScaleFactor __SCALE_FACTOR__", text,
+                      "the placeholder sits directly after the timeout so an empty expansion leaves the job text byte-identical")
+        self.assertRegex(text, r"LEG_HARD_LIMIT_ARGS = Get-AttrCudaLegHardLimitArgs -RunnerAcceptsAllowance \$runnerAcceptsLegHardLimitAllowance -AppReadAllowanceSec \$timeBudget\.appReadAllowanceSec")
+        self.assertIn("Get-AttrCudaLegHardLimitAllowanceMs", BUDGET_MODULE.read_text(encoding="utf-8"))
+        exports = BUDGET_MODULE.read_text(encoding="utf-8").split("Export-ModuleMember", 1)[1]
+        for name in ("Get-AttrCudaLegHardLimitAllowanceMs", "Get-AttrCudaLegHardLimitArgs"):
+            self.assertIn(name, exports)
+
+
 if __name__ == "__main__":
     unittest.main()
