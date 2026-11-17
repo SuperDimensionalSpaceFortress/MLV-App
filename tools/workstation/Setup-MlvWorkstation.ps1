@@ -195,8 +195,13 @@ function ConvertTo-RedactedUrlText {
 # r1 adversary A5: Write-Log applies the scheme rule (ConvertTo-RedactedUrlText) FIRST and the recorded parts after it, so a recorded part that is also a scheme or a host
 # ('?https:') can never break the url apart before the scheme rule has redacted it.
 $script:UrlSecretParts = [System.Collections.Generic.List[string]]::new()
+# r1 adversary pass 2 A2: a decoded part can hold a line break ('%0A': git's output is split there) or a byte that is not UTF-8 ('%FF'), so the part is also decoded
+# byte by byte (Latin-1) and every piece between two characters that are not printable ASCII is recorded on its own (from 6 characters on).
 function Add-UrlSecretPart([string]$Part, [int]$MinLength = 6) {
-    foreach ($p in @("$Part", $(try { [Uri]::UnescapeDataString("$Part") } catch { "$Part" }))) {
+    $latin = [regex]::Replace("$Part", '%([0-9A-Fa-f]{2})', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+    $forms = @("$Part", $(try { [Uri]::UnescapeDataString("$Part") } catch { "$Part" }), $latin)
+    $forms += @($forms | ForEach-Object { $_ -split '[^\x20-\x7E]+' } | Where-Object { $_.Length -ge 6 })
+    foreach ($p in $forms) {
         if ($p.Length -ge [Math]::Max(1, $MinLength) -and -not $script:UrlSecretParts.Contains($p)) { $script:UrlSecretParts.Add($p) }
     }
 }
@@ -1304,7 +1309,8 @@ function Test-CredentialValueExempt {
 # Only the DECODED copy is judged this way (Get-CredentialHitLine): in the raw text every escape is still present and the rule would refuse an accented key.
 # r1 adversary A3: a '%NN' still in a key after decoding (it decodes to a character that is not a name character, '%20') is undecodable too ('a%20b=c' refuses: accepted
 # over-refusal). A backtick before a letter is NOT an introducer (a Markdown code span '`token`: x' would refuse everywhere); '`u{' is.
-$script:CredentialResidualIntro = '(?:\\N\{[^}\n]*\}|(?<!\\)\\[xuUN0-7]|&#|`u\{[0-9A-Fa-f]*\}?|%[0-9A-Fa-f]{2})'
+# r1 adversary pass 2 A3: an XML entity reference other than the five predefined ones ('&w;' declared in a DTD) is undecodable here too.
+$script:CredentialResidualIntro = '(?:\\N\{[^}\n]*\}|(?<!\\)\\[xuUN0-7]|&#|`u\{[0-9A-Fa-f]*\}?|%[0-9A-Fa-f]{2}|&(?!(?:amp|lt|gt|quot|apos);)[A-Za-z_][A-Za-z0-9_.\-]*;)'
 $script:CredentialResidualUnit = '(?:\\N\{[^}\n]*\}|`u\{[0-9A-Fa-f]*\}?|[^\s"''=:,{}\[\]()<>])'
 $script:CredentialResidualIntroRegex = [regex]::new($script:CredentialResidualIntro)
 $script:CredentialResidualKeyRegex = [regex]::new('(?<![^\s"''{\[,(<>?&;])(' + $script:CredentialResidualUnit + '*?' + $script:CredentialResidualIntro + $script:CredentialResidualUnit + '*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))')
@@ -1537,6 +1543,14 @@ function ConvertFrom-CredentialEscapes([string]$Text) {
     return $s
 }
 
+# r1 adversary pass 2 A1: decode escapes in KEY NAMES only (a run of name characters that a separator follows, and the name of a '[table]' header), never in a value.
+# The run may hold an escaped line break ('"pass\<newline>  word"', r25) and a '\N{...}' or '`u{...}' unit.
+$script:CredentialAnyKeyRegex = [regex]::new('(?<![^\s"''{\[,(<>?&;])((?:\\\n[ \t]*|\\N\{[^}\n]*\}|`u\{[0-9A-Fa-f]*\}?|[^\s"''=:,{}\[\]()<>])+)(?=(?:\s*["''\]\)\}])*\s*(?::|=(?!=)))')
+function ConvertFrom-CredentialKeyEscapes([string]$Text) {
+    $s = $script:CredentialAnyKeyRegex.Replace("$Text", [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ConvertFrom-CredentialEscapes $m.Value })
+    return $script:CredentialTableHeaderRegex.Replace($s, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ConvertFrom-CredentialEscapes $m.Value })
+}
+
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
 # judged as written AND with its JSON \uXXXX escapes decoded (p5 A1: '{"api_key":"x"}' says api_key). The Export scan and the Import host-side
 # test both call this one function.
@@ -1559,9 +1573,16 @@ function Get-CredentialHitLine {
     # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
     $idx = Get-CredentialHitIndex $Text
     if ($idx -lt 0 -and (Test-CredentialEscapesPresent $Text)) {
-        $Text = ConvertFrom-CredentialEscapes $Text   # r23 (pass 27 A1): \u, \U, \x and \/ escapes, not only \u; DENY-BY-DEFAULT-1: every form a reader decodes in a key
+        # r1 adversary pass 2 A1: a decoded VALUE can become an exempt literal ('"password": \156ull' would read as '"password": null'), so the rules that judge a value
+        # against the exemption list run on a copy in which only KEY NAMES and table header names are decoded (ConvertFrom-CredentialKeyEscapes); every value stays raw.
+        # The whole-text decoded copy is judged only by the rules that have no exemption at all (the known token shapes and netrc).
+        $whole = $script:CredentialLineBreakRegex.Replace((ConvertFrom-CredentialEscapes $Text), "`n")
+        $m = $script:SecretShapeRegex.Match($whole)
+        $wIdx = $(if ($m.Success) { $m.Index } else { Get-CredentialNetrcHitIndex $whole })
+        $Text = ConvertFrom-CredentialKeyEscapes $Text   # r23 (pass 27 A1): \u, \U, \x and \/ escapes, not only \u; DENY-BY-DEFAULT-1: every form a reader decodes in a key
         $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
         $idx = Get-CredentialHitIndex -Text $Text -Residual $true   # DENY-BY-DEFAULT-1: a key still holding an undecodable escape is secret-named
+        if ($idx -lt 0 -and $wIdx -ge 0) { $Text = $whole; $idx = $wIdx }
     }
     if ($idx -lt 0) { return 0 }
     # the line of the KEY (a block-form value sits on a later line; the report names where the secret-named key stands)

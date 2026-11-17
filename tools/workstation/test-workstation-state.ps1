@@ -2800,6 +2800,11 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         'A6 a non-ASCII namespace prefix'                              = ('<' + $ddE + ':add xmlns:' + $ddE + '="urn:cfg" key="password" value="hunter2" />')
         'A6 sibling: a non-ASCII prefix on a secret element'           = ('<' + $ddE + ':password>hunter2</' + $ddE + ':password>')
         'A7 a table header with an undecodable escape'                 = "[`"pass\U0011FFFFord`"]`nvalue=`"hunter2`""
+        # r1 adversary pass 2: a value is never decoded into an exempt literal (A1), and a DTD entity in a key is undecodable (A3)
+        'p2 A1 an escaped key whose value decodes to null'             = '"password": \156ull'
+        'p2 A1 sibling: a value written as a char-ref empty string'    = '{"password": "&#34;&#34;"}'
+        'p2 A1 sibling: a table body value that decodes to null'       = "[`"password`"]`nx = \156ull"
+        'p2 A3 a DTD entity inside an XML key attribute'               = '<!DOCTYPE add [<!ENTITY w "w">]><add key="pass&w;ord" value="hunter2" />'
     }
     foreach ($k in $ddA.Keys) { Assert-That ((Test-CredentialText $ddA[$k]) -and (Get-CredentialHitLine $ddA[$k]) -gt 0) "DENY-BY-DEFAULT-1 r1 adversary $k refuses" $ddA[$k] }
     $ddA8 = "`"pass\U0011FFFFord`": hunter2`n`"pass%77ord`": hunter2"
@@ -2837,7 +2842,10 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         @{ N = 3; Url = 'https://127.0.0.1:1/o/r.git#token=fake-token-0003'; Tok = 'fake-token-0003' },
         # r1 adversary A4: git percent-decodes the url it echoes; A9: a short query is redacted too
         @{ N = 4; Url = ('file:///' + ((New-Scratch 'dd-s3-absent4') -replace '\\', '/') + '/absent.git?token=fake%2Dtoken%2D0004'); Tok = @('fake-token-0004', 'fake%2Dtoken%2D0004') },
-        @{ N = 5; Url = ('file:///' + ((New-Scratch 'dd-s3-absent5') -replace '\\', '/') + '/absent.git?t=x'); Tok = @('?t=x') }
+        @{ N = 5; Url = ('file:///' + ((New-Scratch 'dd-s3-absent5') -replace '\\', '/') + '/absent.git?t=x'); Tok = @('?t=x') },
+        # r1 adversary pass 2 A2: an encoded line break or a non-UTF-8 byte inside the token
+        @{ N = 6; Url = ('file:///' + ((New-Scratch 'dd-s3-absent6') -replace '\\', '/') + '/absent.git?token=fake-token-0006%0Atail'); Tok = @('fake-token-0006') },
+        @{ N = 7; Url = ('file:///' + ((New-Scratch 'dd-s3-absent7') -replace '\\', '/') + '/absent.git?token=fake-token-0007%FF'); Tok = @('fake-token-0007') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
