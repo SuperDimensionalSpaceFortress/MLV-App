@@ -1035,7 +1035,7 @@ $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
 # RAW value after trimming outer whitespace only (Test-CredentialValueExempt), and the two netrc regexes (Get-CredentialNetrcHitIndex).
 $script:CredentialExemptLiterals = @('""', "''", 'null', '~', '[]', '{}', '***')
 # r15 pass 13 A1: every line separator form, rewritten to one '\n' at the detector's entry (Get-CredentialHitLine)
-$script:CredentialLineBreakRegex = [regex]::new("\r\n|\r|\u0085| | ")
+$script:CredentialLineBreakRegex = [regex]::new("\r\n|\r|\u0085|\u2028|\u2029")
 $script:CredentialPlaceholderRegex = [regex]::new('^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z_ -]+>)$')
 # a netrc-shaped text: it carries a whitespace-delimited netrc keyword that opens or names a record ('machine', 'default', 'login', 'macdef')
 $script:CredentialNetrcShapeRegex = [regex]::new('(?i)(?<!\S)(?:machine|default|login|macdef)(?!\S)')
