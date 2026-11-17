@@ -887,7 +887,8 @@ $SecretPatterns = @(
     '-----BEGIN [A-Z ]*PRIVATE KEY-----', '"(access|refresh|id)_?[Tt]oken"\s*:\s*"[^"]{16,}"', 'AKIA[0-9A-Z]{16}',
     # r14: a URL that carries a user AND a password ('https://alice:hunter2@example.org', the .git-credentials shape)
     # r19 pass 22 A3: an apostrophe is a legal password character ('https://alice:p''ass@host/'), so only '"', '<', '>' and blanks end the password run
-    '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"''<>]+:[^\s/@"<>]+@'
+    # r20 pass 23 A2: the same holds for the user part ('https://o''brien:hunter2@host/')
+    '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"<>]+:[^\s/@"<>]+@'
 )
 # r14: the XML element form of the key/value rule ('<password>hunter2</password>', '<DbPassword>x</DbPassword>'); the attribute form 'password="x"' is the line form.
 # r15 (pass 12 A2): the element's RAW content, from just after its opening tag to its matching closing tag (or to the end of the text when it is never closed), is

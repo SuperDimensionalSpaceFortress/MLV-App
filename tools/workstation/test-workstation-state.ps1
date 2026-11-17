@@ -2186,6 +2186,12 @@ if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r20 INV-1')) {
         Assert-That ($r20err -match 'LEASE_PUSH_URL_DIFFERS') "r20 INV-1 lease: fetch $($r20pair[0]) / push $($r20pair[1]) is refused before any push" $r20err
     }
 }
+# r20 adversary pass 23 A2: an apostrophe in the USER part of 'https://user:password@host' does not hide the credential
+if ($fnLoaded -and (Test-Has 'Get-CredentialHitLine' 'r20 p23 A2')) {
+    Assert-That (Test-CredentialText 'endpoint = "https://o''brien:hunter2@example.org/repo"') 'r20 p23 A2 detector: an apostrophe in a URL user name does not hide the credential'
+    Assert-That (Test-CredentialText 'endpoint = "https://o''brien:p''ass@example.org/repo"') 'r20 p23 A2 detector: an apostrophe in both the user name and the password does not hide it'
+    Assert-That (-not (Test-CredentialText 'endpoint = "https://example.org/repo"')) 'r20 p23 A2 control: a URL with no user:password part holds no credential'
+}
 # INV-12: a non-zero exit of 'git branch --set-upstream-to=fork/master master' is a recorded typed failure and Clone exits non-zero (the exit decision is
 # 'Failures.Count -gt 0'). Real git over local bare repositories gives the exit 128; a function stub gives the exit 1; a repository with a master gives the control.
 if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r20 INV-12')) {
