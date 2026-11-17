@@ -34,7 +34,7 @@ ROADMAP_PATH = REPO_ROOT / "docs" / "roadmap.md"
 CHECKER_PATH = REPO_ROOT / "tools" / "coordination" / "check_roadmap_queue_parity.py"
 
 # OWNER-ASK-PARK-GUARD-1: an owner ask of another kind is on the table too, its kind cell reading "<kind> (owner)".
-ROADMAP_ROW_RX = re.compile(r"^\|\s*\d+\s*\|\s*(\S+)\s*\|\s*(product|playback|[^|\s]+ \(owner\))\s*\|", re.MULTILINE)
+ROADMAP_ROW_RX = re.compile(r"^\|\s*\d+\s*\|\s*(\S+)\s*\|\s*(product|playback|[^|]*?[^|\s] \(owner\))\s*\|", re.MULTILINE)
 GENERATED_FROM_RX = re.compile(r"^generated_from: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", re.MULTILINE)
 # docs/22 working tier is 25000 soft; the rendered roadmap grows with the open backlog.
 ROADMAP_BUDGET_BYTES = 20000
@@ -93,7 +93,7 @@ class RoadmapQueueParityTests(unittest.TestCase):
 
     def test_the_row_regex_reads_every_owner_kind_cell_the_renderer_can_emit(self) -> None:
         """adversary pass 1 A4: a kind with a digit or underscore ('qa2', 'venue_tooling') still reads as a table row."""
-        for kind in ("qa2", "venue_tooling", "hub-tooling", "CI-flake"):
+        for kind in ("qa2", "venue_tooling", "hub-tooling", "CI-flake", "qa tooling"):   # pass 2 A5: a kind with a space
             line = "| 3 | OWNER-1 | %s (owner) | queued | 2026-10-22 | - |" % kind
             self.assertEqual(ROADMAP_ROW_RX.findall(line), [("OWNER-1", "%s (owner)" % kind)], kind)
 

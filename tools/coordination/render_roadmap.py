@@ -48,7 +48,9 @@ import argparse
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta, timezone
+import calendar
+from datetime import date, datetime, timedelta
+from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 
 SCHEMA = "mlv-app/card-queue/v1"
@@ -103,15 +105,19 @@ _ID_EDGE_L = r"(?<![A-Za-z0-9_-])"
 _ID_EDGE_R = r"(?![A-Za-z0-9_-])"
 TERMINAL_PARK_RXS = (
     re.compile(_ID_EDGE_L + r"(?:DONE|NO[_-]GO|DUPLICATE)" + _ID_EDGE_R),
-    re.compile(_ID_EDGE_L + r"(?i:shipped|superseded by|merged into|not new work|won't fix|no successor|closed (?:by|done|as|in))" + _ID_EDGE_R),
+    re.compile(_ID_EDGE_L + r"(?i:shipped|superseded\s+by|merged\s+into|not\s+new\s+work|won't\s+fix|no\s+successor|closed\s+(?:by|done|as|in))" + _ID_EDGE_R),
 )
-_NEGATED_BEFORE_RX = re.compile(r"(?i)\b(?:not|never|until|unless|before|once|when|if|to be|yet to be|un)\s+(?:\w+\s+){0,2}$")
+# (adversary pass 2 A1) a negation or condition ANYWHERE earlier in the same clause makes the match a wait: "waits until #123 has
+# shipped", "until the release branch has shipped". A clause ends at ; , : . | ( ) or a line break.
+_CONDITION_RX = re.compile(r"(?i)\b(?:not|never|until|unless|before|once|when|if|to\s+be|yet|un)\b")
+_CLAUSE_END_RX = re.compile(r"[;,:.|()\n]")
 
 
 def _terminal_park(notes: str) -> bool:
     for rx in TERMINAL_PARK_RXS:
         for m in rx.finditer(notes):
-            if not _NEGATED_BEFORE_RX.search(notes[max(0, m.start() - 40):m.start()]):
+            ends = [e.end() for e in _CLAUSE_END_RX.finditer(notes, 0, m.start())]
+            if not _CONDITION_RX.search(notes[ends[-1] if ends else 0:m.start()]):
                 return True
     return False
 
@@ -120,13 +126,35 @@ def _undelivered_owner_ask(r: dict) -> bool:
     return r.get("origin") == OWNER and not _terminal_park(r.get("notes") or "")
 
 
-def _instant(stamp: str) -> datetime:
-    """A stamp as an aware UTC instant (fractional seconds kept); a date-only or odd tail reads as that day's midnight."""
+# (adversary pass 2 A3/A4/A6/A7) a stamp is read exactly: every fractional digit is kept, an explicit offset is applied, and the
+# instant is a Decimal count of UTC seconds, so a 7-digit fraction, a -02:00 offset or a far-future year never truncates,
+# rounds or overflows. A stamp in no such shape (date only, an odd tail) reads as that date's UTC midnight, as before.
+_STAMP_RX = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:[.,](\d+))?)?\s*(Z|[+-]\d\d:?\d\d)?$", re.IGNORECASE)
+
+
+def _instant(stamp: str) -> Decimal:
+    """Exact UTC seconds since the epoch, as a Decimal."""
+    m = _STAMP_RX.match(stamp.strip())
+    if not m:
+        d = _day(stamp)
+        return Decimal(calendar.timegm((d.year, d.month, d.day, 0, 0, 0)))
+    y, mo, d, h, mi = (int(m.group(i)) for i in range(1, 6))
+    secs = calendar.timegm((y, mo, d, h, mi, int(m.group(6) or 0)))
+    tz = m.group(8)
+    if tz and tz.upper() != "Z":
+        sign = -1 if tz[0] == "-" else 1
+        hh, mm = int(tz[1:3]), int(tz[-2:])
+        secs -= sign * (hh * 3600 + mm * 60)
+    return Decimal(secs) + (Decimal("0." + m.group(7)) if m.group(7) else Decimal(0))
+
+
+def _utc_day(stamp: str) -> date:
+    """The UTC calendar day of a stamp (an offset can move it off the date its text starts with)."""
+    whole = int(_instant(stamp).to_integral_value(rounding=ROUND_FLOOR))
     try:
-        t = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        t = datetime.combine(_day(stamp), datetime.min.time())
-    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+        return date(1970, 1, 1) + timedelta(seconds=whole)
+    except OverflowError:
+        return _day(stamp)
 
 
 def _die(message: str) -> "None":
@@ -195,16 +223,16 @@ def _stats(data: dict) -> tuple:
     rows = [r for r in data["rows"] if _counted(r)]
     open_rows = sorted((r for r in rows if r["state"] not in CLOSED_STATES), key=_sort_key)
     parked = sorted((r for r in rows if r["state"] == "parked"), key=_sort_key)
-    last = _day(data["generated_utc"])
+    last = _utc_day(data["generated_utc"])
     days = [last - timedelta(days=WINDOW_DAYS - 1 - i) for i in range(WINDOW_DAYS)]
     landed = {d: 0 for d in days}
     queued = {d: 0 for d in days}
     for r in rows:
-        d = _day(r["source_ledger_stamp"])
+        d = _utc_day(r["source_ledger_stamp"])
         if d in queued:
             queued[d] += 1
         if r["state"] == "merged":
-            d = _day(_landed_stamp(r))
+            d = _utc_day(_landed_stamp(r))
             if d in landed:
                 landed[d] += 1
     return open_rows, parked, days, landed, queued
@@ -231,7 +259,7 @@ def render(data: dict) -> str:
     out.append("|---|---|---|---|---|---|")
     for r in open_rows:
         out.append("| %s | %s | %s | %s | %s | %s |" % (
-            r["priority"], r["card"], _kind_cell(r), r["state"], r["source_ledger_stamp"][:10], _chain(r)))
+            r["priority"], r["card"], _kind_cell(r), r["state"], _utc_day(r["source_ledger_stamp"]).isoformat(), _chain(r)))
     if not open_rows:
         out.append("| - | (none open) | - | - | - | - |")
     other_kind_asks = sum(1 for r in open_rows if r["kind"] not in KINDS)
@@ -256,9 +284,9 @@ def render(data: dict) -> str:
             "## Parked owner asks", ""]
     for r in owner_parked:
         since = _parked_since(r)
-        age = max(0, int((generated_at - _instant(since)).total_seconds() // 86400))   # elapsed whole days, not a date difference
+        age = max(0, int((generated_at - _instant(since)) // 86400))   # elapsed whole days between exact instants, not a date difference
         out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
-            r["card"], r["priority"], r["kind"], age, since[:10], _note(r, OWNER_NOTE_MAX)))
+            r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
     if not owner_parked:
         out.append("- (no owner ask is parked)")
     out += ["", "## Parked with reason", "", *scope]

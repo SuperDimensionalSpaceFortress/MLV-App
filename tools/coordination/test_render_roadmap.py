@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -607,6 +608,43 @@ class OwnerAskTests(unittest.TestCase):
         self.assertEqual(table_cards(render_roadmap.render(data)), ["A-OLDER", "B-NEWER"])
         landed = row("L", "merged", "2026-10-21T23:59:59.900Z", pinned_utc="2026-10-21T23:59:59Z")
         self.assertEqual(render_roadmap._landed_stamp(landed), "2026-10-21T23:59:59.900Z")
+
+    # adversary pass 2 (review-adversary-OWNER-ASK-PARK-GUARD-1-r1-8d0a0bfd) A1-A4, A6, A7: each finding's input, verbatim.
+    def test_p2_a1_a_condition_anywhere_earlier_in_the_clause_keeps_the_ask_owed(self) -> None:
+        for notes in ("waits until #123 has shipped", "until BLOCKER-1 has shipped", "until the release branch has shipped"):
+            with self.subTest(notes=notes):
+                self.assertIn("OWNER-1", self.owed(self.one_owner(notes, stamp="2026-10-20T00:00:00Z")))
+
+    def test_p2_a2_any_whitespace_inside_a_terminal_phrase(self) -> None:
+        for notes in ("superseded  by OWNER-2", "superseded\nby OWNER-2"):
+            with self.subTest(notes=notes):
+                self.assertNotIn("OWNER-1", self.owed(self.one_owner(notes, stamp="2026-10-20T00:00:00Z")))
+
+    def test_p2_a3_a7_an_offset_stamp_counts_on_its_utc_day(self) -> None:
+        data = {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z",
+                "rows": [row("OWNER-1", "merged", "2026-10-22T23:30:00-02:00", origin="owner", notes="waiting for #123",
+                             pinned_utc="2026-10-23T00:30:00Z")]}
+        text = render_roadmap.render(data)
+        self.assertIn("| 2026-10-23 | 1 | 1 |", text)
+        self.assertIn("| 2026-10-22 | 0 | 0 |", text)
+
+    def test_p2_a4_seven_digit_fractions_are_not_truncated(self) -> None:
+        data = {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00.0000001Z",
+                "rows": [row("OWNER-1", "parked", "2026-10-20T00:00:00Z", origin="owner", notes="waits for #123",
+                             pinned_utc="2026-10-22T00:00:00.0000009Z")]}
+        self.assertIn("parked 0 d (since 2026-10-22)", self.owed(data))
+        data = synthetic(0, 0, 0)
+        data["rows"] += [row("A-NEWER", "queued", "2026-10-22T08:00:00.0000009Z"), row("Z-OLDER", "queued", "2026-10-22T08:00:00.0000001Z")]
+        self.assertEqual(table_cards(render_roadmap.render(data)), ["Z-OLDER", "A-NEWER"])
+        landed = row("L", "merged", "2026-10-22T08:00:00.0000001Z", pinned_utc="2026-10-22T08:00:00.0000009Z")
+        self.assertEqual(render_roadmap._landed_stamp(landed), "2026-10-22T08:00:00.0000009Z")
+
+    def test_p2_a6_a_far_future_age_is_exact(self) -> None:
+        data = {"schema": "mlv-app/card-queue/v1", "generated_utc": "9999-12-31T00:00:00Z",
+                "rows": [row("OWNER-1", "parked", "2026-10-20T00:00:00Z", origin="owner", notes="waits for #123",
+                             pinned_utc="7262-02-02T00:00:00.000001Z")]}
+        days = (date(9999, 12, 31) - date(7262, 2, 2)).days - 1   # one microsecond short of a whole day
+        self.assertIn("parked %d d (since 7262-02-02)" % days, self.owed(data))
 
     def test_no_parked_owner_ask_says_so(self) -> None:
         text = render_roadmap.render(load_fixture())
