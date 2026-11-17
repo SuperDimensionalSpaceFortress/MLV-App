@@ -1337,9 +1337,9 @@ function ConvertFrom-CredentialEscapes([string]$Text) {
         if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
         if ($m.Groups[3].Success) { return [string][char][Convert]::ToInt32($m.Groups[3].Value, 16) }
         if ($m.Groups[4].Success) { return '/' }
-        $cp = [Convert]::ToInt64($m.Groups[2].Value, 16)
-        if ($cp -gt 0x10FFFF -or ($cp -ge 0xD800 -and $cp -le 0xDFFF)) { return $m.Value }
-        return [char]::ConvertFromUtf32([int]$cp)
+        $codePoint = [Convert]::ToInt64($m.Groups[2].Value, 16)
+        if ($codePoint -gt 0x10FFFF -or ($codePoint -ge 0xD800 -and $codePoint -le 0xDFFF)) { return $m.Value }
+        return [char]::ConvertFromUtf32([int]$codePoint)
     })
 }
 
