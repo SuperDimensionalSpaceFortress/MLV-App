@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -18,6 +19,7 @@ from unittest import mock
 
 from tools.repo_hygiene import ci_unittest_shard as shard
 from tools.repo_hygiene import ci_unittest_shard_timings as timings
+from tools.repo_hygiene.hidden_spawn import no_window_flags
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1063,14 +1065,15 @@ class ShardExitCodeTests(unittest.TestCase):
 
     def _parallel(
         self, root: Path, tests: list[unittest.TestCase], tag: str, workers: int, *, pins: dict[str, str] | None = None,
-        timeout: float = 120.0,
+        timeout: float = 120.0, environ: dict[str, str] | None = None, poll_seconds: float | None = None,
     ) -> tuple[int, str, str, Path]:
         out, err = io.StringIO(), io.StringIO()
         manifest = root / "manifest-parallel.txt"
+        extra = {} if poll_seconds is None else {"poll_seconds": poll_seconds}
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = shard.run_parallel(
                 tests, "ubuntu", 1, 1, workers, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
-                repo_root=REPO_ROOT, pins=pins or {}, environ={}, manifest=manifest, timeout=timeout,
+                repo_root=REPO_ROOT, pins=pins or {}, environ=environ or {}, manifest=manifest, timeout=timeout, **extra,
             )
         return code, out.getvalue(), err.getvalue(), manifest
 
@@ -1137,6 +1140,101 @@ class ShardExitCodeTests(unittest.TestCase):
         code, out, err, _manifest = self._parallel(root, tests, tag, 3)
         self.assertEqual(code, 1)
         self.assertIn("ERROR", err)
+
+    # r3 adversary A1: the parent's worker spawn is a console spawn like any other tool spawn.
+    def test_the_worker_spawn_carries_the_hidden_window_flags(self) -> None:
+        root, tests, tag = self._fixture()
+        real = subprocess.Popen
+        seen: list[dict] = []
+
+        def spy(*args: object, **kwargs: object) -> subprocess.Popen:
+            seen.append(dict(kwargs))
+            return real(*args, **kwargs)
+
+        with mock.patch.object(shard.subprocess, "Popen", spy):
+            code, out, err, _manifest = self._parallel(root, tests, tag, 2)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertTrue(seen)
+        for kwargs in seen:
+            self.assertIn("creationflags", kwargs)
+            self.assertEqual(kwargs["creationflags"], no_window_flags())
+
+    # r3 adversary A2: a wait that expired is a timeout even when the worker exits a moment later.
+    def test_a_worker_that_exits_as_the_wait_expires_still_fails_the_shard(self) -> None:
+        root, tests, tag = self._fixture()
+        real = subprocess.Popen
+
+        class RacyPopen:
+            """The worker finishes (cleanly) at the very moment the parent's deadline passes."""
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self._proc = real(*args, **kwargs)
+                self._raised = False
+
+            def wait(self, timeout: float | None = None) -> int:
+                self._proc.wait()
+                if not self._raised:
+                    self._raised = True
+                    raise subprocess.TimeoutExpired("worker", timeout)
+                return self._proc.returncode
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._proc, name)
+
+        with mock.patch.object(shard.subprocess, "Popen", RacyPopen):
+            code, out, err, _manifest = self._parallel(root, tests, tag, 1)
+        self.assertEqual(code, 1, out)
+        self.assertIn("timed out", err)
+
+    # r3 adversary A3: a class or module fixture that skips never starts its tests; serial passes, so must parallel.
+    def test_a_fixture_level_skip_is_accounted_for_and_the_manifest_matches_serial(self) -> None:
+        skipped = (
+            "class FxSkipTests(unittest.TestCase):\n"
+            "    @classmethod\n"
+            "    def setUpClass(cls):\n"
+            "        raise unittest.SkipTest('accepted fixture skip')\n"
+            "    def test_it(self):\n"
+            "        pass"
+        )
+        root, tests, tag = self._fixture({"c": skipped})
+        serial_manifest = root / "manifest-serial.txt"
+        with contextlib.redirect_stdout(io.StringIO()):
+            serial = shard.run_shard(
+                tests, "ubuntu", 1, 1, clock=time.monotonic, environ={}, stream=io.StringIO(), manifest=serial_manifest
+            )
+        self.assertEqual(serial, 0)
+        code, out, err, manifest = self._parallel(root, tests, tag, 3)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(manifest.read_text(encoding="utf-8"), serial_manifest.read_text(encoding="utf-8"))
+
+    def test_a_module_or_class_fixture_skip_names_only_the_tests_that_never_started(self) -> None:
+        clock = FakeClock()
+        started, under_class, under_module, other = (_fake_case(clock, name, 0.0) for name in ("A", "B", "C", "D"))
+        under_class.__class__.__module__ = "mod_one"
+        under_module.__class__.__module__ = "mod_two"
+        other.__class__.__module__ = "mod_three"
+        started.__class__.__module__ = "mod_four"
+        result = shard.ClassTimingResult(io.StringIO(), True, 0, clock=clock)
+        result.startTest(started)
+        result.addSkip(types.SimpleNamespace(id=lambda: "setUpClass (mod_one.B)"), "class fixture")
+        result.addSkip(types.SimpleNamespace(id=lambda: "setUpModule (mod_two)"), "module fixture")
+        result.addSkip(started, "an ordinary skip is not a fixture skip")
+        members = [started, under_class, under_module, other]
+        self.assertEqual(result.skipped_by_fixture(members), [under_class.id(), under_module.id()])
+
+    # r3 adversary A4: the 75 % warning is printed while the workers run, before any cancellation can lose it.
+    def test_the_budget_warning_is_printed_while_the_workers_run(self) -> None:
+        root, tests, tag = self._fixture({"b": "    def test_slow(self):\n        import time\n        time.sleep(3)"})
+        code, out, err, _manifest = self._parallel(  # a 1.2 s cap: 0.9 s is the 75 % mark
+            root, tests, tag, 3, environ={shard.CAP_ENV: "0.02"}, poll_seconds=0.05
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        lines = out.splitlines()
+        warned = [number for number, line in enumerate(lines) if line.startswith("SHARD_BUDGET_WARN")]
+        first_log = next(number for number, line in enumerate(lines) if line.startswith("===== worker 1/"))
+        self.assertEqual(len(warned), 1, out)
+        self.assertEqual(sum(line.startswith("::warning") for line in lines), 1, out)
+        self.assertLess(warned[0], first_log, "the warning came only after the workers had finished")
 
 
 class TimingsTests(unittest.TestCase):

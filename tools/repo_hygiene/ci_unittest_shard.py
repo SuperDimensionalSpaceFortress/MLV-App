@@ -29,6 +29,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,8 @@ import unittest
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import IO, TextIO
+
+from .hidden_spawn import no_window_flags
 
 START_DIR = "tools/repo_hygiene"
 PATTERN = "test_*.py"
@@ -74,8 +77,9 @@ MANIFEST_ENV = "MLV_CI_UNITTEST_MANIFEST"
 # A worker that has not exited by then is killed and fails the shard (a hang is never a pass).
 WORKER_TIMEOUT_ENV = "MLV_CI_UNITTEST_WORKER_TIMEOUT_SECONDS"
 DEFAULT_WORKER_TIMEOUT_SECONDS = 2700.0
-# Modules whose tests must not run beside other workers' tests. All pinned modules in a shard share
-# ONE worker, run serially. Each reason is the evidence (file:line in the survey of 807069e7).
+# Modules that must not be split across workers or run beside one another. All pinned modules in a
+# shard share ONE worker, run serially; each worker has its own TEMP/TMP, so a fixed temp name cannot
+# collide with another worker's tests either. Each reason is the evidence (file:line in the survey of 807069e7).
 SERIAL_PINS: dict[str, str] = {
     # writes FIXED file names under tempfile.gettempdir() (:1370-1525) and spawns pwsh (:2762)
     "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate": "fixed temp file names; heavy-slot machinery spawns pwsh",
@@ -85,6 +89,9 @@ SERIAL_PINS: dict[str, str] = {
     "tools.repo_hygiene.test_playback_attr_3_cuda_behaviour": "junction plus cross-agent shared-lock semantics",
 }
 PINNED_GROUP = "<serial-pins>"
+# What the budget warning names as the slowest class while the workers are still running (their
+# per-class seconds only exist once each has exited).
+RUNNING_WORKERS_LABEL = "<workers still running>"
 
 
 def load_weights(profile: str, path: Path = WEIGHTS_PATH) -> dict[str, float]:
@@ -301,6 +308,9 @@ def verify_partition(profile: str, shards: int, heavy_path: Path = HEAVY_SET_PAT
     return 1 if problems else 0
 
 
+_FIXTURE_SKIP = re.compile(r"^(setUpClass|setUpModule) \((.+)\)$")
+
+
 class ClassTimingResult(unittest.TextTestResult):
     """``TextTestResult`` that also charges wall time to each test's ``module.Class``.
 
@@ -326,6 +336,26 @@ class ClassTimingResult(unittest.TextTestResult):
         self._current: str | None = None
         self.class_seconds: dict[str, float] = {}
         self.started_ids: list[str] = []
+        self.fixture_skips: list[tuple[str, str]] = []
+
+    def addSkip(self, test: unittest.TestCase, reason: str) -> None:  # noqa: N802
+        # A setUpClass / setUpModule that raises SkipTest reports ONE skip against a holder named
+        # "setUpClass (module.Class)" / "setUpModule (module)" and never starts the tests under it.
+        match = _FIXTURE_SKIP.match(test.id())
+        if match:
+            self.fixture_skips.append((match[1], match[2]))
+        super().addSkip(test, reason)
+
+    def skipped_by_fixture(self, members: list[unittest.TestCase]) -> list[str]:
+        """Ids of ``members`` that never started because their class or module fixture skipped."""
+        started = set(self.started_ids)
+        classes = {name for kind, name in self.fixture_skips if kind == "setUpClass"}
+        modules = {name for kind, name in self.fixture_skips if kind == "setUpModule"}
+        return [
+            test.id()
+            for test in members
+            if test.id() not in started and (unit_key(test) in classes or type(test).__module__ in modules)
+        ]
 
     def startTestRun(self) -> None:  # noqa: N802
         super().startTestRun()
@@ -651,11 +681,16 @@ def run_worker(spec_path: Path) -> int:
     if missing:
         print("ERROR: a class the shard assigned is not collected by discover: " + ", ".join(missing), file=sys.stderr)
         return 1
-    result = unittest.TextTestRunner(verbosity=2, resultclass=ClassTimingResult).run(
-        ClassTimingSuite(shard_tests(units, spec["classes"]))
-    )
+    members = shard_tests(units, spec["classes"])
+    result = unittest.TextTestRunner(verbosity=2, resultclass=ClassTimingResult).run(ClassTimingSuite(members))
     ran = result.testsRun
-    record = {"ids": result.started_ids, "seconds": result.class_seconds, "tests_run": ran, "ok": result.wasSuccessful()}
+    record = {
+        "ids": result.started_ids,
+        "skipped_ids": result.skipped_by_fixture(members),
+        "seconds": result.class_seconds,
+        "tests_run": ran,
+        "ok": result.wasSuccessful(),
+    }
     Path(spec["result"]).write_text(json.dumps(record), encoding="utf-8")
     if ran == 0:
         print("ERROR: no tests ran", file=sys.stderr)
@@ -672,6 +707,8 @@ def _worker_record(path: Path) -> dict | None:
         isinstance(record, dict)
         and isinstance(record.get("ids"), list)
         and all(isinstance(item, str) for item in record["ids"])
+        and isinstance(record.get("skipped_ids"), list)
+        and all(isinstance(item, str) for item in record["skipped_ids"])
         and isinstance(record.get("seconds"), dict)
         and type(record.get("tests_run")) is int
     )
@@ -697,15 +734,19 @@ def run_parallel(
     started: float | None = None,
     clock: Callable[[], float] = time.monotonic,
     wall_clock: Callable[[], float] = time.time,
+    poll_seconds: float = 5.0,
 ) -> int:
     """Run the shard's tests in up to ``workers`` child processes and fail closed on anything odd.
 
     Each child is ``python -m tools.repo_hygiene.ci_unittest_shard --worker-spec ...`` with its own
     TEMP/TMP/TMPDIR; its output goes to a log that is printed, grouped, once it has exited. The shard
     exits non-zero on a failing test, a child that exits non-zero, crashes, writes no result or runs
-    past ``timeout``, or when the ids the children ran are not exactly ``members``' ids, each once.
-    The merged ``SHARD_SLOWEST`` and budget warning follow, from the children's per-class seconds
-    (inflated by contention: derive weights from serial logs only).
+    past ``timeout`` (a wait that ran out is a timeout even if the child exits a moment later), or
+    when the ids the children ran or skipped in a class or module fixture are not exactly
+    ``members``' ids, each once. The budget warning is printed while the children run (a
+    ``BudgetWatch``; the class it names is a placeholder until their seconds are known); the merged
+    ``SHARD_SLOWEST`` follows, from the children's per-class seconds (inflated by contention: derive
+    weights from serial logs only).
     """
     out = sys.stdout
     begin = clock() if started is None else started
@@ -720,6 +761,23 @@ def run_parallel(
     logs: list[Path] = []
     codes: list[int | None] = []
     procs: list[tuple[subprocess.Popen[bytes], IO[bytes]]] = []
+    merged: dict[str, float] = {}
+    cap_minutes = job_cap_minutes(profile, env)
+    budget_begin, origin = budget_origin(env, clock, begin, wall_clock, cap_minutes)
+    watch = BudgetWatch(
+        profile,
+        index,
+        of,
+        cap_minutes,
+        budget_begin,
+        clock,
+        lambda: merged or {RUNNING_WORKERS_LABEL: clock() - begin},
+        poll_seconds=poll_seconds,
+        out=out,
+        origin=origin,
+    )
+    deadline = time.monotonic() + limit  # from before the first launch: launching is part of the budget
+    watch.start()
     try:
         for number, classes in enumerate(groups, start=1):
             home = work / f"w{number}"
@@ -743,21 +801,29 @@ def run_parallel(
                 "--profile", profile, "--worker-spec", str(home / "spec.json"),
             ]
             procs.append((
-                subprocess.Popen(command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT),
+                subprocess.Popen(
+                    command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    creationflags=no_window_flags(),
+                ),
                 log,
             ))
             logs.append(home / "log.txt")
-        deadline = time.monotonic() + limit
-        for proc, _log in procs:
+        expired: set[int] = set()
+        for number, (proc, _log) in enumerate(procs, start=1):
             try:
                 proc.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
+                expired.add(number)  # the wait ran out: a worker that exits a moment later was still late
                 break
         for number, (proc, log) in enumerate(procs, start=1):
-            if proc.poll() is None:
+            killed = proc.poll() is None
+            if killed:
                 proc.kill()
                 proc.wait()
-                problems.append(f"worker {number}/{len(procs)} timed out after {limit:g} s and was killed")
+            if killed or number in expired:
+                problems.append(
+                    f"worker {number}/{len(procs)} timed out after {limit:g} s" + (" and was killed" if killed else "")
+                )
             log.close()
             codes.append(proc.returncode)
         for number, (path, code) in enumerate(zip(logs, codes, strict=True), start=1):
@@ -770,6 +836,7 @@ def run_parallel(
             elif record is None:
                 problems.append(f"worker {number}/{len(logs)} wrote no readable result (exit {code})")
     finally:
+        watch.stop()
         for proc, log in procs:  # an exception above must not leave a worker running
             if proc.poll() is None:
                 proc.kill()
@@ -777,25 +844,24 @@ def run_parallel(
             log.close()
         shutil.rmtree(work, ignore_errors=True)
     ran = sorted(item for record in records if record for item in record["ids"])
+    # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
+    accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])
     expected = sorted(test.id() for test in members)
-    if ran != expected:
-        missing, extra = sorted(set(expected) - set(ran)), sorted(set(ran) - set(expected))
+    if accounted != expected:
+        missing, extra = sorted(set(expected) - set(accounted)), sorted(set(accounted) - set(expected))
         problems.append(
             f"the workers' ids are not exactly the shard's: {len(missing)} missing, {len(extra)} extra, "
-            f"{len(ran) - len(set(ran))} repeated"
+            f"{len(accounted) - len(set(accounted))} repeated"
         )
-    seconds: dict[str, float] = {}
     for record in records:
         if record:
-            seconds.update({key: float(value) for key, value in record["seconds"].items()})
+            merged.update({key: float(value) for key, value in record["seconds"].items()})
     if manifest is not None and not problems:
         write_manifest(manifest, ran)
-    cap_minutes = job_cap_minutes(profile, env)
-    budget_begin, origin = budget_origin(env, clock, begin, wall_clock, cap_minutes)
     total = clock() - begin
-    if seconds:
-        lines = budget_warning(profile, index, of, clock() - budget_begin, seconds, cap_minutes, origin)
-        print("\n".join(lines + slowest_block(profile, index, of, total, seconds)), file=out, flush=True)
+    if merged:
+        watch.check()
+        print("\n".join(slowest_block(profile, index, of, total, merged)), file=out, flush=True)
     for problem in problems:
         print(f"ERROR: {problem}", file=sys.stderr)
     if problems or any(code == 1 for code in codes):
