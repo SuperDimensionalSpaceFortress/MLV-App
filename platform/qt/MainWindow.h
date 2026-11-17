@@ -893,12 +893,14 @@ private:
         bool gpuAmaze = false;
         bool gpuBilinear = false;
         int presentedRoute = 0;   // r12 adversary A1: the presented frame's CPU render-path code (a proxy route relabels)
+        int debayerScale = 0;     // r13 adversary pass 15 A1: a prep frame's debayer scale (presentedPlaybackDebayerScale)
         bool operator==( const PlaybackInfoInputs &o ) const
         {
             return pipelineStatus == o.pipelineStatus && scopeCaveat == o.scopeCaveat && requestedScale == o.requestedScale
                 && presentedScale == o.presentedScale && requestContextValid == o.requestContextValid
                 && requestContextScale == o.requestContextScale && gpuAmaze == o.gpuAmaze && gpuBilinear == o.gpuBilinear
-                && presentedRoute == o.presentedRoute;
+                && presentedRoute == o.presentedRoute
+                && debayerScale == o.debayerScale;
         }
     };
     PlaybackInfoInputs m_playbackInfoInputs;
@@ -2379,6 +2381,8 @@ private:
     int presentedPlaybackRouteCode( void ) const;
     // r12 pass-13 A1: the presented frame's shown scale (a CPU prep frame: the render's achieved size times the prep's factor).
     int presentedPlaybackScaleShown( void ) const;
+    // r13 adversary pass 15 A1: the scale a CPU prep frame was debayered at (the render's achieved size; 0 = not a prep frame).
+    int presentedPlaybackDebayerScale( void ) const;
     // The presented pipeline status and the scope caveat, shared by the toolbar indicator and the info label.
     void presentedGpuPlaybackPipelineStatus( GpuPlaybackPipelineStatus &status, bool &scopePerformanceCaveat ) const;
     // r1 adversary A1/A3: relabels only when a pipeline/scale/debayer input changed (int compares; safe per presented frame).

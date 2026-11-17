@@ -1092,3 +1092,72 @@ TEST(PlaybackInfoLabel, R13HaEveryPresentedRouteGuardIsLoadBearing)
     ASSERT_TRUE(route.contains(QStringLiteral("route.routeTag = telemetryIntValue( telemetry, \"render_thread_phase4b_path\" );")));
     ASSERT_TRUE(route.contains(QStringLiteral("return playback_info_label::presentedRouteOfFrame( route );")));
 }
+
+// r13 adversary pass 15 A1 (189dd4f9): 1920x1088 ordinary clip, receipt AMaZE, Don't Switch Debayer, CPU preview processing,
+// fast playback processing on, playback scale 2 (sibling: 4), Zoom Fit on, MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE=1. The reuse
+// refusal debayers full-size AMaZE and the prep box-reduces the RGB by 2, so the frame is shown at Half, but AMaZE ran: both
+// surfaces read "AMaZE->Scaled". A prep frame's debayer scale is the render's achieved size, never the prep's reduction after it.
+TEST(PlaybackInfoLabel, R13P15A1PrepFrameDebayeredFullSizeNamesTheSelectedDebayer)
+{
+    // the render achieved full size: the debayer ran at 1; a reduced recon (960 of 1920) ran at 2; unreadable inputs are unknown
+    ASSERT_EQ(1, playback_info_label::debayerScaleOfCpuPrepRoute(1920, 1920));
+    ASSERT_EQ(2, playback_info_label::debayerScaleOfCpuPrepRoute(1920, 960));
+    ASSERT_EQ(4, playback_info_label::debayerScaleOfCpuPrepRoute(1920, 480));
+    ASSERT_EQ(0, playback_info_label::debayerScaleOfCpuPrepRoute(0, 1920));
+    ASSERT_EQ(0, playback_info_label::debayerScaleOfCpuPrepRoute(1920, 0));
+    ASSERT_EQ(0, playback_info_label::debayerScaleOfCpuPrepRoute(1920, 3840));
+    ASSERT_EQ(0, playback_info_label::debayerScaleOfCpuPrepRoute(1920, 640));
+    for (int scale : {2, 4}) {
+        playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+        f.dualIsoClip = false;
+        f.requestedScale = scale;
+        f.presentedScale = playback_info_label::presentedScaleOfCpuPrepRoute(scale, 1920, 1920, scale);
+        ASSERT_EQ(scale, f.presentedScale);
+        f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, scale, f.requestedScale, f.presentedScale);
+        f.debayerScale = playback_info_label::debayerScaleOfCpuPrepRoute(1920, 1920);
+        ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+        const QString overlay = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+        const QString twin = playback_info_label::compose(f, playback_info_label::Toggles(), false);
+        ASSERT_FALSE(overlay.contains(QStringLiteral("->Scaled")));
+        ASSERT_FALSE(twin.contains(QStringLiteral("->Scaled")));
+        ASSERT_TRUE(overlay.section(QLatin1Char('\n'), 0, 0).endsWith(dot() + QStringLiteral("AMaZE")));
+        // a prep frame that consumed a reduced recon still reads "->Scaled", and so does a frame with no debayer scale
+        f.debayerScale = playback_info_label::debayerScaleOfCpuPrepRoute(1920, 1920 / scale);
+        ASSERT_QSTR_EQ(QStringLiteral("AMaZE->Scaled"), playback_info_label::debayerField(f));
+        f.debayerScale = 0;
+        ASSERT_QSTR_EQ(QStringLiteral("AMaZE->Scaled"), playback_info_label::debayerField(f));
+    }
+    // the wiring: the label facts and the relabel inputs read the one accessor, and the accessor reads the prep frame's sizes
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString accessor = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackDebayerScale("));
+    ASSERT_TRUE(accessor.contains(QStringLiteral("\"playback_prep_cpu_route_active\"")));
+    ASSERT_TRUE(accessor.contains(QStringLiteral("\"render_thread_source_width\"")));
+    ASSERT_TRUE(accessor.contains(QStringLiteral("\"render_thread_rendered_width\"")));
+    ASSERT_TRUE(accessor.contains(QStringLiteral("playback_info_label::debayerScaleOfCpuPrepRoute(")));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.debayerScale = presentedPlaybackDebayerScale();")));
+    const QString inputs = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    ASSERT_TRUE(inputs.contains(QStringLiteral("inputs.debayerScale = presentedPlaybackDebayerScale();")));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("debayerScale == o.debayerScale")));
+}
+
+// r13 adversary pass 15 A2 (189dd4f9): fullscreen GPU window, fps on, 24-fps clip. The previous Play drew, then stalled > 500 ms
+// (m_playbackFramesStalled set, lastDrawTime dropped); Stop at 610 ms, Play at 910 ms with no tick between. Neither toggle cleared
+// the stall, so the new Play's "--/24 fps" relabel pushed with repaintNow=true and the GPU window painted the retained frame. The
+// Play toggle clears the stall flag BEFORE the relabel it triggers; a stall of the new Play is set again after its own draw.
+TEST(PlaybackInfoLabel, R13P15A2APlayToggleClearsThePreviousPlaysStall)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString toggled = functionBody(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    ASSERT_FALSE(toggled.isEmpty());
+    const int clearAt = toggled.indexOf(QStringLiteral("m_playbackFramesStalled = false;"));
+    ASSERT_TRUE(clearAt >= 0);
+    const int relabelAt = toggled.indexOf(QStringLiteral("updatePlaybackInfoLabel();"));
+    ASSERT_TRUE(relabelAt > clearAt);
+    // the push reads the flag for its repaint decision, and only an in-Play stall after a draw sets it again
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay( void )"));
+    ASSERT_TRUE(push.contains(QStringLiteral("m_playbackFramesStalled;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;")));
+}

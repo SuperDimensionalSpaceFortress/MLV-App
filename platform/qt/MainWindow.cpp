@@ -24719,6 +24719,7 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.gpuAmaze = m_lastPresentedFrameUsedGpuAmazeDebayer;
     inputs.gpuBilinear = m_lastPresentedFrameUsedGpuBilinearDebayer;
     inputs.presentedRoute = presentedPlaybackRouteCode();   // r12 adversary A1: a proxy route change relabels
+    inputs.debayerScale = presentedPlaybackDebayerScale();   // r13 adversary pass 15 A1: so does the prep frame's debayer scale
     if( inputs == m_playbackInfoInputs ) return;
     m_playbackInfoInputs = inputs;
     // r1 pass-3 A2: while playing, flushPlaybackInfoIfDue's 250 ms gate relabels, so a per-frame flip stays at most 4 Hz.
@@ -33064,6 +33065,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     // r12 (adversary pass 13 A2 on c58f5bd8): and the average with it: the next draw starts this Play's meter afresh.
     m_playbackFpsEmaFrameMs = 0.0;
     m_playbackFpsMeterNewPlay = true;
+    // r13 (adversary pass 15 A2 on 189dd4f9): a stall belongs to the Play it happened in. Kept across Stop -> Play, it made the
+    // new Play's "--" relabel repaint the retained paused frame at once; a stall of this Play is set again after its own draw.
+    m_playbackFramesStalled = false;
     updatePlaybackInfoLabel();
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
     // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
@@ -33957,6 +33961,8 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
                      : ( m_lastPresentedFrameUsedGpuBilinearDebayer ? QStringLiteral( "Bilinear" ) : QString() );
     // r12 (adversary ff6a22ab A1): the route the presented frame took, so a reduced bilinear proxy never reads as the selected one.
     facts.presentedRoute = presentedPlaybackRouteCode();
+    // r13 (adversary pass 15 A1): a prep frame's own debayer scale (full size, then box-reduced, reads the selected name)
+    facts.debayerScale = presentedPlaybackDebayerScale();
     facts.playing = ui->actionPlay->isChecked();
     // r1 adversary A1: the gate's snapshot, never the live meter, so no hook shows a new rate faster than the 250 ms gate.
     facts.achievedFps = m_playbackInfoFpsShown;
@@ -33991,6 +33997,17 @@ int MainWindow::presentedPlaybackScaleShown( void ) const
 // LOOK-LABEL-PLAYBACK-INFO-1 r13 (keys B1, H-a): the guards live in the pure playback_info_label::presentedRouteOfFrame, so
 // each one is tested by behaviour; a processed-8 cache hit replays the stored tag, which the engine resets to 0 on the scale-1
 // CPU 8-bit routes that never write it (video_mlv.c), so a cached direct-8 frame never replays an older proxy code.
+// LOOK-LABEL-PLAYBACK-INFO-1 r13 (adversary pass 15 A1 on 189dd4f9): the scale a CPU playback-prep frame was debayered at, read
+// from the size the render achieved (the prep box-reduces after the debayer, so its factor never says what the debayer ran at);
+// 0 for any other frame, where the label keeps the shown scale.
+int MainWindow::presentedPlaybackDebayerScale( void ) const
+{
+    const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;
+    if( !telemetryBoolValue( telemetry, "playback_prep_cpu_route_active" ) ) return 0;
+    return playback_info_label::debayerScaleOfCpuPrepRoute( telemetryIntValue( telemetry, "render_thread_source_width" ),
+                                                            telemetryIntValue( telemetry, "render_thread_rendered_width" ) );
+}
+
 int MainWindow::presentedPlaybackRouteCode( void ) const
 {
     const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;

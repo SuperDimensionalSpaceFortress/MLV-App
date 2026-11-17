@@ -38,6 +38,9 @@ struct Facts
     QString gpuDebayer;               // r3: the algorithm the GPU ran for the presented frame ("AMaZE", "Bilinear"; "" = none)
     int presentedRoute = 0;           // r12 (adversary A1): the presented frame's CPU render-path code (render_thread_phase4b_path,
                                       // video_mlv.c); 0 = full recon or unknown. 6/7 = x1 half proxy, 9/10 = x1 quarter proxy.
+    int debayerScale = 0;             // r13 (adversary pass 15 A1): the scale the CPU debayer ran at, when the frame says so (a
+                                      // playback-prep frame: the render's achieved size, before the prep's box reduction);
+                                      // 0 = not known apart from the shown scale, which debayerField then uses.
     bool playing = false;
     double achievedFps = 0.0;         // smoothed presented rate while playing
     double clipFps = 0.0;             // the clip's own rate (<= 0 = unknown, the fps field is omitted)
@@ -133,7 +136,10 @@ inline QString debayerField( const Facts &facts )
     // route bins the Bayer to RGB (pl_downsample_bayer_to_rgb_2x/4x/8x) or runs bilinear on a reduced Bayer (video_mlv.c),
     // so it reads "<selected>->Scaled" (selected -> ran), never "AMaZE". The scale is the one the scale field names as shown.
     const int shownScale = ( facts.presentedValid && facts.presentedScale > 0 ) ? facts.presentedScale : facts.requestedScale;
-    if( shownScale > 1 ) return name + QStringLiteral( "->Scaled" );
+    // r13 (adversary pass 15 A1 on 189dd4f9): a playback-prep frame may debayer full size with the selected algorithm and be
+    // box-reduced afterwards (the recon-reuse refusal), so the frame's own debayer scale decides, not the scale it is shown at.
+    const int debayerRanScale = facts.debayerScale > 0 ? facts.debayerScale : shownScale;
+    if( debayerRanScale > 1 ) return name + QStringLiteral( "->Scaled" );
     return name;
 }
 
@@ -240,6 +246,16 @@ inline int presentedScaleOfCpuPrepRoute( int renderActiveScale, int sourceWidth,
     const int achieved = static_cast<int>( std::lround( static_cast<double>( sourceWidth ) / static_cast<double>( renderedWidth ) ) );
     const int scale = achieved * prepReducedFactor;
     return ( scale == 1 || scale == 2 || scale == 4 || scale == 8 ) ? scale : renderActiveScale;
+}
+
+/*! \brief r13 (adversary pass 15 A1 on 189dd4f9): the scale a CPU playback-prep frame was DEBAYERED at: the size the render
+ *  achieved (sourceWidth / renderedWidth; 1 = the selected algorithm ran full size), never the prep's box reduction after it.
+ *  0 when the inputs do not give 1, 2, 4 or 8 (debayerField then falls back to the shown scale). */
+inline int debayerScaleOfCpuPrepRoute( int sourceWidth, int renderedWidth )
+{
+    if( sourceWidth <= 0 || renderedWidth <= 0 || renderedWidth > sourceWidth ) return 0;
+    const int achieved = static_cast<int>( std::lround( static_cast<double>( sourceWidth ) / static_cast<double>( renderedWidth ) ) );
+    return ( achieved == 1 || achieved == 2 || achieved == 4 || achieved == 8 ) ? achieved : 0;
 }
 
 /*! \brief r13 (keys B1, hardening H-a): the facts of the presented frame that decide whether its CPU route tag
