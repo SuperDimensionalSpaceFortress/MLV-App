@@ -10,7 +10,7 @@
     "schema": { "const": "mlv-app/dual-venue-leg/v1" },
     "legId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}$" },
     "card": { "type": "string", "pattern": "^[A-Z0-9][A-Z0-9-]{1,80}$", "description": "The card that declares this leg; venues.json roles are keyed by it." },
-    "legType": { "enum": ["speed", "look"] },
+    "legType": { "enum": ["speed", "look", "export"] },
     "clipId": { "type": "string", "pattern": "^[A-Za-z][0-9]{2}-[0-9]{3,4}$", "description": "A CONSENTED CLIP ID (never a path, never a tracked fixture: the fixtures are 2 and 16 frames and can never satisfy the owner's 20 s of real footage, so a fixture id is refused by the runner's admission gate, typed, and cannot even be written in a tracked leg). The runner also refuses a venue that has no owner-typed record for this id in venue-clip-consent.json." },
     "playSeconds": { "type": "integer", "minimum": 10, "maximum": 3600, "default": 25, "description": "The settled-playback window the job plays (generator -PlaySeconds). The owner's floor is 20 s, 10 s for a clip of 50 fps or more (HFR-10S-1, owner 2026-10-15); a leg cannot see the clip's fps, so the schema admits the lowest floor and the venue's runner and the app refuse a window under the clip's own. The clip must cover it and the run must advance that many distinct source frames, or the receipt is INVALID." },
     "backends": {
@@ -95,6 +95,17 @@
       "dependentRequired": { "receipt": ["receiptSha256"], "receiptSha256": ["receipt"] },
       "description": "Required when legType is 'look'. Look Assist is FORCED on for a look leg (Amendment 1 A2)."
     },
+    "export": {
+      "type": "object", "required": ["format", "maxFrames", "receipt", "receiptSha256", "dualIsoExpected"], "additionalProperties": false,
+      "properties": {
+        "format": { "enum": ["cdng-lossless", "prores"], "description": "cdng-lossless: --cdng-codec lossless under the app's export stage profiler (export-profile.json). prores: --export-format rendered --rendered-codec prores --rendered-container mov under MLVAPP_STAGE_TIMING (stage-timing.log)." },
+        "maxFrames": { "type": "integer", "minimum": 24, "maximum": 100000, "description": "The MEASURED window: the batch exports exactly this many frames (--max-frames) and the receipt requires framesExported == maxFrames." },
+        "receipt": { "type": "string", "pattern": "^look-receipts/[a-z0-9-]+\\.marxml$", "description": "The batch receipt (-r), relative to tools/profiling/dual-venue/, read as COMMITTED at the admission head." },
+        "receiptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the committed receipt bytes; a mismatch refuses the leg (LOOK_RECEIPT_UNBOUND)." },
+        "dualIsoExpected": { "type": "boolean", "description": "Whether the clip is dual-ISO. A run whose own evidence shows the other class ends INVALID CLIP_CLASS_MISMATCH." }
+      },
+      "description": "Required when legType is 'export' (EXPORT-VENUE-LEG-1), refused on any other leg. An export leg runs one headless CPU batch export of the clip on the venue and publishes only its batch log, its stage profile or stage-timing log, an output manifest and summary.json; the exported frames never leave the venue. For an export leg playSeconds is the clip-length floor (the length gate the job applies to the clip, nothing is played) and maxFrames is the measured window."
+    },
     "criteria": {
       "type": "object", "required": ["acceptance", "supplementary"], "additionalProperties": false,
       "description": "Per venue ROLE (P3) and per backend: criteria evaluated against the metrics copied verbatim from summary.json. An empty list is informational (no gating).",
@@ -106,6 +117,10 @@
   },
   "allOf": [
     { "if": { "properties": { "legType": { "const": "look" } } }, "then": { "required": ["look"] } },
+    { "if": { "properties": { "legType": { "const": "export" } }, "required": ["legType"] },
+      "then": { "required": ["export"], "properties": { "backends": { "const": ["cpu"] }, "scaleFactor": { "const": 1 }, "generatorArgs": { "propertyNames": { "enum": ["cpuQuiescenceThresholdPercent"] } } },
+                "not": { "anyOf": [ { "required": ["look"] }, { "required": ["displayMode"] }, { "required": ["visualCapture"] }, { "required": ["visualCaptureOptOutReason"] }, { "required": ["acceptedEffectiveScale"] }, { "required": ["presentTearingExpectedReason"] } ] } },
+      "else": { "not": { "required": ["export"] } } },
     { "if": { "properties": { "visualCapture": { "const": false } }, "required": ["visualCapture"] }, "then": { "required": ["visualCaptureOptOutReason"] }, "else": { "not": { "required": ["visualCaptureOptOutReason"] } } },
     { "if": { "required": ["presentTearingExpectedReason"] }, "then": { "required": ["generatorArgs"], "properties": { "generatorArgs": { "required": ["unpaced", "swapInterval"], "properties": { "unpaced": { "const": true }, "swapInterval": { "const": 0 } } } } } },
     { "if": { "required": ["generatorArgs"], "properties": { "generatorArgs": { "required": ["lookReceipt"] } } }, "then": { "properties": { "legType": { "const": "speed" }, "generatorArgs": { "properties": { "forceLookAssist": { "const": true } } } } } }

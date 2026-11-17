@@ -1,0 +1,35 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1456-export-prores",
+  "card": "EXPORT-VENUE-LEG-1",
+  "legType": "export",
+  "clipId": "M16-1456",
+  "playSeconds": 10,
+  "backends": ["cpu"],
+  "scaleFactor": 1,
+  "generatorArgs": { "cpuQuiescenceThresholdPercent": 20 },
+  "timeouts": { "queueWaitSec": 1800, "extraClaimedWaitSec": 2400 },
+  "export": {
+    "format": "prores",
+    "maxFrames": 360,
+    "receipt": "look-receipts/export-owner-hq-nodualiso.marxml",
+    "receiptSha256": "dae9d07942133a614939ff4b4d63b7cb62605d9b420804e1d7d6b5a923f6aff9",
+    "dualIsoExpected": false
+  },
+  "criteria": {
+    "acceptance": {
+      "cpu": [
+        { "metric": "framesExported", "op": "eq", "value": 360 },
+        { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
+        { "metric": "stageFramesSeen", "op": "eq", "value": 360 }
+      ]
+    },
+    "supplementary": {
+      "cpu": [
+        { "metric": "framesExported", "op": "eq", "value": 360 },
+        { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
+        { "metric": "stageFramesSeen", "op": "eq", "value": 360 }
+      ]
+    }
+  }
+}
