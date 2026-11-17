@@ -312,18 +312,29 @@ def render(data: dict) -> str:
     # owner rows' drain counts still cost bytes. Collapse: render the board as the base did (product/playback rows only, an owner
     # ask of another kind not counted) and replace ALL owner output with OWNER_COLLAPSED_LINE, no longer than the placeholder it
     # replaces. Owner asks then add zero bytes to what the board renders without them; product rows are still never dropped.
-    text = _render(data, 0, collapsed=True)
-    if _budget_size(text) <= ROADMAP_BUDGET_BYTES:
-        return text
+    collapsed = _render(data, 0, collapsed=True)
+    if _budget_size(collapsed) <= ROADMAP_BUDGET_BYTES:
+        return collapsed
     # (r4 pass 2 A1, r7 A1) the owner section, the owner-aware header and the UTC-instant day reading all cost bytes the base never spent:
     # a product-only board that fit the budget at base (19999 CRLF bytes) was 20143, then 20001 with a closed owner ask, then 20001 with
-    # an offset merged_utc. Last tier: the base's own algorithm, so the file is the base's, byte for byte, for every input it accepted.
-    return _render_base(data)
+    # an offset merged_utc. So the base's own algorithm is tried next: the file is the base's, byte for byte, for every input whose base file fit.
+    # (r10 A1) It is taken only when it fits. Master lists every parked product-kind owner ask, uncapped and unlabelled: 112 of them made
+    # the file 23006 bytes. Then the same algorithm runs on the board without its closed owner asks (the collapsed tier counts none of them
+    # either, and they stay in card-queue.json), and when even that is over budget the collapsed text stands: product rows are never dropped.
+    # (r10 A3) A candidate is None when the base's textual window leaves the date range: never a traceback.
+    owner_free = dict(data, rows=[r for r in data["rows"] if r.get("origin") != OWNER or r["state"] not in CLOSED_STATES])
+    for candidate in (data, owner_free):
+        text = _render_base(candidate)
+        if text is not None and _budget_size(text) <= ROADMAP_BUDGET_BYTES:
+            return text
+    return collapsed
 
 
-def _render_base(data: dict) -> str:
+def _render_base(data: dict) -> "str | None":
     """fork/master's render, verbatim apart from the helpers it inlined: no origin, resolution or owner section, days read as stamp[:10]
-    (not as UTC instants), the base header. The last render tier, so a board that fit the budget at the base fits here."""
+    (not as UTC instants), the base header. A last render tier, so a board that fit the budget at the base fits here. (r10 A2) Rows tied on
+    priority, stamp and card end on _canonical, so input order never decides; master left them in input order. (r10 A3) None when the
+    7-day window, read from generated_utc's text, starts before 0001-01-01 (the loader checks the UTC reading, which can be a day later)."""
     def day(stamp: str) -> date:
         return datetime.strptime(stamp[:10], "%Y-%m-%d").date()
 
@@ -337,13 +348,16 @@ def _render_base(data: dict) -> str:
         return max(stamps)
 
     def sort_key(r: dict) -> tuple:
-        return (r["priority"], r["source_ledger_stamp"], r["card"])
+        return (r["priority"], r["source_ledger_stamp"], r["card"], _canonical(r))
 
     rows = [r for r in data["rows"] if r["kind"] in KINDS]
     open_rows = sorted((r for r in rows if r["state"] not in CLOSED_STATES), key=sort_key)
     parked = sorted((r for r in rows if r["state"] == "parked"), key=sort_key)
     last = day(data["generated_utc"])
-    days = [last - timedelta(days=WINDOW_DAYS - 1 - i) for i in range(WINDOW_DAYS)]
+    try:
+        days = [last - timedelta(days=WINDOW_DAYS - 1 - i) for i in range(WINDOW_DAYS)]
+    except OverflowError:
+        return None
     landed = {d: 0 for d in days}
     queued = {d: 0 for d in days}
     for r in rows:

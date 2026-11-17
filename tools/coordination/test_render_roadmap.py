@@ -1308,7 +1308,8 @@ def master_render(data: dict) -> str:
         return max(stamps)
 
     def sort_key(r: dict) -> tuple:
-        return (r["priority"], r["source_ledger_stamp"], r["card"])
+        # r10 A2: master's key plus the canonical row as the last key, the one deliberate difference (master left fully tied rows in input order)
+        return (r["priority"], r["source_ledger_stamp"], r["card"], json.dumps(r, sort_keys=True, ensure_ascii=True))
 
     def chain(r: dict) -> str:
         oc = r.get("order_chain")
@@ -1511,6 +1512,74 @@ class R5BaseWindowTests(unittest.TestCase):
         data = self.board(100)
         self.assertTrue(render_roadmap._render_base(data).startswith(MASTER_HEADER))
         self.assertFalse(render_roadmap._render(data, 25).startswith(MASTER_HEADER))   # the owner-aware header says owner asks are shown
+
+
+class R10LastTierTests(unittest.TestCase):
+    """OWNER-ASK-PARK-GUARD-1 r10 (review-pr835-sol-r9-20261117T1226Z A1/A2/A3): the last tier (master's algorithm) must keep the owner-reporting
+    contract of the tiers above it: budget, a stable order for tied rows, and a documented status (never a traceback) for every accepted input."""
+
+    STAMP = "2026-10-20T00:00:00Z"
+
+    def products(self, n: int = 300) -> list[dict]:
+        return [row("PRODUCT-%03d" % i, "queued", self.STAMP) for i in range(n)]
+
+    def data(self, rows: list[dict], note_len: int, generated: str = "2026-10-23T00:00:00Z") -> dict:
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": generated, "rows": rows,
+                "scope_notes": [{"title": "S", "text": "x" * note_len}]}
+
+    # A1: 300 product rows + a 596-char scope note are 19999 CRLF bytes at master. 112 closed product-kind owner asks made the last tier 23006.
+    def test_a1_closed_product_owner_asks_do_not_push_the_last_tier_over_budget(self) -> None:
+        base = self.data(self.products(), 596)
+        self.assertEqual(render_roadmap._budget_size(master_render(base)), 19999)
+        for resolution in ({}, {"resolution": "done"}):
+            owners = [row("OWN-%03d" % i, "parked", self.STAMP, origin="owner", notes="waiting", **resolution) for i in range(112)]
+            with self.subTest(resolution=resolution):
+                text = render_roadmap.render(self.data(self.products() + owners, 596))
+                self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+                self.assertEqual(text, master_render(base))
+
+    def test_a1_the_last_tier_still_counts_closed_owner_asks_when_master_s_file_fits(self) -> None:
+        # the r7 A1 contract stays: a board master rendered within budget is master's file, a closed product owner ask counted as master counts it
+        owner = row("OWN-1", "parked", self.STAMP, origin="owner", notes="waiting")
+        for n in range(520, 620):
+            data = self.data(self.products() + [owner], n)
+            if (render_roadmap._budget_size(master_render(data)) <= ROADMAP_BUDGET_BYTES
+                    and render_roadmap._budget_size(render_roadmap._render(data, 0, collapsed=True)) > ROADMAP_BUDGET_BYTES):
+                with self.subTest(note_len=n):
+                    self.assertEqual(render_roadmap.render(data), master_render(data))
+
+    # A2: tied rows (same priority, stamp and card) rendered in input order in the last tier; reordering the input made --check report stale.
+    def tied(self, state: str, **extra) -> list[dict]:
+        return [row("SAME", state, self.STAMP, order_chain={"chain": c, "index": 1, "predecessor": None}, **dict(extra, notes=c.lower()))
+                for c in ("A", "B")]
+
+    def test_a2_tied_rows_render_in_one_order_whatever_the_input_order(self) -> None:
+        for state, note_len in (("queued", 523), ("parked", 575)):
+            tied = self.tied(state)
+            fwd = self.data(self.products(298) + tied, note_len)
+            rev = self.data(self.products(298) + tied[::-1], note_len)
+            with self.subTest(state=state):
+                self.assertTrue(render_roadmap.render(fwd).startswith(MASTER_HEADER), "this board must land in the last tier")
+                self.assertEqual(render_roadmap.render(fwd), render_roadmap.render(rev))
+                self.assertEqual(render_roadmap._render_base(fwd), render_roadmap._render_base(rev))
+
+    def test_a2_untied_rows_keep_master_s_order(self) -> None:
+        data = self.data(self.products(), 560)
+        data["rows"] = data["rows"][::-1]
+        self.assertEqual(render_roadmap._render_base(data), master_render(data))
+
+    # A3: generated_utc 0001-01-06T23:30:00-01:00 is UTC 0001-01-07 (window start 0001-01-01, accepted); the base's textual day, 01-06, minus six days overflows.
+    def test_a3_an_accepted_year_one_offset_stamp_is_a_status_never_a_traceback(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        q, out = Path(tmp.name) / "q.json", Path(tmp.name) / "roadmap.md"
+        for note_len in (9059, 9060, 9061):
+            q.write_text(json.dumps(self.data([], note_len, "0001-01-06T23:30:00-01:00")), encoding="utf-8")
+            with self.subTest(note_len=note_len), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out)]), 0)
+                self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out), "--check"]), 0)
+        text = render_roadmap.render(self.data([], 9061, "0001-01-06T23:30:00-01:00"))
+        self.assertIn("0001-01-07", text)   # the window is the UTC one the loader validated
 
 
 class R4BudgetTests(unittest.TestCase):
