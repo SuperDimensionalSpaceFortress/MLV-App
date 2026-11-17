@@ -1950,7 +1950,9 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
                     # fills only from lookFlavorReported / the receipts (pinned below), or the job's reported-vs-requested comparison.
                     self.assertRegex(line, r"'unknown'|\$null|\$lfReported -ceq|=\s*\$(lookFlavorHonored|pairHonored)\s*$", f"{name}: lookFlavorHonored must come from the app's report (or be 'unknown' / null), never from the spec: {line.strip()}")
         # the runner's one non-literal assignment sits inside the guard that requires the app's report in the job summary
-        self.assertRegex(runner, r"if \(\$null -ne \$summary -and \$summary\.PSObject\.Properties\['lookFlavorReported'\]\) \{\s*\$lookFlavorReported = \[string\]\$summary\.lookFlavorReported\s*\$lookFlavorHonored = \(\$lookFlavorReported -ceq \$lookFlavor\)")
+        # CONTRACT CHANGE, HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): the comparison is Test-DvLookFlavorSame (ordinal and
+        # canonical), no longer the linguistic -ceq, and one comment line names why
+        self.assertRegex(runner, r"if \(\$null -ne \$summary -and \$summary\.PSObject\.Properties\['lookFlavorReported'\]\) \{\s*\$lookFlavorReported = \[string\]\$summary\.lookFlavorReported\s*(#[^\n]*\n\s*)?\$lookFlavorHonored = \(Test-DvLookFlavorSame \$lookFlavorReported \$lookFlavor\)")
 
     def test_the_app_reads_the_flavor_env_var_and_the_job_records_what_it_reports(self) -> None:
         """LOOK-ASSIST-FLAVORS-1 landed the app-side reader this test used to forbid. The job must therefore take lookFlavorHonored from the
@@ -16621,6 +16623,95 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
             vs + "look_assist_enabled=1 look_assist_flavor=cinematic note='a b'",
             vs + "look_assist_enabled=1 look_assist_flavor=cinematic"])
         self.assertEqual(got, ["|HONOURED"] * 10 + ["cinematic|HONOURED", "cinematic|HONOURED"], got)
+
+    R26_VS = "interaction_trace event=gui_smoke.visual_state "
+    R26_SPEC = "@{ legType = 'speed'; generatorArgs = @{ forceLookAssist = $true; lookFlavor = 'cinematic' } }"
+    R26_EXPR = "$e = Get-DvLookAssistEvidence -Spec (" + R26_SPEC + ") -LogText $log; '{0}|{1}|{2}' -f $e.flavor, $e.verdict, $e.blocks"
+
+    def test_r26_b1_an_unreadable_earlier_visual_state_tail_keeps_the_flavor_ambiguous(self) -> None:
+        # sol r25 B1 on 620182b3, its input verbatim (and the two other flavors it names): the first record's conflicting tail is cut to
+        # LOCATION_UNREADABLE, so on 620182b3 its flavor vanished from the all-record set and cinematic was proven (cinematic|HONOURED|False). An earlier
+        # visual_state record that lost its tail may have named any flavor there, so it makes the flavor ambiguous, as an intact conflict does
+        vs = self.R26_VS
+        logs = [vs + 'look_assist_enabled=1 look_assist_flavor=cinematic diagnostic="harmless (text)" x (look_assist_flavor=' + other + "\n"
+                + vs + "look_assist_enabled=1 look_assist_flavor=cinematic" for other in ("classic", "film", "vision50d")]
+        # the same earlier record with no flavor key before the cut, and an old-writer tail that is not a readable location
+        logs.append(vs + "look_assist_enabled=1 x (look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        logs.append(vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b x/MainWindow.cpp:%3)\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        # controls: an intact earlier conflict (no flavor, as before r26) and an earlier record with a READABLE location (still proves cinematic)
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        located = (vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/build/platform/qt/MainWindow.cpp:10011)\n"
+                   + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        got = self.each(self.R26_EXPR, logs + [intact, located])
+        self.assertEqual(got, ["|HONOURED|False"] * 5 + ["|HONOURED|False", "cinematic|HONOURED|False"], got)
+
+    def test_r26_b1_the_app_s_unquoted_parenthesised_reject_reason_never_loses_the_flavor_silently(self) -> None:
+        # opus key3 r25 hardening DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1: the app writes gpu_preview_processing_reject_reason=transform (upside down)
+        # enabled UNQUOTED (GpuPreviewProcessing.cpp:3608 -> MainWindow.cpp:10098) before look_assist_flavor, so the record is cut at Get-DvLocationOpenIndex.
+        # With a READABLE `:<line>)` tail no LOCATION_UNREADABLE sentinel is left, and on 620182b3 the flavor vanished silently: the last record read no
+        # flavor with no reason, and an earlier cut record's conflicting classic disappeared (cinematic proven). The look_assist_enabled field comes first
+        # and still reads; the flavor is a TYPED refusal (flavorReason FLAVOR_UNREADABLE), as the last record, an earlier one, and with a cut location too
+        vs = self.R26_VS
+        rec = vs + "look_assist_enabled=1 gpu_preview_processing_reject_reason=transform (upside down) enabled look_assist_flavor={f} (C:/b/MainWindow.cpp:10011)"
+        intact = "\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        logs = [rec.format(f="cinematic"), rec.format(f="classic") + intact, rec.format(f="cinematic") + intact,
+                vs + "look_assist_enabled=1 gpu_preview_processing_reject_reason=transform (upside down) enabled look_assist_flavor=classic" + intact]
+        got = self.each(self.R26_EXPR, logs)
+        self.assertEqual(got, ["|HONOURED|False"] * 4, got)
+        reasons = self.each("[string](Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log).flavorReason", logs)
+        for i, r in enumerate(reasons):
+            with self.subTest(case=i):
+                self.assertTrue(r.startswith("FLAVOR_UNREADABLE:"), reasons)
+        # control: the same record with the reject reason QUOTED is no cut, and proves its flavor with no reason
+        ok = self.each("$e = Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log; '{0}|{1}' -f $e.flavor, [string]$e.flavorReason",
+                       [vs + 'look_assist_enabled=1 gpu_preview_processing_reject_reason="transform (upside down) enabled" look_assist_flavor=cinematic'])
+        self.assertEqual(ok, ["cinematic|"], ok)
+
+    # sol r25 B2: U+200B (zero-width space), U+00AD (soft hyphen), U+FEFF (zero-width no-break space), each ignorable to a linguistic compare
+    R26_IGNORABLE = ("\u200b", "\u00ad", "\ufeff")
+
+    def test_r26_b2_a_noncanonical_flavor_token_is_never_an_applied_flavor(self) -> None:
+        # sol r25 B2 on 620182b3, its inputs: `look_assist_flavor=cinematic<U+200B|U+00AD|U+FEFF>` passed the -ccontains whitelist (a ten-character
+        # flavor, HONOURED). A token with any character outside [a-z0-9_] is no applied flavor; the leg still reads Look Assist on (no flavor proven)
+        vs = self.R26_VS
+        logs = [vs + "look_assist_enabled=1 look_assist_flavor=cinematic" + c for c in self.R26_IGNORABLE]
+        logs += [vs + "look_assist_enabled=1 look_assist_flavor=" + c + "cinematic" for c in self.R26_IGNORABLE]
+        logs += [vs + "look_assist_enabled=1 look_assist_flavor=cine" + c + "matic" for c in self.R26_IGNORABLE]
+        # two records whose tokens differ only by an ignorable character name two flavors (ordinal): no flavor
+        logs.append(vs + "look_assist_enabled=1 look_assist_flavor=cinematic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic\u200b")
+        logs.append(vs + "look_assist_enabled=1 look_assist_flavor=cinematic\u200b\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        got = self.each(self.R26_EXPR, logs + [vs + "look_assist_enabled=1 look_assist_flavor=cinematic"])
+        self.assertEqual(got, ["|HONOURED|False"] * 11 + ["cinematic|HONOURED|False"], got)
+        # the flavor the reader returns is never longer than the canonical name it could be mistaken for
+        lens = self.each("([string](Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log).flavor).Length", logs[:3])
+        self.assertEqual(lens, [0, 0, 0], lens)
+
+    def test_r26_b2_the_flavor_claim_predicates_are_ordinal_and_canonical(self) -> None:
+        # sol r25 B2: the writer (Invoke-VenueLeg.ps1 lookAssistOn) and the validator (Test-DvReceiptValid LOOK_ASSIST_CLAIM_UNBACKED) compared the
+        # requested, reported, log and stored flavors with -ceq, a linguistic compare that equates cinematic<U+200B> with cinematic. Both now use
+        # Test-DvLookFlavorSame: ordinal, and only an ASCII-canonical [a-z0-9_]+ token is the same as anything
+        pairs = [("cinematic" + c, "cinematic") for c in self.R26_IGNORABLE] + [("cinematic", "cinematic" + c) for c in self.R26_IGNORABLE]
+        pairs += [("CINEMATIC", "CINEMATIC"), ("", ""), ("cinematic", "classic"), ("cine matic", "cine matic"), ("cinematic", "cinematic")]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "pairs.json"
+            path.write_text(json.dumps(pairs), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$ps = Get-Content -Raw -LiteralPath $env:DVE_PAIRS -Encoding utf8 | ConvertFrom-Json\n"
+                "@(foreach ($p in @($ps)) { [bool](Test-DvLookFlavorSame ([string]$p[0]) ([string]$p[1])) }) + @([bool](Test-DvLookFlavorSame $null $null), "
+                "[bool](Test-DvLookFlavorSame @('cinematic') 'cinematic')) | ConvertTo-Json -Compress -AsArray", DVE_PAIRS=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, [False] * 10 + [True, False, False], out)
+        # both claim sites (and the look-leg honoured flag and type binding, same class) compare through it, never -ceq / -cne on a flavor
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        runner = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("(Test-DvLookFlavorSame $laReportedFlavor $laRequestedFlavor) -and (Test-DvLookFlavorSame $laLogFlavor $laRequestedFlavor)", leg)
+        self.assertIn("$lookFlavorHonored = (Test-DvLookFlavorSame $lookFlavorReported $lookFlavor)", leg)
+        self.assertIn("(Test-DvLookFlavorSame $claimReportedRaw $claimRequested) -and (Test-DvLookFlavorSame $claimLogFlavor $claimRequested) -and "
+                      "(Test-DvLookFlavorSame $claimStoredRaw $claimLogFlavor)", runner)
+        for text, name in ((leg, "Invoke-VenueLeg.ps1"), (runner, "DualVenueRunner.psm1")):
+            with self.subTest(file=name):
+                self.assertIsNone(re.search(r"(?i)flavor\w*\s+-c?(eq|ne)\s|-c?(eq|ne)\s+\$\w*flavor\b", text), name)
+                self.assertNotIn("$script:DvAppliedLookFlavors -ccontains", text)
 
 
 @requires_windows_pwsh

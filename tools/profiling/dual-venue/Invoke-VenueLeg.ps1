@@ -896,7 +896,8 @@ if ($isLook -and $artifactsShare) {
     $lookFlavorHonored = 'unknown'
     if ($null -ne $summary -and $summary.PSObject.Properties['lookFlavorReported']) {
         $lookFlavorReported = [string]$summary.lookFlavorReported
-        $lookFlavorHonored = ($lookFlavorReported -ceq $lookFlavor)
+        # r26 (sol r25 B2 sibling): ordinal and canonical, never the linguistic -ceq
+        $lookFlavorHonored = (Test-DvLookFlavorSame $lookFlavorReported $lookFlavor)
     }
     $receipt.look = [ordered]@{
         legType = 'look'; lookAssistForced = $true; lookFlavor = $lookFlavor
@@ -1067,7 +1068,9 @@ $laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properti
 $laRequestedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavor'] -and $summary.lookFlavor -is [string]) { [string]$summary.lookFlavor } else { '' })
 $laReportedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavorReported'] -and $summary.lookFlavorReported -is [string]) { [string]$summary.lookFlavorReported } else { '' })
 $laLogFlavor = [string]$lookAssistVerdict.flavor
-if ($lookAssistVerdict.asked -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and ($laReportedFlavor -ceq $laRequestedFlavor) -and ($laLogFlavor -ceq $laRequestedFlavor)) {
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2): the flavors compare ORDINALLY and only an ASCII-canonical token matches (Test-DvLookFlavorSame);
+# -ceq is linguistic, so a reported `cinematic<U+200B>` equalled the requested `cinematic`
+if ($lookAssistVerdict.asked -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and (Test-DvLookFlavorSame $laReportedFlavor $laRequestedFlavor) -and (Test-DvLookFlavorSame $laLogFlavor $laRequestedFlavor)) {
     $receipt['lookAssistOn'] = $true
     $receipt['lookAssistFlavor'] = $laLogFlavor
 }

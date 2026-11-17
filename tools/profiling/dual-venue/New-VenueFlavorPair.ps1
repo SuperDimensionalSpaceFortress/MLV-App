@@ -151,7 +151,8 @@ if (-not $stageParent) {
 $classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path) | ConvertFrom-Json
 $cinematic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CinematicReceipt).Path) | ConvertFrom-Json
 
-if ([string]$classic.subject.lookFlavor -cne 'classic' -or [string]$cinematic.subject.lookFlavor -cne 'cinematic') {
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): receipt flavors compare ordinally and canonically (Test-DvLookFlavorSame), never the linguistic -cne
+if (-not (Test-DvLookFlavorSame 'classic' ([string]$classic.subject.lookFlavor)) -or -not (Test-DvLookFlavorSame 'cinematic' ([string]$cinematic.subject.lookFlavor))) {
     throw "PAIR_FLAVORS_WRONG the first receipt must be the classic flavor and the second the cinematic flavor (got '$($classic.subject.lookFlavor)' and '$($cinematic.subject.lookFlavor)')"
 }
 foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
@@ -164,7 +165,7 @@ if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiv
 $film = $null
 if ($trio) {
     $film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path) | ConvertFrom-Json
-    if ([string]$film.subject.lookFlavor -cne $ThirdFlavor) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
+    if (-not (Test-DvLookFlavorSame ([string]$ThirdFlavor) ([string]$film.subject.lookFlavor))) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
     foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
         if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }
     }

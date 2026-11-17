@@ -2379,7 +2379,28 @@ function Get-DvTeamPartitionEvidence {
 }
 
 # The flavors the app can apply (src/batch/LookAssistAnalysis.cpp lookAssistFlavorName). The app's `look_assist_flavor=none` (nothing applied) is not among them.
-$script:DvAppliedLookFlavors = @('classic', 'cinematic', 'film', 'vision50d')
+$script:DvAppliedLookFlavors = [string[]]@('classic', 'cinematic', 'film', 'vision50d')
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 on 620182b3, its inputs: `look_assist_flavor=cinematic` followed by U+200B, U+00AD or
+# U+FEFF): a flavor token is ASCII-canonical (only [a-z0-9_], matched case-sensitively and culture-free) or it is UNREADABLE. PowerShell's -ceq / -ccontains
+# compare linguistically, where those characters are ignorable, so a ten-character `cinematic<U+200B>` equalled `cinematic` in the whitelist and in both
+# claim predicates. Every flavor comparison goes through Test-DvAppliedLookFlavor / Test-DvLookFlavorSame: canonical, then ordinal.
+$script:DvCanonicalFlavorToken = [regex]::new('\A[a-z0-9_]+\z', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+
+function Test-DvLookFlavorSame {
+    <#
+    .SYNOPSIS
+    r26 (sol r25 B2): are A and B the same look flavor? True only when both are strings, A is ASCII-canonical ([a-z0-9_]+, nothing else) and B equals A
+    ORDINALLY. An empty, non-string or non-canonical value is the same as nothing, so it never backs a flavor claim.
+    #>
+    param([AllowNull()]$A, [AllowNull()]$B)
+    ($A -is [string]) -and ($B -is [string]) -and $script:DvCanonicalFlavorToken.IsMatch($A) -and [string]::Equals($A, $B, [StringComparison]::Ordinal)
+}
+
+function Test-DvAppliedLookFlavor {
+    # r26 (sol r25 B2): is the token one of the flavors the app can apply, canonical and compared ordinally (Array.IndexOf on string[] is ordinal)?
+    param([AllowNull()]$Token)
+    ($Token -is [string]) -and $script:DvCanonicalFlavorToken.IsMatch($Token) -and ([Array]::IndexOf($script:DvAppliedLookFlavors, $Token) -ge 0)
+}
 
 function Get-DvLookAssistEvidence {
     <#
@@ -2397,6 +2418,7 @@ function Get-DvLookAssistEvidence {
     $asked = (($legTypeRaw -is [string]) -and ($legTypeRaw -ceq 'look')) -or (($forceRaw -is [bool]) -and $forceRaw)
     $reported = $null
     $flavor = $null
+    $flavorReason = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
     if ($requested) {
@@ -2418,7 +2440,18 @@ function Get-DvLookAssistEvidence {
                     # r25 pass 2 A1 (a37b59c9, its input: `... diagnostic=' LOOK_ASSIST_FLAVOR=classic`): the key is counted in ANY case ($script:DvCi), plain
                     # or masked, so a differently cased flavor key is a token too (counting only ever adds tokens: it never proves a flavor, see $exactFlavor below)
                     foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)', $script:DvCi)) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
-                    if ([regex]::IsMatch($line, '(?<![A-Za-z0-9_])look_assist_flavor\x1A', $script:DvCi)) { [void]$flavorsSeen.Add([string]$script:DvQuotedEqualsMask) }
+                    $maskedFlavorKey = [regex]::IsMatch($line, '(?<![A-Za-z0-9_])look_assist_flavor\x1A', $script:DvCi)
+                    if ($maskedFlavorKey) { [void]$flavorsSeen.Add([string]$script:DvQuotedEqualsMask) }
+                    # r26 (sol r25 B1 on 620182b3, its input: an earlier `... diagnostic="harmless (text)" x (look_assist_flavor=classic` record, cut to
+                    # LOCATION_UNREADABLE, then an intact cinematic record): a visual_state record that LOST ITS TAIL may have named any flavor there, so it
+                    # adds an UNREADABLE flavor token ($script:DvLocationUnreadable holds spaces, so no `\S*` token ever equals it) and no flavor is proven,
+                    # exactly as an intact conflicting record. Lost means (a) the LOCATION_UNREADABLE sentinel ends it, or (b) it carries no look_assist_flavor
+                    # key at all (plain or masked, any case): the app writes that key LAST (MainWindow.cpp gui_smoke.visual_state, %48), so a record without
+                    # it was cut short -- opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1: the UNQUOTED reject reason `transform (upside down) enabled`
+                    # (GpuPreviewProcessing.cpp) opens a ` (` that Get-DvLocationOpenIndex takes for the location, and with a readable `:<line>)` tail the
+                    # flavor vanished with no sentinel at all. An app build that writes no flavor key proves no flavor either way (exactFlavor below).
+                    $hasFlavorKey = $maskedFlavorKey -or [regex]::IsMatch($line, '(^|\s)look_assist_flavor=', $script:DvCi)
+                    if ($line.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) -or -not $hasFlavorKey) { [void]$flavorsSeen.Add($script:DvLocationUnreadable) }
                 }
             }
         }
@@ -2448,16 +2481,24 @@ function Get-DvLookAssistEvidence {
                                 @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_flavor\x1A', $script:DvCi) | ForEach-Object { $maskToken })
                 $enabledTokens = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)', $script:DvCi) | ForEach-Object { $_.Groups['v'].Value }) +
                                  @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_enabled\x1A', $script:DvCi) | ForEach-Object { $maskToken })
-                $lastFlavors = @($flavorTokens | Select-Object -Unique)
-                $enabledValues = @($enabledTokens | Select-Object -Unique)
-                if ($exactFlavor.Count -ge 1 -and $flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
+                # r26 (sol r25 B2): distinct ORDINALLY (Select-Object -Unique compares linguistically, so `cinematic` and `cinematic<U+200B>` were one
+                # value), and the one value must be an ASCII-canonical applied flavor (Test-DvAppliedLookFlavor), never a -ccontains match
+                $lastFlavors = @([System.Collections.Generic.HashSet[string]]::new([string[]]@($flavorTokens), [StringComparer]::Ordinal))
+                $enabledValues = @([System.Collections.Generic.HashSet[string]]::new([string[]]@($enabledTokens), [StringComparer]::Ordinal))
+                if ($exactFlavor.Count -ge 1 -and $flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and (Test-DvAppliedLookFlavor $lastFlavors[0])) { $flavor = $lastFlavors[0] }
+                # r26 (opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1): an unproven flavor is TYPED, never a silent null
+                elseif ($flavorsSeen.Contains($script:DvLocationUnreadable)) { $flavorReason = 'FLAVOR_UNREADABLE: a gui_smoke.visual_state record lost its tail (an unreadable location, or a cut before look_assist_flavor, which the app writes last), so the applied flavor is unreadable' }
+                elseif ($flavorsSeen.Count -gt 1 -or $lastFlavors.Count -gt 1) { $flavorReason = 'FLAVOR_AMBIGUOUS: the gui_smoke.visual_state records name more than one look_assist_flavor token, so no applied flavor is proven' }
+                elseif ($exactFlavor.Count -eq 0) { $flavorReason = 'FLAVOR_ABSENT: the answering gui_smoke.visual_state record carries no lower-case look_assist_flavor= token' }
+                elseif ($enabledValues.Count -ne 1) { $flavorReason = 'FLAVOR_UNPROVEN: the answering gui_smoke.visual_state record names look_assist_enabled more than once' }
+                else { $flavorReason = 'FLAVOR_NOT_APPLIED: the look_assist_flavor token is not an ASCII-canonical flavor the app can apply (classic, cinematic, film, vision50d)' }
                 # r24 (r24 adversary pass 2 A2 sibling): ORDINAL, so look_assist_enabled=<U+0661> or 1<U+200B> is never on
                 if (-not [string]::Equals($reported, '1', [StringComparison]::Ordinal)) { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
             }
         }
     }
-    [ordered]@{ requested = $requested; asked = $asked; reported = $reported; flavor = $flavor; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+    [ordered]@{ requested = $requested; asked = $asked; reported = $reported; flavor = $flavor; flavorReason = $flavorReason; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
@@ -4602,7 +4643,8 @@ function Test-DvReceiptValid {
                 elseif ($specLook) {
                     if ((Get-DvProp $ev.summary 'lookAssistForced') -ne $true) { $invalid.Add('LEG_TYPE_MISMATCH: a look leg''s hashed summary.json does not say lookAssistForced') }
                     $specFlavor = [string](Get-DvProp (Get-DvProp $spec 'look') 'lookFlavor'); if ([string]::IsNullOrWhiteSpace($specFlavor)) { $specFlavor = 'classic' }
-                    if ([string](Get-DvProp $ev.summary 'lookFlavor') -cne $specFlavor -or [string](Get-DvProp $subject 'lookFlavor') -cne $specFlavor) { $invalid.Add('LEG_TYPE_MISMATCH: the look flavor in the hashed summary.json / receipt subject is not the committed spec''s') }
+                    # r26 (sol r25 B2 sibling): ordinal and canonical (Test-DvLookFlavorSame), so a `cinematic<U+200B>` summary or subject is a mismatch
+                    if (-not (Test-DvLookFlavorSame $specFlavor ([string](Get-DvProp $ev.summary 'lookFlavor'))) -or -not (Test-DvLookFlavorSame $specFlavor ([string](Get-DvProp $subject 'lookFlavor')))) { $invalid.Add('LEG_TYPE_MISMATCH: the look flavor in the hashed summary.json / receipt subject is not the committed spec''s') }
                     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a run's lookReceiptSha256 is accepted only when the committed spec names a look receipt with that hash (both absent is the old leg).
                     if ([string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne [string](Get-DvProp (Get-DvProp $spec 'look') 'receiptSha256')) { $invalid.Add('LOOK_RECEIPT_MISMATCH: the hashed summary.json''s lookReceiptSha256 is not the committed spec''s look.receiptSha256') }
                 }
@@ -4658,7 +4700,8 @@ function Test-DvReceiptValid {
                 $claimRequestedRaw = Get-DvProp $ev.summary 'lookFlavor'; $claimReportedRaw = Get-DvProp $ev.summary 'lookFlavorReported'; $claimStoredRaw = Get-DvProp $Receipt 'lookAssistFlavor'
                 $claimRequested = [string]$claimRequestedRaw; $claimLogFlavor = [string]$claimVerdict.flavor
                 # strings only (adversary A2: a singleton array casts to its element); the flavor is the one the app's own record body names (adversary A1)
-                if (-not ($claimVerdict.asked -and $claimVerdict.verdict -ceq 'HONOURED' -and $claimForcedRaw -is [bool] -and $claimForcedRaw -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and $claimReportedRaw -ceq $claimRequested -and $claimLogFlavor -ceq $claimRequested -and $claimStoredRaw -ceq $claimLogFlavor)) {
+                # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2): ordinal and canonical (Test-DvLookFlavorSame), never the linguistic -ceq
+                if (-not ($claimVerdict.asked -and $claimVerdict.verdict -ceq 'HONOURED' -and $claimForcedRaw -is [bool] -and $claimForcedRaw -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and (Test-DvLookFlavorSame $claimReportedRaw $claimRequested) -and (Test-DvLookFlavorSame $claimLogFlavor $claimRequested) -and (Test-DvLookFlavorSame $claimStoredRaw $claimLogFlavor))) {
                     $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt says Look Assist ran (lookAssistOn) but the hashed run log / summary.json do not show it ran with the flavor lookAssistFlavor names')
                 }
             }
@@ -5553,6 +5596,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
