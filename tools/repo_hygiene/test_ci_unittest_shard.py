@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -1304,6 +1305,69 @@ class ShardExitCodeTests(unittest.TestCase):
 
     def test_no_worker_starts_after_opening_its_log_took_the_clock_past_the_deadline(self) -> None:
         self.assertEqual([time for time in self._launch_times("log") if time >= 1.0], [])
+
+    # r5 (adversary pass 6 A1): the base file ran by path (`python tools/repo_hygiene/ci_unittest_shard.py`)
+    # because it imported nothing from the repo; the sibling import must not take that entry point away.
+    def test_the_file_runs_by_path_and_prints_usage(self) -> None:
+        done = subprocess.run(
+            [sys.executable, "-B", str(Path("tools") / "repo_hygiene" / "ci_unittest_shard.py"), "--help"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=120, creationflags=no_window_flags(),
+        )
+        self.assertEqual((done.returncode, done.stderr), (0, ""), done.stdout)
+        self.assertIn("usage:", done.stdout)
+        self.assertIn("--profile", done.stdout)
+
+    # r5 (adversary pass 5 A2): the parent can sit in a blocking launch step (the next worker's spec write)
+    # while a worker it already started passes the deadline; that worker must be killed AT the deadline
+    # (on the injected clock), by a watchdog, not whenever the parent next looks.
+    def test_a_launched_worker_is_killed_at_the_deadline_while_the_parent_is_stalled_launching(self) -> None:
+        root, tests, tag = self._fixture()
+        now = [0.0]
+        killed_at: list[float] = []
+        killed = threading.Event()
+        stalled: list[bool] = []
+        real_write = Path.write_text
+
+        class FakeProc:
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired("fake", timeout)
+                return self.returncode
+
+            def kill(self) -> None:
+                if self.returncode is None:
+                    killed_at.append(now[0])
+                    self.returncode = -9
+                    killed.set()
+
+        def stalling_write(path: Path, data: str, *args: object, **kwargs: object) -> int:
+            written = real_write(path, data, *args, **kwargs)
+            if path.name == "spec.json" and path.parent.name == "w2":
+                now[0] = 2.0  # worker 2's spec write stalls the parent past the 1 s deadline...
+                # ...and, while it is stalled, the watchdog must already have killed worker 1
+                stalled.append(killed.wait(timeout=5.0))
+            return written
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.Path, "write_text", stalling_write),
+            mock.patch.object(shard.subprocess, "Popen", side_effect=lambda *a, **k: FakeProc()),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "1"}, clock=lambda: now[0],
+            )
+        self.assertEqual(stalled, [True], "worker 1 was not killed while the parent was stalled launching worker 2")
+        self.assertEqual(killed_at, [2.0], "the kill happened once, on the injected clock, at or after the deadline")
+        self.assertEqual(code, 1)
+        self.assertIn("worker 1/1 timed out", err.getvalue())
 
     # r4 adversary A2 (pass 4): a worker whose only class skips in a fixture but whose cleanup fails
     # runs no test; serial fails it (exit 1 with the others' tests run), so the parallel shard must too.

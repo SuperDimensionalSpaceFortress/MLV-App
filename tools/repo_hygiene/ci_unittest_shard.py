@@ -41,7 +41,10 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, TextIO
 
-from .hidden_spawn import no_window_flags
+try:
+    from .hidden_spawn import no_window_flags
+except ImportError:  # run by path (`python tools/repo_hygiene/ci_unittest_shard.py`): no parent package
+    from hidden_spawn import no_window_flags
 
 START_DIR = "tools/repo_hygiene"
 PATTERN = "test_*.py"
@@ -755,6 +758,55 @@ def late_workers(
     return late
 
 
+class DeadlineKiller:
+    """Kills every registered worker once ``clock`` reaches ``deadline``, whatever the parent is doing.
+
+    The parent blocks while launching (a spec write, the status line, a log open, ``Popen``), and
+    ``late_workers`` only looks once the launch loop is over, so a worker that is already running could
+    pass the deadline unseen. This thread looks every ``WORKER_WATCH_SLICE_SECONDS`` on the same
+    injectable clock and kills what is still running at the deadline; ``add`` does the same check at once
+    for a worker registered after it. It only kills: reaping and the failure message stay with the parent.
+    """
+
+    def __init__(
+        self, deadline: float, clock: Callable[[], float], slice_seconds: float = WORKER_WATCH_SLICE_SECONDS
+    ) -> None:
+        self._deadline = deadline
+        self._clock = clock
+        self._slice = slice_seconds
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._procs: list[subprocess.Popen[bytes]] = []
+        self.killed: set[int] = set()  # 1-based, in registration order
+        self._thread = threading.Thread(target=self._run, name="shard-deadline-killer", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def add(self, proc: subprocess.Popen[bytes]) -> None:
+        with self._lock:
+            self._procs.append(proc)
+        self._kill_due()
+
+    def _kill_due(self) -> None:
+        with self._lock:
+            if self._clock() < self._deadline:
+                return
+            for number, proc in enumerate(self._procs, start=1):
+                if proc.poll() is None:
+                    proc.kill()
+                    self.killed.add(number)
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._slice):
+            self._kill_due()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread.is_alive():
+            self._thread.join()
+
+
 def run_parallel(
     members: list[unittest.TestCase],
     profile: str,
@@ -819,7 +871,9 @@ def run_parallel(
         origin=origin,
     )
     deadline = clock() + limit  # from before the first launch: launching is part of the budget
+    killer = DeadlineKiller(deadline, clock)
     watch.start()
+    killer.start()
     try:
         for number, classes in enumerate(groups, start=1):
             home = work / f"w{number}"
@@ -848,14 +902,13 @@ def run_parallel(
                 log.close()
                 problems.append(f"worker {number}/{len(groups)} not launched: the deadline passed while launching")
                 continue
-            procs.append((
-                subprocess.Popen(
-                    command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    creationflags=no_window_flags(),
-                ),
-                log,
-            ))
+            proc = subprocess.Popen(
+                command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                creationflags=no_window_flags(),
+            )
+            procs.append((proc, log))
             logs.append(home / "log.txt")
+            killer.add(proc)  # from here the deadline is enforced even while the next launch blocks
         watch.check()  # a budget already spent when the workers launch is reported at once
         late = late_workers([proc for proc, _log in procs], deadline, clock)
         for number, (proc, log) in enumerate(procs, start=1):
@@ -863,6 +916,7 @@ def run_parallel(
             if killed:
                 proc.kill()
                 proc.wait()
+            killed = killed or number in killer.killed
             if killed or number in late:
                 problems.append(
                     f"worker {number}/{len(procs)} timed out after {limit:g} s" + (" and was killed" if killed else "")
@@ -887,6 +941,7 @@ def run_parallel(
             elif code == 5 and record["tests_run"] != 0:  # 5 is "no tests ran", never the exit of a run that ran some
                 problems.append(f"worker {number}/{len(logs)} exited 5 after running {record['tests_run']} tests")
     finally:
+        killer.stop()
         watch.stop()
         for proc, log in procs:  # an exception above must not leave a worker running
             if proc.poll() is None:
