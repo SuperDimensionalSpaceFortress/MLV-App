@@ -74,8 +74,11 @@
 # Roles come from venues.json and are never set here. Scheduling is NOT here: UM-REGULAR-BASELINE-SCHEDULE-1 makes one call per night (fetch fork, this driver, then
 # Invoke-VenueBaseline.ps1 on exit 0).
 # -UmRunScript / -DllJobScript / -AssembleScript / -StageJobScript / -SmokeRunnerJobScript / -GitExe / -AgentShare (replaces every share this driver touches) / -ClaimDir /
-# -VenueTablePath / -RepoRoot / -GateDir / -NowUtc / -TestNotAfterSampleDelayMs are seams for the offline tests (tools/repo_hygiene/test_venue_stage_nightly.py);
-# production passes none.
+# -VenueTablePath / -RepoRoot / -GateDir / -NowUtc / -TestNotAfterSampleDelayMs / -TestClockStepBackSec are seams for the offline tests
+# (tools/repo_hygiene/test_venue_stage_nightly.py); production passes none.
+# CLOCKS (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1): -MaxTotalSec is a budget of ELAPSED time, kept on a Stopwatch (Get-NightlyLeftSec), so a backward wall-clock step (NTP
+# correction, VM resume, manual set) never re-grants it. The absolute UTC deadline is only what is handed to other processes, re-derived from that budget at each
+# hand-off (Sync-NightlyDeadline); timestamps that only label things keep the wall clock (Get-WallUtc). The timings.*Sec and totalSec durations are elapsed time too.
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
@@ -104,6 +107,10 @@ param(
     # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
     # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
     [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
+    # Test-only (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1): from the moment the call's deadline is armed, every WALL-clock read this script makes (Get-WallUtc, the one
+    # place that reads [DateTime]::UtcNow) is this many seconds EARLIER, as after a backward NTP correction, a VM resume or a manual clock set. The budget
+    # arithmetic reads the monotonic Stopwatch, so it must not notice; a wall-clock budget is re-granted by exactly this much. Production passes none.
+    [ValidateRange(0, 86400)][double]$TestClockStepBackSec = 0,
     # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe Stop-ShareUnreachable uses (ShareRootAccess.psm1); throwing means the
     # root cannot be read. Production passes none.
     # (r16 merge of #826: this seam and -DllJobIdSuffix below are independent parameters; both are kept, neither side's behaviour is dropped.)
@@ -147,12 +154,35 @@ $ExitCodes = [ordered]@{
 $Caller = 'Invoke-VenueStageNightly'
 $GateCard = 'venue-stage-nightly'
 $FloorRecheckAfterSec = 300       # a DLL-pair wait at least this long re-asks both floors right before the assemble
-$startedUtc = [DateTime]::UtcNow
+$script:ClockStepOn = $false
+function Get-WallUtc {
+    # The ONE wall-clock read of this driver. Labels only (utc= fields, log stamps, build-dir and JobId suffixes) and the absolute instants handed to other
+    # processes read it; no budget decision does (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1). -TestClockStepBackSec shifts it once the deadline is armed.
+    $t = [DateTime]::UtcNow
+    if ($script:ClockStepOn) { $t.AddSeconds(-$TestClockStepBackSec) } else { $t }
+}
+$startedUtc = (Get-WallUtc)
+# VENUE-NIGHTLY-MONOTONIC-DEADLINE-1: -MaxTotalSec is a budget of ELAPSED time, so every in-process "time left", "past the deadline" and "elapsed" decision reads this
+# Stopwatch (started with $startedUtc), never a wall-clock subtraction: a backward step (NTP correction, VM resume, manual set) makes UtcNow smaller and a wall-clock
+# budget re-grants what was spent. The absolute UTC $script:Deadline stays as the CROSS-PROCESS contract (-CallDeadlineUtc, -CallerDeadlineUtc, the assembler's
+# MLV_HEAVY_SLOT_DEADLINE_UTC, the deadline= log line); Sync-NightlyDeadline re-derives it from the monotonic budget right before each hand-off.
+$script:Sw = [Diagnostics.Stopwatch]::StartNew()
+$script:BudgetSec = $null            # armed with the deadline (section 2): -MaxTotalSec, or less when the -TestSoundnessCapLeftSec seam brought it nearer
 $pwshExe = [Environment]::ProcessPath
 $reuseModule = Join-Path $here 'VenueStageReuse.psm1'
 
 function Out-Line([string]$Text) { [Console]::Out.WriteLine($Text) }
-function Say([string]$Text) { Out-Line ('STAGE_NIGHTLY_LOG {0} {1}' -f [DateTime]::UtcNow.ToString('HH:mm:ssZ'), $Text) }
+function Say([string]$Text) { Out-Line ('STAGE_NIGHTLY_LOG {0} {1}' -f (Get-WallUtc).ToString('HH:mm:ssZ'), $Text) }
+function Get-NightlyElapsedSec { $script:Sw.Elapsed.TotalSeconds }
+# What is left of -MaxTotalSec on the monotonic clock (negative once it ran out). The ONE source of "time left" / "past the deadline" for every in-process decision.
+function Get-NightlyLeftSec { $script:BudgetSec - $script:Sw.Elapsed.TotalSeconds }
+function Sync-NightlyDeadline {
+    # Called right before every hand-off of the absolute deadline to another process. $script:Deadline becomes now + what is LEFT of the monotonic budget, so a
+    # backward wall-clock step before the hand-off can never give the child a bound later than the budget really leaves; it never moves later than it was (the
+    # original start + -MaxTotalSec instant, or an earlier hand-off), so a forward step only makes the child's bound nearer, never wider.
+    $d = (Get-WallUtc).AddSeconds((Get-NightlyLeftSec))
+    if ($d -lt $script:Deadline) { $script:Deadline = $d }
+}
 
 # ------------------------------------------------------------------ the row every exit after the plan appends ----------------------------------------------------------
 $script:Row = [ordered]@{
@@ -209,9 +239,9 @@ function Stop-Nightly([string]$Reason, [string]$Detail = '', [string[]]$Verbatim
     $code = [int]$ExitCodes[$Reason]
     if ($Detail) { Out-Line "STAGE_NIGHTLY_DETAIL $Detail" }
     $r = $script:Row
-    $r.utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); $r.outcome = $Reason; $r.exitCode = $code; $r.detail = $(if ($Detail) { $Detail } else { $null })
+    $r.utc = (Get-WallUtc).ToString('yyyy-MM-ddTHH:mm:ssZ'); $r.outcome = $Reason; $r.exitCode = $code; $r.detail = $(if ($Detail) { $Detail } else { $null })
     $r.buildManifestSha256 = $(if ($Reason -cin @('STAGE_OK', 'STAGE_SKIP_ALREADY') -and $Manifest) { $Manifest } else { $null })
-    $r.timings.totalSec = [math]::Round(([DateTime]::UtcNow - $startedUtc).TotalSeconds, 1)
+    $r.timings.totalSec = [math]::Round((Get-NightlyElapsedSec), 1)
     if ($script:WriteRow) {
         $r.cFreeGiB.end = Get-CFree
         $r.reservationId = $script:ReservationId
@@ -247,7 +277,7 @@ function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [double]$Sec) 
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (adversary A1 on 7754d16e, siblings :235/:255/:467): $Sec is a remainder the caller sampled before this call, so the wait
     # also ends at the deadline itself, sampled right before it (capCut: the deadline, not $Sec, is what ended it; the caller types that STAGE_CAP_EXCEEDED)
     $waitSec = $Sec; $capCut = $false
-    if ($null -ne $script:Deadline) { $dl = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds; if ($dl -lt $waitSec) { $waitSec = [Math]::Max(0.0, $dl); $capCut = $true } }
+    if ($null -ne $script:BudgetSec) { $dl = (Get-NightlyLeftSec); if ($dl -lt $waitSec) { $waitSec = [Math]::Max(0.0, $dl); $capCut = $true } }
     if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
         try { [void]$ps.BeginStop($null, $null) } catch { }
         & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
@@ -274,7 +304,7 @@ function Stop-ShareUnreachable([string]$Detail) {
             $probeText = $(if ($TestShareRootProbe) { $TestShareRootProbe.ToString() } else { '' })
             $rb = Invoke-Bounded { param($mod, $r, $pt) Import-Module -Name $mod -Force -DisableNameChecking; if ($pt) { (Get-ShareRootAccess -Root $r -Probe ([scriptblock]::Create($pt))).State } else { (Get-ShareRootAccess -Root $r).State } } @($shareRootModule, $share, $probeText) $rbSec
             # r18 merge of #814: an answer that arrived after the deadline is never acted on (#814's rule for every share read), so it adds no typed line.
-            if ($rb.ok -and ([DateTime]::UtcNow - $script:Deadline).TotalSeconds -lt 0.0) { $state = [string]$rb.value }
+            if ($rb.ok -and (Get-NightlyLeftSec) -gt 0.0) { $state = [string]$rb.value }
         }
     } catch { $state = '' }
     if ($state -ceq 'ACCESS_DENIED') { Stop-Nightly 'SHARE_UNREACHABLE' "$Detail (the share root $share cannot be read: access denied, not a missing share; store the SMB credential for that host with cmdkey, tools\workstation\README.md step 6b)" -Verbatim @("SHARE_ACCESS_DENIED $share") }
@@ -284,7 +314,7 @@ function Stop-ShareUnreachable([string]$Detail) {
 function Get-ProbeSec([string]$What) {
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the total wall-clock cap, so every share probe gets min(-ProbeTimeoutSec,
     # what is left of it), in seconds with their fraction. Under 1 s left there is no read to make: the cap ran out (STAGE_CAP_EXCEEDED), nothing more is read or written.
-    $left = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
+    $left = (Get-NightlyLeftSec)
     if ($left -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out before $What could be read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left)" }
     [Math]::Min([double]$ProbeTimeoutSec, $left)
 }
@@ -298,7 +328,7 @@ function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
     if ($b.timedOut) { Stop-ShareUnreachable "reading $What : $($b.error)" }
     if (-not $b.ok) { Stop-ShareUnreachable "reading $What failed: $($b.error)" }
     # r9 fix iteration (adversary A1 on be203fe6, sibling): an answer that arrived after the deadline is never acted on
-    $past = ([DateTime]::UtcNow - $script:Deadline).TotalSeconds
+    $past = -(Get-NightlyLeftSec)
     if ($past -ge 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What answered $([Math]::Round($past, 2)) s after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
     $b.value
 }
@@ -325,11 +355,12 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     $soundSec = Get-ProbeSec "the soundness of the staged build of $commit"
     $atSeam = ($TestSoundnessCapAt -ieq 'first' -and $script:SoundnessReads -eq 0) -or ($TestSoundnessCapAt -ieq 'final' -and $FinalVerify)
     # r12 fix iteration 2 (adversary A1 on 95274c68): the test-only seam may only bring the deadline NEARER, never move it later than -MaxTotalSec put it
-    if ($atSeam -and $TestSoundnessCapLeftSec -ge 0) { $seamDeadline = [DateTime]::UtcNow.AddSeconds($TestSoundnessCapLeftSec); if ($seamDeadline -lt $script:Deadline) { $script:Deadline = $seamDeadline } }
+    # (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1: the budget is the monotonic one; the absolute instant is re-derived from it at the hand-off below.)
+    if ($atSeam -and $TestSoundnessCapLeftSec -ge 0) { $seamBudget = (Get-NightlyElapsedSec) + $TestSoundnessCapLeftSec; if ($seamBudget -lt $script:BudgetSec) { $script:BudgetSec = $seamBudget } }
     # r6 (Grok G6/G7 on #814): the manifest read keeps that probe bound, and the artifact hash (the package zip, exe and dll over SMB) gets its OWN budget, the
     # lease batch plan preflight's (-ArtifactTimeoutSec 300, Invoke-VenueLeaseBatch.ps1), never past what is left of -MaxTotalSec (-CallCapSec). r4/r5 hashed all
     # three inside the one 30 s probe, so a sound build whose package hashed slower than that was SHARE_UNREACHABLE at step 4 (G6) and at the final verify (G7).
-    $capSec = [Math]::Max(0.0, ($script:Deadline - [DateTime]::UtcNow).TotalSeconds)
+    $capSec = [Math]::Max(0.0, (Get-NightlyLeftSec))
     # r8 fix iteration 2 (adversary A1 on ad703c59): -CallCapSec 0 means NO cap to Get-VenueStagedBuildManifest, so a cap that ran out after Get-ProbeSec is never handed
     # over as 0 (a 300 s artifact hash then ran unbounded and a STAGED answer past the cap was STAGE_SKIP_ALREADY). Under the 1 s any read needs: no read, the cap ran out.
     # r9 (Grok G13 on #814): the final verify runs after the stage job was submitted, so its refusals say so (the wording of the final verify's cap refusal below it).
@@ -342,8 +373,9 @@ function Read-StagedSoundness([string]$When, [switch]$FinalVerify) {
     $script:SoundnessReads++
     $delayMs =$(if ($script:SoundnessReads -eq 1) { $TestSoundnessReadDelayMs } else { 0 })
     $artDelayMs = $(if (($TestSoundnessArtifactDelayAt -ieq 'first' -and $script:SoundnessReads -eq 1) -or ($TestSoundnessArtifactDelayAt -ieq 'final' -and $FinalVerify)) { $TestSoundnessArtifactDelayMs } else { 0 })
+    Sync-NightlyDeadline
     $r = try { Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $commit -VerifyArtifacts -TimeoutSec $soundSec -ArtifactTimeoutSec 300 -CallCapSec $capSec -CallDeadlineUtc $script:Deadline -TestReadDelayMs $delayMs -TestArtifactDelayMs $artDelayMs } catch { [pscustomobject]@{ state = 'UNREACHABLE'; error = ($_.Exception.Message -replace '\s+', ' ') } }
-    $leftAfter = ($script:Deadline - [DateTime]::UtcNow).TotalSeconds
+    $leftAfter = (Get-NightlyLeftSec)
     if ($r.state -ceq 'UNREACHABLE' -and $leftAfter -lt 1.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the soundness read of the staged build of $commit $When ran to the end of the $MaxTotalSec s cap (the manifest read $([Math]::Round($soundSec, 2)) s, the artifact hash at most 300 s, $([Math]::Round($capSec, 2)) s in all) and the cap ran out with no answer ($([Math]::Floor([Math]::Max(0.0, $leftAfter) * 100.0) / 100.0) s left): $($r.error); $notDone" }
     # r9 fix iteration (adversary A1 on be203fe6): the module bounds the read by -CallCapSec on its OWN clock, started when it is called, so a scheduling delay
     # between the cap sample above and the call lets an answer arrive after the deadline. An answer past the cap is never acted on, a STAGED one included (it was
@@ -359,7 +391,7 @@ function Test-StagedSound($Read, [string]$Hash) {
 
 function Format-StagedSoundness($Read) { "state=$($Read.state) manifest=$($Read.sha256) content=[$($Read.contentProblem)] artifacts=[$($Read.artifactProblem)] error=[$($Read.error)]" }
 
-function Get-RemainingSec { [int][Math]::Floor(($script:Deadline - [DateTime]::UtcNow).TotalSeconds) }
+function Get-RemainingSec { [int][Math]::Floor((Get-NightlyLeftSec)) }
 
 function Invoke-Child([string]$Label, [string]$Script, [string[]]$ArgList, [string]$CommandText = '', [hashtable]$ChildEnv = @{}) {
     # One child process, bounded by what is left of -MaxTotalSec, killed with its tree past it. Its output is kept in the call's work dir.
@@ -458,6 +490,8 @@ if ($WhatIf) {
 
 # ------------------------------------------------------------------ 2. once per night, one driver at a time --------------------------------------------------------------
 $script:Deadline = $startedUtc.AddSeconds($MaxTotalSec)
+$script:BudgetSec = [double]$MaxTotalSec
+$script:ClockStepOn = ($TestClockStepBackSec -gt 0)
 $script:Row.cFreeGiB.start = Get-CFree
 $script:Row.commitGiB = Get-CommitGiB
 # One driver per VENUE. No caller-selected path is in the name (CoS Dot b21fb3be): two -ReceiptFile values can no longer stage one venue side by side. Only the
@@ -516,7 +550,7 @@ $reachSec = Get-ProbeSec "the agent share cache '$cache'"
 $reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $reachSec
 if ($reach.timedOut -and ($reachSec -lt $ProbeTimeoutSec -or $reach.capCut)) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' did not answer in $($reach.error), the rest of the $MaxTotalSec s cap" }
 if (-not $reach.ok -or $reach.value -ne $true) { Stop-ShareUnreachable "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
-if (([DateTime]::UtcNow - $script:Deadline).TotalSeconds -ge 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' answered after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
+if ((Get-NightlyLeftSec) -le 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' answered after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
 
 # ------------------------------------------------------------------ 4. idempotency: what the cache already holds, by name --------------------------------------------------
 $script:WorkDir = Join-Path $BuildRoot ('runs\' + $startedUtc.ToString('yyyyMMddTHHmmssZ') + "-$s12")
@@ -583,7 +617,7 @@ Assert-Floors 'before the build'
 # From here on the venue cache can change, so the night is reserved first. A reservation that is not in the receipt afterwards is RECEIPT_IO_FAILED and nothing is staged.
 $rid = [guid]::NewGuid().ToString('N')
 $reservation = [ordered]@{
-    schema = 'mlv-app/venue-stage-nightly/v1'; utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); nightKey = $nightKey; venue = $Venue; sourceCommit = $commit
+    schema = 'mlv-app/venue-stage-nightly/v1'; utc = (Get-WallUtc).ToString('yyyy-MM-ddTHH:mm:ssZ'); nightKey = $nightKey; venue = $Venue; sourceCommit = $commit
     outcome = 'STAGE_RESERVED'; exitCode = $null; reservationId = $rid; resumes = @($script:Row.reconciled | ForEach-Object { $_.reservationId })
 }
 $why = 'not found when the receipt was read back'
@@ -626,6 +660,7 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if ($TestNotAfterSampleDelayMs -gt 0) { Start-Sleep -Milliseconds $TestNotAfterSampleDelayMs }
     # r3 (STAGE-NOTAFTER-THROW-TYPED-EXIT-1): a deadline that passes between the sample and the bound is the cap running out, so it is the typed cap exit,
     # never an untyped throw out of the driver.
+    Sync-NightlyDeadline   # VENUE-NIGHTLY-MONOTONIC-DEADLINE-1: the instant handed out is re-derived from the monotonic budget, after the delay above
     try {
         $notAfter = Get-DvJobNotAfter -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain -CallerCapSec $remain -CallerDeadlineUtc $script:Deadline -LaterHarvest:$LaterHarvest
     } catch {
@@ -677,7 +712,7 @@ if ($buildInCache) {
     $expected = $cached.hash
     $script:Row.jobIds.stage = $null
 } else {
-    $t0 = [DateTime]::UtcNow
+    $t0 = (Get-NightlyElapsedSec)
     $script:Row.jobIds.dllPair = $dllId
     $dllOutbox = "$dllShare\outbox"
     $pair = Read-Share "$dllOutbox\$dllId.result.json" $DllReuseByName @($reuseModule, $dllOutbox, $dllBaseId, $commit, $DllJobIdSuffix)
@@ -700,11 +735,11 @@ if ($buildInCache) {
         Say "DLL pair built: $($pair.Line)"
     }
     $dllDir = [string]$pair.ArtifactsDir
-    $script:Row.timings.dllPairSec = [math]::Round(([DateTime]::UtcNow - $t0).TotalSeconds, 1)
+    $script:Row.timings.dllPairSec = [math]::Round(((Get-NightlyElapsedSec) - $t0), 1)
     if ($script:Row.timings.dllPairSec -ge $FloorRecheckAfterSec) { Assert-Floors "after a $($script:Row.timings.dllPairSec) s DLL-pair wait, before the assemble" }
 
     # -------------------------------------------------------------- 7. assemble (this host, build-guard) --------------------------------------------------------------
-    $t0 = [DateTime]::UtcNow
+    $t0 = (Get-NightlyElapsedSec)
     $localJson = Join-Path $buildDir $names.buildManifestName
     $local = $null
     if (Test-Path -LiteralPath $localJson -PathType Leaf) {
@@ -718,11 +753,12 @@ if ($buildInCache) {
         $script:Row.steps.assemble = 'local-build-present'
         Say "assemble not needed: $localJson already holds $commit (sha256 $local)"
     } else {
-        if (Test-Path -LiteralPath $buildDir) { $buildDir = Join-Path $BuildRoot ("build-$s12-r" + [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')) }
+        if (Test-Path -LiteralPath $buildDir) { $buildDir = Join-Path $BuildRoot ("build-$s12-r" + (Get-WallUtc).ToString('yyyyMMddHHmmss')) }
         Say "assemble $commit -> $buildDir (build-guard)"
         # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: the assembler's machine heavy-slot wait is bounded by THIS call's deadline (an env var, so a
         # stand-in assembler with a fixed parameter list is untouched), not the 60 min default whose refusal re-queued the caller as the youngest ticket.
         # It is set in the assembler child's environment only, never this process's (r3, adversary 8eb98036-A3 sibling).
+        Sync-NightlyDeadline
         $a = Invoke-Child 'assemble' $Assembler @('-SourceCommit', $commit, '-DllPairDir', $dllDir, '-OutDir', $buildDir) -ChildEnv @{ MLV_HEAVY_SLOT_DEADLINE_UTC = $script:Deadline.ToString('o') }
         if ($a.timedOut) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the assembler was still running at the $MaxTotalSec s cap and was killed (see $($script:WorkDir)\assemble.log)" }
         # A machine heavy-slot REQUEUE (heavy-slot code 75/76/77, or its holder gone before the action) is a capacity refusal
@@ -740,10 +776,10 @@ if ($buildInCache) {
         $script:Row.steps.assemble = 'built'
     }
     $script:Row.buildDir = $buildDir
-    $script:Row.timings.assembleSec = [math]::Round(([DateTime]::UtcNow - $t0).TotalSeconds, 1)
+    $script:Row.timings.assembleSec = [math]::Round(((Get-NightlyElapsedSec) - $t0), 1)
 
     # -------------------------------------------------------------- 8. stage (suffix when the default JobId is spent and the cache does not match) ---------------------
-    $t0 = [DateTime]::UtcNow
+    $t0 = (Get-NightlyElapsedSec)
     $suffix = ''
     $submit = $true
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: the assemble can take hours, and another stager may have staged this sha meanwhile (2026-11-13: a second
@@ -780,7 +816,7 @@ if ($buildInCache) {
             $script:Row.jobIds.stage = $stageDefaultId
             Say "the cache already holds manifest $expected (verified by name); $stageDefaultId not submitted"
         } else {
-            $suffix = 'n' + [DateTime]::UtcNow.ToString('yyyyMMddHHmm')
+            $suffix = 'n' + (Get-WallUtc).ToString('yyyyMMddHHmm')
             Say "default stage JobId $stageDefaultId is spent (its result: $($prior.Reason)) but the cache holds $(if ($now2.present) { $now2.hash } else { 'NO build.json' }), not $expected; re-staging under $stageDefaultId-$suffix (an earlier STAGE_OK is never taken as proof of the cache)"
         }
     }
@@ -799,7 +835,7 @@ if ($buildInCache) {
         $script:Row.jobIds.stage = $stageId
         $u = Invoke-UmRun 'stage' $stageJob $sides $stageId $share 3600 'STAGE_FAILED'
         if ($u -ceq 'IN_USE') {
-            if (-not $suffix -and $attempt -eq 1) { $suffix = 'n' + [DateTime]::UtcNow.ToString('yyyyMMddHHmm'); Say "$stageDefaultId turned out spent at submission; re-staging under $stageDefaultId-$suffix"; continue }
+            if (-not $suffix -and $attempt -eq 1) { $suffix = 'n' + (Get-WallUtc).ToString('yyyyMMddHHmm'); Say "$stageDefaultId turned out spent at submission; re-staging under $stageDefaultId-$suffix"; continue }
             Stop-Nightly 'STAGE_FAILED' "$stageId is already in use; not re-submitted"
         }
         $sr = Read-Share "$share\outbox\$stageId.result.json" $StageReuseByName @($reuseModule, "$share\outbox\$stageId.result.json", $stageId, $commit, 'Stage')
@@ -812,11 +848,11 @@ if ($buildInCache) {
     if (-not $v.present -or $v.hash -cne $expected) {
         Stop-Nightly 'STAGE_VERIFY_MISMATCH' "after STAGE_OK the cache $cacheBuildJson hashes $(if ($v.present) { $v.hash } else { 'MISSING' }), not the assembled $expected; never recorded as staged"
     }
-    $script:Row.timings.stageSec = [math]::Round(([DateTime]::UtcNow - $t0).TotalSeconds, 1)
+    $script:Row.timings.stageSec = [math]::Round(((Get-NightlyElapsedSec) - $t0), 1)
 }
 
 # ------------------------------------------------------------------ 9. smoke runner ----------------------------------------------------------------------------------------
-$t0 = [DateTime]::UtcNow
+$t0 = (Get-NightlyElapsedSec)
 $script:Row.jobIds.smokeRunner = $runnerId
 if ($runnerPresent) {
     $script:Row.steps.smokeRunner = 'in-cache'
@@ -838,7 +874,7 @@ if ($runnerPresent) {
         Say "smoke-runner result: $($sr.Line)"
     }
 }
-$script:Row.timings.runnerSec = [math]::Round(([DateTime]::UtcNow - $t0).TotalSeconds, 1)
+$script:Row.timings.runnerSec = [math]::Round(((Get-NightlyElapsedSec) - $t0), 1)
 
 # ------------------------------------------------------------------ 10. the by-name verify the receipt records --------------------------------------------------------------
 $final = Read-Share $cacheBuildJson $HashByName @($cacheBuildJson)
@@ -855,6 +891,6 @@ if (-not (Test-StagedSound $finalSound $final.hash)) {
     Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the $Venue cache holds the expected $cacheBuildJson ($($final.hash)) but it is not a sound staged build ($(Format-StagedSoundness $finalSound)); never recorded as staged (the hub re-assembles)"
 }
 # r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the cap on the whole call, STAGE_OK included: an outcome reached after it is never reported as STAGE_OK.
-$overBy = ([DateTime]::UtcNow - $script:Deadline).TotalSeconds
+$overBy = -(Get-NightlyLeftSec)
 if ($overBy -gt 0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s cap ran out $([Math]::Round($overBy, 2)) s before the verified $cacheBuildJson ($($final.hash)) could be recorded; not recorded as staged" }
 Stop-Nightly 'STAGE_OK' "$cacheBuildJson sha256 $($final.hash) (read by name) and $runnerDirName are in the $Venue cache; Invoke-VenueBaseline finds this manifest" -Manifest $final.hash
