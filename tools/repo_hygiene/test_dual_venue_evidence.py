@@ -7564,9 +7564,18 @@ class LegSpecSchemaTests(unittest.TestCase):
         a leg called native reports a 24 fps run as its evidence. So every such leg names its arm: 'on' for a conform leg, 'off' for every other one."""
         legs = sorted((DV / "legs").glob("m16-145[67]-*.json"))
         self.assertGreater(len(legs), 20)
+        exempt = 0
         for path in legs:
             leg = json.loads(path.read_text(encoding="utf-8"))
+            if leg.get("legType") == "export":
+                # EXPORT-VENUE-LEG-1 r2: an export leg plays nothing (MLVApp --batch), so no arm can silently halve its pace, and naming one would make it INVALID:
+                # Get-DvConformArmVerdict (Invoke-VenueLeg.ps1, run on every PASS/FAIL) finds no playback_smoke.conform line in an export run and blocks, and the
+                # export shape (Get-DvExportShapeRefusal) takes no playbackConform. The export legs are pinned by test_dual_venue_export_leg.
+                self.assertNotIn("playbackConform", leg["generatorArgs"], path.name)
+                exempt += 1
+                continue
             self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on" if "-conform-" in path.name else "off", path.name)
+        self.assertEqual(exempt, 2, "the two M16-1456 export legs are the only exempt ones")
 
     def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
         """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its
