@@ -443,8 +443,13 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     ffmpeg back-pressure, finish, verify) are reported beside the table, not as a stage.
   * The app does not time the untimed part per stage, and the rendered path has no dual-ISO stage. For that reason ProRes legs carry no
     `dualIsoClassAgrees` criterion. Both gaps belong to successor `EXPORT-RENDER-PIPE-TIMING-1` (product code).
-* **Time budget**: the job timeout is one identity read of the clip (at the measured cold rate), plus the quiescence samples, plus the export wait.
-  The export wait is `max(900, 4 x maxFrames)` s plus another identity-read allowance, for the app's own re-read. No smoke-runner ceiling applies.
+* **Time budget** (`Get-ExportJobTimeBudget`): the job timeout is one margined identity read of the clip (at the measured cold rate), plus the quiescence
+  samples (3 x 12 + 30 = 66 s), plus the export wait, plus a fixed 600 s margin. The export wait is `max(900, 4 x maxFrames)` s plus another identity-read
+  allowance, for the app's own re-read. The export wait is the job's own `WaitForExit`, so the smoke runner's 3600 s process ceiling does not cap it.
+  **The shared 3600 s smoke ceiling is still enforced on the read allowance** (CoS I1): `export-stage-job.ps1` calls
+  `Get-AttrCudaLegTimeBudget -ShareSmokeCeiling` (`AttrCudaArtifacts.psm1`) with every fixed second at 0. When the margined identity read is over 3600 s,
+  the allowance is held to 3600 s. When even the **minimum** identity read of the clip (input MB divided by the cold rate, no margin) is over 3600 s,
+  the generator refuses with `ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING` and writes no job. A time budget above that ceiling is open successor work (A2).
 * **Outcomes**:
 
   | Job result | Outcome |
