@@ -248,6 +248,17 @@ class OutputShapeTests(unittest.TestCase):
         self.assertIn("gitignored", text)
         self.assertNotIn("dual-lane/queue.json", text)
 
+    def test_header_states_the_true_refresh_cadence_not_a_check_caller(self) -> None:
+        # No caller runs `--check`; the hub renders an untracked live copy hourly and a drift
+        # detector files a refresh card. The tracked header must say that, not claim a check.
+        text = render_roadmap.render(load_fixture())
+        self.assertNotIn("The hub checks freshness with `--check`", text)
+        self.assertIn("heartbeat/roadmap-live.md", text)
+        self.assertIn("every hour", text)
+        self.assertIn("7 or more days old", text)
+        self.assertIn("refresh card", text)
+        self.assertIn("`--check` is a manual tool", text)
+
     def test_ends_with_one_newline_and_has_no_carriage_returns(self) -> None:
         text = render_roadmap.render(load_fixture())
         self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
