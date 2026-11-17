@@ -3325,9 +3325,6 @@ class EvidenceFactory(RunnerHarness):
         """An INDEPENDENT mirror of Get-DvPlaybackEvidence: the playback block a sound receipt carries, computed from the evidence files."""
         log = (ev / "logs" / "smoke-run.log").read_bytes()
         lines = log.decode("utf-8").splitlines()
-        session = next(re.search(r"measured_session id=(\d+)", l).group(1) for l in lines if "playback_smoke.measured_session" in l)
-        summary_line = [l for l in lines if re.search(rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]
-        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", summary_line))
         result = json.loads((ev / "result.json").read_text(encoding="utf-8"))
         summary = json.loads((ev / "summary.json").read_text(encoding="utf-8"))
         manifest = json.loads((ev / "evidence-manifest.json").read_text(encoding="utf-8")) if (ev / "evidence-manifest.json").exists() else {}
@@ -3366,7 +3363,36 @@ class EvidenceFactory(RunnerHarness):
             return l[:i] if re.search(r":([0-9]+|%2)\)$", l) and l.rfind(":") > i + 2 else None
         # r19 (r19 adversary advisory A2): the record is SELECTED by its body too (the text before its first ` (`), so a location path holding the
         # marker never adds a record; a selected record with an unreadable tail is still None (never read whole)
-        iso = [body(l) for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l if loc(l) < 0 else l[:loc(l)])]
+        # r24 (opus key3 r23 hardening A2 = sol r23 ANCHOR-INDEPENDENT-EVIDENCE-MIRROR-1): every record (the measured-session marker, the summary, the
+        # pacing_isolated record) is selected only where its marker STARTS the record body, after at most three `[...] ` prefix groups, like the
+        # module's $script:DvRecordStart; before r24 an unanchored re.search took `note: interaction_trace event=automation.pacing_isolated ...`
+        rs = r"^(?:\[[^\]]*\] ){0,3}"
+
+        # r24 (opus key3 r23 INV-1, the module's ConvertTo-DvQuoteMaskedBody): a quoted span opens at any `"` or `'` and closes at the next quote of
+        # the same kind (unclosed: to the end of the body); every `=` inside it is masked to U+001A, so quoted text supplies no field here either
+        def mask(l: str) -> str:
+            out, q = [], None
+            for ch in l:
+                if q is None:
+                    q = ch if ch in "\"'" else None
+                    out.append(ch)
+                elif ch == q:
+                    q = None
+                    out.append(ch)
+                else:
+                    out.append("\x1a" if ch == "=" else ch)
+            return "".join(out)
+
+        def read(l: str) -> str:
+            b = body(l)
+            return mask(b if b is not None else l[:loc(l)] + " (LOCATION_UNREADABLE)")
+
+        sel = [l if loc(l) < 0 else l[:loc(l)] for l in lines]
+        session = next(m.group(1) for s in sel for m in [re.match(rs + r"playback_smoke\.measured_session id=([0-9]+)(?:\s|$)", s)] if m)
+        summary_line = read([l for l, s in zip(lines, sel) if re.match(rs + rf"playback_smoke\.summary session={session}(\s|$)", s)][-1])
+        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", summary_line))
+        iso = [None if body(l) is None else mask(body(l)) for l in lines
+               if re.match(rs + r"interaction_trace event=automation\.pacing_isolated(\s|$)", l if loc(l) < 0 else l[:loc(l)])]
         return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
                 "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
                 "wrapped": int(f["wrapped"]) != 0, "wrapCount": int(f["wrap_count"]),
@@ -3386,8 +3412,21 @@ class EvidenceFactory(RunnerHarness):
         the app's own summary line says it rendered at."""
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
         lines = (ev / "logs" / "smoke-run.log").read_text(encoding="utf-8").splitlines()
-        session = next(re.search(r"measured_session id=(\d+)", l).group(1) for l in lines if "playback_smoke.measured_session" in l)
-        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", [l for l in lines if re.search(rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]))
+        # r24 (sol r23 ANCHOR-INDEPENDENT-EVIDENCE-MIRROR-1 sibling): the session and the summary are selected where the marker STARTS the record (the
+        # module's $script:DvRecordStart), and the summary's quoted `=` is masked (the module's ConvertTo-DvQuoteMaskedBody), as in derive_block
+        rs = r"^(?:\[[^\]]*\] ){0,3}"
+        session = next(m.group(1) for l in lines for m in [re.match(rs + r"playback_smoke\.measured_session id=([0-9]+)(?:\s|$)", l)] if m)
+        summary_line = [l for l in lines if re.match(rs + rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]
+        masked, q = [], None
+        for ch in summary_line:
+            if q is None:
+                q = ch if ch in "\"'" else None
+            elif ch == q:
+                q = None
+            elif ch == "=":
+                ch = "\x1a"
+            masked.append(ch)
+        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", "".join(masked)))
         requested = int(spec["scaleFactor"])
         accepted = int(spec.get("acceptedEffectiveScale", {}).get(backend, requested))
         effective = int(f["scale_active_last"]) if "scale_active_last" in f else "UNKNOWN"
@@ -3514,6 +3553,45 @@ class IsolationMirrorSelectsRecordsByTheirBodyTests(unittest.TestCase):
             (ev / "result.json").write_text("{}", encoding="utf-8")
             (ev / "summary.json").write_text("{}", encoding="utf-8")
             self.assertIs(EvidenceFactory.derive_block(ev)["settingsIsolated"], True)
+
+    @staticmethod
+    def mirror(log: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="iso-mirror-") as d:
+            ev = Path(d)
+            (ev / "logs").mkdir()
+            (ev / "logs" / "smoke-run.log").write_bytes(log.encode("utf-8"))
+            (ev / "result.json").write_text("{}", encoding="utf-8")
+            (ev / "summary.json").write_text("{}", encoding="utf-8")
+            return EvidenceFactory.derive_block(ev)
+
+    SUMMARY = "playback_smoke.summary session=3 source_advanced={n} required_source_frames=600 native_fps=60 pace_fps=60 fps_override=0 wrapped=0 wrap_count=0"
+
+    def test_r24_a2_an_embedded_isolation_marker_adds_no_record(self) -> None:
+        # opus key3 r23 hardening A2 = sol r23 ANCHOR-INDEPENDENT-EVIDENCE-MIRROR-1, its input verbatim: production selects a record only where its
+        # marker starts the record body ($script:DvRecordStart); the mirror's unanchored re.search took this line and read settingsIsolated=true
+        log = ("playback_smoke.measured_session id=3\nnote: interaction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               + self.SUMMARY.format(n=600) + "\n")
+        self.assertIs(self.mirror(log)["settingsIsolated"], False)
+        # and a record-start prefix ([utc] [LEVEL] [0x<thread>]) is still the start of the record
+        log = ("playback_smoke.measured_session id=3\n[2026-11-17T00:00:00.000Z] [INFO] [0x1] interaction_trace event=automation.pacing_isolated "
+               "settings_store=run_scoped\n" + self.SUMMARY.format(n=600) + "\n")
+        self.assertIs(self.mirror(log)["settingsIsolated"], True)
+
+    def test_r24_an_embedded_session_or_summary_marker_selects_nothing(self) -> None:
+        # the mirror's session (:3328) and summary (:3329) selections, anchored like production
+        log = ("run_metadata cmd playback_smoke.measured_session id=9\nplayback_smoke.measured_session id=3\n"
+               "interaction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               + self.SUMMARY.format(n=600) + "\nx " + self.SUMMARY.format(n=1) + "\n")
+        self.assertEqual(self.mirror(log)["sourceAdvanced"], 600)
+
+    def test_r24_quoted_text_supplies_no_mirror_field(self) -> None:
+        # the opus key3 r23 repro on the mirror: a later quoted source_advanced and a quoted settings_store supply nothing
+        log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               + self.SUMMARY.format(n=1) + ' note="harmless (text)" diagnostic="prefix source_advanced=600 end"\n')
+        self.assertEqual(self.mirror(log)["sourceAdvanced"], 1)
+        log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated note='x settings_store=run_scoped'\n"
+               + self.SUMMARY.format(n=600) + "\n")
+        self.assertIs(self.mirror(log)["settingsIsolated"], False)
 
 
 class PwshHarnessClassesCarryTheWindowsSkipTests(unittest.TestCase):
@@ -16345,6 +16423,114 @@ class QuotedValueIsNeverALocationTests(unittest.TestCase):
         text = Path(__file__).read_text(encoding="utf-8")
         self.assertIn("def loc(l: str) -> int:", text)
         self.assertIn("l if loc(l) < 0 else l[:loc(l)]", text)
+
+
+@requires_windows_pwsh
+class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker on b8f8e6e6 = sol r23 blocker = r23 adversary A1): text inside a quoted
+    span never supplies a `<key>=` field to any DualVenueRunner reader. On b8f8e6e6 the r21 location rule stepped over an earlier =-free quoted span holding
+    ` (`, found no location, and the whole line reached the last-wins summary reader, so a later quoted `source_advanced=600` replaced the measured 1 and
+    the clip-length verdict read valid (master 42597216 read 1, invalid). r24: every record body is quote-masked (ConvertTo-DvQuoteMaskedBody, applied by
+    Get-DvLogRecordBodies): a span opens at any `"` or `'` and closes at the next quote of the same kind (an unclosed span runs to the end of the body),
+    and an `=` inside a span is never a field separator for any reader."""
+
+    NONCE = "0123456789abcdef0123456789abcdef"
+    WINDOW = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+    SUMMARY = ("playback_smoke.summary session=3 source_advanced=1 required_source_frames=600 native_fps=60 pace_fps=60 fps_override=0 wrapped=0 "
+               "wrap_count=0 run_nonce=0123456789abcdef0123456789abcdef")
+    PLAIN_SUMMARY = "playback_smoke.summary session=3 reason=reached presented_frames=600"
+
+    def each(self, expr: str, logs: list[str]) -> list:
+        """`expr` evaluated once per log ($log), in one pwsh process; each result is wrapped as @{ v = ... } so a $null is kept in place."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "logs.json"
+            path.write_text(json.dumps(logs), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$ls = Get-Content -Raw -LiteralPath $env:DVE_LOGS -Encoding utf8 | ConvertFrom-Json\n"
+                "$sha = 'a' * 64\n"
+                "$summary = [pscustomobject]@{ clipId = 'M16-1457'; fixtureRehearsal = $false }\n"
+                "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+                "@(foreach ($log in @($ls)) { $log = [string]$log; [ordered]@{ v = $(" + expr + ") } }) | ConvertTo-Json -Compress -AsArray -Depth 5",
+                DVE_LOGS=str(path), DVE_NONCE=self.NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return [o["v"] for o in out]
+
+    PLAYBACK = ("$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $null -ResultJson $result -LogText $log -LogSha256 $sha "
+                "-ExpectedClipId 'M16-1457'; [ordered]@{ sourceAdvanced = $pb.sourceAdvanced; valid = $pb.valid }")
+
+    def test_r24_key3_repro_a_later_quoted_field_never_replaces_the_measured_count(self) -> None:
+        tail = ' note="harmless (text)" diagnostic="prefix source_advanced={n} end"'
+        cases = {
+            # opus key3 r23 repro, verbatim, and the sol r23 variants (601, 0)
+            "key3 repro": self.WINDOW + self.SUMMARY + tail.format(n=600),
+            "601": self.WINDOW + self.SUMMARY + tail.format(n=601),
+            "0": self.WINDOW + self.SUMMARY + tail.format(n=0),
+            # opus key3 INV-1 row 4: no ` (` at all, so the body reader never ran (master read 600 too)
+            "no parenthesis": self.WINDOW + self.SUMMARY + ' diagnostic="prefix source_advanced=600 end"',
+            "single quote": self.WINDOW + self.SUMMARY + " diagnostic='prefix source_advanced=600 end'",
+            "unclosed quote": self.WINDOW + self.SUMMARY + ' diagnostic="prefix source_advanced=600',
+            "with a location": self.WINDOW + self.SUMMARY + tail.format(n=600) + " (C:/build/platform/qt/MainWindow.cpp:31150)",
+        }
+        for name, v in zip(cases, self.each(self.PLAYBACK, list(cases.values()))):
+            with self.subTest(case=name):
+                self.assertEqual((v["sourceAdvanced"], v["valid"]), (1, False), v)
+        # control: the measured count outside every quote is read, an =-free quoted ` (` still is no location, and a real 600 is valid
+        ok = self.each(self.PLAYBACK, [self.WINDOW + self.SUMMARY.replace("source_advanced=1 ", "source_advanced=600 ") + ' note="harmless (text)"'])
+        self.assertEqual((ok[0]["sourceAdvanced"], ok[0]["valid"]), (600, True), ok)
+
+    def test_r24_the_class_sweep_readers_take_no_field_from_a_quoted_span(self) -> None:
+        iso = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated {note}\n" + self.SUMMARY
+        look = ("playback_smoke.measured_session id=3\n[INFO] interaction_trace event=gui_smoke.visual_state {note}\n" + self.PLAIN_SUMMARY)
+        unpaced = "playback_smoke.measured_session id=3\n" + self.PLAIN_SUMMARY + "\nplayback_smoke.pace_unpaced session=3 {note}"
+        conform = "playback_smoke.measured_session id=3\n" + self.PLAIN_SUMMARY + "\nplayback_smoke.conform session=3 {note}"
+        rows = [
+            # $runScoped (Get-DvSmokeSummaryFields :1156): a quoted declaration is no settings_store field
+            ("(Get-DvSmokeSummaryFields -LogText $log).settingsIsolated",
+             [iso.format(note='note="prefix settings_store=run_scoped end"'), iso.format(note="note='prefix settings_store=run_scoped end'")],
+             False, iso.format(note="settings_store=run_scoped"), True),
+            # Get-DvLookAssistEvidence (:2396 :2403 :2413 :2414)
+            ("(Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $log).verdict",
+             [look.format(note='note="prefix look_assist_enabled=1 look_assist_flavor=cinematic end"'),
+              look.format(note="note='prefix look_assist_enabled=1 look_assist_flavor=cinematic end'")],
+             "NOT_HONOURED", look.format(note="look_assist_enabled=1 look_assist_flavor=cinematic"), "HONOURED"),
+            # Get-DvUnpacedEvidence (:1606) through Get-DvSmokeSessionLineRead (:2532)
+            ("(Get-DvUnpacedEvidence -Spec (@{ generatorArgs = @{ unpaced = $true } }) -LogText $log).verdict",
+             [unpaced.format(note='note="prefix active=1 drop_frame=0 end"'), unpaced.format(note="note='prefix active=1 drop_frame=0 end'")],
+             "NOT_HONOURED", unpaced.format(note="active=1 drop_frame=0"), "HONOURED"),
+            # the conform line Get-DvPlaybackEvidence parses at :1385 (Get-DvSmokeSummaryFields conformLine), read with :1385's own regex
+            ("@([regex]::Matches([string](Get-DvSmokeSummaryFields -LogText $log).conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\\S+)') | "
+             "Where-Object { $_.Groups['k'].Value -ceq 'conform_active' }).Count",
+             [conform.format(note='note="x conform_active=1 y"'), conform.format(note="note='x conform_active=1 y'")],
+             0, conform.format(note="conform_active=1"), 1),
+        ]
+        for expr, quoted, refused, control, read in rows:
+            with self.subTest(reader=expr[:60]):
+                got = self.each(expr, quoted + [control])
+                self.assertEqual(got, [refused] * len(quoted) + [read], got)
+
+    def test_r24_a_single_quoted_wake_payload_is_never_read(self) -> None:
+        # opus key3 r23 hardening = sol r23 INV-6 row 2, its input verbatim: :2153 refused only a double quote, so this was HONOURED (a span that
+        # ENDS at the value, `delivery_kind=post'`, is refused on b8f8e6e6 already, by the value `post'`; the word after it is what makes it read)
+        window = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        quoted = ("playback_due_wake armed=1 note='prefix fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 "
+                  "delivery_kind=post end'")
+        posted = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        cases = [(posted, window + quoted), ({}, window + quoted.replace("delivery_kind=post", "delivery_kind=send")),
+                 (posted, window + quoted + " (C:/build/platform/qt/MainWindow.cpp:21141)")]
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for i, v in enumerate(out):
+            with self.subTest(case=i):
+                self.assertIsNone(v["observed"], v)
+                if i != 1:
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_r24_the_look_label_reader_takes_no_record_from_a_quoted_span(self) -> None:
+        # Get-DvLookLabelEvidence read raw lines unanchored, so a label record spelled inside another record's quoted span answered for the app
+        inner = 'gui_smoke.look_label shown="Look: A" expected="Look: A" surface=windowed_status_bar show_in_fullscreen=1 wait_ms=0'
+        got = self.each("(Get-DvLookLabelEvidence -LogText $log).source", [
+            "interaction_trace event=x note='" + inner + "'", "interaction_trace event=x note='" + inner, inner])
+        self.assertEqual(got, ["absent from the run log", "absent from the run log", "gui_smoke.look_label"], got)
 
 
 @requires_windows_pwsh

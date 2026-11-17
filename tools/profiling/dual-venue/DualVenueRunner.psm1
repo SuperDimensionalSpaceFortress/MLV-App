@@ -1627,7 +1627,10 @@ function Get-DvLookLabelEvidence {
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $m = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        foreach ($line in ($LogText -split "`r?`n")) {
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 class sweep): the record bodies, quote-masked (Get-DvLogRecordBodies), so a
+        # label record spelled inside another record's quoted span (`note='gui_smoke.look_label shown="a" ... wait_ms=0'`) has no `shown=` and answers
+        # nothing; the app's own label text holds no `=`, so its shown / expected values read as before. Before r24 this reader split the raw text.
+        foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
             # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR upper-case look_label record is read as every other culture reads it
             $labelMatch = [regex]::Match($line, 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)', $script:DvCi)
             if ($labelMatch.Success) {
@@ -2150,7 +2153,9 @@ function Get-DvDueWakeDeliveryEvidence {
         # r23 (r23 adversary A1 on 9b78199f, its input: `playback_due_wake armed=1 note="diagnostic fired=1 ... delivery_kind=post end"` was HONOURED):
         # the app's wake record is numeric and enum fields only (MainWindow::playbackDueWakeSummaryLine writes no quote), so a wake record whose body
         # holds a double quote is not the app's shape and its key shape is unreadable on both paths; text inside a quote never supplies a field here
-        if ($c.IndexOf([char]'"') -ge 0) { $keyShapeUnreadable = $true }
+        # r24 (opus key3 r23 hardening = sol r23 INV-6, its input: `note='prefix fired=1 ... delivery_kind=post end'` was HONOURED): a single quote
+        # too. The candidates are quote-masked bodies (Get-DvLogRecordBodies), so the quoted `=` already supplies no field; the refusal names the shape
+        if ($c.IndexOfAny($script:DvQuoteChars) -ge 0) { $keyShapeUnreadable = $true }
         foreach ($key in @('delivery_kind', 'delivery', 'disabled', 'armed', 'fired', 'post_rescued', 'post_counts_settled')) {
             if ([regex]::Matches($c, '(?<!' + $script:DvNameChar + ')' + $key + '(?!' + $script:DvNameChar + ')', $script:DvCi).Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
         }
@@ -2608,8 +2613,10 @@ function Get-DvLocationOpenIndex {
             if ($k -lt $q - 1 -and ($k -lt 0 -or $Line[$k] -ceq [char]' ')) {
                 $c = $Line.IndexOf('"', $q + 2, [StringComparison]::Ordinal)
                 # r21 adversary A1 on bdb3ec8c (its input: `playback_due_wake armed=1 note="diagnostic ( fired=1 ... delivery_kind=post end)"` was
-                # HONOURED): a span that holds an `=` is no quoted value, so text inside a quote never supplies a `<key>=` field to any reader; its
-                # ` (` stays the location candidate and the record is refused as before r21
+                # HONOURED): a span that holds an `=` is never stepped over here, so its ` (` stays the location candidate and the record is refused as
+                # before r21. r24 (opus key3 r23 blocker on b8f8e6e6): this rule alone does NOT keep quoted text from supplying a field (a later quoted
+                # `source_advanced=600` after an =-free quoted ` (` reached the summary reader); that guarantee is ConvertTo-DvQuoteMaskedBody's, which
+                # Get-DvLogRecordBodies applies to every record body before any reader sees it
                 if ($c -ge 0 -and ($c -eq $n - 1 -or $Line[$c + 1] -ceq [char]' ') -and $Line.IndexOf('=', $q + 2, $c - $q - 2, [StringComparison]::Ordinal) -lt 0) { $i = $c + 1; continue }
             }
             $i = $q + 2
@@ -2664,17 +2671,54 @@ function Get-DvLogRecordBody {
     $body + $script:DvLocationUnreadable
 }
 
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker on b8f8e6e6, sol r23 blocker, r23 adversary A1): what an `=` inside a quoted
+# span of a record body becomes (ConvertTo-DvQuoteMaskedBody). U+001A is no name character, no whitespace, no quote and no `=`, and the app never writes it
+# (log_line_field::fieldValue maps every C0 control to '_'), so a masked `<key>=` is no `<key>=` for any reader, and a value stays one token.
+$script:DvQuotedEqualsMask = [char]0x1A
+$script:DvQuoteChars = [char[]]@([char]'"', [char]"'")
+
+function ConvertTo-DvQuoteMaskedBody {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 INV-1 blocker): one record body with every `=` inside a quoted span replaced by
+    $script:DvQuotedEqualsMask, so text inside a quote never supplies a `<key>=` field to any reader. A quoted span opens at ANY `"` or `'` of the body
+    (whatever precedes it: `k="v"`, `render "free text"`, `x'y`) and closes at the next quote of the SAME kind; the other kind inside it is plain text;
+    a span with no closer runs to the end of the body. Everything else is unchanged (the quotes themselves, the words inside a span, so a quoted
+    `session` or `settings_store` is still a MENTION for the readers that refuse a second mention). It may refuse (a lone apostrophe in an unquoted
+    value masks every later `=`, so those fields read as absent); it never forges. Linear: IndexOf / IndexOfAny only, each position visited once.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Body)
+    if ([string]::IsNullOrEmpty($Body) -or $Body.IndexOf([char]'=') -lt 0) { return $Body }
+    $i = $Body.IndexOfAny($script:DvQuoteChars)
+    if ($i -lt 0) { return $Body }
+    $chars = $Body.ToCharArray()
+    while ($i -ge 0) {
+        $close = $Body.IndexOf($Body[$i], $i + 1)
+        $end = $(if ($close -lt 0) { $Body.Length } else { $close })
+        for ($j = $Body.IndexOf([char]'=', $i + 1); $j -ge 0 -and $j -lt $end; $j = $Body.IndexOf([char]'=', $j + 1)) { $chars[$j] = $script:DvQuotedEqualsMask }
+        if ($close -lt 0) { break }
+        $i = $Body.IndexOfAny($script:DvQuoteChars, $close + 1)
+    }
+    [string]::new($chars)
+}
+
 function Get-DvLogRecordBodies {
     <#
     .SYNOPSIS
     PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 on #726): every line of a run log as its record body (Get-DvLogRecordBody), in order, so a
     reader matches record markers on the body only and a build path that holds `playback_smoke.<marker> session=<n>` never adds or selects a record.
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker): and quote-masked (ConvertTo-DvQuoteMaskedBody), AFTER the location cut
+    (the cut reads the raw line; a quote in a location path never reaches the mask). This is the one place every DualVenueRunner field reader takes its
+    records from (Get-DvSmokeSummaryFields, Get-DvSmokeSessionLineRead, the due-wake, look-assist, prep-route, recon-release, team-partition, worker-threads
+    and look-label readers), so no `<key>=` inside a quoted span supplies a field on any path.
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
     $lines = $LogText -split "`r?`n"
     # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
+    # r24: only a body that holds a quote can hold a quoted span; the rest are returned as they are without a call
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOfAny($script:DvQuoteChars) -ge 0) { $lines[$i] = ConvertTo-DvQuoteMaskedBody -Body $lines[$i] } }
     , [string[]]$lines
 }
 
