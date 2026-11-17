@@ -34,7 +34,8 @@ ROADMAP_PATH = REPO_ROOT / "docs" / "roadmap.md"
 CHECKER_PATH = REPO_ROOT / "tools" / "coordination" / "check_roadmap_queue_parity.py"
 
 # OWNER-ASK-PARK-GUARD-1: an owner ask of another kind is on the table too, its kind cell reading "<kind> (owner)".
-ROADMAP_ROW_RX = re.compile(r"^\|\s*\d+\s*\|\s*(\S+)\s*\|\s*(product|playback|[^|]*?[^|\s] \(owner\))\s*\|", re.MULTILINE)
+# (r2, adversary advisory A4 on 8ba4f8ab) any owner kind cell counts, a blank kind included ("|  (owner) |"): the cell only has to end in "(owner)".
+ROADMAP_ROW_RX = re.compile(r"^\|\s*\d+\s*\|\s*(\S+)\s*\|\s*(product|playback|[^|]*?\(owner\))\s*\|", re.MULTILINE)
 GENERATED_FROM_RX = re.compile(r"^generated_from: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", re.MULTILINE)
 # docs/22 working tier is 25000 soft; the rendered roadmap grows with the open backlog.
 ROADMAP_BUDGET_BYTES = 20000
@@ -96,6 +97,10 @@ class RoadmapQueueParityTests(unittest.TestCase):
         for kind in ("qa2", "venue_tooling", "hub-tooling", "CI-flake", "qa tooling"):   # pass 2 A5: a kind with a space
             line = "| 3 | OWNER-1 | %s (owner) | queued | 2026-10-22 | - |" % kind
             self.assertEqual(ROADMAP_ROW_RX.findall(line), [("OWNER-1", "%s (owner)" % kind)], kind)
+        for kind in ("", " "):   # r2 advisory A4: the renderer emits '| 3 | OWNER-1 |  (owner) | ...' for a blank kind
+            line = "| 3 | OWNER-1 | %s (owner) | queued | 2026-10-22 | - |" % kind
+            self.assertEqual([c for c, _k in ROADMAP_ROW_RX.findall(line)], ["OWNER-1"], repr(kind))
+        self.assertEqual(ROADMAP_ROW_RX.findall("| - | ... and 30 more open owner asks of another kind (card-queue.json) | - | - | - | - |"), [])
 
     def test_no_duplicate_card_ids_on_the_roadmap(self) -> None:
         ids = [card_id for card_id, _kind in _roadmap_rows()]

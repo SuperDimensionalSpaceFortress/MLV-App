@@ -548,19 +548,25 @@ class OwnerAskTests(unittest.TestCase):
         self.assertIn("PARKED-E", reason)
 
     def test_a_terminal_owner_park_is_not_an_undelivered_ask(self) -> None:
+        # r2 A1: only the structured `resolution` field (written by Update-CardQueue.ps1 -Set -State parked -Resolution) closes an ask.
         data = self.owner_board()
         data["rows"] += [
             row("OWNER-DONE-PARKED", "parked", "2026-10-14T08:00:00Z", kind="factory", priority=2, origin="owner",
-                notes="closed DONE by HUB-TICK 20261027T0931Z, no PR by design"),
+                notes="closed DONE by HUB-TICK 20261027T0931Z, no PR by design", resolution="done"),
             row("OWNER-SUPERSEDED-PARKED", "parked", "2026-10-14T08:00:00Z", kind="unclassified", priority=3, origin="owner",
-                notes="superseded by OWNER-OTHER-3 r2"),
+                notes="superseded by OWNER-OTHER-3 r2", resolution="superseded"),
+            row("OWNER-PRODUCT-NOGO", "parked", "2026-10-14T08:00:00Z", kind="product", priority=2, origin="owner",
+                notes="design r1 says no", resolution="no_go"),
         ]
         text = render_roadmap.render(data)
         asks = text.split("## Parked owner asks")[1].split("## Parked with reason")[0]
         reason = text.split("## Parked with reason")[1]
-        for card in ("OWNER-DONE-PARKED", "OWNER-SUPERSEDED-PARKED"):
+        for card in ("OWNER-DONE-PARKED", "OWNER-SUPERSEDED-PARKED", "OWNER-PRODUCT-NOGO"):
             self.assertNotIn(card, asks)
-            self.assertIn(card, reason)
+        # a resolved owner ask of another kind is tooling churn like any other: counted on one line, not listed one by one
+        self.assertNotIn("OWNER-DONE-PARKED", reason)
+        self.assertIn("- 2 owner asks of another kind are closed with a resolution (done 1, superseded 1; card-queue.json)", reason)
+        self.assertIn("- OWNER-PRODUCT-NOGO (P2, owner ask, no_go): design r1 says no", reason)
         self.assertIn("OWNER-UNC-PARKED", asks)
 
     # adversary pass 1 (review-adversary-OWNER-ASK-PARK-GUARD-1-r1-83d7e0ff) A1/A2/A3: each finding's input, verbatim.
@@ -578,12 +584,15 @@ class OwnerAskTests(unittest.TestCase):
             with self.subTest(notes=notes):
                 self.assertIn("OWNER-1", self.owed(self.one_owner(notes)))
 
-    def test_a1_a_terminal_park_word_still_moves_the_row(self) -> None:
+    def test_r2_a1_a_terminal_park_word_without_a_resolution_stays_owed(self) -> None:
+        # deny by default (fleet card mlv-app/spelling-chase-scanner-needs-a-deny-by-default-name): no note wording closes an owner ask
         for notes in ("closed DONE by HUB-TICK 20261027T0931Z", "r3 DONE verdict SPEEDUP", "design r1 NO_GO",
                       "parked DUPLICATE of OTHER-1", "superseded by OTHER-3 r2 DONE", "shipped as OTHER-2 r2",
                       "closed by HUB RULING 2026-11-05T01:19:19Z", "question answered, no successor", "not new work: legacy row"):
             with self.subTest(notes=notes):
-                self.assertNotIn("OWNER-1", self.owed(self.one_owner(notes)))
+                self.assertIn("OWNER-1", self.owed(self.one_owner(notes)))
+                for resolution in render_roadmap.RESOLUTIONS:
+                    self.assertNotIn("OWNER-1", self.owed(self.one_owner(notes, resolution=resolution)))
 
     def test_a2_age_is_elapsed_whole_days_not_a_date_difference(self) -> None:
         data = self.one_owner("waiting on #123", pinned_utc="2026-10-22T23:59:00Z")
@@ -615,10 +624,12 @@ class OwnerAskTests(unittest.TestCase):
             with self.subTest(notes=notes):
                 self.assertIn("OWNER-1", self.owed(self.one_owner(notes, stamp="2026-10-20T00:00:00Z")))
 
-    def test_p2_a2_any_whitespace_inside_a_terminal_phrase(self) -> None:
+    def test_p2_a2_any_whitespace_inside_a_terminal_phrase_is_still_only_text(self) -> None:
+        # r2 A1: the phrase no longer decides anything, however it is spaced; the resolution field does
         for notes in ("superseded  by OWNER-2", "superseded\nby OWNER-2"):
             with self.subTest(notes=notes):
-                self.assertNotIn("OWNER-1", self.owed(self.one_owner(notes, stamp="2026-10-20T00:00:00Z")))
+                self.assertIn("OWNER-1", self.owed(self.one_owner(notes, stamp="2026-10-20T00:00:00Z")))
+                self.assertNotIn("OWNER-1", self.owed(self.one_owner(notes, stamp="2026-10-20T00:00:00Z", resolution="superseded")))
 
     def test_p2_a3_a7_an_offset_stamp_counts_on_its_utc_day(self) -> None:
         data = {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z",
@@ -663,6 +674,141 @@ class OwnerAskTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("origin", err.getvalue())
         self.assertIn("OPEN-A-P2", err.getvalue())
+
+
+_parity_spec = importlib.util.spec_from_file_location(
+    "test_roadmap_queue_parity", HERE.parent / "repo_hygiene" / "test_roadmap_queue_parity.py")
+_parity = importlib.util.module_from_spec(_parity_spec)
+_parity_spec.loader.exec_module(_parity)
+ROADMAP_BUDGET_BYTES = _parity.ROADMAP_BUDGET_BYTES   # the budget docs/roadmap.md is held to (test_roadmap_queue_parity.py)
+
+
+class R2AdversaryTests(unittest.TestCase):
+    """OWNER-ASK-PARK-GUARD-1 r2: the three open majors of review-adversary-OWNER-ASK-PARK-GUARD-1-r1-8ba4f8ab, each on its input."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def board(self, *rows: dict, generated: str = "2026-10-23T00:00:00Z") -> dict:
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": generated, "rows": list(rows)}
+
+    def owner(self, card: str = "OWNER-1", notes: str = "waits for #123", **extra) -> dict:
+        extra.setdefault("kind", "product")
+        return row(card, "parked", extra.pop("stamp", "2026-10-20T00:00:00Z"), origin="owner", notes=notes, **extra)
+
+    def owed(self, data: dict) -> str:
+        return render_roadmap.render(data).split("## Parked owner asks")[1].split("## Parked with reason")[0]
+
+    def load_code(self, data: dict) -> tuple[int, str]:
+        p = Path(self.tmp.name) / "q.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                render_roadmap._load(p)
+                return 0, err.getvalue()
+            except SystemExit as exc:
+                return exc.code, err.getvalue()
+
+    # A1 (introduced, major): conditional or negated completion text is not a verdict; deny by default.
+    def test_a1_the_adversary_notes_stay_owed(self) -> None:
+        for notes in ("after #123 has shipped", "hasn't shipped", "blocker #123 shipped; still waiting for #456", "not\nDONE"):
+            with self.subTest(notes=notes):
+                self.assertIn("OWNER-1", self.owed(self.board(self.owner(notes=notes))))
+
+    def test_a1_only_a_closed_resolution_vocabulary_is_accepted(self) -> None:
+        self.assertEqual(render_roadmap.RESOLUTIONS, ("done", "duplicate", "superseded", "no_go", "refused"))
+        for bad in ("DONE", "shipped", "no-go", "", " done", 1, True, ["done"]):
+            with self.subTest(resolution=bad):
+                code, err = self.load_code(self.board(self.owner(resolution=bad)))
+                self.assertEqual(code, 2, err)
+                self.assertIn("resolution", err)
+                self.assertIn("OWNER-1", err)
+        for good in render_roadmap.RESOLUTIONS:
+            with self.subTest(resolution=good):
+                self.assertEqual(self.load_code(self.board(self.owner(resolution=good)))[0], 0)
+
+    def test_a1_a_resolution_closes_the_ask_whatever_the_note_says(self) -> None:
+        data = self.board(self.owner(notes="waits for #123 until it ships", resolution="refused"))
+        self.assertNotIn("OWNER-1", self.owed(data))
+        self.assertIn("- OWNER-1 (P3, owner ask, refused): waits for #123 until it ships", render_roadmap.render(data))
+
+    def test_a1_a_null_resolution_is_absent_and_the_ask_is_owed(self) -> None:
+        self.assertIn("OWNER-1", self.owed(self.board(self.owner(resolution=None))))
+
+    def test_a1_the_renderer_holds_no_terminal_word_list(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        for gone in ("TERMINAL_PARK_RXS", "_terminal_park", "_CONDITION_RX", "superseded\\s+by"):
+            self.assertNotIn(gone, source)
+
+    # A2 (introduced, major): fractional seconds are exact, with no Decimal context.
+    def test_a2_a_19_digit_fraction_is_not_rounded_into_the_next_day(self) -> None:
+        data = self.board(self.owner(pinned_utc="2026-10-22T00:00:00.0000000000000000001Z"))
+        self.assertIn("- OWNER-1 (P3, product): parked 0 d (since 2026-10-22)", self.owed(data))
+
+    def test_a2_instants_order_newest_stamp_and_utc_day_are_exact_at_any_length(self) -> None:
+        tiny, tinier = "2026-10-22T08:00:00.00000000000000000000000000002Z", "2026-10-22T08:00:00.00000000000000000000000000001Z"
+        self.assertGreater(render_roadmap._instant(tiny), render_roadmap._instant(tinier))
+        self.assertGreater(render_roadmap._instant(tinier), render_roadmap._instant("2026-10-22T08:00:00Z"))
+        data = synthetic(0, 0, 0)
+        data["rows"] += [row("A-NEWER", "queued", tiny), row("Z-OLDER", "queued", tinier)]
+        self.assertEqual(table_cards(render_roadmap.render(data)), ["Z-OLDER", "A-NEWER"])
+        self.assertEqual(render_roadmap._landed_stamp(row("L", "merged", tinier, pinned_utc=tiny)), tiny)
+        self.assertEqual(render_roadmap._utc_day("2026-10-22T23:59:59." + "9" * 40 + "Z"), date(2026, 10, 22))
+        self.assertNotIn("decimal", SCRIPT.read_text(encoding="utf-8").lower().replace("non-decimal", ""))
+
+    def test_a2_the_age_is_floor_of_exact_elapsed_days(self) -> None:
+        data = self.board(self.owner(pinned_utc="2026-10-21T00:00:00.0000000000000000001Z"))
+        self.assertIn("parked 1 d (since 2026-10-21)", self.owed(data))   # 2 d minus 1e-19 s
+        data = self.board(self.owner(pinned_utc="2026-10-21T00:00:00Z"), generated="2026-10-23T00:00:00.0000000000000000001Z")
+        self.assertIn("parked 2 d (since 2026-10-21)", self.owed(data))
+
+    # A3 (introduced, major): the owner section is capped so docs/roadmap.md stays inside its byte budget.
+    def adversary_a3_board(self, n: int = 112) -> dict:
+        rows = [row("OWNER-%03d" % i, "parked", "2026-10-20T00:00:00Z", kind="hub-tooling", origin="owner",
+                    notes="x" * (100 if i < n - 1 else 64)) for i in range(n)]
+        return self.board(*rows)
+
+    def test_a3_112_parked_owner_rows_with_100_char_notes_fit_the_budget(self) -> None:
+        text = render_roadmap.render(self.adversary_a3_board())
+        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        owed = text.split("## Parked owner asks")[1].split("## Parked with reason")[0]
+        self.assertEqual(sum(1 for l in owed.splitlines() if l.startswith("- OWNER-")), render_roadmap.OWNER_LIST_MAX)
+        self.assertIn("- ... and %d more owner asks parked (card-queue.json)" % (112 - render_roadmap.OWNER_LIST_MAX), owed)
+
+    def test_a3_the_cap_keeps_the_longest_parked_rows(self) -> None:
+        rows = [self.owner("OWNER-%03d" % i, stamp="2026-10-%02dT00:00:00Z" % (1 + i % 20)) for i in range(30)]
+        owed = self.owed(self.board(*rows))
+        listed = [l.split()[1] for l in owed.splitlines() if l.startswith("- OWNER-")]
+        expect = sorted(rows, key=lambda r: (r["source_ledger_stamp"], r["priority"], r["card"]))[:render_roadmap.OWNER_LIST_MAX]
+        self.assertEqual(listed, [r["card"] for r in expect])
+        self.assertIn("- ... and 5 more owner asks parked (card-queue.json)", owed)
+
+    def test_a3_at_the_cap_no_more_line_is_written(self) -> None:
+        owed = self.owed(self.adversary_a3_board(render_roadmap.OWNER_LIST_MAX))
+        self.assertNotIn("more owner asks parked", owed)
+
+    def test_a3_sibling_open_owner_asks_of_another_kind_are_capped_too(self) -> None:
+        rows = [row("OWNER-%03d" % i, "queued", "2026-10-20T00:00:00Z", kind="hub-tooling", origin="owner", notes="x" * 100)
+                for i in range(400)]
+        rows.append(row("PRODUCT-1", "queued", "2026-10-21T00:00:00Z"))
+        text = render_roadmap.render(self.board(*rows))
+        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        cards = table_cards(text)
+        self.assertIn("PRODUCT-1", cards)   # a product row is never dropped
+        self.assertEqual(sum(1 for c in cards if c.startswith("OWNER-")), render_roadmap.OWNER_LIST_MAX)
+        self.assertIn("| - | ... and %d more open owner asks of another kind (card-queue.json) | - | - | - | - |"
+                      % (400 - render_roadmap.OWNER_LIST_MAX), text)
+        self.assertIn("product+playback open: 401 (incl. 400 owner asks of another kind)", text)
+
+    def test_a3_sibling_resolved_owner_asks_of_another_kind_are_one_line(self) -> None:
+        rows = [row("OWNER-%03d" % i, "parked", "2026-10-20T00:00:00Z", kind="factory", origin="owner", notes="x" * 140,
+                    resolution=render_roadmap.RESOLUTIONS[i % 5]) for i in range(400)]
+        text = render_roadmap.render(self.board(*rows))
+        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertIn("- 400 owner asks of another kind are closed with a resolution "
+                      "(done 80, duplicate 80, superseded 80, no_go 80, refused 80; card-queue.json)", text)
 
 
 if __name__ == "__main__":

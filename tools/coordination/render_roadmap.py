@@ -26,8 +26,16 @@ the open table its kind cell reads `<kind> (owner)` when the kind is not product
 Parked owner asks get their own `## Parked owner asks` section, longest-parked first, with the
 park reason and the age in whole days from the park stamp (`pinned_utc` when present, else
 `source_ledger_stamp`) to `generated_utc`; they are not repeated under "Parked with reason".
-An owner row whose park note says the work is done, shipped, closed, superseded, a duplicate
-or NO_GO is a delivered (or refused) ask and stays under "Parked with reason".
+At most OWNER_LIST_MAX (25) are listed, then one `- ... and N more owner asks parked` line, and
+the open table lists at most 25 owner asks of another kind the same way, so docs/roadmap.md
+stays inside its 20000-byte budget however many owner asks the board holds.
+Deny by default (r2): a parked owner ask is OWED unless its row carries a structured
+`resolution` (one of done, duplicate, superseded, no_go, refused), which only
+`Update-CardQueue.ps1 -Set <CARD> -State parked -Resolution <r>` writes. The park note is
+never read for that: free text that says "shipped" or "DONE" is still owed. A resolved owner
+ask of product or playback kind is listed under "Parked with reason" with its resolution; one
+of another kind is tooling churn and is counted on a single line there. Any other
+`resolution` value is bad input (exit 2).
 
 Usage:
     py -3 tools/coordination/render_roadmap.py --card-queue <card-queue.json> --out docs/roadmap.md
@@ -50,7 +58,8 @@ import re
 import sys
 import calendar
 from datetime import date, datetime, timedelta
-from decimal import ROUND_FLOOR, Decimal
+from fractions import Fraction   # exact instants: a rational number has no precision context to round in
+import math
 from pathlib import Path
 
 SCHEMA = "mlv-app/card-queue/v1"
@@ -96,48 +105,46 @@ def _parked_since(r: dict) -> str:
     return r.get("pinned_utc") or r["source_ledger_stamp"]
 
 
-# A park note that says the work is finished or will not happen: such an owner row is a delivered (or refused) ask,
-# so it stays under "Parked with reason" and the owner-ask section lists only asks still owed. The hub's verdict words
-# (DONE, NO_GO, DUPLICATE) count only in upper case and never inside a card id (CLOSED-CAPTIONS-1, NO-GO-GATE-1);
-# the prose phrases count in any case. A phrase right after a negation or a condition ("not DONE", "until it has
-# shipped", "to be done") is a wait, not a verdict. A row the hub wants off the owed list can say so plainly.
-_ID_EDGE_L = r"(?<![A-Za-z0-9_-])"
-_ID_EDGE_R = r"(?![A-Za-z0-9_-])"
-TERMINAL_PARK_RXS = (
-    re.compile(_ID_EDGE_L + r"(?:DONE|NO[_-]GO|DUPLICATE)" + _ID_EDGE_R),
-    re.compile(_ID_EDGE_L + r"(?i:shipped|superseded\s+by|merged\s+into|not\s+new\s+work|won't\s+fix|no\s+successor|closed\s+(?:by|done|as|in))" + _ID_EDGE_R),
-)
-# (adversary pass 2 A1) a negation or condition ANYWHERE earlier in the same clause makes the match a wait: "waits until #123 has
-# shipped", "until the release branch has shipped". A clause ends at ; , : . | ( ) or a line break.
-_CONDITION_RX = re.compile(r"(?i)\b(?:not|never|until|unless|before|once|when|if|to\s+be|yet|un)\b")
-_CLAUSE_END_RX = re.compile(r"[;,:.|()\n]")
+# Deny by default (OWNER-ASK-PARK-GUARD-1 r2, adversary A1 on 8ba4f8ab; fleet card
+# mlv-app/spelling-chase-scanner-needs-a-deny-by-default-name, softwarefactory-fleet-doctrine specs/mlv-app/cards.md:663).
+# r1 read the park NOTE for completion words and then chased each way prose can say "not yet": "after #123 has shipped",
+# "hasn't shipped", "blocker #123 shipped; still waiting for #456", "not\nDONE". Every new rule leaked to a new
+# spelling, which is the trap that card records. So the note is never read here. A parked owner ask is owed unless its
+# row carries a structured `resolution` from the closed vocabulary below, and only the hub writes one, through
+# Update-CardQueue.ps1 -Set <CARD> -State parked -Resolution <r> (a value outside the vocabulary exits 2 there and here).
+# The price is over-reporting: a delivered ask stays on the owed list until the hub states its resolution once.
+RESOLUTIONS = ("done", "duplicate", "superseded", "no_go", "refused")
 
 
-def _terminal_park(notes: str) -> bool:
-    for rx in TERMINAL_PARK_RXS:
-        for m in rx.finditer(notes):
-            ends = [e.end() for e in _CLAUSE_END_RX.finditer(notes, 0, m.start())]
-            if not _CONDITION_RX.search(notes[ends[-1] if ends else 0:m.start()]):
-                return True
-    return False
+def _resolution(r: dict) -> str:
+    """The row's structured resolution, or '' when it has none (absent or null): that row is not closed."""
+    return r.get("resolution") or ""
 
 
 def _undelivered_owner_ask(r: dict) -> bool:
-    return r.get("origin") == OWNER and not _terminal_park(r.get("notes") or "")
+    """An owner ask still owed: origin owner and no resolution. Its notes are display text only."""
+    return r.get("origin") == OWNER and not _resolution(r)
+
+
+# At most this many owner asks are listed per section (longest-parked first for the parked ones, table order for the
+# open ones); the rest are counted on one line. docs/roadmap.md has a 20000-byte budget (test_roadmap_queue_parity.py).
+OWNER_LIST_MAX = 25
 
 
 # (adversary pass 2 A3/A4/A6/A7) a stamp is read exactly: every fractional digit is kept, an explicit offset is applied, and the
-# instant is a Decimal count of UTC seconds, so a 7-digit fraction, a -02:00 offset or a far-future year never truncates,
+# instant is a Fraction count of UTC seconds, so a 7-digit fraction, a -02:00 offset or a far-future year never truncates,
 # rounds or overflows. A stamp in no such shape (date only, an odd tail) reads as that date's UTC midnight, as before.
+# (r2 A2 on 8ba4f8ab) the fraction is digits / 10**len(digits), an exact rational: no arithmetic context caps the digits, so
+# 2026-10-22T00:00:00.0000000000000000001Z is later than 00:00:00Z by exactly 1e-19 s and never rounds into the next whole second.
 _STAMP_RX = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:[.,](\d+))?)?\s*(Z|[+-]\d\d:?\d\d)?$", re.IGNORECASE)
 
 
-def _instant(stamp: str) -> Decimal:
-    """Exact UTC seconds since the epoch, as a Decimal."""
+def _instant(stamp: str) -> Fraction:
+    """Exact UTC seconds since the epoch, as a Fraction (every fractional digit kept)."""
     m = _STAMP_RX.match(stamp.strip())
     if not m:
         d = _day(stamp)
-        return Decimal(calendar.timegm((d.year, d.month, d.day, 0, 0, 0)))
+        return Fraction(calendar.timegm((d.year, d.month, d.day, 0, 0, 0)))
     y, mo, d, h, mi = (int(m.group(i)) for i in range(1, 6))
     secs = calendar.timegm((y, mo, d, h, mi, int(m.group(6) or 0)))
     tz = m.group(8)
@@ -145,12 +152,13 @@ def _instant(stamp: str) -> Decimal:
         sign = -1 if tz[0] == "-" else 1
         hh, mm = int(tz[1:3]), int(tz[-2:])
         secs -= sign * (hh * 3600 + mm * 60)
-    return Decimal(secs) + (Decimal("0." + m.group(7)) if m.group(7) else Decimal(0))
+    digits = m.group(7) or ""
+    return Fraction(secs) + (Fraction(int(digits), 10 ** len(digits)) if digits else Fraction(0))
 
 
 def _utc_day(stamp: str) -> date:
     """The UTC calendar day of a stamp (an offset can move it off the date its text starts with)."""
-    whole = int(_instant(stamp).to_integral_value(rounding=ROUND_FLOOR))
+    whole = math.floor(_instant(stamp))   # exact floor of a rational: 23:59:59.999.. stays on its own day
     try:
         return date(1970, 1, 1) + timedelta(seconds=whole)
     except OverflowError:
@@ -257,12 +265,20 @@ def render(data: dict) -> str:
     out = [HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "", *scope]
     out.append("| P | card | kind | state | queued since | order_chain |")
     out.append("|---|---|---|---|---|---|")
+    other_kind_seen = 0
     for r in open_rows:
+        if r["kind"] not in KINDS:   # an owner ask of another kind (r2 A3 sibling): the first OWNER_LIST_MAX in table order are listed
+            other_kind_seen += 1
+            if other_kind_seen > OWNER_LIST_MAX:
+                continue
         out.append("| %s | %s | %s | %s | %s | %s |" % (
             r["priority"], r["card"], _kind_cell(r), r["state"], _utc_day(r["source_ledger_stamp"]).isoformat(), _chain(r)))
     if not open_rows:
         out.append("| - | (none open) | - | - | - | - |")
     other_kind_asks = sum(1 for r in open_rows if r["kind"] not in KINDS)
+    if other_kind_asks > OWNER_LIST_MAX:   # no leading digit cell, so the parity check never reads it as a card row
+        out.append("| - | ... and %d more open owner asks of another kind (card-queue.json) | - | - | - | - |" % (
+            other_kind_asks - OWNER_LIST_MAX))
     open_line = "product+playback open: %d" % len(open_rows)
     if other_kind_asks:
         open_line += " (incl. %d owner ask%s of another kind)" % (other_kind_asks, "" if other_kind_asks == 1 else "s")
@@ -282,16 +298,28 @@ def render(data: dict) -> str:
     other_parked = [r for r in parked if not _undelivered_owner_ask(r)]
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
             "## Parked owner asks", ""]
-    for r in owner_parked:
+    for r in owner_parked[:OWNER_LIST_MAX]:   # r2 A3: the longest-parked OWNER_LIST_MAX, then one count line
         since = _parked_since(r)
-        age = max(0, int((generated_at - _instant(since)) // 86400))   # elapsed whole days between exact instants, not a date difference
+        age = max(0, math.floor((generated_at - _instant(since)) / 86400))   # elapsed whole days between exact instants, not a date difference
         out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
             r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
+    if len(owner_parked) > OWNER_LIST_MAX:
+        out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - OWNER_LIST_MAX))
     if not owner_parked:
         out.append("- (no owner ask is parked)")
     out += ["", "## Parked with reason", "", *scope]
+    # every owner row here carries a resolution (an unresolved one is owed, above). One of another kind is tooling churn: counted, not listed.
+    closed_other = [r for r in other_parked if r.get("origin") == OWNER and r["kind"] not in KINDS]
     for r in other_parked:
+        if r.get("origin") == OWNER:
+            if r["kind"] in KINDS:
+                out.append("- %s (P%s, owner ask, %s): %s" % (r["card"], r["priority"], _resolution(r), _note(r)))
+            continue
         out.append("- %s (P%s): %s" % (r["card"], r["priority"], _note(r)))
+    if closed_other:
+        counts = ["%s %d" % (v, n) for v in RESOLUTIONS for n in [sum(1 for r in closed_other if _resolution(r) == v)] if n]
+        out.append("- %d owner ask%s of another kind %s closed with a resolution (%s; card-queue.json)" % (
+            len(closed_other), "" if len(closed_other) == 1 else "s", "is" if len(closed_other) == 1 else "are", ", ".join(counts)))
     if not other_parked:
         out.append("- (none parked)")
     return "\n".join(out) + "\n"
@@ -315,6 +343,9 @@ def _check_row(path: Path, i: int, r: dict) -> None:
     for key in ("evidence", "notes", "origin"):
         if r.get(key) is not None and not isinstance(r[key], str):
             _die("%s has a non-string %s" % (where, key))
+    res = r.get("resolution")   # r2 A1: a closed vocabulary; null is the same as absent (no resolution, so an owner ask stays owed)
+    if res is not None and not (isinstance(res, str) and res in RESOLUTIONS):
+        _die("%s has a bad resolution: %r (want one of %s, or none)" % (where, res, "|".join(RESOLUTIONS)))
     for token in DECLARED_TOKEN_RX.findall(r.get("evidence") or ""):
         token = token.rstrip(TOKEN_TRAILING_PUNCT)
         stamp = DECLARED_RX.fullmatch("declared@" + token)
