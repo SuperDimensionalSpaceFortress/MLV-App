@@ -17618,11 +17618,18 @@ class ConformStatusParenthesisSurvivesTheLogReaderTests(unittest.TestCase):
             with self.subTest(loc=loc):
                 self.assertRecovered(self.evidence(conformed_summary_line(), loc))
 
-    def test_an_unreadable_location_after_a_conformed_summary_keeps_the_fields_before_it(self) -> None:
-        # LOCATION_UNREADABLE stays for a malformed trailing suffix, but it supplies no field and no longer discards the ones that precede it
+    def test_an_unreadable_location_after_a_conformed_summary_refuses_the_record(self) -> None:
+        # LOCATION_UNREADABLE stays for a malformed trailing suffix and supplies no field. CONTRACT CHANGE, HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1
+        # r24 (r24 adversary pass 2 A1 on d89dc086): before r24 (r10) the fields before the cut still read; the cut tail can hold the field that
+        # decides the verdict (its input: `... fps_override=0 ... diagnostic='prefix ( fps_override=1` read valid=true), so a summary record that lost
+        # its tail is now refused whole, as the session readers refuse it since r12 B2. The app writes a readable `:<digits>)` location, so a real
+        # run is unchanged (real-log-mask-check over the six bench r5 logs); only a malformed or forged tail refuses.
         for loc in (" (C:/b x/MainWindow.cpp:%3)", " (C:/b x/MainWindow.cpp:12) tail", " (C:/b x/MainWindow.cpp:)"):
             with self.subTest(loc=loc):
-                self.assertRecovered(self.evidence(conformed_summary_line(), loc))
+                out = self.evidence(conformed_summary_line(), loc)
+                self.assertEqual((out["valid"], out["sourceAdvanced"]), (False, None), out)
+        # a readable location after the same summary still keeps every field
+        self.assertRecovered(self.evidence(conformed_summary_line(), CONFORM_LOC))
 
     def test_the_record_body_helper_cuts_only_the_trailing_location(self) -> None:
         line = conformed_summary_line()
