@@ -2413,6 +2413,10 @@ function Get-DvLookAssistEvidence {
                 if ([regex]::IsMatch($line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_state(\s|$)'), $script:DvCi)) {
                     $found = $line
                     foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)')) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
+                    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r25 (r25 adversary A1 on 217e0726, its input: `look_assist_flavor=cinematic
+                    # diagnostic=' look_assist_flavor=classic`): a flavor key with a MASKED `=` (ConvertTo-DvQuoteMaskedBody) is UNREADABLE, never absent: it
+                    # is a flavor token of its own (the mask character, never an applied flavor), so the record names more than one flavor and none is proven
+                    if ([regex]::IsMatch($line, '(?<![A-Za-z0-9_])look_assist_flavor\x1A')) { [void]$flavorsSeen.Add([string]$script:DvQuotedEqualsMask) }
                 }
             }
         }
@@ -2432,8 +2436,15 @@ function Get-DvLookAssistEvidence {
                 # "the first" or "the last"); (3) it must be one the app can apply (adversary pass 3 A2: the app prints `none` when it applied no flavor, and `unknown` is a placeholder).
                 # pass 4 A1: an EMPTY token (`look_assist_flavor=`) is a token too (`\S*`), so a duplicate that names nothing makes the record ambiguous instead of being skipped.
                 # pass 4 A2: two contradictory look_assist_enabled tokens in the answering record are no unambiguous `on` -- no flavor is proven from that record.
-                $lastFlavors = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value } | Select-Object -Unique)
-                $enabledValues = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)') | ForEach-Object { $_.Groups['v'].Value } | Select-Object -Unique)
+                # r25 (r25 adversary A1 on 217e0726): a flavor or enabled key with a MASKED `=` in the answering record is a token of its own (UNREADABLE,
+                # never absent), so it makes the record name two values and no flavor is proven from it, as a second plain token does (pass 4 A1 / A2)
+                $maskToken = [string]$script:DvQuotedEqualsMask
+                $flavorTokens = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value }) +
+                                @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_flavor\x1A') | ForEach-Object { $maskToken })
+                $enabledTokens = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)') | ForEach-Object { $_.Groups['v'].Value }) +
+                                 @([regex]::Matches($found, '(?<![A-Za-z0-9_])look_assist_enabled\x1A') | ForEach-Object { $maskToken })
+                $lastFlavors = @($flavorTokens | Select-Object -Unique)
+                $enabledValues = @($enabledTokens | Select-Object -Unique)
                 if ($flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
                 # r24 (r24 adversary pass 2 A2 sibling): ORDINAL, so look_assist_enabled=<U+0661> or 1<U+200B> is never on
                 if (-not [string]::Equals($reported, '1', [StringComparison]::Ordinal)) { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }

@@ -16596,6 +16596,23 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
             "interaction_trace event=x note='" + inner + "'", "interaction_trace event=x note='" + inner, inner])
         self.assertEqual(got, ["absent from the run log", "absent from the run log", "gui_smoke.look_label"], got)
 
+    def test_r25_a1_a_masked_look_assist_key_is_unreadable_never_absent(self) -> None:
+        # r25 adversary A1 on 217e0726, its input verbatim (first case): the mask hid the conflicting `look_assist_flavor=classic` after a stray quote, so
+        # the record read as naming one flavor and cinematic was proven (on 217e0726 flavor=cinematic, HONOURED). A flavor or enabled key with a masked
+        # `=` is a token of its own: no flavor is proven, in the answering record (:2435 :2436) or in an earlier visual_state record (:2415)
+        vs = "interaction_trace event=gui_smoke.visual_state "
+        spec = "@{ legType = 'speed'; generatorArgs = @{ forceLookAssist = $true; lookFlavor = 'cinematic' } }"
+        expr = "$e = Get-DvLookAssistEvidence -Spec (" + spec + ") -LogText $log; '{0}|{1}' -f $e.flavor, $e.verdict"
+        got = self.each(expr, [
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' look_assist_flavor=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic='look_assist_flavor=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' look_assist_enabled=0",
+            vs + "look_assist_enabled=0 look_assist_flavor=cinematic note=' look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic",
+            # controls: a closed quoted span that names no look key, and a record with no quote, still prove cinematic
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic note='a b'",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic"])
+        self.assertEqual(got, ["|HONOURED", "|HONOURED", "|HONOURED", "|HONOURED", "cinematic|HONOURED", "cinematic|HONOURED"], got)
+
 
 @requires_windows_pwsh
 class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
