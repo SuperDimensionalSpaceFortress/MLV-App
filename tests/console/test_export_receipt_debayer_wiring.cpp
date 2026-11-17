@@ -94,6 +94,9 @@ QString caseArm(const QString & body, const QString & name)
 // arm's comments are stripped before the setter is looked for.
 QString stripComments(QString text)
 {
+    // adversary advisory A1 on eb01ef00: splice backslash-continued lines first, as the C++ preprocessor does, so a
+    // "// ... \" comment that swallows the setter on the next physical line is stripped with it
+    text.remove(QRegularExpression(QStringLiteral("\\\\[ \\t]*\\n")));
     text.remove(QRegularExpression(QStringLiteral("/\\*.*?\\*/"), QRegularExpression::DotMatchesEverythingOption));
     text.remove(QRegularExpression(QStringLiteral("//[^\\n]*")));
     return text;
@@ -116,6 +119,9 @@ TEST(ExportReceiptDebayerWiring, ACommentedOutSetterDoesNotCount)
     ASSERT_TRUE(armCalls(live, QStringLiteral("RCD"), QStringLiteral("setMlvUseRcdDebayer(")));
     ASSERT_FALSE(armCalls(block, QStringLiteral("RCD"), QStringLiteral("setMlvUseRcdDebayer(")));
     ASSERT_FALSE(armCalls(line, QStringLiteral("RCD"), QStringLiteral("setMlvUseRcdDebayer(")));
+    const QString spliced = QStringLiteral(
+        "case ReceiptSettings::RCD: // disabled \\\n            setMlvUseRcdDebayer( m_pMlvObject );\n            break;\n        default: break;");
+    ASSERT_FALSE(armCalls(spliced, QStringLiteral("RCD"), QStringLiteral("setMlvUseRcdDebayer(")));
 }
 
 // The enumerators of ReceiptSettings::DebayerAlgorithm, read from the header (never hard-coded).

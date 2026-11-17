@@ -49,6 +49,7 @@ struct BorderRun
 {
     bool outputGuardsIntact = false;
     bool outputsInSampleRange = false;
+    bool ringFilled = true;
     int rc = -1;
 };
 
@@ -77,7 +78,11 @@ BorderRun runBorder(int width, int height, int border)
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 const float v = plane->rows[y][x];
-                if (v == kOutputGuard) continue;   // an interior pixel the border pass does not own
+                const bool ring = x < border || x >= width - border || y < border || y >= height - border;
+                if (v == kOutputGuard) {
+                    if (ring) run.ringFilled = false;   // advisory A2 on eb01ef00: every channel's ring pixel is written
+                    continue;                           // an interior pixel the border pass does not own
+                }
                 if (!(v >= minSample && v <= maxSample)) run.outputsInSampleRange = false;
             }
         }
@@ -89,7 +94,8 @@ std::string describe(int width, int height, int border, const BorderRun & run)
 {
     return std::to_string(width) + "x" + std::to_string(height) + " border=" + std::to_string(border)
            + " rc=" + std::to_string(run.rc) + " guards=" + (run.outputGuardsIntact ? "intact" : "WRITTEN")
-           + " range=" + (run.outputsInSampleRange ? "ok" : "OUT_OF_FRAME_READ");
+           + " range=" + (run.outputsInSampleRange ? "ok" : "OUT_OF_FRAME_READ")
+           + " ring=" + (run.ringFilled ? "filled" : "UNWRITTEN");
 }
 
 // every border a Bayer kernel passes: DCB 1, AMaZE/VNG4 3, HPHD 4, AHD 5, IGV 8, RCD 9
@@ -102,7 +108,7 @@ TEST(BayerBorderBounds, RcdBorderOnAnEightWideFrameStaysInsideEveryRow)
 {
     const BorderRun run = runBorder(8, 32, 9);
     ASSERT_EQ(0, run.rc);
-    ASSERT_EQ(std::string("8x32 border=9 rc=0 guards=intact range=ok"), describe(8, 32, 9, run));
+    ASSERT_EQ(std::string("8x32 border=9 rc=0 guards=intact range=ok ring=filled"), describe(8, 32, 9, run));
 }
 
 // The class: every kernel's border on frames narrower, shorter, or both, than the border (and the boundary sizes).
@@ -114,7 +120,7 @@ TEST(BayerBorderBounds, EveryKernelBorderStaysInsideSmallFrames)
     for (const int border : kKernelBorders) {
         for (const auto & size : sizes) {
             const BorderRun run = runBorder(size[0], size[1], border);
-            if (run.rc != 0 || !run.outputGuardsIntact || !run.outputsInSampleRange) {
+            if (run.rc != 0 || !run.outputGuardsIntact || !run.outputsInSampleRange || !run.ringFilled) {
                 failures += describe(size[0], size[1], border, run) + "; ";
             }
         }
@@ -138,7 +144,10 @@ TEST(BayerBorderBounds, LargeFrameBorderRingIsFilledAndInteriorUntouched)
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 const bool ring = x < border || x >= width - border || y < border || y >= height - border;
+                // adversary advisory A2 on eb01ef00: all three channels, not green alone
+                ASSERT_EQ(ring, red.rows[y][x] != kOutputGuard);
                 ASSERT_EQ(ring, green.rows[y][x] != kOutputGuard);
+                ASSERT_EQ(ring, blue.rows[y][x] != kOutputGuard);
             }
         }
     }
