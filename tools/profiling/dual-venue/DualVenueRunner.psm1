@@ -4526,6 +4526,14 @@ function Get-DvExportStageRow {
                 share = $(if ($null -ne $Denominator -and [double]$Denominator -gt 0) { Get-DvExportRound ($mean / [double]$Denominator) } else { $null }) }
 }
 
+function Get-DvExportDroppedCount {
+    # adversary r6 A2: how many PRESENT values Get-DvExportStageRow rejects (not a finite, non-negative JSON number). Kept out of the stage row on purpose: a receipt
+    # already written carries the row without it, and the validator re-derives and compares the whole stage table.
+    param($Values)
+    $kept = @($Values | Where-Object { ($_ -is [double] -or $_ -is [int] -or $_ -is [long] -or $_ -is [decimal]) -and [double]::IsFinite([double]$_) -and [double]$_ -ge 0 }).Count
+    @($Values | Where-Object { $null -ne $_ }).Count - $kept
+}
+
 function Get-DvExportEvidence {
     <#
     .SYNOPSIS
@@ -4609,8 +4617,10 @@ function Get-DvExportEvidence {
             }
             $m.profileFramesSucceeded = [int64]$ok.Count
             $m.profileFramesFailed = [int64]($rows.Count - $ok.Count)
+            # adversary r6 A2: a profile whose every frame failed measured nothing, whatever the leg's criteria say
+            if ($rows.Count -gt 0 -and $ok.Count -eq 0) { $problems.Add("EXPORT_PROFILE_ABSENT: the profile records no successful frame (all $($rows.Count) failed), so there is no stage share to read") }
             if ($null -ne $m.framesExported -and $ok.Count -gt $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the profile records $($ok.Count) successful frame(s) but the batch exported $($m.framesExported)") }
-            $dualIsoValues = @($ok | ForEach-Object { $dx = Get-DvProp $_ 'llrawproc_dual_iso_ms'; if (($dx -is [double] -or $dx -is [int] -or $dx -is [long]) -and [double]::IsFinite([double]$dx)) { $dx } else { $null } })
+            $dualIsoValues = @($ok | ForEach-Object { $dx = Get-DvProp $_ 'llrawproc_dual_iso_ms'; if (($dx -is [double] -or $dx -is [int] -or $dx -is [long]) -and [double]::IsFinite([double]$dx) -and [double]$dx -ge 0) { $dx } else { $null } })
             if ($ok.Count -gt 0 -and @($dualIsoValues | Where-Object { $null -ne $_ }).Count -ne $ok.Count) {
                 $problems.Add('EXPORT_PROFILE_ABSENT: a successful profile frame carries no llrawproc_dual_iso_ms, so the clip''s dual-ISO class cannot be read')
             }
@@ -4640,6 +4650,19 @@ function Get-DvExportEvidence {
             $shortStages = @($rowsOut.Keys | Where-Object { $rowsOut[$_].samples -gt 0 -and $rowsOut[$_].samples -ne $ok.Count })
             if ($ok.Count -gt 0 -and $shortStages.Count -gt 0) {
                 $problems.Add("EXPORT_PROFILE_ABSENT: producer stage(s) $($shortStages -join ', ') are timed on fewer than the $($ok.Count) successful frames the producer_frame_ms denominator covers, so their shares are of another window")
+            }
+            # adversary r6 A1/A2: the writer stages and the llrawproc total are held to the same window as the denominator (a stage that is timed at all is timed on every
+            # successful frame), and a present value that is not a finite non-negative number makes the profile malformed instead of silently shrinking a population
+            $shortOther = @(@($writer.Keys | Where-Object { $writer[$_].samples -gt 0 -and $writer[$_].samples -ne $ok.Count }) + @($(if ($stages.llrawprocTotal.samples -gt 0 -and $stages.llrawprocTotal.samples -ne $ok.Count) { 'llrawproc_ms' })))
+            if ($ok.Count -gt 0 -and $shortOther.Count -gt 0) {
+                $problems.Add("EXPORT_PROFILE_ABSENT: stage(s) $($shortOther -join ', ') are timed on fewer than the $($ok.Count) successful frames the producer_frame_ms denominator covers, so their shares are of another window")
+            }
+            $malformedStages = [System.Collections.Generic.List[string]]::new()
+            foreach ($stageName in @($script:ExportCdngProducerStages) + @($script:ExportCdngWriterStages) + @('llrawproc', 'producer_frame')) {
+                if ((Get-DvExportDroppedCount -Values @($ok | ForEach-Object { Get-DvProp $_ "${stageName}_ms" })) -gt 0) { $malformedStages.Add("${stageName}_ms") }
+            }
+            if ($malformedStages.Count -gt 0) {
+                $problems.Add("EXPORT_PROFILE_ABSENT: stage timing(s) $($malformedStages -join ', ') carry a value that is not a finite non-negative JSON number, so the profile is malformed")
             }
         }
     }
@@ -4682,7 +4705,9 @@ function Get-DvExportEvidence {
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
             # adversary r2 A2: processed16_total alone is no breakdown; both disjoint children (debayered_frame, processing) must be present and the denominator positive
             # (pass 2 A1: each child must cover exactly the frames processed16_total covers, or its share is of another window)
-            $missingChild = @($script:ExportRenderedTopLevel | Where-Object { $rowsOut[$_].samples -ne $p16.samples })
+            # adversary r6 A1: equal sample COUNTS are not the same window; each child must also be timed on exactly the frames processed16_total is timed on
+            $p16Frames = $perStage['processed16_total']
+            $missingChild = @($script:ExportRenderedTopLevel | Where-Object { $childName = $_; $rowsOut[$childName].samples -ne $p16.samples -or @($perStage[$childName].Keys | Where-Object { -not $p16Frames.ContainsKey($_) }).Count -gt 0 })
             if ($m.stageFramesSeen -gt 0 -and ($null -eq $p16.meanMs -or [double]$p16.meanMs -le 0 -or $missingChild.Count -gt 0)) {
                 $problems.Add("EXPORT_PROFILE_ABSENT: stage-timing.log times $($missingChild -join ' / ') on fewer frames than processed16_total's $($p16.samples) (mean $($p16.meanMs) ms), so no stage share can be read")
             }

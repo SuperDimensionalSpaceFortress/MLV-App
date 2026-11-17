@@ -349,6 +349,45 @@ class ExportEvidenceTests(unittest.TestCase):
             self.assertEqual(got[i]["outcome"], "INVALID", got[i])
             self.assertTrue(any(token in p for p in got[i]["problems"]), got[i])
 
+    def test_r6_adversary_a1_a2_disjoint_windows_and_unusable_timings_are_invalid_whatever_the_criteria(self) -> None:
+        """adversary r6 A1/A2 (on f87b33f3): equal SAMPLE COUNTS hid disjoint frame windows (ProRes children on frames 30..59 against processed16_total on 0..29),
+        a profile whose every frame failed, a negative or object-valued timing and a one-of-N writer population all read PASS under empty criteria. Each is INVALID."""
+        def profile(mutate) -> str:
+            doc = json.loads(cdng_profile(30))
+            mutate(doc["frames"])
+            return json.dumps(doc)
+
+        def set_all(key, value):
+            def go(rows):
+                for r in rows:
+                    r[key] = value
+            return go
+
+        def only_first(key):
+            def go(rows):
+                for r in rows[1:]:
+                    r.pop(key, None)
+            return go
+
+        shifted = "".join(f"[mlv-stage-timing] frame={i if n == 'processed16_total' else i + 30} stage={n} ms={ms:.3f}\n"
+                          for i in range(30) for n, ms in (("debayered_frame", 40.0), ("processing", 15.0), ("processed16_total", 56.0)))
+        cases = [
+            prores_case(stage=shifted, criteria=[]),                                                       # 0 disjoint child windows
+            cdng_case(profile=cdng_profile(30, success=False), criteria=[]),                               # 1 every profile frame failed
+            cdng_case(profile=profile(lambda rows: rows[0].update({"raw_read_ms": -1})), criteria=[]),     # 2 one negative producer timing
+            cdng_case(dualIsoExpected=False, profile=profile(set_all("llrawproc_dual_iso_ms", -1)), criteria=[]),   # 3 negative dual-ISO figure on a no-dual-ISO leg
+            cdng_case(profile=profile(set_all("dng_compress_encode_ms", {"ms": 10})), criteria=[]),        # 4 object-valued stage on every frame
+            cdng_case(profile=profile(only_first("disk_write_ms")), criteria=[]),                          # 5 writer stage on one frame of 30
+            cdng_case(criteria=[]),                                                                        # 6 control: the same case, well formed
+            prores_case(criteria=[]),                                                                      # 7 control: ProRes, well formed
+        ]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(6):
+            self.assertEqual(got[i]["outcome"], "INVALID", (i, got[i]))
+            self.assertTrue(any("EXPORT_PROFILE_ABSENT" in p for p in got[i]["problems"]), (i, got[i]))
+        self.assertEqual((got[6]["outcome"], got[7]["outcome"]), ("PASS", "PASS"), got[6:])
+
     def test_a_capture_with_no_stage_measurement_or_with_footage_left_behind_is_invalid(self) -> None:
         """adversary r2 A2/A3 (on c3768da1): a captured export whose profile rows carry only frame_index and one dual-ISO figure (CDNG), or whose stage log has
         processed16_total and no child stage (ProRes), measured no stage share, yet read PASS; and a manifest that does not record the exported footage as
