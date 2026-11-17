@@ -53,7 +53,11 @@ more than 100 fractional digits, or a UTC day outside 0001-01-01..9999-12-31 exi
 card id or kind that is not a short pipe-free token, or a card that is not a string, exits 2.
 r3: a stamp holds no whitespace except the one T-or-space date/time separator; any string anywhere in the queue (keys included)
 that is not UTF-8 text (a lone surrogate) exits 2; and when the owner lists at cap 0 still leave the file over 20000 bytes, all
-owner output collapses to one line no longer than the "(no owner ask is parked)" placeholder, so owner asks add zero bytes.
+owner output collapses to one line no longer than the "(no owner ask is parked)" placeholder, so owner asks add zero bytes
+(a closed owner ask is then left out of the drain counts too; an open one of product/playback kind is a product row and stays).
+r3 pass 7: `state`, `order_chain.chain` and `order_chain.predecessor` must each fit one table cell (a string of at most 120
+printable characters with no pipe), a scope note is one printable line, and rows that tie on every sort key are ordered by
+their canonical JSON, so the output never depends on the input row order.
 """
 
 from __future__ import annotations
@@ -202,8 +206,14 @@ def _landed_stamp(r: dict) -> str:
     return max(stamps, key=_instant)   # newest INSTANT: a string max picks the older of 08:00:00Z and 08:00:00.100Z
 
 
+def _canonical(r: dict) -> str:
+    """(r3 pass-7 A3) the row as canonical JSON: the last sort key, so rows that tie on every other key (a duplicate card id
+    whose stamps name the same instant, e.g. 00:00:00Z and 01:00:00+01:00) render in one order whatever the input order."""
+    return json.dumps(r, sort_keys=True, ensure_ascii=True)
+
+
 def _sort_key(r: dict) -> tuple:
-    return (r["priority"], _instant(r["source_ledger_stamp"]), r["card"])
+    return (r["priority"], _instant(r["source_ledger_stamp"]), r["card"], _canonical(r))
 
 
 def _chain(r: dict) -> str:
@@ -248,6 +258,8 @@ def _stats(data: dict, collapsed: bool = False) -> tuple:
     """(open_rows, parked_rows, days, landed_by_day, queued_by_day) for product/playback rows and owner asks.
     collapsed (r3 A1): product/playback rows only, as the base counted them, so an owner ask of another kind adds no count digit."""
     rows = [r for r in data["rows"] if (r["kind"] in KINDS if collapsed else _counted(r))]
+    if collapsed:   # (r3 pass-7 A1) a closed (parked or merged) owner ask of any kind is not in the counts either: zero bytes
+        rows = [r for r in rows if r.get("origin") != OWNER or r["state"] not in CLOSED_STATES]
     open_rows = sorted((r for r in rows if r["state"] not in CLOSED_STATES), key=_sort_key)
     parked = sorted((r for r in rows if r["state"] == "parked"), key=_sort_key)
     last = _utc_day(data["generated_utc"])
@@ -332,7 +344,7 @@ def _render(data: dict, cap: int, collapsed: bool = False) -> str:
         out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
     out.append("| total | %d | %d |" % (landed_total, queued_total))
     owner_parked = sorted((r for r in parked if _undelivered_owner_ask(r)),
-                          key=lambda r: (_instant(_parked_since(r)), r["priority"], r["card"]))
+                          key=lambda r: (_instant(_parked_since(r)), r["priority"], r["card"], _canonical(r)))   # (r3 pass-7 A3) total order
     generated_at = _instant(generated)
     other_parked = [r for r in parked if not _undelivered_owner_ask(r)]
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
@@ -436,6 +448,22 @@ def _non_utf8_text(data: object) -> str:
     return ""
 
 
+# (r3 pass-7 A2) text that lands in a table cell (state, order_chain.chain, order_chain.predecessor) is one printable line with
+# no pipe: a line break there wrote a forged "| 3 | FORGED | ..." row that the parity reader counted as a card.
+CELL_MAX = 120
+
+
+def _cell_problem(value: object) -> str:
+    """'' when `value` can stand in one table cell, else why not. str.isprintable() is False for CR, LF, TAB, U+2028, ESC ..."""
+    if not isinstance(value, str):
+        return "is not a string"
+    if "|" in value or not value.isprintable():
+        return "holds a pipe, a line break or another unprintable character"
+    if len(value) > CELL_MAX:
+        return "is longer than %d characters" % CELL_MAX
+    return ""
+
+
 def _valid_stamp(value: object) -> bool:
     return not _stamp_problem(value)
 
@@ -470,6 +498,9 @@ def _check_row(path: Path, i: int, r: dict) -> None:
         _die("%s has an order_chain without an integer index" % where)
     if oc.get("predecessor") is not None and not isinstance(oc["predecessor"], str):
         _die("%s has an order_chain with a non-string predecessor" % where)
+    for key in ("chain", "predecessor"):   # (r3 pass-7 A2) both land in the order_chain cell of the open table
+        if oc.get(key) is not None and _cell_problem(oc[key]):
+            _die("%s has an order_chain whose %s %s: %r" % (where, key, _cell_problem(oc[key]), oc[key]))
 
 
 def _check_scope_notes(path: Path, notes: object) -> None:
@@ -480,6 +511,8 @@ def _check_scope_notes(path: Path, notes: object) -> None:
     for i, n in enumerate(notes):
         if not isinstance(n, dict) or not all(isinstance(n.get(k), str) and n[k].strip() and _utf8_ok(n[k]) for k in ("title", "text")):
             _die("%s scope_notes entry %d needs a non-empty string title and text: %r" % (path, i, n))
+        if not all(n[k].isprintable() for k in ("title", "text")):   # (r3 pass-7 A2 sibling) one paragraph line: no forged table row
+            _die("%s scope_notes entry %d has a line break or an unprintable character in its title or text: %r" % (path, i, n))
 
 
 def _load(path: Path) -> dict:
@@ -508,6 +541,8 @@ def _load(path: Path) -> dict:
             _die("%s row %d (%s) has a bad kind: %r (want letters, digits, ' ', '.', '_', '-'; at most 40)" % (path, i, r["card"], r["kind"]))
         if not isinstance(r["priority"], int):
             _die("%s row %d (%s) has a non-integer priority" % (path, i, r["card"]))
+        if _cell_problem(r["state"]):   # (r3 pass-7 A2) the state cell of the open table
+            _die("%s row %d (%s) has a bad state: %r %s" % (path, i, r["card"], r["state"], _cell_problem(r["state"])))
         _check_row(path, i, r)
     # (r3 A2) the class fix: the named per-field checks above keep their messages; this walk refuses every other string too.
     bad = _non_utf8_text(data)

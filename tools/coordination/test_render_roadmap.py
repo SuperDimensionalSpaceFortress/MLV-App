@@ -1086,5 +1086,78 @@ class R3Tests(unittest.TestCase):
         self.assertEqual(render_roadmap._instant("2026-10-20 00:00:00+01:00"), render_roadmap._instant("2026-10-19T23:00:00Z"))
 
 
+class R3Pass7Tests(R3Tests):
+    """r3 pass 7 (review-adversary-OWNER-ASK-PARK-GUARD-1-r3-9b0c0786) A1-A3, each on its input."""
+
+    # A1: in the collapsed state a closed owner ask (parked or merged, any kind) must not reach the drain counts either.
+    def p7_board(self, *extra: dict) -> dict:
+        data = self.a1_board(*extra)
+        data["scope_notes"] = [{"title": "S", "text": "x" * 701}]
+        return data
+
+    def p7_owners(self, **extra) -> list:
+        return [row("OWNER-%d-%03d" % (day, i), extra.get("state", "parked"), "2026-10-%02dT00:00:00Z" % day, origin="owner",
+                    **{k: v for k, v in extra.items() if k != "state"}) for day in range(17, 24) for i in range(100)]
+
+    def test_p7_a1_closed_product_owner_asks_add_no_count_digit_when_collapsed(self) -> None:
+        base = self.size(self.p7_board())
+        self.assertLessEqual(base, ROADMAP_BUDGET_BYTES)
+        for name, extra in {"parked product": {}, "parked playback resolved": {"kind": "playback", "resolution": "done"},
+                            "merged product": {"state": "merged", "merged_utc": "2026-10-22T00:00:00Z"}}.items():
+            with self.subTest(variant=name):
+                self.assertLessEqual(self.size(self.p7_board(*self.p7_owners(**extra))), base)
+
+    # A2: a line break or pipe in a table cell would forge a card row; such text is bad input (exit 2).
+    FORGE = "C\n| 3 | FORGED | product | queued | 2026-10-20 | - |\n"
+
+    def p7_owner(self, **extra) -> dict:
+        state = extra.pop("state", "queued")
+        return row("OWNER-1", state, self.STAMP, kind="hub-tooling", origin="owner", **extra)
+
+    def test_p7_a2_a_multiline_or_piped_table_cell_is_bad_input(self) -> None:
+        for payload in (self.FORGE, "a|b", "a\rb", "a\tb", "a b", "a\x1bb", "x" * 121):
+            cases = {"state": self.p7_owner(state=payload),
+                     "order_chain.chain": self.p7_owner(order_chain={"chain": payload, "index": 1}),
+                     "order_chain.predecessor": self.p7_owner(order_chain={"chain": "c", "index": 1, "predecessor": payload})}
+            for field, r in cases.items():
+                with self.subTest(field=field, payload=payload[:12]):
+                    code, err = self.load_code(self.board(r))
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(field.split(".")[0], err)
+
+    def test_p7_a2_the_forged_row_never_renders(self) -> None:
+        data = self.board(self.p7_owner(order_chain={"chain": self.FORGE, "index": 1}))
+        self.assertEqual(self.check_code(data), 2)
+
+    def test_p7_a2_a_non_string_state_is_bad_input(self) -> None:
+        for state in ({"|": 1}, ["queued"], 3):
+            with self.subTest(state=state):
+                self.assertEqual(self.load_code(self.board(self.p7_owner(state=state)))[0], 2)
+
+    def test_p7_a2_sibling_a_multiline_scope_note_is_bad_input(self) -> None:
+        for key in ("title", "text"):
+            with self.subTest(key=key):
+                data = self.board(self.p7_owner())
+                note = {"title": "t", "text": "x"}
+                note[key] = "a\n| 3 | FORGED | product | queued | 2026-10-20 | - |"
+                data["scope_notes"] = [note]
+                self.assertEqual(self.load_code(data)[0], 2)
+
+    def test_p7_a2_live_shaped_cells_still_load(self) -> None:
+        r = self.p7_owner(state="pr-open", order_chain={"chain": "ORDER-20261016T035244Z", "index": 2, "predecessor": "CPU-17V9-FPS-GAP-AB-1"})
+        self.assertEqual(self.load_code(self.board(r))[0], 0)
+
+    # A3: rows whose sort keys tie (duplicate ids, equal instants) render the same whatever their input order.
+    def test_p7_a3_input_row_order_does_not_change_the_output(self) -> None:
+        for state in ("queued", "parked"):
+            with self.subTest(state=state):
+                a = row("SAME", state, "2026-10-20T00:00:00Z", order_chain={"chain": "A", "index": 1}, notes="a")
+                b = row("SAME", state, "2026-10-20T01:00:00+01:00", order_chain={"chain": "B", "index": 1}, notes="b")
+                self.assertEqual(render_roadmap.render(self.board(a, b)), render_roadmap.render(self.board(b, a)))
+        a = row("SAME", "parked", "2026-10-20T00:00:00Z", origin="owner", notes="a")
+        b = row("SAME", "parked", "2026-10-20T01:00:00+01:00", origin="owner", notes="b")
+        self.assertEqual(render_roadmap.render(self.board(a, b)), render_roadmap.render(self.board(b, a)))
+
+
 if __name__ == "__main__":
     unittest.main()
