@@ -1,22 +1,20 @@
 # MLV-App product roadmap
 
-Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`
-(schema `mlv-app/card-queue/v1`), the live dispatch surface. It replaces the earlier
-mirror of the frozen dual-lane `queue.json`, whose 16 rows had mostly landed. The
-card-queue file lives under `.claude-state/hub-autopilot/`, which is gitignored and absent
-from every hosted checkout, so this file is the only place a reviewer without local state
-can see the open product backlog. Where the two disagree, `card-queue.json` wins:
-re-render, do not edit by hand. The hub re-renders a live copy to
-`.claude-state/heartbeat/roadmap-live.md` every hour. When this tracked file differs from
-the live queue and is 7 or more days old, a drift detector files a refresh card.
-`--check` is a manual tool: no CI job and no schedule runs it.
+Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`,
+the live dispatch surface. That file lives under `.claude-state/hub-autopilot/`,
+gitignored, absent from hosted checkouts, so this file is the only place a reviewer
+without local state can see the open backlog. Where the two disagree, `card-queue.json`
+wins: re-render, do not edit by hand. The hub renders a live copy to
+`.claude-state/heartbeat/roadmap-live.md` every hour. When this file differs from the live
+queue and is 7 or more days old, a drift detector files a refresh card.
+`--check` is a manual tool; no CI job runs it.
 
 Only rows with `kind` of `product` or `playback` are shown, plus owner asks
-(`origin` = `owner`) of any kind. Other hub-tooling, factory, hygiene and ci-flake cards are
-tooling churn and are not counted here. Rows the board has not classified are not counted
-either, even when the card name says PLAYBACK, unless the owner asked for them.
+(`origin` = `owner`) of any kind. Hub-tooling, factory, hygiene and ci-flake cards are
+tooling churn and are not counted here. Unclassified rows are not counted either, even when
+the card name says PLAYBACK, unless the owner asked.
 
-generated_from: 2026-11-17T20:34:18Z
+generated_from: 2026-11-17T20:47:09Z
 
 ## Open product and playback cards
 

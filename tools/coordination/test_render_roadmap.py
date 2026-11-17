@@ -1598,20 +1598,35 @@ class R10LastTierTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         q, out = Path(tmp.name) / "q.json", Path(tmp.name) / "roadmap.md"
-        # 8944 is the largest note the FULL header leaves room for (ROADMAP-RENDER-CHECK-CI-1: the header's freshness sentence grew it from 9059)
-        for note_len in (8000, 8944):   # fits in an owner-aware tier: written, checked
+        for note_len in (8000, 9059):   # fits in an owner-aware tier: written, checked
             q.write_text(json.dumps(self.data([], note_len, "0001-01-06T23:30:00-01:00")), encoding="utf-8")
             with self.subTest(note_len=note_len), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out)]), 0)
                 self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out), "--check"]), 0)
                 self.assertLessEqual(render_roadmap._budget_size(out.read_bytes().decode("utf-8")), ROADMAP_BUDGET_BYTES)
-        self.assertIn("0001-01-07", render_roadmap.render(self.data([], 8944, "0001-01-06T23:30:00-01:00")))   # the UTC window the loader validated
+        self.assertIn("0001-01-07", render_roadmap.render(self.data([], 9059, "0001-01-06T23:30:00-01:00")))   # the UTC window the loader validated
+
+    # ROADMAP-RENDER-CHECK-CI-1 r2 (adversary A2, introduced major): a longer full-tier header moved the tier boundary, so a board that fit the
+    # owner-aware tier before (19771 CRLF bytes) fell through to the bare tier at 20001 and was read by textual day: four offset-stamped landings
+    # (merged 2026-10-16T23:30:00-01:00 = UTC 2026-10-17) vanished. Class: a header edit that is not budget-neutral in the full tier.
+    def test_a2_the_header_fix_does_not_move_a_near_budget_board_into_the_bare_tier(self) -> None:
+        rows = [row("PRODUCT-%03d" % i, "queued", "2026-09-01T00:00:00Z") for i in range(300)]
+        rows += [row("MERGED-%d" % i, "merged", "2026-09-01T00:00:00Z", merged_utc="2026-10-16T23:30:00-01:00") for i in range(4)]
+        text = render_roadmap.render(self.data(rows, 406))
+        self.assertFalse(text.startswith(MASTER_HEADER), "this board fit the owner-aware tier before the header fix; it must not fall to the bare tier")
+        self.assertIn("| 2026-10-17 | 4 | 0 |", text)   # the four landings, on their UTC day
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+
+    def test_the_full_tier_header_is_budget_neutral_against_the_header_it_replaced(self) -> None:
+        # 970 CRLF bytes is what the full header cost before ROADMAP-RENDER-CHECK-CI-1; a different number moves every board's tier boundary.
+        self.assertEqual(render_roadmap._budget_size(render_roadmap.HEADER), 970)
+        self.assertEqual(render_roadmap._budget_size(render_roadmap.HEADER_BASE), 880)
 
     def test_pass2_a1_an_over_budget_board_with_no_base_rendering_is_refused_with_exit_2(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         q, out = Path(tmp.name) / "q.json", Path(tmp.name) / "roadmap.md"
-        for note_len in (8945, 8946, 12000):   # the first two are one and two bytes past the 8944 that fits (see the A3 test above)
+        for note_len in (9060, 9061, 12000):
             q.write_text(json.dumps(self.data([], note_len, "0001-01-06T23:30:00-01:00")), encoding="utf-8")
             for extra in ([], ["--check"]):
                 err = io.StringIO()
