@@ -470,6 +470,10 @@ param(
     # GUI thread's slot release waits for the recon backend mutex, as before r7), the isolation arm of a same-binary A/B. Absent: nothing is set and the
     # emitted job is the text it was before this parameter.
     [switch]$DisableReconReleaseDeferred,
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the posted due wake (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post: PostMessageW, byte for byte the
+    # delivery before r1), the isolation arm of a same-binary A/B against the sent wake. Absent: nothing is set and the emitted job is the text it was
+    # before this parameter.
+    [switch]$DueWakeDeliveryPost,
     # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the asymmetric playback OpenMP team partition (MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and
     # MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> in the app's env list). Both or neither; 0 (the default) passes nothing and the emitted job is the text it was
     # before these parameters.
@@ -2244,6 +2248,35 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     afterwards is chronologically LATER, and the FIRST playback_smoke.summary line's session id
     is still the measured one.
     #>
+    # SESSION-ANCHOR-1 >>>
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): each marker counts only where it
+    # STARTS the record body, after at most three `[...] ` prefix fields (DualVenueRunner.psm1's $script:DvRecordStart rule), so a
+    # run_metadata command line or any other record holding the marker text never selects the session. This region returns or throws;
+    # the baseline's substring loops after it stay verbatim (the default job's byte-identity pin) and are no longer reached.
+    $recordStart = '^(?:\[[^\]]*\] ){0,3}'
+    # r10 (sol r9 B1 class sweep): the id is the WHOLE token up to whitespace or the end of the line, one plain decimal [0-9]+; a malformed first
+    # marker (or, with no marker, a malformed first summary) is unreadable and throws, never its numeric prefix (id=3x was 3) or a later record's id
+    # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's name (any case, ending at a non-name character) is the marker, read whole
+    # (case-sensitive ` id=`) or as the empty token: `... id`, a doubled space or `ID=` throws unreadable, never skipped for a later marker; same for the summary
+    # r11 pass 11 (A3 sibling, `id=3 id=4`): the marker names the word id once, the summary the word session once (bounded by any non-name character)
+    # r12 (r12 adversary B1 on 7e66a3af, its input: `measured_session id=3 (C:/id/MainWindow.cpp:1)`): words are counted in the record BODY only. A
+    # readable Qt location ` (<path>:<digits>)` (or the old writer's `:%2)`), from the first ` (` that is not the summary's conform group, is cut
+    # first (DualVenueRunner.psm1 Get-DvLogRecordBody); any other ` (` tail is -1, so unreadable (that reader's LOCATION_UNREADABLE). r12 (B3, a Kelvin
+    # sign U+212A before `id=4`): a name character is ASCII [A-Za-z0-9_] matched case-sensitively, (?-i:...), even inside (?i) and -match
+    # r14 (hosted CI on 116db0cb, attr3_publish_write_scan R3/R4): the template may call `&` only on a child executable and only allowlisted .NET
+    # members, so the counter is a function defined here (a known template function) and every ' (' position comes from [regex]::Matches
+    # r18 (r18 adversary A1 on 3945c36c, its input `measured_session id=3 (1 -> 2)"`): the conform group is stepped over only in its place, right after
+    # `gui_fps_status_text="Playback: <n> fps` at the line start or after a space, within 96 characters (Test-DvConformStatusGroupAt's look-back)
+    function Get-MeasuredRecordWordCount([string]$x, [string]$w) { $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $x.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
+    $token = $null
+    foreach ($line in ($RawLog -split "`r?`n")) { if ([regex]::Matches($line, ($recordStart + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant').Count -gt 0) { $token = $(if ((Get-MeasuredRecordWordCount $line 'id') -eq 1 -and (Get-MeasuredRecordWordCount $line 'session') -eq 0 -and $line -cmatch ($recordStart + 'playback_smoke\.measured_session id=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } }
+    if ($null -eq $token) { foreach ($line in ($RawLog -split "`r?`n")) { if ([regex]::Matches($line, ($recordStart + 'playback_smoke\.summary(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant').Count -gt 0) { $token = $(if ((Get-MeasuredRecordWordCount $line 'session') -eq 1 -and $line -cmatch ($recordStart + 'playback_smoke\.summary session=(?<session>\S*)')) { $Matches['session'] } else { '' }); break } } }
+    if ($null -ne $token) {
+        if ($token -cmatch '^[0-9]+$') { return $token }
+        throw ("the measured playback_smoke session id is unreadable (not one whole decimal id): '" + $token + "'")
+    }
+    throw 'no playback_smoke.summary line found in the MLVApp log'
+    # SESSION-ANCHOR-1 <<<
     foreach ($line in ($RawLog -split "`r?`n")) {
         if ($line -match 'playback_smoke\.measured_session id=(?<session>\d+)') {
             return $Matches['session']
@@ -3792,16 +3825,39 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
         $sourceFramesSummaryLine = $candidateLine
     }
 }
+# SESSION-ANCHOR-1 >>>
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling): the summary and conform records count only where they START the record
+# body (the $script:DvRecordStart rule, as Get-MeasuredSmokeSessionId), never as text inside another record; this re-pick replaces the substring
+# pick above (kept verbatim for the default job's byte-identity pin)
+$sourceFramesRecordStart = '^(?:\[[^\]]*\] ){0,3}'
+$sourceFramesSummaryLine = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    # r13 (r12 adversary A1 sibling): culture-invariant, so a tr-TR upper-case summary record is read as every other culture reads it
+    # r14 (hosted CI, scan R4): [regex]::Matches(...).Count, the allowlisted member, not regex::IsMatch
+    if ([regex]::Matches($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant').Count -gt 0) {
+        $sourceFramesSummaryLine = $candidateLine
+    }
+}
+# r19 (r18 adversary A1 on 1d2d2850, its input: a summary whose Qt location `(C:/build source_advanced=600 x/MainWindow.cpp:1)` outvoted the record's own
+# source_advanced=1): each picked record is reduced to its BODY by DualVenueRunner.psm1's Get-DvLogRecordBody rule before any field is read. The first ` (`
+# that is not the summary's in-place conform group (`gui_fps_status_text="Playback: <n> fps (<a> -> <b>)"`) starts the location; a readable
+# ` (<path>:<digits>)` / `:%2)` tail is cut, and any other tail makes the record unreadable ($null: no pick, so the oracle refuses)
+function Get-SourceFramesRecordBody([string]$x) { $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $x.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -lt 0) { return $x }; if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return $null }; $x.Substring(0, $o) }
+if ($null -ne $sourceFramesSummaryLine) { $sourceFramesSummaryLine = Get-SourceFramesRecordBody $sourceFramesSummaryLine }
+# SESSION-ANCHOR-1 <<<
 $sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce
 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>
 # The measured session's playback_smoke.conform line (the last one wins). Only a conform line the oracle can PROVE (active, this session, rates
 # consistent with the summary) moves the PACE rule off the native fps; absent = the verdict above stands. The 20 s floor is never relaxed.
 $sourceFramesConformLine = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
-    if ($candidateLine -match ('playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+    # r13 (r12 adversary A1 sibling): culture-invariant, as the summary pick above
+    if ([regex]::Matches($candidateLine, ($sourceFramesRecordStart + 'playback_smoke\.conform session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)'), 'IgnoreCase, CultureInvariant').Count -gt 0) {
         $sourceFramesConformLine = $candidateLine
     }
 }
+# r19 (r18 adversary A1 sibling :3829): the conform record is read as its body too, so a location that says conform_active=1 never proves a conform
+if ($null -ne $sourceFramesConformLine) { $sourceFramesConformLine = Get-SourceFramesRecordBody $sourceFramesConformLine }
 $sourceFramesVerdict = Get-AttrCudaConformAwareSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce -ConformLine $sourceFramesConformLine
 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<
 $sourceFramesWrapped = [bool]$sourceFramesVerdict.wrapped
@@ -5032,12 +5088,21 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         if ([string]::IsNullOrEmpty($LogText)) { return $r }
         $lines = @($LogText -split "`r?`n")
         $sid = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
-        if ($null -eq $sid) { return $r }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling): the selectors count a marker only where it STARTS the record body
+        # (the $script:DvRecordStart rule), so a marker inside another record's text never picks the session
+        $recordStart = '^(?:\[[^\]]*\] ){0,3}'
+        # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed one is no session (never its numeric prefix)
+        # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's (else the summary's) name is read whole or is the empty token (no session)
+        # r11 pass 11 (A3 sibling): the marker names the word id once, the summary the word session once
+        # r12 (r12 adversary B1 + B3 siblings): counted in the record body only (a readable Qt location cut, any other ` (` tail -1), ASCII name characters
+        $wc = { param([string]$x, [string]$w) $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $x.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
+        foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($recordStart + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'id') -eq 1 -and (& $wc $ln 'session') -eq 0) { $mm.Groups[1].Value } else { '' }); break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($recordStart + 'playback_smoke\.summary(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $recordStart + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'session') -eq 1) { $mm.Groups[1].Value } else { '' }); break } } }
+        if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $r }
         $r.session = [int64]$sid
         $stamp = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.start session=' + $sid + '(\s|$)'); if ($mm.Success) { $stamp = $mm.Groups['ts'].Value; break } }
+        # r18 (r18 adversary A2 sibling): the start record is read whole (the word session once in its body), else it is no start stamp, never this session's
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.start session=' + $sid + '(\s|$)'); if ($mm.Success) { if ((& $wc $ln 'session') -eq 1) { $stamp = $mm.Groups['ts'].Value }; break } }
         if ($null -eq $stamp) { return $r }
         $pt = [DateTime]::MinValue
         if (-not [DateTime]::TryParse($stamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$pt)) { return $r }
@@ -6481,6 +6546,18 @@ if ($DisableReconReleaseDeferred) {
     })
 }
 
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the posted-wake arm adds MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post at the same env-list site, only when
+# asked. The anchor must match exactly once, or the generator throws (the runner also requires the app's own playback_due_wake delivery_kind=post before
+# the leg counts).
+if ($DueWakeDeliveryPost) {
+    $dueWakeDeliveryEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($dueWakeDeliveryEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_DUE_WAKE_DELIVERY_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY to' }
+    $text = $dueWakeDeliveryEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post'," + $m.Groups['nl'].Value
+    })
+}
+
 # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the team-partition arm adds MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> at the same
 # env-list site, only when asked, both or neither. The anchor must match exactly once, or the generator throws (the runner also requires the app's own
 # playback_smoke.omp_teams record to report recon_omp=<r> prep_omp=<p> before the leg counts).
@@ -7505,16 +7582,27 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         $sid = $null
         # adversary 693bf053 A3: only a line that starts with the log sink's prefix counts, so a marker quoted in another line's source-location suffix
         # (a build path such as "C:/b playback_smoke.measured_session id=1 x/MainWindow.cpp:1") is never taken for the measured-session or summary line
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.measured_session id=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
-        if ($null -eq $sid) { return $null }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (r10 adversary advisory A1): the FIRST marker's whole id token, one plain decimal [0-9]+;
+        # a malformed one (id=3x) is no window, never skipped for a later Play's marker (the Get-CorePartitionPlaybackStart rule)
+        # r11 (r10 adversary A1 sibling): the FIRST record starting with the marker's (else the summary's) name is read whole or is the empty token (no window)
+        $ux = '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] '
+        # r11 pass 11 (A3 sibling): the marker names the word id once, the summary the word session once
+        # r12 (r12 adversary B1 + B3 siblings): counted in the record body only (a readable Qt location cut, any other ` (` tail -1), ASCII name characters
+        $wc = { param([string]$x, [string]$w) $p = [regex]::Matches($x, ' \('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $x.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
+        foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($ux + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.measured_session id=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'id') -eq 1 -and (& $wc $ln 'session') -eq 0) { $mm.Groups[1].Value } else { '' }); break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { if ([regex]::IsMatch($ln, ($ux + 'playback_smoke\.summary(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $mm = [regex]::Match($ln, $ux + 'playback_smoke\.summary session=(\S*)'); $sid = $(if ($mm.Success -and (& $wc $ln 'session') -eq 1) { $mm.Groups[1].Value } else { '' }); break } } }
+        if ($null -eq $sid -or $sid -cnotmatch '^[0-9]+$') { return $null }
         $stamp = $null; $startTh = $null
         $begins = [Collections.Generic.Dictionary[string, string]]::new()
         foreach ($ln in $lines) {
             $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] interaction_trace event=play\.toggled\.begin checked=1(\s|$)')
             if ($mm.Success) { $begins[$mm.Groups['th'].Value] = $mm.Groups['ts'].Value; continue }
-            $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] playback_smoke\.start session=(?<id>\d+)(\s|$)')
-            if (-not $mm.Success) { continue }
+            $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] playback_smoke\.start session=(?<id>[0-9]+)(\s|$)')
+            # r11 (r10 adversary A2 sibling): a start record not read whole (session= empty or 4x, no session first, a doubled space) may be another
+            # Play's start, so no begin line before it can be shown to be the measured session's anchor: every begin seen so far is dropped
+            # r18 (r18 adversary A2, `playback_smoke.start session=3 session=4`): read whole also means the body names the word session once
+            if ($mm.Success -and (& $wc $ln 'session') -ne 1) { $mm = [regex]::Match('', 'x') }
+            if (-not $mm.Success) { if ([regex]::IsMatch($ln, ($ux + 'playback_smoke\.start(?!(?-i:[A-Za-z0-9_]))'), 'IgnoreCase, CultureInvariant')) { $begins.Clear() }; continue }
             if ($mm.Groups['id'].Value -ceq $sid) { $stamp = $mm.Groups['ts'].Value; $startTh = $mm.Groups['th'].Value; break }
             [void]$begins.Remove($mm.Groups['th'].Value)
         }
@@ -7940,6 +8028,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
     prepConflatedMove = [bool]$PrepConflatedMove
     disableReconReleaseDeferred = [bool]$DisableReconReleaseDeferred
+    dueWakeDeliveryPost = [bool]$DueWakeDeliveryPost
     reconOmpThreads = $(if ($ReconOmpThreads -gt 0) { $ReconOmpThreads } else { $null })
     prepOmpThreads = $(if ($PrepOmpThreads -gt 0) { $PrepOmpThreads } else { $null })
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })

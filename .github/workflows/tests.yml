@@ -374,14 +374,16 @@ jobs:
     # Eleven parts since CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: re-derived from seven green merge_group
     # runs the suite weighs 17510 s at each class's largest measured time, past the 13962 s that
     # 7 shards plus 6 parts hold at the 85 % limit; 17 more classes moved into the heavy set.
-    name: Repo Hygiene Python windows unittest heavy ${{ matrix.part }}/11
+    # Twelve parts since HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r23: its merge with master
+    # 42597216 left 57 s of slack across 7 shards plus 11 parts at the 85 % limit (19275 s of weight).
+    name: Repo Hygiene Python windows unittest heavy ${{ matrix.part }}/12
     runs-on: windows-latest
     # The shard job's cap and budget: each part is expected at about 16-18 min including setup.
     timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
     steps:
       - name: Record the job start for the shard budget clock

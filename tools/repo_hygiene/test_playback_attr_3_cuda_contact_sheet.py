@@ -754,6 +754,215 @@ class MeasuredSmokeSessionIdTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ID=7", proc.stdout)
 
+    def test_r5_a_marker_counts_only_where_it_starts_the_record_body(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): the dual-venue
+        # reader's $script:DvRecordStart rule -- at most three `[...] ` prefix fields, then the marker. A run_metadata
+        # command line (or any record) holding the marker text never selects the session; before r5 it chose 9.
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        meta = prefix + 'run_metadata={"command_line":["MLVApp.exe","C:/runs/playback_smoke.measured_session id=9/in"]}\n'
+        for name, log, expected in (
+            ("embedded measured marker", meta + prefix + "playback_smoke.measured_session id=2\n"
+             + prefix + "playback_smoke.summary session=2 reason=play-stop elapsed_ms=1000\n", "ID=2"),
+            ("embedded summary text before the real summary", prefix + "interaction_trace event=x note=playback_smoke.summary session=9 reason=y\n"
+             + prefix + "playback_smoke.summary session=7 reason=play-stop elapsed_ms=1000\n", "ID=7"),
+            ("bare marker", "playback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n", "ID=4"),
+        ):
+            with self.subTest(case=name):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(expected, proc.stdout)
+        # only embedded text: neither a marker nor a summary record, so the selector refuses
+        proc = self._run(meta)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_r10_a_malformed_session_id_is_unreadable_never_its_numeric_prefix(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (sol r9 B1 class sweep, playback-attr-3-cuda-job.ps1:2247/2248): the id is the
+        # whole token up to whitespace or the end of the line. Before r10 `id=3x` (3.5, 3/old) returned 3, the numeric prefix, although a valid
+        # id=4 followed; now a malformed first marker (or, with no marker, a malformed first summary) throws: the measured session is unreadable.
+        for token in ("3x", "3.5", "3/old", "", "-3", "٣"):
+            for name, log in (
+                ("measured marker", f"playback_smoke.measured_session id={token}\nplayback_smoke.summary session=3 reason=play-stop\n"
+                 "playback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n"),
+                ("summary fallback", f"playback_smoke.summary session={token} reason=play-stop\nplayback_smoke.summary session=4 reason=play-stop\n"),
+            ):
+                with self.subTest(token=token, case=name):
+                    proc = self._run(log)
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertNotIn("ID=", proc.stdout)
+                    self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        # controls: a whole id still selects, and a tab after it is whitespace
+        for log, expected in (("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\n", "ID=3"),
+                              ("playback_smoke.measured_session id=3\tx\nplayback_smoke.summary session=3 reason=play-stop\n", "ID=3"),
+                              ("playback_smoke.summary session=12 reason=play-stop\n", "ID=12")):
+            with self.subTest(control=log):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(expected, proc.stdout)
+
+    def test_r11_a_first_marker_or_summary_not_read_whole_is_unreadable_never_a_later_one(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r11 (r10 adversary A1 sibling, playback-attr-3-cuda-job.ps1:2250/2251): a first record that
+        # starts `playback_smoke.measured_session` (or, with no marker, `playback_smoke.summary`) but has no whole `id=<n>` (`session=<n>`) right after
+        # it is unreadable. On 205a5b6c the selector needed the literal `id=` / `session=`, skipped the record and returned the later session 4.
+        for shape in ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session  id=3",
+                      "playback_smoke.measured_session ID=3", "playback_smoke.measured_session id:3",
+                      # r11 pass 11 A3 sibling (:2252): the word id named twice
+                      "playback_smoke.measured_session id=3 id=4", 'playback_smoke.measured_session id=3 "id=4"'):
+            log = f"{shape}\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n"
+            with self.subTest(shape=shape):
+                proc = self._run(log)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        for shape in ("playback_smoke.summary", "playback_smoke.summary session", "playback_smoke.summary reason=play-stop session=3",
+                      "playback_smoke.summary  session=3 reason=play-stop", "playback_smoke.summary session=3 session=4 reason=play-stop"):
+            log = f"{shape}\nplayback_smoke.summary session=4 reason=play-stop\n"
+            with self.subTest(summary=shape):
+                proc = self._run(log)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        # control: another record name is not the marker
+        proc = self._run("playback_smoke.measured_session_v2 id=9\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ID=4", proc.stdout)
+
+    def test_r12_words_are_counted_in_the_record_body_with_ascii_name_characters(self) -> None:
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r12 (r12 adversary on 7e66a3af). B1 (playback-attr-3-cuda-job.ps1:2254/2255): a valid Qt
+        # location `(C:/id/MainWindow.cpp:1)` is not the record's, so the id / session in its path is not a second mention; 7e66a3af threw
+        # unreadable. B3: a Kelvin sign U+212A (or U+0130) beside `id=4` / `session=4` is not a name character, so that is a second mention.
+        summary = "playback_smoke.summary session=3 elapsed_ms=20000 presented_fps=50\n"
+        for log in ("playback_smoke.measured_session id=3 (C:/id/MainWindow.cpp:1)\n" + summary,
+                    "playback_smoke.measured_session id=3 (C:/session/MainWindow.cpp:1)\n" + summary,
+                    "playback_smoke.measured_session id=3 (C:/id/x%1.cpp:%2)\n" + summary,
+                    "playback_smoke.summary session=3 (C:/session/MainWindow.cpp:1)\n",
+                    'playback_smoke.summary session=3 gui_fps_status_text="Playback: 24 fps (59.94 -> 24)" presented_fps=24 (C:/session/MainWindow.cpp:1)\n'):
+            with self.subTest(control=log):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("ID=3", proc.stdout)
+        later = "\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n"
+        for shape in ("playback_smoke.measured_session id=3 \u212aid=4", "playback_smoke.measured_session id=3 \u0130d=4 \u212asession=4",
+                      "playback_smoke.measured_session id=3 (id=4)", "playback_smoke.measured_session id=3 (C:/a/MainWindow.cpp)",
+                      "playback_smoke.measured_session\u212a id=4"):
+            with self.subTest(shape=shape):
+                proc = self._run(shape + later)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        for shape in ("playback_smoke.summary session=3 \u212asession=4", "playback_smoke.summary session=3 (session=4)"):
+            with self.subTest(summary=shape):
+                proc = self._run(shape + "\nplayback_smoke.summary session=4 reason=play-stop\n")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+
+    def test_r12_every_sibling_session_selector_uses_the_one_body_scoped_ascii_counter(self) -> None:
+        # r12 (r12 adversary B1 + B3 siblings :5057-5059, :7534-7536, :7546): the core-partition and utilisation selectors count words with the same
+        # body-scoped, ASCII-boundary counter as Get-MeasuredSmokeSessionId, and no name boundary in the job is left on an IgnoreCase class
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        # r14 (hosted CI on 116db0cb, attr3_publish_write_scan R3/R4): every ' (' position comes from [regex]::Matches (no IndexOf /
+        # StringComparison::Ordinal), and the template's copy is a function it defines (no `&` on a script block); the two generator copies stay blocks
+        body = ("$p = [regex]::Matches($x, ' \\('); $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 }); if ($o -ge 0 -and $x.Substring($o) -cmatch "
+                "'^ \\([0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\\.[0-9]+)?(?:e[+-][0-9]+)?\\)\"' -and $x.Substring(0, $o) -cmatch "
+                "'(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text=\"Playback: [0-9]+(?:\\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }; "
+                "if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \\(.+:(?:[0-9]+|%2)\\)$') { return -1 }; $x = $x.Substring(0, $o) }; "
+                "[regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }")
+        self.assertEqual(text.count(body), 3)
+        self.assertEqual(text.count("{ param([string]$x, [string]$w) " + body), 2)
+        self.assertEqual(text.count("function Get-MeasuredRecordWordCount([string]$x, [string]$w) { " + body), 1)
+        self.assertNotIn("& $wordCount", text)
+        self.assertNotIn("$x.IndexOf(' (', ", text)
+        self.assertNotIn("(?![A-Za-z0-9_])", text)
+        self.assertNotIn("(?<![A-Za-z0-9_])", text)
+        # r12 pass 13 (A2 siblings :2258/:2259, :5063/:5064, :7541/:7542, :7552; AttrCudaArtifacts :3497): no session selector matches a record name
+        # with -match or (?i), which follow the process culture (tr-TR skipped an upper-case marker)
+        for prefix in ("$recordStart + 'playback_smoke", "$ux + 'playback_smoke"):
+            self.assertNotIn("-match (" + prefix, text)
+        # r13 (r12 adversary A1 siblings :3810/:3821): the anchored summary and conform re-picks are the eighth and ninth
+        # r14 (scan R4): the four in the emitted template (:2258/:2259, :3811/:3823) read [regex]::Matches(...).Count; the five generator ones keep IsMatch
+        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant'))"), 5)
+        self.assertEqual(text.count("'), 'IgnoreCase, CultureInvariant').Count -gt 0)"), 4)
+        self.assertEqual(text.count("[regex]::IsMatch($line, ($recordStart"), 0)
+        self.assertEqual(text.count("[regex]::IsMatch($candidateLine"), 0)
+        self.assertNotIn("-match ($sourceFramesRecordStart", text)
+        artifacts = (ATTRIBUTION_GENERATOR.parent / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
+        region = artifacts[artifacts.index("    $sessionLine = {"):artifacts.index("    $telemetry = {")]
+        self.assertNotIn("'(?i", region)  # no inline (?i) / (?i: regex literal (the comments may name it)
+        self.assertEqual(region.count("'IgnoreCase, CultureInvariant'"), 2)
+
+    def test_r12_p13_under_tr_tr_an_upper_case_first_marker_is_unreadable_never_a_later_one(self) -> None:
+        # r12 pass 13 A2 sibling (Get-MeasuredSmokeSessionId :2258/:2259): the session pick runs in a fresh pwsh whose culture is tr-TR
+        for log in ("PLAYBACK_SMOKE.MEASURED_SESSION id=3\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop\n",
+                    "PLAYBACK_SMOKE.SUMMARY session=3\nplayback_smoke.summary session=4 reason=play-stop\n",
+                    "playback_smoke.measured_session id=3 ID=4\nplayback_smoke.summary session=3 reason=play-stop\n"):
+            with self.subTest(log=log):
+                tmp = tempfile.TemporaryDirectory(prefix="measured-session-id-tr-")
+                self.addCleanup(tmp.cleanup)
+                script = Path(tmp.name) / "probe.ps1"
+                script.write_text("$ErrorActionPreference = 'Stop'\n[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n" + self._function_text() + "\n"
+                                  "Write-Output ('ID=' + (Get-MeasuredSmokeSessionId '" + log.replace("'", "''") + "'))\n", encoding="utf-8")
+                proc = _run_pwsh_file(script)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+
+    def test_r18_a1_the_conform_group_is_stepped_over_only_after_the_status_field(self) -> None:
+        # r18 (r18 adversary A1 on 3945c36c, playback-attr-3-cuda-job.ps1:2258 + siblings :5067 :7545): a ` (<n> -> <n>)"` group that does not follow
+        # `gui_fps_status_text="Playback: <n> fps` is no conform group, so the ` (` is the location and an unreadable one; 3945c36c returned ID=3
+        later = "\nplayback_smoke.summary session=3 presented_fps=50\n"
+        for shape in ('playback_smoke.measured_session id=3 (1 -> 2)"', 'playback_smoke.measured_session id=3 x="Playback: 24 fps (1 -> 2)"',
+                      'playback_smoke.measured_session id=3 xgui_fps_status_text="Playback: 24 fps (1 -> 2)"',
+                      'playback_smoke.summary session=3 (1 -> 2)"',
+                      'playback_smoke.summary session=3 gui_fps_status_text="Playback: ' + "9" * 70 + ' fps (1 -> 2)"'):
+            with self.subTest(shape=shape):
+                proc = self._run(shape + later)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("ID=", proc.stdout)
+                self.assertIn("unreadable", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+        # controls: the group in its place, with and without a location after it
+        for log in ('playback_smoke.summary session=3 gui_fps_status_text="Playback: 24 fps (59.94 -> 24)" presented_fps=24\n',
+                    'playback_smoke.summary session=3 gui_fps_status_text="Playback: 23.9 fps (59.94 -> 23.976)" x=1 (C:/a/MainWindow.cpp:9)\n'):
+            with self.subTest(control=log):
+                proc = self._run(log)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("ID=3", proc.stdout)
+
+    def _sibling_probe(self, body: str) -> subprocess.CompletedProcess:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        parts = []
+        for name in ("ConvertFrom-CorePartitionNumber", "Get-CorePartitionPlaybackStart", "Get-UtilSamplePlayWindow"):
+            start = text.index("\nfunction " + name + "(") + 1
+            parts.append(text[start:text.index("\nfunction ", start)])
+        tmp = tempfile.TemporaryDirectory(prefix="measured-session-sib-")
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "probe.ps1"
+        script.write_text("$ErrorActionPreference = 'Stop'\n" + "\n".join(parts) + "\n" + body, encoding="utf-8")
+        return _run_pwsh_file(script)
+
+    def test_r18_a1_a2_siblings_the_core_partition_and_util_window_selectors(self) -> None:
+        # r18 (r18 adversary A1 siblings :5067/:7545; A2 :7554 + sibling :5073): the core-partition start and the utilisation Play window take no session
+        # from a marker whose ` (<n> -> <n>)"` is not the status group, and no start stamp from a start record that names the word session twice
+        p = "[2026-11-13T00:00:0{0}.000Z] [INFO] [0x1] "
+        begin = p.format(0) + "interaction_trace event=play.toggled.begin checked=1"
+        summary = "[2026-11-13T00:00:21.000Z] [INFO] [0x1] playback_smoke.summary session=3 elapsed_ms=20000"
+        def log(start: str, marker: str) -> str:
+            return "\n".join((begin, p.format(1) + start, "[2026-11-13T00:00:01.001Z] [INFO] [0x1] " + marker, summary))
+        cases = {
+            "good": log("playback_smoke.start session=3", "playback_smoke.measured_session id=3"),
+            "a1": log("playback_smoke.start session=3", 'playback_smoke.measured_session id=3 (1 -> 2)"'),
+            "a2": log("playback_smoke.start session=3 session=4", "playback_smoke.measured_session id=3"),
+        }
+        body = ""
+        for key, value in cases.items():
+            literal = "'" + value.replace("'", "''") + "'"
+            body += (f"$c = Get-CorePartitionPlaybackStart {literal} 1 1 1 0 $null; $w = Get-UtilSamplePlayWindow {literal}\n"
+                     f"Write-Output ('{key} session=' + $c.session + ' startTicks=' + $c.playbackStartUtcTicks + ' window=' + $(if ($null -eq $w) {{ 'NULL' }} else {{ 'SET' }}))\n")
+        proc = self._sibling_probe(body)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = {ln.split(" ", 1)[0]: ln for ln in proc.stdout.splitlines() if ln.strip()}
+        self.assertRegex(lines["good"], r"^good session=3 startTicks=[0-9]+ window=SET$")
+        self.assertEqual(lines["a1"], "a1 session= startTicks= window=NULL")
+        self.assertEqual(lines["a2"], "a2 session=3 startTicks= window=NULL")
+
     def test_throws_when_neither_marker_nor_summary_is_present(self) -> None:
         proc = self._run("nothing relevant here\n")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
