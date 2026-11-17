@@ -626,6 +626,24 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         got = self.validate(receipt, spec, dv=mutated)
         self.assertFalse(got["valid"], got)
 
+    def test_mutation_without_the_export_hash_recheck_an_edited_export_file_is_not_caught_by_the_hash(self) -> None:
+        """r6 (hosted CI): the sha256 recheck line exists twice in DualVenueRunner.psm1, so the anchor test in test_dual_venue_evidence.py now names the capture-evidence
+        copy and this one names the export-evidence copy ($Invalid, then "export/$name"). The unmutated validator names the hash mismatch of a tampered export/batch.log;
+        with only the export copy disabled it no longer does, so the export loop's recheck is what produces that reason."""
+        spec = self.export_spec(maxframes=30)
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        (Path(receipt["evidence"]["localEvidenceDir"]) / "export" / "batch.log").write_text(batch_log(29), encoding="utf-8")
+        plain = self.validate(receipt, spec)
+        self.assertEqual(plain["status"], "INVALID", plain)
+        self.assertTrue(any("EVIDENCE_HASH_MISMATCH: export/batch.log" in x for x in plain["reasons"]), plain)
+        anchor = 'if ((Get-DvSha256OfBytes $b) -cne $claim) { $Invalid.Add("EVIDENCE_HASH_MISMATCH: export/$name'
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", anchor, anchor.replace("if ((Get-DvSha256OfBytes $b) -cne $claim) {", "if ($false) {"))])
+        got = self.validate(receipt, spec, dv=mutated)
+        self.assertFalse(any("EVIDENCE_HASH_MISMATCH: export/batch.log" in x for x in got["reasons"]), got)
+
 
 @requires_windows_pwsh
 class ExportJobGeneratorTests(unittest.TestCase):

@@ -4055,7 +4055,11 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("ADVISORY", False))
 
     def test_mutation_without_the_evidence_hash_recheck_an_edited_file_validates(self) -> None:
-        mutated = self.mutated_module([("if ((Get-DvSha256OfBytes $b) -cne $claim) {", "if ($false) {")])
+        # r6: the recheck line exists twice in the module (the capture-evidence loop, then the export loop). The anchor names the capture copy by the text after
+        # the condition ($invalid, then "$($rel"); the export copy ($Invalid, then "export/$name") is proven by test_mutation_without_the_export_hash_recheck_... in
+        # test_dual_venue_export_leg.py.
+        mutated = self.mutated_module([('if ((Get-DvSha256OfBytes $b) -cne $claim) { $invalid.Add("EVIDENCE_HASH_MISMATCH: $($rel',
+                                        'if ($false) { $invalid.Add("EVIDENCE_HASH_MISMATCH: $($rel')])
         repo = self.prod_repo()
         ev = self.evidence("m5")
         receipt = self.receipt_for(repo, ev)

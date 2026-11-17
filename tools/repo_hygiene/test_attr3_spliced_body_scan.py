@@ -59,6 +59,7 @@ TEMPLATE_GENERATORS = (
 # text they carry is the same text, so their names are enumerated too.
 SPLICE_SOURCES = TEMPLATE_GENERATORS + (
     BACHELOR / "reference-frame-runner-job.ps1",
+    BACHELOR / "export-stage-job.ps1",
     BACHELOR / "Attr3FootagePresenceJob.psm1",
     BACHELOR / "Attr3FootageReadRateJob.psm1",
     BACHELOR / "Attr3FootageStageJob.psm1",
