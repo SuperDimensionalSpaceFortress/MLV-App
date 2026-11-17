@@ -83,7 +83,7 @@ DECLARED_RX = re.compile(r"declared@(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
 DECLARED_TOKEN_RX = re.compile(r"declared@(\S*)")
 TOKEN_TRAILING_PUNCT = ".,;:)]}'\""
 
-HEADER = """\
+_HEADER_TOP = """\
 # MLV-App product roadmap
 
 Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`
@@ -92,7 +92,12 @@ mirror of the frozen dual-lane `queue.json`, whose 16 rows had mostly landed. Th
 card-queue file lives under `.claude-state/hub-autopilot/`, which is gitignored and absent
 from every hosted checkout, so this file is the only place a reviewer without local state
 can see the open product backlog. Where the two disagree, `card-queue.json` wins:
-re-render, do not edit by hand. The hub checks freshness with `--check`.
+re-render, do not edit by hand."""
+# What this file's freshness really rests on (ROADMAP-RENDER-CHECK-CI-1): no caller runs `--check`, so the header must not say the hub does.
+HEADER = _HEADER_TOP + """ The hub re-renders a live copy to
+`.claude-state/heartbeat/roadmap-live.md` every hour. When this tracked file differs from
+the live queue and is 7 or more days old, a drift detector files a refresh card.
+`--check` is a manual tool: no CI job and no schedule runs it.
 
 Only rows with `kind` of `product` or `playback` are shown, plus owner asks
 (`origin` = `owner`) of any kind. Other hub-tooling, factory, hygiene and ci-flake cards are
@@ -101,8 +106,10 @@ either, even when the card name says PLAYBACK, unless the owner asked for them.
 """
 # The bare (last) render tier is master's file for every board without a resolved owner park (a resolved one is labelled with its
 # resolution, or left out, in _render_base; tied rows are ordered), so it carries master's header: the longer HEADER above would
-# push a board that fit the budget on master over it (r4 blocker).
-HEADER_BASE = HEADER.split("\nOnly rows with", 1)[0] + """
+# push a board that fit the budget on master over it (r4 blocker). Master's one false sentence ("The hub checks freshness with `--check`.",
+# 40 bytes) is replaced by a true one of the SAME 40 bytes, so every board's byte count in this tier is still exactly master's.
+HEADER_BASE = _HEADER_TOP + """ `--check` is manual; no hub job runs it.
+
 Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.

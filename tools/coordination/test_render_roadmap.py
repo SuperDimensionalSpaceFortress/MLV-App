@@ -259,6 +259,15 @@ class OutputShapeTests(unittest.TestCase):
         self.assertIn("refresh card", text)
         self.assertIn("`--check` is a manual tool", text)
 
+    def test_the_bare_tier_header_drops_the_false_claim_at_master_s_byte_count(self) -> None:
+        # The bare tier is held to master's byte count (the 20000-byte window): its true sentence is the same 40 bytes as the false one it replaces.
+        false_claim = "The hub checks freshness with `--check`."
+        true_claim = "`--check` is manual; no hub job runs it."
+        self.assertEqual(len(true_claim.encode("utf-8")), len(false_claim.encode("utf-8")))
+        base = render_roadmap._render_base(load_fixture())
+        self.assertNotIn("checks freshness", base)
+        self.assertIn("re-render, do not edit by hand. " + true_claim + "\n", base)
+
     def test_ends_with_one_newline_and_has_no_carriage_returns(self) -> None:
         text = render_roadmap.render(load_fixture())
         self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
@@ -1277,6 +1286,9 @@ class R4DepthTests(unittest.TestCase):
         self.assertLessEqual(render_roadmap.MAX_NESTING, 100)   # a bound that would not stop the 3,000-deep input is no bound
 
 
+# ROADMAP-RENDER-CHECK-CI-1: the one deliberate difference from fork/master's header below is the freshness sentence. Master said "The hub checks
+# freshness with `--check`." (40 bytes; no caller runs it). The pinned copy says the true thing in the SAME 40 bytes, so every byte count the
+# window tests pin (19999, 20000, 19989 ...) still means "master's size".
 # (r5, review-pr835-opus-r4 blocker + hardening) master's renderer, embedded as it stood on fork/master before this card. The budget
 # window tests measure "fits at base" against THIS copy, never against the renderer under test: a change to the shared header or to
 # any other shared text moves the new renderer and this copy apart, which turns them red. Stamps in these boards are plain Z-stamps,
@@ -1290,7 +1302,7 @@ mirror of the frozen dual-lane `queue.json`, whose 16 rows had mostly landed. Th
 card-queue file lives under `.claude-state/hub-autopilot/`, which is gitignored and absent
 from every hosted checkout, so this file is the only place a reviewer without local state
 can see the open product backlog. Where the two disagree, `card-queue.json` wins:
-re-render, do not edit by hand. The hub checks freshness with `--check`.
+re-render, do not edit by hand. `--check` is manual; no hub job runs it.
 
 Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
@@ -1586,19 +1598,20 @@ class R10LastTierTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         q, out = Path(tmp.name) / "q.json", Path(tmp.name) / "roadmap.md"
-        for note_len in (8000, 9059):   # fits in an owner-aware tier: written, checked
+        # 8944 is the largest note the FULL header leaves room for (ROADMAP-RENDER-CHECK-CI-1: the header's freshness sentence grew it from 9059)
+        for note_len in (8000, 8944):   # fits in an owner-aware tier: written, checked
             q.write_text(json.dumps(self.data([], note_len, "0001-01-06T23:30:00-01:00")), encoding="utf-8")
             with self.subTest(note_len=note_len), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out)]), 0)
                 self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out), "--check"]), 0)
                 self.assertLessEqual(render_roadmap._budget_size(out.read_bytes().decode("utf-8")), ROADMAP_BUDGET_BYTES)
-        self.assertIn("0001-01-07", render_roadmap.render(self.data([], 9059, "0001-01-06T23:30:00-01:00")))   # the UTC window the loader validated
+        self.assertIn("0001-01-07", render_roadmap.render(self.data([], 8944, "0001-01-06T23:30:00-01:00")))   # the UTC window the loader validated
 
     def test_pass2_a1_an_over_budget_board_with_no_base_rendering_is_refused_with_exit_2(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         q, out = Path(tmp.name) / "q.json", Path(tmp.name) / "roadmap.md"
-        for note_len in (9060, 9061, 12000):
+        for note_len in (8945, 8946, 12000):   # the first two are one and two bytes past the 8944 that fits (see the A3 test above)
             q.write_text(json.dumps(self.data([], note_len, "0001-01-06T23:30:00-01:00")), encoding="utf-8")
             for extra in ([], ["--check"]):
                 err = io.StringIO()
