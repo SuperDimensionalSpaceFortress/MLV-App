@@ -99,8 +99,9 @@ Only rows with `kind` of `product` or `playback` are shown, plus owner asks
 tooling churn and are not counted here. Rows the board has not classified are not counted
 either, even when the card name says PLAYBACK, unless the owner asked for them.
 """
-# The bare (last) render tier is master's file byte for byte, so it carries master's header: the
-# longer HEADER above would push a board that fit the budget on master over it (r4 blocker).
+# The bare (last) render tier is master's file for every board without a resolved owner park (a resolved one is labelled with its
+# resolution, or left out, in _render_base; tied rows are ordered), so it carries master's header: the longer HEADER above would
+# push a board that fit the budget on master over it (r4 blocker).
 HEADER_BASE = HEADER.split("\nOnly rows with", 1)[0] + """
 Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
@@ -318,7 +319,7 @@ def render(data: dict) -> str:
     # (r4 pass 2 A1, r7 A1) the owner section, the owner-aware header and the UTC-instant day reading all cost bytes the base never spent:
     # a product-only board that fit the budget at base (19999 CRLF bytes) was 20143, then 20001 with a closed owner ask, then 20001 with
     # an offset merged_utc. So the base's own algorithm is tried next: the file is the base's, byte for byte, for every input whose base file fit
-    # and holds no resolved owner park; (r11 A1) a resolved one is labelled with its resolution, one line longer than master's, and (r13) when
+    # and holds no resolved owner park and no tied rows (tied rows are put in one canonical order, which master left to input order); (r11 A1) a resolved one is labelled with its resolution, one line longer than master's, and (r13) when
     # that does not fit it is left out. (r10 A1) A candidate is taken only when it fits. Master lists every parked product-kind owner ask, uncapped and unlabelled: 112 of them made
     # the file 23006 bytes. Then the same algorithm runs on the board without its closed owner asks (the collapsed tier counts none of them
     # either, and they stay in card-queue.json), and when even that is over budget the collapsed text stands: product rows are never dropped.
