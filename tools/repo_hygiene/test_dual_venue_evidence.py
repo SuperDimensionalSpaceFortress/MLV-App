@@ -7446,7 +7446,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.jsonschema.validate(spec, self.schema)
             self.assertTrue(spec["backends"], path.name)
             types.add(spec["legType"])
-        self.assertEqual(types, {"speed", "look"})
+        # EXPORT-VENUE-LEG-1: the four export legs (cpu-only batch export stage timing) are the third leg type
+        self.assertEqual(types, {"speed", "look", "export"})
         # (the speed leg and the classic look leg still run as cuda AND cpu; the scale-2 look leg is cpu-only until the CUDA route honours scale 2)
         for name in ("m16-1243-speed", "m16-1243-look"):
             self.assertEqual(sorted(json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))["backends"]), ["cpu", "cuda"], name)

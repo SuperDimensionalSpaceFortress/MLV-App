@@ -406,6 +406,53 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
   the bus or as an artifact) and need the per-venue owner CLIP line. Since fixtures are
   never venue playback clips, there are no fixture sheets any more.
 
+## EXPORT legs (EXPORT-VENUE-LEG-1)
+
+An export leg (`legType: "export"`) runs a headless CPU batch export of an owner clip on a venue and measures where the export spends its time.
+It plays nothing. The job is `tools/profiling/bachelor/export-stage-job.ps1`, which `Invoke-VenueLeg.ps1` selects for an export leg. It loads the
+playback generator's resolver, venue-table reader and owner-part path allowlist from that file's AST; it does not copy them.
+
+* **Spec** (`leg-spec.schema.json`, refused again by `Get-DvExportShapeRefusal`). `export` = `{format: "cdng-lossless" | "prores", maxFrames, receipt,
+  receiptSha256, dualIsoExpected}`. The rest of the spec is restricted: `backends` must be `["cpu"]`, `scaleFactor` must be 1, and the only allowed
+  `generatorArgs` key is `cpuQuiescenceThresholdPercent`. No `look`, `displayMode` or `visualCapture*` field is allowed. `playSeconds` is the clip-length
+  floor (the job applies `gui-smoke-length-gate.ps1` with `-ClipOnly`), and `maxFrames` is the measured window. The clip must hold at least `maxFrames`.
+  The batch receipt (`look-receipts/export-owner-hq-*.marxml`) is read from the committed blob and must hash to `receiptSha256`, both at generation and
+  in the job.
+* **Shipped legs**: `m16-1243-export-{cdng-lossless,prores}` (dual-ISO, 480 frames) and `m16-1456-export-{cdng-lossless,prores}` (no dual-ISO, 360 frames).
+  Plan cells are `cpu-export-<format>`, so both formats of one clip can share a leg set.
+* **The job**:
+  1. Verifies the staged build against the build manifest, and the owner parts by length and then by identity hash through private neutral-named views.
+  2. Applies the length gate.
+  3. For ProRes, refuses with `EXPORT_TOOLING_ABSENT` when the package has no `ffmpeg.exe`.
+  4. Samples CPU quiescence.
+  5. Runs `MLVApp.exe --batch ... --max-frames <maxFrames>` with `QT_QPA_PLATFORM=windows`, under one bounded wait that kills the process tree on expiry.
+     CDNG lossless uses `MLVAPP_EXPORT_STAGE_PROFILER` (per-frame `export-profile.json`). ProRes uses `MLVAPP_STAGE_TIMING` (`stage-timing.log`).
+  6. Publishes **only** `summary.json`, `batch.log`, the stage file and `output-manifest.json` (output count, total bytes, first and last file sha256).
+  7. Deletes the exported frames or `.mov` from its venue-local work dir. **Exported footage never reaches the share or the hub.**
+* **Receipt**: `receipt.export` = `{format, maxFrames, dualIsoExpected, receiptSha256, files (sha256 of each published file), stages, problems, verdict}`.
+  `scale` and `display` are null. Metrics include `framesExported`, `exportFramesFailed`, `profileFramesSucceeded` (CDNG), `stageFramesSeen` (ProRes),
+  `dualIsoActiveFrames`, `dualIsoClassAgrees`, `wallSeconds`, `exportFps`, `outputFileCount`, `outputBytes` and `largestStage`.
+  `Test-DvReceiptValid` re-hashes every file and re-derives the metrics, the stage table and the outcome (`Test-DvExportReceiptValid`).
+* **Stage shares**:
+  * CDNG: the denominator is the producer's `frame_ms`. The producer stages run from `raw_read` to `payload_clone` (including `llrawproc_dual_iso` and
+    `dng_compress_encode`). The writer stages (`disk_write`,
+    `writer_queue_wait`, `writer_completion_lag`) are reported apart from the producer stages, because the async writer overlaps the producer.
+  * ProRes: the denominator is the loop wall time per frame. The top-level stages are `debayered_frame`, `processing` and `residual`. `raw_uint16` and
+    `llrawproc` nest inside `debayered_frame`.
+  * `residual` (pipe write plus ffmpeg back-pressure) is not timed by the app. The rendered path also has no dual-ISO stage. For that reason ProRes legs
+    carry no `dualIsoClassAgrees` criterion. Both gaps belong to successor `EXPORT-RENDER-PIPE-TIMING-1` (product code).
+* **Outcomes**:
+
+  | Job result | Outcome |
+  |---|---|
+  | `EXPORT_CAPTURED`, exit 0, evidence binds, dual-ISO class agrees | `PASS` or `FAIL` from the criteria |
+  | `EXPORT_CAPTURED` with a non-zero exit; a dual-ISO class mismatch (`CLIP_CLASS_MISMATCH`); a profile from another build; output count disagreeing with `[BATCH] DONE` | `INVALID` |
+  | `EXPORT_TIMEOUT` (40), `EXPORT_NO_FRAMES` (41), `EXPORT_FRAMES_SHORT` (42), `EXPORT_EXIT_NONZERO` (46) | `FAIL` |
+  | `EXPORT_PROFILE_ABSENT` (43), `EXPORT_OUTPUT_MISMATCH` (44) | `INVALID` |
+  | `EXPORT_TOOLING_ABSENT` (45) | `VENUE_TOOLING` |
+  | a length refusal (`CLIP_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN`, exit 47); an owner-footage or work-dir refusal (exit 19/20/21/22/24/28); no `RESULT=` line; any other token | `INVALID` |
+  | `VENUE_NOT_QUIESCENT` (12) | `VENUE_NOT_QUIESCENT` |
+
 ## Requested scale and rendered scale
 
 A leg's `scaleFactor` is the playback scale it **requests**. It is not necessarily the scale the app **renders** at. Until PLAYBACK-CUDA-HONOUR-SCALE-1 the CUDA

@@ -2124,7 +2124,8 @@ function Get-DvLegSetPlan {
         foreach ($s in $specs) {
             if ($b -notin @($s.spec.backends)) { continue }
             $mode = $(if ($null -ne (Get-DvProp $s.spec 'displayMode')) { [string]$s.spec.displayMode } else { 'fullscreen' })
-            $cellId = "$b-$mode-s$([int]$s.spec.scaleFactor)"
+            # EXPORT-VENUE-LEG-1: an export leg plays nothing and has no display mode; its cell is its format, so both formats of one clip are two cells
+            $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
             $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
@@ -2613,13 +2614,62 @@ function Read-DvContactFrames {
 # JSON object when present (r5, sol r4 B1: an array reads through member enumeration but has no PSObject property, so its controls were dropped), and
 # look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg (r14: and, as the generator's
 # -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
-$script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
+$script:LegTypes = @('speed', 'look', 'export')   # leg-spec.schema.json properties.legType.enum
+# EXPORT-VENUE-LEG-1: the export block's fields and formats (leg-spec.schema.json properties.export), and the only generatorArgs key an export leg takes
+$script:ExportFormats = @('cdng-lossless', 'prores')
+$script:ExportFields = @('format', 'maxFrames', 'receipt', 'receiptSha256', 'dualIsoExpected')
+$script:ExportExcludedKeys = @('look', 'displayMode', 'visualCapture', 'visualCaptureOptOutReason', 'acceptedEffectiveScale', 'presentTearingExpectedReason')
+$script:ExportGeneratorArgs = @('cpuQuiescenceThresholdPercent')
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
 $script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred')
+# EXPORT-VENUE-LEG-1: an export leg's typed shape (the schema's export block and its allOf exclusions), and `export` refused on any other leg. Called by
+# Get-DvLegSpecShapeRefusal, so the leg and the lease batch's preflight refuse the same specs before a lease opens. Returns the refusal text, or $null.
+function Get-DvExportShapeRefusal {
+    param($Spec, [bool]$IsExportLeg)
+    $exportProp = $Spec.PSObject.Properties['export']
+    if (-not $IsExportLeg) {
+        if ($null -ne $exportProp) { return 'export is only for an export leg (legType "export"); this leg is not one' }
+        return $null
+    }
+    if ($null -eq $exportProp) { return 'an export leg needs export (one JSON object); it is absent' }
+    $backends = Get-DvProp $Spec 'backends'
+    if (-not ($backends -is [array] -and $backends.Count -eq 1 -and $backends[0] -is [string] -and $backends[0] -ceq 'cpu')) {
+        return "an export leg runs backends [""cpu""] only (backends is $(ConvertTo-Json -InputObject $backends -Compress -Depth 3))"
+    }
+    $scale = Get-DvProp $Spec 'scaleFactor'
+    if (-not (($scale -is [int] -or $scale -is [long]) -and $scale -eq 1)) { return "an export leg runs scaleFactor 1 (it is $(ConvertTo-Json -InputObject $scale -Compress -Depth 3))" }
+    foreach ($key in $script:ExportExcludedKeys) {
+        if ($null -ne $Spec.PSObject.Properties[$key]) { return "an export leg takes no $key (it plays nothing and captures no window)" }
+    }
+    $genArgs = Get-DvProp $Spec 'generatorArgs'
+    if ($null -ne $genArgs) {
+        foreach ($p in $genArgs.PSObject.Properties) {
+            if ($p.Name -cnotin $script:ExportGeneratorArgs) { return "generatorArgs.$($p.Name) is not an export leg argument (an export leg takes only $($script:ExportGeneratorArgs -join ', '))" }
+        }
+    }
+    $ex = $exportProp.Value
+    foreach ($p in $ex.PSObject.Properties) {
+        if ($p.Name -cnotin $script:ExportFields) { return "export.$($p.Name) is not an export field ($($script:ExportFields -join ', '))" }
+    }
+    $format = Get-DvProp $ex 'format'
+    if (-not ($format -is [string] -and $format -cin $script:ExportFormats)) { return "export.format must be one of $($script:ExportFormats -join ', ') (it is $(ConvertTo-Json -InputObject $format -Compress -Depth 3))" }
+    $maxFrames = Get-DvProp $ex 'maxFrames'
+    if (-not (($maxFrames -is [int] -or $maxFrames -is [long]) -and $maxFrames -ge 24 -and $maxFrames -le 100000)) {
+        return "export.maxFrames must be a whole number from 24 to 100000 (it is $(ConvertTo-Json -InputObject $maxFrames -Compress -Depth 3))"
+    }
+    $receipt = Get-DvProp $ex 'receipt'
+    if (-not ($receipt -is [string] -and $receipt -cmatch '^look-receipts/[a-z0-9-]+\.marxml(?![\s\S])')) { return "export.receipt must name a committed receipt under look-receipts/ (it is $(ConvertTo-Json -InputObject $receipt -Compress -Depth 3))" }
+    $receiptSha = Get-DvProp $ex 'receiptSha256'
+    if (-not ($receiptSha -is [string] -and $receiptSha -cmatch '^[0-9a-f]{64}(?![\s\S])')) { return 'export.receiptSha256 must be 64 lowercase hex digits' }
+    $dualIso = Get-DvProp $ex 'dualIsoExpected'
+    if ($dualIso -isnot [bool]) { return "export.dualIsoExpected must be JSON true or false (it is $(ConvertTo-Json -InputObject $dualIso -Compress -Depth 3))" }
+    $null
+}
+
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
-    foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria') {
+    foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria', 'export') {
         $present = $Spec.PSObject.Properties[$container]
         if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
             $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
@@ -2659,6 +2709,8 @@ function Get-DvLegSpecShapeRefusal {
     if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and $legTypeProp.Value -cin $script:LegTypes)) {
         return "legType must be one of $(($script:LegTypes | ForEach-Object { '"' + $_ + '"' }) -join ', ') (one JSON string; it is $(ConvertTo-Json -InputObject $legTypeProp.Value -Compress -Depth 3))"
     }
+    $exportRefusal = Get-DvExportShapeRefusal -Spec $Spec -IsExportLeg ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'export')
+    if ($null -ne $exportRefusal) { return $exportRefusal }
     $isLookLeg = ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'look')
     # r7 (adversary r6 A2): a look leg reads look.* before its receipt exists, so a look leg with NO look is refused here too (it threw
     # "Cannot index into a null array" after the batch had opened its lease).
@@ -3032,7 +3084,8 @@ function Get-DvVisualCaptureRequest {
     without a reason, or a reason without the opt-out, is a malformed spec: DVE_LEG_SPEC_INVALID.
     #>
     param([Parameter(Mandatory)]$Spec)
-    $applies = ([string](Get-DvProp $Spec 'legType') -cne 'look')
+    # EXPORT-VENUE-LEG-1: an export leg plays nothing, so it never captures (and the shape refusal refuses visualCapture on it)
+    $applies = ([string](Get-DvProp $Spec 'legType') -cnotin @('look', 'export'))
     $flag = $Spec.PSObject.Properties['visualCapture']
     $reason = $Spec.PSObject.Properties['visualCaptureOptOutReason']
     if ($null -ne $flag -and $flag.Value -isnot [bool]) { throw 'DVE_LEG_SPEC_INVALID visualCapture must be a boolean' }
@@ -3842,6 +3895,278 @@ function Read-DvVisualCaptures {
     & $finish
 }
 
+# --- EXPORT-VENUE-LEG-1: the export leg's evidence, outcome and receipt check ---------------------------------------------------------------------------------
+# The CDNG stage profiler (src/dng/dng.c, MLVAPP_EXPORT_STAGE_PROFILER) writes one row per frame. The PRODUCER side is the denominator producer_frame_ms; the
+# writer side runs on the async writer and is reported apart. llrawproc_ms is the sum of its llrawproc_* children, so it is reported once, not as a row.
+$script:ExportCdngProducerStages = @('raw_read', 'raw_decode', 'raw_unpack', 'llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels',
+    'llrawproc_pattern_noise', 'llrawproc_pre_dualiso_fix', 'llrawproc_dual_iso', 'llrawproc_chroma_smooth', 'llrawproc_shared_lock', 'llrawproc_dualiso_refine_lock',
+    'llrawproc_publish_lock', 'llrawproc_other', 'dng_header', 'dng_pack', 'dng_compress_encode', 'payload_clone')
+$script:ExportCdngWriterStages = @('disk_write', 'writer_queue_wait', 'writer_completion_lag')
+# The rendered (ProRes) path's MLVAPP_STAGE_TIMING stages (src/mlv/video_mlv.c). raw_uint16 (with its disk_read and decompress) and llrawproc are timed inside the
+# raw fetch getMlvRawFrameDebayered makes, so they NEST inside debayered_frame; debayered_frame and processing are the disjoint children of processed16_total.
+# The residual (loop wall per frame - processed16_total) is the pipe write to ffmpeg and its back-pressure. Drain and verify are not timed per stage.
+$script:ExportRenderedStages = @('raw_uint16', 'raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc', 'debayered_frame', 'processing', 'processed16_total')
+$script:ExportRenderedTopLevel = @('debayered_frame', 'processing', 'residual')
+$script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total; residual = loop wall per frame - processed16_total (pipe write plus ffmpeg back-pressure)'
+$script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
+$script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json')
+
+function Get-DvExportRound($Value) { if ($null -eq $Value) { return $null }; [math]::Round([double]$Value, 6) }
+
+function Get-DvExportStageRow {
+    param($Values, $Denominator)
+    $v = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ })
+    if ($v.Count -eq 0) { return [ordered]@{ samples = 0; meanMs = $null; medianMs = $null; share = $null } }
+    $mean = ($v | Measure-Object -Sum).Sum / $v.Count
+    [ordered]@{ samples = $v.Count; meanMs = (Get-DvExportRound $mean); medianMs = (Get-DvExportRound (Get-DvMedian $v))
+                share = $(if ($null -ne $Denominator -and [double]$Denominator -gt 0) { Get-DvExportRound ($mean / [double]$Denominator) } else { $null }) }
+}
+
+function Get-DvExportEvidence {
+    <#
+    .SYNOPSIS
+    EXPORT-VENUE-LEG-1: the pure reader of an export job's published TEXT -- the batch log, the CDNG stage profile (export-profile.json) or the rendered path's
+    stage-timing log, and the output manifest. Runs nothing and opens nothing. Returns [pscustomobject]@{ metrics; stages; problems; classMismatch; classDetail }:
+      metrics   flat scalars the leg's criteria read: framesRequested, framesExported, exportFramesSkipped, exportFramesFailed, profileFramesSucceeded (CDNG),
+                profileFramesFailed (CDNG), stageFramesSeen (ProRes), dualIsoActiveFrames, dualIsoClassAgrees, outputFileCount, outputBytes, wallSeconds,
+                exportFps, largestStage, largestStageShare; a metric the format cannot carry is null with <metric>CouldNotCheck naming why;
+      stages    the per-stage table (denominator, rows with samples / meanMs / medianMs / share, writer rows for CDNG, nesting and residual for ProRes);
+      problems  typed reasons the run is no measurement (EXPORT_PROFILE_ABSENT, EXPORT_OUTPUT_MISMATCH, EXPORT_PROFILE_FOREIGN, EXPORT_BATCH_LOG_UNREADABLE);
+      classMismatch  the run's own dual-ISO evidence disagrees with the leg's dualIsoExpected (CLIP_CLASS_MISMATCH).
+    #>
+    param([Parameter(Mandatory)][string]$Format, [Parameter(Mandatory)][int]$MaxFrames, [Parameter(Mandatory)][bool]$DualIsoExpected, [string]$ExpectedBuildId = '',
+          [AllowNull()][AllowEmptyString()][string]$ProfileText = '', [AllowNull()][AllowEmptyString()][string]$StageLogText = '',
+          [AllowNull()][AllowEmptyString()][string]$BatchLogText = '', [AllowNull()][AllowEmptyString()][string]$OutputManifestText = '')
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $m = [ordered]@{ framesRequested = $MaxFrames; framesExported = $null; exportFramesSkipped = $null; exportFramesFailed = $null; profileFramesSucceeded = $null
+                     profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
+                     wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
+    $classMismatch = $false; $classDetail = $null
+    # -- the batch log: exactly one DONE line for the one clip
+    $done = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] DONE (?<base>.+?) exported=(?<e>[0-9]+) skipped=(?<s>[0-9]+) elapsed=(?<t>[0-9]+(?:\.[0-9]+)?)\r?$'))
+    if ([string]::IsNullOrEmpty($BatchLogText)) { $problems.Add('EXPORT_BATCH_LOG_UNREADABLE: batch.log is absent') }
+    elseif ($done.Count -ne 1) { $problems.Add("EXPORT_BATCH_LOG_UNREADABLE: batch.log carries $($done.Count) DONE line(s); one clip exports exactly one") }
+    else {
+        $m.framesExported = [int64]$done[0].Groups['e'].Value
+        $m.exportFramesSkipped = [int64]$done[0].Groups['s'].Value
+        $m.exportFramesFailed = $m.exportFramesSkipped
+        $m.wallSeconds = Get-DvExportRound ([double]::Parse($done[0].Groups['t'].Value, [Globalization.CultureInfo]::InvariantCulture))
+        $m.exportFps = $(if ($m.wallSeconds -gt 0) { Get-DvExportRound ($m.framesExported / $m.wallSeconds) } else { $null })
+    }
+    # -- the output manifest the job wrote before it deleted the exported files
+    $manifest = $null
+    if ([string]::IsNullOrEmpty($OutputManifestText)) { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json is absent') }
+    else {
+        try { $manifest = $OutputManifestText | ConvertFrom-Json -ErrorAction Stop } catch { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json does not parse') }
+        if ($null -ne $manifest) {
+            $count = ConvertTo-DvInt64 (Get-DvProp $manifest 'count'); $bytes = ConvertTo-DvInt64 (Get-DvProp $manifest 'totalBytes')
+            $kind = [string](Get-DvProp $manifest 'kind'); $wantKind = $(if ($Format -ceq 'prores') { 'mov' } else { 'dng' })
+            $m.outputFileCount = $count; $m.outputBytes = $bytes
+            if ($kind -cne $wantKind) { $problems.Add("EXPORT_OUTPUT_MISMATCH: output-manifest.json lists '$kind' output, a $Format export writes $wantKind") }
+            elseif ($Format -ceq 'prores') { if ($count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: a ProRes export writes one .mov; the manifest lists $count") } }
+            elseif ($null -ne $m.framesExported -and $count -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the manifest lists $count .dng file(s) but the batch exported $($m.framesExported)") }
+        }
+    }
+    $stages = $null
+    if ($Format -ceq 'cdng-lossless') {
+        $m.stageFramesSeen = $null; $m['stageFramesSeenCouldNotCheck'] = 'a CDNG export is timed by the export stage profiler, not the stage-timing log'
+        $profile = $null
+        if ([string]::IsNullOrEmpty($ProfileText)) { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json is absent') }
+        else {
+            try { $profile = $ProfileText | ConvertFrom-Json -ErrorAction Stop } catch { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json does not parse') }
+            if ($null -ne $profile -and [string](Get-DvProp $profile 'schema') -cne 'mlvapp.export_stage_profile.v1') { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json is not an mlvapp.export_stage_profile.v1 document'); $profile = $null }
+        }
+        if ($null -ne $profile) {
+            if (-not [string]::IsNullOrEmpty($ExpectedBuildId) -and [string](Get-DvProp $profile 'build_id') -cne $ExpectedBuildId) { $problems.Add('EXPORT_PROFILE_FOREIGN: export-profile.json build_id is not the build the job ran') }
+            $frameList = Get-DvProp $profile 'frames'   # (assigned first: Get-DvProp returns an array as ONE object)
+            $rows = @($frameList | Where-Object { $null -ne $_ })
+            $ok = @($rows | Where-Object { (Get-DvProp $_ 'success') -eq $true })
+            $m.profileFramesSucceeded = [int64]$ok.Count
+            $m.profileFramesFailed = [int64]($rows.Count - $ok.Count)
+            if ($null -ne $m.framesExported -and $ok.Count -gt $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the profile records $($ok.Count) successful frame(s) but the batch exported $($m.framesExported)") }
+            $dualIsoValues = @($ok | ForEach-Object { Get-DvProp $_ 'llrawproc_dual_iso_ms' })
+            if ($ok.Count -gt 0 -and @($dualIsoValues | Where-Object { $null -ne $_ }).Count -ne $ok.Count) {
+                $problems.Add('EXPORT_PROFILE_ABSENT: a successful profile frame carries no llrawproc_dual_iso_ms, so the clip''s dual-ISO class cannot be read')
+            }
+            elseif ($ok.Count -gt 0) {
+                $active = @($dualIsoValues | Where-Object { [double]$_ -gt 0 }).Count
+                $m.dualIsoActiveFrames = [int64]$active
+                $agrees = $(if ($DualIsoExpected) { $active -eq $ok.Count } else { $active -eq 0 })
+                $m.dualIsoClassAgrees = $agrees
+                if (-not $agrees) { $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is $($DualIsoExpected.ToString().ToLowerInvariant()) but $active of $($ok.Count) exported frame(s) ran dual-ISO processing" }
+            }
+            $producer = @($ok | ForEach-Object { Get-DvProp $_ 'producer_frame_ms' })
+            $denRow = Get-DvExportStageRow -Values $producer -Denominator $null
+            $rowsOut = [ordered]@{}; $writer = [ordered]@{}
+            foreach ($name in $script:ExportCdngProducerStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($ok | ForEach-Object { Get-DvProp $_ "${name}_ms" }) -Denominator $denRow.meanMs }
+            foreach ($name in $script:ExportCdngWriterStages) { $writer[$name] = Get-DvExportStageRow -Values @($ok | ForEach-Object { Get-DvProp $_ "${name}_ms" }) -Denominator $denRow.meanMs }
+            $largest = @($rowsOut.Keys | Where-Object { $null -ne $rowsOut[$_].meanMs } | Sort-Object { -[double]$rowsOut[$_].meanMs } | Select-Object -First 1)
+            $stages = [ordered]@{ denominator = 'producer_frame_ms'; denominatorMeanMs = $denRow.meanMs; denominatorMedianMs = $denRow.medianMs; rows = $rowsOut; writerRows = $writer
+                                  llrawprocTotal = (Get-DvExportStageRow -Values @($ok | ForEach-Object { Get-DvProp $_ 'llrawproc_ms' }) -Denominator $denRow.meanMs)
+                                  dngCompressPlacement = (Get-DvProp $profile 'dng_compress_placement'); asyncWriterCanOverlapDngCompress = (Get-DvProp $profile 'async_writer_can_overlap_dng_compress')
+                                  largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
+            if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
+        }
+    }
+    else {
+        $m.profileFramesSucceeded = $null; $m['profileFramesSucceededCouldNotCheck'] = 'a ProRes export is timed by the stage-timing log, not the export stage profiler'
+        $why = "$($script:ExportSuccessor): the rendered export path records no dual-ISO stage, so a ProRes leg cannot read its clip's dual-ISO class"
+        $m['dualIsoActiveFramesCouldNotCheck'] = $why; $m['dualIsoClassAgreesCouldNotCheck'] = $why
+        $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]+)\b'))
+        if ($verified.Count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log carries $($verified.Count) RENDER_VERIFIED line(s); the batch's own verification of the .mov must pass exactly once") }
+        elseif ($null -ne $m.framesExported -and [int64]$verified[0].Groups['n'].Value -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the batch verified $($verified[0].Groups['n'].Value) decoded frame(s) but exported $($m.framesExported)") }
+        if ([string]::IsNullOrEmpty($StageLogText)) { $problems.Add('EXPORT_PROFILE_ABSENT: stage-timing.log is absent') }
+        else {
+            $perStage = @{}
+            foreach ($name in $script:ExportRenderedStages) { $perStage[$name] = @{} }
+            foreach ($hit in [regex]::Matches($StageLogText, '(?m)^\[mlv-stage-timing\] frame=(?<f>[0-9]+) stage=(?<s>[a-z0-9_]+) ms=(?<ms>[0-9]+(?:\.[0-9]+)?)\r?$')) {
+                $s = $hit.Groups['s'].Value
+                if (-not $perStage.ContainsKey($s)) { continue }
+                $f = $hit.Groups['f'].Value
+                $ms = [double]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
+                $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
+            }
+            $m.stageFramesSeen = [int64]$perStage['processed16_total'].Count
+            if ($m.stageFramesSeen -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: stage-timing.log records no processed16_total frame') }
+            $loopWall = $(if ($null -ne $m.framesExported -and $m.framesExported -gt 0 -and $null -ne $m.wallSeconds) { Get-DvExportRound ($m.wallSeconds * 1000.0 / $m.framesExported) } else { $null })
+            $rowsOut = [ordered]@{}
+            foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $loopWall }
+            $p16 = $rowsOut['processed16_total']
+            $residualMean = $(if ($null -ne $loopWall -and $null -ne $p16.meanMs) { Get-DvExportRound ($loopWall - $p16.meanMs) } else { $null })
+            $rowsOut['residual'] = [ordered]@{ samples = $p16.samples; meanMs = $residualMean
+                                               medianMs = $(if ($null -ne $loopWall -and $null -ne $p16.medianMs) { Get-DvExportRound ($loopWall - $p16.medianMs) } else { $null })
+                                               share = $(if ($null -ne $residualMean -and $loopWall -gt 0) { Get-DvExportRound ($residualMean / $loopWall) } else { $null }) }
+            $disjoint = $(if ($null -ne $rowsOut['debayered_frame'].meanMs -and $null -ne $rowsOut['processing'].meanMs) { Get-DvExportRound ($rowsOut['debayered_frame'].meanMs + $rowsOut['processing'].meanMs) } else { $null })
+            $within = $(if ($null -ne $disjoint -and $null -ne $p16.meanMs -and $p16.meanMs -gt 0) { [math]::Abs($disjoint - $p16.meanMs) / $p16.meanMs -le 0.05 } else { $null })
+            $largest = @($script:ExportRenderedTopLevel | Where-Object { $null -ne $rowsOut[$_].meanMs } | Sort-Object { -[double]$rowsOut[$_].meanMs } | Select-Object -First 1)
+            $stages = [ordered]@{ denominator = 'loop_wall_per_frame'; loopWallPerFrameMs = $loopWall; rows = $rowsOut; nesting = $script:ExportRenderedNesting
+                                  disjointSumMs = $disjoint; processed16TotalMeanMs = $p16.meanMs; disjointWithin5Percent = $within
+                                  drainVerify = "$($script:ExportSuccessor): the rendered path times no drain or verify stage"
+                                  largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
+            if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
+        }
+    }
+    [pscustomobject]@{ metrics = [pscustomobject]$m; stages = $stages; problems = @($problems); classMismatch = $classMismatch; classDetail = $classDetail }
+}
+
+function Get-DvExportOutcome {
+    <#
+    .SYNOPSIS
+    EXPORT-VENUE-LEG-1: the ONE export outcome rule, shared by Invoke-VenueLeg (writer) and Test-DvReceiptValid (re-derivation). A failure terminal maps as
+    Resolve-DvJobOutcome maps it. EXPORT_CAPTURED becomes PASS/FAIL only when the job exited 0, the run's dual-ISO class is the leg's, and the evidence has no
+    problem; otherwise INVALID (a capture that disagrees with its exit code; CLIP_CLASS_MISMATCH; unbound evidence). A playback token is never an export result.
+    #>
+    param([string]$ResultToken, [int]$ExitCode, [Parameter(Mandatory)]$Evidence, $Criteria)
+    $base = Resolve-DvJobOutcome -ResultToken $ResultToken -ExitCode $ExitCode
+    # Only the export's own failure terminals are a product FAIL. A clip-length refusal (the job's RESULT is the gate's verdict), an owner-footage or work-dir
+    # refusal, a missing RESULT line or any unknown token falls through Resolve-DvJobOutcome to FAIL; for an export leg that is no measurement: INVALID.
+    if ($base.outcome -eq 'FAIL' -and $ResultToken -cnotin $script:ExportFailResults) {
+        $why = $(if ($ResultToken -cin $script:PlayLengthRefusalReasons) { 'the clip failed the export length gate' } else { 'not an export failure terminal' })
+        return [pscustomobject]@{ outcome = 'INVALID'; detail = "$(if ([string]::IsNullOrEmpty($ResultToken)) { 'no RESULT line' } else { $ResultToken }) (job exit ${ExitCode}): $why, so it is no product result"; criteria = $null }
+    }
+    if ($base.outcome -ne 'CAPTURED') { return [pscustomobject]@{ outcome = $base.outcome; detail = $base.detail; criteria = $null } }
+    if ($ResultToken -cne 'EXPORT_CAPTURED') { return [pscustomobject]@{ outcome = 'INVALID'; detail = "$ResultToken is not an export job's result"; criteria = $null } }
+    if ($ExitCode -ne 0) { return [pscustomobject]@{ outcome = 'INVALID'; detail = "EXPORT_CAPTURED with job exit ${ExitCode}: a capture that disagrees with its own exit code is not evidence"; criteria = $null } }
+    if ($Evidence.classMismatch) { return [pscustomobject]@{ outcome = 'INVALID'; detail = [string]$Evidence.classDetail; criteria = $null } }
+    if (@($Evidence.problems).Count -gt 0) { return [pscustomobject]@{ outcome = 'INVALID'; detail = (@($Evidence.problems) -join '; '); criteria = $null } }
+    $verdict = Test-DvCriteria -Criteria $Criteria -Metrics $Evidence.metrics
+    $detail = $(if ($verdict.pass) { "EXPORT_CAPTURED: $(if ($verdict.informational) { 'no gating criteria' } else { 'all criteria met' }); largest stage $($Evidence.metrics.largestStage)" } else { 'EXPORT_CAPTURED: ' + ($verdict.failures -join '; ') })
+    [pscustomobject]@{ outcome = $(if ($verdict.pass) { 'PASS' } else { 'FAIL' }); detail = $detail; criteria = $verdict }
+}
+
+function Test-DvExportReceiptValid {
+    # EXPORT-VENUE-LEG-1: the export branch of Test-DvReceiptValid. $null when the receipt is not an export receipt (no export block, and its contract spec is not
+    # an export leg). Otherwise the verdict, re-derived from the hashed published files: um-run.json, summary.json and every file receipt.export.files lists (under
+    # <evidence>\export), the export metrics and stage table by Get-DvExportEvidence (the writer's reader), and the outcome by Get-DvExportOutcome against the
+    # contract spec's criteria (production: the committed spec; offline test: the bytes the runner ran). The playback-only blocks are not required here.
+    param($Receipt, [bool]$Production, $CommittedSpec, [bool]$AllowOffline, [byte[]]$OfflineLegSpecBytes, [string]$EvidenceDir, $Invalid, $Incomplete, $Unbound, [string]$Outcome, [string]$Mode)
+    $exportBlock = Get-DvProp $Receipt 'export'
+    $subject = Get-DvProp $Receipt 'subject'
+    $contract = $null; $contractWhy = $null
+    if ($Production) { $contract = $CommittedSpec; if ($null -eq $contract) { $contractWhy = 'the committed leg spec is not readable' } }
+    elseif ($AllowOffline -and $null -ne $OfflineLegSpecBytes) {
+        if ((Get-DvLegSpecSha256 $OfflineLegSpecBytes) -cne [string](Get-DvProp $subject 'legSpecSha256')) { $contractWhy = 'the leg spec the runner ran does not hash to subject.legSpecSha256' }
+        else { try { $contract = [Text.Encoding]::UTF8.GetString($OfflineLegSpecBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json -ErrorAction Stop } catch { $contractWhy = 'the leg spec the runner ran does not parse' } }
+    }
+    else { $contractWhy = 'no leg spec was given to re-derive the export from' }
+    $specIsExport = ([string](Get-DvProp $contract 'legType') -ceq 'export')
+    if ($null -eq $exportBlock -and -not $specIsExport) { return $null }
+    if ($null -eq $contract) { $Invalid.Add("EXPORT_CONTRACT_ABSENT: $contractWhy, so the export receipt is not re-derivable") }
+    elseif (-not $specIsExport) { $Invalid.Add('EXPORT_LEG_MISMATCH: the receipt carries an export block but its leg spec is not an export leg') }
+    else {
+        $shape = Get-DvLegSpecShapeRefusal -Spec $contract
+        if ($null -ne $shape) { $Invalid.Add("EXPORT_LEG_MISMATCH: the leg spec is not a valid export leg ($shape)") }
+    }
+    if ($null -eq $exportBlock) { $Incomplete.Add('RECEIPT_FIELD_ABSENT: an export leg''s receipt carries no export block') }
+    if ([string](Get-DvProp $subject 'backend') -cne 'cpu') { $Invalid.Add('BACKEND_MISMATCH: an export leg runs the cpu backend only') }
+    $specExport = Get-DvProp $contract 'export'
+    if ($null -ne $exportBlock -and $null -ne $specExport) {
+        foreach ($k in 'format', 'maxFrames', 'dualIsoExpected', 'receiptSha256') {
+            if (-not (Test-DvJsonEquivalent (Get-DvProp $exportBlock $k) (Get-DvProp $specExport $k))) { $Invalid.Add("EXPORT_BLOCK_MISMATCH: export.$k is not the leg spec's") }
+        }
+    }
+    # ---- the hashed files
+    $evidence = Get-DvProp $Receipt 'evidence'
+    $dir = $(if (-not [string]::IsNullOrWhiteSpace($EvidenceDir)) { $EvidenceDir } else { [string](Get-DvProp $evidence 'localEvidenceDir') })
+    $texts = @{}; $umRun = $null
+    if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) { $Incomplete.Add('EVIDENCE_ABSENT: the local evidence directory the receipt names is not present') }
+    else {
+        $umClaim = [string](Get-DvProp $evidence 'umRunJsonSha256')
+        $umFile = Join-Path $dir 'um-run.json'
+        if ($umClaim -cnotmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $umFile -PathType Leaf)) { $Incomplete.Add('EVIDENCE_ABSENT: um-run.json (evidence.umRunJsonSha256) is not in the evidence') }
+        elseif ((Get-DvSha256OfFile $umFile) -cne $umClaim) { $Invalid.Add('EVIDENCE_HASH_MISMATCH: um-run.json does not hash to the sha256 the receipt claims') }
+        else {
+            try { $umRun = (ConvertTo-DvText ([IO.File]::ReadAllBytes($umFile))) | ConvertFrom-Json -ErrorAction Stop } catch { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not valid JSON') }
+            if ($null -ne $umRun -and [string](Get-DvProp $umRun 'schema') -cne $script:UmRunSchema) { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not a dual-venue um-run record'); $umRun = $null }
+        }
+        $files = Get-DvProp $exportBlock 'files'
+        if ($null -eq $files) { $Incomplete.Add('EVIDENCE_ABSENT: export.files lists no published file') }
+        else {
+            foreach ($name in @(Get-DvKeys $files)) {
+                if ($name -cnotin $script:ExportEvidenceFiles) { $Invalid.Add("EVIDENCE_UNPARSABLE: export.files names '$name', which an export job does not publish"); continue }
+                $claim = [string](Get-DvProp $files $name)
+                $file = Join-Path (Join-Path $dir 'export') $name
+                if ($claim -cnotmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { $Incomplete.Add("EVIDENCE_ABSENT: export/$name is not in the evidence"); continue }
+                $b = [IO.File]::ReadAllBytes($file)
+                if ((Get-DvSha256OfBytes $b) -cne $claim) { $Invalid.Add("EVIDENCE_HASH_MISMATCH: export/$name does not hash to the sha256 the receipt claims"); continue }
+                $texts[$name] = ConvertTo-DvText $b
+            }
+        }
+    }
+    $summary = $null
+    if ($texts.ContainsKey('summary.json')) { try { $summary = $texts['summary.json'] | ConvertFrom-Json -ErrorAction Stop } catch { $Invalid.Add('EVIDENCE_UNPARSABLE: export/summary.json is not valid JSON') } }
+    elseif ($null -ne $files) { $Incomplete.Add('EVIDENCE_ABSENT: export/summary.json is not listed in export.files') }
+    if ($null -ne $summary -and $null -ne $specExport) {
+        $venueName = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'name')
+        foreach ($pair in @(@('schema', 'export-stage-job.v1'), @('legType', 'export'), @('format', [string](Get-DvProp $specExport 'format')), @('clipId', [string](Get-DvProp $subject 'clipId')), @('backend', 'cpu'),
+                            @('declaredVenue', $venueName), @('buildManifestSha256', [string](Get-DvProp $subject 'buildManifestSha256')), @('receiptSha256', [string](Get-DvProp $specExport 'receiptSha256')))) {
+            if ([string](Get-DvProp $summary $pair[0]) -cne $pair[1]) { $Invalid.Add("EXPORT_SUMMARY_MISMATCH: export/summary.json $($pair[0]) is not the receipt's or the leg spec's") }
+        }
+        if (-not (Test-DvJsonEquivalent (Get-DvProp $summary 'maxFrames') (Get-DvProp $specExport 'maxFrames'))) { $Invalid.Add('EXPORT_SUMMARY_MISMATCH: export/summary.json maxFrames is not the leg spec''s') }
+        if ($null -ne $umRun -and [string](Get-DvProp $summary 'result') -cne [string](Get-DvProp $umRun 'resultToken')) { $Invalid.Add('EXPORT_SUMMARY_MISMATCH: export/summary.json result is not the RESULT the job printed') }
+    }
+    # ---- the metrics, the stage table and the outcome, re-derived
+    if ($Invalid.Count -eq 0 -and $Incomplete.Count -eq 0 -and $null -ne $summary -and $null -ne $umRun -and $null -ne $specExport) {
+        $exit = ConvertTo-DvInt64 (Get-DvProp $umRun 'exitCode')
+        if ($null -eq $exit) { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json carries no integer exitCode') }
+        else {
+            $ev = Get-DvExportEvidence -Format ([string]$specExport.format) -MaxFrames ([int]$specExport.maxFrames) -DualIsoExpected ([bool]$specExport.dualIsoExpected) -ExpectedBuildId ([string](Get-DvProp $summary 'sourceCommit')) `
+                -ProfileText ([string]$texts['export-profile.json']) -StageLogText ([string]$texts['stage-timing.log']) -BatchLogText ([string]$texts['batch.log']) -OutputManifestText ([string]$texts['output-manifest.json'])
+            if (-not (Test-DvJsonEquivalent (Get-DvProp $Receipt 'metrics') (ConvertFrom-Json (ConvertTo-Json $ev.metrics -Depth 8 -Compress)))) { $Invalid.Add('METRICS_NOT_FROM_EVIDENCE: the receipt metrics are not the export metrics of the hashed files') }
+            if (-not (Test-DvJsonEquivalent (Get-DvProp $exportBlock 'stages') $(if ($null -eq $ev.stages) { $null } else { ConvertFrom-Json (ConvertTo-Json $ev.stages -Depth 8 -Compress) }))) { $Invalid.Add('METRICS_NOT_FROM_EVIDENCE: export.stages is not the stage table of the hashed files') }
+            $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
+            $criteria = Get-DvProp (Get-DvProp (Get-DvProp $contract 'criteria') $role) 'cpu'
+            $derived = Get-DvExportOutcome -ResultToken ([string](Get-DvProp $umRun 'resultToken')) -ExitCode ([int]$exit) -Evidence $ev -Criteria $criteria
+            if ($derived.outcome -cnotin @('PASS', 'FAIL')) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
+            elseif ($derived.outcome -cne $Outcome) { $Invalid.Add("OUTCOME_NOT_DERIVED: the export evidence and the leg's criteria derive $($derived.outcome) but the receipt says $Outcome") }
+        }
+    }
+    $reasons = @($Invalid.ToArray()) + @($Incomplete.ToArray())
+    if ($Production) { $reasons += 'VENUE_ANCHOR_ABSENT: no venue-held anchor (a venue-signed summary.json, or a re-read of the venue outbox by jobId) exists, so a production receipt is advisory: it is never VERIFIED and never a usable PASS (DUAL-VENUE-PASS-PROVENANCE-1)' }
+    $status = $(if ($Invalid.Count -gt 0) { 'INVALID' } elseif ($Incomplete.Count -gt 0) { 'INCOMPLETE' } elseif ($Mode -ceq 'offline-test') { 'VERIFIED_OFFLINE_TEST' } elseif ($Production) { 'ADVISORY' } else { 'VERIFIED' })
+    [pscustomobject]@{ valid = ($status -in @('VERIFIED', 'VERIFIED_OFFLINE_TEST')); status = $status; reasons = $reasons; unbound = $Unbound; evidenceDir = $dir; legType = 'export' }
+}
+
 function Test-DvReceiptValid {
     <#
     .SYNOPSIS
@@ -3990,6 +4315,11 @@ function Test-DvReceiptValid {
         if (-not $AllowOfflineTestMode) { $invalid.Add('OFFLINE_TEST_RECEIPT: a receipt written in offline test mode (caller-supplied consent / venue table / um-run) is never evidence') }
     }
     else { $invalid.Add('ADMISSION_UNPROVEN: the receipt records no admission (mode, consent and venue-table blob ids)') }
+
+    # ---- EXPORT-VENUE-LEG-1: an export receipt carries no playback blocks; its export block is re-derived from its own hashed files ----------------
+    $exportCheck = Test-DvExportReceiptValid -Receipt $Receipt -Production $production -CommittedSpec $spec -AllowOffline ([bool]$AllowOfflineTestMode) -OfflineLegSpecBytes $OfflineLegSpecBytes `
+        -EvidenceDir $EvidenceDir -Invalid $invalid -Incomplete $incomplete -Unbound $unbound -Outcome $outcome -Mode $mode
+    if ($null -ne $exportCheck) { return $exportCheck }
 
     # ---- the run: re-derived from HASHED files ---------------------------------------------------------------------------------
     $ev = Read-DvEvidenceSet -Receipt $Receipt -EvidenceDir $EvidenceDir
@@ -4252,6 +4582,8 @@ function Test-DvReceiptValid {
         $resolved = $null
         if ($null -ne $exit) {
             $resolved = Resolve-DvJobOutcome -ResultToken ([string](Get-DvProp $ev.umRun 'resultToken')) -ExitCode ([int]$exit) -SmokeRefusalReason ([string](Get-DvProp $ev.summary 'smokeRefusalReason'))
+            # EXPORT-VENUE-LEG-1: an export job's capture is never playback evidence (an export receipt is validated by the export branch above)
+            if ([string](Get-DvProp $ev.umRun 'resultToken') -ceq 'EXPORT_CAPTURED') { $invalid.Add('OUTCOME_NOT_DERIVABLE: EXPORT_CAPTURED is an export job''s capture, not playback evidence') }
             if ($resolved.outcome -eq 'CAPTURED') {
                 if ($null -eq $ev.manifest) { $incomplete.Add('EVIDENCE_ABSENT: the job captured but evidence-manifest.json (evidence.evidenceManifestSha256) is not in the evidence') }
                 if ($exit -ne 0) { $invalid.Add('OUTCOME_NOT_DERIVABLE: the job printed a capture but exited non-zero; a capture that disagrees with its own exit code is not evidence') }
@@ -4621,7 +4953,12 @@ $script:VenueConditionResults = @('SCREENSAVER_SECURE_OWNER_ONLY', 'DISPLAY_WAKE
 $script:DeviceUnavailableResults = @('BACKEND_NOT_AVAILABLE')
 # A FIXTURE_REHEARSAL_CAPTURED job is NOT a capture of venue playback (fixtures are never played on a venue); only
 # MEASUREMENT_CAPTURED can become PASS/FAIL. A rehearsal result falls through to FAIL ... and then to INVALID below.
-$script:CapturedResults = @('MEASUREMENT_CAPTURED')
+$script:CapturedResults = @('MEASUREMENT_CAPTURED', 'EXPORT_CAPTURED')
+# EXPORT-VENUE-LEG-1: an export job's terminals (tools/profiling/bachelor/export-stage-job.ps1). A run that exported too few frames, none, or did not finish
+# is a product FAIL; one whose stage evidence or output does not bind is no measurement (INVALID); a venue package without ffmpeg.exe is VENUE_TOOLING.
+$script:ExportFailResults = @('EXPORT_EXIT_NONZERO', 'EXPORT_TIMEOUT', 'EXPORT_NO_FRAMES', 'EXPORT_FRAMES_SHORT')
+$script:ExportInvalidResults = @('EXPORT_PROFILE_ABSENT', 'EXPORT_OUTPUT_MISMATCH')
+$script:ExportToolingResults = @('EXPORT_TOOLING_ABSENT')
 # The job's typed smoke refusals (generator: $smokeRefusalReason) that mean "this was not >= 20 s of real footage".
 $script:PlayLengthRefusalReasons = @('PLAY_WINDOW_TOO_SHORT', 'PLAY_DURATION_TOO_SHORT', 'PLAY_PACE_TOO_SLOW', 'CLIP_TOO_SHORT', 'CLIP_LENGTH_UNKNOWN',
     'INVALID_SOURCE_FRAMES', 'INVALID_LOOPED', 'SOURCE_FRAMES_SHORT', 'PLAY_SAFETY_TIMEOUT', 'REPLAY_REFUSED', 'PASS_THROUGH_REFUSED')
@@ -4653,6 +4990,9 @@ function Resolve-DvJobOutcome {
     if ($reasonSuffix -and $SmokeRefusalReason -in $script:PlayLengthRefusalReasons -and $ResultToken -notin $script:VenueConditionResults -and $ResultToken -notin $script:DeviceUnavailableResults) {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $reasonSuffix) }
     }
+    if ($ResultToken -cin $script:ExportFailResults) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "$ResultToken (job exit $ExitCode)" } }
+    if ($ResultToken -cin $script:ExportInvalidResults) { return [pscustomobject]@{ outcome = 'INVALID'; detail = "$ResultToken (job exit $ExitCode): the export's stage evidence or output does not bind, so it is no measurement" } }
+    if ($ResultToken -cin $script:ExportToolingResults) { return [pscustomobject]@{ outcome = 'VENUE_TOOLING'; detail = "$ResultToken (job exit $ExitCode): the staged package carries no ffmpeg.exe for the rendered export" } }
     if ($ResultToken -eq 'VENUE_NOT_QUIESCENT') { return [pscustomobject]@{ outcome = 'VENUE_NOT_QUIESCENT'; detail = $ResultToken } }
     if ($ResultToken -eq 'VENUE_HOST_MISMATCH') { return [pscustomobject]@{ outcome = 'VENUE_HOST_MISMATCH'; detail = $ResultToken } }
     if ($ResultToken -in $script:DeviceUnavailableResults) { return [pscustomobject]@{ outcome = 'DEVICE_UNAVAILABLE'; detail = $ResultToken } }
@@ -4989,6 +5329,9 @@ function New-DvReceipt {
         # PLAYBACK-VISUAL-INSPECTION-1: a speed leg's window captures (Read-DvVisualCaptures): requested / opted out, the frames and their hashes,
         # the distinct-picture count, the play-vs-paused difference, the strip, and the gate verdict. Null on a look leg (its contact sheet is the look).
         visual = $null
+        # EXPORT-VENUE-LEG-1: an export leg's block (format, maxFrames, dualIsoExpected, receiptSha256, the sha256 of each published file under <evidence>\export,
+        # the stage table, the problems and the verdict). Null on a playback leg. A PASS/FAIL export receipt is re-derived from it by Test-DvReceiptValid.
+        export = $null
         # Retired in round 3 (no registry snapshot is taken any more: master isolates an automation run's settings store; the
         # receipt's playback.settingsIsolated is the proof). The key stays null so a reader written against round 2 still parses.
         registry = $null
@@ -5048,4 +5391,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
+    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
