@@ -1628,6 +1628,48 @@ class R10LastTierTests(unittest.TestCase):
                         if line.startswith("- X "):
                             self.assertIn("owner ask, %s" % resolution, line)
 
+    # r13 (review-pr835-opus-r12-20261117T1621Z blocker): when the labelled base was over budget, the owner-free candidate could be LARGER than
+    # master's file (it re-added '- (none parked)' in place of a shorter line, and flipped the drain line when the owner ask was the one queued
+    # row), so a board master fit fell through to the over-budget collapsed tier and was written, exit 0. Class: a fallback chain whose last
+    # candidate is not bounded by the file it falls back to. The r11 boundary test filtered on the board WITHOUT the owner ask, so it never saw it.
+    def board_with_x(self, note_len: int, x_row: dict, merged_landing: bool = False) -> dict:
+        rows = self.products()
+        if merged_landing:   # q == l: the product rows were queued before the window, one landing inside it, the owner ask queued in it
+            rows = [row("PRODUCT-%03d" % i, "queued", "2026-09-01T00:00:00Z") for i in range(300)]
+            rows.append(row("MERGED-1", "merged", "2026-09-01T00:00:00Z", merged_utc="2026-10-22T00:00:00Z"))
+        return self.data(rows + [x_row], note_len)
+
+    def test_r13_a_board_master_fits_never_falls_through_to_an_over_budget_tier(self) -> None:
+        tested = 0
+        for merged_landing in (False, True):
+            for note_len in range(584, 612):   # the window where master fits and the labelled base does not (597 for the repro)
+                for resolution in render_roadmap.RESOLUTIONS:
+                    for note in ("x", "done", "waiting"):
+                        x_row = row("X", "parked", self.STAMP, origin="owner", resolution=resolution, notes=note)
+                        data = self.board_with_x(note_len, x_row, merged_landing)
+                        if render_roadmap._budget_size(master_render(data)) > ROADMAP_BUDGET_BYTES:
+                            continue   # over budget with the owner ask as master lists it: outside this invariant
+                        tested += 1
+                        with self.subTest(merged_landing=merged_landing, note_len=note_len, resolution=resolution, note=note):
+                            text = render_roadmap.render(data)
+                            self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+                            for line in text.splitlines():
+                                if line.startswith("- X "):
+                                    self.assertIn("owner ask, %s" % resolution, line)
+        self.assertGreater(tested, 100)
+
+    def test_r13_the_owner_free_tier_keeps_master_s_counts_and_never_exceeds_master_s_file(self) -> None:
+        # the verdict's repro: 300 queued product rows, a 597-char scope note, a resolved product owner park with a one-character note
+        x_row = row("X", "parked", self.STAMP, origin="owner", resolution="done", notes="x")
+        data = self.board_with_x(597, x_row)
+        self.assertLessEqual(render_roadmap._budget_size(master_render(data)), ROADMAP_BUDGET_BYTES)
+        text = render_roadmap.render(data)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+        self.assertTrue(text.startswith(MASTER_HEADER), "this board is rendered by the base's algorithm")
+        self.assertNotIn("- X ", text, "the resolved owner park has no room: it is left out, never shown without its resolution")
+        self.assertNotIn("(none parked)", text, "no placeholder larger than the line it replaces")
+        self.assertIn("| total | 0 | 301 |", text, "the closed owner ask stays in the counts, as master counts it")
+
     def test_pass2_a1_a_base_that_can_be_rendered_over_budget_is_still_product_alone(self) -> None:
         # the documented exception stays: product rows are never dropped, so a board over budget on them alone is rendered, not refused
         data = self.data(self.products(), 4000)

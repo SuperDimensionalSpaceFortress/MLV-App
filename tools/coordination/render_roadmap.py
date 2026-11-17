@@ -317,17 +317,23 @@ def render(data: dict) -> str:
         return collapsed
     # (r4 pass 2 A1, r7 A1) the owner section, the owner-aware header and the UTC-instant day reading all cost bytes the base never spent:
     # a product-only board that fit the budget at base (19999 CRLF bytes) was 20143, then 20001 with a closed owner ask, then 20001 with
-    # an offset merged_utc. So the base's own algorithm is tried next: the file is the base's, byte for byte, for every input whose base file fit.
-    # (r10 A1) It is taken only when it fits. Master lists every parked product-kind owner ask, uncapped and unlabelled: 112 of them made
+    # an offset merged_utc. So the base's own algorithm is tried next: the file is the base's, byte for byte, for every input whose base file fit
+    # and holds no resolved owner park; (r11 A1) a resolved one is labelled with its resolution, one line longer than master's, and (r13) when
+    # that does not fit it is left out. (r10 A1) A candidate is taken only when it fits. Master lists every parked product-kind owner ask, uncapped and unlabelled: 112 of them made
     # the file 23006 bytes. Then the same algorithm runs on the board without its closed owner asks (the collapsed tier counts none of them
     # either, and they stay in card-queue.json), and when even that is over budget the collapsed text stands: product rows are never dropped.
     # (r10 A3) A candidate is None when the base's textual window leaves the date range: never a traceback. (r10 pass 2 A1) With no base
     # file to compare against, "over budget on product alone" cannot be told from an owner-aware overhead, so the board is refused (exit 2,
-    # as _load refuses the same window) instead of written over budget.
+    # as _load refuses the same window) instead of written over budget. (r13) The base's textual window does not depend on which rows are
+    # kept, so all three candidates are None together or none is.
+    # (r13 blocker) owner_free can be LARGER than master's file (it re-adds "- (none parked)" in place of a shorter line, and a closed owner ask
+    # that was the one queued row flips the drain line), so it does not bound the chain. The last candidate does: master's counts and master's
+    # lines, minus only the resolved owner parks' lines and with no placeholder, so it is never larger than master's file. A board master fit
+    # therefore always fits here, with every resolved owner park either shown with its resolution or left out, never shown without it.
     owner_free = dict(data, rows=[r for r in data["rows"] if r.get("origin") != OWNER or r["state"] not in CLOSED_STATES])
     base_available = False
-    for candidate in (data, owner_free):
-        text = _render_base(candidate)
+    for candidate, omit_lines in ((data, False), (owner_free, False), (data, True)):
+        text = _render_base(candidate, omit_resolved_owner_lines=omit_lines)
         if text is None:
             continue
         base_available = True
@@ -340,9 +346,11 @@ def render(data: dict) -> str:
     return collapsed
 
 
-def _render_base(data: dict) -> "str | None":
+def _render_base(data: dict, omit_resolved_owner_lines: bool = False) -> "str | None":
     """fork/master's render, verbatim apart from the helpers it inlined: no origin, resolution or owner section, days read as stamp[:10]
-    (not as UTC instants), the base header. A last render tier, so a board that fit the budget at the base fits here. (r10 A2) Rows tied on
+    (not as UTC instants), the base header. A last render tier. (r13) With omit_resolved_owner_lines the rows are still counted as master
+    counts them but a resolved owner park gets no line and no placeholder is added, so that text is never larger than master's file: a board
+    that fit the budget at the base always has a fitting candidate here. (r10 A2) Rows tied on
     priority, stamp and card end on _canonical, so input order never decides; master left them in input order. (r10 A3) None when the
     7-day window, read from generated_utc's text, starts before 0001-01-01 (the loader checks the UTC reading, which can be a day later).
     (r11 A1) The one line it adds to master's: a parked owner ask closed with a resolution carries `owner ask, <resolution>` like the upper tiers."""
@@ -402,10 +410,13 @@ def _render_base(data: dict) -> "str | None":
     for r in parked:
         # (r11 A1) a parked owner ask with a structured resolution says so, as `_render` does: done, refused and superseded must not read the
         # same. An owed one has no resolution to lose and stays master's line (r7 A1). When the label pushes the board over budget the
-        # caller's next candidate leaves the closed owner asks out; a row is never shown without the resolution it was closed with.
-        label = ", owner ask, %s" % _resolution(r) if r.get("origin") == OWNER and _resolution(r) else ""
+        # caller's next candidates leave the closed owner asks out; a row is never shown without the resolution it was closed with.
+        resolved_owner = r.get("origin") == OWNER and _resolution(r)
+        if resolved_owner and omit_resolved_owner_lines:
+            continue
+        label = ", owner ask, %s" % _resolution(r) if resolved_owner else ""
         out.append("- %s (P%s%s): %s" % (r["card"], r["priority"], label, _note(r)))
-    if not parked:
+    if not parked:   # (r13) tests the rows, not the lines written: an omitted resolved park gets no placeholder, which can be longer than its line
         out.append("- (none parked)")
     return "\n".join(out) + "\n"
 
