@@ -12,6 +12,10 @@ param(
                            # recommended 30s settled-validation window. Both lanes use a generous window.
     [ValidateRange(0, 3600000)]
     [int]$ProcessTimeoutMs = 0,
+    # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: how long the app's own log may stay silent before the leg is ended as process_no_progress.
+    # 0 = derived from the leg (its derived process budget + 60 s), capped at the whole process timeout; never from -ProcessTimeoutMs.
+    [ValidateRange(0, 3600000)]
+    [int]$NoProgressTimeoutMs = 0,
     [ValidateRange(0, 1000000)]
     [int]$TargetPresentedFrames = 0,
     [int]$StartFrame = 0,
@@ -1978,6 +1982,13 @@ $stderrTask = $process.StandardError.ReadToEndAsync()
 # meaningfully measure (no round-trip of any kind), and adding no extra wall-clock time at all
 # (the sampling happens inside intervals the code was already spending blocked in WaitForExit).
 $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: a leg whose app log stops advancing (one stopped at gui_smoke.foreground_request and held the venue for the
+# whole 3600 s) is ended after the leg's own no-progress window, not after the caller's whole process budget. The window is the runner's derived
+# leg budget (play safety net + settle + screenshot allowances) + 60 s, so it does not widen with a caller's -ProcessTimeoutMs (an owner-clip leg
+# adds the input re-read there). The watch arms at the app's first log line; before that only the whole budget bounds the wait.
+$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $NoProgressTimeoutMs -CeilingMs $effectiveProcessTimeoutMs
+$noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noProgressWindowMs
+$noProgressStalled = $false
 if ($HostLoadSampleIntervalMs -gt 0) {
     $hostLoadSampleLoopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($true) {
@@ -1992,11 +2003,30 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         $newSample = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectProcess $process `
             -SkipEvidenceCollection
         $hostLoadDuringSamples.Add($newSample)
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch) {
+            $noProgressStalled = $true
+            break
+        }
     }
     $hostLoadSampleLoopElapsedMs = [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
 }
 else {
-    $hostLoadSampleLoopElapsedMs = 0
+    # interior host-load sampling is off: the same chunked wait, watching the log only
+    $noProgressLoopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $noProgressRemainingMs = $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds
+        if ($noProgressRemainingMs -le 0) {
+            break
+        }
+        if ($process.WaitForExit([Math]::Min(4000, $noProgressRemainingMs))) {
+            break
+        }
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch) {
+            $noProgressStalled = $true
+            break
+        }
+    }
+    $hostLoadSampleLoopElapsedMs = [int]$noProgressLoopStopwatch.ElapsedMilliseconds
 }
 # Whatever wall-clock time the sampling loop already spent waiting counts against the overall
 # process timeout budget -- the finalize wait below only needs to cover what's left. The 1ms floor
@@ -2007,7 +2037,10 @@ $processBoundary = Wait-GuiSmokeProcessBounded `
     -Process $process `
     -StandardOutputTask $stdoutTask `
     -StandardErrorTask $stderrTask `
-    -TimeoutMs $hostLoadFinalizeTimeoutMs
+    -TimeoutMs $hostLoadFinalizeTimeoutMs `
+    -ReportedTimeoutMs $effectiveProcessTimeoutMs `
+    -NoProgressStalled:$noProgressStalled `
+    -NoProgressWindowMs $noProgressWindowMs
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
@@ -2472,6 +2505,9 @@ $validationFailures = @()
 $validationFailures += $captureBindingFailures
 if ($processBoundary.timedOut) {
     $validationFailures += "MLVApp exceeded its fail-closed process timeout and was terminated."
+    if ($processBoundary.noProgress) {
+        $validationFailures += "MLVApp's log made no progress for $noProgressWindowMs ms (process_no_progress); the leg was ended before the whole $($processBoundary.timeoutMs) ms budget."
+    }
 }
 if ($processExitCode -ne 0) {
     $validationFailures += "MLVApp exited with effective code $processExitCode."
@@ -2936,6 +2972,13 @@ $result = [pscustomobject]@{
         nativeExitCode = $processBoundary.nativeExitCode
         timedOut = [bool]$processBoundary.timedOut
         timeoutMs = [int]$processBoundary.timeoutMs
+        # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: timeoutMs above is the WHOLE budget; the fields below are added beside it, none renamed.
+        # outcome is exited | timeout | process_no_progress; legBudgetMs is the runner's own derived leg budget (the no-progress window's base).
+        outcome = [string]$processBoundary.outcome
+        finalWaitMs = [int]$processBoundary.finalWaitMs
+        noProgress = [bool]$processBoundary.noProgress
+        noProgressWindowMs = [int]$noProgressWindowMs
+        legBudgetMs = [int]$derivedProcessTimeoutMs
         treeKillAttempted = [bool]$processBoundary.treeKillAttempted
         treeKillSucceeded = [bool]$processBoundary.treeKillSucceeded
         terminationConfirmed = [bool]$processBoundary.terminationConfirmed

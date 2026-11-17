@@ -1,0 +1,187 @@
+"""VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: the GUI-smoke process wait reports its whole budget and has a no-progress watchdog.
+
+A venue leg that should take ~4 min held the Bachelor venue for 60 min, and its receipt said "exceeded the fail-closed process timeout of 1 ms"
+(process.timeoutMs = 1) because run-release-gui-smoke.ps1 handed Wait-GuiSmokeProcessBounded only the final chunk REMAINDER of its budget.
+These tests execute pwsh against the real module (tools/profiling/gui-smoke-process-boundary.psm1) with stub processes and temp logs only; no MLVApp
+is launched. The runner's own wiring is pinned by reading its text, because a full GUI-smoke launch needs a real MLVApp.exe and clip.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+MODULE = ROOT / "tools" / "profiling" / "gui-smoke-process-boundary.psm1"
+RUNNER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+PWSH = shutil.which("pwsh")
+
+_PRELUDE = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module $env:GS_MODULE -Force
+function New-Stub([string]$Command) {
+    $psi = [Diagnostics.ProcessStartInfo]::new($env:GS_PWSH); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    foreach ($a in @('-NoProfile', '-NonInteractive', '-Command', $Command)) { [void]$psi.ArgumentList.Add($a) }
+    $p = [Diagnostics.Process]::Start($psi)
+    [pscustomobject]@{ p = $p; o = $p.StandardOutput.ReadToEndAsync(); e = $p.StandardError.ReadToEndAsync() }
+}
+"""
+
+
+def run_ps(body: str, **extra_env: str) -> dict:
+    assert PWSH, "pwsh is required"
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "probe.ps1"
+        script.write_text(_PRELUDE + body, encoding="utf-8")
+        env = dict(os.environ, GS_MODULE=str(MODULE), GS_PWSH=PWSH, GS_TMP=tmp, **extra_env)
+        proc = subprocess.run(
+            [PWSH, "-NoProfile", "-NonInteractive", "-File", str(script)],
+            capture_output=True, text=True, timeout=180, env=env, creationflags=_NO_WINDOW,
+        )
+    if proc.returncode != 0:
+        raise AssertionError(f"probe failed rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}")
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")][-1]
+    return json.loads(line)
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class ReportedTimeoutIsTheWholeBudget(unittest.TestCase):
+    def test_timeout_receipt_names_the_whole_budget_not_the_final_remainder(self) -> None:
+        out = run_ps(r"""
+$s = New-Stub 'Start-Sleep -Seconds 120'
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1500 -ReportedTimeoutMs 600000
+[pscustomobject]@{ timedOut = $r.timedOut; timeoutMs = $r.timeoutMs; failures = @($r.failures); exitCode = $r.exitCode; hasExited = $s.p.HasExited; finalWaitMs = $r.finalWaitMs } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["timedOut"])
+        self.assertEqual(600000, out["timeoutMs"], "the receipt must name the whole budget, never the last chunk remainder")
+        self.assertEqual(1500, out["finalWaitMs"], "the remainder actually waited stays recorded, under its own name")
+        text = " ".join(out["failures"])
+        self.assertIn("600000 ms", text)
+        self.assertNotIn("of 1500 ms", text)
+        self.assertEqual(124, out["exitCode"])
+        self.assertTrue(out["hasExited"])
+
+    def test_without_a_reported_budget_the_wait_time_is_still_the_reported_timeout(self) -> None:
+        out = run_ps(r"""
+$s = New-Stub 'Start-Sleep -Seconds 120'
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1500
+[pscustomobject]@{ timeoutMs = $r.timeoutMs; outcome = $r.outcome } | ConvertTo-Json -Compress
+""")
+        self.assertEqual(1500, out["timeoutMs"])
+        self.assertEqual("timeout", out["outcome"])
+
+    def test_runner_hands_the_whole_budget_to_the_wait(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        start = source.index("$processBoundary = Wait-GuiSmokeProcessBounded")
+        call = source[start:source.index("\n$stdout = $processBoundary.stdout", start)]
+        self.assertIn("-ReportedTimeoutMs $effectiveProcessTimeoutMs", call)
+        self.assertIn("-NoProgressStalled:$noProgressStalled", call)
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class NoProgressWindowComesFromTheLegBudget(unittest.TestCase):
+    def test_window_is_leg_budget_plus_margin_and_never_the_job_timeout(self) -> None:
+        out = run_ps(r"""
+[pscustomobject]@{
+    derived = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 155000
+    override = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 155000 -OverrideMs 90000
+    capped = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 155000 -CeilingMs 100000
+    cappedOverride = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 155000 -OverrideMs 500000 -CeilingMs 100000
+} | ConvertTo-Json -Compress
+""")
+        self.assertEqual(155000 + 60000, out["derived"])
+        self.assertEqual(90000, out["override"])
+        self.assertEqual(100000, out["capped"])
+        self.assertEqual(100000, out["cappedOverride"])
+
+    def test_runner_derives_the_window_from_its_own_leg_inputs(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        start = source.index("$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs")
+        call = source[start:source.index("\n", start)]
+        self.assertIn("-LegBudgetMs $derivedProcessTimeoutMs", call)
+        self.assertIn("-OverrideMs $NoProgressTimeoutMs", call)
+        self.assertIn("-CeilingMs $effectiveProcessTimeoutMs", call)
+        # derived from the leg (playback window + settle + margin), so a caller's 3600 s job timeout cannot widen it
+        self.assertNotIn("3600", call)
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class LogProgressWatchdog(unittest.TestCase):
+    def test_a_log_that_stops_advancing_trips_and_one_that_keeps_advancing_does_not(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'logs'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1500
+$early = $false
+Add-Content -LiteralPath $log -Value 'line0'
+for ($i = 0; $i -lt 14; $i++) { Add-Content -LiteralPath $log -Value "line$i"; Start-Sleep -Milliseconds 250; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $early = $true } }
+$sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
+while ($sw.ElapsedMilliseconds -lt 8000 -and -not $tripped) { Start-Sleep -Milliseconds 200; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
+[pscustomobject]@{ trippedWhileAdvancing = $early; tripped = $tripped; stallMs = [int]$sw.ElapsedMilliseconds } | ConvertTo-Json -Compress
+""")
+        self.assertFalse(out["trippedWhileAdvancing"], "a log that keeps advancing must not trip the watchdog")
+        self.assertTrue(out["tripped"], "a log that stops advancing must trip it")
+        self.assertGreaterEqual(out["stallMs"], 1000)
+        self.assertLess(out["stallMs"], 6000)
+
+    def test_a_run_whose_log_never_appeared_is_not_judged(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'empty'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 500
+Start-Sleep -Milliseconds 1500
+[pscustomobject]@{ stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w) } | ConvertTo-Json -Compress
+""")
+        self.assertFalse(out["stalled"], "before the app writes its first log line the overall budget is the only bound")
+
+    def test_no_progress_ends_the_wait_with_a_typed_outcome_and_kills_only_the_started_tree(self) -> None:
+        out = run_ps(r"""
+$decoy = New-Stub 'Start-Sleep -Seconds 120'
+$s = New-Stub ('& "' + $env:GS_PWSH + '" -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 120"')
+Start-Sleep -Milliseconds 1500
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 600000 -ReportedTimeoutMs 600000 -NoProgressStalled -NoProgressWindowMs 1500
+$waitedMs = [int]$sw.ElapsedMilliseconds
+$decoyAlive = -not $decoy.p.HasExited
+if ($decoyAlive) { $decoy.p.Kill($true) }
+[pscustomobject]@{ outcome = $r.outcome; timedOut = $r.timedOut; noProgress = $r.noProgress; noProgressWindowMs = $r.noProgressWindowMs; timeoutMs = $r.timeoutMs
+    treeKillAttempted = $r.treeKillAttempted; treeKillSucceeded = $r.treeKillSucceeded; terminationConfirmed = $r.terminationConfirmed; exitCode = $r.exitCode
+    failures = @($r.failures); hasExited = $s.p.HasExited; decoyAlive = $decoyAlive; waitedMs = $waitedMs } | ConvertTo-Json -Compress
+""")
+        self.assertEqual("process_no_progress", out["outcome"])
+        self.assertTrue(out["timedOut"], "exit code 124 and the existing timed-out receipt path stay")
+        self.assertTrue(out["noProgress"])
+        self.assertEqual(1500, out["noProgressWindowMs"])
+        self.assertEqual(600000, out["timeoutMs"])
+        self.assertTrue(out["treeKillAttempted"] and out["treeKillSucceeded"] and out["terminationConfirmed"])
+        self.assertEqual(124, out["exitCode"])
+        self.assertTrue(out["hasExited"])
+        self.assertTrue(out["decoyAlive"], "only the process this runner started may be killed, never one picked by image name")
+        text = " ".join(out["failures"])
+        self.assertIn("process_no_progress", text)
+        self.assertNotIn("exceeded the fail-closed process timeout", text)
+        self.assertLess(out["waitedMs"], 60000, "a stalled leg must end at once, not wait out the remaining budget")
+
+    def test_runner_checks_the_log_between_chunks_and_receipt_carries_the_outcome(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        loop_start = source.index("$hostLoadDuringSamples.Add($newSample)")
+        loop_end = source.index("$hostLoadSampleLoopElapsedMs = [int]", loop_start)
+        loop = source[loop_start:loop_end]
+        self.assertIn("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch", loop)
+        self.assertIn("$noProgressStalled = $true", loop)
+        self.assertIn("New-GuiSmokeLogProgressWatch -LogRoot $logRoot", source)
+        receipt_start = source.index("\n    process = [pscustomobject]@{\n")
+        receipt = source[receipt_start:source.index("\n    }\n", receipt_start)]
+        for field in ("outcome = ", "noProgressWindowMs = ", "legBudgetMs = ", "finalWaitMs = "):
+            self.assertIn(field, receipt)
+        self.assertIn("[int]$NoProgressTimeoutMs = 0", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -38,6 +38,89 @@ function Get-GuiSmokeTaskText {
     }
 }
 
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: how long the app's log may stay silent before the leg is judged stuck. It comes from the
+# LEG's own budget (play safety net + settle + screenshot allowances, the runner's $derivedProcessTimeoutMs) plus a margin, never from
+# the caller's -ProcessTimeoutMs / the job timeout, which for an owner-clip leg also holds the input re-read and can be 3600 s.
+# -OverrideMs replaces the derived value; -CeilingMs (the whole process budget) caps either, so the watchdog never outlasts the wait.
+function Get-GuiSmokeNoProgressWindowMs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(0, 3600000)]
+        [int64]$LegBudgetMs,
+        [ValidateRange(0, 3600000)]
+        [int64]$MarginMs = 60000,
+        [ValidateRange(0, 3600000)]
+        [int64]$OverrideMs = 0,
+        [ValidateRange(0, 3600000)]
+        [int64]$CeilingMs = 0
+    )
+
+    $window = if ($OverrideMs -gt 0) { $OverrideMs } else { $LegBudgetMs + $MarginMs }
+    if ($CeilingMs -gt 0 -and $window -gt $CeilingMs) { $window = $CeilingMs }
+    return [int64]$window
+}
+
+# A watch over the app's own log files (mlvapp-*.log in the run's log directory). It is armed by the FIRST sign of a log, so the time
+# before the app writes anything (loading the input, Qt start-up) stays bounded by the overall budget only. Progress is any growth in
+# the summed file length, read through an opened handle (a directory listing can report a stale size for a file the app still holds).
+function New-GuiSmokeLogProgressWatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$LogRoot,
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 3600000)]
+        [int]$WindowMs
+    )
+
+    [pscustomobject]@{
+        LogRoot = $LogRoot
+        WindowMs = $WindowMs
+        Armed = $false
+        LastLength = [int64]-1
+        Quiet = [System.Diagnostics.Stopwatch]::StartNew()
+    }
+}
+
+function Get-GuiSmokeLogTotalLength {
+    param([Parameter(Mandatory)][string]$LogRoot)
+
+    $total = [int64]0
+    $seen = $false
+    try {
+        foreach ($file in @(Get-ChildItem -LiteralPath $LogRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)) {
+            try {
+                $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+                try { $total += [int64]$stream.Length; $seen = $true } finally { $stream.Dispose() }
+            }
+            catch { }
+        }
+    }
+    catch { }
+    if ($seen) { return $total }
+    return $null
+}
+
+function Test-GuiSmokeLogProgressStalled {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Watch
+    )
+
+    $length = Get-GuiSmokeLogTotalLength -LogRoot $Watch.LogRoot
+    if ($null -eq $length) { return $false }
+    if (-not $Watch.Armed -or $length -ne $Watch.LastLength) {
+        $Watch.Armed = $true
+        $Watch.LastLength = $length
+        $Watch.Quiet.Restart()
+        return $false
+    }
+    return ($Watch.Quiet.ElapsedMilliseconds -ge $Watch.WindowMs)
+}
+
 function Wait-GuiSmokeProcessBounded {
     [CmdletBinding()]
     param(
@@ -52,7 +135,16 @@ function Wait-GuiSmokeProcessBounded {
         [ValidateRange(1, 60000)]
         [int]$TerminationGraceMs = 15000,
         [ValidateRange(1, 60000)]
-        [int]$StreamDrainMs = 15000
+        [int]$StreamDrainMs = 15000,
+        # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: -TimeoutMs is only what is LEFT of the budget after the caller's own chunked waits (it can be the
+        # 1 ms floor). The receipt and the failure text report the WHOLE budget the caller started with; 0 = the same as -TimeoutMs.
+        [ValidateRange(0, 3600000)]
+        [int]$ReportedTimeoutMs = 0,
+        # The caller's chunk loop saw the app log stop advancing for -NoProgressWindowMs: end the wait at once (a 1 ms look for an exit that
+        # raced the verdict, then the tree kill below) with the typed outcome process_no_progress.
+        [switch]$NoProgressStalled,
+        [ValidateRange(0, 3600000)]
+        [int]$NoProgressWindowMs = 0
     )
 
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3-6: this used to chop the wait into chunks and
@@ -76,6 +168,7 @@ function Wait-GuiSmokeProcessBounded {
     $treeKillAttempted = $false
     $treeKillSucceeded = $false
     $terminationConfirmed = $false
+    $noProgress = $false
     # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): the wall-clock moment a WaitForExit call returned true, i.e. when termination was
     # confirmed, stamped BEFORE the stream drain below (which can run up to 2 x $StreamDrainMs past the exit while a child holds an inherited
     # handle). $null when termination was never confirmed. The caller's own end stamp, taken after this function returns, includes that drain.
@@ -84,8 +177,11 @@ function Wait-GuiSmokeProcessBounded {
     $exitObservedAtUtc = $null
     $exitObservedTimestamp = $null
 
+    $reportedTimeoutMs = if ($ReportedTimeoutMs -gt 0) { $ReportedTimeoutMs } else { $TimeoutMs }
+    $waitMs = if ($NoProgressStalled) { 1 } else { $TimeoutMs }
+
     try {
-        $terminationConfirmed = $Process.WaitForExit($TimeoutMs)
+        $terminationConfirmed = $Process.WaitForExit($waitMs)
         if ($terminationConfirmed) { $exitObservedTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp(); $exitObservedAtUtc = [datetime]::UtcNow }
     }
     catch {
@@ -96,7 +192,13 @@ function Wait-GuiSmokeProcessBounded {
 
     if (-not $terminationConfirmed) {
         $timedOut = $true
-        $failures.Add("MLVApp exceeded the fail-closed process timeout of $TimeoutMs ms.")
+        $noProgress = [bool]$NoProgressStalled
+        if ($noProgress) {
+            $failures.Add("MLVApp made no log progress for $NoProgressWindowMs ms (process_no_progress) and was terminated; the whole process budget was $reportedTimeoutMs ms.")
+        }
+        else {
+            $failures.Add("MLVApp exceeded the fail-closed process timeout of $reportedTimeoutMs ms.")
+        }
         $treeKillAttempted = $true
         try {
             # Kill(entireProcessTree: true) is required: a child retaining an
@@ -157,7 +259,12 @@ function Wait-GuiSmokeProcessBounded {
 
     [pscustomobject]@{
         timedOut = $timedOut
-        timeoutMs = $TimeoutMs
+        # the WHOLE budget (VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1); finalWaitMs is the remainder this call itself waited
+        timeoutMs = $reportedTimeoutMs
+        finalWaitMs = $TimeoutMs
+        outcome = $(if ($noProgress) { 'process_no_progress' } elseif ($timedOut) { 'timeout' } else { 'exited' })
+        noProgress = $noProgress
+        noProgressWindowMs = $(if ($noProgress) { $NoProgressWindowMs } else { $null })
         treeKillAttempted = $treeKillAttempted
         treeKillSucceeded = $treeKillSucceeded
         terminationConfirmed = $terminationConfirmed
@@ -173,4 +280,4 @@ function Wait-GuiSmokeProcessBounded {
     }
 }
 
-Export-ModuleMember -Function Wait-GuiSmokeProcessBounded
+Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeNoProgressWindowMs, New-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled
