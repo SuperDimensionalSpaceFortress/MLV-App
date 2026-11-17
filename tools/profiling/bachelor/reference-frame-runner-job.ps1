@@ -86,7 +86,7 @@
 [CmdletBinding()]
 param(
     # The commit the STAGED BUILD was built from (cache file names, the build manifest's sourceCommit, the capture's recorded identity).
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
     # The commit whose COMMITTED bytes supply the capture script, its dependencies and tools/gates/output-budget.json. It is NOT the build's
     # commit: the build under test may be older than the capture script's gate-profile arguments (the June-era build the known-good bridge needs).
     # Default: the HEAD of -RepoRoot, the tooling checkout this generator runs from.
@@ -306,7 +306,9 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Add-AttrCudaTraceLine',
     'Get-AttrCudaFileSha256Blocks',
     'Test-AttrCudaFootagePart',
-    'Assert-AttrCudaBuildManifest'
+    'Assert-AttrCudaBuildManifest',
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: the ONE claim-shape predicate every reader of a cached build's artifact claim calls.
+    'Get-AttrCudaBuildManifestClaimSha256'
 )
 # F-01: the neutral owner-clip view, the read-only pin and the identity-checked cleanup, embedded VERBATIM from
 # AttrCudaOwnerFootage.psm1 -- the same functions, extracted the same way, as playback-attr-3-cuda-job.ps1 embeds them.
@@ -400,7 +402,7 @@ function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
 function Assert-UnderAgentRoot([string]$Path, [string]$Label) {
     $full = [IO.Path]::GetFullPath($Path)
     $root = [IO.Path]::GetFullPath($AgentRoot)
-    if ($full -ne $root -and -not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    if ($full -ne $root -and -not $full.StartsWith($(if ($root.Substring($root.Length - 1) -eq '\') { $root } else { $root + '\' }), [StringComparison]::OrdinalIgnoreCase)) {
         throw "job-owned path '$Label' resolves outside the agent root: $full"
     }
 }
@@ -478,10 +480,11 @@ $StepLog['bundleWrite'] = 0
 # --- the staged build: authenticate the manifest BEFORE reading a field of it, then every cached artifact against it ------------------
 try {
     $buildManifest = Assert-AttrCudaBuildManifest -Path (Join-Path $Cache $BuildManifestName) -ExpectedSha256 $BuildManifestSha256 -ExpectedSourceCommit $SourceCommit
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: each digest through the ONE claim-shape predicate the leg job and the stage job use ('' = refused below)
     $artifactChecks = @(
-        @{ label = 'packageZip'; path = (Join-Path $Cache $PackageZipName); expectedSha = [string]$buildManifest.packageZip.sha256 },
-        @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = [string]$buildManifest.exe.sha256 },
-        @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = [string]$buildManifest.dll.sha256 }
+        @{ label = 'packageZip'; path = (Join-Path $Cache $PackageZipName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'packageZip') },
+        @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'exe') },
+        @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'dll') }
     )
     $artifactHashes = @{}
     foreach ($check in $artifactChecks) {
@@ -490,6 +493,9 @@ try {
         $artifactHashes[$check.label] = Get-ShaLower $check.path
         if ($artifactHashes[$check.label] -ne $check.expectedSha.ToLowerInvariant()) { throw "hash mismatch (vs build manifest $BuildManifestName) for $($check.path)" }
     }
+    # r27 (adversary pass-29 A1 on 7f1886f1): the manifest is re-authenticated LAST, after every artifact hash; a stager's repair retires build.json before it
+    # renames artifacts, so a read that overlapped it finds no manifest (or other bytes) here and buildVerify fails, never 0
+    [void](Assert-AttrCudaBuildManifest -Path (Join-Path $Cache $BuildManifestName) -ExpectedSha256 $BuildManifestSha256 -ExpectedSourceCommit $SourceCommit)
 } catch {
     Complete-Failed 208 'buildVerify' $_.Exception.Message
 }

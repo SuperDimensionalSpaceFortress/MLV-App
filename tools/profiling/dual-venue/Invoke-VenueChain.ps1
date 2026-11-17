@@ -73,7 +73,7 @@ param(
     [Parameter(ParameterSetName = 'Chain')][ValidateRange(1, 20)][int]$Repeats = 1,
     [Parameter(ParameterSetName = 'Chain')][ValidateSet('cuda', 'cpu')][string]$Backend,
     [Parameter(ParameterSetName = 'Chain', Mandatory = $true)][string]$RunDir,
-    [Parameter(ParameterSetName = 'Chain', Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    [Parameter(ParameterSetName = 'Chain', Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit,
     [Parameter(ParameterSetName = 'Chain', Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
     [Parameter(ParameterSetName = 'Chain')][string]$Purpose = '',
     [Parameter(ParameterSetName = 'Chain')][string]$SheetCopyDir = '',

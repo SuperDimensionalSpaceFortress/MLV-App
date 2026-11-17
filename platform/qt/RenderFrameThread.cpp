@@ -2454,6 +2454,16 @@ void RenderFrameThread::warmReconForWorker( const ReconQueueEntry &entry,
 void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                                              llrawprocWorkerState_t *workerState )
 {
+    /* CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the Phase-3 recon runs HERE, on the ReconWorker thread,
+     * whose OpenMP team is the libgomp default (nothing sets it; the render thread's
+     * omp_set_num_threads binds to the render thread only). Only when
+     * MLVAPP_PLAYBACK_RECON_OMP_THREADS is set is this thread's team sized (lower-only), before
+     * the frame's llrawproc; unset, no call and no change. */
+    const int reconTeamRequest = mlvappPlaybackReconTeamRequest();
+    if( reconTeamRequest > 0 )
+    {
+        (void)mlvappApplyPlaybackOpenMpThreadCount( reconTeamRequest );
+    }
     if( entry.warm )
     {
         warmReconForWorker( entry, workerState );
@@ -4792,7 +4802,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         playbackPreviewFastPathActive );
 
     const int generalWorkerThreads = mlvappEffectiveWorkerThreadCount();
-    const int workerThreads = mlvappEffectivePlaybackWorkerThreadCount();
+    /* CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the recon-side team (exactly the playback count unless
+     * MLVAPP_PLAYBACK_RECON_OMP_THREADS is set; WorkerThreadCount.h). */
+    const int workerThreads = mlvappPlaybackReconWorkerThreadCount();
     const int openMpThreads = mlvappApplyPlaybackOpenMpThreadCount(workerThreads);
     if( m_pMlvObject )
     {

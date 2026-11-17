@@ -44,11 +44,16 @@
 # Re-staging a build whose default JobId was already used needs -JobIdSuffix: the job is then
 # playback-attr-3-cuda-stage-<sha12>-<suffix>. The generator does not submit anything, so it
 # cannot see an UMRUN_JOBID_IN_USE refusal; the caller of um-run.ps1 owns that.
+# A suffix never replaces a SOUND staged build of the sha (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): the
+# job reuses it when the manifest bytes are the same (STAGE_REUSED_EXISTING, exit 0) and refuses
+# otherwise (STAGE_REFUSED_STAGED_OTHER_MANIFEST, exit 7), writing nothing into the cache either way.
+# Sound means what the leg job accepts (Assert-AttrCudaBuildManifest plus the three artifact hashes);
+# only a staged build the leg job would refuse is replaced.
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     # The assembler's -OutDir: holds playback-attr-3-cuda-<sha12>-build.json and the three
@@ -87,7 +92,10 @@ if (-not (Test-Path -LiteralPath $buildManifestPath)) {
     throw "build manifest not found: $buildManifestPath (the assembler writes it LAST; its absence means that build did not complete)"
 }
 $buildManifest = Get-Content -Raw -LiteralPath $buildManifestPath | ConvertFrom-Json
-if ($buildManifest.sourceCommit -ne $SourceCommit) {
+# r24 (adversary pass-25 A1 on 63887a9c): ordinal, never -ne/-ceq (PowerShell string operators, the case-sensitive ones too, are culture comparisons that ignore U+200B and
+# other format characters): equal length and an OrdinalIgnoreCase StartsWith is ordinal equality.
+$declaredBuildCommit = [string]$buildManifest.sourceCommit
+if ($declaredBuildCommit.Length -ne $SourceCommit.Length -or -not $declaredBuildCommit.StartsWith($SourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
     throw "build manifest sourceCommit=$($buildManifest.sourceCommit) does not match -SourceCommit $SourceCommit"
 }
 if ($buildManifest.pendingSymbolPresence -isnot [bool]) {
@@ -112,8 +120,9 @@ foreach ($item in $canonical) {
     if ($claimedName -cne [string]$item.name) {
         throw "build manifest names $($item.label) '$claimedName'; the canonical name for $SourceCommit is '$($item.name)'. Names are derived, never taken from the manifest."
     }
-    $sha = if ($null -eq $item.claim) { '' } else { ([string]$item.claim.sha256).ToLowerInvariant() }
-    if ($sha -notmatch '^[0-9a-f]{64}$') { throw "build manifest sha256 for $($item.name) is not a lowercase sha256" }
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: through the ONE claim-shape predicate the leg job reads with, so nothing is staged that a leg refuses
+    $sha = Get-AttrCudaBuildManifestClaimSha256 $buildManifest ([string]$item.label)
+    if ($sha -notmatch '^[0-9a-f]{64}$') { throw "build manifest sha256 for $($item.name) is not a lowercase sha256 of the one accepted claim shape" }
     $expected += [ordered]@{ name = [string]$item.name; sha256 = $sha }
 }
 # Verify each one HERE first: a side-file that does not match on this machine can never match on
@@ -151,7 +160,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaOwnershipProof',
     'New-AttrCudaOwnedRoot',
     'New-AttrCudaOwnedFileStream',
-    'Remove-AttrCudaInputFileByContent'
+    'Remove-AttrCudaInputFileByContent',
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a staged build is "sound" exactly when the leg job's own
+    # manifest check (playback-attr-3-cuda-job.ps1) accepts it.
+    'Assert-AttrCudaBuildManifest',
+    # r3 (adversary A1 on ce5a0380): and its artifact claims are read through the ONE claim-shape predicate the leg job reads them with.
+    'Get-AttrCudaBuildManifestClaimSha256',
+    # r3 (adversary A3 on ce5a0380, A1 on 3bec2622): the one stage lock of a sha in a physical agent root, and the test-only hold seam.
+    'Enter-AttrCudaStageLock',
+    'Wait-AttrCudaTestHold'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -163,7 +180,12 @@ $template = @'
 # -VerifyOnly runs the read-only prefix (name derivation and safety, path containment, side-file
 # presence, hashes, manifest binding) and exits without creating, copying, publishing or deleting
 # anything. The agent never passes it; the behavioural tests do.
-param([switch]$VerifyOnly)
+# -TestHoldAfterPartialsPath / -TestLockWaitMarkerPath (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3): test-only seams for the two-stager
+# interleaving test (test_playback_attr_3_cuda_behaviour.py). The agent runs a job with no arguments, so production passes neither.
+# -TestHoldBeforeRetirePath (r9, Grok G8 on #814): the same hold between the never-replace guard's read of an unsound staged manifest and its
+# retirement by content proof (r9 fix iteration 3: before the other-commit re-read too), so a test can put other bytes at the name meanwhile.
+# Production passes none.
+param([switch]$VerifyOnly, [string]$TestHoldAfterPartialsPath = '', [string]$TestLockWaitMarkerPath = '', [string]$TestHoldBeforeRetirePath = '')
 
 $ErrorActionPreference = 'Stop'
 $SourceCommit = '__SOURCE_COMMIT__'
@@ -174,7 +196,7 @@ $ManifestSha256 = '__MANIFEST_SHA256__'
 $Expected = __EXPECTED_LITERAL__
 $Cache = Join-Path $AgentRoot 'cache'
 $Inbox = Join-Path $AgentRoot 'inbox'
-$Work = Join-Path $AgentRoot "work\$JobId"
+# $Work is assigned once, after the stage lock, on the locked root (r16); nothing before the lock uses it.
 $Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
 # OWNER-FOOTAGE-NO-HARDLINK-2: the creator record of everything this job makes under $AgentRoot. No
 # delete below ever adopts a name because it looks like this job's.
@@ -221,16 +243,27 @@ function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
 function Assert-UnderAgentRoot([string]$Path, [string]$Label) {
     $full = [IO.Path]::GetFullPath($Path)
     $root = [IO.Path]::GetFullPath($AgentRoot)
-    if ($full -ne $root -and -not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    if ($full -ne $root -and -not $full.StartsWith($(if ($root.Substring($root.Length - 1) -eq '\') { $root } else { $root + '\' }), [StringComparison]::OrdinalIgnoreCase)) {
         throw "job-owned path '$Label' resolves outside the agent root: $full"
     }
 }
 foreach ($check in @(
     @{ path = $Cache; label = 'Cache' },
     @{ path = $Inbox; label = 'Inbox' },
-    @{ path = $Work; label = 'Work' },
     @{ path = $Pub; label = 'Pub' }
 )) { Assert-UnderAgentRoot $check.path $check.label }
+
+# r16 (r14 OPEN A1, adversary on 6882c873): one side-file's inbox, cache and partial paths, built on the CURRENT $Inbox / $Cache. Used in artifactNameSafety on
+# the lexical root, and again right after the stage lock on the locked root's final path, so the two can never be built two ways.
+function New-JobSideFile([string]$Name, [string]$Sha256) {
+    [ordered]@{
+        name = $Name
+        path = (Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $Name) -Label "inbox/$Name")
+        cachePath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $Name) -Label "cache/$Name")
+        partialPath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache "$Name.partial") -Label "cache/$Name.partial")
+        sha256 = $Sha256
+    }
+}
 
 Say "START source=$SourceCommit files=$($Expected.Count)"
 
@@ -257,13 +290,7 @@ try {
         if ($canonicalNames -cnotcontains $name) {
             throw "baked artifact name '$name' is not one of the canonical names for ${SourceCommit}: $($canonicalNames -join ', ')"
         }
-        $sideFiles += [ordered]@{
-            name = $name
-            path = (Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $name) -Label "inbox/$name")
-            cachePath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $name) -Label "cache/$name")
-            partialPath = (Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache "$name.partial") -Label "cache/$name.partial")
-            sha256 = [string]$item.sha256
-        }
+        $sideFiles += New-JobSideFile $name ([string]$item.sha256)
     }
     $manifestSide = Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $ManifestName) -Label "inbox/$ManifestName"
     $manifestCachePath = Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $ManifestName) -Label "cache/$ManifestName"
@@ -301,18 +328,21 @@ $StepLog['sideFileHashes'] = 0
 # The manifest's own claims must still agree with the baked set: identical bytes cannot
 # disagree, so this fails only if the baking itself was wrong -- which is worth knowing.
 $arrivedManifest = Get-Content -Raw -LiteralPath $manifestSide | ConvertFrom-Json
-if ($arrivedManifest.sourceCommit -ne $SourceCommit) {
+$arrivedCommit = [string]$arrivedManifest.sourceCommit
+if ($arrivedCommit.Length -ne $SourceCommit.Length -or -not $arrivedCommit.StartsWith($SourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
     Complete-Failed 5 'manifestBinding' "arrived manifest sourceCommit=$($arrivedManifest.sourceCommit) does not match $SourceCommit"
 }
 if ($arrivedManifest.pendingSymbolPresence -isnot [bool]) {
     Complete-Failed 5 'manifestBinding' 'arrived manifest has no boolean pendingSymbolPresence; the attribution job would refuse it'
 }
-foreach ($claim in @($arrivedManifest.packageZip, $arrivedManifest.exe, $arrivedManifest.dll)) {
+foreach ($claimKey in 'packageZip', 'exe', 'dll') {
+    $claim = $arrivedManifest.$claimKey
     $claimedName = [string]$claim.name
     if (-not $observed.Contains($claimedName)) {
         Complete-Failed 5 'manifestBinding' "arrived manifest names $claimedName, which is not in the staged set"
     }
-    if ($observed[$claimedName] -ne ([string]$claim.sha256).ToLowerInvariant()) {
+    # r3: the digest through the ONE claim-shape predicate (embedded below), never by member access
+    if ($observed[$claimedName] -ne (Get-AttrCudaBuildManifestClaimSha256 $arrivedManifest $claimKey)) {
         Complete-Failed 5 'manifestBinding' "arrived manifest sha256 for $claimedName disagrees with the staged bytes"
     }
 }
@@ -323,6 +353,154 @@ if ($VerifyOnly) {
     Write-Output "RESULT=VERIFY_ONLY_OK SOURCE=$SourceCommit FILES=$($sideFiles.Count) MANIFEST=$ManifestName"
     exit 0
 }
+
+# --- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a sound staged build of this sha is never replaced -----
+# The cache holds ONE build per sha, and a re-assemble of the same sha is a NEW manifest (build.json
+# carries assembledAtUtc). 2026-11-13: two lanes both assembled 23a07757; the later one's suffixed
+# stage replaced the manifest a running lease batch had pinned (ad005766 -> f8fc75a2), so the batch
+# ended BUILD_MANIFEST_MISMATCH and lost a leg. Every stager reaches the cache only through this job,
+# and the agent runs inbox jobs one at a time, so the rule is held here, before the first cache write.
+# SOUND = exactly what the leg job (playback-attr-3-cuda-job.ps1) accepts before it runs: the cached
+# build.json passes Assert-AttrCudaBuildManifest (this sha, a well-formed dllPairManifestSha256, a
+# boolean pendingSymbolPresence), and each of the three cached artifacts, by its derived name, hashes
+# to the manifest's packageZip / exe / dll sha256. A sound staged build with these exact manifest
+# bytes is reused (STAGE_REUSED_EXISTING, exit 0); with any other manifest it is refused (exit 7).
+# Neither writes the cache; both remove this job's own verified inputs from the inbox by content. A
+# build.json the leg job would refuse anyway is not a build anyone can run, so it is replaced as before.
+#
+# r3 (adversary A3 on ce5a0380): the guard and the publication below are ONE step per cache and sha. Two
+# agents on one root (each with its own -MutexName, both admitted) both passed an absent-manifest guard; B
+# published, then A replaced B's artifacts, deleted B's sound manifest and failed (exit 22): a sound stage
+# with no manifest. So this job takes a lock named for the cache directory's full path and the sha (never a
+# caller-chosen name) BEFORE the guard reads the cache, and holds it until the process ends, past the last
+# cache write (the OS releases it then; an abandoned lock is taken over, because the guard re-reads the cache
+# under it). A second stager of the sha waits, then finds the sound build and reuses or refuses it. A lock
+# that cannot be had is a refusal (exit 7) with nothing written.
+# The lock is keyed on the agent root's PHYSICAL identity (adversary A1 on 3bec2622: a junction alias of the
+# same root took a different lexical-path lock), in Enter-AttrCudaStageLock, embedded above.
+# r4 (Grok G5 on #814): a busy lock prints STAGE_LOCK_WAIT <root-id> <sha> waiting up to <n> s BEFORE the wait
+# (Enter-AttrCudaStageLock), so a stager blocked here is never silent; STAGE_LOCK_WAITED follows the wait.
+$StageLockWaitSec = 1800
+try {
+    $StageLock = Enter-AttrCudaStageLock -Root $AgentRoot -SourceCommit $SourceCommit -WaitSec $StageLockWaitSec -WaitMarkerPath $TestLockWaitMarkerPath
+} catch {
+    Write-Output "STAGE_REFUSED_STAGE_LOCK sha=$($SourceCommit.Substring(0, 12)) $($_.Exception.Message -replace '\s+', ' ')"
+    Complete-Failed 7 'stagedBuildGuard' "the stage lock of $SourceCommit in $AgentRoot could not be taken, so nothing is staged: $($_.Exception.Message)"
+}
+if (-not $StageLock.held) {
+    Write-Output "STAGE_REFUSED_STAGE_LOCK_BUSY sha=$($SourceCommit.Substring(0, 12)) lock=$($StageLock.name) waitedSec=$StageLockWaitSec"
+    Complete-Failed 7 'stagedBuildGuard' "another stager of $SourceCommit into $AgentRoot held $($StageLock.name) for $StageLockWaitSec s; nothing is staged"
+}
+if ($StageLock.waited) { Say "STAGE_LOCK_WAITED another stager of $SourceCommit held $($StageLock.name); the cache is read again under it" }
+# r16 (r14 OPEN A1, adversary on 6882c873; siblings :515/:527 and Publish-AttrCudaFileMove / Assert-AttrCudaWritableFileSlot under them): the lock names the root the
+# ONE handle Enter-AttrCudaStageLock opened and still holds ($StageLock.rootHandle: no FILE_SHARE_DELETE, so neither the root nor an ancestor can be renamed while this
+# job runs). Every path is rebuilt on that root's final path now, before the guard reads the cache: a junction in the lexical -AgentRoot retargeted later moves nothing.
+# $Work is assigned here only (nothing before the lock uses it), once, at top level.
+$AgentRoot = [string]$StageLock.root
+$Cache = Join-Path $AgentRoot 'cache'
+$Inbox = Join-Path $AgentRoot 'inbox'
+$Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
+$OwnedJournal = Join-Path $AgentRoot '.attrcuda-owned.jsonl'
+$Work = Join-Path $AgentRoot "work\$JobId"
+try {
+    foreach ($check in @(
+        @{ path = $Cache; label = 'Cache' },
+        @{ path = $Inbox; label = 'Inbox' },
+        @{ path = $Work; label = 'Work' },
+        @{ path = $Pub; label = 'Pub' }
+    )) { Assert-UnderAgentRoot $check.path $check.label }
+    $sideFiles = @(foreach ($item in $sideFiles) { New-JobSideFile ([string]$item.name) ([string]$item.sha256) })
+    $manifestSide = Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $ManifestName) -Label "inbox/$ManifestName"
+    $manifestCachePath = Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache $ManifestName) -Label "cache/$ManifestName"
+    $manifestPartialPath = Assert-AttrCudaDirectChild -Root $Cache -Path (Join-Path $Cache "$ManifestName.partial") -Label "cache/$ManifestName.partial"
+} catch {
+    Complete-Failed 7 'stagedBuildGuard' "the job paths could not be rebuilt on the locked root $AgentRoot, so nothing is staged: $($_.Exception.Message)"
+}
+if (Test-Path -LiteralPath $manifestCachePath) {
+    $stagedSha = ''
+    $unsound = ''
+    $unsoundRaw = ''
+    $declaredCommit = $null
+    try {
+        $stagedSha = Get-ShaLower $manifestCachePath
+        $staged = $null
+        try {
+            $staged = Assert-AttrCudaBuildManifest -Path $manifestCachePath -ExpectedSha256 $stagedSha -ExpectedSourceCommit $SourceCommit
+        } catch {
+            # Only the leg job's own content refusals make a staged build unsound; a read that failed is not a verdict (outer catch: refused).
+            if ([string]$_.Exception.Message -notmatch '^ATTRCUDA_BUILD_MANIFEST_(UNPARSEABLE|COMMIT_MISMATCH|DLLPAIR_UNBOUND|SYMBOL_PRESENCE_INVALID) ' -and
+                $_.Exception -isnot [ArgumentException]) { throw }
+            $unsoundRaw = [string]$_.Exception.Message
+            $unsound = ($unsoundRaw -replace '\s+', ' ')
+            # r12 (Grok G15 on #814): a COMMIT_MISMATCH carries the commit the judged bytes declare as data; read it from there, never from the message text
+            if ($null -ne $_.Exception.Data -and $_.Exception.Data.Contains('declaredCommit')) { $declaredCommit = [string]$_.Exception.Data['declaredCommit'] }
+        }
+        if (-not $unsound) {
+            $cachePathByName = @{}
+            foreach ($item in $sideFiles) { $cachePathByName[[string]$item.name] = [string]$item.cachePath }
+            foreach ($check in @(@('packageZip', $derived.packageZipName), @('exe', $derived.exeName), @('dll', $derived.reconName))) {
+                # r3 (adversary A1 on ce5a0380): read through the ONE claim-shape predicate the leg job reads it with (embedded verbatim
+                # in both), so the leg and this guard accept exactly the same claims; '' is a claim the leg refuses, so the build is unsound.
+                $claimSha = Get-AttrCudaBuildManifestClaimSha256 $staged ([string]$check[0])
+                $cachedPath = $cachePathByName[[string]$check[1]]
+                if ([string]::IsNullOrWhiteSpace($claimSha)) { $unsound = "it carries no sha256 of the accepted claim shape for $($check[0])"; break }
+                if (-not (Test-Path -LiteralPath $cachedPath -PathType Leaf)) { $unsound = "$($check[1]) is not in the cache"; break }
+                if ((Get-ShaLower $cachedPath) -ne $claimSha.ToLowerInvariant()) { $unsound = "the cached $($check[1]) differs from the manifest's $($check[0]) sha256"; break }
+            }
+        }
+    } catch {
+        # A staged build this job cannot read is not one it may replace: fail closed, write nothing.
+        Write-Output "STAGE_REFUSED_STAGED_UNREADABLE sha=$($SourceCommit.Substring(0, 12)) incoming=$($ManifestSha256.Substring(0, 8)) $($_.Exception.Message -replace '\s+', ' ')"
+        Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit could not be read, so it is not replaced: $($_.Exception.Message)"
+    }
+    if ($unsound) { Wait-AttrCudaTestHold -Path $TestHoldBeforeRetirePath }
+    if ($unsound -match '^ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ') {
+        # r9 fix iteration (adversary A1 on 9825bfd9): the cache name is the sha's first 12 hex, so a manifest of ANOTHER commit with the same 12 can stand at
+        # it, sound for that commit and maybe pinned by its lease batch. It is not this commit's unsound build: never replaced, nothing is staged. (Any other
+        # sourceCommit -- not a sha, or another prefix -- is this name's own corrupt build and is replaced as before.)
+        # r10 (adversary A1 on 0b1fcfe2): the commit is the one the JUDGED bytes declare, never a second read of the file: Assert-AttrCudaBuildManifest parses
+        # the very bytes it hashed to $stagedSha (one read), and its COMMIT_MISMATCH names that declaration. A second read (r9: hash, read, hash) could parse
+        # bytes swapped in and out between its three opens. A refusal of any other shape names no commit: fail closed, nothing is replaced.
+        # r12 (Grok G15 on #814): that commit is Assert's Exception.Data['declaredCommit'], a value, never a parse of the message text: r10 matched the message
+        # byte for byte against a copy of Assert's wording, so any drift on either side failed every COMMIT_MISMATCH closed and wedged the sha.
+        if ($null -eq $declaredCommit) {
+            Write-Output "STAGE_REFUSED_STAGED_UNREADABLE sha=$($SourceCommit.Substring(0, 12)) incoming=$($ManifestSha256.Substring(0, 8)) the COMMIT_MISMATCH refusal names no commit: $unsound"
+            Complete-Failed 7 'stagedBuildGuard' "the staged build of $SourceCommit (COMMIT_MISMATCH) names no commit, so it is not replaced: $unsound"
+        }
+        $cachedCommit = $declaredCommit
+        # r24 (adversary pass-25 A1 on 63887a9c): ordinal compares, and a declaration that is not plainly ANOTHER prefix is refused, never replaced. -ieq/-ine are culture comparisons
+        # that ignore U+200B, so a declaration that only culture-matched this commit's 12 hex (or was a ZWSP-laden copy of another commit's) was not "40-hex" and fell through to
+        # the replace path below. The declaration's hex digits alone (every other character dropped, so no zero-width, format or separator character can hide a prefix) are read
+        # against this name's 12 hex: a declaration whose digits start with them and that is not this commit is somebody's build under this name, whatever its length or shape.
+        $declaredHexDigits = $cachedCommit -replace '[^0-9a-fA-F]', ''
+        $isThisCommit = ($cachedCommit.Length -eq $SourceCommit.Length -and $cachedCommit.StartsWith($SourceCommit, [StringComparison]::OrdinalIgnoreCase))
+        if ($declaredHexDigits.StartsWith($SourceCommit.Substring(0, 12), [StringComparison]::OrdinalIgnoreCase) -and -not $isThisCommit) {
+            Write-Output "STAGE_REFUSED_STAGED_OTHER_COMMIT sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) stagedCommit=$cachedCommit incoming=$($ManifestSha256.Substring(0, 8))"
+            Complete-Failed 7 'stagedBuildGuard' "the cache name of $SourceCommit holds the build of $cachedCommit (the same 12-hex prefix); another commit's build is never replaced, so nothing is staged"
+        }
+    }
+    if ($unsound) {
+        Say "replacing a staged build that is not sound ($unsound); staged manifest $stagedSha"
+        # r8 (adversary A1 on 0c0eafd7): the unsound manifest leaves the cache name BEFORE any artifact is renamed in. Left standing, a reader that hashed the repaired
+        # artifacts against it found it sound and pinned it, and the publish below then replaced it. Removed by content proof only (the bytes judged unsound);
+        # anything else at the name is left and nothing is staged.
+        if (-not (Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestCachePath -ExpectedSha256 $stagedSha)) {
+            Write-Output "STAGE_REFUSED_STAGED_UNRETIRED sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) incoming=$($ManifestSha256.Substring(0, 8))"
+            Complete-Failed 7 'stagedBuildGuard' "the unsound staged manifest of $SourceCommit could not be removed by content proof before the repair, so nothing is staged"
+        }
+    } else {
+        foreach ($item in $sideFiles) { [void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path ([string]$item.path) -ExpectedSha256 ([string]$item.sha256)) }
+        [void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestSide -ExpectedSha256 $ManifestSha256)
+        if ($stagedSha -ceq $ManifestSha256) {
+            Write-Output "STAGE_REUSED_EXISTING sha=$($SourceCommit.Substring(0, 12)) manifest=$($stagedSha.Substring(0, 8)) manifestSha256=$stagedSha"
+            Write-Output "RESULT=STAGE_OK SOURCE=$SourceCommit FILES=0 CACHE=$Cache REUSED=1"
+            exit 0
+        }
+        Write-Output "STAGE_REFUSED_STAGED_OTHER_MANIFEST sha=$($SourceCommit.Substring(0, 12)) staged=$($stagedSha.Substring(0, 8)) incoming=$($ManifestSha256.Substring(0, 8)) stagedSha256=$stagedSha incomingSha256=$ManifestSha256"
+        Complete-Failed 7 'stagedBuildGuard' "the cache already holds a sound build of $SourceCommit (manifest $stagedSha); a staged build is never replaced, a lease batch may have pinned it. Pin that manifest (Get-VenueStagedBuildManifest) instead of re-staging."
+    }
+}
+$StepLog['stagedBuildGuard'] = 0
 
 # Each container is created explicitly, parent first (never as a side effect of -Force on a deeper
 # path), so every one of them is link-checked. The work and outbox trees are created FRESH and
@@ -367,6 +545,9 @@ try {
     Complete-Failed 20 'publishPartials' $_.Exception.Message
 }
 $StepLog['publishPartials'] = 0
+# Test-only (r3): with -TestHoldAfterPartialsPath the partials are copied and verified and the job waits here (bounded) so a second stager can run
+# meanwhile; production passes none and this returns at once.
+Wait-AttrCudaTestHold -Path $TestHoldAfterPartialsPath
 
 try {
     foreach ($item in $sideFiles) {

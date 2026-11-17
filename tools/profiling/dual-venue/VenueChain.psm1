@@ -597,6 +597,23 @@ function Get-VenueSupplementaryIdle {
     [pscustomobject]@{ idle = (-not $held -and $live.Count -eq 0); claimState = [string]$s.claim.state; liveTickets = $live.Count; holder = $holder }
 }
 
+# r11 (Grok G17 on #814): the predicate's module path, a string only (no I/O at import). The file itself is read by Get-VenueClaimShapeSource on every call.
+$script:VenueClaimShapeModulePath = Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'
+function Get-VenueClaimShapeSource {
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): the verbatim text of Get-AttrCudaBuildManifestClaimSha256, extracted from AttrCudaArtifacts.psm1 by
+    # the same contract Get-AttrCudaEmbeddedFunctionSource embeds it into the leg and stage jobs with ("function <Name> {" ... "}" at column 0). Read as text, never imported:
+    # this module imports nothing from the bachelor tree. A missing function is an error, never a silently different predicate.
+    # r11 (Grok G17 on #814): read on EVERY call, never cached. Get-VenueStagedBuildManifest runs this very function INSIDE its bounded read (its text is embedded in
+    # the worker's script), so the read is always inside -CallCapSec (r10's A1 on a4b659de) and a failed read (a scanner holding the file, a share blip) clears itself on
+    # the next call. r10 read it once at import and kept a failure for the module's life.
+    param([string]$Path = $script:VenueClaimShapeModulePath)
+    # r5 (CI run 43580040634): a module that will not read is a typed refusal naming the file, never a bare ReadAllText exception
+    $src = try { [IO.File]::ReadAllText($Path) } catch { throw "VENUE_CLAIM_PREDICATE_UNREADABLE the claim-shape predicate's module $Path could not be read: $($_.Exception.Message -replace '\s+', ' ')" }
+    $mm = [regex]::Match($src, '(?ms)^function\s+Get-AttrCudaBuildManifestClaimSha256\s*\{.*?^\}')
+    if (-not $mm.Success) { throw 'VENUE_CLAIM_PREDICATE_MISSING AttrCudaArtifacts.psm1 defines no extractable Get-AttrCudaBuildManifestClaimSha256' }
+    $mm.Value
+}
+
 function Get-VenueStagedBuildManifest {
     <#
     .SYNOPSIS
@@ -608,12 +625,66 @@ function Get-VenueStagedBuildManifest {
     .OUTPUTS
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
-    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
-        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1)
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1,
+        # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the default manifest read first blocks its worker this long, as a read stuck on a dead SMB host does
+        # (Thread.Sleep: a stop request cannot interrupt it). test_venue_stage_nightly.py uses it; production passes none.
+        [ValidateRange(0, 600000)][int]$TestReadDelayMs = 0,
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r6 (Grok G6/G7 on #814): the whole call (manifest read plus artifact hash) ends inside -CallCapSec seconds of its start
+        # (0 = no such bound): the manifest read gets min(-TimeoutSec, -CallCapSec) (fix iteration, adversary A2 on 424df284), and the hash gets min(-ArtifactTimeoutSec,
+        # what is left of -CallCapSec), none under -ArtifactMinSec (UNREACHABLE).
+        # The stage nightly passes what is left of its -MaxTotalSec, so a 300 s hash never runs past the call's own cap.
+        [ValidateRange(0.0, 86400.0)][double]$CallCapSec = 0,
+        # Test-only (r6): the default artifact hash first blocks its worker this long, as a slow SMB hash of a large cached package does. Production passes none.
+        [ValidateRange(0, 600000)][int]$TestArtifactDelayMs = 0,
+        # Test-only (r10, adversary A3 on e9e6c210): the call's own thread waits this long before the manifest read, as time spent preparing it does. Production passes none.
+        [ValidateRange(0, 600000)][int]$TestPreReadDelayMs = 0,
+        # Test-only (r11, adversary A1 on 7754d16e): the call's own thread waits this long after the hash's budget is taken and before the hash starts, as a caller
+        # descheduled there is. Production passes none.
+        [ValidateRange(0, 600000)][int]$TestPreHashDelayMs = 0,
+        # r12 (adversary A1 on 7754d16e, sibling Invoke-VenueStageNightly.ps1:287/:300): the caller's own deadline as an instant. -CallCapSec becomes at most what is left
+        # of it when this call's clock starts, so a delay between the caller's sample and this call never moves the call's end later. $null = none.
+        [Nullable[DateTime]]$CallDeadlineUtc = $null,
+        # r22 (sol r21 blocker = adversary pass-23 A1 on a8e76648): a caller whose budget is MONOTONIC (the lease batch's guard budget, a Stopwatch) hands it over as that Stopwatch and its
+        # end on it, never as a UTC instant: turning the remainder into an instant and back with a second UtcNow read let a forward wall-clock step (NTP, a VM resume) between the two
+        # reads read as the budget spent. -CallCapSec becomes at most what is left of (-CallBudgetEndSec - -CallBudgetClock.Elapsed) when this call's clock starts, so a delay
+        # between the caller's sample and this call still never moves the end later, and no wall-clock read sits between the two monotonic clocks. $null / 0 = none.
+        [Diagnostics.Stopwatch]$CallBudgetClock = $null, [double]$CallBudgetEndSec = 0)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
+    # r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03): a -CallBudgetEndSec that is not a finite number (NaN, +Inf, -Inf) is REFUSED, typed,
+    # before the call's clock starts and before any read. NaN passed through [Math]::Max/[Math]::Min and replaced a finite -CallCapSec (or, on a PowerShell that let the
+    # assignment through, erased it: the read ran to -TimeoutSec). A non-finite endpoint never widens, and never silently narrows, the call's bound. -TimeoutSec and
+    # -CallCapSec need no such check: their [ValidateRange] already refuses NaN and +/-Inf at binding.
+    if (-not [double]::IsFinite($CallBudgetEndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -CallBudgetEndSec is $($CallBudgetEndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a bound wider than -CallCapSec or -TimeoutSec" }
     $callClock = [Diagnostics.Stopwatch]::StartNew()
+    if ($script:VenueTestPostClockStartDelayMs -gt 0) { $stallMs = $script:VenueTestPostClockStartDelayMs; $script:VenueTestPostClockStartDelayMs = 0; [Threading.Thread]::Sleep($stallMs) }
+    if ($null -ne $CallBudgetClock -or $null -ne $CallDeadlineUtc) {
+        # r12: the caller's end as what is left of it when this call's clock starts (a deadline or budget already past is a cap of 0.001 s: UNREACHABLE below, never "no cap")
+        # (PowerShell hands a [Nullable[DateTime]] parameter over as the DateTime itself: no .Value)
+        # r22 (sol r21 blocker): -CallBudgetClock/-CallBudgetEndSec is the caller's own monotonic budget (a Stopwatch and its end on it): no wall clock is read for it at all.
+        # r22 fix iteration 1 (adversary pass-24 A1 on e3e61e8e, sibling of r12's own sample): the left-over is taken on the CALLER's clock, so it is a remainder AT THE SAMPLE, and the cap is
+        # held against this call's clock, which has run since its start: the cap is that remainder plus what this clock read at the same instant. The two reads are two instants, so they
+        # are BRACKETED: this clock, the caller's, this clock again. A caller descheduled before the first read is charged once (it is in both); a stall INSIDE the bracket (over
+        # 50 ms between its two reads of this clock) is a sample of no instant, so the bracket is taken again (up to 5 times; the last keeps the first read, which only shortens).
+        $sampleTry = 0
+        do {
+            $sampleTry++
+            $sampleElapsed = $callClock.Elapsed.TotalSeconds
+            if ($script:VenueTestDeadlineSampleDelayMs -gt 0) { $stallMs = $script:VenueTestDeadlineSampleDelayMs; $script:VenueTestDeadlineSampleDelayMs = 0; [Threading.Thread]::Sleep($stallMs) }
+            $bdLeft = $(if ($null -ne $CallBudgetClock) { $CallBudgetEndSec - $CallBudgetClock.Elapsed.TotalSeconds } else { $null })
+            $dlLeft = $(if ($null -ne $CallDeadlineUtc) { (([DateTime]$CallDeadlineUtc).ToUniversalTime() - [DateTime]::UtcNow.AddSeconds($script:VenueTestUtcStepSec)).TotalSeconds } else { $null })
+        } while (($callClock.Elapsed.TotalSeconds - $sampleElapsed) -gt 0.05 -and $sampleTry -lt 5)
+        if ($null -ne $bdLeft) {
+            $bdCap = [Math]::Min(86400.0, [Math]::Max(0.001, $bdLeft + $sampleElapsed))
+            $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $bdCap) } else { $bdCap })
+        }
+        if ($null -ne $dlLeft) {
+            $dlCap = [Math]::Min(86400.0, [Math]::Max(0.001, $dlLeft + $sampleElapsed))
+            $CallCapSec = $(if ($CallCapSec -gt 0) { [Math]::Min($CallCapSec, $dlCap) } else { $dlCap })
+        }
+    }
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
     $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
@@ -635,15 +706,56 @@ function Get-VenueStagedBuildManifest {
                 $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
                 # r13 (adversary r13 A1): and the three artifact digests the job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks): a string of
                 # 64 hex, the only value Get-Sha's digest can ever equal; a blank one makes the job throw, a non-string one throws in ToUpperInvariant.
+                # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): each claim is read by Get-AttrCudaBuildManifestClaimSha256, the ONE claim-shape predicate
+                # (tools/profiling/bachelor/AttrCudaArtifacts.psm1). Its TEXT is defined in this read's runspace below, the same text the leg job, the reference-frame runner and the
+                # stage job's generator, binding and host guard embed, so every one of them accepts exactly the same claims. ('' = not of the accepted shape.)
+                # This read is the ONE share-side soundness predicate: the nightly's reuse decision and the lease batch's plan and post-claim guards all take it.
                 foreach ($k in 'packageZip', 'exe', 'dll') {
-                    $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
-                    'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                    $v = Get-AttrCudaBuildManifestClaimSha256 $m $k
+                    'A:' + $k + '=' + $(if ($v -cmatch '^[0-9a-f]{64}\z') { 'ok' } else { 'bad' })
                     # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the digest itself, for -VerifyArtifacts (the same bytes as the facts above)
-                    if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'H:' + $k + '=' + $v.ToLowerInvariant() }
+                    if ($v -cmatch '^[0-9a-f]{64}\z') { 'H:' + $k + '=' + $v }
                 }
             } })
-    $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
+    # r3: the default read runs with the claim-shape predicate defined (the read's own scriptblock is invoked inside, so it sees the function)
+    # r12 (Grok G17 on #814): the predicate's module is read INSIDE this bounded read, on every call: Get-VenueClaimShapeSource's own text is defined in the worker and
+    # run there, so the cap bounds that read too (r10's A1 on a4b659de) and a failed read (a scanner holding the file) clears on the next call. Its typed refusal comes
+    # back as one VENUE_PREDICATE_REFUSED: line and is rethrown here, as the caller-side read threw it.
+    $predicatePath = [string]$script:VenueClaimShapeModulePath
+    $readText = $(if ($null -eq $ProbeScript) {
+            "param(`$p)`nfunction Get-VenueClaimShapeSource {" + ${function:Get-VenueClaimShapeSource}.ToString() + "}`n" +
+            "try { . ([scriptblock]::Create((Get-VenueClaimShapeSource -Path '" + ($predicatePath -replace "'", "''") + "'))) } catch { 'VENUE_PREDICATE_REFUSED:' + `$_.Exception.Message; return }`n" +
+            $(if ($TestReadDelayMs -gt 0) { "[Threading.Thread]::Sleep($TestReadDelayMs)`n" } else { '' }) + "& {" + $read.ToString() + "`n} `$p"
+        } else { $read.ToString() })
+    # r6 fix iteration (adversary A2 on 424df284): -CallCapSec bounds the WHOLE call, the manifest read too (it bounded only the hash, so a read stuck past the cap
+    # answered NOT_STAGED after it). Under 1 s of it (the least a read can be given) there is no read: UNREACHABLE.
+    if ($TestPreReadDelayMs -gt 0) { [Threading.Thread]::Sleep($TestPreReadDelayMs) }
+    # r12 (adversary A1 on 7754d16e, sibling :695): the read's end is fixed ONCE on the call clock, when its budget is taken, and the bounded wait ends at it (-Clock/-EndSec):
+    # a remainder handed over as a number was counted again from the wait's own later start
+    $readStartSec = $callClock.Elapsed.TotalSeconds
+    # r10 (adversary A3 on e9e6c210): the end of the call's bound on its own clock (-TimeoutSec, or -CallCapSec when sooner), what an unbounded hash is given what is left of.
+    # $readSec is a remainder already (the cap less the time before the read), so the hash's remainder taken from it counted that time twice.
+    $boundEndSec = $(if ($CallCapSec -gt 0) { [Math]::Min($TimeoutSec, $CallCapSec) } else { $TimeoutSec })
+    if ($CallCapSec -gt 0) {
+        $capLeft = $CallCapSec - $readStartSec
+        # r14 fix iteration 1 (adversary A1 on f7408e9f, sibling :723): the floor is $script:VenueMinReadSec (0.5 s), never 1: -TimeoutSec / -CallCapSec 1 (the least
+        # they accept) less ANY preparation time was under 1 s, so the minimum bound could never read at all
+        if ($capLeft -lt $script:VenueMinReadSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2))$(if ($null -ne $CallDeadlineUtc) { ' (-CallDeadlineUtc ' + ([DateTime]$CallDeadlineUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture) + ')' })$(if ($null -ne $CallBudgetClock) { ' (-CallBudgetEndSec ' + [Math]::Round($CallBudgetEndSec, 2).ToString([Globalization.CultureInfo]::InvariantCulture) + ' on the caller''s clock)' }) ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $script:VenueMinReadSec)"; contentProblem = $null } }
+    }
+    # r13 (adversary A1 on 5fe750fa, siblings Invoke-VenueChain.ps1:354 / Invoke-VenueLeaseBatch.ps1:1250): the read ends at the BOUND's end on the call clock
+    # ($boundEndSec: -TimeoutSec, or -CallCapSec when sooner), the end the hash below is measured against. r12 ended it at $readStartSec + -TimeoutSec, so time
+    # spent before the read (preparing it, a descheduled caller) ran the call past -TimeoutSec: -TimeoutSec 1 after 1.5 s answered NOT_STAGED at ~2.2 s.
+    # Under 1 s of it left (the least a read can be given) there is no read: UNREACHABLE.
+    $readSec = $boundEndSec - $readStartSec
+    if ($readSec -lt $script:VenueMinReadSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the staged manifest could not be read: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) ($([Math]::Floor([Math]::Max(0.0, $readSec) * 100.0) / 100.0) s left, under $script:VenueMinReadSec)"; contentProblem = $null } }
+    # r14 (Grok G21 on #814): the read is handed the caller's REAL bound (-TimeoutSec) and -EndSec does the clamping, so a cut-short wait names the bound the
+    # operator set ("cut the 2 s bound short"), never the remainder $readSec, which the wait's own later sample is always a little under (the clause fired on every timeout)
+    # r16 (Grok G22 on #814): the read's end is the bound's OWN end unless -CallCapSec lowered it under -TimeoutSec; only then did something cut the bound short
+    # (-EndIsBoundEnd off), so a plain timeout carries no clause
+    $readCapped = ($CallCapSec -gt 0 -and $CallCapSec -lt $TimeoutSec)
+    $r = Invoke-VenueBoundedRead -ScriptText $readText -Argument $path -TimeoutSec $TimeoutSec -Clock $callClock -EndSec $boundEndSec -EndIsBoundEnd:(-not $readCapped)
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
+    if ($null -eq $ProbeScript -and $r.value.Count -gt 0 -and ([string]$r.value[0]).StartsWith('VENUE_PREDICATE_REFUSED:', [StringComparison]::Ordinal)) { throw ([string]$r.value[0]).Substring('VENUE_PREDICATE_REFUSED:'.Length) }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
     if ($sha -cmatch '^[0-9a-f]{64}$') {
         $problem = $null
@@ -653,7 +765,7 @@ function Get-VenueStagedBuildManifest {
             $dll = @($facts | Where-Object { $_.StartsWith('D:') }) | Select-Object -First 1
             $sym = @($facts | Where-Object { $_.StartsWith('S:') }) | Select-Object -First 1
             $problem = $(if ($facts -contains 'UNPARSEABLE') { 'ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE the staged manifest is not JSON' }
-                elseif ($commit.Substring(2) -ne $SourceCommit) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
+                elseif (-not [string]::Equals($commit.Substring(2), $SourceCommit, [StringComparison]::OrdinalIgnoreCase)) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
                 elseif ($dll.Substring(2) -notmatch '^[0-9a-f]{64}$') { "ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND the staged manifest carries no well-formed dllPairManifestSha256 (got '$($dll.Substring(2))')" }
                 elseif ($sym -ne 'S:bool') { 'ATTRCUDA_BUILD_MANIFEST_SYMBOL_PRESENCE_INVALID the staged manifest pendingSymbolPresence is not a boolean' }
                 elseif ($badArt = @('packageZip', 'exe', 'dll' | Where-Object { $facts -cnotcontains "A:$_=ok" })) { "ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING the staged manifest carries no 64-hex sha256 for $($badArt -join ', ') (the leg job hashes the cached artifact against it)" }
@@ -694,19 +806,46 @@ function Get-VenueStagedBuildManifest {
                         }
                     } })
             # adversary r2 A2: with no explicit bound the hash gets what is LEFT of -TimeoutSec, and none when less than -ArtifactMinSec is left (a 1 s floor would run the call past its own bound)
+            # r12 (adversary A1 on 7754d16e, siblings :754/:762/:769/:776): the hash's END is fixed once, here, on the call clock -- explicit: min(now + -ArtifactTimeoutSec,
+            # -CallCapSec); implicit: the bound's end -- and everything after is measured against it. r6-r11 took a remainder here and re-anchored it at the hash start
+            # (hashEnd = elapsed + remainder), so a caller descheduled in between moved the end past the cap.
+            $hashStartSec = $callClock.Elapsed.TotalSeconds
+            $hashEndSec = $boundEndSec
+            # r16 (Grok G22 on #814): did -CallCapSec lower the hash's end? Implicit budget: exactly when it lowered the bound's end; explicit: set below
+            $hashCapped = $readCapped
             $artSec = $ArtifactTimeoutSec
+            if ($artSec -gt 0) { $hashEndSec = $hashStartSec + $artSec; $hashCapped = $false }
+            if ($artSec -gt 0 -and $CallCapSec -gt 0) {
+                # r6 (Grok G6/G7 on #814): an explicit hash budget never runs the call past -CallCapSec; under -ArtifactMinSec left of it, no hash (UNREACHABLE)
+                $capLeft = $CallCapSec - $hashStartSec
+                if ($capLeft -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -CallCapSec $([Math]::Round($CallCapSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $capLeft) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
+                if ($CallCapSec -lt $hashEndSec) { $hashEndSec = $CallCapSec; $hashCapped = $true }
+            }
             if ($artSec -le 0) {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
-                $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
+                # r6 fix iteration (A2): what is left of the manifest read's own bound, which -CallCapSec already shortened
+                # r10 (adversary A3 on e9e6c210): from the bound's end on the call clock, never from $readSec (the time before the read was subtracted twice)
+                $left = $boundEndSec - $hashStartSec
                 # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
                 if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
-                $artSec = $left
             }
-            # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
-            $hashEnd = $callClock.Elapsed.TotalSeconds + $artSec
+            if ($TestPreHashDelayMs -gt 0) { [Threading.Thread]::Sleep($TestPreHashDelayMs) }
+            # r12 (A1 on 7754d16e): what is left of that fixed end is taken again right before the launch; under -ArtifactMinSec of it, no hash (UNREACHABLE)
+            $left = $hashEndSec - $callClock.Elapsed.TotalSeconds
+            if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left before the hash's end ($([Math]::Round($hashEndSec, 2)) s into the call) to start it ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
+            # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file (r12: the fixed end, never re-anchored)
+            $hashEnd = $hashEndSec
             foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
-            $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
+            # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r8 (adversary A1 on 0c0eafd7): the default hash reads the manifest itself again LAST, in the same bounded read, against the
+            # digest read above: a manifest a stager retired or replaced while its artifacts were hashed is BUILD_ARTIFACT_MISSING / _MISMATCH, never sound on its successor's
+            # artifacts. No clock: a few-byte read is never NOTIME. An offline -ArtifactProbeScript still sees the three artifacts only.
+            if ($null -eq $ArtifactProbeScript) { $items += @{ label = 'manifest'; name = [IO.Path]::GetFileName($path); path = $path; sha = $sha } }
+            $probeText = $(if ($TestArtifactDelayMs -gt 0 -and $null -eq $ArtifactProbeScript) { "param(`$items)`n[Threading.Thread]::Sleep($TestArtifactDelayMs)`n& {" + $probe.ToString() + "`n} `$items" } else { $probe.ToString() })
+            # r14 (Grok G21 on #814): the hash is handed its configured budget (-ArtifactTimeoutSec, or -TimeoutSec when it has none) and -EndSec ($hashEnd) clamps it,
+            # as the manifest read above: the clause names the budget the operator set, never a remainder of it (the remainder stores into $artSec went with it; the
+            # fixed end $hashEndSec, clamped to -CallCapSec above, is the only bound the wait takes)
+            $ar = Invoke-VenueBoundedRead -ScriptText $probeText -Argument $items -TimeoutSec $(if ($ArtifactTimeoutSec -gt 0) { [double]$ArtifactTimeoutSec } else { $TimeoutSec }) -Clock $callClock -EndSec $hashEnd -EndIsBoundEnd:(-not $hashCapped)
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
@@ -714,7 +853,10 @@ function Get-VenueStagedBuildManifest {
             $notime = @($lines | Where-Object { $_.StartsWith('NOTIME:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
             # a file found absent or different before the time ran out is still that typed problem; with none, a file never started is a hash that did not finish (UNREACHABLE)
             if (-not $missing.Count -and -not $differs.Count -and $notime.Count) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) to start hashing $($notime[0]) (under $ArtifactMinSec s left)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
-            $artifactProblem = $(if ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
+            # r9 (Grok G11 on #814): the manifest item gone or changed keeps its typed code, but its cause is the manifest, never a missing exe
+            $manifestGone = @(@($missing) + @($differs) | Where-Object { $_.StartsWith('manifest ') })
+            $artifactProblem = $(if ($manifestGone.Count) { "$(if (@($missing | Where-Object { $_.StartsWith('manifest ') }).Count) { 'BUILD_ARTIFACT_MISSING' } else { 'BUILD_ARTIFACT_MISMATCH' }) the build manifest was retired or replaced while its artifacts were hashed: $($manifestGone -join '; ') in $cacheDir" }
+                elseif ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
                 elseif ($differs.Count) { "BUILD_ARTIFACT_MISMATCH the cached artifact does not hash to the build manifest's digest in ${cacheDir}: $($differs -join '; ') (the leg job throws after the lease opened)" }
                 else { '' })
         }
@@ -729,12 +871,26 @@ function Get-VenueStagedArtifactNames {
     The cached artifact file names for a build, by the formulas Get-AttrCudaArtifactNames (tools/profiling/bachelor/AttrCudaArtifacts.psm1) derives and the leg job reads from the
     agent cache. Kept here as a copy because this module imports nothing from the bachelor tree; test_venue_lease_batch.py pins the two together.
     #>
-    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit)
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit)
     $s = $SourceCommit.Substring(0, 12)
     @{ exe = "MLVApp-playback-attr-3-cuda-$s.exe"; dll = "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"; packageZip = "MLVApp-playback-attr-3-cuda-$s-pkg.zip" }
 }
 
 $script:VenueAbandonedReads = 0
+# r14 fix iteration 1 (adversary A1 on f7408e9f): the least time a staged-manifest read may START with. Under 1, so the least bound the call accepts
+# (-TimeoutSec 1, -CallCapSec 1) still reads once its preparation took a few ms; the read itself is handed the caller's bound and ends at -EndSec.
+$script:VenueMinReadSec = 0.5
+# Test-only seams (r12 fix iteration, adversary A1/A2 on 09421b77), set from a test through the module scope; production leaves both 0. The first stalls the
+# caller between the two clock samples -CallDeadlineUtc is taken from, the second between a bounded read's launch and its wait (a descheduled caller).
+$script:VenueTestDeadlineSampleDelayMs = 0
+$script:VenueTestPreWaitDelayMs = 0
+# Test-only (r22 fix iteration 1, adversary pass-24 A1 on e3e61e8e): ONE stall right after the call's own clock starts and before the caller's budget or deadline is sampled, as a callee
+# descheduled there is. It clears itself once used, and so does -VenueTestDeadlineSampleDelayMs (a deschedule happens once, and the sample is then taken again). Production leaves both 0.
+$script:VenueTestPostClockStartDelayMs = 0
+# Test-only (r22, sol r21 blocker / adversary pass-23 A1): the wall clock Get-VenueStagedBuildManifest's -CallDeadlineUtc is read against is stepped forward this many seconds, as an
+# NTP/VM-resume step between a caller's own wall-clock sample and this call's is. Production leaves it 0. The lease batch no longer hands a monotonic budget over as an instant at
+# all (-CallBudgetClock/-CallBudgetEndSec), so a step cannot reach its call; -CallDeadlineUtc stays for the nightly, whose own cap is a UTC deadline end to end.
+$script:VenueTestUtcStepSec = 0
 
 function Complete-VenueProcess {
     <#
@@ -756,18 +912,37 @@ function Invoke-VenueBoundedRead {
     [pscustomobject]@{ answered; value (the script's output as an array); error }
     #>
     # r7 (sol r6 B1): -TimeoutSec keeps its fraction (a caller's exact remainder), so no bound is rounded up past the caller's deadline or down under its minimum
-    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec)
+    # r12 (adversary A1 on 7754d16e, sibling :836): -Clock/-EndSec, the caller's fixed end on its own clock. The wait is min(-TimeoutSec, EndSec - Clock), sampled right
+    # before it (after the worker started), so time spent creating the worker is never added past the caller's end. No -Clock: -TimeoutSec from the wait, as before.
+    # r16 (Grok G22 on #814): -EndIsBoundEnd says -EndSec is the end of -TimeoutSec ITSELF (measured from an earlier start on the caller's clock), not a cap the
+    # caller set under it; a wait it shortens is then a plain timeout and the "cut ... short" clause is not printed. Absent: any shortening by -EndSec is named.
+    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec,
+        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd)
+    # r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03, sibling of Get-VenueStagedBuildManifest -CallBudgetEndSec): an -EndSec that is not a
+    # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
+    # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
+    if (-not [double]::IsFinite($EndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -EndSec is $($EndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a wait wider than the caller's end" }
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
         [void]$ps.AddScript($ScriptText)
         [void]$ps.AddArgument($Argument)
         $async = $ps.BeginInvoke()
-        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))) {
+        if ($script:VenueTestPreWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreWaitDelayMs) }
+        # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
+        $waitSec = $TimeoutSec; $endCut = $false
+        if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
-            return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $([Math]::Round($TimeoutSec, 2)) s" }
+            return [pscustomobject]@{ answered = $false; value = @()
+                error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut -and -not $EndIsBoundEnd) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
+        }
+        # r12 fix iteration (adversary A2 on 09421b77): a caller descheduled past its fixed end finds the worker done and WaitOne(0) true; an answer the caller
+        # sees only after -EndSec is never acted on (the worker finished, so it is disposed as usual)
+        if ($null -ne $Clock -and ($late = $Clock.Elapsed.TotalSeconds - $EndSec) -gt 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($late, 2)) s after the call's end is never acted on" }
         }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
     } catch {

@@ -30,7 +30,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, sibling_modules
+from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, cross_tree_modules, sibling_modules
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -215,11 +215,46 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
 
     def test_ci_b1_a_scratch_copy_with_its_siblings_imports_and_resolves_them_from_the_scratch_dir(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ci-b1-") as tmp:
-            folder = Path(os.path.realpath(tmp))
+            # a dir of its own: copy_with_siblings also writes the neighbouring-folder modules beside it (..\bachelor)
+            folder = Path(os.path.realpath(tmp)) / "dual-venue"
             copy_with_siblings(MODULE, folder)
             r = self.import_copy(folder)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertEqual(Path(r.stdout.strip()), folder / "VenueRawJson.psm1")
+
+    def test_r5_ci_the_derived_cross_tree_set_names_the_claim_shape_predicates_module(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (hosted Tests run 43580040634): VenueChain.psm1 reads ..\bachelor\AttrCudaArtifacts.psm1 as text (Get-VenueClaimShapeSource)
+        self.assertIn("..\\bachelor\\AttrCudaArtifacts.psm1", cross_tree_modules(MODULE))
+
+    def test_r5_ci_a_scratch_copy_reads_the_claim_shape_predicate_from_its_own_scratch_tree(self) -> None:
+        # the staged-manifest read takes the predicate's text from <module dir>\..\bachelor; a scratch copy must find the scratch tree's copy, never the repo's
+        with tempfile.TemporaryDirectory(prefix="ci-r5-") as tmp:
+            folder = Path(os.path.realpath(tmp)) / "dual-venue"
+            copy_with_siblings(MODULE, folder)
+            scratch = folder.parent / "bachelor" / "AttrCudaArtifacts.psm1"
+            self.assertTrue(scratch.is_file(), "the neighbouring-folder module was not copied beside the scratch dir")
+            marker = "# r5-ci scratch marker"
+            scratch.write_text(scratch.read_text(encoding="utf-8").replace("function Get-AttrCudaBuildManifestClaimSha256 {", "function Get-AttrCudaBuildManifestClaimSha256 {\n" + marker, 1), encoding="utf-8")
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
+                      "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn(marker, r.stdout, "the scratch module read the predicate from somewhere other than its own scratch tree")
+
+    def test_r5_ci_control_a_scratch_copy_without_the_neighbouring_module_is_a_typed_refusal(self) -> None:
+        # the failure the hosted run hit, now typed: with no ..\bachelor beside the copy, the predicate read says which file it could not read
+        with tempfile.TemporaryDirectory(prefix="ci-r5-") as tmp:
+            folder = Path(os.path.realpath(tmp)) / "dual-venue"
+            folder.mkdir()
+            for sibling in sibling_modules(MODULE):
+                shutil.copy2(sibling, folder / sibling.name)
+            shutil.copy2(MODULE, folder / MODULE.name)
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
+                      "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("VENUE_CLAIM_PREDICATE_UNREADABLE", r.stdout + r.stderr)
+            self.assertIn("AttrCudaArtifacts.psm1", r.stdout + r.stderr)
 
     def test_ci_b1_control_a_scratch_copy_without_its_siblings_stops_on_the_import(self) -> None:
         # the failure the hosted run hit: with only the module copied, the import stops before any mutation under test
@@ -1615,17 +1650,33 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-1.result.json' -Value '{{}}'; st @('dve-1'); st @('dve-1', 'dve-2')\n"
             f"Set-Content -LiteralPath '{share}\\outbox\\dve-2.result.json' -Value '{{}}'; st @('dve-1', 'dve-2')\n"
             "$t0 = [DateTime]::UtcNow\n"
+            f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 5 -CallCapSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
+            "$capped = \"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
+            "$t0 = [DateTime]::UtcNow\n"
             f"$r = Get-VenueStagedBuildManifest -AgentShare '{share}' -SourceCommit '{SHA}' -TimeoutSec 2 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(20000); 'late' }}\n"
+            "$capped\n"
             "\"$($r.state) [$($r.sha256)] $($r.error) inside=$([int][Math]::Floor(([DateTime]::UtcNow - $t0).TotalSeconds))\"\n"
             "Complete-VenueProcess -ExitCode 7\nexit 7\n", encoding="utf-8")
         t0 = time.time()
         r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
         elapsed = time.time() - t0
         lines = r.stdout.splitlines()
-        self.assertRegex(lines[-1], r"^UNREACHABLE \[\] no answer in 2 s inside=[23]$", r.stdout + r.stderr)
-        self.assertLess(elapsed, 14, f"the stalled read broke the bound: the whole process took {elapsed:.1f}s with a 20 s stuck read and -TimeoutSec 2")
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (adversary A1 on 5fe750fa, Grok G20): the read is given what is left of the 2 s bound on the call's clock, and
+        # the message reports that wait (and, when the call's end visibly cut it, says so)
+        # r14 (Grok G21 on #814): EXACT form, the clause required. The read is handed the caller's real bound (-TimeoutSec 2) and -EndSec clamps it, so the clause
+        # names the 2 s the caller set, never a remainder ("cut the 1.98 s bound short"); the wait itself is what was left of it on the call clock, under 2.
+        # r16 (Grok G22 on #814): the clause means "a cap cut the bound short", so it is printed only when the clamp came from something other than the bound itself.
+        # -TimeoutSec 5 -CallCapSec 2: the cap set the read's end, so the clause names the 5 s bound it cut (EXACT form). Plain -TimeoutSec 2: the end is the bound's
+        # own end, so a timeout is a plain timeout and carries NO clause (r14's pin required the clause here, on every timeout).
+        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s \(the call's end cut the 5 s bound short\) inside=[23]", lines[-2] if len(lines) > 1 else "")
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self.assertTrue(1.0 <= float(m.group(1)) < 2.0, r.stdout + r.stderr)
+        m = re.fullmatch(r"UNREACHABLE \[\] no answer in ([0-9]+(?:\.[0-9]{1,2})?) s inside=[23]", lines[-1] if lines else "")
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self.assertTrue(1.0 <= float(m.group(1)) <= 2.0, r.stdout + r.stderr)
+        self.assertLess(elapsed, 16, f"a stalled read broke its bound: the whole process took {elapsed:.1f}s with two 20 s stuck reads, each bounded at 2 s")
         self.assertEqual(r.returncode, 7)
-        self.assertEqual(lines[:-1], [
+        self.assertEqual(lines[:-2], [
             "n=2[dve-1|dve-2]",  # every printed id, in order, distinct (the client may have submitted a health probe job before the leg job)
             "n=0[]", "n=0[]",    # nothing printed = no id
             "n=1[]", "n=1[]", "n=1[]", "n=1[]",   # an id that is not a plain file name (it becomes a file name on the venue share) stays as ONE empty entry: named, never looked up

@@ -585,6 +585,50 @@ class VenueBaselineTests(unittest.TestCase):
         self.assertEqual(p2.returncode, 0, p2.stdout + p2.stderr)
         self.assertTrue(all(f"manifest={given}" in c for c in self.chain_calls()))
 
+    def test_r12_a_build_of_another_commit_at_the_12_hex_name_is_never_pinned(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (r10's OPEN, Invoke-VenueBaseline.ps1:292-296): the cache name carries only the sha's first 12 hex, and the
+        # lookup pinned whatever manifest stood there by its hash without reading its sourceCommit, so another commit's build (same 12 hex) was handed to both
+        # chains as this commit's. It is BUILD_NOT_STAGED (exit 22), no chain is called; the commit is read from the same bytes that are hashed.
+        bj = self.share / "cache" / f"playback-attr-3-cuda-{SHORT}-build.json"
+        for label, payload in (("another commit, same 12 hex", b'{"sourceCommit": "' + (SHA[:12] + "1" * 28).encode() + b'"}\n'),
+                               ("no sourceCommit", b'{"x": 1}\n'), ("not JSON", b"{ not json")):
+            with self.subTest(case=label):
+                bj.write_bytes(payload)
+                before = len(self.chain_calls())
+                p = self.run_baseline()
+                self.assertEqual(p.returncode, EXIT["BUILD_NOT_STAGED"], p.stdout + p.stderr)
+                self.assertIn("reason=BUILD_NOT_STAGED", p.stdout)
+                self.assertEqual(len(self.chain_calls()), before, "a chain ran on another commit's build")
+        # the case of the declared commit is the leg job's own (Assert-AttrCudaBuildManifest compares with -ne): an upper-case declaration is this commit
+        bj.write_bytes(b'{"sourceCommit": "' + SHA.upper().encode() + b'"}\n')
+        p = self.run_baseline()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_r13_g19_a_manifest_that_exists_but_cannot_be_read_is_share_unreachable(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (Grok G19 on #814): the r12 read worker ran under the runspace's default Continue, so a manifest a writer held
+        # open (FileShare.None) failed its byte read silently, the worker returned nothing, and the baseline reported BUILD_NOT_STAGED (22): a staged build it never
+        # looked at. A read that fails is SHARE_UNREACHABLE (21) with the read's own error, as VenueChain.psm1's canonical read (EAP Stop) reports it; no chain runs.
+        import ctypes
+        from ctypes import wintypes
+        bj = self.share / "cache" / f"playback-attr-3-cuda-{SHORT}-build.json"
+        self.assertTrue(bj.is_file())
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.CreateFileW(str(bj), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value, f"CreateFileW failed: {ctypes.get_last_error()}")
+        try:
+            p = self.run_baseline()
+        finally:
+            k32.CloseHandle(h)
+        self.assertEqual(p.returncode, EXIT["SHARE_UNREACHABLE"], p.stdout + p.stderr)
+        self.assertIn("reason=SHARE_UNREACHABLE", p.stdout)
+        self.assertNotIn("reason=BUILD_NOT_STAGED", p.stdout)
+        # the read's own error is in the message (the .NET sharing-violation text names the file is used by another process)
+        self.assertRegex(p.stdout, r"reading '[^']*-build\.json' failed: .*(being used by another process|another process)", p.stdout)
+        self.assertEqual(self.chain_calls(), [])
+
     def test_gate_refusal_exits_typed_and_stops_before_the_second_backend(self) -> None:
         p = self.run_baseline(mode="gate")
         self.assertEqual(p.returncode, EXIT["GATE_REFUSED"], p.stdout + p.stderr)

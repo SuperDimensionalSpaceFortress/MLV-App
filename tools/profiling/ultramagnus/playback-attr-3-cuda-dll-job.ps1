@@ -58,7 +58,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     [Parameter(Mandatory = $true)]
@@ -226,7 +226,7 @@ $PubReady = $false
 function Assert-UnderAgentRoot([string]$Path, [string]$Label) {
     $full = [IO.Path]::GetFullPath($Path)
     $root = [IO.Path]::GetFullPath($AgentRoot)
-    if ($full -ne $root -and -not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    if ($full -ne $root -and -not $full.StartsWith($(if ($root.Substring($root.Length - 1) -eq '\') { $root } else { $root + '\' }), [StringComparison]::OrdinalIgnoreCase)) {
         throw "job-owned path '$Label' resolves outside the agent root: $full"
     }
 }

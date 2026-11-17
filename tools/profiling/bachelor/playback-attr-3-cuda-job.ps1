@@ -117,7 +117,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-f]{40}$')]
+    [ValidatePattern('^[0-9a-f]{40}\z')]
     [string]$SourceCommit,
 
     # Either the owner-clip id pattern (resolved via tools/gates/resolve_consented_clip.py,
@@ -470,6 +470,11 @@ param(
     # GUI thread's slot release waits for the recon backend mutex, as before r7), the isolation arm of a same-binary A/B. Absent: nothing is set and the
     # emitted job is the text it was before this parameter.
     [switch]$DisableReconReleaseDeferred,
+    # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the asymmetric playback OpenMP team partition (MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and
+    # MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> in the app's env list). Both or neither; 0 (the default) passes nothing and the emitted job is the text it was
+    # before these parameters.
+    [ValidateRange(0, 16)][int]$ReconOmpThreads = 0,
+    [ValidateRange(0, 16)][int]$PrepOmpThreads = 0,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -1031,6 +1036,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# PRESENTMON-BACHELOR-CUDA-INTERN
     'Get-AttrCudaSwapWindowRecord',
     'Get-AttrCudaPlaybackTemporalCoverage'
 )) +"`r`n# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3: the ONE claim-shape predicate every reader of a cached build's artifact claim calls ($manifestChecks below),
+# spliced inside its own sentinel brackets for the same byte-identity reason as the splices above (r5: CI run 43580040634).
+$embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-STAGE-CLAIM-SHAPE-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaBuildManifestClaimSha256'
+)) +"`r`n# VENUE-STAGE-CLAIM-SHAPE-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -2577,11 +2587,16 @@ $buildManifest = Assert-AttrCudaBuildManifest -Path $buildManifestPath -Expected
 # manifest, whose bytes are now authenticated above.
 $pendingSymbolPresence = [bool]$buildManifest.pendingSymbolPresence
 $dllPairManifestSha256 = ([string]$buildManifest.dllPairManifestSha256).ToLowerInvariant()
+# VENUE-STAGE-CLAIM-SHAPE-1 >>>
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A1 on ce5a0380): each digest is read through the ONE claim-shape predicate (embedded
+# above), never by member access: member enumeration turned a nested [["<hex>"]] into a digest here while the stage job's guard refused it.
+# A claim of any other shape is '' and refused below as a missing sha256.
 $manifestChecks = @(
-    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = $buildManifest.packageZip.sha256 },
-    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },
-    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }
+    @{ label = 'packageZip'; path = (Join-Path $Cache $BasePackageZip); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'packageZip') },
+    @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'exe') },
+    @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = (Get-AttrCudaBuildManifestClaimSha256 $buildManifest 'dll') }
 )
+# VENUE-STAGE-CLAIM-SHAPE-1 <<<
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1: each cached artifact is hashed ONCE per job. The digest that
 # just matched the authenticated manifest is kept and reused below as the expected value for the
 # deployed copies -- the deployed-copy comparison further down still catches any change since.
@@ -2592,6 +2607,12 @@ foreach ($check in $manifestChecks) {
     $manifestHashes[$check.label] = Get-Sha $check.path "manifest-$($check.label)-hash"
     if ($manifestHashes[$check.label] -ne $check.expectedSha.ToUpperInvariant()) { throw "hash mismatch (vs build manifest $buildManifestName) for $($check.path)" }
 }
+# VENUE-STAGE-CLAIM-SHAPE-1 >>>
+# VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r27 (adversary pass-29 A1 on 7f1886f1): the manifest is re-authenticated LAST, after every artifact hash. A stager
+# repairing this sha retires build.json first, renames the repaired artifacts in, and publishes the new manifest last, so a read that authenticated M0 and then
+# hashed artifacts mid-repair finds no build.json (or other bytes) here and is refused, never recorded as verified (VenueChain's reader already checks last).
+[void](Assert-AttrCudaBuildManifest -Path $buildManifestPath -ExpectedSha256 $BuildManifestSha256 -ExpectedSourceCommit $SourceCommit)
+# VENUE-STAGE-CLAIM-SHAPE-1 <<<
 Write-JobTrace 'step build-manifest-artifacts-verified'
 if (-not (Test-Path -LiteralPath (Join-Path $Cache $PresentMonName))) { throw "cache missing $PresentMonName" }
 # ATTR3-SMOKE-RUNNER-DEPS-1 round 3 (NARROW BY REDESIGN): the runner alone is not launchable --
@@ -6460,6 +6481,20 @@ if ($DisableReconReleaseDeferred) {
     })
 }
 
+# CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the team-partition arm adds MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> at the same
+# env-list site, only when asked, both or neither. The anchor must match exactly once, or the generator throws (the runner also requires the app's own
+# playback_smoke.omp_teams record to report recon_omp=<r> prep_omp=<p> before the leg counts).
+if (($ReconOmpThreads -gt 0) -ne ($PrepOmpThreads -gt 0)) { throw "DUAL_VENUE_TEAM_PARTITION_HALF -ReconOmpThreads ($ReconOmpThreads) and -PrepOmpThreads ($PrepOmpThreads) are both set or neither" }
+if ($ReconOmpThreads -gt 0) {
+    $teamPartitionEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($teamPartitionEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_TEAM_PARTITION_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_RECON_OMP_THREADS / MLVAPP_PLAYBACK_PREP_OMP_THREADS to' }
+    $text = $teamPartitionEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_RECON_OMP_THREADS=$ReconOmpThreads'," + $m.Groups['nl'].Value +
+            $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_PREP_OMP_THREADS=$PrepOmpThreads'," + $m.Groups['nl'].Value
+    })
+}
+
 # PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
 # above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
 #   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
@@ -7905,6 +7940,8 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
     prepConflatedMove = [bool]$PrepConflatedMove
     disableReconReleaseDeferred = [bool]$DisableReconReleaseDeferred
+    reconOmpThreads = $(if ($ReconOmpThreads -gt 0) { $ReconOmpThreads } else { $null })
+    prepOmpThreads = $(if ($PrepOmpThreads -gt 0) { $PrepOmpThreads } else { $null })
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })

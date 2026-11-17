@@ -92,6 +92,43 @@ TEST(LogLineField, TheRecordFoldKeepsOneLine)
     ASSERT_TRUE(log_line_field::prepRouteLine(7, true) == QStringLiteral("playback_smoke.prep_route session=7 prep_conflated_move_active=1"));
 }
 
+// CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the play-start OpenMP team record (integers only).
+TEST(LogLineField, TheOmpTeamsRecordNamesEachTeam)
+{
+    ASSERT_TRUE(log_line_field::ompTeamsLine(4, 0, 16, 0, 16, 2, 20, 20, 2147483647, 2147483647, false, false)
+                == QStringLiteral("playback_smoke.omp_teams session=4 partition=off recon_omp=0 recon_cpu_cores=16 prep_omp=0 "
+                                  "prep_pointwise=16 prefetch_decoders=2 logical_cpus=20 thread_limit=2147483647 max_active_levels=2147483647 "
+                                  "dynamic=0 override=0"));
+    ASSERT_TRUE(log_line_field::ompTeamsLine(9, 12, 12, 6, 6, 2, 20, 20, 2147483647, 1, false, false)
+                == QStringLiteral("playback_smoke.omp_teams session=9 partition=12+6 recon_omp=12 recon_cpu_cores=12 prep_omp=6 "
+                                  "prep_pointwise=6 prefetch_decoders=2 logical_cpus=20 thread_limit=2147483647 max_active_levels=1 dynamic=0 override=0"));
+    ASSERT_TRUE(log_line_field::ompTeamsLine(1, 12, 12, 0, 16, 0, 20, 20, 64, 4, true, true)
+                == QStringLiteral("playback_smoke.omp_teams session=1 partition=12+0 recon_omp=12 recon_cpu_cores=12 prep_omp=0 "
+                                  "prep_pointwise=16 prefetch_decoders=0 logical_cpus=20 thread_limit=64 max_active_levels=4 dynamic=1 override=1"));
+}
+
+// Adversary A1 on 84d66a4b: recon_omp / prep_omp are the EFFECTIVE teams. An inherited OMP_THREAD_LIMIT=1 (or a smaller initial team)
+// shrinks them below the request, and the record says so instead of repeating 12+6.
+TEST(LogLineField, TheOmpTeamsRecordReportsTheEffectiveTeams)
+{
+    ASSERT_TRUE(log_line_field::ompTeamsLine(3, 12, 12, 6, 6, 2, 20, 20, 1, 1, false, false)
+                == QStringLiteral("playback_smoke.omp_teams session=3 partition=12+6 recon_omp=1 recon_cpu_cores=12 prep_omp=1 "
+                                  "prep_pointwise=6 prefetch_decoders=2 logical_cpus=20 thread_limit=1 max_active_levels=1 dynamic=0 override=0"));
+    ASSERT_TRUE(log_line_field::ompTeamsLine(3, 12, 12, 6, 6, 2, 20, 8, 2147483647, 1, false, false)
+                == QStringLiteral("playback_smoke.omp_teams session=3 partition=12+6 recon_omp=8 recon_cpu_cores=12 prep_omp=6 "
+                                  "prep_pointwise=6 prefetch_decoders=2 logical_cpus=20 thread_limit=2147483647 max_active_levels=1 dynamic=0 override=0"));
+    // Adversary pass 2 A1 on 95d5498e: OMP_MAX_ACTIVE_LEVELS=0 serializes every team to one thread.
+    ASSERT_TRUE(log_line_field::ompTeamsLine(3, 12, 12, 6, 6, 2, 20, 20, 2147483647, 0, false, false)
+                == QStringLiteral("playback_smoke.omp_teams session=3 partition=12+6 recon_omp=1 recon_cpu_cores=12 prep_omp=1 "
+                                  "prep_pointwise=6 prefetch_decoders=2 logical_cpus=20 thread_limit=2147483647 max_active_levels=0 dynamic=0 override=0"));
+    ASSERT_EQ(0, log_line_field::ompEffectiveTeam(0, 20, 64, 1));
+    ASSERT_EQ(12, log_line_field::ompEffectiveTeam(12, 20, 2147483647, 1));
+    ASSERT_EQ(4, log_line_field::ompEffectiveTeam(12, 20, 4, 1));
+    ASSERT_EQ(6, log_line_field::ompEffectiveTeam(12, 6, 64, 1));
+    ASSERT_EQ(1, log_line_field::ompEffectiveTeam(12, 20, 64, 0));
+    ASSERT_EQ(0, log_line_field::ompEffectiveTeam(0, 20, 64, 0));
+}
+
 TEST(LogLineField, ALocationPathHoldingAnArgMarkerIsWrittenVerbatim)
 {
     // r5 (sol r4 B1 on #726): the chained `.arg(file).arg(line)` substituted the line number into a path holding `%1` and left `:%2)`, so the
