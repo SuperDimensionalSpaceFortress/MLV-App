@@ -255,6 +255,9 @@ HFR_NATIVE_S1_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-
 # HFR-NATIVE-60FPS-FULLRES-1 r30 (merge of master into #420): #420 already ships the pair in HFR_NATIVE_LEGS, so each file is listed once (a duplicate
 # made LineEndingsCannotHideACommittedFileTests unlink the same checked-out file twice).
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in SHIPPED_LEGS))
+# EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
+EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
