@@ -692,10 +692,12 @@ def run_worker(spec_path: Path) -> int:
         "ok": result.wasSuccessful(),
     }
     Path(spec["result"]).write_text(json.dumps(record), encoding="utf-8")
+    if not result.wasSuccessful():  # a failed fixture cleanup fails a worker that ran no test, as it does serially
+        return 1
     if ran == 0:
         print("ERROR: no tests ran", file=sys.stderr)
         return 5
-    return 0 if result.wasSuccessful() else 1
+    return 0
 
 
 def _worker_record(path: Path) -> dict | None:
@@ -711,6 +713,7 @@ def _worker_record(path: Path) -> dict | None:
         and all(isinstance(item, str) for item in record["skipped_ids"])
         and isinstance(record.get("seconds"), dict)
         and type(record.get("tests_run")) is int
+        and type(record.get("ok")) is bool
     )
     return record if ok else None
 
@@ -830,9 +833,6 @@ def run_parallel(
                 "top_level_dir": top_level_dir,
             }
             (home / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
-            if clock() >= deadline:  # the spec write above may have been slow: never start a worker past the deadline
-                problems.append(f"worker {number}/{len(groups)} not launched: the deadline passed while launching")
-                continue
             child_env = {k: v for k, v in os.environ.items() if k != MANIFEST_ENV}
             child_env.update(TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp), **{WORKERS_ENV: "1"})
             tests_in = sum(len(units[key]) for key in classes)
@@ -842,6 +842,12 @@ def run_parallel(
                 sys.executable, "-m", "tools.repo_hygiene.ci_unittest_shard", "--repo-root", str(root_dir),
                 "--profile", profile, "--worker-spec", str(home / "spec.json"),
             ]
+            # The last step before the launch, after every blocking one (spec write, status line, log
+            # open): a worker is never started once the deadline has passed.
+            if clock() >= deadline:
+                log.close()
+                problems.append(f"worker {number}/{len(groups)} not launched: the deadline passed while launching")
+                continue
             procs.append((
                 subprocess.Popen(
                     command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -876,6 +882,8 @@ def run_parallel(
                 problems.append(f"worker {number}/{len(logs)} exited {code}")
             elif record is None:
                 problems.append(f"worker {number}/{len(logs)} wrote no readable result (exit {code})")
+            elif code != 1 and not record["ok"]:
+                problems.append(f"worker {number}/{len(logs)} recorded a failed run but exited {code}")
     finally:
         watch.stop()
         for proc, log in procs:  # an exception above must not leave a worker running

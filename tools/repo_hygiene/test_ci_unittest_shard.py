@@ -1033,12 +1033,19 @@ class ShardExitCodeTests(unittest.TestCase):
                     self.assertEqual(serial.call_args.args[0], members)
                     self.assertIsNone(serial.call_args.kwargs.get("manifest"))
 
-    def _fixture(self, extras: dict[str, str] | None = None) -> tuple[Path, list[unittest.TestCase], str]:
-        """Three tiny test modules in a temp dir, collected here and re-collectable by a worker."""
+    def _fixture(
+        self, extras: dict[str, str] | None = None, sources: dict[str, str] | None = None
+    ) -> tuple[Path, list[unittest.TestCase], str]:
+        """Three tiny test modules in a temp dir, collected here and re-collectable by a worker.
+
+        ``sources`` (module letter to full source) replaces the three modules with exactly those.
+        """
         tag = uuid.uuid4().hex[:8]
         root = Path(tempfile.mkdtemp(prefix="fxw-"))
         self.addCleanup(shutil.rmtree, root, True)
-        for name in ("a", "b", "c"):
+        for name, source in (sources or {}).items():
+            (root / f"fxw{tag}_{name}.py").write_text(source, encoding="utf-8")
+        for name in () if sources else ("a", "b", "c"):
             lines = [
                 "import json, os, tempfile, unittest",
                 "from pathlib import Path",
@@ -1052,7 +1059,7 @@ class ShardExitCodeTests(unittest.TestCase):
             ]
             (root / f"fxw{tag}_{name}.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
         tests = shard.collect_tests(str(root), f"fxw{tag}_*.py", str(root))
-        self.assertEqual(len(tests), 6 + len(extras or {}))
+        self.assertEqual(len(tests), len(sources) if sources else 6 + len(extras or {}))
 
         def forget() -> None:
             for module in [m for m in sys.modules if m.startswith(f"fxw{tag}_")]:
@@ -1255,6 +1262,119 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         for number in (1, 2):
             self.assertIn(f"worker {number}/2 not launched: the deadline passed while launching", err.getvalue())
+
+    # r4 adversary A1 (pass 4): the deadline check is the LAST step before Popen; the status line and the
+    # log open are blocking too, so a clock that crosses the deadline there must stop that launch.
+    def _launch_times(self, slow: str) -> list[float]:
+        root, tests, tag = self._fixture()
+        now = [0.0]
+        launched: list[float] = []
+        real_open = Path.open
+
+        class SlowOut(io.StringIO):
+            def write(self, text: str) -> int:
+                if slow == "status" and text.startswith("worker "):
+                    now[0] = 2.0  # printing the status line takes the clock past the 1 s deadline
+                return super().write(text)
+
+        def slow_open(path: Path, *args: object, **kwargs: object):
+            handle = real_open(path, *args, **kwargs)
+            if slow == "log" and path.name == "log.txt":
+                now[0] = 2.0  # creating the log file takes the clock past the deadline
+            return handle
+
+        def fake_popen(*args: object, **kwargs: object) -> mock.MagicMock:
+            launched.append(now[0])
+            return mock.MagicMock()
+
+        with (
+            mock.patch.object(shard.Path, "open", slow_open),
+            mock.patch.object(shard.subprocess, "Popen", side_effect=fake_popen),
+            contextlib.redirect_stdout(SlowOut()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "1"}, clock=lambda: now[0],
+            )
+        return launched
+
+    def test_no_worker_starts_after_the_status_line_took_the_clock_past_the_deadline(self) -> None:
+        self.assertEqual([time for time in self._launch_times("status") if time >= 1.0], [])
+
+    def test_no_worker_starts_after_opening_its_log_took_the_clock_past_the_deadline(self) -> None:
+        self.assertEqual([time for time in self._launch_times("log") if time >= 1.0], [])
+
+    # r4 adversary A2 (pass 4): a worker whose only class skips in a fixture but whose cleanup fails
+    # runs no test; serial fails it (exit 1 with the others' tests run), so the parallel shard must too.
+    _GOOD = "import unittest\nclass FxGoodTests(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+    _BAD_CLASS_CLEANUP = (
+        "import unittest\n"
+        "def _boom():\n    raise RuntimeError('cleanup-boom')\n"
+        "class FxSkipTests(unittest.TestCase):\n"
+        "    @classmethod\n    def setUpClass(cls):\n        cls.addClassCleanup(_boom)\n"
+        "        raise unittest.SkipTest('fixture skip')\n"
+        "    def test_never(self):\n        pass\n"
+    )
+    _BAD_MODULE_CLEANUP = (
+        "import unittest\n"
+        "def _boom():\n    raise RuntimeError('cleanup-boom')\n"
+        "def setUpModule():\n    unittest.addModuleCleanup(_boom)\n    raise unittest.SkipTest('fixture skip')\n"
+        "class FxSkipTests(unittest.TestCase):\n    def test_never(self):\n        pass\n"
+    )
+
+    def test_a_fixture_skip_whose_cleanup_fails_fails_the_shard_as_serial_does(self) -> None:
+        for label, bad in (("class cleanup", self._BAD_CLASS_CLEANUP), ("module cleanup", self._BAD_MODULE_CLEANUP)):
+            with self.subTest(label):
+                root, tests, tag = self._fixture(sources={"a": self._GOOD, "b": bad})
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    serial = shard.run_shard(tests, "ubuntu", 1, 1, clock=time.monotonic, environ={}, stream=io.StringIO())
+                self.assertEqual(serial, 1, "serial fails a failed fixture cleanup")
+                code, out, err, _manifest = self._parallel(root, tests, tag, 2)
+                self.assertEqual(code, 1, out + err)
+
+    def test_a_worker_that_records_a_failed_run_but_exits_zero_or_five_fails_the_shard(self) -> None:
+        for exit_code in (0, 5):
+            with self.subTest(exit_code=exit_code):
+                root, tests, tag = self._fixture()
+
+                class DonePopen:
+                    def __init__(self, command: list[str], **kwargs: object) -> None:
+                        spec = json.loads(Path(command[command.index("--worker-spec") + 1]).read_text(encoding="utf-8"))
+                        record = {"ids": [], "skipped_ids": [], "seconds": {}, "tests_run": 0, "ok": False}
+                        Path(spec["result"]).write_text(json.dumps(record), encoding="utf-8")
+                        self.returncode = exit_code
+
+                    def poll(self) -> int:
+                        return exit_code
+
+                    def wait(self, timeout: float | None = None) -> int:
+                        return exit_code
+
+                    def kill(self) -> None:
+                        pass
+
+                out, err = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(shard.subprocess, "Popen", DonePopen),
+                    contextlib.redirect_stdout(out),
+                    contextlib.redirect_stderr(err),
+                ):
+                    code = shard.run_parallel(
+                        tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                        repo_root=REPO_ROOT, pins={}, environ={}, timeout=120.0,
+                    )
+                self.assertEqual(code, 1)
+                self.assertIn(f"recorded a failed run but exited {exit_code}", err.getvalue())
+
+    def test_a_worker_result_without_a_boolean_ok_is_unreadable(self) -> None:
+        path = Path(tempfile.mkdtemp(prefix="fxw-")) / "result.json"
+        self.addCleanup(shutil.rmtree, path.parent, True)
+        record = {"ids": [], "skipped_ids": [], "seconds": {}, "tests_run": 0}
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertIsNone(shard._worker_record(path))
+        path.write_text(json.dumps({**record, "ok": True}), encoding="utf-8")
+        self.assertIsNotNone(shard._worker_record(path))
 
     # r3 adversary A2 (pass 2): a budget already crossed when the workers launch is reported before any log.
     def test_a_budget_already_crossed_at_launch_warns_before_the_worker_logs(self) -> None:
