@@ -348,8 +348,9 @@ TEST(PlaybackInfoLabel, R1P3A1WithdrawalRepaintsAtOnce)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    // r2 pass-2 A2: the rate withdrawal is the reset's flag (R2P2A2OnlyAWithdrawalRepaintsWhilePlaying).
     ASSERT_TRUE(push.contains(QStringLiteral(
-        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoFpsShown <= 0.0;")));
+        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn;")));
     ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
 }
 
@@ -402,6 +403,57 @@ TEST(PlaybackInfoLabel, R2A1DeferredRelabelHasItsOwnMonotonicGate)
     // A relabel restarts the gate's clock.
     const QString update = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
     ASSERT_TRUE(update.contains(QStringLiteral("m_playbackInfoRelabelClock.start();")));
+}
+
+// r2 pass-2 A1 (1fbfa178): a direct relabel caller (a menu toggle flipped six times in 250 ms, the fullscreen switch, a clip
+// hook) skipped the gate while playing. The gate is now INSIDE updatePlaybackInfoLabel: while playing, a call within 250 ms of
+// the last relabel only marks the info dirty (the per-tick flush relabels), so every playing relabel stays at most 4 Hz.
+TEST(PlaybackInfoLabel, R2P2A1EveryPlayingRelabelPassesTheOneGate)
+{
+    ASSERT_FALSE(playback_info_label::playingRelabelDeferred(false, true, 0));
+    ASSERT_FALSE(playback_info_label::playingRelabelDeferred(true, false, 0));
+    ASSERT_TRUE(playback_info_label::playingRelabelDeferred(true, true, 0));
+    ASSERT_TRUE(playback_info_label::playingRelabelDeferred(true, true, 249));
+    ASSERT_FALSE(playback_info_label::playingRelabelDeferred(true, true, 250));
+    // A due flush is never deferred by the same gate.
+    for ( const qint64 ms : {qint64(0), qint64(249), qint64(250), qint64(86400000)} )
+        ASSERT_FALSE(playback_info_label::deferredRelabelDue(true, true, ms)
+                     && playback_info_label::playingRelabelDeferred(true, true, ms));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString update = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    const int gateAt = update.indexOf(QStringLiteral("playback_info_label::playingRelabelDeferred("));
+    const int deferAt = update.indexOf(QStringLiteral("m_playbackInfoInputsDirty = true;"));
+    const int startAt = update.indexOf(QStringLiteral("m_playbackInfoRelabelClock.start();"));
+    ASSERT_TRUE(gateAt >= 0);
+    ASSERT_TRUE(deferAt > gateAt);
+    ASSERT_TRUE(startAt > deferAt);
+    ASSERT_TRUE(update.indexOf(QStringLiteral("ui->actionPlay->isChecked()")) < startAt);
+}
+
+// r2 pass-2 A2 (1fbfa178): starting Play from a paused frame (no rate measured yet) made repaintNow true, so the GPU window
+// repainted the retained paused frame: an extra paint and swap. Only a WITHDRAWAL repaints at once while playing: the label
+// hidden, or a measured rate reset because frames stopped (the reset sets the flag; the next push consumes it).
+TEST(PlaybackInfoLabel, R2P2A2OnlyAWithdrawalRepaintsWhilePlaying)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    ASSERT_FALSE(push.contains(QStringLiteral("m_playbackInfoFpsShown <= 0.0")));
+    ASSERT_TRUE(push.contains(QStringLiteral(
+        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn;")));
+    // The push never clears it (a look-line push while the info relabel waits must not eat the withdrawal); the info relabel
+    // clears it after its own push, or on each early return past the gate (nothing to withdraw).
+    ASSERT_FALSE(push.contains(QStringLiteral("m_playbackInfoRateWithdrawn = false;")));
+    const QString update = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_EQ(3, static_cast<int>(update.count(QStringLiteral("m_playbackInfoRateWithdrawn = false;"))));
+    ASSERT_TRUE(update.lastIndexOf(QStringLiteral("m_playbackInfoRateWithdrawn = false;"))
+                > update.indexOf(QStringLiteral("pushLookLabelOverlay();")));
+    ASSERT_TRUE(update.indexOf(QStringLiteral("m_playbackInfoRateWithdrawn = false;"))
+                > update.indexOf(QStringLiteral("m_playbackInfoInputsDirty = true;")));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    const int setAt = tick.indexOf(QStringLiteral("m_playbackInfoRateWithdrawn = true;"));
+    ASSERT_TRUE(setAt >= 0);
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("fpsWasMeasured")) < setAt);
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_playbackInfoRateWithdrawn = true;"))));
 }
 
 // r2 adversary A2 (deeae9f4, advisory): a carriage return is a line break too: logForm leaves one line, compose adds none.

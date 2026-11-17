@@ -2964,7 +2964,11 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             m_lastPlaybackFpsStatusUpdateTime = QTime();
             lastDrawTime = QTime();
             // LOOK-LABEL-PLAYBACK-INFO-1: once per reset of a measured rate (this branch runs every idle tick).
-            if( fpsWasMeasured && m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) updatePlaybackInfoLabel();
+            if( fpsWasMeasured && m_lookLabelFullscreenShown && m_playbackInfoToggles.fps )
+            {
+                m_playbackInfoRateWithdrawn = true;   // r2 pass-2 A2: the push that carries this withdrawal repaints at once
+                updatePlaybackInfoLabel();
+            }
         }
     };
 
@@ -33734,7 +33738,9 @@ void MainWindow::pushLookLabelOverlay( void )
     const bool gpuWindow = GpuDisplayWindow::isActive();
     m_lookLabelOverlayGpuWindow = gpuWindow;
     // r1 pass-3 A1: a withdrawal (label hidden, measured rate reset) repaints at once, since no frame may follow it.
-    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoFpsShown <= 0.0;
+    // r2 pass-2 A2: the reset's flag, never "no rate yet" (Play from a paused frame must not repaint the paused frame).
+    // Cleared only by updatePlaybackInfoLabel, after the push that carries the withdrawn text (a look-line push meanwhile repaints too).
+    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn;
     GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow );
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
 }
@@ -33786,11 +33792,21 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
 // playing from the fps meter's 250 ms gate (timerFrameEvent), so it runs at most 4 Hz and re-rasterises only on a new string.
 void MainWindow::updatePlaybackInfoLabel( void )
 {
+    // r2 pass-2 A1: every caller passes the one gate. While playing, a call within 250 ms of the last relabel only marks the
+    // info dirty; flushPlaybackInfoIfDue (every timer tick) relabels once it is due, so playing relabels stay at most 4 Hz.
+    const bool relabelClockValid = m_playbackInfoRelabelClock.isValid();
+    if( playback_info_label::playingRelabelDeferred( ui->actionPlay->isChecked(), relabelClockValid,
+                                                     relabelClockValid ? m_playbackInfoRelabelClock.elapsed() : 0 ) )
+    {
+        m_playbackInfoInputsDirty = true;
+        return;
+    }
     m_playbackInfoInputsDirty = false;
     m_playbackInfoRelabelClock.start();
     const bool twinVisible = m_pPlaybackInfoStatus && m_pPlaybackInfoStatus->isVisible();
+    // r2 pass-2 A2: past the gate, a pending rate withdrawal is carried by this call's push, or there is nothing to withdraw.
     if( !m_lookLabelFullscreenShown && !twinVisible
-     && m_playbackInfoText.isEmpty() && m_lookLabelOverlayText.isEmpty() ) return;
+     && m_playbackInfoText.isEmpty() && m_lookLabelOverlayText.isEmpty() ) { m_playbackInfoRateWithdrawn = false; return; }
     // No clip loaded: no info at all.
     const bool clipLoaded = m_fileLoaded && m_pMlvObject;
     const playback_info_label::Facts facts = clipLoaded ? playbackInfoFacts() : playback_info_label::Facts();
@@ -33798,13 +33814,18 @@ void MainWindow::updatePlaybackInfoLabel( void )
         ? playback_info_label::compose( facts, m_playbackInfoToggles, true ) : QString();
     const QString twin = clipLoaded ? playback_info_label::compose( facts, m_playbackInfoToggles, false ) : QString();
     const bool gpuWindow = GpuDisplayWindow::isActive();
-    if( overlay == m_playbackInfoText && twin == m_playbackInfoStatusText && gpuWindow == m_lookLabelOverlayGpuWindow ) return;
+    if( overlay == m_playbackInfoText && twin == m_playbackInfoStatusText && gpuWindow == m_lookLabelOverlayGpuWindow )
+    {
+        m_playbackInfoRateWithdrawn = false;
+        return;
+    }
     // The twin carries every field but the rate, so a change it does not see is an fps-only change: never logged.
     const bool nonFpsChange = twin != m_playbackInfoStatusText || gpuWindow != m_lookLabelOverlayGpuWindow;
     m_playbackInfoText = overlay;
     m_playbackInfoStatusText = twin;
     if( m_pPlaybackInfoStatus && m_pPlaybackInfoStatus->text() != twin ) m_pPlaybackInfoStatus->setText( twin );
     pushLookLabelOverlay();
+    m_playbackInfoRateWithdrawn = false;
     if( nonFpsChange )
     {
         logInteractionEvent(

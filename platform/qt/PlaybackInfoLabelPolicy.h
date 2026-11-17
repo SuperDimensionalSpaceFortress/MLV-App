@@ -177,6 +177,13 @@ inline bool deferredRelabelDue( bool dirty, bool clockValid, qint64 elapsedMs )
     return dirty && ( !clockValid || elapsedMs >= kDeferredRelabelMs );
 }
 
+/*! \brief r2 pass-2 A1: must a relabel call wait? While playing, a call within kDeferredRelabelMs of the last relabel (same
+ *  monotonic clock) only marks the info dirty; the per-tick flush relabels once deferredRelabelDue. Never while stopped. */
+inline bool playingRelabelDeferred( bool playing, bool clockValid, qint64 elapsedMs )
+{
+    return playing && clockValid && elapsedMs < kDeferredRelabelMs;
+}
+
 /*! \brief One-line form for a log or receipt field: '\n' -> " / ", '"' -> '\''. */
 inline QString logForm( const QString &text )
 {
