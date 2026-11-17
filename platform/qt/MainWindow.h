@@ -876,7 +876,8 @@ private:
     playback_info_label::Toggles m_playbackInfoToggles;
     // r1 adversary A1: the rate the label shows, a snapshot written ONLY at the fps meter's 250 ms gate and its reset.
     double m_playbackInfoFpsShown = 0.0;
-    bool m_playbackInfoInputsDirty = false;  // an info input changed while playing; the fps gate relabels (r1 pass-3 A2)
+    bool m_playbackInfoInputsDirty = false;  // an info input changed while playing; flushPlaybackInfoIfDue relabels (r1 pass-3 A2)
+    QElapsedTimer m_playbackInfoRelabelClock; // r2 A1: monotonic, restarted by every relabel; the deferred relabel's 250 ms gate
     // r1 adversary A1/A3: the info inputs last relabelled for (refreshPlaybackInfoOnInputChange compares them, ints only).
     struct PlaybackInfoInputs
     {
@@ -2336,6 +2337,7 @@ private:
     // resolution) and their status-bar twin (no fps). Change-only: composes only while the overlay is shown or the twin is
     // visible, and pushes only when a text or the overlay route changed.
     void updatePlaybackInfoLabel( void );
+    void flushPlaybackInfoIfDue( void );
     // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
     void pushLookLabelOverlay( void );
     playback_info_label::Facts playbackInfoFacts( void );

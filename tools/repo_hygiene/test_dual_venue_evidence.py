@@ -5833,6 +5833,20 @@ class LookLabelEvidenceTests(unittest.TestCase):
         v = self.evidence(line + "\n")
         self.assertEqual(v["waitMs"], 2147483648)
 
+    def test_r1_a3_a_counter_with_a_suffix_reads_as_unknown_not_truncated(self) -> None:
+        # r1 adversary A3 (a472a49f): samples=1.5 / samples=1junk used to read as 1 (and wait_ms=12junk as 12). A token that is not all
+        # digits is null; the playing block and the look label are still read (informational, never blocks a leg).
+        for token in ("1.5", "1junk", "-1", "+3"):
+            v = self.evidence(f'gui_smoke.look_label_playing shown="Look: Off" info_shown="" surface=none samples={token}\n')
+            self.assertIsNotNone(v["playing"], token)
+            self.assertIsNone(v["playing"]["samples"], token)
+            self.assertEqual(v["playing"]["shownText"], "Look: Off", token)
+        line = self.line("Look: Cinematic", "Look: Cinematic", "windowed_status_bar").replace("wait_ms=17", "wait_ms=12junk")
+        v = self.evidence(line + "\n")
+        self.assertEqual((v["lookLabelShown"], v["waitMs"]), (True, None))
+        v = self.evidence(line + ' info_shown="a" info_expected="a" info_fields=fps\n')
+        self.assertEqual((v["waitMs"], v["infoShownText"], v["infoFields"]), (None, "a", "fps"))
+
     def test_info_never_blocks_or_changes_look_label_shown(self) -> None:
         line = self.line("Look: Off", "Look: Off", "windowed_status_bar") + ' info_shown="" info_expected="" info_fields=none'
         v = self.evidence(line + "\n")

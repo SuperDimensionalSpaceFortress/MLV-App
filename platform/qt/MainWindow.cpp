@@ -2933,6 +2933,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
     // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
     if( m_lookAssistPump.sessionOpen() ) return;
+    // LOOK-LABEL-PLAYBACK-INFO-1 r2 (adversary A1): a deferred info change relabels on its own monotonic 250 ms gate, every tick,
+    // never behind the fps meter's wall-clock gate or a measured rate.
+    flushPlaybackInfoIfDue();
 
     static QTime lastTime;              //Last Time a picture was rendered
     static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
@@ -3115,7 +3118,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 // only when the string changes), and the receipt's sample of what the corner drew while playing.
                 // r1 (adversary A1): the snapshot every other hook composes, so none of them shows a newer rate.
                 m_playbackInfoFpsShown = smoothedFps;
-                if( m_playbackInfoInputsDirty || ( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) ) updatePlaybackInfoLabel();
+                // r2 A1: the new rate only marks the info dirty; the one monotonic gate relabels (<= 4 Hz for every cause).
+                if( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) m_playbackInfoInputsDirty = true;
+                flushPlaybackInfoIfDue();
                 if( m_lookLabelFullscreenShown && ui->actionPlay->isChecked() )
                 {
                     m_lookLabelPlayingShown = lookLabelShownText( &m_lookLabelPlayingSurface );
@@ -24548,7 +24553,7 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.gpuBilinear = m_lastPresentedFrameUsedGpuBilinearDebayer;
     if( inputs == m_playbackInfoInputs ) return;
     m_playbackInfoInputs = inputs;
-    // r1 pass-3 A2: while playing, the fps meter's 250 ms gate relabels, so a per-frame flip stays at most 4 Hz.
+    // r1 pass-3 A2: while playing, flushPlaybackInfoIfDue's 250 ms gate relabels, so a per-frame flip stays at most 4 Hz.
     if( ui->actionPlay->isChecked() ) { m_playbackInfoInputsDirty = true; return; }
     updatePlaybackInfoLabel();
 }
@@ -33782,6 +33787,7 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
 void MainWindow::updatePlaybackInfoLabel( void )
 {
     m_playbackInfoInputsDirty = false;
+    m_playbackInfoRelabelClock.start();
     const bool twinVisible = m_pPlaybackInfoStatus && m_pPlaybackInfoStatus->isVisible();
     if( !m_lookLabelFullscreenShown && !twinVisible
      && m_playbackInfoText.isEmpty() && m_lookLabelOverlayText.isEmpty() ) return;
@@ -33809,6 +33815,17 @@ void MainWindow::updatePlaybackInfoLabel( void )
                 .arg( playback_info_label::fieldsCsv( m_playbackInfoToggles ) )
                 .arg( bool01( m_lookLabelFullscreenShown ) ) );
     }
+}
+
+// LOOK-LABEL-PLAYBACK-INFO-1 r2 (adversary A1 on deeae9f4): the deferred (playing) relabel. Its gate is a monotonic clock restarted
+// by every relabel (QElapsedTimer: no midnight wrap) and needs no fps measurement, so a scale, pipeline or debayer change made
+// while playing reaches the label within 250 ms plus one timer tick, and every playing relabel stays at most 4 Hz.
+void MainWindow::flushPlaybackInfoIfDue( void )
+{
+    const bool clockValid = m_playbackInfoRelabelClock.isValid();
+    if( playback_info_label::deferredRelabelDue( m_playbackInfoInputsDirty, clockValid,
+                                                 clockValid ? m_playbackInfoRelabelClock.elapsed() : 0 ) )
+        updatePlaybackInfoLabel();
 }
 
 void MainWindow::setPlaybackInfoToggle( bool playback_info_label::Toggles::*field, bool on )

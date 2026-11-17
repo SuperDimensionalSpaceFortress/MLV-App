@@ -158,9 +158,9 @@ inline QString compose( const Facts &facts, const Toggles &toggles, bool include
     if( toggles.dualIso ) lineB << dualIsoField( facts );
     if( toggles.resolution ) lineB << resolutionField( facts );
     lineB.removeAll( QString() );
-    // r1 adversary A5: a field never adds a line of its own (a newline inside one reads as a space).
-    for( QString &field : lineA ) field.replace( QLatin1Char( '\n' ), QLatin1Char( ' ' ) );
-    for( QString &field : lineB ) field.replace( QLatin1Char( '\n' ), QLatin1Char( ' ' ) );
+    // r1 adversary A5: a field never adds a line of its own (a newline inside one reads as a space). r2 A2: a CR too.
+    for( QString &field : lineA ) { field.replace( QLatin1Char( '\r' ), QLatin1Char( ' ' ) ); field.replace( QLatin1Char( '\n' ), QLatin1Char( ' ' ) ); }
+    for( QString &field : lineB ) { field.replace( QLatin1Char( '\r' ), QLatin1Char( ' ' ) ); field.replace( QLatin1Char( '\n' ), QLatin1Char( ' ' ) ); }
 
     QStringList lines;
     if( !lineA.isEmpty() ) lines << lineA.join( sep );
@@ -168,10 +168,22 @@ inline QString compose( const Facts &facts, const Toggles &toggles, bool include
     return lines.join( QLatin1Char( '\n' ) );
 }
 
+/*! \brief r2 adversary A1: is a deferred (playing) relabel due? `dirty` = an info input changed since the last relabel;
+ *  `clockValid` / `elapsedMs` = a MONOTONIC clock (QElapsedTimer) restarted by every relabel, never the wall-clock QTime the
+ *  fps meter reads (it wraps at midnight), and never an fps measurement (a 1 fps conform resets the meter). <= 4 Hz. */
+constexpr qint64 kDeferredRelabelMs = 250;
+inline bool deferredRelabelDue( bool dirty, bool clockValid, qint64 elapsedMs )
+{
+    return dirty && ( !clockValid || elapsedMs >= kDeferredRelabelMs );
+}
+
 /*! \brief One-line form for a log or receipt field: '\n' -> " / ", '"' -> '\''. */
 inline QString logForm( const QString &text )
 {
     QString out = text;
+    // r2 adversary A2: a CR (alone or in CRLF) breaks a log line too.
+    out.replace( QStringLiteral( "\r\n" ), QStringLiteral( "\n" ) );
+    out.replace( QLatin1Char( '\r' ), QLatin1Char( '\n' ) );
     out.replace( QLatin1Char( '\n' ), QStringLiteral( " / " ) );
     out.replace( QLatin1Char( '"' ), QLatin1Char( '\'' ) );
     return out;

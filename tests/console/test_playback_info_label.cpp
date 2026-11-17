@@ -362,10 +362,60 @@ TEST(PlaybackInfoLabel, R1P3A2PlayingInputChangeWaitsForTheGate)
     const int dirtyAt = key.indexOf(QStringLiteral("if( ui->actionPlay->isChecked() ) { m_playbackInfoInputsDirty = true; return; }"));
     ASSERT_TRUE(dirtyAt >= 0);
     ASSERT_TRUE(dirtyAt < key.indexOf(QStringLiteral("updatePlaybackInfoLabel();")));
-    ASSERT_TRUE(source.contains(QStringLiteral(
-        "if( m_playbackInfoInputsDirty || ( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) ) updatePlaybackInfoLabel();")));
+    // r2 A1: the relabel that follows is the monotonic gate's (R2A1DeferredRelabelHasItsOwnMonotonicGate).
+    ASSERT_TRUE(source.contains(QStringLiteral("void MainWindow::flushPlaybackInfoIfDue(")));
     const QString update = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
     ASSERT_TRUE(update.contains(QStringLiteral("m_playbackInfoInputsDirty = false;")));
+}
+
+// r2 adversary A1 (deeae9f4): a deferred info change (scale, pipeline, debayer) waited for the fps meter's gate, which reads the
+// wall-clock QTime (after 23:59:59.900 it never reads 250 ms later until the clock catches up) and needs a measured rate (a 1 fps
+// conform resets the meter first). The deferred relabel has its own MONOTONIC 250 ms gate, checked on every timer tick; the fps
+// gate only marks the rate dirty, so every playing relabel still goes through the one <= 4 Hz gate.
+TEST(PlaybackInfoLabel, R2A1DeferredRelabelHasItsOwnMonotonicGate)
+{
+    ASSERT_FALSE(playback_info_label::deferredRelabelDue(false, false, 0));
+    ASSERT_FALSE(playback_info_label::deferredRelabelDue(false, true, 86400000));
+    ASSERT_TRUE(playback_info_label::deferredRelabelDue(true, false, 0));
+    ASSERT_FALSE(playback_info_label::deferredRelabelDue(true, true, 0));
+    ASSERT_FALSE(playback_info_label::deferredRelabelDue(true, true, 249));
+    ASSERT_TRUE(playback_info_label::deferredRelabelDue(true, true, 250));
+    ASSERT_TRUE(playback_info_label::deferredRelabelDue(true, true, 86400000));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString flush = functionBody(source, QStringLiteral("void MainWindow::flushPlaybackInfoIfDue("));
+    ASSERT_TRUE(flush.contains(QStringLiteral("playback_info_label::deferredRelabelDue(")));
+    ASSERT_TRUE(flush.contains(QStringLiteral("m_playbackInfoRelabelClock.elapsed()")));
+    ASSERT_FALSE(flush.contains(QStringLiteral("QTime")));
+    ASSERT_TRUE(flush.contains(QStringLiteral("updatePlaybackInfoLabel();")));
+    // Every tick, right after the Look Assist pump's return and before any other early return of the tick.
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    const int pumpAt = tick.indexOf(QStringLiteral("if( m_lookAssistPump.sessionOpen() ) return;"));
+    const int flushAt = tick.indexOf(QStringLiteral("flushPlaybackInfoIfDue();"));
+    ASSERT_TRUE(pumpAt >= 0);
+    ASSERT_TRUE(flushAt > pumpAt);
+    ASSERT_TRUE(flushAt < tick.indexOf(QStringLiteral("if( m_frameStillDrawing )")));
+    // The fps gate marks the rate dirty and asks the same gate; it never relabels on the wall clock by itself.
+    ASSERT_FALSE(source.contains(QStringLiteral("m_playbackInfoInputsDirty || ( m_lookLabelFullscreenShown")));
+    ASSERT_TRUE(tick.contains(QStringLiteral(
+        "if( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) m_playbackInfoInputsDirty = true;")));
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("flushPlaybackInfoIfDue();"), flushAt + 1) > flushAt);
+    // A relabel restarts the gate's clock.
+    const QString update = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_TRUE(update.contains(QStringLiteral("m_playbackInfoRelabelClock.start();")));
+}
+
+// r2 adversary A2 (deeae9f4, advisory): a carriage return is a line break too: logForm leaves one line, compose adds none.
+TEST(PlaybackInfoLabel, R2A2CarriageReturnsNeverBreakALine)
+{
+    const QString log = playback_info_label::logForm(QStringLiteral("GPU\rCPU\r\nX\nY"));
+    ASSERT_FALSE(log.contains(QLatin1Char('\r')));
+    ASSERT_FALSE(log.contains(QLatin1Char('\n')));
+    ASSERT_QSTR_EQ(QStringLiteral("GPU / CPU / X / Y"), log);
+    playback_info_label::Facts f = ownerFacts();
+    f.processingBadge = QStringLiteral("A\rB");
+    const QString text = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+    ASSERT_FALSE(text.contains(QLatin1Char('\r')));
+    ASSERT_EQ(2, static_cast<int>(text.split(QLatin1Char('\n')).size()));
 }
 
 // r1 adversary A2 (06898800): with RAW corrections off (fix_raw=0) llrawproc never runs, so the selected Dual-ISO mode is not

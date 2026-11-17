@@ -1594,16 +1594,17 @@ function Get-DvLookLabelEvidence {
     $p = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         foreach ($line in ($LogText -split "`r?`n")) {
-            if ($line -match 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\d+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?') {
+            if ($line -match 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\S+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?') {
                 $m = $Matches.Clone()
             }
-            elseif ($line -match 'gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\d+)') {
+            elseif ($line -match 'gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\S+)') {
                 $p = $Matches.Clone()
             }
         }
     }
     # r1 adversary A4: a counter past Int32 (or Int64) never throws here: it reads as Int64, or null when even that overflows.
-    $toCount = { param([string]$Digits) $n = [long]0; if ([long]::TryParse($Digits, [ref]$n)) { $n } else { $null } }
+    # r1 adversary A3: the whole token, digits only (1.5, 1junk, -1, +3 read as null, never truncated to a leading number).
+    $toCount = { param([string]$Digits) $n = [long]0; if ($Digits -cmatch '\A[0-9]+\z' -and [long]::TryParse($Digits, [ref]$n)) { $n } else { $null } }
     $playing = $null
     if ($null -ne $p) {
         $playing = [ordered]@{ shownText = [string]$p['shown']; infoShownText = [string]$p['infoShown']; surface = [string]$p['surface']; samples = (& $toCount ([string]$p['samples'])) }
