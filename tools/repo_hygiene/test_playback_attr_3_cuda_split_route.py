@@ -259,9 +259,12 @@ class StageJobTests(unittest.TestCase):
         self.assertLess(manifest, cleanup, "side-files may only be removed after the publish")
 
     def test_side_files_are_addressed_by_exact_name(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r16 (r14 OPEN A1): the three paths of one side-file are built in ONE helper, New-JobSideFile($Name), used both before and after the stage
+        # lock, so the loop's $name became the helper's $Name. Same call, same exact-name derivation; the pin follows the deliberate rename.
         self.assertIn(
-            'Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $name)', self.text
+            'Assert-AttrCudaDirectChild -Root $Inbox -Path (Join-Path $Inbox $Name)', self.text
         )
+        self.assertIn("$sideFiles += New-JobSideFile $name ([string]$item.sha256)", self.text)
         self.assertNotIn("Get-ChildItem", self.text)
 
     def test_names_are_derived_from_the_commit_not_taken_from_the_manifest(self) -> None:
@@ -338,11 +341,15 @@ class AttributionJobTests(unittest.TestCase):
         function = module[module.index("function Assert-AttrCudaBuildManifest") :]
         function = function[: function.index("\nfunction ")]
         # Statement positions, not prose: the doc comment names ConvertFrom-Json too.
-        self.assertLess(
-            function.index('throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH'),
-            function.index("$manifest = [IO.File]::ReadAllText($Path) | ConvertFrom-Json"),
-            "the hash must be checked before the manifest is parsed",
-        )
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r8 (adversary A1): the read and the typed parse are two statements now; both follow the hash check.
+        # r10 (adversary A1 on 0b1fcfe2): ONE read; the bytes parsed are the bytes hashed, and that hash is checked before the parse too.
+        for statement in ("$manifestBytes = [IO.File]::ReadAllBytes($Path)", 'throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH $Path expected=$ExpectedSha256 actual=$readSha',
+                          "$manifestText = [IO.StreamReader]::new([IO.MemoryStream]::new($manifestBytes)", "$manifest = try { $manifestText | ConvertFrom-Json -ErrorAction Stop }"):
+            self.assertLess(
+                function.index('throw "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH'),
+                function.index(statement),
+                "the hash must be checked before the manifest is parsed",
+            )
 
     def test_the_build_manifest_must_chain_to_the_dll_pair_manifest(self) -> None:
         self.assertIn("ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND", _read(SHARED_MODULE))

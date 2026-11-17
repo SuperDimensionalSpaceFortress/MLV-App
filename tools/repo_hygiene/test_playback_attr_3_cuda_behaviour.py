@@ -31,6 +31,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -382,8 +384,11 @@ class SourceArchiveBindingTests(_PwshCase):
 # --------------------------------------------------------------------------------------------
 
 
-def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None) -> dict:
-    """Write the four files the assembler publishes, with fabricated contents."""
+def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None, rebuild_tag: str = "") -> dict:
+    """Write the four files the assembler publishes, with fabricated contents.
+
+    rebuild_tag (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): one assemble of the sha. A different tag is a re-assemble of
+    the same sha: other exe bytes and another assembledAtUtc, so another manifest sha256, as the real assembler makes."""
     short = sha[:12]
     names = {
         "exe": f"MLVApp-playback-attr-3-cuda-{short}.exe",
@@ -396,7 +401,7 @@ def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None)
 
     shas = {}
     for key in ("exe", "dll", "packageZip"):
-        payload = f"fabricated {key} for {sha}".encode("utf-8")
+        payload = f"fabricated {key} for {sha}{' ' + rebuild_tag if rebuild_tag and key == 'exe' else ''}".encode("utf-8")
         (build / names[key]).write_bytes(payload)
         shas[key] = hashlib.sha256(payload).hexdigest()
     manifest = {
@@ -408,6 +413,8 @@ def _fake_build_dir(build: Path, sha: str, exe_name_override: str | None = None)
         "pendingSymbolPresence": True,
         "dllPairManifestSha256": "b" * 64,
     }
+    if rebuild_tag:
+        manifest["assembledAtUtc"] = rebuild_tag
     (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return names
 
@@ -729,6 +736,31 @@ class BuildManifestAuthenticationTests(_PwshCase):
         )
         self.assert_throws(self.call("a" * 64), "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH")
 
+    def test_every_parse_failure_is_the_unparseable_content_refusal(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r7 (adversary A1 on ef28cd37): ConvertFrom-Json throws InvalidOperationException on keys that differ
+        # only by case, ArgumentException on malformed text; both are a content verdict on readable bytes, so both carry the one token.
+        import hashlib
+
+        for payload in (b'{"x":1,"X":2}', b"{ this is not json"):
+            with self.subTest(payload=payload):
+                self.manifest_path.write_bytes(payload)
+                self.assert_throws(self.call(hashlib.sha256(payload).hexdigest()), "ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE")
+
+    def test_r10_the_bytes_parsed_are_the_bytes_hashed(self) -> None:
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r10 (adversary A1 on 0b1fcfe2): the file was hashed, then read again to parse. Bytes swapped in between were
+        # parsed under the judged sha256: here sourceCommit 'not-a-sha' (the stage guard then took another commit's sound build for this name's corrupt one).
+        # Get-FileHash is shadowed so the swap lands exactly after the hash. The bytes parsed must be the bytes hashed: SHA_MISMATCH, never their content verdict.
+        sha = self.write()
+        swapped = json.dumps({"sourceCommit": "not-a-sha", "pendingSymbolPresence": True, "dllPairManifestSha256": "d" * 64}, indent=2)
+        proc = self.run_with_module(
+            "function global:Get-FileHash { $h = Microsoft.PowerShell.Utility\\Get-FileHash @args; "
+            f"[IO.File]::WriteAllText('{self.manifest_path}', '{swapped}'); $h }}\n"
+            + _guard(f"Assert-AttrCudaBuildManifest -Path '{self.manifest_path}' -ExpectedSha256 '{sha}' -ExpectedSourceCommit '{SHA_FIXTURE}'"),
+            name="swap-after-hash.ps1",
+        )
+        self.assert_throws(proc, "ATTRCUDA_BUILD_MANIFEST_SHA_MISMATCH")
+        self.assertNotIn("not-a-sha", proc.stdout)
+
 
 # --------------------------------------------------------------------------------------------
 # (d) the smoke-runner log contract
@@ -991,6 +1023,1043 @@ class InterruptedStagingTests(_PwshCase):
 
         self.assertEqual(proc.returncode, 4, f"{proc.stdout}\n{proc.stderr}")
         self.assertEqual(self.cache_names(), [])
+
+
+# --------------------------------------------------------------------------------------------
+# (e2) VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1: a sound staged build of a sha is never replaced
+# --------------------------------------------------------------------------------------------
+
+
+@requires_pwsh
+class StagedBuildNeverReplacedTests(_PwshCase):
+    """A stage of a sha whose cache already holds a sound build writes nothing into the cache.
+
+    2026-11-13: lane HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 re-assembled 23a07757 (a new
+    manifest, f8fc75a2), and its suffixed stage job replaced the build another lane had staged
+    (ad005766) while a lease batch that had pinned it was running: BUILD_MANIFEST_MISMATCH
+    (Invoke-VenueLeaseBatch.ps1:1258) and one lost leg. Every stager reaches the cache only through
+    this emitted job, so the job is where the rule holds.
+    """
+
+    VENUE_CHAIN = ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agent = self.tmp / "agent"
+        self.inbox = self.agent / "inbox"
+        self.cache = self.agent / "cache"
+        self.inbox.mkdir(parents=True)
+        self.cache.mkdir(parents=True)
+        self.manifest_name = f"playback-attr-3-cuda-{SHA_FIXTURE[:12]}-build.json"
+
+    def stage(self, tag: str, suffix: str = "", mutate=None) -> subprocess.CompletedProcess:
+        """Assemble (tag = which assemble) and stage the sha through the real generator and job.
+
+        mutate(manifest_dict) edits the assembled build.json before the job is generated."""
+        return _run_job(self.emit(tag, suffix, mutate))
+
+    def emit(self, tag: str, suffix: str = "", mutate=None, agent_root: Path | None = None) -> Path:
+        """Assemble and generate the stage job, and drop its inputs into the inbox; the job is not run.
+
+        agent_root: the -AgentRoot the job is generated for (default self.agent; an alias of it reaches the same inbox and cache)."""
+        build = self.tmp / f"build-{tag}"
+        staging = self.tmp / f"staging-{tag}-{suffix or 'default'}"
+        staging.mkdir(parents=True)
+        names = _fake_build_dir(build, SHA_FIXTURE, rebuild_tag=tag)
+        if mutate is not None:
+            manifest = json.loads((build / names["manifest"]).read_text(encoding="utf-8"))
+            mutate(manifest)
+            (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        script = self.tmp / f"generate-{tag}-{suffix or 'default'}.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{STAGE_GENERATOR}' -SourceCommit '{SHA_FIXTURE}' -BuildDir '{build}' "
+            f"-OutDir '{staging}' -AgentRoot '{agent_root or self.agent}'"
+            + (f" -JobIdSuffix '{suffix}'" if suffix else "")
+            + " | ConvertTo-Json -Depth 5\n",
+            encoding="utf-8",
+        )
+        gen = _run_pwsh_file(script)
+        self.assertEqual(gen.returncode, 0, f"{gen.stdout}\n{gen.stderr}")
+        for name in names.values():
+            shutil.copy2(build / name, self.inbox / name)
+        return Path(json.loads(gen.stdout)["jobFile"])
+
+    def test_two_stagers_of_one_sha_into_one_cache_never_lose_the_staged_build(self) -> None:
+        # r3 (adversary A3 on ce5a0380): two agents on ONE root, each with its own -MutexName, both admitted; identical build bytes, JobIdSuffix a and b.
+        # A passes the (absent-manifest) guard and copies its partials; B then stages. B must not pass the guard while A is between its guard and its
+        # publication: the lock is the cache's and the sha's, not a caller's name. A publishes, and B finds the sound build and reuses it (no cache write).
+        # On ce5a0380 B published meanwhile, A replaced B's artifacts, deleted B's sound manifest and failed (exit 22): a sound stage with no manifest.
+        # adversary A1 on 3bec2622: B reaches the SAME root through a junction (C:\Users\All Users -> C:\ProgramData), so a lock keyed on the lexical
+        # path would be two locks; the lock is the root's physical identity.
+        # The junction is an ANCESTOR of B's root (as All Users is), not the root itself.
+        alias = self.tmp.parent / (self.tmp.name + "-alias")
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(self.tmp)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        self.addCleanup(lambda: os.rmdir(alias) if alias.exists() else None)
+        job_a, job_b = self.emit("ad005766", suffix="a"), self.emit("ad005766", suffix="b", agent_root=alias / self.agent.name)
+        hold, b_waits = self.tmp / "hold-a", self.tmp / "b-waits"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+        a = subprocess.Popen(cmd + [str(job_a), "-TestHoldAfterPartialsPath", str(hold)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        b = None
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "stager A never reached its publication")
+            b = subprocess.Popen(cmd + [str(job_b), "-TestLockWaitMarkerPath", str(b_waits)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # r4 (Grok G5 on #814): B's stdout is read live, so the test sees what B printed WHILE it was blocked on the lock
+            b_lines: list[str] = []
+            b_reader = threading.Thread(target=lambda: b_lines.extend(iter(b.stdout.readline, "")), daemon=True)
+            b_reader.start()
+            t0 = time.monotonic()
+            while b.poll() is None and not b_waits.exists() and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            # a stager blocked on the lock says so BEFORE it blocks (up to 1800 s otherwise silent): the busy line is out while A still holds
+            t0 = time.monotonic()
+            while b.poll() is None and not any(l.startswith("STAGE_LOCK_WAIT ") for l in list(b_lines)) and time.monotonic() - t0 < 30:
+                time.sleep(0.1)
+            b_busy_while_a_held = [l.rstrip() for l in list(b_lines) if l.startswith("STAGE_LOCK_WAIT ")]
+            b_done_while_a_held = b.poll() is not None
+        finally:
+            hold.write_text("", encoding="utf-8")
+            a_out, a_err = a.communicate(timeout=180)
+            if b is not None:
+                b.wait(timeout=180)
+                b_reader.join(timeout=30)
+                b_out, b_err = "".join(b_lines), b.stderr.read()
+            else:
+                b_out, b_err = "", ""
+        lock_id = re.search(r"(?m)^STAGE_LOCK_WAIT (vol=\d+;idx=\d+-\d+) " + SHA_FIXTURE + r" waiting up to 1800 s ", "\n".join(b_busy_while_a_held))
+        self.assertIsNotNone(lock_id, f"stager B printed no STAGE_LOCK_WAIT line before it blocked on the lock A held:\n{b_out}")
+        self.assertRegex(b_out, r"(?m)^\[[^\]]+\] STAGE_LOCK_WAITED ")
+        self.assertEqual(a.returncode, 0, f"A: {a_out}\n{a_err}\nB: {b_out}\n{b_err}")
+        self.assertFalse(b_done_while_a_held, f"stager B finished while A held the stage of the same sha:\n{b_out}")
+        self.assertEqual(b.returncode, 0, f"{b_out}\n{b_err}")
+        self.assertRegex(b_out, rf"(?m)^STAGE_REUSED_EXISTING sha={SHA_FIXTURE[:12]} ")
+        self.assertTrue((self.cache / self.manifest_name).exists(), "the staged manifest was lost")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-ad005766" / self.manifest_name).read_bytes()).hexdigest())
+        proc = self.run_with_module(
+            f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+            f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+            "Write-Output ('STATE=' + $s.state + ' CONTENT=[' + $s.contentProblem + '] ARTIFACT=[' + $s.artifactProblem + ']')\n",
+            name="after-two.ps1",
+        )
+        self.assertIn("STATE=STAGED CONTENT=[] ARTIFACT=[]", proc.stdout, proc.stdout + proc.stderr)
+        self.assertEqual(list(self.inbox.iterdir()), [], "inputs were left in the inbox")
+
+    def test_r16_a1_a_junction_retargeted_after_the_lock_never_moves_the_job_to_another_root(self) -> None:
+        # r16 (r14 OPEN A1, adversary on 6882c873, AttrCudaArtifacts.psm1:510; siblings stage job :376/:515/:527, Publish-AttrCudaFileMove, Assert-AttrCudaWritableFileSlot):
+        # the lock named the physical root the junction reached at the identity sample, but every later file operation went through the LEXICAL -AgentRoot. Retargeted
+        # while A held (after its partials), A's renames resolved into stage-b: the slot check removed stage-b's artifact, the rename found no partial (exit 21).
+        # Fixed: the root is opened ONCE, the lock and the identity come from that handle, and the job rebinds every path to its final path right after the lock.
+        stage_b = self.tmp / "stage-b"
+        (stage_b / "agent" / "inbox").mkdir(parents=True)
+        (stage_b / "agent" / "cache").mkdir(parents=True)
+        alias = self.tmp.parent / (self.tmp.name + "-retarget")
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(self.tmp)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        self.addCleanup(lambda: os.rmdir(alias) if os.path.lexists(alias) else None)
+        job = self.emit("ad005766", suffix="retarget", agent_root=alias / self.agent.name)
+        exe_name = f"MLVApp-playback-attr-3-cuda-{SHA_FIXTURE[:12]}.exe"
+        decoy = stage_b / "agent" / "cache" / exe_name
+        decoy.write_bytes(b"stage-b's own artifact; no job of stage-a may touch it")
+        hold = self.tmp / "hold-retarget"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldAfterPartialsPath", str(hold)]
+        a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached its publication")
+            os.rmdir(alias)
+            mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(stage_b)], capture_output=True, text=True)
+            self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        finally:
+            hold.write_text("", encoding="utf-8")
+            out, err = a.communicate(timeout=180)
+        self.assertEqual(a.returncode, 0, f"{out}\n{err}")
+        self.assertEqual(decoy.read_bytes(), b"stage-b's own artifact; no job of stage-a may touch it", "a stage-a job removed stage-b's artifact")
+        self.assertEqual(sorted(e.name for e in (stage_b / "agent" / "cache").iterdir()), [exe_name], "a stage-a job wrote into stage-b's cache")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-ad005766" / self.manifest_name).read_bytes()).hexdigest())
+        self.assertEqual(list(self.inbox.iterdir()), [], "the inputs were left in stage-a's inbox")
+
+    def test_r8_an_unsound_staged_manifest_is_gone_before_the_repair_renames_an_artifact_in(self) -> None:
+        # r8 (adversary A1 on 0c0eafd7): a cached manifest with its artifacts absent is unsound and is replaced. Left standing until the new manifest's publish,
+        # a reader that hashed the REPAIRED artifacts against it found it sound and pinned it, and the publish then replaced it (BUILD_MANIFEST_MISMATCH later).
+        # Held after the partials (before any rename), the old manifest is already gone and the share-side read says NOT_STAGED.
+        first = self.stage("ad005766", suffix="first")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        for e in list(self.cache.iterdir()):
+            if e.name != self.manifest_name and e.is_file():
+                e.unlink()
+        job = self.emit("f8fc75a2", suffix="repair")
+        hold = self.tmp / "hold-repair"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldAfterPartialsPath", str(hold)]
+        a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached its publication")
+            present_while_held = (self.cache / self.manifest_name).exists()
+            proc = self.run_with_module(
+                f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+                f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+                "Write-Output ('STATE=' + $s.state)\n",
+                name="while-held.ps1",
+            )
+        finally:
+            hold.write_text("", encoding="utf-8")
+            out, err = a.communicate(timeout=180)
+        self.assertFalse(present_while_held, f"the unsound manifest stood while the repair was being published:\n{out}")
+        self.assertIn("STATE=NOT_STAGED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertEqual(a.returncode, 0, f"{out}\n{err}")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_r9_g8_an_unsound_manifest_replaced_before_its_retirement_is_left_and_nothing_is_staged(self) -> None:
+        # r9 (Grok G8 on #814): STAGE_REFUSED_STAGED_UNRETIRED. The guard judged the cached manifest unsound (its artifacts are absent); before the retirement by
+        # content proof, other bytes took the name (the -TestHoldBeforeRetirePath seam). The removal finds bytes it never judged: they are left, nothing is staged.
+        first = self.stage("ad005766", suffix="first")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        for e in list(self.cache.iterdir()):
+            if e.name != self.manifest_name and e.is_file():
+                e.unlink()
+        job = self.emit("f8fc75a2", suffix="unretired")
+        hold = self.tmp / "hold-retire"
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldBeforeRetirePath", str(hold)]
+        a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        foreign = b'{"foreign":"another stager wrote these bytes after the guard read"}'
+        try:
+            t0 = time.monotonic()
+            while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                time.sleep(0.1)
+            self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached the retirement")
+            (self.cache / self.manifest_name).write_bytes(foreign)
+            before = sorted((e.name, e.stat().st_size) for e in self.cache.iterdir() if e.is_file())
+        finally:
+            hold.write_text("", encoding="utf-8")
+            out, err = a.communicate(timeout=180)
+        self.assertEqual(a.returncode, 7, f"{out}\n{err}")
+        self.assertIn("STAGE_REFUSED_STAGED_UNRETIRED sha=", out)
+        self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", out)
+        self.assertEqual((self.cache / self.manifest_name).read_bytes(), foreign, "the foreign manifest was not left in place")
+        self.assertEqual(sorted((e.name, e.stat().st_size) for e in self.cache.iterdir() if e.is_file()), before, "an artifact was renamed into the cache")
+        self.assertEqual(before, [(self.manifest_name, len(foreign))])
+
+    def test_r8_a_manifest_replaced_or_retired_while_its_artifacts_are_hashed_is_never_sound(self) -> None:
+        # r8 (adversary A1 on 0c0eafd7, reader side, VenueChain.psm1 Get-VenueStagedBuildManifest): the manifest read answered for M0's bytes, then a stager retired or
+        # replaced M0 before the artifact hash. The default hash reads the manifest again last: gone -> BUILD_ARTIFACT_MISSING, other bytes -> BUILD_ARTIFACT_MISMATCH.
+        first = self.stage("ad005766", suffix="first")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        m0 = (self.cache / self.manifest_name).read_bytes()
+        m = json.loads(m0)
+        facts = [hashlib.sha256(m0).hexdigest(), "C:" + SHA_FIXTURE, "D:" + m["dllPairManifestSha256"], "S:bool"]
+        for k in ("packageZip", "exe", "dll"):
+            facts += [f"A:{k}=ok", f"H:{k}=" + m[k]["sha256"]]
+        probe = "; ".join(f"'{f}'" for f in facts)
+        for case, change, code in (("retired", lambda p: p.unlink(), "BUILD_ARTIFACT_MISSING"),
+                                   ("replaced", lambda p: p.write_bytes(m0 + b"\n"), "BUILD_ARTIFACT_MISMATCH")):
+            with self.subTest(case=case):
+                (self.cache / self.manifest_name).write_bytes(m0)
+                change(self.cache / self.manifest_name)
+                proc = self.run_with_module(
+                    f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+                    f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts -ProbeScript {{ param($p) {probe} }}\n"
+                    "Write-Output ('STATE=' + $s.state + ' ARTIFACT=[' + $s.artifactProblem + ']')\n",
+                    name=f"swapped-{case}.ps1",
+                )
+                self.assertRegex(proc.stdout, rf"STATE=STAGED ARTIFACT=\[{code} [^\]]*{re.escape(self.manifest_name)}", proc.stdout + proc.stderr)
+                # r9 (Grok G11 on #814): the typed code stays; the cause named is the manifest, never a missing or stale exe
+                self.assertIn(f"ARTIFACT=[{code} the build manifest was retired or replaced while its artifacts were hashed: manifest {self.manifest_name}", proc.stdout)
+                self.assertNotIn("the cached artifact", proc.stdout)
+
+    def test_the_stage_lock_is_the_caches_and_the_shas_never_a_callers_name(self) -> None:
+        # A3 siblings: the lock is taken before the never-replace guard and held through publishRename (:442), the manifest slot (:451) and its publish (:454)
+        text = STAGE_GENERATOR.read_text(encoding="utf-8")
+        lock, guard, publish = text.index("$StageLock = Enter-AttrCudaStageLock -Root $AgentRoot -SourceCommit $SourceCommit "), text.index("if (Test-Path -LiteralPath $manifestCachePath) {"), text.index("Publish-AttrCudaFileMove -Source $manifestPartialPath")
+        self.assertLess(lock, guard)
+        self.assertLess(guard, publish)
+        self.assertNotIn("$MutexName", text)
+        self.assertNotIn("ReleaseMutex", text)
+        # adversary A1 on 3bec2622: the name is the root's PHYSICAL identity and the sha, never a lexical path or a caller's name
+        body = re.search(r"(?ms)^function Enter-AttrCudaStageLock \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
+        # r16 (r14 OPEN A1): the identity is read off the ONE handle the volume check and the final path come from (links followed, never FILE_SHARE_DELETE),
+        # never by a second path open (Get-AttrCudaFileId -Path $Root -FollowLinks was one); the stage job rebinds every path to .root right after the lock
+        self.assertEqual(body.count("::CreateFileW("), 1, "the root is opened once")
+        self.assertIn("::CreateFileW($nativeRoot, [uint32]0x81, [uint32]3, [IntPtr]::Zero, [uint32]3, [uint32]0x02000000, [IntPtr]::Zero)", body)
+        self.assertIn("GetFileInformationByHandle($rootHandle.DangerousGetHandle()", body)
+        # (r16 fix iteration 1, A3: the bound drive-letter path is re-read by identity and must equal the handle's; the ROOT is never opened a second time by path)
+        self.assertNotIn("Get-AttrCudaFileId -Path $Root", body)
+        self.assertIn("Get-AttrCudaFileId -Path $dosFinal -FollowLinks", body)
+        self.assertIn("rootHandle = $rootHandle", body)
+        # r21 (pass-20 A1): GetFullPath reduces the text handed to the ONE CreateFileW (dot segments, before the length test and the '\\?\' prefix) and nothing else:
+        # the identity, the lock key and the name come from the handle, never from a normalized lexical path
+        self.assertEqual(body.count("GetFullPath"), 1)
+        self.assertIn("$nativeRoot = [IO.Path]::GetFullPath($nativeRoot)", body)
+        self.assertLess(body.index("GetFullPath"), body.index("$nativeRoot.Length -ge 240"))
+        self.assertLess(body.index("$nativeRoot.Length -ge 240"), body.index("::CreateFileW($nativeRoot"))
+        self.assertNotRegex(body, r"(?m)^\s*\$(key|name|rootId)\b[^\n]*(GetFullPath|\$nativeRoot)")
+        self.assertNotIn("ReleaseMutex", body)
+        rebind = text.index("$AgentRoot = [string]$StageLock.root")
+        self.assertLess(lock, rebind)
+        self.assertLess(rebind, guard)
+        self.assertIn("$Work = Join-Path $AgentRoot \"work\\$JobId\"", text[rebind:guard])
+        self.assertIn("$sideFiles = @(foreach ($item in $sideFiles) { New-JobSideFile ([string]$item.name) ([string]$item.sha256) })", text[rebind:guard])
+        self.assertEqual(text.count("$Work = Join-Path"), 1, "$Work is assigned once, on the locked root")
+
+    def snapshot(self) -> dict:
+        return {e.name: (e.read_bytes(), e.stat().st_mtime_ns) for e in sorted(self.cache.iterdir())}
+
+    def manifest_sha(self) -> str:
+        return hashlib.sha256((self.cache / self.manifest_name).read_bytes()).hexdigest()
+
+    def test_a_second_stage_with_another_manifest_is_refused_and_writes_nothing(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_MANIFEST sha={SHA_FIXTURE[:12]} staged={staged[:8]} incoming=[0-9a-f]{{8}} ")
+        self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", second.stdout)
+        self.assertEqual(self.snapshot(), before, "the staged build was rewritten")
+        self.assertEqual(list(self.inbox.iterdir()), [], "the refused inputs were left in the inbox")
+
+    def test_r9_a_build_of_another_commit_with_the_same_12_hex_is_never_replaced(self) -> None:
+        # r9 fix iteration (adversary A1 on 9825bfd9): the cache names carry only the sha's first 12 hex. Another commit with the same 12 staged its SOUND build
+        # there (here: the resident manifest's sourceCommit is that commit). The never-replace guard read it as COMMIT_MISMATCH (unsound for this sha), retired
+        # it and published this sha's build over it. It is refused (exit 7) and the cache is left byte for byte.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        other = SHA_FIXTURE[:12] + "1" * 28
+        m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+        m["sourceCommit"] = other
+        (self.cache / self.manifest_name).write_text(json.dumps(m, indent=2), encoding="utf-8")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="samesha12")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_COMMIT sha={SHA_FIXTURE[:12]} staged={staged[:8]} stagedCommit={other} incoming=[0-9a-f]{{8}}")
+        self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", second.stdout)
+        self.assertEqual(self.snapshot(), before, "another commit's staged build was rewritten")
+
+    def test_r9_another_commits_build_held_or_changed_after_the_judgement_is_never_replaced(self) -> None:
+        # r9 fix iteration 3 (adversary A1 on d7d19398): after the guard judged the resident manifest COMMIT_MISMATCH, its commit was read again to tell another
+        # commit's build from this name's corrupt one; a held or changed file made that commit '' and the build was replaced (r9: fail closed, UNREADABLE).
+        # r10 (adversary A1 on 0b1fcfe2): there is no second read: the commit is the one the judged bytes declare, so a file held (FileShare.None) or changed
+        # after the judgement changes nothing: STAGE_REFUSED_STAGED_OTHER_COMMIT, exit 7, the manifest left as it is.
+        if os.name != "nt":
+            self.skipTest("the held case takes a FileShare.None handle through kernel32")
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        other = SHA_FIXTURE[:12] + "1" * 28
+        first = self.stage("ad005766", suffix="resident")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+        m["sourceCommit"] = other
+        resident = json.dumps(m, indent=2).encode()
+        for case in ("held", "changed"):
+            with self.subTest(case=case):
+                (self.cache / self.manifest_name).write_bytes(resident)
+                job = self.emit("f8fc75a2", suffix=f"reread{case}")
+                hold = self.tmp / f"hold-reread-{case}"
+                cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(job), "-TestHoldBeforeRetirePath", str(hold)]
+                a = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                h = None
+                expect = resident
+                try:
+                    t0 = time.monotonic()
+                    while not Path(f"{hold}.reached").exists() and a.poll() is None and time.monotonic() - t0 < 90:
+                        time.sleep(0.1)
+                    self.assertTrue(Path(f"{hold}.reached").exists(), "the stager never reached the re-read")
+                    if case == "held":
+                        h = k32.CreateFileW(str(self.cache / self.manifest_name), 0x80000000, 0, None, 3, 0x80, None)
+                        self.assertNotEqual(h, wintypes.HANDLE(-1).value, ctypes.get_last_error())
+                    else:
+                        expect = resident + b"\n"
+                        (self.cache / self.manifest_name).write_bytes(expect)
+                    hold.write_text("", encoding="utf-8")
+                    out, err = a.communicate(timeout=180)
+                finally:
+                    if h is not None:
+                        k32.CloseHandle(h)
+                    hold.write_text("", encoding="utf-8")
+                    if a.poll() is None:
+                        a.kill()
+                self.assertEqual(a.returncode, 7, f"{out}\n{err}")
+                self.assertRegex(out, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_COMMIT sha={SHA_FIXTURE[:12]} staged=[0-9a-f]{{8}} stagedCommit={other} ")
+                self.assertIn("RESULT=STAGE_FAILED STEP=stagedBuildGuard EXIT=7", out)
+                self.assertEqual((self.cache / self.manifest_name).read_bytes(), expect, "another commit's build was replaced")
+
+    def test_r10_the_stage_guard_names_the_commit_from_the_judged_bytes_only(self) -> None:
+        # r10 (adversary A1 on 0b1fcfe2, sibling of AttrCudaArtifacts.psm1:399): between the judgement and the retirement the guard opens the manifest no more
+        # (r9 hashed, read and hashed it again: three opens a writer could interleave); its commit is the one Assert-AttrCudaBuildManifest's refusal names.
+        text = STAGE_GENERATOR.read_text(encoding="utf-8")
+        guard = text[text.index("if ($unsound -match '^ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ') {"):text.index("Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestCachePath")]
+        self.assertNotIn("$manifestCachePath)", guard.replace("$mismatchHead", ""))
+        self.assertNotIn("Get-ShaLower", guard)
+        self.assertNotIn("ReadAll", guard)
+        body = re.search(r"(?ms)^function Assert-AttrCudaBuildManifest \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
+        self.assertEqual(body.count("[IO.File]::ReadAll"), 1, "the manifest is read once")
+        self.assertIn("$manifestText = [IO.StreamReader]::new([IO.MemoryStream]::new($manifestBytes)", body)
+
+    def test_r12_g15_the_stage_guard_takes_the_declared_commit_as_data_never_from_the_message(self) -> None:
+        # r12 (Grok G15 on #814): r10 matched the COMMIT_MISMATCH message byte for byte against a copy of Assert's wording ($mismatchHead/$mismatchTail), so a
+        # wording drift on either side failed every COMMIT_MISMATCH closed (STAGE_REFUSED_STAGED_UNREADABLE) and wedged the sha. The declared commit is now
+        # data on the refusal (Exception.Data['declaredCommit']), and the guard reads it from there only.
+        text = STAGE_GENERATOR.read_text(encoding="utf-8")
+        guard = text[text.index("if ($unsound -match '^ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ') {"):text.index("Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestCachePath")]
+        self.assertNotIn("$unsoundRaw.Substring", guard)
+        self.assertIn("$cachedCommit = $declaredCommit", guard)
+        self.assertIn("$_.Exception.Data['declaredCommit']", text)
+        for declared in ("not-a-sha", "", SHA_FIXTURE[:12] + "1" * 28, "it's, expected 'x'"):
+            with self.subTest(declared=declared):
+                bj = self.tmp / f"g15-{len(declared)}.json"
+                bj.write_text(json.dumps({"sourceCommit": declared, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True}), encoding="utf-8")
+                p = self.run_with_module(
+                    f"try {{ Assert-AttrCudaBuildManifest -Path '{bj}' -ExpectedSha256 '{hashlib.sha256(bj.read_bytes()).hexdigest()}' -ExpectedSourceCommit '{SHA_FIXTURE}' | Out-Null; 'NO_THROW' }} "
+                    "catch { 'HAS=' + $_.Exception.Data.Contains('declaredCommit'); 'DATA=[' + $_.Exception.Data['declaredCommit'] + ']'; 'MSG=' + $_.Exception.Message }\n",
+                    name=f"g15-{len(declared)}.ps1")
+                self.assertIn("HAS=True", p.stdout, p.stdout + p.stderr)
+                self.assertIn(f"DATA=[{declared}]", p.stdout, p.stdout + p.stderr)
+                self.assertIn("MSG=ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ", p.stdout, p.stdout + p.stderr)
+
+    def test_r12_g15_this_names_own_corrupt_commit_is_replaced(self) -> None:
+        # r12 (Grok G15 (a) on #814): the replace path the r9 comment promises ("is replaced as before") had no behaviour test; only the refuse path did. A resident
+        # manifest whose sourceCommit is not a sha, is missing, or is a 40-hex of ANOTHER 12-hex prefix is this name's own corrupt build: exit 0, the new manifest in
+        # place, and never STAGE_REFUSED_STAGED_UNREADABLE.
+        for i, declared in enumerate(("not-a-sha", None, "f" * 40)):
+            with self.subTest(declared=declared):
+                for e in list(self.cache.iterdir()):
+                    shutil.rmtree(e) if e.is_dir() else e.unlink()
+                first = self.stage("ad005766", suffix=f"g15first{i}")
+                self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+                m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+                if declared is None:
+                    m.pop("sourceCommit")
+                else:
+                    m["sourceCommit"] = declared
+                (self.cache / self.manifest_name).write_text(json.dumps(m, indent=2), encoding="utf-8")
+
+                second = self.stage("f8fc75a2", suffix=f"g15repair{i}")
+
+                self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+                self.assertNotIn("STAGE_REFUSED_STAGED_UNREADABLE", second.stdout)
+                self.assertIn("ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH", second.stdout)
+                self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    # r24 (adversary pass-25 A1 on 63887a9c): PowerShell -eq/-ne/-ieq/-ine on strings are CULTURE comparisons that ignore U+200B and other format characters, so a manifest whose
+    # sourceCommit is a commit's 40 hex with a zero-width space in it compared EQUAL to that commit at every commit check; B was staged with such a manifest, and staging another
+    # commit with B's 12-hex cache name saw a "mismatch" whose declaration was not 40-hex plain, skipped the OTHER_COMMIT refusal and replaced B's build. A commit is compared
+    # ORDINALLY, and a declaration that is not plainly another prefix is refused, never replaced.
+    ZW = "​"
+
+    def _zw_declarations(self) -> dict:
+        return {"zwsp-after-the-prefix": SHA_FIXTURE[:12] + self.ZW + SHA_FIXTURE[12:],
+                "zwsp-inside-the-prefix": SHA_FIXTURE[:5] + self.ZW + SHA_FIXTURE[5:],
+                "zwsp-leading": self.ZW + SHA_FIXTURE,
+                "zwsp-trailing": SHA_FIXTURE + self.ZW,
+                "soft-hyphen": SHA_FIXTURE[:12] + "­" + SHA_FIXTURE[12:]}
+
+    def test_r24_a1_assert_compares_the_manifest_commit_ordinally(self) -> None:
+        for label, declared in self._zw_declarations().items():
+            with self.subTest(declared=label):
+                bj = self.tmp / f"r24-assert-{label}.json"
+                bj.write_text(json.dumps({"sourceCommit": declared, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True}), encoding="utf-8")
+                p = self.run_with_module(
+                    f"try {{ Assert-AttrCudaBuildManifest -Path '{bj}' -ExpectedSha256 '{hashlib.sha256(bj.read_bytes()).hexdigest()}' -ExpectedSourceCommit '{SHA_FIXTURE}' | Out-Null; 'NO_THROW' }} "
+                    "catch { 'HAS=' + $_.Exception.Data.Contains('declaredCommit'); 'MSG=' + $_.Exception.Message }\n",
+                    name=f"r24-assert-{label}.ps1")
+                self.assertNotIn("NO_THROW", p.stdout, f"a manifest declaring {label!r} compared EQUAL to the commit: {p.stdout}{p.stderr}")
+                self.assertIn("HAS=True", p.stdout, p.stdout + p.stderr)
+                self.assertIn("MSG=ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH ", p.stdout, p.stdout + p.stderr)
+        for label, declared in (("exact", SHA_FIXTURE), ("upper-case", SHA_FIXTURE.upper())):
+            with self.subTest(control=label):
+                bj = self.tmp / f"r24-assert-control-{label}.json"
+                bj.write_text(json.dumps({"sourceCommit": declared, "dllPairManifestSha256": "d" * 64, "pendingSymbolPresence": True}), encoding="utf-8")
+                p = self.run_with_module(
+                    f"try {{ Assert-AttrCudaBuildManifest -Path '{bj}' -ExpectedSha256 '{hashlib.sha256(bj.read_bytes()).hexdigest()}' -ExpectedSourceCommit '{SHA_FIXTURE}' | Out-Null; 'NO_THROW' }} "
+                    "catch { 'MSG=' + $_.Exception.Message }\n",
+                    name=f"r24-assert-control-{label}.ps1")
+                self.assertIn("NO_THROW", p.stdout, p.stdout + p.stderr)
+
+    def test_r24_a1_the_generator_refuses_a_build_manifest_whose_commit_only_culture_matches(self) -> None:
+        for label, declared in self._zw_declarations().items():
+            with self.subTest(declared=label):
+                build = self.tmp / f"r24-build-{label}"
+                staging = self.tmp / f"r24-staging-{label}"
+                staging.mkdir(parents=True)
+                names = _fake_build_dir(build, SHA_FIXTURE, rebuild_tag="ad005766")
+                manifest = json.loads((build / names["manifest"]).read_text(encoding="utf-8"))
+                manifest["sourceCommit"] = declared
+                (build / names["manifest"]).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                script = self.tmp / f"r24-generate-{label}.ps1"
+                script.write_text("$ErrorActionPreference = 'Stop'\n"
+                                  f"& '{STAGE_GENERATOR}' -SourceCommit '{SHA_FIXTURE}' -BuildDir '{build}' -OutDir '{staging}' -AgentRoot '{self.agent}' | ConvertTo-Json -Depth 5\n",
+                                  encoding="utf-8")
+                gen = _run_pwsh_file(script)
+                self.assertNotEqual(gen.returncode, 0, f"the generator accepted a build manifest declaring {label!r} as the commit: {gen.stdout}")
+                self.assertIn("does not match -SourceCommit", gen.stdout + gen.stderr)
+
+    def test_r24_a1_a_declaration_that_is_not_plainly_another_prefix_is_refused_never_replaced(self) -> None:
+        # A resident manifest whose declared commit is not a plain 40-hex but matches the incoming commit's 12-hex cache name (ordinally, or by culture once ignorable
+        # characters are dropped) is somebody's build under this name: STAGE_REFUSED_STAGED_OTHER_COMMIT, exit 7, the cache byte for byte. ("not-a-sha", an absent
+        # commit and a 40-hex of another prefix are still this name's own corrupt build: test_r12_g15_this_names_own_corrupt_commit_is_replaced.)
+        declarations = dict(self._zw_declarations())
+        declarations["zwsp-after-the-prefix-other-tail"] = SHA_FIXTURE[:12] + self.ZW + "1" * 28
+        declarations["zwsp-inside-the-prefix-other-tail"] = SHA_FIXTURE[:5] + self.ZW + SHA_FIXTURE[5:12] + "1" * 28
+        declarations["39-hex-same-prefix"] = SHA_FIXTURE[:12] + "1" * 27
+        declarations["the-prefix-alone"] = SHA_FIXTURE[:12]
+        for i, (label, declared) in enumerate(declarations.items()):
+            with self.subTest(declared=label):
+                for e in list(self.cache.iterdir()):
+                    shutil.rmtree(e) if e.is_dir() else e.unlink()
+                first = self.stage("ad005766", suffix=f"r24first{i}")
+                self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+                m = json.loads((self.cache / self.manifest_name).read_text(encoding="utf-8"))
+                m["sourceCommit"] = declared
+                (self.cache / self.manifest_name).write_text(json.dumps(m, indent=2), encoding="utf-8")
+                before = self.snapshot()
+
+                second = self.stage("f8fc75a2", suffix=f"r24second{i}")
+
+                self.assertEqual(second.returncode, 7, f"{label}: {second.stdout}\n{second.stderr}")
+                self.assertRegex(second.stdout, rf"(?m)^STAGE_REFUSED_STAGED_OTHER_COMMIT sha={SHA_FIXTURE[:12]} staged=[0-9a-f]{{8}} ")
+                self.assertEqual(self.snapshot(), before, f"{label}: a staged build under this name was replaced")
+
+    def test_r24_a1_no_commit_string_is_compared_by_culture_in_the_stage_chain(self) -> None:
+        # The class: -eq/-ne/-ieq/-ine on a string is a culture comparison, and so are -ceq/-cne (PowerShell 7: "d4bd...<U+200B>..." -ceq "d4bd..." is True; only the case
+        # is checked). Every commit compare in the stage chain is ordinal: [string]::Equals(..., Ordinal or OrdinalIgnoreCase), or (where the publish-write scanner
+        # allowlists no static) equal Length and an OrdinalIgnoreCase StartsWith.
+        tools = ROOT / "tools" / "profiling"
+        files = [tools / "bachelor" / "AttrCudaArtifacts.psm1", tools / "bachelor" / "playback-attr-3-cuda-stage-job.ps1", tools / "bachelor" / "playback-attr-3-cuda-assemble.ps1",
+                 tools / "bachelor" / "playback-attr-3-cuda-job.ps1", tools / "bachelor" / "reference-frame-runner-job.ps1",
+                 tools / "dual-venue" / "VenueChain.psm1", tools / "dual-venue" / "Invoke-VenueBaseline.ps1", tools / "dual-venue" / "Invoke-VenueStageNightly.ps1",
+                 tools / "dual-venue" / "Invoke-VenueLeaseBatch.ps1", tools / "dual-venue" / "VenueStageReuse.psm1", tools / "dual-venue" / "New-VenueFlavorPair.ps1"]
+        culture = re.compile(r"(?m)^(?!\s*#)[^\n]*?(?:(?:[sS]ourceCommit|ExpectedCommit|\$commit\b|\$cachedCommit|\$declaredCommit)(?!\.Length)[\w.\[\]()]*\s+-[ic]?(?:eq|ne)\b|-[ic]?(?:eq|ne)\s+\$(?:SourceCommit|ExpectedSourceCommit|ExpectedCommit|commit|cachedCommit)\b(?!\.Length))[^\n]*")
+        hits = [f"{f.name}:{text.count(chr(10), 0, m.start()) + 1}: {m.group(0).strip()[:140]}"
+                for f in files for text in [f.read_text(encoding="utf-8")] for m in culture.finditer(text)]
+        self.assertEqual(hits, [], "a commit string is compared by culture (it ignores U+200B and other format characters):\n" + "\n".join(hits))
+
+    def test_r24_a2_the_dll_pair_reuse_compares_the_declared_commit_and_job_id_ordinally(self) -> None:
+        # adversary pass-26 A2 (VenueStageReuse.psm1:84, pre-existing, same class as pass-25 A1): -cne is a culture comparison, so a reused DLL pair's manifest declaring the
+        # commit (or its job id) with a trailing U+200B read as the requested one and the pair was reused.
+        reuse = ROOT / "tools" / "profiling" / "dual-venue" / "VenueStageReuse.psm1"
+        job_id = f"playback-attr-3-cuda-dllpair-{SHA_FIXTURE[:12]}"
+
+        def reusable(tag: str, declared_commit: str, declared_job: str) -> str:
+            outbox = self.tmp / f"r24-outbox-{tag}"
+            (outbox / f"{job_id}.artifacts").mkdir(parents=True)
+            (outbox / f"{job_id}.result.json").write_text(json.dumps({"jobId": job_id, "exitCode": 0, "stdout": f"RESULT=DLL_PAIR_OK SOURCE={SHA_FIXTURE}\n"}), encoding="utf-8")
+            (outbox / f"{job_id}.artifacts" / "dll-pair-manifest.json").write_text(json.dumps({"sourceCommit": declared_commit, "jobId": declared_job}), encoding="utf-8")
+            script = self.tmp / f"r24-reuse-{tag}.ps1"
+            script.write_text(f"Import-Module '{reuse}' -Force\n(Get-DllPairReuse -Outbox '{outbox}' -JobId '{job_id}' -Sha '{SHA_FIXTURE}').Reusable\n", encoding="utf-8")
+            proc = _run_pwsh_file(script)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout.strip()
+
+        self.assertEqual(reusable("plain", SHA_FIXTURE, job_id), "True")
+        self.assertEqual(reusable("zwsp-commit", SHA_FIXTURE + self.ZW, job_id), "False", "a manifest declaring the commit with a U+200B was reused")
+        self.assertEqual(reusable("zwsp-job", SHA_FIXTURE, job_id + self.ZW), "False", "a manifest declaring the job id with a U+200B was reused")
+
+    def test_r9_the_stage_lock_is_one_for_every_sha_that_shares_the_cache_names(self) -> None:
+        # r9 fix iteration (adversary A1 on 9825bfd9): the lock was keyed on the full sha, so two commits with the same 12 hex (the same cache files) never
+        # contended; it is keyed on the 12 hex the cache names carry. Another 12 is another lock.
+        def lock_name(sha: str) -> str:
+            proc = self.run_with_module(f"(Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{sha}' -WaitSec 5).name\n", name=f"lock-{sha[:14]}.ps1")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout.strip()
+        a, b, c = lock_name(SHA_FIXTURE), lock_name(SHA_FIXTURE[:12] + "1" * 28), lock_name("e" + SHA_FIXTURE[1:])
+        self.assertRegex(a, r"^Global\\MlvAttrCudaStage-[0-9a-f]{64}$")
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_r14_a2_a_root_on_another_hosts_volume_is_refused_never_locked(self) -> None:
+        # r14 (adversary A2 on 5fe750fa, AttrCudaArtifacts.psm1:512): a Global\ mutex is host-local, so host B on Z: (mapped to host A's share) and host A on its
+        # local path each took "the" lock and both passed the absent-manifest guard. RED: both seamed calls below returned a held lock. A mapped drive (its
+        # DriveType is Network) and a root whose final volume is none of this host's fixed volumes (a link into a share) are refused, typed, before any lock.
+        def call(seam: str, name: str):
+            return self.run_with_module(
+                f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1 {seam}; 'HELD=' + $l.held }} "
+                "catch { 'REFUSED=' + $_.Exception.Message }\n", name=name)
+        # r14 fix iteration 1 (adversary A2 + A3 on f7408e9f): never by volume serial (A2: two hosts' volumes can share one; A3: a folder-mounted local volume has no
+        # drive letter to enumerate). The FINAL path by volume GUID name exists only for a volume mounted on this host, and that volume must be FIXED.
+        for seam, kind in (("-TestRootVolumeType Network", "Network"), ("-TestRootVolumeType NoLocalVolume", "NoLocalVolume"), ("-TestRootVolumeType Removable", "Removable")):
+            with self.subTest(seam=seam):
+                proc = call(seam, f"r14-a2-{kind}.ps1")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(f"REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is {kind}, not a local fixed volume",
+                              proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("HELD=", proc.stdout, proc.stdout + proc.stderr)
+        # the real probe, no seam: a root on this host's own fixed volume still takes its lock
+        proc = call("", "r14-a2-local.ps1")
+        self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
+        # the real probe on a REAL share handle: the same local directory reached through the loopback admin share (\\localhost\C$) is a handle on SMB, which has no
+        # volume GUID name, so it is refused (A2's input: a root another host reaches through a share). Skipped where the loopback share is not reachable.
+        agent = str(self.agent)
+        if re.match(r"^[A-Za-z]:\\", agent) and os.path.isdir(rf"\\localhost\{agent[0]}$" + agent[2:]):
+            unc = rf"\\localhost\{agent[0]}$" + agent[2:]
+            proc = self.run_with_module(
+                f"try {{ $l = Enter-AttrCudaStageLock -Root '{unc}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
+                name="r14-a2-unc.ps1")
+            self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r16_g23_a_root_that_cannot_be_opened_is_named_apart_from_a_share(self) -> None:
+        # r16 (Grok G23 on #814): a root CreateFileW could not open (an ACL, a sharing or AV hold) got the same "is NoLocalVolume" message as a share. Each failure now
+        # carries its own Win32 error; the refusal is the same. Here: an absent root (win32 2, ERROR_FILE_NOT_FOUND) and a root held open by another handle that shares
+        # nothing (win32 32, ERROR_SHARING_VIOLATION).
+        if os.name != "nt":
+            self.skipTest("the held case takes a share-none directory handle through kernel32")
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+
+        def call(root: Path, name: str):
+            return self.run_with_module(
+                f"try {{ $l = Enter-AttrCudaStageLock -Root '{root}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
+                name=name)
+        proc = call(self.agent / "absent", "r16-g23-absent.ps1")
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume (open failed, win32 2), not a local fixed volume",
+                      proc.stdout, proc.stdout + proc.stderr)
+        held = self.agent / "held"
+        held.mkdir()
+        h = k32.CreateFileW(str(held), 0x80000000, 0, None, 3, 0x02000000, None)
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value, ctypes.get_last_error())
+        try:
+            proc = call(held, "r16-g23-held.ps1")
+        finally:
+            k32.CloseHandle(h)
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume (open failed, win32 32), not a local fixed volume",
+                      proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r16_g23_a_root_with_no_volume_guid_path_names_its_win32_error(self) -> None:
+        # r16 (Grok G23 on #814): the second message. A handle on SMB (the loopback admin share) opens but has no volume GUID final path: "NoLocalVolume (no volume GUID
+        # path, win32 <n>)", never "open failed". Skipped where the loopback share is not reachable.
+        agent = str(self.agent)
+        unc = rf"\\localhost\{agent[0]}$" + agent[2:]
+        if not (re.match(r"^[A-Za-z]:\\", agent) and os.path.isdir(unc)):
+            self.skipTest("the loopback admin share is not reachable on this host")
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{unc}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
+            name="r16-g23-unc.ps1")
+        self.assertRegex(proc.stdout, r"REFUSED=ATTRCUDA_STAGE_ROOT_NOT_LOCAL the agent root's final volume, read through its links, is NoLocalVolume \(no volume GUID path, win32 [1-9]\d*\), not a local fixed volume",
+                         proc.stdout + proc.stderr)
+
+    def test_r16_a1_the_lock_returns_the_roots_final_path_and_keeps_its_handle(self) -> None:
+        # r16 (r14 OPEN A1): reached through a junction, the lock's .root is the physical root's drive-letter final path (the junction resolved), and the handle it
+        # holds counts in share accounting and shares no delete, so neither the root nor an ancestor of it can be renamed while the lock is held. RED on the first
+        # cut of r16 (FILE_READ_ATTRIBUTES only, which share modes never see): the root renamed under the lock.
+        anc = self.tmp / "anc"
+        root = anc / "root"
+        root.mkdir(parents=True)
+        alias = self.tmp.parent / (self.tmp.name + "-rootalias")
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(anc)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stdout + mk.stderr)
+        self.addCleanup(lambda: os.rmdir(alias) if os.path.lexists(alias) else None)
+        proc = self.run_with_module(
+            f"$l = Enter-AttrCudaStageLock -Root '{alias / 'root'}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1\n"
+            "'ROOT=' + $l.root\n'OPEN=' + (-not $l.rootHandle.IsInvalid -and -not $l.rootHandle.IsClosed)\n"
+            f"try {{ Rename-Item -LiteralPath '{root}' -NewName 'root-renamed'; 'ROOT_RENAMED' }} catch {{ 'ROOT_RENAME_REFUSED' }}\n"
+            f"try {{ Rename-Item -LiteralPath '{anc}' -NewName 'anc-renamed'; 'ANCESTOR_RENAMED' }} catch {{ 'ANCESTOR_RENAME_REFUSED' }}\n"
+            "New-Item -ItemType Directory -Path (Join-Path $l.root 'cache') | Out-Null; 'CHILD_CREATED'\n",
+            name="r16-a1-root.ps1")
+        self.assertIn(f"ROOT={root}\n", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
+        self.assertIn("OPEN=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("ROOT_RENAME_REFUSED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("ANCESTOR_RENAME_REFUSED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("CHILD_CREATED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertTrue((root / "cache").is_dir())
+
+    def test_r21_a1_a_volume_with_no_drive_letter_path_is_refused_not_bound_through_its_mount_folder(self) -> None:
+        # r21 (pass-22 A1; sol blocker 1 on d59e9bb7; supersedes r16 fix iterations 1+2, which bound such a root through the volume's first mount folder): a root on a
+        # volume with no drive letter (no VOLUME_NAME_DOS final path) was bound through a mount-folder PATHNAME, so a remount after the identity check moved every
+        # later open to another volume. It is refused at the lock step, typed (the stage job exits 7 on any lock throw), nothing locked and nothing written.
+        # -TestNoDosPath drops the drive-letter answer on this host's own volume, so the folder-mount shape is reached here with no real remount. RED: HELD=True.
+        # Production roots are drive-letter paths (C:\mlvtmp\mlv-agent on Bachelor, G:\Temp\mlv-gpu-profile\agent on Ultra-Magnus): the no-seam row still locks.
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1 -TestNoDosPath; 'HELD=' + $l.held; 'ROOT=' + $l.root }} "
+            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r21-a1.ps1")
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_FOLDER_MOUNT_REFUSED the agent root's volume has no drive-letter path", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("HELD=", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("ROOT=", proc.stdout, proc.stdout + proc.stderr)
+        # the mount-folder binding is gone, not merely unreached
+        body = re.search(r"(?ms)^function Enter-AttrCudaStageLock \{.*?^\}", MODULE.read_text(encoding="utf-8")).group(0)
+        self.assertNotIn("GetVolumePathNamesForVolumeNameW", body)
+        self.assertNotIn("$firstMount", body)
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held + ' ROOT=' + $l.root }} "
+            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r21-a1-drive-letter.ps1")
+        self.assertIn(f"HELD=True ROOT={self.agent}", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
+
+    def test_r16_fix1_a3_a_root_whose_plain_path_names_another_directory_is_refused(self) -> None:
+        # r16 fix iteration 1 (adversary A3 on 4118843c, AttrCudaArtifacts.psm1:570): the lock held \\?\...\stage.\agent (a trailing dot only the extended form keeps),
+        # but '\\?\' was dropped from the bound path and every later open normalized it to ...\stage\agent, ANOTHER directory, which the job then wrote under this
+        # lock. The bound path must reach the very object the handle holds; here it cannot, so the root is refused. RED: HELD=True with the other directory's path.
+        dotted = "\\\\?\\" + str(self.tmp) + "\\stage.\\agent"
+        os.makedirs(dotted)
+        (self.tmp / "stage" / "agent").mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, "\\\\?\\" + str(self.tmp) + "\\stage.", True)
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{dotted}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held + ' ROOT=' + $l.root }} "
+            "catch { 'REFUSED=' + $_.Exception.Message }\n", name="r16-fix1-a3.ps1")
+        self.assertIn("REFUSED=ATTRCUDA_STAGE_ROOT_UNRESOLVED the agent root's final path", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("HELD=", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r16_fix1_a2_a_drive_root_agent_root_contains_its_own_children(self) -> None:
+        # r16 fix iteration 1 (adversary A2 on 4118843c, stage job :243; siblings the fixture, smoke-runner, reference-frame and dll jobs): rebound to a junction's
+        # drive-root target (D:\), Assert-UnderAgentRoot required the prefix 'D:\\' and refused D:\cache, so a valid stage exited 7. RED: every one refused.
+        for gen in (STAGE_GENERATOR, ROOT / "tools/profiling/bachelor/attr3-stage-fixture-job.ps1", ROOT / "tools/profiling/bachelor/attr3-stage-smoke-runner-job.ps1",
+                    ROOT / "tools/profiling/bachelor/reference-frame-runner-job.ps1", ROOT / "tools/profiling/ultramagnus/playback-attr-3-cuda-dll-job.ps1"):
+            with self.subTest(gen=gen.name):
+                fn = re.search(r"(?ms)^function Assert-UnderAgentRoot\(.*?^\}", gen.read_text(encoding="utf-8")).group(0)
+                probe = self.tmp / f"r16-fix1-a2-{gen.stem}.ps1"
+                probe.write_text(fn + "\n$AgentRoot = 'D:\\'\ntry { Assert-UnderAgentRoot 'D:\\cache' 'Cache'; 'INSIDE' } catch { 'REFUSED' }\n"
+                                 "try { Assert-UnderAgentRoot 'E:\\cache' 'Cache'; 'INSIDE' } catch { 'REFUSED' }\n", encoding="utf-8")
+                proc = _run_pwsh_file(probe)
+                self.assertEqual(proc.stdout.split(), ["INSIDE", "REFUSED"], proc.stdout + proc.stderr)
+
+    def test_r14_fix2_a2_a_long_local_root_still_takes_its_lock(self) -> None:
+        # r14 fix iteration 2 (adversary A2 on 6882c873, AttrCudaArtifacts.psm1:526): the volume check's CreateFileW got the root unprefixed, so a 260+ character
+        # local root (Win32 long-path opt-in off) read as NoLocalVolume and the stage exited 7. The extended-length prefix is added from 240 characters, as
+        # Get-AttrCudaFileId adds it. NOT RED on a host with LongPathsEnabled=1 (pwsh is long-path aware there); a regression pin for the long form everywhere.
+        long_root = str(self.agent) + "\\" + "\\".join(["a" * 50] * 5) + "\\agent"
+        self.assertGreater(len(long_root), 260)
+        os.makedirs("\\\\?\\" + long_root, exist_ok=True)
+        # removed through the extended-length form, so the temp root's own cleanup never meets a long path
+        self.addCleanup(shutil.rmtree, "\\\\?\\" + str(self.agent) + "\\" + "a" * 50, True)
+        proc = self.run_with_module(
+            f"try {{ $l = Enter-AttrCudaStageLock -Root '{long_root}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held }} catch {{ 'REFUSED=' + $_.Exception.Message }}\n",
+            name="r14-fix2-a2-long.ps1")
+        self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r21_a3_a_long_root_that_is_long_only_because_of_dot_segments_is_accepted_like_its_canonical_spelling(self) -> None:
+        # r21 (pass-20 A1; sol blocker 3 on d59e9bb7, AttrCudaArtifacts.psm1:545-552): a root of 240+ characters that is long ONLY because of '.\' segments got the
+        # '\\?\' prefix on the UNREDUCED text, and the extended-length form does no dot-segment reduction, so CreateFileW read it as absent and the lock refused
+        # ATTRCUDA_STAGE_ROOT_NOT_LOCAL (NoLocalVolume, open failed). The path is reduced with GetFullPath before the length test and the prefix. RED: REFUSED.
+        real = self.agent / "dotted-real"
+        real.mkdir()
+        dotted = str(self.agent) + "\\" + ".\\" * 130 + "dotted-real"
+        self.assertGreater(len(dotted), 260)
+        for label, root in (("canonical", str(real)), ("dot segments", dotted)):
+            with self.subTest(root=label):
+                proc = self.run_with_module(
+                    f"try {{ $l = Enter-AttrCudaStageLock -Root '{root}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1; 'HELD=' + $l.held + ' ROOT=' + $l.root }} "
+                    "catch { 'REFUSED=' + $_.Exception.Message }\n", name=f"r21-a3-{label.split()[0]}.ps1")
+                self.assertIn(f"HELD=True ROOT={real}", proc.stdout.replace("\r\n", "\n"), proc.stdout + proc.stderr)
+
+    def test_r20_a2_a_contended_wait_in_seconds_that_overflows_int32_milliseconds_returns_a_typed_result(self) -> None:
+        # r20 (adversary pass 21 A2 on f28b4f7e, AttrCudaArtifacts.psm1:619): a contended wait did $mutex.WaitOne($WaitSec * 1000). An accepted -WaitSec of 2147484
+        # or more is 2147484000+ ms, past Int32, so the native wait refused the argument and the call THREW instead of answering held=false/true; a negative one
+        # threw the same way (only -1 is a valid negative timeout, and it means "forever"). RED: REFUSED=... for every row below. The wait is clamped to
+        # [0, Int32.MaxValue] ms and the typed held/waited result is kept. Production passes 1800, so its behaviour is unchanged.
+        holders: list[subprocess.Popen] = []
+
+        def hold(seconds: int, tag: str) -> subprocess.Popen:
+            # the previous row's holder (still asleep when its call threw, i.e. when RED) never leaks its lock into this row
+            for old in holders:
+                old.kill()
+                old.communicate()
+            holders.clear()
+            marker = self.tmp / f"r20-a2-{tag}.held"
+            holder = self.tmp / f"r20-a2-holder-{tag}.ps1"
+            holder.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{MODULE}' -Force\n"
+                f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+                f"$l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec 1\n"
+                "if (-not $l.held) { 'NOT_HELD'; exit 3 }\n"
+                f"[IO.File]::WriteAllText('{marker}', 'x')\n"
+                f"Start-Sleep -Seconds {seconds}\n", encoding="utf-8")
+            proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(holder)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            holders.append(proc)
+            self.addCleanup(lambda: (proc.kill(), proc.communicate()))
+            for _ in range(600):
+                if marker.exists() or proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            self.assertTrue(marker.exists(), f"the holder never took the lock (exit {proc.poll()})")
+            return proc
+
+        def call(wait: str, name: str):
+            return self.run_with_module(
+                f"try {{ $l = Enter-AttrCudaStageLock -Root '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -WaitSec {wait}; 'HELD=' + $l.held + ' WAITED=' + $l.waited }} "
+                "catch { 'REFUSED=' + $_.Exception.Message }\n", name=name)
+        # too long for Int32 ms: the holder ends after ten seconds (its abandoned mutex is taken over), so the wait ends with the lock held
+        # (-WaitSec is [int], so a value past Int32 is already refused at parameter binding, before any lock: not a row here)
+        # r21 (pass-22 A2; sol blocker 2 on d59e9bb7): 2147483 s is 2147483000 ms, which fits Int32, so it is the LAST unclamped value (the threshold was -ge). The
+        # wait the lock announces (STAGE_LOCK_WAIT ... waiting up to <n> s) is the clamped one: 2147483 for 2147483, 2147483.647 (Int32.MaxValue ms) past it.
+        for wait, tag, announced in (("2147483", "last-fit", "2147483"), ("2147484", "first-over", "2147483.647"), ("2147483647", "int-max", "2147483.647")):
+            with self.subTest(wait=wait):
+                hold(10, tag)
+                proc = call(wait, f"r20-a2-{tag}.ps1")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("HELD=True", proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("REFUSED=", proc.stdout, proc.stdout + proc.stderr)
+                self.assertRegex(proc.stdout, rf"STAGE_LOCK_WAIT \S+ \S+ waiting up to {re.escape(announced)} s \(", proc.stdout + proc.stderr)
+        # a negative wait is "do not wait": busy -> held=false, typed, no throw (the holder is still alive)
+        with self.subTest(wait="-5"):
+            hold(30, "negative")
+            proc = call("-5", "r20-a2-negative.ps1")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("HELD=False WAITED=True", proc.stdout, proc.stdout + proc.stderr)
+            self.assertNotIn("REFUSED=", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_a_manifest_a_lease_batch_pinned_still_reads_as_its_pin_after_a_second_stage(self) -> None:
+        # The batch's own guard (Invoke-VenueLeaseBatch.ps1:1258 / :1393) reads Get-VenueStagedBuildManifest and compares it to the
+        # sha256 its plan pinned when the lease opened; any other answer is BUILD_MANIFEST_MISMATCH.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        pin = self.manifest_sha()
+
+        self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        proc = self.run_with_module(
+            f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+            f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+            "Write-Output ('STATE=' + $s.state + ' SHA=' + $s.sha256 + ' CONTENT=[' + $s.contentProblem + '] ARTIFACT=[' + $s.artifactProblem + ']')\n",
+            name="pin.ps1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"STATE=STAGED SHA={pin} CONTENT=[] ARTIFACT=[]", proc.stdout)
+
+    def test_a_second_stage_with_the_same_manifest_reuses_it_and_writes_nothing(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        staged, before = self.manifest_sha(), self.snapshot()
+
+        second = self.stage("ad005766", suffix="again")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertRegex(second.stdout, rf"(?m)^STAGE_REUSED_EXISTING sha={SHA_FIXTURE[:12]} manifest={staged[:8]} ")
+        self.assertRegex(second.stdout, rf"(?m)^RESULT=STAGE_OK SOURCE={SHA_FIXTURE} ")
+        self.assertEqual(self.snapshot(), before, "a reuse rewrote the cache")
+        self.assertEqual(list(self.inbox.iterdir()), [], "the reused inputs were left in the inbox")
+
+    def test_a_staged_build_that_is_not_sound_is_replaced(self) -> None:
+        # A build.json whose artifacts are gone is not a build any leg can run (BUILD_ARTIFACT_MISSING), so it does not wedge the sha.
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        (self.cache / f"MLVApp-playback-attr-3-cuda-{SHA_FIXTURE[:12]}.exe").unlink()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_a_readable_staged_build_json_no_parser_accepts_is_replaced(self) -> None:
+        # r7 (adversary A1 on ef28cd37): ConvertFrom-Json throws InvalidOperationException (not ArgumentException) on keys that differ only by case,
+        # which the guard's content allowlist did not name, so a readable but unparseable cached build.json was STAGE_REFUSED_STAGED_UNREADABLE
+        # (exit 7) and wedged the sha. Every parse failure is the leg job's content refusal (ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE): replaced.
+        # (A key repeated exactly parses, last value wins, so it reaches the content checks: COMMIT_MISMATCH, already replaced.)
+        cases = (("keys differing only by case", b'{"x":1,"X":2}'), ("not JSON", b"{ this is not json"))
+        for i, (label, payload) in enumerate(cases):
+            with self.subTest(case=label):
+                for e in list(self.cache.iterdir()):
+                    shutil.rmtree(e) if e.is_dir() else e.unlink()
+                first = self.stage("ad005766", suffix=f"first{i}")
+                self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+                (self.cache / self.manifest_name).write_bytes(payload)
+
+                second = self.stage("f8fc75a2", suffix=f"repair{i}")
+
+                self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+                self.assertNotIn("STAGE_REFUSED_STAGED_UNREADABLE", second.stdout)
+                self.assertIn("ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE", second.stdout)
+                self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_a_staged_build_the_leg_job_accepts_is_sound_whatever_the_case_of_its_commit(self) -> None:
+        # adversary A1 (b47fcfbc): the stage and leg jobs compare sourceCommit case-insensitively, so an upper-case one is a build legs run
+        # and a lease can pin; it must be protected exactly like any other.
+        first = self.stage("ad005766", mutate=lambda m: m.update(sourceCommit=SHA_FIXTURE.upper()))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        before = self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="fsgap202611131829")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("STAGE_REFUSED_STAGED_OTHER_MANIFEST", second.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_claim_the_leg_job_reads_through_member_enumeration_is_sound(self) -> None:
+        # adversary A1 (72577e87): the leg job reads $buildManifest.exe.sha256, so an exe claim held in a one-element array is accepted there
+        # (and by the generator and the job's own binding); the guard reads it the same way and protects that build.
+        first = self.stage("ad005766", mutate=lambda m: m.update(exe=[m["exe"]]))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        before = self.snapshot()
+
+        second = self.stage("f8fc75a2", suffix="again")
+
+        self.assertEqual(second.returncode, 7, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("STAGE_REFUSED_STAGED_OTHER_MANIFEST", second.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    # r3 (adversary A1 on ce5a0380): ONE table of claim shapes, fed to every reader of a cached build's artifact claim. Accept-set equality:
+    # the shared predicate, the leg job's own $manifestChecks text, the stage job's host guard and the share read (Get-VenueStagedBuildManifest,
+    # which the nightly and the lease batch decide on) all say the same thing for every row.
+    CLAIM_SHAPES = (
+        ("one object", lambda m: None, "accept"),
+        ("a one-element array of the object", lambda m: m.update(exe=[m["exe"]]), "accept"),
+        ("a nested singleton digest [[hex]]", lambda m: m["exe"].update(sha256=[[m["exe"]["sha256"]]]), "refuse"),
+        ("a singleton digest [hex]", lambda m: m["exe"].update(sha256=[m["exe"]["sha256"]]), "refuse"),
+        ("two claims", lambda m: m.update(exe=[m["exe"], m["exe"]]), "refuse"),
+    )
+
+    def leg_manifest_check_text(self) -> str:
+        """The leg job's own claim check, verbatim from the generator ($manifestChecks through the verified trace line)."""
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        m = re.search(r"(?ms)^\$manifestChecks = @\(.*?^Write-JobTrace 'step build-manifest-artifacts-verified'", text)
+        self.assertIsNotNone(m, "the leg job's $manifestChecks block moved")
+        return m.group(0)
+
+    def readers_verdicts(self, names: dict) -> dict:
+        """predicate / leg / share verdicts for the build in the cache, in one pwsh."""
+        bj = self.cache / self.manifest_name
+        proc = self.run_with_module(
+            f"Import-Module '{self.VENUE_CHAIN}' -Force -DisableNameChecking\n"
+            f"$bj = '{bj}'\n"
+            "$m = [IO.File]::ReadAllText($bj) | ConvertFrom-Json\n"
+            "'PREDICATE=' + $(if (@('packageZip', 'exe', 'dll' | Where-Object { -not (Get-AttrCudaBuildManifestClaimSha256 $m $_) }).Count -eq 0) { 'accept' } else { 'refuse' })\n"
+            f"$Cache = '{self.cache}'; $BasePackageZip = '{names['packageZip']}'; $ExeName = '{names['exe']}'; $ReconName = '{names['dll']}'; $buildManifestName = '{self.manifest_name}'\n"
+            "function Get-Sha([string]$Path, [string]$Label) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant() }\n"
+            "function Write-JobTrace([string]$Text) { }\n"
+            f"$buildManifest = Assert-AttrCudaBuildManifest -Path $bj -ExpectedSha256 ((Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant()) -ExpectedSourceCommit '{SHA_FIXTURE}'\n"
+            # r27 (A1): the leg block now re-authenticates the manifest last, through the job's own three names; bind them to the same build.json
+            f"$buildManifestPath = $bj; $BuildManifestSha256 = (Get-FileHash -LiteralPath $bj -Algorithm SHA256).Hash.ToLowerInvariant(); $SourceCommit = '{SHA_FIXTURE}'\n"
+            "$leg = try { & {\n" + self.leg_manifest_check_text() + "\n}; 'accept' } catch { 'refuse' }\n"
+            "'LEG=' + $leg\n"
+            f"$s = Get-VenueStagedBuildManifest -AgentShare '{self.agent}' -SourceCommit '{SHA_FIXTURE}' -VerifyArtifacts\n"
+            "'SHARE=' + $(if ($s.state -ceq 'STAGED' -and $s.contentProblem -ceq '' -and $s.artifactProblem -ceq '') { 'accept' } else { 'refuse' })\n",
+            name="readers.ps1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return dict(re.findall(r"(?m)^(PREDICATE|LEG|SHARE)=(\w+)\s*$", proc.stdout))
+
+    def test_every_reader_of_a_cached_claim_accepts_exactly_the_same_shapes(self) -> None:
+        first = self.stage("ad005766")
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+        good = {e.name: e.read_bytes() for e in self.cache.iterdir()}
+        names = _fake_build_dir(self.tmp / "names-only", SHA_FIXTURE)
+        seen = {}
+        for i, (label, mutate, expected) in enumerate(self.CLAIM_SHAPES):
+            for e in self.cache.iterdir():
+                e.unlink()
+            for n, b in good.items():
+                (self.cache / n).write_bytes(b)
+            manifest = json.loads(good[self.manifest_name].decode("utf-8"))
+            mutate(manifest)
+            (self.cache / self.manifest_name).write_text(json.dumps(manifest), encoding="utf-8")
+            verdicts = self.readers_verdicts(names)
+            staged = self.manifest_sha()
+            # the host guard: a sound staged build is never replaced (exit 7); an unsound one is replaced by the incoming stage (exit 0)
+            second = self.stage("f8fc75a2", suffix=f"shape{i}")
+            guard = {7: "accept", 0: "refuse"}.get(second.returncode, f"exit {second.returncode}")
+            if guard == "accept":
+                self.assertEqual(self.manifest_sha(), staged, f"{label}: a refused stage changed the cache")
+            verdicts["GUARD"] = guard
+            seen[label] = verdicts
+        expected = {label: {k: want for k in ("PREDICATE", "LEG", "SHARE", "GUARD")} for label, _, want in self.CLAIM_SHAPES}
+        self.maxDiff = None
+        self.assertEqual(seen, expected)
+
+    def test_every_claim_reader_calls_the_one_predicate(self) -> None:
+        # the leg job, the reference-frame runner and the stage job read a claim's digest only through Get-AttrCudaBuildManifestClaimSha256 (embedded
+        # verbatim), and VenueChain's share read runs the same text; the nightly and the lease batch decide only on that share read.
+        bachelor = ROOT / "tools" / "profiling" / "bachelor"
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        for path in (ATTRIBUTION_GENERATOR, bachelor / "reference-frame-runner-job.ps1", STAGE_GENERATOR, self.VENUE_CHAIN,
+                     dv / "Invoke-VenueStageNightly.ps1", dv / "Invoke-VenueLeaseBatch.ps1"):
+            text = "\n".join(l for l in path.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#"))
+            self.assertEqual(re.findall(r"(?:packageZip|exe|dll|\$k|\(\$check\[0\]\)|\$claim)\)?\.sha256\b", text), [], f"{path.name} reads a claim digest by member access")
+        for path in (ATTRIBUTION_GENERATOR, bachelor / "reference-frame-runner-job.ps1", STAGE_GENERATOR):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("'Get-AttrCudaBuildManifestClaimSha256'", text, f"{path.name} does not embed the predicate")
+        self.assertIn("Get-AttrCudaBuildManifestClaimSha256", self.VENUE_CHAIN.read_text(encoding="utf-8"))
+
+    def test_a_staged_build_the_leg_job_refuses_for_its_dll_pair_binding_is_replaced(self) -> None:
+        # adversary A3 (b47fcfbc): Assert-AttrCudaBuildManifest refuses a build.json with no dllPairManifestSha256 (DLLPAIR_UNBOUND), so no leg can
+        # run it; a corrected stage must be able to replace it, not be refused.
+        first = self.stage("ad005766", mutate=lambda m: m.pop("dllPairManifestSha256"))
+        self.assertEqual(first.returncode, 0, f"{first.stdout}\n{first.stderr}")
+
+        second = self.stage("f8fc75a2", suffix="repair")
+
+        self.assertEqual(second.returncode, 0, f"{second.stdout}\n{second.stderr}")
+        self.assertIn("DLLPAIR_UNBOUND", second.stdout)
+        self.assertEqual(self.manifest_sha(), hashlib.sha256((self.tmp / "build-f8fc75a2" / self.manifest_name).read_bytes()).hexdigest())
+
+    def test_r22_the_test_only_hold_never_sleeps_past_its_max_sec(self) -> None:
+        # r22 (VENUE-STAGE-TEST-HOLD-DEADLINE-1, sol r21 hardening, AttrCudaArtifacts.psm1:637-640): the last 100 ms sleep is cut to what is left of -MaxSec, so the hold returns by -MaxSec
+        # (a stopwatch cannot pin a 100 ms overshoot on a loaded host, so the clamp is pinned in the function's own text and the behaviour by its coarse bound and its marker)
+        text = MODULE.read_text(encoding="utf-8")
+        body = text[text.index("function Wait-AttrCudaTestHold"):text.index("function Get-AttrCudaGitBlobHashFromBytes")]
+        self.assertIn("$napMs = [int](($MaxSec - $clock.Elapsed.TotalSeconds) * 1000.0); if ($napMs -gt 100) { $napMs = 100 }", body)
+        self.assertIn("Start-Sleep -Milliseconds $napMs", body)
+        self.assertNotIn("Start-Sleep -Milliseconds 100", body)
+        hold = self.tmp / "never-created.flag"
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$t = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"Wait-AttrCudaTestHold -Path '{hold}' -MaxSec 1\n"
+                  "[Console]::Out.WriteLine($t.Elapsed.TotalSeconds.ToString('0.000', [Globalization.CultureInfo]::InvariantCulture))\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(Path(str(hold) + ".reached").exists(), "the hold did not mark that it was reached")
+        self.assertGreaterEqual(float(out.stdout.strip().splitlines()[-1]), 0.95, out.stdout)
+        self.assertLess(float(out.stdout.strip().splitlines()[-1]), 5.0, out.stdout)
+
+    def test_r27_a_manifest_retired_during_the_artifact_hashes_is_refused_by_both_readers(self) -> None:
+        # r27 (adversary pass-29 A1 on 7f1886f1, playback-attr-3-cuda-job.ps1:2605 + sibling reference-frame-runner-job.ps1:495): a reader authenticated M0,
+        # then a repairing stager retired build.json and renamed the repaired artifacts in while the reader hashed them; the reader recorded
+        # artifacts-verified / buildVerify=0 with no build.json present. Each job's REAL verification block runs here with its hash call retiring the manifest
+        # at the first artifact hash: the block must refuse (it re-authenticates the manifest last).
+        for job, start, end in (
+            (ATTRIBUTION_GENERATOR, "$buildManifest = Assert-AttrCudaBuildManifest -Path $buildManifestPath",
+             "Write-JobTrace 'step build-manifest-artifacts-verified'"),
+            (ROOT / "tools" / "profiling" / "bachelor" / "reference-frame-runner-job.ps1",
+             "$buildManifest = Assert-AttrCudaBuildManifest -Path (Join-Path $Cache $BuildManifestName)",
+             "} catch {\n    Complete-Failed 208 'buildVerify'"),
+        ):
+            with self.subTest(job=job.name):
+                out = _run_manifest_retired_mid_read(job.read_text(encoding="utf-8"), start, end, self.tmp / job.stem)
+                self.assertNotEqual(out.returncode, 0, f"{job.name} verified its artifacts after build.json was retired:\n{out.stdout}{out.stderr}")
+                self.assertIn("BUILD_MANIFEST_RETIRED_FIXTURE", out.stdout + out.stderr)
+
+
+def _run_manifest_retired_mid_read(job_text: str, start: str, end: str, work: Path) -> "subprocess.CompletedProcess[str]":
+    """Run a job's manifest + artifact verification block (start inclusive, end exclusive) with the first artifact hash retiring build.json (r27 A1)."""
+    text = job_text.replace("\r\n", "\n")
+    block = text[text.index(start):text.index(end, text.index(start))]
+    work.mkdir(parents=True, exist_ok=True)
+    cache = work / "cache"
+    cache.mkdir(exist_ok=True)
+    for leaf in ("build.json", "pkg.zip", "app.exe", "recon.dll"):
+        (cache / leaf).write_bytes(b"x")
+    harness = (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$Cache = '{cache}'\n"
+        "$BuildManifestName = 'build.json'; $buildManifestName = 'build.json'; $buildManifestPath = Join-Path $Cache 'build.json'\n"
+        "$BuildManifestSha256 = 'a' * 64; $SourceCommit = 'b' * 40\n"
+        "$BasePackageZip = 'pkg.zip'; $PackageZipName = 'pkg.zip'; $ExeName = 'app.exe'; $ReconName = 'recon.dll'\n"
+        "function Assert-AttrCudaBuildManifest { param($Path, $ExpectedSha256, $ExpectedSourceCommit)\n"
+        "    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw \"BUILD_MANIFEST_RETIRED_FIXTURE $Path\" }\n"
+        "    [pscustomobject]@{ pendingSymbolPresence = $true; dllPairManifestSha256 = 'c' * 64 } }\n"
+        "function Get-AttrCudaBuildManifestClaimSha256 { param($Manifest, $Label) 'd' * 64 }\n"
+        "function Invoke-RetireFixture { $p = Join-Path $Cache 'build.json'; if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force } }\n"
+        "function Get-Sha { param($Path, $Step) Invoke-RetireFixture; ('d' * 64).ToUpperInvariant() }\n"
+        "function Get-ShaLower { param($Path) Invoke-RetireFixture; 'd' * 64 }\n"
+        + block + "\n[Console]::Out.WriteLine('VERIFIED_WITHOUT_MANIFEST')\n"
+    )
+    script = work / "harness.ps1"
+    script.write_text(harness, encoding="utf-8")
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
 
 
 # --------------------------------------------------------------------------------------------

@@ -166,6 +166,20 @@ _IN_MEMORY = "in-memory object or buffer only; no file, process or registry acce
 _TYPE_NAME = "reads the exception's type name inside a catch block to report it; nothing is reflected into or invoked"
 _LOCAL_BLOCK = "invokes a script block bound to a local variable in this same body, so the block's text is inside the scanned body"
 
+# ---- VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r3 (adversary A3 on ce5a0380): the stage lock and its test-only seams ----
+_allow("Enter-AttrCudaStageLock",
+       "named stage lock (kernel mutex, no file) on the root's physical id and the sha; Write-Host prints STAGE_LOCK_WAIT to job stdout before a busy wait (r4 G5); "
+       "WriteAllText only for test-only -WaitMarkerPath",
+       ("R4", "Threading.Mutex::new", 1), ("R4", "IO.File::WriteAllText", 1), ("R1", "Write-Host", 1))
+_allow("Enter-AttrCudaStageLock",
+       "r14 A2/r16 A1: opens the root ONCE (list+read-attributes, no share-delete, kept open); reads its id, GUID and drive-letter final paths and drive type; nothing written",
+       ("R1", "Add-Type", 1), ("R4", "AttrCudaWin32.StageRootVolumeNative::CreateFileW", 1), ("R4", "Text.StringBuilder::new", 2),
+       ("R4", "AttrCudaWin32.StageRootVolumeNative::GetFinalPathNameByHandleW", 2), ("R4", "AttrCudaWin32.StageRootVolumeNative::GetDriveTypeW", 1),
+       ("R4", "AttrCudaWin32.FileIdNative+FileIdInfo::new", 1), ("R4", "AttrCudaWin32.FileIdNative::GetFileInformationByHandle", 1))
+_allow("Wait-AttrCudaTestHold",
+       "test-only seam: writes '<Path>.reached' only when a test passed -Path; production passes none and the body returns before it",
+       ("R4", "IO.File::WriteAllText", 1))
+
 # ---- the runtime WRITE / DELETE boundary: every raw write or delete lives here, behind a slot or ownership proof ----
 _allow("Assert-AttrCudaWritableFileSlot",
        "replace-in-place of a fixed derived publish name: removes the stale plain FILE in the slot after refusing a directory, a reparse point and a multi-link file",
@@ -244,6 +258,9 @@ _allow("Open-AttrCudaReadOnlyHandle",
 _allow("Publish-AttrCudaBoundedTextCopy",
        "reads the tail of -Source (File.Open Open/Read); the bounded text is then published through Publish-AttrCudaText, never written here",
        ("R1", "New-Object byte[]", 1), ("R4", "IO.File::Open", 1))
+_allow("Assert-AttrCudaBuildManifest",
+       "r10/r12: decodes the manifest bytes already read and hashed (a MemoryStream), opens no file; its COMMIT_MISMATCH is an in-memory InvalidOperationException with the commit in Data",
+       ("R4", "IO.StreamReader::new", 1), ("R4", ".ReadToEnd()", 1), ("R4", "InvalidOperationException::new", 1))
 _allow("Read-AttrCudaOwnedJournal",
        "reads the creator journal (File.Open Open/Read, ReadWrite share) through a StreamReader; read-only",
        ("R4", "IO.File::Open", 1), ("R4", "IO.StreamReader::new", 1))

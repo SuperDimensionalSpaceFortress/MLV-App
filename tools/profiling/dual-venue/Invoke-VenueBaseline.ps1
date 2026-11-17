@@ -56,7 +56,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
-    [ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit = '',
+    [ValidatePattern('^[0-9a-f]{40}\z')][string]$SourceCommit = '',
     [ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256 = '',
     [string]$TrendFile = '',
     [string]$RunDir = '',
@@ -102,6 +102,8 @@ function Stop-Baseline([string]$Reason, [string]$Detail) {
         $r = [ordered]@{ schema = 'mlv-app/venue-baseline-result/v1'; venue = $Venue; exitCode = $code; reason = $Reason; detail = $Detail; startedUtc = $startedUtc.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o') }
         try { [IO.File]::WriteAllText((Join-Path $script:RunDirResolved 'baseline-result.json'), ($r | ConvertTo-Json -Compress -Depth 6)) } catch { }
     }
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A2 sibling): a by-name read given up on is a live foreground thread the host would wait for at exit; end now.
+    Complete-VenueProcess -ExitCode $code
     exit $code
 }
 
@@ -114,6 +116,8 @@ function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [int]$Sec) {
     $async = $ps.BeginInvoke()
     if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($Sec))) {
         try { [void]$ps.BeginStop($null, $null) } catch { }
+        # r2 (A2 sibling): counted, so Complete-VenueProcess ends the process at exit instead of waiting for this worker
+        & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
         return [pscustomobject]@{ ok = $false; timedOut = $true; value = $null; error = "no answer in $Sec s" }
     }
     try { $v = @($ps.EndInvoke($async)); [pscustomobject]@{ ok = $true; timedOut = $false; value = $(if ($v.Count -gt 0) { $v[0] } else { $null }); error = $null } }
@@ -286,10 +290,25 @@ if (-not $reach.ok -or $reach.value -ne $true) { Stop-Baseline 'SHARE_UNREACHABL
 $manifest = $BuildManifestSha256
 if (-not $manifest) {
     $buildJson = "$cache\playback-attr-3-cuda-$($commit.Substring(0, 12))-build.json"
-    $m = Invoke-Bounded { param($p) if (Test-Path -LiteralPath $p -PathType Leaf) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' } } @($buildJson) $ProbeTimeoutSec
+    # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r12 (r10's OPEN): the cache name carries only the sha's first 12 hex, so the manifest standing there may be ANOTHER commit's
+    # build. ONE read: the bytes hashed are the bytes whose sourceCommit is read (decoded as Assert-AttrCudaBuildManifest decodes them); a manifest that does not declare
+    # this commit (compared as the leg job compares it, ordinally) is not this commit's staged build, so it is never pinned for the chains.
+    # r13 (Grok G19 on #814): the worker runs under EAP Stop, as VenueChain.psm1's canonical read does, so a manifest that exists but cannot be read (a writer holding
+    # it open, a share error) ends the read with its own error (-not $m.ok: SHARE_UNREACHABLE below). Under the runspace's default Continue the failed byte read went
+    # on, the worker returned nothing, and a staged build it never looked at was reported BUILD_NOT_STAGED.
+    $m = Invoke-Bounded {
+        param($p)
+        $ErrorActionPreference = 'Stop'
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
+        $bytes = [IO.File]::ReadAllBytes($p)
+        $declared = try { $j = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true).ReadToEnd() | ConvertFrom-Json -ErrorAction Stop; $q = $j.PSObject.Properties['sourceCommit']; if ($null -eq $q) { '<absent>' } else { [string]$q.Value } } catch { '<unparseable>' }
+        [pscustomobject]@{ hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant(); commit = $declared }
+    } @($buildJson) $ProbeTimeoutSec
     if ($m.timedOut) { Stop-Baseline 'SHARE_UNREACHABLE' "reading '$buildJson' $($m.error)" }
-    if (-not $m.ok -or -not $m.value) { Stop-Baseline 'BUILD_NOT_STAGED' "no staged build manifest for $($commit.Substring(0, 12)) at '$buildJson'; the hub stages it first (assemble + stage job), this script stages nothing" }
-    $manifest = [string]$m.value
+    if (-not $m.ok) { Stop-Baseline 'SHARE_UNREACHABLE' "reading '$buildJson' failed: $($m.error)" }
+    if (-not $m.value) { Stop-Baseline 'BUILD_NOT_STAGED' "no staged build manifest for $($commit.Substring(0, 12)) at '$buildJson'; the hub stages it first (assemble + stage job), this script stages nothing" }
+    if (-not [string]::Equals([string]$m.value.commit, $commit, [StringComparison]::OrdinalIgnoreCase)) { Stop-Baseline 'BUILD_NOT_STAGED' "the staged build manifest at '$buildJson' declares '$($m.value.commit)', not $commit (the 12-hex cache name holds another build); this commit is not staged, so no chain runs on it; the hub stages it first, this script stages nothing" }
+    $manifest = [string]$m.value.hash
 }
 Out-Line "BASELINE_BUILD sourceCommit=$commit buildManifestSha256=$manifest"
 
@@ -500,4 +519,5 @@ $summary = [ordered]@{
 [IO.File]::WriteAllText((Join-Path $RunDir 'baseline-result.json'), ($summary | ConvertTo-Json -Compress -Depth 8))
 Out-Line "BASELINE_EXIT code=$code reason=$reason rows=$($rows.Count)$(if ($typed) { " detail=$($typed.detail)" } elseif ($reason -ceq 'NO_MEASUREMENT') { " detail=$noMeasurementDetail" })"
 Out-Line ('BASELINE_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 8))
+Complete-VenueProcess -ExitCode $code
 exit $code
