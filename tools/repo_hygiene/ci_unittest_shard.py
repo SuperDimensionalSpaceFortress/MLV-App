@@ -32,6 +32,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -768,45 +769,51 @@ def session_kwargs() -> dict[str, object]:
 TREE_KILL_SECONDS = 10.0
 
 
-def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
-    """Best effort: end every process ``proc`` started (a bounded test's child and grandchild).
+def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
+    """End every process ``proc`` started (a bounded test's child and grandchild); the error text if not.
 
-    ``taskkill /T`` on Windows, the worker's process group elsewhere. A failure here is not an error:
-    ``terminate`` still kills the worker itself, and the first reading of that is the one reported.
+    ``taskkill /T`` on Windows, the worker's process group elsewhere. Anything that goes wrong, whatever
+    its type, comes back as text and never as an exception: ``terminate`` still kills the worker itself and
+    reports both. (A test that starts its own session or group on purpose is out of reach of either.)
     """
     pid = getattr(proc, "pid", None)
     if not isinstance(pid, int):
-        return
+        return None
     try:
         if os.name == "nt":
-            subprocess.run(
+            done = subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(pid)], stdin=subprocess.DEVNULL, capture_output=True,
                 timeout=TREE_KILL_SECONDS, creationflags=no_window_flags(), check=False,
             )
+            if done.returncode not in (0, 128):  # 128: no such process, it had already exited
+                return f"taskkill exited {done.returncode}"
         else:
-            import signal
-
-            os.killpg(pid, signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError):
-        pass
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:  # the group is already gone
+                pass
+    except Exception as error:  # noqa: BLE001 - an audit hook or a patched run may raise any type
+        return f"{type(error).__name__}: {error}"
+    return None
 
 
 def terminate(proc: subprocess.Popen[bytes], *, reap: bool = True) -> str | None:
-    """Kill ``proc`` and its process tree (and reap it when ``reap``); the error text when the OS refuses
-    to kill the worker itself, else ``None``.
+    """Kill ``proc`` and its process tree (and reap it when ``reap``); the error text when either the
+    worker or its tree could not be ended, else ``None``. It never raises.
 
-    Callers end every owned worker through this, so one worker that cannot be killed (an ``OSError``
-    such as ``PermissionError``) never stops the kill of the others; a worker that could not be killed
-    is not waited on (that wait would never return).
+    Callers end every owned worker through this, so one worker that cannot be killed (``PermissionError``
+    or anything else) never stops the kill of the others; a worker that could not be killed is not waited
+    on (that wait would never return), and the worker is killed even when its tree could not be.
     """
-    _kill_tree(proc)
+    tree_error = _kill_tree(proc)
+    tree_note = f"its process tree was not ended ({tree_error})" if tree_error else None
     try:
         proc.kill()
         if reap:
             proc.wait()
-    except OSError as error:
-        return f"{type(error).__name__}: {error}"
-    return None
+    except Exception as error:  # noqa: BLE001 - nothing a kill raises may stop the others being killed
+        return f"{type(error).__name__}: {error}" + (f"; {tree_note}" if tree_note else "")
+    return tree_note
 
 
 class DeadlineKiller:
@@ -829,7 +836,8 @@ class DeadlineKiller:
         self._stopped = threading.Event()
         self._procs: list[subprocess.Popen[bytes]] = []
         self.killed: set[int] = set()  # 1-based, in registration order
-        self.failed: dict[int, str] = {}  # workers the OS would not let it kill (retried every slice)
+        # Workers (or their trees) it could not end; a running one is retried every slice, the record stays.
+        self.failed: dict[int, str] = {}
         self._thread = threading.Thread(target=self._run, name="shard-deadline-killer", daemon=True)
 
     def start(self) -> None:
@@ -845,10 +853,12 @@ class DeadlineKiller:
             if self._clock() < self._deadline:
                 return
             for number, proc in enumerate(self._procs, start=1):
-                if proc.poll() is not None:
-                    self.failed.pop(number, None)
-                    continue
-                error = terminate(proc, reap=False)
+                try:
+                    if proc.poll() is not None:
+                        continue  # a failure already on record stays: the parent reports it
+                    error = terminate(proc, reap=False)
+                except Exception as exc:  # noqa: BLE001 - the watchdog thread must survive anything
+                    error = f"{type(exc).__name__}: {exc}"
                 if error is None:
                     self.killed.add(number)
                     self.failed.pop(number, None)
@@ -931,6 +941,13 @@ def run_parallel(
     )
     deadline = clock() + limit  # from before the first launch: launching is part of the budget
     killer = DeadlineKiller(deadline, clock)
+
+    def report_unended() -> None:  # what the watchdog could not end (a worker or its tree), once each
+        for number, error in sorted(killer.failed.items()):
+            if number not in stuck:
+                stuck.add(number)
+                problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
+
     watch.start()
     killer.start()
     try:
@@ -989,6 +1006,7 @@ def run_parallel(
                 )
             log.close()
             codes.append(proc.returncode)
+        report_unended()
         for path in logs:
             records.append(_worker_record(path.with_name("result.json")))
         for record in records:
@@ -1018,6 +1036,7 @@ def run_parallel(
             with contextlib.suppress(OSError):
                 log.close()
         killer.stop()
+        report_unended()
         watch.stop()
         shutil.rmtree(work, ignore_errors=True)
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback

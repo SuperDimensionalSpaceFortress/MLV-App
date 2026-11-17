@@ -1436,6 +1436,7 @@ class ShardExitCodeTests(unittest.TestCase):
     def test_a_failed_kill_at_the_timeout_does_not_leave_later_workers_running(self) -> None:
         class NoKiller:  # only the parent's own timeout loop is under test here
             killed: set[int] = set()
+            failed: dict[int, str] = {}
 
             def __init__(self, *args: object, **kwargs: object) -> None:
                 pass
@@ -1492,11 +1493,11 @@ class ShardExitCodeTests(unittest.TestCase):
         return not (status.exists() and status.read_text().rsplit(")", 1)[1].split()[0] == "Z")
 
     def test_ending_a_worker_ends_the_process_tree_it_started(self) -> None:
-        tree = (
+        tree = (  # short sleeps: a red run leaves nothing behind for long, and no cleanup kills a bare PID
             "import subprocess, sys, time\n"
-            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(40)'])\n"
             "print(c.pid, flush=True)\n"
-            "time.sleep(120)\n"
+            "time.sleep(40)\n"
         )
         worker = subprocess.Popen(
             [sys.executable, "-c", tree], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
@@ -1505,20 +1506,53 @@ class ShardExitCodeTests(unittest.TestCase):
         self.addCleanup(worker.stdout.close)
         grandchild = int(worker.stdout.readline())
 
-        def last_resort() -> None:  # a red run must not leave a sleeper behind
-            if self._pid_alive(grandchild):
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/F", "/PID", str(grandchild)], capture_output=True, creationflags=no_window_flags())
-                else:
-                    os.kill(grandchild, 9)
-
-        self.addCleanup(last_resort)
         self.addCleanup(worker.kill)
         self.assertIsNone(shard.terminate(worker))
         deadline = time.monotonic() + 15.0
         while self._pid_alive(grandchild) and time.monotonic() < deadline:
             time.sleep(0.1)
         self.assertFalse(self._pid_alive(grandchild), "the worker's own child survived the worker's termination")
+
+    # r6 adversary pass 9 A2/A3: a tree kill that fails (or raises anything at all) is reported, and the
+    # worker itself and the other workers are still killed; the watchdog thread must survive it.
+    def _tree_kill_fails(self, error: BaseException) -> contextlib.ExitStack:
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(shard.subprocess, "run", side_effect=error))
+        stack.enter_context(mock.patch.object(shard.os, "killpg", side_effect=error, create=True))
+        self.addCleanup(stack.close)
+        return stack
+
+    def _pid_proc(self) -> "ShardExitCodeTests._RunningProc":
+        proc = self._RunningProc()
+        proc.pid = 424242  # only ever seen by the patched tree kill in these tests
+        return proc
+
+    def test_a_tree_kill_that_fails_is_reported_and_the_worker_is_still_killed(self) -> None:
+        for error in (PermissionError(5, "Access is denied"), RuntimeError("policy denies taskkill")):
+            with self.subTest(error=type(error).__name__), self._tree_kill_fails(error):
+                proc = self._pid_proc()
+                result = shard.terminate(proc)
+                self.assertIsNotNone(result, "a tree that was not ended must not read as a clean kill")
+                self.assertIn("process tree", result)
+                self.assertEqual(proc.returncode, -9, "the worker itself is still killed")
+
+    def test_a_tree_kill_that_raises_does_not_kill_the_watchdog_or_skip_later_workers(self) -> None:
+        with self._tree_kill_fails(RuntimeError("policy denies taskkill")):
+            killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)
+            first, second = self._pid_proc(), self._pid_proc()
+            killer.add(first)  # must not raise
+            killer.add(second)
+        self.assertEqual((first.returncode, second.returncode), (-9, -9))
+        self.assertEqual(sorted(killer.failed), [1, 2], "the failures stay on record after the workers died")
+
+    def test_a_run_reports_a_tree_kill_failure_the_watchdog_met(self) -> None:
+        with self._tree_kill_fails(PermissionError(5, "Access is denied")):
+            procs = [self._pid_proc(), self._pid_proc()]
+            code, err, raised = self._run_with_fake_workers(procs, past_deadline=True)
+        self.assertIsNone(raised)
+        self.assertEqual(code, 1)
+        self.assertIn("could not be terminated", err)
+        self.assertIn("process tree", err)
 
     # r6 adversary pass 8 A2: a log opened for a worker whose launch then fails is closed, not leaked.
     def test_a_launch_that_fails_closes_the_log_it_opened(self) -> None:
