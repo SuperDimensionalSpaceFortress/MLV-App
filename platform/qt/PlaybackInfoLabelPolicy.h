@@ -35,6 +35,7 @@ struct Facts
     bool presentedValid = false;      // presentedScale belongs to the requested scale's frames
     QString debayer;                  // the chosen debayer's menu text ("" = omitted)
     bool debayerOnGpu = false;
+    QString gpuDebayer;               // r3: the algorithm the GPU ran for the presented frame ("AMaZE", "Bilinear"; "" = none)
     bool playing = false;
     double achievedFps = 0.0;         // smoothed presented rate while playing
     double clipFps = 0.0;             // the clip's own rate (<= 0 = unknown, the fps field is omitted)
@@ -96,6 +97,14 @@ inline QString scaleField( const Facts &facts )
 inline QString debayerField( const Facts &facts )
 {
     const QString name = facts.debayer.trimmed();
+    const QString gpu = facts.gpuDebayer.trimmed();
+    // r3 adversary A2 (a271daee): the GPU names what it ran. LMMSE selected passes the GPU AMaZE eligibility, so a frame
+    // rendered by GPU AMaZE reads "LMMSE->AMaZE (GPU)" (selected -> ran), never "LMMSE (GPU)".
+    if( facts.debayerOnGpu && !gpu.isEmpty() )
+    {
+        if( name.isEmpty() || name.compare( gpu, Qt::CaseInsensitive ) == 0 ) return gpu + QStringLiteral( " (GPU)" );
+        return name + QStringLiteral( "->" ) + gpu + QStringLiteral( " (GPU)" );
+    }
     if( name.isEmpty() ) return QString();
     return facts.debayerOnGpu ? name + QStringLiteral( " (GPU)" ) : name;
 }

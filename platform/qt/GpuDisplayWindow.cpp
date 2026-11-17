@@ -214,7 +214,12 @@ bool GpuDisplayWindow::setLookLabelIfActive(const QString &text, bool repaintNow
 {
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     if ( !win || QThread::currentThread() != win->thread() ) return false;
-    if ( win->m_lookLabelText == text ) return true;
+    if ( win->m_lookLabelText == text )
+    {
+        // LOOK-LABEL-PLAYBACK-INFO-1 r3: a text stored for the next frame's paint that never came (frames stalled) is painted now.
+        if ( repaintNow && win->m_lookLabelDrawnText != text ) win->update();
+        return true;
+    }
     win->m_lookLabelText = text;
     if ( repaintNow ) win->update();
     return true;

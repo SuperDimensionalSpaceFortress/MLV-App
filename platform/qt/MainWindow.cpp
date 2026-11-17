@@ -2959,6 +2959,11 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             }
             // LOOK-LABEL-PLAYBACK-INFO-1: whether the corner label showed a rate the reset now withdraws.
             const bool fpsWasMeasured = m_playbackInfoFpsShown > 0.0;
+            // r3 pass-2 A1: frames stopped while playing (a draw happened, then none for > 500 ms). Once per stall: the reset
+            // drops lastDrawTime, so hasDraw is false on the next idle tick. The next draw ends it.
+            const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;
+            if( stallEntered ) m_playbackFramesStalled = true;
+            else if( !ui->actionPlay->isChecked() ) m_playbackFramesStalled = false;
             m_playbackFpsEmaFrameMs = 0.0;
             m_playbackInfoFpsShown = 0.0;
             m_lastPlaybackFpsStatusUpdateTime = QTime();
@@ -2969,6 +2974,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 m_playbackInfoRateWithdrawn = true;   // r2 pass-2 A2: the push that carries this withdrawal repaints at once
                 updatePlaybackInfoLabel( true );      // r3 (adversary r2 c65933cb A2): at once, never deferred by the playing gate
             }
+            // r3 pass-2 A1: a label stored for the next frame's paint (a relabel while playing) is painted now: no frame follows.
+            if( stallEntered && m_lookLabelFullscreenShown ) pushLookLabelOverlay();
         }
     };
 
@@ -3100,6 +3107,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
         const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;
         lastDrawTime = nowTime;
+        m_playbackFramesStalled = false;   // LOOK-LABEL-PLAYBACK-INFO-1 r3: a frame was drawn, so the next one carries the label
         if( timeDiff != 0 )
         {
             m_playbackFpsEmaFrameMs =
@@ -33747,7 +33755,8 @@ void MainWindow::pushLookLabelOverlay( void )
     // r2 pass-2 A2: the reset's flag, never "no rate yet" (Play from a paused frame must not repaint the paused frame).
     // Cleared by updatePlaybackInfoLabel after the push that carries the withdrawn text (a look-line push meanwhile repaints too),
     // or by the fps gate's next measured rate (r3: the rate is back, so there is nothing left to withdraw).
-    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn;
+    // r3 pass-2 A1: and while frames are stalled (the meter's reset after a draw, until the next draw), since no frame will come.
+    const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn || m_playbackFramesStalled;
     GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow );
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
 }
@@ -33781,6 +33790,9 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     // The chosen debayer's menu text, never the playback debayer label helper (it returns "receipt").
     facts.debayer = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();
     facts.debayerOnGpu = m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer;
+    // r3 (adversary a271daee A2): what the GPU ran (LMMSE selected may render with GPU AMaZE).
+    facts.gpuDebayer = m_lastPresentedFrameUsedGpuAmazeDebayer ? QStringLiteral( "AMaZE" )
+                     : ( m_lastPresentedFrameUsedGpuBilinearDebayer ? QStringLiteral( "Bilinear" ) : QString() );
     facts.playing = ui->actionPlay->isChecked();
     // r1 adversary A1: the gate's snapshot, never the live meter, so no hook shows a new rate faster than the 250 ms gate.
     facts.achievedFps = m_playbackInfoFpsShown;

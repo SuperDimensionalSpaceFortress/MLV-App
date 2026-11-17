@@ -879,6 +879,7 @@ private:
     bool m_playbackInfoInputsDirty = false;  // an info input changed while playing; flushPlaybackInfoIfDue relabels (r1 pass-3 A2)
     QElapsedTimer m_playbackInfoRelabelClock; // r2 A1: monotonic, restarted by every relabel; the deferred relabel's 250 ms gate
     bool m_playbackInfoRateWithdrawn = false; // r2 pass-2 A2: a measured rate was reset; the next overlay push repaints at once
+    bool m_playbackFramesStalled = false;     // r3 pass-2 A1: playing, but no draw for > 500 ms; overlay pushes repaint at once
     // r1 adversary A1/A3: the info inputs last relabelled for (refreshPlaybackInfoOnInputChange compares them, ints only).
     struct PlaybackInfoInputs
     {

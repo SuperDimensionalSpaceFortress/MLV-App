@@ -348,9 +348,11 @@ TEST(PlaybackInfoLabel, R1P3A1WithdrawalRepaintsAtOnce)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
-    // r2 pass-2 A2: the rate withdrawal is the reset's flag (R2P2A2OnlyAWithdrawalRepaintsWhilePlaying).
+    // r2 pass-2 A2: the rate withdrawal is the reset's flag (R2P2A2OnlyAWithdrawalRepaintsWhilePlaying). r3 pass-2 A1: and a stall
+    // (R3P2A1StalledFramesPaintTheStoredLabel).
     ASSERT_TRUE(push.contains(QStringLiteral(
-        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn;")));
+        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
+        " || m_playbackFramesStalled;")));
     ASSERT_TRUE(push.contains(QStringLiteral("GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow )")));
 }
 
@@ -438,8 +440,10 @@ TEST(PlaybackInfoLabel, R2P2A2OnlyAWithdrawalRepaintsWhilePlaying)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
     ASSERT_FALSE(push.contains(QStringLiteral("m_playbackInfoFpsShown <= 0.0")));
+    // r3 pass-2 A1: a stall (no draw for > 500 ms after one) is no Play-from-paused start: the flag needs a draw first.
     ASSERT_TRUE(push.contains(QStringLiteral(
-        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn;")));
+        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
+        " || m_playbackFramesStalled;")));
     // The push never clears it (a look-line push while the info relabel waits must not eat the withdrawal); the info relabel
     // clears it after its own push, or on each early return past the gate (nothing to withdraw).
     ASSERT_FALSE(push.contains(QStringLiteral("m_playbackInfoRateWithdrawn = false;")));
@@ -553,6 +557,66 @@ TEST(PlaybackInfoLabel, R3P1A1ClampedRequestShowsThePresentedScale)
     ASSERT_FALSE(indicator.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactor == requestedScale")));
     const QString key = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
     ASSERT_TRUE(key.contains(QStringLiteral("inputs.requestContextScale = m_lastPresentedRequestContext.playbackScaleFactorPolicy;")));
+}
+
+// r3 pass-2 A1 (a271daee): while playing the GPU window only STORES a changed label for the next frame's paint. Frames stall, FPS
+// and DF are toggled off: the gated flush stores the text without the rate (repaintNow false), the reset then skips the withdrawal
+// (the fps toggle is off), and the old measured rate stays on screen. Once frames stop (the meter's reset after a draw, while
+// playing) every push repaints at once until the next draw, and the stall's entry pushes the stored label once, so a label stored
+// for a frame that never comes is painted; the GPU window repaints an equal text that it has not drawn yet.
+TEST(PlaybackInfoLabel, R3P2A1StalledFramesPaintTheStoredLabel)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString push = functionBody(source, QStringLiteral("void MainWindow::pushLookLabelOverlay("));
+    ASSERT_TRUE(push.contains(QStringLiteral(
+        "const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn"
+        " || m_playbackFramesStalled;")));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    const int enteredAt = tick.indexOf(QStringLiteral("const bool stallEntered = ui->actionPlay->isChecked() && hasDraw;"));
+    const int setAt = tick.indexOf(QStringLiteral("if( stallEntered ) m_playbackFramesStalled = true;"));
+    const int pushAt = tick.indexOf(QStringLiteral("if( stallEntered && m_lookLabelFullscreenShown ) pushLookLabelOverlay();"));
+    ASSERT_TRUE(enteredAt >= 0);
+    ASSERT_TRUE(setAt > enteredAt);
+    ASSERT_TRUE(pushAt > setAt);
+    // Paused is not a stall (it repaints anyway), and the next draw ends the stall.
+    ASSERT_TRUE(tick.contains(QStringLiteral("else if( !ui->actionPlay->isChecked() ) m_playbackFramesStalled = false;")));
+    const int drawAt = tick.indexOf(QStringLiteral("lastDrawTime = nowTime;"));
+    ASSERT_TRUE(drawAt >= 0);
+    ASSERT_TRUE(tick.indexOf(QStringLiteral("m_playbackFramesStalled = false;"), drawAt) > drawAt);
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_playbackFramesStalled = true;"))));
+    const QString gpu = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString set = functionBody(gpu, QStringLiteral("bool GpuDisplayWindow::setLookLabelIfActive("));
+    const int equalAt = set.indexOf(QStringLiteral("if ( win->m_lookLabelText == text )"));
+    const int undrawnAt = set.indexOf(QStringLiteral("if ( repaintNow && win->m_lookLabelDrawnText != text ) win->update();"));
+    ASSERT_TRUE(equalAt >= 0);
+    ASSERT_TRUE(undrawnAt > equalAt);
+}
+
+// r3 pass-2 A2 (a271daee): LMMSE selected (use_amaze=4) passes the GPU AMaZE eligibility, GPU AMaZE renders the frame, and the
+// label read "LMMSE (GPU)". The GPU debayer flag names what ran: "LMMSE->AMaZE (GPU)" (selected -> ran, the scale field's form).
+TEST(PlaybackInfoLabel, R3P2A2GpuDebayerNamesWhatRan)
+{
+    playback_info_label::Facts f = ownerFacts();
+    f.debayer = QStringLiteral("LMMSE");
+    f.debayerOnGpu = true;
+    f.gpuDebayer = QStringLiteral("AMaZE");
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE->AMaZE (GPU)"), playback_info_label::debayerField(f));
+    f.debayer = QStringLiteral("AMaZE");
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE (GPU)"), playback_info_label::debayerField(f));
+    f.debayer = QStringLiteral("Bilinear");
+    f.gpuDebayer = QStringLiteral("Bilinear");
+    ASSERT_QSTR_EQ(QStringLiteral("Bilinear (GPU)"), playback_info_label::debayerField(f));
+    f.debayer = QString();
+    ASSERT_QSTR_EQ(QStringLiteral("Bilinear (GPU)"), playback_info_label::debayerField(f));
+    // On the CPU: the selected name alone.
+    f.debayer = QStringLiteral("LMMSE");
+    f.debayerOnGpu = false;
+    f.gpuDebayer = QString();
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE"), playback_info_label::debayerField(f));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
+    ASSERT_TRUE(facts.contains(QStringLiteral(
+        "facts.gpuDebayer = m_lastPresentedFrameUsedGpuAmazeDebayer ? QStringLiteral( \"AMaZE\" )")));
 }
 
 // r2 adversary A2 (deeae9f4, advisory): a carriage return is a line break too: logForm leaves one line, compose adds none.
