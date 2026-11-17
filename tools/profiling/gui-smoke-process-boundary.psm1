@@ -74,21 +74,6 @@ function Get-GuiSmokeNoProgressChunkMs {
     return [int][Math]::Max(250, [Math]::Min(4000, [Math]::Floor($WindowMs / 4)))
 }
 
-# The directory read and the file opens, run on a worker runspace so a stalled share cannot hold the caller (adversary 797947a7 A4).
-$script:GuiSmokeLogLengthProbe = @'
-param($LogRoot)
-foreach ($file in @(Get-ChildItem -LiteralPath $LogRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)) {
-    $length = [int64]-1
-    try {
-        $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
-            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-        try { $length = [int64]$stream.Length } finally { $stream.Dispose() }
-    }
-    catch { }
-    '{0}|{1}' -f $file.Name, $length
-}
-'@
-
 # A watch over the app's own log files (mlvapp-*.log in the run's log directory). It is armed by the FIRST sign of a log (a log that is
 # listed but cannot be opened still arms it), so the time before the app writes anything (loading the input, Qt start-up) stays bounded by
 # the overall budget only. Progress is GROWTH of a file beyond its own high-water length (read through an opened handle: a directory listing
@@ -96,6 +81,11 @@ foreach ($file in @(Get-ChildItem -LiteralPath $LogRoot -Filter 'mlvapp-*.log' -
 # shrinks, or returns to a length it already had is never progress, so toggling read access cannot manufacture it (adversary 57a7a5c9 A1).
 # A probe that has not answered within its wait is left running and counts as no new information; it is waited on ONCE, never again, and
 # never past the process budget the caller has left. Call Stop-GuiSmokeLogProgressWatch when done.
+# The probe (the directory read and the file opens) runs as a background ForEach-Object -Parallel job so a stalled share cannot hold the caller
+# (adversary 797947a7 A4). Its body is a LITERAL scriptblock below, not a string built at run time: nothing here is an executed string, and the
+# module stays free of the runspace-object and script-string shapes the smoke-runner closure census (AttrCudaArtifacts.psm1) flags in every
+# closure file -- the pinned dual-venue baseline generator carries that census without any new exclusion (test_dual_venue_evidence byte identity).
+# -ProbeDelayMs is a test seam (data only): the probe sleeps that long before it reads, so a probe that hangs can be simulated.
 function New-GuiSmokeLogProgressWatch {
     [CmdletBinding()]
     param(
@@ -104,21 +94,18 @@ function New-GuiSmokeLogProgressWatch {
         [Parameter(Mandatory)]
         [ValidateRange(1, 3600000)]
         [int]$WindowMs,
-        [string]$ProbeScript = $script:GuiSmokeLogLengthProbe,
+        [ValidateRange(0, 3600000)]
+        [int]$ProbeDelayMs = 0,
         [ValidateRange(50, 5000)]
         [int]$ProbeWaitMs = 1000
     )
 
-    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $runspace.Open()
     [pscustomobject]@{
         LogRoot = $LogRoot
         WindowMs = $WindowMs
-        ProbeScript = $ProbeScript
+        ProbeDelayMs = $ProbeDelayMs
         ProbeWaitMs = $ProbeWaitMs
-        Runspace = $runspace
         Pending = $null
-        Handle = $null
         Hung = $false
         Armed = $false
         Files = @{}
@@ -133,8 +120,8 @@ function Stop-GuiSmokeLogProgressWatch {
         [object]$Watch
     )
 
-    try { if ($null -ne $Watch.Pending) { [void]$Watch.Pending.BeginStop($null, $null) } } catch { }
-    try { [void]$Watch.Runspace.CloseAsync() } catch { }
+    # a probe still hung on a stalled share is asked to stop and abandoned, never waited on
+    try { if ($null -ne $Watch.Pending) { $Watch.Pending.StopJobAsync() } } catch { }
 }
 
 function Test-GuiSmokeLogProgressStalled {
@@ -149,30 +136,39 @@ function Test-GuiSmokeLogProgressStalled {
 
     # r4 (adversary b0a33ba9 A2): the budget is an ABSOLUTE endpoint, the entry stopwatch plus -BudgetRemainingMs, so a scheduling delay between
     # here and the wait can never grant a wait past the deadline.
-    $entry = [System.Diagnostics.Stopwatch]::StartNew()
+    $entryClock = [System.Diagnostics.Stopwatch]::StartNew()
     # no budget left: no probe is started (a pending one is only looked at, 0 ms)
     if ($null -eq $Watch.Pending -and $BudgetRemainingMs -gt 0) {
-        $shell = [System.Management.Automation.PowerShell]::Create()
-        $shell.Runspace = $Watch.Runspace
-        [void]$shell.AddScript($Watch.ProbeScript).AddArgument($Watch.LogRoot)
-        $Watch.Pending = $shell
-        $Watch.Handle = $shell.BeginInvoke()
+        $probeRoot = [string]$Watch.LogRoot
+        $probeDelayMs = [int]$Watch.ProbeDelayMs
+        $Watch.Pending = 1 | ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {
+            if ($using:probeDelayMs -gt 0) { Start-Sleep -Milliseconds $using:probeDelayMs }
+            foreach ($file in @(Get-ChildItem -LiteralPath $using:probeRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)) {
+                $length = [int64]-1
+                try {
+                    $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+                    try { $length = [int64]$stream.Length } finally { $stream.Dispose() }
+                }
+                catch { }
+                '{0}|{1}' -f $file.Name, $length
+            }
+        }
         $Watch.Hung = $false
     }
     $entries = $null
     if ($null -ne $Watch.Pending) {
         # re-derived from the absolute end just before the wait; a probe that already outran its wait is only looked at (0 ms), never waited on again
-        $leftMs = [int][Math]::Max([int64]0, [int64]$BudgetRemainingMs - [int64]$entry.ElapsedMilliseconds)
+        $leftMs = [int][Math]::Max([int64]0, [int64]$BudgetRemainingMs - [int64]$entryClock.ElapsedMilliseconds)
         $waitMs = if ($Watch.Hung) { 0 } else { [Math]::Min([int]$Watch.ProbeWaitMs, $leftMs) }
-        if ($Watch.Handle.AsyncWaitHandle.WaitOne($waitMs)) {
-            $landed = $null
-            try { $landed = @($Watch.Pending.EndInvoke($Watch.Handle)) } catch { $landed = @() }
-            try { $Watch.Pending.Dispose() } catch { }
+        if ($Watch.Pending.Finished.WaitOne($waitMs)) {
+            $landed = @()
+            try { $landed = @(Receive-Job -Job $Watch.Pending -ErrorAction SilentlyContinue) } catch { $landed = @() }
+            try { Remove-Job -Job $Watch.Pending -Force -ErrorAction SilentlyContinue } catch { }
             $Watch.Pending = $null
-            $Watch.Handle = $null
             $Watch.Hung = $false
             # a result that lands once the budget is spent is ignored: the caller's loop is ending on the whole budget, not on this log
-            if ([int64]$entry.ElapsedMilliseconds -lt [int64]$BudgetRemainingMs) { $entries = $landed }
+            if ([int64]$entryClock.ElapsedMilliseconds -lt [int64]$BudgetRemainingMs) { $entries = $landed }
         }
         else {
             $Watch.Hung = $true

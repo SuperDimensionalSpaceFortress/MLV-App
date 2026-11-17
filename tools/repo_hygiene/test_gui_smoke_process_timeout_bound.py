@@ -222,7 +222,7 @@ function Trip([scriptblock]$Mutate, [int]$Window = 1200) {
     def test_a_hung_log_probe_never_blocks_the_caller(self) -> None:
         out = run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'hung'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Seconds 40; 5' -ProbeWaitMs 300
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeDelayMs 40000 -ProbeWaitMs 300
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $r = @(1..4 | ForEach-Object { [bool](Test-GuiSmokeLogProgressStalled -Watch $w) })
 $ms = [int]$sw.ElapsedMilliseconds
@@ -275,11 +275,11 @@ $held.Dispose(); Stop-GuiSmokeLogProgressWatch -Watch $w
     def test_probe_wait_is_bounded_by_the_remaining_budget_and_a_hung_probe_is_not_waited_on_twice(self) -> None:
         out = run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'budget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Seconds 40; 5' -ProbeWaitMs 1000
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeDelayMs 40000 -ProbeWaitMs 1000
 $sw = [Diagnostics.Stopwatch]::StartNew()
 [void](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 50)
 $cappedMs = [int]$sw.ElapsedMilliseconds
-$w2 = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Seconds 40; 5' -ProbeWaitMs 400
+$w2 = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeDelayMs 40000 -ProbeWaitMs 400
 $sw.Restart()
 1..5 | ForEach-Object { [void](Test-GuiSmokeLogProgressStalled -Watch $w2) }
 $fiveMs = [int]$sw.ElapsedMilliseconds
@@ -332,7 +332,8 @@ $stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 0
 $zeroMs = [int]$sw.ElapsedMilliseconds
 $pendingAfterZero = ($null -ne $w.Pending)
 Stop-GuiSmokeLogProgressWatch -Watch $w
-$late = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Milliseconds 600; ''mlvapp-1.log|500''' -ProbeWaitMs 5000
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
+$late = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeDelayMs 600 -ProbeWaitMs 5000
 [void](Test-GuiSmokeLogProgressStalled -Watch $late -BudgetRemainingMs 300)
 Start-Sleep -Milliseconds 1500
 [void](Test-GuiSmokeLogProgressStalled -Watch $late -BudgetRemainingMs 0)
@@ -349,7 +350,7 @@ Stop-GuiSmokeLogProgressWatch -Watch $late
         text = MODULE.read_text(encoding="utf-8")
         body = text[text.index("function Test-GuiSmokeLogProgressStalled"):text.index("function Wait-GuiSmokeProcessBounded")]
         self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", body, "an absolute endpoint is taken at function entry")
-        self.assertLess(body.index("[System.Diagnostics.Stopwatch]::StartNew()"), body.index("AsyncWaitHandle.WaitOne("))
+        self.assertLess(body.index("[System.Diagnostics.Stopwatch]::StartNew()"), body.index("Finished.WaitOne("))
         self.assertIn("$BudgetRemainingMs - ", body, "the wait is re-derived from the entry stopwatch just before WaitOne")
 
     # adversary b0a33ba9 A4 (r4): the early no-progress stop must not also print the whole-timeout message.

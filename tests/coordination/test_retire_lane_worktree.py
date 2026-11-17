@@ -4413,15 +4413,6 @@ UNRESOLVED_EXECUTED_SITES = {
          "is test-only, runs under pytest tmp dirs and never runs against a lane worktree "
          "(test_launcher_census_stub_executed_string_interpolates_only_its_own_values)"),
     ],
-    "tools/profiling/gui-smoke-process-boundary.psm1": [
-        ("[void]$shell.AddScript($Watch.ProbeScript)",
-         "VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4 (a runspace script, not an executable launch): $Watch.ProbeScript defaults to "
-         "$script:GuiSmokeLogLengthProbe, the single-quoted here-string literal in this same module (its only writer), which lists "
-         "mlvapp-*.log under the run's log directory and opens each read-only to report its length; it runs in a private in-process runspace "
-         "(Test-GuiSmokeLogProgressStalled) so a stalled share cannot hold the caller. A caller-supplied -ProbeScript exists for the tests "
-         "only; run-release-gui-smoke.ps1 never passes one "
-         "(test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_only_reads_the_log_directory)"),
-    ],
     "tools/profiling/bachelor/AttrCudaArtifacts.psm1": [
         ("[void]$shell.AddScript($loopScript)",
          "r5 rule V2: $loopScript is the { } literal at :6242 in the same function (Start-AttrCudaDisplayWakeKeepAlive), its only writer, "
@@ -4679,23 +4670,57 @@ def test_launcher_census_stub_executed_string_interpolates_only_its_own_values()
 
 
 def test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_only_reads_the_log_directory():
-    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4 (adversary b0a33ba9 A3): the watchdog's one .AddScript runs a module-private literal in an
-    in-process runspace; it lists and opens mlvapp-*.log files read-only and launches nothing; the runner never supplies the script."""
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4 (adversary b0a33ba9 A3), restated for the r5 design: the watchdog's probe is no longer a string run
+    on a runspace (the one AddScript site r4 classified) but a literal -Parallel job, so there is nothing to classify; the probe lists and opens
+    mlvapp-*.log files read-only and launches nothing; the runner never supplies the probe or its test delay."""
     path = "tools/profiling/gui-smoke-process-boundary.psm1"
     t = (REPO / path).read_text(encoding="utf-8")
-    [(pin, why)] = UNRESOLVED_EXECUTED_SITES[path]
-    assert pin == "[void]$shell.AddScript($Watch.ProbeScript)" and "$script:GuiSmokeLogLengthProbe" in why
-    assert t.count(".AddScript(") == 1, "the module gained another executed string: classify it"
-    assert t.count("$script:GuiSmokeLogLengthProbe = @'") == 1, "the probe literal has one writer"
-    assert "[string]$ProbeScript = $script:GuiSmokeLogLengthProbe" in t, "the default script is the module-private literal"
-    probe = t.split("$script:GuiSmokeLogLengthProbe = @'", 1)[1].split("\n'@", 1)[0]
+    assert path not in UNRESOLVED_EXECUTED_SITES, "the module has no executed string: nothing to classify (r4's AddScript entry is gone with the site)"
+    assert t.count(".AddScript(") == 0, "the module gained an executed string: classify it"
+    assert "$script:GuiSmokeLogLengthProbe" not in t, "the string-built probe (r4's here-string) is gone: the probe is a literal scriptblock"
+    assert "[string]$ProbeScript" not in t and "[int]$ProbeDelayMs = 0" in t, "the only seam is the data-only -ProbeDelayMs, never a script"
+    start = t.index("ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {")
+    probe = t[start:t.index("\n        }\n        $Watch.Hung = $false", start)]
     # (-File is not listed: Get-ChildItem's own -File switch is in the probe; a pwsh -File launch needs pwsh, which is)
     for launch in ("Start-Process", "-EncodedCommand", "-Command", "Invoke-Expression", "iex", "Create(", "AddScript", "cmd", "pwsh",
                    "Invoke-Command", "&", "Out-File", "Set-Content", "Remove-Item"):
         assert launch not in probe, f"the log probe now carries {launch!r}: it must only list and read"
-    assert "Get-ChildItem -LiteralPath $LogRoot" in probe and "[System.IO.FileAccess]::Read" in probe
+    assert "Get-ChildItem -LiteralPath $using:probeRoot" in probe and "[System.IO.FileAccess]::Read" in probe
     runner = (REPO / "tools/profiling/run-release-gui-smoke.ps1").read_text(encoding="utf-8")
-    assert "-ProbeScript" not in runner, "the runner must not hand the watchdog a script of its own"
+    assert "-ProbeScript" not in runner and "-ProbeDelayMs" not in runner, "the runner must not hand the watchdog a script or a test delay of its own"
+
+
+def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_executed_string():
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r5 (the r4 sibling sweep): the watchdog's probe is a LITERAL ForEach-Object -Parallel scriptblock
+    run as a one-thread background job, not a string built at run time, so no census (this one, the AttrCuda closure scan, the pinned
+    dual-venue baseline generator's closure scan) sees an executed-string site in the module. One assert per property."""
+    path = "tools/profiling/gui-smoke-process-boundary.psm1"
+    t = (REPO / path).read_text(encoding="utf-8")
+    code = "\n".join(line for line in t.splitlines() if not line.lstrip().startswith("#"))
+    # (1) no executed-string site, and none of the shapes the closure census flags in every closure file
+    flagged = [s for s in (".AddScript(", ".AddCommand(", ".InvokeScript(", ".NewScriptBlock(", "[scriptblock]::", "[System.Management.Automation.PowerShell]",
+                           "Invoke-Expression", "Start-ThreadJob", "Start-Job", "Invoke-Command", "Add-Type", "Start-Process", "Import-Module")
+               if s in code]
+    assert not flagged and not re.search(r"(?i)\biex\b", code), f"the module carries executed-string shapes {flagged}: it must stay a literal scriptblock"
+    # (2) the probe is a literal -Parallel scriptblock, one thread, as a job
+    start = code.index("ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {")
+    probe = code[start:code.index("\n        }\n", start)]
+    assert code.count("-Parallel {") == 1 and "-ThrottleLimit 1 -AsJob" in probe.splitlines()[0], "one literal -Parallel scriptblock, -ThrottleLimit 1, -AsJob"
+    # (3) the scriptblock reads only under the log root it is handed
+    body = probe.split("\n", 1)[1]
+    writers = [v for v in ("Start-Process", "-EncodedCommand", "-Command", "Out-File", "Set-Content", "Add-Content", "Remove-Item", "Move-Item",
+                           "Copy-Item", "New-Item", "pwsh", "&") if v in body]
+    assert not writers and "Get-ChildItem -LiteralPath $using:probeRoot" in body and "[System.IO.FileAccess]::Read" in body, f"the probe must only list and read: {writers}"
+    # (4) the wait is $job.Finished.WaitOne(ms) bounded by the absolute end (entry stopwatch + budget)
+    assert "$Watch.Pending.Finished.WaitOne($waitMs)" in code and "[Math]::Min([int]$Watch.ProbeWaitMs, $leftMs)" in code, "the wait is Finished.WaitOne bounded by what is left"
+    # (5) completion receives the job's output then removes the job
+    done = code[code.index("$Watch.Pending.Finished.WaitOne($waitMs)"):]
+    assert 0 <= done.index("Receive-Job -Job $Watch.Pending") < done.index("Remove-Job -Job $Watch.Pending"), "Receive-Job, then Remove-Job"
+    # (6) Stop-GuiSmokeLogProgressWatch asks a pending job to stop and never waits on it
+    stop = code[code.index("function Stop-GuiSmokeLogProgressWatch"):code.index("function Test-GuiSmokeLogProgressStalled")]
+    assert "$Watch.Pending.StopJobAsync()" in stop and "WaitOne" not in stop and "Wait-Job" not in stop, "stop is StopJobAsync, never a wait"
+    # (7) a hung probe is waited on once: the wait is 0 ms once it has outrun its wait
+    assert "$waitMs = if ($Watch.Hung) { 0 } else" in code and "$Watch.Hung = $true" in code, "a hung probe is only looked at, never re-waited past the budget"
 
 
 # --- LANE-RETIRE-LAUNCH-SITE-CENSUS-1 / LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census classifies launch SITES, not files.

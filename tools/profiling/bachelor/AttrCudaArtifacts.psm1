@@ -1370,26 +1370,6 @@ $script:AttrCudaClosureScanExclusions = @(
             'a $PSScriptRoot sibling script -- and its only argument is the numeric pid Process.Start ' +
             'returned for the probe. It loads and runs no PowerShell/.NET code from a file this ' +
             'census needs to see.'
-    },
-    [pscustomobject]@{
-        repoRelativePath = 'tools/profiling/gui-smoke-process-boundary.psm1'
-        literal = '[System.Management.Automation.PowerShell]::Create()'
-        reason = 'VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4: the no-progress watchdog ' +
-            '(Test-GuiSmokeLogProgressStalled) creates one in-process PowerShell object bound to its OWN private runspace and runs ' +
-            'the module-private $script:GuiSmokeLogLengthProbe literal on it, so a stalled share cannot hold the runner. ' +
-            'It loads no file and no $PSScriptRoot sibling: the script text is a here-string in the same module that lists ' +
-            'mlvapp-*.log in the run log directory and reads each length through a read-only handle; ' +
-            'run-release-gui-smoke.ps1 never passes a -ProbeScript of its own ' +
-            '(test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_only_reads_the_log_directory).'
-    },
-    [pscustomobject]@{
-        repoRelativePath = 'tools/profiling/gui-smoke-process-boundary.psm1'
-        literal = '$shell.AddScript($Watch.ProbeScript)'
-        reason = 'VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4: the second half of the same watchdog site. $Watch.ProbeScript defaults ' +
-            'to the module-private $script:GuiSmokeLogLengthProbe here-string (its only writer; a caller-supplied -ProbeScript is ' +
-            'for the tests only and the runner never passes one). It runs in the watch''s own in-process runspace, lists ' +
-            'mlvapp-*.log and opens each read-only to report a length, and loads no file ' +
-            '(test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_only_reads_the_log_directory).'
     }
 )
 
