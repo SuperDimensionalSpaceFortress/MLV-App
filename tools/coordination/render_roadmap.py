@@ -305,14 +305,19 @@ def render(data: dict) -> str:
     # owner rows' drain counts still cost bytes. Collapse: render the board as the base did (product/playback rows only, an owner
     # ask of another kind not counted) and replace ALL owner output with OWNER_COLLAPSED_LINE, no longer than the placeholder it
     # replaces. Owner asks then add zero bytes to what the board renders without them; product rows are still never dropped.
-    return _render(data, 0, collapsed=True)
+    text = _render(data, 0, collapsed=True)
+    if _budget_size(text) <= ROADMAP_BUDGET_BYTES:
+        return text
+    # (r4 pass 2 A1) the owner section's own heading and placeholder cost bytes the base never spent: a product-only board that fit
+    # the budget at base (19999 CRLF bytes) was 20143 here. Last tier: no owner section, so the file is the base's, byte for byte.
+    return _render(data, 0, collapsed=True, bare=True)
 
 
 # The one owner line in the collapsed state; never longer than "- (no owner ask is parked)", so it adds no byte to the board.
 OWNER_COLLAPSED_LINE = "- (see card-queue.json)"
 
 
-def _render(data: dict, cap: int, collapsed: bool = False) -> str:
+def _render(data: dict, cap: int, collapsed: bool = False, bare: bool = False) -> str:
     open_rows, parked, days, landed, queued = _stats(data, collapsed)
     if collapsed:   # (r3 A1) no parked owner ask is listed anywhere: OWNER_COLLAPSED_LINE stands for all of them
         parked = [r for r in parked if r.get("origin") != OWNER]
@@ -355,20 +360,22 @@ def _render(data: dict, cap: int, collapsed: bool = False) -> str:
                           key=lambda r: (_instant(_parked_since(r)), r["priority"], r["card"], _canonical(r)))   # (r3 pass-7 A3) total order
     generated_at = _instant(generated)
     other_parked = [r for r in parked if not _undelivered_owner_ask(r)]
-    out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
-            "## Parked owner asks", ""]
-    for r in owner_parked[:cap]:   # r2 A3: the longest-parked `cap` (OWNER_LIST_MAX unless the budget is short), then one count line
-        since = _parked_since(r)
-        age = max(0, math.floor((generated_at - _instant(since)) / 86400))   # elapsed whole days between exact instants, not a date difference
-        out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
-            r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
-    if len(owner_parked) > cap:
-        out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - cap))
-    if collapsed and any(r.get("origin") == OWNER for r in data["rows"]):
-        out.append(OWNER_COLLAPSED_LINE)   # (r3 A1) the one owner line: no list, no count, no suffix
-    elif not owner_parked:
-        out.append("- (no owner ask is parked)")
-    out += ["", "## Parked with reason", "", *scope]
+    out += ["", _drain_line(len(open_rows), landed_total, queued_total), ""]
+    if not bare:   # (r4 pass 2 A1) the bare tier has no owner section at all: its bytes are the base's, heading included
+        out += ["## Parked owner asks", ""]
+        for r in owner_parked[:cap]:   # r2 A3: the longest-parked `cap` (OWNER_LIST_MAX unless the budget is short), then one count line
+            since = _parked_since(r)
+            age = max(0, math.floor((generated_at - _instant(since)) / 86400))   # elapsed whole days between exact instants, not a date difference
+            out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
+                r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
+        if len(owner_parked) > cap:
+            out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - cap))
+        if collapsed and any(r.get("origin") == OWNER for r in data["rows"]):
+            out.append(OWNER_COLLAPSED_LINE)   # (r3 A1) the one owner line: no list, no count, no suffix
+        elif not owner_parked:
+            out.append("- (no owner ask is parked)")
+        out.append("")
+    out += ["## Parked with reason", "", *scope]
     # every owner row here carries a resolution (an unresolved one is owed, above). One of another kind is tooling churn: counted, not listed.
     closed_other = [r for r in other_parked if r.get("origin") == OWNER and r["kind"] not in KINDS]
     closed_product_seen = 0   # (r2 pass-4 A2) resolved owner asks of product/playback kind are an owner list too: capped like the others

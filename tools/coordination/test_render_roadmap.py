@@ -1285,6 +1285,41 @@ class R4BudgetTests(unittest.TestCase):
         self.assertLessEqual(self.crlf_size(text), ROADMAP_BUDGET_BYTES)
         self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
 
+    # pass 2 A1 (review-adversary-OWNER-ASK-PARK-GUARD-1-r4-9e9184f9): the owner section's heading and placeholder cost bytes the base never
+    # spent, so a product-only board that fit at base (19999 CRLF bytes) rendered at 20143. The last tier drops that section.
+    def window_board(self, note_len: int, *extra: dict) -> dict:
+        rows = [row("PRODUCT-%03d" % i, "queued", "2026-10-20T00:00:00Z") for i in range(300)]
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z", "rows": rows + list(extra),
+                "scope_notes": [{"title": "S", "text": "x" * note_len}]}
+
+    def window_lengths(self) -> list[int]:
+        """Note lengths whose board fits the budget with no owner section but not with one: the window the base fit and head did not."""
+        found = []
+        for n in range(300, 900):
+            data = self.window_board(n)
+            if (render_roadmap._budget_size(render_roadmap._render(data, 0, collapsed=True)) > ROADMAP_BUDGET_BYTES
+                    and render_roadmap._budget_size(render_roadmap._render(data, 0, collapsed=True, bare=True)) <= ROADMAP_BUDGET_BYTES):
+                found.append(n)
+        return found
+
+    def test_a1_p2_a_board_that_fit_without_the_owner_section_still_fits(self) -> None:
+        window = self.window_lengths()
+        self.assertTrue(window, "the window the base fit and head did not must exist for this test to mean anything")
+        owner = row("OWNER-1", "parked", "2026-10-20T00:00:00Z", kind="hub-tooling", origin="owner", notes="waiting")
+        for n in (window[0], window[len(window) // 2], window[-1]):
+            for extra in ((), (owner,)):
+                with self.subTest(note_len=n, owners=len(extra)):
+                    text = render_roadmap.render(self.window_board(n, *extra))
+                    self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+                    self.assertEqual(sum(1 for c in table_cards(text) if c.startswith("PRODUCT-")), 300)   # product rows never drop
+                    if not extra:   # with an owner ask the one collapsed line can fit where the empty placeholder did not: then it stays
+                        self.assertNotIn("Parked owner asks", text)
+
+    def test_a1_p2_the_owner_section_is_back_whenever_it_fits(self) -> None:
+        text = render_roadmap.render(self.window_board(100))
+        self.assertIn("## Parked owner asks", text)
+        self.assertIn("(no owner ask is parked)", text)
+
     def test_a3_check_on_an_output_that_is_not_utf8_is_a_comparison_status(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
