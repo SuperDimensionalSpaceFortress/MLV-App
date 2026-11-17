@@ -168,6 +168,70 @@ if ($decoyAlive) { $decoy.p.Kill($true) }
         self.assertNotIn("exceeded the fail-closed process timeout", text)
         self.assertLess(out["waitedMs"], 60000, "a stalled leg must end at once, not wait out the remaining budget")
 
+    # adversary 797947a7 A1: after arming, a log that vanishes or is held unreadable, or a total that shrinks, is NOT progress.
+    def test_a_deleted_or_locked_or_shrinking_log_is_no_progress(self) -> None:
+        out = run_ps(r"""
+function Trip([scriptblock]$Mutate, [int]$Window = 1200) {
+    $dir = Join-Path $env:GS_TMP ([guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 1000)
+    Set-Content -LiteralPath (Join-Path $dir 'mlvapp-2.log') -Value ('y' * 1000)
+    $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs $Window
+    [void](Test-GuiSmokeLogProgressStalled -Watch $w)
+    $held = & $Mutate $dir
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
+    while ($sw.ElapsedMilliseconds -lt 6000 -and -not $tripped) { Start-Sleep -Milliseconds 150; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
+    if ($held) { $held.Dispose() }
+    Stop-GuiSmokeLogProgressWatch -Watch $w
+    $tripped
+}
+[pscustomobject]@{
+    deleted = [bool](Trip { param($d) Remove-Item -LiteralPath (Join-Path $d 'mlvapp-1.log'); Remove-Item -LiteralPath (Join-Path $d 'mlvapp-2.log'); $null })
+    locked = [bool](Trip { param($d) [IO.File]::Open((Join-Path $d 'mlvapp-1.log'), 'Open', 'ReadWrite', 'None') | Out-Null; $null })
+    shrunk = [bool](Trip { param($d) Remove-Item -LiteralPath (Join-Path $d 'mlvapp-2.log'); $null })
+} | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["deleted"], "a vanished log must not read as 'no data, so not stalled' forever")
+        self.assertTrue(out["shrunk"], "a total that shrinks is not progress")
+        self.assertTrue(out["locked"], "a log held unreadable is not progress")
+
+    # adversary 797947a7 A2: a chunked wait longer than the window would let a one-second window permit a minute or two.
+    def test_poll_chunk_is_a_fraction_of_the_window_and_the_runner_uses_it(self) -> None:
+        out = run_ps(r"""
+[pscustomobject]@{ a = Get-GuiSmokeNoProgressChunkMs -WindowMs 1000; b = Get-GuiSmokeNoProgressChunkMs -WindowMs 8000; c = Get-GuiSmokeNoProgressChunkMs -WindowMs 215000 } | ConvertTo-Json -Compress
+""")
+        self.assertEqual(250, out["a"])
+        self.assertEqual(2000, out["b"])
+        self.assertEqual(4000, out["c"])
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("$noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs", source)
+        # [Math]::Min takes two arguments (a three-argument call would throw), so the three bounds nest
+        self.assertIn("$hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))", source)
+        self.assertIn("[Math]::Min($noProgressChunkMs, $noProgressRemainingMs)", source)
+
+    # adversary 797947a7 A3: an -ExtraEnvironment pair must not move the log directory the watchdog (and the runner's own evidence read) uses.
+    def test_extra_environment_cannot_redirect_the_log_directory(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        for target in ("$launchEnv", "$envBlock"):
+            pairs = source.index(f"Add-EnvironmentPairs -Target {target} -Pairs $ExtraEnvironment")
+            nxt = source.index("\n", pairs)
+            reassert = source.index(f'{target}["MLVAPP_CRASH_FORENSICS_LOG_DIR"] = $logRoot', nxt)
+            self.assertLess(reassert - nxt, 700, f"{target}: the log directory must be re-asserted right after the extra pairs")
+
+    # adversary 797947a7 A4: a filesystem call that hangs (a stalled share) must not hold the chunk loop past its own budget.
+    def test_a_hung_log_probe_never_blocks_the_caller(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'hung'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Seconds 40; 5' -ProbeWaitMs 300
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$r = @(1..4 | ForEach-Object { [bool](Test-GuiSmokeLogProgressStalled -Watch $w) })
+$ms = [int]$sw.ElapsedMilliseconds
+$sw.Restart(); Stop-GuiSmokeLogProgressWatch -Watch $w; $stopMs = [int]$sw.ElapsedMilliseconds
+[pscustomobject]@{ results = $r; ms = $ms; stopMs = $stopMs } | ConvertTo-Json -Compress
+""")
+        self.assertFalse(any(out["results"]), "a probe that has not answered is unknown, and the overall budget stays the bound")
+        self.assertLess(out["ms"], 5000, "four polls with a hung probe must cost about 4 x 300 ms, not the probe's 40 s")
+        self.assertLess(out["stopMs"], 5000)
+
     def test_runner_checks_the_log_between_chunks_and_receipt_carries_the_outcome(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
         loop_start = source.index("$hostLoadDuringSamples.Add($newSample)")

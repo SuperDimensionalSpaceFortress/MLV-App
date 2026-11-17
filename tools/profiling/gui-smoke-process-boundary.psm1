@@ -61,9 +61,40 @@ function Get-GuiSmokeNoProgressWindowMs {
     return [int64]$window
 }
 
+# How often the runner's chunk loop looks at the log: a fraction of the window (a window of 1 s must not sit inside a 60 s chunked wait), never
+# below 250 ms and never above the 4 s cadence the host-load samples already use. The wait overshoots a stall by at most one chunk + one probe.
+function Get-GuiSmokeNoProgressChunkMs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 3600000)]
+        [int]$WindowMs
+    )
+
+    return [int][Math]::Max(250, [Math]::Min(4000, [Math]::Floor($WindowMs / 4)))
+}
+
+# The directory read and the file opens, run on a worker runspace so a stalled share cannot hold the caller (adversary 797947a7 A4).
+$script:GuiSmokeLogLengthProbe = @'
+param($LogRoot)
+$total = [int64]0
+$seen = $false
+foreach ($file in @(Get-ChildItem -LiteralPath $LogRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)) {
+    try {
+        $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try { $total += [int64]$stream.Length; $seen = $true } finally { $stream.Dispose() }
+    }
+    catch { }
+}
+if ($seen) { $total }
+'@
+
 # A watch over the app's own log files (mlvapp-*.log in the run's log directory). It is armed by the FIRST sign of a log, so the time
-# before the app writes anything (loading the input, Qt start-up) stays bounded by the overall budget only. Progress is any growth in
-# the summed file length, read through an opened handle (a directory listing can report a stale size for a file the app still holds).
+# before the app writes anything (loading the input, Qt start-up) stays bounded by the overall budget only. Progress is GROWTH of the
+# summed file length, read through an opened handle (a directory listing can report a stale size for a file the app still holds).
+# A log that vanishes, is held unreadable, or makes the total shrink is not progress. A probe that has not answered within -ProbeWaitMs is
+# left running and counts as no new information; the caller never waits on it again. Call Stop-GuiSmokeLogProgressWatch when done.
 function New-GuiSmokeLogProgressWatch {
     [CmdletBinding()]
     param(
@@ -71,36 +102,37 @@ function New-GuiSmokeLogProgressWatch {
         [string]$LogRoot,
         [Parameter(Mandatory)]
         [ValidateRange(1, 3600000)]
-        [int]$WindowMs
+        [int]$WindowMs,
+        [string]$ProbeScript = $script:GuiSmokeLogLengthProbe,
+        [ValidateRange(50, 5000)]
+        [int]$ProbeWaitMs = 1000
     )
 
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace.Open()
     [pscustomobject]@{
         LogRoot = $LogRoot
         WindowMs = $WindowMs
+        ProbeScript = $ProbeScript
+        ProbeWaitMs = $ProbeWaitMs
+        Runspace = $runspace
+        Pending = $null
+        Handle = $null
         Armed = $false
         LastLength = [int64]-1
         Quiet = [System.Diagnostics.Stopwatch]::StartNew()
     }
 }
 
-function Get-GuiSmokeLogTotalLength {
-    param([Parameter(Mandatory)][string]$LogRoot)
+function Stop-GuiSmokeLogProgressWatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Watch
+    )
 
-    $total = [int64]0
-    $seen = $false
-    try {
-        foreach ($file in @(Get-ChildItem -LiteralPath $LogRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)) {
-            try {
-                $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
-                    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-                try { $total += [int64]$stream.Length; $seen = $true } finally { $stream.Dispose() }
-            }
-            catch { }
-        }
-    }
-    catch { }
-    if ($seen) { return $total }
-    return $null
+    try { if ($null -ne $Watch.Pending) { [void]$Watch.Pending.BeginStop($null, $null) } } catch { }
+    try { [void]$Watch.Runspace.CloseAsync() } catch { }
 }
 
 function Test-GuiSmokeLogProgressStalled {
@@ -110,14 +142,40 @@ function Test-GuiSmokeLogProgressStalled {
         [object]$Watch
     )
 
-    $length = Get-GuiSmokeLogTotalLength -LogRoot $Watch.LogRoot
-    if ($null -eq $length) { return $false }
-    if (-not $Watch.Armed -or $length -ne $Watch.LastLength) {
-        $Watch.Armed = $true
-        $Watch.LastLength = $length
-        $Watch.Quiet.Restart()
-        return $false
+    if ($null -eq $Watch.Pending) {
+        $shell = [System.Management.Automation.PowerShell]::Create()
+        $shell.Runspace = $Watch.Runspace
+        [void]$shell.AddScript($Watch.ProbeScript).AddArgument($Watch.LogRoot)
+        $Watch.Pending = $shell
+        $Watch.Handle = $shell.BeginInvoke()
     }
+    $length = $null
+    if ($Watch.Handle.AsyncWaitHandle.WaitOne($Watch.ProbeWaitMs)) {
+        try {
+            $answer = @($Watch.Pending.EndInvoke($Watch.Handle))
+            if ($answer.Count -gt 0 -and $null -ne $answer[0]) { $length = [int64]$answer[0] }
+        }
+        catch { }
+        try { $Watch.Pending.Dispose() } catch { }
+        $Watch.Pending = $null
+        $Watch.Handle = $null
+    }
+    if ($null -ne $length) {
+        if (-not $Watch.Armed) {
+            $Watch.Armed = $true
+            $Watch.LastLength = $length
+            $Watch.Quiet.Restart()
+            return $false
+        }
+        if ($length -gt $Watch.LastLength) {
+            $Watch.LastLength = $length
+            $Watch.Quiet.Restart()
+            return $false
+        }
+        # shrinkage (a log removed) is never progress; the baseline follows it so a later real growth still counts
+        $Watch.LastLength = $length
+    }
+    if (-not $Watch.Armed) { return $false }
     return ($Watch.Quiet.ElapsedMilliseconds -ge $Watch.WindowMs)
 }
 
@@ -280,4 +338,4 @@ function Wait-GuiSmokeProcessBounded {
     }
 }
 
-Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeNoProgressWindowMs, New-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled
+Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled

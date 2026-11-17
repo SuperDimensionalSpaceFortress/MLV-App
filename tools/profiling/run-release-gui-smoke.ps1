@@ -1690,6 +1690,9 @@ if (-not [string]::IsNullOrWhiteSpace($GpuPlaybackReconBackend)) {
     $launchEnv["MLVAPP_GPU_PLAYBACK_RECON_BACKEND"] = $GpuPlaybackReconBackend
 }
 Add-EnvironmentPairs -Target $launchEnv -Pairs $ExtraEnvironment
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r3 (adversary 797947a7 A3): the app's log directory is the one the no-progress watchdog and the evidence read use,
+# so no -ExtraEnvironment pair may move it.
+$launchEnv["MLVAPP_CRASH_FORENSICS_LOG_DIR"] = $logRoot
 if ($CpuPlayPaceInformational) {
     $launchEnv[$script:GuiSmokePaceModeEnvironment] = "informational"
 }
@@ -1911,6 +1914,8 @@ else {
     [void]$envBlock.Remove("MLVAPP_GPU_PLAYBACK_RECON_BACKEND")
 }
 Add-EnvironmentPairs -Target $envBlock -Pairs $ExtraEnvironment
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r3 (adversary 797947a7 A3): re-assert the log directory the watchdog watches (see the $launchEnv path above).
+$envBlock["MLVAPP_CRASH_FORENSICS_LOG_DIR"] = $logRoot
 # ENFORCE-4 r2 (sol BLOCKER): the per-run nonce the app echoes on its playback_smoke.summary (run_nonce=); the loop verdict below
 # judges only a summary that carries it. Set AFTER -ExtraEnvironment so a caller cannot choose the nonce it is judged against.
 $envBlock["MLVAPP_RUN_NONCE"] = $runNonce
@@ -1988,18 +1993,31 @@ $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
 # adds the input re-read there). The watch arms at the app's first log line; before that only the whole budget bounds the wait.
 $noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $NoProgressTimeoutMs -CeilingMs $effectiveProcessTimeoutMs
 $noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noProgressWindowMs
+# r3 (adversary 797947a7 A2): no chunked wait may outlast a fraction of the window, or a short window would permit one chunk (up to 60 s) of silence.
+$noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs
 $noProgressStalled = $false
 if ($HostLoadSampleIntervalMs -gt 0) {
     $hostLoadSampleLoopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $hostLoadLastSampleAtMs = [int64]0
     while ($true) {
         $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
         if ($hostLoadRemainingMs -le 0) {
             break
         }
-        $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, $hostLoadRemainingMs)
+        $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))
         if ($process.WaitForExit($hostLoadChunkMs)) {
             break
         }
+        # r3: the chunk can now be shorter than the sampling interval (it follows the no-progress window), so a sample is taken only once the
+        # configured -HostLoadSampleIntervalMs has passed since the last one; the host-load cadence is unchanged.
+        if (([int64]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds - $hostLoadLastSampleAtMs) -lt $HostLoadSampleIntervalMs) {
+            if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch) {
+                $noProgressStalled = $true
+                break
+            }
+            continue
+        }
+        $hostLoadLastSampleAtMs = [int64]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
         $newSample = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectProcess $process `
             -SkipEvidenceCollection
         $hostLoadDuringSamples.Add($newSample)
@@ -2018,7 +2036,7 @@ else {
         if ($noProgressRemainingMs -le 0) {
             break
         }
-        if ($process.WaitForExit([Math]::Min(4000, $noProgressRemainingMs))) {
+        if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
             break
         }
         if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch) {
@@ -2028,6 +2046,8 @@ else {
     }
     $hostLoadSampleLoopElapsedMs = [int]$noProgressLoopStopwatch.ElapsedMilliseconds
 }
+# the worker runspace behind the log probe is released (a probe still hung on a stalled share is abandoned, never waited on)
+Stop-GuiSmokeLogProgressWatch -Watch $noProgressWatch
 # Whatever wall-clock time the sampling loop already spent waiting counts against the overall
 # process timeout budget -- the finalize wait below only needs to cover what's left. The 1ms floor
 # never actually extends an already-finished leg: WaitForExit on an already-exited process returns
