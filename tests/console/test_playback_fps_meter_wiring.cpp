@@ -65,6 +65,11 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
     const int lambdaEnd = lambda.indexOf(QStringLiteral("if( m_frameStillDrawing )"));
     ASSERT_TRUE(lambdaEnd > zeroAt);
     ASSERT_FALSE(lambda.left(lambdaEnd).contains(QStringLiteral("lastTime =")));
+    // LOOK-LABEL-PLAYBACK-INFO-1 r7 (adversary pass 9 A1): the 250 ms fps-text gate goes through the policy, which
+    // treats a wall-clock wrap as due; the raw `>= 250` held the status fps and the corner rate across midnight.
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "|| playback_fps_meter::fpsTextUpdateDue( m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) >=")));
 }
 
 // sol r1 BLOCKER: each 8 ms tick used to return through the m_frameStillDrawing branch before the

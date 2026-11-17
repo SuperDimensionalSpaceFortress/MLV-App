@@ -3114,7 +3114,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );
             const bool shouldUpdateFpsText =
                 !m_lastPlaybackFpsStatusUpdateTime.isValid()
-                || m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) >= 250;
+                || playback_fps_meter::fpsTextUpdateDue( m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) );   // r7 A1: a wrap is due
             if( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )
             {
                 const double smoothedFps = 1000.0 / m_playbackFpsEmaFrameMs;

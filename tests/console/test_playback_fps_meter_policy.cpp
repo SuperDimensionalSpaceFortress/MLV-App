@@ -6,7 +6,9 @@
 
 using playback_fps_meter::fpsMeterShouldReset;
 using playback_fps_meter::fpsMeterStalled;
+using playback_fps_meter::fpsTextUpdateDue;
 using playback_fps_meter::kFpsMeterStallMs;
+using playback_fps_meter::kFpsTextUpdateMs;
 using playback_fps_meter::smoothedFrameMs;
 
 // ---- fps meter: the interval is draw-to-draw, so an 8 ms poll cannot masquerade as the rate ----
@@ -58,4 +60,34 @@ TEST(PlaybackFpsMeterPolicy, ResetsWhenPausedBeforeAnyDrawOrStalledButNotBetween
     // the sol r1 repro: label at 24 fps, a render stays busy 900 ms -> stale, must reset
     ASSERT_TRUE(fpsMeterShouldReset(true, true, 900));
     ASSERT_TRUE(fpsMeterShouldReset(true, true, kFpsMeterStallMs + 1));
+}
+
+// LOOK-LABEL-PLAYBACK-INFO-1 r7 (adversary pass 9 A1 on 2239db98): the meter's QTime is wall clock, so
+// lastDrawTime 23:59:59.900 -> now 00:00:00.500 reads -86399400 ms. A negative (wrapped or stepped) draw age
+// is stalled like one past the limit; otherwise the stall reset and its stored-label repaint never run.
+TEST(PlaybackFpsMeterPolicy, R7A1ANegativeOrWrappedDrawAgeCountsAsStalled)
+{
+    const int midnightWrapMs = -86399400; // QTime(23,59,59,900).msecsTo(QTime(0,0,0,500))
+    ASSERT_TRUE(fpsMeterStalled(midnightWrapMs));
+    ASSERT_TRUE(fpsMeterStalled(-1));
+    ASSERT_TRUE(fpsMeterShouldReset(true, true, midnightWrapMs));
+    ASSERT_TRUE(fpsMeterShouldReset(true, true, -1));
+    // zero (same millisecond) and a normal frame period are not stalls
+    ASSERT_FALSE(fpsMeterStalled(0));
+    ASSERT_FALSE(fpsMeterShouldReset(true, true, 0));
+    // the smoothing step still ignores a negative sample (its <= 0 guard runs first)
+    ASSERT_EQ(42.0, smoothedFrameMs(42.0, midnightWrapMs));
+}
+
+// r7 A1 sibling (MainWindow.cpp fps-text gate): the same wall-clock wrap on the 250 ms text gate held the
+// status fps and the corner label's rate for a day when a draw, not an idle tick, was the first to see it.
+TEST(PlaybackFpsMeterPolicy, R7A1TheFpsTextGateTreatsAWrapAsDue)
+{
+    ASSERT_EQ(250, kFpsTextUpdateMs);
+    ASSERT_TRUE(fpsTextUpdateDue(-86399400));
+    ASSERT_TRUE(fpsTextUpdateDue(-1));
+    ASSERT_FALSE(fpsTextUpdateDue(0));
+    ASSERT_FALSE(fpsTextUpdateDue(kFpsTextUpdateMs - 1));
+    ASSERT_TRUE(fpsTextUpdateDue(kFpsTextUpdateMs));
+    ASSERT_TRUE(fpsTextUpdateDue(900));
 }

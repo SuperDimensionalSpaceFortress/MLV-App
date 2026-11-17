@@ -18,11 +18,23 @@ namespace playback_fps_meter
 /*! No draw for longer than this and the meter reads 0 and restarts. */
 inline constexpr int kFpsMeterStallMs = 500;
 
+/*! The status fps text (and the corner label's rate) is re-rendered at most this often. */
+inline constexpr int kFpsTextUpdateMs = 250;
+
 /*! \return true when no draw has happened for long enough that the meter
- *  should read 0 and restart (paused, stalled, or a fresh clip). */
+ *  should read 0 and restart (paused, stalled, or a fresh clip). A negative
+ *  age is stalled too: the meter's QTime is wall clock, so across midnight (or
+ *  a clock step back) msecsTo() reads about -86.4 million and never passes the limit. */
 inline bool fpsMeterStalled( int msSinceLastDraw )
 {
-    return msSinceLastDraw > kFpsMeterStallMs;
+    return msSinceLastDraw < 0 || msSinceLastDraw > kFpsMeterStallMs;
+}
+
+/*! \return true when the fps text is due a refresh. A negative age (wall-clock
+ *  wrap or step back) is due, or the gate would hold the old text for a day. */
+inline bool fpsTextUpdateDue( int msSinceLastUpdate )
+{
+    return msSinceLastUpdate < 0 || msSinceLastUpdate >= kFpsTextUpdateMs;
 }
 
 /*! \return true when the meter must read 0 and restart: playback is paused, no
