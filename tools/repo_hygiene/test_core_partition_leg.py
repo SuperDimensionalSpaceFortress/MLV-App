@@ -2924,9 +2924,18 @@ if (-not $hb.Contains($cat)) { throw 'the helper no longer reads the Processor I
 $hb = $hb.Replace($cat, '$cpFakeCat')
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
-$global:cpF = @{ sw = [Diagnostics.Stopwatch]::StartNew(); firstAt = $null; exitAt = [long]::MaxValue; stalled = $false; stopped = $false; start = [DateTime]::UtcNow }
+$global:cpF = @{ sw = [Diagnostics.Stopwatch]::StartNew(); firstAt = $null; exitAt = [long]::MaxValue; stalled = $false; stopped = $false; start = $null }
+# CORE-PARTITION-B1-RECUR-1: a slow host (hosted Windows: the helper's Add-Type compile and topology read before its first poll) spends real time between this
+# prelude and the helper's first sighting; the knob injects that time (CP_SETUP_DELAY_MS, default none) so the fixture is proven independent of it.
+if ($env:CP_SETUP_DELAY_MS) { Start-Sleep -Milliseconds ([int]$env:CP_SETUP_DELAY_MS) }
 # CORE-PARTITION-HELPER-PID-REUSE-1: its handle opens, as a real app's does (the helper refuses a measured app it could not pin with a held handle)
-$global:cpP = [pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; StartTime = $global:cpF.start; PriorityClass = 'Normal'; Handle = [IntPtr]1 }
+# CORE-PARTITION-B1-RECUR-1 (r3): the birth stamp is taken at the last read the helper makes before it stamps first sight, the StartTime getter (Get-CpBirth,
+# first read stamps), never at prelude time (r1) and never in the enumeration (r2 finding): the host time the helper spends on its own setup, or paused
+# between the enumeration and its first sighting (CP_ENUM_DELAY_MS), cannot push the first sighting past the runner-launch tolerance. Residual: the few
+# statements between that read and the first-sight stamp have no pause point.
+function global:Get-CpBirth { if ($null -eq $global:cpF.start) { $global:cpF.start = [DateTime]::UtcNow }; $global:cpF.start }
+$global:cpP =[pscustomobject]@{ Id = 5000; Path = $env:MLV_CP_EXE; PriorityClass = 'Normal'; Handle = [IntPtr]1 }
+$global:cpP | Add-Member -MemberType ScriptProperty -Name StartTime -Value { Get-CpBirth }
 $global:cpP | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
 $global:cpP | Add-Member -MemberType ScriptProperty -Name HasExited -Value {
     $e = $global:cpF.sw.ElapsedMilliseconds -ge $global:cpF.exitAt
@@ -2937,7 +2946,7 @@ $global:cpP | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Val
     if ($null -eq $global:cpF.firstAt) { $global:cpF.firstAt = $t }
     elseif (-not $global:cpF.stalled -and $t -ge $global:cpF.firstAt + 2500) { $global:cpF.stalled = $true; $global:cpF.exitAt = $t + 100; if ($env:CP_MODE -eq 'delayed') { Start-Sleep -Milliseconds 1500 } }
     [int64]4095 }
-function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id) if ($PSBoundParameters.ContainsKey('Id')) { return (@($global:cpP, $global:cpQ) | Where-Object { $null -ne $_ -and $_.Id -eq $Id }) }; if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { $global:cpP } }
+function Get-Process { [CmdletBinding()] param([string]$Name, [int]$Id) if ($PSBoundParameters.ContainsKey('Id')) { return (@($global:cpP, $global:cpQ) | Where-Object { $null -ne $_ -and $_.Id -eq $Id }) }; if (-not $global:cpF.stopped -and $global:cpF.sw.ElapsedMilliseconds -lt $global:cpF.exitAt) { if ($env:CP_ENUM_DELAY_MS -and -not $global:cpF.enumDelayed) { $global:cpF.enumDelayed = $true; Start-Sleep -Milliseconds ([int]$env:CP_ENUM_DELAY_MS) }; $global:cpP } }
 '@
 $src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n")
 $src = $src + "`n" + $hb
@@ -3038,8 +3047,8 @@ def _r14b_unidentified_driver() -> str:
                       "$global:cpQ = [pscustomobject]@{ Id = 200; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095; HasExited = $false }\n"
                       "$global:cpQ | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }\n"
                       "$global:cpQ | Add-Member -MemberType ScriptProperty -Name Path -Value { if ($env:CP_MODE -eq 'unreadable-path') { throw [ComponentModel.Win32Exception]::new(5) }; $env:MLV_CP_EXE }\n"
-                      "$global:cpQ | Add-Member -MemberType ScriptProperty -Name StartTime -Value { if ($env:CP_MODE -eq 'unreadable-start') { throw [ComponentModel.Win32Exception]::new(5) }; $global:cpF.start.AddSeconds(-5) }\n"),
-                     ("$global:cpF.exitAt) { $global:cpP } }", "$global:cpF.exitAt) { $global:cpP }; if ($env:CP_MODE -like 'unreadable-*') { $global:cpQ } }"),
+                      "$global:cpQ | Add-Member -MemberType ScriptProperty -Name StartTime -Value { if ($env:CP_MODE -eq 'unreadable-start') { throw [ComponentModel.Win32Exception]::new(5) }; (Get-CpBirth).AddSeconds(-5) }\n"),
+                     ("$global:cpP } }\n'@", "$global:cpP }; if ($env:CP_MODE -like 'unreadable-*') { $global:cpQ } }\n'@"),
                      ("foreach ($mode in @('delayed', 'tight')) {", "foreach ($mode in @('unreadable-path', 'unreadable-start', 'tight')) {"),
                      ("    $out[$mode] = [ordered]@{ endedBy = $rec.endedBy;",
                       "    $out[$mode] = [ordered]@{ vwhy = [string]$v.why; unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified }).Count; endedBy = $rec.endedBy;")):
@@ -3438,12 +3447,12 @@ class CorePartitionR10Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
 
-    def drive(self, name: str, body: str, lift: bool) -> dict:
+    def drive(self, name: str, body: str, lift: bool, env_more: dict | None = None) -> dict:
         work = self.tmp / name
         work.mkdir()
         driver = self.tmp / f"{name}.ps1"
         driver.write_text((LIFT if lift else "") + body, encoding="utf-8")
-        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work), **(env_more or {})})
         self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
         return json.loads(proc.stdout.strip().splitlines()[-1])
 
@@ -3451,7 +3460,25 @@ class CorePartitionR10Tests(unittest.TestCase):
         """B1 (sol r9 B1 = adversary r9 8cf7e883 A1), the real helper body: the alive stamp is taken before the liveness query, so a helper stalled
         1500 ms after the query that saw the app alive (the app exiting 100 ms into the stall) reports the whole alive-to-gone gap and the run is
         refused coverage-endpoint-gap; on 8cf7e883 the late stamp shrinks the gap to one poll and bench and load are accepted. Control: a tight poll."""
-        got = self.drive("b1", B1_DRIVER, True)
+        self.check_b1(self.drive("b1", B1_DRIVER, True))
+
+    def test_b1_a_slow_helper_setup_does_not_pre_empt_the_endpoint_gap_reason(self) -> None:
+        """CORE-PARTITION-B1-RECUR-1 (merge_group runs 43971516626 and 44015460397, run 42740532903): on a slow hosted runner the helper's own setup
+        (Add-Type compile, topology read) before its first poll took over 1.5 s, the double's birth stamp was taken before it, and the first sighting
+        then read as past the runner-launch tolerance (measured-app-seen-after-runner-launch), which the verdict applies before the endpoint gap, so
+        the reason the B1 test pins was never written. 3000 ms of injected setup time must change nothing: the fixture's birth stamp is taken when
+        the helper first enumerates the process, never earlier."""
+        self.check_b1(self.drive("b1-slow-setup", B1_DRIVER, True, {"CP_SETUP_DELAY_MS": "3000"}))
+
+    def test_b1_a_pause_between_the_enumeration_and_the_first_sighting_does_not_pre_empt_the_endpoint_gap_reason(self) -> None:
+        """CORE-PARTITION-B1-RECUR-1 r3 (sol r1 on 1706fb2d, blocker): the r1 fix stamped the double's birth inside Get-Process, so a pause between that
+        enumeration and the helper's first-sighting stamp (the helper reads Handle, Path and StartTime in between) still pushed the first sighting past
+        the runner-launch tolerance. 2000 ms injected right after the enumeration must change nothing: the birth is stamped at the last read the helper
+        makes before it stamps first sight (the StartTime getter). Residual: the few statements between that read and the first-sight stamp have no
+        pause point."""
+        self.check_b1(self.drive("b1-enum-pause", B1_DRIVER, True, {"CP_ENUM_DELAY_MS": "2000"}))
+
+    def check_b1(self, got: dict) -> None:
         delayed, tight = got["delayed"], got["tight"]
         for case in (delayed, tight):
             self.assertEqual(case["endedBy"], "stop-file", got)
