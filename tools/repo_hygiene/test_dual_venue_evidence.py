@@ -16549,6 +16549,46 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
         ok = self.each(capped, [start.format(q="unset").replace(" env_omp_num_threads=1", " env_omp_num_threads=unset")])
         self.assertEqual((ok[0]["verdict"], ok[0]["blocks"]), ("HONOURED", False), ok)
 
+    def test_r24_pass2_a1_a_record_that_lost_its_tail_is_refused_whole(self) -> None:
+        # r24 adversary pass 2 A1 on d89dc086, its input verbatim: the =-free quoted ` (` is no location, the unquoted ` (` after the proof fields is an
+        # unreadable one, and the cut tail held fps_override=1; on d89dc086 the fields before the cut still read (valid=true). Refused whole now.
+        summary = ("playback_smoke.summary session=3 note=\"harmless (text)\" source_advanced=600 required_source_frames=600 native_fps=30 pace_fps=30 "
+                   "fps_override=0 wrapped=0 wrap_count=0 run_nonce=0123456789abcdef0123456789abcdef diagnostic='prefix ( fps_override=1")
+        got = self.each(self.PLAYBACK, [self.WINDOW + summary])
+        self.assertEqual((got[0]["sourceAdvanced"], got[0]["valid"]), (None, False), got)
+        # siblings: the start record the inherited-override reader reads, and the visual_state record the Look Assist reader reads
+        start = ("playback_smoke.measured_session id=3\nplayback_smoke.start session=3 worker_threads=8 env_force_threads=unset env_force_singlethread=unset "
+                 "env_playback_max_threads=8 env_disable_playback_thread_cap=unset x ( env_omp_num_threads=1")
+        capped = ("$w = Get-DvWorkerThreadsEvidence -Spec (@{ generatorArgs = @{ playbackMaxThreads = 8 } }) -LogText $log -Summary ([pscustomobject]@{ "
+                  "result = 'MEASUREMENT_CAPTURED'; playbackMaxThreadsRequested = 8; playbackMaxThreadsSmoke = 8; playbackWorkerThreadsRead = 8 }); $w.blocks")
+        self.assertEqual(self.each(capped, [start]), [True])
+        look = ("playback_smoke.measured_session id=3\n[INFO] interaction_trace event=gui_smoke.visual_state look_assist_enabled=1 "
+                "look_assist_flavor=cinematic x ( look_assist_enabled=0\n" + self.PLAIN_SUMMARY)
+        self.assertEqual(self.each("(Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $log).verdict", [look]),
+                         ["NOT_HONOURED"])
+
+    def test_r24_pass2_a2_a_proof_token_is_compared_ordinally(self) -> None:
+        # r24 adversary pass 2 A2 on d89dc086, its input verbatim (post_counts_settled=U+0661) plus the variants it names: a linguistic compare read
+        # each as ASCII 1 and the posted arm was HONOURED
+        window = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        wake = "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled={s} disabled=0 delivery=native-msg delivery_kind=post"
+        posted = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        tokens = ["١", "۱", "1­", "1​", "1﻿"]
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [(posted, window + wake.format(s=t)) for t in tokens]
+                                            + [(posted, window + wake.format(s="1").replace("native-msg", "native-msg­"))])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for i, v in enumerate(out):
+            with self.subTest(case=i):
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [(posted, window + wake.format(s="1"))])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["verdict"], out[0]["blocks"]), ("HONOURED", False), out[0])
+        look = ("playback_smoke.measured_session id=3\n[INFO] interaction_trace event=gui_smoke.visual_state look_assist_enabled={v} "
+                "look_assist_flavor=cinematic\n" + self.PLAIN_SUMMARY)
+        got = self.each("(Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $log).verdict",
+                        [look.format(v="١"), look.format(v="1​"), look.format(v="1")])
+        self.assertEqual(got, ["NOT_HONOURED", "NOT_HONOURED", "HONOURED"], got)
+
     def test_r24_the_look_label_reader_takes_no_record_from_a_quoted_span(self) -> None:
         # Get-DvLookLabelEvidence read raw lines unanchored, so a label record spelled inside another record's quoted span answered for the app
         inner = 'gui_smoke.look_label shown="Look: A" expected="Look: A" surface=windowed_status_bar show_in_fullscreen=1 wait_ms=0'

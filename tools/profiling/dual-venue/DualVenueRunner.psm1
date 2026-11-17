@@ -1137,7 +1137,10 @@ function Get-DvSmokeSummaryFields {
             # MASKED `=` (a `<key>=` inside a quoted span, ConvertTo-DvQuoteMaskedBody) is refused whole: no field is read from it, so the quoted text never
             # supplies a field (the key3 repro's `source_advanced=600`) and a stray quote never hides a real field while the rest still reads (fields empty,
             # so every proof field is absent and the evidence is invalid). The app's own summary values hold no `=` inside a quote (real-log-mask-check)
-            if ($null -ne $summaryLine -and $summaryLine.IndexOf($script:DvQuotedEqualsMask) -lt 0) {
+            # r24 (r24 adversary pass 2 A1 on d89dc086, its input: an =-free quoted ` (` first, then the proof fields, then `diagnostic='prefix (
+            # fps_override=1`): a summary record that lost its tail to the LOCATION_UNREADABLE sentinel ($located false) is refused whole too, as the
+            # session readers already refuse it, so a field in the cut tail is never hidden while the fields before it still read
+            if ($null -ne $summaryLine -and $summaryLine.IndexOf($script:DvQuotedEqualsMask) -lt 0 -and (& $located $summaryLine)) {
                 foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
             }
             foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $conformLine = $line } }
@@ -1386,7 +1389,10 @@ function Get-DvPlaybackEvidence {
     $parsed = Get-DvSmokeSummaryFields -LogText $LogText
     $f = $parsed.fields
     $conformFields = @{}
-    if ($null -ne $parsed.conformLine) { foreach ($m in [regex]::Matches([string]$parsed.conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $conformFields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
+    # r24 (r24 adversary pass 2 A1 sibling): a conform record that holds a masked `=` or lost its tail to the LOCATION_UNREADABLE sentinel supplies no
+    # conform field (refused whole, like the summary record), so the conform proof reads it as absent and is not proven
+    $conformReadable = ($null -ne $parsed.conformLine) -and ([string]$parsed.conformLine).IndexOf($script:DvQuotedEqualsMask) -lt 0 -and -not ([string]$parsed.conformLine).EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)
+    if ($conformReadable) { foreach ($m in [regex]::Matches([string]$parsed.conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $conformFields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
     $conformPlaybackField = ConvertTo-DvDouble $conformFields['playback_fps']
     $conformClipField = ConvertTo-DvDouble $conformFields['clip_fps']
     $wrappedField = ConvertTo-DvInt64 $f['wrapped']
@@ -1702,7 +1708,8 @@ function Get-DvInheritedWorkerOverrides {
     $overrides = [System.Collections.Generic.List[string]]::new()
     $unreadable = [System.Collections.Generic.List[string]]::new()
     foreach ($row in $rows) {
-        if ($StartRead.duplicates -contains $row[0]) { $unreadable.Add($row[1]); continue }
+        # r24 (r24 adversary pass 2 A1 sibling): a start record refused whole (Get-DvSmokeSessionLineRead unreadable) makes every row unreadable
+        if ($StartRead.unreadable -eq $true -or $StartRead.duplicates -contains $row[0]) { $unreadable.Add($row[1]); continue }
         $value = $StartRead.fields[$row[0]]
         if ($null -ne $value -and $value -cnotin $row[2]) { $overrides.Add("$($row[1])=$value") }
     }
@@ -2003,7 +2010,9 @@ function Get-DvDueWakeDelivered {
     }
     # r9 (G10): the post counts must be settled, as exactly one post_counts_settled=1
     $settled = [regex]::Matches([string]$Line, '(?:^|\s)post_counts_settled=(?<s>\S*)')
-    if ($settled.Count -ne 1 -or $settled[0].Groups['s'].Value -cne '1') { return 'unreadable' }
+    # r24 (r24 adversary pass 2 A2 on d89dc086, its input: post_counts_settled=<U+0661>): ORDINAL, never -cne (a linguistic compare equates U+0661 /
+    # U+06F1 with ASCII 1 and ignores U+00AD / U+200B / U+FEFF), so only the ASCII token 1 is settled
+    if ($settled.Count -ne 1 -or -not [string]::Equals($settled[0].Groups['s'].Value, '1', [StringComparison]::Ordinal)) { return 'unreadable' }
     if (($n['fired'] - $n['post_rescued']) -lt [System.Numerics.BigInteger]::One) { return 'none' }
     'delivered'
 }
@@ -2206,7 +2215,8 @@ function Get-DvDueWakeDeliveryEvidence {
                 $k = $fields[0].Groups['k'].Value
                 $parts = @($mech[0].Groups['m'].Value -split '\+')
                 $allowed = switch ($k) { 'none' { @('none') } 'qtimer' { @('qtimer', 'none') } 'notifier' { @('notifier', 'qtimer', 'none') } default { @('native-msg', 'qtimer', 'none') } }
-                if (@($parts | Where-Object { $_ -cnotin $allowed }).Count -gt 0) { $unreadableSeen = $true }
+                # r24 (r24 adversary pass 2 A2 sibling): each part is one of the allowed tokens ORDINALLY (-cnotin is linguistic: native-msg<U+00AD> matched)
+                if (@($parts | Where-Object { $p = [string]$_; @($allowed | Where-Object { [string]::Equals($p, $_, [StringComparison]::Ordinal) }).Count -eq 0 }).Count -gt 0) { $unreadableSeen = $true }
                 else { $observed = $k; $mechanism = $mech[0].Groups['m'].Value; $delivered = Get-DvDueWakeDelivered -Line $l }
             }
         }
@@ -2408,6 +2418,9 @@ function Get-DvLookAssistEvidence {
         }
         $verdict = 'NOT_HONOURED'
         if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
+        # r24 (r24 adversary pass 2 A1 sibling): a visual_state record that lost its tail to the LOCATION_UNREADABLE sentinel may have said
+        # look_assist_enabled=0 there, so it is unreadable whole, never read from the fields before the cut
+        elseif ($found.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $reason = "the app's last gui_smoke.visual_state line lost its tail to an unreadable location, so whether Look Assist was on is unreadable" }
         else {
             $m = [regex]::Match($found, '(^|\s)look_assist_enabled=(?<v>\S+)')
             if (-not $m.Success) { $reason = 'the app''s gui_smoke.visual_state line carries no look_assist_enabled' }
@@ -2422,7 +2435,8 @@ function Get-DvLookAssistEvidence {
                 $lastFlavors = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value } | Select-Object -Unique)
                 $enabledValues = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)') | ForEach-Object { $_.Groups['v'].Value } | Select-Object -Unique)
                 if ($flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
-                if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
+                # r24 (r24 adversary pass 2 A2 sibling): ORDINAL, so look_assist_enabled=<U+0661> or 1<U+200B> is never on
+                if (-not [string]::Equals($reported, '1', [StringComparison]::Ordinal)) { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
             }
         }
@@ -2522,6 +2536,7 @@ function Get-DvSmokeSessionLineRead {
     $fields = @{}
     # keys compare case-insensitively, like the @{} table every caller indexes
     $duplicates = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $unreadableRecord = $false
     $found = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
@@ -2549,9 +2564,13 @@ function Get-DvSmokeSessionLineRead {
         # the duplicates, which every consumer already refuses (Get-DvInheritedWorkerOverrides names it unreadable; Get-DvSmokeSessionLineFields leaves
         # it out, fail closed). The key is bounded by any non-name character, so a quote-glued key counts too.
         foreach ($m in [regex]::Matches($found, '(?<![A-Za-z0-9_])(?<k>[A-Za-z0-9_]+)\x1A')) { [void]$duplicates.Add($m.Groups['k'].Value) }
+        # r24 (r24 adversary pass 2 A1 sibling): a record that lost its tail to the LOCATION_UNREADABLE sentinel may have named any key there, so it is
+        # UNREADABLE whole: every key it shows is a duplicate (no field is read) and `unreadable` tells a reader that treats absence as clean
+        # (Get-DvInheritedWorkerOverrides) that every key it needs is unreadable too
+        if ($found.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $unreadableRecord = $true; foreach ($k in @($seen.Keys)) { [void]$duplicates.Add($k) } }
         foreach ($k in $seen.Keys) { if (-not $duplicates.Contains($k)) { $fields[$k] = $seen[$k] } }
     }
-    @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
+    @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object); unreadable = [bool]$unreadableRecord }
 }
 
 # r5 (sol r4 B1 on #726): what Get-DvLogRecordBody puts in place of a location it cannot read. It holds no `=` and no record marker, so no field or
