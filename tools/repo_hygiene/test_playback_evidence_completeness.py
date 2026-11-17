@@ -380,6 +380,8 @@ CONSUMER_EXEMPT: dict[str, str] = {
         "parameter-validation self-test: it runs the runner only to see it REFUSE at param validation (never plays).",
     "tools/profiling/test-playback-quality-contract.ps1":
         "contract self-test: every case runs the runner expecting a non-zero exit and fails when it exits 0.",
+    "tools/profiling/test-um-run-share-root-access.ps1":
+        "self-test that lifts Test-AgentHeartbeat out of the two ultramagnus evidence scripts with the PowerShell parser and calls only that function on scratch roots; it never launches either script.",
     "tools/profiling/summarize-local-cuda-proof.ps1": "prints the proof commands as text; it launches nothing.",
     "tools/profiling/package-local-cuda-proof-result.ps1": "packages an existing proof folder; it launches nothing.",
     "tools/profiling/run-release-cuda-dng-export.ps1":

@@ -4335,6 +4335,12 @@ ENCODED_LAUNCH_SITES = {
         ('"-EncodedCommand", (New-HeavySlotSentinelCommand',
          "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree"),
     ],
+    "tools/workstation/Setup-MlvWorkstation.ps1": [
+        ("-EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($call)))",
+         "MINI3-CUTOVER-STATE-GAPS-1: the owner-run workstation setup re-running itself under the MSI pwsh when the Store pwsh is detected: a "
+         "synchronous child (`& $msiPwsh ...` then `exit $LASTEXITCODE`), not detached; it installs workstation tooling, takes no lane worktree "
+         "and is never a lane driver the retire guard has to find"),
+    ],
 }
 # MLV-VM-HEAVY-SLOT-ADOPT-1 r3b: sites the scanner reports as `encoded` that launch nothing. Unlike the inventories above, these
 # match the WHOLE site text exactly (not a substring), so a launch built around the same expression is still a site to classify.
@@ -4471,6 +4477,13 @@ UNRESOLVED_EXECUTED_SITES = {
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
         ("[void]$ps.AddScript($Script.ToString())",
          "the same Invoke-Bounded pattern: every caller in this file hands it a { } literal share read, which the AST scans as code"),
+        ("(Get-ShareRootAccess -Root $r -Probe ([scriptblock]::Create($pt))).State",
+         "MINI3-CUTOVER-STATE-GAPS-1 r13 (r12 A6): inside the { } literal Stop-ShareUnreachable hands Invoke-Bounded (:242), which the AST scans as code. "
+         "$pt is $probeText (:241), the .ToString() of the test-only -TestShareRootProbe parameter ([scriptblock], :105), '' in production, where the worker "
+         "takes the else branch and runs Get-ShareRootAccess with its built-in one-attribute-read default. The text is rebuilt inside the worker runspace "
+         "because a scriptblock cannot cross runspaces; the worker only passes it to Get-ShareRootAccess -Probe (ShareRootAccess.psm1:44), which calls "
+         "it once with the share root and reads State. The parameter is a { } the caller of the nightly typed on its own command line (a test), "
+         "never text read from a share or a job file"),
     ],
     "tools/profiling/dual-venue/Summarize-VenueBusyProbes.ps1": [
         (". ([scriptblock]::Create($fn[0].Extent.Text))",
