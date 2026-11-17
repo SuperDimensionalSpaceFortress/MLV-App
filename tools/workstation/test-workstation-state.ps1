@@ -2236,6 +2236,26 @@ if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r21 p25')) {
     }
     Assert-That ($r21err -match 'LEASE_PUSH_URL_DIFFERS') 'r21 p25 A4 lease: a fetch url with a trailing space and a push url without it is refused before any push (the reader no longer trims it away)' $r21err
 }
+# r21 adversary pass 26 A3: a line terminator INSIDE a configured url is part of what Git sends. 'git remote get-url' prints it as extra output lines, so the readers join the lines
+# with LF (they used to join with '' and trim the end) and the helper treats any CR or LF as not mapped (equal only to the identical string).
+if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r21 p26')) {
+    Assert-That (-not (Test-GitRemoteUrlSame ('git@nas.example:repos/lease.git' + "`n") 'git@nas.example:repos/lease.git')) 'r21 p26 A3 url: a trailing line feed is part of the url'
+    Assert-That (-not (Test-GitRemoteUrlSame ('git@nas.example:repos/lease' + "`n" + '.git') 'git@nas.example:repos/lease.git')) 'r21 p26 A3 url: an embedded line feed is part of the url'
+    Assert-That (Test-GitRemoteUrlSame ('git@nas.example:repos/lease' + "`n" + '.git') ('git@nas.example:repos/lease' + "`n" + '.git')) 'r21 p26 A3 url control: an identical url with an embedded line feed is the same'
+    $r26ws = New-Scratch 'r21-p26-a3'; $r26repo = Join-Path $r26ws 'repo'; [void][IO.Directory]::CreateDirectory($r26repo); & git -C $r26repo init -q 2>$null
+    & git -C $r26repo remote add fork ('git@nas.example:repos/lease.git' + "`n"); & git -C $r26repo remote set-url --push fork 'git@nas.example:repos/lease.git'   # configuration only: no network is touched
+    $r26err = ''
+    $r26saved = @{ Repo = $script:Repo; Temp = $env:TEMP; Log = $script:LogFile; Name = $GitName; Email = $GitEmail }
+    $script:Repo = $r26repo; $Repo = $r26repo; $env:TEMP = New-Scratch 'r21-p26-a3-temp'; $script:LogFile = Join-Path $r26ws 'lease.log'
+    $GitName = 'r21 test'; $script:GitName = 'r21 test'; $GitEmail = 'r21@example.invalid'; $script:GitEmail = 'r21@example.invalid'
+    $r26ident = @{}; foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { $r26ident[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, 'r21 test') }
+    try { Set-HubLease -Holder 'TEST-HOST' -Current @{ Exists = $false; Sha = ''; Holder = '' } -Reason 'r21 p26 A3' *>&1 | Out-Null } catch { $r26err = $_.Exception.Message }
+    finally {
+        $script:Repo = $r26saved.Repo; $Repo = $r26saved.Repo; $env:TEMP = $r26saved.Temp; $script:LogFile = $r26saved.Log; $GitName = $r26saved.Name; $script:GitName = $r26saved.Name; $GitEmail = $r26saved.Email; $script:GitEmail = $r26saved.Email
+        foreach ($n in $r26ident.Keys) { [Environment]::SetEnvironmentVariable($n, $r26ident[$n]) }
+    }
+    Assert-That ($r26err -match 'LEASE_PUSH_URL_DIFFERS') 'r21 p26 A3 lease: a fetch url ending in a line feed and a push url without it is refused before any push' $r26err
+}
 # r20 adversary pass 23 A2: an apostrophe in the USER part of 'https://user:password@host' does not hide the credential
 if ($fnLoaded -and (Test-Has 'Get-CredentialHitLine' 'r20 p23 A2')) {
     Assert-That (Test-CredentialText 'endpoint = "https://o''brien:hunter2@example.org/repo"') 'r20 p23 A2 detector: an apostrophe in a URL user name does not hide the credential'
