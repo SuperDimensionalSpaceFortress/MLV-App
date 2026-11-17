@@ -282,6 +282,38 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         # a is read at about 2 s and b at about 4 s: credited when seen the verdict is about 2 s + the 3 s window = 5 s, credited when the batch ends it is 4 s + 3 s = 7 s
         self.assertLess(out["stalledAfterMs"], 6200,"the growth must be credited at the poll that sees it, not at the end of the batch")
 
+    # adversary 1b823896 A2 (r5 fix 2): the announcement arms the watch and starts the quiet clock; the log's FIRST read, arriving late, is only a
+    # baseline. Unchanged data must not be granted a second window from the read.
+    def test_a_late_first_read_of_an_announced_log_does_not_restart_the_quiet_clock(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'latefirstread'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 1000) -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 3000 -ProbeOpenDelayMs 2750 -ProbeWaitMs 300
+$sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $armedAt = -1
+while ($sw.ElapsedMilliseconds -lt 12000 -and -not $tripped) {
+    if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
+    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$sw.ElapsedMilliseconds }
+    Start-Sleep -Milliseconds 100
+}
+$ms = [int]$sw.ElapsedMilliseconds
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ tripped = $tripped; armedAt = $armedAt; ms = $ms } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["tripped"])
+        self.assertGreaterEqual(out["armedAt"], 0)
+        # armed at the announcement, so the verdict is at about armedAt + 3 s; a first read credited as growth would move it to about armedAt + 5.75 s
+        self.assertLess(out["ms"] - out["armedAt"], 4600, "unchanged data was granted a second window by its first read")
+
+    # adversary 1b823896 A1 (r5 fix 2): the announcement of a listed log comes out of the PIPELINE as the listing yields it, never after the whole
+    # listing is collected, so a listing that blocks after its first entry still arms the watch.
+    def test_the_announcement_streams_from_the_listing_before_the_listing_completes(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        start = text.index("ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {")
+        probe = text[start:text.index("\n        }\n        $Watch.Hung = $false", start)]
+        self.assertNotIn("@(Get-ChildItem", probe, "collecting the listing first would hold every announcement behind a blocked enumeration")
+        self.assertIn("Get-ChildItem -LiteralPath $using:probeRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue | ForEach-Object { '{0}|-2' -f $_.Name;", probe)
+        self.assertLess(probe.index("|-2' -f $_.Name"), probe.index("[System.IO.File]::Open("), "every announcement precedes the first open")
+
     # adversary 57a7a5c9 A1: toggling read access to one log (total 2000 / 1000 / 2000 ...) must not read as growth -- restoration is not progress.
     def test_denying_and_restoring_read_access_cannot_manufacture_progress(self) -> None:
         out = run_ps(r"""

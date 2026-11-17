@@ -4715,6 +4715,9 @@ def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_e
                            "WriteAll", ".Write(", "Delete(", "SetLength", "FileAccess]::Write", "FileAccess]::ReadWrite", "FileMode]::Create",
                            "FileMode]::Truncate", "FileMode]::Append", "FileMode]::OpenOrCreate") if v in body]
     assert not writers and "Get-ChildItem -LiteralPath $using:probeRoot" in body and "[System.IO.FileAccess]::Read" in body, f"the probe must only list and read: {writers}"
+    # (3b) r5 fix 2 (adversary 1b823896 A3): a positive allowlist, so a write shape no blacklist names is refused too: the only .NET file call is
+    # Open, and the only commands are the listing, the pipeline stage and the test-seam sleep
+    assert re.findall(r"\[System\.IO\.File\]::(\w+)", body) == ["Open"] and set(re.findall(r"\b[A-Z][a-z]+-[A-Z]\w+", body)) <= {"Get-ChildItem", "ForEach-Object", "Start-Sleep"}, "the probe may only list, open for reading and sleep"
     # (4) the wait is $job.Finished.WaitOne(ms) bounded by the absolute end (entry stopwatch + budget)
     assert "$Watch.Pending.Finished.WaitOne($waitMs)" in code and "[Math]::Min([int]$Watch.ProbeWaitMs, $leftMs)" in code, "the wait is Finished.WaitOne bounded by what is left"
     # (5) completion receives the job's output then removes the job

@@ -148,9 +148,10 @@ function Test-GuiSmokeLogProgressStalled {
         $probeOpenDelayMs = [int]$Watch.ProbeOpenDelayMs
         $Watch.Pending = 1 | ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {
             if ($using:probeDelayMs -gt 0) { Start-Sleep -Milliseconds $using:probeDelayMs }
-            $listed = @(Get-ChildItem -LiteralPath $using:probeRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue)
-            # every listed log is announced (length -2) BEFORE any open, so a log whose open then blocks still arms the watch
-            foreach ($file in $listed) { '{0}|-2' -f $file.Name }
+            # every listed log is announced (length -2) AS THE LISTING YIELDS IT and BEFORE any open, so a log whose open then blocks, or a listing
+            # that blocks after its first entry, still arms the watch (adversary 1b823896 A1)
+            $listed = @()
+            Get-ChildItem -LiteralPath $using:probeRoot -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue | ForEach-Object { '{0}|-2' -f $_.Name; $listed += $_ }
             foreach ($file in $listed) {
                 if ($using:probeOpenDelayMs -gt 0) { Start-Sleep -Milliseconds $using:probeOpenDelayMs }
                 $length = [int64]-1
@@ -198,8 +199,9 @@ function Test-GuiSmokeLogProgressStalled {
             $length = if ([int64]::TryParse($text.Substring($cut + 1), [ref]$parsed)) { $parsed } else { [int64]-1 }
             if ($length -eq -2) {
                 # listed, not yet read (the probe announces every listed log before it opens any): arms the watch, is not progress, and a name
-                # already known is left as it is
-                if (-not $Watch.Files.ContainsKey($name)) { $Watch.Files[$name] = [int64]-2 }
+                # already known is left as it is. -2 = announced while the watch was not yet armed (the arming IS its sign of life, so its first
+                # read is only a baseline: adversary 1b823896 A2); -3 = a NEW name announced mid-run (its first readable length is the sign of life)
+                if (-not $Watch.Files.ContainsKey($name)) { $Watch.Files[$name] = $(if ($Watch.Armed) { [int64]-3 } else { [int64]-2 }) }
             }
             elseif (-not $Watch.Files.ContainsKey($name)) {
                 # the first sighting of a log arms the watch (below). r4 (adversary b0a33ba9 A1): a log unreadable at that first look is UNKNOWN
@@ -208,7 +210,12 @@ function Test-GuiSmokeLogProgressStalled {
                 if ($length -ge 0) { $progress = $true }
             }
             elseif ([int64]$Watch.Files[$name] -eq -2) {
-                # the first read of a log announced earlier: the same first-sighting rule (unreadable is UNKNOWN, readable is a sign of life)
+                # the first read of a log announced before the watch armed: unreadable is UNKNOWN, readable is the BASELINE and is not growth
+                # (unchanged data must not restart the quiet clock the announcement started)
+                $Watch.Files[$name] = [Math]::Max([int64]-1, $length)
+            }
+            elseif ([int64]$Watch.Files[$name] -eq -3) {
+                # the first read of a new log announced after the watch armed: the first-sighting rule (unreadable is UNKNOWN, readable is a sign of life)
                 $Watch.Files[$name] = [Math]::Max([int64]-1, $length)
                 if ($length -ge 0) { $progress = $true }
             }
