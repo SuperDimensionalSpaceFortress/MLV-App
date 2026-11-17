@@ -106,7 +106,13 @@ inline QString debayerField( const Facts &facts )
         return name + QStringLiteral( "->" ) + gpu + QStringLiteral( " (GPU)" );
     }
     if( name.isEmpty() ) return QString();
-    return facts.debayerOnGpu ? name + QStringLiteral( " (GPU)" ) : name;
+    if( facts.debayerOnGpu ) return name + QStringLiteral( " (GPU)" );
+    // r7 (adversary pass 10 A1 on 235e3275): a CPU frame below full scale never runs the selected debayer. Every scaled CPU
+    // route bins the Bayer to RGB (pl_downsample_bayer_to_rgb_2x/4x/8x) or runs bilinear on a reduced Bayer (video_mlv.c),
+    // so it reads "<selected>->Scaled" (selected -> ran), never "AMaZE". The scale is the one the scale field names as shown.
+    const int shownScale = ( facts.presentedValid && facts.presentedScale > 0 ) ? facts.presentedScale : facts.requestedScale;
+    if( shownScale > 1 ) return name + QStringLiteral( "->Scaled" );
+    return name;
 }
 
 inline bool clipFpsKnown( const Facts &facts )

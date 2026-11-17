@@ -678,3 +678,55 @@ TEST(PlaybackInfoLabel, R1A5FieldNewlinesNeverAddLines)
     ASSERT_TRUE(text.startsWith(QStringLiteral("GPU display A B C")));
     ASSERT_TRUE(text.contains(QStringLiteral("X Y (GPU)")));
 }
+
+// r7 adversary pass 10 A1 (235e3275): non-Dual-ISO clip, CPU playback at scale 2 with AMaZE selected. The scaled CPU route bins
+// the Bayer (pl_downsample_bayer_to_rgb_2x, video_mlv.c) and never runs AMaZE, yet both surfaces read "AMaZE". A CPU frame below
+// full scale names the scaled route; scales 4 and 8 share it; full scale and the GPU forms are unchanged.
+TEST(PlaybackInfoLabel, R7P10A1ScaledCpuFrameNeverNamesTheSelectedDebayerAsRan)
+{
+    playback_info_label::Facts f = ownerFacts();
+    f.gpuDisplay = false;
+    f.processingBadge = QStringLiteral("CPU");
+    f.dualIsoClip = false;
+    f.debayer = QStringLiteral("AMaZE");
+    f.debayerOnGpu = false;
+    f.gpuDebayer = QString();
+    for (int scale : {2, 4, 8}) {
+        f.requestedScale = scale;
+        f.presentedScale = scale;
+        f.presentedValid = true;
+        ASSERT_QSTR_EQ(QStringLiteral("AMaZE->Scaled"), playback_info_label::debayerField(f));
+        const QString overlay = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+        const QString twin = playback_info_label::compose(f, playback_info_label::Toggles(), false);
+        ASSERT_TRUE(overlay.contains(QStringLiteral("AMaZE->Scaled")));
+        ASSERT_TRUE(twin.contains(QStringLiteral("AMaZE->Scaled")));
+        ASSERT_FALSE(overlay.section(QLatin1Char('\n'), 0, 0).endsWith(dot() + QStringLiteral("AMaZE")));
+    }
+    // the scale the scale field shows: a presented Full frame of a Half request ran full scale, so the selected name stands
+    f.requestedScale = 2;
+    f.presentedScale = 1;
+    f.presentedValid = true;
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+    // no presented frame of this request yet: the requested scale is the one shown
+    f.presentedValid = false;
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE->Scaled"), playback_info_label::debayerField(f));
+    // full scale on the CPU: the selected debayer ran
+    f.requestedScale = 1;
+    f.presentedScale = 1;
+    f.presentedValid = true;
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+    // scale unknown (0): no claim beyond the selected name
+    f.requestedScale = 0;
+    f.presentedScale = 0;
+    f.presentedValid = false;
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+    // the GPU forms are unchanged at a reduced scale (the GPU names what it ran)
+    f.requestedScale = 2;
+    f.presentedScale = 2;
+    f.presentedValid = true;
+    f.debayerOnGpu = true;
+    f.gpuDebayer = QStringLiteral("AMaZE");
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE (GPU)"), playback_info_label::debayerField(f));
+    f.gpuDebayer = QString();
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE (GPU)"), playback_info_label::debayerField(f));
+}
