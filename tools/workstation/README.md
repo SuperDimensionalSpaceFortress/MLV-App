@@ -130,6 +130,11 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    (r17: a push url that names another repository is the same mismatch.) `LEASE_OBJECT_FAILED` means
    git could not build the lease commit (an empty `-GitName`, say), and `LEASE_PUSH_URL_DIFFERS` means the
    lease remote pushes somewhere other than where it reads. In both cases nothing is pushed.
+   (r22: remote urls are read raw from `git config -z`, and the lease and Clone fetch and push the url
+   strings they checked, never the remote name. `REMOTE_URL_UNSAFE` means a url holds a control
+   character, starts with `-`, or is rewritten by a `url.<base>.insteadOf` rule; it is refused, never
+   compared. `GATE_LOCK_IO_FAILED` (exit 5) means the gate lock file could not be opened for a reason
+   other than another holder; the gate does not run its target and a release changes nothing.)
 
 5. **Do the owner-only checklist** (`-Phase Checklist` prints it). Then go through the cut-over phases.
 

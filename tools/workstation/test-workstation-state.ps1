@@ -2311,6 +2311,147 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r20 INV-12')) {
     [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $r20protoOuter)
 }
 
+# ================================================================ r22 (sol r21 B1 B2, fable key3 r21 B1 B2; HUB RULING 20261117T1152Z)
+# Runs Set-HubLease in this process against a scratch repository, identity pinned; every value it changes is restored in the finally. Returns the error text ('' = no throw).
+function Invoke-R22Lease([string]$RepoDir, [hashtable]$Current, [string]$Tag) {
+    $r22s = @{ Repo = $script:Repo; Temp = $env:TEMP; Log = $script:LogFile; Name = $script:GitName; Email = $script:GitEmail }
+    $r22id = @{}; foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { $r22id[$n] = [Environment]::GetEnvironmentVariable($n) }
+    $r22e = ''
+    try {
+        $script:Repo = $RepoDir; $env:TEMP = New-Scratch "r22-temp-$Tag"; $script:LogFile = Join-Path (Split-Path $RepoDir) "lease-$Tag.log"
+        $script:GitName = 'r22 test'; $script:GitEmail = 'r22@example.invalid'
+        foreach ($n in @($r22id.Keys)) { [Environment]::SetEnvironmentVariable($n, 'r22 test') }
+        Set-HubLease -Holder 'TEST-HOST' -Current $Current -Reason "r22 $Tag" *>&1 | Out-Null
+    } catch { $r22e = $_.Exception.Message }
+    finally {
+        $script:Repo = $r22s.Repo; $env:TEMP = $r22s.Temp; $script:LogFile = $r22s.Log; $script:GitName = $r22s.Name; $script:GitEmail = $r22s.Email
+        foreach ($n in @($r22id.Keys)) { [Environment]::SetEnvironmentVariable($n, $r22id[$n]) }
+    }
+    return $r22e
+}
+function Get-R22Ref([string]$Bare) { return ("$(& git -C $Bare rev-parse --verify --quiet $LeaseRef 2>$null)").Trim() }
+function Get-R22Holder([string]$Bare) { $raw = (& git -C $Bare cat-file -p "${LeaseRef}:$LeaseFile" 2>$null) -join "`n"; if (-not $raw) { return '<none>' }; return [string](($raw | ConvertFrom-Json).holder) }
+# local bare repositories only (an earlier section may leave a narrower GIT_ALLOW_PROTOCOL or an empty identity); restored after the r22 sections
+$r22envSaved = @{}; foreach ($n in 'GIT_ALLOW_PROTOCOL', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL') { $r22envSaved[$n] = [Environment]::GetEnvironmentVariable($n) }
+[Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')
+foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { [Environment]::SetEnvironmentVariable($n, 'r22 test') }
+foreach ($n in 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_EMAIL') { [Environment]::SetEnvironmentVariable($n, 'r22@example.invalid') }
+if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r22 sol B1')) {
+    # Two bare repositories hold the same released lease commit S; the lease repository reads and pushes 'read.git'.
+    $r22a = New-Scratch 'r22-a'
+    $r22seed = Join-Path $r22a 'seed'; [void][IO.Directory]::CreateDirectory($r22seed); & git -C $r22seed init -q 2>$null
+    [IO.File]::WriteAllText((Join-Path $r22seed $LeaseFile), '{"holder":""}'); & git -C $r22seed add $LeaseFile 2>$null
+    & git -C $r22seed -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --no-verify -m lease 2>$null
+    $r22S = ("$(& git -C $r22seed rev-parse HEAD)").Trim()
+    # Each case gets its own read.git / other.git pair (both at S) and a lease repository holding S locally (commit-tree names it as the parent).
+    function New-R22LeaseRepo([string]$Name) {
+        $c = Join-Path $r22a $Name; [void][IO.Directory]::CreateDirectory($c)
+        $script:r22read = Join-Path $c 'read.git'; $script:r22other = Join-Path $c 'other.git'
+        foreach ($b in $script:r22read, $script:r22other) { & git init -q --bare $b 2>$null; & git -C $r22seed push -q --no-verify $b "HEAD:$LeaseRef" 2>$null }
+        $d = Join-Path $c 'repo'; [void][IO.Directory]::CreateDirectory($d); & git -C $d init -q 2>$null
+        & git -C $d fetch -q $script:r22read "+${LeaseRef}:refs/hub-lease-local/mlv-app" 2>$null
+        return $d
+    }
+    # (a) check = use: the push url is changed AFTER the guard and BEFORE the push (through the Invoke-Native seam). The push must still go to the checked url.
+    $r22ra = New-R22LeaseRepo 'repo-a'
+    & git -C $r22ra remote add fork $r22read; & git -C $r22ra config remote.fork.pushurl $r22read
+    $global:R22Swap = @{ Repo = $r22ra; Other = $r22other; Orig = ${function:Invoke-Native}; Pushes = 0 }
+    function Invoke-Native { param([string]$Exe, [string[]]$Arguments, [switch]$AllowFail, [int[]]$OkCodes = @(0))
+        if ($Arguments -contains 'push') { $global:R22Swap.Pushes++; & git -C $global:R22Swap.Repo config remote.fork.pushurl $global:R22Swap.Other 2>$null }
+        & $global:R22Swap.Orig -Exe $Exe -Arguments $Arguments -AllowFail:$AllowFail -OkCodes $OkCodes
+    }
+    try { $r22aErr = Invoke-R22Lease $r22ra @{ Exists = $true; Sha = $r22S; Holder = '' } 'a' } finally { Set-Item -Path 'Function:\Invoke-Native' -Value $global:R22Swap.Orig }
+    $r22aRead = Get-R22Holder $r22read; $r22aOther = Get-R22Ref $r22other
+    Assert-That ($global:R22Swap.Pushes -ge 1 -and $r22aOther -ceq $r22S -and (($r22aErr -eq '' -and $r22aRead -ceq 'TEST-HOST') -or ($r22aErr -match 'LEASE_PUSH_URL_DIFFERS' -and $r22aRead -ceq ''))) 'r22 sol B1 lease: a push url changed between the check and the push never receives the push; the checked repository is the one written' "err=$r22aErr pushes=$($global:R22Swap.Pushes) readHolder=$r22aRead otherRef=$r22aOther S=$r22S"
+    # (a2) the lease read names the url it read from, and a write whose fetch url moved since that read is refused
+    $r22ra2 = New-R22LeaseRepo 'repo-a2'
+    & git -C $r22ra2 remote add fork $r22read
+    $r22gSaved = $script:Repo; $script:Repo = $r22ra2
+    try { $r22gh = Get-HubLease } finally { $script:Repo = $r22gSaved }
+    Assert-That ($null -eq $r22gh.Error -and $r22gh.Sha -ceq $r22S -and "$($r22gh.Url)" -ceq $r22read) 'r22 sol B1 lease read: Get-HubLease reads through the literal fetch url and returns it' "err=$($r22gh.Error) sha=$($r22gh.Sha) url=$($r22gh.Url)"
+    $r22a2Err = Invoke-R22Lease $r22ra2 @{ Exists = $true; Sha = $r22S; Holder = ''; Url = $r22other } 'a2'
+    Assert-That ($r22a2Err -match 'LEASE_PUSH_URL_DIFFERS' -and (Get-R22Ref $r22read) -ceq $r22S -and (Get-R22Ref $r22other) -ceq $r22S) 'r22 sol B1 lease: a fetch url that changed since the lease was read is refused and nothing is pushed' "err=$r22a2Err"
+    # (b) control characters: a pushurl 'X<LF>X' with url X, and a url ending in a literal CR (a hand-edited quoted value) with pushurl X, are refused; nothing is pushed
+    $r22rb = New-R22LeaseRepo 'repo-b'
+    & git -C $r22rb remote add fork $r22read; & git -C $r22rb config remote.fork.pushurl ($r22read + "`n" + $r22read)
+    $r22bErr = Invoke-R22Lease $r22rb @{ Exists = $true; Sha = $r22S; Holder = '' } 'b'
+    Assert-That ($r22bErr -match 'LEASE_PUSH_URL_DIFFERS' -and $r22bErr -match 'REMOTE_URL_UNSAFE' -and (Get-R22Ref $r22read) -ceq $r22S) 'r22 fable B2 lease: a pushurl X<LF>X with url X is refused (REMOTE_URL_UNSAFE), nothing pushed' "err=$r22bErr"
+    $r22rc = New-R22LeaseRepo 'repo-c'
+    $r22fwd = $r22read -replace '\\', '/'
+    [IO.File]::AppendAllText((Join-Path $r22rc '.git\config'), "[remote `"fork`"]`n`turl = `"$r22fwd`r`"`n`tpushurl = $r22fwd`n", [Text.Encoding]::ASCII)
+    $r22cErr = Invoke-R22Lease $r22rc @{ Exists = $true; Sha = $r22S; Holder = '' } 'c'
+    Assert-That ($r22cErr -match 'LEASE_PUSH_URL_DIFFERS' -and $r22cErr -match 'REMOTE_URL_UNSAFE' -and (Get-R22Ref $r22read) -ceq $r22S) 'r22 fable B2 lease: a url ending in a literal CR with a pushurl without it is refused (REMOTE_URL_UNSAFE), nothing pushed' "err=$r22cErr"
+    # control: an ordinary url/pushurl pair still acquires the lease
+    $r22rd = New-R22LeaseRepo 'repo-d'
+    & git -C $r22rd remote add fork $r22read
+    $r22dErr = Invoke-R22Lease $r22rd @{ Exists = $true; Sha = $r22S; Holder = ''; Url = $r22read } 'd'
+    Assert-That ($r22dErr -eq '' -and (Get-R22Holder $r22read) -ceq 'TEST-HOST' -and (Get-R22Ref $r22other) -ceq $r22S) 'r22 lease control: a plain remote with no pushurl acquires the lease in the repository it read' "err=$r22dErr"
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r22 fable B2 clone')) {
+    # Clone and doctrine siblings: a push url 'U<LF>U' (each line equal to the expected url) is a mismatch, not two matching urls
+    $r22cws = New-Scratch 'r22-clone'
+    $r22crepo = Join-Path $r22cws 'MLV-App'; [void][IO.Directory]::CreateDirectory($r22crepo); & git -C $r22crepo init -q 2>$null
+    & git -C $r22crepo remote add fork $ForkUrl; & git -C $r22crepo config remote.fork.pushurl ($ForkUrl + "`n" + $ForkUrl)
+    $r22cdoc = Join-Path $r22cws 'doctrine'; [void][IO.Directory]::CreateDirectory($r22cdoc); & git -C $r22cdoc init -q 2>$null
+    & git -C $r22cdoc remote add origin $DoctrineUrl; & git -C $r22cdoc config remote.origin.pushurl ($DoctrineUrl + "`n" + $DoctrineUrl)
+    $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo; $savedLog = $script:LogFile
+    $script:Repo = $r22crepo; $Repo = $r22crepo; $script:DoctrineRepo = $r22cdoc; $DoctrineRepo = $r22cdoc; $script:LogFile = Join-Path $r22cws 'clone.log'
+    $script:Failures.Clear()
+    $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')   # no network: an older script that goes on to fetch is refused at once
+    try { Invoke-PhaseClone *>&1 | Out-Null } catch { } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
+    $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH* fork pushurl' }).Count -eq 1) 'r22 fable B2 clone: a fork pushurl U<LF>U is refused typed CLONE_REMOTE_MISMATCH' ($script:Failures -join ',')
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_DOCTRINE_REMOTE_MISMATCH*' }).Count -eq 1) 'r22 fable B2 doctrine: a doctrine origin pushurl U<LF>U is refused typed CLONE_DOCTRINE_REMOTE_MISMATCH' ($script:Failures -join ',')
+    $script:Failures.Clear()
+}
+# (c) fable key3 r21 B1 + H1, opus H2: deny by default. An ssh spelling is normalised only for a plain user, host and path; anything else is keyed by its raw string.
+if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r22 fable B1')) {
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:a~b/lease.git' 'ssh://git@nas.example/~/a~b/lease.git')) 'r22 fable B1 R-a url: an scp path whose second character is ~ (Git sends ~b/lease.git) is not ssh://host/~/a~b/lease.git'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ab:cd@nas.example:repos/lease.git' 'ssh://ab:cd@nas.example/~/repos/lease.git')) 'r22 fable B1 R-b url: a colon in the scp user part (Git: host ab) is not the ssh:// user ab:cd'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:/~/r.git' 'ssh://git@nas.example/~/r.git')) 'r22 fable H1 url: scp host:/~/p is uncertain and fails closed'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:x~git/lease.git' 'git@nas.example:~/x~git/lease.git')) 'r22 opus H2 url: scp host:x~git/p (Git sends ~git/p) is not host:~/x~git/p'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/lease.git?x' 'git@nas.example:/repos/lease.git?x')) 'r22 url: a query is outside the plain alphabet, so the two spellings are keyed raw'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git+ssh://git@nas.example/repos/lease.git' 'ssh://git@nas.example/repos/lease.git')) 'r22 fable r21 hardening url: another scheme is not normalised to ssh://'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/lease.git/' 'ssh://git@nas.example/repos/lease.git')) 'r22 fable r21 hardening url: a trailing slash is significant'
+    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'ssh://git@nas.example/~/repos/lease.git') 'r22 url control: a home-relative scp path equals ssh://host/~/path'
+    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:/repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r22 url control: an absolute scp path equals ssh://host/path'
+    Assert-That (Test-GitRemoteUrlSame 'ab:cd@nas.example:repos/lease.git' 'ab:cd@nas.example:repos/lease.git') 'r22 url control: an identical uncertain spelling is the same'
+    Assert-That (Test-GitRemoteUrlSame 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git' 'git@github.com:SuperDimensionalSpaceFortress/MLV-App.git') 'r22 url control: the live lease remote (https fetch, git@github.com push) still names one repository'
+}
+# (d) sol r21 B2 = opus H3: Open-GateLock returns null only for a sharing or lock violation. A lock file that vanishes before the open is created and the open retried once;
+# a second failure, or any other error, is the typed GATE_LOCK_IO_FAILED, never 'a lease release is in progress' (Gate, exit 0) or 'a Lease-gated task is running' (exit 4).
+if ($fnLoaded -and (Test-Has 'Open-GateLock' 'r22 sol B2')) {
+    $r22lr = New-Scratch 'r22-lock-fnf'
+    $global:R22Lock = @{ Calls = 0; FailTimes = 1; Orig = $(if (Get-Command Open-GateLockStream -CommandType Function -ErrorAction SilentlyContinue) { ${function:Open-GateLockStream} } else { $null }) }
+    function Open-GateLockStream { param([string]$Path, [string]$Mode)
+        $global:R22Lock.Calls++
+        if ($global:R22Lock.Calls -le $global:R22Lock.FailTimes) { if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }; throw [IO.FileNotFoundException]::new('r22 test: the lock file vanished before the open', $Path) }
+        & $global:R22Lock.Orig -Path $Path -Mode $Mode
+    }
+    $r22l1 = $null; $r22l1Err = ''
+    try { $r22l1 = Open-GateLock -Root $r22lr -Mode Shared } catch { $r22l1Err = $_.Exception.Message }
+    Assert-That ($null -ne $r22l1 -and $global:R22Lock.Calls -eq 2 -and (Test-Path -LiteralPath (Join-Path $r22lr 'gate.lock'))) 'r22 sol B2 lock: a lock file that vanishes before the open is created again and the lock is acquired (one retry)' "calls=$($global:R22Lock.Calls) err=$r22l1Err"
+    if ($r22l1) { $r22l1.Dispose() }
+    $global:R22Lock.Calls = 0; $global:R22Lock.FailTimes = 99
+    $r22l2 = $null; $r22l2Err = ''
+    try { $r22l2 = Open-GateLock -Root $r22lr -Mode Exclusive } catch { $r22l2Err = $_.Exception.Message }
+    Assert-That ($null -eq $r22l2 -and $r22l2Err -match '^GATE_LOCK_IO_FAILED' -and $global:R22Lock.Calls -eq 2) 'r22 sol B2 lock: a second missing-file failure is the typed GATE_LOCK_IO_FAILED, not contention' "calls=$($global:R22Lock.Calls) err=$r22l2Err lock=$([bool]$r22l2)"
+    if ($r22l2) { $r22l2.Dispose() }
+    if ($global:R22Lock.Orig) { Set-Item -Path 'Function:\Open-GateLockStream' -Value $global:R22Lock.Orig } else { Remove-Item -Path 'Function:\Open-GateLockStream' -Force -ErrorAction SilentlyContinue }
+    # end to end: a gate.lock that cannot be opened as a file (a folder stands there) is a typed failure in both consumers, exit 5
+    $r22lrDir = New-Scratch 'r22-lock-dir'; [void][IO.Directory]::CreateDirectory((Join-Path $r22lrDir 'gate.lock'))
+    [IO.File]::Delete($gateMarker) 2>$null
+    $wsR22 = New-LeaseWorkspace 'ws-r22-gate' $me
+    $r22gState = New-Scratch 'state-r22-g'
+    $r22g = Invoke-Setup (New-Scratch 'home-r22-g') @('-Phase', 'Gate', '-GateMode', 'Lease', '-GateScript', $gateTarget, '-StateRoot', $r22gState, '-LockRoot', $r22lrDir, '-Workspace', $wsR22)
+    $r22gLogPath = Join-Path $r22gState 'logs\gate.log'   # a gate run writes its log file, not the console
+    $r22gText = $r22g.Out + "`n" + $(if (Test-Path -LiteralPath $r22gLogPath) { [IO.File]::ReadAllText($r22gLogPath) } else { '' })
+    Assert-That ($r22g.Exit -eq 5 -and $r22gText -match 'GATE_LOCK_IO_FAILED' -and $r22gText -notmatch 'release is in progress' -and -not (Test-Path -LiteralPath $gateMarker)) 'r22 sol B2 gate: an unopenable gate lock is GATE_LOCK_IO_FAILED exit 5, not a release-in-progress skip, and the target does not run' "exit=$($r22g.Exit)`n$r22gText"
+    $r22rel = Invoke-Setup (New-Scratch 'home-r22-r') @('-Phase', 'LeaseRelease', '-StateRoot', (New-Scratch 'state-r22-r'), '-LockRoot', $r22lrDir, '-Workspace', $wsR22)
+    Assert-That ($r22rel.Exit -eq 5 -and $r22rel.Out -match 'GATE_LOCK_IO_FAILED' -and $r22rel.Out -notmatch 'task is running' -and (Get-LeaseHolder $wsR22) -ceq $me) 'r22 sol B2 release: an unopenable gate lock is GATE_LOCK_IO_FAILED exit 5, not a running-gate refusal, and the lease is unchanged' "exit=$($r22rel.Exit)`n$($r22rel.Out)"
+}
+foreach ($n in @($r22envSaved.Keys)) { [Environment]::SetEnvironmentVariable($n, $r22envSaved[$n]) }
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

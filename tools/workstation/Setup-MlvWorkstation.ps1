@@ -268,21 +268,81 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
 # Hub lease: one host drives the board. A git ref on the fork is the shared, atomic token.
 # Acquire and release are deliberate (owner or hub), never automatic; staleness never transfers it.
 # ---------------------------------------------------------------------------------------------
+# r22 (fable key3 r21 B2 = opus r21 H1; HUB RULING 20261117T1152Z rule 2): a configured value is read RAW. 'git config -z' ends each value with a NUL, and the bytes are taken
+# off the child's stdout untouched: PowerShell's native-output line framing split a pushurl 'X<LF>X' into two urls and dropped a CR before the LF. Strict UTF-8 (a byte that is
+# not UTF-8 is a failure, never a replacement character that two different values share). -Regexp reads 'git config -z --get-regexp' records ('<key><LF><value>').
+# An unset key is an empty list; a failed read throws GIT_CONFIG_READ_FAILED (never an empty list).
+function Get-GitConfigValuesRaw {
+    param([string]$RepoDir, [string]$Key, [switch]$Regexp)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
+    foreach ($a in @('-C', $RepoDir, 'config', '-z', $(if ($Regexp) { '--get-regexp' } else { '--get-all' }), $Key)) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    $proc = Invoke-GitTraceScrubbed { [System.Diagnostics.Process]::Start($psi) }   # r17 F3: the child inherits no GIT_TRACE* destination
+    $ms = [IO.MemoryStream]::new()
+    try {
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        $proc.StandardOutput.BaseStream.CopyTo($ms)
+        $proc.WaitForExit()
+        $errText = "$($errTask.Result)".Trim(); $code = $proc.ExitCode
+    } finally { $proc.Dispose() }
+    if ($code -eq 1 -and $ms.Length -eq 0) { return [string[]]@() }   # the key is not set
+    if ($code -ne 0) { throw "GIT_CONFIG_READ_FAILED git config $Key exited $code ($errText)" }
+    $bytes = $ms.ToArray()
+    if ($bytes.Length -eq 0 -or $bytes[$bytes.Length - 1] -ne 0) { throw "GIT_CONFIG_READ_FAILED git config -z $Key printed no NUL-terminated value" }
+    try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, 0, $bytes.Length - 1) } catch { throw "GIT_CONFIG_READ_FAILED git config $Key holds bytes that are not UTF-8" }
+    return [string[]]$text.Split([char]0)
+}
+
+# r22: true when a remote url may not be compared or used at all: a control character (U+0000-U+001F or U+007F, CR and LF included) or a leading '-' (git would read it as an option)
+function Test-RemoteUrlUnsafe([string]$Url) { return ("$Url" -match '[\x00-\x1F\x7F]' -or "$Url".StartsWith('-')) }
+
+# r22: a remote url as a log line may show it: redacted (Get-RedactedRemoteUrl) and every control character printed as \xNN, so a CR or LF can never split or hide the line
+function Format-RemoteUrlForLog([string]$Url) { return [regex]::Replace((Get-RedactedRemoteUrl $Url), '[\x00-\x1F\x7F]', { param($m) '\x{0:X2}' -f [int][char]$m.Value }) }
+
+# r22 (HUB RULING 20261117T1152Z rules 1-2): remote <Name>'s urls, read raw ONCE. Fetch = the first remote.<name>.url (what git fetch uses); Push = every remote.<name>.pushurl, or
+# every url when no pushurl is set (what git push uses). Rules = the url.<base>.insteadOf / pushInsteadOf prefixes: 'git remote get-url' used to apply them, a raw value does not,
+# so a value one of them rewrites is refused by Get-RemoteUrlRefusal (Git would connect somewhere the check never saw).
+function Get-RemoteUrlsRaw {
+    param([string]$RepoDir, [string]$Name)
+    $urls = @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key "remote.$Name.url")
+    $push = @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key "remote.$Name.pushurl")
+    if ($push.Count -eq 0) { $push = $urls }
+    $rules = @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key '^url\..*\.(insteadof|pushinsteadof)$' -Regexp | ForEach-Object { $nl = $_.IndexOf("`n"); if ($nl -ge 0) { $_.Substring($nl + 1) } else { '' } })
+    return @{ Fetch = $(if ($urls.Count) { $urls[0] } else { '' }); Push = [string[]]$push; Rules = [string[]]$rules }
+}
+
+# r22: '' when every url may be compared and used; otherwise the typed REMOTE_URL_UNSAFE reason (a control character, a leading '-', or a url rewrite rule that matches it)
+function Get-RemoteUrlRefusal {
+    param([string[]]$Urls, [string[]]$Rules)
+    foreach ($u in @($Urls)) {
+        if (Test-RemoteUrlUnsafe $u) { return "REMOTE_URL_UNSAFE $(Format-RemoteUrlForLog $u) holds a control character or starts with '-' (refused, never compared)" }
+        foreach ($r in @($Rules)) { if ("$u".StartsWith("$r", [StringComparison]::Ordinal)) { return "REMOTE_URL_UNSAFE $(Format-RemoteUrlForLog $u) is rewritten by a url.<base>.insteadOf/pushInsteadOf rule (refused: Git would not connect to the url that was checked)" } }
+    }
+    return ''
+}
+
 function Get-HubLease {
     if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) { return @{ Error = "repo missing at $Repo" } }
-    $ls = Invoke-GitTraceScrubbed { & git -C $Repo ls-remote $LeaseRemote $LeaseRef 2>&1 }   # r17 F3: every native git call drops GIT_TRACE*
+    # r22 (sol r21 B1; HUB RULING 20261117T1152Z rule 1, check = use): the fetch url is read raw ONCE and the lease is read from that literal string, which is returned as Url;
+    # no git call below resolves the remote NAME again (a configuration change in between can no longer move the read to another repository)
+    try { $lr = Get-RemoteUrlsRaw -RepoDir $Repo -Name $LeaseRemote } catch { return @{ Error = "$($_.Exception.Message)" } }
+    $url = $lr.Fetch
+    if (-not $url) { return @{ Error = "remote '$LeaseRemote' has no url" } }
+    $why = Get-RemoteUrlRefusal -Urls @($url) -Rules $lr.Rules
+    if ($why) { return @{ Error = $why } }
+    $ls = Invoke-GitTraceScrubbed { & git -C $Repo ls-remote $url $LeaseRef 2>&1 }   # r17 F3: every native git call drops GIT_TRACE*
     if ($LASTEXITCODE -ne 0) { return @{ Error = "ls-remote failed: $($ls -join ' ')" } }
     $line = @($ls | Where-Object { "$_" -match '^[0-9a-f]{40}\s' }) | Select-Object -First 1
-    if (-not $line) { return @{ Error = $null; Exists = $false; Sha = ''; Holder = ''; Data = $null } }
+    if (-not $line) { return @{ Error = $null; Exists = $false; Sha = ''; Holder = ''; Data = $null; Url = $url } }
     $sha = ("$line" -split '\s+')[0]
     # r15 pass 14 A4 sibling: under -WhatIf the fetch (a write to the local lease ref and the object store) is not run; the lease is reported unread
     if ($WhatIfPreference) { return @{ Error = 'WhatIf: the lease content is not fetched (a dry run writes nothing)' } }
-    Invoke-GitTraceScrubbed { & git -C $Repo fetch --quiet --no-tags $LeaseRemote "+${LeaseRef}:refs/hub-lease-local/mlv-app" 2>&1 } | Out-Null
+    Invoke-GitTraceScrubbed { & git -C $Repo fetch --quiet --no-tags $url "+${LeaseRef}:refs/hub-lease-local/mlv-app" 2>&1 } | Out-Null
     if ($LASTEXITCODE -ne 0) { return @{ Error = 'fetch of lease ref failed' } }
     $raw = Invoke-GitTraceScrubbed { & git -C $Repo show "${sha}:$LeaseFile" 2>&1 }
     if ($LASTEXITCODE -ne 0) { return @{ Error = "lease commit $sha has no $LeaseFile" } }
     try { $data = ($raw -join "`n") | ConvertFrom-Json } catch { return @{ Error = "lease JSON unreadable at $sha" } }
-    return @{ Error = $null; Exists = $true; Sha = $sha; Holder = [string]$data.holder; Data = $data }
+    return @{ Error = $null; Exists = $true; Sha = $sha; Holder = [string]$data.holder; Data = $data; Url = $url }
 }
 
 function Set-HubLease {
@@ -327,16 +387,26 @@ function Set-HubLease {
     if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_OBJECT_FAILED git commit-tree exited $LASTEXITCODE; nothing was pushed, the lease ref is unchanged" }
     # r17 pass 19 A6: Get-HubLease reads the lease through the remote's FETCH url and a push goes to its PUSH url(s); a remote whose pushurl names another repository would
     # report the lease acquired while the fork stays unheld. Every push url must name the fetch url's repository, else LEASE_PUSH_URL_DIFFERS and nothing is pushed.
-    $leaseFetchUrl = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $LeaseRemote 2>$null }) -join "`n")   # r21 pass 26 A3: nothing is trimmed and the lines are joined with LF: a line terminator or whitespace INSIDE the url is part of it (the helper refuses to normalise one)
-    $leasePushUrls = @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $LeaseRemote 2>$null })
+    # r22 (sol r21 B1, fable key3 r21 B2; HUB RULING 20261117T1152Z rules 1-2): the urls are read raw ONCE (Get-RemoteUrlsRaw). A value with a control character, a leading '-' or a
+    # matching url rewrite rule is refused unread (REMOTE_URL_UNSAFE). The fetch url must be the very string the lease was read from ($Current.Url, set by Get-HubLease), and
+    # every push url must name its repository. The push then goes to each CHECKED push url string, never to the remote name: git re-resolves a name, so a configuration change
+    # after the check used to move the push to an unchecked repository while the lease was logged acquired.
+    $refuse = { param($why) Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_PUSH_URL_DIFFERS remote '$LeaseRemote' $why; nothing was pushed, the lease ref is unchanged" }
+    $lr = $null
+    try { $lr = Get-RemoteUrlsRaw -RepoDir $Repo -Name $LeaseRemote } catch { & $refuse "could not be read ($($_.Exception.Message))" }
+    $leaseFetchUrl = $lr.Fetch; $leasePushUrls = @($lr.Push)
+    $unsafeWhy = Get-RemoteUrlRefusal -Urls (@($leaseFetchUrl) + $leasePushUrls) -Rules $lr.Rules
+    if ($unsafeWhy) { & $refuse "($unsafeWhy)" }
+    if ($Current.ContainsKey('Url') -and "$($Current.Url)" -cne $leaseFetchUrl) { & $refuse "reads from $(Format-RemoteUrlForLog $leaseFetchUrl) now, but the lease was read from $(Format-RemoteUrlForLog $Current.Url)" }
     if (-not $leaseFetchUrl -or $leasePushUrls.Count -eq 0 -or @($leasePushUrls | Where-Object { -not (Test-GitRemoteUrlSame $_ $leaseFetchUrl) }).Count -gt 0) {
-        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
-        throw "LEASE_PUSH_URL_DIFFERS remote '$LeaseRemote' reads from $(Get-RedactedRemoteUrl $leaseFetchUrl) but pushes to $((@($leasePushUrls | ForEach-Object { Get-RedactedRemoteUrl $_ })) -join ', '); nothing was pushed, the lease ref is unchanged"
+        & $refuse "reads from $(Format-RemoteUrlForLog $leaseFetchUrl) but pushes to $((@($leasePushUrls | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')"
     }
     $expect = if ($Current.Exists) { $Current.Sha } else { '' }
-    [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'push', '--porcelain', "--force-with-lease=${LeaseRef}:$expect", $LeaseRemote, "${commit}:$LeaseRef"))
+    foreach ($pushUrl in $leasePushUrls) {
+        [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'push', '--porcelain', "--force-with-lease=${LeaseRef}:$expect", $pushUrl, "${commit}:$LeaseRef"))
+    }
     Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
-    Write-Log "lease now holder='$Holder' commit=$commit" 'OK'
+    Write-Log "lease now holder='$Holder' commit=$commit at $((@($leasePushUrls | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')" 'OK'
 }
 
 function Show-HubLease {
@@ -666,28 +736,37 @@ function Invoke-PhaseClone {
             $remotes = @(Invoke-GitTraceScrubbed { & git -C $Repo remote })
             # r15 pass 13 A5: an EXISTING remote must name the intended repository (fork = $ForkUrl, origin = $UpstreamUrl). A remote that names another repository (the
             # two swapped, say) is refused typed CLONE_REMOTE_MISMATCH before anything is fetched or tracked; it is never silently accepted or rewritten.
+            # r22 (sol r21 B1 siblings; HUB RULING 20261117T1152Z rules 1-2): each remote's urls are read raw once, a REMOTE_URL_UNSAFE value is a mismatch (never compared), and
+            # the fetches below go to the CHECKED url string ($checked), never to the remote name that git would resolve again
+            $checked = @{}
             foreach ($want in @(@('fork', $ForkUrl), @('origin', $UpstreamUrl))) {
                 if ($remotes -notcontains $want[0]) { continue }
-                $have = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $want[0] }) -join "`n")
-                if (-not (Test-GitRemoteUrlSame $have $want[1])) {
+                $ru = $null; $readWhy = ''
+                try { $ru = Get-RemoteUrlsRaw -RepoDir $Repo -Name $want[0] } catch { $readWhy = "$($_.Exception.Message)" }
+                $have = $(if ($ru) { $ru.Fetch } else { '' })
+                $haveWhy = $(if ($readWhy) { $readWhy } else { Get-RemoteUrlRefusal -Urls @($have) -Rules $ru.Rules })
+                if ($haveWhy -or -not (Test-GitRemoteUrlSame $have $want[1])) {
                     $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0])")
                     # r15 pass 14 A2: the URL is printed with any user:password part redacted (the log and the console never carry a credential)
-                    throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' is $(Get-RedactedRemoteUrl $have), expected $($want[1]) (nothing was fetched; fix the remote by hand and re-run -Phase Clone)"
+                    throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' is $(Format-RemoteUrlForLog $have), expected $($want[1])$(if ($haveWhy) { " ($haveWhy)" }) (nothing was fetched; fix the remote by hand and re-run -Phase Clone)"
                 }
                 # r17 pass 19 A6 sibling: a push url (remote.<name>.pushurl) that names another repository is the same mismatch
-                foreach ($pu in @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $want[0] 2>$null })) {
-                    if (-not (Test-GitRemoteUrlSame $pu $want[1])) {
+                foreach ($pu in @($ru.Push)) {
+                    $puWhy = Get-RemoteUrlRefusal -Urls @($pu) -Rules $ru.Rules
+                    if ($puWhy -or -not (Test-GitRemoteUrlSame $pu $want[1])) {
                         $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0]) pushurl")
-                        throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' pushes to $(Get-RedactedRemoteUrl $pu), expected $($want[1]) (nothing was fetched; fix the push url by hand and re-run -Phase Clone)"
+                        throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' pushes to $(Format-RemoteUrlForLog $pu), expected $($want[1])$(if ($puWhy) { " ($puWhy)" }) (nothing was fetched; fix the push url by hand and re-run -Phase Clone)"
                     }
                 }
+                $checked[$want[0]] = $have
             }
-            if ($remotes -notcontains 'fork') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'fork', $ForkUrl)) }
-            if ($remotes -notcontains 'origin') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'origin', $UpstreamUrl)) }
+            if ($remotes -notcontains 'fork') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'fork', $ForkUrl)); $checked['fork'] = $ForkUrl }
+            if ($remotes -notcontains 'origin') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'origin', $UpstreamUrl)); $checked['origin'] = $UpstreamUrl }
+            foreach ($k in @($checked.Keys)) { if (Test-RemoteUrlUnsafe $checked[$k]) { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $k"); throw "CLONE_REMOTE_MISMATCH $Repo remote '$k' url $(Format-RemoteUrlForLog $checked[$k]) is REMOTE_URL_UNSAFE (nothing was fetched)" } }
             [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', 'core.longpaths', 'true'))
-            [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', 'fork'))
+            [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', $checked['fork'], '+refs/heads/*:refs/remotes/fork/*'))
             # r20 sibling: the upstream (origin) fetch stays non-fatal by design (fork is the base), but its failure is now said, not discarded
-            $originCode = Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', 'origin') -AllowFail
+            $originCode = Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', $checked['origin'], '+refs/heads/*:refs/remotes/origin/*') -AllowFail
             if ($originCode -ne 0) { Write-Log "CLONE_ORIGIN_FETCH_FAILED git fetch origin exited $originCode (non-fatal: fork is the base; re-run -Phase Clone when the upstream is reachable)" 'WARN' }
             # r20 (sol r19 INV-12; r18 OPEN A7): 'master tracks fork/master' is promised by this step, so a non-zero exit (1, or 128 'branch master does not exist') is a recorded
             # typed failure (the setup exits non-zero); it used to be discarded with -AllowFail and the run reported done / exit 0
@@ -705,14 +784,18 @@ function Invoke-PhaseClone {
         }
     } else {
         # r15 pass 13 A5: an existing doctrine checkout must BE the doctrine repository (its 'origin' names $DoctrineUrl); any other checkout is a typed failure
-        $dHave = (@(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url origin 2>$null }) -join "`n")
+        # r22: read raw once (Get-RemoteUrlsRaw); a REMOTE_URL_UNSAFE fetch or push url is a mismatch, never compared
+        $dr = $null; $dWhy = ''
+        try { $dr = Get-RemoteUrlsRaw -RepoDir $DoctrineRepo -Name 'origin' } catch { $dWhy = "$($_.Exception.Message)" }
+        $dHave = $(if ($dr) { $dr.Fetch } else { '' })
+        if (-not $dWhy -and $dr) { $dWhy = Get-RemoteUrlRefusal -Urls @($dHave) -Rules $dr.Rules }
         # r19 pass 21 A3: every PUSH url of that origin must name it too ('remote.origin.pushurl' naming another repository is the same mismatch)
-        $dPush = @(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url --push --all origin 2>$null })
-        $dBadPush = @($dPush | Where-Object { -not (Test-GitRemoteUrlSame $_ $DoctrineUrl) })
-        if ((Test-GitRemoteUrlSame $dHave $DoctrineUrl) -and $dBadPush.Count -eq 0) { Write-Log "present: $DoctrineRepo" 'OK' }
+        $dPush = $(if ($dr) { @($dr.Push) } else { @() })
+        $dBadPush = @($dPush | Where-Object { (Get-RemoteUrlRefusal -Urls @($_) -Rules $dr.Rules) -or -not (Test-GitRemoteUrlSame $_ $DoctrineUrl) })
+        if (-not $dWhy -and (Test-GitRemoteUrlSame $dHave $DoctrineUrl) -and $dBadPush.Count -eq 0) { Write-Log "present: $DoctrineRepo" 'OK' }
         else {
-            $dPushNote = $(if ($dBadPush.Count -gt 0) { " and pushes to $((@($dBadPush | ForEach-Object { Get-RedactedRemoteUrl $_ })) -join ', ')" } else { '' })
-            Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$(Get-RedactedRemoteUrl $dHave)'$dPushNote, expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
+            $dPushNote = $(if ($dBadPush.Count -gt 0) { " and pushes to $((@($dBadPush | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')" } else { '' })
+            Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$(Format-RemoteUrlForLog $dHave)'$dPushNote$(if ($dWhy) { "; $dWhy" }), expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
             $script:Failures.Add("CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo")
         }
     }
@@ -738,6 +821,7 @@ function Get-RedactedRemoteUrl {
 # git-upload-pack). scp-like 'host:/p' is the absolute '/p' and equals 'ssh://host/p'; scp-like 'host:p' and 'host:~/p' are home-relative '~/p' and equal 'ssh://host/~/p'
 # but NOT 'ssh://host/p' (Git sends 'p' for the first and '/p' for the second: two repositories). A spelling that cannot be normalised with certainty (another scheme, a port,
 # a '~user' path, a query) compares UNEQUAL unless the two strings are identical: the lease guard then refuses.
+# r22: deny by default (see the ssh branches): only a plain user, host and path alphabet is normalised; scp 'host:/~/p' and 'host:a~b/p' (Git strips them to '~' forms) are raw.
 # Two documented exceptions: github.com (case-insensitive owner/repo, '.git' optional, https and 'git@' ssh the same repository) and a Windows drive or UNC local path (NTFS
 # is case-insensitive; separators and a trailing slash do not change it). Any other local path (a POSIX path, 'file://') is ordinal.
 function Test-GitRemoteUrlSame {
@@ -747,26 +831,39 @@ function Test-GitRemoteUrlSame {
         $s = "$u"
         # r21 pass 25 A4: whitespace around a URL is part of what Git sends ('repos/lease.git ' is not 'repos/lease.git'), so it is never trimmed away; compared only as the identical string
         if ($s -match '^\s|\s$|[\r\n]') { return "raw:$s" }   # r21 pass 26 A3: a CR or LF anywhere in it counts too
-        $scheme = ''; $user = ''; $hostName = ''; $path = ''; $uncertain = $false
+        $scheme = ''; $user = ''; $hostName = ''; $path = ''
+        # r22 (fable key3 r21 B1 + H1, opus r21 H2; HUB RULING 20261117T1152Z rule 3): DENY BY DEFAULT in both ssh branches. A spelling is normalised only when the user is
+        # [A-Za-z0-9._-]+ (no ':'), the host is [A-Za-z0-9.-]+ (no port, no IPv6 literal) and the path is [A-Za-z0-9._/-]+ after exactly one of: '/~/' (ssh://host/~/p), '~/' or
+        # nothing (scp home-relative), or a '/' NOT followed by '~'. Anything else ('~user', a second-character '~' that Git strips to a '~user' form, '%', '?', a port, a user
+        # with ':' that Git's first-colon scp split reads as the host...) is uncertain and keyed by its raw string: equal only to the identical spelling, so the guard refuses.
+        $plainUser = '^[A-Za-z0-9._-]+$'; $plainHost = '^[A-Za-z0-9.-]+$'; $plainPath = '^[A-Za-z0-9._/-]+$'
         $mUrl = [regex]::Match($s, '^(?i)(?!file://)([a-z][a-z0-9+.\-]*)://([^/]*)(.*)$')
-        # scp-like [user@]host:path (git: no '/' before the first ':'); a host of one letter is a Windows drive ('C:/repos'), never a host
-        $mScp = [regex]::Match($s, '^(?:([^/\\\s]+)@)?([^/\\\s:@]{2,}):(.*)$')
+        # scp-like as Git splits it: no '://', the FIRST ':' at index 2 or later (index 1 is a Windows drive, 'C:/repos'), no '/' before it, and not 'file:'
+        $colon = $s.IndexOf(':'); $slash = $s.IndexOf('/')
+        $isScp = (-not $mUrl.Success) -and $colon -ge 2 -and ($slash -lt 0 -or $slash -gt $colon) -and -not $s.Contains('://') -and $s -notmatch '^(?i)file:'
         if ($mUrl.Success) {
             $scheme = $mUrl.Groups[1].Value.ToLowerInvariant(); $auth = $mUrl.Groups[2].Value; $path = $mUrl.Groups[3].Value
             $at = $auth.LastIndexOf('@')
             if ($at -ge 0) { $user = $auth.Substring(0, $at); $hostName = $auth.Substring($at + 1) } else { $hostName = $auth }
-            # r21 B1: ssh://host/~/p is home-relative '~/p' (Git strips the slash); ssh://host/p is absolute '/p'; ssh://host/~user/p is not mapped with certainty
             if ($scheme -eq 'ssh') {
-                if ($path -match '^/~/') { $path = $path.Substring(1) } elseif ($path -match '^/~') { $uncertain = $true }
+                if ($user -cnotmatch $plainUser -or $hostName -cnotmatch $plainHost) { return "raw:$s" }
+                # ssh://host/~/p is home-relative '~/p' (Git strips the slash); ssh://host/p is absolute '/p'
+                if ($path.StartsWith('/~/') -and $path.Substring(3) -cmatch $plainPath) { $path = $path.Substring(1) }
+                elseif ($path.Length -gt 1 -and $path[0] -eq '/' -and $path[1] -ne '~' -and $path.Substring(1) -cmatch $plainPath) { }
+                else { return "raw:$s" }
             }
-        } elseif ($mScp.Success -and $s -notmatch '^(?i)file:') {
+        } elseif ($isScp) {
             # r21 B1 (sol r20): the server path is what Git sends to git-upload-pack. scp-like 'host:/p' is the absolute '/p'; 'host:p' and 'host:~/p' are both home-relative
-            # and are kept as '~/p', NEVER given a leading '/' (that made 'host:p' equal to the absolute 'ssh://host/p'); 'host:~user/p' is not mapped with certainty.
-            $scheme = 'ssh'; $user = $mScp.Groups[1].Value; $hostName = $mScp.Groups[2].Value; $sp = $mScp.Groups[3].Value
-            if ($sp.StartsWith('/')) { $path = $sp }
-            elseif ($sp -match '^~/') { $path = $sp }
-            elseif ($sp.StartsWith('~')) { $uncertain = $true }
-            elseif ($sp) { $path = '~/' + $sp }
+            # and are kept as '~/p', NEVER given a leading '/' (that made 'host:p' equal to the absolute 'ssh://host/p').
+            $scheme = 'ssh'; $before = $s.Substring(0, $colon); $sp = $s.Substring($colon + 1)
+            $mB = [regex]::Match($before, '^([^@]*)@(.*)$')
+            if (-not $mB.Success) { return "raw:$s" }
+            $user = $mB.Groups[1].Value; $hostName = $mB.Groups[2].Value
+            if ($user -cnotmatch $plainUser -or $hostName -cnotmatch $plainHost) { return "raw:$s" }
+            if ($sp.Length -gt 1 -and $sp[0] -eq '/' -and $sp[1] -ne '~' -and $sp.Substring(1) -cmatch $plainPath) { $path = $sp }
+            elseif ($sp.StartsWith('~/') -and $sp.Substring(2) -cmatch $plainPath) { $path = $sp }
+            elseif ($sp -cmatch $plainPath -and $sp[0] -ne '/') { $path = '~/' + $sp }
+            else { return "raw:$s" }
         } else {
             # r19 pass 21 A2: a LOCAL path names a directory exactly: '.git', '?x' and '#x' are part of it, so 'C:/repos/lease' and 'C:/repos/lease.git' are two repositories.
             if ($s -match '^(?:[a-zA-Z]:[\\/]|\\\\)') { return (($s -replace '\\', '/') -replace '/+$', '').ToLowerInvariant() }   # a drive or UNC path: separators, case, trailing slash
@@ -774,9 +871,8 @@ function Test-GitRemoteUrlSame {
         }
         $hostName = $hostName.ToLowerInvariant()
         if (-not $hostName -or $hostName -match '[\s]') { return '' }
-        # r21 B1: an ssh spelling not mapped with certainty (a '~user' path, a port or an IPv6 literal in the host part) is equal only to the identical string: the guard refuses
-        # r21 pass 25 A3: Git percent-decodes an ssh:// path but sends a scp-like path literally, so any '%' in an ssh spelling is not mapped with certainty either
-        if ($scheme -eq 'ssh' -and ($uncertain -or $hostName.Contains(':') -or $s.Contains('%'))) { return "raw:$s" }
+        # r21 B1 / pass 25 A3 (a '~user' path, a port, an IPv6 literal, a '%' that Git decodes for ssh:// only) are all outside the r22 plain alphabet above, so an ssh spelling
+        # that reaches this point was mapped with certainty
         # github.com: documented case-insensitive and '.git'-optional; https (any userinfo is a token) and the 'git@' ssh forms name one repository
         if ($hostName -ceq 'github.com' -and (($scheme -in @('http', 'https')) -or ($scheme -in @('ssh') -and $user -ceq 'git'))) {
             $gp = (($path -replace '[?#].*$', '') -replace '^~/', '').Trim('/') -replace '(?i)\.git$', ''
@@ -2220,7 +2316,8 @@ function Invoke-PhaseGate {
     $lock = $null
     try {
         if ($GateMode -eq 'Lease') {
-            $lock = Open-GateLock -Root $LockRoot -Mode Shared
+            try { $lock = Open-GateLock -Root $LockRoot -Mode Shared }
+            catch { Write-Log "$tag failed: $($_.Exception.Message) (the target was not run)" 'ERROR'; exit 5 }   # r22: an I/O failure is not contention, and never a successful skip
             if (-not $lock) { Write-Log "$tag skipped: a lease release is in progress on this host (gate lock busy)" 'WARN'; exit 0 }
             $l = Get-HubLease
             if ($l.Error) { Write-Log "$tag skipped: lease unreadable, failing closed ($($l.Error))" 'WARN'; exit 0 }
@@ -2244,15 +2341,32 @@ function Invoke-PhaseGate {
 
 # The gate lock (see Invoke-PhaseGate). Shared = a Lease-gated run is inside its target; Exclusive = a lease release is in flight. Returns the open
 # FileStream (the caller disposes it) or $null when the other kind holds it. Any error other than a sharing violation is thrown, not read as "free".
+# r22 (sol r21 B2 = opus r21 H3; HUB RULING 20261117T1152Z rule 4): $null ONLY for a sharing or lock violation (HResult 0x80070020 / 0x80070021). FileNotFoundException and
+# DirectoryNotFoundException derive from IOException and used to read as "busy" too (a gate skipped its target with exit 0, a release refused as if a gate ran): a lock file
+# that vanished is now created again and the open retried ONCE; a second failure, or any other error, throws the typed GATE_LOCK_IO_FAILED (both callers exit 5).
+function Open-GateLockStream {
+    # the raw open, a seam of its own (the suite replaces it to make the lock file vanish between the create and the open)
+    param([string]$Path, [string]$Mode)
+    if ($Mode -eq 'Shared') { return [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) }
+    return [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+}
+
 function Open-GateLock {
     param([string]$Root, [ValidateSet('Shared', 'Exclusive')][string]$Mode)
-    [void][IO.Directory]::CreateDirectory($Root)
     $p = Join-Path $Root 'gate.lock'
-    if (-not (Test-Path -LiteralPath $p)) { try { [IO.File]::WriteAllText($p, '') } catch { } }
-    try {
-        if ($Mode -eq 'Shared') { return [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) }
-        return [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    } catch [System.IO.IOException] { return $null }
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            [void][IO.Directory]::CreateDirectory($Root)
+            if (-not (Test-Path -LiteralPath $p)) { try { [IO.File]::WriteAllText($p, '') } catch { } }   # a failed create shows up as the open's own error below
+            return (Open-GateLockStream -Path $p -Mode $Mode)
+        } catch {
+            $e = $_.Exception
+            while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+            if ($e -is [System.IO.IOException] -and (('0x{0:X8}' -f $e.HResult) -in @('0x80070020', '0x80070021'))) { return $null }   # sharing / lock violation: the other kind holds it
+            if ($attempt -eq 1 -and ($e -is [System.IO.FileNotFoundException] -or $e -is [System.IO.DirectoryNotFoundException])) { continue }   # vanished: create it again, open once more
+            throw "GATE_LOCK_IO_FAILED $p could not be opened $Mode ($($e.GetType().Name): $($e.Message))"
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -2545,7 +2659,9 @@ foreach ($p in $run) {
             if (-not (Test-LockRootIsMachineWide)) { Write-Log "LOCKROOT_NOT_MACHINE_WIDE: $LockRoot is not the machine-wide gate lock folder, so this release could not exclude a running gate" 'ERROR'; exit 4 }
             # r10 pass 7 A4: a dry run takes no gate lock (it would make a scheduled Lease-gated task skip as busy) and reads no lease (that is a git fetch).
             if ($WhatIfPreference) { Write-Log 'SKIP (WhatIf) LeaseRelease: no gate lock was taken and no lease was read'; break }
-            $xlock = Open-GateLock -Root $LockRoot -Mode Exclusive
+            $xlock = $null
+            try { $xlock = Open-GateLock -Root $LockRoot -Mode Exclusive }
+            catch { Write-Log "$($_.Exception.Message) (nothing was released; this is not a running gate: fix the lock folder and re-run)" 'ERROR'; exit 5 }   # r22: typed, not 'a Lease-gated task is running'
             if (-not $xlock) { Write-Log 'a Lease-gated task is running on this host (gate lock busy); releasing now would hand the lease over under it. Wait for it to end, then re-run.' 'ERROR'; exit 4 }
             try {
                 $cur = Show-HubLease
