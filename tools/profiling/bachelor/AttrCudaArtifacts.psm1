@@ -3718,14 +3718,47 @@ function Get-AttrCudaSelfHealMetrics {
     $sessionLine = {
         param([string]$LogText, [string]$Session, [string]$Marker)
         if ([string]::IsNullOrEmpty($LogText)) { return $null }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): a marker counts only where it STARTS the
+        # record body, after at most three `[...] ` prefix fields (DualVenueRunner.psm1's $script:DvRecordStart rule; one line, so no field spans a
+        # newline), never as text inside another record's line
+        $recordStart = '(?m)^(?:\[[^\]\r\n]*\] ){0,3}'
         if ([string]::IsNullOrEmpty($Session)) {
-            $sm = [regex]::Match($LogText, 'playback_smoke\.measured_session id=(\d+)')
-            if (-not $sm.Success) { return $null }
+            # r10 (sol r9 B1 class sweep): the WHOLE id token, one plain decimal [0-9]+; a malformed first marker is no session (never its numeric prefix)
+            # r11 (r10 adversary A1 sibling, its run: an incomplete first marker then id=4 read presented_fps=99): the FIRST record starting with the
+            # marker's name (any case, ending at a non-name character) is the marker, read whole (case-sensitive ` id=<[0-9]+>`) or no session
+            # r12 (r12 adversary B4 on 7e66a3af, its input: `measured_session id=3<CR>id=4`): the record runs to the newline (the job and dual-venue
+            # readers split on `\r?\n`), so a lone CR inside it never hides a second id; only a CRLF's own CR is trimmed. r12 (B3): ASCII name boundary
+            # r12 (pass 13 A2 sibling): the marker name is matched culture-invariantly (an inline (?i) follows the process culture; tr-TR skipped
+            # an upper-case marker)
+            $first = [regex]::Match($LogText, $recordStart + 'playback_smoke\.measured_session(?!(?-i:[A-Za-z0-9_]))[^\n]*', 'IgnoreCase, CultureInvariant')
+            if (-not $first.Success) { return $null }
+            $fv = $first.Value.TrimEnd([char]13)
+            $sm = [regex]::Match($fv, '^(?:\[[^\]\r\n]*\] ){0,3}playback_smoke\.measured_session id=(\S*)')
+            # r11 pass 11 (A3 sibling, `id=3 id=4`): the marker names the word id exactly once and no session (bounded by any non-name character)
+            # r12 (r12 adversary B1 on 7e66a3af, its input: `id=3 (C:/id/MainWindow.cpp:1)`): words are counted in the record BODY only; a readable Qt
+            # location ` (<path>:<digits>)` (or `:%2)`) is cut first, and any other ` (` tail is -1, so no session (Get-DvLogRecordBody's rule)
+            $wc = { param([string]$x, [string]$w) $o = $x.IndexOf(' (', [StringComparison]::Ordinal); if ($o -ge 0) { if ($x.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return -1 }; $x = $x.Substring(0, $o) }; [regex]::Matches($x, '(?<!(?-i:[A-Za-z0-9_]))' + $w + '(?!(?-i:[A-Za-z0-9_]))', 'IgnoreCase, CultureInvariant').Count }
+            $ids = & $wc $fv 'id'
+            $sess = & $wc $fv 'session'
+            if (-not $sm.Success -or $ids -ne 1 -or $sess -ne 0 -or $sm.Groups[1].Value -cnotmatch '^[0-9]+$') { return $null }
             $Session = $sm.Groups[1].Value
         }
         $found = $null
-        foreach ($lm in [regex]::Matches($LogText, '(?m)' + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
+        $foundRecord = $null
+        foreach ($lm in [regex]::Matches($LogText, $recordStart + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value; $foundRecord = $lm }
         if ($null -eq $found) { return $null }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r18 adversary A1 sibling :3513 / :3516): the fields come from the record BODY (Get-DvLogRecordBody's
+        # rule): the first ` (` of the record that is not the summary's in-place conform group starts the Qt location; a readable ` (<path>:<digits>)` / `:%2)`
+        # tail is cut, any other tail is no record ($null), so a key=value inside the location path never supplies a field
+        $rec = $foundRecord.Value
+        $p = [regex]::Matches($rec, ' \(')
+        $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 })
+        if ($o -ge 0 -and $rec.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $rec.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }
+        if ($o -ge 0) {
+            if ($rec.Substring($o) -cnotmatch '^ \(.+:(?:[0-9]+|%2)\)$') { return $null }
+            $restAt = $foundRecord.Groups['rest'].Index - $foundRecord.Index
+            $found = $(if ($o -gt $restAt) { $rec.Substring($restAt, $o - $restAt) } else { '' })
+        }
         $fields = @{}
         foreach ($kv in [regex]::Matches($found, '([A-Za-z0-9_]+)=(\S*)')) { $fields[$kv.Groups[1].Value] = $kv.Groups[2].Value }
         $fields
@@ -7896,6 +7929,21 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
     $conformReductionMargin = 0.005   # a conform lowers playback_fps below the source rate AND the engine pace below native_fps by more than this fraction
     $conformPrintTolerance = 0.0005   # the source rate and native_fps print one value to 3 decimals, so they agree within half a print unit
     $inv = [Globalization.CultureInfo]::InvariantCulture
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r18 adversary A1 on 1d2d2850, siblings :7568 / :7684 / :7697): a handed-in summary or conform line is
+    # read as its record BODY by DualVenueRunner.psm1's Get-DvLogRecordBody rule before any key=value read, so a Qt location path never supplies a field: the
+    # first ` (` that is not the summary's in-place conform group starts the location; a readable ` (<path>:<digits>)` / `:%2)` tail is cut, and any other
+    # tail makes the line unreadable (empty: no summary, or no conform line, so absence never helps). The baseline oracle below is handed the body.
+    $recordBodies = @()
+    foreach ($rawRecord in @($SummaryLine, $ConformLine)) {
+        $b = [string]$rawRecord
+        $p = [regex]::Matches($b, ' \(')
+        $o = $(if ($p.Count -gt 0) { $p[0].Index } else { -1 })
+        if ($o -ge 0 -and $b.Substring($o) -cmatch '^ \([0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)? -> [0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?\)"' -and $b.Substring(0, $o) -cmatch '(?:^(?=.{0,96}$)| (?=.{0,95}$))gui_fps_status_text="Playback: [0-9]+(?:\.[0-9])? fps$') { $o = $(if ($p.Count -gt 1) { $p[1].Index } else { -1 }) }
+        if ($o -ge 0) { $b = $(if ($b.Substring($o) -cmatch '^ \(.+:(?:[0-9]+|%2)\)$') { $b.Substring(0, $o) } else { '' }) }
+        $recordBodies += $b
+    }
+    $SummaryLine = $recordBodies[0]
+    $ConformLine = $recordBodies[1]
     $fields = @{}
     if (-not [string]::IsNullOrWhiteSpace($SummaryLine)) {
         foreach ($match in [regex]::Matches($SummaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$match.Groups['k'].Value] = $match.Groups['v'].Value }
