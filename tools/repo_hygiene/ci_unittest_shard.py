@@ -26,6 +26,7 @@ collects, each once, no heavy class is missing from discover, and no module fail
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -758,6 +759,22 @@ def late_workers(
     return late
 
 
+def terminate(proc: subprocess.Popen[bytes], *, reap: bool = True) -> str | None:
+    """Kill ``proc`` (and reap it when ``reap``); the error text when the OS refuses, else ``None``.
+
+    Callers end every owned worker through this, so one worker that cannot be killed (an ``OSError``
+    such as ``PermissionError``) never stops the kill of the others; a worker that could not be killed
+    is not waited on (that wait would never return).
+    """
+    try:
+        proc.kill()
+        if reap:
+            proc.wait()
+    except OSError as error:
+        return f"{type(error).__name__}: {error}"
+    return None
+
+
 class DeadlineKiller:
     """Kills every registered worker once ``clock`` reaches ``deadline``, whatever the parent is doing.
 
@@ -778,6 +795,7 @@ class DeadlineKiller:
         self._stopped = threading.Event()
         self._procs: list[subprocess.Popen[bytes]] = []
         self.killed: set[int] = set()  # 1-based, in registration order
+        self.failed: dict[int, str] = {}  # workers the OS would not let it kill (retried every slice)
         self._thread = threading.Thread(target=self._run, name="shard-deadline-killer", daemon=True)
 
     def start(self) -> None:
@@ -793,9 +811,15 @@ class DeadlineKiller:
             if self._clock() < self._deadline:
                 return
             for number, proc in enumerate(self._procs, start=1):
-                if proc.poll() is None:
-                    proc.kill()
+                if proc.poll() is not None:
+                    self.failed.pop(number, None)
+                    continue
+                error = terminate(proc, reap=False)
+                if error is None:
                     self.killed.add(number)
+                    self.failed.pop(number, None)
+                else:
+                    self.failed[number] = error  # the others are still killed; the parent reports it
 
     def _run(self) -> None:
         while not self._stopped.wait(self._slice):
@@ -855,6 +879,7 @@ def run_parallel(
     logs: list[Path] = []
     codes: list[int | None] = []
     procs: list[tuple[subprocess.Popen[bytes], IO[bytes]]] = []
+    stuck: set[int] = set()  # 1-based workers the OS would not let the parent kill
     merged: dict[str, float] = {}
     cap_minutes = job_cap_minutes(profile, env)
     budget_begin, origin = budget_origin(env, clock, begin, wall_clock, cap_minutes)
@@ -914,12 +939,15 @@ def run_parallel(
         for number, (proc, log) in enumerate(procs, start=1):
             killed = proc.poll() is None
             if killed:
-                proc.kill()
-                proc.wait()
+                error = terminate(proc)
+                if error is not None:  # the other workers are still killed below
+                    stuck.add(number)
+                    problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
             killed = killed or number in killer.killed
             if killed or number in late:
                 problems.append(
-                    f"worker {number}/{len(procs)} timed out after {limit:g} s" + (" and was killed" if killed else "")
+                    f"worker {number}/{len(procs)} timed out after {limit:g} s"
+                    + (" and was killed" if killed and number not in stuck else "")
                 )
             log.close()
             codes.append(proc.returncode)
@@ -941,14 +969,22 @@ def run_parallel(
             elif code == 5 and record["tests_run"] != 0:  # 5 is "no tests ran", never the exit of a run that ran some
                 problems.append(f"worker {number}/{len(logs)} exited 5 after running {record['tests_run']} tests")
     finally:
+        # An exception above must not leave a worker running: every owned worker is attempted, one that
+        # cannot be killed is reported, and the watchdog keeps enforcing the deadline until they are done.
+        for number, (proc, log) in enumerate(procs, start=1):
+            if proc.poll() is None:
+                error = terminate(proc)
+                if error is not None and number not in stuck:
+                    stuck.add(number)
+                    problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
+            with contextlib.suppress(OSError):
+                log.close()
         killer.stop()
         watch.stop()
-        for proc, log in procs:  # an exception above must not leave a worker running
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            log.close()
         shutil.rmtree(work, ignore_errors=True)
+        if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
+            for problem in problems:
+                print(f"ERROR: {problem}", file=sys.stderr)
     ran = sorted(item for record in records if record for item in record["ids"])
     # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
     accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])

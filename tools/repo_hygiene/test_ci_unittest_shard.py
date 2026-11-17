@@ -1369,6 +1369,103 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("worker 1/1 timed out", err.getvalue())
 
+    # r6 (adversary pass 7 B1): a kill that raises OSError for one worker must not stop the kill of the
+    # others, in any of the three places the parent ends a worker, and the failure must be reported.
+    class _RunningProc:
+        def __init__(self, kill_error: OSError | None = None) -> None:
+            self.kill_error = kill_error
+            self.kill_calls = 0
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("fake", timeout)
+            return self.returncode
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            if self.kill_error is not None:
+                raise self.kill_error
+            self.returncode = -9
+
+    def _run_with_fake_workers(self, procs: list, *, launch_error_after: int | None = None, past_deadline: bool = False,
+                               killer: object | None = None) -> tuple[int | None, str, BaseException | None]:
+        root, tests, tag = self._fixture()
+        now = [0.0]
+        calls: list[int] = []
+
+        def popen(*args: object, **kwargs: object) -> object:
+            calls.append(1)
+            if launch_error_after is not None and len(calls) > launch_error_after:
+                raise OSError("launch failed")
+            if past_deadline and len(calls) == len(procs):
+                now[0] = 2.0  # the last launch ends past the 1 s deadline
+            return procs[len(calls) - 1]
+
+        err = io.StringIO()
+        code: int | None = None
+        raised: BaseException | None = None
+        patches = [mock.patch.object(shard.subprocess, "Popen", side_effect=popen)]
+        if killer is not None:
+            patches.append(mock.patch.object(shard, "DeadlineKiller", killer))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            try:
+                code = shard.run_parallel(
+                    tests, "ubuntu", 1, 1, 3, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, clock=lambda: now[0],
+                    environ={shard.WORKER_TIMEOUT_ENV: "1" if past_deadline else "600"},
+                )
+            except OSError as error:
+                raised = error
+        return code, err.getvalue(), raised
+
+    def test_a_failed_kill_does_not_leave_later_workers_running_after_a_launch_error(self) -> None:
+        procs = [self._RunningProc(PermissionError("denied")), self._RunningProc()]
+        code, err, raised = self._run_with_fake_workers(procs, launch_error_after=2)
+        self.assertIsNotNone(raised, "the launch error still propagates")
+        self.assertEqual(procs[1].returncode, -9, "worker 2 was never killed after worker 1's kill raised")
+        self.assertIn("worker 1/2 could not be terminated", err)
+
+    def test_a_failed_kill_at_the_timeout_does_not_leave_later_workers_running(self) -> None:
+        class NoKiller:  # only the parent's own timeout loop is under test here
+            killed: set[int] = set()
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def start(self) -> None:
+                pass
+
+            def add(self, proc: object) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        procs = [self._RunningProc(PermissionError("denied")), self._RunningProc()]
+        code, err, raised = self._run_with_fake_workers(procs, past_deadline=True, killer=NoKiller)
+        self.assertIsNone(raised, "a failed kill is reported as a failure, not raised")
+        self.assertEqual(procs[1].returncode, -9, "worker 2 was never killed after worker 1's kill raised")
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("worker 1/2 could not be terminated"), 1, err)
+
+    def test_a_failed_kill_in_the_watchdog_does_not_skip_the_later_workers(self) -> None:
+        killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)
+        first, second = self._RunningProc(PermissionError("denied")), self._RunningProc()
+        killer.add(first)  # must not raise
+        killer.add(second)
+        self.assertEqual(second.returncode, -9, "worker 2 was never killed after worker 1's kill raised")
+        self.assertEqual(killer.killed, {2})
+        self.assertEqual(sorted(killer.failed), [1])
+        self.assertGreaterEqual(first.kill_calls, 2, "the watchdog retries a worker it could not kill")
+
     # r4 adversary A2 (pass 4): a worker whose only class skips in a fixture but whose cleanup fails
     # runs no test; serial fails it (exit 1 with the others' tests run), so the parallel shard must too.
     _GOOD = "import unittest\nclass FxGoodTests(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
