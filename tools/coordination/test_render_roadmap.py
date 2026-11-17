@@ -493,5 +493,93 @@ class DeclaredTokenTests(unittest.TestCase):
         self.assertIn("queued = rows of any state by `source_ledger_stamp`", legend)
 
 
+class OwnerAskTests(unittest.TestCase):
+    """OWNER-ASK-PARK-GUARD-1 (d): origin=owner rows count whatever their kind, and parked owner asks get their own section."""
+
+    def owner_board(self) -> dict:
+        data = load_fixture()
+        data["rows"] += [
+            row("OWNER-TOOL-OPEN", "queued", "2026-10-22T10:00:00Z", kind="hub-tooling", priority=2, origin="owner"),
+            row("OWNER-UNC-PARKED", "parked", "2026-10-13T08:00:00Z", kind="unclassified", priority=3, origin="owner",
+                notes="INTAKE-GUARD 2026-10-13: queued>landed 3 days; park, not drop"),
+            row("OWNER-PROD-PARKED", "parked", "2026-10-01T08:00:00Z", kind="product", priority=6, origin="owner",
+                notes="throughput swarm 3", pinned_utc="2026-10-20T08:00:00Z"),
+            row("HUB-TOOL-PARKED", "parked", "2026-10-22T10:00:00Z", kind="hub-tooling", priority=3, origin="hub",
+                notes="not an owner ask"),
+        ]
+        return data
+
+    def test_an_open_owner_ask_of_any_kind_is_on_the_open_table_and_counted(self) -> None:
+        text = render_roadmap.render(self.owner_board())
+        self.assertIn("OWNER-TOOL-OPEN", table_cards(text))
+        self.assertIn("| 2 | OWNER-TOOL-OPEN | hub-tooling (owner) | queued | 2026-10-22 | - |", text)
+        self.assertIn("product+playback open: 5 (incl. 1 owner ask of another kind)", text)
+
+    def test_a_non_owner_tooling_row_is_still_not_counted(self) -> None:
+        text = render_roadmap.render(self.owner_board())
+        self.assertNotIn("TOOLING-J-OPEN", table_cards(text))
+        self.assertNotIn("HUB-TOOL-PARKED", text)
+
+    def test_owner_intake_counts_in_the_queued_column(self) -> None:
+        # fixture 10-22 has OPEN-B (1 queued); OWNER-TOOL-OPEN adds one more on 10-22, OWNER-UNC-PARKED is outside the window
+        self.assertIn("| 2026-10-22 | 1 | 2 |", render_roadmap.render(self.owner_board()))
+
+    def test_parked_owner_asks_section_lists_reason_and_age(self) -> None:
+        text = render_roadmap.render(self.owner_board())
+        self.assertIn("## Parked owner asks", text)
+        section = text.split("## Parked owner asks")[1].split("## Parked with reason")[0]
+        self.assertIn("- OWNER-UNC-PARKED (P3, unclassified): parked 10 d (since 2026-10-13): INTAKE-GUARD 2026-10-13", section)
+        # the park age counts from pinned_utc when the row has one (the hub's -Set park), else from source_ledger_stamp
+        self.assertIn("- OWNER-PROD-PARKED (P6, product): parked 3 d (since 2026-10-20): throughput swarm 3", section)
+        self.assertLess(section.index("OWNER-UNC-PARKED"), section.index("OWNER-PROD-PARKED"), "the longest-parked ask comes first")
+
+    def test_owner_ask_reason_is_cut_at_100_chars(self) -> None:
+        data = self.owner_board()
+        data["rows"].append(row("OWNER-LONG-PARKED", "parked", "2026-10-15T08:00:00Z", kind="hygiene", origin="owner", notes="x" * 300))
+        line = next(l for l in render_roadmap.render(data).splitlines() if l.startswith("- OWNER-LONG-PARKED"))
+        self.assertTrue(line.endswith("x" * 97 + "..."), line)
+        self.assertNotIn("x" * 98, line)
+
+    def test_an_owner_ask_is_not_listed_twice(self) -> None:
+        reason = render_roadmap.render(self.owner_board()).split("## Parked with reason")[1]
+        self.assertNotIn("OWNER-UNC-PARKED", reason)
+        self.assertNotIn("OWNER-PROD-PARKED", reason)
+        self.assertIn("PARKED-E", reason)
+
+    def test_a_terminal_owner_park_is_not_an_undelivered_ask(self) -> None:
+        data = self.owner_board()
+        data["rows"] += [
+            row("OWNER-DONE-PARKED", "parked", "2026-10-14T08:00:00Z", kind="factory", priority=2, origin="owner",
+                notes="closed DONE by HUB-TICK 20261027T0931Z, no PR by design"),
+            row("OWNER-SUPERSEDED-PARKED", "parked", "2026-10-14T08:00:00Z", kind="unclassified", priority=3, origin="owner",
+                notes="superseded by OWNER-OTHER-3 r2"),
+        ]
+        text = render_roadmap.render(data)
+        asks = text.split("## Parked owner asks")[1].split("## Parked with reason")[0]
+        reason = text.split("## Parked with reason")[1]
+        for card in ("OWNER-DONE-PARKED", "OWNER-SUPERSEDED-PARKED"):
+            self.assertNotIn(card, asks)
+            self.assertIn(card, reason)
+        self.assertIn("OWNER-UNC-PARKED", asks)
+
+    def test_no_parked_owner_ask_says_so(self) -> None:
+        text = render_roadmap.render(load_fixture())
+        self.assertIn("## Parked owner asks", text)
+        self.assertIn("- (no owner ask is parked)", text.split("## Parked owner asks")[1])
+        self.assertIn("product+playback open: 4\n", text)
+
+    def test_non_string_origin_exits_2_naming_the_row(self) -> None:
+        data = load_fixture()
+        data["rows"][0]["origin"] = 1
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "q.json"
+            p.write_text(json.dumps(data), encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as cm:
+                render_roadmap._load(p)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("origin", err.getvalue())
+        self.assertIn("OPEN-A-P2", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,15 @@ list of `{"title": ..., "text": ...}` in card-queue.json is rendered as `**title
 the open table and under "Parked with reason". This file holds no PR number or card id; a queue
 without `scope_notes` renders no note. The hub owns the block and removes a note when it lapses.
 
+Owner asks (OWNER-ASK-PARK-GUARD-1): a row with `origin` of `owner` is counted whatever its
+`kind` (an owner ask filed as unclassified or hub-tooling used to vanish from this file). On
+the open table its kind cell reads `<kind> (owner)` when the kind is not product or playback.
+Parked owner asks get their own `## Parked owner asks` section, longest-parked first, with the
+park reason and the age in whole days from the park stamp (`pinned_utc` when present, else
+`source_ledger_stamp`) to `generated_utc`; they are not repeated under "Parked with reason".
+An owner row whose park note says the work is done, shipped, closed, superseded, a duplicate
+or NO_GO is a delivered (or refused) ask and stays under "Parked with reason".
+
 Usage:
     py -3 tools/coordination/render_roadmap.py --card-queue <card-queue.json> --out docs/roadmap.md
     py -3 tools/coordination/render_roadmap.py --card-queue <card-queue.json> --out docs/roadmap.md --check
@@ -64,10 +73,36 @@ from every hosted checkout, so this file is the only place a reviewer without lo
 can see the open product backlog. Where the two disagree, `card-queue.json` wins:
 re-render, do not edit by hand. The hub checks freshness with `--check`.
 
-Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
-hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
-not classified are not counted either, even when the card name says PLAYBACK.
+Only rows with `kind` of `product` or `playback` are shown, plus owner asks
+(`origin` = `owner`) of any kind. Other hub-tooling, factory, hygiene and ci-flake cards are
+tooling churn and are not counted here. Rows the board has not classified are not counted
+either, even when the card name says PLAYBACK, unless the owner asked for them.
 """
+OWNER = "owner"
+
+
+def _counted(r: dict) -> bool:
+    """A product/playback row, or an owner ask of any kind."""
+    return r["kind"] in KINDS or r.get("origin") == OWNER
+
+
+def _kind_cell(r: dict) -> str:
+    return r["kind"] if r["kind"] in KINDS else "%s (owner)" % r["kind"]
+
+
+def _parked_since(r: dict) -> str:
+    return r.get("pinned_utc") or r["source_ledger_stamp"]
+
+
+# A park note that says the work is finished or will not happen: such an owner row is a delivered (or refused) ask,
+# so it stays under "Parked with reason" and the owner-ask section lists only asks still owed.
+TERMINAL_PARK_RX = re.compile(
+    r"\b(?:DONE|shipped|closed|superseded|NO[_-]GO|DUPLICATE|merged into|not new work|won't fix|no successor)\b",
+    re.IGNORECASE)
+
+
+def _undelivered_owner_ask(r: dict) -> bool:
+    return r.get("origin") == OWNER and not TERMINAL_PARK_RX.search(r.get("notes") or "")
 
 
 def _die(message: str) -> "None":
@@ -109,11 +144,15 @@ def _scope_notes(data: dict) -> list:
     return out
 
 
-def _note(r: dict) -> str:
+def _note(r: dict, limit: int = NOTE_MAX) -> str:
     text = " ".join((r.get("notes") or "").split())
     if not text:
         return "(no note)"
-    return text if len(text) <= NOTE_MAX else text[: NOTE_MAX - 3] + "..."
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+# An owner-ask line already carries kind and age, so its park reason is cut shorter (docs/roadmap.md has a 20000-byte budget).
+OWNER_NOTE_MAX = 100
 
 
 def _drain_line(open_n: int, landed: int, queued: int) -> str:
@@ -128,8 +167,8 @@ def _drain_line(open_n: int, landed: int, queued: int) -> str:
 
 
 def _stats(data: dict) -> tuple:
-    """(open_rows, parked_rows, days, landed_by_day, queued_by_day) for product/playback rows."""
-    rows = [r for r in data["rows"] if r["kind"] in KINDS]
+    """(open_rows, parked_rows, days, landed_by_day, queued_by_day) for product/playback rows and owner asks."""
+    rows = [r for r in data["rows"] if _counted(r)]
     open_rows = sorted((r for r in rows if r["state"] not in CLOSED_STATES), key=_sort_key)
     parked = sorted((r for r in rows if r["state"] == "parked"), key=_sort_key)
     last = _day(data["generated_utc"])
@@ -168,11 +207,15 @@ def render(data: dict) -> str:
     out.append("|---|---|---|---|---|---|")
     for r in open_rows:
         out.append("| %s | %s | %s | %s | %s | %s |" % (
-            r["priority"], r["card"], r["kind"], r["state"], r["source_ledger_stamp"][:10], _chain(r)))
+            r["priority"], r["card"], _kind_cell(r), r["state"], r["source_ledger_stamp"][:10], _chain(r)))
     if not open_rows:
         out.append("| - | (none open) | - | - | - | - |")
+    other_kind_asks = sum(1 for r in open_rows if r["kind"] not in KINDS)
+    open_line = "product+playback open: %d" % len(open_rows)
+    if other_kind_asks:
+        open_line += " (incl. %d owner ask%s of another kind)" % (other_kind_asks, "" if other_kind_asks == 1 else "s")
 
-    out += ["", "## Drain", "", "product+playback open: %d" % len(open_rows),
+    out += ["", "## Drain", "", open_line,
             "", "Window: the %d UTC days ending %s (the last day is partial)." % (WINDOW_DAYS, last.isoformat()),
             "Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp "
             "(approximate: a lower bound on the merge time, not a measurement); "
@@ -181,11 +224,22 @@ def render(data: dict) -> str:
     for d in days:
         out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
     out.append("| total | %d | %d |" % (landed_total, queued_total))
+    owner_parked = sorted((r for r in parked if _undelivered_owner_ask(r)),
+                          key=lambda r: (_parked_since(r), r["priority"], r["card"]))
+    other_parked = [r for r in parked if not _undelivered_owner_ask(r)]
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
-            "## Parked with reason", "", *scope]
-    for r in parked:
+            "## Parked owner asks", ""]
+    for r in owner_parked:
+        since = _parked_since(r)
+        age = max(0, (last - _day(since)).days)
+        out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
+            r["card"], r["priority"], r["kind"], age, since[:10], _note(r, OWNER_NOTE_MAX)))
+    if not owner_parked:
+        out.append("- (no owner ask is parked)")
+    out += ["", "## Parked with reason", "", *scope]
+    for r in other_parked:
         out.append("- %s (P%s): %s" % (r["card"], r["priority"], _note(r)))
-    if not parked:
+    if not other_parked:
         out.append("- (none parked)")
     return "\n".join(out) + "\n"
 
@@ -205,7 +259,7 @@ def _check_row(path: Path, i: int, r: dict) -> None:
     for key in ("source_ledger_stamp", "pinned_utc", "merged_utc"):
         if r.get(key) is not None and not _valid_stamp(r[key]):
             _die("%s has a malformed %s: %r (want YYYY-MM-DD...)" % (where, key, r[key]))
-    for key in ("evidence", "notes"):
+    for key in ("evidence", "notes", "origin"):
         if r.get(key) is not None and not isinstance(r[key], str):
             _die("%s has a non-string %s" % (where, key))
     for token in DECLARED_TOKEN_RX.findall(r.get("evidence") or ""):

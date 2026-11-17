@@ -33,7 +33,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ROADMAP_PATH = REPO_ROOT / "docs" / "roadmap.md"
 CHECKER_PATH = REPO_ROOT / "tools" / "coordination" / "check_roadmap_queue_parity.py"
 
-ROADMAP_ROW_RX = re.compile(r"^\|\s*\d+\s*\|\s*(\S+)\s*\|\s*(product|playback)\s*\|", re.MULTILINE)
+# OWNER-ASK-PARK-GUARD-1: an owner ask of another kind is on the table too, its kind cell reading "<kind> (owner)".
+ROADMAP_ROW_RX = re.compile(r"^\|\s*\d+\s*\|\s*(\S+)\s*\|\s*(product|playback|[a-z][a-z-]* \(owner\))\s*\|", re.MULTILINE)
 GENERATED_FROM_RX = re.compile(r"^generated_from: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", re.MULTILINE)
 # docs/22 working tier is 25000 soft; the rendered roadmap grows with the open backlog.
 ROADMAP_BUDGET_BYTES = 20000
