@@ -1441,6 +1441,44 @@ class R5BaseWindowTests(unittest.TestCase):
                 self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
                 self.assertEqual(text, master_render(base))
 
+    def a1_board(self, closed_owner_kind: str = "product", **closed_extra) -> dict:
+        """review-adversary-OWNER-ASK-PARK-GUARD-1-r7-4757a720 A1: 300 product rows (one pr-open) and four merged product rows, two of them
+        owner asks. Master has no origin concept and counts all four (drain 525 days); the collapsed tiers dropped the two closed owner asks
+        (drain 1050 days), so the bare fallback was 20001 CRLF bytes against master's 20000."""
+        stamp = "2026-09-01T00:00:00Z"
+        rows = [row("PRODUCT-%03d" % i, "pr-open" if i == 299 else "queued", stamp) for i in range(300)]
+        for i in range(4):
+            extra = dict(closed_extra) if i >= 2 else {}
+            if i >= 2:
+                extra["origin"] = "owner"
+            rows.append(row("MERGED-%d" % i, "merged", stamp, kind="product" if i < 2 else closed_owner_kind, merged_utc="2026-10-22T00:00:00Z", **extra))
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z", "rows": rows,
+                "scope_notes": [{"title": "S", "text": "x" * 592}]}
+
+    def test_r7_a1_the_bare_tier_counts_a_closed_product_owner_ask_as_master_does(self) -> None:
+        data = self.a1_board()
+        self.assertEqual(render_roadmap._budget_size(master_render(data)), ROADMAP_BUDGET_BYTES)
+        text = render_roadmap.render(data)
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+        self.assertEqual(text, master_render(data))
+
+    def test_r7_a1_any_base_fitting_board_with_product_owner_asks_stays_within_budget(self) -> None:
+        # sibling shapes (the finding's siblings): product-kind owner asks that are queued, parked (owed), parked with a resolution or merged
+        # are plain product rows to master, so a board that fit at master must fit here whatever the owner-aware tiers do with them
+        stamp = self.STAMP
+        shapes = {
+            "queued": row("OWN-Q", "queued", stamp, origin="owner"),
+            "owed": row("OWN-P", "parked", stamp, origin="owner", notes="waiting"),
+            "resolved": row("OWN-R", "parked", stamp, origin="owner", notes="done", resolution="done"),
+            "merged": row("OWN-M", "merged", stamp, origin="owner", merged_utc="2026-10-22T00:00:00Z"),
+        }
+        for n in range(300, 900, 5):
+            for name, extra in shapes.items():
+                data = self.board(n, extra)
+                if render_roadmap._budget_size(master_render(data)) <= ROADMAP_BUDGET_BYTES:
+                    with self.subTest(note_len=n, owner_ask=name):
+                        self.assertLessEqual(render_roadmap._budget_size(render_roadmap.render(data)), ROADMAP_BUDGET_BYTES)
+
     def test_r6_any_base_fitting_board_plus_owner_rows_stays_within_budget(self) -> None:
         for n in range(300, 900, 7):
             if render_roadmap._budget_size(master_render(self.board(n))) > ROADMAP_BUDGET_BYTES:

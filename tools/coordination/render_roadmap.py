@@ -325,6 +325,8 @@ OWNER_COLLAPSED_LINE = "- (see card-queue.json)"
 
 
 def _render(data: dict, cap: int, collapsed: bool = False, bare: bool = False) -> str:
+    if bare:   # (r7 A1) master has no origin or resolution: every product/playback row, a closed owner ask included, is a plain row to it
+        data = dict(data, rows=[{k: v for k, v in r.items() if k not in ("origin", "resolution")} for r in data["rows"] if r["kind"] in KINDS])
     open_rows, parked, days, landed, queued = _stats(data, collapsed)
     if collapsed:   # (r3 A1) no parked owner ask is listed anywhere: OWNER_COLLAPSED_LINE stands for all of them
         parked = [r for r in parked if r.get("origin") != OWNER]
