@@ -2997,12 +2997,42 @@
     },
     {
       "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( d -> runnerSleepStartDelayMsForTest > 0 ) QThread :: msleep ( static_cast < unsigned long > ( d -> runnerSleepStartDelayMsForTest ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r15 (r14 adversary A1 RED-test seam), not an elapsed-time inference: runnerSleepStartDelayMsForTest is a requested pause set only by setRunnerSleepStartDelayMsForTest (0 by default and always in the app). The comparison selects whether the runner sleep pauses at its entry; it measures nothing and proves no run (the dispatch spans are read on the caller's clock around each dispatch).",
+      "lines": [
+        812
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "d -> runnerSleepStartDelayMsForTest = ms > 0 ? ms : 0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r15 (r14 adversary A1 RED-test seam): the test hook clamps a requested pause length to >= 0. A value select on a configured duration, not a measurement; nothing is timed or proven to have run.",
+      "lines": [
+        938
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
       "anchor": "if ( retryWaitMs == 0 ) break ;",
       "class": "not_run_proof_structural",
       "clock": "other",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): retryWaitMs is the NEXT wait playbackDueWakeSliceWaitMs computed from GetTickCount64 and the retry deadline (time left, clamped to 1 ms); 0 means the retry budget is spent, so the loop starts no further wait or attempt. A budget bound, not a proof that anything ran (postRefusals / postFailures count what happened).",
       "lines": [
         255
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( leftMs > 0 ) QThread :: msleep ( static_cast < unsigned long > ( leftMs ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r2 G3 (CoS PR 811): after the runner sleep's message wait returned WAIT_FAILED, leftMs is the part of the REQUESTED sleep still to go (requested ms minus the QElapsedTimer reading); the comparison only selects whether a plain msleep fills it, so the runner cadence never shortens to ~0 ms. A sleep length, not a proof that anything ran (runner_sleep_wait_failed counts the failure).",
+      "lines": [
+        806
       ]
     },
     {

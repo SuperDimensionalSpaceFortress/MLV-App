@@ -317,5 +317,47 @@ class CliTests(unittest.TestCase):
             self.assertEqual(c.stdout.strip(), "PR_TOPOLOGY ok")
 
 
+class DoneBodyOwedTokenTests(unittest.TestCase):
+    """LANE-DENY-AFTER-PUSH-DONE-BODY-OWED-1: a fix-round lane whose commits are pushed but whose PR text a hook denied ends line 1
+    `DONE_BODY_OWED <40-hex> PR <n> rule=<id>`. The pushed head is real, so it binds the producer row exactly like `DONE <40-hex>`;
+    a `PARTIAL HOOK_DENY ...` line (no pushed head) binds nothing."""
+
+    def _head(self, line1):
+        with tempfile.TemporaryDirectory() as d:
+            _write(os.path.join(d, "summary.md"), line1 + "\nbody\n")
+            return pt._producer_head(d)
+
+    def test_done_body_owed_binds_the_pushed_head(self):
+        self.assertEqual(self._head("DONE_BODY_OWED %s PR 9 rule=NA-2" % IMPL_SHA), IMPL_SHA)
+
+    def test_done_body_owed_sha_is_lowercased_like_done(self):
+        self.assertEqual(self._head("DONE_BODY_OWED %s PR 9 rule=NA-7" % IMPL_SHA.upper()), IMPL_SHA)
+
+    def test_partial_hook_deny_yields_none(self):
+        self.assertIsNone(self._head("PARTIAL HOOK_DENY NA-2"))
+        self.assertIsNone(self._head("PARTIAL HOOK_DENY NA-2 (final step; head %s IS pushed to PR 9)" % IMPL_SHA))
+
+    def test_short_or_malformed_done_body_owed_yields_none(self):
+        self.assertIsNone(self._head("DONE_BODY_OWED abc1234 PR 9 rule=NA-2"))
+        self.assertIsNone(self._head("DONE_BODY_OWEDX %s PR 9" % IMPL_SHA))
+        self.assertIsNone(self._head("DONE_BODY_OWED"))
+
+    def test_plain_done_is_unchanged(self):
+        self.assertEqual(self._head("DONE %s PR 9 | x" % IMPL_SHA), IMPL_SHA)
+        self.assertIsNone(self._head("DONEX %s PR 9" % IMPL_SHA))
+
+    def test_render_binds_a_done_body_owed_round_to_its_head(self):
+        with tempfile.TemporaryDirectory() as root:
+            make_runs(root)
+            _write(os.path.join(root, "lane-%s-r2-20261024T0200Z" % CARD, "summary.md"),
+                   "DONE_BODY_OWED %s PR %d rule=NA-2\n" % (FIX_SHA, PR))
+            block = pt.render(PR, FIX_SHA, CARD, root)
+        row = [r for r in rows_of(block) if "fixer r2" in r]
+        self.assertEqual(len(row), 1, block)
+        self.assertIn("| %s |" % FIX_SHA, row[0])
+        self.assertNotIn("stale", row[0])
+        self.assertNotIn(pt.UNBOUND, row[0])
+
+
 if __name__ == "__main__":
     unittest.main()

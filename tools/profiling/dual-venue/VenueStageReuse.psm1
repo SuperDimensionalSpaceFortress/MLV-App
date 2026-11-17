@@ -13,6 +13,9 @@
 # WHAT THEY DO NOT ANSWER (#508, VENUE-STAGED-BUILD-VANISHED-AFTER-ADMISSION-WAIT-1). A STAGE_OK result for the default stage JobId does NOT prove the venue cache
 # holds the manifest a caller expects: a re-assemble of the same sha makes a new manifest (build.json carries assembledAtUtc), and the cache keeps whatever was
 # staged first. Get-StageReuse is therefore evidence about a RESULT, never about the CACHE; Invoke-VenueStageNightly.ps1 hashes the cache build.json by name.
+# Nor does it stop a re-stage (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1, 2026-11-13): a lane stage-one compared the cache with ITS OWN fresh assemble and,
+# on a difference, submitted a suffixed stage that replaced a manifest a lease batch had pinned. The never-replace rule is held by the emitted stage job
+# (tools\profiling\bachelor\playback-attr-3-cuda-stage-job.ps1, step stagedBuildGuard), which every stager's submission passes through.
 
 function Test-UmRunJobIdInUseMessage {
     param([string]$Message, [string]$JobId)
@@ -24,7 +27,7 @@ function Get-StageReuse {
     param(
         [Parameter(Mandatory = $true)][string]$ResultPath,
         [Parameter(Mandatory = $true)][string]$JobId,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Sha,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$Sha,
         [Parameter(Mandatory = $true)][ValidateSet('Stage', 'SmokeRunner')][string]$Kind
     )
     $no = { param($why) [pscustomobject]@{ Staged = $false; Reason = $why; EndedUtc = $null; Line = $null } }
@@ -66,10 +69,11 @@ function Get-DllPairReuse {
     param(
         [Parameter(Mandatory = $true)][string]$Outbox,
         [Parameter(Mandatory = $true)][string]$JobId,
-        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$Sha,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}\z')][string]$Sha,
         [AllowEmptyString()][string]$JobIdSuffix = ''
     )
-    if ($JobIdSuffix -ne '') {
+    # r27 merge: a length test, never -ne '' (a culture comparison: '<U+200B>' -ne '' is false, which would skip the suffix check below and look up the default id)
+    if (-not [string]::IsNullOrEmpty($JobIdSuffix)) {
         if ($JobIdSuffix -cnotmatch '^(?=.{1,32}\z)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\z') { throw "DLLPAIR_JOBID_SUFFIX_INVALID -JobIdSuffix must be 1-32 characters of alphanumeric runs joined by single hyphens; got '$JobIdSuffix'" }
         $JobId = "$JobId-$JobIdSuffix"
     }
@@ -78,7 +82,7 @@ function Get-DllPairReuse {
     $art = Join-Path $Outbox "$JobId.artifacts"
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { return (& $no 'result-missing') }
     try { $raw = Get-Content -LiteralPath $resultPath -Raw -ErrorAction Stop; $r = $raw | ConvertFrom-Json -ErrorAction Stop } catch { return (& $no 'result-unreadable') }
-    if ([string]$r.jobId -cne $JobId) { return (& $no "jobId-mismatch ($([string]$r.jobId))") }
+    if (-not [string]::Equals([string]$r.jobId, $JobId, [StringComparison]::Ordinal)) { return (& $no "jobId-mismatch ($([string]$r.jobId))") }
     $code = 0
     if (-not [int]::TryParse([string]$r.exitCode, [ref]$code) -or $code -ne 0) { return (& $no "exitCode-not-0 ($([string]$r.exitCode))") }
     foreach ($flag in 'timedOut', 'cancelled', 'queueExpired', 'orphaned') {
@@ -90,8 +94,9 @@ function Get-DllPairReuse {
     $mp = Join-Path $art 'dll-pair-manifest.json'
     if (-not (Test-Path -LiteralPath $mp -PathType Leaf)) { return (& $no 'artifacts-manifest-missing') }
     try { $man = Get-Content -LiteralPath $mp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return (& $no 'artifacts-manifest-unreadable') }
-    if ([string]$man.sourceCommit -cne $Sha) { return (& $no "manifest-sourceCommit-mismatch ($([string]$man.sourceCommit))") }
-    if ([string]$man.jobId -cne $JobId) { return (& $no "manifest-jobId-mismatch ($([string]$man.jobId))") }
+    # r24 (adversary pass-26 A2): ordinal, never -cne (a culture comparison that ignores U+200B; the case-sensitive operators included)
+    if (-not [string]::Equals([string]$man.sourceCommit, $Sha, [StringComparison]::Ordinal)) { return (& $no "manifest-sourceCommit-mismatch ($([string]$man.sourceCommit))") }
+    if (-not [string]::Equals([string]$man.jobId, $JobId, [StringComparison]::Ordinal)) { return (& $no "manifest-jobId-mismatch ($([string]$man.jobId))") }
     [pscustomobject]@{ Reusable = $true; Reason = 'dll-pair-already-built'; EndedUtc = [string]$r.endedUtc; Line = $m.Value.TrimEnd(); ArtifactsDir = $art; JobId = $JobId }
 }
 

@@ -20,7 +20,8 @@ Where the facts live: lane receipts `<runs-root>/<run dir>/<lane>-NNN.receipt.js
 (schema mlv-app/fleet-lane-receipt/v1, written by tools/coordination/Invoke-Lane.ps1). The run-dir
 NAME classifies the role; the receipt supplies engine, resolved model and effort; a review key's
 `<lane>-NNN.last.txt` verdict JSON supplies `subject_sha`; a producer's `summary.md` first line
-`DONE <sha>` supplies the round's resulting head. Anything that cannot be derived is written as
+`DONE <sha>` or `DONE_BODY_OWED <sha>` (pushed, only the hook-denied PR text owed) supplies the
+round's resulting head; `PARTIAL HOOK_DENY ...` supplies none. Anything that cannot be derived is written as
 `unknown`, `unbound` or `claimed: ...`, never guessed. Independence is never inferred from a
 Co-Authored-By footer.
 """
@@ -35,7 +36,7 @@ END = "<!-- pr-topology:end -->"
 HEAD_PREFIX = "<!-- pr-topology:head "
 HEAD_RE = re.compile(r"<!-- pr-topology:head ([0-9a-fA-F]{40}) -->")
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-DONE_RE = re.compile(r"^DONE\s+([0-9a-fA-F]{40})\b")
+DONE_RE = re.compile(r"^DONE(?:_BODY_OWED)?\s+([0-9a-fA-F]{40})\b")
 
 STALE = "stale (other head)"
 UNBOUND = "unbound"
@@ -109,7 +110,7 @@ def _key_subject_sha(last_path):
 
 
 def _producer_head(run_dir):
-    """The round's resulting head: `DONE <40-hex>` as the first line of summary.md, or None."""
+    """The round's resulting head: `DONE <40-hex>` or `DONE_BODY_OWED <40-hex>` as the first line of summary.md, or None."""
     try:
         text = _read_capped(os.path.join(run_dir, "summary.md"), 4096).decode("utf-8", "replace")
     except Exception:

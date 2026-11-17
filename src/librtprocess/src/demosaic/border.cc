@@ -40,14 +40,16 @@ rpError bayerborder_demosaic(int winw, int winh, int lborders, const float * con
 
         float sum[6];
 
-        for (int j = 0; j < bord; j++) { //first few columns
+        // MLV-App (UPSTREAM-SYNC-20260920-1, adversary A1): every loop and neighbour stays inside the frame when it is
+        // narrower or shorter than the border (RCD's border 9 on an 8-wide frame wrote columns 8 and -1)
+        for (int j = 0; j < std::min(bord, width); j++) { //first few columns
             for (int c = 0; c < 6; c++) {
                 sum[c] = 0;
             }
 
             for (int i1 = i - 1; i1 < i + 2; i1++)
                 for (int j1 = j - 1; j1 < j + 2; j1++) {
-                    if ((i1 > -1) && (i1 < height) && (j1 > -1)) {
+                    if ((i1 > -1) && (i1 < height) && (j1 > -1) && (j1 < width)) {
                         int c = fc(cfarray, i1, j1);
                         sum[c] += rawData[i1][j1];
                         sum[c + 3]++;
@@ -73,14 +75,14 @@ rpError bayerborder_demosaic(int winw, int winh, int lborders, const float * con
             }
         }//j
 
-        for (int j = width - bord; j < width; j++) { //last few columns
+        for (int j = std::max(width - bord, 0); j < width; j++) { //last few columns
             for (int c = 0; c < 6; c++) {
                 sum[c] = 0;
             }
 
             for (int i1 = i - 1; i1 < i + 2; i1++)
                 for (int j1 = j - 1; j1 < j + 2; j1++) {
-                    if ((i1 > -1) && (i1 < height ) && (j1 < width)) {
+                    if ((i1 > -1) && (i1 < height ) && (j1 > -1) && (j1 < width)) {
                         int c = fc(cfarray, i1, j1);
                         sum[c] += rawData[i1][j1];
                         sum[c + 3]++;
@@ -107,7 +109,7 @@ rpError bayerborder_demosaic(int winw, int winh, int lborders, const float * con
         }//j
     }//i
 
-    for (int i = 0; i < bord; i++) {
+    for (int i = 0; i < std::min(bord, height); i++) {
 
         float sum[6];
 
@@ -118,7 +120,7 @@ rpError bayerborder_demosaic(int winw, int winh, int lborders, const float * con
 
             for (int i1 = i - 1; i1 < i + 2; i1++)
                 for (int j1 = j - 1; j1 < j + 2; j1++) {
-                    if ((i1 > -1) && (i1 < height) && (j1 > -1)) {
+                    if ((i1 > -1) && (i1 < height) && (j1 > -1) && (j1 < width)) {
                         int c = fc(cfarray, i1, j1);
                         sum[c] += rawData[i1][j1];
                         sum[c + 3]++;
@@ -145,7 +147,7 @@ rpError bayerborder_demosaic(int winw, int winh, int lborders, const float * con
         }//j
     }
 
-    for (int i = height - bord; i < height; i++) {
+    for (int i = std::max(height - bord, 0); i < height; i++) {
 
         float sum[6];
 
@@ -156,7 +158,7 @@ rpError bayerborder_demosaic(int winw, int winh, int lborders, const float * con
 
             for (int i1 = i - 1; i1 < i + 2; i1++)
                 for (int j1 = j - 1; j1 < j + 2; j1++) {
-                    if ((i1 > -1) && (i1 < height) && (j1 < width)) {
+                    if ((i1 > -1) && (i1 < height) && (j1 > -1) && (j1 < width)) {
                         int c = fc(cfarray, i1, j1);
                         sum[c] += rawData[i1][j1];
                         sum[c + 3]++;

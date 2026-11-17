@@ -1019,11 +1019,26 @@ TEST(GpuPresentTailTiming, RefusalsAbandonTheWindowAndRunnerSleepsReachIt)
     ASSERT_TRUE(helperAt >= 0);
     const int helperEnd = main.indexOf(QStringLiteral("\n}"), helperAt);
     const QString helper = main.mid(helperAt, helperEnd - helperAt);
-    const int startAt = helper.indexOf(QStringLiteral("slept.start();"));
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r4: the sleep is the due wake's sent wait (sleepForSmokeRunner) with
+    // the msleep kept as the fallback; since r3 (r2 adversary pass 7 A3) a sent message dispatched inside the sleep is GUI
+    // work, never sleep. r17 (r16 adversary A1 on 522f72c6): the sent wait hands each SLEPT segment to the sink before the
+    // dispatch that ends it, and the msleep is one segment, so the tail window and the gap each take only the segments that
+    // ran while they were open. No account is made after the sleep returns.
+    const int sentSleepAt = helper.indexOf(QStringLiteral(
+        "m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); }, &MainWindow::chargeSmokeRunnerSleepSegmentSink, this )"));
     const int sleepAt = helper.indexOf(QStringLiteral("QThread::msleep( ms );"));
-    const int readAt = helper.indexOf(QStringLiteral("const qint64 sleptNs = slept.nsecsElapsed();"));
-    const int noteAt = helper.indexOf(QStringLiteral("GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );"));
-    ASSERT_TRUE(startAt >= 0 && sleepAt > startAt && readAt > sleepAt && noteAt > readAt);
+    const int chargedAt = helper.indexOf(QStringLiteral("chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );"));
+    ASSERT_TRUE(sentSleepAt >= 0 && sleepAt > sentSleepAt && chargedAt > sleepAt);
+    ASSERT_EQ(0, countOccurrences(helper, QStringLiteral("m_guiPresentGapRunnerSleepNs +=")));
+    ASSERT_EQ(0, countOccurrences(helper, QStringLiteral("noteSmokeRunnerSleepIfActive(")));
+    ASSERT_EQ(0, countOccurrences(helper, QStringLiteral("lastRunnerSleepDispatchNs()")));
+    const int segmentAt = main.indexOf(QStringLiteral("void MainWindow::chargeSmokeRunnerSleepSegment( double startS, double endS )"));
+    ASSERT_TRUE(segmentAt >= 0);
+    const QString segment = main.mid(segmentAt, main.indexOf(QStringLiteral("\n}"), segmentAt) - segmentAt);
+    // one gap update and one tail-window note per segment, both the segment's own length
+    ASSERT_EQ(1, countOccurrences(segment, QStringLiteral("if( m_guiPresentGapStartNs >= 0 ) m_guiPresentGapRunnerSleepNs += segmentNs;")));
+    ASSERT_EQ(1, countOccurrences(segment, QStringLiteral("GpuDisplayWindow::noteSmokeRunnerSleepIfActive( segmentNs );")));
+    ASSERT_EQ(1, countOccurrences(main, QStringLiteral("noteSmokeRunnerSleepIfActive(")));
 }
 
 // PLAYBACK-PRESENT-TAIL-TIMING-1 (W1): slip_summary appends the max-setup tail keys after present_setup_first_ms (the

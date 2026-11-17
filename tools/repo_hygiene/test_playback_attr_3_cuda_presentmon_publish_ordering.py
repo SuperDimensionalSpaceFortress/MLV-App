@@ -492,27 +492,23 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
         shared_list = text[shared_call:shared_list_end]
         cls.shared_parser_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", shared_list)
 
-        # UM-PRESENTMON-ORPHAN-SWEEP-1: the card's three module helpers are spliced by a FOURTH statement (inside its own sentinel brackets, so the dual-venue byte-identity strip
-        # removes them), after the display-identity try/finally. Its -Name list is parsed out of the generator here and embedded from the working-tree module, so the
-        # helpers the template calls (Get-AttrCudaPresentMonEventsLost, ...) are checked as defined in the emitted job's text too.
-        orphan_marker = text.index("# UM-PRESENTMON-ORPHAN-SWEEP-1: the card's module helpers", shared_call)
-        orphan_list_start = text.index("-Name @(", orphan_marker)
-        orphan_list_end = text.index("\n))", orphan_list_start)
-        cls.orphan_sweep_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[orphan_list_start:orphan_list_end])
-
-        # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware source-frame verdict is spliced by its own bracketed statement, and the template CALLS it (the job's source-frame
-        # block). Its -Name list is parsed out of the generator here and embedded from the working-tree module, like the orphan-sweep helpers above.
-        hfr_marker = text.index("# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the conform-aware entry point", orphan_list_end)
-        hfr_list_start = text.index("-Name @(", hfr_marker)
-        hfr_list_end = text.index("\n))", hfr_list_start)
-        cls.hfr_conform_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[hfr_list_start:hfr_list_end])
-
-        # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the temporal arm over the app's swap window is spliced by its own bracketed statement too, and the template CALLS it. Its -Name list is
-        # parsed out of the generator here and embedded from the working-tree module, like the two splices above.
-        pm_gap_marker = text.index("# PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1: the temporal arm over the app's swap window", hfr_list_end)
-        pm_gap_list_start = text.index("-Name @(", pm_gap_marker)
-        pm_gap_list_end = text.index("\n))", pm_gap_list_start)
-        cls.pm_internal_gap_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[pm_gap_list_start:pm_gap_list_end])
+        # Every card's own module helpers are spliced by a bracketed statement (inside its own sentinel brackets, so the dual-venue byte-identity strip removes them), after the
+        # display-identity try/finally: UM-PRESENTMON-ORPHAN-SWEEP-1, VENUE-SESSION-LOCKED-REFUSAL-1, HFR-CONFORM-AWARE-RECEIPT-ORACLES-1, PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1,
+        # VENUE-STAGE-CLAIM-SHAPE-1, ... VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r7 (CI run 43605635128): this class used to model those splices one hand-named card at a time, so a
+        # new bracketed splice (r5 moved Get-AttrCudaBuildManifestClaimSha256 into VENUE-STAGE-CLAIM-SHAPE-1) went unmodelled and its helper read as undefined. Every bracketed
+        # statement is now taken out of the generator by shape and run VERBATIM, and every other $embeddedFunctions append in the generator must be one this probe models, so a
+        # splice of a new shape fails here by count instead of slipping past the probe.
+        splice_re = re.compile(
+            r'^\$embeddedFunctions = \$embeddedFunctions \+ "`r`n# ([A-Z0-9-]+) >>>`r`n" \+ \(Get-AttrCudaEmbeddedFunctionSource -Name @\(\n'
+            r"(?:    '[A-Za-z]+-[A-Za-z0-9]+',?\n)+"
+            r'\)\) \+"`r`n# \1 <<<"$',
+            re.M,
+        )
+        splices = list(splice_re.finditer(text))
+        cls.bracketed_splice_tags = [m.group(1) for m in splices]
+        cls.bracketed_splice_statements = [m.group(0) for m in splices]
+        # The appends this probe models: the OwnerFootage one inside embedding_snippet, the display-identity one (re-issued below from the working tree), and the bracketed ones.
+        cls.append_count = len(re.findall(r"(?m)^\s*\$embeddedFunctions = \$embeddedFunctions \+ ", text))
 
         # The body ONLY -- unlike this file's other classes, which keep the "$template = @'"
         # prefix (harmless there, since they only ever substring-search it) -- because this class
@@ -532,6 +528,13 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
         # FunctionDefinitionAst.Name for what the real embedding actually defines. __TOKEN__
         # placeholders are substituted with a dummy variable reference first, the same way that
         # sibling test parses the generator's own placeholder-bearing source.
+        for tag in ("UM-PRESENTMON-ORPHAN-SWEEP-1", "VENUE-SESSION-LOCKED-REFUSAL-1", "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1",
+                    "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1", "VENUE-STAGE-CLAIM-SHAPE-1"):
+            self.assertIn(tag, self.bracketed_splice_tags, f"the {tag} splice is not a bracketed statement of the modelled shape")
+        self.assertEqual(
+            self.append_count, 2 + len(self.bracketed_splice_statements),
+            "an $embeddedFunctions append in the generator is neither the OwnerFootage nor the display-identity one nor a bracketed splice of the modelled shape",
+        )
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             template_path = tmp_path / "template.txt"
@@ -546,12 +549,7 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
                 "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource "
                 f"-ModulePath '{ROOT / 'tools' / 'profiling' / 'gui-smoke-display-identity.ps1'}' "
                 "-Name $sharedParserNames)\n"
-                "$orphanSweepNames = @(" + ",".join(f"'{n}'" for n in self.orphan_sweep_names) + ")\n"
-                "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $orphanSweepNames)\n"
-                "$hfrConformNames = @(" + ",".join(f"'{n}'" for n in self.hfr_conform_names) + ")\n"
-                "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $hfrConformNames)\n"
-                "$pmInternalGapNames = @(" + ",".join(f"'{n}'" for n in self.pm_internal_gap_names) + ")\n"
-                "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $pmInternalGapNames)\n"
+                + "".join(f"{statement}\n" for statement in self.bracketed_splice_statements) +
                 "$definedNames =[System.Collections.Generic.HashSet[string]]::new()\n"
                 "$tokens = $null; $errors = $null\n"
                 "$embeddedAst = [System.Management.Automation.Language.Parser]::ParseInput("

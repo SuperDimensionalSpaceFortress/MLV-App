@@ -1102,28 +1102,70 @@ function Get-DvSmokeSummaryFields {
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $fields = @{}
     $session = $null
+    $sessionUnreadable = $false
     $isolated = $false
     $conformLine = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 and advisory A3 on #726): every line is read as its record body, so a build path in a Qt
         # location suffix never selects the session or a line, and never adds a summary or conform field.
         $lines = Get-DvLogRecordBodies -LogText $LogText
-        foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
-        if ($null -eq $session) { foreach ($line in $lines) { if ($line -match 'playback_smoke\.summary session=(?<s>\d+)') { $session = $Matches['s']; break } } }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r3 (r2 adversary pass 7 A2): each marker counts only where it STARTS the record body
+        # ($script:DvRecordStart), so a run_metadata command line (or any other record) holding `playback_smoke.measured_session id=<n>` never picks the session
+        $rs = $script:DvRecordStart
+        # r10 (sol r9 B1): the id is the WHOLE token up to whitespace or the end of the line, and must be one plain decimal [0-9]+; before r10 `id=3x`,
+        # `3.5` or `3/old` selected session 3 by its numeric prefix (and another Play's wake was honoured). A malformed first marker (or, with no marker,
+        # a malformed first summary) makes the measured session UNREADABLE: session stays $null and sessionUnreadable is $true, never a later record's
+        # r11 (r10 adversary A1 on 205a5b6c): the FIRST record that starts with the marker's name (`playback_smoke.measured_session` ending at a non-name
+        # character, any case) is the marker, read whole (case-sensitive) or not at all: no `id=` right after it (`... id`, a doubled space, `ID=`) is the
+        # empty token, so unreadable, never skipped for a later Play's marker. The summary fallback reads the first `playback_smoke.summary` the same way.
+        $token = $null
+        # r11 pass 11 (A3, `id=3 id=4`): the marker names the word id exactly once and the summary the word session exactly once (bounded by any
+        # non-name character, so a quoted or repeated one counts); a second mention is the empty token, so unreadable
+        # r12 (r12 adversary B3 on 7e66a3af, its input: a Kelvin sign U+212A before `id=4`): a name character is ASCII [A-Za-z0-9_] matched CASE-SENSITIVELY
+        # ($script:DvNameChar); under (?i) .NET folds U+212A / U+0130 into [A-Za-z], which hid the mention. r12 (B2, its input: a first marker
+        # `id=3 (id=4)`): a body that ends in the LOCATION_UNREADABLE sentinel lost its tail, so it is not read whole (the empty token, unreadable)
+        # r12 (pass 13 A2): case-insensitive reads are culture-invariant ($script:DvCi), never -match or (?i)
+        $wordCount = { param([string]$x, [string]$w) [regex]::Matches($x, '(?<!' + $script:DvNameChar + ')' + $w + '(?!' + $script:DvNameChar + ')', $script:DvCi).Count }
+        $located = { param([string]$x) -not $x.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) }
+        foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.measured_session(?!' + $script:DvNameChar + ')'), $script:DvCi)) { $token = $(if ((& $located $line) -and (& $wordCount $line 'id') -eq 1 -and (& $wordCount $line 'session') -eq 0 -and $line -cmatch ($rs + 'playback_smoke\.measured_session id=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } }
+        if ($null -eq $token) { foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.summary(?!' + $script:DvNameChar + ')'), $script:DvCi)) { $token = $(if ((& $located $line) -and (& $wordCount $line 'session') -eq 1 -and $line -cmatch ($rs + 'playback_smoke\.summary session=(?<s>\S*)')) { $Matches['s'] } else { '' }); break } } }
+        if ($null -ne $token) { if ($token -cmatch '^[0-9]+$') { $session = $token } else { $sessionUnreadable = $true } }
         if ($null -ne $session) {
             $summaryLine = $null
-            foreach ($line in $lines) { if ($line -match ('playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
-            if ($null -ne $summaryLine) {
+            foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $summaryLine = $line } }
+            # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker; r24 adversary A1 on c1b10b4f): a summary record that holds a
+            # MASKED `=` (a `<key>=` inside a quoted span, ConvertTo-DvQuoteMaskedBody) is refused whole: no field is read from it, so the quoted text never
+            # supplies a field (the key3 repro's `source_advanced=600`) and a stray quote never hides a real field while the rest still reads (fields empty,
+            # so every proof field is absent and the evidence is invalid). The app's own summary values hold no `=` inside a quote (real-log-mask-check)
+            # r24 (r24 adversary pass 2 A1 on d89dc086, its input: an =-free quoted ` (` first, then the proof fields, then `diagnostic='prefix (
+            # fps_override=1`): a summary record that lost its tail to the LOCATION_UNREADABLE sentinel ($located false) is refused whole too, as the
+            # session readers already refuse it, so a field in the cut tail is never hidden while the fields before it still read
+            if ($null -ne $summaryLine -and $summaryLine.IndexOf($script:DvQuotedEqualsMask) -lt 0 -and (& $located $summaryLine)) {
                 foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
             }
-            foreach ($line in $lines) { if ($line -match ('playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)')) { $conformLine = $line } }
+            foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $conformLine = $line } }
         }
         # Master isolates an automation run's settings store (the venue's persisted settings are never read or rewritten).
         # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
-        $iso = @($lines | Where-Object { $_ -match 'interaction_trace event=automation\.pacing_isolated(\s|$)' })
-        $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { $_ -notmatch 'settings_store=run_scoped(\s|$)' }).Count -eq 0)
+        # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR `INTERACTION_TRACE` record is read as every other culture reads it
+        $iso = @($lines | Where-Object { [regex]::IsMatch($_, ($rs + 'interaction_trace event=automation\.pacing_isolated(\s|$)'), $script:DvCi) })
+        # r13 (r13 adversary A2 on 04c1337b): each record names settings_store as one whole token, and that one token is run_scoped. A longer key that
+        # ends in it (`not_settings_store=run_scoped`) is no settings_store, and two settings_store tokens (`settings_store=venue settings_store=run_scoped`)
+        # do not say which store ran, so either refuses isolation
+        # r15 (r15 adversary A2 on d991b0af, its input: `settings_store=run_scoped "settings_store=venue"`): a mention is the WORD settings_store bounded
+        # by any non-name character ($script:DvNameChar), so a quoted or punctuated declaration counts; exactly one mention, and it is that whole token
+        # r16 (r15 adversary A1 on c24d5ee5, its input: `settings_store=run_scoped (settings_store=venue)`): a record that ends in the LOCATION_UNREADABLE
+        # sentinel lost its tail, and the tail may have named the store, so such a record is never read whole: not isolated (as the session readers do)
+        $runScoped = {
+            param([string]$x)
+            if ($x.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { return $false }
+            $mentions =[regex]::Matches($x, '(?<!' + $script:DvNameChar + ')settings_store(?!' + $script:DvNameChar + ')', $script:DvCi).Count
+            $stores = [regex]::Matches($x, '(?<!\S)settings_store=(?<v>\S*)', $script:DvCi)
+            ($mentions -eq 1) -and ($stores.Count -eq 1) -and [string]::Equals($stores[0].Groups['v'].Value, 'run_scoped', [StringComparison]::OrdinalIgnoreCase)
+        }
+        $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { -not (& $runScoped $_) }).Count -eq 0)
     }
-    [pscustomobject]@{ session = $session; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
+    [pscustomobject]@{ session = $session; sessionUnreadable = $sessionUnreadable; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
 }
 
 function Get-DvConformPaceProof {
@@ -1347,7 +1389,10 @@ function Get-DvPlaybackEvidence {
     $parsed = Get-DvSmokeSummaryFields -LogText $LogText
     $f = $parsed.fields
     $conformFields = @{}
-    if ($null -ne $parsed.conformLine) { foreach ($m in [regex]::Matches([string]$parsed.conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $conformFields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
+    # r24 (r24 adversary pass 2 A1 sibling): a conform record that holds a masked `=` or lost its tail to the LOCATION_UNREADABLE sentinel supplies no
+    # conform field (refused whole, like the summary record), so the conform proof reads it as absent and is not proven
+    $conformReadable = ($null -ne $parsed.conformLine) -and ([string]$parsed.conformLine).IndexOf($script:DvQuotedEqualsMask) -lt 0 -and -not ([string]$parsed.conformLine).EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)
+    if ($conformReadable) { foreach ($m in [regex]::Matches([string]$parsed.conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $conformFields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
     $conformPlaybackField = ConvertTo-DvDouble $conformFields['playback_fps']
     $conformClipField = ConvertTo-DvDouble $conformFields['clip_fps']
     $wrappedField = ConvertTo-DvInt64 $f['wrapped']
@@ -1461,7 +1506,10 @@ function Get-DvScaleEvidence {
         if ($null -ne $clampFlag) { $clampActive = ($clampFlag -ne 0) }
         if ($null -eq $effective) {
             foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($line -match 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)') { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
+                # r3 (r2 adversary pass 6 A3): the clamp record only where it starts the record body
+                # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR upper-case clamp record is read as every other culture reads it
+                $clampMatch = [regex]::Match($line, ($script:DvRecordStart + 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)'), $script:DvCi)
+                if ($clampMatch.Success) { $effective = [int64]$clampMatch.Groups['e'].Value; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
             }
         }
     }
@@ -1593,12 +1641,26 @@ function Get-DvLookLabelEvidence {
     $m = $null
     $p = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        foreach ($line in ($LogText -split "`r?`n")) {
-            if ($line -match 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\S+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?') {
-                $m = $Matches.Clone()
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 class sweep): the record bodies, quote-masked (Get-DvLogRecordBodies), so a
+        # label record spelled inside another record's quoted span (`note='gui_smoke.look_label shown="a" ... wait_ms=0'`) has no `shown=` and answers
+        # nothing; the app's own label text holds no `=`, so its shown / expected values read as before. Before r24 this reader split the raw text.
+        foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+            # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi), so a tr-TR upper-case look_label record is read as every other culture reads it
+            # LOOK-LABEL-PLAYBACK-INFO-1: wait_ms= is read as a whole token (toCount reads a non-digit token as null) and the playback-info fields the app appends after it are optional
+            $labelMatch = [regex]::Match($line, 'gui_smoke\.look_label shown="(?<shown>[^"]*)" expected="(?<expected>[^"]*)" surface=(?<surface>\S+) show_in_fullscreen=(?<sif>[01]) wait_ms=(?<wait>\S+)(?: info_shown="(?<infoShown>[^"]*)" info_expected="(?<infoExpected>[^"]*)" info_fields=(?<infoFields>\S+))?', $script:DvCi)
+            if ($labelMatch.Success) {
+                $m = @{}
+                foreach ($g in 'shown', 'expected', 'surface', 'sif', 'wait') { $m[$g] = $labelMatch.Groups[$g].Value }
+                # a build that does not print the info fields leaves these groups unmatched, so the keys stay absent and infoPresent reads false
+                foreach ($g in 'infoShown', 'infoExpected', 'infoFields') { if ($labelMatch.Groups[$g].Success) { $m[$g] = $labelMatch.Groups[$g].Value } }
             }
-            elseif ($line -match 'gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\S+)') {
-                $p = $Matches.Clone()
+            else {
+                # same culture-invariant read for the playing record (LOOK-LABEL-PLAYBACK-INFO-1, sibling of the r13 label read above)
+                $playMatch = [regex]::Match($line, 'gui_smoke\.look_label_playing shown="(?<shown>[^"]*)" info_shown="(?<infoShown>[^"]*)" surface=(?<surface>\S+) samples=(?<samples>\S+)', $script:DvCi)
+                if ($playMatch.Success) {
+                    $p = @{}
+                    foreach ($g in 'shown', 'infoShown', 'surface', 'samples') { $p[$g] = $playMatch.Groups[$g].Value }
+                }
             }
         }
     }
@@ -1674,7 +1736,8 @@ function Get-DvInheritedWorkerOverrides {
     $overrides = [System.Collections.Generic.List[string]]::new()
     $unreadable = [System.Collections.Generic.List[string]]::new()
     foreach ($row in $rows) {
-        if ($StartRead.duplicates -contains $row[0]) { $unreadable.Add($row[1]); continue }
+        # r24 (r24 adversary pass 2 A1 sibling): a start record refused whole (Get-DvSmokeSessionLineRead unreadable) makes every row unreadable
+        if ($StartRead.unreadable -eq $true -or $StartRead.duplicates -contains $row[0]) { $unreadable.Add($row[1]); continue }
         $value = $StartRead.fields[$row[0]]
         if ($null -ne $value -and $value -cnotin $row[2]) { $overrides.Add("$($row[1])=$value") }
     }
@@ -1783,6 +1846,11 @@ function ConvertTo-DvSessionKey {
 # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r14: the optional log prefix a canonical session record may carry ([utc] [LEVEL] [0xthread] ), shared by
 # every whole-line record pattern Get-DvCanonicalRecordPattern builds.
 $script:DvLogRecordPrefix = '(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?'
+
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r3 (r2 adversary pass 7 A2, pass 6 advisory A3): where a record marker must sit to count -- at the START
+# of the record body, after at most the log prefix's bracket groups ([utc] [LEVEL] [0x<thread>] , or a shorter fixture prefix), never as text inside
+# another record (a run_metadata command line, a path, a field value). Every reader that selects the measured session or reads a session record anchors on it.
+$script:DvRecordStart = '^(?:\[[^\]]*\] ){0,3}'
 
 function Get-DvCanonicalRecordPattern {
     <#
@@ -1942,6 +2010,307 @@ function Get-DvReconReleaseDeferredEvidence {
     [ordered]@{ requested = $requested; observed = $observed; counts = $counts; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvDueWakeDelivered {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r8 (B1, sol + key3 opus r7): does ONE measured playback_due_wake record show a DELIVERED wake?
+    fired= counts the wakes the GUI thread took (MainWindow::onPlaybackDueWake); armed= counts arms, and an arm replaced or cancelled before delivery
+    (stranded=) delivers nothing, so arming is not delivery. r8 adversary pass 3 A1: fired= also counts a LOST post (the queue refused the native
+    message past its retry budget) that the poll tick delivered (PlaybackDueWake::deliverLostPost, counted in post_rescued=), which is no native
+    delivery; so the wakes the arm's own route delivered are fired= minus post_rescued=. Returns 'delivered' (exactly one whole-number fired= and
+    exactly one whole-number post_rescued=, and fired - post_rescued >= 1), 'none' (both readable, difference < 1) or 'unreadable' (either field
+    missing, repeated, empty, signed or not a whole count). FAIL CLOSED: only 'delivered' is delivery evidence.
+    r9 (Grok CoS G10): post_rescued= is a settled count only when the same line says post_counts_settled=1. The app prints 0 when the wait thread
+    did not answer in time at the line or at the Play's baseline (MainWindow::playbackDueWakeSummaryLine, postCountsSettled), which leaves the post
+    differences open to another Play's late count, so a rescue that would cancel the one wake may not be counted yet. Anything but exactly one
+    post_counts_settled=1 (0, missing, repeated, empty, any other value) is 'unreadable', never 'delivered'.
+    advanced= is not read (decided r8): a delivered wake on a busy renderer hands its advance to the frameReady path (busy_deferred=), so advanced=0
+    with a delivered wake is a measured outcome of the arm, not a route that did not run.
+    The one predicate for "a wake was delivered": Get-DvDueWakeDeliveryEvidence calls it for both the requested and the head path, and the runner's
+    gate (Invoke-VenueLeg) and Test-DvReceiptValid reach it only through that reader.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Line)
+    $n = @{}
+    foreach ($name in @('fired', 'post_rescued')) {
+        $f = [regex]::Matches([string]$Line, '(?:^|\s)' + $name + '=(?<f>\S*)')
+        if ($f.Count -ne 1 -or $f[0].Groups['f'].Value -cnotmatch '^[0-9]+$') { return 'unreadable' }
+        $n[$name] = [System.Numerics.BigInteger]::Parse($f[0].Groups['f'].Value, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    # r9 (G10): the post counts must be settled, as exactly one post_counts_settled=1
+    $settled = [regex]::Matches([string]$Line, '(?:^|\s)post_counts_settled=(?<s>\S*)')
+    # r24 (r24 adversary pass 2 A2 on d89dc086, its input: post_counts_settled=<U+0661>): ORDINAL, never -cne (a linguistic compare equates U+0661 /
+    # U+06F1 with ASCII 1 and ignores U+00AD / U+200B / U+FEFF), so only the ASCII token 1 is settled
+    if ($settled.Count -ne 1 -or -not [string]::Equals($settled[0].Groups['s'].Value, '1', [StringComparison]::Ordinal)) { return 'unreadable' }
+    if (($n['fired'] - $n['post_rescued']) -lt [System.Numerics.BigInteger]::One) { return 'none' }
+    'delivered'
+}
+
+function Get-DvDueWakeDeliveryEvidence {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: did a leg run with the due-wake delivery its arm names? A leg that asks for the posted wake
+    (generatorArgs.dueWakeDeliveryPost = true, which sets MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post) must report delivery_kind=post; any other leg is the head
+    arm and must not report a kind the variable selects. Read ONLY from the MEASURED session's own `playback_due_wake armed=<n> ...` record (the one after
+    its playback_smoke.pace_summary; the delivery_kind field r1 appends, cross-checked with the same line's delivery= mechanisms), never from another Play's
+    line, the start line, the spec or the launcher's env block. FAIL CLOSED: `blocks` is true when the leg asked and the measured line carries no
+    delivery_kind (a binary before r1 emits none, or the measured Play printed no line), the field is unreadable or contradicts delivery=, or the value is not
+    post. A leg that does not ask blocks when the measured line reports post or notifier (DUE_WAKE_DELIVERY_INHERITED: the variable came from the launcher)
+    or is unreadable; send, none (no wake: an unpaced leg) and qtimer, and no delivery_kind at all (a control binary before r1) leave it unchanged (any
+    other kind, "mixed" included, is unreadable). r2 adversary pass 6: a record counts only where it starts its record body, and the measured window closes
+    at the next pace_summary or at any playback_smoke record of another session. r4 (r4 adversary pass 9 A1): a leg that does not ask also blocks when the
+    measured line says disabled=1 (DUE_WAKE_DISABLED_INHERITED: MLVAPP_PLAYBACK_DUE_WAKE=0 came from the launcher; a control binary's line included), and
+    when a PACED leg's measured Play armed no wake (delivery=none: DUE_WAKE_NOT_ENGAGED); "none" is the app's own only on a generatorArgs.unpaced = true leg.
+    r5 (Grok G8, r4 adversary pass 10 A2/A3): a disabled= that is not exactly one 0 or 1 across the measured window's wake records blocks such a leg on a
+    control binary's line too (DUE_WAKE_DISABLED_UNREADABLE), and a playback_smoke.measured_session id= of another session closes the window.
+    r5 (pass 12 A1): on a control binary's line (no delivery_kind) a paced leg's delivery=none is DUE_WAKE_NOT_ENGAGED too, and a repeated or
+    out-of-grammar delivery= is unreadable; a posted leg whose line says disabled=1 is ROUTE_NOT_ENGAGED (pass 11 A2).
+    r8 (B1, sol + key3 opus r7): on a line with a delivery_kind, the posted leg and every PACED leg that does not ask count only when the measured
+    Play DELIVERED a wake by its route (Get-DvDueWakeDelivered: fired= minus post_rescued= of one or more); none, or a missing or unreadable count, is
+    DUE_WAKE_NOT_ENGAGED. r9 (Grok G10): post_rescued= counts only beside exactly one post_counts_settled=1 on the same line; an unsettled, missing,
+    repeated or malformed flag is unreadable there, so DUE_WAKE_NOT_ENGAGED on both paths. r10 (sol r9 B1): a malformed measured-session id (id=3x, 3.5,
+    3/old; Get-DvSmokeSummaryFields sessionUnreadable) blocks every leg, exempt ones included (DUE_WAKE_SESSION_UNREADABLE). r11 (r10 adversary A1/A2): so
+    does a first marker not read whole (no id=, a doubled space), and a session boundary inside the measured window not read whole ends the measured Play
+    and blocks every leg too (DUE_WAKE_SESSION_BOUNDARY_UNREADABLE). EXEMPT: a control binary's line (no delivery_kind; its binary is not under test) and an unpaced leg (it never arms).
+    Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'dueWakeDeliveryPost'
+    $requested = ($raw -is [bool]) -and $raw
+    $observed = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    $mentions = 0
+    $unreadableSeen = $false
+    # r1 adversary pass 1 A3: the MEASURED Play's own line only. The app prints playback_due_wake once per smoke session, directly after that session's
+    # playback_smoke.pace_summary (MainWindow.cpp, the smoke summary path), so the measured line is the first playback_due_wake record after the measured
+    # session's pace_summary and before any other pace_summary; another Play's line never stands in for it, and a measured Play with no line has none.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $paces = 0
+    $sessionUnreadable = $false
+    # r11 (r10 adversary A2): a session boundary inside the measured window that is not read whole (see the loop below)
+    $boundaryUnreadable = $false
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $picked = Get-DvSmokeSummaryFields -LogText $LogText
+        $session = $picked.session
+        # r10 (sol r9 B1): a malformed measured-session id names no session, so no line is the measured Play's; it blocks every leg below
+        $sessionUnreadable = ($picked.sessionUnreadable -eq $true)
+        if ($null -ne $session) {
+            # r2 adversary pass 6 A1: a record is read only where it STARTS the record body (after the optional `[utc] [LEVEL] [0x<thread>] ` prefix,
+            # Get-DvLogRecordBody), never as text inside another record's line. r3: the one shared anchor ($script:DvRecordStart), which the session
+            # selector above (Get-DvSmokeSummaryFields) now uses too (r2 adversary pass 7 A2)
+            $start = $script:DvRecordStart
+            # r15 (r14 adversary A2): session ids are compared as canonical decimals (ConvertTo-DvSessionKey), never as strings, so a boundary that
+            # spells the measured session `03` is that session (it neither closes its window nor fails to open it). r15 (r15 adversary A1 on d991b0af):
+            # the module's one ConvertTo-DvSessionKey (-Sign/-Digits), never a second definition; every id here is one ASCII [0-9]+
+            $sessionKey = ConvertTo-DvSessionKey -Sign '' -Digits ([string]$session)
+            $paceIdRx = $start + 'playback_smoke\.pace_summary session=(?<s>[0-9]+)(?:\s|$)'
+            $isMeasuredPace = { param([string]$x) ($x -cmatch $paceIdRx) -and ((ConvertTo-DvSessionKey -Sign '' -Digits $Matches['s']) -ceq $sessionKey) }
+            $open = $false
+            # r11 (r10 adversary A2 on 205a5b6c): a session boundary inside the open window that is not read whole ENDS the measured Play and marks
+            # the read unreadable (DUE_WAKE_SESSION_BOUNDARY_UNREADABLE below, every leg), so the wake after it is never credited to the measured Play.
+            # A boundary is: a measured_session marker (read whole: ` id=<[0-9]+>`), a start / summary / conform / pace_summary record, or any
+            # playback_smoke record whose first field is session (read whole: ` session=<[0-9]+>`); the empty `id=` / `session=`, no `=`, a doubled
+            # space, `4x`, or a start with no session first are each unreadable. A boundary read whole of another session still just closes it.
+            # r12 (r12 adversary B3): every name boundary is the ASCII, case-sensitive $script:DvNameChar, inside (?i) and -match too
+            $nameEnd = '(?!' + $script:DvNameChar + ')'
+            $nameStart = '(?<!' + $script:DvNameChar + ')'
+            # r12 (r12 adversary B2 on 7e66a3af, its input: `playback_smoke.gpu_summary (session=4)` in the window): a body that ends in the
+            # LOCATION_UNREADABLE sentinel lost its tail, and with it any session or key mention there, so such a record is never read whole
+            $located = { param([string]$x) -not $x.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) }
+            # r11 (r11 adversary pass 10 A1 on 93fa8621, its input: `playback_smoke.gpu_summary frames=600 session=4` was skipped): a record that names a
+            # session ANYWHERE (a `session` token, with or without =) is a boundary, read whole only as ONE ` session=<[0-9]+>` that is its first field
+            # r11 pass 11 (A1, its input: a quoted `"session=4"`): a mention is the WORD session bounded by any non-name character (a quote, a comma,
+            # a bracket, whitespace), not only by whitespace; `measured_session=` / `x_session=` are other names
+            # r12 (pass 13 A2): every case-insensitive read here is culture-invariant ($ci / $script:DvCi), never -match or (?i)
+            $ci = { param([string]$x, [string]$p) [regex]::IsMatch($x, $p, $script:DvCi) }
+            $sessionTokens = { param([string]$x) [regex]::Matches($x, $nameStart + 'session' + $nameEnd, $script:DvCi).Count }
+            # r11 pass 11 (A3, its input: `playback_smoke.measured_session id=3 id=4`): a marker names its id exactly once (the word id, bounded the same way)
+            $idTokens = { param([string]$x) [regex]::Matches($x, $nameStart + 'id' + $nameEnd, $script:DvCi).Count }
+            foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if (& $ci $l ($start + 'playback_smoke\.pace_summary' + $nameEnd)) {
+                    $paceWhole = (& $located $l) -and ($l -cmatch ($start + 'playback_smoke\.pace_summary session=[0-9]+(?:\s|$)')) -and ((& $sessionTokens $l) -eq 1)
+                    # r12 (B2, its input: the sole pace_summary `session=3 (session=4)`): a pace_summary not read whole whose visible text opens the
+                    # measured session's window is unreadable too, not only one inside an open window
+                    # r12 (pass 13 A1 on bbfe69d1, its input: `pace_summary  session=3` then `pace_summary session=3`): so is one BEFORE the measured
+                    # window was first seen ($paces 0), whatever its text; it may have been the measured Play's own pace, so the later one cannot be
+                    # shown to be the only measured window. Only a pace after the window closed is another Play's.
+                    if (-not $paceWhole -and ($open -or $paces -eq 0 -or (& $isMeasuredPace $l))) { $boundaryUnreadable = $true }
+                    $open = $paceWhole -and (& $isMeasuredPace $l); if ($open) { $paces++ }; continue
+                }
+                # r2 adversary pass 6 A2: any playback_smoke record of ANOTHER session (its start, summary, ...) closes the window, so another Play's
+                # wake line never stands in for the measured Play's missing one. r5 (r4 adversary pass 10 advisory A3): measured_session names its
+                # session with id=, not session=, and closes the window the same way
+                if ($open) {
+                    $bid = $null; $isBoundary = $false
+                    if (& $ci $l ($start + 'playback_smoke\.measured_session' + $nameEnd)) {
+                        $isBoundary = $true; if ((& $located $l) -and (& $sessionTokens $l) -eq 0 -and (& $idTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.measured_session id=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
+                    }
+                    # r12 (B2): any playback_smoke record whose body lost its tail to the sentinel may have named a session there, so it is a boundary
+                    # not read whole
+                    elseif ((& $ci $l ($start + 'playback_smoke\.(?:start|summary|conform)' + $nameEnd)) -or ((& $ci $l ($start + 'playback_smoke\.' + $script:DvNameChar + '+' + $nameEnd)) -and ((& $sessionTokens $l) -gt 0 -or -not (& $located $l)))) {
+                        $isBoundary = $true; if ((& $located $l) -and (& $sessionTokens $l) -eq 1 -and $l -cmatch ($start + 'playback_smoke\.[A-Za-z0-9_]+ session=(?<s>[0-9]+)(?:\s|$)')) { $bid = $Matches['s'] }
+                    }
+                    if ($isBoundary -and $null -eq $bid) { $boundaryUnreadable = $true; $open = $false; continue }
+                    if ($isBoundary -and (ConvertTo-DvSessionKey -Sign '' -Digits $bid) -cne $sessionKey) { $open = $false; continue }
+                }
+                # r1 adversary pass 2 A4: the window stays open to the next pace_summary, so a second line in it is seen (and is unreadable).
+                # r2 adversary pass 6 A1: ANY playback_due_wake record (the app prints exactly one shape, starting armed=) is a candidate, so a second
+                # one without armed= makes the read unreadable instead of being skipped
+                # r11 pass 11 advisory A4 (`playback_due_wake: armed=0 ... disabled=1` was skipped): the record name ends at any non-name character
+                if ($open -and (& $ci $l ($start + 'playback_due_wake' + $nameEnd))) { $candidates.Add($l) }
+            }
+        }
+    }
+    # delivery_kind is the SELECTED delivery (send / post / notifier; qtimer when the wake was built on a QTimer; none with no wake), never rewritten by a
+    # fallback arm; delivery= is what this Play's arms used (native-msg, qtimer, notifier, "+"-joined when they differed, none with no arm)
+    $mechanism = $null
+    # r8 (B1): 'delivered' / 'none' / 'unreadable' for the one measured line the delivery_kind path accepts ($null when it accepts none)
+    $delivered = $null
+    # r4 (r4 adversary pass 9 A1): disabled= is the app's MLVAPP_PLAYBACK_DUE_WAKE kill switch (MainWindow::playbackDueWakeSummaryLine prints 0 or 1), read
+    # from the measured line whether or not it carries a delivery_kind (a control binary's line has none); a repeated or non-0/1 value is unreadable.
+    # r5 (Grok G8 = r4 adversary pass 10 advisory A2): the repeat is counted across every wake record in the measured window (a second control line
+    # repeats it), and an unreadable value blocks a leg that does not ask on a line with no delivery_kind too (DUE_WAKE_DISABLED_UNREADABLE below)
+    $disabledSeen = $false
+    $disabledUnreadable = $false
+    $dis = @(foreach ($c in $candidates) { [regex]::Matches($c, '(?:^|\s)disabled=(?<d>\S*)') })
+    if ($dis.Count -gt 1 -or ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -cnotmatch '^[01]$')) { $disabledUnreadable = $true }
+    elseif ($dis.Count -eq 1 -and $dis[0].Groups['d'].Value -ceq '1') { $disabledSeen = $true }
+    $unpacedRaw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'unpaced'
+    $unpacedLeg = ($unpacedRaw -is [bool]) -and $unpacedRaw
+    # r11 (r11 adversary pass 10 A2 on 93fa8621, its input: a paced head line ending in a bare `delivery_kind` took the control-line exemption): a line
+    # NAMES delivery_kind with the key in any shape (no `=`, `delivery_kind post`, another case), and every key this reader reads (delivery_kind,
+    # delivery, disabled, armed, fired, post_rescued, post_counts_settled) must appear only as `<key>=`; a key named any other way makes the read
+    # unreadable on both paths (never skipped, never the control exemption)
+    # r11 pass 11 (A2, its input: a quoted `"delivery_kind=post"`): a mention is the key's WORD bounded by any non-name character, so a quoted or
+    # punctuated key is a mention that is not `<key>=` after whitespace, hence unreadable
+    # r12 (r12 adversary B3, its input: `delivery=native-msg <U+212A>delivery_kind=post`): the key boundary is the ASCII, case-sensitive $script:DvNameChar
+    # r12 (pass 13 A2): culture-invariant ($script:DvCi), so a tr-TR `DELIVERY_KIND=post` is a mention too
+    $withKind = @($candidates | Where-Object { [regex]::IsMatch($_, ('(?<!' + $script:DvNameChar + ')delivery_kind(?!' + $script:DvNameChar + ')'), $script:DvCi) })
+    $keyShapeUnreadable = $false
+    foreach ($c in $candidates) {
+        # r12 (r12 adversary B2, its input: a sent-head wake line ending ` (delivery_kind=1)`): a wake record whose body lost its tail to the
+        # LOCATION_UNREADABLE sentinel may have named a key there, so its key shape is unreadable on both paths
+        if ($c.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $keyShapeUnreadable = $true }
+        # r23 (r23 adversary A1 on 9b78199f, its input: `playback_due_wake armed=1 note="diagnostic fired=1 ... delivery_kind=post end"` was HONOURED):
+        # the app's wake record is numeric and enum fields only (MainWindow::playbackDueWakeSummaryLine writes no quote), so a wake record whose body
+        # holds a double quote is not the app's shape and its key shape is unreadable on both paths; text inside a quote never supplies a field here
+        # r24 (opus key3 r23 hardening = sol r23 INV-6, its input: `note='prefix fired=1 ... delivery_kind=post end'` was HONOURED): a single quote
+        # too. The candidates are quote-masked bodies (Get-DvLogRecordBodies), so the quoted `=` already supplies no field; the refusal names the shape
+        if ($c.IndexOfAny($script:DvQuoteChars) -ge 0) { $keyShapeUnreadable = $true }
+        foreach ($key in @('delivery_kind', 'delivery', 'disabled', 'armed', 'fired', 'post_rescued', 'post_counts_settled')) {
+            if ([regex]::Matches($c, '(?<!' + $script:DvNameChar + ')' + $key + '(?!' + $script:DvNameChar + ')', $script:DvCi).Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
+        }
+    }
+    # r5 (r5 adversary pass 12 A1): a control binary's line (one wake record, no delivery_kind) still carries delivery= (master's
+    # playbackDueWakeSummaryLine prints it), so a paced leg whose measured Play armed no wake (delivery=none) is not engaged there either; a
+    # repeated or out-of-grammar delivery= on that line is unreadable. A line with no delivery= at all (an older binary) is left unchanged.
+    # r6 (r5 adversary pass 13 A1): the app prints one wake record per Play, so a measured window with more than one and no delivery_kind is unreadable
+    # too; before r6 a second record (a bare `playback_due_wake`) skipped the one-line read and removed the paced no-arm refusal below
+    # r7 (Grok G9): and so is one with the measured session's pace_summary more than once, as on the delivery_kind path below ($paces -ne 1): a line
+    # from a later pace window never stands in for the measured Play
+    $controlMech = $null
+    $controlMechUnreadable = ($withKind.Count -eq 0 -and $candidates.Count -gt 0 -and ($candidates.Count -gt 1 -or $paces -ne 1 -or $keyShapeUnreadable))
+    # r7 (r7 adversary pass 1 A2): the app's delivery= is "none" alone (reset, no arm this Play) or a "+"-join of distinct mechanisms (the first arm
+    # replaces "none", and a later arm appends its mechanism only when the join lacks it; MainWindow.cpp, the arm path), so none+qtimer or a repeated
+    # mechanism is unreadable on both paths
+    $mechReadable = { param([string]$m) ($m -cmatch '^(?:none|(?:native-msg|qtimer|notifier)(?:\+(?:native-msg|qtimer|notifier))*)$') -and
+                      (@($m -split '\+' | Sort-Object -Unique).Count -eq @($m -split '\+').Count) }
+    # r7 (r7 adversary pass 1 A1): a control binary prints the same `playback_due_wake armed=<n>` start (46d3472b's playbackDueWakeSummaryLine), so a
+    # control line without one plain armed count is unreadable as on the delivery_kind path below
+    $armedReadable = { param([string]$l) ($l -cmatch ($script:DvRecordStart + 'playback_due_wake armed=[0-9]+(?:\s|$)')) -and
+                       ([regex]::Matches($l, '(?:^|\s)armed=(?<a>\S*)').Count -eq 1) }
+    if ($candidates.Count -eq 1 -and $withKind.Count -eq 0) {
+        $cm = [regex]::Matches($candidates[0], '(?:^|\s)delivery=(?<m>\S*)')
+        if (-not (& $armedReadable $candidates[0]) -or $cm.Count -gt 1 -or ($cm.Count -eq 1 -and -not (& $mechReadable $cm[0].Groups['m'].Value))) { $controlMechUnreadable = $true }
+        elseif ($cm.Count -eq 1) { $controlMech = $cm[0].Groups['m'].Value }
+    }
+    if ($withKind.Count -gt 0) {
+        $mentions = $withKind.Count
+        if ($paces -ne 1 -or $candidates.Count -ne 1 -or $keyShapeUnreadable) { $unreadableSeen = $true }
+        else {
+            $l = $candidates[0]
+            $fields = [regex]::Matches($l, '(?:^|\s)delivery_kind=(?<k>\S*)')
+            $mech = [regex]::Matches($l, '(?:^|\s)delivery=(?<m>\S*)')
+            # r3 (r2 adversary pass 7 advisory A1): the app's record starts `playback_due_wake armed=<n>` (MainWindow::playbackDueWakeSummaryLine) with one
+            # non-negative decimal count; a record without it, or with an empty, signed, fractional or repeated armed=, is unreadable
+            # r8 (r8 adversary pass 4 A1): a binary that prints delivery_kind always prints disabled=, so a line with no disabled= cannot show the
+            # kill switch off and is unreadable too ($dis counts this one candidate's disabled= tokens; a control line with none stays as r5 left it)
+            if (-not (& $armedReadable $l) -or $disabledUnreadable -or $dis.Count -ne 1) { $unreadableSeen = $true }
+            elseif ($fields.Count -ne 1 -or $fields[0].Groups['k'].Value -cnotmatch '^(send|post|notifier|qtimer|none)$' -or $mech.Count -ne 1 -or -not (& $mechReadable $mech[0].Groups['m'].Value)) { $unreadableSeen = $true }
+            else {
+                # r1 adversary pass 3 A1: the selection and the arms must agree -- none only with no arm (delivery=none), qtimer only on QTimer arms, notifier
+                # only on notifier (or fallback QTimer) arms, send / post only on native-message (or fallback QTimer) arms; any other pair is contradictory
+                $k = $fields[0].Groups['k'].Value
+                $parts = @($mech[0].Groups['m'].Value -split '\+')
+                $allowed = switch ($k) { 'none' { @('none') } 'qtimer' { @('qtimer', 'none') } 'notifier' { @('notifier', 'qtimer', 'none') } default { @('native-msg', 'qtimer', 'none') } }
+                # r24 (r24 adversary pass 2 A2 sibling): each part is one of the allowed tokens ORDINALLY (-cnotin is linguistic: native-msg<U+00AD> matched)
+                if (@($parts | Where-Object { $p = [string]$_; @($allowed | Where-Object { [string]::Equals($p, $_, [StringComparison]::Ordinal) }).Count -eq 0 }).Count -gt 0) { $unreadableSeen = $true }
+                else { $observed = $k; $mechanism = $mech[0].Groups['m'].Value; $delivered = Get-DvDueWakeDelivered -Line $l }
+            }
+        }
+    }
+    $unreadable = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake line (after its playback_smoke.pace_summary, before the next) is not exactly one line carrying one delivery_kind of send, post, notifier, qtimer, none and one delivery= of native-msg, qtimer, notifier, none or a "+"-join (MainWindow::playbackDueWakeSummaryLine)'
+    # r8 (B1): the reason both paths give when the measured line shows no delivered wake
+    $notDelivered = "DUE_WAKE_NOT_ENGAGED: the measured session's playback_due_wake line shows $(if ($delivered -ceq 'none') { 'no wake delivered by its route (fired= minus post_rescued= is below 1)' } else { 'no readable fired= or post_rescued= count (exactly one whole number each, with exactly one post_counts_settled=1: an unsettled post count may still move)' }), so no armed wake was delivered to the GUI thread by the route the leg names (fired= counts the wakes it took, a lost post the poll tick rescued included; an arm replaced or cancelled first delivers nothing) and the run measured no delivered wake"
+    if ($sessionUnreadable) {
+        # r10 (sol r9 B1, its input: `playback_smoke.measured_session id=3x` before session 3's posted wake and a valid id=4 was HONOURED): FAIL CLOSED for
+        # every leg, the posted one and the head arm alike; never the numeric prefix's wake and never a later session's
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_SESSION_UNREADABLE: the first playback_smoke.measured_session id= (or, with none, the first playback_smoke.summary session=) is not one whole decimal id up to whitespace or the end of the line, so no playback_due_wake line can be read as the measured Play''s'
+    }
+    elseif ($boundaryUnreadable) {
+        # r11 (r10 adversary A2, its input: an empty `playback_smoke.measured_session id=` or `playback_smoke.start session=` after session 3's pace_summary,
+        # then a posted wake, was HONOURED): the boundary may be another Play's, so no wake after it is the measured Play's; FAIL CLOSED for every leg
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_SESSION_BOUNDARY_UNREADABLE: inside the measured session''s window (after its playback_smoke.pace_summary) a playback_smoke session boundary (measured_session, start, summary, conform, pace_summary, or a record whose first field is session) is not read whole as id=<n> / session=<n>, so the measured Play''s end is unknown and no later playback_due_wake line can be read as its own'
+    }
+    elseif ($requested) {
+        $verdict = 'NOT_HONOURED'
+        if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session has no playback_due_wake line with a delivery_kind (after its playback_smoke.pace_summary), so the binary does not report how its wake was delivered' }
+        elseif ($null -eq $observed) { $reason = $unreadable }
+        elseif ($observed -cne 'post') { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_due_wake says delivery_kind=$observed, not the post the leg names" }
+        # r1 adversary pass 1 A2: the posted arm counts only when every arm of the measured Play went by the native message
+        elseif ($mechanism -cne 'native-msg') { $reason = "DUE_WAKE_DELIVERY_FELL_BACK: the measured Play's arms used delivery=$mechanism, not only the native message the posted arm names" }
+        # r5 (r5 adversary pass 11 advisory A2): the kill switch on contradicts any engagement the same line claims
+        elseif ($disabledSeen) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_due_wake line says disabled=1 (MLVAPP_PLAYBACK_DUE_WAKE=0), which contradicts the posted wake it reports' }
+        # r8 (B1, sol + key3 opus r7, their input: armed=1200 fired=0 ... delivery_kind=post was HONOURED): a posted arm that delivered no wake
+        elseif ($delivered -cne 'delivered') { $reason = $notDelivered }
+        else { $verdict = 'HONOURED' }
+    }
+    elseif ($disabledSeen) {
+        # r4 (r4 adversary pass 9 A1, its input: the committed paced head cell with an inherited MLVAPP_PLAYBACK_DUE_WAKE=0): the kill switch is never a
+        # leg's own arm (no leg spec sets it), and it also changes how an unpaced Play advances, so disabled=1 blocks every leg that does not ask, a control
+        # binary's line included
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_DISABLED_INHERITED: the measured session''s playback_due_wake line says disabled=1 (MLVAPP_PLAYBACK_DUE_WAKE=0 came from the launcher), so this run is not the arm its leg names'
+    }
+    elseif ($disabledUnreadable) {
+        # r5 (Grok G8 = r4 adversary pass 10 advisory A2): a control binary's line (no delivery_kind, so no mention) with disabled=yes, an empty disabled=
+        # or a repeated disabled= cannot show the kill switch off, so it blocks like a line with a delivery_kind does (the $unreadableSeen path above)
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_DISABLED_UNREADABLE: the kill switch is unreadable: the measured session''s playback_due_wake records carry a disabled= that is not exactly one 0 or 1 (MainWindow::playbackDueWakeSummaryLine prints one), so the kill switch is not shown off'
+    }
+    elseif ($controlMechUnreadable) {
+        # r5 (r5 adversary pass 12 A1): the control line's delivery= cannot show which arms the measured Play used
+        $verdict = 'NOT_HONOURED'; $reason = 'the due-wake delivery is unreadable: the measured session''s playback_due_wake records carry no delivery_kind and are more than one or follow more than one of its pace_summary lines, or the one line does not start with one plain armed= count, or its delivery= is repeated or is not none alone or a "+"-join of distinct native-msg, qtimer, notifier'
+    }
+    elseif ($controlMech -ceq 'none' -and -not $unpacedLeg) {
+        # r5 (r5 adversary pass 12 A1, its input: the committed paced cell with a control line saying delivery=none): the r4 rule below, on a line
+        # with no delivery_kind
+        $verdict = 'NOT_HONOURED'; $reason = 'DUE_WAKE_NOT_ENGAGED: the leg is paced (no generatorArgs.unpaced) but its measured Play armed no due wake (delivery=none, no delivery_kind), so it measured no wake; only an unpaced leg runs without one'
+    }
+    elseif ($mentions -gt 0) {
+        # r1 adversary passes 1 A1 / 2 A1: a selection the variable makes (post, notifier) is inherited whatever the arms used; qtimer (no native wake
+        # built) is the app's own; send is the head arm, and counts only when no arm fell back (pass 1 A2). r4 (pass 9 A1): no arm in the measured Play
+        # (delivery=none, delivery_kind none or not) is the app's own only on an unpaced leg (generatorArgs.unpaced = true, which never arms); a paced leg
+        # that armed no wake measured no sent wake
+        if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
+        elseif ($observed -cin @('post', 'notifier')) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_INHERITED: the leg does not ask for the posted wake but the app reports delivery_kind=$observed (MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY came from the launcher), so this run is not the head arm" }
+        elseif ($mechanism -ceq 'none' -and -not $unpacedLeg) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_NOT_ENGAGED: the leg is paced (no generatorArgs.unpaced) but its measured Play armed no due wake (delivery=none, delivery_kind=$observed), so it measured no sent wake; only an unpaced leg runs without one" }
+        elseif ($observed -ceq 'send' -and $mechanism -cnotin @('native-msg', 'none')) { $verdict = 'NOT_HONOURED'; $reason = "DUE_WAKE_DELIVERY_FELL_BACK: the head arm's measured Play used delivery=$mechanism, not only the sent native message" }
+        # r8 (B1): a paced leg's measured Play that armed but delivered no wake (fired=0, or no readable fired=) measured no wake, the sent head arm
+        # included (its sent-head twin of the B1 input was unblocked); only an unpaced leg (it never arms) is exempt
+        elseif (-not $unpacedLeg -and $delivered -cne 'delivered') { $verdict = 'NOT_HONOURED'; $reason = $notDelivered }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
 function Get-DvTeamPartitionEvidence {
     <#
     .SYNOPSIS
@@ -2038,7 +2407,47 @@ function Get-DvTeamPartitionEvidence {
 }
 
 # The flavors the app can apply (src/batch/LookAssistAnalysis.cpp lookAssistFlavorName). The app's `look_assist_flavor=none` (nothing applied) is not among them.
-$script:DvAppliedLookFlavors = @('classic', 'cinematic', 'film', 'vision50d')
+$script:DvAppliedLookFlavors = [string[]]@('classic', 'cinematic', 'film', 'vision50d')
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 on 620182b3, its inputs: `look_assist_flavor=cinematic` followed by U+200B, U+00AD or
+# U+FEFF): a flavor token is ASCII-canonical (only [a-z0-9_], matched case-sensitively and culture-free) or it is UNREADABLE. PowerShell's -ceq / -ccontains
+# compare linguistically, where those characters are ignorable, so a ten-character `cinematic<U+200B>` equalled `cinematic` in the whitelist and in both
+# claim predicates. Every flavor comparison goes through Test-DvAppliedLookFlavor / Test-DvLookFlavorSame: canonical, then ordinal.
+$script:DvCanonicalFlavorToken = [regex]::new('\A[a-z0-9_]+\z', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+# r26 adversary A1 + A2 on 2f131c49: where a look_assist key STARTS for the ambiguity counts -- after any character that is not an ASCII name character,
+# matched case-sensitively inside a (?i) / $script:DvCi pattern (as $script:DvNameChar), or at the start of the body. Under IgnoreCase a bare [A-Za-z0-9_]
+# folds U+212A (Kelvin sign) to `k`, which hid a masked conflicting key; a whitespace-only `(^|\s)` start missed `,look_assist_flavor=classic`.
+$script:DvLookKeyStart = '(?<!(?-i:[A-Za-z0-9_]))'
+
+function Get-DvLookKeyTokens {
+    <#
+    .SYNOPSIS
+    r26 adversary pass 2 A1 on eed44c40: every token one look_assist key names in a record body, for the AMBIGUITY counts of Get-DvLookAssistEvidence.
+    A mention is the key in any case ($script:DvCi) bounded on both sides by non-name characters (ASCII, case-sensitive: $script:DvLookKeyStart and the
+    lookahead below). A mention followed by a plain `=` yields its value (`\S*`, empty included); any other mention -- a masked `=` (U+001A), a space,
+    a colon, nothing -- yields the mask token, UNREADABLE and never an applied flavor. So a malformed key is a token, never absent; it never proves one.
+    #>
+    param([AllowEmptyString()][string]$Body, [Parameter(Mandatory)][ValidatePattern('^[a-z_]+$')][string]$Key)
+    $mask = [string]$script:DvQuotedEqualsMask
+    foreach ($m in [regex]::Matches($Body, ($script:DvLookKeyStart + $Key + '(?!(?-i:[A-Za-z0-9_]))(?<eq>=(?<v>\S*))?'), $script:DvCi)) {
+        if ($m.Groups['eq'].Success) { $m.Groups['v'].Value } else { $mask }
+    }
+}
+
+function Test-DvLookFlavorSame {
+    <#
+    .SYNOPSIS
+    r26 (sol r25 B2): are A and B the same look flavor? True only when both are strings, A is ASCII-canonical ([a-z0-9_]+, nothing else) and B equals A
+    ORDINALLY. An empty, non-string or non-canonical value is the same as nothing, so it never backs a flavor claim.
+    #>
+    param([AllowNull()]$A, [AllowNull()]$B)
+    ($A -is [string]) -and ($B -is [string]) -and $script:DvCanonicalFlavorToken.IsMatch($A) -and [string]::Equals($A, $B, [StringComparison]::Ordinal)
+}
+
+function Test-DvAppliedLookFlavor {
+    # r26 (sol r25 B2): is the token one of the flavors the app can apply, canonical and compared ordinally (Array.IndexOf on string[] is ordinal)?
+    param([AllowNull()]$Token)
+    ($Token -is [string]) -and $script:DvCanonicalFlavorToken.IsMatch($Token) -and ([Array]::IndexOf($script:DvAppliedLookFlavors, $Token) -ge 0)
+}
 
 function Get-DvLookAssistEvidence {
     <#
@@ -2056,23 +2465,71 @@ function Get-DvLookAssistEvidence {
     $asked = (($legTypeRaw -is [string]) -and ($legTypeRaw -ceq 'look')) -or (($forceRaw -is [bool]) -and $forceRaw)
     $reported = $null
     $flavor = $null
+    $flavorReason = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
     if ($requested) {
         $found = $null
+        # r27 (sol r26 B1 on af784b7b): whether the answering record's DISCARDED text (Get-DvLogRecordDiscardedText) mentions look_assist_enabled
+        $foundEnabledDiscarded = $false
         # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r2 (Dot bd11a92): every flavor token of every visual_state record, so duplicate records that disagree can be told from one that is repeated
         $flavorsSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
-            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
-                if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') {
+            # r27: the raw lines, index for index with the bodies (Get-DvLogRecordBodies splits the same way and keeps every line), for the discarded text
+            $rawLines = $LogText -split "`r?`n"
+            $bodies = Get-DvLogRecordBodies -LogText $LogText
+            for ($li = 0; $li -lt $bodies.Count; $li++) {
+                $line = $bodies[$li]
+                # r3 (r2 adversary pass 6 A3): the visual_state record only where it starts the record body (logInteractionEvent writes
+                # `interaction_trace event=<name> ...`), never an `event=gui_smoke.visual_state` text inside another record
+                # r13 (r12 adversary A1): culture-invariant ($script:DvCi), so a tr-TR `INTERACTION_TRACE event=gui_smoke.visual_state look_assist_enabled=0`
+                # record answers (and refuses the leg) as it does in every other culture, never skipped
+                if ([regex]::IsMatch($line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_state(\s|$)'), $script:DvCi)) {
                     $found = $line
-                    foreach ($ft in [regex]::Matches($line, '(^|\s)look_assist_flavor=(?<f>\S*)')) { [void]$flavorsSeen.Add($ft.Groups['f'].Value) }
+                    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r25 (r25 adversary A1 on 217e0726, its input: `look_assist_flavor=cinematic
+                    # diagnostic=' look_assist_flavor=classic`): a flavor key with a MASKED `=` (ConvertTo-DvQuoteMaskedBody) is UNREADABLE, never absent: it
+                    # is a flavor token of its own (the mask character, never an applied flavor), so the record names more than one flavor and none is proven.
+                    # r25 pass 2 A1 (a37b59c9, its input: `... diagnostic=' LOOK_ASSIST_FLAVOR=classic`): the key is counted in ANY case ($script:DvCi), plain
+                    # or masked, so a differently cased flavor key is a token too (counting only ever adds tokens: it never proves a flavor, see $exactFlavor below)
+                    # r26 adversary A1 + A2 on 2f131c49 (inputs: `... diagnostic=' <U+212A>look_assist_flavor=classic` and `... ,look_assist_flavor=classic`):
+                    # a key counts wherever it is bounded by a NON-name character ($script:DvLookKeyStart: ASCII, case-sensitive even under $script:DvCi, so the
+                    # Kelvin sign is no name character and a comma, quote or any other punctuation starts a key), never only after whitespace
+                    # r26 adversary pass 2 A1 on eed44c40 (inputs: `look_assist_flavor =classic`, a bare `look_assist_flavor`, `LOOK_ASSIST_FLAVOR:classic`,
+                    # `diagnostic='look_assist_flavor classic end'`): EVERY bounded mention of the key is a token (Get-DvLookKeyTokens); one not followed by
+                    # a plain `=` is UNREADABLE (the mask token), never absent
+                    $lineFlavorTokens = @(Get-DvLookKeyTokens -Body $line -Key 'look_assist_flavor')
+                    foreach ($ft in $lineFlavorTokens) { [void]$flavorsSeen.Add($ft) }
+                    # r26 (sol r25 B1 on 620182b3, its input: an earlier `... diagnostic="harmless (text)" x (look_assist_flavor=classic` record, cut to
+                    # LOCATION_UNREADABLE, then an intact cinematic record): a visual_state record that LOST ITS TAIL may have named any flavor there, so it
+                    # adds an UNREADABLE flavor token ($script:DvLocationUnreadable holds spaces, so no `\S*` token ever equals it) and no flavor is proven,
+                    # exactly as an intact conflicting record. Lost means (a) the LOCATION_UNREADABLE sentinel ends it, or (b) it carries no look_assist_flavor
+                    # key at all (plain or masked, any case): the app writes that key LAST (MainWindow.cpp gui_smoke.visual_state, %48), so a record without
+                    # it was cut short -- opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1: the UNQUOTED reject reason `transform (upside down) enabled`
+                    # (GpuPreviewProcessing.cpp) opens a ` (` that Get-DvLocationOpenIndex takes for the location, and with a readable `:<line>)` tail the
+                    # flavor vanished with no sentinel at all. An app build that writes no flavor key proves no flavor either way (exactFlavor below).
+                    if ($line.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) -or $lineFlavorTokens.Count -eq 0) { [void]$flavorsSeen.Add($script:DvLocationUnreadable) }
+                    # r27 (sol r26 B1 on af784b7b, its input: `look_assist_flavor=cinematic gpu_preview_processing_reject_reason=transform (upside down)
+                    # enabled look_assist_flavor=classic (C:/b/MainWindow.cpp:10011)`): the cut at the unquoted ` (` kept the earlier cinematic token, the
+                    # READABLE `:<line>)` ending left no sentinel, and the conflicting classic was discarded, so cinematic was proven. INV-1: ANY bounded
+                    # mention of the key in the text the cut discarded (Get-DvLogRecordDiscardedText, the location included) may be a discarded value, so it
+                    # adds the UNREADABLE token and no flavor is proven, in this record or any other. The same for look_assist_enabled in the answering record.
+                    $discarded = Get-DvLogRecordDiscardedText -Line $rawLines[$li]
+                    $foundEnabledDiscarded = $false
+                    if ($discarded.Length -gt 0) {
+                        if (@(Get-DvLookKeyTokens -Body $discarded -Key 'look_assist_flavor').Count -gt 0) { [void]$flavorsSeen.Add($script:DvLocationUnreadable) }
+                        $foundEnabledDiscarded = (@(Get-DvLookKeyTokens -Body $discarded -Key 'look_assist_enabled').Count -gt 0)
+                    }
                 }
             }
         }
         $verdict = 'NOT_HONOURED'
         if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
+        # r24 (r24 adversary pass 2 A1 sibling): a visual_state record that lost its tail to the LOCATION_UNREADABLE sentinel may have said
+        # look_assist_enabled=0 there, so it is unreadable whole, never read from the fields before the cut
+        elseif ($found.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $reason = "the app's last gui_smoke.visual_state line lost its tail to an unreadable location, so whether Look Assist was on is unreadable" }
+        # r27 (sol r26 B1 sibling): the answering record's discarded text names look_assist_enabled, which may have said 0 there: unreadable whole, as r24
+        elseif ($foundEnabledDiscarded) { $reason = "the app's last gui_smoke.visual_state line names look_assist_enabled in the text cut at its location (an unquoted ' (' before a readable location ending), so whether Look Assist was on is unreadable" }
         else {
             $m = [regex]::Match($found, '(^|\s)look_assist_enabled=(?<v>\S+)')
             if (-not $m.Success) { $reason = 'the app''s gui_smoke.visual_state line carries no look_assist_enabled' }
@@ -2084,15 +2541,35 @@ function Get-DvLookAssistEvidence {
                 # "the first" or "the last"); (3) it must be one the app can apply (adversary pass 3 A2: the app prints `none` when it applied no flavor, and `unknown` is a placeholder).
                 # pass 4 A1: an EMPTY token (`look_assist_flavor=`) is a token too (`\S*`), so a duplicate that names nothing makes the record ambiguous instead of being skipped.
                 # pass 4 A2: two contradictory look_assist_enabled tokens in the answering record are no unambiguous `on` -- no flavor is proven from that record.
-                $lastFlavors = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value } | Select-Object -Unique)
-                $enabledValues = @([regex]::Matches($found, '(^|\s)look_assist_enabled=(?<v>\S*)') | ForEach-Object { $_.Groups['v'].Value } | Select-Object -Unique)
-                if ($flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and ($script:DvAppliedLookFlavors -ccontains $lastFlavors[0])) { $flavor = $lastFlavors[0] }
-                if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
+                # r25 (r25 adversary A1 on 217e0726): a flavor or enabled key with a MASKED `=` in the answering record is a token of its own (UNREADABLE,
+                # never absent), so it makes the record name two values and no flavor is proven from it, as a second plain token does (pass 4 A1 / A2)
+                # r25 pass 2 A1 (a37b59c9): the ambiguity counts take the key in ANY case ($script:DvCi), plain or masked; the flavor itself is still proven
+                # only by the app's own lower-case `look_assist_flavor=` token ($exactFlavor), so a differently cased key adds a token and never supplies one
+                $maskToken = [string]$script:DvQuotedEqualsMask
+                $exactFlavor = @([regex]::Matches($found, '(^|\s)look_assist_flavor=(?<f>\S*)') | ForEach-Object { $_.Groups['f'].Value })
+                # r26 adversary A1 + A2 on 2f131c49: every ambiguity count takes a key bounded by any non-name character ($script:DvLookKeyStart), plain
+                # or masked; the proof ($exactFlavor) stays the app's own whitespace-bounded lower-case token, so a wider count only ever adds tokens
+                # r26 adversary pass 2 A1 on eed44c40: every bounded mention of either key, whatever follows it (Get-DvLookKeyTokens)
+                $flavorTokens = @(Get-DvLookKeyTokens -Body $found -Key 'look_assist_flavor')
+                $enabledTokens = @(Get-DvLookKeyTokens -Body $found -Key 'look_assist_enabled')
+                # r26 (sol r25 B2): distinct ORDINALLY (Select-Object -Unique compares linguistically, so `cinematic` and `cinematic<U+200B>` were one
+                # value), and the one value must be an ASCII-canonical applied flavor (Test-DvAppliedLookFlavor), never a -ccontains match
+                $lastFlavors = @([System.Collections.Generic.HashSet[string]]::new([string[]]@($flavorTokens), [StringComparer]::Ordinal))
+                $enabledValues = @([System.Collections.Generic.HashSet[string]]::new([string[]]@($enabledTokens), [StringComparer]::Ordinal))
+                if ($exactFlavor.Count -ge 1 -and $flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and (Test-DvAppliedLookFlavor $lastFlavors[0])) { $flavor = $lastFlavors[0] }
+                # r26 (opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1): an unproven flavor is TYPED, never a silent null
+                elseif ($flavorsSeen.Contains($script:DvLocationUnreadable)) { $flavorReason = 'FLAVOR_UNREADABLE: a gui_smoke.visual_state record lost its tail (an unreadable location, a cut before look_assist_flavor, which the app writes last, or a look_assist_flavor mention in the text cut at the location), so the applied flavor is unreadable' }
+                elseif ($flavorsSeen.Count -gt 1 -or $lastFlavors.Count -gt 1) { $flavorReason = 'FLAVOR_AMBIGUOUS: the gui_smoke.visual_state records name more than one look_assist_flavor token, so no applied flavor is proven' }
+                elseif ($exactFlavor.Count -eq 0) { $flavorReason = 'FLAVOR_ABSENT: the answering gui_smoke.visual_state record carries no lower-case look_assist_flavor= token' }
+                elseif ($enabledValues.Count -ne 1) { $flavorReason = 'FLAVOR_UNPROVEN: the answering gui_smoke.visual_state record names look_assist_enabled more than once' }
+                else { $flavorReason = 'FLAVOR_NOT_APPLIED: the look_assist_flavor token is not an ASCII-canonical flavor the app can apply (classic, cinematic, film, vision50d)' }
+                # r24 (r24 adversary pass 2 A2 sibling): ORDINAL, so look_assist_enabled=<U+0661> or 1<U+200B> is never on
+                if (-not [string]::Equals($reported, '1', [StringComparison]::Ordinal)) { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
                 else { $verdict = 'HONOURED' }
             }
         }
     }
-    [ordered]@{ requested = $requested; asked = $asked; reported = $reported; flavor = $flavor; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+    [ordered]@{ requested = $requested; asked = $asked; reported = $reported; flavor = $flavor; flavorReason = $flavorReason; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
@@ -2187,14 +2664,17 @@ function Get-DvSmokeSessionLineRead {
     $fields = @{}
     # keys compare case-insensitively, like the @{} table every caller indexes
     $duplicates = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $unreadableRecord = $false
     $found = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
-            $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            # r3 (r2 adversary pass 6 A3): the record only where it starts the record body
+            $pattern = $script:DvRecordStart + 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
             # r4 (r3 adversary A2 on #726): the marker is matched on each line's record body, so a later line whose build path holds
             # `playback_smoke.<Marker> session=<n>` is never selected
-            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match $pattern) { $found = $line } }
+            # r13 (r12 adversary A1 sibling): culture-invariant ($script:DvCi)
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ([regex]::IsMatch($line, $pattern, $script:DvCi)) { $found = $line } }
         }
     }
     if ($null -ne $found) {
@@ -2206,14 +2686,33 @@ function Get-DvSmokeSessionLineRead {
             if ($seen.ContainsKey($k)) { [void]$duplicates.Add($k) }
             else { $seen[$k] = $m.Groups['v'].Value }
         }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (r24 adversary A1 on c1b10b4f, its input: a start line whose
+        # env_playback_scope_interval_ms value is a lone `'`, so the mask hid the real env_omp_num_threads=1 after it and the inherited override read
+        # absent, HONOURED): a key written with a MASKED `=` (inside a quoted span, ConvertTo-DvQuoteMaskedBody) is UNREADABLE, never absent. It joins
+        # the duplicates, which every consumer already refuses (Get-DvInheritedWorkerOverrides names it unreadable; Get-DvSmokeSessionLineFields leaves
+        # it out, fail closed). The key is bounded by any non-name character, so a quote-glued key counts too.
+        foreach ($m in [regex]::Matches($found, '(?<![A-Za-z0-9_])(?<k>[A-Za-z0-9_]+)\x1A')) { [void]$duplicates.Add($m.Groups['k'].Value) }
+        # r24 (r24 adversary pass 2 A1 sibling): a record that lost its tail to the LOCATION_UNREADABLE sentinel may have named any key there, so it is
+        # UNREADABLE whole: every key it shows is a duplicate (no field is read) and `unreadable` tells a reader that treats absence as clean
+        # (Get-DvInheritedWorkerOverrides) that every key it needs is unreadable too
+        if ($found.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $unreadableRecord = $true; foreach ($k in @($seen.Keys)) { [void]$duplicates.Add($k) } }
         foreach ($k in $seen.Keys) { if (-not $duplicates.Contains($k)) { $fields[$k] = $seen[$k] } }
     }
-    @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
+    @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object); unreadable = [bool]$unreadableRecord }
 }
 
 # r5 (sol r4 B1 on #726): what Get-DvLogRecordBody puts in place of a location it cannot read. It holds no `=` and no record marker, so no field or
 # marker is read from it, and a whole-line match (the prep_route record) fails on it: the record is unreadable, never absent and never forged.
 $script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r12 (r12 adversary B3 on 7e66a3af): ONE name character of a record name, key or identity word, ASCII and
+# matched case-sensitively even inside a (?i) pattern or a PowerShell -match. Under IgnoreCase .NET folds U+212A (Kelvin sign) and U+0130 into [A-Za-z],
+# so `<U+212A>session=4` hid the session mention; the inline (?-i:...) keeps every non-ASCII neighbour a non-name character.
+$script:DvNameChar = '(?-i:[A-Za-z0-9_])'
+# r12 (r12 adversary pass 13 A2 on bbfe69d1, its input: tr-TR culture and a first `PLAYBACK_SMOKE.MEASURED_SESSION id=3`): every case-insensitive
+# read of a record name, an identity word or a read key uses these options, never -match or (?i). Those take the CURRENT culture, where tr-TR folds
+# `I` to the dotless i (U+0131), so an upper-case marker or key was skipped (a later Play's marker chosen, DELIVERY_KIND= / DISABLED= ignored).
+# The same options as the PATH-refusal rule's $script:DvCultureFreeIgnoreCase (r9 B2 above), under a short name for these readers.
+$script:DvCi = $script:DvCultureFreeIgnoreCase
 
 # r10 (ADV-A1, Dot 6550442583; r8 adversary on 894ef15c): the ONE parenthesis the app writes inside a record body. PlaybackConformPolicy.h
 # playbackFpsStatusText appends ` (<clip> -> <rate>)` (each number QString::number(x, 'g', 5)) to the status text when a clip is conformed, and the
@@ -2241,6 +2740,52 @@ function Test-DvConformStatusGroupAt {
     $script:DvConformStatusMeasured.IsMatch($before.Substring($k + $script:DvConformStatusKey.Length))
 }
 
+function Get-DvLocationOpenIndex {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r21 (bench HFR-NATIVE-M16-1457-VENUE-EVIDENCE-MINI3-1 r3, receipt a4b1e24c-ce2a-4c8a-8633-4c0c43916f50:
+    every cuda s1 leg's `playback_smoke.gpu_dualiso_recon_scale_summary ... session_reason="preview scale 1 (full resolution)" ...` lost its tail to
+    LOCATION_UNREADABLE, so the due-wake reader refused it as DUE_WAKE_SESSION_BOUNDARY_UNREADABLE): the index of the ` (` that starts the Qt location,
+    or -1 when the line has none. By CLASS, a ` (` inside a double-quoted value is never a location: the app writes free text with spaces and
+    parentheses only as `<key>="<text>"` (MainWindow.cpp: session_reason, fallback_reason_last, gui_fps_status_text, screen, model, ...). A quoted value
+    opens at `="` whose key ([A-Za-z0-9_]+) starts the line or follows a space, and closes at the FIRST `"` after it, which must be followed by a space
+    or end the line; a `"` followed by anything else closes nothing, and then the opener is not a quoted value (its ` (` stays a location candidate, the
+    reading before r21). An opener with no closer is not a quoted value either. The r10 conform group (Test-DvConformStatusGroupAt) is still stepped over
+    once in its place. The scan is linear: each IndexOf result is reused until the scan passes it.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
+    $n = $Line.Length
+    $i = 0
+    $p = -2
+    $q = -2
+    $conformSkipped = $false
+    while ($i -lt $n) {
+        if ($p -ne -1 -and $p -lt $i) { $p = $Line.IndexOf(' (', $i, [StringComparison]::Ordinal) }
+        if ($p -lt 0) { return -1 }
+        if ($q -ne -1 -and $q -lt $i) { $q = $Line.IndexOf('="', $i, [StringComparison]::Ordinal) }
+        if ($q -ge 0 -and $q -lt $p) {
+            # is $q a value opener: a non-empty ASCII key that starts the line or follows a space
+            $k = $q - 1
+            while ($k -ge 0 -and (($Line[$k] -ge [char]'A' -and $Line[$k] -le [char]'Z') -or ($Line[$k] -ge [char]'a' -and $Line[$k] -le [char]'z') -or ($Line[$k] -ge [char]'0' -and $Line[$k] -le [char]'9') -or $Line[$k] -ceq [char]'_')) { $k-- }
+            if ($k -lt $q - 1 -and ($k -lt 0 -or $Line[$k] -ceq [char]' ')) {
+                $c = $Line.IndexOf('"', $q + 2, [StringComparison]::Ordinal)
+                # r21 adversary A1 on bdb3ec8c (its input: `playback_due_wake armed=1 note="diagnostic ( fired=1 ... delivery_kind=post end)"` was
+                # HONOURED): a span that holds an `=` is never stepped over here, so its ` (` stays the location candidate and the record is refused as
+                # before r21. r24 (opus key3 r23 blocker on b8f8e6e6): this rule alone does NOT keep quoted text from supplying a field (a later quoted
+                # `source_advanced=600` after an =-free quoted ` (` reached the summary reader); that guarantee is ConvertTo-DvQuoteMaskedBody's, which
+                # Get-DvLogRecordBodies applies to every record body before any reader sees it
+                if ($c -ge 0 -and ($c -eq $n - 1 -or $Line[$c + 1] -ceq [char]' ') -and $Line.IndexOf('=', $q + 2, $c - $q - 2, [StringComparison]::Ordinal) -lt 0) { $i = $c + 1; continue }
+            }
+            $i = $q + 2
+            continue
+        }
+        # r10 (ADV-A1, Dot 6550442583): the conform group the app writes INSIDE its own status field, stepped over once
+        if (-not $conformSkipped -and (Test-DvConformStatusGroupAt -Line $Line -Index $p)) { $conformSkipped = $true; $i = $p + 2; continue }
+        return $p
+    }
+    -1
+}
+
 function Get-DvLogRecordBody {
     <#
     .SYNOPSIS
@@ -2262,15 +2807,12 @@ function Get-DvLogRecordBody {
     path of at least one character gives the body; any other tail (no line number, text after the `)`, an empty path, a message that held a marker on the
     old writer) gives the body plus ' (LOCATION_UNREADABLE)', which refuses a whole-line match and supplies no field or marker. It may refuse; it never
     forges. The scan is linear: one IndexOf and one right-to-left walk over the digits, no regex (the r4 regex was super-linear on repeated ` (`).
+    r21 (bench MINI3-1 r3 FINDING): the app also writes ` (` inside its own double-quoted values (session_reason="preview scale 1 (full resolution)" on
+    playback_smoke.gpu_dualiso_recon_scale_summary), so the location starts at the first ` (` OUTSIDE a `<key>="<text>"` value (Get-DvLocationOpenIndex).
     #>
     param([AllowNull()][AllowEmptyString()][string]$Line)
     if ([string]::IsNullOrEmpty($Line)) { return $Line }
-    $open = $Line.IndexOf(' (', [StringComparison]::Ordinal)
-    # r10 (ADV-A1, Dot 6550442583): the first ` (` is the location's only when it is not the conform group the app writes INSIDE its own status field
-    # (see the r10 note above). That group is skipped once (one gui_fps_status_text per summary line); the next ` (` is the location.
-    if ($open -ge 0 -and (Test-DvConformStatusGroupAt -Line $Line -Index $open)) {
-        $open = $Line.IndexOf(' (', $open + 2, [StringComparison]::Ordinal)
-    }
+    $open = Get-DvLocationOpenIndex -Line $Line
     if ($open -lt 0) { return $Line }
     $body = $Line.Substring(0, $open)
     $end = $Line.Length - 1
@@ -2286,17 +2828,78 @@ function Get-DvLogRecordBody {
     $body + $script:DvLocationUnreadable
 }
 
+function Get-DvLogRecordDiscardedText {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r27 (sol r26 B1 on af784b7b; opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1): the RAW text
+    Get-DvLogRecordBody cuts from one run-log line (from the location open index to the end of the line, the Qt location included), or '' when it cuts
+    nothing. The cut stays at the FIRST ` (` outside a quoted value (r4/r5: a location path may hold ` (`, so a later ` (` is never trusted to be the
+    location, and path text never reaches a body). But the app writes one UNQUOTED value with ` (` (GpuPreviewProcessing.cpp: reject reason
+    `transform (upside down) enabled`), so with a readable `:<line>)` ending the cut can discard body fields with NO sentinel. A reader that proves a value
+    from one key checks this text for that key: a mention here may be a discarded conflicting value, so it proves nothing (INV-1). It never forges: it
+    only ever makes a reader refuse more.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Line)
+    if ([string]::IsNullOrEmpty($Line) -or $Line.IndexOf(' (', [StringComparison]::Ordinal) -lt 0) { return '' }
+    $open = Get-DvLocationOpenIndex -Line $Line
+    if ($open -lt 0) { return '' }
+    $Line.Substring($open)
+}
+
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker on b8f8e6e6, sol r23 blocker, r23 adversary A1): what an `=` inside a quoted
+# span of a record body becomes (ConvertTo-DvQuoteMaskedBody). U+001A is no name character, no whitespace, no quote and no `=`, and the app never writes it
+# (log_line_field::fieldValue maps every C0 control to '_'), so a masked `<key>=` is no `<key>=` for any reader, and a value stays one token.
+$script:DvQuotedEqualsMask = [char]0x1A
+$script:DvQuoteChars = [char[]]@([char]'"', [char]"'")
+
+function ConvertTo-DvQuoteMaskedBody {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 INV-1 blocker): one record body with every `=` inside a quoted span replaced by
+    $script:DvQuotedEqualsMask, so text inside a quote never supplies a `<key>=` field to any reader. A quoted span opens at ANY `"` or `'` of the body
+    (whatever precedes it: `k="v"`, `render "free text"`, `x'y`) and closes at the next quote of the SAME kind; the other kind inside it is plain text;
+    a span with no closer runs to the end of the body. Everything else is unchanged (the quotes themselves, the words inside a span, so a quoted
+    `session` or `settings_store` is still a MENTION for the readers that refuse a second mention). It may refuse; it never forges, and it never
+    HIDES a field: a lone apostrophe in an unquoted value (log_line_field::fieldValue maps no quote, so a launcher env value can hold one) masks every
+    later `=`, and a key with a masked `=` is UNREADABLE, never absent (r24 adversary A1 on c1b10b4f): Get-DvSmokeSessionLineRead counts it as a
+    duplicate and Get-DvSmokeSummaryFields refuses the whole summary record. Linear: IndexOf / IndexOfAny only, each position visited once.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Body)
+    if ([string]::IsNullOrEmpty($Body) -or $Body.IndexOf([char]'=') -lt 0) { return $Body }
+    $i = $Body.IndexOfAny($script:DvQuoteChars)
+    if ($i -lt 0) { return $Body }
+    $chars = $Body.ToCharArray()
+    # r24 (r24 adversary advisory A3 on c1b10b4f, its input: 4000 =-free quoted spans before one `=`): the next `=` is found once and reused until the
+    # scan passes it, so an =-free span never rescans the rest of the body (linear, as the synopsis says)
+    $j = -2
+    while ($i -ge 0) {
+        $close = $Body.IndexOf($Body[$i], $i + 1)
+        $end = $(if ($close -lt 0) { $Body.Length } else { $close })
+        if ($j -ne -1 -and $j -lt $i) { $j = $Body.IndexOf([char]'=', $i + 1) }
+        while ($j -ge 0 -and $j -lt $end) { $chars[$j] = $script:DvQuotedEqualsMask; $j = $Body.IndexOf([char]'=', $j + 1) }
+        if ($close -lt 0) { break }
+        $i = $Body.IndexOfAny($script:DvQuoteChars, $close + 1)
+    }
+    [string]::new($chars)
+}
+
 function Get-DvLogRecordBodies {
     <#
     .SYNOPSIS
     PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 on #726): every line of a run log as its record body (Get-DvLogRecordBody), in order, so a
     reader matches record markers on the body only and a build path that holds `playback_smoke.<marker> session=<n>` never adds or selects a record.
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker): and quote-masked (ConvertTo-DvQuoteMaskedBody), AFTER the location cut
+    (the cut reads the raw line; a quote in a location path never reaches the mask). This is the one place every DualVenueRunner field reader takes its
+    records from (Get-DvSmokeSummaryFields, Get-DvSmokeSessionLineRead, the due-wake, look-assist, prep-route, recon-release, team-partition, worker-threads
+    and look-label readers), so no `<key>=` inside a quoted span supplies a field on any path.
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
     $lines = $LogText -split "`r?`n"
     # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
+    # r24: only a body that holds a quote can hold a quoted span; the rest are returned as they are without a call
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOfAny($script:DvQuoteChars) -ge 0) { $lines[$i] = ConvertTo-DvQuoteMaskedBody -Body $lines[$i] } }
     , [string[]]$lines
 }
 
@@ -2635,7 +3238,7 @@ function Read-DvContactFrames {
 # -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
 $script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
-$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred')
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample', 'disableReconReleaseDeferred', 'dueWakeDeliveryPost')
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
@@ -4129,7 +4732,8 @@ function Test-DvReceiptValid {
                 elseif ($specLook) {
                     if ((Get-DvProp $ev.summary 'lookAssistForced') -ne $true) { $invalid.Add('LEG_TYPE_MISMATCH: a look leg''s hashed summary.json does not say lookAssistForced') }
                     $specFlavor = [string](Get-DvProp (Get-DvProp $spec 'look') 'lookFlavor'); if ([string]::IsNullOrWhiteSpace($specFlavor)) { $specFlavor = 'classic' }
-                    if ([string](Get-DvProp $ev.summary 'lookFlavor') -cne $specFlavor -or [string](Get-DvProp $subject 'lookFlavor') -cne $specFlavor) { $invalid.Add('LEG_TYPE_MISMATCH: the look flavor in the hashed summary.json / receipt subject is not the committed spec''s') }
+                    # r26 (sol r25 B2 sibling): ordinal and canonical (Test-DvLookFlavorSame), so a `cinematic<U+200B>` summary or subject is a mismatch
+                    if (-not (Test-DvLookFlavorSame $specFlavor ([string](Get-DvProp $ev.summary 'lookFlavor'))) -or -not (Test-DvLookFlavorSame $specFlavor ([string](Get-DvProp $subject 'lookFlavor')))) { $invalid.Add('LEG_TYPE_MISMATCH: the look flavor in the hashed summary.json / receipt subject is not the committed spec''s') }
                     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a run's lookReceiptSha256 is accepted only when the committed spec names a look receipt with that hash (both absent is the old leg).
                     if ([string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne [string](Get-DvProp (Get-DvProp $spec 'look') 'receiptSha256')) { $invalid.Add('LOOK_RECEIPT_MISMATCH: the hashed summary.json''s lookReceiptSha256 is not the committed spec''s look.receiptSha256') }
                 }
@@ -4185,7 +4789,8 @@ function Test-DvReceiptValid {
                 $claimRequestedRaw = Get-DvProp $ev.summary 'lookFlavor'; $claimReportedRaw = Get-DvProp $ev.summary 'lookFlavorReported'; $claimStoredRaw = Get-DvProp $Receipt 'lookAssistFlavor'
                 $claimRequested = [string]$claimRequestedRaw; $claimLogFlavor = [string]$claimVerdict.flavor
                 # strings only (adversary A2: a singleton array casts to its element); the flavor is the one the app's own record body names (adversary A1)
-                if (-not ($claimVerdict.asked -and $claimVerdict.verdict -ceq 'HONOURED' -and $claimForcedRaw -is [bool] -and $claimForcedRaw -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and $claimReportedRaw -ceq $claimRequested -and $claimLogFlavor -ceq $claimRequested -and $claimStoredRaw -ceq $claimLogFlavor)) {
+                # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2): ordinal and canonical (Test-DvLookFlavorSame), never the linguistic -ceq
+                if (-not ($claimVerdict.asked -and $claimVerdict.verdict -ceq 'HONOURED' -and $claimForcedRaw -is [bool] -and $claimForcedRaw -and $claimRequestedRaw -is [string] -and $claimReportedRaw -is [string] -and $claimStoredRaw -is [string] -and $claimRequested.Length -gt 0 -and (Test-DvLookFlavorSame $claimReportedRaw $claimRequested) -and (Test-DvLookFlavorSame $claimLogFlavor $claimRequested) -and (Test-DvLookFlavorSame $claimStoredRaw $claimLogFlavor))) {
                     $invalid.Add('LOOK_ASSIST_CLAIM_UNBACKED: the receipt says Look Assist ran (lookAssistOn) but the hashed run log / summary.json do not show it ran with the flavor lookAssistFlavor names')
                 }
             }
@@ -4233,6 +4838,20 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedReconRelease) { $invalid.Add('RECON_RELEASE_DEFERRED_NOT_FROM_EVIDENCE: the receipt carries a reconReleaseDeferred block but its committed leg spec names no disableReconReleaseDeferred') }
+            # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: a leg whose due-wake delivery is not the one its arm names (post when it asks, otherwise
+            # send when reported) is no measurement of its arm; the receipt's own dueWakeDelivery block is re-derived like the reconReleaseDeferred block.
+            $dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ev.logText
+            if ($dueWakeDeliveryVerdict.blocks) { $invalid.Add("DUE_WAKE_DELIVERY_NOT_HONOURED: $($dueWakeDeliveryVerdict.reason); a run whose due-wake delivery is not the one its leg names (post when it asks, otherwise send) is no measurement of that arm") }
+            $storedDueWakeDelivery = Get-DvProp $Receipt 'dueWakeDelivery'
+            if ($dueWakeDeliveryVerdict.requested) {
+                if ($null -eq $storedDueWakeDelivery) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no dueWakeDelivery block (requested / observed / verdict) and its committed spec names a dueWakeDeliveryPost') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedDueWakeDelivery $f) $dueWakeDeliveryVerdict[$f])) { $invalid.Add("DUE_WAKE_DELIVERY_NOT_FROM_EVIDENCE: dueWakeDelivery.$f is not what the hashed run log and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedDueWakeDelivery) { $invalid.Add('DUE_WAKE_DELIVERY_NOT_FROM_EVIDENCE: the receipt carries a dueWakeDelivery block but its committed leg spec names no dueWakeDeliveryPost') }
             # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: a leg that asks for the team partition the app did not report at exactly r+p (or whose report is unreadable, or
             # absent because the binary emits none), or a control leg whose app reports a partition, is no measurement of its arm; the receipt's own
             # teamPartition block is re-derived like the reconReleaseDeferred block.
@@ -5066,6 +5685,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

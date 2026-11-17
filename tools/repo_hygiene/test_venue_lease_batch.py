@@ -38,6 +38,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
+
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
 RUNNER = DV / "Invoke-VenueLeaseBatch.ps1"
@@ -3016,6 +3018,8 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (CI run 43580040634): and every neighbouring-folder module the dual-venue modules read (..\bachelor\AttrCudaArtifacts.psm1)
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")
         if agent_patches:
             agent_copy = tree / "bachelor" / AGENT.name
             agent_text = agent_copy.read_text(encoding="utf-8")
@@ -3983,6 +3987,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (CI run 43580040634): and every neighbouring-folder module the dual-venue modules read (..\bachelor\AttrCudaArtifacts.psm1)
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")
         runner = tree / "dual-venue" / RUNNER.name
         text = runner.read_text(encoding="utf-8")
         for o, n in ((old, new), *more):
@@ -6378,7 +6384,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_artifact_preflight_r8b_adv_a1_the_hash_worker_checks_the_minimum_again_after_the_existence_check(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
         start = text.index("# a read that fails ends the read (UNREACHABLE), never \"absent\"")
-        worker = text[start:text.index("Invoke-VenueBoundedRead -ScriptText $probe.ToString()", start)]
+        # r12/r16 (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): the bounded read is handed $probeText (the worker text, optionally behind the test delay), no longer $probe.ToString() itself
+        worker = text[start:text.index("$probeText = $(if ($TestArtifactDelayMs", start)]
         exists, opened = worker.index("Test-Path -LiteralPath $i.path"), worker.index("[IO.File]::Open($i.path")
         checks = [m.start() for m in re.finditer(r"-lt \$i\.minSec\) \{ 'NOTIME:'", worker)]
         self.assertEqual(len(checks), 3, "the minimum is checked before the existence check, again before the open, and again once the file is open (r10 adversary A1)")
@@ -8172,10 +8179,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # the manifest read again (1.87 -> 1), under its -ArtifactMinSec 2: a room of 2.8 or 2.99 s, a 100 ms manifest read and a 100 ms matching hash were refused SHARE_UNREACHABLE
     # with no hash (after the open, a lease closed and charged with no leg). Run on the runner's own functions (New-GuardBudget, Get-InputContentRefusal, lifted from its AST) with
     # offline probes; each manifest read and each hash appends a line.
-    def _guard_room_run(self, room: float, manifest_ms: int = 100, hash_ms: int = 100) -> dict:
+    def _guard_room_run(self, room: float, manifest_ms: int = 100, hash_ms: int = 100, utc_step: float = 0) -> dict:
         c = "3" * 40
-        reads, hashes = self.case / f"room-{room}-{manifest_ms}-reads.txt", self.case / f"room-{room}-{manifest_ms}-hashes.txt"
-        bounds = self.case / f"room-{room}-{manifest_ms}-bounds.txt"
+        reads, hashes = self.case / f"room-{room}-{manifest_ms}-{utc_step}-reads.txt", self.case / f"room-{room}-{manifest_ms}-{utc_step}-hashes.txt"
+        bounds = self.case / f"room-{room}-{manifest_ms}-{utc_step}-bounds.txt"
         facts = ("('a' * 64); 'C:" + c + "'; 'D:' + ('f' * 64); 'S:bool'; "
                  "'A:packageZip=ok'; 'H:packageZip=' + ('1' * 64); 'A:exe=ok'; 'H:exe=' + ('2' * 64); 'A:dll=ok'; 'H:dll=' + ('3' * 64)")
         script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
@@ -8202,8 +8209,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "$null = Get-InputContentRefusal\n"
                   f"foreach ($f in '{reads}', '{hashes}', '{bounds}') {{ if (Test-Path -LiteralPath $f) {{ Remove-Item -LiteralPath $f }} }}\n"
                   f"$script:guardBudget = New-GuardBudget {room} 'the test room' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'\n"
+                  # r22 (sol r21 blocker, adversary pass-23 A1): the wall clock stepped forward `utc_step` s after the measured pass's budget began (a NTP / VM-resume step); 0 = none
+                  f"& (Get-Module VenueChain) {{ $script:VenueTestUtcStepSec = {utc_step} }}\n"
                   "$hit = Get-InputContentRefusal\n"
-                  "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; why = [string]$hit.why; ms = [int]$script:guardBudget.clock.Elapsed.TotalMilliseconds }\n"
+                  "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; why = [string]$hit.why; noAnswer = [bool]$hit.noAnswer; ms = [int]$script:guardBudget.clock.Elapsed.TotalMilliseconds }\n"
                   "Complete-VenueProcess -ExitCode 0\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -8231,6 +8240,99 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         got = self._guard_room_run(1.9)
         self.assertEqual((got["code"], got["reads"], got["hashes"]), ("LEG_BUDGET_EXCEEDS_LEASE", 0, 0), got)
         self.assertIn("no time is left in the test room", got["why"])
+
+    # r22 (sol r21 blocker = producer adversary pass-23 A1, VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1): the guard's share was a REMAINING MONOTONIC budget turned into a UTC instant (Get-InputContentRefusal)
+    # and back into a duration by the module's own second UtcNow read, so a forward wall-clock step between the two reads (NTP, a VM resume) read as the share spent: the cap clamped to 0.001 s,
+    # the read refused without reading and the caller ended SHARE_UNREACHABLE with noAnswer = $false, skipping the no-claim retry, with about 29.8 monotonic seconds left of a 30 s guard.
+    # The budget now goes over as the caller's own Stopwatch and its end on it (-CallBudgetClock/-CallBudgetEndSec), so no wall-clock read sits between the two monotonic clocks.
+    # RED on a8e76648 (seam added, code unchanged): code SHARE_UNREACHABLE, noAnswer False, 0 reads, 0 hashes.
+    def test_r22_a1_a_60s_forward_wall_clock_step_never_exhausts_a_30s_guard_share(self) -> None:
+        got = self._guard_room_run(30, utc_step=60)
+        self.assertEqual((got["code"], got["reads"], got["hashes"]), ("", 1, 1), f"a 60 s UTC step read as the 30 s share spent: {got}")
+        self.assertFalse(got["noAnswer"], got)
+
+    def test_r22_a1_control_no_step_validates_the_same_build(self) -> None:
+        got = self._guard_room_run(30, utc_step=0)
+        self.assertEqual((got["code"], got["reads"], got["hashes"]), ("", 1, 1), got)
+
+    def test_r22_a1_control_a_backward_wall_clock_step_never_lengthens_the_share_past_the_budget(self) -> None:
+        # a backward step used to ADD its seconds to the cap (an instant 60 s earlier is 60 s more room); the budget's own end is what the call is held to now
+        got = self._guard_room_run(2.3, utc_step=-60)
+        self.assertEqual((got["code"], got["hashes"]), ("", 1), got)
+        self.assertLessEqual(got["bound"], 2.3, f"the hash was given more than the guard's whole room: {got}")
+
+    def test_r22_a1_control_a_spent_budget_stays_the_typed_refusal_and_the_nightlys_utc_deadline_still_feels_a_step(self) -> None:
+        # the real budget spent (the caller's clock is past its end): UNREACHABLE with no read, as before. And -CallDeadlineUtc (the nightly's, a UTC deadline end to end) is still
+        # stepped by the seam, so the seam is live and the lease batch's immunity above is the budget's own doing, not a dead seam.
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$probe = { param($p) ('a' * 64) }\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew(); [Threading.Thread]::Sleep(700)\n"
+                  f"$spent = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript $probe -CallBudgetClock $sw -CallBudgetEndSec 0.2\n"
+                  f"$room = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript $probe -CallBudgetClock $sw -CallBudgetEndSec ($sw.Elapsed.TotalSeconds + 30)\n"
+                  "& (Get-Module VenueChain) { $script:VenueTestUtcStepSec = 60 }\n"
+                  f"$nightly = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript $probe -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(30))\n"
+                  f"$stepped = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript $probe -CallBudgetClock $sw -CallBudgetEndSec ($sw.Elapsed.TotalSeconds + 30)\n"
+                  "ConvertTo-Json -Compress -InputObject @{ spent = $spent.state; spentError = [string]$spent.error; room = $room.state; nightly = $nightly.state; nightlyError = [string]$nightly.error; stepped = $stepped.state }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["spent"], "UNREACHABLE", got)
+        self.assertIn("no time is left of -CallCapSec", got["spentError"], got)
+        self.assertEqual(got["room"], "STAGED", got)
+        self.assertEqual(got["stepped"], "STAGED", f"a UTC step reached a call that holds a monotonic budget: {got}")
+        self.assertEqual(got["nightly"], "UNREACHABLE", f"the seam no longer steps -CallDeadlineUtc: {got}")
+        self.assertIn("no time is left of -CallCapSec", got["nightlyError"], got)
+
+    # r22 fix iteration 1 (adversary pass-24 A1 on e3e61e8e, VenueChain.psm1:659): the budget's remainder was taken on the CALLER's clock and held against the call's own clock, which had run
+    # since its start, so a stall after that start and before the sample was charged twice: a 3 s stall under a 4 s end left a cap of 1 s with 3 s already on the call's clock, and a healthy
+    # read was refused with 1 s truly left. RED on e3e61e8e (seam only): UNREACHABLE, no read, for both the budget and the UTC deadline. The stall INSIDE the bracket is taken again.
+    def _r22_stall_run(self, seam: str, budget_args: str) -> dict:
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"& (Get-Module VenueChain) {{ {seam} }}\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 30 -ProbeScript {{ param($p) ('a' * 64) }} {budget_args}\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; error = [string]$r.error; sec = $sw.Elapsed.TotalSeconds }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_r22_a1_fix1_a_stall_after_the_call_clock_starts_is_charged_once_to_the_budget(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestPostClockStartDelayMs = 3000", "-CallBudgetClock $sw -CallBudgetEndSec 6.0")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall under a 6 s budget end (3 s truly left) was charged twice: {got}")
+
+    def test_r22_a1_fix1_a_stall_after_the_call_clock_starts_is_charged_once_to_a_utc_deadline(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestPostClockStartDelayMs = 3000", "-CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(6))")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall under a 6 s deadline (3 s truly left) was charged twice: {got}")
+
+    def test_r22_a1_fix1_a_stall_between_the_two_samples_is_sampled_again_for_the_budget(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestDeadlineSampleDelayMs = 3000", "-CallBudgetClock $sw -CallBudgetEndSec 6.0")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall between the call clock read and the budget read (3 s truly left) refused the read: {got}")
+
+    def test_r22_a1_fix1_a_stall_between_the_two_samples_is_sampled_again_for_a_utc_deadline(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestDeadlineSampleDelayMs = 3000", "-CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(6))")
+        self.assertEqual(got["state"], "STAGED", f"a 3 s stall between the call clock read and the wall clock read (3 s truly left) refused the read: {got}")
+
+    def test_r22_a1_fix1_control_a_stall_that_really_spends_the_budget_stays_the_typed_refusal(self) -> None:
+        got = self._r22_stall_run("$script:VenueTestPostClockStartDelayMs = 3000", "-CallBudgetClock $sw -CallBudgetEndSec 2.0")
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertIn("no time is left of -CallCapSec", got["error"], got)
+
+    def test_r22_a1_control_a_caller_stall_before_the_call_never_moves_the_budgets_end_later(self) -> None:
+        # r12's property on the monotonic path: the end is fixed ON THE CALLER'S CLOCK, so a caller descheduled between its sample and the call (3 s here, under a 4 s end) leaves the
+        # call what is left (about 1 s), never the whole share counted again from the call's own later start: the stuck 3 s read is given up on at the end, not waited for.
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew(); $end = 4.0; [Threading.Thread]::Sleep(3000)\n"
+                  "$t = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{self.commit_a}' -TimeoutSec 20 -ProbeScript {{ param($p) [Threading.Thread]::Sleep(3000); ('a' * 64) }} -CallBudgetClock $sw -CallBudgetEndSec $end\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sec = $t.Elapsed.TotalSeconds }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertLess(got["sec"], 1.6, f"the call ran past the caller's budget end: {got}")
 
     # r10 B1 (sol r9 = Dot cc5b2a97): `[Math]::Min(330, <double>)` takes the Int32 overload (an integer first operand), so a guard room of 2.3 / 2.4 / 2.49 s became a 2 s share, the hash was
     # left under its 2 s minimum after a 100 ms manifest read and a healthy staged build was refused SHARE_UNREACHABLE with no hash (after the open, a lease closed and charged with no leg).
@@ -8297,7 +8399,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         got = json.loads(out.stdout.strip().splitlines()[-1])
         self.assertEqual(got["state"], "UNREACHABLE", got)
-        self.assertIn("to start hashing packageZip", got["error"])
+        # r12 (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1, adversary A1 on 7754d16e): the hash's end is fixed once and what is left of it is taken again right before the launch, so a
+        # bound under the minimum is refused there, before any worker starts (the per-file NOTIME check inside the worker stays, pinned by the r8b test above); no file is hashed either way
+        self.assertRegex(got["error"], r"no time is left before the hash's end \([\d.]+ s into the call\) to start it \([\d.]+ s left, under 2\)")
         # control: the same build with room for every file is STAGED and matches
         script = script.replace(" -ArtifactTimeoutSec 1 -ArtifactMinSec 2", "")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
@@ -8326,10 +8430,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # spelling of the same cap (330.0, [double]330, 330.00) is the contract
         text = RUNNER.read_text(encoding="utf-8")
         guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
-        m = re.search(r"\$share = \[Math\]::Min\((\[double\]\s*)?(\d+(?:\.\d+)?)\s*,\s*\$script:guardBudget\.sec\s*-\s*\$script:guardBudget\.clock\.Elapsed\.TotalSeconds\)", guard)
-        self.assertIsNotNone(m, "the guard's share is Min(<cap>, <budget> - <elapsed>)")
-        self.assertEqual(float(m.group(2)), 330.0, "the cap is the preflight's own 30 s + 300 s bounds")
-        self.assertTrue(m.group(1) or "." in m.group(2), "the cap is a double: an integer first operand takes the Int32 overload and rounds the room (2.3 s -> 2)")
+        # r26 (CI heavy 1/11, run 43883120765): since r22/r23 the budget's elapsed time is sampled ONCE, in the same guarded statement, into a variable the share and the share's end
+        # (`$shareEndSec = $shareAtSec + ...`) both read, so the two cannot disagree: `$share = Min(<cap>, <budget> - <that one sample>)`. The share is still not a second clock read.
+        m = re.search(r"if \(\$null -ne \$script:guardBudget\) \{\s*\$(?P<at>\w+) = \$script:guardBudget\.clock\.Elapsed\.TotalSeconds\s*;\s*"
+                      r"\$share = \[Math\]::Min\((?P<dbl>\[double\]\s*)?(?P<cap>\d+(?:\.\d+)?)\s*,\s*\$script:guardBudget\.sec\s*-\s*\$(?P=at)\)", guard)
+        self.assertIsNotNone(m, "the guard's share is Min(<cap>, <budget> - <one sample of the budget's elapsed seconds>), sampled in the same `if ($null -ne $script:guardBudget) { ... }` block")
+        self.assertEqual(float(m.group("cap")), 330.0, "the cap is the preflight's own 30 s + 300 s bounds")
+        self.assertTrue(m.group("dbl") or "." in m.group("cap"), "the cap is a double: an integer first operand takes the Int32 overload and rounds the room (2.3 s -> 2)")
+        # the one sample: assigned exactly once in the guard, from the budget's own Stopwatch, and the share's end reads that same variable (no second clock read for either)
+        at = m.group("at")
+        self.assertEqual(len(re.findall(r"\$" + at + r" = \$script:guardBudget\.clock\.Elapsed\.TotalSeconds", guard)), 1, "the elapsed sample is assigned once")
+        self.assertRegex(guard, r"\$shareEndSec = \$" + at + r" \+ \[Math\]::Max\(0\.0, \$share\)", "the share's end is the same sample plus the share")
         self.assertIn("-TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", text, "the preflight's bounds the cap is the sum of")
 
     def test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand(self) -> None:

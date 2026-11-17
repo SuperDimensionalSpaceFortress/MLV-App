@@ -151,24 +151,25 @@ if (-not $stageParent) {
 $classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path) | ConvertFrom-Json
 $cinematic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CinematicReceipt).Path) | ConvertFrom-Json
 
-if ([string]$classic.subject.lookFlavor -cne 'classic' -or [string]$cinematic.subject.lookFlavor -cne 'cinematic') {
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): receipt flavors compare ordinally and canonically (Test-DvLookFlavorSame), never the linguistic -cne
+if (-not (Test-DvLookFlavorSame 'classic' ([string]$classic.subject.lookFlavor)) -or -not (Test-DvLookFlavorSame 'cinematic' ([string]$cinematic.subject.lookFlavor))) {
     throw "PAIR_FLAVORS_WRONG the first receipt must be the classic flavor and the second the cinematic flavor (got '$($classic.subject.lookFlavor)' and '$($cinematic.subject.lookFlavor)')"
 }
 foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
     if ([string]$classic.subject.$f -cne [string]$cinematic.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the receipts differ in subject.$f" }
 }
 if ([string]$classic.subject.backend -cne 'cpu') { throw "PAIR_BACKEND_NOT_CPU the flavor pair is a cpu benchmark; the receipts are backend '$($classic.subject.backend)'" }
-if ([string]$classic.metrics.sourceCommit -cne [string]$cinematic.metrics.sourceCommit) { throw 'PAIR_SUBJECT_DIFFERS the receipts differ in metrics.sourceCommit' }
+if (-not [string]::Equals([string]$classic.metrics.sourceCommit, [string]$cinematic.metrics.sourceCommit, [StringComparison]::Ordinal)) { throw 'PAIR_SUBJECT_DIFFERS the receipts differ in metrics.sourceCommit' }
 if ([string]$classic.venue.name -cne [string]$cinematic.venue.name -or [string]$classic.card -cne [string]$cinematic.card) { throw 'PAIR_VENUE_OR_CARD_DIFFERS the receipts are not the same venue/card' }
 if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the receipts rendered at different effective scales ($(Get-DvScaleLabel -Factor $classic.scale.effectiveScale) vs $(Get-DvScaleLabel -Factor $cinematic.scale.effectiveScale))" }
 $film = $null
 if ($trio) {
     $film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path) | ConvertFrom-Json
-    if ([string]$film.subject.lookFlavor -cne $ThirdFlavor) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
+    if (-not (Test-DvLookFlavorSame ([string]$ThirdFlavor) ([string]$film.subject.lookFlavor))) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
     foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
         if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }
     }
-    if ([string]$classic.metrics.sourceCommit -cne [string]$film.metrics.sourceCommit) { throw 'PAIR_SUBJECT_DIFFERS the film receipt differs in metrics.sourceCommit' }
+    if (-not [string]::Equals([string]$classic.metrics.sourceCommit, [string]$film.metrics.sourceCommit, [StringComparison]::Ordinal)) { throw 'PAIR_SUBJECT_DIFFERS the film receipt differs in metrics.sourceCommit' }
     if ([string]$classic.venue.name -cne [string]$film.venue.name -or [string]$classic.card -cne [string]$film.card) { throw 'PAIR_VENUE_OR_CARD_DIFFERS the film receipt is not the same venue/card' }
     if ([string]$classic.scale.effectiveScale -cne [string]$film.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the film receipt rendered at a different effective scale ($(Get-DvScaleLabel -Factor $classic.scale.effectiveScale) vs $(Get-DvScaleLabel -Factor $film.scale.effectiveScale))" }
 }

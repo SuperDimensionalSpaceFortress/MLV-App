@@ -303,7 +303,11 @@ TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
         source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
     ASSERT_FALSE(helper.isEmpty());
     ASSERT_EQ(1, helper.count(QStringLiteral("QThread::msleep( ms );")));
-    ASSERT_TRUE(helper.contains(QStringLiteral("m_guiPresentGapRunnerSleepNs +=")));
+    // r17 (r16 adversary A1): the gap's runner sleep is charged per slept segment, in the segment charger
+    ASSERT_TRUE(helper.contains(QStringLiteral("chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );")));
+    const QString segment = bracedBlockAfter(
+        source, QStringLiteral("void MainWindow::chargeSmokeRunnerSleepSegment( double startS, double endS )"));
+    ASSERT_TRUE(segment.contains(QStringLiteral("m_guiPresentGapRunnerSleepNs +=")));
 
     const QString close = closeGapBody();
     ASSERT_FALSE(close.isEmpty());
@@ -1328,9 +1332,24 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     const QString source = mainWindowSource();
     // Runner sleep: [start, end] on the stage clock, only while a session is active.
     const QString sleep = bracedBlockAfter(source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
-    ASSERT_TRUE(sleep.contains(QStringLiteral("const double hopSleepStartS = m_playbackSmokeActive ? mlv_stage_timing_now() : 0.0;")));
-    ASSERT_TRUE(sleep.contains(QStringLiteral("m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, hopSleepStartS, mlv_stage_timing_now() );")));
-    ASSERT_TRUE(sleep.indexOf(QStringLiteral("m_guiHopWait.push(")) > sleep.indexOf(QStringLiteral("QThread::msleep( ms );")));
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r13 (the merge with #811's due-wake sleep): one RunnerSleep interval
+    // per slept segment, none for a dispatch inside the sleep (r13 adversary A1 on 04c1337b), on the stage clock (r15, r14
+    // adversary A1 on a27f3d88). r17 (r16 adversary A1 on 522f72c6): each segment is pushed the moment it ends -- by the sent
+    // wait's sink BEFORE the dispatch that ends it, so a prep result presented in that dispatch splits its hop wait with the
+    // segment already recorded -- and the msleep's one segment right after it. Nothing is pushed after the sleep returns.
+    ASSERT_TRUE(sleep.contains(QStringLiteral(
+        "m_playbackDueWake->sleepForSmokeRunner( ms, []() { return mlv_stage_timing_now(); }, &MainWindow::chargeSmokeRunnerSleepSegmentSink, this )")));
+    ASSERT_EQ(0, sleep.count(QStringLiteral("m_guiHopWait.push(")));
+    ASSERT_EQ(0, sleep.count(QStringLiteral("lastRunnerSleepDispatchSpansS()")));
+    ASSERT_EQ(0, sleep.count(QStringLiteral("hopDueWakeSleepStartS")));
+    ASSERT_TRUE(sleep.indexOf(QStringLiteral("chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );"))
+                > sleep.indexOf(QStringLiteral("QThread::msleep( ms );")));
+    ASSERT_TRUE(sleep.indexOf(QStringLiteral("chargeSmokeRunnerSleepSegment( sleepStartS, mlv_stage_timing_now() );"))
+                < sleep.indexOf(QStringLiteral("m_playbackDueWake->dispatchSentMessages();")));
+    const QString segment = bracedBlockAfter(source, QStringLiteral("void MainWindow::chargeSmokeRunnerSleepSegment( double startS, double endS )"));
+    ASSERT_EQ(1, segment.count(QStringLiteral("m_guiHopWait.push(")));
+    ASSERT_TRUE(segment.contains(QStringLiteral(
+        "if( m_playbackSmokeActive ) m_guiHopWait.push( gui_hop_wait::Kind::RunnerSleep, startS, endS );")));
 
     // Prepared present: the result's wait split at entry (the avg_playback_prep_result_queue_ms stamp), then the
     // present's own [entry, exit] interval, from one entry stamp.
@@ -1378,7 +1397,13 @@ TEST(CriticalHopSummaryWiring, HooksFeedTheSplitOnlyInsideASmokeSession)
     const QString endAnchor = QStringLiteral("    m_playbackSmokeActive = false;\n    m_playbackPresentTrace.end();\n");
     const int inactive = finish.indexOf(endAnchor);
     ASSERT_TRUE(inactive >= 0);
-    ASSERT_EQ(inactive + static_cast<int>(endAnchor.size()) + 4,
+    // HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r14 (hosted CI on 116db0cb): the merge with #824 keeps #811's due-wake trace end
+    // between the flag drop and the listener reset; nothing else sits between them.
+    const QString dueWakeEnd = QStringLiteral(
+        "    // FULLSCREEN-S1S2-PRESENT-GAP-1 (r2: after the present trace's end, which PlaybackPresentTraceWiring pins next to the flag)\n"
+        "    if( m_playbackDueWake ) m_playbackDueWake->setGuiTraceActive( false );\n");
+    ASSERT_EQ(inactive + static_cast<int>(endAnchor.size()), finish.indexOf(dueWakeEnd));
+    ASSERT_EQ(inactive + static_cast<int>(endAnchor.size()) + static_cast<int>(dueWakeEnd.size()) + 4,
               finish.indexOf(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));
     ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("MainWindow::~MainWindow()"))
                     .contains(QStringLiteral("preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();")));

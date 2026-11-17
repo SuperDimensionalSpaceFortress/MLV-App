@@ -76,8 +76,10 @@ struct GpuPresentTailWindow
         ++idleWaits;
         blockStartNs = -1;
     }
-    // The smoke runner slept on this thread for sleptNs. No present runs during the sleep (same thread), so a window
-    // open now was open for the whole sleep.
+    // The smoke runner slept on this thread for sleptNs: ONE slept segment of a runner sleep, reported the moment it ended.
+    // r17 (r16 adversary A1 on 522f72c6): a sent message dispatched inside the sleep can present (closing this window and
+    // opening the next), so the caller reports each segment before that dispatch runs (PlaybackRunnerSleepSegments); no
+    // present runs inside a segment, so a window open when it is reported was open for the whole segment.
     void runnerSlept( qint64 sleptNs )
     {
         if( !isOpen() ) return;
