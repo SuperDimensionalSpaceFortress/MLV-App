@@ -1991,7 +1991,9 @@ $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
 # whole 3600 s) is ended after the leg's own no-progress window, not after the caller's whole process budget. The window is the runner's derived
 # leg budget (play safety net + settle + screenshot allowances) + 60 s, so it does not widen with a caller's -ProcessTimeoutMs (an owner-clip leg
 # adds the input re-read there). The watch arms at the app's first log line; before that only the whole budget bounds the wait.
-$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $NoProgressTimeoutMs -CeilingMs $effectiveProcessTimeoutMs
+# r4 (adversary b0a33ba9 A5): an explicit -NoProgressTimeoutMs below 1000 ms is clamped up to 1000 ms (0 stays "derived from the leg")
+$noProgressOverrideMs = if ($NoProgressTimeoutMs -gt 0) { [Math]::Max(1000, $NoProgressTimeoutMs) } else { 0 }
+$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $effectiveProcessTimeoutMs
 $noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noProgressWindowMs
 # r3 (adversary 797947a7 A2): no chunked wait may outlast a fraction of the window, or a short window would permit one chunk (up to 60 s) of silence.
 $noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs
@@ -2524,9 +2526,12 @@ $colorArtifactScanPassed =
 $validationFailures = @()
 $validationFailures += $captureBindingFailures
 if ($processBoundary.timedOut) {
-    $validationFailures += "MLVApp exceeded its fail-closed process timeout and was terminated."
-    if ($processBoundary.noProgress) {
+    # r4 (adversary b0a33ba9 A4): the typed outcome decides, so an early no-progress stop does not also print the whole-timeout message
+    if ($processBoundary.outcome -eq 'process_no_progress') {
         $validationFailures += "MLVApp's log made no progress for $noProgressWindowMs ms (process_no_progress); the leg was ended before the whole $($processBoundary.timeoutMs) ms budget."
+    }
+    else {
+        $validationFailures += "MLVApp exceeded its fail-closed process timeout and was terminated."
     }
 }
 if ($processExitCode -ne 0) {

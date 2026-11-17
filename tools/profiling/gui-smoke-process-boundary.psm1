@@ -147,7 +147,11 @@ function Test-GuiSmokeLogProgressStalled {
         [int]$BudgetRemainingMs = 3600000
     )
 
-    if ($null -eq $Watch.Pending) {
+    # r4 (adversary b0a33ba9 A2): the budget is an ABSOLUTE endpoint, the entry stopwatch plus -BudgetRemainingMs, so a scheduling delay between
+    # here and the wait can never grant a wait past the deadline.
+    $entry = [System.Diagnostics.Stopwatch]::StartNew()
+    # no budget left: no probe is started (a pending one is only looked at, 0 ms)
+    if ($null -eq $Watch.Pending -and $BudgetRemainingMs -gt 0) {
         $shell = [System.Management.Automation.PowerShell]::Create()
         $shell.Runspace = $Watch.Runspace
         [void]$shell.AddScript($Watch.ProbeScript).AddArgument($Watch.LogRoot)
@@ -155,18 +159,24 @@ function Test-GuiSmokeLogProgressStalled {
         $Watch.Handle = $shell.BeginInvoke()
         $Watch.Hung = $false
     }
-    # a probe that already outran its wait is only looked at (0 ms), never waited on again
-    $waitMs = if ($Watch.Hung) { 0 } else { [Math]::Min([int]$Watch.ProbeWaitMs, $BudgetRemainingMs) }
     $entries = $null
-    if ($Watch.Handle.AsyncWaitHandle.WaitOne($waitMs)) {
-        try { $entries = @($Watch.Pending.EndInvoke($Watch.Handle)) } catch { $entries = @() }
-        try { $Watch.Pending.Dispose() } catch { }
-        $Watch.Pending = $null
-        $Watch.Handle = $null
-        $Watch.Hung = $false
-    }
-    else {
-        $Watch.Hung = $true
+    if ($null -ne $Watch.Pending) {
+        # re-derived from the absolute end just before the wait; a probe that already outran its wait is only looked at (0 ms), never waited on again
+        $leftMs = [int][Math]::Max([int64]0, [int64]$BudgetRemainingMs - [int64]$entry.ElapsedMilliseconds)
+        $waitMs = if ($Watch.Hung) { 0 } else { [Math]::Min([int]$Watch.ProbeWaitMs, $leftMs) }
+        if ($Watch.Handle.AsyncWaitHandle.WaitOne($waitMs)) {
+            $landed = $null
+            try { $landed = @($Watch.Pending.EndInvoke($Watch.Handle)) } catch { $landed = @() }
+            try { $Watch.Pending.Dispose() } catch { }
+            $Watch.Pending = $null
+            $Watch.Handle = $null
+            $Watch.Hung = $false
+            # a result that lands once the budget is spent is ignored: the caller's loop is ending on the whole budget, not on this log
+            if ([int64]$entry.ElapsedMilliseconds -lt [int64]$BudgetRemainingMs) { $entries = $landed }
+        }
+        else {
+            $Watch.Hung = $true
+        }
     }
     if ($null -ne $entries -and $entries.Count -gt 0) {
         $progress = $false
@@ -178,15 +188,20 @@ function Test-GuiSmokeLogProgressStalled {
             $parsed = [int64]0
             $length = if ([int64]::TryParse($text.Substring($cut + 1), [ref]$parsed)) { $parsed } else { [int64]-1 }
             if (-not $Watch.Files.ContainsKey($name)) {
-                # the first sighting of a log (readable or not) arms the watch and is itself a sign of life
-                $Watch.Files[$name] = [Math]::Max([int64]0, $length)
-                $progress = $true
+                # the first sighting of a log arms the watch (below). r4 (adversary b0a33ba9 A1): a log unreadable at that first look is UNKNOWN
+                # (-1), never length 0; a log readable at first sight is a sign of life.
+                $Watch.Files[$name] = [Math]::Max([int64]-1, $length)
+                if ($length -ge 0) { $progress = $true }
+            }
+            elseif ([int64]$Watch.Files[$name] -lt 0) {
+                # unknown until the first readable length, which becomes the baseline and is NOT growth
+                if ($length -ge 0) { $Watch.Files[$name] = $length }
             }
             elseif ($length -gt [int64]$Watch.Files[$name]) {
                 $Watch.Files[$name] = $length
                 $progress = $true
             }
-            # unreadable (-1), shorter, or an already-seen length: not progress, and the high-water mark is never lowered
+            # unreadable (-1), shorter, or an already-seen length: not progress, and a known high-water mark is never lowered
         }
         if (-not $Watch.Armed) {
             $Watch.Armed = $true

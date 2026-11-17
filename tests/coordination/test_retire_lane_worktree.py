@@ -4413,6 +4413,15 @@ UNRESOLVED_EXECUTED_SITES = {
          "is test-only, runs under pytest tmp dirs and never runs against a lane worktree "
          "(test_launcher_census_stub_executed_string_interpolates_only_its_own_values)"),
     ],
+    "tools/profiling/gui-smoke-process-boundary.psm1": [
+        ("[void]$shell.AddScript($Watch.ProbeScript)",
+         "VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4 (a runspace script, not an executable launch): $Watch.ProbeScript defaults to "
+         "$script:GuiSmokeLogLengthProbe, the single-quoted here-string literal in this same module (its only writer), which lists "
+         "mlvapp-*.log under the run's log directory and opens each read-only to report its length; it runs in a private in-process runspace "
+         "(Test-GuiSmokeLogProgressStalled) so a stalled share cannot hold the caller. A caller-supplied -ProbeScript exists for the tests "
+         "only; run-release-gui-smoke.ps1 never passes one "
+         "(test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_only_reads_the_log_directory)"),
+    ],
     "tools/profiling/bachelor/AttrCudaArtifacts.psm1": [
         ("[void]$shell.AddScript($loopScript)",
          "r5 rule V2: $loopScript is the { } literal at :6242 in the same function (Start-AttrCudaDisplayWakeKeepAlive), its only writer, "
@@ -4667,6 +4676,26 @@ def test_launcher_census_stub_executed_string_interpolates_only_its_own_values()
     assert "$ticket = 'stub-{0}' -f $PID" in t
     for launch in ("Start-Process", "-EncodedCommand", "-File", "Invoke-Expression", "cmd "):
         assert launch not in command, launch
+
+
+def test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_only_reads_the_log_directory():
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4 (adversary b0a33ba9 A3): the watchdog's one .AddScript runs a module-private literal in an
+    in-process runspace; it lists and opens mlvapp-*.log files read-only and launches nothing; the runner never supplies the script."""
+    path = "tools/profiling/gui-smoke-process-boundary.psm1"
+    t = (REPO / path).read_text(encoding="utf-8")
+    [(pin, why)] = UNRESOLVED_EXECUTED_SITES[path]
+    assert pin == "[void]$shell.AddScript($Watch.ProbeScript)" and "$script:GuiSmokeLogLengthProbe" in why
+    assert t.count(".AddScript(") == 1, "the module gained another executed string: classify it"
+    assert t.count("$script:GuiSmokeLogLengthProbe = @'") == 1, "the probe literal has one writer"
+    assert "[string]$ProbeScript = $script:GuiSmokeLogLengthProbe" in t, "the default script is the module-private literal"
+    probe = t.split("$script:GuiSmokeLogLengthProbe = @'", 1)[1].split("\n'@", 1)[0]
+    # (-File is not listed: Get-ChildItem's own -File switch is in the probe; a pwsh -File launch needs pwsh, which is)
+    for launch in ("Start-Process", "-EncodedCommand", "-Command", "Invoke-Expression", "iex", "Create(", "AddScript", "cmd", "pwsh",
+                   "Invoke-Command", "&", "Out-File", "Set-Content", "Remove-Item"):
+        assert launch not in probe, f"the log probe now carries {launch!r}: it must only list and read"
+    assert "Get-ChildItem -LiteralPath $LogRoot" in probe and "[System.IO.FileAccess]::Read" in probe
+    runner = (REPO / "tools/profiling/run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+    assert "-ProbeScript" not in runner, "the runner must not hand the watchdog a script of its own"
 
 
 # --- LANE-RETIRE-LAUNCH-SITE-CENSUS-1 / LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census classifies launch SITES, not files.

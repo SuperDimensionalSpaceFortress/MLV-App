@@ -106,7 +106,8 @@ class NoProgressWindowComesFromTheLegBudget(unittest.TestCase):
         start = source.index("$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs")
         call = source[start:source.index("\n", start)]
         self.assertIn("-LegBudgetMs $derivedProcessTimeoutMs", call)
-        self.assertIn("-OverrideMs $NoProgressTimeoutMs", call)
+        # r4 (adversary b0a33ba9 A5): the override is the runner's >= 1000 ms clamp of -NoProgressTimeoutMs ($noProgressOverrideMs)
+        self.assertIn("-OverrideMs $noProgressOverrideMs", call)
         self.assertIn("-CeilingMs $effectiveProcessTimeoutMs", call)
         # derived from the leg (playback window + settle + margin), so a caller's 3600 s job timeout cannot widen it
         self.assertNotIn("3600", call)
@@ -292,6 +293,89 @@ Stop-GuiSmokeLogProgressWatch -Watch $w; Stop-GuiSmokeLogProgressWatch -Watch $w
         self.assertGreaterEqual(calls, 2)
         self.assertEqual(calls, source.count("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs"),
                          "every runner call hands the remaining process budget to the probe wait")
+
+    # adversary b0a33ba9 A1 (r4): a log unreadable at its first sighting is UNKNOWN, not length 0; becoming readable at an unchanged length is
+    # not growth, and only growth beyond the first KNOWN length restarts the quiet clock.
+    def test_a_log_unreadable_at_first_sight_then_readable_unchanged_is_not_progress(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'unknownfirst'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value ('x' * 1000) -NoNewline
+$held = [IO.File]::Open($log, 'Open', 'ReadWrite', 'None')
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 600000 -ProbeWaitMs 5000
+[void](Test-GuiSmokeLogProgressStalled -Watch $w)
+$armed = [bool]$w.Armed
+Start-Sleep -Milliseconds 1200
+$held.Dispose()
+[void](Test-GuiSmokeLogProgressStalled -Watch $w)
+$quietAfterRestore = [int]$w.Quiet.ElapsedMilliseconds
+$baseline = [int64]$w.Files['mlvapp-1.log']
+Add-Content -LiteralPath $log -Value 'more' -NoNewline
+[void](Test-GuiSmokeLogProgressStalled -Watch $w)
+$quietAfterGrowth = [int]$w.Quiet.ElapsedMilliseconds
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ armed = $armed; quietAfterRestore = $quietAfterRestore; baseline = $baseline; quietAfterGrowth = $quietAfterGrowth } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["armed"], "the unreadable first sighting still arms the watch")
+        self.assertGreaterEqual(out["quietAfterRestore"], 1000, "becoming readable at an unchanged length must not restart the quiet clock")
+        self.assertEqual(1000, out["baseline"], "the first readable length after unknown is the baseline")
+        self.assertLess(out["quietAfterGrowth"], 600, "growth beyond a known baseline restarts the quiet clock")
+
+    # adversary b0a33ba9 A2 (r4): no budget left = no probe and no wait; the wait is re-derived from an absolute end just before WaitOne;
+    # a probe result that lands once the budget is spent is ignored.
+    def test_probe_is_not_started_or_waited_on_without_budget_and_a_late_result_is_ignored(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'nobudget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeWaitMs 1000
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 0)
+$zeroMs = [int]$sw.ElapsedMilliseconds
+$pendingAfterZero = ($null -ne $w.Pending)
+Stop-GuiSmokeLogProgressWatch -Watch $w
+$late = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeScript 'param($d) Start-Sleep -Milliseconds 600; ''mlvapp-1.log|500''' -ProbeWaitMs 5000
+[void](Test-GuiSmokeLogProgressStalled -Watch $late -BudgetRemainingMs 300)
+Start-Sleep -Milliseconds 1500
+[void](Test-GuiSmokeLogProgressStalled -Watch $late -BudgetRemainingMs 0)
+$lateArmed = [bool]$late.Armed
+$lateFiles = @($late.Files.Keys).Count
+Stop-GuiSmokeLogProgressWatch -Watch $late
+[pscustomobject]@{ stalled = $stalled; zeroMs = $zeroMs; pendingAfterZero = $pendingAfterZero; lateArmed = $lateArmed; lateFiles = $lateFiles } | ConvertTo-Json -Compress
+""")
+        self.assertFalse(out["stalled"])
+        self.assertFalse(out["pendingAfterZero"], "with no budget left no probe may be started")
+        self.assertLess(out["zeroMs"], 300)
+        self.assertFalse(out["lateArmed"], "a probe result that lands after the budget was spent is ignored")
+        self.assertEqual(0, out["lateFiles"])
+        text = MODULE.read_text(encoding="utf-8")
+        body = text[text.index("function Test-GuiSmokeLogProgressStalled"):text.index("function Wait-GuiSmokeProcessBounded")]
+        self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", body, "an absolute endpoint is taken at function entry")
+        self.assertLess(body.index("[System.Diagnostics.Stopwatch]::StartNew()"), body.index("AsyncWaitHandle.WaitOne("))
+        self.assertIn("$BudgetRemainingMs - ", body, "the wait is re-derived from the entry stopwatch just before WaitOne")
+
+    # adversary b0a33ba9 A4 (r4): the early no-progress stop must not also print the whole-timeout message.
+    def test_runner_prints_the_no_progress_message_alone_for_a_no_progress_stop(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        start = source.index("if ($processBoundary.timedOut) {")
+        block = source[start:source.index("if ($processExitCode -ne 0) {", start)]
+        self.assertIn("$processBoundary.outcome -eq 'process_no_progress'", block)
+        self.assertEqual(1, block.count("exceeded its fail-closed process timeout"))
+        self.assertLess(block.index("$processBoundary.outcome -eq 'process_no_progress'"), block.index("exceeded its fail-closed process timeout"))
+        self.assertIn("else {", block, "the whole-timeout message is the else branch of the typed outcome")
+
+    # adversary b0a33ba9 A5 (r4): an explicit window below 1 s is clamped in the runner; the helper keeps its 250 ms floor for any window.
+    def test_runner_clamps_an_explicit_no_progress_override_to_one_second(self) -> None:
+        out = run_ps(r"""
+[pscustomobject]@{ one = Get-GuiSmokeNoProgressChunkMs -WindowMs 1; two = Get-GuiSmokeNoProgressChunkMs -WindowMs 999 } | ConvertTo-Json -Compress
+""")
+        self.assertEqual(250, out["one"], "the helper's max(250, min(4000, window/4)) floor stays for a window of 1 ms")
+        self.assertEqual(250, out["two"])
+        source = RUNNER.read_text(encoding="utf-8")
+        start = source.index("$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs")
+        call = source[start:source.index("\n", start)]
+        self.assertIn("-OverrideMs $noProgressOverrideMs", call)
+        clamp = source[:start]
+        self.assertIn("[Math]::Max(1000, $NoProgressTimeoutMs)", clamp)
+        self.assertIn("$noProgressOverrideMs = if ($NoProgressTimeoutMs -gt 0)", clamp)
 
     def test_runner_checks_the_log_between_chunks_and_receipt_carries_the_outcome(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
