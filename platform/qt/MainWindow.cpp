@@ -24712,6 +24712,7 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.requestContextScale = m_lastPresentedRequestContext.playbackScaleFactorPolicy;   // r3: the asked scale (A1)
     inputs.gpuAmaze = m_lastPresentedFrameUsedGpuAmazeDebayer;
     inputs.gpuBilinear = m_lastPresentedFrameUsedGpuBilinearDebayer;
+    inputs.presentedRoute = presentedPlaybackRouteCode();   // r12 adversary A1: a proxy route change relabels
     if( inputs == m_playbackInfoInputs ) return;
     m_playbackInfoInputs = inputs;
     // r1 pass-3 A2: while playing, flushPlaybackInfoIfDue's 250 ms gate relabels, so a per-frame flip stays at most 4 Hz.
@@ -33945,6 +33946,8 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     // r3 (adversary a271daee A2): what the GPU ran (LMMSE selected may render with GPU AMaZE).
     facts.gpuDebayer = m_lastPresentedFrameUsedGpuAmazeDebayer ? QStringLiteral( "AMaZE" )
                      : ( m_lastPresentedFrameUsedGpuBilinearDebayer ? QStringLiteral( "Bilinear" ) : QString() );
+    // r12 (adversary ff6a22ab A1): the route the presented frame took, so a reduced bilinear proxy never reads as the selected one.
+    facts.presentedRoute = presentedPlaybackRouteCode();
     facts.playing = ui->actionPlay->isChecked();
     // r1 adversary A1: the gate's snapshot, never the live meter, so no hook shows a new rate faster than the 250 ms gate.
     facts.achievedFps = m_playbackInfoFpsShown;
@@ -33957,6 +33960,22 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     facts.width = static_cast<int>( getMlvWidth( m_pMlvObject ) );
     facts.height = static_cast<int>( getMlvHeight( m_pMlvObject ) );
     return facts;
+}
+
+// LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary ff6a22ab A1): the CPU render-path code of the PRESENTED frame, read from that frame's
+// own telemetry (RenderFrameThread's render_thread_phase4b_path, a cache hit replays the cached route), never from the settings.
+// The tag is thread-local and only the CPU processed entries rewrite it, so it is trusted only for a frame whose CPU processed
+// stage ran at scale 1 (the x1 proxy cores run nowhere else), not through the direct-8 path, the GPU recon or a GPU debayer.
+int MainWindow::presentedPlaybackRouteCode( void ) const
+{
+    if( !m_lastPresentedRequestContextValid ) return 0;
+    if( m_lastPresentedPlaybackScaleFactorActive != 1 ) return 0;
+    if( m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer ) return 0;
+    const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;
+    if( !telemetryBoolValue( telemetry, "processed16_stage_measured" ) ) return 0;
+    if( telemetryBoolValue( telemetry, "processed8_direct_path_active" ) ) return 0;
+    if( telemetryBoolValue( telemetry, "gpu_playback_recon_used" ) ) return 0;
+    return telemetryIntValue( telemetry, "render_thread_phase4b_path" );
 }
 
 // LOOK-LABEL-PLAYBACK-INFO-1: change-only. Composes only while the fullscreen overlay is shown or the twin is visible (windowed

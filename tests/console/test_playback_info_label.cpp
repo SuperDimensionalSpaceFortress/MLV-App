@@ -731,6 +731,84 @@ TEST(PlaybackInfoLabel, R7P10A1ScaledCpuFrameNeverNamesTheSelectedDebayerAsRan)
     ASSERT_QSTR_EQ(QStringLiteral("AMaZE (GPU)"), playback_info_label::debayerField(f));
 }
 
+// r12 adversary A1 (ff6a22ab): 1920x1088 24-fps HQ Dual-ISO clip, CPU 8-bit preview, fast playback processing on, Full playback
+// scale, Preview Resolution=Half, LMMSE selected. The x1 half/quarter proxy (video_mlv.c mlv_render_scaled_rgb16_x1_half_preview_core)
+// debayers bilinear (debayerBasicU16) at reduced dimensions and upscales, while the output scale stays 1, so both surfaces read
+// "LMMSE". The presented frame's own route code names what ran: codes 6/7 the half proxy, 9/10 the quarter proxy.
+TEST(PlaybackInfoLabel, R12A1ReducedProxyFrameNamesTheProxyDebayerNotTheSelected)
+{
+    playback_info_label::Facts f = ownerFacts();
+    f.gpuDisplay = false;
+    f.processingBadge = QStringLiteral("CPU");
+    f.debayer = QStringLiteral("LMMSE");
+    f.debayerOnGpu = false;
+    f.gpuDebayer = QString();
+    f.requestedScale = 1;
+    f.presentedScale = 1;
+    f.presentedValid = true;
+    f.dualIsoClip = true;
+    f.dualIsoOn = true;
+    f.width = 1920;
+    f.height = 1088;
+    struct RouteCase { int route; const char *expected; };
+    const RouteCase cases[] = {
+        { 6, "LMMSE->Bilinear (Half proxy)" },
+        { 7, "LMMSE->Bilinear (Half proxy)" },
+        { 9, "LMMSE->Bilinear (Quarter proxy)" },
+        { 10, "LMMSE->Bilinear (Quarter proxy)" },
+    };
+    for (const RouteCase &c : cases) {
+        f.presentedRoute = c.route;
+        ASSERT_QSTR_EQ(QString::fromLatin1(c.expected), playback_info_label::debayerField(f));
+        const QString overlay = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+        const QString twin = playback_info_label::compose(f, playback_info_label::Toggles(), false);
+        const QString overlayLineA = overlay.section(QLatin1Char('\n'), 0, 0);
+        const QString twinLineA = twin.section(QLatin1Char('\n'), 0, 0);
+        ASSERT_FALSE(overlayLineA.endsWith(dot() + QStringLiteral("LMMSE")));
+        ASSERT_FALSE(twinLineA.endsWith(dot() + QStringLiteral("LMMSE")));
+        ASSERT_TRUE(overlayLineA.endsWith(QString::fromLatin1(c.expected)));
+        ASSERT_TRUE(twinLineA.endsWith(QString::fromLatin1(c.expected)));
+    }
+    // the full-recon route (0) and a code that is no x1 proxy leave the selected name standing at full scale
+    for (int route : {0, 2, 3, 4, 8, -1, 99}) {
+        f.presentedRoute = route;
+        ASSERT_QSTR_EQ(QStringLiteral("LMMSE"), playback_info_label::debayerField(f));
+    }
+    // Bilinear selected: the proxy ran the selected algorithm, at the proxy's resolution
+    f.presentedRoute = 6;
+    f.debayer = QStringLiteral("Bilinear");
+    ASSERT_QSTR_EQ(QStringLiteral("Bilinear (Half proxy)"), playback_info_label::debayerField(f));
+    // no selected name known: the proxy still names what ran
+    f.debayer = QString();
+    f.presentedRoute = 9;
+    ASSERT_QSTR_EQ(QStringLiteral("Bilinear (Quarter proxy)"), playback_info_label::debayerField(f));
+    // the GPU forms are unchanged (the GPU names what it ran)
+    f.debayer = QStringLiteral("LMMSE");
+    f.presentedRoute = 6;
+    f.debayerOnGpu = true;
+    f.gpuDebayer = QStringLiteral("AMaZE");
+    ASSERT_QSTR_EQ(QStringLiteral("LMMSE->AMaZE (GPU)"), playback_info_label::debayerField(f));
+}
+
+// r12 adversary A1 siblings (MainWindow.cpp playbackInfoFacts, refreshPlaybackInfoOnInputChange): the route is read from the
+// presented frame's own telemetry, and only from a frame whose processed stage ran (the tag is thread-local and is not reset by
+// the GPU debayered routes); a route change relabels like any other info input.
+TEST(PlaybackInfoLabel, R12A1PresentedRouteIsReadFromThePresentedFrame)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
+    ASSERT_TRUE(facts.contains(QStringLiteral("facts.presentedRoute = presentedPlaybackRouteCode();")));
+    const QString route = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackRouteCode("));
+    ASSERT_TRUE(route.contains(QStringLiteral("m_lastPresentedStageTimingTelemetry")));
+    ASSERT_TRUE(route.contains(QStringLiteral("\"processed16_stage_measured\"")));
+    ASSERT_TRUE(route.contains(QStringLiteral("\"render_thread_phase4b_path\"")));
+    ASSERT_FALSE(route.contains(QStringLiteral("mlv_phase4bv2_last_path_taken")));
+    const QString inputs = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    ASSERT_TRUE(inputs.contains(QStringLiteral("inputs.presentedRoute = presentedPlaybackRouteCode();")));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("presentedRoute == o.presentedRoute")));
+}
+
 // r7 adversary pass 11 A1 (045434fc): Stop at t=100 ms, Play at t=450 ms with no idle tick between: the corner kept the last
 // Play's measured 23.8 (only the > 500 ms idle reset zeroed it) and composed "23.8/24 fps" before this Play measured a frame.
 // The Play toggle drops the snapshot BEFORE the relabel it triggers, so a new Play reads "--" until its own measurement.

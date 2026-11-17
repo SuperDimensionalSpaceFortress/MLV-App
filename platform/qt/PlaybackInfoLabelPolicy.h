@@ -36,6 +36,8 @@ struct Facts
     QString debayer;                  // the chosen debayer's menu text ("" = omitted)
     bool debayerOnGpu = false;
     QString gpuDebayer;               // r3: the algorithm the GPU ran for the presented frame ("AMaZE", "Bilinear"; "" = none)
+    int presentedRoute = 0;           // r12 (adversary A1): the presented frame's CPU render-path code (render_thread_phase4b_path,
+                                      // video_mlv.c); 0 = full recon or unknown. 6/7 = x1 half proxy, 9/10 = x1 quarter proxy.
     bool playing = false;
     double achievedFps = 0.0;         // smoothed presented rate while playing
     double clipFps = 0.0;             // the clip's own rate (<= 0 = unknown, the fps field is omitted)
@@ -94,6 +96,16 @@ inline QString scaleField( const Facts &facts )
     return PlaybackScaleLabel::fractionWord( facts.requestedScale );
 }
 
+/*! \brief r12 adversary A1: the reduced-proxy level of a presented CPU route code (video_mlv.c
+ *  mlv_render_scaled_rgb16_x1_half_preview_core): 6 (half preview, full processing) and 7 (half preview, half processing) -> 1
+ *  halving; 10 and 9 (the quarter variants) -> 2. Every other code (0 = full recon, 2/3/4/8 = scaled pre-recon) -> 0. */
+inline int proxyRouteHalvings( int presentedRoute )
+{
+    if( presentedRoute == 6 || presentedRoute == 7 ) return 1;
+    if( presentedRoute == 9 || presentedRoute == 10 ) return 2;
+    return 0;
+}
+
 inline QString debayerField( const Facts &facts )
 {
     const QString name = facts.debayer.trimmed();
@@ -104,6 +116,16 @@ inline QString debayerField( const Facts &facts )
     {
         if( name.isEmpty() || name.compare( gpu, Qt::CaseInsensitive ) == 0 ) return gpu + QStringLiteral( " (GPU)" );
         return name + QStringLiteral( "->" ) + gpu + QStringLiteral( " (GPU)" );
+    }
+    // r12 adversary A1 (ff6a22ab): the x1 half/quarter proxy debayers bilinear (debayerBasicU16) at reduced dimensions and
+    // upscales, so the output scale stays Full while the selected algorithm never ran. The presented frame's route names it.
+    const int proxyHalvings = facts.debayerOnGpu ? 0 : proxyRouteHalvings( facts.presentedRoute );
+    if( proxyHalvings > 0 )
+    {
+        const QString proxy = QStringLiteral( "Bilinear" );
+        const QString level = proxyHalvings >= 2 ? QStringLiteral( " (Quarter proxy)" ) : QStringLiteral( " (Half proxy)" );
+        if( name.isEmpty() || name.compare( proxy, Qt::CaseInsensitive ) == 0 ) return proxy + level;
+        return name + QStringLiteral( "->" ) + proxy + level;
     }
     if( name.isEmpty() ) return QString();
     if( facts.debayerOnGpu ) return name + QStringLiteral( " (GPU)" );

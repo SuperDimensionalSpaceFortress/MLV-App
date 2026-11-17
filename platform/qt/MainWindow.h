@@ -891,11 +891,13 @@ private:
         int requestContextScale = 0;
         bool gpuAmaze = false;
         bool gpuBilinear = false;
+        int presentedRoute = 0;   // r12 adversary A1: the presented frame's CPU render-path code (a proxy route relabels)
         bool operator==( const PlaybackInfoInputs &o ) const
         {
             return pipelineStatus == o.pipelineStatus && scopeCaveat == o.scopeCaveat && requestedScale == o.requestedScale
                 && presentedScale == o.presentedScale && requestContextValid == o.requestContextValid
-                && requestContextScale == o.requestContextScale && gpuAmaze == o.gpuAmaze && gpuBilinear == o.gpuBilinear;
+                && requestContextScale == o.requestContextScale && gpuAmaze == o.gpuAmaze && gpuBilinear == o.gpuBilinear
+                && presentedRoute == o.presentedRoute;
         }
     };
     PlaybackInfoInputs m_playbackInfoInputs;
@@ -2372,6 +2374,8 @@ private:
     // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
     void pushLookLabelOverlay( void );
     playback_info_label::Facts playbackInfoFacts( void );
+    // r12 adversary A1: the presented frame's CPU render-path code, read from its own telemetry (0 = full recon or unknown).
+    int presentedPlaybackRouteCode( void ) const;
     // The presented pipeline status and the scope caveat, shared by the toolbar indicator and the info label.
     void presentedGpuPlaybackPipelineStatus( GpuPlaybackPipelineStatus &status, bool &scopePerformanceCaveat ) const;
     // r1 adversary A1/A3: relabels only when a pipeline/scale/debayer input changed (int compares; safe per presented frame).
