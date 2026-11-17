@@ -61,6 +61,29 @@ function Get-GuiSmokeNoProgressWindowMs {
     return [int64]$window
 }
 
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 B1): the HARD deadline of the GUI process, derived from the LEG and not from the caller's job
+# timeout. The leg budget (the runner's $derivedProcessTimeoutMs: play safety net + settle + screenshot allowances) plus a stated, bounded
+# setup/teardown allowance (-AllowanceMs, 0 = 120000 ms: app start-up, clip open and teardown, which no play window covers), and NEVER above the
+# job's -ProcessTimeoutMs (-JobTimeoutMs) nor the 3600000 ms safety ceiling. With no job timeout the runner's own derived leg budget is the deadline
+# (floor 1000 ms), exactly as before. It bounds the wait on every branch -- no log yet, a log that keeps growing, and the finalize -- because the
+# runner uses it AS its process budget; the silence watchdog only ever ends a leg sooner.
+function Get-GuiSmokeLegHardLimitMs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(0, 3600000)]
+        [int64]$LegBudgetMs,
+        [ValidateRange(0, 3600000)]
+        [int64]$JobTimeoutMs = 0,
+        [ValidateRange(0, 3600000)]
+        [int64]$AllowanceMs = 0
+    )
+
+    $allowance = if ($AllowanceMs -gt 0) { $AllowanceMs } else { 120000 }
+    $limit = if ($JobTimeoutMs -gt 0) { [Math]::Min($JobTimeoutMs, $LegBudgetMs + $allowance) } else { [Math]::Max(1000, $LegBudgetMs) }
+    return [int64][Math]::Min(3600000, $limit)
+}
+
 # How often the runner's chunk loop looks at the log: a fraction of the window (a window of 1 s must not sit inside a 60 s chunked wait), never
 # below 250 ms and never above the 4 s cadence the host-load samples already use. The wait overshoots a stall by at most one chunk + one probe.
 function Get-GuiSmokeNoProgressChunkMs {
@@ -316,7 +339,9 @@ function Wait-GuiSmokeProcessBounded {
         $timedOut = $true
         $noProgress = [bool]$NoProgressStalled
         if ($noProgress) {
-            $failures.Add("MLVApp made no log progress for $NoProgressWindowMs ms (process_no_progress) and was terminated; the whole process budget was $reportedTimeoutMs ms.")
+            # r6 (sol r5 H2, VENUE-SMOKE-KILL-PROSE-UNCONFIRMED-1): this line is written BEFORE the kill below, so it says termination was
+            # REQUESTED; "termination was confirmed" is added only once the post-kill wait has seen the exit.
+            $failures.Add("MLVApp made no log progress for $NoProgressWindowMs ms (process_no_progress); termination was requested; the whole process budget was $reportedTimeoutMs ms.")
         }
         else {
             $failures.Add("MLVApp exceeded the fail-closed process timeout of $reportedTimeoutMs ms.")
@@ -346,6 +371,9 @@ function Wait-GuiSmokeProcessBounded {
         }
         if (-not $terminationConfirmed) {
             $failures.Add("MLVApp process tree was not confirmed terminated within $TerminationGraceMs ms.")
+        }
+        elseif ($noProgress) {
+            $failures.Add("MLVApp process_no_progress termination was confirmed.")
         }
     }
 
@@ -402,4 +430,4 @@ function Wait-GuiSmokeProcessBounded {
     }
 }
 
-Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled
+Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeLegHardLimitMs, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled

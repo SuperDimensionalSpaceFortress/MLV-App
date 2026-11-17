@@ -16,6 +16,10 @@ param(
     # 0 = derived from the leg (its derived process budget + 60 s), capped at the whole process timeout; never from -ProcessTimeoutMs.
     [ValidateRange(0, 3600000)]
     [int]$NoProgressTimeoutMs = 0,
+    # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6: the setup/teardown allowance added to the leg budget to form the process's hard deadline
+    # (app start-up, clip open, teardown); 0 = 120000 ms. The deadline never exceeds -ProcessTimeoutMs.
+    [ValidateRange(0, 3600000)]
+    [int]$LegHardLimitAllowanceMs = 0,
     [ValidateRange(0, 1000000)]
     [int]$TargetPresentedFrames = 0,
     [int]$StartFrame = 0,
@@ -1767,11 +1771,11 @@ $derivedProcessTimeoutMs = [Math]::Ceiling(
 if ($derivedProcessTimeoutMs -gt 3600000) {
     throw "Derived GUI-smoke process timeout exceeds the 3600000 ms safety ceiling; pass a smaller bounded workload."
 }
-$effectiveProcessTimeoutMs = if ($ProcessTimeoutMs -gt 0) {
-    $ProcessTimeoutMs
-} else {
-    [Math]::Max(1000, [int]$derivedProcessTimeoutMs)
-}
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 B1): the process's HARD deadline is derived from the LEG (leg budget + a 120 s setup/teardown
+# allowance, -LegHardLimitAllowanceMs to widen it) and capped by -ProcessTimeoutMs, never equal to a job-sized -ProcessTimeoutMs by itself. It is the
+# one budget every wait below uses (no log yet, a growing log, the finalize, the receipt), so a short leg under a one-hour job timeout ends at its
+# own deadline even when the silence watchdog is unarmed or keeps being restarted.
+$effectiveProcessTimeoutMs = [int](Get-GuiSmokeLegHardLimitMs -LegBudgetMs $derivedProcessTimeoutMs -JobTimeoutMs $ProcessTimeoutMs -AllowanceMs $LegHardLimitAllowanceMs)
 
 if ($DryRun) {
     $dryRunResult = [pscustomobject]@{
@@ -2531,7 +2535,8 @@ if ($processBoundary.timedOut) {
         $validationFailures += "MLVApp's log made no progress for $noProgressWindowMs ms (process_no_progress); the leg was ended before the whole $($processBoundary.timeoutMs) ms budget."
     }
     else {
-        $validationFailures += "MLVApp exceeded its fail-closed process timeout and was terminated."
+        # r6 (sol r5 H2): "was terminated" only when the boundary SAW the exit; a failed kill or an unseen exit says so
+        $validationFailures += "MLVApp exceeded its fail-closed process timeout and " + $(if ($processBoundary.terminationConfirmed) { "was terminated." } else { "its termination was not confirmed." })
     }
 }
 if ($processExitCode -ne 0) {

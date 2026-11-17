@@ -474,5 +474,165 @@ Stop-GuiSmokeLogProgressWatch -Watch $late
         self.assertIn("[int]$NoProgressTimeoutMs = 0", source)
 
 
+def _runner_snippet(start_marker: str, end_marker: str) -> str:
+    """The runner's OWN text between two markers, so a test runs the shipped wiring and not a copy of it."""
+    source = RUNNER.read_text(encoding="utf-8")
+    start = source.index(start_marker)
+    return source[start:source.index(end_marker, start)]
+
+
+# the runner's two hard-limit regions, executed verbatim: the derivation of the process budget, and the chunked wait + finalize (both sampling
+# branches, the unarmed-watch path and the growing-log path share one bound)
+_DERIVE_REGION = ("$effectiveProcessTimeoutMs = ", "\n\nif ($DryRun)")
+_WAIT_REGION = ("$noProgressOverrideMs = if", "\n$stdout = $processBoundary.stdout")
+
+_RUNNER_HARNESS = r"""
+function Get-HostLoadSnapshot { param($TopProcessCount, $SubjectProcess, [switch]$SkipEvidenceCollection) [pscustomobject]@{ sample = 1 } }
+$ProcessTimeoutMs = 3600000; $NoProgressTimeoutMs = 0; $LegHardLimitAllowanceMs = 1000
+$derivedProcessTimeoutMs = 2000
+$HostLoadSampleIntervalMs = [int]$env:GS_SAMPLE_MS; $HostLoadTopProcessCount = 3
+$hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
+$logRoot = Join-Path $env:GS_TMP 'legdeadline'; New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
+$env:GS_LOG = Join-Path $logRoot 'mlvapp-1.log'
+$s = New-Stub $env:GS_STUB
+$process = $s.p; $stdoutTask = $s.o; $stderrTask = $s.e
+. ([scriptblock]::Create($env:GS_DERIVE))
+$hardLimitMs = [int64]$effectiveProcessTimeoutMs
+$sw = [Diagnostics.Stopwatch]::StartNew()
+. ([scriptblock]::Create($env:GS_WAIT))
+$waitedMs = [int]$sw.ElapsedMilliseconds
+$alive = -not $process.HasExited
+if ($alive) { $process.Kill($true) }
+[pscustomobject]@{ hardLimitMs = $hardLimitMs; waitedMs = $waitedMs; timedOut = [bool]$processBoundary.timedOut; outcome = [string]$processBoundary.outcome
+    timeoutMs = [int]$processBoundary.timeoutMs; exitCode = [int]$processBoundary.exitCode; alive = $alive; samples = $hostLoadDuringSamples.Count } | ConvertTo-Json -Compress
+"""
+
+_NEVER_EXITS_NO_LOG = "Start-Sleep -Seconds 20"
+_NEVER_EXITS_GROWING_LOG = "1..40 | ForEach-Object { Add-Content -LiteralPath $env:GS_LOG -Value 'tick'; Start-Sleep -Milliseconds 500 }"
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class LegDerivedHardDeadline(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 B1; catalogue B-03): the GUI process has a hard deadline derived from its LEG (leg budget plus a
+    stated setup/teardown allowance, never above the job's -ProcessTimeoutMs), so a short leg under a one-hour job timeout is ended at the leg's
+    deadline whether its log never appeared (the watchdog is unarmed) or keeps growing (its quiet clock keeps restarting)."""
+
+    def _run_runner_wiring(self, stub: str, sample_ms: int) -> dict:
+        return run_ps(_RUNNER_HARNESS, GS_STUB=stub, GS_SAMPLE_MS=str(sample_ms),
+                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION))
+
+    def _assert_ended_at_the_leg_deadline(self, out: dict) -> None:
+        # the observed behaviour first: the stub never exits within 20 s, so only a leg-derived deadline can end it sooner
+        self.assertLess(out["waitedMs"], 12000, "the process outlived the leg-derived deadline: the job timeout is still its only bound")
+        self.assertTrue(out["timedOut"], "the process is ended at the leg-derived deadline, not left to the one-hour job timeout")
+        self.assertFalse(out["alive"], "the owned tree is killed")
+        self.assertEqual(124, out["exitCode"])
+        self.assertEqual(3000, out["hardLimitMs"], "leg budget 2000 ms + 1000 ms allowance, under a 3600000 ms job timeout")
+        self.assertEqual(3000, out["timeoutMs"], "the receipt names the leg-derived whole budget")
+
+    def test_hard_limit_is_the_leg_plus_an_allowance_and_never_above_the_job_timeout(self) -> None:
+        out = run_ps(r"""
+[pscustomobject]@{
+    withJobTimeout = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 155000 -JobTimeoutMs 3600000
+    jobBelowLeg = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 155000 -JobTimeoutMs 200000
+    noJobTimeout = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 155000 -JobTimeoutMs 0
+    noJobTimeoutFloor = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 500 -JobTimeoutMs 0
+    explicitAllowance = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 2000 -JobTimeoutMs 3600000 -AllowanceMs 1000
+    safetyCeiling = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 3600000 -JobTimeoutMs 3600000
+    tinyJob = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 155000 -JobTimeoutMs 500
+} | ConvertTo-Json -Compress
+""")
+        self.assertEqual(155000 + 120000, out["withJobTimeout"], "the stated allowance is 120 s of app start-up and teardown")
+        self.assertEqual(200000, out["jobBelowLeg"], "never above the job's own -ProcessTimeoutMs")
+        self.assertEqual(155000, out["noJobTimeout"], "no -ProcessTimeoutMs: the runner's own derived leg budget, unchanged")
+        self.assertEqual(1000, out["noJobTimeoutFloor"])
+        self.assertEqual(3000, out["explicitAllowance"])
+        self.assertEqual(3600000, out["safetyCeiling"])
+        self.assertEqual(500, out["tinyJob"], "a job timeout below the leg is honoured as given")
+
+    def test_runner_derives_its_process_budget_from_the_leg_and_exposes_the_allowance(self) -> None:
+        derive = _runner_snippet(*_DERIVE_REGION)
+        self.assertIn("Get-GuiSmokeLegHardLimitMs -LegBudgetMs $derivedProcessTimeoutMs -JobTimeoutMs $ProcessTimeoutMs -AllowanceMs $LegHardLimitAllowanceMs", derive)
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("[int]$LegHardLimitAllowanceMs = 0", source)
+        self.assertNotIn("$effectiveProcessTimeoutMs = if ($ProcessTimeoutMs -gt 0)", source, "the job timeout is no longer the process deadline by itself")
+
+    def test_a_short_leg_with_no_log_yet_is_ended_at_the_leg_deadline_without_host_load_sampling(self) -> None:
+        self._assert_ended_at_the_leg_deadline(self._run_runner_wiring(_NEVER_EXITS_NO_LOG, 0))
+
+    def test_a_short_leg_with_no_log_yet_is_ended_at_the_leg_deadline_with_host_load_sampling(self) -> None:
+        out = self._run_runner_wiring(_NEVER_EXITS_NO_LOG, 500)
+        self._assert_ended_at_the_leg_deadline(out)
+
+    def test_a_short_leg_whose_log_keeps_growing_is_ended_at_the_leg_deadline_without_host_load_sampling(self) -> None:
+        self._assert_ended_at_the_leg_deadline(self._run_runner_wiring(_NEVER_EXITS_GROWING_LOG, 0))
+
+    def test_a_short_leg_whose_log_keeps_growing_is_ended_at_the_leg_deadline_with_host_load_sampling(self) -> None:
+        out = self._run_runner_wiring(_NEVER_EXITS_GROWING_LOG, 500)
+        self._assert_ended_at_the_leg_deadline(out)
+        self.assertGreaterEqual(out["samples"], 1, "the sampling branch ran")
+
+    def test_the_no_progress_window_can_never_outlast_the_leg_deadline(self) -> None:
+        out = run_ps(r"""
+$hard = Get-GuiSmokeLegHardLimitMs -LegBudgetMs 24000 -JobTimeoutMs 3600000
+[pscustomobject]@{ hard = $hard; window = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 24000 -OverrideMs 3600000 -CeilingMs $hard } | ConvertTo-Json -Compress
+""")
+        self.assertEqual(24000 + 120000, out["hard"])
+        self.assertEqual(out["hard"], out["window"], "an explicit -NoProgressTimeoutMs of the whole job timeout is capped by the leg deadline")
+
+
+# r6 (sol r5 A4 / H2, absorbing VENUE-SMOKE-KILL-PROSE-UNCONFIRMED-1): the failure text says termination was REQUESTED until the exit is confirmed.
+_FAKE_PROCESS = r"""
+class FakeProc : System.Diagnostics.Process {
+    [bool]$KillThrows = $false
+    [bool]$ExitsAfterKill = $false
+    [bool]$Killed = $false
+    [void]Kill([bool]$tree) { if ($this.KillThrows) { throw [System.InvalidOperationException]::new('denied C:\secret\path') }; $this.Killed = $true }
+    [bool]WaitForExit([int]$ms) { return ($this.Killed -and $this.ExitsAfterKill) }
+}
+"""
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TerminationProseIsOnlyAsStrongAsTheEvidence(unittest.TestCase):
+    def _wait(self, kill_throws: str, exits_after_kill: str, no_progress: str) -> dict:
+        return run_ps(_FAKE_PROCESS + r"""
+$p = [FakeProc]::new(); $p.KillThrows = %s; $p.ExitsAfterKill = %s
+$done = [System.Threading.Tasks.Task]::FromResult('')
+$r = Wait-GuiSmokeProcessBounded -Process $p -StandardOutputTask $done -StandardErrorTask $done -TimeoutMs 50 -ReportedTimeoutMs 3000 -TerminationGraceMs 50 %s
+[pscustomobject]@{ failures = @($r.failures); treeKillSucceeded = $r.treeKillSucceeded; terminationConfirmed = $r.terminationConfirmed; exitCode = $r.exitCode; outcome = $r.outcome } | ConvertTo-Json -Compress
+""" % (kill_throws, exits_after_kill, no_progress))
+
+    def test_a_failed_kill_and_unconfirmed_exit_never_claim_termination(self) -> None:
+        for no_progress in ("-NoProgressStalled -NoProgressWindowMs 1500", ""):
+            out = self._wait("$true", "$false", no_progress)
+            text = " ".join(out["failures"])
+            self.assertNotIn("was terminated", text, f"the kill threw and the exit was never seen (no_progress={bool(no_progress)})")
+            self.assertIn("termination failed", text)
+            self.assertIn("not confirmed terminated", text)
+            self.assertFalse(out["terminationConfirmed"])
+            self.assertFalse(out["treeKillSucceeded"])
+            self.assertEqual(124, out["exitCode"])
+
+    def test_runner_claims_termination_only_when_the_boundary_confirmed_the_exit(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        start = source.index("if ($processBoundary.timedOut) {")
+        block = source[start:source.index("if ($processExitCode -ne 0) {", start)]
+        self.assertIn("$processBoundary.terminationConfirmed", block)
+        self.assertLess(block.index("$processBoundary.terminationConfirmed"), block.index('"was terminated."'))
+        self.assertIn("its termination was not confirmed.", block)
+
+    def test_no_progress_prose_says_requested_until_the_exit_is_confirmed(self) -> None:
+        unconfirmed = " ".join(self._wait("$false", "$false", "-NoProgressStalled -NoProgressWindowMs 1500")["failures"])
+        self.assertIn("process_no_progress", unconfirmed)
+        self.assertIn("termination was requested", unconfirmed)
+        self.assertNotIn("was terminated", unconfirmed)
+        self.assertIn("not confirmed terminated", unconfirmed)
+        confirmed = self._wait("$false", "$true", "-NoProgressStalled -NoProgressWindowMs 1500")
+        self.assertTrue(confirmed["terminationConfirmed"])
+        self.assertIn("termination was confirmed", " ".join(confirmed["failures"]), "the confirmation is its own statement, made only once the exit is seen")
+        self.assertEqual("process_no_progress", confirmed["outcome"])
+
+
 if __name__ == "__main__":
     unittest.main()

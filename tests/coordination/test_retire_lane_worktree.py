@@ -4730,6 +4730,47 @@ def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_e
     assert "$waitMs = if ($Watch.Hung) { 0 } else" in code and "$Watch.Hung = $true" in code, "a hung probe is only looked at, never re-waited past the budget"
 
 
+def _gui_smoke_log_probe_purity_problems(body: str) -> list:
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 H1): the .NET surface a read-only log probe may touch, as a positive allowlist over the probe
+    body: the types it may name, the members it may call, and no writer/stream constructor. Returns the problems (empty = pure)."""
+    problems = []
+    types = set(re.findall(r"\[([A-Za-z][\w.]*)\]", body))
+    allowed_types = {"int64", "System.IO.File", "System.IO.FileMode", "System.IO.FileAccess", "System.IO.FileShare"}
+    problems += [f"type [{t}]" for t in sorted(types - allowed_types)]
+    members = set(re.findall(r"\.([A-Za-z]\w*)\(", body)) | set(re.findall(r"::(\w+)\(", body))
+    problems += [f"member call .{m}(" for m in sorted(members - {"Open", "Dispose"})]
+    # a writer or stream built any way at all (constructor, ::new, New-Object, a type accelerator) is refused by name too
+    for shape in ("StreamWriter", "FileStream", "BinaryWriter", "TextWriter", "StringWriter", "WriteLine", "Flush", "::new", "New-Object", "CopyTo", "WriteByte"):
+        if shape in body:
+            problems.append(f"shape {shape}")
+    return problems
+
+
+def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_write_mutations():
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 H1): an in-memory [IO.StreamWriter]::new(...) + WriteLine survived both r5 purity guards. The
+    shipped probe passes the type/member allowlist; each writer mutation, inserted into the probe's own foreach, is refused. ADDITIVE: the r4/r5
+    purity tests above are unchanged."""
+    t = (REPO / "tools/profiling/gui-smoke-process-boundary.psm1").read_text(encoding="utf-8")
+    code = "\n".join(line for line in t.splitlines() if not line.lstrip().startswith("#"))
+    start = code.index("ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {")
+    body = code[start:code.index("\n        }\n", start)].split("\n", 1)[1]
+    assert _gui_smoke_log_probe_purity_problems(body) == [], "the shipped probe must be pure"
+    anchor = "                $length = [int64]-1\n"
+    assert anchor in body
+    mutations = {
+        "streamwriter accelerator": "$sink = [IO.StreamWriter]::new($file.FullName, $true); $sink.WriteLine('x'); $sink.Dispose()\n",
+        "streamwriter full name": "$sink = [System.IO.StreamWriter]::new($file.FullName, $true); $sink.WriteLine('x'); $sink.Dispose()\n",
+        "streamwriter new-object": "$sink = New-Object System.IO.StreamWriter($file.FullName); $sink.Write('x'); $sink.Dispose()\n",
+        "filestream append": "$sink = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Append); $sink.Dispose()\n",
+        "file create text": "$sink = [System.IO.File]::CreateText($file.FullName); $sink.Dispose()\n",
+        "opened stream written": "$stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open); $stream.WriteByte(1); $stream.Dispose()\n",
+        "in memory writer": "$sink = [IO.StringWriter]::new(); $sink.WriteLine('x')\n",
+    }
+    for label, injected in mutations.items():
+        mutated = body.replace(anchor, anchor + injected, 1)
+        assert _gui_smoke_log_probe_purity_problems(mutated), f"the purity guard let a writer mutation through: {label}"
+
+
 # --- LANE-RETIRE-LAUNCH-SITE-CENSUS-1 / LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census classifies launch SITES, not files.
 # These fixtures run against synthetic source text through the same seam the real census uses (_encoded_sites, _detached_sites,
 # _census_problems), so a site the census cannot see fails here without anyone adding a real launcher script to the repo.
