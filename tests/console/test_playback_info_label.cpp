@@ -313,8 +313,8 @@ TEST(PlaybackInfoLabel, R1A1FpsShownOnlyFromTheGateSnapshot)
     const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
     ASSERT_TRUE(facts.contains(QStringLiteral("facts.achievedFps = m_playbackInfoFpsShown;")));
     ASSERT_FALSE(facts.contains(QStringLiteral("m_playbackFpsEmaFrameMs")));
-    // Written at the gate (beside m_pFpsStatus) and at the reset, nowhere else.
-    ASSERT_EQ(2, static_cast<int>(source.count(QStringLiteral("m_playbackInfoFpsShown = "))));
+    // Written at the gate (beside m_pFpsStatus), at the reset, and (r7 pass 11 A1) zeroed by the Play toggle, nowhere else.
+    ASSERT_EQ(3, static_cast<int>(source.count(QStringLiteral("m_playbackInfoFpsShown = "))));
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackInfoFpsShown = smoothedFps;")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackInfoFpsShown = 0.0;")));
     const QString indicator = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackQualityIndicator("));

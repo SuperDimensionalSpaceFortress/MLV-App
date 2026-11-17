@@ -1951,6 +1951,26 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "return msSinceLastDraw < 0 || msSinceLastDraw > kFpsMeterStallMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r7 (adversary pass 9 A1): fpsMeterStalled() decides when the status-bar fps meter and the fullscreen corner rate read 0 and restart. msSinceLastDraw is a wall-clock QTime::msecsTo() draw age, so a negative value (midnight wrap, clock step back) is treated as stalled like one past 500 ms. A display reset for the fps text and its stored-label repaint, never proof that a stage ran or a frame rendered.",
+      "lines": [
+        30
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "return msSinceLastUpdate < 0 || msSinceLastUpdate >= kFpsTextUpdateMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "LOOK-LABEL-PLAYBACK-INFO-1 r7 (adversary pass 9 A1 sibling): fpsTextUpdateDue() is the 250 ms refresh throttle of the status-bar fps text and the corner label's rate snapshot. A negative wall-clock age (midnight wrap) counts as due so the text is not held for a day. It chooses only when the displayed rate string is re-rendered, never whether work ran.",
+      "lines": [
+        37
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackDecodeRenderOverlap.h",
       "anchor": "return renderBusyMs > 0.0 ? overlapMs / renderBusyMs : 0.0 ;",
       "class": "division_guard",
