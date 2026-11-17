@@ -2148,6 +2148,93 @@ if ($fnLoaded -and (Test-Has 'Get-CredentialHitLine' 'r19 p22')) {
     Assert-That ($null -ne (Get-Variable -Scope Script -Name ImportBeforeAsideRestoreHook -ErrorAction SilentlyContinue)) 'r19 p22 A6 import: the rollback seam variable is initialised (strict mode would throw on an unset one)'
 }
 
+# ================================================================ r20 (head 58e213a5): sol r19 INV-1 (lease remote comparator) and INV-12 (Clone set-upstream exit)
+# INV-1: the repository PATH compares ordinally and a '.git' suffix is significant; only the scheme spelling (scp-like vs ssh://) and the host name (case-insensitive) are
+# normalised, and a spelling that cannot be normalised with certainty compares UNEQUAL. github.com (documented case-insensitive, '.git' optional) keeps its own rule.
+if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r20 INV-1')) {
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/Lease.git' 'ssh://git@nas.example/repos/lease.git')) 'r20 INV-1 url: ssh:// paths that differ only in case are two repositories'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:repos/Lease.git' 'git@nas.example:repos/lease.git')) 'r20 INV-1 url: scp-like paths that differ only in case are two repositories'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/lease.git' 'ssh://git@nas.example/repos/lease')) 'r20 INV-1 url: a .git suffix is significant on a non-GitHub host'
+    Assert-That (-not (Test-GitRemoteUrlSame 'nas.example:repos/Lease.git' 'nas.example:repos/lease.git')) 'r20 INV-1 url: a user-less scp-like host:path is compared ordinally too'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:/repos/lease.git' 'git@nas.example:repos/lease.git')) 'r20 INV-1 url: an absolute and a home-relative scp-like path are not the same repository'
+    Assert-That (-not (Test-GitRemoteUrlSame 'ssh://alice@nas.example/repos/lease.git' 'ssh://bob@nas.example/repos/lease.git')) 'r20 INV-1 url: two ssh users are not normalised to one'
+    Assert-That (-not (Test-GitRemoteUrlSame '/srv/git/Lease' '/srv/git/lease')) 'r20 INV-1 url: POSIX local paths that differ in case are two repositories'
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://nas.example/repos/Lease.git' 'https://nas.example/repos/lease.git')) 'r20 INV-1 url: https paths on a non-GitHub host compare ordinally'
+    Assert-That (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r20 INV-1 url control: an identical URL is the same repository'
+    Assert-That (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r20 INV-1 url control: the scp-like and ssh:// spellings of one path are the same repository'
+    Assert-That (Test-GitRemoteUrlSame 'ssh://git@NAS.Example/repos/lease.git' 'ssh://git@nas.example/repos/lease.git') 'r20 INV-1 url control: a host name differing only in case is the same repository'
+    Assert-That (Test-GitRemoteUrlSame 'git@GitHub.com:Owner/Repo.git' 'https://github.com/owner/repo') 'r20 INV-1 url control: github.com keeps its case-insensitive, .git-optional rule'
+}
+if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r20 INV-1')) {
+    foreach ($r20pair in @(
+            @('ssh://git@nas.example/repos/Lease.git', 'ssh://git@nas.example/repos/lease.git'),
+            @('git@nas.example:repos/Lease.git', 'git@nas.example:repos/lease.git'),
+            @('ssh://git@nas.example/repos/lease.git', 'ssh://git@nas.example/repos/lease'))) {
+        $r20ws = New-Scratch ('r20-inv1-' + [Math]::Abs($r20pair[1].GetHashCode()))
+        $r20repo = Join-Path $r20ws 'repo'; [void][IO.Directory]::CreateDirectory($r20repo); & git -C $r20repo init -q 2>$null
+        & git -C $r20repo remote add fork $r20pair[0]; & git -C $r20repo remote set-url --push fork $r20pair[1]   # configuration only: no network is touched
+        $savedRepo = $script:Repo; $savedTemp = $env:TEMP; $savedLog = $script:LogFile; $savedName = $GitName; $savedEmail = $GitEmail
+        $script:Repo = $r20repo; $Repo = $r20repo; $env:TEMP = New-Scratch ('r20-inv1-temp-' + [Math]::Abs($r20pair[1].GetHashCode())); $script:LogFile = Join-Path $r20ws 'lease.log'
+        $GitName = 'r20 test'; $script:GitName = 'r20 test'; $GitEmail = 'r20@example.invalid'; $script:GitEmail = 'r20@example.invalid'
+        $r20ident = @{}; foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { $r20ident[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, 'r20 test') }
+        $r20err = ''
+        try { Set-HubLease -Holder 'TEST-HOST' -Current @{ Exists = $false; Sha = ''; Holder = '' } -Reason 'r20 INV-1' *>&1 | Out-Null } catch { $r20err = $_.Exception.Message }
+        finally {
+            $script:Repo = $savedRepo; $Repo = $savedRepo; $env:TEMP = $savedTemp; $script:LogFile = $savedLog; $GitName = $savedName; $script:GitName = $savedName; $GitEmail = $savedEmail; $script:GitEmail = $savedEmail
+            foreach ($n in $r20ident.Keys) { [Environment]::SetEnvironmentVariable($n, $r20ident[$n]) }
+        }
+        Assert-That ($r20err -match 'LEASE_PUSH_URL_DIFFERS') "r20 INV-1 lease: fetch $($r20pair[0]) / push $($r20pair[1]) is refused before any push" $r20err
+    }
+}
+# INV-12: a non-zero exit of 'git branch --set-upstream-to=fork/master master' is a recorded typed failure and Clone exits non-zero (the exit decision is
+# 'Failures.Count -gt 0'). Real git over local bare repositories gives the exit 128; a function stub gives the exit 1; a repository with a master gives the control.
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r20 INV-12')) {
+    $r20ws2 = New-Scratch 'r20-inv12'
+    $r20protoOuter = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')   # local bare repositories only; restored at the end of the section
+    $r20fork = Join-Path $r20ws2 'fork.git'; $r20up = Join-Path $r20ws2 'up.git'; $r20seed = Join-Path $r20ws2 'seed'
+    & git init -q --bare -b master $r20fork 2>$null; & git init -q --bare -b master $r20up 2>$null   # HEAD names master, so a clone of the fork checks out a local master
+    [void][IO.Directory]::CreateDirectory($r20seed); & git -C $r20seed init -q -b master 2>$null
+    [IO.File]::WriteAllText((Join-Path $r20seed 'a.txt'), 'a')
+    & git -C $r20seed add a.txt 2>$null
+    $r20idv = [ordered]@{ GIT_AUTHOR_NAME = 'r20 test'; GIT_AUTHOR_EMAIL = 'r20@example.invalid'; GIT_COMMITTER_NAME = 'r20 test'; GIT_COMMITTER_EMAIL = 'r20@example.invalid' }   # env outranks -c, and an earlier section may have left an empty one
+    $r20idSaved = @{}; foreach ($n in $r20idv.Keys) { $r20idSaved[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, $r20idv[$n]) }
+    try { $r20commitOut = (& git -C $r20seed -c commit.gpgsign=false commit -q --no-verify -m seed 2>&1 | Out-String) } finally { foreach ($n in $r20idSaved.Keys) { [Environment]::SetEnvironmentVariable($n, $r20idSaved[$n]) } }
+    $r20pushOut = (& git -C $r20seed push -q --no-verify $r20fork master 2>&1 | Out-String)   # --no-verify: a global pre-push guard must not judge a scratch seed
+    $r20commitOut = "$r20commitOut $r20pushOut"
+    Assert-That ((("$(& git -C $r20fork rev-parse --verify --quiet refs/heads/master 2>$null)").Trim()) -match '^[0-9a-f]{40}') 'r20 INV-12 fixture: the fork has a master commit' $r20commitOut
+    $r20doc = Join-Path $r20ws2 'doctrine'; [void][IO.Directory]::CreateDirectory($r20doc); & git -C $r20doc init -q 2>$null; & git -C $r20doc remote add origin $DoctrineUrl
+    $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo; $savedLog = $script:LogFile; $savedFork = $script:ForkUrl; $savedUp = $script:UpstreamUrl
+    $script:ForkUrl = $r20fork; $ForkUrl = $r20fork; $script:UpstreamUrl = $r20up; $UpstreamUrl = $r20up
+    $script:DoctrineRepo = $r20doc; $DoctrineRepo = $r20doc
+    $r20gitExe = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+    foreach ($r20case in @(
+            @{ Name = 'exit 128 (real git: no local master)'; Has = $false; Stub = $false; Expect = $true },
+            @{ Name = 'exit 1 (stub)'; Has = $true; Stub = $true; Expect = $true },
+            @{ Name = 'exit 0 control (a local master exists)'; Has = $true; Stub = $false; Expect = $false })) {
+        $r20repo2 = Join-Path $r20ws2 ('repo-' + ($r20case.Name -replace '[^a-z0-9]', ''))
+        if ($r20case.Has) { & git clone -q --origin fork $r20fork $r20repo2 2>$null }
+        else { [void][IO.Directory]::CreateDirectory($r20repo2); & git -C $r20repo2 init -q -b other 2>$null; & git -C $r20repo2 remote add fork $r20fork }
+        $script:Repo = $r20repo2; $Repo = $r20repo2; $script:LogFile = Join-Path $r20ws2 ('clone-' + ($r20case.Name -replace '[^a-z0-9]', '') + '.log')
+        $script:Failures.Clear()
+        if ($r20case.Stub) {
+            $global:R20GitExe = $r20gitExe
+            function global:git { if ($args -contains '--set-upstream-to=fork/master') { $global:LASTEXITCODE = 1; return }; & $global:R20GitExe @args }
+        }
+        $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')
+        try { Invoke-PhaseClone *>&1 | Out-Null } catch { } finally {
+            [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto)
+            if ($r20case.Stub) { Remove-Item -Path 'Function:\git' -Force -ErrorAction SilentlyContinue }
+            if (Get-Command -Name git -CommandType Function -ErrorAction SilentlyContinue) { Assert-That $false 'r20 INV-12 fixture: the git function stub was removed' }
+        }
+        $r20hit = @($script:Failures | Where-Object { "$_" -like 'CLONE_TRACKING_FAILED*' }).Count
+        if ($r20case.Expect) { Assert-That ($r20hit -eq 1) "r20 INV-12 clone: set-upstream $($r20case.Name) is a recorded CLONE_TRACKING_FAILED failure (so setup exits non-zero)" ($script:Failures -join ',') }
+        else { Assert-That ($r20hit -eq 0 -and $script:Failures.Count -eq 0) "r20 INV-12 clone: set-upstream $($r20case.Name) records no failure" ($script:Failures -join ',') }
+        $script:Failures.Clear()
+    }
+    $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog; $script:ForkUrl = $savedFork; $ForkUrl = $savedFork; $script:UpstreamUrl = $savedUp; $UpstreamUrl = $savedUp
+    [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $r20protoOuter)
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

@@ -686,8 +686,16 @@ function Invoke-PhaseClone {
             if ($remotes -notcontains 'origin') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'origin', $UpstreamUrl)) }
             [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', 'core.longpaths', 'true'))
             [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', 'fork'))
-            [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', 'origin') -AllowFail)
-            [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'branch', '--set-upstream-to=fork/master', 'master') -AllowFail)
+            # r20 sibling: the upstream (origin) fetch stays non-fatal by design (fork is the base), but its failure is now said, not discarded
+            $originCode = Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', 'origin') -AllowFail
+            if ($originCode -ne 0) { Write-Log "CLONE_ORIGIN_FETCH_FAILED git fetch origin exited $originCode (non-fatal: fork is the base; re-run -Phase Clone when the upstream is reachable)" 'WARN' }
+            # r20 (sol r19 INV-12; r18 OPEN A7): 'master tracks fork/master' is promised by this step, so a non-zero exit (1, or 128 'branch master does not exist') is a recorded
+            # typed failure (the setup exits non-zero); it used to be discarded with -AllowFail and the run reported done / exit 0
+            $trackCode = Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'branch', '--set-upstream-to=fork/master', 'master') -AllowFail
+            if ($trackCode -ne 0) {
+                $script:Failures.Add("CLONE_TRACKING_FAILED $Repo")
+                throw "CLONE_TRACKING_FAILED $Repo 'git branch --set-upstream-to=fork/master master' exited $trackCode (the local master does not track fork/master; create or check out master, then re-run -Phase Clone)"
+            }
         }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $DoctrineRepo '.git'))) {
@@ -722,23 +730,46 @@ function Get-RedactedRemoteUrl {
     return (ConvertTo-RedactedUrlText $u)   # the one free-text rule, defined beside Write-Log (it runs before this point of the script is reached)
 }
 
-# r15 pass 13 A5: true when two git remote URLs name the same repository: compared case-insensitively after the GitHub ssh forms ('git@github.com:o/r',
-# 'ssh://git@github.com/o/r') are written as 'https://github.com/o/r' and a trailing '.git' or '/' is dropped. An empty URL never matches.
+# r15 pass 13 A5: true when two git remote URLs name the same repository (r20: exactly; see below). An empty or unparseable URL never matches.
+#
+# r20 (sol r19 INV-1; hub ruling): the lease reads one repository and pushes to another when this says two URLs are the same, so equality is EXACT on the repository: the PATH
+# compares ordinally (case-sensitive) and a '.git' suffix or a trailing slash is significant. Only the scheme spelling (scp-like 'host:path' = 'ssh://host/path'; a scp-like
+# path is read as absolute, so 'host:/p' is '//p' and is not 'host:p') and the host name (case-insensitive) are normalised, and the ssh user is kept (a relative scp-like path
+# is relative to that user's home). A spelling that cannot be normalised with certainty (another scheme, a port, a query) compares UNEQUAL: the lease guard then refuses.
+# Two documented exceptions: github.com (case-insensitive owner/repo, '.git' optional, https and 'git@' ssh the same repository) and a Windows drive or UNC local path (NTFS
+# is case-insensitive; separators and a trailing slash do not change it). Any other local path (a POSIX path, 'file://') is ordinal.
 function Test-GitRemoteUrlSame {
     param([string]$A, [string]$B)
     $norm = {
         param($u)
         $s = "$u".Trim()
-        $s = $s -replace '^(?i)git@github\.com:', 'https://github.com/' -replace '^(?i)ssh://git@github\.com/', 'https://github.com/'
-        # r19 pass 21 A2: a LOCAL path (no 'scheme://', not an scp-like 'user@host:path'; 'file://' counts as local) names a directory exactly: '.git', '?x' and '#x' are part of it,
-        # so 'C:/repos/lease' and 'C:/repos/lease.git' are two repositories. Only separators, case and a trailing slash are normalised.
-        if (($s -notmatch '^(?i)(?!file://)[a-z][a-z0-9+.\-]*://') -and ($s -notmatch '^[^/\\\s]+@[^/\\\s]+:')) {
-            return (($s -replace '\\', '/') -replace '/+$', '').ToLowerInvariant()
+        $scheme = ''; $user = ''; $hostName = ''; $path = ''
+        $mUrl = [regex]::Match($s, '^(?i)(?!file://)([a-z][a-z0-9+.\-]*)://([^/]*)(.*)$')
+        # scp-like [user@]host:path (git: no '/' before the first ':'); a host of one letter is a Windows drive ('C:/repos'), never a host
+        $mScp = [regex]::Match($s, '^(?:([^/\\\s]+)@)?([^/\\\s:@]{2,}):(.*)$')
+        if ($mUrl.Success) {
+            $scheme = $mUrl.Groups[1].Value.ToLowerInvariant(); $auth = $mUrl.Groups[2].Value; $path = $mUrl.Groups[3].Value
+            $at = $auth.LastIndexOf('@')
+            if ($at -ge 0) { $user = $auth.Substring(0, $at); $hostName = $auth.Substring($at + 1) } else { $hostName = $auth }
+        } elseif ($mScp.Success -and $s -notmatch '^(?i)file:') {
+            $scheme = 'ssh'; $user = $mScp.Groups[1].Value; $hostName = $mScp.Groups[2].Value; $path = '/' + $mScp.Groups[3].Value
+        } else {
+            # r19 pass 21 A2: a LOCAL path names a directory exactly: '.git', '?x' and '#x' are part of it, so 'C:/repos/lease' and 'C:/repos/lease.git' are two repositories.
+            if ($s -match '^(?:[a-zA-Z]:[\\/]|\\\\)') { return (($s -replace '\\', '/') -replace '/+$', '').ToLowerInvariant() }   # a drive or UNC path: separators, case, trailing slash
+            return ($s -replace '/+$', '')   # r20: any other local path is ordinal
         }
-        $s = $s -replace '^(?i)([a-z][a-z0-9+.\-]*://)[^/\s]*@', '$1'   # r15 pass 14 A2: a user / token part does not change which repository a URL names (r17 F2: up to the last '@')
-        $s = $s -replace '[?#].*$', ''   # r17 F2: nor does a query string or a fragment
-        $s = $s -replace '/+$', '' -replace '(?i)\.git$', ''
-        return $s.ToLowerInvariant()
+        $hostName = $hostName.ToLowerInvariant()
+        if (-not $hostName -or $hostName -match '[\s]') { return '' }
+        # github.com: documented case-insensitive and '.git'-optional; https (any userinfo is a token) and the 'git@' ssh forms name one repository
+        if ($hostName -ceq 'github.com' -and (($scheme -in @('http', 'https')) -or ($scheme -in @('ssh') -and $user -ceq 'git'))) {
+            $gp = ($path -replace '[?#].*$', '').Trim('/') -replace '(?i)\.git$', ''
+            if (-not $gp) { return '' }
+            return ('https://github.com/' + $gp).ToLowerInvariant()
+        }
+        if (-not $path -or $path -eq '/') { return '' }
+        if ($scheme -eq 'ssh') { return "ssh://$user@$hostName$path" }
+        if ($scheme -in @('http', 'https')) { return "${scheme}://$hostName$path" }   # a user / token part does not change which repository an https URL names
+        return "${scheme}://$user@$hostName$path"   # any other scheme: kept whole (user included); equal only when spelled identically
     }
     $x = & $norm $A; $y = & $norm $B
     return ($x.Length -gt 0 -and $x -ceq $y)
@@ -1202,7 +1233,8 @@ function Get-StagedFileVerdictDetail {
         $rs = [IO.File]::OpenRead($File.FullName)
         try {
             $chunk = [byte[]]::new(65536)
-            while (($got = $rs.Read($chunk, 0, $chunk.Length)) -gt 0) { $ms.Write($chunk, 0, $got); if ($ms.Length -gt $MaxScanBytes) { break } }
+            # r20 (sol r19 advisory): each read asks for no more than the bytes still allowed plus one, so at most limit+1 bytes are ever read (no 65536-byte chunk past a small limit)
+            while ($ms.Length -le $MaxScanBytes -and (($got = $rs.Read($chunk, 0, [int][Math]::Min([long]$chunk.Length, $MaxScanBytes + 1 - $ms.Length))) -gt 0)) { $ms.Write($chunk, 0, $got) }
         } finally { $rs.Dispose() }
     } catch { return @{ Why = 'unreadable'; Line = 0 } }
     if ($ms.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
