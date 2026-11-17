@@ -387,6 +387,10 @@ TEST(PlaybackInfoLabel, R2A1DeferredRelabelHasItsOwnMonotonicGate)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString flush = functionBody(source, QStringLiteral("void MainWindow::flushPlaybackInfoIfDue("));
     ASSERT_TRUE(flush.contains(QStringLiteral("playback_info_label::deferredRelabelDue(")));
+    // r6: the call's whole bool argument list (dirty, clockValid), so an inverted argument fails here.
+    ASSERT_TRUE(flush.contains(QStringLiteral(
+        "if( playback_info_label::deferredRelabelDue( m_playbackInfoInputsDirty, clockValid,")));
+    ASSERT_TRUE(flush.contains(QStringLiteral("clockValid ? m_playbackInfoRelabelClock.elapsed() : 0 ) )")));
     ASSERT_TRUE(flush.contains(QStringLiteral("m_playbackInfoRelabelClock.elapsed()")));
     ASSERT_FALSE(flush.contains(QStringLiteral("QTime")));
     ASSERT_TRUE(flush.contains(QStringLiteral("updatePlaybackInfoLabel();")));
@@ -430,6 +434,15 @@ TEST(PlaybackInfoLabel, R2P2A1EveryPlayingRelabelPassesTheOneGate)
     ASSERT_TRUE(deferAt > gateAt);
     ASSERT_TRUE(startAt > deferAt);
     ASSERT_TRUE(update.indexOf(QStringLiteral("ui->actionPlay->isChecked()")) < startAt);
+    // r6: the call's whole bool argument list (playing, clockValid), so an inverted argument fails here.
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "if( !forceWithdrawal && playback_info_label::playingRelabelDeferred( ui->actionPlay->isChecked(), relabelClockValid,")));
+    ASSERT_TRUE(update.contains(QStringLiteral("relabelClockValid ? m_playbackInfoRelabelClock.elapsed() : 0 ) )")));
+    // r6: compose's includeFps. The overlay carries the rate (true); the status-bar twin sits beside the fps meter (false).
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "? playback_info_label::compose( facts, m_playbackInfoToggles, true ) : QString();")));
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "const QString twin = clipLoaded ? playback_info_label::compose( facts, m_playbackInfoToggles, false ) : QString();")));
 }
 
 // r2 pass-2 A2 (1fbfa178): starting Play from a paused frame (no rate measured yet) made repaintNow true, so the GPU window
@@ -551,6 +564,15 @@ TEST(PlaybackInfoLabel, R3P1A1ClampedRequestShowsThePresentedScale)
     const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
     ASSERT_TRUE(facts.contains(QStringLiteral("playback_info_label::presentedScaleBelongsToRequest(")));
     ASSERT_TRUE(facts.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactorPolicy")));
+    // r6: each call site's whole argument list, anchored on its own statement (the contextValid bool, then the asked scale).
+    ASSERT_TRUE(facts.contains(QStringLiteral(
+        "facts.presentedValid = playback_info_label::presentedScaleBelongsToRequest(\n"
+        "        m_lastPresentedRequestContextValid, m_lastPresentedRequestContext.playbackScaleFactorPolicy,\n"
+        "        facts.requestedScale, activeScale );")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "const bool presentedBelongs = playback_info_label::presentedScaleBelongsToRequest(\n"
+        "            m_lastPresentedRequestContextValid, m_lastPresentedRequestContext.playbackScaleFactorPolicy,\n"
+        "            requestedScale, activeScale );")));
     ASSERT_FALSE(facts.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactor ==")));
     const QString indicator = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackQualityIndicator("));
     ASSERT_TRUE(indicator.contains(QStringLiteral("playback_info_label::presentedScaleBelongsToRequest(")));

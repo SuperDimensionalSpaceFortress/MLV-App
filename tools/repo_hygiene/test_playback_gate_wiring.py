@@ -231,6 +231,22 @@ class PlaybackGatePolicyWiringTest(unittest.TestCase):
             saw_increment,
             "expected at least one increment site for %r" % DECODE_COUNTER_NAME)
 
+    def test_playback_info_label_compose_calls_pin_their_include_fps_argument(self):
+        # LOOK-LABEL-PLAYBACK-INFO-1 r6 (POLICY_MUTANT_SURVIVED, fast-suites-for-diff): the two
+        # playback_info_label::compose( facts, toggles, includeFps ) calls in updatePlaybackInfoLabel must keep their
+        # bool: the fullscreen overlay carries the rate (true), the status-bar twin sits beside the fps meter and
+        # drops it (false). The argument has no identifier, so a C++ literal pin cannot name it; these whole-statement
+        # patterns fail on a flipped bool.
+        source = MAIN_WINDOW_CPP.read_text(encoding="utf-8")
+        self.assertIsNotNone(re.search(
+            r"const QString overlay = \( clipLoaded && m_lookLabelFullscreenShown \)\n"
+            r"\s+\? playback_info_label::compose\( facts, m_playbackInfoToggles, true \) : QString\(\);",
+            source))
+        self.assertIsNotNone(re.search(
+            r"const QString twin = clipLoaded \? playback_info_label::compose\( facts, m_playbackInfoToggles, false \)"
+            r" : QString\(\);",
+            source))
+
 
 if __name__ == "__main__":
     unittest.main()
