@@ -1266,6 +1266,165 @@ class R4DepthTests(unittest.TestCase):
         self.assertLessEqual(render_roadmap.MAX_NESTING, 100)   # a bound that would not stop the 3,000-deep input is no bound
 
 
+# (r5, review-pr835-opus-r4 blocker + hardening) master's renderer, embedded as it stood on fork/master before this card. The budget
+# window tests measure "fits at base" against THIS copy, never against the renderer under test: a change to the shared header or to
+# any other shared text moves the new renderer and this copy apart, which turns them red. Stamps in these boards are plain Z-stamps,
+# where master's string sort and the new instant sort agree.
+MASTER_HEADER = """\
+# MLV-App product roadmap
+
+Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`
+(schema `mlv-app/card-queue/v1`), the live dispatch surface. It replaces the earlier
+mirror of the frozen dual-lane `queue.json`, whose 16 rows had mostly landed. The
+card-queue file lives under `.claude-state/hub-autopilot/`, which is gitignored and absent
+from every hosted checkout, so this file is the only place a reviewer without local state
+can see the open product backlog. Where the two disagree, `card-queue.json` wins:
+re-render, do not edit by hand. The hub checks freshness with `--check`.
+
+Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
+hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
+not classified are not counted either, even when the card name says PLAYBACK.
+"""
+
+
+def master_render(data: dict) -> str:
+    """fork/master's render_roadmap.render, verbatim apart from inlined helpers (_day, _landed_stamp, _stats, _note, _drain_line)."""
+    import re as _re
+    from datetime import datetime as _dt, timedelta as _td
+    kinds = ("product", "playback")
+    closed = ("merged", "parked")
+    declared = _re.compile(r"declared@(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
+
+    def day(stamp: str) -> date:
+        return _dt.strptime(stamp[:10], "%Y-%m-%d").date()
+
+    def landed_stamp(r: dict) -> str:
+        if r.get("merged_utc"):
+            return r["merged_utc"]
+        stamps = [r["source_ledger_stamp"]]
+        if r.get("pinned_utc"):
+            stamps.append(r["pinned_utc"])
+        stamps += declared.findall(r.get("evidence") or "")
+        return max(stamps)
+
+    def sort_key(r: dict) -> tuple:
+        return (r["priority"], r["source_ledger_stamp"], r["card"])
+
+    def chain(r: dict) -> str:
+        oc = r.get("order_chain")
+        if not oc:
+            return "-"
+        pred = oc.get("predecessor")
+        return "%s #%s %s" % (oc["chain"], oc["index"], "after " + pred if pred else "first")
+
+    def note(r: dict) -> str:
+        text = " ".join((r.get("notes") or "").split())
+        if not text:
+            return "(no note)"
+        return text if len(text) <= 140 else text[:137] + "..."
+
+    def drain_line(open_n: int, landed_n: int, queued_n: int) -> str:
+        if open_n == 0:
+            return "product is drained (0 open)"
+        if queued_n >= landed_n:
+            return "does not drain (queued >= landed)"
+        net = landed_n - queued_n
+        return "at the 7-day mean, product drains in %d days" % (-(-open_n * 7 // net))
+
+    rows = [r for r in data["rows"] if r["kind"] in kinds]
+    open_rows = sorted((r for r in rows if r["state"] not in closed), key=sort_key)
+    parked = sorted((r for r in rows if r["state"] == "parked"), key=sort_key)
+    last = day(data["generated_utc"])
+    days = [last - _td(days=6 - i) for i in range(7)]
+    landed = {d: 0 for d in days}
+    queued = {d: 0 for d in days}
+    for r in rows:
+        d = day(r["source_ledger_stamp"])
+        if d in queued:
+            queued[d] += 1
+        if r["state"] == "merged":
+            d = day(landed_stamp(r))
+            if d in landed:
+                landed[d] += 1
+    landed_total, queued_total = sum(landed.values()), sum(queued.values())
+    scope = []
+    for n in data.get("scope_notes") or []:
+        scope += ["**%s.** %s" % (n["title"], n["text"]), ""]
+    out = [MASTER_HEADER, "generated_from: %s" % data["generated_utc"], "", "## Open product and playback cards", "", *scope]
+    out.append("| P | card | kind | state | queued since | order_chain |")
+    out.append("|---|---|---|---|---|---|")
+    for r in open_rows:
+        out.append("| %s | %s | %s | %s | %s | %s |" % (
+            r["priority"], r["card"], r["kind"], r["state"], r["source_ledger_stamp"][:10], chain(r)))
+    if not open_rows:
+        out.append("| - | (none open) | - | - | - | - |")
+    out += ["", "## Drain", "", "product+playback open: %d" % len(open_rows),
+            "", "Window: the %d UTC days ending %s (the last day is partial)." % (7, last.isoformat()),
+            "Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp "
+            "(approximate: a lower bound on the merge time, not a measurement); "
+            "queued = rows of any state by `source_ledger_stamp`.", "",
+            "| day (UTC) | landed | queued |", "|---|---|---|"]
+    for d in days:
+        out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
+    out.append("| total | %d | %d |" % (landed_total, queued_total))
+    out += ["", drain_line(len(open_rows), landed_total, queued_total), "", "## Parked with reason", "", *scope]
+    for r in parked:
+        out.append("- %s (P%s): %s" % (r["card"], r["priority"], note(r)))
+    if not parked:
+        out.append("- (none parked)")
+    return "\n".join(out) + "\n"
+
+
+class R5BaseWindowTests(unittest.TestCase):
+    """OWNER-ASK-PARK-GUARD-1 r5 (review-pr835-opus-r4 blocker): the last tier claims master's output, so a product-only board that fit the
+    20000-byte budget on master must fit here and, in the window where every owner-aware tier is over, be master's file byte for byte."""
+
+    STAMP = "2026-10-20T00:00:00Z"
+
+    def board(self, note_len: int, *extra: dict) -> dict:
+        rows = [row("PRODUCT-%03d" % i, "queued", self.STAMP) for i in range(300)]
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z", "rows": rows + list(extra),
+                "scope_notes": [{"title": "S", "text": "x" * note_len}]}
+
+    def sweep(self) -> list[int]:
+        """Note lengths whose board fits at master and is over budget as the new renderer's collapsed tier (header and owner section)."""
+        found = []
+        for n in range(300, 900):
+            data = self.board(n)
+            if (render_roadmap._budget_size(master_render(data)) <= ROADMAP_BUDGET_BYTES
+                    and render_roadmap._budget_size(render_roadmap._render(data, 0, collapsed=True)) > ROADMAP_BUDGET_BYTES):
+                found.append(n)
+        return found
+
+    def test_the_base_renderer_copy_matches_master_on_a_plain_board(self) -> None:
+        # the embedded copy is the oracle: pin it to the renderer on a board where the owner features add nothing
+        data = load_fixture()
+        data["rows"] = [r for r in data["rows"] if r.get("origin") != "owner" and r["kind"] in ("product", "playback")]
+        self.assertEqual(render_roadmap._render(data, 0, collapsed=True, bare=True), master_render(data))
+
+    def test_a_board_that_fit_at_master_still_fits_and_is_master_s_file(self) -> None:
+        window = self.sweep()
+        self.assertTrue(window, "the window master fit and the owner-aware tiers did not must exist for this test to mean anything")
+        for n in window:
+            data = self.board(n)
+            with self.subTest(note_len=n):
+                text = render_roadmap.render(data)
+                self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+                self.assertEqual(text, master_render(data))
+
+    def test_every_board_that_fit_at_master_fits_here(self) -> None:
+        for n in range(300, 900):
+            data = self.board(n)
+            if render_roadmap._budget_size(master_render(data)) <= ROADMAP_BUDGET_BYTES:
+                with self.subTest(note_len=n):
+                    self.assertLessEqual(render_roadmap._budget_size(render_roadmap.render(data)), ROADMAP_BUDGET_BYTES)
+
+    def test_the_header_text_is_master_s_in_the_bare_tier_only(self) -> None:
+        data = self.board(100)
+        self.assertTrue(render_roadmap._render(data, 0, collapsed=True, bare=True).startswith(MASTER_HEADER))
+        self.assertFalse(render_roadmap._render(data, 25).startswith(MASTER_HEADER))   # the owner-aware header says owner asks are shown
+
+
 class R4BudgetTests(unittest.TestCase):
     """OWNER-ASK-PARK-GUARD-1 r4 pass 1 A1 (review-adversary-OWNER-ASK-PARK-GUARD-1-r4-7304a0c2). test_roadmap_queue_parity.py holds
     docs/roadmap.md to 20000 bytes by st_size, so a Windows checkout (core.autocrlf=true) counts every line break as two bytes. The
@@ -1297,8 +1456,9 @@ class R4BudgetTests(unittest.TestCase):
         found = []
         for n in range(300, 900):
             data = self.window_board(n)
+            # r5: "fits at base" is measured on the embedded copy of master's renderer, not on the renderer under test
             if (render_roadmap._budget_size(render_roadmap._render(data, 0, collapsed=True)) > ROADMAP_BUDGET_BYTES
-                    and render_roadmap._budget_size(render_roadmap._render(data, 0, collapsed=True, bare=True)) <= ROADMAP_BUDGET_BYTES):
+                    and render_roadmap._budget_size(master_render(data)) <= ROADMAP_BUDGET_BYTES):
                 found.append(n)
         return found
 
