@@ -168,6 +168,8 @@ Assert-That ((Get-ShareRootAccess -Root $fakeRoot -Probe $deepProbe).State -ceq 
 $s = ''
 try { Invoke-Expression (Get-ScriptFunctionText $nightly 'Stop-ShareUnreachable') } catch { Assert-That $false 'A13 nightly: Stop-ShareUnreachable is not defined' $_.Exception.Message }
 Invoke-Expression (Get-ScriptFunctionText $nightly 'Read-Share')
+# r18 merge of #814: Read-Share now takes its bound from Get-ProbeSec (min(-ProbeTimeoutSec, what is left of the cap)); the real one is loaded, the deadline is 1 h out.
+Invoke-Expression (Get-ScriptFunctionText $nightly 'Get-ProbeSec')
 $share = $fakeRoot
 $ProbeTimeoutSec = 5
 $shareRootModule = Join-Path $here 'ShareRootAccess.psm1'
