@@ -364,8 +364,8 @@ def _stamp_problem(value: object) -> str:
         except ValueError:
             return "no such date"
         return ""
-    m = _STAMP_RX.match(value.strip())
-    if not m:
+    m = _STAMP_RX.fullmatch(value)   # (r2 pass-5 A2) the stamp as written: a CR, LF or space around it is not stripped into validity
+    if not m or "\n" in value:
         return "not a date or a date-time stamp"
     y, mo, d, h, mi = (int(m.group(i)) for i in range(1, 6))
     if h > 23 or mi > 59 or int(m.group(6) or 0) > 59:
@@ -386,6 +386,14 @@ def _stamp_problem(value: object) -> str:
     return ""
 
 
+def _utf8_ok(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _valid_stamp(value: object) -> bool:
     return not _stamp_problem(value)
 
@@ -398,6 +406,8 @@ def _check_row(path: Path, i: int, r: dict) -> None:
     for key in ("evidence", "notes", "origin"):
         if r.get(key) is not None and not isinstance(r[key], str):
             _die("%s has a non-string %s" % (where, key))
+        if isinstance(r.get(key), str) and not _utf8_ok(r[key]):   # (r2 pass-5 A3) a lone surrogate cannot be written as UTF-8
+            _die("%s has a %s that is not valid UTF-8 text (a lone surrogate)" % (where, key))
     res = r.get("resolution")   # r2 A1: a closed vocabulary; null is the same as absent (no resolution, so an owner ask stays owed)
     if res is not None and not (isinstance(res, str) and res in RESOLUTIONS):
         _die("%s has a bad resolution: %r (want one of %s, or none)" % (where, res, "|".join(RESOLUTIONS)))
@@ -426,7 +436,7 @@ def _check_scope_notes(path: Path, notes: object) -> None:
     if not isinstance(notes, list):
         _die("%s has a scope_notes that is not a list: %r" % (path, notes))
     for i, n in enumerate(notes):
-        if not isinstance(n, dict) or not all(isinstance(n.get(k), str) and n[k].strip() for k in ("title", "text")):
+        if not isinstance(n, dict) or not all(isinstance(n.get(k), str) and n[k].strip() and _utf8_ok(n[k]) for k in ("title", "text")):
             _die("%s scope_notes entry %d needs a non-empty string title and text: %r" % (path, i, n))
 
 

@@ -881,5 +881,36 @@ class R2Pass4Tests(R2AdversaryTests):
                 self.assertEqual(self.load_code(self.board(row("Q-1", "merged", stamp)))[0], 0)
 
 
+class R2Pass5Tests(unittest.TestCase):
+    """r2 pass 5 (review-adversary-OWNER-ASK-PARK-GUARD-1-r2-e59a30f8) A2/A3: each finding's input."""
+
+    def load_code(self, data: dict) -> int:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "q.json"
+            p.write_text(json.dumps(data), encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    render_roadmap._load(p)
+                    return 0
+                except SystemExit as exc:
+                    return exc.code
+
+    def board(self, generated: str = "2026-10-23T00:00:00Z", notes: str = "waits for #123") -> dict:
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": generated,
+                "rows": [row("OWNER-1", "parked", "2026-10-20T00:00:00Z", kind="hub-tooling", origin="owner", notes=notes)]}
+
+    def test_p5_a2_a_stamp_with_a_carriage_return_or_line_break_is_bad_input(self) -> None:
+        for g in ("\r2026-10-23T00:00:00Z", "2026-10-23T00:00:00Z\r", "2026-10-23T00:00:00\nZ", "2026-10-23T00:00:00Z\n", " 2026-10-23T00:00:00Z"):
+            with self.subTest(generated=g):
+                self.assertEqual(self.load_code(self.board(generated=g)), 2)
+        self.assertEqual(self.load_code(self.board()), 0)
+
+    def test_p5_a3_a_lone_surrogate_is_bad_input_not_an_encode_crash(self) -> None:
+        self.assertEqual(self.load_code(self.board(notes="\ud800")), 2)
+        data = self.board()
+        data["scope_notes"] = [{"title": "t", "text": "\udfff"}]
+        self.assertEqual(self.load_code(data), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
