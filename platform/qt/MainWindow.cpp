@@ -2967,7 +2967,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             if( fpsWasMeasured && m_lookLabelFullscreenShown && m_playbackInfoToggles.fps )
             {
                 m_playbackInfoRateWithdrawn = true;   // r2 pass-2 A2: the push that carries this withdrawal repaints at once
-                updatePlaybackInfoLabel();
+                updatePlaybackInfoLabel( true );      // r3 (adversary r2 c65933cb A2): at once, never deferred by the playing gate
             }
         }
     };
@@ -3122,6 +3122,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 // only when the string changes), and the receipt's sample of what the corner drew while playing.
                 // r1 (adversary A1): the snapshot every other hook composes, so none of them shows a newer rate.
                 m_playbackInfoFpsShown = smoothedFps;
+                // r3 (adversary r2 c65933cb A2): a measured rate is not a withdrawal: the relabel that carries it adds no paint.
+                m_playbackInfoRateWithdrawn = false;
                 // r2 A1: the new rate only marks the info dirty; the one monotonic gate relabels (<= 4 Hz for every cause).
                 if( m_lookLabelFullscreenShown && m_playbackInfoToggles.fps ) m_playbackInfoInputsDirty = true;
                 flushPlaybackInfoIfDue();
@@ -33708,12 +33710,13 @@ void MainWindow::updateLookLabel( void )
     const bool fullscreenShown =
         look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );
     if( text == m_lookLabelText && fullscreenShown == m_lookLabelFullscreenShown ) return;
+    const bool routeChanged = fullscreenShown != m_lookLabelFullscreenShown;
     m_lookLabelText = text;
     m_lookLabelFullscreenShown = fullscreenShown;
     if( m_pLookLabelStatus ) m_pLookLabelStatus->setText( text );
-    // LOOK-LABEL-PLAYBACK-INFO-1: the info lines are composed only while the corner label is shown (one push below).
-    m_playbackInfoText = ( fullscreenShown && m_fileLoaded && m_pMlvObject )
-        ? playback_info_label::compose( playbackInfoFacts(), m_playbackInfoToggles, true ) : QString();
+    // LOOK-LABEL-PLAYBACK-INFO-1 r3 (adversary r2 c65933cb A1): never composes info. The look line goes out with the CACHED info
+    // lines (hidden: the overlay is empty, a withdrawal that repaints at once); the info text changes only in the gated relabel,
+    // which a route change asks below (while playing it waits for the 250 ms gate, so info relabels stay at most 4 Hz).
     pushLookLabelOverlay();
     const bool gpuWindow = GpuDisplayWindow::isActive();
     logInteractionEvent(
@@ -33724,6 +33727,7 @@ void MainWindow::updateLookLabel( void )
             .arg( fullscreenShown ? ( gpuWindow ? QStringLiteral("gpu_window") : QStringLiteral("cpu_viewport") )
                                   : QStringLiteral("status_bar") )
             .arg( playback_info_label::logForm( m_playbackInfoText ) ) );
+    if( routeChanged ) updatePlaybackInfoLabel();
 }
 
 // LOOK-LABEL-PLAYBACK-INFO-1: the one push of the corner label. In fullscreen it is the look line with the info lines under
@@ -33739,7 +33743,8 @@ void MainWindow::pushLookLabelOverlay( void )
     m_lookLabelOverlayGpuWindow = gpuWindow;
     // r1 pass-3 A1: a withdrawal (label hidden, measured rate reset) repaints at once, since no frame may follow it.
     // r2 pass-2 A2: the reset's flag, never "no rate yet" (Play from a paused frame must not repaint the paused frame).
-    // Cleared only by updatePlaybackInfoLabel, after the push that carries the withdrawn text (a look-line push meanwhile repaints too).
+    // Cleared by updatePlaybackInfoLabel after the push that carries the withdrawn text (a look-line push meanwhile repaints too),
+    // or by the fps gate's next measured rate (r3: the rate is back, so there is nothing left to withdraw).
     const bool repaintNow = !ui->actionPlay->isChecked() || m_lookLabelOverlayText.isEmpty() || m_playbackInfoRateWithdrawn;
     GpuDisplayWindow::setLookLabelIfActive( m_lookLabelOverlayText, repaintNow );
     ui->graphicsView->setLookLabel( gpuWindow ? QString() : m_lookLabelOverlayText );
@@ -33790,12 +33795,14 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
 // LOOK-LABEL-PLAYBACK-INFO-1: change-only. Composes only while the fullscreen overlay is shown or the twin is visible (windowed
 // playback composes no fps), and pushes only when a text or the overlay route changed. Called from the change hooks, and while
 // playing from the fps meter's 250 ms gate (timerFrameEvent), so it runs at most 4 Hz and re-rasterises only on a new string.
-void MainWindow::updatePlaybackInfoLabel( void )
+void MainWindow::updatePlaybackInfoLabel( bool forceWithdrawal )
 {
     // r2 pass-2 A1: every caller passes the one gate. While playing, a call within 250 ms of the last relabel only marks the
     // info dirty; flushPlaybackInfoIfDue (every timer tick) relabels once it is due, so playing relabels stay at most 4 Hz.
+    // r3 (adversary r2 c65933cb A2): except the fps meter's reset of a measured rate (forceWithdrawal): frames stopped, so no
+    // frame may follow to carry it. It needs a > 500 ms draw gap and a new measurement first, so it is at most 2 Hz by itself.
     const bool relabelClockValid = m_playbackInfoRelabelClock.isValid();
-    if( playback_info_label::playingRelabelDeferred( ui->actionPlay->isChecked(), relabelClockValid,
+    if( !forceWithdrawal && playback_info_label::playingRelabelDeferred( ui->actionPlay->isChecked(), relabelClockValid,
                                                      relabelClockValid ? m_playbackInfoRelabelClock.elapsed() : 0 ) )
     {
         m_playbackInfoInputsDirty = true;

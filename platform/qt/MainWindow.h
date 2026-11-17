@@ -2337,7 +2337,8 @@ private:
     // LOOK-LABEL-PLAYBACK-INFO-1: the info lines under the fullscreen look label (pipeline, scale, debayer, fps, Dual-ISO,
     // resolution) and their status-bar twin (no fps). Change-only: composes only while the overlay is shown or the twin is
     // visible, and pushes only when a text or the overlay route changed.
-    void updatePlaybackInfoLabel( void );
+    // r3: forceWithdrawal (only the fps meter's reset of a measured rate) skips the playing gate.
+    void updatePlaybackInfoLabel( bool forceWithdrawal = false );
     void flushPlaybackInfoIfDue( void );
     // The one push of the look label (plus the info lines in fullscreen) to the status bar and the corner surfaces.
     void pushLookLabelOverlay( void );

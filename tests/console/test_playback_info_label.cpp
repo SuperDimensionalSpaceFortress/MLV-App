@@ -456,6 +456,65 @@ TEST(PlaybackInfoLabel, R2P2A2OnlyAWithdrawalRepaintsWhilePlaying)
     ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_playbackInfoRateWithdrawn = true;"))));
 }
 
+// r2 pass-3 A1 (c65933cb): updateLookLabel composed the info lines itself and pushed them outside the 250 ms relabel gate, so
+// a field toggle then the fullscreen label off/on relabelled info 80 ms apart. updateLookLabel never composes info: it pushes the
+// look line with the CACHED info (a hide is a withdrawal: the overlay is empty and repaints at once), and on a route change asks
+// updatePlaybackInfoLabel, which is gated while playing. The info text changes only inside updatePlaybackInfoLabel.
+TEST(PlaybackInfoLabel, R3A1UpdateLookLabelNeverComposesInfo)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString update = functionBody(source, QStringLiteral("void MainWindow::updateLookLabel("));
+    ASSERT_FALSE(update.isEmpty());
+    ASSERT_FALSE(update.contains(QStringLiteral("playback_info_label::compose(")));
+    ASSERT_FALSE(update.contains(QStringLiteral("playbackInfoFacts(")));
+    ASSERT_FALSE(update.contains(QStringLiteral("m_playbackInfoText =")));
+    // The one writer of the info text is the gated relabel.
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("m_playbackInfoText ="))));
+    const QString relabel = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_TRUE(relabel.contains(QStringLiteral("m_playbackInfoText = overlay;")));
+    // A route change (the corner label shown or hidden) asks the gated relabel, after the look line's own push.
+    const int routeAt = update.indexOf(QStringLiteral("const bool routeChanged = fullscreenShown != m_lookLabelFullscreenShown;"));
+    const int pushAt = update.indexOf(QStringLiteral("pushLookLabelOverlay();"));
+    const int askAt = update.indexOf(QStringLiteral("if( routeChanged ) updatePlaybackInfoLabel();"));
+    ASSERT_TRUE(routeAt >= 0);
+    ASSERT_TRUE(pushAt > routeAt);
+    ASSERT_TRUE(askAt > pushAt);
+    // Never the forced (withdrawal) relabel: that bypass belongs to the fps meter's reset alone (R3A2...).
+    ASSERT_FALSE(update.contains(QStringLiteral("updatePlaybackInfoLabel( true )")));
+}
+
+// r2 pass-3 A2 (c65933cb): a reset deferred by the playing gate kept m_playbackInfoRateWithdrawn set; a new measured rate did not
+// cancel it, so the later push of an ordinary "25.0/25 fps" relabel repainted the retained GPU frame (an extra playing paint), and
+// the withdrawal itself waited for the gate while stalled. (a) A measured rate is not a withdrawal: the fps gate clears the flag
+// when it takes the new snapshot. (b) The withdrawal relabel is forced past the playing gate (it needs a > 500 ms draw gap first,
+// so it runs at most 2 Hz on its own); every other caller stays gated.
+TEST(PlaybackInfoLabel, R3A2WithdrawalIsPromptAndAMeasuredRateCancelsIt)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString tick = functionBody(source, QStringLiteral("void MainWindow::timerFrameEvent("));
+    // (a) right after the gate's snapshot, before the gate's flush.
+    const int snapAt = tick.indexOf(QStringLiteral("m_playbackInfoFpsShown = smoothedFps;"));
+    const int cancelAt = tick.indexOf(QStringLiteral("m_playbackInfoRateWithdrawn = false;"), snapAt);
+    const int gateFlushAt = tick.indexOf(QStringLiteral("flushPlaybackInfoIfDue();"), snapAt);
+    ASSERT_TRUE(snapAt >= 0);
+    ASSERT_TRUE(cancelAt > snapAt);
+    ASSERT_TRUE(gateFlushAt > cancelAt);
+    // (b) the reset forces its relabel; it is the only forced caller.
+    const int setAt = tick.indexOf(QStringLiteral("m_playbackInfoRateWithdrawn = true;"));
+    const int forcedAt = tick.indexOf(QStringLiteral("updatePlaybackInfoLabel( true );"));
+    ASSERT_TRUE(setAt >= 0);
+    ASSERT_TRUE(forcedAt > setAt);
+    ASSERT_TRUE(forcedAt < snapAt);
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("updatePlaybackInfoLabel( true )"))));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("void updatePlaybackInfoLabel( bool forceWithdrawal = false );")));
+    const QString relabel = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackInfoLabel("));
+    ASSERT_TRUE(relabel.contains(QStringLiteral("if( !forceWithdrawal && playback_info_label::playingRelabelDeferred(")));
+    // The gated flush never forces.
+    const QString flush = functionBody(source, QStringLiteral("void MainWindow::flushPlaybackInfoIfDue("));
+    ASSERT_FALSE(flush.contains(QStringLiteral("updatePlaybackInfoLabel( true )")));
+}
+
 // r2 adversary A2 (deeae9f4, advisory): a carriage return is a line break too: logForm leaves one line, compose adds none.
 TEST(PlaybackInfoLabel, R2A2CarriageReturnsNeverBreakALine)
 {
