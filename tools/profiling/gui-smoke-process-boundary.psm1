@@ -221,10 +221,15 @@ function Test-GuiSmokeLogProgressStalled {
             $parsed = [int64]0
             $length = if ([int64]::TryParse($text.Substring($cut + 1), [ref]$parsed)) { $parsed } else { [int64]-1 }
             if ($length -eq -2) {
-                # listed, not yet read (the probe announces every listed log before it opens any): arms the watch, is not progress, and a name
-                # already known is left as it is. -2 = announced while the watch was not yet armed (the arming IS its sign of life, so its first
-                # read is only a baseline: adversary 1b823896 A2); -3 = a NEW name announced mid-run (its first readable length is the sign of life)
-                if (-not $Watch.Files.ContainsKey($name)) { $Watch.Files[$name] = $(if ($Watch.Armed) { [int64]-3 } else { [int64]-2 }) }
+                # listed, not yet read (the probe announces every listed log before it opens any); a name already known is left as it is. A NEW
+                # name is a sign of life AT ITS ANNOUNCEMENT, and its first read is only a baseline (-2), in either state of the watch: before the
+                # watch is armed the arming below IS the sign of life (adversary 1b823896 A2); once it is armed the fresh name is progress here
+                # (adversary 2d33c39f A1: crediting the READ instead gave an announced-but-unread log no life, and an unchanged delayed read a
+                # whole second window).
+                if (-not $Watch.Files.ContainsKey($name)) {
+                    $Watch.Files[$name] = [int64]-2
+                    if ($Watch.Armed) { $progress = $true }
+                }
             }
             elseif (-not $Watch.Files.ContainsKey($name)) {
                 # the first sighting of a log arms the watch (below). r4 (adversary b0a33ba9 A1): a log unreadable at that first look is UNKNOWN
@@ -233,14 +238,9 @@ function Test-GuiSmokeLogProgressStalled {
                 if ($length -ge 0) { $progress = $true }
             }
             elseif ([int64]$Watch.Files[$name] -eq -2) {
-                # the first read of a log announced before the watch armed: unreadable is UNKNOWN, readable is the BASELINE and is not growth
-                # (unchanged data must not restart the quiet clock the announcement started)
+                # the first read of an announced log: unreadable is UNKNOWN, readable is the BASELINE and is not growth (unchanged data must not
+                # restart the quiet clock the announcement started or restarted)
                 $Watch.Files[$name] = [Math]::Max([int64]-1, $length)
-            }
-            elseif ([int64]$Watch.Files[$name] -eq -3) {
-                # the first read of a new log announced after the watch armed: the first-sighting rule (unreadable is UNKNOWN, readable is a sign of life)
-                $Watch.Files[$name] = [Math]::Max([int64]-1, $length)
-                if ($length -ge 0) { $progress = $true }
             }
             elseif ([int64]$Watch.Files[$name] -lt 0) {
                 # unknown until the first readable length, which becomes the baseline and is NOT growth

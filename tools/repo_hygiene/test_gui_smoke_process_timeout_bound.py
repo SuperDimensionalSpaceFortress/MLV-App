@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -472,6 +473,60 @@ Stop-GuiSmokeLogProgressWatch -Watch $late
         for field in ("outcome = ", "noProgressWindowMs = ", "legBudgetMs = ", "finalWaitMs = "):
             self.assertIn(field, receipt)
         self.assertIn("[int]$NoProgressTimeoutMs = 0", source)
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class NewLogAnnouncedMidRunIsASignOfLife(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (adversary 2d33c39f A1): a log name first seen AFTER the watch armed is itself a sign of life, at its
+    announcement; its delayed first read is only a baseline. The r5 -3 state credited the READ instead, so an announced-but-unread fresh log gave no
+    life while an unchanged delayed read gave a whole second window."""
+
+    def test_a_fresh_log_announced_mid_run_restarts_the_quiet_clock_at_its_announcement(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'freshannounce'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-a.log') -Value ('x' * 100) -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeOpenDelayMs 30000 -ProbeWaitMs 300
+# an armed watch whose app log (a) has been quiet for longer than the window, as after a stall the watchdog has not yet judged
+$w.Files['mlvapp-a.log'] = [int64]100; $w.Armed = $true; $w.Quiet.Restart()
+Start-Sleep -Milliseconds 1500
+$quietBefore = [int]$w.Quiet.ElapsedMilliseconds
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-b.log') -Value ('y' * 100) -NoNewline
+$stalledAtAnnouncement = [bool](Test-GuiSmokeLogProgressStalled -Watch $w)
+$quietAfter = [int]$w.Quiet.ElapsedMilliseconds
+$known = @($w.Files.Keys) -contains 'mlvapp-b.log'
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ stalledAtAnnouncement = $stalledAtAnnouncement; quietBefore = $quietBefore; quietAfter = $quietAfter; known = $known } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["known"], "the fresh log was announced (its open never returns: the announcement is all the watch has)")
+        self.assertGreaterEqual(out["quietBefore"], 1000, "the quiet clock had outrun the window")
+        self.assertFalse(out["stalledAtAnnouncement"], "a log first seen mid-run is a sign of life at its announcement")
+        self.assertLess(out["quietAfter"], 500, "the announcement restarted the quiet clock")
+
+    def test_a_delayed_unchanged_first_read_of_a_mid_run_log_is_a_baseline_not_a_second_window(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'delayedbaseline'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-a.log') -Value ('x' * 100) -NoNewline
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-b.log') -Value ('y' * 100) -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 600000 -ProbeOpenDelayMs 1500 -ProbeWaitMs 300
+$w.Files['mlvapp-a.log'] = [int64]100; $w.Armed = $true; $w.Quiet.Restart()
+$sw = [Diagnostics.Stopwatch]::StartNew(); $quietAtRead = -1
+while ($sw.ElapsedMilliseconds -lt 15000 -and $quietAtRead -lt 0) {
+    [void](Test-GuiSmokeLogProgressStalled -Watch $w)
+    if ($w.Files.ContainsKey('mlvapp-b.log') -and [int64]$w.Files['mlvapp-b.log'] -ge 0) { $quietAtRead = [int]$w.Quiet.ElapsedMilliseconds }
+    Start-Sleep -Milliseconds 100
+}
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ quietAtRead = $quietAtRead; baseline = [int64]$w.Files['mlvapp-b.log'] } | ConvertTo-Json -Compress
+""")
+        self.assertEqual(100, out["baseline"], "the first readable length of the fresh log is its baseline")
+        # b is announced at the first poll and read about 3 s later (two 1.5 s opens: a then b); credited as growth, the read would restart the clock to about 0
+        self.assertGreaterEqual(out["quietAtRead"], 2000, "the unchanged delayed read was granted a second quiet window")
+
+    def test_the_watcher_has_no_announced_after_arming_state(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        body = code[code.index("function Test-GuiSmokeLogProgressStalled"):code.index("function Wait-GuiSmokeProcessBounded")]
+        self.assertIsNone(re.search(r"(?<![\w.])-3(?!\d)", body), "a name announced mid-run is progress at its announcement; there is no -3 state")
 
 
 def _runner_snippet(start_marker: str, end_marker: str) -> str:

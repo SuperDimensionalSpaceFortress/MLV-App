@@ -4743,6 +4743,9 @@ def _gui_smoke_log_probe_purity_problems(body: str) -> list:
     for shape in ("StreamWriter", "FileStream", "BinaryWriter", "TextWriter", "StringWriter", "WriteLine", "Flush", "::new", "New-Object", "CopyTo", "WriteByte"):
         if shape in body:
             problems.append(f"shape {shape}")
+    # r6 (adversary 2d33c39f A2): a computed member name, [System.IO.File]::('Write'+'AllText')(...) or $o.$name(...), is invisible to the member allowlist
+    if re.search(r"(?:::|\.)\s*[(\$'\"]", body):
+        problems.append("computed member access")
     return problems
 
 
@@ -4765,6 +4768,8 @@ def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_wr
         "file create text": "$sink = [System.IO.File]::CreateText($file.FullName); $sink.Dispose()\n",
         "opened stream written": "$stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open); $stream.WriteByte(1); $stream.Dispose()\n",
         "in memory writer": "$sink = [IO.StringWriter]::new(); $sink.WriteLine('x')\n",
+        "computed static member": "[System.IO.File]::('Write'+'AllText')($file.FullName, 'overwritten')\n",
+        "computed instance member": "$name = 'Write'; $stream.$name([byte[]]@(1), 0, 1)\n",
     }
     for label, injected in mutations.items():
         mutated = body.replace(anchor, anchor + injected, 1)
