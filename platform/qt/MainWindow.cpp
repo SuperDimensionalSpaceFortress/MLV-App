@@ -3106,7 +3106,13 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 
         //fps measurement: draw-to-draw interval. lastTime is re-armed on every idle poll tick (it
         //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
-        const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;
+        // LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary pass 13 A2): the first draw of a Play drops the previous Play's average and
+        // feeds no interval, so the rate stays unmeasured ("--") until an interval inside this Play exists.
+        const bool firstDrawOfPlay = m_playbackFpsMeterNewPlay;
+        m_playbackFpsMeterNewPlay = false;
+        if( firstDrawOfPlay ) m_playbackFpsEmaFrameMs = 0.0;
+        const int measuredFrameMs = playback_fps_meter::meterIntervalMs(
+            firstDrawOfPlay, lastDrawTime.isValid(), lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0 );
         lastDrawTime = nowTime;
         m_playbackFramesStalled = false;   // LOOK-LABEL-PLAYBACK-INFO-1 r3: a frame was drawn, so the next one carries the label
         if( timeDiff != 0 )
@@ -24449,7 +24455,7 @@ void MainWindow::updatePlaybackQualityIndicator( void )
     const bool guiScaleOverrideActive = !envOverrideActive && guiScaleSettingActive;
     auto playbackScaleLabel = [this]( int requestedScale ) -> QString
     {
-        const int activeScale = m_lastPresentedPlaybackScaleFactorActive;
+        const int activeScale = presentedPlaybackScaleShown();   // r12 pass-13 A1: the toolbar sibling reads the same scale
         // LOOK-LABEL-PLAYBACK-INFO-1 r3 (adversary 9c9941cd A1): matched on the presented request's ASKED scale, so the GPU
         // texture route's clamp of x8 to 1 reads as presented Full, never as "x8" (the effective 1 never equals the asked 8).
         const bool presentedBelongs = playback_info_label::presentedScaleBelongsToRequest(
@@ -24707,7 +24713,7 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.pipelineStatus = static_cast<int>( status );
     inputs.scopeCaveat = scopePerformanceCaveat;
     inputs.requestedScale = playbackScaleFactorPolicyDecision();
-    inputs.presentedScale = m_lastPresentedPlaybackScaleFactorActive;
+    inputs.presentedScale = presentedPlaybackScaleShown();   // r12 pass-13 A1
     inputs.requestContextValid = m_lastPresentedRequestContextValid;
     inputs.requestContextScale = m_lastPresentedRequestContext.playbackScaleFactorPolicy;   // r3: the asked scale (A1)
     inputs.gpuAmaze = m_lastPresentedFrameUsedGpuAmazeDebayer;
@@ -33055,6 +33061,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     // r7 (adversary pass 11 A1 on 045434fc): the corner rate belongs to one Play. Stop -> Play within 500 ms with no idle tick
     // kept the last Play's 23.8 and composed "23.8/24 fps" before this Play measured anything: it reads "--" until it does.
     m_playbackInfoFpsShown = 0.0;
+    // r12 (adversary pass 13 A2 on c58f5bd8): and the average with it: the next draw starts this Play's meter afresh.
+    m_playbackFpsEmaFrameMs = 0.0;
+    m_playbackFpsMeterNewPlay = true;
     updatePlaybackInfoLabel();
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
     // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
@@ -33934,7 +33943,7 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     // The toolbar indicator's rule (updatePlaybackQualityIndicator's playbackScaleLabel): the presented scale counts only
     // when it belongs to the requested scale's frames.
     facts.requestedScale = playbackScaleFactorPolicyDecision();
-    const int activeScale = m_lastPresentedPlaybackScaleFactorActive;
+    const int activeScale = presentedPlaybackScaleShown();   // r12 pass-13 A1: what the prep presented, not the render's request
     facts.presentedScale = activeScale;
     // r3 (adversary 9c9941cd A1): matched on the presented request's ASKED scale (a texture-route clamp of x8 is "Eighth->Full").
     facts.presentedValid = playback_info_label::presentedScaleBelongsToRequest(
@@ -33966,6 +33975,19 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
 // own telemetry (RenderFrameThread's render_thread_phase4b_path, a cache hit replays the cached route), never from the settings.
 // The tag is thread-local and only the CPU processed entries rewrite it, so it is trusted only for a frame whose CPU processed
 // stage ran at scale 1 (the x1 proxy cores run nowhere else), not through the direct-8 path, the GPU recon or a GPU debayer.
+// LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary pass 13 A1 on c58f5bd8): the scale the presented frame is shown at. The render thread
+// reports the requested scale for a CPU OutputDebayered16 frame (it debayers full size; the prep box-reduces it afterwards, or
+// refuses with factor 1), so a frame the prep developed is read from what the render produced and the prep's own factor.
+int MainWindow::presentedPlaybackScaleShown( void ) const
+{
+    const QJsonObject &telemetry = m_lastPresentedStageTimingTelemetry;
+    if( !telemetryBoolValue( telemetry, "playback_prep_cpu_route_active" ) ) return m_lastPresentedPlaybackScaleFactorActive;
+    return playback_info_label::presentedScaleOfCpuPrepRoute( m_lastPresentedPlaybackScaleFactorActive,
+                                                             telemetryIntValue( telemetry, "render_thread_source_width" ),
+                                                             telemetryIntValue( telemetry, "render_thread_rendered_width" ),
+                                                             telemetryIntValue( telemetry, "playback_prep_reduced_factor" ) );
+}
+
 int MainWindow::presentedPlaybackRouteCode( void ) const
 {
     if( !m_lastPresentedRequestContextValid ) return 0;

@@ -860,6 +860,7 @@ private:
     QLabel *m_pFpsStatus;
     QString m_lastPlaybackFpsStatusText;
     double m_playbackFpsEmaFrameMs = 0.0;
+    bool m_playbackFpsMeterNewPlay = false;   // r12 (adversary pass 13 A2): the next draw is a new Play's first (feeds no interval)
     QTime m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
@@ -2376,6 +2377,8 @@ private:
     playback_info_label::Facts playbackInfoFacts( void );
     // r12 adversary A1: the presented frame's CPU render-path code, read from its own telemetry (0 = full recon or unknown).
     int presentedPlaybackRouteCode( void ) const;
+    // r12 pass-13 A1: the presented frame's shown scale (a CPU prep frame: the render's achieved size times the prep's factor).
+    int presentedPlaybackScaleShown( void ) const;
     // The presented pipeline status and the scope caveat, shared by the toolbar indicator and the info label.
     void presentedGpuPlaybackPipelineStatus( GpuPlaybackPipelineStatus &status, bool &scopePerformanceCaveat ) const;
     // r1 adversary A1/A3: relabels only when a pipeline/scale/debayer input changed (int compares; safe per presented frame).

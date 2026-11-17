@@ -59,6 +59,14 @@ inline double smoothedFrameMs( double emaFrameMs, int msSinceLastDraw )
     return ( emaFrameMs * 0.9 ) + ( static_cast<double>( msSinceLastDraw ) * 0.1 );
 }
 
+/*! LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary pass 13 A2 on c58f5bd8): the interval a draw feeds the meter. The first draw
+ *  after a Play toggle feeds none (0, which smoothedFrameMs ignores): the previous draw belongs to the previous Play, so a
+ *  Stop -> Play within the stall limit never smooths the cross-Play gap into the new Play's rate. */
+inline int meterIntervalMs( bool firstDrawOfPlay, bool hasPreviousDraw, int msSincePreviousDraw )
+{
+    return ( firstDrawOfPlay || !hasPreviousDraw ) ? 0 : msSincePreviousDraw;
+}
+
 } // namespace playback_fps_meter
 
 #endif // PLAYBACKFPSMETERPOLICY_H

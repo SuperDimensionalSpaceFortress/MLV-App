@@ -230,6 +230,18 @@ inline bool presentedScaleBelongsToRequest( bool contextValid, int contextPolicy
     return activeValid && contextValid && requestedScale > 0 && contextPolicyScale == requestedScale;
 }
 
+/*! \brief r12 pass-2 A1 (c58f5bd8): the scale a CPU playback-prep frame is presented at. OutputDebayered16 renders at the size the
+ *  render achieved (sourceWidth / renderedWidth, full size unless it consumed a reduced recon) and the prep box-reduces it by
+ *  prepReducedFactor (1 when it refuses), so the frame is shown at their product, never at the requested scale the render
+ *  thread reports for it. Any input that does not give 1, 2, 4 or 8 keeps the render's own report. */
+inline int presentedScaleOfCpuPrepRoute( int renderActiveScale, int sourceWidth, int renderedWidth, int prepReducedFactor )
+{
+    if( sourceWidth <= 0 || renderedWidth <= 0 || renderedWidth > sourceWidth || prepReducedFactor < 1 ) return renderActiveScale;
+    const int achieved = static_cast<int>( std::lround( static_cast<double>( sourceWidth ) / static_cast<double>( renderedWidth ) ) );
+    const int scale = achieved * prepReducedFactor;
+    return ( scale == 1 || scale == 2 || scale == 4 || scale == 8 ) ? scale : renderActiveScale;
+}
+
 /*! \brief One-line form for a log or receipt field: '\n' -> " / ", '"' -> '\''. */
 inline QString logForm( const QString &text )
 {

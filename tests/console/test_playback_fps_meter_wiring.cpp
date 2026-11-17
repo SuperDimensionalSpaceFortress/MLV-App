@@ -45,8 +45,10 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
     const QString body = timerFrameEventBody();
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral("static QTime lastDrawTime;")));
+    // LOOK-LABEL-PLAYBACK-INFO-1 r12 (adversary pass 13 A2): the draw-to-draw interval, none for a new Play's first draw
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;")));
+        "const int measuredFrameMs = playback_fps_meter::meterIntervalMs(\n"
+        "            firstDrawOfPlay, lastDrawTime.isValid(), lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0 );")));
     ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::smoothedFrameMs(")));
     // the old measurement off the idle-re-armed lastTime is gone
     ASSERT_FALSE(body.contains(QStringLiteral("const int measuredFrameMs = lastTime.msecsTo( nowTime );")));

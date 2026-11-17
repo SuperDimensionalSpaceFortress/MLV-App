@@ -5,6 +5,7 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
+#include "../../platform/qt/PlaybackFpsMeterPolicy.h"
 #include "../../platform/qt/PlaybackInfoLabelPolicy.h"
 #include "../../platform/qt/PlaybackScaleLabel.h"
 
@@ -336,7 +337,10 @@ TEST(PlaybackInfoLabel, R1A3PresentedFrameRelabelsOnAnInfoInputChange)
     const QString key = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
     ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedFrameUsedGpuAmazeDebayer")));
     ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedFrameUsedGpuBilinearDebayer")));
-    ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedPlaybackScaleFactorActive")));
+    // r12 pass-13 A1: the presented scale through the one accessor, which still starts from the render's own report
+    ASSERT_TRUE(key.contains(QStringLiteral("inputs.presentedScale = presentedPlaybackScaleShown();")));
+    ASSERT_TRUE(functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackScaleShown("))
+                    .contains(QStringLiteral("m_lastPresentedPlaybackScaleFactorActive")));
     ASSERT_TRUE(key.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactor")));
     ASSERT_TRUE(key.contains(QStringLiteral("playbackScaleFactorPolicyDecision()")));
     ASSERT_TRUE(key.contains(QStringLiteral("updatePlaybackInfoLabel();")));
@@ -809,6 +813,82 @@ TEST(PlaybackInfoLabel, R12A1PresentedRouteIsReadFromThePresentedFrame)
     ASSERT_TRUE(header.contains(QStringLiteral("presentedRoute == o.presentedRoute")));
 }
 
+// r12 adversary pass 13 A1 (c58f5bd8): ordinary 1920x1088 clip, CPU presentation, receipt AMaZE with Don't Switch Debayer, fast
+// playback processing on, MLVAPP_PLAYBACK_SCALE_FACTOR=2, Zoom Fit off. OutputDebayered16 reconstructs full-size AMaZE, the prep
+// refuses the reduction (factor 1), and the render thread reports the requested 2: both surfaces read "Half" and
+// "AMaZE->Scaled" over a full-resolution AMaZE frame. A CPU prep frame is shown at the render's achieved size times the prep factor.
+TEST(PlaybackInfoLabel, R12P13A1CpuPrepFrameNamesTheScaleItWasShownAt)
+{
+    // the refused prep: full-size render (1920 of 1920), factor 1 -> Full, though the render thread reported 2
+    ASSERT_EQ(1, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 1));
+    // the prep's own reduction of a full-size render, and of a render that consumed a reduced recon
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 2));
+    ASSERT_EQ(4, playback_info_label::presentedScaleOfCpuPrepRoute(4, 1920, 1920, 4));
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 960, 1));
+    ASSERT_EQ(4, playback_info_label::presentedScaleOfCpuPrepRoute(4, 1920, 960, 2));
+    // unreadable or impossible inputs keep the render's own report
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 0, 1920, 1));
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 0, 1));
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 3840, 1));
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 0));
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 3));
+    ASSERT_EQ(8, playback_info_label::presentedScaleOfCpuPrepRoute(8, 1920, 1920, 16));
+    // the finding's label: requested Half, shown Full -> "Half->Full" and the selected AMaZE ran at full size
+    playback_info_label::Facts f = ownerFacts();
+    f.gpuDisplay = false;
+    f.processingBadge = QStringLiteral("CPU");
+    f.dualIsoClip = false;
+    f.debayer = QStringLiteral("AMaZE");
+    f.debayerOnGpu = false;
+    f.gpuDebayer = QString();
+    f.requestedScale = 2;
+    f.presentedScale = playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 1);
+    f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, 2, f.requestedScale, f.presentedScale);
+    ASSERT_QSTR_EQ(QStringLiteral("Half->Full"), playback_info_label::scaleField(f));
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+    // the MainWindow sites read the one accessor (label facts, relabel inputs, toolbar indicator)
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString shown = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackScaleShown("));
+    ASSERT_TRUE(shown.contains(QStringLiteral("\"playback_prep_cpu_route_active\"")));
+    ASSERT_TRUE(shown.contains(QStringLiteral("\"render_thread_source_width\"")));
+    ASSERT_TRUE(shown.contains(QStringLiteral("\"render_thread_rendered_width\"")));
+    ASSERT_TRUE(shown.contains(QStringLiteral("\"playback_prep_reduced_factor\"")));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
+    ASSERT_TRUE(facts.contains(QStringLiteral("const int activeScale = presentedPlaybackScaleShown();")));
+    const QString indicator = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackQualityIndicator("));
+    ASSERT_TRUE(indicator.contains(QStringLiteral("const int activeScale = presentedPlaybackScaleShown();")));
+    ASSERT_FALSE(indicator.contains(QStringLiteral("const int activeScale = m_lastPresentedPlaybackScaleFactorActive;")));
+}
+
+// r12 adversary pass 13 A2 (c58f5bd8): previous Play EMA 40 ms, last draw at .000, Stop at .100, Play at .450, first new draw at
+// .458. The first draw smoothed the 458 ms cross-Play gap into the old average (81.8 ms, 12.2 fps), so the relabel near .700
+// showed a rate though only one draw belonged to this Play. The first draw of a Play feeds no interval; the next one seeds it.
+TEST(PlaybackInfoLabel, R12P13A2NewPlayRateWaitsForAnIntervalInsideThisPlay)
+{
+    double ema = 40.0;                       // the previous Play's average
+    // on_actionPlay_toggled drops the average; the first draw of the new Play feeds nothing
+    ema = 0.0;
+    int interval = playback_fps_meter::meterIntervalMs(true, true, 458);
+    ASSERT_EQ(0, interval);
+    ema = playback_fps_meter::smoothedFrameMs(ema, interval);
+    ASSERT_TRUE(ema <= 0.0);                 // unmeasured: the corner reads "--"
+    // the second draw, 40 ms later inside this Play, seeds the average from its own interval
+    interval = playback_fps_meter::meterIntervalMs(false, true, 40);
+    ASSERT_EQ(40, interval);
+    ema = playback_fps_meter::smoothedFrameMs(ema, interval);
+    ASSERT_TRUE(ema > 39.9 && ema < 40.1);
+    // no previous draw at all: nothing to measure
+    ASSERT_EQ(0, playback_fps_meter::meterIntervalMs(false, false, 123));
+    // the wiring: the first draw after a toggle consumes the flag, drops the average and feeds meterIntervalMs
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int drawAt = source.indexOf(QStringLiteral("const bool firstDrawOfPlay = m_playbackFpsMeterNewPlay;"));
+    ASSERT_TRUE(drawAt >= 0);
+    const QString draw = source.mid(drawAt, 600);
+    ASSERT_TRUE(draw.contains(QStringLiteral("m_playbackFpsMeterNewPlay = false;")));
+    ASSERT_TRUE(draw.contains(QStringLiteral("if( firstDrawOfPlay ) m_playbackFpsEmaFrameMs = 0.0;")));
+    ASSERT_TRUE(draw.contains(QStringLiteral("playback_fps_meter::meterIntervalMs(")));
+}
+
 // r7 adversary pass 11 A1 (045434fc): Stop at t=100 ms, Play at t=450 ms with no idle tick between: the corner kept the last
 // Play's measured 23.8 (only the > 500 ms idle reset zeroed it) and composed "23.8/24 fps" before this Play measured a frame.
 // The Play toggle drops the snapshot BEFORE the relabel it triggers, so a new Play reads "--" until its own measurement.
@@ -817,8 +897,14 @@ TEST(PlaybackInfoLabel, R7P11A1APlayToggleDropsThePreviousPlaysRate)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString toggled = functionBody(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
     ASSERT_FALSE(toggled.isEmpty());
-    const int dropAt = toggled.indexOf(QStringLiteral("m_playbackInfoFpsShown = 0.0;\n    updatePlaybackInfoLabel();"));
+    // r12 (pass 13 A2): the drop still precedes the relabel it triggers; the meter re-arm sits between them
+    const int dropAt = toggled.indexOf(QStringLiteral("m_playbackInfoFpsShown = 0.0;"));
     ASSERT_TRUE(dropAt >= 0);
+    const int relabelAt = toggled.indexOf(QStringLiteral("updatePlaybackInfoLabel();"), dropAt);
+    ASSERT_TRUE(relabelAt > dropAt);
+    const QString between = toggled.mid(dropAt, relabelAt - dropAt);
+    ASSERT_TRUE(between.contains(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;")));
+    ASSERT_TRUE(between.contains(QStringLiteral("m_playbackFpsMeterNewPlay = true;")));
     // the composed form for a new Play with no snapshot is "--/24 fps"
     playback_info_label::Facts f = ownerFacts();
     f.playing = true;
