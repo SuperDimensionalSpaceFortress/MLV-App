@@ -1315,8 +1315,14 @@ function Get-VenueLegPreLoadMean {
     try {
         if (-not $ReceiptPath) { return $null }
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
-        $summary = Join-Path (Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))) 'summary.json'
-        if (-not (Test-Path -LiteralPath $summary -PathType Leaf)) { return $null }
+        $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
+        # A playback leg publishes <evidence>\<receiptId>\summary.json; an export leg publishes <evidence>\<receiptId>\export\summary.json (EXPORT-VENUE-LEG-1 r3: the
+        # first venue proof read UNKNOWN because only the first was looked at). The first that exists is read.
+        $summary = $null
+        foreach ($candidate in @((Join-Path $evidence 'summary.json'), (Join-Path (Join-Path $evidence 'export') 'summary.json'))) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $summary = $candidate; break }
+        }
+        if ($null -eq $summary) { return $null }
         $q = ([IO.File]::ReadAllText($summary) | ConvertFrom-Json).cpuQuiescence
         if ($null -eq $q -or $null -eq $q.timeMeanPercent) { return $null }
         [double]$q.timeMeanPercent

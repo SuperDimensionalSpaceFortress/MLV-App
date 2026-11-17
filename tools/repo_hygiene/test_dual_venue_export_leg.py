@@ -700,6 +700,45 @@ class ExportJobGeneratorTests(unittest.TestCase):
                     "cpuThresholdPercent = $cpuThresholdPercent"):
             self.assertFalse(old in template, f"the export quiescence record must use the playback summary's field names, not {old}")
 
+    def test_the_leg_batch_finds_the_export_summary_where_the_export_job_publishes_it(self) -> None:
+        """r3 (venue proof 2026-11-17, receipt 638671c5): the export ran (480 frames) and its summary carried cpuQuiescence.timeMeanPercent=8.5, yet the leg read
+        preLoadMean=UNKNOWN / QUIET_PRELOAD_UNKNOWN. A playback leg's summary.json is <evidence>\\<receiptId>\\summary.json; the export evidence is published under
+        <evidence>\\<receiptId>\\export\\summary.json, and Get-VenueLegPreLoadMean looked only at the first. Both readers (the module's and the chain driver's
+        own copy, which now delegates) read either layout; a malformed or field-less summary is still $null, never 0."""
+        mod = DV / "VenueChain.psm1"
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "receipts"
+            ev = Path(d) / "evidence"
+            cases = {"play-1": ("", 7.25), "exp-1": ("export", 8.5), "bad-1": ("export", None), "none-1": (None, None)}
+            for rid, (sub, mean) in cases.items():
+                receipt = root / CARD / "leg-x" / "bachelor" / f"{rid}.json"
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                receipt.write_text("{}", encoding="utf-8")
+                if sub is None:
+                    continue
+                folder = ev / rid / sub if sub else ev / rid
+                folder.mkdir(parents=True, exist_ok=True)
+                body = {"cpuQuiescence": {"timeMeanPercent": mean}} if mean is not None else {"cpuQuiescence": {"cpuTimeMean": 3.0}}
+                (folder / "summary.json").write_text(json.dumps(body), encoding="utf-8")
+            script = (f"Import-Module '{mod}' -Force -DisableNameChecking; $r = [ordered]@{{}}; "
+                      + "".join(f"$r['{rid}'] = Get-VenueLegPreLoadMean -ReceiptPath '{root / CARD / 'leg-x' / 'bachelor' / (rid + '.json')}'; " for rid in cases)
+                      + "$r | ConvertTo-Json -Compress")
+            proc = run_pwsh(["-Command", script])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout)
+        self.assertEqual(got["play-1"], 7.25, "the playback layout must keep working")
+        self.assertEqual(got["exp-1"], 8.5, "the export layout (<evidence>\\<id>\\export\\summary.json) must be read")
+        self.assertIsNone(got["bad-1"], "a summary without timeMeanPercent is UNKNOWN, never 0")
+        self.assertIsNone(got["none-1"])
+
+    def test_the_chain_driver_does_not_keep_its_own_copy_of_the_preload_reader(self) -> None:
+        """r3: Invoke-VenueChain.ps1 carried a second copy of the same reader, with the same wrong path. It delegates to the module's one function."""
+        text = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        start = text.index("function Get-LegPreLoadMean")
+        body = text[start:text.index("function Add-Result", start)]
+        self.assertIn("Get-VenueLegPreLoadMean", body)
+        self.assertNotIn("summary.json", body, "a second copy of the summary path is how the two drifted")
+
     def test_the_time_budget_fits_the_shipped_legs_and_long_windows(self) -> None:
         """adversary r1 A1: the export's budget is identity read + the app's re-read + the export wait; the shipped M16-1243 legs (two parts, 3.4 GB,
         480 frames) and a 1000-frame window generate, and the job timeout holds every allowance."""
