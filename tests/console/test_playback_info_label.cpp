@@ -515,6 +515,46 @@ TEST(PlaybackInfoLabel, R3A2WithdrawalIsPromptAndAMeasuredRateCancelsIt)
     ASSERT_FALSE(flush.contains(QStringLiteral("updatePlaybackInfoLabel( true )")));
 }
 
+// r3 pass-1 A1 (9c9941cd): the GPU texture route clamps an x8 request to 1 and presents Full, but the presented request's
+// scale (the EFFECTIVE 1) was compared with the requested (policy) 8, so presentedValid was false and both info surfaces and the
+// toolbar indicator read "Eighth" instead of "Eighth->Full". The presented request carries its POLICY scale too, and the match
+// is on that (playback_info_label::presentedScaleBelongsToRequest), for the label, its relabel key and the toolbar sibling.
+TEST(PlaybackInfoLabel, R3P1A1ClampedRequestShowsThePresentedScale)
+{
+    // The clamp case: asked 8, the presented request was asked 8 too, presented Full.
+    ASSERT_TRUE(playback_info_label::presentedScaleBelongsToRequest(true, 8, 8, 1));
+    ASSERT_TRUE(playback_info_label::presentedScaleBelongsToRequest(true, 2, 2, 2));
+    // Another request's frame, no presented frame, or an unknown active scale: not shown.
+    ASSERT_FALSE(playback_info_label::presentedScaleBelongsToRequest(true, 4, 8, 1));
+    ASSERT_FALSE(playback_info_label::presentedScaleBelongsToRequest(false, 8, 8, 1));
+    ASSERT_FALSE(playback_info_label::presentedScaleBelongsToRequest(true, 8, 8, 3));
+    ASSERT_FALSE(playback_info_label::presentedScaleBelongsToRequest(true, 0, 0, 1));
+    playback_info_label::Facts f = ownerFacts();
+    f.requestedScale = 8;
+    f.presentedScale = 1;
+    f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, 8, 8, 1);
+    ASSERT_TRUE(playback_info_label::compose(f, playback_info_label::Toggles(), true)
+                    .contains(dot() + QStringLiteral("Eighth->Full") + dot()));
+
+    const QString thread = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.h"));
+    ASSERT_TRUE(thread.contains(QStringLiteral("int playbackScaleFactorPolicy = 0;")));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int effectiveAt = source.indexOf(QStringLiteral("requestContext.playbackScaleFactor = effectivePlaybackScaleFactorForRequest();"));
+    const int policyAt = source.indexOf(QStringLiteral("requestContext.playbackScaleFactorPolicy = playbackScaleFactorPolicyDecision();"));
+    ASSERT_TRUE(effectiveAt >= 0);
+    ASSERT_TRUE(policyAt > effectiveAt);
+    ASSERT_EQ(1, static_cast<int>(source.count(QStringLiteral("playbackScaleFactorPolicy = "))));
+    const QString facts = functionBody(source, QStringLiteral("playback_info_label::Facts MainWindow::playbackInfoFacts("));
+    ASSERT_TRUE(facts.contains(QStringLiteral("playback_info_label::presentedScaleBelongsToRequest(")));
+    ASSERT_TRUE(facts.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactorPolicy")));
+    ASSERT_FALSE(facts.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactor ==")));
+    const QString indicator = functionBody(source, QStringLiteral("void MainWindow::updatePlaybackQualityIndicator("));
+    ASSERT_TRUE(indicator.contains(QStringLiteral("playback_info_label::presentedScaleBelongsToRequest(")));
+    ASSERT_FALSE(indicator.contains(QStringLiteral("m_lastPresentedRequestContext.playbackScaleFactor == requestedScale")));
+    const QString key = functionBody(source, QStringLiteral("void MainWindow::refreshPlaybackInfoOnInputChange("));
+    ASSERT_TRUE(key.contains(QStringLiteral("inputs.requestContextScale = m_lastPresentedRequestContext.playbackScaleFactorPolicy;")));
+}
+
 // r2 adversary A2 (deeae9f4, advisory): a carriage return is a line break too: logForm leaves one line, compose adds none.
 TEST(PlaybackInfoLabel, R2A2CarriageReturnsNeverBreakALine)
 {

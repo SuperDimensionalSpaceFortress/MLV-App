@@ -184,6 +184,15 @@ inline bool playingRelabelDeferred( bool playing, bool clockValid, qint64 elapse
     return playing && clockValid && elapsedMs < kDeferredRelabelMs;
 }
 
+/*! \brief r3 adversary A1 (9c9941cd): does the presented frame's active scale belong to the requested scale? It compares the
+ *  presented request's POLICY scale (what the setting or Auto asked for), never its effective scale: the GPU texture route clamps
+ *  an x8 request to 1, and comparing that 1 with the asked 8 hid "Eighth->Full". `activeScale` must be 1, 2, 4 or 8. */
+inline bool presentedScaleBelongsToRequest( bool contextValid, int contextPolicyScale, int requestedScale, int activeScale )
+{
+    const bool activeValid = activeScale == 1 || activeScale == 2 || activeScale == 4 || activeScale == 8;
+    return activeValid && contextValid && requestedScale > 0 && contextPolicyScale == requestedScale;
+}
+
 /*! \brief One-line form for a log or receipt field: '\n' -> " / ", '"' -> '\''. */
 inline QString logForm( const QString &text )
 {

@@ -7582,6 +7582,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
      * Once Phase 4B lands the dial will start producing smaller buffers
      * without any further plumbing churn. */
     requestContext.playbackScaleFactor = effectivePlaybackScaleFactorForRequest();
+    // LOOK-LABEL-PLAYBACK-INFO-1 r3 (adversary 9c9941cd A1): the asked scale too, so a clamped x8 reads "Eighth->Full".
+    requestContext.playbackScaleFactorPolicy = playbackScaleFactorPolicyDecision();
 
     /* CPU-DEBAYERED16-HONOUR-SCALE-1: may the recon worker reconstruct this
      * request's OutputDebayered16 frame at the preview scale? Only when the prep
@@ -24235,7 +24237,7 @@ void MainWindow::updatePlaybackQualityIndicator( void )
         aggressivePreviewActive,
         m_lastPresentedPlaybackScaleFactorActive,
         m_lastPresentedRequestContextValid,
-        m_lastPresentedRequestContext.playbackScaleFactor,
+        m_lastPresentedRequestContext.playbackScaleFactorPolicy,   // r3 (A1): the label below matches on the asked scale
         phase3Tier,
         static_cast<int>( gpuPlaybackPipelineStatus ),
         scopePerformanceCaveat
@@ -24295,13 +24297,13 @@ void MainWindow::updatePlaybackQualityIndicator( void )
     auto playbackScaleLabel = [this]( int requestedScale ) -> QString
     {
         const int activeScale = m_lastPresentedPlaybackScaleFactorActive;
-        const bool activeScaleValid =
-            activeScale == 1 || activeScale == 2 || activeScale == 4 || activeScale == 8;
-        const bool sameRequest =
-            m_lastPresentedRequestContextValid
-         && m_lastPresentedRequestContext.playbackScaleFactor == requestedScale;
+        // LOOK-LABEL-PLAYBACK-INFO-1 r3 (adversary 9c9941cd A1): matched on the presented request's ASKED scale, so the GPU
+        // texture route's clamp of x8 to 1 reads as presented Full, never as "x8" (the effective 1 never equals the asked 8).
+        const bool presentedBelongs = playback_info_label::presentedScaleBelongsToRequest(
+            m_lastPresentedRequestContextValid, m_lastPresentedRequestContext.playbackScaleFactorPolicy,
+            requestedScale, activeScale );
         return PlaybackScaleLabel::indicatorText(
-            requestedScale, ( activeScaleValid && sameRequest ) ? activeScale : requestedScale );
+            requestedScale, presentedBelongs ? activeScale : requestedScale );
     };
 
     QString text;
@@ -24554,7 +24556,7 @@ void MainWindow::refreshPlaybackInfoOnInputChange( GpuPlaybackPipelineStatus sta
     inputs.requestedScale = playbackScaleFactorPolicyDecision();
     inputs.presentedScale = m_lastPresentedPlaybackScaleFactorActive;
     inputs.requestContextValid = m_lastPresentedRequestContextValid;
-    inputs.requestContextScale = m_lastPresentedRequestContext.playbackScaleFactor;
+    inputs.requestContextScale = m_lastPresentedRequestContext.playbackScaleFactorPolicy;   // r3: the asked scale (A1)
     inputs.gpuAmaze = m_lastPresentedFrameUsedGpuAmazeDebayer;
     inputs.gpuBilinear = m_lastPresentedFrameUsedGpuBilinearDebayer;
     if( inputs == m_playbackInfoInputs ) return;
@@ -33772,9 +33774,10 @@ playback_info_label::Facts MainWindow::playbackInfoFacts( void )
     facts.requestedScale = playbackScaleFactorPolicyDecision();
     const int activeScale = m_lastPresentedPlaybackScaleFactorActive;
     facts.presentedScale = activeScale;
-    facts.presentedValid = ( activeScale == 1 || activeScale == 2 || activeScale == 4 || activeScale == 8 )
-                        && m_lastPresentedRequestContextValid
-                        && m_lastPresentedRequestContext.playbackScaleFactor == facts.requestedScale;
+    // r3 (adversary 9c9941cd A1): matched on the presented request's ASKED scale (a texture-route clamp of x8 is "Eighth->Full").
+    facts.presentedValid = playback_info_label::presentedScaleBelongsToRequest(
+        m_lastPresentedRequestContextValid, m_lastPresentedRequestContext.playbackScaleFactorPolicy,
+        facts.requestedScale, activeScale );
     // The chosen debayer's menu text, never the playback debayer label helper (it returns "receipt").
     facts.debayer = m_pChosenDebayer ? m_pChosenDebayer->text() : QString();
     facts.debayerOnGpu = m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer;
