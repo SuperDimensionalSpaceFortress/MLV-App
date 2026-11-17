@@ -1294,7 +1294,8 @@ function Get-CredentialXmlHitIndex {
 # next table header) carries a value that is not on the closed exemption list, or has no key/value form at all (deny by default: 'key = "hunter2"' under '[auth]' names no
 # secret by its own key). A body of blank and '#' comment lines holds nothing. Returns the index of the header, -1 when there is none.
 # r19 pass 22 A2: a quoted name part may hold brackets ('["secret[primary]"]'), so a quoted run is one unit of the header name
-$script:CredentialTableHeaderRegex = [regex]::new('(?m)^[ \t]*\[{1,2}[ \t]*((?:"[^"\r\n]*"|''[^''\r\n]*''|[^\[\]\r\n"''])+?)[ \t]*\]{1,2}[ \t]*(?:#[^\n]*)?$')
+# r23 (adversary pass 27 A2): an INI header may end in a ';' comment too ('[auth] ; connection settings'); only '#' was allowed, so that table was never seen
+$script:CredentialTableHeaderRegex = [regex]::new('(?m)^[ \t]*\[{1,2}[ \t]*((?:"[^"\r\n]*"|''[^''\r\n]*''|[^\[\]\r\n"''])+?)[ \t]*\]{1,2}[ \t]*(?:[#;][^\n]*)?$')
 function Get-CredentialTableHitIndex {
     param([string]$Text)
     $heads = @($script:CredentialTableHeaderRegex.Matches($Text))
@@ -1327,6 +1328,21 @@ function Get-CredentialHitIndex {
     return $best
 }
 
+# r23 (adversary pass 27 A1; pass 26 A3): the escapes a TOML, YAML or JSON reader decodes in a key or value: \uXXXX, \UXXXXXXXX (TOML), \xXX (YAML) and \/ (JSON).
+# Only \uXXXX used to be decoded, so '"\U00000070assword" = "hunter2"' and '"\x70assword": hunter2' named no secret. A \U value that is not a Unicode scalar is left as written.
+function Test-CredentialEscapesPresent([string]$Text) { return ("$Text" -match '\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|/)') }
+function ConvertFrom-CredentialEscapes([string]$Text) {
+    return [regex]::Replace("$Text", '\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2})|(/))', [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
+        if ($m.Groups[3].Success) { return [string][char][Convert]::ToInt32($m.Groups[3].Value, 16) }
+        if ($m.Groups[4].Success) { return '/' }
+        $cp = [Convert]::ToInt64($m.Groups[2].Value, 16)
+        if ($cp -gt 0x10FFFF -or ($cp -ge 0xD800 -and $cp -le 0xDFFF)) { return $m.Value }
+        return [char]::ConvertFromUtf32([int]$cp)
+    })
+}
+
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
 # judged as written AND with its JSON \uXXXX escapes decoded (p5 A1: '{"api_key":"x"}' says api_key). The Export scan and the Import host-side
 # test both call this one function.
@@ -1348,8 +1364,8 @@ function Get-CredentialHitLine {
     $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
     # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
     $idx = Get-CredentialHitIndex $Text
-    if ($idx -lt 0 -and $Text.Contains('\u')) {
-        $Text = [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+    if ($idx -lt 0 -and (Test-CredentialEscapesPresent $Text)) {
+        $Text = ConvertFrom-CredentialEscapes $Text   # r23 (pass 27 A1): \u, \U, \x and \/ escapes, not only \u
         $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
         $idx = Get-CredentialHitIndex $Text
     }
@@ -1723,7 +1739,7 @@ function Test-CredentialNamePresent {
     param([string]$Text)
     if (-not $Text) { return $false }
     $texts = @($Text)
-    if ($Text.Contains('\u')) { $texts += [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }) }
+    if (Test-CredentialEscapesPresent $Text) { $texts += ConvertFrom-CredentialEscapes $Text }   # r23 (pass 27 A1 sibling): the same decoder as the content guard
     foreach ($t in $texts) {
         # r16 (adversary pass 15 A2): the seen set is CASE-SENSITIVE (ordinal). The classifier splits camelCase, so 'authHeader' (auth + header: secret-named) and
         # 'authheader' (one word: not) get different answers; a case-insensitive @{} table skipped the camelCase spelling after its benign lowercase twin.

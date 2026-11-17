@@ -2459,6 +2459,17 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r23 A2')) {
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $r23fresh 'doctrine\.git')) -and @($r23fb | Where-Object { $_ -like 'CLONE_DOCTRINE_REMOTE_MISMATCH*' }).Count -ge 1) 'r23 A2 doctrine: an initial doctrine clone whose url a url.insteadOf rule rewrites is refused typed CLONE_DOCTRINE_REMOTE_MISMATCH and nothing is cloned' "failures=$($r23fb -join ',')"
     $script:Failures.Clear()
 }
+# r23 (adversary pass 27 A1/A2 on d7359c2c; pass 26 A3): the credential detector decodes the \U, \x and \/ escapes a TOML, YAML or JSON reader decodes, and an INI table header
+# may end in a ';' comment
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r23 p27 detector')) {
+    Assert-That (Test-CredentialText '"\U00000070assword" = "hunter2"') 'r23 p27 A1 detector: a TOML \U00000070assword key is a credential' ''
+    Assert-That (Test-CredentialText ('["\U00000061uth"]' + "`n" + 'key = "hunter2"')) 'r23 p27 A1 detector: a TOML table ["\U00000061uth"] with a value is a credential' ''
+    Assert-That (Test-CredentialText '"\x70assword": hunter2') 'r23 p27 A1 detector: a YAML \x70assword key is a credential' ''
+    Assert-That (Test-CredentialText '{"endpoint":"https:\/\/alice:hunter2@example.org/repo"}') 'r23 p26 A3 detector: a JSON url with \/ escapes and user:password is a credential' ''
+    Assert-That (Test-CredentialText ('[auth] ; connection settings' + "`n" + 'key = hunter2')) 'r23 p27 A2 detector: an INI [auth] table whose header ends in a ; comment is a credential' ''
+    Assert-That (-not (Test-CredentialText '"\U00000070ath" = "C:/work"')) 'r23 p27 control detector: a \U escape that spells a plain key is not a credential' ''
+    if (Test-Has 'Test-CredentialNamePresent' 'r23 p27 role name') { Assert-That (Test-CredentialNamePresent '\U00000070assword') 'r23 p27 A1 role name: a \U-escaped password name is a credential name' '' }
+}
 # (c) fable key3 r21 B1 + H1, opus H2: deny by default. An ssh spelling is normalised only for a plain user, host and path; anything else is keyed by its raw string.
 if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r22 fable B1')) {
     Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:a~b/lease.git' 'ssh://git@nas.example/~/a~b/lease.git')) 'r22 fable B1 R-a url: an scp path whose second character is ~ (Git sends ~b/lease.git) is not ssh://host/~/a~b/lease.git'
