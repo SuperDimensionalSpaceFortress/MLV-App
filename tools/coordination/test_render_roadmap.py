@@ -1159,5 +1159,91 @@ class R3Pass7Tests(R3Tests):
         self.assertEqual(render_roadmap.render(self.board(a, b)), render_roadmap.render(self.board(b, a)))
 
 
+class R4DepthTests(unittest.TestCase):
+    """OWNER-ASK-PARK-GUARD-1 r4: r3 OPEN A1 (review-adversary-OWNER-ASK-PARK-GUARD-1-r3-6739295e). A row with an extra field nested
+    thousands of arrays deep passed _load and then raised RecursionError in json.dumps (_canonical and its siblings). Past
+    MAX_NESTING levels the queue is bad input: exit 2 with a typed message, never a traceback."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def deep_text(self, depth: int, **row_extra: str) -> str:
+        """The adversary's exact input shape, written as text (json.dumps itself cannot serialise it)."""
+        extra = "".join(',"%s":%s' % (k, v) for k, v in row_extra.items())
+        return ('{"schema":"mlv-app/card-queue/v1","generated_utc":"2026-10-23","rows":[{"card":"X","kind":"product","priority":1,'
+                '"state":"queued","source_ledger_stamp":"2026-10-20"%s,"extra":%s0%s}]}' % (extra, "[" * depth, "]" * depth))
+
+    def write_text(self, text: str) -> Path:
+        p = Path(self.tmp.name) / "q.json"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def load_code(self, text: str) -> tuple[int, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                render_roadmap._load(self.write_text(text))
+                return 0, err.getvalue()
+            except SystemExit as exc:
+                return exc.code, err.getvalue()
+
+    def main_code(self, text: str, *flags: str) -> tuple[int, str]:
+        """main on the text: a status (never an exception, RecursionError included)."""
+        p = self.write_text(text)
+        out = Path(self.tmp.name) / "roadmap.md"
+        out.write_bytes(b"stale\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                return render_roadmap.main(["--card-queue", str(p), "--out", str(out), *flags]), err.getvalue()
+            except SystemExit as exc:
+                return exc.code, err.getvalue()
+
+    def test_a1_a_deeply_nested_extra_field_is_bad_input_not_a_recursion_error(self) -> None:
+        for depth in (render_roadmap.MAX_NESTING + 5, 3000, 5000):
+            with self.subTest(depth=depth):
+                code, err = self.load_code(self.deep_text(depth))
+                self.assertEqual(code, 2, err)
+                self.assertIn("nests", err)
+
+    def test_a1_every_entry_point_returns_a_status_on_the_adversary_input(self) -> None:
+        for state in ("queued", "parked"):
+            text = self.deep_text(5000).replace('"state":"queued"', '"state":"%s"' % state)
+            for flags in (("--check",), (), ("--drain-line",)):
+                with self.subTest(state=state, flags=flags):
+                    code, err = self.main_code(text, *flags)
+                    self.assertEqual(code, 2, err)
+
+    def test_a1_the_owner_origin_variant_is_bad_input_too(self) -> None:
+        code, err = self.main_code(self.deep_text(5000, origin='"owner"'), "--check")
+        self.assertEqual(code, 2, err)
+
+    def test_a1_json_that_python_itself_cannot_parse_that_deep_is_bad_input(self) -> None:
+        for depth in (20000, 100000):
+            with self.subTest(depth=depth):
+                code, err = self.load_code(self.deep_text(depth))
+                self.assertEqual(code, 2, err)
+
+    def test_a1_a_deep_chain_of_objects_is_bounded_too(self) -> None:
+        deep_obj = '{"k":' * 5000 + "0" + "}" * 5000
+        text = self.deep_text(1).replace('"extra":[0]', '"extra":' + deep_obj)
+        code, err = self.load_code(text)
+        self.assertEqual(code, 2, err)
+        self.assertIn("nests", err)
+
+    def test_a1_the_bound_is_exact(self) -> None:
+        base = 3   # the queue object, its rows list and the row object take three levels before the extra field
+        at_bound = self.deep_text(render_roadmap.MAX_NESTING - base)
+        self.assertEqual(self.load_code(at_bound)[0], 0)
+        code, err = self.main_code(at_bound, "--check")
+        self.assertEqual(code, 1, err)   # the stale output differs: a comparison status, not an error
+        self.assertEqual(self.load_code(self.deep_text(render_roadmap.MAX_NESTING - base + 1))[0], 2)
+
+    def test_a1_live_shaped_rows_are_nowhere_near_the_bound(self) -> None:
+        self.assertEqual(self.load_code(json.dumps(load_fixture()))[0], 0)
+        self.assertLessEqual(render_roadmap.MAX_NESTING, 100)   # a bound that would not stop the 3,000-deep input is no bound
+
+
 if __name__ == "__main__":
     unittest.main()

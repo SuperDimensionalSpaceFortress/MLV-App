@@ -427,6 +427,30 @@ def _utf8_ok(text: str) -> bool:
     return True
 
 
+# (r4, r3 OPEN A1) the deepest nesting of arrays and objects a queue may hold. Live rows nest to about four (queue, rows, row,
+# order_chain); an extra field thousands of levels deep passed _load and made json.dumps (_canonical and its callers) raise
+# RecursionError. 64 is far above any live shape and far below the interpreter's recursion limit.
+MAX_NESTING = 64
+
+
+def _nesting_exceeds(data: object, limit: int = MAX_NESTING) -> bool:
+    """True when `data` holds arrays or objects nested more than `limit` levels deep (the top-level value is level 1). Iterative
+    and path-free, so the walk itself is linear in the size of the input and cannot recurse however deep that input is."""
+    stack = [(data, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if isinstance(value, dict):
+            children = value.values()
+        elif isinstance(value, list):
+            children = value
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
+
 def _non_utf8_text(data: object) -> str:
     """'' when every string in the parsed queue (dict keys included, at any depth) encodes as UTF-8, else the JSON path of the
     first one that does not (r3 A2 on 6c9167ce: a lone surrogate in `state` or `order_chain` passed _load and then crashed the
@@ -520,6 +544,10 @@ def _load(path: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         _die("cannot read %s: %s" % (path, exc))
+    except RecursionError:   # (r4) the parser itself gives up at about 10,000 levels: the same bad input, one step earlier
+        _die("%s nests JSON more than %d levels deep" % (path, MAX_NESTING))
+    if _nesting_exceeds(data):   # (r4 A1) before any later step: every json.dumps below then runs on a bounded value
+        _die("%s nests JSON more than %d levels deep" % (path, MAX_NESTING))
     if not isinstance(data, dict) or data.get("schema") != SCHEMA or not isinstance(data.get("rows"), list):
         _die("%s is not a %s file" % (path, SCHEMA))
     if not isinstance(data.get("generated_utc"), str):
