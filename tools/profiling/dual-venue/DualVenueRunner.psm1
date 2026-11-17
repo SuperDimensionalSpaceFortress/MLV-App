@@ -2442,11 +2442,17 @@ function Get-DvLookAssistEvidence {
     $reason = $null
     if ($requested) {
         $found = $null
+        # r27 (sol r26 B1 on af784b7b): whether the answering record's DISCARDED text (Get-DvLogRecordDiscardedText) mentions look_assist_enabled
+        $foundEnabledDiscarded = $false
         # VENUE-NATIVE-LEG-LOOKLEG-LABEL-1 r2 (Dot bd11a92): every flavor token of every visual_state record, so duplicate records that disagree can be told from one that is repeated
         $flavorsSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
-            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+            # r27: the raw lines, index for index with the bodies (Get-DvLogRecordBodies splits the same way and keeps every line), for the discarded text
+            $rawLines = $LogText -split "`r?`n"
+            $bodies = Get-DvLogRecordBodies -LogText $LogText
+            for ($li = 0; $li -lt $bodies.Count; $li++) {
+                $line = $bodies[$li]
                 # r3 (r2 adversary pass 6 A3): the visual_state record only where it starts the record body (logInteractionEvent writes
                 # `interaction_trace event=<name> ...`), never an `event=gui_smoke.visual_state` text inside another record
                 # r13 (r12 adversary A1): culture-invariant ($script:DvCi), so a tr-TR `INTERACTION_TRACE event=gui_smoke.visual_state look_assist_enabled=0`
@@ -2475,6 +2481,17 @@ function Get-DvLookAssistEvidence {
                     # (GpuPreviewProcessing.cpp) opens a ` (` that Get-DvLocationOpenIndex takes for the location, and with a readable `:<line>)` tail the
                     # flavor vanished with no sentinel at all. An app build that writes no flavor key proves no flavor either way (exactFlavor below).
                     if ($line.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal) -or $lineFlavorTokens.Count -eq 0) { [void]$flavorsSeen.Add($script:DvLocationUnreadable) }
+                    # r27 (sol r26 B1 on af784b7b, its input: `look_assist_flavor=cinematic gpu_preview_processing_reject_reason=transform (upside down)
+                    # enabled look_assist_flavor=classic (C:/b/MainWindow.cpp:10011)`): the cut at the unquoted ` (` kept the earlier cinematic token, the
+                    # READABLE `:<line>)` ending left no sentinel, and the conflicting classic was discarded, so cinematic was proven. INV-1: ANY bounded
+                    # mention of the key in the text the cut discarded (Get-DvLogRecordDiscardedText, the location included) may be a discarded value, so it
+                    # adds the UNREADABLE token and no flavor is proven, in this record or any other. The same for look_assist_enabled in the answering record.
+                    $discarded = Get-DvLogRecordDiscardedText -Line $rawLines[$li]
+                    $foundEnabledDiscarded = $false
+                    if ($discarded.Length -gt 0) {
+                        if (@(Get-DvLookKeyTokens -Body $discarded -Key 'look_assist_flavor').Count -gt 0) { [void]$flavorsSeen.Add($script:DvLocationUnreadable) }
+                        $foundEnabledDiscarded = (@(Get-DvLookKeyTokens -Body $discarded -Key 'look_assist_enabled').Count -gt 0)
+                    }
                 }
             }
         }
@@ -2483,6 +2500,8 @@ function Get-DvLookAssistEvidence {
         # r24 (r24 adversary pass 2 A1 sibling): a visual_state record that lost its tail to the LOCATION_UNREADABLE sentinel may have said
         # look_assist_enabled=0 there, so it is unreadable whole, never read from the fields before the cut
         elseif ($found.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $reason = "the app's last gui_smoke.visual_state line lost its tail to an unreadable location, so whether Look Assist was on is unreadable" }
+        # r27 (sol r26 B1 sibling): the answering record's discarded text names look_assist_enabled, which may have said 0 there: unreadable whole, as r24
+        elseif ($foundEnabledDiscarded) { $reason = "the app's last gui_smoke.visual_state line names look_assist_enabled in the text cut at its location (an unquoted ' (' before a readable location ending), so whether Look Assist was on is unreadable" }
         else {
             $m = [regex]::Match($found, '(^|\s)look_assist_enabled=(?<v>\S+)')
             if (-not $m.Success) { $reason = 'the app''s gui_smoke.visual_state line carries no look_assist_enabled' }
@@ -2511,7 +2530,7 @@ function Get-DvLookAssistEvidence {
                 $enabledValues = @([System.Collections.Generic.HashSet[string]]::new([string[]]@($enabledTokens), [StringComparer]::Ordinal))
                 if ($exactFlavor.Count -ge 1 -and $flavorsSeen.Count -eq 1 -and $lastFlavors.Count -eq 1 -and $enabledValues.Count -eq 1 -and (Test-DvAppliedLookFlavor $lastFlavors[0])) { $flavor = $lastFlavors[0] }
                 # r26 (opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1): an unproven flavor is TYPED, never a silent null
-                elseif ($flavorsSeen.Contains($script:DvLocationUnreadable)) { $flavorReason = 'FLAVOR_UNREADABLE: a gui_smoke.visual_state record lost its tail (an unreadable location, or a cut before look_assist_flavor, which the app writes last), so the applied flavor is unreadable' }
+                elseif ($flavorsSeen.Contains($script:DvLocationUnreadable)) { $flavorReason = 'FLAVOR_UNREADABLE: a gui_smoke.visual_state record lost its tail (an unreadable location, a cut before look_assist_flavor, which the app writes last, or a look_assist_flavor mention in the text cut at the location), so the applied flavor is unreadable' }
                 elseif ($flavorsSeen.Count -gt 1 -or $lastFlavors.Count -gt 1) { $flavorReason = 'FLAVOR_AMBIGUOUS: the gui_smoke.visual_state records name more than one look_assist_flavor token, so no applied flavor is proven' }
                 elseif ($exactFlavor.Count -eq 0) { $flavorReason = 'FLAVOR_ABSENT: the answering gui_smoke.visual_state record carries no lower-case look_assist_flavor= token' }
                 elseif ($enabledValues.Count -ne 1) { $flavorReason = 'FLAVOR_UNPROVEN: the answering gui_smoke.visual_state record names look_assist_enabled more than once' }
@@ -2779,6 +2798,24 @@ function Get-DvLogRecordBody {
     # the path is everything between `(` (at $open + 1) and the colon, and must not be empty
     if ($colon -gt $open + 2) { return $body }
     $body + $script:DvLocationUnreadable
+}
+
+function Get-DvLogRecordDiscardedText {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r27 (sol r26 B1 on af784b7b; opus key3 r25 DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1): the RAW text
+    Get-DvLogRecordBody cuts from one run-log line (from the location open index to the end of the line, the Qt location included), or '' when it cuts
+    nothing. The cut stays at the FIRST ` (` outside a quoted value (r4/r5: a location path may hold ` (`, so a later ` (` is never trusted to be the
+    location, and path text never reaches a body). But the app writes one UNQUOTED value with ` (` (GpuPreviewProcessing.cpp: reject reason
+    `transform (upside down) enabled`), so with a readable `:<line>)` ending the cut can discard body fields with NO sentinel. A reader that proves a value
+    from one key checks this text for that key: a mention here may be a discarded conflicting value, so it proves nothing (INV-1). It never forges: it
+    only ever makes a reader refuse more.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Line)
+    if ([string]::IsNullOrEmpty($Line) -or $Line.IndexOf(' (', [StringComparison]::Ordinal) -lt 0) { return '' }
+    $open = Get-DvLocationOpenIndex -Line $Line
+    if ($open -lt 0) { return '' }
+    $Line.Substring($open)
 }
 
 # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker on b8f8e6e6, sol r23 blocker, r23 adversary A1): what an `=` inside a quoted

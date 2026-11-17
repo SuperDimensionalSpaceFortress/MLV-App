@@ -16701,6 +16701,76 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
         got = self.each(expr, logs + controls)
         self.assertEqual(got, ["|HONOURED|False"] * len(logs) + ["cinematic|HONOURED|False"] * len(controls), got)
 
+    # sol r26 B1 on af784b7b: the app's UNQUOTED reject reason (GpuPreviewProcessing.cpp:3608) opens a ` (` that Get-DvLocationOpenIndex takes for the
+    # location; with a READABLE `:<line>)` ending no sentinel is left, and the cut discarded a conflicting flavor written after it
+    R27_REJECT = "gpu_preview_processing_reject_reason=transform (upside down) enabled "
+    R27_LOC = " (C:/b/MainWindow.cpp:10011)"
+
+    def test_r27_b1_a_flavor_discarded_with_a_readable_location_is_never_proven(self) -> None:
+        # sol r26 B1 on af784b7b, its input verbatim (classic) and the two other flavors it names, as an EARLIER record and as the answering LAST
+        # record: on af784b7b the cut kept the earlier cinematic token and proved it (cinematic|HONOURED|False). INV-1: text discarded from a record
+        # body that mentions look_assist_flavor never lets an earlier token prove the flavor; the reason is TYPED (FLAVOR_UNREADABLE), never silent
+        vs = self.R26_VS
+        cut = vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_flavor={o}" + self.R27_LOC
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        logs = []
+        for other in ("classic", "film", "vision50d"):
+            logs.append(cut.format(o=other) + "\n" + intact)
+            logs.append(intact + "\n" + cut.format(o=other))
+        # the class: any discarded mention (upper case, masked or bare key), a tail that only LOOKS like a location path, a path after a second ` (`
+        logs += [intact + "\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "LOOK_ASSIST_FLAVOR=classic" + self.R27_LOC,
+                 intact + "\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_flavor" + self.R27_LOC,
+                 vs + "look_assist_enabled=1 look_assist_flavor=cinematic (x) look_assist_flavor=classic:12)",
+                 vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b x) ,look_assist_flavor=classic/MainWindow.cpp:12)"]
+        got = self.each(self.R26_EXPR, logs)
+        self.assertEqual(got, ["|HONOURED|False"] * len(logs), got)
+        reasons = self.each("[string](Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log).flavorReason", logs)
+        for i, r in enumerate(reasons):
+            with self.subTest(case=i):
+                self.assertTrue(r.startswith("FLAVOR_UNREADABLE:"), reasons)
+        # controls (sol's own): the rejection text QUOTED exposes the conflict (FLAVOR_AMBIGUOUS); no earlier cinematic token is FLAVOR_UNREADABLE
+        quoted = vs + 'look_assist_enabled=1 look_assist_flavor=cinematic gpu_preview_processing_reject_reason="transform (upside down) enabled" look_assist_flavor=classic'
+        bare = vs + "look_assist_enabled=1 " + self.R27_REJECT + "look_assist_flavor=classic" + self.R27_LOC
+        ctl = self.each("$e = Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log; '{0}|{1}|{2}' -f $e.flavor, $e.verdict, ([string]$e.flavorReason).Split(':')[0]",
+                        [quoted, bare])
+        self.assertEqual(ctl, ["|HONOURED|FLAVOR_AMBIGUOUS", "|HONOURED|FLAVOR_UNREADABLE"], ctl)
+
+    def test_r27_b1_a_look_assist_enabled_discarded_from_the_answering_record_is_unreadable(self) -> None:
+        # sibling of sol r26 B1 (same class, the other key the reader proves): `look_assist_enabled=0` discarded after the unquoted ` (` read as on. The
+        # answering record is unreadable for Look Assist on (NOT_HONOURED, blocks), as the r24 LOCATION_UNREADABLE tail is; an earlier record never answers
+        vs = self.R26_VS
+        last = vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_enabled=0" + self.R27_LOC
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        got = self.each(self.R26_EXPR, [last, intact + "\n" + last,
+                                        vs + "look_assist_enabled=1 look_assist_flavor=cinematic (x) LOOK_ASSIST_ENABLED=0:12)"])
+        self.assertEqual(got, ["|NOT_HONOURED|True"] * 3, got)
+
+    def test_r27_b1_the_app_s_real_reject_reason_shape_and_located_records_still_read(self) -> None:
+        # controls: the app's real record (reject reason unquoted, ONE flavor, written last) keeps the r26 typed refusal and Look Assist reads on; a
+        # readable location whose path holds no bounded look key (LookAssistAnalysis.cpp has no `look_assist_` key) still proves the flavor
+        vs = self.R26_VS
+        real = vs + "look_assist_enabled=1 look_assist_diagnostics_valid=1 " + self.R27_REJECT + "look_assist_flavor=cinematic" + self.R27_LOC
+        got = self.each("$e = Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log; '{0}|{1}|{2}' -f $e.flavor, $e.verdict, ([string]$e.flavorReason).Split(':')[0]",
+                        [real, vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b/src/batch/LookAssistAnalysis.cpp:120)",
+                         vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b (x)/MainWindow.cpp:10011)"])
+        self.assertEqual(got, ["|HONOURED|FLAVOR_UNREADABLE", "cinematic|HONOURED|", "cinematic|HONOURED|"], got)
+
+    def test_r27_b1_neither_claim_predicate_accepts_a_discarded_conflict(self) -> None:
+        # sol r26 B1: with the committed m16-1457-native-fullscreen-s1-wake-post spec, the writer's lookAssistOn condition (Invoke-VenueLeg.ps1) was true
+        # and the validator's LOOK_ASSIST_CLAIM_UNBACKED condition (Test-DvReceiptValid) false. Both are evaluated here as the sources write them
+        vs = self.R26_VS
+        cut = vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_flavor={o}" + self.R27_LOC
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        logs = [cut.format(o="classic") + "\n" + intact, intact + "\n" + cut.format(o="film"), cut.format(o="vision50d") + "\n" + intact]
+        spec = (DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").as_posix()
+        expr = ("$spec = Get-Content -Raw -LiteralPath '" + spec + "' | ConvertFrom-Json; $e = Get-DvLookAssistEvidence -Spec $spec -LogText $log; "
+                "$req = 'cinematic'; $lf = [string]$e.flavor; "
+                "$w = [bool]($e.asked -and ($e.verdict -ceq 'HONOURED') -and (Test-DvLookFlavorSame $req $req) -and (Test-DvLookFlavorSame $lf $req)); "
+                "$r = -not ($e.asked -and $e.verdict -ceq 'HONOURED' -and (Test-DvLookFlavorSame $req $req) -and (Test-DvLookFlavorSame $lf $req) -and (Test-DvLookFlavorSame $req $lf)); "
+                "'{0}|{1}|{2}' -f [bool]$e.asked, $w, $r")
+        got = self.each(expr, logs + [intact])
+        self.assertEqual(got, ["True|False|True"] * len(logs) + ["True|True|False"], got)
+
 
     # sol r25 B2: U+200B (zero-width space), U+00AD (soft hyphen), U+FEFF (zero-width no-break space), each ignorable to a linguistic compare
     R26_IGNORABLE = ("\u200b", "\u00ad", "\ufeff")
