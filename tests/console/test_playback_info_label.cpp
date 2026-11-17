@@ -730,3 +730,20 @@ TEST(PlaybackInfoLabel, R7P10A1ScaledCpuFrameNeverNamesTheSelectedDebayerAsRan)
     f.gpuDebayer = QString();
     ASSERT_QSTR_EQ(QStringLiteral("AMaZE (GPU)"), playback_info_label::debayerField(f));
 }
+
+// r7 adversary pass 11 A1 (045434fc): Stop at t=100 ms, Play at t=450 ms with no idle tick between: the corner kept the last
+// Play's measured 23.8 (only the > 500 ms idle reset zeroed it) and composed "23.8/24 fps" before this Play measured a frame.
+// The Play toggle drops the snapshot BEFORE the relabel it triggers, so a new Play reads "--" until its own measurement.
+TEST(PlaybackInfoLabel, R7P11A1APlayToggleDropsThePreviousPlaysRate)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString toggled = functionBody(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    ASSERT_FALSE(toggled.isEmpty());
+    const int dropAt = toggled.indexOf(QStringLiteral("m_playbackInfoFpsShown = 0.0;\n    updatePlaybackInfoLabel();"));
+    ASSERT_TRUE(dropAt >= 0);
+    // the composed form for a new Play with no snapshot is "--/24 fps"
+    playback_info_label::Facts f = ownerFacts();
+    f.playing = true;
+    f.achievedFps = 0.0;
+    ASSERT_QSTR_EQ(QStringLiteral("--/24 fps"), playback_info_label::fpsField(f));
+}

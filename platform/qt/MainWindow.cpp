@@ -32902,6 +32902,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     m_playbackPaceGuard.reset();
     if( checked ) m_conformDropDebtFrames = 0.0;   // HFR-NATIVE-60FPS-FULLRES-1 r24: no held conform frame survives a Play start
     // LOOK-LABEL-PLAYBACK-INFO-1: playing <-> stopped changes the fps form ("--/24 fps" vs "24 fps").
+    // r7 (adversary pass 11 A1 on 045434fc): the corner rate belongs to one Play. Stop -> Play within 500 ms with no idle tick
+    // kept the last Play's 23.8 and composed "23.8/24 fps" before this Play measured anything: it reads "--" until it does.
+    m_playbackInfoFpsShown = 0.0;
     updatePlaybackInfoLabel();
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
     // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
