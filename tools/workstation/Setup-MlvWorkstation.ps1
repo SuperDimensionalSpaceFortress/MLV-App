@@ -832,7 +832,7 @@ $CredentialNameWords = 'SECRET|PASS[_.\-]*W(?:OR)?D|PRIVATE[_.\-]*KEY|API[_.\-]*
 # classifier still decides every candidate ('a_u_t_h' is offered and rejected, as 'author' is).
 # r16 (adversary pass 16 A2): any number of CLOSING characters may stand between the name and its separator ('$c[(("password"))] = "x"' has four); the r15 bound of
 # three let a fourth closer hide the key. The run is linear (each step needs one closer), so it cannot backtrack catastrophically.
-$CredentialNameCore = (@('password', 'passwd', 'secret', 'credential', 'apikey', 'privatekey', 'accesskey', 'auth', 'token', 'pwd') | ForEach-Object { (@($_.ToCharArray()) | ForEach-Object { [string]$_ }) -join '[_.\-]*' }) -join '|'
+$CredentialNameCore = (@('password', 'passwd', 'secret', 'credential', 'apikey', 'privatekey', 'accesskey', 'auth', 'token', 'pwd') | ForEach-Object { (@($_.ToCharArray()) | ForEach-Object { [string]$_ }) -join '[_.\-/\\]*' }) -join '|'   # r19 pass 22 A1: '/' and '\' separate letters as '_' does ('api/key')
 # r19 pass 21 A1: a '/' or '\' may stand inside a key name ('password/primary', 'vault\secret'): the name run is the classifier's own separators plus those two
 $CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-/\\])([A-Za-z0-9_.\-/\\]*?(?:' + $CredentialNameCore + ')[A-Za-z0-9_.\-/\\]*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
@@ -855,7 +855,8 @@ $SecretPatterns = @(
     'gh[pousr]_[A-Za-z0-9]{30,}', 'github_pat_[A-Za-z0-9_]{30,}', 'xox[abprs]-[A-Za-z0-9\-]{10,}',
     '-----BEGIN [A-Z ]*PRIVATE KEY-----', '"(access|refresh|id)_?[Tt]oken"\s*:\s*"[^"]{16,}"', 'AKIA[0-9A-Z]{16}',
     # r14: a URL that carries a user AND a password ('https://alice:hunter2@example.org', the .git-credentials shape)
-    '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"''<>]+:[^\s/@"''<>]+@'
+    # r19 pass 22 A3: an apostrophe is a legal password character ('https://alice:p''ass@host/'), so only '"', '<', '>' and blanks end the password run
+    '(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@"''<>]+:[^\s/@"<>]+@'
 )
 # r14: the XML element form of the key/value rule ('<password>hunter2</password>', '<DbPassword>x</DbPassword>'); the attribute form 'password="x"' is the line form.
 # r15 (pass 12 A2): the element's RAW content, from just after its opening tag to its matching closing tag (or to the end of the text when it is never closed), is
@@ -1097,7 +1098,8 @@ function Get-CredentialXmlHitIndex {
 # r19 pass 21 A1: a TOML / INI TABLE whose header names a secret ('[auth]', '[[auth.primary]]', '[tool.token]') holds a credential whenever any line of its body (up to the
 # next table header) carries a value that is not on the closed exemption list, or has no key/value form at all (deny by default: 'key = "hunter2"' under '[auth]' names no
 # secret by its own key). A body of blank and '#' comment lines holds nothing. Returns the index of the header, -1 when there is none.
-$script:CredentialTableHeaderRegex = [regex]::new('(?m)^[ \t]*\[{1,2}[ \t]*([^\[\]\r\n]+?)[ \t]*\]{1,2}[ \t]*(?:#[^\n]*)?$')
+# r19 pass 22 A2: a quoted name part may hold brackets ('["secret[primary]"]'), so a quoted run is one unit of the header name
+$script:CredentialTableHeaderRegex = [regex]::new('(?m)^[ \t]*\[{1,2}[ \t]*((?:"[^"\r\n]*"|''[^''\r\n]*''|[^\[\]\r\n"''])+?)[ \t]*\]{1,2}[ \t]*(?:#[^\n]*)?$')
 function Get-CredentialTableHitIndex {
     param([string]$Text)
     $heads = @($script:CredentialTableHeaderRegex.Matches($Text))
@@ -1142,6 +1144,8 @@ function Test-CredentialText {
 # Test-CredentialText is exactly "this is greater than 0", so the Export report and every guard always agree. Never returns the matched text.
 function Get-CredentialHitLine {
     param([string]$Text)
+    if (-not $Text) { return 0 }
+    $Text = $Text.Replace([string][char]0, '')   # r19 pass 22 A4: a NUL is never part of a credential file's text; a BOM-less UTF-16 file decodes with one between every letter
     if (-not $Text) { return 0 }
     # r15 pass 13 A1: every line separator is ONE '\n' before any rule runs ('\r\n', a lone '\r' as in '{"password":\r"hunter2"}', NEL U+0085, LS U+2028, PS U+2029).
     # The rules below (block form, indented lines, next value line, the hit line) all walk '\n'; a CR-only file used to look like one line and its block value was
@@ -1528,7 +1532,7 @@ function Test-CredentialNamePresent {
         # r16 (adversary pass 15 A2): the seen set is CASE-SENSITIVE (ordinal). The classifier splits camelCase, so 'authHeader' (auth + header: secret-named) and
         # 'authheader' (one word: not) get different answers; a case-insensitive @{} table skipped the camelCase spelling after its benign lowercase twin.
         $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($w in [regex]::Matches($t, '[A-Za-z0-9_.\-]+')) {
+        foreach ($w in [regex]::Matches($t, '[A-Za-z0-9_.\-/\\]+')) {   # r19 pass 22 A1: '/' and '\' stand inside a name word, as in the key pattern
             $v = $w.Value
             if (-not $seen.Add($v)) { continue }
             if (Get-CredentialKeyClass $v) { return $true }
@@ -1672,7 +1676,9 @@ function Read-ImportHeldBytes {
 function ConvertFrom-ImportBytes {
     param([byte[]]$Bytes)
     $sr = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.Encoding]::UTF8, $true)
-    try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+    # r19 pass 22 A4: a UTF-16 file WITHOUT a byte order mark decodes as NUL-separated text ('p<NUL>a<NUL>s...') that no rule matches; the NULs are removed so the same text is judged
+    # (a NUL never stands in a real credential file, so removing them only ever widens what is refused).
+    try { return $sr.ReadToEnd().Replace([string][char]0, '') } finally { $sr.Dispose() }
 }
 
 function Get-ImportBytesHash {
@@ -1916,6 +1922,9 @@ $script:ImportAfterSwapHook = $null
 # Test seam for r15 (pass 12 A5): called with the destination path while the rollback holds its lock on the host file, right before the rollback's File.Replace. It stands
 # for an editor saving in that instant (an in-place write is refused by the lock; a rename-over save lands and must be put back). Always $null in a real run.
 $script:ImportBeforeRollbackHook = $null
+# r19 pass 22 A6: test seam, called right before the rollback's second Replace (an editor's rename-over save in that instant). It MUST be initialised here: the script runs under
+# strict mode, and an unset script variable read in the rollback threw before the newest save could be put back. Always $null in a real run.
+$script:ImportBeforeAsideRestoreHook = $null
 
 # r12 A3: the settings.json profile rewrite (VIRTUAL-TEN profile -> this profile) as ONE locked read-judge-write on the host file, the same discipline as
 # Copy-ImportFileLocked: the file is opened exclusively (FileShare.None), read, judged by Test-CredentialText, and written back through the SAME handle. It used to be

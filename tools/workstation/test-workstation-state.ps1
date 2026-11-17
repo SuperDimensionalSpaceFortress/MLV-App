@@ -2136,6 +2136,18 @@ if ($fnLoaded -and (Test-Has 'Get-StagedFileVerdictDetail' 'r19 A5')) {
     Assert-That ((Get-StagedFileVerdictDetail -File ([IO.FileInfo]::new($r19e)) -MaxScanBytes 4096).Why -ceq '') 'r19 A5 export control: 2000 bytes under a 4096-byte limit is clean'
 }
 
+# ================================================================ r19 fix iteration 2 (head 72e24666): adversary pass 22, A1 A2 A3 A4 A6 (A5 DISTINGUISH, A7 advisory: see the PR)
+if ($fnLoaded -and (Test-Has 'Get-CredentialHitLine' 'r19 p22')) {
+    Assert-That (Test-CredentialText '{"api/key":"hunter2"}') 'r19 p22 A1 detector: api/key (a slash between the name words) is a credential key'
+    Assert-That (Test-CredentialNamePresent '{"api/key":""}') 'r19 p22 A1 role guard: a host role file naming api/key counts as naming a credential key'
+    Assert-That (Test-CredentialText "[`"secret[primary]`"]`nkey = `"hunter2`"`n") 'r19 p22 A2 detector: a quoted table name with brackets is still a secret-named table'
+    Assert-That (Test-CredentialText 'endpoint = "https://alice:p''ass@example.org/repo"') 'r19 p22 A3 detector: an apostrophe in a URL password does not hide it'
+    $r22 = Join-Path (New-Scratch 'r19-p22-a4') 'service.xml'
+    [IO.File]::WriteAllBytes($r22, [Text.Encoding]::Unicode.GetBytes('<?xml version="1.0" encoding="UTF-16LE"?><password>hunter2</password>'))   # UTF-16LE, no BOM
+    Assert-That ((Get-StagedFileVerdictDetail -File ([IO.FileInfo]::new($r22)) -MaxScanBytes 4096).Why -ceq 'credential pattern') 'r19 p22 A4 export: a BOM-less UTF-16LE file carrying a credential is refused'
+    Assert-That ($null -ne (Get-Variable -Scope Script -Name ImportBeforeAsideRestoreHook -ErrorAction SilentlyContinue)) 'r19 p22 A6 import: the rollback seam variable is initialised (strict mode would throw on an unset one)'
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
