@@ -135,6 +135,9 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    character, starts with `-`, or is rewritten by a `url.<base>.insteadOf` rule; it is refused, never
    compared. `GATE_LOCK_IO_FAILED` (exit 5) means the gate lock file could not be opened for a reason
    other than another holder; the gate does not run its target and a release changes nothing.)
+   (r23: a url that is also the name of a configured remote is `REMOTE_URL_UNSAFE` too, because git
+   would resolve it as that remote. A url Clone adds, and the url of a first clone, are checked the
+   same way before use.)
 
 5. **Do the owner-only checklist** (`-Phase Checklist` prints it). Then go through the cut-over phases.
 

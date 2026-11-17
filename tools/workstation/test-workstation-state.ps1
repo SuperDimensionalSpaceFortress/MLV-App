@@ -2404,6 +2404,61 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r22 fable B2 clone')) {
     Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_DOCTRINE_REMOTE_MISMATCH*' }).Count -eq 1) 'r22 fable B2 doctrine: a doctrine origin pushurl U<LF>U is refused typed CLONE_DOCTRINE_REMOTE_MISMATCH' ($script:Failures -join ',')
     $script:Failures.Clear()
 }
+# r23 (adversary pass 26 on ae45ed76, A1): git reads a url argument as a REMOTE NAME first, so a checked url string that is also the name of a configured remote is resolved as
+# that remote (its url / pushurl). The lease read and the lease push must refuse such a url (REMOTE_URL_UNSAFE): the push must never reach the alias's pushurl.
+if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r23 A1') -and (Get-Command New-R22LeaseRepo -ErrorAction SilentlyContinue)) {
+    $r23ra = New-R22LeaseRepo 'repo-r23-a1'
+    & git -C $r23ra remote add fork $r22read
+    & git -C $r23ra config "remote.$r22read.url" $r22read; & git -C $r23ra config "remote.$r22read.pushurl" $r22other
+    $r23gSaved = $script:Repo; $script:Repo = $r23ra
+    try { $r23gh = Get-HubLease } finally { $script:Repo = $r23gSaved }
+    Assert-That ("$($r23gh.Error)" -match 'REMOTE_URL_UNSAFE') 'r23 A1 lease read: a fetch url that is also the name of a configured remote is refused (REMOTE_URL_UNSAFE)' "err=$($r23gh.Error)"
+    $r23aErr = Invoke-R22Lease $r23ra @{ Exists = $true; Sha = $r22S; Holder = ''; Url = $r22read } 'r23a1'
+    Assert-That ($r23aErr -match 'LEASE_PUSH_URL_DIFFERS' -and $r23aErr -match 'REMOTE_URL_UNSAFE' -and (Get-R22Ref $r22other) -ceq $r22S -and (Get-R22Ref $r22read) -ceq $r22S) 'r23 A1 lease: a push url that is also a configured remote name (whose pushurl is other.git) is refused; other.git never receives the push' "err=$r23aErr otherRef=$(Get-R22Ref $r22other) S=$r22S"
+    # control: the same repository without the alias remote still acquires the lease
+    $r23rc = New-R22LeaseRepo 'repo-r23-a1c'
+    & git -C $r23rc remote add fork $r22read
+    $r23cErr = Invoke-R22Lease $r23rc @{ Exists = $true; Sha = $r22S; Holder = ''; Url = $r22read } 'r23a1c'
+    Assert-That ($r23cErr -eq '' -and (Get-R22Holder $r22read) -ceq 'TEST-HOST') 'r23 A1 lease control: without an alias remote the lease is acquired in the repository it read' "err=$r23cErr"
+}
+# r23 (adversary pass 26 on ae45ed76, A2): a url Clone ADDS (absent fork/origin) and the url of an initial clone (MLV-App and the doctrine bus) are checked against the
+# url.BASE.insteadOf rules before use, like a configured url; a rewritten url is refused typed and nothing is fetched or cloned from the rewrite target.
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r23 A2')) {
+    $r23ws = New-Scratch 'r23-clone'
+    $r23seed = Join-Path $r23ws 'seed'; [void][IO.Directory]::CreateDirectory($r23seed); & git -C $r23seed init -q 2>$null
+    [IO.File]::WriteAllText((Join-Path $r23seed 'x.txt'), 'unrelated'); & git -C $r23seed add x.txt 2>$null
+    & git -C $r23seed -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --no-verify -m unrelated 2>$null
+    $r23un = Join-Path $r23ws 'unrelated.git'; & git init -q --bare $r23un 2>$null; & git -C $r23seed push -q --no-verify $r23un 'HEAD:refs/heads/master' 2>$null
+    $r23unFwd = $r23un -replace '\\', '/'
+    $r23run = {
+        param([string]$RepoDir, [string]$DocDir, [string]$Log)
+        $sv = @{ Repo = $script:Repo; Doc = $script:DoctrineRepo; Log = $script:LogFile }
+        $script:Repo = $RepoDir; $Repo = $RepoDir; $script:DoctrineRepo = $DocDir; $DoctrineRepo = $DocDir; $script:LogFile = $Log
+        $script:Failures.Clear()
+        try { Invoke-PhaseClone *>&1 | Out-Null } catch { } finally { $script:Repo = $sv.Repo; $script:DoctrineRepo = $sv.Doc; $script:LogFile = $sv.Log }
+        return @($script:Failures)
+    }
+    # (a) an existing checkout with origin and no fork; a repository url rewrite rule maps the fork url to unrelated.git
+    $r23repo = Join-Path $r23ws 'MLV-App'; [void][IO.Directory]::CreateDirectory($r23repo); & git -C $r23repo init -q 2>$null
+    & git -C $r23repo remote add origin $UpstreamUrl; & git -C $r23repo config "url.$r23unFwd.insteadOf" $ForkUrl
+    $r23doc = Join-Path $r23ws 'doctrine'; [void][IO.Directory]::CreateDirectory($r23doc); & git -C $r23doc init -q 2>$null; & git -C $r23doc remote add origin $DoctrineUrl
+    $r23f = & $r23run $r23repo $r23doc (Join-Path $r23ws 'clone-a.log')
+    $r23forkRef = ("$(& git -C $r23repo rev-parse --verify --quiet refs/remotes/fork/master 2>$null)").Trim()
+    Assert-That (@($r23f | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH* fork*' }).Count -ge 1 -and -not $r23forkRef) 'r23 A2 clone: an added fork url that a url.insteadOf rule rewrites is refused typed CLONE_REMOTE_MISMATCH and nothing is fetched into refs/remotes/fork' "failures=$($r23f -join ',') forkRef=$r23forkRef"
+    # (b) initial clones: neither checkout exists; command-scope rules (GIT_CONFIG_COUNT) rewrite the fork and doctrine urls to unrelated.git
+    $r23fresh = Join-Path $r23ws 'fresh'; [void][IO.Directory]::CreateDirectory($r23fresh)
+    $r23cfgNames = 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1'
+    $r23cfgSaved = @{}; foreach ($n in $r23cfgNames) { $r23cfgSaved[$n] = [Environment]::GetEnvironmentVariable($n) }
+    try {
+        [Environment]::SetEnvironmentVariable('GIT_CONFIG_COUNT', '2')
+        [Environment]::SetEnvironmentVariable('GIT_CONFIG_KEY_0', "url.$r23unFwd.insteadOf"); [Environment]::SetEnvironmentVariable('GIT_CONFIG_VALUE_0', $ForkUrl)
+        [Environment]::SetEnvironmentVariable('GIT_CONFIG_KEY_1', "url.$r23unFwd.insteadOf"); [Environment]::SetEnvironmentVariable('GIT_CONFIG_VALUE_1', $DoctrineUrl)
+        $r23fb = & $r23run (Join-Path $r23fresh 'MLV-App') (Join-Path $r23fresh 'doctrine') (Join-Path $r23ws 'clone-b.log')
+    } finally { foreach ($n in $r23cfgNames) { [Environment]::SetEnvironmentVariable($n, $r23cfgSaved[$n]) } }
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $r23fresh 'MLV-App\.git')) -and @($r23fb | Where-Object { $_ -like 'CLONE_REMOTE_MISMATCH*' }).Count -ge 1) 'r23 A2 clone: an initial MLV-App clone whose url a url.insteadOf rule rewrites is refused typed CLONE_REMOTE_MISMATCH and nothing is cloned' "failures=$($r23fb -join ',')"
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $r23fresh 'doctrine\.git')) -and @($r23fb | Where-Object { $_ -like 'CLONE_DOCTRINE_REMOTE_MISMATCH*' }).Count -ge 1) 'r23 A2 doctrine: an initial doctrine clone whose url a url.insteadOf rule rewrites is refused typed CLONE_DOCTRINE_REMOTE_MISMATCH and nothing is cloned' "failures=$($r23fb -join ',')"
+    $script:Failures.Clear()
+}
 # (c) fable key3 r21 B1 + H1, opus H2: deny by default. An ssh spelling is normalised only for a plain user, host and path; anything else is keyed by its raw string.
 if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r22 fable B1')) {
     Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:a~b/lease.git' 'ssh://git@nas.example/~/a~b/lease.git')) 'r22 fable B1 R-a url: an scp path whose second character is ~ (Git sends ~b/lease.git) is not ssh://host/~/a~b/lease.git'

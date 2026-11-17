@@ -307,16 +307,45 @@ function Get-RemoteUrlsRaw {
     $urls = @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key "remote.$Name.url")
     $push = @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key "remote.$Name.pushurl")
     if ($push.Count -eq 0) { $push = $urls }
+    $ctx = Get-RemoteUrlContext -RepoDir $RepoDir
+    return @{ Fetch = $(if ($urls.Count) { $urls[0] } else { '' }); Push = [string[]]$push; Rules = $ctx.Rules; Names = $ctx.Names }
+}
+
+# r23 (adversary pass 26 on ae45ed76, A1/A2): what Git applies to a url ARGUMENT before it connects, read raw. Rules = every url.<base>.insteadOf / pushInsteadOf prefix.
+# Names = every configured remote name (the subsection of any remote.<name>.* key, plus the legacy .git/remotes and .git/branches file names): git fetch / ls-remote / push
+# read their url argument as a remote NAME first, so a url string that is also a remote name would be resolved to that remote's url / pushurl, never the url that was checked.
+# -RepoDir may be a directory outside any repository (an initial clone): the global, system and command-scope rules are read there and Names is then empty.
+function Get-RemoteUrlContext {
+    param([string]$RepoDir)
     $rules = @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key '^url\..*\.(insteadof|pushinsteadof)$' -Regexp | ForEach-Object { $nl = $_.IndexOf("`n"); if ($nl -ge 0) { $_.Substring($nl + 1) } else { '' } })
-    return @{ Fetch = $(if ($urls.Count) { $urls[0] } else { '' }); Push = [string[]]$push; Rules = [string[]]$rules }
+    $names = [Collections.Generic.List[string]]::new()
+    foreach ($rec in @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key '^remote\.' -Regexp)) {
+        $k = "$rec"; $nl = $k.IndexOf("`n"); if ($nl -ge 0) { $k = $k.Substring(0, $nl) }
+        $dot = $k.LastIndexOf('.'); if ($dot -gt 7) { $names.Add($k.Substring(7, $dot - 7)) }
+    }
+    foreach ($legacy in 'remotes', 'branches') {
+        $ld = Join-Path (Join-Path $RepoDir '.git') $legacy
+        if (Test-Path -LiteralPath $ld -PathType Container) { foreach ($lf in @(Get-ChildItem -LiteralPath $ld -File -Force)) { $names.Add($lf.Name) } }
+    }
+    return @{ Rules = [string[]]$rules; Names = [string[]]$names.ToArray() }
+}
+
+# r23 A2: the directory an initial clone's rules are read in: the nearest existing ancestor of the clone destination, else the user profile. A repository there only adds rules
+# (and names), so the check can refuse more, never less, than the clone itself would rewrite.
+function Get-CloneProbeDir([string]$Dest) {
+    $d = Split-Path -Parent $Dest
+    while ($d -and -not (Test-Path -LiteralPath $d -PathType Container)) { $d = Split-Path -Parent $d }
+    return $(if ($d) { $d } else { $env:USERPROFILE })
 }
 
 # r22: '' when every url may be compared and used; otherwise the typed REMOTE_URL_UNSAFE reason (a control character, a leading '-', or a url rewrite rule that matches it)
+# r23 A1: or a url string that is also the name of a configured remote (-Names; compared case-insensitively, so a case-folding file system can only refuse more)
 function Get-RemoteUrlRefusal {
-    param([string[]]$Urls, [string[]]$Rules)
+    param([string[]]$Urls, [string[]]$Rules, [string[]]$Names)
     foreach ($u in @($Urls)) {
         if (Test-RemoteUrlUnsafe $u) { return "REMOTE_URL_UNSAFE $(Format-RemoteUrlForLog $u) holds a control character or starts with '-' (refused, never compared)" }
         foreach ($r in @($Rules)) { if ("$u".StartsWith("$r", [StringComparison]::Ordinal)) { return "REMOTE_URL_UNSAFE $(Format-RemoteUrlForLog $u) is rewritten by a url.<base>.insteadOf/pushInsteadOf rule (refused: Git would not connect to the url that was checked)" } }
+        foreach ($n in @($Names)) { if ([string]::Equals("$u", "$n", [StringComparison]::OrdinalIgnoreCase)) { return "REMOTE_URL_UNSAFE $(Format-RemoteUrlForLog $u) is also the name of a configured remote (refused: Git would resolve it as that remote, not as the url that was checked)" } }
     }
     return ''
 }
@@ -328,7 +357,7 @@ function Get-HubLease {
     try { $lr = Get-RemoteUrlsRaw -RepoDir $Repo -Name $LeaseRemote } catch { return @{ Error = "$($_.Exception.Message)" } }
     $url = $lr.Fetch
     if (-not $url) { return @{ Error = "remote '$LeaseRemote' has no url" } }
-    $why = Get-RemoteUrlRefusal -Urls @($url) -Rules $lr.Rules
+    $why = Get-RemoteUrlRefusal -Urls @($url) -Rules $lr.Rules -Names $lr.Names   # r23 A1: a url that is also a remote name is refused
     if ($why) { return @{ Error = $why } }
     $ls = Invoke-GitTraceScrubbed { & git -C $Repo ls-remote $url $LeaseRef 2>&1 }   # r17 F3: every native git call drops GIT_TRACE*
     if ($LASTEXITCODE -ne 0) { return @{ Error = "ls-remote failed: $($ls -join ' ')" } }
@@ -395,7 +424,7 @@ function Set-HubLease {
     $lr = $null
     try { $lr = Get-RemoteUrlsRaw -RepoDir $Repo -Name $LeaseRemote } catch { & $refuse "could not be read ($($_.Exception.Message))" }
     $leaseFetchUrl = $lr.Fetch; $leasePushUrls = @($lr.Push)
-    $unsafeWhy = Get-RemoteUrlRefusal -Urls (@($leaseFetchUrl) + $leasePushUrls) -Rules $lr.Rules
+    $unsafeWhy = Get-RemoteUrlRefusal -Urls (@($leaseFetchUrl) + $leasePushUrls) -Rules $lr.Rules -Names $lr.Names   # r23 A1
     if ($unsafeWhy) { & $refuse "($unsafeWhy)" }
     if ($Current.ContainsKey('Url') -and "$($Current.Url)" -cne $leaseFetchUrl) { & $refuse "reads from $(Format-RemoteUrlForLog $leaseFetchUrl) now, but the lease was read from $(Format-RemoteUrlForLog $Current.Url)" }
     if (-not $leaseFetchUrl -or $leasePushUrls.Count -eq 0 -or @($leasePushUrls | Where-Object { -not (Test-GitRemoteUrlSame $_ $leaseFetchUrl) }).Count -gt 0) {
@@ -728,6 +757,10 @@ function Invoke-PhaseClone {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Log 'CLONE_PREREQ_MISSING git missing: run -Phase Packages first' 'ERROR'; $script:Failures.Add('CLONE_PREREQ_MISSING git'); return }   # r15 pass 14 A5 sibling: a failure (exit 1)
     if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) {
         Invoke-Step "Clone MLV-App fork into $Repo (remote 'fork' = SuperDimensionalSpaceFortress, 'origin' = ilia3101, as on VIRTUAL-TEN)" {
+            # r23 (adversary pass 26 A2 sibling): the clone url is checked against the url rewrite rules BEFORE the clone (a rewritten url would clone another repository)
+            $cWhy = ''
+            try { $cCtx = Get-RemoteUrlContext -RepoDir (Get-CloneProbeDir $Repo); $cWhy = Get-RemoteUrlRefusal -Urls @($ForkUrl) -Rules $cCtx.Rules } catch { $cWhy = "$($_.Exception.Message)" }
+            if ($cWhy) { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo fork"); throw "CLONE_REMOTE_MISMATCH $Repo clone url $ForkUrl is refused ($cWhy); nothing was cloned" }
             [void](Invoke-Native -Exe 'git' -Arguments @('-c', 'core.longpaths=true', 'clone', '--origin', 'fork', $ForkUrl, $Repo))
         }
     } else { Write-Log "present: $Repo" 'OK' }
@@ -744,7 +777,7 @@ function Invoke-PhaseClone {
                 $ru = $null; $readWhy = ''
                 try { $ru = Get-RemoteUrlsRaw -RepoDir $Repo -Name $want[0] } catch { $readWhy = "$($_.Exception.Message)" }
                 $have = $(if ($ru) { $ru.Fetch } else { '' })
-                $haveWhy = $(if ($readWhy) { $readWhy } else { Get-RemoteUrlRefusal -Urls @($have) -Rules $ru.Rules })
+                $haveWhy = $(if ($readWhy) { $readWhy } else { Get-RemoteUrlRefusal -Urls @($have) -Rules $ru.Rules -Names $ru.Names })
                 if ($haveWhy -or -not (Test-GitRemoteUrlSame $have $want[1])) {
                     $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0])")
                     # r15 pass 14 A2: the URL is printed with any user:password part redacted (the log and the console never carry a credential)
@@ -752,7 +785,7 @@ function Invoke-PhaseClone {
                 }
                 # r17 pass 19 A6 sibling: a push url (remote.<name>.pushurl) that names another repository is the same mismatch
                 foreach ($pu in @($ru.Push)) {
-                    $puWhy = Get-RemoteUrlRefusal -Urls @($pu) -Rules $ru.Rules
+                    $puWhy = Get-RemoteUrlRefusal -Urls @($pu) -Rules $ru.Rules -Names $ru.Names
                     if ($puWhy -or -not (Test-GitRemoteUrlSame $pu $want[1])) {
                         $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0]) pushurl")
                         throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' pushes to $(Format-RemoteUrlForLog $pu), expected $($want[1])$(if ($puWhy) { " ($puWhy)" }) (nothing was fetched; fix the push url by hand and re-run -Phase Clone)"
@@ -760,9 +793,21 @@ function Invoke-PhaseClone {
                 }
                 $checked[$want[0]] = $have
             }
-            if ($remotes -notcontains 'fork') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'fork', $ForkUrl)); $checked['fork'] = $ForkUrl }
-            if ($remotes -notcontains 'origin') { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', 'origin', $UpstreamUrl)); $checked['origin'] = $UpstreamUrl }
-            foreach ($k in @($checked.Keys)) { if (Test-RemoteUrlUnsafe $checked[$k]) { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $k"); throw "CLONE_REMOTE_MISMATCH $Repo remote '$k' url $(Format-RemoteUrlForLog $checked[$k]) is REMOTE_URL_UNSAFE (nothing was fetched)" } }
+            # r23 (adversary pass 26 A2): an ADDED remote's url gets the same full refusal as a configured one (rewrite rules and remote names, not only the character check),
+            # BEFORE it is added; and every url about to be fetched is checked once more against the configuration as it is after the adds
+            $ctx = $null
+            try { $ctx = Get-RemoteUrlContext -RepoDir $Repo } catch { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo fork"); throw "CLONE_REMOTE_MISMATCH $Repo url rewrite rules could not be read ($($_.Exception.Message)); nothing was fetched" }
+            foreach ($add in @(@('fork', $ForkUrl), @('origin', $UpstreamUrl))) {
+                if ($remotes -contains $add[0]) { continue }
+                $addWhy = Get-RemoteUrlRefusal -Urls @($add[1]) -Rules $ctx.Rules -Names $ctx.Names
+                if ($addWhy) { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($add[0])"); throw "CLONE_REMOTE_MISMATCH $Repo remote '$($add[0])' url $($add[1]) is refused ($addWhy); it was not added and nothing was fetched" }
+                [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'remote', 'add', $add[0], $add[1])); $checked[$add[0]] = $add[1]
+            }
+            try { $ctx = Get-RemoteUrlContext -RepoDir $Repo } catch { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo fork"); throw "CLONE_REMOTE_MISMATCH $Repo url rewrite rules could not be read ($($_.Exception.Message)); nothing was fetched" }
+            foreach ($k in @($checked.Keys)) {
+                $useWhy = Get-RemoteUrlRefusal -Urls @($checked[$k]) -Rules $ctx.Rules -Names $ctx.Names
+                if ($useWhy) { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $k"); throw "CLONE_REMOTE_MISMATCH $Repo remote '$k' url $(Format-RemoteUrlForLog $checked[$k]) is refused ($useWhy); nothing was fetched" }
+            }
             [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', 'core.longpaths', 'true'))
             [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'fetch', '--quiet', $checked['fork'], '+refs/heads/*:refs/remotes/fork/*'))
             # r20 sibling: the upstream (origin) fetch stays non-fatal by design (fork is the base), but its failure is now said, not discarded
@@ -779,6 +824,10 @@ function Invoke-PhaseClone {
     }
     if (-not (Test-Path -LiteralPath (Join-Path $DoctrineRepo '.git'))) {
         Invoke-Step "Clone doctrine bus into $DoctrineRepo" {
+            # r23 (adversary pass 26 A2 sibling): the doctrine clone url is checked against the url rewrite rules before the clone, like the MLV-App clone above
+            $dcWhy = ''
+            try { $dcCtx = Get-RemoteUrlContext -RepoDir (Get-CloneProbeDir $DoctrineRepo); $dcWhy = Get-RemoteUrlRefusal -Urls @($DoctrineUrl) -Rules $dcCtx.Rules } catch { $dcWhy = "$($_.Exception.Message)" }
+            if ($dcWhy) { $script:Failures.Add("CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo"); throw "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo clone url $DoctrineUrl is refused ($dcWhy); nothing was cloned" }
             $code = Invoke-Native -Exe 'git' -Arguments @('clone', $DoctrineUrl, $DoctrineRepo) -AllowFail
             if ($code -ne 0) { Write-Log 'doctrine bus clone failed (private repo?): run "gh auth login", then re-run -Phase Clone' 'MANUAL' }
         }
@@ -788,10 +837,10 @@ function Invoke-PhaseClone {
         $dr = $null; $dWhy = ''
         try { $dr = Get-RemoteUrlsRaw -RepoDir $DoctrineRepo -Name 'origin' } catch { $dWhy = "$($_.Exception.Message)" }
         $dHave = $(if ($dr) { $dr.Fetch } else { '' })
-        if (-not $dWhy -and $dr) { $dWhy = Get-RemoteUrlRefusal -Urls @($dHave) -Rules $dr.Rules }
+        if (-not $dWhy -and $dr) { $dWhy = Get-RemoteUrlRefusal -Urls @($dHave) -Rules $dr.Rules -Names $dr.Names }
         # r19 pass 21 A3: every PUSH url of that origin must name it too ('remote.origin.pushurl' naming another repository is the same mismatch)
         $dPush = $(if ($dr) { @($dr.Push) } else { @() })
-        $dBadPush = @($dPush | Where-Object { (Get-RemoteUrlRefusal -Urls @($_) -Rules $dr.Rules) -or -not (Test-GitRemoteUrlSame $_ $DoctrineUrl) })
+        $dBadPush = @($dPush | Where-Object { (Get-RemoteUrlRefusal -Urls @($_) -Rules $dr.Rules -Names $dr.Names) -or -not (Test-GitRemoteUrlSame $_ $DoctrineUrl) })
         if (-not $dWhy -and (Test-GitRemoteUrlSame $dHave $DoctrineUrl) -and $dBadPush.Count -eq 0) { Write-Log "present: $DoctrineRepo" 'OK' }
         else {
             $dPushNote = $(if ($dBadPush.Count -gt 0) { " and pushes to $((@($dBadPush | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')" } else { '' })
