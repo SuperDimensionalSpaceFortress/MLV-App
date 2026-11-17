@@ -383,10 +383,125 @@ class ExportEvidenceTests(unittest.TestCase):
         ]
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (r7: the record schema types each of these: a value or window that breaks it is EXPORT_RECORD_INVALID / EXPORT_STAGE_WINDOW_MISMATCH, a profile with no
+        # successful frame stays EXPORT_PROFILE_ABSENT)
+        typed = ("EXPORT_PROFILE_ABSENT", "EXPORT_RECORD_INVALID", "EXPORT_STAGE_WINDOW_MISMATCH")
         for i in range(6):
             self.assertEqual(got[i]["outcome"], "INVALID", (i, got[i]))
-            self.assertTrue(any("EXPORT_PROFILE_ABSENT" in p for p in got[i]["problems"]), (i, got[i]))
+            self.assertTrue(any(t in p for p in got[i]["problems"] for t in typed), (i, got[i]))
         self.assertEqual((got[6]["outcome"], got[7]["outcome"]), ("PASS", "PASS"), got[6:])
+
+    # --- r7: the validator CLASS (adversary r6 A1-A5 on a22d7786, Dot I2-EXPORT-NESTED-STAGE-WINDOW) -----------------------------------------
+    @staticmethod
+    def stage_lines(frames_by_stage: dict, ms: dict | None = None) -> str:
+        default = {"raw_uint16_disk_read": 3.0, "raw_uint16_decompress": 5.0, "raw_uint16": 9.0, "llrawproc": 20.0, "debayered_frame": 40.0,
+                   "processing": 15.0, "processed16_total": 56.0}
+        default.update(ms or {})
+        return "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={default[s]:.3f}\n" for s, frames in frames_by_stage.items() for i in frames)
+
+    def test_r7_a1_every_nested_rendered_stage_is_held_to_processed16_totals_frames(self) -> None:
+        """adversary r6 A1 + Dot I2: only the two top-level children were held to processed16_total's frames; raw_uint16, raw_uint16_disk_read, raw_uint16_decompress and
+        llrawproc published a share over any window. Every nested stage is parameterized over an unrelated singleton, an equal-sized disjoint set, a partial subset, a
+        matching-frame control and a permitted absent stage, under empty AND the shipped criteria. The 480-frame shape from the finding is covered too."""
+        nested = ("raw_uint16", "raw_uint16_disk_read", "raw_uint16_decompress", "llrawproc")
+        everything = {s: range(30) for s in ("raw_uint16_disk_read", "raw_uint16_decompress", "raw_uint16", "llrawproc", "debayered_frame", "processing", "processed16_total")}
+        scenarios = {"singleton": [100], "disjoint": range(30, 60), "partial": range(15), "control": range(30), "absent": []}
+        cases, names = [], []
+        for stage in nested:
+            for name, frames in scenarios.items():
+                for label, criteria in (("empty", []), ("shipped", None)):
+                    over = dict(everything)
+                    over[stage] = frames
+                    case = prores_case(stage=self.stage_lines(over))
+                    if criteria is not None:
+                        case["criteria"] = criteria
+                    cases.append(case)
+                    names.append((stage, name, label))
+        everything480 = {s: range(480) for s in everything}
+        moved = dict(everything480)
+        for s in nested:
+            moved[s] = range(480, 960)
+        only_first = dict(everything480)
+        only_first["llrawproc"] = [0]
+        for stage_map in (moved, only_first):
+            cases.append(prores_case(maxFrames=480, stage=self.stage_lines(stage_map), batch=batch_log(480, verified=480), criteria=[]))
+            names.append(("finding-480", "moved" if stage_map is moved else "llrawproc-one-frame", "empty"))
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (stage, scenario, label), result in zip(names, got):
+            with self.subTest(stage=stage, scenario=scenario, criteria=label):
+                if scenario in ("control", "absent"):
+                    self.assertEqual(result["outcome"], "PASS", result)
+                else:
+                    self.assertEqual(result["outcome"], "INVALID", result)
+                    self.assertTrue(any("EXPORT_STAGE_WINDOW_MISMATCH" in p for p in result["problems"]), result)
+
+    def test_r7_a2_a_null_or_negative_timing_record_is_invalid_whatever_the_criteria(self) -> None:
+        """adversary r6 A2: a JSON null timing on every CDNG frame and a negative / non-finite ProRes stage-timing record read PASS (the value was dropped, never refused)."""
+        def null_all(key):
+            doc = json.loads(cdng_profile(30))
+            for r in doc["frames"]:
+                r[key] = None
+            return json.dumps(doc)
+        bad_lines = ("ms=-1.000", "ms=nan", "ms=inf", "ms=1e5", "ms=", "ms=1e999")
+        cases = [cdng_case(profile=null_all("raw_read_ms"), criteria=[]),
+                 cdng_case(profile=null_all("producer_frame_ms"), criteria=[]),
+                 cdng_case(profile=null_all("llrawproc_dual_iso_ms"), criteria=[])]
+        cases += [prores_case(stage=stage_log(30) + f"[mlv-stage-timing] frame=0 stage=processing {bad}\n", criteria=[]) for bad in bad_lines]
+        cases += [cdng_case(criteria=[]), prores_case(criteria=[])]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(len(cases) - 2):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_RECORD_INVALID" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual((got[-2]["outcome"], got[-1]["outcome"]), ("PASS", "PASS"), got[-2:])
+
+    def test_r7_a3_an_export_of_fewer_frames_than_requested_is_not_a_pass_under_empty_criteria(self) -> None:
+        """adversary r6 A3: 30 exported of maxFrames=480 read PASS when both criteria arrays were empty. The receipt requires framesExported == the request unless a criterion
+        of the leg names framesExported itself (then the criteria decide: the shipped legs' framesExported eq criterion still reads FAIL, see case 1 above). Decision:
+        INVALID, because EXPORT_CAPTURED itself asserts the batch exported the requested window, so a short count under that token is evidence that disagrees with itself."""
+        cases = [cdng_case(maxFrames=480, criteria=[]), prores_case(maxFrames=480, criteria=[]),
+                 cdng_case(maxFrames=24, criteria=[]),                                       # 30 exported of a 24-frame request: more is not the request either
+                 cdng_case(maxFrames=480, criteria=[{"metric": "framesExported", "op": "eq", "value": 480}]),   # the criterion decides: FAIL
+                 cdng_case(criteria=[]), prores_case(criteria=[])]                           # controls: the count is the request
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in (0, 1, 2):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertIn("EXPORT_FRAMES_MISMATCH", got[i]["detail"], got[i])
+        self.assertEqual(got[3]["outcome"], "FAIL", got[3])
+        self.assertEqual((got[4]["outcome"], got[5]["outcome"]), ("PASS", "PASS"), got[4:])
+
+    def test_r7_a5_a_malformed_profile_container_or_element_is_invalid_before_counting(self) -> None:
+        """adversary r6 A5: a JSON null appended to profile frames (frame_count 481), or frames given as one object, read PASS because null elements were filtered and a
+        lone object was wrapped. The container must be an array of objects, frame_count must be the array's length, and every element is a record."""
+        def mutate(fn) -> str:
+            doc = json.loads(cdng_profile(30))
+            fn(doc)
+            return json.dumps(doc)
+        def append(value):
+            def go(doc):
+                doc["frames"].append(value)
+                doc["frame_count"] = len(doc["frames"])
+            return go
+        def one_object(doc):
+            doc["frames"] = doc["frames"][0]
+        def wrong_count(doc):
+            doc["frame_count"] = 29
+        cases = [cdng_case(profile=mutate(append(None)), criteria=[]), cdng_case(profile=mutate(append(5)), criteria=[]),
+                 cdng_case(profile=mutate(append("x")), criteria=[]), cdng_case(profile=mutate(append([])), criteria=[]),
+                 cdng_case(profile=mutate(one_object), criteria=[]), cdng_case(profile=mutate(wrong_count), criteria=[]),
+                 cdng_case(profile=mutate(append(None))),                                    # shipped-style criteria too
+                 cdng_case(criteria=[])]                                                      # control
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(len(cases) - 1):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_RECORD_INVALID" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
 
     def test_a_capture_with_no_stage_measurement_or_with_footage_left_behind_is_invalid(self) -> None:
         """adversary r2 A2/A3 (on c3768da1): a captured export whose profile rows carry only frame_index and one dual-ISO figure (CDNG), or whose stage log has
@@ -513,7 +628,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         return path
 
     def write_export_artifacts(self, frames: int, profile: bool = True, venue: str = "bachelor", fmt: str = "cdng-lossless",
-                               exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None) -> None:
+                               exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None, stage: str | None = None) -> None:
         a = self.artifacts
         if a.exists():
             shutil.rmtree(a)
@@ -525,6 +640,11 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                    "exportWallSeconds": 30.0, "appExitCode": 0, "timedOut": False, "fixtureRehearsal": False}
         (a / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
         (a / "batch.log").write_text(batch_log(exported), encoding="utf-8")
+        if fmt == "prores":
+            (a / "batch.log").write_text(batch_log(exported, verified=exported), encoding="utf-8")
+            (a / "stage-timing.log").write_text(stage_log(frames) if stage is None else stage, encoding="utf-8")
+            (a / "output-manifest.json").write_text(output_manifest(1, "mov"), encoding="utf-8")
+            return
         if profile:
             (a / "export-profile.json").write_text(cdng_profile(frames, build_id=self.sha), encoding="utf-8")
         (a / "output-manifest.json").write_text(output_manifest(exported), encoding="utf-8")
@@ -646,6 +766,52 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                 self.assertEqual(receipt["outcome"], want, receipt["outcomeDetail"])
                 if want == "FAIL":
                     self.assertEqual(receipt["verification"]["status"], "VERIFIED_OFFLINE_TEST", receipt["outcomeDetail"])
+
+    def test_r7_i2_the_receipt_validator_holds_every_nested_stage_to_processed16_totals_frames(self) -> None:
+        """Dot I2-EXPORT-NESTED-STAGE-WINDOW through the WRITER (Invoke-VenueLeg) and the receipt VALIDATOR (Test-DvReceiptValid): a nested rendered stage on an unrelated
+        window is an INVALID receipt at write time (never PASS), and a good receipt whose hashed stage log is rewritten to that window (every sha256 claim updated to
+        match) does not verify. A matching-frame control verifies, and a permitted absent stage verifies."""
+        spec = self.export_spec(EXPORT_LEGS[1], maxframes=30)
+        everything = {s: range(30) for s in ("raw_uint16_disk_read", "raw_uint16_decompress", "raw_uint16", "llrawproc", "debayered_frame", "processing", "processed16_total")}
+
+        def log(stage: str, frames) -> str:
+            over = dict(everything)
+            over[stage] = frames
+            return ExportEvidenceTests.stage_lines(over)
+        # a good receipt first
+        self.write_export_artifacts(30, fmt="prores")
+        proc, good, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(good, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(good["outcome"], "PASS", good["outcomeDetail"])
+        self.assertEqual(self.validate(good, spec)["status"], "VERIFIED_OFFLINE_TEST")
+        for stage in ("raw_uint16", "raw_uint16_disk_read", "raw_uint16_decompress", "llrawproc"):
+            for name, frames in (("singleton", [100]), ("disjoint", range(30, 60)), ("partial", range(15))):
+                with self.subTest(stage=stage, scenario=name, via="writer"):
+                    self.write_export_artifacts(30, fmt="prores", stage=log(stage, frames))
+                    proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+                    self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+                    self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                    self.assertIn("EXPORT_STAGE_WINDOW_MISMATCH", receipt["outcomeDetail"])
+        # the validator: the good receipt's hashed stage log rewritten, every claim updated to match
+        evdir = Path(good["evidence"]["localEvidenceDir"])
+        for stage, name, frames, want in (("llrawproc", "partial", range(15), "INVALID"), ("raw_uint16", "disjoint", range(30, 60), "INVALID"),
+                                          ("llrawproc", "absent", [], "VERIFIED_OFFLINE_TEST"), ("llrawproc", "control", range(30), "VERIFIED_OFFLINE_TEST")):
+            with self.subTest(stage=stage, scenario=name, via="validator"):
+                work = self.tmp / f"ev-i2-{stage}-{name}"
+                if work.exists():
+                    shutil.rmtree(work)
+                shutil.copytree(evdir, work)
+                raw = log(stage, frames).encode("utf-8")
+                (work / "export" / "stage-timing.log").write_bytes(raw)
+                r = json.loads(json.dumps(good))
+                r["export"]["files"]["stage-timing.log"] = hashlib.sha256(raw).hexdigest()
+                got = self.validate(r, spec, evidence_dir=str(work))
+                if want == "INVALID":
+                    self.assertEqual(got["status"], "INVALID", got)
+                else:
+                    # an absent or matching nested stage changes the stage table, so the receipt's own table no longer equals the re-derived one: still never a PASS
+                    # that verifies as the ORIGINAL receipt; the point here is that the reader itself raises no window problem
+                    self.assertFalse(any("EXPORT_STAGE_WINDOW_MISMATCH" in x for x in got["reasons"]), got)
 
     def test_a_profile_missing_on_a_captured_run_is_invalid(self) -> None:
         spec = self.export_spec(maxframes=30)
@@ -807,6 +973,21 @@ class ExportJobGeneratorTests(unittest.TestCase):
                 b = json.loads(proc.stdout)
                 self.assertGreaterEqual(b["exportTimeoutSec"], max(900, 4 * frames))
                 self.assertGreaterEqual(b["jobTimeoutSec"], b["identityReadSec"] + b["exportTimeoutSec"])
+
+    def test_r7_a4_a_window_whose_budget_passes_the_agent_cap_is_refused_typed_before_the_runner_sees_it(self) -> None:
+        """adversary r6 A4 (and r5 A3): maxFrames=20000 on the 3.4 GB clip gave jobTimeoutSec 87144; the runner adds 120 and submits 87264, UmRunDrop refuses past 86400
+        (UMRUN_JOB_TIMEOUT_INVALID) and the leg ended UNRESOLVED after a lease was spent. The generator now refuses a budget whose submitted timeout passes the cap, with
+        a typed reason, and never lets an int cast of an out-of-range figure throw."""
+        m1243 = 2221399552 + 1174057472
+        for frames, bytes_, ok in ((4000, m1243, True), (19000, m1243, True), (20000, m1243, False), (100000, m1243, False), (480, 1099511627776, False)):
+            with self.subTest(frames=frames, clipBytes=bytes_):
+                proc = run_pwsh(["-Command", f"try {{ & '{EXPORT_JOB}' -DescribeTimeBudgetBytes {bytes_} -MaxFrames {frames} -ErrorAction Stop | ConvertTo-Json -Compress }} catch {{ 'REFUSED ' + $_.Exception.Message }}"])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                if ok:
+                    b = json.loads(proc.stdout)
+                    self.assertLessEqual(b["jobTimeoutSec"] + 120, 86400, b)
+                else:
+                    self.assertTrue(proc.stdout.startswith("REFUSED DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED"), proc.stdout + proc.stderr)
 
     def test_every_schema_valid_quiescence_threshold_binds(self) -> None:
         """adversary r1 A5: the schema admits any threshold in (0, 100]; the generator binds each one (0.05 was refused by ValidateRange(0.1, 100))."""

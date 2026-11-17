@@ -426,14 +426,24 @@ function Get-ExportJobTimeBudget {
     # job's own wall is the ONE margined identity read of the clip (Get-AttrCudaLegTimeBudget's measured cold rate), the quiescence samples, then the
     # export, whose wait holds the app's re-read of the clip at that same cold rate plus a generous per-frame CPU ceiling (dual-ISO AMaZE at full
     # resolution), never under 15 minutes. No ceiling of the smoke runner applies: the export wait is the job's own WaitForExit.
+    # r7 (adversary r6 A4, r5 A3): the job's submitted timeout must fit what the agent accepts. UmRunDrop and the agent take 1..86400 s for the whole job
+    # ($UmRunMaxJobTimeoutSec); Invoke-VenueLeg adds $RunnerSubmitMarginSec to recommendedJobTimeoutSec before it submits. A window whose budget passes that is REFUSED
+    # here with a typed reason, before any lease is spent -- never clamped, because an export cut short by a smaller wait is not the export that was asked for. The sums
+    # are int64 so no out-of-range figure throws an untyped cast.
     param([int64]$ClipBytes, [int]$Frames)
+    $UmRunMaxJobTimeoutSec = [int64]86400
+    $RunnerSubmitMarginSec = [int64]120
     Import-Module $ArtifactsModule -Force
-    $read = Get-AttrCudaLegTimeBudget -InputBytes $ClipBytes -LaunchSeconds 0 -PlaySeconds 0 -SettleSeconds 0 -RunnerSlackSeconds 0 -ShareSmokeCeiling
-    $identityReadSec = [int]$read.identityReadSec
-    $exportTimeoutSec = [int]([Math]::Max(900, 4 * $Frames) + $identityReadSec)
-    $quiescenceSec = 3 * 12 + 30
-    [pscustomobject]@{ identityReadSec = $identityReadSec; exportTimeoutSec = $exportTimeoutSec; quiescenceSec = $quiescenceSec
-                       jobTimeoutSec = [int]($identityReadSec + $quiescenceSec + $exportTimeoutSec + 600) }
+    try { $read = Get-AttrCudaLegTimeBudget -InputBytes $ClipBytes -LaunchSeconds 0 -PlaySeconds 0 -SettleSeconds 0 -RunnerSlackSeconds 0 -ShareSmokeCeiling }
+    catch { throw "DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED a clip of $ClipBytes bytes is outside the cold-read budget model, so no job timeout can be derived for it" }
+    $identityReadSec = [int64]$read.identityReadSec
+    $exportTimeoutSec = [int64]([Math]::Max(900, 4 * [int64]$Frames)) + $identityReadSec
+    $quiescenceSec = [int64](3 * 12 + 30)
+    $jobTimeoutSec = $identityReadSec + $quiescenceSec + $exportTimeoutSec + 600
+    if ($jobTimeoutSec + $RunnerSubmitMarginSec -gt $UmRunMaxJobTimeoutSec) {
+        throw "DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $Frames frames of a $ClipBytes-byte clip need a job timeout of $jobTimeoutSec s ($($jobTimeoutSec + $RunnerSubmitMarginSec) s submitted), past the agent's $UmRunMaxJobTimeoutSec s cap; export a shorter window"
+    }
+    [pscustomobject]@{ identityReadSec = [int]$identityReadSec; exportTimeoutSec = [int]$exportTimeoutSec; quiescenceSec = [int]$quiescenceSec; jobTimeoutSec = [int]$jobTimeoutSec }
 }
 if ($DescribeTimeBudgetBytes -ge 0) {
     if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }

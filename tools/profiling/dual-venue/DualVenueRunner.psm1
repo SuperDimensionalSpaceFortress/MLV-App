@@ -4515,23 +4515,119 @@ $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.jso
 
 function Get-DvExportRound($Value) { if ($null -eq $Value) { return $null }; [math]::Round([double]$Value, 6) }
 
+# --- r7 (adversary r6 A1-A5, Dot I2): ONE record schema for everything the export reader reads, not one check per finding ----------------------------------------
+# Every profile frame and every stage-log record is validated against these tables BEFORE a count, a mean or a share is taken, and a record that does not conform
+# is a typed problem (EXPORT_RECORD_INVALID: type / null / finite / range; EXPORT_STAGE_WINDOW_MISMATCH: a stage not timed on exactly the frames its denominator is),
+# never a value that is silently dropped. A timing is a JSON number, finite, 0 .. ExportTimingMaxMs (24 h, the agent's own cap on a whole job), so no mean or share
+# the reader computes can be infinite or negative.
+$script:ExportTimingMaxMs = 86400000.0
+# CDNG frame record: success is a boolean and frame_index a non-negative integer on every row; every timing below is, WHEN PRESENT, a conforming timing, and a timing
+# present on any successful frame is present on all of them (its share is of the denominator's window). These two are required on every successful frame.
+$script:ExportCdngTimingFields = @(@($script:ExportCdngProducerStages) + @($script:ExportCdngWriterStages) + @('llrawproc', 'producer_frame') | ForEach-Object { "${_}_ms" })
+$script:ExportCdngRequiredTimingFields = @('producer_frame_ms', 'llrawproc_dual_iso_ms')
+# Stage-log record: one line, exactly this shape. Every line that carries the tag must match it (the digits are bounded so no value can overflow a cast).
+$script:ExportStageLogTag = '[mlv-stage-timing]'
+$script:ExportStageLogRecord = '^\[mlv-stage-timing\] frame=(?<f>[0-9]{1,12}) stage=(?<s>[a-z0-9_]{1,64}) ms=(?<ms>[0-9]{1,12}(?:\.[0-9]{1,9})?)$'
+
+function Get-DvExportTimingProblem {
+    # $null when $Value is a conforming timing, else the reason it is not. Never throws, whatever the value is.
+    param($Value)
+    if ($null -eq $Value) { return 'is JSON null' }
+    if (-not ($Value -is [double] -or $Value -is [int] -or $Value -is [long] -or $Value -is [decimal])) { return "is a $($Value.GetType().Name), not a JSON number" }
+    $d = [double]$Value
+    if (-not [double]::IsFinite($d)) { return 'is not finite' }
+    if ($d -lt 0) { return 'is negative' }
+    if ($d -gt $script:ExportTimingMaxMs) { return "is past the $($script:ExportTimingMaxMs) ms ceiling" }
+    $null
+}
+
 function Get-DvExportStageRow {
     param($Values, $Denominator)
-    # adversary r2 pass 2 A4: only a finite, non-negative JSON number is a timing; an object / string / negative is dropped here (never a cast that throws), and the
-    # callers' sample-count checks then say the stage is short
-    $v = @($Values | Where-Object { ($_ -is [double] -or $_ -is [int] -or $_ -is [long] -or $_ -is [decimal]) -and [double]::IsFinite([double]$_) -and [double]$_ -ge 0 } | ForEach-Object { [double]$_ })
+    # only a conforming timing is a sample (Get-DvExportTimingProblem); the record validators have already refused every other value, so this never drops one silently
+    $v = @($Values | Where-Object { $null -eq (Get-DvExportTimingProblem $_) } | ForEach-Object { [double]$_ })
     if ($v.Count -eq 0) { return [ordered]@{ samples = 0; meanMs = $null; medianMs = $null; share = $null } }
     $mean = ($v | Measure-Object -Sum).Sum / $v.Count
     [ordered]@{ samples = $v.Count; meanMs = (Get-DvExportRound $mean); medianMs = (Get-DvExportRound (Get-DvMedian $v))
                 share = $(if ($null -ne $Denominator -and [double]$Denominator -gt 0) { Get-DvExportRound ($mean / [double]$Denominator) } else { $null }) }
 }
 
-function Get-DvExportDroppedCount {
-    # adversary r6 A2: how many PRESENT values Get-DvExportStageRow rejects (not a finite, non-negative JSON number). Kept out of the stage row on purpose: a receipt
-    # already written carries the row without it, and the validator re-derives and compares the whole stage table.
-    param($Values)
-    $kept = @($Values | Where-Object { ($_ -is [double] -or $_ -is [int] -or $_ -is [long] -or $_ -is [decimal]) -and [double]::IsFinite([double]$_) -and [double]$_ -ge 0 }).Count
-    @($Values | Where-Object { $null -ne $_ }).Count - $kept
+function Test-DvExportCdngProfileRecords {
+    # The CDNG profile's `frames` against the tables above. Returns [pscustomobject]@{ rows; ok; problems }: rows = the object records, ok = the successful ones.
+    param($Profile)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $list = Get-DvProp $Profile 'frames'
+    $rows = @(); $ok = @()
+    if ($null -ne $list -and $list -isnot [array]) { $problems.Add('EXPORT_RECORD_INVALID: export-profile.json frames is not a JSON array of frame records (one object or a scalar is no list)') }
+    elseif ($null -ne $list) {
+        $notObject = [System.Collections.Generic.List[string]]::new(); $rows = [System.Collections.Generic.List[object]]::new()
+        for ($i = 0; $i -lt $list.Count; $i++) { if ($list[$i] -is [System.Management.Automation.PSCustomObject]) { $rows.Add($list[$i]) } else { $notObject.Add([string]$i) } }
+        if ($notObject.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($notObject.Count) profile frame record(s) are not JSON objects (first at index $($notObject[0]))") }
+        $rows = @($rows)
+        $declared = Get-DvProp $Profile 'frame_count'
+        if ($null -ne $declared -and (ConvertTo-DvInt64 $declared) -ne [int64]$list.Count) { $problems.Add("EXPORT_RECORD_INVALID: export-profile.json frame_count is $(ConvertTo-Json -InputObject $declared -Compress -Depth 2) but frames holds $($list.Count) record(s)") }
+    }
+    if ($rows.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json lists no frame, so there is nothing to read a stage share from') }
+    # the per-record schema
+    $broken = [ordered]@{}
+    $note = { param($field, $why, $at) $k = "$field $why"; if (-not $broken.Contains($k)) { $broken[$k] = [System.Collections.Generic.List[int]]::new() }; $broken[$k].Add($at) }
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        if ((Get-DvProp $r 'success') -isnot [bool]) { & $note 'success' 'is not a JSON boolean' $i }
+        $fi = Get-DvProp $r 'frame_index'
+        if (-not (($fi -is [int] -or $fi -is [long]) -and [int64]$fi -ge 0)) { & $note 'frame_index' 'is not a non-negative integer' $i }
+        foreach ($field in $script:ExportCdngTimingFields) {
+            if ($null -eq $r.PSObject.Properties[$field]) { continue }
+            $why = Get-DvExportTimingProblem (Get-DvProp $r $field)
+            if ($null -ne $why) { & $note $field $why $i }
+        }
+    }
+    foreach ($k in $broken.Keys) { $problems.Add("EXPORT_RECORD_INVALID: profile frame record(s) at index $(@($broken[$k] | Select-Object -First 3) -join ', ')$(if ($broken[$k].Count -gt 3) { " and $($broken[$k].Count - 3) more" }): $k") }
+    $ok = @($rows | Where-Object { $s = Get-DvProp $_ 'success'; $s -is [bool] -and $s })
+    # frame identity: each successful frame has its own integer frame_index
+    $ids = @($ok | ForEach-Object { $fi = Get-DvProp $_ 'frame_index'; if ($fi -is [int] -or $fi -is [long]) { [int64]$fi } else { 'x' } })
+    if (@($ids | Where-Object { $_ -is [string] }).Count -gt 0 -or @($ids | Select-Object -Unique).Count -ne $ok.Count) {
+        $problems.Add('EXPORT_OUTPUT_MISMATCH: the successful profile frames do not carry one distinct integer frame_index each')
+    }
+    # the window rule: a timing present on any successful frame is present on every one (a share is over the denominator's frames); two are required outright
+    if ($ok.Count -gt 0) {
+        $partial = @($script:ExportCdngTimingFields | Where-Object { $f = $_; $n = @($ok | Where-Object { $null -ne $_.PSObject.Properties[$f] }).Count; $n -gt 0 -and $n -ne $ok.Count })
+        if ($partial.Count -gt 0) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage(s) $($partial -join ', ') are timed on some but not all of the $($ok.Count) successful frames the producer_frame_ms denominator covers, so their shares are of another window") }
+        $missing = @($script:ExportCdngRequiredTimingFields | Where-Object { $f = $_; @($ok | Where-Object { $null -ne $_.PSObject.Properties[$f] }).Count -ne $ok.Count })
+        if ($missing.Count -gt 0) { $problems.Add("EXPORT_PROFILE_ABSENT: a successful profile frame carries no $($missing -join ' / '), so the stage share and the clip's dual-ISO class cannot be read") }
+    }
+    [pscustomobject]@{ rows = @($rows); ok = @($ok); problems = @($problems) }
+}
+
+function Test-DvExportStageLogRecords {
+    # The rendered path's stage-timing log against the table above. Returns [pscustomobject]@{ perStage; problems }: perStage[stage][frame] = ms for each stage in
+    # $script:ExportRenderedStages. A line that carries the tag and is not exactly one conforming record is a problem; a stage the reader does not know is checked
+    # for shape and then ignored (it is another stage's record, not this one's).
+    param([string]$Text)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $perStage = @{}
+    foreach ($name in $script:ExportRenderedStages) { $perStage[$name] = @{} }
+    $bad = [System.Collections.Generic.List[string]]::new()
+    $lineNo = 0
+    foreach ($line in ($Text -split "`r?`n")) {
+        $lineNo++
+        if (-not $line.Contains($script:ExportStageLogTag)) { continue }
+        $hit = [regex]::Match($line, $script:ExportStageLogRecord)
+        $why = $null
+        if (-not $hit.Success) { $why = 'is not one record of the form frame=N stage=NAME ms=NUMBER' }
+        else {
+            $ms = [double]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
+            $why = Get-DvExportTimingProblem $ms
+            if ($null -eq $why) {
+                $s = $hit.Groups['s'].Value
+                if (-not $perStage.ContainsKey($s)) { continue }
+                $f = $hit.Groups['f'].Value.TrimStart('0'); if ($f -eq '') { $f = '0' }
+                $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
+            }
+        }
+        if ($null -ne $why) { $bad.Add("line ${lineNo} $why") }
+    }
+    if ($bad.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($bad.Count) stage-timing record(s) do not conform (first: $($bad[0]))") }
+    [pscustomobject]@{ perStage = $perStage; problems = @($problems) }
 }
 
 function Get-DvExportEvidence {
@@ -4555,7 +4651,8 @@ function Get-DvExportEvidence {
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
     # -- the batch log: exactly one DONE line for the one clip
-    $done = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] DONE (?<base>.+?) exported=(?<e>[0-9]+) skipped=(?<s>[0-9]+) elapsed=(?<t>[0-9]+(?:\.[0-9]+)?)\r?$'))
+    # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
+    $done = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] DONE (?<base>.+?) exported=(?<e>[0-9]{1,15}) skipped=(?<s>[0-9]{1,15}) elapsed=(?<t>[0-9]{1,12}(?:\.[0-9]{1,9})?)\r?$'))
     if ([string]::IsNullOrEmpty($BatchLogText)) { $problems.Add('EXPORT_BATCH_LOG_UNREADABLE: batch.log is absent') }
     elseif ($done.Count -ne 1) { $problems.Add("EXPORT_BATCH_LOG_UNREADABLE: batch.log carries $($done.Count) DONE line(s); one clip exports exactly one") }
     else {
@@ -4604,25 +4701,20 @@ function Get-DvExportEvidence {
             # adversary r2 pass 2 A3: no expected build id (a summary without sourceCommit) is not a pass of this check, it is a profile that cannot be bound to the build
             if ([string]::IsNullOrEmpty($ExpectedBuildId)) { $problems.Add('EXPORT_PROFILE_FOREIGN: no expected build id (the job summary names no sourceCommit), so export-profile.json cannot be bound to the build the job ran') }
             elseif ([string](Get-DvProp $profile 'build_id') -cne $ExpectedBuildId) { $problems.Add('EXPORT_PROFILE_FOREIGN: export-profile.json build_id is not the build the job ran') }
-            $frameList = Get-DvProp $profile 'frames'   # (assigned first: Get-DvProp returns an array as ONE object)
-            $rows = @($frameList | Where-Object { $null -ne $_ })
-            if ($rows.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json lists no frame, so there is nothing to read a stage share from') }
-            # adversary r2 pass 2 A4: success is the boolean true (the string "true" is not), and each successful frame has its own integer frame_index
-            $notBool = @($rows | Where-Object { (Get-DvProp $_ 'success') -isnot [bool] })
-            if ($notBool.Count -gt 0) { $problems.Add("EXPORT_PROFILE_ABSENT: $($notBool.Count) profile frame(s) carry no boolean success, so the profile is malformed") }
-            $ok = @($rows | Where-Object { $s = Get-DvProp $_ 'success'; $s -is [bool] -and $s })
-            $frameIds = @($ok | ForEach-Object { $fi = Get-DvProp $_ 'frame_index'; if ($fi -is [int] -or $fi -is [long]) { [int64]$fi } else { 'x' } })
-            if (@($frameIds | Where-Object { $_ -is [string] }).Count -gt 0 -or @($frameIds | Select-Object -Unique).Count -ne $ok.Count) {
-                $problems.Add('EXPORT_OUTPUT_MISMATCH: the successful profile frames do not carry one distinct integer frame_index each')
-            }
+            # r7: ONE schema (Test-DvExportCdngProfileRecords) validates the container, every frame record, every timing and the frame windows before anything is counted
+            $records = Test-DvExportCdngProfileRecords -Profile $profile
+            foreach ($p in $records.problems) { $problems.Add($p) }
+            $rows = @($records.rows); $ok = @($records.ok)
             $m.profileFramesSucceeded = [int64]$ok.Count
             $m.profileFramesFailed = [int64]($rows.Count - $ok.Count)
             # adversary r6 A2: a profile whose every frame failed measured nothing, whatever the leg's criteria say
             if ($rows.Count -gt 0 -and $ok.Count -eq 0) { $problems.Add("EXPORT_PROFILE_ABSENT: the profile records no successful frame (all $($rows.Count) failed), so there is no stage share to read") }
-            if ($null -ne $m.framesExported -and $ok.Count -gt $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the profile records $($ok.Count) successful frame(s) but the batch exported $($m.framesExported)") }
-            $dualIsoValues = @($ok | ForEach-Object { $dx = Get-DvProp $_ 'llrawproc_dual_iso_ms'; if (($dx -is [double] -or $dx -is [int] -or $dx -is [long]) -and [double]::IsFinite([double]$dx) -and [double]$dx -ge 0) { $dx } else { $null } })
+            # r7: the successful frames ARE the exported frames (shipped criteria say so too: profileFramesSucceeded eq the window), so a different count is no measurement of this export
+            if ($null -ne $m.framesExported -and $ok.Count -gt 0 -and $ok.Count -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the profile records $($ok.Count) successful frame(s) but the batch exported $($m.framesExported)") }
+            $dualIsoValues = @($ok | ForEach-Object { $dx = Get-DvProp $_ 'llrawproc_dual_iso_ms'; if ($null -eq (Get-DvExportTimingProblem $dx)) { $dx } else { $null } })
             if ($ok.Count -gt 0 -and @($dualIsoValues | Where-Object { $null -ne $_ }).Count -ne $ok.Count) {
-                $problems.Add('EXPORT_PROFILE_ABSENT: a successful profile frame carries no llrawproc_dual_iso_ms, so the clip''s dual-ISO class cannot be read')
+                # (the reason is already typed by the record schema above; the class is simply not readable)
+                $m.dualIsoClassAgrees = $null
             }
             elseif ($ok.Count -gt 0) {
                 $active = @($dualIsoValues | Where-Object { [double]$_ -gt 0 }).Count
@@ -4646,46 +4738,26 @@ function Get-DvExportEvidence {
             if ($ok.Count -gt 0 -and ($denRow.samples -ne $ok.Count -or $null -eq $denRow.meanMs -or [double]$denRow.meanMs -le 0 -or $largest.Count -eq 0)) {
                 $problems.Add("EXPORT_PROFILE_ABSENT: the profile carries no producer_frame_ms and per-stage timings for its $($ok.Count) successful frame(s) ($($denRow.samples) with a denominator, $($largest.Count) producer stage row(s)), so no stage share can be read")
             }
-            # adversary r2 pass 2 A1: a share is a stage's mean over the SAME window as the denominator; a producer stage timed on some of the frames only is a share of another window
-            $shortStages = @($rowsOut.Keys | Where-Object { $rowsOut[$_].samples -gt 0 -and $rowsOut[$_].samples -ne $ok.Count })
-            if ($ok.Count -gt 0 -and $shortStages.Count -gt 0) {
-                $problems.Add("EXPORT_PROFILE_ABSENT: producer stage(s) $($shortStages -join ', ') are timed on fewer than the $($ok.Count) successful frames the producer_frame_ms denominator covers, so their shares are of another window")
-            }
-            # adversary r6 A1/A2: the writer stages and the llrawproc total are held to the same window as the denominator (a stage that is timed at all is timed on every
-            # successful frame), and a present value that is not a finite non-negative number makes the profile malformed instead of silently shrinking a population
-            $shortOther = @(@($writer.Keys | Where-Object { $writer[$_].samples -gt 0 -and $writer[$_].samples -ne $ok.Count }) + @($(if ($stages.llrawprocTotal.samples -gt 0 -and $stages.llrawprocTotal.samples -ne $ok.Count) { 'llrawproc_ms' })))
-            if ($ok.Count -gt 0 -and $shortOther.Count -gt 0) {
-                $problems.Add("EXPORT_PROFILE_ABSENT: stage(s) $($shortOther -join ', ') are timed on fewer than the $($ok.Count) successful frames the producer_frame_ms denominator covers, so their shares are of another window")
-            }
-            $malformedStages = [System.Collections.Generic.List[string]]::new()
-            foreach ($stageName in @($script:ExportCdngProducerStages) + @($script:ExportCdngWriterStages) + @('llrawproc', 'producer_frame')) {
-                if ((Get-DvExportDroppedCount -Values @($ok | ForEach-Object { Get-DvProp $_ "${stageName}_ms" })) -gt 0) { $malformedStages.Add("${stageName}_ms") }
-            }
-            if ($malformedStages.Count -gt 0) {
-                $problems.Add("EXPORT_PROFILE_ABSENT: stage timing(s) $($malformedStages -join ', ') carry a value that is not a finite non-negative JSON number, so the profile is malformed")
-            }
+            # (the stage windows -- every timed stage on every successful frame, none on a subset -- and the value domain are the record schema's: Test-DvExportCdngProfileRecords)
         }
     }
     else {
         $m.profileFramesSucceeded = $null; $m['profileFramesSucceededCouldNotCheck'] = 'a ProRes export is timed by the stage-timing log, not the export stage profiler'
         $why = "$($script:ExportSuccessor): the rendered export path records no dual-ISO stage, so a ProRes leg cannot read its clip's dual-ISO class"
         $m['dualIsoActiveFramesCouldNotCheck'] = $why; $m['dualIsoClassAgreesCouldNotCheck'] = $why
-        $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]+)\b'))
+        $verified = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]{1,15})\b'))
         if ($verified.Count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: batch.log carries $($verified.Count) RENDER_VERIFIED line(s); the batch's own verification of the .mov must pass exactly once") }
         elseif ($null -ne $m.framesExported -and [int64]$verified[0].Groups['n'].Value -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the batch verified $($verified[0].Groups['n'].Value) decoded frame(s) but exported $($m.framesExported)") }
         if ([string]::IsNullOrEmpty($StageLogText)) { $problems.Add('EXPORT_PROFILE_ABSENT: stage-timing.log is absent') }
         else {
-            $perStage = @{}
-            foreach ($name in $script:ExportRenderedStages) { $perStage[$name] = @{} }
-            foreach ($hit in [regex]::Matches($StageLogText, '(?m)^\[mlv-stage-timing\] frame=(?<f>[0-9]+) stage=(?<s>[a-z0-9_]+) ms=(?<ms>[0-9]+(?:\.[0-9]+)?)\r?$')) {
-                $s = $hit.Groups['s'].Value
-                if (-not $perStage.ContainsKey($s)) { continue }
-                $f = $hit.Groups['f'].Value
-                $ms = [double]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
-                $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
-            }
+            # r7: ONE schema (Test-DvExportStageLogRecords) -- every line that carries the tag is one conforming record, or the log is INVALID with a typed reason
+            $records = Test-DvExportStageLogRecords -Text $StageLogText
+            foreach ($p in $records.problems) { $problems.Add($p) }
+            $perStage = $records.perStage
             $m.stageFramesSeen = [int64]$perStage['processed16_total'].Count
             if ($m.stageFramesSeen -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: stage-timing.log records no processed16_total frame') }
+            # r7: processed16_total is timed once per exported frame (the shipped criterion stageFramesSeen eq the window says the same), so a log of another frame count is another window
+            elseif ($null -ne $m.framesExported -and $m.stageFramesSeen -ne $m.framesExported) { $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log times $($m.stageFramesSeen) frame(s) but the batch exported $($m.framesExported)") }
             # adversary r1 A4: the batch's DONE elapsed starts before the clip opens and also times finish, decode-verify and probe, so wall / frames is no
             # per-frame loop time and never the share denominator. The shares are of the timed per-frame work (processed16_total); what the batch wall adds per
             # frame is reported apart as untimed (open, pipe write, ffmpeg back-pressure, finish, verify), never as a stage.
@@ -4706,10 +4778,18 @@ function Get-DvExportEvidence {
             # adversary r2 A2: processed16_total alone is no breakdown; both disjoint children (debayered_frame, processing) must be present and the denominator positive
             # (pass 2 A1: each child must cover exactly the frames processed16_total covers, or its share is of another window)
             # adversary r6 A1: equal sample COUNTS are not the same window; each child must also be timed on exactly the frames processed16_total is timed on
+            # r7 (A1 + Dot I2): that holds for EVERY stage the table publishes a share for, at every depth: a disjoint child or nested stage (raw_uint16, its disk_read and
+            # decompress, llrawproc) is timed on exactly processed16_total's frames or on none at all (a stage the app did not run is absent, never partial)
             $p16Frames = $perStage['processed16_total']
-            $missingChild = @($script:ExportRenderedTopLevel | Where-Object { $childName = $_; $rowsOut[$childName].samples -ne $p16.samples -or @($perStage[$childName].Keys | Where-Object { -not $p16Frames.ContainsKey($_) }).Count -gt 0 })
+            $missingChild = @($script:ExportRenderedTopLevel | Where-Object { $rowsOut[$_].samples -ne $p16.samples })
             if ($m.stageFramesSeen -gt 0 -and ($null -eq $p16.meanMs -or [double]$p16.meanMs -le 0 -or $missingChild.Count -gt 0)) {
                 $problems.Add("EXPORT_PROFILE_ABSENT: stage-timing.log times $($missingChild -join ' / ') on fewer frames than processed16_total's $($p16.samples) (mean $($p16.meanMs) ms), so no stage share can be read")
+            }
+            $otherWindow = @($script:ExportRenderedStages | Where-Object { $_ -cne 'processed16_total' } | Where-Object {
+                $frames = $perStage[$_]
+                $frames.Count -gt 0 -and ($frames.Count -ne $p16Frames.Count -or @($frames.Keys | Where-Object { -not $p16Frames.ContainsKey($_) }).Count -gt 0) })
+            if ($m.stageFramesSeen -gt 0 -and $otherWindow.Count -gt 0) {
+                $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log times $($otherWindow -join ' / ') on frames other than the $($p16Frames.Count) processed16_total is timed on, so their shares are of another window")
             }
         }
     }
@@ -4736,6 +4816,14 @@ function Get-DvExportOutcome {
     if ($ExitCode -ne 0) { return [pscustomobject]@{ outcome = 'INVALID'; detail = "EXPORT_CAPTURED with job exit ${ExitCode}: a capture that disagrees with its own exit code is not evidence"; criteria = $null } }
     if ($Evidence.classMismatch) { return [pscustomobject]@{ outcome = 'INVALID'; detail = [string]$Evidence.classDetail; criteria = $null } }
     if (@($Evidence.problems).Count -gt 0) { return [pscustomobject]@{ outcome = 'INVALID'; detail = (@($Evidence.problems) -join '; '); criteria = $null } }
+    # r7 (adversary r6 A3): EXPORT_CAPTURED asserts the batch exported the requested window, whatever criteria the leg carries. A count that is not the request is INVALID
+    # (the evidence disagrees with the token) unless a criterion of the leg names framesExported itself: then the criteria decide (the shipped legs' framesExported eq
+    # criterion reads FAIL), so a leg may state a different expectation on purpose.
+    $namesFramesExported = @(@($Criteria) | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq 'framesExported' }).Count -gt 0
+    $requested = $Evidence.metrics.framesRequested; $exported = $Evidence.metrics.framesExported
+    if (-not $namesFramesExported -and $null -ne $requested -and ($null -eq $exported -or [int64]$exported -ne [int64]$requested)) {
+        return [pscustomobject]@{ outcome = 'INVALID'; detail = "EXPORT_FRAMES_MISMATCH: the batch exported $(if ($null -eq $exported) { 'no countable number of' } else { $exported }) of the $requested requested frame(s) yet the job reported EXPORT_CAPTURED, and no criterion of the leg sets another expectation"; criteria = $null }
+    }
     $verdict = Test-DvCriteria -Criteria $Criteria -Metrics $Evidence.metrics
     $detail = $(if ($verdict.pass) { "EXPORT_CAPTURED: $(if ($verdict.informational) { 'no gating criteria' } else { 'all criteria met' }); largest stage $($Evidence.metrics.largestStage)" } else { 'EXPORT_CAPTURED: ' + ($verdict.failures -join '; ') })
     [pscustomobject]@{ outcome = $(if ($verdict.pass) { 'PASS' } else { 'FAIL' }); detail = $detail; criteria = $verdict }
