@@ -99,6 +99,13 @@ Only rows with `kind` of `product` or `playback` are shown, plus owner asks
 tooling churn and are not counted here. Rows the board has not classified are not counted
 either, even when the card name says PLAYBACK, unless the owner asked for them.
 """
+# The bare (last) render tier is master's file byte for byte, so it carries master's header: the
+# longer HEADER above would push a board that fit the budget on master over it (r4 blocker).
+HEADER_BASE = HEADER.split("\nOnly rows with", 1)[0] + """
+Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
+hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
+not classified are not counted either, even when the card name says PLAYBACK.
+"""
 OWNER = "owner"
 
 
@@ -296,7 +303,7 @@ def _budget_size(text: str) -> int:
 def render(data: dict) -> str:
     """The roadmap text. Each owner list starts at OWNER_LIST_MAX rows and all of them shrink, one row at a time, while the file is
     over ROADMAP_BUDGET_BYTES (_budget_size); product and playback rows are never dropped (a file over budget at cap 0 is over on
-    product alone)."""
+    product alone). The collapsed tier drops resolved product-kind owner asks from "Parked with reason"; table rows are never dropped."""
     for cap in range(OWNER_LIST_MAX, -1, -1):
         text = _render(data, cap)
         if _budget_size(text) <= ROADMAP_BUDGET_BYTES:
@@ -326,7 +333,7 @@ def _render(data: dict, cap: int, collapsed: bool = False, bare: bool = False) -
     landed_total, queued_total = sum(landed.values()), sum(queued.values())
 
     scope = _scope_notes(data)
-    out = [HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "", *scope]
+    out = [HEADER_BASE if bare else HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "", *scope]
     out.append("| P | card | kind | state | queued since | order_chain |")
     out.append("|---|---|---|---|---|---|")
     other_kind_seen = 0
