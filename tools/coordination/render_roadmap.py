@@ -48,7 +48,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = "mlv-app/card-queue/v1"
@@ -95,14 +95,38 @@ def _parked_since(r: dict) -> str:
 
 
 # A park note that says the work is finished or will not happen: such an owner row is a delivered (or refused) ask,
-# so it stays under "Parked with reason" and the owner-ask section lists only asks still owed.
-TERMINAL_PARK_RX = re.compile(
-    r"\b(?:DONE|shipped|closed|superseded|NO[_-]GO|DUPLICATE|merged into|not new work|won't fix|no successor)\b",
-    re.IGNORECASE)
+# so it stays under "Parked with reason" and the owner-ask section lists only asks still owed. The hub's verdict words
+# (DONE, NO_GO, DUPLICATE) count only in upper case and never inside a card id (CLOSED-CAPTIONS-1, NO-GO-GATE-1);
+# the prose phrases count in any case. A phrase right after a negation or a condition ("not DONE", "until it has
+# shipped", "to be done") is a wait, not a verdict. A row the hub wants off the owed list can say so plainly.
+_ID_EDGE_L = r"(?<![A-Za-z0-9_-])"
+_ID_EDGE_R = r"(?![A-Za-z0-9_-])"
+TERMINAL_PARK_RXS = (
+    re.compile(_ID_EDGE_L + r"(?:DONE|NO[_-]GO|DUPLICATE)" + _ID_EDGE_R),
+    re.compile(_ID_EDGE_L + r"(?i:shipped|superseded by|merged into|not new work|won't fix|no successor|closed (?:by|done|as|in))" + _ID_EDGE_R),
+)
+_NEGATED_BEFORE_RX = re.compile(r"(?i)\b(?:not|never|until|unless|before|once|when|if|to be|yet to be|un)\s+(?:\w+\s+){0,2}$")
+
+
+def _terminal_park(notes: str) -> bool:
+    for rx in TERMINAL_PARK_RXS:
+        for m in rx.finditer(notes):
+            if not _NEGATED_BEFORE_RX.search(notes[max(0, m.start() - 40):m.start()]):
+                return True
+    return False
 
 
 def _undelivered_owner_ask(r: dict) -> bool:
-    return r.get("origin") == OWNER and not TERMINAL_PARK_RX.search(r.get("notes") or "")
+    return r.get("origin") == OWNER and not _terminal_park(r.get("notes") or "")
+
+
+def _instant(stamp: str) -> datetime:
+    """A stamp as an aware UTC instant (fractional seconds kept); a date-only or odd tail reads as that day's midnight."""
+    try:
+        t = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        t = datetime.combine(_day(stamp), datetime.min.time())
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
 def _die(message: str) -> "None":
@@ -121,11 +145,11 @@ def _landed_stamp(r: dict) -> str:
     if r.get("pinned_utc"):
         stamps.append(r["pinned_utc"])
     stamps += DECLARED_RX.findall(r.get("evidence") or "")
-    return max(stamps)
+    return max(stamps, key=_instant)   # newest INSTANT: a string max picks the older of 08:00:00Z and 08:00:00.100Z
 
 
 def _sort_key(r: dict) -> tuple:
-    return (r["priority"], r["source_ledger_stamp"], r["card"])
+    return (r["priority"], _instant(r["source_ledger_stamp"]), r["card"])
 
 
 def _chain(r: dict) -> str:
@@ -225,13 +249,14 @@ def render(data: dict) -> str:
         out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
     out.append("| total | %d | %d |" % (landed_total, queued_total))
     owner_parked = sorted((r for r in parked if _undelivered_owner_ask(r)),
-                          key=lambda r: (_parked_since(r), r["priority"], r["card"]))
+                          key=lambda r: (_instant(_parked_since(r)), r["priority"], r["card"]))
+    generated_at = _instant(generated)
     other_parked = [r for r in parked if not _undelivered_owner_ask(r)]
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
             "## Parked owner asks", ""]
     for r in owner_parked:
         since = _parked_since(r)
-        age = max(0, (last - _day(since)).days)
+        age = max(0, int((generated_at - _instant(since)).total_seconds() // 86400))   # elapsed whole days, not a date difference
         out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
             r["card"], r["priority"], r["kind"], age, since[:10], _note(r, OWNER_NOTE_MAX)))
     if not owner_parked:

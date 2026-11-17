@@ -562,6 +562,52 @@ class OwnerAskTests(unittest.TestCase):
             self.assertIn(card, reason)
         self.assertIn("OWNER-UNC-PARKED", asks)
 
+    # adversary pass 1 (review-adversary-OWNER-ASK-PARK-GUARD-1-r1-83d7e0ff) A1/A2/A3: each finding's input, verbatim.
+    def one_owner(self, notes: str, stamp: str = "2026-10-22T23:59:00Z", **extra) -> dict:
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": "2026-10-23T00:00:00Z",
+                "rows": [row("OWNER-1", "parked", stamp, kind="product", origin="owner", notes=notes, **extra)]}
+
+    def owed(self, data: dict) -> str:
+        return render_roadmap.render(data).split("## Parked owner asks")[1].split("## Parked with reason")[0]
+
+    def test_a1_an_unfinished_ask_naming_done_or_a_closed_card_stays_owed(self) -> None:
+        for notes in ("waits for #123 to be done", "not DONE yet; waits for #123", "until it has shipped",
+                      "stacked after CLOSED-CAPTIONS-1", "waits for NO-GO-GATE-1 and DUPLICATE-FRAMES-2 to land",
+                      "never superseded by anything", "not closed by the hub"):
+            with self.subTest(notes=notes):
+                self.assertIn("OWNER-1", self.owed(self.one_owner(notes)))
+
+    def test_a1_a_terminal_park_word_still_moves_the_row(self) -> None:
+        for notes in ("closed DONE by HUB-TICK 20261027T0931Z", "r3 DONE verdict SPEEDUP", "design r1 NO_GO",
+                      "parked DUPLICATE of OTHER-1", "superseded by OTHER-3 r2 DONE", "shipped as OTHER-2 r2",
+                      "closed by HUB RULING 2026-11-05T01:19:19Z", "question answered, no successor", "not new work: legacy row"):
+            with self.subTest(notes=notes):
+                self.assertNotIn("OWNER-1", self.owed(self.one_owner(notes)))
+
+    def test_a2_age_is_elapsed_whole_days_not_a_date_difference(self) -> None:
+        data = self.one_owner("waiting on #123", pinned_utc="2026-10-22T23:59:00Z")
+        self.assertIn("- OWNER-1 (P3, product): parked 0 d (since 2026-10-22)", self.owed(data))
+        data = self.one_owner("waiting on #123", stamp="2026-10-20T00:00:01Z")
+        self.assertIn("parked 2 d (since 2026-10-20)", self.owed(data))
+
+    def test_a3_longest_parked_first_compares_instants_not_strings(self) -> None:
+        data = self.one_owner("waiting on #123")
+        data["rows"] = [
+            row("NEWER", "parked", "2026-10-22T23:59:00Z", kind="product", origin="owner", notes="waiting on #123",
+                pinned_utc="2026-10-22T08:00:00.100Z"),
+            row("OLDER", "parked", "2026-10-22T23:59:00Z", kind="product", origin="owner", notes="waiting on #123",
+                pinned_utc="2026-10-22T08:00:00Z"),
+        ]
+        owed = self.owed(data)
+        self.assertLess(owed.index("OLDER"), owed.index("NEWER"))
+
+    def test_a3_sibling_open_rows_and_landing_compare_instants(self) -> None:
+        data = synthetic(0, 0, 0)
+        data["rows"] += [row("B-NEWER", "queued", "2026-10-20T08:00:00.100Z"), row("A-OLDER", "queued", "2026-10-20T08:00:00Z")]
+        self.assertEqual(table_cards(render_roadmap.render(data)), ["A-OLDER", "B-NEWER"])
+        landed = row("L", "merged", "2026-10-21T23:59:59.900Z", pinned_utc="2026-10-21T23:59:59Z")
+        self.assertEqual(render_roadmap._landed_stamp(landed), "2026-10-21T23:59:59.900Z")
+
     def test_no_parked_owner_ask_says_so(self) -> None:
         text = render_roadmap.render(load_fixture())
         self.assertIn("## Parked owner asks", text)
