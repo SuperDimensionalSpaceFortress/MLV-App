@@ -259,7 +259,7 @@ class OutputShapeTests(unittest.TestCase):
         self.assertIn("refresh card", text)
         self.assertIn("`--check` is a manual tool", text)
         # the drift detector compares open rows and scope notes only (not the generated stamp, the Drain section or a state-only change)
-        self.assertIn("open rows or notes differ", text)
+        self.assertIn("open cards, priorities or notes differ", text)
 
     def test_the_bare_tier_header_drops_the_false_claim_at_master_s_byte_count(self) -> None:
         # The bare tier is held to master's byte count (the 20000-byte window): its true sentence is the same 40 bytes as the false one it replaces.

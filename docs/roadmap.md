@@ -1,20 +1,20 @@
 # MLV-App product roadmap
 
 Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`,
-the live dispatch surface. That file lives under `.claude-state/hub-autopilot/`,
-gitignored, absent from hosted checkouts, so this file is the only place a reviewer
+the live dispatch surface. That file sits under `.claude-state/hub-autopilot/`,
+gitignored, absent from hosted checkouts, so this is the only place a reviewer
 without local state sees the open backlog. Where they disagree, `card-queue.json`
 wins: re-render, do not edit by hand. The hub renders a live copy to
-`.claude-state/heartbeat/roadmap-live.md` every hour. When its open rows or notes differ from
-the live queue and it is 7 or more days old, a drift detector files a refresh card.
-`--check` is a manual tool; no CI job runs it.
+`.claude-state/heartbeat/roadmap-live.md` every hour. When its
+open cards, priorities or notes differ from the live queue and it is 7 or more days old,
+a drift detector files a refresh card. `--check` is a manual tool; no CI job runs it.
 
 Only rows with `kind` of `product` or `playback` are shown, plus owner asks
 (`origin` = `owner`) of any kind. Hub-tooling, factory, hygiene and ci-flake cards are
-tooling churn, not counted here. Unclassified rows are not counted either, even if
+tooling churn, not counted here. Unclassified rows are not counted, even if
 the card name says PLAYBACK, unless the owner asked.
 
-generated_from: 2026-11-17T20:47:09Z
+generated_from: 2026-11-17T21:02:01Z
 
 ## Open product and playback cards
 
