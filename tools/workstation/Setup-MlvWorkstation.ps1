@@ -1038,9 +1038,13 @@ $script:CredentialExemptLiterals = @('""', "''", 'null', '~', '[]', '{}', '***')
 $script:CredentialLineBreakRegex = [regex]::new("\r\n|\r|\u0085|\u2028|\u2029")
 $script:CredentialPlaceholderRegex = [regex]::new('^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z_ -]+>)$')
 # a netrc-shaped text: it carries a whitespace-delimited netrc keyword that opens or names a record ('machine', 'default', 'login', 'macdef')
-$script:CredentialNetrcShapeRegex = [regex]::new('(?i)(?<!\S)(?:machine|default|login|macdef)(?!\S)')
+# r25 (adversary pass 29 A1): a netrc reader (Python's netrc, curl) accepts a double-quoted token and a backslash inside a token, so 'login alice "password" hunter2' and
+# 'password' written 'pass\word' are the same keywords. $q is the run of quote and backslash characters allowed around and between the letters of a keyword.
+$script:NetrcQ = '[\\"'']*'
+function Get-NetrcKeywordPattern([string]$Word) { return (($Word.ToCharArray() | ForEach-Object { [regex]::Escape([string]$_) }) -join $script:NetrcQ) }
+$script:CredentialNetrcShapeRegex = [regex]::new('(?i)(?<!\S)' + $script:NetrcQ + '(?:' + ((@('machine', 'default', 'login', 'macdef') | ForEach-Object { Get-NetrcKeywordPattern $_ }) -join '|') + ')' + $script:NetrcQ + '(?!\S)')
 # in a netrc-shaped text, the token 'password' (or 'passwd') followed by ANY further token (any line, comments included) is a credential
-$script:CredentialNetrcPasswordRegex = [regex]::new('(?i)(?<!\S)(?:password|passwd)(?!\S)\s+\S')
+$script:CredentialNetrcPasswordRegex = [regex]::new('(?i)(?<!\S)' + $script:NetrcQ + '(?:' + (Get-NetrcKeywordPattern 'password') + '|' + (Get-NetrcKeywordPattern 'passwd') + ')' + $script:NetrcQ + '(?!\S)\s+\S')
 # Files that hold credentials by ROLE on the host that receives a bundle, whatever else they contain (Import never replaces one that carries a credential).
 $CredentialRoleFiles = @('settings.json', 'settings.local.json', 'config.toml', '.mcp.json', 'mcp.json', 'mcp_settings.json', 'hosts.yml', '.npmrc', '.netrc', '.git-credentials', 'credentials')
 # Known token SHAPES: a secret by its own form, whatever key (if any) it stands under. These are not spellings of the key/value rule above.
@@ -1330,10 +1334,13 @@ function Get-CredentialHitIndex {
 
 # r23 (adversary pass 27 A1; pass 26 A3): the escapes a TOML, YAML or JSON reader decodes in a key or value: \uXXXX, \UXXXXXXXX (TOML), \xXX (YAML) and \/ (JSON).
 # Only \uXXXX used to be decoded, so '"\U00000070assword" = "hunter2"' and '"\x70assword": hunter2' named no secret. A \U value that is not a Unicode scalar is left as written.
-function Test-CredentialEscapesPresent([string]$Text) { return ("$Text" -match '\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|/)') }
+# r25 (adversary pass 29 A2): a YAML or TOML double-quoted scalar also takes a backslash at the end of a line as an escaped line break: the break and the leading blanks of the
+# next line are dropped ('"pass\<newline>  word"' is 'password'). The text has one '\n' per separator by the time it gets here (Get-CredentialHitLine).
+function Test-CredentialEscapesPresent([string]$Text) { return ("$Text" -match '\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|/|\n)') }
 function ConvertFrom-CredentialEscapes([string]$Text) {
-    return [regex]::Replace("$Text", '\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2})|(/))', [System.Text.RegularExpressions.MatchEvaluator]{
+    return [regex]::Replace("$Text", '\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2})|(/)|(\n[ \t]*))', [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
+        if ($m.Groups[5].Success) { return '' }
         if ($m.Groups[1].Success) { return [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }
         if ($m.Groups[3].Success) { return [string][char][Convert]::ToInt32($m.Groups[3].Value, 16) }
         if ($m.Groups[4].Success) { return '/' }
@@ -2008,12 +2015,27 @@ function Set-ImportFileContentAtomic {
                 # r19 pass 21 A4: a rename-over save the lock cannot block may land between the check above and this Replace. What the Replace displaced (now at $older) must be the
                 # interleaved save read above (bytes AND time); anything else is a NEWER save, and it goes back to the host path at once (the file the Replace just put there, the older
                 # one, moves aside to $undo). The newest save is therefore always the live file; the older saves are kept and named, never deleted.
-                $olderIsWas = $true
-                try { $olderIsWas = ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($older))) -ceq (Get-ImportBytesHash $was) -and [IO.File]::GetLastWriteTimeUtc($older) -eq $wasTime) } catch { $olderIsWas = $true }   # unreadable: the note below keeps it named
+                # r25 (adversary pass 29 A3, deny by default): an unreadable $older is NOT proof that it is the interleaved save (it used to read as 'is the interleaved save', so a newer
+                # save held open at that instant stayed unrestored while the message said it had been put back). Unreadable now takes the restore path below, whose Replace fails
+                # typed when the file really is held and names both files.
+                $olderIsWas = $false
+                try { $olderIsWas = ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($older))) -ceq (Get-ImportBytesHash $was) -and [IO.File]::GetLastWriteTimeUtc($older) -eq $wasTime) } catch { $olderIsWas = $false }
                 if (-not $olderIsWas) {
                     $undo = "$base.undo"
+                    if ($script:ImportBeforeUndoHook) { & $script:ImportBeforeUndoHook $Dest }   # r25 test seam: a save in the instant before this Replace
                     try { [IO.File]::Replace($older, $Dest, $undo, $true) }
                     catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a newer save landed while the rollback ran and is kept at $older; putting it back failed: $($_.Exception.Message); an older save is at $Dest)" }
+                    # r25 (adversary pass 29 A3): this Replace is itself a window. What it displaced (now at $undo) must be the interleaved save read above (bytes AND time);
+                    # anything else is a save that landed after the check, i.e. the NEWEST, and it goes back to the host path at once. Nothing is deleted: the save the second
+                    # Replace displaces is kept at $undo2 and named.
+                    $undoIsWas = $false
+                    try { $undoIsWas = ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($undo))) -ceq (Get-ImportBytesHash $was) -and [IO.File]::GetLastWriteTimeUtc($undo) -eq $wasTime) } catch { $undoIsWas = $false }
+                    if (-not $undoIsWas) {
+                        $undo2 = "$base.undo2"
+                        try { [IO.File]::Replace($undo, $Dest, $undo2, $true) }
+                        catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a newest save landed in the instant of the restore and is kept at $undo; putting it back failed: $($_.Exception.Message); an older save is at $Dest)" }
+                        throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (saves landed while the rollback ran: the newest is live at $Dest again; the older save it displaced is kept at $undo2)"
+                    }
                     throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (saves landed while the rollback ran: the newest is live at $Dest; the older save it displaced is kept at $undo)"
                 }
             } finally { if ($h2) { $h2.Dispose() } }
@@ -2137,6 +2159,7 @@ $script:ImportBeforeRollbackHook = $null
 # r19 pass 22 A6: test seam, called right before the rollback's second Replace (an editor's rename-over save in that instant). It MUST be initialised here: the script runs under
 # strict mode, and an unset script variable read in the rollback threw before the newest save could be put back. Always $null in a real run.
 $script:ImportBeforeAsideRestoreHook = $null
+$script:ImportBeforeUndoHook = $null   # r25 test seam (pass 29 A3): the instant before the newest-save restore Replace
 
 # r12 A3: the settings.json profile rewrite (VIRTUAL-TEN profile -> this profile) as ONE locked read-judge-write on the host file, the same discipline as
 # Copy-ImportFileLocked: the file is opened exclusively (FileShare.None), read, judged by Test-CredentialText, and written back through the SAME handle. It used to be

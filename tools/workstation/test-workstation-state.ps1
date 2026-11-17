@@ -2470,6 +2470,40 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r23 p27 detector')) {
     Assert-That (-not (Test-CredentialText '"\U00000070ath" = "C:/work"')) 'r23 p27 control detector: a \U escape that spells a plain key is not a credential' ''
     if (Test-Has 'Test-CredentialNamePresent' 'r23 p27 role name') { Assert-That (Test-CredentialNamePresent '\U00000070assword') 'r23 p27 A1 role name: a \U-escaped password name is a credential name' '' }
 }
+# r25 (adversary pass 29 on 39c1f9f2, A1/A2): a netrc reader accepts a quoted or backslashed keyword, and a YAML/TOML double-quoted scalar takes a backslash-newline as an escaped line break
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'r25 p29 detector')) {
+    Assert-That (Test-CredentialText 'machine example.org login alice "password" hunter2') 'r25 p29 A1 detector: a netrc "password" (quoted keyword) is a credential' ''
+    Assert-That (Test-CredentialText 'machine example.org login alice pass\word hunter2') 'r25 p29 A1 detector: a netrc pass\word (backslash inside the keyword) is a credential' ''
+    Assert-That (Test-CredentialText 'machine example.org login alice ''password'' hunter2') 'r25 p29 A1 detector: a netrc single-quoted password keyword is a credential' ''
+    Assert-That (Test-CredentialText '"machine" example.org "login" alice "passwd" hunter2') 'r25 p29 A1 detector: a netrc with every keyword quoted is a credential' ''
+    Assert-That (Test-CredentialText ('? "pass\' + "`n" + '  word"' + "`n" + ': hunter2')) 'r25 p29 A2 detector: a YAML explicit key "pass\<newline>  word" (an escaped line break) is a credential' ''
+    Assert-That (Test-CredentialText ('"pass\' + "`r`n" + '   word": hunter2')) 'r25 p29 A2 detector: the same split key with a CRLF is a credential' ''
+    Assert-That (-not (Test-CredentialText 'machine example.org login alice')) 'r25 p29 control: a netrc record with no password is not a credential' ''
+    Assert-That (-not (Test-CredentialText ('"pat\' + "`n" + '   h": C:/work'))) 'r25 p29 control: an escaped line break that spells a plain key is not a credential' ''
+}
+# r25 (adversary pass 29 A3): a save that lands in the instant before the newest-save restore Replace is the NEWEST; it must be live at the end, never left in the .undo file
+if ($fnLoaded -and (Test-Has 'Copy-ImportFileLocked' 'r25 p29 A3')) {
+    $r25d = New-Scratch 'r25-a3'
+    $r25Src = Join-Path $r25d 'bundle\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $r25Src))
+    $r25Dst = Join-Path $r25d 'host\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $r25Dst))
+    [IO.File]::WriteAllText($r25Src, '{"v":"bundle"}'); (Get-Item -LiteralPath $r25Src).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 11, 0, 0, [DateTimeKind]::Utc)
+    [IO.File]::WriteAllText($r25Dst, '{"v":"old"}'); (Get-Item -LiteralPath $r25Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 10, 0, 0, [DateTimeKind]::Utc)
+    $script:R25Moved = $null
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"v":"owner-v1"}'); [IO.File]::SetLastWriteTimeUtc($Dest, [DateTime]::new(2026, 11, 16, 12, 0, 0, [DateTimeKind]::Utc)) }
+    $script:ImportBeforeRollbackHook = { param($Dest) $s2 = "$Dest.editor-save"; [IO.File]::WriteAllText($s2, '{"api_key":"owner-v2"}'); try { [IO.File]::Move($s2, $Dest, $true) } catch { } }
+    $script:ImportBeforeAsideRestoreHook = { param($Dest) $s3 = "$Dest.editor-save3"; [IO.File]::WriteAllText($s3, '{"api_key":"owner-v3"}'); try { [IO.File]::Move($s3, $Dest, $true) } catch { } }
+    $script:ImportBeforeUndoHook = { param($Dest) $s4 = "$Dest.editor-save4"; [IO.File]::WriteAllText($s4, '{"api_key":"owner-v4"}'); try { [IO.File]::Move($s4, $Dest, $true); $script:R25Moved = $true } catch { $script:R25Moved = "move failed: $($_.Exception.Message)" } }
+    $r25msg = ''
+    try { $r25r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($r25Src)) -Dest $r25Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false; $r25msg = "result=$($r25r.Result)" } catch { $r25msg = $_.Exception.Message } finally { $script:ImportBeforeSwapHook = $null; $script:ImportBeforeRollbackHook = $null; $script:ImportBeforeAsideRestoreHook = $null; $script:ImportBeforeUndoHook = $null }
+    Write-Host "INFO r25 A3 seam: moved=$($script:R25Moved) | $r25msg"
+    if ($script:R25Moved -eq $true) {
+        Assert-That (([IO.File]::ReadAllText($r25Dst)) -ceq '{"api_key":"owner-v4"}') 'r25 p29 A3 import: the newest save (landed in the instant before the .undo Replace) is the live file' "$r25msg | $([IO.File]::ReadAllText($r25Dst))"
+        Assert-That ($r25msg -like 'IMPORT_ROLLBACK_DEST_CHANGED*' -and $r25msg -match 'again') 'r25 p29 A3 import: the refusal names that the newest save is live again' $r25msg
+    } else {
+        Assert-That (([IO.File]::ReadAllText($r25Dst)) -notmatch 'bundle') 'r25 p29 A3 import: a newest save refused by the lock loses nothing and the bundle copy is not live' "moved=$($script:R25Moved) $r25msg | $([IO.File]::ReadAllText($r25Dst))"
+    }
+    Assert-That ($null -ne (Get-Variable -Scope Script -Name ImportBeforeUndoHook -ErrorAction SilentlyContinue)) 'r25 p29 A3 import: the .undo seam variable is initialised'
+}
 # (c) fable key3 r21 B1 + H1, opus H2: deny by default. An ssh spelling is normalised only for a plain user, host and path; anything else is keyed by its raw string.
 if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r22 fable B1')) {
     Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:a~b/lease.git' 'ssh://git@nas.example/~/a~b/lease.git')) 'r22 fable B1 R-a url: an scp path whose second character is ~ (Git sends ~b/lease.git) is not ssh://host/~/a~b/lease.git'
