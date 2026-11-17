@@ -1133,7 +1133,11 @@ function Get-DvSmokeSummaryFields {
         if ($null -ne $session) {
             $summaryLine = $null
             foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $summaryLine = $line } }
-            if ($null -ne $summaryLine) {
+            # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker; r24 adversary A1 on c1b10b4f): a summary record that holds a
+            # MASKED `=` (a `<key>=` inside a quoted span, ConvertTo-DvQuoteMaskedBody) is refused whole: no field is read from it, so the quoted text never
+            # supplies a field (the key3 repro's `source_advanced=600`) and a stray quote never hides a real field while the rest still reads (fields empty,
+            # so every proof field is absent and the evidence is invalid). The app's own summary values hold no `=` inside a quote (real-log-mask-check)
+            if ($null -ne $summaryLine -and $summaryLine.IndexOf($script:DvQuotedEqualsMask) -lt 0) {
                 foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
             }
             foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $conformLine = $line } }
@@ -2539,6 +2543,12 @@ function Get-DvSmokeSessionLineRead {
             if ($seen.ContainsKey($k)) { [void]$duplicates.Add($k) }
             else { $seen[$k] = $m.Groups['v'].Value }
         }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (r24 adversary A1 on c1b10b4f, its input: a start line whose
+        # env_playback_scope_interval_ms value is a lone `'`, so the mask hid the real env_omp_num_threads=1 after it and the inherited override read
+        # absent, HONOURED): a key written with a MASKED `=` (inside a quoted span, ConvertTo-DvQuoteMaskedBody) is UNREADABLE, never absent. It joins
+        # the duplicates, which every consumer already refuses (Get-DvInheritedWorkerOverrides names it unreadable; Get-DvSmokeSessionLineFields leaves
+        # it out, fail closed). The key is bounded by any non-name character, so a quote-glued key counts too.
+        foreach ($m in [regex]::Matches($found, '(?<![A-Za-z0-9_])(?<k>[A-Za-z0-9_]+)\x1A')) { [void]$duplicates.Add($m.Groups['k'].Value) }
         foreach ($k in $seen.Keys) { if (-not $duplicates.Contains($k)) { $fields[$k] = $seen[$k] } }
     }
     @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
@@ -2684,18 +2694,24 @@ function ConvertTo-DvQuoteMaskedBody {
     $script:DvQuotedEqualsMask, so text inside a quote never supplies a `<key>=` field to any reader. A quoted span opens at ANY `"` or `'` of the body
     (whatever precedes it: `k="v"`, `render "free text"`, `x'y`) and closes at the next quote of the SAME kind; the other kind inside it is plain text;
     a span with no closer runs to the end of the body. Everything else is unchanged (the quotes themselves, the words inside a span, so a quoted
-    `session` or `settings_store` is still a MENTION for the readers that refuse a second mention). It may refuse (a lone apostrophe in an unquoted
-    value masks every later `=`, so those fields read as absent); it never forges. Linear: IndexOf / IndexOfAny only, each position visited once.
+    `session` or `settings_store` is still a MENTION for the readers that refuse a second mention). It may refuse; it never forges, and it never
+    HIDES a field: a lone apostrophe in an unquoted value (log_line_field::fieldValue maps no quote, so a launcher env value can hold one) masks every
+    later `=`, and a key with a masked `=` is UNREADABLE, never absent (r24 adversary A1 on c1b10b4f): Get-DvSmokeSessionLineRead counts it as a
+    duplicate and Get-DvSmokeSummaryFields refuses the whole summary record. Linear: IndexOf / IndexOfAny only, each position visited once.
     #>
     param([AllowNull()][AllowEmptyString()][string]$Body)
     if ([string]::IsNullOrEmpty($Body) -or $Body.IndexOf([char]'=') -lt 0) { return $Body }
     $i = $Body.IndexOfAny($script:DvQuoteChars)
     if ($i -lt 0) { return $Body }
     $chars = $Body.ToCharArray()
+    # r24 (r24 adversary advisory A3 on c1b10b4f, its input: 4000 =-free quoted spans before one `=`): the next `=` is found once and reused until the
+    # scan passes it, so an =-free span never rescans the rest of the body (linear, as the synopsis says)
+    $j = -2
     while ($i -ge 0) {
         $close = $Body.IndexOf($Body[$i], $i + 1)
         $end = $(if ($close -lt 0) { $Body.Length } else { $close })
-        for ($j = $Body.IndexOf([char]'=', $i + 1); $j -ge 0 -and $j -lt $end; $j = $Body.IndexOf([char]'=', $j + 1)) { $chars[$j] = $script:DvQuotedEqualsMask }
+        if ($j -ne -1 -and $j -lt $i) { $j = $Body.IndexOf([char]'=', $i + 1) }
+        while ($j -ge 0 -and $j -lt $end) { $chars[$j] = $script:DvQuotedEqualsMask; $j = $Body.IndexOf([char]'=', $j + 1) }
         if ($close -lt 0) { break }
         $i = $Body.IndexOfAny($script:DvQuoteChars, $close + 1)
     }

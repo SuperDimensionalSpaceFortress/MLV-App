@@ -16473,7 +16473,8 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
         }
         for name, v in zip(cases, self.each(self.PLAYBACK, list(cases.values()))):
             with self.subTest(case=name):
-                self.assertEqual((v["sourceAdvanced"], v["valid"]), (1, False), v)
+                # r24 iteration 2 (r24 adversary A1): a summary holding a quoted `<key>=` is refused whole, so no field is read (never the quoted value)
+                self.assertEqual((v["sourceAdvanced"], v["valid"]), (None, False), v)
         # control: the measured count outside every quote is read, an =-free quoted ` (` still is no location, and a real 600 is valid
         ok = self.each(self.PLAYBACK, [self.WINDOW + self.SUMMARY.replace("source_advanced=1 ", "source_advanced=600 ") + ' note="harmless (text)"'])
         self.assertEqual((ok[0]["sourceAdvanced"], ok[0]["valid"]), (600, True), ok)
@@ -16524,6 +16525,29 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
                 self.assertIsNone(v["observed"], v)
                 if i != 1:
                     self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_r24_adversary_a1_a_stray_quote_never_hides_an_inherited_worker_override(self) -> None:
+        # r24 adversary A1 on c1b10b4f, its input verbatim: the env value of env_playback_scope_interval_ms is a lone `'` (log_line_field::fieldValue maps
+        # no quote), the mask hid the REAL env_omp_num_threads=1 after it, and the override read absent: HONOURED, blocks=false. A key with a masked `=` is
+        # unreadable, never absent, so the leg blocks on both paths, either quote
+        start = ("playback_smoke.measured_session id=3\nplayback_smoke.start session=3 worker_threads=8 env_force_threads=unset "
+                 "env_force_singlethread=unset env_playback_max_threads=8 env_disable_playback_thread_cap=unset env_playback_scope_interval_ms={q} "
+                 "env_omp_num_threads=1")
+        summary = ("([pscustomobject]@{ result = 'MEASUREMENT_CAPTURED'; playbackMaxThreadsRequested = 8; playbackMaxThreadsSmoke = 8; "
+                   "playbackWorkerThreadsRead = 8 })")
+        capped = ("$w = Get-DvWorkerThreadsEvidence -Spec (@{ generatorArgs = @{ playbackMaxThreads = 8 } }) -LogText $log -Summary " + summary +
+                  "; [ordered]@{ verdict = $w.verdict; blocks = $w.blocks }")
+        # the uncapped control leg reads the same line (its spec names no worker variable: env_playback_max_threads=8 is an override there too)
+        uncapped = "$w = Get-DvWorkerThreadsEvidence -Spec (@{}) -LogText $log -Summary $null; [ordered]@{ verdict = $w.verdict; blocks = $w.blocks }"
+        logs = [start.format(q="'"), start.format(q='"'), start.format(q="'x") + "'"]
+        for expr in (capped, uncapped):
+            for i, v in enumerate(self.each(expr, logs)):
+                with self.subTest(expr=expr[:40], case=i):
+                    self.assertTrue(v["blocks"], v)
+                    self.assertNotEqual(v["verdict"], "HONOURED", v)
+        # control: the same capped line with an unquoted scope value is HONOURED only without the inherited OMP_NUM_THREADS
+        ok = self.each(capped, [start.format(q="unset").replace(" env_omp_num_threads=1", " env_omp_num_threads=unset")])
+        self.assertEqual((ok[0]["verdict"], ok[0]["blocks"]), ("HONOURED", False), ok)
 
     def test_r24_the_look_label_reader_takes_no_record_from_a_quoted_span(self) -> None:
         # Get-DvLookLabelEvidence read raw lines unanchored, so a label record spelled inside another record's quoted span answered for the app
