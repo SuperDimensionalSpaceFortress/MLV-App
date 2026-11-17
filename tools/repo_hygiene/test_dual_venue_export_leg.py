@@ -381,6 +381,71 @@ class ExportEvidenceTests(unittest.TestCase):
                 self.assertTrue(any(token in p for p in got[i]["problems"]), got[i])
 
 
+    def test_a_stage_table_of_another_window_or_a_malformed_profile_is_invalid_and_never_throws(self) -> None:
+        """adversary r2 pass 2 A1/A3/A4/A5: a stage timed on a few frames only (its share is of another window), a profile read with no expected build id, a
+        profile with duplicate frame ids / a string success / no frames / an object-valued timing, and a negative output byte count each read INVALID with a
+        typed problem and never PASS or a thrown cast."""
+        def profile(rows: list[dict]) -> str:
+            return json.dumps({"schema": "mlvapp.export_stage_profile.v1", "build_id": BUILD_ID, "frame_count": len(rows), "dng_compress_placement": "producer",
+                               "async_writer_can_overlap_dng_compress": False, "stages": {}, "frames": rows})
+
+        def row(i: int, **over) -> dict:
+            r = {"clip": "view-0", "frame_index": i, "success": True, "llrawproc_dual_iso_ms": 30.0, "producer_frame_ms": 50.0, "raw_read_ms": 4.0}
+            r.update(over)
+            return r
+        one_window = profile([row(i, **({"raw_read_ms": 10.0} if i == 0 else {})) for i in range(30)])
+        one_window = json.loads(one_window)
+        for r in one_window["frames"][1:]:
+            r.pop("raw_read_ms")                       # raw_read is timed on frame 0 only
+        children_late = "".join(f"[mlv-stage-timing] frame={i} stage=processed16_total ms=56.000\n" for i in range(30)) \
+            + "".join(f"[mlv-stage-timing] frame={i} stage={s} ms=1000.000\n" for i, s in ((30, "debayered_frame"), (31, "processing")))
+        neg_bytes = json.loads(output_manifest(30))
+        neg_bytes["totalBytes"] = -1
+        cases = [prores_case(stage=children_late),                                                                                    # 0 children outside processed16_total's frames
+                 cdng_case(profile=json.dumps(one_window)),                                                                           # 1 raw_read timed on one frame
+                 cdng_case(buildId=""),                                                                                               # 2 no expected build id
+                 cdng_case(profile=profile([row(0) for _ in range(30)])),                                                             # 3 every frame_index 0
+                 cdng_case(profile=profile([row(i, success="true") for i in range(30)])),                                             # 4 string success
+                 cdng_case(profile=profile([]), criteria=[]),                                                                         # 5 no frames, informational criteria
+                 cdng_case(profile=profile([row(i, **({"producer_frame_ms": {}} if i == 0 else {})) for i in range(30)])),            # 6 object-valued timing
+                 cdng_case(manifest=json.dumps(neg_bytes)),                                                                           # 7 negative totalBytes
+                 cdng_case(profile=profile([row(i, llrawproc_dual_iso_ms={}) for i in range(30)]))]                                   # 8 object-valued dual-ISO figure
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(len(got), len(cases))
+        for i in range(len(cases)):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(got[i]["problems"], got[i])
+
+    def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
+        """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string
+        passed the shape and threw at the generator's double cast after a lease was spent."""
+        base = leg(EXPORT_LEGS[0])
+        values = [{}, True, "20", [20], -1, 0, 100.5, None]
+        cases = []
+        for v in values:
+            s = json.loads(json.dumps(base))
+            s["generatorArgs"]["cpuQuiescenceThresholdPercent"] = v
+            cases.append({"name": repr(v), "spec": s})
+        for v in (0.05, 20, 100):
+            s = json.loads(json.dumps(base))
+            s["generatorArgs"]["cpuQuiescenceThresholdPercent"] = v
+            cases.append({"name": "ok-" + repr(v), "spec": s})
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps(cases), encoding="utf-8")
+            proc, got = run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:C -Encoding utf8 | ConvertFrom-Json\n"
+                                      "@($cases | ForEach-Object { [ordered]@{ name = $_.name; r = (Get-DvLegSpecShapeRefusal -Spec $_.spec) } }) | ConvertTo-Json -Compress -AsArray", C=str(path))
+        self.assertIsNotNone(got, proc.stdout + proc.stderr)
+        for case, row_ in zip(cases, got):
+            with self.subTest(case=case["name"]):
+                if case["name"].startswith("ok-"):
+                    self.assertIsNone(row_["r"], row_)
+                else:
+                    self.assertIsNotNone(row_["r"], row_)
+
+
 EXPORT_STUB_GENERATOR = r"""
 param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
