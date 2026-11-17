@@ -17487,7 +17487,13 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                     v = self.verdict(spec, self.PREFIX + "interaction_trace event=automation.start" + tail + "\n" + self.log(self.route(value)))
                     self.assertEqual((v["observed"], v["verdict"], v["blocks"]), expected, v)
         start_loc = " (C:/build playback_smoke.start session=3 worker_threads=2 25846/MainWindow.cpp:%2)"
-        for name, end in (("old writer :%2)", ""), ("unreadable tail", " x")):
+        # CONTRACT CHANGE, HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r25 (forced companion of 424ca7e9, CI run 44019211058): in the `unreadable
+        # tail` case the summary and pace_summary records THEMSELVES end in ` x` after `:%2)`, so each is a cut (LOCATION_UNREADABLE) record and is refused
+        # whole: summary, presentedFps and timelineFpsAfterFirstPresent read None (before r24 the fields before the cut read 24 / 24 / 59.9). workers and
+        # look come from the intact start and visual-state records and still read; 999 is never read in either case.
+        intact = {"workers": "8", "look": "0"}
+        for name, end, expected in (("old writer :%2)", "", dict(intact, summary="24", presentedFps=24, timelineFpsAfterFirstPresent=59.9)),
+                                    ("unreadable tail", " x", dict(intact, summary=None, presentedFps=None, timelineFpsAfterFirstPresent=None))):
             with self.subTest(case=name):
                 log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8 (C:/a/MainWindow.cpp:1)",
                                  self.PREFIX + "interaction_trace event=gui_smoke.visual_state look_assist_enabled=0 (C:/a/MainWindow.cpp:2)",
@@ -17502,8 +17508,7 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                                           DVE_LOG=log)
                 self.assertIsNotNone(out, proc.stdout + proc.stderr)
                 self.assertEqual({"workers": out["workers"], "look": out["look"], "summary": out["summary"], "presentedFps": out["rates"]["presentedFps"],
-                                  "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]},
-                                 {"workers": "8", "look": "0", "summary": "24", "presentedFps": 24, "timelineFpsAfterFirstPresent": 59.9})
+                                  "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]}, expected)
 
     def test_a_long_run_of_open_parentheses_is_read_in_one_pass(self) -> None:
         # r5 (sol r4 H1 on #726): the r4 suffix regex was super-linear on repeated ` (` (10000: ~0.9 s, 30000: ~6.7 s, 100000: more than 8 s). The scan is
