@@ -382,6 +382,9 @@ CONSUMER_EXEMPT: dict[str, str] = {
         "contract self-test: every case runs the runner expecting a non-zero exit and fails when it exits 0.",
     "tools/profiling/summarize-local-cuda-proof.ps1": "prints the proof commands as text; it launches nothing.",
     "tools/profiling/package-local-cuda-proof-result.ps1": "packages an existing proof folder; it launches nothing.",
+    "tools/profiling/bachelor/export-stage-job.ps1":
+        "EXPORT-VENUE-LEG-1 export job generator: it names Invoke-VenueLeg.ps1 (its caller) in its description and launches nothing on this host; "
+        "the job it emits runs MLVApp.exe --batch on the venue and classifies that exit itself (RESULT= / exit 40-47).",
     "tools/profiling/run-release-cuda-dng-export.ps1":
         "export launcher: -Context 'launcher' refuses every play mode; it names a proof command as text.",
     "tools/profiling/start-release-cuda-playback.ps1":
