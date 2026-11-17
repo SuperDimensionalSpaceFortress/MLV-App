@@ -33,7 +33,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ROADMAP_PATH = REPO_ROOT / "docs" / "roadmap.md"
 CHECKER_PATH = REPO_ROOT / "tools" / "coordination" / "check_roadmap_queue_parity.py"
 
-ROADMAP_ROW_RX = re.compile(r"^\|\s*\d+\s*\|\s*(\S+)\s*\|\s*(product|playback)\s*\|", re.MULTILINE)
+# OWNER-ASK-PARK-GUARD-1: an owner ask of another kind is on the table too, its kind cell reading "<kind> (owner)".
+# (r2, adversary advisory A4 on 8ba4f8ab) any owner kind cell counts, a blank kind included ("|  (owner) |"): the cell only has to end in "(owner)".
+# (r10, advisory A4) the gaps between cells are spaces or tabs only: `\s` also matched a newline, so a row broken between cells still read as a row.
+# (r11, sol r10 hardening) the card cell is `[^\s|]+`, one pipe-free token as the renderer's loader requires: `\S+` read "OWNER|EXTRA" as a card.
+# (r10 adversary advisories A1, pass 2 A2) the owner kind is the renderer's KIND_RX ([A-Za-z0-9][A-Za-z0-9 _.-]{0,39}, or blank) then " (owner)": `[^|\n]` also matched U+2028 and U+0085.
+ROADMAP_ROW_RX = re.compile(r"^\|[ \t]*\d+[ \t]*\|[ \t]*([^\s|]+)[ \t]*\|[ \t]*(product|playback|(?:[A-Za-z0-9][A-Za-z0-9 _.-]{0,39})?[ ]\(owner\))[ \t]*\|", re.MULTILINE)
 GENERATED_FROM_RX = re.compile(r"^generated_from: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", re.MULTILINE)
 # docs/22 working tier is 25000 soft; the rendered roadmap grows with the open backlog.
 ROADMAP_BUDGET_BYTES = 20000
@@ -89,6 +94,46 @@ class RoadmapQueueParityTests(unittest.TestCase):
         section = ROADMAP_PATH.read_text(encoding="utf-8").split("## Drain")[0]
         table_lines = [l for l in section.splitlines() if re.match(r"^\|\s*\d+\s*\|", l)]
         self.assertEqual(len(table_lines), len(ROADMAP_ROW_RX.findall(section)), table_lines)
+
+    def test_the_row_regex_reads_every_owner_kind_cell_the_renderer_can_emit(self) -> None:
+        """adversary pass 1 A4: a kind with a digit or underscore ('qa2', 'venue_tooling') still reads as a table row."""
+        for kind in ("qa2", "venue_tooling", "hub-tooling", "CI-flake", "qa tooling"):   # pass 2 A5: a kind with a space
+            line = "| 3 | OWNER-1 | %s (owner) | queued | 2026-10-22 | - |" % kind
+            self.assertEqual(ROADMAP_ROW_RX.findall(line), [("OWNER-1", "%s (owner)" % kind)], kind)
+        for kind in ("", " "):   # r2 advisory A4: the renderer emits '| 3 | OWNER-1 |  (owner) | ...' for a blank kind
+            line = "| 3 | OWNER-1 | %s (owner) | queued | 2026-10-22 | - |" % kind
+            self.assertEqual([c for c, _k in ROADMAP_ROW_RX.findall(line)], ["OWNER-1"], repr(kind))
+        self.assertEqual(ROADMAP_ROW_RX.findall("| - | ... and 30 more open owner asks of another kind (card-queue.json) | - | - | - | - |"), [])
+
+    def test_the_kind_cell_never_spans_a_line_break(self) -> None:
+        """adversary pass r7 A3: a kind cell is one physical line; '[^|]' also matched a newline, so a broken row read as kind 'qa\\n(owner)'."""
+        self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa\n(owner) | queued | 2026-10-20 | - |"), [])
+
+    def test_no_cell_gap_spans_a_line_break(self) -> None:
+        """r9 advisory A4 (ROADMAP-ROW-REGEX-PHYSICAL-LINE-1): the whitespace between cells is spaces or tabs, never a newline, so a row broken after the card cell reads as no row."""
+        for broken in ("| 3 | OWNER-1 |\nqa (owner) | queued | 2026-10-20 | - |",
+                       "| 3 |\nOWNER-1 | product | queued | 2026-10-20 | - |",
+                       "| 3\n| OWNER-1 | product | queued | 2026-10-20 | - |",
+                       "|\n3 | OWNER-1 | product | queued | 2026-10-20 | - |",
+                       "| 3 | OWNER-1 | product\n| queued | 2026-10-20 | - |"):
+            with self.subTest(broken=broken):
+                self.assertEqual(ROADMAP_ROW_RX.findall(broken), [])
+        self.assertEqual(ROADMAP_ROW_RX.findall("|\t3\t|\tOWNER-1\t|\tproduct\t| queued |"), [("OWNER-1", "product")])
+        for kind in ("q" * 41, "-qa", "_qa", ".qa", "qa|x"):   # pass 2 A2: a kind the renderer's KIND_RX refuses is no row
+            with self.subTest(kind=kind):
+                self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | %s (owner) | queued | 2026-10-20 | - |" % kind), [])
+        self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa(owner) | queued | 2026-10-20 | - |"), [])   # the renderer always writes " (owner)"
+        self.assertEqual([k for _c, k in ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | %s (owner) | queued |" % ("q" * 40))], ["q" * 40 + " (owner)"])
+        for sep in (" ", " ", "\x85", "\x0b", "\x0c", "\r"):   # adversary advisory A1: no other line break inside the kind cell
+            with self.subTest(sep=repr(sep)):
+                self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa%s(owner) | queued | 2026-10-20 | - |\n" % sep), [])
+
+    def test_r11_the_card_cell_is_one_pipe_free_token(self) -> None:
+        # ROADMAP-PARITY-CARD-DELIMITER-1 (sol r10 hardening): the renderer's loader refuses a card with a pipe, so no such line is a row
+        for line in ("| 3 | OWNER|EXTRA | qa (owner) | queued | 2026-10-20 | - |", "| 3 | A|B|C | product | queued | 2026-10-20 | - |"):
+            with self.subTest(line=line):
+                self.assertEqual(ROADMAP_ROW_RX.findall(line), [])
+        self.assertEqual(ROADMAP_ROW_RX.findall("| 3 | OWNER-1 | qa (owner) | queued | 2026-10-20 | - |"), [("OWNER-1", "qa (owner)")])
 
     def test_no_duplicate_card_ids_on_the_roadmap(self) -> None:
         ids = [card_id for card_id, _kind in _roadmap_rows()]
