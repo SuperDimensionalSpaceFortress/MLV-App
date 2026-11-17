@@ -16667,6 +16667,25 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
                        [vs + 'look_assist_enabled=1 gpu_preview_processing_reject_reason="transform (upside down) enabled" look_assist_flavor=cinematic'])
         self.assertEqual(ok, ["cinematic|"], ok)
 
+    def test_r26_adversary_a1_a2_a_look_key_bounded_by_any_non_name_character_counts(self) -> None:
+        # r26 adversary pass on 2f131c49, its inputs verbatim. A1: the masked conflicting key after U+212A (Kelvin sign), which IgnoreCase folded into the
+        # ASCII lookbehind class, so the key read as absent (cinematic proven). A2: a plain conflicting key glued to punctuation (`,look_assist_flavor=classic`,
+        # `,look_assist_enabled=0`, and the same in an earlier record) was not counted by the whitespace-only start. Both: no flavor is proven
+        vs = self.R26_VS
+        head = vs + 'look_assist_enabled=1 note="harmless (text)" look_assist_flavor=cinematic '
+        logs = [head + "diagnostic=' Klook_assist_flavor=classic",
+                head + ",look_assist_flavor=classic",
+                head + ",look_assist_enabled=0",
+                vs + "look_assist_enabled=1 look_assist_flavor=cinematic ,look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic",
+                # the class: a plain key after the Kelvin sign or any other non-name character, masked keys after punctuation, the enabled key masked
+                head + "Klook_assist_flavor=classic", head + "élook_assist_flavor=classic", head + ";look_assist_flavor=classic",
+                head + "diagnostic=' ,look_assist_flavor=classic", head + "diagnostic=' Klook_assist_enabled=0"]
+        # controls: a DIFFERENT key that only ends in look_assist_flavor (an ASCII name character before it) is no flavor key, and the plain record proves
+        controls = [head + "xlook_assist_flavor=classic", head + "x_look_assist_enabled=0", vs + "look_assist_enabled=1 look_assist_flavor=cinematic"]
+        got = self.each(self.R26_EXPR, logs + controls)
+        self.assertEqual(got, ["|HONOURED|False"] * len(logs) + ["cinematic|HONOURED|False"] * len(controls), got)
+
+
     # sol r25 B2: U+200B (zero-width space), U+00AD (soft hyphen), U+FEFF (zero-width no-break space), each ignorable to a linguistic compare
     R26_IGNORABLE = ("\u200b", "\u00ad", "\ufeff")
 
