@@ -48,6 +48,9 @@ Bad input includes a malformed stamp (`generated_utc`, `source_ledger_stamp`, `p
 names the file, the row index and the field. A `declared@` token is malformed unless it is
 exactly `declared@YYYY-MM-DDTHH:MM:SSZ` (trailing `.,;:)]}'"` is ignored): a non-zero-padded
 stamp would otherwise lose or win the string `max()` that picks the landing day.
+r2: a stamp is checked whole, not by its date prefix (an impossible clock, an offset past 23:59,
+more than 100 fractional digits, or a UTC day outside 0001-01-01..9999-12-31 exits 2), and a
+card id or kind that is not a short pipe-free token, or a card that is not a string, exits 2.
 """
 
 from __future__ import annotations
@@ -129,6 +132,15 @@ def _undelivered_owner_ask(r: dict) -> bool:
 # At most this many owner asks are listed per section (longest-parked first for the parked ones, table order for the
 # open ones); the rest are counted on one line. docs/roadmap.md has a 20000-byte budget (test_roadmap_queue_parity.py).
 OWNER_LIST_MAX = 25
+# (r2 pass-4 A2) render() shrinks every owner list (never a product row) one row at a time until the file fits this budget, so owner
+# asks alone can never push docs/roadmap.md over it. It is the same number tools/repo_hygiene/test_roadmap_queue_parity.py holds the file to.
+ROADMAP_BUDGET_BYTES = 20000
+# (r2 pass-4 A3/A4) a card id and a kind land in a table cell and in sort keys: a pipe or a line break would split the row, a non-string
+# cannot sort, and an unbounded length breaks the budget. Anything else is bad input (exit 2), not a render-time crash.
+CARD_RX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", re.ASCII)
+KIND_RX = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}", re.ASCII)
+# (r2 pass-4 A1) a fraction is read exactly, so its length is bounded (int() refuses more than 4300 digits): longer is bad input.
+FRACTION_MAX_DIGITS = 100
 
 
 # (adversary pass 2 A3/A4/A6/A7) a stamp is read exactly: every fractional digit is kept, an explicit offset is applied, and the
@@ -136,7 +148,8 @@ OWNER_LIST_MAX = 25
 # rounds or overflows. A stamp in no such shape (date only, an odd tail) reads as that date's UTC midnight, as before.
 # (r2 A2 on 8ba4f8ab) the fraction is digits / 10**len(digits), an exact rational: no arithmetic context caps the digits, so
 # 2026-10-22T00:00:00.0000000000000000001Z is later than 00:00:00Z by exactly 1e-19 s and never rounds into the next whole second.
-_STAMP_RX = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:[.,](\d+))?)?\s*(Z|[+-]\d\d:?\d\d)?$", re.IGNORECASE)
+_STAMP_RX = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:[.,](\d+))?)?\s*(Z|[+-]\d\d:?\d\d)?$", re.IGNORECASE | re.ASCII)
+_DATE_ONLY_RX = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 
 
 def _instant(stamp: str) -> Fraction:
@@ -161,8 +174,8 @@ def _utc_day(stamp: str) -> date:
     whole = math.floor(_instant(stamp))   # exact floor of a rational: 23:59:59.999.. stays on its own day
     try:
         return date(1970, 1, 1) + timedelta(seconds=whole)
-    except OverflowError:
-        return _day(stamp)
+    except OverflowError:   # (r2 pass-4 A7) never a substitute day: _load already refused a stamp whose UTC day is out of range
+        raise ValueError("stamp %r is outside the UTC date range 0001-01-01..9999-12-31" % stamp) from None
 
 
 def _die(message: str) -> "None":
@@ -256,6 +269,16 @@ def drain_line(data: dict) -> str:
 
 
 def render(data: dict) -> str:
+    """The roadmap text. Each owner list starts at OWNER_LIST_MAX rows and all of them shrink, one row at a time, while the file is
+    over ROADMAP_BUDGET_BYTES; product and playback rows are never dropped (a file over budget at cap 0 is over on product alone)."""
+    for cap in range(OWNER_LIST_MAX, -1, -1):
+        text = _render(data, cap)
+        if len(text.encode("utf-8")) <= ROADMAP_BUDGET_BYTES:
+            break
+    return text
+
+
+def _render(data: dict, cap: int) -> str:
     open_rows, parked, days, landed, queued = _stats(data)
     generated = data["generated_utc"]
     last = days[-1]
@@ -269,16 +292,16 @@ def render(data: dict) -> str:
     for r in open_rows:
         if r["kind"] not in KINDS:   # an owner ask of another kind (r2 A3 sibling): the first OWNER_LIST_MAX in table order are listed
             other_kind_seen += 1
-            if other_kind_seen > OWNER_LIST_MAX:
+            if other_kind_seen > cap:
                 continue
         out.append("| %s | %s | %s | %s | %s | %s |" % (
             r["priority"], r["card"], _kind_cell(r), r["state"], _utc_day(r["source_ledger_stamp"]).isoformat(), _chain(r)))
     if not open_rows:
         out.append("| - | (none open) | - | - | - | - |")
     other_kind_asks = sum(1 for r in open_rows if r["kind"] not in KINDS)
-    if other_kind_asks > OWNER_LIST_MAX:   # no leading digit cell, so the parity check never reads it as a card row
+    if other_kind_asks > cap:   # no leading digit cell, so the parity check never reads it as a card row
         out.append("| - | ... and %d more open owner asks of another kind (card-queue.json) | - | - | - | - |" % (
-            other_kind_asks - OWNER_LIST_MAX))
+            other_kind_asks - cap))
     open_line = "product+playback open: %d" % len(open_rows)
     if other_kind_asks:
         open_line += " (incl. %d owner ask%s of another kind)" % (other_kind_asks, "" if other_kind_asks == 1 else "s")
@@ -298,24 +321,29 @@ def render(data: dict) -> str:
     other_parked = [r for r in parked if not _undelivered_owner_ask(r)]
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
             "## Parked owner asks", ""]
-    for r in owner_parked[:OWNER_LIST_MAX]:   # r2 A3: the longest-parked OWNER_LIST_MAX, then one count line
+    for r in owner_parked[:cap]:   # r2 A3: the longest-parked `cap` (OWNER_LIST_MAX unless the budget is short), then one count line
         since = _parked_since(r)
         age = max(0, math.floor((generated_at - _instant(since)) / 86400))   # elapsed whole days between exact instants, not a date difference
         out.append("- %s (P%s, %s): parked %d d (since %s): %s" % (
             r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
-    if len(owner_parked) > OWNER_LIST_MAX:
-        out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - OWNER_LIST_MAX))
+    if len(owner_parked) > cap:
+        out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - cap))
     if not owner_parked:
         out.append("- (no owner ask is parked)")
     out += ["", "## Parked with reason", "", *scope]
     # every owner row here carries a resolution (an unresolved one is owed, above). One of another kind is tooling churn: counted, not listed.
     closed_other = [r for r in other_parked if r.get("origin") == OWNER and r["kind"] not in KINDS]
+    closed_product_seen = 0   # (r2 pass-4 A2) resolved owner asks of product/playback kind are an owner list too: capped like the others
     for r in other_parked:
         if r.get("origin") == OWNER:
             if r["kind"] in KINDS:
-                out.append("- %s (P%s, owner ask, %s): %s" % (r["card"], r["priority"], _resolution(r), _note(r)))
+                closed_product_seen += 1
+                if closed_product_seen <= cap:
+                    out.append("- %s (P%s, owner ask, %s): %s" % (r["card"], r["priority"], _resolution(r), _note(r)))
             continue
         out.append("- %s (P%s): %s" % (r["card"], r["priority"], _note(r)))
+    if closed_product_seen > cap:
+        out.append("- ... and %d more owner asks closed with a resolution (card-queue.json)" % (closed_product_seen - cap))
     if closed_other:
         counts = ["%s %d" % (v, n) for v in RESOLUTIONS for n in [sum(1 for r in closed_other if _resolution(r) == v)] if n]
         out.append("- %d owner ask%s of another kind %s closed with a resolution (%s; card-queue.json)" % (
@@ -325,14 +353,41 @@ def render(data: dict) -> str:
     return "\n".join(out) + "\n"
 
 
-def _valid_stamp(value: object) -> bool:
+def _stamp_problem(value: object) -> str:
+    """'' when `value` is a stamp the renderer reads exactly, else why it is not (r2 pass-4 A1/A5/A7: the whole stamp is checked,
+    not its date prefix). Accepted: YYYY-MM-DD (that day's UTC midnight), or YYYY-MM-DD[T ]HH:MM[:SS[.f]][Z|+HH:MM|-HH:MM]."""
     if not isinstance(value, str):
-        return False
+        return "not a string"
+    if _DATE_ONLY_RX.fullmatch(value):
+        try:
+            _day(value)
+        except ValueError:
+            return "no such date"
+        return ""
+    m = _STAMP_RX.match(value.strip())
+    if not m:
+        return "not a date or a date-time stamp"
+    y, mo, d, h, mi = (int(m.group(i)) for i in range(1, 6))
+    if h > 23 or mi > 59 or int(m.group(6) or 0) > 59:
+        return "hour, minute or second out of range"
     try:
-        _day(value)
+        date(y, mo, d)
     except ValueError:
-        return False
-    return True
+        return "no such date"
+    if len(m.group(7) or "") > FRACTION_MAX_DIGITS:
+        return "more than %d fractional digits" % FRACTION_MAX_DIGITS
+    tz = m.group(8)
+    if tz and tz.upper() != "Z" and (int(tz[1:3]) > 23 or int(tz[-2:]) > 59):
+        return "offset out of range"
+    try:
+        date(1970, 1, 1) + timedelta(seconds=math.floor(_instant(value)))
+    except OverflowError:
+        return "its UTC day is outside 0001-01-01..9999-12-31"
+    return ""
+
+
+def _valid_stamp(value: object) -> bool:
+    return not _stamp_problem(value)
 
 
 def _check_row(path: Path, i: int, r: dict) -> None:
@@ -386,11 +441,19 @@ def _load(path: Path) -> dict:
         _die("%s has no generated_utc" % path)
     if not _valid_stamp(data["generated_utc"]):
         _die("%s has a malformed generated_utc: %r (want YYYY-MM-DD...)" % (path, data["generated_utc"]))
+    try:   # (r2 pass-4 A6) the 7-day window ends on generated_utc's UTC day: its first day must exist too
+        _utc_day(data["generated_utc"]) - timedelta(days=WINDOW_DAYS - 1)
+    except OverflowError:
+        _die("%s has a generated_utc whose %d-day window starts before 0001-01-01: %r" % (path, WINDOW_DAYS, data["generated_utc"]))
     _check_scope_notes(path, data.get("scope_notes"))
     for i, r in enumerate(data["rows"]):
         missing = [k for k in REQUIRED if not isinstance(r, dict) or r.get(k) is None]
         if missing:
             _die("%s row %d lacks %s" % (path, i, ", ".join(missing)))
+        if not isinstance(r["card"], str) or not CARD_RX.fullmatch(r["card"]):
+            _die("%s row %d has a bad card id: %r (want letters, digits, '.', '_', '-'; at most 120)" % (path, i, r["card"]))
+        if not isinstance(r["kind"], str) or not KIND_RX.fullmatch(r["kind"]):
+            _die("%s row %d (%s) has a bad kind: %r (want letters, digits, ' ', '.', '_', '-'; at most 40)" % (path, i, r["card"], r["kind"]))
         if not isinstance(r["priority"], int):
             _die("%s row %d (%s) has a non-integer priority" % (path, i, r["card"]))
         _check_row(path, i, r)

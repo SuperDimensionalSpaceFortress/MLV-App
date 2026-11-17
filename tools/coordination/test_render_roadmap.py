@@ -811,5 +811,75 @@ class R2AdversaryTests(unittest.TestCase):
                       "(done 80, duplicate 80, superseded 80, no_go 80, refused 80; card-queue.json)", text)
 
 
+class R2Pass4Tests(R2AdversaryTests):
+    """r2 pass 4 (review-adversary-OWNER-ASK-PARK-GUARD-1-r2-72580ab2): A1-A4, A6, A7 introduced; A5 (pre-existing) fixed with them.
+    The class fix: a row the renderer cannot read exactly is bad input (exit 2), and owner lines never push the file over budget."""
+
+    def assert_rejected(self, data: dict, *needles: str) -> None:
+        code, err = self.load_code(data)
+        self.assertEqual(code, 2, err)
+        for needle in needles:
+            self.assertIn(needle, err)
+
+    def test_p4_a1_an_overlong_fraction_is_bad_input_not_a_crash(self) -> None:
+        self.assert_rejected(self.board(self.owner(pinned_utc="2026-10-22T00:00:00." + "0" * 4300 + "1Z")), "pinned_utc")
+        ok = self.board(self.owner(pinned_utc="2026-10-22T00:00:00." + "0" * 99 + "1Z"))
+        self.assertEqual(self.load_code(ok)[0], 0)
+        self.assertIn("parked 0 d (since 2026-10-22)", self.owed(ok))
+
+    def test_p4_a2_owner_lines_never_push_the_file_over_budget(self) -> None:
+        resolved = [row("OWNER-%03d" % i, "parked", "2026-10-20T00:00:00Z", origin="owner", resolution="done", notes="x" * 100)
+                    for i in range(140)]
+        self.assertLessEqual(len(render_roadmap.render(self.board(*resolved)).encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        self.assertIn("more owner asks closed with a resolution (card-queue.json)", render_roadmap.render(self.board(*resolved)))
+        self.assert_rejected(self.board(*[row("OWNER-%03d" % i, "queued", "2026-10-20T00:00:00Z", kind="qa-" + "x" * 800,
+                                              origin="owner", notes="x" * 100) for i in range(25)]), "kind")
+        big = [row(("O%03d-" % i) + "C" * 115, st, "2026-10-20T00:00:00Z", kind="k" * 40, origin="owner", notes="x" * 300,
+                   **({"resolution": "done"} if st == "parked" and i % 2 else {}))
+               for i in range(150) for st in ("queued", "parked")]
+        big += [row("PRODUCT-%d" % i, "queued", "2026-10-21T00:00:00Z") for i in range(5)]
+        big += [row(("P%03d-" % i) + "C" * 115, "parked", "2026-10-20T00:00:00Z", origin="owner", resolution="no_go", notes="x" * 300)
+                for i in range(150)]
+        text = render_roadmap.render(self.board(*big))
+        self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+        for i in range(5):
+            self.assertIn("PRODUCT-%d" % i, table_cards(text))   # a product row is never dropped to fit
+
+    def test_p4_a2_the_renderer_and_the_parity_test_share_one_budget(self) -> None:
+        self.assertEqual(render_roadmap.ROADMAP_BUDGET_BYTES, ROADMAP_BUDGET_BYTES)
+
+    def test_p4_a3_a_kind_or_card_that_would_split_a_table_row_is_bad_input(self) -> None:
+        for kind in ("qa|tooling", "qa\ntooling", "qa\rtooling", "", " lead"):
+            with self.subTest(kind=kind):
+                self.assert_rejected(self.board(row("OWNER-1", "queued", "2026-10-20T00:00:00Z", kind=kind, origin="owner")), "kind")
+        for card in ("OWNER|1", "OWNER\n1", "", "C" * 121):
+            with self.subTest(card=card):
+                self.assert_rejected(self.board(row(card, "queued", "2026-10-20T00:00:00Z", kind="hub-tooling", origin="owner")), "card")
+
+    def test_p4_a4_a_non_string_card_is_bad_input(self) -> None:
+        for card in ([], {}, {"id": "x"}, 1, 1.5, True):
+            with self.subTest(card=card):
+                self.assert_rejected(self.board(row(card, "queued", "2026-10-20T00:00:00Z", kind="hub-tooling"),
+                                                row("OWNER-2", "queued", "2026-10-20T00:00:00Z", kind="hub-tooling")), "card")
+
+    def test_p4_a6_a_window_before_year_1_is_bad_input(self) -> None:
+        self.assert_rejected(self.board(generated="0001-01-07T00:30:00+01:00"), "generated_utc")
+        self.assertEqual(self.load_code(self.board(generated="0001-01-07T00:30:00Z"))[0], 0)
+
+    def test_p4_a7_a_stamp_outside_the_utc_date_range_is_bad_input(self) -> None:
+        self.assert_rejected(self.board(row("Q-1", "queued", "9999-12-31T23:30:00-01:00"), generated="9999-12-31T12:00:00Z"),
+                             "source_ledger_stamp")
+        self.assert_rejected(self.board(row("Q-1", "queued", "0001-01-01T00:30:00+01:00")), "source_ledger_stamp")
+
+    def test_p4_a5_an_impossible_clock_is_bad_input(self) -> None:
+        for stamp in ("2026-10-20T99:99:99Z", "2026-10-20T24:00:00Z", "2026-10-20T23:60:00Z", "2026-10-20T23:59:60Z",
+                      "2026-10-20T10:00:00+24:00", "2026-10-20T10:00:00+05:60", "2026-10-20T10:00:00Z junk", "2026-10-20 junk"):
+            with self.subTest(stamp=stamp):
+                self.assert_rejected(self.board(row("Q-1", "merged", stamp)), "source_ledger_stamp")
+        for stamp in ("2026-10-20", "2026-10-20T10:00Z", "2026-10-20 10:00:00", "2026-10-20T10:00:00.5+05:30"):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(self.load_code(self.board(row("Q-1", "merged", stamp)))[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
