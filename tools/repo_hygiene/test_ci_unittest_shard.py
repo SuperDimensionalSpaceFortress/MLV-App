@@ -3,12 +3,15 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import re
+import shutil
 import sys
 import tempfile
 import time
 import types
 import unittest
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
@@ -117,6 +120,43 @@ class AssignTests(unittest.TestCase):
                 shard.load_weights("windows", path)
             path.write_text(json.dumps({"schema": 1, "seconds": {"windows": {"a.A": 2, "b.B": 0.5}}}), encoding="utf-8")
             self.assertEqual(shard.load_weights("windows", path), {"a.A": 2.0, "b.B": 0.5})
+
+    def test_worker_count_fails_closed_to_one(self) -> None:
+        # Unreadable is 1 (today's serial run), never a guess; a real count is capped.
+        for raw in (None, "", " ", "1", "0", "-2", "abc", "2.5", "2e1", "٣", "9" * 5000):
+            with self.subTest(raw=raw):
+                env = {} if raw is None else {shard.WORKERS_ENV: raw}
+                self.assertEqual(shard.worker_count(env), 1)
+        self.assertEqual(shard.worker_count({shard.WORKERS_ENV: " 3 "}), 3)
+        self.assertEqual(shard.worker_count({shard.WORKERS_ENV: "999"}), shard.MAX_WORKERS)
+
+    @staticmethod
+    def _module_of(key: str) -> str:
+        return type(_UNITS[key][0]).__module__
+
+    def test_plan_workers_covers_each_class_once_keeps_modules_whole_and_pins_together(self) -> None:
+        weights = shard.load_weights("windows")
+        for workers in (2, 4, shard.MAX_WORKERS):
+            with self.subTest(workers=workers):
+                groups = shard.plan_workers(_UNITS, workers, weights, shard.SERIAL_PINS)
+                self.assertLessEqual(len(groups), workers)
+                self.assertTrue(all(groups))
+                self.assertEqual(sorted(key for group in groups for key in group), sorted(_UNITS))
+                owners: dict[str, set[int]] = {}
+                for number, group in enumerate(groups):
+                    for key in group:
+                        owners.setdefault(self._module_of(key), set()).add(number)
+                self.assertTrue(all(len(seen) == 1 for seen in owners.values()), "a module was split")
+                pinned = {next(iter(seen)) for module, seen in owners.items() if module in shard.SERIAL_PINS}
+                self.assertEqual(len(pinned), 1, "pinned modules must share one serial worker")
+
+    def test_every_serial_pin_is_a_discovered_module_with_a_reason(self) -> None:
+        modules = {self._module_of(key) for key in _UNITS}
+        self.assertTrue(shard.SERIAL_PINS)
+        for module, reason in shard.SERIAL_PINS.items():
+            with self.subTest(module=module):
+                self.assertIn(module, modules, "a stale pin: discover no longer collects this module")
+                self.assertTrue(reason.strip(), "a pin names why the module must not run beside others")
 
 
 class CoverageTests(unittest.TestCase):
@@ -966,6 +1006,137 @@ class ShardExitCodeTests(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = shard.run_shard([], "ubuntu", 1, 3, clock=FakeClock(), environ={}, stream=io.StringIO())
         self.assertEqual(code, 5)
+
+    def test_a_worker_env_that_is_not_a_count_above_one_keeps_the_serial_path(self) -> None:
+        buckets, heavy = shard.plan_buckets(_COUNTS, "windows", 7)
+        planned = (_TESTS, _UNITS, buckets, heavy)
+        members = shard.shard_tests(_UNITS, buckets[0])
+        argv = ["--repo-root", str(REPO_ROOT), "--profile", "windows", "--of", "7", "--shard", "1"]
+        for raw, parallel in ((None, False), ("", False), ("1", False), ("0", False), ("-1", False), ("abc", False), ("3", True)):
+            env = {} if raw is None else {shard.WORKERS_ENV: raw}
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, env):
+                os.environ.pop(shard.MANIFEST_ENV, None)
+                if raw is None:
+                    os.environ.pop(shard.WORKERS_ENV, None)
+                with (
+                    mock.patch.object(shard, "plan", return_value=planned),
+                    mock.patch.object(shard, "run_shard", return_value=0) as serial,
+                    mock.patch.object(shard, "run_parallel", return_value=0) as pool,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(shard.main(argv), 0)
+                self.assertEqual(serial.call_count, 0 if parallel else 1)
+                self.assertEqual(pool.call_count, 1 if parallel else 0)
+                if not parallel:
+                    self.assertEqual(serial.call_args.args[0], members)
+                    self.assertIsNone(serial.call_args.kwargs.get("manifest"))
+
+    def _fixture(self, extras: dict[str, str] | None = None) -> tuple[Path, list[unittest.TestCase], str]:
+        """Three tiny test modules in a temp dir, collected here and re-collectable by a worker."""
+        tag = uuid.uuid4().hex[:8]
+        root = Path(tempfile.mkdtemp(prefix="fxw-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        for name in ("a", "b", "c"):
+            lines = [
+                "import json, os, tempfile, unittest",
+                "from pathlib import Path",
+                f"SEEN = Path(__file__).with_name('seen-{name}.json')",
+                f"class Fx{name.upper()}Tests(unittest.TestCase):",
+                "    def test_one(self):",
+                "        SEEN.write_text(json.dumps({'pid': os.getpid(), 'temp': tempfile.gettempdir()}), encoding='utf-8')",
+                "    def test_two(self):",
+                "        pass",
+                (extras or {}).get(name, ""),
+            ]
+            (root / f"fxw{tag}_{name}.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tests = shard.collect_tests(str(root), f"fxw{tag}_*.py", str(root))
+        self.assertEqual(len(tests), 6 + len(extras or {}))
+
+        def forget() -> None:
+            for module in [m for m in sys.modules if m.startswith(f"fxw{tag}_")]:
+                del sys.modules[module]
+            while str(root) in sys.path:
+                sys.path.remove(str(root))
+
+        self.addCleanup(forget)
+        return root, tests, tag
+
+    def _parallel(
+        self, root: Path, tests: list[unittest.TestCase], tag: str, workers: int, *, pins: dict[str, str] | None = None,
+        timeout: float = 120.0,
+    ) -> tuple[int, str, str, Path]:
+        out, err = io.StringIO(), io.StringIO()
+        manifest = root / "manifest-parallel.txt"
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = shard.run_parallel(
+                tests, "ubuntu", 1, 1, workers, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins=pins or {}, environ={}, manifest=manifest, timeout=timeout,
+            )
+        return code, out.getvalue(), err.getvalue(), manifest
+
+    @staticmethod
+    def _seen(root: Path, name: str) -> dict:
+        return json.loads((root / f"seen-{name}.json").read_text(encoding="utf-8"))
+
+    def test_parallel_workers_run_the_serial_id_set_exactly_once_each_with_their_own_temp(self) -> None:
+        root, tests, tag = self._fixture()
+        serial_manifest = root / "manifest-serial.txt"
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = shard.run_shard(
+                tests, "ubuntu", 1, 1, clock=time.monotonic, environ={}, stream=io.StringIO(), manifest=serial_manifest
+            )
+        self.assertEqual(code, 0)
+        expected = sorted(test.id() for test in tests)
+        self.assertEqual(serial_manifest.read_text(encoding="utf-8").splitlines(), expected)
+        for name in ("a", "b", "c"):
+            (root / f"seen-{name}.json").unlink()
+        code, out, err, manifest = self._parallel(root, tests, tag, 3)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(manifest.read_text(encoding="utf-8").splitlines(), expected)
+        seen = [self._seen(root, name) for name in ("a", "b", "c")]
+        self.assertEqual(len({one["pid"] for one in seen}), 3, "each module ran in its own worker process")
+        self.assertEqual(len({one["temp"] for one in seen}), 3, "each worker has its own TEMP")
+        self.assertNotIn(tempfile.gettempdir(), {one["temp"] for one in seen})
+        self.assertIn("SHARD_SLOWEST profile=ubuntu shard=1/1", out)
+
+    def test_pinned_modules_share_one_serial_worker(self) -> None:
+        root, tests, tag = self._fixture()
+        code, out, err, _manifest = self._parallel(
+            root, tests, tag, 3, pins={f"fxw{tag}_a": "fixed path", f"fxw{tag}_b": "pwsh"}
+        )
+        self.assertEqual((code, err), (0, ""), out)
+        one, two, three = (self._seen(root, name) for name in ("a", "b", "c"))
+        self.assertEqual(one["pid"], two["pid"])
+        self.assertNotEqual(one["pid"], three["pid"])
+        self.assertEqual(one["temp"], two["temp"])
+
+    def test_a_failing_test_in_a_worker_fails_the_shard_and_is_printed(self) -> None:
+        root, tests, tag = self._fixture({"b": "    def test_fails(self):\n        self.fail('fx-boom')"})
+        code, out, err, _manifest = self._parallel(root, tests, tag, 3)
+        self.assertEqual(code, 1)
+        self.assertIn("fx-boom", out)
+        self.assertIn("FAIL", out)
+
+    def test_a_worker_crash_is_a_failure_not_a_silent_pass(self) -> None:
+        root, tests, tag = self._fixture({"b": "    def test_crash(self):\n        os._exit(3)"})
+        code, out, err, manifest = self._parallel(root, tests, tag, 3)
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: worker", err)
+
+    def test_a_worker_that_outlives_the_timeout_is_killed_and_fails_the_shard(self) -> None:
+        root, tests, tag = self._fixture({"b": "    def test_hang(self):\n        import time\n        time.sleep(60)"})
+        started = time.monotonic()
+        code, out, err, _manifest = self._parallel(root, tests, tag, 3, timeout=3.0)
+        self.assertEqual(code, 1)
+        self.assertIn("timed out", err)
+        self.assertLess(time.monotonic() - started, 30.0)
+
+    def test_a_class_a_worker_cannot_find_fails_the_shard(self) -> None:
+        root, tests, tag = self._fixture()
+        (root / f"fxw{tag}_c.py").unlink()
+        code, out, err, _manifest = self._parallel(root, tests, tag, 3)
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR", err)
 
 
 class TimingsTests(unittest.TestCase):

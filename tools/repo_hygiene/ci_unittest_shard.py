@@ -29,13 +29,16 @@ import argparse
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import TextIO
+from typing import IO, TextIO
 
 START_DIR = "tools/repo_hygiene"
 PATTERN = "test_*.py"
@@ -61,6 +64,27 @@ ORIGIN_MAIN = "main"
 ORIGIN_MAIN_INVALID = "main_invalid_job_start"
 WEIGHTS_PATH = Path(__file__).with_name("ci_unittest_shard_weights.json")
 HEAVY_SET_PATH = Path(__file__).with_name("ci_unittest_heavy_set.json")
+# In-job worker processes. Default 1 = the single in-process run every shard has always been; an
+# unreadable value is 1 too (fail closed). Above 1 the shard's classes are split by MODULE across
+# that many child processes, each with its own TEMP/TMP/TMPDIR.
+WORKERS_ENV = "MLV_CI_UNITTEST_WORKERS"
+MAX_WORKERS = 8
+# A path that receives the sorted ids of every test that actually ran (one per line). Off by default.
+MANIFEST_ENV = "MLV_CI_UNITTEST_MANIFEST"
+# A worker that has not exited by then is killed and fails the shard (a hang is never a pass).
+WORKER_TIMEOUT_ENV = "MLV_CI_UNITTEST_WORKER_TIMEOUT_SECONDS"
+DEFAULT_WORKER_TIMEOUT_SECONDS = 2700.0
+# Modules whose tests must not run beside other workers' tests. All pinned modules in a shard share
+# ONE worker, run serially. Each reason is the evidence (file:line in the survey of 807069e7).
+SERIAL_PINS: dict[str, str] = {
+    # writes FIXED file names under tempfile.gettempdir() (:1370-1525) and spawns pwsh (:2762)
+    "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate": "fixed temp file names; heavy-slot machinery spawns pwsh",
+    # os.chdir is process-global (:729) and a run root is gettempdir() itself (:781)
+    "tools.repo_hygiene.test_runtime_floor_suites": "os.chdir and a shared temp root",
+    # makes a directory junction with mklink /J and asserts a cross-agent root-identity lock (:1088)
+    "tools.repo_hygiene.test_playback_attr_3_cuda_behaviour": "junction plus cross-agent shared-lock semantics",
+}
+PINNED_GROUP = "<serial-pins>"
 
 
 def load_weights(profile: str, path: Path = WEIGHTS_PATH) -> dict[str, float]:
@@ -123,9 +147,11 @@ def unit_key(test: unittest.TestCase) -> str:
     return f"{kind.__module__}.{kind.__qualname__}"
 
 
-def collect_tests() -> list[unittest.TestCase]:
+def collect_tests(
+    start_dir: str = START_DIR, pattern: str = PATTERN, top_level_dir: str = TOP_LEVEL_DIR
+) -> list[unittest.TestCase]:
     """Every test ``unittest discover`` collects, in its order. Run from the repo root."""
-    suite = unittest.TestLoader().discover(START_DIR, pattern=PATTERN, top_level_dir=TOP_LEVEL_DIR)
+    suite = unittest.TestLoader().discover(start_dir, pattern=pattern, top_level_dir=top_level_dir)
     return list(_flatten(suite))
 
 
@@ -162,6 +188,54 @@ def assign(units: dict[str, int], shards: int, weights: dict[str, float]) -> lis
 def shard_tests(units: dict[str, list[unittest.TestCase]], bucket: list[str]) -> list[unittest.TestCase]:
     """The bucket's tests, class-contiguous and module-contiguous so fixtures run once."""
     return [test for key in sorted(bucket) for test in units[key]]
+
+
+def worker_count(environ: Mapping[str, str]) -> int:
+    """Worker processes for one shard: ``WORKERS_ENV`` as a whole number, capped at ``MAX_WORKERS``.
+
+    Anything else (unset, empty, zero, negative, fractional, non-ASCII digits, absurdly long) is 1,
+    the serial run: an unreadable setting never changes what a shard does.
+    """
+    raw = environ.get(WORKERS_ENV, "").strip()
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 6:
+        return 1
+    return min(max(int(raw), 1), MAX_WORKERS)
+
+
+def worker_timeout(environ: Mapping[str, str]) -> float:
+    """Seconds a worker may run; ``WORKER_TIMEOUT_ENV`` overrides it when it is a positive finite number."""
+    try:
+        seconds = float(environ[WORKER_TIMEOUT_ENV])
+    except (KeyError, ValueError):
+        return DEFAULT_WORKER_TIMEOUT_SECONDS
+    return seconds if math.isfinite(seconds) and seconds > 0 else DEFAULT_WORKER_TIMEOUT_SECONDS
+
+
+def plan_workers(
+    units: dict[str, list[unittest.TestCase]],
+    workers: int,
+    weights: Mapping[str, float],
+    pins: Mapping[str, str] = SERIAL_PINS,
+) -> list[list[str]]:
+    """Split a shard's classes into at most ``workers`` groups, whole MODULES per group.
+
+    A module is never split, so its module fixtures run once and its classes stay contiguous. Every
+    pinned module present goes into ONE group (they run serially in one worker). Longest-processing-
+    time-first over the summed class weights, as ``assign`` does for shards; empty groups are dropped.
+    """
+    items: dict[str, list[str]] = {}
+    for key, tests in units.items():
+        module = type(tests[0]).__module__
+        items.setdefault(PINNED_GROUP if module in pins else module, []).append(key)
+    counts = {name: sum(len(units[key]) for key in keys) for name, keys in items.items()}
+    item_weights = {name: sum(unit_weight(key, len(units[key]), weights) for key in keys) for name, keys in items.items()}
+    return [sorted(key for name in bucket for key in items[name]) for bucket in assign(counts, workers, item_weights) if bucket]
+
+
+def write_manifest(path: Path, ids: list[str]) -> None:
+    """The ids that ran, sorted, one per line: two runs of one shard are equal iff the files are."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{test_id}\n" for test_id in sorted(ids)), encoding="utf-8", newline="\n")
 
 
 def plan_buckets(
@@ -251,6 +325,7 @@ class ClassTimingResult(unittest.TextTestResult):
         self._mark = clock()
         self._current: str | None = None
         self.class_seconds: dict[str, float] = {}
+        self.started_ids: list[str] = []
 
     def startTestRun(self) -> None:  # noqa: N802
         super().startTestRun()
@@ -258,6 +333,7 @@ class ClassTimingResult(unittest.TextTestResult):
             self._mark = self._clock()
 
     def startTest(self, test: unittest.TestCase) -> None:  # noqa: N802
+        self.started_ids.append(test.id())
         self.enter(unit_key(test))
         super().startTest(test)
 
@@ -503,8 +579,11 @@ def run_shard(
     started: float | None = None,
     poll_seconds: float = 5.0,
     wall_clock: Callable[[], float] = time.time,
+    manifest: Path | None = None,
 ) -> int:
     """Run the shard's tests, warning when it passes the budget share and reporting its slowest classes.
+
+    ``manifest``, when given, receives the sorted ids of the tests that ran (``write_manifest``).
 
     The budget clock starts at the job start when the workflow exported ``JOB_START_ENV`` (read
     through ``wall_clock``) and the value is believable, else at ``started`` (``main()``); the
@@ -552,10 +631,176 @@ def run_shard(
         if seconds:
             watch.check()
             print("\n".join(slowest_block(profile, index, of, clock() - begin, seconds)), file=out, flush=True)
+    if manifest is not None and made:
+        write_manifest(manifest, made[0].started_ids)
     if result.testsRun == 0:
         print("ERROR: no tests ran", file=sys.stderr)
         return 5
     return 0 if result.wasSuccessful() else 1
+
+
+def run_worker(spec_path: Path) -> int:
+    """One worker process: run the classes named in the spec file, record what ran, exit 0/1/5.
+
+    The parent wrote ``{"classes", "result", "start_dir", "pattern", "top_level_dir"}``. The worker
+    re-collects (the same discover), so a class it cannot find fails it rather than dropping tests.
+    """
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    units = group_units(collect_tests(spec["start_dir"], spec["pattern"], spec["top_level_dir"]))
+    missing = [key for key in spec["classes"] if key not in units]
+    if missing:
+        print("ERROR: a class the shard assigned is not collected by discover: " + ", ".join(missing), file=sys.stderr)
+        return 1
+    result = unittest.TextTestRunner(verbosity=2, resultclass=ClassTimingResult).run(
+        ClassTimingSuite(shard_tests(units, spec["classes"]))
+    )
+    ran = result.testsRun
+    record = {"ids": result.started_ids, "seconds": result.class_seconds, "tests_run": ran, "ok": result.wasSuccessful()}
+    Path(spec["result"]).write_text(json.dumps(record), encoding="utf-8")
+    if ran == 0:
+        print("ERROR: no tests ran", file=sys.stderr)
+        return 5
+    return 0 if result.wasSuccessful() else 1
+
+
+def _worker_record(path: Path) -> dict | None:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ok = (
+        isinstance(record, dict)
+        and isinstance(record.get("ids"), list)
+        and all(isinstance(item, str) for item in record["ids"])
+        and isinstance(record.get("seconds"), dict)
+        and type(record.get("tests_run")) is int
+    )
+    return record if ok else None
+
+
+def run_parallel(
+    members: list[unittest.TestCase],
+    profile: str,
+    index: int,
+    of: int,
+    workers: int,
+    *,
+    start_dir: str = START_DIR,
+    pattern: str = PATTERN,
+    top_level_dir: str = TOP_LEVEL_DIR,
+    repo_root: Path | None = None,
+    pins: Mapping[str, str] = SERIAL_PINS,
+    weights: Mapping[str, float] | None = None,
+    environ: Mapping[str, str] | None = None,
+    manifest: Path | None = None,
+    timeout: float | None = None,
+    started: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
+) -> int:
+    """Run the shard's tests in up to ``workers`` child processes and fail closed on anything odd.
+
+    Each child is ``python -m tools.repo_hygiene.ci_unittest_shard --worker-spec ...`` with its own
+    TEMP/TMP/TMPDIR; its output goes to a log that is printed, grouped, once it has exited. The shard
+    exits non-zero on a failing test, a child that exits non-zero, crashes, writes no result or runs
+    past ``timeout``, or when the ids the children ran are not exactly ``members``' ids, each once.
+    The merged ``SHARD_SLOWEST`` and budget warning follow, from the children's per-class seconds
+    (inflated by contention: derive weights from serial logs only).
+    """
+    out = sys.stdout
+    begin = clock() if started is None else started
+    env = os.environ if environ is None else environ
+    root_dir = Path.cwd() if repo_root is None else repo_root
+    limit = worker_timeout(env) if timeout is None else timeout
+    units = group_units(members)
+    groups = plan_workers(units, workers, load_weights(profile) if weights is None else weights, pins)
+    work = Path(tempfile.mkdtemp(prefix="mlv-ci-workers-"))
+    problems: list[str] = []
+    records: list[dict | None] = []
+    logs: list[Path] = []
+    codes: list[int | None] = []
+    procs: list[tuple[subprocess.Popen[bytes], IO[bytes]]] = []
+    try:
+        for number, classes in enumerate(groups, start=1):
+            home = work / f"w{number}"
+            temp = home / "tmp"
+            temp.mkdir(parents=True)
+            spec = {
+                "classes": classes,
+                "result": str(home / "result.json"),
+                "start_dir": start_dir,
+                "pattern": pattern,
+                "top_level_dir": top_level_dir,
+            }
+            (home / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+            child_env = {k: v for k, v in os.environ.items() if k != MANIFEST_ENV}
+            child_env.update(TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp), **{WORKERS_ENV: "1"})
+            tests_in = sum(len(units[key]) for key in classes)
+            print(f"worker {number}/{len(groups)}: {len(classes)} classes, {tests_in} tests", flush=True)
+            log = (home / "log.txt").open("wb")
+            command = [
+                sys.executable, "-m", "tools.repo_hygiene.ci_unittest_shard", "--repo-root", str(root_dir),
+                "--profile", profile, "--worker-spec", str(home / "spec.json"),
+            ]
+            procs.append((
+                subprocess.Popen(command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT),
+                log,
+            ))
+            logs.append(home / "log.txt")
+        deadline = time.monotonic() + limit
+        for proc, _log in procs:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                break
+        for number, (proc, log) in enumerate(procs, start=1):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+                problems.append(f"worker {number}/{len(procs)} timed out after {limit:g} s and was killed")
+            log.close()
+            codes.append(proc.returncode)
+        for number, (path, code) in enumerate(zip(logs, codes, strict=True), start=1):
+            print(f"===== worker {number}/{len(logs)} exit {code} =====", flush=True)
+            print(path.read_text(encoding="utf-8", errors="replace"), end="", flush=True)
+            record = _worker_record(path.with_name("result.json"))
+            records.append(record)
+            if code not in (0, 1, 5):
+                problems.append(f"worker {number}/{len(logs)} exited {code}")
+            elif record is None:
+                problems.append(f"worker {number}/{len(logs)} wrote no readable result (exit {code})")
+    finally:
+        for proc, log in procs:  # an exception above must not leave a worker running
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            log.close()
+        shutil.rmtree(work, ignore_errors=True)
+    ran = sorted(item for record in records if record for item in record["ids"])
+    expected = sorted(test.id() for test in members)
+    if ran != expected:
+        missing, extra = sorted(set(expected) - set(ran)), sorted(set(ran) - set(expected))
+        problems.append(
+            f"the workers' ids are not exactly the shard's: {len(missing)} missing, {len(extra)} extra, "
+            f"{len(ran) - len(set(ran))} repeated"
+        )
+    seconds: dict[str, float] = {}
+    for record in records:
+        if record:
+            seconds.update({key: float(value) for key, value in record["seconds"].items()})
+    if manifest is not None and not problems:
+        write_manifest(manifest, ran)
+    cap_minutes = job_cap_minutes(profile, env)
+    budget_begin, origin = budget_origin(env, clock, begin, wall_clock, cap_minutes)
+    total = clock() - begin
+    if seconds:
+        lines = budget_warning(profile, index, of, clock() - budget_begin, seconds, cap_minutes, origin)
+        print("\n".join(lines + slowest_block(profile, index, of, total, seconds)), file=out, flush=True)
+    for problem in problems:
+        print(f"ERROR: {problem}", file=sys.stderr)
+    if problems or any(code == 1 for code in codes):
+        return 1
+    return 5 if not ran else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -568,8 +813,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-partition", action="store_true")
     parser.add_argument("--list", action="store_true", help="print the shard's classes and exit")
     parser.add_argument("--list-tests", action="store_true", help="print the shard's test ids and exit")
+    parser.add_argument("--manifest", help=f"write the sorted ids that ran to this file (else ${MANIFEST_ENV}; off by default)")
+    parser.add_argument("--worker-spec", help=argparse.SUPPRESS)  # internal: one worker of a parallel shard
     args = parser.parse_args(argv)
     started = time.monotonic()
+    if args.worker_spec is not None:
+        sys.path.insert(0, str(Path(args.repo_root).resolve()))
+        os.chdir(Path(args.repo_root).resolve())
+        return run_worker(Path(args.worker_spec))
     if args.heavy_part is not None:
         if args.of is not None or args.shard is not None or args.verify_partition:
             parser.error("--heavy-part takes no --of, --shard or --verify-partition")
@@ -610,7 +861,12 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(test.id() for test in members))
         return 0
     print(f"{label} {index}/{of}: {len(bucket)} classes, {len(members)} tests", flush=True)
-    return run_shard(members, args.profile, index, of, started=started)
+    manifest_name = args.manifest or os.environ.get(MANIFEST_ENV, "")
+    manifest = Path(manifest_name) if manifest_name else None
+    workers = worker_count(os.environ)
+    if workers > 1:
+        return run_parallel(members, args.profile, index, of, workers, manifest=manifest, started=started)
+    return run_shard(members, args.profile, index, of, started=started, manifest=manifest)
 
 
 if __name__ == "__main__":
