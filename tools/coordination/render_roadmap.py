@@ -51,6 +51,9 @@ stamp would otherwise lose or win the string `max()` that picks the landing day.
 r2: a stamp is checked whole, not by its date prefix (an impossible clock, an offset past 23:59,
 more than 100 fractional digits, or a UTC day outside 0001-01-01..9999-12-31 exits 2), and a
 card id or kind that is not a short pipe-free token, or a card that is not a string, exits 2.
+r3: a stamp holds no whitespace except the one T-or-space date/time separator; any string anywhere in the queue (keys included)
+that is not UTF-8 text (a lone surrogate) exits 2; and when the owner lists at cap 0 still leave the file over 20000 bytes, all
+owner output collapses to one line no longer than the "(no owner ask is parked)" placeholder, so owner asks add zero bytes.
 """
 
 from __future__ import annotations
@@ -148,13 +151,15 @@ FRACTION_MAX_DIGITS = 100
 # rounds or overflows. A stamp in no such shape (date only, an odd tail) reads as that date's UTC midnight, as before.
 # (r2 A2 on 8ba4f8ab) the fraction is digits / 10**len(digits), an exact rational: no arithmetic context caps the digits, so
 # 2026-10-22T00:00:00.0000000000000000001Z is later than 00:00:00Z by exactly 1e-19 s and never rounds into the next whole second.
-_STAMP_RX = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:[.,](\d+))?)?\s*(Z|[+-]\d\d:?\d\d)?$", re.IGNORECASE | re.ASCII)
+# (r3 A3 on 6c9167ce) no gap before the zone: the old `\s*` there let CR, TAB, VT, FF or a trailing space through, and a CR then reached the
+# generated_from line raw. The one date/time separator (T or a single space) is the only whitespace a stamp may hold (_stamp_problem).
+_STAMP_RX = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:[.,](\d+))?)?(Z|[+-]\d\d:?\d\d)?$", re.IGNORECASE | re.ASCII)
 _DATE_ONLY_RX = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 
 
 def _instant(stamp: str) -> Fraction:
     """Exact UTC seconds since the epoch, as a Fraction (every fractional digit kept)."""
-    m = _STAMP_RX.match(stamp.strip())
+    m = _STAMP_RX.fullmatch(stamp)   # (r3 A3 sibling) as written, like _stamp_problem: nothing stripped, no `$` before a final LF
     if not m:
         d = _day(stamp)
         return Fraction(calendar.timegm((d.year, d.month, d.day, 0, 0, 0)))
@@ -239,9 +244,10 @@ def _drain_line(open_n: int, landed: int, queued: int) -> str:
     return "at the 7-day mean, product drains in %d days" % days
 
 
-def _stats(data: dict) -> tuple:
-    """(open_rows, parked_rows, days, landed_by_day, queued_by_day) for product/playback rows and owner asks."""
-    rows = [r for r in data["rows"] if _counted(r)]
+def _stats(data: dict, collapsed: bool = False) -> tuple:
+    """(open_rows, parked_rows, days, landed_by_day, queued_by_day) for product/playback rows and owner asks.
+    collapsed (r3 A1): product/playback rows only, as the base counted them, so an owner ask of another kind adds no count digit."""
+    rows = [r for r in data["rows"] if (r["kind"] in KINDS if collapsed else _counted(r))]
     open_rows = sorted((r for r in rows if r["state"] not in CLOSED_STATES), key=_sort_key)
     parked = sorted((r for r in rows if r["state"] == "parked"), key=_sort_key)
     last = _utc_day(data["generated_utc"])
@@ -274,12 +280,22 @@ def render(data: dict) -> str:
     for cap in range(OWNER_LIST_MAX, -1, -1):
         text = _render(data, cap)
         if len(text.encode("utf-8")) <= ROADMAP_BUDGET_BYTES:
-            break
-    return text
+            return text
+    # (r3 A1 on 6c9167ce, hub ruling: FIX) cap 0 is still over budget, yet its count lines, the "(incl. N ...)" suffix and the
+    # owner rows' drain counts still cost bytes. Collapse: render the board as the base did (product/playback rows only, an owner
+    # ask of another kind not counted) and replace ALL owner output with OWNER_COLLAPSED_LINE, no longer than the placeholder it
+    # replaces. Owner asks then add zero bytes to what the board renders without them; product rows are still never dropped.
+    return _render(data, 0, collapsed=True)
 
 
-def _render(data: dict, cap: int) -> str:
-    open_rows, parked, days, landed, queued = _stats(data)
+# The one owner line in the collapsed state; never longer than "- (no owner ask is parked)", so it adds no byte to the board.
+OWNER_COLLAPSED_LINE = "- (see card-queue.json)"
+
+
+def _render(data: dict, cap: int, collapsed: bool = False) -> str:
+    open_rows, parked, days, landed, queued = _stats(data, collapsed)
+    if collapsed:   # (r3 A1) no parked owner ask is listed anywhere: OWNER_COLLAPSED_LINE stands for all of them
+        parked = [r for r in parked if r.get("origin") != OWNER]
     generated = data["generated_utc"]
     last = days[-1]
     landed_total, queued_total = sum(landed.values()), sum(queued.values())
@@ -328,7 +344,9 @@ def _render(data: dict, cap: int) -> str:
             r["card"], r["priority"], r["kind"], age, _utc_day(since).isoformat(), _note(r, OWNER_NOTE_MAX)))
     if len(owner_parked) > cap:
         out.append("- ... and %d more owner asks parked (card-queue.json)" % (len(owner_parked) - cap))
-    if not owner_parked:
+    if collapsed and any(r.get("origin") == OWNER for r in data["rows"]):
+        out.append(OWNER_COLLAPSED_LINE)   # (r3 A1) the one owner line: no list, no count, no suffix
+    elif not owner_parked:
         out.append("- (no owner ask is parked)")
     out += ["", "## Parked with reason", "", *scope]
     # every owner row here carries a resolution (an unresolved one is owed, above). One of another kind is tooling churn: counted, not listed.
@@ -358,6 +376,9 @@ def _stamp_problem(value: object) -> str:
     not its date prefix). Accepted: YYYY-MM-DD (that day's UTC midnight), or YYYY-MM-DD[T ]HH:MM[:SS[.f]][Z|+HH:MM|-HH:MM]."""
     if not isinstance(value, str):
         return "not a string"
+    spaces = [i for i, c in enumerate(value) if c.isspace()]   # (r3 A3) str.isspace(): CR, LF, TAB, VT, FF, NBSP, U+2003 ...
+    if spaces and not (spaces == [10] and value[10] == " "):   # only the single-space date/time separator at index 10
+        return "whitespace inside or around the stamp"
     if _DATE_ONLY_RX.fullmatch(value):
         try:
             _day(value)
@@ -392,6 +413,27 @@ def _utf8_ok(text: str) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+def _non_utf8_text(data: object) -> str:
+    """'' when every string in the parsed queue (dict keys included, at any depth) encodes as UTF-8, else the JSON path of the
+    first one that does not (r3 A2 on 6c9167ce: a lone surrogate in `state` or `order_chain` passed _load and then crashed the
+    UTF-8 budget measure). Iterative, so a deep queue cannot add a RecursionError. The path is ascii() text, safe for stderr."""
+    stack = [("$", data)]
+    while stack:
+        where, value = stack.pop()
+        if isinstance(value, str):
+            if not _utf8_ok(value):
+                return where
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                key_where = "%s[%s]" % (where, ascii(k))
+                if isinstance(k, str) and not _utf8_ok(k):
+                    return key_where + " (the key)"
+                stack.append((key_where, v))
+        elif isinstance(value, list):
+            stack.extend(("%s[%d]" % (where, i), v) for i, v in enumerate(value))
+    return ""
 
 
 def _valid_stamp(value: object) -> bool:
@@ -467,6 +509,10 @@ def _load(path: Path) -> dict:
         if not isinstance(r["priority"], int):
             _die("%s row %d (%s) has a non-integer priority" % (path, i, r["card"]))
         _check_row(path, i, r)
+    # (r3 A2) the class fix: the named per-field checks above keep their messages; this walk refuses every other string too.
+    bad = _non_utf8_text(data)
+    if bad:
+        _die("%s has text that is not valid UTF-8 (a lone surrogate) at %s" % (path, bad))
     return data
 
 

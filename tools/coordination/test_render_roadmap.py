@@ -912,5 +912,179 @@ class R2Pass5Tests(unittest.TestCase):
         self.assertEqual(self.load_code(data), 2)
 
 
+class R3Tests(unittest.TestCase):
+    """OWNER-ASK-PARK-GUARD-1 r3: the three open majors of review-adversary-OWNER-ASK-PARK-GUARD-1-r2-6c9167ce, each on its input.
+    A1 owner rows add zero bytes once cap 0 is over budget; A2 every string in the queue must be UTF-8; A3 no whitespace in a stamp."""
+
+    STAMP = "2026-10-20T00:00:00Z"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def board(self, *rows: dict, generated: str = "2026-10-23T00:00:00Z") -> dict:
+        return {"schema": "mlv-app/card-queue/v1", "generated_utc": generated, "rows": list(rows)}
+
+    def write(self, data: dict) -> Path:
+        p = Path(self.tmp.name) / "q.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+        return p
+
+    def load_code(self, data: dict) -> tuple[int, str]:
+        p = self.write(data)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                render_roadmap._load(p)
+                return 0, err.getvalue()
+            except SystemExit as exc:
+                return exc.code, err.getvalue()
+
+    def check_code(self, data: dict) -> int:
+        """main --check on an existing stale output: must return a status (2 for bad input), never raise."""
+        p = self.write(data)
+        out = Path(self.tmp.name) / "roadmap.md"
+        out.write_bytes(b"stale\n")
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                return render_roadmap.main(["--card-queue", str(p), "--out", str(out), "--check"])
+            except SystemExit as exc:
+                return exc.code
+
+    # A1 (introduced, major): at cap 0 the owner count lines, the "(incl. N ...)" suffix and the owner stats still added bytes.
+    def a1_board(self, *extra: dict) -> dict:
+        rows = [row("PRODUCT-%03d" % i, "queued", self.STAMP) for i in range(300)]
+        data = self.board(*rows, *extra)
+        data["scope_notes"] = [{"title": "S", "text": "x" * 700}]
+        return data
+
+    def size(self, data: dict) -> int:
+        return len(render_roadmap.render(data).encode("utf-8"))
+
+    def test_a1_the_adversary_baseline_is_at_the_boundary(self) -> None:
+        base = self.size(self.a1_board())
+        self.assertLessEqual(base, ROADMAP_BUDGET_BYTES)
+        self.assertGreaterEqual(base, ROADMAP_BUDGET_BYTES - 40)   # within one owner line of the budget, as the pass built it
+
+    def test_a1_one_owner_ask_never_pushes_a_boundary_board_over_budget(self) -> None:
+        variants = {
+            "parked-tooling": row("OWNER-1", "parked", self.STAMP, kind="hub-tooling", origin="owner", notes="waiting"),
+            "queued-tooling": row("OWNER-1", "queued", self.STAMP, kind="hub-tooling", origin="owner", notes="waiting"),
+            "resolved-product": row("OWNER-1", "parked", self.STAMP, origin="owner", notes="waiting", resolution="done"),
+            "resolved-tooling": row("OWNER-1", "parked", self.STAMP, kind="hub-tooling", origin="owner", notes="waiting",
+                                    resolution="done"),
+            "owed-product": row("OWNER-1", "parked", self.STAMP, origin="owner", notes="waiting"),
+        }
+        for name, owner in variants.items():
+            with self.subTest(variant=name):
+                text = render_roadmap.render(self.a1_board(owner))
+                self.assertLessEqual(len(text.encode("utf-8")), ROADMAP_BUDGET_BYTES)
+                self.assertNotIn("owner ask", text.split("## Parked owner asks")[0].split("## Drain")[1])   # no (incl. ...) suffix
+                self.assertNotIn("more owner asks", text)
+                self.assertEqual(sum(1 for c in table_cards(text) if c.startswith("PRODUCT-")), 300)   # product rows never drop
+
+    def test_a1_many_owner_asks_of_every_shape_add_zero_bytes_past_cap_0(self) -> None:
+        owners = []
+        for i in range(60):
+            owners += [row("OT-%03d" % i, "queued", "2026-10-21T00:00:00Z", kind="hub-tooling", origin="owner", notes="n" * 100),
+                       row("PT-%03d" % i, "parked", "2026-10-21T00:00:00Z", kind="factory", origin="owner", notes="n" * 100),
+                       row("RT-%03d" % i, "parked", "2026-10-21T00:00:00Z", kind="factory", origin="owner", resolution="done"),
+                       row("RP-%03d" % i, "parked", "2026-09-01T00:00:00Z", origin="owner", resolution="no_go"),
+                       row("PP-%03d" % i, "parked", "2026-09-01T00:00:00Z", origin="owner", notes="n" * 100)]
+        self.assertLessEqual(self.size(self.a1_board(*owners)), self.size(self.a1_board()))
+
+    def test_a1_the_collapsed_owner_line_is_no_longer_than_the_placeholder(self) -> None:
+        self.assertLessEqual(len(render_roadmap.OWNER_COLLAPSED_LINE), len("- (no owner ask is parked)"))
+        text = render_roadmap.render(self.a1_board(row("OWNER-1", "parked", self.STAMP, kind="hub-tooling", origin="owner")))
+        owed = text.split("## Parked owner asks")[1].split("## Parked with reason")[0]
+        self.assertEqual([l for l in owed.splitlines() if l], [render_roadmap.OWNER_COLLAPSED_LINE])
+
+    def test_a1_a_board_that_fits_still_lists_its_owner_asks(self) -> None:
+        text = render_roadmap.render(self.board(row("OWNER-1", "parked", self.STAMP, kind="hub-tooling", origin="owner")))
+        self.assertIn("- OWNER-1 (P3, hub-tooling): parked 3 d", text)
+        self.assertNotIn(render_roadmap.OWNER_COLLAPSED_LINE, text)
+
+    def test_a1_distinguish_queued_product_kind_owner_asks_are_product_rows(self) -> None:
+        # The DISTINGUISH variant: queued owner asks of kind product were product rows before this card too, so they are listed.
+        asks = [row("OP-%03d" % i, "queued", self.STAMP, origin="owner") for i in range(400)]
+        cards = table_cards(render_roadmap.render(self.a1_board(*asks)))
+        self.assertEqual(sum(1 for c in cards if c.startswith("OP-")), 400)
+
+    # A2 (introduced, major): a lone surrogate anywhere in the queue is bad input (exit 2), never an encode crash.
+    def a2_owner(self, **extra) -> dict:
+        state = extra.pop("state", "queued")   # row() takes state positionally
+        return row("OWNER-1", state, self.STAMP, origin="owner", **extra)
+
+    def test_a2_a_lone_surrogate_in_state_or_order_chain_is_bad_input(self) -> None:
+        cases = {
+            "state": self.a2_owner(state="\ud800"),
+            "order_chain.chain": self.a2_owner(order_chain={"chain": "\ud800", "index": 1}),
+            "order_chain.predecessor": self.a2_owner(order_chain={"chain": "c", "index": 1, "predecessor": "\ud800"}),
+        }
+        for name, r in cases.items():
+            with self.subTest(field=name):
+                self.assertEqual(self.load_code(self.board(r))[0], 2)
+                self.assertEqual(self.check_code(self.board(r)), 2)
+
+    def test_a2_a_lone_surrogate_anywhere_in_the_queue_is_bad_input(self) -> None:
+        def nest(data: dict) -> dict:
+            return data
+        cases = []
+        d = self.board(self.a2_owner(extra_field="\udfff")); cases.append(("row value", d))
+        d = self.board(self.a2_owner(**{"\ud800key": "v"})); cases.append(("row key", d))
+        d = self.board(self.a2_owner(tags=["ok", {"deep": ["\ud801"]}])); cases.append(("nested list", d))
+        d = self.board(self.a2_owner()); d["comment"] = "\udc00"; cases.append(("top-level value", d))
+        d = self.board(self.a2_owner()); d["\udc00"] = 1; cases.append(("top-level key", d))
+        d = self.board(self.a2_owner()); d["scope_notes"] = [{"title": "t", "text": "x", "by": "\ud800"}]; cases.append(("scope note", d))
+        d = self.board(self.a2_owner(notes="\ud800")); cases.append(("notes", d))
+        for name, data in cases:
+            with self.subTest(where=name):
+                code, err = self.load_code(nest(data))
+                self.assertEqual(code, 2, err)
+                self.assertIn("UTF-8", err)
+                self.assertEqual(self.check_code(data), 2)
+
+    def test_a2_valid_unicode_text_still_loads(self) -> None:
+        self.assertEqual(self.load_code(self.board(self.a2_owner(notes="café \U0001f600", state="queued")))[0], 0)
+
+    # A3 (introduced, major): no whitespace inside or around a stamp except the one T-or-space date/time separator.
+    BAD_STAMPS = ("2026-10-20T00:00:00\rZ", "2026-10-20T00:00:00\tZ", "2026-10-20T00:00:00\vZ", "2026-10-20T00:00:00\fZ",
+                  "2026-10-20T00:00:00 Z", "2026-10-20T00:00:00 ", "2026-10-20T00:00:00\r", "2026-10-20T00:00\tZ",
+                  "2026-10-20T00:00:00\r+01:00", "2026-10-20T00:00:00.5 Z", "2026-10-20  00:00:00Z", "2026-10-20 00:00:00 Z")
+
+    def test_a3_whitespace_in_every_stamp_field_is_bad_input(self) -> None:
+        for stamp in self.BAD_STAMPS:
+            for field in ("generated_utc", "source_ledger_stamp", "pinned_utc", "merged_utc"):
+                with self.subTest(field=field, stamp=stamp):
+                    if field == "generated_utc":
+                        data = self.board(row("Q-1", "queued", self.STAMP), generated=stamp.replace("2026-10-20", "2026-10-23"))
+                    elif field == "source_ledger_stamp":
+                        data = self.board(row("Q-1", "merged", stamp))
+                    else:
+                        data = self.board(row("Q-1", "merged", self.STAMP, **{field: stamp}))
+                    code, err = self.load_code(data)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(field, err)
+
+    def test_a3_the_adversary_generated_utc_never_renders_a_carriage_return(self) -> None:
+        for g in ("2026-10-23T00:00:00\rZ", "2026-10-23T00:00:00 "):
+            with self.subTest(generated=g):
+                self.assertEqual(self.load_code(self.board(generated=g))[0], 2)
+
+    def test_a3_the_stamp_problem_names_whitespace(self) -> None:
+        for stamp in self.BAD_STAMPS:
+            with self.subTest(stamp=stamp):
+                self.assertTrue(render_roadmap._stamp_problem(stamp))
+
+    def test_a3_the_one_separator_and_plain_stamps_still_load(self) -> None:
+        for stamp in ("2026-10-20 00:00:00Z", "2026-10-20 00:00:00", "2026-10-20T00:00Z", "2026-10-20T00:00:00.5+05:30", "2026-10-20"):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(self.load_code(self.board(row("Q-1", "merged", stamp, pinned_utc=stamp)))[0], 0)
+
+    def test_a3_instant_reads_the_stamp_as_written(self) -> None:
+        self.assertIsNone(render_roadmap._STAMP_RX.fullmatch("2026-10-20T00:00:00 Z"))
+        self.assertEqual(render_roadmap._instant("2026-10-20 00:00:00+01:00"), render_roadmap._instant("2026-10-19T23:00:00Z"))
+
+
 if __name__ == "__main__":
     unittest.main()
