@@ -2784,6 +2784,30 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         'an appSettings block of plain settings'    = "<appSettings>`n  <add key=`"LogLevel`" value=`"Information`" />`n</appSettings>"
     }
     foreach ($k in $ddOk.Keys) { Assert-That (-not (Test-CredentialText $ddOk[$k])) "DENY-BY-DEFAULT-1 must-pass: $k is not a credential" $ddOk[$k] }
+    # r1 adversary pass 1 (A1-A3, A6-A8): each finding's input, plus its siblings
+    $ddE = [string][char]0xE9
+    $ddA = [ordered]@{
+        'A1 a char-ref key with a char-ref quote in the value'         = '<add key="pass&#119;ord" value="hunt&#34;er2" />'
+        'A1 a hex char-ref key with a hex char-ref quote in the value' = '<add key="pass&#x77;ord" value="hunt&#x22;er2" />'
+        'A1 single-quoted, with a char-ref apostrophe in the value'    = "<add key='pass&#119;ord' value='hunt&#39;er2' />"
+        'A2 a second naming attribute carries the secret'              = '<add key="password" name="hunter2" />'
+        'A2 name plus id'                                              = '<add name="token" id="hunter2" />'
+        'A3 a percent-encoded slash in a query key'                    = 'https://h.example/cb?api%2Fkey=hunter2'
+        'A3 a percent-encoded backslash in a query key'                = 'https://h.example/cb?api%5Ckey=hunter2'
+        'A3 a percent-encoded slash in an XML key attribute'           = '<add key="api%2Fkey" value="hunter2" />'
+        'A3 a percent escape left undecoded in a key'                  = 'pass%20word=hunter2'
+        'A6 a non-ASCII attribute name beside the pair'                = ('<add key="password" value="hunter2" caf' + $ddE + '="x" />')
+        'A6 a non-ASCII namespace prefix'                              = ('<' + $ddE + ':add xmlns:' + $ddE + '="urn:cfg" key="password" value="hunter2" />')
+        'A6 sibling: a non-ASCII prefix on a secret element'           = ('<' + $ddE + ':password>hunter2</' + $ddE + ':password>')
+        'A7 a table header with an undecodable escape'                 = "[`"pass\U0011FFFFord`"]`nvalue=`"hunter2`""
+    }
+    foreach ($k in $ddA.Keys) { Assert-That ((Test-CredentialText $ddA[$k]) -and (Get-CredentialHitLine $ddA[$k]) -gt 0) "DENY-BY-DEFAULT-1 r1 adversary $k refuses" $ddA[$k] }
+    $ddA8 = "`"pass\U0011FFFFord`": hunter2`n`"pass%77ord`": hunter2"
+    Assert-That ((Get-CredentialHitLine $ddA8) -eq 1) 'DENY-BY-DEFAULT-1 r1 adversary A8: the report names the line of the EARLIEST key (a residual key on line 1)' "line=$(Get-CredentialHitLine $ddA8)"
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r1 adversary role guard') {
+        Assert-That (Test-CredentialNamePresent '{"api%2Fkey": ""}') 'DENY-BY-DEFAULT-1 r1 adversary A3 role guard: a percent-encoded slash spelling names a secret'
+        Assert-That (Test-CredentialNamePresent "[`"pass\U0011FFFFord`"]`nvalue=`"`"") 'DENY-BY-DEFAULT-1 r1 adversary A7 role guard: a table header with an undecodable escape names a secret'
+    }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
         $ddRole = [ordered]@{
@@ -2810,7 +2834,10 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
     $ddCases = @(
         @{ N = 1; Url = ('file:///' + ((New-Scratch 'dd-s3-absent') -replace '\\', '/') + '/absent.git?token=fake-token-0001'); Tok = 'fake-token-0001' },
         @{ N = 2; Url = 'https://127.0.0.1:1/o/r.git?token=fake-token-0002'; Tok = 'fake-token-0002' },
-        @{ N = 3; Url = 'https://127.0.0.1:1/o/r.git#token=fake-token-0003'; Tok = 'fake-token-0003' }
+        @{ N = 3; Url = 'https://127.0.0.1:1/o/r.git#token=fake-token-0003'; Tok = 'fake-token-0003' },
+        # r1 adversary A4: git percent-decodes the url it echoes; A9: a short query is redacted too
+        @{ N = 4; Url = ('file:///' + ((New-Scratch 'dd-s3-absent4') -replace '\\', '/') + '/absent.git?token=fake%2Dtoken%2D0004'); Tok = @('fake-token-0004', 'fake%2Dtoken%2D0004') },
+        @{ N = 5; Url = ('file:///' + ((New-Scratch 'dd-s3-absent5') -replace '\\', '/') + '/absent.git?t=x'); Tok = @('?t=x') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
@@ -2826,9 +2853,18 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         try { $ddout = (Invoke-PhaseClone *>&1 | Out-String) } catch { $ddout += $_.Exception.Message } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
         $ddlog = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
         $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog; $script:ForkUrl = $savedFork; $ForkUrl = $savedFork
-        Assert-That ($ddlog.Length -gt 0 -and $ddlog -notmatch [regex]::Escape($ddc.Tok)) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the setup log never holds the url's query token" $ddlog
-        Assert-That ($ddout -notmatch [regex]::Escape($ddc.Tok)) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the console never shows the url's query token" $ddout
+        $ddLeakLog = @(@($ddc.Tok) | Where-Object { $ddlog.Contains($_) }); $ddLeakOut = @(@($ddc.Tok) | Where-Object { $ddout.Contains($_) })
+        Assert-That ($ddlog.Length -gt 0 -and $ddLeakLog.Count -eq 0) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the setup log never holds the url's query token" $ddlog
+        Assert-That ($ddLeakOut.Count -eq 0) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the console never shows the url's query token" $ddout
         $script:Failures.Clear()
+    }
+    # r1 adversary A5: a registered part that is also a scheme ('?https:') never breaks a url apart before the scheme rule redacts its short password
+    if (Test-Has 'Register-UrlSecretParts' 'DENY-BY-DEFAULT-1 r1 adversary A5') {
+        $ddA5 = Join-Path (New-Scratch 'dd-a5-sink') 'sink.log'
+        $savedLog = $script:LogFile; $script:LogFile = $ddA5
+        try { Register-UrlSecretParts 'https://u:abc@h.example/r.git?https:'; Write-Log 'x https://u:abc@h.example/r.git?https: y' *>&1 | Out-Null } finally { $script:LogFile = $savedLog }
+        $ddA5Text = [IO.File]::ReadAllText($ddA5)
+        Assert-That (-not $ddA5Text.Contains(':abc@') -and -not $ddA5Text.Contains('abc@h')) 'DENY-BY-DEFAULT-1 r1 adversary A5: the short password of a url whose query is a registered scheme is still redacted' $ddA5Text
     }
 }
 
