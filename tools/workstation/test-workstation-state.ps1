@@ -1938,7 +1938,7 @@ if ($fnLoaded -and (Test-Has 'Invoke-Native' 'r17 F3')) {
     $f3env = ''
     try {
         [Environment]::SetEnvironmentVariable('GIT_TRACE', $f3a); [Environment]::SetEnvironmentVariable('GIT_TRACE2_EVENT', $f3b); [Environment]::SetEnvironmentVariable('GIT_TRACE_PERFORMANCE', $f3a)
-        [void](Invoke-Native -Exe 'git' -Arguments @('-C', $f3repo, 'status', '--porcelain') *>&1)
+        [void](Invoke-Native -Exe 'git' -Arguments @('-C', $f3repo, 'status', '--porcelain', '-z') *>&1)
         if (Test-Has 'Invoke-GitTraceScrubbed' 'r17 F3') {
             [void](Invoke-GitTraceScrubbed { & git -C $f3repo worktree list --porcelain } *>&1)
             [void](Invoke-GitTraceScrubbed { & git -C $f3repo ls-remote . 'refs/heads/*' 2>$null })
