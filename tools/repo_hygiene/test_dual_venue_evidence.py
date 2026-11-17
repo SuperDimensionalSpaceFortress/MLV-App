@@ -16312,6 +16312,35 @@ class QuotedValueIsNeverALocationTests(unittest.TestCase):
         # the head arm reads no delivery_kind from the quote either (the control-line path; never observed=post)
         self.assertIsNone(out[1]["observed"], out[1])
 
+    def test_r23_a1_a_wake_record_holding_a_quote_is_never_read(self) -> None:
+        # r23 adversary A1 on 9b78199f, its input verbatim: with no ` (` the r21 span rule never ran, so every proof field came from note="..." and the
+        # posted arm was HONOURED (observed=post, blocks=false). The app's playback_due_wake record is numeric and enum fields only
+        # (MainWindow::playbackDueWakeSummaryLine writes no quote), so a wake record that holds a `"` is unreadable on both paths, whatever the quote holds.
+        quoted = ("playback_due_wake armed=1 note=\"diagnostic fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "
+                  "delivery_kind=post end\"")
+        head = quoted.replace("delivery_kind=post", "delivery_kind=send")
+        window = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        posted = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        cases = [(posted, window + quoted),
+                 # the same with a real-shaped Qt location suffix (the body keeps the quote)
+                 (posted, window + quoted + " (C:/build/platform/qt/MainWindow.cpp:21141)"),
+                 # the head arm, its sent wake supplied by the quote
+                 ({}, window + head),
+                 ({}, window + head + " (C:/build/platform/qt/MainWindow.cpp:21141)"),
+                 # a real wake record followed by a quoted note: still unreadable (one shape, no quote)
+                 (posted, window + "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "
+                          "delivery_kind=post note=\"x\"")]
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for i, v in enumerate(out):
+            with self.subTest(case=i):
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+        # control: the same fields outside a quote are read (the rule refuses the quote, not the fields)
+        plain = window + ("playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [(posted, plain)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["observed"], out[0]["verdict"], out[0]["blocks"]), ("post", "HONOURED", False), out[0])
+
     def test_the_python_isolation_mirror_reads_a_quoted_parenthesis_like_the_module(self) -> None:
         text = Path(__file__).read_text(encoding="utf-8")
         self.assertIn("def loc(l: str) -> int:", text)

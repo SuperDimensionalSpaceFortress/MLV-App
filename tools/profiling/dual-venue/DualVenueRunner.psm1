@@ -2147,6 +2147,10 @@ function Get-DvDueWakeDeliveryEvidence {
         # r12 (r12 adversary B2, its input: a sent-head wake line ending ` (delivery_kind=1)`): a wake record whose body lost its tail to the
         # LOCATION_UNREADABLE sentinel may have named a key there, so its key shape is unreadable on both paths
         if ($c.EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $keyShapeUnreadable = $true }
+        # r23 (r23 adversary A1 on 9b78199f, its input: `playback_due_wake armed=1 note="diagnostic fired=1 ... delivery_kind=post end"` was HONOURED):
+        # the app's wake record is numeric and enum fields only (MainWindow::playbackDueWakeSummaryLine writes no quote), so a wake record whose body
+        # holds a double quote is not the app's shape and its key shape is unreadable on both paths; text inside a quote never supplies a field here
+        if ($c.IndexOf([char]'"') -ge 0) { $keyShapeUnreadable = $true }
         foreach ($key in @('delivery_kind', 'delivery', 'disabled', 'armed', 'fired', 'post_rescued', 'post_counts_settled')) {
             if ([regex]::Matches($c, '(?<!' + $script:DvNameChar + ')' + $key + '(?!' + $script:DvNameChar + ')', $script:DvCi).Count -ne [regex]::Matches($c, '(?:^|\s)' + $key + '=').Count) { $keyShapeUnreadable = $true }
         }
