@@ -1499,7 +1499,8 @@ class ShardExitCodeTests(unittest.TestCase):
             "time.sleep(120)\n"
         )
         worker = subprocess.Popen(
-            [sys.executable, "-c", tree], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, **shard.worker_launch_kwargs()
+            [sys.executable, "-c", tree], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            creationflags=no_window_flags(), **shard.session_kwargs(),
         )
         self.addCleanup(worker.stdout.close)
         grandchild = int(worker.stdout.readline())

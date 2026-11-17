@@ -759,13 +759,10 @@ def late_workers(
     return late
 
 
-def worker_launch_kwargs() -> dict[str, object]:
-    """The ``Popen`` keywords every worker is launched with: the hidden window, and on POSIX its own
-    process group, so ending the worker can end what its tests launched (``terminate``)."""
-    kwargs: dict[str, object] = {"creationflags": no_window_flags()}
-    if os.name != "nt":
-        kwargs["start_new_session"] = True
-    return kwargs
+def session_kwargs() -> dict[str, object]:
+    """On POSIX a worker gets its own process group, so ending it can end what its tests launched
+    (``terminate``); on Windows ``taskkill /T`` walks the tree and nothing is needed at launch."""
+    return {} if os.name == "nt" else {"start_new_session": True}
 
 
 TREE_KILL_SECONDS = 10.0
@@ -967,7 +964,7 @@ def run_parallel(
             try:
                 proc = subprocess.Popen(
                     command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log,
-                    stderr=subprocess.STDOUT, **worker_launch_kwargs(),
+                    stderr=subprocess.STDOUT, creationflags=no_window_flags(), **session_kwargs(),
                 )
             except BaseException:
                 log.close()  # not yet in procs: the cleanup below would never close it before the rmtree
