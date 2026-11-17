@@ -16685,6 +16685,22 @@ class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
         got = self.each(self.R26_EXPR, logs + controls)
         self.assertEqual(got, ["|HONOURED|False"] * len(logs) + ["cinematic|HONOURED|False"] * len(controls), got)
 
+    def test_r26_adversary_pass2_a1_every_bounded_look_key_mention_is_a_token(self) -> None:
+        # r26 adversary pass 2 on eed44c40, its input verbatim (spec with forceLookAssist and no lookFlavor) and the variants it names: the counters
+        # needed `=` or the mask right after the key, so `look_assist_flavor =classic`, a bare key, `LOOK_ASSIST_FLAVOR:classic` and a quoted
+        # `look_assist_flavor classic` were absent (cinematic proven). Every bounded mention is a token; one without a plain `=` is unreadable
+        vs = self.R26_VS
+        base = vs + "look_assist_enabled=1 look_assist_flavor=cinematic "
+        logs = [base + "look_assist_flavor =classic", base + "look_assist_flavor", base + "LOOK_ASSIST_FLAVOR:classic",
+                base + "diagnostic='look_assist_flavor classic end'",
+                # the enabled key, and the same mention in an earlier record
+                base + "look_assist_enabled :0", vs + "look_assist_enabled=1 look_assist_flavor=cinematic look_assist_flavor\n" + base.rstrip()]
+        controls = [base + "look_assist_flavors=classic", base + "my_look_assist_flavor=classic", base.rstrip()]
+        expr = ("$e = Get-DvLookAssistEvidence -Spec (@{ legType = 'speed'; generatorArgs = @{ forceLookAssist = $true } }) -LogText $log; "
+                "'{0}|{1}|{2}' -f $e.flavor, $e.verdict, $e.blocks")
+        got = self.each(expr, logs + controls)
+        self.assertEqual(got, ["|HONOURED|False"] * len(logs) + ["cinematic|HONOURED|False"] * len(controls), got)
+
 
     # sol r25 B2: U+200B (zero-width space), U+00AD (soft hyphen), U+FEFF (zero-width no-break space), each ignorable to a linguistic compare
     R26_IGNORABLE = ("\u200b", "\u00ad", "\ufeff")
