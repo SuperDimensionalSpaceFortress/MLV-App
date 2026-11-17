@@ -404,6 +404,8 @@ int BatchRunner::exportRenderedVideoFile(
         case ReceiptSettings::IGV:      setMlvUseIgvDebayer( mlvObject );       break;
         case ReceiptSettings::AMaZE:    setMlvAlwaysUseAmaze( mlvObject );      break;
         case ReceiptSettings::AHD:      setMlvUseAhdDebayer( mlvObject );       break;
+        case ReceiptSettings::RCD:      setMlvUseRcdDebayer( mlvObject );       break;
+        case ReceiptSettings::DCB:      setMlvUseDcbDebayer( mlvObject );       break;
         default:                                                                break;
     }
 

@@ -13795,6 +13795,12 @@ void MainWindow::startExportPipe(QString fileName)
         case ReceiptSettings::AHD:
             setMlvUseAhdDebayer( m_pMlvObject );
             break;
+        case ReceiptSettings::RCD:
+            setMlvUseRcdDebayer( m_pMlvObject );
+            break;
+        case ReceiptSettings::DCB:
+            setMlvUseDcbDebayer( m_pMlvObject );
+            break;
         default:
             break;
         }
@@ -15052,6 +15058,12 @@ void MainWindow::startExportAVFoundation(QString fileName)
             break;
         case ReceiptSettings::AHD:
             setMlvUseAhdDebayer( m_pMlvObject );
+            break;
+        case ReceiptSettings::RCD:
+            setMlvUseRcdDebayer( m_pMlvObject );
+            break;
+        case ReceiptSettings::DCB:
+            setMlvUseDcbDebayer( m_pMlvObject );
             break;
         default:
             break;
