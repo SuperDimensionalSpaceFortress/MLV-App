@@ -291,6 +291,9 @@ class ExportEvidenceTests(unittest.TestCase):
             cdng_case(profile=cdng_profile(30, build_id="f" * 40)),                   # 9 another build's profile
             cdng_case(dualIsoExpected=True, profile=cdng_profile(30, dual_iso_ms=0.0)),   # 10 no dual-ISO frames on a dual-ISO leg
             prores_case(batch=batch_log(30, verified=29)),                            # 11 ProRes verified frames disagree
+            cdng_case(manifest="null"),                                               # 12 adversary r1 A2: a JSON-null output manifest
+            cdng_case(profile="null"),                                                # 13 adversary r1 A2: a JSON-null CDNG profile
+            prores_case(manifest="[]"),                                               # 14 adversary r1 A2: a manifest that is no object
         ]
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -322,12 +325,19 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertEqual((pr["metrics"]["stageFramesSeen"], pr["metrics"]["framesExported"], pr["metrics"]["outputFileCount"]), (30, 30, 1))
         self.assertIsNone(pr["metrics"]["dualIsoActiveFrames"])
         ps = pr["stages"]
-        self.assertEqual(ps["denominator"], "loop_wall_per_frame")
-        self.assertAlmostEqual(ps["loopWallPerFrameMs"], 20000.0 / 30.0, places=3)
-        self.assertAlmostEqual(ps["rows"]["residual"]["meanMs"], 20000.0 / 30.0 - 56.0, places=3)
+        # adversary r1 A4: the batch's DONE elapsed also times clip open, finish and verify, so it is never the share denominator; the shares are of the
+        # timed per-frame work (processed16_total), and what the wall adds is reported apart, untimed, never as a stage
+        self.assertEqual(ps["denominator"], "processed16_total")
+        self.assertAlmostEqual(ps["denominatorMeanMs"], 56.0)
+        self.assertNotIn("residual", ps["rows"])
+        self.assertAlmostEqual(ps["rows"]["debayered_frame"]["share"], 40.0 / 56.0, places=4)
+        self.assertAlmostEqual(ps["batchWallPerFrameMs"], 20000.0 / 30.0, places=3)
+        self.assertAlmostEqual(ps["untimedPerFrameMs"], 20000.0 / 30.0 - 56.0, places=3)
+        self.assertIn("EXPORT-RENDER-PIPE-TIMING-1", ps["untimed"])
         self.assertAlmostEqual(ps["disjointSumMs"], 55.0)
         self.assertTrue(ps["disjointWithin5Percent"])
-        self.assertEqual(ps["largestStage"], "residual")
+        self.assertEqual(ps["largestStage"], "debayered_frame")
+        self.assertEqual(pr["metrics"]["largestStage"], "debayered_frame")
         self.assertEqual(got[5]["outcome"], "INVALID", got[5])
         self.assertEqual(got[6]["outcome"], "INVALID", got[6])
         self.assertEqual(got[7]["outcome"], "FAIL", got[7])
@@ -335,6 +345,9 @@ class ExportEvidenceTests(unittest.TestCase):
         for i in (8, 9, 10, 11):
             self.assertEqual(got[i]["outcome"], "INVALID", got[i])
         self.assertIn("CLIP_CLASS_MISMATCH", got[10]["detail"])
+        for i, token in ((12, "EXPORT_OUTPUT_MISMATCH"), (13, "EXPORT_PROFILE_ABSENT"), (14, "EXPORT_OUTPUT_MISMATCH")):
+            self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+            self.assertTrue(any(token in p for p in got[i]["problems"]), got[i])
 
 
 EXPORT_STUB_GENERATOR = r"""
@@ -381,15 +394,54 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
             (a / "export-profile.json").write_text(cdng_profile(frames, build_id=self.sha), encoding="utf-8")
         (a / "output-manifest.json").write_text(output_manifest(exported), encoding="utf-8")
 
-    def validate(self, receipt: dict, spec: Path, dv: Path = DV) -> dict:
+    def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "") -> dict:
         rp = self.tmp / "receipt-under-test.json"
         rp.write_text(json.dumps(receipt), encoding="utf-8")
+        ev = f" -EvidenceDir '{evidence_dir}'" if evidence_dir else ""
         proc, got = run_pwsh_json(f"Import-Module '{dv / 'DualVenueRunner.psm1'}' -Force\n"
                                   f"$r = Get-Content -Raw '{rp}' | ConvertFrom-Json\n"
-                                  f"$v = Test-DvReceiptValid -Receipt $r -AllowOfflineTestMode -OfflineLegSpecBytes ([IO.File]::ReadAllBytes('{spec}'))\n"
+                                  f"$v = Test-DvReceiptValid -Receipt $r -AllowOfflineTestMode -OfflineLegSpecBytes ([IO.File]::ReadAllBytes('{spec}')){ev}\n"
                                   "[ordered]@{ valid = $v.valid; status = $v.status; reasons = @($v.reasons) } | ConvertTo-Json -Compress")
         self.assertIsNotNone(got, proc.stdout + proc.stderr)
         return got
+
+    def test_a_json_null_summary_or_um_run_with_its_hash_updated_does_not_verify(self) -> None:
+        """adversary r1 A2: a published document that parses to JSON null (its sha256 claim updated to match) is no evidence, never a PASS."""
+        spec = self.export_spec(maxframes=30)
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(self.validate(receipt, spec)["status"], "VERIFIED_OFFLINE_TEST")
+        evdir = Path(receipt["evidence"]["localEvidenceDir"])
+        null_sha = hashlib.sha256(b"null").hexdigest()
+        for target in ("summary", "um-run"):
+            with self.subTest(target=target):
+                r = json.loads(json.dumps(receipt))
+                work = self.tmp / f"ev-{target}"
+                if work.exists():
+                    shutil.rmtree(work)
+                shutil.copytree(evdir, work)
+                if target == "summary":
+                    (work / "export" / "summary.json").write_bytes(b"null")
+                    r["export"]["files"]["summary.json"] = null_sha
+                    if r["evidence"].get("summaryJsonSha256"):
+                        r["evidence"]["summaryJsonSha256"] = null_sha
+                else:
+                    (work / "um-run.json").write_bytes(b"null")
+                    r["evidence"]["umRunJsonSha256"] = null_sha
+                got = self.validate(r, spec, evidence_dir=str(work))
+                self.assertFalse(got["valid"], got)
+                self.assertIn(got["status"], ("INVALID", "INCOMPLETE"), got)
+
+    def test_a_missing_evidence_dir_is_incomplete_not_an_exception(self) -> None:
+        """adversary r1 A3: an evidence directory that is not there is a typed INCOMPLETE, never a StrictMode throw."""
+        spec = self.export_spec(maxframes=30)
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = self.validate(receipt, spec, evidence_dir=str(self.tmp / "missing-export-evidence-A3"))
+        self.assertEqual(got["status"], "INCOMPLETE", got)
+        self.assertTrue(any("EVIDENCE_ABSENT" in r for r in got["reasons"]), got)
 
     def test_the_runner_hands_the_export_generator_the_export_arguments(self) -> None:
         spec = self.export_spec(maxframes=30)
@@ -475,6 +527,26 @@ class ExportJobGeneratorTests(unittest.TestCase):
         # the published set is the five records only: the job never copies an exported frame or .mov to the share
         self.assertIn("Remove-ExportOutput", template)
         self.assertNotRegex(template, r"Publish-AttrCudaFileCopy -Source \$outputs", "an exported output is never published")
+
+    def test_the_time_budget_fits_the_shipped_legs_and_long_windows(self) -> None:
+        """adversary r1 A1: the export's budget is identity read + the app's re-read + the export wait; the shipped M16-1243 legs (two parts, 3.4 GB,
+        480 frames) and a 1000-frame window generate, and the job timeout holds every allowance."""
+        m1243 = 2221399552 + 1174057472
+        for frames in (480, 360, 1000, 4000):
+            with self.subTest(frames=frames):
+                proc = run_pwsh(["-Command", f"& '{EXPORT_JOB}' -DescribeTimeBudgetBytes {m1243} -MaxFrames {frames} | ConvertTo-Json -Compress"])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                b = json.loads(proc.stdout)
+                self.assertGreaterEqual(b["exportTimeoutSec"], max(900, 4 * frames))
+                self.assertGreaterEqual(b["jobTimeoutSec"], b["identityReadSec"] + b["exportTimeoutSec"])
+
+    def test_every_schema_valid_quiescence_threshold_binds(self) -> None:
+        """adversary r1 A5: the schema admits any threshold in (0, 100]; the generator binds each one (0.05 was refused by ValidateRange(0.1, 100))."""
+        for value, ok in (("0.05", True), ("100", True), ("0", False), ("100.5", False)):
+            with self.subTest(value=value):
+                proc = run_pwsh(["-Command", f"try {{ & '{EXPORT_JOB}' -DescribeTemplate -CpuQuiescenceThresholdPercent {value} -ErrorAction Stop | Out-Null; 'BOUND' }} catch {{ 'REFUSED' }}"])
+                self.assertEqual("BOUND" in proc.stdout, ok, proc.stdout + proc.stderr)
+                self.assertEqual("REFUSED" in proc.stdout, not ok, proc.stdout + proc.stderr)
 
     def test_the_emitted_job_parses_with_every_token_substituted(self) -> None:
         proc = run_pwsh(["-Command", f"$d = & '{EXPORT_JOB}' -DescribeTemplate\n"

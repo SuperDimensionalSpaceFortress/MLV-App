@@ -437,10 +437,14 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   * CDNG: the denominator is the producer's `frame_ms`. The producer stages run from `raw_read` to `payload_clone` (including `llrawproc_dual_iso` and
     `dng_compress_encode`). The writer stages (`disk_write`,
     `writer_queue_wait`, `writer_completion_lag`) are reported apart from the producer stages, because the async writer overlaps the producer.
-  * ProRes: the denominator is the loop wall time per frame. The top-level stages are `debayered_frame`, `processing` and `residual`. `raw_uint16` and
-    `llrawproc` nest inside `debayered_frame`.
-  * `residual` (pipe write plus ffmpeg back-pressure) is not timed by the app. The rendered path also has no dual-ISO stage. For that reason ProRes legs
-    carry no `dualIsoClassAgrees` criterion. Both gaps belong to successor `EXPORT-RENDER-PIPE-TIMING-1` (product code).
+  * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
+    `raw_uint16` and `llrawproc` nest inside `debayered_frame`. The batch's `DONE elapsed` starts before the clip opens and also times finish, verify and
+    probe, so it is never a denominator. `batchWallPerFrameMs` and `untimedPerFrameMs` (wall per frame minus `processed16_total`: open, pipe write,
+    ffmpeg back-pressure, finish, verify) are reported beside the table, not as a stage.
+  * The app does not time the untimed part per stage, and the rendered path has no dual-ISO stage. For that reason ProRes legs carry no
+    `dualIsoClassAgrees` criterion. Both gaps belong to successor `EXPORT-RENDER-PIPE-TIMING-1` (product code).
+* **Time budget**: the job timeout is one identity read of the clip (at the measured cold rate), plus the quiescence samples, plus the export wait.
+  The export wait is `max(900, 4 x maxFrames)` s plus another identity-read allowance, for the app's own re-read. No smoke-runner ceiling applies.
 * **Outcomes**:
 
   | Job result | Outcome |

@@ -37,7 +37,10 @@ param(
     [string]$ReceiptPath,
     [bool]$DualIsoExpected = $false,
     [ValidateRange(10, 3600)][int]$PlaySeconds = 20,
-    [ValidateRange(0.1, 100.0)][double]$CpuQuiescenceThresholdPercent = 20,
+    # the leg schema's range, exactly: (0, 100] (adversary r1 A5: ValidateRange(0.1, 100) refused a schema-valid 0.05)
+    [ValidateScript({ $_ -gt 0 -and $_ -le 100 })][double]$CpuQuiescenceThresholdPercent = 20,
+    # test seam (adversary r1 A1): print the time budget for a clip of this many bytes and -MaxFrames, then stop (no clip, no git)
+    [int64]$DescribeTimeBudgetBytes = -1,
     [string]$OutFile,
     [string]$RepoRoot = '',
     [string]$VenueTablePath = ''
@@ -133,12 +136,10 @@ Assert-UnderMlvTmp $outDir 'out'
 Assert-UnderMlvTmp $pkgRoot 'pkg'
 
 function Remove-ExportOutput {
-    # The exported frames / .mov are derived from the owner's footage: they stay on the venue and are deleted here, never published.
-    if (Test-Path -LiteralPath $outDir) {
-        [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot '__SCRATCH_ROOT__' -Path $outDir)
-        Remove-Item -LiteralPath $outDir -Recurse -Force
-    }
-    -not (Test-Path -LiteralPath $outDir)
+    # The exported frames / .mov are derived from the owner's footage: they stay on the venue and are deleted here, never published. The out dir is a
+    # journalled fresh root (New-AttrCudaOwnedRoot), so the delete is by proof (Remove-AttrCudaTree), never a recursive pathname delete.
+    $sweep = Remove-AttrCudaTree -TrustedRoot '__SCRATCH_ROOT__' -Path $outDir -OwnedJournal $OwnerJournal
+    [bool]($sweep.TreeRemoved -and @($sweep.Left).Count -eq 0)
 }
 
 try {
@@ -166,7 +167,7 @@ try {
     try { $receiptActual = ([BitConverter]::ToString($receiptHasher.ComputeHash($receiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $receiptHasher.Dispose() }
     if ($receiptActual -cne $ReceiptSha256) { throw 'EXPORT_RECEIPT_MISMATCH the carried batch receipt does not hash to the leg''s receiptSha256' }
     $receiptLocal = Join-Path $Work 'export-receipt.marxml'
-    [void](Publish-AttrCudaBytes -Path $receiptLocal -Bytes $receiptBytes)
+    [void](Publish-AttrCudaBytes -Path $receiptLocal -Bytes $receiptBytes -OwnedJournal $OwnerJournal)
 
     # --- the owner footage: verified parts, private neutral-named views (the playback job's own sequence) ---------------------------------------------------------
     Write-JobTrace 'step footage-verify start'
@@ -226,7 +227,7 @@ try {
 
     # --- the clip-length gate (the smoke runner's own gate file, dot-sourced): an export plays nothing, so -ClipOnly; and the clip must hold maxFrames -----------
     $lengthGateLocal = Join-Path $Work 'gui-smoke-length-gate.ps1'
-    [void](Publish-AttrCudaBytes -Path $lengthGateLocal -Bytes ([Convert]::FromBase64String($LengthGateBase64)))
+    [void](Publish-AttrCudaBytes -Path $lengthGateLocal -Bytes ([Convert]::FromBase64String($LengthGateBase64)) -OwnedJournal $OwnerJournal)
     . $lengthGateLocal
     $lengthGate = Test-GuiSmokeClipLength -Path $clipPath -WindowSeconds $PlaySeconds -ClipOnly
     $lengthGateRecord = [ordered]@{ verdict = [string]$lengthGate.verdict; frames = $lengthGate.frames; fps = $lengthGate.fps; playSeconds = $PlaySeconds; maxFrames = $MaxFrames }
@@ -241,6 +242,7 @@ try {
 
     # --- the staged package -------------------------------------------------------------------------------------------------------------------------------------
     Write-JobTrace 'step package-expand start'
+    $pkgRoot = (New-AttrCudaOwnedRoot -TrustedRoot '__SCRATCH_ROOT__' -Path $pkgRoot -OwnedJournal $OwnerJournal).Path
     Expand-Archive -LiteralPath (Join-Path $Cache $BasePackageZip) -DestinationPath $pkgRoot -Force
     $baseExe = Get-ChildItem -LiteralPath $pkgRoot -Recurse -Filter $BasePackageExeName | Select-Object -First 1
     if (-not $baseExe) { throw "base package executable not found: $BasePackageExeName" }
@@ -285,7 +287,7 @@ try {
     }
 
     # --- the export: MLVApp.exe --batch, headless, one bounded wait -----------------------------------------------------------------------------------------------------
-    [void](New-AttrCudaDirectory -Path $outDir)
+    $outDir = (New-AttrCudaOwnedRoot -TrustedRoot '__SCRATCH_ROOT__' -Path $outDir -OwnedJournal $OwnerJournal).Path
     $batchLog = Join-Path $Work 'batch.log'
     $profilePath = Join-Path $Work 'export-profile.json'
     $stageLog = Join-Path $Work 'stage-timing.log'
@@ -361,7 +363,7 @@ try {
 } finally {
     if ($OwnerClipDir) { Close-AttrCudaOwnerFootageWorkspace -Handles $ownerViewHandles -Views @($ownerViews) }
     try { [void](Remove-ExportOutput) } catch { Write-JobTrace "export output cleanup error=$([string]$_.CategoryInfo.Reason)" }
-    try { if (Test-Path -LiteralPath $pkgRoot) { [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot '__SCRATCH_ROOT__' -Path $pkgRoot); Remove-Item -LiteralPath $pkgRoot -Recurse -Force } } catch { Write-JobTrace "package cleanup error=$([string]$_.CategoryInfo.Reason)" }
+    try { [void](Remove-AttrCudaTree -TrustedRoot '__SCRATCH_ROOT__' -Path $pkgRoot -OwnedJournal $OwnerJournal) } catch { Write-JobTrace "package cleanup error=$([string]$_.CategoryInfo.Reason)" }
 }
 '@
 
@@ -409,6 +411,25 @@ function Get-ExportEmbedding {
         foreach ($m in [regex]::Matches($text, $callPattern)) { $pending.Enqueue($m.Groups[1].Value) }
     }
     [pscustomobject]@{ names = @($names); text = ($blocks -join "`r`n`r`n"); unresolved = @($unresolved) }
+}
+
+function Get-ExportJobTimeBudget {
+    # adversary r1 A1: an export plays nothing, so the playback smoke budget (whose 3600 s smoke ceiling the export wait overflowed) is not its shape. The
+    # job's own wall is the ONE margined identity read of the clip (Get-AttrCudaLegTimeBudget's measured cold rate), the quiescence samples, then the
+    # export, whose wait holds the app's re-read of the clip at that same cold rate plus a generous per-frame CPU ceiling (dual-ISO AMaZE at full
+    # resolution), never under 15 minutes. No ceiling of the smoke runner applies: the export wait is the job's own WaitForExit.
+    param([int64]$ClipBytes, [int]$Frames)
+    Import-Module $ArtifactsModule -Force
+    $read = Get-AttrCudaLegTimeBudget -InputBytes $ClipBytes -LaunchSeconds 0 -PlaySeconds 0 -SettleSeconds 0 -RunnerSlackSeconds 0 -ShareSmokeCeiling
+    $identityReadSec = [int]$read.identityReadSec
+    $exportTimeoutSec = [int]([Math]::Max(900, 4 * $Frames) + $identityReadSec)
+    $quiescenceSec = 3 * 12 + 30
+    [pscustomobject]@{ identityReadSec = $identityReadSec; exportTimeoutSec = $exportTimeoutSec; quiescenceSec = $quiescenceSec
+                       jobTimeoutSec = [int]($identityReadSec + $quiescenceSec + $exportTimeoutSec + 600) }
+}
+if ($DescribeTimeBudgetBytes -ge 0) {
+    if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
+    return (Get-ExportJobTimeBudget -ClipBytes $DescribeTimeBudgetBytes -Frames $MaxFrames)
 }
 
 $ast = Get-PlaybackGeneratorAst
@@ -459,13 +480,11 @@ $receiptBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $ReceiptPath)
 $hasher = [System.Security.Cryptography.SHA256]::Create()
 try { $receiptSha256 = ([BitConverter]::ToString($hasher.ComputeHash($receiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
 
-# The export's own wait: a generous CPU ceiling per frame (dual-ISO AMaZE at full resolution), never under 15 minutes; the um-run timeout adds the identity read
-# of the clip at the venue's measured cold rate (Get-AttrCudaLegTimeBudget, the playback generator's derivation) and the quiescence samples.
-$exportTimeoutSec = [int][Math]::Min(3600, [Math]::Max(900, 4 * $MaxFrames))
 $clipBytes = [int64]0
 foreach ($p in $ownerParts) { $clipBytes += [int64]$p.length }
-$timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytes -PlaySeconds $exportTimeoutSec
-$jobTimeoutSec = [int]$timeBudget.jobTimeoutSec + 60
+$timeBudget = Get-ExportJobTimeBudget -ClipBytes $clipBytes -Frames $MaxFrames
+$exportTimeoutSec = $timeBudget.exportTimeoutSec
+$jobTimeoutSec = $timeBudget.jobTimeoutSec
 
 $short = $SourceCommit.Substring(0, 12)
 $tokens = [ordered]@{

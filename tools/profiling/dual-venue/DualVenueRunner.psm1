@@ -3906,8 +3906,8 @@ $script:ExportCdngWriterStages = @('disk_write', 'writer_queue_wait', 'writer_co
 # raw fetch getMlvRawFrameDebayered makes, so they NEST inside debayered_frame; debayered_frame and processing are the disjoint children of processed16_total.
 # The residual (loop wall per frame - processed16_total) is the pipe write to ffmpeg and its back-pressure. Drain and verify are not timed per stage.
 $script:ExportRenderedStages = @('raw_uint16', 'raw_uint16_disk_read', 'raw_uint16_decompress', 'llrawproc', 'debayered_frame', 'processing', 'processed16_total')
-$script:ExportRenderedTopLevel = @('debayered_frame', 'processing', 'residual')
-$script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total; residual = loop wall per frame - processed16_total (pipe write plus ffmpeg back-pressure)'
+$script:ExportRenderedTopLevel = @('debayered_frame', 'processing')
+$script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total, the share denominator'
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
 $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json')
 
@@ -3957,12 +3957,16 @@ function Get-DvExportEvidence {
     $manifest = $null
     if ([string]::IsNullOrEmpty($OutputManifestText)) { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json is absent') }
     else {
-        try { $manifest = $OutputManifestText | ConvertFrom-Json -ErrorAction Stop } catch { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json does not parse') }
+        $parsed = $false
+        try { $manifest = $OutputManifestText | ConvertFrom-Json -NoEnumerate -ErrorAction Stop; $parsed = $true } catch { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json does not parse') }
+        # adversary r1 A2: JSON null (or an array, a scalar) parses without an exception and is no manifest
+        if ($parsed -and $manifest -isnot [System.Management.Automation.PSCustomObject]) { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json is not one JSON object'); $manifest = $null }
         if ($null -ne $manifest) {
             $count = ConvertTo-DvInt64 (Get-DvProp $manifest 'count'); $bytes = ConvertTo-DvInt64 (Get-DvProp $manifest 'totalBytes')
             $kind = [string](Get-DvProp $manifest 'kind'); $wantKind = $(if ($Format -ceq 'prores') { 'mov' } else { 'dng' })
             $m.outputFileCount = $count; $m.outputBytes = $bytes
-            if ($kind -cne $wantKind) { $problems.Add("EXPORT_OUTPUT_MISMATCH: output-manifest.json lists '$kind' output, a $Format export writes $wantKind") }
+            if ($null -eq $count -or $null -eq $bytes) { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json carries no integer count / totalBytes') }
+            elseif ($kind -cne $wantKind) { $problems.Add("EXPORT_OUTPUT_MISMATCH: output-manifest.json lists '$kind' output, a $Format export writes $wantKind") }
             elseif ($Format -ceq 'prores') { if ($count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: a ProRes export writes one .mov; the manifest lists $count") } }
             elseif ($null -ne $m.framesExported -and $count -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the manifest lists $count .dng file(s) but the batch exported $($m.framesExported)") }
         }
@@ -3973,7 +3977,9 @@ function Get-DvExportEvidence {
         $profile = $null
         if ([string]::IsNullOrEmpty($ProfileText)) { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json is absent') }
         else {
-            try { $profile = $ProfileText | ConvertFrom-Json -ErrorAction Stop } catch { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json does not parse') }
+            $parsed = $false
+            try { $profile = $ProfileText | ConvertFrom-Json -NoEnumerate -ErrorAction Stop; $parsed = $true } catch { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json does not parse') }
+            if ($parsed -and $profile -isnot [System.Management.Automation.PSCustomObject]) { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json is not one JSON object'); $profile = $null }
             if ($null -ne $profile -and [string](Get-DvProp $profile 'schema') -cne 'mlvapp.export_stage_profile.v1') { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json is not an mlvapp.export_stage_profile.v1 document'); $profile = $null }
         }
         if ($null -ne $profile) {
@@ -4028,19 +4034,20 @@ function Get-DvExportEvidence {
             }
             $m.stageFramesSeen = [int64]$perStage['processed16_total'].Count
             if ($m.stageFramesSeen -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: stage-timing.log records no processed16_total frame') }
-            $loopWall = $(if ($null -ne $m.framesExported -and $m.framesExported -gt 0 -and $null -ne $m.wallSeconds) { Get-DvExportRound ($m.wallSeconds * 1000.0 / $m.framesExported) } else { $null })
+            # adversary r1 A4: the batch's DONE elapsed starts before the clip opens and also times finish, decode-verify and probe, so wall / frames is no
+            # per-frame loop time and never the share denominator. The shares are of the timed per-frame work (processed16_total); what the batch wall adds per
+            # frame is reported apart as untimed (open, pipe write, ffmpeg back-pressure, finish, verify), never as a stage.
+            $batchWall = $(if ($null -ne $m.framesExported -and $m.framesExported -gt 0 -and $null -ne $m.wallSeconds) { Get-DvExportRound ($m.wallSeconds * 1000.0 / $m.framesExported) } else { $null })
+            $p16 = Get-DvExportStageRow -Values @($perStage['processed16_total'].Values) -Denominator $null
             $rowsOut = [ordered]@{}
-            foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $loopWall }
-            $p16 = $rowsOut['processed16_total']
-            $residualMean = $(if ($null -ne $loopWall -and $null -ne $p16.meanMs) { Get-DvExportRound ($loopWall - $p16.meanMs) } else { $null })
-            $rowsOut['residual'] = [ordered]@{ samples = $p16.samples; meanMs = $residualMean
-                                               medianMs = $(if ($null -ne $loopWall -and $null -ne $p16.medianMs) { Get-DvExportRound ($loopWall - $p16.medianMs) } else { $null })
-                                               share = $(if ($null -ne $residualMean -and $loopWall -gt 0) { Get-DvExportRound ($residualMean / $loopWall) } else { $null }) }
+            foreach ($name in $script:ExportRenderedStages) { $rowsOut[$name] = Get-DvExportStageRow -Values @($perStage[$name].Values) -Denominator $p16.meanMs }
+            $untimed = $(if ($null -ne $batchWall -and $null -ne $p16.meanMs) { Get-DvExportRound ($batchWall - $p16.meanMs) } else { $null })
             $disjoint = $(if ($null -ne $rowsOut['debayered_frame'].meanMs -and $null -ne $rowsOut['processing'].meanMs) { Get-DvExportRound ($rowsOut['debayered_frame'].meanMs + $rowsOut['processing'].meanMs) } else { $null })
             $within = $(if ($null -ne $disjoint -and $null -ne $p16.meanMs -and $p16.meanMs -gt 0) { [math]::Abs($disjoint - $p16.meanMs) / $p16.meanMs -le 0.05 } else { $null })
             $largest = @($script:ExportRenderedTopLevel | Where-Object { $null -ne $rowsOut[$_].meanMs } | Sort-Object { -[double]$rowsOut[$_].meanMs } | Select-Object -First 1)
-            $stages = [ordered]@{ denominator = 'loop_wall_per_frame'; loopWallPerFrameMs = $loopWall; rows = $rowsOut; nesting = $script:ExportRenderedNesting
-                                  disjointSumMs = $disjoint; processed16TotalMeanMs = $p16.meanMs; disjointWithin5Percent = $within
+            $stages = [ordered]@{ denominator = 'processed16_total'; denominatorMeanMs = $p16.meanMs; denominatorMedianMs = $p16.medianMs; rows = $rowsOut; nesting = $script:ExportRenderedNesting
+                                  disjointSumMs = $disjoint; disjointWithin5Percent = $within; batchWallPerFrameMs = $batchWall; untimedPerFrameMs = $untimed
+                                  untimed = "$($script:ExportSuccessor): batch wall per frame minus processed16_total (clip open, pipe write, ffmpeg back-pressure, finish and verify) is not timed per stage by the app"
                                   drainVerify = "$($script:ExportSuccessor): the rendered path times no drain or verify stage"
                                   largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
@@ -4108,7 +4115,7 @@ function Test-DvExportReceiptValid {
     # ---- the hashed files
     $evidence = Get-DvProp $Receipt 'evidence'
     $dir = $(if (-not [string]::IsNullOrWhiteSpace($EvidenceDir)) { $EvidenceDir } else { [string](Get-DvProp $evidence 'localEvidenceDir') })
-    $texts = @{}; $umRun = $null
+    $texts = @{}; $umRun = $null; $files = $null   # (adversary r1 A3: $files is read below even when the evidence directory is absent)
     if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) { $Incomplete.Add('EVIDENCE_ABSENT: the local evidence directory the receipt names is not present') }
     else {
         $umClaim = [string](Get-DvProp $evidence 'umRunJsonSha256')
@@ -4116,7 +4123,10 @@ function Test-DvExportReceiptValid {
         if ($umClaim -cnotmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $umFile -PathType Leaf)) { $Incomplete.Add('EVIDENCE_ABSENT: um-run.json (evidence.umRunJsonSha256) is not in the evidence') }
         elseif ((Get-DvSha256OfFile $umFile) -cne $umClaim) { $Invalid.Add('EVIDENCE_HASH_MISMATCH: um-run.json does not hash to the sha256 the receipt claims') }
         else {
-            try { $umRun = (ConvertTo-DvText ([IO.File]::ReadAllBytes($umFile))) | ConvertFrom-Json -ErrorAction Stop } catch { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not valid JSON') }
+            $parsed = $false
+            try { $umRun = (ConvertTo-DvText ([IO.File]::ReadAllBytes($umFile))) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop; $parsed = $true } catch { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not valid JSON') }
+            # adversary r1 A2: JSON null parses without an exception and is no um-run record
+            if ($parsed -and $umRun -isnot [System.Management.Automation.PSCustomObject]) { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not one JSON object'); $umRun = $null }
             if ($null -ne $umRun -and [string](Get-DvProp $umRun 'schema') -cne $script:UmRunSchema) { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not a dual-venue um-run record'); $umRun = $null }
         }
         $files = Get-DvProp $exportBlock 'files'
@@ -4134,7 +4144,11 @@ function Test-DvExportReceiptValid {
         }
     }
     $summary = $null
-    if ($texts.ContainsKey('summary.json')) { try { $summary = $texts['summary.json'] | ConvertFrom-Json -ErrorAction Stop } catch { $Invalid.Add('EVIDENCE_UNPARSABLE: export/summary.json is not valid JSON') } }
+    if ($texts.ContainsKey('summary.json')) {
+        $parsed = $false
+        try { $summary = $texts['summary.json'] | ConvertFrom-Json -NoEnumerate -ErrorAction Stop; $parsed = $true } catch { $Invalid.Add('EVIDENCE_UNPARSABLE: export/summary.json is not valid JSON') }
+        if ($parsed -and $summary -isnot [System.Management.Automation.PSCustomObject]) { $Invalid.Add('EVIDENCE_UNPARSABLE: export/summary.json is not one JSON object'); $summary = $null }
+    }
     elseif ($null -ne $files) { $Incomplete.Add('EVIDENCE_ABSENT: export/summary.json is not listed in export.files') }
     if ($null -ne $summary -and $null -ne $specExport) {
         $venueName = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'name')
@@ -4160,6 +4174,10 @@ function Test-DvExportReceiptValid {
             if ($derived.outcome -cnotin @('PASS', 'FAIL')) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
             elseif ($derived.outcome -cne $Outcome) { $Invalid.Add("OUTCOME_NOT_DERIVED: the export evidence and the leg's criteria derive $($derived.outcome) but the receipt says $Outcome") }
         }
+    }
+    elseif ($Invalid.Count -eq 0 -and $Incomplete.Count -eq 0) {
+        # adversary r1 A2: no guard above may be the only thing between a missing input and a verified PASS/FAIL
+        $Invalid.Add('OUTCOME_NOT_DERIVABLE: the export summary, um-run record or leg spec export block is not readable, so the outcome cannot be re-derived')
     }
     $reasons = @($Invalid.ToArray()) + @($Incomplete.ToArray())
     if ($Production) { $reasons += 'VENUE_ANCHOR_ABSENT: no venue-held anchor (a venue-signed summary.json, or a re-read of the venue outbox by jobId) exists, so a production receipt is advisory: it is never VERIFIED and never a usable PASS (DUAL-VENUE-PASS-PROVENANCE-1)' }
