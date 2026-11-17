@@ -723,27 +723,30 @@ def late_workers(
 ) -> set[int]:
     """The 1-based numbers of workers not seen to have exited BEFORE ``deadline`` (on ``monotonic``).
 
-    A worker is in time only when a look at it, taken before the deadline, found it gone. A worker
-    first seen gone at or after the deadline is late (a wait that ran out, or a parent that was held
-    up while launching, cannot tell an early exit from a late one), and one still running then is late
-    too: the caller kills it. Every look is at most ``WORKER_WATCH_SLICE_SECONDS`` after the last.
+    A worker is in time only when the clock, read AFTER a look at it found it gone, is still before
+    the deadline (a ``poll()`` can itself take the clock past it, so a reading taken before the look
+    proves nothing). A worker first seen gone at or after the deadline is late (a wait that ran out,
+    or a parent that was held up while launching, cannot tell an early exit from a late one), and one
+    still running then is late too: the caller kills it. Every look is at most
+    ``WORKER_WATCH_SLICE_SECONDS`` after the last, and a wait is cut to the time left on a fresh
+    reading and never starts once none is left.
     """
     pending = set(range(1, len(procs) + 1))
     late: set[int] = set()
     while pending:
-        now = monotonic()
         for number in sorted(pending):
             if procs[number - 1].poll() is not None:
                 pending.discard(number)
-                if now >= deadline:
+                if monotonic() >= deadline:
                     late.add(number)
         if not pending:
             break
-        if now >= deadline:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
             late |= pending
             break
         try:
-            procs[min(pending) - 1].wait(timeout=min(WORKER_WATCH_SLICE_SECONDS, deadline - now))
+            procs[min(pending) - 1].wait(timeout=min(WORKER_WATCH_SLICE_SECONDS, remaining))
         except subprocess.TimeoutExpired:
             pass
     return late
@@ -775,7 +778,9 @@ def run_parallel(
     Each child is ``python -m tools.repo_hygiene.ci_unittest_shard --worker-spec ...`` with its own
     TEMP/TMP/TMPDIR; its output goes to a log that is printed, grouped, once it has exited. The shard
     exits non-zero on a failing test, a child that exits non-zero, crashes, writes no result or runs
-    past ``timeout`` (a wait that ran out is a timeout even if the child exits a moment later), or
+    past ``timeout`` (a wait that ran out is a timeout even if the child exits a moment later; the
+    timeout starts before the first launch, and a child whose launch would begin after it is not
+    started and fails the shard), or
     when the ids the children ran or skipped in a class or module fixture are not exactly
     ``members``' ids, each once. The budget warning is printed while the children run (a
     ``BudgetWatch``; the class it names is a placeholder until their seconds are known); the merged
@@ -810,7 +815,7 @@ def run_parallel(
         out=out,
         origin=origin,
     )
-    deadline = time.monotonic() + limit  # from before the first launch: launching is part of the budget
+    deadline = clock() + limit  # from before the first launch: launching is part of the budget
     watch.start()
     try:
         for number, classes in enumerate(groups, start=1):
@@ -825,6 +830,9 @@ def run_parallel(
                 "top_level_dir": top_level_dir,
             }
             (home / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+            if clock() >= deadline:  # the spec write above may have been slow: never start a worker past the deadline
+                problems.append(f"worker {number}/{len(groups)} not launched: the deadline passed while launching")
+                continue
             child_env = {k: v for k, v in os.environ.items() if k != MANIFEST_ENV}
             child_env.update(TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp), **{WORKERS_ENV: "1"})
             tests_in = sum(len(units[key]) for key in classes)
@@ -843,7 +851,7 @@ def run_parallel(
             ))
             logs.append(home / "log.txt")
         watch.check()  # a budget already spent when the workers launch is reported at once
-        late = late_workers([proc for proc, _log in procs], deadline)
+        late = late_workers([proc for proc, _log in procs], deadline, clock)
         for number, (proc, log) in enumerate(procs, start=1):
             killed = proc.poll() is None
             if killed:

@@ -1173,8 +1173,10 @@ class ShardExitCodeTests(unittest.TestCase):
             def wait(self, timeout: float | None = None) -> int:
                 raise subprocess.TimeoutExpired("fake", timeout)
 
-        ticks = iter(times)
-        return shard.late_workers([FakeProc(seq) for seq in polls], deadline, lambda: next(ticks))
+        ticks = list(times)  # the last reading repeats once the list is used up
+        return shard.late_workers(
+            [FakeProc(seq) for seq in polls], deadline, lambda: ticks.pop(0) if len(ticks) > 1 else ticks[0]
+        )
 
     def test_a_worker_seen_to_exit_before_the_deadline_is_in_time(self) -> None:
         self.assertEqual(self._late([[0], [0]], [0.5]), set())
@@ -1188,6 +1190,71 @@ class ShardExitCodeTests(unittest.TestCase):
 
     def test_a_worker_still_running_at_the_deadline_is_late_and_the_others_are_not(self) -> None:
         self.assertEqual(self._late([[0], [None]], [0.5, 2.0]), {2})
+
+    # r4 adversary A1 (pass 3): the clock is read AFTER a look finds a worker gone, and the wait slice
+    # comes from a fresh reading, so a poll() that itself crosses the deadline is not mistaken for in time.
+    @staticmethod
+    def _slow_proc(now: list[float], reading: float, code: int | None, waits: list[float | None] | None = None):
+        class SlowProc:
+            def poll(self) -> int | None:
+                now[0] = max(now[0], reading)  # the look itself takes the clock to `reading`
+                return code
+
+            def wait(self, timeout: float | None = None) -> int:
+                if waits is not None:
+                    waits.append(timeout)
+                    if len(waits) > 3:  # a runaway loop must fail the test, not eat the host
+                        raise AssertionError(f"late_workers keeps waiting: {waits}")
+                now[0] = max(now[0], 1.2)  # a wait that ran its slice leaves the clock past the deadline
+                raise subprocess.TimeoutExpired("fake", timeout)
+
+        return SlowProc()
+
+    def test_an_exit_first_seen_while_the_poll_itself_crossed_the_deadline_is_late(self) -> None:
+        now = [0.9]  # deadline 1.0; each poll() returns 0 at 1.1
+        procs = [self._slow_proc(now, 1.1, 0), self._slow_proc(now, 1.1, 0)]
+        self.assertEqual(shard.late_workers(procs, 1.0, lambda: now[0]), {1, 2})
+
+    def test_the_wait_slice_is_cut_to_the_time_left_on_a_fresh_reading(self) -> None:
+        now, waits = [0.0], []
+        proc = self._slow_proc(now, 0.95, None, waits)  # the look takes 0.95 s of a 1.0 s deadline
+        self.assertEqual(shard.late_workers([proc], 1.0, lambda: now[0]), {1})
+        self.assertEqual(len(waits), 1, waits)
+        self.assertAlmostEqual(waits[0], 0.05)
+
+    def test_no_wait_starts_once_a_poll_has_taken_the_clock_past_the_deadline(self) -> None:
+        now, waits = [0.0], []
+        proc = self._slow_proc(now, 1.5, None, waits)
+        self.assertEqual(shard.late_workers([proc], 1.0, lambda: now[0]), {1})
+        self.assertEqual(waits, [])
+
+    # r4 adversary A2 (pass 3): the deadline covers launching, so no worker is started once it has passed.
+    def test_no_worker_is_launched_after_the_deadline_passed_while_launching(self) -> None:
+        root, tests, tag = self._fixture()
+        now = [0.0]
+        real_write = Path.write_text
+
+        def slow_write(path: Path, data: str, *args: object, **kwargs: object) -> int:
+            written = real_write(path, data, *args, **kwargs)
+            if path.name == "spec.json":
+                now[0] = 2.0  # the first spec write completes after the 1 s deadline
+            return written
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.Path, "write_text", slow_write),
+            mock.patch.object(shard.subprocess, "Popen") as popen,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "1"}, clock=lambda: now[0],
+            )
+        self.assertEqual(popen.call_count, 0)
+        self.assertEqual(code, 1)
+        for number in (1, 2):
+            self.assertIn(f"worker {number}/2 not launched: the deadline passed while launching", err.getvalue())
 
     # r3 adversary A2 (pass 2): a budget already crossed when the workers launch is reported before any log.
     def test_a_budget_already_crossed_at_launch_warns_before_the_worker_logs(self) -> None:
