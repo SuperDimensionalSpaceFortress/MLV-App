@@ -2071,6 +2071,71 @@ if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r17 p19 A6') -and (Test-Has 'Invoke
     $script:Failures.Clear()
 }
 
+# ================================================================ r19 fix iteration 1 (head f4ca8b44): adversary pass 21, A1 A2 A3 A4 A5
+# A1: a secret-named key whose name carries a '/' ('password/primary') and a value under a secret-named TOML table ('[auth]' then 'key = "x"') are credentials
+if ($fnLoaded -and (Test-Has 'Get-CredentialHitLine' 'r19 A1')) {
+    Assert-That (Test-CredentialText '{"password/primary":"hunter2"}') 'r19 A1 detector: a secret-named key with a slash in its name is a credential'
+    Assert-That (Test-CredentialText '{"vault\\secret":"hunter2"}') 'r19 A1 detector: a secret-named key with a backslash in its name is a credential'
+    Assert-That (Test-CredentialText "[auth]`nkey = `"hunter2`"`n") 'r19 A1 detector: a value under a secret-named TOML table is a credential'
+    Assert-That (Test-CredentialText "[[auth.primary]]`r`nuser = 'bob'`r`n") 'r19 A1 detector: a value under a secret-named TOML array-of-tables header is a credential'
+    Assert-That (Test-CredentialText "[tool.token]`nvalue: abc`n") 'r19 A1 detector: a value under a dotted secret-named table is a credential'
+    Assert-That (-not (Test-CredentialText "[auth]`n# nothing set yet`n`n[editor]`nkey = `"x`"`n")) 'r19 A1 control: an empty secret-named table and another table hold no credential'
+    Assert-That (-not (Test-CredentialText "[author]`nname = `"x`"`n")) 'r19 A1 control: [author] is not a secret-named table'
+}
+# A2: two DISTINCT local paths ('C:/repos/lease' and 'C:/repos/lease.git', or a '#other' tail) are never the same repository; hosted URL forms keep their normalising
+if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r19 A2')) {
+    Assert-That (-not (Test-GitRemoteUrlSame 'C:/repos/lease' 'C:/repos/lease.git')) 'r19 A2 url: a local path and its .git sibling are two repositories'
+    Assert-That (-not (Test-GitRemoteUrlSame 'C:/repos/lease#other' 'C:/repos/lease')) 'r19 A2 url: a local path with a # tail is another path'
+    Assert-That (-not (Test-GitRemoteUrlSame '/srv/git/lease?x' '/srv/git/lease')) 'r19 A2 url: a local path with a ? tail is another path'
+    Assert-That (Test-GitRemoteUrlSame 'C:\repos\lease' 'c:/repos/lease/') 'r19 A2 url control: separators, case and a trailing slash do not change a local path'
+    Assert-That (Test-GitRemoteUrlSame 'https://github.com/o/r.git' 'https://github.com/o/r') 'r19 A2 url control: a hosted .git suffix is still dropped'
+}
+# A3: Clone refuses an existing doctrine checkout whose origin PUSH url names another repository
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r19 A3')) {
+    $r19cws = New-Scratch 'r19-a3-clone'
+    $r19crepo = Join-Path $r19cws 'MLV-App'; [void][IO.Directory]::CreateDirectory($r19crepo); & git -C $r19crepo init -q 2>$null
+    & git -C $r19crepo remote add fork $ForkUrl; & git -C $r19crepo remote add origin $UpstreamUrl
+    $r19cdoc = Join-Path $r19cws 'doctrine'; [void][IO.Directory]::CreateDirectory($r19cdoc); & git -C $r19cdoc init -q 2>$null
+    & git -C $r19cdoc remote add origin $DoctrineUrl; & git -C $r19cdoc remote set-url --push origin 'https://github.com/example/unrelated.git'
+    $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo; $savedLog = $script:LogFile
+    $script:Repo = $r19crepo; $Repo = $r19crepo; $script:DoctrineRepo = $r19cdoc; $DoctrineRepo = $r19cdoc; $script:LogFile = Join-Path $r19cws 'clone.log'
+    $script:Failures.Clear()
+    $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')   # no network: an https fetch is refused at once
+    try { Invoke-PhaseClone *>&1 | Out-Null } catch { } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
+    $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog
+    Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_DOCTRINE_REMOTE_MISMATCH*' }).Count -eq 1) 'r19 A3 clone: a doctrine origin whose push url names another repository is refused typed CLONE_DOCTRINE_REMOTE_MISMATCH' ($script:Failures -join ',')
+    $script:Failures.Clear()
+}
+# A4: a rename-over save that lands between the rollback's lock check and its second Replace stays the live file (the older save it displaced is put back aside)
+if ($fnLoaded -and (Test-Has 'Set-ImportFileContentAtomic' 'r19 A4') -and (Test-Has 'Copy-ImportFileLocked' 'r19 A4')) {
+    $r19d = New-Scratch 'r19-a4'
+    $r19Src = Join-Path $r19d 'bundle\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $r19Src))
+    $r19Dst = Join-Path $r19d 'host\service.json'; [void][IO.Directory]::CreateDirectory((Split-Path -Parent $r19Dst))
+    [IO.File]::WriteAllText($r19Src, '{"v":"bundle"}'); (Get-Item -LiteralPath $r19Src).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 11, 0, 0, [DateTimeKind]::Utc)
+    [IO.File]::WriteAllText($r19Dst, '{"v":"old"}'); (Get-Item -LiteralPath $r19Dst).LastWriteTimeUtc = [DateTime]::new(2026, 11, 16, 10, 0, 0, [DateTimeKind]::Utc)
+    $script:R19Moved = $null
+    $script:ImportBeforeSwapHook = { param($Dest) [IO.File]::WriteAllText($Dest, '{"v":"owner-v1"}'); [IO.File]::SetLastWriteTimeUtc($Dest, [DateTime]::new(2026, 11, 16, 12, 0, 0, [DateTimeKind]::Utc)) }
+    $script:ImportBeforeRollbackHook = { param($Dest) $s2 = "$Dest.editor-save"; [IO.File]::WriteAllText($s2, '{"api_key":"owner-v2"}'); try { [IO.File]::Move($s2, $Dest, $true) } catch { } }
+    $script:ImportBeforeAsideRestoreHook = { param($Dest) $s3 = "$Dest.editor-save3"; [IO.File]::WriteAllText($s3, '{"api_key":"owner-v3"}'); try { [IO.File]::Move($s3, $Dest, $true); $script:R19Moved = $true } catch { $script:R19Moved = "move failed: $($_.Exception.Message)" } }
+    $r19msg = ''
+    try { $r19r = Copy-ImportFileLocked -Source ([IO.FileInfo]::new($r19Src)) -Dest $r19Dst -ExcludeNewer $false -ExcludeOlder $true -ExcludeChanged $false; $r19msg = "result=$($r19r.Result)" } catch { $r19msg = $_.Exception.Message } finally { $script:ImportBeforeSwapHook = $null; $script:ImportBeforeRollbackHook = $null; $script:ImportBeforeAsideRestoreHook = $null }
+    Write-Host "INFO r19 A4 seam: moved=$($script:R19Moved) | $r19msg"
+    if ($script:R19Moved -eq $true) {
+        Assert-That (([IO.File]::ReadAllText($r19Dst)) -ceq '{"api_key":"owner-v3"}') 'r19 A4 import: the newest save (landed between the lock check and the second Replace) is the live file' "$r19msg | $([IO.File]::ReadAllText($r19Dst))"
+        Assert-That ($r19msg -like 'IMPORT_ROLLBACK_DEST_CHANGED*') 'r19 A4 import: that rollback refuses typed IMPORT_ROLLBACK_DEST_CHANGED' $r19msg
+    } else {
+        Assert-That (([IO.File]::ReadAllText($r19Dst)) -notmatch 'bundle') 'r19 A4 import: a newest save refused by the lock loses nothing and the bundle copy is not live' "moved=$($script:R19Moved) $r19msg | $([IO.File]::ReadAllText($r19Dst))"
+    }
+}
+# A5: a staged file is judged on the BYTES read, not the decoded character count (15 MB of a two-byte character is 30 MB)
+if ($fnLoaded -and (Test-Has 'Get-StagedFileVerdictDetail' 'r19 A5')) {
+    $r19e = Join-Path (New-Scratch 'r19-a5') 'service.txt'; [IO.File]::WriteAllText($r19e, 'x'); $r19efi = [IO.FileInfo]::new($r19e); [void]$r19efi.Length   # cached length 1
+    [IO.File]::WriteAllText($r19e, ([string][char]0x00E9 * 3000))   # 3000 characters, 6000 UTF-8 bytes, no BOM
+    Assert-That ((Get-StagedFileVerdictDetail -File $r19efi -MaxScanBytes 4096).Why -ceq 'larger than the scan limit') 'r19 A5 export: 3000 two-byte characters (6000 bytes) exceed a 4096-byte limit even though the cached length said 1'
+    [IO.File]::WriteAllText($r19e, ([string][char]0x00E9 * 1000))
+    Assert-That ((Get-StagedFileVerdictDetail -File ([IO.FileInfo]::new($r19e)) -MaxScanBytes 4096).Why -ceq '') 'r19 A5 export control: 2000 bytes under a 4096-byte limit is clean'
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 

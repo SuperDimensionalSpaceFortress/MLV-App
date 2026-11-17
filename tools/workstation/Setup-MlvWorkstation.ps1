@@ -698,9 +698,13 @@ function Invoke-PhaseClone {
     } else {
         # r15 pass 13 A5: an existing doctrine checkout must BE the doctrine repository (its 'origin' names $DoctrineUrl); any other checkout is a typed failure
         $dHave = (@(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url origin 2>$null }) -join '').Trim()
-        if (Test-GitRemoteUrlSame $dHave $DoctrineUrl) { Write-Log "present: $DoctrineRepo" 'OK' }
+        # r19 pass 21 A3: every PUSH url of that origin must name it too ('remote.origin.pushurl' naming another repository is the same mismatch)
+        $dPush = @(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url --push --all origin 2>$null } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+        $dBadPush = @($dPush | Where-Object { -not (Test-GitRemoteUrlSame $_ $DoctrineUrl) })
+        if ((Test-GitRemoteUrlSame $dHave $DoctrineUrl) -and $dBadPush.Count -eq 0) { Write-Log "present: $DoctrineRepo" 'OK' }
         else {
-            Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$(Get-RedactedRemoteUrl $dHave)', expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
+            $dPushNote = $(if ($dBadPush.Count -gt 0) { " and pushes to $((@($dBadPush | ForEach-Object { Get-RedactedRemoteUrl $_ })) -join ', ')" } else { '' })
+            Write-Log "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo (origin is '$(Get-RedactedRemoteUrl $dHave)'$dPushNote, expected $DoctrineUrl; it is left as it is: move it aside and re-run -Phase Clone)" 'ERROR'
             $script:Failures.Add("CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo")
         }
     }
@@ -726,6 +730,11 @@ function Test-GitRemoteUrlSame {
         param($u)
         $s = "$u".Trim()
         $s = $s -replace '^(?i)git@github\.com:', 'https://github.com/' -replace '^(?i)ssh://git@github\.com/', 'https://github.com/'
+        # r19 pass 21 A2: a LOCAL path (no 'scheme://', not an scp-like 'user@host:path'; 'file://' counts as local) names a directory exactly: '.git', '?x' and '#x' are part of it,
+        # so 'C:/repos/lease' and 'C:/repos/lease.git' are two repositories. Only separators, case and a trailing slash are normalised.
+        if (($s -notmatch '^(?i)(?!file://)[a-z][a-z0-9+.\-]*://') -and ($s -notmatch '^[^/\\\s]+@[^/\\\s]+:')) {
+            return (($s -replace '\\', '/') -replace '/+$', '').ToLowerInvariant()
+        }
         $s = $s -replace '^(?i)([a-z][a-z0-9+.\-]*://)[^/\s]*@', '$1'   # r15 pass 14 A2: a user / token part does not change which repository a URL names (r17 F2: up to the last '@')
         $s = $s -replace '[?#].*$', ''   # r17 F2: nor does a query string or a fragment
         $s = $s -replace '/+$', '' -replace '(?i)\.git$', ''
@@ -824,7 +833,8 @@ $CredentialNameWords = 'SECRET|PASS[_.\-]*W(?:OR)?D|PRIVATE[_.\-]*KEY|API[_.\-]*
 # r16 (adversary pass 16 A2): any number of CLOSING characters may stand between the name and its separator ('$c[(("password"))] = "x"' has four); the r15 bound of
 # three let a fourth closer hide the key. The run is linear (each step needs one closer), so it cannot backtrack catastrophically.
 $CredentialNameCore = (@('password', 'passwd', 'secret', 'credential', 'apikey', 'privatekey', 'accesskey', 'auth', 'token', 'pwd') | ForEach-Object { (@($_.ToCharArray()) | ForEach-Object { [string]$_ }) -join '[_.\-]*' }) -join '|'
-$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-])([A-Za-z0-9_.\-]*?(?:' + $CredentialNameCore + ')[A-Za-z0-9_.\-]*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))'
+# r19 pass 21 A1: a '/' or '\' may stand inside a key name ('password/primary', 'vault\secret'): the name run is the classifier's own separators plus those two
+$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-/\\])([A-Za-z0-9_.\-/\\]*?(?:' + $CredentialNameCore + ')[A-Za-z0-9_.\-/\\]*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
 # r15 (hub ruling on adversary pass 12 A1-A3, DENY BY DEFAULT on the key name): the value span regexes, the quoted-run regexes and the netrc record tokenizer of
 # r14 are gone (they stripped quotes, braces, comments and CDATA before the exemption test). What is left is the CLOSED exemption list, compared against the whole
@@ -860,9 +870,9 @@ $script:SecretShapeRegex = [regex]::new(($SecretPatterns -join '|'))
 # over-refusal: the file is dropped and named in SECRET-SCAN.txt). The class is kept so the report and a later narrowing can still tell the two apart.
 function Get-CredentialKeyClass {
     param([string]$Key)
-    $flat = ($Key -replace '[_.\-]', '').ToLowerInvariant()
+    $flat = ($Key -replace '[_.\-/\\]', '').ToLowerInvariant()   # r19 pass 21 A1: '/' and '\' separate a name's parts too
     if ($flat -match 'password|passwd|secret|credential|apikey|privatekey|accesskey|authkey') { return 'strong' }
-    $parts = @(($Key -creplace '(?<=[a-z0-9])(?=[A-Z])', '_').ToLowerInvariant() -split '[_.\-]+' | Where-Object { $_ })
+    $parts = @(($Key -creplace '(?<=[a-z0-9])(?=[A-Z])', '_').ToLowerInvariant() -split '[_.\-/\\]+' | Where-Object { $_ })
     foreach ($p in $parts) { if ($p -ceq 'auth' -or $p -ceq 'pwd' -or $p -ceq 'authorization') { return 'strong' } }
     if (-not $flat.Contains('token')) { return '' }
     # a TOKEN key that names a count ('max_tokens', 'token_count', 'token_limit', 'num_tokens', 'token_budget') may hold a number; any other TOKEN key ('GH_TOKEN') is strong
@@ -1084,6 +1094,28 @@ function Get-CredentialXmlHitIndex {
     return -1
 }
 
+# r19 pass 21 A1: a TOML / INI TABLE whose header names a secret ('[auth]', '[[auth.primary]]', '[tool.token]') holds a credential whenever any line of its body (up to the
+# next table header) carries a value that is not on the closed exemption list, or has no key/value form at all (deny by default: 'key = "hunter2"' under '[auth]' names no
+# secret by its own key). A body of blank and '#' comment lines holds nothing. Returns the index of the header, -1 when there is none.
+$script:CredentialTableHeaderRegex = [regex]::new('(?m)^[ \t]*\[{1,2}[ \t]*([^\[\]\r\n]+?)[ \t]*\]{1,2}[ \t]*(?:#[^\n]*)?$')
+function Get-CredentialTableHitIndex {
+    param([string]$Text)
+    $heads = @($script:CredentialTableHeaderRegex.Matches($Text))
+    for ($h = 0; $h -lt $heads.Count; $h++) {
+        $name = ($heads[$h].Groups[1].Value -replace '["'']', '')
+        if (-not (Get-CredentialKeyClass $name)) { continue }
+        $from = $heads[$h].Index + $heads[$h].Length
+        $to = $(if ($h + 1 -lt $heads.Count) { $heads[$h + 1].Index } else { $Text.Length })
+        foreach ($line in @($Text.Substring($from, $to - $from) -split "`n")) {
+            $l = $line.Trim()
+            if (-not $l -or $l.StartsWith('#')) { continue }
+            $kv = [regex]::Match($l, '^[^=:]*[=:]\s*(.*)$')
+            if (-not $kv.Success -or -not (Test-CredentialValueExempt $kv.Groups[1].Value)) { return $heads[$h].Index }
+        }
+    }
+    return -1
+}
+
 # The index of the first credential in the text (a known token shape, the key/value rule, or a netrc record), -1 when there is none.
 function Get-CredentialHitIndex {
     param([string]$Text)
@@ -1092,7 +1124,7 @@ function Get-CredentialHitIndex {
     if ($m.Success) { $best = $m.Index }
     # r15: the XML element form (Get-CredentialXmlHitIndex) judges the element's RAW content; the comment, CDATA and markup strip of r14 (pass 12 A2) is gone
     $xml = Get-CredentialXmlHitIndex $Text
-    foreach ($i in @((Get-CredentialKeyValueHitIndex $Text), (Get-CredentialNetrcHitIndex $Text), $xml)) {
+    foreach ($i in @((Get-CredentialKeyValueHitIndex $Text), (Get-CredentialNetrcHitIndex $Text), $xml, (Get-CredentialTableHitIndex $Text))) {
         if ($i -ge 0 -and ($best -lt 0 -or $i -lt $best)) { $best = $i }
     }
     return $best
@@ -1159,9 +1191,18 @@ function Get-StagedFileVerdictDetail {
     param([System.IO.FileInfo]$File, [long]$MaxScanBytes = 26214400)
     if ($File.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
     $t = $null
-    try { $t = [IO.File]::ReadAllText($File.FullName) } catch { return @{ Why = 'unreadable'; Line = 0 } }
-    # r17 pass 19 A5 sibling: a file that grew past the limit between the length check and the read is judged on what was read
-    if ($t.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
+    # r19 pass 21 A5: the size is judged on the BYTES actually read (never the cached FileInfo.Length, never the decoded character count: 15 MB of a two-byte character is 30 MB).
+    # The read stops one byte past the limit, so a file that grew or was swapped after the length check is still oversized and is never decoded.
+    $ms = [IO.MemoryStream]::new()
+    try {
+        $rs = [IO.File]::OpenRead($File.FullName)
+        try {
+            $chunk = [byte[]]::new(65536)
+            while (($got = $rs.Read($chunk, 0, $chunk.Length)) -gt 0) { $ms.Write($chunk, 0, $got); if ($ms.Length -gt $MaxScanBytes) { break } }
+        } finally { $rs.Dispose() }
+    } catch { return @{ Why = 'unreadable'; Line = 0 } }
+    if ($ms.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
+    try { $t = ConvertFrom-ImportBytes $ms.ToArray() } catch { return @{ Why = 'unreadable'; Line = 0 } }
     $line = Get-CredentialHitLine $t
     if ($line -gt 0) { return @{ Why = 'credential pattern'; Line = $line } }
     return @{ Why = ''; Line = 0 }
@@ -1743,8 +1784,20 @@ function Set-ImportFileContentAtomic {
                 if ((Get-ImportBytesHash $cur2) -cne (Get-ImportBytesHash $was) -or [IO.File]::GetLastWriteTimeUtc($h2.SafeFileHandle) -ne $wasTime) {
                     throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (two saves landed while the rollback ran: the newest stays live at $Dest and the other is kept at $aside)"
                 }
+                if ($script:ImportBeforeAsideRestoreHook) { & $script:ImportBeforeAsideRestoreHook $Dest }   # test seam: an editor's rename-over save in the instant before the Replace
                 try { [IO.File]::Replace($aside, $Dest, $older, $true) }   # while $h2 is still held
                 catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a save landed while the rollback ran and is kept at $aside; putting it back failed: $($_.Exception.Message); the older interleaved save is at $Dest)" }
+                # r19 pass 21 A4: a rename-over save the lock cannot block may land between the check above and this Replace. What the Replace displaced (now at $older) must be the
+                # interleaved save read above (bytes AND time); anything else is a NEWER save, and it goes back to the host path at once (the file the Replace just put there, the older
+                # one, moves aside to $undo). The newest save is therefore always the live file; the older saves are kept and named, never deleted.
+                $olderIsWas = $true
+                try { $olderIsWas = ((Get-ImportBytesHash ([IO.File]::ReadAllBytes($older))) -ceq (Get-ImportBytesHash $was) -and [IO.File]::GetLastWriteTimeUtc($older) -eq $wasTime) } catch { $olderIsWas = $true }   # unreadable: the note below keeps it named
+                if (-not $olderIsWas) {
+                    $undo = "$base.undo"
+                    try { [IO.File]::Replace($older, $Dest, $undo, $true) }
+                    catch { throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (a newer save landed while the rollback ran and is kept at $older; putting it back failed: $($_.Exception.Message); an older save is at $Dest)" }
+                    throw "IMPORT_ROLLBACK_DEST_CHANGED $Dest (saves landed while the rollback ran: the newest is live at $Dest; the older save it displaced is kept at $undo)"
+                }
             } finally { if ($h2) { $h2.Dispose() } }
             # the displaced file is the older interleaved save read above (bytes AND time): superseded by the newer save, it is removed (proven). Anything else is kept.
             $olderNote = "the older interleaved save is kept at $older"
