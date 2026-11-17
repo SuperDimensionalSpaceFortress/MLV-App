@@ -240,6 +240,12 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_D4_LEGS)
 # MLVAPP_GPU_RECON_RELEASE_DEFERRED=0), keyed to the paced cell it twins (legId and that key are the only differences). The head arm is the cell itself.
 RELEASE_SYNC_LEGS = {"legs/m16-1457-native-fullscreen-s2-release-sync.json": "legs/m16-1457-native-fullscreen-s2.json"}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *RELEASE_SYNC_LEGS)
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the isolation arm of the due-wake delivery A/B (generatorArgs.dueWakeDeliveryPost true ->
+# MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post, the wake posted as before r1), keyed to the fullscreen cell it twins (legId and that key are the only differences).
+# The head arm is the cell itself (the wake sent).
+WAKE_POST_LEGS = {"legs/m16-1457-native-fullscreen-s1-wake-post.json": "legs/m16-1457-native-fullscreen-s1.json",
+                  "legs/m16-1457-native-fullscreen-s2-wake-post.json": "legs/m16-1457-native-fullscreen-s2.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *WAKE_POST_LEGS)
 # CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
 CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
@@ -516,6 +522,13 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     PM_INTERNAL_GAP_OPEN = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 >>>"
     PM_INTERNAL_GAP_CLOSE = "PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 <<<"
     PM_INTERNAL_GAP_REGIONS = 7
+    # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling; r5 adversary pass 11 A1, this pin): the measured-session and summary
+    # selectors take a marker only where it starts the record body. Two regions in the default job: Get-MeasuredSmokeSessionId's anchored pick
+    # (returns or throws, so the baseline loops after it are not reached) and the source-frames summary re-pick. The baseline's substring lines stay
+    # verbatim outside them; absent from the baseline.
+    SESSION_ANCHOR_OPEN = "SESSION-ANCHOR-1 >>>"
+    SESSION_ANCHOR_CLOSE = "SESSION-ANCHOR-1 <<<"
+    SESSION_ANCHOR_REGIONS = 2
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (CI run 43580040634): the ONE claim-shape predicate (Get-AttrCudaBuildManifestClaimSha256). Two regions in every job: its
     # splice, and $manifestChecks reading each digest through it. The second REPLACES the baseline's member-access block (test_playback_attr_3_cuda_behaviour
     # test_every_claim_reader_calls_the_one_predicate forbids keeping it), so that exact baseline block is pinned below and taken out of the baseline, once, before the
@@ -567,6 +580,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
                     "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
                     "pm-internal-gap": (cls.PM_INTERNAL_GAP_OPEN, cls.PM_INTERNAL_GAP_CLOSE),
+                    "session-anchor": (cls.SESSION_ANCHOR_OPEN, cls.SESSION_ANCHOR_CLOSE),
                     "claim-shape": (cls.CLAIM_SHAPE_OPEN, cls.CLAIM_SHAPE_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
@@ -623,6 +637,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
         self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
         self.assertEqual((new_counts["pm-internal-gap"], old_counts["pm-internal-gap"]), (self.PM_INTERNAL_GAP_REGIONS, 0), "the default job carries exactly the pinned number of bracketed PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1 regions; the baseline predates them")
+        self.assertEqual((new_counts["session-anchor"], old_counts["session-anchor"]), (self.SESSION_ANCHOR_REGIONS, 0), "the default job carries exactly the pinned number of bracketed SESSION-ANCHOR-1 regions; the baseline predates them")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -1166,6 +1181,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disableReconReleaseDeferred"]["type"], "boolean")
+
+    def test_the_posted_due_wake_reaches_the_apps_env_only_when_asked(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: -DueWakeDeliveryPost adds MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post to the app's env list
+        exactly once; absent, the job is the text it was (the head arm sets nothing: the app's default is the sent wake). The runner maps
+        generatorArgs.dueWakeDeliveryPost true for any leg (outside the forceLookAssist branch); the schema types it as a boolean."""
+        plain = self.generate(GENERATOR, "dwd-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY", plain)
+        job = self.generate(GENERATOR, "dwd-post.job.ps1", ["-DueWakeDeliveryPost"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=post',\n"
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the switch is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['dueWakeDeliveryPost'] -and $spec.generatorArgs.dueWakeDeliveryPost -is [bool] "
+                   "-and $spec.generatorArgs.dueWakeDeliveryPost) { $gen['DueWakeDeliveryPost'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["dueWakeDeliveryPost"]["type"], "boolean")
 
     def test_the_team_partition_reaches_the_apps_env_only_when_asked(self) -> None:
         """CPU-S1-FS-SPIKE-TEAM-PARTITION-1: -ReconOmpThreads r -PrepOmpThreads p add MLVAPP_PLAYBACK_RECON_OMP_THREADS=r and MLVAPP_PLAYBACK_PREP_OMP_THREADS=p
@@ -1916,7 +1953,9 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
                     # fills only from lookFlavorReported / the receipts (pinned below), or the job's reported-vs-requested comparison.
                     self.assertRegex(line, r"'unknown'|\$null|\$lfReported -ceq|=\s*\$(lookFlavorHonored|pairHonored)\s*$", f"{name}: lookFlavorHonored must come from the app's report (or be 'unknown' / null), never from the spec: {line.strip()}")
         # the runner's one non-literal assignment sits inside the guard that requires the app's report in the job summary
-        self.assertRegex(runner, r"if \(\$null -ne \$summary -and \$summary\.PSObject\.Properties\['lookFlavorReported'\]\) \{\s*\$lookFlavorReported = \[string\]\$summary\.lookFlavorReported\s*\$lookFlavorHonored = \(\$lookFlavorReported -ceq \$lookFlavor\)")
+        # CONTRACT CHANGE, HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): the comparison is Test-DvLookFlavorSame (ordinal and
+        # canonical), no longer the linguistic -ceq, and one comment line names why
+        self.assertRegex(runner, r"if \(\$null -ne \$summary -and \$summary\.PSObject\.Properties\['lookFlavorReported'\]\) \{\s*\$lookFlavorReported = \[string\]\$summary\.lookFlavorReported\s*(#[^\n]*\n\s*)?\$lookFlavorHonored = \(Test-DvLookFlavorSame \$lookFlavorReported \$lookFlavor\)")
 
     def test_the_app_reads_the_flavor_env_var_and_the_job_records_what_it_reports(self) -> None:
         """LOOK-ASSIST-FLAVORS-1 landed the app-side reader this test used to forbid. The job must therefore take lookFlavorHonored from the
@@ -3291,23 +3330,85 @@ class EvidenceFactory(RunnerHarness):
         """An INDEPENDENT mirror of Get-DvPlaybackEvidence: the playback block a sound receipt carries, computed from the evidence files."""
         log = (ev / "logs" / "smoke-run.log").read_bytes()
         lines = log.decode("utf-8").splitlines()
-        session = next(re.search(r"measured_session id=(\d+)", l).group(1) for l in lines if "playback_smoke.measured_session" in l)
-        summary_line = [l for l in lines if re.search(rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]
-        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", summary_line))
         result = json.loads((ev / "result.json").read_text(encoding="utf-8"))
         summary = json.loads((ev / "summary.json").read_text(encoding="utf-8"))
         manifest = json.loads((ev / "evidence-manifest.json").read_text(encoding="utf-8")) if (ev / "evidence-manifest.json").exists() else {}
         log_sha = hashlib.sha256(log).hexdigest()
         declared = result.get("evidence", {}).get("runLogSnapshot", {}).get("sha256", "").lower()
         man_sha = manifest.get("smokeRunLog", {}).get("sha256", "")
-        iso = [l for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l)]
+        # r16 (r15 adversary A1 and advisory A2): read each record as its body, like Get-DvLogRecordBody: a trailing ` (<path>:<digits>)` is the Qt location
+        # and strips; any other ` (` tail is unreadable (None), so that record is never read whole
+        # r21 (bench MINI3-1 r3 FINDING, the module's Get-DvLocationOpenIndex): a ` (` inside a `<key>="<text>"` value (closed by the first `"`, which is
+        # followed by a space or ends the line) is never the location; the location is the first ` (` outside one
+        def loc(l: str) -> int:
+            i = 0
+            while True:
+                p = l.find(" (", i)
+                if p < 0:
+                    return -1
+                q = l.find('="', i)
+                if 0 <= q < p:
+                    k = q - 1
+                    while k >= 0 and (l[k] == "_" or ("A" <= l[k] <= "Z") or ("a" <= l[k] <= "z") or ("0" <= l[k] <= "9")):
+                        k -= 1
+                    c = l.find('"', q + 2)
+                    # r21 adversary A1: a span holding `=` is no quoted value (quoted text never supplies a field)
+                    if k < q - 1 and (k < 0 or l[k] == " ") and c >= 0 and (c == len(l) - 1 or l[c + 1] == " ") and "=" not in l[q + 2:c]:
+                        i = c + 1
+                    else:
+                        i = q + 2
+                    continue
+                return p
+
+        def body(l: str) -> str | None:
+            i = loc(l)
+            if i < 0:
+                return l
+            # r18 (r18 adversary advisory A3): ASCII digits only, like the module's 0-9 walk (Python's \d also takes Arabic-Indic digits)
+            return l[:i] if re.search(r":([0-9]+|%2)\)$", l) and l.rfind(":") > i + 2 else None
+        # r19 (r19 adversary advisory A2): the record is SELECTED by its body too (the text before its first ` (`), so a location path holding the
+        # marker never adds a record; a selected record with an unreadable tail is still None (never read whole)
+        # r24 (opus key3 r23 hardening A2 = sol r23 ANCHOR-INDEPENDENT-EVIDENCE-MIRROR-1): every record (the measured-session marker, the summary, the
+        # pacing_isolated record) is selected only where its marker STARTS the record body, after at most three `[...] ` prefix groups, like the
+        # module's $script:DvRecordStart; before r24 an unanchored re.search took `note: interaction_trace event=automation.pacing_isolated ...`
+        rs = r"^(?:\[[^\]]*\] ){0,3}"
+
+        # r24 (opus key3 r23 INV-1, the module's ConvertTo-DvQuoteMaskedBody): a quoted span opens at any `"` or `'` and closes at the next quote of
+        # the same kind (unclosed: to the end of the body); every `=` inside it is masked to U+001A, so quoted text supplies no field here either
+        def mask(l: str) -> str:
+            out, q = [], None
+            for ch in l:
+                if q is None:
+                    q = ch if ch in "\"'" else None
+                    out.append(ch)
+                elif ch == q:
+                    q = None
+                    out.append(ch)
+                else:
+                    out.append("\x1a" if ch == "=" else ch)
+            return "".join(out)
+
+        def read(l: str) -> str:
+            b = body(l)
+            return mask(b if b is not None else l[:loc(l)] + " (LOCATION_UNREADABLE)")
+
+        sel = [l if loc(l) < 0 else l[:loc(l)] for l in lines]
+        session = next(m.group(1) for s in sel for m in [re.match(rs + r"playback_smoke\.measured_session id=([0-9]+)(?:\s|$)", s)] if m)
+        summary_line = read([l for l, s in zip(lines, sel) if re.match(rs + rf"playback_smoke\.summary session={session}(\s|$)", s)][-1])
+        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", summary_line))
+        iso = [None if body(l) is None else mask(body(l)) for l in lines
+               if re.match(rs + r"interaction_trace event=automation\.pacing_isolated(\s|$)", l if loc(l) < 0 else l[:loc(l)])]
         return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
                 "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
                 "wrapped": int(f["wrapped"]) != 0, "wrapCount": int(f["wrap_count"]),
                 "expectedRunNonce": result.get("evidence", {}).get("runNonce"), "observedRunNonce": f.get("run_nonce"),
                 "manifestRunNonce": manifest.get("smokeRunLog", {}).get("runNonce"), "logSha256": log_sha,
                 "logShaBound": declared == log_sha and (not man_sha or man_sha.lower() == log_sha),
-                "settingsIsolated": bool(iso) and all(re.search(r"settings_store=run_scoped(\s|$)", l) for l in iso),
+                # r13 (r13 adversary A2 sibling): one whole settings_store token per record, and it is run_scoped
+                # r15 (r15 adversary A2): and the word settings_store is mentioned exactly once (a quoted second declaration counts)
+                "settingsIsolated": bool(iso) and all(l is not None and [v.lower() for v in re.findall(r"(?<!\S)settings_store=(\S*)", l, re.I)] == ["run_scoped"]
+                                                      and len(re.findall(r"(?<!(?-i:[A-Za-z0-9_]))settings_store(?!(?-i:[A-Za-z0-9_]))", l, re.I)) == 1
+                                                      for l in iso),
                 "fixtureRehearsal": summary.get("fixtureRehearsal"), "clipId": summary.get("clipId")}
 
     @staticmethod
@@ -3316,8 +3417,21 @@ class EvidenceFactory(RunnerHarness):
         the app's own summary line says it rendered at."""
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
         lines = (ev / "logs" / "smoke-run.log").read_text(encoding="utf-8").splitlines()
-        session = next(re.search(r"measured_session id=(\d+)", l).group(1) for l in lines if "playback_smoke.measured_session" in l)
-        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", [l for l in lines if re.search(rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]))
+        # r24 (sol r23 ANCHOR-INDEPENDENT-EVIDENCE-MIRROR-1 sibling): the session and the summary are selected where the marker STARTS the record (the
+        # module's $script:DvRecordStart), and the summary's quoted `=` is masked (the module's ConvertTo-DvQuoteMaskedBody), as in derive_block
+        rs = r"^(?:\[[^\]]*\] ){0,3}"
+        session = next(m.group(1) for l in lines for m in [re.match(rs + r"playback_smoke\.measured_session id=([0-9]+)(?:\s|$)", l)] if m)
+        summary_line = [l for l in lines if re.match(rs + rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]
+        masked, q = [], None
+        for ch in summary_line:
+            if q is None:
+                q = ch if ch in "\"'" else None
+            elif ch == q:
+                q = None
+            elif ch == "=":
+                ch = "\x1a"
+            masked.append(ch)
+        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", "".join(masked)))
         requested = int(spec["scaleFactor"])
         accepted = int(spec.get("acceptedEffectiveScale", {}).get(backend, requested))
         effective = int(f["scale_active_last"]) if "scale_active_last" in f else "UNKNOWN"
@@ -3423,6 +3537,100 @@ class EvidenceFactory(RunnerHarness):
             self.assertEqual(got, status, f"{needle}: {reasons}")
         self.assertTrue(any(needle in r for r in reasons), f"{needle!r} not in {reasons}")
         return reasons
+
+
+class IsolationMirrorSelectsRecordsByTheirBodyTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r19 adversary advisory A2 on af002fce, its input verbatim): the Python isolation mirror
+    (EvidenceFactory.derive_block) SELECTS a pacing_isolated record by its body, as Get-DvPlaybackEvidence does, so a Qt location path that holds the
+    marker never adds a record (the production parser reads settingsIsolated=true on this log). Pure Python (no pwsh), so it runs on every OS.
+    r20: r19 inserted this class between `@requires_windows_pwsh` and EvidenceBoundReceiptTests, which moved that skip off EvidenceBoundReceiptTests
+    and ran its pwsh leg tests on ubuntu (hosted CI run 43917107820: no offline receipt); the skip is back on EvidenceBoundReceiptTests and
+    PwshHarnessClassesCarryTheWindowsSkipTests pins it for every harness class."""
+
+    def test_a2_a_location_path_holding_the_marker_adds_no_isolation_record(self) -> None:
+        log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               "playback_smoke.summary session=3 source_advanced=600 required_source_frames=600 native_fps=60 pace_fps=60 fps_override=0 wrapped=0 wrap_count=0\n"
+               "trace (C:/build interaction_trace event=automation.pacing_isolated settings_store=run_scoped x/MainWindow.cpp:1)\n")
+        with tempfile.TemporaryDirectory(prefix="iso-mirror-") as d:
+            ev = Path(d)
+            (ev / "logs").mkdir()
+            (ev / "logs" / "smoke-run.log").write_bytes(log.encode("utf-8"))
+            (ev / "result.json").write_text("{}", encoding="utf-8")
+            (ev / "summary.json").write_text("{}", encoding="utf-8")
+            self.assertIs(EvidenceFactory.derive_block(ev)["settingsIsolated"], True)
+
+    @staticmethod
+    def mirror(log: str) -> dict:
+        with tempfile.TemporaryDirectory(prefix="iso-mirror-") as d:
+            ev = Path(d)
+            (ev / "logs").mkdir()
+            (ev / "logs" / "smoke-run.log").write_bytes(log.encode("utf-8"))
+            (ev / "result.json").write_text("{}", encoding="utf-8")
+            (ev / "summary.json").write_text("{}", encoding="utf-8")
+            return EvidenceFactory.derive_block(ev)
+
+    SUMMARY = "playback_smoke.summary session=3 source_advanced={n} required_source_frames=600 native_fps=60 pace_fps=60 fps_override=0 wrapped=0 wrap_count=0"
+
+    def test_r24_a2_an_embedded_isolation_marker_adds_no_record(self) -> None:
+        # opus key3 r23 hardening A2 = sol r23 ANCHOR-INDEPENDENT-EVIDENCE-MIRROR-1, its input verbatim: production selects a record only where its
+        # marker starts the record body ($script:DvRecordStart); the mirror's unanchored re.search took this line and read settingsIsolated=true
+        log = ("playback_smoke.measured_session id=3\nnote: interaction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               + self.SUMMARY.format(n=600) + "\n")
+        self.assertIs(self.mirror(log)["settingsIsolated"], False)
+        # and a record-start prefix ([utc] [LEVEL] [0x<thread>]) is still the start of the record
+        log = ("playback_smoke.measured_session id=3\n[2026-11-17T00:00:00.000Z] [INFO] [0x1] interaction_trace event=automation.pacing_isolated "
+               "settings_store=run_scoped\n" + self.SUMMARY.format(n=600) + "\n")
+        self.assertIs(self.mirror(log)["settingsIsolated"], True)
+
+    def test_r24_an_embedded_session_or_summary_marker_selects_nothing(self) -> None:
+        # the mirror's session (:3328) and summary (:3329) selections, anchored like production
+        log = ("run_metadata cmd playback_smoke.measured_session id=9\nplayback_smoke.measured_session id=3\n"
+               "interaction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               + self.SUMMARY.format(n=600) + "\nx " + self.SUMMARY.format(n=1) + "\n")
+        self.assertEqual(self.mirror(log)["sourceAdvanced"], 600)
+
+    def test_r24_quoted_text_supplies_no_mirror_field(self) -> None:
+        # the opus key3 r23 repro on the mirror: a later quoted source_advanced and a quoted settings_store supply nothing
+        log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+               + self.SUMMARY.format(n=1) + ' note="harmless (text)" diagnostic="prefix source_advanced=600 end"\n')
+        self.assertEqual(self.mirror(log)["sourceAdvanced"], 1)
+        log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated note='x settings_store=run_scoped'\n"
+               + self.SUMMARY.format(n=600) + "\n")
+        self.assertIs(self.mirror(log)["settingsIsolated"], False)
+
+
+class PwshHarnessClassesCarryTheWindowsSkipTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r20 (hosted CI red on dce22027, run 43917107820): a class inserted between
+    `@requires_windows_pwsh` and the class below it takes that skip, so the class below ran its pwsh leg tests on ubuntu. Every concrete TestCase
+    built on a pwsh harness (RunnerHarness, EvidenceFactory, ModuleMutationMixin, IdentityProbeMixin) names the skip itself. Read from the source
+    (skipIf with a false condition leaves no mark on Windows), so the pin holds on every OS."""
+
+    PWSH_BASES = frozenset({"RunnerHarness", "ModuleMutationMixin", "IdentityProbeMixin"})
+
+    @classmethod
+    def unskipped_harness_classes(cls, source: str) -> list[str]:
+        classes = [n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)]
+        bases = {n.name: {b.id for b in n.bases if isinstance(b, ast.Name)} for n in classes}
+        pwsh = set(cls.PWSH_BASES)
+        grew = True
+        while grew:                                   # EvidenceFactory(RunnerHarness) is a harness too, transitively
+            grew = False
+            for name, names in bases.items():
+                if name not in pwsh and names & pwsh:
+                    pwsh.add(name)
+                    grew = True
+        return [n.name for n in classes
+                if "TestCase" in {b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", "") for b in n.bases}
+                and bases[n.name] & pwsh
+                and not any(isinstance(d, ast.Name) and d.id == "requires_windows_pwsh" for d in n.decorator_list)]
+
+    def test_every_pwsh_harness_test_class_names_the_windows_skip(self) -> None:
+        self.assertEqual(self.unskipped_harness_classes(Path(__file__).read_text(encoding="utf-8")), [])
+
+    def test_the_r19_shape_a_class_inserted_under_the_skip_is_caught(self) -> None:
+        r19 = ("class EvidenceFactory(RunnerHarness):\n    pass\n\n\n@requires_windows_pwsh\nclass Mirror(unittest.TestCase):\n    pass\n\n\n"
+               "class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):\n    pass\n")
+        self.assertEqual(self.unskipped_harness_classes(r19), ["EvidenceBoundReceiptTests"])
 
 
 @requires_windows_pwsh
@@ -7888,19 +8096,23 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-145[67]-conform-(fullscreen|windowed)-s1$", path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the native-HFR capture-free speed legs on M16-1457, named by cell and lever
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s1(-nola|-la3|-heavy)?$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s1(-nola|-la3|-heavy|-wake-post)?$", path.name)
+                # -wake-post: the posted-due-wake isolation twin (HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, WAKE_POST_LEGS); no other leg sets it
+                self.assertEqual(spec["generatorArgs"].get("dueWakeDeliveryPost", False), spec["legId"].endswith("-wake-post"), path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
-            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS, *RELEASE_SYNC_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
-                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg), and the
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS, *RELEASE_SYNC_LEGS, *WAKE_POST_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg), the
                 # deferred-release isolation twin (HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7, RELEASE_SYNC_LEGS; the kill switch only on a -release-sync leg)
+                # and the posted-due-wake isolation twin (HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, WAKE_POST_LEGS; the key only on a -wake-post leg)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24](-release-sync)?$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24](-release-sync|-wake-post)?$", path.name)
                 self.assertEqual(spec["generatorArgs"].get("presentTrace", False), "-trace-" in spec["legId"], path.name)
                 self.assertEqual(spec["generatorArgs"].get("disableReconReleaseDeferred", False), spec["legId"].endswith("-release-sync"), path.name)
+                self.assertEqual(spec["generatorArgs"].get("dueWakeDeliveryPost", False), spec["legId"].endswith("-wake-post"), path.name)
                 # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
                 self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
                 self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
@@ -8896,6 +9108,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PRESENTMON-BACHELOR-CUDA-INTERNAL-GAP-1's regions: in the new job only (the base predates the app-swap-window temporal arm), at their pinned count.
                 self.assertEqual((new_counts.pop("pm-internal-gap"), old_counts.pop("pm-internal-gap")),
                                  (GeneratorByteIdentityAndVariantTests.PM_INTERNAL_GAP_REGIONS, 0), name)
+                # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5's anchored session selectors: in the new job only (the base predates them).
+                self.assertEqual((new_counts.pop("session-anchor"), old_counts.pop("session-anchor")),
+                                 (GeneratorByteIdentityAndVariantTests.SESSION_ANCHOR_REGIONS, 0), name)
                 # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5: the claim-shape predicate's regions, in every new job (cuda and cpu); the base predates them.
                 self.assertEqual((new_counts.pop("claim-shape"), old_counts.pop("claim-shape")),
                                  (GeneratorByteIdentityAndVariantTests.CLAIM_SHAPE_REGIONS, 0), name)
@@ -11435,11 +11650,12 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
         "fps-absent-l3": (["selfHealL3FpsRatio"], "COUNTER_ABSENT"),
     }
 
-    def evaluate(self, cases, measured_fps: str = "23.201") -> dict:
+    def evaluate(self, cases, measured_fps: str = "23.201", measured_log: str | None = None) -> dict:
         with tempfile.TemporaryDirectory(prefix="sh-gate-") as d:
             measured = Path(d) / "measured.log"
-            measured.write_text("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
-                                f"presented_fps={measured_fps}\n", encoding="utf-8")
+            measured.write_text(measured_log if measured_log is not None else
+                                ("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
+                                 f"presented_fps={measured_fps}\n"), encoding="utf-8")
             for case in cases:
                 if case != "l4-counters-only":
                     write_self_heal_evidence(Path(d) / case / "self-heal", "good" if case == "good" else case)
@@ -11481,6 +11697,15 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                     self.assertIn(metric, failed, f"{case}: {got['failures']}")
                 if case not in ("l4-counters-only", "skipped-l2"):
                     self.assertEqual(sorted(expected), failed, f"{case} breaks exactly its own fact: {got['failures']}")
+
+    def test_r19_a1_sibling_a_location_tail_never_supplies_a_session_record_field(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r19 (r18 adversary A1 sibling AttrCudaArtifacts.psm1:3513/:3516): the self-heal session record
+        is read as its body (the Get-DvLogRecordBody rule): a readable Qt location's path never supplies presented_fps, and an unreadable tail is no record."""
+        head = "playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201"
+        out = self.evaluate(["good"], measured_log=head + " (C:/b presented_fps=99 x/MainWindow.cpp:1)\n")
+        self.assertEqual(out["good"]["metrics"]["selfHealL1FpsRatio"], 0.974, "the location path supplied presented_fps")
+        out = self.evaluate(["good"], measured_log=head + " (settings_store=venue)\n")
+        self.assertIsNone(out["good"]["metrics"]["selfHealL1FpsRatio"], "an unreadable tail still gave a record")
 
     def test_an_unreadable_counter_is_could_not_check_never_zero(self) -> None:
         """r10 (CoS #437, Dot c503450a): an L3 gpu_summary whose CUDA and preview counters are absent, empty or not decimal counts, a reuse summary
@@ -11526,6 +11751,81 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                 for n in (1, 2, 3):
                     self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
                     self.assertIsNotNone(got["metrics"][f"selfHealL{n}PresentedFps"])
+
+    def test_r5_the_measured_session_and_its_summary_count_only_where_they_start_the_record_body(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r5 (Grok G5 sibling, r4 adversary pass 10 A1): AttrCudaArtifacts' session-line reader takes
+        the measured session and its marker line only where they START the record body ($script:DvRecordStart rule). Before r5 a run_metadata line
+        holding `playback_smoke.measured_session id=9` picked session 9 (no summary: MEASURED_FPS_UNUSABLE), and a later record holding summary text
+        supplied presented_fps=0."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        real = (prefix + "playback_smoke.measured_session id=1\n" + prefix
+                + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+        for name, log in (("embedded measured marker first",
+                           prefix + 'run_metadata={"command_line":["MLVApp.exe","C:/runs/playback_smoke.measured_session id=9/in"]}\n' + real),
+                          ("embedded summary text last", real + prefix + "interaction_trace event=x note=playback_smoke.summary session=1 presented_fps=0\n")):
+            with self.subTest(case=name):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertTrue(got["pass"] and got["supplementaryPass"], got["failures"])
+                self.assertEqual(got["metrics"]["selfHealL1FpsRatio"], 0.974)
+
+    def test_r10_a_malformed_measured_session_id_is_no_session_never_its_numeric_prefix(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r10 (sol r9 B1 class sweep, AttrCudaArtifacts.psm1:3492): the self-heal reader's measured-
+        session pick reads the whole id token. Before r10 `id=1x` (or 1.5, 1/old) selected session 1 by its numeric prefix and its summary's
+        presented_fps passed every ratio; now a malformed id is no measured session, so the ratios are unusable (fail closed)."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        for token in ("1x", "1.5", "1/old", "", "١"):
+            log = (prefix + f"playback_smoke.measured_session id={token}\n"
+                   + prefix + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n"
+                   + prefix + "playback_smoke.measured_session id=2\n"
+                   + prefix + "playback_smoke.summary session=2 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+            with self.subTest(token=token):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertFalse(got["pass"], got)
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), [f"selfHealL{n}FpsRatio" for n in (1, 2, 3)], got["failures"])
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
+
+    def test_r11_an_incomplete_first_measured_session_marker_is_no_session_never_a_later_one(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r11 (r10 adversary A1 sibling, AttrCudaArtifacts.psm1:3493): a first record that starts
+        `playback_smoke.measured_session` but is not read whole as `id=<n>` (no `id=`, no `=`, a doubled space, another key) is no measured session.
+        On 205a5b6c the reader required the literal `id=`, skipped it and took the later id=2 marker (the adversary's run: presented_fps=99 read)."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        for shape in ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session  id=1",
+                      "playback_smoke.measured_session ID=1", "playback_smoke.measured_session session=1", "playback_smoke.measured_session id:1",
+                      # r11 pass 11 A3 sibling: the word id named twice
+                      "playback_smoke.measured_session id=1 id=2", 'playback_smoke.measured_session id=1 "id=2"'):
+            log = (prefix + shape + "\n"
+                   + prefix + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n"
+                   + prefix + "playback_smoke.measured_session id=2\n"
+                   + prefix + "playback_smoke.summary session=2 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+            with self.subTest(shape=shape):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertFalse(got["pass"], got)
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), [f"selfHealL{n}FpsRatio" for n in (1, 2, 3)], got["failures"])
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
+
+    def test_r12_the_first_marker_is_counted_in_its_body_with_ascii_name_characters_to_its_newline(self) -> None:
+        """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r12 (r12 adversary on 7e66a3af, AttrCudaArtifacts.psm1:3499-3501). B1: a valid Qt location
+        `(C:/id/MainWindow.cpp:1)` is not the record's, so its `id` is not a second mention (7e66a3af had no session). B3: a Kelvin sign before `id=2` is
+        not a name character, so it is a second mention. B4: a lone CR inside the marker record no longer ends it, so `id=2` after it is seen."""
+        prefix = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+        summary = prefix + "playback_smoke.summary session=1 reason=visual-capture presented_frames=599 presented_fps=23.201\n"
+        for loc in (" (C:/id/MainWindow.cpp:1)", " (C:/session/MainWindow.cpp:1)", " (C:/id/x%1.cpp:%2)"):
+            with self.subTest(location=loc):
+                got = self.evaluate(["good"], measured_log=prefix + "playback_smoke.measured_session id=1" + loc + "\n" + summary)["good"]
+                self.assertTrue(got["pass"] and got["supplementaryPass"], got["failures"])
+                self.assertEqual(got["metrics"]["selfHealL1FpsRatio"], 0.974)
+        for shape in ("playback_smoke.measured_session id=1 \u212aid=2", "playback_smoke.measured_session id=1 \u212asession=2",
+                      "playback_smoke.measured_session id=1\rid=2", "playback_smoke.measured_session id=1 (id=2)",
+                      "playback_smoke.measured_session id=1 (C:/a/MainWindow.cpp)"):
+            log = (prefix + shape + "\n" + summary + prefix + "playback_smoke.measured_session id=2\n"
+                   + prefix + "playback_smoke.summary session=2 reason=visual-capture presented_frames=599 presented_fps=23.201\n")
+            with self.subTest(shape=shape):
+                got = self.evaluate(["good"], measured_log=log)["good"]
+                self.assertFalse(got["pass"], got)
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
 
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
@@ -15223,6 +15523,1838 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
         self.assertEqual((v["counts"]["deferred"], v["counts"]["drained"], v["counts"]["maxDepth"], v["counts"]["outstandingAtStop"]), (412, 412, 2, 0))
 
 
+class DueWakeDeliveryLegSpecTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the isolation arm of the due-wake delivery A/B is a named generatorArgs key; each isolation
+    twin differs from the cell it twins only in legId and that key, so no receipted cell changes a byte."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_each_isolation_twin_differs_from_its_cell_only_in_the_leg_id_and_the_key(self) -> None:
+        self.assertEqual(len(WAKE_POST_LEGS), 2, "two isolation twins: m16-1457 fullscreen s1 and s2, the card's gate cells")
+        for rel, cell_rel in WAKE_POST_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("dueWakeDeliveryPost", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-wake-post")
+                self.assertIs(twin["generatorArgs"].pop("dueWakeDeliveryPost"), True)
+                self.assertEqual(dict(twin, legId=cell["legId"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+                self.assertTrue(cell["generatorArgs"].get("forceLookAssist"), "the gate cells run with Look Assist on")
+
+    def test_no_other_leg_sets_the_key(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name in WAKE_POST_LEGS:
+                continue
+            with self.subTest(leg=path.name):
+                self.assertNotIn("dueWakeDeliveryPost", json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {})
+
+    def test_the_key_must_be_a_json_boolean(self) -> None:
+        twin = json.loads((DV / next(iter(WAKE_POST_LEGS))).read_text(encoding="utf-8"))
+        for bad in (0, 1, "1", "post", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], dueWakeDeliveryPost=bad)), self.schema)
+
+    def test_the_runner_and_the_validator_both_gate_on_the_apps_own_readback(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($dueWakeDeliveryVerdict.blocks) { $invalid.Add("DUE_WAKE_DELIVERY_NOT_HONOURED:', module)
+        self.assertIn("Get-DvDueWakeDeliveryEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("DUE_WAKE_DELIVERY_NOT_HONOURED", runner)
+        # the app emits the fields the gate reads on its playback_due_wake line: delivery_kind = the wake's SELECTED delivery (never rewritten by a
+        # fallback arm: r1 adversary pass 2 A1), delivery= = what the Play's arms used (pass 1 A2)
+        mw = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertIn('reentrant_deferred=%5 delivery_kind=%6" )', mw)
+        self.assertIn('.arg( m_playbackDueWake ? QString::fromLatin1( m_playbackDueWake->deliveryKindName() ) : QStringLiteral( "none" ) )', mw)
+        self.assertIn('"late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )', mw)
+        self.assertIn('return QStringLiteral( "playback_due_wake armed=%1 ', mw)
+        # r2 G1 / G3 (CoS PR 811): the line also carries the runner-sleep interruptions by another sent message and the failed waits, BEFORE
+        # delivery_kind; neither name contains " delivery=" or " delivery_kind=", so the gate's two field reads stay exactly one each
+        self.assertIn('+ QStringLiteral( " runner_sleep_woken=%1" )', mw)
+        self.assertIn('+ QStringLiteral( " runner_sleep_woken_other=%1 runner_sleep_wait_failed=%2" )', mw)
+        self.assertLess(mw.index('" runner_sleep_woken_other=%1 runner_sleep_wait_failed=%2"'), mw.index('reentrant_deferred=%5 delivery_kind=%6" )'))
+        # A3: the line follows the measured session's pace_summary, which is what binds it to the measured Play
+        pace = mw.index('"playback_smoke.pace_summary session=%1 first_present_ms=%2 paced_elapsed_ms=%3 "')
+        line = mw.index("qInfo().noquote() << playbackDueWakeSummaryLine();")
+        self.assertLess(pace, line)
+        self.assertNotIn("qInfo", mw[mw.index("\n", pace):line].replace("qInfo().noquote() << playbackDueWakeSummaryLine();", ""))
+        self.assertEqual(mw.count("playbackDueWakeSummaryLine();"), 1)
+
+
+@requires_windows_pwsh
+class DueWakeDeliveryEvidenceTests(unittest.TestCase):
+    """Get-DvDueWakeDeliveryEvidence, pure: a leg that asks for the posted due wake counts only when the MEASURED session's own playback_due_wake line
+    (the one after its playback_smoke.pace_summary) reports delivery_kind=post with delivery=native-msg; a leg that does not ask blocks only on a kind the
+    variable selects (post, notifier). A value in the launcher's env block is a request, not engagement, and a binary before r1 emits no delivery_kind, so
+    an isolation leg on it is NOT_HONOURED rather than an unproven PASS."""
+
+    POST = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+    PREFIX = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @staticmethod
+    def wake(kind: str | None, mech: str = "native-msg") -> str:
+        line = ("playback_due_wake armed=1200 fired=1198 advanced=1190 rearmed=8 busy_deferred=3 late_p50_ms=0.4 late_p95_ms=1.9 hires=1 disabled=0"
+                f" delivery={mech} unpresented_deferred=0 post_refused=0 post_failed=0 post_rescued=0 post_counts_settled=1"
+                " stranded=0 runner_sleep_woken=12 runner_sleep_woken_other=2 runner_sleep_wait_failed=0"
+                " reentrant_deferred=0")
+        return line if kind is None else line + f" delivery_kind={kind} post_to_awake_min_ms=0.1"
+
+    @staticmethod
+    def play(session: int, *wake_lines: str) -> list:
+        return [f"playback_smoke.summary session={session} reason=reached presented_frames=600",
+                f"playback_smoke.pace_summary session={session} first_present_ms=40.000 paced_elapsed_ms=25000.000", *wake_lines,
+                f"playback_smoke.startup_catchup session={session} frames=0"]
+
+    @classmethod
+    def log(cls, *wake_lines: str, before: list | None = None) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", *(before or []), *cls.play(3, *wake_lines)]) + "\n"
+
+    def test_honoured_only_when_the_measured_play_reports_the_post(self) -> None:
+        for name, log in (("bare", self.log(self.wake("post"))), ("crash-forensics prefix", self.log(self.PREFIX + self.wake("post"))),
+                          ("an earlier Play agrees", self.log(self.wake("post"), before=self.play(2, self.wake("post")))),
+                          ("an earlier Play sent (not the measured one)", self.log(self.wake("post"), before=self.play(2, self.wake("send"))))):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, "post", "HONOURED", False), v)
+
+    def test_a_binary_or_play_that_reports_no_delivery_kind_is_not_engaged(self) -> None:
+        for name, log in (("pre-r1 line", self.log(self.wake(None))), ("no line", self.log()), ("no log", ""),
+                          # r1 adversary pass 1 A3, verbatim shape: another Play's post never stands in for the measured Play's line
+                          ("measured line lacks the field, an earlier Play has it", self.log(self.wake(None), before=self.play(1, self.wake("post")))),
+                          ("measured Play has no line, an earlier Play has it", self.log(before=self.play(1, self.wake("post")))),
+                          ("the line is not after the measured pace_summary", "\n".join(["playback_smoke.measured_session id=3", self.wake("post"),
+                                                                                        *self.play(3)]) + "\n"),
+                          # r2 adversary pass 6 A1, verbatim: the wake text inside ANOTHER record's line is not a wake record
+                          ("the wake is text inside another record", "\n".join([
+                              "playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600",
+                              "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000",
+                              "playback_smoke.startup_catchup session=3 frames=0 playback_due_wake armed=1200 delivery=native-msg delivery_kind=post"]) + "\n"),
+                          # r2 adversary pass 6 A2, verbatim: the measured Play has no wake record; session 4's must not stand in for it
+                          ("another session's wake after the measured pace_summary", "\n".join([
+                              "playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600",
+                              "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000",
+                              "playback_smoke.startup_catchup session=3 frames=0", "playback_smoke.start session=4",
+                              "playback_smoke.summary session=4 reason=reached presented_frames=600",
+                              "playback_due_wake armed=1200 delivery=native-msg delivery_kind=post"]) + "\n")):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        # r2 adversary pass 6 A1, second input: a genuine post record followed by a contradictory wake record without armed= is unreadable
+        v = self.verdict(self.POST, self.log(self.wake("post"), "playback_due_wake delivery=native-msg delivery_kind=send"))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("unreadable", v["reason"])
+
+    def test_any_other_report_blocks_never_passes(self) -> None:
+        for name, log in (("sent", self.log(self.wake("send"))),
+                          ("notifier", self.log(self.wake("notifier", "notifier"))),
+                          ("wake off", self.log(self.wake("none", "none"))),
+                          ("a fallback Play", self.log(self.wake("mixed", "native-msg+qtimer"))),
+                          ("not a kind", self.log(self.wake("Post"))),
+                          ("empty", self.log(self.wake(""))),
+                          ("two fields", self.log(self.wake("post") + " delivery_kind=post")),
+                          # r1 adversary pass 1 A2, verbatim shape: post claimed on a Play whose arms went by a QTimer
+                          ("post on a qtimer Play", self.log(self.wake("post", "qtimer"))),
+                          ("post on a mixed Play", self.log(self.wake("post", "native-msg+qtimer"))),
+                          ("post with no delivery= field", self.log(self.wake("post").replace(" delivery=native-msg", ""))),
+                          ("two measured pace_summaries", "\n".join(["playback_smoke.measured_session id=3", *self.play(3, self.wake("post")),
+                                                                     *self.play(3, self.wake("post"))]) + "\n"),
+                          # r1 adversary pass 2 A4, verbatim shape: a second line in the measured window is seen, and contradicts
+                          ("two lines after the measured pace_summary", self.log(self.wake("post"), self.wake("send"))),
+                          ("two agreeing lines after the measured pace_summary", self.log(self.wake("post"), self.wake("post")))):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_field_outside_a_playback_due_wake_line_is_not_read(self) -> None:
+        v = self.verdict(self.POST, self.log(self.wake(None), before=["playback_smoke.start session=3 delivery_kind=post"]))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_a_leg_that_does_not_ask_blocks_only_on_a_kind_the_variable_selects(self) -> None:
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}, {"generatorArgs": {"dueWakeDeliveryPost": False}}, {"generatorArgs": {"dueWakeDeliveryPost": "true"}}):
+            for name, log in (("control binary, no delivery_kind", self.log(self.wake(None))), ("sent", self.log(self.wake("send"))), ("no log", ""),
+                              ("no native wake built", self.log(self.wake("qtimer", "qtimer"))),
+                              ("an earlier Play posted (not the measured one)", self.log(self.wake("send"), before=self.play(2, self.wake("post"))))):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+            # r1 adversary pass 1 A1, verbatim shape: an unpaced leg has no wake at all. r4 (pass 9 A1): ONLY an unpaced leg; a paced leg whose
+            # measured Play armed no wake measured no sent wake (test_r4_a1_* below)
+            for name, log in (("no wake (unpaced)", self.log(self.NO_WAKE)), ("sent, no arm this Play", self.log(self.wake("send", "none")))):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    if spec.get("generatorArgs", {}).get("unpaced") is True:
+                        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+                    else:
+                        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                        self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+            # r1 adversary pass 2 A1, verbatim shape: an inherited selection shows whatever the arms used, a fallback arm included
+            for name, kind, mech in (("inherited post", "post", "native-msg"), ("inherited notifier", "notifier", "notifier"),
+                                     ("inherited post, one arm fell back", "post", "native-msg+qtimer"), ("inherited post, other order", "post", "qtimer+native-msg"),
+                                     ("inherited notifier, one arm fell back", "notifier", "notifier+qtimer"), ("inherited post, every arm fell back", "post", "qtimer")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, self.log(self.wake(kind, mech)))
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_DELIVERY_INHERITED", v["reason"])
+            for name, mech in (("send on a qtimer Play", "qtimer"), ("send on a mixed Play", "native-msg+qtimer")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, self.log(self.wake("send", mech)))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_DELIVERY_FELL_BACK", v["reason"])
+            for name, log in (("unreadable", self.log(self.wake("p0st"))), ("a kind the app never prints", self.log(self.wake("mixed", "native-msg+qtimer"))),
+                              # r1 adversary pass 3 A1, verbatim shape: a selection that contradicts the arms is unreadable
+                              ("none on a native Play", self.log(self.wake("none", "native-msg"))),
+                              ("qtimer on a native Play", self.log(self.wake("qtimer", "native-msg"))),
+                              ("notifier on a native Play", self.log(self.wake("notifier", "native-msg"))),
+                              ("send on a notifier Play", self.log(self.wake("send", "notifier")))):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_wake_record_without_one_plain_armed_count_is_unreadable(self) -> None:
+        # r3 (r2 adversary pass 7 advisory A1, verbatim shape): the app's record starts `playback_due_wake armed=<n>`; without that count it proves nothing
+        bare = "playback_due_wake delivery=native-msg delivery_kind=post"
+        for name, line in (("no armed=", bare), ("empty armed=", bare.replace("playback_due_wake ", "playback_due_wake armed= ")),
+                           ("negative armed=", bare.replace("playback_due_wake ", "playback_due_wake armed=-1 ")),
+                           ("NaN armed=", bare.replace("playback_due_wake ", "playback_due_wake armed=NaN ")),
+                           ("armed= not first", "playback_due_wake fired=3 armed=3 delivery=native-msg delivery_kind=post"),
+                           ("two armed=", self.wake("post") + " armed=4")):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("unreadable", v["reason"])
+        v = self.verdict(self.POST, self.log(self.PREFIX + self.wake("post").replace("armed=1200", "armed=0")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    NO_WAKE = ("playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=0"
+               " delivery=none unpresented_deferred=0 delivery_kind=none")
+
+    def test_r4_a1_an_inherited_kill_switch_or_a_paced_play_without_a_wake_blocks(self) -> None:
+        # r4 (r4 adversary pass 9 A1, verbatim input): the committed paced head cell, unchanged, run with an inherited MLVAPP_PLAYBACK_DUE_WAKE=0. The
+        # app reports disabled=1 delivery=none delivery_kind=none; the gate read that as an unpaced leg's own "no wake" and let the run count.
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=1 delivery=none unpresented_deferred=0"
+                    " delivery_kind=none\n")
+        v = self.verdict(cell, verbatim)
+        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_DISABLED_INHERITED", v["reason"])
+        disabled = self.NO_WAKE.replace("disabled=0", "disabled=1")
+        # the kill switch also changes how an unpaced Play advances (playbackPendingAdvanceMayBeTaken), and a control binary's line (no
+        # delivery_kind) carries it too: whatever the leg, an inherited disabled=1 is not the arm the leg names
+        for name, spec, log in (("unpaced leg", {"generatorArgs": {"unpaced": True}}, self.log(disabled)),
+                                ("control binary line", cell, self.log(self.wake(None).replace("disabled=0", "disabled=1"))),
+                                ("crash-forensics prefix", cell, self.log(self.PREFIX + disabled))):
+            with self.subTest(case=name):
+                v = self.verdict(spec, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_DISABLED_INHERITED", v["reason"])
+        # the wake on (disabled=0) but no arm in the measured Play: a paced leg measured no sent wake; only a boolean unpaced=true excuses it
+        for name, spec in (("committed paced cell", cell), ("no generatorArgs", {}), ("unpaced as a string", {"generatorArgs": {"unpaced": "true"}}),
+                           ("unpaced false", {"generatorArgs": {"unpaced": False}})):
+            for case, log in (("no wake object", self.log(self.NO_WAKE)), ("sent, no arm", self.log(self.wake("send", "none"))),
+                              ("qtimer, no arm", self.log(self.wake("qtimer", "none")))):
+                with self.subTest(spec=name, case=case):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # a disabled= the app never prints is unreadable, never read as on
+        for name, line in (("disabled=yes", self.wake("send").replace("disabled=0", "disabled=yes")),
+                           ("two disabled=", self.wake("send") + " disabled=1"), ("empty disabled=", self.wake("send").replace("disabled=0", "disabled="))):
+            with self.subTest(case=name):
+                v = self.verdict(cell, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # unchanged: the paced head arm's sent wake counts, and a posted leg with the kill switch is still not engaged
+        v = self.verdict(cell, self.log(self.wake("send")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        v = self.verdict(self.POST, self.log(disabled))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_r5_g8_an_unreadable_kill_switch_on_a_control_binary_line_blocks(self) -> None:
+        # r5 (Grok G8 = r4 adversary pass 10 advisory A2): disabled= is read whether or not the line carries a delivery_kind, so an unreadable value on a
+        # control binary's line (no delivery_kind: no kind is a mention) blocks a leg that does not ask; before r5 it fell through to NOT_REQUESTED
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        control = self.wake(None)
+        self.assertNotIn("delivery_kind=", control)
+        for spec_name, spec in (("committed paced cell", cell), ("no generatorArgs", {}), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, log in (("disabled=yes", self.log(control.replace("disabled=0", "disabled=yes"))),
+                              ("empty disabled=", self.log(control.replace("disabled=0", "disabled="))),
+                              ("two disabled=, both 0", self.log(control + " disabled=0")),
+                              ("two disabled=, 0 then 1", self.log(control + " disabled=1")),
+                              ("crash-forensics prefix, disabled=yes", self.log(self.PREFIX + control.replace("disabled=0", "disabled=yes"))),
+                              # the repeat is counted across the measured window's wake records, not per line
+                              ("two control lines in the measured window", self.log(control, control))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_DISABLED_UNREADABLE", v["reason"])
+            # unchanged: a control line with a readable disabled=0 (or none at all) leaves a leg that does not ask unchanged
+            for name, log in (("disabled=0", self.log(control)), ("no disabled=", self.log(control.replace(" disabled=0", "")))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # r5 adversary pass 11 advisory A2, its input verbatim: a posted leg whose measured line claims the posted wake with the kill switch on is not
+        # engaged (the switch contradicts the claim); before r5 it was HONOURED
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=1200 disabled=1 delivery=native-msg delivery_kind=post\n")
+        for name, log in (("verbatim", verbatim), ("full line", self.log(self.wake("post").replace("disabled=0", "disabled=1")))):
+            with self.subTest(case=name, leg="posted"):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (True, "NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        v = self.verdict(self.POST, self.log(self.wake("post")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    def test_r5_p12_a1_a_paced_control_line_with_no_arm_blocks(self) -> None:
+        # r5 adversary pass 12 A1, its input verbatim: the committed paced cell, a control-binary line (no delivery_kind) saying delivery=none. The
+        # r4 paced no-arm rule ran only on a line with a delivery_kind, so this was NOT_REQUESTED blocks=false
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 late_p50_ms=na late_p95_ms=na hires=0 disabled=0 delivery=none"
+                    " unpresented_deferred=0\n")
+        control = self.wake(None)
+        for spec_name, spec in (("committed paced cell", cell), ("no generatorArgs", {}), ("unpaced as a string", {"generatorArgs": {"unpaced": "true"}})):
+            for name, log in (("verbatim", verbatim), ("control line, no arm", self.log(control.replace("delivery=native-msg", "delivery=none"))),
+                              ("crash-forensics prefix", self.log(self.PREFIX + control.replace("delivery=native-msg", "delivery=none")))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # a control line's delivery= that is repeated or outside the app's grammar is unreadable, whatever the leg
+        for spec_name, spec in (("committed paced cell", cell), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, line in (("two delivery=", control + " delivery=none"), ("delivery=bogus", control.replace("delivery=native-msg", "delivery=bogus")),
+                               ("empty delivery=", control.replace("delivery=native-msg", "delivery="))):
+                with self.subTest(spec=spec_name, case=name):
+                    v = self.verdict(spec, self.log(line))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("unreadable", v["reason"])
+        # unchanged: an unpaced leg's control line with no arm, a control line that armed (native-msg, a fallback join), and an older line with no
+        # delivery= at all leave a leg that does not ask unchanged
+        for spec_name, spec, line in (("unpaced leg, no arm", {"generatorArgs": {"unpaced": True}}, control.replace("delivery=native-msg", "delivery=none")),
+                                      ("paced, native-msg", cell, control), ("paced, fallback join", cell, control.replace("delivery=native-msg", "delivery=native-msg+qtimer")),
+                                      ("paced, no delivery=", cell, control.replace(" delivery=native-msg", ""))):
+            with self.subTest(case=spec_name):
+                v = self.verdict(spec, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # a posted leg on a control line is still not engaged (no delivery_kind)
+        v = self.verdict(self.POST, verbatim)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_r6_p13_a1_a_second_control_record_is_unreadable_not_a_pass(self) -> None:
+        # r5 adversary pass 13 A1, its input verbatim: the committed paced cell, a control line saying delivery=none, then a bare playback_due_wake
+        # record. The control delivery= rule read only a window with exactly one candidate, so the second record removed the refusal and the verdict
+        # was NOT_REQUESTED blocks=false; more than one wake record in the measured window is unreadable, whatever the leg
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n"
+                    "playback_due_wake armed=0 fired=0 advanced=0 rearmed=0 busy_deferred=0 hires=0 disabled=0 delivery=none unpresented_deferred=0\n"
+                    "playback_due_wake\n")
+        control = self.wake(None).replace(" disabled=0", "")
+        for spec_name, spec, log in (("committed paced cell, verbatim", cell, verbatim),
+                                     ("committed paced cell, two armed control lines", cell, self.log(control, control)),
+                                     ("unpaced leg, two armed control lines", {"generatorArgs": {"unpaced": True}}, self.log(control, control))):
+            with self.subTest(case=spec_name):
+                v = self.verdict(spec, log)
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                self.assertIn("unreadable", v["reason"])
+        # unchanged: one armed control line leaves the paced cell unchanged (a posted leg on a control window: test_r5_p12 above)
+        v = self.verdict(cell, self.log(control))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r7_g9_a_control_line_after_two_measured_pace_windows_is_unreadable(self) -> None:
+        # r7 (Grok G9 on #811, its input verbatim): the committed paced cell, the measured session's pace_summary twice, then one control line
+        # (no delivery_kind) saying delivery=native-msg. The delivery_kind path treats $paces -ne 1 as unreadable; the control path counted only
+        # the candidates, so a line from a later pace window stood in for the measured Play and the verdict was NOT_REQUESTED blocks=false
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        pace = "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000"
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                    f"{pace}\n{pace}\n"
+                    "playback_due_wake armed=1200 fired=1198 advanced=1190 rearmed=8 busy_deferred=3 hires=1 disabled=0 delivery=native-msg"
+                    " unpresented_deferred=0\n")
+        self.assertNotIn("delivery_kind=", verbatim)
+        v = self.verdict(cell, verbatim)
+        self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+        self.assertIn("unreadable", v["reason"])
+
+    def test_r7_g9_parity_the_control_and_delivery_kind_paths_agree_on_the_pace_window(self) -> None:
+        # r7 (Grok G9, escaped-defect rule): the same log run through BOTH paths -- a control line (no delivery_kind) and the same line with
+        # delivery_kind=send -- reaches the same blocks verdict. Two measured pace windows are unreadable on both paths whatever the layout; one
+        # window with one armed line passes on both (so the parity is not met by blocking everything). Passes 12 A1 and 13 A1 were this split.
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        pace = "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000"
+        head = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=play-stop presented_frames=600"]
+        layouts = {
+            "Grok G9: pace, pace, line": lambda w: head + [pace, pace, w],
+            "pace, line, pace": lambda w: head + [pace, w, pace],
+            "a line in each window": lambda w: head + [pace, w, pace, w],
+            "crash-forensics prefix, pace, pace, line": lambda w: head + [pace, pace, self.PREFIX + w],
+        }
+        single = lambda w: head + [pace, w]
+        for spec_name, spec in (("committed paced cell", cell), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, layout in [*layouts.items(), ("one window (baseline)", single)]:
+                control = self.verdict(spec, "\n".join(layout(self.wake(None))) + "\n")
+                kinded = self.verdict(spec, "\n".join(layout(self.wake("send"))) + "\n")
+                with self.subTest(spec=spec_name, case=name):
+                    self.assertEqual(control["blocks"], kinded["blocks"], (control, kinded))
+                    if name in layouts:
+                        self.assertEqual((control["verdict"], control["blocks"]), ("NOT_HONOURED", True), control)
+                        self.assertIn("unreadable", control["reason"])
+                    else:
+                        self.assertEqual((control["verdict"], control["blocks"]), ("NOT_REQUESTED", False), control)
+
+    def test_r7_p1_a1_a2_a_malformed_armed_or_delivery_blocks_on_both_paths(self) -> None:
+        # r7 adversary pass 1 A1 / A2, their inputs verbatim, each run as a control line (no delivery_kind) and with a delivery_kind appended. A1: the
+        # control path skipped the `playback_due_wake armed=<n>` check the delivery_kind path makes, so armed=-1 was NOT_REQUESTED blocks=false. A2:
+        # the delivery= grammar admitted none+qtimer (the app prints "none" only alone and never repeats a mechanism in the join)
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        head = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\n"
+                "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000\n")
+        a1 = "playback_due_wake armed=-1 disabled=0 delivery=native-msg"
+        a2 = "playback_due_wake armed=0 fired=0 advanced=0 disabled=0 delivery=none+qtimer"
+        line = "playback_due_wake armed=1200 fired=1198 disabled=0 delivery=native-msg"
+        cases = [("A1 verbatim", a1, "send"), ("A2 verbatim", a2, "qtimer"),
+                 ("no armed=", line.replace("armed=1200 ", ""), "send"), ("empty armed=", line.replace("armed=1200", "armed="), "send"),
+                 ("NaN armed=", line.replace("armed=1200", "armed=NaN"), "send"), ("armed= not first", line.replace("armed=1200 fired=1198", "fired=1198 armed=1200"), "send"),
+                 ("two armed=", line + " armed=4", "send"),
+                 ("qtimer+none", line.replace("native-msg", "qtimer+none"), "qtimer"), ("native-msg+none", line.replace("native-msg", "native-msg+none"), "send"),
+                 ("a repeated mechanism", line.replace("native-msg", "native-msg+native-msg"), "send"),
+                 ("a mechanism repeated after another", line.replace("native-msg", "qtimer+native-msg+qtimer"), "send")]
+        for spec_name, spec in (("committed paced cell", cell), ("unpaced leg", {"generatorArgs": {"unpaced": True}})):
+            for name, wake, kind in cases:
+                if spec_name == "unpaced leg" and not name.endswith("verbatim"):
+                    continue
+                for path, log in (("control line", head + wake + "\n"), (f"delivery_kind={kind}", head + wake + f" delivery_kind={kind}\n")):
+                    with self.subTest(spec=spec_name, case=name, path=path):
+                        v = self.verdict(spec, log)
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                        self.assertIn("unreadable", v["reason"])
+        # unchanged: a readable control line (one plain armed=, distinct mechanisms in either order) leaves the paced cell unchanged
+        for name, wake in (("native-msg", line), ("a fallback join", line.replace("native-msg", "native-msg+qtimer")),
+                           ("the other order", line.replace("native-msg", "qtimer+native-msg")), ("armed=0", line.replace("armed=1200", "armed=0"))):
+            with self.subTest(case=name, path="control line, readable"):
+                v = self.verdict(cell, head + wake + "\n")
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r5_a3_a_measured_session_record_of_another_session_closes_the_window(self) -> None:
+        # r5 (r4 adversary pass 10 advisory A3, verbatim shape): `playback_smoke.measured_session id=4` names its session with id=, not session=, and
+        # it is a playback_smoke record of ANOTHER session, so it closes the measured wake window like any other; a wake record after it is not the
+        # measured Play's
+        def closed(marker: str, wake: str) -> str:
+            return "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600",
+                              "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000", marker, wake]) + "\n"
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        for name, marker in (("bare", "playback_smoke.measured_session id=4"), ("crash-forensics prefix", self.PREFIX + "playback_smoke.measured_session id=4"),
+                             ("trailing fields", "playback_smoke.measured_session id=4 reason=second")):
+            with self.subTest(case=name, leg="posted"):
+                v = self.verdict(self.POST, closed(marker, self.wake("post")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+            with self.subTest(case=name, leg="head, another session's kill switch"):
+                v = self.verdict(cell, closed(marker, self.wake("send").replace("disabled=0", "disabled=1")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # the measured session's own measured_session record keeps the window open (sessions compare as written, like session= above)
+        for name, marker in (("same session", "playback_smoke.measured_session id=3"), ("same session, prefix", self.PREFIX + "playback_smoke.measured_session id=3")):
+            with self.subTest(case=name):
+                v = self.verdict(self.POST, closed(marker, self.wake("post")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        # a measured_session id= inside another record's text is not a record and closes nothing
+        v = self.verdict(self.POST, closed("playback_smoke.startup_catchup session=3 frames=0 note=playback_smoke.measured_session id=4", self.wake("post")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    def test_r8_b1_a_paced_record_with_no_delivered_wake_is_not_engaged(self) -> None:
+        # r8 B1 (sol r7 + key3 opus r7 on e9a55f21, their input verbatim): the reader never read fired=, so a posted leg whose measured Play delivered
+        # zero wakes was HONOURED and the sent head arm with fired=0 was unblocked. fired= counts the wakes the GUI thread took
+        # (MainWindow::onPlaybackDueWake); armed= counts arms, and an arm replaced or cancelled before delivery (stranded=) delivers nothing
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        verbatim = head + "playback_due_wake armed=1200 fired=0 disabled=0 delivery=native-msg runner_sleep_woken=0 delivery_kind=post\n"
+        zero = {
+            "verbatim": verbatim,
+            "armed=0 fired=0 (opus row 3)": head + "playback_due_wake armed=0 fired=0 disabled=0 delivery=native-msg runner_sleep_woken=0 delivery_kind=post\n",
+            "full line, stranded=1200": self.log(self.wake("post").replace("fired=1198", "fired=0").replace("stranded=0", "stranded=1200")
+                                                 .replace("runner_sleep_woken=12", "runner_sleep_woken=0")),
+            "crash-forensics prefix": self.log(self.PREFIX + self.wake("post").replace("fired=1198", "fired=0")),
+            "fired=00": self.log(self.wake("post").replace("fired=1198", "fired=00")),
+        }
+        # (a) the posted isolation arm: not honoured
+        for name, log in zero.items():
+            with self.subTest(leg="posted", case=name):
+                v = self.verdict(self.POST, log)
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (True, "NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # (b) the same records as the sent head arm (and a paced QTimer-built wake that never fired): blocked
+        for name, log in zero.items():
+            for kind, mech in (("send", "native-msg"), ("qtimer", "qtimer")):
+                with self.subTest(leg="head", case=name, kind=kind):
+                    v = self.verdict(cell, log.replace("delivery_kind=post", f"delivery_kind={kind}").replace("delivery=native-msg", f"delivery={mech}"))
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # fail closed: a fired= that is missing, empty, signed, not a whole count or repeated cannot show a delivered wake, on either arm
+        for name, line in (("no fired=", self.wake("post").replace(" fired=1198", "")), ("empty fired=", self.wake("post").replace("fired=1198", "fired=")),
+                           ("negative fired=", self.wake("post").replace("fired=1198", "fired=-1")), ("NaN fired=", self.wake("post").replace("fired=1198", "fired=NaN")),
+                           ("fractional fired=", self.wake("post").replace("fired=1198", "fired=1.5")),
+                           ("two fired=", self.wake("post") + " fired=0"), ("two fired=, both delivered", self.wake("post") + " fired=1198")):
+            for leg, spec, kind in (("posted", self.POST, "post"), ("head", cell, "send")):
+                with self.subTest(leg=leg, case=name):
+                    v = self.verdict(spec, self.log(line.replace("delivery_kind=post", f"delivery_kind={kind}")))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # (c) one delivered wake is enough, and a sibling field named *fired= is never read as fired=
+        for name, line in (("fired=1", self.wake("post").replace("fired=1198", "fired=1")), ("fired=1198", self.wake("post")),
+                           ("prev_probe_fired=0 elsewhere", self.wake("post") + " prev_probe_fired=0")):
+            with self.subTest(leg="posted", case=name):
+                v = self.verdict(self.POST, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+            with self.subTest(leg="head", case=name):
+                v = self.verdict(cell, self.log(line.replace("delivery_kind=post", "delivery_kind=send")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # (d) EXEMPT, by design: a control binary's line (no delivery_kind) is the C arm, whose binary is not under test here; the paced no-arm rule
+        # (delivery=none) is its only engagement check, so fired=0 or no fired= there leaves a leg that does not ask unchanged. An unpaced leg never
+        # arms, so its fired=0 is its own (and a posted leg on a control line stays ROUTE_NOT_ENGAGED)
+        control = self.wake(None)
+        for name, spec, line in (("control line, fired=0", cell, control.replace("fired=1198", "fired=0")),
+                                 ("control line, no fired=", cell, control.replace(" fired=1198", "")),
+                                 ("unpaced leg, no wake", {"generatorArgs": {"unpaced": True}}, self.NO_WAKE),
+                                 ("unpaced leg, control line with no arm", {"generatorArgs": {"unpaced": True}}, control.replace("fired=1198", "fired=0").replace("delivery=native-msg", "delivery=none"))):
+            with self.subTest(exempt=name):
+                v = self.verdict(spec, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        v = self.verdict(self.POST, self.log(control.replace("fired=1198", "fired=0")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        # (e) DECIDED: advanced=0 with fired>0 IS engaged. The evidence bar is a DELIVERED wake; advanced= counts only the wakes that moved the frame
+        # themselves, and a delivered wake on a busy renderer hands its advance to the frameReady path (busy_deferred=), so advanced=0 is a measured
+        # outcome of the arm, not a route that did not run
+        for name, line in (("advanced=0, fired=5", self.wake("post").replace("fired=1198", "fired=5").replace("advanced=1190", "advanced=0")),
+                           ("advanced=0, every wake busy-deferred", self.wake("post").replace("advanced=1190", "advanced=0").replace("busy_deferred=3", "busy_deferred=1198"))):
+            with self.subTest(leg="posted", case=name):
+                v = self.verdict(self.POST, self.log(line))
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+            with self.subTest(leg="head", case=name):
+                v = self.verdict(cell, self.log(line.replace("delivery_kind=post", "delivery_kind=send")))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r8_p3_a1_a_lost_post_the_poll_tick_rescued_is_no_route_delivery(self) -> None:
+        # r8 adversary pass 3 A1, its input verbatim: fired= also counts a lost post (the queue refused the native message past its retry budget)
+        # that the poll tick delivered (PlaybackDueWake::deliverLostPost, counted in post_rescued=). With fired=1 post_rescued=1 the arm's own
+        # route delivered nothing, yet the posted arm was HONOURED and the sent head counterpart unblocked
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertIs(post["generatorArgs"]["dueWakeDeliveryPost"], True)
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop presented_frames=1200\n"
+                    "playback_smoke.pace_summary session=3 first_present_ms=40 paced_elapsed_ms=25000\n"
+                    "playback_due_wake armed=1200 fired=1 advanced=0 rearmed=0 busy_deferred=1 hires=1 disabled=0 delivery=native-msg unpresented_deferred=0"
+                    " post_stamped=0 post_unsplit=0 post_refused=100 post_failed=1 post_rescued=1 post_counts_settled=1 stranded=1199 runner_sleep_woken=0"
+                    " delivery_kind=post\n")
+        rescued = lambda fired, resc: self.wake("post").replace("fired=1198", f"fired={fired}").replace("post_rescued=0", f"post_rescued={resc}")
+        cases = {"verbatim": verbatim, "every delivery rescued": self.log(rescued(5, 5)), "more rescued than fired": self.log(rescued(1, 3)),
+                 "no post_rescued=": self.log(self.wake("post").replace(" post_rescued=0", "")),
+                 "empty post_rescued=": self.log(self.wake("post").replace("post_rescued=0", "post_rescued=")),
+                 "negative post_rescued=": self.log(self.wake("post").replace("post_rescued=0", "post_rescued=-1")),
+                 "two post_rescued=": self.log(self.wake("post") + " post_rescued=0")}
+        for name, log in cases.items():
+            for leg, spec, kind in (("posted", post, "post"), ("head", cell, "send")):
+                with self.subTest(leg=leg, case=name):
+                    v = self.verdict(spec, log.replace("delivery_kind=post", f"delivery_kind={kind}"))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+        # one wake the route itself delivered beside a rescued one still counts
+        for leg, spec, kind, want in (("posted", post, "post", "HONOURED"), ("head", cell, "send", "NOT_REQUESTED")):
+            with self.subTest(leg=leg, case="fired=2 post_rescued=1"):
+                v = self.verdict(spec, self.log(rescued(2, 1).replace("delivery_kind=post", f"delivery_kind={kind}")))
+                self.assertEqual((v["verdict"], v["blocks"]), (want, False), v)
+
+    def test_r8_p4_a1_a_delivery_kind_line_without_one_disabled_is_unreadable(self) -> None:
+        # r8 adversary pass 4 A1, its input verbatim: a line WITH a delivery_kind (an r1+ binary, whose playbackDueWakeSummaryLine always prints
+        # disabled=) but no disabled= at all left the kill switch unshown, yet the posted arm was HONOURED and the sent head counterpart unblocked
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        verbatim = ("playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+                    "playback_due_wake armed=1 fired=1 post_rescued=0 delivery=native-msg delivery_kind=post\n")
+        # r9 (G10): the verbatim input predates the settled flag; it is added for the one case below that must count
+        verbatim = verbatim.replace(" post_rescued=0", " post_rescued=0 post_counts_settled=1")
+        for name, log in (("verbatim", verbatim), ("full line, no disabled=", self.log(self.wake("post").replace(" disabled=0", ""))),
+                          ("crash-forensics prefix", self.log(self.PREFIX + self.wake("post").replace(" disabled=0", "")))):
+            for leg, spec, kind in (("posted, verbatim spec", self.POST, "post"), ("posted, committed spec", post, "post"), ("head", cell, "send"),
+                                    ("unpaced leg", {"generatorArgs": {"unpaced": True}}, "send")):
+                with self.subTest(leg=leg, case=name):
+                    v = self.verdict(spec, log.replace("delivery_kind=post", f"delivery_kind={kind}"))
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("unreadable", v["reason"])
+        # unchanged: the same line with its disabled=0 counts; a control binary's line (no delivery_kind) with no disabled= stays exempt (r5 G8 test)
+        v = self.verdict(post, verbatim.replace(" delivery=", " disabled=0 delivery="))
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        v = self.verdict(cell, self.log(self.wake(None).replace(" disabled=0", "")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r8_b1_one_delivered_wake_predicate_serves_both_arms_and_every_consumer(self) -> None:
+        # r8 B1 class sweep: one predicate decides "a wake was delivered" for the requested and the head path, and both consumers (the runner's
+        # gate and Test-DvReceiptValid's re-derivation) reach it only through Get-DvDueWakeDeliveryEvidence
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        body = module.split("function Get-DvDueWakeDeliveryEvidence {", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("function Get-DvDueWakeDelivered {", module)
+        self.assertEqual(body.count("Get-DvDueWakeDelivered -Line"), 1, "one read of the measured line, shared by both paths")
+        self.assertEqual(body.count("-cne 'delivered'"), 2, "the requested path and the head path both gate on it")
+        self.assertNotIn("(?:^|\\s)fired=", body, "fired= is parsed only inside Get-DvDueWakeDelivered")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $ev.logText", module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertNotIn("Get-DvDueWakeDelivered -Line", runner, "the runner's gate reads delivery only through Get-DvDueWakeDeliveryEvidence")
+
+    def test_r9_g10_post_rescued_counts_only_when_its_line_says_the_post_counts_settled(self) -> None:
+        # r9 (Grok CoS G10 on 316e3744, its input verbatim): the predicate subtracts post_rescued= but never read the same line's
+        # post_counts_settled=, so `fired=1 post_rescued=0 post_counts_settled=0 delivery_kind=post` was HONOURED. The app prints
+        # post_counts_settled=0 when the wait thread did not answer in time at the line or at the Play's baseline (MainWindow.cpp, the
+        # postCountsSettled comment), which leaves the post differences open to another Play's late count: a rescue that would cancel the one wake
+        # may not be counted yet. Anything but exactly one post_counts_settled=1 is unreadable, on the posted and on the paced head path
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertIs(post["generatorArgs"]["dueWakeDeliveryPost"], True)
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        grok = head + "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=0 delivery_kind=post\n"
+        full = self.wake("post")
+        bad = {
+            "Grok G10 verbatim": grok,
+            "full line, post_counts_settled=0": self.log(full.replace("post_counts_settled=1", "post_counts_settled=0")),
+            "crash-forensics prefix, post_counts_settled=0": self.log(self.PREFIX + full.replace("post_counts_settled=1", "post_counts_settled=0")),
+            "no post_counts_settled=": self.log(full.replace(" post_counts_settled=1", "")),
+            "empty post_counts_settled=": self.log(full.replace("post_counts_settled=1", "post_counts_settled=")),
+            "post_counts_settled=01": self.log(full.replace("post_counts_settled=1", "post_counts_settled=01")),
+            "post_counts_settled=2": self.log(full.replace("post_counts_settled=1", "post_counts_settled=2")),
+            "post_counts_settled=yes": self.log(full.replace("post_counts_settled=1", "post_counts_settled=yes")),
+            "two post_counts_settled=1": self.log(full + " post_counts_settled=1"),
+            "post_counts_settled=1 then =0": self.log(full + " post_counts_settled=0"),
+            "post_counts_settled=0 then =1": self.log(full.replace("post_counts_settled=1", "post_counts_settled=0") + " post_counts_settled=1"),
+            "only a sibling x_post_counts_settled=1": self.log(full.replace(" post_counts_settled=1", " x_post_counts_settled=1")),
+        }
+        cases, labels = [], []
+        for name, log in bad.items():
+            for leg, spec, kind, mech in (("posted, committed spec", post, "post", "native-msg"), ("posted, verbatim spec", self.POST, "post", "native-msg"),
+                                          ("head (send)", cell, "send", "native-msg"), ("head (qtimer)", cell, "qtimer", "qtimer")):
+                cases.append((spec, log.replace("delivery_kind=post", f"delivery_kind={kind}").replace("delivery=native-msg", f"delivery={mech}")))
+                labels.append((leg, name))
+        # unchanged: exactly one post_counts_settled=1 counts (Grok's line settled, and the full line), and a sibling field beside the real one is not read
+        good = {"Grok G10 line, settled": grok.replace("post_counts_settled=0", "post_counts_settled=1"), "full line": self.log(full),
+                "sibling x_post_counts_settled=0 beside the real one": self.log(full + " x_post_counts_settled=0")}
+        for name, log in good.items():
+            for leg, spec, kind, want in (("posted", post, "post", "HONOURED"), ("head (send)", cell, "send", "NOT_REQUESTED")):
+                cases.append((spec, log.replace("delivery_kind=post", f"delivery_kind={kind}")))
+                labels.append((leg, "good: " + name))
+        # EXEMPT as r8 left it: a control binary's line (no delivery_kind) never reads post_rescued=, so its settled flag changes nothing there
+        cases.append((cell, self.log(self.wake(None).replace("post_counts_settled=1", "post_counts_settled=0"))))
+        labels.append(("head", "exempt: control line, post_counts_settled=0"))
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases))
+        for (leg, name), v in zip(labels, out):
+            with self.subTest(leg=leg, case=name):
+                if name.startswith("good: "):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED" if leg == "posted" else "NOT_REQUESTED", False), v)
+                elif name.startswith("exempt: "):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+                else:
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_NOT_ENGAGED", v["reason"])
+                    self.assertIn("post_counts_settled=1", v["reason"])
+
+    def test_r9_g10_class_sweep_post_rescued_is_read_only_beside_its_settled_flag(self) -> None:
+        # r9 (G10 class sweep): post_rescued= and post_counts_settled= are parsed in one place (Get-DvDueWakeDelivered), which requires the flag;
+        # no other reader in the module or the runner reads either field
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        pred = module.split("function Get-DvDueWakeDelivered {", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("post_counts_settled", pred.split("#>", 1)[1], "the predicate's code reads the settled flag")
+        rest = module.replace(pred, "")
+        for field in ("post_rescued", "post_counts_settled"):
+            code = "\n".join(l for l in rest.splitlines() if not l.lstrip().startswith("#"))
+            self.assertNotRegex(code, r"\(\?:\^\|\\s\)" + field + "=", f"{field}= is parsed only inside Get-DvDueWakeDelivered")
+            self.assertNotIn(field + "=", (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8"))
+
+    def test_r15_a2_an_equivalent_decimal_session_spelling_is_the_same_session(self) -> None:
+        # r15 (r14 adversary A2 on a27f3d88, its input verbatim): `measured_session id=03` inside session 3's window is session 3, never another
+        # session, so it does not close the window and the inherited posted delivery after it blocks the head leg (before r15 the ids were compared as
+        # strings: NOT_REQUESTED blocks=false). Siblings: the start / summary / conform / gpu_summary / pace_summary `session=03` boundaries, and a
+        # measured session selected as 03 whose pace_summary says 3. Session ids are compared as canonical decimals; another session still closes.
+        cell = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("unpaced", cell["generatorArgs"])
+        wake = ("playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        a2 = ("playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\nplayback_smoke.measured_session id=03\n" + wake +
+              "\nplayback_smoke.summary session=3 presented_frames=600")
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        cases, labels = [(cell, a2)], ["A2 verbatim"]
+        for rec in ("start", "summary", "conform", "gpu_summary", "pace_summary"):
+            cases.append((cell, head + f"playback_smoke.{rec} session=03 presented_frames=600\n" + wake + "\n"))
+            labels.append(f"{rec} session=03")
+        for sel, pace in (("03", "3"), ("3", "003"), ("00", "0")):
+            cases.append((cell, f"playback_smoke.measured_session id={sel}\nplayback_smoke.pace_summary session={pace}\n" + wake + "\n"))
+            labels.append(f"selected {sel}, pace {pace}")
+        # unchanged: a boundary of ANOTHER session (04, 30) still closes the window, so a later Play's line is never the measured one
+        for other in ("id=04", "id=30"):
+            cases.append((cell, head + f"playback_smoke.measured_session {other}\n" + wake + "\n"))
+            labels.append(f"other: measured_session {other}")
+        cases.append((cell, head + "playback_smoke.start session=30\n" + wake + "\n"))
+        labels.append("other: start session=30")
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases))
+        for name, v in zip(labels, out):
+            with self.subTest(case=name):
+                if name.startswith("other: "):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+                else:
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    if not name.startswith("pace_summary"):
+                        self.assertIn("DUE_WAKE_DELIVERY_INHERITED", v["reason"])
+
+    def test_r15_pass_a1_a_canonical_record_of_another_session_is_still_skipped_by_the_lever_readers(self) -> None:
+        # r15 adversary A1 on d991b0af, its input verbatim: a second ConvertTo-DvSessionKey definition replaced the module's -Sign/-Digits one, so
+        # Test-DvRecordMentionsSession keyed every session as $null and session 4's canonical prep_route was a duplicate mention of session 3.
+        # The recon_release sibling reads through the same predicate. One definition only, and both readers skip another session's record.
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(module.count("function ConvertTo-DvSessionKey {"), 1)
+        prep = ("playback_smoke.measured_session id=3\nplayback_smoke.prep_route session=3 prep_conflated_move_active=1\n"
+                "playback_smoke.prep_route session=4 prep_conflated_move_active=1\nplayback_smoke.summary session=3")
+        rr = " deferred=10 sync=0 drained=10 max_depth=2 outstanding_at_stop=0"
+        recon = ("playback_smoke.measured_session id=3\nplayback_smoke.recon_release session=3 deferred_enabled=0" + rr +
+                 "\nplayback_smoke.recon_release session=4 deferred_enabled=0" + rr + "\nplayback_smoke.summary session=3")
+        proc, out = run_pwsh_evidence_cases("Get-DvPrepConflatedMoveEvidence", [({"generatorArgs": {"prepConflatedMove": True}}, prep)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["verdict"], out[0]["blocks"]), ("HONOURED", False), out[0])
+        proc, out = run_pwsh_evidence_cases("Get-DvReconReleaseDeferredEvidence", [({"generatorArgs": {"disableReconReleaseDeferred": True}}, recon)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["verdict"], out[0]["blocks"]), ("HONOURED", False), out[0])
+
+    def test_r15_pass_a2_a_quoted_second_settings_store_declaration_refuses_isolation(self) -> None:
+        # r15 adversary A2 on d991b0af, its input verbatim: the whitespace-bounded matcher skipped the quoted `"settings_store=venue"` and accepted the
+        # run_scoped one. A mention is the word settings_store bounded by any non-name character; exactly one, and it is the whole run_scoped token.
+        base = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated {}\nplayback_smoke.summary session=3\n"
+        for name, store, want in (("A2 verbatim", 'settings_store=run_scoped "settings_store=venue"', False),
+                                  ("quoted first", '"settings_store=venue" settings_store=run_scoped', False),
+                                  ("bracketed", "[settings_store=venue] settings_store=run_scoped", False),
+                                  ("bare key mention", "settings_store=run_scoped settings_store", False),
+                                  ("one whole token", "site=x settings_store=run_scoped", True),
+                                  ("a longer key is another name", "settings_store=run_scoped x_settings_store=venue", True)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated | ConvertTo-Json -Compress",
+                                          DVE_LOG=base.format(store))
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertIs(out, want)
+
+    def test_r16_pass_a1_a_parenthesised_second_settings_store_declaration_refuses_isolation(self) -> None:
+        # r16 adversary A1 on c24d5ee5, its input verbatim: ` (settings_store=venue)` is no Qt location (no `:<digits>)` end), so Get-DvLogRecordBody keeps
+        # the text before it and appends the LOCATION_UNREADABLE sentinel; the isolation reader then saw ONE declaration (run_scoped) and accepted the
+        # record. A record that ends in the sentinel lost its tail, so it is never read whole: not isolated. A real location suffix still strips.
+        base = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated {}\nplayback_smoke.summary session=3\n"
+        for name, store, want in (("A1 verbatim", "settings_store=run_scoped (settings_store=venue)", False),
+                                  ("unreadable tail without a store word", "settings_store=run_scoped (not-a-location)", False),
+                                  ("a real Qt location", "settings_store=run_scoped (C:/settings_store/MainWindow.cpp:1)", True),
+                                  ("a real Qt location, no path store word", "settings_store=run_scoped (C:/src/MainWindow.cpp:1)", True),
+                                  ("no suffix", "settings_store=run_scoped", True)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated | ConvertTo-Json -Compress",
+                                          DVE_LOG=base.format(store))
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertIs(out, want)
+
+    def test_r16_pass_a1_the_python_mirror_reads_the_record_body_like_the_module(self) -> None:
+        # r16 adversary advisory A2: derive_block (the independent mirror) counted settings_store on the raw located line, so a real Qt location
+        # holding the word refused isolation where the module accepts. It reads the body: a real location strips, an unreadable tail refuses.
+        for store, want in (("settings_store=run_scoped (C:/settings_store/MainWindow.cpp:1)", True),
+                            ("settings_store=run_scoped (C:/a%1.cpp:%2)", True),   # r16 pass 2 advisory A2: the old writer's `:%2)` ending
+                            ("settings_store=run_scoped (settings_store=venue)", False),
+                            # r18 adversary advisory A3: a line number in Arabic-Indic digits is no `:<digits>)` (the module's ASCII 0-9 walk)
+                            ("settings_store=run_scoped (C:/a.cpp:\u0661)", False),
+                            ("settings_store=run_scoped (C:/a.cpp:1\u0661)", False),
+                            ("settings_store=run_scoped", True)):
+            with self.subTest(store=store):
+                log = ("playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated " + store +
+                       "\nplayback_smoke.summary session=3 source_advanced=1200 required_source_frames=600 native_fps=59.94 pace_fps=59.94 "
+                       "fps_override=0 wrapped=0 wrap_count=0\n")
+                with tempfile.TemporaryDirectory() as td:
+                    ev = Path(td)
+                    (ev / "logs").mkdir()
+                    (ev / "logs" / "smoke-run.log").write_bytes(log.encode("utf-8"))
+                    (ev / "result.json").write_text("{}", encoding="utf-8")
+                    (ev / "summary.json").write_text("{}", encoding="utf-8")
+                    self.assertIs(EvidenceFactory.derive_block(ev)["settingsIsolated"], want)
+
+
+@requires_windows_pwsh
+class QuotedValueIsNeverALocationTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r21 (bench HFR-NATIVE-M16-1457-VENUE-EVIDENCE-MINI3-1 r3 FINDING, PR 811 comment 6929981460):
+    the app writes ` (` inside its own double-quoted values (session_reason="preview scale 1 (full resolution)" on the in-window record
+    playback_smoke.gpu_dualiso_recon_scale_summary). On f4a952e3 Get-DvLogRecordBody read that span as an unparsable Qt location, the body became
+    `... (LOCATION_UNREADABLE)`, and the r12 B2 boundary rule refused every cuda s1 leg as DUE_WAKE_SESSION_BOUNDARY_UNREADABLE although its measured
+    line shows a delivered wake. By class, a ` (` inside a `<key>="<text>"` value is never a location; an unreadable tail OUTSIDE one still refuses."""
+
+    # Copied verbatim from the bench r3 run log of leg 01 (H f4a952e3, m16-1457-native-fullscreen-s1, cuda), receipt
+    # a4b1e24c-ce2a-4c8a-8633-4c0c43916f50: legs\evidence\a4b1e24c-ce2a-4c8a-8633-4c0c43916f50\logs\smoke-run.log lines 87, 2679, 2680 and 2697.
+    BENCH_MEASURED = "[2026-11-16T20:02:10.427Z] [INFO] [0x26928] playback_smoke.measured_session id=1"
+    BENCH_PACE = ("[2026-11-16T20:02:35.636Z] [INFO] [0x26928] playback_smoke.pace_summary session=1 first_present_ms=213.544 paced_elapsed_ms=25002.415 "
+                  "timeline_fps_after_first_present=59.874 presented_fps_after_first_present=59.914 pace_fps=59.940 first_present_catchup_frames=1")
+    BENCH_WAKE = (
+        "[2026-11-16T20:02:35.637Z] [INFO] [0x26928] playback_due_wake armed=1499 fired=1482 advanced=1436 rearmed=0 busy_deferred=46 late_p50_ms=0.389 "
+        "late_p95_ms=0.713 hires=1 disabled=0 delivery=native-msg unpresented_deferred=0 post_stamped=1482 due_to_post_p50_lo_ms=0.311 "
+        "due_to_post_p50_hi_ms=0.335 due_to_post_p95_lo_ms=0.539 due_to_post_p95_hi_ms=0.574 post_to_receive_p50_lo_ms=0.045 post_to_receive_p50_hi_ms=0.070 "
+        "post_to_receive_p95_lo_ms=0.138 post_to_receive_p95_hi_ms=0.183 post_call_p50_ms=0.016 post_call_p95_ms=0.058 samples_binned=0 post_unsplit=0 "
+        "post_refused=0 post_failed=0 post_rescued=0 post_counts_settled=1 late_exact=1 late_underflow=0 late_overflow=0 late_range_ms=-20.000:80.000 "
+        "due_to_post_lo_exact=1 due_to_post_lo_underflow=0 due_to_post_lo_overflow=0 due_to_post_lo_range_ms=-20.000:80.000 due_to_post_hi_exact=1 "
+        "due_to_post_hi_underflow=0 due_to_post_hi_overflow=0 due_to_post_hi_range_ms=-20.000:80.000 post_to_receive_lo_exact=1 post_to_receive_lo_underflow=0 "
+        "post_to_receive_lo_overflow=0 post_to_receive_lo_range_ms=-20.000:80.000 post_to_receive_hi_exact=1 post_to_receive_hi_underflow=0 "
+        "post_to_receive_hi_overflow=0 post_to_receive_hi_range_ms=-20.000:80.000 post_call_exact=1 post_call_underflow=0 post_call_overflow=0 "
+        "post_call_range_ms=-20.000:80.000 stranded=13 stranded_asleep=0 stranded_runner_sleep=0 stranded_awake=10 stranded_unknown=3 post_asleep=1400 "
+        "post_runner_sleep=0 post_awake=82 post_state_unknown=0 runner_sleep_woken=0 runner_sleep_woken_other=0 runner_sleep_wait_failed=0 "
+        "post_to_awake_p50_ms=0.020 post_to_awake_p95_ms=0.062 awake_to_receive_p50_ms=0.021 awake_to_receive_p95_ms=0.074 reentrant_deferred=0 "
+        "delivery_kind=send post_to_awake_exact=1 post_to_awake_underflow=0 post_to_awake_overflow=0 post_to_awake_range_ms=-20.000:80.000 "
+        "awake_to_receive_exact=1 awake_to_receive_underflow=0 awake_to_receive_overflow=0 awake_to_receive_range_ms=-20.000:80.000")
+    BENCH_SCALE = ("[2026-11-16T20:02:35.643Z] [INFO] [0x26928] playback_smoke.gpu_dualiso_recon_scale_summary session=1 reduced_recon_frames=0 "
+                   "full_recon_frames=0 recon_scale_last=0 session_scale=1 session_reason=\"preview scale 1 (full resolution)\" fallback_reason_last=\"\" "
+                   "clip_dims_busy_refusals=0 retained_outstanding=2")
+
+    def log(self, scale_line: str) -> str:
+        return "\n".join([self.BENCH_MEASURED, self.BENCH_PACE, self.BENCH_WAKE, scale_line]) + "\n"
+
+    def bodies(self, lines: list[str]) -> list:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "lines.json"
+            path.write_text(json.dumps(lines), encoding="utf-8")
+            proc, out = run_pwsh_json("$ls = Get-Content -Raw -LiteralPath $env:DVE_LINES -Encoding utf8 | ConvertFrom-Json\n"
+                                      "@($ls | ForEach-Object { Get-DvLogRecordBody -Line ([string]$_) }) | ConvertTo-Json -Compress -AsArray", DVE_LINES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def test_the_bench_s1_record_keeps_its_body_and_the_head_leg_is_not_refused(self) -> None:
+        located = self.BENCH_SCALE + " (C:/build/platform/qt/MainWindow.cpp:32062)"
+        self.assertEqual(self.bodies([self.BENCH_SCALE, located]), [self.BENCH_SCALE, self.BENCH_SCALE])
+        # the bench leg (paced head arm, no generatorArgs): the measured line's sent wake was delivered (fired 1482, post_rescued 0, settled 1)
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [({}, self.log(self.BENCH_SCALE)), ({}, self.log(located)),
+                                                                               ({"generatorArgs": {"dueWakeDeliveryPost": True}}, self.log(self.BENCH_SCALE))])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual([(v["observed"], v["verdict"], v["blocks"]) for v in out[:2]], [("send", "NOT_REQUESTED", False)] * 2, out)
+        # the posted arm reading the same sent line is refused for its route, never for an unreadable boundary
+        self.assertEqual((out[2]["verdict"], out[2]["blocks"]), ("NOT_HONOURED", True), out[2])
+        self.assertIn("ROUTE_NOT_ENGAGED", out[2]["reason"])
+
+    def test_an_unreadable_tail_outside_a_quoted_value_still_refuses(self) -> None:
+        sentinel = " (LOCATION_UNREADABLE)"
+        cases = {
+            # a real unreadable location after the quoted value
+            "bad location": (self.BENCH_SCALE + " (C:/b x/MainWindow.cpp:%3)", self.BENCH_SCALE + sentinel),
+            # the r12 B2 shape: a session named in a parenthesised tail outside any quoted value
+            "session tail": (self.BENCH_SCALE + " (session=4)", self.BENCH_SCALE + sentinel),
+            # a closing quote followed by a non-space closes nothing, so the span is no quoted value and its ` (` is the location candidate
+            "glued quote": (self.BENCH_SCALE.replace('(full resolution)" ', '(full resolution)"x '), None),
+            # an opener with no closer is no quoted value
+            "unclosed": ('playback_smoke.gpu_summary session=1 reason="a (b', 'playback_smoke.gpu_summary session=1 reason="a' + sentinel),
+            # a ` (` before any quoted value is the location, whatever a quote in its path does later
+            "path quote": ('a=1 (C:/b k="x (y" id=9 x/M.cpp:%3)', "a=1" + sentinel),
+            "path quote readable": ('a=1 (C:/b k="x (y" id=9 x/M.cpp:12)', "a=1"),
+            # a key that does not start the line or follow a space opens no quoted value
+            "glued key": ('a=1 x,k="v (w)" b=2', "a=1 x,k=\"v" + sentinel),
+            # r21 adversary A1 on bdb3ec8c: a quoted span holding `=` is no quoted value, so its key=value text never reaches a reader
+            "quoted fields": ('playback_due_wake armed=1 note="diagnostic ( fired=1 delivery_kind=post end)"', 'playback_due_wake armed=1 note="diagnostic' + sentinel),
+        }
+        got = self.bodies([line for line, _ in cases.values()])
+        for (name, (line, want)), body in zip(cases.items(), got):
+            with self.subTest(case=name):
+                if want is None:
+                    self.assertTrue(body.endswith(sentinel), body)
+                else:
+                    self.assertEqual(body, want)
+        # and in the measured window, the boundary refusal stands for every leg
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [
+            (spec, self.log(line)) for spec in ({}, {"generatorArgs": {"dueWakeDeliveryPost": True}})
+            for line in (cases["bad location"][0], cases["session tail"][0], cases["glued quote"][0])])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for v in out:
+            self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+            self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"])
+
+    def test_r21_a1_quoted_text_never_supplies_the_delivery_evidence(self) -> None:
+        # r21 adversary A1 on bdb3ec8c, its input verbatim: on bdb3ec8c the posted arm read observed=post, HONOURED, from fields inside note="..."
+        log = ("playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\nplayback_due_wake armed=1 note=\"diagnostic ( fired=1 "
+               "post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post end)\"")
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [({"generatorArgs": {"dueWakeDeliveryPost": True}}, log), ({}, log)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["observed"], out[0]["verdict"], out[0]["blocks"]), (None, "NOT_HONOURED", True), out[0])
+        # the head arm reads no delivery_kind from the quote either (the control-line path; never observed=post)
+        self.assertIsNone(out[1]["observed"], out[1])
+
+    def test_r23_a1_a_wake_record_holding_a_quote_is_never_read(self) -> None:
+        # r23 adversary A1 on 9b78199f, its input verbatim: with no ` (` the r21 span rule never ran, so every proof field came from note="..." and the
+        # posted arm was HONOURED (observed=post, blocks=false). The app's playback_due_wake record is numeric and enum fields only
+        # (MainWindow::playbackDueWakeSummaryLine writes no quote), so a wake record that holds a `"` is unreadable on both paths, whatever the quote holds.
+        quoted = ("playback_due_wake armed=1 note=\"diagnostic fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "
+                  "delivery_kind=post end\"")
+        head = quoted.replace("delivery_kind=post", "delivery_kind=send")
+        window = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        posted = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        cases = [(posted, window + quoted),
+                 # the same with a real-shaped Qt location suffix (the body keeps the quote)
+                 (posted, window + quoted + " (C:/build/platform/qt/MainWindow.cpp:21141)"),
+                 # the head arm, its sent wake supplied by the quote
+                 ({}, window + head),
+                 ({}, window + head + " (C:/build/platform/qt/MainWindow.cpp:21141)"),
+                 # a real wake record followed by a quoted note: still unreadable (one shape, no quote)
+                 (posted, window + "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "
+                          "delivery_kind=post note=\"x\"")]
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for i, v in enumerate(out):
+            with self.subTest(case=i):
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+        # control: the same fields outside a quote are read (the rule refuses the quote, not the fields)
+        plain = window + ("playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [(posted, plain)])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["observed"], out[0]["verdict"], out[0]["blocks"]), ("post", "HONOURED", False), out[0])
+
+    def test_the_python_isolation_mirror_reads_a_quoted_parenthesis_like_the_module(self) -> None:
+        text = Path(__file__).read_text(encoding="utf-8")
+        self.assertIn("def loc(l: str) -> int:", text)
+        self.assertIn("l if loc(l) < 0 else l[:loc(l)]", text)
+
+
+@requires_windows_pwsh
+class QuotedValueSuppliesNoFieldTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r24 (opus key3 r23 blocker on b8f8e6e6 = sol r23 blocker = r23 adversary A1): text inside a quoted
+    span never supplies a `<key>=` field to any DualVenueRunner reader. On b8f8e6e6 the r21 location rule stepped over an earlier =-free quoted span holding
+    ` (`, found no location, and the whole line reached the last-wins summary reader, so a later quoted `source_advanced=600` replaced the measured 1 and
+    the clip-length verdict read valid (master 42597216 read 1, invalid). r24: every record body is quote-masked (ConvertTo-DvQuoteMaskedBody, applied by
+    Get-DvLogRecordBodies): a span opens at any `"` or `'` and closes at the next quote of the same kind (an unclosed span runs to the end of the body),
+    and an `=` inside a span is never a field separator for any reader."""
+
+    NONCE = "0123456789abcdef0123456789abcdef"
+    WINDOW = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+    SUMMARY = ("playback_smoke.summary session=3 source_advanced=1 required_source_frames=600 native_fps=60 pace_fps=60 fps_override=0 wrapped=0 "
+               "wrap_count=0 run_nonce=0123456789abcdef0123456789abcdef")
+    PLAIN_SUMMARY = "playback_smoke.summary session=3 reason=reached presented_frames=600"
+
+    def each(self, expr: str, logs: list[str]) -> list:
+        """`expr` evaluated once per log ($log), in one pwsh process; each result is wrapped as @{ v = ... } so a $null is kept in place."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "logs.json"
+            path.write_text(json.dumps(logs), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$ls = Get-Content -Raw -LiteralPath $env:DVE_LOGS -Encoding utf8 | ConvertFrom-Json\n"
+                "$sha = 'a' * 64\n"
+                "$summary = [pscustomobject]@{ clipId = 'M16-1457'; fixtureRehearsal = $false }\n"
+                "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+                "@(foreach ($log in @($ls)) { $log = [string]$log; [ordered]@{ v = $(" + expr + ") } }) | ConvertTo-Json -Compress -AsArray -Depth 5",
+                DVE_LOGS=str(path), DVE_NONCE=self.NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return [o["v"] for o in out]
+
+    PLAYBACK = ("$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $null -ResultJson $result -LogText $log -LogSha256 $sha "
+                "-ExpectedClipId 'M16-1457'; [ordered]@{ sourceAdvanced = $pb.sourceAdvanced; valid = $pb.valid }")
+
+    def test_r24_key3_repro_a_later_quoted_field_never_replaces_the_measured_count(self) -> None:
+        tail = ' note="harmless (text)" diagnostic="prefix source_advanced={n} end"'
+        cases = {
+            # opus key3 r23 repro, verbatim, and the sol r23 variants (601, 0)
+            "key3 repro": self.WINDOW + self.SUMMARY + tail.format(n=600),
+            "601": self.WINDOW + self.SUMMARY + tail.format(n=601),
+            "0": self.WINDOW + self.SUMMARY + tail.format(n=0),
+            # opus key3 INV-1 row 4: no ` (` at all, so the body reader never ran (master read 600 too)
+            "no parenthesis": self.WINDOW + self.SUMMARY + ' diagnostic="prefix source_advanced=600 end"',
+            "single quote": self.WINDOW + self.SUMMARY + " diagnostic='prefix source_advanced=600 end'",
+            "unclosed quote": self.WINDOW + self.SUMMARY + ' diagnostic="prefix source_advanced=600',
+            "with a location": self.WINDOW + self.SUMMARY + tail.format(n=600) + " (C:/build/platform/qt/MainWindow.cpp:31150)",
+        }
+        for name, v in zip(cases, self.each(self.PLAYBACK, list(cases.values()))):
+            with self.subTest(case=name):
+                # r24 iteration 2 (r24 adversary A1): a summary holding a quoted `<key>=` is refused whole, so no field is read (never the quoted value)
+                self.assertEqual((v["sourceAdvanced"], v["valid"]), (None, False), v)
+        # control: the measured count outside every quote is read, an =-free quoted ` (` still is no location, and a real 600 is valid
+        ok = self.each(self.PLAYBACK, [self.WINDOW + self.SUMMARY.replace("source_advanced=1 ", "source_advanced=600 ") + ' note="harmless (text)"'])
+        self.assertEqual((ok[0]["sourceAdvanced"], ok[0]["valid"]), (600, True), ok)
+
+    def test_r24_the_class_sweep_readers_take_no_field_from_a_quoted_span(self) -> None:
+        iso = "playback_smoke.measured_session id=3\ninteraction_trace event=automation.pacing_isolated {note}\n" + self.SUMMARY
+        look = ("playback_smoke.measured_session id=3\n[INFO] interaction_trace event=gui_smoke.visual_state {note}\n" + self.PLAIN_SUMMARY)
+        unpaced = "playback_smoke.measured_session id=3\n" + self.PLAIN_SUMMARY + "\nplayback_smoke.pace_unpaced session=3 {note}"
+        conform = "playback_smoke.measured_session id=3\n" + self.PLAIN_SUMMARY + "\nplayback_smoke.conform session=3 {note}"
+        rows = [
+            # $runScoped (Get-DvSmokeSummaryFields :1156): a quoted declaration is no settings_store field
+            ("(Get-DvSmokeSummaryFields -LogText $log).settingsIsolated",
+             [iso.format(note='note="prefix settings_store=run_scoped end"'), iso.format(note="note='prefix settings_store=run_scoped end'")],
+             False, iso.format(note="settings_store=run_scoped"), True),
+            # Get-DvLookAssistEvidence (:2396 :2403 :2413 :2414)
+            ("(Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $log).verdict",
+             [look.format(note='note="prefix look_assist_enabled=1 look_assist_flavor=cinematic end"'),
+              look.format(note="note='prefix look_assist_enabled=1 look_assist_flavor=cinematic end'")],
+             "NOT_HONOURED", look.format(note="look_assist_enabled=1 look_assist_flavor=cinematic"), "HONOURED"),
+            # Get-DvUnpacedEvidence (:1606) through Get-DvSmokeSessionLineRead (:2532)
+            ("(Get-DvUnpacedEvidence -Spec (@{ generatorArgs = @{ unpaced = $true } }) -LogText $log).verdict",
+             [unpaced.format(note='note="prefix active=1 drop_frame=0 end"'), unpaced.format(note="note='prefix active=1 drop_frame=0 end'")],
+             "NOT_HONOURED", unpaced.format(note="active=1 drop_frame=0"), "HONOURED"),
+            # the conform line Get-DvPlaybackEvidence parses at :1385 (Get-DvSmokeSummaryFields conformLine), read with :1385's own regex
+            ("@([regex]::Matches([string](Get-DvSmokeSummaryFields -LogText $log).conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\\S+)') | "
+             "Where-Object { $_.Groups['k'].Value -ceq 'conform_active' }).Count",
+             [conform.format(note='note="x conform_active=1 y"'), conform.format(note="note='x conform_active=1 y'")],
+             0, conform.format(note="conform_active=1"), 1),
+        ]
+        for expr, quoted, refused, control, read in rows:
+            with self.subTest(reader=expr[:60]):
+                got = self.each(expr, quoted + [control])
+                self.assertEqual(got, [refused] * len(quoted) + [read], got)
+
+    def test_r24_a_single_quoted_wake_payload_is_never_read(self) -> None:
+        # opus key3 r23 hardening = sol r23 INV-6 row 2, its input verbatim: :2153 refused only a double quote, so this was HONOURED (a span that
+        # ENDS at the value, `delivery_kind=post'`, is refused on b8f8e6e6 already, by the value `post'`; the word after it is what makes it read)
+        window = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        quoted = ("playback_due_wake armed=1 note='prefix fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 "
+                  "delivery_kind=post end'")
+        posted = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        cases = [(posted, window + quoted), ({}, window + quoted.replace("delivery_kind=post", "delivery_kind=send")),
+                 (posted, window + quoted + " (C:/build/platform/qt/MainWindow.cpp:21141)")]
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", cases)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for i, v in enumerate(out):
+            with self.subTest(case=i):
+                self.assertIsNone(v["observed"], v)
+                if i != 1:
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_r24_adversary_a1_a_stray_quote_never_hides_an_inherited_worker_override(self) -> None:
+        # r24 adversary A1 on c1b10b4f, its input verbatim: the env value of env_playback_scope_interval_ms is a lone `'` (log_line_field::fieldValue maps
+        # no quote), the mask hid the REAL env_omp_num_threads=1 after it, and the override read absent: HONOURED, blocks=false. A key with a masked `=` is
+        # unreadable, never absent, so the leg blocks on both paths, either quote
+        start = ("playback_smoke.measured_session id=3\nplayback_smoke.start session=3 worker_threads=8 env_force_threads=unset "
+                 "env_force_singlethread=unset env_playback_max_threads=8 env_disable_playback_thread_cap=unset env_playback_scope_interval_ms={q} "
+                 "env_omp_num_threads=1")
+        summary = ("([pscustomobject]@{ result = 'MEASUREMENT_CAPTURED'; playbackMaxThreadsRequested = 8; playbackMaxThreadsSmoke = 8; "
+                   "playbackWorkerThreadsRead = 8 })")
+        capped = ("$w = Get-DvWorkerThreadsEvidence -Spec (@{ generatorArgs = @{ playbackMaxThreads = 8 } }) -LogText $log -Summary " + summary +
+                  "; [ordered]@{ verdict = $w.verdict; blocks = $w.blocks }")
+        # the uncapped control leg reads the same line (its spec names no worker variable: env_playback_max_threads=8 is an override there too)
+        uncapped = "$w = Get-DvWorkerThreadsEvidence -Spec (@{}) -LogText $log -Summary $null; [ordered]@{ verdict = $w.verdict; blocks = $w.blocks }"
+        logs = [start.format(q="'"), start.format(q='"'), start.format(q="'x") + "'"]
+        for expr in (capped, uncapped):
+            for i, v in enumerate(self.each(expr, logs)):
+                with self.subTest(expr=expr[:40], case=i):
+                    self.assertTrue(v["blocks"], v)
+                    self.assertNotEqual(v["verdict"], "HONOURED", v)
+        # control: the same capped line with an unquoted scope value is HONOURED only without the inherited OMP_NUM_THREADS
+        ok = self.each(capped, [start.format(q="unset").replace(" env_omp_num_threads=1", " env_omp_num_threads=unset")])
+        self.assertEqual((ok[0]["verdict"], ok[0]["blocks"]), ("HONOURED", False), ok)
+
+    def test_r24_pass2_a1_a_record_that_lost_its_tail_is_refused_whole(self) -> None:
+        # r24 adversary pass 2 A1 on d89dc086, its input verbatim: the =-free quoted ` (` is no location, the unquoted ` (` after the proof fields is an
+        # unreadable one, and the cut tail held fps_override=1; on d89dc086 the fields before the cut still read (valid=true). Refused whole now.
+        summary = ("playback_smoke.summary session=3 note=\"harmless (text)\" source_advanced=600 required_source_frames=600 native_fps=30 pace_fps=30 "
+                   "fps_override=0 wrapped=0 wrap_count=0 run_nonce=0123456789abcdef0123456789abcdef diagnostic='prefix ( fps_override=1")
+        got = self.each(self.PLAYBACK, [self.WINDOW + summary])
+        self.assertEqual((got[0]["sourceAdvanced"], got[0]["valid"]), (None, False), got)
+        # siblings: the start record the inherited-override reader reads, and the visual_state record the Look Assist reader reads
+        start = ("playback_smoke.measured_session id=3\nplayback_smoke.start session=3 worker_threads=8 env_force_threads=unset env_force_singlethread=unset "
+                 "env_playback_max_threads=8 env_disable_playback_thread_cap=unset x ( env_omp_num_threads=1")
+        capped = ("$w = Get-DvWorkerThreadsEvidence -Spec (@{ generatorArgs = @{ playbackMaxThreads = 8 } }) -LogText $log -Summary ([pscustomobject]@{ "
+                  "result = 'MEASUREMENT_CAPTURED'; playbackMaxThreadsRequested = 8; playbackMaxThreadsSmoke = 8; playbackWorkerThreadsRead = 8 }); $w.blocks")
+        self.assertEqual(self.each(capped, [start]), [True])
+        look = ("playback_smoke.measured_session id=3\n[INFO] interaction_trace event=gui_smoke.visual_state look_assist_enabled=1 "
+                "look_assist_flavor=cinematic x ( look_assist_enabled=0\n" + self.PLAIN_SUMMARY)
+        self.assertEqual(self.each("(Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $log).verdict", [look]),
+                         ["NOT_HONOURED"])
+
+    def test_r24_pass2_a2_a_proof_token_is_compared_ordinally(self) -> None:
+        # r24 adversary pass 2 A2 on d89dc086, its input verbatim (post_counts_settled=U+0661) plus the variants it names: a linguistic compare read
+        # each as ASCII 1 and the posted arm was HONOURED
+        window = "playback_smoke.measured_session id=3\nplayback_smoke.pace_summary session=3\n"
+        wake = "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled={s} disabled=0 delivery=native-msg delivery_kind=post"
+        posted = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        tokens = ["١", "۱", "1­", "1​", "1﻿"]
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [(posted, window + wake.format(s=t)) for t in tokens]
+                                            + [(posted, window + wake.format(s="1").replace("native-msg", "native-msg­"))])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for i, v in enumerate(out):
+            with self.subTest(case=i):
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        proc, out = run_pwsh_evidence_cases("Get-DvDueWakeDeliveryEvidence", [(posted, window + wake.format(s="1"))])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[0]["verdict"], out[0]["blocks"]), ("HONOURED", False), out[0])
+        look = ("playback_smoke.measured_session id=3\n[INFO] interaction_trace event=gui_smoke.visual_state look_assist_enabled={v} "
+                "look_assist_flavor=cinematic\n" + self.PLAIN_SUMMARY)
+        got = self.each("(Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $log).verdict",
+                        [look.format(v="١"), look.format(v="1​"), look.format(v="1")])
+        self.assertEqual(got, ["NOT_HONOURED", "NOT_HONOURED", "HONOURED"], got)
+
+    def test_r24_the_look_label_reader_takes_no_record_from_a_quoted_span(self) -> None:
+        # Get-DvLookLabelEvidence read raw lines unanchored, so a label record spelled inside another record's quoted span answered for the app
+        inner = 'gui_smoke.look_label shown="Look: A" expected="Look: A" surface=windowed_status_bar show_in_fullscreen=1 wait_ms=0'
+        got = self.each("(Get-DvLookLabelEvidence -LogText $log).source", [
+            "interaction_trace event=x note='" + inner + "'", "interaction_trace event=x note='" + inner, inner])
+        self.assertEqual(got, ["absent from the run log", "absent from the run log", "gui_smoke.look_label"], got)
+
+    def test_r25_a1_a_masked_look_assist_key_is_unreadable_never_absent(self) -> None:
+        # r25 adversary A1 on 217e0726, its input verbatim (first case): the mask hid the conflicting `look_assist_flavor=classic` after a stray quote, so
+        # the record read as naming one flavor and cinematic was proven (on 217e0726 flavor=cinematic, HONOURED). A flavor or enabled key with a masked
+        # `=` is a token of its own: no flavor is proven, in the answering record (:2435 :2436) or in an earlier visual_state record (:2415)
+        vs = "interaction_trace event=gui_smoke.visual_state "
+        spec = "@{ legType = 'speed'; generatorArgs = @{ forceLookAssist = $true; lookFlavor = 'cinematic' } }"
+        expr = "$e = Get-DvLookAssistEvidence -Spec (" + spec + ") -LogText $log; '{0}|{1}' -f $e.flavor, $e.verdict"
+        got = self.each(expr, [
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' look_assist_flavor=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic='look_assist_flavor=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' look_assist_enabled=0",
+            vs + "look_assist_enabled=0 look_assist_flavor=cinematic note=' look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic",
+            # r25 pass 2 A1 on a37b59c9, its input verbatim and the variants it names: the masked-key match was case-sensitive, so an upper- or mixed-case
+            # masked key was absent again (flavor=cinematic, HONOURED, lookAssistOn true). The key counts in any case, masked or plain, in the answering
+            # record and in an earlier one; only the lower-case token proves a flavor (an upper-case key alone proves none, as before r25)
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' LOOK_ASSIST_FLAVOR=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' LOOK_ASSIST_ENABLED=0",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic diagnostic=' look_ASSIST_flavor=classic",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic LOOK_ASSIST_FLAVOR=classic",
+            vs + "look_assist_enabled=0 look_assist_flavor=cinematic note=' Look_Assist_Flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic",
+            vs + "look_assist_enabled=1 LOOK_ASSIST_FLAVOR=cinematic",
+            # controls: a closed quoted span that names no look key, and a record with no quote, still prove cinematic
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic note='a b'",
+            vs + "look_assist_enabled=1 look_assist_flavor=cinematic"])
+        self.assertEqual(got, ["|HONOURED"] * 10 + ["cinematic|HONOURED", "cinematic|HONOURED"], got)
+
+    R26_VS = "interaction_trace event=gui_smoke.visual_state "
+    R26_SPEC = "@{ legType = 'speed'; generatorArgs = @{ forceLookAssist = $true; lookFlavor = 'cinematic' } }"
+    R26_EXPR = "$e = Get-DvLookAssistEvidence -Spec (" + R26_SPEC + ") -LogText $log; '{0}|{1}|{2}' -f $e.flavor, $e.verdict, $e.blocks"
+
+    def test_r26_b1_an_unreadable_earlier_visual_state_tail_keeps_the_flavor_ambiguous(self) -> None:
+        # sol r25 B1 on 620182b3, its input verbatim (and the two other flavors it names): the first record's conflicting tail is cut to
+        # LOCATION_UNREADABLE, so on 620182b3 its flavor vanished from the all-record set and cinematic was proven (cinematic|HONOURED|False). An earlier
+        # visual_state record that lost its tail may have named any flavor there, so it makes the flavor ambiguous, as an intact conflict does
+        vs = self.R26_VS
+        logs = [vs + 'look_assist_enabled=1 look_assist_flavor=cinematic diagnostic="harmless (text)" x (look_assist_flavor=' + other + "\n"
+                + vs + "look_assist_enabled=1 look_assist_flavor=cinematic" for other in ("classic", "film", "vision50d")]
+        # the same earlier record with no flavor key before the cut, and an old-writer tail that is not a readable location
+        logs.append(vs + "look_assist_enabled=1 x (look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        logs.append(vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b x/MainWindow.cpp:%3)\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        # controls: an intact earlier conflict (no flavor, as before r26) and an earlier record with a READABLE location (still proves cinematic)
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        located = (vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/build/platform/qt/MainWindow.cpp:10011)\n"
+                   + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        got = self.each(self.R26_EXPR, logs + [intact, located])
+        self.assertEqual(got, ["|HONOURED|False"] * 5 + ["|HONOURED|False", "cinematic|HONOURED|False"], got)
+
+    def test_r26_b1_the_app_s_unquoted_parenthesised_reject_reason_never_loses_the_flavor_silently(self) -> None:
+        # opus key3 r25 hardening DV-VISUAL-STATE-UNQUOTED-PAREN-VALUE-1: the app writes gpu_preview_processing_reject_reason=transform (upside down)
+        # enabled UNQUOTED (GpuPreviewProcessing.cpp:3608 -> MainWindow.cpp:10098) before look_assist_flavor, so the record is cut at Get-DvLocationOpenIndex.
+        # With a READABLE `:<line>)` tail no LOCATION_UNREADABLE sentinel is left, and on 620182b3 the flavor vanished silently: the last record read no
+        # flavor with no reason, and an earlier cut record's conflicting classic disappeared (cinematic proven). The look_assist_enabled field comes first
+        # and still reads; the flavor is a TYPED refusal (flavorReason FLAVOR_UNREADABLE), as the last record, an earlier one, and with a cut location too
+        vs = self.R26_VS
+        rec = vs + "look_assist_enabled=1 gpu_preview_processing_reject_reason=transform (upside down) enabled look_assist_flavor={f} (C:/b/MainWindow.cpp:10011)"
+        intact = "\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        logs = [rec.format(f="cinematic"), rec.format(f="classic") + intact, rec.format(f="cinematic") + intact,
+                vs + "look_assist_enabled=1 gpu_preview_processing_reject_reason=transform (upside down) enabled look_assist_flavor=classic" + intact]
+        got = self.each(self.R26_EXPR, logs)
+        self.assertEqual(got, ["|HONOURED|False"] * 4, got)
+        reasons = self.each("[string](Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log).flavorReason", logs)
+        for i, r in enumerate(reasons):
+            with self.subTest(case=i):
+                self.assertTrue(r.startswith("FLAVOR_UNREADABLE:"), reasons)
+        # control: the same record with the reject reason QUOTED is no cut, and proves its flavor with no reason
+        ok = self.each("$e = Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log; '{0}|{1}' -f $e.flavor, [string]$e.flavorReason",
+                       [vs + 'look_assist_enabled=1 gpu_preview_processing_reject_reason="transform (upside down) enabled" look_assist_flavor=cinematic'])
+        self.assertEqual(ok, ["cinematic|"], ok)
+
+    def test_r26_adversary_a1_a2_a_look_key_bounded_by_any_non_name_character_counts(self) -> None:
+        # r26 adversary pass on 2f131c49, its inputs verbatim. A1: the masked conflicting key after U+212A (Kelvin sign), which IgnoreCase folded into the
+        # ASCII lookbehind class, so the key read as absent (cinematic proven). A2: a plain conflicting key glued to punctuation (`,look_assist_flavor=classic`,
+        # `,look_assist_enabled=0`, and the same in an earlier record) was not counted by the whitespace-only start. Both: no flavor is proven
+        vs = self.R26_VS
+        head = vs + 'look_assist_enabled=1 note="harmless (text)" look_assist_flavor=cinematic '
+        logs = [head + "diagnostic=' Klook_assist_flavor=classic",
+                head + ",look_assist_flavor=classic",
+                head + ",look_assist_enabled=0",
+                vs + "look_assist_enabled=1 look_assist_flavor=cinematic ,look_assist_flavor=classic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic",
+                # the class: a plain key after the Kelvin sign or any other non-name character, masked keys after punctuation, the enabled key masked
+                head + "Klook_assist_flavor=classic", head + "élook_assist_flavor=classic", head + ";look_assist_flavor=classic",
+                head + "diagnostic=' ,look_assist_flavor=classic", head + "diagnostic=' Klook_assist_enabled=0"]
+        # controls: a DIFFERENT key that only ends in look_assist_flavor (an ASCII name character before it) is no flavor key, and the plain record proves
+        controls = [head + "xlook_assist_flavor=classic", head + "x_look_assist_enabled=0", vs + "look_assist_enabled=1 look_assist_flavor=cinematic"]
+        got = self.each(self.R26_EXPR, logs + controls)
+        self.assertEqual(got, ["|HONOURED|False"] * len(logs) + ["cinematic|HONOURED|False"] * len(controls), got)
+
+    def test_r26_adversary_pass2_a1_every_bounded_look_key_mention_is_a_token(self) -> None:
+        # r26 adversary pass 2 on eed44c40, its input verbatim (spec with forceLookAssist and no lookFlavor) and the variants it names: the counters
+        # needed `=` or the mask right after the key, so `look_assist_flavor =classic`, a bare key, `LOOK_ASSIST_FLAVOR:classic` and a quoted
+        # `look_assist_flavor classic` were absent (cinematic proven). Every bounded mention is a token; one without a plain `=` is unreadable
+        vs = self.R26_VS
+        base = vs + "look_assist_enabled=1 look_assist_flavor=cinematic "
+        logs = [base + "look_assist_flavor =classic", base + "look_assist_flavor", base + "LOOK_ASSIST_FLAVOR:classic",
+                base + "diagnostic='look_assist_flavor classic end'",
+                # the enabled key, and the same mention in an earlier record
+                base + "look_assist_enabled :0", vs + "look_assist_enabled=1 look_assist_flavor=cinematic look_assist_flavor\n" + base.rstrip()]
+        controls = [base + "look_assist_flavors=classic", base + "my_look_assist_flavor=classic", base.rstrip()]
+        expr = ("$e = Get-DvLookAssistEvidence -Spec (@{ legType = 'speed'; generatorArgs = @{ forceLookAssist = $true } }) -LogText $log; "
+                "'{0}|{1}|{2}' -f $e.flavor, $e.verdict, $e.blocks")
+        got = self.each(expr, logs + controls)
+        self.assertEqual(got, ["|HONOURED|False"] * len(logs) + ["cinematic|HONOURED|False"] * len(controls), got)
+
+    # sol r26 B1 on af784b7b: the app's UNQUOTED reject reason (GpuPreviewProcessing.cpp:3608) opens a ` (` that Get-DvLocationOpenIndex takes for the
+    # location; with a READABLE `:<line>)` ending no sentinel is left, and the cut discarded a conflicting flavor written after it
+    R27_REJECT = "gpu_preview_processing_reject_reason=transform (upside down) enabled "
+    R27_LOC = " (C:/b/MainWindow.cpp:10011)"
+
+    def test_r27_b1_a_flavor_discarded_with_a_readable_location_is_never_proven(self) -> None:
+        # sol r26 B1 on af784b7b, its input verbatim (classic) and the two other flavors it names, as an EARLIER record and as the answering LAST
+        # record: on af784b7b the cut kept the earlier cinematic token and proved it (cinematic|HONOURED|False). INV-1: text discarded from a record
+        # body that mentions look_assist_flavor never lets an earlier token prove the flavor; the reason is TYPED (FLAVOR_UNREADABLE), never silent
+        vs = self.R26_VS
+        cut = vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_flavor={o}" + self.R27_LOC
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        logs = []
+        for other in ("classic", "film", "vision50d"):
+            logs.append(cut.format(o=other) + "\n" + intact)
+            logs.append(intact + "\n" + cut.format(o=other))
+        # the class: any discarded mention (upper case, masked or bare key), a tail that only LOOKS like a location path, a path after a second ` (`
+        logs += [intact + "\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "LOOK_ASSIST_FLAVOR=classic" + self.R27_LOC,
+                 intact + "\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_flavor" + self.R27_LOC,
+                 vs + "look_assist_enabled=1 look_assist_flavor=cinematic (x) look_assist_flavor=classic:12)",
+                 vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b x) ,look_assist_flavor=classic/MainWindow.cpp:12)"]
+        got = self.each(self.R26_EXPR, logs)
+        self.assertEqual(got, ["|HONOURED|False"] * len(logs), got)
+        reasons = self.each("[string](Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log).flavorReason", logs)
+        for i, r in enumerate(reasons):
+            with self.subTest(case=i):
+                self.assertTrue(r.startswith("FLAVOR_UNREADABLE:"), reasons)
+        # controls (sol's own): the rejection text QUOTED exposes the conflict (FLAVOR_AMBIGUOUS); no earlier cinematic token is FLAVOR_UNREADABLE
+        quoted = vs + 'look_assist_enabled=1 look_assist_flavor=cinematic gpu_preview_processing_reject_reason="transform (upside down) enabled" look_assist_flavor=classic'
+        bare = vs + "look_assist_enabled=1 " + self.R27_REJECT + "look_assist_flavor=classic" + self.R27_LOC
+        ctl = self.each("$e = Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log; '{0}|{1}|{2}' -f $e.flavor, $e.verdict, ([string]$e.flavorReason).Split(':')[0]",
+                        [quoted, bare])
+        self.assertEqual(ctl, ["|HONOURED|FLAVOR_AMBIGUOUS", "|HONOURED|FLAVOR_UNREADABLE"], ctl)
+
+    def test_r27_b1_a_look_assist_enabled_discarded_from_the_answering_record_is_unreadable(self) -> None:
+        # sibling of sol r26 B1 (same class, the other key the reader proves): `look_assist_enabled=0` discarded after the unquoted ` (` read as on. The
+        # answering record is unreadable for Look Assist on (NOT_HONOURED, blocks), as the r24 LOCATION_UNREADABLE tail is; an earlier record never answers
+        vs = self.R26_VS
+        last = vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_enabled=0" + self.R27_LOC
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        got = self.each(self.R26_EXPR, [last, intact + "\n" + last,
+                                        vs + "look_assist_enabled=1 look_assist_flavor=cinematic (x) LOOK_ASSIST_ENABLED=0:12)"])
+        self.assertEqual(got, ["|NOT_HONOURED|True"] * 3, got)
+
+    def test_r27_b1_the_app_s_real_reject_reason_shape_and_located_records_still_read(self) -> None:
+        # controls: the app's real record (reject reason unquoted, ONE flavor, written last) keeps the r26 typed refusal and Look Assist reads on; a
+        # readable location whose path holds no bounded look key (LookAssistAnalysis.cpp has no `look_assist_` key) still proves the flavor
+        vs = self.R26_VS
+        real = vs + "look_assist_enabled=1 look_assist_diagnostics_valid=1 " + self.R27_REJECT + "look_assist_flavor=cinematic" + self.R27_LOC
+        got = self.each("$e = Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log; '{0}|{1}|{2}' -f $e.flavor, $e.verdict, ([string]$e.flavorReason).Split(':')[0]",
+                        [real, vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b/src/batch/LookAssistAnalysis.cpp:120)",
+                         vs + "look_assist_enabled=1 look_assist_flavor=cinematic (C:/b (x)/MainWindow.cpp:10011)"])
+        self.assertEqual(got, ["|HONOURED|FLAVOR_UNREADABLE", "cinematic|HONOURED|", "cinematic|HONOURED|"], got)
+
+    def test_r27_b1_neither_claim_predicate_accepts_a_discarded_conflict(self) -> None:
+        # sol r26 B1: with the committed m16-1457-native-fullscreen-s1-wake-post spec, the writer's lookAssistOn condition (Invoke-VenueLeg.ps1) was true
+        # and the validator's LOOK_ASSIST_CLAIM_UNBACKED condition (Test-DvReceiptValid) false. Both are evaluated here as the sources write them
+        vs = self.R26_VS
+        cut = vs + "look_assist_enabled=1 look_assist_flavor=cinematic " + self.R27_REJECT + "look_assist_flavor={o}" + self.R27_LOC
+        intact = vs + "look_assist_enabled=1 look_assist_flavor=cinematic"
+        logs = [cut.format(o="classic") + "\n" + intact, intact + "\n" + cut.format(o="film"), cut.format(o="vision50d") + "\n" + intact]
+        spec = (DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").as_posix()
+        expr = ("$spec = Get-Content -Raw -LiteralPath '" + spec + "' | ConvertFrom-Json; $e = Get-DvLookAssistEvidence -Spec $spec -LogText $log; "
+                "$req = 'cinematic'; $lf = [string]$e.flavor; "
+                "$w = [bool]($e.asked -and ($e.verdict -ceq 'HONOURED') -and (Test-DvLookFlavorSame $req $req) -and (Test-DvLookFlavorSame $lf $req)); "
+                "$r = -not ($e.asked -and $e.verdict -ceq 'HONOURED' -and (Test-DvLookFlavorSame $req $req) -and (Test-DvLookFlavorSame $lf $req) -and (Test-DvLookFlavorSame $req $lf)); "
+                "'{0}|{1}|{2}' -f [bool]$e.asked, $w, $r")
+        got = self.each(expr, logs + [intact])
+        self.assertEqual(got, ["True|False|True"] * len(logs) + ["True|True|False"], got)
+
+
+    # sol r25 B2: U+200B (zero-width space), U+00AD (soft hyphen), U+FEFF (zero-width no-break space), each ignorable to a linguistic compare
+    R26_IGNORABLE = ("\u200b", "\u00ad", "\ufeff")
+
+    def test_r26_b2_a_noncanonical_flavor_token_is_never_an_applied_flavor(self) -> None:
+        # sol r25 B2 on 620182b3, its inputs: `look_assist_flavor=cinematic<U+200B|U+00AD|U+FEFF>` passed the -ccontains whitelist (a ten-character
+        # flavor, HONOURED). A token with any character outside [a-z0-9_] is no applied flavor; the leg still reads Look Assist on (no flavor proven)
+        vs = self.R26_VS
+        logs = [vs + "look_assist_enabled=1 look_assist_flavor=cinematic" + c for c in self.R26_IGNORABLE]
+        logs += [vs + "look_assist_enabled=1 look_assist_flavor=" + c + "cinematic" for c in self.R26_IGNORABLE]
+        logs += [vs + "look_assist_enabled=1 look_assist_flavor=cine" + c + "matic" for c in self.R26_IGNORABLE]
+        # two records whose tokens differ only by an ignorable character name two flavors (ordinal): no flavor
+        logs.append(vs + "look_assist_enabled=1 look_assist_flavor=cinematic\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic\u200b")
+        logs.append(vs + "look_assist_enabled=1 look_assist_flavor=cinematic\u200b\n" + vs + "look_assist_enabled=1 look_assist_flavor=cinematic")
+        got = self.each(self.R26_EXPR, logs + [vs + "look_assist_enabled=1 look_assist_flavor=cinematic"])
+        self.assertEqual(got, ["|HONOURED|False"] * 11 + ["cinematic|HONOURED|False"], got)
+        # the flavor the reader returns is never longer than the canonical name it could be mistaken for
+        lens = self.each("([string](Get-DvLookAssistEvidence -Spec (" + self.R26_SPEC + ") -LogText $log).flavor).Length", logs[:3])
+        self.assertEqual(lens, [0, 0, 0], lens)
+
+    def test_r26_b2_the_flavor_claim_predicates_are_ordinal_and_canonical(self) -> None:
+        # sol r25 B2: the writer (Invoke-VenueLeg.ps1 lookAssistOn) and the validator (Test-DvReceiptValid LOOK_ASSIST_CLAIM_UNBACKED) compared the
+        # requested, reported, log and stored flavors with -ceq, a linguistic compare that equates cinematic<U+200B> with cinematic. Both now use
+        # Test-DvLookFlavorSame: ordinal, and only an ASCII-canonical [a-z0-9_]+ token is the same as anything
+        pairs = [("cinematic" + c, "cinematic") for c in self.R26_IGNORABLE] + [("cinematic", "cinematic" + c) for c in self.R26_IGNORABLE]
+        pairs += [("CINEMATIC", "CINEMATIC"), ("", ""), ("cinematic", "classic"), ("cine matic", "cine matic"), ("cinematic", "cinematic")]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "pairs.json"
+            path.write_text(json.dumps(pairs), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$ps = Get-Content -Raw -LiteralPath $env:DVE_PAIRS -Encoding utf8 | ConvertFrom-Json\n"
+                "@(foreach ($p in @($ps)) { [bool](Test-DvLookFlavorSame ([string]$p[0]) ([string]$p[1])) }) + @([bool](Test-DvLookFlavorSame $null $null), "
+                "[bool](Test-DvLookFlavorSame @('cinematic') 'cinematic')) | ConvertTo-Json -Compress -AsArray", DVE_PAIRS=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, [False] * 10 + [True, False, False], out)
+        # both claim sites (and the look-leg honoured flag and type binding, same class) compare through it, never -ceq / -cne on a flavor
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        runner = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("(Test-DvLookFlavorSame $laReportedFlavor $laRequestedFlavor) -and (Test-DvLookFlavorSame $laLogFlavor $laRequestedFlavor)", leg)
+        self.assertIn("$lookFlavorHonored = (Test-DvLookFlavorSame $lookFlavorReported $lookFlavor)", leg)
+        self.assertIn("(Test-DvLookFlavorSame $claimReportedRaw $claimRequested) -and (Test-DvLookFlavorSame $claimLogFlavor $claimRequested) -and "
+                      "(Test-DvLookFlavorSame $claimStoredRaw $claimLogFlavor)", runner)
+        for text, name in ((leg, "Invoke-VenueLeg.ps1"), (runner, "DualVenueRunner.psm1")):
+            with self.subTest(file=name):
+                self.assertIsNone(re.search(r"(?i)flavor\w*\s+-c?(eq|ne)\s|-c?(eq|ne)\s+\$\w*flavor\b", text), name)
+                self.assertNotIn("$script:DvAppliedLookFlavors -ccontains", text)
+
+
+@requires_windows_pwsh
+class DueWakeMeasuredSessionAnchorTests(unittest.TestCase):
+    """HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r3 (r2 adversary pass 7 A2, pass 6 advisory A3): the measured session, and every session record a
+    reader takes from the run log, counts only where its marker STARTS the record body ($script:DvRecordStart). A run_metadata command line (or any other
+    record) that holds `playback_smoke.measured_session id=<n>` or a session record's text never selects the session or supplies a field."""
+
+    PREFIX = "[2026-11-13T00:00:00.000Z] [INFO] [0x1a2b] "
+    # r2 adversary pass 7 A2 (its input; the clip file name in the command line is left out, the marker text is what it tests)
+    A2_LOG = "\n".join([
+        'run_metadata={"command_line":["MLVApp.exe","--gui-smoke-playback","C:/runs/playback_smoke.measured_session id=2/input"]}',
+        "playback_smoke.summary session=2 reason=play-stop presented_frames=120",
+        "playback_smoke.pace_summary session=2 first_present_ms=40.000 paced_elapsed_ms=2000.000",
+        "playback_due_wake armed=120 delivery=native-msg delivery_kind=post",
+        "playback_smoke.measured_session id=3",
+        "playback_smoke.summary session=3 reason=play-stop presented_frames=600",
+        "playback_smoke.pace_summary session=3 first_present_ms=40.000 paced_elapsed_ms=25000.000",
+        "playback_due_wake armed=1200 disabled=0 delivery=native-msg+qtimer delivery_kind=post"]) + "\n"
+
+    def ps(self, script: str, log: str, spec: dict | None = None) -> dict:
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SPEC=json.dumps(spec or {}))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def summary(self, log: str) -> dict:
+        return self.ps("$r = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n[ordered]@{ session = $r.session; fields = $r.fields; "
+                       "iso = $r.settingsIsolated; conform = $r.conformLine } | ConvertTo-Json -Compress -Depth 4", log)
+
+    def test_a2_the_metadata_line_never_selects_the_measured_session(self) -> None:
+        for name, log in (("bare", self.A2_LOG), ("crash-forensics prefix", "\n".join(self.PREFIX + l for l in self.A2_LOG.splitlines()) + "\n")):
+            with self.subTest(case=name):
+                self.assertEqual(self.summary(log)["session"], "3")
+                v = self.ps("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                            log, {"generatorArgs": {"dueWakeDeliveryPost": True}})
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_DELIVERY_FELL_BACK", v["reason"])
+
+    def test_pass6_a3_record_text_inside_another_record_supplies_nothing(self) -> None:
+        # r2 adversary pass 6 advisory A3, verbatim: diagnostic text selects no session and adds no summary field
+        r = self.summary("diagnostic: playback_smoke.summary session=3 presented_frames=600 scale_active_last=1\n")
+        self.assertIsNone(r["session"], r)
+        self.assertEqual(r["fields"], {}, r)
+        base = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600"]
+        r = self.summary("\n".join(base + ["note: playback_smoke.summary session=3 presented_frames=1 scale_active_last=4",
+                                           "note: playback_smoke.conform session=3 conform_active=1",
+                                           "note: interaction_trace event=automation.pacing_isolated settings_store=run_scoped"]) + "\n")
+        self.assertEqual((r["session"], r["fields"].get("presented_frames"), r["fields"].get("scale_active_last"), r["conform"], r["iso"]),
+                         ("3", "600", None, None, False), r)
+        # the app's own records, with and without the crash-forensics prefix, still read
+        r = self.summary("\n".join([self.PREFIX + base[0], base[1], self.PREFIX + "playback_smoke.conform session=3 conform_active=1",
+                                    self.PREFIX + "interaction_trace event=automation.pacing_isolated site=x settings_store=run_scoped"]) + "\n")
+        self.assertEqual((r["session"], r["fields"].get("presented_frames"), r["iso"]), ("3", "600", True), r)
+        self.assertIsNotNone(r["conform"], r)
+
+    def test_pass6_a3_sibling_readers_ignore_marker_text_inside_another_record(self) -> None:
+        base = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=reached presented_frames=600"]
+        pace = self.ps("(Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'pace_summary') | ConvertTo-Json -Compress -Depth 4",
+                       "\n".join(base + ["note: playback_smoke.pace_summary session=3 timeline_fps_after_first_present=99"]) + "\n")
+        self.assertFalse(pace["found"], pace)
+        scale = self.ps("$s = [pscustomobject]@{ scaleFactor = 2 }\n(Get-DvScaleEvidence -Spec $s -Backend 'cuda' -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                        "\n".join(base + ["note: playback_scale_clamped_for_gpu_texture_route requested=2 effective=2"]) + "\n")
+        self.assertEqual(scale["effectiveScale"], "UNKNOWN", scale)
+        look = self.ps("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvLookAssistEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                       "\n".join(base + ["note: event=gui_smoke.visual_state look_assist_enabled=1"]) + "\n", {"generatorArgs": {"forceLookAssist": True}})
+        self.assertEqual((look["verdict"], look["blocks"]), ("NOT_HONOURED", True), look)
+
+    # r10 (sol r9 B1, its input verbatim with the token as the variable): a malformed measured-session token followed by conflicting valid-session
+    # evidence. On 65701d27 `id=3x` selected session 3 by its numeric prefix and HONOURED session 3's posted wake (blocks=false); `3.5` and `3/old` too,
+    # and through the summary fallback. The token must be one whole decimal id up to whitespace or the end of the line; anything else makes the measured
+    # session UNREADABLE, so the due-wake reader blocks every leg (never HONOURED, never another session's line).
+    WAKE_POST = "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=post"
+    WAKE_SEND = "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=send"
+    MALFORMED_TOKENS = ("3x", "3.5", "3/old", "", "+3", "-3", "3,4", "0x3", "٣")
+
+    @classmethod
+    def sol_r9_b1_log(cls, token: str | None, prefix: str = "") -> str:
+        lines = ([] if token is None else [f"playback_smoke.measured_session id={token}"]) + [
+            "playback_smoke.summary session=3 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3", cls.WAKE_POST,
+            "playback_smoke.measured_session id=4", "playback_smoke.summary session=4 reason=play-stop presented_frames=600",
+            "playback_smoke.pace_summary session=4", cls.WAKE_SEND]
+        return "\n".join(prefix + l for l in lines) + "\n"
+
+    @classmethod
+    def summary_fallback_log(cls, token: str) -> str:
+        return "\n".join([f"playback_smoke.summary session={token} reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3", cls.WAKE_POST,
+                          "playback_smoke.summary session=4 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=4", cls.WAKE_SEND]) + "\n"
+
+    def selected(self, log: str) -> dict:
+        return self.ps("$r = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n[ordered]@{ session = $r.session; unreadable = $r.sessionUnreadable } | ConvertTo-Json -Compress", log)
+
+    def wake_verdict(self, log: str, spec: dict) -> dict:
+        return self.ps("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress", log, spec)
+
+    def test_r10_sol_b1_a_malformed_measured_session_id_never_selects_its_numeric_prefix(self) -> None:
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for token in self.MALFORMED_TOKENS:
+            for prefix_name, prefix in (("bare", ""), ("crash-forensics prefix", self.PREFIX)):
+                log = self.sol_r9_b1_log(token, prefix)
+                with self.subTest(token=token, prefix=prefix_name):
+                    self.assertEqual(self.selected(log), {"session": None, "unreadable": True})
+                    for leg, spec in (("posted", post), ("head", {})):
+                        v = self.wake_verdict(log, spec)
+                        self.assertEqual((leg, v["verdict"], v["blocks"]), (leg, "NOT_HONOURED", True), v)
+                        self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+        # controls: without the malformed marker the reader takes session 4 exactly as before (its send line refuses the posted leg; the head leg reads it)
+        log = self.sol_r9_b1_log(None)
+        self.assertEqual(self.selected(log), {"session": "4", "unreadable": False})
+        v = self.wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+        v = self.wake_verdict(log, {})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # and a well-formed id=3 still selects session 3 and honours its own posted wake
+        log = self.sol_r9_b1_log("3")
+        self.assertEqual(self.selected(log), {"session": "3", "unreadable": False})
+        v = self.wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    def test_r10_sol_b1_a_malformed_summary_session_never_selects_its_numeric_prefix(self) -> None:
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for token in self.MALFORMED_TOKENS:
+            log = self.summary_fallback_log(token)
+            with self.subTest(token=token):
+                self.assertEqual(self.selected(log), {"session": None, "unreadable": True})
+                for leg, spec in (("posted", post), ("head", {})):
+                    v = self.wake_verdict(log, spec)
+                    self.assertEqual((leg, v["verdict"], v["blocks"]), (leg, "NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+        log = self.summary_fallback_log("3")
+        self.assertEqual(self.selected(log), {"session": "3", "unreadable": False})
+        v = self.wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    def test_r10_sol_b1_class_sweep_every_session_capture_is_a_whole_token(self) -> None:
+        # r10 (sol r9 B1 class sweep): no live selector in the runner module, the artifacts module or the job's anchored and core-partition selectors
+        # captures a session id as a bare \d+ (a numeric prefix); each reads the whole token (\S*) and refuses anything but [0-9]+
+        unbounded = re.compile(r"(?:measured_session id|summary session)=\((?:\?<\w+>)?\\d\+\)(?!\(\\s\|\$\))")
+        for path in (DV / "DualVenueRunner.psm1", DV / "Invoke-VenueLeg.ps1", ATTR_MODULE):
+            with self.subTest(path=path.name):
+                self.assertIsNone(unbounded.search(path.read_text(encoding="utf-8")), path)
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        anchor = job.split("# SESSION-ANCHOR-1 >>>", 1)[1].split("# SESSION-ANCHOR-1 <<<", 1)[0]
+        core = job.split("function Get-CorePartitionPlaybackStart(", 1)[1].split("\nfunction ", 1)[0]
+        # r10 adversary advisory A1: the utilisation Play-window selector follows the same rule (a malformed first id is no window)
+        util = job.split("function Get-UtilSamplePlayWindow(", 1)[1].split("\nfunction ", 1)[0]
+        for name, body in (("Get-MeasuredSmokeSessionId anchored region", anchor), ("Get-CorePartitionPlaybackStart", core), ("Get-UtilSamplePlayWindow", util)):
+            with self.subTest(region=name):
+                self.assertIsNone(unbounded.search(body), name)
+                self.assertIn("'^[0-9]+$'", body, name)
+
+    # r11 (r10 adversary pass on 205a5b6c, A1 and A2, both introduced): a record that LOOKS like a measured-session marker or a session boundary but is
+    # not read whole is never skipped. FIRST (the selector's marker, or with none the first summary): the measured session is UNREADABLE, never a later
+    # Play. INTERVENING (inside the measured session's pace window): it ends the measured Play and blocks every leg, so the wake after it is never the
+    # measured Play's. Every leg: posted, head (send), unpaced (none) and a control binary's line (no delivery_kind) on the head spec.
+    WAKE_NONE = "playback_due_wake armed=0 fired=0 disabled=0 delivery=none post_rescued=0 post_counts_settled=1 delivery_kind=none"
+    WAKE_CONTROL = "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg"
+    LEG_WAKES = (("posted", {"generatorArgs": {"dueWakeDeliveryPost": True}}, "WAKE_POST"), ("head", {}, "WAKE_SEND"),
+                 ("unpaced", {"generatorArgs": {"unpaced": True}}, "WAKE_NONE"), ("control", {}, "WAKE_CONTROL"))
+    MARKER_SHAPES = ("playback_smoke.measured_session", "playback_smoke.measured_session id", "playback_smoke.measured_session id=",
+                     "playback_smoke.measured_session  id=3", "playback_smoke.measured_session ID=3", "playback_smoke.measured_session session=3",
+                     "playback_smoke.measured_session id:3", "playback_smoke.measured_session id=3x", "playback_smoke.measured_session.id=3")
+    SUMMARY_SHAPES = ("playback_smoke.summary", "playback_smoke.summary session", "playback_smoke.summary session=",
+                      "playback_smoke.summary reason=play-stop session=3 presented_frames=600", "playback_smoke.summary  session=3 reason=play-stop",
+                      "playback_smoke.summary SESSION=3 reason=play-stop", "playback_smoke.summary session=3x reason=play-stop")
+    BOUNDARY_SHAPES = ("playback_smoke.measured_session id=", "playback_smoke.measured_session", "playback_smoke.measured_session id",
+                       "playback_smoke.measured_session id=4x", "playback_smoke.measured_session  id=4", "playback_smoke.start session=",
+                       "playback_smoke.start", "playback_smoke.start session", "playback_smoke.start session=4x", "playback_smoke.start  session=4",
+                       "playback_smoke.start position=0 session=4", "playback_smoke.summary session=", "playback_smoke.summary",
+                       "playback_smoke.summary session=3x reason=play-stop", "playback_smoke.conform session=", "playback_smoke.pace_summary session=",
+                       "playback_smoke.pace_summary", "playback_smoke.pace_summary session=3x", "playback_smoke.gpu_summary session=",
+                       "playback_smoke.gpu_summary session")
+
+    def leg_wake(self, attr: str) -> str:
+        return getattr(self, attr)
+
+    def assert_every_leg_blocks(self, log_for_wake, token: str, **sub) -> None:
+        for leg, spec, wake in self.LEG_WAKES:
+            v = self.wake_verdict(log_for_wake(self.leg_wake(wake)), spec)
+            with self.subTest(leg=leg, **sub):
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn(token, v["reason"], v)
+
+    def test_r11_a1_its_input_verbatim_an_incomplete_first_marker_never_selects_a_later_play(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        log = ("playback_smoke.measured_session id\nplayback_smoke.summary session=3 reason=play-stop presented_frames=600\nplayback_smoke.pace_summary session=3\n"
+               "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=send\n"
+               "playback_smoke.measured_session id=4\nplayback_smoke.summary session=4 reason=play-stop presented_frames=600\nplayback_smoke.pace_summary session=4\n"
+               "playback_due_wake armed=1 fired=1 disabled=0 delivery=native-msg post_rescued=0 post_counts_settled=1 delivery_kind=post\n")
+        for name, text in (("bare", log), ("crash-forensics prefix", "\n".join(self.PREFIX + l for l in log.splitlines()) + "\n")):
+            with self.subTest(case=name):
+                self.assertEqual(self.selected(text), {"session": None, "unreadable": True})
+                v = self.wake_verdict(text, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+
+    def test_r11_a1_class_every_first_marker_or_summary_shape_not_read_whole_is_unreadable(self) -> None:
+        def marker_log(first: str):
+            return lambda wake: "\n".join([first, "playback_smoke.summary session=3 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3",
+                                           wake, "playback_smoke.measured_session id=4", "playback_smoke.summary session=4 reason=play-stop presented_frames=600",
+                                           "playback_smoke.pace_summary session=4", wake]) + "\n"
+
+        def summary_log(first: str):
+            return lambda wake: "\n".join([first, "playback_smoke.pace_summary session=3", wake, "playback_smoke.summary session=4 reason=play-stop presented_frames=600",
+                                           "playback_smoke.pace_summary session=4", wake]) + "\n"
+        for kind, shapes, build in (("marker", self.MARKER_SHAPES, marker_log), ("summary", self.SUMMARY_SHAPES, summary_log)):
+            for shape in shapes:
+                with self.subTest(kind=kind, shape=shape):
+                    self.assertEqual(self.selected(build(shape)(self.WAKE_SEND)), {"session": None, "unreadable": True})
+                self.assert_every_leg_blocks(build(shape), "DUE_WAKE_SESSION_UNREADABLE", kind=kind, shape=shape)
+        # controls: a marker read whole selects its session; another record name (measured_session_v2) is not a marker
+        self.assertEqual(self.selected(marker_log("playback_smoke.measured_session id=3")(self.WAKE_SEND)), {"session": "3", "unreadable": False})
+        self.assertEqual(self.selected(marker_log("playback_smoke.measured_session_v2 id=9")(self.WAKE_SEND)), {"session": "4", "unreadable": False})
+        self.assertEqual(self.selected(summary_log("playback_smoke.summary session=3 reason=play-stop")(self.WAKE_SEND)), {"session": "3", "unreadable": False})
+
+    A2_BASE = ["playback_smoke.measured_session id=3", "playback_smoke.summary session=3 reason=play-stop presented_frames=600", "playback_smoke.pace_summary session=3"]
+
+    def test_r11_a2_its_input_verbatim_an_unreadable_intervening_boundary_never_binds_the_following_wake(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        for boundary in ("playback_smoke.measured_session id=", "playback_smoke.start session="):
+            log = "\n".join(self.A2_BASE + [boundary, self.WAKE_POST]) + "\n"
+            for name, text in (("bare", log), ("crash-forensics prefix", "\n".join(self.PREFIX + l for l in log.splitlines()) + "\n")):
+                with self.subTest(boundary=boundary, case=name):
+                    v = self.wake_verdict(text, spec)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                    self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"], v)
+
+    def test_r11_a2_class_every_intervening_boundary_shape_not_read_whole_blocks_every_leg(self) -> None:
+        for shape in self.BOUNDARY_SHAPES:
+            for prefix_name, prefix in (("bare", ""), ("crash-forensics prefix", self.PREFIX)):
+                build = (lambda s, p: lambda wake: "\n".join(p + l for l in self.A2_BASE + [s, wake]) + "\n")(shape, prefix)
+                self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape, prefix=prefix_name)
+        # controls, unchanged by r11: a same-session record, a record with no session field and the same marker keep the window open; another
+        # session's readable boundary still closes it (the posted leg then has no line, the head leg is not refused)
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for keep in ("playback_smoke.gpu_summary session=3 frames=600", "playback_smoke.render_manifest frames=600", "playback_smoke.measured_session id=3"):
+            with self.subTest(control=keep):
+                v = self.wake_verdict("\n".join(self.A2_BASE + [keep, self.WAKE_POST]) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        for close in ("playback_smoke.start session=4 position=0", "playback_smoke.measured_session id=4"):
+            with self.subTest(control=close):
+                v = self.wake_verdict("\n".join(self.A2_BASE + [close, self.WAKE_POST]) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"], v)
+                v = self.wake_verdict("\n".join(self.A2_BASE + [close, self.WAKE_SEND]) + "\n", {})
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # an unreadable record AFTER another session's boundary closed the window is that session's, not the measured Play's
+        v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST, "playback_smoke.start session=4", "playback_smoke.start session="]) + "\n", post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    # r11 pass 10 (r11 adversary on 93fa8621) A1: a record naming a session anywhere but as its one whole first field
+    SESSION_ELSEWHERE_SHAPES = ("playback_smoke.gpu_summary frames=600 session=4", "playback_smoke.cpu_summary frames=600 session=4",
+                                "playback_smoke.prep_summary x=1 session=4", "playback_smoke.recon_release deferred=1 session=4",
+                                "playback_smoke.pace_unpaced x=1 session=4", "playback_smoke.present_gap_summary x=1 session=4",
+                                "playback_smoke.render_manifest frames=600 session=4", "playback_smoke.gpu_summary session=3 session=4",
+                                "playback_smoke.gpu_summary frames=1 SESSION=4", "playback_smoke.gpu_summary frames=1 session",
+                                "playback_smoke.measured_session id=3 session=4", "playback_smoke.pace_summary session=3 session=4")
+
+    def test_r11_p10_a1_its_input_verbatim_another_sessions_record_with_session_not_first_ends_the_window(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        log = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+               "playback_smoke.gpu_summary frames=600 session=4\n"
+               "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        v = self.wake_verdict(log, spec)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"], v)
+
+    def test_r11_p10_a1_class_a_session_named_anywhere_but_whole_and_first_blocks_every_leg(self) -> None:
+        for shape in self.SESSION_ELSEWHERE_SHAPES:
+            for prefix_name, prefix in (("bare", ""), ("crash-forensics prefix", self.PREFIX)):
+                build = (lambda s, p: lambda wake: "\n".join(p + l for l in self.A2_BASE + [s, wake]) + "\n")(shape, prefix)
+                self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape, prefix=prefix_name)
+        # control: a field whose name only ends in session (measured_session=, x_session=) names no session
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        v = self.wake_verdict("\n".join(self.A2_BASE + ["playback_smoke.gate session=3 measured_session=3 x_session=4", self.WAKE_POST]) + "\n", post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    # r11 pass 10 (r11 adversary on 93fa8621) A2: a key the reader reads, named on the wake line in any shape but `<key>=`
+    READ_KEYS = ("delivery_kind", "delivery", "disabled", "armed", "fired", "post_rescued", "post_counts_settled")
+
+    def test_r11_p10_a2_its_input_verbatim_a_bare_delivery_kind_never_takes_the_control_exemption(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        head = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+        for tail in ("delivery_kind", "delivery_kind post", "DELIVERY_KIND=send"):
+            with self.subTest(tail=tail):
+                v = self.wake_verdict(head + "playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg " + tail, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_r11_p10_a2_class_a_read_key_in_any_other_shape_is_unreadable_on_every_leg(self) -> None:
+        for key in self.READ_KEYS:
+            for shape in (key, key.upper() + "=1", key + " 1"):
+                build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [wake + " " + s]) + "\n")(shape)
+                for leg, spec, wake in self.LEG_WAKES:
+                    v = self.wake_verdict(build(self.leg_wake(wake)), spec)
+                    with self.subTest(key=key, shape=shape, leg=leg):
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # controls: the app's own lines still read (a sibling key such as x_fired= or rearmed= is not the key)
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST + " rearmed=0 x_fired=9"]) + "\n", post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+        v = self.wake_verdict("\n".join(self.A2_BASE + [self.WAKE_CONTROL]) + "\n", {})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+
+    def test_r11_p11_its_inputs_verbatim_a_quoted_or_repeated_mention_is_never_skipped(self) -> None:
+        # r11 pass 11 (r11 adversary on 8317f372) A1 / A2 / A3 verbatim, and advisory A4: a mention is the word bounded by ANY non-name character
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        head = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        base = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+        wake = "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post"
+        for name, log, spec in (("A1", base + 'playback_smoke.gpu_summary "session=4"\n' + wake, post),
+                                ("A2", base + 'playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "delivery_kind=post"', head),
+                                ("A3", base + "playback_smoke.measured_session id=3 id=4\n" + wake, post),
+                                ("A4", base + "playback_due_wake: armed=0 fired=0 disabled=1 delivery=none delivery_kind=post post_rescued=0 post_counts_settled=1", head)):
+            with self.subTest(finding=name):
+                v = self.wake_verdict(log, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # A3 at the FIRST position: a marker naming id twice is unreadable, never id=3
+        self.assertEqual(self.selected("playback_smoke.measured_session id=3 id=4\n" + base + wake), {"session": None, "unreadable": True})
+        self.assertEqual(self.selected("playback_smoke.summary session=3 session=4 reason=play-stop\nplayback_smoke.summary session=4\n"), {"session": None, "unreadable": True})
+
+    def test_r11_p11_class_punctuated_mentions_block_every_leg(self) -> None:
+        for shape in ('playback_smoke.gpu_summary "session=4"', "playback_smoke.gpu_summary x=(session=4)", "playback_smoke.gpu_summary x=1,session=4",
+                      "playback_smoke.gpu_summary session=3 'session=4'", "playback_smoke.measured_session id=3 id=4",
+                      'playback_smoke.measured_session id=3 "id=4"', "playback_smoke.measured_session id=3,id=4"):
+            build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [s, wake]) + "\n")(shape)
+            self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape)
+        for key in self.READ_KEYS:
+            # (a ` (`-led tail is the Qt location suffix Get-DvLogRecordBodies strips by design, so it is not a shape of the record body)
+            for shape in (f'"{key}=1"', f"[{key}=1]", f"'{key}=1'", f",{key}=1"):
+                build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [wake + " " + s]) + "\n")(shape)
+                for leg, spec, wake in self.LEG_WAKES:
+                    v = self.wake_verdict(build(self.leg_wake(wake)), spec)
+                    with self.subTest(key=key, shape=shape, leg=leg):
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    # r12 (r12 adversary on 7e66a3af): B2, a record body that lost its tail to the LOCATION_UNREADABLE sentinel (the tail may have named a session or
+    # a key); B3, a non-ASCII letter that IgnoreCase folds into [A-Za-z] (U+212A KELVIN SIGN, U+0130) beside a mention
+    KELVIN = "\u212a"
+    DOTTED_I = "\u0130"
+
+    def test_r12_its_inputs_verbatim_a_sentinel_tail_or_a_folded_neighbour_never_hides_a_mention(self) -> None:
+        post = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        head = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        base = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3\n"
+        wake = "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post"
+        k = self.KELVIN
+        sole_pace = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 reason=play-stop\nplayback_smoke.pace_summary session=3 (session=4)\n"
+        for name, log, spec in (("B2", base + "playback_smoke.gpu_summary (session=4)\n" + wake, post),
+                                ("B2 sole pace summary", sole_pace + wake, post),
+                                ("B3", base + f"playback_smoke.gpu_summary {k}session=4\n" + wake, post),
+                                ("B3 marker", base + f"playback_smoke.measured_session id=3 {k}id=4\n" + wake, post),
+                                ("B3 head key", base + "playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg "
+                                 + f"{k}delivery_kind=post", head),
+                                ("B3 record name", base + f"playback_due_wake{k} armed=0 fired=0 disabled=1 delivery=none delivery_kind=post post_rescued=0 "
+                                 "post_counts_settled=1", head)):
+            with self.subTest(finding=name):
+                v = self.wake_verdict(log, spec)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # at the FIRST position: a marker or summary whose tail was cut, or that names id / session again beside a folded letter, is unreadable
+        rest = "playback_smoke.summary session=4 reason=play-stop\n"
+        for first in ("playback_smoke.measured_session id=3 (id=4)", f"playback_smoke.measured_session id=3 {k}id=4",
+                      f"playback_smoke.measured_session id=3 {self.DOTTED_I}d=4 {k}session=4", "playback_smoke.measured_session id=3 (C:/a/MainWindow.cpp)",
+                      "playback_smoke.summary session=3 (session=4)", f"playback_smoke.summary session=3 {k}session=4"):
+            with self.subTest(first=first):
+                self.assertEqual(self.selected(first + "\n" + rest), {"session": None, "unreadable": True})
+        # controls: a readable Qt location is not the record's, whatever its path holds
+        for first in ("playback_smoke.measured_session id=3 (C:/id/MainWindow.cpp:1)", "playback_smoke.measured_session id=3 (C:/session/MainWindow.cpp:1)",
+                      "playback_smoke.summary session=3 (C:/session/MainWindow.cpp:1)"):
+            with self.subTest(control=first):
+                self.assertEqual(self.selected(first + "\n" + rest), {"session": "3", "unreadable": False})
+
+    def test_r12_class_every_sentinel_tail_or_folded_neighbour_blocks_every_leg(self) -> None:
+        k, i = self.KELVIN, self.DOTTED_I
+        for shape in ("playback_smoke.gpu_summary (session=4)", "playback_smoke.gpu_summary frames=1 (x)", "playback_smoke.pace_summary session=3 (session=4)",
+                      "playback_smoke.measured_session id=3 (id=4)", f"playback_smoke.gpu_summary {k}session=4", f"playback_smoke.gpu_summary {i}session=4",
+                      f"playback_smoke.gpu_summary session=3 x{k}session=4", f"playback_smoke.measured_session id=3 {k}id=4",
+                      f"playback_smoke.measured_session{k} id=4", f"playback_smoke.start{k} session=4"):
+            build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [s, wake]) + "\n")(shape)
+            self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape)
+        for key in self.READ_KEYS:
+            for shape in (f"({key}=1)", f"{k}{key}=1", f"{i}{key}=1", f"x{k}{key}=1"):
+                build = (lambda s: lambda wake: "\n".join(self.A2_BASE + [wake + " " + s]) + "\n")(shape)
+                for leg, spec, wake in self.LEG_WAKES:
+                    v = self.wake_verdict(build(self.leg_wake(wake)), spec)
+                    with self.subTest(key=key, shape=shape, leg=leg):
+                        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # controls: a readable Qt location on a same-session record or on the wake line is cut, so it names nothing; the legs still read
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for lines in ([self.A2_BASE[0] + " (C:/id/session/MainWindow.cpp:7)"] + self.A2_BASE[1:] + ["playback_smoke.gpu_summary session=3 (C:/session/a.cpp:12)",
+                                                                                                    self.WAKE_POST + " (C:/delivery_kind/fired/MainWindow.cpp:9)"],
+                      self.A2_BASE + [self.WAKE_POST + f" note=x{k}y"]):
+            with self.subTest(control=lines[-1]):
+                v = self.wake_verdict("\n".join(lines) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    # r12 pass 13 (r12 adversary on bbfe69d1) A1: a pace_summary not read whole BEFORE the measured window was first seen
+    EARLY_PACE_SHAPES = ("playback_smoke.pace_summary  session=3", "playback_smoke.pace_summary session=", "playback_smoke.pace_summary session=3x",
+                         "playback_smoke.pace_summary", "playback_smoke.pace_summary (session=3)", "PLAYBACK_SMOKE.PACE_SUMMARY session=3",
+                         "playback_smoke.pace_summary session=2 session=3")
+
+    def test_r12_p13_a1_its_input_verbatim_an_unreadable_pace_before_the_measured_one_is_never_skipped(self) -> None:
+        log = ("playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 elapsed_ms=20000\nplayback_smoke.pace_summary  session=3\n"
+               "playback_smoke.pace_summary session=3\n"
+               "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        v = self.wake_verdict(log, {"generatorArgs": {"dueWakeDeliveryPost": True}})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", v["reason"], v)
+
+    def test_r12_p13_a1_class_every_unreadable_pace_before_the_measured_window_blocks_every_leg(self) -> None:
+        for shape in self.EARLY_PACE_SHAPES:
+            build = (lambda s: lambda wake: "\n".join(self.A2_BASE[:2] + [s, self.A2_BASE[2], wake]) + "\n")(shape)
+            self.assert_every_leg_blocks(build, "DUE_WAKE_SESSION_BOUNDARY_UNREADABLE", shape=shape)
+        # controls: a readable pace of another session before the window; an unreadable pace after another session's boundary closed the window
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        for lines in (self.A2_BASE[:2] + ["playback_smoke.pace_summary session=2", self.A2_BASE[2], self.WAKE_POST],
+                      self.A2_BASE + [self.WAKE_POST, "playback_smoke.start session=4", "playback_smoke.pace_summary  session=4"]):
+            with self.subTest(control=lines):
+                v = self.wake_verdict("\n".join(lines) + "\n", post)
+                self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    # r12 pass 13 (r12 adversary on bbfe69d1) A2: under the tr-TR culture `I` does not fold onto `i` for -match / (?i), so an upper-case marker,
+    # record name or key was skipped. Each call is a fresh pwsh whose culture is set before the first reader call.
+    def tr_wake_verdict(self, log: str, spec: dict) -> dict:
+        return self.ps("[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n$s = $env:DVE_SPEC | ConvertFrom-Json\n"
+                       "(Get-DvDueWakeDeliveryEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress", log, spec)
+
+    def tr_selected(self, log: str) -> dict:
+        return self.ps("[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n$r = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n"
+                       "[ordered]@{ session = $r.session; unreadable = $r.sessionUnreadable } | ConvertTo-Json -Compress", log)
+
+    def test_r12_p13_a2_its_input_verbatim_under_tr_tr_an_upper_case_marker_or_key_is_never_skipped(self) -> None:
+        post = {"generatorArgs": {"dueWakeDeliveryPost": True}}
+        log = ("PLAYBACK_SMOKE.MEASURED_SESSION id=3\nplayback_smoke.measured_session id=4\nplayback_smoke.summary session=4 elapsed_ms=20000\n"
+               "playback_smoke.pace_summary session=4\n"
+               "playback_due_wake armed=1 fired=1 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg delivery_kind=post")
+        v = self.tr_wake_verdict(log, post)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("DUE_WAKE_SESSION_UNREADABLE", v["reason"], v)
+        self.assertEqual(self.tr_selected(log), {"session": None, "unreadable": True})
+        self.assertEqual(self.tr_selected("PLAYBACK_SMOKE.SUMMARY session=3\nplayback_smoke.summary session=4\n"), {"session": None, "unreadable": True})
+        base = "\n".join(self.A2_BASE) + "\n"
+        for name, wake in (("DELIVERY_KIND=post", "playback_due_wake armed=1 fired=0 post_rescued=0 post_counts_settled=1 disabled=0 delivery=native-msg DELIVERY_KIND=post"),
+                           ("DISABLED=1", self.WAKE_SEND + " DISABLED=1")):
+            with self.subTest(head=name):
+                v = self.tr_wake_verdict(base + wake, {})
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_r12_p13_a2_class_under_tr_tr_every_upper_case_boundary_or_wake_record_blocks_every_leg(self) -> None:
+        for shape in ("PLAYBACK_SMOKE.MEASURED_SESSION id=4", "playback_smoke.gpu_summary SESSION=4", "PLAYBACK_DUE_WAKE armed=1 fired=1"):
+            for leg, spec, wake in self.LEG_WAKES:
+                v = self.tr_wake_verdict("\n".join(self.A2_BASE + [shape, self.leg_wake(wake)]) + "\n", spec)
+                with self.subTest(shape=shape, leg=leg):
+                    self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        # control: the app's own lower-case lines read the same under tr-TR
+        v = self.tr_wake_verdict("\n".join(self.A2_BASE + [self.WAKE_POST]) + "\n", {"generatorArgs": {"dueWakeDeliveryPost": True}})
+        self.assertEqual((v["verdict"], v["blocks"]), ("HONOURED", False), v)
+
+    # r13 (r12 adversary A1 on 3a96e53e): the record-name reads pass 13 A2 did not reach were still culture-sensitive -match, so under tr-TR an
+    # upper-case `INTERACTION_TRACE event=gui_smoke.visual_state look_assist_enabled=0` was skipped and the look leg read HONOURED. Each call is a fresh
+    # pwsh whose culture is set before the first reader call; each row is the same log read the same way under the invariant culture.
+    TR = "[cultureinfo]::CurrentCulture = [cultureinfo]::new('tr-TR')\n"
+
+    def test_r13_a1_its_input_verbatim_under_tr_tr_an_upper_case_visual_state_record_answers_and_refuses(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1457-native-fullscreen-s1-wake-post.json").read_text(encoding="utf-8"))
+        log = ("interaction_trace event=gui_smoke.visual_state look_assist_enabled=1 look_assist_flavor=cinematic\n"
+               "INTERACTION_TRACE event=gui_smoke.visual_state look_assist_enabled=0 look_assist_flavor=cinematic")
+        for culture in (self.TR, ""):
+            with self.subTest(culture=culture or "invariant"):
+                v = self.ps(culture + "$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvLookAssistEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                            log, spec)
+                self.assertTrue(v["requested"], v)
+                self.assertEqual((v["reported"], v["verdict"], v["blocks"]), ("0", "NOT_HONOURED", True), v)
+
+    def test_r13_a1_class_under_tr_tr_every_upper_case_record_name_is_read_as_the_invariant_culture_reads_it(self) -> None:
+        base = "playback_smoke.measured_session id=3\nplayback_smoke.summary session=3 presented_frames=600\n"
+        rows = {
+            # Get-DvSmokeSummaryFields (DualVenueRunner.psm1 pacing_isolated): an upper-case record that says the store is NOT run-scoped refuses isolation
+            "pacing_isolated refuses": (base + "interaction_trace event=automation.pacing_isolated settings_store=run_scoped\n"
+                                        "INTERACTION_TRACE event=automation.pacing_isolated settings_store=venue\n",
+                                        "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated reads": (base + "INTERACTION_TRACE EVENT=AUTOMATION.PACING_ISOLATED SETTINGS_STORE=RUN_SCOPED\n",
+                                      "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", True),
+            # r13 (r13 adversary A2 on 04c1337b, its input verbatim): a longer key ending in settings_store, or two settings_store tokens, refuses isolation
+            "pacing_isolated a2 verbatim": (base + "INTERACTION_TRACE event=automation.pacing_isolated settings_store=venue not_settings_store=run_scoped\n",
+                                            "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated suffix key": (base + "interaction_trace event=automation.pacing_isolated not_settings_store=run_scoped\n",
+                                           "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated two stores": (base + "interaction_trace event=automation.pacing_isolated settings_store=venue settings_store=run_scoped\n",
+                                           "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", False),
+            "pacing_isolated one store": (base + "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry settings_store=run_scoped persisted_fps_override=0\n",
+                                          "(Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).settingsIsolated", True),
+            # Get-DvScaleEvidence (the clamp record)
+            "scale clamp": ("PLAYBACK_SCALE_CLAMPED_FOR_GPU_TEXTURE_ROUTE requested=2 EFFECTIVE=1\n",
+                            "(Get-DvScaleEvidence -Spec ('{\"scaleFactor\":2}' | ConvertFrom-Json) -Backend cuda -LogText $env:DVE_LOG).effectiveScale", 1),
+            # Get-DvLookLabelEvidence
+            "look label": ('GUI_SMOKE.LOOK_LABEL shown="Cinematic" expected="Cinematic" surface=fullscreen_gpu_window SHOW_IN_FULLSCREEN=1 WAIT_MS=5\n',
+                           "(Get-DvLookLabelEvidence -LogText $env:DVE_LOG).lookLabelShown", True),
+            # Get-DvSmokeSessionLineRead (any marker of the measured session)
+            "session line": (base + "PLAYBACK_SMOKE.GPU_SUMMARY SESSION=3 worker_threads=8\n",
+                             "[bool](Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker gpu_summary).found", True),
+        }
+        for name, (log, expr, want) in rows.items():
+            script = "[ordered]@{ v = (" + expr + ") } | ConvertTo-Json -Compress"
+            invariant = self.ps(script, log)["v"]
+            self.assertEqual(invariant, want, name)
+            with self.subTest(row=name):
+                self.assertEqual(self.ps(self.TR + script, log)["v"], invariant, name)
+
+    def test_r13_a1_sibling_the_jobs_anchored_summary_and_conform_picks_are_culture_invariant_under_tr_tr(self) -> None:
+        job = GENERATOR.read_text(encoding="utf-8")
+        start = job.index("$sourceFramesRecordStart = '")
+        summary_loop = job[job.index("$sourceFramesSummaryLine = $null", start):job.index("# SESSION-ANCHOR-1 <<<", start)]
+        conform_loop = job[job.index("$sourceFramesConformLine = $null", start):job.index("$sourceFramesVerdict = Get-AttrCudaConformAwareSourceFramesVerdict", start)]
+        self.assertNotIn("-match", summary_loop + conform_loop)
+        record_start = job[start:job.index("\n", start)]
+        log = ("playback_smoke.measured_session id=3\nPLAYBACK_SMOKE.SUMMARY SESSION=3 presented_frames=600\n"
+               "PLAYBACK_SMOKE.CONFORM SESSION=3 active=1\n")
+        script = ("$rawLog = $env:DVE_LOG\n$measuredSmokeSessionId = '3'\n" + record_start + "\n" + summary_loop + "\n" + conform_loop + "\n"
+                  "[ordered]@{ summary = $sourceFramesSummaryLine; conform = $sourceFramesConformLine } | ConvertTo-Json -Compress")
+        want = {"summary": "PLAYBACK_SMOKE.SUMMARY SESSION=3 presented_frames=600", "conform": "PLAYBACK_SMOKE.CONFORM SESSION=3 active=1"}
+        for culture in (self.TR, ""):
+            with self.subTest(culture=culture or "invariant"):
+                self.assertEqual(self.ps(culture + script, log), want)
+
+
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
     """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it
     twins only in legId and that key, so no receipted cell changes a byte."""
@@ -15590,7 +17722,13 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                     v = self.verdict(spec, self.PREFIX + "interaction_trace event=automation.start" + tail + "\n" + self.log(self.route(value)))
                     self.assertEqual((v["observed"], v["verdict"], v["blocks"]), expected, v)
         start_loc = " (C:/build playback_smoke.start session=3 worker_threads=2 25846/MainWindow.cpp:%2)"
-        for name, end in (("old writer :%2)", ""), ("unreadable tail", " x")):
+        # CONTRACT CHANGE, HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r25 (forced companion of 424ca7e9, CI run 44019211058): in the `unreadable
+        # tail` case the summary and pace_summary records THEMSELVES end in ` x` after `:%2)`, so each is a cut (LOCATION_UNREADABLE) record and is refused
+        # whole: summary, presentedFps and timelineFpsAfterFirstPresent read None (before r24 the fields before the cut read 24 / 24 / 59.9). workers and
+        # look come from the intact start and visual-state records and still read; 999 is never read in either case.
+        intact = {"workers": "8", "look": "0"}
+        for name, end, expected in (("old writer :%2)", "", dict(intact, summary="24", presentedFps=24, timelineFpsAfterFirstPresent=59.9)),
+                                    ("unreadable tail", " x", dict(intact, summary=None, presentedFps=None, timelineFpsAfterFirstPresent=None))):
             with self.subTest(case=name):
                 log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8 (C:/a/MainWindow.cpp:1)",
                                  self.PREFIX + "interaction_trace event=gui_smoke.visual_state look_assist_enabled=0 (C:/a/MainWindow.cpp:2)",
@@ -15605,8 +17743,7 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                                           DVE_LOG=log)
                 self.assertIsNotNone(out, proc.stdout + proc.stderr)
                 self.assertEqual({"workers": out["workers"], "look": out["look"], "summary": out["summary"], "presentedFps": out["rates"]["presentedFps"],
-                                  "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]},
-                                 {"workers": "8", "look": "0", "summary": "24", "presentedFps": 24, "timelineFpsAfterFirstPresent": 59.9})
+                                  "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]}, expected)
 
     def test_a_long_run_of_open_parentheses_is_read_in_one_pass(self) -> None:
         # r5 (sol r4 H1 on #726): the r4 suffix regex was super-linear on repeated ` (` (10000: ~0.9 s, 30000: ~6.7 s, 100000: more than 8 s). The scan is
@@ -15721,11 +17858,18 @@ class ConformStatusParenthesisSurvivesTheLogReaderTests(unittest.TestCase):
             with self.subTest(loc=loc):
                 self.assertRecovered(self.evidence(conformed_summary_line(), loc))
 
-    def test_an_unreadable_location_after_a_conformed_summary_keeps_the_fields_before_it(self) -> None:
-        # LOCATION_UNREADABLE stays for a malformed trailing suffix, but it supplies no field and no longer discards the ones that precede it
+    def test_an_unreadable_location_after_a_conformed_summary_refuses_the_record(self) -> None:
+        # LOCATION_UNREADABLE stays for a malformed trailing suffix and supplies no field. CONTRACT CHANGE, HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1
+        # r24 (r24 adversary pass 2 A1 on d89dc086): before r24 (r10) the fields before the cut still read; the cut tail can hold the field that
+        # decides the verdict (its input: `... fps_override=0 ... diagnostic='prefix ( fps_override=1` read valid=true), so a summary record that lost
+        # its tail is now refused whole, as the session readers refuse it since r12 B2. The app writes a readable `:<digits>)` location, so a real
+        # run is unchanged (real-log-mask-check over the six bench r5 logs); only a malformed or forged tail refuses.
         for loc in (" (C:/b x/MainWindow.cpp:%3)", " (C:/b x/MainWindow.cpp:12) tail", " (C:/b x/MainWindow.cpp:)"):
             with self.subTest(loc=loc):
-                self.assertRecovered(self.evidence(conformed_summary_line(), loc))
+                out = self.evidence(conformed_summary_line(), loc)
+                self.assertEqual((out["valid"], out["sourceAdvanced"]), (False, None), out)
+        # a readable location after the same summary still keeps every field
+        self.assertRecovered(self.evidence(conformed_summary_line(), CONFORM_LOC))
 
     def test_the_record_body_helper_cuts_only_the_trailing_location(self) -> None:
         line = conformed_summary_line()

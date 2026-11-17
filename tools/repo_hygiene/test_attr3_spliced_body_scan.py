@@ -333,7 +333,9 @@ _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
 _allow("Get-AttrCudaPresentMonDisplayReport", _LOCAL_BLOCK, ("R3", "& $buildWindow", 2), ("R3", "& $unavailable", 7))
 _allow("Get-AttrCudaSelfHealMetrics", _LOCAL_BLOCK,
        ("R3", "& $count", 4), ("R3", "& $field", 2), ("R3", "& $fps", 2), ("R3", "& $iniFlag", 2), ("R3", "& $readJson", 3),
-       ("R3", "& $readText", 3), ("R3", "& $sessionLine", 4), ("R3", "& $setRead", 4), ("R3", "& $telemetry", 2))
+       ("R3", "& $readText", 3), ("R3", "& $sessionLine", 4), ("R3", "& $setRead", 4), ("R3", "& $telemetry", 2),
+       # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r14: $wc is the body-scoped word counter defined two lines above its two calls
+       ("R3", "& $wc", 2))
 _allow("Get-AttrCudaSelfHealMetrics",
        "numeric TryParse on a caller-chosen numeric type variable ([long] / [double]) with InvariantCulture; parse only",
        ("R4", "$Type::TryParse($raw, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)", 1))

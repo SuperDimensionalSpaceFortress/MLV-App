@@ -97,7 +97,9 @@ public:
      * GUI-thread only; read it right after presentGpuPlaybackReconAmazePostWbTextureIfActive. */
     static GpuPresentTailTiming lastPresentTailTimingIfActive(void);
     /* PLAYBACK-PRESENT-TAIL-TIMING-1 r3: the smoke runner slept sleptNs on the GUI thread (MainWindow::
-     * sleepGuiThreadForSmokeRunner); counted inside the active window's open tail window, never as GUI work. */
+     * sleepGuiThreadForSmokeRunner); counted inside the active window's open tail window, never as GUI work. r17 (r16
+     * adversary A1): one call per slept segment, made before a dispatch inside the sleep can close that window
+     * (MainWindow::chargeSmokeRunnerSleepSegment). */
     static void noteSmokeRunnerSleepIfActive(qint64 sleptNs);
     /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: warm the playback recon texture route while paused (program compile,
      * one AMaZE run at texWidth x texHeight on temporary textures, then freed). Changes nothing on screen. GUI-thread

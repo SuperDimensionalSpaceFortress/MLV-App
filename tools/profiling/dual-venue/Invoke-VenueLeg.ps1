@@ -550,6 +550,9 @@ try {
         # HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 r7: the deferred-release kill switch (isolation arm), for any leg; judged below by the app's own
         # playback_smoke.recon_release deferred_enabled readback. Only a JSON true arms it.
         if ($spec.generatorArgs.PSObject.Properties['disableReconReleaseDeferred'] -and $spec.generatorArgs.disableReconReleaseDeferred -is [bool] -and $spec.generatorArgs.disableReconReleaseDeferred) { $gen['DisableReconReleaseDeferred'] = $true }
+        # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1: the due wake's isolation arm (posted, as before r1), for any leg; judged below by the app's
+        # own playback_due_wake delivery_kind readback. Only a JSON true arms it.
+        if ($spec.generatorArgs.PSObject.Properties['dueWakeDeliveryPost'] -and $spec.generatorArgs.dueWakeDeliveryPost -is [bool] -and $spec.generatorArgs.dueWakeDeliveryPost) { $gen['DueWakeDeliveryPost'] = $true }
         # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the asymmetric OpenMP team partition (both or neither; the generator refuses one alone), for any leg; judged below by
         # the app's own playback_smoke.omp_teams readback.
         if ($spec.generatorArgs.PSObject.Properties['reconOmpThreads']) { $gen['ReconOmpThreads'] = [int]$spec.generatorArgs.reconOmpThreads }
@@ -981,7 +984,8 @@ if ($isLook -and $artifactsShare) {
     $lookFlavorHonored = 'unknown'
     if ($null -ne $summary -and $summary.PSObject.Properties['lookFlavorReported']) {
         $lookFlavorReported = [string]$summary.lookFlavorReported
-        $lookFlavorHonored = ($lookFlavorReported -ceq $lookFlavor)
+        # r26 (sol r25 B2 sibling): ordinal and canonical, never the linguistic -ceq
+        $lookFlavorHonored = (Test-DvLookFlavorSame $lookFlavorReported $lookFlavor)
     }
     $receipt.look = [ordered]@{
         legType = 'look'; lookAssistForced = $true; lookFlavor = $lookFlavor
@@ -1120,6 +1124,15 @@ if ($outcome -in @('PASS', 'FAIL') -and $reconReleaseVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but RECON_RELEASE_DEFERRED_NOT_HONOURED: $($reconReleaseVerdict.reason). A run whose deferred-release state is not the one its leg names (off when it asks, otherwise not off) is no measurement of that arm"
     $outcome = 'INVALID'
 }
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, FAIL CLOSED: a leg that asks for the posted due wake counts only when the measured session's own
+# playback_due_wake line reports delivery_kind=post (delivery=native-msg); a leg that does not ask blocks when that line reports post or notifier (a binary
+# that emits no delivery_kind, the control arm before r1, is unchanged). A value in the launcher's env block is a request, not engagement.
+$dueWakeDeliveryVerdict = Get-DvDueWakeDeliveryEvidence -Spec $spec -LogText $runLogText
+if ($dueWakeDeliveryVerdict.requested) { $receipt['dueWakeDelivery'] = [ordered]@{ requested = $true; observed = $dueWakeDeliveryVerdict.observed; verdict = $dueWakeDeliveryVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $dueWakeDeliveryVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but DUE_WAKE_DELIVERY_NOT_HONOURED: $($dueWakeDeliveryVerdict.reason). A run whose due-wake delivery is not the one its leg names (post when it asks, otherwise send) is no measurement of that arm"
+    $outcome = 'INVALID'
+}
 # CPU-S1-FS-SPIKE-TEAM-PARTITION-1, FAIL CLOSED: a leg that asks for the OpenMP team partition counts only when the measured session's own
 # playback_smoke.omp_teams record reports partition=r+p (recon_omp=r, prep_omp=p, override=0); a value in the launcher's env block is a request, not
 # engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask blocks only when the app reports one.
@@ -1143,7 +1156,9 @@ $laSummaryForced = ($null -ne $summary -and $null -ne $summary.PSObject.Properti
 $laRequestedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavor'] -and $summary.lookFlavor -is [string]) { [string]$summary.lookFlavor } else { '' })
 $laReportedFlavor = $(if ($null -ne $summary -and $null -ne $summary.PSObject.Properties['lookFlavorReported'] -and $summary.lookFlavorReported -is [string]) { [string]$summary.lookFlavorReported } else { '' })
 $laLogFlavor = [string]$lookAssistVerdict.flavor
-if ($lookAssistVerdict.asked -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and ($laReportedFlavor -ceq $laRequestedFlavor) -and ($laLogFlavor -ceq $laRequestedFlavor)) {
+# HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2): the flavors compare ORDINALLY and only an ASCII-canonical token matches (Test-DvLookFlavorSame);
+# -ceq is linguistic, so a reported `cinematic<U+200B>` equalled the requested `cinematic`
+if ($lookAssistVerdict.asked -and ($lookAssistVerdict.verdict -ceq 'HONOURED') -and $laSummaryForced -and $laRequestedFlavor.Length -gt 0 -and (Test-DvLookFlavorSame $laReportedFlavor $laRequestedFlavor) -and (Test-DvLookFlavorSame $laLogFlavor $laRequestedFlavor)) {
     $receipt['lookAssistOn'] = $true
     $receipt['lookAssistFlavor'] = $laLogFlavor
 }
