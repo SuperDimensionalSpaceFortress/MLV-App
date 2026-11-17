@@ -138,6 +138,14 @@ run for a dry run. The new-machine phases refuse to run on VIRTUAL-TEN unless yo
    (r23: a url that is also the name of a configured remote is `REMOTE_URL_UNSAFE` too, because git
    would resolve it as that remote. A url Clone adds, and the url of a first clone, are checked the
    same way before use.)
+   (r26: `LEASE_LEGACY_REMOTE_ALIAS_PRESENT <path>` means an entry exists under `remotes\` or
+   `branches\` of the repository's common or per-worktree git directory. Git can resolve a url through
+   such a legacy alias, so the lease and Clone refuse and never parse it; move the entry aside.
+   `LEASE_GIT_DIR_UNRESOLVED` means `git rev-parse --git-dir --git-common-dir` gave no usable answer, and
+   the same refusal follows. A `://` url whose authority is not exactly `[userinfo@]host[:port]` (it
+   holds `?`, `#`, `\` or a second `@`, as in `https://evil.example#@github.com/o/r`) is compared only as
+   the identical string, and logs print it as `https://***`, so a log never names a host the url
+   does not contact.)
 
 5. **Do the owner-only checklist** (`-Phase Checklist` prints it). Then go through the cut-over phases.
 

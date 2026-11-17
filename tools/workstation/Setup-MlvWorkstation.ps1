@@ -164,9 +164,23 @@ $script:LogFile = if ($isGate) { Join-Path $logDir 'gate.log' } else { Join-Path
 # in free text a URL ends at whitespace, so the userinfo span is every non-space character up to the last '@' of that word (over-redaction is the safe side).
 # r17 pass 19 A3: a space does not end a URL either (a query value 'first SECOND_SECRET' quoted in git's error text): the userinfo span is everything up to the last '@'
 # before the first '/' on that line, and after a URL's first '?' or '#' the REST OF THE LINE is dropped ('?***'). Only a line break ends a span.
+# r26 (fable key3 r25 B1; HUB RULING fail closed): the ONE authority rule. A '://' url's authority (the text before its first '/') is parsed only when it is exactly
+# [userinfo@]host[:port]: no '?', '#', '\' or second '@' anywhere in it, a host without ':' and a port of digits. Git and curl end the authority at the first '/', '?' or '#'
+# (RFC 3986 section 3.2), so 'https://evil.example#@github.com/o/r' contacts evil.example: splitting it at the last '@' named github.com. Test-GitRemoteUrlSame keys any other
+# authority by its raw string (byte-equal only) and the redactors print it as 'scheme://***', so a log line never names a host the url does not contact.
+function Test-UrlAuthorityPlain([string]$Authority) { return ("$Authority" -match '^(?:[^@?#\\/]*@)?[^@?#\\/:]*(?::[0-9]*)?$') }
+
 function ConvertTo-RedactedUrlText {
     param([string]$Text)
-    $s = [regex]::Replace("$Text", '(?im)([a-z][a-z0-9+.\-]*://)[^/\r\n]*@', '$1***@')
+    # r26: in free text the authority span runs to the first '/' or line end, and stops before the next 'scheme://' (two urls on one line are judged apart). A span whose
+    # userinfo part (before its last '@') holds '@', '?', '#' or '\' is not the authority Git contacts: it is printed 'scheme://***', never '***@<a host after it>'.
+    $s = [regex]::Replace("$Text", '(?im)([a-z][a-z0-9+.\-]*://)((?:(?![a-z][a-z0-9+.\-]*://)[^/\r\n])*)', {
+            param($m)
+            $span = $m.Groups[2].Value; $at = $span.LastIndexOf('@')
+            if ($at -ge 0 -and $span.Substring(0, $at) -match '[@?#\\]') { return $m.Groups[1].Value + '***' }
+            return $m.Value
+        })
+    $s = [regex]::Replace($s, '(?im)([a-z][a-z0-9+.\-]*://)[^/\r\n]*@', '$1***@')
     return ([regex]::Replace($s, '(?im)([a-z][a-z0-9+.\-]*://[^\r\n?#]*)[?#][^\r\n]*', '$1?***'))
 }
 
@@ -312,22 +326,44 @@ function Get-RemoteUrlsRaw {
 }
 
 # r23 (adversary pass 26 on ae45ed76, A1/A2): what Git applies to a url ARGUMENT before it connects, read raw. Rules = every url.<base>.insteadOf / pushInsteadOf prefix.
-# Names = every configured remote name (the subsection of any remote.<name>.* key, plus the legacy .git/remotes and .git/branches file names): git fetch / ls-remote / push
+# Names = every configured remote name (the subsection of any remote.<name>.* key; r26: a legacy remotes/ or branches/ entry in the common or per-worktree git dir is
+# no longer listed here but refused outright, LEASE_LEGACY_REMOTE_ALIAS_PRESENT): git fetch / ls-remote / push
 # read their url argument as a remote NAME first, so a url string that is also a remote name would be resolved to that remote's url / pushurl, never the url that was checked.
 # -RepoDir may be a directory outside any repository (an initial clone): the global, system and command-scope rules are read there and Names is then empty.
 function Get-RemoteUrlContext {
-    param([string]$RepoDir)
+    # r26: -RulesOnly is for an initial clone's probe directory (Get-CloneProbeDir), which need not be a repository: its callers use Rules only, so no Names census is taken
+    param([string]$RepoDir, [switch]$RulesOnly)
     $rules = @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key '^url\..*\.(insteadof|pushinsteadof)$' -Regexp | ForEach-Object { $nl = $_.IndexOf("`n"); if ($nl -ge 0) { $_.Substring($nl + 1) } else { '' } })
+    if ($RulesOnly) { return @{ Rules = [string[]]$rules; Names = [string[]]@() } }
     $names = [Collections.Generic.List[string]]::new()
     foreach ($rec in @(Get-GitConfigValuesRaw -RepoDir $RepoDir -Key '^remote\.' -Regexp)) {
         $k = "$rec"; $nl = $k.IndexOf("`n"); if ($nl -ge 0) { $k = $k.Substring(0, $nl) }
         $dot = $k.LastIndexOf('.'); if ($dot -gt 7) { $names.Add($k.Substring(7, $dot - 7)) }
     }
-    foreach ($legacy in 'remotes', 'branches') {
-        $ld = Join-Path (Join-Path $RepoDir '.git') $legacy
-        if (Test-Path -LiteralPath $ld -PathType Container) { foreach ($lf in @(Get-ChildItem -LiteralPath $ld -File -Force)) { $names.Add($lf.Name) } }
+    # r26 (sol r25 B1; HUB RULING fail closed): Git reads legacy aliases from remotes/<name> and branches/<name> of the COMMON git dir, which in a linked worktree is not
+    # '$RepoDir\.git' (a file there): the r23 census missed them and a url string could resolve as an alias while the guard compared the literal. Alias files are no longer
+    # parsed: ANY entry under remotes\ or branches\ of the common or the per-worktree git dir refuses typed LEASE_LEGACY_REMOTE_ALIAS_PRESENT (move it aside to proceed).
+    foreach ($gd in @(Get-GitDirsResolved -RepoDir $RepoDir)) {
+        foreach ($legacy in 'remotes', 'branches') {
+            $ld = Join-Path $gd $legacy
+            if (-not (Test-Path -LiteralPath $ld)) { continue }
+            $entry = $(if (Test-Path -LiteralPath $ld -PathType Container) { @(Get-ChildItem -LiteralPath $ld -Force -ErrorAction Stop) | Select-Object -First 1 } else { Get-Item -LiteralPath $ld -Force -ErrorAction Stop })
+            if ($entry) { throw "LEASE_LEGACY_REMOTE_ALIAS_PRESENT $($entry.FullName) is a legacy remote alias entry (refused, never parsed: Git could resolve a url argument through it; move it aside and re-run)" }
+        }
     }
     return @{ Rules = [string[]]$rules; Names = [string[]]$names.ToArray() }
+}
+
+# r26 (sol r25 B1): the per-worktree and the common git dir of -RepoDir, as Git resolves them ('git rev-parse --path-format=absolute --git-dir --git-common-dir').
+# A failed resolution, an answer that is not exactly two lines, or a path that is not a directory throws LEASE_GIT_DIR_UNRESOLVED (never an empty list: the census refuses).
+function Get-GitDirsResolved {
+    param([string]$RepoDir)
+    $out = @(Invoke-GitTraceScrubbed { & git -C $RepoDir rev-parse --path-format=absolute --git-dir --git-common-dir 2>$null })
+    $code = $LASTEXITCODE
+    $dirs = @($out | ForEach-Object { "$_".TrimEnd("`r") } | Where-Object { $_ -ne '' })
+    if ($code -ne 0 -or $dirs.Count -ne 2) { throw "LEASE_GIT_DIR_UNRESOLVED git rev-parse --git-dir --git-common-dir in $RepoDir exited $code with $($dirs.Count) path(s) (the legacy remote alias census is refused)" }
+    foreach ($d in $dirs) { if (-not (Test-Path -LiteralPath $d -PathType Container)) { throw "LEASE_GIT_DIR_UNRESOLVED git dir '$d' of $RepoDir is not a directory (the legacy remote alias census is refused)" } }
+    return [string[]]$dirs
 }
 
 # r23 A2: the directory an initial clone's rules are read in: the nearest existing ancestor of the clone destination, else the user profile. A repository there only adds rules
@@ -759,7 +795,7 @@ function Invoke-PhaseClone {
         Invoke-Step "Clone MLV-App fork into $Repo (remote 'fork' = SuperDimensionalSpaceFortress, 'origin' = ilia3101, as on VIRTUAL-TEN)" {
             # r23 (adversary pass 26 A2 sibling): the clone url is checked against the url rewrite rules BEFORE the clone (a rewritten url would clone another repository)
             $cWhy = ''
-            try { $cCtx = Get-RemoteUrlContext -RepoDir (Get-CloneProbeDir $Repo); $cWhy = Get-RemoteUrlRefusal -Urls @($ForkUrl) -Rules $cCtx.Rules } catch { $cWhy = "$($_.Exception.Message)" }
+            try { $cCtx = Get-RemoteUrlContext -RepoDir (Get-CloneProbeDir $Repo) -RulesOnly; $cWhy = Get-RemoteUrlRefusal -Urls @($ForkUrl) -Rules $cCtx.Rules } catch { $cWhy = "$($_.Exception.Message)" }
             if ($cWhy) { $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo fork"); throw "CLONE_REMOTE_MISMATCH $Repo clone url $ForkUrl is refused ($cWhy); nothing was cloned" }
             [void](Invoke-Native -Exe 'git' -Arguments @('-c', 'core.longpaths=true', 'clone', '--origin', 'fork', $ForkUrl, $Repo))
         }
@@ -826,7 +862,7 @@ function Invoke-PhaseClone {
         Invoke-Step "Clone doctrine bus into $DoctrineRepo" {
             # r23 (adversary pass 26 A2 sibling): the doctrine clone url is checked against the url rewrite rules before the clone, like the MLV-App clone above
             $dcWhy = ''
-            try { $dcCtx = Get-RemoteUrlContext -RepoDir (Get-CloneProbeDir $DoctrineRepo); $dcWhy = Get-RemoteUrlRefusal -Urls @($DoctrineUrl) -Rules $dcCtx.Rules } catch { $dcWhy = "$($_.Exception.Message)" }
+            try { $dcCtx = Get-RemoteUrlContext -RepoDir (Get-CloneProbeDir $DoctrineRepo) -RulesOnly; $dcWhy = Get-RemoteUrlRefusal -Urls @($DoctrineUrl) -Rules $dcCtx.Rules } catch { $dcWhy = "$($_.Exception.Message)" }
             if ($dcWhy) { $script:Failures.Add("CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo"); throw "CLONE_DOCTRINE_REMOTE_MISMATCH $DoctrineRepo clone url $DoctrineUrl is refused ($dcWhy); nothing was cloned" }
             $code = Invoke-Native -Exe 'git' -Arguments @('clone', $DoctrineUrl, $DoctrineRepo) -AllowFail
             if ($code -ne 0) { Write-Log 'doctrine bus clone failed (private repo?): run "gh auth login", then re-run -Phase Clone' 'MANUAL' }
@@ -851,11 +887,21 @@ function Invoke-PhaseClone {
 }
 
 # r15 pass 14 A2: a remote URL as it may be printed: every 'scheme://<userinfo>@' part (a user, a user:password, a token) is replaced by 'scheme://***@'.
+# r26 (fable key3 r25 B1): a second '@' (or a '?', '#' or '\') in the authority now prints the whole value as 'scheme://***' (Test-UrlAuthorityPlain); the r17 text below
+# describes a plain authority.
 # r17 F2 (opus key3 B2 = sol B3 = fable B2): the userinfo runs to the LAST '@' before the path ('https://alice:p@ssw0rd@github.com/...' prints 'https://***@github.com/...',
 # not '***@ssw0rd@'), and everything after a '?' or '#' (a query-string token, a fragment) is dropped and printed '?***'. It works on any text (a log line, a
 # git error that quotes the URL), so Write-Log applies it to every line it writes. An scp-like 'git@github.com:o/r.git' has no scheme and no secret; it is unchanged.
 function Get-RedactedRemoteUrl {
     param([string]$Url)
+    # r26 (fable key3 r25 B1): the authority rule (Test-UrlAuthorityPlain). An authority that is not [userinfo@]host[:port], or an '@' anywhere after the authority (path,
+    # query or fragment), prints as 'scheme://***' and nothing more: no host the url does not contact, and no tail of a password that held a '/'.
+    $mA = [regex]::Match("$Url", '(?is)^(\s*[a-z][a-z0-9+.\-]*://)(.*)$')
+    if ($mA.Success) {
+        $rest = $mA.Groups[2].Value; $sl = $rest.IndexOf('/')
+        $auth = $(if ($sl -ge 0) { $rest.Substring(0, $sl) } else { $rest })
+        if (-not (Test-UrlAuthorityPlain $auth) -or ($sl -ge 0 -and $rest.Substring($sl).Contains('@'))) { return ($mA.Groups[1].Value + '***') }
+    }
     # r17 pass 18 A1: the value is ONE URL, so a space in it ends nothing: userinfo runs to the last '@' of the whole value, and everything after its first '?' or '#' goes
     $u = [regex]::Replace("$Url", '(?is)^(\s*[a-z][a-z0-9+.\-]*://).*@', '$1***@')
     $u = [regex]::Replace($u, '(?s)^([^?#]*)[?#].*$', '$1?***')
@@ -892,6 +938,9 @@ function Test-GitRemoteUrlSame {
         $isScp = (-not $mUrl.Success) -and $colon -ge 2 -and ($slash -lt 0 -or $slash -gt $colon) -and -not $s.Contains('://') -and $s -notmatch '^(?i)file:'
         if ($mUrl.Success) {
             $scheme = $mUrl.Groups[1].Value.ToLowerInvariant(); $auth = $mUrl.Groups[2].Value; $path = $mUrl.Groups[3].Value
+            # r26 (fable key3 r25 B1; HUB RULING fail closed): every scheme's authority must be exactly [userinfo@]host[:port] (Test-UrlAuthorityPlain: no '?', '#', '\' or
+            # second '@'), else the url is keyed raw. 'https://evil.example#@github.com/o/r' used to split at the last '@' and key as the GitHub fork while Git contacts evil.example.
+            if (-not (Test-UrlAuthorityPlain $auth)) { return "raw:$s" }
             $at = $auth.LastIndexOf('@')
             if ($at -ge 0) { $user = $auth.Substring(0, $at); $hostName = $auth.Substring($at + 1) } else { $hostName = $auth }
             if ($scheme -eq 'ssh') {

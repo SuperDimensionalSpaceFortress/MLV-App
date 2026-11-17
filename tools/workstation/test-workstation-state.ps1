@@ -1887,12 +1887,14 @@ if ($fnLoaded -and (Test-Has 'Get-ImportCredentialSkips' 'r17 F1') -and (Test-Ha
 if ($fnLoaded -and (Test-Has 'Get-RedactedRemoteUrl' 'r17 F2') -and (Test-Has 'Test-GitRemoteUrlSame' 'r17 F2')) {
     $f2 = [ordered]@{
         'https://github.com/other/repo.git?access_token=OWNER_HUNTER2'                       = 'https://github.com/other/repo.git?***'
-        'https://alice:p@ssw0rd@github.com/SuperDimensionalSpaceFortress/MLV-App.git'         = 'https://***@github.com/SuperDimensionalSpaceFortress/MLV-App.git'
+        # r26 (fable key3 r25 B1, HUB RULING): a second '@' makes the authority uncertain, so the whole authority and the rest are redacted (no host is named)
+        'https://alice:p@ssw0rd@github.com/SuperDimensionalSpaceFortress/MLV-App.git'         = 'https://***'
         'https://x-access-token:TOK@github.com/o/r.git#frag=TOK2'                            = 'https://***@github.com/o/r.git?***'
         'git@github.com:o/r.git'                                                             = 'git@github.com:o/r.git'
     }
     foreach ($k in $f2.Keys) { $got = Get-RedactedRemoteUrl $k; Assert-That ($got -ceq $f2[$k]) "r17 F2 url: $k prints as $($f2[$k])" $got }
-    Assert-That (Test-GitRemoteUrlSame 'https://alice:p@ssw0rd@github.com/SuperDimensionalSpaceFortress/MLV-App.git' 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git') 'r17 F2 url: a password with an unencoded @ does not change the repository the URL names'
+    # r26 (fable key3 r25 B1, HUB RULING): an authority with a second '@' is not [userinfo@]host[:port], so it is keyed raw and is NOT the GitHub repository (fail closed)
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://alice:p@ssw0rd@github.com/SuperDimensionalSpaceFortress/MLV-App.git' 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git')) 'r26 url (was r17 F2): a password with an unencoded @ makes the authority uncertain; it is keyed raw and never equals the fork'
     Assert-That (-not (Test-GitRemoteUrlSame 'https://alice:p@ssw0rd@github.com/other/MLV-App.git' 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git')) 'r17 F2 url control: another owner is still another repository'
     # the setup log sink: no line it writes carries a query token or a password, whoever printed it
     $f2Log = Join-Path (New-Scratch 'r17-f2-sink') 'sink.log'
@@ -2556,6 +2558,115 @@ if ($fnLoaded -and (Test-Has 'Open-GateLock' 'r22 sol B2')) {
     Assert-That ($r22g.Exit -eq 5 -and $r22gText -match 'GATE_LOCK_IO_FAILED' -and $r22gText -notmatch 'release is in progress' -and -not (Test-Path -LiteralPath $gateMarker)) 'r22 sol B2 gate: an unopenable gate lock is GATE_LOCK_IO_FAILED exit 5, not a release-in-progress skip, and the target does not run' "exit=$($r22g.Exit)`n$r22gText"
     $r22rel = Invoke-Setup (New-Scratch 'home-r22-r') @('-Phase', 'LeaseRelease', '-StateRoot', (New-Scratch 'state-r22-r'), '-LockRoot', $r22lrDir, '-Workspace', $wsR22)
     Assert-That ($r22rel.Exit -eq 5 -and $r22rel.Out -match 'GATE_LOCK_IO_FAILED' -and $r22rel.Out -notmatch 'task is running' -and (Get-LeaseHolder $wsR22) -ceq $me) 'r22 sol B2 release: an unopenable gate lock is GATE_LOCK_IO_FAILED exit 5, not a running-gate refusal, and the lease is unchanged' "exit=$($r22rel.Exit)`n$($r22rel.Out)"
+}
+
+# ================================================================ r26 (sol r25 B1, fable key3 r25 B1; HUB RULING fail closed, no more spelling chases)
+# sol r25 B1: Git reads legacy remote aliases (remotes/<name>, branches/<name>) from the COMMON git dir, which in a linked worktree is not '$Repo\.git' (a file there).
+# Any entry under remotes/ or branches/ of the common or the per-worktree git dir is refused typed LEASE_LEGACY_REMOTE_ALIAS_PRESENT; alias files are never parsed.
+if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r26 sol B1') -and (Get-Command New-R22LeaseRepo -ErrorAction SilentlyContinue)) {
+    # (a) sol's input: a linked worktree, url 'lease.git', pushurl 'lease.git/', '<common>\remotes\lease.git' says 'URL: other.git', and a bare '<worktree>\lease.git'
+    $r26main = New-R22LeaseRepo 'repo-r26-a'; $r26other = $script:r22other; $r26read = $script:r22read
+    $r26wt = Join-Path (Split-Path $r26main) 'wt'
+    & git -C $r26main worktree add -q --detach $r26wt 'refs/hub-lease-local/mlv-app' 2>$null
+    $r26local = Join-Path $r26wt 'lease.git'; & git init -q --bare $r26local 2>$null; & git -C $r22seed push -q --no-verify $r26local "HEAD:$LeaseRef" 2>$null
+    $r26common = ("$(& git -C $r26wt rev-parse --path-format=absolute --git-common-dir 2>$null)").Trim()
+    [void][IO.Directory]::CreateDirectory((Join-Path $r26common 'remotes'))
+    [IO.File]::WriteAllText((Join-Path $r26common 'remotes\lease.git'), "URL: $($r26other -replace '\\', '/')`n", [Text.Encoding]::ASCII)
+    & git -C $r26wt remote add fork 'lease.git' 2>$null; & git -C $r26wt config remote.fork.pushurl 'lease.git/' 2>$null
+    $r26gSaved = $script:Repo; $script:Repo = $r26wt
+    try { $r26gh = Get-HubLease } finally { $script:Repo = $r26gSaved }
+    Assert-That ("$($r26gh.Error)" -match 'LEASE_LEGACY_REMOTE_ALIAS_PRESENT') 'r26 sol B1 lease read: a linked worktree whose common git dir holds remotes/lease.git is refused (LEASE_LEGACY_REMOTE_ALIAS_PRESENT), the alias is never parsed' "err=$($r26gh.Error)"
+    $r26aErr = Invoke-R22Lease $r26wt @{ Exists = $true; Sha = $r22S; Holder = ''; Url = 'lease.git' } 'r26a'
+    Assert-That ($r26aErr -match 'LEASE_LEGACY_REMOTE_ALIAS_PRESENT' -and (Get-R22Ref $r26local) -ceq $r22S -and (Get-R22Ref $r26other) -ceq $r22S) 'r26 sol B1 lease: the push guard refuses a common-dir legacy alias; neither lease.git/ nor other.git receives a push' "err=$r26aErr localRef=$(Get-R22Ref $r26local) otherRef=$(Get-R22Ref $r26other) S=$r22S"
+    # (b) the per-worktree git dir: a 'branches\x' entry there is refused too (plain urls, no alias name in use)
+    $r26bmain = New-R22LeaseRepo 'repo-r26-b'; $r26bread = $script:r22read
+    $r26bwt = Join-Path (Split-Path $r26bmain) 'wt'
+    & git -C $r26bmain worktree add -q --detach $r26bwt 'refs/hub-lease-local/mlv-app' 2>$null
+    $r26bgd = ("$(& git -C $r26bwt rev-parse --path-format=absolute --git-dir 2>$null)").Trim()
+    [void][IO.Directory]::CreateDirectory((Join-Path $r26bgd 'branches')); [IO.File]::WriteAllText((Join-Path $r26bgd 'branches\x'), "unrelated`n", [Text.Encoding]::ASCII)
+    & git -C $r26bwt remote add fork $r26bread 2>$null
+    $r26bErr = Invoke-R22Lease $r26bwt @{ Exists = $true; Sha = $r22S; Holder = ''; Url = $r26bread } 'r26b'
+    Assert-That ($r26bErr -match 'LEASE_LEGACY_REMOTE_ALIAS_PRESENT' -and (Get-R22Holder $r26bread) -ceq '') 'r26 sol B1 lease: an entry under the per-worktree git dir branches\ is refused; nothing is pushed' "err=$r26bErr holder=$(Get-R22Holder $r26bread)"
+    # (c) a main worktree: any entry under .git\remotes (an unrelated name) refuses, not only one whose name equals a url
+    $r26c = New-R22LeaseRepo 'repo-r26-c'; $r26cread = $script:r22read
+    [void][IO.Directory]::CreateDirectory((Join-Path $r26c '.git\remotes')); [IO.File]::WriteAllText((Join-Path $r26c '.git\remotes\unrelated'), "URL: x`n", [Text.Encoding]::ASCII)
+    & git -C $r26c remote add fork $r26cread 2>$null
+    $r26cErr = Invoke-R22Lease $r26c @{ Exists = $true; Sha = $r22S; Holder = ''; Url = $r26cread } 'r26c'
+    Assert-That ($r26cErr -match 'LEASE_LEGACY_REMOTE_ALIAS_PRESENT' -and (Get-R22Holder $r26cread) -ceq '') 'r26 sol B1 lease: any entry under .git\remotes refuses (fail closed, never parsed)' "err=$r26cErr holder=$(Get-R22Holder $r26cread)"
+    # (d) control: a linked worktree with EMPTY remotes\ and branches\ folders still acquires the lease in the repository it read
+    $r26dmain = New-R22LeaseRepo 'repo-r26-d'; $r26dread = $script:r22read
+    $r26dwt = Join-Path (Split-Path $r26dmain) 'wt'
+    & git -C $r26dmain worktree add -q --detach $r26dwt 'refs/hub-lease-local/mlv-app' 2>$null
+    $r26dcommon = ("$(& git -C $r26dwt rev-parse --path-format=absolute --git-common-dir 2>$null)").Trim()
+    foreach ($ld in 'remotes', 'branches') { [void][IO.Directory]::CreateDirectory((Join-Path $r26dcommon $ld)) }
+    & git -C $r26dwt remote add fork $r26dread 2>$null
+    $r26dErr = Invoke-R22Lease $r26dwt @{ Exists = $true; Sha = $r22S; Holder = ''; Url = $r26dread } 'r26d'
+    Assert-That ($r26dErr -eq '' -and (Get-R22Holder $r26dread) -ceq 'TEST-HOST') 'r26 sol B1 lease control: a linked worktree with empty legacy folders acquires the lease in the repository it read' "err=$r26dErr holder=$(Get-R22Holder $r26dread)"
+    # (e) a git dir that cannot be resolved refuses (the census never assumes an empty list)
+    if (Test-Has 'Get-RemoteUrlContext' 'r26 sol B1 unresolved') {
+        $r26eDir = New-Scratch 'r26-not-a-repo'; $r26eErr = ''
+        $r26eSaved = [Environment]::GetEnvironmentVariable('GIT_CEILING_DIRECTORIES'); [Environment]::SetEnvironmentVariable('GIT_CEILING_DIRECTORIES', (Split-Path $r26eDir))
+        try { [void](Get-RemoteUrlContext -RepoDir $r26eDir) } catch { $r26eErr = $_.Exception.Message } finally { [Environment]::SetEnvironmentVariable('GIT_CEILING_DIRECTORIES', $r26eSaved) }
+        Assert-That ($r26eErr -match 'LEASE_GIT_DIR_UNRESOLVED') 'r26 sol B1 census: a directory whose git dir cannot be resolved is refused typed LEASE_GIT_DIR_UNRESOLVED' "err=$r26eErr"
+    }
+}
+# fable key3 r25 B1: an https authority holding '#', '?', '\' or a second '@' before the host is not [userinfo@]host[:port]: Git and curl end it at the first '?' or '#', so the
+# url is keyed by its raw string (byte-equal only) and the redactor never prints a host the url does not contact.
+if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r26 fable B1') -and (Test-Has 'Get-RedactedRemoteUrl' 'r26 fable B1') -and (Test-Has 'ConvertTo-RedactedUrlText' 'r26 fable B1')) {
+    $r26gh = 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git'
+    foreach ($bad in @('https://evil.example#@github.com/SuperDimensionalSpaceFortress/MLV-App.git', 'https://evil.example?@github.com/SuperDimensionalSpaceFortress/MLV-App.git',
+            'https://evil.example\@github.com/SuperDimensionalSpaceFortress/MLV-App.git', 'https://a@evil.example#@github.com/SuperDimensionalSpaceFortress/MLV-App.git')) {
+        Assert-That (-not (Test-GitRemoteUrlSame $bad $r26gh)) "r26 fable B1 url: $bad is not the GitHub fork (Git connects to evil.example)"
+        Assert-That (Test-GitRemoteUrlSame $bad $bad) "r26 fable B1 url: $bad is keyed raw (equal only to the identical string)"
+        $red = Get-RedactedRemoteUrl $bad
+        Assert-That ($red -notmatch 'github' -and $red -notmatch 'evil') "r26 fable B1 redact: $bad prints without naming a host ($red)" $red
+        $txt = ConvertTo-RedactedUrlText "remote 'fork' pushes to $bad, expected x"
+        Assert-That ($txt -notmatch '\*\*\*@github') "r26 fable B1 sink: free text quoting $bad never prints ***@github" $txt
+    }
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://127.0.0.1:9#@github.com/o/r' 'https://github.com/o/r')) 'r26 fable B1 url: https://127.0.0.1:9#@github.com/o/r is not https://github.com/o/r'
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://evil.example?@nas.example/p' 'https://nas.example/p')) 'r26 fable B1 url: a non-GitHub https authority with ?@ is keyed raw'
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://alice:pa/ss@github.com/o/r' 'https://github.com/o/r')) 'r26 fable B1 url: an @ after the first / is path, not userinfo'
+    Assert-That ((Get-RedactedRemoteUrl 'https://alice:pa/ss@github.com/o/r') -notmatch 'github|ss') 'r26 fable B1 redact: an @ after the first / is fully redacted (no host that is not contacted, no password tail)' (Get-RedactedRemoteUrl 'https://alice:pa/ss@github.com/o/r')
+    Assert-That ((Format-RemoteUrlForLog 'https://127.0.0.1:9#@github.com/o/r') -notmatch 'github') 'r26 fable B1 redact: Format-RemoteUrlForLog never names github.com for 127.0.0.1:9#@github.com' (Format-RemoteUrlForLog 'https://127.0.0.1:9#@github.com/o/r')
+    # controls: a plain userinfo, a port and a query after the path are unchanged
+    Assert-That (Test-GitRemoteUrlSame 'https://x-access-token:TOK@github.com/o/r.git' 'https://github.com/o/r') 'r26 url control: a plain token userinfo still names the GitHub repository'
+    Assert-That (Test-GitRemoteUrlSame 'https://nas.example:8443/p' 'https://NAS.example:8443/p') 'r26 url control: host:port is plain (host case-folded)'
+    Assert-That (-not (Test-GitRemoteUrlSame 'https://nas.example:8443/p' 'https://nas.example/p')) 'r26 url control: a port is significant'
+    Assert-That ((Get-RedactedRemoteUrl 'https://u:pw@nas.example:8443/p?t=1') -ceq 'https://***@nas.example:8443/p?***') 'r26 redact control: a plain authority with a port prints its host' (Get-RedactedRemoteUrl 'https://u:pw@nas.example:8443/p?t=1')
+}
+if ($fnLoaded -and (Test-Has 'Set-HubLease' 'r26 fable B1 lease') -and (Get-Command New-R22LeaseRepo -ErrorAction SilentlyContinue)) {
+    # the lease guard: fetch https://github.com/o/r, push https://127.0.0.1:9#@github.com/o/r (GIT_ALLOW_PROTOCOL=file here, so nothing can connect)
+    $r26f = New-R22LeaseRepo 'repo-r26-f'
+    & git -C $r26f remote add fork 'https://github.com/o/r' 2>$null; & git -C $r26f config remote.fork.pushurl 'https://127.0.0.1:9#@github.com/o/r' 2>$null
+    $r26fErr = Invoke-R22Lease $r26f @{ Exists = $true; Sha = $r22S; Holder = ''; Url = 'https://github.com/o/r' } 'r26f'
+    $r26fLog = Join-Path (Split-Path $r26f) 'lease-r26f.log'
+    $r26fLogText = $(if (Test-Path -LiteralPath $r26fLog) { [IO.File]::ReadAllText($r26fLog) } else { '' })
+    Assert-That ($r26fErr -match 'LEASE_PUSH_URL_DIFFERS' -and $r26fErr -notmatch '\*\*\*@github' -and ($r26fLogText + $r26fErr) -notmatch '> git .*push') 'r26 fable B1 lease: a push url whose authority holds #@ is LEASE_PUSH_URL_DIFFERS, nothing is pushed, and no line names ***@github.com' "err=$r26fErr`nlog=$r26fLogText"
+}
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r26 clone')) {
+    # Clone and doctrine siblings of both blockers: run 1 = a legacy branches\ entry in MLV-App + a doctrine origin pushurl with #@; run 2 = a fork pushurl with ?@ + a doctrine remotes\ entry
+    foreach ($r26case in @(@{ N = 1; Legacy = 'mlv'; ForkPush = ''; DocPush = 'https://evil.example#@github.com/layibabalola/softwarefactory-fleet-doctrine.git' },
+            @{ N = 2; Legacy = 'doc'; ForkPush = 'https://evil.example?@github.com/SuperDimensionalSpaceFortress/MLV-App.git'; DocPush = '' })) {
+        $r26cws = New-Scratch "r26-clone-$($r26case.N)"
+        $r26crepo = Join-Path $r26cws 'MLV-App'; [void][IO.Directory]::CreateDirectory($r26crepo); & git -C $r26crepo init -q 2>$null
+        & git -C $r26crepo remote add fork $ForkUrl 2>$null; & git -C $r26crepo remote add origin $UpstreamUrl 2>$null
+        if ($r26case.ForkPush) { & git -C $r26crepo config remote.fork.pushurl $r26case.ForkPush 2>$null }
+        $r26cdoc = Join-Path $r26cws 'doctrine'; [void][IO.Directory]::CreateDirectory($r26cdoc); & git -C $r26cdoc init -q 2>$null; & git -C $r26cdoc remote add origin $DoctrineUrl 2>$null
+        if ($r26case.DocPush) { & git -C $r26cdoc config remote.origin.pushurl $r26case.DocPush 2>$null }
+        $r26lroot = $(if ($r26case.Legacy -eq 'mlv') { Join-Path $r26crepo '.git\branches' } else { Join-Path $r26cdoc '.git\remotes' })
+        [void][IO.Directory]::CreateDirectory($r26lroot); [IO.File]::WriteAllText((Join-Path $r26lroot 'x'), "URL: x`n", [Text.Encoding]::ASCII)
+        $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo; $savedLog = $script:LogFile
+        $script:Repo = $r26crepo; $Repo = $r26crepo; $script:DoctrineRepo = $r26cdoc; $DoctrineRepo = $r26cdoc; $script:LogFile = Join-Path $r26cws 'clone.log'
+        $script:Failures.Clear()
+        try { Invoke-PhaseClone *>&1 | Out-Null } catch { }
+        $r26clog = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+        $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog
+        $r26forkWant = $(if ($r26case.N -eq 1) { 'CLONE_REMOTE_MISMATCH* fork' } else { 'CLONE_REMOTE_MISMATCH* fork pushurl' })
+        Assert-That (@($script:Failures | Where-Object { $_ -like $r26forkWant }).Count -eq 1) "r26 clone ($($r26case.N)): the MLV-App fork is refused typed ($r26forkWant)" ($script:Failures -join ',')
+        Assert-That (@($script:Failures | Where-Object { $_ -like 'CLONE_DOCTRINE_REMOTE_MISMATCH*' }).Count -eq 1) "r26 doctrine ($($r26case.N)): the doctrine checkout is refused typed CLONE_DOCTRINE_REMOTE_MISMATCH" ($script:Failures -join ',')
+        Assert-That ($r26clog -notmatch '\*\*\*@github\.com/(SuperDimensionalSpaceFortress|layibabalola)' -and $r26clog -notmatch 'fetch --quiet') "r26 clone ($($r26case.N)): nothing is fetched and no log line names ***@github.com for a url that would contact evil.example" $r26clog
+        $script:Failures.Clear()
+    }
 }
 foreach ($n in @($r22envSaved.Keys)) { [Environment]::SetEnvironmentVariable($n, $r22envSaved[$n]) }
 
