@@ -302,6 +302,10 @@ try {
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.WorkingDirectory = $pkgDir
+    # r2 (adversary A1): the child inherits the venue agent's environment; an MLVAPP_GPU_EXPORT=1 there made the 'cpu' leg a GPU export under a cpu label. Every inherited
+    # MLVAPP_* variable is removed before this job sets its own below, and the names removed are published in the summary.
+    $mlvappEnvScrubbed = @()
+    foreach ($envKey in @($psi.Environment.Keys | Where-Object { $_ -like 'MLVAPP_*' })) { [void]$psi.Environment.Remove($envKey); $mlvappEnvScrubbed += [string]$envKey }
     $psi.Environment['QT_QPA_PLATFORM'] = 'windows'
     $psi.Environment['QT_QPA_PLATFORM_PLUGIN_PATH'] = (Join-Path $pkgDir 'platforms')
     $psi.Environment['QT_PLUGIN_PATH'] = $pkgDir
@@ -360,7 +364,7 @@ try {
     Save-Json $manifest (Join-Path $Pub 'output-manifest.json')
     Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
                                    framesExported = $exported; outputCount = $outputs.Count; outputsDeleted = $manifest.deleted; ffmpegPresent = $ffmpegPresent
-                                   executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord }
+                                   executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord; mlvappEnvScrubbed = @($mlvappEnvScrubbed) }
     Write-Output "RESULT=$result FRAMES=$exported ARTIFACTS=$Pub"
     exit $exitFor[$result]
 } finally {

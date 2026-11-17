@@ -3931,7 +3931,7 @@ function Get-DvExportEvidence {
                 profileFramesFailed (CDNG), stageFramesSeen (ProRes), dualIsoActiveFrames, dualIsoClassAgrees, outputFileCount, outputBytes, wallSeconds,
                 exportFps, largestStage, largestStageShare; a metric the format cannot carry is null with <metric>CouldNotCheck naming why;
       stages    the per-stage table (denominator, rows with samples / meanMs / medianMs / share, writer rows for CDNG, nesting and residual for ProRes);
-      problems  typed reasons the run is no measurement (EXPORT_PROFILE_ABSENT, EXPORT_OUTPUT_MISMATCH, EXPORT_PROFILE_FOREIGN, EXPORT_BATCH_LOG_UNREADABLE);
+      problems  typed reasons the run is no measurement (EXPORT_PROFILE_ABSENT -- also a profile / stage log with no stage figure, EXPORT_OUTPUT_MISMATCH, EXPORT_OUTPUT_NOT_DELETED, EXPORT_PROFILE_FOREIGN, EXPORT_BATCH_LOG_UNREADABLE);
       classMismatch  the run's own dual-ISO evidence disagrees with the leg's dualIsoExpected (CLIP_CLASS_MISMATCH).
     #>
     param([Parameter(Mandatory)][string]$Format, [Parameter(Mandatory)][int]$MaxFrames, [Parameter(Mandatory)][bool]$DualIsoExpected, [string]$ExpectedBuildId = '',
@@ -3969,6 +3969,10 @@ function Get-DvExportEvidence {
             elseif ($kind -cne $wantKind) { $problems.Add("EXPORT_OUTPUT_MISMATCH: output-manifest.json lists '$kind' output, a $Format export writes $wantKind") }
             elseif ($Format -ceq 'prores') { if ($count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: a ProRes export writes one .mov; the manifest lists $count") } }
             elseif ($null -ne $m.framesExported -and $count -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the manifest lists $count .dng file(s) but the batch exported $($m.framesExported)") }
+            # adversary r2 A3: the exported frames / .mov are derived from the owner's footage and must be gone from the venue; a job whose delete failed (a reader held
+            # a file open) says deleted=false, and a manifest with no boolean true is no proof of the delete either
+            $deleted = Get-DvProp $manifest 'deleted'
+            if (-not ($deleted -is [bool] -and $deleted)) { $problems.Add('EXPORT_OUTPUT_NOT_DELETED: output-manifest.json does not record the exported footage as deleted from the venue (deleted is not true), so derived owner footage may remain there') }
         }
     }
     $stages = $null
@@ -4012,6 +4016,10 @@ function Get-DvExportEvidence {
                                   dngCompressPlacement = (Get-DvProp $profile 'dng_compress_placement'); asyncWriterCanOverlapDngCompress = (Get-DvProp $profile 'async_writer_can_overlap_dng_compress')
                                   largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
+            # adversary r2 A2: a capture is a stage-share measurement; successful rows with no producer_frame_ms (or no producer stage figure at all) measured none
+            if ($ok.Count -gt 0 -and ($denRow.samples -ne $ok.Count -or $null -eq $denRow.meanMs -or [double]$denRow.meanMs -le 0 -or $largest.Count -eq 0)) {
+                $problems.Add("EXPORT_PROFILE_ABSENT: the profile carries no producer_frame_ms and per-stage timings for its $($ok.Count) successful frame(s) ($($denRow.samples) with a denominator, $($largest.Count) producer stage row(s)), so no stage share can be read")
+            }
         }
     }
     else {
@@ -4051,6 +4059,11 @@ function Get-DvExportEvidence {
                                   drainVerify = "$($script:ExportSuccessor): the rendered path times no drain or verify stage"
                                   largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
+            # adversary r2 A2: processed16_total alone is no breakdown; both disjoint children (debayered_frame, processing) must be present and the denominator positive
+            $missingChild = @($script:ExportRenderedTopLevel | Where-Object { $rowsOut[$_].samples -eq 0 })
+            if ($m.stageFramesSeen -gt 0 -and ($null -eq $p16.meanMs -or [double]$p16.meanMs -le 0 -or $missingChild.Count -gt 0)) {
+                $problems.Add("EXPORT_PROFILE_ABSENT: stage-timing.log records no $($missingChild -join ' / ') stage under processed16_total (mean $($p16.meanMs) ms), so no stage share can be read")
+            }
         }
     }
     [pscustomobject]@{ metrics = [pscustomobject]$m; stages = $stages; problems = @($problems); classMismatch = $classMismatch; classDetail = $classDetail }
@@ -4153,7 +4166,7 @@ function Test-DvExportReceiptValid {
     if ($null -ne $summary -and $null -ne $specExport) {
         $venueName = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'name')
         foreach ($pair in @(@('schema', 'export-stage-job.v1'), @('legType', 'export'), @('format', [string](Get-DvProp $specExport 'format')), @('clipId', [string](Get-DvProp $subject 'clipId')), @('backend', 'cpu'),
-                            @('declaredVenue', $venueName), @('buildManifestSha256', [string](Get-DvProp $subject 'buildManifestSha256')), @('receiptSha256', [string](Get-DvProp $specExport 'receiptSha256')))) {
+                            @('declaredVenue', $venueName), @('venue', $venueName), @('buildManifestSha256', [string](Get-DvProp $subject 'buildManifestSha256')), @('receiptSha256', [string](Get-DvProp $specExport 'receiptSha256')))) {
             if ([string](Get-DvProp $summary $pair[0]) -cne $pair[1]) { $Invalid.Add("EXPORT_SUMMARY_MISMATCH: export/summary.json $($pair[0]) is not the receipt's or the leg spec's") }
         }
         if (-not (Test-DvJsonEquivalent (Get-DvProp $summary 'maxFrames') (Get-DvProp $specExport 'maxFrames'))) { $Invalid.Add('EXPORT_SUMMARY_MISMATCH: export/summary.json maxFrames is not the leg spec''s') }

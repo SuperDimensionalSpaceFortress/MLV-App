@@ -349,6 +349,37 @@ class ExportEvidenceTests(unittest.TestCase):
             self.assertEqual(got[i]["outcome"], "INVALID", got[i])
             self.assertTrue(any(token in p for p in got[i]["problems"]), got[i])
 
+    def test_a_capture_with_no_stage_measurement_or_with_footage_left_behind_is_invalid(self) -> None:
+        """adversary r2 A2/A3 (on c3768da1): a captured export whose profile rows carry only frame_index and one dual-ISO figure (CDNG), or whose stage log has
+        processed16_total and no child stage (ProRes), measured no stage share, yet read PASS; and a manifest that does not record the exported footage as
+        deleted (deleted false or absent) read PASS with the derived owner footage still on the venue. Each is INVALID with a typed problem."""
+        bare_profile = json.dumps({"schema": "mlvapp.export_stage_profile.v1", "build_id": BUILD_ID, "frame_count": 30, "dng_compress_placement": "producer",
+                                   "async_writer_can_overlap_dng_compress": False, "stages": {},
+                                   "frames": [{"clip": "view-0", "frame_index": i, "success": True, "llrawproc_dual_iso_ms": 1.0} for i in range(30)]})
+        bare_stage = "".join(f"[mlv-stage-timing] frame={i} stage=processed16_total ms=56.000\n" for i in range(30))
+        one_child = "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms}\n" for i in range(30) for s, ms in (("processed16_total", 56.0), ("processing", 15.0)))
+
+        def manifest(count: int, kind: str, **over) -> str:
+            doc = json.loads(output_manifest(count, kind))
+            doc.update(over)
+            if over.get("deleted", 0) is None:
+                del doc["deleted"]
+            return json.dumps(doc)
+        cases = [cdng_case(profile=bare_profile),                                              # 0 CDNG: no stage figure at all
+                 prores_case(stage=bare_stage),                                                # 1 ProRes: no child stage
+                 prores_case(stage=one_child),                                                 # 2 ProRes: only one of the two disjoint children
+                 cdng_case(manifest=manifest(30, "dng", deleted=False)),                       # 3 CDNG footage left behind
+                 prores_case(manifest=manifest(1, "mov", deleted=False)),                      # 4 ProRes footage left behind
+                 cdng_case(manifest=manifest(30, "dng", deleted=None)),                        # 5 no deleted field
+                 cdng_case(manifest=manifest(30, "dng", deleted="true"))]                      # 6 a string is not true
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i, token in ((0, "EXPORT_PROFILE_ABSENT"), (1, "EXPORT_PROFILE_ABSENT"), (2, "EXPORT_PROFILE_ABSENT"), (3, "EXPORT_OUTPUT_NOT_DELETED"),
+                         (4, "EXPORT_OUTPUT_NOT_DELETED"), (5, "EXPORT_OUTPUT_NOT_DELETED"), (6, "EXPORT_OUTPUT_NOT_DELETED")):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any(token in p for p in got[i]["problems"]), got[i])
+
 
 EXPORT_STUB_GENERATOR = r"""
 param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected)
@@ -378,14 +409,14 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         return path
 
     def write_export_artifacts(self, frames: int, profile: bool = True, venue: str = "bachelor", fmt: str = "cdng-lossless",
-                               exported: int | None = None, result: str = "EXPORT_CAPTURED") -> None:
+                               exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None) -> None:
         a = self.artifacts
         if a.exists():
             shutil.rmtree(a)
         a.mkdir(parents=True)
         exported = frames if exported is None else exported
         summary = {"schema": "export-stage-job.v1", "result": result, "legType": "export", "format": fmt, "maxFrames": frames,
-                   "dualIsoExpected": True, "clipId": "M16-1243", "backend": "cpu", "declaredVenue": venue, "venue": venue,
+                   "dualIsoExpected": True, "clipId": "M16-1243", "backend": "cpu", "declaredVenue": venue, "venue": observed_venue or venue,
                    "sourceCommit": self.sha, "buildManifestSha256": self.build_sha, "receiptSha256": leg(EXPORT_LEGS[0])["export"]["receiptSha256"],
                    "exportWallSeconds": 30.0, "appExitCode": 0, "timedOut": False, "fixtureRehearsal": False}
         (a / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -432,6 +463,35 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                 got = self.validate(r, spec, evidence_dir=str(work))
                 self.assertFalse(got["valid"], got)
                 self.assertIn(got["status"], ("INVALID", "INCOMPLETE"), got)
+
+    def test_a_summary_observed_on_another_venue_is_invalid_at_write_and_at_verify(self) -> None:
+        """adversary r2 A4 (on c3768da1): summary.venue is the host the job MEASURED on (Get-AttrCudaMeasurementVenue); only summary.declaredVenue was compared, so
+        a Bachelor receipt whose job ran on Ultra-Magnus wrote PASS and re-derived VERIFIED. Both identity loops now compare it."""
+        spec = self.export_spec(maxframes=30)
+        self.write_export_artifacts(30, observed_venue="ultra-magnus")
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("EXPORT_SUMMARY_MISMATCH", receipt["outcomeDetail"])
+        # the validator: a good receipt, then its hashed summary rewritten to name another observed venue with every sha256 claim updated to match
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        evdir = Path(receipt["evidence"]["localEvidenceDir"])
+        work = self.tmp / "ev-venue-A4"
+        shutil.copytree(evdir, work)
+        summary = json.loads((work / "export" / "summary.json").read_text(encoding="utf-8"))
+        summary["venue"] = "ultra-magnus"
+        raw = json.dumps(summary).encode("utf-8")
+        (work / "export" / "summary.json").write_bytes(raw)
+        new_sha = hashlib.sha256(raw).hexdigest()
+        r = json.loads(json.dumps(receipt))
+        r["export"]["files"]["summary.json"] = new_sha
+        if r["evidence"].get("summaryJsonSha256"):
+            r["evidence"]["summaryJsonSha256"] = new_sha
+        got = self.validate(r, spec, evidence_dir=str(work))
+        self.assertEqual(got["status"], "INVALID", got)
+        self.assertTrue(any("EXPORT_SUMMARY_MISMATCH" in x for x in got["reasons"]), got)
 
     def test_a_missing_evidence_dir_is_incomplete_not_an_exception(self) -> None:
         """adversary r1 A3: an evidence directory that is not there is a typed INCOMPLETE, never a StrictMode throw."""
@@ -547,6 +607,21 @@ class ExportJobGeneratorTests(unittest.TestCase):
         got = json.loads(proc.stdout)
         self.assertEqual(got["missing"], [], got["missing"])
         self.assertIn("ConvertTo-AttrCudaFileIdObject", got["embedded"], "Get-AttrCudaFileId's callee must ride with it")
+
+    def test_the_app_never_inherits_the_venue_agents_mlvapp_environment(self) -> None:
+        """adversary r2 A1 (on c3768da1): the export child inherited the agent's environment, so MLVAPP_GPU_EXPORT=1 on a CUDA venue made the 'cpu' leg a GPU
+        export under a cpu label. Every inherited MLVAPP_* variable is removed from the child's environment BEFORE the job sets its own (the profiler pair, the
+        stage-timing pair), and the names removed are published in the summary."""
+        proc = run_pwsh(["-Command", f"$d = & '{EXPORT_JOB}' -DescribeTemplate; $d.template"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        template = proc.stdout
+        scrub = template.find("$psi.Environment.Keys")
+        first_set = template.find("$psi.Environment['MLVAPP_")
+        self.assertGreater(scrub, 0, "no scrub of the inherited environment")
+        self.assertGreater(first_set, scrub, "the scrub must precede the job's own MLVAPP_* settings")
+        self.assertIn("-like 'MLVAPP_*'", template[scrub - 200:scrub + 300])
+        self.assertIn("Environment.Remove", template[scrub:first_set])
+        self.assertIn("mlvappEnvScrubbed", template)
 
     def test_the_quiescence_record_carries_the_names_the_leg_batch_reads(self) -> None:
         """r2: the leg batch reads cpuQuiescence.timeMeanPercent from summary.json (VenueChain.psm1 Get-VenueLegPreLoadMean, the playback job's name); an export

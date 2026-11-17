@@ -450,7 +450,7 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   | Job result | Outcome |
   |---|---|
   | `EXPORT_CAPTURED`, exit 0, evidence binds, dual-ISO class agrees | `PASS` or `FAIL` from the criteria |
-  | `EXPORT_CAPTURED` with a non-zero exit; a dual-ISO class mismatch (`CLIP_CLASS_MISMATCH`); a profile from another build; output count disagreeing with `[BATCH] DONE` | `INVALID` |
+  | `EXPORT_CAPTURED` with a non-zero exit; a dual-ISO class mismatch (`CLIP_CLASS_MISMATCH`); a profile from another build; output count disagreeing with `[BATCH] DONE`; a profile or stage log with no stage figure (no `producer_frame_ms`, or no `debayered_frame` / `processing` under `processed16_total`); an output manifest that does not say `deleted: true` (`EXPORT_OUTPUT_NOT_DELETED`); a `summary.json` whose `venue` (the host the job measured on) is not the receipt's venue | `INVALID` |
   | `EXPORT_TIMEOUT` (40), `EXPORT_NO_FRAMES` (41), `EXPORT_FRAMES_SHORT` (42), `EXPORT_EXIT_NONZERO` (46) | `FAIL` |
   | `EXPORT_PROFILE_ABSENT` (43), `EXPORT_OUTPUT_MISMATCH` (44) | `INVALID` |
   | `EXPORT_TOOLING_ABSENT` (45) | `VENUE_TOOLING` |
