@@ -2211,6 +2211,31 @@ if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r21 B1')) {
     Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' 'git@nas.example:~/repos/Lease.git')) 'r21 B1 url: a home-relative path still compares ordinally'
     Assert-That (Test-GitRemoteUrlSame 'git@github.com:Owner/Repo.git' 'ssh://git@github.com/owner/repo') 'r21 B1 url control: github.com ssh spellings still name one repository'
 }
+# r21 adversary pass 25 (its json was unparsable; the text is in sol-001.last.txt) A3 + A4, the same comparator class as B1:
+# A3: Git percent-decodes the path of an ssh:// URL but sends a scp-like path literally ('/repos/lease%20copy.git' vs '/repos/lease copy.git'), so an ssh spelling with a '%' is
+#     not mapped with certainty and is equal only to the identical string. A4: leading or trailing whitespace of a URL is part of what Git sends ('repos/lease.git ' is not
+#     'repos/lease.git'), so the helper no longer trims and the readers strip only the line terminator.
+if ($fnLoaded -and (Test-Has 'Test-GitRemoteUrlSame' 'r21 p25')) {
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:/repos/lease%20copy.git' 'ssh://git@nas.example/repos/lease%20copy.git')) 'r21 p25 A3 url: a percent-encoded path is decoded by Git for ssh:// only, so the two spellings are not the same'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:repos/lease%20copy.git' 'ssh://git@nas.example/~/repos/lease%20copy.git')) 'r21 p25 A3 url: the home-relative percent-encoded pair is not the same either'
+    Assert-That (Test-GitRemoteUrlSame 'ssh://git@nas.example/repos/lease%20copy.git' 'ssh://git@nas.example/repos/lease%20copy.git') 'r21 p25 A3 url control: an identical percent-encoded URL is the same'
+    Assert-That (-not (Test-GitRemoteUrlSame ('git@nas.example:repos/lease.git' + ' ') 'git@nas.example:repos/lease.git')) 'r21 p25 A4 url: a trailing space is part of the path Git sends'
+    Assert-That (-not (Test-GitRemoteUrlSame 'git@nas.example:repos/lease.git' (' ' + 'git@nas.example:repos/lease.git'))) 'r21 p25 A4 url: a leading space is not trimmed away either'
+    Assert-That (Test-GitRemoteUrlSame ('git@nas.example:repos/lease.git' + ' ') ('git@nas.example:repos/lease.git' + ' ')) 'r21 p25 A4 url control: two identical spellings (trailing space included) are the same'
+    $r21wsRepo = Join-Path (New-Scratch 'r21-p25-a4') 'repo'; [void][IO.Directory]::CreateDirectory($r21wsRepo); & git -C $r21wsRepo init -q 2>$null
+    & git -C $r21wsRepo remote add fork ('git@nas.example:repos/lease.git' + ' '); & git -C $r21wsRepo remote set-url --push fork 'git@nas.example:repos/lease.git'   # configuration only: no network is touched
+    $r21err = ''
+    $r21saved = @{ Repo = $script:Repo; Temp = $env:TEMP; Log = $script:LogFile; Name = $GitName; Email = $GitEmail }
+    $script:Repo = $r21wsRepo; $Repo = $r21wsRepo; $env:TEMP = New-Scratch 'r21-p25-a4-temp'; $script:LogFile = Join-Path (Split-Path $r21wsRepo) 'lease.log'
+    $GitName = 'r21 test'; $script:GitName = 'r21 test'; $GitEmail = 'r21@example.invalid'; $script:GitEmail = 'r21@example.invalid'
+    $r21ident = @{}; foreach ($n in 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_NAME') { $r21ident[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, 'r21 test') }
+    try { Set-HubLease -Holder 'TEST-HOST' -Current @{ Exists = $false; Sha = ''; Holder = '' } -Reason 'r21 p25 A4' *>&1 | Out-Null } catch { $r21err = $_.Exception.Message }
+    finally {
+        $script:Repo = $r21saved.Repo; $Repo = $r21saved.Repo; $env:TEMP = $r21saved.Temp; $script:LogFile = $r21saved.Log; $GitName = $r21saved.Name; $script:GitName = $r21saved.Name; $GitEmail = $r21saved.Email; $script:GitEmail = $r21saved.Email
+        foreach ($n in $r21ident.Keys) { [Environment]::SetEnvironmentVariable($n, $r21ident[$n]) }
+    }
+    Assert-That ($r21err -match 'LEASE_PUSH_URL_DIFFERS') 'r21 p25 A4 lease: a fetch url with a trailing space and a push url without it is refused before any push (the reader no longer trims it away)' $r21err
+}
 # r20 adversary pass 23 A2: an apostrophe in the USER part of 'https://user:password@host' does not hide the credential
 if ($fnLoaded -and (Test-Has 'Get-CredentialHitLine' 'r20 p23 A2')) {
     Assert-That (Test-CredentialText 'endpoint = "https://o''brien:hunter2@example.org/repo"') 'r20 p23 A2 detector: an apostrophe in a URL user name does not hide the credential'

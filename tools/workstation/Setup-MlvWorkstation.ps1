@@ -327,8 +327,8 @@ function Set-HubLease {
     if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "LEASE_OBJECT_FAILED git commit-tree exited $LASTEXITCODE; nothing was pushed, the lease ref is unchanged" }
     # r17 pass 19 A6: Get-HubLease reads the lease through the remote's FETCH url and a push goes to its PUSH url(s); a remote whose pushurl names another repository would
     # report the lease acquired while the fork stays unheld. Every push url must name the fetch url's repository, else LEASE_PUSH_URL_DIFFERS and nothing is pushed.
-    $leaseFetchUrl = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $LeaseRemote 2>$null }) -join '').Trim()
-    $leasePushUrls = @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $LeaseRemote 2>$null } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    $leaseFetchUrl = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $LeaseRemote 2>$null }) -join '').TrimEnd("`r", "`n")   # r21 pass 25 A4: only the line terminator goes; whitespace is part of the URL
+    $leasePushUrls = @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $LeaseRemote 2>$null } | ForEach-Object { "$_".TrimEnd("`r", "`n") } | Where-Object { $_ })
     if (-not $leaseFetchUrl -or $leasePushUrls.Count -eq 0 -or @($leasePushUrls | Where-Object { -not (Test-GitRemoteUrlSame $_ $leaseFetchUrl) }).Count -gt 0) {
         Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
         throw "LEASE_PUSH_URL_DIFFERS remote '$LeaseRemote' reads from $(Get-RedactedRemoteUrl $leaseFetchUrl) but pushes to $((@($leasePushUrls | ForEach-Object { Get-RedactedRemoteUrl $_ })) -join ', '); nothing was pushed, the lease ref is unchanged"
@@ -668,14 +668,14 @@ function Invoke-PhaseClone {
             # two swapped, say) is refused typed CLONE_REMOTE_MISMATCH before anything is fetched or tracked; it is never silently accepted or rewritten.
             foreach ($want in @(@('fork', $ForkUrl), @('origin', $UpstreamUrl))) {
                 if ($remotes -notcontains $want[0]) { continue }
-                $have = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $want[0] }) -join '').Trim()
+                $have = (@(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url $want[0] }) -join '').TrimEnd("`r", "`n")
                 if (-not (Test-GitRemoteUrlSame $have $want[1])) {
                     $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0])")
                     # r15 pass 14 A2: the URL is printed with any user:password part redacted (the log and the console never carry a credential)
                     throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' is $(Get-RedactedRemoteUrl $have), expected $($want[1]) (nothing was fetched; fix the remote by hand and re-run -Phase Clone)"
                 }
                 # r17 pass 19 A6 sibling: a push url (remote.<name>.pushurl) that names another repository is the same mismatch
-                foreach ($pu in @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $want[0] 2>$null } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })) {
+                foreach ($pu in @(Invoke-GitTraceScrubbed { & git -C $Repo remote get-url --push --all $want[0] 2>$null } | ForEach-Object { "$_".TrimEnd("`r", "`n") } | Where-Object { $_ })) {
                     if (-not (Test-GitRemoteUrlSame $pu $want[1])) {
                         $script:Failures.Add("CLONE_REMOTE_MISMATCH $Repo $($want[0]) pushurl")
                         throw "CLONE_REMOTE_MISMATCH $Repo remote '$($want[0])' pushes to $(Get-RedactedRemoteUrl $pu), expected $($want[1]) (nothing was fetched; fix the push url by hand and re-run -Phase Clone)"
@@ -705,9 +705,9 @@ function Invoke-PhaseClone {
         }
     } else {
         # r15 pass 13 A5: an existing doctrine checkout must BE the doctrine repository (its 'origin' names $DoctrineUrl); any other checkout is a typed failure
-        $dHave = (@(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url origin 2>$null }) -join '').Trim()
+        $dHave = (@(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url origin 2>$null }) -join '').TrimEnd("`r", "`n")
         # r19 pass 21 A3: every PUSH url of that origin must name it too ('remote.origin.pushurl' naming another repository is the same mismatch)
-        $dPush = @(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url --push --all origin 2>$null } | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+        $dPush = @(Invoke-GitTraceScrubbed { & git -C $DoctrineRepo remote get-url --push --all origin 2>$null } | ForEach-Object { "$_".TrimEnd("`r", "`n") } | Where-Object { $_ })
         $dBadPush = @($dPush | Where-Object { -not (Test-GitRemoteUrlSame $_ $DoctrineUrl) })
         if ((Test-GitRemoteUrlSame $dHave $DoctrineUrl) -and $dBadPush.Count -eq 0) { Write-Log "present: $DoctrineRepo" 'OK' }
         else {
@@ -744,7 +744,9 @@ function Test-GitRemoteUrlSame {
     param([string]$A, [string]$B)
     $norm = {
         param($u)
-        $s = "$u".Trim()
+        $s = "$u"
+        # r21 pass 25 A4: whitespace around a URL is part of what Git sends ('repos/lease.git ' is not 'repos/lease.git'), so it is never trimmed away; compared only as the identical string
+        if ($s -match '^\s|\s$') { return "raw:$s" }
         $scheme = ''; $user = ''; $hostName = ''; $path = ''; $uncertain = $false
         $mUrl = [regex]::Match($s, '^(?i)(?!file://)([a-z][a-z0-9+.\-]*)://([^/]*)(.*)$')
         # scp-like [user@]host:path (git: no '/' before the first ':'); a host of one letter is a Windows drive ('C:/repos'), never a host
@@ -773,7 +775,8 @@ function Test-GitRemoteUrlSame {
         $hostName = $hostName.ToLowerInvariant()
         if (-not $hostName -or $hostName -match '[\s]') { return '' }
         # r21 B1: an ssh spelling not mapped with certainty (a '~user' path, a port or an IPv6 literal in the host part) is equal only to the identical string: the guard refuses
-        if ($scheme -eq 'ssh' -and ($uncertain -or $hostName.Contains(':'))) { return "raw:$s" }
+        # r21 pass 25 A3: Git percent-decodes an ssh:// path but sends a scp-like path literally, so any '%' in an ssh spelling is not mapped with certainty either
+        if ($scheme -eq 'ssh' -and ($uncertain -or $hostName.Contains(':') -or $s.Contains('%'))) { return "raw:$s" }
         # github.com: documented case-insensitive and '.git'-optional; https (any userinfo is a token) and the 'git@' ssh forms name one repository
         if ($hostName -ceq 'github.com' -and (($scheme -in @('http', 'https')) -or ($scheme -in @('ssh') -and $user -ceq 'git'))) {
             $gp = (($path -replace '[?#].*$', '') -replace '^~/', '').Trim('/') -replace '(?i)\.git$', ''
