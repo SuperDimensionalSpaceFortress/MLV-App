@@ -447,9 +447,11 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   samples (3 x 12 + 30 = 66 s), plus the export wait, plus a fixed 600 s margin. The export wait is `max(900, 4 x maxFrames)` s plus another identity-read
   allowance, for the app's own re-read. The export wait is the job's own `WaitForExit`, so the smoke runner's 3600 s process ceiling does not cap it.
   **The shared 3600 s smoke ceiling is still enforced on the read allowance** (CoS I1): `export-stage-job.ps1` calls
-  `Get-AttrCudaLegTimeBudget -ShareSmokeCeiling` (`AttrCudaArtifacts.psm1`) with every fixed second at 0. When the margined identity read is over 3600 s,
-  the allowance is held to 3600 s. When even the **minimum** identity read of the clip (input MB divided by the cold rate, no margin) is over 3600 s,
-  the generator refuses with `ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING` and writes no job. A time budget above that ceiling is open successor work (A2).
+  `Get-AttrCudaLegTimeBudget -ShareSmokeCeiling` (`AttrCudaArtifacts.psm1`) with every fixed second at 0. The only effect of that switch on an export is the
+  **refusal**: when even the **minimum** identity read of the clip (input MB divided by the cold rate, no margin) is over 3600 s, the generator refuses with
+  `ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING` and writes no job. The function also returns a clamped `appReadAllowanceSec` (held to 3600 s), but the export
+  does not use it: `Get-ExportJobTimeBudget` takes the margined, unclamped `identityReadSec` for both the job's read and the export wait's re-read allowance,
+  so a clip whose margined read is over 3600 s but whose minimum read is not still gets the longer budget. A time budget above that ceiling is open successor work (A2).
 * **Outcomes**:
 
   | Job result | Outcome |
