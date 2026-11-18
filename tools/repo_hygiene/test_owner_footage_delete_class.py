@@ -95,6 +95,12 @@ PATHNAME_DELETE = re.compile(r"\bRemove-Item\b|\[(?:System\.)?IO\.(?:File|Direct
 # (file name, source line with comments removed and whitespace trimmed) -> why its target cannot be a name of
 # owner footage. Exactly these, nothing else.
 PATHNAME_DELETE_ALLOWED = {
+    ("Deploy-BachelorAgent.ps1", "Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue"):
+        "Write-BytesAtomic: the '<file>.deploy-<GUID>.tmp' this very call just created beside the agent file it was about to replace; "
+        "a fresh GUID name cannot be an owner file.",
+    ("Deploy-BachelorAgent.ps1", "Remove-Item -LiteralPath $dest -Force"):
+        "sha-mismatch restore of a FIRST deploy: $dest is <VenueRoot>\\ultra-magnus-agent.ps1 (a fixed name), and this call wrote it "
+        "moments earlier after finding no file there; it names the agent script, never footage.",
     ("attr3-footage-presence-job.ps1", "if (Test-Path -LiteralPath $emitPath) { Remove-Item -LiteralPath $emitPath -Force }"):
         "generator side: the emitted <job id>.job.ps1 at the generator's own -OutDir, rewritten each emission.",
     ("attr3-footage-read-rate-job.ps1", "if (Test-Path -LiteralPath $emitPath) { Remove-Item -LiteralPath $emitPath -Force }"):
