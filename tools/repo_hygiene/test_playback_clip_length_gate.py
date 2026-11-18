@@ -2687,6 +2687,22 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             with self.subTest(injected):
                 self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
 
+    def test_r5_p2_a1_a2_a_type_computed_from_a_key_event_pointer_is_a_synthesized_key(self) -> None:
+        # adversary pass on d3ad0b0f A1: a decltype over a cast named the object type; A2: a 600-character lookback cap
+        # returned "no template" (exempt) on long whitespace. Also parentheses inside the template argument list.
+        press = " press{ QEvent::KeyPress, 32, Qt::NoModifier };"
+        for name, injected in {
+                "decltype over a static_cast": "std::remove_pointer_t<decltype(static_cast<QKeyEvent*>(nullptr))>" + press,
+                "__typeof__ over a cast": "std::remove_pointer_t<__typeof__(static_cast<QKeyEvent*>(nullptr))>" + press,
+                "declval": "std::remove_pointer_t<decltype(std::declval<QKeyEvent*>())>" + press,
+                "600 spaces": "std::remove_pointer_t<" + " " * 600 + "QKeyEvent*>" + press,
+                "5000 spaces": "std::remove_pointer_t<" + " " * 5000 + "QKeyEvent*>" + press,
+                "5000 newlines": "std::remove_pointer_t<" + "\n" * 5000 + "QKeyEvent*>" + press,
+                "a parenthesised expression before it":
+                    "std::remove_pointer_t<std::enable_if_t<(sizeof(int)>1), QKeyEvent*>>" + press}.items():
+            with self.subTest(name):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
     def test_r5_a2_casts_and_parameter_lists_with_a_delivered_key_event_stay_clean(self) -> None:
         for text in ("QKeyEvent *k = static_cast<QKeyEvent*>( e );\n", "auto *k = dynamic_cast< QKeyEvent const * >( e );\n",
                      "auto *k = reinterpret_cast<QKeyEvent *>( e );\n", "auto *k = const_cast<QKeyEvent*>( p );\n",

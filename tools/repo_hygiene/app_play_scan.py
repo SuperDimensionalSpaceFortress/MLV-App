@@ -268,26 +268,53 @@ _TEMPLATE_CAST_NAMES = frozenset({"static_cast", "dynamic_cast", "reinterpret_ca
 def _enclosing_template_name(blank: str, pos: int) -> str | None:
     """The identifier before the unmatched `<` that encloses `pos` (``""`` when none), or None outside template arguments.
 
-    Walks back over the declaration (never past a ; { } or an opening parenthesis, which is a parameter list)."""
+    Walks back over the statement with NO length cap (adversary pass on d3ad0b0f A2: a 600-character cap returned "no
+    template", which the caller treats as exempt, on long whitespace), never past a ; { } or an UNMATCHED opening
+    parenthesis (a parameter list). A balanced parenthesised group is skipped whole: angle brackets inside it are
+    comparisons or nested expressions, and the template argument list can open before it."""
     depth = 0
+    paren = 0
     i = pos - 1
-    low = max(0, pos - 600)
-    while i >= low:
+    while i >= 0:
         c = blank[i]
-        if c in ";{}(":
+        if c in ";{}":
             return None
-        if c == ">":
+        if c == ")":
+            paren += 1
+        elif c == "(":
+            if paren == 0:
+                return None
+            paren -= 1
+        elif paren:
+            pass
+        elif c == ">":
             if i > 0 and blank[i - 1] == "-":     # `->` is not a closing angle bracket
                 i -= 1
             else:
                 depth += 1
         elif c == "<":
             if depth == 0:
-                name = re.search(r"(\w*)\s*$", blank[:i])
-                return name.group(1) if name else ""
+                end = i
+                while end > 0 and blank[end - 1].isspace():
+                    end -= 1
+                start = end
+                while start > 0 and (blank[start - 1].isalnum() or blank[start - 1] == "_"):
+                    start -= 1
+                return blank[start:end]
             depth -= 1
         i -= 1
     return None
+
+
+def _statement_start(blank: str, pos: int) -> int:
+    """Offset just after the last ; { } before `pos` (0 when there is none)."""
+    return max(blank.rfind(";", 0, pos), blank.rfind("{", 0, pos), blank.rfind("}", 0, pos)) + 1
+
+
+# r5 (adversary pass on d3ad0b0f A1): `std::remove_pointer_t<decltype(static_cast<QKeyEvent*>(nullptr))> press{...}` names the
+# OBJECT type through a cast that is only an operand. The cast exemption therefore holds only in a statement with no
+# type-computing operator in front of it (fail-closed: such a statement is reviewed here).
+_TYPE_OF_EXPRESSION = re.compile(r"\b(?:decltype|typeof|__typeof__|__typeof|declval)\b")
 # r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
 _KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
 # PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
@@ -676,7 +703,8 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
         for match in _KEY_EVENT_REF.finditer(blank):
             enclosing = _enclosing_template_name(blank, match.start())
-            if enclosing is not None and enclosing not in _TEMPLATE_CAST_NAMES:
+            if enclosing is not None and (enclosing not in _TEMPLATE_CAST_NAMES or _TYPE_OF_EXPRESSION.search(
+                    blank, _statement_start(blank, match.start()), match.start())):
                 problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
         for match in _EVENT_POST.finditer(blank):
             key = (path, match.group(1))
