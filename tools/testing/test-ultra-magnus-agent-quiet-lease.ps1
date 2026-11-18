@@ -112,7 +112,7 @@ foreach ($name in $lift) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
 $liftBatch = @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Get-QuietLeaseRemainingSec', 'Get-LeaseBatchAdmission', 'Open-LeaseBatch',
     'Use-LeaseBatchForJob', 'Complete-LeaseBatchJob', 'Write-LeaseBatchReceipt', 'Close-LeaseBatch', 'Sync-LeaseBatchForJob', 'Update-LeaseBatchHold')
 # lease-batch r2 (the renew-gap demotion): the same, asserted by the demoted case after it has shown the behaviour.
-$liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec')
+$liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'ConvertTo-RenewGapCeilingSec')   # the last: BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2)
 # lease-batch r3 (sol r2 B1, B2): the same, asserted by the r3 cases after they have shown the behaviour.
 $liftBatchR3 = @('Test-LeaseBatchClosePending', 'Get-LeaseBatchJobStop')
 $batchLifted = [System.Collections.Generic.List[string]]::new()
@@ -1194,7 +1194,7 @@ try {
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
-        'lease-seam-census-self-pid', 'renew-slow-monitor-slice')
+        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -5831,6 +5831,35 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($agentText.Contains('Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -OnEach { Invoke-QuietLeaseRenewTick }')) "renew-slow-monitor-slice: the job monitor loop passes the renew tick into its descendant walk"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
+    }
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1, adversary pass 1 on 41ffc7fa (both introduced, major): the agent's successful-renew gap must never read
+    # shorter than heavy-slot.py's. A1: a renew whose process ExitTime reads EARLY (a clock step: exit t0+105.02 s, collected at t0+125 s) must not
+    # shorten the gap below the collection's 125 s. A2: a gap of 120.042 s must read over 120 (rounded up, never to the nearest 120.0), so the
+    # strict "-gt LeaseRenewStaleSec" guards refuse it. Both drive the REAL Update-QuietLeaseRenew + Get-QuietLeaseRenewOkGapSec on a virtual clock.
+    foreach ($gc in @(@{ name = 'renew-gap-clock-step'; exitSec = 105.02; nowSec = 125.0; minGap = 125.0 }, @{ name = 'renew-gap-round-up'; exitSec = 120.042; nowSec = 120.042; minGap = 120.05 })) {
+        if (-not (Test-Case $gc.name)) { continue }
+        $gcSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch }
+        try {
+            $gcOut = & {
+                $t0 = [datetime]::new(2026, 11, 18, 2, 0, 0, [DateTimeKind]::Local)
+                $script:GcNow = $t0.AddSeconds($gc.nowSec)
+                function Get-Date { return $script:GcNow }
+                $p = [pscustomobject]@{ HasExited = $true; ExitCode = 0; ExitTime = $t0.AddSeconds($gc.exitSec) }
+                $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) return $true }
+                $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+                $done = [System.Threading.Tasks.Task]::FromResult('')
+                $call = [pscustomobject]@{ ok = $true; proc = $p; out = $done; err = $done; started = $t0.AddSeconds(100); why = $null }
+                $lease = [pscustomobject]@{ ok = $true; jobId = "gc-$($gc.name)"; label = 'quiet-lease mlv'; proc = [pscustomobject]@{ HasExited = $false }; pid = 4000; active = [pscustomobject]@{ slot = 1; held = '1:4000'; until = 9999999999 }
+                    activeAt = $t0; lastRenewStart = $t0.AddSeconds(100); lastRenewOkStart = $t0; renewCall = $call; renewStarts = 1; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0; renewOkMaxGapSec = 0 }
+                Update-QuietLeaseRenew -Lease $lease -CollectOnly
+                [pscustomobject]@{ ok = $lease.renewsOk; okMaxGapSec = $lease.renewOkMaxGapSec; gapSec = (Get-QuietLeaseRenewOkGapSec -Lease $lease) }
+            }
+        }
+        finally { $script:QuietLease = $gcSaved.q; $script:QuietLeaseWaiting = $gcSaved.w; $script:LeaseBatch = $gcSaved.b }
+        $gcTxt = $gcOut | ConvertTo-Json -Compress
+        Assert-True ($gcOut.ok -eq 1 -and [double]$gcOut.okMaxGapSec -ge $gc.minGap -and [double]$gcOut.gapSec -ge $gc.minGap) "$($gc.name): the successful-renew gap reads at least $($gc.minGap) s (exit t0+$($gc.exitSec) s, collected t0+$($gc.nowSec) s, previous success t0): $gcTxt"
+        Assert-True ([double]$gcOut.gapSec -gt 120) "$($gc.name): a real gap over 120 s reads over the strict -gt 120 demotion bound: $gcTxt"
+        $results[$gc.name] = $gcOut
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

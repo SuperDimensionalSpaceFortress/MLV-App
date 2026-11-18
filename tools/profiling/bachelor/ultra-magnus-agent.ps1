@@ -3449,11 +3449,8 @@ function Receive-HeavySlotCli {
     try { if ($Call.out.Wait(2000)) { $o = [string]$Call.out.Result } } catch { }
     try { if ($Call.err.Wait(2000)) { $e = [string]$Call.err.Result } } catch { }
     $rc = $p.ExitCode
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: when the call exited (local time, as Get-Date), read before Dispose; $null when unreadable.
-    $exitedAt = $null
-    try { $exitedAt = [datetime]$p.ExitTime } catch { $exitedAt = $null }
     $p.Dispose()
-    return [pscustomobject]@{ done = $true; rc = $rc; stdout = $o.Trim(); stderr = $e.Trim(); why = $null; exitedAt = $exitedAt }
+    return [pscustomobject]@{ done = $true; rc = $rc; stdout = $o.Trim(); stderr = $e.Trim(); why = $null }
 }
 
 function Stop-HeavySlotCli {
@@ -3629,18 +3626,15 @@ function Register-QuietLeaseRenewOk {
     # lease-batch r2: a renew that returned rc 0. heavy-slot.py demotes a lease not renewed for renew_stale_s (120 s), so the
     # gap that matters is between SUCCESSFUL renews (activation counts as the first). Measured from the previous success's
     # call start to now (the result's collection), an upper bound on heavy-slot.py's own gap: it never under-reads one.
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: measured to -CallEnded (the renew process's exit) when given, not to the collection.
-    # heavy-slot.py records the renew before its process exits, so the exit is still an upper bound; the collection waited for
-    # the next monitor slice, which on a slow slice added a whole slice to every gap (95 s start-to-start read as 125.7 s).
-    # A CallEnded outside [CallStarted, now] (unreadable or a clock step) falls back to now, the old, never-shorter bound.
-    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallEnded = $null)
-    $now = Get-Date
-    $end = $now
-    if ($CallEnded -is [datetime] -and $CallEnded -ge $CallStarted -and $CallEnded -le $now) { $end = $CallEnded }
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: still measured to the collection (a renew process's own ExitTime is NOT used: across a
+    # clock step it can read shorter than heavy-slot.py's gap, adversary A1); the collection is now prompt instead, because the
+    # job monitor's descendant walk ticks the renew too. The gap is rounded UP to 0.1 s (ConvertTo-RenewGapCeilingSec), so
+    # 120.04 s never reads 120.0 and slips past a strict "> 120" guard (adversary A2).
+    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted)
     $prev = if ($null -ne $Lease.lastRenewOkStart) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
     if ($null -ne $prev) {
-        $gap = ($end - $prev).TotalSeconds
-        if ($gap -gt $Lease.renewOkMaxGapSec) { $Lease.renewOkMaxGapSec = [Math]::Round($gap, 1) }
+        $gap = ((Get-Date) - $prev).TotalSeconds
+        if ($gap -gt $Lease.renewOkMaxGapSec) { $Lease.renewOkMaxGapSec = ConvertTo-RenewGapCeilingSec $gap }
     }
     $Lease.lastRenewOkStart = $CallStarted
 }
@@ -3648,10 +3642,18 @@ function Register-QuietLeaseRenewOk {
 function Get-QuietLeaseRenewOkGapSec {
     # lease-batch r2: the longest gap between successful renews of an ACTIVE lease so far, the open one up to now included,
     # or $null when it is not active. Over $script:LeaseRenewStaleSec, heavy-slot.py has demoted the lease (non-exclusive).
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2): rounded UP, never to the nearest, so a gap just over the bound reads over it.
     param($Lease)
     if ($null -eq $Lease -or $null -eq $Lease.activeAt) { return $null }
     $prev = if ($null -ne $Lease.lastRenewOkStart) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
-    return [Math]::Round([Math]::Max([double]$Lease.renewOkMaxGapSec, ((Get-Date) - $prev).TotalSeconds), 1)
+    return ConvertTo-RenewGapCeilingSec ([Math]::Max([double]$Lease.renewOkMaxGapSec, ((Get-Date) - $prev).TotalSeconds))
+}
+
+function ConvertTo-RenewGapCeilingSec {
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2): a renew gap in seconds, rounded UP to 0.1 s. Every guard compares it with a
+    # strict "-gt $script:LeaseRenewStaleSec", so rounding to the nearest turned 120.04 s into 120.0 and let a demoted lease run.
+    param([double]$Sec)
+    return [Math]::Ceiling([Math]::Round($Sec * 10, 6)) / 10
 }
 
 function Update-QuietLeaseRenew {
@@ -3667,7 +3669,7 @@ function Update-QuietLeaseRenew {
         if ($c.proc.HasExited) {
             $r = Receive-HeavySlotCli -Call $c
             $Lease.renewCall = $null
-            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started -CallEnded $r.exitedAt }
+            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started }
             else {
                 $Lease.renewFailures++
                 Add-AgentLogLine "quiet-lease: renew-failed job=$($Lease.jobId) rc=$($r.rc) out=[$($r.stdout)] err=[$($r.stderr)]; not fatal (the lease goes stale at 120 s without a renew)"
@@ -3684,7 +3686,7 @@ function Update-QuietLeaseRenew {
     if ($CollectOnly -or $null -eq $Lease.active -or $Lease.proc.HasExited) { return }
     $gap = ($now - $Lease.lastRenewStart).TotalSeconds
     if ($gap -lt $LeaseRenewSec) { return }
-    if ($gap -gt $Lease.renewMaxGapSec) { $Lease.renewMaxGapSec = [Math]::Round($gap, 1) }
+    if ($gap -gt $Lease.renewMaxGapSec) { $Lease.renewMaxGapSec = ConvertTo-RenewGapCeilingSec $gap }
     $Lease.lastRenewStart = $now
     $Lease.renewStarts++
     $c = Start-HeavySlotCli -Arguments @("lease", "renew", "--label", $Lease.label)
