@@ -3054,9 +3054,12 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( !ui->actionPlay->isChecked() )
     {
         lastDrawnPlaybackPosition = -1;
+        m_playbackRedrawAfterResize = false;
     }
-    else if( m_frameChanged
-          && ui->horizontalSliderPosition->value() == lastDrawnPlaybackPosition )
+    else if( resize_playback_policy::suppressDuplicatePlaybackDraw( m_frameChanged,
+                                                                    ui->horizontalSliderPosition->value(),
+                                                                    lastDrawnPlaybackPosition,
+                                                                    m_playbackRedrawAfterResize ) )
     {
         /* Fast timer polling (mlvappPlaybackTimerIntervalMs) can mark the
          * frame changed on ticks where elapsed-time pacing advanced zero
@@ -3068,6 +3071,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( m_frameChanged && !m_dontDraw && !m_inOpeningProcess )
     {
         m_frameChanged = false; //first do this, if there are changes between rendering
+        m_playbackRedrawAfterResize = false;
         if( ui->actionPlay->isChecked() )
         {
             lastDrawnPlaybackPosition = ui->horizontalSliderPosition->value();
@@ -3244,7 +3248,14 @@ void MainWindow::resizeEvent(QResizeEvent *event)
         }
         return;
     case resize_playback_policy::Action::KeepPlaying:
-        // The next playback frame lands on the new scene; the flag makes finishPresentedFrame re-anchor the gradient there.
+        // Adversary A1: a frame already requested, prepared or in flight was scaled for the OLD scene and would land on it.
+        // The display-change invalidation (the one a mid-Play scale change uses) drops and cancels that generation.
+        invalidatePlaybackPrepForDisplayChange( "resize-keep-playing" );
+        // Adversary A2: the playback tick redraws the current position at the new geometry even when Play holds one frame
+        // (a collapsed looped range), past its duplicate-position suppression. The tick draws it, not this handler.
+        m_playbackRedrawAfterResize = true;
+        m_frameChanged = true;
+        // The redrawn frame lands on the new scene; the flag makes finishPresentedFrame re-anchor the gradient there.
         if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() ) m_zoomModeChanged = true;
         logInteractionEvent( QStringLiteral("resize.keep_playing"),
                              QStringLiteral("width=%1 height=%2 fullscreen=%3")

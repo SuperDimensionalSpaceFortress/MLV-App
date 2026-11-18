@@ -31,6 +31,15 @@ inline Action decide( bool openingInProgress, bool lookAssistSessionOpen, bool p
     return Action::RedrawStopped;
 }
 
+// timerFrameEvent's duplicate-position suppression during Play: a tick that marks the frame changed while the position
+// has not moved past the last drawn one re-presents nothing. Adversary A2 on c6993e68: a Play that holds ONE frame (a
+// collapsed looped range, e.g. cut 100..100) never advances, so after a KeepPlaying resize the picture kept its old size
+// forever. A resize during Play arms redrawAfterResize, which lets exactly the next draw through.
+inline bool suppressDuplicatePlaybackDraw( bool frameChanged, int position, int lastDrawnPosition, bool redrawAfterResize )
+{
+    return frameChanged && position == lastDrawnPosition && !redrawAfterResize;
+}
+
 inline const char *actionName( Action a )
 {
     switch( a )
