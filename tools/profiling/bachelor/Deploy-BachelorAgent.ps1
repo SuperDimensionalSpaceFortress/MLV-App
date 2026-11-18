@@ -74,7 +74,10 @@
 #   The heartbeat pid must also BE the task's running instance: the Task Scheduler is asked (IRunningTask.EnginePID, the pid of the
 #   Exec action's process) and must name exactly one instance, that pid; a process that only writes a matching heartbeat is not what
 #   `schtasks /End` stops. The replacement must be the task's new instance by the same test. Idle is judged once more AFTER all of
-#   this binding and immediately before the stop, because the binding's reads can each take up to a deadline. -TaskPidsFile is the
+#   this binding, and again INSIDE the stop routine with the instance object in hand and immediately before Stop() (the scheduler
+#   lookup can take up to its deadline too). The stop acts on pid AND the recorded start (a reused pid is another instance). Its answer is
+#   three-valued: stopped / not-stopped (Stop() never called) / unknown (no answer in time, or Stop() raised: it may have been applied,
+#   so the pid is re-observed and the restart goes on only when the process is seen gone). -TaskPidsFile is the
 #   seam for the scheduler's running pids. Residual (stated): the definition is re-read immediately before /Run, and the replacement
 #   is attested after it, but an edit in the instant between the two cannot be excluded from here; a replacement that fails the
 #   attestation is DEPLOY_RESTART_FAILED, never reported as restarted.
@@ -127,6 +130,8 @@ $script:StartToleranceSec = 2
 $script:OnWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
 # the longest a single read of the venue (a listing, the heartbeat) may take before it counts as unanswered
 $script:ReadTimeoutSec = 20
+# how long the restart waits for the stopped agent's process to go (the tests shorten it)
+$script:StopWaitSec = 30
 # the file a bounded runspace dot-sources to get this script's functions (empty only if the host gives no path)
 $script:SelfPath = $PSCommandPath
 
@@ -639,34 +644,63 @@ function Get-TaskXml {
     catch { return (& $no "task $TaskName could not be read: $($_.Exception.Message)") }
 }
 
+function Get-RunningTaskInstances {
+    # ALL running task instances, as the Task Scheduler's IRunningTask objects (Path, EnginePID, Stop()); the caller picks its own by
+    # path, pid and start. Windows only: off Windows it throws, and the caller reads that as "nothing was stopped". This is the one
+    # place the scheduler is asked, and the seam the tests replace with stand-in objects that have the same three members.
+    if (-not $script:OnWindows) { throw 'the Task Scheduler API exists on Windows only' }
+    $svc = New-Object -ComObject 'Schedule.Service'
+    $svc.Connect()
+    $all = @()
+    foreach ($rt in $svc.GetRunningTasks(1)) { $all += $rt }
+    return $all
+}
+
 function Stop-TaskInstanceByPid {
-    # Stops ONE running instance of the task: the one whose process is $ProcessId, found and stopped in the same loop through the Task
-    # Scheduler (IRunningTask.Stop). `schtasks /End /TN <name>` stops whatever the NAME resolves to when it runs, and the name, the
-    # definition and the running instance can all change between the binding and that call; this acts on the identity the binding
-    # proved. Returns @{ ok; why }. Windows only (the scheduler API); off Windows it never stops anything.
-    param([int]$ProcessId)
+    # Stops ONE running instance of the task: the one whose process is $ProcessId AND whose OS start time is $StartText (the start the
+    # binding proved: a pid alone can be reused by another instance of the same task after the proved one exited), found and stopped
+    # through the Task Scheduler (IRunningTask.Stop). `schtasks /End /TN <name>` stops whatever the NAME resolves to when it runs;
+    # this acts on the identity the binding proved. The venue is judged idle AGAIN here, with the instance object in hand and
+    # immediately before Stop(): the lookup before it can take up to its deadline, and work can land meanwhile.
+    # Returns @{ outcome; why; busy } where outcome is one of
+    #   'stopped'      Stop() returned (the caller still waits for the process to go)
+    #   'not-stopped'  Stop() was never called: no instance with that pid and start, the venue was busy (busy = the refusal lines), or the
+    #                  scheduler failed BEFORE the call
+    #   'unknown'      Stop() was called and raised: whether it was applied is not known, so the caller re-observes the pid
+    param([int]$ProcessId, [string]$StartText)
+    $notStopped = { param($why, $busy = $null) [pscustomobject]@{ outcome = 'not-stopped'; why = $why; busy = $busy } }
     try {
-        if (-not $script:OnWindows) { return [pscustomobject]@{ ok = $false; why = 'the Task Scheduler API exists on Windows only' } }
-        $svc = New-Object -ComObject 'Schedule.Service'
-        $svc.Connect()
+        if ([string]::IsNullOrWhiteSpace($StartText)) { return (& $notStopped 'the proved start time of the agent is missing, so no instance can be identified') }
+        $mine = $null
         $want = '\' + $TaskName.TrimStart('\')
-        foreach ($rt in $svc.GetRunningTasks(1)) {
-            if ([string]::Equals([string]$rt.Path, $want, [StringComparison]::OrdinalIgnoreCase) -and [int]$rt.EnginePID -eq $ProcessId) {
-                $rt.Stop()
-                return [pscustomobject]@{ ok = $true; why = $null }
-            }
+        foreach ($rt in @(Get-RunningTaskInstances)) {
+            if (-not [string]::Equals([string]$rt.Path, $want, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ([int]$rt.EnginePID -ne $ProcessId) { continue }
+            # the instance object names a pid; the process under that pid must be the one proved (pid plus start), not a reuse of it
+            $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if ($null -eq $proc) { continue }
+            if (-not (Test-StartTimesMatch -A $proc.StartTime.ToUniversalTime() -B (ConvertTo-UtcStart -Text $StartText))) { continue }
+            $mine = $rt
+            break
         }
-        return [pscustomobject]@{ ok = $false; why = "task $TaskName has no running instance with pid=$ProcessId any more" }
+        if ($null -eq $mine) { return (& $notStopped "task $TaskName has no running instance with pid=$ProcessId and the proved start $StartText any more") }
+        $busy = Get-Refusals
+        if ($null -ne $busy) { return (& $notStopped 'the venue is no longer idle' @($busy.lines)) }
     }
-    catch { return [pscustomobject]@{ ok = $false; why = "stopping the instance failed: $($_.Exception.Message)" } }
+    catch { return (& $notStopped "looking for the instance failed: $($_.Exception.Message)") }
+    try { $mine.Stop() }
+    catch { return [pscustomobject]@{ outcome = 'unknown'; why = "IRunningTask.Stop raised: $($_.Exception.Message)"; busy = $null } }
+    return [pscustomobject]@{ outcome = 'stopped'; why = $null; busy = $null }
 }
 
 function Stop-TaskInstanceBounded {
-    # Stop-TaskInstanceByPid under a deadline (the scheduler can stall): no answer is a failure, and nothing is assumed stopped.
-    param([int]$ProcessId)
-    $r = Invoke-Bounded -Script { Stop-TaskInstanceByPid -ProcessId $ProcId } -TimeoutMs 30000 -Variables @{ ProcId = $ProcessId }
-    if ($r.timedOut) { return [pscustomobject]@{ ok = $false; why = 'the Task Scheduler did not answer the stop within 30 s' } }
-    if ($null -ne $r.error -or $null -eq $r.value) { return [pscustomobject]@{ ok = $false; why = "the stop returned no answer ($($r.error))" } }
+    # Stop-TaskInstanceByPid under a deadline (the scheduler can stall). The deadline covers the lookup, the idle read and Stop(), so a
+    # timeout cannot tell whether Stop() ran: it is 'unknown', never "nothing was stopped" (a COM call that outlives the deadline may
+    # still have been applied). The caller re-observes the pid.
+    param([int]$ProcessId, [string]$StartText)
+    $r = Invoke-Bounded -Script { Stop-TaskInstanceByPid -ProcessId $ProcId -StartText $StartAt } -TimeoutMs 60000 -Variables @{ ProcId = $ProcessId; StartAt = $StartText }
+    if ($r.timedOut) { return [pscustomobject]@{ outcome = 'unknown'; why = 'the Task Scheduler did not answer the stop within 60 s'; busy = $null } }
+    if ($null -ne $r.error -or $null -eq $r.value) { return [pscustomobject]@{ outcome = 'unknown'; why = "the stop returned no answer ($($r.error))"; busy = $null } }
     return $r.value
 }
 
@@ -733,11 +767,20 @@ function Invoke-AgentRestart {
     # work can land meanwhile, so idle is judged AGAIN as the last step before the End (the check before the binding is only the early out)
     $last = Get-Refusals
     if ($null -ne $last) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $($last.lines -join '; ')"; warn = $null } }
-    # stop the INSTANCE the binding proved (its pid), not "the task" by a name that can be re-pointed or re-run in the meantime
-    $stop = Stop-TaskInstanceBounded -ProcessId $before.pid
-    if (-not $stop.ok) { return @{ why = "could not stop agent pid=$($before.pid); nothing was stopped: $($stop.why)"; warn = $null } }
-    $gone = Wait-Until -TimeoutSec 30 -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
-    if (-not $gone) { return @{ why = "agent pid $($before.pid) still alive 30 s after its task instance was stopped"; warn = $null } }
+    # stop the INSTANCE the binding proved (its pid AND its recorded start), not "the task" by a name that can be re-pointed or re-run in
+    # the meantime. The stop judges idle once more itself, with the instance in hand and right before Stop(), so the last idle read
+    # above is only an early out. Its answer is three-valued: 'unknown' (no answer in time, or Stop() raised) may still have stopped the agent.
+    $stop = Stop-TaskInstanceBounded -ProcessId $before.pid -StartText $before.start
+    if ($stop.outcome -eq 'not-stopped') {
+        if ($null -ne $stop.busy) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $(@($stop.busy) -join '; ')"; warn = $null } }
+        return @{ why = "could not stop agent pid=$($before.pid); nothing was stopped: $($stop.why)"; warn = $null }
+    }
+    # 'stopped' or 'unknown': either way the pid is re-observed, and only an OBSERVED exit lets the restart go on to the start
+    $gone = Wait-Until -TimeoutSec $script:StopWaitSec -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
+    if (-not $gone) {
+        if ($stop.outcome -ne 'stopped') { return @{ why = "the stop of agent pid=$($before.pid) has an UNKNOWN outcome ($($stop.why)) and the agent is still alive $($script:StopWaitSec) s later; the task was NOT started"; warn = $null } }
+        return @{ why = "agent pid $($before.pid) still alive $($script:StopWaitSec) s after its task instance was stopped"; warn = $null }
+    }
     $warn = Get-ArrivalWarning
     # the definition can be edited between the binding and now, and /Run STARTS whatever it says: read it again, as the last step
     # before the start, and refuse to start a definition that no longer runs this script and root (the old agent is down: said so)

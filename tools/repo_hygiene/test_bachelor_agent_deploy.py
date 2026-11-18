@@ -941,7 +941,7 @@ class DeployBachelorAgent(unittest.TestCase):
             "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
             "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
             # stand-in for the scheduler's instance stop (a real one needs the real task): it ends the live agent, as a stop would
-            "function Stop-TaskInstanceBounded { param([int]$ProcessId) Stop-Process -Id $ProcessId -Force; [pscustomobject]@{ ok = $true; why = $null } };"
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText) Stop-Process -Id $ProcessId -Force; [pscustomobject]@{ outcome = 'stopped'; why = $null; busy = $null } };"
             "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
         ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME))
         cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; %s" % (psq(SCRIPT), psq(self.venue), psq(busy), body)
@@ -949,6 +949,155 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("the old agent is stopped but the task was NOT started", r.stdout)
         self.assertIn("its definition changed", r.stdout)
+
+    # ---- adversary pass 9 findings (A1..A3 of eb16397b): each test failed on eb16397b ----
+    # The Task Scheduler is replaced by a stand-in Get-RunningTaskInstances (the one seam): it returns instance objects with the same
+    # members the COM IRunningTask has (Path, EnginePID, Stop()). Stop() on the stand-in writes a marker file, so "was it stopped" is observed.
+
+    def _stop_case(self, label: str, *, start_shift_sec: int = 0, drop_job_during_lookup: bool = False, task_path: str = "\\MlvTest"):
+        """Runs Stop-TaskInstanceByPid directly against a live process, with a stand-in scheduler. Returns (stdout lines dict, marker Path)."""
+        pid, _start = self.live_agent()
+        marker = Path(self._tmp.name) / ("stop-marker-%s.txt" % label)
+        job = self.venue / "inbox" / "j1.job.ps1"
+        body = (
+            "$script:Marker='%s'; $script:FakePid=%d; $script:Job='%s'; $script:DropJob=$%s; $script:FakePath='%s';"
+            "function Get-RunningTaskInstances {"
+            "  if ($script:DropJob) { Set-Content -LiteralPath $script:Job -Value x };"   # work lands while the scheduler is being asked
+            "  $o=[pscustomobject]@{ Path=$script:FakePath; EnginePID=$script:FakePid };"
+            "  Add-Member -InputObject $o -MemberType ScriptMethod -Name Stop -Value { Set-Content -LiteralPath $script:Marker -Value stopped };"
+            "  @($o) };"
+            "$real=(Get-Process -Id %d).StartTime.ToUniversalTime();"
+            "$claimed=$real.AddSeconds(%d).ToString('o');"
+            "$r = Stop-TaskInstanceByPid -ProcessId %d -StartText $claimed;"
+            "'outcome=' + $r.outcome; 'why=' + $r.why; 'busy=' + (@($r.busy) -join '|')"
+        ) % (psq(marker), pid, psq(job), "true" if drop_job_during_lookup else "false", psq(task_path), pid, start_shift_sec, pid)
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvTest'; %s" % (psq(SCRIPT), psq(self.venue), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = {}
+        for line in r.stdout.splitlines():
+            k, _, v = line.partition("=")
+            out[k] = v
+        return out, marker
+
+    def test_p9a1_a_reused_pid_with_another_start_is_not_stopped(self) -> None:
+        # pass 9 A1: the binding proved task \MlvAgentBachelor pid P AND its start; that instance exited, the task was re-pointed, and a
+        # NEW instance got the same pid P ten seconds later. Pid plus task path matched, so the new instance was stopped.
+        out, marker = self._stop_case("reused", start_shift_sec=-10)
+        self.assertEqual(out.get("outcome"), "not-stopped", out)
+        self.assertFalse(marker.exists(), "an instance whose start differs from the proved one is never stopped")
+
+    def test_p9a1_the_instance_with_the_proved_pid_and_start_is_stopped(self) -> None:
+        out, marker = self._stop_case("same")
+        self.assertEqual(out.get("outcome"), "stopped", out)
+        self.assertTrue(marker.exists(), "the proved instance is stopped")
+        # the clock tolerance of every other 'same process' check applies here too (one reading of 'same start')
+        out, marker = self._stop_case("within-tolerance", start_shift_sec=1)
+        self.assertEqual(out.get("outcome"), "stopped", out)
+
+    def test_p9a1_the_caller_hands_the_proved_start_to_the_stop(self) -> None:
+        pid, start = self.live_agent()
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText) Write-Host ('seen pid=' + $ProcessId + ' start=' + $StartText);"
+            "  [pscustomobject]@{ outcome = 'not-stopped'; why = 'stand-in'; busy = $null } };"
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME))
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest'; %s" % (psq(SCRIPT), psq(self.venue), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("pid=%d start=%s" % (pid, start), r.stdout)
+
+    def test_p9a3_idle_is_judged_after_the_scheduler_lookup_and_right_before_the_stop(self) -> None:
+        # pass 9 A3: idle was read, then the scheduler lookup took a while, and a job landed in inbox\ meanwhile. The matching instance
+        # is in hand and the venue is NOT idle any more: nothing may be stopped.
+        out, marker = self._stop_case("late-job", drop_job_during_lookup=True)
+        self.assertEqual(out.get("outcome"), "not-stopped", out)
+        self.assertIn("inbox=1", out.get("busy", ""), out)
+        self.assertFalse(marker.exists(), "a job that arrived during the lookup stops the stop")
+
+    def test_p9a3_the_caller_says_busy_when_the_stop_found_the_venue_busy(self) -> None:
+        pid, start = self.live_agent()
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText)"
+            "  [pscustomobject]@{ outcome = 'not-stopped'; why = 'the venue is busy'; busy = @('DEPLOY_REFUSED_BUSY running=0 inbox=1') } };"
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME))
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest'; %s" % (psq(SCRIPT), psq(self.venue), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("why=the venue is no longer idle, so the agent was not stopped", r.stdout)
+        self.assertIn("inbox=1", r.stdout)
+
+    def _unanswered_stop_prelude(self, pid: int, kill: bool) -> str:
+        """A stand-in for the bounded runner: the Task Scheduler stop call never answers within the deadline. With kill=True the stop WAS
+        applied (late), as a COM call that outlives the worker timeout can be; every other bounded call passes through to the real one."""
+        return (
+            "$orig = ${function:Invoke-Bounded};"
+            "function Invoke-Bounded { param([scriptblock]$Script, [long]$TimeoutMs, [hashtable]$Variables = @{})"
+            "  if ($Script.ToString() -match 'Stop-TaskInstanceByPid') {"
+            + ("    Stop-Process -Id %d -Force; Start-Sleep -Milliseconds 300;" % pid if kill else "")
+            + "    return [pscustomobject]@{ timedOut = $true; error = $null; ok = $false; value = $null } }"
+            "  & $orig -Script $Script -TimeoutMs $TimeoutMs -Variables $Variables };"
+        )
+
+    def test_p9a2_a_stop_that_did_not_answer_is_unknown_not_nothing_stopped(self) -> None:
+        pid, start = self.live_agent()
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "%s"
+            "$s = Stop-TaskInstanceBounded -ProcessId %d -StartText '%s'; 'outcome=' + $s.outcome; 'why=' + $s.why"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), self._unanswered_stop_prelude(pid, kill=False), pid, start)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("outcome=unknown", r.stdout)
+        self.assertNotIn("nothing was stopped", r.stdout)
+
+    def test_p9a2_an_unanswered_stop_that_was_applied_goes_on_to_the_start_gates(self) -> None:
+        # pass 9 A2: IRunningTask.Stop was applied after 1 s but its COM answer outlived the 30 s worker timeout. The old agent IS down;
+        # saying "nothing was stopped" and skipping the start leaves the venue with no agent. The pid is re-observed, and the restart
+        # carries on to the definition re-read and the start (here the definition names another root, so the start is refused: that
+        # message is the proof that the restart went past the stop).
+        pid, start = self.live_agent()
+        busy = Path(self._tmp.name) / "task-busy-p9.xml"
+        busy.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File C:\\busy\\ultra-magnus-agent.ps1</Arguments></Exec></Actions></Task>", encoding="utf-8")
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "%s"
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), self._unanswered_stop_prelude(pid, kill=True), psq(self.venue / AGENT_NAME))
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; %s" % (psq(SCRIPT), psq(self.venue), psq(busy), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("nothing was stopped", r.stdout)
+        self.assertIn("the old agent is stopped but the task was NOT started", r.stdout)
+
+    def test_p9a2_an_unanswered_stop_with_the_agent_still_alive_says_unknown_not_nothing(self) -> None:
+        pid, start = self.live_agent()
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "%s"
+            "$script:StopWaitSec = 2;"   # the wait for the agent to go is shortened for the test
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why; 'alive=' + [bool](Get-Process -Id %d -ErrorAction SilentlyContinue)"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), self._unanswered_stop_prelude(pid, kill=False), psq(self.venue / AGENT_NAME), pid)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("nothing was stopped", r.stdout)
+        self.assertIn("UNKNOWN", r.stdout)
+        self.assertIn("pid=%d" % pid, r.stdout)
+        self.assertIn("alive=True", r.stdout)
+
+    def test_p9_a_stop_that_never_reached_the_scheduler_still_says_nothing_was_stopped(self) -> None:
+        # the three-valued answer keeps its middle: a stop that found no instance (and so never called Stop()) is 'not-stopped'
+        out, marker = self._stop_case("no-such-path", task_path="\\Other")
+        self.assertEqual(out.get("outcome"), "not-stopped", out)
+        self.assertFalse(marker.exists())
 
     def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
         # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.
