@@ -564,14 +564,19 @@ class ExportEvidenceTests(unittest.TestCase):
                  prores_case(stage=stage_with(processing=200.0), criteria=[]),                         # 3: a top-level child past processed16_total
                  cdng_case(profile=cdng_with(raw_read_ms=900.0), criteria=[]),                         # 4: a producer stage past producer_frame_ms
                  cdng_case(profile=cdng_with(llrawproc_ms=5.0, llrawproc_other_ms=20.0), criteria=[]), # 5: a llrawproc child past llrawproc_ms
-                 prores_case(criteria=[]), cdng_case(criteria=[])]                                    # 6, 7: controls
-        proc, got = evidence_cases(cases)
+                 cdng_case(profile=cdng_with(llrawproc_ms=900.0), criteria=[]),                        # 6: (pass 10 A1) the llrawproc TOTAL past producer_frame_ms
+                 # (pass 10 A2) disjoint siblings that are each inside the parent but together are not:
+                 prores_case(stage=stage_with(debayered_frame=10.0, processing=10.0, processed16_total=10.0, raw_uint16=2.0, raw_uint16_disk_read=1.0, raw_uint16_decompress=1.0, llrawproc=2.0), criteria=[]),  # 7
+                 prores_case(stage=stage_with(raw_uint16=40.0, llrawproc=40.0, debayered_frame=40.0, raw_uint16_disk_read=3.0, raw_uint16_decompress=5.0), criteria=[]),                                    # 8
+                 prores_case(stage=stage_with(raw_uint16_disk_read=9.0, raw_uint16_decompress=9.0), criteria=[])]                                                                                      # 9
+        controls = [prores_case(criteria=[]), cdng_case(criteria=[])]
+        proc, got = evidence_cases(cases + controls)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        for i in range(6):
+        for i in range(len(cases)):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[i]["problems"]), got[i])
-        self.assertEqual((got[6]["outcome"], got[7]["outcome"]), ("PASS", "PASS"), got[6:])
+        self.assertEqual((got[-2]["outcome"], got[-1]["outcome"]), ("PASS", "PASS"), got[-2:])
 
     def test_r8_a3_a_manifest_count_or_total_that_is_not_a_json_integer_is_invalid(self) -> None:
         """adversary r7 pass A3 (advisory): count [1] / "1" and totalBytes [1000] / "1000" were stringified and parsed, so a non-integer shape read PASS. Only a JSON integer is one."""
@@ -1167,6 +1172,10 @@ class ExportJobGeneratorTests(unittest.TestCase):
         self.assertIn("if ($timedOut -and -not $killConfirmed) { 'EXPORT_KILL_UNCONFIRMED' }", text)
         self.assertIn("EXPORT_KILL_UNCONFIRMED = 48", text)
         self.assertIn("killConfirmed = $killConfirmed", text, "the summary records whether the tree was confirmed dead")
+        # (pass 10 A3) a log or stage record a survivor holds is read and copied best effort, so no file access can cost the typed terminal
+        self.assertIn("$logText = try { if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [IO.File]::ReadAllText($batchLog) } else { '' } } catch {", text)
+        self.assertIn("try { if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $batchLog", text)
+        self.assertIn("try { if (Test-Path -LiteralPath $stageEvidence -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $stageEvidence", text)
         self.assertLess(text.index("$killConfirmed = $true"), text.index("$manifest.deleted = $(try { Remove-ExportOutput }"), "the kill is settled before any output is read or deleted")
         proc, got = run_pwsh_json("$e = [pscustomobject]@{ metrics = [pscustomobject]@{}; stages = $null; problems = @(); classMismatch = $false; classDetail = $null }\n"
                                   "[ordered]@{ unconfirmed = (Get-DvExportOutcome -ResultToken 'EXPORT_KILL_UNCONFIRMED' -ExitCode 48 -Evidence $e -Criteria @()).outcome; "

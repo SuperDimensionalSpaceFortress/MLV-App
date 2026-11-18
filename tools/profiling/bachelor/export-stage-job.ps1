@@ -337,7 +337,9 @@ try {
     Write-JobTrace "step export done timedOut=$timedOut exit=$appExitCode seconds=$([math]::Round($exportWatch.Elapsed.TotalSeconds, 1))"
 
     # --- classify from the app's own records -----------------------------------------------------------------------------------------------------------------------
-    $logText = if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [IO.File]::ReadAllText($batchLog) } else { '' }
+    # r8 fix 3 (adversary r8 pass 10 A3): a survivor of an unconfirmed kill may hold the log (or the stage record) without read sharing. Reading or copying it must never cost the typed
+    # EXPORT_KILL_UNCONFIRMED terminal, so the read is guarded (an unreadable log is no log: the classification below decides from the timeout first) and each publish copy is best effort.
+    $logText = try { if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [IO.File]::ReadAllText($batchLog) } else { '' } } catch { Write-JobTrace "step export batch.log read error=$([string]$_.CategoryInfo.Reason)"; '' }
     $done = @([regex]::Matches($logText, '(?m)^\[BATCH\] DONE .+? exported=(?<e>[0-9]+) skipped=(?<s>[0-9]+) elapsed=[0-9.]+\r?$'))
     $exported = if ($done.Count -eq 1) { [int64]$done[0].Groups['e'].Value } else { $null }
     $verified = @([regex]::Matches($logText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]+)\b'))
@@ -370,8 +372,8 @@ try {
 
     # --- publish ONLY the records; then delete the exported footage from the venue-local work dir -------------------------------------------------------------------
     $manifest.deleted = $(try { Remove-ExportOutput } catch { Write-JobTrace "export output delete error=$([string]$_.CategoryInfo.Reason)"; $false })   # a locked survivor makes this false, never a missing terminal
-    if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $batchLog -Destination (Join-Path $Pub 'batch.log')) }
-    if (Test-Path -LiteralPath $stageEvidence -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $stageEvidence -Destination (Join-Path $Pub ([IO.Path]::GetFileName($stageEvidence)))) }
+    try { if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $batchLog -Destination (Join-Path $Pub 'batch.log')) } } catch { Write-JobTrace "step export batch.log publish error=$([string]$_.CategoryInfo.Reason)" }
+    try { if (Test-Path -LiteralPath $stageEvidence -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $stageEvidence -Destination (Join-Path $Pub ([IO.Path]::GetFileName($stageEvidence)))) } } catch { Write-JobTrace "step export stage record publish error=$([string]$_.CategoryInfo.Reason)" }
     Save-Json $manifest (Join-Path $Pub 'output-manifest.json')
     Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
                                    framesExported = $exported; outputCount = $outputs.Count; outputsDeleted = $manifest.deleted; ffmpegPresent = $ffmpegPresent

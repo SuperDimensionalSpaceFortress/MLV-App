@@ -4523,9 +4523,23 @@ $script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw
 $script:ExportCdngLlrawprocChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_pre_dualiso_fix',
     'llrawproc_dual_iso', 'llrawproc_chroma_smooth', 'llrawproc_shared_lock', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock', 'llrawproc_other')
 
+# r8 fix 3 (adversary pass 10 A2): DISJOINT siblings together are inside their parent too: each below its parent is no proof that the pair is (10 + 10 ms inside a 10 ms parent).
+# Each group is (the disjoint children, the parent); the rendered tree's groups below.
+$script:ExportRenderedSumGroups = @(@(@('debayered_frame', 'processing'), 'processed16_total'), @(@('raw_uint16', 'llrawproc'), 'debayered_frame'), @(@('raw_uint16_disk_read', 'raw_uint16_decompress'), 'raw_uint16'))
+
 function Get-DvExportContainmentProblem {
-    # $null, or the EXPORT_STAGE_CONTAINMENT_MISMATCH problem naming the first child (and the count) whose mean exceeds its parent's. $Means: stage name -> mean ms ($null = absent).
-    param($Means, $Pairs)
+    # $null, or the EXPORT_STAGE_CONTAINMENT_MISMATCH problem naming the first child (and the count) whose mean exceeds its parent's, or the first disjoint group whose summed means do.
+    # $Means: stage name -> mean ms ($null = absent).
+    param($Means, $Pairs, $SumGroups = @())
+    foreach ($group in $SumGroups) {
+        $present = @($group[0] | Where-Object { $null -ne $Means[$_] })
+        $parent = $Means[[string]$group[1]]
+        if ($present.Count -lt 2 -or $null -eq $parent) { continue }
+        $sum = 0.0; foreach ($n in $present) { $sum += [double]$Means[$n] }
+        if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) {
+            return "EXPORT_STAGE_CONTAINMENT_MISMATCH: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $parent ms, so their shares are of work this run's frames do not hold"
+        }
+    }
     $bad = [System.Collections.Generic.List[string[]]]::new()   # (a list of pairs: a pipeline would unroll a one-pair result into its two names)
     foreach ($pair in $Pairs) {
         $c = $Means[$pair[0]]; $p = $Means[$pair[1]]
@@ -4781,7 +4795,8 @@ function Get-DvExportEvidence {
             # r8 fix 2 (adversary r8 A1): every producer stage is inside producer_frame_ms and every llrawproc_* child is inside llrawproc_ms
             $means = @{ producer_frame = $denRow.meanMs; llrawproc = $stages.llrawprocTotal.meanMs }
             foreach ($name in $script:ExportCdngProducerStages) { $means[$name] = $rowsOut[$name].meanMs }
-            $pairs = @(foreach ($name in $script:ExportCdngProducerStages) { , @($name, 'producer_frame') }) + @(foreach ($name in $script:ExportCdngLlrawprocChildren) { , @($name, 'llrawproc') })
+            # (r8 fix 3, adversary pass 10 A1: the llrawproc TOTAL is published as a row too, so it is held inside producer_frame_ms like every producer stage)
+            $pairs = @(foreach ($name in $script:ExportCdngProducerStages) { , @($name, 'producer_frame') }) + @(foreach ($name in $script:ExportCdngLlrawprocChildren) { , @($name, 'llrawproc') }) + @(, @('llrawproc', 'producer_frame'))
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs
             if ($null -ne $containment) { $problems.Add($containment) }
             # adversary r2 A2: a capture is a stage-share measurement; successful rows with no producer_frame_ms (or no producer stage figure at all) measured none
@@ -4833,7 +4848,7 @@ function Get-DvExportEvidence {
             # r8 fix 2 (adversary r8 A1): and each stage's mean is inside the stage that contains it (the rendered stage tree in $script:ExportRenderedContainment)
             $means = @{}
             foreach ($name in $script:ExportRenderedStages) { $means[$name] = $rowsOut[$name].meanMs }
-            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportRenderedContainment
+            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportRenderedContainment -SumGroups $script:ExportRenderedSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             $p16Frames = $perStage['processed16_total']
             $missingChild = @($script:ExportRenderedTopLevel | Where-Object { $rowsOut[$_].samples -ne $p16.samples })
