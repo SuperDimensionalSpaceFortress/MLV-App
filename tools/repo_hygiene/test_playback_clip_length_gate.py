@@ -2956,6 +2956,16 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             with self.subTest(text):
                 self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": head + text + "}\n"}), [])
 
+    def test_r8_a_trailing_dot_at_the_end_of_a_file_with_no_final_newline_does_not_crash_the_lexer(self) -> None:
+        # adversary pass on 70336ec9 A3 (advisory, introduced by r7): `.` as the LAST character took the leading-dot number
+        # branch because an empty `nxt` is "in" the digit string, then dereferenced a failed regex match.
+        for text in ("#define DOT .", "// QKeyEvent: a comment only\n#define DOT .", ".", "int x = 1.", "int x = 0x1'0", "x = 5 ."):
+            with self.subTest(text):
+                blank, keep = strip_cpp(text)
+                self.assertTrue(blank.endswith(text[-1]), blank)   # the last token survives (comment text is blanked)
+                self.assertTrue(keep.endswith(text[-1]), keep)
+                scan_app_play_sources({"platform/qt/OtherWidget.h": text})
+
     def test_r3_p2_a2_a_qualified_qkeyevent_include_is_not_a_synthesized_key(self) -> None:
         for text in ("#include <QtGui/QKeyEvent>\n", "#include <qevent.h>\n", '#include "QKeyEvent"\n'):
             with self.subTest(text):
