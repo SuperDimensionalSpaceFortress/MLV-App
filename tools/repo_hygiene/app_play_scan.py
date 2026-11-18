@@ -253,7 +253,8 @@ _INVOKE_METHOD = re.compile(r"\binvokeMethod\s*\([^;]*?\w*[Aa]ctionPlay\w*")
 # parentheses, braces, an array declarator, a template argument (r2 adversary A1 and pass 2 A2). An owning smart
 # pointer of a key event is caught too, on purpose (fail-closed: review it here). A type ALIAS of it, pointer or
 # not, is caught as well, since an alias can construct one without naming the type.
-_KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!\s*[*&])|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
+# r3 (adversary pass on c1216855 A3, advisory): `QKeyEvent const *` / `QKeyEvent const &` is a pointer / reference too.
+_KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!\s*(?:const\b\s*)?[*&])|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
                         r"|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
 # r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
 _KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
@@ -292,7 +293,10 @@ KEY_TABLE_SOURCE = "platform/qt/PlayerShortcutBinding.h"
 KEY_TABLE_REVIEWED_DIRECTIVES = {
     "#ifndef PLAYERSHORTCUTBINDING_H": 1, "#define PLAYERSHORTCUTBINDING_H": 1, "#ifdef Q_OS_WIN": 1, "#endif": 2}
 _DIRECTIVE_LINE = re.compile(r"^[ \t\f\v]*#.*$", re.MULTILINE)
-_INCLUDE_DIRECTIVE = re.compile(r'#\s*include\s*(?:<[^<>"\n]+>|"[^<>"\n]+")')
+# r3 (adversary pass on c1216855 A1): a quoted include of an unscanned fragment carried a macro over the statement. The
+# key table includes only a Qt class header (<QKeySequence>, <QtGui/QKeyEvent>) or a standard library header
+# (<algorithm>): no quotes, no extension, no path. Anything else is a directive change reviewed here.
+_INCLUDE_DIRECTIVE = re.compile(r"#\s*include\s*<\s*(?:(?:Qt\w*/)?Q\w+|[a-z_][a-z0-9_]*)\s*>")
 # r3 (adversary pass on fce56625 A1): a form feed / vertical tab before `#` hid a directive. Fail-closed on the class:
 # ANY control character but tab, newline and carriage return, anywhere in the key table.
 _PREPROCESSOR_RESPELL = re.compile(r"%:|\?\?[=/'()!<>\-]|\\[ \t\r]*$|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", re.MULTILINE)

@@ -2546,6 +2546,13 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             ("\f#define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", "\f#undef QKeySequence"),
         "a vertical tab before an #undef": ("\v#undef QKeySequence", ""),
         "a control character anywhere in the file": ("// a note \x0c with a form feed", ""),
+        # r3 adversary pass on c1216855 A1: a quoted include of an unscanned fragment carried the macro in. Only a Qt
+        # class header or a standard library header may be included by the key table.
+        "a quoted include of a fragment around the statement":
+            ('#include "player-shortcut-key-compat.inc"', '#include "player-shortcut-key-compat-end.inc"'),
+        "a quoted include of a project header": ('#include "LocalHelper.h"', ""),
+        "an angle include of a fragment": ("#include <compat.inc>", ""),
+        "an angle include of a path": ("#include <../platform/qt/compat.h>", ""),
     }
 
     def _key_table_with(self, before: str, after: str) -> dict[str, str]:
@@ -2590,6 +2597,23 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                 problems = scan_app_play_sources({"platform/qt/MainWindow.cpp": lead + "#define QKeySequence(k) k\n"})
                 self.assertIn("platform/qt/MainWindow.cpp:1: #define of QKeySequence, a token of the reviewed Space "
                               "binding statement", problems)
+
+    def test_r3_p3_a1_the_key_table_may_include_qt_and_standard_headers(self) -> None:
+        for include in ("#include <QtGui/QKeyEvent>", "#include <QKeySequence>", "#include <type_traits>"):
+            with self.subTest(include):
+                problems = scan_app_play_sources(self._key_table_with(include, ""))
+                self.assertFalse([p for p in problems if "preprocessor" in p], problems)
+
+    def test_r3_p3_a3_a_const_qualified_pointer_or_reference_is_not_a_synthesized_key(self) -> None:
+        for text in ("auto inspect = [](QKeyEvent const *e) { return e->key(); };\n",
+                     "auto inspect = [](QKeyEvent const &e) { return e.key(); };\n",
+                     "void f( QKeyEvent const* event );\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+        # A const-qualified OBJECT is still a construction.
+        problems = self._key_synth_problems({"platform/qt/StatusDialog.h":
+                                             "void g() { QKeyEvent const press( QEvent::KeyPress, 32, {} ); }\n"})
+        self.assertTrue(any("synthesized key event" in p for p in problems), problems)
 
     def test_r3_p2_a2_a_qualified_qkeyevent_include_is_not_a_synthesized_key(self) -> None:
         for text in ("#include <QtGui/QKeyEvent>\n", "#include <qevent.h>\n", '#include "QKeyEvent"\n'):
