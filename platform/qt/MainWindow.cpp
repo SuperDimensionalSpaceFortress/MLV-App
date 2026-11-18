@@ -1538,6 +1538,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDebayer.h"
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "GpuWindowViewerInputForwarder.h"
 #include "GpuFieldTelemetry.h"
 #include "GpuDeviceLossBreaker.h"
 #include "MainWindowGpuPreviewPolicy.h"
@@ -3684,14 +3685,15 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     }
     else if( event->type() == QEvent::MouseButtonPress )
     {
-        if( !ui->graphicsView->underMouse()
+        const bool onViewer = gpu_window_input::pressIsOnViewer( ui->graphicsView->underMouse(), watched, GpuDisplayWindow::activeWindow() );
+        if( !onViewer
          && !ui->toolButtonWb->underMouse()
          && ui->actionWhiteBalancePicker->isChecked() )
         {
             ui->toolButtonWb->setChecked( false );
             ui->actionWhiteBalancePicker->setChecked( false );
         }
-        else if( !ui->graphicsView->underMouse()
+        else if( !onViewer
               && !ui->toolButtonBadPixelsSearchMethodEdit->underMouse()
               && !ui->toolButtonBadPixelsCrosshairEnable->underMouse() )
         {
@@ -13240,6 +13242,8 @@ void MainWindow::initGui( void )
     connect( m_pScene, SIGNAL( wbPicked(int,int) ), this, SLOT( whiteBalancePicked(int,int) ) );
     connect( m_pScene, SIGNAL( bpPicked(int,int) ), this, SLOT( badPixelPicked(int,int) ) );
     connect( m_pScene, SIGNAL( filesDropped(QStringList) ), this, SLOT( openMlvSet(QStringList) ) );
+    //PLAYER-GL-WINDOW-INPUT-PARITY-1: the GL display window feeds the viewer's mouse input to the same slots as the scene
+    if( QWindow *glWindow = GpuDisplayWindow::activeWindow() ) installGlWindowViewerInput( glWindow );
 
     //Prepare gradient elements
     QPolygon polygon;
@@ -26028,6 +26032,22 @@ void MainWindow::selectAllFiles( void )
 {
     if( m_previewMode == 4 ) ui->tableViewSession->selectAll();
     else ui->listViewSession->selectAll();
+}
+
+//PLAYER-GL-WINDOW-INPUT-PARITY-1: route GL-window clicks, right-clicks and drops into the QGraphicsView path's own slots
+void MainWindow::installGlWindowViewerInput( QWindow *glWindow )
+{
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.sceneSize = [this]() { return m_pScene ? m_pScene->sceneRect().size() : QSizeF(); };
+    hooks.wbArmed = [this]() { return ui->actionWhiteBalancePicker->isChecked(); };
+    hooks.bpArmed = [this]() { return ui->toolButtonBadPixelsSearchMethodEdit->isChecked(); };
+    hooks.pickWhiteBalance = [this]( int x, int y ) { whiteBalancePicked( x, y ); };
+    hooks.pickBadPixel = [this]( int x, int y ) { badPixelPicked( x, y ); };
+    // The menu slot maps through the (hidden) view's mapToGlobal; mapFromGlobal is its exact inverse.
+    hooks.contextMenuAtGlobal = [this]( const QPoint &globalPos ) { pictureCustomContextMenuRequested( ui->graphicsView->mapFromGlobal( globalPos ) ); };
+    hooks.dragEnter = [this]( QDragEnterEvent *e ) { dragEnterEvent( e ); };
+    hooks.drop = [this]( QDropEvent *e ) { dropEvent( e ); };
+    glWindow->installEventFilter( new gpu_window_input::Forwarder( glWindow, std::move( hooks ) ) );
 }
 
 //Contextmenu on picture

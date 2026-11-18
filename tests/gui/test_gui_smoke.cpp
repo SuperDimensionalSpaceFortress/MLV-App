@@ -4,6 +4,7 @@
 #include "../../platform/qt/DualIsoPatternMapping.h"
 #include "../../platform/qt/GpuDisplayViewport.h"
 #include "../../platform/qt/GpuDisplayWindow.h"
+#include "../../platform/qt/GpuWindowViewerInputForwarder.h"
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/Histogram.h"
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
@@ -686,6 +687,11 @@ private slots:
     void scopesLabelDispatchesRawWaveformExactly();
     void scopesLabelDispatchesRawParadeExactly();
     void scopesLabelDispatchesRawVectorScopeExactly();
+    void glWindowViewerInput_picksMapToSceneAndRespectArming();
+    void glWindowViewerInput_contextMenuOnPlatformTriggerOnly();
+    void glWindowViewerInput_dragAndDropReachTheHooks();
+    void glWindowViewerInput_otherObjectsAreIgnored();
+    void glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal();
 };
 
 void GuiSmokeTest::checkedStateUpdatesPalette()
@@ -3722,6 +3728,202 @@ void GuiSmokeTest::scopesLabelDispatchesRawVectorScopeExactly()
     const QImage actual = render_scopes_label_output(raw, 16, 8, false, false, ScopesLabel::ScopeVectorScope);
     QVERIFY(!actual.isNull());
     assert_expected_hash(expected_hashes, QStringLiteral("scopeslabel.raw_vectorscope"), actual);
+}
+
+// PLAYER-GL-WINDOW-INPUT-PARITY-1: the GL display window's viewer-input forwarder, driven on a
+// plain QWindow (never shown) with hooks that record their calls.
+namespace
+{
+
+struct GlWindowInputRecorder
+{
+    int wbCalls = 0;
+    int bpCalls = 0;
+    QPoint lastPick;
+    int menuCalls = 0;
+    QPoint lastMenuGlobal;
+    int dragEnterCalls = 0;
+    int dropCalls = 0;
+    QList<QUrl> droppedUrls;
+    bool wbArmed = false;
+    bool bpArmed = false;
+};
+
+// Sees only the mouse-button events the forwarder did not consume (filters run newest first, so
+// this one, installed before the forwarder, runs after it). Other events (ChildAdded when the
+// forwarder is parented to the window) are not counted.
+class PassThroughSpy : public QObject
+{
+public:
+    int seen = 0;
+    bool eventFilter(QObject *, QEvent *event) override
+    {
+        if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease) ++seen;
+        return false;
+    }
+};
+
+gpu_window_input::Forwarder *installRecordingForwarder(QWindow *window, GlWindowInputRecorder *rec)
+{
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.sceneSize = []() { return QSizeF(1920, 804); };
+    hooks.wbArmed = [rec]() { return rec->wbArmed; };
+    hooks.bpArmed = [rec]() { return rec->bpArmed; };
+    hooks.pickWhiteBalance = [rec](int x, int y) { ++rec->wbCalls; rec->lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [rec](int x, int y) { ++rec->bpCalls; rec->lastPick = QPoint(x, y); };
+    hooks.contextMenuAtGlobal = [rec](const QPoint & global) { ++rec->menuCalls; rec->lastMenuGlobal = global; };
+    hooks.dragEnter = [rec](QDragEnterEvent * e) {
+        ++rec->dragEnterCalls;
+        if (e->mimeData()->hasUrls()) e->acceptProposedAction();
+    };
+    hooks.drop = [rec](QDropEvent * e) { ++rec->dropCalls; rec->droppedUrls = e->mimeData()->urls(); };
+    auto *forwarder = new gpu_window_input::Forwarder(window, std::move(hooks));
+    window->installEventFilter(forwarder);
+    return forwarder;
+}
+
+void deliverMouse(QObject *receiver, QEvent::Type type, Qt::MouseButton button, const QPointF & local, const QPointF & global)
+{
+    QMouseEvent event(type, local, global, button, type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::MouseButtons(button), Qt::NoModifier);
+    QCoreApplication::sendEvent(receiver, &event);
+}
+
+} // namespace
+
+void GuiSmokeTest::glWindowViewerInput_picksMapToSceneAndRespectArming()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    QCOMPARE(window.size(), QSize(1920, 1080));
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    installRecordingForwarder(&window, &rec);
+
+    // White balance armed: the window centre is the scene centre (1920x804 letterboxed into 1920x1080).
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(rec.lastPick, QPoint(960, 402));
+    QCOMPARE(spy.seen, 0); // consumed: the filter returned true
+
+    // A press on the top black bar calls nothing (and is still consumed).
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 20), QPointF(960, 20));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(spy.seen, 0);
+
+    // Bad-pixel armed only: the bad-pixel hook instead.
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(0.5, 138.5), QPointF(0.5, 138.5));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(0, 0));
+    QCOMPARE(spy.seen, 0);
+
+    // Neither armed: nothing is called and the event passes through (the filter returned false).
+    rec.bpArmed = false;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(spy.seen, 1);
+}
+
+void GuiSmokeTest::glWindowViewerInput_contextMenuOnPlatformTriggerOnly()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    installRecordingForwarder(&window, &rec);
+    rec.wbArmed = true; // the menu does not depend on arming
+
+    const bool onRelease = gpu_window_input::contextMenuOnReleaseDefault();
+    const QEvent::Type trigger = onRelease ? QEvent::MouseButtonRelease : QEvent::MouseButtonPress;
+    const QEvent::Type other = onRelease ? QEvent::MouseButtonPress : QEvent::MouseButtonRelease;
+
+    deliverMouse(&window, other, Qt::RightButton, QPointF(100, 200), QPointF(1234, 567));
+    QCOMPARE(rec.menuCalls, 0);
+    QCOMPARE(rec.wbCalls, 0);
+
+    deliverMouse(&window, trigger, Qt::RightButton, QPointF(100, 200), QPointF(1234, 567));
+    QCOMPARE(rec.menuCalls, 1);
+    QCOMPARE(rec.lastMenuGlobal, QPoint(1234, 567));
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(spy.seen, 1); // only the non-trigger event passed through
+}
+
+void GuiSmokeTest::glWindowViewerInput_dragAndDropReachTheHooks()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    installRecordingForwarder(&window, &rec);
+
+    QMimeData mime;
+    const QList<QUrl> urls = { QUrl::fromLocalFile(QStringLiteral("C:/drop-test/first.dat")),
+                               QUrl::fromLocalFile(QStringLiteral("C:/drop-test/second.dat")) };
+    mime.setUrls(urls);
+
+    QDragEnterEvent enter(QPoint(100, 100), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(&window, &enter);
+    QCOMPARE(rec.dragEnterCalls, 1);
+    QVERIFY(enter.isAccepted());
+
+    QDragMoveEvent move(QPoint(120, 110), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    move.ignore();
+    QCoreApplication::sendEvent(&window, &move);
+    QVERIFY(move.isAccepted());
+    QCOMPARE(rec.dragEnterCalls, 1);
+
+    QDropEvent drop(QPointF(120, 110), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(&window, &drop);
+    QCOMPARE(rec.dropCalls, 1);
+    QCOMPARE(rec.droppedUrls, urls);
+}
+
+void GuiSmokeTest::glWindowViewerInput_otherObjectsAreIgnored()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    gpu_window_input::Forwarder *forwarder = installRecordingForwarder(&window, &rec);
+    rec.wbArmed = true;
+
+    QWindow otherWindow;
+    otherWindow.resize(1920, 1080);
+    otherWindow.installEventFilter(forwarder);
+    PassThroughSpy spy;
+    otherWindow.installEventFilter(&spy); // newest: runs first, so it sees every event
+    deliverMouse(&otherWindow, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(spy.seen, 1);
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(rec.menuCalls, 0);
+    // The direct answer for a foreign watched object is false.
+    QMouseEvent press(QEvent::MouseButtonPress, QPointF(960, 540), QPointF(960, 540), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QVERIFY(!forwarder->eventFilter(&otherWindow, &press));
+    QCOMPARE(rec.wbCalls, 0);
+    otherWindow.removeEventFilter(forwarder);
+}
+
+void GuiSmokeTest::glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal()
+{
+    // The context-menu hook passes ui->graphicsView->mapFromGlobal( global ) to a slot that maps
+    // it back with mapToGlobal while the view is hidden behind the GL window container.
+    QWidget parent;
+    parent.resize(800, 600);
+    parent.move(50, 70);
+    QWidget *child = new QWidget(&parent);
+    child->setGeometry(30, 40, 400, 300);
+    child->hide();
+    const QPoint global(1234, 567);
+    QCOMPARE(child->mapToGlobal(child->mapFromGlobal(global)), global);
+    parent.show();
+    QCOMPARE(child->mapToGlobal(child->mapFromGlobal(global)), global);
+    parent.hide();
 }
 
 int main(int argc, char ** argv)
