@@ -398,7 +398,7 @@ class ControlContainerShapeTests(RunnerHarness, unittest.TestCase):
 
 
 BOOL_SWITCHES = ("forceLookAssist", "corePartitionTelemetry", "disableLookAssist", "presentTrace", "firstPresentCapture", "warmReuseMissDump", "unpaced",
-                 "disablePrepPointwiseFast", "prepConflatedMove", "utilSample", "disableReconReleaseDeferred", "dueWakeDeliveryPost")   # every generatorArgs member leg-spec.schema.json types as a boolean (prepConflatedMove: const true)
+                 "disablePrepPointwiseFast", "prepConflatedMove", "utilSample", "disableReconReleaseDeferred", "dueWakeDeliveryPost", "midPlayWindowToggles")   # every generatorArgs member leg-spec.schema.json types as a boolean (prepConflatedMove: const true)
 
 
 @requires_windows_pwsh
@@ -411,7 +411,9 @@ class GeneratorArgsBooleanStrictnessTests(RunnerHarness, unittest.TestCase):
         script = ("$spec = $env:DVE_SPEC_JSON | ConvertFrom-Json -NoEnumerate\n"
                   "$r = Get-DvLegSpecShapeRefusal -Spec $spec\n"
                   "Write-Output ('REFUSAL=' + $r)")
-        spec = '{"schema":"mlv-app/dual-venue-leg/v1","legType":"speed","generatorArgs":{"%s":%s}}' % (name, raw_json)
+        # displayMode windowed: midPlayWindowToggles true is refused on any other display mode (VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 adversary A4), a refusal this
+        # strictness test is not about; no other switch reads displayMode
+        spec = '{"schema":"mlv-app/dual-venue-leg/v1","legType":"speed","displayMode":"windowed","generatorArgs":{"%s":%s}}' % (name, raw_json)
         proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n" + script], env_extra={"DVE_SPEC_JSON": spec})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return next(l for l in proc.stdout.splitlines() if l.startswith("REFUSAL="))[len("REFUSAL="):]

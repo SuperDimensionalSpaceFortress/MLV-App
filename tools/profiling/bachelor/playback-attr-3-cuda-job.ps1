@@ -871,9 +871,6 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # foreground/fullscreen confirmation -- self-contained (no calls to other AttrCuda
     # functions), like the two above it.
     'Get-AttrCudaForegroundVerification',
-    # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the mid-play window-toggle evidence read of the run log (self-contained; only called by a
-    # -MidPlayWindowToggles job, but embedded always so the job's function set does not depend on the switch).
-    'Get-AttrCudaWindowToggleEvidence',
     # CUDA-PERF-DISPLAY-WAKE-1/2: wakes the display from the interactive session before this leg
     # launches MLVApp, holds it awake for the leg, and keeps nudging periodically for the whole
     # leg (SetThreadExecutionState alone does not stop the screen saver) -- see their own header in
@@ -6581,7 +6578,10 @@ if ($MidPlayWindowToggles) {
     $wtClose = '# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 <<<'
     $wtEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
     $wtMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
-    $wtMetrics = $wtOpen + "`n" + @'
+    # The evidence reader is embedded ONLY here (a plain job's function set stays byte-identical to the pinned baseline), extracted from the module by the
+    # same Get-AttrCudaEmbeddedFunctionSource the job's function list uses; it is self-contained.
+    $wtFunctionSource = Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Name @('Get-AttrCudaWindowToggleEvidence')
+    $wtMetrics = $wtOpen + "`n" + $wtFunctionSource + "`n" + @'
 $windowToggleEvidence = $null
 try { $windowToggleEvidence = Get-AttrCudaWindowToggleEvidence -LogText $rawLog -MeasuredSessionId ([string]$measuredSmokeSessionId) } catch { }
 if ($null -eq $windowToggleEvidence) { $windowToggleEvidence = [pscustomobject]@{ requested = 0; driven = 0; keptPlaying = 0; advanced = 0; reason = 'evidence-read-threw' } }

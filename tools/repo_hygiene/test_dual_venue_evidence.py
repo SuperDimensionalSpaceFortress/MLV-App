@@ -1237,8 +1237,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(text.count(closed), 2)
         stripped = re.sub(r"[ \t]*" + re.escape(opened) + r"\n.*?[ \t]*" + re.escape(closed) + r"\n", "", text.replace(line, ""), flags=re.S)
         self.assertEqual(stripped, plain, "the switch's env line and its two brackets are the only difference from the plain job")
-        # the function is embedded in the job always, so the job's function set does not depend on the switch
-        self.assertIn("function Get-AttrCudaWindowToggleEvidence", plain)
+        # the evidence reader is embedded only into the job that asks (inside the first bracketed region), so a plain job stays the pinned baseline's bytes
+        self.assertNotIn("Get-AttrCudaWindowToggleEvidence", plain)
+        self.assertEqual(text.count("function Get-AttrCudaWindowToggleEvidence"), 1)
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mapping = ("if ($spec.generatorArgs.PSObject.Properties['midPlayWindowToggles'] -and $spec.generatorArgs.midPlayWindowToggles -is [bool] "
                    "-and $spec.generatorArgs.midPlayWindowToggles) { $gen['MidPlayWindowToggles'] = $true }")
