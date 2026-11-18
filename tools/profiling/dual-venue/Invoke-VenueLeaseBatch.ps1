@@ -1403,6 +1403,12 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
+    # (adversary pass 19 A1: the floor reads no clip, so a floor child that ends with no answer -- a nonzero exit and no marker, e.g. its module import held without read sharing -- is
+    # not "unknowable": the window's budget is unchecked, and that is the typed refusal, never "no refusal")
+    if ($fp.exit -ne 0) {
+        $firstLine = @(($floorText -split '\r?\n') | Where-Object { $_.Trim() } | Select-Object -First 1)
+        return 'EXPORT_BUDGET_PREFLIGHT_FAILED', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor could not be evaluated (exit $($fp.exit)$(if ($firstLine.Count) { ': ' + ($firstLine[0] -replace '\s+', ' ') })), so its job budget is unchecked; no claim or lease is taken on it"
+    }
     return '', ''
 }
 
