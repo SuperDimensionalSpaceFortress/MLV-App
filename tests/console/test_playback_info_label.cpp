@@ -1173,7 +1173,8 @@ TEST(PlaybackInfoLabel, R13P16A1GpuPrepFrameDebayeredFullSizeNamesFullAndTheSele
     ASSERT_EQ(1, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 1920));
     // a reduced recon consumed by the render (960 of 1920) -> 2
     ASSERT_EQ(2, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 960));
-    // any other frame keeps the render's report (0): a CPU processed frame, the GPU recon, a GPU debayer, unreadable sizes
+    // any other frame keeps the render's report (0): a CPU processed frame, a Bayer-texture-presented frame (r16: not the GPU
+    // recon as such, which a read-back CPU debayer follows), a GPU debayer, unreadable sizes
     ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(true, false, false, 1920, 1920));
     ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, true, false, 1920, 1920));
     ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, true, 1920, 1920));
@@ -1199,7 +1200,7 @@ TEST(PlaybackInfoLabel, R13P16A1GpuPrepFrameDebayeredFullSizeNamesFullAndTheSele
     const QString unreduced = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackUnreducedCpuDebayerScale("));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("playback_info_label::unreducedCpuDebayerScale(")));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"processed16_stage_measured\" ),")));
-    ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"gpu_playback_recon_used\" ),")));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"gpu_playback_recon_texture_present_active\" ),")));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer,")));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_source_width\" ),")));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_rendered_width\" ) );")));
@@ -1208,4 +1209,65 @@ TEST(PlaybackInfoLabel, R13P16A1GpuPrepFrameDebayeredFullSizeNamesFullAndTheSele
     ASSERT_TRUE(shownBody.contains(QStringLiteral("return unreduced > 0 ? unreduced : m_lastPresentedPlaybackScaleFactorActive;")));
     const QString debayerBody = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackDebayerScale("));
     ASSERT_TRUE(debayerBody.contains(QStringLiteral("return presentedPlaybackUnreducedCpuDebayerScale();")));
+}
+
+// r16 (adversary pass 17 A1 on 06faad35): 1920x1088 HQ Dual-ISO, RAW corrections on, AMaZE, Don't Switch Debayer, GL surface,
+// GPU preview processing, CPU debayer backends, MLVAPP_GPU_PLAYBACK_RECON=1, texture presentation OFF, MLVAPP_PLAYBACK_SCALE_FACTOR=2,
+// MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE=1; a supported CUDA recon reads back. Tuple: processedStageMeasured=false, gpuRecon=true,
+// gpuDebayer=false, 1920 of 1920, active 2. The CUDA recon is read back and the CPU debayers it full-size AMaZE, yet the helper
+// refused the frame for gpuRecon alone: both surfaces read "Half" and "AMaZE->Scaled". A GPU recon is not a GPU debayer; only a
+// frame the viewport presented as a Bayer texture (gpu_playback_recon_texture_present_active) skipped the CPU debayer.
+TEST(PlaybackInfoLabel, R16P17A1ReadbackGpuReconFrameDebayeredFullSizeNamesFullAndTheSelectedDebayer)
+{
+    // the finding's frame: not texture-presented, no CPU processed stage, no GPU debayer, rendered 1920 of 1920 -> 1
+    const int shown = playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 1920);
+    ASSERT_EQ(1, shown);
+    // a frame the viewport presented as a Bayer texture keeps the render's report
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, true, false, 1920, 1920));
+    playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+    f.processingBadge = QStringLiteral("GPU Preview");
+    f.gpuDisplay = true;
+    f.requestedScale = 2;
+    f.presentedScale = shown;
+    f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, 2, f.requestedScale, f.presentedScale);
+    f.debayerScale = shown;
+    ASSERT_QSTR_EQ(QStringLiteral("Half->Full"), playback_info_label::scaleField(f));
+    ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+    const QString overlay = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+    const QString twin = playback_info_label::compose(f, playback_info_label::Toggles(), false);
+    ASSERT_FALSE(overlay.contains(QStringLiteral("->Scaled")));
+    ASSERT_FALSE(twin.contains(QStringLiteral("->Scaled")));
+    // the wiring: the accessor reads the texture-presentation key, never the GPU recon flag (the finding's tuple has it true)
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString unreduced = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackUnreducedCpuDebayerScale("));
+    ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"gpu_playback_recon_texture_present_active\" ),")));
+    ASSERT_FALSE(unreduced.contains(QStringLiteral("\"gpu_playback_recon_used\"")));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/PlaybackInfoLabelPolicy.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuTexturePresent, bool gpuDebayer,")));
+}
+
+// r16 (adversary pass 17 A2 on 06faad35): HQ Dual-ISO, AMaZE, CPU 8-bit presentation, fast playback processing, scale 1, GPU
+// recon on, texture presentation off. A GPU-reconstructed Full frame, then a Half preview frame (route 7) in the same Play: the
+// CPU with-dimensions proxy recon kept the thread's "last recon used CUDA" flag, so the route guard refused route 7 and both
+// surfaces read "AMaZE". The engine now clears the flag on every with-dimensions entry (pipeline test
+// DualIsoPipeline.WithDimsCpuReconClearsTheLastGpuReconUsedFlag); the label then names the proxy for every proxy route.
+TEST(PlaybackInfoLabel, R16P17A2ProxyAfterAGpuReconFrameNamesTheProxy)
+{
+    for (int tag : {6, 7, 9, 10}) {
+        playback_info_label::PresentedRouteFacts r = cpuScale1RouteFacts(tag);
+        r.gpuRecon = false;   // what the presented proxy frame's telemetry reads once the with-dimensions entry clears it
+        playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+        f.presentedRoute = playback_info_label::presentedRouteOfFrame(r);
+        ASSERT_EQ(tag, f.presentedRoute);
+        const QString level = (tag == 9 || tag == 10) ? QStringLiteral(" (Quarter proxy)") : QStringLiteral(" (Half proxy)");
+        ASSERT_QSTR_EQ(QStringLiteral("AMaZE->Bilinear") + level, playback_info_label::debayerField(f));
+    }
+    // the engine side: the non-worker with-dimensions entry (every x1 proxy core and scaled pre-recon route calls it) clears
+    // the GPU recon run state before its CPU recon, as the recon worker's entry already did
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    const QString entry = functionBody(llrawproc, QStringLiteral("int applyLLRawProcObject_with_dims(mlvObject_t * video,"));
+    ASSERT_FALSE(entry.isEmpty());
+    const int resetAt = entry.indexOf(QStringLiteral("llrawproc_gpu_playback_reset_last_run_state();"));
+    ASSERT_TRUE(resetAt >= 0);
+    ASSERT_TRUE(entry.indexOf(QStringLiteral("return llrawproc_apply_with_dims_internal(")) > resetAt);
 }

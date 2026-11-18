@@ -260,11 +260,13 @@ inline int debayerScaleOfCpuPrepRoute( int sourceWidth, int renderedWidth )
 
 /*! \brief r13 (adversary pass 16 A1 on deb5a42b): a CPU-debayered OutputDebayered16 frame that the CPU prep did not take (GPU
  *  preview processing presents the RGB16 as rendered) is shown, and was debayered, at the size the render achieved; the render
- *  thread reports the requested scale for it. Only for such a frame: no CPU processed stage, no GPU recon, no GPU debayer.
+ *  thread reports the requested scale for it. Only for such a frame: no CPU processed stage, not presented by the viewport as a
+ *  Bayer texture (gpu_playback_recon_texture_present_active), no GPU debayer. r16 (adversary pass 17 A1 on 06faad35): a GPU
+ *  recon as such does not disqualify it; with texture presentation off the CUDA recon is read back and the CPU debayers it.
  *  0 = not such a frame or unreadable sizes (the caller keeps the render's report). */
-inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuRecon, bool gpuDebayer, int sourceWidth, int renderedWidth )
+inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuTexturePresent, bool gpuDebayer, int sourceWidth, int renderedWidth )
 {
-    if( processedStageMeasured || gpuRecon || gpuDebayer ) return 0;
+    if( processedStageMeasured || gpuTexturePresent || gpuDebayer ) return 0;
     return debayerScaleOfCpuPrepRoute( sourceWidth, renderedWidth );
 }
 
