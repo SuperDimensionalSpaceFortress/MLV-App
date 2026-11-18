@@ -13,6 +13,7 @@
 #include <QTextStream>
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 using gpu_window_input::Route;
@@ -363,38 +364,36 @@ TEST(GpuWindowViewerInput, C11_StretchChangeAt100PercentPicksTheDisplayedRawPixe
     // 1920x1260) in a 1000x1000 window at DPR 2; stretchY is then set to 1 before another frame lands.
     // The centre click shows raw row 210; the slot divides by the current stretch (1).
     // (Red on 1d1960eb, whose hook handed pickPixel the painted scene rect 1920x1260: raw row 630.)
-    using gpu_window_input::pickerSceneSize;
     const QRectF drawn = paintedRect(1000, 1000, 2.0, 1920, 1260);
     const QSizeF paintedScene(1920, 1260); // the scene rect is still the painted frame's
-    const QSizeF hookScene = pickerSceneSize(false, paintedScene, 1920, 420, 1.0, 1.0);
-    ASSERT_NEAR(1920.0, hookScene.width(), 1e-9);
-    ASSERT_NEAR(420.0, hookScene.height(), 1e-9);
+    gpu_window_input::PickBasis basis;
+    basis.zoomFit = false;
+    basis.sceneRect = paintedScene;
+    basis.rawWidth = 1920;
+    basis.rawHeight = 420;
+    basis.stretchX = 1.0;
+    basis.stretchY = 1.0;
     int x = -1;
     int y = -1;
     // Just off the centre, so no float ulp sits on a pixel boundary.
-    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, hookScene, &x, &y));
+    ASSERT_TRUE(gpu_window_input::pickSlotPixel(QPointF(500.3, 500.3), drawn, basis, &x, &y));
     const QPoint raw = slotRaw(x, y, false, 1920, 420, paintedScene.width(), paintedScene.height(), 1.0, 1.0);
     ASSERT_EQ(960, raw.x());
     ASSERT_EQ(210, raw.y());
     // Unchanged stretch (3) gives the same raw pixel.
-    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, pickerSceneSize(false, paintedScene, 1920, 420, 1.0, 3.0), &x, &y));
+    basis.stretchY = 3.0;
+    ASSERT_TRUE(gpu_window_input::pickSlotPixel(QPointF(500.3, 500.3), drawn, basis, &x, &y));
     const QPoint same = slotRaw(x, y, false, 1920, 420, paintedScene.width(), paintedScene.height(), 1.0, 3.0);
     ASSERT_EQ(960, same.x());
     ASSERT_EQ(210, same.y());
-    // Fit mode: the slots scale by raw / scene rect, so the scene rect is the basis, whatever the stretch.
-    const QSizeF fitScene(1000, 654);
-    const QSizeF fitHook = pickerSceneSize(true, fitScene, 1920, 420, 1.0, 1.0);
-    ASSERT_NEAR(1000.0, fitHook.width(), 1e-9);
-    ASSERT_NEAR(654.0, fitHook.height(), 1e-9);
-    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, fitHook, &x, &y));
-    const QPoint fitRaw = slotRaw(x, y, true, 1920, 420, fitScene.width(), fitScene.height(), 1.0, 1.0);
-    ASSERT_TRUE(fitRaw.x() >= 959 && fitRaw.x() <= 961);   // the slot's own int truncation: within one pixel
-    ASSERT_TRUE(fitRaw.y() >= 209 && fitRaw.y() <= 211);
-    // Not a usable clip size or stretch: no basis, so no pick.
-    ASSERT_TRUE(pickerSceneSize(false, paintedScene, 0, 420, 1.0, 1.0).isEmpty());
-    ASSERT_TRUE(pickerSceneSize(false, paintedScene, 1920, 420, 0.0, 1.0).isEmpty());
-    ASSERT_TRUE(pickerSceneSize(false, paintedScene, 1920, 420, 1.0, std::nan("")).isEmpty());
-    ASSERT_FALSE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, pickerSceneSize(false, paintedScene, 0, 0, 1.0, 1.0), &x, &y));
+    // Fit mode: the slots scale by raw / scene rect (1000x654 here, smaller than the clip, so one scene
+    // pixel spans about 1.9 x 0.64 raw pixels): the nearest raw pixel the slots can reach.
+    basis.zoomFit = true;
+    basis.sceneRect = QSizeF(1000, 654);
+    ASSERT_TRUE(gpu_window_input::pickSlotPixel(QPointF(500.3, 500.3), drawn, basis, &x, &y));
+    const QPoint fitRaw = slotRaw(x, y, true, 1920, 420, 1000, 654, 1.0, 3.0);
+    ASSERT_TRUE(fitRaw.x() >= 959 && fitRaw.x() <= 961);
+    ASSERT_EQ(210, fitRaw.y());
 }
 
 TEST(GpuWindowViewerInput, C11b_StretchXChangeAt100PercentPicksTheDisplayedRawColumn)
@@ -404,13 +403,111 @@ TEST(GpuWindowViewerInput, C11b_StretchXChangeAt100PercentPicksTheDisplayedRawCo
     // (Red on 1d1960eb: column 1080, past the image, and the slots' "x > width" guard let it through.)
     const QRectF drawn = paintedRect(1200, 1000, 1.0, 2160, 1922);
     const QSizeF paintedScene(2160, 1922);
-    const QSizeF hookScene = gpu_window_input::pickerSceneSize(false, paintedScene, 1080, 1922, 1.0, 1.0);
+    gpu_window_input::PickBasis basis;
+    basis.zoomFit = false;
+    basis.sceneRect = paintedScene;
+    basis.rawWidth = 1080;
+    basis.rawHeight = 1922;
     int x = -1;
     int y = -1;
-    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(600.3, 500.3), drawn, hookScene, &x, &y));
+    ASSERT_TRUE(gpu_window_input::pickSlotPixel(QPointF(600.3, 500.3), drawn, basis, &x, &y));
     const QPoint raw = slotRaw(x, y, false, 1080, 1922, paintedScene.width(), paintedScene.height(), 1.0, 1.0);
     ASSERT_EQ(540, raw.x());
     ASSERT_EQ(961, raw.y());
+}
+
+TEST(GpuWindowViewerInput, C12_SlotIntegersLandOnTheDisplayedRawPixelAtAnyStretch)
+{
+    // Adversary r2 pass 2 A1 (on a8771a41): raw 1920x420, 100%, painted 1920x1260 (drawn rect
+    // (0, 171.875, 1000, 656.25) at DPR 2); stretch set to 1.25 x 1.6667 before the next paint; press at
+    // (12, 330). The picture shows raw (23.04, 101.2), so raw (23, 101).
+    const QRectF drawn = paintedRect(1000, 1000, 2.0, 1920, 1260);
+    gpu_window_input::PickBasis basis;
+    basis.zoomFit = false;
+    basis.sceneRect = QSizeF(1920, 1260);
+    basis.rawWidth = 1920;
+    basis.rawHeight = 420;
+    basis.stretchX = 1.25;
+    basis.stretchY = 1.6667;
+    // a8771a41 floored in scene space (into raw x stretch) and the slot truncated again: (22, 100).
+    int sx = -1;
+    int sy = -1;
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(12, 330), drawn, QSizeF(1920 * 1.25, 420 * 1.6667), &sx, &sy));
+    const QPoint before = slotRaw(sx, sy, false, 1920, 420, 1920, 1260, 1.25, 1.6667);
+    ASSERT_EQ(22, before.x());
+    ASSERT_EQ(100, before.y());
+    int x = -1;
+    int y = -1;
+    ASSERT_TRUE(gpu_window_input::pickSlotPixel(QPointF(12, 330), drawn, basis, &x, &y));
+    const QPoint raw = slotRaw(x, y, false, 1920, 420, 1920, 1260, 1.25, 1.6667);
+    ASSERT_EQ(23, raw.x());
+    ASSERT_EQ(101, raw.y());
+
+    // Every stretch the controls offer (H x V, and H x 3 for the V index-3 case), 100%: over a dense
+    // sweep of the drawn picture, the slots land exactly on floor(fraction * raw), always a real pixel.
+    const double hs[] = { 1.0, 1.25, 1.3333, 1.5, 1.6667, 1.75, 1.8, 2.0, 3.0, 3.75, 3.9999, 4.5, 5.0001, 5.25, 5.4, 6.0 };
+    const double vs[] = { 1.0, 1.6667, 3.0 };
+    for (double h : hs)
+    {
+        for (double v : vs)
+        {
+            basis.stretchX = h;
+            basis.stretchY = v;
+            for (int wy = 172; wy < 828; wy += 37)
+            {
+                for (int wx = 0; wx < 1000; wx += 13)
+                {
+                    const QPointF p(wx + 0.37, wy + 0.61);
+                    ASSERT_TRUE(gpu_window_input::pickSlotPixel(p, drawn, basis, &x, &y));
+                    const QPoint got = slotRaw(x, y, false, 1920, 420, 1920, 1260, h, v);
+                    const int wantX = int(std::floor((p.x() - drawn.x()) / drawn.width() * 1920));
+                    const int wantY = int(std::floor((p.y() - drawn.y()) / drawn.height() * 420));
+                    ASSERT_EQ(wantX, got.x());
+                    ASSERT_EQ(wantY, got.y());
+                }
+            }
+        }
+    }
+    // Fit mode, scene smaller than the clip: within one scene pixel's span of the wanted raw pixel,
+    // and always a real pixel the slots accept.
+    basis.zoomFit = true;
+    basis.sceneRect = QSizeF(1000, 218);
+    for (int wy = 172; wy < 828; wy += 29)
+    {
+        for (int wx = 0; wx < 1000; wx += 11)
+        {
+            const QPointF p(wx + 0.5, wy + 0.5);
+            ASSERT_TRUE(gpu_window_input::pickSlotPixel(p, drawn, basis, &x, &y));
+            const QPoint got = slotRaw(x, y, true, 1920, 420, 1000, 218, 1.0, 1.0);
+            const int wantX = int(std::floor((p.x() - drawn.x()) / drawn.width() * 1920));
+            const int wantY = int(std::floor((p.y() - drawn.y()) / drawn.height() * 420));
+            ASSERT_TRUE(got.x() >= 0 && got.x() <= 1919 && got.y() >= 0 && got.y() <= 419);
+            ASSERT_TRUE(std::abs(got.x() - wantX) <= 1);   // 1.92 raw per scene pixel: nearest reachable
+            ASSERT_TRUE(std::abs(got.y() - wantY) <= 1);   // 1.93 raw per scene pixel
+        }
+    }
+
+    // Advisory A3 (pass 2): fit mode refuses an unusable clip size or stretch too.
+    gpu_window_input::PickBasis bad = basis;
+    bad.rawWidth = 0;
+    ASSERT_FALSE(gpu_window_input::pickSlotPixel(QPointF(500, 500), drawn, bad, &x, &y));
+    bad = basis;
+    bad.stretchY = std::nan("");
+    ASSERT_FALSE(gpu_window_input::pickSlotPixel(QPointF(500, 500), drawn, bad, &x, &y));
+    bad = basis;
+    bad.sceneRect = QSizeF();
+    ASSERT_FALSE(gpu_window_input::pickSlotPixel(QPointF(500, 500), drawn, bad, &x, &y));
+    ASSERT_FALSE(gpu_window_input::pickSlotPixel(QPointF(500, 500), drawn, gpu_window_input::PickBasis(), &x, &y));
+    // Advisory A2 (pass 2): INT_MAX-sized geometry is refused before any int conversion.
+    bad = basis;
+    bad.zoomFit = false;
+    bad.rawWidth = std::numeric_limits<int>::max();
+    bad.rawHeight = std::numeric_limits<int>::max();
+    bad.stretchX = 2.0;
+    bad.stretchY = 2.0;
+    ASSERT_FALSE(gpu_window_input::pickSlotPixel(QPointF(0.75, 0.75), QRectF(0, 0, 1, 1), bad, &x, &y));
+    ASSERT_FALSE(gpu_window_input::pickPixel(QPointF(0.75, 0.75), QRectF(0, 0, 1, 1), QSizeF(4294967294.0, 4294967294.0), &x, &y));
+    ASSERT_FALSE(gpu_window_input::pickPixel(QPointF(0.75, 0.75), QRectF(0, 0, 1, 1), QSizeF(std::nan(""), 10), &x, &y));
 }
 
 TEST(GpuWindowViewerInput, C10_DrawnPictureRectIsTheQuadPaintGlDrew)

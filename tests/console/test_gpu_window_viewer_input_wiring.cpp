@@ -125,10 +125,21 @@ TEST(GpuWindowViewerInputWiring, W6_PickSceneIsTheBasisTheSlotsConvertFrom)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString body = functionBody(source, kDefinition, kNextDefinition);
     ASSERT_FALSE(body.isEmpty());
-    ASSERT_TRUE(body.contains(QStringLiteral(
-        "return gpu_window_input::pickerSceneSize( ui->actionZoomFit->isChecked(), m_pScene->sceneRect().size(), "
-        "static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ), "
-        "getHorizontalStretchFactor( false ), getVerticalStretchFactor( false ) );")));
+    // The basis is read with the slots' own reads, at the click (adversary r2 pass 2 A1: the forwarder
+    // solves for the integers whose slot conversion lands on the displayed raw pixel).
+    const QString basisHook = QStringLiteral(
+        "    hooks.pickBasis = [this]() {\n"
+        "        gpu_window_input::PickBasis basis;\n"
+        "        if( !m_pScene || !m_pMlvObject ) return basis;\n"
+        "        basis.zoomFit = ui->actionZoomFit->isChecked();\n"
+        "        basis.sceneRect = m_pScene->sceneRect().size();\n"
+        "        basis.rawWidth = static_cast<int>( getMlvWidth( m_pMlvObject ) );\n"
+        "        basis.rawHeight = static_cast<int>( getMlvHeight( m_pMlvObject ) );\n"
+        "        basis.stretchX = getHorizontalStretchFactor( false );\n"
+        "        basis.stretchY = getVerticalStretchFactor( false );\n"
+        "        return basis;\n"
+        "    };\n");
+    ASSERT_TRUE(body.contains(basisHook));
     const QString slotConversion = QStringLiteral(
         "    if( ui->actionZoomFit->isChecked() )\n"
         "    {\n"

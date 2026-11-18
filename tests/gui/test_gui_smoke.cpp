@@ -3771,7 +3771,15 @@ public:
 gpu_window_input::Forwarder *installRecordingForwarder(QWindow *window, GlWindowInputRecorder *rec)
 {
     gpu_window_input::Forwarder::Hooks hooks;
-    hooks.sceneSize = []() { return QSizeF(1920, 804); };
+    // A 1920x804 clip in fit mode with a scene of the same size: the slots' conversion is the identity.
+    hooks.pickBasis = []() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = QSizeF(1920, 804);
+        basis.rawWidth = 1920;
+        basis.rawHeight = 804;
+        return basis;
+    };
     // As if paintGL last drew the scene-sized image letterboxed into the window.
     hooks.drawnPicture = [window]() { return gpu_window_input::letterboxRect(QSizeF(window->size()), QSizeF(1920, 804)); };
     hooks.wbArmed = [rec]() { return rec->wbArmed; };
@@ -3980,9 +3988,17 @@ void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
     QWindow window;
     window.resize(1000, 1000);
     QSizeF scene(1000, 418);
+    QSize raw(1000, 418); // the slots' conversion is the identity until the A3 part below
     QRectF drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 804)); // texture route: from y 290.625
     gpu_window_input::Forwarder::Hooks hooks;
-    hooks.sceneSize = [&scene]() { return scene; };
+    hooks.pickBasis = [&scene, &raw]() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = scene;
+        basis.rawWidth = raw.width();
+        basis.rawHeight = raw.height();
+        return basis;
+    };
     hooks.drawnPicture = [&drawn]() { return drawn; };
     hooks.wbArmed = [&rec]() { return rec.wbArmed; };
     hooks.bpArmed = [&rec]() { return rec.bpArmed; };
@@ -4002,16 +4018,21 @@ void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
 
     // A3: a 1920x420 clip at stretchY 3 drawn as 1920x1260 (from y 171.875) with a 1000x654 scene;
     // whatever the stretch controls say next, until paintGL draws again the drawn rect decides.
+    // The clip is 1920x420 in fit mode with a 1000x654 scene: the slots turn the handed integers into
+    // raw pixels with int( c * 1920 / 1000 ), int( c * 420 / 654 ); the raw pixel shown must come out.
     scene = QSizeF(1000, 654);
+    raw = QSize(1920, 420);
     drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 1260));
+    const auto slotRawY = [](int c) { return static_cast<int>(c * (420 / 654.0)); };
     rec.wbArmed = false;
     rec.bpArmed = true;
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 172), QPointF(500, 172));
     QCOMPARE(rec.bpCalls, 1);
-    QCOMPARE(rec.lastPick, QPoint(500, 0));
-    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 200), QPointF(500, 200));
+    QCOMPARE(rec.lastPick.x(), 500);
+    QCOMPARE(slotRawY(rec.lastPick.y()), 0);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 200.5), QPointF(500, 200.5));
     QCOMPARE(rec.bpCalls, 2);
-    QCOMPARE(rec.lastPick, QPoint(500, 28));
+    QCOMPARE(slotRawY(rec.lastPick.y()), 18);   // (200.5 - 171.875) / 656.25 * 420 = 18.32
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 171.8), QPointF(500, 171.8));
     QCOMPARE(rec.bpCalls, 2);
 }
@@ -4025,8 +4046,16 @@ void GuiSmokeTest::glWindowViewerInput_noDrawnPictureIsNoPick()
     window.resize(1000, 1000);
     PassThroughSpy spy;
     window.installEventFilter(&spy);
+    const auto usableBasis = []() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = QSizeF(1000, 654);
+        basis.rawWidth = 1000;
+        basis.rawHeight = 654;
+        return basis;
+    };
     gpu_window_input::Forwarder::Hooks hooks;
-    hooks.sceneSize = []() { return QSizeF(1000, 654); };
+    hooks.pickBasis = usableBasis;
     hooks.drawnPicture = []() { return QRectF(); };
     hooks.wbArmed = [&rec]() { return rec.wbArmed; };
     hooks.bpArmed = [&rec]() { return rec.bpArmed; };
@@ -4047,7 +4076,7 @@ void GuiSmokeTest::glWindowViewerInput_noDrawnPictureIsNoPick()
     QWindow window2;
     window2.resize(1000, 1000);
     gpu_window_input::Forwarder::Hooks bare;
-    bare.sceneSize = []() { return QSizeF(1000, 654); };
+    bare.pickBasis = usableBasis;
     bare.wbArmed = []() { return true; };
     bare.pickWhiteBalance = [&rec2](int, int) { ++rec2.wbCalls; };
     window2.installEventFilter(new gpu_window_input::Forwarder(&window2, std::move(bare)));

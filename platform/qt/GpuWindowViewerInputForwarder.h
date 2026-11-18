@@ -4,9 +4,9 @@
 // (GpuDisplayWindow, a QOpenGLWindow inside a window container) that routes the viewer's
 // mouse input to the same MainWindow slots the QGraphicsView path reaches through its scene:
 // white-balance pick, bad-pixel pick, the right-click viewer menu, and drop-to-open.
-// Picks are mapped from window to scene pixels with gpu_window_input::pickPixel, through the
-// picture rect the window's last paintGL drew (the drawnPicture hook); the slots convert scene
-// coordinates as before. A drop is handed over as the scene's filesDropped list (openMlvSet),
+// Picks are mapped with gpu_window_input::pickSlotPixel, through the picture rect the window's
+// last paintGL drew (the drawnPicture hook), into the scene integers whose conversion in the
+// unchanged slots (the pickBasis hook) selects the raw pixel the picture shows. A drop is handed over as the scene's filesDropped list (openMlvSet),
 // not through MainWindow::dropEvent, so it opens what the same drop on the scene opens.
 // Header-only, no Q_OBJECT (no moc). The filter is a child of the window, so it lives as
 // long as the window does.
@@ -31,7 +31,9 @@ class Forwarder : public QObject
 public:
     struct Hooks
     {
-        std::function<QSizeF()> sceneSize;
+        // How the picker slots convert the scene integers they are handed (fit flag, scene rect, clip
+        // size, current stretch), read at the click; see pickSlotPixel. Unset = no usable basis: no pick.
+        std::function<PickBasis()> pickBasis;
         // The picture rect the window's last paintGL drew, in window logical pixels
         // (drawnPictureRect of GpuDisplayWindow::lastPaintedPicture()); see pickPixel. Unset or
         // empty = nothing drawn yet: a pick is refused, never guessed.
@@ -86,11 +88,11 @@ public:
         case Route::PickWhiteBalance:
         case Route::PickBadPixel:
         {
-            const QSizeF scene = m_hooks.sceneSize ? m_hooks.sceneSize() : QSizeF();
+            const PickBasis basis = m_hooks.pickBasis ? m_hooks.pickBasis() : PickBasis();
             const QRectF drawn = m_hooks.drawnPicture ? m_hooks.drawnPicture() : QRectF();
             int x = 0;
             int y = 0;
-            if( pickPixel( pos, drawn, scene, &x, &y ) )
+            if( pickSlotPixel( pos, drawn, basis, &x, &y ) )
             {
                 const bool white = wb;
                 if( white && m_hooks.pickWhiteBalance ) m_hooks.pickWhiteBalance( x, y );

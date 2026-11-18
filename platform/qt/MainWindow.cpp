@@ -26038,10 +26038,17 @@ void MainWindow::selectAllFiles( void )
 void MainWindow::installGlWindowViewerInput( QWindow *glWindow )
 {
     gpu_window_input::Forwarder::Hooks hooks;
-    // The basis the picker slots convert from (fit: the scene rect; 100%: the clip at the current stretch).
-    hooks.sceneSize = [this]() {
-        if( !m_pScene || !m_pMlvObject ) return QSizeF();
-        return gpu_window_input::pickerSceneSize( ui->actionZoomFit->isChecked(), m_pScene->sceneRect().size(), static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ), getHorizontalStretchFactor( false ), getVerticalStretchFactor( false ) );
+    // What the picker slots convert the handed scene integers with, read at the click (their own reads).
+    hooks.pickBasis = [this]() {
+        gpu_window_input::PickBasis basis;
+        if( !m_pScene || !m_pMlvObject ) return basis;
+        basis.zoomFit = ui->actionZoomFit->isChecked();
+        basis.sceneRect = m_pScene->sceneRect().size();
+        basis.rawWidth = static_cast<int>( getMlvWidth( m_pMlvObject ) );
+        basis.rawHeight = static_cast<int>( getMlvHeight( m_pMlvObject ) );
+        basis.stretchX = getHorizontalStretchFactor( false );
+        basis.stretchY = getVerticalStretchFactor( false );
+        return basis;
     };
     // The picture rect the GL window's last paintGL actually drew, whichever route presented and
     // whatever the stretch controls say now (empty before any frame: no pick). The forwarder is a
