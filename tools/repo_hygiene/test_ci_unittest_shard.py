@@ -2536,6 +2536,76 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertFalse(shard.is_interrupt(ClassAttributeExits(0)))
         self.assertTrue(shard.is_interrupt(KeyboardInterrupt()))
 
+    # r12 adversary pass 21 A1: a SystemExit subclass whose ``code`` property raises SystemExit(0) must not end the run green.
+    def test_the_zero_exit_guard_does_not_read_a_code_property_of_the_exit_it_judges(self) -> None:
+        def explode(self: object) -> int:
+            raise SystemExit(0)
+
+        class CodeGetterExits(SystemExit):
+            code = property(explode)  # type: ignore[assignment]
+
+        for label, raised, nonzero in (("nonzero", CodeGetterExits(1), True), ("zero", CodeGetterExits(0), False)):
+            def ended() -> int:
+                raise raised
+
+            outcome: SystemExit | None = None
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    shard.never_exits_zero(ended)()
+                except SystemExit as error:
+                    outcome = error
+            # asserted outside the handler: a failure here must not chain to the hostile exception
+            with self.subTest(label):
+                self.assertIsNotNone(outcome, "the guard let the run return normally")
+                final = SystemExit.code.__get__(outcome, SystemExit)
+                self.assertIs(issubclass(type(final), int) and int.__eq__(final, 0) is True, False, "ended with a zero exit")
+                self.assertEqual(final, 1)
+
+    # r12 adversary pass 21 A2: an interrupt inside Popen after the OS created the child leaves nothing returned to end.
+    def test_an_interrupt_inside_the_launch_after_the_child_exists_still_ends_the_worker(self) -> None:
+        root, tests, tag = self._fixture()
+        made: list[object] = []
+        running = self._RunningProc
+
+        class HalfBuilt(running):  # type: ignore[valid-type, misc]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__()
+                self.pid = 424242
+                made.append(self)
+                raise KeyboardInterrupt  # the child exists; the constructor never returns it
+
+        out, err = io.StringIO(), io.StringIO()
+        raised: BaseException | None = None
+        with (
+            mock.patch.object(shard.subprocess, "Popen", HalfBuilt),
+            mock.patch.object(shard, "_kill_tree", return_value=None),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                shard.run_parallel(
+                    tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+                )
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        for kept in re.findall(r"kept at (.+)$", err.getvalue(), re.MULTILINE):
+            self.addCleanup(shutil.rmtree, kept, True)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised) + err.getvalue())
+        self.assertEqual(len(made), 1)
+        self.assertEqual(made[0].returncode, -9, "the child the launch created was left running")
+
+    def test_half_built_worker_is_none_when_no_child_was_created(self) -> None:
+        def build() -> None:
+            self = subprocess.Popen.__new__(subprocess.Popen)  # noqa: F841 - a Popen with no pid: nothing was created
+            raise KeyboardInterrupt
+
+        try:
+            build()
+        except KeyboardInterrupt as error:
+            found = shard.half_built_worker(error)
+        self.assertIsNone(found)
+
     # r11 adversary A1 (pass 19): an interrupt after the worker exists but before it is registered must not leave it running.
     def test_an_interrupt_between_the_launch_and_its_registration_still_ends_the_worker(self) -> None:
         import inspect

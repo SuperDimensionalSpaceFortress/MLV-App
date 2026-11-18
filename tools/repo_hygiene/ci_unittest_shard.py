@@ -632,6 +632,25 @@ class BudgetWatch:
             self.check()
 
 
+def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
+    """The ``Popen`` whose constructor ``error`` cut short after the OS had already created the child.
+
+    ``Popen(...)`` never returns in that case, so the caller holds nothing to end. The object is still
+    ``self`` in the constructor's frames, which the error's traceback keeps alive; it carries the child's
+    ``pid`` (and, on Windows, its handle) as soon as the child exists. ``None`` when there is no such child.
+    """
+    link = error.__traceback__
+    while link is not None:
+        try:
+            candidate = link.tb_frame.f_locals.get("self")
+            if isinstance(candidate, subprocess.Popen) and candidate.pid is not None and candidate.returncode is None:
+                return candidate
+        except Exception:  # noqa: BLE001 - a frame that cannot be read is skipped, never fatal
+            pass
+        link = link.tb_next
+    return None
+
+
 def is_interrupt(error: BaseException) -> bool:
     """Whether ``error`` is a ``KeyboardInterrupt``, decided on its real type.
 
@@ -639,6 +658,9 @@ def is_interrupt(error: BaseException) -> bool:
     that attribute raise (an audit hook's ``SystemExit(0)`` is enough). ``type()`` never reads it.
     """
     return issubclass(type(error), KeyboardInterrupt)
+
+
+_EXIT_CODE_SLOT = SystemExit.code  # the member descriptor: reads the stored code, whatever a subclass defines
 
 
 def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
@@ -654,9 +676,14 @@ def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
             # Decided on the code's own value, never through its methods or attributes: an int subclass can
             # make ``bool()``, ``==``, ``repr()`` or ``__class__`` (which ``isinstance`` reads) raise a
             # ``SystemExit(0)`` from inside this handler. ``type()`` and ``int.__eq__`` read none of them.
-            code = error.code
+            # The code is read from ``SystemExit``'s own slot, not through ``error.code``: a subclass can
+            # turn that attribute into a property that raises ``SystemExit(0)``.
+            code = _EXIT_CODE_SLOT.__get__(error, SystemExit)
             if not (code is None or (issubclass(type(code), int) and int.__eq__(code, 0) is True)):
-                raise
+                if type(error) is SystemExit:
+                    raise
+                # A subclass's own ``code`` is read again by the interpreter at exit: end with a plain one.
+                raise SystemExit(code) from error
             emit_error(f"{function.__name__} was ended by {describe_error(error)} (code {'None' if code is None else 0}), which is not a pass")
             raise SystemExit(1) from error
 
@@ -1220,8 +1247,12 @@ def run_parallel(
                 procs.append((proc, log))
                 logs.append(home / "log.txt")
                 killer.add(proc)  # from here the deadline is enforced even while the next launch blocks
-            except BaseException:
+            except BaseException as launch_error:
                 log.close()  # a launch that failed is not in procs: the cleanup below would never close it
+                if proc is None:
+                    # Popen never returned, but an interrupt after the OS created the child leaves a built
+                    # ``self`` in its own frames: take that over, or nothing would ever end the child.
+                    proc = half_built_worker(launch_error)
                 if proc is not None:
                     # The worker exists but its registration was cut short (an interrupt between the launch and
                     # the lists): finish it, so the cleanup below kills it, reports its log and keeps the lists paired.
