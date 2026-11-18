@@ -1809,14 +1809,80 @@ class ShardExitCodeTests(unittest.TestCase):
 
         procs = [self._pid_proc() for _ in range(7)]
         with (
+            mock.patch.object(shard.os, "name", "nt"),
             mock.patch.object(shard, "time", types.SimpleNamespace(monotonic=lambda: now[0])),
             mock.patch.object(shard.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")),
-            mock.patch.object(shard, "_kill_tree", tree),
+            mock.patch.object(shard, "_kill_tree", mock.Mock(side_effect=tree)) as kill_tree,
+            mock.patch.object(shard.subprocess, "run", side_effect=AssertionError("taskkill launched inline")) as run,
         ):
             results = shard.terminate_all(procs)
         self.assertLessEqual(now[0], shard.TERMINATE_BOUND_SECONDS, "seven serial inline kills overran the total bound")
         self.assertEqual([proc.returncode for proc in procs], [-9] * 7, "every worker is still killed")
         self.assertEqual(len(results), 7)
+        # r8 adversary A1: a taskkill launch (process creation) is outside its own timeout, so no blocking tree
+        # kill runs inline at all; the tree is reported as not confirmed.
+        self.assertEqual((kill_tree.call_count, run.call_count), (0, 0))
+        self.assertTrue(all(result and "tree is not confirmed" in result for result in results), results)
+
+    # r8 adversary A2: a worker whose exit the inline fallback could not confirm is reported, not read as clean.
+    def test_the_inline_fallback_reports_a_worker_whose_exit_it_could_not_confirm(self) -> None:
+        class Slow(self._RunningProc):
+            def kill(self) -> None:
+                self.kill_calls += 1  # accepted, but the process object is not signalled yet
+
+        for name in ("posix", "nt"):
+            with self.subTest(os=name):
+                proc = Slow()
+                proc.pid = 424242
+                with (
+                    mock.patch.object(shard.os, "name", name),
+                    mock.patch.object(shard.threading.Thread, "start", side_effect=RuntimeError("no thread")),
+                    mock.patch.object(shard.os, "killpg", create=True),
+                    mock.patch.object(shard.signal, "SIGKILL", 9, create=True),
+                ):
+                    results = shard.terminate_all([proc], reap=True)
+                self.assertIsNotNone(results[0], "an unconfirmed exit read as a clean termination")
+                self.assertIn("exit was not confirmed", results[0])
+        reaped = self._pid_proc()  # a worker that is gone after the kill and a tree kill that cannot block
+        with (
+            mock.patch.object(shard.os, "name", "posix"),
+            mock.patch.object(shard.threading.Thread, "start", side_effect=RuntimeError("no thread")),
+            mock.patch.object(shard.os, "killpg", create=True),
+            mock.patch.object(shard.signal, "SIGKILL", 9, create=True),
+        ):
+            self.assertEqual(shard.terminate_all([reaped], reap=True), [None])
+        self.assertEqual(reaped.returncode, -9)
+
+    # r8 adversary A3: a log the parent's stdout cannot encode must not raise, lose the other logs or be deleted.
+    def test_a_log_that_stdout_cannot_encode_does_not_lose_the_other_logs(self) -> None:
+        root, tests, tag = self._fixture()
+        calls: list[int] = []
+        real = self._finished_popen(calls)
+
+        def popen(*args: object, **kwargs: object) -> object:
+            proc = real(*args, **kwargs)
+            if len(calls) == 1:
+                kwargs["stdout"].write(b"caf\xe9\n")  # cp1252 bytes: not UTF-8, so decoded to U+FFFD
+                kwargs["stdout"].flush()
+            return proc
+
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="cp1252", errors="strict", write_through=True)
+        err = io.StringIO()
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=popen),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        out.flush()
+        printed = raw.getvalue().decode("cp1252")
+        self.assertEqual(code, 1)
+        self.assertIn("fx-boom-2", printed, "worker 2's output was lost to worker 1's unencodable log")
+        self.assertIn("caf", printed, "worker 1's encodable text was dropped with its unencodable character")
 
     # r8 sol r7 B2: one unreadable worker log must not discard the readable failure logs of the others.
     @staticmethod

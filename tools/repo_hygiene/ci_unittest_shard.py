@@ -743,6 +743,21 @@ def read_log(path: Path) -> tuple[str, str | None]:
         return "", describe_error(error)
 
 
+def emit_log(text: str) -> str | None:
+    """Print a worker's log to stdout; ``None``, or the error text when it still cannot be printed.
+
+    A worker may write bytes that decode to characters the parent's stdout cannot encode (a cp1252
+    console, a child with its own ``PYTHONIOENCODING``): those are replaced, never allowed to raise, and
+    whatever is raised anyway is returned, so one log never costs the others their output.
+    """
+    try:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"), end="", flush=True)
+    except Exception as error:  # noqa: BLE001 - a closed or broken stdout, an unknown codec
+        return describe_error(error)
+    return None
+
+
 WORKER_WATCH_SLICE_SECONDS = 0.2
 
 
@@ -883,21 +898,26 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
             results[position] = describe_error(error)
 
     def inline(position: int) -> None:
-        """No thread to be had: end the worker here, but only while a whole tree kill still fits in the
-        bound. Past that point the worker is killed without the tree kill (which can block) and without
-        a wait, and reads as unended, so the total never exceeds the bound however many threads fail."""
-        if end - time.monotonic() >= TREE_KILL_SECONDS:
-            try:  # no reap: a tree kill is the only wait left in it that fits in what is left of the bound
-                results[position] = terminate(procs[position], reap=False)
-            except BaseException as error:  # noqa: BLE001 - terminate never raises; a patched one might
-                results[position] = describe_error(error)
-            return
+        """No thread to be had: end the worker here WITHOUT anything that can wait. On Windows the tree kill
+        is a ``taskkill`` launch (process creation sits outside its own timeout) and the reap is a wait,
+        so neither runs: the worker is killed and the tree is reported as not confirmed. On POSIX the tree
+        kill is a ``killpg``, which never waits. A requested reap is one look (``poll``): a worker not seen
+        gone is reported. So the total never exceeds the bound however many threads fail."""
+        proc = procs[position]
+        notes: list[str] = []
         try:
-            procs[position].kill()
+            if os.name == "nt":
+                notes.append("no thread was available to end its process tree, so the tree is not confirmed ended")
+            else:
+                tree_error = _kill_tree(proc)
+                if tree_error:
+                    notes.append(f"its process tree was not ended ({tree_error})")
+            proc.kill()
+            if reap and proc.poll() is None:
+                notes.append("its exit was not confirmed (no thread was available to wait for it)")
         except BaseException as error:  # noqa: BLE001 - nothing a kill raises may stop the others being killed
-            results[position] = describe_error(error)
-        else:
-            results[position] = "no thread was available to end its process tree, so the tree is not confirmed ended"
+            notes.append(describe_error(error))
+        results[position] = "; ".join(notes) or None
 
     threads: list[threading.Thread] = []
     for position in range(len(procs)):
@@ -1138,11 +1158,12 @@ def run_parallel(
         for number, (path, code, record) in enumerate(zip(logs, codes, records, strict=True), start=1):
             print(f"===== worker {number}/{len(logs)} exit {code} =====", flush=True)
             text, unreadable = read_log(path)
+            verb = "read"
             if unreadable is None:
-                print(text, end="", flush=True)
-            else:  # the other workers' logs are still printed, and this one is kept (see the cleanup)
+                unreadable, verb = emit_log(text), "printed"
+            if unreadable is not None:  # the other workers' logs are still printed, and this one is kept (see the cleanup)
                 unread.append(number)
-                problems.append(f"worker {number}/{len(logs)} log could not be read ({unreadable}); kept at {work}")
+                problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
             if code not in (0, 1, 5):
                 problems.append(f"worker {number}/{len(logs)} exited {code}")
             elif record is None:
@@ -1170,12 +1191,12 @@ def run_parallel(
                 with contextlib.suppress(Exception):
                     print(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====", flush=True)
                 text, unreadable = read_log(path)
+                verb = "read"
                 if unreadable is None:
-                    with contextlib.suppress(Exception):
-                        print(text, end="", flush=True)
-                else:
+                    unreadable, verb = emit_log(text), "printed"
+                if unreadable is not None:
                     unread.append(number)
-                    problems.append(f"worker {number}/{len(logs)} log could not be read ({unreadable}); kept at {work}")
+                    problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
         killer.stop()
         report_unended()
         watch.stop()
