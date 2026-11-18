@@ -18,6 +18,7 @@ No test launches MLVApp and no test opens a clip (owner rule 2026-10-11).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -914,6 +915,125 @@ class ExportEvidenceTests(unittest.TestCase):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
+
+    def test_r17_pass16_a1_disjoint_work_with_the_shared_lock_is_held_inside_its_parent(self) -> None:
+        """adversary pass16 A1 (EXPORT-VENUE-LEG-1-OPEN-16-1): shared_lock (llrawproc.c :5142-5288, :5302-5376, :6731-6815 and the refine / publish adds) never meets dual_iso, chroma_smooth,
+        vertical_stripes or pattern_noise, yet no group held them together: dual_iso 80 + shared_lock 80 + other 20 inside a 100 ms llrawproc read PASS (also with llrawproc_ms absent),
+        raw_read 80 + dual_iso 1 + shared_lock 80 inside a 100 ms producer_frame read PASS, chroma_smooth 60 + shared_lock 60 inside a 100 ms llrawproc read PASS."""
+        def profile(set_rows: dict, drop_total: bool = False) -> str:
+            doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+            for r in doc["frames"]:
+                for k in CDNG_STAGES:
+                    if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                        r[k] = 0.0
+                if drop_total:
+                    r.pop("llrawproc_ms", None)
+                r.update(set_rows)
+            return json.dumps(doc)
+        bad = [
+            profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_shared_lock_ms": 80.0, "llrawproc_other_ms": 20.0}),
+            profile({"producer_frame_ms": 100.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_shared_lock_ms": 80.0, "llrawproc_other_ms": 20.0}, drop_total=True),
+            profile({"producer_frame_ms": 100.0, "raw_read_ms": 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_shared_lock_ms": 80.0}, drop_total=True),
+            profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_chroma_smooth_ms": 60.0, "llrawproc_shared_lock_ms": 60.0, "llrawproc_other_ms": 40.0}),
+            # (the same class through the two other members the table derives: vertical_stripes and pattern_noise never meet shared_lock either)
+            profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_vertical_stripes_ms": 30.0, "llrawproc_pattern_noise_ms": 30.0, "llrawproc_dual_iso_ms": 10.0,
+                     "llrawproc_shared_lock_ms": 50.0, "llrawproc_other_ms": 30.0}),
+        ]
+        controls = [
+            # a real shape: shared_lock overlaps dark_frame / focus_pixels / bad_pixels (the first lock window holds them), and retains the refine and publish times
+            profile({"producer_frame_ms": 110.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 40.0, "llrawproc_bad_pixels_ms": 20.0, "llrawproc_dual_iso_ms": 30.0,
+                     "llrawproc_shared_lock_ms": 65.0, "llrawproc_dualiso_refine_lock_ms": 3.0, "llrawproc_publish_lock_ms": 2.0, "llrawproc_other_ms": 10.0}),
+            profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 50.0, "llrawproc_shared_lock_ms": 50.0, "llrawproc_other_ms": 50.0}),
+            profile({"producer_frame_ms": 100.0, "raw_read_ms": 40.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_shared_lock_ms": 30.0}, drop_total=True),
+        ]
+        proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in bad + controls])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(len(bad)):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
+        for i in range(len(bad), len(bad) + len(controls)):
+            with self.subTest(control=i):
+                self.assertEqual(got[i]["outcome"], "PASS", got[i])
+
+    def test_r17_every_disjoint_group_is_derived_from_the_stage_window_table(self) -> None:
+        """CDNG-STAGE-WINDOW-TABLE-1: the groups the reader holds are every maximal pairwise-disjoint set of each parent's descendants in ExportCdngStageWindowTable, recomputed here from the
+        table alone (no shared code), so a sixth member cannot be hand-missed; and the table names every CDNG producer stage plus the llrawproc total, so a new timer cannot be left out of it."""
+        proc, got = run_pwsh_json(f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                                  "& (Get-Module DualVenueRunner) { [ordered]@{ table = @($script:ExportCdngStageWindowTable); stages = @($script:ExportCdngProducerStages); "
+                                  "groups = @(foreach ($g in $script:ExportCdngSumGroups) { [ordered]@{ members = @($g[0]); parent = [string]$g[1] } }) } } | ConvertTo-Json -Compress -Depth 6")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        rows = {r["name"]: r for r in got["table"]}
+        self.assertEqual(set(rows), set(got["stages"]) | {"llrawproc"})
+        rng = re.compile(r"^([^:#]+):(\d+)-(\d+)$")
+
+        def meet(a: list, b: list) -> bool:
+            for x in a:
+                for y in b:
+                    if x == y:
+                        return True
+                    mx, my = rng.match(x), rng.match(y)
+                    if mx and my and mx.group(1) == my.group(1) and int(mx.group(2)) <= int(my.group(3)) and int(my.group(2)) <= int(mx.group(3)):
+                        return True
+            return False
+
+        def lines(w: list) -> set:
+            out = set()
+            for x in w:
+                m = rng.match(x)
+                out |= {(m.group(1), n) for n in range(int(m.group(2)), int(m.group(3)) + 1)} if m else {x}
+            return out
+
+        def sib_overlap(x: str, y: str) -> bool:
+            for rem, sib in ((rows[x], rows[y]), (rows[y], rows[x])):
+                if rem.get("remainderOf"):
+                    if sib["name"] in rem["remainderOf"]:
+                        return False
+                    covered = set().union(*(lines(rows[s]["windows"] or []) for s in rem["remainderOf"]))
+                    return bool(lines(sib["windows"] or []) - covered)
+            return meet(rows[x]["windows"] or [], rows[y]["windows"] or [])
+
+        def chain(n: str) -> list:
+            out = [n]
+            while out[-1] in rows:
+                out.append(rows[out[-1]]["parent"])
+            return out
+
+        @functools.lru_cache(maxsize=None)
+        def overlap(x: str, y: str) -> bool:
+            cx, cy = chain(x), chain(y)
+            if y in cx or x in cy:
+                return True
+            for u in cx:
+                for v in cy:
+                    if u in rows and v in rows and rows[u]["parent"] == rows[v]["parent"]:
+                        return sib_overlap(u, v)
+            return True
+
+        expected = set()
+        for parent in {r["parent"] for r in rows.values()}:
+            desc = [n for n in rows if parent in chain(n)[1:]]
+            nbr = {v: {w for w in desc if w != v and not overlap(v, w)} for v in desc}
+            best: list[set] = []
+
+            def bk(r: set, p: set, x: set) -> None:   # Bron-Kerbosch with a pivot over the disjointness graph
+                if not p and not x:
+                    best.append(r)
+                    return
+                pivot = max(p | x, key=lambda u: len(p & nbr[u]))
+                for v in list(p - nbr[pivot]):
+                    bk(r | {v}, p & nbr[v], x & nbr[v])
+                    p = p - {v}
+                    x = x | {v}
+            bk(set(), set(desc), set())
+            for c in best:
+                self.assertFalse(any(v not in c and c <= nbr[v] for v in desc), (parent, sorted(c)))   # maximal
+                if len(c) >= 2:
+                    expected.add((frozenset(c), parent))
+        derived = {(frozenset(g["members"]), g["parent"]) for g in got["groups"]}
+        self.assertEqual(derived, expected)
+        # (the pass16 A1 member is in a derived group, and so is every earlier round's)
+        self.assertIn((frozenset({"llrawproc_vertical_stripes", "llrawproc_pattern_noise", "llrawproc_dual_iso", "llrawproc_chroma_smooth", "llrawproc_shared_lock"}), "llrawproc"), derived)
 
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string

@@ -4527,17 +4527,141 @@ $script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw
 $script:ExportCdngLlrawprocChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_pre_dualiso_fix',
     'llrawproc_dual_iso', 'llrawproc_chroma_smooth', 'llrawproc_shared_lock', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock', 'llrawproc_other')
 
-# r11 (adversary r11 A2): the DISJOINT partitions of the CDNG stage tree (src/dng/dng.c:569-605). producer_frame = raw_read + raw_decode + raw_unpack + the llrawproc TOTAL + dng_header + dng_pack +
-# dng_compress_encode + payload_clone (the llrawproc_* children are inside the total, so they are not in this list); llrawproc = the seven timed children + llrawproc_other (its remainder, which also
-# holds pre_dualiso_fix and the shared / refine / publish lock times: those are NOT in this partition).
-$script:ExportCdngProducerPartition = @('raw_read', 'raw_decode', 'raw_unpack', 'llrawproc', 'dng_header', 'dng_pack', 'dng_compress_encode', 'payload_clone')
-$script:ExportCdngLlrawprocPartition = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso',
-    'llrawproc_chroma_smooth', 'llrawproc_other')
-# r16 (adversary r15 A1): the disjoint set is the seven timed children (dng.c:571-577) PLUS the two lock times llrawproc.c takes outside every one of their windows (refine :6063-6130 sits between the
-# dual_iso windows :5591-6019 and :6210-6219 and before focus_pixels :6140; publish :6288 / :7053 follows chroma_smooth); dark_frame 80 + dual_iso 1 + publish_lock 80 inside a 100 ms llrawproc read PASS
-# when only dual_iso and the locks were held. llrawproc_other is the remainder (it retains the locks) and shared_lock / pre_dualiso_fix overlap the children, so none of those three is a member.
-$script:ExportCdngLlrawprocDisjointFrontier = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso',
-    'llrawproc_chroma_smooth', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock')
+# r17 (EXPORT-VENUE-LEG-1-OPEN-16-1 = adversary pass16 A1; CDNG-STAGE-WINDOW-TABLE-1): ONE table of every CDNG producer and llrawproc timer and the source window(s) its value accrues in. The
+# disjoint groups held together inside each parent are DERIVED from it (Get-DvExportCdngDisjointGroups), never hand-listed: five rounds (r11, r13, r13-2, r15, r16) each found one more disjoint
+# member a hand list had missed (r16's lists left shared_lock out: dual_iso 80 + shared_lock 80 inside a 100 ms llrawproc read PASS).
+# A window is <file>:<first>-<last> (source lines of the timer's start .. its accrual; a callee's lines count when its only call sites are inside the window) or <file>#<token> (a bracket
+# named once). Two rows with ONE parent overlap when a window of each meets (same file, the line ranges intersect, or the same token). A row with remainderOf is its parent less those
+# siblings (dng.c:579-604 sets llrawproc_other = total - the seven timed children), so it overlaps exactly the siblings that accrue on a line outside every remainderOf window. A row
+# overlaps its ancestors; rows under different parents compare the ancestors that share a parent. Branch-exclusive windows on one line range are listed apart (the union over branches).
+$script:ExportCdngStageWindowTable = @(
+    # producer_frame (dng.c:666, :3619) holds these in sequence; each is one export_profile_stage_begin/end bracket and none is inside another (the r11 partition, dng.c:2567-2923)
+    [ordered]@{ name = 'raw_read'; parent = 'producer_frame'; windows = @('dng.c#raw_read') }                         # dng.c:2661-2699, :2754-2858
+    [ordered]@{ name = 'raw_decode'; parent = 'producer_frame'; windows = @('dng.c#raw_decode') }                     # dng.c:2608-2616, :2701-2708, :2789-2797
+    [ordered]@{ name = 'raw_unpack'; parent = 'producer_frame'; windows = @('dng.c#raw_unpack') }                     # dng.c:2869-2875
+    [ordered]@{ name = 'llrawproc'; parent = 'producer_frame'; windows = @('dng.c#llrawproc') }                       # dng.c:2619-2622, :2719-2721, :2800-2802, :2878-2880 (the llrawproc TOTAL)
+    [ordered]@{ name = 'dng_header'; parent = 'producer_frame'; windows = @('dng.c#dng_header') }                     # dng.c:2921-2923
+    [ordered]@{ name = 'dng_pack'; parent = 'producer_frame'; windows = @('dng.c#dng_pack') }                         # dng.c:2643-2650, :2741-2748, :2820-2836, :2863-2865, :2898-2914
+    [ordered]@{ name = 'dng_compress_encode'; parent = 'producer_frame'; windows = @('dng.c#dng_compress_encode') }   # dng.c:2426-2440 (dng_compress_image_profiled, called at :2567-2578 / :3138-3149)
+    [ordered]@{ name = 'payload_clone'; parent = 'producer_frame'; windows = @('dng.c#payload_clone') }               # dng.c:3726-3728, :3781-3783
+    # llrawproc's children (src/mlv/llrawproc/llrawproc.c; main path applyLLRawProcObject :5014-6329, scaled path :6606-7076). The seven timed children (dng.c:571-577):
+    [ordered]@{ name = 'llrawproc_dark_frame'; parent = 'llrawproc'; windows = @('llrawproc.c:5168-5188', 'llrawproc.c:5385-5392', 'llrawproc.c:6826-6833') }
+    [ordered]@{ name = 'llrawproc_vertical_stripes'; parent = 'llrawproc'; windows = @('llrawproc.c:5290-5300', 'llrawproc.c:5397-5404') }
+    [ordered]@{ name = 'llrawproc_focus_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5321-5341', 'llrawproc.c:5409-5420', 'llrawproc.c:6140-6151') }
+    # (bad_pixels calls llrawproc_reset_force_bad_pixel_search, :4688-4696, only from inside its windows, :5438 and :6174)
+    [ordered]@{ name = 'llrawproc_bad_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5346-5372', 'llrawproc.c:5425-5440', 'llrawproc.c:6161-6176', 'llrawproc.c:4688-4696') }
+    [ordered]@{ name = 'llrawproc_pattern_noise'; parent = 'llrawproc'; windows = @('llrawproc.c:5445-5458') }
+    # (dual_iso: main :5560-5586, :5591-6019, :6210-6219; scaled :6863-6887, :6890-6954 and the notch :6964-6969 added at :6970)
+    [ordered]@{ name = 'llrawproc_dual_iso'; parent = 'llrawproc'; windows = @('llrawproc.c:5560-5586', 'llrawproc.c:5591-6019', 'llrawproc.c:6210-6219', 'llrawproc.c:6863-6887', 'llrawproc.c:6890-6954', 'llrawproc.c:6964-6969') }
+    [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6258-6271', 'llrawproc.c:7022-7032') }
+    # The lock times. shared_lock: the first lock :5142-5288 (or :5142-5376 when the stripes block :5285-5317 does not run; both lie inside the two windows listed), the stripes publish lock
+    # :5302-5312 and the relock :5314-5376, the reset lock :4688-4696 (:4696), the scaled snapshot lock :6731-6815, AND the refine and publish lock times added to it (:6131, :6293, :7058).
+    [ordered]@{ name = 'llrawproc_shared_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:5142-5288', 'llrawproc.c:5302-5376', 'llrawproc.c:4688-4696', 'llrawproc.c:6731-6815',
+        'llrawproc.c:6063-6130', 'llrawproc.c:6288-6292', 'llrawproc.c:7053-7057') }
+    [ordered]@{ name = 'llrawproc_dualiso_refine_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6063-6130') }
+    [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6288-6292', 'llrawproc.c:7053-7057') }
+    # pre_dualiso_fix is apply_start .. :5463 (:5014-5463). The scaled path does not reset it (:6615-6625 resets every other timer, not this one), so a scaled call may carry a previous
+    # call's value: it is given that whole call (:6606-7076) as a window.
+    [ordered]@{ name = 'llrawproc_pre_dualiso_fix'; parent = 'llrawproc'; windows = @('llrawproc.c:5014-5463', 'llrawproc.c:6606-7076') }
+    # llrawproc_other is the total less the seven timed children (dng.c:579-604), so it retains pre_dualiso_fix and the lock times
+    [ordered]@{ name = 'llrawproc_other'; parent = 'llrawproc'; windows = @(); remainderOf = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels',
+        'llrawproc_pattern_noise', 'llrawproc_dual_iso', 'llrawproc_chroma_smooth') }
+)
+
+function Get-DvExportWindowsMeet {
+    # $true when any window in $A meets any in $B: the same <file>#<token>, or the same file with intersecting line ranges.
+    param([string[]]$A, [string[]]$B)
+    foreach ($wa in $A) {   # (not $a / $b: PowerShell names are case-blind, so they would overwrite $A / $B)
+        foreach ($wb in $B) {
+            if ($wa -ceq $wb) { return $true }
+            $ma = [regex]::Match($wa, '^([^:#]+):(\d+)-(\d+)$'); $mb = [regex]::Match($wb, '^([^:#]+):(\d+)-(\d+)$')
+            if ($ma.Success -and $mb.Success -and $ma.Groups[1].Value -ceq $mb.Groups[1].Value -and [int]$ma.Groups[2].Value -le [int]$mb.Groups[3].Value -and [int]$mb.Groups[2].Value -le [int]$ma.Groups[3].Value) { return $true }
+        }
+    }
+    $false
+}
+
+function Get-DvExportCdngDisjointGroups {
+    # Every MAXIMAL pairwise-disjoint set (two or more rows) of each parent's descendants in $Table, as (members, parent) groups for Get-DvExportContainmentProblem's -SumGroups.
+    param($Table = $script:ExportCdngStageWindowTable)
+    $rows = @{}; foreach ($r in $Table) { $rows[[string]$r.name] = $r }
+    $names = [System.Collections.Generic.List[string]]::new(); foreach ($row in $Table) { $names.Add([string]$row.name) }
+    $chain = @{}   # name -> the name and its ancestors, nearest first
+    foreach ($n in $names) {
+        $c = [System.Collections.Generic.List[string]]::new(); $c.Add($n)
+        $up = [string]$rows[$n].parent
+        while ($up) { $c.Add($up); $up = $(if ($rows.ContainsKey($up)) { [string]$rows[$up].parent } else { '' }) }
+        $chain[$n] = $c
+    }
+    $overlap = @{}
+    foreach ($nx in $names) {
+        foreach ($ny in $names) {
+            if ($nx -ceq $ny) { continue }
+            if ($chain[$nx].Contains($ny) -or $chain[$ny].Contains($nx)) { $overlap["$nx|$ny"] = $true; continue }
+            $hit = $null   # lift each to the ancestor that shares a parent with the other's
+            foreach ($u in $chain[$nx]) {
+                foreach ($v in $chain[$ny]) {
+                    if ($null -eq $hit -and $rows.ContainsKey($u) -and $rows.ContainsKey($v) -and [string]$rows[$u].parent -ceq [string]$rows[$v].parent) { $hit = @($u, $v) }
+                }
+            }
+            $overlap["$nx|$ny"] = $(if ($null -eq $hit) { $true } else { Get-DvExportSiblingsMeet -Rows $rows -First $hit[0] -Second $hit[1] })
+        }
+    }
+    $groups = [System.Collections.Generic.List[object]]::new()
+    $parents = [System.Collections.Generic.List[string]]::new()
+    foreach ($n in $names) { $p = [string]$rows[$n].parent; if ($p -and -not $parents.Contains($p)) { $parents.Add($p) } }
+    foreach ($parent in $parents) {
+        $desc = [string[]]@(foreach ($n in $names) { if ($chain[$n].IndexOf($parent) -gt 0) { $n } })
+        $nbr = @{}
+        foreach ($v in $desc) { $s = [System.Collections.Generic.HashSet[string]]::new(); foreach ($w in $desc) { if ($w -cne $v -and -not $overlap["$v|$w"]) { [void]$s.Add($w) } }; $nbr[$v] = $s }
+        $cliques = [System.Collections.Generic.List[object]]::new()
+        Add-DvExportMaximalCliques -Neighbours $nbr -Cliques $cliques -R ([string[]]@()) -P $desc -Excluded ([string[]]@())
+        foreach ($clique in $cliques) {
+            if (@($clique).Count -lt 2) { continue }
+            $ordered = [string[]]@(foreach ($n in $names) { if (@($clique) -ccontains $n) { $n } })   # (table order)
+            $groups.Add(@(, $ordered) + @($parent))
+        }
+    }
+    , $groups.ToArray()
+}
+
+function Add-DvExportMaximalCliques {
+    # Bron-Kerbosch with a pivot: every maximal set of pairwise-adjacent names (here: pairwise DISJOINT stages) is added to $Cliques. (Without the pivot one 16-member set costs 2^16 calls.)
+    param($Neighbours, $Cliques, [string[]]$R, [string[]]$P, [string[]]$Excluded)
+    if (@($P).Count -eq 0 -and @($Excluded).Count -eq 0) { $Cliques.Add([string[]]@($R)); return }
+    $pending = [System.Collections.Generic.List[string]]::new(); foreach ($v in @($P)) { $pending.Add($v) }
+    $done = [System.Collections.Generic.List[string]]::new(); foreach ($v in @($Excluded)) { $done.Add($v) }
+    $pivot = $null; $best = -1
+    foreach ($u in @(@($P) + @($Excluded))) { $k = 0; foreach ($w in @($P)) { if ($Neighbours[$u].Contains($w)) { $k++ } }; if ($k -gt $best) { $best = $k; $pivot = $u } }
+    foreach ($v in @($P)) {
+        if ($null -ne $pivot -and $Neighbours[$pivot].Contains($v)) { continue }
+        $nb = $Neighbours[$v]
+        Add-DvExportMaximalCliques -Neighbours $Neighbours -Cliques $Cliques -R ([string[]](@($R) + $v)) -P ([string[]]@(foreach ($w in $pending) { if ($nb.Contains($w)) { $w } })) `
+            -Excluded ([string[]]@(foreach ($w in $done) { if ($nb.Contains($w)) { $w } }))
+        [void]$pending.Remove($v); $done.Add($v)
+    }
+}
+
+function Get-DvExportSiblingsMeet {
+    # $true when two rows with one parent overlap (see the table's header): a remainderOf row meets a sibling that accrues on a line outside every remainderOf window.
+    param($Rows, [string]$First, [string]$Second)
+    foreach ($pair in @(@($First, $Second), @($Second, $First))) {
+        $rem = $Rows[$pair[0]]; $sib = $Rows[$pair[1]]
+        if (-not ($rem.Contains('remainderOf') -and @($rem.remainderOf).Count)) { continue }
+        if (@($rem.remainderOf) -ccontains [string]$sib.name) { return $false }
+        $covered = [string[]]@(foreach ($s in $rem.remainderOf) { @($Rows[[string]$s].windows) })
+        foreach ($w in @($sib.windows)) {
+            $m = [regex]::Match([string]$w, '^([^:#]+):(\d+)-(\d+)$')
+            if (-not $m.Success) { if (-not ($covered -ccontains [string]$w)) { return $true }; continue }
+            for ($line = [int]$m.Groups[2].Value; $line -le [int]$m.Groups[3].Value; $line++) {
+                if (-not (Get-DvExportWindowsMeet -A @("$($m.Groups[1].Value):$line-$line") -B $covered)) { return $true }
+            }
+        }
+        return $false
+    }
+    Get-DvExportWindowsMeet -A @($Rows[$First].windows) -B @($Rows[$Second].windows)
+}
+$script:ExportCdngSumGroups = Get-DvExportCdngDisjointGroups
 
 # r8 fix 3 (adversary pass 10 A2): DISJOINT siblings together are inside their parent too: each below its parent is no proof that the pair is (10 + 10 ms inside a 10 ms parent).
 # Each group is (the disjoint children, the parent); the rendered tree's groups below.
@@ -4838,15 +4962,11 @@ function Get-DvExportEvidence {
             # three lock times, which are published beside it and must not be added to it again; and the llrawproc children are inside the llrawproc TOTAL, which the producer partition counts once)
             # (adversary r13 A2: llrawproc_ms is an optional total; without it the producer partition had one member short of two and was skipped, leaving 80 ms of disjoint work inside a 50 ms producer
             # unjudged. The third group is the producer partition with the llrawproc TOTAL replaced by its own partition, which holds whether or not the total is published.)
-            $producerFlat = @($script:ExportCdngProducerPartition | Where-Object { $_ -cne 'llrawproc' }) + @($script:ExportCdngLlrawprocPartition)
             # (adversary r13-2 A1: llrawproc_other is total less the seven timed children, so the lock times it RETAINS are not in the partition, and a profile may publish one beside a too-small
-            # llrawproc_other (dual_iso 30 + publish_lock 90 inside a 100 ms total read PASS). llrawproc.c takes the refine lock (:6130) and the publish lock (:6292, :7057) OUTSIDE every dual_iso
-            # window (:5560-6219, :6890-6954), so dual_iso and the two locks are disjoint and are held together inside llrawproc, and, with the producer's other members, inside producer_frame.)
-            $llrawprocFrontier = @($script:ExportCdngLlrawprocDisjointFrontier)
-            $producerFrontier = @(@($script:ExportCdngProducerPartition | Where-Object { $_ -cne 'llrawproc' }) + $llrawprocFrontier)
-            $cdngSumGroups = @(@(@($script:ExportCdngProducerPartition), 'producer_frame'), @(@($script:ExportCdngLlrawprocPartition), 'llrawproc'), @(@($producerFlat), 'producer_frame'),
-                               @(@($llrawprocFrontier), 'llrawproc'), @(@($producerFrontier), 'producer_frame'))
-            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs -SumGroups $cdngSumGroups
+            # llrawproc_other (dual_iso 30 + publish_lock 90 inside a 100 ms total read PASS).)
+            # r17 (pass16 A1, CDNG-STAGE-WINDOW-TABLE-1): every one of these groups, and every other maximal disjoint group, is DERIVED from $script:ExportCdngStageWindowTable
+            # (Get-DvExportCdngDisjointGroups): each llrawproc group inside llrawproc and, with the producer's other members, inside producer_frame, whether or not llrawproc_ms is published.
+            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs -SumGroups $script:ExportCdngSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed
             $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $denRow.meanMs
