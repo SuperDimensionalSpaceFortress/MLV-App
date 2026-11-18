@@ -474,6 +474,49 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertEqual(got[3]["outcome"], "FAIL", got[3])
         self.assertEqual((got[4]["outcome"], got[5]["outcome"]), ("PASS", "PASS"), got[4:])
 
+    def test_r8_a1_naming_framesexported_in_a_criterion_does_not_switch_off_the_window_check(self) -> None:
+        """adversary r7 A1: valid evidence for 24 exported frames against maxFrames=30 read PASS with criteria=[framesExported ge 0] (the r7 check was skipped for any
+        criterion that merely NAMED the metric). Only `framesExported eq <the request>` hands the verdict to the criteria (it fails every other count, so the shipped legs
+        still read FAIL); every other criterion on the metric leaves the count to the outcome rule, INVALID. Both formats; the full-window controls still PASS."""
+        def short(maker, criteria):
+            if maker is cdng_case:
+                return cdng_case(maxFrames=30, profile=cdng_profile(24), batch=batch_log(24), manifest=output_manifest(24), criteria=criteria)
+            return prores_case(maxFrames=30, stage=stage_log(24), batch=batch_log(24, verified=24), criteria=criteria)
+        def ge0(): return [{"metric": "framesExported", "op": "ge", "value": 0}]
+        invalid_criteria = (ge0(), [{"metric": "framesExported", "op": "ne", "value": 99}], [{"metric": "framesExported", "op": "eq", "value": 24}],
+                            [{"metric": "framesExported", "op": "eq", "value": "30"}], [{"metric": "framesExported", "op": "le", "value": 30}], [])
+        cases = [short(maker, c) for maker in (cdng_case, prores_case) for c in invalid_criteria]
+        cases += [short(cdng_case, [{"metric": "framesExported", "op": "eq", "value": 30}]), short(prores_case, [{"metric": "framesExported", "op": "eq", "value": 30}]),
+                  cdng_case(criteria=ge0()), prores_case(criteria=ge0())]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        n = len(invalid_criteria) * 2
+        for i in range(n):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertIn("EXPORT_FRAMES_MISMATCH", got[i]["detail"], got[i])
+        self.assertEqual((got[n]["outcome"], got[n + 1]["outcome"]), ("FAIL", "FAIL"), got[n:n + 2])   # the window gate itself decides
+        self.assertEqual((got[n + 2]["outcome"], got[n + 3]["outcome"]), ("PASS", "PASS"), got[n + 2:])
+
+    def test_r8_a2_repeated_records_that_sum_past_the_ceiling_are_invalid_not_dropped(self) -> None:
+        """adversary r7 A2 + Dot: each of two stage-timing records for one frame conforms (ms=86400000 and ms=1) but their per-frame SUM passes the 24 h ceiling, so
+        Get-DvExportStageRow dropped the frame (samples 0, share null) while the window check still counted it: PASS with no problem. Every stage the reader publishes is
+        held to the ceiling on the per-frame accumulated value; a repeat that stays inside it is still a valid (summed) sample."""
+        stages = ("raw_uint16", "raw_uint16_disk_read", "raw_uint16_decompress", "llrawproc", "debayered_frame", "processing", "processed16_total")
+        def with_repeat(stage: str, ms: float, frames=range(30)) -> str:
+            return stage_log(30) + "".join(f"[mlv-stage-timing] frame={i} stage={stage} ms={ms:.3f}\n" for i in frames)
+        cases = [prores_case(stage=with_repeat(s, 86400000.0) + with_repeat(s, 1.0).replace(stage_log(30), ""), criteria=[]) for s in stages]
+        cases += [prores_case(stage=with_repeat("processing", 86400000.0, [7]), criteria=[]), prores_case(stage=with_repeat("raw_uint16", 86400000.0), criteria=[{"metric": "stageFramesSeen", "op": "eq", "value": 30}])]
+        cases += [prores_case(stage=with_repeat("processing", 1.0), criteria=[]), prores_case(criteria=[])]   # controls: a repeat inside the ceiling
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(len(cases) - 2):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_RECORD_INVALID" in p and "accumulated" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual((got[-2]["outcome"], got[-1]["outcome"]), ("PASS", "PASS"), got[-2:])
+        self.assertEqual(got[-2]["stages"]["rows"]["processing"]["samples"], 30, "the summed repeat is one sample per frame")
+
     def test_r7_a5_a_malformed_profile_container_or_element_is_invalid_before_counting(self) -> None:
         """adversary r6 A5: a JSON null appended to profile frames (frame_count 481), or frames given as one object, read PASS because null elements were filtered and a
         lone object was wrapped. The container must be an array of objects, frame_count must be the array's length, and every element is a record."""
@@ -988,6 +1031,21 @@ class ExportJobGeneratorTests(unittest.TestCase):
                     self.assertLessEqual(b["jobTimeoutSec"] + 120, 86400, b)
                 else:
                     self.assertTrue(proc.stdout.startswith("REFUSED DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED"), proc.stdout + proc.stderr)
+
+    def test_r8_a3_the_preflight_budget_mode_needs_no_receipt_build_or_output_and_stops_before_them(self) -> None:
+        """adversary r7 A3: the lease batch asks the generator for the job budget BEFORE any lease, so -PreflightBudgetOnly takes only the clip, format and window. It must not
+        ask for the receipt / build / out file (those are the leg's, written after the lease), and its return must come before anything reads them (git, the receipt)."""
+        text = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("[switch]$PreflightBudgetOnly", text)
+        gate = text.index("if ($PreflightBudgetOnly) {\n    if ($MaxFrames")
+        self.assertLess(gate, text.index("& git -C $RepoRoot cat-file"), "the preflight returns before git is asked")
+        self.assertLess(gate, text.index("$receiptBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $ReceiptPath"), "and before the receipt is read")
+        self.assertLess(gate, text.index("$timeBudget = Get-ExportJobTimeBudget -ClipBytes $clipBytes"), "the generation below makes the SAME budget call")
+        self.assertIn("Get-ExportJobTimeBudget -ClipBytes $preflightBytes -Frames $MaxFrames", text, "and the preflight asks that SAME function")
+        proc = run_pwsh(["-File", str(EXPORT_JOB), "-PreflightBudgetOnly", "-ClipId", "M16-1243", "-Format", "prores", "-MaxFrames", "20000"])
+        out = proc.stdout + proc.stderr
+        for absent in ("DUAL_VENUE_EXPORT_ARG_MISSING", "DUAL_VENUE_EXPORT_RECEIPT_ABSENT"):
+            self.assertNotIn(absent, out, "the preflight mode never asks for the leg's own arguments")
 
     def test_every_schema_valid_quiescence_threshold_binds(self) -> None:
         """adversary r1 A5: the schema admits any threshold in (0, 100]; the generator binds each one (0.05 was refused by ValidateRange(0.1, 100))."""

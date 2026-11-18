@@ -452,6 +452,14 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   `ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING` and writes no job. The function also returns a clamped `appReadAllowanceSec` (held to 3600 s), but the export
   does not use it: `Get-ExportJobTimeBudget` takes the margined, unclamped `identityReadSec` for both the job's read and the export wait's re-read allowance,
   so a clip whose margined read is over 3600 s but whose minimum read is not still gets the longer budget. A time budget above that ceiling is open successor work (A2).
+  A budget the **agent** would refuse (`jobTimeoutSec` plus the runner's 120 s submit margin past the agent's 86400 s cap) is refused with
+  `DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED` **before any claim or lease**: `Invoke-VenueLeaseBatch.ps1` asks the generator's `-PreflightBudgetOnly` mode
+  (the same `Get-ExportJobTimeBudget`, over the resolved clip's real size) in its preflight for every form (`-LegPlan` item, `-LegSet`, `-LegSpec`) and ends
+  `EXPORT_TIME_BUDGET_EXCEEDED` with nothing submitted. A clip this host cannot resolve is not refused there (its size is unknowable); the leg's generator still refuses it.
+* **Frame window**: `EXPORT_CAPTURED` asserts the batch exported the requested `maxFrames`. A different count is `INVALID` (`EXPORT_FRAMES_MISMATCH`) unless the leg's
+  criteria carry `framesExported eq <maxFrames>`, which then decides (the shipped legs: `FAIL`). A criterion that only names the metric (`ge 0`, `ne`, `le`, `eq` of
+  another value) never switches the check off. Repeated stage-timing records for one frame are summed, and the per-frame sum is held to the same 24 h ceiling as one record
+  (`EXPORT_RECORD_INVALID`), so a frame is never silently dropped from a mean.
 * **Outcomes**:
 
   | Job result | Outcome |

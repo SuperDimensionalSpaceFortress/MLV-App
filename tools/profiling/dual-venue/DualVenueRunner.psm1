@@ -4627,6 +4627,17 @@ function Test-DvExportStageLogRecords {
         if ($null -ne $why) { $bad.Add("line ${lineNo} $why") }
     }
     if ($bad.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($bad.Count) stage-timing record(s) do not conform (first: $($bad[0]))") }
+    # r8 (adversary r7 A2, Dot): a frame's repeated records for one stage are SUMMED above, and the sum is the value every mean, median and share reads, so it is a timing too:
+    # two lines that each conform can add up past the ceiling, and Get-DvExportStageRow would then drop that frame without a word (a stage with no sample, a share of null,
+    # and the frame still counted by the window check). Each accumulated per-frame value is held to the same domain as one record, per stage that carries it.
+    $overflow = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $script:ExportRenderedStages) {
+        foreach ($f in @($perStage[$name].Keys | Sort-Object { [int64]$_ })) {
+            $why = Get-DvExportTimingProblem $perStage[$name][$f]
+            if ($null -ne $why) { $overflow.Add("stage $name frame $f (the sum of its records) $why") }
+        }
+    }
+    if ($overflow.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($overflow.Count) accumulated per-frame stage timing(s) do not conform (first: $($overflow[0]))") }
     [pscustomobject]@{ perStage = $perStage; problems = @($problems) }
 }
 
@@ -4817,11 +4828,15 @@ function Get-DvExportOutcome {
     if ($Evidence.classMismatch) { return [pscustomobject]@{ outcome = 'INVALID'; detail = [string]$Evidence.classDetail; criteria = $null } }
     if (@($Evidence.problems).Count -gt 0) { return [pscustomobject]@{ outcome = 'INVALID'; detail = (@($Evidence.problems) -join '; '); criteria = $null } }
     # r7 (adversary r6 A3): EXPORT_CAPTURED asserts the batch exported the requested window, whatever criteria the leg carries. A count that is not the request is INVALID
-    # (the evidence disagrees with the token) unless a criterion of the leg names framesExported itself: then the criteria decide (the shipped legs' framesExported eq
-    # criterion reads FAIL), so a leg may state a different expectation on purpose.
-    $namesFramesExported = @(@($Criteria) | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq 'framesExported' }).Count -gt 0
+    # (the evidence disagrees with the token) unless the leg's own criteria GATE that same window: r8 (adversary r7 A1) it is no longer enough that a criterion NAMES
+    # framesExported (`framesExported ge 0` named it and switched the check off, so 24 of 30 frames read PASS). Only `framesExported eq <the request>` hands the verdict
+    # to the criteria, because only that criterion fails every other count (the shipped legs' criterion reads FAIL); any other criterion on it leaves the count to this rule.
     $requested = $Evidence.metrics.framesRequested; $exported = $Evidence.metrics.framesExported
-    if (-not $namesFramesExported -and $null -ne $requested -and ($null -eq $exported -or [int64]$exported -ne [int64]$requested)) {
+    $gatesTheWindow = @(@($Criteria) | Where-Object {
+        if ($null -eq $_ -or [string](Get-DvProp $_ 'metric') -cne 'framesExported' -or [string](Get-DvProp $_ 'op') -cne 'eq') { return $false }
+        $want = Get-DvProp $_ 'value'
+        ($want -is [int] -or $want -is [long] -or $want -is [double]) -and $null -ne $requested -and [double]$want -eq [double]$requested }).Count -gt 0
+    if (-not $gatesTheWindow -and $null -ne $requested -and ($null -eq $exported -or [int64]$exported -ne [int64]$requested)) {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = "EXPORT_FRAMES_MISMATCH: the batch exported $(if ($null -eq $exported) { 'no countable number of' } else { $exported }) of the $requested requested frame(s) yet the job reported EXPORT_CAPTURED, and no criterion of the leg sets another expectation"; criteria = $null }
     }
     $verdict = Test-DvCriteria -Criteria $Criteria -Metrics $Evidence.metrics

@@ -235,6 +235,9 @@ param(
     # preflight and in the claim guard alike, so a test can time a slow share. Offline only: refused with the real um-run.ps1.
     [string]$StagedBuildProbeScript = '',
     [string]$ArtifactProbeScript = '',
+    # r8 (adversary r7 A3): the export generator the export-budget preflight calls (Get-ExportBudgetRefusal). Default: tools/profiling/bachelor/export-stage-job.ps1. Offline only: refused
+    # with the real um-run.ps1, so a production run can never swap the budget check out.
+    [string]$ExportBudgetScript = '',
     # r4 (sol r3 B1): '<claim|open>:<existence|identity|spec>=<sec>' makes that guard's read of that kind take <sec> longer, so a test can time a slow file system read inside
     # the guard. Offline only: refused with the real um-run.ps1, like the two probe seams above. r5 (sol r4 B1): '<guard>:rundir=<sec>' delays every read of -RunDir itself, in that
     # guard's worker and on the main thread after it (Wait-RunDirReadSeam), as a -RunDir that stopped answering would. r6: and every TEMP read after it that reaches -RunDir (Get-TempReadSeamMs).
@@ -269,6 +272,8 @@ if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
     Stop-Usage "LEASE_CAP_RELAXED -LeaseBudgetWindowSec $LeaseBudgetWindowSec is looser than Bachelor's 10800 s window"
 }
 if ($umRunIsReal -and ($StagedBuildProbeScript -or $ArtifactProbeScript)) { Stop-Usage '-StagedBuildProbeScript and -ArtifactProbeScript are offline test seams: with the real um-run.ps1 the staged build is read from the share' }
+if ($umRunIsReal -and $ExportBudgetScript) { Stop-Usage '-ExportBudgetScript is an offline test seam: with the real um-run.ps1 the export budget is always read from the real export generator' }
+if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }
 foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
@@ -1341,6 +1346,23 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend) {
     return '', ''
 }
 
+function Get-ExportBudgetRefusal([string]$Path) {
+    # r8 (adversary r7 A3): an export leg whose job budget the agent would refuse (DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED: the submitted timeout passes the agent's 86400 s cap) used to be
+    # refused only by the generator Invoke-VenueLeg runs AFTER the batch's lease was open, so an impossible window spent a lease (and its 30 min cooldown) on a refusal known in advance.
+    # The generator's own -PreflightBudgetOnly mode (the SAME Get-ExportJobTimeBudget, over the resolved clip's real size) is asked here, in the preflight, before any claim or lease.
+    # Returns 'EXPORT_TIME_BUDGET_EXCEEDED', <the generator's reason>, or '', '' for a leg that is not an export, a spec the shape predicates refuse (they own that), and a clip
+    # this host cannot resolve (the leg's generator still refuses it, typed, as before: the budget of an unreadable clip is unknowable here).
+    try { $spec = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return '', '' }
+    if ($spec -isnot [System.Management.Automation.PSCustomObject] -or [string](Get-DvProp $spec 'legType') -cne 'export') { return '', '' }
+    $export = Get-DvProp $spec 'export'
+    $clipId = [string](Get-DvProp $spec 'clipId'); $format = [string](Get-DvProp $export 'format'); $frames = Get-DvProp $export 'maxFrames'
+    if ($clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}\z' -or $format -cnotin @('cdng-lossless', 'prores') -or -not ($frames -is [int] -or $frames -is [long]) -or $frames -lt 24 -or $frames -gt 100000) { return '', '' }
+    $pwshExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $text = (@(& $pwshExe -NoProfile -File $ExportBudgetScript -PreflightBudgetOnly -ClipId $clipId -Format $format -MaxFrames ([int]$frames) 2>&1) | ForEach-Object { [string]$_ }) -join "`n"
+    if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
+    return '', ''
+}
+
 function Get-ScalarLegShapeRefusal([string]$Path) {
     # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): the -LegSpec / -LegSet modes run the leg's SHAPE predicate (Get-DvLegSpecShapeRefusal, the one
     # the leg and Get-LegSpecRefusal call) before any claim, read the way the leg reads the spec (-NoEnumerate). A spec that does not parse is left to the
@@ -1392,6 +1414,8 @@ if ($legPlanMode) {
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') $n "the leg spec $outputRefusal" }
             $specRefusal = Get-LegSpecRefusal $path $be
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
+            $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
+            if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
         }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
@@ -1444,6 +1468,8 @@ if ($legPlanMode) {
     foreach ($e in $sp.plan) {
         $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$($e.specPath)' cannot be run: $shapeRefusal" }
+        $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
+        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
         $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend })
     }
 } else {
@@ -1458,6 +1484,8 @@ if ($legPlanMode) {
         # throw them only after the lease opened (LEG_FAILED, no receipt).
         $shapeRefusal = Get-ScalarLegShapeRefusal $path
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
+        $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
+        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
         $legId = Get-LegSpecId $path
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })

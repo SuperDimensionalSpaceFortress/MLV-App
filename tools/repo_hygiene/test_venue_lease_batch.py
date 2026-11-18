@@ -5666,6 +5666,64 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
 
+    def test_r8_export_a_window_the_agent_job_cap_refuses_is_refused_before_the_claim_in_every_mode(self) -> None:
+        # EXPORT-VENUE-LEG-1 r8 (adversary r7 A3): maxFrames=20000 on the shipped 3.4 GB ProRes leg is a job the agent refuses (submitted timeout past 86400 s), but only the
+        # generator Invoke-VenueLeg runs AFTER the lease opened said so. The batch now asks the export generator's -PreflightBudgetOnly mode in its preflight; -ExportBudgetScript
+        # is the offline seam (a stand-in that refuses past 19000 frames, as the real budget does for that clip), and is refused with the real um-run.ps1.
+        fake = self.case / "fake-export-budget.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        shipped = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+
+        def spec_with(frames: int) -> Path:
+            doc = json.loads(json.dumps(shipped))
+            doc["export"]["maxFrames"] = frames
+            p = self.case / f"export-{frames}.json"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            return p
+        over = spec_with(20000)
+        for p in (self.events, self.claim_path):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([over], "-ExportBudgetScript", str(fake))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE EXPORT_TIME_BUDGET_EXCEEDED", r.stderr)
+        self.assertIn("DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        # the plan form: the whole plan is refused at the item, with nothing submitted
+        plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(over, "B", self.commit_a)])
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        r = self.run_plan(plan, "-ExportBudgetScript", str(fake))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=EXPORT_TIME_BUDGET_EXCEEDED item=2 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        # a window inside the cap is not refused by this check (it may go on to run, which is not this test's concern)
+        ok = spec_with(480)
+        for p in (self.events, self.claim_path):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([ok], "-ExportBudgetScript", str(fake))
+        self.assertNotIn("EXPORT_TIME_BUDGET_EXCEEDED", r.stdout + r.stderr, r.stdout + r.stderr)
+
+    def test_r8_export_the_budget_seam_is_refused_with_the_real_um_run(self) -> None:
+        # a production run can never swap the budget check out: with the real um-run.ps1 the seam is a usage error
+        fake = self.case / "fake-export-budget-real.ps1"
+        fake.write_text("[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        for p in (self.events, self.claim_path):
+            p.unlink(missing_ok=True)
+        spec = self.case / "plain.json"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        args, e = self.batch_cmd([spec], "-ExportBudgetScript", str(fake))
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-ExportBudgetScript is an offline test seam", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
     def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
         # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
         # the BATCH entrypoint (scalar -LegSpec mode and -LegPlan mode), not only the predicate and the leg. A string, 0/1 and null are each refused, naming the field.

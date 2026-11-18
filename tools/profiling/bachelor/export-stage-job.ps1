@@ -41,6 +41,9 @@ param(
     [ValidateScript({ $_ -gt 0 -and $_ -le 100 })][double]$CpuQuiescenceThresholdPercent = 20,
     # test seam (adversary r1 A1): print the time budget for a clip of this many bytes and -MaxFrames, then stop (no clip, no git)
     [int64]$DescribeTimeBudgetBytes = -1,
+    # r8 (adversary r7 A3): resolve the clip and print the job's time budget (or throw its typed DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED refusal), then stop: no receipt, build,
+    # git or output file is read. The lease batch calls this BEFORE any claim or lease, so a window the agent would refuse is refused where no lease is spent on it.
+    [switch]$PreflightBudgetOnly,
     [string]$OutFile,
     [string]$RepoRoot = '',
     [string]$VenueTablePath = ''
@@ -458,11 +461,11 @@ if ($DescribeTemplate) {
 }
 
 # --- generation ------------------------------------------------------------------------------------------------------------------------------------------------------
-foreach ($needed in 'SourceCommit', 'BuildManifestSha256', 'ClipId', 'Format', 'ReceiptPath', 'OutFile') {
+foreach ($needed in $(if ($PreflightBudgetOnly) { @('ClipId', 'Format') } else { @('SourceCommit', 'BuildManifestSha256', 'ClipId', 'Format', 'ReceiptPath', 'OutFile') })) {
     if ([string]::IsNullOrWhiteSpace([string](Get-Variable -Name $needed -ValueOnly))) { throw "DUAL_VENUE_EXPORT_ARG_MISSING -$needed is required" }
 }
 if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
-if (-not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { throw 'DUAL_VENUE_EXPORT_RECEIPT_ABSENT -ReceiptPath names no file' }
+if (-not $PreflightBudgetOnly -and -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { throw 'DUAL_VENUE_EXPORT_RECEIPT_ABSENT -ReceiptPath names no file' }
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = Join-Path $PSScriptRoot '..\..\..' }
 try { $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path } catch { throw 'DUAL_VENUE_EXPORT_REPOROOT_INVALID -RepoRoot does not resolve to an existing path' }
 
@@ -490,6 +493,13 @@ if ($scratchRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$' -or $agentRoot -not
 $ownerParts = @(Resolve-AttrCudaOwnerClipParts -ClipId $ClipId -RepoRoot $RepoRoot)
 $ownerPartsJson = $ownerParts | ConvertTo-Json -Compress -Depth 5
 if ($ownerParts.Count -eq 1) { $ownerPartsJson = "[$ownerPartsJson]" }
+
+if ($PreflightBudgetOnly) {
+    if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
+    $preflightBytes = [int64]0
+    foreach ($p in $ownerParts) { $preflightBytes += [int64]$p.length }
+    return (Get-ExportJobTimeBudget -ClipBytes $preflightBytes -Frames $MaxFrames)   # the same function, the same refusal the generation below makes
+}
 
 & git -C $RepoRoot cat-file -e "$SourceCommit^{commit}" 2>$null
 if ($LASTEXITCODE -ne 0) { throw 'DUAL_VENUE_EXPORT_SOURCE_COMMIT_UNKNOWN -SourceCommit is not a commit known to the local repo' }
