@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import (
@@ -2139,6 +2140,10 @@ _PLAY_RELEVANT = re.compile(
 
 def _load_play_sources() -> dict[str, str]:
     sources = {path: (ROOT / path).read_text(encoding="utf-8") for path in PLAY_SOURCES}
+    # r5: every pinned file is always scanned. A pinned file whose mentions all vanished no longer matches _PLAY_RELEVANT
+    # and would otherwise leave the scan, hiding the vanished pin; a deleted pinned file raises here (a red test).
+    for pinned in sorted({path for path, _ in PINNED_EVENT_SITES} | set(PINNED_KEY_SPACE_BINDINGS)):
+        sources.setdefault(pinned, (ROOT / pinned).read_text(encoding="utf-8"))
     # Every other C++ translation unit under platform/qt and src that can reach the Play / Loop action at all.
     # Generated and build output (a shadow or in-tree build dir, uic's ui_*.h) is not source.
     for base in ("platform/qt", "src"):
@@ -2405,6 +2410,57 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         statement, count = PINNED_KEY_SPACE_BINDINGS[self._SPACE_TABLE]
         self.assertEqual(re.sub(r"\s+", " ", keep).count(statement), count)
 
+    # r5 (sol r4 blocker, fable key3 r4 APPROVE hardening): the exact-count guards must fail a count of ZERO too. A pinned
+    # Space statement that is deleted or retargeted, and a pinned event site whose mentions all disappear, scanned clean.
+
+    def _space_statement_span(self) -> tuple[str, int, int]:
+        # The span indexes the comment-stripped text (comments are removed, literals kept), so mutate that text.
+        statement, _ = PINNED_KEY_SPACE_BINDINGS[self._SPACE_TABLE]
+        _, keep = strip_cpp(self.sources[self._SPACE_TABLE])
+        match = _app_play_scan._statement_pattern(statement).search(keep)
+        self.assertIsNotNone(match, "the pinned Space statement is missing from the real key table")
+        return keep, match.start(), match.end()
+
+    def test_r5_the_pinned_space_statement_deleted_fails(self) -> None:
+        text, start, end = self._space_statement_span()
+        mutated = dict(self.sources)
+        mutated[self._SPACE_TABLE] = text[:start] + text[end:]
+        problems = scan_app_play_sources(mutated)
+        self.assertIn(f"{self._SPACE_TABLE}: 0 Space shortcut binding(s), 1 reviewed "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+        self.assertIn(f"{self._SPACE_TABLE}: the reviewed Space binding statement x0, pinned x1 "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+
+    def test_r5_the_pinned_space_statement_retargeted_to_another_key_fails(self) -> None:
+        text, start, end = self._space_statement_span()
+        retargeted = text[start:end].replace("Qt::Key_Space", "Qt::Key_P")
+        self.assertNotEqual(retargeted, text[start:end])
+        mutated = dict(self.sources)
+        mutated[self._SPACE_TABLE] = text[:start] + retargeted + text[end:]
+        problems = scan_app_play_sources(mutated)
+        self.assertIn(f"{self._SPACE_TABLE}: 0 Space shortcut binding(s), 1 reviewed "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+        self.assertIn(f"{self._SPACE_TABLE}: the reviewed Space binding statement x0, pinned x1 "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+
+    def test_r5_a_pinned_event_site_whose_mentions_all_vanish_fails(self) -> None:
+        for (path, name), pinned in PINNED_EVENT_SITES.items():
+            with self.subTest(path=path, name=name):
+                text = self.sources[path]
+                self.assertEqual(len(re.findall(rf"\b{name}\b", strip_cpp(text)[0])), pinned)
+                mutated = dict(self.sources)
+                mutated[path] = re.sub(rf"\b{name}\b", "renamedAway", text)
+                problems = scan_app_play_sources(mutated)
+                self.assertTrue(any(p.startswith(f"event dispatch {name} in {path} x0, pinned x{pinned}")
+                                    for p in problems), problems)
+
+    def test_r5_the_real_loader_always_scans_every_pinned_file(self) -> None:
+        # A pinned file whose mentions all vanish would no longer match _PLAY_RELEVANT and silently leave the scan.
+        pinned_paths = {path for path, _ in PINNED_EVENT_SITES} | set(PINNED_KEY_SPACE_BINDINGS)
+        self.assertLessEqual(pinned_paths, set(self.sources))
+        with mock.patch.dict(globals(), {"_PLAY_RELEVANT": re.compile(r"(?!)")}):   # nothing matches any more
+            self.assertLessEqual(pinned_paths, set(_load_play_sources()))
+
     def test_a_second_space_binding_in_the_key_table_fails(self) -> None:
         text = self._SPACE_BINDING + "inline QKeySequence u() { return QKeySequence( Qt::Key_Space ); }\n"
         problems = self._key_synth_problems({self._SPACE_TABLE: text})
@@ -2519,7 +2575,8 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
     def test_r2_a1_a_cast_of_a_delivered_key_event_is_not_a_synthesized_key(self) -> None:
         # FocusGuard reads the ShortcutOverride the user's key produced; reading an event is not making one.
         text = "bool f( QEvent *event ) { QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event ); return keyEvent; }\n"
-        self.assertEqual(self._key_synth_problems({self._SPACE_TABLE: text}), [])
+        # r5: the key table must hold its one reviewed binding (a count of zero fails), so the fixture carries it.
+        self.assertEqual(self._key_synth_problems({self._SPACE_TABLE: self._SPACE_BINDING + text}), [])
 
     # r3 (adversary pass 3 on f64af6f5, HUB RULING HUB-TICK 20261118T1142Z: close each class with one cheap fail-closed
     # rule, never chase spellings). A1: a digraph `%:define` or a spliced `#de\<nl>fine` re-spelled a macro over the

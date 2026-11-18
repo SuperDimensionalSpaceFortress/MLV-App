@@ -611,10 +611,12 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
         pinned_statement, reviewed_bindings = PINNED_KEY_SPACE_BINDINGS.get(path, ("", 0))
         statement_spans = ([(m.start(), m.end()) for m in _statement_pattern(pinned_statement).finditer(keep)]
                            if pinned_statement else [])
-        if space_bindings and space_bindings != reviewed_bindings:
+        # r5 (sol r4 blocker): the exact-count checks fail ZERO too. A pinned path has reviewed_bindings > 0, so a deleted or
+        # retargeted binding (count 0) is a mismatch; a path that is not pinned has reviewed_bindings == 0 as before.
+        if space_bindings != reviewed_bindings:
             problems.append(f"{path}: {space_bindings} Space shortcut binding(s), {reviewed_bindings} reviewed "
                             "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)")
-        if pinned_statement and space_bindings and len(statement_spans) != reviewed_bindings:
+        if pinned_statement and len(statement_spans) != reviewed_bindings:
             problems.append(f"{path}: the reviewed Space binding statement x{len(statement_spans)}, pinned "
                             f"x{reviewed_bindings} (a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)")
         bindings_reviewed = space_bindings == reviewed_bindings == len(statement_spans)
@@ -649,6 +651,12 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
     for key, count in event_counts.items():
         if PINNED_EVENT_SITES.get(key, 0) != count:
             problems.append(f"event dispatch {key[1]} in {key[0]} x{count}: not a pinned site (the Play shortcut can be synthesized)")
+    # r5 (fable key3 r4, APP-PLAY-SCAN-VANISHED-EVENT-PIN-1): a pinned site in a scanned file whose mentions all vanished has no
+    # observed count, so the loop above never saw it. Iterate the pinned table too: zero is a count other than the pinned one.
+    for (pinned_path, pinned_name), pinned_count in PINNED_EVENT_SITES.items():
+        if pinned_path in sources and (pinned_path, pinned_name) not in event_counts:
+            problems.append(f"event dispatch {pinned_name} in {pinned_path} x0, pinned x{pinned_count} (a pinned site vanished: "
+                            "re-review it in app_play_scan.py PINNED_EVENT_SITES)")
 
     # ---- the reviewed site tables ------------------------------------------------------------------------
     reviewed_counts = {site: count for site, (count, _) in REVIEWED_PROGRAMMATIC_PLAY_SITES.items()}
