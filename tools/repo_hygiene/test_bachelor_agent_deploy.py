@@ -370,7 +370,7 @@ class DeployBachelorAgent(unittest.TestCase):
         # a mention in a later argument is not the script the task runs
         self.assertEqual(self._task_xml_case("later", mine, task("-File &quot;C:\\busy-root\\ultra-magnus-agent.ps1&quot; " + mine)), "False")
         self.assertEqual(self._task_xml_case("quoted", mine, task("-NoProfile -File &quot;%s&quot;" % mine)), "True")
-        self.assertEqual(self._task_xml_case("bare", mine, task("-NoProfile -File %s -Foo" % mine)), "True")
+        self.assertEqual(self._task_xml_case("bare", mine, task("-NoProfile -File %s" % mine)), "True")
         self.assertEqual(self._task_xml_case("case", mine, task("-File &quot;C:\\BENCH\\Ultra-Magnus-Agent.ps1&quot;")), "True")
         # XML-escaped path: the correct task for a root with an ampersand must still bind
         amp = r"C:\Bench & Jobs\ultra-magnus-agent.ps1"
@@ -489,11 +489,103 @@ class DeployBachelorAgent(unittest.TestCase):
         # the first positional parameter of the agent IS -Root
         self.assertEqual(self._exec_task_case("root-positional", "pwsh.exe", base + " C:\\busy-root"), "False")
         self.assertEqual(self._exec_task_case("root-no-value", "pwsh.exe", base + " -Root"), "False")
-        # the same root, spelled any way, binds; other agent parameters do not matter
+        # pass 4 A2: a common parameter is not a skippable token: PowerShell binds the path that follows -Verbose / -Debug to -Root
+        self.assertEqual(self._exec_task_case("verbose-positional", "pwsh.exe", base + " -Verbose C:\\busy"), "False")
+        self.assertEqual(self._exec_task_case("debug-positional", "pwsh.exe", base + " -Debug C:\\busy"), "False")
+        # every argument beyond -Root is refused, not skipped: the check cannot know what each one binds
+        self.assertEqual(self._exec_task_case("verbose", "pwsh.exe", base + " -Verbose"), "False")
+        self.assertEqual(self._exec_task_case("runonce", "pwsh.exe", base + " -RunOnce"), "False")
+        self.assertEqual(self._exec_task_case("poll", "pwsh.exe", base + " -PollSeconds 5 -Root C:\\bench"), "False")
+        self.assertEqual(self._exec_task_case("root-twice", "pwsh.exe", base + " -Root C:\\bench -Root C:\\bench"), "False")
+        self.assertEqual(self._exec_task_case("root-ambiguous", "pwsh.exe", base + " -R C:\\bench"), "False")
+        # the same root, spelled any way, binds
         self.assertEqual(self._exec_task_case("root-same", "pwsh.exe", base + " -Root C:\\bench"), "True")
-        self.assertEqual(self._exec_task_case("root-same-slash", "pwsh.exe", base + " -Root &quot;c:\\BENCH\\&quot;"), "True")
-        self.assertEqual(self._exec_task_case("runonce", "pwsh.exe", base + " -RunOnce"), "True")
-        self.assertEqual(self._exec_task_case("poll", "pwsh.exe", base + " -PollSeconds 5 -RunOnce -Root C:\\bench"), "True")
+        self.assertEqual(self._exec_task_case("root-same-colon", "pwsh.exe", base + " -Root:C:\\bench"), "True")
+        self.assertEqual(self._exec_task_case("root-same-abbrev", "pwsh.exe", base + " -Roo C:\\BENCH"), "True")
+        self.assertEqual(self._exec_task_case("root-same-slash", "pwsh.exe", base + " -Root C:\\bench\\"), "True")
+        self.assertEqual(self._exec_task_case("root-same-quoted-slash", "pwsh.exe", base + " -Root &quot;c:\\BENCH\\\\&quot;"), "True")
+
+    def test_p4a6_the_task_arguments_are_decoded_as_windows_decodes_them(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        # pass 4 A6: in -Root "C:\bench\" the backslash escapes the closing quote, so Root is C:\bench" (a literal quote), not C:\bench
+        self.assertEqual(self._exec_task_case("quote-escaped", "pwsh.exe", "-NoProfile -File %s -Root &quot;C:\\bench\\&quot;" % mine), "False")
+        # an unterminated or doubled quote is unreadable, so it refuses
+        self.assertEqual(self._exec_task_case("unterminated", "pwsh.exe", "-NoProfile -File %s -Root &quot;C:\\bench" % mine), "False")
+        self.assertEqual(self._exec_task_case("doubled", "pwsh.exe", "-NoProfile -File &quot;C:\\bench\\ultra-magnus-agent.ps1&quot;&quot; -Root C:\\bench"), "False")
+        # the decoder itself (CommandLineToArgvW): the text goes in through a file, so no shell quoting is involved
+        cases = [
+            ('-a "b c" d', "True", ["-a", "b c", "d"]),
+            ('x\\"y', "True", ['x"y']),                  # one backslash + quote: a literal quote
+            ('p\\\\"q r" s', "True", ["p\\q r", "s"]),  # two backslashes + quote: one backslash, the quote toggles
+            ('C:\\a\\b "C:\\c d\\"', "False", []),       # the closing quote is escaped: unterminated
+            ('a "" b', "True", ["a", "", "b"]),          # an empty quoted argument OUTSIDE a quoted run is fine
+        ]
+        for n, (text, ok, toks) in enumerate(cases):
+            f = Path(self._tmp.name) / ("args-%d.txt" % n)
+            f.write_text(text, encoding="utf-8")
+            r = self._dot_source("$r = Split-TaskArguments -Text (Get-Content -Raw -LiteralPath '%s'); $r.ok; $r.tokens.Count; $r.tokens" % psq(f))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            lines = r.stdout.splitlines()
+            self.assertEqual(lines[0], ok, text)
+            self.assertEqual(lines[2:] if ok == "True" else [], toks, text)
+
+    def test_p4a3_a_task_with_a_second_action_is_refused(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        busy = r"C:\busy\ultra-magnus-agent.ps1"
+
+        def two(first: str, second: str) -> str:
+            e = "<Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File %s</Arguments></Exec>"
+            return "<Task><Actions>%s%s</Actions></Task>" % (e % first, e % second)
+
+        # `schtasks /End` stops the whole task, so a busy first action is ended with the bench agent that was checked
+        self.assertEqual(self._task_xml_case("two-busy-first", mine, two(busy, mine)), "False")
+        self.assertEqual(self._task_xml_case("two-mine-first", mine, two(mine, busy)), "False")
+        self.assertEqual(self._task_xml_case("two-same", mine, two(mine, mine)), "False")
+        com = "<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File %s</Arguments></Exec><ComHandler><ClassId>{x}</ClassId></ComHandler></Actions></Task>" % mine
+        self.assertEqual(self._task_xml_case("exec-and-com", mine, com), "False")
+        one = "<Task><Actions Context=\"Author\"><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File %s</Arguments></Exec></Actions></Task>" % mine
+        self.assertEqual(self._task_xml_case("one", mine, one), "True")
+
+    def test_p4a4_host_options_that_stop_the_script_from_running_are_refused(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        for name, opts in (("version", "-Version 7"), ("help", "-Help"), ("question", "-?"), ("noexit", "-NoExit"), ("interactive", "-Interactive"),
+                           ("cwd", "-WorkingDirectory C:\\x"), ("unknown", "-Bogus"), ("value-eats-file", "-ExecutionPolicy -File")):
+            self.assertEqual(self._exec_task_case("host-" + name, "pwsh.exe", "%s -File %s" % (opts, mine)), "False", name)
+        self.assertEqual(self._exec_task_case("host-ok", "pwsh.exe", "-NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("host-short", "pwsh.exe", "-nop -ep Bypass -w Hidden -f %s" % mine), "True")
+
+    def test_p4a5_the_stop_acts_on_a_heartbeat_identified_by_pid_and_start(self) -> None:
+        # pass 4 A5: the binding was proved before the deploy; a heartbeat rewritten without a start (PID 4 is a live system process)
+        # must not be stopped. Invoke-AgentRestart re-proves the binding first; the task name is one that does not exist, so a regression
+        # that reached schtasks could not touch a real task.
+        import os
+        me = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
+        self.addCleanup(lambda: (me.kill(), me.wait()))
+        start = subprocess.run(
+            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % me.pid],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        agent = self.venue / AGENT_NAME
+        good = 'alive x pid=%d host=BENCHTEST generation=1 processStartUtc=%s agentScript="%s"\r\n' % (me.pid, start, agent)
+        # the same live pid, but the heartbeat now carries NO processStartUtc: it no longer identifies a process
+        bad = 'alive x pid=%d host=BENCHTEST generation=1 agentScript="%s"\r\n' % (me.pid, agent)
+        xml = Path(self._tmp.name) / "task-p4a5.xml"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
+        beat = self.venue / "heartbeat.txt"
+        later = Path(self._tmp.name) / "heartbeat-later.txt"
+        beat.write_text(good)
+        later.write_text(bad)
+        cmd = (
+            ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; "
+            "$first = Get-RestartBindingRefusal -AgentScript '%s'; 'first=' + $(if ($null -eq $first) { 'bound' } else { $first });"
+            "Copy-Item -LiteralPath '%s' -Destination '%s' -Force; "
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (psq(SCRIPT), psq(self.venue), psq(xml), psq(agent), psq(later), psq(beat), psq(agent))
+        env = dict(os.environ, COMPUTERNAME="BENCHTEST")
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("first=bound", r.stdout)
+        self.assertIn("why=the agent binding no longer holds, so nothing was stopped", r.stdout)
+        self.assertIn("recorded start", r.stdout)
 
     def test_p3a3_a_wait_is_bounded_even_when_the_condition_stalls(self) -> None:
         t0 = time.monotonic()

@@ -363,21 +363,44 @@ function Test-BeatIsDifferentProcess {
 }
 
 function Split-TaskArguments {
-    # The argument string as the process would receive it: split on whitespace outside double quotes, quotes dropped.
+    # The argument string as the process receives it (the Windows rules of CommandLineToArgvW): whitespace outside double quotes
+    # splits; 2n backslashes before a quote are n backslashes and the quote toggles; 2n+1 are n backslashes and a LITERAL quote,
+    # so "C:\bench\" keeps its closing quote inside the argument (C:\bench"). A doubled quote inside a quoted run reads differently
+    # between runtimes, so it is not guessed at: the whole string is unreadable and $null is returned (the caller refuses).
     param([string]$Text)
     $tokens = [System.Collections.Generic.List[string]]::new()
     $sb = [System.Text.StringBuilder]::new()
     $inQuote = $false; $has = $false
-    foreach ($ch in $Text.ToCharArray()) {
-        if ($ch -eq [char]'"') { $inQuote = -not $inQuote; $has = $true; continue }
-        if ((-not $inQuote) -and [char]::IsWhiteSpace($ch)) {
-            if ($has) { $tokens.Add($sb.ToString()); [void]$sb.Clear(); $has = $false }
+    $chars = $Text.ToCharArray()
+    $i = 0
+    while ($i -lt $chars.Length) {
+        $ch = $chars[$i]
+        if ($ch -eq [char]'\') {
+            $n = 0
+            while ($i -lt $chars.Length -and $chars[$i] -eq [char]'\') { $n++; $i++ }
+            $has = $true
+            if ($i -lt $chars.Length -and $chars[$i] -eq [char]'"') {
+                [void]$sb.Append([char]'\', [int][Math]::Floor($n / 2))
+                if ($n % 2 -eq 1) { [void]$sb.Append([char]'"'); $i++ }
+            }
+            else { [void]$sb.Append([char]'\', $n) }
             continue
         }
-        [void]$sb.Append($ch); $has = $true
+        if ($ch -eq [char]'"') {
+            if ($inQuote -and $i + 1 -lt $chars.Length -and $chars[$i + 1] -eq [char]'"') { return [pscustomobject]@{ ok = $false; tokens = @() } }
+            $inQuote = -not $inQuote; $has = $true; $i++
+            continue
+        }
+        if ((-not $inQuote) -and [char]::IsWhiteSpace($ch)) {
+            if ($has) { $tokens.Add($sb.ToString()); [void]$sb.Clear(); $has = $false }
+            $i++
+            continue
+        }
+        [void]$sb.Append($ch); $has = $true; $i++
     }
+    if ($inQuote) { return [pscustomobject]@{ ok = $false; tokens = @() } }
     if ($has) { $tokens.Add($sb.ToString()) }
-    return $tokens.ToArray()
+    return [pscustomobject]@{ ok = $true; tokens = $tokens.ToArray() }
 }
 
 function Test-ParamName {
@@ -392,78 +415,84 @@ function Test-ParamName {
 
 function Get-TaskRootFromScriptArgs {
     # The arguments AFTER the script path are the agent's own. The agent serves -Root (its FIRST positional parameter too), which
-    # defaults to its own folder. Returns @{ ok; root } : ok = $false when an argument cannot be read as a known shape (a positional
-    # value, a -Root with no value); root = the folder named by -Root, or $null when the task names none.
+    # defaults to its own folder. The only shapes accepted are: nothing, or ONE -Root <folder> / -Root:<folder> (spelled Root, Roo or
+    # Ro; "-R" is ambiguous with RunOnce). Every other token is refused, not skipped: a positional value, a common parameter such
+    # as -Verbose (a switch that would let a following path bind to -Root), another agent parameter, a -Root with no value.
+    # Returns @{ ok; root }: root = the folder named by -Root, or $null when the task names none.
     param([string[]]$ScriptArgs)
     $root = $null
     $k = 0
     while ($k -lt $ScriptArgs.Count) {
-        $t = $ScriptArgs[$k]
-        $m = [regex]::Match($t, '^[-/]([A-Za-z]+)(:(.*))?$')
+        $m = [regex]::Match($ScriptArgs[$k], '^-([A-Za-z]+)(:(.*))?$')
         if (-not $m.Success) { return @{ ok = $false; root = $null } }
-        $inline = $m.Groups[2].Success
-        if (Test-ParamName -Token ('-' + $m.Groups[1].Value) -Full 'Root') {
-            if ($inline) { $val = $m.Groups[3].Value; $k++ }
-            elseif ($k + 1 -lt $ScriptArgs.Count) { $val = $ScriptArgs[$k + 1]; $k += 2 }
-            else { return @{ ok = $false; root = $null } }
-            if ([string]::IsNullOrWhiteSpace($val)) { return @{ ok = $false; root = $null } }
-            $root = $val
-            continue
-        }
-        if ($inline -or (Test-ParamName -Token ('-' + $m.Groups[1].Value) -Full 'RunOnce')) { $k++; continue }
-        # another agent parameter: it takes the next token as its value when that token is not itself a parameter
-        if ($k + 1 -lt $ScriptArgs.Count -and $ScriptArgs[$k + 1] -notmatch '^[-/][A-Za-z]') { $k += 2 } else { $k++ }
+        if ($m.Groups[1].Value.Length -lt 2 -or -not (Test-ParamName -Token ('-' + $m.Groups[1].Value) -Full 'Root')) { return @{ ok = $false; root = $null } }
+        if ($null -ne $root) { return @{ ok = $false; root = $null } }
+        if ($m.Groups[2].Success) { $val = $m.Groups[3].Value; $k++ }
+        elseif ($k + 1 -lt $ScriptArgs.Count) { $val = $ScriptArgs[$k + 1]; $k += 2 }
+        else { return @{ ok = $false; root = $null } }
+        if ([string]::IsNullOrWhiteSpace($val)) { return @{ ok = $false; root = $null } }
+        $root = $val
     }
     return @{ ok = $true; root = $root }
 }
 
 function Test-TaskXmlRunsScript {
-    # The task's EXECUTABLE action must be a PowerShell host whose FIRST -File is <AgentScript> (an absolute path), serving the root
-    # that script lives in. A mention elsewhere (Description, a later -File, a -Command that never runs it) is not the script the
-    # task runs; a -Root override or a positional first argument that names ANOTHER folder means the task serves a root that was
-    # not checked idle. XML escapes (&amp;) are decoded by the parser, so a correct task for an unusual path still binds.
+    # `schtasks /End` stops the WHOLE task, so the task must be exactly one action: a PowerShell host that runs <AgentScript> and
+    # nothing else. The action's <Command> is pwsh/powershell; the host options before -File are an allowlist (-NoProfile, -NoLogo,
+    # -NonInteractive, -ExecutionPolicy <v>, -WindowStyle <v>): anything else (-Command, -Version, -Help, a positional token) could
+    # keep the script from running, so it is refused, not skipped. The FIRST -File is the absolute agent path, and the agent's own
+    # arguments name no other root (Get-TaskRootFromScriptArgs). A second action of any kind refuses. A mention elsewhere
+    # (Description, a later -File) is not the script the task runs. XML escapes (&amp;) are decoded by the parser, so a correct
+    # task for an unusual path still binds.
     param([string]$Xml, [string]$AgentScript)
     try { $doc = [xml]$Xml } catch { return $false }
     $expectedRoot = $AgentScript -replace '[\\/][^\\/]*$', ''
-    $valueSwitches = @('ExecutionPolicy', 'ep', 'WindowStyle', 'WorkingDirectory', 'wd', 'InputFormat', 'if', 'OutputFormat', 'of',
-        'ConfigurationName', 'ConfigurationFile', 'SettingsFile', 'CustomPipeName', 'Version')
-    foreach ($exec in @($doc.SelectNodes("//*[local-name()='Exec']"))) {
-        $cmdNode = $exec.SelectSingleNode("*[local-name()='Command']")
-        $argNode = $exec.SelectSingleNode("*[local-name()='Arguments']")
-        if ($null -eq $cmdNode -or $null -eq $argNode) { continue }
-        $leaf = [regex]::Match($cmdNode.InnerText.Trim().Trim('"'), '[^\\/]+$').Value
-        if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { continue }
-        $tokens = @(Split-TaskArguments -Text $argNode.InnerText)
-        $scriptPath = $null; $i = 0
-        while ($i -lt $tokens.Count) {
-            $t = $tokens[$i]
-            if ((Test-ParamName -Token $t -Full 'Command') -or (Test-ParamName -Token $t -Full 'CommandWithArgs') -or
-                (Test-ParamName -Token $t -Full 'EncodedCommand') -or (Test-ParamName -Token $t -Full 'EncodedArguments')) { break }
-            if (Test-ParamName -Token $t -Full 'File') {
-                if ($i + 1 -lt $tokens.Count) { $scriptPath = $tokens[$i + 1]; $i += 2 }
-                break
-            }
-            if ($t -notmatch '^[-/]') { break }
-            $takesValue = $false
-            foreach ($v in $valueSwitches) { if (Test-ParamName -Token $t -Full $v) { $takesValue = $true; break } }
-            if ($takesValue) { $i += 2 } else { $i++ }
+    $actions = @($doc.SelectNodes("//*[local-name()='Actions']/*"))
+    if ($actions.Count -ne 1 -or $actions[0].LocalName -ne 'Exec') { return $false }
+    $exec = $actions[0]
+    $cmdNode = $exec.SelectSingleNode("*[local-name()='Command']")
+    $argNode = $exec.SelectSingleNode("*[local-name()='Arguments']")
+    if ($null -eq $cmdNode -or $null -eq $argNode) { return $false }
+    $leaf = [regex]::Match($cmdNode.InnerText.Trim().Trim('"'), '[^\\/]+$').Value
+    if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { return $false }
+    $split = Split-TaskArguments -Text $argNode.InnerText
+    if (-not $split.ok) { return $false }
+    $tokens = @($split.tokens)
+    $hostFlags = @('NoProfile', 'nop', 'NoLogo', 'nol', 'NonInteractive', 'noni')
+    $policies = @('Bypass', 'RemoteSigned', 'Unrestricted', 'AllSigned', 'Restricted', 'Default', 'Undefined')
+    $styles = @('Hidden', 'Normal', 'Minimized', 'Maximized')
+    $hostValued = @{ ExecutionPolicy = $policies; ep = $policies; WindowStyle = $styles; w = $styles }
+    $scriptPath = $null; $i = 0
+    while ($i -lt $tokens.Count) {
+        $t = $tokens[$i]
+        if (Test-ParamName -Token $t -Full 'File') {
+            if ($i + 1 -lt $tokens.Count) { $scriptPath = $tokens[$i + 1]; $i += 2 }
+            break
         }
-        if ($null -eq $scriptPath) { continue }
-        if ($scriptPath -notmatch '^([A-Za-z]:[\\/]|\\\\|/)') { continue }
-        if (-not (Test-SamePath -A $scriptPath -B $AgentScript)) { continue }
-        $rest = @(); if ($i -lt $tokens.Count) { $rest = @($tokens[$i..($tokens.Count - 1)]) }
-        $parsed = Get-TaskRootFromScriptArgs -ScriptArgs $rest
-        if (-not $parsed.ok) { continue }
-        if ($null -ne $parsed.root -and -not (Test-SamePath -A $parsed.root -B $expectedRoot)) { continue }
-        return $true
+        if ($t.Length -lt 2 -or ($t[0] -ne [char]'-' -and $t[0] -ne [char]'/')) { return $false }
+        $name = $t.Substring(1)
+        if ($hostFlags -contains $name) { $i++; continue }
+        # a valued option takes ONLY one of its known values (a value of -File, or a path, would shift what the host runs)
+        if ($hostValued.ContainsKey($name) -and $i + 1 -lt $tokens.Count -and $hostValued[$name] -contains $tokens[$i + 1]) { $i += 2; continue }
+        return $false
     }
-    return $false
+    if ($null -eq $scriptPath) { return $false }
+    if ($scriptPath -notmatch '^([A-Za-z]:[\\/]|\\\\|/)') { return $false }
+    if (-not (Test-SamePath -A $scriptPath -B $AgentScript)) { return $false }
+    $rest = @(); if ($i -lt $tokens.Count) { $rest = @($tokens[$i..($tokens.Count - 1)]) }
+    $parsed = Get-TaskRootFromScriptArgs -ScriptArgs $rest
+    if (-not $parsed.ok) { return $false }
+    if ($null -ne $parsed.root -and -not (Test-SamePath -A $parsed.root -B $expectedRoot)) { return $false }
+    return $true
 }
 
 function Get-RestartBindingRefusal {
     # -RestartMode when-idle without -RestartScript: the schtasks End/Run act on THIS machine's task, so the root that was checked
     # idle must be the root of the agent that task runs. Returns a reason string, or $null when bound.
+    # On success the heartbeat that was validated (live pid WITH its recorded start, this host, this root's script) is left in
+    # $script:BoundBeat: it is the identity the stop acts on, so the restart re-runs this check right before the stop and uses it.
     param([string]$AgentScript)
+    $script:BoundBeat = $null
     $beat = Read-HeartbeatBounded
     if ($null -eq $beat) { return 'heartbeat.txt is missing, unreadable or did not answer in time, so the agent host cannot be confirmed' }
     if (-not [string]::Equals($beat.host, $env:COMPUTERNAME, [StringComparison]::OrdinalIgnoreCase)) {
@@ -489,6 +518,7 @@ function Get-RestartBindingRefusal {
     if (-not (Test-TaskXmlRunsScript -Xml $xml -AgentScript $AgentScript)) {
         return "task $TaskName does not run -File $AgentScript in an executable action; ending it would stop a different agent"
     }
+    $script:BoundBeat = $beat
     return $null
 }
 
@@ -504,9 +534,12 @@ function Invoke-AgentRestart {
         if ($LASTEXITCODE -ne 0) { return @{ why = "restart script exited $LASTEXITCODE"; warn = $null } }
         return @{ why = $null; warn = (Get-ArrivalWarning) }
     }
-    $before = Read-HeartbeatBounded
-    if ($null -eq $before) { return @{ why = 'heartbeat.txt did not answer in time, so the agent to stop cannot be identified; nothing was stopped'; warn = $null } }
-    $end = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/End', '/TN', $TaskName) -TimeoutSec 30
+    # the binding was proved before the deploy; the heartbeat and the task can change since, so prove it again NOW and stop only the
+    # process that proof identified (pid AND recorded start), never a heartbeat read separately that might carry no start
+    $again = Get-RestartBindingRefusal -AgentScript $AgentScript
+    if ($null -ne $again) { return @{ why = "the agent binding no longer holds, so nothing was stopped: $again"; warn = $null } }
+    $before = $script:BoundBeat
+    $end =Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/End', '/TN', $TaskName) -TimeoutSec 30
     if ($end.timedOut) { return @{ why = "schtasks /End $TaskName did not return within 30 s"; warn = $null } }
     $gone = Wait-Until -TimeoutSec 30 -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
     if (-not $gone) { return @{ why = "agent pid $($before.pid) still alive 30 s after schtasks /End"; warn = $null } }
