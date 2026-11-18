@@ -22,8 +22,9 @@ namespace gpu_window_input
 // Input mirror of GpuDisplayWindow::paintGL's fit block (the letterbox fit):
 //     if ( imgAspect > winAspect ) sy = winAspect / imgAspect;
 //     else                         sx = imgAspect / winAspect;
-// The console drift pin (test_gpu_window_viewer_input.cpp C6) fails if paintGL changes.
-// Returns the centred rect, in window coordinates, that the frame occupies.
+// Returns the centred rect, in window coordinates, that a frame of that display size occupies.
+// Picks do not use it (they map through drawnPictureRect, what paintGL recorded); it is the
+// reference the tests compare drawnPictureRect and windowToScene against.
 inline QRectF letterboxRect( const QSizeF &window, const QSizeF &display )
 {
     if( window.width() <= 0.0 || window.height() <= 0.0
@@ -63,33 +64,42 @@ inline bool halfOpenContains( const QRectF &r, const QPointF &p )
     return !r.isEmpty() && p.x() >= r.left() && p.x() < r.right() && p.y() >= r.top() && p.y() < r.bottom();
 }
 
+// The picture the last paintGL drew, in window logical pixels (mouse coordinates), from what
+// GpuDisplayWindow::lastPaintedPicture() recorded: the framebuffer size, the device pixel ratio
+// and the quad's half-extents sx/sy. paintGL draws the quad over NDC [-sx, sx] x [-sy, sy] in a
+// framebuffer-sized viewport, so the picture spans device x (1 - sx) / 2 * fbw .. (1 + sx) / 2 * fbw
+// (y likewise, from the top); dividing by the device pixel ratio gives logical pixels. Empty
+// (no pick) when nothing was drawn or any input is not a positive finite number.
+inline QRectF drawnPictureRect( bool valid, int framebufferWidth, int framebufferHeight,
+                                double devicePixelRatio, double scaleX, double scaleY )
+{
+    if( !valid || framebufferWidth <= 0 || framebufferHeight <= 0 ) return QRectF();
+    if( !std::isfinite( devicePixelRatio ) || !std::isfinite( scaleX ) || !std::isfinite( scaleY ) ) return QRectF();
+    if( devicePixelRatio <= 0.0 || scaleX <= 0.0 || scaleY <= 0.0 ) return QRectF();
+    const double w = framebufferWidth / devicePixelRatio;
+    const double h = framebufferHeight / devicePixelRatio;
+    return QRectF( ( 1.0 - scaleX ) * 0.5 * w, ( 1.0 - scaleY ) * 0.5 * h, scaleX * w, scaleY * h );
+}
+
 // Window position -> the scene pixel a picker click selects, as the slots take it.
 //
-// paintGL letterboxes with the display size it was handed, which is NOT always the scene's
-// aspect: the image route hands it the scene-sized image, but the CUDA texture route hands it
-// the clip's own stretched size (mainWindowGpuTexturePresentDisplaySize), while the scene is
-// computed with integer division before the stretch (computeDisplaySceneGeometry), so under an
-// anamorphic stretch the two pictures can differ by several scene pixels (adversary r1 pass 1
-// A3, pass 2 A1). GpuDisplayWindow exposes no read of its display size, so the caller passes
-// both candidates: primaryDisplay (the route that presented last) and otherDisplay. An empty
-// candidate means the scene.
-//  - A click counts when it is inside EITHER candidate's letterbox (half-open), so a click on
-//    the displayed picture is never dropped whichever route drew it; a click outside both is on
-//    the black bars and selects nothing.
-//  - It is mapped through the primary candidate's letterbox, then clamped to a real pixel,
-//    [0, ceil(width) - 1] x [0, ceil(height) - 1], so no pick names a row or column one past
-//    the image (adversary r1 pass 1 A2: the slots' own guard is "x > width").
-inline bool pickPixel( const QPointF &windowPos, const QSizeF &window, const QSizeF &scene,
-                       const QSizeF &primaryDisplay, const QSizeF &otherDisplay, int *x, int *y )
+// drawn is the picture rect the last paintGL actually drew (drawnPictureRect). paintGL letterboxes
+// with whatever display size the route that presented handed it (the scene-sized image, the CUDA
+// texture route's stretched clip size, or the RGB fallback), and the stretch controls can change
+// before the next frame lands, so only paintGL knows the rect: r1's reconstructions from the
+// requested route and the live stretch were wrong after a route fallback, a stretch change or
+// integer truncation (adversary r1 pass 3 A1-A3). An empty rect (nothing drawn yet) is no pick.
+//  - A click counts only inside drawn (half-open); the black bars select nothing.
+//  - The drawn picture is the whole frame, as the scene is, so the click maps proportionally into
+//    the scene, then is clamped to a real pixel, [0, ceil(width) - 1] x [0, ceil(height) - 1], so no
+//    pick names a row or column one past the image (adversary r1 pass 1 A2: the slots' own guard
+//    is "x > width").
+inline bool pickPixel( const QPointF &windowPos, const QRectF &drawn, const QSizeF &scene, int *x, int *y )
 {
     if( scene.width() <= 0.0 || scene.height() <= 0.0 ) return false;
-    const auto orScene = [&scene]( const QSizeF &d ) { return ( d.width() > 0.0 && d.height() > 0.0 ) ? d : scene; };
-    const QRectF primary = letterboxRect( window, orScene( primaryDisplay ) );
-    const QRectF other = letterboxRect( window, orScene( otherDisplay ) );
-    if( primary.isEmpty() ) return false;
-    if( !halfOpenContains( primary, windowPos ) && !halfOpenContains( other, windowPos ) ) return false;
-    const double sx = ( windowPos.x() - primary.x() ) / primary.width() * scene.width();
-    const double sy = ( windowPos.y() - primary.y() ) / primary.height() * scene.height();
+    if( !halfOpenContains( drawn, windowPos ) ) return false;
+    const double sx = ( windowPos.x() - drawn.x() ) / drawn.width() * scene.width();
+    const double sy = ( windowPos.y() - drawn.y() ) / drawn.height() * scene.height();
     const int lastX = int( std::ceil( scene.width() ) ) - 1;
     const int lastY = int( std::ceil( scene.height() ) ) - 1;
     int px = int( std::floor( sx ) );

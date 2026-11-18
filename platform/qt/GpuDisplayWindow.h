@@ -182,6 +182,23 @@ public:
      * surface, not the hidden QGraphicsView. GUI-thread only. */
     static QSize displaySize(void);
 
+    /* PLAYER-GL-WINDOW-INPUT-PARITY-1 r2: what the last paintGL() that drew a frame letterboxed it with -- its
+     * framebuffer size, the device pixel ratio, and the quad's half-extents sx/sy from the fit block -- so viewer
+     * picks map through the picture actually on screen (gpu_window_input::drawnPictureRect), not a guess from the
+     * requested route or the live stretch. valid is false before any frame was drawn and while the window holds no
+     * texture. Read-only: paintGL records it with one plain member store; nothing painted or presented changes.
+     * GUI-thread only. */
+    struct PaintedPicture
+    {
+        bool valid = false;
+        int framebufferWidth = 0;
+        int framebufferHeight = 0;
+        qreal devicePixelRatio = 1.0;
+        float scaleX = 0.0f;
+        float scaleY = 0.0f;
+    };
+    PaintedPicture lastPaintedPicture(void) const;
+
     /* LOOK-FULLSCREEN-PARITY-1: the "current look" label paintGL() draws in the window's
      * bottom-right corner (empty text = no label). The label is rasterised once per change
      * of text or framebuffer height and kept as a texture; every paint composites that one
@@ -434,6 +451,9 @@ private:
     QOpenGLTexture *m_lookLabelTexture = nullptr;
     bool m_lookLabelTextureDirty = false;
     QString m_lookLabelDrawnText;
+
+    // PLAYER-GL-WINDOW-INPUT-PARITY-1 r2: see lastPaintedPicture(); written only by paintGL().
+    PaintedPicture m_lastPaintedPicture;
 
     // Swap telemetry (see resetSwapTelemetry()/swapTelemetrySnapshot()/noteRealSwap()).
     // The session id/active-state live at file scope in the .cpp, not here -- see the

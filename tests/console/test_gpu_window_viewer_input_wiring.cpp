@@ -83,29 +83,31 @@ TEST(GpuWindowViewerInputWiring, W3_HooksCallTheViewerPathsOwnSlots)
     ASSERT_TRUE(body.contains(QStringLiteral("installEventFilter( new gpu_window_input::Forwarder( glWindow")));
 }
 
-TEST(GpuWindowViewerInputWiring, W5_PickMappingUsesTheTextureRoutesOwnDisplaySize)
+TEST(GpuWindowViewerInputWiring, W5_PickMappingReadsTheRectPaintGlDrew)
 {
-    // Adversary r1 pass 1 A3 / pass 2 A1: the CUDA texture route letterboxes with the clip's own
-    // stretched size, not the scene's. The hook must compute it as that route does: the same
-    // helper, the clip's width and height, and the same stretch reads the prep task carries.
+    // Adversary r1 pass 3 A1-A3 (r2): the hook reads the geometry the GL window's last paintGL
+    // recorded, through the one read-only getter, and nothing reconstructed from the requested
+    // route (A2) or the live stretch controls (A3).
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString body = functionBody(source, kDefinition, kNextDefinition);
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "mainWindowGpuTexturePresentDisplaySize( static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ), getHorizontalStretchFactor( false ), getVerticalStretchFactor( false ) )")));
+        "GpuDisplayWindow *const paintedWindow = qobject_cast<GpuDisplayWindow *>( glWindow );")));
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "m_lastPresentedRequestContextValid && m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested")));
-    // The route side of the mirror: the texture present's display size and the task's stretch.
-    ASSERT_TRUE(source.contains(QStringLiteral("? static_cast<int>( getMlvWidth( m_pMlvObject ) )")));
-    ASSERT_TRUE(source.contains(QStringLiteral("? static_cast<int>( getMlvHeight( m_pMlvObject ) )")));
-    const int helperAt = source.indexOf(QStringLiteral("mainWindowGpuTexturePresentDisplaySize(\n"));
-    ASSERT_TRUE(helperAt >= 0);
-    const QString helperCall = source.mid(helperAt, 300);
-    ASSERT_TRUE(helperCall.contains(QStringLiteral("task.stretchX")));
-    ASSERT_TRUE(helperCall.contains(QStringLiteral("task.stretchY")));
-    ASSERT_TRUE(source.contains(QStringLiteral("task.stretchX = stretchX;")));
-    ASSERT_TRUE(source.contains(QStringLiteral("const double stretchX = getHorizontalStretchFactor(false);")));
-    ASSERT_TRUE(source.contains(QStringLiteral("const double stretchY = getVerticalStretchFactor(false);")));
+        "const GpuDisplayWindow::PaintedPicture p = paintedWindow->lastPaintedPicture();")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "return gpu_window_input::drawnPictureRect( p.valid, p.framebufferWidth, p.framebufferHeight, p.devicePixelRatio, p.scaleX, p.scaleY );")));
+    ASSERT_TRUE(body.contains(QStringLiteral("if( !paintedWindow ) return QRectF();")));
+    // r1's reconstructions are gone from the hooks.
+    ASSERT_FALSE(body.contains(QStringLiteral("textureDisplaySize")));
+    ASSERT_FALSE(body.contains(QStringLiteral("textureRouteLast")));
+    ASSERT_FALSE(body.contains(QStringLiteral("gpuPlaybackReconTexturePresentRequested")));
+    ASSERT_FALSE(body.contains(QStringLiteral("StretchFactor")));
+    ASSERT_FALSE(body.contains(QStringLiteral("mainWindowGpuTexturePresentDisplaySize")));
+    // The getter is a const read on the window (no static that could read another window).
+    const QString header = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("    PaintedPicture lastPaintedPicture(void) const;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("    PaintedPicture m_lastPaintedPicture;")));
 }
 
 TEST(GpuWindowViewerInputWiring, W4_GlDropOpensLikeTheSceneNotLikeTheTopLevelWindow)

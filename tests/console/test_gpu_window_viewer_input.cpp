@@ -1,9 +1,9 @@
 // PLAYER-GL-WINDOW-INPUT-PARITY-1: pins the pure mapping and routing rules in
 // platform/qt/GpuWindowViewerInput.h. When the preview is hosted in the GL display window,
-// viewer clicks land on that window; the forwarder maps them into scene coordinates with
-// windowToScene (the input mirror of GpuDisplayWindow::paintGL's letterbox fit) and routes
-// them with route(). C6 is the drift pin: if paintGL's fit changes, this test fails so the
-// mirror is updated with it.
+// viewer clicks land on that window; the forwarder maps them into scene coordinates through
+// the picture rect paintGL last drew (drawnPictureRect of GpuDisplayWindow::lastPaintedPicture,
+// then pickPixel) and routes them with route(). C6 is the drift pin: if paintGL's fit, its one
+// store of the drawn geometry, or the quad that draws with it changes, this test fails.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "../../platform/qt/GpuWindowViewerInput.h"
@@ -11,6 +11,9 @@
 #include <QFile>
 #include <QString>
 #include <QTextStream>
+
+#include <cmath>
+#include <limits>
 
 using gpu_window_input::Route;
 
@@ -25,6 +28,22 @@ QString readRepoFile(const QString & relativePath)
     ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
     QTextStream stream(&file);
     return stream.readAll();
+}
+
+// What GpuDisplayWindow::paintGL records (lastPaintedPicture) for a frame of display size dw x dh in a
+// w x h window at dpr, with paintGL's own int framebuffer and float fit arithmetic, as the forwarder's
+// hook turns it into a rect.
+QRectF paintedRect(int w, int h, double dpr, int dw, int dh)
+{
+    const int fbw = static_cast<int>(w * dpr);
+    const int fbh = static_cast<int>(h * dpr);
+    const float winAspect = static_cast<float>(w) / static_cast<float>(h);
+    const float imgAspect = static_cast<float>(dw) / static_cast<float>(dh);
+    float sx = 1.0f;
+    float sy = 1.0f;
+    if (imgAspect > winAspect) sy = winAspect / imgAspect;
+    else                       sx = imgAspect / winAspect;
+    return gpu_window_input::drawnPictureRect(true, fbw, fbh, dpr, sx, sy);
 }
 
 void assertRect(const QRectF & r, double x, double y, double w, double h)
@@ -182,79 +201,81 @@ TEST(GpuWindowViewerInput, C5_PressIsOnViewer)
 
 TEST(GpuWindowViewerInput, C7_PickPixelStaysInsideTheImageAndFollowsTheDrawnPicture)
 {
+    using gpu_window_input::letterboxRect;
     using gpu_window_input::pickPixel;
-    const QSizeF none;
     int x = -1;
     int y = -1;
     // Adversary r1 pass 1 A2: the picture is half-open, and a hit is clamped to a real pixel.
-    ASSERT_FALSE(pickPixel(QPointF(960, 942), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
-    ASSERT_TRUE(pickPixel(QPointF(960, 941.9), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    const QRectF wide = letterboxRect(QSizeF(1920, 1080), QSizeF(1920, 804)); // y 138..942
+    ASSERT_FALSE(pickPixel(QPointF(960, 942), wide, QSizeF(1920, 804), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(960, 941.9), wide, QSizeF(1920, 804), &x, &y));
     ASSERT_EQ(960, x);
     ASSERT_EQ(803, y);
-    ASSERT_FALSE(pickPixel(QPointF(1920, 540), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
-    ASSERT_TRUE(pickPixel(QPointF(1919.9, 540), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(1920, 540), wide, QSizeF(1920, 804), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(1919.9, 540), wide, QSizeF(1920, 804), &x, &y));
     ASSERT_EQ(1919, x);
     ASSERT_EQ(402, y);
     // Pillarbox (1080x1080 in 1920x1080, picture x 420..1500).
-    ASSERT_FALSE(pickPixel(QPointF(1500, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), none, none, &x, &y));
-    ASSERT_TRUE(pickPixel(QPointF(1499.5, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), none, none, &x, &y));
+    const QRectF tall = letterboxRect(QSizeF(1920, 1080), QSizeF(1080, 1080));
+    ASSERT_FALSE(pickPixel(QPointF(1500, 540), tall, QSizeF(1080, 1080), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(1499.5, 540), tall, QSizeF(1080, 1080), &x, &y));
     ASSERT_EQ(1079, x);
     ASSERT_EQ(540, y);
-    ASSERT_TRUE(pickPixel(QPointF(0, 138), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(0, 138), wide, QSizeF(1920, 804), &x, &y));
     ASSERT_EQ(0, x);
     ASSERT_EQ(0, y);
-    ASSERT_TRUE(pickPixel(QPointF(960, 540), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(960, 540), wide, QSizeF(1920, 804), &x, &y));
     ASSERT_EQ(960, x);
     ASSERT_EQ(402, y);
 
     // Adversary r1 pass 1 A3: 1920x804 clip fit into 1000x1000 has a 1000x418 scene; the CUDA texture
-    // route draws the 1920x804 display size, starting at y 290.625; the scene's letterbox starts at 291.
+    // route draws the 1920x804 display size, from y 290.625 (the scene's own letterbox starts at 291).
+    // The drawn rect decides, never the scene's aspect.
     const QSizeF w1000(1000, 1000);
     const QSizeF scene418(1000, 418);
-    const QSizeF tex804(1920, 804);
-    ASSERT_TRUE(pickPixel(QPointF(500, 290.75), w1000, scene418, tex804, scene418, &x, &y)); // texture route drew it
+    const QRectF drawn804 = letterboxRect(w1000, QSizeF(1920, 804));
+    ASSERT_TRUE(pickPixel(QPointF(500, 290.75), drawn804, scene418, &x, &y));
     ASSERT_EQ(500, x);
     ASSERT_EQ(0, y);
-    ASSERT_TRUE(pickPixel(QPointF(500, 290.75), w1000, scene418, scene418, tex804, &x, &y)); // image route last, still on a candidate
-    ASSERT_EQ(0, y);
-    ASSERT_FALSE(pickPixel(QPointF(500, 290.5), w1000, scene418, tex804, scene418, &x, &y));  // above both: the bar
-    ASSERT_FALSE(pickPixel(QPointF(500, 290.75), w1000, scene418, none, none, &x, &y));       // no texture candidate: off the scene picture
+    ASSERT_FALSE(pickPixel(QPointF(500, 290.5), drawn804, scene418, &x, &y)); // the bar
+    // The image route drew the scene itself: the same click is on its black bar.
+    ASSERT_FALSE(pickPixel(QPointF(500, 290.75), letterboxRect(w1000, scene418), scene418, &x, &y));
 
     // Adversary r1 pass 2 A1: clip 1920x420 at stretchY 3 in a 1000x1000 window. The scene is
     // 1000x654 (integer division before the stretch) but the texture route draws a 1920x1260
-    // display, 656.25 high from y 171.875; the scene's letterbox starts at y 173.
+    // display, 656.25 high from y 171.875.
     const QSizeF scene654(1000, 654);
-    const QSizeF tex1260(1920, 1260);
-    ASSERT_TRUE(pickPixel(QPointF(500, 172), w1000, scene654, tex1260, scene654, &x, &y));
+    const QRectF drawn1260 = letterboxRect(w1000, QSizeF(1920, 1260));
+    ASSERT_TRUE(pickPixel(QPointF(500, 172), drawn1260, scene654, &x, &y));
     ASSERT_EQ(500, x);
     ASSERT_EQ(0, y);
-    ASSERT_TRUE(pickPixel(QPointF(500, 828.0), w1000, scene654, tex1260, scene654, &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(500, 828.0), drawn1260, scene654, &x, &y));
     ASSERT_EQ(653, y);
-    ASSERT_FALSE(pickPixel(QPointF(500, 171.8), w1000, scene654, tex1260, scene654, &x, &y));
-    ASSERT_FALSE(pickPixel(QPointF(500, 828.2), w1000, scene654, tex1260, scene654, &x, &y));
-    // ...and its centre maps to the scene centre through the drawn picture.
-    ASSERT_TRUE(pickPixel(QPointF(500, 500), w1000, scene654, tex1260, scene654, &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(500, 171.8), drawn1260, scene654, &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(500, 828.2), drawn1260, scene654, &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(500, 500), drawn1260, scene654, &x, &y));
     ASSERT_EQ(327, y);
     // Width sibling: clip 1080x1922 at stretchX 2 in 1200x1000: scene 1122x1000, texture display
-    // 2160x1922 drawn from x 38.08; the scene's letterbox starts at x 39.
-    ASSERT_TRUE(pickPixel(QPointF(38.4, 500), QSizeF(1200, 1000), QSizeF(1122, 1000), QSizeF(2160, 1922), QSizeF(1122, 1000), &x, &y));
+    // 2160x1922 drawn from x 38.08.
+    const QRectF drawn2160 = letterboxRect(QSizeF(1200, 1000), QSizeF(2160, 1922));
+    ASSERT_TRUE(pickPixel(QPointF(38.4, 500), drawn2160, QSizeF(1122, 1000), &x, &y));
     ASSERT_EQ(0, x);
-    ASSERT_FALSE(pickPixel(QPointF(38.0, 500), QSizeF(1200, 1000), QSizeF(1122, 1000), QSizeF(2160, 1922), QSizeF(1122, 1000), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(38.0, 500), drawn2160, QSizeF(1122, 1000), &x, &y));
 
-    // Bars and empty geometry.
-    ASSERT_FALSE(pickPixel(QPointF(960, 20), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
-    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(1920, 1080), QSizeF(), tex804, none, &x, &y));
-    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(), QSizeF(1920, 804), none, none, &x, &y));
-    // Every hit over a dense sweep, either route first, is a real pixel.
-    for (int route = 0; route < 2; ++route)
+    // Bars and empty geometry: no drawn picture, or no scene, is no pick.
+    ASSERT_FALSE(pickPixel(QPointF(960, 20), wide, QSizeF(1920, 804), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(10, 10), wide, QSizeF(), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(960, 540), QRectF(), QSizeF(1920, 804), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(0, 0), QRectF(0, 0, 0, 10), QSizeF(1920, 804), &x, &y));
+    // Every hit over a dense sweep, through either drawn picture, is a real pixel.
+    for (int pass = 0; pass < 2; ++pass)
     {
-        const QSizeF primary = route ? tex1260 : scene654;
-        const QSizeF other = route ? scene654 : tex1260;
+        const QRectF drawn = pass ? drawn1260 : letterboxRect(w1000, scene654);
         for (int wy = 0; wy <= 1000; wy += 3)
         {
             for (int wx = 0; wx <= 1000; wx += 7)
             {
-                if (pickPixel(QPointF(wx + 0.5, wy + 0.5), w1000, scene654, primary, other, &x, &y))
+                if (pickPixel(QPointF(wx + 0.5, wy + 0.5), drawn, scene654, &x, &y))
                 {
                     ASSERT_TRUE(x >= 0 && x <= 999);
                     ASSERT_TRUE(y >= 0 && y <= 653);
@@ -263,6 +284,92 @@ TEST(GpuWindowViewerInput, C7_PickPixelStaysInsideTheImageAndFollowsTheDrawnPict
         }
     }
 }
+// r2 (adversary r1 pass 3 A1-A3 + no-paint refusal). Red on r1's API (red.txt: r1's hooks picked
+// from the requested route and the live stretch); here the pick goes through the rect paintGL
+// recorded, computed with paintGL's own float fit (paintedRect). Window 1000x1000 at DPR 2, as the
+// adversary inputs.
+TEST(GpuWindowViewerInput, C9a_ImageRouteBlackBarIsNoPick)
+{
+    // A1: the image route drew the scene-sized 1000x654 image, from y 173; the texture route's taller
+    // 1920x1260 rect would start at 171.875, but it is not what is on screen. (500,172) is the bar.
+    const QRectF drawn = paintedRect(1000, 1000, 2.0, 1000, 654);
+    int x = -1;
+    int y = -1;
+    ASSERT_FALSE(gpu_window_input::pickPixel(QPointF(500, 172), drawn, QSizeF(1000, 654), &x, &y));
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500, 173.5), drawn, QSizeF(1000, 654), &x, &y));
+    ASSERT_EQ(0, y);
+}
+
+TEST(GpuWindowViewerInput, C9b_RgbFallbackMapsThroughTheRectDrawn)
+{
+    // A2: the texture present was requested but the RGB fallback presented, at 1000x654: the pick maps
+    // through that picture (row 651), not the requested texture's 1920x1260 (row 649).
+    const QRectF drawn = paintedRect(1000, 1000, 2.0, 1000, 654);
+    int x = -1;
+    int y = -1;
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500, 824.3), drawn, QSizeF(1000, 654), &x, &y));
+    ASSERT_EQ(500, x);
+    ASSERT_EQ(651, y);
+}
+
+TEST(GpuWindowViewerInput, C9c_StretchChangeBeforeTheNextFrameMapsThroughTheRectLastDrawn)
+{
+    // A3: paintGL drew 1920x1260 (stretchY 3: from y 171.875, 656.25 high). stretchY is then set to 1,
+    // and no frame has landed: the recorded rect still describes the picture on screen.
+    // (200 - 171.875) / 656.25 * 654 = 28.03.
+    const QRectF drawn = paintedRect(1000, 1000, 2.0, 1920, 1260);
+    int x = -1;
+    int y = -1;
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500, 200), drawn, QSizeF(1000, 654), &x, &y));
+    ASSERT_EQ(28, y);
+    ASSERT_FALSE(gpu_window_input::pickPixel(QPointF(500, 171.8), drawn, QSizeF(1000, 654), &x, &y));
+}
+
+TEST(GpuWindowViewerInput, C9d_NoPaintYetIsNoPick)
+{
+    // Nothing drawn yet (lastPaintedPicture().valid == false): the rect is empty and there is no pick.
+    const QRectF none = gpu_window_input::drawnPictureRect(false, 2000, 2000, 2.0, 1.0, 0.654);
+    ASSERT_TRUE(none.isEmpty());
+    int x = -1;
+    int y = -1;
+    ASSERT_FALSE(gpu_window_input::pickPixel(QPointF(500, 500), none, QSizeF(1000, 654), &x, &y));
+    ASSERT_EQ(-1, x);
+    ASSERT_EQ(-1, y);
+}
+
+TEST(GpuWindowViewerInput, C10_DrawnPictureRectIsTheQuadPaintGlDrew)
+{
+    using gpu_window_input::drawnPictureRect;
+    using gpu_window_input::letterboxRect;
+    // At DPR 1 and 1.5 it is the letterbox of the display size it was painted with (float fit).
+    const QRectF a = paintedRect(1920, 1080, 1.0, 1920, 804);
+    const QRectF b = letterboxRect(QSizeF(1920, 1080), QSizeF(1920, 804));
+    ASSERT_NEAR(b.x(), a.x(), 1e-3);
+    ASSERT_NEAR(b.y(), a.y(), 1e-3);
+    ASSERT_NEAR(b.width(), a.width(), 1e-3);
+    ASSERT_NEAR(b.height(), a.height(), 1e-3);
+    const QRectF c = paintedRect(1280, 720, 1.5, 1080, 1080);
+    const QRectF d = letterboxRect(QSizeF(1280, 720), QSizeF(1080, 1080));
+    ASSERT_NEAR(d.x(), c.x(), 1e-3);
+    ASSERT_NEAR(d.y(), c.y(), 1e-3);
+    ASSERT_NEAR(d.width(), c.width(), 1e-3);
+    ASSERT_NEAR(d.height(), c.height(), 1e-3);
+    // The framebuffer is truncated to whole device pixels: 1001 logical at DPR 1.25 is 1251 device
+    // pixels, so a full-width picture ends at logical 1000.8, where paintGL's viewport ends.
+    const QRectF e = drawnPictureRect(true, 1251, 1251, 1.25, 1.0, 1.0);
+    ASSERT_NEAR(0.0, e.x(), 1e-9);
+    ASSERT_NEAR(1000.8, e.width(), 1e-9);
+    // Not a positive finite input: none.
+    ASSERT_TRUE(drawnPictureRect(true, 0, 1000, 1.0, 1.0, 1.0).isEmpty());
+    ASSERT_TRUE(drawnPictureRect(true, 1000, -1, 1.0, 1.0, 1.0).isEmpty());
+    ASSERT_TRUE(drawnPictureRect(true, 1000, 1000, 0.0, 1.0, 1.0).isEmpty());
+    ASSERT_TRUE(drawnPictureRect(true, 1000, 1000, 1.0, 0.0, 1.0).isEmpty());
+    ASSERT_TRUE(drawnPictureRect(true, 1000, 1000, 1.0, 1.0, -0.5).isEmpty());
+    ASSERT_TRUE(drawnPictureRect(true, 1000, 1000, std::nan(""), 1.0, 1.0).isEmpty());
+    ASSERT_TRUE(drawnPictureRect(true, 1000, 1000, 1.0, std::numeric_limits<double>::infinity(), 1.0).isEmpty());
+    ASSERT_FALSE(drawnPictureRect(true, 1000, 1000, 1.0, 1.0, 1.0).isEmpty());
+}
+
 TEST(GpuWindowViewerInput, C8_DropPathsMatchTheScenesFilesDroppedList)
 {
     // A1: the scene's dropEvent hands openMlvSet every toLocalFile() path, in order, skipping
@@ -289,14 +396,20 @@ TEST(GpuWindowViewerInput, C8_DropPathsMatchTheScenesFilesDroppedList)
 
 TEST(GpuWindowViewerInput, C6_PaintGlFitBlockIsUnchanged)
 {
-    // GpuWindowViewerInput.h letterboxRect mirrors these two lines; change both together.
+    // Picks map through what paintGL recorded (lastPaintedPicture -> drawnPictureRect), and
+    // drawnPictureRect assumes the quad spans NDC [-sx, sx] x [-sy, sy] of a framebuffer-sized
+    // viewport. Pin the whole path as one contiguous text: the viewport from fbw/fbh, then the fit
+    // block, the one store of exactly those values, and the vertex block that draws with them.
+    // Adversary A4 (r1, advisory on f81879eb): a line such as "sy = 1.0f;" added after the fit block
+    // passed the old pin; any line between the fit, the store and the vertices now fails it.
     const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
-    ASSERT_TRUE(source.contains(QStringLiteral("if ( imgAspect > winAspect ) sy = winAspect / imgAspect;")));
-    ASSERT_TRUE(source.contains(QStringLiteral("else                         sx = imgAspect / winAspect;")));
-    // Adversary A4 (r1): the three lines alone survive a swapped imgAspect expression. Pin the
-    // whole fit block as one contiguous text, from the window aspect (logical size, as the
-    // mapper) through the image aspect (width over height) to the two scale lines.
-    const QString fitBlock = QStringLiteral(
+    const QString viewport = QStringLiteral(
+        "    const qreal dpr = devicePixelRatio();\n"
+        "    const int fbw = static_cast<int>(width() * dpr);\n"
+        "    const int fbh = static_cast<int>(height() * dpr);\n"
+        "    glViewport(0, 0, std::max(1, fbw), std::max(1, fbh));\n");
+    ASSERT_TRUE(source.contains(viewport));
+    const QString fitStoreAndQuad = QStringLiteral(
         "    const float winAspect = static_cast<float>(width()) / static_cast<float>(height());\n"
         "    const int displayWidth = m_pendingDisplayWidth > 0 ? m_pendingDisplayWidth : m_texture->width();\n"
         "    const int displayHeight = m_pendingDisplayHeight > 0 ? m_pendingDisplayHeight : m_texture->height();\n"
@@ -304,8 +417,32 @@ TEST(GpuWindowViewerInput, C6_PaintGlFitBlockIsUnchanged)
         "    float sx = 1.0f;\n"
         "    float sy = 1.0f;\n"
         "    if ( imgAspect > winAspect ) sy = winAspect / imgAspect;\n"
-        "    else                         sx = imgAspect / winAspect;\n");
-    ASSERT_TRUE(source.contains(fitBlock));
-    // Exactly one fit block, so a second (divergent) copy cannot hide behind the pinned one.
+        "    else                         sx = imgAspect / winAspect;\n"
+        "    m_lastPaintedPicture = PaintedPicture{ true, fbw, fbh, dpr, sx, sy };   // PLAYER-GL-WINDOW-INPUT-PARITY-1 r2: read by lastPaintedPicture()\n"
+        "\n"
+        "    // Interleaved [x, y, u, v]; screen-top maps to texture v=0 (matches the corrected\n"
+        "    // GpuDisplayViewport quad so QImage row 0 / image top shows at the top -> upright).\n"
+        "    const float verts[16] = {\n"
+        "        -sx,  sy, 0.0f, 0.0f,\n"
+        "         sx,  sy, 1.0f, 0.0f,\n"
+        "        -sx, -sy, 0.0f, 1.0f,\n"
+        "         sx, -sy, 1.0f, 1.0f,\n"
+        "    };\n");
+    ASSERT_TRUE(source.contains(fitStoreAndQuad));
+    // Exactly one fit block and one store, so a second (divergent) copy cannot hide behind the pinned one.
     ASSERT_EQ(1, source.count(QStringLiteral("if ( imgAspect > winAspect ) sy = winAspect / imgAspect;")));
+    ASSERT_EQ(1, source.count(QStringLiteral("m_lastPaintedPicture =")));
+    // The viewport comes before the fit inside paintGL (no reassignment of fbw/fbh/dpr in between).
+    const int paintAt = source.indexOf(QStringLiteral("void GpuDisplayWindow::paintGL()"));
+    ASSERT_TRUE(paintAt >= 0);
+    const int viewportAt = source.indexOf(viewport, paintAt);
+    const int fitAt = source.indexOf(fitStoreAndQuad, paintAt);
+    ASSERT_TRUE(viewportAt > paintAt);
+    ASSERT_TRUE(fitAt > viewportAt);
+    const QString between = source.mid(viewportAt + viewport.size(), fitAt - viewportAt - viewport.size());
+    ASSERT_FALSE(between.contains(QStringLiteral("fbw =")));
+    ASSERT_FALSE(between.contains(QStringLiteral("fbh =")));
+    ASSERT_FALSE(between.contains(QStringLiteral("dpr =")));
+    // The getter reports none while the window holds no texture.
+    ASSERT_TRUE(source.contains(QStringLiteral("if ( !m_texture ) return PaintedPicture();\n    return m_lastPaintedPicture;")));
 }

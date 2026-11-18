@@ -4,8 +4,8 @@
 // (GpuDisplayWindow, a QOpenGLWindow inside a window container) that routes the viewer's
 // mouse input to the same MainWindow slots the QGraphicsView path reaches through its scene:
 // white-balance pick, bad-pixel pick, the right-click viewer menu, and drop-to-open.
-// Picks are mapped from window to scene pixels with gpu_window_input::pickPixel (built on
-// windowToScene, the input mirror of paintGL's letterbox fit); the slots convert scene
+// Picks are mapped from window to scene pixels with gpu_window_input::pickPixel, through the
+// picture rect the window's last paintGL drew (the drawnPicture hook); the slots convert scene
 // coordinates as before. A drop is handed over as the scene's filesDropped list (openMlvSet),
 // not through MainWindow::dropEvent, so it opens what the same drop on the scene opens.
 // Header-only, no Q_OBJECT (no moc). The filter is a child of the window, so it lives as
@@ -32,10 +32,10 @@ public:
     struct Hooks
     {
         std::function<QSizeF()> sceneSize;
-        // The display size paintGL letterboxes with on the CUDA texture route (empty = none), and
-        // whether that route presented last; see pickPixel. Unset = the scene for both routes.
-        std::function<QSizeF()> textureDisplaySize;
-        std::function<bool()> textureRouteLast;
+        // The picture rect the window's last paintGL drew, in window logical pixels
+        // (drawnPictureRect of GpuDisplayWindow::lastPaintedPicture()); see pickPixel. Unset or
+        // empty = nothing drawn yet: a pick is refused, never guessed.
+        std::function<QRectF()> drawnPicture;
         std::function<bool()> wbArmed;
         std::function<bool()> bpArmed;
         std::function<void(int, int)> pickWhiteBalance;
@@ -87,12 +87,10 @@ public:
         case Route::PickBadPixel:
         {
             const QSizeF scene = m_hooks.sceneSize ? m_hooks.sceneSize() : QSizeF();
-            const QSizeF texture = m_hooks.textureDisplaySize ? m_hooks.textureDisplaySize() : QSizeF();
-            const bool textureLast = m_hooks.textureRouteLast ? m_hooks.textureRouteLast() : false;
+            const QRectF drawn = m_hooks.drawnPicture ? m_hooks.drawnPicture() : QRectF();
             int x = 0;
             int y = 0;
-            if( pickPixel( pos, QSizeF( m_window->size() ), scene,
-                           textureLast ? texture : scene, textureLast ? scene : texture, &x, &y ) )
+            if( pickPixel( pos, drawn, scene, &x, &y ) )
             {
                 const bool white = wb;
                 if( white && m_hooks.pickWhiteBalance ) m_hooks.pickWhiteBalance( x, y );

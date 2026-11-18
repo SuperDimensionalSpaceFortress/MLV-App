@@ -694,6 +694,8 @@ private slots:
     void glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal();
     void glWindowViewerInput_edgePicksStayInsideTheImage();
     void glWindowViewerInput_roundedSceneEdgeStillPicks();
+    void glWindowViewerInput_noDrawnPictureIsNoPick();
+    void glWindowViewerInput_getterRecordsThePaintedPicture();
 };
 
 void GuiSmokeTest::checkedStateUpdatesPalette()
@@ -3769,6 +3771,8 @@ gpu_window_input::Forwarder *installRecordingForwarder(QWindow *window, GlWindow
 {
     gpu_window_input::Forwarder::Hooks hooks;
     hooks.sceneSize = []() { return QSizeF(1920, 804); };
+    // As if paintGL last drew the scene-sized image letterboxed into the window.
+    hooks.drawnPicture = [window]() { return gpu_window_input::letterboxRect(QSizeF(window->size()), QSizeF(1920, 804)); };
     hooks.wbArmed = [rec]() { return rec->wbArmed; };
     hooks.bpArmed = [rec]() { return rec->bpArmed; };
     hooks.pickWhiteBalance = [rec](int x, int y) { ++rec->wbCalls; rec->lastPick = QPoint(x, y); };
@@ -3970,19 +3974,15 @@ void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
     // 1000x1000 window), so its aspect differs from the display aspect paintGL letterboxes with by
     // up to one scene pixel. paintGL's picture starts at y = 290.625; the scene-aspect rect at 291.
     // A click on the displayed picture between the two must still pick (the top row).
+    // r2 (adversary r1 pass 3): only the rect paintGL drew decides; the scene's aspect does not.
     GlWindowInputRecorder rec;
     QWindow window;
     window.resize(1000, 1000);
-    // Adversary r1 pass 2 A1 is the same class under an anamorphic stretch: a 1920x420 clip at
-    // stretchY 3 has a 1000x654 scene (integer division before the stretch) but the texture
-    // route draws a 1920x1260 display, from y 171.875 (the scene's letterbox starts at 173).
     QSizeF scene(1000, 418);
-    QSizeF texture(1920, 804);
-    bool textureLast = true;
+    QRectF drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 804)); // texture route: from y 290.625
     gpu_window_input::Forwarder::Hooks hooks;
     hooks.sceneSize = [&scene]() { return scene; };
-    hooks.textureDisplaySize = [&texture]() { return texture; };
-    hooks.textureRouteLast = [&textureLast]() { return textureLast; };
+    hooks.drawnPicture = [&drawn]() { return drawn; };
     hooks.wbArmed = [&rec]() { return rec.wbArmed; };
     hooks.bpArmed = [&rec]() { return rec.bpArmed; };
     hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
@@ -3992,28 +3992,138 @@ void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
     QCOMPARE(rec.wbCalls, 1);
     QCOMPARE(rec.lastPick, QPoint(500, 0));
-    // Image route last: the click is still on a candidate picture, so it picks (clamped).
-    textureLast = false;
-    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
-    QCOMPARE(rec.wbCalls, 2);
-    QCOMPARE(rec.lastPick, QPoint(500, 0));
-    // Above both pictures is the bar: nothing.
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.5), QPointF(500, 290.5));
-    QCOMPARE(rec.wbCalls, 2);
+    QCOMPARE(rec.wbCalls, 1);
+    // A1: the image route drew the scene itself (from y 291): the same click is now on its bar.
+    drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), scene);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
+    QCOMPARE(rec.wbCalls, 1);
 
+    // A3: a 1920x420 clip at stretchY 3 drawn as 1920x1260 (from y 171.875) with a 1000x654 scene;
+    // whatever the stretch controls say next, until paintGL draws again the drawn rect decides.
     scene = QSizeF(1000, 654);
-    texture = QSizeF(1920, 1260);
-    textureLast = true;
+    drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 1260));
     rec.wbArmed = false;
     rec.bpArmed = true;
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 172), QPointF(500, 172));
     QCOMPARE(rec.bpCalls, 1);
     QCOMPARE(rec.lastPick, QPoint(500, 0));
-    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 200), QPointF(500, 200));
     QCOMPARE(rec.bpCalls, 2);
-    QCOMPARE(rec.lastPick, QPoint(500, 327));
+    QCOMPARE(rec.lastPick, QPoint(500, 28));
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 171.8), QPointF(500, 171.8));
     QCOMPARE(rec.bpCalls, 2);
+}
+
+void GuiSmokeTest::glWindowViewerInput_noDrawnPictureIsNoPick()
+{
+    // r2: before paintGL has drawn a frame the getter reports none, and an armed pick is refused
+    // (still consumed, so it does not reach the view's own handling), never guessed.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1000, 1000);
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.sceneSize = []() { return QSizeF(1000, 654); };
+    hooks.drawnPicture = []() { return QRectF(); };
+    hooks.wbArmed = [&rec]() { return rec.wbArmed; };
+    hooks.bpArmed = [&rec]() { return rec.bpArmed; };
+    hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [&rec](int x, int y) { ++rec.bpCalls; rec.lastPick = QPoint(x, y); };
+    window.installEventFilter(new gpu_window_input::Forwarder(&window, std::move(hooks)));
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(spy.seen, 0);
+
+    // An unset hook is the same: no pick.
+    GlWindowInputRecorder rec2;
+    QWindow window2;
+    window2.resize(1000, 1000);
+    gpu_window_input::Forwarder::Hooks bare;
+    bare.sceneSize = []() { return QSizeF(1000, 654); };
+    bare.wbArmed = []() { return true; };
+    bare.pickWhiteBalance = [&rec2](int, int) { ++rec2.wbCalls; };
+    window2.installEventFilter(new gpu_window_input::Forwarder(&window2, std::move(bare)));
+    deliverMouse(&window2, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    QCOMPARE(rec2.wbCalls, 0);
+
+    // The real getter on a GL window that never painted reports none.
+    GpuDisplayWindow glWindow;
+    QVERIFY(!glWindow.lastPaintedPicture().valid);
+    const GpuDisplayWindow::PaintedPicture p = glWindow.lastPaintedPicture();
+    QVERIFY(gpu_window_input::drawnPictureRect(p.valid, p.framebufferWidth, p.framebufferHeight,
+                                               p.devicePixelRatio, p.scaleX, p.scaleY).isEmpty());
+}
+
+void GuiSmokeTest::glWindowViewerInput_getterRecordsThePaintedPicture()
+{
+    MLV_SKIP_OR_FAIL_IF_OFFSCREEN("the GL window's paintGL needs a platform plugin that can create an OpenGL context");
+
+    qputenv(GpuDisplayWindow::environmentVariableName(), QByteArrayLiteral("1"));
+    auto host = std::make_unique<QWidget>();
+    auto *layout = new QVBoxLayout(host.get());
+    auto *view = new QGraphicsView(host.get());
+    layout->addWidget(view);
+    host->resize(96, 96);
+    QVERIFY(GpuDisplayWindow::installInPreview(view));
+    host->show();
+    QApplication::processEvents();
+    static_cast<void>(QTest::qWaitForWindowExposed(host.get()));
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QTest::qWait(10);
+    }
+    GpuDisplayWindow *glWindow = qobject_cast<GpuDisplayWindow *>(GpuDisplayWindow::activeWindow());
+    QVERIFY(glWindow);
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+
+    // A 32x8 frame shown at display size 64x8: the picture is the letterbox of the DISPLAY size.
+    QImage submitted(32, 8, QImage::Format_RGB888);
+    submitted.fill(qRgb(10, 200, 30));
+    QVERIFY(GpuDisplayWindow::presentImageIfActive(submitted, QSize(64, 8)));
+    QImage grabbed;
+    QString reason;
+    const bool ok = GpuDisplayWindow::grabPresentedFramebufferIfActive(&grabbed, &reason); // a real, synchronous paintGL
+    if (!ok || grabbed.isNull()) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("OpenGL framebuffer capture is unavailable in this environment");
+    }
+    const GpuDisplayWindow::PaintedPicture p = glWindow->lastPaintedPicture();
+    QVERIFY(p.valid);
+    const QRectF drawn = gpu_window_input::drawnPictureRect(p.valid, p.framebufferWidth, p.framebufferHeight,
+                                                            p.devicePixelRatio, p.scaleX, p.scaleY);
+    const QRectF expected = gpu_window_input::letterboxRect(QSizeF(glWindow->size()), QSizeF(64, 8));
+    const double slack = 1.0 / p.devicePixelRatio; // the framebuffer is truncated to whole device pixels
+    QVERIFY2(qAbs(drawn.x() - expected.x()) <= slack && qAbs(drawn.y() - expected.y()) <= slack
+             && qAbs(drawn.width() - expected.width()) <= slack && qAbs(drawn.height() - expected.height()) <= slack,
+             qPrintable(QStringLiteral("drawn (%1,%2 %3x%4) vs expected (%5,%6 %7x%8)")
+                        .arg(drawn.x()).arg(drawn.y()).arg(drawn.width()).arg(drawn.height())
+                        .arg(expected.x()).arg(expected.y()).arg(expected.width()).arg(expected.height())));
+
+    // A new frame handed over but not painted yet: the getter still describes the picture on screen.
+    QImage square(16, 16, QImage::Format_RGB888);
+    square.fill(qRgb(200, 10, 30));
+    QVERIFY(GpuDisplayWindow::presentImageIfActive(square));
+    const GpuDisplayWindow::PaintedPicture before = glWindow->lastPaintedPicture();
+    QVERIFY(before.valid);
+    QCOMPARE(before.scaleX, p.scaleX);
+    QCOMPARE(before.scaleY, p.scaleY);
+
+    // Cleared and painted (the paint releases the texture and draws black): none.
+    QVERIFY(GpuDisplayWindow::clearIfActive());
+    QImage cleared;
+    QString clearedReason;
+    static_cast<void>(GpuDisplayWindow::grabPresentedFramebufferIfActive(&cleared, &clearedReason));
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+
+    host.reset();
+    QVERIFY(!GpuDisplayWindow::isActive());
+    qunsetenv(GpuDisplayWindow::environmentVariableName());
 }
 
 int main(int argc, char ** argv)

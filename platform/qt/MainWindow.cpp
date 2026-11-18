@@ -26039,13 +26039,15 @@ void MainWindow::installGlWindowViewerInput( QWindow *glWindow )
 {
     gpu_window_input::Forwarder::Hooks hooks;
     hooks.sceneSize = [this]() { return m_pScene ? m_pScene->sceneRect().size() : QSizeF(); };
-    // What the CUDA texture route hands paintGL as its display size (drawFrameReady's
-    // textureDisplaySize: the clip at its stretch), so picks map onto the picture actually drawn.
-    hooks.textureDisplaySize = [this]() {
-        if( !m_pMlvObject ) return QSizeF();
-        return QSizeF( mainWindowGpuTexturePresentDisplaySize( static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ), getHorizontalStretchFactor( false ), getVerticalStretchFactor( false ) ) );
+    // The picture rect the GL window's last paintGL actually drew, whichever route presented and
+    // whatever the stretch controls say now (empty before any frame: no pick). The forwarder is a
+    // child of glWindow, so this pointer outlives every call.
+    GpuDisplayWindow *const paintedWindow = qobject_cast<GpuDisplayWindow *>( glWindow );
+    hooks.drawnPicture = [paintedWindow]() {
+        if( !paintedWindow ) return QRectF();
+        const GpuDisplayWindow::PaintedPicture p = paintedWindow->lastPaintedPicture();
+        return gpu_window_input::drawnPictureRect( p.valid, p.framebufferWidth, p.framebufferHeight, p.devicePixelRatio, p.scaleX, p.scaleY );
     };
-    hooks.textureRouteLast = [this]() { return m_lastPresentedRequestContextValid && m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested; };
     hooks.wbArmed = [this]() { return ui->actionWhiteBalancePicker->isChecked(); };
     hooks.bpArmed = [this]() { return ui->toolButtonBadPixelsSearchMethodEdit->isChecked(); };
     hooks.pickWhiteBalance = [this]( int x, int y ) { whiteBalancePicked( x, y ); };
