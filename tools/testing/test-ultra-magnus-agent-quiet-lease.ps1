@@ -112,7 +112,8 @@ foreach ($name in $lift) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
 $liftBatch = @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Get-QuietLeaseRemainingSec', 'Get-LeaseBatchAdmission', 'Open-LeaseBatch',
     'Use-LeaseBatchForJob', 'Complete-LeaseBatchJob', 'Write-LeaseBatchReceipt', 'Close-LeaseBatch', 'Sync-LeaseBatchForJob', 'Update-LeaseBatchHold')
 # lease-batch r2 (the renew-gap demotion): the same, asserted by the demoted case after it has shown the behaviour.
-$liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'ConvertTo-RenewGapCeilingSec')   # the last: BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2)
+$liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'ConvertTo-RenewGapCeilingSec',   # the last: BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2)
+    'Get-AgentMonotonicSec', 'Get-RenewGapSec', 'Get-QuietLeaseRenewOkAt')   # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (pass 3 A1, A2): optional, so the r2 cases run RED on 591ea10f
 # lease-batch r3 (sol r2 B1, B2): the same, asserted by the r3 cases after they have shown the behaviour.
 $liftBatchR3 = @('Test-LeaseBatchClosePending', 'Get-LeaseBatchJobStop')
 $batchLifted = [System.Collections.Generic.List[string]]::new()
@@ -434,6 +435,8 @@ $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
 # lease-batch r2: heavy-slot.py's renew_stale_s, as the agent assigns it (asserted in the demoted case).
 $script:LeaseRenewStaleSec = 120
+# BACHELOR-LEASE-RENEW-MARGIN-1 r2: the agent's clock-step tolerance for trusting a renew's own exit (asserted against its assignment in the r2 case).
+$script:LeaseRenewClockSkewSec = 1.0
 # lease-batch r3: a batch job is stopped this long before its lease's until= (asserted against the agent's assignment in the r3 case).
 $script:LeaseBatchJobGuardSec = 10
 $script:Admission = $null
@@ -1194,7 +1197,8 @@ try {
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
-        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up')
+        'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up',
+        'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -1879,7 +1883,7 @@ function Exit-HeavySlot {
             [pscustomobject]@{ fn = '(script)'; line = 'if ($agentMutexHeld) { Exit-HeavySlot }'; why = 'agent-mutex teardown: the agent is leaving (exception or stop request), no job record is open to carry a release' }
         )
         $agentLines = $agentText -split "`r?`n"
-        $exitSites = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Exit-HeavySlot' }, $true))
+        $exitSites = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq'Exit-HeavySlot' }, $true))
         $exitTable = [System.Collections.Generic.List[object]]::new()
         $exitBad = [System.Collections.Generic.List[string]]::new()
         foreach ($s in $exitSites) {
@@ -1906,7 +1910,7 @@ function Exit-HeavySlot {
         Assert-True ($exitSites.Count -ge 1 -and $exitBad.Count -eq 0) "exit-release-pin: every Exit-HeavySlot call site records its release or is allowlisted with a reason: $($exitBad -join ' ; ')"
         # Light jobs run from inside a gate-wait never call it: the waiting job's lease is the wait's own local.
         $ewAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ExemptJobsDuringWait' }, $true)
-        Assert-True ($null -ne $ewAst -and $null -eq $ewAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Exit-HeavySlot' }, $true)) "exit-release-pin: Invoke-ExemptJobsDuringWait never calls Exit-HeavySlot (its mention is a comment)"
+        Assert-True ($null -ne $ewAst -and $null -eq $ewAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq'Exit-HeavySlot' }, $true)) "exit-release-pin: Invoke-ExemptJobsDuringWait never calls Exit-HeavySlot (its mention is a comment)"
         $results.exitReleasePin = [ordered]@{
             sites = @($exitTable | ForEach-Object { "$($_.line) $($_.fn) recorded=$($_.recorded) allowlisted=$($_.allowlisted)" })
             recorded = @($exitTable | Where-Object { $_.recorded }).Count; allowlisted = @($exitTable | Where-Object { $_.allowlisted }).Count
@@ -5350,10 +5354,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # static guard over this file: Get-FixtureCensus ... -Rows only inside Get-SyntheticCensus or Invoke-DefaultSelfCensus
         $spsTok = $null; $spsErr = $null
         $spsAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$spsTok, [ref]$spsErr)
-        $spsDirect = @($spsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Get-FixtureCensus' -and $n.Extent.Text -match '-Rows\b' }, $true) | Where-Object {
+        $spsDirect = @($spsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq'Get-FixtureCensus' -and $n.Extent.Text -match '-Rows\b' }, $true) | Where-Object {
                 $p = $_.Parent; while ($null -ne $p -and -not ($p -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $p = $p.Parent }
                 -not ($null -ne $p -and @('Get-SyntheticCensus', 'Invoke-DefaultSelfCensus') -contains $p.Name) })
-        $spsSynthSites = @($spsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Get-SyntheticCensus' }, $true)).Count
+        $spsSynthSites = @($spsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq'Get-SyntheticCensus' }, $true)).Count
         Assert-True ($spsOwnGot -ceq $spsOwnWant -and $spsLog.Count -eq $spsWantCalls -and $spsDirect.Count -eq 0 -and $spsSynthSites -ge 9) "lease-seam-census-self-pid: every synthetic census table goes through Get-SyntheticCensus and was logged (own table $spsOwnGot want $spsOwnWant; logged calls=$($spsLog.Count) want $spsWantCalls; direct Get-FixtureCensus -Rows sites outside the helper=$($spsDirect.Count) at lines [$(@($spsDirect | ForEach-Object { $_.Extent.StartLineNumber }) -join ',')]; Get-SyntheticCensus call sites=$spsSynthSites want >= 9)"
         function Invoke-DefaultSelfCensus([string]$Fx, $Rows) { return (Get-FixtureCensus $Fx -Rows $Rows) }   # the real-run default, on purpose
         $spsSavedSelf = $script:SuiteSelfPid; $spsSavedLog = $script:SyntheticCensusLog
@@ -5830,9 +5834,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rsOut.okMaxGapSec + 0.05 -ge $rsOut.recordMaxGapSec) "renew-slow-monitor-slice: the agent's measured gap never under-reads heavy-slot.py's gap between renew records (okMaxGapSec=$($rsOut.okMaxGapSec) recordMaxGapSec=$($rsOut.recordMaxGapSec))"
         # Pass 2 A3: matched against the REAL monitor loop (the while loop over $jobProcess in Invoke-QueuedJob's AST, comments excluded), so a
         # comment carrying the call, or the call anywhere else, does not satisfy it.
-        $rsQj = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
+        # r2 (pass 3 A3): command names are matched case-INsensitively (-eq), as PowerShell resolves them, so a lowercase walk is counted too;
+        # the same fix at every GetCommandName() comparison in this suite.
+        $rsQj =$ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
         $rsLoop = if ($null -ne $rsQj) { $rsQj.Find({ param($n) $n -is [System.Management.Automation.Language.WhileStatementAst] -and $n.Condition.Extent.Text -match '\$jobProcess\.HasExited' }, $true) } else { $null }
-        $rsCalls = if ($null -ne $rsLoop) { @($rsLoop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Get-DescendantProcessIdentities' }, $true)) } else { @() }
+        $rsCalls = if ($null -ne $rsLoop) { @($rsLoop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq'Get-DescendantProcessIdentities' }, $true)) } else { @() }
         $rsWired = @($rsCalls | Where-Object { $_.Extent.Text -match '-OnEach\s*\{\s*Invoke-QuietLeaseRenewTick\s*\}' })
         Assert-True ($rsCalls.Count -ge 1 -and $rsWired.Count -eq $rsCalls.Count) "renew-slow-monitor-slice: the job monitor loop passes the renew tick into every descendant walk it runs (calls=$($rsCalls.Count) wired=$($rsWired.Count))"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
@@ -5870,6 +5876,107 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($gcOut.ok -eq 1 -and [double]$gcOut.okMaxGapSec -ge $gc.minGap -and [double]$gcOut.gapSec -ge $gc.minGap) "$($gc.name): the successful-renew gap reads at least $($gc.minGap) s (exit t0+$($gc.exitSec) s, collected t0+$($gc.nowSec) s, previous success t0): $gcTxt"
         Assert-True ([double]$gcOut.gapSec -gt 120) "$($gc.name): a real gap over 120 s reads over the strict -gt 120 demotion bound: $gcTxt"
         $results[$gc.name] = $gcOut
+    }
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1, introduced major; and the pass-3 advisory A2): a renew that SUCCEEDED early in a slow
+    # monitor step is not read as late. Input (A1): interval 30 s and timeout 30 s (the defaults); the batch lease was last renewed OK at t0 (stored
+    # maximum 0, 2700 s left); the monitor walk starts at t0+40; job pid 5000 has no children and its one child query takes 85 s; the renew exits 3 s
+    # after it starts. The -OnEach tick starts the renew at t0+40, it succeeds at t0+43 and is collected at t0+125. heavy-slot.py's gaps were at most
+    # 43 s and (open) 85 s, so the job must NOT be demoted. Wall and monotonic clocks are both virtual (Get-Date, Get-AgentMonotonicSec).
+    # Controls (renew-stale-still-demotes): the same walk where the renew FAILS (rc 1), and one where the renew starts at t0+30.5 and succeeds only at
+    # t0+121 (inside a 95 s query), are still demoted at the slice's check. renew-gap-dst-fallback (A2): the local wall clock falls back an hour between
+    # the last success (01:59:50, daylight) and now (01:01:55, standard) while 125 s really pass: the gap reads at least 125 s and the job is demoted.
+    function Invoke-RcCase {
+        # -WallStepSec: the wall clock (only) steps by this much at the end of the query, after the renew has exited (a clock step).
+        param([double]$QuerySec, [double]$ExitAfterSec, [int]$Rc, [datetime]$PrevWall, [datetime]$WalkStartWall, [double]$MonoAdvanceToWalk, [switch]$NoWalk, [double]$WallStepSec = 0)
+        $rcSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch; a = $script:Admission }
+        try {
+            return & {
+                $LeaseRenewSec = [int]$paramDefaults['LeaseRenewSec']
+                $LeaseRenewTimeoutSec = [int]$paramDefaults['LeaseRenewTimeoutSec']
+                $script:RcNow = $WalkStartWall
+                $script:RcMono = 1000.0 + $MonoAdvanceToWalk
+                $script:RcRecords = [System.Collections.Generic.List[double]]::new()
+                $script:RcExitAfter = $ExitAfterSec; $script:RcRc = $Rc; $script:RcQuery = $QuerySec; $script:RcWallStep = $WallStepSec
+                function Get-Date { return $script:RcNow }
+                function Get-AgentMonotonicSec { return $script:RcMono }
+                function Step-RcClock([double]$Sec) { $script:RcNow = $script:RcNow.AddSeconds($Sec); $script:RcMono += $Sec }
+                function Get-CimInstance {
+                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
+                    Step-RcClock $script:RcQuery
+                    $script:RcNow = $script:RcNow.AddSeconds($script:RcWallStep); $script:RcWallStep = 0
+                    return @()
+                }
+                function Get-ProcessIdentity { param([int]$ProcessId) return [pscustomobject]@{ exists = $true; processId = $ProcessId; startEpochMs = 1 } }
+                function Start-HeavySlotCli {
+                    param([string[]]$Arguments, [string]$Python = '', [string]$Script = '')
+                    $started = Get-Date; $startedMono = $script:RcMono
+                    $p = [pscustomobject]@{ exitAt = $started.AddSeconds($script:RcExitAfter); exitMono = $startedMono + $script:RcExitAfter; ExitCode = $script:RcRc; disposed = $false }
+                    $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $script:RcMono -ge $this.exitMono }
+                    # Like a real Process: no ExitTime before the exit, and none after Dispose (so the agent must read it before disposing).
+                    $p | Add-Member -MemberType ScriptProperty -Name ExitTime -Value { if ($this.disposed) { throw 'disposed' }; if ($script:RcMono -ge $this.exitMono) { $this.exitAt } else { throw 'not exited' } }
+                    $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) return $true }
+                    $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.disposed = $true }
+                    $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) }
+                    $script:RcRecords.Add($startedMono + $script:RcExitAfter - 1000.0)
+                    $done = [System.Threading.Tasks.Task]::FromResult('')
+                    return [pscustomobject]@{ ok = $true; proc = $p; out = $done; err = $done; started = $started; startedMono = $startedMono; why = $null }
+                }
+                $wrapper = [pscustomobject]@{ HasExited = $false; ExitCode = $null }
+                $until = [long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 2700)
+                $lease = [pscustomobject]@{ ok = $true; jobId = 'rc-collect'; label = 'quiet-lease mlv'; proc = $wrapper; pid = 4000; active = [pscustomobject]@{ slot = 1; held = '1:4000'; until = $until }
+                    activeAt = $PrevWall.AddSeconds(-600); activeAtMono = 400.0; lastRenewStart = $PrevWall; lastRenewStartMono = 1000.0; lastRenewOkStart = $PrevWall; lastRenewOkStartMono = 1000.0
+                    renewCall = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0; renewOkMaxGapSec = 0 }
+                $script:QuietLease = $lease; $script:QuietLeaseWaiting = $null; $script:LeaseBatch = $null
+                $script:Admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ seq = 1; token = 'rc' } }
+                # The agent's slice order: walk (with the -OnEach tick), the slice's own tick, the batch bound check.
+                if (-not $NoWalk) { $null = @(Get-DescendantProcessIdentities -ParentProcessId 5000 -OnEach { Invoke-QuietLeaseRenewTick }) }
+                Invoke-QuietLeaseRenewTick
+                $stop = Get-LeaseBatchJobStop -Admission $script:Admission -Lease $lease
+                [pscustomobject]@{ starts = $lease.renewStarts; ok = $lease.renewsOk; failures = $lease.renewFailures; okMaxGapSec = [double]$lease.renewOkMaxGapSec
+                    gapSec = (Get-QuietLeaseRenewOkGapSec -Lease $lease); stop = $(if ($null -ne $stop) { $stop.reason } else { $null }); stopWhy = $(if ($null -ne $stop) { $stop.why } else { $null })
+                    atMonoSec = $script:RcMono - 1000.0; records = @($script:RcRecords) }
+            }
+        }
+        finally { $script:QuietLease = $rcSaved.q; $script:QuietLeaseWaiting = $rcSaved.w; $script:LeaseBatch = $rcSaved.b; $script:Admission = $rcSaved.a }
+    }
+    $rcT0 = [datetime]::new(2026, 11, 18, 2, 0, 0, [DateTimeKind]::Local)
+    if (Test-Case 'renew-collect-after-slow-slice') {
+        $rc = Invoke-RcCase -QuerySec 85 -ExitAfterSec 3 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(40) -MonoAdvanceToWalk 40
+        $rcTxt = $rc | ConvertTo-Json -Compress -Depth 4
+        # starts=2: the slice's own tick at t0+125 collects the first renew and, 85 s after it started, starts the next one (still in flight).
+        Assert-True ($rc.starts -eq 2 -and $rc.ok -eq 1 -and $rc.failures -eq 0 -and [Math]::Abs($rc.atMonoSec - 125) -lt 0.01 -and [double]$rc.records[0] -eq 43) "renew-collect-after-slow-slice: the renew starts at t0+40, succeeds at t0+43 and is collected (ok) at t0+125: $rcTxt"
+        Assert-True ($null -eq $rc.stop) "renew-collect-after-slow-slice: a renew that succeeded at t0+43 (collected at t0+125 behind an 85 s query) does not demote the batch job: $rcTxt"
+        Assert-True ($rc.okMaxGapSec -ge 43 -and $rc.okMaxGapSec -le 45) "renew-collect-after-slow-slice: the closed gap reads the renew's own success (43 s, an upper bound on heavy-slot.py's), not its collection (125 s): $rcTxt"
+        Assert-True ($rc.gapSec -ge 85 -and $rc.gapSec -le 87) "renew-collect-after-slow-slice: the open gap is measured from the renew's call start (t0+40) to the check (t0+125), never under 85 s: $rcTxt"
+        # The same input with a +20 s wall-clock step after the renew exited: its exit is no longer trusted, the collection is used (as before r2),
+        # and the gap reads at least the collection's (wall 145 s, monotonic 125 s): demoted, the safe direction.
+        $rs = Invoke-RcCase -QuerySec 85 -ExitAfterSec 3 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(40) -MonoAdvanceToWalk 40 -WallStepSec 20
+        $rsTxt2 = $rs | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($rs.ok -eq 1 -and $rs.okMaxGapSec -ge 145 -and $rs.stop -ceq 'demoted') "renew-collect-after-slow-slice: after a wall-clock step the renew's own exit is not trusted and the collection's gap (>= 145 s) demotes: $rsTxt2"
+        Assert-True ($agentText -match '\$script:LeaseRenewClockSkewSec = 1\.0\b') "renew-collect-after-slow-slice: the agent's clock-step tolerance is 1.0 s (the value this suite runs with)"
+        # The fake Start-HeavySlotCli above stands in for the real one; the real one must carry the same monotonic start reading.
+        Assert-True ((Get-FunctionBody 'Start-HeavySlotCli').Contains('startedMono = (Get-AgentMonotonicSec)')) "renew-collect-after-slow-slice: the real Start-HeavySlotCli records startedMono beside started"
+        $results.renewCollectAfterSlowSlice = [ordered]@{ noStep = $rc; wallStep = $rs }
+    }
+    if (Test-Case 'renew-stale-still-demotes') {
+        $rf = Invoke-RcCase -QuerySec 85 -ExitAfterSec 3 -Rc 1 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(40) -MonoAdvanceToWalk 40
+        $rfTxt = $rf | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($rf.failures -eq 1 -and $rf.ok -eq 0 -and $rf.stop -ceq 'demoted' -and $rf.gapSec -ge 125) "renew-stale-still-demotes: a renew that FAILED leaves 125 s since the last success, and the job is demoted: $rfTxt"
+        # The renew starts at t0+30.5 (the walk starts there) and exits 90.5 s later (t0+121), inside a 95 s query: heavy-slot.py's gap may be 121 s.
+        $rl = Invoke-RcCase -QuerySec 95 -ExitAfterSec 90.5 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(30.5) -MonoAdvanceToWalk 30.5
+        $rlTxt = $rl | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($rl.ok -eq 1 -and $rl.okMaxGapSec -gt 120 -and $rl.stop -ceq 'demoted') "renew-stale-still-demotes: a renew that succeeded only at t0+121 still reads over 120 s (its exit, not its start) and the job is demoted: $rlTxt"
+        $results.renewStaleStillDemotes = [ordered]@{ failed = $rf; lateExit = $rl }
+    }
+    if (Test-Case 'renew-gap-dst-fallback') {
+        # America/Chicago 2026-11-01: 01:59:50 CDT (06:59:50Z) is the last success; now is 01:01:55 CST (07:01:55Z), 125 s later. The local wall
+        # clock reads 3475 s BACKWARD; the monotonic clock reads 125 s. No renew is started (-NoWalk, and the tick sees a negative wall gap on base).
+        $dPrev = [datetime]::new(2026, 11, 1, 1, 59, 50, [DateTimeKind]::Local)
+        $dNow = [datetime]::new(2026, 11, 1, 1, 1, 55, [DateTimeKind]::Local)
+        $dd = Invoke-RcCase -QuerySec 0 -ExitAfterSec 200 -Rc 0 -PrevWall $dPrev -WalkStartWall $dNow -MonoAdvanceToWalk 125 -NoWalk
+        $ddTxt = $dd | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($dd.gapSec -ge 125 -and $dd.stop -ceq 'demoted') "renew-gap-dst-fallback: 125 s really passed across a DST fall-back (local wall -3475 s): the gap reads >= 125 s and the batch job is demoted: $ddTxt"
+        $results.renewGapDstFallback = $dd
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }
