@@ -754,7 +754,11 @@ def _worker_record(path: Path) -> dict | None:
         and isinstance(record.get("skipped_ids"), list)
         and all(isinstance(item, str) for item in record["skipped_ids"])
         and isinstance(record.get("seconds"), dict)
+        and all(type(value) in (int, float) and math.isfinite(value) and value >= 0 for value in record["seconds"].values())
         and type(record.get("tests_run")) is int
+        # unittest counts a test when it starts, and ``started_ids`` is appended at the same moment, so a
+        # real worker's count is exactly its id count: a record that says otherwise is not one it wrote.
+        and record["tests_run"] == len(record["ids"])
         and type(record.get("ok")) is bool
     )
     return record if ok else None

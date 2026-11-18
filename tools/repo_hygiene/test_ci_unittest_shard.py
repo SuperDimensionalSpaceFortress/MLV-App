@@ -2329,6 +2329,66 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("exited 5 after running", err.getvalue())
 
+    # r10 sol A2: a zero-exit worker whose record names its ids but a contradictory tests_run (the real
+    # worker always has tests_run == len(ids), unittest counts a test at its start) must not pass.
+    def test_a_zero_exit_worker_with_a_contradictory_tests_run_fails_the_shard(self) -> None:
+        for bad in (-1, 0, 2, 999):
+            with self.subTest(tests_run=bad):
+                root, tests, tag = self._fixture()
+
+                class CountLiesPopen:
+                    def __init__(self, command: list[str], **kwargs: object) -> None:
+                        spec = json.loads(Path(command[command.index("--worker-spec") + 1]).read_text(encoding="utf-8"))
+                        ids = [t.id() for t in tests if f"{type(t).__module__}.{type(t).__qualname__}" in spec["classes"]]
+                        record = {"ids": ids, "skipped_ids": [], "seconds": {}, "tests_run": bad, "ok": True}
+                        Path(spec["result"]).write_text(json.dumps(record), encoding="utf-8")
+                        self.returncode = 0
+
+                    def poll(self) -> int:
+                        return 0
+
+                    def wait(self, timeout: float | None = None) -> int:
+                        return 0
+
+                    def kill(self) -> None:
+                        pass
+
+                out, err = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(shard.subprocess, "Popen", CountLiesPopen),
+                    contextlib.redirect_stdout(out),
+                    contextlib.redirect_stderr(err),
+                ):
+                    code = shard.run_parallel(
+                        tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                        repo_root=REPO_ROOT, pins={}, environ={}, timeout=120.0,
+                    )
+                self.assertEqual(code, 1, err.getvalue())
+                self.assertIn("wrote no readable result", err.getvalue())
+
+    def test_a_worker_result_whose_counts_or_timings_contradict_itself_is_unreadable(self) -> None:
+        path = Path(tempfile.mkdtemp(prefix="fxw-")) / "result.json"
+        self.addCleanup(shutil.rmtree, path.parent, True)
+        good = {"ids": ["m.C.test_a"], "skipped_ids": [], "seconds": {"m.C": 1.5}, "tests_run": 1, "ok": True}
+        path.write_text(json.dumps(good), encoding="utf-8")
+        self.assertIsNotNone(shard._worker_record(path), "the consistent record is the control")
+        for label, changes in (
+            ("tests_run below the ids", {"tests_run": 0}),
+            ("tests_run above the ids", {"tests_run": 2}),
+            ("negative tests_run", {"tests_run": -1}),
+            ("a string timing", {"seconds": {"m.C": "slow"}}),
+            ("a null timing", {"seconds": {"m.C": None}}),
+            ("a boolean timing", {"seconds": {"m.C": True}}),
+            ("a negative timing", {"seconds": {"m.C": -1.0}}),
+        ):
+            with self.subTest(label):
+                path.write_text(json.dumps({**good, **changes}), encoding="utf-8")
+                self.assertIsNone(shard._worker_record(path))
+        path.write_text(json.dumps(good).replace("1.5", "NaN"), encoding="utf-8")
+        self.assertIsNone(shard._worker_record(path), "a NaN timing is not a duration")
+        path.write_text(json.dumps(good).replace("1.5", "Infinity"), encoding="utf-8")
+        self.assertIsNone(shard._worker_record(path), "an infinite timing is not a duration")
+
     def test_a_worker_result_without_a_boolean_ok_is_unreadable(self) -> None:
         path = Path(tempfile.mkdtemp(prefix="fxw-")) / "result.json"
         self.addCleanup(shutil.rmtree, path.parent, True)
