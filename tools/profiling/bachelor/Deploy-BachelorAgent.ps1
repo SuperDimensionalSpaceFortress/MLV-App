@@ -61,8 +61,11 @@
 #   checked), re-read the task definition, schtasks.exe /Run /TN \MlvAgentBachelor, wait for a heartbeat from a new LIVE agent
 #   process. The host options before -File may only be -NoProfile/-NoLogo/-NonInteractive, -ExecutionPolicy Bypass|RemoteSigned|
 #   Unrestricted (Restricted, AllSigned, Default and Undefined would keep the replacement from running) and -WindowStyle, and
-#   -NoProfile is REQUIRED (a profile can set the agent's -Root default, so an argv that names no -Root would serve an unseen root).
-#   Right before /Run the task must show no running instance (IgnoreNew would make /Run a no-op and confirm an earlier instance), and a
+#   -NoProfile is REQUIRED (a profile can set the agent's -Root default, so an argv that names no -Root would serve an unseen root)
+#   and so is an explicit -ExecutionPolicy (without one the account's persistent policy applies and may block the replacement).
+#   The stop is handed the start the OS reported for the pid at the binding (osStart) and compares within 100 ms; the task
+#   definition is re-read AFTER the last wait, right before /Run. Residual (stated, OPEN): a trigger that starts the task between
+#   the no-instance check and /Run, with /Run then ignored (IgnoreNew), is not distinguishable from this side. Right before /Run the task must show no running instance (IgnoreNew would make /Run a no-op and confirm an earlier instance), and a
 #   wall clock stepped against a monotonic watch during the restart makes the "started at or after /Run" proof void. It acts on THIS
 #   machine's task list, so -RestartMode when-idle is refused (16) before anything changes unless ALL hold: heartbeat.txt
 #   names this machine as host=; its agentScript= is <VenueRoot>\ultra-magnus-agent.ps1 (a copied heartbeat from another
@@ -133,6 +136,9 @@ $script:StartToleranceSec = 2
 $script:OnWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
 # the longest a single read of the venue (a listing, the heartbeat) may take before it counts as unanswered
 $script:ReadTimeoutSec = 20
+# two reads of the OS start time of ONE process agree within this (ms); the stop compares the process under a pid with the start the
+# OS reported at the binding, so a pid reused by another instance (even started a fraction of a second later) is not the proved one
+$script:OsStartToleranceMs = 100
 # how long the restart waits for the stopped agent's process to go (the tests shorten it)
 $script:StopWaitSec = 30
 # how long the restart waits for the scheduler to show NO running instance of the task before /Run (the tests shorten it)
@@ -622,6 +628,9 @@ function Test-HostArgvRunsScript {
     # -NoProfile is REQUIRED: without it the host loads a profile, which can set PSDefaultParameterValues for the agent's -Root and so
     # point the agent at a root this check never saw (the argv then names no -Root, and the default is whatever the profile says)
     $sawNoProfile = $false
+    # an explicit -ExecutionPolicy is REQUIRED too: without one the host applies the account's persistent policy, which may be
+    # Restricted today even though the running agent started under another one, so the replacement script could be blocked
+    $sawPolicy = $false
     # only the policies under which a LOCAL, unsigned script runs: Restricted and AllSigned (and Default / Undefined, which resolve to
     # Restricted on a Windows client) would keep the replacement script from running, so the restart would stop the agent and not bring it back
     $policies = @('Bypass', 'RemoteSigned', 'Unrestricted')
@@ -638,11 +647,14 @@ function Test-HostArgvRunsScript {
         $name = $t.Substring(1)
         if ($hostFlags -contains $name) { if ($name -eq 'NoProfile' -or $name -eq 'nop') { $sawNoProfile = $true }; $i++; continue }
         # a valued option takes ONLY one of its known values (a value of -File, or a path, would shift what the host runs)
-        if ($hostValued.ContainsKey($name) -and $i + 1 -lt $tokens.Count -and $hostValued[$name] -contains $tokens[$i + 1]) { $i += 2; continue }
+        if ($hostValued.ContainsKey($name) -and $i + 1 -lt $tokens.Count -and $hostValued[$name] -contains $tokens[$i + 1]) {
+            if ($name -eq 'ExecutionPolicy' -or $name -eq 'ep') { $sawPolicy = $true }
+            $i += 2; continue
+        }
         return $false
     }
     if ($null -eq $scriptPath) { return $false }
-    if (-not $sawNoProfile) { return $false }
+    if (-not $sawNoProfile -or -not $sawPolicy) { return $false }
     if (-not (Test-AbsolutePathText -P $scriptPath)) { return $false }
     if (-not (Test-SamePath -A $scriptPath -B $AgentScript)) { return $false }
     $rest = @(); if ($i -lt $tokens.Count) { $rest = @($tokens[$i..($tokens.Count - 1)]) }
@@ -700,7 +712,9 @@ function Stop-TaskInstanceByPid {
             # the instance object names a pid; the process under that pid must be the one proved (pid plus start), not a reuse of it
             $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
             if ($null -eq $proc) { continue }
-            if (-not (Test-StartTimesMatch -A $proc.StartTime.ToUniversalTime() -B (ConvertTo-UtcStart -Text $StartText))) { continue }
+            # $StartText is the start the OS reported for this pid at the binding, so the two reads of ONE process agree to well under
+            # a second; a reuse of the pid starts a different process (a heartbeat's 2 s tolerance would admit a reuse 0.5 s later)
+            if ([Math]::Abs(($proc.StartTime.ToUniversalTime() - (ConvertTo-UtcStart -Text $StartText)).TotalMilliseconds) -gt $script:OsStartToleranceMs) { continue }
             $mine = $rt
             break
         }
@@ -743,6 +757,14 @@ function Get-RestartBindingRefusal {
     if (-not (Test-AgentProcessAlive -Beat $beat -RequireStart)) {
         return "heartbeat pid=$($beat.pid) is not a live agent process with the recorded start time; start the agent task by hand, then deploy"
     }
+    # the start the OS itself reports for that pid, right now: the stop is later handed THIS (not the heartbeat's claim, which is only
+    # held to the 2 s tolerance above) and compares the process under the pid with it
+    try {
+        $osStart = (Get-Process -Id $beat.pid -ErrorAction Stop).StartTime.ToUniversalTime()
+        if (-not (Test-StartTimesMatch -A $osStart -B (ConvertTo-UtcStart -Text $beat.start))) { return "heartbeat pid=$($beat.pid) no longer has the recorded start time" }
+        Add-Member -InputObject $beat -NotePropertyName osStart -NotePropertyValue $osStart.ToString('o') -Force
+    }
+    catch { return "the OS start time of heartbeat pid=$($beat.pid) could not be read: $($_.Exception.Message)" }
     # the RUNNING instance's own command line, read from the OS: a task definition edited after the instance started would bind the
     # definition while the live agent still serves another root. Both must say: a PowerShell host, -File <this script>, this root.
     $argv = Get-ProcessArgvBounded -ProcessId $beat.pid
@@ -795,7 +817,8 @@ function Invoke-AgentRestart {
     # /Run" comparison below (which reads the wall clock) can no longer be trusted
     $clockUtc0 = [DateTime]::UtcNow
     $clockWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $stop = Stop-TaskInstanceBounded -ProcessId $before.pid -StartText $before.start
+    # the start handed to the stop is the one the OS reported for the pid at the binding (osStart), compared with a tight tolerance there
+    $stop = Stop-TaskInstanceBounded -ProcessId $before.pid -StartText $(if (-not [string]::IsNullOrWhiteSpace([string]$before.osStart)) { [string]$before.osStart } else { [string]$before.start })
     if ($stop.outcome -eq 'not-stopped') {
         if ($null -ne $stop.busy) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $(@($stop.busy) -join '; ')"; warn = $null } }
         return @{ why = "could not stop agent pid=$($before.pid); nothing was stopped: $($stop.why)"; warn = $null }
@@ -807,13 +830,6 @@ function Invoke-AgentRestart {
         return @{ why = "agent pid $($before.pid) still alive $($script:StopWaitSec) s after its task instance was stopped"; warn = $null }
     }
     $warn = Get-ArrivalWarning
-    # the definition can be edited between the binding and now, and /Run STARTS whatever it says: read it again, as the last step
-    # before the start, and refuse to start a definition that no longer runs this script and root (the old agent is down: said so)
-    $nowXml = Get-TaskXml
-    if (-not $nowXml.ok) { return @{ why = "the old agent is stopped but the task was NOT started: $($nowXml.why)"; warn = $warn } }
-    if (-not (Test-TaskXmlRunsScript -Xml $nowXml.xml -AgentScript $AgentScript)) {
-        return @{ why = "the old agent is stopped but the task was NOT started: its definition changed and no longer runs -File $AgentScript for this root"; warn = $warn }
-    }
     # /Run with the task's default IgnoreNew policy does NOT start a second instance: if a trigger (or anything else) already started one
     # after the old agent exited, /Run succeeds and that earlier instance would be attested as the replacement. So the task must have NO
     # running instance right before /Run (it may take a moment for the scheduler to drop the instance whose process just exited)
@@ -822,6 +838,14 @@ function Invoke-AgentRestart {
         $left = Get-TaskRunningPidsBounded
         $what = $(if ($null -eq $left) { 'its running instances could not be read from the Task Scheduler' } else { "task $TaskName already has a running instance (pid $(@($left) -join ',')) that this restart did not start, so /Run would not start a new one and the replacement could not be proved" })
         return @{ why = "the old agent is stopped but the task was NOT started: $what"; warn = $warn }
+    }
+    # the definition can be edited between the binding and now (and during the wait above), and /Run STARTS whatever it says: read it
+    # again as the LAST step before the start, AFTER every wait, and refuse to start a definition that no longer runs this script and
+    # root (the old agent is down: said so)
+    $nowXml = Get-TaskXml
+    if (-not $nowXml.ok) { return @{ why = "the old agent is stopped but the task was NOT started: $($nowXml.why)"; warn = $warn } }
+    if (-not (Test-TaskXmlRunsScript -Xml $nowXml.xml -AgentScript $AgentScript)) {
+        return @{ why = "the old agent is stopped but the task was NOT started: its definition changed and no longer runs -File $AgentScript for this root"; warn = $warn }
     }
     $runAt = [DateTime]::UtcNow
     $run = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName) -TimeoutSec 30

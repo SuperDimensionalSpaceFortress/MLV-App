@@ -81,9 +81,9 @@ class DeployBachelorAgent(unittest.TestCase):
             capture_output=True, text=True, timeout=60).stdout.strip()
 
     def live_agent(self, *script_args: str):
-        """A LIVE process that runs the venue's agent script the way the task does: `pwsh -NoProfile -File <agent> [args]`.
+        """A LIVE process that runs the venue's agent script the way the task does: `pwsh -NoProfile -ExecutionPolicy Bypass -File <agent> [args]`.
         Returns (pid, utc start text). The command line is what Get-ProcessArgv reads (Win32_Process on Windows, /proc elsewhere)."""
-        p = subprocess.Popen([PWSH, "-NoProfile", "-File", str(self.venue / AGENT_NAME), *script_args])
+        p = subprocess.Popen([PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(self.venue / AGENT_NAME), *script_args])
         self.addCleanup(lambda: (p.kill(), p.wait()))
         return p.pid, self.start_of(p.pid)
 
@@ -408,12 +408,12 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(self._task_xml_case("desc", mine, task("-File &quot;C:\\busy-root\\ultra-magnus-agent.ps1&quot;", "backup of " + mine)), "False")
         # a mention in a later argument is not the script the task runs
         self.assertEqual(self._task_xml_case("later", mine, task("-File &quot;C:\\busy-root\\ultra-magnus-agent.ps1&quot; " + mine)), "False")
-        self.assertEqual(self._task_xml_case("quoted", mine, task("-NoProfile -File &quot;%s&quot;" % mine)), "True")
-        self.assertEqual(self._task_xml_case("bare", mine, task("-NoProfile -File %s" % mine)), "True")
-        self.assertEqual(self._task_xml_case("case", mine, task("-NoProfile -File &quot;C:\\BENCH\\Ultra-Magnus-Agent.ps1&quot;")), "True")
+        self.assertEqual(self._task_xml_case("quoted", mine, task("-NoProfile -ExecutionPolicy Bypass -File &quot;%s&quot;" % mine)), "True")
+        self.assertEqual(self._task_xml_case("bare", mine, task("-NoProfile -ExecutionPolicy Bypass -File %s" % mine)), "True")
+        self.assertEqual(self._task_xml_case("case", mine, task("-NoProfile -ExecutionPolicy Bypass -File &quot;C:\\BENCH\\Ultra-Magnus-Agent.ps1&quot;")), "True")
         # XML-escaped path: the correct task for a root with an ampersand must still bind
         amp = r"C:\Bench & Jobs\ultra-magnus-agent.ps1"
-        self.assertEqual(self._task_xml_case("amp", amp, task("-NoProfile -File &quot;C:\\Bench &amp; Jobs\\ultra-magnus-agent.ps1&quot;")), "True")
+        self.assertEqual(self._task_xml_case("amp", amp, task("-NoProfile -ExecutionPolicy Bypass -File &quot;C:\\Bench &amp; Jobs\\ultra-magnus-agent.ps1&quot;")), "True")
         self.assertEqual(self._task_xml_case("nofile", mine, task("-NoProfile")), "False")
         self.assertEqual(self._task_xml_case("malformed", mine, "<Task><Actions>"), "False")
 
@@ -504,15 +504,15 @@ class DeployBachelorAgent(unittest.TestCase):
         # a non-switch token before -File is a script or command the host would run first
         self.assertEqual(self._exec_task_case("positional-first", "pwsh.exe", "C:\\busy\\x.ps1 -File %s" % mine), "False")
         # the real shapes still bind
-        self.assertEqual(self._exec_task_case("full-path-host", "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoProfile -File %s%s%s" % (q, mine, q)), "True")
+        self.assertEqual(self._exec_task_case("full-path-host", "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File %s%s%s" % (q, mine, q)), "True")
         self.assertEqual(self._exec_task_case("ps51", "powershell.exe", "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File %s" % mine), "True")
-        self.assertEqual(self._exec_task_case("noexe", "pwsh", "-NoProfile -NoLogo -NonInteractive -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("noexe", "pwsh", "-NoProfile -NoLogo -NonInteractive -ExecutionPolicy Bypass -File %s" % mine), "True")
         # a relative script resolves against a working directory this check cannot see
         self.assertEqual(self._exec_task_case("relative", "pwsh.exe", "-File ultra-magnus-agent.ps1"), "False")
 
     def test_p3a2_the_task_root_override_is_bound_to_the_checked_root(self) -> None:
         mine = r"C:\bench\ultra-magnus-agent.ps1"
-        base = "-NoProfile -File %s" % mine
+        base = "-NoProfile -ExecutionPolicy Bypass -File %s" % mine
         # the adversary's input: the task serves a different (busy) root than the one checked idle
         self.assertEqual(self._exec_task_case("root-other", "pwsh.exe", base + " -Root C:\\busy-root"), "False")
         self.assertEqual(self._exec_task_case("root-colon", "pwsh.exe", base + " -Root:C:\\busy-root"), "False")
@@ -539,7 +539,7 @@ class DeployBachelorAgent(unittest.TestCase):
 
     def test_p5a1_a_relative_path_never_names_a_place(self) -> None:
         mine = r"C:\bench\ultra-magnus-agent.ps1"
-        base = "-NoProfile -File %s" % mine
+        base = "-NoProfile -ExecutionPolicy Bypass -File %s" % mine
         # pass 5 A1: -Root . resolves against the TASK's working directory, which this process cannot see
         for name, root in (("dot", "."), ("dotdot", "..\\bench"), ("bare", "bench"), ("drive-relative", "C:bench"), ("tilde", "~")):
             self.assertEqual(self._exec_task_case("root-rel-" + name, "pwsh.exe", base + " -Root " + root), "False", root)
@@ -553,25 +553,25 @@ class DeployBachelorAgent(unittest.TestCase):
         r = self._dot_source(body)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.split(), ["rel=False", "reldot=False", "abs=True"], r.stdout + r.stderr)
-        self.assertEqual(self._exec_task_case("script-rel", "pwsh.exe", "-NoProfile -File .\\ultra-magnus-agent.ps1"), "False")
+        self.assertEqual(self._exec_task_case("script-rel", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File .\\ultra-magnus-agent.ps1"), "False")
 
     def test_p5a2_only_a_space_or_a_tab_separates_task_arguments(self) -> None:
         mine = r"C:\bench\ultra-magnus-agent.ps1"
         # pass 5 A2: U+00A0 is not a separator for CreateProcess; "-NoProfile<NBSP>-File" is ONE argument, so the script never runs
         self.assertEqual(self._exec_task_case("nbsp", "pwsh.exe", "-NoProfile&#160;-File %s" % mine), "False")
-        self.assertEqual(self._exec_task_case("nbsp-after-file", "pwsh.exe", "-NoProfile -File&#160;%s" % mine), "False")
+        self.assertEqual(self._exec_task_case("nbsp-after-file", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File&#160;%s" % mine), "False")
         self.assertEqual(self._exec_task_case("newline", "pwsh.exe", "-NoProfile&#10;-File %s" % mine), "False")
         self.assertEqual(self._exec_task_case("ideographic", "pwsh.exe", "-NoProfile&#12288;-File %s" % mine), "False")
-        self.assertEqual(self._exec_task_case("tab", "pwsh.exe", "-NoProfile&#9;-File %s" % mine), "True")
-        self.assertEqual(self._exec_task_case("two-spaces", "pwsh.exe", "-NoProfile  -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("tab", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass&#9;-File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("two-spaces", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass  -File %s" % mine), "True")
 
     def test_p4a6_the_task_arguments_are_decoded_as_windows_decodes_them(self) -> None:
         mine = r"C:\bench\ultra-magnus-agent.ps1"
         # pass 4 A6: in -Root "C:\bench\" the backslash escapes the closing quote, so Root is C:\bench" (a literal quote), not C:\bench
-        self.assertEqual(self._exec_task_case("quote-escaped", "pwsh.exe", "-NoProfile -File %s -Root &quot;C:\\bench\\&quot;" % mine), "False")
+        self.assertEqual(self._exec_task_case("quote-escaped", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File %s -Root &quot;C:\\bench\\&quot;" % mine), "False")
         # an unterminated or doubled quote is unreadable, so it refuses
-        self.assertEqual(self._exec_task_case("unterminated", "pwsh.exe", "-NoProfile -File %s -Root &quot;C:\\bench" % mine), "False")
-        self.assertEqual(self._exec_task_case("doubled", "pwsh.exe", "-NoProfile -File &quot;C:\\bench\\ultra-magnus-agent.ps1&quot;&quot; -Root C:\\bench"), "False")
+        self.assertEqual(self._exec_task_case("unterminated", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File %s -Root &quot;C:\\bench" % mine), "False")
+        self.assertEqual(self._exec_task_case("doubled", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File &quot;C:\\bench\\ultra-magnus-agent.ps1&quot;&quot; -Root C:\\bench"), "False")
         # the decoder itself (CommandLineToArgvW): the text goes in through a file, so no shell quoting is involved
         cases = [
             ('-a "b c" d', "True", ["-a", "b c", "d"]),
@@ -594,16 +594,16 @@ class DeployBachelorAgent(unittest.TestCase):
         busy = r"C:\busy\ultra-magnus-agent.ps1"
 
         def two(first: str, second: str) -> str:
-            e = "<Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File %s</Arguments></Exec>"
+            e = "<Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File %s</Arguments></Exec>"
             return "<Task><Actions>%s%s</Actions></Task>" % (e % first, e % second)
 
         # `schtasks /End` stops the whole task, so a busy first action is ended with the bench agent that was checked
         self.assertEqual(self._task_xml_case("two-busy-first", mine, two(busy, mine)), "False")
         self.assertEqual(self._task_xml_case("two-mine-first", mine, two(mine, busy)), "False")
         self.assertEqual(self._task_xml_case("two-same", mine, two(mine, mine)), "False")
-        com = "<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File %s</Arguments></Exec><ComHandler><ClassId>{x}</ClassId></ComHandler></Actions></Task>" % mine
+        com = "<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File %s</Arguments></Exec><ComHandler><ClassId>{x}</ClassId></ComHandler></Actions></Task>" % mine
         self.assertEqual(self._task_xml_case("exec-and-com", mine, com), "False")
-        one = "<Task><Actions Context=\"Author\"><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File %s</Arguments></Exec></Actions></Task>" % mine
+        one = "<Task><Actions Context=\"Author\"><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File %s</Arguments></Exec></Actions></Task>" % mine
         self.assertEqual(self._task_xml_case("one", mine, one), "True")
 
     def test_p4a4_host_options_that_stop_the_script_from_running_are_refused(self) -> None:
@@ -624,7 +624,7 @@ class DeployBachelorAgent(unittest.TestCase):
         # the same live pid, but the heartbeat now carries NO processStartUtc: it no longer identifies a process
         bad = 'alive x pid=%d host=BENCHTEST generation=1 agentScript="%s"\r\n' % (pid, agent)
         xml = Path(self._tmp.name) / "task-p4a5.xml"
-        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
         beat = self.venue / "heartbeat.txt"
         later = Path(self._tmp.name) / "heartbeat-later.txt"
         beat.write_text(good)
@@ -720,8 +720,8 @@ class DeployBachelorAgent(unittest.TestCase):
 
     def test_p6a1_a_task_whose_root_or_script_has_no_drive_does_not_bind_on_windows(self) -> None:
         mine = r"C:\bench\ultra-magnus-agent.ps1"
-        for name, args in (("root-slash", "-NoProfile -File %s -Root /bench" % mine), ("root-backslash", "-NoProfile -File %s -Root \\bench" % mine),
-                           ("script-slash", "-NoProfile -File /bench/ultra-magnus-agent.ps1")):
+        for name, args in (("root-slash", "-NoProfile -ExecutionPolicy Bypass -File %s -Root /bench" % mine), ("root-backslash", "-NoProfile -ExecutionPolicy Bypass -File %s -Root \\bench" % mine),
+                           ("script-slash", "-NoProfile -ExecutionPolicy Bypass -File /bench/ultra-magnus-agent.ps1")):
             xml = "<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>%s</Arguments></Exec></Actions></Task>" % args
             f = Path(self._tmp.name) / ("task-p6a1-%s.xml" % name)
             f.write_text(xml, encoding="utf-8")
@@ -729,7 +729,7 @@ class DeployBachelorAgent(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertEqual(r.stdout.strip(), "False", name)
         # the same drive-less text is legitimate off Windows, where "/" is the root of the one filesystem
-        xml = "<Task><Actions><Exec><Command>pwsh</Command><Arguments>-NoProfile -File /bench/ultra-magnus-agent.ps1 -Root /bench</Arguments></Exec></Actions></Task>"
+        xml = "<Task><Actions><Exec><Command>pwsh</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File /bench/ultra-magnus-agent.ps1 -Root /bench</Arguments></Exec></Actions></Task>"
         f = Path(self._tmp.name) / "task-p6a1-posix.xml"
         f.write_text(xml, encoding="utf-8")
         r = self._dot_source("$script:OnWindows=$false; Test-TaskXmlRunsScript -Xml (Get-Content -Raw -LiteralPath '%s') -AgentScript '/bench/ultra-magnus-agent.ps1'" % psq(f))
@@ -770,7 +770,7 @@ class DeployBachelorAgent(unittest.TestCase):
         pid, start = self.live_agent("-Root", r"C:\other-root")
         self.write_beat(pid, start)
         xml = Path(self._tmp.name) / "task-p6a3.xml"
-        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File \"%s\"</Arguments></Exec></Actions></Task>"
                        % (self.venue / AGENT_NAME), encoding="utf-8")
         r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml))
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
@@ -781,7 +781,7 @@ class DeployBachelorAgent(unittest.TestCase):
 
     def test_p6a3_a_live_process_serving_this_root_binds_and_others_do_not(self) -> None:
         xml = Path(self._tmp.name) / "task-p6a3b.xml"
-        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File \"%s\"</Arguments></Exec></Actions></Task>"
                        % (self.venue / AGENT_NAME), encoding="utf-8")
         agent = self.venue / AGENT_NAME
         verdicts = {}
@@ -823,7 +823,7 @@ class DeployBachelorAgent(unittest.TestCase):
 
     def _task_xml_for_agent(self) -> Path:
         xml = Path(self._tmp.name) / "task-p7.xml"
-        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File \"%s\"</Arguments></Exec></Actions></Task>"
                        % (self.venue / AGENT_NAME), encoding="utf-8")
         return xml
 
@@ -936,7 +936,7 @@ class DeployBachelorAgent(unittest.TestCase):
         # last step before the start; a definition that no longer runs this script is not started (the old agent is down, and said so).
         pid, start = self.live_agent()
         busy = Path(self._tmp.name) / "task-busy.xml"
-        busy.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File C:\\busy\\ultra-magnus-agent.ps1</Arguments></Exec></Actions></Task>", encoding="utf-8")
+        busy.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\\busy\\ultra-magnus-agent.ps1</Arguments></Exec></Actions></Task>", encoding="utf-8")
         body = (
             "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
             "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
@@ -954,7 +954,7 @@ class DeployBachelorAgent(unittest.TestCase):
     # The Task Scheduler is replaced by a stand-in Get-RunningTaskInstances (the one seam): it returns instance objects with the same
     # members the COM IRunningTask has (Path, EnginePID, Stop()). Stop() on the stand-in writes a marker file, so "was it stopped" is observed.
 
-    def _stop_case(self, label: str, *, start_shift_sec: int = 0, drop_job_during_lookup: bool = False, task_path: str = "\\MlvTest"):
+    def _stop_case(self, label: str, *, start_shift_sec: float = 0, drop_job_during_lookup: bool = False, task_path: str = "\\MlvTest"):
         """Runs Stop-TaskInstanceByPid directly against a live process, with a stand-in scheduler. Returns (stdout lines dict, marker Path)."""
         pid, _start = self.live_agent()
         marker = Path(self._tmp.name) / ("stop-marker-%s.txt" % label)
@@ -967,7 +967,7 @@ class DeployBachelorAgent(unittest.TestCase):
             "  Add-Member -InputObject $o -MemberType ScriptMethod -Name Stop -Value { Set-Content -LiteralPath $script:Marker -Value stopped };"
             "  @($o) };"
             "$real=(Get-Process -Id %d).StartTime.ToUniversalTime();"
-            "$claimed=$real.AddSeconds(%d).ToString('o');"
+            "$claimed=$real.AddSeconds(%s).ToString('o');"
             "$r = Stop-TaskInstanceByPid -ProcessId %d -StartText $claimed;"
             "'outcome=' + $r.outcome; 'why=' + $r.why; 'busy=' + (@($r.busy) -join '|')"
         ) % (psq(marker), pid, psq(job), "true" if drop_job_during_lookup else "false", psq(task_path), pid, start_shift_sec, pid)
@@ -991,9 +991,81 @@ class DeployBachelorAgent(unittest.TestCase):
         out, marker = self._stop_case("same")
         self.assertEqual(out.get("outcome"), "stopped", out)
         self.assertTrue(marker.exists(), "the proved instance is stopped")
-        # the clock tolerance of every other 'same process' check applies here too (one reading of 'same start')
-        out, marker = self._stop_case("within-tolerance", start_shift_sec=1)
+        # (pass 11 A2: the stop compares two OS reads of ONE process, so a 2 s heartbeat-sized tolerance does not apply; see below)
+        out, marker = self._stop_case("sub-tolerance", start_shift_sec=0.02)
         self.assertEqual(out.get("outcome"), "stopped", out)
+
+    def test_p11a2_a_pid_reused_half_a_second_later_is_not_the_proved_instance(self) -> None:
+        # pass 11 A2: the binding proved pid 4242 at 12:00:00.0; a re-pointed instance reuses pid 4242 at 12:00:00.5. The heartbeat's 2 s
+        # tolerance admitted it. The stop is handed the OS-observed start and compares two reads of one process (100 ms).
+        out, marker = self._stop_case("half-second", start_shift_sec=-0.5)
+        self.assertEqual(out.get("outcome"), "not-stopped", out)
+        self.assertFalse(marker.exists())
+        out, marker = self._stop_case("one-second", start_shift_sec=1)
+        self.assertEqual(out.get("outcome"), "not-stopped", out)
+
+    def test_p11a2_the_binding_records_the_os_start_and_the_caller_hands_it_to_the_stop(self) -> None:
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
+        xml = self._task_xml_for_agent()
+        cmd = (". '%s' -VenueRoot '%s' -TaskXmlFile '%s' -TaskPidsFile '%s'; $x = Get-RestartBindingRefusal -AgentScript '%s';"
+               "'bound=' + ($null -eq $x); 'os=' + $script:BoundBeat.osStart; 'real=' + (Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')"
+               % (psq(SCRIPT), psq(self.venue), psq(xml), psq(self.task_pids(pid)), psq(self.venue / AGENT_NAME), pid))
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        vals = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        self.assertEqual(vals.get("bound"), "True", r.stdout + r.stderr)
+        self.assertEqual(vals.get("os"), vals.get("real"), "the bound identity carries the start the OS reports for the pid")
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';osStart='2026-11-18T12:00:00.1234567Z';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText) Write-Host ('seen start=' + $StartText);"
+            "  [pscustomobject]@{ outcome = 'not-stopped'; why = 'stand-in'; busy = $null } };"
+            "$r = Invoke-AgentRestart -AgentScript '%s'"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME))
+        r = self._dot_source(body)
+        self.assertIn("seen start=2026-11-18T12:00:00.1234567Z", r.stdout)
+
+    def test_p11a1_the_definition_is_read_again_after_the_wait_for_the_scheduler(self) -> None:
+        # pass 11 A1: the definition was re-read, THEN the restart waited (up to 15 s) for the scheduler to drop the old instance, and
+        # /Run started whatever the definition said by then. During that wait another admin re-points the task to another root.
+        pid, start = self.live_agent()
+        agent = self.venue / AGENT_NAME
+        good = Path(self._tmp.name) / "task-p11a1.xml"
+        good.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
+        busy = "<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\\busy\\ultra-magnus-agent.ps1</Arguments></Exec></Actions></Task>"
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText) Stop-Process -Id $ProcessId -Force; [pscustomobject]@{ outcome = 'stopped'; why = $null; busy = $null } };"
+            # the scheduler-idle wait is where the definition is edited
+            "$orig = ${function:Wait-Until};"
+            "function Wait-Until { param([int]$TimeoutSec, [scriptblock]$Condition, [int]$PollMs = 500, [hashtable]$Variables = @{})"
+            "  if ($Condition.ToString() -match 'Get-TaskRunningPids') { Set-Content -LiteralPath $TaskXmlFile -Value '%s'; return $true }"
+            "  & $orig -TimeoutSec $TimeoutSec -Condition $Condition -PollMs $PollMs -Variables $Variables };"
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (pid, start, psq(agent), psq(busy), psq(agent))
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; %s" % (psq(SCRIPT), psq(self.venue), psq(good), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("its definition changed", r.stdout)
+        self.assertNotIn("schtasks /Run", r.stdout, "the changed definition is not started")
+
+    def test_p11a4_a_task_without_an_explicit_execution_policy_is_refused(self) -> None:
+        # pass 11 A4: with no -ExecutionPolicy the host applies the account's persistent policy, which can be Restricted now though the
+        # running agent started under another: the old agent is stopped and the replacement script is blocked.
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        self.assertEqual(self._exec_task_case("p11-nopolicy", "pwsh.exe", "-NoProfile -File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("p11-nopolicy-nologo", "pwsh.exe", "-NoProfile -NoLogo -NonInteractive -File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("p11-policy", "pwsh.exe", "-NoProfile -ExecutionPolicy RemoteSigned -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("p11-ep", "pwsh.exe", "-nop -ep Bypass -File %s" % mine), "True")
+        body = (
+            "function A($t){ [pscustomobject]@{ ok = $true; tokens = $t } };"
+            "'nopolicy='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-File','%s')) -AgentScript '%s');"
+            "'policy='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s')"
+        ) % (psq(mine), psq(mine), psq(mine), psq(mine))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["nopolicy=False", "policy=True"], r.stdout + r.stderr)
 
     def test_p9a1_the_caller_hands_the_proved_start_to_the_stop(self) -> None:
         pid, start = self.live_agent()
@@ -1064,7 +1136,7 @@ class DeployBachelorAgent(unittest.TestCase):
         # message is the proof that the restart went past the stop).
         pid, start = self.live_agent()
         busy = Path(self._tmp.name) / "task-busy-p9.xml"
-        busy.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File C:\\busy\\ultra-magnus-agent.ps1</Arguments></Exec></Actions></Task>", encoding="utf-8")
+        busy.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\\busy\\ultra-magnus-agent.ps1</Arguments></Exec></Actions></Task>", encoding="utf-8")
         body = (
             "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
             "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
@@ -1108,11 +1180,11 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(self._exec_task_case("p10-profile", "pwsh.exe", "-ExecutionPolicy Bypass -File %s" % mine), "False")
         self.assertEqual(self._exec_task_case("p10-bare", "pwsh.exe", "-File %s" % mine), "False")
         self.assertEqual(self._exec_task_case("p10-noprofile", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File %s" % mine), "True")
-        self.assertEqual(self._exec_task_case("p10-nop", "pwsh.exe", "-nop -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("p10-nop", "pwsh.exe", "-nop -ep Bypass -File %s" % mine), "True")
         body = (
             "function A($t){ [pscustomobject]@{ ok = $true; tokens = $t } };"
             "'profile='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s');"
-            "'noprofile='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-File','%s')) -AgentScript '%s')"
+            "'noprofile='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s')"
         ) % (psq(mine), psq(mine), psq(mine), psq(mine))
         r = self._dot_source(body)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1122,11 +1194,11 @@ class DeployBachelorAgent(unittest.TestCase):
         # pass 10 A3: the script folder of R:\ultra-magnus-agent.ps1 is R:\, and it was computed as "R:" (drive-relative), so the matching
         # -Root R:\ was refused. The same must hold for a UNC share root and for a subfolder.
         body = (
-            "'drive='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','R:\\ultra-magnus-agent.ps1','-Root','R:\\') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
-            "'drive-no-root='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','R:\\ultra-magnus-agent.ps1') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
-            "'drive-other='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','R:\\ultra-magnus-agent.ps1','-Root','R:\\busy') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
-            "'sub='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','C:\\bench\\ultra-magnus-agent.ps1','-Root','C:\\bench') -AgentScript 'C:\\bench\\ultra-magnus-agent.ps1');"
-            "'sub-other='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','C:\\bench\\ultra-magnus-agent.ps1','-Root','C:\\busy') -AgentScript 'C:\\bench\\ultra-magnus-agent.ps1')"
+            "'drive='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-ExecutionPolicy','Bypass','-File','R:\\ultra-magnus-agent.ps1','-Root','R:\\') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
+            "'drive-no-root='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-ExecutionPolicy','Bypass','-File','R:\\ultra-magnus-agent.ps1') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
+            "'drive-other='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-ExecutionPolicy','Bypass','-File','R:\\ultra-magnus-agent.ps1','-Root','R:\\busy') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
+            "'sub='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-ExecutionPolicy','Bypass','-File','C:\\bench\\ultra-magnus-agent.ps1','-Root','C:\\bench') -AgentScript 'C:\\bench\\ultra-magnus-agent.ps1');"
+            "'sub-other='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-ExecutionPolicy','Bypass','-File','C:\\bench\\ultra-magnus-agent.ps1','-Root','C:\\busy') -AgentScript 'C:\\bench\\ultra-magnus-agent.ps1')"
         )
         r = self._dot_source(body)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1150,7 +1222,7 @@ class DeployBachelorAgent(unittest.TestCase):
         pid, start = self.live_agent()
         agent = self.venue / AGENT_NAME
         xml = Path(self._tmp.name) / "task-p10a2.xml"
-        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
         body = (
             "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
             "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
