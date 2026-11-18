@@ -2541,6 +2541,11 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         "a #define of a token outside the statement": ("#  define OTHER_MACRO 1", ""),
         "an #include_next": ("#include_next <QKeySequence>", ""),
         "a comment that splices the next line into itself": ("// a note \\", ""),
+        # r3 adversary pass on fce56625 A1: a form feed or vertical tab is whitespace before `#` to the compiler.
+        "a form feed before a #define":
+            ("\f#define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", "\f#undef QKeySequence"),
+        "a vertical tab before an #undef": ("\v#undef QKeySequence", ""),
+        "a control character anywhere in the file": ("// a note \x0c with a form feed", ""),
     }
 
     def _key_table_with(self, before: str, after: str) -> dict[str, str]:
@@ -2577,6 +2582,19 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             with self.subTest(text):
                 problems = scan_app_play_sources({"platform/qt/OtherWidget.h": text})
                 self.assertFalse([p for p in problems if "preprocessor" in p or "#define of" in p], problems)
+
+    def test_r3_p2_a1_a_form_feed_or_vertical_tab_before_a_define_is_still_a_define(self) -> None:
+        # The sibling: the identifier #define check every other scanned file keeps.
+        for lead in ("\f", "\v", " \f\t"):
+            with self.subTest(repr(lead)):
+                problems = scan_app_play_sources({"platform/qt/MainWindow.cpp": lead + "#define QKeySequence(k) k\n"})
+                self.assertIn("platform/qt/MainWindow.cpp:1: #define of QKeySequence, a token of the reviewed Space "
+                              "binding statement", problems)
+
+    def test_r3_p2_a2_a_qualified_qkeyevent_include_is_not_a_synthesized_key(self) -> None:
+        for text in ("#include <QtGui/QKeyEvent>\n", "#include <qevent.h>\n", '#include "QKeyEvent"\n'):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
 
     # A2: a parenthesised `(qApp->notify)( w, e )` or a grouped `(QCoreApplication::sendEvent)(...)` escaped _EVENT_POST,
     # which required `name(`. The class is "a dispatch named any other way": EVERY identifier mention of postEvent,

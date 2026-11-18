@@ -255,7 +255,8 @@ _INVOKE_METHOD = re.compile(r"\binvokeMethod\s*\([^;]*?\w*[Aa]ctionPlay\w*")
 # not, is caught as well, since an alias can construct one without naming the type.
 _KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!\s*[*&])|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
                         r"|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
-_KEY_EVENT_INCLUDE = re.compile(r"#\s*include\s*<\s*QKeyEvent\s*>")
+# r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
+_KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
 # PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
 # (PlayerShortcutBinding::bindings(), handed to QAction::setShortcuts(); before, MainWindow.ui carried it). A binding is
 # not an event. Only the ``Key_Space`` inside the exact (comment-stripped, whitespace-normalised) table STATEMENT
@@ -279,7 +280,8 @@ def _statement_pattern(statement: str) -> re.Pattern[str]:
 # binding while the text still matches. Any #define of one of those identifiers, in any scanned source, fails.
 SPACE_BINDING_STATEMENT_IDENTIFIERS = frozenset(
     token for statement, _ in PINNED_KEY_SPACE_BINDINGS.values() for token in re.findall(r"[A-Za-z_]\w*", statement))
-_DEFINE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)", re.MULTILINE)
+# r3 (adversary pass on fce56625 A1): a form feed and a vertical tab are whitespace to the preprocessor too.
+_DEFINE = re.compile(r"^[ \t\f\v]*#[ \t\f\v]*define[ \t\f\v]+([A-Za-z_]\w*)", re.MULTILINE)
 # r3 (adversary pass 3 A1, HUB RULING HUB-TICK 20261118T1142Z): a digraph `%:define` or a spliced `#de\<nl>fine` re-spelled
 # that macro. The scan guards against an accidental or refactor-made synthesized Play key, not deliberate obfuscation, so
 # the class is closed with one fail-closed rule instead of a preprocessor: in the ONE pinned key-table file a directive
@@ -289,9 +291,11 @@ _DEFINE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)", re.MULTILINE)
 KEY_TABLE_SOURCE = "platform/qt/PlayerShortcutBinding.h"
 KEY_TABLE_REVIEWED_DIRECTIVES = {
     "#ifndef PLAYERSHORTCUTBINDING_H": 1, "#define PLAYERSHORTCUTBINDING_H": 1, "#ifdef Q_OS_WIN": 1, "#endif": 2}
-_DIRECTIVE_LINE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
+_DIRECTIVE_LINE = re.compile(r"^[ \t\f\v]*#.*$", re.MULTILINE)
 _INCLUDE_DIRECTIVE = re.compile(r'#\s*include\s*(?:<[^<>"\n]+>|"[^<>"\n]+")')
-_PREPROCESSOR_RESPELL = re.compile(r"%:|\?\?[=/'()!<>\-]|\\[ \t\r]*$", re.MULTILINE)
+# r3 (adversary pass on fce56625 A1): a form feed / vertical tab before `#` hid a directive. Fail-closed on the class:
+# ANY control character but tab, newline and carriage return, anywhere in the key table.
+_PREPROCESSOR_RESPELL = re.compile(r"%:|\?\?[=/'()!<>\-]|\\[ \t\r]*$|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", re.MULTILINE)
 # r3 (adversary pass 3 A2, same ruling): a grouped `(qApp->notify)( w, e )` or `(QCoreApplication::sendEvent)(...)` escaped
 # a `name(` match. EVERY identifier mention of a dispatch name is counted against the pinned sites: a call, a grouping, a
 # member pointer alike.
