@@ -678,13 +678,26 @@ function Get-AssignmentConversionTypes($Left) {
 }
 
 function Get-AssignmentsTo($Root, [string]$Name) {
-    @($Root.FindAll({
-        param($n)
-        if ($n -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { return $false }
-        $left = Get-AssignmentTarget $n.Left
-        ($left -is [System.Management.Automation.Language.VariableExpressionAst]) -and ((Get-VariableName $left).name -ieq $Name)
-    }, $true))
+    # Every assignment under $Root whose target is the variable $Name (scope qualifier ignored, case-insensitive), in document order.
+    # EXPORT-VENUE-LEG-1 r15: read from a per-tree index built by ONE walk of the tree. Test-VariableMayHoldSession follows an assignment
+    # chain one variable at a time, and the walk it used to make per variable cost the whole tree each time: about 30 s per member with a
+    # computed name on DualVenueRunner.psm1 (the real scan then ran past its 600 s bound on a hosted runner). The result is the same list.
+    if (-not $script:assignmentIndexes.ContainsKey($Root)) {
+        $index = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($n in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))) {
+            $left = Get-AssignmentTarget $n.Left
+            if ($left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            $target = (Get-VariableName $left).name
+            if (-not $index.ContainsKey($target)) { $index[$target] = [System.Collections.Generic.List[object]]::new() }
+            $index[$target].Add($n)
+        }
+        $script:assignmentIndexes[$Root] = $index
+    }
+    $found = $null
+    if ($script:assignmentIndexes[$Root].TryGetValue($Name, [ref]$found)) { return @($found) }
+    return @()
 }
+$script:assignmentIndexes = [System.Collections.Generic.Dictionary[object, object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
 
 function Get-AssignedObjectOrigin($Assignment) {
     # What one assignment to a local variable binds it to: 'literal' (a hashtable / [ordered] /

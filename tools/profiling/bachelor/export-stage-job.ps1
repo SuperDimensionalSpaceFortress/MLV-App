@@ -342,7 +342,7 @@ try {
     $logText = try { if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [IO.File]::ReadAllText($batchLog) } else { '' } } catch { Write-JobTrace "step export batch.log read error=$([string]$_.CategoryInfo.Reason)"; '' }
     $done = @([regex]::Matches($logText, '(?m)^\[BATCH\] DONE .+? exported=(?<e>[0-9]+) skipped=(?<s>[0-9]+) elapsed=[0-9.]+\r?$'))
     $exported = if ($done.Count -eq 1) { [int64]$done[0].Groups['e'].Value } else { $null }
-    $verified = @([regex]::Matches($logText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]+)\b'))
+    $verified = @([regex]::Matches($logText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]+)(?=\s|$)'))   # r15 (pass14 A2): the token ends at whitespace or the line end (a word boundary also ends it at '.', so 480.5 read as 480)
     $stageEvidence = if ($Format -eq 'cdng-lossless') { $profilePath } else { $stageLog }
     # (adversary r11 A3: the same best-effort rule for the stage record's size: a survivor of an unconfirmed kill can remove or lock it between Test-Path and Get-Item, which threw into the finally
     # and cost the typed terminal; an unreadable record is an absent one, and the classification below decides from the timeout first)

@@ -284,8 +284,37 @@ class ExportPlanAndOutcomeTests(unittest.TestCase):
         self.assertEqual((got["applies"], got["requested"]), (False, False), proc.stdout + proc.stderr)
 
 
+MALFORMED_DECODED_FRAME_TOKENS = ("480.5", "480-1", "480/2", "480x", "480e0")
+
+
 @requires_windows_pwsh
 class ExportEvidenceTests(unittest.TestCase):
+    def test_r15_pass14_a2_a_decoded_frame_token_that_is_not_a_whole_integer_verifies_nothing(self) -> None:
+        """r13 adversary pass 14 A2: ``decoded_frames=480.5`` was read as 480 (the regex ended in a word boundary, which a '.' also satisfies), so a ProRes batch that
+        verified a malformed count passed against 480 exported frames. The reader (Get-DvExportEvidence) and the emitted job (export-stage-job.ps1:345, which types the
+        result from the same line) both end the token at whitespace or the end of the line, so such a line is no RENDER_VERIFIED line at all."""
+        def prores_480(token) -> dict:
+            return prores_case(maxFrames=480, stage=stage_log(480), batch=batch_log(480, verified=token, elapsed=60.0), criteria=[])
+        proc, got = evidence_cases([prores_480(480)] + [prores_480(t) for t in MALFORMED_DECODED_FRAME_TOKENS])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual((got[0]["problems"], got[0]["outcome"]), ([], "PASS"), "the control: a whole integer token verifies")
+        for token, row in zip(MALFORMED_DECODED_FRAME_TOKENS, got[1:]):
+            with self.subTest(reader_token=token):
+                self.assertTrue(any("RENDER_VERIFIED" in p for p in row["problems"]), row)
+                self.assertNotEqual(row["outcome"], "PASS", row)
+        # the emitted job's own pattern, taken from its source and run over the same lines
+        job_pattern = re.search(r"'(\(\?m\)\^\\\[BATCH\\\] RENDER_VERIFIED[^']*)'", EXPORT_JOB.read_text(encoding="utf-8"))
+        self.assertIsNotNone(job_pattern, "export-stage-job.ps1 no longer carries the RENDER_VERIFIED pattern this test reads")
+        lines = [batch_log(480, verified=t) for t in (480,) + MALFORMED_DECODED_FRAME_TOKENS]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "lines.json"
+            path.write_text(json.dumps(lines), encoding="utf-8")
+            proc, counts = run_pwsh_json("$p = $env:DVE_PATTERN\n$lines = Get-Content -Raw -LiteralPath $env:DVE_LINES -Encoding utf8 | ConvertFrom-Json\n"
+                                         "@($lines | ForEach-Object { @([regex]::Matches([string]$_, $p)).Count }) | ConvertTo-Json -Compress -AsArray",
+                                         DVE_PATTERN=job_pattern.group(1), DVE_LINES=str(path))
+        self.assertIsNotNone(counts, proc.stdout[-2000:] + proc.stderr[-2000:])
+        self.assertEqual(counts, [1] + [0] * len(MALFORMED_DECODED_FRAME_TOKENS), "the job reads a malformed decoded_frames token as a verification")
+
     def test_the_pure_reader_over_fixture_text(self) -> None:
         cases = [
             cdng_case(),                                                              # 0 happy CDNG

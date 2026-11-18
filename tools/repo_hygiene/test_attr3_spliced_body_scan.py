@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -408,6 +409,8 @@ def run_bounded(command: list[str], timeout: float) -> "subprocess.CompletedProc
 # the bound only has to be finite and well above that.
 SCAN_TIMEOUT_SECONDS = 600
 PROBE_TIMEOUT_SECONDS = 300
+# EXPORT-VENUE-LEG-1 r15: DualVenueRunner.psm1 scanned alone (see test_the_dual_venue_runner_scans_inside_its_runtime_pin).
+DUAL_VENUE_RUNNER_SCAN_PIN_SECONDS = 120
 
 
 # A call to the extractor, however it is spelled: PowerShell command names are case-insensitive and
@@ -515,6 +518,22 @@ class SplicedBodyScanOnRealSourcesTests(unittest.TestCase):
             sorted(found), sorted(SPLICE_SOURCES + DYNAMIC_SPLICE_SOURCES),
             "a generator splices helper text into a job but is not a listed splice source (or the reverse)",
         )
+
+    def test_the_dual_venue_runner_scans_inside_its_runtime_pin(self) -> None:
+        """EXPORT-VENUE-LEG-1 r15: the scan's cost on one source must stay linear in the source. Hosted heavy shard 7/12 died at 50 min because
+        the whole real scan (SCAN_TIMEOUT_SECONDS = 600) timed out three times: each of a source's few members with a computed name (``$x.$name``)
+        followed every variable assignment chain with a full-tree walk per variable (Get-AssignmentsTo), about 30 s per member on
+        DualVenueRunner.psm1 (about 280 s for that one file before the per-tree assignment index), the real splice source with the most commands
+        and members. It is scanned alone and must finish inside DUAL_VENUE_RUNNER_SCAN_PIN_SECONDS, a bound a linear scan clears many times over
+        on a slow runner and the quadratic one did not."""
+        source = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        self.assertIn(source, SPLICE_SOURCES, "the pinned source is no longer a listed splice source")
+        started = time.monotonic()
+        result = run_scan(splice_sources=(source,))
+        elapsed = time.monotonic() - started
+        self.assertGreater(len(result["spliced"]), 0, "the single-source scan enumerated no spliced bodies")
+        self.assertLess(elapsed, DUAL_VENUE_RUNNER_SCAN_PIN_SECONDS,
+                        f"scanning {source.name} alone took {elapsed:.0f}s; the pin is {DUAL_VENUE_RUNNER_SCAN_PIN_SECONDS:g}s")
 
     def test_a_dynamic_splice_source_embeds_only_bodies_the_scan_already_enumerates(self) -> None:
         """r6: the scan cannot enumerate a computed -Name list, so each generator in DYNAMIC_SPLICE_SOURCES is held to a weaker, checkable claim: every
