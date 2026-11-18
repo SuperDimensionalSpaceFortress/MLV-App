@@ -5,7 +5,8 @@
 // was added to, inside the active window. A QMenu counts only through its own menu action (so
 // through the menu bar that shows it). With the menu bar and toolbar hidden, the action has no
 // visible carrier and its keys are dead. Adding the action to the top-level window itself gives
-// it a carrier that is visible whenever the window is.
+// it a carrier that is visible whenever the window is. (A macOS native menu bar counts as
+// visible even when hidden, so there the keys were never dead; binding is harmless there.)
 //
 // The shortcut context is deliberately left as it is (Qt::WindowShortcut, the QAction default).
 // An application-wide context would fire while a non-modal dialog (for example StatusDialog)

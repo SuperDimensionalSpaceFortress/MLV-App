@@ -157,8 +157,9 @@ TEST(PlaybackFullscreenUiWiring, SmokeGeometryVerificationUsesTheSameScreenChoic
 TEST(PlaybackFullscreenUiWiring, PlayerShortcutsAreBoundToTheWindowAndKeepWindowScope)
 {
     // PLAYER-FULLSCREEN-SHORTCUTS-LIVE-1: fullscreen hides the menu bar and toolbar, the only
-    // visible carriers of the player actions, so MainWindow binds them to itself as well. The
-    // behaviour is proven by gui_tests fullscreenLiveShortcuts_*; this pins the call site.
+    // visible carriers of the player actions where the menu bar is a widget (Windows, Linux; a
+    // macOS native menu bar keeps carrying them), so MainWindow binds them to itself as well.
+    // The behaviour is proven by gui_tests fullscreenLiveShortcuts_*; this pins the call site.
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     ASSERT_TRUE(source.contains(QStringLiteral("#include \"PlayerShortcutBinding.h\"")));
     const int bindAt = source.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"));

@@ -742,6 +742,10 @@ public:
     FullscreenShortcutMirror()
     {
         window.resize( 640, 360 );
+        // A widget menu bar on every platform (adversary A1): a macOS native menu bar does not
+        // show as a QWidget and counts as visible for shortcut matching even when hidden, which
+        // would break both the visible-bars case and the hidden-bars control.
+        window.menuBar()->setNativeMenuBar( false );
         QMenu *playback = window.menuBar()->addMenu( QStringLiteral( "Playback" ) );
         toolBar = window.addToolBar( QStringLiteral( "mainToolBar" ) );
         const QVector<LiveShortcutKey> keys = live_shortcut_keys();
@@ -951,6 +955,7 @@ void GuiSmokeTest::fullscreenLiveShortcuts_visibleBarsWithBindingFireExactlyOnce
     QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
     QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 ); // a second bind is a no-op
     QVERIFY( m.showAndActivate( false ) );
+    QVERIFY( !m.window.menuBar()->isNativeMenuBar() );
     QVERIFY( m.window.menuBar()->isVisible() );
     QVERIFY( m.toolBar->isVisible() );
     m.viewer->setFocus();
