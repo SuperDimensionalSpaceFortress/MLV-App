@@ -640,7 +640,9 @@ function Test-ProcessIdentityMatch {
 function Get-DescendantProcessIdentities {
     # BACHELOR-LEASE-RENEW-MARGIN-1 r1: -OnEach runs before every CIM query of the walk. The job monitor passes its quiet-lease
     # renew tick, because this walk (two CIM queries per descendant) is the slow step of a monitor slice under a heavy leg's
-    # load: a renew due mid-walk starts mid-walk, not one whole slice later. It must never wait; nothing it returns is kept.
+    # load: a renew due mid-walk starts mid-walk, not one whole slice later. It must never wait for a renew to finish (its only waits are
+    # bounded: a collected renew's output reads, about 4 s, and the lease sidecar read's retries); nothing it returns is kept.
+    # It ticks only BETWEEN queries: one CIM query that alone outlasts the cadence still delays a due renew until it returns.
     param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null)
 
     if ($null -ne $OnEach) { $null = & $OnEach }
@@ -2238,6 +2240,11 @@ function Initialize-RenewExitStamp {
     # credited at its exit, not at its collection, and nothing reads the call's own wall-clock ExitTime (a clock step or a DST change can skew
     # that). The stamp is taken after the exit, so it never reads earlier than the exit on either clock. Compiled once at agent start (never on
     # the wait loop); $false when it cannot be, and then every success is measured at its collection, as before r2.
+    # r4 (sol r3 A1) NON-PROMISE: the stamp is "after the exit", not "at the exit". It is prompt only while the agent process runs: a slow
+    # monitor step (one long CIM query on the agent's main thread) does not delay it, but a suspension of the WHOLE agent process does (no thread
+    # runs to stamp). A late stamp only reads LONGER, so the outcome is a false demotion, never a missed one (pinned by the quiet-lease case
+    # renew-exit-stamp-late-known-limit; base a7278cbd demotes the same input). Crediting an earlier time would need an out-of-process record
+    # time: card BACHELOR-LEASE-RENEW-RECORD-TIME-1.
     if ($null -ne ('MlvApp.Agent.RenewExitStamp' -as [type])) { return $true }
     try {
         Add-Type -TypeDefinition @"
@@ -3675,15 +3682,24 @@ function Update-QuietLeaseRequest {
 function Register-QuietLeaseRenewOk {
     # lease-batch r2: a renew that returned rc 0. heavy-slot.py demotes a lease not renewed for renew_stale_s (120 s), so the
     # gap that matters is between SUCCESSFUL renews (activation counts as the first). Measured from the previous success's
-    # call start to now (the result's collection), an upper bound on heavy-slot.py's own gap: it never under-reads one.
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: still measured to the collection (a renew process's own ExitTime is NOT used: across a
-    # clock step it can read shorter than heavy-slot.py's gap, adversary A1); the collection is now prompt instead, because the
-    # job monitor's descendant walk ticks the renew too. The gap is rounded UP to 0.1 s (ConvertTo-RenewGapCeilingSec), so
-    # 120.04 s never reads 120.0 and slips past a strict "> 120" guard (adversary A2).
+    # call start to the end moment below. It is an upper bound on heavy-slot.py's own gap only within the limits Get-RenewGapSec states.
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: the gap is rounded UP to 0.1 s (ConvertTo-RenewGapCeilingSec), so 120.04 s never reads 120.0 and
+    # slips past a strict "> 120" guard (adversary A2). The renew process's own wall-clock ExitTime is never used (across a clock step it
+    # can read shorter than heavy-slot.py's gap, adversary A1; pass 4 A2).
     # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1): with -Call (the renew tick's collection), the gap ends at the renew's in-process EXIT
     # STAMP (Get-QuietLeaseRenewOkAt), not at its collection: a renew that succeeded at t0+43 but was collected at t0+125 behind an 85 s monitor
-    # query closed a 43 s gap, not 125 s. No stamp: the collection, as before. Every gap is Get-RenewGapSec: the larger of the UTC wall gap and
-    # the monotonic gap (pass 3 A2: a DST fall-back no longer reads negative; pass 4 A2: a wall step during the call cannot shrink it).
+    # query closed a 43 s gap, not 125 s. Without -Call (the pre-launch renew, collected as it exits by a bounded wait) or without a usable stamp,
+    # the gap ends at the collection, as before r2. Every gap is Get-RenewGapSec: the larger of the UTC wall gap and the monotonic gap (pass 3
+    # A2: a DST fall-back no longer reads negative; pass 4 A2: a wall step that is still in effect at the stamp, or a backward step at any time,
+    # cannot shrink it).
+    # r4 (sol r3) NON-PROMISES, both pinned by quiet-lease cases and owed to card BACHELOR-LEASE-RENEW-RECORD-TIME-1 (heavy-slot.py reporting
+    # its own record time; heavy-slot.py is not in this repo):
+    #   A1 - the late-collection remedy covers a slow monitor slice WHILE THE AGENT PROCESS RUNS, not a suspension of the agent process: a
+    #        suspended agent stamps the exit late and the gap reads long (a false demotion, the safe direction;
+    #        renew-exit-stamp-late-known-limit).
+    #   A2 - a forward wall step that is in effect when heavy-slot.py writes its record but reverted before the exit stamp is never read: the gap
+    #        then under-reads heavy-slot.py's (a missed demotion; renew-gap-reverted-step-known-limit). Base a7278cbd shares this limit on a
+    #        neighbouring input (renew-gap-reverted-step-base-neighbour).
     param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallStartedMono = $null, $Call = $null)
     $nowWall = Get-Date
     $nowMono = Get-AgentMonotonicSec
@@ -3710,6 +3726,12 @@ function Get-RenewGapSec {
     # staleness on this host's wall clock, so a forward step makes its lease staler) and the monotonic gap (the real time; a backward step or a DST
     # fall-back cannot shrink it). Local-time subtraction is never used: across a fall-back it read 125 s as -3475 s. A missing monotonic end
     # (a record from before r2) leaves the wall gap alone.
+    # r4 (sol r3 A2) THE BOUND, stated exactly: the wall clock is read only at the two moments passed in (agent sample points), so this is an
+    # upper bound on heavy-slot.py's wall-clock record gap for any single wall step whose effect is still visible at an agent sample point. It
+    # is NOT a bound for a forward wall step that is in effect when heavy-slot.py writes its record and reverted before the agent's next sample:
+    # that step is never read, and the gap under-reads heavy-slot.py's (a missed demotion). Base a7278cbd has the same limit. Covering it needs
+    # heavy-slot.py to report its record time (card BACHELOR-LEASE-RENEW-RECORD-TIME-1; heavy-slot.py is not in this repo). Pinned by the
+    # quiet-lease cases renew-gap-reverted-step-known-limit and renew-gap-reverted-step-base-neighbour.
     param([Parameter(Mandatory = $true)][datetime]$FromWall, $FromMono, [Parameter(Mandatory = $true)][datetime]$ToWall, $ToMono)
     $g = ($ToWall.ToUniversalTime() - $FromWall.ToUniversalTime()).TotalSeconds
     if ($null -ne $FromMono -and $null -ne $ToMono) { $g = [Math]::Max($g, [double]$ToMono - [double]$FromMono) }
@@ -3717,12 +3739,15 @@ function Get-RenewGapSec {
 }
 
 function Get-QuietLeaseRenewOkAt {
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1): the LATEST moment a collected, successful renew call can have written heavy-slot.py's
-    # renew record, as @{ wall; mono; fromExit }. The record is written before the call exits, so that is the call's in-process exit stamp
-    # (Initialize-RenewExitStamp: Stopwatch and UtcNow read on Process.Exited, after the exit, on both clocks). The stamp is read as taken: no
-    # offset is added to a local time (pass 4 A1: AddSeconds on a local time across a DST change), and the process's own wall-clock ExitTime is
-    # never used (pass 4 A2: a wall step during the call made it read 20 s early). A missing, unfinished or unreadable stamp, or one later than
-    # now on the monotonic clock, is the collection, now: never earlier than the record, as before r2.
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1): the moment a collected, successful renew call's gap ends, as @{ wall; mono; fromExit }:
+    # a moment no earlier IN REAL TIME (monotonic) than heavy-slot.py's renew record. The record is written before the call exits, so that is the
+    # call's in-process exit stamp (Initialize-RenewExitStamp: Stopwatch and UtcNow read on Process.Exited, after the exit, on both clocks). The
+    # stamp is read as taken: no offset is added to a local time (pass 4 A1: AddSeconds on a local time across a DST change), and the process's
+    # own wall-clock ExitTime is never used (pass 4 A2: a wall step during the call made it read 20 s early). A missing, unfinished or unreadable
+    # stamp, or one later than now on the monotonic clock, is the collection, now, as before r2.
+    # r4 (sol r3) NON-PROMISES: (A1) the stamp is prompt only while the agent process runs; a suspended agent stamps late, so the gap reads long
+    # (false demotion, safe direction). (A2) the stamp's WALL reading can be earlier than the record's wall reading when a forward wall step was
+    # reverted between the record and the stamp; Get-RenewGapSec states that bound. Both: card BACHELOR-LEASE-RENEW-RECORD-TIME-1.
     param([Parameter(Mandatory = $true)]$Call, [Parameter(Mandatory = $true)][datetime]$NowWall, [Parameter(Mandatory = $true)][double]$NowMono)
     $now = [pscustomobject]@{ wall = $NowWall; mono = $NowMono; fromExit = $false }
     $s = $Call.exitStamp
@@ -3742,6 +3767,8 @@ function Get-QuietLeaseRenewOkGapSec {
     # or $null when it is not active. Over $script:LeaseRenewStaleSec, heavy-slot.py has demoted the lease (non-exclusive).
     # BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2): rounded UP, never to the nearest, so a gap just over the bound reads over it.
     # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (pass 3 A2): the open gap is Get-RenewGapSec (UTC wall and monotonic, the larger), never local-time arithmetic.
+    # r4 (sol r3 A2): the implication runs one way. Over the limit, heavy-slot.py has demoted the lease; at or under it, heavy-slot.py has not,
+    # only within Get-RenewGapSec's bound (a forward wall step reverted between two agent samples is never read).
     param($Lease)
     if ($null -eq $Lease -or $null -eq $Lease.activeAt) { return $null }
     $useOk = $null -ne $Lease.lastRenewOkStart
@@ -3766,7 +3793,9 @@ function Update-QuietLeaseRenew {
     # LEASE-NOT-AFTER-HARDENING-2 (Dot R18 on #648): CollectOnly (a waiting lease past its notAfterUtc) does the first half only:
     # the renew in flight is still collected or killed, and no new one starts.
     # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (pass 3 A1/A2): a collected success hands its call to Register-QuietLeaseRenewOk (the gap ends at the renew's
-    # own exit when no clock step happened), and the timeout and the cadence are Get-RenewGapSec (UTC wall and monotonic), not local-time arithmetic.
+    # in-process exit stamp, taken after the exit; r4: late if the agent process was suspended, see Initialize-RenewExitStamp), the cadence is
+    # Get-RenewGapSec (UTC wall and monotonic, the larger), and the timeout is monotonic (UTC wall without a monotonic start), never local-time
+    # arithmetic.
     param([Parameter(Mandatory = $true)]$Lease, [switch]$CollectOnly)
     $now = Get-Date
     $nowMono = Get-AgentMonotonicSec

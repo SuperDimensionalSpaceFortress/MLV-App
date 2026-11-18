@@ -1198,7 +1198,8 @@ try {
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
         'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up',
-        'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst')
+        'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst',
+        'renew-exit-stamp-late-known-limit', 'renew-gap-reverted-step-known-limit', 'renew-gap-reverted-step-base-neighbour')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -5768,8 +5769,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     # tick when it has one), Invoke-QuietLeaseRenewTick, gap check, heartbeat, the 5 s wait. The agent's REAL Update-QuietLeaseRenew,
     # Receive-HeavySlotCli, Register-QuietLeaseRenewOk and Get-QuietLeaseRenewOkGapSec run, at the agent's DEFAULT LeaseRenewSec and
     # LeaseRenewTimeoutSec; only Start-HeavySlotCli returns a fake renew process that exits 3 s (virtual) after its start.
-    # Asserted: the successful-renew gap the agent measures (and would demote on) stays < 90 s at every slice end, it never under-reads the gap
-    # between the fake heavy-slot.py's renew records, and the monitor loop passes the tick into its walk.
+    # Asserted: the successful-renew gap the agent measures (and would demote on) stays < 90 s at every slice end, in this run (no clock step)
+    # it does not under-read the gap between the fake heavy-slot.py's renew records, and the monitor loop passes the tick into its walk.
+    # (r4: the reverted wall step that CAN make it under-read is the pinned known limit renew-gap-reverted-step-known-limit.)
     # RED on fork/master a7278cbd: cadence 60 s, one tick per slice, gap measured to the collection -> about two slices (150+ s).
     if (Test-Case 'renew-slow-monitor-slice') {
         $rsSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch }
@@ -5831,7 +5833,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True (@($rsOut.slices | Where-Object { $_.sliceSec -lt 70 -or $_.sliceSec -gt 90 }).Count -eq 0) "renew-slow-monitor-slice: every modelled monitor slice takes 70-90 s: $rsTxt"
         Assert-True ($rsOut.failures -eq 0 -and $rsOut.slow -eq 0 -and $rsOut.ok -ge 1) "renew-slow-monitor-slice: the renews succeed (late is the only fault modelled): $rsTxt"
         Assert-True ($rsOut.okMaxGapSec -lt 90 -and $rsOut.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 70-90 s monitor slices the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsOut.okMaxGapSec) checkMaxGapSec=$($rsOut.checkMaxGapSec): $rsTxt"
-        Assert-True ($rsOut.okMaxGapSec + 0.05 -ge $rsOut.recordMaxGapSec) "renew-slow-monitor-slice: the agent's measured gap never under-reads heavy-slot.py's gap between renew records (okMaxGapSec=$($rsOut.okMaxGapSec) recordMaxGapSec=$($rsOut.recordMaxGapSec))"
+        Assert-True ($rsOut.okMaxGapSec + 0.05 -ge $rsOut.recordMaxGapSec) "renew-slow-monitor-slice: with no clock step, the agent's measured gap does not under-read heavy-slot.py's gap between renew records (okMaxGapSec=$($rsOut.okMaxGapSec) recordMaxGapSec=$($rsOut.recordMaxGapSec))"
         # Pass 2 A3: matched against the REAL monitor loop (the while loop over $jobProcess in Invoke-QueuedJob's AST, comments excluded), so a
         # comment carrying the call, or the call anywhere else, does not satisfy it.
         # r2 (pass 3 A3): command names are matched case-INsensitively (-eq), as PowerShell resolves them, so a lowercase walk is counted too;
@@ -5844,8 +5846,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
     }
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r1, adversary pass 1 on 41ffc7fa (both introduced, major): the agent's successful-renew gap must never read
-    # shorter than heavy-slot.py's. A1: a renew whose process ExitTime reads EARLY (a clock step: exit t0+105.02 s, collected at t0+125 s) must not
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1, adversary pass 1 on 41ffc7fa (both introduced, major): the agent's successful-renew gap must not read
+    # shorter than heavy-slot.py's on these inputs (r4: a wall step reverted between two agent samples is the one it can miss, the pinned known
+    # limit renew-gap-reverted-step-known-limit). A1: a renew whose process ExitTime reads EARLY (a clock step: exit t0+105.02 s, collected at t0+125 s) must not
     # shorten the gap below the collection's 125 s. A2: a gap of 120.042 s must read over 120 (rounded up, never to the nearest 120.0), so the
     # strict "-gt LeaseRenewStaleSec" guards refuse it. Both drive the REAL Update-QuietLeaseRenew + Get-QuietLeaseRenewOkGapSec on a virtual clock.
     # Pass 2 A4: the helper itself rounds a sub-tick excess up too (asserted where the round-up case runs).
@@ -5878,7 +5881,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $results[$gc.name] = $gcOut
     }
     # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1, introduced major; and the pass-3 advisory A2): a renew that SUCCEEDED early in a slow
-    # monitor step is not read as late. Input (A1): interval 30 s and timeout 30 s (the defaults); the batch lease was last renewed OK at t0 (stored
+    # monitor step is not read as late, while the agent process runs (r4: a suspension of the whole agent process is the pinned known limit
+    # renew-exit-stamp-late-known-limit, a false demotion). Input (A1): interval 30 s and timeout 30 s (the defaults); the batch lease was last renewed OK at t0 (stored
     # maximum 0, 2700 s left); the monitor walk starts at t0+40; job pid 5000 has no children and its one child query takes 85 s; the renew exits 3 s
     # after it starts. The -OnEach tick starts the renew at t0+40, it succeeds at t0+43 and is collected at t0+125. heavy-slot.py's gaps were at most
     # 43 s and (open) 85 s, so the job must NOT be demoted. Wall and monotonic clocks are both virtual (Get-Date, Get-AgentMonotonicSec).
@@ -5890,7 +5894,16 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # -ExitWallOffsetSec: the wall clock read this much off at the moment the renew exited (a transient step, restored by the collection):
         # the call's wall-clock ExitTime and its exit stamp's UtcNow both carry it; its monotonic exit does not.
         # The virtual wall clock is kept in UTC and Get-Date returns it as local time (ToLocalTime), like the real Get-Date across a DST change.
-        param([double]$QuerySec, [double]$ExitAfterSec, [int]$Rc, [datetime]$PrevWall, [datetime]$WalkStartWall, [double]$MonoAdvanceToWalk, [switch]$NoWalk, [double]$WallStepSec = 0, [double]$ExitWallOffsetSec = 0)
+        # r4 (sol r3 A1, A2; the KNOWN LIMITS, pinned by renew-exit-stamp-late-known-limit and renew-gap-reverted-step-known-limit):
+        # -StampDelaySec: the exit stamp is taken this long AFTER the exit, on both clocks (the agent process was suspended, so Process.Exited
+        # ran late); the record and the exit itself are unchanged.
+        # -RecordWallStepSec / -RecordWallStepAtSec: from this long after the call start, the wall clock reads RecordWallStepSec ahead, and
+        # heavy-slot.py writes its renew record then; the step is reverted before the exit, so no agent sample (call start, exit stamp,
+        # collection) ever reads it. recordWalls is heavy-slot.py's record wall time, in seconds after PrevWall.
+        # -PreTickSec: one renew tick, then both clocks advance this much, before the slice's own tick (with -NoWalk: two ticks and no walk,
+        # which runs on an agent whose walk has no -OnEach, such as base a7278cbd).
+        param([double]$QuerySec, [double]$ExitAfterSec, [int]$Rc, [datetime]$PrevWall, [datetime]$WalkStartWall, [double]$MonoAdvanceToWalk, [switch]$NoWalk, [double]$WallStepSec = 0, [double]$ExitWallOffsetSec = 0,
+            [double]$StampDelaySec = 0, [double]$RecordWallStepSec = 0, [double]$RecordWallStepAtSec = 0, [double]$PreTickSec = 0)
         $rcSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch; a = $script:Admission }
         try {
             return & {
@@ -5900,6 +5913,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $script:RcMono = 1000.0 + $MonoAdvanceToWalk
                 $script:RcRecords = [System.Collections.Generic.List[double]]::new()
                 $script:RcExitAfter = $ExitAfterSec; $script:RcRc = $Rc; $script:RcQuery = $QuerySec; $script:RcWallStep = $WallStepSec; $script:RcExitWallOff = $ExitWallOffsetSec
+                $script:RcStampDelay = $StampDelaySec; $script:RcRecStep = $RecordWallStepSec; $script:RcRecStepAt = $RecordWallStepAtSec
+                $script:RcPrevUtc = $PrevWall.ToUniversalTime()
+                $script:RcRecordWalls = [System.Collections.Generic.List[double]]::new()
                 function Get-Date { return $script:RcNowUtc.ToLocalTime() }
                 function Get-AgentMonotonicSec { return $script:RcMono }
                 function Step-RcClock([double]$Sec) { $script:RcNowUtc = $script:RcNowUtc.AddSeconds($Sec); $script:RcMono += $Sec }
@@ -5912,8 +5928,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 function Get-ProcessIdentity { param([int]$ProcessId) return [pscustomobject]@{ exists = $true; processId = $ProcessId; startEpochMs = 1 } }
                 function Start-HeavySlotCli {
                     param([string[]]$Arguments, [string]$Python = '', [string]$Script = '')
-                    $started = Get-Date; $startedMono = $script:RcMono
-                    $exitUtc = $script:RcNowUtc.AddSeconds($script:RcExitAfter + $script:RcExitWallOff)
+                    $started = Get-Date; $startedMono = $script:RcMono; $startedUtc = $script:RcNowUtc
+                    $exitUtc = $startedUtc.AddSeconds($script:RcExitAfter + $script:RcExitWallOff)
                     $p = [pscustomobject]@{ exitAt = $exitUtc.ToLocalTime(); exitMono = $startedMono + $script:RcExitAfter; ExitCode = $script:RcRc; disposed = $false }
                     $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $script:RcMono -ge $this.exitMono }
                     # Like a real Process: no ExitTime before the exit, and none after Dispose.
@@ -5922,12 +5938,14 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                     $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.disposed = $true }
                     $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) }
                     # The in-process exit stamp (the agent's RenewExitStamp shape): Stamped once the process has exited, with that moment's
-                    # monotonic and UTC wall readings.
-                    $st = [pscustomobject]@{ stampMono = $p.exitMono; stampUtc = $exitUtc }
+                    # monotonic and UTC wall readings (-StampDelaySec later on both when the agent process was suspended).
+                    $st = [pscustomobject]@{ stampMono = $p.exitMono + $script:RcStampDelay; stampUtc = $exitUtc.AddSeconds($script:RcStampDelay) }
                     $st | Add-Member -MemberType ScriptProperty -Name Stamped -Value { $script:RcMono -ge $this.stampMono }
                     $st | Add-Member -MemberType ScriptProperty -Name ExitMonoSec -Value { $this.stampMono }
                     $st | Add-Member -MemberType ScriptProperty -Name ExitUtc -Value { $this.stampUtc }
                     $script:RcRecords.Add($startedMono + $script:RcExitAfter - 1000.0)
+                    $recWallUtc = if ($script:RcRecStep -ne 0) { $startedUtc.AddSeconds($script:RcRecStepAt + $script:RcRecStep) } else { $exitUtc }
+                    $script:RcRecordWalls.Add(($recWallUtc - $script:RcPrevUtc).TotalSeconds)
                     $done = [System.Threading.Tasks.Task]::FromResult('')
                     return [pscustomobject]@{ ok = $true; proc = $p; out = $done; err = $done; started = $started; startedMono = $startedMono; exitStamp = $st; why = $null }
                 }
@@ -5940,11 +5958,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $script:Admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ seq = 1; token = 'rc' } }
                 # The agent's slice order: walk (with the -OnEach tick), the slice's own tick, the batch bound check.
                 if (-not $NoWalk) { $null = @(Get-DescendantProcessIdentities -ParentProcessId 5000 -OnEach { Invoke-QuietLeaseRenewTick }) }
+                if ($PreTickSec -gt 0) { Invoke-QuietLeaseRenewTick; Step-RcClock $PreTickSec }
                 Invoke-QuietLeaseRenewTick
                 $stop = Get-LeaseBatchJobStop -Admission $script:Admission -Lease $lease
                 [pscustomobject]@{ starts = $lease.renewStarts; ok = $lease.renewsOk; failures = $lease.renewFailures; okMaxGapSec = [double]$lease.renewOkMaxGapSec
                     gapSec = (Get-QuietLeaseRenewOkGapSec -Lease $lease); stop = $(if ($null -ne $stop) { $stop.reason } else { $null }); stopWhy = $(if ($null -ne $stop) { $stop.why } else { $null })
-                    atMonoSec = $script:RcMono - 1000.0; records = @($script:RcRecords) }
+                    atMonoSec = $script:RcMono - 1000.0; records = @($script:RcRecords); recordWalls = @($script:RcRecordWalls) }
             }
         }
         finally { $script:QuietLease = $rcSaved.q; $script:QuietLeaseWaiting = $rcSaved.w; $script:LeaseBatch = $rcSaved.b; $script:Admission = $rcSaved.a }
@@ -5956,7 +5975,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # starts=2: the slice's own tick at t0+125 collects the first renew and, 85 s after it started, starts the next one (still in flight).
         Assert-True ($rc.starts -eq 2 -and $rc.ok -eq 1 -and $rc.failures -eq 0 -and [Math]::Abs($rc.atMonoSec - 125) -lt 0.01 -and [double]$rc.records[0] -eq 43) "renew-collect-after-slow-slice: the renew starts at t0+40, succeeds at t0+43 and is collected (ok) at t0+125: $rcTxt"
         Assert-True ($null -eq $rc.stop) "renew-collect-after-slow-slice: a renew that succeeded at t0+43 (collected at t0+125 behind an 85 s query) does not demote the batch job: $rcTxt"
-        Assert-True ($rc.okMaxGapSec -ge 43 -and $rc.okMaxGapSec -le 45) "renew-collect-after-slow-slice: the closed gap reads the renew's own success (43 s, an upper bound on heavy-slot.py's), not its collection (125 s): $rcTxt"
+        Assert-True ($rc.okMaxGapSec -ge 43 -and $rc.okMaxGapSec -le 45) "renew-collect-after-slow-slice: the closed gap reads the renew's own success (43 s; with the agent running and no clock step, an upper bound on heavy-slot.py's), not its collection (125 s): $rcTxt"
         Assert-True ($rc.gapSec -ge 85 -and $rc.gapSec -le 87) "renew-collect-after-slow-slice: the open gap is measured from the renew's call start (t0+40) to the check (t0+125), never under 85 s: $rcTxt"
         # The same input with a +20 s wall-clock step AFTER the renew exited: the exit stamp was taken at the exit (43 s on both clocks), and the open
         # gap carries the step on the wall clock (t0+40 to wall t0+145 = 105 s, as heavy-slot.py would see it on this host): not demoted.
@@ -6009,6 +6028,41 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $tdTxt = $td | ConvertTo-Json -Compress -Depth 4
         Assert-True ($td.ok -eq 1 -and $td.okMaxGapSec -ge 43 -and $td.okMaxGapSec -le 44 -and $td.gapSec -ge 70 -and $td.gapSec -le 71 -and $null -eq $td.stop) "renew-exit-stamp-dst (host zone $tz): across the fall-back the closed gap reads 43 s and the open gap 70 s, not demoted: $tdTxt"
         $results.renewExitStampDst = [ordered]@{ hostZone = $tz; result = $td }
+    }
+    # r4 (sol r3 A1, A2): the two KNOWN LIMITS of the exit-stamp accounting, pinned as they are today. Neither is a property this PR claims; both
+    # need heavy-slot.py to report its own renew record time (card BACHELOR-LEASE-RENEW-RECORD-TIME-1; heavy-slot.py is not in this repo). A
+    # successor that closes one turns its case RED on purpose: change the pin there, never here by weakening it.
+    # A1 (safe direction): the renew starts at t0+40 and heavy-slot.py records it at t0+43 (exit), but the WHOLE agent process is suspended from
+    # t0+42 to t0+124, so Process.Exited stamps t0+124; collected at t0+125. The closed gap reads 124 s and the job is demoted: a FALSE demotion,
+    # never a missed one. Base a7278cbd demotes this input too (it measures to the collection, 125 s).
+    if (Test-Case 'renew-exit-stamp-late-known-limit') {
+        $ka = Invoke-RcCase -QuerySec 85 -ExitAfterSec 3 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(40) -MonoAdvanceToWalk 40 -StampDelaySec 81
+        $kaTxt = $ka | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($ka.ok -eq 1 -and [double]$ka.records[0] -eq 43 -and [Math]::Abs([double]$ka.recordWalls[0] - 43) -lt 0.01) "renew-exit-stamp-late-known-limit: heavy-slot.py recorded the renew at t0+43 and the agent collected it (ok): $kaTxt"
+        Assert-True ($ka.okMaxGapSec -ge 124 -and $ka.okMaxGapSec -le 125 -and $ka.stop -ceq 'demoted') "renew-exit-stamp-late-known-limit (known limit A1, safe direction): a suspended agent stamps the exit late (t0+124), the closed gap reads 124 s and the job is demoted, although heavy-slot.py's record gap was 43 s: $kaTxt"
+        $results.renewExitStampLateKnownLimit = $ka
+    }
+    # A2 (sol r3's exact trace): last success t0 (wall and monotonic); the renew starts at t0+100; the wall clock steps +30 s at mono t0+101, when
+    # heavy-slot.py writes its record (wall t0+131: its gap is 131 s, so it demoted the lease), and is reverted before the exit at t0+105; collected
+    # at t0+130. No agent sample reads the step: the closed gap reads 105 s and the job is NOT demoted. That is a MISSED demotion, pinned here as the
+    # documented limit: the gap is an upper bound on heavy-slot.py's only for a wall step that an agent sample point observes.
+    if (Test-Case 'renew-gap-reverted-step-known-limit') {
+        $kb = Invoke-RcCase -QuerySec 30 -ExitAfterSec 5 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(100) -MonoAdvanceToWalk 100 -RecordWallStepSec 30 -RecordWallStepAtSec 1
+        $kbTxt = $kb | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($kb.ok -eq 1 -and [Math]::Abs([double]$kb.recordWalls[0] - 131) -lt 0.01 -and [Math]::Abs($kb.atMonoSec - 130) -lt 0.01) "renew-gap-reverted-step-known-limit: heavy-slot.py recorded the renew at wall t0+131 (its gap 131 s) and the agent collected it (ok) at t0+130: $kbTxt"
+        Assert-True ($kb.okMaxGapSec -ge 105 -and $kb.okMaxGapSec -le 106 -and $kb.gapSec -le 106 -and $null -eq $kb.stop) "renew-gap-reverted-step-known-limit (known limit A2, pinned): a wall step reverted between two agent samples is not seen: the gap reads 105 s and the job is not demoted, although heavy-slot.py's record gap was 131 s: $kbTxt"
+        Assert-True ($kb.okMaxGapSec -lt [double]$kb.recordWalls[0]) "renew-gap-reverted-step-known-limit: the pinned reading is an UNDER-read of heavy-slot.py's record gap ($($kb.okMaxGapSec) < $($kb.recordWalls[0])), the limit the PR names: $kbTxt"
+        $results.renewGapRevertedStepKnownLimit = $kb
+    }
+    # A2's neighbouring input, which base a7278cbd shares (two ticks, no walk, so it runs against base's agent with -AgentScript): last success t0;
+    # the renew starts at t0+60; the wall steps +70 s from t0+61 (heavy-slot.py records wall t0+131) to before the exit at t0+65; collected at t0+66.
+    # Base measures to the collection (66 s) and this head to the exit stamp (65 s): neither demotes, although heavy-slot.py's record gap is 131 s.
+    if ((Test-Case 'renew-gap-reverted-step-base-neighbour') -or (Test-Case 'renew-gap-reverted-step-known-limit')) {
+        $kn = Invoke-RcCase -QuerySec 0 -ExitAfterSec 5 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(60) -MonoAdvanceToWalk 60 -NoWalk -PreTickSec 6 -RecordWallStepSec 70 -RecordWallStepAtSec 1
+        $knTxt = $kn | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($kn.ok -eq 1 -and [Math]::Abs([double]$kn.recordWalls[0] - 131) -lt 0.01 -and [Math]::Abs($kn.atMonoSec - 66) -lt 0.01) "renew-gap-reverted-step-base-neighbour: heavy-slot.py recorded the renew at wall t0+131 and the agent collected it (ok) at t0+66: $knTxt"
+        Assert-True ($kn.okMaxGapSec -ge 65 -and $kn.okMaxGapSec -le 66.1 -and $null -eq $kn.stop) "renew-gap-reverted-step-base-neighbour (known limit A2, shared with base): the gap reads 65-66 s and the job is not demoted, although heavy-slot.py's record gap was 131 s: $knTxt"
+        $results.renewGapRevertedStepBaseNeighbour = $kn
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }
