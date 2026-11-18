@@ -267,23 +267,37 @@ $script:switchAttemptStart = [DateTime]::UtcNow
 $script:windowStart = [DateTime]::MinValue
 $script:windowEnd = [DateTime]::MinValue
 $script:selfTicks = 0
-function Set-Switch([string]$State, [int]$Count, [int]$Block) {
+$script:blockSec = 0.0
+$script:appliedBlock = -1
+$script:appliedState = ''
+$script:appliedCount = 1
+function New-SwitchText([string]$State, [int]$Count, [int]$Block) {
     $o = [ordered]@{
         schema = 'heavy-slot-ab.v1'; count = $Count; state = $State
         windowStartUtc = (Get-IsoUtc $script:windowStart); endUtc = (Get-IsoUtc $script:windowEnd)
         driverPid = $PID; driverStartTicks = $script:selfTicks; block = $Block; updatedUtc = (Get-IsoUtc ([DateTime]::UtcNow))
     }
+    return (($o | ConvertTo-Json -Compress) + "`n")
+}
+function Set-Switch([string]$State, [int]$Count, [int]$Block) {
     # A reader that has the file open without delete sharing makes one rewrite fail with "access denied" until it lets go. Retry against a
     # TIME budget (SwitchRetrySeconds, short jittered pauses) rather than a fixed attempt count: a busy or slow host (CI run 44251460414)
     # keeps the handle open longer than ~1 s, and a passing reader must never end a 24 h window. Only a reader that holds the file past
     # the whole budget fails the rewrite.
-    $text = ($o | ConvertTo-Json -Compress) + "`n"
+    # The block written is the block due at the moment of EACH attempt: a retry loop that outlasts a block edge must not land an obsolete
+    # block (a B written while an A is due would enable count 2 in the wrong arm); the caller reads back what was really applied through
+    # $script:appliedBlock / appliedState / appliedCount (adversary r5 A8).
     $lastError = $null
     $giveUp = [DateTime]::UtcNow.AddSeconds($SwitchRetrySeconds)
     $jitter = New-Object System.Random
     while ($true) {
+        if ($State -cne 'REVERTED' -and $Block -ge 0 -and $script:blockSec -gt 0) {
+            $dueNow = [int][Math]::Floor(([DateTime]::UtcNow - $script:windowStart).TotalSeconds / $script:blockSec)
+            if ($dueNow -gt $Block) { $Block = $dueNow; $State = if ($Block % 2 -eq 0) { 'A' } else { 'B' }; $Count = if ($State -ceq 'B') { 2 } else { 1 } }
+        }
+        $script:appliedBlock = $Block; $script:appliedState = $State; $script:appliedCount = $Count
         $script:switchAttemptStart = [DateTime]::UtcNow    # the start of the attempt that finally lands is the block's real start (adversary r4 A1)
-        try { Write-AtomicText $SwitchPath $text; return } catch { $lastError = $_ }
+        try { Write-AtomicText $SwitchPath (New-SwitchText $State $Count $Block); return } catch { $lastError = $_ }
         if ([DateTime]::UtcNow -ge $giveUp) { break }
         Start-Sleep -Milliseconds (10 + $jitter.Next(0, 30))
     }
@@ -312,6 +326,24 @@ $script:finalSweep = $false
 $script:heldUnreadable = 0
 $script:ledgerExisted = $false
 $script:receiptDirExisted = $false
+function Get-LedgerBaselineOffset {
+    # The ledger length at the baseline, moved back to just after the last newline: a record still being written at that instant starts
+    # before the offset and ends after it, so its tail would otherwise read as a complete line that does not parse (adversary r5 A4).
+    $bfs = [IO.File]::Open($script:ledgerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    try {
+        $len = $bfs.Length
+        $n = [int][Math]::Min($len, 65536)
+        if ($n -le 0) { return 0 }
+        $buf = New-Object byte[] $n
+        [void]$bfs.Seek($len - $n, [IO.SeekOrigin]::Begin)
+        $got = 0
+        while ($got -lt $n) { $rd = $bfs.Read($buf, $got, $n - $got); if ($rd -le 0) { break }; $got += $rd }
+        for ($bi = $got - 1; $bi -ge 0; $bi--) { if ($buf[$bi] -eq 10) { return ($len - $n + $bi + 1) } }
+        if ($n -eq $len) { return 0 }     # the whole file was scanned and holds no newline: it is one record still being written
+        return $len                        # no newline in the last 64 KB of a bigger file: stay at the end
+    }
+    finally { $bfs.Dispose() }
+}
 function Get-LedgerFinding {
     # The first ledger row since window start that is an `unguarded` event or an admit with class != shared / wholeMachine; $null if none.
     # FAIL CLOSED: a read that fails sets $script:ledgerFailed and leaves the offset where it was, so nothing is lost and the caller counts
@@ -347,7 +379,11 @@ function Get-LedgerFinding {
         $script:ledgerOffset += $utf8.GetByteCount($body)
         foreach ($line in $lines) {
             if (-not $line.Trim()) { continue }
-            try { $e = $line | ConvertFrom-Json } catch { continue }
+            # A COMPLETE (newline-terminated) line that does not parse is an unread event, and its offset is already past it: it can never be
+            # revisited, so it ends the window now rather than being skipped for a clean DONE (adversary r5 A4).
+            $e = $null
+            try { $e = $line | ConvertFrom-Json } catch { $e = $null }
+            if ($null -eq $e -or $e -isnot [pscustomobject]) { return ('ledger-unreadable (a complete ledger line does not parse: {0})' -f $line.Substring(0, [Math]::Min(60, $line.Length))) }
             $at = ConvertTo-UtcInstant $e.at
             if ($null -eq $at -or $at -lt $script:windowStart) { continue }
             if ([string]$e.event -eq 'unguarded') { return "unguarded ledger event ticket=$($e.ticket)" }
@@ -475,8 +511,15 @@ try {
         if ($null -eq $disk0 -or $disk0 -lt $MinFreeDiskGiB) { Write-Refused "low-disk free=${disk0}GiB" }
         # One directory holds ONE window: the three streams are append-only, so a directory that already holds one would blend two windows
         # into one evaluation (adversary r1 A1).
-        foreach ($leftover in 'ab-blocks.jsonl', 'ab-samples.jsonl', 'ab-receipt.json', 'ab-window.lock') {
-            if (Test-Path -LiteralPath (Join-Path $WindowDir $leftover)) { Write-Refused "window-dir-used ($leftover already exists in $WindowDir; give each window its own directory)" }
+        # The evidence the window is judged on must EXIST at the start: a HeavySlot with no ledger or no receipts directory yet has nothing
+        # to read, and "nothing found" about a source that was never there would let a window end DONE on no evidence (adversary r5 A3).
+        if (-not (Test-Path -LiteralPath (Join-Path $HeavySlotDir 'ledger.jsonl') -PathType Leaf)) { Write-Refused "ledger-missing (no ledger.jsonl in ${HeavySlotDir}: there is no evidence stream to read)" }
+        if (-not (Test-Path -LiteralPath (Join-Path $HeavySlotDir 'receipts') -PathType Container)) { Write-Refused "receipts-dir-missing (no receipts directory in ${HeavySlotDir}: there is no evidence stream to read)" }
+        # Every name this driver writes under the window dir, its temp name included, must be ABSENT (a dangling or live symlink counts):
+        # a planted ab-receipt.json.tmp -> CoreTempFeed would be followed by the receipt write (adversary r5 A2).
+        foreach ($leftover in 'ab-blocks.jsonl', 'ab-samples.jsonl', 'ab-receipt.json', 'ab-receipt.json.tmp', 'ab-window.lock') {
+            $lp = Join-Path $WindowDir $leftover
+            if ([IO.File]::Exists($lp) -or [IO.Directory]::Exists($lp) -or ($null -ne (Get-Item -LiteralPath $lp -Force -ErrorAction SilentlyContinue))) { Write-Refused "window-dir-used ($leftover already exists in $WindowDir; give each window its own directory)" }
         }
         # CLAIM the directory atomically (adversary r3 A2): the check above and the first write are not one step, so two drivers (distinct
         # switches, distinct mutex names) could both pass it. An exclusive CreateNew of ab-window.lock lets exactly one win; it is held for
@@ -495,7 +538,11 @@ try {
     # (adversary r2 A3; events older than the start are still filtered out by their own timestamp) ---------------------------------------
     $script:ledgerPath = Join-Path $HeavySlotDir 'ledger.jsonl'
     $script:ledgerExisted = [bool](Test-Path -LiteralPath $script:ledgerPath)
-    $script:ledgerOffset = if ($script:ledgerExisted) { (Get-Item -LiteralPath $script:ledgerPath).Length } else { 0 }
+    $script:ledgerOffset = 0
+    if ($script:ledgerExisted) {
+        # a ledger that cannot be opened for the baseline keeps the plain length: the polls then fail to read it and end the window (ledger-unreadable)
+        try { $script:ledgerOffset = Get-LedgerBaselineOffset } catch { $script:ledgerOffset = (Get-Item -LiteralPath $script:ledgerPath).Length }
+    }
     $script:receiptDir = Join-Path $HeavySlotDir 'receipts'
     $script:receiptDirExisted = [bool](Test-Path -LiteralPath $script:receiptDir -PathType Container)
     $script:knownReceipts = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -503,6 +550,7 @@ try {
     $script:windowStart = [DateTime]::UtcNow
     $script:windowEnd = $script:windowStart.AddHours($Hours)
     $blockLen = [TimeSpan]::FromMinutes($BlockMinutes)
+    $script:blockSec = $blockLen.TotalSeconds
     $blockState = ''
     $lastRowUtc = $script:windowStart
     $rowWin = New-Object System.Collections.Generic.List[object]
@@ -529,7 +577,8 @@ try {
             # driver that is descheduled after the write must not log a start later than the state a ticket actually read. The row also
             # carries switchWrittenUtc, the moment the write returned.
             Set-Switch $blockState $cnt $blockIndex
-            $startedAt = $script:switchAttemptStart    # taken just before the attempt that landed, not before a retry loop that may have run for seconds
+            $blockIndex = $script:appliedBlock; $blockState = $script:appliedState; $cnt = $script:appliedCount    # what the landing attempt really wrote
+            $startedAt = $script:switchAttemptStart   # taken just before the attempt that landed, not before a retry loop that may have run for seconds
             $writtenAt = [DateTime]::UtcNow
             $switchTouched = $true
             if ($PostSwitchDelaySeconds -gt 0) { Start-Sleep -Milliseconds ([int]($PostSwitchDelaySeconds * 1000)) }   # test seam: descheduled right after the write
@@ -549,11 +598,15 @@ try {
         # A feed row between two polls is only credited with 2+ holders when BOTH bracketing polls saw 2+: the holders are sampled, not
         # continuous, so a second holder seen at alternate polls is not sustained overlap (adversary r1 A7).
         $rowHolders = if ($null -eq $prevHolders) { $holders.Count } else { [Math]::Min([int]$prevHolders, $holders.Count) }
+        $regressedInRead = $false
         foreach ($r in $newRows) {
+            # $prevRowUtc / $lastRowUtc are the NEWEST row time seen so far, never the time of the last row read: a row older than that
+            # (a valid cool row at t+25 followed by a hot row at t) is a regression in the feed itself and must not replace the watermark
+            # or silently get dt=0 (adversary r5 A1).
+            if ($null -ne $prevRowUtc -and $r.utc -lt $prevRowUtc.AddSeconds(-2)) { $regressedInRead = $true }
             $dt = if ($null -ne $prevRowUtc) { [Math]::Min(6.0, [Math]::Max(0.0, ($r.utc - $prevRowUtc).TotalSeconds)) } else { 2.0 }
             $rowWin.Add([pscustomobject]@{ utc = $r.utc; dt = $dt; temp = $r.temp; holders = $rowHolders })
-            $prevRowUtc = $r.utc
-            $lastRowUtc = $r.utc
+            if ($null -eq $prevRowUtc -or $r.utc -gt $prevRowUtc) { $prevRowUtc = $r.utc; $lastRowUtc = $r.utc }
         }
         $prevHolders = $holders.Count
         $keepFrom = $now.AddSeconds(-[Math]::Max($CapWindowSeconds, $WarmWindowSeconds) - 5)
@@ -561,7 +614,7 @@ try {
         $newest = if ($rows.Count -gt 0) { $rows[-1] } else { $null }
         # The feed's own clock must not run backwards: a newest row older than the newest row already ingested means the host clock was
         # stepped back (or the feed was rewritten), and the watermark would then hide every correctly dated row (adversary r4 A7). End closed.
-        $clockBack = ($null -ne $newest -and $null -ne $prevRowUtc -and $newest.utc -lt $prevRowUtc.AddSeconds(-2))
+        $clockBack = ($regressedInRead -or ($null -ne $newest -and $null -ne $prevRowUtc -and $newest.utc -lt $prevRowUtc.AddSeconds(-2)))
         $feedAge = if ($newest) { [Math]::Max(0.0, ($now - $newest.utc).TotalSeconds) } else { [double]::PositiveInfinity }
         $mem = Get-MemoryProbe
         $disk = Get-DiskProbe
@@ -581,7 +634,7 @@ try {
         # ---- hard aborts -----------------------------------------------------------------------------------------------------
         $why = $null
         if (Test-Path -LiteralPath $stopFile) { $why = 'stop-file' }
-        if (-not $why -and $clockBack) { $why = ('feed-time-regressed the newest feed row ({0}) is older than one already read ({1}): the host clock stepped back or the feed was rewritten' -f (Get-IsoUtc $newest.utc), (Get-IsoUtc $prevRowUtc)) }
+        if (-not $why -and $clockBack) { $why = ('feed-time-regressed a feed row is older than one already read (newest row {0}, newest time seen {1}): the host clock stepped back or the feed was rewritten' -f $(if ($newest) { Get-IsoUtc $newest.utc } else { 'n/a' }), (Get-IsoUtc $prevRowUtc)) }
         if (-not $why) {
             $capFrom = $now.AddSeconds(-$CapWindowSeconds)
             $hot = ($rowWin.ToArray() | Where-Object { $_.utc -ge $capFrom -and $_.temp -ge $CapTempC } | Measure-Object -Property dt -Sum).Sum

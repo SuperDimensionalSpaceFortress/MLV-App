@@ -68,6 +68,15 @@ Import-Module -Force (Join-Path $PSScriptRoot 'HeavySlotAb.psm1')    # Resolve-H
 $inv = [Globalization.CultureInfo]::InvariantCulture
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 
+function Write-OutputFile([string]$Path, [string]$Text) {
+    # Every output is written to a fresh, unguessable temp name and MOVED over the target, never opened in place: a target that is a
+    # hard link or a symlink onto an input (ledger.jsonl) has its NAME replaced, so the input's bytes are never truncated through the
+    # alias, whatever the alias check could or could not see (adversary r5 A9: a hard link has no link target to resolve).
+    $tmp = '{0}.{1}.tmp' -f $Path, [Guid]::NewGuid().ToString('N')
+    [IO.File]::WriteAllText($tmp, $Text, $utf8)
+    [IO.File]::Move($tmp, $Path, $true)
+}
+
 function ConvertTo-UtcTime($v) {
     if ($null -eq $v -or "$v" -eq '') { return $null }
     if ($v -is [DateTime]) { return $v.ToUniversalTime() }
@@ -136,7 +145,7 @@ function Get-Stat([double[]]$Waits, [double[]]$Holds) {
 function Write-EarlyVerdict([string]$Verdict, [string]$Reason) {
     # A verdict that needs none of the analysis below (the directory cannot be read as ONE finished window).
     $o = [ordered]@{ schema = 'heavy-slot-ab-verdict.v1'; verdict = $Verdict; reason = $Reason; evaluatedUtc = $Now.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $inv) }
-    [IO.File]::WriteAllText((Join-Path $WindowDir 'ab-verdict.json'), (($o | ConvertTo-Json -Depth 4) + "`n"), $utf8)
+    Write-OutputFile (Join-Path $WindowDir 'ab-verdict.json') (($o | ConvertTo-Json -Depth 4) + "`n")
     Write-Output ("AB_VERDICT {0} reason={1}" -f $Verdict, $Reason)
     exit 0
 }
@@ -248,7 +257,16 @@ if (Test-Path -LiteralPath $rdir -PathType Container) {
             continue
         }
         $enq = ConvertTo-UtcTime $r.enqueuedAt
-        if ($null -eq $enq -or $enq -lt $winStart -or $enq -ge $winEnd) { continue }
+        if ($null -eq $enq) {
+            # A receipt with no usable enqueue time (an empty object, a string where a time belongs) cannot be placed in or out of the
+            # window: one last written at or after the window start MAY be a ticket of it, so it is unreadable evidence, not a skip (adversary r5 A6).
+            $lw2 = $null
+            try { $lw2 = (Get-Item -LiteralPath $f -ErrorAction Stop).LastWriteTimeUtc } catch { $lw2 = $null }
+            if ($null -eq $lw2 -or $lw2 -ge $winStart) { $receiptsUnreadable.Add([IO.Path]::GetFileName($f)) }
+            continue
+        }
+        if ($enq -lt $winStart -or $enq -ge $winEnd) { continue }
+        if (-not ([string]$r.ticket).Trim()) { $receiptsUnreadable.Add([IO.Path]::GetFileName($f)); continue }    # in the window and nameless: the ticket is unknown
         $tickets.Add([pscustomobject]@{
                 ticket = [string]$r.ticket; label = [string]$r.label; enq = $enq; adm = (ConvertTo-UtcTime $r.admittedAt); fin = (ConvertTo-UtcTime $r.finishedAt)
                 waitedMs = $r.waitedMs; hasExit = ($null -ne $r.exit); slotCount = $r.slotCount; slots = @($r.slots)
@@ -352,7 +370,7 @@ foreach ($h0 in $holds.ToArray()) {
             freq_mhz_p50 = (Get-Pct $freqs0 50); samples_in_hold = $pr.Count; nearest_sample = $nearest
         })
 }
-[IO.File]::WriteAllText((Join-Path $WindowDir 'ab-holds.jsonl'), ((@($holdRows.ToArray() | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`n") + "`n"), $utf8)
+Write-OutputFile (Join-Path $WindowDir 'ab-holds.jsonl') ((@($holdRows.ToArray() | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`n") + "`n")
 function Get-CohortStat($Rows) {
     $r = @($Rows)
     return [ordered]@{
@@ -377,6 +395,7 @@ foreach ($grp in 'A', 'B', 'all') {
 # ---- samples, split by live holders --------------------------------------------------------------------------------------------
 $groups = @{ '0' = New-Object System.Collections.Generic.List[object]; '1' = New-Object System.Collections.Generic.List[object]; '2' = New-Object System.Collections.Generic.List[object] }
 $allB = New-Object System.Collections.Generic.List[object]
+$statesUnknown = 0
 for ($i = 0; $i -lt $psamples.Count; $i++) {
     $s = $psamples[$i]
     $t = $s.t
@@ -388,7 +407,8 @@ for ($i = 0; $i -lt $psamples.Count; $i++) {
     $key = if ($h -ge 2) { '2' } elseif ($h -eq 1) { '1' } else { '0' }
     $row = [pscustomobject]@{ dt = [Math]::Max(0.0, $dt); temp = $s.temp; cpu = $s.cpu; freq = $s.freq; commit = $s.commit; state = $s.state }
     $groups[$key].Add($row)
-    if ($row.state -eq 'B') { $allB.Add($row) }
+    if ($row.state -ceq 'B') { $allB.Add($row) }
+    elseif ($row.state -cne 'A') { $statesUnknown++ }     # a sample with no usable block state may be a B one: never silently left out of the B minimum (adversary r5 A7)
 }
 function Get-Nums($rows, [string]$Prop) { return @($rows | Where-Object { $null -ne $_.$Prop } | ForEach-Object { [double]$_.$Prop }) }
 $sampleStats = [ordered]@{}
@@ -451,6 +471,13 @@ if ($driverReceipt -and [string]$driverReceipt.state -eq 'ABORTED') { $verdict =
 else {
     if (-not $driverReceipt) { $inconclusive.Add('no ab-receipt.json (the driver never finished)') }
     elseif ([string]$driverReceipt.state -ne 'DONE') { $inconclusive.Add("receipt state $($driverReceipt.state)") }
+    else {
+        # A DONE receipt is evidence only when it names THIS window and says when it ended: without windowStartUtc it cannot be bound to the
+        # blocks, without endedUtc the window end is a guess from the last sample (adversary r5 A5).
+        if ($null -eq (ConvertTo-UtcTime $driverReceipt.windowStartUtc)) { $inconclusive.Add('ab-receipt.json has no readable windowStartUtc, so it cannot be bound to this window') }
+        if ($null -eq (ConvertTo-UtcTime $driverReceipt.endedUtc)) { $inconclusive.Add('ab-receipt.json has no readable endedUtc, so the window end is unknown') }
+    }
+    if ($statesUnknown -gt 0) { $inconclusive.Add("$statesUnknown sample(s) have no usable block state (A or B), so the B minimum free commit and the arm split are unknown") }
     if ($A.overall.n_closed -lt $MinTicketsPerArm -or $B.overall.n_closed -lt $MinTicketsPerArm) { $inconclusive.Add("live closed tickets per arm A=$($A.overall.n_closed) B=$($B.overall.n_closed) (need $MinTicketsPerArm each)") }
     if ($A.build.n_closed -lt $MinBuildsPerArm -or $B.build.n_closed -lt $MinBuildsPerArm) { $inconclusive.Add("builds per arm A=$($A.build.n_closed) B=$($B.build.n_closed) (need $MinBuildsPerArm each)") }
     if ([double]$rawStats['2'].minutes -lt $MinHolders2Minutes) { $inconclusive.Add(("holders>=2 time {0:N3} min (need {1})" -f [double]$rawStats['2'].minutes, $MinHolders2Minutes)) }
@@ -501,6 +528,7 @@ $out = [ordered]@{
         samples_lines_unparseable = [int]$script:badLines['ab-samples.jsonl']
         samples_skipped = $samplesSkipped
         b_samples_without_free_commit = $bCommitUnknown
+        samples_without_block_state = $statesUnknown
     }
     arms = $armStats
     holds_by_holders = $holdsByHolders
@@ -509,15 +537,15 @@ $out = [ordered]@{
     min_free_commit_gb_in_b = $minCommitB
     checks = $checks.ToArray()
 }
-[IO.File]::WriteAllText((Join-Path $WindowDir 'ab-verdict.json'), (($out | ConvertTo-Json -Depth 8) + "`n"), $utf8)
+Write-OutputFile (Join-Path $WindowDir 'ab-verdict.json') (($out | ConvertTo-Json -Depth 8) + "`n")
 
 if (-not $SkipHeadroom) {
     $hh = if ($HostHeadroomScript) { $HostHeadroomScript } else { Join-Path $env:USERPROFILE '.claude\machine\host-headroom\Run-HostHeadroom.ps1' }
     try {
         $hs = @(& pwsh -NoProfile -File $hh -Mode Summary 2>&1 | ForEach-Object { "$_" })
-        [IO.File]::WriteAllText((Join-Path $WindowDir 'ab-headroom-summary.json'), (($hs -join "`n") + "`n"), $utf8)
+        Write-OutputFile (Join-Path $WindowDir 'ab-headroom-summary.json') (($hs -join "`n") + "`n")
     }
-    catch { [IO.File]::WriteAllText((Join-Path $WindowDir 'ab-headroom-summary.json'), ('{"error":"' + ($_.Exception.Message -replace '"', "'") + '"}' + "`n"), $utf8) }
+    catch { Write-OutputFile (Join-Path $WindowDir 'ab-headroom-summary.json') ('{"error":"' + ($_.Exception.Message -replace '"', "'") + '"}' + "`n") }
 }
 Write-Output ("AB_VERDICT {0} reason={1}" -f $verdict, $reason)
 exit 0
