@@ -250,7 +250,7 @@ class OutputShapeTests(unittest.TestCase):
 
     def test_header_states_the_true_refresh_cadence_not_a_check_caller(self) -> None:
         # No caller runs `--check`; the hub renders an untracked live copy hourly and a drift
-        # detector files a refresh card. The tracked header must say that, not claim a check.
+        # detector may file a refresh card. The tracked header must say that, not claim a check.
         text = render_roadmap.render(load_fixture())
         self.assertNotIn("The hub checks freshness with `--check`", text)
         self.assertIn("heartbeat/roadmap-live.md", text)
@@ -266,7 +266,11 @@ class OutputShapeTests(unittest.TestCase):
         # r4 (sol + opus blocker): the filing promise is conditional. The detector reads every table row's priority as an integer and throws on
         # anything else, so a render holding a row it cannot read (the capped owner summary row's "-" priority, an empty state, a boolean or
         # out-of-Int64 priority) is verdict=unknown and files nothing. The header must say so; "this file is" names the tracked file, not the live copy.
-        self.assertIn("a drift detector files a refresh card, or none if a row will not parse.", text)
+        self.assertIn("a drift detector may file a refresh card, or none if a row will not parse.", text)
+        # r5 (sol adversary A1, major): "files" promised a card, but the detector has more gates than the parse (it never files twice in 7 days,
+        # nor when a card for the day exists, nor while its state or the ledger is unreadable). The header says "may", never an unconditional "files".
+        self.assertNotIn("detector files", text)
+        self.assertIn("If they differ, `card-queue.json`\nwins", text)
         self.assertIn("When this file is\n7 or more days old and its open cards", text)
 
     def test_the_header_condition_matches_a_render_the_detector_cannot_read(self) -> None:

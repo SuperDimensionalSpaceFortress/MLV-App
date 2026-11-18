@@ -91,18 +91,19 @@ TOKEN_TRAILING_PUNCT = ".,;:)]}'\""
 # the open table (whitespace-normalised). Not the parked notes, not state or kind, not the generated stamp or the Drain section (r3 sol D-06).
 # It also reads every table row's priority as an integer and throws on anything else, which files nothing (verdict=unknown): the capped owner
 # summary row ("-" priority, the "... and N more" row emitted near line 474), an empty state, a boolean or out-of-Int64 priority. The header says "or none if a row will not
-# parse" for that (r4 sol + opus blocker). The parse mismatch itself is the detector's, board-local and outside this PR (OPEN, see the PR comment).
+# parse" for that (r4 sol + opus blocker). Even a readable drift files only when no card was filed in the last 7 days, none exists for the
+# day, and its state file and the ledger read: so the header says "may file", never "files" (r5 sol adversary A1). The parse mismatch itself is the detector's, board-local and outside this PR (OPEN, see the PR comment).
 HEADER = """\
 # MLV-App product roadmap
 
 Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`.
 That file sits under `.claude-state/hub-autopilot/`,
 gitignored, absent from hosted checkouts, so this is the only place a reviewer
-without local state sees the open backlog. Where they differ, `card-queue.json`
+without local state sees the open backlog. If they differ, `card-queue.json`
 wins: re-render, do not edit by hand. The hub renders a copy to
 `.claude-state/heartbeat/roadmap-live.md` every hour. When this file is
 7 or more days old and its open cards, priorities or pre-table note words differ from the queue,
-a drift detector files a refresh card, or none if a row will not parse. `--check` is manual; no CI runs it.
+a drift detector may file a refresh card, or none if a row will not parse. `--check` is manual; no CI runs it.
 
 Only rows with `kind` of `product` or `playback` are shown, plus owner asks
 (`origin` = `owner`) of any kind. Hub-tooling, factory, hygiene and ci-flake cards are
