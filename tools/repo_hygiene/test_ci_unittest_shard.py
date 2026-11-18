@@ -1424,6 +1424,8 @@ class ShardExitCodeTests(unittest.TestCase):
                 )
             except OSError as error:
                 raised = error
+        for kept in re.findall(r"kept at (.+)$", err.getvalue(), re.MULTILINE):  # a worker that could not be ended keeps its dir
+            self.addCleanup(shutil.rmtree, kept, True)
         return code, err.getvalue(), raised
 
     def test_a_failed_kill_does_not_leave_later_workers_running_after_a_launch_error(self) -> None:
@@ -1456,6 +1458,18 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(procs[1].returncode, -9, "worker 2 was never killed after worker 1's kill raised")
         self.assertEqual(code, 1)
         self.assertEqual(err.count("worker 1/2 could not be terminated"), 1, err)
+
+    # r10 adversary pass 16 A1: a worker the parent could not end may still write its log, so the work dir is kept
+    # (and its path reported) rather than deleted from under it.
+    def test_a_worker_that_could_not_be_ended_keeps_its_log_dir_and_reports_it(self) -> None:
+        procs = [self._RunningProc(PermissionError("denied")), self._RunningProc()]
+        code, err, raised = self._run_with_fake_workers(procs, launch_error_after=2)
+        kept = re.search(r"kept at (.+)$", err, re.MULTILINE)
+        if kept:
+            self.addCleanup(shutil.rmtree, kept[1], True)
+        self.assertIsNotNone(raised)
+        self.assertIsNotNone(kept, "a log dir under a worker that was still running was deleted without a word: " + err)
+        self.assertTrue(Path(kept[1], "w1").is_dir(), "the kept path does not hold the worker's log dir")
 
     def test_a_failed_kill_in_the_watchdog_does_not_skip_the_later_workers(self) -> None:
         killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)

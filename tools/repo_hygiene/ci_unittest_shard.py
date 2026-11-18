@@ -1255,7 +1255,12 @@ def run_parallel(
         killer.stop()
         report_unended()
         watch.stop()
-        if not unread:  # a log that could not be read is evidence nobody has seen: it is never deleted
+        if stuck and not unread:  # a worker still running can write to its log after this: say where it stays
+            problems.append(
+                "worker(s) " + ", ".join(str(number) for number in sorted(stuck))
+                + f" could not be ended and may still write to their logs; kept at {work}"
+            )
+        if not unread and not stuck:  # unseen output (unread log, live worker) is evidence: never deleted
             shutil.rmtree(work, ignore_errors=True)
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             for problem in problems:
