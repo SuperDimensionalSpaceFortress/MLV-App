@@ -376,10 +376,16 @@ try {
     $manifest.deleted = $(try { Remove-ExportOutput } catch { Write-JobTrace "export output delete error=$([string]$_.CategoryInfo.Reason)"; $false })   # a locked survivor makes this false, never a missing terminal
     try { if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $batchLog -Destination (Join-Path $Pub 'batch.log')) } } catch { Write-JobTrace "step export batch.log publish error=$([string]$_.CategoryInfo.Reason)" }
     try { if (Test-Path -LiteralPath $stageEvidence -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $stageEvidence -Destination (Join-Path $Pub ([IO.Path]::GetFileName($stageEvidence)))) } } catch { Write-JobTrace "step export stage record publish error=$([string]$_.CategoryInfo.Reason)" }
-    Save-Json $manifest (Join-Path $Pub 'output-manifest.json')
-    Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
-                                   framesExported = $exported; outputCount = $outputs.Count; outputsDeleted = $manifest.deleted; ffmpegPresent = $ffmpegPresent
-                                   executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord; mlvappEnvScrubbed = @($mlvappEnvScrubbed) }
+    # (adversary r13 A3: after an unconfirmed kill a survivor may hold output-manifest.json or summary.json without sharing, so an unguarded write threw through the finally and
+    # cost RESULT=EXPORT_KILL_UNCONFIRMED and exit 48. On that terminal the two records are best effort: the failure is traced, the typed RESULT line and the exit code still go out.
+    # Any other terminal keeps the write fatal: a run that cannot publish its summary must not report a result it did not record.)
+    $evidenceBestEffort = ($timedOut -and -not $killConfirmed)
+    try { Save-Json $manifest (Join-Path $Pub 'output-manifest.json') } catch { if (-not $evidenceBestEffort) { throw }; Write-JobTrace "step export manifest write error=$([string]$_.CategoryInfo.Reason)" }
+    try {
+        Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
+                                       framesExported = $exported; outputCount = $outputs.Count; outputsDeleted = $manifest.deleted; ffmpegPresent = $ffmpegPresent
+                                       executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord; mlvappEnvScrubbed = @($mlvappEnvScrubbed) }
+    } catch { if (-not $evidenceBestEffort) { throw }; Write-JobTrace "step export summary write error=$([string]$_.CategoryInfo.Reason)" }
     Write-Output "RESULT=$result FRAMES=$exported ARTIFACTS=$Pub"
     exit $exitFor[$result]
 } finally {

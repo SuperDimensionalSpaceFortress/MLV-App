@@ -789,6 +789,46 @@ class ExportEvidenceTests(unittest.TestCase):
                 self.assertFalse(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[i]["problems"]), got[i])
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
 
+    def test_r13_adversary_a1_disjoint_render_work_is_held_inside_the_nearest_published_ancestor(self) -> None:
+        """adversary r13 A1: with raw_uint16 unpublished, llrawproc 30 + disk_read 25 + decompress 10 (65 ms of disjoint work) inside a 40 ms debayered_frame read PASS, because the sum
+        groups needed raw_uint16 beside llrawproc. The leaves are held together inside the nearest ancestor that IS published; a run that omits debayered_frame too is held inside the denominator."""
+        def log(rows: tuple) -> str:
+            return "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(480) for s, ms in rows)
+        criteria = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
+
+        def case(rows: tuple) -> dict:
+            return prores_case(maxFrames=480, stage=log(rows), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
+        no_raw = (("processed16_total", 56.0), ("debayered_frame", 40.0), ("processing", 16.0), ("raw_uint16_disk_read", 25.0), ("raw_uint16_decompress", 10.0), ("llrawproc", 30.0))
+        no_debayer = (("processed16_total", 56.0), ("processing", 16.0), ("raw_uint16", 40.0), ("llrawproc", 30.0))
+        ok = (("processed16_total", 56.0), ("debayered_frame", 40.0), ("processing", 16.0), ("raw_uint16_disk_read", 5.0), ("raw_uint16_decompress", 5.0), ("llrawproc", 10.0))
+        proc, got = evidence_cases([case(no_raw), case(no_debayer), case(ok)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in (0, 1):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
+
+    def test_r13_adversary_a2_cdng_disjoint_producer_work_is_held_inside_producer_frame_without_the_llrawproc_total(self) -> None:
+        """adversary r13 A2: llrawproc_ms is an optional total. Without it raw_read 20 + dark_frame 30 + dual_iso 30 (80 ms of disjoint work) inside a 50 ms producer_frame read PASS,
+        because the producer partition counts the total once and so had one member short of two. The partition with the total replaced by its own children is held too."""
+        def profile(set_rows: dict) -> str:
+            doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+            for r in doc["frames"]:
+                for k in CDNG_STAGES:
+                    if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                        r[k] = 0.0
+                r.pop("llrawproc_ms", None)
+                r.update(set_rows)
+            return json.dumps(doc)
+        over = profile({"producer_frame_ms": 50.0, "raw_read_ms": 20.0, "llrawproc_dark_frame_ms": 30.0, "llrawproc_dual_iso_ms": 30.0})
+        control = profile({"producer_frame_ms": 50.0, "raw_read_ms": 10.0, "llrawproc_dark_frame_ms": 10.0, "llrawproc_dual_iso_ms": 10.0})
+        proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in (over, control)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and "inside producer_frame mean" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["outcome"], "PASS", got[1])
+
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string
         passed the shape and threw at the generator's double cast after a lease was spent."""
@@ -1287,6 +1327,17 @@ class ExportJobGeneratorTests(unittest.TestCase):
         self.assertNotIn("$stagePresent = (Test-Path -LiteralPath $stageEvidence -PathType Leaf) -and ((Get-Item -LiteralPath $stageEvidence).Length -gt 0)", text)
         self.assertRegex(text, r"\$stagePresent = try \{ \(Test-Path -LiteralPath \$stageEvidence -PathType Leaf\) -and \(\(Get-Item -LiteralPath \$stageEvidence -ErrorAction Stop\)\.Length -gt 0\) \} catch \{")
         self.assertLess(text.index("$stagePresent = try {"), text.index("$result = $(if ($timedOut -and -not $killConfirmed)"), "the read is settled before the result is typed")
+
+    def test_r13_adversary_a3_the_evidence_writes_cannot_cost_the_typed_kill_terminal(self) -> None:
+        """adversary r13 A3: after an unconfirmed kill a survivor may hold output-manifest.json or summary.json without sharing; the unguarded Save-Json / Write-ExportSummary threw through
+        the finally before RESULT=EXPORT_KILL_UNCONFIRMED and exit 48. On that terminal both writes are best effort; on every other terminal they stay fatal."""
+        text = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("$evidenceBestEffort = ($timedOut -and -not $killConfirmed)", text)
+        self.assertRegex(text, r"try \{ Save-Json \$manifest \(Join-Path \$Pub 'output-manifest\.json'\) \} catch \{ if \(-not \$evidenceBestEffort\) \{ throw \}")
+        self.assertRegex(text, r"\} catch \{ if \(-not \$evidenceBestEffort\) \{ throw \}; Write-JobTrace \"step export summary write error=")
+        tail = text[text.index("$evidenceBestEffort = "):]
+        self.assertLess(tail.index("Write-ExportSummary $result"), tail.index('Write-Output "RESULT=$result'), "the summary write is settled before the RESULT line")
+        self.assertNotRegex(text, r"(?m)^    Save-Json \$manifest \(Join-Path \$Pub 'output-manifest\.json'\)\s*$")
 
     def test_every_schema_valid_quiescence_threshold_binds(self) -> None:
         """adversary r1 A5: the schema admits any threshold in (0, 100]; the generator binds each one (0.05 was refused by ValidateRange(0.1, 100))."""
