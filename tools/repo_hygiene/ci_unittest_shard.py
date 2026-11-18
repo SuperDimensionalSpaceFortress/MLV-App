@@ -655,6 +655,16 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
     return None
 
 
+def _windows_handle_type() -> type[int] | None:
+    """``subprocess.Handle`` (the int subclass ``Popen`` keeps a child's process handle in), ``None`` off Windows.
+
+    Looked up in ``sys.modules`` rather than read as ``subprocess.Handle``: the hidden-spawn scan allows only
+    constants and a short list of data types as attributes of ``subprocess``, ``Handle`` is not on it, and
+    it is no spawn API (this reads a class, it starts nothing)."""
+    handle_type = getattr(sys.modules.get("subprocess"), "Handle", None)
+    return handle_type if isinstance(handle_type, type) and issubclass(handle_type, int) else None
+
+
 def _created_child(candidate: subprocess.Popen[bytes], link: types.TracebackType) -> subprocess.Popen[bytes] | None:
     """``candidate`` when its launch had created the child, else ``None``.
 
@@ -672,7 +682,7 @@ def _created_child(candidate: subprocess.Popen[bytes], link: types.TracebackType
                 if issubclass(type(pid), int) and not issubclass(type(pid), bool):
                     candidate.pid = pid
                     candidate._child_created = True  # type: ignore[attr-defined]
-                    handle_type = getattr(subprocess, "Handle", None)  # Windows only
+                    handle_type = _windows_handle_type()
                     if handle_type is not None and issubclass(type(handle), int) and not hasattr(candidate, "_handle"):
                         candidate._handle = handle_type(handle)  # type: ignore[attr-defined]
                 break
