@@ -4611,10 +4611,11 @@ function Get-DvExportCdngDisjointGroups {
     $groups = [System.Collections.Generic.List[object]]::new()
     $parents = [System.Collections.Generic.List[string]]::new()
     foreach ($n in $names) { $p = [string]$rows[$n].parent; if ($p -and -not $parents.Contains($p)) { $parents.Add($p) } }
-    # (pass17 A1: a row that accumulates sibling timers (contains) is a parent of those rows too, for the groups; the pairs are Get-DvExportCdngContainedPairs)
-    foreach ($n in $names) { if ($rows[$n].Contains('contains') -and @($rows[$n].contains).Count -and -not $parents.Contains($n)) { $parents.Add($n) } }
+    # (pass17 A1, pass18 A1: a row that CONTAINS sibling timers (Get-DvExportCdngContains) is a parent of those rows too, for the groups; the pairs are Get-DvExportCdngContainedPairs)
+    $contains = Get-DvExportCdngContains -Table $Table
+    foreach ($n in $names) { if ($contains.ContainsKey($n) -and -not $parents.Contains($n)) { $parents.Add($n) } }
     foreach ($parent in $parents) {
-        $desc = [string[]]@($(if ($rows.ContainsKey($parent) -and $rows[$parent].Contains('contains')) { @($rows[$parent].contains) }
+        $desc = [string[]]@($(if ($contains.ContainsKey($parent)) { @($contains[$parent]) }
                               else { @(foreach ($n in $names) { if ($chain[$n].IndexOf($parent) -gt 0) { $n } }) }))
         $nbr = @{}
         foreach ($v in $desc) { $s = [System.Collections.Generic.HashSet[string]]::new(); foreach ($w in $desc) { if ($w -cne $v -and -not $overlap["$v|$w"]) { [void]$s.Add($w) } }; $nbr[$v] = $s }
@@ -4665,13 +4666,33 @@ function Get-DvExportSiblingsMeet {
     }
     Get-DvExportWindowsMeet -A @($Rows[$First].windows) -B @($Rows[$Second].windows)
 }
-$script:ExportCdngSumGroups = Get-DvExportCdngDisjointGroups
+function Get-DvExportCdngContains {
+    # name -> the sibling rows it CONTAINS: the explicit contains column (a timer that accumulates others, pass17 A1), and, for a remainderOf row, every sibling that accrues on no line of a
+    # remainderOf window (pass18 A1: llrawproc_other = total - the seven timed children, so the refine and publish lock times, which lie outside every child window, are inside it).
+    param($Table = $script:ExportCdngStageWindowTable)
+    $out = @{}
+    foreach ($row in $Table) {
+        $set = [System.Collections.Generic.List[string]]::new()
+        if ($row.Contains('contains')) { foreach ($m in @($row.contains)) { if (-not $set.Contains([string]$m)) { $set.Add([string]$m) } } }
+        if ($row.Contains('remainderOf') -and @($row.remainderOf).Count) {
+            $covered = [string[]]@(foreach ($s in $row.remainderOf) { foreach ($r2 in $Table) { if ([string]$r2.name -ceq [string]$s) { @($r2.windows) } } })
+            foreach ($sib in $Table) {
+                if ([string]$sib.parent -cne [string]$row.parent -or [string]$sib.name -ceq [string]$row.name -or @($row.remainderOf) -ccontains [string]$sib.name -or @($sib.windows).Count -eq 0) { continue }
+                if (-not (Get-DvExportWindowsMeet -A @($sib.windows) -B $covered) -and -not $set.Contains([string]$sib.name)) { $set.Add([string]$sib.name) }
+            }
+        }
+        if ($set.Count) { $out[[string]$row.name] = [string[]]$set.ToArray() }
+    }
+    $out
+}
 
 function Get-DvExportCdngContainedPairs {
-    # (adversary pass17 A1) child -> container pairs for each row a table row accumulates (contains): refine 10 + publish 10 beside a 0 ms shared_lock read PASS.
+    # (adversary pass17 A1, pass18 A1) child -> container pairs for each row another row contains: refine 10 + publish 10 beside a 0 ms shared_lock, or a 0 ms llrawproc_other, read PASS.
     param($Table = $script:ExportCdngStageWindowTable)
-    , [object[]]@(foreach ($row in $Table) { if ($row.Contains('contains')) { foreach ($m in @($row.contains)) { , [string[]]@([string]$m, [string]$row.name) } } })
+    $contains = Get-DvExportCdngContains -Table $Table
+    , [object[]]@(foreach ($row in $Table) { $n = [string]$row.name; if ($contains.ContainsKey($n)) { foreach ($m in $contains[$n]) { , [string[]]@([string]$m, $n) } } })
 }
+$script:ExportCdngSumGroups = Get-DvExportCdngDisjointGroups   # (after every function it calls is defined)
 $script:ExportCdngContainedPairs = Get-DvExportCdngContainedPairs
 
 # r8 fix 3 (adversary pass 10 A2): DISJOINT siblings together are inside their parent too: each below its parent is no proof that the pair is (10 + 10 ms inside a 10 ms parent).
