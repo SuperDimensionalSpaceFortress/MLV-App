@@ -1199,7 +1199,8 @@ try {
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
         'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up',
         'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst',
-        'renew-exit-stamp-late-known-limit', 'renew-gap-reverted-step-known-limit', 'renew-gap-reverted-step-base-neighbour')
+        'renew-exit-stamp-late-known-limit', 'renew-gap-reverted-step-known-limit', 'renew-gap-reverted-step-base-neighbour',
+        'renew-call-start-before-process-start')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -5592,7 +5593,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 if ($null -eq $f) { return [DateTime]::Now }
                 $v = $null
                 try { $v = $f.GetFrameVariables()['p'] } catch { }
-                if ($null -ne $v -and $v.Value -is [System.Diagnostics.Process]) { try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id); try { $script:PsSeamStart[[int]$v.Value.Id] = Get-ProcessStartUtcTicks $v.Value } catch { } } } catch { } }
+                # BACHELOR-LEASE-RENEW-MARGIN-1 r4 (pass 6 A3): the seam fires only AFTER Process.Start (once $p is the started child): a reading
+                # taken before the start (Start-HeavySlotCli's call start, since r4) is not the post-start failure this case injects.
+                if ($null -eq $v -or $v.Value -isnot [System.Diagnostics.Process]) { return [DateTime]::Now }
+                try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id); try { $script:PsSeamStart[[int]$v.Value.Id] = Get-ProcessStartUtcTicks $v.Value } catch { } } } catch { }
                 'not-a-date'
             }
             $WarningPreference = 'Stop'
@@ -5984,7 +5988,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rs.ok -eq 1 -and $rs.okMaxGapSec -ge 43 -and $rs.okMaxGapSec -le 45 -and $rs.gapSec -ge 105 -and $null -eq $rs.stop) "renew-collect-after-slow-slice: a wall step after the exit leaves the stamped 43 s gap, the open gap reads the step (>= 105 s), not demoted: $rsTxt2"
         # The fake Start-HeavySlotCli above stands in for the real one; the real one must carry the same monotonic start reading and exit stamp.
         $hsBody = Get-FunctionBody 'Start-HeavySlotCli'
-        Assert-True ($hsBody.Contains('startedMono = (Get-AgentMonotonicSec)') -and $hsBody.Contains('exitStamp = (New-RenewExitStamp -Process $p)')) "renew-collect-after-slow-slice: the real Start-HeavySlotCli records startedMono and an exit stamp beside started"
+        # r4 (pass 6 A3, a forced companion of the fix): the call start is now read into $startedWall/$startedMono BEFORE Process.Start, and the
+        # pin checks that order too (renew-call-start-before-process-start drives the real function).
+        $hsStartAt = $hsBody.IndexOf('[System.Diagnostics.Process]::Start(')
+        Assert-True ($hsStartAt -gt 0 -and $hsBody.IndexOf('$startedWall = Get-Date') -ge 0 -and $hsBody.IndexOf('$startedWall = Get-Date') -lt $hsStartAt -and $hsBody.IndexOf('$startedMono = Get-AgentMonotonicSec') -ge 0 -and $hsBody.IndexOf('$startedMono = Get-AgentMonotonicSec') -lt $hsStartAt -and $hsBody.Contains('started = $startedWall; startedMono = $startedMono') -and $hsBody.Contains('exitStamp = (New-RenewExitStamp -Process $p)')) "renew-collect-after-slow-slice: the real Start-HeavySlotCli records started and startedMono (read before Process.Start) and an exit stamp"
         $results.renewCollectAfterSlowSlice = [ordered]@{ noStep = $rc; wallStepAfterExit = $rs }
     }
     if (Test-Case 'renew-stale-still-demotes') {
@@ -6063,6 +6070,51 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($kn.ok -eq 1 -and [Math]::Abs([double]$kn.recordWalls[0] - 131) -lt 0.01 -and [Math]::Abs($kn.atMonoSec - 66) -lt 0.01) "renew-gap-reverted-step-base-neighbour: heavy-slot.py recorded the renew at wall t0+131 and the agent collected it (ok) at t0+66: $knTxt"
         Assert-True ($kn.okMaxGapSec -ge 65 -and $kn.okMaxGapSec -le 66.1 -and $null -eq $kn.stop) "renew-gap-reverted-step-base-neighbour (known limit A2, shared with base): the gap reads 65-66 s and the job is not demoted, although heavy-slot.py's record gap was 131 s: $knTxt"
         $results.renewGapRevertedStepBaseNeighbour = $kn
+    }
+    # r4 (adversary pass 6 A3, introduced major): a renew call's start must be read BEFORE Process.Start. Read after it, a parent descheduled
+    # between the start and the reading anchors the next gap after the child's renew record (child starts 0, records and exits 3, parent reads
+    # its start and stamps at 20: the open gap is then measured from 20, not 3, and read 105 s at t125 where heavy-slot.py's was 122 s).
+    # Driven on the REAL Start-HeavySlotCli and the fake heavy-slot.py: every Get-Date and Get-AgentMonotonicSec reading inside it returns a
+    # distinct value and records whether the child already existed ($p a started Process); the call's started and startedMono must be readings
+    # taken before the child existed. RED on 732b9190 and c4c347f1: both are post-start readings.
+    if (Test-Case 'renew-call-start-before-process-start') {
+        Reset-Case @{ request = 'active' }
+        Sync-FakeStatus
+        $script:CsReads = [System.Collections.Generic.List[object]]::new()
+        $csCall = & {
+            $script:CsN = 0
+            function Test-CsAfterStart {
+                $f = @(Get-PSCallStack | Where-Object { $_.Command -eq 'Start-HeavySlotCli' }) | Select-Object -First 1
+                if ($null -eq $f) { return $null }
+                $v = $null
+                try { $v = $f.GetFrameVariables()['p'] } catch { }
+                return ($null -ne $v -and $v.Value -is [System.Diagnostics.Process])
+            }
+            function Get-Date {
+                $script:CsN++
+                $val = [datetime]::new(2026, 11, 18, 3, 0, 0, [DateTimeKind]::Local).AddSeconds($script:CsN)
+                $script:CsReads.Add([pscustomobject]@{ clock = 'wall'; value = $val; afterStart = (Test-CsAfterStart) })
+                return $val
+            }
+            function Get-AgentMonotonicSec {
+                $script:CsN++
+                $val = 5000.0 + $script:CsN
+                $script:CsReads.Add([pscustomobject]@{ clock = 'mono'; value = $val; afterStart = (Test-CsAfterStart) })
+                return $val
+            }
+            Start-HeavySlotCli -Arguments @('status', '--slots', '2')
+        }
+        $csDone = $null
+        try {
+            Assert-True ($null -ne $csCall -and $csCall.ok -eq $true -and $null -ne $csCall.proc) "renew-call-start-before-process-start: the real Start-HeavySlotCli started the fake heavy-slot.py: ok=$($csCall.ok) why=[$($csCall.why)]"
+            $csWall = @($script:CsReads | Where-Object { $_.clock -ceq 'wall' -and $_.value -eq $csCall.started })
+            $csMono = @($script:CsReads | Where-Object { $_.clock -ceq 'mono' -and [double]$_.value -eq [double]$csCall.startedMono })
+            $csTxt = ($script:CsReads | ForEach-Object { "$($_.clock)=$($_.value.ToString()) afterStart=$($_.afterStart)" }) -join '; '
+            Assert-True ($csWall.Count -eq 1 -and $csWall[0].afterStart -eq $false) "renew-call-start-before-process-start: the call's started is a wall reading taken BEFORE Process.Start (never after it, where a descheduled parent reads it late): started=$($csCall.started) reads=[$csTxt]"
+            Assert-True ($csMono.Count -eq 1 -and $csMono[0].afterStart -eq $false) "renew-call-start-before-process-start: the call's startedMono is a monotonic reading taken BEFORE Process.Start: startedMono=$($csCall.startedMono) reads=[$csTxt]"
+        }
+        finally { if ($null -ne $csCall -and $csCall.ok) { $csDone = Complete-HeavySlotCli -Call $csCall -TimeoutSec 10 } }
+        $results.renewCallStartBeforeProcessStart = [ordered]@{ reads = @($script:CsReads | ForEach-Object { [ordered]@{ clock = $_.clock; afterStart = $_.afterStart } }); collected = $(if ($null -ne $csDone) { $csDone.done } else { $null }) }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

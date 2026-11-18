@@ -3447,7 +3447,8 @@ function ConvertFrom-QuietLeaseActiveLine {
 function Start-HeavySlotCli {
     # One short heavy-slot.py call (lease renew / release), started windowless with this agent's HEAVY_SLOT_DIR and
     # HEAVY_SLOT_FEED and WITHOUT HEAVY_SLOT_HELD (a lease call is never nested). Nothing waits here: Complete-HeavySlotCli
-    # waits with a bound, Receive-HeavySlotCli collects a call that has exited. Returns @{ ok; proc; out; err; started; why }.
+    # waits with a bound, Receive-HeavySlotCli collects a call that has exited. Returns @{ ok; proc; out; err; started; startedMono;
+    # startedAfter; exitStamp; why } (started and startedMono are read before the start, r4).
     # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (sol r4 S2): -Python/-Script are paths the caller has already checked (the slot snapshot's local-disk
     # rule). They are started as given and never re-resolved: a checked python that is gone now is ok=$false, never a PATH search.
     param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$Python = "", [string]$Script = "")
@@ -3462,6 +3463,12 @@ function Start-HeavySlotCli {
     $scr = if ($Script) { $Script } else { $HeavySlotScript }
     if (-not (Test-Path -LiteralPath $scr -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "heavy-slot.py not found ($scr)" } }
     $p = $null
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r4 (adversary pass 6 A3): the call's start (started, startedMono) is read BEFORE Process.Start, so it is
+    # never later than the child's start, and so never later than any renew record the child writes. Read after the start (r2), a parent
+    # descheduled between the two read it late: the next gap was anchored after heavy-slot.py's record and under-read its gap. startedAfter is
+    # the old post-start reading, kept only as evidence of the start latency; no gap is measured from it.
+    $startedWall = Get-Date
+    $startedMono = Get-AgentMonotonicSec
     try {
         $si = [System.Diagnostics.ProcessStartInfo]::new()
         $si.FileName = $py
@@ -3476,7 +3483,7 @@ function Start-HeavySlotCli {
         $p = [System.Diagnostics.Process]::Start($si)
         # BACHELOR-LEASE-RENEW-MARGIN-1 r2: startedMono (a Get-AgentMonotonicSec reading) beside started, and exitStamp (New-RenewExitStamp: the
         # call's exit stamped in-process; $null when unavailable), which Get-QuietLeaseRenewOkAt uses to end a successful renew's gap at its exit.
-        return [pscustomobject]@{ ok = $true; proc = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync(); started = (Get-Date); startedMono = (Get-AgentMonotonicSec); exitStamp = (New-RenewExitStamp -Process $p); why = $null }
+        return [pscustomobject]@{ ok = $true; proc = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync(); started = $startedWall; startedMono = $startedMono; startedAfter = (Get-Date); exitStamp = (New-RenewExitStamp -Process $p); why = $null }
     }
     catch {
         $msg = "heavy-slot.py $($Arguments -join ' ') failed to start: $($_.Exception.Message)"
@@ -3657,6 +3664,9 @@ function Update-QuietLeaseRequest {
             if ($null -ne $a) {
                 $Lease.ownerCheck = Test-QuietLeaseOwnerPid -Lease $Lease -OwnerPid $a.ownerPid
                 $Lease.active = $a
+                # r4 NON-PROMISE (adversary pass 6 A3's sibling, OPEN): activeAt is when the agent READ the active line, which can be later than
+                # heavy-slot.py's activation record (a slow monitor step, a descheduled agent). Unlike a renew call's start, no in-process reading
+                # bounds the record from below (the line is printed after it). Same as base; card BACHELOR-LEASE-RENEW-RECORD-TIME-1.
                 $Lease.activeAt = Get-Date
                 $Lease.lastRenewStart = $Lease.activeAt
                 $mono = Get-AgentMonotonicSec
