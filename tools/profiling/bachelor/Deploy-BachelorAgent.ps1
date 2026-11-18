@@ -68,6 +68,10 @@
 #   deadline; an unreadable one, for example another user's process without elevation, is a refusal) is held to the same rule, so a
 #   task definition edited after the instance started cannot bind while the live agent serves another root. The replacement that
 #   /Run starts is held to it too, and must have STARTED at or after /Run (no tolerance: the old agent never counts as new).
+#   The heartbeat pid must also BE the task's running instance: the Task Scheduler is asked (IRunningTask.EnginePID, the pid of the
+#   Exec action's process) and must name exactly one instance, that pid; a process that only writes a matching heartbeat is not what
+#   `schtasks /End` stops. The replacement must be the task's new instance by the same test. Idle is judged once more AFTER all of
+#   this binding and immediately before the End, because the binding's reads can each take up to a deadline. -TaskPidsFile is the seam.
 #   A path with no drive (/bench, \bench) never names a place on Windows: it resolves against another process's current drive.
 #   The root itself must also list (a root whose listing is denied is DEPLOY_REFUSED_UNREADABLE, even for a no-op).
 #   The idle gate keeps the End from stranding a lease: with running\, inbox\ and slot-holders\ empty, nothing is lost.
@@ -101,6 +105,7 @@ param(
     [string]$RestartScript = '',
     [string]$TaskName = '\MlvAgentBachelor',
     [string]$TaskXmlFile = '',
+    [string]$TaskPidsFile = '',
     [switch]$TestCorruptAfterWrite
 )
 
@@ -162,9 +167,10 @@ function Invoke-Bounded {
     $rs.SessionStateProxy.SetVariable('VenueRoot', $VenueRoot)
     $rs.SessionStateProxy.SetVariable('TaskName', $TaskName)
     $rs.SessionStateProxy.SetVariable('TaskXmlFile', $TaskXmlFile)
+    $rs.SessionStateProxy.SetVariable('TaskPidsFile', $TaskPidsFile)
     foreach ($k in $Variables.Keys) { $rs.SessionStateProxy.SetVariable([string]$k, $Variables[$k]) }
     $ps = [System.Management.Automation.PowerShell]::Create($rs)
-    [void]$ps.AddScript(('. $__self -VenueRoot $VenueRoot -TaskName $TaskName -TaskXmlFile $TaskXmlFile' + "`n" + $Script.ToString()))
+    [void]$ps.AddScript(('. $__self -VenueRoot $VenueRoot -TaskName $TaskName -TaskXmlFile $TaskXmlFile -TaskPidsFile $TaskPidsFile' + "`n" + $Script.ToString()))
     $handle = $ps.BeginInvoke()
     if (-not $handle.AsyncWaitHandle.WaitOne([int][Math]::Min([Math]::Max($TimeoutMs, 0L), 2000000000L))) {
         try { [void]$ps.BeginStop($null, $null) } catch { }
@@ -377,8 +383,11 @@ function Test-NewHeartbeatIsLiveAgent {
     # the OS reports for the pid: /Run cannot create a process before it is called, so a process that began even a moment earlier
     # (the old agent, or a stray one) is not the replacement. (The tolerance belongs to "same process" checks, never to "newer than".)
     # With -CheckCommandLine the process's OWN command line must run this script with this root (Test-HostArgvRunsScript).
-    param($Beat, [string]$AgentScript, $NotBeforeUtc = $null, [switch]$CheckCommandLine)
+    # With -TaskPids (the running instances of the task, Get-TaskRunningPids) the heartbeat's pid must BE one of them: a process that
+    # merely writes a matching heartbeat is not the instance `schtasks /End` and /Run act on.
+    param($Beat, [string]$AgentScript, $NotBeforeUtc = $null, [switch]$CheckCommandLine, $TaskPids = $null)
     if ($null -eq $Beat) { return $false }
+    if ($null -ne $TaskPids -and @($TaskPids) -notcontains [int]$Beat.pid) { return $false }
     if ([string]::IsNullOrWhiteSpace($Beat.start)) { return $false }
     if (-not [string]::Equals($Beat.host, $env:COMPUTERNAME, [StringComparison]::OrdinalIgnoreCase)) { return $false }
     if ($Beat.pid -eq $PID) { return $false }
@@ -423,6 +432,37 @@ function Get-ProcessArgvBounded {
     $r = Invoke-Bounded -Script { Get-ProcessArgv -ProcessId $ProcId } -TimeoutMs ($script:ReadTimeoutSec * 1000) -Variables @{ ProcId = $ProcessId }
     if ($r.timedOut -or $null -ne $r.error) { return $null }
     return $r.value
+}
+
+function Get-TaskRunningPids {
+    # The pids of the RUNNING instances of the task, asked of the Task Scheduler itself (IRunningTask.EnginePID, which for an Exec
+    # action is the pid of the process the action started). `schtasks /End` stops exactly these, so this is the identity the stop acts
+    # on; a heartbeat file only CLAIMS a pid. Returns @{ ok; pids } ($ok false when the scheduler cannot be asked, and off Windows).
+    # -TaskPidsFile is the test seam: the pids are read (digits, any separator) from that file instead.
+    $no = [pscustomobject]@{ ok = $false; pids = @() }
+    try {
+        if ($TaskPidsFile -ne '') {
+            $text = [System.IO.File]::ReadAllText($TaskPidsFile)
+            return [pscustomobject]@{ ok = $true; pids = @([regex]::Matches($text, '\d+') | ForEach-Object { [int]$_.Value }) }
+        }
+        if (-not $script:OnWindows) { return $no }
+        $svc = New-Object -ComObject 'Schedule.Service'
+        $svc.Connect()
+        $want = '\' + $TaskName.TrimStart('\')
+        $found = @()
+        foreach ($rt in $svc.GetRunningTasks(1)) {
+            if ([string]::Equals([string]$rt.Path, $want, [StringComparison]::OrdinalIgnoreCase)) { $found += [int]$rt.EnginePID }
+        }
+        return [pscustomobject]@{ ok = $true; pids = $found }
+    }
+    catch { return $no }
+}
+
+function Get-TaskRunningPidsBounded {
+    # Get-TaskRunningPids under the read deadline (the scheduler can stall); no answer reads as unreadable. Returns the pid array or $null.
+    $r = Invoke-Bounded -Script { Get-TaskRunningPids } -TimeoutMs ($script:ReadTimeoutSec * 1000)
+    if ($r.timedOut -or $null -ne $r.error -or $null -eq $r.value -or -not $r.value.ok) { return $null }
+    return ,@($r.value.pids)   # the comma keeps an EMPTY array from unrolling to $null (which would read as "unreadable")
 }
 
 function Test-ArgvBindsScript {
@@ -619,6 +659,12 @@ function Get-RestartBindingRefusal {
     if (-not (Test-TaskXmlRunsScript -Xml $xml -AgentScript $AgentScript)) {
         return "task $TaskName does not run -File $AgentScript in an executable action; ending it would stop a different agent"
     }
+    # the pid the heartbeat names must be the pid of the task's RUNNING instance: End stops that instance and no other, so a process in
+    # another session that writes a matching heartbeat (and a task instance serving a different root) must not satisfy this
+    $running = Get-TaskRunningPidsBounded
+    if ($null -eq $running) { return "task $TaskName running instances could not be read from the Task Scheduler, so the process it would end is unconfirmed" }
+    if (@($running).Count -ne 1) { return "task $TaskName has $(@($running).Count) running instance(s) ($(@($running) -join ',')), not exactly one; the stop would not act on the agent that was checked" }
+    if ([int]$running[0] -ne [int]$beat.pid) { return "task $TaskName is running pid=$($running[0]), not heartbeat pid=$($beat.pid): the live agent that was checked is not the task instance that ending the task would stop" }
     $script:BoundBeat = $beat
     return $null
 }
@@ -640,7 +686,11 @@ function Invoke-AgentRestart {
     $again = Get-RestartBindingRefusal -AgentScript $AgentScript
     if ($null -ne $again) { return @{ why = "the agent binding no longer holds, so nothing was stopped: $again"; warn = $null } }
     $before = $script:BoundBeat
-    $end =Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/End', '/TN', $TaskName) -TimeoutSec 30
+    # the binding above reads the heartbeat, the process command line, the task definition and the scheduler, each up to its deadline:
+    # work can land meanwhile, so idle is judged AGAIN as the last step before the End (the check before the binding is only the early out)
+    $last = Get-Refusals
+    if ($null -ne $last) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $($last.lines -join '; ')"; warn = $null } }
+    $end = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/End', '/TN', $TaskName) -TimeoutSec 30
     if ($end.timedOut) { return @{ why = "schtasks /End $TaskName did not return within 30 s"; warn = $null } }
     $gone = Wait-Until -TimeoutSec 30 -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
     if (-not $gone) { return @{ why = "agent pid $($before.pid) still alive 30 s after schtasks /End"; warn = $null } }
@@ -651,7 +701,11 @@ function Invoke-AgentRestart {
     if ($run.exitCode -ne 0) { return @{ why = "schtasks /Run $TaskName exited $($run.exitCode)"; warn = $warn } }
     $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript; runAt = $runAt } -Condition {
         $now = Read-Heartbeat
-        ($null -ne $now) -and ($now.ageSec -lt 30) -and (Test-BeatIsDifferentProcess -Old $before -New $now) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $runAt -CheckCommandLine)
+        if (($null -eq $now) -or ($now.ageSec -ge 30) -or -not (Test-BeatIsDifferentProcess -Old $before -New $now)) { return $false }
+        # the replacement is the task's own new instance (not just a process that wrote a heartbeat), and it runs this script and root
+        $tp = Get-TaskRunningPids
+        if (-not $tp.ok) { return $false }
+        Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $runAt -CheckCommandLine -TaskPids $tp.pids
     } -PollMs 1000
     if (-not $up) { return @{ why = 'no heartbeat from a new LIVE agent process within 60 s of schtasks /Run'; warn = $warn } }
     return @{ why = $null; warn = $warn }

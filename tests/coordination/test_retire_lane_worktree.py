@@ -4426,12 +4426,13 @@ UNRESOLVED_EXECUTED_SITES = {
          "Move-Item / Remove-Item -LiteralPath $var), none of them on the variable: drive"),
     ],
     "tools/profiling/bachelor/Deploy-BachelorAgent.ps1": [
-        ("[void]$ps.AddScript(('. $__self -VenueRoot $VenueRoot -TaskName $TaskName -TaskXmlFile $TaskXmlFile' + \"`n\" + $Script.ToString()))",
-         "BACHELOR-AGENT-DEPLOY-TRACKED-1 r2 (adversary r2 A1): Invoke-Bounded runs a read of the venue on a worker runspace it abandons at a deadline. "
+        ("[void]$ps.AddScript(('. $__self -VenueRoot $VenueRoot -TaskName $TaskName -TaskXmlFile $TaskXmlFile -TaskPidsFile $TaskPidsFile' + \"`n\" + $Script.ToString()))",
+         "BACHELOR-AGENT-DEPLOY-TRACKED-1 r2 (adversary r2 A1; r3 adds -TaskPidsFile): Invoke-Bounded runs a read of the venue on a worker runspace it abandons at a deadline. "
          "The prefix is a literal that dot-sources THIS file ($__self is its own $PSCommandPath; functions only, the dot-source guard returns before any "
-         "deploy step) with the three values this file already holds. $Script is a { } literal handed by this file's own callers (Get-VenueState, "
-         "Read-HeartbeatBounded and the Wait-Until conditions in Invoke-AgentRestart: a directory listing, a heartbeat read, a process-alive check), "
-         "which the AST scans as code; none launches a process. The deployer's only child process is schtasks.exe, started by Invoke-BoundedProcess "
+         "deploy step) with the four values this file already holds. $Script is a { } literal handed by this file's own callers (Get-VenueState, "
+         "Read-HeartbeatBounded, Get-ProcessArgvBounded, Get-TaskRunningPidsBounded and the Wait-Until conditions in Invoke-AgentRestart: a directory "
+         "listing, a heartbeat read, a process command-line read (Win32_Process / /proc), a Task Scheduler read (IRunningTask, read-only), a process-alive "
+         "check), which the AST scans as code; none launches a process. The deployer's only child process is schtasks.exe, started by Invoke-BoundedProcess "
          "with a fixed /Query, /End or /Run argument list and the task name"),
     ],
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [

@@ -87,6 +87,12 @@ class DeployBachelorAgent(unittest.TestCase):
         self.addCleanup(lambda: (p.kill(), p.wait()))
         return p.pid, self.start_of(p.pid)
 
+    def task_pids(self, *pids: int, name: str = "task-pids") -> Path:
+        """The -TaskPidsFile seam: the pids of the task's RUNNING instances, as the Task Scheduler would report them."""
+        f = Path(self._tmp.name) / ("%s-%s.txt" % (name, "-".join(str(p) for p in pids) or "none"))
+        f.write_text("\n".join(str(p) for p in pids), encoding="ascii")
+        return f
+
     def write_beat(self, pid: int, start: str, agent: Path | None = None) -> None:
         (self.venue / "heartbeat.txt").write_text(
             'alive x pid=%d host=%s generation=1 processStartUtc=%s agentScript="%s"\r\n'
@@ -624,11 +630,11 @@ class DeployBachelorAgent(unittest.TestCase):
         beat.write_text(good)
         later.write_text(bad)
         cmd = (
-            ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; "
+            ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s' -TaskPidsFile '%s'; "
             "$first = Get-RestartBindingRefusal -AgentScript '%s'; 'first=' + $(if ($null -eq $first) { 'bound' } else { $first });"
             "Copy-Item -LiteralPath '%s' -Destination '%s' -Force; "
             "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
-        ) % (psq(SCRIPT), psq(self.venue), psq(xml), psq(agent), psq(later), psq(beat), psq(agent))
+        ) % (psq(SCRIPT), psq(self.venue), psq(xml), psq(self.task_pids(pid)), psq(agent), psq(later), psq(beat), psq(agent))
         r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("first=bound", r.stdout)
@@ -783,8 +789,8 @@ class DeployBachelorAgent(unittest.TestCase):
                            ("positional-root", (r"C:\other-root",)), ("verbose", ("-Verbose",))):
             pid, start = self.live_agent(*args)
             self.write_beat(pid, start)
-            cmd = (". '%s' -VenueRoot '%s' -TaskXmlFile '%s'; $x = Get-RestartBindingRefusal -AgentScript '%s'; if ($null -eq $x) { 'bound' } else { 'refused:' + $x }"
-                   % (psq(SCRIPT), psq(self.venue), psq(xml), psq(agent)))
+            cmd = (". '%s' -VenueRoot '%s' -TaskXmlFile '%s' -TaskPidsFile '%s'; $x = Get-RestartBindingRefusal -AgentScript '%s'; if ($null -eq $x) { 'bound' } else { 'refused:' + $x }"
+                   % (psq(SCRIPT), psq(self.venue), psq(xml), psq(self.task_pids(pid)), psq(agent)))
             r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             verdicts[name] = r.stdout.strip().split(":")[0]
@@ -812,6 +818,74 @@ class DeployBachelorAgent(unittest.TestCase):
         r = self._dot_source(body)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.split(), ["ok=True", "other-root=False", "other-root-unchecked=True"], r.stdout + r.stderr)
+
+    # ---- adversary pass 7 findings (A1..A2 of 606e89a1): each test failed on 606e89a18 ----
+
+    def _task_xml_for_agent(self) -> Path:
+        xml = Path(self._tmp.name) / "task-p7.xml"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>"
+                       % (self.venue / AGENT_NAME), encoding="utf-8")
+        return xml
+
+    def test_p7a2_the_heartbeat_pid_must_be_the_pid_of_the_tasks_running_instance(self) -> None:
+        # pass 7 A2: PID 4100 (interactive session) writes a valid matching heartbeat for this root; the task's RUNNING instance is PID
+        # 4200 serving a busy root. Every earlier check passes for 4100; ending the task would stop 4200. The scheduler is asked who runs.
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
+        xml = self._task_xml_for_agent()
+        for label, pids, needle in (("other-instance", (4200,), "not heartbeat pid=%d" % pid), ("no-instance", (), "0 running instance"),
+                                    ("two-instances", (pid, 4200), "2 running instance")):
+            r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(*pids, name=label)))
+            self.assertEqual(r.returncode, 16, label + r.stdout + r.stderr)
+            self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+            self.assertIn(needle, r.stdout, label)
+            self.assert_untouched()
+        # the scheduler cannot be asked (an unreadable seam stands for a COM failure, and for any non-Windows host): refuse, never assume
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(Path(self._tmp.name) / "no-such-file.txt"))
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("could not be read from the Task Scheduler", r.stdout)
+        self.assert_untouched()
+
+    def test_p7a2_the_task_instance_is_the_same_pid_it_is_bound_to_end_to_end(self) -> None:
+        # the matching case: a bound agent whose task instance IS the heartbeat pid passes the binding (it would go on to schtasks, so
+        # only the binding function is run here)
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
+        cmd = (". '%s' -VenueRoot '%s' -TaskXmlFile '%s' -TaskPidsFile '%s'; $x = Get-RestartBindingRefusal -AgentScript '%s'; if ($null -eq $x) { 'bound' } else { 'refused:' + $x }"
+               % (psq(SCRIPT), psq(self.venue), psq(self._task_xml_for_agent()), psq(self.task_pids(pid)), psq(self.venue / AGENT_NAME)))
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.stdout.strip(), "bound", r.stdout + r.stderr)
+
+    def test_p7a2_the_replacement_must_be_the_tasks_new_instance(self) -> None:
+        pid, s = self._sleeper()
+        body = (
+            "$a='%s'; $s='%s'; $sp=%d;"
+            "function B($p,$st,$sc){ [pscustomobject]@{pid=$p;host=$env:COMPUTERNAME;start=$st;agentScript=$sc;ageSec=1} };"
+            "'instance='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -TaskPids @($sp));"
+            "'other-instance='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -TaskPids @(4200));"
+            "'no-instance='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -TaskPids @());"
+            "'not-asked='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a)"
+        ) % (psq(self.venue / AGENT_NAME), s, pid)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["instance=True", "other-instance=False", "no-instance=False", "not-asked=True"], r.stdout + r.stderr)
+
+    def test_p7a1_idle_is_judged_again_right_before_the_end(self) -> None:
+        # pass 7 A1: the binding reads the heartbeat, a command line, the task XML and the scheduler (each up to a deadline), so a job can
+        # land AFTER the idle check that preceded it. The venue is idle on entry; the binding (replaced here by a stand-in that drops a
+        # job into inbox\ and succeeds, as a slow query would allow) must be followed by a fresh idle check, and nothing may be stopped.
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; Set-Content -LiteralPath (Join-Path (Join-Path $VenueRoot 'inbox') 'j1.job.ps1') -Value x; return $null };"
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME))
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest'; %s" % (psq(SCRIPT), psq(self.venue), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("why=the venue is no longer idle, so the agent was not stopped", r.stdout)
+        self.assertIn("inbox=1", r.stdout)
 
     def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
         # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.
