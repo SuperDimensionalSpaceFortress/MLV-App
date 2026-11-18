@@ -973,12 +973,17 @@ class ExportEvidenceTests(unittest.TestCase):
                profile({**base, "llrawproc_dualiso_refine_lock_ms": 30.0, "llrawproc_shared_lock_ms": 10.0}),                                     # one member above it
                profile({**base, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_shared_lock_ms": 15.0})]  # each below, the sum above
         control = profile({**base, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_shared_lock_ms": 25.0})
+        # (adversary pass18 A1: llrawproc_other = total - the seven timed children, and the two lock times lie outside every child window, so they are inside it too)
+        other_base = {"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_shared_lock_ms": 20.0,
+                      "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_publish_lock_ms": 10.0}
+        bad += [profile({**other_base, "llrawproc_other_ms": 0.0}), profile({**other_base, "llrawproc_other_ms": 10.0})]   # the pass-18 input, both remainder values
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in bad + [control]])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(bad)):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
-                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "llrawproc_shared_lock" in p for p in got[i]["problems"]), got[i])
+                container = "llrawproc_shared_lock" if i < 3 else "llrawproc_other"
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and f"inside {container}" in p for p in got[i]["problems"]), got[i])
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
 
     def test_r17_every_disjoint_group_is_derived_from_the_stage_window_table(self) -> None:
@@ -1037,7 +1042,12 @@ class ExportEvidenceTests(unittest.TestCase):
             return True
 
         expected = set()
-        containers = {n: r["contains"] for n, r in rows.items() if r.get("contains")}   # (pass17 A1: a row that accumulates others contains them)
+        containers = {n: list(r["contains"]) for n, r in rows.items() if r.get("contains")}   # (pass17 A1: a row that accumulates others contains them)
+        for n, r in rows.items():   # (pass18 A1: a remainder contains every sibling that accrues on no line of the rows it is the remainder of)
+            if r.get("remainderOf"):
+                covered = [w for s in r["remainderOf"] for w in (rows[s]["windows"] or [])]
+                inside = [m for m, s in rows.items() if s["parent"] == r["parent"] and m != n and m not in r["remainderOf"] and s["windows"] and not meet(s["windows"], covered)]
+                containers[n] = containers.get(n, []) + [m for m in inside if m not in containers.get(n, [])]
         for parent in {r["parent"] for r in rows.values()} | set(containers):
             desc = list(containers[parent]) if parent in containers else [n for n in rows if parent in chain(n)[1:]]
             nbr = {v: {w for w in desc if w != v and not overlap(v, w)} for v in desc}
@@ -1061,6 +1071,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertEqual(derived, expected)
         self.assertEqual({tuple(p) for p in got["pairs"]}, {(m, n) for n, ms in containers.items() for m in ms})
         self.assertIn((frozenset({"llrawproc_dualiso_refine_lock", "llrawproc_publish_lock"}), "llrawproc_shared_lock"), derived)
+        self.assertIn((frozenset({"llrawproc_dualiso_refine_lock", "llrawproc_publish_lock"}), "llrawproc_other"), derived)
         # (the pass16 A1 member is in a derived group, and so is every earlier round's)
         self.assertIn((frozenset({"llrawproc_vertical_stripes", "llrawproc_pattern_noise", "llrawproc_dual_iso", "llrawproc_chroma_smooth", "llrawproc_shared_lock"}), "llrawproc"), derived)
 
