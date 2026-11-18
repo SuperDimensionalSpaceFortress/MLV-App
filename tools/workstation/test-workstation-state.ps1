@@ -3112,6 +3112,9 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
 }
 # S3: a Clone whose url carries a query token: neither the console nor the setup log ever holds the token, also where git echoes the url without its scheme
 if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
+    # r8 (sol r6 hardening): the url-redaction registry is process-wide and only grows. Every independent case below starts from an EMPTY registry, so a later case can
+    # only pass through the registration its own code path makes, never through one an earlier case left behind. One test further down keeps the accumulation on purpose.
+    function Reset-DdUrlRegistry { $script:UrlSecretParts.Clear(); $script:UrlSecretHeads.Clear(); $script:UrlSecretAnchors.Clear() }
     $ddCases = @(
         @{ N = 1; Url = ('file:///' + ((New-Scratch 'dd-s3-absent') -replace '\\', '/') + '/absent.git?token=fake-token-0001'); Tok = 'fake-token-0001' },
         @{ N = 2; Url = 'https://127.0.0.1:1/o/r.git?token=fake-token-0002'; Tok = 'fake-token-0002' },
@@ -3148,6 +3151,7 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         @{ N = 24; Url = ('file:///' + ((New-Scratch 'dd-s3-absent24') -replace '\\', '/') + '/absent-24.git?t=%0D%9Fqzf'); Tok = @('qzf') }
     )
     foreach ($ddc in $ddCases) {
+        Reset-DdUrlRegistry
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
         $ddrepo = Join-Path $ddws 'MLV-App'
         $dddoc = Join-Path $ddws 'doctrine'; [void][IO.Directory]::CreateDirectory($dddoc); & git -C $dddoc init -q 2>$null; & git -C $dddoc remote add origin $DoctrineUrl 2>$null
@@ -3178,6 +3182,7 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
     # r4 adversary pass 9 A2: an anchor built from a path with many '%XX' is an ambiguous pattern; the sink finishes in bounded time and never prints the query
     if (-not (Test-Path -LiteralPath 'variable:script:UrlRedactTimeout')) { Assert-That $false 'DENY-BY-DEFAULT-1 r4 pass 9 A2: the log sink has no match bound ($script:UrlRedactTimeout missing; not run, it would not finish)' }
     else {
+        Reset-DdUrlRegistry
         $ddP9 = Join-Path (New-Scratch 'dd-p9a2-sink') 'sink.log'
         $savedLog = $script:LogFile; $script:LogFile = $ddP9
         $ddSw9 = [Diagnostics.Stopwatch]::StartNew()
@@ -3187,11 +3192,49 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
     }
     # r1 adversary A5: a registered part that is also a scheme ('?https:') never breaks a url apart before the scheme rule redacts its short password
     if (Test-Has 'Register-UrlSecretParts' 'DENY-BY-DEFAULT-1 r1 adversary A5') {
+        Reset-DdUrlRegistry
         $ddA5 = Join-Path (New-Scratch 'dd-a5-sink') 'sink.log'
         $savedLog = $script:LogFile; $script:LogFile = $ddA5
         try { Register-UrlSecretParts 'https://u:abc@h.example/r.git?https:'; Write-Log 'x https://u:abc@h.example/r.git?https: y' *>&1 | Out-Null } finally { $script:LogFile = $savedLog }
         $ddA5Text = [IO.File]::ReadAllText($ddA5)
         Assert-That (-not $ddA5Text.Contains(':abc@') -and -not $ddA5Text.Contains('abc@h')) 'DENY-BY-DEFAULT-1 r1 adversary A5: the short password of a url whose query is a registered scheme is still redacted' $ddA5Text
+    }
+    # r8 (sol r6 hardening): the isolation itself, then the accumulation kept on purpose, then the lease-error sink with the registry emptied first
+    Reset-DdUrlRegistry
+    $ddIsoLog = Join-Path (New-Scratch 'dd-r8-iso') 'sink.log'
+    $savedLog = $script:LogFile; $script:LogFile = $ddIsoLog
+    try {
+        Register-UrlSecretParts 'https://u:p@h.example/r.git?iso_tok_r8_one'
+        Reset-DdUrlRegistry
+        Write-Log 'echo iso_tok_r8_one' *>&1 | Out-Null
+    } finally { $script:LogFile = $savedLog }
+    Assert-That (($script:UrlSecretParts.Count + $script:UrlSecretHeads.Count + $script:UrlSecretAnchors.Count) -eq 0 -and [IO.File]::ReadAllText($ddIsoLog).Contains('iso_tok_r8_one')) 'DENY-BY-DEFAULT-1 r8 isolation: a reset empties all three registries, so a part an earlier case registered no longer redacts a later one'
+    $ddAccLog = Join-Path (New-Scratch 'dd-r8-accum') 'sink.log'
+    $savedLog = $script:LogFile; $script:LogFile = $ddAccLog
+    try {
+        Register-UrlSecretParts 'https://u:p@h.example/r.git?acc_tok_r8_two'
+        Write-Log 'a later, unrelated line: acc_tok_r8_two' *>&1 | Out-Null
+    } finally { $script:LogFile = $savedLog }
+    $ddAccText = [IO.File]::ReadAllText($ddAccLog)
+    Assert-That ($ddAccText.Contains('later, unrelated line') -and -not $ddAccText.Contains('acc_tok_r8_two')) 'DENY-BY-DEFAULT-1 r8 accumulation (intentional): a url registered once is redacted in every later line of the run' $ddAccText
+    # the lease-error sink: Show-HubLease prints 'lease: UNKNOWN (<error>)' with git's own text for a lease remote whose url carries a token (the real Get-HubLease, a real failing ls-remote)
+    if ((Test-Has 'Show-HubLease' 'DENY-BY-DEFAULT-1 r8 lease sink') -and (Test-Has 'Get-HubLease' 'DENY-BY-DEFAULT-1 r8 lease sink')) {
+        foreach ($ddL in @(@{ N = 1; Q = '?token=fake-token-LS0001'; Tok = @('fake-token-LS0001') }, @{ N = 2; Q = '#token=fake-token-LS0002'; Tok = @('fake-token-LS0002') }, @{ N = 3; Q = '?t=%0A%80qzl'; Tok = @('qzl') })) {
+            Reset-DdUrlRegistry
+            $ddLws = New-Scratch "dd-r8-lease-$($ddL.N)"
+            $ddLrepo = Join-Path $ddLws 'MLV-App'; [void][IO.Directory]::CreateDirectory($ddLrepo); & git -C $ddLrepo init -q 2>$null
+            $ddLurl = 'file:///' + ((New-Scratch "dd-r8-lease-absent-$($ddL.N)") -replace '\\', '/') + '/absent.git' + $ddL.Q
+            & git -C $ddLrepo remote add fork $ddLurl 2>$null
+            $savedRepo = $script:Repo; $savedLog = $script:LogFile
+            $script:Repo = $ddLrepo; $Repo = $ddLrepo; $script:LogFile = Join-Path $ddLws 'lease.log'
+            $ddLout = ''
+            $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')
+            try { $ddLout = (Show-HubLease *>&1 | Out-String) } catch { $ddLout += $_.Exception.Message } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
+            $ddLlog = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+            $script:Repo = $savedRepo; $Repo = $savedRepo; $script:LogFile = $savedLog
+            Assert-That ($ddLlog -match 'lease: UNKNOWN' -and $ddLout -match 'lease: UNKNOWN') "DENY-BY-DEFAULT-1 r8 lease sink ($($ddL.N)): the failing lease read reaches the log and the console as 'lease: UNKNOWN'" "log=$ddLlog`nout=$ddLout"
+            Assert-That (@(@($ddL.Tok) | Where-Object { $ddLlog.Contains($_) -or $ddLout.Contains($_) }).Count -eq 0) "DENY-BY-DEFAULT-1 r8 lease sink ($($ddL.N)): neither the setup log nor the console holds the lease url's token" "log=$ddLlog`nout=$ddLout"
+        }
     }
 }
 
