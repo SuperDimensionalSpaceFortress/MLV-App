@@ -1637,7 +1637,8 @@ function Get-CredentialHitIndex {
 # MINI3-CUTOVER-CREDENTIAL-DETECTOR-DENY-BY-DEFAULT-1 S1 (doctrine bus 0fc7511 + d6d115b: fix the CLASS, not one more spelling): every escape form a reader of a file
 # Export may ship decodes in a KEY is decoded on the COPY that the second pass judges: YAML/JSON/TOML '\xNN' '\uNNNN' '\UNNNNNNNN' '\/' and the escaped line break;
 # XML/HTML character references '&#NNN;' and '&#xNN;' (an attribute value is decoded by every XML reader: '<add key="pass&#119;ord" .../>'); PowerShell '`u{NN}' and
-# '`<letter>' (an unknown backtick escape is the letter itself: "pass`word" is 'password'; the special '`0 `a `b `e `f `n `r `t `v' stay as written); C / Python octal
+# '`<char>' (an unknown backtick escape is the character itself: "pass`word" is 'password'; the special '`0 `a `b `e `f `n `r `t `v' are decoded on their own level, r5, and any other
+# character after a backtick, punctuation, blank, tab and line break included, is that character, r6); a doubled quote inside a quoted string (r6); C / Python octal
 # '\NNN' and Python '\N{LATIN SMALL LETTER W}' (also CAPITAL, DIGIT ZERO..NINE, LOW LINE, HYPHEN-MINUS, FULL STOP, SOLIDUS); URL '%NN'. The octal and '%NN' forms are
 # decoded only to a name character ([A-Za-z0-9_.-/\]), so a path or a query value is not rewritten into line breaks. The decode repeats until nothing changes, so a
 # nested spelling ('&#92;x77' is '\x77' is 'w') is decoded too. What is still an escape after that cannot be decoded and is judged deny by default
@@ -1650,11 +1651,30 @@ for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyName
 # ('<add key=''pass\nword'' .../>' inside a JSON string is the naming value 'pass<LF>word', 'password' once its blanks are removed). Each is decoded on its own level.
 # r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): the rest of the YAML double-quoted escape table is decoded on its own level
 # too: '\v' (VT), '\a' (BEL), '\e' (ESC), '\L' (U+2028) and '\P' (U+2029), '\_' (U+00A0), '\ ' (a blank) and '\<TAB>'. '\0' and '\N' stay undecoded, which the residual rule refuses.
-$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psq>["''`$])|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psq>["''`$])|`(?<psl>[\s\S])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
 $script:CredentialEntities = @{ 'amp' = '&'; 'lt' = '<'; 'gt' = '>'; 'quot' = '"'; 'apos' = "'" }
 # r5 (adversary pass 12 A1, defect class: an escape a reader decodes that the normaliser left as written): the special PowerShell backtick escapes were kept as written
 # ('"pass`nword"' is 'pass<LF>word' to PowerShell); each is decoded on its own level now, and a backtick-escaped quote, '$' or backtick is that character ('`"password`"' frames an XML pair).
 # (ordinal: '`N' is the letter N, only '`n' is a line break)
+# r6 (sol r5 A1 + opus r5 B1, same class): PowerShell reads a backtick before ANY other character as that character, not only before a letter, a digit, '_', '.' or '-'. The class
+# was a list of the characters seen so far; it is now every character ('"pass`/word"' is the key 'pass/word', "pass` word" is 'pass word', a backtick before the '>' of a start tag is '>').
+# A backtick at the very end of the text has nothing to decode and is left. (Over-decoding is safe: the raw text is judged first, and the copy only adds hits.)
+# r6 (sol r5 A2 + opus r5 hardening, same class): a DOUBLED quote inside a quoted string is one quote to a PowerShell (and a YAML single-quoted, and a CSV) reader. Two rules, both
+# on the decoded copy, each shortening the text: (1) a quoted RUN ('...' or "...", the doubled form of its own quote kept inside it) that holds a doubled quote has the pair
+# collapsed; (2) a doubled quote with a name character right before or after it (the run rule's alignment can break on an apostrophe in prose) is collapsed too. A lone empty
+# literal ('', "" between separators) is neither: '$p = ''x''' decodes, "password: ''" and 'value=""/>' stay the empty literals that the exemption list names.
+$script:CredentialQuoteRunRegex = [regex]::new('''(?>[^'']+|'''')*''|"(?>[^"]+|"")*"', [System.Text.RegularExpressions.RegexOptions]::None, [TimeSpan]::FromSeconds(20))
+$script:CredentialQuoteNearNameRegex = [regex]::new('(?<=[\w.\-/\\$])(?:''''|"")|(?:''''|"")(?=[\w.\-\\$])', [System.Text.RegularExpressions.RegexOptions]::None, [TimeSpan]::FromSeconds(20))
+$script:CredentialQuoteRunEval = {
+    param($m)
+    $v = $m.Value
+    if ($v.Length -lt 4) { return $v }
+    $q = [string]$v[0]; $pair = $q + $q
+    $inner = $v.Substring(1, $v.Length - 2)
+    if (-not $inner.Contains($pair)) { return $v }
+    return $q + $inner.Replace($pair, $q) + $q
+}
+$script:CredentialQuoteNearNameEval = { param($m) $m.Value.Substring(0, 1) }
 $script:CredentialPsControls = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
 foreach ($credPs in @(@('0', [string][char]0), @('a', [string][char]7), @('b', [string][char]8), @('e', [string][char]27), @('f', [string][char]12), @('n', "`n"), @('r', "`r"), @('t', "`t"), @('v', [string][char]11))) { $script:CredentialPsControls[$credPs[0]] = $credPs[1] }
 $script:CredentialOneLetterEscapes = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
@@ -1751,7 +1771,15 @@ function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null) 
         if ($r) { $s = $r.Text; $mask = $r.Mask }
         $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
         if ($b) { $s = $b.Text; $mask = $b.Mask }
-        if (-not $r -and -not $b) { break }
+        # r6 (sol r5 A2): the doubled quote, on the same level (see $script:CredentialQuoteRunRegex); only when the text holds a doubled quote at all
+        $q1 = $null; $q2 = $null
+        if ($s.Contains("''") -or $s.Contains('""')) {
+            $q1 = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialQuoteRunRegex -Eval $script:CredentialQuoteRunEval
+            if ($q1) { $s = $q1.Text; $mask = $q1.Mask }
+            $q2 = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialQuoteNearNameRegex -Eval $script:CredentialQuoteNearNameEval
+            if ($q2) { $s = $q2.Text; $mask = $q2.Mask }
+        }
+        if (-not $r -and -not $b -and -not $q1 -and -not $q2) { break }
         $levels++
         if ($levels -gt $script:CredentialMaxDecodeStages) { throw (New-CredentialDecodeLimitError "the text still decodes after $($script:CredentialMaxDecodeStages) levels") }
         if ($OnStage) {
