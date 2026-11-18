@@ -3448,7 +3448,7 @@ function Start-HeavySlotCli {
     # One short heavy-slot.py call (lease renew / release), started windowless with this agent's HEAVY_SLOT_DIR and
     # HEAVY_SLOT_FEED and WITHOUT HEAVY_SLOT_HELD (a lease call is never nested). Nothing waits here: Complete-HeavySlotCli
     # waits with a bound, Receive-HeavySlotCli collects a call that has exited. Returns @{ ok; proc; out; err; started; startedMono;
-    # startedAfter; exitStamp; why } (started and startedMono are read before the start, r4).
+    # startedWallKnown; startedAfter; exitStamp; why } (started and startedMono are read before the start, r4; startedWallKnown, r6).
     # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (sol r4 S2): -Python/-Script are paths the caller has already checked (the slot snapshot's local-disk
     # rule). They are started as given and never re-resolved: a checked python that is gone now is ok=$false, never a PATH search.
     param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$Python = "", [string]$Script = "")
@@ -3487,16 +3487,23 @@ function Start-HeavySlotCli {
         # r5 (adversary pass 10 A1): the pair is read as monotonic, wall, monotonic and kept only when the two monotonic readings are within
         # 0.5 s (else read again, at most 3 times): a stall BETWEEN the wall and the monotonic reading (wall t0, monotonic t0+90) no longer leaves
         # the wall anchor 90 s early. The later monotonic reading is the anchor; the wall reading lies inside the bracket.
+        # r6 (sol r5 B1 = adversary pass 11 A1): when all 3 brackets are wider than 0.5 s (stalls 0.6, 0.6, 90 s after the wall readings), the
+        # last wall reading is NOT paired with its monotonic reading as a tight anchor: startedWallKnown is $false. startedMono stays the last
+        # monotonic reading (the one nearest Process.Start). The gap readers (Register-QuietLeaseRenewOk, Get-QuietLeaseRenewOkGapSec) then
+        # measure from this start on the monotonic clock only, with heavy-slot.py's own record times standing in for the wall term; where no record
+        # time can stand in, they fall back to this wall reading, a lower bound read before Process.Start (a false demotion, the safe direction).
+        # dd5c99c5 paired wall t0+1.2 with monotonic t0+91.2 and read the healthy batch's 32 s record gap as 125 s: demoted.
+        $startedWallKnown = $false
         for ($pairTry = 0; $pairTry -lt 3; $pairTry++) {
             $m1 = Get-AgentMonotonicSec
             $startedWall = Get-Date
             $startedMono = Get-AgentMonotonicSec
-            if (($startedMono - $m1) -le 0.5) { break }
+            if (($startedMono - $m1) -le 0.5) { $startedWallKnown = $true; break }
         }
         $p = [System.Diagnostics.Process]::Start($si)
         # BACHELOR-LEASE-RENEW-MARGIN-1 r2: startedMono (a Get-AgentMonotonicSec reading) beside started, and exitStamp (New-RenewExitStamp: the
         # call's exit stamped in-process; $null when unavailable), which Get-QuietLeaseRenewOkAt uses to end a successful renew's gap at its exit.
-        return [pscustomobject]@{ ok = $true; proc = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync(); started = $startedWall; startedMono = $startedMono; startedAfter = (Get-Date); exitStamp = (New-RenewExitStamp -Process $p); why = $null }
+        return [pscustomobject]@{ ok = $true; proc = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync(); started = $startedWall; startedMono = $startedMono; startedWallKnown = $startedWallKnown; startedAfter = (Get-Date); exitStamp = (New-RenewExitStamp -Process $p); why = $null }
     }
     catch {
         $msg = "heavy-slot.py $($Arguments -join ' ') failed to start: $($_.Exception.Message)"
@@ -3730,7 +3737,13 @@ function Register-QuietLeaseRenewOk {
     #        r5 (adversary pass 9 A1): the exit stamp ends the gap ONLY when the record time was read too. Without it (an output with no readable
     #        "renewed"), a reverted step cannot be ruled out, so the gap ends at the collection, as base a7278cbd: a late collection then reads
     #        long (a false demotion, the safe direction), never a missed one.
-    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallStartedMono = $null, $Call = $null, $RecordEpochSec = $null)
+    # r6 (sol r5 B1 = adversary pass 11 A1): -CallStartedWallKnown $false (Start-HeavySlotCli exhausted its start-pair re-reads) marks this
+    # call's wall anchor unknown, and it is stored beside the anchor. A later gap measured FROM such an anchor (Test-RenewGapFromWallUnknown) is
+    # the monotonic gap and heavy-slot.py's record-to-record gap only: the unknown wall reading is never used beside the monotonic one. Where
+    # either record time is missing, nothing can stand in for the wall term, so it is taken from that wall reading (read before Process.Start,
+    # so never later than the child's record: it can only read the gap long, a false demotion, the safe direction, as base). Any reading that
+    # says stale still demotes; a known anchor ($null counts as known: a call or lease from before r6) is measured as in r5.
+    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallStartedMono = $null, $Call = $null, $RecordEpochSec = $null, $CallStartedWallKnown = $null)
     $nowWall = Get-Date
     $nowMono = Get-AgentMonotonicSec
     $at = if ($null -ne $Call -and $null -ne $RecordEpochSec) { Get-QuietLeaseRenewOkAt -Call $Call -NowWall $nowWall -NowMono $nowMono } else { [pscustomobject]@{ wall = $nowWall; mono = $nowMono; fromExit = $false } }
@@ -3739,16 +3752,34 @@ function Register-QuietLeaseRenewOk {
     $prevMono = if ($useOk) { $Lease.lastRenewOkStartMono } else { $Lease.activeAtMono }
     $prevRecord = if ($useOk) { $Lease.lastRenewOkRecordEpochSec } else { $null }
     if ($null -ne $prev) {
-        $gap = Get-RenewGapSec -FromWall $prev -FromMono $prevMono -ToWall $at.wall -ToMono $at.mono
-        if ($null -ne $RecordEpochSec) {
-            $from = if ($null -ne $prevRecord) { [double]$prevRecord } else { ConvertTo-RenewEpochSec ([datetime]$prev) }
-            $gap = [Math]::Max($gap, [double]$RecordEpochSec - $from)
+        if (Test-RenewGapFromWallUnknown -Lease $Lease -UseOk $useOk -PrevMono $prevMono -PrevRecord $prevRecord -ToRecord $RecordEpochSec) {
+            $gap = [Math]::Max([double]$at.mono - [double]$prevMono, [double]$RecordEpochSec - [double]$prevRecord)
+        }
+        else {
+            $gap = Get-RenewGapSec -FromWall $prev -FromMono $prevMono -ToWall $at.wall -ToMono $at.mono
+            if ($null -ne $RecordEpochSec) {
+                $from = if ($null -ne $prevRecord) { [double]$prevRecord } else { ConvertTo-RenewEpochSec ([datetime]$prev) }
+                $gap = [Math]::Max($gap, [double]$RecordEpochSec - $from)
+            }
         }
         if ($gap -gt $Lease.renewOkMaxGapSec) { $Lease.renewOkMaxGapSec = ConvertTo-RenewGapCeilingSec $gap }
     }
     $Lease.lastRenewOkStart = $CallStarted
     $Lease | Add-Member -NotePropertyName lastRenewOkStartMono -NotePropertyValue $CallStartedMono -Force
     $Lease | Add-Member -NotePropertyName lastRenewOkRecordEpochSec -NotePropertyValue $RecordEpochSec -Force
+    $Lease | Add-Member -NotePropertyName lastRenewOkStartWallKnown -NotePropertyValue ($CallStartedWallKnown -ne $false) -Force
+}
+
+function Test-RenewGapFromWallUnknown {
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r6 (sol r5 B1): $true when a gap from the lease's last successful renew must NOT use that renew's wall start:
+    # the anchor's wall reading is unknown (its start pair was never tight, lastRenewOkStartWallKnown -eq $false), it has a monotonic start, and
+    # heavy-slot.py's record time is known at BOTH ends (-ToRecord: the record that closes the gap, or the agent's now for the open gap), so the
+    # record-to-record reading stands in for the wall term. Otherwise $false: the gap is measured as in r5 (an unknown wall reading is then a
+    # lower bound read before Process.Start, which can only read long). The activation anchor (-UseOk $false) is always known.
+    param([Parameter(Mandatory = $true)]$Lease, [bool]$UseOk, $PrevMono, $PrevRecord, $ToRecord)
+    if (-not $UseOk) { return $false }
+    if ($Lease.lastRenewOkStartWallKnown -ne $false) { return $false }
+    return ($null -ne $PrevMono -and $null -ne $PrevRecord -and $null -ne $ToRecord)
 }
 
 function ConvertTo-RenewEpochSec {
@@ -3843,10 +3874,15 @@ function Get-QuietLeaseRenewOkGapSec {
     $prev = if ($useOk) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
     $prevMono = if ($useOk) { $Lease.lastRenewOkStartMono } else { $Lease.activeAtMono }
     $nowWall = Get-Date
-    $open = Get-RenewGapSec -FromWall $prev -FromMono $prevMono -ToWall $nowWall -ToMono (Get-AgentMonotonicSec)
-    # r5 (sol r4 A2): the open gap as heavy-slot.py reads it too (now minus its last success's own record wall time), when that was reported.
+    $nowMono = Get-AgentMonotonicSec
     $prevRecord = if ($useOk) { $Lease.lastRenewOkRecordEpochSec } else { $null }
-    if ($null -ne $prevRecord) { $open = [Math]::Max($open, (ConvertTo-RenewEpochSec $nowWall) - [double]$prevRecord) }
+    $nowEpoch = ConvertTo-RenewEpochSec $nowWall
+    # r6 (sol r5 B1): from an anchor whose wall reading is unknown (an exhausted start pair), the open gap is monotonic plus heavy-slot.py's
+    # own reading (now minus its last record), never the unknown wall reading beside the monotonic one (Test-RenewGapFromWallUnknown).
+    if (Test-RenewGapFromWallUnknown -Lease $Lease -UseOk $useOk -PrevMono $prevMono -PrevRecord $prevRecord -ToRecord $nowEpoch) { $open = $nowMono - [double]$prevMono }
+    else { $open = Get-RenewGapSec -FromWall $prev -FromMono $prevMono -ToWall $nowWall -ToMono $nowMono }
+    # r5 (sol r4 A2): the open gap as heavy-slot.py reads it too (now minus its last success's own record wall time), when that was reported.
+    if ($null -ne $prevRecord) { $open = [Math]::Max($open, $nowEpoch - [double]$prevRecord) }
     return ConvertTo-RenewGapCeilingSec ([Math]::Max([double]$Lease.renewOkMaxGapSec, $open))
 }
 
@@ -3878,7 +3914,8 @@ function Update-QuietLeaseRenew {
             $Lease.renewCall = $null
             # r5 (sol r4 A2): the renew's own record wall time (its printed flag's "renewed") is a further reading of the gap; $null (none printed)
             # ends the gap at this collection, never at the exit stamp (adversary pass 9 A1).
-            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started -CallStartedMono $c.startedMono -Call $c -RecordEpochSec (Get-RenewRecordEpochSec -Stdout $r.stdout) }
+            # r6 (sol r5 B1): the call's startedWallKnown travels with its anchor.
+            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started -CallStartedMono $c.startedMono -CallStartedWallKnown $c.startedWallKnown -Call $c -RecordEpochSec (Get-RenewRecordEpochSec -Stdout $r.stdout) }
             else {
                 $Lease.renewFailures++
                 Add-AgentLogLine "quiet-lease: renew-failed job=$($Lease.jobId) rc=$($r.rc) out=[$($r.stdout)] err=[$($r.stderr)]; not fatal (the lease goes stale at 120 s without a renew)"
@@ -4019,7 +4056,11 @@ function Confirm-QuietLeaseHeldForLaunch {
     $preLaunchCall = Start-HeavySlotCli -Arguments @("lease", "renew", "--label", $l.label)
     # r5 (sol r4 A3's sibling): the anchor is the call's own start, read immediately before Process.Start (after Start-HeavySlotCli's checks
     # and set-up), so a stall there never inflates the next gap; the readings above remain only for a call that did not start.
-    if ($preLaunchCall.ok -and $null -ne $preLaunchCall.started -and $null -ne $preLaunchCall.startedMono) { $preLaunchStart = $preLaunchCall.started; $preLaunchStartMono = $preLaunchCall.startedMono }
+    # r6 (sol r5 B1): with the call's anchor goes its startedWallKnown ($false: an exhausted start pair; the gap readers then never pair its
+    # wall reading with its monotonic one). The fallback readings above are used only for a call that did not start, which never reaches
+    # Register-QuietLeaseRenewOk.
+    $preLaunchWallKnown = $null
+    if ($preLaunchCall.ok -and $null -ne $preLaunchCall.started -and $null -ne $preLaunchCall.startedMono) { $preLaunchStart = $preLaunchCall.started; $preLaunchStartMono = $preLaunchCall.startedMono; $preLaunchWallKnown = $preLaunchCall.startedWallKnown }
     $r = Complete-HeavySlotCli -Call $preLaunchCall -TimeoutSec $LeaseRenewTimeoutSec -HeartbeatActivity "pre-launch job=$JobId"
     if (-not $r.done) { $l.renewSlow++; return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "pre-launch lease renew: $($r.why)" } }
     $flag = $null
@@ -4029,7 +4070,7 @@ function Confirm-QuietLeaseHeldForLaunch {
         return [pscustomobject]@{ ok = $false; reason = "holder-lost"; why = "pre-launch lease renew rc=$($r.rc) did not return this lease's active flag (slot $($l.active.slot), pid $($l.active.ownerPid)): out=[$($r.stdout)] err=[$($r.stderr)]" }
     }
     $l.renewsOk++
-    Register-QuietLeaseRenewOk -Lease $l -CallStarted $preLaunchStart -CallStartedMono $preLaunchStartMono -RecordEpochSec (Get-RenewRecordEpochSec -Stdout $r.stdout)   # collected as it exits (a bounded wait): no -Call; r5: its record wall time
+    Register-QuietLeaseRenewOk -Lease $l -CallStarted $preLaunchStart -CallStartedMono $preLaunchStartMono -CallStartedWallKnown $preLaunchWallKnown -RecordEpochSec (Get-RenewRecordEpochSec -Stdout $r.stdout)   # collected as it exits (a bounded wait): no -Call; r5: its record wall time
     $l.lastRenewStart = Get-Date
     $l | Add-Member -NotePropertyName lastRenewStartMono -NotePropertyValue (Get-AgentMonotonicSec) -Force
     return [pscustomobject]@{ ok = $true; reason = $null; why = "quiet lease slot $($l.active.slot) held=$($l.active.held) renewed pre-launch" }
