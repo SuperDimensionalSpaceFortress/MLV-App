@@ -34023,7 +34023,6 @@ int MainWindow::presentedPlaybackUnreducedCpuDebayerScale( void ) const
     return playback_info_label::unreducedCpuDebayerScale(
         telemetryBoolValue( telemetry, "processed16_stage_measured" ),
         telemetryBoolValue( telemetry, "gpu_playback_recon_texture_present_active" ),   // r16 pass 17 A1: not the GPU recon flag
-        m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer,
         telemetryIntValue( telemetry, "render_thread_source_width" ),
         telemetryIntValue( telemetry, "render_thread_rendered_width" ) );
 }

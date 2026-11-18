@@ -1170,23 +1170,22 @@ TEST(PlaybackInfoLabel, R13P15A2APlayToggleClearsThePreviousPlaysStall)
 TEST(PlaybackInfoLabel, R13P16A1GpuPrepFrameDebayeredFullSizeNamesFullAndTheSelectedDebayer)
 {
     // the finding's frame: no CPU processed stage, no GPU recon, no GPU debayer, rendered 1920 of 1920 -> 1
-    ASSERT_EQ(1, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 1920));
+    ASSERT_EQ(1, playback_info_label::unreducedCpuDebayerScale(false, false, 1920, 1920));
     // a reduced recon consumed by the render (960 of 1920) -> 2
-    ASSERT_EQ(2, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 960));
+    ASSERT_EQ(2, playback_info_label::unreducedCpuDebayerScale(false, false, 1920, 960));
     // any other frame keeps the render's report (0): a CPU processed frame, a Bayer-texture-presented frame (r16: not the GPU
-    // recon as such, which a read-back CPU debayer follows), a GPU debayer, unreadable sizes
-    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(true, false, false, 1920, 1920));
-    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, true, false, 1920, 1920));
-    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, true, 1920, 1920));
-    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, false, 0, 1920));
-    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 0));
+    // recon as such, which a read-back CPU debayer follows, nor a GPU debayer, which debayers the source size), unreadable sizes
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(true, false, 1920, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, true, 1920, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, 0, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, false, 1920, 0));
     for (int scale : {2, 4}) {
         playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
         f.processingBadge = QStringLiteral("GPU Preview");
         f.gpuDisplay = true;
         f.dualIsoClip = false;
         f.requestedScale = scale;
-        const int shown = playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 1920);
+        const int shown = playback_info_label::unreducedCpuDebayerScale(false, false, 1920, 1920);
         f.presentedScale = shown > 0 ? shown : scale;
         f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, scale, f.requestedScale, f.presentedScale);
         f.debayerScale = shown;
@@ -1201,7 +1200,7 @@ TEST(PlaybackInfoLabel, R13P16A1GpuPrepFrameDebayeredFullSizeNamesFullAndTheSele
     ASSERT_TRUE(unreduced.contains(QStringLiteral("playback_info_label::unreducedCpuDebayerScale(")));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"processed16_stage_measured\" ),")));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"gpu_playback_recon_texture_present_active\" ),")));
-    ASSERT_TRUE(unreduced.contains(QStringLiteral("m_lastPresentedFrameUsedGpuAmazeDebayer || m_lastPresentedFrameUsedGpuBilinearDebayer,")));
+    ASSERT_FALSE(unreduced.contains(QStringLiteral("m_lastPresentedFrameUsedGpuAmazeDebayer")));   // r16 pass 18 A1
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_source_width\" ),")));
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_rendered_width\" ) );")));
     const QString shownBody = functionBody(source, QStringLiteral("int MainWindow::presentedPlaybackScaleShown("));
@@ -1220,10 +1219,10 @@ TEST(PlaybackInfoLabel, R13P16A1GpuPrepFrameDebayeredFullSizeNamesFullAndTheSele
 TEST(PlaybackInfoLabel, R16P17A1ReadbackGpuReconFrameDebayeredFullSizeNamesFullAndTheSelectedDebayer)
 {
     // the finding's frame: not texture-presented, no CPU processed stage, no GPU debayer, rendered 1920 of 1920 -> 1
-    const int shown = playback_info_label::unreducedCpuDebayerScale(false, false, false, 1920, 1920);
+    const int shown = playback_info_label::unreducedCpuDebayerScale(false, false, 1920, 1920);
     ASSERT_EQ(1, shown);
     // a frame the viewport presented as a Bayer texture keeps the render's report
-    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, true, false, 1920, 1920));
+    ASSERT_EQ(0, playback_info_label::unreducedCpuDebayerScale(false, true, 1920, 1920));
     playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
     f.processingBadge = QStringLiteral("GPU Preview");
     f.gpuDisplay = true;
@@ -1243,7 +1242,35 @@ TEST(PlaybackInfoLabel, R16P17A1ReadbackGpuReconFrameDebayeredFullSizeNamesFullA
     ASSERT_TRUE(unreduced.contains(QStringLiteral("telemetryBoolValue( telemetry, \"gpu_playback_recon_texture_present_active\" ),")));
     ASSERT_FALSE(unreduced.contains(QStringLiteral("\"gpu_playback_recon_used\"")));
     const QString header = readRepoFile(QStringLiteral("platform/qt/PlaybackInfoLabelPolicy.h"));
-    ASSERT_TRUE(header.contains(QStringLiteral("inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuTexturePresent, bool gpuDebayer,")));
+    ASSERT_TRUE(header.contains(QStringLiteral("inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuTexturePresent, int sourceWidth,")));
+}
+
+// r16 (adversary pass 18 A1 on 0ec1f394): ordinary 1920x1088 AMaZE receipt, Don't Switch Debayer, GL viewport, GPU processing,
+// GPU AMaZE debayer, MLVAPP_PLAYBACK_SCALE_FACTOR=2, recon texture presentation off. GPU AMaZE debayers and presents 1920 wide, but
+// the helper refused a GPU-debayered frame and the shown scale fell back to the reported 2: the labels read "Half", not "Half->Full".
+// GPU bilinear and requested 4/8 share it. (A2: an overflowing size input keeps the render's report.)
+TEST(PlaybackInfoLabel, R16P18A1GpuDebayerFrameNamesTheScaleItWasShownAt)
+{
+    for (int scale : {2, 4, 8}) {
+        const int shown = playback_info_label::unreducedCpuDebayerScale(false, false, 1920, 1920);
+        ASSERT_EQ(1, shown);
+        for (const QString gpu : {QStringLiteral("AMaZE"), QStringLiteral("Bilinear")}) {
+            playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+            f.gpuDisplay = true;
+            f.debayerOnGpu = true;
+            f.gpuDebayer = gpu;
+            f.requestedScale = scale;
+            f.presentedScale = shown;
+            f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, scale, f.requestedScale, f.presentedScale);
+            f.debayerScale = shown;
+            ASSERT_QSTR_EQ(QString(PlaybackScaleLabel::fractionWord(scale)) + QStringLiteral("->Full"), playback_info_label::scaleField(f));
+            const QString expect = gpu == QStringLiteral("AMaZE") ? QStringLiteral("AMaZE (GPU)") : QStringLiteral("AMaZE->Bilinear (GPU)");
+            ASSERT_QSTR_EQ(expect, playback_info_label::debayerField(f));
+        }
+    }
+    // A2: sizes that would overflow the product keep the render's report
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 2147483647, 1, 2));
+    ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 2147483647));
 }
 
 // r16 (adversary pass 17 A2 on 06faad35): HQ Dual-ISO, AMaZE, CPU 8-bit presentation, fast playback processing, scale 1, GPU

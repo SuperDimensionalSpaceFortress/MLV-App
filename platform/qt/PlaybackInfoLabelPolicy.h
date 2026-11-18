@@ -244,6 +244,8 @@ inline int presentedScaleOfCpuPrepRoute( int renderActiveScale, int sourceWidth,
 {
     if( sourceWidth <= 0 || renderedWidth <= 0 || renderedWidth > sourceWidth || prepReducedFactor < 1 ) return renderActiveScale;
     const int achieved = static_cast<int>( std::lround( static_cast<double>( sourceWidth ) / static_cast<double>( renderedWidth ) ) );
+    // r16 (adversary pass 18 A2): bound both factors before the product, so no input overflows it
+    if( achieved > 8 || prepReducedFactor > 8 ) return renderActiveScale;
     const int scale = achieved * prepReducedFactor;
     return ( scale == 1 || scale == 2 || scale == 4 || scale == 8 ) ? scale : renderActiveScale;
 }
@@ -263,10 +265,12 @@ inline int debayerScaleOfCpuPrepRoute( int sourceWidth, int renderedWidth )
  *  thread reports the requested scale for it. Only for such a frame: no CPU processed stage, not presented by the viewport as a
  *  Bayer texture (gpu_playback_recon_texture_present_active), no GPU debayer. r16 (adversary pass 17 A1 on 06faad35): a GPU
  *  recon as such does not disqualify it; with texture presentation off the CUDA recon is read back and the CPU debayers it.
+ *  r16 (adversary pass 18 A1 on 0ec1f394): nor does a GPU debayer; GPU AMaZE and GPU bilinear debayer the source size
+ *  (RenderFrameThread), so the sizes name what is shown, and debayerField names a GPU debayer before it reads the scale.
  *  0 = not such a frame or unreadable sizes (the caller keeps the render's report). */
-inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuTexturePresent, bool gpuDebayer, int sourceWidth, int renderedWidth )
+inline int unreducedCpuDebayerScale( bool processedStageMeasured, bool gpuTexturePresent, int sourceWidth, int renderedWidth )
 {
-    if( processedStageMeasured || gpuTexturePresent || gpuDebayer ) return 0;
+    if( processedStageMeasured || gpuTexturePresent ) return 0;
     return debayerScaleOfCpuPrepRoute( sourceWidth, renderedWidth );
 }
 
