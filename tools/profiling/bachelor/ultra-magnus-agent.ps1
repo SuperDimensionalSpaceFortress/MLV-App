@@ -3652,8 +3652,9 @@ function Get-QuietLeaseRenewOkGapSec {
 function ConvertTo-RenewGapCeilingSec {
     # BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2): a renew gap in seconds, rounded UP to 0.1 s. Every guard compares it with a
     # strict "-gt $script:LeaseRenewStaleSec", so rounding to the nearest turned 120.04 s into 120.0 and let a demoted lease run.
+    # Pass 2 A4: no pre-rounding before the ceiling (it turned 120.00000001 into 120.0); float noise can only read 0.1 s HIGH.
     param([double]$Sec)
-    return [Math]::Ceiling([Math]::Round($Sec * 10, 6)) / 10
+    return [Math]::Ceiling($Sec * 10) / 10
 }
 
 function Update-QuietLeaseRenew {

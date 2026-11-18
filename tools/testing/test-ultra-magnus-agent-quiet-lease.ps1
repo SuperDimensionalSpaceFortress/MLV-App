@@ -5828,7 +5828,13 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rsOut.failures -eq 0 -and $rsOut.slow -eq 0 -and $rsOut.ok -ge 1) "renew-slow-monitor-slice: the renews succeed (late is the only fault modelled): $rsTxt"
         Assert-True ($rsOut.okMaxGapSec -lt 90 -and $rsOut.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 70-90 s monitor slices the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsOut.okMaxGapSec) checkMaxGapSec=$($rsOut.checkMaxGapSec): $rsTxt"
         Assert-True ($rsOut.okMaxGapSec + 0.05 -ge $rsOut.recordMaxGapSec) "renew-slow-monitor-slice: the agent's measured gap never under-reads heavy-slot.py's gap between renew records (okMaxGapSec=$($rsOut.okMaxGapSec) recordMaxGapSec=$($rsOut.recordMaxGapSec))"
-        Assert-True ($agentText.Contains('Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -OnEach { Invoke-QuietLeaseRenewTick }')) "renew-slow-monitor-slice: the job monitor loop passes the renew tick into its descendant walk"
+        # Pass 2 A3: matched against the REAL monitor loop (the while loop over $jobProcess in Invoke-QueuedJob's AST, comments excluded), so a
+        # comment carrying the call, or the call anywhere else, does not satisfy it.
+        $rsQj = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
+        $rsLoop = if ($null -ne $rsQj) { $rsQj.Find({ param($n) $n -is [System.Management.Automation.Language.WhileStatementAst] -and $n.Condition.Extent.Text -match '\$jobProcess\.HasExited' }, $true) } else { $null }
+        $rsCalls = if ($null -ne $rsLoop) { @($rsLoop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Get-DescendantProcessIdentities' }, $true)) } else { @() }
+        $rsWired = @($rsCalls | Where-Object { $_.Extent.Text -match '-OnEach\s*\{\s*Invoke-QuietLeaseRenewTick\s*\}' })
+        Assert-True ($rsCalls.Count -ge 1 -and $rsWired.Count -eq $rsCalls.Count) "renew-slow-monitor-slice: the job monitor loop passes the renew tick into every descendant walk it runs (calls=$($rsCalls.Count) wired=$($rsWired.Count))"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
     }
@@ -5836,6 +5842,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     # shorter than heavy-slot.py's. A1: a renew whose process ExitTime reads EARLY (a clock step: exit t0+105.02 s, collected at t0+125 s) must not
     # shorten the gap below the collection's 125 s. A2: a gap of 120.042 s must read over 120 (rounded up, never to the nearest 120.0), so the
     # strict "-gt LeaseRenewStaleSec" guards refuse it. Both drive the REAL Update-QuietLeaseRenew + Get-QuietLeaseRenewOkGapSec on a virtual clock.
+    # Pass 2 A4: the helper itself rounds a sub-tick excess up too (asserted where the round-up case runs).
+    if ((Test-Case 'renew-gap-round-up') -and $batchLifted -contains 'ConvertTo-RenewGapCeilingSec') {
+        Assert-True ((ConvertTo-RenewGapCeilingSec 120.00000001) -gt 120 -and (ConvertTo-RenewGapCeilingSec 120.0) -eq 120.0 -and (ConvertTo-RenewGapCeilingSec 119.91) -eq 120.0) "renew-gap-round-up: ConvertTo-RenewGapCeilingSec rounds up to 0.1 s ($(ConvertTo-RenewGapCeilingSec 120.00000001), $(ConvertTo-RenewGapCeilingSec 120.0), $(ConvertTo-RenewGapCeilingSec 119.91))"
+    }
     foreach ($gc in @(@{ name = 'renew-gap-clock-step'; exitSec = 105.02; nowSec = 125.0; minGap = 125.0 }, @{ name = 'renew-gap-round-up'; exitSec = 120.042; nowSec = 120.042; minGap = 120.05 })) {
         if (-not (Test-Case $gc.name)) { continue }
         $gcSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch }
