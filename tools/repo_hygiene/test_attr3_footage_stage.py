@@ -1557,10 +1557,16 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
     # fresh; each is submitted ONCE (an open um-run gave up on is read back by name from the outbox, never resubmitted; a RETRACTED / UNRESOLVED open ends
     # the batch), and claim-first ownership holds anyway. There is no shared submit API to route it through: like the four above, it calls um-run.ps1 directly
     # (um-run is the only writer to a venue share). test_venue_lease_batch.py pins "no JobId twice in one run".
+    # MINI3-CUTOVER-STATE-GAPS-1: tools/profiling/test-um-run-share-root-access.ps1 (the in-process test of um-run's typed SHARE_ACCESS_DENIED) is the sixth.
+    # Re-examined: it is a test harness, not a submitter. It runs um-run.ps1 -Command noop against a scratch or fake root with a stubbed -TestShareRootProbe, and
+    # um-run.ps1 throws SHARE_ACCESS_DENIED / "No agent heartbeat" (the share-root probe and the heartbeat check) BEFORE Invoke-UmRunDrop, so it never mints a JobId,
+    # never claims an inbox slot and never writes a job. It lives under tools/profiling/ (next to the module it exercises) rather than tools/testing/, so the
+    # directory exemption in _um_run_caller_paths does not cover it; it is pinned here by name instead of widening that exemption to every test-*.ps1.
     KNOWN_PRODUCTION_CALLERS = {GENERATOR, ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1",
                                 ROOT / "tools" / "profiling" / "dual-venue" / "Wait-VenueQuiet.ps1",
                                 ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1",
-                                ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeaseBatch.ps1"}
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeaseBatch.ps1",
+                                ROOT / "tools" / "profiling" / "test-um-run-share-root-access.ps1"}
 
     def _production_um_run_references(self) -> set[Path]:
         proc = subprocess.run(
@@ -2233,6 +2239,8 @@ class Attr3FootageStageCliEndToEndTests(unittest.TestCase):
             shutil.copy2(ROOT / "tools" / "profiling" / "bachelor" / name, fixture_bachelor / name)
         shutil.copy2(UM_RUN, fixture_profiling / "um-run.ps1")
         shutil.copy2(ROOT / "tools" / "profiling" / "UmRunDrop.psm1", fixture_profiling / "UmRunDrop.psm1")
+        # MINI3-CUTOVER-STATE-GAPS-1: um-run.ps1 probes the share root through ShareRootAccess.psm1 before it reads the heartbeat
+        shutil.copy2(ROOT / "tools" / "profiling" / "ShareRootAccess.psm1", fixture_profiling / "ShareRootAccess.psm1")
         # BACHELOR-THERMAL-GATE-WAIT-1 r14: um-run.ps1 reads the agent's result through dual-venue\VenueRawJson.psm1
         (fixture_profiling / "dual-venue").mkdir()
         shutil.copy2(ROOT / "tools" / "profiling" / "dual-venue" / "VenueRawJson.psm1", fixture_profiling / "dual-venue" / "VenueRawJson.psm1")

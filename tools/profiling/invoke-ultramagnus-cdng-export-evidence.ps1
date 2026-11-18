@@ -27,10 +27,13 @@ param(
     [int]$CandidateAsyncWriterThreadCount = 0,
     [string]$CandidateGpuExportBackend = "",
     [switch]$RequireElapsedImprovement,
-    [double]$MinElapsedImprovementPercent = 0.0
+    [double]$MinElapsedImprovementPercent = 0.0,
+    # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe used by Test-AgentHeartbeat. Production never passes this.
+    [scriptblock]$TestShareRootProbe = $null
 )
 
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSScriptRoot 'ShareRootAccess.psm1') -Force -DisableNameChecking
 
 if ($CandidateUseAsyncWriterCompression -and -not $CandidateUseAsyncWriter) {
     throw "-CandidateUseAsyncWriterCompression requires -CandidateUseAsyncWriter."
@@ -187,6 +190,17 @@ function Invoke-RobocopyMirror {
 function Test-AgentHeartbeat {
     param([Parameter(Mandatory = $true)][string]$Root)
     $heartbeat = Join-Path $Root "heartbeat.txt"
+    # MINI3-CUTOVER-STATE-GAPS-1: a share root this host cannot read (System error 5, no SMB credential) is not a missing heartbeat.
+    $rootAccess = Get-ShareRootAccess -Root $Root -Probe $TestShareRootProbe
+    if ($rootAccess.State -ceq 'ACCESS_DENIED') {
+        return [pscustomobject]@{
+            ok = $false
+            path = $heartbeat
+            ageSeconds = $null
+            text = $null
+            reason = (Get-ShareAccessDeniedLine -Root $Root)
+        }
+    }
     if (!(Test-Path -LiteralPath $heartbeat)) {
         return [pscustomobject]@{
             ok = $false

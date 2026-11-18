@@ -58,7 +58,8 @@
 #   3  capacity: DISK_FLOOR_REFUSED | HOST_COMMIT_REFUSED | BUILD_GUARD_REFUSED (the refusal text is printed verbatim)
 #   40 AGENT_BUSY (a live claim or queued ticket, another driver holds the venue lock, or um-run RETRACTED a job the agent never claimed)
 #   41 SHARE_UNREACHABLE (the share did not answer by name inside -ProbeTimeoutSec, the agent has no heartbeat, or the share stalled through placement:
-#      UMRUN_NOT_AFTER_PLACEMENT_STALL, the job never visible)
+#      UMRUN_NOT_AFTER_PLACEMENT_STALL, the job never visible). A share ROOT this host cannot read (System error 5, no SMB credential) prints the typed
+#      line `SHARE_ACCESS_DENIED <unc root>` first, then exits 41 too; 'No agent heartbeat' is kept for a readable share whose heartbeat is missing.
 #   42 SOURCE_COMMIT_UNRESOLVED   43 GATE_UNAVAILABLE   44 DLLPAIR_FAILED   45 ASSEMBLE_FAILED   46 STAGE_FAILED   47 STAGE_VERIFY_MISMATCH
 #   48 SMOKE_RUNNER_STAGE_FAILED  49 STAGE_UNRESOLVED (um-run stopped while the agent may still own the job; not retried)  50 STAGE_CAP_EXCEEDED (-MaxTotalSec ran out)
 #   51 RECEIPT_IO_FAILED (the receipt could not be read for the night check, the reservation could not be persisted -- staging did not start -- or the closing
@@ -103,6 +104,11 @@ param(
     # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
     # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
     [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0,
+    # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe Stop-ShareUnreachable uses (ShareRootAccess.psm1); throwing means the
+    # root cannot be read. Production passes none.
+    # (r16 merge of #826: this seam and -DllJobIdSuffix below are independent parameters; both are kept, neither side's behaviour is dropped.)
+    # (r18 merge of #814: the -TestSoundness* seams below are #814's, independent of this one; all are kept.)
+    [scriptblock]$TestShareRootProbe = $null,
     # Test-only (VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2): the call's first soundness read (r4: step 4's when a build.json is there, else step 8's) blocks its
     # worker this long first, as a read stuck on a dead SMB host does (Get-VenueStagedBuildManifest -TestReadDelayMs). Production passes none.
     [ValidateRange(0, 600000)][int]$TestSoundnessReadDelayMs = 0,
@@ -127,6 +133,8 @@ $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueStageReuse.psm1') -Force -DisableNameChecking
+$shareRootModule = Join-Path $here '..\ShareRootAccess.psm1'
+Import-Module $shareRootModule -Force -DisableNameChecking
 Import-Module (Join-Path $here '..\bachelor\AttrCudaArtifacts.psm1') -Force -DisableNameChecking
 
 $ExitCodes = [ordered]@{
@@ -250,6 +258,29 @@ function Invoke-Bounded([scriptblock]$Script, [object[]]$ArgList, [double]$Sec) 
     finally { $ps.Dispose() }
 }
 
+function Stop-ShareUnreachable([string]$Detail) {
+    # MINI3-CUTOVER-STATE-GAPS-1 (adversary A13): Test-Path answers $false for a share ROOT this host has no SMB credential for (System error 5), exactly as for a
+    # missing cache, so every SHARE_UNREACHABLE exit asks the root first (one attribute read, bounded, never a listing) and prints the typed line verbatim when
+    # it is denied. The exit stays SHARE_UNREACHABLE (41); a readable or unreachable root keeps its own detail text only.
+    $state = ''
+    try {
+        # Bounded by what is LEFT of the total cap as well as by -ProbeTimeoutSec (adversary pass 2, A16): this probe runs after the cap may have nearly passed.
+        # No floor: with under 1 s left (or the cap already passed) the probe is skipped and the plain detail is reported, so the probe can never run past the
+        # cap (adversary pass 3, A9: a Max(1, ...) floor re-opened a 1 s probe after the deadline).
+        # r12 A6: the -TestShareRootProbe seam takes the SAME bounded path (its text is handed to the worker and rebuilt there, so it must be self-contained); it used
+        # to run synchronously outside Invoke-Bounded, past both limits.
+        $rbSec = [Math]::Min([int]$ProbeTimeoutSec, [int](Get-RemainingSec))
+        if ($rbSec -ge 1) {
+            $probeText = $(if ($TestShareRootProbe) { $TestShareRootProbe.ToString() } else { '' })
+            $rb = Invoke-Bounded { param($mod, $r, $pt) Import-Module -Name $mod -Force -DisableNameChecking; if ($pt) { (Get-ShareRootAccess -Root $r -Probe ([scriptblock]::Create($pt))).State } else { (Get-ShareRootAccess -Root $r).State } } @($shareRootModule, $share, $probeText) $rbSec
+            # r18 merge of #814: an answer that arrived after the deadline is never acted on (#814's rule for every share read), so it adds no typed line.
+            if ($rb.ok -and ([DateTime]::UtcNow - $script:Deadline).TotalSeconds -lt 0.0) { $state = [string]$rb.value }
+        }
+    } catch { $state = '' }
+    if ($state -ceq 'ACCESS_DENIED') { Stop-Nightly 'SHARE_UNREACHABLE' "$Detail (the share root $share cannot be read: access denied, not a missing share; store the SMB credential for that host with cmdkey, tools\workstation\README.md step 6b)" -Verbatim @("SHARE_ACCESS_DENIED $share") }
+    Stop-Nightly 'SHARE_UNREACHABLE' $Detail
+}
+
 function Get-ProbeSec([string]$What) {
     # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r2 (adversary A3 on 90b1c58e): -MaxTotalSec is the total wall-clock cap, so every share probe gets min(-ProbeTimeoutSec,
     # what is left of it), in seconds with their fraction. Under 1 s left there is no read to make: the cap ran out (STAGE_CAP_EXCEEDED), nothing more is read or written.
@@ -263,8 +294,9 @@ function Read-Share([string]$What, [scriptblock]$Script, [object[]]$ArgList) {
     $sec = Get-ProbeSec $What
     $b = Invoke-Bounded $Script $ArgList $sec
     if ($b.timedOut -and ($sec -lt $ProbeTimeoutSec -or $b.capCut)) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What : $($b.error), the rest of the $MaxTotalSec s cap" }
-    if ($b.timedOut) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What : $($b.error)" }
-    if (-not $b.ok) { Stop-Nightly 'SHARE_UNREACHABLE' "reading $What failed: $($b.error)" }
+    # MINI3-CUTOVER-STATE-GAPS-1 (kept through the r18 merge of #814): both SHARE_UNREACHABLE exits go through Stop-ShareUnreachable (root probe, typed line).
+    if ($b.timedOut) { Stop-ShareUnreachable "reading $What : $($b.error)" }
+    if (-not $b.ok) { Stop-ShareUnreachable "reading $What failed: $($b.error)" }
     # r9 fix iteration (adversary A1 on be203fe6, sibling): an answer that arrived after the deadline is never acted on
     $past = ([DateTime]::UtcNow - $script:Deadline).TotalSeconds
     if ($past -ge 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "reading $What answered $([Math]::Round($past, 2)) s after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
@@ -483,7 +515,7 @@ Assert-VenueFree 'before anything was built'
 $reachSec = Get-ProbeSec "the agent share cache '$cache'"
 $reach = Invoke-Bounded { param($p) Test-Path -LiteralPath $p -PathType Container } @($cache) $reachSec
 if ($reach.timedOut -and ($reachSec -lt $ProbeTimeoutSec -or $reach.capCut)) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' did not answer in $($reach.error), the rest of the $MaxTotalSec s cap" }
-if (-not $reach.ok -or $reach.value -ne $true) { Stop-Nightly 'SHARE_UNREACHABLE' "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
+if (-not $reach.ok -or $reach.value -ne $true) { Stop-ShareUnreachable "the agent share cache '$cache' did not answer as a directory ($(if ($reach.error) { $reach.error } else { 'not found' }))" }
 if (([DateTime]::UtcNow - $script:Deadline).TotalSeconds -ge 0.0) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the agent share cache '$cache' answered after the $MaxTotalSec s cap ran out; an answer past the cap is never acted on" }
 
 # ------------------------------------------------------------------ 4. idempotency: what the cache already holds, by name --------------------------------------------------
@@ -515,7 +547,9 @@ $runnerPresent = [bool](Read-Share "$cache\$runnerDirName" $PathByName @((Join-P
 $buildInCache = $false
 if ($cached.present) {
     $step4 = Read-StagedSoundness 'before anything was built'
-    if ($step4.state -ceq 'UNREACHABLE') { Stop-Nightly 'SHARE_UNREACHABLE' "the soundness read of the staged build of $commit did not answer before anything was built: $($step4.error)" }
+    # r18 merge of #814 into MINI3-CUTOVER-STATE-GAPS-1: #814's soundness-read SHARE_UNREACHABLE exit goes through Stop-ShareUnreachable too (same detail text;
+    # an access-denied share root adds the typed SHARE_ACCESS_DENIED line first).
+    if ($step4.state -ceq 'UNREACHABLE') { Stop-ShareUnreachable "the soundness read of the staged build of $commit did not answer before anything was built: $($step4.error)" }
     $buildInCache = Test-StagedSound $step4 $cached.hash
     if (-not $buildInCache) { Say "the $Venue cache holds a build.json for $commit that is not a sound staged build ($(Format-StagedSoundness $step4)); it is not taken as staged" }
 }
@@ -610,7 +644,7 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
         if ($notAfter.capUtc) { $call += ' -NotAfterCapUtc ' + (& $lit $notAfter.capUtc) }
     } elseif ($notAfter.notAfterUtc) { $call += ' -NotAfterUtc ' + (& $lit $notAfter.notAfterUtc) }
     if (@($Side).Count -gt 0) { $call += ' -SideFile @(' + ((@($Side) | ForEach-Object { & $lit $_ }) -join ', ') + ')' }
-    $text = "try { `$null = $call; [Console]::Out.WriteLine('UMRUN_RETURNED'); exit 0 } catch { [Console]::Out.WriteLine('UMRUN_ERROR ' + (`$_.Exception.Message -replace '\s+', ' ')); exit 1 }"
+    $text = "try { `$null = $call; [Console]::Out.WriteLine('UMRUN_RETURNED'); exit 0 } catch { [Console]::Out.WriteLine('UMRUN_ERROR ' + (`$_.Exception.Message -replace '[\r\n]+', ' ')); exit 1 }"
     $bound = $(if ($null -ne $notAfter.budgetSec) { "drop+$($notAfter.budgetSec)s cap=$(if ($notAfter.capUtc) { $notAfter.capUtc } else { 'none' })" } elseif ($notAfter.notAfterUtc) { $notAfter.notAfterUtc } else { 'none' })
     Say "submit $Step $JobId -> $Share notAfter=$bound ($($notAfter.source)) deadline=$($script:Deadline.ToString('o'))"
     $c = Invoke-Child "umrun-$Step" '' @() -CommandText $text
@@ -621,6 +655,9 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if (Test-UmRunJobIdInUseMessage -Message $msg -JobId $JobId) { return 'IN_USE' }
     if ($msg -match '^UNRESOLVED:') { Stop-Nightly 'STAGE_UNRESOLVED' "um-run $Step ($JobId): $msg (not retried in this call)" }
     if ($msg -match '^RETRACTED:') { Stop-Nightly 'AGENT_BUSY' "um-run $Step ($JobId) was never claimed: $msg" }
+    # MINI3-CUTOVER-STATE-GAPS-1: um-run throws the typed 'SHARE_ACCESS_DENIED <root>' when the share ROOT cannot be read (System error 5: this host has no SMB
+    # credential for it). It is printed verbatim FIRST, so no 'No agent heartbeat' text can come before it, and it keeps the SHARE_UNREACHABLE exit (41).
+    if ($msg -match '^SHARE_ACCESS_DENIED (\S.*)$') { $deniedRoot = $Matches[1].Trim(); Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step : the share root $deniedRoot cannot be read (access denied, not a missing heartbeat): store the SMB credential for that host with cmdkey, tools\workstation\README.md step 6b" -Verbatim @("SHARE_ACCESS_DENIED $deniedRoot") }
     if ($msg -match '^No agent heartbeat') { Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step : $msg" }
     # r2: the drop refuses a cap (this call's deadline) that passed before its claim, before any share write; r3/r4: or during placement, before the job's
     # rename. r5 (Grok G5): the text says what holds in every case: the job was never made visible.
@@ -812,7 +849,8 @@ if (-not $final.present -or $final.hash -cne $expected) {
 # STAGE_OK for an unsound build that every reuse read had refused (the local build held the same unsound manifest, and the spent default JobId's
 # "cache holds the expected hash" fallback skipped the submission). STAGE_OK and STAGE_SKIP_ALREADY are recorded only for a SOUND staged build.
 $finalSound = Read-StagedSoundness 'at the final verify' -FinalVerify
-if ($finalSound.state -ceq 'UNREACHABLE') { Stop-Nightly 'SHARE_UNREACHABLE' "the soundness read of the staged build of $commit did not answer at the final verify: $($finalSound.error); not recorded as staged" }
+# r18 merge of #814: routed through Stop-ShareUnreachable as every other SHARE_UNREACHABLE share read is (same detail text).
+if ($finalSound.state -ceq 'UNREACHABLE') { Stop-ShareUnreachable "the soundness read of the staged build of $commit did not answer at the final verify: $($finalSound.error); not recorded as staged" }
 if (-not (Test-StagedSound $finalSound $final.hash)) {
     Stop-Nightly 'STAGE_VERIFY_MISMATCH' "the $Venue cache holds the expected $cacheBuildJson ($($final.hash)) but it is not a sound staged build ($(Format-StagedSoundness $finalSound)); never recorded as staged (the hub re-assembles)"
 }
