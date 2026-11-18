@@ -15830,6 +15830,26 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.log(summary=None).replace(self.toggle(3, "begin"), "gui_smoke.window_toggles requested=4 driven=4 reason=ok\n" + self.toggle(3, "begin"), 1), (4, 4, 4, 4), False),
             "A5: no measured_session marker and no session id (zero markers is not one session)": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "", 1), (4, 4, 4, 4), False),
+            # r3 adversary pass on 1f00a482 (A1-A5): each case changes ONLY the field under attack
+            "r3-A1: a parenthesised tail on the summary that is no location (`(reason=incomplete)`)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok (reason=incomplete)"), (4, 4, 4, 4), False),
+            "r3-A1: a tail on toggle 1's begin record that is no location": (
+                self.log(mutate=lambda i, b, e: (b + " (position=0)" if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "r3-A1: a keep_playing record whose tail is no location counts for nothing": (
+                self.log(drop_keep=2, mutate=lambda i, b, e: (b + "\n" + self.KEEP + " (not-a-location)" if i == 2 else b, e)), (4, 4, 3, 4), False),
+            "r3-A1: a real location tail on the summary is still cut": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok (C:/build x/MainWindow.cpp:10975)"), (4, 4, 4, 4), True),
+            "r3-A2: a fifth toggle record with index= before phase= after the summary": (
+                self.log() + "\ngui_smoke.window_toggle index=4 phase=begin kind=restore at_ms=24000 elapsed_ms=24007 play_checked=1 position=410 presented_serial=4100 "
+                             "window=1920x1040 fullscreen=0 maximized=1", (5, 4, 4, 4), False),
+            "r3-A3: toggle 1's end window with padded zeros (01920x01080) is no changed size": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", window="01920x01080") if i == 1 else e)), (4, 3, 3, 3), False),
+            "r3-A4: a playback_smoke record of another session right after the marker closes the measured window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.start session=4 position=10\n", 1), (0, 0, 0, 0), False),
+            "r3-A5: position=10 inside a quoted diagnostic value is no field": (
+                self.log(mutate=lambda i, b, e: (b.replace("position=10 ", 'diagnostic="lost position=10 tail" ', 1) if i == 0 else b, e)), (4, 3, 3, 3), False),
+            "r3-A5: a stray bare word on the summary makes it unreadable": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok extra"), (4, 4, 4, 4), False),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (

@@ -7416,12 +7416,23 @@ function Get-AttrCudaWindowToggleEvidence {
     # Each run-log line is reduced to the record body the app wrote: the optional `[utc] [LEVEL] [0x<thread>] ` prefix is dropped and the Qt location suffix
     # (` (<file>:<line>)`, written last; the app's own record bodies here hold no other ` (`) is cut at its first ` (`, so a path in the suffix can never
     # supply a field or a marker. A record counts only where it STARTS the body. A key that repeats inside one record makes that record unusable.
-    $lines = @($LogText -split "`r?`n" | ForEach-Object {
-        $body = [regex]::Replace($_, '^\s*(?:\[[^\]]*\]\s*)*', '')
+    # r3 (adversary A1 on 1f00a482): the cut tail must BE a location, ` (<path>:<digits>)` to the very end of the line with a path of at least one character (the
+    # runner's Get-DvLogRecordBody rule); any other tail (`(reason=incomplete)`, text after the `)`, no line number) is no location, so its record is unreadable
+    # ($badTail) and a keep_playing line carrying it counts for nothing. It may refuse; it never forges.
+    $badTail = [System.Collections.Generic.HashSet[int]]::new()
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($rawLine in @($LogText -split "`r?`n")) {
+        $body = [regex]::Replace($rawLine, '^\s*(?:\[[^\]]*\]\s*)*', '')
         $cut = $body.IndexOf(' (', [StringComparison]::Ordinal)
-        if ($cut -ge 0) { $body = $body.Substring(0, $cut) }
-        $body
-    })
+        if ($cut -ge 0) {
+            $tail = $body.Substring($cut)
+            $digitAt = $tail.Length - 2
+            while ($digitAt -gt 2 -and $tail[$digitAt] -ge [char]'0' -and $tail[$digitAt] -le [char]'9') { $digitAt-- }
+            if (-not ($tail.EndsWith(')', [StringComparison]::Ordinal) -and $digitAt -lt $tail.Length - 2 -and $digitAt -gt 2 -and $tail[$digitAt] -ceq [char]':')) { [void]$badTail.Add($lines.Count) }
+            $body = $body.Substring(0, $cut)
+        }
+        $lines.Add($body)
+    }
     $anomalies = [System.Collections.Generic.List[string]]::new()
     $markerIds = @{}
     $start = 0
@@ -7433,14 +7444,19 @@ function Get-AttrCudaWindowToggleEvidence {
             if ($wanted -eq '' -or $Matches['id'] -ceq $wanted) { $start = $i }
         }
     }
+    # r3 (A5 of the first r3 round): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
+    $windowId = $wanted
     if ($wanted -eq '') {
-        # r3 (A5): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
         if ($markerIds.Count -gt 1) { $anomalies.Add('measured-session-ambiguous') }
         elseif ($markerIds.Count -eq 0) { $anomalies.Add('measured-session-marker-absent') }
-    } else {
-        if (-not $markerIds.ContainsKey($wanted)) { $anomalies.Add('measured-session-marker-absent'); $start = $lines.Count }
+        else { $windowId = [string]@($markerIds.Keys)[0] }
+    } elseif (-not $markerIds.ContainsKey($wanted)) { $anomalies.Add('measured-session-marker-absent'); $start = $lines.Count }
+    # r3 (adversary A4 on 1f00a482): the window closes at the next marker of ANOTHER session AND at any playback_smoke record that names another session
+    # (`playback_smoke.start session=4 ...`), as the runner's own due-wake reader closes its window, so a foreign Play's toggles are never credited here
+    if ($windowId -ne '') {
         for ($i = $start + 1; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^playback_smoke\.measured_session id=(?<id>\S+)(\s|$)' -and $Matches['id'] -cne $wanted) { $end = $i; break }
+            if ($lines[$i] -match '^playback_smoke\.measured_session id=(?<id>\S+)(\s|$)') { if ($Matches['id'] -cne $windowId) { $end = $i; break } }
+            elseif ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+ (?:.* )?session=(?<sid>\S*)(\s|$)' -and $Matches['sid'] -cne $windowId) { $end = $i; break }
         }
     }
 
@@ -7453,12 +7469,22 @@ function Get-AttrCudaWindowToggleEvidence {
     $lastToggleLine = -1
     for ($i = $start; $i -lt $end; $i++) {
         $line = $lines[$i]
-        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') { $keepLines += $i; continue }
-        $isSummary = $line -match '^gui_smoke\.window_toggles '
-        if (-not $isSummary -and $line -notmatch '^gui_smoke\.window_toggle phase=') { continue }
+        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') { if (-not $badTail.Contains($i)) { $keepLines += $i }; continue }
+        # r3 (adversary A2 on 1f00a482): a toggle record is any record that starts with the name (phase= need not come first), so a record with index= before
+        # phase= is read, ordered and counted like the rest, never skipped
+        $isSummary = $line -match '^gui_smoke\.window_toggles(\s|$)'
+        if (-not $isSummary -and $line -notmatch '^gui_smoke\.window_toggle(\s|$)') { continue }
         if (-not $isSummary -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
         $values = @{}
         $repeatedKey = $false
+        # r3 (adversary A1 and A5 on 1f00a482): a record is WELL FORMED only when its tail is a location (or absent) and every token after the record name is one
+        # `<key>=<value>` with no quote in the value; a quoted field value, a bare word or a stray tail makes the whole record unusable (the app writes none of these
+        # in a toggle record), so a `<key>=` inside quoted text is never a field
+        $wellFormed = -not $badTail.Contains($i)
+        foreach ($token in ($line -split ' ' | Select-Object -Skip 1)) {
+            if ($token -cnotmatch '^[A-Za-z0-9_]+=[^\s"''`‘’“”]*$') { $wellFormed = $false; break }
+        }
+        if (-not $wellFormed) { $repeatedKey = $true }
         # r3 (B2): the value may be EMPTY (`[^\s]*`), so a key repeated with no value (` position=`, ` requested=`) still counts as repeated; an empty value is never a usable one
         foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]*)')) {
             if ($values.ContainsKey($match.Groups['key'].Value)) { $repeatedKey = $true }
@@ -7478,15 +7504,17 @@ function Get-AttrCudaWindowToggleEvidence {
         [long]$serial = -1
         [long]$elapsed = -1
         $window = $null
-        if ($values.ContainsKey('window') -and ([string]$values['window']) -match '^(?<w>\d+)x(?<h>\d+)$') { $window = $Matches['w'] + 'x' + $Matches['h'] }
+        # r3 (adversary A3 on 1f00a482): the size is canonical decimal (no leading zero, no sign), so `01920x01080` is neither a size nor a changed one; the
+        # numeric parts are compared as the strings they canonically are
+        if ($values.ContainsKey('window') -and ([string]$values['window']) -cmatch '^(?<w>[1-9][0-9]{0,5})x(?<h>[1-9][0-9]{0,5})$') { $window = $Matches['w'] + 'x' + $Matches['h'] }
         $usable = (-not $repeatedKey) -and ($values['phase'] -eq 'begin' -or $values['phase'] -eq 'end') -and
             $values.ContainsKey('kind') -and ($expectedKinds -contains [string]$values['kind']) -and
             $values.ContainsKey('play_checked') -and [int]::TryParse([string]$values['play_checked'], [ref]$playChecked) -and ($playChecked -eq 0 -or $playChecked -eq 1) -and
             $values.ContainsKey('fullscreen') -and [int]::TryParse([string]$values['fullscreen'], [ref]$fullscreen) -and ($fullscreen -eq 0 -or $fullscreen -eq 1) -and
             $values.ContainsKey('maximized') -and [int]::TryParse([string]$values['maximized'], [ref]$maximized) -and ($maximized -eq 0 -or $maximized -eq 1) -and
             $values.ContainsKey('position') -and [int]::TryParse([string]$values['position'], [ref]$position) -and
-            $values.ContainsKey('presented_serial') -and ([string]$values['presented_serial'] -match '^\d{1,15}$') -and
-            $values.ContainsKey('elapsed_ms') -and ([string]$values['elapsed_ms'] -match '^\d{1,15}$') -and
+            $values.ContainsKey('presented_serial') -and ([string]$values['presented_serial'] -cmatch '^[0-9]{1,15}$') -and
+            $values.ContainsKey('elapsed_ms') -and ([string]$values['elapsed_ms'] -cmatch '^[0-9]{1,15}$') -and
             ($null -ne $window)
         if (-not $usable) { $poisoned[$index] = $true; continue }
         $serial = [long]$values['presented_serial']
@@ -7508,8 +7536,8 @@ function Get-AttrCudaWindowToggleEvidence {
     else {
         $sv = $summaries[0].values
         $sumOk = (-not $summaries[0].repeated) -and
-            $sv.ContainsKey('requested') -and ([string]$sv['requested'] -match '^\d{1,6}$') -and
-            $sv.ContainsKey('driven') -and ([string]$sv['driven'] -match '^\d{1,6}$') -and
+            $sv.ContainsKey('requested') -and ([string]$sv['requested'] -cmatch '^[0-9]{1,6}$') -and
+            $sv.ContainsKey('driven') -and ([string]$sv['driven'] -cmatch '^[0-9]{1,6}$') -and
             $sv.ContainsKey('reason') -and ($sv['reason'] -ceq 'ok' -or $sv['reason'] -ceq 'incomplete')
         if (-not $sumOk) { $anomalies.Add('window-toggles-summary-unreadable') }
         else {
