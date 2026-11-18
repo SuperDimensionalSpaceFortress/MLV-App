@@ -96,21 +96,10 @@ $receiptFile = Join-Path $WindowDir 'ab-receipt.json'
 
 function Get-IsoUtc([DateTime]$t) { return $t.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', $inv) }
 
-function ConvertTo-UtcInstant($v) {
-    # ConvertFrom-Json already turns an ISO date string into a [DateTime] (UTC kind, whole ticks); a string is parsed as UTC. $null when
-    # it is neither. Never go through [string] of a DateTime: that drops the fraction and renders local time.
-    if ($null -eq $v -or "$v" -eq '') { return $null }
-    if ($v -is [DateTime]) { return $v.ToUniversalTime() }
-    if ($v -is [DateTimeOffset]) { return $v.UtcDateTime }
-    try { return [DateTimeOffset]::Parse([string]$v, $inv, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime } catch { return $null }
-}
-
 function Write-AtomicText([string]$Path, [string]$Text) {
-    # The temp name is FIXED (<path>.tmp, no pid) so the containment check can name it before anything is written: one driver per switch
-    # and one per window dir, so nothing else ever uses it (adversary r4 A4).
-    $tmp = $Path + '.tmp'
-    [IO.File]::WriteAllText($tmp, $Text, $utf8)
-    [IO.File]::Move($tmp, $Path, $true)
+    # r6 (a): the shared writer. A fresh CreateNew temp name is moved over the target and an aliased target is refused, so a planted
+    # <path>.tmp hard link onto an input is never opened, let alone truncated (adversary pass 6 A1).
+    Write-HeavySlotAbFile -Path $Path -Text $Text
 }
 
 function ConvertTo-FiniteOrNull($v) {
@@ -124,7 +113,8 @@ function ConvertTo-FiniteOrNull($v) {
 }
 
 function Add-JsonLine([string]$Path, $Obj) {
-    [IO.File]::AppendAllText($Path, (($Obj | ConvertTo-Json -Compress -Depth 6) + "`n"), $utf8)
+    # r6 (a): the shared writer in append mode (alias refused, never truncates)
+    Write-HeavySlotAbFile -Path $Path -Text (($Obj | ConvertTo-Json -Compress -Depth 6) + "`n") -Append
 }
 
 $script:refused = $false
@@ -142,6 +132,7 @@ function Read-Feed {
     # A row dated later than now + FeedFutureSkewSeconds is INVALID and dropped (counted in $script:feedFuture): a frozen future-dated row
     # would otherwise read as "fresh" for ever and hide a stalled feed (Dot B1).
     $script:feedFuture = 0
+    $script:feedUnknown = 0
     try {
         $fs = [IO.File]::Open($CoreTempFeed, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
         try {
@@ -162,14 +153,19 @@ function Read-Feed {
         finally { $fs.Dispose() }
         $lines = @([Text.Encoding]::ASCII.GetString($buf, 0, $got) -split "`r?`n")
         if ($from -gt 0 -and $lines.Count -gt 0) { $lines = @($lines | Select-Object -Skip 1) }   # the first line is a cut one
+        # r6 (b): the last segment is not newline-terminated while the writer is mid-row (or is the empty string after the final newline):
+        # it is never a row yet. Every COMPLETE line must be a header or a valid row; any other is unknown evidence ($script:feedUnknown).
+        if ($lines.Count -gt 0) { $lines = @($lines | Select-Object -First ($lines.Count - 1)) }
         $rows = New-Object System.Collections.Generic.List[object]
         foreach ($l in $lines) {
+            if (-not $l.Trim()) { continue }
             $f = $l -split ','
-            if ($f.Count -le $iTemp -or $f[0] -eq 'Date') { continue }
+            if ($f[0] -eq 'Date') { continue }
+            if ($f.Count -le $iTemp) { $script:feedUnknown++; continue }
             $dt = [DateTime]::MinValue
-            if (-not [DateTime]::TryParseExact(('{0} {1}' -f $f[$iDate], $f[$iTime]), 'dd.MM.yyyy HH:mm:ss.fff', $inv, [Globalization.DateTimeStyles]::None, [ref]$dt)) { continue }
+            if (-not [DateTime]::TryParseExact(('{0} {1}' -f $f[$iDate], $f[$iTime]), 'dd.MM.yyyy HH:mm:ss.fff', $inv, [Globalization.DateTimeStyles]::None, [ref]$dt)) { $script:feedUnknown++; continue }
             $temp = ConvertTo-FiniteOrNull $f[$iTemp]
-            if ($null -eq $temp) { continue }     # NaN / Infinity / unparseable temperature: the row is invalid, never "cool"
+            if ($null -eq $temp) { $script:feedUnknown++; continue }     # NaN / Infinity / unparseable temperature: unknown evidence, never "cool"
             $cpu = $null; $w = $null
             if ($iCpu -ge 0 -and $f.Count -gt $iCpu) { $cpu = ConvertTo-FiniteOrNull $f[$iCpu] }
             if ($iW -ge 0 -and $f.Count -gt $iW) { $w = ConvertTo-FiniteOrNull $f[$iW] }
@@ -242,24 +238,31 @@ function Get-LiveHolders {
     # judged counts as absent, so the figure can undercount (TRAPS.md:29367); it never invents a holder.
     # A record that CANNOT BE PARSED (a lock, a half-written file) is counted in $script:heldUnreadable and two polls in a row end the
     # window (held-unreadable); a record that is simply gone, or whose pid is not alive, is an absent holder.
+    # r6 (b): every record goes through the shared row parser (ticket, pid, pidStart required; a field of the wrong type is unknown
+    # evidence), and two records naming ONE ticket are unknown evidence: neither is counted, so a copied hold can never read as 2 holders
+    # (adversary pass 6 A7 driver sibling).
     $script:heldUnreadable = 0
     $out = New-Object System.Collections.Generic.List[object]
     $dir = Join-Path $HeavySlotDir 'held'
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @() }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $dups = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($f in [IO.Directory]::GetFiles($dir, '*.json')) {
         $h = $null
         try { $h = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json; if ($null -eq $h) { throw 'empty held record' } }
         catch { if (Test-Path -LiteralPath $f -PathType Leaf) { $script:heldUnreadable++ }; continue }
+        $pr = Read-HeavySlotAbRow -Row $h -Spec ([ordered]@{ ticket = 'string'; pid = 'int'; pidStart = 'time'; label = 'string?'; class = 'string?'; wholeMachine = 'bool?'; slots = 'array?' })
+        if (-not $pr.ok -or -not $pr.v.ticket.Trim()) { $script:heldUnreadable++; continue }
+        if (Test-HeavySlotAbDuplicate -Seen $seen -Key $pr.v.ticket) { [void]$dups.Add($pr.v.ticket); continue }
         try {
-            $p = Get-Process -Id ([int]$h.pid) -ErrorAction Stop
-            $rec = ConvertTo-UtcInstant $h.pidStart
-            if ($null -eq $rec) { continue }
-            if ($p.StartTime.ToUniversalTime().Ticks -ne $rec.Ticks) { continue }
-            $out.Add([pscustomobject]@{ label = [string]$h.label; slots = @($h.slots); cls = [string]$h.class; whole = ($h.wholeMachine -eq $true) })
+            $p = Get-Process -Id ([int]$pr.v.pid) -ErrorAction Stop
+            if ($p.StartTime.ToUniversalTime().Ticks -ne $pr.v.pidStart.Ticks) { continue }
+            $out.Add([pscustomobject]@{ ticket = $pr.v.ticket; label = [string]$pr.v.label; slots = @($pr.v.slots); cls = [string]$pr.v.class; whole = ($pr.v.wholeMachine -eq $true) })
         }
         catch { continue }
     }
-    return $out.ToArray()
+    if ($dups.Count -gt 0) { $script:heldUnreadable += $dups.Count }
+    return @($out.ToArray() | Where-Object { -not $dups.Contains($_.ticket) })
 }
 
 # ---- switch ------------------------------------------------------------------------------------------------------------------
@@ -298,7 +301,8 @@ function Set-Switch([string]$State, [int]$Count, [int]$Block) {
         $script:appliedBlock = $Block; $script:appliedState = $State; $script:appliedCount = $Count
         $script:switchAttemptStart = [DateTime]::UtcNow    # the start of the attempt that finally lands is the block's real start (adversary r4 A1)
         try { Write-AtomicText $SwitchPath (New-SwitchText $State $Count $Block); return } catch { $lastError = $_ }
-        if ([DateTime]::UtcNow -ge $giveUp) { break }
+        # r6 (c), the A6 rule: a retry may not START after the budget minus its maximum jitter (40 ms), so no attempt starts past the budget
+        if (-not (Test-HeavySlotAbRetryMayStart -Now ([DateTime]::UtcNow) -GiveUp $giveUp -MaxJitterMs 40)) { break }
         Start-Sleep -Milliseconds (10 + $jitter.Next(0, 30))
     }
     throw $lastError
@@ -384,10 +388,13 @@ function Get-LedgerFinding {
             $e = $null
             try { $e = $line | ConvertFrom-Json } catch { $e = $null }
             if ($null -eq $e -or $e -isnot [pscustomobject]) { return ('ledger-unreadable (a complete ledger line does not parse: {0})' -f $line.Substring(0, [Math]::Min(60, $line.Length))) }
-            $at = ConvertTo-UtcInstant $e.at
-            if ($null -eq $at -or $at -lt $script:windowStart) { continue }
-            if ([string]$e.event -eq 'unguarded') { return "unguarded ledger event ticket=$($e.ticket)" }
-            if ([string]$e.event -eq 'admit' -and ([string]$e.class -cne 'shared' -or $e.wholeMachine -eq $true)) { return "exclusive-admit ticket=$($e.ticket) class=$($e.class)" }
+            # r6 (b): the shared row parser. A complete record whose at / event is null, of the wrong type or not a date is UNKNOWN evidence
+            # and ends the window (adversary pass 6 A5: {"at":null,"event":"unguarded"} was skipped as undated).
+            $pr = Read-HeavySlotAbRow -Row $e -Spec ([ordered]@{ at = 'time'; event = 'string'; ticket = 'string?'; class = 'string?'; wholeMachine = 'bool?' })
+            if (-not $pr.ok) { return ('ledger-unreadable (unknown evidence: {0}; line {1})' -f $pr.why, $line.Substring(0, [Math]::Min(60, $line.Length))) }
+            if ($pr.v.at -lt $script:windowStart) { continue }
+            if ($pr.v.event -eq 'unguarded') { return "unguarded ledger event ticket=$($pr.v.ticket)" }
+            if ($pr.v.event -eq 'admit' -and ([string]$pr.v.class -cne 'shared' -or $pr.v.wholeMachine -eq $true)) { return "exclusive-admit ticket=$($pr.v.ticket) class=$($pr.v.class)" }
         }
     }
     catch { $script:ledgerFailed = $true }
@@ -415,9 +422,13 @@ function Get-ReceiptFinding {
             continue
         }
         [void]$script:knownReceipts.Add($nm)
-        if ($rc.wholeMachine -eq $true) { return "exclusive-admit receipt=$nm wholeMachine=true" }
+        # r6 (b): the shared row parser. A receipt that parses as JSON but whose class / wholeMachine has the wrong type is complete and
+        # will never change: unknown evidence at once (receipt-unreadable), never a receipt read as "shared".
+        $pr = Read-HeavySlotAbRow -Row $rc -Spec ([ordered]@{ class = 'string?'; wholeMachine = 'bool?' })
+        if (-not $pr.ok) { $stuck.Add("$nm ($($pr.why))"); continue }
+        if ($pr.v.wholeMachine -eq $true) { return "exclusive-admit receipt=$nm wholeMachine=true" }
         # fail closed: a receipt whose class is missing or empty is not "shared" (adversary r4 A5)
-        if ([string]$rc.class -cne 'shared') { return "exclusive-admit receipt=$nm class=$($rc.class)" }
+        if ([string]$pr.v.class -cne 'shared') { return "exclusive-admit receipt=$nm class=$($pr.v.class)" }
     }
     $script:receiptStuck = $stuck.ToArray()
     return $null
@@ -476,9 +487,9 @@ $script:windowLock = $null
 try {
     $lockDir = Split-Path -Parent $SwitchPath
     if ($lockDir) { New-Item -ItemType Directory -Path $lockDir -Force | Out-Null }
-    $script:switchLock = [IO.File]::Open(($SwitchPath + '.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $script:switchLock = Open-HeavySlotAbLockFile -Path ($SwitchPath + '.lock')     # r6 (a): an aliased lock name is refused, never locked through
 }
-catch { Write-Refused "driver-running (the switch lock $SwitchPath.lock is held by another driver, or cannot be taken: $($_.Exception.GetType().Name))" }
+catch { Write-Refused "driver-running (the switch lock $SwitchPath.lock is held by another driver, or cannot be taken: $($_.Exception.GetType().Name): $($_.Exception.Message))" }
 
 $self = Get-Process -Id $PID
 $script:selfTicks = $self.StartTime.ToUniversalTime().Ticks
@@ -503,6 +514,9 @@ try {
         $feed0 = @(Read-Feed)
         if ($feed0.Count -eq 0 -and $script:feedFuture -gt 0) { Write-Refused "feed-future ($($script:feedFuture) row(s) dated later than now + ${FeedFutureSkewSeconds}s and none valid)" }
         if ($feed0.Count -eq 0) { Write-Refused 'feed-unreadable' }
+        if ($script:feedUnknown -gt 0) { Write-Refused "feed-unreadable ($($script:feedUnknown) complete feed row(s) are unknown evidence)" }
+        $wm0 = Step-HeavySlotAbWatermark -Times ([DateTime[]]@($feed0 | ForEach-Object { $_.utc })) -Watermark $null
+        if ($wm0.Regressed) { Write-Refused "feed-time-regressed ($($wm0.Why))" }
         $feedAge0 = ([DateTime]::UtcNow - $feed0[-1].utc).TotalSeconds
         if ($feedAge0 -gt $PreflightFeedSeconds) { Write-Refused ('feed-stale age={0:N0}s' -f $feedAge0) }
         $mem0 = Get-MemoryProbe
@@ -526,7 +540,7 @@ try {
         # the life of the process and never removed, so it also marks the directory used for ever.
         if ($WindowClaimDelaySeconds -gt 0) { Start-Sleep -Milliseconds ([int]($WindowClaimDelaySeconds * 1000)) }
         New-Item -ItemType Directory -Path $WindowDir -Force | Out-Null
-        try { $script:windowLock = [IO.File]::Open((Join-Path $WindowDir 'ab-window.lock'), [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+        try { $script:windowLock = Open-HeavySlotAbLockFile -Path (Join-Path $WindowDir 'ab-window.lock') -CreateNew }
         catch { Write-Refused "window-dir-used (ab-window.lock in $WindowDir was claimed by another driver first, or cannot be created: $($_.Exception.GetType().Name))" }
     }
     catch {
@@ -594,27 +608,30 @@ try {
         $holders = @(Get-LiveHolders)
         if ($script:heldUnreadable -gt 0) { $badHeld++ } else { $badHeld = 0 }
         $rows = @(Read-Feed)
-        $newRows = @($rows | Where-Object { $_.utc -gt $lastRowUtc })
+        $feedUnknownNow = $script:feedUnknown
         # A feed row between two polls is only credited with 2+ holders when BOTH bracketing polls saw 2+: the holders are sampled, not
         # continuous, so a second holder seen at alternate polls is not sustained overlap (adversary r1 A7).
         $rowHolders = if ($null -eq $prevHolders) { $holders.Count } else { [Math]::Min([int]$prevHolders, $holders.Count) }
-        $regressedInRead = $false
-        foreach ($r in $newRows) {
-            # $prevRowUtc / $lastRowUtc are the NEWEST row time seen so far, never the time of the last row read: a row older than that
-            # (a valid cool row at t+25 followed by a hot row at t) is a regression in the feed itself and must not replace the watermark
-            # or silently get dt=0 (adversary r5 A1).
-            if ($null -ne $prevRowUtc -and $r.utc -lt $prevRowUtc.AddSeconds(-2)) { $regressedInRead = $true }
-            $dt = if ($null -ne $prevRowUtc) { [Math]::Min(6.0, [Math]::Max(0.0, ($r.utc - $prevRowUtc).TotalSeconds)) } else { 2.0 }
-            $rowWin.Add([pscustomobject]@{ utc = $r.utc; dt = $dt; temp = $r.temp; holders = $rowHolders })
-            if ($null -eq $prevRowUtc -or $r.utc -gt $prevRowUtc) { $prevRowUtc = $r.utc; $lastRowUtc = $r.utc }
+        # r6 (c): the shared ordering rule. The watermark ($prevRowUtc) is the MAXIMUM accepted row time; a read whose rows are not
+        # non-decreasing in file order, or whose newest row is older than the watermark, is REFUSED as a whole (feed-time-regressed). Rows are
+        # never filtered by the watermark BEFORE the order is checked, so a hot row dated below a future-dated cool one can no longer vanish
+        # (adversary pass 6 A2; r5 A1 and r4 A7 were the same class at the other two sites).
+        $step = Step-HeavySlotAbWatermark -Times ([DateTime[]]@($rows | ForEach-Object { $_.utc })) -Watermark $prevRowUtc
+        $clockBack = $step.Regressed
+        $newRows = @()
+        if (-not $clockBack) {
+            $newRows = @($step.NewIndex | ForEach-Object { $rows[$_] })
+            foreach ($r in $newRows) {
+                $dt = if ($null -ne $prevRowUtc) { [Math]::Min(6.0, [Math]::Max(0.0, ($r.utc - $prevRowUtc).TotalSeconds)) } else { 2.0 }
+                $rowWin.Add([pscustomobject]@{ utc = $r.utc; dt = $dt; temp = $r.temp; holders = $rowHolders })
+                $prevRowUtc = $r.utc
+            }
+            $prevRowUtc = $step.Watermark
         }
         $prevHolders = $holders.Count
         $keepFrom = $now.AddSeconds(-[Math]::Max($CapWindowSeconds, $WarmWindowSeconds) - 5)
         while ($rowWin.Count -gt 0 -and $rowWin[0].utc -lt $keepFrom) { $rowWin.RemoveAt(0) }
         $newest = if ($rows.Count -gt 0) { $rows[-1] } else { $null }
-        # The feed's own clock must not run backwards: a newest row older than the newest row already ingested means the host clock was
-        # stepped back (or the feed was rewritten), and the watermark would then hide every correctly dated row (adversary r4 A7). End closed.
-        $clockBack = ($regressedInRead -or ($null -ne $newest -and $null -ne $prevRowUtc -and $newest.utc -lt $prevRowUtc.AddSeconds(-2)))
         $feedAge = if ($newest) { [Math]::Max(0.0, ($now - $newest.utc).TotalSeconds) } else { [double]::PositiveInfinity }
         $mem = Get-MemoryProbe
         $disk = Get-DiskProbe
@@ -634,7 +651,9 @@ try {
         # ---- hard aborts -----------------------------------------------------------------------------------------------------
         $why = $null
         if (Test-Path -LiteralPath $stopFile) { $why = 'stop-file' }
-        if (-not $why -and $clockBack) { $why = ('feed-time-regressed a feed row is older than one already read (newest row {0}, newest time seen {1}): the host clock stepped back or the feed was rewritten' -f $(if ($newest) { Get-IsoUtc $newest.utc } else { 'n/a' }), (Get-IsoUtc $prevRowUtc)) }
+        if (-not $why -and $clockBack) { $why = ('feed-time-regressed {0}: the host clock stepped back or the feed was rewritten' -f $step.Why) }
+        # r6 (b): a complete feed row that does not parse (bad date, NaN temperature, too few columns) is unknown evidence, never skipped
+        if (-not $why -and $feedUnknownNow -gt 0) { $why = ('feed-unreadable ({0} complete feed row(s) are unknown evidence: a bad date, a non-finite temperature or too few columns)' -f $feedUnknownNow) }
         if (-not $why) {
             $capFrom = $now.AddSeconds(-$CapWindowSeconds)
             $hot = ($rowWin.ToArray() | Where-Object { $_.utc -ge $capFrom -and $_.temp -ge $CapTempC } | Measure-Object -Property dt -Sum).Sum

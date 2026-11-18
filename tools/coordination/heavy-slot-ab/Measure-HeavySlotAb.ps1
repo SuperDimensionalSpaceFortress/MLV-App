@@ -69,20 +69,12 @@ $inv = [Globalization.CultureInfo]::InvariantCulture
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Write-OutputFile([string]$Path, [string]$Text) {
-    # Every output is written to a fresh, unguessable temp name and MOVED over the target, never opened in place: a target that is a
-    # hard link or a symlink onto an input (ledger.jsonl) has its NAME replaced, so the input's bytes are never truncated through the
-    # alias, whatever the alias check could or could not see (adversary r5 A9: a hard link has no link target to resolve).
-    $tmp = '{0}.{1}.tmp' -f $Path, [Guid]::NewGuid().ToString('N')
-    [IO.File]::WriteAllText($tmp, $Text, $utf8)
-    [IO.File]::Move($tmp, $Path, $true)
+    # r6 (a): the shared writer (HeavySlotAb.psm1), the same one the driver uses: an aliased target is refused, and a whole-file write goes
+    # to a fresh CreateNew temp name MOVED over the target (adversary r5 A9, pass 6 A1 class).
+    Write-HeavySlotAbFile -Path $Path -Text $Text
 }
 
-function ConvertTo-UtcTime($v) {
-    if ($null -eq $v -or "$v" -eq '') { return $null }
-    if ($v -is [DateTime]) { return $v.ToUniversalTime() }
-    if ($v -is [DateTimeOffset]) { return $v.UtcDateTime }
-    try { return [DateTimeOffset]::Parse([string]$v, $inv, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime } catch { return $null }
-}
+function ConvertTo-UtcTime($v) { return (ConvertTo-HeavySlotAbUtc $v) }    # r6 (b): the shared time parser
 # Any unexpected terminating error ends as a typed line and exit 3, never as a bare stack trace (adversary r2 A6).
 trap { Write-Output ("AB_EVAL_ERROR {0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message); exit 3 }
 
@@ -111,6 +103,9 @@ foreach ($on in $outputNames) {
     if ((Test-PathInside $outReal $HeavySlotDir) -or ($inputRealPaths -contains $outReal)) {
         Write-Output "AB_EVAL_REFUSED output-alias ($on resolves to $outReal, which is inside the HeavySlot dir or is one of the inputs this evaluator reads)"; exit 2
     }
+    # r6 (a): a hard link has no link target to resolve, so the real path above cannot see it: the shared alias rule refuses it up front
+    $aliasWhy = Test-HeavySlotAbWriteAlias -Path (Join-Path $WindowDir $on)
+    if ($aliasWhy) { Write-Output "AB_EVAL_REFUSED output-alias ($on is $aliasWhy and may alias an input; this evaluator never writes through it)"; exit 2 }
 }
 
 # Every input line that does not parse is COUNTED per file name, never silently dropped: the verdict prints the counts (input_problems).
@@ -187,15 +182,23 @@ if ($driverReceipt) { $winEnd = ConvertTo-UtcTime $driverReceipt.endedUtc }
 if (-not $winEnd -and $samples.Count -gt 0) { $winEnd = ConvertTo-UtcTime $samples[-1].utc }
 if (-not $winEnd) { $winEnd = $winPlannedEnd }
 # only this window's samples (a stray row from outside it never reaches the split)
+# r6 (b): UNKNOWN EVIDENCE. Every row of every shape goes through the shared parser (Read-HeavySlotAbRow) with ONE rule: a required field
+# that is null, a field of the wrong type, a date that does not parse or a duplicate identity makes the row unknown evidence. An unknown
+# row is never skipped and never counted: it is listed here and the verdict is INCONCLUSIVE (adversary pass 6 A3, A4, A5, A7).
+$unknownEvidence = New-Object System.Collections.Generic.List[string]
+function Add-Unknown([string]$Source, [string]$Why) { $unknownEvidence.Add("${Source}: $Why") }
+$blocksUnknown = $blocksRaw.Count - $blocks.Count
+if ($blocksUnknown -gt 0) { Add-Unknown 'ab-blocks.jsonl' "$blocksUnknown row(s) with a field missing or of the wrong type" }
 $samplesSkipped = 0
-$samples = @($samples | Where-Object { $t0 = ConvertTo-UtcTime $_.utc; if ($null -eq $t0) { $script:samplesSkipped++ }; $null -ne $t0 -and $t0 -ge $winStart -and $t0 -le $winEnd })
-# every sample row is parsed ONCE here; a row whose utc or holders does not parse (or is not a finite whole number 0..1000) is a typed SKIP
-# counted in input_problems.samples_skipped, a numeric field that does not parse reads as unknown (adversary r1 A11, r2 A7)
+$sampleSpec = [ordered]@{ utc = 'time'; holders = 'int'; state = 'string'; temp_c = 'number?'; cpu_pct = 'number?'; freq_mhz = 'number?'; free_commit_gb = 'number?' }
+$sampleSeen = New-Object 'System.Collections.Generic.HashSet[string]'
 $psamples = @(foreach ($sm in $samples) {
-        $hd = ConvertTo-DoubleOrNull $sm.holders
-        if ($null -eq $hd -or [double]::IsNaN($hd) -or [double]::IsInfinity($hd) -or $hd -lt 0 -or $hd -gt 1000 -or $hd -ne [Math]::Floor($hd)) { $samplesSkipped++; continue }
-        [pscustomobject]@{ t = (ConvertTo-UtcTime $sm.utc); holders = [int]$hd; temp = (ConvertTo-DoubleOrNull $sm.temp_c); cpu = (ConvertTo-DoubleOrNull $sm.cpu_pct)
-            freq = (ConvertTo-DoubleOrNull $sm.freq_mhz); commit = (ConvertTo-DoubleOrNull $sm.free_commit_gb); state = [string]$sm.state }
+        $pr = Read-HeavySlotAbRow -Row $sm -Spec $sampleSpec
+        if (-not $pr.ok) { $samplesSkipped++; Add-Unknown 'ab-samples.jsonl' $pr.why; continue }
+        if ($pr.v.holders -lt 0 -or $pr.v.holders -gt 1000) { $samplesSkipped++; Add-Unknown 'ab-samples.jsonl' "holders $($pr.v.holders) is outside 0..1000"; continue }
+        if (Test-HeavySlotAbDuplicate -Seen $sampleSeen -Key ([string]$pr.v.utc.Ticks)) { $samplesSkipped++; Add-Unknown 'ab-samples.jsonl' "two samples at one instant ($($pr.v.utc.ToString('o')))"; continue }
+        if ($pr.v.utc -lt $winStart -or $pr.v.utc -gt $winEnd) { continue }     # parsed, and outside this window: not this window's evidence
+        [pscustomobject]@{ t = $pr.v.utc; holders = [int]$pr.v.holders; temp = $pr.v.temp_c; cpu = $pr.v.cpu_pct; freq = $pr.v.freq_mhz; commit = $pr.v.free_commit_gb; state = $pr.v.state }
     })
 $psamples = @($psamples | Sort-Object { $_.t.Ticks })
 # A block lasts from the moment its state was REALLY applied (startUtc) until the next block was applied (or the window ended): the
@@ -219,9 +222,18 @@ $exited = @{}
 $toolExit = @{}
 $reapedHeld = @{}
 $admits = New-Object System.Collections.Generic.List[object]
-foreach ($e in $ledger) {
-    $at = ConvertTo-UtcTime $e.at
-    if ($null -eq $at) { continue }
+$ledgerSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($e0 in $ledger) {
+    # r6 (b): at and event are required; a row this evaluator reads (exit, tool-exit, reaped, admit) needs its ticket. An undated reaped row
+    # (adversary pass 6 A5 evaluator sibling) is unknown evidence, never "no event". Two rows of one event for one ticket are unknown too.
+    $pr = Read-HeavySlotAbRow -Row $e0 -Spec ([ordered]@{ at = 'time'; event = 'string'; ticket = 'string?'; kind = 'string?' })
+    if (-not $pr.ok) { Add-Unknown 'ledger.jsonl' $pr.why; continue }
+    $at = $pr.v.at
+    $e = $e0
+    if ($pr.v.event -in 'exit', 'tool-exit', 'reaped', 'admit') {
+        if (-not ([string]$pr.v.ticket).Trim()) { Add-Unknown 'ledger.jsonl' "a $($pr.v.event) row has no ticket"; continue }
+        if ($at -ge $winStart -and (Test-HeavySlotAbDuplicate -Seen $ledgerSeen -Key ('{0}|{1}' -f $pr.v.event, $pr.v.ticket))) { Add-Unknown 'ledger.jsonl' "two $($pr.v.event) rows for ticket $($pr.v.ticket)"; continue }
+    }
     switch ([string]$e.event) {
         'exit' { $exited[[string]$e.ticket] = $at }
         'tool-exit' { $toolExit[[string]$e.ticket] = $e }
@@ -256,22 +268,37 @@ if (Test-Path -LiteralPath $rdir -PathType Container) {
             if ($null -eq $lw -or $lw -ge $winStart) { $receiptsUnreadable.Add([IO.Path]::GetFileName($f)) }
             continue
         }
-        $enq = ConvertTo-UtcTime $r.enqueuedAt
-        if ($null -eq $enq) {
-            # A receipt with no usable enqueue time (an empty object, a string where a time belongs) cannot be placed in or out of the
-            # window: one last written at or after the window start MAY be a ticket of it, so it is unreadable evidence, not a skip (adversary r5 A6).
+        # r6 (b): the shared row parser. enqueuedAt and ticket are required; admittedAt / finishedAt / waitedMs / exit may be absent (the
+        # event did not happen) but a present value of the wrong kind ("bad" for finishedAt, adversary pass 6 A4) is unknown evidence.
+        $pr = Read-HeavySlotAbRow -Row $r -Spec ([ordered]@{ enqueuedAt = 'time'; ticket = 'string'; label = 'string?'; admittedAt = 'time?'; finishedAt = 'time?'; waitedMs = 'number?'; exit = 'object?'; slotCount = 'int?'; slots = 'array?' })
+        if (-not $pr.ok -or -not $pr.v.ticket.Trim()) {
+            # A receipt that cannot be read as a whole cannot be placed in or out of the window: one last written at or after the window start
+            # MAY be a ticket of it, so it is unreadable evidence, not a skip (adversary r5 A6). A receipt whose enqueue time DID parse is
+            # placed by that time.
+            $enq0 = ConvertTo-UtcTime $r.enqueuedAt
+            if ($null -ne $enq0) { if ($enq0 -ge $winStart -and $enq0 -lt $winEnd) { $receiptsUnreadable.Add([IO.Path]::GetFileName($f)) }; continue }
             $lw2 = $null
             try { $lw2 = (Get-Item -LiteralPath $f -ErrorAction Stop).LastWriteTimeUtc } catch { $lw2 = $null }
             if ($null -eq $lw2 -or $lw2 -ge $winStart) { $receiptsUnreadable.Add([IO.Path]::GetFileName($f)) }
             continue
         }
+        $enq = $pr.v.enqueuedAt
         if ($enq -lt $winStart -or $enq -ge $winEnd) { continue }
-        if (-not ([string]$r.ticket).Trim()) { $receiptsUnreadable.Add([IO.Path]::GetFileName($f)); continue }    # in the window and nameless: the ticket is unknown
         $tickets.Add([pscustomobject]@{
-                ticket = [string]$r.ticket; label = [string]$r.label; enq = $enq; adm = (ConvertTo-UtcTime $r.admittedAt); fin = (ConvertTo-UtcTime $r.finishedAt)
-                waitedMs = $r.waitedMs; hasExit = ($null -ne $r.exit); slotCount = $r.slotCount; slots = @($r.slots)
+                ticket = $pr.v.ticket; label = [string]$pr.v.label; enq = $enq; adm = $pr.v.admittedAt; fin = $pr.v.finishedAt
+                waitedMs = $pr.v.waitedMs; hasExit = ($null -ne $pr.v.exit); slotCount = $pr.v.slotCount; slots = @($pr.v.slots); file = [IO.Path]::GetFileName($f)
             })
     }
+}
+# r6 (b): ONE ticket identity, ONE receipt. Two receipts naming one ticket (nine byte-identical copies, adversary pass 6 A7) are unknown
+# evidence: none of them is counted, every file name is listed as unreadable, and the verdict is INCONCLUSIVE.
+$ticketCount = @{}
+foreach ($k0 in $tickets.ToArray()) { $ticketCount[$k0.ticket] = [int]$ticketCount[$k0.ticket] + 1 }
+$dupTickets = @($ticketCount.Keys | Where-Object { $ticketCount[$_] -gt 1 })
+if ($dupTickets.Count -gt 0) {
+    foreach ($k0 in @($tickets.ToArray() | Where-Object { $dupTickets -contains $_.ticket })) { $receiptsUnreadable.Add("$($k0.file) (duplicate ticket $($k0.ticket))") }
+    $keep = @($tickets.ToArray() | Where-Object { $dupTickets -notcontains $_.ticket })
+    $tickets.Clear(); foreach ($k0 in $keep) { $tickets.Add($k0) }
 }
 
 $cls = { param($label) if ($label -match ':build$') { 'build' } elseif ($label -match ':pytest$') { 'pytest' } else { 'other' } }
@@ -485,6 +512,9 @@ else {
     if (-not (Test-Path -LiteralPath (Join-Path $HeavySlotDir 'ledger.jsonl') -PathType Leaf)) { $inconclusive.Add('the HeavySlot ledger.jsonl is missing, so dead holders and reaped rows cannot be told') }
     if (-not (Test-Path -LiteralPath (Join-Path $HeavySlotDir 'receipts') -PathType Container)) { $inconclusive.Add('the HeavySlot receipts directory is missing, so no ticket can be read') }
     if ($bCommitUnknown -gt 0) { $inconclusive.Add("$bCommitUnknown B sample(s) have no free commit reading, so the B minimum free commit is unknown") }
+    $badLineTotal = 0; foreach ($bk in @($script:badLines.Keys)) { $badLineTotal += [int]$script:badLines[$bk] }
+    if ($badLineTotal -gt 0) { $inconclusive.Add(("unknown evidence: {0} input line(s) do not parse as JSON ({1})" -f $badLineTotal, ((@($script:badLines.Keys | Sort-Object) | ForEach-Object { "$_=$($script:badLines[$_])" }) -join ', '))) }
+    if ($unknownEvidence.Count -gt 0) { $inconclusive.Add(("unknown evidence: {0} row(s) with a null, wrong-typed, undated or duplicate field (first: {1})" -f $unknownEvidence.Count, (($unknownEvidence | Select-Object -First 3) -join '; '))) }
     if ($receiptsUnreadable.Count -gt 0) { $inconclusive.Add(("{0} receipt(s) written during the window cannot be read ({1}): the tickets in them are unknown" -f $receiptsUnreadable.Count, (($receiptsUnreadable | Select-Object -First 3) -join ', '))) }
     if ($bPytestCount2 -lt $MinBPytestAtSlotCount2) { $inconclusive.Add("B pytest tickets that ran at slotCount 2: $bPytestCount2 of $bPytestN (need $MinBPytestAtSlotCount2): the switch may never have reached the tool") }
     if ($null -ne $A.overall.wait_s_p90 -and [double]$A.overall.wait_s_p90 -eq 0) { $inconclusive.Add('A arm shows no queueing (wait_p90 = 0), nothing to reduce') }
@@ -527,6 +557,7 @@ $out = [ordered]@{
         blocks_lines_unparseable = [int]$script:badLines['ab-blocks.jsonl']
         samples_lines_unparseable = [int]$script:badLines['ab-samples.jsonl']
         samples_skipped = $samplesSkipped
+        unknown_evidence = $unknownEvidence.Count
         b_samples_without_free_commit = $bCommitUnknown
         samples_without_block_state = $statesUnknown
     }
