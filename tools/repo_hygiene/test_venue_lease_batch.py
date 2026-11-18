@@ -5837,6 +5837,34 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stdout + r.stderr, r.stdout[-3000:] + r.stderr[-3000:])
         self.assertEqual(floor_calls.read_text(encoding="utf-8").split(), ["0", "480"])
 
+    def test_r18_adversary_a1_a_budget_floor_that_cannot_be_evaluated_is_refused_before_the_claim(self) -> None:
+        # adversary pass 19 A1 (on 410b5e09, introduced): the floor child itself can fail with no marker (its module import held without read sharing, as the first child's was), and
+        # the floor fallback read only the marker, never the floor's exit, so an over-cap window still returned "no refusal" and reached a claim and a lease. The floor reads no clip,
+        # so a floor that cannot be evaluated is not "unknowable": it is the typed refusal EXPORT_BUDGET_PREFLIGHT_FAILED before any claim or lease.
+        fake = self.case / "fake-export-budget-r18-a1.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "throw \"Import-Module: the process cannot access the file 'AttrCudaArtifacts.psm1' because it is being used by another process\"\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 100000
+        over = self.case / "export-r18-a1-over.json"
+        over.write_text(json.dumps(doc), encoding="utf-8")
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                if mode == "-LegSpec":
+                    r = self.run_batch([over], "-ExportBudgetScript", str(fake))
+                    line = "BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_FAILED"
+                else:
+                    r = self.run_plan(self.write_plan([self.item(over, "A", self.commit_a)]), "-ExportBudgetScript", str(fake))
+                    line = "LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_FAILED item=1 "
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened on a window whose budget floor could not be evaluated. " + out)
+                self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted. " + out)
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn(line, r.stderr, out)
+
     def test_r11_export_a_budget_preflight_that_never_returns_is_killed_and_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r11 (sol r9 B1, EXPORT-BUDGET-PREFLIGHT-CHILD-DEADLINE-1; fable H1 EXPORT-LEGSET-BUDGET-PREFLIGHT-TEST-1): the preflight child (the export generator's
         # -PreflightBudgetOnly mode, which resolves the clip) was waited for with no deadline, so a hung resolver held the batch before any claim forever. It now runs as a bounded
