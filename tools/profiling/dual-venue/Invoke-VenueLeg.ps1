@@ -274,7 +274,7 @@ $receipt.display = $display
 if ($isExport) {
     $receipt.scale = $null; $receipt.display = $null
     $receipt.export = [ordered]@{ format = [string]$spec.export.format; maxFrames = $spec.export.maxFrames; dualIsoExpected = $spec.export.dualIsoExpected
-                                  receiptSha256 = [string]$spec.export.receiptSha256; files = $null; stages = $null; problems = @(); verdict = $null }
+                                  receiptSha256 = [string]$spec.export.receiptSha256; files = $null; stages = $null; problems = @(); containmentAdvisory = @(); verdict = $null }
 }
 # PLAYBACK-VISUAL-INSPECTION-1: EVERY speed-leg receipt says whether captures were asked for; what they show is filled in once the job has published them (step 7).
 if ($visualRequest.applies) {
@@ -750,6 +750,8 @@ if ($isExport) {
     $receipt.metrics = $exportEvidence.metrics
     $receipt.export.stages = $exportEvidence.stages
     $receipt.export.problems = @($exportEvidence.problems)
+    # r18 (EXPORT-CDNG-STAGE-CONTAINMENT-1): the CDNG disjoint-stage containment findings, beside the problems and never among them: advisory, no verdict input
+    $receipt.export.containmentAdvisory = @($exportEvidence.containmentAdvisory)
     # the run IS the leg the receipt names: the hashed summary.json's own identity (the validator checks the same fields)
     $identityProblems = @()
     if (-not $collected) { $identityProblems += 'EVIDENCE_ABSENT: the job published no artifacts directory' }

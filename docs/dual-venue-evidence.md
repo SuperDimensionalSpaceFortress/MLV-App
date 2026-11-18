@@ -435,7 +435,7 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
      CDNG lossless uses `MLVAPP_EXPORT_STAGE_PROFILER` (per-frame `export-profile.json`). ProRes uses `MLVAPP_STAGE_TIMING` (`stage-timing.log`).
   6. Publishes **only** `summary.json`, `batch.log`, the stage file and `output-manifest.json` (output count, total bytes, first and last file sha256).
   7. Deletes the exported frames or `.mov` from its venue-local work dir. **Exported footage never reaches the share or the hub.**
-* **Receipt**: `receipt.export` = `{format, maxFrames, dualIsoExpected, receiptSha256, files (sha256 of each published file), stages, problems, verdict}`.
+* **Receipt**: `receipt.export` = `{format, maxFrames, dualIsoExpected, receiptSha256, files (sha256 of each published file), stages, problems, containmentAdvisory, verdict}`.
   `scale` and `display` are null. Metrics include `framesExported`, `exportFramesFailed`, `profileFramesSucceeded` (CDNG), `stageFramesSeen` (ProRes),
   `dualIsoActiveFrames`, `dualIsoClassAgrees`, `wallSeconds`, `exportFps`, `outputFileCount`, `outputBytes` and `largestStage`.
   `Test-DvReceiptValid` re-hashes every file and re-derives the metrics, the stage table and the outcome (`Test-DvExportReceiptValid`).
@@ -443,6 +443,13 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   * CDNG: the denominator is the producer's `frame_ms`. The producer stages run from `raw_read` to `payload_clone` (including `llrawproc_dual_iso` and
     `dng_compress_encode`). The writer stages (`disk_write`,
     `writer_queue_wait`, `writer_completion_lag`) are reported apart from the producer stages, because the async writer overlaps the producer.
+    Each stage must still fit inside the stage that contains it (a producer stage inside `producer_frame`, an `llrawproc_*` child inside `llrawproc`); a stage that does not is
+    `INVALID` (`EXPORT_STAGE_CONTAINMENT_MISMATCH`).
+  * **CDNG disjoint-stage containment is advisory, pending `EXPORT-CDNG-STAGE-CONTAINMENT-1`.** The checks derived from `ExportCdngStageWindowTable` (`DualVenueRunner.psm1`)
+    are: disjoint stages held together inside their parent, and the lock times inside the `llrawproc_shared_lock` / `llrawproc_other` that contain them. Each one they fail is
+    written to `containmentAdvisory` (on the evidence and in `receipt.export`) as an `EXPORT_STAGE_CONTAINMENT_ADVISORY` line. It is never put in `problems`, never turns a
+    `PASS` into a `FAIL` or `INVALID`, and is not re-derived by the receipt check. The reason: the table's `llrawproc_pre_dualiso_fix` row still carries the scaled-path window
+    (`llrawproc.c:6606-7076`), which CDNG export never runs (r17 keys). The stage shares are reported as before.
   * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
     `raw_uint16` and `llrawproc` nest inside `debayered_frame`. The batch's `DONE elapsed` starts before the clip opens and also times finish, verify and
     probe, so it is never a denominator. `batchWallPerFrameMs` and `untimedPerFrameMs` (wall per frame minus `processed16_total`: open, pipe write,
@@ -462,8 +469,7 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   A budget the **agent** would refuse (`jobTimeoutSec` plus the runner's 120 s submit margin past the agent's 86400 s cap) is refused with
   `DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED` **before any claim or lease**: `Invoke-VenueLeaseBatch.ps1` asks the generator's `-PreflightBudgetOnly` mode
   (the same `Get-ExportJobTimeBudget`, over the resolved clip's real size) in its preflight for every form (`-LegPlan` item, `-LegSet`, `-LegSpec`) and ends
-  `EXPORT_TIME_BUDGET_EXCEEDED` with nothing submitted. A clip this host cannot resolve is not refused there (its size is unknowable); the leg's generator still refuses it.
-* **Frame window**: `EXPORT_CAPTURED` asserts the batch exported the requested `maxFrames`. A different count is `INVALID` (`EXPORT_FRAMES_MISMATCH`) unless the leg's
+  `EXPORT_TIME_BUDGET_EXCEEDED` with nothing submitted. A clip this host cannot resolve is not refused there (its size is unknowable); the leg's generator still refuses it.* **Frame window**: `EXPORT_CAPTURED` asserts the batch exported the requested `maxFrames`. A different count is `INVALID` (`EXPORT_FRAMES_MISMATCH`) unless the leg's
   criteria carry `framesExported eq <maxFrames>`, which then decides (the shipped legs: `FAIL`). A criterion that only names the metric (`ge 0`, `ne`, `le`, `eq` of
   another value) never switches the check off. Repeated stage-timing records for one frame are summed, and the per-frame sum is held to the same 24 h ceiling as one record
   (`EXPORT_RECORD_INVALID`), so a frame is never silently dropped from a mean.

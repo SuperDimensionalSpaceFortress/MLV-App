@@ -4727,6 +4727,32 @@ function Get-DvExportContainmentProblem {
     "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $($Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $($Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
 }
 
+$script:ExportContainmentAdvisoryCard = 'EXPORT-CDNG-STAGE-CONTAINMENT-1'
+function Get-DvExportContainmentAdvisories {
+    # r18 (hub STOP RULE 2026-11-18T17:26:25Z): EVERY finding of the CDNG disjoint-stage containment check (each disjoint group whose summed means exceed its parent's, each contained pair whose
+    # child exceeds its container), with the same tolerance as Get-DvExportContainmentProblem, as advisory strings. Never a problem and never a verdict input until
+    # EXPORT-CDNG-STAGE-CONTAINMENT-1 makes the window table trustworthy; an empty array when nothing exceeds.
+    param($Means, $Pairs = @(), $SumGroups = @())
+    $out = [System.Collections.Generic.List[string]]::new()
+    $tail = "(advisory pending $($script:ExportContainmentAdvisoryCard): recorded only, never a problem or a verdict input)"
+    foreach ($group in $SumGroups) {
+        $present = @($group[0] | Where-Object { $null -ne $Means[$_] })
+        $parent = $Means[[string]$group[1]]
+        if ($present.Count -lt 2 -or $null -eq $parent) { continue }
+        $sum = 0.0; foreach ($n in $present) { $sum += [double]$Means[$n] }
+        if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) {
+            $out.Add("EXPORT_STAGE_CONTAINMENT_ADVISORY: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $parent ms $tail")
+        }
+    }
+    foreach ($pair in $Pairs) {
+        $c = $Means[$pair[0]]; $p = $Means[$pair[1]]
+        if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) {
+            $out.Add("EXPORT_STAGE_CONTAINMENT_ADVISORY: $($pair[0]) mean $c ms is timed longer than $($pair[1]) mean $p ms, which contains it $tail")
+        }
+    }
+    , [string[]]$out.ToArray()
+}
+
 # r11 (sol r9 B2 (a), fable r9 B2; EXPORT-VENUE-LEG-1): the OUTERMOST containment: the measured per-frame work is inside the batch's own DONE elapsed. A DONE elapsed shorter than the
 # work the stage log / profile measured (elapsed=0.0 beside 480 frames of 56 ms) is two records of one run that disagree: it read PASS with a negative untimedPerFrameMs and an inflated
 # exportFps. The same tolerance as every other containment (5 % + 1 ms per frame: elapsed is logged to one decimal). $StageMeanMs is the per-frame work the format's denominator measures
@@ -4893,6 +4919,7 @@ function Get-DvExportEvidence {
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
+    $containmentAdvisory = @()   # r18 (EXPORT-CDNG-STAGE-CONTAINMENT-1): the CDNG disjoint-stage containment findings, advisory only (see the CDNG branch)
     # -- the batch log: exactly one DONE line for the one clip
     # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
     $done = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] DONE (?<base>.+?) exported=(?<e>[0-9]{1,15}) skipped=(?<s>[0-9]{1,15}) elapsed=(?<t>[0-9]{1,12}(?:\.[0-9]{1,9})?)\r?$'))
@@ -4998,9 +5025,13 @@ function Get-DvExportEvidence {
             # llrawproc_other (dual_iso 30 + publish_lock 90 inside a 100 ms total read PASS).)
             # r17 (pass16 A1, CDNG-STAGE-WINDOW-TABLE-1): every one of these groups, and every other maximal disjoint group, is DERIVED from $script:ExportCdngStageWindowTable
             # (Get-DvExportCdngDisjointGroups): each llrawproc group inside llrawproc and, with the producer's other members, inside producer_frame, whether or not llrawproc_ms is published.
-            $pairs += @($script:ExportCdngContainedPairs)   # (pass17 A1: refine and publish are inside the shared_lock they accumulate into)
-            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs -SumGroups $script:ExportCdngSumGroups
+            # r18 (hub STOP RULE 2026-11-18T17:26:25Z; split to EXPORT-CDNG-STAGE-CONTAINMENT-1): that DISJOINT-STAGE check -- the table-derived sum groups and the table-derived contained pairs
+            # (pass17 A1: refine and publish inside the shared_lock they accumulate into; pass18 A1: inside llrawproc_other) -- no longer gates. Every finding it makes is recorded in
+            # containmentAdvisory, never in problems, so it never turns a PASS into a FAIL or INVALID (r17 keys: the table's pre_dualiso_fix row still carries a window the export never runs).
+            # The r8 parent/child pairs above (each stage inside the stage that contains it) still gate.
+            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs
             if ($null -ne $containment) { $problems.Add($containment) }
+            $containmentAdvisory = Get-DvExportContainmentAdvisories -Means $means -Pairs $script:ExportCdngContainedPairs -SumGroups $script:ExportCdngSumGroups
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed
             $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $denRow.meanMs
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }
@@ -5072,7 +5103,7 @@ function Get-DvExportEvidence {
             }
         }
     }
-    [pscustomobject]@{ metrics = [pscustomobject]$m; stages = $stages; problems = @($problems); classMismatch = $classMismatch; classDetail = $classDetail }
+    [pscustomobject]@{ metrics = [pscustomobject]$m; stages = $stages; problems = @($problems); classMismatch = $classMismatch; classDetail = $classDetail; containmentAdvisory = [string[]]@($containmentAdvisory) }
 }
 
 function Get-DvExportOutcome {

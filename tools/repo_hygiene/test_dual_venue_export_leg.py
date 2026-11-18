@@ -107,8 +107,19 @@ def evidence_cases(cases: list[dict]):
         return run_pwsh_json("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
                              f"@($cases | ForEach-Object {{ $c = $_; $e = {EVIDENCE_CALL}; "
                              "$o = Get-DvExportOutcome -ResultToken $c.token -ExitCode ([int]$c.exit) -Evidence $e -Criteria @($c.criteria); "
-                             "[ordered]@{ metrics = $e.metrics; problems = @($e.problems); classMismatch = $e.classMismatch; stages = $e.stages; outcome = $o.outcome; detail = $o.detail } }) "
+                             "[ordered]@{ metrics = $e.metrics; problems = @($e.problems); classMismatch = $e.classMismatch; stages = $e.stages; outcome = $o.outcome; detail = $o.detail; "
+                             "containmentAdvisory = @($e.containmentAdvisory) } }) "
                              "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
+
+
+def assert_containment_advisory(tc: unittest.TestCase, row: dict, *needles: str) -> None:
+    """r18 (hub STOP RULE 2026-11-18T17:26:25Z; EXPORT-CDNG-STAGE-CONTAINMENT-1): a CDNG disjoint-stage containment finding is ADVISORY. It is recorded in containmentAdvisory, never
+    in problems, and never turns the outcome: a run with no other problem and an agreeing dual-ISO class still reads PASS."""
+    tc.assertFalse(any("EXPORT_STAGE_CONTAINMENT" in p for p in row["problems"]), row)
+    tc.assertTrue(any(p.startswith("EXPORT_STAGE_CONTAINMENT_ADVISORY: ") and "EXPORT-CDNG-STAGE-CONTAINMENT-1" in p and all(n in p for n in needles)
+                      for p in row["containmentAdvisory"]), row)
+    if not row["problems"] and not row["classMismatch"]:
+        tc.assertEqual(row["outcome"], "PASS", row)
 
 
 def cdng_case(**over) -> dict:
@@ -776,11 +787,13 @@ class ExportEvidenceTests(unittest.TestCase):
         cases = [cdng_case(dualIsoExpected=False, profile=p, criteria=[]) for p in (producer_sum, children_sum, control)]
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        # (r18: advisory pending EXPORT-CDNG-STAGE-CONTAINMENT-1, recorded and never gating)
         for i, inside in ((0, "producer_frame"), (1, "llrawproc")):
             with self.subTest(case=i):
-                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
-                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and f"inside {inside} mean" in p for p in got[i]["problems"]), got[i])
+                assert_containment_advisory(self, got[i], "the disjoint stages", f"inside {inside} mean")
+                self.assertEqual(got[i]["outcome"], "PASS", got[i])
         self.assertEqual(got[2]["outcome"], "PASS", got[2])
+        self.assertEqual(got[2]["containmentAdvisory"], [], got[2])
 
     def test_r11_adversary_a1_nested_render_stages_are_held_inside_debayered_frame_when_raw_uint16_is_absent(self) -> None:
         """adversary r11 A1: raw_uint16 is a stage the app may not publish, which skipped both child pairs and their sum group: raw_uint16_disk_read and raw_uint16_decompress at 900 ms each
@@ -855,9 +868,10 @@ class ExportEvidenceTests(unittest.TestCase):
         control = profile({"producer_frame_ms": 50.0, "raw_read_ms": 10.0, "llrawproc_dark_frame_ms": 10.0, "llrawproc_dual_iso_ms": 10.0})
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in (over, control)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
-        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and "inside producer_frame mean" in p for p in got[0]["problems"]), got[0])
+        assert_containment_advisory(self, got[0], "the disjoint stages", "inside producer_frame mean")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
+        self.assertEqual(got[0]["outcome"], "PASS", got[0])
         self.assertEqual(got[1]["outcome"], "PASS", got[1])
+        self.assertEqual(got[1]["containmentAdvisory"], [], got[1])
 
     def test_r13_pass13_a1_dual_iso_and_the_lock_times_outside_its_window_are_held_inside_llrawproc(self) -> None:
         """adversary r13 pass 13 A1: llrawproc_other retains the lock times, so dual_iso 30 + publish_lock 90 (disjoint windows, llrawproc.c:6210-6219 vs :6292) inside a 100 ms llrawproc total
@@ -882,9 +896,9 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in (0, 1, 2):
             with self.subTest(case=i):
-                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
-                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
+                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
         self.assertEqual(got[3]["outcome"], "PASS", got[3])
+        self.assertEqual(got[3]["containmentAdvisory"], [], got[3])
 
     def test_r16_pass15_a1_every_disjoint_llrawproc_child_and_the_outside_lock_times_are_held_together(self) -> None:
         """adversary r15 A1 (= pass14 A1): the held frontier was only dual_iso + the two locks, so a timed child beside them was unjudged: dark_frame 80 + dual_iso 1 + publish_lock 80 (161 ms of
@@ -913,9 +927,9 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(profiles) + 1):
             with self.subTest(case=i):
-                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
-                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
+                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
+        self.assertEqual(got[-1]["containmentAdvisory"], [], got[-1])
 
     def test_r17_pass16_a1_disjoint_work_with_the_shared_lock_is_held_inside_its_parent(self) -> None:
         """adversary pass16 A1 (EXPORT-VENUE-LEG-1-OPEN-16-1): shared_lock (llrawproc.c :5142-5288, :5302-5376, :6731-6815 and the refine / publish adds) never meets dual_iso, chroma_smooth,
@@ -951,11 +965,11 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(bad)):
             with self.subTest(case=i):
-                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
-                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
+                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
         for i in range(len(bad), len(bad) + len(controls)):
             with self.subTest(control=i):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
+                self.assertEqual(got[i]["containmentAdvisory"], [], got[i])
 
     def test_r17_pass17_a1_the_lock_times_shared_lock_accumulates_are_inside_it(self) -> None:
         """adversary pass17 A1: llrawproc.c adds the refine and publish lock times to shared_lock (:6131, :6293, :7058), so each, and their disjoint sum, is inside it. refine 10 + publish 10
@@ -981,10 +995,12 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(bad)):
             with self.subTest(case=i):
-                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 container = "llrawproc_shared_lock" if i < 3 else "llrawproc_other"
-                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and f"inside {container}" in p for p in got[i]["problems"]), got[i])
+                # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1: a contained-pair line names "than <container>", a group line "inside <container>")
+                self.assertTrue(any(f"inside {container}" in p or f"than {container}" in p for p in got[i]["containmentAdvisory"]), got[i])
+                assert_containment_advisory(self, got[i])
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
+        self.assertEqual(got[-1]["containmentAdvisory"], [], got[-1])
 
     def test_r17_every_disjoint_group_is_derived_from_the_stage_window_table(self) -> None:
         """CDNG-STAGE-WINDOW-TABLE-1: the groups the reader holds are every maximal pairwise-disjoint set of each parent's descendants in ExportCdngStageWindowTable, recomputed here from the
