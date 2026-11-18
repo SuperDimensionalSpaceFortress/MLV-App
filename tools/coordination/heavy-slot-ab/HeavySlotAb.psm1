@@ -60,4 +60,37 @@ function Get-HeavySlotAbCount {
     return [int](Get-HeavySlotAbStatus -SwitchPath $SwitchPath -Now $Now).Count
 }
 
-Export-ModuleMember -Function Get-HeavySlotAbStatus, Get-HeavySlotAbCount
+function Resolve-HeavySlotAbRealPath {
+    # The REAL full path of $Path: every existing component is looked up in its parent (which turns a short 8.3 name into the long one) and a
+    # junction or symlink is replaced by its final target, so two spellings of one place compare equal. A component that does not exist yet
+    # (a switch, a window dir not created yet) is appended unresolved. Used by the driver and the evaluator for the "never write over what
+    # is only read" containment check (adversary r3 A1): a plain GetFullPath compare is fooled by an alias.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path, [int]$Depth = 0)
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($Depth -gt 16) { return $full }
+    $root = [IO.Path]::GetPathRoot($full)
+    $cur = $root
+    $parts = @($full.Substring($root.Length) -split '[\\/]' | Where-Object { $_ })
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $next = [IO.Path]::Combine($cur, $parts[$i])
+        $info = $null
+        try {
+            $hit = @((New-Object IO.DirectoryInfo $cur).GetFileSystemInfos($parts[$i]))
+            if ($hit.Count -eq 1) { $info = $hit[0] }
+        }
+        catch { $info = $null }
+        if ($null -eq $info) {
+            if ([IO.Directory]::Exists($next)) { $info = New-Object IO.DirectoryInfo $next }
+            elseif ([IO.File]::Exists($next)) { $info = New-Object IO.FileInfo $next }
+        }
+        if ($null -eq $info) { return ([IO.Path]::Combine($cur, (($parts[$i..($parts.Count - 1)]) -join '\'))) }
+        $target = $null
+        try { $target = $info.ResolveLinkTarget($true) } catch { $target = $null }
+        if ($null -ne $target) { $cur = Resolve-HeavySlotAbRealPath -Path $target.FullName -Depth ($Depth + 1) }
+        else { $cur = $info.FullName }
+    }
+    return $cur
+}
+
+Export-ModuleMember -Function Get-HeavySlotAbStatus, Get-HeavySlotAbCount, Resolve-HeavySlotAbRealPath

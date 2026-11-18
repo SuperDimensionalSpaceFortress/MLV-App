@@ -31,6 +31,11 @@
                   at holders >= 2 temp_ge90_frac <= 0.20 and temp_c_p95 <= 94; at holders >= 2 under load freq_p50 >= 0.90 x the
                   holders = 1 figure; no Event 2004; min free commit (all B samples) >= 10 GB.
     REJECT        otherwise.
+  ROUND 4: every threshold is compared against the EXACT figure (rounding is for printing only); a B sample with no free-commit reading, a
+  receipt written during the window that cannot be read, and fewer than 10 B pytest tickets that really ran at slotCount 2 are each
+  INCONCLUSIVE; a `reaped kind=held` row excludes its receipt even with no admit row; a never-admitted wait cut off in another block is
+  SPILL; a holders value that is not a finite whole number 0..1000 is a typed skip; every unparseable input line is counted in
+  input_problems; containment checks resolve junctions and short names.
   Exit: 0 always when a verdict was written (the verdict is the answer); 2 when the window dir has no usable input.
   ASCII-only on purpose.
 #>
@@ -54,10 +59,12 @@ param(
     [double]$MinFreqRatio = 0.90,
     [double]$MinFreeCommitGB = 10,
     [double]$LoadCpuPct = 50,
-    [double]$DeadGraceMinutes = 90
+    [double]$DeadGraceMinutes = 90,
+    [int]$MinBPytestAtSlotCount2 = 10    # ADOPT needs at least this many B pytest tickets whose receipt says they really ran at slotCount 2
 )
 
 $ErrorActionPreference = 'Stop'
+Import-Module -Force (Join-Path $PSScriptRoot 'HeavySlotAb.psm1')    # Resolve-HeavySlotAbRealPath
 $inv = [Globalization.CultureInfo]::InvariantCulture
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 
@@ -77,30 +84,35 @@ function ConvertTo-DoubleOrNull($v) {
     return $null
 }
 function Test-PathInside([string]$Child, [string]$Parent) {
-    $c = ([IO.Path]::GetFullPath($Child)).TrimEnd('\', '/')
-    $p = ([IO.Path]::GetFullPath($Parent)).TrimEnd('\', '/')
+    # junctions, symlinks and short names are resolved to the real path first, so an alias into the HeavySlot dir cannot slip past (adversary r3 A1)
+    $c = (Resolve-HeavySlotAbRealPath $Child).TrimEnd('\', '/')
+    $p = (Resolve-HeavySlotAbRealPath $Parent).TrimEnd('\', '/')
     return ($c -ieq $p) -or $c.StartsWith($p + '\', [StringComparison]::OrdinalIgnoreCase)
 }
 # This script is read-only against HeavySlot: the verdict, holds log and headroom summary go under -WindowDir, which therefore may
 # never be (or lie under) the HeavySlot dir (adversary r2 A7).
 if (Test-PathInside $WindowDir $HeavySlotDir) { Write-Output "AB_EVAL_REFUSED path-overlap (the window dir $WindowDir is, or lies under, the HeavySlot dir $HeavySlotDir; this evaluator never writes there)"; exit 2 }
 
+# Every input line that does not parse is COUNTED per file name, never silently dropped: the verdict prints the counts (input_problems).
+$script:badLines = @{}
 function Read-JsonLines([string]$Path) {
     $out = New-Object System.Collections.Generic.List[object]
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $out.ToArray() }
+    $name = [IO.Path]::GetFileName($Path)
     foreach ($l in [IO.File]::ReadAllLines($Path)) {
         if (-not $l.Trim()) { continue }
-        try { $out.Add(($l | ConvertFrom-Json)) } catch { }
+        try { $out.Add(($l | ConvertFrom-Json)) } catch { $script:badLines[$name] = [int]$script:badLines[$name] + 1 }
     }
     return $out.ToArray()
 }
 function Get-Pct([double[]]$Values, [double]$P) {
-    # nearest-rank percentile; $null for an empty list
+    # nearest-rank percentile (an element of the data, so no arithmetic happens); $null for an empty list. NOT rounded: a threshold is
+    # compared against the exact value and only printed text is ever rounded (adversary r3 A8).
     $v = @($Values | Sort-Object)
     if ($v.Count -eq 0) { return $null }
     $rank = [int][Math]::Ceiling($P / 100.0 * $v.Count)
     if ($rank -lt 1) { $rank = 1 }
-    return [Math]::Round([double]$v[$rank - 1], 3)
+    return [double]$v[$rank - 1]
 }
 function Get-Stat([double[]]$Waits, [double[]]$Holds) {
     return [ordered]@{
@@ -155,11 +167,13 @@ if ($driverReceipt) { $winEnd = ConvertTo-UtcTime $driverReceipt.endedUtc }
 if (-not $winEnd -and $samples.Count -gt 0) { $winEnd = ConvertTo-UtcTime $samples[-1].utc }
 if (-not $winEnd) { $winEnd = $winPlannedEnd }
 # only this window's samples (a stray row from outside it never reaches the split)
-$samples = @($samples | Where-Object { $t0 = ConvertTo-UtcTime $_.utc; $null -ne $t0 -and $t0 -ge $winStart -and $t0 -le $winEnd })
-# every sample row is parsed ONCE here; a row whose utc or holders does not parse is skipped, a numeric field that does not parse reads as unknown
+$samplesSkipped = 0
+$samples = @($samples | Where-Object { $t0 = ConvertTo-UtcTime $_.utc; if ($null -eq $t0) { $script:samplesSkipped++ }; $null -ne $t0 -and $t0 -ge $winStart -and $t0 -le $winEnd })
+# every sample row is parsed ONCE here; a row whose utc or holders does not parse (or is not a finite whole number 0..1000) is a typed SKIP
+# counted in input_problems.samples_skipped, a numeric field that does not parse reads as unknown (adversary r1 A11, r2 A7)
 $psamples = @(foreach ($sm in $samples) {
         $hd = ConvertTo-DoubleOrNull $sm.holders
-        if ($null -eq $hd) { continue }
+        if ($null -eq $hd -or [double]::IsNaN($hd) -or [double]::IsInfinity($hd) -or $hd -lt 0 -or $hd -gt 1000 -or $hd -ne [Math]::Floor($hd)) { $samplesSkipped++; continue }
         [pscustomobject]@{ t = (ConvertTo-UtcTime $sm.utc); holders = [int]$hd; temp = (ConvertTo-DoubleOrNull $sm.temp_c); cpu = (ConvertTo-DoubleOrNull $sm.cpu_pct)
             freq = (ConvertTo-DoubleOrNull $sm.freq_mhz); commit = (ConvertTo-DoubleOrNull $sm.free_commit_gb); state = [string]$sm.state }
     })
@@ -210,9 +224,18 @@ foreach ($a in $admits.ToArray()) {
 
 $rdir = Join-Path $HeavySlotDir 'receipts'
 $tickets = New-Object System.Collections.Generic.List[object]
+$receiptsUnreadable = New-Object System.Collections.Generic.List[string]
 if (Test-Path -LiteralPath $rdir -PathType Container) {
     foreach ($f in [IO.Directory]::GetFiles($rdir, '*.json')) {
-        try { $r = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json } catch { continue }
+        try { $r = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json; if ($null -eq $r) { throw 'empty receipt' } }
+        catch {
+            # A receipt that cannot be read is never skipped silently (adversary r2 A7): one last written at or after the window start MAY be a
+            # ticket of this window, so the verdict becomes INCONCLUSIVE; an older one cannot be in the window and is not counted.
+            $lw = $null
+            try { $lw = (Get-Item -LiteralPath $f -ErrorAction Stop).LastWriteTimeUtc } catch { $lw = $null }
+            if ($null -eq $lw -or $lw -ge $winStart) { $receiptsUnreadable.Add([IO.Path]::GetFileName($f)) }
+            continue
+        }
         $enq = ConvertTo-UtcTime $r.enqueuedAt
         if ($null -eq $enq -or $enq -lt $winStart -or $enq -ge $winEnd) { continue }
         $tickets.Add([pscustomobject]@{
@@ -237,6 +260,9 @@ foreach ($k in $tickets.ToArray()) {
     # A receipt that closed after window end + grace is a dead (or hopelessly slow) holder even when its ledger admit row is missing
     # (the producer's ledger append is advisory): the receipt itself says when it finished (adversary r2 A1).
     if ($null -ne $k.fin -and $k.fin -gt $deadline -and -not $dead.ContainsKey($k.ticket)) { $dead[$k.ticket] = $k.label }
+    # A holder the status sweep reaped (`reaped kind=held`) is dead even when its ledger admit row is missing: the receipt is excluded the
+    # same way (adversary r3 A4; the admit row is advisory, the reaped row is the proof).
+    if ($reapedHeld.ContainsKey($k.ticket) -and -not $dead.ContainsKey($k.ticket)) { $dead[$k.ticket] = $k.label }
     if ($dead.ContainsKey($k.ticket)) { $excludedDead++; continue }
     if ($pending.ContainsKey($k.ticket)) { $excludedPending++; continue }
     $be = Get-BlockOf $k.enq
@@ -258,6 +284,13 @@ foreach ($k in $tickets.ToArray()) {
     }
     elseif ($toolExit.ContainsKey($k.ticket) -and [string]$toolExit[$k.ticket].code -eq '75') {
         $tAt = ConvertTo-UtcTime $toolExit[$k.ticket].at
+        # A wait that was cut off in ANOTHER block (or after the window) crossed an applied edge: it ran partly under each state, so it is
+        # SPILL like an admitted ticket that crossed one, never a timed-out wait of the block it enqueued in (adversary r3 A5).
+        $endBlock = Get-BlockOf $tAt
+        if (-not $endBlock -or $endBlock.index -ne $be.index) {
+            $spill.Add([pscustomobject]@{ ticket = $k.ticket; label = $k.label; enqueuedBlock = $be.index; admittedBlock = $null; endedBlock = $(if ($endBlock) { $endBlock.index } else { $null }); kind = 'timed-out-wait' })
+            continue
+        }
         $wait = [Math]::Max(0.0, ($tAt - $k.enq).TotalSeconds)
         $arm[$be.state].all.w += $wait
         if ($c -ne 'other') { $arm[$be.state][$c].w += $wait }
@@ -348,24 +381,33 @@ for ($i = 0; $i -lt $psamples.Count; $i++) {
 }
 function Get-Nums($rows, [string]$Prop) { return @($rows | Where-Object { $null -ne $_.$Prop } | ForEach-Object { [double]$_.$Prop }) }
 $sampleStats = [ordered]@{}
+$rawStats = @{}    # the EXACT figures every threshold is compared against; the json carries rounded copies for reading only (adversary r3 A8)
 foreach ($key in '0', '1', '2') {
     $rows = $groups[$key].ToArray()
     $temps = @(Get-Nums $rows 'temp')
     $load = @($rows | Where-Object { $null -ne $_.cpu -and [double]$_.cpu -ge $LoadCpuPct })
     $commits = @(Get-Nums $rows 'commit')
     $ge90 = @($temps | Where-Object { $_ -ge 90 }).Count
+    $sumDt = [double](($rows | Measure-Object -Property dt -Sum).Sum)
+    $fracRaw = $(if ($temps.Count -gt 0) { $ge90 / [double]$temps.Count } else { $null })
+    $rawStats[$key] = @{ minutes = ($sumDt / 60.0); frac = $fracRaw }
     $sampleStats[$key] = [ordered]@{
         samples = $rows.Count
-        minutes = [Math]::Round((($rows | Measure-Object -Property dt -Sum).Sum) / 60.0, 2)
+        minutes = [Math]::Round($sumDt / 60.0, 3)
         temp_c_p95 = (Get-Pct $temps 95)
-        temp_ge90_frac = $(if ($temps.Count -gt 0) { [Math]::Round($ge90 / $temps.Count, 4) } else { $null })
+        temp_ge90_frac = $(if ($null -ne $fracRaw) { [Math]::Round($fracRaw, 4) } else { $null })
         under_load_samples = $load.Count
         freq_p50_under_load = (Get-Pct @(Get-Nums $load 'freq') 50)
         min_free_commit_gb = $(if ($commits.Count -gt 0) { ($commits | Measure-Object -Minimum).Minimum } else { $null })
+        free_commit_unknown_samples = ($rows.Count - $commits.Count)
     }
 }
+# A B sample with no free-commit reading is NOT dropped from the minimum (adversary r3 A6): the minimum over the readings that exist says
+# nothing about the one that does not, so any unreadable B sample makes the B minimum unknown and the verdict INCONCLUSIVE.
 $minCommitB = $null
-$cB = @(Get-Nums $allB.ToArray() 'commit')
+$allBRows = $allB.ToArray()
+$cB = @(Get-Nums $allBRows 'commit')
+$bCommitUnknown = $allBRows.Count - $cB.Count
 if ($cB.Count -gt 0) { $minCommitB = ($cB | Measure-Object -Minimum).Minimum }
 
 # ---- Event 2004 -----------------------------------------------------------------------------------------------------------------
@@ -386,6 +428,7 @@ $thresholds = [ordered]@{
     b_wait_p90_max_ratio_of_a = $WaitP90Ratio; b_build_wait_p90_max_ratio_of_a = $BuildWaitP90Ratio; b_build_hold_p50_max_ratio_of_a = $BuildHoldP50Ratio
     holders2_temp_ge90_frac_max = $MaxGe90Frac; holders2_temp_c_p95_max = $MaxTempP95; holders2_freq_p50_min_ratio_of_holders1 = $MinFreqRatio
     min_free_commit_gb = $MinFreeCommitGB; under_load_cpu_pct = $LoadCpuPct; dead_holder_grace_minutes = $DeadGraceMinutes
+    min_b_pytest_at_slotcount_2 = $MinBPytestAtSlotCount2
 }
 $A = $armStats['A']; $B = $armStats['B']
 $checks = New-Object System.Collections.Generic.List[object]
@@ -399,7 +442,10 @@ else {
     elseif ([string]$driverReceipt.state -ne 'DONE') { $inconclusive.Add("receipt state $($driverReceipt.state)") }
     if ($A.overall.n_closed -lt $MinTicketsPerArm -or $B.overall.n_closed -lt $MinTicketsPerArm) { $inconclusive.Add("live closed tickets per arm A=$($A.overall.n_closed) B=$($B.overall.n_closed) (need $MinTicketsPerArm each)") }
     if ($A.build.n_closed -lt $MinBuildsPerArm -or $B.build.n_closed -lt $MinBuildsPerArm) { $inconclusive.Add("builds per arm A=$($A.build.n_closed) B=$($B.build.n_closed) (need $MinBuildsPerArm each)") }
-    if ([double]$sampleStats['2'].minutes -lt $MinHolders2Minutes) { $inconclusive.Add("holders>=2 time $($sampleStats['2'].minutes) min (need $MinHolders2Minutes)") }
+    if ([double]$rawStats['2'].minutes -lt $MinHolders2Minutes) { $inconclusive.Add(("holders>=2 time {0:N3} min (need {1})" -f [double]$rawStats['2'].minutes, $MinHolders2Minutes)) }
+    if ($bCommitUnknown -gt 0) { $inconclusive.Add("$bCommitUnknown B sample(s) have no free commit reading, so the B minimum free commit is unknown") }
+    if ($receiptsUnreadable.Count -gt 0) { $inconclusive.Add(("{0} receipt(s) written during the window cannot be read ({1}): the tickets in them are unknown" -f $receiptsUnreadable.Count, (($receiptsUnreadable | Select-Object -First 3) -join ', '))) }
+    if ($bPytestCount2 -lt $MinBPytestAtSlotCount2) { $inconclusive.Add("B pytest tickets that ran at slotCount 2: $bPytestCount2 of $bPytestN (need $MinBPytestAtSlotCount2): the switch may never have reached the tool") }
     if ($null -ne $A.overall.wait_s_p90 -and [double]$A.overall.wait_s_p90 -eq 0) { $inconclusive.Add('A arm shows no queueing (wait_p90 = 0), nothing to reduce') }
     if ($null -eq $sampleStats['2'].freq_p50_under_load -or $null -eq $sampleStats['1'].freq_p50_under_load) { $inconclusive.Add('no under-load frequency sample at holders=1 or holders>=2') }
     if ($null -eq $ev) { $inconclusive.Add('the System Event 2004 count could not be read (event probe or log query failed), so "no Event 2004" cannot be shown') }
@@ -412,7 +458,7 @@ else {
         $abh = [double]$A.build.hold_s_p50; $bbh = [double]$B.build.hold_s_p50
         Add-Check 'build_hold_p50_b_vs_a' $bbh ("<= {0} x {1} = {2}" -f $BuildHoldP50Ratio, $abh, ($BuildHoldP50Ratio * $abh)) ($bbh -le $BuildHoldP50Ratio * $abh)
         $s2 = $sampleStats['2']; $s1 = $sampleStats['1']
-        Add-Check 'holders2_temp_ge90_frac' $s2.temp_ge90_frac "<= $MaxGe90Frac" ($null -ne $s2.temp_ge90_frac -and [double]$s2.temp_ge90_frac -le $MaxGe90Frac)
+        Add-Check 'holders2_temp_ge90_frac' $s2.temp_ge90_frac "<= $MaxGe90Frac" ($null -ne $rawStats['2'].frac -and [double]$rawStats['2'].frac -le $MaxGe90Frac)
         Add-Check 'holders2_temp_c_p95' $s2.temp_c_p95 "<= $MaxTempP95" ($null -ne $s2.temp_c_p95 -and [double]$s2.temp_c_p95 -le $MaxTempP95)
         $f2 = [double]$s2.freq_p50_under_load; $f1 = [double]$s1.freq_p50_under_load
         Add-Check 'holders2_freq_p50_under_load_vs_holders1' $f2 (">= {0} x {1} = {2}" -f $MinFreqRatio, $f1, ($MinFreqRatio * $f1)) ($f2 -ge $MinFreqRatio * $f1)
@@ -434,6 +480,14 @@ $out = [ordered]@{
     hold_crosses_block_edge = $holdCrossEdge
     b_pytest = [ordered]@{ tickets = $bPytestN; ran_at_slotcount_2 = $bPytestCount2 }
     event_2004 = $ev
+    input_problems = [ordered]@{
+        receipts_unreadable = $receiptsUnreadable.Count
+        ledger_lines_unparseable = [int]$script:badLines['ledger.jsonl']
+        blocks_lines_unparseable = [int]$script:badLines['ab-blocks.jsonl']
+        samples_lines_unparseable = [int]$script:badLines['ab-samples.jsonl']
+        samples_skipped = $samplesSkipped
+        b_samples_without_free_commit = $bCommitUnknown
+    }
     arms = $armStats
     holds_by_holders = $holdsByHolders
     holds_log = 'ab-holds.jsonl'

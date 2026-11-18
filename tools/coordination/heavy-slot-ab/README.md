@@ -105,6 +105,25 @@ Verdict (every threshold is printed in the json):
   each sample stands for at most the time left to window end.
 * **Reader.** A switch whose window has not started is count 1 (a clock stepped back); the file is read with delete sharing.
 
+## Rules added in r4 (CI run 44251460414, adversary pass 3, Dot advisory)
+
+* **The rewrite waits out a reader.** A switch rewrite retries against a time budget (`-SwitchRetrySeconds`, default 10 s, jittered 10-40 ms pauses), not 10 fixed
+  tries: a reader that keeps the file open for seconds on a loaded host no longer ends the window with `driver-exception ... Access to the path is denied`.
+* **One window dir, claimed atomically.** The driver takes an exclusive `ab-window.lock` in the window dir (held, never removed, so a used dir stays used).
+  Two drivers that both passed the unused-dir check cannot both run: the loser is refused `window-dir-used`.
+* **Evidence fails closed.** A ledger that cannot be read on 2 polls in a row or in the final sweep (4 tries) aborts `ledger-unreadable`; a held record that cannot
+  be parsed on 2 polls aborts `held-unreadable`; a receipt that never parses aborts `receipt-unreadable` (never skipped). The evaluator is INCONCLUSIVE for a B
+  sample with no free-commit reading and for a receipt written during the window that cannot be read; every unparseable input line is counted in `input_problems`.
+* **No receipt, no DONE.** A final receipt that cannot be written (3 tries) prints `AB_RECEIPT_FAILED` and exits 5; `AB_DONE` is never printed.
+* **Compare before rounding.** Free disk and memory in the driver, and holders>=2 minutes, the >=90 C fraction and the percentiles in the evaluator are compared
+  exactly; only printed text is rounded.
+* **Aliases.** The containment checks of both tools resolve junctions, symlinks and 8.3 names to the real path first (`Resolve-HeavySlotAbRealPath`).
+* **Block edges.** The blocks log `startUtc` is taken before the switch write (`switchWrittenUtc` is when the write returned); a `reaped kind=held` row excludes its
+  receipt even with no admit row; a never-admitted wait cut off in another block is spill; a holders value that is not a finite whole number 0..1000 is a skip.
+* **Telemetry.** A feed row dated later than now + 30 s is invalid: a feed with only such rows is refused `feed-future`, and a frozen future row ages into `stale-feed`.
+* **Adoption** also needs at least 10 B pytest tickets whose receipt shows slotCount 2 (`thresholds.min_b_pytest_at_slotcount_2`).
+* **Open, outside this card:** `tools/coordination/build-guard.ps1:446-447` still compares the rounded memory figure (BUILD-GUARD-MEMORY-FLOOR-COMPARE-UNROUNDED-1).
+
 ## Known limits
 
 * The slot-1 object is not keeper-owned during the window (`HeavySlot-KeepObjects` keeps slot 0 only), so every heavy-slot run in a

@@ -551,7 +551,7 @@ def _scale(values, f):
 
 def build_window(root: Path, name: str, *, b_build=None, b_pytest=None, a_hold=60.0, b_hold=62.0, b_temp=85.0, b_freq=4400.0, a_freq=4500.0,
                  a_build=None, a_pytest=None, dead=0, reaped=0, spill=False, receipt_state="DONE", receipt_reason="window-complete",
-                 b_commit=60.0, a2_holders=1):
+                 b_commit=60.0, a2_holders=1, b_slot_count=2):
     a_build = A_BUILD if a_build is None else a_build
     a_pytest = A_PYTEST if a_pytest is None else a_pytest
     b_build = _scale(A_BUILD, 0.5) if b_build is None else b_build
@@ -581,7 +581,7 @@ def build_window(root: Path, name: str, *, b_build=None, b_pytest=None, a_hold=6
         ledger.append({"at": iso7(adm), "event": "admit", "ticket": tid, "label": label, "class": "shared", "waitedMs": int(wait * 1000)})
         ledger.append({"at": iso7(fin), "event": "exit", "ticket": tid, "label": label, "source": "child", "code": 0})
 
-    for state, ws_build, ws_pytest, hold, sc in (("A", a_build, a_pytest, a_hold, 1), ("B", b_build, b_pytest, b_hold, 2)):
+    for state, ws_build, ws_pytest, hold, sc in (("A", a_build, a_pytest, a_hold, 1), ("B", b_build, b_pytest, b_hold, b_slot_count)):
         for i, w in enumerate(ws_build):
             ticket(state, arms[state][i % 3], "build", w, hold, 1)
         for i, w in enumerate(ws_pytest):
@@ -731,14 +731,14 @@ def test_evaluator_carries_an_aborted_receipt_through(tmp_path):
 def test_evaluator_counts_a_ticket_that_timed_out_waiting_in_its_arms_waits(tmp_path):
     win, hs = build_window(tmp_path, "timeout")
     enq = block_start(2) + timedelta(minutes=5)
-    rec = {"ticket": "to1", "label": "mlv:SLOW:build", "class": "shared", "wholeMachine": False, "slotCount": 1, "enqueuedAt": iso7(enq), "waitedMs": 1500000}
+    rec = {"ticket": "to1", "label": "mlv:SLOW:build", "class": "shared", "wholeMachine": False, "slotCount": 1, "enqueuedAt": iso7(enq), "waitedMs": 1200000}
     (hs / "receipts" / "to1.json").write_text(json.dumps(rec), encoding="ascii")
     with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
-        fh.write(json.dumps({"at": iso7(enq + timedelta(seconds=1500)), "event": "tool-exit", "ticket": "to1", "label": "mlv:SLOW:build", "code": 75, "reason": "timed out waiting for the slot"}) + "\n")
+        fh.write(json.dumps({"at": iso7(enq + timedelta(seconds=1200)), "event": "tool-exit", "ticket": "to1", "label": "mlv:SLOW:build", "code": 75, "reason": "timed out waiting for the slot"}) + "\n")
     v, _ = evaluate(tmp_path, "timeout", win, hs)
     assert v["arms"]["A"]["timed_out_waiting"] == 1
     assert v["arms"]["A"]["build"]["n"] == 16 and v["arms"]["A"]["build"]["n_closed"] == 15, "a wait that happened counts as a wait, never as a hold"
-    assert v["arms"]["A"]["build"]["wait_s_p99"] == 1500.0
+    assert v["arms"]["A"]["build"]["wait_s_p99"] == 1200.0
 
 
 def test_the_evaluator_never_writes_under_the_heavy_slot_dir_and_saves_the_headroom_summary(tmp_path):
@@ -937,7 +937,7 @@ def test_A9_a_final_revert_that_fails_is_never_recorded_as_reverted(tmp_path, me
     w = World(tmp_path, "revertfail", me)
     holder = None
     try:
-        proc = w.start(0.012, 0.1)
+        proc = w.start(0.012, 0.1, ["-SwitchRetrySeconds", "1"])   # a short retry budget: this test holds the file for good
         assert _wait(lambda: (w.switch_doc() or {}).get("state") == "B", 60), w.text()
         holder = open(w.switch, "rb")   # read-shared, not delete-shared: the atomic replace over it cannot succeed
         code = proc.wait(timeout=90)
@@ -1069,7 +1069,7 @@ def test_r2_A4_a_refusal_whose_revert_cannot_be_proven_exits_4_not_2(tmp_path, m
     try:
         w.switch.write_text(json.dumps(switch_doc(me)), encoding="ascii")    # a live count-2 switch left by something else
         holder = open(w.switch, "rb")                                        # and a reader that will not let go
-        out = subprocess.run(w.args(0.05, 0.05), capture_output=True, text=True, timeout=120)
+        out = subprocess.run(w.args(0.05, 0.05, ["-SwitchRetrySeconds", "1"]), capture_output=True, text=True, timeout=120)
         holder.close()
         holder = None
         assert out.returncode == 4, (out.returncode, out.stdout, out.stderr)
@@ -1118,7 +1118,7 @@ def test_r2_A6_unparseable_block_rows_are_no_input_and_unparseable_samples_are_s
         out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / name / "event.txt")])
         assert out.returncode == 2 and "AB_EVAL_NO_INPUT" in out.stdout, (name, out.returncode, out.stdout, out.stderr)
     win, hs = build_window(tmp_path, "badsample")
-    _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=30)), "block": 1, "state": "B", "holders": "x", "temp_c": "hot", "cpu_pct": 60.0, "freq_mhz": 4400.0})
+    _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=30)), "block": 1, "state": "B", "holders": "x", "temp_c": "hot", "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0})
     _append_sample(win, {"utc": "not-a-date", "holders": 2})
     v, _ = evaluate(tmp_path, "badsample", win, hs)
     assert v["verdict"] == "ADOPT", v
@@ -1177,5 +1177,301 @@ def test_r2_A10_a_second_driver_with_another_mutex_name_but_the_same_switch_is_r
         assert (w.switch_doc() or {}).get("driverPid") == first.pid and (w.switch_doc() or {}).get("state") in ("A", "B")
         (w.window / "ab-stop").write_text("stop", encoding="ascii")
         assert first.wait(timeout=60) == 3
+    finally:
+        w.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# round r4 (head bd40d96d): the CI red, adversary pass 2 (ten majors) and the Dot advisory, each fed its own input
+# ---------------------------------------------------------------------------------------------------------------------------
+def _parse_iso(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+
+
+def test_r4_ci_a_reader_that_holds_the_switch_for_seconds_does_not_end_the_window(tmp_path, me):
+    """CI run 44251460414: the atomic rewrite gave up after ~1 s of 'access denied' and the window ended as driver-exception. A reader
+    that keeps the file open past that budget (a slow runner) must be waited out, not abort a 24 h window."""
+    w = World(tmp_path, "holdreader", me)
+    holder = None
+    try:
+        proc = w.start(0.01, 0.07)     # 36 s window, 4.2 s blocks
+        assert _wait(lambda: (w.switch_doc() or {}).get("state") == "A", 60), w.text()
+        holder = open(w.switch, "rb")  # not delete-shared: the rewrite at the 4.2 s edge cannot replace the file while this is open
+        time.sleep(7.0)                # past the old 1 s budget by several seconds, well inside the new one
+        holder.close()
+        holder = None
+        code = proc.wait(timeout=120)
+        assert code == 0, w.text()
+        assert w.receipt()["state"] == "DONE" and w.receipt()["switchFinal"] == "REVERTED"
+    finally:
+        if holder:
+            holder.close()
+        w.close()
+
+
+def _junction(link: Path, target: Path):
+    out = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
+def test_r4_A1_a_switch_reached_through_a_junction_into_the_heavy_slot_dir_is_refused(tmp_path, me):
+    w = World(tmp_path, "junction-driver", me)
+    link = w.root / "alias"
+    try:
+        _junction(link, w.hs)
+        args = w.args(0.05, 0.05)
+        args[args.index("-SwitchPath") + 1] = str(link / "switch.json")
+        out = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=path-overlap" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert not (w.hs / "switch.json").exists() and not (w.hs / "switch.json.lock").exists(), "the driver wrote into the HeavySlot dir through the alias"
+    finally:
+        if link.exists():
+            os.rmdir(link)
+        w.close()
+
+
+def test_r4_A1_an_evaluator_window_dir_reached_through_a_junction_into_the_heavy_slot_dir_is_refused(tmp_path):
+    win, hs = build_window(tmp_path, "junction-eval")
+    link = tmp_path / "junction-eval" / "alias"
+    _junction(link, hs)
+    try:
+        out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(link / "window"), "-HeavySlotDir", str(hs), "-SkipHeadroom"])
+        assert out.returncode == 2 and "AB_EVAL_REFUSED" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert not (hs / "window").exists()
+    finally:
+        os.rmdir(link)
+
+
+def test_r4_A2_two_drivers_that_pass_the_unused_check_together_cannot_share_a_window_dir(tmp_path, me):
+    w = World(tmp_path, "claimrace", me)
+    try:
+        procs = []
+        for tag in "12":
+            a = w.args(0.004, 0.05, ["-WindowClaimDelaySeconds", "3"])
+            a[a.index("-SwitchPath") + 1] = str(w.root / f"switch-{tag}.json")
+            a[a.index("-MutexName") + 1] = "Global\\MLV-HeavySlotAbDriver-test-" + uuid.uuid4().hex[:12]
+            procs.append(subprocess.Popen(a, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        outs = [p.communicate(timeout=120) for p in procs]
+        codes = sorted(p.returncode for p in procs)
+        text = "\n".join(o + e for o, e in outs)
+        assert codes.count(2) == 1 and "AB_REFUSED reason=window-dir-used" in text, (codes, text)
+        assert (w.window / "ab-window.lock").exists()
+        rows = w.blocks()
+        assert len({r["windowStartUtc"] for r in rows}) == 1, "two windows were written into one directory"
+    finally:
+        w.close()
+
+
+def test_r4_A3_a_ledger_that_cannot_be_read_ends_the_window_aborted_not_clean(tmp_path, me):
+    w = World(tmp_path, "ledgerlock", me)
+    release = None
+    try:
+        release = _lock_exclusively(w.hs / "ledger.jsonl")
+        proc = w.start(0.004, 0.05)
+        code = proc.wait(timeout=90)
+        release()
+        release = None
+        assert code == 3, (code, w.text())
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith("ledger-unreadable"), w.receipt()
+        assert w.switch_doc()["state"] == "REVERTED"
+    finally:
+        if release:
+            release()
+        w.close()
+
+
+def test_r4_A3_a_held_record_that_cannot_be_parsed_ends_the_window_aborted(tmp_path, me):
+    w = World(tmp_path, "heldbad", me)
+    try:
+        (w.hs / "held" / "broken.json").write_text('{"ticket": "broken", "pid": ', encoding="ascii")
+        code = w.start(0.004, 0.05).wait(timeout=90)
+        assert code == 3, (code, w.text())
+        assert w.receipt()["reason"].startswith("held-unreadable"), w.receipt()
+    finally:
+        w.close()
+
+
+def test_r4_A3_a_receipt_that_stays_unreadable_ends_the_window_aborted(tmp_path, me):
+    w = World(tmp_path, "receiptbad", me)
+    try:
+        proc = w.start(0.004, 0.05, ["-ReceiptGiveUpReads", "3"])
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        (w.hs / "receipts" / (datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "777Z-3-badbad.json")).write_text('{"ticket": "x', encoding="ascii")
+        code = proc.wait(timeout=90)
+        assert code == 3, (code, w.text())
+        assert w.receipt()["reason"].startswith("receipt-unreadable"), w.receipt()
+    finally:
+        w.close()
+
+
+def test_r4_A9_a_final_receipt_that_cannot_be_written_never_reads_as_done(tmp_path, me):
+    w = World(tmp_path, "rcptfail", me)
+    try:
+        proc = w.start(0.004, 0.05)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        (w.window / "ab-receipt.json").mkdir()      # something else took the receipt's name after preflight
+        code = proc.wait(timeout=90)
+        text = w.text()
+        assert code == 5 and "AB_RECEIPT_FAILED" in text and "AB_DONE" not in text, (code, text)
+        assert w.switch_doc()["state"] == "REVERTED" and _reader_counts(tmp_path, w.switch) == 1
+    finally:
+        w.close()
+
+
+def test_r4_A10_the_blocks_log_takes_the_start_before_the_switch_is_written(tmp_path, me):
+    w = World(tmp_path, "prestart", me)
+    try:
+        proc = w.start(0.004, 0.05, ["-PostSwitchDelaySeconds", "2"])    # the driver is descheduled for 2 s right after each write
+        seen = {}
+
+        def b_written():
+            doc = w.switch_doc()
+            if doc and doc.get("state") == "B" and "updatedUtc" in doc:
+                seen["updated"] = _parse_iso(doc["updatedUtc"])
+                return True
+            return False
+
+        assert _wait(b_written, 60), w.text()
+        assert _wait(lambda: any(r["block"] == 1 for r in w.blocks()), 60), w.text()
+        row = next(r for r in w.blocks() if r["block"] == 1)
+        assert _parse_iso(row["startUtc"]) <= seen["updated"] + timedelta(milliseconds=100), f"startUtc {row['startUtc']} is later than the write {seen['updated']}"
+        assert "switchWrittenUtc" in row and _parse_iso(row["switchWrittenUtc"]) >= _parse_iso(row["startUtc"])
+        proc.wait(timeout=90)
+    finally:
+        w.close()
+
+
+def test_r4_A8_a_c_drive_a_mebibyte_under_the_floor_is_refused_not_rounded_up(tmp_path, me):
+    w = World(tmp_path, "diskround", me)
+    try:
+        out = subprocess.run(w.args(0.05, 0.05, ["-DiskProbeBytes", "42948624384"]), capture_output=True, text=True, timeout=120)    # 40 GiB minus 1 MiB
+        assert out.returncode == 2 and "AB_REFUSED reason=low-disk" in out.stdout, (out.returncode, out.stdout, out.stderr)
+    finally:
+        w.close()
+
+
+def test_r4_A8_holders2_time_a_fraction_under_the_floor_is_inconclusive_not_rounded_up(tmp_path):
+    win, hs = build_window(tmp_path, "minround")
+    receipt = json.loads((win / "ab-receipt.json").read_text(encoding="utf-8"))
+    receipt["pollSeconds"] = 59.9
+    (win / "ab-receipt.json").write_text(json.dumps(receipt), encoding="ascii")
+    rows = []
+    for m in range(5):
+        rows.append({"utc": iso(block_start(0) + timedelta(minutes=m)), "block": 0, "state": "A", "holders": 1, "temp_c": 72.0, "cpu_pct": 60.0, "freq_mhz": 4500.0, "free_commit_gb": 65.0})
+    for m in range(30):
+        rows.append({"utc": iso(block_start(1) + timedelta(minutes=m)), "block": 1, "state": "B", "holders": 2, "temp_c": 70.0, "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0})
+    (win / "ab-samples.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="ascii")
+    v, _ = evaluate(tmp_path, "minround", win, hs)
+    # 29 samples stand 60 s each and the last one 59.9 s: 1799.9 s = 29.998 min, under the 30 min floor (it prints as 30.0)
+    assert v["verdict"] == "INCONCLUSIVE" and "holders>=2 time" in v["reason"], v
+
+
+def test_r4_A4_a_reaped_held_row_without_an_admit_row_still_excludes_its_receipt(tmp_path):
+    win, hs = build_window(tmp_path, "reapnoadmit")
+    enq = block_start(1) + timedelta(minutes=1)
+    rec = {"ticket": "r1", "label": "mlv:REAP:build", "class": "shared", "wholeMachine": False, "slotCount": 1, "slots": [0], "enqueuedAt": iso7(enq),
+           "admittedAt": iso7(enq + timedelta(minutes=1)), "finishedAt": iso7(enq + timedelta(minutes=2)), "waitedMs": 60000, "exit": {"source": "child", "code": 0}}
+    (hs / "receipts" / "r1.json").write_text(json.dumps(rec), encoding="ascii")
+    with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
+        fh.write(json.dumps({"at": iso7(enq + timedelta(minutes=1, seconds=30)), "event": "reaped", "kind": "held", "ticket": "r1", "pid": 1}) + "\n")
+    v, _ = evaluate(tmp_path, "reapnoadmit", win, hs)
+    assert "r1" in v["dead_holders"]["tickets"], v["dead_holders"]
+    assert v["arms"]["B"]["build"]["n_closed"] == 15, "a reaped holder's receipt must not enter the statistics"
+
+
+def test_r4_A5_a_never_admitted_wait_that_ends_in_another_block_is_spill_not_a_timed_out_wait(tmp_path):
+    win, hs = build_window(tmp_path, "waitcross")
+    enq = block_start(1) - timedelta(seconds=10)
+    rec = {"ticket": "to1", "label": "mlv:SLOW:build", "class": "shared", "wholeMachine": False, "slotCount": 1, "enqueuedAt": iso7(enq), "waitedMs": 20000}
+    (hs / "receipts" / "to1.json").write_text(json.dumps(rec), encoding="ascii")
+    with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
+        fh.write(json.dumps({"at": iso7(block_start(1) + timedelta(seconds=10)), "event": "tool-exit", "ticket": "to1", "label": "mlv:SLOW:build", "code": 75, "reason": "timed out waiting for the slot"}) + "\n")
+    v, _ = evaluate(tmp_path, "waitcross", win, hs)
+    assert v["arms"]["A"]["timed_out_waiting"] == 0 and v["arms"]["B"]["timed_out_waiting"] == 0
+    assert v["spill"]["count"] == 1 and v["spill"]["tickets"][0]["ticket"] == "to1"
+
+
+def test_r4_A6_a_b_sample_with_no_free_commit_reading_is_not_dropped_from_the_minimum(tmp_path):
+    win, hs = build_window(tmp_path, "nullcommit")
+    rows = [json.loads(line) for line in (win / "ab-samples.jsonl").read_text(encoding="utf-8").splitlines()]
+    next(r for r in rows if r["state"] == "B")["free_commit_gb"] = None
+    (win / "ab-samples.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="ascii")
+    v, _ = evaluate(tmp_path, "nullcommit", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "free commit" in v["reason"], v
+
+
+def test_r4_A7_a_receipt_written_during_the_window_that_cannot_be_read_is_inconclusive(tmp_path):
+    win, hs = build_window(tmp_path, "rcptlocked", a_build=[100] * 15, a_pytest=[100] * 12, b_build=[50] * 12 + [800] * 3, b_pytest=[20] * 12)
+    bad = hs / "receipts" / "t001.json"
+    release = _lock_exclusively(bad)
+    try:
+        v, _ = evaluate(tmp_path, "rcptlocked", win, hs)
+    finally:
+        release()
+    assert v["verdict"] == "INCONCLUSIVE" and "receipt" in v["reason"].lower() and "cannot be read" in v["reason"], v
+    assert v["input_problems"]["receipts_unreadable"] == 1
+
+
+def test_r4_A7_an_old_unreadable_receipt_and_unparseable_ledger_lines_are_counted_not_fatal(tmp_path):
+    win, hs = build_window(tmp_path, "oldbad")
+    old = hs / "receipts" / "ancient.json"
+    old.write_text("{not json", encoding="ascii")
+    ancient = datetime(2020, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(old, (ancient, ancient))
+    with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
+        fh.write("this is not json\n")
+    v, _ = evaluate(tmp_path, "oldbad", win, hs)
+    assert v["verdict"] == "ADOPT", v
+    assert v["input_problems"]["receipts_unreadable"] == 0 and v["input_problems"]["ledger_lines_unparseable"] == 1, v["input_problems"]
+
+
+def test_r4_A11_a_holders_value_that_overflows_is_a_typed_skip_not_an_eval_error(tmp_path):
+    win, hs = build_window(tmp_path, "overflow")
+    _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=30)), "block": 1, "state": "B", "holders": 1e20, "temp_c": 80.0, "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0})
+    _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=40)), "block": 1, "state": "B", "holders": 2.5, "temp_c": 80.0, "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0})
+    v, out = evaluate(tmp_path, "overflow", win, hs)
+    assert "AB_EVAL_ERROR" not in out and v["verdict"] == "ADOPT", (out, v)
+    assert v["input_problems"]["samples_skipped"] == 2, v["input_problems"]
+
+
+def test_r4_I1_adoption_needs_enough_b_pytest_tickets_that_really_ran_at_slotcount_2(tmp_path):
+    win, hs = build_window(tmp_path, "noslot2", b_slot_count=1)
+    v, _ = evaluate(tmp_path, "noslot2", win, hs)
+    assert v["b_pytest"] == {"tickets": 12, "ran_at_slotcount_2": 0}
+    assert v["verdict"] == "INCONCLUSIVE" and "slotCount 2" in v["reason"], v
+    assert v["thresholds"]["min_b_pytest_at_slotcount_2"] == 10
+
+
+def _write_feed_rows(path: Path, rows):
+    path.write_text(FEED_HEADER, encoding="ascii")
+    with open(path, "a", encoding="ascii") as fh:
+        for when in rows:
+            fh.write(when.strftime("%d.%m.%Y,%H:%M:%S.") + f"{when.microsecond // 1000:03d}" + ",20.0,60.0,40.0,No,No\n")
+
+
+def test_r4_B1_a_feed_whose_only_rows_are_in_the_future_is_refused_at_preflight(tmp_path, me):
+    w = World(tmp_path, "futurefeed", me)
+    try:
+        w.feed.close()
+        _write_feed_rows(w.feed_path, [datetime.now() + timedelta(hours=1)])
+        out = subprocess.run(w.args(0.004, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=feed-future" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert not w.window.exists()
+    finally:
+        w.close()
+
+
+def test_r4_B1_a_frozen_future_row_cannot_hide_a_stalled_feed(tmp_path, me):
+    w = World(tmp_path, "frozenfuture", me)
+    try:
+        proc = w.start(0.004, 0.2, ["-FeedAbortSeconds", "1.5"])
+        assert _wait(lambda: len(w.samples()) >= 3, 60), w.text()
+        w.feed.paused = True
+        time.sleep(0.6)
+        with open(w.feed_path, "a", encoding="ascii") as fh:
+            fut = datetime.now() + timedelta(hours=1)
+            fh.write(fut.strftime("%d.%m.%Y,%H:%M:%S.") + f"{fut.microsecond // 1000:03d}" + ",20.0,60.0,40.0,No,No\n")
+        code = proc.wait(timeout=90)
+        assert code == 3 and w.receipt()["reason"].startswith("stale-feed"), (code, w.text())
     finally:
         w.close()
