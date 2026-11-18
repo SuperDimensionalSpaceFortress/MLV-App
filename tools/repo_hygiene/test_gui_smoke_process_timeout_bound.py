@@ -843,11 +843,33 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
 
     def test_both_runner_wait_branches_record_the_exhausted_budget_and_hand_it_to_the_boundary(self) -> None:
         wait = _runner_snippet(*_WAIT_REGION)
-        self.assertEqual(2, wait.count("$waitBudgetExhausted = $true"), "the host-load branch and the log-only branch both record it")
+        record = "$waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs"
+        self.assertEqual(2, wait.count(record), "the host-load branch and the log-only branch both record it, from the process's own lifetime")
+        self.assertNotIn("$waitBudgetExhausted = $true", wait, "elapsed time alone never says the app was still running at the deadline (r10 sol A1, 3534e113)")
         self.assertIn("-DeadlineReached:$waitBudgetExhausted", wait)
         for marker in ("if ($hostLoadRemainingMs -le 0) {", "if ($noProgressRemainingMs -le 0) {"):
             start = wait.index(marker)
-            self.assertIn("$waitBudgetExhausted = $true", wait[start:wait.index("break", start)], marker)
+            self.assertIn(record, wait[start:wait.index("break", start)], marker)
+
+    def _exhausted(self, command: str, budget_ms: int, wait_ms: int) -> bool:
+        out = run_ps(r"""
+$s = New-Stub '%s'
+[void]$s.p.WaitForExit(%d)
+$e = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs %d
+if (-not $s.p.HasExited) { $s.p.Kill($true) }
+[pscustomobject]@{ exhausted = [bool]$e } | ConvertTo-Json -Compress
+""" % (command, wait_ms, budget_ms))
+        return bool(out["exhausted"])
+
+    def test_a_process_that_exited_within_its_budget_is_never_a_deadline_hit(self) -> None:
+        # the adversary's input: the chunked wait saw the app alive, a stalled probe then spent the rest of the budget, and the app exited 7 inside it
+        self.assertFalse(self._exhausted("exit 7", 600000, 30000))
+
+    def test_a_process_still_running_when_the_budget_ends_is_a_deadline_hit(self) -> None:
+        self.assertTrue(self._exhausted("Start-Sleep -Seconds 20", 600000, 300), "an app still alive at the check: the budget ran out under it")
+
+    def test_a_process_that_outlived_its_budget_before_exiting_is_a_deadline_hit(self) -> None:
+        self.assertTrue(self._exhausted("Start-Sleep -Seconds 3", 500, 30000), "the exit came after the deadline: not a completion")
 
 
 if __name__ == "__main__":

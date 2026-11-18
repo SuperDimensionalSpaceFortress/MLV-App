@@ -270,6 +270,29 @@ function Test-GuiSmokeLogProgressStalled {
     return ($Watch.Quiet.ElapsedMilliseconds -ge $Watch.WindowMs)
 }
 
+# r10 (adversary 3534e113 A1): did the leg-derived budget run out UNDER a still-running app? Elapsed time alone cannot say: a log probe that stalls
+# on a share can spend the rest of the budget after the app already exited cleanly. The process's own lifetime decides. A process still running is
+# exhausted; one that exited is exhausted only if it lived longer than the budget; a lifetime that cannot be read for an exited process is NOT
+# exhausted (the finalize look then reports the exit it sees, as before).
+function Test-GuiSmokeWaitBudgetExhausted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory)]
+        [ValidateRange(0, 3600000)]
+        [int64]$BudgetMs
+    )
+
+    try {
+        if (-not $Process.HasExited) { return $true }
+        return (($Process.ExitTime - $Process.StartTime).TotalMilliseconds -gt $BudgetMs)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Wait-GuiSmokeProcessBounded {
     [CmdletBinding()]
     param(
@@ -439,4 +462,4 @@ function Wait-GuiSmokeProcessBounded {
     }
 }
 
-Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeLegHardLimitMs, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled
+Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeLegHardLimitMs, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, Test-GuiSmokeWaitBudgetExhausted, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled

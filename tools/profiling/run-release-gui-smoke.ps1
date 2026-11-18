@@ -2002,8 +2002,9 @@ $noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noP
 # r3 (adversary 797947a7 A2): no chunked wait may outlast a fraction of the window, or a short window would permit one chunk (up to 60 s) of silence.
 $noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs
 $noProgressStalled = $false
-# r10 (adversary 412ce3e0 A1): set when either chunked wait ran the leg-derived budget out with the process still running; the finalize wait below
-# then treats a late exit as the timeout it is, not as a completion.
+# r10 (adversary 412ce3e0 A1, 3534e113 A1): set when either chunked wait ran the leg-derived budget out under a process that was still running (or that
+# outlived the budget before exiting), judged from the process's own lifetime, never from elapsed time alone; the finalize wait below then treats
+# a late exit as the timeout it is, while an app that exited inside the budget keeps its native exit classification.
 $waitBudgetExhausted = $false
 if ($HostLoadSampleIntervalMs -gt 0) {
     $hostLoadSampleLoopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -2011,7 +2012,7 @@ if ($HostLoadSampleIntervalMs -gt 0) {
     while ($true) {
         $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
         if ($hostLoadRemainingMs -le 0) {
-            $waitBudgetExhausted = $true
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs
             break
         }
         $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))
@@ -2044,7 +2045,7 @@ else {
     while ($true) {
         $noProgressRemainingMs = $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds
         if ($noProgressRemainingMs -le 0) {
-            $waitBudgetExhausted = $true
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs
             break
         }
         if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
