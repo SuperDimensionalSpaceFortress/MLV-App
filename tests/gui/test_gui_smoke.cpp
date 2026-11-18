@@ -53,6 +53,7 @@
 #include <QStringListModel>
 #include <QTableWidget>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWindow>
@@ -1373,11 +1374,45 @@ void GuiSmokeTest::playerShortcutMap_helpRowsAreGeneratedFromLiveActions()
     hidden->setVisible( false );                                           // a dead key: not listed
     QShortcut *described = new QShortcut( seq( "Esc" ), &m.window );
     described->setWhatsThis( QStringLiteral( "Exit fullscreen" ) );
-    new QShortcut( seq( "Q" ), &m.window );                               // undescribed: not listed
+    new QShortcut( seq( "Q" ), &m.window );                               // undescribed: listed by its owner's name
+    // Adversary A1 (pass 1, 0142890b): keys that live OFF the window's direct children must be
+    // listed too -- a tool button's own shortcut (MainWindow.ui M, Shift+I), a QShortcut owned by
+    // a child widget (GraphicsZoomView zoom in/out) and an action in a submenu (QRecentFilesMenu
+    // Ctrl+R). A dialog's keys are its own and stay out.
+    QToolButton *badPixels = new QToolButton( m.central );
+    badPixels->setToolTip( QStringLiteral( "Select Bad Pixels" ) );
+    badPixels->setShortcut( seq( "M" ) );
+    QToolButton *cutIn = new QToolButton( m.central );
+    cutIn->setText( QStringLiteral( "&In" ) );
+    cutIn->setShortcut( seq( "Shift+I" ) );
+    QShortcut *zoomIn = new QShortcut( QKeySequence::ZoomIn, m.viewer );
+    zoomIn->setWhatsThis( QStringLiteral( "Zoom in" ) );
+    QMenu *recent = m.window.menuBar()->actions().first()->menu()->addMenu( QStringLiteral( "Recent" ) );
+    recent->addAction( QStringLiteral( "1 recent session" ) )->setShortcut( seq( "Ctrl+R" ) );
+    QDialog *otherWindow = new QDialog( &m.window );
+    QAction *dialogAction = new QAction( QStringLiteral( "Dialog action" ), otherWindow );
+    dialogAction->setShortcut( seq( "Ctrl+Shift+D" ) );
+    otherWindow->addAction( dialogAction );
+    new QShortcut( seq( "Ctrl+Shift+G" ), otherWindow );
+    QToolButton *dialogButton = new QToolButton( otherWindow );
+    dialogButton->setShortcut( seq( "Ctrl+Shift+B" ) );
 
     const QList<PlayerShortcutBinding::ShortcutRow> rows = PlayerShortcutBinding::shortcutRows( &m.window );
     const QList<OracleAction> oracle = standard_map_oracle();
-    QCOMPARE( rows.size(), int( oracle.size() ) + 2 );
+    QStringList listed;
+    for( const PlayerShortcutBinding::ShortcutRow &r : rows ) listed << r.action + QStringLiteral( " = " ) + r.keys;
+    const QString eq = QStringLiteral( " = " );
+    const int n = int( oracle.size() );
+    const QStringList expectedExtras = QStringList()
+        << QStringLiteral( "1 recent session" ) + eq + seq( "Ctrl+R" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "In" ) + eq + seq( "Shift+I" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Select Bad Pixels" ) + eq + seq( "M" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Zz Unrelated" ) + eq + seq( "Ctrl+Shift+Y" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Exit fullscreen" ) + eq + seq( "Esc" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "QMainWindow" ) + eq + seq( "Q" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Zoom in" ) + eq + PlayerShortcutBinding::keysText( zoomIn->keys() );
+    QCOMPARE( listed.mid( n ), expectedExtras );
+    QCOMPARE( rows.size(), n + int( expectedExtras.size() ) );
     for( int i = 0; i < oracle.size(); ++i )
     {
         const OracleAction &row = oracle.at( i );
@@ -1396,10 +1431,11 @@ void GuiSmokeTest::playerShortcutMap_helpRowsAreGeneratedFromLiveActions()
         }
         QCOMPARE( rows.at( i ).note.contains( PlayerShortcutBinding::aliasRetireNote() ), hasAlias );
     }
-    QCOMPARE( rows.at( oracle.size() ).action, QStringLiteral( "Zz Unrelated" ) );
-    QCOMPARE( rows.at( oracle.size() ).keys, seq( "Ctrl+Shift+Y" ).toString( QKeySequence::NativeText ) );
-    QCOMPARE( rows.at( oracle.size() + 1 ).action, QStringLiteral( "Exit fullscreen" ) );
-    QCOMPARE( rows.at( oracle.size() + 1 ).keys, seq( "Esc" ).toString( QKeySequence::NativeText ) );
+    // Nothing from the dialog, which is its own window with its own keys.
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( QStringLiteral( "Dialog action" ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+G" ).toString( QKeySequence::NativeText ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+B" ).toString( QKeySequence::NativeText ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+H" ).toString( QKeySequence::NativeText ) ) );
 
     std::unique_ptr<QDialog> dialog( PlayerShortcutBinding::createShortcutsDialog( &m.window ) );
     QVERIFY( dialog );

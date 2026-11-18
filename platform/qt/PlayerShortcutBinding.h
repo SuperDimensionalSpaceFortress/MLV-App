@@ -25,6 +25,7 @@
 #ifndef PLAYERSHORTCUTBINDING_H
 #define PLAYERSHORTCUTBINDING_H
 
+#include <QAbstractButton>
 #include <QAbstractItemView>
 #include <QAbstractSlider>
 #include <QAbstractSpinBox>
@@ -35,12 +36,14 @@
 #include <QDebug>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDockWidget>
 #include <QEvent>
 #include <QHeaderView>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLineEdit>
 #include <QList>
+#include <QMenu>
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QShortcut>
@@ -261,9 +264,34 @@ inline QString keysText( const QList<QKeySequence> &sequences )
     return parts.join( QStringLiteral( " or " ) );
 }
 
-// Rows from the window's LIVE actions: section 1 is the table actions in table order, section 2
-// every other direct-child visible QAction with a shortcut (by text), then every direct-child
-// QShortcut that carries a whatsThis() description (by description).
+// True when `object` lives in `window` itself: walking up its parents reaches `window` without
+// passing another top-level window (a dialog has its own shortcuts). Menus (popup windows) and
+// floating dock widgets still belong to the window that owns them.
+inline bool ownedByWindow( const QObject *object, const QWidget *window )
+{
+    for( const QObject *o = object; o; o = o->parent() )
+    {
+        if( o == window ) return true;
+        const QWidget *w = qobject_cast<const QWidget*>( o );
+        if( w && w->isWindow() && !qobject_cast<const QMenu*>( w ) && !qobject_cast<const QDockWidget*>( w ) )
+            return false;
+    }
+    return false;
+}
+
+// Name for a key that has no action text: its description, else its owner's.
+inline QString describedName( const QString &primary, const QString &secondary, const QObject *fallback )
+{
+    if( !primary.isEmpty() ) return primary;
+    if( !secondary.isEmpty() ) return secondary;
+    if( fallback && !fallback->objectName().isEmpty() ) return fallback->objectName();
+    return fallback ? QString::fromLatin1( fallback->metaObject()->className() ) : QString();
+}
+
+// Rows from the window's LIVE key carriers, so nothing is kept by hand: section 1 is the table
+// actions in table order; section 2 every other visible QAction (menus and submenus included)
+// and every button with a shortcut, by name; section 3 every QShortcut in the window (its
+// whatsThis(), else its owner's name), by name. Objects inside a dialog are not listed.
 inline QList<ShortcutRow> shortcutRows( QWidget *window )
 {
     QList<ShortcutRow> rows;
@@ -286,23 +314,32 @@ inline QList<ShortcutRow> shortcutRows( QWidget *window )
     }
 
     QList<ShortcutRow> others;
-    const QList<QAction*> actions = window->findChildren<QAction*>( QString(), Qt::FindDirectChildrenOnly );
+    const QList<QAction*> actions = window->findChildren<QAction*>();
     for( QAction *action : actions )
     {
-        if( tableNames.contains( action->objectName() ) ) continue;
-        if( action->shortcuts().isEmpty() || !action->isVisible() ) continue;
-        others << ShortcutRow{ plainActionText( action->text() ), keysText( action->shortcuts() ), QString() };
+        if( tableNames.contains( action->objectName() ) && action->parent() == window ) continue;
+        if( action->shortcuts().isEmpty() || !action->isVisible() || !ownedByWindow( action, window ) ) continue;
+        others << ShortcutRow{ describedName( plainActionText( action->text() ), action->toolTip(), action ),
+                               keysText( action->shortcuts() ), QString() };
+    }
+    const QList<QAbstractButton*> buttons = window->findChildren<QAbstractButton*>();
+    for( QAbstractButton *button : buttons )
+    {
+        if( button->shortcut().isEmpty() || !ownedByWindow( button, window ) ) continue;
+        others << ShortcutRow{ describedName( button->toolTip(), plainActionText( button->text() ), button ),
+                               keysText( { button->shortcut() } ), QString() };
     }
     std::stable_sort( others.begin(), others.end(), []( const ShortcutRow &a, const ShortcutRow &b )
                       { return a.action.compare( b.action, Qt::CaseInsensitive ) < 0; } );
     rows << others;
 
     QList<ShortcutRow> described;
-    const QList<QShortcut*> shortcuts = window->findChildren<QShortcut*>( QString(), Qt::FindDirectChildrenOnly );
+    const QList<QShortcut*> shortcuts = window->findChildren<QShortcut*>();
     for( QShortcut *shortcut : shortcuts )
     {
-        if( shortcut->whatsThis().isEmpty() || shortcut->keys().isEmpty() ) continue;
-        described << ShortcutRow{ shortcut->whatsThis(), keysText( shortcut->keys() ), QString() };
+        if( shortcut->keys().isEmpty() || !ownedByWindow( shortcut, window ) ) continue;
+        described << ShortcutRow{ describedName( shortcut->whatsThis(), QString(), shortcut->parent() ),
+                                  keysText( shortcut->keys() ), QString() };
     }
     std::stable_sort( described.begin(), described.end(), []( const ShortcutRow &a, const ShortcutRow &b )
                       { return a.action.compare( b.action, Qt::CaseInsensitive ) < 0; } );
