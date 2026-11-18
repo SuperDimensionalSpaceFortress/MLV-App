@@ -394,11 +394,31 @@ function Test-ClockStepped {
     return ([Math]::Abs(([DateTime]::UtcNow - $expected).TotalSeconds) -gt $script:StartToleranceSec)
 }
 
+function Get-LiveProcess {
+    # Get-Process for a process that is RUNNING: $null when the pid does not exist, and also when it is a zombie. A killed child whose
+    # parent has not yet collected its exit status stays listed by the OS (state Z in /proc/<pid>/stat on Linux) and Get-Process still
+    # returns it, although it executes nothing; Windows drops a terminated process from the list, so the two hosts agree only if the
+    # zombie reads as gone. Every "is that pid alive / does that process exist" probe below goes through here.
+    param([int]$ProcessId)
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $proc) { return $null }
+    if (-not $script:OnWindows) {
+        try {
+            $stat = [System.IO.File]::ReadAllText("/proc/$ProcessId/stat")
+            # "<pid> (<comm>) <state> ...": comm may hold spaces and parentheses, so the state follows the LAST ')'
+            $close = $stat.LastIndexOf(')')
+            if ($close -ge 0 -and ($close + 2) -lt $stat.Length -and $stat[$close + 2] -eq 'Z') { return $null }
+        }
+        catch { }   # no /proc (another Unix) or the process just exited: the Get-Process answer stands
+    }
+    return $proc
+}
+
 function Test-AgentProcessAlive {
     # Alive AND the same process the heartbeat recorded (pid plus start time, so a reused pid does not count).
     param($Beat, [switch]$RequireStart)
     if ($null -eq $Beat) { return $false }
-    $proc = Get-Process -Id $Beat.pid -ErrorAction SilentlyContinue
+    $proc = Get-LiveProcess -ProcessId $Beat.pid
     if ($null -eq $proc) { return $false }
     if ([string]::IsNullOrWhiteSpace($Beat.start)) { return (-not $RequireStart) }
     try { return (Test-StartTimesMatch -A $proc.StartTime.ToUniversalTime() -B (ConvertTo-UtcStart -Text $Beat.start)) }
@@ -426,7 +446,7 @@ function Test-NewHeartbeatIsLiveAgent {
         try {
             $notBefore = ([datetime]$NotBeforeUtc).ToUniversalTime()
             if ((ConvertTo-UtcStart -Text $Beat.start) -lt $notBefore) { return $false }
-            $proc = Get-Process -Id $Beat.pid -ErrorAction SilentlyContinue
+            $proc = Get-LiveProcess -ProcessId $Beat.pid
             if ($null -eq $proc -or $proc.StartTime.ToUniversalTime() -lt $notBefore) { return $false }
         }
         catch { return $false }
@@ -710,7 +730,7 @@ function Stop-TaskInstanceByPid {
             if (-not [string]::Equals([string]$rt.Path, $want, [StringComparison]::OrdinalIgnoreCase)) { continue }
             if ([int]$rt.EnginePID -ne $ProcessId) { continue }
             # the instance object names a pid; the process under that pid must be the one proved (pid plus start), not a reuse of it
-            $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            $proc = Get-LiveProcess -ProcessId $ProcessId
             if ($null -eq $proc) { continue }
             # $StartText is the start the OS reported for this pid at the binding, so the two reads of ONE process agree to well under
             # a second; a reuse of the pid starts a different process (a heartbeat's 2 s tolerance would admit a reuse 0.5 s later)
@@ -760,7 +780,9 @@ function Get-RestartBindingRefusal {
     # the start the OS itself reports for that pid, right now: the stop is later handed THIS (not the heartbeat's claim, which is only
     # held to the 2 s tolerance above) and compares the process under the pid with it
     try {
-        $osStart = (Get-Process -Id $beat.pid -ErrorAction Stop).StartTime.ToUniversalTime()
+        $liveProc = Get-LiveProcess -ProcessId $beat.pid
+        if ($null -eq $liveProc) { return "heartbeat pid=$($beat.pid) is no longer a running process" }
+        $osStart = $liveProc.StartTime.ToUniversalTime()
         if (-not (Test-StartTimesMatch -A $osStart -B (ConvertTo-UtcStart -Text $beat.start))) { return "heartbeat pid=$($beat.pid) no longer has the recorded start time" }
         Add-Member -InputObject $beat -NotePropertyName osStart -NotePropertyValue $osStart.ToString('o') -Force
     }

@@ -1238,6 +1238,30 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn("already has a running instance", r.stdout)
         self.assertNotIn("schtasks /Run", r.stdout, "/Run is not issued when an instance already runs")
 
+    # ---- r5: the Ubuntu shard failed four stop tests on a0aa52e0 (a killed, unreaped child still read as alive) ----
+
+    def test_r5_a_killed_child_that_its_parent_has_not_reaped_is_not_alive(self) -> None:
+        # The stand-ins above end the agent with Stop-Process while the test process (its parent) never waits on it. On Linux such a child
+        # stays listed as a zombie (state Z) and Get-Process still returns it, so the "agent is gone" wait ran out before the gate each
+        # test exercises. A process that is killed and not yet collected is not alive on either host: every liveness probe goes through
+        # Get-LiveProcess. (Same body on both OSes; no skip.)
+        p = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        start = self.start_of(p.pid)
+        body = (
+            "$b=[pscustomobject]@{pid=%d;start='%s'};"
+            "'before='+[bool](Get-LiveProcess -ProcessId %d);'before-alive='+(Test-AgentProcessAlive -Beat $b -RequireStart);"
+            "Stop-Process -Id %d -Force;"
+            "$gone = Wait-Until -TimeoutSec 15 -PollMs 100 -Variables @{ b = $b } -Condition { -not (Test-AgentProcessAlive -Beat $b -RequireStart) };"
+            "'gone='+$gone; 'live='+[bool](Get-LiveProcess -ProcessId %d)"
+        ) % (p.pid, start, p.pid, p.pid, p.pid)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["before=True", "before-alive=True", "gone=True", "live=False"], r.stdout + r.stderr)
+        # the sibling probes: every process-existence read in the deploy script goes through the one helper
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"Get-Process\s+-Id", code)), 1, "only Get-LiveProcess itself reads a pid with Get-Process")
+
     def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
         # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.
         src = Path(__file__).read_text(encoding="utf-8")
