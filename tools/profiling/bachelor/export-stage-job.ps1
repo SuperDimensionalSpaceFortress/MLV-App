@@ -13,7 +13,7 @@ playback-attr-3-cuda-job.ps1. It writes one <jobId>.job.ps1 that um-run.ps1 drop
   * refuses EXPORT_TOOLING_ABSENT for a ProRes leg whose staged package has no ffmpeg.exe, then samples CPU quiescence (VENUE_NOT_QUIESCENT);
   * runs the staged MLVApp.exe --batch headless (QT_QPA_PLATFORM=windows, as run-release-cdng-export-profile.ps1 does) inside a bounded wait that kills
     the process tree on expiry, with the export stage profiler (CDNG lossless) or MLVAPP_STAGE_TIMING (ProRes);
-  * classifies the run (EXPORT_CAPTURED, EXPORT_EXIT_NONZERO, EXPORT_TIMEOUT, EXPORT_NO_FRAMES, EXPORT_FRAMES_SHORT, EXPORT_PROFILE_ABSENT,
+  * classifies the run (EXPORT_CAPTURED, EXPORT_EXIT_NONZERO, EXPORT_TIMEOUT, EXPORT_KILL_UNCONFIRMED, EXPORT_NO_FRAMES, EXPORT_FRAMES_SHORT, EXPORT_PROFILE_ABSENT,
     EXPORT_OUTPUT_MISMATCH), publishes ONLY batch.log, export-profile.json or stage-timing.log, output-manifest.json and summary.json, and DELETES the
     exported frames / .mov from its venue-local work dir after the manifest. Exported footage never reaches the share.
 
@@ -324,9 +324,13 @@ try {
     $exportWatch = [Diagnostics.Stopwatch]::StartNew()
     $app = [Diagnostics.Process]::Start($psi)
     $timedOut = -not $app.WaitForExit([int]($ExportTimeoutSec * 1000))
+    # r8 (adversary r7 pass A2): the kill is CONFIRMED or it is typed. A tree kill that threw (access denied: ffmpeg or a child may still hold the output), a fallback root-only
+    # kill (the descendants are unknown) or a root still running after 30 s used to be swallowed: the job then read changing output, tried to delete it and published an ordinary
+    # EXPORT_TIMEOUT. Now any of them ends EXPORT_KILL_UNCONFIRMED (exit 48, an INVALID export: no measurement and no FAIL claim about the product).
+    $killConfirmed = $true
     if ($timedOut) {
-        try { $app.Kill($true) } catch { try { $app.Kill() } catch { } }
-        [void]$app.WaitForExit(30000)
+        try { $app.Kill($true) } catch { $killConfirmed = $false; Write-JobTrace "step export kill tree error=$([string]$_.CategoryInfo.Reason)"; try { $app.Kill() } catch { Write-JobTrace "step export kill root error=$([string]$_.CategoryInfo.Reason)" } }
+        if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }
     }
     $exportWatch.Stop()
     $appExitCode = if ($timedOut) { $null } else { $app.ExitCode }
@@ -350,7 +354,8 @@ try {
         $manifest.last = [ordered]@{ name = $outputs[-1].Name; bytes = $outputs[-1].Length; sha256 = (Get-AttrCudaFileSha256Blocks -Path $outputs[-1].FullName -TracePath $Trace -Label 'output-last').sha256 }
     }
     $outputAgrees = if ($Format -eq 'cdng-lossless') { $null -ne $exported -and $outputs.Count -eq $exported } else { $outputs.Count -eq 1 -and $verified.Count -eq 1 -and $null -ne $exported -and [int64]$verified[0].Groups['n'].Value -eq $exported }
-    $result = $(if ($timedOut) { 'EXPORT_TIMEOUT' }
+    $result = $(if ($timedOut -and -not $killConfirmed) { 'EXPORT_KILL_UNCONFIRMED' }
+        elseif ($timedOut) { 'EXPORT_TIMEOUT' }
         elseif ($appExitCode -ne 0) { 'EXPORT_EXIT_NONZERO' }
         elseif ($null -eq $exported) { 'EXPORT_OUTPUT_MISMATCH' }
         elseif ($exported -eq 0) { 'EXPORT_NO_FRAMES' }
@@ -358,14 +363,14 @@ try {
         elseif (-not $stagePresent) { 'EXPORT_PROFILE_ABSENT' }
         elseif (-not $outputAgrees) { 'EXPORT_OUTPUT_MISMATCH' }
         else { 'EXPORT_CAPTURED' })
-    $exitFor = @{ EXPORT_CAPTURED = 0; EXPORT_TIMEOUT = 40; EXPORT_NO_FRAMES = 41; EXPORT_FRAMES_SHORT = 42; EXPORT_PROFILE_ABSENT = 43; EXPORT_OUTPUT_MISMATCH = 44; EXPORT_EXIT_NONZERO = 46 }
+    $exitFor = @{ EXPORT_CAPTURED = 0; EXPORT_TIMEOUT = 40; EXPORT_NO_FRAMES = 41; EXPORT_FRAMES_SHORT = 42; EXPORT_PROFILE_ABSENT = 43; EXPORT_OUTPUT_MISMATCH = 44; EXPORT_EXIT_NONZERO = 46; EXPORT_KILL_UNCONFIRMED = 48 }
 
     # --- publish ONLY the records; then delete the exported footage from the venue-local work dir -------------------------------------------------------------------
     $manifest.deleted = Remove-ExportOutput
     if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $batchLog -Destination (Join-Path $Pub 'batch.log')) }
     if (Test-Path -LiteralPath $stageEvidence -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $stageEvidence -Destination (Join-Path $Pub ([IO.Path]::GetFileName($stageEvidence)))) }
     Save-Json $manifest (Join-Path $Pub 'output-manifest.json')
-    Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
+    Write-ExportSummary $result @{ appExitCode = $appExitCode; timedOut = $timedOut; killConfirmed = $killConfirmed;exportWallSeconds = [math]::Round($exportWatch.Elapsed.TotalSeconds, 3); exportTimeoutSec = $ExportTimeoutSec
                                    framesExported = $exported; outputCount = $outputs.Count; outputsDeleted = $manifest.deleted; ffmpegPresent = $ffmpegPresent
                                    executableSha256 = $manifestHashes['exe']; cpuQuiescence = $quiescence; lengthGate = $lengthGateRecord; mlvappEnvScrubbed = @($mlvappEnvScrubbed) }
     Write-Output "RESULT=$result FRAMES=$exported ARTIFACTS=$Pub"

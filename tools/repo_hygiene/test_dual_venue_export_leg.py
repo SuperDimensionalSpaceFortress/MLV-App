@@ -517,6 +517,50 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertEqual((got[-2]["outcome"], got[-1]["outcome"]), ("PASS", "PASS"), got[-2:])
         self.assertEqual(got[-2]["stages"]["rows"]["processing"]["samples"], 30, "the summed repeat is one sample per frame")
 
+    def test_r8_a1_a_failed_profile_frame_the_batch_did_not_skip_is_contradictory_evidence(self) -> None:
+        """adversary r7 pass A1: a profile with 480 successful frames plus one success=false row, beside a batch that says exported=480 skipped=0, read PASS (only the successful
+        rows were reconciled with the batch, and exportFramesFailed read the batch alone). No more failed profile rows than batch-skipped frames; a skipped frame the profile
+        never logged is not a contradiction. Matching and absent-failure controls still PASS."""
+        def with_failed_row(n_failed: int) -> str:
+            doc = json.loads(cdng_profile(30))
+            for k in range(n_failed):
+                row = dict(doc["frames"][-1])
+                row["frame_index"] = 30 + k
+                row["success"] = False
+                doc["frames"].append(row)
+            doc["frame_count"] = len(doc["frames"])
+            return json.dumps(doc)
+        shipped = [{"metric": "framesExported", "op": "eq", "value": 30}, {"metric": "exportFramesFailed", "op": "eq", "value": 0}, {"metric": "profileFramesSucceeded", "op": "eq", "value": 30}]
+        cases = [cdng_case(profile=with_failed_row(1), batch=batch_log(30, skipped=0), criteria=shipped),    # 0: the finding
+                 cdng_case(profile=with_failed_row(2), batch=batch_log(30, skipped=1), criteria=[]),         # 1: two failed rows, one skipped
+                 cdng_case(profile=with_failed_row(1), batch=batch_log(30, skipped=1), criteria=[]),         # 2: control: the failure is the batch's skip too
+                 cdng_case(profile=with_failed_row(0), batch=batch_log(30, skipped=2), criteria=[]),         # 3: control: skipped frames with no profile row
+                 cdng_case(criteria=[])]                                                                     # 4: control: no failure anywhere
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in (0, 1):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_OUTPUT_MISMATCH" in p and "failed frame" in p for p in got[i]["problems"]), got[i])
+        for i in (2, 3, 4):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "PASS", got[i])
+
+    def test_r8_a3_a_manifest_count_or_total_that_is_not_a_json_integer_is_invalid(self) -> None:
+        """adversary r7 pass A3 (advisory): count [1] / "1" and totalBytes [1000] / "1000" were stringified and parsed, so a non-integer shape read PASS. Only a JSON integer is one."""
+        def manifest(count, total) -> str:
+            return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": "mov", "count": count, "totalBytes": total, "deleted": True})
+        cases = [prores_case(manifest=manifest([1], 1000), criteria=[]), prores_case(manifest=manifest("1", 1000), criteria=[]),
+                 prores_case(manifest=manifest(1, [1000]), criteria=[]), prores_case(manifest=manifest(1, "1000"), criteria=[]),
+                 prores_case(manifest=manifest(1, 1000.5), criteria=[]), prores_case(criteria=[])]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(5):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_OUTPUT_MISMATCH" in p and "integer" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual(got[5]["outcome"], "PASS", got[5])
+
     def test_r7_a5_a_malformed_profile_container_or_element_is_invalid_before_counting(self) -> None:
         """adversary r6 A5: a JSON null appended to profile frames (frame_count 481), or frames given as one object, read PASS because null elements were filtered and a
         lone object was wrapped. The container must be an array of objects, frame_count must be the array's length, and every element is a record."""
@@ -730,6 +774,30 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                 got = self.validate(r, spec, evidence_dir=str(work))
                 self.assertFalse(got["valid"], got)
                 self.assertIn(got["status"], ("INVALID", "INCOMPLETE"), got)
+
+    def test_r8_a4_an_out_of_range_or_non_integer_um_run_exit_code_is_a_typed_invalid_not_a_throw(self) -> None:
+        """adversary r7 pass A4: um-run.json exitCode 2147483648 (valid Int64) passed the null-only guard and the [int] narrowing threw before Test-DvReceiptValid returned.
+        Out-of-range, string and array exit codes (hash claim updated to match) are typed INVALID, and a real exit code still verifies."""
+        spec = self.export_spec(maxframes=30)
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(self.validate(receipt, spec)["status"], "VERIFIED_OFFLINE_TEST")
+        evdir = Path(receipt["evidence"]["localEvidenceDir"])
+        for label, code in (("int32-max-plus-1", "2147483648"), ("int32-min-minus-1", "-2147483649"), ("int64-max", "9223372036854775807"), ("string", '"0"'), ("array", "[0]")):
+            with self.subTest(exitCode=label):
+                work = self.tmp / f"ev-exit-{label}"
+                if work.exists():
+                    shutil.rmtree(work)
+                shutil.copytree(evdir, work)
+                raw = ('{"schema":"mlv-app/dual-venue-um-run/v1","exitCode":' + code + ',"resultToken":"EXPORT_CAPTURED"}\n').encode("utf-8")
+                (work / "um-run.json").write_bytes(raw)
+                r = json.loads(json.dumps(receipt))
+                r["evidence"]["umRunJsonSha256"] = hashlib.sha256(raw).hexdigest()
+                got = self.validate(r, spec, evidence_dir=str(work))
+                self.assertFalse(got["valid"], got)
+                self.assertEqual(got["status"], "INVALID", got)
+                self.assertTrue(any("EVIDENCE_UNPARSABLE: um-run.json" in x and "exitCode" in x for x in got["reasons"]), got)
 
     def test_a_summary_observed_on_another_venue_is_invalid_at_write_and_at_verify(self) -> None:
         """adversary r2 A4 (on c3768da1): summary.venue is the host the job MEASURED on (Get-AttrCudaMeasurementVenue); only summary.declaredVenue was compared, so
@@ -1046,6 +1114,23 @@ class ExportJobGeneratorTests(unittest.TestCase):
         out = proc.stdout + proc.stderr
         for absent in ("DUAL_VENUE_EXPORT_ARG_MISSING", "DUAL_VENUE_EXPORT_RECEIPT_ABSENT"):
             self.assertNotIn(absent, out, "the preflight mode never asks for the leg's own arguments")
+
+    def test_r8_a2_a_timeout_whose_kill_is_not_confirmed_is_its_own_typed_invalid_token(self) -> None:
+        """adversary r7 pass A2: Kill($true) and Kill() errors were swallowed and the 30 s wait's result discarded, so an unkillable export tree published an ordinary
+        EXPORT_TIMEOUT (a FAIL claim about the product) after reading and deleting output a live process still held. The job now types it EXPORT_KILL_UNCONFIRMED (exit 48),
+        which the runner reads as INVALID, never PASS or FAIL."""
+        text = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("$killConfirmed = $true", text)
+        wait = text.index("if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }")
+        self.assertIn("catch { $killConfirmed = $false", text[text.index("try { $app.Kill($true) }"):wait])
+        self.assertIn("if ($timedOut -and -not $killConfirmed) { 'EXPORT_KILL_UNCONFIRMED' }", text)
+        self.assertIn("EXPORT_KILL_UNCONFIRMED = 48", text)
+        self.assertIn("killConfirmed = $killConfirmed", text, "the summary records whether the tree was confirmed dead")
+        self.assertLess(text.index("$killConfirmed = $true"), text.index("$manifest.deleted = Remove-ExportOutput"), "the kill is settled before any output is read or deleted")
+        proc, got = run_pwsh_json("$e = [pscustomobject]@{ metrics = [pscustomobject]@{}; stages = $null; problems = @(); classMismatch = $false; classDetail = $null }\n"
+                                  "[ordered]@{ unconfirmed = (Get-DvExportOutcome -ResultToken 'EXPORT_KILL_UNCONFIRMED' -ExitCode 48 -Evidence $e -Criteria @()).outcome; "
+                                  "timeout = (Get-DvExportOutcome -ResultToken 'EXPORT_TIMEOUT' -ExitCode 40 -Evidence $e -Criteria @()).outcome } | ConvertTo-Json -Compress")
+        self.assertEqual(got, {"unconfirmed": "INVALID", "timeout": "FAIL"}, proc.stdout + proc.stderr)
 
     def test_every_schema_valid_quiescence_threshold_binds(self) -> None:
         """adversary r1 A5: the schema admits any threshold in (0, 100]; the generator binds each one (0.05 was refused by ValidateRange(0.1, 100))."""

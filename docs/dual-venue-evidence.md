@@ -467,7 +467,7 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   | `EXPORT_CAPTURED`, exit 0, evidence binds, dual-ISO class agrees | `PASS` or `FAIL` from the criteria |
   | `EXPORT_CAPTURED` with a non-zero exit; a dual-ISO class mismatch (`CLIP_CLASS_MISMATCH`); a profile from another build; output count disagreeing with `[BATCH] DONE`; a profile or stage log with no stage figure (no `producer_frame_ms`, or no `debayered_frame` / `processing` under `processed16_total`); an output manifest that does not say `deleted: true` (`EXPORT_OUTPUT_NOT_DELETED`); a `summary.json` whose `venue` (the host the job measured on) is not the receipt's venue | `INVALID` |
   | `EXPORT_TIMEOUT` (40), `EXPORT_NO_FRAMES` (41), `EXPORT_FRAMES_SHORT` (42), `EXPORT_EXIT_NONZERO` (46) | `FAIL` |
-  | `EXPORT_PROFILE_ABSENT` (43), `EXPORT_OUTPUT_MISMATCH` (44) | `INVALID` |
+  | `EXPORT_PROFILE_ABSENT` (43), `EXPORT_OUTPUT_MISMATCH` (44), `EXPORT_KILL_UNCONFIRMED` (48: the export timed out and the job could not confirm the app's process tree dead, so it asserts nothing about the product) | `INVALID` |
   | `EXPORT_TOOLING_ABSENT` (45) | `VENUE_TOOLING` |
   | a length refusal (`CLIP_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN`, exit 47); an owner-footage or work-dir refusal (exit 19/20/21/22/24/28); no `RESULT=` line; any other token | `INVALID` |
   | `VENUE_NOT_QUIESCENT` (12) | `VENUE_NOT_QUIESCENT` |

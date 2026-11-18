@@ -4513,6 +4513,13 @@ $script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and 
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
 $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json')
 
+function Get-DvExportInt64($Value) {
+    # r8 (adversary r7 pass A3): the export writers emit these figures as JSON integers; ConvertTo-DvInt64 stringifies first, so [1] and "1" read as 1. Only a JSON integer is
+    # one here, anything else is $null (absent), which every caller already types.
+    if ($Value -is [int] -or $Value -is [long]) { return [int64]$Value }
+    $null
+}
+
 function Get-DvExportRound($Value) { if ($null -eq $Value) { return $null }; [math]::Round([double]$Value, 6) }
 
 # --- r7 (adversary r6 A1-A5, Dot I2): ONE record schema for everything the export reader reads, not one check per finding ----------------------------------------
@@ -4564,7 +4571,7 @@ function Test-DvExportCdngProfileRecords {
         if ($notObject.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($notObject.Count) profile frame record(s) are not JSON objects (first at index $($notObject[0]))") }
         $rows = @($rows)
         $declared = Get-DvProp $Profile 'frame_count'
-        if ($null -ne $declared -and (ConvertTo-DvInt64 $declared) -ne [int64]$list.Count) { $problems.Add("EXPORT_RECORD_INVALID: export-profile.json frame_count is $(ConvertTo-Json -InputObject $declared -Compress -Depth 2) but frames holds $($list.Count) record(s)") }
+        if ($null -ne $declared -and (Get-DvExportInt64 $declared) -ne [int64]$list.Count) { $problems.Add("EXPORT_RECORD_INVALID: export-profile.json frame_count is $(ConvertTo-Json -InputObject $declared -Compress -Depth 2) but frames holds $($list.Count) record(s)") }
     }
     if ($rows.Count -eq 0) { $problems.Add('EXPORT_PROFILE_ABSENT: export-profile.json lists no frame, so there is nothing to read a stage share from') }
     # the per-record schema
@@ -4682,7 +4689,7 @@ function Get-DvExportEvidence {
         # adversary r1 A2: JSON null (or an array, a scalar) parses without an exception and is no manifest
         if ($parsed -and $manifest -isnot [System.Management.Automation.PSCustomObject]) { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json is not one JSON object'); $manifest = $null }
         if ($null -ne $manifest) {
-            $count = ConvertTo-DvInt64 (Get-DvProp $manifest 'count'); $bytes = ConvertTo-DvInt64 (Get-DvProp $manifest 'totalBytes')
+            $count = Get-DvExportInt64 (Get-DvProp $manifest 'count'); $bytes = Get-DvExportInt64 (Get-DvProp $manifest 'totalBytes')
             $kind = [string](Get-DvProp $manifest 'kind'); $wantKind = $(if ($Format -ceq 'prores') { 'mov' } else { 'dng' })
             $m.outputFileCount = $count; $m.outputBytes = $bytes
             if ($null -eq $count -or $null -eq $bytes) { $problems.Add('EXPORT_OUTPUT_MISMATCH: output-manifest.json carries no integer count / totalBytes') }
@@ -4718,6 +4725,10 @@ function Get-DvExportEvidence {
             $rows = @($records.rows); $ok = @($records.ok)
             $m.profileFramesSucceeded = [int64]$ok.Count
             $m.profileFramesFailed = [int64]($rows.Count - $ok.Count)
+            # r8 (adversary r7 pass A1): a profile row that says a frame failed is a frame the batch must have counted as skipped; a batch that says skipped=0 beside it is two
+            # records of one run that disagree (the shipped criterion exportFramesFailed eq 0 read the batch alone, so the run passed). A skipped frame the profile never logged
+            # is not a contradiction (it has no row), so the rule is one-directional: no more failed rows than skipped frames.
+            if ($null -ne $m.exportFramesSkipped -and $m.profileFramesFailed -gt $m.exportFramesSkipped) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the profile records $($m.profileFramesFailed) failed frame(s) but the batch skipped $($m.exportFramesSkipped)") }
             # adversary r6 A2: a profile whose every frame failed measured nothing, whatever the leg's criteria say
             if ($rows.Count -gt 0 -and $ok.Count -eq 0) { $problems.Add("EXPORT_PROFILE_ABSENT: the profile records no successful frame (all $($rows.Count) failed), so there is no stage share to read") }
             # r7: the successful frames ARE the exported frames (shipped criteria say so too: profileFramesSucceeded eq the window), so a different count is no measurement of this export
@@ -4924,8 +4935,10 @@ function Test-DvExportReceiptValid {
     }
     # ---- the metrics, the stage table and the outcome, re-derived
     if ($Invalid.Count -eq 0 -and $Incomplete.Count -eq 0 -and $null -ne $summary -and $null -ne $umRun -and $null -ne $specExport) {
-        $exit = ConvertTo-DvInt64 (Get-DvProp $umRun 'exitCode')
+        $exit = Get-DvExportInt64 (Get-DvProp $umRun 'exitCode')
         if ($null -eq $exit) { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json carries no integer exitCode') }
+        # r8 (adversary r7 pass A4): the Int64 parse admits 2147483648, and the [int] narrowing below threw before this function could return its typed INVALID
+        elseif ($exit -lt [int64][int]::MinValue -or $exit -gt [int64][int]::MaxValue) { $Invalid.Add('EVIDENCE_UNPARSABLE: um-run.json exitCode is outside the 32-bit range a process exit code has') }
         else {
             $ev = Get-DvExportEvidence -Format ([string]$specExport.format) -MaxFrames ([int]$specExport.maxFrames) -DualIsoExpected ([bool]$specExport.dualIsoExpected) -ExpectedBuildId ([string](Get-DvProp $summary 'sourceCommit')) `
                 -ProfileText ([string]$texts['export-profile.json']) -StageLogText ([string]$texts['stage-timing.log']) -BatchLogText ([string]$texts['batch.log']) -OutputManifestText ([string]$texts['output-manifest.json'])
@@ -5196,6 +5209,8 @@ function Test-DvReceiptValid {
         if ([string](Get-DvProp $ev.umRun 'schema') -cne $script:UmRunSchema) { $invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not a dual-venue um-run record') }
         $exit = ConvertTo-DvInt64 (Get-DvProp $ev.umRun 'exitCode')
         if ($null -eq $exit) { $invalid.Add('EVIDENCE_UNPARSABLE: um-run.json carries no integer exitCode') }
+        # r8 (adversary r7 pass A4, sibling): the same Int64 -> [int] narrowing below (Resolve-DvJobOutcome) throws on an out-of-range code; it is a typed INVALID instead
+        elseif ($exit -lt [int64][int]::MinValue -or $exit -gt [int64][int]::MaxValue) { $invalid.Add('EVIDENCE_UNPARSABLE: um-run.json exitCode is outside the 32-bit range a process exit code has'); $exit = $null }
 
         # ---- the run IS the backend and the leg the receipt names: re-derived from the HASHED summary, never from a receipt field -------
         $derivedBackend = $null
