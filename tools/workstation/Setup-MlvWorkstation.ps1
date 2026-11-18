@@ -228,11 +228,20 @@ function Register-UrlSecretParts {
             $anc = $rest.Substring(0, $q)
             # git prints a file:// path with its leading '/' ('/C:/r.git?x') or without it ('C:/r.git#x', the fragment form), and prints a '%XX' in the path as written,
             # decoded, as a replacement character or as the bare hex digits ('ABSENT%80' is printed 'ABSENT80', r2 pass 6 A2). The anchor is therefore a PATTERN: the
-            # leading '/' optional, and each '%XX' any run of up to four characters that cannot end the path.
+            # leading '/' optional, and each '%XX' any run of up to four characters.
+            # r3 pass 7 A1 (defect class: the anchor guessed which characters a decoded '%XX' can print): git prints a decoded '%20' as a blank, '%27' and '%22' as quotes,
+            # so a '%XX' stands for ANY run of up to four characters but a line break. A '%XX' that decodes to a control byte ('%0A', '%0D') can BREAK the line git prints:
+            # the path after it starts a later line, so that tail is an anchor of its own at the start of a line (blanks allowed before it, as Invoke-Native indents).
             $core = $anc.TrimStart('/')
             if ($core.Length -ge 2) {
-                $pat = '/?' + ((@([regex]::Split($core, '%[0-9A-Fa-f]{2}')) | ForEach-Object { [regex]::Escape($_) }) -join '[^\s''"?#]{0,4}?')
-                if (-not $script:UrlSecretAnchors.Contains($pat)) { $script:UrlSecretAnchors.Add($pat) }
+                $wild = '[^\r\n]{0,4}?'
+                $bits = @([regex]::Split($core, '(%[0-9A-Fa-f]{2})'))
+                $pats = @('/?' + ((@(for ($k = 0; $k -lt $bits.Count; $k += 2) { [regex]::Escape($bits[$k]) })) -join $wild))
+                for ($k = 1; $k -lt $bits.Count; $k += 2) {
+                    $byte = [Convert]::ToInt32($bits[$k].Substring(1), 16)
+                    if ($byte -lt 0x20 -or $byte -eq 0x7F) { $pats += '(?m)^\s*' + ((@(for ($t = $k + 1; $t -lt $bits.Count; $t += 2) { [regex]::Escape($bits[$t]) })) -join $wild) }
+                }
+                foreach ($pat in $pats) { if (-not $script:UrlSecretAnchors.Contains($pat)) { $script:UrlSecretAnchors.Add($pat) } }
             }
             # r2 pass 4 A3 (defect class: redaction-order dependence): the scheme rule runs first and rewrites an EMBEDDED url ('&redirect=https://h/x?q=1' becomes
             # '...https://h/x?***'), so the whole registered part no longer matches. Everything up to and including each embedded 'scheme://' survives that rule unchanged,
@@ -1533,8 +1542,13 @@ function Get-CredentialXmlAttrPairHitIndex {
         $namer = -1
         for ($j = 0; $j -lt $attrs.Count; $j++) {
             if ($script:CredentialXmlNameAttrs -notcontains $attrs[$j].N) { continue }
-            $dv = ConvertFrom-CredentialEscapes $attrs[$j].V
-            if ((Get-CredentialKeyClass ($dv -replace '\s', '')) -or $script:CredentialResidualIntroRegex.IsMatch($dv)) { $namer = $j; break }
+            # r3 pass 7 A2: the value is judged at EVERY decode level (Get-CredentialDecodeLevels), not only the fixed point: 'auth&#92;u0068eader' is 'authheader'
+            # (a secret name) to a reader that decodes once, and only the deeper 'authheader' is a plain word
+            # (an escape still standing at a shallower level is decodable by definition: the undecodable residual is judged on the fixed point only)
+            $lv = @(Get-CredentialDecodeLevels $attrs[$j].V); if ($lv.Count -eq 0) { $lv = @($attrs[$j].V) }
+            if ($script:CredentialResidualIntroRegex.IsMatch($lv[-1])) { $namer = $j; break }
+            foreach ($dv in $lv) { if (Get-CredentialKeyClass ($dv -replace '\s', '')) { $namer = $j; break } }
+            if ($namer -ge 0) { break }
         }
         if ($namer -lt 0) { continue }
         if ($NameOnly) { return $tm.Index }
@@ -1657,6 +1671,9 @@ function Get-CredentialNormalForm([string]$Text) {
     }
     return [pscustomobject]@{ Text = $s; Mask = $mask; Stages = $stages }
 }
+# r3 pass 7 A2 (defect class: a judge that reads only the fixed point): every DECODED level of the text, shallowest first, the fixed point last (none when nothing decodes).
+# Each site that decodes a piece on its own (an XML naming attribute value, the Import role guard) judges every level, exactly as the decoded pass of Get-CredentialHitLine does.
+function Get-CredentialDecodeLevels([string]$Text) { return @((Get-CredentialNormalForm $Text).Stages | ForEach-Object { $_.Text }) }
 
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
 # judged as written AND with its JSON \uXXXX escapes decoded (p5 A1: '{"api_key":"x"}' says api_key). The Export scan and the Import host-side
@@ -2073,6 +2090,8 @@ function Test-CredentialNamePresent {
         # r1 adversary A7 sibling: a table header ('["pass\U0011FFFFord"]') or an XML naming attribute value holding one counts the same
         foreach ($hm in $script:CredentialTableHeaderRegex.Matches($dec)) { if ($script:CredentialResidualIntroRegex.IsMatch($hm.Groups[1].Value)) { return $true } }
         if ((Get-CredentialXmlAttrPairHitIndex -Text $Text -NameOnly) -ge 0) { return $true }   # r2 pass 4 A4: a name, whatever the value
+        # r3 pass 7 A2: every decode level is searched for a secret name, not only the fixed point $dec (the last level): a reader that decodes once sees the first
+        $texts += @(Get-CredentialDecodeLevels $Text)
         $texts += $dec
     }
     foreach ($t in $texts) {

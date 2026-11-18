@@ -2835,6 +2835,9 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         # r2 pass 6 A1: a reader decodes ONCE; the deeper level ('password suffix') names nothing, the first level ('password suffix') does
         'p6 A1 an escaped backslash before a second escape'       = '{"password\u0020suffix":"hunter2"}'
     }
+    # r3 pass 7 A2: an XML naming attribute VALUE is judged at every decode level too (its first level names a secret, the deeper fixed point does not)
+    $ddR2['p7 A2 an XML key whose first decode level names a secret'] = '<add key="&#97;uth&#92;u0068eader" value="hunter2" />'
+    $ddR2['p7 A2 sibling: the same key in a JSON pair'] = '{"\x61uth\x5cu0068eader": "hunter2"}'
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
     foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
@@ -2857,6 +2860,9 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         Assert-That (Test-CredentialNamePresent "<add key='pass&w;ord' value='' />") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: a residual XML naming attribute with an empty value names a secret'
         Assert-That (Test-CredentialNamePresent "xml = `"<add key='pass&w;ord' value='' />`"") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: the same inside a config.toml string'
         Assert-That (Test-CredentialNamePresent "xml = `"<add key='p a s s w o r d' value='' />`"") 'DENY-BY-DEFAULT-1 r2 adversary p6 A3 role guard: a spaced XML naming attribute with no escape names a secret'
+        # r3 pass 7 A2: the role guard judges every decode level, not only the fixed point (hosts.yml '"\x61uth\x5cu0068eader": ""' is one decode away from a strong 'auth' name, two from the plain word 'authheader')
+        Assert-That (Test-CredentialNamePresent '"\x61uth\x5cu0068eader": ""') 'DENY-BY-DEFAULT-1 r3 adversary p7 A2 role guard: a key whose first decode level names a secret (empty value)'
+        Assert-That (Test-CredentialNamePresent '<add key="&#97;uth&#92;u0068eader" value="" />') 'DENY-BY-DEFAULT-1 r3 adversary p7 A2 role guard: the same as an XML naming attribute with an empty value'
     }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
@@ -2902,7 +2908,14 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         @{ N = 13; Url = ('file:///' + ((New-Scratch 'dd-s3-absent13') -replace '\\', '/') + '/absent.git?token=https://h.example/SECRET0013?x=y'); Tok = @('SECRET0013') },
         # r2 pass 6 A2: a '%XX' in the PATH too (git prints 'absent80'), in the query and the fragment form
         @{ N = 14; Url = ('file:///' + ((New-Scratch 'dd-s3-absent14') -replace '\\', '/') + '/absent%80-14.git?%80qzx'); Tok = @('qzx') },
-        @{ N = 15; Url = ('file:///' + ((New-Scratch 'dd-s3-absent15') -replace '\\', '/') + '/absent%80-15.git#%80qzy'); Tok = @('qzy') }
+        @{ N = 15; Url = ('file:///' + ((New-Scratch 'dd-s3-absent15') -replace '\\', '/') + '/absent%80-15.git#%80qzy'); Tok = @('qzy') },
+        # r3 pass 7 A1: git DECODES the path it echoes: a blank, a quote or a line break where the '%XX' stood (a decoded line break starts the rest on its own line)
+        @{ N = 16; Url = ('file:///' + ((New-Scratch 'dd-s3-absent16') -replace '\\', '/') + '/absent%20x-16.git?%80qzr'); Tok = @('qzr') },
+        @{ N = 17; Url = ('file:///' + ((New-Scratch 'dd-s3-absent17') -replace '\\', '/') + '/absent%27x-17.git?%80qzs'); Tok = @('qzs') },
+        @{ N = 18; Url = ('file:///' + ((New-Scratch 'dd-s3-absent18') -replace '\\', '/') + '/absent%22x-18.git#%80qzt'); Tok = @('qzt') },
+        @{ N = 19; Url = ('file:///' + ((New-Scratch 'dd-s3-absent19') -replace '\\', '/') + '/absent%0Ax-19.git?%80qzu'); Tok = @('qzu') },
+        @{ N = 20; Url = ('file:///' + ((New-Scratch 'dd-s3-absent20') -replace '\\', '/') + '/absent%0D%0Ax-20.git?qzk'); Tok = @('qzk') },
+        @{ N = 21; Url = ('file:///' + ((New-Scratch 'dd-s3-absent21') -replace '\\', '/') + '/absent-21%0A?%80qzj'); Tok = @('qzj') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
