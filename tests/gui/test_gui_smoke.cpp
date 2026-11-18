@@ -953,7 +953,15 @@ void GuiSmokeTest::fullscreenLiveShortcuts_visibleBarsWithBindingFireExactlyOnce
     // entry however many widgets carry it, so each key fires once (no ambiguity, no double fire).
     FullscreenShortcutMirror m;
     QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
-    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 ); // a second bind is a no-op
+    // A second bind leaves the window's actions as they are -- no remove/re-append reorder past
+    // an unrelated action added in between (adversary pass 2 A1).
+    QAction *extra = new QAction( QStringLiteral( "Extra" ), &m.window );
+    m.window.addAction( extra );
+    const QList<QAction*> before = m.window.actions();
+    QCOMPARE( before.size(), 8 );
+    QCOMPARE( before.last(), extra );
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    QCOMPARE( m.window.actions(), before );
     QVERIFY( m.showAndActivate( false ) );
     QVERIFY( !m.window.menuBar()->isNativeMenuBar() );
     QVERIFY( m.window.menuBar()->isVisible() );

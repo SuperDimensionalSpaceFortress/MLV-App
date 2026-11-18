@@ -11,7 +11,8 @@
 // The shortcut context is deliberately left as it is (Qt::WindowShortcut, the QAction default).
 // An application-wide context would fire while a non-modal dialog (for example StatusDialog)
 // has focus; tests/console/test_playback_fullscreen_ui_wiring.cpp pins that this file never
-// changes the context. Adding an action to a widget that already carries it is a no-op, and one action is one
+// changes the context. An action the window already carries is left where it is
+// (QWidget::addAction() would remove and re-append it, reordering actions()). One action is one
 // shortcut-map entry however many widgets carry it, so windowed behaviour does not change and
 // no key becomes ambiguous.
 //
@@ -42,7 +43,8 @@ inline QStringList liveActionNames()
 
 // Adds each live action to `window`. uic parents every QAction directly to the main window,
 // so the lookup is limited to direct children (a dialog's same-named action is never bound).
-// Returns the number of actions bound; warns for each name that is missing.
+// Returns the number of live actions the window carries afterwards (already-carried ones count);
+// warns for each name that is missing.
 inline int bindToWindow( QWidget *window )
 {
     if( !window ) return 0;
@@ -56,7 +58,7 @@ inline int bindToWindow( QWidget *window )
             qWarning() << "PlayerShortcutBinding: action not found:" << name;
             continue;
         }
-        window->addAction( action );
+        if( !window->actions().contains( action ) ) window->addAction( action );
         ++bound;
     }
     return bound;
