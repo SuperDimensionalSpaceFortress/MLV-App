@@ -1273,6 +1273,77 @@ TEST(PlaybackInfoLabel, R16P18A1GpuDebayerFrameNamesTheScaleItWasShownAt)
     ASSERT_EQ(2, playback_info_label::presentedScaleOfCpuPrepRoute(2, 1920, 1920, 2147483647));
 }
 
+// r18 (keys B2 on 00c600a9, fable key3 + opus): CUDA texture route, playback scale 2 or 4 honoured, playing, a reduced GPU recon
+// slot (1920 wide clip, 960 recon) whose texture no-readback skip is false (the AMaZE texture handoff unavailable, or a warm-up
+// frame). The CPU route makes the frame full size and the render reports active 1, but render_thread_rendered_width kept the
+// reduced 960 written with the slot, so unreducedCpuDebayerScale(false, false, 1920, 960) = 2: the label, the twin and the
+// toolbar read "Half" / "Half res" and "<sel>->Scaled" over a full-size frame. The render thread now rewrites both rendered-size
+// keys where it restores the full size (as the consumed-reduced-recon branch does); every reader then reads the frame's sizes.
+TEST(PlaybackInfoLabel, R18B2ReducedCudaFrameMadeFullSizeByTheCpuRouteNamesFullAndTheSelectedDebayer)
+{
+    // the producer: the full-size restore rewrites both keys, after the slot fields and inside the same branch
+    const QString render = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    const int restoreAt = render.indexOf(QStringLiteral("if( gpuReducedReconSlot && !skipCpuDebayerForGpuTextureNoReadback )"));
+    ASSERT_TRUE(restoreAt >= 0);
+    const int restoreEnd = render.indexOf(QStringLiteral("\n    }\n"), restoreAt);
+    ASSERT_TRUE(restoreEnd > restoreAt);
+    const QString restore = render.mid(restoreAt, restoreEnd - restoreAt);
+    const int slotAt = restore.indexOf(QStringLiteral("slot.renderedImageWidth = renderedImageWidth;"));
+    const int widthKeyAt = restore.indexOf(QStringLiteral("QStringLiteral(\"render_thread_rendered_width\"),\n            renderedImageWidth );"));
+    const int heightKeyAt = restore.indexOf(QStringLiteral("QStringLiteral(\"render_thread_rendered_height\"),\n            renderedImageHeight );"));
+    ASSERT_TRUE(slotAt >= 0);
+    ASSERT_TRUE(widthKeyAt > slotAt);
+    ASSERT_TRUE(heightKeyAt > slotAt);
+    // the class sweep: every write of the rendered size after the first key insert is followed by its key rewrite
+    ASSERT_EQ(3, render.count(QStringLiteral("QStringLiteral(\"render_thread_rendered_width\"),")));
+    ASSERT_EQ(3, render.count(QStringLiteral("QStringLiteral(\"render_thread_rendered_height\"),")));
+
+    // the frame's telemetry after the fix: no CPU processed stage, not texture-presented, 1920 of 1920, render active 1
+    const int source = 1920;
+    const int rendered = 1920;
+    // the old stale tuple is what the finding read
+    ASSERT_EQ(2, playback_info_label::unreducedCpuDebayerScale(false, false, source, 960));
+    for (int scale : {2, 4}) {
+        // reader 1: presentedPlaybackScaleShown off the CPU prep route (GPU preview prep) and presentedPlaybackDebayerScale /
+        // presentedPlaybackUnreducedCpuDebayerScale, which both read unreducedCpuDebayerScale
+        const int unreduced = playback_info_label::unreducedCpuDebayerScale(false, false, source, rendered);
+        ASSERT_EQ(1, unreduced);
+        // reader 2: presentedPlaybackScaleShown on the CPU prep route (the prep refuses: factor 1) and its debayer scale
+        ASSERT_EQ(1, playback_info_label::presentedScaleOfCpuPrepRoute(1, source, rendered, 1));
+        ASSERT_EQ(1, playback_info_label::debayerScaleOfCpuPrepRoute(source, rendered));
+        for (bool gpuPrep : {true, false}) {
+            const int shown = gpuPrep ? unreduced : playback_info_label::presentedScaleOfCpuPrepRoute(1, source, rendered, 1);
+            const int debayerScale = gpuPrep ? unreduced : playback_info_label::debayerScaleOfCpuPrepRoute(source, rendered);
+            // the label facts (MainWindow playbackInfoFacts and the relabel inputs read the same two accessors)
+            playback_info_label::Facts f = cpuFullScaleFacts(QStringLiteral("AMaZE"));
+            f.processingBadge = gpuPrep ? QStringLiteral("GPU Preview") : QStringLiteral("CPU");
+            f.gpuDisplay = true;
+            f.requestedScale = scale;
+            f.presentedScale = shown;
+            f.presentedValid = playback_info_label::presentedScaleBelongsToRequest(true, scale, f.requestedScale, f.presentedScale);
+            f.debayerScale = debayerScale;
+            ASSERT_QSTR_EQ(QString(PlaybackScaleLabel::fractionWord(scale)) + QStringLiteral("->Full"), playback_info_label::scaleField(f));
+            ASSERT_QSTR_EQ(QStringLiteral("AMaZE"), playback_info_label::debayerField(f));
+            const QString overlay = playback_info_label::compose(f, playback_info_label::Toggles(), true);
+            const QString twin = playback_info_label::compose(f, playback_info_label::Toggles(), false);
+            ASSERT_FALSE(overlay.contains(QStringLiteral("->Scaled")));
+            ASSERT_FALSE(twin.contains(QStringLiteral("->Scaled")));
+        }
+    }
+    // the readers: the toolbar cache key and label, the relabel inputs and the facts all read the two accessors, which read the
+    // rewritten keys (so none of them can see the reduced width)
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(mw.contains(QStringLiteral("        presentedPlaybackScaleShown(),   // LOOK-LABEL-PLAYBACK-INFO-1 r12 (pass 14 A1)")));
+    ASSERT_TRUE(mw.contains(QStringLiteral("const int activeScale = presentedPlaybackScaleShown();   // r12 pass-13 A1: the toolbar sibling")));
+    ASSERT_TRUE(mw.contains(QStringLiteral("inputs.presentedScale = presentedPlaybackScaleShown();")));
+    ASSERT_TRUE(mw.contains(QStringLiteral("inputs.debayerScale = presentedPlaybackDebayerScale();")));
+    ASSERT_TRUE(mw.contains(QStringLiteral("facts.debayerScale = presentedPlaybackDebayerScale();")));
+    const QString shownBody = functionBody(mw, QStringLiteral("int MainWindow::presentedPlaybackScaleShown("));
+    ASSERT_TRUE(shownBody.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_rendered_width\" ),")));
+    const QString unreducedBody = functionBody(mw, QStringLiteral("int MainWindow::presentedPlaybackUnreducedCpuDebayerScale("));
+    ASSERT_TRUE(unreducedBody.contains(QStringLiteral("telemetryIntValue( telemetry, \"render_thread_rendered_width\" ) );")));
+}
+
 // r16 (adversary pass 17 A2 on 06faad35): HQ Dual-ISO, AMaZE, CPU 8-bit presentation, fast playback processing, scale 1, GPU
 // recon on, texture presentation off. A GPU-reconstructed Full frame, then a Half preview frame (route 7) in the same Play: the
 // CPU with-dimensions proxy recon kept the thread's "last recon used CUDA" flag, so the route guard refused route 7 and both
