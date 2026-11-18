@@ -2916,7 +2916,34 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     $ddR2['r6 adv p14 A2 sibling: a backtick-quote and an XML &#34;'] = ('$xml = "<add key=' + $ddBqA2 + '"password' + $ddBqA2 + '" value=' + $ddBqA2 + '"hunt&#34;er2' + $ddBqA2 + '" />"')
     $ddR2['r6 adv p14 A2 sibling: a YAML \" and an XML &quot;'] = ('xml: "<add key=' + $ddBsA2 + '"password' + $ddBsA2 + '" value=' + $ddBsA2 + '"hunt&quot;er2' + $ddBsA2 + '" />"')
     $ddR2['r6 adv p14 A2 sibling: a JSON " and an XML &#x22;'] = ('{"xml":"<add key=' + $ddBsA2 + 'u0022password' + $ddBsA2 + 'u0022 value=' + $ddBsA2 + 'u0022hunt&#x22;er2' + $ddBsA2 + 'u0022 />"}')
+    # r7 (sol r6 A1 + adversary pass 15 A1, defect class: an alternative reading judged ONE step and then discarded): the XML pair is intact only after SEVERAL outer reads, and the inner
+    # reader's quote reference is safe to decode only after them. The reviewer's literal input (JSON inside JSON), then the same with three and four outer reads and every quote spelling.
+    $ddJ = '{"payload":"{' + $ddBsA2 + '"xml' + $ddBsA2 + '":' + $ddBsA2 + '"<add key=' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '"p a s s w o r d' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '" value=' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '"hunt&#34;er2' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '" />' + $ddBsA2 + '"}"}'
+    $ddR2['r7 sol r6 A1 the reviewer input: JSON in JSON, an XML pair and &#34; in the value'] = $ddJ
+    $ddR7Gen = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddEnt in @('&#34;', '&quot;', '&#x22;', '&#x0022;')) {
+        foreach ($ddAttr in @('key', 'name')) {
+            $ddBase = '<add ' + $ddAttr + '="p a s s w o r d" value="hunt' + $ddEnt + 'er2" />'
+            $ddCur = $ddBase
+            for ($ddDepth = 1; $ddDepth -le 4; $ddDepth++) {
+                $ddCur = '{"payload":"' + $ddCur.Replace($ddBsA2, ($ddBsA2 + $ddBsA2)).Replace('"', ($ddBsA2 + '"')) + '"}'
+                $ddR7Gen.Add($ddCur)
+            }
+        }
+    }
+    $ddR7Miss = [System.Collections.Generic.List[string]]::new(); $ddR7RoleMiss = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddT in $ddR7Gen) {
+        if (-not (Test-CredentialText $ddT)) { $ddR7Miss.Add($ddT) }
+        if ((Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r7 A1 role guard') -and -not (Test-CredentialNamePresent $ddT)) { $ddR7RoleMiss.Add($ddT) }
+    }
+    Assert-That ($ddR7Miss.Count -eq 0 -and $ddR7Gen.Count -eq 32) "DENY-BY-DEFAULT-1 r7 sol r6 A1 generated sweep: all $($ddR7Gen.Count) nested-JSON XML pairs (1-4 outer reads, 4 quote spellings, 2 naming attributes) refuse" ("misses=$($ddR7Miss.Count): " + (($ddR7Miss | Select-Object -First 3) -join '; '))
+    Assert-That ($ddR7RoleMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r7 sol r6 A1 generated sweep, role guard: all $($ddR7Gen.Count) name a secret" ("misses=$($ddR7RoleMiss.Count): " + (($ddR7RoleMiss | Select-Object -First 3) -join '; '))
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r7 A1 role guard') { Assert-That (Test-CredentialNamePresent $ddJ) 'DENY-BY-DEFAULT-1 r7 sol r6 A1 role guard: the reviewer input names a secret' $ddJ }
+    # r7 must-pass: nested JSON with an entity and no credential is not refused, nor is a nested note with a plain quote reference
+    foreach ($ddOkR7 in @(('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"a &amp; b' + $ddBsA2 + '"}"}'), ('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"say &#34;hi&#34;' + $ddBsA2 + '"}"}'), ('{"payload":"<add key=' + $ddBsA2 + '"theme' + $ddBsA2 + '" value=' + $ddBsA2 + '"dark&#34;x' + $ddBsA2 + '" />"}'))) {
+        Assert-That (-not (Test-CredentialText $ddOkR7)) "DENY-BY-DEFAULT-1 r7 must-pass: $ddOkR7 is not a credential" $ddOkR7
+    }
     # r6 must-pass: the decode of a backtick before any character and of a doubled quote never turns an empty literal, a plain value or a Markdown code span into a credential
     foreach ($ddOkR6 in @('<add key="password" value="" />', '<add key="password" value=""/>', "<add key='password' value=''/>", "password: ''", 'password: ""', '{"a":"","b":"x"}', '$msg = ''it''''s a plain note''', '$msg = "say ""hi"" to the team"', ('a ' + $ddBq + '/ path note: plain'), ('the ' + $ddBq + 'theme' + $ddBq + ' setting'))) {
         Assert-That (-not (Test-CredentialText $ddOkR6)) "DENY-BY-DEFAULT-1 r6 must-pass: $ddOkR6 is not a credential" $ddOkR6
@@ -3048,6 +3075,39 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         $ddHuge = '{"note":"&' + ('amp;' * 1000000) + '"}'
         $ddSw = [Diagnostics.Stopwatch]::StartNew(); $ddHugeHit = Test-CredentialText $ddHuge; $ddSw.Stop()
         Assert-That ($ddHugeHit -and $ddSw.Elapsed.TotalSeconds -lt 120) 'DENY-BY-DEFAULT-1 r4 A3: a 4 MB nesting below the scan cap refuses in bounded time' "hit=$ddHugeHit seconds=$([int]$ddSw.Elapsed.TotalSeconds)"
+        # r7 (sol r6 A2 + adversary pass 15 A2, defect class: a shared mutable allowance that a nested call replenishes): the allowance of one walk is set by the OUTERMOST
+        # Get-CredentialNormalForm only. (1) a nested entry from a level callback never raises it; (2) at a reduced allowance a benign XML naming value (normalised again in the
+        # callback: key, name and id forms) in a text that nests past the allowance refuses typed in the content guard and the role guard; (3) a text that fits still passes.
+        $ddBudgetTrace = [System.Collections.Generic.List[long]]::new()
+        $script:ddBudgetTraceRef = $ddBudgetTrace
+        $null = Get-CredentialNormalForm ('&' + ('amp;' * 3)) -OnStage { param($lvT, $lvM) $script:ddBudgetTraceRef.Add($script:CredentialViewBudget); $null = Get-CredentialNormalForm 'a&amp;b' -OnStage { param($lvT2, $lvM2) -1 }; $script:ddBudgetTraceRef.Add($script:CredentialViewBudget); -1 }
+        $ddRose = $false; for ($ddI = 1; $ddI -lt $ddBudgetTrace.Count; $ddI++) { if ($ddBudgetTrace[$ddI] -gt $ddBudgetTrace[$ddI - 1]) { $ddRose = $true } }
+        Assert-That ($ddBudgetTrace.Count -ge 4 -and -not $ddRose) 'DENY-BY-DEFAULT-1 r7 sol r6 A2: a nested Get-CredentialNormalForm never raises the allowance of the enclosing walk' ("trace=" + ($ddBudgetTrace -join ','))
+        $ddSavedBudget = $script:CredentialViewBudgetChars
+        try {
+            $script:CredentialViewBudgetChars = 3000
+            foreach ($ddAttrA2 in @('key', 'name', 'id')) {
+                $ddA2Text = '<add ' + $ddAttrA2 + '="theme" />' + '{"note":"&' + ('amp;' * 12) + '"}'
+                $ddA2Hit = Test-CredentialText $ddA2Text
+                Assert-That ($ddA2Hit -and $script:CredentialDecodeLimitHit) "DENY-BY-DEFAULT-1 r7 sol r6 A2: at a reduced allowance a benign $ddAttrA2 naming value does not replenish it (content guard refuses typed)" "hit=$ddA2Hit limit=$($script:CredentialDecodeLimitHit)"
+                if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r7 A2 role guard') { Assert-That (Test-CredentialNamePresent $ddA2Text) "DENY-BY-DEFAULT-1 r7 sol r6 A2 role guard: the same $ddAttrA2 text refuses (deny by default)" }
+            }
+            Assert-That (-not (Test-CredentialText '<add key="theme" />{"note":"a &amp; b"}')) 'DENY-BY-DEFAULT-1 r7 sol r6 A2 must-pass: a benign naming value and a short nesting fit the reduced allowance'
+        } finally { $script:CredentialViewBudgetChars = $ddSavedBudget }
+        # the reviewer's size: a benign naming value before a 4 MB nesting refuses in bounded time too (it used to charge the full allowance again at every level)
+        $ddHuge2 = '<add key="theme" />' + '{"note":"&' + ('amp;' * 1000000) + '"}'
+        $ddSw2 = [Diagnostics.Stopwatch]::StartNew(); $ddHuge2Hit = Test-CredentialText $ddHuge2; $ddSw2.Stop()
+        Assert-That ($ddHuge2Hit -and $script:CredentialDecodeLimitHit -and $ddSw2.Elapsed.TotalSeconds -lt 120) 'DENY-BY-DEFAULT-1 r7 sol r6 A2: a benign XML naming value before a 4 MB nesting refuses typed in bounded time' "hit=$ddHuge2Hit limit=$($script:CredentialDecodeLimitHit) seconds=$([int]$ddSw2.Elapsed.TotalSeconds)"
+        # r7: the alternative reading walk is bounded by a node count too (typed refusal), and a text with a few orders is not refused
+        $ddBsN = [string][char]92
+        $ddNodeText = '{"payload":"{' + $ddBsN + '"note' + $ddBsN + '":' + $ddBsN + '"a &amp; b' + $ddBsN + '"}"}'
+        $ddSavedNodes = Get-Variable -Name CredentialMaxBranchNodes -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        try {
+            Assert-That (-not (Test-CredentialText $ddNodeText)) 'DENY-BY-DEFAULT-1 r7 must-pass: a text with two decode orders and no credential is not refused'
+            $script:CredentialMaxBranchNodes = 1
+            Assert-That ((Test-CredentialText $ddNodeText) -and $script:CredentialDecodeLimitHit) 'DENY-BY-DEFAULT-1 r7: past the node bound the orders walk refuses typed (deny by default)'
+        } finally { $script:CredentialMaxBranchNodes = $ddSavedNodes }
+        Assert-That ((Get-Variable -Name CredentialNormalDepth -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 0) 'DENY-BY-DEFAULT-1 r7 sol r6 A2: the nesting depth is back to zero after every walk (also after the typed refusals above)'
     }
 }
 # S3: a Clone whose url carries a query token: neither the console nor the setup log ever holds the token, also where git echoes the url without its scheme

@@ -1805,10 +1805,84 @@ function Get-CredentialResidualView([string]$Text) {
     }
     return $t
 }
+# r7 (sol r6 A2 + adversary pass 15 A2, defect class: a shared mutable allowance that a nested call replenishes): Get-CredentialNormalForm is re-entered from the rules it hands
+# each level to (a benign XML naming value is normalised again, Get-CredentialXmlAttrPairHitIndex), and every entry used to reset the allowance. The allowance and the branch-node
+# count are now set by the OUTERMOST entry only ($script:CredentialNormalDepth), so a nested call spends the enclosing walk's allowance and can never raise it.
+$script:CredentialNormalDepth = 0
+$script:CredentialBranchNodes = 0
+$script:CredentialMaxBranchNodes = 2000
+# r7 (sol r6 A1 + adversary pass 15 A1, defect class: an alternative reading judged ONE step and then discarded): a text read by two nested readers can be decoded in more than one
+# order (the outer reader first, the inner one first, both on one level). '{"payload":"{\"xml\":\"<add key=\\\"p a s s w o r d\\\" value=\\\"hunt&#34;er2\\\" />\"}"}' shows the
+# XML pair only after TWO outer reads; the combined decode turns '&#34;' into a quote before the outer reader has finished, and the pair is lost. Every alternative (outer-only,
+# inner-only) is now walked to ITS OWN fixed point, each level judged, branching again wherever both kinds of escape stand (Find-CredentialBranchHit). The orders are deduplicated by
+# text and mask (a SHA-256 key, no text retained), bounded by the shared allowance and by $script:CredentialMaxBranchNodes; past either the text is REFUSED typed, as past the level bound.
+function Get-CredentialTextKey([string]$S, [string]$Mask) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $b = [byte[]]::new(2 * $S.Length)
+        [Buffer]::BlockCopy($S.ToCharArray(), 0, $b, 0, $b.Length)   # the UTF-16 units as they are (a lone surrogate is kept; an encoder would replace it)
+        [void]$sha.TransformBlock($b, 0, $b.Length, $null, 0)
+        $mb = [System.Text.Encoding]::ASCII.GetBytes($Mask)
+        [void]$sha.TransformFinalBlock($mb, 0, $mb.Length)
+        return [Convert]::ToBase64String($sha.Hash)
+    } finally { $sha.Dispose() }
+}
+# The texts one decode step from ($S, $Mask) leads to, the LAST being the combined step the walk follows; empty when nothing changes. A doubled quote is collapsed on a level of its own
+# (a single child). With -Alternatives and BOTH kinds of escape in the text, the outer-only and inner-only partial decodes come first (and charge the shared allowance).
+function Get-CredentialDecodeChildren([string]$S, [string]$Mask, [bool]$Alternatives) {
+    $q1 = $null; $q2 = $null
+    if ($S.Contains("''") -or $S.Contains('""')) {
+        $q1 = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialQuoteRunRegex -Eval $script:CredentialQuoteRunEval
+        if ($q1) { $S = $q1.Text; $Mask = $q1.Mask }
+        $q2 = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialQuoteNearNameRegex -Eval $script:CredentialQuoteNearNameEval
+        if ($q2) { $S = $q2.Text; $Mask = $q2.Mask }
+    }
+    if ($q1 -or $q2) { return [pscustomobject]@{ Text = $S; Mask = $Mask } }
+    $kids = [System.Collections.Generic.List[object]]::new()
+    if ($Alternatives) {
+        Use-CredentialViewBudget (2 * $S.Length)
+        $po = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeOuterEval
+        $pi = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeInnerEval
+        if ($po -and $pi) {
+            foreach ($part in @($po, $pi)) {
+                $pb = Invoke-CredentialMaskedReplace -S $part.Text -Mask $part.Mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
+                $kids.Add($(if ($pb) { $pb } else { $part }))
+            }
+        }
+    }
+    $r = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
+    if ($r) { $S = $r.Text; $Mask = $r.Mask }
+    $b = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
+    if ($b) { $S = $b.Text; $Mask = $b.Mask }
+    if (-not $r -and -not $b) { return @() }
+    $kids.Add([pscustomobject]@{ Text = $S; Mask = $Mask })
+    return $kids.ToArray()
+}
+function Find-CredentialBranchHit([string]$S, [string]$Mask, [int]$Level, [scriptblock]$OnStage, $Seen) {
+    if (-not $Seen.Add((Get-CredentialTextKey $S $Mask))) { return $null }
+    $script:CredentialBranchNodes++
+    if ($script:CredentialBranchNodes -gt $script:CredentialMaxBranchNodes) { throw (New-CredentialDecodeLimitError "the text can be decoded in more than $($script:CredentialMaxBranchNodes) different orders") }
+    Use-CredentialViewBudget (3 * $S.Length)
+    $got = @(& $OnStage $S $Mask)
+    if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $S; Mask = $Mask; Levels = $Level; Hit = [int]$got[-1] } }
+    $kids = @(Get-CredentialDecodeChildren $S $Mask $true)
+    if ($kids.Count -eq 0) { return $null }
+    if ($Level + 1 -gt $script:CredentialMaxDecodeStages) { throw (New-CredentialDecodeLimitError "the text still decodes after $($script:CredentialMaxDecodeStages) levels") }
+    foreach ($kid in $kids) {
+        $found = Find-CredentialBranchHit $kid.Text $kid.Mask ($Level + 1) $OnStage $Seen
+        if ($found) { return $found }
+    }
+    return $null
+}
 function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null, [scriptblock]$OnView = $null) {
+    $outermost = ($script:CredentialNormalDepth -le 0)
+    if ($outermost) { $script:CredentialViewBudget = $script:CredentialViewBudgetChars; $script:CredentialBranchNodes = 0 }
+    $script:CredentialNormalDepth++
+    try { return (Get-CredentialNormalFormWalk $Text $OnStage $OnView) } finally { $script:CredentialNormalDepth-- }
+}
+function Get-CredentialNormalFormWalk([string]$Text, [scriptblock]$OnStage = $null, [scriptblock]$OnView = $null) {
     $s = "$Text"; $mask = [string]::new([char]'0', $s.Length)
-    $levels = 0; $hit = -1
-    $script:CredentialViewBudget = $script:CredentialViewBudgetChars
+    $levels = 0; $hit = -1; $seen = $null
     while ($true) {
         # r6 (adversary pass 13 A2): the residual view of the text about to be decoded (see Get-CredentialResidualView); a hit ends the walk on the view (same length as the level text)
         # r6 (adversary pass 14 A1): the view is built whenever the text holds a character an escape starts with ('\', '&', '%', a backtick), NOT only when an introducer already stands in it:
@@ -1823,38 +1897,24 @@ function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null, 
         # r6 (adversary pass 13 A1, defect class: decode order): a doubled quote belongs to the OUTER reader (PowerShell, YAML, CSV), so it is collapsed on a level of its own, BEFORE
         # the escapes and character references that the string holds are decoded and judged ('$x = ''<add key=''''k'''' value=''''hunt&#39;er2'''' />''' must reach the XML rule with
         # its quoting intact: collapsing it on the same level as '&#39;' leaves 'value=''hunt''er2''' and no start tag). Only when the text holds a doubled quote at all.
-        $q1 = $null; $q2 = $null
-        if ($s.Contains("''") -or $s.Contains('""')) {
-            $q1 = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialQuoteRunRegex -Eval $script:CredentialQuoteRunEval
-            if ($q1) { $s = $q1.Text; $mask = $q1.Mask }
-            $q2 = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialQuoteNearNameRegex -Eval $script:CredentialQuoteNearNameEval
-            if ($q2) { $s = $q2.Text; $mask = $q2.Mask }
-        }
-        $r = $null; $b = $null
-        if (-not $q1 -and -not $q2) {
-            # r6 (adversary pass 14 A2, defect class: decode order between two readers on ONE level): a string holds the OUTER reader's escapes (JSON / YAML / TOML / PowerShell backslash
-            # and backtick forms) and the INNER reader's (XML character references and entities, URL '%NN'). Decoded together ('{"xml":"<add key=\"k\" value=\"a&#34;b\" />"}'),
-            # the inner '&#34;' lands inside the quoting the outer '\"' just produced and the tag is lost. When BOTH kinds stand on this level, each partial decode is judged as well:
-            # the outer one alone, then the inner one alone (each from this level's text); the combined decode below is still the one the walk follows.
-            if ($OnStage) {
-                Use-CredentialViewBudget (2 * $s.Length)
-                $po = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeOuterEval
-                $pi = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeInnerEval
-                if ($po -and $pi) {
-                    foreach ($part in @($po, $pi)) {
-                        $got = @(& $OnStage $part.Text $part.Mask)
-                        if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $part.Text; Mask = $part.Mask; Levels = $levels + 1; Hit = [int]$got[-1] } }
-                    }
-                }
-            }
-            $r = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
-            if ($r) { $s = $r.Text; $mask = $r.Mask }
-            $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
-            if ($b) { $s = $b.Text; $mask = $b.Mask }
-        }
-        if (-not $r -and -not $b -and -not $q1 -and -not $q2) { break }
+        # r6 (adversary pass 14 A2) / r7: the step is Get-CredentialDecodeChildren: the combined decode is the one the walk follows, and when BOTH kinds of escape stand on this level
+        # (the outer reader's JSON / YAML / TOML / PowerShell forms, the inner reader's XML references and entities) every alternative order is walked as well.
+        # r7 (sol r6 A1 + adversary pass 15 A1, defect class: an alternative reading judged ONE step and then discarded): each alternative is walked to its OWN fixed point, every level
+        # judged (Find-CredentialBranchHit), because the outer reader may need several steps before the inner reader's reference is safe to decode.
+        $kids = @(Get-CredentialDecodeChildren $s $mask ([bool]$OnStage))
+        if ($kids.Count -eq 0) { break }
         $levels++
         if ($levels -gt $script:CredentialMaxDecodeStages) { throw (New-CredentialDecodeLimitError "the text still decodes after $($script:CredentialMaxDecodeStages) levels") }
+        $next = $kids[$kids.Count - 1]
+        if ($OnStage -and $kids.Count -gt 1) {
+            if (-not $seen) { $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal) }
+            [void]$seen.Add((Get-CredentialTextKey $next.Text $next.Mask))   # the combined step is judged below, by the walk itself
+            for ($ki = 0; $ki -lt $kids.Count - 1; $ki++) {
+                $found = Find-CredentialBranchHit $kids[$ki].Text $kids[$ki].Mask $levels $OnStage $seen
+                if ($found) { return $found }
+            }
+        }
+        $s = $next.Text; $mask = $next.Mask
         if ($OnStage) {
             $got = @(& $OnStage $s $mask)
             if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { $hit = [int]$got[-1]; break }
