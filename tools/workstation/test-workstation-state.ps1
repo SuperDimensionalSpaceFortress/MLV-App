@@ -2670,6 +2670,714 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'r26 clone')) {
 }
 foreach ($n in @($r22envSaved.Keys)) { [Environment]::SetEnvironmentVariable($n, $r22envSaved[$n]) }
 
+# ---------------------------------------------------------------- MINI3-CUTOVER-CREDENTIAL-DETECTOR-DENY-BY-DEFAULT-1 (filed from #829 r16 adversary pass 17 A1-A3)
+# S1: a secret-named key written with ESCAPES a reader decodes (YAML/JSON/TOML \xNN \uNNNN \UNNNNNNNN, XML &#NNN; &#xNN;, PowerShell `u{NN} and `<letter>, C/Python
+#     octal \NNN and \N{NAME}, URL %NN) is the same key. An escape that cannot be decoded in a key position counts as secret-named (deny by default).
+# S2: a .NET config element that puts the secret NAME in a key= / name= attribute VALUE and the secret in another attribute ('<add key="password" value="x" />').
+# S3: a Clone-phase message never carries a url's query token, also when git echoes the url WITHOUT its scheme ('fatal: ''/C:/r.git?token=x'' does not appear ...').
+# Every case is GENERATED (doctrine d6d115b) over the same value wrappers as the r15 sweep; the fakes are 'hunter2' and 'fake-token-000N'.
+if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Test-Has 'Get-CredentialHitLine' 'DENY-BY-DEFAULT-1')) {
+    $ddBt = [string][char]0x60
+    # one encoder per escape form: the escaped spelling of ONE character, or $null when the form cannot spell it (it is then left as written)
+    $ddEnc = [ordered]@{
+        'yaml \xNN'        = { param($c) '\x{0:x2}' -f [int]$c }
+        'json \uNNNN'      = { param($c) '\u{0:x4}' -f [int]$c }
+        'toml \UNNNNNNNN'  = { param($c) '\U{0:x8}' -f [int]$c }
+        'xml &#NNN;'       = { param($c) '&#{0};' -f [int]$c }
+        'xml &#xNN;'       = { param($c) '&#x{0:x};' -f [int]$c }
+        'ps `u{NN}'        = { param($c) $ddBt + ('u{{{0:x}}}' -f [int]$c) }
+        'ps `letter'       = { param($c) if ('0abefnrtv'.Contains([string]$c)) { $null } else { $ddBt + [string]$c } }
+        'octal \NNN'       = { param($c) '\' + [Convert]::ToString([int]$c, 8).PadLeft(3, '0') }
+        'python \N{NAME}'  = { param($c) if ($c -cmatch '[a-z]') { '\N{LATIN SMALL LETTER ' + ([string]$c).ToUpperInvariant() + '}' } elseif ($c -eq [char]'_') { '\N{LOW LINE}' } else { $null } }
+        'url %NN'          = { param($c) '%{0:X2}' -f [int]$c }
+    }
+    # the secret names, each with the index of the ONE letter the 'one letter' variant escapes
+    $ddNames = @(@('password', 4), @('token', 2), @('api_key', 4), @('secret', 2))
+    $ddKeyForms = [ordered]@{
+        'YAML double-quoted' = { param($k, $v) '"' + $k + '": ' + $v }
+        'JSON'               = { param($k, $v) '{"' + $k + '": ' + $v + '}' }
+        'TOML'               = { param($k, $v) '"' + $k + '" = ' + $v }
+        'ini line'           = { param($k, $v) $k + '=' + $v }
+        'PS hashtable'       = { param($k, $v) '@{ "' + $k + '" = ' + $v + ' }' }
+        'XML attribute pair' = { param($k, $v) $q = $(if ($v.Contains('"')) { "'" } else { '"' }); '<add key=' + $q + $k + $q + ' value=' + $q + $v + $q + ' />' }
+        'query string'       = { param($k, $v) 'https://h.example/cb?' + $k + '=' + $v }
+    }
+    $ddValues = [System.Collections.Generic.List[object]]::new()
+    $ddValues.Add(@{ Name = 'hunter2'; Value = 'hunter2' })
+    foreach ($wn in $r15Wrap.Keys) { $ddValues.Add(@{ Name = "$wn(hunter2)"; Value = (& $r15Wrap[$wn] 'hunter2') }) }
+    $ddTotal = 0
+    foreach ($en in $ddEnc.Keys) {
+        $ddMiss = [System.Collections.Generic.List[string]]::new(); $ddN = 0
+        foreach ($nm in $ddNames) {
+            $chars = $nm[0].ToCharArray()
+            $one = (@(for ($i = 0; $i -lt $chars.Length; $i++) { if ($i -eq $nm[1]) { $e = & $ddEnc[$en] $chars[$i]; if ($null -eq $e) { [string]$chars[$i] } else { $e } } else { [string]$chars[$i] } }) -join '')
+            $all = (@(foreach ($c in $chars) { $e = & $ddEnc[$en] $c; if ($null -eq $e) { [string]$c } else { $e } }) -join '')
+            foreach ($key in @($one, $all)) {
+                if ($key -ceq $nm[0]) { continue }
+                foreach ($fn in $ddKeyForms.Keys) {
+                    foreach ($val in $ddValues) {
+                        $text = & $ddKeyForms[$fn] $key $val.Value
+                        $ddN++
+                        if (-not (Test-CredentialText $text) -or (Get-CredentialHitLine $text) -le 0) { $ddMiss.Add("$fn / $key / $($val.Name)") }
+                    }
+                }
+            }
+        }
+        $ddTotal += $ddN
+        Assert-That ($ddMiss.Count -eq 0) "DENY-BY-DEFAULT-1 S1 generated sweep, $en escapes: all $ddN escaped key spellings refuse" ("misses=$($ddMiss.Count): " + (($ddMiss | Select-Object -First 8) -join '; '))
+    }
+    Assert-That ($ddTotal -ge 5000) "DENY-BY-DEFAULT-1 S1 generated sweep: the sweep ran ($ddTotal cases)" "$ddTotal"
+    # S1 deny by default: an escape that cannot be decoded, standing in a key, makes the key secret-named
+    $ddResidual = [ordered]@{
+        'an out-of-range \U escape'              = '"pass\U0011FFFFord": hunter2'
+        'an unknown \N{NAME} escape'             = '"pass\N{NO SUCH CHARACTER}ord": hunter2'
+        'an out-of-range XML character ref'      = '<add key="pass&#99999999;ord" value="hunter2" />'
+        'an out-of-range PS `u{} escape'         = ('$c[' + "'pass" + $ddBt + "u{110FFFF}ord'] = 'hunter2'")
+        'a \x escape with no hex digits'         = 'pass\xZZord=hunter2'
+    }
+    foreach ($k in $ddResidual.Keys) { Assert-That ((Test-CredentialText $ddResidual[$k]) -and (Get-CredentialHitLine $ddResidual[$k]) -gt 0) "DENY-BY-DEFAULT-1 S1 residual: $k in a key refuses" $ddResidual[$k] }
+    # S2: the XML attribute pair, generated over the attribute names, both quote styles, the attribute order and both element shapes
+    $ddS2Miss = [System.Collections.Generic.List[string]]::new(); $ddS2N = 0
+    foreach ($nameAttr in @('key', 'name', 'Key', 'Name')) {
+        foreach ($valAttr in @('value', 'Value', 'connectionString', 'serializedValue')) {
+            foreach ($secret in @('password', 'DbPassword', 'ApiKey', 'GitHubToken', 'Pwd', 'client_secret', 'DB Password')) {
+                foreach ($q in @('"', "'")) {
+                    foreach ($order in @('name first', 'value first')) {
+                        foreach ($shape in @('self-closing', 'open and close')) {
+                            $na = $nameAttr + '=' + $q + $secret + $q; $va = $valAttr + '=' + $q + 'hunter2' + $q
+                            $attrs = $(if ($order -eq 'name first') { "$na $va" } else { "$va $na" })
+                            $el = $(if ($shape -eq 'self-closing') { "<add $attrs />" } else { "<add $attrs></add>" })
+                            $text = "<configuration>`n  <appSettings>`n    $el`n  </appSettings>`n</configuration>"
+                            $ddS2N++
+                            if (-not (Test-CredentialText $text) -or (Get-CredentialHitLine $text) -le 0) { $ddS2Miss.Add($el) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Assert-That ($ddS2Miss.Count -eq 0 -and $ddS2N -ge 800) "DENY-BY-DEFAULT-1 S2 generated sweep: all $ddS2N XML key/value attribute pairs refuse" ("misses=$($ddS2Miss.Count): " + (($ddS2Miss | Select-Object -First 8) -join '; '))
+    $ddS2Hit = [ordered]@{
+        'a settings element whose value is a child element' = '<setting name="ApiToken" serializeAs="String"><value>hunter2</value></setting>'
+        'a Java properties XML entry'                       = '<entry key="db.password">hunter2</entry>'
+        'a connection string Password='                     = '<add name="Main" connectionString="Server=s;Database=d;User Id=u;Password=hunter2;" />'
+        'a connection string Pwd='                          = '<add name="Main" connectionString="Server=s;Uid=u;Pwd=hunter2" />'
+        'a connection string with spaces round ='           = '<add name="Main" connectionString="Server=s; Password = hunter2" />'
+        'a connection string key spelled with a char ref'   = '<add name="Main" connectionString="Server=s;Pass&#119;ord=hunter2" />'
+        'a key attribute spelled with a char ref'           = '<add key="pass&#119;ord" value="hunter2" />'
+        'a key attribute spelled with a hex char ref'       = '<add key="pass&#x77;ord" value="hunter2" />'
+    }
+    foreach ($k in $ddS2Hit.Keys) { Assert-That ((Test-CredentialText $ddS2Hit[$k]) -and (Get-CredentialHitLine $ddS2Hit[$k]) -gt 0) "DENY-BY-DEFAULT-1 S2: $k refuses" $ddS2Hit[$k] }
+    # must-pass: decodable escapes that name nothing secret, paths, and XML pairs whose name is not secret or whose value is on the closed exemption list
+    $ddOk = [ordered]@{
+        'a JSON key with a decoded accent'          = '{"caf\u00e9": "x"}'
+        'a JSON value with a decoded accent'        = '{"name": "caf\u00e9"}'
+        'a Windows path value'                      = 'path: C:\Users\me\x64\tools'
+        'a JSON Windows path value'                 = '{"path": "C:\\Users\\x"}'
+        'a percent-encoded query value'             = 'url: https://x.example/?q=a%20b'
+        'a PowerShell string with escapes'          = ('$x = "line' + $ddBt + 'nnext' + $ddBt + 'tend"')
+        'an appSettings pair that is not secret'    = '<add key="Theme" value="dark" />'
+        'an appSettings secret with an empty value' = '<add key="password" value="" />'
+        'a secret name with no other attribute'     = '<add name="password" />'
+        'an appSettings secret with an env ref'     = '<add key="ApiKey" value="${API_KEY}" />'
+        'a connection string with no password'      = '<add name="Main" connectionString="Server=s;Database=d;Integrated Security=true" />'
+        'an appSettings block of plain settings'    = "<appSettings>`n  <add key=`"LogLevel`" value=`"Information`" />`n</appSettings>"
+    }
+    foreach ($k in $ddOk.Keys) { Assert-That (-not (Test-CredentialText $ddOk[$k])) "DENY-BY-DEFAULT-1 must-pass: $k is not a credential" $ddOk[$k] }
+    # r1 adversary pass 1 (A1-A3, A6-A8): each finding's input, plus its siblings
+    $ddE = [string][char]0xE9
+    $ddA = [ordered]@{
+        'A1 a char-ref key with a char-ref quote in the value'         = '<add key="pass&#119;ord" value="hunt&#34;er2" />'
+        'A1 a hex char-ref key with a hex char-ref quote in the value' = '<add key="pass&#x77;ord" value="hunt&#x22;er2" />'
+        'A1 single-quoted, with a char-ref apostrophe in the value'    = "<add key='pass&#119;ord' value='hunt&#39;er2' />"
+        'A2 a second naming attribute carries the secret'              = '<add key="password" name="hunter2" />'
+        'A2 name plus id'                                              = '<add name="token" id="hunter2" />'
+        'A3 a percent-encoded slash in a query key'                    = 'https://h.example/cb?api%2Fkey=hunter2'
+        'A3 a percent-encoded backslash in a query key'                = 'https://h.example/cb?api%5Ckey=hunter2'
+        'A3 a percent-encoded slash in an XML key attribute'           = '<add key="api%2Fkey" value="hunter2" />'
+        'A3 a percent escape left undecoded in a key'                  = 'pass%20word=hunter2'
+        'A6 a non-ASCII attribute name beside the pair'                = ('<add key="password" value="hunter2" caf' + $ddE + '="x" />')
+        'A6 a non-ASCII namespace prefix'                              = ('<' + $ddE + ':add xmlns:' + $ddE + '="urn:cfg" key="password" value="hunter2" />')
+        'A6 sibling: a non-ASCII prefix on a secret element'           = ('<' + $ddE + ':password>hunter2</' + $ddE + ':password>')
+        'A7 a table header with an undecodable escape'                 = "[`"pass\U0011FFFFord`"]`nvalue=`"hunter2`""
+        # r1 adversary pass 2: a value is never decoded into an exempt literal (A1), and a DTD entity in a key is undecodable (A3)
+        'p2 A1 an escaped key whose value decodes to null'             = '"password": \156ull'
+        'p2 A1 sibling: a value written as a char-ref empty string'    = '{"password": "&#34;&#34;"}'
+        'p2 A1 sibling: a table body value that decodes to null'       = "[`"password`"]`nx = \156ull"
+        'p2 A3 a DTD entity inside an XML key attribute'               = '<!DOCTYPE add [<!ENTITY w "w">]><add key="pass&w;ord" value="hunter2" />'
+    }
+    foreach ($k in $ddA.Keys) { Assert-That ((Test-CredentialText $ddA[$k]) -and (Get-CredentialHitLine $ddA[$k]) -gt 0) "DENY-BY-DEFAULT-1 r1 adversary $k refuses" $ddA[$k] }
+    $ddA8 = "`"pass\U0011FFFFord`": hunter2`n`"pass%77ord`": hunter2"
+    Assert-That ((Get-CredentialHitLine $ddA8) -eq 1) 'DENY-BY-DEFAULT-1 r1 adversary A8: the report names the line of the EARLIEST key (a residual key on line 1)' "line=$(Get-CredentialHitLine $ddA8)"
+    # r2 (adversary pass 3 A1-A4, one normal form): every finding's input and sibling, plus a generated sweep of an escaped key after ANY predecessor character
+    $ddR2 = [ordered]@{
+        'p3 A1 an escaped key after a colon inside a name'        = '{"db:password":"hunter2"}'
+        'p3 A1 sibling: after an equals sign inside a name'       = '{"db=password":"hunter2"}'
+        'p3 A1 sibling: a residual key after a colon'             = '{"db:pass\U0011FFFFord":"hunter2"}'
+        'p3 A2 a nested same-name entry in an attribute pair'     = '<entry key="password"><entry></entry>hunter2</entry>'
+        'p3 A2 twin: a nested same-name secret element'           = '<password><password></password>hunter2</password>'
+        'p3 A2 sibling: an unclosed child as the pair content'    = '<entry key="password"><entry></entry>'
+        'p3 A3 a DTD entity in a connection-string key'           = '<!DOCTYPE add [<!ENTITY w "w">]><add name="Main" connectionString="Pass&w;ord=hunter2" />'
+        'p3 A4 a non-ASCII DTD entity name in a key attribute'    = ('<!DOCTYPE add [<!ENTITY ' + $ddE + ' "w">]><add key="pass&' + $ddE + ';ord" value="hunter2" />')
+        'p3 A4 sibling: a non-ASCII entity in a JSON key'         = ('{"pass&' + $ddE + ';ord": "hunter2"}')
+        'p3 nested: an escaped entity that decodes to a char ref' = '{"pass&amp;#119;ord": "hunter2"}'
+        'p3 mask: a decoded key whose value decodes to null'      = '{"db:password": \156ull}'
+        # r2 pass 4 A1: a decoded character that SHAPES the value (its terminator, a blank the reader skips, a '#' that makes a later line a comment)
+        'p4 A1 a decoded comma ends the value'                    = '{"pass\x77ord": \x26#44;hunter2}'
+        'p4 A1 sibling: a decoded blank before null'              = '{"pass\x77ord": \x26#32;null}'
+        'p4 A1 sibling: a decoded line break ends the value'      = "pass\x77ord: \u000a"
+        'p4 A1 sibling: a decoded # makes the value line a comment' = "`"password`":`n\x23 hunter2"
+        'p4 A1 sibling: a decoded = in an ini-style value'        = "pass\x77ord=\x26#10;hunter2"
+        # r2 pass 5 A1: a decode that DELETES (a decoded backslash joins the next line) still marks the value
+        'p5 A1 a decoded backslash joins a null line'             = "`"password`": \`n  null"
+        'p5 A1 sibling: the same in a table body'                 = "[`"password`"]`nx = \`n  null"
+        'p5 A1 sibling: a raw escaped line break before null'     = "`"password`": \`n  null"
+        # r2 pass 6 A1: a reader decodes ONCE; the deeper level ('password suffix') names nothing, the first level ('password suffix') does
+        'p6 A1 an escaped backslash before a second escape'       = '{"password\u0020suffix":"hunter2"}'
+    }
+    # r3 pass 7 A2: an XML naming attribute VALUE is judged at every decode level too (its first level names a secret, the deeper fixed point does not)
+    $ddR2['p7 A2 an XML key whose first decode level names a secret'] = '<add key="&#97;uth&#92;u0068eader" value="hunter2" />'
+    $ddR2['p7 A2 sibling: the same key in a JSON pair'] = '{"\x61uth\x5cu0068eader": "hunter2"}'
+    # r4 (sol r3 A1, defect class: a judge that drops the spelling AS WRITTEN once a decode exists): the raw naming value is a candidate too, beside every decode level
+    # ($ddU is backslash + 'u0068', the escaped 'h', built here so no editor or encoder can decode it in the source)
+    $ddU = [string][char]92 + 'u0068'
+    $ddR2['r4 A1 a raw strong XML naming value that also decodes'] = ('<add key="auth' + $ddU + 'eader" value="hunter2" />')
+    $ddR2['r4 A1 sibling: the same with single quotes'] = ("<add key='auth" + $ddU + "eader' value='hunter2' />")
+    $ddR2['r4 A1 sibling: a raw strong spaced naming value that decodes'] = ('<add key="a u t h' + $ddU + 'eader" value="hunter2" />')
+    # r4 (sol r3 hardening): raw benign, first decode level strong, fixed point benign, so only a judge of the intermediate level refuses it
+    $ddR2['r4 hardening: a JSON key strong only at its first decode level'] = '{"&#97;uth&#92;u0068eader": "hunter2"}'
+    # r4 adversary pass 9 A3: a quoted '/>' inside a secret-named element's start tag is not a self-closing tag
+    $ddR2['r4 pass 9 A3 a quoted /> in a secret element start tag'] = '<password note="/>">hunter2</password>'
+    $ddR2['r4 pass 9 A3 sibling: single quotes'] = "<password note='/>'>hunter2</password>"
+    # r4 adversary pass 10 A1-A2: the escaped backslash and the one-letter escapes a JSON reader decodes ($ddBs is one backslash, built so no encoder can decode it)
+    $ddBs = [string][char]92
+    $ddR2['r4 pass 10 A1 an escaped backslash before an undecodable escape in a key'] = ('{"pass' + $ddBs + $ddBs + 'U0011FFFFord":"hunter2"}')
+    $ddR2['r4 pass 10 A2 an escaped line break inside an XML naming value in JSON'] = ('{"xml":"<add key=''pass' + $ddBs + 'nword'' value=''hunter2'' />"}')
+    $ddR2['r4 pass 10 A2 sibling: an escaped tab'] = ('{"xml":"<add key=''pass' + $ddBs + 'tword'' value=''hunter2'' />"}')
+    # r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): the YAML whitespace escapes \L \P \v (and the control escapes \a \e) in an XML naming value
+    $ddR2['r5 sol r4 A2 a YAML \L (U+2028) in an XML naming value'] = ('xml: "<add key=''pass' + $ddBs + 'Lword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \P (U+2029) in an element-form pair'] = ('xml: "<entry key=''pass' + $ddBs + 'Pword''>hunter2</entry>"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \v (VT)'] = ('xml: "<add key=''pass' + $ddBs + 'vword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \e (ESC)'] = ('xml: "<add key=''pass' + $ddBs + 'eword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \a (BEL)'] = ('xml: "<add key=''pass' + $ddBs + 'aword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \_ (NBSP)'] = ('xml: "<add key=''pass' + $ddBs + '_word'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \L in a JSON string'] = ('{"xml":"<add key=''pass' + $ddBs + 'Lword'' value=''hunter2'' />"}')
+    # r5 adversary pass 12 A1 (defect class: an escape a reader decodes that the normaliser left as written, the PowerShell form): a backtick-escaped quote frames an XML pair inside
+    # a PowerShell string, and the special backtick escapes (`n `t `r `a `b `e `f `v `0) are blanks or control characters inside a naming value ($ddBq is one backtick)
+    $ddBq = [string][char]0x60
+    $ddR2['r5 adv p12 A1 a backtick-escaped double quote frames the XML pair'] = ('$xml = "<add key=' + $ddBq + '"password' + $ddBq + '" value=' + $ddBq + '"hunter2' + $ddBq + '" />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-n inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'nword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-t inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'tword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-r inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'rword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-v inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'vword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-e inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'eword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-a inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'aword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-b inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'bword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-f inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'fword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-escaped quote and a backtick-n together'] = ('$xml = "<add key=' + $ddBq + '"pass' + $ddBq + 'nword' + $ddBq + '" value=' + $ddBq + '"hunter2' + $ddBq + '" />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-escaped single quote frames the pair'] = ('$xml = "<add key=' + $ddBq + '''password' + $ddBq + ''' value=' + $ddBq + '''hunter2' + $ddBq + ''' />"')
+    # r6 (sol r5 A1 + opus r5 B1, defect class: an escape a reader decodes that the normaliser left as written; PowerShell reads a backtick before ANY character as that character,
+    # so the punctuation, blank, tab and line-break forms the key rule allows are escapes too): a backtick before '/', a backslash, a blank, a tab, a line break, '>' or any other character
+    $ddR2['r6 sol r5 A1 a backtick before a slash inside a key'] = ('$cfg = @{ "pass' + $ddBq + '/word" = ''hunter2'' }')
+    $ddR2['r6 sol r5 A1 sibling: a backtick before a backslash inside a key'] = ('$cfg = @{ "pass' + $ddBq + '\word" = ''hunter2'' }')
+    $ddR2['r6 sol r5 A1 sibling: a backtick before a slash in api/key'] = ('$cfg = @{ "api' + $ddBq + '/key" = ''hunter2'' }')
+    $ddR2['r6 opus r5 B1 sibling: a backtick before a blank in an XML naming value'] = ('$xml = "<add key=''pass' + $ddBq + ' word'' value=''hunter2'' />"')
+    $ddR2['r6 opus r5 B1 sibling: a backtick before a tab in an XML naming value'] = ('$xml = "<add key=''pass' + $ddBq + [string][char]9 + 'word'' value=''hunter2'' />"')
+    $ddR2['r6 opus r5 B1 sibling: a backtick before a line break in an XML naming value'] = ('$xml = "<add key=''pass' + $ddBq + "`n" + 'word'' value=''hunter2'' />"')
+    $ddR2['r6 sol r5 A1 XML sibling: a backtick before the > of the start tag'] = ('$xml = "<add key=''password'' value=''hunter2'' /' + $ddBq + '>"')
+    # r6 (sol r5 A2 + opus r5 hardening, defect class: an escape a reader decodes that the normaliser left as written; the doubled quote): PowerShell and YAML read a doubled single
+    # quote inside a single-quoted string as one quote, and PowerShell and CSV read a doubled double quote inside a double-quoted string as one
+    $ddR2['r6 sol r5 A2 doubled single quotes frame an XML pair'] = ('$xml = ''<add key=''''password'''' value=''''hunter2'''' />''')
+    $ddR2['r6 opus r5 hardening: doubled double quotes frame an XML pair'] = ('$xml = "<add key=""password"" value=""hunter2"" />"')
+    $ddR2['r6 sol r5 A2 sibling: doubled single quotes around an element-form pair'] = ('$xml = ''<entry key=''''password''''>hunter2</entry>''')
+    $ddR2['r6 sol r5 A2 sibling: doubled quotes around a slash-led key'] = ('$xml = ''<add key=''''/password'''' value=''''hunter2'''' />''')
+    $ddR2['r6 sol r5 A2 sibling: a doubled quote pair with no enclosing run (adjacent to name characters)'] = ('x ''''password'''' value=''''hunter2'''' <add key=''''password'''' value=''''hunter2'''' />')
+    # r6 adversary pass 13 A1 (defect class: decode order): the doubled quote belongs to the OUTER reader, so it collapses on a level of its own BEFORE a character reference inside the string is decoded
+    $ddR2['r6 adv p13 A1 a char-ref apostrophe in a doubled-quote PowerShell string'] = ('$xml = ''<add key=''''pass&#119;ord'''' value=''''hunt&#39;er2'''' />''')
+    $ddR2['r6 adv p13 A1 sibling: a char-ref quote in a doubled-double-quote string'] = ('$xml = "<add key=""pass&#119;ord"" value=""hunt&#34;er2"" />"')
+    $ddR2['r6 adv p13 A1 sibling: a hex char-ref apostrophe in a YAML single-quoted string'] = ('xml: ''<add key=''''pass&#x77;ord'''' value=''''hunt&#x27;er2'''' />''')
+    # r6 adversary pass 13 A2 (defect class: a residual escape whose framing a decode destroys on the SAME level): the residual key / table header stays visible whatever a same-level decode makes of its framing
+    $ddBsA2 = [string][char]92
+    foreach ($ddD in @('0020', '0009', '000A', '0022', '0027', '003A', '003D', '002C', '005D')) {
+        foreach ($ddX in @(($ddBsA2 + $ddBsA2), $ddBsA2)) {
+            $ddR2["r6 adv p13 A2 key: residual after '$ddX', then \u$ddD"] = ('{"ab' + $ddX + 'U0011FFFF' + $ddBsA2 + 'u' + $ddD + 'cd":"hunter2"}')
+            $ddR2["r6 adv p13 A2 header: residual after '$ddX', then \u$ddD"] = ('["ab' + $ddX + 'U0011FFFF' + $ddBsA2 + 'u' + $ddD + 'cd"]' + "`n" + 'x="hunter2"')
+        }
+    }
+    # r6 adversary pass 14 A1 (defect class: the residual view was gated on an introducer already standing in the raw text): an escaped backslash that EXPOSES the residual, with a
+    # same-level decode of a line break, tab, CR, form feed, blank or YAML line separator that ends the residual key's name run
+    foreach ($ddX in @('n', 't', 'r', 'f', ' ', 'L', 'P', 'v')) {
+        $ddR2["r6 adv p14 A1 key: exposed residual then \$ddX"] = ('{"ab' + $ddBsA2 + $ddBsA2 + 'U0011FFFF' + $ddBsA2 + $ddX + 'cd":"hunter2"}')
+        $ddR2["r6 adv p14 A1 header: exposed residual then \$ddX"] = ('["ab' + $ddBsA2 + $ddBsA2 + 'U0011FFFF' + $ddBsA2 + $ddX + 'cd"]' + "`n" + 'x="hunter2"')
+    }
+    # r6 adversary pass 14 A2 (defect class: decode order between two readers on ONE level): the outer reader's quote escape and the inner reader's character reference or entity together
+    $ddBqA2 = [string][char]0x60
+    $ddR2['r6 adv p14 A2 a JSON \" and an XML &#34; on one level'] = ('{"xml":"<add key=' + $ddBsA2 + '"p a s s&#119;o r d' + $ddBsA2 + '" value=' + $ddBsA2 + '"hunt&#34;er2' + $ddBsA2 + '" />"}')
+    $ddR2['r6 adv p14 A2 sibling: a backtick-quote and an XML &#34;'] = ('$xml = "<add key=' + $ddBqA2 + '"password' + $ddBqA2 + '" value=' + $ddBqA2 + '"hunt&#34;er2' + $ddBqA2 + '" />"')
+    $ddR2['r6 adv p14 A2 sibling: a YAML \" and an XML &quot;'] = ('xml: "<add key=' + $ddBsA2 + '"password' + $ddBsA2 + '" value=' + $ddBsA2 + '"hunt&quot;er2' + $ddBsA2 + '" />"')
+    $ddR2['r6 adv p14 A2 sibling: a JSON " and an XML &#x22;'] = ('{"xml":"<add key=' + $ddBsA2 + 'u0022password' + $ddBsA2 + 'u0022 value=' + $ddBsA2 + 'u0022hunt&#x22;er2' + $ddBsA2 + 'u0022 />"}')
+    # r7 (sol r6 A1 + adversary pass 15 A1, defect class: an alternative reading judged ONE step and then discarded): the XML pair is intact only after SEVERAL outer reads, and the inner
+    # reader's quote reference is safe to decode only after them. The reviewer's literal input (JSON inside JSON), then the same with three and four outer reads and every quote spelling.
+    $ddJ = '{"payload":"{' + $ddBsA2 + '"xml' + $ddBsA2 + '":' + $ddBsA2 + '"<add key=' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '"p a s s w o r d' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '" value=' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '"hunt&#34;er2' + $ddBsA2 + $ddBsA2 + $ddBsA2 + '" />' + $ddBsA2 + '"}"}'
+    $ddR2['r7 sol r6 A1 the reviewer input: JSON in JSON, an XML pair and &#34; in the value'] = $ddJ
+    $ddR7Gen = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddEnt in @('&#34;', '&quot;', '&#x22;', '&#x0022;')) {
+        foreach ($ddAttr in @('key', 'name')) {
+            $ddBase = '<add ' + $ddAttr + '="p a s s w o r d" value="hunt' + $ddEnt + 'er2" />'
+            $ddCur = $ddBase
+            for ($ddDepth = 1; $ddDepth -le 4; $ddDepth++) {
+                $ddCur = '{"payload":"' + $ddCur.Replace($ddBsA2, ($ddBsA2 + $ddBsA2)).Replace('"', ($ddBsA2 + '"')) + '"}'
+                $ddR7Gen.Add($ddCur)
+            }
+        }
+    }
+    $ddR7Miss = [System.Collections.Generic.List[string]]::new(); $ddR7RoleMiss = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddT in $ddR7Gen) {
+        if (-not (Test-CredentialText $ddT)) { $ddR7Miss.Add($ddT) }
+        if ((Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r7 A1 role guard') -and -not (Test-CredentialNamePresent $ddT)) { $ddR7RoleMiss.Add($ddT) }
+    }
+    Assert-That ($ddR7Miss.Count -eq 0 -and $ddR7Gen.Count -eq 32) "DENY-BY-DEFAULT-1 r7 sol r6 A1 generated sweep: all $($ddR7Gen.Count) nested-JSON XML pairs (1-4 outer reads, 4 quote spellings, 2 naming attributes) refuse" ("misses=$($ddR7Miss.Count): " + (($ddR7Miss | Select-Object -First 3) -join '; '))
+    Assert-That ($ddR7RoleMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r7 sol r6 A1 generated sweep, role guard: all $($ddR7Gen.Count) name a secret" ("misses=$($ddR7RoleMiss.Count): " + (($ddR7RoleMiss | Select-Object -First 3) -join '; '))
+    foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r7 A1 role guard') { Assert-That (Test-CredentialNamePresent $ddJ) 'DENY-BY-DEFAULT-1 r7 sol r6 A1 role guard: the reviewer input names a secret' $ddJ }
+    # r8 (adversary pass 16 A1, defect class: an alternative reading judged one step and then discarded; the readers were split two ways, outer and inner, not by reader): a PowerShell string whose
+    # backtick-quotes frame an intact XML pair and whose value holds a BACKSLASH quote spelling. The PowerShell reader alone leaves the pair intact; decoding the backslash form on the same level
+    # puts a quote inside the value and ends the pair. The literal reviewer input first, then every spelling x both naming attributes x with and without a markup reference, then the mirror
+    # (the backslash reader frames the pair, a PowerShell `u{22} sits in the value).
+    $ddR8Gen = [System.Collections.Generic.List[string]]::new()
+    $ddR8Gen.Add('$xml = "<add key=' + $ddBqA2 + '"p a s s w o r d' + $ddBqA2 + '" value=' + $ddBqA2 + '"hunt' + $ddBsA2 + 'u0022er2' + $ddBqA2 + '" />"')
+    foreach ($ddEsc in @('u0022', 'x22', 'U00000022')) {
+        foreach ($ddAttr in @('key', 'name')) {
+            foreach ($ddTail in @('', '&#34;x')) {
+                $ddR8Gen.Add('$xml = "<add ' + $ddAttr + '=' + $ddBqA2 + '"password' + $ddBqA2 + '" value=' + $ddBqA2 + '"hunt' + $ddBsA2 + $ddEsc + 'er2' + $ddTail + $ddBqA2 + '" />"')
+            }
+        }
+    }
+    foreach ($ddPsq in @('u{22}', 'u{0022}')) { $ddR8Gen.Add('{"x":"<add key=' + $ddBsA2 + '"p a s s w o r d' + $ddBsA2 + '" value=' + $ddBsA2 + '"hunt' + $ddBqA2 + $ddPsq + 'er2' + $ddBsA2 + '" />"}') }
+    $ddR8Miss = @($ddR8Gen | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR8Miss.Count -eq 0 -and $ddR8Gen.Count -eq 15) "DENY-BY-DEFAULT-1 r8 adv p16 A1: all $($ddR8Gen.Count) readings of a PowerShell-framed or JSON-framed XML pair with a second reader's quote in the value refuse" ("misses=$($ddR8Miss.Count): " + (($ddR8Miss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r8 A1 role guard') {
+        $ddR8RoleMiss = @($ddR8Gen | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR8RoleMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r8 adv p16 A1 role guard: all $($ddR8Gen.Count) name a secret" ("misses=$($ddR8RoleMiss.Count): " + (($ddR8RoleMiss | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText ('$xml = "<add key=' + $ddBqA2 + '"theme' + $ddBqA2 + '" value=' + $ddBqA2 + '"a' + $ddBsA2 + 'u0022b' + $ddBqA2 + '" />"'))) 'DENY-BY-DEFAULT-1 r8 must-pass: a PowerShell-framed pair with a backslash quote in a plain value is not a credential'
+    Assert-That (-not (Test-CredentialText ('{"x":"<add key=' + $ddBsA2 + '"theme' + $ddBsA2 + '" value=' + $ddBsA2 + '"a' + $ddBqA2 + 'u{22}b' + $ddBsA2 + '" />"}'))) 'DENY-BY-DEFAULT-1 r8 must-pass: a JSON-framed pair with a PowerShell quote in a plain value is not a credential'
+    # r8 (adversary pass 17 A1, defect class: an escape a reader decodes that the normaliser left as written): Python, JavaScript and C decode an escaped apostrophe '\'' and C decodes '\?'.
+    # A Python source line that frames an XML pair with escaped apostrophes holds the pair only after that decode.
+    $ddR8Ap = [System.Collections.Generic.List[string]]::new()
+    $ddR8Ap.Add('xml = ' + "'" + '<add key=' + $ddBsA2 + "'" + 'p a s s w o r d' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter2' + $ddBsA2 + "'" + ' />' + "'")
+    $ddR8Ap.Add('xml = ' + "'" + '<add name=' + $ddBsA2 + "'" + 'password' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter2' + $ddBsA2 + "'" + ' />' + "'")
+    $ddR8Ap.Add('{"x":"<add key=' + $ddBsA2 + "'" + 'password' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter2' + $ddBsA2 + "'" + ' />"}')
+    $ddR8Ap.Add('xml = ' + "'" + '<add key=' + $ddBsA2 + "'" + 'password' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter' + $ddBsA2 + '?2' + $ddBsA2 + "'" + ' />' + "'")
+    $ddR8ApMiss = @($ddR8Ap | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR8ApMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r8 adv p17 A1: all $($ddR8Ap.Count) escaped-apostrophe or escaped-question-mark spellings of an XML naming pair refuse" ("misses=$($ddR8ApMiss.Count): " + (($ddR8ApMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r8 A1 apostrophe role guard') {
+        $ddR8ApRole = @($ddR8Ap | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR8ApRole.Count -eq 0) "DENY-BY-DEFAULT-1 r8 adv p17 A1 role guard: all $($ddR8Ap.Count) name a secret" ("misses=$($ddR8ApRole.Count): " + (($ddR8ApRole | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText ('xml = ' + "'" + '<add key=' + $ddBsA2 + "'" + 'theme' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'dark' + $ddBsA2 + "'" + ' />' + "'"))) 'DENY-BY-DEFAULT-1 r8 must-pass: an escaped-apostrophe pair that names no secret is not a credential'
+    # r9 (sol r8 B1, defect class: an escape a reader decodes that the normaliser left as written): JavaScript (and Python, C) read a backslash before ANY punctuation character as
+    # that character, so 'key\=' is 'key=' and the pair below is intact after the reader. Every structural character of a start tag, and every naming attribute, is swept.
+    $ddR9Pair = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR9Attr in @('key', 'name', 'id', 'property', 'variable', 'setting', 'param', 'parameter', 'field')) {
+        $ddR9Pair.Add('const xml = "<add ' + $ddR9Attr + $ddBsA2 + "='p a s s w o r d' value='hunter2' />" + '";')
+        $ddR9Pair.Add('const xml = "<add ' + $ddR9Attr + $ddBsA2 + "='password' value='hunter2' />" + '";')
+    }
+    $ddR9Pair.Add('const xml = "<add key' + $ddBsA2 + '=' + $ddBsA2 + "'password" + $ddBsA2 + "' value" + $ddBsA2 + '=' + $ddBsA2 + "'hunter2" + $ddBsA2 + "' /" + $ddBsA2 + '>";')
+    $ddR9Pair.Add('const xml = "<add key=' + "'password' value='hunter2' /" + $ddBsA2 + '>";')
+    $ddR9Pair.Add('const xml = "' + $ddBsA2 + '<add key' + $ddBsA2 + "='password' value" + $ddBsA2 + "='hunter2' /" + $ddBsA2 + '>";')
+    $ddR9Pair.Add('{"x":"<add key' + $ddBsA2 + "='password' value='hunter2' />" + '"}')
+    # the identity escape of a LETTER inside the attribute name ('k\ey' is 'key' to a JavaScript reader)
+    foreach ($ddR9L in @(('k' + $ddBsA2 + 'ey'), ('na' + $ddBsA2 + 'me'), ('i' + $ddBsA2 + 'd'), ('pro' + $ddBsA2 + 'perty'), ('fi' + $ddBsA2 + 'eld'))) { $ddR9Pair.Add('const xml = "<add ' + $ddR9L + "='password' value='hunter2' />" + '";') }
+    $ddR9PairMiss = @($ddR9Pair | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9PairMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B1: all $($ddR9Pair.Count) identity-escaped XML naming-pair spellings refuse" ("misses=$($ddR9PairMiss.Count): " + (($ddR9PairMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 B1 role guard') {
+        $ddR9PairRole = @($ddR9Pair | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR9PairRole.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B1 role guard: all $($ddR9Pair.Count) name a secret" ("misses=$($ddR9PairRole.Count): " + (($ddR9PairRole | Select-Object -First 3) -join '; '))
+    }
+    # the identity escape of every ASCII punctuation character a start tag, a key line or a table is built from decodes to that character
+    $ddR9PunctChars = [char[]]'=:;,.!#$%&()*+-<>@[]^{|}~'
+    $ddR9PunctMiss = @($ddR9PunctChars | Where-Object { (ConvertFrom-CredentialEscapes ('a' + $ddBsA2 + [string]$_ + 'b')) -cne ('a' + [string]$_ + 'b') })
+    Assert-That ($ddR9PunctMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B1 sibling: all $($ddR9PunctChars.Count) identity-escaped punctuation characters decode to themselves" ("misses=" + ($ddR9PunctMiss -join ' '))
+    foreach ($ddOkR9 in @(('const xml = "<add key' + $ddBsA2 + "='theme' value='dark' />" + '";'), ('{"path": "C:' + $ddBsA2 + 'Users' + $ddBsA2 + 'me' + $ddBsA2 + '.config' + $ddBsA2 + 'app", "theme": "dark"}'), ('const re = /a' + $ddBsA2 + '.b' + $ddBsA2 + '-c' + $ddBsA2 + '(d' + $ddBsA2 + ')/;'))) {
+        Assert-That (-not (Test-CredentialText $ddOkR9)) "DENY-BY-DEFAULT-1 r9 must-pass: $ddOkR9 is not a credential" $ddOkR9
+    }
+    # r9 (sol r8 B2, defect class: a candidate list narrower than the classifier): a decoded key can end in a character the candidate name run does not hold ('passwordU+00E9', 'password!'),
+    # which Get-CredentialKeyClass still calls strong (it only looks for the word). The candidate run accepts every character that does not end a key.
+    $ddR9Sfx = @(0xE9, 0x21, 0x24, 0x40, 0x23, 0x4E2D, 0xF1)
+    $ddR9Names = @('password', 'passwd', 'secret', 'credential', 'api_key', 'private_key', 'access_key', 'token', 'client_secret', 'db.password')
+    $ddR9Key = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR9N in $ddR9Names) {
+        foreach ($ddR9S in $ddR9Sfx) {
+            $ddR9Head = $ddBsA2 + ('u{0:x4}' -f [int][char]$ddR9N[0]) + $ddR9N.Substring(1)
+            $ddR9Tail = $ddBsA2 + ('u{0:x4}' -f $ddR9S)
+            $ddR9Key.Add('{"' + $ddR9Head + $ddR9Tail + '":"hunter2"}')
+            $ddR9Key.Add('"' + $ddR9Head + $ddR9Tail + '": hunter2')
+            $ddR9Key.Add('"' + $ddR9Head + $ddR9Tail + '" = "hunter2"')
+        }
+    }
+    foreach ($ddR9N in @('{"pass' + $ddBsA2 + 'u0077ord' + $ddBsA2 + 'u00e9":"hunter2"}', '{"api' + $ddBsA2 + 'u005fkey' + $ddBsA2 + 'u00e9":"hunter2"}', '{"to' + $ddBsA2 + 'u006ben' + $ddBsA2 + 'u00e9":"hunter2"}', '{"password!":"hunter2"}', '{"password' + [string][char]0xE9 + '":"hunter2"}')) { $ddR9Key.Add($ddR9N) }
+    $ddR9KeyMiss = @($ddR9Key | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9KeyMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B2: all $($ddR9Key.Count) escaped secret keys with a decoded non-name suffix refuse" ("misses=$($ddR9KeyMiss.Count): " + (($ddR9KeyMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 B2 role guard') {
+        $ddR9KeyRole = @($ddR9Key | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR9KeyRole.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B2 role guard: all $($ddR9Key.Count) name a secret" ("misses=$($ddR9KeyRole.Count): " + (($ddR9KeyRole | Select-Object -First 3) -join '; '))
+    }
+    foreach ($ddOkR9b in @(('{"theme' + $ddBsA2 + 'u00e9":"dark"}'), ('{"caf' + $ddBsA2 + 'u00e9' + $ddBsA2 + 'u0021":"x"}'), ('{"author' + $ddBsA2 + 'u00e9":"x"}'), ('{"password' + $ddBsA2 + 'u00e9":""}'))) {
+        if ($ddOkR9b -match 'password') { Assert-That (-not (Test-CredentialText $ddOkR9b)) "DENY-BY-DEFAULT-1 r9 must-pass: an empty literal value stays exempt under an escaped secret key with a suffix: $ddOkR9b" $ddOkR9b }
+        else { Assert-That (-not (Test-CredentialText $ddOkR9b)) "DENY-BY-DEFAULT-1 r9 must-pass: $ddOkR9b is not a credential" $ddOkR9b }
+    }
+    # r9 sibling sweep: the same two classes in the other record forms (a JSON key with an escaped colon, an escaped table header, an escaped question-mark suffix, an unquoted YAML key)
+    $ddR9Sib = @(
+        ('{"password"' + $ddBsA2 + ':"hunter2"}'),
+        ($ddBsA2 + '[password' + $ddBsA2 + ']' + "`n" + 'value = "hunter2"'),
+        ('{"pass' + $ddBsA2 + 'u0077ord' + $ddBsA2 + 'u003f":"hunter2"}'),
+        ('pass' + $ddBsA2 + 'u0077ord' + $ddBsA2 + 'u00e9: hunter2'),
+        ('const x = "' + $ddBsA2 + '<password' + $ddBsA2 + '>hunter2' + $ddBsA2 + '</password' + $ddBsA2 + '>";')
+    )
+    $ddR9SibMiss = @($ddR9Sib | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9SibMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sibling sweep: all $($ddR9Sib.Count) other record forms refuse" ("misses=$($ddR9SibMiss.Count): " + (($ddR9SibMiss | Select-Object -First 3) -join '; '))
+    # r9 (adversary pass 18 A1, defect class: an alternative reading judged without the residual-view check): a text with BOTH an outer-reader escape and a markup reference is also walked
+    # as its markup-only reading ('&#58;' decoded, the backslash forms left), and that reading's residual view ('\\U0011FFFF' exposed, '\n' neutralised) was never judged.
+    $ddR9Rv = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR9Frame in @(
+            @{ Gap = ($ddBsA2 + 'n'); Name = 'a decoded line break' }, @{ Gap = ($ddBsA2 + 'u0020'); Name = 'a decoded blank' }, @{ Gap = ($ddBsA2 + 't'); Name = 'a decoded tab' })) {
+        $ddR9RvKey = 'ab' + $ddBsA2 + $ddBsA2 + 'U0011FFFF' + $ddR9Frame.Gap + 'cd'
+        $ddR9Rv.Add('{"' + $ddR9RvKey + '"&#58;"x"}')
+        $ddR9Rv.Add('{"' + $ddR9RvKey + '"&#x3a;"x"}')
+        $ddR9Rv.Add('&#91;"' + $ddR9RvKey + '"&#93;' + "`n" + 'x="hunter2"')
+        $ddR9Rv.Add($ddR9RvKey + '&#61;x')
+    }
+    $ddR9RvMiss = @($ddR9Rv | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9RvMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 adv p18 A1: all $($ddR9Rv.Count) markup-only readings that expose an undecodable escape refuse" ("misses=$($ddR9RvMiss.Count): " + (($ddR9RvMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 A1 role guard') {
+        $ddR9RvRole = @($ddR9Rv | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR9RvRole.Count -eq 0) "DENY-BY-DEFAULT-1 r9 adv p18 A1 role guard: all $($ddR9Rv.Count) name a secret" ("misses=$($ddR9RvRole.Count): " + (($ddR9RvRole | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText ('{"ab' + $ddBsA2 + 'ncd"&#58;"x"}'))) 'DENY-BY-DEFAULT-1 r9 adv p18 A1 must-pass: a decodable key with a markup reference is not a credential'
+    # r10 (adversary pass 19 A1, defect class: a wider key candidate swallows a narrower one): the r9 B2 candidate takes any non-ending character after the name, so a rejected leftmost
+    # candidate ('//author.example/?pwd') hid the real key inside it; the rejected candidate is judged again part by part
+    $ddR10Url = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR10Host in @('https://author.example/', 'https://author.example/a/b', 'http://authority.test:8080/x', 'https://secretary.example/', 'see /author/x/')) {
+        foreach ($ddR10Name in @('pwd', 'auth', 'authorization', 'password', 'token', 'api_key')) { $ddR10Url.Add($ddR10Host + '?' + $ddR10Name + '=hunter2') }
+    }
+    $ddR10Url.Add('https://author.example/?x=1&pwd=hunter2')
+    $ddR10Url.Add('https://author.example/?pwd!=hunter2')
+    $ddR10UrlMiss = @($ddR10Url | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR10UrlMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r10 adv p19 A1: all $($ddR10Url.Count) urls with a secret-named query key beside a rejected name word refuse" ("misses=$($ddR10UrlMiss.Count): " + (($ddR10UrlMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 A1 role guard') {
+        $ddR10UrlRole = @($ddR10Url | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR10UrlRole.Count -eq 0) "DENY-BY-DEFAULT-1 r10 adv p19 A1 role guard: all $($ddR10Url.Count) name a secret" ("misses=$($ddR10UrlRole.Count): " + (($ddR10UrlRole | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText 'https://author.example/?name=x')) 'DENY-BY-DEFAULT-1 r10 adv p19 A1 must-pass: a url whose only name words are not secret-named is not a credential'
+    # r8 (adversary pass 17 A2, defect class: the reported line counted a line break that a decode produced): the line is the line of the SOURCE, not of the decoded copy
+    $ddR8Line = @(
+        @{ T = ('{"note":"' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded \n before the key on one source line' },
+        @{ T = ('{"note":"' + $ddBsA2 + 'u2028","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded U+2028' },
+        @{ T = ('{"note":"a&#10;b","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded &#10;' },
+        @{ T = ('{"note":"' + $ddBsA2 + 'n' + $ddBsA2 + 'n' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'three decoded line breaks' },
+        @{ T = ('{"note":"' + $ddBsA2 + 'n"}' + "`n" + '{"' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 2; N = 'a decoded \n on line 1, the key on source line 2' },
+        @{ T = ("x`n`n" + '{"note":"' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 3; N = 'two real line breaks then a decoded one' }
+    )
+    foreach ($ddRl in $ddR8Line) { $ddGot = Get-CredentialHitLine $ddRl.T; Assert-That ($ddGot -eq $ddRl.Want) "DENY-BY-DEFAULT-1 r8 adv p17 A2 source line: $($ddRl.N) reports line $($ddRl.Want)" "got=$ddGot text=$($ddRl.T)" }
+    # r7 must-pass: nested JSON with an entity and no credential is not refused, nor is a nested note with a plain quote reference
+    foreach ($ddOkR7 in @(('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"a &amp; b' + $ddBsA2 + '"}"}'), ('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"say &#34;hi&#34;' + $ddBsA2 + '"}"}'), ('{"payload":"<add key=' + $ddBsA2 + '"theme' + $ddBsA2 + '" value=' + $ddBsA2 + '"dark&#34;x' + $ddBsA2 + '" />"}'))) {
+        Assert-That (-not (Test-CredentialText $ddOkR7)) "DENY-BY-DEFAULT-1 r7 must-pass: $ddOkR7 is not a credential" $ddOkR7
+    }
+    # r6 must-pass: the decode of a backtick before any character and of a doubled quote never turns an empty literal, a plain value or a Markdown code span into a credential
+    foreach ($ddOkR6 in @('<add key="password" value="" />', '<add key="password" value=""/>', "<add key='password' value=''/>", "password: ''", 'password: ""', '{"a":"","b":"x"}', '$msg = ''it''''s a plain note''', '$msg = "say ""hi"" to the team"', ('a ' + $ddBq + '/ path note: plain'), ('the ' + $ddBq + 'theme' + $ddBq + ' setting'))) {
+        Assert-That (-not (Test-CredentialText $ddOkR6)) "DENY-BY-DEFAULT-1 r6 must-pass: $ddOkR6 is not a credential" $ddOkR6
+    }
+    Assert-That (-not (Test-CredentialText ('{"caf' + [string][char]92 + 'u00e9": "x", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r6 must-pass: a decodable accent escape in a key is not a credential (the residual view does not refuse it)'
+    $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
+    foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
+        foreach ($esc in @('w', '\x77', '&#119;', '&#x77;', '\167', '%77', ('`u{77}'), '&amp;#119;', '\U0011FFFF', '&w;', ('&' + $ddE + ';'))) {
+            foreach ($wrap in @('json', 'xml')) {
+                $t = $(if ($wrap -eq 'json') { '{"' + $pre + 'pass' + $esc + 'ord":"hunter2"}' } else { '<add key="' + $pre + 'pass' + $esc + 'ord" value="hunter2" />' })
+                $ddR2N++
+                if (-not (Test-CredentialText $t)) { $ddR2Miss.Add($t) }
+            }
+        }
+    }
+    Assert-That ($ddR2Miss.Count -eq 0 -and $ddR2N -ge 170) "DENY-BY-DEFAULT-1 r2 generated sweep: all $ddR2N escaped keys after a predecessor character refuse" ("misses=$($ddR2Miss.Count): " + (($ddR2Miss | Select-Object -First 8) -join '; '))
+    $ddA6 = "machine h login u password hunter2`n{`"password`":`"hunter3`"}"
+    Assert-That ((Get-CredentialHitLine $ddA6) -eq 1) 'DENY-BY-DEFAULT-1 r2 advisory A6: the report names the netrc line (line 1), not the later key' "line=$(Get-CredentialHitLine $ddA6)"
+    foreach ($ok in @('{"note": "a &amp; b"}', '<add key="Theme" value="a &amp; b" />', '{"name": "caf&#233;"}')) { Assert-That (-not (Test-CredentialText $ok)) "DENY-BY-DEFAULT-1 r2 must-pass: $ok is not a credential" $ok }
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r1 adversary role guard') {
+        Assert-That (Test-CredentialNamePresent '{"api%2Fkey": ""}') 'DENY-BY-DEFAULT-1 r1 adversary A3 role guard: a percent-encoded slash spelling names a secret'
+        Assert-That (Test-CredentialNamePresent "[`"pass\U0011FFFFord`"]`nvalue=`"`"") 'DENY-BY-DEFAULT-1 r1 adversary A7 role guard: a table header with an undecodable escape names a secret'
+        # r2 pass 4 A4: a residual XML naming attribute names a secret whatever its value (an empty one included), also inside a config.toml string
+        Assert-That (Test-CredentialNamePresent "<add key='pass&w;ord' value='' />") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: a residual XML naming attribute with an empty value names a secret'
+        Assert-That (Test-CredentialNamePresent "xml = `"<add key='pass&w;ord' value='' />`"") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: the same inside a config.toml string'
+        Assert-That (Test-CredentialNamePresent "xml = `"<add key='p a s s w o r d' value='' />`"") 'DENY-BY-DEFAULT-1 r2 adversary p6 A3 role guard: a spaced XML naming attribute with no escape names a secret'
+        # r3 pass 7 A2: the role guard judges every decode level, not only the fixed point (hosts.yml '"\x61uth\x5cu0068eader": ""' is one decode away from a strong 'auth' name, two from the plain word 'authheader')
+        Assert-That (Test-CredentialNamePresent '"\x61uth\x5cu0068eader": ""') 'DENY-BY-DEFAULT-1 r3 adversary p7 A2 role guard: a key whose first decode level names a secret (empty value)'
+        Assert-That (Test-CredentialNamePresent '<add key="&#97;uth&#92;u0068eader" value="" />') 'DENY-BY-DEFAULT-1 r3 adversary p7 A2 role guard: the same as an XML naming attribute with an empty value'
+        # r4 (sol r3 A1): the raw spelling of a naming value that also decodes still names a secret (spaced, so the word scan alone misses it)
+        $ddU2 = [string][char]92 + 'u0068'
+        Assert-That (Test-CredentialNamePresent ('<add key="a u t h' + $ddU2 + 'eader" value="" />')) 'DENY-BY-DEFAULT-1 r4 A1 role guard: a raw strong spaced XML naming value that decodes names a secret'
+        Assert-That (Test-CredentialNamePresent ("xml = `"<add key='a u t h" + $ddU2 + "eader' value='' />`"")) 'DENY-BY-DEFAULT-1 r4 A1 role guard: the same inside a config.toml string'
+        Assert-That (-not (Test-CredentialNamePresent ('<add key="t h' + $ddU2 + 'eme" value="" />'))) 'DENY-BY-DEFAULT-1 r4 A1 role guard must-pass: a raw benign naming value that decodes names nothing'
+        # r4 adversary pass 9 A1: an XML naming attribute that exists only once the text is decoded (config.toml with an escaped '<' and '>') names a secret too
+        $ddLt = [string][char]92 + 'u003C'; $ddGt = [string][char]92 + 'u003E'
+        Assert-That (Test-CredentialNamePresent ("xml = `"" + $ddLt + "add key='p a s s w o r d' value='' /" + $ddGt + "`"")) 'DENY-BY-DEFAULT-1 r4 pass 9 A1 role guard: a spaced XML naming value that appears only after decoding names a secret'
+        $ddBs2 = [string][char]92
+        Assert-That (Test-CredentialNamePresent ('{"pass' + $ddBs2 + $ddBs2 + 'U0011FFFFord":""}')) 'DENY-BY-DEFAULT-1 r4 pass 10 A1 role guard: an escaped backslash before an undecodable escape names a secret'
+        Assert-That (Test-CredentialNamePresent ('{"xml":"<add key=''pass' + $ddBs2 + 'nword'' value='''' />"}')) 'DENY-BY-DEFAULT-1 r4 pass 10 A2 role guard: an escaped line break inside an XML naming value names a secret'
+        # r5 (sol r4 A1, defect class: a check that runs on the fixed point only): an intermediate residual key or table header that a deeper decode destroys keeps the role verdict true.
+        # The generated sweep puts every framing-destroying decode (a blank, a tab, a line break, a double and a single quote, a colon, an equals sign) after the residual.
+        $ddA1Miss = [System.Collections.Generic.List[string]]::new(); $ddA1N = 0
+        foreach ($ddD in @('0020', '0009', '000A', '0022', '0027', '003A', '003D', '002C', '005D')) {
+            $ddA1Keys = @(('{"ab' + $ddBs2 + $ddBs2 + 'U0011FFFF' + $ddBs2 + $ddBs2 + 'u' + $ddD + 'cd":""}'), ('["ab' + $ddBs2 + $ddBs2 + 'U0011FFFF' + $ddBs2 + $ddBs2 + 'u' + $ddD + 'cd"]' + "`n" + 'x=""'), ('<add key=''ab' + $ddBs2 + $ddBs2 + 'U0011FFFF' + $ddBs2 + $ddBs2 + 'u' + $ddD + 'cd'' value='''' />'))
+            foreach ($ddT in $ddA1Keys) { $ddA1N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA1Miss.Add($ddT) } }
+        }
+        Assert-That ($ddA1Miss.Count -eq 0 -and $ddA1N -eq 27) "DENY-BY-DEFAULT-1 r5 sol r4 A1 role guard: all $ddA1N intermediate residual keys and headers keep a true verdict" ("misses=$($ddA1Miss.Count): " + (($ddA1Miss | Select-Object -First 4) -join '; '))
+        # r5 (sol r4 A2): the YAML whitespace and control escapes in an XML naming value name a secret whatever the value (an empty one included)
+        $ddA2Miss = [System.Collections.Generic.List[string]]::new(); $ddA2N = 0
+        foreach ($ddL in @('L', 'P', 'v', 'e', 'a', '_', ' ')) {
+            foreach ($ddT in @(('xml: "<add key=''pass' + $ddBs2 + $ddL + 'word'' value='''' />"'), ('xml: "<entry key=''pass' + $ddBs2 + $ddL + 'word''></entry>"'), ('{"xml":"<add name=''pass' + $ddBs2 + $ddL + 'word'' value='''' />"}'))) {
+                $ddA2N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA2Miss.Add($ddT) }
+            }
+        }
+        Assert-That ($ddA2Miss.Count -eq 0 -and $ddA2N -eq 21) "DENY-BY-DEFAULT-1 r5 sol r4 A2 role guard: all $ddA2N YAML-escape XML naming values name a secret" ("misses=$($ddA2Miss.Count): " + (($ddA2Miss | Select-Object -First 4) -join '; '))
+        # r5 adversary pass 12 A1: the PowerShell backtick forms in an XML naming value or around its quotes name a secret whatever the value
+        $ddBq2 = [string][char]0x60
+        $ddA3Miss = [System.Collections.Generic.List[string]]::new(); $ddA3N = 0
+        foreach ($ddL in @('n', 't', 'r', 'v', 'e', 'a', 'b', 'f')) {
+            $ddA3N++; $ddT = ('$xml = "<add key=''pass' + $ddBq2 + $ddL + 'word'' value='''' />"'); if (-not (Test-CredentialNamePresent $ddT)) { $ddA3Miss.Add($ddT) }
+        }
+        $ddA3N++; $ddT = ('$xml = "<add key=' + $ddBq2 + '"password' + $ddBq2 + '" value=' + $ddBq2 + '"' + $ddBq2 + '" />"'); if (-not (Test-CredentialNamePresent $ddT)) { $ddA3Miss.Add($ddT) }
+        Assert-That ($ddA3Miss.Count -eq 0 -and $ddA3N -eq 9) "DENY-BY-DEFAULT-1 r5 adv p12 A1 role guard: all $ddA3N PowerShell backtick forms in an XML naming value name a secret" ("misses=$($ddA3Miss.Count): " + (($ddA3Miss | Select-Object -First 4) -join '; '))
+        # r6 (sol r5 A1-A2, opus r5 B1): the backtick before punctuation, a blank, a tab or a line break, and the doubled quote, name a secret in the role guard too (an empty value included)
+        $ddA4Miss = [System.Collections.Generic.List[string]]::new(); $ddA4N = 0
+        # a blank, tab or line break is dropped from an XML naming value only, so those three are checked in the XML form; '/' and '\' separate a key's parts in every form
+        foreach ($ddCh in @('/', '\', ' ', [string][char]9, "`n")) {
+            $ddForms = @(('$xml = "<add key=''pass' + $ddBq2 + $ddCh + 'word'' value='''' />"'))
+            if ($ddCh -eq '/' -or $ddCh -eq '\') { $ddForms += ('$cfg = @{ "pass' + $ddBq2 + $ddCh + 'word" = '''' }') }
+            foreach ($ddT in $ddForms) { $ddA4N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA4Miss.Add($ddT) } }
+        }
+        foreach ($ddT in @('$xml = ''<add key=''''password'''' value='''''''' />''', '$xml = "<add key=""password"" value="""" />"', '$xml = ''<entry key=''''password''''></entry>''')) {
+            $ddA4N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA4Miss.Add($ddT) }
+        }
+        Assert-That ($ddA4Miss.Count -eq 0 -and $ddA4N -eq 10) "DENY-BY-DEFAULT-1 r6 sol r5 A1-A2 role guard: all $ddA4N backtick-punctuation and doubled-quote forms name a secret" ("misses=$($ddA4Miss.Count): " + (($ddA4Miss | Select-Object -First 6) -join '; '))
+        Assert-That (-not (Test-CredentialNamePresent '{"theme": "dark", "note": "say ""hi"" and it''''s fine"}')) 'DENY-BY-DEFAULT-1 r6 role guard must-pass: doubled quotes in a plain note name no secret'
+        # r6 adversary pass 13 A1-A2: a char-ref in a doubled-quote string, and a residual escape whose framing a same-level decode destroys, name a secret in the role guard too
+        $ddA5Miss = [System.Collections.Generic.List[string]]::new(); $ddA5N = 0
+        $ddBsR = [string][char]92
+        foreach ($ddT in @(('xml: ''<add key=''''p a s s&#119;o r d'''' value=''''hunt&#39;er2'''' />'''), ('$xml = "<add key=""pass&#119;ord"" value="""" />"'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+        foreach ($ddD in @('0020', '0009', '000A', '0022', '0027', '003A', '003D', '002C', '005D')) {
+            foreach ($ddX in @(($ddBsR + $ddBsR), $ddBsR)) {
+                foreach ($ddT in @(('{"ab' + $ddX + 'U0011FFFF' + $ddBsR + 'u' + $ddD + 'cd":""}'), ('["ab' + $ddX + 'U0011FFFF' + $ddBsR + 'u' + $ddD + 'cd"]' + "`n" + 'x=""'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+            }
+        }
+        foreach ($ddX in @('n', 't', 'r', 'f', ' ', 'L', 'P', 'v')) {
+            foreach ($ddT in @(('{"ab' + $ddBsR + $ddBsR + 'U0011FFFF' + $ddBsR + $ddX + 'cd":""}'), ('["ab' + $ddBsR + $ddBsR + 'U0011FFFF' + $ddBsR + $ddX + 'cd"]' + "`n" + 'x=""'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+        }
+        foreach ($ddT in @(('{"xml":"<add key=' + $ddBsR + '"p a s s&#119;o r d' + $ddBsR + '" value=' + $ddBsR + '"hunt&#34;er2' + $ddBsR + '" />"}'), ('$xml = "<add key=' + [string][char]0x60 + '"password' + [string][char]0x60 + '" value=' + [string][char]0x60 + '"hunt&#34;er2' + [string][char]0x60 + '" />"'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+        Assert-That ($ddA5Miss.Count -eq 0 -and $ddA5N -eq 56) "DENY-BY-DEFAULT-1 r6 adv p13 A1-A2 role guard: all $ddA5N forms name a secret" ("misses=$($ddA5Miss.Count): " + (($ddA5Miss | Select-Object -First 4) -join '; '))
+        Assert-That (-not (Test-CredentialNamePresent ('{"caf' + $ddBsR + 'u00e9": "x", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r6 role guard must-pass: a decodable accent escape in a key names no secret (the residual view does not refuse it)'
+        # must-pass: the new escapes do not make a plain Windows path in a settings file name a secret
+        Assert-That (-not (Test-CredentialNamePresent ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 role guard must-pass: a JSON Windows path with \P \L \a \e \v \_ sequences names no secret'
+        Assert-That (-not (Test-CredentialText ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 must-pass: a JSON Windows path with \P \L sequences is not a credential'
+    }
+    # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
+        $ddRole = [ordered]@{
+            'a PowerShell backtick spelling'   = ('{"pass' + $ddBt + 'word": ""}')
+            'an XML character reference'       = '<add key="pass&#119;ord" value="" />'
+            'an octal spelling'                = '{"pass\167ord": ""}'
+            'an undecodable \U escape'         = '{"pass\U0011FFFFord": ""}'
+        }
+        foreach ($k in $ddRole.Keys) { Assert-That (Test-CredentialNamePresent $ddRole[$k]) "DENY-BY-DEFAULT-1 role guard: $k names a secret" $ddRole[$k] }
+        Assert-That (-not (Test-CredentialNamePresent '{"theme": "dark", "path": "C:\\Users\\x", "name": "caf\u00e9"}')) 'DENY-BY-DEFAULT-1 role guard must-pass: plain keys, a JSON path and an accent name no secret'
+    }
+    # every guard site calls the one detector: the export stage scan and the archive re-check refuse an S1 and an S2 file
+    foreach ($ddG in @(@('s1', '{"pass\u0077ord": "hunter2"}'), @('s1x', '<add key="pass&#119;ord" value="hunter2" />'), @('s2', '<add key="password" value="hunter2" />'))) {
+        $st = New-Scratch "dd-$($ddG[0])-stage"; [IO.File]::WriteAllText((Join-Path $st 'app.config'), $ddG[1])
+        Assert-That (@(Get-StagedCredentialHits -Stage $st).Count -eq 1) "DENY-BY-DEFAULT-1 $($ddG[0]) export: the staged file is a hit" $ddG[1]
+        $zp = Join-Path (New-Scratch "dd-$($ddG[0])-zip") 'b.zip'
+        $zf = [IO.Compression.ZipFile]::Open($zp, 'Create')
+        try { $e = $zf.CreateEntry('home-claude/machine/app.config'); $sw = [IO.StreamWriter]::new($e.Open()); $sw.Write($ddG[1]); $sw.Dispose() } finally { $zf.Dispose() }
+        Assert-That (@(Get-ArchiveCredentialHits -Zip $zp).Count -eq 1) "DENY-BY-DEFAULT-1 $($ddG[0]) archive re-check: the zip entry is a hit" $ddG[1]
+    }
+    # r4 (sol r3 A3, defect class: unbounded input): nested entities decode one layer per pass. Past $script:CredentialMaxDecodeStages levels the text is REFUSED (typed
+    # CREDENTIAL_DECODE_LIMIT, deny by default) by every guard, in bounded time and memory, and no level is retained as a full copy.
+    $ddDeep = '{"note":"&' + ('amp;' * 40) + '"}'
+    Assert-That (Test-CredentialText $ddDeep) 'DENY-BY-DEFAULT-1 r4 A3: a text that needs more decode levels than the bound refuses (deny by default)' $ddDeep
+    Assert-That (Test-CredentialNamePresent $ddDeep) 'DENY-BY-DEFAULT-1 r4 A3 role guard: the same text counts as naming a secret (deny by default)'
+    Assert-That (Test-CredentialNamePresent ('<add key="&' + ('amp;' * 40) + '" value="" />')) 'DENY-BY-DEFAULT-1 r4 A3 role guard: an XML naming value past the bound counts as naming a secret'
+    Assert-That (-not (Test-CredentialText ('{"note":"&' + ('amp;' * 6) + '"}'))) 'DENY-BY-DEFAULT-1 r4 A3 must-pass: a shallow nesting within the bound is not a credential'
+    if (Test-Has 'New-CredentialDecodeLimitError' 'DENY-BY-DEFAULT-1 r4 A3') {
+        $ddDeepSt = New-Scratch 'dd-r4-a3-stage'; [IO.File]::WriteAllText((Join-Path $ddDeepSt 'note.json'), $ddDeep)
+        $ddDeepWhy = (Get-StagedFileVerdictDetail -File ([IO.FileInfo]::new((Join-Path $ddDeepSt 'note.json')))).Why
+        Assert-That ("$ddDeepWhy".Contains('CREDENTIAL_DECODE_LIMIT')) 'DENY-BY-DEFAULT-1 r4 A3 export: the staged verdict names the typed decode-limit refusal' "why=$ddDeepWhy"
+        # the reviewer's input shape, a 4 MB text below the scan cap: it must finish (it used to need terabytes) and refuse
+        $ddHuge = '{"note":"&' + ('amp;' * 1000000) + '"}'
+        $ddSw = [Diagnostics.Stopwatch]::StartNew(); $ddHugeHit = Test-CredentialText $ddHuge; $ddSw.Stop()
+        Assert-That ($ddHugeHit -and $ddSw.Elapsed.TotalSeconds -lt 120) 'DENY-BY-DEFAULT-1 r4 A3: a 4 MB nesting below the scan cap refuses in bounded time' "hit=$ddHugeHit seconds=$([int]$ddSw.Elapsed.TotalSeconds)"
+        # r7 (sol r6 A2 + adversary pass 15 A2, defect class: a shared mutable allowance that a nested call replenishes): the allowance of one walk is set by the OUTERMOST
+        # Get-CredentialNormalForm only. (1) a nested entry from a level callback never raises it; (2) at a reduced allowance a benign XML naming value (normalised again in the
+        # callback: key, name and id forms) in a text that nests past the allowance refuses typed in the content guard and the role guard; (3) a text that fits still passes.
+        $ddBudgetTrace = [System.Collections.Generic.List[long]]::new()
+        $script:ddBudgetTraceRef = $ddBudgetTrace
+        $null = Get-CredentialNormalForm ('&' + ('amp;' * 3)) -OnStage { param($lvT, $lvM) $script:ddBudgetTraceRef.Add($script:CredentialViewBudget); $null = Get-CredentialNormalForm 'a&amp;b' -OnStage { param($lvT2, $lvM2) -1 }; $script:ddBudgetTraceRef.Add($script:CredentialViewBudget); -1 }
+        $ddRose = $false; for ($ddI = 1; $ddI -lt $ddBudgetTrace.Count; $ddI++) { if ($ddBudgetTrace[$ddI] -gt $ddBudgetTrace[$ddI - 1]) { $ddRose = $true } }
+        Assert-That ($ddBudgetTrace.Count -ge 4 -and -not $ddRose) 'DENY-BY-DEFAULT-1 r7 sol r6 A2: a nested Get-CredentialNormalForm never raises the allowance of the enclosing walk' ("trace=" + ($ddBudgetTrace -join ','))
+        $ddSavedBudget = $script:CredentialViewBudgetChars
+        try {
+            $script:CredentialViewBudgetChars = 3000
+            foreach ($ddAttrA2 in @('key', 'name', 'id')) {
+                $ddA2Text = '<add ' + $ddAttrA2 + '="theme" />' + '{"note":"&' + ('amp;' * 12) + '"}'
+                $ddA2Hit = Test-CredentialText $ddA2Text
+                Assert-That ($ddA2Hit -and $script:CredentialDecodeLimitHit) "DENY-BY-DEFAULT-1 r7 sol r6 A2: at a reduced allowance a benign $ddAttrA2 naming value does not replenish it (content guard refuses typed)" "hit=$ddA2Hit limit=$($script:CredentialDecodeLimitHit)"
+                if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r7 A2 role guard') { Assert-That (Test-CredentialNamePresent $ddA2Text) "DENY-BY-DEFAULT-1 r7 sol r6 A2 role guard: the same $ddAttrA2 text refuses (deny by default)" }
+            }
+            Assert-That (-not (Test-CredentialText '<add key="theme" />{"note":"a &amp; b"}')) 'DENY-BY-DEFAULT-1 r7 sol r6 A2 must-pass: a benign naming value and a short nesting fit the reduced allowance'
+        } finally { $script:CredentialViewBudgetChars = $ddSavedBudget }
+        # the reviewer's size: a benign naming value before a 4 MB nesting refuses in bounded time too (it used to charge the full allowance again at every level)
+        $ddHuge2 = '<add key="theme" />' + '{"note":"&' + ('amp;' * 1000000) + '"}'
+        $ddSw2 = [Diagnostics.Stopwatch]::StartNew(); $ddHuge2Hit = Test-CredentialText $ddHuge2; $ddSw2.Stop()
+        Assert-That ($ddHuge2Hit -and $script:CredentialDecodeLimitHit -and $ddSw2.Elapsed.TotalSeconds -lt 120) 'DENY-BY-DEFAULT-1 r7 sol r6 A2: a benign XML naming value before a 4 MB nesting refuses typed in bounded time' "hit=$ddHuge2Hit limit=$($script:CredentialDecodeLimitHit) seconds=$([int]$ddSw2.Elapsed.TotalSeconds)"
+        # r7: the alternative reading walk is bounded by a node count too (typed refusal), and a text with a few orders is not refused
+        $ddBsN = [string][char]92
+        $ddNodeText = '{"payload":"{' + $ddBsN + '"note' + $ddBsN + '":' + $ddBsN + '"a &amp; b' + $ddBsN + '"}"}'
+        $ddSavedNodes = Get-Variable -Name CredentialMaxBranchNodes -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        try {
+            Assert-That (-not (Test-CredentialText $ddNodeText)) 'DENY-BY-DEFAULT-1 r7 must-pass: a text with two decode orders and no credential is not refused'
+            $script:CredentialMaxBranchNodes = 1
+            Assert-That ((Test-CredentialText $ddNodeText) -and $script:CredentialDecodeLimitHit) 'DENY-BY-DEFAULT-1 r7: past the node bound the orders walk refuses typed (deny by default)'
+        } finally { $script:CredentialMaxBranchNodes = $ddSavedNodes }
+        Assert-That ((Get-Variable -Name CredentialNormalDepth -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 0) 'DENY-BY-DEFAULT-1 r7 sol r6 A2: the nesting depth is back to zero after every walk (also after the typed refusals above)'
+    }
+}
+# S3: a Clone whose url carries a query token: neither the console nor the setup log ever holds the token, also where git echoes the url without its scheme
+if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
+    # r8 (sol r6 hardening): the url-redaction registry is process-wide and only grows. Every independent case below starts from an EMPTY registry, so a later case can
+    # only pass through the registration its own code path makes, never through one an earlier case left behind. One test further down keeps the accumulation on purpose.
+    function Reset-DdUrlRegistry { $script:UrlSecretParts.Clear(); $script:UrlSecretHeads.Clear(); $script:UrlSecretAnchors.Clear() }
+    $ddCases = @(
+        @{ N = 1; Url = ('file:///' + ((New-Scratch 'dd-s3-absent') -replace '\\', '/') + '/absent.git?token=fake-token-0001'); Tok = 'fake-token-0001' },
+        @{ N = 2; Url = 'https://127.0.0.1:1/o/r.git?token=fake-token-0002'; Tok = 'fake-token-0002' },
+        @{ N = 3; Url = 'https://127.0.0.1:1/o/r.git#token=fake-token-0003'; Tok = 'fake-token-0003' },
+        # r1 adversary A4: git percent-decodes the url it echoes; A9: a short query is redacted too
+        @{ N = 4; Url = ('file:///' + ((New-Scratch 'dd-s3-absent4') -replace '\\', '/') + '/absent.git?token=fake%2Dtoken%2D0004'); Tok = @('fake-token-0004', 'fake%2Dtoken%2D0004') },
+        @{ N = 5; Url = ('file:///' + ((New-Scratch 'dd-s3-absent5') -replace '\\', '/') + '/absent.git?t=x'); Tok = @('?t=x') },
+        # r1 adversary pass 2 A2: an encoded line break or a non-UTF-8 byte inside the token
+        @{ N = 6; Url = ('file:///' + ((New-Scratch 'dd-s3-absent6') -replace '\\', '/') + '/absent.git?token=fake-token-0006%0Atail'); Tok = @('fake-token-0006') },
+        @{ N = 7; Url = ('file:///' + ((New-Scratch 'dd-s3-absent7') -replace '\\', '/') + '/absent.git?token=fake-token-0007%FF'); Tok = @('fake-token-0007') },
+        # r2 (adversary pass 3 A5): a SHORT query split at a decoded line break keeps its delimiter-bearing first piece
+        @{ N = 8; Url = ('file:///' + ((New-Scratch 'dd-s3-absent8') -replace '\\', '/') + '/absent.git?t=x%0Ay'); Tok = @('?t=x') },
+        # r2 pass 4 A2: the short piece AFTER the decoded line break (git prints it at the start of its own line); A3: an embedded url in the query
+        @{ N = 9; Url = ('file:///' + ((New-Scratch 'dd-s3-absent9') -replace '\\', '/') + '/absent.git?t=%0Aqzv'); Tok = @('qzv') },
+        @{ N = 10; Url = ('file:///' + ((New-Scratch 'dd-s3-absent10') -replace '\\', '/') + '/absent.git?token=fake-token-0010&redirect=https://h.example/x?q=1'); Tok = @('fake-token-0010') },
+        # r2 pass 5 A2: a non-UTF-8 byte right after the delimiter ('?' and '#'); A3: the secret inside an embedded url's path
+        @{ N = 11; Url = ('file:///' + ((New-Scratch 'dd-s3-absent11') -replace '\\', '/') + '/absent.git?%80qzv'); Tok = @('qzv') },
+        @{ N = 12; Url = ('file:///' + ((New-Scratch 'dd-s3-absent12') -replace '\\', '/') + '/absent.git#%80qzw'); Tok = @('qzw') },
+        @{ N = 13; Url = ('file:///' + ((New-Scratch 'dd-s3-absent13') -replace '\\', '/') + '/absent.git?token=https://h.example/SECRET0013?x=y'); Tok = @('SECRET0013') },
+        # r2 pass 6 A2: a '%XX' in the PATH too (git prints 'absent80'), in the query and the fragment form
+        @{ N = 14; Url = ('file:///' + ((New-Scratch 'dd-s3-absent14') -replace '\\', '/') + '/absent%80-14.git?%80qzx'); Tok = @('qzx') },
+        @{ N = 15; Url = ('file:///' + ((New-Scratch 'dd-s3-absent15') -replace '\\', '/') + '/absent%80-15.git#%80qzy'); Tok = @('qzy') },
+        # r3 pass 7 A1: git DECODES the path it echoes: a blank, a quote or a line break where the '%XX' stood (a decoded line break starts the rest on its own line)
+        @{ N = 16; Url = ('file:///' + ((New-Scratch 'dd-s3-absent16') -replace '\\', '/') + '/absent%20x-16.git?%80qzr'); Tok = @('qzr') },
+        @{ N = 17; Url = ('file:///' + ((New-Scratch 'dd-s3-absent17') -replace '\\', '/') + '/absent%27x-17.git?%80qzs'); Tok = @('qzs') },
+        @{ N = 18; Url = ('file:///' + ((New-Scratch 'dd-s3-absent18') -replace '\\', '/') + '/absent%22x-18.git#%80qzt'); Tok = @('qzt') },
+        @{ N = 19; Url = ('file:///' + ((New-Scratch 'dd-s3-absent19') -replace '\\', '/') + '/absent%0Ax-19.git?%80qzu'); Tok = @('qzu') },
+        @{ N = 20; Url = ('file:///' + ((New-Scratch 'dd-s3-absent20') -replace '\\', '/') + '/absent%0D%0Ax-20.git?qzk'); Tok = @('qzk') },
+        @{ N = 21; Url = ('file:///' + ((New-Scratch 'dd-s3-absent21') -replace '\\', '/') + '/absent-21%0A?%80qzj'); Tok = @('qzj') },
+        # r4 (sol r3 A2, defect class: matching a secret by a spelling git may print differently): a line break then a high byte in the query or fragment; git prints a
+        # continuation line '80qzh' that no registered spelling matches. The output of a native call whose url secret holds such a byte is withheld (fail closed).
+        @{ N = 22; Url = ('file:///' + ((New-Scratch 'dd-s3-absent22') -replace '\\', '/') + '/absent-22.git?t=%0A%80qzh'); Tok = @('qzh') },
+        @{ N = 23; Url = ('file:///' + ((New-Scratch 'dd-s3-absent23') -replace '\\', '/') + '/absent-23.git#t=%0A%80qzg'); Tok = @('qzg') },
+        @{ N = 24; Url = ('file:///' + ((New-Scratch 'dd-s3-absent24') -replace '\\', '/') + '/absent-24.git?t=%0D%9Fqzf'); Tok = @('qzf') }
+    )
+    foreach ($ddc in $ddCases) {
+        Reset-DdUrlRegistry
+        $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
+        $ddrepo = Join-Path $ddws 'MLV-App'
+        $dddoc = Join-Path $ddws 'doctrine'; [void][IO.Directory]::CreateDirectory($dddoc); & git -C $dddoc init -q 2>$null; & git -C $dddoc remote add origin $DoctrineUrl 2>$null
+        $savedRepo = $script:Repo; $savedDoc = $script:DoctrineRepo; $savedLog = $script:LogFile; $savedFork = $ForkUrl
+        $script:Repo = $ddrepo; $Repo = $ddrepo; $script:DoctrineRepo = $dddoc; $DoctrineRepo = $dddoc; $script:LogFile = Join-Path $ddws 'clone.log'
+        $script:ForkUrl = $ddc.Url; $ForkUrl = $ddc.Url
+        $script:Failures.Clear()
+        $ddout = ''
+        # file:// is allowed so git really opens case 1 and echoes its url without the scheme; https is not (no network)
+        $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')
+        try { $ddout = (Invoke-PhaseClone *>&1 | Out-String) } catch { $ddout += $_.Exception.Message } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
+        $ddlog = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+        $script:Repo = $savedRepo; $Repo = $savedRepo; $script:DoctrineRepo = $savedDoc; $DoctrineRepo = $savedDoc; $script:LogFile = $savedLog; $script:ForkUrl = $savedFork; $ForkUrl = $savedFork
+        $ddLeakLog = @(@($ddc.Tok) | Where-Object { $ddlog.Contains($_) }); $ddLeakOut = @(@($ddc.Tok) | Where-Object { $ddout.Contains($_) })
+        Assert-That ($ddlog.Length -gt 0 -and $ddLeakLog.Count -eq 0) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the setup log never holds the url's query token" $ddlog
+        Assert-That ($ddLeakOut.Count -eq 0) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the console never shows the url's query token" $ddout
+        $script:Failures.Clear()
+    }
+    # r4 (sol r3 A2): the fail-closed predicate shared by Invoke-Native and the lease read (Get-HubLease)
+    if (Test-Has 'Test-UrlSecretUnprintable' 'DENY-BY-DEFAULT-1 r4 A2') {
+        foreach ($ddW in @('file:///C:/x.git?t=%0A%80qzv', 'file:///C:/x.git#t=%0A%80qzv', 'https://h.example/r.git?t=%FF', 'https://u:p%0Aw@h.example/r.git', 'file:///C:/a%0Ab.git?t=x')) {
+            Assert-That (Test-UrlSecretUnprintable $ddW) "DENY-BY-DEFAULT-1 r4 A2: output is withheld for $ddW"
+        }
+        foreach ($ddK in @('https://github.com/o/r.git', 'file:///C:/a%0Ab.git', 'https://h.example/r.git?t=plain-token', 'git@github.com:o/r.git')) {
+            Assert-That (-not (Test-UrlSecretUnprintable $ddK)) "DENY-BY-DEFAULT-1 r4 A2 must-pass: output is shown for $ddK"
+        }
+    }
+    # r4 adversary pass 9 A2: an anchor built from a path with many '%XX' is an ambiguous pattern; the sink finishes in bounded time and never prints the query
+    if (-not (Test-Path -LiteralPath 'variable:script:UrlRedactTimeout')) { Assert-That $false 'DENY-BY-DEFAULT-1 r4 pass 9 A2: the log sink has no match bound ($script:UrlRedactTimeout missing; not run, it would not finish)' }
+    else {
+        Reset-DdUrlRegistry
+        $ddP9 = Join-Path (New-Scratch 'dd-p9a2-sink') 'sink.log'
+        $savedLog = $script:LogFile; $script:LogFile = $ddP9
+        $ddSw9 = [Diagnostics.Stopwatch]::StartNew()
+        try { Register-UrlSecretParts ('file:///C:/r' + ('a%61' * 128) + '.git?xq9'); Write-Log ("fatal: '/C:/r" + ('aa' * 128) + ".git?xq9' does not appear to be a git repository") *>&1 | Out-Null } finally { $script:LogFile = $savedLog; $ddSw9.Stop() }
+        $ddP9Text = [IO.File]::ReadAllText($ddP9)
+        Assert-That ($ddSw9.Elapsed.TotalSeconds -lt 60 -and -not $ddP9Text.Contains('?xq9')) 'DENY-BY-DEFAULT-1 r4 pass 9 A2: an ambiguous anchor finishes in bounded time and the query never reaches the log' "seconds=$([int]$ddSw9.Elapsed.TotalSeconds) $ddP9Text"
+    }
+    # r1 adversary A5: a registered part that is also a scheme ('?https:') never breaks a url apart before the scheme rule redacts its short password
+    if (Test-Has 'Register-UrlSecretParts' 'DENY-BY-DEFAULT-1 r1 adversary A5') {
+        Reset-DdUrlRegistry
+        $ddA5 = Join-Path (New-Scratch 'dd-a5-sink') 'sink.log'
+        $savedLog = $script:LogFile; $script:LogFile = $ddA5
+        try { Register-UrlSecretParts 'https://u:abc@h.example/r.git?https:'; Write-Log 'x https://u:abc@h.example/r.git?https: y' *>&1 | Out-Null } finally { $script:LogFile = $savedLog }
+        $ddA5Text = [IO.File]::ReadAllText($ddA5)
+        Assert-That (-not $ddA5Text.Contains(':abc@') -and -not $ddA5Text.Contains('abc@h')) 'DENY-BY-DEFAULT-1 r1 adversary A5: the short password of a url whose query is a registered scheme is still redacted' $ddA5Text
+    }
+    # r8 (sol r6 hardening): the isolation itself, then the accumulation kept on purpose, then the lease-error sink with the registry emptied first
+    Reset-DdUrlRegistry
+    $ddIsoLog = Join-Path (New-Scratch 'dd-r8-iso') 'sink.log'
+    $savedLog = $script:LogFile; $script:LogFile = $ddIsoLog
+    try {
+        Register-UrlSecretParts 'https://u:p@h.example/r.git?iso_tok_r8_one'
+        Reset-DdUrlRegistry
+        Write-Log 'echo iso_tok_r8_one' *>&1 | Out-Null
+    } finally { $script:LogFile = $savedLog }
+    Assert-That (($script:UrlSecretParts.Count + $script:UrlSecretHeads.Count + $script:UrlSecretAnchors.Count) -eq 0 -and [IO.File]::ReadAllText($ddIsoLog).Contains('iso_tok_r8_one')) 'DENY-BY-DEFAULT-1 r8 isolation: a reset empties all three registries, so a part an earlier case registered no longer redacts a later one'
+    $ddAccLog = Join-Path (New-Scratch 'dd-r8-accum') 'sink.log'
+    $savedLog = $script:LogFile; $script:LogFile = $ddAccLog
+    try {
+        Register-UrlSecretParts 'https://u:p@h.example/r.git?acc_tok_r8_two'
+        Write-Log 'a later, unrelated line: acc_tok_r8_two' *>&1 | Out-Null
+    } finally { $script:LogFile = $savedLog }
+    $ddAccText = [IO.File]::ReadAllText($ddAccLog)
+    Assert-That ($ddAccText.Contains('later, unrelated line') -and -not $ddAccText.Contains('acc_tok_r8_two')) 'DENY-BY-DEFAULT-1 r8 accumulation (intentional): a url registered once is redacted in every later line of the run' $ddAccText
+    # the lease-error sink: Show-HubLease prints 'lease: UNKNOWN (<error>)' with git's own text for a lease remote whose url carries a token (the real Get-HubLease, a real failing ls-remote)
+    if ((Test-Has 'Show-HubLease' 'DENY-BY-DEFAULT-1 r8 lease sink') -and (Test-Has 'Get-HubLease' 'DENY-BY-DEFAULT-1 r8 lease sink')) {
+        foreach ($ddL in @(@{ N = 1; Q = '?token=fake-token-LS0001'; Tok = @('fake-token-LS0001') }, @{ N = 2; Q = '#token=fake-token-LS0002'; Tok = @('fake-token-LS0002') }, @{ N = 3; Q = '?t=%0A%80qzl'; Tok = @('qzl') })) {
+            Reset-DdUrlRegistry
+            $ddLws = New-Scratch "dd-r8-lease-$($ddL.N)"
+            $ddLrepo = Join-Path $ddLws 'MLV-App'; [void][IO.Directory]::CreateDirectory($ddLrepo); & git -C $ddLrepo init -q 2>$null
+            $ddLurl = 'file:///' + ((New-Scratch "dd-r8-lease-absent-$($ddL.N)") -replace '\\', '/') + '/absent.git' + $ddL.Q
+            & git -C $ddLrepo remote add fork $ddLurl 2>$null
+            $savedRepo = $script:Repo; $savedLog = $script:LogFile
+            $script:Repo = $ddLrepo; $Repo = $ddLrepo; $script:LogFile = Join-Path $ddLws 'lease.log'
+            $ddLout = ''
+            $savedProto = [Environment]::GetEnvironmentVariable('GIT_ALLOW_PROTOCOL'); [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', 'file')
+            try { $ddLout = (Show-HubLease *>&1 | Out-String) } catch { $ddLout += $_.Exception.Message } finally { [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $savedProto) }
+            $ddLlog = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+            $script:Repo = $savedRepo; $Repo = $savedRepo; $script:LogFile = $savedLog
+            Assert-That ($ddLlog -match 'lease: UNKNOWN' -and $ddLout -match 'lease: UNKNOWN') "DENY-BY-DEFAULT-1 r8 lease sink ($($ddL.N)): the failing lease read reaches the log and the console as 'lease: UNKNOWN'" "log=$ddLlog`nout=$ddLout"
+            Assert-That (@(@($ddL.Tok) | Where-Object { $ddLlog.Contains($_) -or $ddLout.Contains($_) }).Count -eq 0) "DENY-BY-DEFAULT-1 r8 lease sink ($($ddL.N)): neither the setup log nor the console holds the lease url's token" "log=$ddLlog`nout=$ddLout"
+        }
+    }
+}
+
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
 Assert-That ($gb.Exit -eq 64 -and $gb.Out -match "Unknown phase 'Bogus'") 'phases: an unknown phase exits 64 (it used to exit 1: Write-Error under ErrorActionPreference Stop threw before the exit)' "exit=$($gb.Exit)`n$($gb.Out)"
 
