@@ -2846,6 +2846,9 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     $ddR2['r4 A1 sibling: a raw strong spaced naming value that decodes'] = ('<add key="a u t h' + $ddU + 'eader" value="hunter2" />')
     # r4 (sol r3 hardening): raw benign, first decode level strong, fixed point benign, so only a judge of the intermediate level refuses it
     $ddR2['r4 hardening: a JSON key strong only at its first decode level'] = '{"&#97;uth&#92;u0068eader": "hunter2"}'
+    # r4 adversary pass 9 A3: a quoted '/>' inside a secret-named element's start tag is not a self-closing tag
+    $ddR2['r4 pass 9 A3 a quoted /> in a secret element start tag'] = '<password note="/>">hunter2</password>'
+    $ddR2['r4 pass 9 A3 sibling: single quotes'] = "<password note='/>'>hunter2</password>"
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
     foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
@@ -2876,6 +2879,9 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         Assert-That (Test-CredentialNamePresent ('<add key="a u t h' + $ddU2 + 'eader" value="" />')) 'DENY-BY-DEFAULT-1 r4 A1 role guard: a raw strong spaced XML naming value that decodes names a secret'
         Assert-That (Test-CredentialNamePresent ("xml = `"<add key='a u t h" + $ddU2 + "eader' value='' />`"")) 'DENY-BY-DEFAULT-1 r4 A1 role guard: the same inside a config.toml string'
         Assert-That (-not (Test-CredentialNamePresent ('<add key="t h' + $ddU2 + 'eme" value="" />'))) 'DENY-BY-DEFAULT-1 r4 A1 role guard must-pass: a raw benign naming value that decodes names nothing'
+        # r4 adversary pass 9 A1: an XML naming attribute that exists only once the text is decoded (config.toml with an escaped '<' and '>') names a secret too
+        $ddLt = [string][char]92 + 'u003C'; $ddGt = [string][char]92 + 'u003E'
+        Assert-That (Test-CredentialNamePresent ("xml = `"" + $ddLt + "add key='p a s s w o r d' value='' /" + $ddGt + "`"")) 'DENY-BY-DEFAULT-1 r4 pass 9 A1 role guard: a spaced XML naming value that appears only after decoding names a secret'
     }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
@@ -2978,6 +2984,16 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         foreach ($ddK in @('https://github.com/o/r.git', 'file:///C:/a%0Ab.git', 'https://h.example/r.git?t=plain-token', 'git@github.com:o/r.git')) {
             Assert-That (-not (Test-UrlSecretUnprintable $ddK)) "DENY-BY-DEFAULT-1 r4 A2 must-pass: output is shown for $ddK"
         }
+    }
+    # r4 adversary pass 9 A2: an anchor built from a path with many '%XX' is an ambiguous pattern; the sink finishes in bounded time and never prints the query
+    if (-not (Test-Path -LiteralPath 'variable:script:UrlRedactTimeout')) { Assert-That $false 'DENY-BY-DEFAULT-1 r4 pass 9 A2: the log sink has no match bound ($script:UrlRedactTimeout missing; not run, it would not finish)' }
+    else {
+        $ddP9 = Join-Path (New-Scratch 'dd-p9a2-sink') 'sink.log'
+        $savedLog = $script:LogFile; $script:LogFile = $ddP9
+        $ddSw9 = [Diagnostics.Stopwatch]::StartNew()
+        try { Register-UrlSecretParts ('file:///C:/r' + ('a%61' * 128) + '.git?xq9'); Write-Log ("fatal: '/C:/r" + ('aa' * 128) + ".git?xq9' does not appear to be a git repository") *>&1 | Out-Null } finally { $script:LogFile = $savedLog; $ddSw9.Stop() }
+        $ddP9Text = [IO.File]::ReadAllText($ddP9)
+        Assert-That ($ddSw9.Elapsed.TotalSeconds -lt 60 -and -not $ddP9Text.Contains('?xq9')) 'DENY-BY-DEFAULT-1 r4 pass 9 A2: an ambiguous anchor finishes in bounded time and the query never reaches the log' "seconds=$([int]$ddSw9.Elapsed.TotalSeconds) $ddP9Text"
     }
     # r1 adversary A5: a registered part that is also a scheme ('?https:') never breaks a url apart before the scheme rule redacts its short password
     if (Test-Has 'Register-UrlSecretParts' 'DENY-BY-DEFAULT-1 r1 adversary A5') {

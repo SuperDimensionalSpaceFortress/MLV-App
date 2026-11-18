@@ -200,6 +200,7 @@ $script:UrlSecretParts = [System.Collections.Generic.List[string]]::new()
 # a redacted part, so a short head never blanks ordinary words elsewhere.
 $script:UrlSecretHeads = [System.Collections.Generic.List[string]]::new()
 $script:UrlSecretAnchors = [System.Collections.Generic.List[string]]::new()
+$script:UrlRedactTimeout = [TimeSpan]::FromSeconds(2)   # r4 (adversary pass 9 A2): the match bound of every pattern rule in Write-Log
 # r1 adversary pass 2 A2: a decoded part can hold a line break ('%0A': git's output is split there) or a byte that is not UTF-8 ('%FF'), so the part is also decoded
 # byte by byte (Latin-1) and every piece between two characters that are not printable ASCII is recorded on its own (from 6 characters on).
 function Add-UrlSecretPart([string]$Part, [int]$MinLength = 6) {
@@ -285,12 +286,22 @@ function Write-Log {
     # r17 F2: the one sink for the console and the setup log; no line it writes carries a URL's userinfo or query string, whichever caller printed the URL
     # (a remote-mismatch refusal, a native command line, git's own error text quoting a remote)
     $Message = ConvertTo-RedactedUrlText $Message
-    # r2 pass 5 A2/A3: after the scheme rule (r1 A5 order), an anchor's '?' or '#' drops the rest of the line
-    foreach ($a in @($script:UrlSecretAnchors | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(' + $a + ')[?#][^\r\n]*', '$1?***') }   # $a is a pattern (Register-UrlSecretParts)
-    # DENY-BY-DEFAULT-1 S3: then every registered url secret part, wherever it stands (git's echo of a url without its scheme included); longest first (r1 A5: after the scheme rule)
-    foreach ($p in @($script:UrlSecretParts | Sort-Object Length -Descending)) { $Message = $Message.Replace($p, '***') }
-    # r2 pass 4 A2: a recorded HEAD (and the rest of its word) where it starts the line or follows a redacted part
-    foreach ($h in @($script:UrlSecretHeads | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(^\s*|\*\*\*[^\s''"]*?)' + [regex]::Escape($h) + '[^\s''"]*', '$1***') }
+    # r4 (adversary pass 9 A2, defect class: attacker-shaped regex work in the sink): an anchor is a PATTERN built from a url ('a%61' x 128 gives 128 ambiguous wildcards,
+    # exponential backtracking on the path git echoes). Every pattern rule below runs under a match timeout; a timeout withholds the WHOLE line (fail closed), never a
+    # partly redacted one.
+    try {
+        # r2 pass 5 A2/A3: after the scheme rule (r1 A5 order), an anchor's '?' or '#' drops the rest of the line
+        foreach ($a in @($script:UrlSecretAnchors | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(' + $a + ')[?#][^\r\n]*', '$1?***', [System.Text.RegularExpressions.RegexOptions]::None, $script:UrlRedactTimeout) }   # $a is a pattern (Register-UrlSecretParts)
+        # DENY-BY-DEFAULT-1 S3: then every registered url secret part, wherever it stands (git's echo of a url without its scheme included); longest first (r1 A5: after the scheme rule)
+        foreach ($p in @($script:UrlSecretParts | Sort-Object Length -Descending)) { $Message = $Message.Replace($p, '***') }
+        # r2 pass 4 A2: a recorded HEAD (and the rest of its word) where it starts the line or follows a redacted part
+        foreach ($h in @($script:UrlSecretHeads | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(^\s*|\*\*\*[^\s''"]*?)' + [regex]::Escape($h) + '[^\s''"]*', '$1***', [System.Text.RegularExpressions.RegexOptions]::None, $script:UrlRedactTimeout) }
+    } catch {
+        $tx = $_.Exception; $timedOut = $false
+        while ($tx) { if ($tx -is [System.Text.RegularExpressions.RegexMatchTimeoutException]) { $timedOut = $true }; $tx = $tx.InnerException }
+        if (-not $timedOut) { throw }
+        $Message = '(line withheld: its url-secret redaction exceeded the time bound, fail closed)'
+    }
     $line = '{0} [{1}] {2}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $Level, $Message
     if (-not $isGate) {
         $color = @{ INFO = 'Gray'; WARN = 'Yellow'; ERROR = 'Red'; MANUAL = 'Cyan'; OK = 'Green' }[$Level]
@@ -1236,7 +1247,11 @@ $SecretPatterns = @(
 # finds the OPENING tag of a secret-named element (Get-CredentialXmlHitIndex finds its close); a self-closing tag ('<password/>') has no content at all.
 # r16 (adversary pass 16 A1 sibling): the same separator-run name list ($CredentialNameCore) as the key/value rule ('<api__key>x</api__key>')
 # r1 adversary A6 sibling: a namespace prefix (or any name part) may hold non-ASCII name characters ('<e:password>' with an accented 'e'); only what ends a name is excluded
-$script:CredentialXmlOpenRegex = [regex]::new('(?i)<(?![!?/])([^\s<>/="'']*?(?:' + $CredentialNameCore + ')[^\s<>/="'']*)(?=[\s/>])[^<>]*>')
+# r4 (adversary pass 9 A3, defect class: a quote-unaware tag tail): the tail of a start tag skips QUOTED attribute values whole, so '<password note="/>">hunter2</password>'
+# ends at its real '>' and is not read as self-closing. A quoted value never holds a '<' (XML forbids it; an unmatched quote is one character), and the loop is atomic, so the
+# tail is linear in the tag's length.
+$script:CredentialXmlTagTail = '(?>(?:[^<>"'']|"[^"<]*"|''[^''<]*''|["''])*)>'
+$script:CredentialXmlOpenRegex = [regex]::new('(?i)<(?![!?/])([^\s<>/="'']*?(?:' + $CredentialNameCore + ')[^\s<>/="'']*)(?=[\s/>])' + $script:CredentialXmlTagTail)
 $script:SecretShapeRegex = [regex]::new(($SecretPatterns -join '|'))
 
 # '' = not a secret-named key; 'strong' = the key says its value is a secret; 'count' = a TOKEN key that names a count ('max_tokens').
@@ -1394,7 +1409,7 @@ function Test-CredentialValueExempt {
 function Get-CredentialXmlCloseIndex {
     param([string]$Text, [string]$Name, [int]$Start)
     $depth = 1
-    foreach ($t in [regex]::new('(?i)<(/?)' + [regex]::Escape($Name) + '(?=[\s/>])[^<>]*>').Matches($Text, $Start)) {
+    foreach ($t in [regex]::new('(?i)<(/?)' + [regex]::Escape($Name) + '(?=[\s/>])' + $script:CredentialXmlTagTail).Matches($Text, $Start)) {   # r4 pass 9 A3 sibling: quote-aware tail
         if ($t.Groups[1].Value -eq '/') { $depth--; if ($depth -eq 0) { return $t.Index } }
         elseif (-not $t.Value.EndsWith('/>')) { $depth++ }
     }
@@ -2148,7 +2163,9 @@ function Test-CredentialNamePresent {
         if (Test-CredentialNameWordPresent $Text) { return $true }
         # r3 pass 7 A2: every decode level is searched for a secret name, not only the fixed point (a reader that decodes once sees the first). r23 (pass 27 A1 sibling):
         # the same decoder as the content guard. r4 (sol r3 A3): each level is judged as it is produced and dropped; past the bound the text names a secret (deny by default).
-        $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) if (Test-CredentialNameWordPresent $lvText) { 0 } else { -1 } }
+        # r4 (adversary pass 9 A1, defect class: a check that runs on the raw text only): EVERY name check runs at every level, the XML naming attribute included
+        # (config.toml 'xml = "<add key=''p a s s w o r d'' value='''' />"' has no tag until it is decoded)
+        $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) if ((Test-CredentialNameWordPresent $lvText) -or (Get-CredentialXmlAttrPairHitIndex -Text $lvText -NameOnly) -ge 0) { 0 } else { -1 } }
         if ($nf.Hit -ge 0) { return $true }
         $dec = $nf.Text
         if ($script:CredentialResidualIntroRegex.IsMatch($dec)) {
