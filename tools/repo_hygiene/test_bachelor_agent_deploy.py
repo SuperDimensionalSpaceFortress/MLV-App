@@ -235,6 +235,125 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
         self.assert_untouched()
 
+    # ---- adversary r1 findings (A1..A6): each test failed on 0ef6bd17 ----
+
+    def test_a3_noop_still_requires_a_readable_venue(self) -> None:
+        # A3: an identical copy in a root with no inbox\ is NOT a clean no-op: the root cannot be judged, every doubt refuses.
+        (self.venue / AGENT_NAME).write_bytes(NEW)
+        shutil.rmtree(self.venue / "inbox")
+        for extra in ((), ("-DryRun",)):
+            r = self.run_deploy(*extra)
+            self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+            self.assertIn("DEPLOY_REFUSED_UNREADABLE", r.stdout)
+            self.assertNotIn("DEPLOY_NOOP", r.stdout)
+
+    def test_a2_a_second_deployer_is_refused_while_the_lock_is_held(self) -> None:
+        # A2: two deployers on one root could each judge "no previous copy" and one would delete the other's verified deploy.
+        (self.venue / "deploy.lock").write_text("held by another deployer")
+        r = self.run_deploy()
+        self.assertEqual(r.returncode, 17, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_LOCKED", r.stdout)
+        self.assertEqual((self.venue / AGENT_NAME).read_bytes(), OLD)
+        self.assertEqual(self.rollbacks(), [])
+        self.assertTrue((self.venue / "deploy.lock").exists(), "a lock this run did not take is never removed")
+
+    def test_a2_the_lock_is_released_after_a_deploy_and_a_noop(self) -> None:
+        self.assertEqual(self.run_deploy().returncode, 0)
+        self.assertFalse((self.venue / "deploy.lock").exists())
+        self.assertEqual(self.run_deploy().returncode, 0)
+        self.assertFalse((self.venue / "deploy.lock").exists())
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        (self.venue / "running" / "j.started.json").write_text("{}")
+        self.assertEqual(self.run_deploy().returncode, 10)
+        self.assertFalse((self.venue / "deploy.lock").exists(), "a refusal releases the lock too")
+
+    def _beat(self, host: str, agent_script: str, pid: int = 4242) -> None:
+        (self.venue / "heartbeat.txt").write_text(
+            'alive 2026-11-18T10:00:00.0000000-06:00 pid=%d host=%s generation=1 processStartUtc=2026-11-18T09:00:00.0000000Z '
+            'imagePath="C:\\pwsh.exe" agentScript="%s"\r\n' % (pid, host, agent_script)
+        )
+
+    def test_a4_restart_is_bound_to_the_agent_whose_root_was_checked(self) -> None:
+        # A4: a copied heartbeat (host matches, but agentScript is the LIVE agent's path) must not let an idle backup root
+        # stand in for a busy live agent: the schtasks End would hit the live task.
+        import os
+        self._beat(os.environ.get("COMPUTERNAME", "HOST"), r"C:\live-agent\ultra-magnus-agent.ps1")
+        r = self.run_deploy("-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assertIn("agentScript", r.stdout)
+        self.assert_untouched()
+
+    def test_a4_restart_refuses_when_the_heartbeat_process_is_not_alive(self) -> None:
+        import os
+        done = subprocess.run([PWSH, "-NoProfile", "-Command", "$PID"], capture_output=True, text=True, timeout=60)
+        dead_pid = int(done.stdout.strip())
+        self._beat(os.environ.get("COMPUTERNAME", "HOST"), str(self.venue / AGENT_NAME), pid=dead_pid)
+        r = self.run_deploy("-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assert_untouched()
+
+    def test_a4_restart_refuses_when_the_task_does_not_run_this_roots_agent(self) -> None:
+        import os
+        me = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        self.addCleanup(lambda: (me.kill(), me.wait()))
+        start = subprocess.run(
+            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % me.pid],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        (self.venue / "heartbeat.txt").write_text(
+            'alive x pid=%d host=%s generation=1 processStartUtc=%s agentScript="%s"\r\n'
+            % (me.pid, os.environ.get("COMPUTERNAME", "HOST"), start, self.venue / AGENT_NAME))
+        xml = Path(self._tmp.name) / "task.xml"
+        xml.write_text('<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-File "C:\\live-agent\\ultra-magnus-agent.ps1"</Arguments></Exec></Actions></Task>')
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml))
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assertIn("task", r.stdout.lower())
+        self.assert_untouched()
+
+    def _dot_source(self, body: str):
+        cmd = ". '%s' -VenueRoot '%s'; %s" % (SCRIPT, self.venue, body)
+        return subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+
+    def test_a5_a_new_heartbeat_confirms_a_restart_only_for_a_live_matching_process(self) -> None:
+        # A5: a heartbeat written by an agent that already died is not a restart.
+        body = (
+            "$me=Get-Process -Id $PID; $s=$me.StartTime.ToUniversalTime().ToString('o'); $a='%s';"
+            "function B($p,$st,$sc){ [pscustomobject]@{pid=$p;host='H';start=$st;agentScript=$sc;ageSec=1} };"
+            "'live='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID $s $a) -AgentScript $a);"
+            "'dead='+(Test-NewHeartbeatIsLiveAgent -Beat (B 2147480000 $s $a) -AgentScript $a);"
+            "'wrongstart='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID '2001-01-01T00:00:00.0000000Z' $a) -AgentScript $a);"
+            "'nostart='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID '' $a) -AgentScript $a);"
+            "'wrongscript='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID $s 'C:\\other.ps1') -AgentScript $a);"
+            "'null='+(Test-NewHeartbeatIsLiveAgent -Beat $null -AgentScript $a)"
+        ) % (self.venue / AGENT_NAME)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(
+            r.stdout.split(),
+            ["live=True", "dead=False", "wrongstart=False", "nostart=False", "wrongscript=False", "null=False"], r.stdout + r.stderr)
+
+    def test_a6_waits_are_bounded_by_a_monotonic_clock(self) -> None:
+        # A6: Get-Date moves with the wall clock; a step back of an hour would stretch a 60 s wait to an hour.
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"\(Get-Date\)\.Add(Seconds|Minutes)", "no wall-clock deadline")
+        self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", code)
+        r = self._dot_source("$t=[Diagnostics.Stopwatch]::StartNew(); 'never='+(Wait-Until -TimeoutSec 1 -Condition { $false }); 'sec='+[int]$t.Elapsed.TotalSeconds; 'now='+(Wait-Until -TimeoutSec 5 -Condition { $true })")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["never=False", "sec=1", "now=True"], r.stdout + r.stderr)
+
+    def test_a1_work_that_arrives_during_the_restart_is_reported_not_hidden(self) -> None:
+        # A1: no admission barrier exists in the agent, so a job landing during the restart cannot be prevented from here.
+        # It must be DETECTED and typed (the agent's own startup recovery then adopts or requeues it).
+        arriving = Path(self._tmp.name) / "arriving-restart.ps1"
+        arriving.write_text(
+            "param([string]$VenueRoot)\r\nSet-Content -LiteralPath (Join-Path $VenueRoot 'inbox\\late.job.ps1') -Value 'x'\r\n", encoding="ascii")
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(arriving))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_WARN_ARRIVED_DURING_RESTART running=0 inbox=1", r.stdout)
+        self.assertRegex(r.stdout, r"DEPLOY_OK sha=[0-9A-F]{64} rollback=.+ restarted=yes")
+
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.
         r = subprocess.run(
