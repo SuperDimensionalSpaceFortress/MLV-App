@@ -6583,7 +6583,7 @@ if ($MidPlayWindowToggles) {
     $wtMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $wtMetrics = $wtOpen + "`n" + @'
 $windowToggleEvidence = $null
-try { $windowToggleEvidence = Get-AttrCudaWindowToggleEvidence -LogText $rawLog } catch { }
+try { $windowToggleEvidence = Get-AttrCudaWindowToggleEvidence -LogText $rawLog -MeasuredSessionId ([string]$measuredSmokeSessionId) } catch { }
 if ($null -eq $windowToggleEvidence) { $windowToggleEvidence = [pscustomobject]@{ requested = 0; driven = 0; keptPlaying = 0; advanced = 0; reason = 'evidence-read-threw' } }
 Write-JobTrace "step window-toggles requested=$($windowToggleEvidence.requested) driven=$($windowToggleEvidence.driven) keptPlaying=$($windowToggleEvidence.keptPlaying) advanced=$($windowToggleEvidence.advanced) reason=$($windowToggleEvidence.reason)"
 '@ + "`n" + $wtClose + "`n"

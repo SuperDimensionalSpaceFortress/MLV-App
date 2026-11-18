@@ -7381,23 +7381,34 @@ function Get-AttrCudaWindowToggleEvidence {
     VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: did each mid-play window toggle of a -MidPlayWindowToggles leg keep Play going, and did the
     picture keep advancing? Pure over the raw run log; self-contained (embedded verbatim into the job, like Get-AttrCudaForegroundVerification).
     .DESCRIPTION
-    Reads the measured session's records (the lines after the LAST playback_smoke.measured_session line):
-      gui_smoke.window_toggle phase=begin|end index= kind= elapsed_ms= play_checked= position= presented_serial= window=WxH ...
-      gui_smoke.window_toggles requested= driven= reason=
+    Reads the measured session's records:
+      gui_smoke.window_toggle phase=begin|end index= kind= elapsed_ms= play_checked= position= presented_serial= window=WxH fullscreen= maximized=
+      gui_smoke.window_toggles requested= driven= reason=            (exactly one, after the loop)
       interaction_trace event=resize.keep_playing ...
-    Toggle i is DRIVEN when it has exactly one begin and one end, in log order, the same kind, parseable, and after the previous toggle's end.
-    It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both,
-    and the window size changed (end != begin; an fs_off must also end at a size other than the preceding fs_on's end, the fullscreen size). It ADVANCED
-    when it is driven and position_end > position_begin and presented_serial_end > presented_serial_begin. A duplicate, unordered, missing or
-    unparseable record (a key repeated inside one record included) makes that toggle count for NOTHING (fail closed). Records are read from the app's
-    record body only: the log prefix and the Qt location suffix are cut first. Returns requested / driven / keptPlaying / advanced / reason
-    (reason = ok only when every requested toggle was driven, kept playing and advanced).
+    The measured session is the one -MeasuredSessionId names (the job's own measured-session read): its records are the lines from that session's
+    playback_smoke.measured_session marker up to the next marker of ANOTHER session. With no id, the log must carry markers of ONE session only (more is
+    ambiguous: reason names it) and the last marker starts the window.
+    The job's schedule is fixed (fs_on, fs_off, restore, maximize at indexes 0..3). Toggle i is DRIVEN when it has exactly one begin and one end, in log
+    order, parseable (a key repeated inside one record is not), the same kind, a kind of the schedule at its index, and after the previous toggle's end.
+    It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both, the
+    window size changed (end != begin; an fs_off must also end at a size other than the preceding fs_on's end, the fullscreen size), the end state is its
+    kind's (fs_on: fullscreen at the end, not at the begin; fs_off: the reverse; restore: neither fullscreen nor maximized; maximize: maximized, not
+    fullscreen) and the end was logged at least 2000 ms after the begin. It ADVANCED when it is driven and position_end > position_begin and
+    presented_serial_end > presented_serial_begin. The one summary record must be present, whole, with requested= and driven= whole numbers (driven
+    equal to what the records show) and reason= ok or incomplete. A duplicate, unordered, missing, contradictory or unparseable record makes that
+    toggle (or the summary) count for NOTHING more and names itself in reason. Records are read from the app's record body only: the log prefix and the
+    Qt location suffix are cut first. Returns requested / driven / keptPlaying / advanced / reason (reason = ok only when every requested toggle was
+    driven, kept playing and advanced and nothing above was anomalous).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
-        [string]$LogText
+        [string]$LogText,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$MeasuredSessionId = ''
     )
 
     # Each run-log line is reduced to the record body the app wrote: the optional `[utc] [LEVEL] [0x<thread>] ` prefix is dropped and the Qt location suffix
@@ -7409,59 +7420,98 @@ function Get-AttrCudaWindowToggleEvidence {
         if ($cut -ge 0) { $body = $body.Substring(0, $cut) }
         $body
     })
-    $start = 0
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^playback_smoke\.measured_session id=') { $start = $i }
-    }
     $anomalies = [System.Collections.Generic.List[string]]::new()
+    $markerIds = @{}
+    $start = 0
+    $end = $lines.Count
+    $wanted = [string]$MeasuredSessionId
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^playback_smoke\.measured_session id=(?<id>\S+)(\s|$)') {
+            $markerIds[$Matches['id']] = $true
+            if ($wanted -eq '' -or $Matches['id'] -ceq $wanted) { $start = $i }
+        }
+    }
+    if ($wanted -eq '') {
+        if ($markerIds.Count -gt 1) { $anomalies.Add('measured-session-ambiguous') }
+    } else {
+        if (-not $markerIds.ContainsKey($wanted)) { $anomalies.Add('measured-session-marker-absent'); $start = $lines.Count }
+        for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^playback_smoke\.measured_session id=(?<id>\S+)(\s|$)' -and $Matches['id'] -cne $wanted) { $end = $i; break }
+        }
+    }
+
+    $expectedKinds = @('fs_on', 'fs_off', 'restore', 'maximize')
     $records = @{}
-    $poisoned = [System.Collections.Generic.HashSet[int]]::new()
-    $keepLines = [System.Collections.Generic.List[int]]::new()
-    $summaryRequested = [System.Collections.Generic.List[int]]::new()
+    $poisoned = @{}
+    $keepLines = @()
+    $summaries = @()
     $maxIndex = -1
-    for ($i = $start; $i -lt $lines.Count; $i++) {
+    for ($i = $start; $i -lt $end; $i++) {
         $line = $lines[$i]
-        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') { $keepLines.Add($i); continue }
-        if ($line -match '^gui_smoke\.window_toggles requested=(?<n>\d{1,6})(\s|$)') { $summaryRequested.Add([int]$Matches['n']); continue }
-        if ($line -notmatch '^gui_smoke\.window_toggle phase=') { continue }
+        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') { $keepLines += $i; continue }
+        $isSummary = $line -match '^gui_smoke\.window_toggles '
+        if (-not $isSummary -and $line -notmatch '^gui_smoke\.window_toggle phase=') { continue }
         $values = @{}
         $repeatedKey = $false
         foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) {
             if ($values.ContainsKey($match.Groups['key'].Value)) { $repeatedKey = $true }
             $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
         }
+        if ($isSummary) { $summaries += , @{ values = $values; repeated = $repeatedKey }; continue }
         [int]$index = -1
-        if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0)) {
+        if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0 -and $index -lt 1000)) {
             $anomalies.Add('unparseable-record-without-index')
             continue
         }
         if ($index -gt $maxIndex) { $maxIndex = $index }
         [int]$playChecked = -1
         [int]$position = -1
+        [int]$fullscreen = -1
+        [int]$maximized = -1
         [long]$serial = -1
         [long]$elapsed = -1
         $window = $null
         if ($values.ContainsKey('window') -and ([string]$values['window']) -match '^(?<w>\d+)x(?<h>\d+)$') { $window = $Matches['w'] + 'x' + $Matches['h'] }
         $usable = (-not $repeatedKey) -and ($values['phase'] -eq 'begin' -or $values['phase'] -eq 'end') -and
-            $values.ContainsKey('kind') -and
+            $values.ContainsKey('kind') -and ($expectedKinds -contains [string]$values['kind']) -and
             $values.ContainsKey('play_checked') -and [int]::TryParse([string]$values['play_checked'], [ref]$playChecked) -and ($playChecked -eq 0 -or $playChecked -eq 1) -and
+            $values.ContainsKey('fullscreen') -and [int]::TryParse([string]$values['fullscreen'], [ref]$fullscreen) -and ($fullscreen -eq 0 -or $fullscreen -eq 1) -and
+            $values.ContainsKey('maximized') -and [int]::TryParse([string]$values['maximized'], [ref]$maximized) -and ($maximized -eq 0 -or $maximized -eq 1) -and
             $values.ContainsKey('position') -and [int]::TryParse([string]$values['position'], [ref]$position) -and
-            $values.ContainsKey('presented_serial') -and [long]::TryParse([string]$values['presented_serial'], [ref]$serial) -and
-            $values.ContainsKey('elapsed_ms') -and [long]::TryParse([string]$values['elapsed_ms'], [ref]$elapsed) -and
+            $values.ContainsKey('presented_serial') -and ([string]$values['presented_serial'] -match '^\d{1,15}$') -and
+            $values.ContainsKey('elapsed_ms') -and ([string]$values['elapsed_ms'] -match '^\d{1,15}$') -and
             ($null -ne $window)
-        if (-not $usable) { [void]$poisoned.Add($index); continue }
-        if (-not $records.ContainsKey($index)) {
-            $records[$index] = @{ begin = [System.Collections.Generic.List[object]]::new(); end = [System.Collections.Generic.List[object]]::new() }
-        }
-        $records[$index][[string]$values['phase']].Add([pscustomobject]@{
+        if (-not $usable) { $poisoned[$index] = $true; continue }
+        $serial = [long]$values['presented_serial']
+        $elapsed = [long]$values['elapsed_ms']
+        if (-not $records.ContainsKey($index)) { $records[$index] = @{ begin = @(); end = @() } }
+        $phaseName = [string]$values['phase']
+        $entry = $records[$index]
+        $entry[$phaseName] += , [pscustomobject]@{
             line = $i; kind = [string]$values['kind']; playChecked = $playChecked; position = $position; serial = $serial; elapsed = $elapsed; window = $window
-        })
+            fullscreen = $fullscreen; maximized = $maximized
+        }
     }
 
-    $requested = 0
-    if ($summaryRequested.Count -eq 1) { $requested = $summaryRequested[0] }
-    elseif ($summaryRequested.Count -gt 1) { $anomalies.Add('duplicate-window-toggles-summary'); $requested = $maxIndex + 1 }
-    else { $requested = $maxIndex + 1 }
+    # The one summary record: whole and not contradicted by the records above.
+    [int]$summaryRequested = -1
+    [int]$summaryDriven = -1
+    if ($summaries.Count -eq 0) { $anomalies.Add('no-window-toggles-summary') }
+    elseif ($summaries.Count -gt 1) { $anomalies.Add('duplicate-window-toggles-summary') }
+    else {
+        $sv = $summaries[0].values
+        $sumOk = (-not $summaries[0].repeated) -and
+            $sv.ContainsKey('requested') -and ([string]$sv['requested'] -match '^\d{1,6}$') -and
+            $sv.ContainsKey('driven') -and ([string]$sv['driven'] -match '^\d{1,6}$') -and
+            $sv.ContainsKey('reason') -and ($sv['reason'] -ceq 'ok' -or $sv['reason'] -ceq 'incomplete')
+        if (-not $sumOk) { $anomalies.Add('window-toggles-summary-unreadable') }
+        else {
+            $summaryRequested = [int]$sv['requested']
+            $summaryDriven = [int]$sv['driven']
+        }
+    }
+    $requested = $maxIndex + 1
+    if ($summaryRequested -ge 0) { $requested = $summaryRequested }
     if ($maxIndex -ge $requested) { $anomalies.Add('toggle-index-beyond-requested'); $requested = $maxIndex + 1 }
     if ($requested -le 0) { $anomalies.Add('no-window-toggle-records') }
 
@@ -7474,14 +7524,15 @@ function Get-AttrCudaWindowToggleEvidence {
     for ($t = 0; $t -lt $requested; $t++) {
         $rec = $null
         if ($records.ContainsKey($t)) { $rec = $records[$t] }
-        if ($null -eq $rec -and -not $poisoned.Contains($t)) { $anomalies.Add("toggle-${t}:no-records"); $previousEnd = $null; continue }
-        if ($poisoned.Contains($t)) { $anomalies.Add("toggle-${t}:unparseable-record"); $previousEnd = $null; continue }
+        if ($null -eq $rec -and -not $poisoned.ContainsKey($t)) { $anomalies.Add("toggle-${t}:no-records"); $previousEnd = $null; continue }
+        if ($poisoned.ContainsKey($t)) { $anomalies.Add("toggle-${t}:unparseable-record"); $previousEnd = $null; continue }
         if ($rec.begin.Count -ne 1 -or $rec.end.Count -ne 1) { $anomalies.Add("toggle-${t}:duplicate-or-missing-phase"); $previousEnd = $null; continue }
         $b = $rec.begin[0]
         $e = $rec.end[0]
         if ($e.line -le $b.line -or $e.kind -ne $b.kind -or $e.elapsed -lt $b.elapsed -or $b.line -le $previousEndLine) {
             $anomalies.Add("toggle-${t}:unordered"); $previousEnd = $null; continue
         }
+        if ($t -ge $expectedKinds.Count -or $b.kind -ne $expectedKinds[$t]) { $anomalies.Add("toggle-${t}:unexpected-kind"); $previousEnd = $null; continue }
         $driven++
         $keepBetween = 0
         foreach ($k in $keepLines) { if ($k -gt $b.line -and $k -lt $e.line) { $keepBetween++ } }
@@ -7491,12 +7542,21 @@ function Get-AttrCudaWindowToggleEvidence {
         # the window must end at a size other than it began at; an fs_off must also LEAVE the size the preceding fs_on ended at (the fullscreen size)
         if ($e.window -eq $b.window) { $problems.Add('window-size-unchanged') }
         if ($b.kind -eq 'fs_off' -and $null -ne $previousEnd -and $previousKind -eq 'fs_on' -and $e.window -eq $previousEnd.window) { $problems.Add('window-still-fullscreen-size') }
+        # the end state is the kind's own, and the end came at least the 2000 ms settle window after the begin
+        $stateOk = $false
+        if ($b.kind -eq 'fs_on') { $stateOk = ($b.fullscreen -eq 0 -and $e.fullscreen -eq 1) }
+        elseif ($b.kind -eq 'fs_off') { $stateOk = ($b.fullscreen -eq 1 -and $e.fullscreen -eq 0) }
+        elseif ($b.kind -eq 'restore') { $stateOk = ($e.fullscreen -eq 0 -and $e.maximized -eq 0) }
+        elseif ($b.kind -eq 'maximize') { $stateOk = ($e.fullscreen -eq 0 -and $e.maximized -eq 1) }
+        if (-not $stateOk) { $problems.Add('end-state-not-the-kinds') }
+        if (($e.elapsed - $b.elapsed) -lt 2000) { $problems.Add('settle-interval-short') }
         if ($problems.Count -eq 0) { $kept++ } else { $anomalies.Add("toggle-${t}:" + ($problems -join '+')) }
         if ($e.position -gt $b.position -and $e.serial -gt $b.serial) { $advanced++ } else { $anomalies.Add("toggle-${t}:not-advanced") }
         $previousEndLine = $e.line
         $previousEnd = $e
         $previousKind = $b.kind
     }
+    if ($summaryDriven -ge 0 -and $summaryDriven -ne $driven) { $anomalies.Add("summary-driven-$summaryDriven-but-records-show-$driven") }
     $reason = 'ok'
     if ($anomalies.Count -gt 0 -or $driven -ne $requested -or $kept -ne $requested -or $advanced -ne $requested) {
         $reason = if ($anomalies.Count -gt 0) { ($anomalies -join ';') } else { 'incomplete' }

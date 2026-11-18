@@ -15672,6 +15672,8 @@ class MidPlayWindowToggleLegSpecTests(unittest.TestCase):
         # a fullscreen leg that does not set the key is untouched by the rule
         plain = json.loads((DV / "legs/m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
         self.jsonschema.validate(plain, self.schema)
+        # adversary A5 (advisory): an explicit false is no request, so the live validator and the schema agree on it
+        self.jsonschema.validate(dict(plain, generatorArgs=dict(plain["generatorArgs"], midPlayWindowToggles=False)), self.schema)
 
     def test_the_legs_are_the_card_s_pair_in_the_card_s_order(self) -> None:
         self.assertEqual(list(FSTOGGLE_LEGS)[0], "legs/m16-1457-native-windowed-s2-fstoggle.json")
@@ -15688,6 +15690,8 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     KINDS = ("fs_on", "fs_off", "restore", "maximize")
     # window size at each toggle's begin and end: maximized 1920x1040 -> fullscreen 1920x1080 -> maximized -> normal 1280x693 -> maximized
     SIZES = (("1920x1040", "1920x1080"), ("1920x1080", "1920x1040"), ("1920x1040", "1280x693"), ("1280x693", "1920x1040"))
+    # (fullscreen, maximized) at each toggle's begin and end: fs_on enters fullscreen, fs_off leaves it for maximized, restore is normal, maximize is maximized
+    FLAGS = ((((0, 1)), ((1, 0))), (((1, 0)), ((0, 1))), (((0, 1)), ((0, 0))), (((0, 0)), ((0, 1))))
 
     @classmethod
     def toggle(cls, i: int, phase: str, *, play: int = 1, pos: int | None = None, serial: int | None = None, window: str | None = None, kind: str | None = None,
@@ -15697,12 +15701,12 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             serial = 1000 * i + 100 if serial is None else serial
             window = cls.SIZES[i][0] if window is None else window
             return (f"gui_smoke.window_toggle phase=begin index={i} kind={kind or cls.KINDS[i]} at_ms={4000 * (i + 1)} elapsed_ms={4000 * (i + 1) + 7} "
-                    f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen=0 maximized=1")
+                    f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen={cls.FLAGS[i][0][0]} maximized={cls.FLAGS[i][0][1]}")
         pos = 100 * i + 60 if pos is None else pos
         serial = 1000 * i + 600 if serial is None else serial
         window = cls.SIZES[i][1] if window is None else window
         return (f"gui_smoke.window_toggle phase=end index={i} kind={kind or cls.KINDS[i]} elapsed_ms={4000 * (i + 1) + 2007} "
-                f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen=0 maximized=1")
+                f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen={cls.FLAGS[i][1][0]} maximized={cls.FLAGS[i][1][1]}")
 
     KEEP = "interaction_trace event=resize.keep_playing width=1920 height=1080 fullscreen=1"
 
@@ -15721,16 +15725,16 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             lines.append(summary)
         return "\n".join(lines)
 
-    def run_cases(self, logs: list[str]) -> list[dict]:
+    def run_cases(self, logs: list[str], sessions: list[str] | None = None) -> list[dict]:
         with tempfile.TemporaryDirectory(prefix="wt-ev-") as d:
             path = Path(d) / "cases.json"
-            path.write_text(json.dumps([{"log": log} for log in logs]), encoding="utf-8")
+            path.write_text(json.dumps([{"log": log, "session": (sessions[n] if sessions else "3")} for n, log in enumerate(logs)]), encoding="utf-8")
             script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
                       "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
                       "$specs = @('m16-1457-native-windowed-s2-fstoggle', 'm16-1457-native-windowed-s1-fstoggle') | ForEach-Object { [IO.File]::ReadAllText('"
                       f"{DV}/legs/' + $_ + '.json') | ConvertFrom-Json }}\n"
                       "@($cases | ForEach-Object {\n"
-                      "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log)\n"
+                      "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId ([string]$_.session)\n"
                       "  $summary = [ordered]@{ result = 'MEASUREMENT_CAPTURED'; lookAssistForced = $true; gpuFramesTotal = 599; lookFlavorReported = 'cinematic'\n"
                       "    windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced\n"
                       "    windowToggleEvidenceReason = $e.reason }\n"
@@ -15789,11 +15793,30 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "A3: fs_off ends at the fullscreen size fs_on ended at, though it began elsewhere": (
                 self.log(mutate=lambda i, b, e: (self.toggle(1, "begin", window="1280x693") if i == 1 else b, self.toggle(1, "end", window="1920x1080") if i == 1 else e)),
                 (4, 4, 3, 4), False),
+            "A2: every kind replaced by restore (a kind outside its index's schedule)": (
+                self.log(mutate=lambda i, b, e: (b.replace(f"kind={self.KINDS[i]}", "kind=restore"), e.replace(f"kind={self.KINDS[i]}", "kind=restore"))), (4, 1, 1, 1), False),
+            "A2: fs_on replaced by an unknown kind": (
+                self.log(mutate=lambda i, b, e: (b.replace("kind=fs_on", "kind=unknown"), e.replace("kind=fs_on", "kind=unknown"))), (4, 3, 3, 3), False),
+            "A2: every fullscreen and maximized flag 0": (
+                self.log(mutate=lambda i, b, e: (b.replace("fullscreen=1", "fullscreen=0").replace("maximized=1", "maximized=0"),
+                                                 e.replace("fullscreen=1", "fullscreen=0").replace("maximized=1", "maximized=0"))), (4, 4, 1, 4), False),
+            "A2: every elapsed_ms 0 (no settle interval)": (
+                self.log(mutate=lambda i, b, e: (re.sub(r"elapsed_ms=\d+", "elapsed_ms=0", b), re.sub(r"elapsed_ms=\d+", "elapsed_ms=0", e))), (4, 4, 0, 4), False),
+            "A3: a summary repeating requested= (the first is not consumed)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok requested=5"), (4, 4, 4, 4), False),
+            "A3: a contradictory summary (driven=0 reason=incomplete)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=0 reason=incomplete"), (4, 4, 4, 4), False),
+            "A3: no summary at all": (self.log(summary=None), (4, 4, 4, 4), False),
+            "A3: a summary with a reason outside ok / incomplete": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=not_windowed"), (4, 4, 4, 4), False),
+            "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
+                self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (
                 "\n".join(self.log(summary="gui_smoke.window_toggles requested=4 driven=2 reason=incomplete").split("\n")[:11] +
                           ["gui_smoke.window_toggles requested=4 driven=2 reason=incomplete"]), (4, 2, 2, 2), False),
         }
-        out = self.run_cases([log for log, _, _ in cases.values()])
+        sessions = ["2" if name.startswith("A4:") else "3" for name in cases]
+        out = self.run_cases([log for log, _, _ in cases.values()], sessions)
         self.assertEqual(len(out), len(cases))
         for (name, (log, expected, passes)), got in zip(cases.items(), out, strict=True):
             with self.subTest(case=name):
