@@ -1342,6 +1342,299 @@ def shell_acts(command):
     return acts
 
 
+# HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1 -- PER-STATEMENT DELETE/MOVE BINDING (PB).
+#
+# `shell_acts` answers WHETHER a command deletes or moves anything; NA-2 used to charge that act
+# to EVERY protected token on the line.  Measured on 2026-11-17: a read-only `Select-String
+# -Pattern 'Remove-Item Env:'` over another lane's output file, a `-match 'Confirm|rm-'` filter
+# over a hub-tools listing, and two `Remove-Item Env:GIT_*` cleanups were each refused as
+# "deleting <run dir>".  This binds a delete/move verb to the tokens it can actually reach:
+#
+#   * a verb OUTSIDE quotes binds the tokens of ITS OWN statement (`;`, `&&`, `||`, `&` and an
+#     unescaped newline outside quotes and parentheses end a statement; a pipe does not);
+#   * it falls back to the WHOLE command -- the old reading, never looser -- when the command
+#     cannot be lexed (heredoc, here-string, `$'`, smart quotes, unbalanced quotes or
+#     parentheses), when the statement may hide its target (`$var` other than
+#     `$true/$false/$null`, `%NAME%`, `@splat`, `{}`), when the verb has no literal operand
+#     (pipeline-fed), or when an operand is relative and the command changes directory;
+#   * `Env:`/`Variable:`/`Function:`/`Alias:` operands name no file, and the value after
+#     `-ErrorAction`/`-WarningAction`/... is a preference, not an operand;
+#   * a verb INSIDE a quoted string is TEXT unless something in the command can evaluate a
+#     string (`_command_can_evaluate_a_string`).  When nothing can, it binds the string body
+#     plus its literal operands; when something can, the whole command, because deciding which
+#     strings are data is quote masking (G1), which this card does not ship;
+#   * an interpreter delete (`os.remove(` and the like) binds the whole command, as before.
+#
+# NO QUOTE MASKING: the raw command is scanned; quoted spans are only used to find statement
+# separators and to locate a verb inside a string.  Truncation keeps its own attribution
+# (`truncating_destinations`), unchanged.
+
+_SHELL_DELETE_RX = re.compile(
+    r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b|\bremove-item\b|\bgit\s+rm\b", re.I
+)
+_INTERP_DELETE_RX = re.compile(
+    r"\bos\.(?:remove|unlink)\s*\(|\bshutil\.rmtree\s*\(|\.unlink\s*\(", re.I
+)
+_SHELL_MOVE_RX = re.compile(
+    r"(?:^|[\s;&|`(])(?:mv|move)\b|\bmove-item\b|\brename-item\b|\bgit\s+mv\b", re.I
+)
+_INTERP_MOVE_RX = re.compile(r"\bos\.rename\s*\(|\bshutil\.move\s*\(", re.I)
+_DIR_CHANGE_RX = re.compile(
+    r"(?:^|[\s;&|`(])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)\b",
+    re.I,
+)
+_HARMLESS_DOLLAR_RX = re.compile(r"(?:-[\w-]+:)?\$(?:true|false|null)", re.I)
+_PS_DRIVE_OPERAND_RX = re.compile(r"^(?:env|variable|function|alias):[\\/]?[\w.*?-]*$", re.I)
+_PS_PREFERENCE_PARAM_RX = re.compile(
+    r"^-(?:erroraction|ea|warningaction|wa|informationaction|infa|progressaction)$", re.I
+)
+_PS_PREFERENCE_VALUE_RX = re.compile(
+    r"^(?:silentlycontinue|stop|continue|inquire|ignore|suspend|break)$", re.I
+)
+# Anything that can turn a STRING into code: a call or dot-source operator, an evaluating
+# cmdlet or method, a shell/interpreter/launcher name, an inline-command flag, `/c` or `/k`,
+# or a script path (PowerShell runs `C:\x\a.ps1 'arg'` without `&`).  A glob like `*.ps1` is
+# a filter, not a script.  Over-matching only costs the fallback to whole-command binding.
+_STRING_EVAL_RX = re.compile(
+    # `&` the call operator (not `&&`), and `.` the dot-source operator -- which takes a
+    # space or a quote after it, so `(Get-Item $o).Length` and `$_.Name` are not one.
+    r"(?:^|[\s;|(){}=])(?<!&)&(?!&)(?=\s*[\"'$({\[\w])"
+    r"|(?:^|[\s;|&({}=])\.(?=\s+[\"'$({\[\w]|[\"'$])"
+    r"|\b(?:invoke-expression|invoke-command|invoke-item|start-process|start-job"
+    r"|start-threadjob|scriptblock|foreach-object\s+-parallel|invokescript|invokecommand"
+    r"|executioncontext|add-type|invoke-wmimethod|invoke-cimmethod|scheduledtask"
+    r"|register-scheduledjob|register-engineevent|register-objectevent)\b"
+    r"|\.(?:invoke|invokescript|run|exec|create|start)\s*\("
+    r"|(?:^|[\s;|&(){}=`])(?:pwsh|powershell|bash|sh|zsh|dash|ksh|cmd|wsl|python\d*|py"
+    r"|node|perl|ruby|eval|exec|xargs|source|sudo|env|nohup|timeout|watch|git|iex|icm"
+    r"|saps|start|ii|call|wscript|cscript|mshta|rundll32|schtasks|runas|wmic)(?:\.exe)?"
+    r"(?=[\s;|&)]|$)"
+    r"|(?:^|\s)-(?:c|command|e|ec|enc|encodedcommand)(?=[\s:]|$)"
+    r"|(?:^|\s)/[ck](?=\s|$)"
+    r"|(?<!\*)\.(?:ps1|psm1|psd1|sh|bash|py|pyw|cmd|bat|js|mjs|cjs|vbs|exe)\b",
+    re.I,
+)
+# Bash runs a word that EXPANDS to a command name (`$c 'rm -rf x'` with c=eval), and both
+# shells substitute commands; for Bash any expansion or backtick counts as an evaluator.
+_BASH_EXPANSION_RX = re.compile(r"\$[\w{(]|`")
+
+
+def _command_can_evaluate_a_string(command, tool):
+    if _STRING_EVAL_RX.search(command):
+        return True
+    return tool == "Bash" and bool(_BASH_EXPANSION_RX.search(command))
+
+
+def quoted_spans(command, tool):
+    """``[(start, end)]`` of every quoted string (quotes included), or None if unlexable."""
+    if not command:
+        return []
+    if "@\"" in command or "@'" in command or "<<" in command or "$'" in command:
+        return None
+    if any(char in command for char in u"\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f"):
+        return None
+    bash = tool == "Bash"
+    escape = "\\" if bash else "`"
+    spans = []
+    index = 0
+    length = len(command)
+    while index < length:
+        char = command[index]
+        if char == escape:
+            index += 2
+            continue
+        if char == "'":
+            probe = index + 1
+            while True:
+                close = command.find("'", probe)
+                if close == -1:
+                    return None
+                if not bash and close + 1 < length and command[close + 1] == "'":
+                    probe = close + 2
+                    continue
+                break
+            spans.append((index, close + 1))
+            index = close + 1
+            continue
+        if char == '"':
+            probe = index + 1
+            close = -1
+            while probe < length:
+                inner = command[probe]
+                if inner == escape:
+                    probe += 2
+                    continue
+                if inner == '"':
+                    if not bash and probe + 1 < length and command[probe + 1] == '"':
+                        probe += 2
+                        continue
+                    close = probe
+                    break
+                probe += 1
+            if close == -1:
+                return None
+            spans.append((index, close + 1))
+            index = close + 1
+            continue
+        index += 1
+    return spans
+
+
+def _statement_bounds(command, tool, position, spans):
+    """``(start, end)`` of the statement holding ``position``, or None when unbalanced."""
+    escape = "\\" if tool == "Bash" else "`"
+    length = len(command)
+    in_span = [False] * length
+    for start, end in spans:
+        for point in range(start, end):
+            in_span[point] = True
+    cuts = []
+    depth = 0
+    index = 0
+    while index < length:
+        char = command[index]
+        if in_span[index]:
+            index += 1
+            continue
+        if char == escape:
+            index += 2
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0:
+            if char == ";":
+                cuts.append((index, index + 1))
+            elif char in "&|" and command[index : index + 2] in ("&&", "||"):
+                cuts.append((index, index + 2))
+                index += 2
+                continue
+            elif char == "&":
+                before = command[index - 1] if index > 0 else ""
+                after = command[index + 1] if index + 1 < length else ""
+                if before not in "><" and after != ">":
+                    cuts.append((index, index + 1))
+            elif char == "\n":
+                tail = "".join(
+                    " " if in_span[point] else command[point] for point in range(0, index)
+                ).rstrip(" \t\r")
+                head = command[index + 1 :].lstrip(" \t\r")
+                continued = (tail[-1:] in ("|", "&", ",", "(", "{", escape)) or head[:1] == "|"
+                if not continued:
+                    cuts.append((index, index + 1))
+        index += 1
+    if depth != 0:
+        return None
+    start = 0
+    for cut_start, cut_end in cuts:
+        if cut_end <= position:
+            start = cut_end
+        elif cut_start > position:
+            return start, cut_start
+    return start, length
+
+
+def _statement_hides_its_target(statement_tokens):
+    for token in statement_tokens:
+        if "$" in token and not _HARMLESS_DOLLAR_RX.fullmatch(token):
+            return True
+        if re.search(r"%[A-Za-z_]\w*%", token):
+            return True
+        if token.startswith("@") or token in ("{}", "{}+"):
+            return True
+    return False
+
+
+def _verb_operands(text):
+    found = []
+    skip_value = False
+    for token in tokens(text):
+        if skip_value:
+            skip_value = False
+            if _PS_PREFERENCE_VALUE_RX.match(token):
+                continue
+        if token.startswith("-"):
+            skip_value = bool(_PS_PREFERENCE_PARAM_RX.match(token))
+            continue
+        found.append(token)
+    return found
+
+
+def _operands_unprovable(operands, dir_change):
+    if not operands:
+        return True
+    files = [token for token in operands if not _PS_DRIVE_OPERAND_RX.match(token)]
+    return dir_change and any(not is_absolute(norm(token)) for token in files)
+
+
+def _bind_one_verb(command, tool, spans, match, dir_change):
+    """The tokens one delete/move verb can reach, or None for whole-command binding."""
+    position = match.end() - 1
+    span = next(((s, e) for (s, e) in spans if s < position < e - 1), None)
+    if span is None:
+        bounds = _statement_bounds(command, tool, position, spans)
+        if bounds is None:
+            return None
+        statement_tokens = tokens(command[bounds[0] : bounds[1]])
+        if _statement_hides_its_target(statement_tokens):
+            return None
+        if _operands_unprovable(_verb_operands(command[match.end() : bounds[1]]), dir_change):
+            return None
+        return statement_tokens
+    start, end = span
+    body = command[start + 1 : end - 1]
+    if _command_can_evaluate_a_string(command, tool):
+        return None
+    if command[start] == '"' and "$(" in body:
+        return None
+    before = command[start - 1] if start > 0 else " "
+    after = command[end] if end < len(command) else " "
+    if not (before.isspace() or before in "(;|&=") or not (after.isspace() or after in ");|&"):
+        return None
+    clause = re.split(r";|&&|\|\||\n|\|", command[match.end() : end - 1])[0]
+    operands = _verb_operands(clause)
+    if _statement_hides_its_target(operands):
+        return None
+    if operands and _operands_unprovable(operands, dir_change):
+        return None
+    # Nothing in the command can run this string, so the verb is text.  A verb with no
+    # operand at all (`-match 'Confirm|rm-'`) names nothing but the string itself.
+    return [body] + operands
+
+
+def positional_bindings(command, tool):
+    """``{"delete": [tokens], "move": [tokens]}`` -- what each act can reach (PB above)."""
+    command = command or ""
+    whole = tokens(command)
+    bound = {}
+    scan = _GIT_RM_CACHED_RX.sub(lambda match: "_" * len(match.group(0)), command)
+    spans = quoted_spans(command, tool)
+    dir_change = bool(_DIR_CHANGE_RX.search(command))
+    for act, shell_rx, interp_rx in (
+        ("delete", _SHELL_DELETE_RX, _INTERP_DELETE_RX),
+        ("move", _SHELL_MOVE_RX, _INTERP_MOVE_RX),
+    ):
+        if interp_rx.search(scan):
+            bound[act] = list(whole)
+            continue
+        matches = list(shell_rx.finditer(scan))
+        if not matches:
+            continue
+        if spans is None:
+            bound[act] = list(whole)
+            continue
+        for match in matches:
+            got = _bind_one_verb(command, tool, spans, match, dir_change)
+            if got is None:
+                bound[act] = list(whole)
+                break
+            bound.setdefault(act, []).extend(got)
+    return bound
+
+
 # ------------------------------------------------------------------------- NA-1
 
 _PUSH_RX = re.compile(r"\bgit\b[^\n;|&]*\bpush\b", re.I)
@@ -2773,7 +3066,153 @@ def _create_is_admissible(ctx, path_norm):
     return True
 
 
-def _na2_decide(ctx, path_norm, acts, source):
+# ------------------------------- NA-2: the CALLING lane's OWN run dir (HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1)
+#
+# Lanes keep scratch scripts, args files and captured output in their own run dir, and NA-2
+# refused every shrinking Edit/Write and every shell create there (14 measured refusals across
+# 9 cards, 2026-11-16/17).  Two NARROW admits, both only for a file DIRECTLY in the calling
+# lane's run dir (derived from MLV_LANE_PROMPT, which a tool call cannot set and NA-3 refuses to
+# persist), and never for a guarded name:
+#   (a) a shrinking Edit/Write of an existing plain file (no link, junction, 8.3 or trailing-dot
+#       alias, ADS, or second hard link);
+#   (b) a shell truncating write that provably CREATES: every spelling is an absolute literal
+#       path that does not exist, and the command creates no link.
+# Delete and move are NOT admitted anywhere: they raise before either admit is reached.
+# LIMIT (recorded): an earlier PROGRAM in the same shell call could create a link at the fresh
+# name; the hook treats interpreter/script effects as invisible by design, and such a program
+# could truncate a guarded file directly today.
+_RUN_DIR_PREFIX = "lane-"
+# The spec, the dispatcher's and guards' artifacts, and the time budget.  Narrowing only.
+_OWN_RUN_GUARDED_NAME_RX = re.compile(
+    r"summary\.md|dispatch-proof\.txt|prompt[^/]*\.md|[^/]*prompt\.md|[^/]*\.prompt\.txt"
+    r"|[^/]*\.receipt\.json|[a-z]+-\d{3}\.[^/]*|dispatch\.(?:out|err)\.txt"
+    r"|invoke(?:\.err)?\.txt|contract-sha256\.txt|adversary-deadline\.txt"
+    r"|non-building\.marker|subject-declared\.txt|prepush-guard\.log"
+    r"|adversary-[^/]*\.json|adversary-successors\.md"
+)
+# A command that may create a link at the fresh name it then truncates.  `|ln)` inside a
+# quoted grep pattern is not `ln` (no whitespace follows it).
+_LINK_CREATE_RX = re.compile(
+    r"\bmklink\b|\bfsutil\b|\bjunction\b|(?:^|[\s;&|(`{])ln\s"
+    r"|\b(?:symbolic|hard)link\b|symlink_to|hardlink_to|\bos\.(?:sym)?link\s*\("
+    r"|createhardlink|createsymboliclink|\bcp\s+(?:-\w*[ls]\w*|--(?:sym)?link)\b"
+    r"|(?:^|[\s;&|(`{])(?:ren|rename)\s",
+    re.I,
+)
+
+
+def _own_lane_run_dir(ctx):
+    """The CALLING lane's run dir (normalised), or None (ported from #818).
+
+    Derived from ``MLV_LANE_PROMPT`` -- the dispatcher sets it to the absolute path of the
+    lane's prompt file, which lives in the lane's run dir -- and accepted only when that
+    directory is a DIRECT child of ``<board root>/.claude-state/fleet-runs`` whose name starts
+    ``lane-``.  Unset, unresolvable, or anywhere else: None, and nothing is loosened.
+    """
+    if not ctx.lane_prompt:
+        return None
+    prompt_norm = norm(ctx.lane_prompt)
+    if _unresolved_env_ref(prompt_norm) or "/" not in prompt_norm:
+        return None
+    run_dir = prompt_norm.rsplit("/", 1)[0]
+    if "/" not in run_dir:
+        return None
+    parent, leaf = run_dir.rsplit("/", 1)
+    fleet_root = norm(os.path.join(ctx.board_root_raw, ".claude-state", "fleet-runs"))
+    if parent != fleet_root or not leaf.startswith(_RUN_DIR_PREFIX):
+        return None
+    return run_dir
+
+
+def _own_run_dir_is_real(ctx):
+    """The run dir exists and resolves to the fleet root's own child (no junction/link)."""
+    try:
+        prompt = expand_hook_env(ctx.lane_prompt.strip().strip('"').strip("'"))
+        run_raw = os.path.dirname(prompt)
+        if not os.path.isdir(run_raw) or os.path.islink(run_raw):
+            return False
+        fleet_raw = os.path.join(ctx.board_root_raw, ".claude-state", "fleet-runs")
+        expected = norm(os.path.join(os.path.realpath(fleet_raw), os.path.basename(run_raw)))
+        return norm(os.path.realpath(run_raw)) == expected
+    except Exception:
+        return False
+
+
+def _own_run_dir_name_ok(ctx, path_norm, raw):
+    """``raw`` names a NON-guarded file directly in the calling lane's real run dir."""
+    run_dir = _own_lane_run_dir(ctx)
+    if run_dir is None or "/" not in path_norm:
+        return False
+    parent, base = path_norm.rsplit("/", 1)
+    if parent != run_dir or not base or _OWN_RUN_GUARDED_NAME_RX.fullmatch(base):
+        return False
+    text = expand_hook_env(str(raw or "").strip().strip('"').strip("'"))
+    if not text or _unresolved_env_ref(text.lower()) is not None:
+        return False
+    segments = text.replace("\\", "/").split("/")
+    if ".." in segments or "." in segments[1:]:
+        return False
+    for name in (base, segments[-1]):
+        # ADS (`x:stream`), an 8.3 short name, or a trailing dot/space that Windows strips.
+        if not name or ":" in name or "~" in name or name[-1] in ". ":
+            return False
+    return _own_run_dir_is_real(ctx)
+
+
+def _own_run_dir_leaf_is_plain(path):
+    """Absent, or a regular file that is not a link/reparse alias and has ONE hard link."""
+    try:
+        if not os.path.lexists(path):
+            return True
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        here = norm(
+            os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+        )
+        if norm(os.path.realpath(path)) != here:
+            return False
+        return os.stat(path).st_nlink == 1
+    except Exception:
+        return False
+
+
+def _own_run_dir_edit_ok(ctx, path_norm):
+    """Admit (a): a shrinking Edit/Write of a plain, non-guarded file in the own run dir."""
+    if ctx.tool not in ("Edit", "Write"):
+        return False
+    if not _own_run_dir_name_ok(ctx, path_norm, ctx.path):
+        return False
+    return _own_run_dir_leaf_is_plain(
+        expand_hook_env(ctx.path.strip().strip('"').strip("'"))
+    )
+
+
+def _own_run_dir_shell_create_ok(ctx, path_norm, acts, spellings):
+    """Admit (b): a shell truncating write that provably CREATES in the own run dir."""
+    if set(acts) != {"truncate"} or not spellings:
+        return False
+    if _LINK_CREATE_RX.search(ctx.command or ""):
+        return False
+    for raw in spellings:
+        if not _own_run_dir_name_ok(ctx, path_norm, raw):
+            return False
+        text = expand_hook_env(str(raw).strip().strip('"').strip("'"))
+        if re.search(r"[$%*?\[\]`]", text) or text.startswith("~"):
+            return False
+        spelled = text.replace("\\", "/")
+        if not is_absolute(spelled.lower()):
+            return False
+        if os.name == "nt" and spelled.startswith("/") and not spelled.startswith("//"):
+            return False
+        try:
+            if os.path.lexists(text) or os.path.lexists(spelled) or os.path.lexists(path_norm):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _na2_decide(ctx, path_norm, acts, source, spellings=None):
     """One protected path, one act set.  Raises Deny, or returns for ALLOW."""
     tag = _carve_tag(ctx, path_norm)
 
@@ -2805,6 +3244,8 @@ def _na2_decide(ctx, path_norm, acts, source):
             # (`Add-Content`, `>>`).  0.2's canonical compound is the one shell write these
             # paths admit, and only because the dedicated act is evaluated BEFORE this rule
             # -- its `Set-Content` half is denied here too, not merely its `Remove-Item`.
+            if tag == "fleet" and _own_run_dir_shell_create_ok(ctx, path_norm, acts, spellings):
+                return  # admit (b): a provable create in the calling lane's own run dir
             if "truncate" in acts:
                 raise Deny(
                     "NA-2",
@@ -2812,6 +3253,8 @@ def _na2_decide(ctx, path_norm, acts, source):
                 )
             return
         if _file_shrinks(ctx):
+            if tag == "fleet" and _own_run_dir_edit_ok(ctx, path_norm):
+                return  # admit (a): the calling lane's own scratch file, not a guarded name
             if tag in ("resume", "seat") and _archive_release_ok(ctx, path_norm, ctx.new_text):
                 return
             raise Deny(
@@ -3106,26 +3549,35 @@ def rule_na2(ctx):
         _refuse_marker_delete_outside_the_act(ctx, acts)
         # HOOK-FALSE-POSITIVE-1: "truncate" is attributed to the TARGET of the redirect or
         # the cmdlet, never to every protected token that happens to share the command
-        # line.  Delete and move keep the whole-command attribution they have always had:
-        # `rm -rf A B` really does name both, and a delete verb's operands are the tokens.
-        # A truncation, by contrast, has exactly one destination per redirect, and reading
-        # a protected file BESIDE one is the commonest read-only act on this board.
-        positional = acts - {"truncate"}
-        targets = (
-            frozenset(norm(dest) for dest in truncating_destinations(ctx.command))
-            if "truncate" in acts
-            else frozenset()
+        # line.  HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1: delete and move are attributed to the
+        # tokens their verb can reach (`positional_bindings`), which falls back to the whole
+        # command whenever that is not provable -- `rm -rf A B` still names both.
+        bound = positional_bindings(ctx.command, ctx.tool)
+        for act in ("delete", "move"):
+            if act in acts and act not in bound:
+                bound[act] = tokens(ctx.command)  # fail closed: the scans disagree
+        bound_norms = dict(
+            (act, frozenset(norm(token) for token in bound_tokens))
+            for act, bound_tokens in bound.items()
         )
+        spellings = {}
+        if "truncate" in acts:
+            for dest in truncating_destinations(ctx.command):
+                spellings.setdefault(norm(dest), []).append(dest)
         for token in tokens(ctx.command):
             path_norm = norm(token)
             if not _is_na2_protected(path_norm):
                 continue
-            token_acts = set(positional)
-            if path_norm in targets:
+            token_acts = set(
+                act
+                for act in ("delete", "move")
+                if act in acts and path_norm in bound_norms.get(act, ())
+            )
+            if path_norm in spellings:
                 token_acts.add("truncate")
             if not token_acts:
                 continue
-            _na2_decide(ctx, path_norm, token_acts, "shell")
+            _na2_decide(ctx, path_norm, token_acts, "shell", spellings.get(path_norm))
         return
     # S125: the SECOND dedicated act is decided BEFORE generic content attribution, and
     # content attribution BEFORE the path guard and its carve-outs -- a carve-out is a
@@ -3641,7 +4093,11 @@ def rule_na6(ctx):
         acts = shell_acts(ctx.command)
         if "delete" not in acts:
             return
-        for token in tokens(ctx.command):
+        # HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1: the same per-statement binding as NA-2, so a
+        # test path run beside `Remove-Item Env:GIT_DIR` is not "deleted"; whenever the
+        # binding is not provable it is the whole command, exactly as before.
+        reach = positional_bindings(ctx.command, ctx.tool).get("delete") or tokens(ctx.command)
+        for token in reach:
             path_norm = norm(token)
             if has_seg(path_norm, "tests") or path_norm.startswith("tests/"):
                 raise Deny("NA-6", "deleting %s removes a test" % path_norm)
