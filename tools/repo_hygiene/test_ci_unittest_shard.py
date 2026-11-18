@@ -2666,6 +2666,71 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIsNone(raised, "terminate_all let an exit out")
         self.assertEqual([proc.returncode for proc in procs], [-9, -9], "a worker was left running")
 
+    # r15 adversary pass 24 A1: the Thread OBJECT can fail to build (MemoryError), and a join can be interrupted.
+    def test_terminate_all_still_ends_every_worker_when_a_thread_cannot_even_be_built(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc()]
+        real_thread = threading.Thread
+        built: list[int] = []
+
+        def thread(*args: object, **kwargs: object) -> threading.Thread:
+            built.append(1)
+            if len(built) == 1:
+                raise MemoryError("thread object allocation failed")
+            return real_thread(*args, **kwargs)
+
+        raised: BaseException | None = None
+        with mock.patch.object(shard, "_kill_tree", return_value=None), mock.patch.object(shard.threading, "Thread", thread):
+            try:
+                results = shard.terminate_all(procs)  # type: ignore[arg-type]
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        self.assertIsNone(raised, f"terminate_all let {raised!r} out")
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9], "a worker was left running")
+        self.assertEqual(len(results), 2)
+
+    def test_terminate_all_still_attempts_every_worker_when_a_join_is_interrupted(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc(), self._RunningProc()]
+        real_join = threading.Thread.join
+        joins: list[int] = []
+
+        def join(thread: threading.Thread, timeout: float | None = None) -> None:
+            joins.append(1)
+            if len(joins) == 1:
+                raise KeyboardInterrupt
+            real_join(thread, timeout)
+
+        raised: BaseException | None = None
+        with mock.patch.object(shard, "_kill_tree", return_value=None), mock.patch.object(threading.Thread, "join", join):
+            try:
+                shard.terminate_all(procs)  # type: ignore[arg-type]
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        self.assertIsNone(raised, f"terminate_all let {raised!r} out")
+        self.assertEqual(len(joins), 3, "a thread after the interrupted join was never waited on")
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9, -9], "a worker was left running")
+
+    # r15 adversary pass 24 A1 sibling: the watchdog threads' own stop() waits are not a place an interrupt may escape from.
+    def test_the_watch_and_the_killer_stop_even_when_the_wait_for_their_thread_is_interrupted(self) -> None:
+        clock = time.monotonic
+        watch = shard.BudgetWatch("ubuntu", 1, 1, 10.0, clock(), clock, lambda: {}, poll_seconds=0.05, out=io.StringIO())
+        killer = shard.DeadlineKiller(clock() + 600, clock, 0.05)
+        for stoppable in (watch, killer):
+            stoppable.start()
+        real_join = threading.Thread.join
+        self.addCleanup(lambda: [real_join(thread, 5) for thread in (watch._thread, killer._thread)])
+
+        def join(thread: threading.Thread, timeout: float | None = None) -> None:
+            raise KeyboardInterrupt
+
+        raised: BaseException | None = None
+        with mock.patch.object(threading.Thread, "join", join):
+            for stoppable in (watch, killer):
+                try:
+                    stoppable.stop()
+                except BaseException as error:  # noqa: BLE001
+                    raised = error
+        self.assertIsNone(raised, f"stop() let {raised!r} out")
+
     # r11 adversary A1 (pass 19): an interrupt after the worker exists but before it is registered must not leave it running.
     def test_an_interrupt_between_the_launch_and_its_registration_still_ends_the_worker(self) -> None:
         import inspect

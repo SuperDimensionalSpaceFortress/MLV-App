@@ -626,7 +626,10 @@ class BudgetWatch:
     def stop(self) -> None:
         self._stopped.set()
         if self._thread.is_alive():
-            self._thread.join()
+            try:
+                self._thread.join()
+            except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
+                pass
 
     def _poll(self) -> None:
         while not self._stopped.wait(self._poll_seconds):
@@ -639,6 +642,11 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
     ``Popen(...)`` never returns in that case, so the caller holds nothing to end. The object is still
     ``self`` in the constructor's frames, which the error's traceback keeps alive; it carries the child's
     ``pid`` (and, on Windows, its handle) as soon as the child exists. ``None`` when there is no such child.
+
+    Known limit: between ``CreateProcess`` returning and the statement that unpacks its result, the child's
+    identity lives only on the interpreter's evaluation stack, in no frame local and on no object. An interrupt
+    landing exactly there (a profile hook that raises on the C-return event does it) leaves nothing here to read,
+    and no wrapper around the call can close that window, since the same one opens after the wrapper's own call.
     """
     link = error.__traceback__
     while link is not None:
@@ -1080,20 +1088,24 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
 
     threads: list[threading.Thread] = []
     for position in range(len(procs)):
-        thread = threading.Thread(target=one, args=(position,), name="shard-terminate", daemon=True)
+        thread: threading.Thread | None = None
         try:
+            thread = threading.Thread(target=one, args=(position,), name="shard-terminate", daemon=True)
             thread.start()
-        except BaseException:  # noqa: BLE001 - no thread to be had (the OS refused one), or an interrupt inside the start
+        except BaseException:  # noqa: BLE001 - no thread to be had (the OS refused one, or not even the object could be built), or an interrupt inside the start
             # A ``SystemExit`` or ``KeyboardInterrupt`` here must not abort the cleanup of every worker still
             # running. An interrupt can land after the thread began: that one is kept and joined, not killed twice.
-            if thread.is_alive():
+            if thread is not None and thread.is_alive():
                 threads.append(thread)
             else:
                 inline(position)
         else:
             threads.append(thread)
     for thread in threads:
-        thread.join(max(0.0, end - time.monotonic()))
+        try:
+            thread.join(max(0.0, end - time.monotonic()))
+        except BaseException:  # noqa: BLE001 - an interrupt while waiting must not leave the other workers unwaited and unreported
+            continue
     return results
 
 
@@ -1175,7 +1187,10 @@ class DeadlineKiller:
     def stop(self) -> None:
         self._stopped.set()
         if self._thread.is_alive():
-            self._thread.join()
+            try:
+                self._thread.join()
+            except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
+                pass
 
 
 @never_exits_zero
