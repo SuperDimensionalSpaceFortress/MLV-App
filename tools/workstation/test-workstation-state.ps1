@@ -3055,6 +3055,21 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         Assert-That ($ddR9RvRole.Count -eq 0) "DENY-BY-DEFAULT-1 r9 adv p18 A1 role guard: all $($ddR9Rv.Count) name a secret" ("misses=$($ddR9RvRole.Count): " + (($ddR9RvRole | Select-Object -First 3) -join '; '))
     }
     Assert-That (-not (Test-CredentialText ('{"ab' + $ddBsA2 + 'ncd"&#58;"x"}'))) 'DENY-BY-DEFAULT-1 r9 adv p18 A1 must-pass: a decodable key with a markup reference is not a credential'
+    # r10 (adversary pass 19 A1, defect class: a wider key candidate swallows a narrower one): the r9 B2 candidate takes any non-ending character after the name, so a rejected leftmost
+    # candidate ('//author.example/?pwd') hid the real key inside it; the rejected candidate is judged again part by part
+    $ddR10Url = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR10Host in @('https://author.example/', 'https://author.example/a/b', 'http://authority.test:8080/x', 'https://secretary.example/', 'see /author/x/')) {
+        foreach ($ddR10Name in @('pwd', 'auth', 'authorization', 'password', 'token', 'api_key')) { $ddR10Url.Add($ddR10Host + '?' + $ddR10Name + '=hunter2') }
+    }
+    $ddR10Url.Add('https://author.example/?x=1&pwd=hunter2')
+    $ddR10Url.Add('https://author.example/?pwd!=hunter2')
+    $ddR10UrlMiss = @($ddR10Url | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR10UrlMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r10 adv p19 A1: all $($ddR10Url.Count) urls with a secret-named query key beside a rejected name word refuse" ("misses=$($ddR10UrlMiss.Count): " + (($ddR10UrlMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 A1 role guard') {
+        $ddR10UrlRole = @($ddR10Url | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR10UrlRole.Count -eq 0) "DENY-BY-DEFAULT-1 r10 adv p19 A1 role guard: all $($ddR10Url.Count) name a secret" ("misses=$($ddR10UrlRole.Count): " + (($ddR10UrlRole | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText 'https://author.example/?name=x')) 'DENY-BY-DEFAULT-1 r10 adv p19 A1 must-pass: a url whose only name words are not secret-named is not a credential'
     # r8 (adversary pass 17 A2, defect class: the reported line counted a line break that a decode produced): the line is the line of the SOURCE, not of the decoded copy
     $ddR8Line = @(
         @{ T = ('{"note":"' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded \n before the key on one source line' },

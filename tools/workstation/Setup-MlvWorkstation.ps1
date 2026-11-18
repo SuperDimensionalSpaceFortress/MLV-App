@@ -1213,6 +1213,7 @@ $CredentialNameCore = (@('password', 'passwd', 'secret', 'credential', 'apikey',
 # r19 pass 21 A1: a '/' or '\' may stand inside a key name ('password/primary', 'vault\secret'): the name run is the classifier's own separators plus those two
 $CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-/\\])([A-Za-z0-9_.\-/\\]*?(?:' + $CredentialNameCore + ')[^\s"''`:=,;{}\[\]()<>]*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
+$script:CredentialKeyPartRegex = [regex]::new('[A-Za-z0-9_.\-/\\]+')   # r10: the name characters of a key candidate, one part per run (Get-CredentialKeyValueHitIndex)
 # r15 (hub ruling on adversary pass 12 A1-A3, DENY BY DEFAULT on the key name): the value span regexes, the quoted-run regexes and the netrc record tokenizer of
 # r14 are gone (they stripped quotes, braces, comments and CDATA before the exemption test). What is left is the CLOSED exemption list, compared against the whole
 # RAW value after trimming outer whitespace only (Test-CredentialValueExempt), and the two netrc regexes (Get-CredentialNetrcHitIndex).
@@ -1446,8 +1447,18 @@ function Get-CredentialKeyValueHitIndex {
         $m = $cand.M
         $key = $m.Groups[1].Value
         $class = $(if ($cand.Residual) { 'strong' } else { Get-CredentialKeyClass $key })
+        $keyOff = 0
+        # r10 (adversary pass 18 A1, defect class: a wider candidate swallows a narrower one): the candidate's trailing run takes any character that does not end a key (r9 B2), so the
+        # leftmost match of 'https://author.example/?pwd=hunter2' is '//author.example/?pwd' (rejected as a whole) and the matches never overlap, which hid the real key 'pwd'. A rejected
+        # candidate is judged again PART BY PART: each run of the classifier's own name characters, in text order (disjoint runs, so linear). The first secret-named part is the key.
+        if (-not $class) {
+            foreach ($seg in $script:CredentialKeyPartRegex.Matches($key)) {
+                $segClass = Get-CredentialKeyClass $seg.Value
+                if ($segClass) { $class = $segClass; $keyOff = $seg.Index; break }
+            }
+        }
         if (-not $class) { continue }
-        $keyStart = $m.Groups[1].Index
+        $keyStart = $m.Groups[1].Index + $keyOff
         $sep = $m.Groups[3].Value
         # r15: a script variable ('$Token = Get-Token') is no longer exempt (deny by default: the ONLY exemptions are the closed literal list)
         $flow = Test-CredentialFlowContext -Text $Text -KeyStart $keyStart -Sep $sep
