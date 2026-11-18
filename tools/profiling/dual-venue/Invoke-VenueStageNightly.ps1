@@ -110,11 +110,11 @@ param(
     # Test-only (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1): from the moment the call's deadline is armed, every WALL-clock read this script makes (Get-WallUtc, the one
     # place that reads [DateTime]::UtcNow) is this many seconds EARLIER, as after a backward NTP correction, a VM resume or a manual clock set. The budget
     # arithmetic reads the monotonic Stopwatch, so it must not notice; a wall-clock budget is re-granted by exactly this much. Production passes none.
-    [ValidateRange(0, 86400)][double]$TestClockStepBackSec = 0,
+    [ValidateRange(0.0, 86400.0)][double]$TestClockStepBackSec = 0,
     # Test-only (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1 r1, adversary A1 on c253316d): the wall clock the soundness read's -CallDeadlineUtc is read against inside VenueChain.psm1
     # is stepped this many seconds (negative = backward) BETWEEN the hand-off projection (Sync-NightlyDeadline) and the module's own sample, as a correction landing in that
     # gap does. It moves no clock of this script's. Production passes none.
-    [ValidateRange(-86400, 86400)][double]$TestWallStepAfterSyncSec = 0,
+    [ValidateRange(-86400.0, 86400.0)][double]$TestWallStepAfterSyncSec = 0,
     # Test-only (MINI3-CUTOVER-STATE-GAPS-1): replaces the share-root read probe Stop-ShareUnreachable uses (ShareRootAccess.psm1); throwing means the
     # root cannot be read. Production passes none.
     # (r16 merge of #826: this seam and -DllJobIdSuffix below are independent parameters; both are kept, neither side's behaviour is dropped.)
