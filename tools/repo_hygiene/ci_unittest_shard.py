@@ -766,7 +766,22 @@ def session_kwargs() -> dict[str, object]:
     return {} if os.name == "nt" else {"start_new_session": True}
 
 
-TREE_KILL_SECONDS = 10.0
+TREE_KILL_SECONDS = 5.0
+
+
+def describe_error(error: BaseException) -> str:
+    """``Type: message`` for an exception, or just its type when rendering the message itself raises.
+
+    A kill error is reported, never allowed to escape, so rendering it must not be able to fail: an audit
+    hook or a patched call can raise an exception whose ``__str__`` raises.
+    """
+    try:
+        return f"{type(error).__name__}: {error}"
+    except Exception:  # noqa: BLE001 - __str__ (or __repr__) of the exception raised
+        try:
+            return type(error).__name__
+        except Exception:  # noqa: BLE001 - not even the type name is readable
+            return "unprintable exception"
 
 
 def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
@@ -775,6 +790,11 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
     ``taskkill /T`` on Windows, the worker's process group elsewhere. Anything that goes wrong, whatever
     its type, comes back as text and never as an exception: ``terminate`` still kills the worker itself and
     reports both. (A test that starts its own session or group on purpose is out of reach of either.)
+
+    ``taskkill`` exit 128 means the root was already gone, and a tree cannot be walked from a dead root, so
+    its descendants may be running: that is reported as "not confirmed", never as a clean kill. (Only a Job
+    Object would contain a tree that orphans itself before the kill; the worker is killed through here
+    while it is still running, so the window is the one between the poll and the ``taskkill``.)
     """
     pid = getattr(proc, "pid", None)
     if not isinstance(pid, int):
@@ -785,7 +805,9 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
                 ["taskkill", "/T", "/F", "/PID", str(pid)], stdin=subprocess.DEVNULL, capture_output=True,
                 timeout=TREE_KILL_SECONDS, creationflags=no_window_flags(), check=False,
             )
-            if done.returncode not in (0, 128):  # 128: no such process, it had already exited
+            if done.returncode == 128:  # no such process: the root exited first, its descendants were not walked
+                return "taskkill found no process 128: the worker had already exited, its process tree is not confirmed ended"
+            if done.returncode != 0:
                 return f"taskkill exited {done.returncode}"
         else:
             try:
@@ -793,7 +815,7 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
             except ProcessLookupError:  # the group is already gone
                 pass
     except Exception as error:  # noqa: BLE001 - an audit hook or a patched run may raise any type
-        return f"{type(error).__name__}: {error}"
+        return describe_error(error)
     return None
 
 
@@ -812,8 +834,36 @@ def terminate(proc: subprocess.Popen[bytes], *, reap: bool = True) -> str | None
         if reap:
             proc.wait()
     except Exception as error:  # noqa: BLE001 - nothing a kill raises may stop the others being killed
-        return f"{type(error).__name__}: {error}" + (f"; {tree_note}" if tree_note else "")
+        return describe_error(error) + (f"; {tree_note}" if tree_note else "")
     return tree_note
+
+
+def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) -> list[str | None]:
+    """``terminate`` every worker at the same time (one thread each); the error text or ``None`` per worker.
+
+    Each ``terminate`` can block for ``TREE_KILL_SECONDS`` in ``taskkill``, so ending the workers one
+    after the other would kill the last one that many seconds per worker late. It never raises.
+    """
+    results: list[str | None] = [None] * len(procs)
+
+    def one(position: int) -> None:
+        try:
+            results[position] = terminate(procs[position], reap=reap)
+        except Exception as error:  # noqa: BLE001 - terminate never raises; a patched one might
+            results[position] = describe_error(error)
+
+    threads: list[threading.Thread] = []
+    for position in range(len(procs)):
+        thread = threading.Thread(target=one, args=(position,), name="shard-terminate", daemon=True)
+        try:
+            thread.start()
+        except Exception:  # noqa: BLE001 - no thread to be had: end this worker here, it is still ended
+            one(position)
+        else:
+            threads.append(thread)
+    for thread in threads:
+        thread.join()
+    return results
 
 
 class DeadlineKiller:
@@ -835,6 +885,7 @@ class DeadlineKiller:
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._procs: list[subprocess.Popen[bytes]] = []
+        self._inflight: set[int] = set()  # being ended by some thread right now
         self.killed: set[int] = set()  # 1-based, in registration order
         # Workers (or their trees) it could not end; a running one is retried every slice, the record stays.
         self.failed: dict[int, str] = {}
@@ -849,21 +900,38 @@ class DeadlineKiller:
         self._kill_due()
 
     def _kill_due(self) -> None:
+        """Kill every running worker that is due. The lock is held only to pick them and to record the
+        result, never across a kill (a ``taskkill`` can block for its whole bound): ``add`` and the other
+        workers' kills are never held up behind it, and the due workers are ended at the same time."""
         with self._lock:
             if self._clock() < self._deadline:
                 return
+            due: list[tuple[int, subprocess.Popen[bytes]]] = []
             for number, proc in enumerate(self._procs, start=1):
+                if number in self.killed or number in self._inflight:
+                    continue  # ended already, or another thread is ending it right now
                 try:
                     if proc.poll() is not None:
                         continue  # a failure already on record stays: the parent reports it
-                    error = terminate(proc, reap=False)
                 except Exception as exc:  # noqa: BLE001 - the watchdog thread must survive anything
-                    error = f"{type(exc).__name__}: {exc}"
-                if error is None:
-                    self.killed.add(number)
-                    self.failed.pop(number, None)
-                else:
-                    self.failed[number] = error  # the others are still killed; the parent reports it
+                    self.failed[number] = describe_error(exc)
+                    continue
+                due.append((number, proc))
+                self._inflight.add(number)
+        if not due:
+            return
+        errors: list[str | None] = ["the kill did not complete"] * len(due)
+        try:
+            errors = terminate_all([proc for _number, proc in due], reap=False)
+        finally:
+            with self._lock:
+                for (number, _proc), error in zip(due, errors, strict=True):
+                    self._inflight.discard(number)
+                    if error is None:
+                        self.killed.add(number)
+                        self.failed.pop(number, None)
+                    else:
+                        self.failed[number] = error  # the others are still killed; the parent reports it
 
     def _run(self) -> None:
         while not self._stopped.wait(self._slice):
@@ -991,13 +1059,14 @@ def run_parallel(
             killer.add(proc)  # from here the deadline is enforced even while the next launch blocks
         watch.check()  # a budget already spent when the workers launch is reported at once
         late = late_workers([proc for proc, _log in procs], deadline, clock)
+        running = [number for number, (proc, _log) in enumerate(procs, start=1) if proc.poll() is None]
+        ended = dict(zip(running, terminate_all([procs[number - 1][0] for number in running]), strict=True))
         for number, (proc, log) in enumerate(procs, start=1):
-            killed = proc.poll() is None
-            if killed:
-                error = terminate(proc)
-                if error is not None:  # the other workers are still killed below
-                    stuck.add(number)
-                    problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
+            killed = number in ended
+            error = ended.get(number)
+            if error is not None:  # the other workers were still killed with it
+                stuck.add(number)
+                problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
             killed = killed or number in killer.killed
             if killed or number in late:
                 problems.append(
@@ -1027,12 +1096,13 @@ def run_parallel(
     finally:
         # An exception above must not leave a worker running: every owned worker is attempted, one that
         # cannot be killed is reported, and the watchdog keeps enforcing the deadline until they are done.
+        leftover = [number for number, (proc, _log) in enumerate(procs, start=1) if proc.poll() is None]
+        ended_late = dict(zip(leftover, terminate_all([procs[number - 1][0] for number in leftover]), strict=True))
         for number, (proc, log) in enumerate(procs, start=1):
-            if proc.poll() is None:
-                error = terminate(proc)
-                if error is not None and number not in stuck:
-                    stuck.add(number)
-                    problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
+            error = ended_late.get(number)
+            if error is not None and number not in stuck:
+                stuck.add(number)
+                problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
             with contextlib.suppress(OSError):
                 log.close()
         killer.stop()

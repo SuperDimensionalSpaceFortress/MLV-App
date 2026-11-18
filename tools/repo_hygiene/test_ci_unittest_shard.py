@@ -1554,6 +1554,123 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIn("could not be terminated", err)
         self.assertIn("process tree", err)
 
+    # r7 adversary pass 10 A1: an exception whose own __str__ raises must not escape any kill path.
+    class _BadDetail(RuntimeError):
+        def __str__(self) -> str:
+            raise self
+
+    def test_an_exception_that_cannot_be_rendered_is_reported_by_type_and_the_worker_is_killed(self) -> None:
+        with self._tree_kill_fails(self._BadDetail("x")):
+            proc = self._pid_proc()
+            result = shard.terminate(proc)
+        self.assertIsNotNone(result)
+        self.assertIn("_BadDetail", result)
+        self.assertEqual(proc.returncode, -9, "the worker itself is still killed")
+        direct = self._RunningProc(self._BadDetail("x"))  # the worker's own kill raising it
+        self.assertIn("_BadDetail", shard.terminate(direct) or "")
+
+    def test_the_watchdog_survives_an_unrenderable_kill_error_and_kills_the_others(self) -> None:
+        bad, good = self._RunningProc(self._BadDetail("x")), self._RunningProc()
+        killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)
+        killer.add(bad)  # must not raise
+        killer.add(good)
+        self.assertEqual(good.returncode, -9)
+        self.assertEqual(sorted(killer.failed), [1])
+        self.assertIn("_BadDetail", killer.failed[1])
+
+    def test_the_watchdog_survives_a_terminate_that_raises_an_unrenderable_error(self) -> None:
+        first, second = self._RunningProc(), self._RunningProc()
+
+        def flaky(proc: object, *, reap: bool = True) -> str | None:
+            if proc is first:
+                raise self._BadDetail("x")
+            proc.kill()
+            return None
+
+        killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)
+        with mock.patch.object(shard, "terminate", flaky):
+            killer.add(first)  # must not raise
+            killer.add(second)
+        self.assertEqual(second.returncode, -9)
+        self.assertIn("_BadDetail", killer.failed[1])
+
+    # r7 adversary pass 10 A2: the watchdog never holds its lock across a blocking tree kill, and the
+    # workers' trees are ended at the same time, not one after the other.
+    def test_the_watchdog_ends_the_trees_of_two_workers_at_the_same_time(self) -> None:
+        both_in = threading.Barrier(2)
+        reached: list[bool] = []
+
+        def tree(proc: object) -> str | None:
+            try:
+                both_in.wait(timeout=3.0)  # a serial kill never gets the second one here
+                reached.append(True)
+            except threading.BrokenBarrierError:
+                reached.append(False)
+            return None
+
+        killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)
+        killer._procs.extend([self._RunningProc(), self._RunningProc()])
+        with mock.patch.object(shard, "_kill_tree", tree):
+            killer._kill_due()
+        self.assertEqual(reached, [True, True], "the second worker's tree was only ended after the first one's returned")
+
+    def test_a_worker_registered_while_another_tree_kill_blocks_is_not_held_up(self) -> None:
+        release = threading.Event()
+        first, second = self._RunningProc(), self._RunningProc()
+
+        def tree(proc: object) -> str | None:
+            if proc is first:
+                release.wait(timeout=10.0)  # a taskkill that takes its whole bound
+            return None
+
+        killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)
+        self.addCleanup(release.set)
+        with mock.patch.object(shard, "_kill_tree", tree):
+            blocked = threading.Thread(target=killer.add, args=(first,), daemon=True)
+            blocked.start()
+            while not killer._inflight:
+                time.sleep(0.01)
+            registered = threading.Thread(target=killer.add, args=(second,), daemon=True)
+            registered.start()
+            registered.join(timeout=3.0)
+            held_up = registered.is_alive()
+            release.set()
+            blocked.join(timeout=10.0)
+            registered.join(timeout=10.0)
+        self.assertFalse(held_up, "add() blocked behind another worker's tree kill")
+        self.assertEqual(second.returncode, -9)
+
+    def test_the_parents_own_kill_loops_end_the_trees_at_the_same_time(self) -> None:
+        both_in = threading.Barrier(2)
+        reached: list[bool] = []
+
+        def tree(proc: object) -> str | None:
+            try:
+                both_in.wait(timeout=3.0)
+                reached.append(True)
+            except threading.BrokenBarrierError:
+                reached.append(False)
+            return None
+
+        procs = [self._RunningProc(), self._RunningProc()]
+        with mock.patch.object(shard, "_kill_tree", tree):
+            results = shard.terminate_all(procs)
+        self.assertEqual(results, [None, None])
+        self.assertEqual(reached, [True, True])
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9])
+
+    # r7 adversary pass 10 A3: taskkill exit 128 (the root is gone) means its descendants were not walked.
+    def test_a_taskkill_that_finds_no_root_is_reported_as_the_tree_not_confirmed(self) -> None:
+        done = subprocess.CompletedProcess(["taskkill"], 128, b"", b"")
+        proc = self._pid_proc()
+        with (
+            mock.patch.object(shard.os, "name", "nt"),
+            mock.patch.object(shard.subprocess, "run", return_value=done),
+        ):
+            result = shard.terminate(proc)
+        self.assertIsNotNone(result, "128 read as a clean kill although the root's descendants may survive")
+        self.assertIn("not confirmed", result)
+
     # r6 adversary pass 8 A2: a log opened for a worker whose launch then fails is closed, not leaked.
     def test_a_launch_that_fails_closes_the_log_it_opened(self) -> None:
         root, tests, tag = self._fixture()
