@@ -646,6 +646,7 @@ private slots:
     void playerShortcutMap_otherTopLevelWindowDoesNotFire();
     void playerShortcutMap_glContainerFocus();
     void playerShortcutMap_helpRowsAreGeneratedFromLiveActions();
+    void playerShortcutMap_oneSecondSeekTargetNeverOverflows();
     void mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes();
     void mainWindowGpuPreviewPolicyScopesVetoOnlyWhenDisplayed();
     void mainWindowGpuPreviewPolicyHideScopesVetoesNothingWhilePlaying();
@@ -1357,6 +1358,34 @@ void GuiSmokeTest::playerShortcutMap_glContainerFocus()
     QTest::keyClick( child, Qt::Key_Right );
     QCOMPARE( m.counts.value( QStringLiteral( "actionNextFrame" ) ), 1 );
     QCOMPARE( m.total(), 1 );
+}
+
+void GuiSmokeTest::playerShortcutMap_oneSecondSeekTargetNeverOverflows()
+{
+    // Adversary pass 2 A1 (95d6cb1c): a 201-frame clip whose accepted metadata says 2147483648
+    // fps (or 2147483647), paused at 100: Shift+Left/Right must clamp to the slider range, never
+    // overflow an int on the way there.
+    using PlayerShortcutBinding::oneSecondSeekTarget;
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483648.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483648.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483647.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483647.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 2147483647, 25.0, +1, 0, 2147483647 ), 2147483647 );
+    QCOMPARE( oneSecondSeekTarget( -2147483647 - 1, 25.0, -1, -2147483647 - 1, 0 ), -2147483647 - 1 );
+    QCOMPARE( oneSecondSeekTarget( 100, 1e300, +1, 0, 200 ), 200 );
+    // Ordinary rates: one second of frames, rounded, at least one frame.
+    QCOMPARE( oneSecondSeekTarget( 100, 25.0, +1, 0, 200 ), 125 );
+    QCOMPARE( oneSecondSeekTarget( 100, 23.976, -1, 0, 200 ), 76 );
+    QCOMPARE( oneSecondSeekTarget( 100, 0.4, +1, 0, 200 ), 101 );
+    // No usable rate: one frame.
+    QCOMPARE( oneSecondSeekTarget( 100, 0.0, +1, 0, 200 ), 101 );
+    QCOMPARE( oneSecondSeekTarget( 100, -30.0, -1, 0, 200 ), 99 );
+    QCOMPARE( oneSecondSeekTarget( 100, std::numeric_limits<double>::quiet_NaN(), +1, 0, 200 ), 101 );
+    QCOMPARE( oneSecondSeekTarget( 100, std::numeric_limits<double>::infinity(), -1, 0, 200 ), 99 );
+    // Clamped at the ends; an empty range stays at its minimum.
+    QCOMPARE( oneSecondSeekTarget( 10, 25.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 190, 25.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 0, 25.0, +1, 0, -1 ), 0 );
 }
 
 void GuiSmokeTest::playerShortcutMap_helpRowsAreGeneratedFromLiveActions()

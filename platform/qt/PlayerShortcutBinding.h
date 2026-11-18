@@ -54,6 +54,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <cmath>
 
 namespace PlayerShortcutBinding
 {
@@ -165,6 +166,20 @@ inline int bindToWindow( QWidget *window )
         ++bound;
     }
     return bound;
+}
+
+// Target frame of a one-second seek (Shift+Left/Right): `direction` (-1 or +1) times the clip's
+// frame rate rounded to whole frames (at least 1), from `position`, clamped to [minimum, maximum].
+// All in double, so a huge or non-finite rate from clip metadata never overflows an int
+// (adversary pass 2 A1: an accepted 2147483648 fps clip).
+inline int oneSecondSeekTarget( int position, double fps, int direction, int minimum, int maximum )
+{
+    double step = ( std::isfinite( fps ) && fps > 0.0 ) ? std::round( fps ) : 1.0;
+    if( step < 1.0 ) step = 1.0;
+    if( maximum < minimum ) maximum = minimum;
+    const double target = static_cast<double>( position ) + ( direction < 0 ? -step : step );
+    const double clamped = std::min( std::max( target, static_cast<double>( minimum ) ), static_cast<double>( maximum ) );
+    return static_cast<int>( clamped );
 }
 
 // Keeps navigation keys with the focused input widget: the player table binds Left/Right/Home/

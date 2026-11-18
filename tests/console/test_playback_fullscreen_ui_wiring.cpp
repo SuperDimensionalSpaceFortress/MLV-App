@@ -242,6 +242,25 @@ TEST(PlaybackFullscreenUiWiring, MainWindowSetsNoShortcutOnATableAction)
     }
 }
 
+TEST(PlaybackFullscreenUiWiring, OneSecondSeeksGoThroughTheOverflowSafeHelper)
+{
+    // Adversary pass 2 A1 (95d6cb1c): clip metadata can carry an accepted frame rate such as
+    // 2147483648; qRound() of it (or position + step in int) overflows before the slider clamps.
+    // Both seek slots compute the target in PlayerShortcutBinding::oneSecondSeekTarget()
+    // (behaviour: gui_tests playerShortcutMap_oneSecondSeekTargetNeverOverflows).
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    for (const char *slot : { "void MainWindow::on_actionSeekBackwardOneSecond_triggered()",
+                              "void MainWindow::on_actionSeekForwardOneSecond_triggered()" })
+    {
+        const QString body = functionBody(source, QString::fromLatin1(slot), QStringLiteral("\n}"));
+        ASSERT_FALSE(body.isEmpty());
+        ASSERT_TRUE(body.contains(QStringLiteral("PlayerShortcutBinding::oneSecondSeekTarget(")));
+        ASSERT_FALSE(body.contains(QStringLiteral("qRound(")));
+        ASSERT_TRUE(body.contains(QStringLiteral("ui->horizontalSliderPosition->minimum()")));
+        ASSERT_TRUE(body.contains(QStringLiteral("ui->horizontalSliderPosition->maximum()")));
+    }
+}
+
 TEST(PlaybackFullscreenUiWiring, HelpMenuOffersKeyboardShortcuts)
 {
     const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));

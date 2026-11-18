@@ -33629,20 +33629,23 @@ void MainWindow::on_actionPreviousFrame_triggered()
     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() - 1 );
 }
 
-//Jump back one second (one clip-framerate's worth of frames; the slider clamps at its range)
+//Jump back one second (one clip-framerate's worth of frames, clamped to the slider range;
+//computed overflow-safe, the rate comes from clip metadata)
 void MainWindow::on_actionSeekBackwardOneSecond_triggered()
 {
-    if( !m_fileLoaded ) return;
-    const int step = qMax( 1, qRound( getMlvFramerate( m_pMlvObject ) ) );
-    ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() - step );
+    if( !m_fileLoaded || !m_pMlvObject ) return;
+    ui->horizontalSliderPosition->setValue( PlayerShortcutBinding::oneSecondSeekTarget(
+        ui->horizontalSliderPosition->value(), getMlvFramerate( m_pMlvObject ), -1,
+        ui->horizontalSliderPosition->minimum(), ui->horizontalSliderPosition->maximum() ) );
 }
 
 //Jump forward one second
 void MainWindow::on_actionSeekForwardOneSecond_triggered()
 {
-    if( !m_fileLoaded ) return;
-    const int step = qMax( 1, qRound( getMlvFramerate( m_pMlvObject ) ) );
-    ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + step );
+    if( !m_fileLoaded || !m_pMlvObject ) return;
+    ui->horizontalSliderPosition->setValue( PlayerShortcutBinding::oneSecondSeekTarget(
+        ui->horizontalSliderPosition->value(), getMlvFramerate( m_pMlvObject ), +1,
+        ui->horizontalSliderPosition->minimum(), ui->horizontalSliderPosition->maximum() ) );
 }
 
 //Help > Keyboard Shortcuts: generated from the live actions (PlayerShortcutBinding.h)
