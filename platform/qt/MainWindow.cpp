@@ -16,6 +16,7 @@
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackScaleLabel.h"
+#include "PlayerShortcutBinding.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
 #include "LogLineField.h"
@@ -13562,6 +13563,8 @@ void MainWindow::initGui( void )
     //Rename selected clip (only one! selected clip)
     connect( ui->actionRename, SIGNAL( triggered() ), this, SLOT( renameActiveClip() ) );
     addAction( ui->actionRename );
+    //Fullscreen hides the menu bar and toolbar; carry the player shortcuts on the window too
+    PlayerShortcutBinding::bindToWindow( this );
 }
 
 //Initialize the library
