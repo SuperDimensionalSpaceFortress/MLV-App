@@ -1659,3 +1659,146 @@ def test_r4b_A7_a_feed_clock_that_runs_backwards_ends_the_window_closed(tmp_path
         assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith("feed-time-regressed"), w.receipt()
     finally:
         w.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# round r5 (head 4cb29776): adversary pass 5 (nine introduced majors), each fed its own input. Every test fails on 4cb29776 except the
+# one marked GUARD, which pins a fix the A4 change needed (it passes there only because that code skipped the damaged line).
+# ---------------------------------------------------------------------------------------------------------------------------
+def test_r5_A1_a_cool_future_row_followed_by_a_hot_older_row_is_a_feed_regression(tmp_path, me):
+    w = World(tmp_path, "interleave", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: len(w.samples()) >= 3, 60), w.text()
+        w.feed.paused = True
+        time.sleep(0.5)
+        with open(w.feed_path, "a", encoding="ascii") as fh:
+            fut = datetime.now() + timedelta(seconds=25)
+            hot = datetime.now()
+            fh.write(fut.strftime("%d.%m.%Y,%H:%M:%S.") + f"{fut.microsecond // 1000:03d}" + ",20.0,60.0,40.0,No,No\n")     # valid and cool, t+25
+            fh.write(hot.strftime("%d.%m.%Y,%H:%M:%S.") + f"{hot.microsecond // 1000:03d}" + ",20.0,96.0,40.0,No,No\n")     # valid and hot, t
+        time.sleep(1.0)
+        w.feed.paused = False
+        code = proc.wait(timeout=90)
+        assert code == 3, (code, w.text())
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith("feed-time-regressed"), w.receipt()
+    finally:
+        w.close()
+
+
+def test_r5_A2_a_planted_receipt_temp_name_is_a_leftover_never_a_write_target(tmp_path, me):
+    w = World(tmp_path, "tmplink", me)
+    try:
+        w.window.mkdir()
+        try:
+            os.symlink(w.feed_path, w.window / "ab-receipt.json.tmp")
+        except OSError:
+            pytest.skip("no symlink rights on this host")
+        out = subprocess.run(w.args(0.004, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=window-dir-used" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert FEED_HEADER in w.feed_path.read_text(encoding="ascii") and "heavy-slot-ab-receipt" not in w.feed_path.read_text(encoding="ascii")
+    finally:
+        w.close()
+
+
+@pytest.mark.parametrize("what,reason", [("ledger", "ledger-missing"), ("receipts", "receipts-dir-missing")])
+def test_r5_A3_a_heavy_slot_with_no_ledger_or_no_receipts_dir_is_refused_not_read_as_no_events(tmp_path, me, what, reason):
+    w = World(tmp_path, "absent-" + what, me)
+    try:
+        if what == "ledger":
+            (w.hs / "ledger.jsonl").unlink()
+        else:
+            shutil.rmtree(w.hs / "receipts")
+        out = subprocess.run(w.args(0.004, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and f"AB_REFUSED reason={reason}" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert not w.window.exists() and not w.switch.exists()
+    finally:
+        w.close()
+
+
+def test_r5_A4_a_complete_ledger_line_that_does_not_parse_ends_the_window_aborted(tmp_path, me):
+    w = World(tmp_path, "garbageline", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        with open(w.hs / "ledger.jsonl", "ab") as fh:
+            fh.write(b'{"at": "2026-11\n')
+        code = proc.wait(timeout=90)
+        assert code == 3, (code, w.text())
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith("ledger-unreadable"), w.receipt()
+    finally:
+        w.close()
+
+
+def test_r5_A4_GUARD_a_record_still_being_written_at_the_baseline_is_not_a_garbage_line(tmp_path, me):
+    w = World(tmp_path, "midwrite", me)
+    try:
+        (w.hs / "ledger.jsonl").write_bytes(b'{"at":"2020-01-01T00:00:00.000Z","event":"admit","ticket":"old"')      # no newline yet
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        with open(w.hs / "ledger.jsonl", "ab") as fh:
+            fh.write(b',"label":"mlv:X:build","class":"shared"}\n')                                                     # the writer finishes it
+        assert proc.wait(timeout=90) == 0, w.text()
+        assert w.receipt()["state"] == "DONE", w.receipt()
+    finally:
+        w.close()
+
+
+def test_r5_A5_a_done_receipt_with_no_window_binding_is_inconclusive(tmp_path):
+    win, hs = build_window(tmp_path, "unbound")
+    (win / "ab-receipt.json").write_text(json.dumps({"state": "DONE"}), encoding="ascii")
+    v, _ = evaluate(tmp_path, "unbound", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "windowStartUtc" in v["reason"] and "endedUtc" in v["reason"], v
+
+
+def test_r5_A6_a_receipt_with_no_ticket_identity_written_in_the_window_is_inconclusive(tmp_path):
+    win, hs = build_window(tmp_path, "emptyreceipt")
+    (hs / "receipts" / "unknown.json").write_text("{}", encoding="ascii")
+    v, _ = evaluate(tmp_path, "emptyreceipt", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "cannot be read" in v["reason"], v
+    assert v["input_problems"]["receipts_unreadable"] == 1
+
+
+def test_r5_A7_a_sample_with_no_block_state_is_not_dropped_from_the_b_minimum(tmp_path):
+    win, hs = build_window(tmp_path, "nostate")
+    rows = [json.loads(line) for line in (win / "ab-samples.jsonl").read_text(encoding="utf-8").splitlines()]
+    row = next(r for r in rows if r["utc"] == iso(block_start(1)))
+    row["state"] = ""
+    row["free_commit_gb"] = 1
+    (win / "ab-samples.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="ascii")
+    v, _ = evaluate(tmp_path, "nostate", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "no usable block state" in v["reason"], v
+
+
+def test_r5_A8_a_retry_that_outlasts_block_edges_lands_the_block_due_now_not_an_obsolete_one(tmp_path, me):
+    w = World(tmp_path, "staleblock", me)
+    holder = None
+    try:
+        proc = w.start(0.001, 0.01)      # 3.6 s window, 0.6 s blocks
+        assert _wait(lambda: (w.switch_doc() or {}).get("state") == "A", 60), w.text()
+        holder = open(w.switch, "rb")    # not delete-shared: every rewrite fails until this is closed, across several block edges
+        time.sleep(2.0)
+        holder.close()
+        holder = None
+        assert proc.wait(timeout=60) == 0, w.text()
+        rows = w.blocks()
+        assert len(rows) >= 2, rows
+        ws = _parse_iso(rows[0]["windowStartUtc"])
+        idx = lambda t: int((t - ws).total_seconds() // 0.6)
+        for r in rows:
+            start = _parse_iso(r["startUtc"])
+            assert idx(start - timedelta(milliseconds=20)) <= r["block"] <= idx(start), f"block {r['block']} was applied when block {idx(start)} was due: {r}"
+            assert r["state"] == "AB"[r["block"] % 2] and r["count"] == 1 + r["block"] % 2, r
+    finally:
+        if holder:
+            holder.close()
+        w.close()
+
+
+def test_r5_A9_an_output_that_is_a_hard_link_onto_an_input_never_truncates_it(tmp_path):
+    win, hs = build_window(tmp_path, "hardlink")
+    os.link(hs / "ledger.jsonl", win / "ab-holds.jsonl")
+    before = (hs / "ledger.jsonl").read_bytes()
+    _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / "hardlink" / "event.txt"),
+         "-Now", iso(block_start(N_BLOCKS) + timedelta(hours=2))])
+    assert (hs / "ledger.jsonl").read_bytes() == before, "the evaluator wrote through a hard link into the HeavySlot ledger"
