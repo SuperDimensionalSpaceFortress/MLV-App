@@ -1628,9 +1628,8 @@ class ShardExitCodeTests(unittest.TestCase):
         with mock.patch.object(shard, "_kill_tree", tree):
             blocked = threading.Thread(target=killer.add, args=(first,), daemon=True)
             blocked.start()
-            while not killer._inflight:
-                time.sleep(0.01)
-            registered = threading.Thread(target=killer.add, args=(second,), daemon=True)
+            _wait_until(lambda: bool(killer._inflight), 5.0)  # bounded, never an unbounded poll (r8 pass 14 A2)
+            registered =threading.Thread(target=killer.add, args=(second,), daemon=True)
             registered.start()
             registered.join(timeout=3.0)
             held_up = registered.is_alive()
@@ -1852,6 +1851,45 @@ class ShardExitCodeTests(unittest.TestCase):
         ):
             self.assertEqual(shard.terminate_all([reaped], reap=True), [None])
         self.assertEqual(reaped.returncode, -9)
+
+    # r8 adversary pass 14 A1: stdout closing (BrokenPipeError) before the first grouped header must not delete
+    # the unprinted logs: they are kept and reported, and the run still ends with an exit code.
+    def test_a_stdout_that_closes_before_the_grouped_logs_keeps_every_log(self) -> None:
+        root, tests, tag = self._fixture()
+        calls: list[int] = []
+        real = self._finished_popen(calls)
+
+        class ClosingOut(io.StringIO):
+            broken = False
+
+            def write(self, text: str) -> int:
+                if self.broken:
+                    raise BrokenPipeError(32, "the consumer closed the pipe")
+                return super().write(text)
+
+        out, err = ClosingOut(), io.StringIO()
+
+        def popen(*args: object, **kwargs: object) -> object:
+            proc = real(*args, **kwargs)
+            out.broken = len(calls) == 2  # closed once the last launch is done, before any grouped header
+            return proc
+
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=popen),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        kept = re.search(r"kept at (.+)$", err.getvalue(), re.MULTILINE)
+        if kept:
+            self.addCleanup(shutil.rmtree, kept[1], True)
+        self.assertEqual(code, 1)
+        self.assertIsNotNone(kept, "the unprinted logs were deleted: " + err.getvalue())
+        for name in ("w1", "w2"):
+            self.assertTrue(Path(kept[1], name, "log.txt").exists(), f"{name}'s unprinted log is gone")
 
     # r8 adversary A3: a log the parent's stdout cannot encode must not raise, lose the other logs or be deleted.
     def test_a_log_that_stdout_cannot_encode_does_not_lose_the_other_logs(self) -> None:

@@ -1156,11 +1156,11 @@ def run_parallel(
         watch.check()  # a share crossed since the last poll is reported before any worker log
         printed = True  # from here the logs go out in order; a failure later must not print them twice
         for number, (path, code, record) in enumerate(zip(logs, codes, records, strict=True), start=1):
-            print(f"===== worker {number}/{len(logs)} exit {code} =====", flush=True)
+            header_error = emit_log(f"===== worker {number}/{len(logs)} exit {code} =====\n")  # a closed stdout raises here too
             text, unreadable = read_log(path)
             verb = "read"
             if unreadable is None:
-                unreadable, verb = emit_log(text), "printed"
+                unreadable, verb = emit_log(text) or header_error, "printed"
             if unreadable is not None:  # the other workers' logs are still printed, and this one is kept (see the cleanup)
                 unread.append(number)
                 problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
@@ -1188,12 +1188,15 @@ def run_parallel(
             # An exception (a launch that raised, say) skipped the grouped logs: the workers that ran keep
             # their output, which is deleted with the work dir just below.
             for number, (path, (proc, _log)) in enumerate(zip(logs, procs, strict=True), start=1):
-                with contextlib.suppress(Exception):
-                    print(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====", flush=True)
+                header_error = None
+                try:
+                    header_error = emit_log(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====\n")
+                except Exception as error:  # noqa: BLE001 - poll() itself raised
+                    header_error = describe_error(error)
                 text, unreadable = read_log(path)
                 verb = "read"
                 if unreadable is None:
-                    unreadable, verb = emit_log(text), "printed"
+                    unreadable, verb = emit_log(text) or header_error, "printed"
                 if unreadable is not None:
                     unread.append(number)
                     problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
