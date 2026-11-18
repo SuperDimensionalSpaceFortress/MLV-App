@@ -2784,6 +2784,30 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             with self.subTest(name):
                 self._assert_caught(self._inject_after_measured_loop_off(injected), "key event")
 
+    # r6 adversary pass on a91a899d A1: grouping parentheses `(keyEvent)` were read as a whole call argument; A2: a whole
+    # argument handed the event to a generic lambda that cloned or copied it. Handing a delivered event on is allowed
+    # ONLY as the single argument of a qualified base key handler (`QDialog::keyPressEvent( event )`).
+    _FOCUS_GUARD_CAST = "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );"
+    _R6_P3_HANDED_ON = (
+        "auto *copy = (keyEvent)->clone();",
+        "auto copy = *(keyEvent);",
+        "auto *alias = (keyEvent); auto copy = *alias;",
+        "auto *copy = [](auto *source) { return source->clone(); }(keyEvent);",
+        "auto copy = [](auto *source) { return *source; }(keyEvent);",
+        "auto *copy = make( keyEvent );",
+        "auto *copy = keyPressEvent( keyEvent );",
+        "QDialog::keyPressEvent( keyEvent, 1 );",
+    )
+
+    def test_r6_p3_a1_a2_a_delivered_key_event_is_handed_on_only_to_a_base_key_handler(self) -> None:
+        for injected in self._R6_P3_HANDED_ON:
+            with self.subTest(injected):
+                self._assert_caught(self._mutated(self._FOCUS_GUARD_CAST, self._FOCUS_GUARD_CAST + "\n        " + injected,
+                                                  path=self._SPACE_TABLE), "synthesized key event")
+        # The real hand-on stays exempt (StatusDialog.cpp passes its event to QDialog::keyPressEvent).
+        text = "void D::keyPressEvent( QKeyEvent *event )\n{\n    QDialog::keyPressEvent( event );\n}\n"
+        self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.cpp": text}), [])
+
     def test_r6_p2_a1_no_scanned_source_computes_a_type_from_an_expression(self) -> None:
         for text in ("int f() { int a = 0; decltype(a) b = a; return b; }\n", "__typeof__(1) x = 1;\n", "typeof(1) y = 1;\n"):
             with self.subTest(text):

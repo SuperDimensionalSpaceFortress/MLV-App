@@ -300,6 +300,8 @@ _PARAM_LIST_END = re.compile(
 _KEY_EVENT_READ_MEMBERS = (r"(?:key|modifiers|accept|ignore|setAccepted|isAccepted|type|text|isAutoRepeat|count|spontaneous"
                            r"|nativeScanCode|nativeVirtualKey|nativeModifiers|keyCombination|matches)\b")
 _KEY_EVENT_READ_USE = re.compile(rf"\s*(?:->|\.)\s*{_KEY_EVENT_READ_MEMBERS}\s*\(")   # `.` for a reference
+# The one reviewed hand-on: `QDialog::keyPressEvent( event )` (the callee is matched just before its opening parenthesis).
+_BASE_KEY_HANDLER_CALL = re.compile(r"\b\w+\s*::\s*(?:keyPressEvent|keyReleaseEvent)\s*$")
 # (b) the whole statement: `[cv] QKeyEvent|auto cv* name = <named cast><cv QKeyEvent cv*>( ... );`, the same cast
 # assigned to a name, or the cast read through one reviewed member (`return static_cast<QKeyEvent*>( e )->key();`).
 # The cast operand is a nested group, scanned on its own (a ref inside it has a parenthesis as its context: flagged).
@@ -470,11 +472,16 @@ def _scan_key_event_reads(path: str, blank: str) -> list[str]:
         for use in re.compile(rf"\b{re.escape(name)}\b").finditer(blank, start, end):
             if _KEY_EVENT_READ_USE.match(blank, use.end()):
                 continue
-            if re.search(r"[(,]\s*$", blank[max(0, use.start() - 64):use.start()]) and re.match(r"\s*[,)]", blank[use.end():]):
+            # r6 adversary pass on a91a899d A1 A2: "a whole call argument" took grouping parentheses `(keyEvent)->clone()`
+            # for a call and let any callee -- a generic lambda that clones -- take the event. Handing it on is allowed ONLY
+            # as the single argument of a qualified base key handler.
+            group = brackets.enclosing(use.start())
+            if (group != -1 and brackets.text[group] == "(" and blank[group + 1:brackets.closer[group]].strip() == name
+                    and _BASE_KEY_HANDLER_CALL.search(blank, max(0, group - 200), group)):
                 continue
             problems.append(f"{path}:{_line_of(blank, use.start())}: synthesized key event (the delivered key event `{name}` is "
-                            "used as anything but a reviewed member read or a whole call argument: a copy, a clone or a "
-                            "type computed from it builds a key event)")
+                            "used as anything but a reviewed member read or the argument of a base key handler: a copy, a "
+                            "clone or a type computed from it builds a key event)")
     return problems
 # r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
 _KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
