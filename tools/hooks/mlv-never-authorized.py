@@ -1352,6 +1352,14 @@ def shell_acts(command):
 #
 #   * a verb OUTSIDE quotes binds the tokens of ITS OWN statement (`;`, `&&`, `||`, `&` and an
 #     unescaped newline outside quotes and parentheses end a statement; a pipe does not);
+#   * INSIDE a cmd.exe body (`_cmd_body_start`: from a `cmd`/`cmd.exe` word, a standalone
+#     `/c`/`/k` -- `//c` from Git Bash -- or PowerShell's `--%`, to the END of the command)
+#     `;`, `,`, `=`, space and tab are cmd ARGUMENT DELIMITERS, never separators: only `&`,
+#     `&&` and `||` end a statement there, and a newline does not either.  A cmd body with a
+#     caret escape, a `%` (an environment or FOR variable) or a delayed `!name!` cannot be
+#     parsed and binds the WHOLE command.  cmd also skips a `,`, `=` or `@` before a command
+#     name, so `,rd`, `=move` and `@cd` are still verbs (PR #843 r5: LOOSENED parity rows
+#     defeater-delimiter-15 and main:defeater-delimiter-15, `cmd /c rd /s /q;<run dir>`);
 #   * it falls back to the WHOLE command -- the old reading, never looser -- when the command
 #     cannot be lexed (heredoc, here-string, `$'`, smart quotes, unbalanced quotes or
 #     parentheses), when the statement may hide its target (`%NAME%`, `@splat`, `{}`, and a
@@ -1375,18 +1383,22 @@ def shell_acts(command):
 # separators and to locate a verb inside a string.  Truncation keeps its own attribution
 # (`truncating_destinations`), unchanged.
 
+# What may precede a verb or `cd`: the outer shells' separators and openers, plus cmd's `,`,
+# `=` and `@`, which cmd skips before a command name (`cmd /c echo x&,rd /s /q <dir>`).  A
+# broader lead only finds MORE verbs, and every verb found binds more tokens, never fewer.
+_VERB_LEAD = r"(?:^|[\s;&|`(,=@{])"
 _SHELL_DELETE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:rm|del|rd|rmdir)\b|\bremove-item\b|\bgit\s+rm\b", re.I
+    _VERB_LEAD + r"(?:rm|del|rd|rmdir)\b|\bremove-item\b|\bgit\s+rm\b", re.I
 )
 _INTERP_DELETE_RX = re.compile(
     r"\bos\.(?:remove|unlink)\s*\(|\bshutil\.rmtree\s*\(|\.unlink\s*\(", re.I
 )
 _SHELL_MOVE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:mv|move)\b|\bmove-item\b|\brename-item\b|\bgit\s+mv\b", re.I
+    _VERB_LEAD + r"(?:mv|move)\b|\bmove-item\b|\brename-item\b|\bgit\s+mv\b", re.I
 )
 _INTERP_MOVE_RX = re.compile(r"\bos\.rename\s*\(|\bshutil\.move\s*\(", re.I)
 _DIR_CHANGE_RX = re.compile(
-    r"(?:^|[\s;&|`(])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)\b",
+    _VERB_LEAD + r"(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)\b",
     re.I,
 )
 # PowerShell-ONLY (see PB above): `$true`/`$false`/`$null` are constants in PowerShell and
@@ -1425,10 +1437,43 @@ _STRING_EVAL_RX = re.compile(
 # Bash runs a word that EXPANDS to a command name (`$c 'rm -rf x'` with c=eval), and both
 # shells substitute commands; for Bash any expansion or backtick counts as an evaluator.
 _BASH_EXPANSION_RX = re.compile(r"\$[\w{(]|`")
+# cmd.exe (PR #843 r5).  cmd separates COMMANDS only at `&`, `&&`, `||` and `|`; `;`, `,`, `=`,
+# space and tab are ARGUMENT DELIMITERS, so `cmd /c rd /s /q;C:\x` removes C:\x.  A cmd body
+# starts at a `cmd`/`cmd.exe` word in any case after any path, quote or delimiter
+# (`C:\Windows\System32\cmd.exe`, `"cmd.exe"`, `,cmd`), at a standalone `/c` or `/k` (`//c`
+# from Git Bash), or at PowerShell's stop-parsing `--%` (which hands a `;` to the native
+# command verbatim), and runs to the END of the command: where the outer shell ends it is not
+# provable from text, and the longest reading only ever binds more.
+_CMD_BODY_RX = re.compile(
+    r"(?<![^\s;,=@|&(){}`\"'\\/])cmd(?:\.exe)?[\"']?(?=[\s;,=|&()\"']|/{1,2}[ck]|$)"
+    r"|(?<![^\s;,=])/{1,2}[ck](?=[\s\"']|$)"
+    r"|(?<!\S)--%(?!\S)",
+    re.I,
+)
+# A body cmd reads differently from this lexer cannot be parsed: a caret escape (`^&` is a
+# literal `&`), a `%` (an environment or FOR variable: `for %f in (<dir>) do echo %f & rd /s
+# /q %f`), or delayed expansion (`!name!`, or any `!` under `/v:on`).
+_CMD_UNPARSEABLE_RX = re.compile(r"[\^%]|![^!\s\"'\\/]+!")
+_CMD_DELAYED_SWITCH_RX = re.compile(r"(?<!\S)/v(?::on)?(?!\S)", re.I)
+
+
+def _cmd_body_start(command):
+    """Where a cmd.exe body begins (it runs to the end of the command), or None."""
+    match = _CMD_BODY_RX.search(command or "")
+    return None if match is None else match.start()
+
+
+def _cmd_body_unparseable(command, cmd_from):
+    """True when cmd would read the body from ``cmd_from`` differently (fail closed)."""
+    body = command[cmd_from:]
+    if _CMD_UNPARSEABLE_RX.search(body):
+        return True
+    return "!" in body and bool(_CMD_DELAYED_SWITCH_RX.search(body))
 
 
 def _command_can_evaluate_a_string(command, tool):
-    if _STRING_EVAL_RX.search(command):
+    # A cmd body is an evaluator, whatever spelling started it.
+    if _STRING_EVAL_RX.search(command) or _cmd_body_start(command) is not None:
         return True
     return tool == "Bash" and bool(_BASH_EXPANSION_RX.search(command))
 
@@ -1489,9 +1534,19 @@ def quoted_spans(command, tool):
 
 
 def _statement_bounds(command, tool, position, spans):
-    """``(start, end)`` of the statement holding ``position``, or None when unbalanced."""
+    """``(start, end)`` of the statement holding ``position``, or None when unbalanced.
+
+    From ``_cmd_body_start`` on, the text is a cmd.exe body: only `&`, `&&` and `||` end a
+    statement there (`;` is an argument delimiter and a newline ends nothing either), and a
+    body cmd reads differently from this lexer (``_cmd_body_unparseable``) is None.
+    """
     escape = "\\" if tool == "Bash" else "`"
     length = len(command)
+    cmd_from = _cmd_body_start(command)
+    if cmd_from is None:
+        cmd_from = length
+    elif _cmd_body_unparseable(command, cmd_from):
+        return None
     in_span = [False] * length
     for start, end in spans:
         for point in range(start, end):
@@ -1514,7 +1569,8 @@ def _statement_bounds(command, tool, position, spans):
             if depth < 0:
                 return None
         elif depth == 0:
-            if char == ";":
+            # Inside a cmd body (index >= cmd_from) a `;` and a newline end nothing.
+            if char == ";" and index < cmd_from:
                 cuts.append((index, index + 1))
             elif char in "&|" and command[index : index + 2] in ("&&", "||"):
                 cuts.append((index, index + 2))
@@ -1525,7 +1581,7 @@ def _statement_bounds(command, tool, position, spans):
                 after = command[index + 1] if index + 1 < length else ""
                 if before not in "><" and after != ">":
                     cuts.append((index, index + 1))
-            elif char == "\n":
+            elif char == "\n" and index < cmd_from:
                 tail = "".join(
                     " " if in_span[point] else command[point] for point in range(0, index)
                 ).rstrip(" \t\r")
@@ -3119,11 +3175,13 @@ _OWN_RUN_GUARDED_NAME_RX = re.compile(
 # test_owner_footage_no_hardlink_class.py scans every tools/ string constant for that word and
 # this detector creates no link (no path-keyed HARD_LINK_ALLOWED exception: that would exempt
 # the whole hook).
+# cmd skips a `,`, `=` or `@` before a command name (`cmd /c ,ren <file> <fresh>`), so those
+# lead `ln` and `ren` too (PR #843 r5).
 _LINK_CREATE_RX = re.compile(
-    r"\bmklink\b|\bfsutil\b|\bjunction\b|(?:^|[\s;&|(`{])ln\s"
+    r"\bmklink\b|\bfsutil\b|\bjunction\b|(?:^|[\s;&|(`{,=@])ln\s"
     r"|\b(?:symbolic|hard)link\b|symlink_to|hardlink_to|\bos\.(?:sym)?link\s*\("
     r"|create(?:hard)link|createsymboliclink|\bcp\s+(?:-\w*[ls]\w*|--(?:sym)?link)\b"
-    r"|(?:^|[\s;&|(`{])(?:ren|rename)\s",
+    r"|(?:^|[\s;&|(`{,=@])(?:ren|rename)\s",
     re.I,
 )
 
@@ -3219,6 +3277,10 @@ def _own_run_dir_shell_create_ok(ctx, path_norm, acts, spellings):
     if set(acts) != {"truncate"} or not spellings:
         return False
     if _LINK_CREATE_RX.search(ctx.command or ""):
+        return False
+    # PR #843 r5: a delete or move `shell_acts` cannot see -- cmd skips a leading `,`, `=` or
+    # `@`, so `cmd /c ,move <file> <fresh> & echo x > <fresh>` moves -- is never admitted.
+    if _SHELL_DELETE_RX.search(ctx.command or "") or _SHELL_MOVE_RX.search(ctx.command or ""):
         return False
     for raw in spellings:
         if not _own_run_dir_name_ok(ctx, path_norm, raw):

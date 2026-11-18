@@ -9534,5 +9534,139 @@ for _case in NA2_BASH_BOOLEAN_ROWS:
     setattr(Na2BashBooleanVariableTests, _name, _make_test(_case))
 
 
+# ------------------------------------- HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1 r5 (PR #843)
+#
+# CMD-ARGUMENT-DELIMITER-ATTRIBUTION (safety-lint parity rows defeater-delimiter-15 and
+# main:defeater-delimiter-15, LOOSENED since r3): in cmd.exe `;`, `,`, `=`, space and tab are
+# ARGUMENT delimiters and only `&`, `&&`, `||` and `|` separate commands, so splitting a cmd body
+# on `;` detached `rd /s /q` from `;<run dir>`.  Inside a cmd body the verb binds the whole body,
+# a body cmd would read differently (`^`, `%`, `!name!`) binds the whole command, and a verb or
+# `cd` that cmd reaches past a leading `,`, `=` or `@` is still a verb.  Every "red" row is
+# admitted on 8b677fca and refused with the fix.  A "pin" row (a `,` or `=` ALONE before the
+# target, which the tokenizer already splits) is DENY on both heads.  The controls -- true `&`
+# and `&&` separators, an outer `;` before the cmd word -- are ALLOW on both.
+
+_R5_SPELLINGS = (
+    ("c", "semicolon", ";", "cmd /c"),
+    ("c", "comma", ",", "CMD.EXE /C"),
+    ("c", "equals", "=", "C:\\Windows\\System32\\cmd.exe /c"),
+    ("k", "semicolon", ";", "cmd /k"),
+    ("k", "comma", ",", "cmd.exe /K"),
+    ("k", "equals", "=", "Cmd /K"),
+)
+
+
+def _r5_switches(delim, first, second):
+    """`<first> <second>;` for `;`; else `<first>;<second><delim>` (still red on 8b677fca)."""
+    if delim == ";":
+        return "%s %s;" % (first, second)
+    return "%s;%s%s" % (first, second, delim)
+
+
+NA2_CMD_DELIMITER_ROWS = []
+for _switch, _dname, _delim, _cmd in _R5_SPELLINGS:
+    _label = "r5 red cmd %s %s" % (_switch, _dname)
+    NA2_CMD_DELIMITER_ROWS += [
+        _na2_row(_label + " protected dir delete", "PowerShell",
+                 '%s rd %s"{OTHER_RUN}"' % (_cmd, _r5_switches(_delim, "/s", "/q")), "DENY",
+                 reason_contains="deleting"),
+        _na2_row(_label + " protected file delete", "PowerShell",
+                 '%s del %s"{OTHER_RUN}\\existing.txt"' % (_cmd, _r5_switches(_delim, "/f", "/q")),
+                 "DENY", reason_contains="deleting"),
+        _na2_row(_label + " protected move", "PowerShell",
+                 '%s move %s"{OTHER_RUN}\\existing.txt" "{WORKTREE}\\moved.txt"'
+                 % (_cmd, _r5_switches(_delim, "/-y", "/y")), "DENY", reason_contains="moving"),
+        _na2_row(_label + " NA-6 test delete", "PowerShell",
+                 "%s del %stests/coordination/test_x.py" % (_cmd, _r5_switches(_delim, "/f", "/q")),
+                 "DENY", na="NA-6"),
+    ]
+
+NA2_CMD_DELIMITER_ROWS += [
+    # ---- red: the same class from Git Bash
+    _na2_row("r5 red bash cmd double slash c semicolon protected file delete", "Bash",
+             'cmd //c del /f /q;"{OTHER_RUN}/existing.txt"', "DENY", reason_contains="deleting"),
+    _na2_row("r5 red bash cmd c semicolon NA-6 test delete", "Bash",
+             "cmd /c del /f /q;tests/coordination/test_x.py", "DENY", na="NA-6"),
+    # ---- red: cmd skips a leading `,` `=` `@` before a command name, so these are verbs
+    _na2_row("r5 red cmd comma led del after a harmless delete", "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" & ,del /q "{OTHER_RUN}\\existing.txt"',
+             "DENY", reason_contains="deleting"),
+    _na2_row("r5 red cmd at led rd after a harmless delete", "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" & @rd /s /q "{OTHER_RUN}"', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd equals led move after a harmless move", "PowerShell",
+             'cmd /c move /y "{WORKTREE}\\a.txt" "{WORKTREE}\\b.txt" & '
+             '=move /y "{OTHER_RUN}\\existing.txt" "{WORKTREE}\\moved.txt"', "DENY",
+             reason_contains="moving"),
+    _na2_row("r5 red cmd comma led cd then a relative delete", "PowerShell",
+             'cmd /c ,cd /d "{OTHER_RUN}" & del /q existing.txt', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd at led cd then a relative NA-6 test delete", "PowerShell",
+             "cmd /c @cd tests\\coordination & del /q test_x.py", "DENY", na="NA-6"),
+    # ---- red: the own-run-dir create admit never covers a delete or move cmd can see
+    _na2_row("r5 red own run create after a comma led move of a run dir file", "PowerShell",
+             'cmd /c ,move /y "{OWN_RUN}\\existing.txt" "{OWN_RUN}\\fresh-cmd-a.txt" & '
+             'echo x > "{OWN_RUN}\\fresh-cmd-a.txt"', "DENY"),
+    _na2_row("r5 red own run create after an equals led ren of a run dir file", "PowerShell",
+             'cmd /c =ren "{OWN_RUN}\\existing.txt" fresh-cmd-b.txt & '
+             'echo x > "{OWN_RUN}\\fresh-cmd-b.txt"', "DENY"),
+    _na2_row("r5 red own run create after an at led del of a run dir file", "PowerShell",
+             'cmd /c @del /q "{OWN_RUN}\\existing.txt" & echo x > "{OWN_RUN}\\fresh-cmd-c.txt"',
+             "DENY"),
+    # ---- red: a body cmd reads differently from the lexer binds the whole command
+    _na2_row("r5 red cmd FOR variable carries the protected dir to rd", "PowerShell",
+             'cmd /c for %f in ("{OTHER_RUN}") do echo %f & rd /s /q %f', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd caret escaped ampersand keeps the protected dir a del operand",
+             "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" ^& "{OTHER_RUN}"', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd delayed expansion carries the protected dir to rd", "PowerShell",
+             'cmd /v:on /c set d="{OTHER_RUN}" & rd /s /q !d!', "DENY",
+             reason_contains="deleting"),
+    # ---- pins: a `,` or `=` ALONE before the target (DENY on both heads)
+    _na2_row("r5 pin cmd c comma alone before a protected file delete", "PowerShell",
+             'cmd /c del /f /q,"{OTHER_RUN}\\existing.txt"', "DENY", reason_contains="deleting"),
+    _na2_row("r5 pin cmd k equals alone before a protected move", "PowerShell",
+             'cmd /k move /y="{OTHER_RUN}\\existing.txt" "{WORKTREE}\\moved.txt"', "DENY",
+             reason_contains="moving"),
+    _na2_row("r5 pin cmd c comma alone before an NA-6 test delete", "PowerShell",
+             "cmd /c del /f /q,tests/coordination/test_x.py", "DENY", na="NA-6"),
+    # ---- controls: true cmd separators still end a statement (ALLOW on both heads)
+    _na2_row("r5 control cmd ampersand harmless read then own run create", "PowerShell",
+             'cmd /c type "{WORKTREE}\\notes.txt" & echo x > "{OWN_RUN}\\fresh-cmd-d.txt"',
+             "ALLOW"),
+    _na2_row("r5 control cmd ampersand harmless delete then protected read", "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" & type "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("r5 control cmd k and-and harmless delete then protected read", "PowerShell",
+             'cmd /k del /q "{WORKTREE}\\scratch.txt" && type "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("r5 control outer semicolon before the cmd word still ends a statement",
+             "PowerShell",
+             'Remove-Item Env:X; cmd /c type "{OTHER_RUN}\\existing.txt"', "ALLOW"),
+]
+
+
+class Na2CmdDelimiterTests(unittest.TestCase):
+    """PR #843 r5: cmd argument delimiters never end a statement (full hook, inert)."""
+
+    maxDiff = None
+    setUp = MlvNeverAuthorizedHookTests.setUp
+    _substitute = MlvNeverAuthorizedHookTests._substitute
+    _render_content = MlvNeverAuthorizedHookTests._render_content
+    _bind_the_enable_literal = MlvNeverAuthorizedHookTests._bind_the_enable_literal
+    _invoke = MlvNeverAuthorizedHookTests._invoke
+    _run_case = MlvNeverAuthorizedHookTests._run_case
+
+
+for _case in NA2_CMD_DELIMITER_ROWS:
+    _name = "test_" + _slug(_case["name"])
+    if _name in _seen:
+        raise RuntimeError("duplicate table row name: %s" % _case["name"])
+    _seen.add(_name)
+    setattr(Na2CmdDelimiterTests, _name, _make_test(_case))
+
+
 if __name__ == "__main__":
     unittest.main()
