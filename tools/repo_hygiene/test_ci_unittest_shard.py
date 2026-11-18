@@ -2709,6 +2709,120 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(len(joins), 3, "a thread after the interrupted join was never waited on")
         self.assertEqual([proc.returncode for proc in procs], [-9, -9, -9], "a worker was left running")
 
+    # r15 adversary pass 25 A1/A2: the launch error's own attribute can lie, and a failing log close must not outrank the adoption.
+    def _launch_cut_short(self, patches: list[object], raises: type[BaseException]) -> tuple[list[object], BaseException | None]:
+        root, tests, tag = self._fixture()
+        made: list[object] = []
+        running = self._RunningProc
+
+        class HalfBuilt(running):  # type: ignore[valid-type, misc]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__()
+                self.pid = 424242
+                made.append(self)
+                raise raises  # the child exists; the constructor never returns it
+
+        out, err = io.StringIO(), io.StringIO()
+        raised: BaseException | None = None
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(shard.subprocess, "Popen", HalfBuilt))
+            stack.enter_context(mock.patch.object(shard, "_kill_tree", return_value=None))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            for patch in patches:
+                stack.enter_context(patch)  # type: ignore[arg-type]
+            try:
+                shard.run_parallel(
+                    tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+                )
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        for kept in re.findall(r"kept at (.+)$", err.getvalue(), re.MULTILINE):
+            self.addCleanup(shutil.rmtree, kept, True)
+        return made, raised
+
+    def test_a_launch_error_whose_traceback_attribute_lies_still_hands_the_child_to_the_cleanup(self) -> None:
+        class Masked(KeyboardInterrupt):
+            __traceback__ = property(lambda self: None)  # type: ignore[assignment]
+
+        made, raised = self._launch_cut_short([], Masked)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertEqual(len(made), 1)
+        self.assertEqual(made[0].returncode, -9, "the child the launch created was left running")
+
+    def test_a_log_that_will_not_close_does_not_outrank_ending_the_created_child(self) -> None:
+        real_open = Path.open
+
+        class StubbornLog:
+            def __init__(self, real: object) -> None:
+                self._real, self._tried = real, False
+
+            def close(self) -> None:
+                if not self._tried:
+                    self._tried = True
+                    raise OSError("log close failed")
+                self._real.close()  # type: ignore[attr-defined]
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+        def opened(path: Path, *args: object, **kwargs: object) -> object:
+            real = real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path.name != "log.txt":
+                return real
+            self.addCleanup(real.close)  # the stub only pretends the close failed; the handle is released here
+            return StubbornLog(real)
+
+        made, raised = self._launch_cut_short([mock.patch.object(shard.Path, "open", opened)], KeyboardInterrupt)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertEqual(len(made), 1)
+        self.assertEqual(made[0].returncode, -9, "the child the launch created was left running")
+
+    # r15 adversary pass 25 A3: is_alive is one more call an interrupt can land in.
+    def test_terminate_all_ends_every_worker_when_is_alive_itself_is_interrupted(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc()]
+
+        def start(thread: threading.Thread) -> None:
+            raise RuntimeError("cannot start new thread")
+
+        def is_alive(thread: threading.Thread) -> bool:
+            raise KeyboardInterrupt
+
+        raised: BaseException | None = None
+        with (
+            mock.patch.object(shard, "_kill_tree", return_value=None),
+            mock.patch.object(threading.Thread, "start", start),
+            mock.patch.object(threading.Thread, "is_alive", is_alive),
+        ):
+            try:
+                shard.terminate_all(procs)  # type: ignore[arg-type]
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        self.assertIsNone(raised, f"terminate_all let {raised!r} out")
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9], "a worker was left running")
+
+    def test_the_watch_and_the_killer_stop_even_when_is_alive_is_interrupted(self) -> None:
+        clock = time.monotonic
+        watch = shard.BudgetWatch("ubuntu", 1, 1, 10.0, clock(), clock, lambda: {}, poll_seconds=0.05, out=io.StringIO())
+        killer = shard.DeadlineKiller(clock() + 600, clock, 0.05)
+        for stoppable in (watch, killer):
+            stoppable.start()
+        real_join = threading.Thread.join
+        self.addCleanup(lambda: [real_join(thread, 5) for thread in (watch._thread, killer._thread)])
+
+        def is_alive(thread: threading.Thread) -> bool:
+            raise KeyboardInterrupt
+
+        raised: BaseException | None = None
+        with mock.patch.object(threading.Thread, "is_alive", is_alive):
+            for stoppable in (watch, killer):
+                try:
+                    stoppable.stop()
+                except BaseException as error:  # noqa: BLE001
+                    raised = error
+        self.assertIsNone(raised, f"stop() let {raised!r} out")
+
     # r15 adversary pass 24 A1 sibling: the watchdog threads' own stop() waits are not a place an interrupt may escape from.
     def test_the_watch_and_the_killer_stop_even_when_the_wait_for_their_thread_is_interrupted(self) -> None:
         clock = time.monotonic

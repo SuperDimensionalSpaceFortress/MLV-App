@@ -625,15 +625,18 @@ class BudgetWatch:
 
     def stop(self) -> None:
         self._stopped.set()
-        if self._thread.is_alive():
-            try:
+        try:
+            if self._thread.is_alive():
                 self._thread.join()
-            except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
-                pass
+        except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
+            pass
 
     def _poll(self) -> None:
         while not self._stopped.wait(self._poll_seconds):
             self.check()
+
+
+_TRACEBACK_SLOT = BaseException.__traceback__  # the member descriptor: reads the stored traceback, whatever a subclass defines
 
 
 def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
@@ -648,7 +651,9 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
     landing exactly there (a profile hook that raises on the C-return event does it) leaves nothing here to read,
     and no wrapper around the call can close that window, since the same one opens after the wrapper's own call.
     """
-    link = error.__traceback__
+    # Read from ``BaseException``'s own slot, never through ``error.__traceback__``: a subclass can turn that
+    # attribute into a property that answers ``None`` while the real traceback is there.
+    link = _TRACEBACK_SLOT.__get__(error, BaseException)
     while link is not None:
         try:
             candidate = link.tb_frame.f_locals.get("self")
@@ -1047,6 +1052,15 @@ def terminate(proc: subprocess.Popen[bytes], *, reap: bool = True) -> str | None
     return tree_note
 
 
+def _alive(thread: threading.Thread) -> bool:
+    """Whether ``thread`` is running; ``False`` when that cannot be read (an interrupt can land in the call
+    too), so the caller falls back to its no-thread path instead of letting the interrupt out of a cleanup."""
+    try:
+        return thread.is_alive()
+    except BaseException:  # noqa: BLE001
+        return False
+
+
 def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) -> list[str | None]:
     """``terminate`` every worker at the same time (one thread each); the error text or ``None`` per worker.
 
@@ -1095,7 +1109,7 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
         except BaseException:  # noqa: BLE001 - no thread to be had (the OS refused one, or not even the object could be built), or an interrupt inside the start
             # A ``SystemExit`` or ``KeyboardInterrupt`` here must not abort the cleanup of every worker still
             # running. An interrupt can land after the thread began: that one is kept and joined, not killed twice.
-            if thread is not None and thread.is_alive():
+            if thread is not None and _alive(thread):
                 threads.append(thread)
             else:
                 inline(position)
@@ -1186,11 +1200,11 @@ class DeadlineKiller:
 
     def stop(self) -> None:
         self._stopped.set()
-        if self._thread.is_alive():
-            try:
+        try:
+            if self._thread.is_alive():
                 self._thread.join()
-            except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
-                pass
+        except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
+            pass
 
 
 @never_exits_zero
@@ -1309,7 +1323,6 @@ def run_parallel(
                 logs.append(home / "log.txt")
                 killer.add(proc)  # from here the deadline is enforced even while the next launch blocks
             except BaseException as launch_error:
-                log.close()  # a launch that failed is not in procs: the cleanup below would never close it
                 if proc is None:
                     # Popen never returned, but an interrupt after the OS created the child leaves a built
                     # ``self`` in its own frames: take that over, or nothing would ever end the child.
@@ -1322,6 +1335,12 @@ def run_parallel(
                     while len(logs) < len(procs):
                         logs.append(home / "log.txt")
                     killer.add(proc)
+                else:
+                    # A launch that failed with no child is not in procs: the cleanup below would never close its
+                    # log. Closed only after the child (if any) is adopted, so a close that fails cannot outrank
+                    # that, and never replaces the launch's own error.
+                    with contextlib.suppress(Exception):
+                        log.close()
                 raise
         watch.check()  # a budget already spent when the workers launch is reported at once
         late = late_workers([proc for proc, _log in procs], deadline, clock)
