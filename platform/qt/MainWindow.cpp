@@ -1539,6 +1539,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuWindowViewerInputForwarder.h"
+#include "ViewerDoubleClickFilter.h"
 #include "GpuFieldTelemetry.h"
 #include "GpuDeviceLossBreaker.h"
 #include "MainWindowGpuPreviewPolicy.h"
@@ -3671,6 +3672,13 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     Q_UNUSED( watched );
     // Application filter: the first event dispatched after a dispatcher wait ends that wait.
     endGuiPresentIdleWait();
+    //PLAYER-DOUBLECLICK-FULLSCREEN-1: a left double-click on the viewer (either display path) toggles fullscreen, once, and is swallowed
+    if( viewer_dblclick::filterEvent( m_viewerDoubleClickGate, watched, event, ui->graphicsView->viewport(),
+                                      GpuDisplayWindow::activeWindow(), [this]() { return viewerDoubleClickState(); } ) )
+    {
+        ui->actionFullscreen->trigger();
+        return true;
+    }
     if( event->type() == QEvent::MouseMove )
     {
         static bool graphicsViewReached = false;
@@ -3711,6 +3719,24 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         m_frameChanged = true;
     }
     return QWidget::eventFilter(watched, event);
+}
+
+//PLAYER-DOUBLECLICK-FULLSCREEN-1: the viewer's tool state for the double-click decision. The gradient
+//handle is read only with a clip loaded: m_pGradientElement has no initializer before initGui sets it.
+viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( void ) const
+{
+    viewer_dblclick::ViewerState s;
+    s.enabled = m_doubleClickViewerFullscreen;
+    s.clipLoaded = m_fileLoaded;
+    s.wbArmed = ui->actionWhiteBalancePicker->isChecked();
+    s.bpArmed = ui->toolButtonBadPixelsSearchMethodEdit->isChecked();
+    s.gradientPaintArmed = ui->toolButtonGradientPaint->isChecked();
+    if( m_fileLoaded && m_pGradientElement && m_pGradientElement->gradientGraphicsElement() )
+    {
+        const QGraphicsItem *handle = m_pGradientElement->gradientGraphicsElement();
+        s.gradientHandleHovered = handle->isVisible() && handle->isUnderMouse();
+    }
+    return s;
 }
 
 bool MainWindow::playbackPolicyActive( void ) const
@@ -23761,6 +23787,10 @@ void MainWindow::initPlaybackQualityFromSettings( void )
     m_lookLabelShowInFullscreen = look_label::showInFullscreenFromSettings();
     if ( ui->actionShowLookLabelInFullscreen )
         ui->actionShowLookLabelInFullscreen->setChecked( m_lookLabelShowInFullscreen );
+    //PLAYER-DOUBLECLICK-FULLSCREEN-1: "Double-Click Viewer Toggles Fullscreen" (on by default)
+    m_doubleClickViewerFullscreen = set.value( viewer_dblclick::kSettingsKey(), viewer_dblclick::kSettingsDefault() ).toBool();
+    if ( ui->actionDoubleClickViewerFullscreen )
+        ui->actionDoubleClickViewerFullscreen->setChecked( m_doubleClickViewerFullscreen );
     updateLookLabel();
     applyPlaybackScopesMode( playbackScopesMode(), /*persist*/false );
     updatePhase3PlaybackQualityUi();
@@ -24929,6 +24959,14 @@ void MainWindow::on_actionShowLookLabelInFullscreen_triggered()
     m_lookLabelShowInFullscreen = ui->actionShowLookLabelInFullscreen->isChecked();
     look_label::showInFullscreenWriteToSettings( m_lookLabelShowInFullscreen );
     updateLookLabel();
+}
+
+//PLAYER-DOUBLECLICK-FULLSCREEN-1: "Double-Click Viewer Toggles Fullscreen". Applies at once and persists.
+void MainWindow::on_actionDoubleClickViewerFullscreen_triggered()
+{
+    m_doubleClickViewerFullscreen = ui->actionDoubleClickViewerFullscreen->isChecked();
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
+    set.setValue( viewer_dblclick::kSettingsKey(), m_doubleClickViewerFullscreen );
 }
 
 // PLAYBACK-SCOPES-OPTION-1: "Scopes During Playback". Applies at once (the next presented frame and
