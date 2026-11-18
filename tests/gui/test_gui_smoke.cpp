@@ -692,6 +692,8 @@ private slots:
     void glWindowViewerInput_dragAndDropReachTheHooks();
     void glWindowViewerInput_otherObjectsAreIgnored();
     void glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal();
+    void glWindowViewerInput_edgePicksStayInsideTheImage();
+    void glWindowViewerInput_roundedSceneEdgeStillPicks();
 };
 
 void GuiSmokeTest::checkedStateUpdatesPalette()
@@ -3744,7 +3746,7 @@ struct GlWindowInputRecorder
     QPoint lastMenuGlobal;
     int dragEnterCalls = 0;
     int dropCalls = 0;
-    QList<QUrl> droppedUrls;
+    QStringList droppedPaths;
     bool wbArmed = false;
     bool bpArmed = false;
 };
@@ -3776,7 +3778,7 @@ gpu_window_input::Forwarder *installRecordingForwarder(QWindow *window, GlWindow
         ++rec->dragEnterCalls;
         if (e->mimeData()->hasUrls()) e->acceptProposedAction();
     };
-    hooks.drop = [rec](QDropEvent * e) { ++rec->dropCalls; rec->droppedUrls = e->mimeData()->urls(); };
+    hooks.openFiles = [rec](const QStringList & paths) { ++rec->dropCalls; rec->droppedPaths = paths; };
     auto *forwarder = new gpu_window_input::Forwarder(window, std::move(hooks));
     window->installEventFilter(forwarder);
     return forwarder;
@@ -3879,10 +3881,16 @@ void GuiSmokeTest::glWindowViewerInput_dragAndDropReachTheHooks()
     QVERIFY(move.isAccepted());
     QCOMPARE(rec.dragEnterCalls, 1);
 
-    QDropEvent drop(QPointF(120, 110), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    // Every local path reaches the hook, in order (the scene's filesDropped list), and the drop
+    // is accepted; a non-file URL is skipped as the scene skips it.
+    QMimeData mixed;
+    mixed.setUrls({ urls.at(0), QUrl(QStringLiteral("https://example.invalid/x")), urls.at(1) });
+    QDropEvent drop(QPointF(120, 110), Qt::CopyAction, &mixed, Qt::LeftButton, Qt::NoModifier);
+    drop.ignore();
     QCoreApplication::sendEvent(&window, &drop);
     QCOMPARE(rec.dropCalls, 1);
-    QCOMPARE(rec.droppedUrls, urls);
+    QCOMPARE(rec.droppedPaths, QStringList({ urls.at(0).toLocalFile(), urls.at(1).toLocalFile() }));
+    QVERIFY(drop.isAccepted());
 }
 
 void GuiSmokeTest::glWindowViewerInput_otherObjectsAreIgnored()
@@ -3924,6 +3932,56 @@ void GuiSmokeTest::glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGl
     parent.show();
     QCOMPARE(child->mapToGlobal(child->mapFromGlobal(global)), global);
     parent.hide();
+}
+
+void GuiSmokeTest::glWindowViewerInput_edgePicksStayInsideTheImage()
+{
+    // Adversary A2 (r1): the bottom and right picture edges map to scene y == height and
+    // x == width, one past the last pixel; the slots' "x > width" guard lets that through.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    installRecordingForwarder(&window, &rec); // scene 1920x804, letterboxed to y 138..942
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 942), QPointF(960, 942));
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(960, 803));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1920, 540), QPointF(1920, 540));
+    QCOMPARE(rec.bpCalls, 2);
+    QCOMPARE(rec.lastPick, QPoint(1919, 402));
+    rec.bpArmed = false;
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1920, 942), QPointF(1920, 942));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(1919, 803));
+    // Well inside the bottom bar: still nothing.
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 944), QPointF(960, 944));
+    QCOMPARE(rec.wbCalls, 1);
+}
+
+void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
+{
+    // Adversary A3 (r1): the fit-mode scene is an integer size (1000x418 for a 1920x804 clip in a
+    // 1000x1000 window), so its aspect differs from the display aspect paintGL letterboxes with by
+    // up to one scene pixel. paintGL's picture starts at y = 290.625; the scene-aspect rect at 291.
+    // A click on the displayed picture between the two must still pick (the top row).
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1000, 1000);
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.sceneSize = []() { return QSizeF(1000, 418); };
+    hooks.wbArmed = [&rec]() { return rec.wbArmed; };
+    hooks.bpArmed = [&rec]() { return rec.bpArmed; };
+    hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [&rec](int x, int y) { ++rec.bpCalls; rec.lastPick = QPoint(x, y); };
+    window.installEventFilter(new gpu_window_input::Forwarder(&window, std::move(hooks)));
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(500, 0));
+    // A full scene pixel above the picture is on the bar: nothing.
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 289.9), QPointF(500, 289.9));
+    QCOMPARE(rec.wbCalls, 1);
 }
 
 int main(int argc, char ** argv)

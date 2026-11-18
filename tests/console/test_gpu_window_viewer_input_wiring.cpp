@@ -80,6 +80,22 @@ TEST(GpuWindowViewerInputWiring, W3_HooksCallTheViewerPathsOwnSlots)
     ASSERT_TRUE(body.contains(QStringLiteral("whiteBalancePicked( x, y )")));
     ASSERT_TRUE(body.contains(QStringLiteral("badPixelPicked( x, y )")));
     ASSERT_TRUE(body.contains(QStringLiteral("pictureCustomContextMenuRequested( ui->graphicsView->mapFromGlobal( globalPos ) )")));
-    ASSERT_TRUE(body.contains(QStringLiteral("dropEvent( e )")));
     ASSERT_TRUE(body.contains(QStringLiteral("installEventFilter( new gpu_window_input::Forwarder( glWindow")));
+}
+
+TEST(GpuWindowViewerInputWiring, W4_GlDropOpensLikeTheSceneNotLikeTheTopLevelWindow)
+{
+    // Adversary A1 (r1): the QGraphicsView path's drop is GraphicsPickerScene::dropEvent ->
+    // filesDropped(every local path) -> openMlvSet. MainWindow::dropEvent (the top-level window's
+    // drop) classifies by the FIRST path only, so a drop whose first file is a split-chunk part
+    // and whose second is the main clip imports nothing there. The GL window's drop must take the
+    // scene's route.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source, kDefinition, kNextDefinition);
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(body.contains(QStringLiteral("hooks.openFiles = [this]( const QStringList &paths ) { openMlvSet( paths ); };")));
+    ASSERT_FALSE(body.contains(QStringLiteral("dropEvent(")));
+    // The scene's own route is unchanged: the same slot.
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "connect( m_pScene, SIGNAL( filesDropped(QStringList) ), this, SLOT( openMlvSet(QStringList) ) );")));
 }

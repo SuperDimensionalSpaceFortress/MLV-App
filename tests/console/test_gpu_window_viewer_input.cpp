@@ -75,13 +75,18 @@ TEST(GpuWindowViewerInput, C2_WindowToSceneRoundTripsAndRejectsTheBars)
         }
     }
     QPointF topLeft;
-    windowToScene(r.topLeft(), window, scene, &topLeft);
+    ASSERT_TRUE(windowToScene(r.topLeft(), window, scene, &topLeft));
     ASSERT_NEAR(0.0, topLeft.x(), 1e-9);
     ASSERT_NEAR(0.0, topLeft.y(), 1e-9);
     QPointF bottomRight;
-    windowToScene(r.bottomRight(), window, scene, &bottomRight);
+    // Half-open picture (adversary A2, r1): the bottom-right corner is one past the last pixel.
+    ASSERT_FALSE(windowToScene(r.bottomRight(), window, scene, &bottomRight));
     ASSERT_NEAR(scene.width(), bottomRight.x(), 1e-9);
     ASSERT_NEAR(scene.height(), bottomRight.y(), 1e-9);
+    QPointF edge;
+    ASSERT_FALSE(windowToScene(QPointF(960, r.bottom()), window, scene, &edge));
+    ASSERT_FALSE(windowToScene(QPointF(r.right(), 540), window, scene, &edge));
+    ASSERT_TRUE(windowToScene(QPointF(960, r.bottom() - 0.01), window, scene, &edge));
 
     // The centre of the window is the centre of the scene.
     QPointF centre;
@@ -175,12 +180,106 @@ TEST(GpuWindowViewerInput, C5_PressIsOnViewer)
     ASSERT_FALSE(pressIsOnViewer(false, nullptr, nullptr));
 }
 
+TEST(GpuWindowViewerInput, C7_PickPixelStaysInsideTheImageAndAllowsTheRoundingSlack)
+{
+    using gpu_window_input::pickPixel;
+    int x = -1;
+    int y = -1;
+    // A2: the bottom and right edges (scene y == 804, x == 1920) clamp to the last pixel.
+    ASSERT_TRUE(pickPixel(QPointF(960, 942), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_EQ(960, x);
+    ASSERT_EQ(803, y);
+    // Pillarbox (1080x1080 in 1920x1080, picture x 420..1500): its right edge clamps to the last
+    // column; the far right of the window is on the bar.
+    ASSERT_FALSE(pickPixel(QPointF(1920, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(1500, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), &x, &y));
+    ASSERT_EQ(1079, x);
+    ASSERT_EQ(540, y);
+    ASSERT_TRUE(pickPixel(QPointF(0, 138), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_EQ(0, x);
+    ASSERT_EQ(0, y);
+    ASSERT_TRUE(pickPixel(QPointF(960, 540), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_EQ(960, x);
+    ASSERT_EQ(402, y);
+    // A3: a 1920x804 clip fit into a 1000x1000 window has a 1000x418 scene; paintGL's picture
+    // (display aspect) starts at y 290.625, the scene-aspect rect at 291. A click between picks
+    // the top row; a full scene pixel above it is on the bar.
+    ASSERT_TRUE(pickPixel(QPointF(500, 290.75), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
+    ASSERT_EQ(500, x);
+    ASSERT_EQ(0, y);
+    ASSERT_TRUE(pickPixel(QPointF(500, 709.3), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
+    ASSERT_EQ(417, y);
+    ASSERT_FALSE(pickPixel(QPointF(500, 289.9), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(500, 710.6), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
+    // The slack is exactly half a scene pixel (scene 1920x804 in 1920x1080: 1 window px = 1 scene px).
+    ASSERT_NEAR(0.5, gpu_window_input::sceneEdgeSlack(), 0.0);
+    ASSERT_TRUE(pickPixel(QPointF(960, 137.6), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_EQ(0, y);
+    ASSERT_FALSE(pickPixel(QPointF(960, 137.4), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(960, 942.4), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_EQ(803, y);
+    ASSERT_FALSE(pickPixel(QPointF(960, 942.6), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    // Bars and empty geometry.
+    ASSERT_FALSE(pickPixel(QPointF(960, 20), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(1920, 1080), QSizeF(), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(), QSizeF(1920, 804), &x, &y));
+    // Every hit over a dense sweep of the window is a real pixel.
+    for (int wy = 0; wy <= 1080; wy += 3)
+    {
+        for (int wx = 0; wx <= 1920; wx += 7)
+        {
+            if (pickPixel(QPointF(wx + 0.5, wy + 0.5), QSizeF(1920, 1080), QSizeF(1000, 418), &x, &y))
+            {
+                ASSERT_TRUE(x >= 0 && x <= 999);
+                ASSERT_TRUE(y >= 0 && y <= 417);
+            }
+        }
+    }
+}
+
+TEST(GpuWindowViewerInput, C8_DropPathsMatchTheScenesFilesDroppedList)
+{
+    // A1: the scene's dropEvent hands openMlvSet every toLocalFile() path, in order, skipping
+    // non-file URLs; UNC hosts survive (the 2026-04-24 \\server\share fix).
+    const QList<QUrl> urls = {
+        QUrl::fromLocalFile(QStringLiteral("C:/drop-test/part.M00")),
+        QUrl(QStringLiteral("https://example.invalid/not-a-file")),
+        QUrl::fromLocalFile(QStringLiteral("C:/drop-test/main.dat")),
+        QUrl(QStringLiteral("file://server/share/clip.dat")),
+    };
+    const QStringList paths = gpu_window_input::localPathsFromUrls(urls);
+    ASSERT_EQ(3, paths.size());
+    ASSERT_TRUE(paths.at(0) == QStringLiteral("C:/drop-test/part.M00"));
+    ASSERT_TRUE(paths.at(1) == QStringLiteral("C:/drop-test/main.dat"));
+    ASSERT_TRUE(paths.at(2) == QStringLiteral("//server/share/clip.dat"));
+    ASSERT_TRUE(gpu_window_input::localPathsFromUrls(QList<QUrl>()).isEmpty());
+
+    // The mirror is the scene's own loop: pin GraphicsPickerScene::dropEvent's body text.
+    const QString scene = readRepoFile(QStringLiteral("platform/qt/GraphicsPickerScene.cpp"));
+    ASSERT_TRUE(scene.contains(QStringLiteral("const QString localPath = url.toLocalFile();")));
+    ASSERT_TRUE(scene.contains(QStringLiteral("if( !localPath.isEmpty() )")));
+    ASSERT_TRUE(scene.contains(QStringLiteral("emit filesDropped( list );")));
+}
+
 TEST(GpuWindowViewerInput, C6_PaintGlFitBlockIsUnchanged)
 {
     // GpuWindowViewerInput.h letterboxRect mirrors these two lines; change both together.
     const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
     ASSERT_TRUE(source.contains(QStringLiteral("if ( imgAspect > winAspect ) sy = winAspect / imgAspect;")));
     ASSERT_TRUE(source.contains(QStringLiteral("else                         sx = imgAspect / winAspect;")));
-    // Aspect from the logical size (the mapper works in logical pixels too).
-    ASSERT_TRUE(source.contains(QStringLiteral("const float winAspect = static_cast<float>(width()) / static_cast<float>(height());")));
+    // Adversary A4 (r1): the three lines alone survive a swapped imgAspect expression. Pin the
+    // whole fit block as one contiguous text, from the window aspect (logical size, as the
+    // mapper) through the image aspect (width over height) to the two scale lines.
+    const QString fitBlock = QStringLiteral(
+        "    const float winAspect = static_cast<float>(width()) / static_cast<float>(height());\n"
+        "    const int displayWidth = m_pendingDisplayWidth > 0 ? m_pendingDisplayWidth : m_texture->width();\n"
+        "    const int displayHeight = m_pendingDisplayHeight > 0 ? m_pendingDisplayHeight : m_texture->height();\n"
+        "    const float imgAspect = static_cast<float>(displayWidth) / static_cast<float>(displayHeight);\n"
+        "    float sx = 1.0f;\n"
+        "    float sy = 1.0f;\n"
+        "    if ( imgAspect > winAspect ) sy = winAspect / imgAspect;\n"
+        "    else                         sx = imgAspect / winAspect;\n");
+    ASSERT_TRUE(source.contains(fitBlock));
+    // Exactly one fit block, so a second (divergent) copy cannot hide behind the pinned one.
+    ASSERT_EQ(1, source.count(QStringLiteral("if ( imgAspect > winAspect ) sy = winAspect / imgAspect;")));
 }

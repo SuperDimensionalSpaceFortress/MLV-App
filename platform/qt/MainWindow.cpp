@@ -26046,7 +26046,8 @@ void MainWindow::installGlWindowViewerInput( QWindow *glWindow )
     // The menu slot maps through the (hidden) view's mapToGlobal; mapFromGlobal is its exact inverse.
     hooks.contextMenuAtGlobal = [this]( const QPoint &globalPos ) { pictureCustomContextMenuRequested( ui->graphicsView->mapFromGlobal( globalPos ) ); };
     hooks.dragEnter = [this]( QDragEnterEvent *e ) { dragEnterEvent( e ); };
-    hooks.drop = [this]( QDropEvent *e ) { dropEvent( e ); };
+    // The scene's own drop route (filesDropped -> openMlvSet), not the top-level window's dropEvent.
+    hooks.openFiles = [this]( const QStringList &paths ) { openMlvSet( paths ); };
     glWindow->installEventFilter( new gpu_window_input::Forwarder( glWindow, std::move( hooks ) ) );
 }
 

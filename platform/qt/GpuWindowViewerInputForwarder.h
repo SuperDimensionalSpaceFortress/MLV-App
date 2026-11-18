@@ -4,8 +4,10 @@
 // (GpuDisplayWindow, a QOpenGLWindow inside a window container) that routes the viewer's
 // mouse input to the same MainWindow slots the QGraphicsView path reaches through its scene:
 // white-balance pick, bad-pixel pick, the right-click viewer menu, and drop-to-open.
-// Picks are mapped from window to scene coordinates with gpu_window_input::windowToScene,
-// the input mirror of paintGL's letterbox fit; the slots convert scene coordinates as before.
+// Picks are mapped from window to scene pixels with gpu_window_input::pickPixel (built on
+// windowToScene, the input mirror of paintGL's letterbox fit); the slots convert scene
+// coordinates as before. A drop is handed over as the scene's filesDropped list (openMlvSet),
+// not through MainWindow::dropEvent, so it opens what the same drop on the scene opens.
 // Header-only, no Q_OBJECT (no moc). The filter is a child of the window, so it lives as
 // long as the window does.
 
@@ -36,7 +38,8 @@ public:
         std::function<void(int, int)> pickBadPixel;
         std::function<void(const QPoint &)> contextMenuAtGlobal;
         std::function<void(QDragEnterEvent *)> dragEnter;
-        std::function<void(QDropEvent *)> drop;
+        // Receives the drop as the scene's filesDropped(QStringList) does (localPathsFromUrls).
+        std::function<void(const QStringList &)> openFiles;
     };
 
     Forwarder( QWindow *window, Hooks hooks )
@@ -80,11 +83,10 @@ public:
         case Route::PickBadPixel:
         {
             const QSizeF scene = m_hooks.sceneSize ? m_hooks.sceneSize() : QSizeF();
-            QPointF p;
-            if( windowToScene( pos, QSizeF( m_window->size() ), scene, &p ) )
+            int x = 0;
+            int y = 0;
+            if( pickPixel( pos, QSizeF( m_window->size() ), scene, &x, &y ) )
             {
-                const int x = int( std::floor( p.x() ) );
-                const int y = int( std::floor( p.y() ) );
                 const bool white = wb;
                 if( white && m_hooks.pickWhiteBalance ) m_hooks.pickWhiteBalance( x, y );
                 else if( !white && m_hooks.pickBadPixel ) m_hooks.pickBadPixel( x, y );
@@ -107,8 +109,14 @@ public:
             }
             return true;
         case Route::Drop:
-            if( m_hooks.drop ) m_hooks.drop( static_cast<QDropEvent *>( event ) );
+        {
+            // As GraphicsPickerScene::dropEvent: every local path, then accept.
+            QDropEvent *drop = static_cast<QDropEvent *>( event );
+            const QStringList paths = drop->mimeData() ? localPathsFromUrls( drop->mimeData()->urls() ) : QStringList();
+            if( m_hooks.openFiles ) m_hooks.openFiles( paths );
+            drop->acceptProposedAction();
             return true;
+        }
         case Route::None:
         default:
             return false;

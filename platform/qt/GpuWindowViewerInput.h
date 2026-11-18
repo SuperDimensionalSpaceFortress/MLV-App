@@ -5,10 +5,14 @@
 // so console tests can pin it without a GUI.
 
 #include <QEvent>
+#include <QList>
 #include <QObject>
 #include <QPointF>
 #include <QRectF>
 #include <QSizeF>
+#include <QString>
+#include <QStringList>
+#include <QUrl>
 
 #include <cmath>
 
@@ -38,7 +42,9 @@ inline QRectF letterboxRect( const QSizeF &window, const QSizeF &display )
 
 // Window position -> scene position. Logical pixels in and out: the device pixel ratio
 // cancels. Returns false when the point is outside the picture (on a black bar) or the
-// geometry is empty; *scenePos is still written when the geometry is not empty.
+// geometry is empty; *scenePos is still written when the geometry is not empty. The picture
+// is HALF-OPEN, [left, right) x [top, bottom): its right and bottom edges map to scene x ==
+// width and y == height, one past the last pixel, so they are outside (adversary A2, r1).
 inline bool windowToScene( const QPointF &windowPos, const QSizeF &window, const QSizeF &scene, QPointF *scenePos )
 {
     const QRectF r = letterboxRect( window, scene );
@@ -48,7 +54,57 @@ inline bool windowToScene( const QPointF &windowPos, const QSizeF &window, const
         *scenePos = QPointF( ( windowPos.x() - r.x() ) / r.width() * scene.width(),
                              ( windowPos.y() - r.y() ) / r.height() * scene.height() );
     }
-    return r.contains( windowPos );
+    return windowPos.x() >= r.left() && windowPos.x() < r.right()
+        && windowPos.y() >= r.top() && windowPos.y() < r.bottom();
+}
+
+// How far, in scene pixels, a pick may land outside the scene and still count as its edge
+// pixel. The scene is an integer size (drawFrameReady sets it from int sceneWidth and
+// sceneHeight), while paintGL letterboxes with the display aspect it was handed (for the CUDA
+// texture route, the clip's own stretched size), so the two pictures differ by less than one
+// scene pixel in total, under half a scene pixel per edge (adversary A3, r1). The mapper has
+// no read of paintGL's display size (GpuDisplayWindow exposes none), so it allows that bound.
+inline constexpr double sceneEdgeSlack() { return 0.5; }
+
+// Window position -> the scene pixel a picker click selects, as the slots take it. False on
+// the black bars (beyond sceneEdgeSlack()) or for empty geometry. A hit is clamped to the
+// last pixel, [0, ceil(width) - 1] x [0, ceil(height) - 1], so no pick names a row or column
+// one past the image (adversary A2, r1: the slots' own guard is "x > width").
+inline bool pickPixel( const QPointF &windowPos, const QSizeF &window, const QSizeF &scene, int *x, int *y )
+{
+    QPointF p;
+    if( letterboxRect( window, scene ).isEmpty() ) return false;
+    windowToScene( windowPos, window, scene, &p );
+    const double slack = sceneEdgeSlack();
+    if( p.x() < -slack || p.y() < -slack
+     || p.x() >= scene.width() + slack || p.y() >= scene.height() + slack )
+        return false;
+    const int lastX = int( std::ceil( scene.width() ) ) - 1;
+    const int lastY = int( std::ceil( scene.height() ) ) - 1;
+    int px = int( std::floor( p.x() ) );
+    int py = int( std::floor( p.y() ) );
+    px = px < 0 ? 0 : ( px > lastX ? lastX : px );
+    py = py < 0 ? 0 : ( py > lastY ? lastY : py );
+    if( x ) *x = px;
+    if( y ) *y = py;
+    return true;
+}
+
+// The dropped URLs as the QGraphicsView path hands them to openMlvSet: every URL through
+// toLocalFile(), empty results skipped, order kept. Mirrors GraphicsPickerScene::dropEvent, so
+// a drop on the GL window opens exactly what the same drop on the scene opens (adversary A1,
+// r1: MainWindow::dropEvent classifies by the first path only and is the top-level route).
+inline QStringList localPathsFromUrls( const QList<QUrl> &urls )
+{
+    QStringList list;
+    list.reserve( urls.size() );
+    for( const QUrl &url : urls )
+    {
+        const QString localPath = url.toLocalFile();
+        if( !localPath.isEmpty() )
+            list.append( localPath );
+    }
+    return list;
 }
 
 // Inverse of windowToScene (used by the round-trip test).
