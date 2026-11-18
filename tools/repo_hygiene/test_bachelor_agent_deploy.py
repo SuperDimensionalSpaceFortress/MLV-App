@@ -15,7 +15,9 @@ import hashlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -30,6 +32,11 @@ NEW = b"# new agent\r\nWrite-Output 'new'\r\n"
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest().upper()
+
+
+def psq(value: object) -> str:
+    """Body of a single-quoted PowerShell literal: a path with an apostrophe (C:\\O'Brien\\Temp) must not break out of it."""
+    return str(value).replace("'", "''")
 
 
 @unittest.skipUnless(PWSH, "pwsh (PowerShell 7) is required")
@@ -48,7 +55,7 @@ class DeployBachelorAgent(unittest.TestCase):
         self.marker = base / "restart-ran.txt"
         self.restart = base / "restart.ps1"
         self.restart.write_text(
-            "param([string]$VenueRoot)\r\nSet-Content -LiteralPath '%s' -Value $VenueRoot\r\n" % self.marker,
+            "param([string]$VenueRoot)\r\nSet-Content -LiteralPath '%s' -Value $VenueRoot\r\n" % psq(self.marker),
             encoding="ascii",
         )
 
@@ -313,7 +320,7 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assert_untouched()
 
     def _dot_source(self, body: str):
-        cmd = ". '%s' -VenueRoot '%s'; %s" % (SCRIPT, self.venue, body)
+        cmd = ". '%s' -VenueRoot '%s'; %s" % (psq(SCRIPT), psq(self.venue), body)
         return subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
 
     def test_a5_a_new_heartbeat_confirms_a_restart_only_for_a_live_matching_process(self) -> None:
@@ -327,7 +334,7 @@ class DeployBachelorAgent(unittest.TestCase):
             "'nostart='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID '' $a) -AgentScript $a);"
             "'wrongscript='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID $s 'C:\\other.ps1') -AgentScript $a);"
             "'null='+(Test-NewHeartbeatIsLiveAgent -Beat $null -AgentScript $a)"
-        ) % (self.venue / AGENT_NAME)
+        ) % psq(self.venue / AGENT_NAME)
         r = self._dot_source(body)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(
@@ -348,7 +355,7 @@ class DeployBachelorAgent(unittest.TestCase):
     def _task_xml_case(self, name: str, agent_script: str, xml: str) -> str:
         f = Path(self._tmp.name) / ("task-%s.xml" % name)
         f.write_text(xml, encoding="utf-8")
-        r = self._dot_source("Test-TaskXmlRunsScript -Xml (Get-Content -Raw -LiteralPath '%s') -AgentScript '%s'" % (f, agent_script))
+        r = self._dot_source("Test-TaskXmlRunsScript -Xml (Get-Content -Raw -LiteralPath '%s') -AgentScript '%s'" % (psq(f), psq(agent_script)))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r.stdout.strip()
 
@@ -396,8 +403,8 @@ class DeployBachelorAgent(unittest.TestCase):
             "$s=[Diagnostics.Stopwatch]::StartNew();"
             "'slowcond='+(Wait-Until -TimeoutSec 1 -Condition { Start-Sleep -Milliseconds 1500; $true });"
             "$g=[Diagnostics.Stopwatch]::StartNew();"
-            "'late='+(Wait-Until -TimeoutSec 1 -PollMs 900 -Condition { $g.Elapsed.TotalSeconds -gt 1.05 });"
-            "'inside='+(Wait-Until -TimeoutSec 5 -PollMs 100 -Condition { $s.Elapsed.TotalSeconds -gt 0 })"
+            "'late='+(Wait-Until -TimeoutSec 1 -PollMs 900 -Variables @{ g = $g } -Condition { $g.Elapsed.TotalSeconds -gt 1.05 });"
+            "'inside='+(Wait-Until -TimeoutSec 5 -PollMs 100 -Variables @{ s = $s } -Condition { $s.Elapsed.TotalSeconds -gt 0 })"
         )
         r = self._dot_source(body)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -415,6 +422,12 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.split(), ["samepid_newstart=True", "same=False", "newpid=True", "nostart=False"], r.stdout + r.stderr)
 
+    def test_b4_get_venue_state_lists_the_root_itself(self) -> None:
+        # Platform-free pin (the ACL case below runs on Windows only): the root is enumerated, not only its three children.
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertRegex(code, r"EnumerateFileSystemEntries\(\$VenueRoot\)")
+
+    @unittest.skipUnless(sys.platform == "win32" and shutil.which("icacls"), "needs Windows icacls to deny List-Directory on the root")
     def test_b4_a_root_that_cannot_be_listed_is_unreadable_even_for_a_noop(self) -> None:
         import os
         who = "%s\\%s" % (os.environ.get("USERDOMAIN", ""), os.environ.get("USERNAME", ""))
@@ -437,6 +450,114 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("DEPLOY_WARN_ARRIVED_DURING_RESTART running=0 inbox=1", r.stdout)
         self.assertRegex(r.stdout, r"DEPLOY_OK sha=[0-9A-F]{64} rollback=.+ restarted=yes")
+
+    # ---- adversary r1 pass 3 findings (A1..A5 of fa4db2b5): each test failed on fa4db2b5 ----
+
+    def _exec_task_case(self, name: str, command: str, args: str, agent_script: str = r"C:\bench\ultra-magnus-agent.ps1") -> str:
+        xml = "<Task><Actions><Exec><Command>%s</Command><Arguments>%s</Arguments></Exec></Actions></Task>" % (command, args)
+        return self._task_xml_case(name, agent_script, xml)
+
+    def test_p3a1_the_task_runs_this_script_as_the_first_file_of_a_powershell_host(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        q = "&quot;"
+        # the adversary's input: a -Command that never runs the agent, then a later -File naming it
+        self.assertEqual(self._exec_task_case("cmd-then-file", "pwsh.exe", "-Command %sStart-Sleep 3600; # ignored%s -File %s" % (q, q, mine)), "False")
+        self.assertEqual(self._exec_task_case("short-c", "pwsh.exe", "-c x -File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("encoded", "pwsh.exe", "-EncodedCommand AAAA -File %s" % mine), "False")
+        # the command must be a PowerShell host: cmd.exe /c echo -File <mine> is not the agent
+        self.assertEqual(self._exec_task_case("cmd-exe", "cmd.exe", "/c echo -File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("cmd-exe-file", "cmd.exe", "-File %s" % mine), "False")
+        # only the FIRST -File is the script the host runs; a later one is that script's argument
+        self.assertEqual(self._exec_task_case("two-files", "pwsh.exe", "-File C:\\busy\\ultra-magnus-agent.ps1 -File %s" % mine), "False")
+        # a non-switch token before -File is a script or command the host would run first
+        self.assertEqual(self._exec_task_case("positional-first", "pwsh.exe", "C:\\busy\\x.ps1 -File %s" % mine), "False")
+        # the real shapes still bind
+        self.assertEqual(self._exec_task_case("full-path-host", "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoProfile -File %s%s%s" % (q, mine, q)), "True")
+        self.assertEqual(self._exec_task_case("ps51", "powershell.exe", "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("noexe", "pwsh", "-NoLogo -NonInteractive -File %s" % mine), "True")
+        # a relative script resolves against a working directory this check cannot see
+        self.assertEqual(self._exec_task_case("relative", "pwsh.exe", "-File ultra-magnus-agent.ps1"), "False")
+
+    def test_p3a2_the_task_root_override_is_bound_to_the_checked_root(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        base = "-NoProfile -File %s" % mine
+        # the adversary's input: the task serves a different (busy) root than the one checked idle
+        self.assertEqual(self._exec_task_case("root-other", "pwsh.exe", base + " -Root C:\\busy-root"), "False")
+        self.assertEqual(self._exec_task_case("root-colon", "pwsh.exe", base + " -Root:C:\\busy-root"), "False")
+        self.assertEqual(self._exec_task_case("root-abbrev", "pwsh.exe", base + " -Ro C:\\busy-root"), "False")
+        self.assertEqual(self._exec_task_case("root-quoted", "pwsh.exe", base + " -Root &quot;C:\\busy root&quot;"), "False")
+        # the first positional parameter of the agent IS -Root
+        self.assertEqual(self._exec_task_case("root-positional", "pwsh.exe", base + " C:\\busy-root"), "False")
+        self.assertEqual(self._exec_task_case("root-no-value", "pwsh.exe", base + " -Root"), "False")
+        # the same root, spelled any way, binds; other agent parameters do not matter
+        self.assertEqual(self._exec_task_case("root-same", "pwsh.exe", base + " -Root C:\\bench"), "True")
+        self.assertEqual(self._exec_task_case("root-same-slash", "pwsh.exe", base + " -Root &quot;c:\\BENCH\\&quot;"), "True")
+        self.assertEqual(self._exec_task_case("runonce", "pwsh.exe", base + " -RunOnce"), "True")
+        self.assertEqual(self._exec_task_case("poll", "pwsh.exe", base + " -PollSeconds 5 -RunOnce -Root C:\\bench"), "True")
+
+    def test_p3a3_a_wait_is_bounded_even_when_the_condition_stalls(self) -> None:
+        t0 = time.monotonic()
+        r = self._dot_source("'stalled='+(Wait-Until -TimeoutSec 1 -Condition { Start-Sleep -Seconds 120; $true })")
+        elapsed = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["stalled=False"], r.stdout + r.stderr)
+        self.assertLess(elapsed, 30, "the wait returned at its budget and the host did not wait for the stalled condition")
+
+    def test_p3a3_a_wait_condition_sees_the_scripts_own_functions_and_variables(self) -> None:
+        (self.venue / "heartbeat.txt").write_text("alive x pid=%d host=H generation=1\r\n" % 4242)
+        body = (
+            "'fn='+(Wait-Until -TimeoutSec 20 -PollMs 100 -Condition { $b = Read-Heartbeat; ($null -ne $b) -and ($b.pid -eq 4242) });"
+            "'var='+(Wait-Until -TimeoutSec 20 -PollMs 100 -Variables @{ want = 7 } -Condition { $want -eq 7 });"
+            "'thrown='+$(try { Wait-Until -TimeoutSec 5 -Condition { throw 'boom' } } catch { 'caught:' + $_.Exception.Message })"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["fn=True", "var=True", "thrown=caught:boom"], r.stdout + r.stderr)
+
+    def test_p3a3_a_child_process_call_is_bounded(self) -> None:
+        body = (
+            "$t=[Diagnostics.Stopwatch]::StartNew();"
+            "$r=Invoke-BoundedProcess -FilePath '%s' -Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 120') -TimeoutSec 2;"
+            "'timedout='+$r.timedOut; 'fast='+($t.Elapsed.TotalSeconds -lt 20);"
+            "$ok=Invoke-BoundedProcess -FilePath '%s' -Arguments @('-NoProfile','-Command','Write-Output hi; exit 3') -TimeoutSec 60;"
+            "'exit='+$ok.exitCode; 'out='+$ok.output.Trim(); 'ok_timedout='+$ok.timedOut"
+        ) % (psq(PWSH), psq(PWSH))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["timedout=True", "fast=True", "exit=3", "out=hi", "ok_timedout=False"], r.stdout + r.stderr)
+
+    def test_p3a3_the_restart_calls_and_the_venue_reads_use_the_bounded_helpers(self) -> None:
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertIsNone(re.search(r"&\s*schtasks\.exe", code), "schtasks is run through Invoke-BoundedProcess, never directly")
+        self.assertIn("Invoke-BoundedProcess", code)
+
+    def test_p3a5_one_start_time_tolerance_decides_alive_and_different(self) -> None:
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"\$script:StartToleranceSec\s*=", code)), 1, "the tolerance is defined once")
+        self.assertIsNone(re.search(r"TotalSeconds\)\s*-(lt|ge|gt|le)\s+\d", code), "no second tolerance literal beside the shared one")
+        # at exactly the tolerance the two checks must still agree: same process in BOTH, or different in BOTH
+        body = (
+            "$me=Get-Process -Id $PID; $s0=$me.StartTime.ToUniversalTime();"
+            "function B($p,$st){ [pscustomobject]@{pid=$p;start=$st;agentScript='x';host='H';ageSec=1} };"
+            "foreach($d in 0.5,2.0,2.5){ $st=$s0.AddSeconds($d).ToString('o');"
+            " 'd'+$d+' alive='+(Test-AgentProcessAlive -Beat (B $PID $st) -RequireStart)+' different='+(Test-BeatIsDifferentProcess -Old (B $PID $s0.ToString('o')) -New (B $PID $st)) }"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        lines = [l for l in r.stdout.splitlines() if l.startswith("d")]
+        self.assertEqual(len(lines), 3, r.stdout + r.stderr)
+        for line in lines:
+            m = re.match(r"d(\S+) alive=(\w+) different=(\w+)$", line)
+            self.assertIsNotNone(m, line)
+            self.assertNotEqual(m.group(2), m.group(3), "alive and different are exact opposites for one pid and one start gap: " + line)
+        self.assertEqual([re.match(r"d(\S+) alive=(\w+)", l).group(2) for l in lines], ["True", "True", "False"])
+
+    def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
+        # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.
+        src = Path(__file__).read_text(encoding="utf-8")
+        i = src.index("def test_b4_a_root_that_cannot_be_listed_is_unreadable_even_for_a_noop")
+        self.assertIn('sys.platform == "win32"', src[max(0, i - 260):i])
+        self.assertIn('shutil.which("icacls")', src[max(0, i - 260):i])
 
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.

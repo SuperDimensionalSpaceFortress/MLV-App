@@ -61,10 +61,17 @@
 #   machine's task list, so -RestartMode when-idle is refused (16) before anything changes unless ALL hold: heartbeat.txt
 #   names this machine as host=; its agentScript= is <VenueRoot>\ultra-magnus-agent.ps1 (a copied heartbeat from another
 #   root fails here); its pid is alive with the recorded start time; and the task's own XML has an executable action
-#   `-File <that script path>` (a path mentioned only in the description or a later argument does not count).
+#   `-File <that script path>`: the action's <Command> is pwsh/powershell, the FIRST -File (no -Command/-EncodedCommand before it,
+#   no positional token before it) is that absolute path, and the agent's own arguments after it name no other root (-Root, or a
+#   positional first argument, must be this folder; a path mentioned only in the description or a later argument does not count).
 #   The root itself must also list (a root whose listing is denied is DEPLOY_REFUSED_UNREADABLE, even for a no-op).
 #   The idle gate keeps the End from stranding a lease: with running\, inbox\ and slot-holders\ empty, nothing is lost.
-#   Waits use a monotonic Stopwatch, never the wall clock.
+#   Waits use a monotonic Stopwatch, never the wall clock, and EVERY read of the venue is under a deadline: a listing, a heartbeat
+#   read and each wait condition run in their own runspace (Invoke-Bounded) and a schtasks call runs as a child process
+#   (Invoke-BoundedProcess), so a share that stops answering is a typed refusal or failure at the deadline, never a hang with
+#   deploy.lock held. Not bounded (the deploy's own file I/O, the root's existence check, -RestartScript, the dot-source seam): a stall
+#   there holds the process, and the lock is released when the process is killed (DeleteOnClose).
+#   One start-time tolerance ($script:StartToleranceSec) decides both "is this the live agent" and "is this a different process".
 #
 # Residual race (stated, not hidden): the agent has no drain or admission barrier, so a job can land in inbox\ between the
 #   last idle check and the End. The check is repeated immediately before the End and once more after the old agent has
@@ -94,6 +101,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $agentName = 'ultra-magnus-agent.ps1'
+# ONE tolerance for "same process start": the heartbeat's processStartUtc against the live process (alive check) and the old
+# heartbeat against the new one (replacement check). Same iff the gap is within it, in BOTH checks (VenueChain.psm1 uses 2 s too).
+$script:StartToleranceSec = 2
+# the longest a single read of the venue (a listing, the heartbeat) may take before it counts as unanswered
+$script:ReadTimeoutSec = 20
+# the file a bounded runspace dot-sources to get this script's functions (empty only if the host gives no path)
+$script:SelfPath = $PSCommandPath
 
 function Out-Typed { param([string]$Line) Write-Output $Line }
 
@@ -121,20 +135,82 @@ function Write-BytesAtomic {
     }
 }
 
+function Invoke-Bounded {
+    # Runs $Script in its OWN runspace and stops waiting for it at the deadline, so a read that stalls (a share that stops
+    # answering) cannot hold this script, and the deploy lock with it, past its budget. The runspace dot-sources this script
+    # (functions only), so every function here is available, plus $VenueRoot, $TaskName and $TaskXmlFile; anything else the
+    # script closes over goes in -Variables. On a timeout the runspace is ABANDONED (stopped if it can be, never disposed, since
+    # disposing would wait for the stalled call); its thread is a background thread and never keeps the process alive.
+    # Returns [pscustomobject]@{ timedOut; error; ok; value }: ok is the truth of the last output, value is the last output.
+    param([scriptblock]$Script, [long]$TimeoutMs, [hashtable]$Variables = @{})
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.ExecutionPolicy = [Microsoft.PowerShell.ExecutionPolicy]::Bypass
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('__self', $script:SelfPath)
+    $rs.SessionStateProxy.SetVariable('VenueRoot', $VenueRoot)
+    $rs.SessionStateProxy.SetVariable('TaskName', $TaskName)
+    $rs.SessionStateProxy.SetVariable('TaskXmlFile', $TaskXmlFile)
+    foreach ($k in $Variables.Keys) { $rs.SessionStateProxy.SetVariable([string]$k, $Variables[$k]) }
+    $ps = [System.Management.Automation.PowerShell]::Create($rs)
+    [void]$ps.AddScript(('. $__self -VenueRoot $VenueRoot -TaskName $TaskName -TaskXmlFile $TaskXmlFile' + "`n" + $Script.ToString()))
+    $handle = $ps.BeginInvoke()
+    if (-not $handle.AsyncWaitHandle.WaitOne([int][Math]::Min([Math]::Max($TimeoutMs, 0L), 2000000000L))) {
+        try { [void]$ps.BeginStop($null, $null) } catch { }
+        return [pscustomobject]@{ timedOut = $true; error = $null; ok = $false; value = $null }
+    }
+    $out = @(); $err = $null
+    try { $out = @($ps.EndInvoke($handle)) }
+    catch { $inner = $_.Exception.InnerException; $err = $(if ($null -ne $inner) { $inner.Message } else { $_.Exception.Message }) }
+    try { $ps.Dispose(); $rs.Dispose() } catch { }
+    $last = $(if ($out.Count -gt 0) { $out[$out.Count - 1] } else { $null })
+    return [pscustomobject]@{ timedOut = $false; error = $err; ok = [bool]$last; value = $last }
+}
+
+function Invoke-BoundedProcess {
+    # A child process with a hard deadline: killed (by the pid this script started, never by name) when it does not exit in time.
+    param([string]$FilePath, [string[]]$Arguments = @(), [int]$TimeoutSec = 30)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($FilePath)
+    foreach ($a in $Arguments) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit([int][Math]::Min([long]$TimeoutSec * 1000, 2000000000L))) {
+        try { $p.Kill($true) } catch { }
+        return [pscustomobject]@{ timedOut = $true; exitCode = $null; output = ''; errorText = '' }
+    }
+    [void]$outTask.Wait(5000)
+    [void]$errTask.Wait(5000)
+    return [pscustomobject]@{
+        timedOut = $false; exitCode = $p.ExitCode
+        output = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' })
+        errorText = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' })
+    }
+}
+
 function Wait-Until {
     # Bounded by a monotonic Stopwatch: a wall-clock step cannot stretch or cut the wait.
-    # A condition counts only if it was OBSERVED true inside the window: the deadline is checked before it is evaluated and again
-    # after (a slow read that crosses the deadline is a timeout), and the sleep never runs past the deadline.
-    param([int]$TimeoutSec, [scriptblock]$Condition, [int]$PollMs = 500)
+    # A condition counts only if it was OBSERVED true inside the window. It is evaluated by Invoke-Bounded, so a condition that
+    # itself stalls (a synchronous read of a share) is a timeout at the deadline, not a wait of the stall's length. A condition that
+    # throws throws here. The remaining time is kept in [long] milliseconds (no int overflow for a large -TimeoutSec).
+    param([int]$TimeoutSec, [scriptblock]$Condition, [int]$PollMs = 500, [hashtable]$Variables = @{})
+    $budgetMs = [long]$TimeoutSec * 1000
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($true) {
-        if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { return $false }
-        $ok = & $Condition
-        if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { return $false }
-        if ($ok) { return $true }
-        $leftMs = [int](($TimeoutSec - $sw.Elapsed.TotalSeconds) * 1000)
+        $leftMs = $budgetMs - [long]$sw.Elapsed.TotalMilliseconds
         if ($leftMs -le 0) { return $false }
-        Start-Sleep -Milliseconds ([Math]::Min($PollMs, $leftMs))
+        $r = Invoke-Bounded -Script $Condition -TimeoutMs $leftMs -Variables $Variables
+        if ($r.timedOut) { return $false }
+        if ($null -ne $r.error) { throw $r.error }
+        if ($sw.Elapsed.TotalMilliseconds -ge $budgetMs) { return $false }
+        if ($r.ok) { return $true }
+        $leftMs = $budgetMs - [long]$sw.Elapsed.TotalMilliseconds
+        if ($leftMs -le 0) { return $false }
+        Start-Sleep -Milliseconds ([int][Math]::Min([long]$PollMs, $leftMs))
     }
 }
 
@@ -149,6 +225,16 @@ function Test-SamePath {
 }
 
 function Get-VenueState {
+    # The listing under a hard deadline: a share that stops answering is "unreadable" (a refusal), never a hang with the lock held.
+    $r = Invoke-Bounded -Script { Get-VenueStateRaw } -TimeoutMs ($script:ReadTimeoutSec * 1000)
+    $failed = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @() }
+    if ($r.timedOut) { $failed.unreadable = "listing the venue did not answer within $($script:ReadTimeoutSec) s"; return [pscustomobject]$failed }
+    if ($null -ne $r.error) { $failed.unreadable = "listing failed: $($r.error)"; return [pscustomobject]$failed }
+    if ($null -eq $r.value) { $failed.unreadable = 'listing returned nothing'; return [pscustomobject]$failed }
+    return $r.value
+}
+
+function Get-VenueStateRaw {
     # Reads the three folders the idle judgement rests on. Any failure to list one is "unreadable", never "empty".
     $state = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @() }
     # the root itself must list too: lock creation and file reads can succeed where enumeration is denied
@@ -229,6 +315,24 @@ function Read-Heartbeat {
     catch { return $null }
 }
 
+function Read-HeartbeatBounded {
+    # Read-Heartbeat under the read deadline; no answer reads as no heartbeat (a refusal upstream, never a hang).
+    $r = Invoke-Bounded -Script { Read-Heartbeat } -TimeoutMs ($script:ReadTimeoutSec * 1000)
+    if ($r.timedOut -or $null -ne $r.error) { return $null }
+    return $r.value
+}
+
+function Test-StartTimesMatch {
+    # THE one start-time comparison: the same process iff the two starts are within $script:StartToleranceSec of each other.
+    param([datetime]$A, [datetime]$B)
+    return ([Math]::Abs(($A - $B).TotalSeconds) -le $script:StartToleranceSec)
+}
+
+function ConvertTo-UtcStart {
+    param([string]$Text)
+    return [DateTimeOffset]::Parse($Text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime
+}
+
 function Test-AgentProcessAlive {
     # Alive AND the same process the heartbeat recorded (pid plus start time, so a reused pid does not count).
     param($Beat, [switch]$RequireStart)
@@ -236,10 +340,7 @@ function Test-AgentProcessAlive {
     $proc = Get-Process -Id $Beat.pid -ErrorAction SilentlyContinue
     if ($null -eq $proc) { return $false }
     if ([string]::IsNullOrWhiteSpace($Beat.start)) { return (-not $RequireStart) }
-    try {
-        $want = [DateTimeOffset]::Parse($Beat.start, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        return ([Math]::Abs(($proc.StartTime.ToUniversalTime() - $want.UtcDateTime).TotalSeconds) -lt 2)
-    }
+    try { return (Test-StartTimesMatch -A $proc.StartTime.ToUniversalTime() -B (ConvertTo-UtcStart -Text $Beat.start)) }
     catch { return (-not $RequireStart) }
 }
 
@@ -257,26 +358,104 @@ function Test-BeatIsDifferentProcess {
     param($Old, $New)
     if ($Old.pid -ne $New.pid) { return $true }
     if ([string]::IsNullOrWhiteSpace($Old.start) -or [string]::IsNullOrWhiteSpace($New.start)) { return $false }
-    try {
-        $a = [DateTimeOffset]::Parse($Old.start, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        $b = [DateTimeOffset]::Parse($New.start, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
-        return ([Math]::Abs(($a.UtcDateTime - $b.UtcDateTime).TotalSeconds) -ge 2)
-    }
+    try { return (-not (Test-StartTimesMatch -A (ConvertTo-UtcStart -Text $Old.start) -B (ConvertTo-UtcStart -Text $New.start))) }
     catch { return $false }
 }
 
+function Split-TaskArguments {
+    # The argument string as the process would receive it: split on whitespace outside double quotes, quotes dropped.
+    param([string]$Text)
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    $sb = [System.Text.StringBuilder]::new()
+    $inQuote = $false; $has = $false
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($ch -eq [char]'"') { $inQuote = -not $inQuote; $has = $true; continue }
+        if ((-not $inQuote) -and [char]::IsWhiteSpace($ch)) {
+            if ($has) { $tokens.Add($sb.ToString()); [void]$sb.Clear(); $has = $false }
+            continue
+        }
+        [void]$sb.Append($ch); $has = $true
+    }
+    if ($has) { $tokens.Add($sb.ToString()) }
+    return $tokens.ToArray()
+}
+
+function Test-ParamName {
+    # "-Fi", "-file", "/FILE" are all spellings of File: a leading - or /, then a (case-insensitive) prefix of the full name.
+    param([string]$Token, [string]$Full)
+    if ($Token.Length -lt 2) { return $false }
+    if ($Token[0] -ne [char]'-' -and $Token[0] -ne [char]'/') { return $false }
+    $n = $Token.Substring(1)
+    if ($n.Length -gt $Full.Length) { return $false }
+    return $Full.StartsWith($n, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-TaskRootFromScriptArgs {
+    # The arguments AFTER the script path are the agent's own. The agent serves -Root (its FIRST positional parameter too), which
+    # defaults to its own folder. Returns @{ ok; root } : ok = $false when an argument cannot be read as a known shape (a positional
+    # value, a -Root with no value); root = the folder named by -Root, or $null when the task names none.
+    param([string[]]$ScriptArgs)
+    $root = $null
+    $k = 0
+    while ($k -lt $ScriptArgs.Count) {
+        $t = $ScriptArgs[$k]
+        $m = [regex]::Match($t, '^[-/]([A-Za-z]+)(:(.*))?$')
+        if (-not $m.Success) { return @{ ok = $false; root = $null } }
+        $inline = $m.Groups[2].Success
+        if (Test-ParamName -Token ('-' + $m.Groups[1].Value) -Full 'Root') {
+            if ($inline) { $val = $m.Groups[3].Value; $k++ }
+            elseif ($k + 1 -lt $ScriptArgs.Count) { $val = $ScriptArgs[$k + 1]; $k += 2 }
+            else { return @{ ok = $false; root = $null } }
+            if ([string]::IsNullOrWhiteSpace($val)) { return @{ ok = $false; root = $null } }
+            $root = $val
+            continue
+        }
+        if ($inline -or (Test-ParamName -Token ('-' + $m.Groups[1].Value) -Full 'RunOnce')) { $k++; continue }
+        # another agent parameter: it takes the next token as its value when that token is not itself a parameter
+        if ($k + 1 -lt $ScriptArgs.Count -and $ScriptArgs[$k + 1] -notmatch '^[-/][A-Za-z]') { $k += 2 } else { $k++ }
+    }
+    return @{ ok = $true; root = $root }
+}
+
 function Test-TaskXmlRunsScript {
-    # The task's EXECUTABLE action must run -File <AgentScript>. A mention elsewhere (Description, a later argument) is not the
-    # script the task runs, and XML escapes (&amp;) are decoded by the parser, so a correct task for an unusual path still binds.
+    # The task's EXECUTABLE action must be a PowerShell host whose FIRST -File is <AgentScript> (an absolute path), serving the root
+    # that script lives in. A mention elsewhere (Description, a later -File, a -Command that never runs it) is not the script the
+    # task runs; a -Root override or a positional first argument that names ANOTHER folder means the task serves a root that was
+    # not checked idle. XML escapes (&amp;) are decoded by the parser, so a correct task for an unusual path still binds.
     param([string]$Xml, [string]$AgentScript)
     try { $doc = [xml]$Xml } catch { return $false }
+    $expectedRoot = $AgentScript -replace '[\\/][^\\/]*$', ''
+    $valueSwitches = @('ExecutionPolicy', 'ep', 'WindowStyle', 'WorkingDirectory', 'wd', 'InputFormat', 'if', 'OutputFormat', 'of',
+        'ConfigurationName', 'ConfigurationFile', 'SettingsFile', 'CustomPipeName', 'Version')
     foreach ($exec in @($doc.SelectNodes("//*[local-name()='Exec']"))) {
+        $cmdNode = $exec.SelectSingleNode("*[local-name()='Command']")
         $argNode = $exec.SelectSingleNode("*[local-name()='Arguments']")
-        if ($null -eq $argNode) { continue }
-        $m = [regex]::Match($argNode.InnerText, '(?i)(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))')
-        if (-not $m.Success) { continue }
-        $file = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
-        if (Test-SamePath -A $file -B $AgentScript) { return $true }
+        if ($null -eq $cmdNode -or $null -eq $argNode) { continue }
+        $leaf = [regex]::Match($cmdNode.InnerText.Trim().Trim('"'), '[^\\/]+$').Value
+        if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { continue }
+        $tokens = @(Split-TaskArguments -Text $argNode.InnerText)
+        $scriptPath = $null; $i = 0
+        while ($i -lt $tokens.Count) {
+            $t = $tokens[$i]
+            if ((Test-ParamName -Token $t -Full 'Command') -or (Test-ParamName -Token $t -Full 'CommandWithArgs') -or
+                (Test-ParamName -Token $t -Full 'EncodedCommand') -or (Test-ParamName -Token $t -Full 'EncodedArguments')) { break }
+            if (Test-ParamName -Token $t -Full 'File') {
+                if ($i + 1 -lt $tokens.Count) { $scriptPath = $tokens[$i + 1]; $i += 2 }
+                break
+            }
+            if ($t -notmatch '^[-/]') { break }
+            $takesValue = $false
+            foreach ($v in $valueSwitches) { if (Test-ParamName -Token $t -Full $v) { $takesValue = $true; break } }
+            if ($takesValue) { $i += 2 } else { $i++ }
+        }
+        if ($null -eq $scriptPath) { continue }
+        if ($scriptPath -notmatch '^([A-Za-z]:[\\/]|\\\\|/)') { continue }
+        if (-not (Test-SamePath -A $scriptPath -B $AgentScript)) { continue }
+        $rest = @(); if ($i -lt $tokens.Count) { $rest = @($tokens[$i..($tokens.Count - 1)]) }
+        $parsed = Get-TaskRootFromScriptArgs -ScriptArgs $rest
+        if (-not $parsed.ok) { continue }
+        if ($null -ne $parsed.root -and -not (Test-SamePath -A $parsed.root -B $expectedRoot)) { continue }
+        return $true
     }
     return $false
 }
@@ -285,8 +464,8 @@ function Get-RestartBindingRefusal {
     # -RestartMode when-idle without -RestartScript: the schtasks End/Run act on THIS machine's task, so the root that was checked
     # idle must be the root of the agent that task runs. Returns a reason string, or $null when bound.
     param([string]$AgentScript)
-    $beat = Read-Heartbeat
-    if ($null -eq $beat) { return 'heartbeat.txt is missing or unreadable, so the agent host cannot be confirmed' }
+    $beat = Read-HeartbeatBounded
+    if ($null -eq $beat) { return 'heartbeat.txt is missing, unreadable or did not answer in time, so the agent host cannot be confirmed' }
     if (-not [string]::Equals($beat.host, $env:COMPUTERNAME, [StringComparison]::OrdinalIgnoreCase)) {
         return "heartbeat host=$($beat.host) is not this machine ($env:COMPUTERNAME); run it on the agent host"
     }
@@ -300,9 +479,10 @@ function Get-RestartBindingRefusal {
     try {
         if ($TaskXmlFile -ne '') { $xml = [System.IO.File]::ReadAllText($TaskXmlFile) }
         else {
-            $out = & schtasks.exe /Query /TN $TaskName /XML 2>&1
-            if ($LASTEXITCODE -ne 0) { return "task $TaskName could not be queried (exit $LASTEXITCODE)" }
-            $xml = ($out | Out-String)
+            $q = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Query', '/TN', $TaskName, '/XML') -TimeoutSec 30
+            if ($q.timedOut) { return "task $TaskName did not answer schtasks /Query within 30 s" }
+            if ($q.exitCode -ne 0) { return "task $TaskName could not be queried (exit $($q.exitCode))" }
+            $xml = $q.output
         }
     }
     catch { return "task $TaskName could not be read: $($_.Exception.Message)" }
@@ -324,14 +504,17 @@ function Invoke-AgentRestart {
         if ($LASTEXITCODE -ne 0) { return @{ why = "restart script exited $LASTEXITCODE"; warn = $null } }
         return @{ why = $null; warn = (Get-ArrivalWarning) }
     }
-    $before = Read-Heartbeat
-    & schtasks.exe /End /TN $TaskName | Out-Null
-    $gone = Wait-Until -TimeoutSec 30 -Condition { -not (Test-AgentProcessAlive -Beat $before) }
+    $before = Read-HeartbeatBounded
+    if ($null -eq $before) { return @{ why = 'heartbeat.txt did not answer in time, so the agent to stop cannot be identified; nothing was stopped'; warn = $null } }
+    $end = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/End', '/TN', $TaskName) -TimeoutSec 30
+    if ($end.timedOut) { return @{ why = "schtasks /End $TaskName did not return within 30 s"; warn = $null } }
+    $gone = Wait-Until -TimeoutSec 30 -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
     if (-not $gone) { return @{ why = "agent pid $($before.pid) still alive 30 s after schtasks /End"; warn = $null } }
     $warn = Get-ArrivalWarning
-    & schtasks.exe /Run /TN $TaskName | Out-Null
-    if ($LASTEXITCODE -ne 0) { return @{ why = "schtasks /Run $TaskName exited $LASTEXITCODE"; warn = $warn } }
-    $up = Wait-Until -TimeoutSec 60 -Condition {
+    $run = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName) -TimeoutSec 30
+    if ($run.timedOut) { return @{ why = "schtasks /Run $TaskName did not return within 30 s"; warn = $warn } }
+    if ($run.exitCode -ne 0) { return @{ why = "schtasks /Run $TaskName exited $($run.exitCode)"; warn = $warn } }
+    $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript } -Condition {
         $now = Read-Heartbeat
         ($null -ne $now) -and ($now.ageSec -lt 30) -and (Test-BeatIsDifferentProcess -Old $before -New $now) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript)
     } -PollMs 1000
