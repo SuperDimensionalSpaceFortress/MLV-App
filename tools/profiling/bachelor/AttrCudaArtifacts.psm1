@@ -7387,7 +7387,7 @@ function Get-AttrCudaWindowToggleEvidence {
       interaction_trace event=resize.keep_playing ...
     The measured session is the one -MeasuredSessionId names (the job's own measured-session read): its records are the lines from that session's
     playback_smoke.measured_session marker up to the next marker of ANOTHER session. With no id, the log must carry markers of ONE session only (more is
-    ambiguous: reason names it) and the last marker starts the window.
+    ambiguous, none is absent: reason names either) and the last marker starts the window.
     The job's schedule is fixed (fs_on, fs_off, restore, maximize at indexes 0..3). Toggle i is DRIVEN when it has exactly one begin and one end, in log
     order, parseable (a key repeated inside one record is not), the same kind, a kind of the schedule at its index, and after the previous toggle's end.
     It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both, the
@@ -7395,7 +7395,9 @@ function Get-AttrCudaWindowToggleEvidence {
     kind's (fs_on: fullscreen at the end, not at the begin; fs_off: the reverse; restore: neither fullscreen nor maximized; maximize: maximized, not
     fullscreen) and the end was logged at least 2000 ms after the begin. It ADVANCED when it is driven and position_end > position_begin and
     presented_serial_end > presented_serial_begin. The one summary record must be present, whole, with requested= and driven= whole numbers (driven
-    equal to what the records show) and reason= ok or incomplete. A duplicate, unordered, missing, contradictory or unparseable record makes that
+    equal to what the records show) and reason= ok or incomplete (its own reason is carried through: incomplete names itself in the result, and ok over a
+    driven short of requested contradicts itself), and it must come after the last toggle record. A key repeated in a record, even with an empty value, makes
+    it unusable. A duplicate, unordered, missing, contradictory or unparseable record makes that
     toggle (or the summary) count for NOTHING more and names itself in reason. Records are read from the app's record body only: the log prefix and the
     Qt location suffix are cut first. Returns requested / driven / keptPlaying / advanced / reason (reason = ok only when every requested toggle was
     driven, kept playing and advanced and nothing above was anomalous).
@@ -7432,7 +7434,9 @@ function Get-AttrCudaWindowToggleEvidence {
         }
     }
     if ($wanted -eq '') {
+        # r3 (A5): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
         if ($markerIds.Count -gt 1) { $anomalies.Add('measured-session-ambiguous') }
+        elseif ($markerIds.Count -eq 0) { $anomalies.Add('measured-session-marker-absent') }
     } else {
         if (-not $markerIds.ContainsKey($wanted)) { $anomalies.Add('measured-session-marker-absent'); $start = $lines.Count }
         for ($i = $start + 1; $i -lt $lines.Count; $i++) {
@@ -7446,18 +7450,21 @@ function Get-AttrCudaWindowToggleEvidence {
     $keepLines = @()
     $summaries = @()
     $maxIndex = -1
+    $lastToggleLine = -1
     for ($i = $start; $i -lt $end; $i++) {
         $line = $lines[$i]
         if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') { $keepLines += $i; continue }
         $isSummary = $line -match '^gui_smoke\.window_toggles '
         if (-not $isSummary -and $line -notmatch '^gui_smoke\.window_toggle phase=') { continue }
+        if (-not $isSummary -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
         $values = @{}
         $repeatedKey = $false
-        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) {
+        # r3 (B2): the value may be EMPTY (`[^\s]*`), so a key repeated with no value (` position=`, ` requested=`) still counts as repeated; an empty value is never a usable one
+        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]*)')) {
             if ($values.ContainsKey($match.Groups['key'].Value)) { $repeatedKey = $true }
             $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
         }
-        if ($isSummary) { $summaries += , @{ values = $values; repeated = $repeatedKey }; continue }
+        if ($isSummary) { $summaries += , @{ values = $values; repeated = $repeatedKey; line = $i }; continue }
         [int]$index = -1
         if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0 -and $index -lt 1000)) {
             $anomalies.Add('unparseable-record-without-index')
@@ -7508,7 +7515,13 @@ function Get-AttrCudaWindowToggleEvidence {
         else {
             $summaryRequested = [int]$sv['requested']
             $summaryDriven = [int]$sv['driven']
+            # r3 (B1): the summary's OWN reason is carried through, never rebuilt from the counts: `incomplete` over healthy records names itself, and `ok`
+            # over a short driven count contradicts itself
+            if ($sv['reason'] -ceq 'incomplete') { $anomalies.Add('summary-reason-incomplete') }
+            elseif ($summaryDriven -ne $summaryRequested) { $anomalies.Add("summary-ok-but-driven-$summaryDriven-of-$summaryRequested") }
         }
+        # r3 (B3): the one summary is written AFTER the loop, so it must come after the last toggle record
+        if ($lastToggleLine -ge 0 -and $summaries[0].line -lt $lastToggleLine) { $anomalies.Add('summary-before-toggle-records') }
     }
     $requested = $maxIndex + 1
     if ($summaryRequested -ge 0) { $requested = $summaryRequested }

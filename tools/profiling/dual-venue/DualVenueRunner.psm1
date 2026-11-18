@@ -2044,6 +2044,43 @@ function Get-DvWindowToggleRequestEvidence {
     }
 }
 
+function Get-DvWindowToggleReconcileEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r3 (sol B4 on 11def8e4): a leg that NAMES generatorArgs.midPlayWindowToggles must have its windowToggles* scalars
+    (windowTogglesRequested / Driven / KeptPlaying / Advanced and windowToggleEvidenceReason) backed by the hashed run log. They are re-derived here from the
+    log with the job's own reader (Get-AttrCudaWindowToggleEvidence, over the measured session Get-DvSmokeSummaryFields names, none when it is unreadable) and
+    compared field for field with the metrics; `blocks` is true when any of the five is absent or differs, so a summary whose toggle records were removed from
+    the log (and the log-hash references refreshed) is INVALID, never a PASS. An honest failure (the scalars are exactly what the log derives, reason not ok)
+    does not block: the criteria FAIL it. A leg that does not ask is not judged here (Get-DvWindowToggleRequestEvidence is its gate). Pure and shared: the
+    runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText, $Metrics)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    $requested = ($raw -is [bool]) -and $raw
+    if (-not $requested) { return [pscustomobject]@{ requested = $false; blocks = $false; reason = $null; derived = $null } }
+    $sessionRead = Get-DvSmokeSummaryFields -LogText $LogText
+    $session = $(if ($null -ne $sessionRead.session) { [string]$sessionRead.session } else { '' })
+    $module = Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1') -PassThru -DisableNameChecking
+    $derived = & $module { param([string]$t, [string]$s) Get-AttrCudaWindowToggleEvidence -LogText $t -MeasuredSessionId $s } ([string]$LogText) $session
+    $pairs = @(@('windowTogglesRequested', $derived.requested), @('windowTogglesDriven', $derived.driven), @('windowTogglesKeptPlaying', $derived.keptPlaying),
+        @('windowTogglesAdvanced', $derived.advanced), @('windowToggleEvidenceReason', $derived.reason))
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    foreach ($pair in $pairs) {
+        $claimed = Get-DvProp $Metrics $pair[0]
+        if ($null -eq $claimed -or -not [string]::Equals([string]$claimed, [string]$pair[1], [StringComparison]::Ordinal)) {
+            $mismatches.Add("$($pair[0])=$(if ($null -eq $claimed) { '<absent>' } else { [string]$claimed }) but the run log derives $([string]$pair[1])")
+        }
+    }
+    $blocks = $mismatches.Count -gt 0
+    [pscustomobject]@{
+        requested = $true
+        blocks = $blocks
+        reason = $(if ($blocks) { "WINDOW_TOGGLES_NOT_FROM_LOG: the leg names midPlayWindowToggles but its windowToggles* scalars are not what the hashed run log derives ($($mismatches -join '; ')); a toggle claim the raw records do not back is no evidence" } else { $null })
+        derived = $derived
+    }
+}
+
 function Get-DvDueWakeDeliveryEvidence {
     <#
     .SYNOPSIS
@@ -4864,6 +4901,9 @@ function Test-DvReceiptValid {
             # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A5): a leg that names no midPlayWindowToggles but whose run log shows window toggles was moved by an inherited env
             $windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText
             if ($windowToggleRequestVerdict.blocks) { $invalid.Add("WINDOW_TOGGLES_INHERITED: $($windowToggleRequestVerdict.reason)") }
+            # r3 (sol B4): a leg that names the toggles has its windowToggles* scalars re-derived from the hashed run log; a claim the raw records do not back is INVALID
+            $windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $ev.logText -Metrics $metrics
+            if ($windowToggleReconcileVerdict.blocks) { $invalid.Add($windowToggleReconcileVerdict.reason) }
             # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: a leg that asks for the team partition the app did not report at exactly r+p (or whose report is unreadable, or
             # absent because the binary emits none), or a control leg whose app reports a partition, is no measurement of its arm; the receipt's own
             # teamPartition block is re-derived like the reconReleaseDeferred block.
@@ -5697,6 +5737,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

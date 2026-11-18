@@ -1055,6 +1055,12 @@ if ($outcome -in @('PASS', 'FAIL') -and $windowToggleRequestVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but WINDOW_TOGGLES_INHERITED: $($windowToggleRequestVerdict.reason)"
     $outcome = 'INVALID'
 }
+# r3 (sol B4), FAIL CLOSED: a leg that names midPlayWindowToggles counts only when its windowToggles* scalars are what the run log itself derives (the receipt validator re-derives the same).
+$windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $runLogText -Metrics $receipt.metrics
+if ($outcome -in @('PASS', 'FAIL') -and $windowToggleReconcileVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but $($windowToggleReconcileVerdict.reason)"
+    $outcome = 'INVALID'
+}
 # CPU-S1-FS-SPIKE-TEAM-PARTITION-1, FAIL CLOSED: a leg that asks for the OpenMP team partition counts only when the measured session's own
 # playback_smoke.omp_teams record reports partition=r+p (recon_omp=r, prep_omp=p, override=0); a value in the launcher's env block is a request, not
 # engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask blocks only when the app reports one.

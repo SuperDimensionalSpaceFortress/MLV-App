@@ -15810,13 +15810,33 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "A3: no summary at all": (self.log(summary=None), (4, 4, 4, 4), False),
             "A3: a summary with a reason outside ok / incomplete": (
                 self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=not_windowed"), (4, 4, 4, 4), False),
+            # r3 (the r2 keys' B1-B3, each case changes ONLY the field under attack)
+            "B1: requested=driven=4 over four healthy toggles, only reason=incomplete (the reason is carried through, never rebuilt into ok)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=incomplete"), (4, 4, 4, 4), False),
+            "B1: reason=ok but driven short of requested (an ok summary that contradicts itself)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=3 reason=ok"), (4, 4, 4, 4), False),
+            "B2: an empty duplicate position= on toggle 1's begin record": (
+                self.log(mutate=lambda i, b, e: (b + " position=" if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "B2: an empty duplicate presented_serial= on toggle 2's end record": (
+                self.log(mutate=lambda i, b, e: (b, e + " presented_serial=" if i == 2 else e)), (4, 3, 3, 3), False),
+            "B2: an empty duplicate requested= on the summary": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok requested="), (4, 4, 4, 4), False),
+            "B2: an empty duplicate reason= on the summary": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok reason="), (4, 4, 4, 4), False),
+            "B3: the summary directly after the measured-session marker, before every toggle record": (
+                self.log(summary=None).replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\ngui_smoke.window_toggles requested=4 driven=4 reason=ok\n", 1),
+                (4, 4, 4, 4), False),
+            "B3: the summary between toggle 2 and toggle 3": (
+                self.log(summary=None).replace(self.toggle(3, "begin"), "gui_smoke.window_toggles requested=4 driven=4 reason=ok\n" + self.toggle(3, "begin"), 1), (4, 4, 4, 4), False),
+            "A5: no measured_session marker and no session id (zero markers is not one session)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "", 1), (4, 4, 4, 4), False),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (
                 "\n".join(self.log(summary="gui_smoke.window_toggles requested=4 driven=2 reason=incomplete").split("\n")[:11] +
                           ["gui_smoke.window_toggles requested=4 driven=2 reason=incomplete"]), (4, 2, 2, 2), False),
         }
-        sessions = ["2" if name.startswith("A4:") else "3" for name in cases]
+        sessions = ["2" if name.startswith("A4:") else "" if name.startswith("A5:") else "3" for name in cases]
         out = self.run_cases([log for log, _, _ in cases.values()], sessions)
         self.assertEqual(len(out), len(cases))
         for (name, (log, expected, passes)), got in zip(cases.items(), out, strict=True):
@@ -15860,6 +15880,54 @@ class WindowToggleEvidenceTests(unittest.TestCase):
         for (name, _, _, blocks), v in zip(cases, out, strict=True):
             with self.subTest(case=name):
                 self.assertEqual(v["blocks"], blocks, v)
+
+    def test_r3_b4_a_requested_leg_must_back_its_scalars_with_the_hashed_run_log(self) -> None:
+        """r3 B4 (sol): requested-toggle success is reconciled with the hashed run log, in the writer and in receipt validation, by the one shared reader
+        Get-DvWindowToggleReconcileEvidence (the log's own derivation, never the summary scalars, decides)."""
+        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        good = self.log()
+        summary = "gui_smoke.window_toggles requested=4 driven=4 reason=ok"
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        no_toggles = "\n".join(line for line in good.split("\n") if not line.startswith("gui_smoke.window_toggle"))
+        no_keep = "\n".join(line for line in good.split("\n") if not line.startswith("interaction_trace event=resize.keep_playing"))
+        cases = (("scalars the log backs", asks, good, ok, False),
+                 ("toggle records removed, the scalars kept (the log-hash reference refreshed)", asks, no_toggles, ok, True),
+                 ("only the summary line kept", asks, no_toggles + "\n" + summary, ok, True),
+                 ("the keep_playing lines removed, the scalars kept", asks, no_keep, ok, True),
+                 ("one scalar (driven) the log does not back", asks, good, dict(ok, windowTogglesDriven=3), True),
+                 ("the reason scalar the log does not back", asks, self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=incomplete"), ok, True),
+                 ("the scalars absent from the metrics", asks, good, {}, True),
+                 ("no run log at all", asks, "", ok, True),
+                 ("an honest failure: the scalars are exactly what the log derives (a FAIL by the criteria, not INVALID)", asks, self.log(drop_keep=2), "DERIVE", False),
+                 ("a leg that does not ask is not judged here", {}, no_toggles, {}, False))
+        with tempfile.TemporaryDirectory(prefix="wt-b4-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": log, "metrics": metrics} for _, spec, log, metrics, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $m = $_.metrics\n"
+                "  if ($m -is [string]) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "    $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason } }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = $r.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, _, blocks), got in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(got["blocks"], blocks, got)
+                if blocks:
+                    self.assertIn("WINDOW_TOGGLES_NOT_FROM_LOG", got["reason"])
+
+    def test_r3_b4_the_writer_and_the_receipt_validator_both_gate_on_the_reconcile_reader(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $ev.logText -Metrics $metrics", module)
+        self.assertIn('if ($windowToggleReconcileVerdict.blocks) { $invalid.Add($windowToggleReconcileVerdict.reason) }', module)
+        self.assertIn("Get-DvWindowToggleReconcileEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$windowToggleReconcileVerdict = Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $runLogText -Metrics $receipt.metrics", runner)
+        self.assertIn("$outcome -in @('PASS', 'FAIL') -and $windowToggleReconcileVerdict.blocks", runner)
 
     def test_a_summary_without_the_scalars_fails_both_legs_criteria(self) -> None:
         script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
