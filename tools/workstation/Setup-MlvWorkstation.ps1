@@ -1675,6 +1675,11 @@ $script:CredentialQuoteRunEval = {
     return $q + $inner.Replace($pair, $q) + $q
 }
 $script:CredentialQuoteNearNameEval = { param($m) $m.Value.Substring(0, 1) }
+# r6 (adversary pass 14 A1-A2): the characters an escape starts with (the gate of the residual view), and the two halves of the escape decoder (outer reader: backslash and backtick forms;
+# inner reader: XML character references, XML entities, URL '%NN'), used to judge each half alone on a level that holds both (Get-CredentialNormalForm)
+$script:CredentialEscapeStarts = [char[]]@([char]92, [char]38, [char]37, [char]96)
+$script:CredentialEscapeOuterEval = { param($m) $g = $m.Groups; if ($g['ent'].Success -or $g['dec'].Success -or $g['hex'].Success -or $g['pct'].Success) { return $m.Value }; return (& $script:CredentialEscapeEval $m) }
+$script:CredentialEscapeInnerEval = { param($m) $g = $m.Groups; if ($g['ent'].Success -or $g['dec'].Success -or $g['hex'].Success -or $g['pct'].Success) { return (& $script:CredentialEscapeEval $m) }; return $m.Value }
 $script:CredentialPsControls = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
 foreach ($credPs in @(@('0', [string][char]0), @('a', [string][char]7), @('b', [string][char]8), @('e', [string][char]27), @('f', [string][char]12), @('n', "`n"), @('r', "`r"), @('t', "`t"), @('v', [string][char]11))) { $script:CredentialPsControls[$credPs[0]] = $credPs[1] }
 $script:CredentialOneLetterEscapes = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
@@ -1771,9 +1776,17 @@ function Test-CredentialDecodeLimitError($ErrorRecord) {
 # decode that happens on the same level can destroy its framing (a blank, a quote, a colon, a bracket). An escape that cannot be decoded is kept as written. The view is not the
 # same length as the text (the exposing decodes shorten it): it is judged without the decoded-character mask, and a hit index counts lines in the VIEW.
 # Get-CredentialNormalForm hands the view of EACH level's text, the raw text included, to -OnView BEFORE that level is decoded.
+# The extra judging (the residual view and the outer / inner partial decodes) rescans the text; a nested text (4 MB of '&amp;amp;...') would rescan it on every level. The characters they may
+# scan in one walk are bounded ($script:CredentialViewBudget, set by Get-CredentialNormalForm): past it the walk is refused typed (CREDENTIAL_DECODE_LIMIT, deny by default), as past the level bound.
+$script:CredentialViewBudgetChars = 80000000
+function Use-CredentialViewBudget([long]$Chars) {
+    $script:CredentialViewBudget -= $Chars
+    if ($script:CredentialViewBudget -lt 0) { throw (New-CredentialDecodeLimitError 'the residual view and the partial decodes of this text need more work than the bound') }
+}
 function Get-CredentialResidualView([string]$Text) {
     $t = $Text
     for ($pass = 0; $pass -le $script:CredentialMaxDecodeStages; $pass++) {
+        Use-CredentialViewBudget $t.Length
         $sb = [System.Text.StringBuilder]::new(); $last = 0; $changed = $false
         foreach ($m in $script:CredentialEscapeRegex.Matches($t)) {
             $r = [string](& $script:CredentialEscapeEval $m)
@@ -1795,12 +1808,17 @@ function Get-CredentialResidualView([string]$Text) {
 function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null, [scriptblock]$OnView = $null) {
     $s = "$Text"; $mask = [string]::new([char]'0', $s.Length)
     $levels = 0; $hit = -1
+    $script:CredentialViewBudget = $script:CredentialViewBudgetChars
     while ($true) {
         # r6 (adversary pass 13 A2): the residual view of the text about to be decoded (see Get-CredentialResidualView); a hit ends the walk on the view (same length as the level text)
-        if ($OnView -and $script:CredentialResidualIntroRegex.IsMatch($s)) {
+        # r6 (adversary pass 14 A1): the view is built whenever the text holds a character an escape starts with ('\', '&', '%', a backtick), NOT only when an introducer already stands in it:
+        # '{"ab\\U0011FFFF\ncd":"x"}' has no introducer until its '\\' is decoded. It is judged only when the VIEW holds an undecodable escape.
+        if ($OnView -and $s.IndexOfAny($script:CredentialEscapeStarts) -ge 0) {
             $vw = Get-CredentialResidualView $s
-            $got = @(& $OnView $vw $mask)
-            if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $vw; Mask = $mask; Levels = $levels; Hit = [int]$got[-1] } }
+            if ($script:CredentialResidualIntroRegex.IsMatch($vw)) {
+                $got = @(& $OnView $vw $mask)
+                if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $vw; Mask = $mask; Levels = $levels; Hit = [int]$got[-1] } }
+            }
         }
         # r6 (adversary pass 13 A1, defect class: decode order): a doubled quote belongs to the OUTER reader (PowerShell, YAML, CSV), so it is collapsed on a level of its own, BEFORE
         # the escapes and character references that the string holds are decoded and judged ('$x = ''<add key=''''k'''' value=''''hunt&#39;er2'''' />''' must reach the XML rule with
@@ -1814,6 +1832,21 @@ function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null, 
         }
         $r = $null; $b = $null
         if (-not $q1 -and -not $q2) {
+            # r6 (adversary pass 14 A2, defect class: decode order between two readers on ONE level): a string holds the OUTER reader's escapes (JSON / YAML / TOML / PowerShell backslash
+            # and backtick forms) and the INNER reader's (XML character references and entities, URL '%NN'). Decoded together ('{"xml":"<add key=\"k\" value=\"a&#34;b\" />"}'),
+            # the inner '&#34;' lands inside the quoting the outer '\"' just produced and the tag is lost. When BOTH kinds stand on this level, each partial decode is judged as well:
+            # the outer one alone, then the inner one alone (each from this level's text); the combined decode below is still the one the walk follows.
+            if ($OnStage) {
+                Use-CredentialViewBudget (2 * $s.Length)
+                $po = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeOuterEval
+                $pi = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeInnerEval
+                if ($po -and $pi) {
+                    foreach ($part in @($po, $pi)) {
+                        $got = @(& $OnStage $part.Text $part.Mask)
+                        if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $part.Text; Mask = $part.Mask; Levels = $levels + 1; Hit = [int]$got[-1] } }
+                    }
+                }
+            }
             $r = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
             if ($r) { $s = $r.Text; $mask = $r.Mask }
             $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval

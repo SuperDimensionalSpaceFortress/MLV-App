@@ -2904,6 +2904,18 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
             $ddR2["r6 adv p13 A2 header: residual after '$ddX', then \u$ddD"] = ('["ab' + $ddX + 'U0011FFFF' + $ddBsA2 + 'u' + $ddD + 'cd"]' + "`n" + 'x="hunter2"')
         }
     }
+    # r6 adversary pass 14 A1 (defect class: the residual view was gated on an introducer already standing in the raw text): an escaped backslash that EXPOSES the residual, with a
+    # same-level decode of a line break, tab, CR, form feed, blank or YAML line separator that ends the residual key's name run
+    foreach ($ddX in @('n', 't', 'r', 'f', ' ', 'L', 'P', 'v')) {
+        $ddR2["r6 adv p14 A1 key: exposed residual then \$ddX"] = ('{"ab' + $ddBsA2 + $ddBsA2 + 'U0011FFFF' + $ddBsA2 + $ddX + 'cd":"hunter2"}')
+        $ddR2["r6 adv p14 A1 header: exposed residual then \$ddX"] = ('["ab' + $ddBsA2 + $ddBsA2 + 'U0011FFFF' + $ddBsA2 + $ddX + 'cd"]' + "`n" + 'x="hunter2"')
+    }
+    # r6 adversary pass 14 A2 (defect class: decode order between two readers on ONE level): the outer reader's quote escape and the inner reader's character reference or entity together
+    $ddBqA2 = [string][char]0x60
+    $ddR2['r6 adv p14 A2 a JSON \" and an XML &#34; on one level'] = ('{"xml":"<add key=' + $ddBsA2 + '"p a s s&#119;o r d' + $ddBsA2 + '" value=' + $ddBsA2 + '"hunt&#34;er2' + $ddBsA2 + '" />"}')
+    $ddR2['r6 adv p14 A2 sibling: a backtick-quote and an XML &#34;'] = ('$xml = "<add key=' + $ddBqA2 + '"password' + $ddBqA2 + '" value=' + $ddBqA2 + '"hunt&#34;er2' + $ddBqA2 + '" />"')
+    $ddR2['r6 adv p14 A2 sibling: a YAML \" and an XML &quot;'] = ('xml: "<add key=' + $ddBsA2 + '"password' + $ddBsA2 + '" value=' + $ddBsA2 + '"hunt&quot;er2' + $ddBsA2 + '" />"')
+    $ddR2['r6 adv p14 A2 sibling: a JSON " and an XML &#x22;'] = ('{"xml":"<add key=' + $ddBsA2 + 'u0022password' + $ddBsA2 + 'u0022 value=' + $ddBsA2 + 'u0022hunt&#x22;er2' + $ddBsA2 + 'u0022 />"}')
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     # r6 must-pass: the decode of a backtick before any character and of a doubled quote never turns an empty literal, a plain value or a Markdown code span into a credential
     foreach ($ddOkR6 in @('<add key="password" value="" />', '<add key="password" value=""/>', "<add key='password' value=''/>", "password: ''", 'password: ""', '{"a":"","b":"x"}', '$msg = ''it''''s a plain note''', '$msg = "say ""hi"" to the team"', ('a ' + $ddBq + '/ path note: plain'), ('the ' + $ddBq + 'theme' + $ddBq + ' setting'))) {
@@ -2991,7 +3003,11 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
                 foreach ($ddT in @(('{"ab' + $ddX + 'U0011FFFF' + $ddBsR + 'u' + $ddD + 'cd":""}'), ('["ab' + $ddX + 'U0011FFFF' + $ddBsR + 'u' + $ddD + 'cd"]' + "`n" + 'x=""'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
             }
         }
-        Assert-That ($ddA5Miss.Count -eq 0 -and $ddA5N -eq 38) "DENY-BY-DEFAULT-1 r6 adv p13 A1-A2 role guard: all $ddA5N forms name a secret" ("misses=$($ddA5Miss.Count): " + (($ddA5Miss | Select-Object -First 4) -join '; '))
+        foreach ($ddX in @('n', 't', 'r', 'f', ' ', 'L', 'P', 'v')) {
+            foreach ($ddT in @(('{"ab' + $ddBsR + $ddBsR + 'U0011FFFF' + $ddBsR + $ddX + 'cd":""}'), ('["ab' + $ddBsR + $ddBsR + 'U0011FFFF' + $ddBsR + $ddX + 'cd"]' + "`n" + 'x=""'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+        }
+        foreach ($ddT in @(('{"xml":"<add key=' + $ddBsR + '"p a s s&#119;o r d' + $ddBsR + '" value=' + $ddBsR + '"hunt&#34;er2' + $ddBsR + '" />"}'), ('$xml = "<add key=' + [string][char]0x60 + '"password' + [string][char]0x60 + '" value=' + [string][char]0x60 + '"hunt&#34;er2' + [string][char]0x60 + '" />"'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+        Assert-That ($ddA5Miss.Count -eq 0 -and $ddA5N -eq 56) "DENY-BY-DEFAULT-1 r6 adv p13 A1-A2 role guard: all $ddA5N forms name a secret" ("misses=$($ddA5Miss.Count): " + (($ddA5Miss | Select-Object -First 4) -join '; '))
         Assert-That (-not (Test-CredentialNamePresent ('{"caf' + $ddBsR + 'u00e9": "x", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r6 role guard must-pass: a decodable accent escape in a key names no secret (the residual view does not refuse it)'
         # must-pass: the new escapes do not make a plain Windows path in a settings file name a secret
         Assert-That (-not (Test-CredentialNamePresent ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 role guard must-pass: a JSON Windows path with \P \L \a \e \v \_ sequences names no secret'
