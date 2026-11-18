@@ -2886,6 +2886,76 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         literal = "const char *s = \"QKeyEvent press{}\"; char c = 'Q'; int n = 1'000;\nchar x = 'K';\n"
         self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": literal}), [])
 
+    # r8 (sol r7 blocker, HUB RULING 2026-11-18 ROUND_TAIL): the named-cast exemption read the cast's operand group as an
+    # empty `()`, so a cast whose operand PRODUCES an event (`event->clone()`) passed as a read of the delivered event. A cast
+    # is exempt only when its operand is the bare identifier of the delivered event; any other operand (a call, a member
+    # access, `->clone()`, a nested cast, a dereference) is never exempt.
+    _R8_FOCUS_GUARD_CAST_RE = "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );"
+    _R8_CLONE_OPERANDS = {
+        "typed declaration, clone": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event->clone() );",
+        "auto declaration, clone": "auto *keyEvent = static_cast<QKeyEvent*>( event->clone() );",
+        "dynamic_cast declaration, clone": "QKeyEvent *keyEvent = dynamic_cast<QKeyEvent*>( event->clone() );",
+        "qobject_cast declaration, clone": "QKeyEvent *keyEvent = qobject_cast<QKeyEvent*>( event->clone() );",
+        "reinterpret_cast declaration, clone": "QKeyEvent *keyEvent = reinterpret_cast<QKeyEvent*>( event->clone() );",
+        "a call": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( cloneOf( event ) );",
+        "a call with no argument": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( makeEvent() );",
+        "a member access": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( holder.event );",
+        "an arrow member access": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( holder->event );",
+        "a dereference": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( *eventPointer );",
+        "a nested cast": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( static_cast<QEvent*>( event ) );",
+        "a subscript": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( events[0] );",
+        "a qualified name": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( Holder::event );",
+        "a grouped operand": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( ( event ) );",
+        "a ternary": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( ok ? event : other );",
+        "a new expression": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( new QEvent( QEvent::KeyPress ) );",
+        "an empty operand": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( );",
+    }
+
+    def test_r8_a_cast_whose_operand_produces_an_event_is_a_synthesized_key_in_the_declaration_form(self) -> None:
+        for name, injected in self._R8_CLONE_OPERANDS.items():
+            with self.subTest(name):
+                self._assert_caught(self._mutated(self._R8_FOCUS_GUARD_CAST_RE, injected, path=self._SPACE_TABLE),
+                                    "synthesized key event")
+
+    def test_r8_a_cast_whose_operand_produces_an_event_is_a_synthesized_key_in_the_assignment_and_inline_forms(self) -> None:
+        cast = self._R8_FOCUS_GUARD_CAST_RE
+        for name, injected in {
+                "assignment, clone": "keyEvent = static_cast<QKeyEvent*>( event->clone() );",
+                "assignment, call": "keyEvent = static_cast<QKeyEvent*>( cloneOf( event ) );",
+                "an inline member read through a clone cast": "int copiedKey = static_cast<QKeyEvent*>( event->clone() )->key();",
+                "a return of a member read through a clone cast": "return static_cast<QKeyEvent*>( event->clone() )->key();",
+                "an inline member read through a call cast": "int copiedKey = static_cast<QKeyEvent*>( cloneOf( event ) )->key();",
+                "a bare inline cast of a clone": "static_cast<QKeyEvent*>( event->clone() )->accept();"}.items():
+            with self.subTest(name):
+                self._assert_caught(self._mutated(cast, cast + "\n        " + injected, path=self._SPACE_TABLE),
+                                    "synthesized key event")
+
+    def test_r8_a_cast_whose_operand_produces_an_event_is_caught_in_a_fixture_file(self) -> None:
+        # The same class off the real table: a fixture file, so no pinned-site machinery is involved.
+        for name, injected in self._R8_CLONE_OPERANDS.items():
+            with self.subTest(name):
+                text = "bool f( QObject *w, QEvent *event )\n{\n    " + injected + "\n    return keyEvent->key();\n}\n"
+                problems = self._key_synth_problems({"platform/qt/StatusDialog.h": text})
+                self.assertTrue(any("synthesized key event" in p for p in problems), problems)
+
+    def test_r8_a_cast_of_the_bare_delivered_event_identifier_stays_exempt(self) -> None:
+        # Negative controls: the real tree scans clean, and every bare-identifier cast (any spacing, any cast keyword, a
+        # member read through it) is still a read of the delivered event.
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        head = "bool f( QObject *w, QEvent *event )\n{\n"
+        bound = "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );\n"
+        for text in (bound + "    return true;\n",
+                     "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>(event);\n    return true;\n",
+                     "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>(\n        event\n    );\n    return true;\n",
+                     "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event_ );\n    return true;\n",
+                     "    auto *keyEvent = dynamic_cast<QKeyEvent*>( event );\n    return true;\n",
+                     "    auto *keyEvent = qobject_cast<QKeyEvent*>( e );\n    return true;\n",
+                     "    keyEvent = static_cast<QKeyEvent*>( event );\n    return true;\n",
+                     "    int k = static_cast<QKeyEvent*>( event )->key();\n    return k;\n",
+                     "    return static_cast<QKeyEvent*>( event )->key();\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": head + text + "}\n"}), [])
+
     def test_r3_p2_a2_a_qualified_qkeyevent_include_is_not_a_synthesized_key(self) -> None:
         for text in ("#include <QtGui/QKeyEvent>\n", "#include <qevent.h>\n", '#include "QKeyEvent"\n'):
             with self.subTest(text):

@@ -311,6 +311,8 @@ _KEY_EVENT_CAST_STATEMENT = re.compile(
     rf"\s*(?:(?:(?:const|volatile)\s+)*(?:QKeyEvent|auto)\s*{_CV}[*&]\s*{_CV}(?P<name>\w+)\s*=\s*{_KEY_EVENT_CAST}"
     rf"|(?P<assigned>\w+)\s*=\s*{_KEY_EVENT_CAST}"
     rf"|(?:return\s+|[\w\s:]*\w\s*=\s*)?{_KEY_EVENT_CAST}\s*->\s*{_KEY_EVENT_READ_MEMBERS}\s*\(\))\s*")
+# r8: the one operand a named cast of a delivered key event may have -- the delivered event's own identifier.
+_BARE_IDENTIFIER = re.compile(r"\s*[A-Za-z_]\w*\s*")
 # r6 adversary pass on c1f09601 A1: a type-of operator computes a type from an EXPRESSION, so it can name the object type
 # of a delivered key event with no QKeyEvent spelled. No scanned source uses one; a new use is reviewed here.
 _TYPE_OF_OPERATOR = re.compile(r"\b(?:decltype|typeof|__typeof__|__typeof)\b")
@@ -441,13 +443,34 @@ def _key_event_ref_is_delivered_read(brackets: _Brackets, pos: int) -> tuple[str
     if parent != -1 and not brackets.block_context(parent):
         return None
     scope_end = brackets.closer[parent] if parent != -1 else len(text)
-    tail = []
+    tail: list[tuple[str, int]] = []
     for token, at in brackets.items(pos, scope_end):
         if token == ";":
-            statement = _KEY_EVENT_CAST_STATEMENT.fullmatch(brackets.prefix(pos) + "".join(tail))
-            return (statement.group("name") or statement.group("assigned") or "", at, scope_end) if statement else None
-        tail.append(token)
+            statement = _KEY_EVENT_CAST_STATEMENT.fullmatch(brackets.prefix(pos) + "".join(t for t, _ in tail))
+            if not statement or not _cast_operand_is_bare_identifier(brackets, tail):
+                return None
+            return statement.group("name") or statement.group("assigned") or "", at, scope_end
+        tail.append((token, at))
     return None
+
+
+def _cast_operand_is_bare_identifier(brackets: _Brackets, tail: list[tuple[str, int]]) -> bool:
+    """r8 (sol r7 blocker): the named-cast statement collapses the cast's operand to an empty `()`, so a cast whose operand
+    PRODUCES an event (`static_cast<QKeyEvent*>( event->clone() )`, `( cloneOf( event ) )`) matched as a read of the delivered
+    event. The cast is exempt only when its operand is the bare delivered-event identifier: a call, a member access, a
+    nested cast, a dereference, a subscript, a qualified name, a grouping or an empty operand is never exempt. `tail` is the
+    statement's depth-filtered tokens from the QKeyEvent reference to the `;`; the operand group is the `()` that follows the
+    cast's closing `>` (the statement shape was already matched, so there is exactly one such group)."""
+    operands = 0
+    previous = ""
+    for token, at in tail:
+        if token == "()" and previous == ">":
+            operands += 1
+            if not _BARE_IDENTIFIER.fullmatch(brackets.text, at + 1, brackets.closer[at]):
+                return False
+        if not token.isspace():
+            previous = token
+    return operands == 1
 
 
 def _scan_key_event_reads(path: str, blank: str) -> list[str]:
