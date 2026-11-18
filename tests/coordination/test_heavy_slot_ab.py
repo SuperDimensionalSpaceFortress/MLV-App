@@ -298,7 +298,9 @@ ABORTS = {
     "thermal-cap": (["-CapSeconds", "0.3", "-CapWindowSeconds", "10"], None, lambda w: setattr(w.feed, "temp", 96.0), 0.0, "thermal-cap", 5),
     "warm-while-2": (["-WarmWindowSeconds", "2", "-WarmFraction", "0.3"], lambda w: (w.add_holder("h0", 0), w.add_holder("h1", 1)),
                      lambda w: setattr(w.feed, "temp", 91.0), 0.0, "warm-while-2", 6),
-    "stale-feed": (["-FeedAbortSeconds", "1.0"], None, lambda w: setattr(w.feed, "paused", True), 1.0, "stale-feed", 8),
+    # r6 (CI run 44298772131 shard 8/8): a 1.0 s stale-feed limit fired BEFORE the flip on a loaded runner (15 drivers at once), so the B
+    # read lost the race. 6 s keeps the abort tied to the pause; the cap counts polls at 0.3 s across the 6 s plus slack.
+    "stale-feed": (["-FeedAbortSeconds", "6.0"], None, lambda w: setattr(w.feed, "paused", True), 6.0, "stale-feed", 30),
     "low-memory": ([], None, lambda w: w.set_memory(5.0, 60.0), 0.0, "low-memory", 4),
     "event-2004": ([], None, lambda w: w.event.write_text("1", encoding="ascii"), 0.0, "event-2004", 3),
     "low-disk": ([], None, lambda w: w.set_disk(10.0), 0.0, "low-disk", 3),
@@ -1121,7 +1123,9 @@ def test_r2_A6_unparseable_block_rows_are_no_input_and_unparseable_samples_are_s
     _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=30)), "block": 1, "state": "B", "holders": "x", "temp_c": "hot", "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0})
     _append_sample(win, {"utc": "not-a-date", "holders": 2})
     v, _ = evaluate(tmp_path, "badsample", win, hs)
-    assert v["verdict"] == "ADOPT", v
+    # r6 (b) supersedes the r2 "typed skip": an unparseable sample is UNKNOWN evidence and fails the measurement closed
+    assert v["verdict"] == "INCONCLUSIVE" and "unknown evidence" in v["reason"], v
+    assert v["input_problems"]["unknown_evidence"] == 2, v["input_problems"]
 
 
 def test_r2_A7_the_driver_never_writes_over_what_it_only_reads(tmp_path, me):
@@ -1421,7 +1425,9 @@ def test_r4_A7_an_old_unreadable_receipt_and_unparseable_ledger_lines_are_counte
     with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
         fh.write("this is not json\n")
     v, _ = evaluate(tmp_path, "oldbad", win, hs)
-    assert v["verdict"] == "ADOPT", v
+    # r6 (b): the old receipt is still placed out of the window by its write time, but a ledger line that does not parse cannot be placed
+    # at all: it is unknown evidence, so the verdict is INCONCLUSIVE (it used to be counted and ignored)
+    assert v["verdict"] == "INCONCLUSIVE" and "unknown evidence" in v["reason"] and "ledger.jsonl=1" in v["reason"], v
     assert v["input_problems"]["receipts_unreadable"] == 0 and v["input_problems"]["ledger_lines_unparseable"] == 1, v["input_problems"]
 
 
@@ -1430,8 +1436,9 @@ def test_r4_A11_a_holders_value_that_overflows_is_a_typed_skip_not_an_eval_error
     _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=30)), "block": 1, "state": "B", "holders": 1e20, "temp_c": 80.0, "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0})
     _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=40)), "block": 1, "state": "B", "holders": 2.5, "temp_c": 80.0, "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0})
     v, out = evaluate(tmp_path, "overflow", win, hs)
-    assert "AB_EVAL_ERROR" not in out and v["verdict"] == "ADOPT", (out, v)
-    assert v["input_problems"]["samples_skipped"] == 2, v["input_problems"]
+    # r6 (b): still no eval error, but an out-of-range or fractional holders value is unknown evidence, never a skip
+    assert "AB_EVAL_ERROR" not in out and v["verdict"] == "INCONCLUSIVE" and "unknown evidence" in v["reason"], (out, v)
+    assert v["input_problems"]["samples_skipped"] == 2 and v["input_problems"]["unknown_evidence"] == 2, v["input_problems"]
 
 
 def test_r4_I1_adoption_needs_enough_b_pytest_tickets_that_really_ran_at_slotcount_2(tmp_path):
@@ -1639,7 +1646,8 @@ def test_r4b_A6_an_infinite_free_commit_in_b_samples_is_unknown_not_a_pass(tmp_p
             r["free_commit_gb"] = "1e999"
     (win / "ab-samples.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="ascii")
     v, _ = evaluate(tmp_path, "infcommit", win, hs)
-    assert v["verdict"] == "INCONCLUSIVE" and "free commit" in v["reason"], v
+    # r6 (b): a string where a number belongs is a wrong-typed field, so the row is unknown evidence (named by its field)
+    assert v["verdict"] == "INCONCLUSIVE" and ("free commit" in v["reason"] or "free_commit_gb" in v["reason"]), v
 
 
 def test_r4b_A7_a_feed_clock_that_runs_backwards_ends_the_window_closed(tmp_path, me):
@@ -1802,3 +1810,254 @@ def test_r5_A9_an_output_that_is_a_hard_link_onto_an_input_never_truncates_it(tm
     _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / "hardlink" / "event.txt"),
          "-Now", iso(block_start(N_BLOCKS) + timedelta(hours=2))])
     assert (hs / "ledger.jsonl").read_bytes() == before, "the evaluator wrote through a hard link into the HeavySlot ledger"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# round r6 (head b3df3428): adversary pass 6 (A1-A7) fixed BY CLASS. Each class has ONE helper in HeavySlotAb.psm1 that every site
+# calls: (a) write safety, (b) row parse (unknown evidence fails closed), (c) ordering (watermark, retry start). One test per class at
+# each pass-6 site and one per sibling where a seam allows. Every test below fails on b3df3428's tool files except the 8.3 test and the
+# static sweep pin, which are containment / sweep guards.
+# ---------------------------------------------------------------------------------------------------------------------------
+def _feed_line(when: datetime, temp=60.0) -> str:
+    return when.strftime("%d.%m.%Y,%H:%M:%S.") + f"{when.microsecond // 1000:03d}" + f",20.0,{temp},40.0,No,No\n"
+
+
+def _static_feed(w: World):
+    w.feed.close()
+    w.feed_path.write_text(FEED_HEADER + _feed_line(datetime.now()), encoding="ascii")
+    return w.feed_path.read_bytes()
+
+
+def test_r6_a_A1_a_planted_switch_tmp_hard_link_onto_the_feed_is_never_truncated(tmp_path, me):
+    w = World(tmp_path, "r6tmplink", me)
+    try:
+        before = _static_feed(w)
+        w.switch.write_text("{}", encoding="ascii")                  # an existing switch: the preflight revert is the first write
+        os.link(w.feed_path, Path(str(w.switch) + ".tmp"))
+        subprocess.run(w.args(0.002, 0.05), capture_output=True, text=True, timeout=120)
+        assert w.feed_path.read_bytes() == before, "the feed was truncated through the hard-linked <switch>.tmp"
+    finally:
+        w.close()
+
+
+def test_r6_a_A1_sibling_a_receipt_tmp_hard_link_planted_during_the_window_is_never_written_through(tmp_path, me):
+    w = World(tmp_path, "r6rcpttmp", me)
+    try:
+        proc = w.start(0.003, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        os.link(w.feed_path, w.window / "ab-receipt.json.tmp")     # after the preflight check of leftover names
+        proc.wait(timeout=90)
+        text = w.feed_path.read_text(encoding="ascii", errors="replace")
+        assert text.startswith(FEED_HEADER) and "heavy-slot-ab-receipt" not in text, "the receipt write went through the planted temp name"
+    finally:
+        w.close()
+
+
+def test_r6_a_A1_sibling_a_samples_file_swapped_for_a_hard_link_is_refused_not_appended_through(tmp_path, me):
+    w = World(tmp_path, "r6samplelink", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: len(w.samples()) >= 2, 60), w.text()
+        samples = w.window / "ab-samples.jsonl"
+
+        def swap():
+            try:
+                samples.unlink()
+                os.link(w.feed_path, samples)
+                return True
+            except OSError:
+                return False
+        assert _wait(swap, 20, 0.01), "could not swap the samples file"
+        code = proc.wait(timeout=90)
+        assert '"free_commit_gb"' not in w.feed_path.read_text(encoding="ascii", errors="replace"), "a sample was appended into the feed"
+        assert code == 3 and "write-alias" in w.receipt()["reason"], (code, w.receipt(), w.text())
+    finally:
+        w.close()
+
+
+def test_r6_a_A1_sibling_a_switch_lock_that_is_a_hard_link_onto_the_feed_is_refused(tmp_path, me):
+    w = World(tmp_path, "r6locklink", me)
+    try:
+        _static_feed(w)
+        os.link(w.feed_path, Path(str(w.switch) + ".lock"))
+        out = subprocess.run(w.args(0.002, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "write-alias" in out.stdout, (out.returncode, out.stdout, out.stderr)
+    finally:
+        w.close()
+
+
+def test_r6_a_A1_sibling_an_evaluator_output_that_is_a_hard_link_is_refused_up_front(tmp_path):
+    win, hs = build_window(tmp_path, "r6verdictlink")
+    os.link(hs / "ledger.jsonl", win / "ab-verdict.json")
+    out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / "r6verdictlink" / "event.txt"),
+               "-Now", iso(block_start(N_BLOCKS) + timedelta(hours=2))])
+    assert out.returncode == 2 and "AB_EVAL_REFUSED output-alias" in out.stdout, (out.returncode, out.stdout, out.stderr)
+
+
+def test_r6_a_sweep_every_write_in_the_driver_and_evaluator_goes_through_the_shared_writer():
+    for path in (DRIVER, EVALUATOR):
+        text = path.read_text(encoding="ascii")
+        for raw in ("WriteAllText", "AppendAllText", "FileMode]::Create", "FileMode]::OpenOrCreate", "FileMode]::Append", "Set-Content", "Out-File", "Add-Content"):
+            assert raw not in text, f"{path.name} writes with {raw} instead of Write-HeavySlotAbFile / Open-HeavySlotAbLockFile"
+
+
+def test_r6_b_A3_a_b_sample_with_null_holders_and_low_commit_is_unknown_not_skipped(tmp_path):
+    win, hs = build_window(tmp_path, "r6nullholders")
+    rows = [json.loads(line) for line in (win / "ab-samples.jsonl").read_text(encoding="utf-8").splitlines()]
+    row = next(r for r in rows if r["utc"] == iso(T0 + timedelta(minutes=30)))
+    row["holders"] = None
+    row["free_commit_gb"] = 1
+    (win / "ab-samples.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="ascii")
+    v, _ = evaluate(tmp_path, "r6nullholders", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "unknown evidence" in v["reason"] and "holders" in v["reason"], v
+
+
+def test_r6_b_A4_a_receipt_with_an_unparseable_finished_at_is_unknown_not_dropped(tmp_path):
+    win, hs = build_window(tmp_path, "r6badfinish")
+    path = hs / "receipts" / "t054.json"
+    rec = json.loads(path.read_text(encoding="ascii"))
+    rec["finishedAt"] = "bad"
+    path.write_text(json.dumps(rec), encoding="ascii")
+    v, _ = evaluate(tmp_path, "r6badfinish", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "cannot be read" in v["reason"] and "t054.json" in v["reason"], v
+    assert v["input_problems"]["receipts_unreadable"] == 1
+
+
+def test_r6_b_A5_a_complete_ledger_record_with_a_null_time_ends_the_window(tmp_path, me):
+    w = World(tmp_path, "r6nullat", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        w.append_ledger({"at": None, "event": "unguarded", "ticket": "u1"})
+        code = proc.wait(timeout=90)
+        assert code == 3 and w.receipt()["reason"].startswith("ledger-unreadable"), (code, w.receipt(), w.text())
+    finally:
+        w.close()
+
+
+def test_r6_b_A5_sibling_an_undated_reaped_row_is_unknown_evidence_in_the_evaluator(tmp_path):
+    win, hs = build_window(tmp_path, "r6reapednull")
+    with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
+        fh.write(json.dumps({"at": "bad", "event": "reaped", "kind": "held", "ticket": "t030", "pid": 1}) + "\n")
+    v, _ = evaluate(tmp_path, "r6reapednull", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "unknown evidence" in v["reason"], v
+
+
+def test_r6_b_A7_nine_copies_of_one_receipt_are_one_identity_never_nine_tickets(tmp_path):
+    win, hs = build_window(tmp_path, "r6copies", b_pytest=[2])
+    sole = hs / "receipts" / "t043.json"
+    assert json.loads(sole.read_text(encoding="ascii"))["label"].endswith(":pytest")
+    for i in range(9):
+        shutil.copyfile(sole, hs / "receipts" / f"copy{i}.json")
+    v, _ = evaluate(tmp_path, "r6copies", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "duplicate ticket t043" in v["reason"], v
+    assert v["b_pytest"]["tickets"] == 0, v["b_pytest"]
+
+
+def test_r6_b_A7_sibling_two_held_records_for_one_ticket_are_never_two_holders(tmp_path, me):
+    w = World(tmp_path, "r6heldcopy", me)
+    try:
+        w.add_holder("d1", 0)
+        shutil.copyfile(w.hs / "held" / "d1.json", w.hs / "held" / "d1-copy.json")
+        proc = w.start(0.01, 0.2)
+        code = proc.wait(timeout=90)
+        assert all(s["holders"] < 2 for s in w.samples()), [s["holders"] for s in w.samples()]
+        assert code == 3 and w.receipt()["reason"].startswith("held-unreadable"), (code, w.receipt(), w.text())
+    finally:
+        w.close()
+
+
+def test_r6_b_sibling_a_receipt_whose_whole_machine_is_not_a_bool_is_unknown_not_shared(tmp_path, me):
+    w = World(tmp_path, "r6wholestr", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        (w.hs / "receipts" / (datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "777Z-1-abcdef.json")).write_text(
+            json.dumps({"ticket": "x7", "class": "shared", "wholeMachine": "yes"}), encoding="ascii")
+        code = proc.wait(timeout=90)
+        assert code == 3 and w.receipt()["reason"].startswith("receipt-unreadable"), (code, w.receipt(), w.text())
+    finally:
+        w.close()
+
+
+def test_r6_b_sibling_a_complete_feed_row_with_a_bad_date_is_unknown_not_skipped(tmp_path, me):
+    w = World(tmp_path, "r6feedbad", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: len(w.samples()) >= 2, 60), w.text()
+        with open(w.feed_path, "a", encoding="ascii") as fh:
+            fh.write("99.99.2026,25:61:00.000,20.0,99.0,40.0,No,No\n")
+        code = proc.wait(timeout=90)
+        assert code == 3 and w.receipt()["reason"].startswith("feed-unreadable"), (code, w.receipt(), w.text())
+    finally:
+        w.close()
+
+
+def test_r6_c_A2_hot_rows_below_a_future_watermark_across_reads_are_a_regression(tmp_path, me):
+    w = World(tmp_path, "r6watermark", me)
+    try:
+        proc = w.start(0.004, 0.2)
+        assert _wait(lambda: len(w.samples()) >= 2, 60), w.text()
+        w.feed.paused = True
+        time.sleep(0.3)
+        start = datetime.now()
+        with open(w.feed_path, "a", encoding="ascii") as fh:
+            fh.write(_feed_line(start + timedelta(seconds=25)))           # a cool row 25 s ahead: inside the 30 s skew
+        k = 1
+        while proc.poll() is None and k < 60:
+            time.sleep(0.7)                                                # more than two polls: each pair lands in a later read
+            now = datetime.now()
+            with open(w.feed_path, "a", encoding="ascii") as fh:
+                fh.write(_feed_line(now, 96.0) + _feed_line(now + timedelta(seconds=25)))
+            k += 1
+        code = proc.wait(timeout=90)
+        assert code == 3 and w.receipt()["reason"].startswith("feed-time-regressed"), (code, w.receipt(), w.text())
+    finally:
+        w.close()
+
+
+def _module_call(tmp_path: Path, body: str) -> str:
+    script = tmp_path / "module-call.ps1"
+    script.write_text(f"$ErrorActionPreference = 'Stop'\nImport-Module -Force '{MODULE}'\n{body}\n", encoding="ascii")
+    out = _ps(["-File", str(script)])
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout.strip()
+
+
+def test_r6_c_A2_the_watermark_helper_refuses_any_non_monotonic_read(tmp_path):
+    got = _module_call(tmp_path, "\n".join([
+        "$t = [DateTime]::new(2026, 1, 5, 12, 0, 0, [DateTimeKind]::Utc)",
+        "$a = Step-HeavySlotAbWatermark -Times @($t.AddSeconds(25), $t.AddSeconds(1)) -Watermark $null",
+        "$b = Step-HeavySlotAbWatermark -Times @($t.AddSeconds(1), $t.AddSeconds(26)) -Watermark $t.AddSeconds(25)",
+        "$c = Step-HeavySlotAbWatermark -Times @($t.AddSeconds(20), $t.AddSeconds(26), $t.AddSeconds(27)) -Watermark $t.AddSeconds(25)",
+        "$d = Step-HeavySlotAbWatermark -Times @($t.AddSeconds(3)) -Watermark $t.AddSeconds(25)",
+        "Write-Output ('{0}|{1}|{2}|{3}|{4}' -f $a.Regressed, $b.Regressed, $c.Regressed, (@($c.NewIndex) -join ','), $d.Regressed)",
+    ]))
+    assert got == "True|False|False|1,2|True", got
+
+
+def test_r6_c_A6_a_retry_may_not_start_after_the_budget_minus_its_maximum_jitter(tmp_path):
+    got = _module_call(tmp_path, "\n".join([
+        "$g = [DateTime]::new(2026, 1, 5, 12, 0, 10, [DateTimeKind]::Utc)",
+        "$late = Test-HeavySlotAbRetryMayStart -Now $g.AddMilliseconds(-10) -GiveUp $g -MaxJitterMs 40",      # 9.990 s into a 10 s budget
+        "$early = Test-HeavySlotAbRetryMayStart -Now $g.AddMilliseconds(-50) -GiveUp $g -MaxJitterMs 40",
+        "Write-Output ('{0}|{1}' -f $late, $early)",
+    ]))
+    assert got == "False|True", got
+    assert "Test-HeavySlotAbRetryMayStart" in DRIVER.read_text(encoding="ascii"), "Set-Switch must ask the shared retry rule"
+
+
+def test_r6_the_evaluator_refuses_a_window_dir_named_by_its_8dot3_short_name_under_the_heavy_slot_dir(tmp_path):
+    import ctypes
+    hs = tmp_path / "heavyslot-long-directory-name"
+    (hs / "receipts").mkdir(parents=True)
+    (hs / "ledger.jsonl").write_text("", encoding="ascii")
+    win = hs / "window-long-directory-name"
+    win.mkdir()
+    buf = ctypes.create_unicode_buffer(1024)
+    n = ctypes.windll.kernel32.GetShortPathNameW(str(win), buf, 1024)
+    short = buf.value if n else ""
+    if not short or short.lower() == str(win).lower() or "~" not in short:
+        pytest.skip("8.3 short names are not generated on this volume")
+    out = _ps(["-File", str(EVALUATOR), "-WindowDir", short, "-HeavySlotDir", str(hs), "-SkipHeadroom"])
+    assert out.returncode == 2 and "path-overlap" in out.stdout, (short, out.returncode, out.stdout, out.stderr)
