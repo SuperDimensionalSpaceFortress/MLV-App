@@ -9451,5 +9451,88 @@ for _case in CASES:
         )
 
 
+# ------------------------------------- HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1 r4 (Dot B1, PR #843)
+#
+# B1-BASH-BOOLEAN-VARIABLE-ATTRIBUTION: `true`, `false` and `null` are ordinary assignable Bash
+# variables, so the PowerShell `$true/$false/$null` exemption must never let a Bash `rm $true`
+# bind to its own statement: an unresolved Bash expansion binds to the WHOLE command.  Every
+# DENY row below is admitted on 721ffe9c (RED) and refused with the fix.  The class rows pin the
+# other PowerShell-only exemptions (drive operands, preference values) and Bash tilde expansion
+# the same way; the PowerShell constants stay ALLOW.
+
+_B1_SEPARATORS = (("semicolon", "; "), ("newline", "\n"), ("and-and", " && "))
+
+NA2_BASH_BOOLEAN_ROWS = []
+for _var in ("true", "false", "null"):
+    for _sep_name, _sep in _B1_SEPARATORS:
+        _label = "b1 bash %s variable %s" % (_var, _sep_name)
+        NA2_BASH_BOOLEAN_ROWS.append(_na2_row(
+            _label + " protected delete", "Bash",
+            '%s="{OTHER_RUN}/existing.txt"%srm -f $%s' % (_var, _sep, _var), "DENY",
+            reason_contains="deleting"))
+        NA2_BASH_BOOLEAN_ROWS.append(_na2_row(
+            _label + " protected move", "Bash",
+            '%s="{OTHER_RUN}/existing.txt"%smv $%s "{WORKTREE}/moved.txt"' % (_var, _sep, _var),
+            "DENY", reason_contains="moving"))
+        NA2_BASH_BOOLEAN_ROWS.append(_na2_row(
+            _label + " NA-6 test delete", "Bash",
+            "%s=tests/coordination/test_x.py%srm -f $%s" % (_var, _sep, _var), "DENY",
+            na="NA-6"))
+
+NA2_BASH_BOOLEAN_ROWS += [
+    # ---- the class: every other PowerShell-only exemption is PowerShell-only too
+    _na2_row("b1 class bash Env drive operand after cd protected delete", "Bash",
+             'cd "{OTHER_RUN}" && rm -f Env:existing.txt', "DENY", reason_contains="deleting"),
+    _na2_row("b1 class bash Variable drive operand after cd protected move", "Bash",
+             'cd "{OTHER_RUN}" && mv Variable:existing.txt "{WORKTREE}/moved.txt"', "DENY",
+             reason_contains="moving"),
+    _na2_row("b1 class bash Alias drive operand after cd NA-6 test delete", "Bash",
+             "cd tests/coordination && rm -f Alias:test_x.py", "DENY", na="NA-6"),
+    _na2_row("b1 class bash preference value is an operand after cd", "Bash",
+             'cd "{OTHER_RUN}" && rm -f -ea stop "{WORKTREE}/scratch.txt"', "DENY",
+             reason_contains="deleting"),
+    _na2_row("b1 class bash tilde expands an assigned HOME", "Bash",
+             'HOME="{OTHER_RUN}"; rm -f ~/existing.txt', "DENY", reason_contains="deleting"),
+    # ---- controls: the PowerShell constants keep their exemption (ALLOW on both heads)
+    _na2_row("b1 control powershell true switch beside a protected read", "PowerShell",
+             'Remove-Item Env:X -Recurse:$true; Get-Content "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("b1 control powershell false switch newline protected read", "PowerShell",
+             'Remove-Item Env:X -Confirm:$false\nGet-Content "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("b1 control powershell null sink beside a protected read", "PowerShell",
+             '$null = Remove-Item Env:X; Get-Content "{OTHER_RUN}\\existing.txt"', "ALLOW"),
+    _na2_row("b1 control powershell false switch on a move beside a protected read",
+             "PowerShell",
+             'Rename-Item Env:X Y -Force:$false; Get-Content "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("b1 control powershell false switch beside a test run", "PowerShell",
+             "Remove-Item Env:GIT_DIR -Confirm:$false; "
+             "py -3 -m pytest tests/coordination/test_x.py -q", "ALLOW"),
+    _na2_row("b1 control bash literal delete beside a protected read", "Bash",
+             'rm -f "{WORKTREE}/scratch.txt"; cat "{OTHER_RUN}/existing.txt"', "ALLOW"),
+]
+
+
+class Na2BashBooleanVariableTests(unittest.TestCase):
+    """Dot B1: the PowerShell-only exemptions never reach a Bash statement (full hook, inert)."""
+
+    maxDiff = None
+    setUp = MlvNeverAuthorizedHookTests.setUp
+    _substitute = MlvNeverAuthorizedHookTests._substitute
+    _render_content = MlvNeverAuthorizedHookTests._render_content
+    _bind_the_enable_literal = MlvNeverAuthorizedHookTests._bind_the_enable_literal
+    _invoke = MlvNeverAuthorizedHookTests._invoke
+    _run_case = MlvNeverAuthorizedHookTests._run_case
+
+
+for _case in NA2_BASH_BOOLEAN_ROWS:
+    _name = "test_" + _slug(_case["name"])
+    if _name in _seen:
+        raise RuntimeError("duplicate table row name: %s" % _case["name"])
+    _seen.add(_name)
+    setattr(Na2BashBooleanVariableTests, _name, _make_test(_case))
+
+
 if __name__ == "__main__":
     unittest.main()

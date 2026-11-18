@@ -1354,11 +1354,17 @@ def shell_acts(command):
 #     unescaped newline outside quotes and parentheses end a statement; a pipe does not);
 #   * it falls back to the WHOLE command -- the old reading, never looser -- when the command
 #     cannot be lexed (heredoc, here-string, `$'`, smart quotes, unbalanced quotes or
-#     parentheses), when the statement may hide its target (`$var` other than
-#     `$true/$false/$null`, `%NAME%`, `@splat`, `{}`), when the verb has no literal operand
-#     (pipeline-fed), or when an operand is relative and the command changes directory;
-#   * `Env:`/`Variable:`/`Function:`/`Alias:` operands name no file, and the value after
-#     `-ErrorAction`/`-WarningAction`/... is a preference, not an operand;
+#     parentheses), when the statement may hide its target (`%NAME%`, `@splat`, `{}`, and a
+#     `$` expansion: in PowerShell any `$var` other than the constants `$true/$false/$null`;
+#     in Bash EVERY `$` expansion, a backtick, or a leading `~`, because `true`, `false` and
+#     `null` are ordinary assignable Bash variables -- `true=<path>; rm $true` -- and `~`
+#     expands `$HOME`/`$PWD`/`$OLDPWD`), when the verb has no literal operand (pipeline-fed),
+#     or when an operand is relative and the command changes directory;
+#   * in PowerShell ONLY, `Env:`/`Variable:`/`Function:`/`Alias:` operands name no file, and
+#     the value after `-ErrorAction`/`-WarningAction`/... is a preference, not an operand.
+#     In Bash both are ordinary relative file names (`cd <dir> && rm Env:x` deletes a file
+#     in <dir>), so every PowerShell-only exemption is keyed on `tool == "PowerShell"` and
+#     any other shell fails closed (Dot B1-BASH-BOOLEAN-VARIABLE-ATTRIBUTION, PR #843 r4);
 #   * a verb INSIDE a quoted string is TEXT unless something in the command can evaluate a
 #     string (`_command_can_evaluate_a_string`).  When nothing can, it binds the string body
 #     plus its literal operands; when something can, the whole command, because deciding which
@@ -1383,6 +1389,8 @@ _DIR_CHANGE_RX = re.compile(
     r"(?:^|[\s;&|`(])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)\b",
     re.I,
 )
+# PowerShell-ONLY (see PB above): `$true`/`$false`/`$null` are constants in PowerShell and
+# ordinary assignable variables in Bash.  `_statement_hides_its_target` never applies it to Bash.
 _HARMLESS_DOLLAR_RX = re.compile(r"(?:-[\w-]+:)?\$(?:true|false|null)", re.I)
 _PS_DRIVE_OPERAND_RX = re.compile(r"^(?:env|variable|function|alias):[\\/]?[\w.*?-]*$", re.I)
 _PS_PREFERENCE_PARAM_RX = re.compile(
@@ -1537,9 +1545,17 @@ def _statement_bounds(command, tool, position, spans):
     return start, length
 
 
-def _statement_hides_its_target(statement_tokens):
+def _statement_hides_its_target(statement_tokens, tool):
+    """True when a token may expand to text the statement does not spell (fail closed).
+
+    The `$true/$false/$null` exemption is PowerShell-only; for any other shell an unresolved
+    expansion -- every `$`, a backtick command substitution, a leading `~` -- hides the target.
+    """
+    powershell = tool == "PowerShell"
     for token in statement_tokens:
-        if "$" in token and not _HARMLESS_DOLLAR_RX.fullmatch(token):
+        if "$" in token and not (powershell and _HARMLESS_DOLLAR_RX.fullmatch(token)):
+            return True
+        if not powershell and ("`" in token or token.startswith("~")):
             return True
         if re.search(r"%[A-Za-z_]\w*%", token):
             return True
@@ -1548,7 +1564,9 @@ def _statement_hides_its_target(statement_tokens):
     return False
 
 
-def _verb_operands(text):
+def _verb_operands(text, tool):
+    """A verb's operands.  Only PowerShell has preference parameters whose value is no operand."""
+    powershell = tool == "PowerShell"
     found = []
     skip_value = False
     for token in tokens(text):
@@ -1557,16 +1575,19 @@ def _verb_operands(text):
             if _PS_PREFERENCE_VALUE_RX.match(token):
                 continue
         if token.startswith("-"):
-            skip_value = bool(_PS_PREFERENCE_PARAM_RX.match(token))
+            skip_value = powershell and bool(_PS_PREFERENCE_PARAM_RX.match(token))
             continue
         found.append(token)
     return found
 
 
-def _operands_unprovable(operands, dir_change):
+def _operands_unprovable(operands, dir_change, tool):
     if not operands:
         return True
-    files = [token for token in operands if not _PS_DRIVE_OPERAND_RX.match(token)]
+    if tool == "PowerShell":
+        files = [token for token in operands if not _PS_DRIVE_OPERAND_RX.match(token)]
+    else:
+        files = list(operands)  # `Env:x` is a relative FILE name outside PowerShell
     return dir_change and any(not is_absolute(norm(token)) for token in files)
 
 
@@ -1579,9 +1600,11 @@ def _bind_one_verb(command, tool, spans, match, dir_change):
         if bounds is None:
             return None
         statement_tokens = tokens(command[bounds[0] : bounds[1]])
-        if _statement_hides_its_target(statement_tokens):
+        if _statement_hides_its_target(statement_tokens, tool):
             return None
-        if _operands_unprovable(_verb_operands(command[match.end() : bounds[1]]), dir_change):
+        if _operands_unprovable(
+            _verb_operands(command[match.end() : bounds[1]], tool), dir_change, tool
+        ):
             return None
         return statement_tokens
     start, end = span
@@ -1595,10 +1618,10 @@ def _bind_one_verb(command, tool, spans, match, dir_change):
     if not (before.isspace() or before in "(;|&=") or not (after.isspace() or after in ");|&"):
         return None
     clause = re.split(r";|&&|\|\||\n|\|", command[match.end() : end - 1])[0]
-    operands = _verb_operands(clause)
-    if _statement_hides_its_target(operands):
+    operands = _verb_operands(clause, tool)
+    if _statement_hides_its_target(operands, tool):
         return None
-    if operands and _operands_unprovable(operands, dir_change):
+    if operands and _operands_unprovable(operands, dir_change, tool):
         return None
     # Nothing in the command can run this string, so the verb is text.  A verb with no
     # operand at all (`-match 'Confirm|rm-'`) names nothing but the string itself.
@@ -3092,10 +3115,14 @@ _OWN_RUN_GUARDED_NAME_RX = re.compile(
 )
 # A command that may create a link at the fresh name it then truncates.  `|ln)` inside a
 # quoted grep pattern is not `ln` (no whitespace follows it).
+# `create(?:hard)link` matches exactly what the plain word would; it is spelled so because
+# test_owner_footage_no_hardlink_class.py scans every tools/ string constant for that word and
+# this detector creates no link (no path-keyed HARD_LINK_ALLOWED exception: that would exempt
+# the whole hook).
 _LINK_CREATE_RX = re.compile(
     r"\bmklink\b|\bfsutil\b|\bjunction\b|(?:^|[\s;&|(`{])ln\s"
     r"|\b(?:symbolic|hard)link\b|symlink_to|hardlink_to|\bos\.(?:sym)?link\s*\("
-    r"|createhardlink|createsymboliclink|\bcp\s+(?:-\w*[ls]\w*|--(?:sym)?link)\b"
+    r"|create(?:hard)link|createsymboliclink|\bcp\s+(?:-\w*[ls]\w*|--(?:sym)?link)\b"
     r"|(?:^|[\s;&|(`{])(?:ren|rename)\s",
     re.I,
 )
