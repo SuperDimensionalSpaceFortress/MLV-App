@@ -27,6 +27,7 @@
 #include "ClipOpenAbortPolicy.h"
 #include "ResizeStillDrawingWait.h"
 #include "ResizePlaybackPolicy.h"
+#include "SmokeWindowToggleSchedule.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -10562,6 +10563,50 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
     }
 
+    // VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1: window-state toggles driven MID-PLAY (the PLAYER-FULLSCREEN-KEEPS-PLAYING-1
+    // venue proof: every earlier leg entered full screen BEFORE the measured Play, so no resize ever met a checked Play).
+    // Default off; a windowed leg only. The toggles are stepped by the measured loop below, never by a nested wait.
+    smoke_window_toggle_schedule::Schedule windowToggleSchedule;
+    bool windowToggleRequested = false;
+    const char * const windowToggleEnvName = "MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES";
+    if( qEnvironmentVariableIsSet( windowToggleEnvName ) )
+    {
+        windowToggleRequested = true;
+        windowToggleSchedule = smoke_window_toggle_schedule::parse(
+            qEnvironmentVariable( windowToggleEnvName ).toStdString() );
+        if( !windowedSmoke )
+        {
+            qWarning().noquote()
+                << QStringLiteral( "gui_smoke.window_toggles requested=%1 driven=0 reason=not_windowed" )
+                       .arg( static_cast<qulonglong>( windowToggleSchedule.entries.size() ) );
+            windowToggleSchedule.entries.clear();
+        }
+        else if( !windowToggleSchedule.ok() )
+        {
+            qWarning().noquote()
+                << QStringLiteral( "gui_smoke.window_toggles requested=0 driven=0 reason=invalid_schedule detail=%1" )
+                       .arg( QString::fromStdString( windowToggleSchedule.reason ) );
+        }
+    }
+    struct WindowToggleState
+    {
+        bool begun = false;
+        bool ended = false;
+        qint64 beginMs = 0;
+    };
+    std::vector<WindowToggleState> windowToggleStates( windowToggleSchedule.entries.size() );
+    auto windowToggleSnapshot = [&]() -> QString
+    {
+        return QStringLiteral( "play_checked=%1 position=%2 presented_serial=%3 window=%4x%5 fullscreen=%6 maximized=%7" )
+            .arg( bool01( ui->actionPlay->isChecked() ) )
+            .arg( ui->horizontalSliderPosition->value() )
+            .arg( static_cast<qulonglong>( m_lastPresentedRequestSerial ) )
+            .arg( width() )
+            .arg( height() )
+            .arg( bool01( isFullScreen() ) )
+            .arg( bool01( isMaximized() ) );
+    };
+
     bool stressAttempted = false;
     bool stressOk = true;
     bool stressPlayedBeforeSwitch = false;
@@ -10836,9 +10881,90 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             midSessionExposureChangeApplied = true;
             qApp->processEvents( QEventLoop::AllEvents );
         }
+        // VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 STEP BEGIN
+        // A non-blocking state machine: each loop turn does at most the begin or the end of one toggle, in order, and the
+        // end phase is logged kSettleMs after the ACTUAL begin. It never starts, stops or resumes Play: the window change
+        // reaches the app the way a user's does (resizeEvent), which is exactly what the leg observes.
+        for( size_t toggleIndex = 0; toggleIndex < windowToggleSchedule.entries.size(); ++toggleIndex )
+        {
+            WindowToggleState & toggleState = windowToggleStates[toggleIndex];
+            if( toggleState.ended ) continue;
+            const smoke_window_toggle_schedule::Entry & toggle = windowToggleSchedule.entries[toggleIndex];
+            const qint64 toggleNowMs = playbackClock.elapsed();
+            if( !toggleState.begun )
+            {
+                if( toggleIndex > 0 && !windowToggleStates[toggleIndex - 1].ended ) break;
+                if( toggleNowMs < toggle.atMs ) break;
+                toggleState.begun = true;
+                toggleState.beginMs = toggleNowMs;
+                qInfo().noquote()
+                    << QStringLiteral( "gui_smoke.window_toggle phase=begin index=%1 kind=%2 at_ms=%3 elapsed_ms=%4 %5" )
+                           .arg( static_cast<qulonglong>( toggleIndex ) )
+                           .arg( QString::fromLatin1( smoke_window_toggle_schedule::kindName( toggle.kind ) ) )
+                           .arg( toggle.atMs )
+                           .arg( toggleNowMs )
+                           .arg( windowToggleSnapshot() );
+                switch( toggle.kind )
+                {
+                case smoke_window_toggle_schedule::Kind::FsOn:
+                    if( !ui->actionFullscreen->isChecked() ) ui->actionFullscreen->trigger();
+                    break;
+                case smoke_window_toggle_schedule::Kind::FsOff:
+                    if( ui->actionFullscreen->isChecked() ) ui->actionFullscreen->trigger();
+                    break;
+                case smoke_window_toggle_schedule::Kind::Restore:
+                {
+                    if( ui->actionFullscreen->isChecked() ) ui->actionFullscreen->trigger();
+                    showNormal();
+                    const QScreen * toggleScreen = screen();
+                    const QRect avail = toggleScreen ? toggleScreen->availableGeometry() : QRect( 0, 0, 1280, 720 );
+                    const int restoreW = avail.width() * 2 / 3;
+                    const int restoreH = avail.height() * 2 / 3;
+                    setGeometry( avail.x() + ( avail.width() - restoreW ) / 2,
+                                 avail.y() + ( avail.height() - restoreH ) / 2,
+                                 restoreW, restoreH );
+                    break;
+                }
+                case smoke_window_toggle_schedule::Kind::Maximize:
+                    if( ui->actionFullscreen->isChecked() ) ui->actionFullscreen->trigger();
+                    showMaximized();
+                    break;
+                }
+            }
+            else if( toggleNowMs >= toggleState.beginMs + smoke_window_toggle_schedule::kSettleMs )
+            {
+                toggleState.ended = true;
+                qInfo().noquote()
+                    << QStringLiteral( "gui_smoke.window_toggle phase=end index=%1 kind=%2 elapsed_ms=%3 %4" )
+                           .arg( static_cast<qulonglong>( toggleIndex ) )
+                           .arg( QString::fromLatin1( smoke_window_toggle_schedule::kindName( toggle.kind ) ) )
+                           .arg( toggleNowMs )
+                           .arg( windowToggleSnapshot() );
+            }
+            else
+            {
+                break;
+            }
+        }
+        // VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 STEP END
         waitGuiThreadForSmokeEvents( 10 );
     }
     const qint64 playedMs = playbackClock.elapsed();
+    if( windowToggleRequested && windowedSmoke && windowToggleSchedule.ok() )
+    {
+        int windowTogglesDriven = 0;
+        for( const WindowToggleState & toggleState : windowToggleStates )
+        {
+            if( toggleState.begun && toggleState.ended ) ++windowTogglesDriven;
+        }
+        // A toggle the loop exit cut short (begun, not ended, or never begun) is not driven.
+        qInfo().noquote()
+            << QStringLiteral( "gui_smoke.window_toggles requested=%1 driven=%2 reason=%3" )
+                   .arg( static_cast<qulonglong>( windowToggleSchedule.entries.size() ) )
+                   .arg( windowTogglesDriven )
+                   .arg( windowTogglesDriven == static_cast<int>( windowToggleSchedule.entries.size() )
+                             ? QStringLiteral( "ok" ) : QStringLiteral( "incomplete" ) );
+    }
     // ENFORCE-3: a measured Play that did not CONSUME the required source frames -- the engine ended it first
     // (SOURCE_FRAMES_SHORT) or the safety net expired (PLAY_SAFETY_TIMEOUT) -- is never a pass: typed, exit 14.
     // (This replaces the ENFORCE-2 wall-clock "played_ms >= 20000" check, which a persisted fpsOverride defeated.)

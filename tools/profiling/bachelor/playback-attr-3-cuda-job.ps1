@@ -474,6 +474,10 @@ param(
     # delivery before r1), the isolation arm of a same-binary A/B against the sent wake. Absent: nothing is set and the emitted job is the text it was
     # before this parameter.
     [switch]$DueWakeDeliveryPost,
+    # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: four window-state toggles driven MID-PLAY (MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES=
+    # fs_on@4000,fs_off@8000,restore@12000,maximize@16000), WINDOWED legs only (the app refuses it otherwise). Adds the env at the same env-list site and
+    # the windowToggles* scalars to the success summary, only when asked; absent: the emitted job is the text it was before this parameter.
+    [switch]$MidPlayWindowToggles,
     # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the asymmetric playback OpenMP team partition (MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and
     # MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> in the app's env list). Both or neither; 0 (the default) passes nothing and the emitted job is the text it was
     # before these parameters.
@@ -867,6 +871,9 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # foreground/fullscreen confirmation -- self-contained (no calls to other AttrCuda
     # functions), like the two above it.
     'Get-AttrCudaForegroundVerification',
+    # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the mid-play window-toggle evidence read of the run log (self-contained; only called by a
+    # -MidPlayWindowToggles job, but embedded always so the job's function set does not depend on the switch).
+    'Get-AttrCudaWindowToggleEvidence',
     # CUDA-PERF-DISPLAY-WAKE-1/2: wakes the display from the interactive session before this leg
     # launches MLVApp, holds it awake for the leg, and keeps nudging periodically for the whole
     # leg (SetThreadExecutionState alone does not stop the screen saver) -- see their own header in
@@ -6558,6 +6565,42 @@ if ($DueWakeDeliveryPost) {
     })
 }
 
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the mid-play window-toggle arm adds MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES at the same env-list site, and
+# the windowToggles* scalars (Get-AttrCudaWindowToggleEvidence over the run log) to the success summary, only when asked. Each anchor must match exactly once, or the
+# generator throws (the leg's criteria bind the scalars; an absent one fails the leg, Test-DvCriteria).
+if ($MidPlayWindowToggles) {
+    $windowToggleEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($windowToggleEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES to' }
+    $text = $windowToggleEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES=fs_on@4000,fs_off@8000,restore@12000,maximize@16000'," + $m.Groups['nl'].Value
+    })
+    $wtOpen = '# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 >>>'
+    $wtClose = '# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 <<<'
+    $wtEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $wtMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
+    $wtMetrics = $wtOpen + "`n" + @'
+$windowToggleEvidence = $null
+try { $windowToggleEvidence = Get-AttrCudaWindowToggleEvidence -LogText $rawLog } catch { }
+if ($null -eq $windowToggleEvidence) { $windowToggleEvidence = [pscustomobject]@{ requested = 0; driven = 0; keptPlaying = 0; advanced = 0; reason = 'evidence-read-threw' } }
+Write-JobTrace "step window-toggles requested=$($windowToggleEvidence.requested) driven=$($windowToggleEvidence.driven) keptPlaying=$($windowToggleEvidence.keptPlaying) advanced=$($windowToggleEvidence.advanced) reason=$($windowToggleEvidence.reason)"
+'@ + "`n" + $wtClose + "`n"
+    $text = Edit-DualVenueTemplate $text $wtMetricsAnchor ($wtMetrics + $wtMetricsAnchor)
+    $wtMetricsAt = $text.IndexOf($wtMetricsAnchor, [StringComparison]::Ordinal)
+    $wtKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $wtEol
+    $wtKeysAt = $text.IndexOf($wtKeysAnchor, $wtMetricsAt, [StringComparison]::Ordinal)
+    if ($wtKeysAt -lt 0) { throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING the success summary has no cpuFrames line to put the windowToggles scalars after' }
+    $wtKeyLines = @(
+        "    $wtOpen",
+        '    windowTogglesRequested = $windowToggleEvidence.requested',
+        '    windowTogglesDriven = $windowToggleEvidence.driven',
+        '    windowTogglesKeptPlaying = $windowToggleEvidence.keptPlaying',
+        '    windowTogglesAdvanced = $windowToggleEvidence.advanced',
+        '    windowToggleEvidenceReason = $windowToggleEvidence.reason',
+        "    $wtClose")
+    $text = $text.Substring(0, $wtKeysAt + $wtKeysAnchor.Length) + (($wtKeyLines -join $wtEol) + $wtEol) + $text.Substring($wtKeysAt + $wtKeysAnchor.Length)
+}
+
 # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: the team-partition arm adds MLVAPP_PLAYBACK_RECON_OMP_THREADS=<r> and MLVAPP_PLAYBACK_PREP_OMP_THREADS=<p> at the same
 # env-list site, only when asked, both or neither. The anchor must match exactly once, or the generator throws (the runner also requires the app's own
 # playback_smoke.omp_teams record to report recon_omp=<r> prep_omp=<p> before the leg counts).
@@ -8029,6 +8072,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     prepConflatedMove = [bool]$PrepConflatedMove
     disableReconReleaseDeferred = [bool]$DisableReconReleaseDeferred
     dueWakeDeliveryPost = [bool]$DueWakeDeliveryPost
+    midPlayWindowToggles = [bool]$MidPlayWindowToggles
     reconOmpThreads = $(if ($ReconOmpThreads -gt 0) { $ReconOmpThreads } else { $null })
     prepOmpThreads = $(if ($PrepOmpThreads -gt 0) { $PrepOmpThreads } else { $null })
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })

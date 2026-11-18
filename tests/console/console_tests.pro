@@ -105,6 +105,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_recon_warm_run_policy.cpp \
     $$REPO_ROOT/tests/console/test_resize_still_drawing_wait.cpp \
     $$REPO_ROOT/tests/console/test_resize_playback_policy.cpp \
+    $$REPO_ROOT/tests/console/test_smoke_window_toggle_schedule.cpp \
     $$REPO_ROOT/tests/console/test_playback_gpu_clock_kick_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_warm_output_reuse_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
@@ -185,6 +186,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
     $$REPO_ROOT/platform/qt/ResizeStillDrawingWait.h \
     $$REPO_ROOT/platform/qt/ResizePlaybackPolicy.h \
+    $$REPO_ROOT/platform/qt/SmokeWindowToggleSchedule.h \
     $$REPO_ROOT/platform/qt/PlaybackGpuClockKickPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \

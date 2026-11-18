@@ -7375,6 +7375,122 @@ function Get-AttrCudaForegroundVerification {
     [pscustomobject]@{ verified = $true; reason = $null }
 }
 
+function Get-AttrCudaWindowToggleEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: did each mid-play window toggle of a -MidPlayWindowToggles leg keep Play going, and did the
+    picture keep advancing? Pure over the raw run log; self-contained (embedded verbatim into the job, like Get-AttrCudaForegroundVerification).
+    .DESCRIPTION
+    Reads the measured session's records (the lines after the LAST playback_smoke.measured_session line):
+      gui_smoke.window_toggle phase=begin|end index= kind= elapsed_ms= play_checked= position= presented_serial= window=WxH ...
+      gui_smoke.window_toggles requested= driven= reason=
+      interaction_trace event=resize.keep_playing ...
+    Toggle i is DRIVEN when it has exactly one begin and one end, in log order, the same kind, parseable, and after the previous toggle's end.
+    It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both,
+    and the window size changed (end != begin; for fs_off, end != the previous fs_on's end size, which is the state fs_off leaves). It ADVANCED
+    when it is driven and position_end > position_begin and presented_serial_end > presented_serial_begin. A duplicate, unordered, missing or
+    unparseable record makes that toggle count for NOTHING (fail closed). Returns requested / driven / keptPlaying / advanced / reason
+    (reason = ok only when every requested toggle was driven, kept playing and advanced).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$LogText
+    )
+
+    $lines = @($LogText -split "`r?`n")
+    $start = 0
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match 'playback_smoke\.measured_session id=') { $start = $i }
+    }
+    $anomalies = [System.Collections.Generic.List[string]]::new()
+    $records = @{}
+    $poisoned = [System.Collections.Generic.HashSet[int]]::new()
+    $keepLines = [System.Collections.Generic.List[int]]::new()
+    $summaryRequested = [System.Collections.Generic.List[int]]::new()
+    $maxIndex = -1
+    for ($i = $start; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match 'interaction_trace event=resize\.keep_playing(\s|$)') { $keepLines.Add($i); continue }
+        if ($line -match 'gui_smoke\.window_toggles requested=(?<n>\d+)(\s|$)') { $summaryRequested.Add([int]$Matches['n']); continue }
+        if ($line -notmatch 'gui_smoke\.window_toggle phase=') { continue }
+        $values = @{}
+        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) { $values[$match.Groups['key'].Value] = $match.Groups['value'].Value }
+        [int]$index = -1
+        if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0)) {
+            $anomalies.Add('unparseable-record-without-index')
+            continue
+        }
+        if ($index -gt $maxIndex) { $maxIndex = $index }
+        [int]$playChecked = -1
+        [int]$position = -1
+        [long]$serial = -1
+        [long]$elapsed = -1
+        $window = $null
+        if ($values.ContainsKey('window') -and ([string]$values['window']) -match '^(?<w>\d+)x(?<h>\d+)$') { $window = $Matches['w'] + 'x' + $Matches['h'] }
+        $usable = ($values['phase'] -eq 'begin' -or $values['phase'] -eq 'end') -and
+            $values.ContainsKey('kind') -and
+            $values.ContainsKey('play_checked') -and [int]::TryParse([string]$values['play_checked'], [ref]$playChecked) -and ($playChecked -eq 0 -or $playChecked -eq 1) -and
+            $values.ContainsKey('position') -and [int]::TryParse([string]$values['position'], [ref]$position) -and
+            $values.ContainsKey('presented_serial') -and [long]::TryParse([string]$values['presented_serial'], [ref]$serial) -and
+            $values.ContainsKey('elapsed_ms') -and [long]::TryParse([string]$values['elapsed_ms'], [ref]$elapsed) -and
+            ($null -ne $window)
+        if (-not $usable) { [void]$poisoned.Add($index); continue }
+        if (-not $records.ContainsKey($index)) {
+            $records[$index] = @{ begin = [System.Collections.Generic.List[object]]::new(); end = [System.Collections.Generic.List[object]]::new() }
+        }
+        $records[$index][[string]$values['phase']].Add([pscustomobject]@{
+            line = $i; kind = [string]$values['kind']; playChecked = $playChecked; position = $position; serial = $serial; elapsed = $elapsed; window = $window
+        })
+    }
+
+    $requested = 0
+    if ($summaryRequested.Count -eq 1) { $requested = $summaryRequested[0] }
+    elseif ($summaryRequested.Count -gt 1) { $anomalies.Add('duplicate-window-toggles-summary'); $requested = $maxIndex + 1 }
+    else { $requested = $maxIndex + 1 }
+    if ($maxIndex -ge $requested) { $anomalies.Add('toggle-index-beyond-requested'); $requested = $maxIndex + 1 }
+    if ($requested -le 0) { $anomalies.Add('no-window-toggle-records') }
+
+    $driven = 0
+    $kept = 0
+    $advanced = 0
+    $previousEndLine = -1
+    $previousEnd = $null
+    $previousKind = ''
+    for ($t = 0; $t -lt $requested; $t++) {
+        $rec = $null
+        if ($records.ContainsKey($t)) { $rec = $records[$t] }
+        if ($null -eq $rec -and -not $poisoned.Contains($t)) { $anomalies.Add("toggle-${t}:no-records"); $previousEnd = $null; continue }
+        if ($poisoned.Contains($t)) { $anomalies.Add("toggle-${t}:unparseable-record"); $previousEnd = $null; continue }
+        if ($rec.begin.Count -ne 1 -or $rec.end.Count -ne 1) { $anomalies.Add("toggle-${t}:duplicate-or-missing-phase"); $previousEnd = $null; continue }
+        $b = $rec.begin[0]
+        $e = $rec.end[0]
+        if ($e.line -le $b.line -or $e.kind -ne $b.kind -or $e.elapsed -lt $b.elapsed -or $b.line -le $previousEndLine) {
+            $anomalies.Add("toggle-${t}:unordered"); $previousEnd = $null; continue
+        }
+        $driven++
+        $keepBetween = 0
+        foreach ($k in $keepLines) { if ($k -gt $b.line -and $k -lt $e.line) { $keepBetween++ } }
+        $referenceWindow = $b.window
+        if ($b.kind -eq 'fs_off' -and $null -ne $previousEnd -and $previousKind -eq 'fs_on') { $referenceWindow = $previousEnd.window }
+        $problems = [System.Collections.Generic.List[string]]::new()
+        if ($keepBetween -lt 1) { $problems.Add('no-keep-playing-between') }
+        if ($b.playChecked -ne 1 -or $e.playChecked -ne 1) { $problems.Add('play-not-checked') }
+        if ($e.window -eq $referenceWindow) { $problems.Add('window-size-unchanged') }
+        if ($problems.Count -eq 0) { $kept++ } else { $anomalies.Add("toggle-${t}:" + ($problems -join '+')) }
+        if ($e.position -gt $b.position -and $e.serial -gt $b.serial) { $advanced++ } else { $anomalies.Add("toggle-${t}:not-advanced") }
+        $previousEndLine = $e.line
+        $previousEnd = $e
+        $previousKind = $b.kind
+    }
+    $reason = 'ok'
+    if ($anomalies.Count -gt 0 -or $driven -ne $requested -or $kept -ne $requested -or $advanced -ne $requested) {
+        $reason = if ($anomalies.Count -gt 0) { ($anomalies -join ';') } else { 'incomplete' }
+    }
+    [pscustomobject]@{ requested = $requested; driven = $driven; keptPlaying = $kept; advanced = $advanced; reason = $reason }
+}
+
 function Get-AttrCudaTemporalCoverage {
     <#
     .SYNOPSIS
@@ -8263,6 +8379,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaPresentMonDisplayReport, `
     Get-AttrCudaAppSwapTelemetry, `
     Get-AttrCudaForegroundVerification, `
+    Get-AttrCudaWindowToggleEvidence, `
     Get-AttrCudaTemporalCoverage, `
     Get-AttrCudaPlaybackTemporalCoverage, `
     ConvertFrom-AttrCudaSwapStampUtc, `

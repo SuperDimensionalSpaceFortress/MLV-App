@@ -270,6 +270,11 @@ HFR_NATIVE_S1_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-
 # HFR-NATIVE-60FPS-FULLRES-1 r30 (merge of master into #420): #420 already ships the pair in HFR_NATIVE_LEGS, so each file is listed once (a duplicate
 # made LineEndingsCannotHideACommittedFileTests unlink the same checked-out file twice).
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in SHIPPED_LEGS))
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the mid-play window-toggle twins of the two windowed M16-1457 native cells (generatorArgs.midPlayWindowToggles true ->
+# MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES), keyed to the cell each one twins. They differ from it only in legId, card, that key and the three windowToggles* criteria.
+FSTOGGLE_LEGS = {"legs/m16-1457-native-windowed-s2-fstoggle.json": "legs/m16-1457-native-windowed-s2.json",
+                 "legs/m16-1457-native-windowed-s1-fstoggle.json": "legs/m16-1457-native-windowed-s1.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -1209,6 +1214,49 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["dueWakeDeliveryPost"]["type"], "boolean")
+
+    def test_the_mid_play_window_toggles_reach_the_apps_env_and_the_summary_only_when_asked(self) -> None:
+        """VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: -MidPlayWindowToggles adds MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES to the app's env list exactly once
+        and the windowToggles* scalars to the success summary (one region, bracketed); absent, the job is the text it was. The runner maps
+        generatorArgs.midPlayWindowToggles true for any leg (outside the forceLookAssist branch); the schema types it as a boolean."""
+        plain = self.generate(GENERATOR, "mpwt-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES", plain)
+        self.assertNotIn("windowTogglesDriven", plain)
+        job = self.generate(GENERATOR, "mpwt-on.job.ps1", ["-MidPlayWindowToggles"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES=fs_on@4000,fs_off@8000,restore@12000,maximize@16000',\n"
+        self.assertEqual(text.count("MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        for key in ("windowTogglesRequested", "windowTogglesDriven", "windowTogglesKeptPlaying", "windowTogglesAdvanced", "windowToggleEvidenceReason"):
+            self.assertEqual(text.count(f"    {key} = $windowToggleEvidence."), 1, key)
+        self.assertEqual(text.count("Get-AttrCudaWindowToggleEvidence -LogText $rawLog"), 1)
+        opened, closed = "# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 >>>", "# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 <<<"
+        self.assertEqual(text.count(opened), 2)
+        self.assertEqual(text.count(closed), 2)
+        stripped = re.sub(r"[ \t]*" + re.escape(opened) + r"\n.*?[ \t]*" + re.escape(closed) + r"\n", "", text.replace(line, ""), flags=re.S)
+        self.assertEqual(stripped, plain, "the switch's env line and its two brackets are the only difference from the plain job")
+        # the function is embedded in the job always, so the job's function set does not depend on the switch
+        self.assertIn("function Get-AttrCudaWindowToggleEvidence", plain)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['midPlayWindowToggles'] -and $spec.generatorArgs.midPlayWindowToggles -is [bool] "
+                   "-and $spec.generatorArgs.midPlayWindowToggles) { $gen['MidPlayWindowToggles'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["midPlayWindowToggles"]["type"], "boolean")
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("'dueWakeDeliveryPost', 'midPlayWindowToggles')", module)
+
+    def test_a_job_template_without_the_env_list_site_refuses_the_mid_play_window_toggles(self) -> None:
+        """The anchor must match exactly once, or the generator throws DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING (never a silent no-env job)."""
+        source = GENERATOR.read_text(encoding="utf-8")
+        anchor = '[regex]"(?<ind>[ \\t]*)\'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1\',(?<nl>\\r?\\n)"'
+        block = source.index("if ($MidPlayWindowToggles) {")
+        self.assertIn(anchor, source[block:block + 400], "the toggle arm's own anchor, the one the throw below guards")
+        self.assertIn("throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING", source[block:block + 900])
+        self.assertIn("Matches($text).Count -ne 1", source[block:block + 700])
 
     def test_the_team_partition_reaches_the_apps_env_only_when_asked(self) -> None:
         """CPU-S1-FS-SPIKE-TEAM-PARTITION-1: -ReconOmpThreads r -PrepOmpThreads p add MLVAPP_PLAYBACK_RECON_OMP_THREADS=r and MLVAPP_PLAYBACK_PREP_OMP_THREADS=p
@@ -8134,6 +8182,14 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
                 self.assertIs(spec["generatorArgs"]["utilSample"], True, path.name)
+            elif spec["card"] == "VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1":   # the mid-play window-toggle twins of the windowed M16-1457 native s1/s2 cells
+                self.assertIn("legs/" + path.name, FSTOGGLE_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-windowed-s[12]-fstoggle$", path.name)
+                self.assertEqual(spec["displayMode"], "windowed", path.name)
+                self.assertEqual(spec["backends"], ["cuda"], path.name)
+                self.assertIs(spec["generatorArgs"]["midPlayWindowToggles"], True, path.name)
+                self.assertIs(spec["generatorArgs"]["forceLookAssist"], True, path.name)   # Look Assist ON (D4b, the owner shape)
             elif spec["card"] == "CUDA-HEADROOM-24-60-UTIL-FULLSCREEN-SPECS-1":   # the fullscreen s1/s2 utilisation-sampler copies of four tracked legs
                 rel = "legs/" + path.name
                 self.assertIn(rel, UTIL_FULLSCREEN_LEGS, path.name)
@@ -15537,6 +15593,195 @@ class ReconReleaseDeferredEvidenceTests(unittest.TestCase):
         v = self.verdict({}, self.log(self.record("1", deferred="412")))
         self.assertEqual(v["observed"], 1)
         self.assertEqual((v["counts"]["deferred"], v["counts"]["drained"], v["counts"]["maxDepth"], v["counts"]["outstandingAtStop"]), (412, 412, 2, 0))
+
+
+class MidPlayWindowToggleLegSpecTests(unittest.TestCase):
+    """VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: the two mid-play window-toggle legs are named generatorArgs.midPlayWindowToggles twins of the windowed
+    M16-1457 native cells; the schema keeps the key off a fullscreen leg, and no other leg sets it."""
+
+    GATES = [{"metric": "windowTogglesDriven", "op": "eq", "value": 4}, {"metric": "windowTogglesKeptPlaying", "op": "eq", "value": 4},
+             {"metric": "windowTogglesAdvanced", "op": "eq", "value": 4}]
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_each_twin_differs_from_its_cell_only_in_leg_id_card_the_key_and_the_three_gates(self) -> None:
+        self.assertEqual(len(FSTOGGLE_LEGS), 2, "the card's two legs: windowed s2 first, then s1")
+        for rel, cell_rel in FSTOGGLE_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("midPlayWindowToggles", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-fstoggle")
+                self.assertEqual(twin["card"], "VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1")
+                self.assertIs(twin["generatorArgs"].pop("midPlayWindowToggles"), True)
+                for role in ("acceptance", "supplementary"):
+                    # the cell's three criteria stay, in order, then the three toggle gates
+                    self.assertEqual(twin["criteria"][role]["cuda"], cell["criteria"][role]["cuda"] + self.GATES, role)
+                    twin["criteria"][role]["cuda"] = cell["criteria"][role]["cuda"]
+                self.assertEqual(dict(twin, legId=cell["legId"], card=cell["card"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+                self.assertTrue(cell["generatorArgs"].get("forceLookAssist"), "Look Assist ON (D4b)")
+                self.assertEqual(cell["generatorArgs"].get("lookFlavor"), "cinematic")
+                self.assertEqual(cell["displayMode"], "windowed")
+
+    def test_no_other_leg_sets_the_key(self) -> None:
+        for path in sorted((DV / "legs").glob("*.json")):
+            if "legs/" + path.name in FSTOGGLE_LEGS:
+                continue
+            with self.subTest(leg=path.name):
+                self.assertNotIn("midPlayWindowToggles", json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {})
+
+    def test_the_key_must_be_a_json_boolean(self) -> None:
+        twin = json.loads((DV / next(iter(FSTOGGLE_LEGS))).read_text(encoding="utf-8"))
+        for bad in (0, 1, "1", "true", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], midPlayWindowToggles=bad)), self.schema)
+
+    def test_the_schema_refuses_the_key_on_a_fullscreen_leg_or_one_with_no_display_mode(self) -> None:
+        twin = json.loads((DV / next(iter(FSTOGGLE_LEGS))).read_text(encoding="utf-8"))
+        self.jsonschema.validate(twin, self.schema)
+        with self.assertRaises(self.jsonschema.ValidationError):
+            self.jsonschema.validate(dict(twin, displayMode="fullscreen"), self.schema)
+        absent = {k: v for k, v in twin.items() if k != "displayMode"}
+        with self.assertRaises(self.jsonschema.ValidationError):
+            self.jsonschema.validate(absent, self.schema)
+        # a fullscreen leg that does not set the key is untouched by the rule
+        plain = json.loads((DV / "legs/m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        self.jsonschema.validate(plain, self.schema)
+
+    def test_the_legs_are_the_card_s_pair_in_the_card_s_order(self) -> None:
+        self.assertEqual(list(FSTOGGLE_LEGS)[0], "legs/m16-1457-native-windowed-s2-fstoggle.json")
+        for rel in FSTOGGLE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.assertEqual((spec["backends"], spec["displayMode"], spec["playSeconds"]), (["cuda"], "windowed", 25))
+            self.assertNotIn("visualCapture", spec, "visual capture stays at its default (on)")
+
+
+@requires_windows_pwsh
+class WindowToggleEvidenceTests(unittest.TestCase):
+    """Get-AttrCudaWindowToggleEvidence over the raw run log, and the new legs' criteria on the scalars it yields (VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1)."""
+
+    KINDS = ("fs_on", "fs_off", "restore", "maximize")
+    # window size at each toggle's begin and end: maximized 1920x1040 -> fullscreen 1920x1080 -> maximized -> normal 1280x693 -> maximized
+    SIZES = (("1920x1040", "1920x1080"), ("1920x1080", "1920x1040"), ("1920x1040", "1280x693"), ("1280x693", "1920x1040"))
+
+    @classmethod
+    def toggle(cls, i: int, phase: str, *, play: int = 1, pos: int | None = None, serial: int | None = None, window: str | None = None, kind: str | None = None,
+               position: str | None = None) -> str:
+        if phase == "begin":
+            pos = 100 * i + 10 if pos is None else pos
+            serial = 1000 * i + 100 if serial is None else serial
+            window = cls.SIZES[i][0] if window is None else window
+            return (f"gui_smoke.window_toggle phase=begin index={i} kind={kind or cls.KINDS[i]} at_ms={4000 * (i + 1)} elapsed_ms={4000 * (i + 1) + 7} "
+                    f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen=0 maximized=1")
+        pos = 100 * i + 60 if pos is None else pos
+        serial = 1000 * i + 600 if serial is None else serial
+        window = cls.SIZES[i][1] if window is None else window
+        return (f"gui_smoke.window_toggle phase=end index={i} kind={kind or cls.KINDS[i]} elapsed_ms={4000 * (i + 1) + 2007} "
+                f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen=0 maximized=1")
+
+    KEEP = "interaction_trace event=resize.keep_playing width=1920 height=1080 fullscreen=1"
+
+    @classmethod
+    def log(cls, *, drop_keep: int | None = None, mutate=None, summary: str | None = "gui_smoke.window_toggles requested=4 driven=4 reason=ok", prefix=()) -> str:
+        lines = [*prefix, "playback_smoke.measured_session id=3"]
+        for i in range(4):
+            begin, end = cls.toggle(i, "begin"), cls.toggle(i, "end")
+            if mutate:
+                begin, end = mutate(i, begin, end)
+            lines += [begin, "playback_smoke.frame session=3 n=1"]
+            if i != drop_keep:
+                lines += [cls.KEEP]
+            lines += [end]
+        if summary:
+            lines.append(summary)
+        return "\n".join(lines)
+
+    def run_cases(self, logs: list[str]) -> list[dict]:
+        with tempfile.TemporaryDirectory(prefix="wt-ev-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"log": log} for log in logs]), encoding="utf-8")
+            script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                      "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                      "$specs = @('m16-1457-native-windowed-s2-fstoggle', 'm16-1457-native-windowed-s1-fstoggle') | ForEach-Object { [IO.File]::ReadAllText('"
+                      f"{DV}/legs/' + $_ + '.json') | ConvertFrom-Json }}\n"
+                      "@($cases | ForEach-Object {\n"
+                      "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log)\n"
+                      "  $summary = [ordered]@{ result = 'MEASUREMENT_CAPTURED'; lookAssistForced = $true; gpuFramesTotal = 599; lookFlavorReported = 'cinematic'\n"
+                      "    windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced\n"
+                      "    windowToggleEvidenceReason = $e.reason }\n"
+                      "  $metrics = Get-DvVerbatimMetrics -Summary (($summary | ConvertTo-Json -Depth 4) | ConvertFrom-Json) -EvidenceManifest $null\n"
+                      "  $passes = @($specs | ForEach-Object { (Test-DvCriteria -Criteria $_.criteria.acceptance.cuda -Metrics $metrics).pass -and (Test-DvCriteria -Criteria $_.criteria.supplementary.cuda -Metrics $metrics).pass })\n"
+                      "  [ordered]@{ e = $e; passes = $passes }\n"
+                      "}) | ConvertTo-Json -Compress -Depth 6 -AsArray")
+            proc = run_pwsh(["-Command", script], env_extra={"DVE_CASES": str(path)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_the_toggle_table(self) -> None:
+        ok = self.log()
+        cases = {
+            "all four keep playing and advance": (ok, (4, 4, 4, 4), True),
+            "no keep_playing record between toggle 2's begin and end": (self.log(drop_keep=2), (4, 4, 3, 4), False),
+            "no toggle record at all": ("playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 n=1", (0, 0, 0, 0), False),
+            "an empty log": ("", (0, 0, 0, 0), False),
+            "a duplicate begin of toggle 1 (it counts for nothing, driven included)": (
+                self.log(mutate=lambda i, b, e: (b + "\n" + b if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "a duplicate end of toggle 3": (self.log(mutate=lambda i, b, e: (b, e + "\n" + e if i == 3 else e)), (4, 3, 3, 3), False),
+            "a keep_playing record only BEFORE its toggle's begin": (
+                self.log(drop_keep=0, mutate=lambda i, b, e: (self.KEEP + "\n" + b if i == 0 else b, e)), (4, 4, 3, 4), False),
+            "Play unchecked at the end of toggle 0": (self.log(mutate=lambda i, b, e: (b, self.toggle(0, "end", play=0) if i == 0 else e)), (4, 4, 3, 4), False),
+            "the window did not change size in toggle 2": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(2, "end", window=self.SIZES[2][0]) if i == 2 else e)), (4, 4, 3, 4), False),
+            "fs_off ends at the size fs_on ended at": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", window=self.SIZES[0][1]) if i == 1 else e)), (4, 4, 3, 4), False),
+            "position did not advance in toggle 3": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(3, "end", pos=310) if i == 3 else e)), (4, 4, 4, 3), False),
+            "presented_serial did not advance in toggle 0": (
+                self.log(mutate=lambda i, b, e: (b, self.toggle(0, "end", serial=100) if i == 0 else e)), (4, 4, 4, 3), False),
+            "an unparseable position in toggle 1": (
+                self.log(mutate=lambda i, b, e: (self.toggle(1, "begin", position="abc") if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "toggle 2's end logged before its begin": (
+                self.log(mutate=lambda i, b, e: (e, b) if i == 2 else (b, e)), (4, 3, 3, 3), False),
+            "an end of another kind": (self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", kind="restore") if i == 1 else e)), (4, 3, 3, 3), False),
+            "records of an earlier session before the last measured_session marker are not read": (
+                self.log(prefix=(self.toggle(0, "begin"), self.toggle(0, "begin"), "playback_smoke.measured_session id=2")), (4, 4, 4, 4), True),
+            "two toggles only (the loop exit cut the rest short)": (
+                "\n".join(self.log(summary="gui_smoke.window_toggles requested=4 driven=2 reason=incomplete").split("\n")[:11] +
+                          ["gui_smoke.window_toggles requested=4 driven=2 reason=incomplete"]), (4, 2, 2, 2), False),
+        }
+        out = self.run_cases([log for log, _, _ in cases.values()])
+        self.assertEqual(len(out), len(cases))
+        for (name, (log, expected, passes)), got in zip(cases.items(), out, strict=True):
+            with self.subTest(case=name):
+                e = got["e"]
+                self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), expected, e)
+                self.assertEqual(got["passes"], [passes, passes], f"{name}: {e}")
+                self.assertEqual(e["reason"] == "ok", passes, e)
+
+    def test_a_summary_without_the_scalars_fails_both_legs_criteria(self) -> None:
+        script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                  "$out = foreach ($leg in @('m16-1457-native-windowed-s2-fstoggle', 'm16-1457-native-windowed-s1-fstoggle')) {\n"
+                  f"  $spec = [IO.File]::ReadAllText('{DV}/legs/' + $leg + '.json') | ConvertFrom-Json\n"
+                  "  $m = [pscustomobject]@{ lookAssistForced = $true; gpuFramesTotal = 599; lookFlavorReported = 'cinematic' }\n"
+                  "  $a = Test-DvCriteria -Criteria $spec.criteria.acceptance.cuda -Metrics $m\n"
+                  "  $s = Test-DvCriteria -Criteria $spec.criteria.supplementary.cuda -Metrics $m\n"
+                  "  [ordered]@{ a = $a.pass; s = $s.pass; failures = @($a.failures) }\n"
+                  "}\n"
+                  "@($out) | ConvertTo-Json -Compress -Depth 4 -AsArray")
+        proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for got in json.loads(proc.stdout):
+            self.assertEqual((got["a"], got["s"]), (False, False))
+            self.assertEqual(sorted(f.split(":")[0] for f in got["failures"]), ["windowTogglesAdvanced", "windowTogglesDriven", "windowTogglesKeptPlaying"])
 
 
 class DueWakeDeliveryLegSpecTests(unittest.TestCase):
