@@ -304,6 +304,9 @@ function Set-Switch([string]$State, [int]$Count, [int]$Block) {
         # r6 (c), the A6 rule: a retry may not START after the budget minus its maximum jitter (40 ms), so no attempt starts past the budget
         if (-not (Test-HeavySlotAbRetryMayStart -Now ([DateTime]::UtcNow) -GiveUp $giveUp -MaxJitterMs 40)) { break }
         Start-Sleep -Milliseconds (10 + $jitter.Next(0, 30))
+        # r9 B3: the sleep is a request, not a bound (the host may resume this thread late). The prediction above is made BEFORE the sleep, so
+        # the clock is read again AFTER it: an attempt whose start is already past the shared deadline is never made.
+        if (-not (Test-HeavySlotAbRetryMayStart -Now ([DateTime]::UtcNow) -GiveUp $giveUp -MaxJitterMs 0)) { break }
     }
     throw $lastError
 }
@@ -355,6 +358,9 @@ function Get-LedgerFinding {
     $script:ledgerFailed = $false
     # a ledger that existed at the baseline and is now GONE (renamed, deleted) is an unread source, not an empty one (adversary r4 A2)
     if (-not (Test-Path -LiteralPath $script:ledgerPath)) { if ($script:ledgerExisted) { $script:ledgerFailed = $true }; return $null }
+    # r9 B5: the offset is moved past the bytes BEFORE they are judged, so any exception while judging them must put it back: otherwise the
+    # next poll reads an empty tail, clears the failure and the unjudged row is lost for ever. Restored in the catch below.
+    $offsetBefore = $script:ledgerOffset
     try {
         $lfs = [IO.File]::Open($script:ledgerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
         try {
@@ -397,7 +403,7 @@ function Get-LedgerFinding {
             if ($pr.v.event -eq 'admit' -and ([string]$pr.v.class -cne 'shared' -or $pr.v.wholeMachine -eq $true)) { return "exclusive-admit ticket=$($pr.v.ticket) class=$($pr.v.class)" }
         }
     }
-    catch { $script:ledgerFailed = $true }
+    catch { $script:ledgerOffset = $offsetBefore; $script:ledgerFailed = $true }
     return $null
 }
 
@@ -570,6 +576,8 @@ try {
     $rowWin = New-Object System.Collections.Generic.List[object]
     $prevRowUtc = $null
     $prevHolders = $null
+    $prevPollUtc = $null
+    $seenRows = New-Object 'System.Collections.Generic.HashSet[string]'     # r9 B2: the identity of every feed row accepted so far
     $badMem = 0
     $badEvent = 0
     $badHeld = 0
@@ -611,24 +619,29 @@ try {
         $feedUnknownNow = $script:feedUnknown
         # A feed row between two polls is only credited with 2+ holders when BOTH bracketing polls saw 2+: the holders are sampled, not
         # continuous, so a second holder seen at alternate polls is not sustained overlap (adversary r1 A7).
-        $rowHolders = if ($null -eq $prevHolders) { $holders.Count } else { [Math]::Min([int]$prevHolders, $holders.Count) }
+        # r9 B1: the credit is per ROW (Get-HeavySlotAbRowHolders): the first read, which has no previous poll, credits no overlap, so the
+        # feed's pre-window tail can never read as observed two-holder heat; a later read credits a row only inside the observed interval.
         # r6 (c): the shared ordering rule. The watermark ($prevRowUtc) is the MAXIMUM accepted row time; a read whose rows are not
         # non-decreasing in file order, or whose newest row is older than the watermark, is REFUSED as a whole (feed-time-regressed). Rows are
         # never filtered by the watermark BEFORE the order is checked, so a hot row dated below a future-dated cool one can no longer vanish
         # (adversary pass 6 A2; r5 A1 and r4 A7 were the same class at the other two sites).
-        $step = Step-HeavySlotAbWatermark -Times ([DateTime[]]@($rows | ForEach-Object { $_.utc })) -Watermark $prevRowUtc
+        # r9 B2: the read is also refused when it carries a row at or below the watermark that this stream never delivered (a replaced or
+        # truncated feed): that row could be a hot one hidden below the watermark.
+        $step = Step-HeavySlotAbWatermark -Times ([DateTime[]]@($rows | ForEach-Object { $_.utc })) -Watermark $prevRowUtc -Keys ([string[]]@($rows | ForEach-Object { Get-HeavySlotAbFeedRowKey $_ })) -Seen $seenRows
         $clockBack = $step.Regressed
         $newRows = @()
         if (-not $clockBack) {
             $newRows = @($step.NewIndex | ForEach-Object { $rows[$_] })
             foreach ($r in $newRows) {
                 $dt = if ($null -ne $prevRowUtc) { [Math]::Min(6.0, [Math]::Max(0.0, ($r.utc - $prevRowUtc).TotalSeconds)) } else { 2.0 }
+                $rowHolders = Get-HeavySlotAbRowHolders -PrevPollUtc $prevPollUtc -PrevHolders $prevHolders -Holders $holders.Count -RowUtc $r.utc -LeadSeconds $PollSeconds
                 $rowWin.Add([pscustomobject]@{ utc = $r.utc; dt = $dt; temp = $r.temp; holders = $rowHolders })
                 $prevRowUtc = $r.utc
             }
             $prevRowUtc = $step.Watermark
         }
         $prevHolders = $holders.Count
+        $prevPollUtc = $now
         $keepFrom = $now.AddSeconds(-[Math]::Max($CapWindowSeconds, $WarmWindowSeconds) - 5)
         while ($rowWin.Count -gt 0 -and $rowWin[0].utc -lt $keepFrom) { $rowWin.RemoveAt(0) }
         $newest = if ($rows.Count -gt 0) { $rows[-1] } else { $null }
@@ -736,7 +749,9 @@ finally {
     if ($script:refused) { $final = $null }
     elseif (-not $final) { $final = @{ state = 'ABORTED'; reason = 'driver-interrupted' } }
     if ($final -and $revertFailed -and -not $script:refused) { $final = @{ state = 'ABORTED'; reason = ('revert-failed: ' + $revertWhy + ' (the window ended as ' + $final.state + ': ' + $final.reason + ')') } }
-    if ($final -and (Test-Path -LiteralPath $WindowDir -PathType Container) -and $switchTouched) {
+    # r9 B4: the receipt is owed by the OUTCOME and the touch, never by the destination directory still existing: a vanished directory
+    # makes the write fail (AB_RECEIPT_FAILED, exit 5), it must not skip the write and print AB_DONE.
+    if (Test-HeavySlotAbReceiptOwed -Final $final -SwitchTouched ([bool]$switchTouched)) {
         $rcpt = [ordered]@{
             state = $final.state; reason = $final.reason; schema = 'heavy-slot-ab-receipt.v1'
             windowStartUtc = (Get-IsoUtc $script:windowStart); windowEndUtc = (Get-IsoUtc $script:windowEnd); endedUtc = (Get-IsoUtc ([DateTime]::UtcNow))

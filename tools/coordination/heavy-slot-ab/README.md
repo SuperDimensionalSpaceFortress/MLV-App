@@ -124,6 +124,20 @@ Verdict (every threshold is printed in the json):
 * **Adoption** also needs at least 10 B pytest tickets whose receipt shows slotCount 2 (`thresholds.min_b_pytest_at_slotcount_2`).
 * **Open, outside this card:** `tools/coordination/build-guard.ps1:446-447` still compares the rounded memory figure (BUILD-GUARD-MEMORY-FLOOR-COMPARE-UNROUNDED-1).
 
+## Rules added in r9 (adversary review of r8, five blockers)
+
+* **No observed interval, no overlap credit.** A feed row is credited with 2+ holders only inside the interval two bracketing polls observed
+  (`Get-HeavySlotAbRowHolders`): the FIRST read has no previous poll and credits nothing, so the feed's pre-window tail (for example 15 minutes of old 91 C
+  rows) can never abort a legitimate window as `warm-while-2`.
+* **A replaced feed fails closed.** A read that carries a row at or below the accepted watermark that this stream never delivered (a replaced or truncated
+  feed hiding a hot row under the watermark) is refused `feed-time-regressed`; the identities of every accepted row are kept (`Get-HeavySlotAbFeedRowKey`).
+* **No retry starts past its deadline.** After the jittered sleep the clock is read again; an attempt that would START after the shared `-SwitchRetrySeconds`
+  budget is not made, whatever delayed the thread.
+* **No receipt, no DONE, even when the window directory vanished.** The receipt is owed by the outcome plus the switch touch (`Test-HeavySlotAbReceiptOwed`),
+  not by the directory still existing: the write fails and the driver exits 5 `AB_RECEIPT_FAILED`.
+* **A diagnostic never loses evidence.** The unknown-evidence text is length-bounded on the normalized value (64 spaces normalize to one character), and a
+  ledger read that throws while judging puts the offset back, so the row is read again and two failures in a row abort `ledger-unreadable`.
+
 ## Known limits
 
 * The slot-1 object is not keeper-owned during the window (`HeavySlot-KeepObjects` keeps slot 0 only), so every heavy-slot run in a

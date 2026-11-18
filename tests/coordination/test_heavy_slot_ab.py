@@ -572,20 +572,37 @@ def test_a_second_driver_is_refused_and_leaves_the_first_ones_switch_alone(tmp_p
 # ---------------------------------------------------------------------------------------------------------------------------
 # 8. static: nothing in the folder can reach the live slot or a process census
 # ---------------------------------------------------------------------------------------------------------------------------
+FORBIDDEN_SURFACE = {
+    "status passed as a heavy-slot verb": re.compile(r"heavy-slot(?:\.cmd|\.ps1)?['\"`]?\s+status\b|['\"]status['\"]", re.I),
+    "a Global\\HeavySlot mutex name": re.compile(r"Global\\+HeavySlot", re.I),
+    "a mutex wait": re.compile(r"WaitOne|WaitAny|WaitHandle", re.I),
+    "a Win32_Process query (filtered or not)": re.compile(r"Win32_Process|wmic", re.I),
+    "a heavy-slot launch": re.compile(r"heavy-slot\.cmd['\"]?\)?\s+(?:run|exclusive|status)\b", re.I),
+}
+
+
+def _forbidden_surface_hits(text: str) -> list:
+    # r9 hardening (Sol r8 DC-01): a name built from quoted pieces ('heavy-' + 'slot.cmd', "Win32_" + "Process") must read as the name it builds,
+    # so the pieces are joined (PowerShell '+' and a plain adjacency of the two quote styles) BEFORE the patterns run.
+    joined = re.sub(r"""['"]\s*\+\s*['"]""", "", text)
+    return [what for what, rx in FORBIDDEN_SURFACE.items() if rx.search(text) or rx.search(joined)]
+
+
 def test_no_file_in_the_folder_touches_the_live_slot_or_a_process_census():
     files = sorted(p for p in AB_DIR.iterdir() if p.is_file())
     assert {p.name for p in files} >= {"HeavySlotAb.psm1", "Invoke-HeavySlotAbDriver.ps1", "Measure-HeavySlotAb.ps1", "README.md"}
-    forbidden = {
-        "status passed as a heavy-slot verb": re.compile(r"heavy-slot(?:\.cmd|\.ps1)?['\"`]?\s+status\b|['\"]status['\"]", re.I),
-        "a Global\\HeavySlot mutex name": re.compile(r"Global\\+HeavySlot", re.I),
-        "a mutex wait": re.compile(r"WaitOne|WaitAny|WaitHandle", re.I),
-        "a Win32_Process query (filtered or not)": re.compile(r"Win32_Process|wmic", re.I),
-        "a heavy-slot launch": re.compile(r"heavy-slot\.cmd'?\s+(?:run|exclusive|status)\b", re.I),
-    }
     for path in files:
-        text = path.read_text(encoding="utf-8")
-        for what, rx in forbidden.items():
-            assert not rx.search(text), f"{path.name} contains {what}: {rx.search(text).group(0)!r}"
+        hits = _forbidden_surface_hits(path.read_text(encoding="utf-8"))
+        assert not hits, f"{path.name} contains {hits}"
+
+
+def test_r9_the_forbidden_surface_scan_sees_through_concatenated_spellings():
+    assert "a heavy-slot launch" in _forbidden_surface_hits("& ('heavy-' + 'slot.cmd') run x")   # a parenthesized built name then a verb
+    assert "a heavy-slot launch" in _forbidden_surface_hits("& 'heavy-'+'slot.cmd' run build")
+    assert "a heavy-slot launch" in _forbidden_surface_hits('& "heavy-" + "slot.cmd" exclusive build')
+    assert "a Win32_Process query (filtered or not)" in _forbidden_surface_hits("Get-CimInstance ('Win32_' + 'Process')")
+    assert "a mutex wait" in _forbidden_surface_hits("$m.'Wait'+'One'(1)")
+    assert _forbidden_surface_hits("Write-Output 'heavy-slot is quiet'") == []
 
 
 def test_the_driver_never_removes_the_switch_file():
@@ -2139,3 +2156,191 @@ def test_r6_the_evaluator_refuses_a_window_dir_named_by_its_8dot3_short_name_und
         pytest.skip("8.3 short names are not generated on this volume")
     out = _ps(["-File", str(EVALUATOR), "-WindowDir", short, "-HeavySlotDir", str(hs), "-SkipHeadroom"])
     assert out.returncode == 2 and "path-overlap" in out.stdout, (short, out.returncode, out.stdout, out.stderr)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# round r10 (head 41d12861): Sol r8 B1-B5, each fed its own input. Every test below fails on 41d12861's tool files.
+# The driver-internal ones (B3 retry deadline, B4 finalizer, B5 ledger offset) run the driver's OWN code, cut out of the script by the
+# PowerShell parser, with only its I/O seams stubbed: they never carry a copy of the code they test.
+# ---------------------------------------------------------------------------------------------------------------------------
+_AST_PREAMBLE = "\n".join([
+    "$ErrorActionPreference = 'Stop'",
+    "$ast = [System.Management.Automation.Language.Parser]::ParseFile('{driver}', [ref]$null, [ref]$null)",
+    "function Get-DriverFunction([string]$Name) {{",
+    "    $hit = $ast.Find({{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name }}.GetNewClosure(), $true)",
+    "    if ($null -eq $hit) {{ throw \"no function $Name in the driver\" }}",
+    "    return $hit.Extent.Text",
+    "}}",
+])
+
+
+def _driver_cut(tmp_path: Path, body: str, module=True):
+    script = tmp_path / "driver-cut.ps1"
+    pre = _AST_PREAMBLE.format(driver=DRIVER)
+    if module:
+        pre += f"\nImport-Module -Force '{MODULE}'"
+    script.write_text(pre + "\n" + body + "\n", encoding="ascii")
+    return _ps(["-File", str(script)])
+
+
+def test_r10_B1_B2_B4_the_shared_helpers_hold_their_rules(tmp_path):
+    got = _module_call(tmp_path, "\n".join([
+        "$t = [DateTime]::new(2026, 1, 5, 12, 0, 0, [DateTimeKind]::Utc)",
+        # B1: no previous poll -> no observed interval -> no credit; inside the interval -> min of the bracketing polls; far before it -> 0
+        "$h = @(",
+        "  (Get-HeavySlotAbRowHolders -PrevPollUtc $null -PrevHolders $null -Holders 2 -RowUtc $t -LeadSeconds 15),",
+        "  (Get-HeavySlotAbRowHolders -PrevPollUtc $t -PrevHolders 2 -Holders 2 -RowUtc $t.AddSeconds(5) -LeadSeconds 15),",
+        "  (Get-HeavySlotAbRowHolders -PrevPollUtc $t -PrevHolders 2 -Holders 2 -RowUtc $t.AddSeconds(-600) -LeadSeconds 15),",
+        "  (Get-HeavySlotAbRowHolders -PrevPollUtc $t -PrevHolders 1 -Holders 2 -RowUtc $t.AddSeconds(5) -LeadSeconds 15))",
+        # B2: the retained tail of the same stream passes; a never-delivered (hot) row below the watermark is a regression
+        "$seen = New-Object 'System.Collections.Generic.HashSet[string]'",
+        "$r1 = @([pscustomobject]@{ utc = $t; temp = 60.0 }, [pscustomobject]@{ utc = $t.AddSeconds(2); temp = 61.0 })",
+        "$s1 = Step-HeavySlotAbWatermark -Times @($r1 | ForEach-Object { $_.utc }) -Watermark $null -Keys @($r1 | ForEach-Object { Get-HeavySlotAbFeedRowKey $_ }) -Seen $seen",
+        "$r2 = @($r1[1], [pscustomobject]@{ utc = $t.AddSeconds(4); temp = 62.0 })",
+        "$s2 = Step-HeavySlotAbWatermark -Times @($r2 | ForEach-Object { $_.utc }) -Watermark $s1.Watermark -Keys @($r2 | ForEach-Object { Get-HeavySlotAbFeedRowKey $_ }) -Seen $seen",
+        "$r3 = @([pscustomobject]@{ utc = $t.AddSeconds(-6); temp = 96.0 }, [pscustomobject]@{ utc = $t.AddSeconds(5); temp = 60.0 })",
+        "$s3 = Step-HeavySlotAbWatermark -Times @($r3 | ForEach-Object { $_.utc }) -Watermark $s2.Watermark -Keys @($r3 | ForEach-Object { Get-HeavySlotAbFeedRowKey $_ }) -Seen $seen",
+        # B4: a receipt is owed by an outcome plus a touch of the switch, whatever the directory says
+        "$o = @((Test-HeavySlotAbReceiptOwed -Final @{ state = 'DONE' } -SwitchTouched $true), (Test-HeavySlotAbReceiptOwed -Final $null -SwitchTouched $true), (Test-HeavySlotAbReceiptOwed -Final @{ state = 'DONE' } -SwitchTouched $false))",
+        "Write-Output ('{0}|{1}/{2}/{3}|{4}|{5}' -f ($h -join ','), $s1.Regressed, $s2.Regressed, $s3.Regressed, (@($s2.NewIndex) -join ','), ($o -join ','))",
+    ]))
+    assert got == "0,2,0,1|False/False/True|1|True,False,False", got
+
+
+def test_r10_B1_a_hot_feed_tail_from_before_the_first_poll_is_never_two_holder_heat(tmp_path, me):
+    # Sol r8 B1: two holders first seen at the first poll, 451 rows at 91 C dated N-900 s .. N. No poll observed any of those rows, so
+    # none of them is overlap; on 41d12861 every one was credited 2 holders and the window aborted warm-while-2 at its first poll.
+    w = World(tmp_path, "r10pretail", me)
+    try:
+        w.add_holder("h0", 0)
+        w.add_holder("h1", 1)
+        w.feed.paused = True
+        time.sleep(0.4)
+        now = datetime.now()
+        w.feed_path.write_text(FEED_HEADER + "".join(_feed_line(now - timedelta(seconds=900 - 2 * i), 91.0) for i in range(451)), encoding="ascii")
+        w.feed.paused = False
+        out = subprocess.run(w.args(0.003, 0.05), capture_output=True, text=True, timeout=120)
+        rc = w.receipt()
+        assert "warm-while-2" not in out.stdout, (out.returncode, rc, out.stdout, out.stderr)
+        assert out.returncode == 0 and rc and rc["state"] == "DONE", (out.returncode, rc, out.stdout, out.stderr)
+    finally:
+        w.close()
+
+
+def test_r10_B2_a_replaced_feed_hiding_a_new_hot_row_below_the_watermark_fails_closed(tmp_path, me):
+    # Sol r8 B2: after the watermark T is accepted the feed is REPLACED by [96 C at T-10, 60 C at T+1]. On 41d12861 the hot row was
+    # dropped as "not newer" and the window ran on to a clean DONE; it must end feed-time-regressed.
+    w = World(tmp_path, "r10replaced", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: len(w.samples()) >= 3, 60), w.text()
+        w.feed.paused = True
+        time.sleep(1.0)                                   # more than two polls accept the last live row: it is the watermark
+        now = datetime.now()
+        new = w.root / "feed.replacement"
+        new.write_text(FEED_HEADER + _feed_line(now - timedelta(seconds=10), 96.0) + _feed_line(now + timedelta(seconds=1)), encoding="ascii")
+
+        def swap():
+            try:
+                os.replace(new, w.feed_path)              # atomic: the driver never reads a half-written replacement
+                return True
+            except OSError:
+                return False
+        assert _wait(swap, 20, 0.02), "could not replace the feed"
+        code = proc.wait(timeout=90)
+        assert code == 3 and w.receipt()["reason"].startswith("feed-time-regressed"), (code, w.receipt(), w.text())
+    finally:
+        w.close()
+
+
+def test_r10_B3_no_retry_starts_after_the_shared_deadline_even_when_the_sleep_overruns(tmp_path):
+    # Sol r8 B3: the retry rule was asked BEFORE the jittered sleep only. A sleep that overruns (500 ms here, past a 250 ms budget) must
+    # not be followed by an attempt: Set-Switch throws the last error. On 41d12861 the late attempt ran and "returned".
+    out = _driver_cut(tmp_path, "\n".join([
+        ". ([scriptblock]::Create((Get-DriverFunction 'Set-Switch')))",
+        "$SwitchRetrySeconds = 0.25; $SwitchPath = 'unused'; $script:blockSec = 0; $script:writes = 0",
+        "function Write-AtomicText([string]$Path, [string]$Text) { $script:writes++; if ($script:writes -eq 1) { throw 'a reader holds the switch' } }",
+        "function New-SwitchText { return 'x' }",
+        "function Start-Sleep([int]$Milliseconds) { [System.Threading.Thread]::Sleep(500) }",
+        "try { Set-Switch 'REVERTED' 1 -1; $r = 'returned' } catch { $r = 'threw' }",
+        "Write-Output ('{0}|{1}' -f $r, $script:writes)",
+    ]))
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.strip() == "threw|1", out.stdout + out.stderr
+
+
+def test_r10_B4_a_vanished_window_dir_is_a_failed_receipt_never_a_done(tmp_path):
+    # Sol r8 B4: final DONE, the switch touched and reverted, and the window directory gone at the finalizer. On 41d12861 the receipt
+    # branch was skipped by Test-Path and the driver printed AB_DONE and exited 0 with no receipt anywhere.
+    gone = tmp_path / "window-gone"
+    switch = tmp_path / "switch.json"
+    out = _driver_cut(tmp_path, "\n".join([
+        ". ([scriptblock]::Create((Get-DriverFunction 'Get-IsoUtc')))",
+        ". ([scriptblock]::Create((Get-DriverFunction 'Write-AtomicText')))",
+        "$inv = [Globalization.CultureInfo]::InvariantCulture",
+        "$try = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] -and $null -ne $n.Finally -and $n.Finally.Extent.Text.Contains('revertFailed') }, $true)",
+        "$body = $try.Finally.Extent.Text; $body = $body.Substring(1, $body.Length - 2)",
+        f"$WindowDir = '{gone}'; $receiptFile = Join-Path $WindowDir 'ab-receipt.json'; $SwitchPath = '{switch}'",
+        "function Set-Switch($State, $Count, $Block) { [System.IO.File]::WriteAllText($SwitchPath, (@{ state = $State; count = $Count } | ConvertTo-Json -Compress)) }",
+        "function Start-Sleep([int]$Milliseconds) { }",
+        "$switchTouched = $true; $blockIndex = 3; $script:refused = $false; $final = @{ state = 'DONE'; reason = 'window-complete' }",
+        "$script:windowStart = [DateTime]::UtcNow.AddMinutes(-5); $script:windowEnd = [DateTime]::UtcNow",
+        "$Hours = 0.1; $BlockMinutes = 1; $PollSeconds = 1; $nSamples = 10; $mutex = $null; $script:switchLock = $null; $script:windowLock = $null",
+        ". ([scriptblock]::Create($body))",
+        "exit 0",
+    ]))
+    assert not gone.exists()
+    assert "AB_DONE" not in out.stdout, (out.returncode, out.stdout, out.stderr)
+    assert out.returncode == 5 and "AB_RECEIPT_FAILED" in out.stdout, (out.returncode, out.stdout, out.stderr)
+
+
+def test_r10_B5_a_whitespace_heavy_invalid_field_is_typed_unknown_evidence_never_a_throw(tmp_path):
+    got = _module_call(tmp_path, "\n".join([
+        "$e = ('{\"at\":\"2026-01-05T12:00:00.000Z\",\"event\":\"admit\",\"class\":\"shared\",\"wholeMachine\":\"' + (' ' * 64) + '\"}') | ConvertFrom-Json",
+        "try {",
+        "  $p = Read-HeavySlotAbRow -Row $e -Spec ([ordered]@{ at = 'time'; event = 'string'; ticket = 'string?'; class = 'string?'; wholeMachine = 'bool?' })",
+        "  Write-Output ('ok={0}|{1}' -f $p.ok, $p.why.StartsWith('wholeMachine is not a valid'))",
+        "} catch { Write-Output ('threw: ' + $_.Exception.Message) }",
+    ]))
+    assert got == "ok=False|True", got
+
+
+def test_r10_B5_a_ledger_row_with_a_whitespace_heavy_field_ends_the_window_unknown_evidence(tmp_path, me):
+    # Sol r8 B5 end to end: on 41d12861 the diagnostic threw after the offset had moved past the row, the next empty read cleared the
+    # failure and the window finished DONE over an admit row nobody judged.
+    w = World(tmp_path, "r10ledgerws", me)
+    try:
+        proc = w.start(0.006, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        w.append_ledger({"at": iso(datetime.now(UTC)), "event": "admit", "ticket": "x9", "class": "shared", "wholeMachine": " " * 64})
+        code = proc.wait(timeout=90)
+        rc = w.receipt()
+        assert code == 3 and rc["reason"].startswith("ledger-unreadable (unknown evidence"), (code, rc, w.text())
+    finally:
+        w.close()
+
+
+def test_r10_B5_a_ledger_read_that_throws_while_judging_puts_the_offset_back(tmp_path):
+    # Sol r8 B5, the consume-before-judge half: whatever throws while a read's rows are judged, the offset returns to where the read began
+    # so the next poll reads the same row again (and a second failure in a row ends the window). On 41d12861 the offset stayed advanced.
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text(json.dumps({"at": "2026-01-05T12:00:00.000Z", "event": "admit", "ticket": "x9", "class": "shared"}) + "\n", encoding="ascii")
+    out = _driver_cut(tmp_path, "\n".join([
+        ". ([scriptblock]::Create((Get-DriverFunction 'Get-LedgerFinding')))",
+        "function Read-HeavySlotAbRow { throw 'the row parser failed' }",
+        "$utf8 = New-Object System.Text.UTF8Encoding($false)",
+        f"$script:ledgerPath = '{ledger}'; $script:ledgerOffset = 0; $script:ledgerExisted = $true; $script:finalSweep = $false",
+        "$script:windowStart = [DateTime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)",
+        "$f = Get-LedgerFinding",
+        "Write-Output ('{0}|{1}|{2}' -f ($null -eq $f), $script:ledgerFailed, $script:ledgerOffset)",
+    ]), module=False)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.strip() == "True|True|0", out.stdout + out.stderr
+
+
+def test_r10_B5_sibling_the_evaluator_reads_a_whitespace_heavy_ledger_field_as_unknown_not_an_eval_error(tmp_path):
+    win, hs = build_window(tmp_path, "r10evalws")
+    with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
+        fh.write(json.dumps({"at": " " * 64, "event": "reaped", "kind": "held", "ticket": "t030", "pid": 1}) + "\n")
+    v, _ = evaluate(tmp_path, "r10evalws", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "unknown evidence" in v["reason"], v

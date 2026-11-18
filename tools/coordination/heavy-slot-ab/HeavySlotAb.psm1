@@ -202,7 +202,13 @@ function Read-HeavySlotAbRow {
             'array' { if ($raw -is [array]) { $val = @($raw); $good = $true } }
             default { throw "Read-HeavySlotAbRow: unknown kind '$kind' for $name" }
         }
-        if (-not $good) { return [pscustomobject]@{ ok = $false; why = ("{0} is not a valid {1} ({2})" -f $name, $k, ("$raw" -replace '\s+', ' ').Substring(0, [Math]::Min(40, ("$raw").Length))); v = $v } }
+        if (-not $good) {
+            # r9 B5: the length bound is taken from the NORMALIZED text. A value of 64 spaces normalizes to one character, and asking that
+            # one character for 40 threw out of the diagnostic after the caller had already consumed the row.
+            $shown = ("$raw" -replace '\s+', ' ')
+            $shown = $shown.Substring(0, [Math]::Min(40, $shown.Length))
+            return [pscustomobject]@{ ok = $false; why = ("{0} is not a valid {1} ({2})" -f $name, $k, $shown); v = $v }
+        }
         $v[$name] = $val
     }
     return [pscustomobject]@{ ok = $true; why = ''; v = $v }
@@ -224,11 +230,21 @@ function Step-HeavySlotAbWatermark {
     #   - the read's newest row is older than the watermark (the stream was rewritten or the clock stepped back).
     # Otherwise the rows newer than the watermark are the NEW rows (their indexes in NewIndex) and the watermark moves to the read's
     # maximum. There is no tolerance: hiding even one hot row behind a future-dated cool one is the defect (adversary pass 6 A2).
-    param([AllowEmptyCollection()][DateTime[]]$Times, $Watermark)
+    #
+    # r9 B2 (continuity): with -Keys (one identity string per row, Get-HeavySlotAbFeedRowKey) and -Seen (a HashSet[string] of every row
+    # identity accepted so far) a row at or below the watermark must be one this stream ALREADY delivered. A replaced or truncated feed
+    # that carries a never-seen row below the watermark (a hot row dated T-10 after T was accepted) cannot be told apart from the old
+    # stream, so the read is refused (Regressed) instead of dropping the row. On success the identities of the whole read join -Seen.
+    param([AllowEmptyCollection()][DateTime[]]$Times, $Watermark, [string[]]$Keys = $null, $Seen = $null)
     $new = New-Object System.Collections.Generic.List[int]
     $max = $null
+    $track = ($null -ne $Keys -and $null -ne $Seen)
+    if ($track -and $Keys.Count -ne $Times.Count) { return [pscustomobject]@{ Regressed = $true; Why = 'the row identities do not match the row times'; NewIndex = @(); Watermark = $Watermark } }
     for ($i = 0; $i -lt $Times.Count; $i++) {
         $t = $Times[$i]
+        if ($track -and $null -ne $Watermark -and $t -le $Watermark -and -not $Seen.Contains($Keys[$i])) {
+            return [pscustomobject]@{ Regressed = $true; Why = ('row {0} ({1:o}) is at or below the accepted watermark ({2:o}) and was never delivered before: the feed was replaced or truncated' -f $i, $t, $Watermark); NewIndex = @(); Watermark = $Watermark }
+        }
         if ($null -ne $max -and $t -lt $max) {
             return [pscustomobject]@{ Regressed = $true; Why = ('row {0} ({1:o}) is older than an earlier row of the same read ({2:o})' -f $i, $t, $max); NewIndex = @(); Watermark = $Watermark }
         }
@@ -239,7 +255,33 @@ function Step-HeavySlotAbWatermark {
         return [pscustomobject]@{ Regressed = $true; Why = ('the newest row ({0:o}) is older than the newest row already accepted ({1:o})' -f $max, $Watermark); NewIndex = @(); Watermark = $Watermark }
     }
     $wm = if ($null -eq $Watermark -or ($null -ne $max -and $max -gt $Watermark)) { $max } else { $Watermark }
+    if ($track) { foreach ($k0 in $Keys) { [void]$Seen.Add($k0) } }
     return [pscustomobject]@{ Regressed = $false; Why = ''; NewIndex = $new.ToArray(); Watermark = $wm }
+}
+
+function Get-HeavySlotAbFeedRowKey {
+    # The identity of one feed row for the continuity check above: its instant (ticks) and its temperature as read.
+    param([Parameter(Mandatory = $true)]$Row)
+    return ('{0}|{1}' -f $Row.utc.Ticks, ([double]$Row.temp).ToString('R', [Globalization.CultureInfo]::InvariantCulture))
+}
+
+function Get-HeavySlotAbRowHolders {
+    # r9 B1: how many holders a feed row may be credited with. Holders are SAMPLED at polls, so a row is credited only when it lies in the
+    # interval the two bracketing polls observed: it is not older than the previous poll minus one poll interval (-LeadSeconds, the
+    # feed's own write lag). With no previous poll there is no observed interval at all, so the FIRST read credits nothing: heat that was
+    # already in the feed's tail before the window began is not an overlap anybody observed, and 15 minutes of old 91 C rows must never
+    # read as 15 minutes of two-holder heat. Otherwise the credit is the smaller of the two bracketing counts (adversary r1 A7).
+    param($PrevPollUtc, $PrevHolders, [Parameter(Mandatory = $true)][int]$Holders, [Parameter(Mandatory = $true)][DateTime]$RowUtc, [double]$LeadSeconds = 0)
+    if ($null -eq $PrevPollUtc -or $null -eq $PrevHolders) { return 0 }
+    if ($RowUtc -lt ([DateTime]$PrevPollUtc).AddSeconds(-$LeadSeconds)) { return 0 }
+    return [Math]::Min([int]$PrevHolders, $Holders)
+}
+
+function Test-HeavySlotAbReceiptOwed {
+    # r9 B4: a window that touched the switch and reached ANY outcome owes a persisted receipt. The test is the outcome and the touch,
+    # never the existence of the destination directory: a directory that vanished makes the write FAIL (exit 5), it does not excuse it.
+    param($Final, [bool]$SwitchTouched)
+    return ($null -ne $Final -and $SwitchTouched)
 }
 
 function Test-HeavySlotAbRetryMayStart {
@@ -250,4 +292,4 @@ function Test-HeavySlotAbRetryMayStart {
     return ($Now.AddMilliseconds($MaxJitterMs) -lt $GiveUp)
 }
 
-Export-ModuleMember -Function Get-HeavySlotAbStatus, Get-HeavySlotAbCount, Resolve-HeavySlotAbRealPath, Test-HeavySlotAbWriteAlias, Write-HeavySlotAbFile, Open-HeavySlotAbLockFile, ConvertTo-HeavySlotAbUtc, Read-HeavySlotAbRow, Test-HeavySlotAbDuplicate, Step-HeavySlotAbWatermark, Test-HeavySlotAbRetryMayStart
+Export-ModuleMember -Function Get-HeavySlotAbStatus, Get-HeavySlotAbCount, Resolve-HeavySlotAbRealPath, Test-HeavySlotAbWriteAlias, Write-HeavySlotAbFile, Open-HeavySlotAbLockFile, ConvertTo-HeavySlotAbUtc, Read-HeavySlotAbRow, Test-HeavySlotAbDuplicate, Step-HeavySlotAbWatermark, Test-HeavySlotAbRetryMayStart, Get-HeavySlotAbFeedRowKey, Get-HeavySlotAbRowHolders, Test-HeavySlotAbReceiptOwed
