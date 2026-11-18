@@ -14,7 +14,7 @@
     "maxFrames": 360,
     "receipt": "look-receipts/export-owner-hq-nodualiso.marxml",
     "receiptSha256": "dae9d07942133a614939ff4b4d63b7cb62605d9b420804e1d7d6b5a923f6aff9",
-    "dualIsoExpected": false
+    "dualIsoExpected": true
   },
   "criteria": {
     "acceptance": {

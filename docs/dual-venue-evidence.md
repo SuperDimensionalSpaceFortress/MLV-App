@@ -418,7 +418,13 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   floor (the job applies `gui-smoke-length-gate.ps1` with `-ClipOnly`), and `maxFrames` is the measured window. The clip must hold at least `maxFrames`.
   The batch receipt (`look-receipts/export-owner-hq-*.marxml`) is read from the committed blob and must hash to `receiptSha256`, both at generation and
   in the job.
-* **Shipped legs**: `m16-1243-export-{cdng-lossless,prores}` (dual-ISO, 480 frames) and `m16-1456-export-{cdng-lossless,prores}` (no dual-ISO, 360 frames).
+* **Shipped legs**: `m16-1243-export-{cdng-lossless,prores}` (dual-ISO, 480 frames) and `m16-1456-export-{cdng-lossless,prores}` (dual-ISO, 360 frames).
+  r11 (fable r9 B1(a)): M16-1456 is declared dual-ISO because that is its measured class: the three Bachelor CDNG receipts of the first declaration (f23fa981, 1e9153b6, 01905cfe)
+  each ran dual-ISO processing on 360 of 360 frames and ended INVALID `CLIP_CLASS_MISMATCH`. The likely cause is `src/batch/ReceiptApplier.cpp:326-339`: with no
+  `dualIsoAutoCorrected` mark, the batch turns dual-ISO on when the clip's own two ISO levels differ, whatever the receipt asked for, so the `nodualiso` receipt
+  (still the one these legs run; its hash is unchanged) does not make the export a no-dual-ISO one. There is therefore no non-dual-ISO export share in this set yet
+  (OPEN `EXPORT-NODUALISO-CLIP-CLASS-1`: a clip that really is no dual-ISO, or a receipt the batch honours as no dual-ISO, needs a venue proof). `test_dual_venue_export_leg.py`
+  pins each export leg's declared class against `KNOWN_CLIP_DUAL_ISO_CLASS`, the table of the clips' measured classes.
   Plan cells are `cpu-export-<format>`, so both formats of one clip can share a leg set.
 * **The job**:
   1. Verifies the staged build against the build manifest, and the owner parts by length and then by identity hash through private neutral-named views.

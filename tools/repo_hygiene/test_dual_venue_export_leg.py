@@ -40,6 +40,9 @@ EXPORT_LEGS = ("m16-1243-export-cdng-lossless", "m16-1243-export-prores", "m16-1
 RECEIPTS = {"dualiso": "look-receipts/export-owner-hq-dualiso.marxml", "nodualiso": "look-receipts/export-owner-hq-nodualiso.marxml"}
 EXPORT_JOB = ROOT / "tools" / "profiling" / "bachelor" / "export-stage-job.ps1"
 BUILD_ID = "e" * 40
+# r11 (fable r9 B1(a)): the measured dual-ISO class of each clip an export leg ships on. M16-1243: 480 of 480 frames ran dual-ISO (receipts 638671c5, 0fc26d37, 2fcd3cf4, 64185ab8, dbd2fc28).
+# M16-1456: 360 of 360 frames ran dual-ISO on the three Bachelor receipts f23fa981, 1e9153b6, 01905cfe (each INVALID CLIP_CLASS_MISMATCH against the first declaration, false).
+KNOWN_CLIP_DUAL_ISO_CLASS = {"M16-1243": True, "M16-1456": True}
 
 
 def leg(name: str) -> dict:
@@ -62,7 +65,7 @@ def cdng_profile(frames: int, dual_iso_ms: float = 30.0, success: bool = True, b
         stage["llrawproc_dual_iso_ms"] = dual_iso_ms
         stage["llrawproc_ms"] = 40.0   # r8: the llrawproc total contains its llrawproc_* children (the 30 ms dual-ISO one included)
         stage["dng_compress_encode_ms"] = 10.0
-        stage["producer_frame_ms"] = 50.0 + (i % 3)
+        stage["producer_frame_ms"] = 62.0 + (i % 3)   # r11: the 19 producer stages below total 60 ms, so producer_frame (which contains them all) is at least that
         row = {"clip": "view-0", "frame_index": i, "raw_input_state": "x", "raw_output_state": "y", "success": success and i >= failed}
         row.update(stage)
         rows.append(row)
@@ -153,7 +156,12 @@ class ExportLegSchemaTests(unittest.TestCase):
         self.assertEqual([(leg(n)["clipId"], leg(n)["playSeconds"], leg(n)["export"]["maxFrames"], leg(n)["export"]["dualIsoExpected"], leg(n)["export"]["format"])
                           for n in EXPORT_LEGS],
                          [("M16-1243", 20, 480, True, "cdng-lossless"), ("M16-1243", 20, 480, True, "prores"),
-                          ("M16-1456", 10, 360, False, "cdng-lossless"), ("M16-1456", 10, 360, False, "prores")])
+                          ("M16-1456", 10, 360, True, "cdng-lossless"), ("M16-1456", 10, 360, True, "prores")])
+        # r11 (fable r9 B1(a)): each leg's declared class is the clip's MEASURED class, never a per-leg guess: one table, every export leg against it
+        for name in EXPORT_LEGS:
+            spec = leg(name)
+            self.assertIn(spec["clipId"], KNOWN_CLIP_DUAL_ISO_CLASS, f"{name}: no measured dual-ISO class for {spec['clipId']}; measure it before shipping a leg")
+            self.assertIs(spec["export"]["dualIsoExpected"], KNOWN_CLIP_DUAL_ISO_CLASS[spec["clipId"]], f"{name}: declared class differs from the clip's measured class")
         self.assertEqual(leg(EXPORT_LEGS[0])["export"]["receipt"], RECEIPTS["dualiso"])
         self.assertEqual(leg(EXPORT_LEGS[2])["export"]["receipt"], RECEIPTS["nodualiso"])
 
@@ -308,7 +316,7 @@ class ExportEvidenceTests(unittest.TestCase):
         st = happy["stages"]
         self.assertEqual(st["denominator"], "producer_frame_ms")
         self.assertAlmostEqual(st["rows"]["raw_read"]["medianMs"], 4.0)
-        self.assertAlmostEqual(st["rows"]["raw_read"]["share"], 4.0 / 51.0, places=4)
+        self.assertAlmostEqual(st["rows"]["raw_read"]["share"], 4.0 / 63.0, places=4)   # (producer_frame mean: 62 + the 0 / 1 / 2 cycle)
         self.assertAlmostEqual(st["rows"]["llrawproc_dual_iso"]["meanMs"], 30.0)
         self.assertIn("disk_write", st["writerRows"])
         self.assertNotIn("disk_write", st["rows"])
@@ -690,6 +698,59 @@ class ExportEvidenceTests(unittest.TestCase):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 self.assertTrue(got[i]["problems"], got[i])
+
+    def test_r11_stage_evidence_is_held_inside_the_batch_elapsed_for_both_formats(self) -> None:
+        """EXPORT-VENUE-LEG-1 r11 (sol r9 B2 (a)): a batch DONE elapsed shorter than the per-frame work the stage evidence measured is INVALID EXPORT_STAGE_CONTAINMENT_MISMATCH, for
+        ProRes (processed16_total) and CDNG (producer_frame): elapsed=0.0 and 0.1 beside 480 frames used to PASS with a negative untimedPerFrameMs and an inflated exportFps. The control
+        (elapsed=60.0) and the real-shaped tolerance (a few percent under, one decimal of logging) still PASS, and a slightly negative residual is reported as 0, never negative."""
+        legs = {fmt: leg(name) for fmt, name in (("prores", "m16-1243-export-prores"), ("cdng-lossless", "m16-1243-export-cdng-lossless"))}
+        shipped = {fmt: spec["criteria"]["acceptance"]["cpu"] for fmt, spec in legs.items()}
+        frames = 480
+
+        def case(fmt: str, elapsed: float, n: int = frames) -> dict:
+            if fmt == "prores":
+                return prores_case(maxFrames=n, stage=stage_log(n), batch=batch_log(n, verified=n, elapsed=elapsed), manifest=output_manifest(1, "mov"), criteria=shipped[fmt])
+            return cdng_case(maxFrames=n, profile=cdng_profile(n), batch=batch_log(n, elapsed=elapsed), manifest=output_manifest(n), criteria=shipped[fmt])
+        cases = [case(f, e) for f in ("prores", "cdng-lossless") for e in (0.0, 0.1, 60.0)]
+        # tolerance: 30 frames of 56 ms is 1.68 s of work; an elapsed of 1.6 s is 5 % under (one decimal of logging, a clock's rounding), not a contradiction
+        cases.append(prores_case(maxFrames=30, stage=stage_log(30), batch=batch_log(30, verified=30, elapsed=1.6)))
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for (fmt, elapsed), g in zip([(f, e) for f in ("prores", "cdng-lossless") for e in (0.0, 0.1, 60.0)], got):
+            with self.subTest(fmt=fmt, elapsed=elapsed):
+                if elapsed == 60.0:
+                    self.assertEqual(g["outcome"], "PASS", g)
+                    self.assertFalse(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in g["problems"]), g)
+                else:
+                    self.assertEqual(g["outcome"], "INVALID", g)
+                    self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "batch_wall_per_frame" in p for p in g["problems"]), g)
+        near = got[-1]
+        self.assertEqual(near["outcome"], "PASS", near)
+        self.assertGreaterEqual(near["stages"]["untimedPerFrameMs"], 0.0, "a residual the logging precision made slightly negative is 0, never a negative stage")
+
+    def test_r11_cdng_disjoint_producer_stages_and_llrawproc_children_are_held_together_inside_their_parents(self) -> None:
+        """EXPORT-VENUE-LEG-1 r11 (fable r9 B2 / (b)): the CDNG reader held each producer stage below producer_frame but never their SUM: 40 + 30 + 30 + 40 ms of disjoint stages inside a
+        41 ms producer_frame read PASS. The producer stages (the disjoint partition of producer_frame) and the llrawproc_* children (the partition of llrawproc) are each held together."""
+        def profile(set_rows: dict) -> str:
+            doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+            for r in doc["frames"]:
+                for k in CDNG_STAGES:
+                    if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                        r[k] = 0.0
+                r.update(set_rows)
+            return json.dumps(doc)
+        producer_sum = profile({"raw_read_ms": 40.0, "raw_decode_ms": 30.0, "dng_pack_ms": 30.0, "payload_clone_ms": 40.0, "producer_frame_ms": 41.0})
+        children_sum = profile({"llrawproc_dark_frame_ms": 40.0, "llrawproc_vertical_stripes_ms": 30.0, "llrawproc_focus_pixels_ms": 30.0, "llrawproc_ms": 41.0, "producer_frame_ms": 200.0})
+        control = profile({"raw_read_ms": 10.0, "raw_decode_ms": 10.0, "dng_pack_ms": 10.0, "payload_clone_ms": 10.0, "llrawproc_dark_frame_ms": 5.0, "llrawproc_vertical_stripes_ms": 5.0,
+                           "llrawproc_ms": 10.0, "producer_frame_ms": 60.0})
+        cases = [cdng_case(dualIsoExpected=False, profile=p, criteria=[]) for p in (producer_sum, children_sum, control)]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i, inside in ((0, "producer_frame"), (1, "llrawproc")):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and f"inside {inside} mean" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual(got[2]["outcome"], "PASS", got[2])
 
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string

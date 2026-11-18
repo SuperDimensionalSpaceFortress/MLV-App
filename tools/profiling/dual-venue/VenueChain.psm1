@@ -1680,7 +1680,8 @@ function Invoke-VenueBoundedProcess {
     .SYNOPSIS
     Run one child process and give up on it after -TimeoutSec (the child and its tree are killed). .exit is $null when it timed out.
     .OUTPUTS
-    [pscustomobject]@{ exit; timedOut; stdout; stderr }
+    [pscustomobject]@{ exit; timedOut; killConfirmed; stdout; stderr }. killConfirmed (EXPORT-VENUE-LEG-1 r11) is $true when the child exited on its own, or was killed and HasExited read true after the 15 s wait; a caller that
+    must not leave a child behind reads it.
     #>
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec)
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
@@ -1692,7 +1693,7 @@ function Invoke-VenueBoundedProcess {
     $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
     if ($timedOut) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(15000) }
     [void]$outTask.Wait(15000); [void]$errTask.Wait(15000)
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { [bool]$p.HasExited } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 

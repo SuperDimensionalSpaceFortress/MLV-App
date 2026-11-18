@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -5723,6 +5724,85 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("-ExportBudgetScript is an offline test seam", r.stderr)
         self.assertEqual(self.kinds(), [])
+
+    def test_r11_export_a_budget_preflight_that_never_returns_is_killed_and_refused_before_the_claim_in_every_mode(self) -> None:
+        # EXPORT-VENUE-LEG-1 r11 (sol r9 B1, EXPORT-BUDGET-PREFLIGHT-CHILD-DEADLINE-1; fable H1 EXPORT-LEGSET-BUDGET-PREFLIGHT-TEST-1): the preflight child (the export generator's
+        # -PreflightBudgetOnly mode, which resolves the clip) was waited for with no deadline, so a hung resolver held the batch before any claim forever. It now runs as a bounded
+        # child (the room left before -DeadlineUtc, under a hard cap), is killed and confirmed dead on expiry, and the batch ends with the typed refusal before any claim or lease,
+        # in -LegSpec, -LegPlan and -LegSet. The stand-in sleeps forever and records its pid, so the test also proves the child did not outlive the batch.
+        pid_file = self.case / "budget-child.pid"
+        fake = self.case / "fake-export-budget-hang.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n"
+                        "while ($true) { Start-Sleep -Seconds 60 }\n", encoding="utf-8")
+        shipped = (DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8")
+        spec = self.case / "export-hang.json"
+        spec.write_text(shipped, encoding="utf-8")
+        shipped_doc = json.loads(shipped)
+        legset_name = f"zz-r11-budget-hang-{uuid.uuid4().hex[:8]}"
+        legset_path = DV / "legsets" / f"{legset_name}.json"
+        short = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30))
+        # the plan and set forms spend their preamble (module import, spec predicates) before the preflight on a loaded host: more room, so the child is started and then bound by it
+        longer = lambda: utc_iso(datetime.now(timezone.utc) + timedelta(seconds=100))  # noqa: E731
+
+        def assert_child_gone(mode: str, r: subprocess.CompletedProcess) -> None:
+            self.assertTrue(pid_file.exists(), f"{mode}: the stand-in never started, so the kill path was not exercised: {r.stderr}")
+            pid = pid_file.read_text(encoding="utf-8").strip().lstrip("﻿")
+            alive = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=60).stdout
+            self.assertNotRegex(alive, rf"\b{re.escape(pid)}\b", f"{mode}: the hung preflight child {pid} was left running")
+
+        def assert_nothing_started(mode: str, r: subprocess.CompletedProcess) -> None:
+            self.assertEqual(r.returncode, 2, f"{mode}: " + r.stdout + r.stderr)
+            self.assertIn("EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr, f"{mode}: " + r.stdout + r.stderr)
+            self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted: no open, no probe, no leg")
+            self.assertFalse(self.claim_path.exists(), f"{mode}: no claim was written")
+            self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: no lease was opened")
+            assert_child_gone(mode, r)
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, pid_file):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+
+        reset()
+        t0 = time.monotonic()
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", short, FAKE_BUDGET_PID_FILE=str(pid_file))
+        assert_nothing_started("-LegSpec", r)
+        self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        self.assertLess(time.monotonic() - t0, 60, "the preflight was bounded by the room before -DeadlineUtc, not by the child")
+        reset()
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-DeadlineUtc", longer(), FAKE_BUDGET_PID_FILE=str(pid_file))
+        assert_nothing_started("-LegPlan", r)
+        self.assertIn("LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 ", r.stderr)
+        # -LegSet: a set under legsets/ naming the shipped export leg (the real legsets/ directory is the only place the batch reads one; removed in the finally)
+        legset_path.write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": legset_name, "card": shipped_doc["card"], "clipId": shipped_doc["clipId"],
+                                           "description": "r11 test stand-in, removed by the test", "legs": ["legs/m16-1243-export-prores.json"]}), encoding="utf-8")
+        try:
+            reset()
+            args, e = self.batch_cmd([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", longer(), FAKE_BUDGET_PID_FILE=str(pid_file))
+            args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", legset_name]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            assert_nothing_started("-LegSet", r)
+            self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        finally:
+            legset_path.unlink(missing_ok=True)
+
+    def test_r11_export_a_budget_preflight_with_no_room_before_the_deadline_never_starts_the_child(self) -> None:
+        # the same class from the other side: with no room left before -DeadlineUtc the child is not started at all (no process to leave behind), and the refusal is the same typed one
+        pid_file = self.case / "budget-child-noroom.pid"
+        fake = self.case / "fake-export-budget-noroom.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        spec = self.case / "export-noroom.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        for p in (self.events, self.claim_path, pid_file):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1)), FAKE_BUDGET_PID_FILE=str(pid_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
+        self.assertEqual(self.kinds(), [])
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
 
     def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
         # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
