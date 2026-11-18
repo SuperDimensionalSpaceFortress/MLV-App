@@ -147,7 +147,22 @@ TEST(SmokeWindowToggleScheduleWiring, TheToggleBlockNeverStartsOrStopsPlayAndNev
     ASSERT_FALSE(block.contains(QStringLiteral("msleep")));
     ASSERT_FALSE(block.contains(QStringLiteral("QEventLoop")));
     ASSERT_FALSE(block.contains(QStringLiteral("processEvents")));
-    // at most one phase per loop turn (adversary A6 on ead7bbdb): the begin gates (previous not ended, not yet due), the settled end and the
-    // not-yet-settled wait each leave the turn with a break, so an overdue next toggle begins on the next turn
-    ASSERT_TRUE(block.count(QStringLiteral("break;")) >= 4);
+    // at most one phase per call (adversary A6 on ead7bbdb): the begin gates (previous not ended, not yet due), the settled end and the
+    // not-yet-settled wait each leave the call with a return, so an overdue next toggle begins on the next call
+    ASSERT_TRUE(block.count(QStringLiteral("return;")) >= 4);
+}
+
+TEST(SmokeWindowToggleScheduleWiring, TheStepperLivesOutsideTheMeasuredLoopWhichOnlyCallsIt)
+{
+    // The measured loop's wait-loop pin (app_play_scan.PINNED_WAIT_LOOPS) holds one break and no trigger call, so the stepper is a lambda defined
+    // before the loop and the loop body carries one call to it, ahead of the loop's single wait.
+    const QString body = mainWindowFunction(QStringLiteral("int MainWindow::runGuiPlaybackSmoke("));
+    ASSERT_FALSE(body.isEmpty());
+    const int loopAt = body.indexOf(QStringLiteral("for( ;; )"));
+    ASSERT_TRUE(loopAt > 0);
+    ASSERT_EQ(1, static_cast<int>(body.count(QStringLiteral("auto stepWindowToggles = [&]()"))));
+    ASSERT_TRUE(body.indexOf(QStringLiteral("auto stepWindowToggles = [&]()")) < loopAt);
+    ASSERT_EQ(1, static_cast<int>(body.count(QStringLiteral("stepWindowToggles();"))));
+    ASSERT_TRUE(body.indexOf(QStringLiteral("stepWindowToggles();")) > loopAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("stepWindowToggles();")) < body.indexOf(QStringLiteral("waitGuiThreadForSmokeEvents( 10 );")));
 }
