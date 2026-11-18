@@ -17,6 +17,12 @@
   nearest-rank (ceil(p/100 * n)-th smallest). From ab-samples, split by live holders (0, 1, 2+): temp_c_p95, temp_ge90_frac,
   freq_p50 under load (cpu >= 50 %), min free commit, minutes.
 
+  PER HOLD (hub ruling b): <WindowDir>\ab-holds.jsonl carries one row per live closed hold (wait_s, hold_s, the peak live-holder count over
+  its samples, hottest / mean package temp, median frequency) and the verdict's holds_by_holders splits them (per arm and overall) into
+  holders_1 (ran alone), holders_2_plus (overlapped) and holders_unknown (no sample). One directory is one window: a directory whose
+  blocks file holds two windows, or whose receipt names another window, is INCONCLUSIVE; samples outside the window are ignored; an exit
+  that landed after window end + grace is a dead holder; a System Event 2004 count that cannot be read is never read as zero.
+
   VERDICT (every threshold is printed in the json):
     ABORTED       carried through from ab-receipt.json state ABORTED (reason copied).
     INCONCLUSIVE  no receipt; fewer than 20 live closed tickets per arm; fewer than 10 builds per arm; fewer than 30 min of
@@ -86,12 +92,24 @@ function Get-Stat([double[]]$Waits, [double[]]$Holds) {
     }
 }
 
-$blocks = @(Read-JsonLines (Join-Path $WindowDir 'ab-blocks.jsonl'))
+function Write-EarlyVerdict([string]$Verdict, [string]$Reason) {
+    # A verdict that needs none of the analysis below (the directory cannot be read as ONE finished window).
+    $o = [ordered]@{ schema = 'heavy-slot-ab-verdict.v1'; verdict = $Verdict; reason = $Reason; evaluatedUtc = $Now.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', $inv) }
+    [IO.File]::WriteAllText((Join-Path $WindowDir 'ab-verdict.json'), (($o | ConvertTo-Json -Depth 4) + "`n"), $utf8)
+    Write-Output ("AB_VERDICT {0} reason={1}" -f $Verdict, $Reason)
+    exit 0
+}
+
+$blocksRaw = @(Read-JsonLines (Join-Path $WindowDir 'ab-blocks.jsonl'))
+# a block row is usable only when every field the evaluation reads parses (adversary r1 A10: a stray {} must not reach the date maths)
+$blocks = @($blocksRaw | Where-Object {
+        $null -ne $_ -and $null -ne $_.PSObject.Properties['block'] -and [string]$_.state -and $null -ne (ConvertTo-UtcTime $_.startUtc) -and $null -ne (ConvertTo-UtcTime $_.endUtc) -and
+        $null -ne (ConvertTo-UtcTime $_.windowStartUtc) -and $null -ne (ConvertTo-UtcTime $_.windowEndUtc) })
 $samples = @(Read-JsonLines (Join-Path $WindowDir 'ab-samples.jsonl'))
 $receiptPath = Join-Path $WindowDir 'ab-receipt.json'
 $driverReceipt = $null
 if (Test-Path -LiteralPath $receiptPath -PathType Leaf) { try { $driverReceipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json } catch { $driverReceipt = $null } }
-if ($blocks.Count -eq 0) { Write-Output 'AB_EVAL_NO_INPUT no ab-blocks.jsonl rows'; exit 2 }
+if ($blocks.Count -eq 0) { Write-Output 'AB_EVAL_NO_INPUT no usable ab-blocks.jsonl rows'; exit 2 }
 if ($WaitForGrace -and $driverReceipt) {
     # The hub arms this from the receipt, i.e. at window end. A ticket still running then must be able to close (and a dead holder be
     # told from a slow one) before anything is judged, so wait here for window end + the grace, then re-read the clock.
@@ -103,12 +121,22 @@ if ($WaitForGrace -and $driverReceipt) {
     }
 }
 
+# ONE directory = ONE window (the driver refuses to reuse a directory; this is the same rule on the reading side, adversary r1 A1)
+$windowStarts = @($blocks | ForEach-Object { (ConvertTo-UtcTime $_.windowStartUtc).Ticks } | Sort-Object -Unique)
+if ($windowStarts.Count -gt 1) {
+    Write-EarlyVerdict 'INCONCLUSIVE' ("ab-blocks.jsonl holds {0} windows (windowStartUtc {1}): the append-only streams must not be blended, evaluate one window per directory" -f $windowStarts.Count, ((@($windowStarts | ForEach-Object { ([DateTime]::new([long]$_, [DateTimeKind]::Utc)).ToString('yyyy-MM-ddTHH:mm:ssZ', $inv) })) -join ', '))
+}
 $winStart = ConvertTo-UtcTime $blocks[0].windowStartUtc
+if ($driverReceipt -and $driverReceipt.windowStartUtc -and (ConvertTo-UtcTime $driverReceipt.windowStartUtc).Ticks -ne $winStart.Ticks) {
+    Write-EarlyVerdict 'INCONCLUSIVE' ("ab-receipt.json belongs to another window (receipt windowStartUtc {0}, blocks windowStartUtc {1})" -f $driverReceipt.windowStartUtc, $winStart.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', $inv))
+}
 $winPlannedEnd = ConvertTo-UtcTime $blocks[0].windowEndUtc
 $winEnd = $null
 if ($driverReceipt) { $winEnd = ConvertTo-UtcTime $driverReceipt.endedUtc }
 if (-not $winEnd -and $samples.Count -gt 0) { $winEnd = ConvertTo-UtcTime $samples[-1].utc }
 if (-not $winEnd) { $winEnd = $winPlannedEnd }
+# only this window's samples (a stray row from outside it never reaches the split)
+$samples = @($samples | Where-Object { $t0 = ConvertTo-UtcTime $_.utc; $null -ne $t0 -and $t0 -ge $winStart -and $t0 -le $winEnd })
 $blockList = @(foreach ($b in $blocks) { [pscustomobject]@{ index = [int]$b.block; state = [string]$b.state; start = (ConvertTo-UtcTime $b.startUtc); end = (ConvertTo-UtcTime $b.endUtc) } })
 function Get-BlockOf($t) {
     if ($null -eq $t -or $t -lt $winStart -or $t -ge $winEnd) { return $null }
@@ -138,7 +166,8 @@ $dead = @{}
 $pending = @{}
 foreach ($a in $admits.ToArray()) {
     $t = $a.ticket
-    $hasExit = ($exited.ContainsKey($t) -or $toolExit.ContainsKey($t))
+    # an exit only counts when it landed BY window end + grace; a later one is still a dead (or far too slow) holder (adversary r1 A2)
+    $hasExit = (($exited.ContainsKey($t) -and $exited[$t] -le $deadline) -or ($toolExit.ContainsKey($t) -and $null -ne (ConvertTo-UtcTime $toolExit[$t].at) -and (ConvertTo-UtcTime $toolExit[$t].at) -le $deadline))
     if ($reapedHeld.ContainsKey($t)) { $dead[$t] = $a.label; continue }
     if ($hasExit) { continue }
     if ($evaluatedEarly) { $pending[$t] = $a.label } else { $dead[$t] = $a.label }
@@ -168,6 +197,7 @@ $timedOut = @{ A = 0; B = 0 }
 $bPytestCount2 = 0
 $bPytestN = 0
 $holdCrossEdge = 0
+$holds = New-Object System.Collections.Generic.List[object]
 foreach ($k in $tickets.ToArray()) {
     if ($dead.ContainsKey($k.ticket)) { $excludedDead++; continue }
     if ($pending.ContainsKey($k.ticket)) { $excludedPending++; continue }
@@ -184,6 +214,7 @@ foreach ($k in $tickets.ToArray()) {
         if (-not $bf -or $bf.index -ne $be.index) { $holdCrossEdge++ }
         $arm[$be.state].all.w += $wait; $arm[$be.state].all.h += $hold
         if ($c -ne 'other') { $arm[$be.state][$c].w += $wait; $arm[$be.state][$c].h += $hold }
+        $holds.Add([pscustomobject]@{ ticket = $k.ticket; label = $k.label; cls = $c; arm = $be.state; block = $be.index; wait = $wait; hold = $hold; adm = $k.adm; fin = $k.fin })
         if ($be.state -eq 'B' -and $c -eq 'pytest') { $bPytestN++; if ([string]$k.slotCount -eq '2') { $bPytestCount2++ } }
     }
     elseif ($toolExit.ContainsKey($k.ticket) -and [string]$toolExit[$k.ticket].code -eq '75') {
@@ -205,8 +236,62 @@ foreach ($s in 'A', 'B') {
     }
 }
 
-# ---- samples, split by live holders --------------------------------------------------------------------------------------------
+# ---- per hold: wait, frequency and temperature logged for EACH hold and split by the live holders it ran beside (hub ruling b) --------
+# For every live closed hold: the peak live-holder count over its samples ([admit, finish]; with none inside, the first sample at or
+# after admit within two polls, else the last one before), the hottest and mean package temp and the median frequency over those samples.
+# holders_peak >= 2 means the hold overlapped another; <= 1 means it ran alone. ab-holds.jsonl carries one row per hold (adversary r1 A6).
 $pollGuess = if ($driverReceipt -and $driverReceipt.pollSeconds) { [double]$driverReceipt.pollSeconds } else { 15.0 }
+$sampRows = @(foreach ($sm in $samples) { [pscustomobject]@{ t = (ConvertTo-UtcTime $sm.utc).Ticks; holders = [int]$sm.holders; temp = $sm.temp_c; freq = $sm.freq_mhz } })
+$sampRows = @($sampRows | Sort-Object t)
+$sTicks = [long[]]@($sampRows | ForEach-Object { $_.t })
+$holdRows = New-Object System.Collections.Generic.List[object]
+foreach ($h0 in $holds.ToArray()) {
+    $picked = New-Object System.Collections.Generic.List[object]
+    $nearest = $false
+    if ($sTicks.Length -gt 0) {
+        $lo = [Array]::BinarySearch($sTicks, [long]$h0.adm.Ticks); if ($lo -lt 0) { $lo = -bnot $lo }
+        for ($ix = $lo; $ix -lt $sTicks.Length -and $sTicks[$ix] -le $h0.fin.Ticks; $ix++) { $picked.Add($sampRows[$ix]) }
+        if ($picked.Count -eq 0) {
+            $nearest = $true
+            if ($lo -lt $sTicks.Length -and ($sTicks[$lo] - $h0.adm.Ticks) -le [long](2 * $pollGuess * 1e7)) { $picked.Add($sampRows[$lo]) }
+            elseif ($lo -gt 0) { $picked.Add($sampRows[$lo - 1]) }
+        }
+    }
+    $pr = $picked.ToArray()
+    $temps0 = @($pr | Where-Object { $null -ne $_.temp } | ForEach-Object { [double]$_.temp })
+    $freqs0 = @($pr | Where-Object { $null -ne $_.freq } | ForEach-Object { [double]$_.freq })
+    $peak = if ($pr.Count -gt 0) { ($pr | Measure-Object -Property holders -Maximum).Maximum } else { $null }
+    $holdRows.Add([pscustomobject][ordered]@{
+            ticket = $h0.ticket; label = $h0.label; class = $h0.cls; arm = $h0.arm; block = $h0.block
+            wait_s = [Math]::Round($h0.wait, 3); hold_s = [Math]::Round($h0.hold, 3); holders_peak = $peak
+            temp_c_max = $(if ($temps0.Count -gt 0) { ($temps0 | Measure-Object -Maximum).Maximum } else { $null })
+            temp_c_mean = $(if ($temps0.Count -gt 0) { [Math]::Round(($temps0 | Measure-Object -Average).Average, 2) } else { $null })
+            freq_mhz_p50 = (Get-Pct $freqs0 50); samples_in_hold = $pr.Count; nearest_sample = $nearest
+        })
+}
+[IO.File]::WriteAllText((Join-Path $WindowDir 'ab-holds.jsonl'), ((@($holdRows.ToArray() | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`n") + "`n"), $utf8)
+function Get-CohortStat($Rows) {
+    $r = @($Rows)
+    return [ordered]@{
+        n = $r.Count
+        wait_s_p50 = (Get-Pct @($r | ForEach-Object { [double]$_.wait_s }) 50); wait_s_p90 = (Get-Pct @($r | ForEach-Object { [double]$_.wait_s }) 90); wait_s_p99 = (Get-Pct @($r | ForEach-Object { [double]$_.wait_s }) 99)
+        hold_s_p50 = (Get-Pct @($r | ForEach-Object { [double]$_.hold_s }) 50)
+        hold_temp_c_max_p95 = (Get-Pct @($r | Where-Object { $null -ne $_.temp_c_max } | ForEach-Object { [double]$_.temp_c_max }) 95)
+        hold_freq_mhz_p50 = (Get-Pct @($r | Where-Object { $null -ne $_.freq_mhz_p50 } | ForEach-Object { [double]$_.freq_mhz_p50 }) 50)
+    }
+}
+$holdsAll = $holdRows.ToArray()
+$holdsByHolders = [ordered]@{}
+foreach ($grp in 'A', 'B', 'all') {
+    $inGrp = @($holdsAll | Where-Object { $grp -eq 'all' -or $_.arm -eq $grp })
+    $holdsByHolders[$grp] = [ordered]@{
+        holders_1 = (Get-CohortStat @($inGrp | Where-Object { $null -ne $_.holders_peak -and $_.holders_peak -le 1 }))
+        holders_2_plus = (Get-CohortStat @($inGrp | Where-Object { $null -ne $_.holders_peak -and $_.holders_peak -ge 2 }))
+        holders_unknown = (Get-CohortStat @($inGrp | Where-Object { $null -eq $_.holders_peak }))
+    }
+}
+
+# ---- samples, split by live holders --------------------------------------------------------------------------------------------
 $groups = @{ '0' = New-Object System.Collections.Generic.List[object]; '1' = New-Object System.Collections.Generic.List[object]; '2' = New-Object System.Collections.Generic.List[object] }
 $allB = New-Object System.Collections.Generic.List[object]
 for ($i = 0; $i -lt $samples.Count; $i++) {
@@ -243,10 +328,15 @@ $cB = @(Get-Nums $allB.ToArray() 'commit')
 if ($cB.Count -gt 0) { $minCommitB = ($cB | Measure-Object -Minimum).Minimum }
 
 # ---- Event 2004 -----------------------------------------------------------------------------------------------------------------
-$ev = 0
-if ($EventProbeFile) { try { $ev = [int](Get-Content -LiteralPath $EventProbeFile -Raw).Trim() } catch { $ev = 0 } }
+# $null = the count could not be read (an unreadable probe, a log query that failed): never read as zero (adversary r1 A3). "No such
+# events" is a real zero (Get-WinEvent reports NoMatchingEventsFound).
+$ev = $null
+if ($EventProbeFile) {
+    try { $n0 = 0; if ([int]::TryParse(([IO.File]::ReadAllText($EventProbeFile)).Trim(), [ref]$n0) -and $n0 -ge 0) { $ev = $n0 } } catch { $ev = $null }
+}
 else {
-    try { $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 2004; StartTime = $winStart.ToLocalTime(); EndTime = $winEnd.ToLocalTime() } -MaxEvents 5 -ErrorAction SilentlyContinue).Count } catch { $ev = 0 }
+    try { $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 2004; StartTime = $winStart.ToLocalTime(); EndTime = $winEnd.ToLocalTime() } -MaxEvents 5 -ErrorAction Stop).Count }
+    catch { if ([string]$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $ev = 0 } else { $ev = $null } }
 }
 
 # ---- verdict ----------------------------------------------------------------------------------------------------------------------
@@ -271,6 +361,7 @@ else {
     if ([double]$sampleStats['2'].minutes -lt $MinHolders2Minutes) { $inconclusive.Add("holders>=2 time $($sampleStats['2'].minutes) min (need $MinHolders2Minutes)") }
     if ($null -ne $A.overall.wait_s_p90 -and [double]$A.overall.wait_s_p90 -eq 0) { $inconclusive.Add('A arm shows no queueing (wait_p90 = 0), nothing to reduce') }
     if ($null -eq $sampleStats['2'].freq_p50_under_load -or $null -eq $sampleStats['1'].freq_p50_under_load) { $inconclusive.Add('no under-load frequency sample at holders=1 or holders>=2') }
+    if ($null -eq $ev) { $inconclusive.Add('the System Event 2004 count could not be read (event probe or log query failed), so "no Event 2004" cannot be shown') }
     if ($inconclusive.Count -gt 0) { $verdict = 'INCONCLUSIVE'; $reason = ($inconclusive -join '; ') }
     else {
         $aw = [double]$A.overall.wait_s_p90; $bw = [double]$B.overall.wait_s_p90
@@ -303,6 +394,8 @@ $out = [ordered]@{
     b_pytest = [ordered]@{ tickets = $bPytestN; ran_at_slotcount_2 = $bPytestCount2 }
     event_2004 = $ev
     arms = $armStats
+    holds_by_holders = $holdsByHolders
+    holds_log = 'ab-holds.jsonl'
     samples_by_live_holders = [ordered]@{ holders_0 = $sampleStats['0']; holders_1 = $sampleStats['1']; holders_2_plus = $sampleStats['2'] }
     min_free_commit_gb_in_b = $minCommitB
     checks = $checks.ToArray()

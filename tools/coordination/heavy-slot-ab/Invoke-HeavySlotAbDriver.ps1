@@ -28,7 +28,11 @@
   The revert is a REWRITE of the switch file; this script never removes it. Killing the process makes the reader answer 1
   at once (driver pid gone).
 
-  Exit: 0 DONE, 2 REFUSED, 3 ABORTED. ASCII-only on purpose.
+  Exit: 0 DONE, 2 REFUSED, 3 ABORTED, 4 the final revert could not be proven (receipt switchFinal REVERT_FAILED; the reader still
+  answers 1 once the process is gone). One window per directory: a -WindowDir that already holds ab-blocks.jsonl, ab-samples.jsonl or
+  ab-receipt.json is refused (window-dir-used). A System Event 2004 count that cannot be read twice in a row aborts the window
+  (event-2004-unreadable). Holders are exact (pid + start ticks) and a feed row counts as 2+ holders only when both bracketing polls saw 2+.
+  ASCII-only on purpose.
 #>
 [CmdletBinding()]
 param(
@@ -70,6 +74,15 @@ $samplesFile = Join-Path $WindowDir 'ab-samples.jsonl'
 $receiptFile = Join-Path $WindowDir 'ab-receipt.json'
 
 function Get-IsoUtc([DateTime]$t) { return $t.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', $inv) }
+
+function ConvertTo-UtcInstant($v) {
+    # ConvertFrom-Json already turns an ISO date string into a [DateTime] (UTC kind, whole ticks); a string is parsed as UTC. $null when
+    # it is neither. Never go through [string] of a DateTime: that drops the fraction and renders local time.
+    if ($null -eq $v -or "$v" -eq '') { return $null }
+    if ($v -is [DateTime]) { return $v.ToUniversalTime() }
+    if ($v -is [DateTimeOffset]) { return $v.UtcDateTime }
+    try { return [DateTimeOffset]::Parse([string]$v, $inv, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime } catch { return $null }
+}
 
 function Write-AtomicText([string]$Path, [string]$Text) {
     $tmp = '{0}.tmp-{1}' -f $Path, $PID
@@ -162,19 +175,30 @@ function Get-PerfProbe {
 }
 
 function Get-EventCount([DateTime]$SinceUtc) {
-    # System Event 2004 (resource exhaustion) rows since the window began.
+    # System Event 2004 (resource exhaustion) rows since the window began; $null when the count CANNOT be read. "No such events" is a
+    # real zero (Get-WinEvent says NoMatchingEventsFound); any other failure, an unreadable probe file or a probe that is not a
+    # whole number is unknown, never zero (adversary r1 A3).
     if ($EventProbeFile) {
-        try { return [int](Get-Content -LiteralPath $EventProbeFile -Raw).Trim() } catch { return 0 }
+        try {
+            $n = 0
+            if ([int]::TryParse(([IO.File]::ReadAllText($EventProbeFile)).Trim(), [ref]$n) -and $n -ge 0) { return $n }
+            return $null
+        }
+        catch { return $null }
     }
     try {
-        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 2004; StartTime = $SinceUtc.ToLocalTime() } -MaxEvents 5 -ErrorAction SilentlyContinue)
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 2004; StartTime = $SinceUtc.ToLocalTime() } -MaxEvents 5 -ErrorAction Stop)
         return $ev.Count
     }
-    catch { return 0 }
+    catch {
+        if ([string]$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { return 0 }
+        return $null
+    }
 }
 
 function Get-LiveHolders {
-    # Live holder records: a held\*.json whose pid is alive with the recorded start time (+-2 s). A holder whose record cannot be
+    # Live holder records: a held\*.json whose pid is alive with EXACTLY the recorded start time (100 ns ticks, the comparison heavy-slot
+    # itself makes for its queue records), so a reused pid never reads as a holder (adversary r1 A8). A holder whose record cannot be
     # judged counts as absent, so the figure can undercount (TRAPS.md:29367); it never invents a holder.
     $out = New-Object System.Collections.Generic.List[object]
     $dir = Join-Path $HeavySlotDir 'held'
@@ -183,8 +207,9 @@ function Get-LiveHolders {
         try {
             $h = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
             $p = Get-Process -Id ([int]$h.pid) -ErrorAction Stop
-            $rec = [DateTimeOffset]::Parse([string]$h.pidStart, $inv, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime
-            if ([Math]::Abs(($p.StartTime.ToUniversalTime() - $rec).TotalSeconds) -gt 2) { continue }
+            $rec = ConvertTo-UtcInstant $h.pidStart
+            if ($null -eq $rec) { continue }
+            if ($p.StartTime.ToUniversalTime().Ticks -ne $rec.Ticks) { continue }
             $out.Add([pscustomobject]@{ label = [string]$h.label; slots = @($h.slots); cls = [string]$h.class; whole = ($h.wholeMachine -eq $true) })
         }
         catch { continue }
@@ -202,7 +227,14 @@ function Set-Switch([string]$State, [int]$Count, [int]$Block) {
         windowStartUtc = (Get-IsoUtc $script:windowStart); endUtc = (Get-IsoUtc $script:windowEnd)
         driverPid = $PID; driverStartTicks = $script:selfTicks; block = $Block; updatedUtc = (Get-IsoUtc ([DateTime]::UtcNow))
     }
-    Write-AtomicText $SwitchPath (($o | ConvertTo-Json -Compress) + "`n")
+    # A reader that has the file open without delete sharing makes one rewrite fail with "access denied" for a moment: retry for ~1 s
+    # before giving up, so a passing reader never ends a 24 h window.
+    $text = ($o | ConvertTo-Json -Compress) + "`n"
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try { Write-AtomicText $SwitchPath $text; return } catch { $lastError = $_; Start-Sleep -Milliseconds 100 }
+    }
+    throw $lastError
 }
 
 # ---- preflight ----------------------------------------------------------------------------------------------------------------
@@ -237,6 +269,11 @@ try {
     if ($null -eq $mem0.commit -or $mem0.commit -lt $PreflightCommitGB) { Write-Refused "low-commit free=$($mem0.commit)GB" }
     $disk0 = Get-DiskProbe
     if ($null -eq $disk0 -or $disk0 -lt $MinFreeDiskGiB) { Write-Refused "low-disk free=${disk0}GiB" }
+    # One directory holds ONE window: the three streams are append-only, so a directory that already holds one would blend two windows
+    # into one evaluation (adversary r1 A1).
+    foreach ($leftover in 'ab-blocks.jsonl', 'ab-samples.jsonl', 'ab-receipt.json') {
+        if (Test-Path -LiteralPath (Join-Path $WindowDir $leftover)) { Write-Refused "window-dir-used ($leftover already exists in $WindowDir; give each window its own directory)" }
+    }
     New-Item -ItemType Directory -Path $WindowDir -Force | Out-Null
     $swDir = Split-Path -Parent $SwitchPath
     if ($swDir) { New-Item -ItemType Directory -Path $swDir -Force | Out-Null }
@@ -251,12 +288,18 @@ try {
     $ledgerPath = Join-Path $HeavySlotDir 'ledger.jsonl'
     $ledgerOffset = if (Test-Path -LiteralPath $ledgerPath) { (Get-Item -LiteralPath $ledgerPath).Length } else { 0 }
     $receiptDir = Join-Path $HeavySlotDir 'receipts'
-    $startStamp = $script:windowStart.ToString("yyyyMMdd'T'HHmmssfff'Z'", $inv)
-    $seenReceipts = New-Object 'System.Collections.Generic.HashSet[string]'
+    # Receipts: the names present at window start are the baseline. Any NEW name is read, whatever time its name carries (a ticket that
+    # queued before the window still writes its receipt when it finishes inside it, adversary r1 A5), and is retried until it parses
+    # (a half-written receipt must not be marked seen, A4); after 200 failed reads of one name it is given up on.
+    $knownReceipts = New-Object 'System.Collections.Generic.HashSet[string]'
+    $receiptTries = @{}
+    if (Test-Path -LiteralPath $receiptDir -PathType Container) { foreach ($rf0 in [IO.Directory]::GetFiles($receiptDir, '*.json')) { [void]$knownReceipts.Add([IO.Path]::GetFileName($rf0)) } }
     $lastRowUtc = $script:windowStart
     $rowWin = New-Object System.Collections.Generic.List[object]
     $prevRowUtc = $null
+    $prevHolders = $null
     $badMem = 0
+    $badEvent = 0
     $nextEventCheck = $script:windowStart
     $nSamples = 0
     Write-Output ("AB_DRIVER start={0} end={1} hours={2} blockMinutes={3} pollSeconds={4} switch={5}" -f (Get-IsoUtc $script:windowStart), (Get-IsoUtc $script:windowEnd), $Hours, $BlockMinutes, $PollSeconds, $SwitchPath)
@@ -281,12 +324,16 @@ try {
         $holders = @(Get-LiveHolders)
         $rows = @(Read-Feed)
         $newRows = @($rows | Where-Object { $_.utc -gt $lastRowUtc })
+        # A feed row between two polls is only credited with 2+ holders when BOTH bracketing polls saw 2+: the holders are sampled, not
+        # continuous, so a second holder seen at alternate polls is not sustained overlap (adversary r1 A7).
+        $rowHolders = if ($null -eq $prevHolders) { $holders.Count } else { [Math]::Min([int]$prevHolders, $holders.Count) }
         foreach ($r in $newRows) {
             $dt = if ($null -ne $prevRowUtc) { [Math]::Min(6.0, [Math]::Max(0.0, ($r.utc - $prevRowUtc).TotalSeconds)) } else { 2.0 }
-            $rowWin.Add([pscustomobject]@{ utc = $r.utc; dt = $dt; temp = $r.temp; holders = $holders.Count })
+            $rowWin.Add([pscustomobject]@{ utc = $r.utc; dt = $dt; temp = $r.temp; holders = $rowHolders })
             $prevRowUtc = $r.utc
             $lastRowUtc = $r.utc
         }
+        $prevHolders = $holders.Count
         $keepFrom = $now.AddSeconds(-[Math]::Max($CapWindowSeconds, $WarmWindowSeconds) - 5)
         while ($rowWin.Count -gt 0 -and $rowWin[0].utc -lt $keepFrom) { $rowWin.RemoveAt(0) }
         $newest = if ($rows.Count -gt 0) { $rows[-1] } else { $null }
@@ -327,7 +374,9 @@ try {
         if (-not $why -and $now -ge $nextEventCheck) {
             $nextEventCheck = $now.AddSeconds($(if ($EventProbeFile) { 0 } else { $EventCheckSeconds }))
             $n = Get-EventCount $script:windowStart
-            if ($n -gt 0) { $why = "event-2004 rows=$n since window start" }
+            if ($null -eq $n) { $badEvent++ } else { $badEvent = 0 }
+            if ($null -ne $n -and $n -gt 0) { $why = "event-2004 rows=$n since window start" }
+            elseif ($badEvent -ge 2) { $why = 'event-2004-unreadable the System event count could not be read on 2 consecutive checks' }
         }
         if (-not $why -and ($null -eq $disk -or $disk -lt $MinFreeDiskGiB)) { $why = "low-disk C:=${disk}GiB" }
         if (-not $why) {
@@ -351,9 +400,8 @@ try {
                     foreach ($line in ($txt.Substring(0, $cut) -split "`n")) {
                         if (-not $line.Trim()) { continue }
                         try { $e = $line | ConvertFrom-Json } catch { continue }
-                        $at = [DateTime]::MinValue
-                        if (-not [DateTime]::TryParse([string]$e.at, $inv, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$at)) { continue }
-                        if ($at -lt $script:windowStart) { continue }
+                        $at = ConvertTo-UtcInstant $e.at
+                        if ($null -eq $at -or $at -lt $script:windowStart) { continue }
                         if ([string]$e.event -eq 'unguarded') { $why = "unguarded ledger event ticket=$($e.ticket)"; break }
                         if ([string]$e.event -eq 'admit' -and ([string]$e.class -ne 'shared' -or $e.wholeMachine -eq $true)) { $why = "exclusive-admit ticket=$($e.ticket) class=$($e.class)"; break }
                     }
@@ -364,13 +412,17 @@ try {
         if (-not $why -and (Test-Path -LiteralPath $receiptDir -PathType Container)) {
             foreach ($rf in [IO.Directory]::GetFiles($receiptDir, '*.json')) {
                 $nm = [IO.Path]::GetFileName($rf)
-                if ([string]::CompareOrdinal($nm, $startStamp) -lt 0 -or -not $seenReceipts.Add($nm)) { continue }
-                try {
-                    $rc = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json
-                    if ($rc.wholeMachine -eq $true) { $why = "exclusive-admit receipt=$nm wholeMachine=true"; break }
-                    if ($rc.class -and [string]$rc.class -ne 'shared') { $why = "exclusive-admit receipt=$nm class=$($rc.class)"; break }
+                if ($knownReceipts.Contains($nm)) { continue }
+                $rc = $null
+                try { $rc = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json } catch { $rc = $null }
+                if ($null -eq $rc) {
+                    $receiptTries[$nm] = [int]$receiptTries[$nm] + 1
+                    if ($receiptTries[$nm] -ge 200) { [void]$knownReceipts.Add($nm) }
+                    continue
                 }
-                catch { }
+                [void]$knownReceipts.Add($nm)   # marked seen only after it PARSED
+                if ($rc.wholeMachine -eq $true) { $why = "exclusive-admit receipt=$nm wholeMachine=true"; break }
+                if ($rc.class -and [string]$rc.class -ne 'shared') { $why = "exclusive-admit receipt=$nm class=$($rc.class)"; break }
             }
         }
         if ($why) { $final = @{ state = 'ABORTED'; reason = $why }; break }
@@ -388,23 +440,39 @@ catch {
     if (-not $final) { $final = @{ state = 'ABORTED'; reason = ('driver-exception: ' + $_.Exception.Message) } }
 }
 finally {
-    # Every exit path: the switch goes back to count 1 first, then the receipt is written, then the mutex is released.
+    # Every exit path: the switch goes back to count 1 first (an atomic rewrite, 5 tries, then read back to PROVE it), then the receipt is
+    # written, then the mutex is released. A revert that cannot be proven is recorded as REVERT_FAILED and exits 4, never as REVERTED
+    # (adversary r1 A9); the reader still answers 1 once this process is gone, because the driver pid it checks no longer exists.
+    $revertFailed = $false
+    $revertWhy = ''
     if ($switchTouched -or (Test-Path -LiteralPath $SwitchPath -PathType Leaf)) {
-        try { Set-Switch 'REVERTED' 1 $(if ($blockIndex -ge 0) { $blockIndex } else { -1 }) } catch { Write-Output "AB_REVERT_FAILED $($_.Exception.Message)" }
+        $revertFailed = $true
+        for ($tryNo = 1; $tryNo -le 5 -and $revertFailed; $tryNo++) {
+            try {
+                Set-Switch 'REVERTED' 1 $(if ($blockIndex -ge 0) { $blockIndex } else { -1 })
+                $back = Get-Content -LiteralPath $SwitchPath -Raw | ConvertFrom-Json
+                if ([string]$back.state -ceq 'REVERTED' -and [long]$back.count -eq 1) { $revertFailed = $false } else { $revertWhy = 'the read-back did not show REVERTED / count 1' }
+            }
+            catch { $revertWhy = $_.Exception.Message }
+            if ($revertFailed -and $tryNo -lt 5) { Start-Sleep -Milliseconds 200 }
+        }
+        if ($revertFailed) { Write-Output "AB_REVERT_FAILED $revertWhy" }
     }
     if ($script:refused) { $final = $null }
     elseif (-not $final) { $final = @{ state = 'ABORTED'; reason = 'driver-interrupted' } }
+    if ($final -and $revertFailed -and -not $script:refused) { $final = @{ state = 'ABORTED'; reason = ('revert-failed: ' + $revertWhy + ' (the window ended as ' + $final.state + ': ' + $final.reason + ')') } }
     if ($final -and (Test-Path -LiteralPath $WindowDir -PathType Container) -and $switchTouched) {
         $rcpt = [ordered]@{
             state = $final.state; reason = $final.reason; schema = 'heavy-slot-ab-receipt.v1'
             windowStartUtc = (Get-IsoUtc $script:windowStart); windowEndUtc = (Get-IsoUtc $script:windowEnd); endedUtc = (Get-IsoUtc ([DateTime]::UtcNow))
             hours = $Hours; blockMinutes = $BlockMinutes; pollSeconds = $PollSeconds; blocks = ($blockIndex + 1); samples = $nSamples
-            driverPid = $PID; switchPath = $SwitchPath; switchFinal = 'REVERTED'
+            driverPid = $PID; switchPath = $SwitchPath; switchFinal = $(if ($revertFailed) { 'REVERT_FAILED' } else { 'REVERTED' })
         }
         try { Write-AtomicText $receiptFile (($rcpt | ConvertTo-Json -Compress) + "`n") } catch { Write-Output "AB_RECEIPT_FAILED $($_.Exception.Message)" }
     }
     if ($final) { Write-Output ("AB_{0} reason={1}" -f $(if ($final.state -eq 'DONE') { 'DONE' } else { 'ABORT' }), $final.reason) }
     if ($mutex) { try { $mutex.ReleaseMutex() } catch { }; $mutex.Dispose() }
 }
+if ($revertFailed) { exit 4 }
 if ($final -and $final.state -eq 'ABORTED') { exit 3 }
 exit 0

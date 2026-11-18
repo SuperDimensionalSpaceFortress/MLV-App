@@ -76,6 +76,20 @@ Verdict (every threshold is printed in the json):
   Event 2004; min free commit in B samples >= 10 GB. Otherwise `REJECT`.
 * `ABORTED` is carried through from the driver receipt.
 
+## Rules the adversary pass added (r1)
+
+* **One window per directory.** The driver refuses a `-WindowDir` that already holds `ab-blocks.jsonl`, `ab-samples.jsonl` or `ab-receipt.json`
+  (`window-dir-used`); the evaluator calls a directory with two windows, or a receipt that names another window, INCONCLUSIVE and ignores
+  samples outside the window.
+* **Exit codes.** Driver 0 DONE, 2 REFUSED, 3 ABORTED, 4 the final revert could not be proven (receipt `switchFinal: REVERT_FAILED`; the reader
+  still answers 1 once the driver process is gone). The revert is tried 5 times and read back.
+* **Holders are exact.** A held record counts only when its pid is alive with exactly the recorded start ticks (as heavy-slot itself compares). A feed row
+  between two polls counts as 2+ holders only when both bracketing polls saw 2+, so a second holder seen at alternate polls does not trip `warm-while-2`.
+* **Receipts.** New receipt files are read whatever time their name carries, and a half-written one is retried, not marked seen.
+* **Event 2004.** A count that cannot be read is never zero: two unreadable checks abort the window (`event-2004-unreadable`); the evaluator is INCONCLUSIVE.
+* **Per hold.** The evaluator writes `ab-holds.jsonl` (one row per live closed hold: wait, hold, peak live holders, hottest and mean temp, median frequency)
+  and `holds_by_holders` in the verdict (holders_1 / holders_2_plus / holders_unknown, per arm and overall). An exit that landed after window end + grace is a dead holder.
+
 ## Known limits
 
 * The slot-1 object is not keeper-owned during the window (`HeavySlot-KeepObjects` keeps slot 0 only), so every heavy-slot run in a

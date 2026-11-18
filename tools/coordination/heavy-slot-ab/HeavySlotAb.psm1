@@ -18,7 +18,11 @@ function Get-HeavySlotAbStatus {
     $fail = { param($why) [pscustomobject]@{ Count = 1; State = ''; Reason = $why } }
     $raw = $null
     for ($try = 0; $try -lt 2 -and $null -eq $raw; $try++) {
-        try { $raw = [IO.File]::ReadAllText($SwitchPath) }
+        try {
+            # opened with delete sharing so this read can never make the driver's atomic rewrite fail
+            $fs = [IO.File]::Open($SwitchPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try { $raw = (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+        }
         catch { if ($try -eq 0 -and (Test-Path -LiteralPath $SwitchPath -PathType Leaf)) { Start-Sleep -Milliseconds 120 } else { return (& $fail "unreadable: $($_.Exception.GetType().Name)") } }
     }
     try {

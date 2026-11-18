@@ -285,6 +285,12 @@ def _hold_a_ticket(w: World, name="t1"):
     w.add_holder(name, 0)
 
 
+def _receipt_unreadable_then_valid(w):
+    path = w.hs / "receipts" / (datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "998Z-2-fedcba.json")
+    path.write_text('{"ticket": "x4", "class": "shar', encoding="ascii")   # half written
+    threading.Timer(1.0, lambda: path.write_text(json.dumps({"ticket": "x4", "class": "shared", "wholeMachine": True}), encoding="ascii")).start()
+
+
 ABORTS = {
     # name: (driver extra args, setup(w), flip(w) -> condition delay seconds, expected reason prefix, max samples after the flip)
     "thermal-cap": (["-CapSeconds", "0.3", "-CapWindowSeconds", "10"], None, lambda w: setattr(w.feed, "temp", 96.0), 0.0, "thermal-cap", 5),
@@ -300,6 +306,13 @@ ABORTS = {
         json.dumps({"ticket": "x2", "class": "shared", "wholeMachine": True}), encoding="ascii"), 0.0, "exclusive-admit", 3),
     "exclusive-admit-held": ([], None, lambda w: w.add_holder("x3", 0, whole=True), 0.0, "exclusive-admit", 3),
     "stop-file": ([], None, lambda w: (w.window / "ab-stop").write_text("stop", encoding="ascii"), 0.0, "stop-file", 3),
+    # adversary pass r1 (A3): an event probe that cannot be read is never "zero events"
+    "event-unreadable": ([], None, lambda w: w.event.write_text("not-a-number", encoding="ascii"), 0.0, "event-2004-unreadable", 5),
+    # adversary pass r1 (A5): a receipt named for an enqueue time BEFORE the window (the ticket queued earlier, finished inside the window)
+    "exclusive-admit-receipt-queued-before-window": ([], None, lambda w: (w.hs / "receipts" / "20200101T000000000Z-9-abcdef.json").write_text(
+        json.dumps({"ticket": "x5", "class": "shared", "wholeMachine": True}), encoding="ascii"), 0.0, "exclusive-admit", 3),
+    # adversary pass r1 (A4): a receipt that is half-written on the first scan and valid a second later is not marked seen
+    "exclusive-admit-receipt-unreadable-first": ([], None, lambda w: _receipt_unreadable_then_valid(w), 1.0, "exclusive-admit", 9),
 }
 
 
@@ -536,7 +549,7 @@ def _scale(values, f):
 
 def build_window(root: Path, name: str, *, b_build=None, b_pytest=None, a_hold=60.0, b_hold=62.0, b_temp=85.0, b_freq=4400.0, a_freq=4500.0,
                  a_build=None, a_pytest=None, dead=0, reaped=0, spill=False, receipt_state="DONE", receipt_reason="window-complete",
-                 b_commit=60.0):
+                 b_commit=60.0, a2_holders=1):
     a_build = A_BUILD if a_build is None else a_build
     a_pytest = A_PYTEST if a_pytest is None else a_pytest
     b_build = _scale(A_BUILD, 0.5) if b_build is None else b_build
@@ -593,7 +606,7 @@ def build_window(root: Path, name: str, *, b_build=None, b_pytest=None, a_hold=6
         state = "AB"[k % 2]
         for m in range(BLOCK_MIN):
             hot = state == "B" and b_temp >= 90 and m % 2 == 0
-            samples.append({"utc": iso(block_start(k) + timedelta(minutes=m)), "block": k, "state": state, "holders": 2 if state == "B" else 1,
+            samples.append({"utc": iso(block_start(k) + timedelta(minutes=m)), "block": k, "state": state, "holders": 2 if state == "B" else (a2_holders if k == 2 else 1),
                             "temp_c": b_temp if state == "B" and (b_temp < 90 or hot) else 70.0 if state == "B" else 72.0, "cpu_pct": 60.0,
                             "freq_mhz": b_freq if state == "B" else a_freq, "free_commit_gb": b_commit if state == "B" else 65.0})
     (win / "ab-samples.jsonl").write_text("\n".join(json.dumps(s) for s in samples) + "\n", encoding="ascii")
@@ -754,3 +767,227 @@ def test_the_evaluator_waits_for_window_end_plus_the_grace_when_asked(tmp_path):
     v = json.loads((win / "ab-verdict.json").read_text(encoding="utf-8"))
     assert v["window"]["evaluatedEarly"] is False
     assert v["dead_holders"]["count"] == 1 and v["dead_holders"]["pending_before_grace"] == 0
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# adversary pass r1 (b0b10c03): one test per finding, fed the finding's own input
+# ---------------------------------------------------------------------------------------------------------------------------
+def ticks_to_iso(ticks: int) -> str:
+    dt = datetime(1, 1, 1) + timedelta(microseconds=ticks // 10)
+    return f"{dt:%Y-%m-%dT%H:%M:%S}.{ticks % 10_000_000:07d}Z"
+
+
+def _add_ticket(hs: Path, tid: str, label: str, enq: datetime, adm: datetime, fin: datetime, exit_at: datetime = None):
+    rec = {"ticket": tid, "label": label, "class": "shared", "wholeMachine": False, "slotCount": 1, "slots": [0], "enqueuedAt": iso7(enq), "admittedAt": iso7(adm),
+           "finishedAt": iso7(fin), "waitedMs": int((adm - enq).total_seconds() * 1000), "exit": {"source": "child", "code": 0}}
+    (hs / "receipts" / f"{tid}.json").write_text(json.dumps(rec), encoding="ascii")
+    with open(hs / "ledger.jsonl", "a", encoding="ascii") as fh:
+        fh.write(json.dumps({"at": iso7(adm), "event": "admit", "ticket": tid, "label": label, "class": "shared"}) + "\n")
+        fh.write(json.dumps({"at": iso7(exit_at or fin), "event": "exit", "ticket": tid, "label": label, "source": "child", "code": 0}) + "\n")
+
+
+def test_A1_the_driver_refuses_a_window_dir_that_already_holds_a_window(tmp_path, me):
+    w = World(tmp_path, "reused", me)
+    try:
+        w.window.mkdir()
+        old = w.window / "ab-blocks.jsonl"
+        old.write_text(json.dumps({"block": 0, "state": "A", "startUtc": iso(T0), "endUtc": iso(block_start(1)), "windowStartUtc": iso(T0), "windowEndUtc": iso(block_start(6))}) + "\n", encoding="ascii")
+        before = old.read_bytes()
+        w.switch.write_text(json.dumps(switch_doc(me)), encoding="ascii")
+        out = subprocess.run(w.args(0.05, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=window-dir-used" in out.stdout, out.stdout + out.stderr
+        assert old.read_bytes() == before and not (w.window / "ab-samples.jsonl").exists() and not (w.window / "ab-receipt.json").exists()
+        assert _reader_counts(tmp_path, w.switch) == 1
+    finally:
+        w.close()
+
+
+def test_A1_the_evaluator_does_not_mix_two_windows_found_in_one_dir(tmp_path):
+    win, hs = build_window(tmp_path, "mixed")
+    later = T0 + timedelta(hours=10)
+    rows = [{"utc": iso(later + timedelta(minutes=30 * k)), "block": k, "state": "AB"[k % 2], "count": 1 + k % 2, "startUtc": iso(later + timedelta(minutes=30 * k)),
+             "endUtc": iso(later + timedelta(minutes=30 * (k + 1))), "windowStartUtc": iso(later), "windowEndUtc": iso(later + timedelta(hours=3))} for k in range(6)]
+    with open(win / "ab-blocks.jsonl", "a", encoding="ascii") as fh:
+        fh.write("\n".join(json.dumps(r) for r in rows) + "\n")
+    receipt = json.loads((win / "ab-receipt.json").read_text(encoding="utf-8"))
+    receipt.update({"windowStartUtc": iso(later), "windowEndUtc": iso(later + timedelta(hours=3)), "endedUtc": iso(later + timedelta(hours=3))})
+    (win / "ab-receipt.json").write_text(json.dumps(receipt), encoding="ascii")
+    v, _ = evaluate(tmp_path, "mixed", win, hs, now=later + timedelta(hours=6))
+    assert v["verdict"] == "INCONCLUSIVE" and "2 windows" in v["reason"], v
+
+
+def test_A1_a_receipt_from_another_window_is_not_accepted(tmp_path):
+    win, hs = build_window(tmp_path, "otherreceipt")
+    receipt = json.loads((win / "ab-receipt.json").read_text(encoding="utf-8"))
+    receipt["windowStartUtc"] = iso(T0 + timedelta(days=1))
+    (win / "ab-receipt.json").write_text(json.dumps(receipt), encoding="ascii")
+    v, _ = evaluate(tmp_path, "otherreceipt", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "another window" in v["reason"], v
+
+
+def test_A2_an_exit_after_window_end_plus_grace_is_still_a_dead_holder(tmp_path):
+    win, hs = build_window(tmp_path, "late")
+    end = block_start(N_BLOCKS)
+    _add_ticket(hs, "late1", "mlv:LATE:build", end - timedelta(minutes=5), end - timedelta(minutes=1), end + timedelta(minutes=90, seconds=1))
+    v, _ = evaluate(tmp_path, "late", win, hs, now=end + timedelta(hours=2))
+    assert v["dead_holders"]["count"] == 1 and v["dead_holders"]["tickets"] == ["late1"], v["dead_holders"]
+    assert v["arms"]["B"]["build"]["n_closed"] == 15, "the late exit must not enter the statistics"
+    # an exit INSIDE the grace is an ordinary closed ticket
+    win, hs = build_window(tmp_path, "intime")
+    _add_ticket(hs, "late2", "mlv:LATE:build", end - timedelta(minutes=5), end - timedelta(minutes=1), end + timedelta(minutes=89))
+    v, _ = evaluate(tmp_path, "intime", win, hs, now=end + timedelta(hours=2))
+    assert v["dead_holders"]["count"] == 0 and v["arms"]["B"]["build"]["n_closed"] == 16
+
+
+def test_A3_an_unreadable_event_probe_makes_the_evaluator_inconclusive_never_adopt(tmp_path):
+    win, hs = build_window(tmp_path, "evbad")
+    (tmp_path / "evbad" / "event.txt").write_text("not-a-number", encoding="ascii")
+    v, _ = evaluate(tmp_path, "evbad", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "event" in v["reason"].lower() and v["event_2004"] is None, v
+    missing = tmp_path / "evbad" / "no-such-event-file.txt"
+    out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(missing), "-Now", iso(block_start(N_BLOCKS) + timedelta(hours=2))])
+    assert out.returncode == 0 and json.loads((win / "ab-verdict.json").read_text(encoding="utf-8"))["verdict"] == "INCONCLUSIVE"
+
+
+def test_A6_waits_frequency_and_temperature_are_logged_per_hold_and_split_by_live_holders(tmp_path):
+    win, hs = build_window(tmp_path, "perhold", a2_holders=2)
+    v, _ = evaluate(tmp_path, "perhold", win, hs)
+    split = v["holds_by_holders"]
+    # A block 2 carries holders=2 samples: its 9 tickets (5 builds + 4 pytest) overlapped; the other 18 A tickets ran alone; every B ticket overlapped
+    assert split["A"]["holders_2_plus"]["n"] == 9 and split["A"]["holders_1"]["n"] == 18, split["A"]
+    assert split["B"]["holders_2_plus"]["n"] == 27 and split["B"]["holders_1"]["n"] == 0
+    for arm in ("A", "B"):
+        for key in ("holders_1", "holders_2_plus"):
+            cohort = split[arm][key]
+            if cohort["n"]:
+                for stat in ("wait_s_p50", "wait_s_p90", "wait_s_p99", "hold_s_p50", "hold_temp_c_max_p95", "hold_freq_mhz_p50"):
+                    assert cohort[stat] is not None, (arm, key, stat)
+    assert split["B"]["holders_2_plus"]["hold_freq_mhz_p50"] == 4400.0 and split["A"]["holders_1"]["hold_freq_mhz_p50"] == 4500.0
+    rows = [json.loads(line) for line in (win / "ab-holds.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 54 and {r["arm"] for r in rows} == {"A", "B"}
+    for key in ("ticket", "label", "class", "arm", "block", "wait_s", "hold_s", "holders_peak", "temp_c_max", "freq_mhz_p50"):
+        assert key in rows[0], key
+    assert sum(1 for r in rows if r["holders_peak"] >= 2) == 36
+
+
+def test_A7_a_second_holder_seen_only_at_alternate_polls_does_not_count_as_sustained_overlap(tmp_path, me):
+    w = World(tmp_path, "alternate", me)
+    try:
+        w.feed.temp = 91.0
+        w.add_holder("h0", 0)
+        second = w.hs / "held" / "h1.json"
+        aside = w.root / "h1.aside"
+        w.add_holder("h1", 1)
+        os.replace(second, aside)
+        proc = w.start(0.2, 0.2, ["-WarmWindowSeconds", "2", "-WarmFraction", "0.3"])
+        seen = 0
+        present = False
+        end = time.monotonic() + 60
+        while time.monotonic() < end and proc.poll() is None:
+            n = len(w.samples())
+            if n > seen:
+                seen = n
+                present = not present
+                if present:
+                    os.replace(aside, second)
+                else:
+                    os.replace(second, aside)
+            if seen >= 26:
+                break
+            time.sleep(0.02)
+        (w.window / "ab-stop").write_text("stop", encoding="ascii")
+        assert proc.wait(timeout=60) == 3
+        receipt = w.receipt()
+        counts = {s["holders"] for s in w.samples()}
+        assert counts == {1, 2}, "the scenario must really alternate"
+        assert receipt["reason"].startswith("stop-file"), f"overlap seen at alternate polls was counted as sustained: {receipt['reason']}"
+    finally:
+        w.close()
+
+
+def test_A8_a_held_record_whose_pid_start_is_a_fraction_of_a_second_off_is_not_a_holder(tmp_path, me):
+    w = World(tmp_path, "pidreuse", me)
+    try:
+        w.add_holder("stale", 0, cls="exclusive", whole=True)
+        rec_path = w.hs / "held" / "stale.json"
+        rec = json.loads(rec_path.read_text(encoding="ascii"))
+        rec["pidStart"] = ticks_to_iso(me["ticks"] + 5_000_000)   # the reused pid started half a second after the record says
+        rec_path.write_text(json.dumps(rec), encoding="ascii")
+        proc = w.start(0.2, 0.2)
+        assert _wait(lambda: len(w.samples()) >= 6, 60), w.text()
+        (w.window / "ab-stop").write_text("stop", encoding="ascii")
+        assert proc.wait(timeout=60) == 3
+        assert w.receipt()["reason"].startswith("stop-file"), w.receipt()
+        assert {s["holders"] for s in w.samples()} == {0}
+        # the same record with the EXACT start is a live exclusive holder and aborts
+        w2 = World(tmp_path, "pidexact", me)
+        try:
+            w2.add_holder("live", 0, cls="exclusive", whole=True)
+            out = subprocess.run(w2.args(0.2, 0.2), capture_output=True, text=True, timeout=120)
+            assert out.returncode == 3 and "AB_ABORT reason=exclusive-admit" in out.stdout, out.stdout + out.stderr
+        finally:
+            w2.close()
+    finally:
+        w.close()
+
+
+def test_A9_a_final_revert_that_fails_is_never_recorded_as_reverted(tmp_path, me):
+    w = World(tmp_path, "revertfail", me)
+    holder = None
+    try:
+        proc = w.start(0.012, 0.1)
+        assert _wait(lambda: (w.switch_doc() or {}).get("state") == "B", 60), w.text()
+        holder = open(w.switch, "rb")   # read-shared, not delete-shared: the atomic replace over it cannot succeed
+        code = proc.wait(timeout=90)
+        receipt = w.receipt()
+        text = w.text()
+        holder.close()
+        holder = None
+        assert code == 4, (code, text)
+        assert receipt["state"] == "ABORTED" and receipt["switchFinal"] == "REVERT_FAILED" and "revert-failed" in receipt["reason"], receipt
+        assert "AB_REVERT_FAILED" in text
+        doc = w.switch_doc()
+        assert doc["count"] == 2 and doc["state"] == "B", "the test really did block the rewrite"
+        assert _reader_counts(tmp_path, w.switch) == 1, "a driver that has exited can never leave the reader at 2"
+    finally:
+        if holder:
+            holder.close()
+        w.close()
+
+
+def test_A10_a_blocks_file_with_no_usable_row_returns_the_typed_no_input_exit(tmp_path):
+    win, hs = build_window(tmp_path, "noinput")
+    (win / "ab-blocks.jsonl").write_text("{}\n", encoding="ascii")
+    out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / "noinput" / "event.txt")])
+    assert out.returncode == 2 and "AB_EVAL_NO_INPUT" in out.stdout, out.stdout + out.stderr
+
+
+def test_a_reader_that_keeps_opening_the_switch_never_ends_the_window(tmp_path, me):
+    """The driver's atomic rewrite must survive a reader that has the file open without delete sharing (Python's open does not share delete)."""
+    w = World(tmp_path, "busyreader", me)
+    stop = threading.Event()
+    reads = [0]
+
+    def hammer():
+        while not stop.is_set():
+            try:
+                with open(w.switch, "rb") as fh:
+                    fh.read()
+                reads[0] += 1
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=hammer, daemon=True)
+    try:
+        proc = w.start(0.01, 0.07)     # 36 s window, 4.2 s blocks: 8 rewrites while the reader hammers the file
+        assert _wait(lambda: w.switch.exists(), 60)
+        thread.start()
+        code = proc.wait(timeout=120)
+        stop.set()
+        thread.join(timeout=5)
+        assert code == 0, w.text()
+        assert w.receipt()["state"] == "DONE" and w.receipt()["switchFinal"] == "REVERTED"
+        assert reads[0] > 100, "the reader must really have been busy"
+    finally:
+        stop.set()
+        w.close()
