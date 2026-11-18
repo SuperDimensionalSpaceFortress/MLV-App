@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -643,11 +644,41 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
     while link is not None:
         try:
             candidate = link.tb_frame.f_locals.get("self")
-            if isinstance(candidate, subprocess.Popen) and candidate.pid is not None and candidate.returncode is None:
-                return candidate
-        except Exception:  # noqa: BLE001 - a frame that cannot be read is skipped, never fatal
+            if isinstance(candidate, subprocess.Popen):
+                # The first ``Popen`` met walking inward is the constructor the launch called: every frame
+                # below it (an audit hook, a callback) can hold some OTHER live ``Popen`` as its own ``self``,
+                # which is not this launch's child and must never be adopted, so the search ends here.
+                return _created_child(candidate, link)
+        except BaseException:  # noqa: BLE001 - a frame that cannot be read is skipped; recovery never replaces the launch's own error
             pass
         link = link.tb_next
+    return None
+
+
+def _created_child(candidate: subprocess.Popen[bytes], link: types.TracebackType) -> subprocess.Popen[bytes] | None:
+    """``candidate`` when its launch had created the child, else ``None``.
+
+    On Windows ``CreateProcess`` returns the child's handle and pid as locals of ``_execute_child``, and
+    ``Popen`` stores them on ``self`` a few statements later (after the pipe cleanup): an interrupt in
+    between leaves ``self.pid`` unset although the child runs. Those two values are taken from that frame
+    (only when it is the constructor's own ``_execute_child`` for this ``candidate``) so it can be ended.
+    """
+    if candidate.pid is None:
+        walk: types.TracebackType | None = link
+        while walk is not None:
+            frame = walk.tb_frame
+            if frame.f_code.co_name == "_execute_child" and frame.f_locals.get("self") is candidate:
+                pid, handle = frame.f_locals.get("pid"), frame.f_locals.get("hp")
+                if issubclass(type(pid), int) and not issubclass(type(pid), bool):
+                    candidate.pid = pid
+                    candidate._child_created = True  # type: ignore[attr-defined]
+                    handle_type = getattr(subprocess, "Handle", None)  # Windows only
+                    if handle_type is not None and issubclass(type(handle), int) and not hasattr(candidate, "_handle"):
+                        candidate._handle = handle_type(handle)  # type: ignore[attr-defined]
+                break
+            walk = walk.tb_next
+    if candidate.pid is not None and candidate.returncode is None:
+        return candidate
     return None
 
 
@@ -1042,8 +1073,13 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
         thread = threading.Thread(target=one, args=(position,), name="shard-terminate", daemon=True)
         try:
             thread.start()
-        except Exception:  # noqa: BLE001 - no thread to be had (the OS refused one)
-            inline(position)
+        except BaseException:  # noqa: BLE001 - no thread to be had (the OS refused one), or an interrupt inside the start
+            # A ``SystemExit`` or ``KeyboardInterrupt`` here must not abort the cleanup of every worker still
+            # running. An interrupt can land after the thread began: that one is kept and joined, not killed twice.
+            if thread.is_alive():
+                threads.append(thread)
+            else:
+                inline(position)
         else:
             threads.append(thread)
     for thread in threads:

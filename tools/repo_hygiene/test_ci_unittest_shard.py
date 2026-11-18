@@ -2606,6 +2606,66 @@ class ShardExitCodeTests(unittest.TestCase):
             found = shard.half_built_worker(error)
         self.assertIsNone(found)
 
+    # r13 adversary pass 22 A1: CreateProcess returned (hp, pid) but Popen was cut short before storing self.pid.
+    def test_half_built_worker_takes_the_child_identity_from_create_process_when_popen_never_stored_it(self) -> None:
+        class CutShort(subprocess.Popen):  # type: ignore[type-arg]
+            def _execute_child(self, *args: object, **kwargs: object) -> None:
+                hp, ht, pid, tid = 111, 112, 424242, 1  # noqa: F841 - what CreateProcess returned
+                raise KeyboardInterrupt
+
+        found = None
+        try:
+            CutShort([sys.executable, "-c", "pass"])
+        except KeyboardInterrupt as error:
+            found = shard.half_built_worker(error)
+        if found is not None:
+            self.addCleanup(setattr, found, "_child_created", False)  # nothing real stands behind pid 424242
+        self.assertIsNotNone(found, "the child CreateProcess made was not handed over")
+        self.assertEqual(found.pid, 424242)  # type: ignore[union-attr]
+
+    # r13 adversary pass 22 A2: the nearest Popen is this launch's; a live one deeper in the stack is not its child.
+    def test_half_built_worker_never_adopts_an_unrelated_live_popen_from_a_deeper_frame(self) -> None:
+        unrelated = subprocess.Popen.__new__(subprocess.Popen)
+        unrelated.pid = 99
+        unrelated.returncode = None
+
+        def audit_callback(self: object) -> None:
+            raise KeyboardInterrupt
+
+        class NothingCreated(subprocess.Popen):  # type: ignore[type-arg]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = None  # type: ignore[assignment]
+                self.returncode = None
+                audit_callback(unrelated)
+
+        found: object = "unset"
+        try:
+            NothingCreated([sys.executable])
+        except KeyboardInterrupt as error:
+            found = shard.half_built_worker(error)
+        self.assertIsNone(found, "an unrelated running Popen was taken for the launch's child")
+
+    # r13 adversary pass 22 A3: an exit raised where terminate_all starts a thread must not stop the other kills.
+    def test_terminate_all_still_ends_every_worker_when_a_thread_start_raises_an_exit(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc()]
+        real_start = threading.Thread.start
+        starts: list[int] = []
+
+        def start(thread: threading.Thread) -> None:
+            starts.append(1)
+            if len(starts) == 1:
+                raise SystemExit(0)
+            real_start(thread)
+
+        raised: BaseException | None = None
+        with mock.patch.object(shard, "_kill_tree", return_value=None), mock.patch.object(threading.Thread, "start", start):
+            try:
+                shard.terminate_all(procs)  # type: ignore[arg-type]
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        self.assertIsNone(raised, "terminate_all let an exit out")
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9], "a worker was left running")
+
     # r11 adversary A1 (pass 19): an interrupt after the worker exists but before it is registered must not leave it running.
     def test_an_interrupt_between_the_launch_and_its_registration_still_ends_the_worker(self) -> None:
         import inspect
