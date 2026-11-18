@@ -2976,6 +2976,67 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         Assert-That ($ddR8ApRole.Count -eq 0) "DENY-BY-DEFAULT-1 r8 adv p17 A1 role guard: all $($ddR8Ap.Count) name a secret" ("misses=$($ddR8ApRole.Count): " + (($ddR8ApRole | Select-Object -First 3) -join '; '))
     }
     Assert-That (-not (Test-CredentialText ('xml = ' + "'" + '<add key=' + $ddBsA2 + "'" + 'theme' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'dark' + $ddBsA2 + "'" + ' />' + "'"))) 'DENY-BY-DEFAULT-1 r8 must-pass: an escaped-apostrophe pair that names no secret is not a credential'
+    # r9 (sol r8 B1, defect class: an escape a reader decodes that the normaliser left as written): JavaScript (and Python, C) read a backslash before ANY punctuation character as
+    # that character, so 'key\=' is 'key=' and the pair below is intact after the reader. Every structural character of a start tag, and every naming attribute, is swept.
+    $ddR9Pair = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR9Attr in @('key', 'name', 'id', 'property', 'variable', 'setting', 'param', 'parameter', 'field')) {
+        $ddR9Pair.Add('const xml = "<add ' + $ddR9Attr + $ddBsA2 + "='p a s s w o r d' value='hunter2' />" + '";')
+        $ddR9Pair.Add('const xml = "<add ' + $ddR9Attr + $ddBsA2 + "='password' value='hunter2' />" + '";')
+    }
+    $ddR9Pair.Add('const xml = "<add key' + $ddBsA2 + '=' + $ddBsA2 + "'password" + $ddBsA2 + "' value" + $ddBsA2 + '=' + $ddBsA2 + "'hunter2" + $ddBsA2 + "' /" + $ddBsA2 + '>";')
+    $ddR9Pair.Add('const xml = "<add key=' + "'password' value='hunter2' /" + $ddBsA2 + '>";')
+    $ddR9Pair.Add('const xml = "' + $ddBsA2 + '<add key' + $ddBsA2 + "='password' value" + $ddBsA2 + "='hunter2' /" + $ddBsA2 + '>";')
+    $ddR9Pair.Add('{"x":"<add key' + $ddBsA2 + "='password' value='hunter2' />" + '"}')
+    # the identity escape of a LETTER inside the attribute name ('k\ey' is 'key' to a JavaScript reader)
+    foreach ($ddR9L in @(('k' + $ddBsA2 + 'ey'), ('na' + $ddBsA2 + 'me'), ('i' + $ddBsA2 + 'd'), ('pro' + $ddBsA2 + 'perty'), ('fi' + $ddBsA2 + 'eld'))) { $ddR9Pair.Add('const xml = "<add ' + $ddR9L + "='password' value='hunter2' />" + '";') }
+    $ddR9PairMiss = @($ddR9Pair | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9PairMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B1: all $($ddR9Pair.Count) identity-escaped XML naming-pair spellings refuse" ("misses=$($ddR9PairMiss.Count): " + (($ddR9PairMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 B1 role guard') {
+        $ddR9PairRole = @($ddR9Pair | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR9PairRole.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B1 role guard: all $($ddR9Pair.Count) name a secret" ("misses=$($ddR9PairRole.Count): " + (($ddR9PairRole | Select-Object -First 3) -join '; '))
+    }
+    # the identity escape of every ASCII punctuation character a start tag, a key line or a table is built from decodes to that character
+    $ddR9PunctChars = [char[]]'=:;,.!#$%&()*+-<>@[]^{|}~'
+    $ddR9PunctMiss = @($ddR9PunctChars | Where-Object { (ConvertFrom-CredentialEscapes ('a' + $ddBsA2 + [string]$_ + 'b')) -cne ('a' + [string]$_ + 'b') })
+    Assert-That ($ddR9PunctMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B1 sibling: all $($ddR9PunctChars.Count) identity-escaped punctuation characters decode to themselves" ("misses=" + ($ddR9PunctMiss -join ' '))
+    foreach ($ddOkR9 in @(('const xml = "<add key' + $ddBsA2 + "='theme' value='dark' />" + '";'), ('{"path": "C:' + $ddBsA2 + 'Users' + $ddBsA2 + 'me' + $ddBsA2 + '.config' + $ddBsA2 + 'app", "theme": "dark"}'), ('const re = /a' + $ddBsA2 + '.b' + $ddBsA2 + '-c' + $ddBsA2 + '(d' + $ddBsA2 + ')/;'))) {
+        Assert-That (-not (Test-CredentialText $ddOkR9)) "DENY-BY-DEFAULT-1 r9 must-pass: $ddOkR9 is not a credential" $ddOkR9
+    }
+    # r9 (sol r8 B2, defect class: a candidate list narrower than the classifier): a decoded key can end in a character the candidate name run does not hold ('passwordU+00E9', 'password!'),
+    # which Get-CredentialKeyClass still calls strong (it only looks for the word). The candidate run accepts every character that does not end a key.
+    $ddR9Sfx = @(0xE9, 0x21, 0x24, 0x40, 0x23, 0x4E2D, 0xF1)
+    $ddR9Names = @('password', 'passwd', 'secret', 'credential', 'api_key', 'private_key', 'access_key', 'token', 'client_secret', 'db.password')
+    $ddR9Key = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR9N in $ddR9Names) {
+        foreach ($ddR9S in $ddR9Sfx) {
+            $ddR9Head = $ddBsA2 + ('u{0:x4}' -f [int][char]$ddR9N[0]) + $ddR9N.Substring(1)
+            $ddR9Tail = $ddBsA2 + ('u{0:x4}' -f $ddR9S)
+            $ddR9Key.Add('{"' + $ddR9Head + $ddR9Tail + '":"hunter2"}')
+            $ddR9Key.Add('"' + $ddR9Head + $ddR9Tail + '": hunter2')
+            $ddR9Key.Add('"' + $ddR9Head + $ddR9Tail + '" = "hunter2"')
+        }
+    }
+    foreach ($ddR9N in @('{"pass' + $ddBsA2 + 'u0077ord' + $ddBsA2 + 'u00e9":"hunter2"}', '{"api' + $ddBsA2 + 'u005fkey' + $ddBsA2 + 'u00e9":"hunter2"}', '{"to' + $ddBsA2 + 'u006ben' + $ddBsA2 + 'u00e9":"hunter2"}', '{"password!":"hunter2"}', '{"password' + [string][char]0xE9 + '":"hunter2"}')) { $ddR9Key.Add($ddR9N) }
+    $ddR9KeyMiss = @($ddR9Key | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9KeyMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B2: all $($ddR9Key.Count) escaped secret keys with a decoded non-name suffix refuse" ("misses=$($ddR9KeyMiss.Count): " + (($ddR9KeyMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 B2 role guard') {
+        $ddR9KeyRole = @($ddR9Key | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR9KeyRole.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sol r8 B2 role guard: all $($ddR9Key.Count) name a secret" ("misses=$($ddR9KeyRole.Count): " + (($ddR9KeyRole | Select-Object -First 3) -join '; '))
+    }
+    foreach ($ddOkR9b in @(('{"theme' + $ddBsA2 + 'u00e9":"dark"}'), ('{"caf' + $ddBsA2 + 'u00e9' + $ddBsA2 + 'u0021":"x"}'), ('{"author' + $ddBsA2 + 'u00e9":"x"}'), ('{"password' + $ddBsA2 + 'u00e9":""}'))) {
+        if ($ddOkR9b -match 'password') { Assert-That (-not (Test-CredentialText $ddOkR9b)) "DENY-BY-DEFAULT-1 r9 must-pass: an empty literal value stays exempt under an escaped secret key with a suffix: $ddOkR9b" $ddOkR9b }
+        else { Assert-That (-not (Test-CredentialText $ddOkR9b)) "DENY-BY-DEFAULT-1 r9 must-pass: $ddOkR9b is not a credential" $ddOkR9b }
+    }
+    # r9 sibling sweep: the same two classes in the other record forms (a JSON key with an escaped colon, an escaped table header, an escaped question-mark suffix, an unquoted YAML key)
+    $ddR9Sib = @(
+        ('{"password"' + $ddBsA2 + ':"hunter2"}'),
+        ($ddBsA2 + '[password' + $ddBsA2 + ']' + "`n" + 'value = "hunter2"'),
+        ('{"pass' + $ddBsA2 + 'u0077ord' + $ddBsA2 + 'u003f":"hunter2"}'),
+        ('pass' + $ddBsA2 + 'u0077ord' + $ddBsA2 + 'u00e9: hunter2'),
+        ('const x = "' + $ddBsA2 + '<password' + $ddBsA2 + '>hunter2' + $ddBsA2 + '</password' + $ddBsA2 + '>";')
+    )
+    $ddR9SibMiss = @($ddR9Sib | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9SibMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sibling sweep: all $($ddR9Sib.Count) other record forms refuse" ("misses=$($ddR9SibMiss.Count): " + (($ddR9SibMiss | Select-Object -First 3) -join '; '))
     # r8 (adversary pass 17 A2, defect class: the reported line counted a line break that a decode produced): the line is the line of the SOURCE, not of the decoded copy
     $ddR8Line = @(
         @{ T = ('{"note":"' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded \n before the key on one source line' },

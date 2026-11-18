@@ -1211,7 +1211,7 @@ $CredentialNameWords = 'SECRET|PASS[_.\-]*W(?:OR)?D|PRIVATE[_.\-]*KEY|API[_.\-]*
 # three let a fourth closer hide the key. The run is linear (each step needs one closer), so it cannot backtrack catastrophically.
 $CredentialNameCore = (@('password', 'passwd', 'secret', 'credential', 'apikey', 'privatekey', 'accesskey', 'auth', 'token', 'pwd') | ForEach-Object { (@($_.ToCharArray()) | ForEach-Object { [string]$_ }) -join '[_.\-/\\]*' }) -join '|'   # r19 pass 22 A1: '/' and '\' separate letters as '_' does ('api/key')
 # r19 pass 21 A1: a '/' or '\' may stand inside a key name ('password/primary', 'vault\secret'): the name run is the classifier's own separators plus those two
-$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-/\\])([A-Za-z0-9_.\-/\\]*?(?:' + $CredentialNameCore + ')[A-Za-z0-9_.\-/\\]*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))'
+$CredentialKeyPattern = '(?i)(?<![A-Za-z0-9_.\-/\\])([A-Za-z0-9_.\-/\\]*?(?:' + $CredentialNameCore + ')[^\s"''`:=,;{}\[\]()<>]*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))'
 $script:CredentialKeyRegex = [regex]::new($CredentialKeyPattern)
 # r15 (hub ruling on adversary pass 12 A1-A3, DENY BY DEFAULT on the key name): the value span regexes, the quoted-run regexes and the netrc record tokenizer of
 # r14 are gone (they stripped quotes, braces, comments and CDATA before the exemption test). What is left is the CLOSED exemption list, compared against the whole
@@ -1577,6 +1577,7 @@ function Get-CredentialTableHitIndex {
 $script:CredentialXmlStartTagRegex = [regex]::new('<(?![!?/])([^\s<>/="'']+)((?:\s+[^\s<>/="'']+\s*=\s*(?:"[^"]*"|''[^'']*''))+)\s*(/?)>')
 $script:CredentialXmlAttrRegex = [regex]::new('([^\s<>/="'']+)\s*=\s*(?:"([^"]*)"|''([^'']*)'')')
 $script:CredentialXmlNameAttrs = @('key', 'name', 'id', 'property', 'variable', 'setting', 'param', 'parameter', 'field')
+# r9 (sol r8 B1 sibling): the attribute NAME is judged without backslashes and control characters, as the VALUE is: a JavaScript reader takes 'k\ey' as 'key' (the identity escape of a letter).
 # r2 pass 4 A4: -NameOnly returns the first start tag whose naming attribute is secret-named (or holds an undecodable escape) WHATEVER the other values are; the Import
 # credential-ROLE guard (Test-CredentialNamePresent) asks whether a name is present, not whether a value is.
 function Get-CredentialXmlAttrPairHitIndex {
@@ -1584,7 +1585,7 @@ function Get-CredentialXmlAttrPairHitIndex {
     foreach ($tm in $script:CredentialXmlStartTagRegex.Matches($Text)) {
         $attrs = @(foreach ($am in $script:CredentialXmlAttrRegex.Matches($tm.Groups[2].Value)) {
                 $vg = $(if ($am.Groups[2].Success) { $am.Groups[2] } else { $am.Groups[3] })
-                [pscustomobject]@{ N = ($am.Groups[1].Value -replace '^.*:', '').ToLowerInvariant(); V = $vg.Value; At = $tm.Groups[2].Index + $vg.Index }
+                [pscustomobject]@{ N = (($am.Groups[1].Value -replace '^.*:', '') -replace '[\\\p{Cc}]', '').ToLowerInvariant(); V = $vg.Value; At = $tm.Groups[2].Index + $vg.Index }
             })
         $namer = -1
         for ($j = 0; $j -lt $attrs.Count; $j++) {
@@ -1649,9 +1650,12 @@ for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyName
 # r4 (adversary pass 10 A1-A2, defect class: an escape a reader decodes that the normaliser left as written): JSON, YAML, TOML and C also decode the escaped backslash
 # '\\' (so '"pass\\U0011FFFFord"' is the key 'pass\U0011FFFFord', whose undecodable escape is deny by default) and the one-letter escapes '\n' '\t' '\r' '\b' '\f' '\"'
 # ('<add key=''pass\nword'' .../>' inside a JSON string is the naming value 'pass<LF>word', 'password' once its blanks are removed). Each is decoded on its own level.
+# r9 (sol r8 B1, defect class: an escape a reader decodes that the normaliser left as written): JavaScript, Python and C read a backslash before any character they have no escape
+# for as that character ("<add key\='p a s s w o r d' value='hunter2' />" is an intact pair to Node), so the identity escape of any punctuation character ('\=' '\>' '\:' ...) is decoded
+# (group idp; a letter or digit after a backslash stays as written: the name rules already treat '\' as a name separator). Over-decoding is safe: the copy only adds hits.
 # r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): the rest of the YAML double-quoted escape table is decoded on its own level
 # too: '\v' (VT), '\a' (BEL), '\e' (ESC), '\L' (U+2028) and '\P' (U+2029), '\_' (U+00A0), '\ ' (a blank) and '\<TAB>'. '\0' and '\N' stay undecoded, which the residual rule refuses.
-$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"''?vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psq>["''`$])|`(?<psl>[\s\S])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"''?vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\}|(?<idp>[^\w\s]))|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psq>["''`$])|`(?<psl>[\s\S])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
 $script:CredentialEntities = @{ 'amp' = '&'; 'lt' = '<'; 'gt' = '>'; 'quot' = '"'; 'apos' = "'" }
 # r5 (adversary pass 12 A1, defect class: an escape a reader decodes that the normaliser left as written): the special PowerShell backtick escapes were kept as written
 # ('"pass`nword"' is 'pass<LF>word' to PowerShell); each is decoded on its own level now, and a backtick-escaped quote, '$' or backtick is that character ('`"password`"' frames an XML pair).
@@ -1705,6 +1709,7 @@ $script:CredentialEscapeEval = {
         if ($g['sl'].Success) { return '/' }
         if ($g['bs'].Success) { return '\' }   # r4 pass 10 A1
         if ($g['one'].Success) { return $script:CredentialOneLetterEscapes[$g['one'].Value] }   # r4 pass 10 A2
+        if ($g['idp'].Success) { return $g['idp'].Value }   # r9 sol r8 B1: an identity escape, '\' before any other punctuation character is that character
         if ($g['x'].Success) { return [string][char][Convert]::ToInt32($g['x'].Value, 16) }
         if ($g['psq'].Success) { return $g['psq'].Value }   # r5 adversary pass 12 A1: a backtick-escaped quote, '$' or backtick is that character
         if ($g['psl'].Success) { if ($script:CredentialPsControls.ContainsKey($g['psl'].Value)) { return $script:CredentialPsControls[$g['psl'].Value] }; return $g['psl'].Value }
