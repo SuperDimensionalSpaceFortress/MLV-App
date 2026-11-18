@@ -257,12 +257,27 @@ class OutputShapeTests(unittest.TestCase):
         self.assertIn("every hour", text)
         self.assertIn("7 or more days old", text)
         self.assertIn("refresh card", text)
-        self.assertIn("`--check` is a manual tool", text)
+        self.assertIn("`--check` is manual; no CI runs it", text)
         # the drift detector compares card names, priorities and the WORDS of the scope notes above the open table (whitespace-normalised): not the
         # generated stamp, the Drain section, a state-only change or the parked notes (r3 sol blocker D-06: "notes differ" claimed all of them)
         # (the header must not use the word "scope": a queue without scope notes renders none, see ScopeNoteTests)
         self.assertIn("open cards, priorities or pre-table note words differ", text)
         self.assertNotIn("or notes differ", text)
+        # r4 (sol + opus blocker): the filing promise is conditional. The detector reads every table row's priority as an integer and throws on
+        # anything else, so a render holding a row it cannot read (the capped owner summary row's "-" priority, an empty state, a boolean or
+        # out-of-Int64 priority) is verdict=unknown and files nothing. The header must say so; "this file is" names the tracked file, not the live copy.
+        self.assertIn("a drift detector files a refresh card, or none if a row will not parse.", text)
+        self.assertIn("When this file is\n7 or more days old and its open cards", text)
+
+    def test_the_header_condition_matches_a_render_the_detector_cannot_read(self) -> None:
+        # The case the header's "or none" names, built from the real renderer: more owner asks of another kind than OWNER_LIST_MAX makes the
+        # renderer append a summary row whose priority cell is "-", which the detector refuses (roadmap-tracked-drift.ps1 priority-not-integer).
+        data = load_fixture()
+        data["rows"] = [dict(card="OWN-%02d" % i, kind="hub-tooling", priority=3, state="queued",
+                             source_ledger_stamp="2026-10-20T00:00:00Z", origin="owner") for i in range(render_roadmap.OWNER_LIST_MAX + 1)]
+        text = render_roadmap.render(data)
+        self.assertIn("| - | ... and 1 more open owner asks of another kind (card-queue.json) | - | - | - | - |", text)
+        self.assertIn("or none if a row will not parse", text)
 
     def test_the_bare_tier_header_drops_the_false_claim_at_master_s_byte_count(self) -> None:
         # The bare tier is held to master's byte count (the 20000-byte window): its true sentence is the same 40 bytes as the false one it replaces.

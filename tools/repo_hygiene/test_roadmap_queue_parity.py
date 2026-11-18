@@ -5,7 +5,8 @@ Asserts `docs/roadmap.md` (the tracked product-backlog view) keeps the shape tha
 or `card-queue.json`, which are gitignored and absent from every hosted checkout
 (O97/O106). Freshness against the board's card-queue.json is `render_roadmap.py --check`,
 a manual tool that no hub job or CI job runs: the hub re-renders an untracked live copy hourly
-and a drift detector files a refresh card (ROADMAP-RENDER-CHECK-CI-1). Until
+and a drift detector files a refresh card (ROADMAP-RENDER-CHECK-CI-1), or none when a row of the render will
+not parse (for example the capped owner summary row). Until
 ROADMAP-REFRESH-FROM-CARD-QUEUE-1 the roadmap mirrored the
 procedure files at `docs/lane-prompts/v2/`; it no longer does, and those checks are gone.
 

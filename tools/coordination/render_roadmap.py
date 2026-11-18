@@ -89,21 +89,24 @@ TOKEN_TRAILING_PUNCT = ".,;:)]}'\""
 # had mostly landed" history sentence is what paid for the longer freshness text.
 # What the drift detector (board-local roadmap-tracked-drift.ps1) really compares: card names, priorities and the WORDS of the scope notes above
 # the open table (whitespace-normalised). Not the parked notes, not state or kind, not the generated stamp or the Drain section (r3 sol D-06).
+# It also reads every table row's priority as an integer and throws on anything else, which files nothing (verdict=unknown): the capped owner
+# summary row ("-" priority, the "... and N more" row emitted near line 474), an empty state, a boolean or out-of-Int64 priority. The header says "or none if a row will not
+# parse" for that (r4 sol + opus blocker). The parse mismatch itself is the detector's, board-local and outside this PR (OPEN, see the PR comment).
 HEADER = """\
 # MLV-App product roadmap
 
-Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`,
-the dispatch surface. That file sits under `.claude-state/hub-autopilot/`,
+Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`.
+That file sits under `.claude-state/hub-autopilot/`,
 gitignored, absent from hosted checkouts, so this is the only place a reviewer
-without local state sees the open backlog. Where they disagree, `card-queue.json`
+without local state sees the open backlog. Where they differ, `card-queue.json`
 wins: re-render, do not edit by hand. The hub renders a copy to
-`.claude-state/heartbeat/roadmap-live.md` every hour. When its
-open cards, priorities or pre-table note words differ from the queue and it is 7 or more days old,
-a drift detector files a refresh card. `--check` is a manual tool; no CI job runs it.
+`.claude-state/heartbeat/roadmap-live.md` every hour. When this file is
+7 or more days old and its open cards, priorities or pre-table note words differ from the queue,
+a drift detector files a refresh card, or none if a row will not parse. `--check` is manual; no CI runs it.
 
 Only rows with `kind` of `product` or `playback` are shown, plus owner asks
 (`origin` = `owner`) of any kind. Hub-tooling, factory, hygiene and ci-flake cards are
-tooling churn, not counted here. Unclassified rows are not counted, even if
+tooling churn, not counted. Unclassified rows are not counted, even if
 the card name says PLAYBACK, unless the owner asked.
 """
 # The bare (last) render tier is master's file for every board without a resolved owner park (a resolved one is labelled with its
