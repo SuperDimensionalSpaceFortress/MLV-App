@@ -2832,6 +2832,8 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         'p5 A1 a decoded backslash joins a null line'             = "`"password`": \`n  null"
         'p5 A1 sibling: the same in a table body'                 = "[`"password`"]`nx = \`n  null"
         'p5 A1 sibling: a raw escaped line break before null'     = "`"password`": \`n  null"
+        # r2 pass 6 A1: a reader decodes ONCE; the deeper level ('password suffix') names nothing, the first level ('password suffix') does
+        'p6 A1 an escaped backslash before a second escape'       = '{"password\u0020suffix":"hunter2"}'
     }
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
@@ -2854,6 +2856,7 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         # r2 pass 4 A4: a residual XML naming attribute names a secret whatever its value (an empty one included), also inside a config.toml string
         Assert-That (Test-CredentialNamePresent "<add key='pass&w;ord' value='' />") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: a residual XML naming attribute with an empty value names a secret'
         Assert-That (Test-CredentialNamePresent "xml = `"<add key='pass&w;ord' value='' />`"") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: the same inside a config.toml string'
+        Assert-That (Test-CredentialNamePresent "xml = `"<add key='p a s s w o r d' value='' />`"") 'DENY-BY-DEFAULT-1 r2 adversary p6 A3 role guard: a spaced XML naming attribute with no escape names a secret'
     }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
@@ -2896,7 +2899,10 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         # r2 pass 5 A2: a non-UTF-8 byte right after the delimiter ('?' and '#'); A3: the secret inside an embedded url's path
         @{ N = 11; Url = ('file:///' + ((New-Scratch 'dd-s3-absent11') -replace '\\', '/') + '/absent.git?%80qzv'); Tok = @('qzv') },
         @{ N = 12; Url = ('file:///' + ((New-Scratch 'dd-s3-absent12') -replace '\\', '/') + '/absent.git#%80qzw'); Tok = @('qzw') },
-        @{ N = 13; Url = ('file:///' + ((New-Scratch 'dd-s3-absent13') -replace '\\', '/') + '/absent.git?token=https://h.example/SECRET0013?x=y'); Tok = @('SECRET0013') }
+        @{ N = 13; Url = ('file:///' + ((New-Scratch 'dd-s3-absent13') -replace '\\', '/') + '/absent.git?token=https://h.example/SECRET0013?x=y'); Tok = @('SECRET0013') },
+        # r2 pass 6 A2: a '%XX' in the PATH too (git prints 'absent80'), in the query and the fragment form
+        @{ N = 14; Url = ('file:///' + ((New-Scratch 'dd-s3-absent14') -replace '\\', '/') + '/absent%80-14.git?%80qzx'); Tok = @('qzx') },
+        @{ N = 15; Url = ('file:///' + ((New-Scratch 'dd-s3-absent15') -replace '\\', '/') + '/absent%80-15.git#%80qzy'); Tok = @('qzy') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"

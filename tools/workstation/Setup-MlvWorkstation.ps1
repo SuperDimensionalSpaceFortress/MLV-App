@@ -226,9 +226,14 @@ function Register-UrlSecretParts {
             # without the scheme) is an ANCHOR, as written and decoded; Write-Log drops everything after an anchor's '?' or '#' to the end of the line, exactly as the
             # scheme rule does for a 'scheme://' url, whatever bytes, embedded urls or rewritten text follow.
             $anc = $rest.Substring(0, $q)
-            # git prints a file:// path with its leading '/' ('/C:/r.git?x') or without it ('C:/r.git#x', the fragment form), so both spellings are anchors
-            $ancForms = @($anc, $(try { [Uri]::UnescapeDataString($anc) } catch { $anc }))
-            foreach ($a in @($ancForms + @($ancForms | ForEach-Object { $_.TrimStart('/') }))) { if ($a.Length -ge 2 -and -not $script:UrlSecretAnchors.Contains($a)) { $script:UrlSecretAnchors.Add($a) } }
+            # git prints a file:// path with its leading '/' ('/C:/r.git?x') or without it ('C:/r.git#x', the fragment form), and prints a '%XX' in the path as written,
+            # decoded, as a replacement character or as the bare hex digits ('ABSENT%80' is printed 'ABSENT80', r2 pass 6 A2). The anchor is therefore a PATTERN: the
+            # leading '/' optional, and each '%XX' any run of up to four characters that cannot end the path.
+            $core = $anc.TrimStart('/')
+            if ($core.Length -ge 2) {
+                $pat = '/?' + ((@([regex]::Split($core, '%[0-9A-Fa-f]{2}')) | ForEach-Object { [regex]::Escape($_) }) -join '[^\s''"?#]{0,4}?')
+                if (-not $script:UrlSecretAnchors.Contains($pat)) { $script:UrlSecretAnchors.Add($pat) }
+            }
             # r2 pass 4 A3 (defect class: redaction-order dependence): the scheme rule runs first and rewrites an EMBEDDED url ('&redirect=https://h/x?q=1' becomes
             # '...https://h/x?***'), so the whole registered part no longer matches. Everything up to and including each embedded 'scheme://' survives that rule unchanged,
             # so each such prefix is recorded too.
@@ -254,7 +259,7 @@ function Write-Log {
     # (a remote-mismatch refusal, a native command line, git's own error text quoting a remote)
     $Message = ConvertTo-RedactedUrlText $Message
     # r2 pass 5 A2/A3: after the scheme rule (r1 A5 order), an anchor's '?' or '#' drops the rest of the line
-    foreach ($a in @($script:UrlSecretAnchors | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(' + [regex]::Escape($a) + ')[?#][^\r\n]*', '$1?***') }
+    foreach ($a in @($script:UrlSecretAnchors | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(' + $a + ')[?#][^\r\n]*', '$1?***') }   # $a is a pattern (Register-UrlSecretParts)
     # DENY-BY-DEFAULT-1 S3: then every registered url secret part, wherever it stands (git's echo of a url without its scheme included); longest first (r1 A5: after the scheme rule)
     foreach ($p in @($script:UrlSecretParts | Sort-Object Length -Descending)) { $Message = $Message.Replace($p, '***') }
     # r2 pass 4 A2: a recorded HEAD (and the rest of its word) where it starts the line or follows a redacted part
@@ -1636,16 +1641,21 @@ function Invoke-CredentialMaskedReplace {
     return [pscustomobject]@{ Text = $sb.ToString(); Mask = $mb.ToString() }
 }
 $script:CredentialLineBreakEval = { param($m) "`n" }
+# r2 pass 6 A1 (defect class: over-decoding can REMOVE a hit): a reader decodes ONCE ('password\u0020suffix' is the key 'password suffix'); the fixed
+# point decodes on to 'password suffix', which no candidate matches. Every decode LEVEL is therefore kept (.Stages, one per pass of the loop, each with its mask) and the
+# decoded pass judges each one: the first level a reader may stop at, every deeper level a nested reader may reach.
 function Get-CredentialNormalForm([string]$Text) {
     $s = "$Text"; $mask = [string]::new([char]'0', $s.Length)
+    $stages = [System.Collections.Generic.List[object]]::new()
     while ($true) {
         $r = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
         if ($r) { $s = $r.Text; $mask = $r.Mask }
         $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
         if ($b) { $s = $b.Text; $mask = $b.Mask }
         if (-not $r -and -not $b) { break }
+        $stages.Add([pscustomobject]@{ Text = $s; Mask = $mask })
     }
-    return [pscustomobject]@{ Text = $s; Mask = $mask }
+    return [pscustomobject]@{ Text = $s; Mask = $mask; Stages = $stages }
 }
 
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
@@ -1675,9 +1685,13 @@ function Get-CredentialHitLine {
         # off the exemption list (r1 pass 2 A1: '"password": \156ull'); a key still holding an undecodable escape is secret-named (-Residual, deny by default).
         $nf = Get-CredentialNormalForm $Text
         if ($nf.Text -cne $Text -or $script:CredentialResidualIntroRegex.IsMatch($Text)) {
-            $Text = $nf.Text
-            $script:CredentialDecodedMask = $nf.Mask
-            try { $idx = Get-CredentialHitIndex -Text $Text -Residual $true } finally { $script:CredentialDecodedMask = $null }
+            # r2 pass 6 A1: every decode level, shallowest first (a text with only undecodable escapes has none: it is judged as its own normal form)
+            $levels = @($nf.Stages); if ($levels.Count -eq 0) { $levels = @($nf) }
+            foreach ($lv in $levels) {
+                $script:CredentialDecodedMask = $lv.Mask
+                try { $idx = Get-CredentialHitIndex -Text $lv.Text -Residual $true } finally { $script:CredentialDecodedMask = $null }
+                if ($idx -ge 0) { $Text = $lv.Text; break }
+            }
         }
     }
     if ($idx -lt 0) { return 0 }
@@ -2050,6 +2064,8 @@ function Test-CredentialNamePresent {
     param([string]$Text)
     if (-not $Text) { return $false }
     $texts = @($Text)
+    # r2 pass 6 A3: an XML naming attribute that names a secret ('p a s s w o r d': blanks removed first) counts with or without an escape in the text
+    if ((Get-CredentialXmlAttrPairHitIndex -Text $Text -NameOnly) -ge 0) { return $true }
     if (Test-CredentialEscapesPresent $Text) {
         $dec = ConvertFrom-CredentialEscapes $Text   # r23 (pass 27 A1 sibling): the same decoder as the content guard (DENY-BY-DEFAULT-1: every escape form it decodes)
         # DENY-BY-DEFAULT-1 sibling: a key in the decoded copy that still holds an undecodable escape names a secret, as in the content guard (deny by default)
