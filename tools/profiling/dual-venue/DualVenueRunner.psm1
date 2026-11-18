@@ -4556,8 +4556,9 @@ $script:ExportCdngStageWindowTable = @(
     [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6258-6271', 'llrawproc.c:7022-7032') }
     # The lock times. shared_lock: the first lock :5142-5288 (or :5142-5376 when the stripes block :5285-5317 does not run; both lie inside the two windows listed), the stripes publish lock
     # :5302-5312 and the relock :5314-5376, the reset lock :4688-4696 (:4696), the scaled snapshot lock :6731-6815, AND the refine and publish lock times added to it (:6131, :6293, :7058).
+    # (adversary pass17 A1: because shared_lock ACCUMULATES the refine and publish lock times, it CONTAINS them: each, and their disjoint sum, is inside shared_lock; contains = those rows)
     [ordered]@{ name = 'llrawproc_shared_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:5142-5288', 'llrawproc.c:5302-5376', 'llrawproc.c:4688-4696', 'llrawproc.c:6731-6815',
-        'llrawproc.c:6063-6130', 'llrawproc.c:6288-6292', 'llrawproc.c:7053-7057') }
+        'llrawproc.c:6063-6130', 'llrawproc.c:6288-6292', 'llrawproc.c:7053-7057'); contains = @('llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock') }
     [ordered]@{ name = 'llrawproc_dualiso_refine_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6063-6130') }
     [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6288-6292', 'llrawproc.c:7053-7057') }
     # pre_dualiso_fix is apply_start .. :5463 (:5014-5463). The scaled path does not reset it (:6615-6625 resets every other timer, not this one), so a scaled call may carry a previous
@@ -4610,8 +4611,11 @@ function Get-DvExportCdngDisjointGroups {
     $groups = [System.Collections.Generic.List[object]]::new()
     $parents = [System.Collections.Generic.List[string]]::new()
     foreach ($n in $names) { $p = [string]$rows[$n].parent; if ($p -and -not $parents.Contains($p)) { $parents.Add($p) } }
+    # (pass17 A1: a row that accumulates sibling timers (contains) is a parent of those rows too, for the groups; the pairs are Get-DvExportCdngContainedPairs)
+    foreach ($n in $names) { if ($rows[$n].Contains('contains') -and @($rows[$n].contains).Count -and -not $parents.Contains($n)) { $parents.Add($n) } }
     foreach ($parent in $parents) {
-        $desc = [string[]]@(foreach ($n in $names) { if ($chain[$n].IndexOf($parent) -gt 0) { $n } })
+        $desc = [string[]]@($(if ($rows.ContainsKey($parent) -and $rows[$parent].Contains('contains')) { @($rows[$parent].contains) }
+                              else { @(foreach ($n in $names) { if ($chain[$n].IndexOf($parent) -gt 0) { $n } }) }))
         $nbr = @{}
         foreach ($v in $desc) { $s = [System.Collections.Generic.HashSet[string]]::new(); foreach ($w in $desc) { if ($w -cne $v -and -not $overlap["$v|$w"]) { [void]$s.Add($w) } }; $nbr[$v] = $s }
         $cliques = [System.Collections.Generic.List[object]]::new()
@@ -4662,6 +4666,13 @@ function Get-DvExportSiblingsMeet {
     Get-DvExportWindowsMeet -A @($Rows[$First].windows) -B @($Rows[$Second].windows)
 }
 $script:ExportCdngSumGroups = Get-DvExportCdngDisjointGroups
+
+function Get-DvExportCdngContainedPairs {
+    # (adversary pass17 A1) child -> container pairs for each row a table row accumulates (contains): refine 10 + publish 10 beside a 0 ms shared_lock read PASS.
+    param($Table = $script:ExportCdngStageWindowTable)
+    , [object[]]@(foreach ($row in $Table) { if ($row.Contains('contains')) { foreach ($m in @($row.contains)) { , [string[]]@([string]$m, [string]$row.name) } } })
+}
+$script:ExportCdngContainedPairs = Get-DvExportCdngContainedPairs
 
 # r8 fix 3 (adversary pass 10 A2): DISJOINT siblings together are inside their parent too: each below its parent is no proof that the pair is (10 + 10 ms inside a 10 ms parent).
 # Each group is (the disjoint children, the parent); the rendered tree's groups below.
@@ -4966,6 +4977,7 @@ function Get-DvExportEvidence {
             # llrawproc_other (dual_iso 30 + publish_lock 90 inside a 100 ms total read PASS).)
             # r17 (pass16 A1, CDNG-STAGE-WINDOW-TABLE-1): every one of these groups, and every other maximal disjoint group, is DERIVED from $script:ExportCdngStageWindowTable
             # (Get-DvExportCdngDisjointGroups): each llrawproc group inside llrawproc and, with the producer's other members, inside producer_frame, whether or not llrawproc_ms is published.
+            $pairs += @($script:ExportCdngContainedPairs)   # (pass17 A1: refine and publish are inside the shared_lock they accumulate into)
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs -SumGroups $script:ExportCdngSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed
