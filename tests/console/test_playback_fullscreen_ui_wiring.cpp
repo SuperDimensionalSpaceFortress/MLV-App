@@ -43,7 +43,7 @@ TEST(PlaybackFullscreenUiWiring, MenuEntryIsNotForceHidden)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     ASSERT_FALSE(source.contains(QStringLiteral("ui->actionFullscreen->setVisible( false )")));
-    // Still added to the View menu in the .ui -- nothing hides it after setupUi() runs.
+    // Still added to the Playback menu (MainWindow.ui:291) -- nothing hides it after setupUi() runs.
     const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
     ASSERT_TRUE(ui.contains(QStringLiteral("<addaction name=\"actionFullscreen\"/>")));
 }
@@ -152,6 +152,36 @@ TEST(PlaybackFullscreenUiWiring, SmokeGeometryVerificationUsesTheSameScreenChoic
     ASSERT_TRUE(body.contains(QStringLiteral("QScreen *presentationScreen = this->screen();")));
     ASSERT_TRUE(body.contains(QStringLiteral("presentationScreen = this->screen();")));
     ASSERT_TRUE(body.contains(QStringLiteral("const bool onTarget = ( presentationScreen == target );")));
+}
+
+TEST(PlaybackFullscreenUiWiring, PlayerShortcutsAreBoundToTheWindowAndKeepWindowScope)
+{
+    // PLAYER-FULLSCREEN-SHORTCUTS-LIVE-1: fullscreen hides the menu bar and toolbar, the only
+    // visible carriers of the player actions, so MainWindow binds them to itself as well. The
+    // behaviour is proven by gui_tests fullscreenLiveShortcuts_*; this pins the call site.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("#include \"PlayerShortcutBinding.h\"")));
+    const int bindAt = source.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"));
+    ASSERT_TRUE(bindAt >= 0);
+    ASSERT_TRUE(source.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"), bindAt + 1) < 0);
+    // Inside initGui(), which the constructor calls after ui->setupUi(this) -- the actions
+    // must exist when it runs (bindToWindow() warns for any it cannot find).
+    const QString initGui = functionBody(source,
+        QStringLiteral("void MainWindow::initGui( void )"),
+        QStringLiteral("void MainWindow::initLib( void )"));
+    ASSERT_FALSE(initGui.isEmpty());
+    ASSERT_TRUE(initGui.contains(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );")));
+    const int setupAt = source.indexOf(QStringLiteral("ui->setupUi(this);"));
+    const int initGuiCallAt = source.indexOf(QStringLiteral("    initGui();"), setupAt);
+    ASSERT_TRUE(setupAt >= 0);
+    ASSERT_TRUE(initGuiCallAt > setupAt);
+
+    // Window scope kept: the helper never changes the shortcut context. ApplicationShortcut
+    // would fire while a non-modal dialog (StatusDialog) has focus.
+    const QString helper = readRepoFile(QStringLiteral("platform/qt/PlayerShortcutBinding.h"));
+    ASSERT_FALSE(helper.contains(QStringLiteral("setShortcutContext")));
+    ASSERT_FALSE(helper.contains(QStringLiteral("ApplicationShortcut")));
+    ASSERT_TRUE(helper.contains(QStringLiteral("window->addAction( action );")));
 }
 
 TEST(PlaybackFullscreenUiWiring, HeaderStillDeclaresTheAction)
