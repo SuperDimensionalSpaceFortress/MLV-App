@@ -2545,6 +2545,17 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             self._mutated(restart, restart + "\n    ui->actionPlay->setChecked( false );"))
         self.assertTrue(any("MainWindow::runGuiPlaybackSmoke" in p and "(3, 0, 2)" in p for p in problems), problems)
 
+    def test_player_fullscreen_keeps_playing_1_a_resize_stop_is_an_unreviewed_stop(self) -> None:
+        # PLAYER-FULLSCREEN-KEEPS-PLAYING-1: resizeEvent no longer stops Play, so its pin is gone; putting the old
+        # stop back (a fullscreen toggle ends playback again) must fail the scan by naming the function.
+        from tools.repo_hygiene.app_play_scan import REVIEWED_PLAY_STOPS
+        self.assertNotIn("MainWindow::resizeEvent", REVIEWED_PLAY_STOPS)
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        anchor = "case resize_playback_policy::Action::KeepPlaying:"
+        problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n        ui->actionPlay->setChecked( false );"))
+        self.assertTrue(problems, "the scan did not go red on a resize stop")
+        self.assertTrue(any("unreviewed Play stop in MainWindow::resizeEvent" in p for p in problems), problems)
+
     def test_enforce3_the_reviewed_stop_table_covers_every_stop_in_the_real_sources(self) -> None:
         from tools.repo_hygiene.app_play_scan import REVIEWED_PLAY_STOPS
         for function in ("MainWindow::MainWindow", "MainWindow::runGuiPlaybackSmoke",
