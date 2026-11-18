@@ -93,6 +93,7 @@ class SourceWriteGuard;
 class QAction;
 class QElapsedTimer;
 class QScreen;
+class QWindow;
 
 class MainWindow : public QMainWindow
 {
@@ -660,6 +661,7 @@ private slots:
     void onPlaybackPrepResultReady( void );
 
 private:
+    void installGlWindowViewerInput( QWindow *glWindow );
     struct DisplayPreviewCacheEntry
     {
         bool valid = false;

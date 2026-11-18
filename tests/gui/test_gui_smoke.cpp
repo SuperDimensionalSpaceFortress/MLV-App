@@ -4,6 +4,7 @@
 #include "../../platform/qt/DualIsoPatternMapping.h"
 #include "../../platform/qt/GpuDisplayViewport.h"
 #include "../../platform/qt/GpuDisplayWindow.h"
+#include "../../platform/qt/GpuWindowViewerInputForwarder.h"
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/Histogram.h"
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
@@ -686,6 +687,16 @@ private slots:
     void scopesLabelDispatchesRawWaveformExactly();
     void scopesLabelDispatchesRawParadeExactly();
     void scopesLabelDispatchesRawVectorScopeExactly();
+    void glWindowViewerInput_picksMapToSceneAndRespectArming();
+    void glWindowViewerInput_contextMenuOnPlatformTriggerOnly();
+    void glWindowViewerInput_dragAndDropReachTheHooks();
+    void glWindowViewerInput_otherObjectsAreIgnored();
+    void glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal();
+    void glWindowViewerInput_edgePicksStayInsideTheImage();
+    void glWindowViewerInput_roundedSceneEdgeStillPicks();
+    void glWindowViewerInput_noDrawnPictureIsNoPick();
+    void glWindowViewerInput_getterRefusesWhileAFrameIsHandedOver();
+    void glWindowViewerInput_getterRecordsThePaintedPicture();
 };
 
 void GuiSmokeTest::checkedStateUpdatesPalette()
@@ -3722,6 +3733,477 @@ void GuiSmokeTest::scopesLabelDispatchesRawVectorScopeExactly()
     const QImage actual = render_scopes_label_output(raw, 16, 8, false, false, ScopesLabel::ScopeVectorScope);
     QVERIFY(!actual.isNull());
     assert_expected_hash(expected_hashes, QStringLiteral("scopeslabel.raw_vectorscope"), actual);
+}
+
+// PLAYER-GL-WINDOW-INPUT-PARITY-1: the GL display window's viewer-input forwarder, driven on a
+// plain QWindow (never shown) with hooks that record their calls.
+namespace
+{
+
+struct GlWindowInputRecorder
+{
+    int wbCalls = 0;
+    int bpCalls = 0;
+    QPoint lastPick;
+    int menuCalls = 0;
+    QPoint lastMenuGlobal;
+    int dragEnterCalls = 0;
+    int dropCalls = 0;
+    QStringList droppedPaths;
+    bool wbArmed = false;
+    bool bpArmed = false;
+};
+
+// Sees only the mouse-button events the forwarder did not consume (filters run newest first, so
+// this one, installed before the forwarder, runs after it). Other events (ChildAdded when the
+// forwarder is parented to the window) are not counted.
+class PassThroughSpy : public QObject
+{
+public:
+    int seen = 0;
+    bool eventFilter(QObject *, QEvent *event) override
+    {
+        if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease) ++seen;
+        return false;
+    }
+};
+
+gpu_window_input::Forwarder *installRecordingForwarder(QWindow *window, GlWindowInputRecorder *rec)
+{
+    gpu_window_input::Forwarder::Hooks hooks;
+    // A 1920x804 clip in fit mode with a scene of the same size: the slots' conversion is the identity.
+    hooks.pickBasis = []() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = QSizeF(1920, 804);
+        basis.rawWidth = 1920;
+        basis.rawHeight = 804;
+        return basis;
+    };
+    // As if paintGL last drew the scene-sized image letterboxed into the window.
+    hooks.drawnPicture = [window]() { return gpu_window_input::letterboxRect(QSizeF(window->size()), QSizeF(1920, 804)); };
+    hooks.wbArmed = [rec]() { return rec->wbArmed; };
+    hooks.bpArmed = [rec]() { return rec->bpArmed; };
+    hooks.pickWhiteBalance = [rec](int x, int y) { ++rec->wbCalls; rec->lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [rec](int x, int y) { ++rec->bpCalls; rec->lastPick = QPoint(x, y); };
+    hooks.contextMenuAtGlobal = [rec](const QPoint & global) { ++rec->menuCalls; rec->lastMenuGlobal = global; };
+    hooks.dragEnter = [rec](QDragEnterEvent * e) {
+        ++rec->dragEnterCalls;
+        if (e->mimeData()->hasUrls()) e->acceptProposedAction();
+    };
+    hooks.openFiles = [rec](const QStringList & paths) { ++rec->dropCalls; rec->droppedPaths = paths; };
+    auto *forwarder = new gpu_window_input::Forwarder(window, std::move(hooks));
+    window->installEventFilter(forwarder);
+    return forwarder;
+}
+
+void deliverMouse(QObject *receiver, QEvent::Type type, Qt::MouseButton button, const QPointF & local, const QPointF & global)
+{
+    QMouseEvent event(type, local, global, button, type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::MouseButtons(button), Qt::NoModifier);
+    QCoreApplication::sendEvent(receiver, &event);
+}
+
+} // namespace
+
+void GuiSmokeTest::glWindowViewerInput_picksMapToSceneAndRespectArming()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    QCOMPARE(window.size(), QSize(1920, 1080));
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    installRecordingForwarder(&window, &rec);
+
+    // White balance armed: the window centre is the scene centre (1920x804 letterboxed into 1920x1080).
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(rec.lastPick, QPoint(960, 402));
+    QCOMPARE(spy.seen, 0); // consumed: the filter returned true
+
+    // A press on the top black bar calls nothing (and is still consumed).
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 20), QPointF(960, 20));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(spy.seen, 0);
+
+    // Bad-pixel armed only: the bad-pixel hook instead.
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(0.5, 138.5), QPointF(0.5, 138.5));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(0, 0));
+    QCOMPARE(spy.seen, 0);
+
+    // Neither armed: nothing is called and the event passes through (the filter returned false).
+    rec.bpArmed = false;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(spy.seen, 1);
+}
+
+void GuiSmokeTest::glWindowViewerInput_contextMenuOnPlatformTriggerOnly()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    installRecordingForwarder(&window, &rec);
+    rec.wbArmed = true; // the menu does not depend on arming
+
+    const bool onRelease = gpu_window_input::contextMenuOnReleaseDefault();
+    const QEvent::Type trigger = onRelease ? QEvent::MouseButtonRelease : QEvent::MouseButtonPress;
+    const QEvent::Type other = onRelease ? QEvent::MouseButtonPress : QEvent::MouseButtonRelease;
+
+    deliverMouse(&window, other, Qt::RightButton, QPointF(100, 200), QPointF(1234, 567));
+    QCOMPARE(rec.menuCalls, 0);
+    QCOMPARE(rec.wbCalls, 0);
+
+    deliverMouse(&window, trigger, Qt::RightButton, QPointF(100, 200), QPointF(1234, 567));
+    QCOMPARE(rec.menuCalls, 1);
+    QCOMPARE(rec.lastMenuGlobal, QPoint(1234, 567));
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(spy.seen, 1); // only the non-trigger event passed through
+}
+
+void GuiSmokeTest::glWindowViewerInput_dragAndDropReachTheHooks()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    installRecordingForwarder(&window, &rec);
+
+    QMimeData mime;
+    const QList<QUrl> urls = { QUrl::fromLocalFile(QStringLiteral("C:/drop-test/first.dat")),
+                               QUrl::fromLocalFile(QStringLiteral("C:/drop-test/second.dat")) };
+    mime.setUrls(urls);
+
+    QDragEnterEvent enter(QPoint(100, 100), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(&window, &enter);
+    QCOMPARE(rec.dragEnterCalls, 1);
+    QVERIFY(enter.isAccepted());
+
+    QDragMoveEvent move(QPoint(120, 110), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    move.ignore();
+    QCoreApplication::sendEvent(&window, &move);
+    QVERIFY(move.isAccepted());
+    QCOMPARE(rec.dragEnterCalls, 1);
+
+    // Every local path reaches the hook, in order (the scene's filesDropped list), and the drop
+    // is accepted; a non-file URL is skipped as the scene skips it.
+    QMimeData mixed;
+    mixed.setUrls({ urls.at(0), QUrl(QStringLiteral("https://example.invalid/x")), urls.at(1) });
+    QDropEvent drop(QPointF(120, 110), Qt::CopyAction, &mixed, Qt::LeftButton, Qt::NoModifier);
+    drop.ignore();
+    QCoreApplication::sendEvent(&window, &drop);
+    QCOMPARE(rec.dropCalls, 1);
+    QCOMPARE(rec.droppedPaths, QStringList({ urls.at(0).toLocalFile(), urls.at(1).toLocalFile() }));
+    QVERIFY(drop.isAccepted());
+}
+
+void GuiSmokeTest::glWindowViewerInput_otherObjectsAreIgnored()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    gpu_window_input::Forwarder *forwarder = installRecordingForwarder(&window, &rec);
+    rec.wbArmed = true;
+
+    QWindow otherWindow;
+    otherWindow.resize(1920, 1080);
+    otherWindow.installEventFilter(forwarder);
+    PassThroughSpy spy;
+    otherWindow.installEventFilter(&spy); // newest: runs first, so it sees every event
+    deliverMouse(&otherWindow, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(spy.seen, 1);
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(rec.menuCalls, 0);
+    // The direct answer for a foreign watched object is false.
+    QMouseEvent press(QEvent::MouseButtonPress, QPointF(960, 540), QPointF(960, 540), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QVERIFY(!forwarder->eventFilter(&otherWindow, &press));
+    QCOMPARE(rec.wbCalls, 0);
+    otherWindow.removeEventFilter(forwarder);
+}
+
+void GuiSmokeTest::glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal()
+{
+    // The context-menu hook passes ui->graphicsView->mapFromGlobal( global ) to a slot that maps
+    // it back with mapToGlobal while the view is hidden behind the GL window container.
+    QWidget parent;
+    parent.resize(800, 600);
+    parent.move(50, 70);
+    QWidget *child = new QWidget(&parent);
+    child->setGeometry(30, 40, 400, 300);
+    child->hide();
+    const QPoint global(1234, 567);
+    QCOMPARE(child->mapToGlobal(child->mapFromGlobal(global)), global);
+    parent.show();
+    QCOMPARE(child->mapToGlobal(child->mapFromGlobal(global)), global);
+    parent.hide();
+}
+
+void GuiSmokeTest::glWindowViewerInput_edgePicksStayInsideTheImage()
+{
+    // Adversary A2 (r1): the bottom and right picture edges map to scene y == height and
+    // x == width, one past the last pixel; the slots' "x > width" guard lets that through.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    installRecordingForwarder(&window, &rec); // scene 1920x804, letterboxed to y 138..942
+    rec.bpArmed = true;
+    // The edge itself is one past the picture (half-open): no pick, so never row 804.
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 942), QPointF(960, 942));
+    QCOMPARE(rec.bpCalls, 0);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 941.9), QPointF(960, 941.9));
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(960, 803));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1920, 540), QPointF(1920, 540));
+    QCOMPARE(rec.bpCalls, 1);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1919.9, 540), QPointF(1919.9, 540));
+    QCOMPARE(rec.bpCalls, 2);
+    QCOMPARE(rec.lastPick, QPoint(1919, 402));
+    rec.bpArmed = false;
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1919.9, 941.9), QPointF(1919.9, 941.9));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(1919, 803));
+    // Inside the bottom bar: nothing.
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 944), QPointF(960, 944));
+    QCOMPARE(rec.wbCalls, 1);
+}
+
+void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
+{
+    // Adversary A3 (r1): the fit-mode scene is an integer size (1000x418 for a 1920x804 clip in a
+    // 1000x1000 window), so its aspect differs from the display aspect paintGL letterboxes with by
+    // up to one scene pixel. paintGL's picture starts at y = 290.625; the scene-aspect rect at 291.
+    // A click on the displayed picture between the two must still pick (the top row).
+    // r2 (adversary r1 pass 3): only the rect paintGL drew decides; the scene's aspect does not.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1000, 1000);
+    QSizeF scene(1000, 418);
+    QSize raw(1000, 418); // the slots' conversion is the identity until the A3 part below
+    QRectF drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 804)); // texture route: from y 290.625
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.pickBasis = [&scene, &raw]() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = scene;
+        basis.rawWidth = raw.width();
+        basis.rawHeight = raw.height();
+        return basis;
+    };
+    hooks.drawnPicture = [&drawn]() { return drawn; };
+    hooks.wbArmed = [&rec]() { return rec.wbArmed; };
+    hooks.bpArmed = [&rec]() { return rec.bpArmed; };
+    hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [&rec](int x, int y) { ++rec.bpCalls; rec.lastPick = QPoint(x, y); };
+    window.installEventFilter(new gpu_window_input::Forwarder(&window, std::move(hooks)));
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(500, 0));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.5), QPointF(500, 290.5));
+    QCOMPARE(rec.wbCalls, 1);
+    // A1: the image route drew the scene itself (from y 291): the same click is now on its bar.
+    drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), scene);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
+    QCOMPARE(rec.wbCalls, 1);
+
+    // A3: a 1920x420 clip at stretchY 3 drawn as 1920x1260 (from y 171.875) with a 1000x654 scene;
+    // whatever the stretch controls say next, until paintGL draws again the drawn rect decides.
+    // The clip is 1920x420 in fit mode with a 1000x654 scene: the slots turn the handed integers into
+    // raw pixels with int( c * 1920 / 1000 ), int( c * 420 / 654 ); the raw pixel shown must come out.
+    scene = QSizeF(1000, 654);
+    raw = QSize(1920, 420);
+    drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 1260));
+    const auto slotRawY = [](int c) { return static_cast<int>(c * (420 / 654.0)); };
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 172), QPointF(500, 172));
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick.x(), 500);
+    QCOMPARE(slotRawY(rec.lastPick.y()), 0);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 200.5), QPointF(500, 200.5));
+    QCOMPARE(rec.bpCalls, 2);
+    QCOMPARE(slotRawY(rec.lastPick.y()), 18);   // (200.5 - 171.875) / 656.25 * 420 = 18.32
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 171.8), QPointF(500, 171.8));
+    QCOMPARE(rec.bpCalls, 2);
+}
+
+void GuiSmokeTest::glWindowViewerInput_noDrawnPictureIsNoPick()
+{
+    // r2: before paintGL has drawn a frame the getter reports none, and an armed pick is refused
+    // (still consumed, so it does not reach the view's own handling), never guessed.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1000, 1000);
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    const auto usableBasis = []() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = QSizeF(1000, 654);
+        basis.rawWidth = 1000;
+        basis.rawHeight = 654;
+        return basis;
+    };
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.pickBasis = usableBasis;
+    hooks.drawnPicture = []() { return QRectF(); };
+    hooks.wbArmed = [&rec]() { return rec.wbArmed; };
+    hooks.bpArmed = [&rec]() { return rec.bpArmed; };
+    hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [&rec](int x, int y) { ++rec.bpCalls; rec.lastPick = QPoint(x, y); };
+    window.installEventFilter(new gpu_window_input::Forwarder(&window, std::move(hooks)));
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(spy.seen, 0);
+
+    // An unset hook is the same: no pick.
+    GlWindowInputRecorder rec2;
+    QWindow window2;
+    window2.resize(1000, 1000);
+    gpu_window_input::Forwarder::Hooks bare;
+    bare.pickBasis = usableBasis;
+    bare.wbArmed = []() { return true; };
+    bare.pickWhiteBalance = [&rec2](int, int) { ++rec2.wbCalls; };
+    window2.installEventFilter(new gpu_window_input::Forwarder(&window2, std::move(bare)));
+    deliverMouse(&window2, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    QCOMPARE(rec2.wbCalls, 0);
+
+    // The real getter on a GL window that never painted reports none.
+    GpuDisplayWindow glWindow;
+    QVERIFY(!glWindow.lastPaintedPicture().valid);
+    const GpuDisplayWindow::PaintedPicture p = glWindow.lastPaintedPicture();
+    QVERIFY(gpu_window_input::drawnPictureRect(p.valid, p.framebufferWidth, p.framebufferHeight,
+                                               p.devicePixelRatio, p.scaleX, p.scaleY).isEmpty());
+}
+
+void GuiSmokeTest::glWindowViewerInput_getterRefusesWhileAFrameIsHandedOver()
+{
+    // Adversary r2 pass 1 A2: a painted clear, then a hand-over that restores a texture without
+    // painting, must not bring the pre-clear picture back. The getter reports a picture only while
+    // the last paintGL drew one and nothing has been handed over since. Offscreen: the paint is
+    // stood in for by the state paintGL leaves (friend access); the hand-overs are the real calls.
+    GpuDisplayWindow win;
+    QOpenGLTexture texture(QOpenGLTexture::Target2D); // never created: no GL call
+    const GpuDisplayWindow::PaintedPicture painted{ true, 2000, 2000, 2.0, 1.0f, 0.418f };
+    const auto standInForADrawingPaint = [&]() {
+        win.m_lastPaintedPicture = painted;
+        win.m_texture = &texture;
+        win.m_texturePresentationActive = true;
+    };
+    standInForADrawingPaint();
+    QVERIFY(win.lastPaintedPicture().valid);
+    QCOMPARE(win.lastPaintedPicture().scaleY, 0.418f);
+
+    // A frame handed over and not painted yet: none (the picture on screen is about to change).
+    QImage frame(16, 8, QImage::Format_RGB888);
+    frame.fill(Qt::gray);
+    win.setPresentedImage(frame, QSize(1920, 804));
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // A clear: none.
+    standInForADrawingPaint();
+    win.clearPresented();
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // A paint that drew nothing (paintGL's no-texture branch) leaves the flag false; a texture that
+    // comes back without a paint (recon adoption at submit) does not revive the old picture.
+    standInForADrawingPaint();
+    win.m_texturePresentationActive = false;
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // No texture at all: none.
+    standInForADrawingPaint();
+    win.m_texture = nullptr;
+    QVERIFY(!win.lastPaintedPicture().valid);
+    win.m_texture = nullptr;
+}
+
+void GuiSmokeTest::glWindowViewerInput_getterRecordsThePaintedPicture()
+{
+    MLV_SKIP_OR_FAIL_IF_OFFSCREEN("the GL window's paintGL needs a platform plugin that can create an OpenGL context");
+
+    qputenv(GpuDisplayWindow::environmentVariableName(), QByteArrayLiteral("1"));
+    auto host = std::make_unique<QWidget>();
+    auto *layout = new QVBoxLayout(host.get());
+    auto *view = new QGraphicsView(host.get());
+    layout->addWidget(view);
+    host->resize(96, 96);
+    QVERIFY(GpuDisplayWindow::installInPreview(view));
+    host->show();
+    QApplication::processEvents();
+    static_cast<void>(QTest::qWaitForWindowExposed(host.get()));
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QTest::qWait(10);
+    }
+    GpuDisplayWindow *glWindow = qobject_cast<GpuDisplayWindow *>(GpuDisplayWindow::activeWindow());
+    QVERIFY(glWindow);
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+
+    // A 32x8 frame shown at display size 64x8: the picture is the letterbox of the DISPLAY size.
+    QImage submitted(32, 8, QImage::Format_RGB888);
+    submitted.fill(qRgb(10, 200, 30));
+    QVERIFY(GpuDisplayWindow::presentImageIfActive(submitted, QSize(64, 8)));
+    QImage grabbed;
+    QString reason;
+    const bool ok = GpuDisplayWindow::grabPresentedFramebufferIfActive(&grabbed, &reason); // a real, synchronous paintGL
+    if (!ok || grabbed.isNull()) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("OpenGL framebuffer capture is unavailable in this environment");
+    }
+    const GpuDisplayWindow::PaintedPicture p = glWindow->lastPaintedPicture();
+    QVERIFY(p.valid);
+    const QRectF drawn = gpu_window_input::drawnPictureRect(p.valid, p.framebufferWidth, p.framebufferHeight,
+                                                            p.devicePixelRatio, p.scaleX, p.scaleY);
+    const QRectF expected = gpu_window_input::letterboxRect(QSizeF(glWindow->size()), QSizeF(64, 8));
+    const double slack = 1.0 / p.devicePixelRatio; // the framebuffer is truncated to whole device pixels
+    QVERIFY2(qAbs(drawn.x() - expected.x()) <= slack && qAbs(drawn.y() - expected.y()) <= slack
+             && qAbs(drawn.width() - expected.width()) <= slack && qAbs(drawn.height() - expected.height()) <= slack,
+             qPrintable(QStringLiteral("drawn (%1,%2 %3x%4) vs expected (%5,%6 %7x%8)")
+                        .arg(drawn.x()).arg(drawn.y()).arg(drawn.width()).arg(drawn.height())
+                        .arg(expected.x()).arg(expected.y()).arg(expected.width()).arg(expected.height())));
+
+    // A new frame handed over but not painted yet: none until it is painted (adversary r2 pass 1 A2),
+    // then the new picture.
+    QImage square(16, 16, QImage::Format_RGB888);
+    square.fill(qRgb(200, 10, 30));
+    QVERIFY(GpuDisplayWindow::presentImageIfActive(square));
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+    QImage grabbedSquare;
+    QString squareReason;
+    QVERIFY(GpuDisplayWindow::grabPresentedFramebufferIfActive(&grabbedSquare, &squareReason));
+    const GpuDisplayWindow::PaintedPicture after = glWindow->lastPaintedPicture();
+    QVERIFY(after.valid);
+    const QRectF squareDrawn = gpu_window_input::drawnPictureRect(after.valid, after.framebufferWidth, after.framebufferHeight,
+                                                                  after.devicePixelRatio, after.scaleX, after.scaleY);
+    const QRectF squareExpected = gpu_window_input::letterboxRect(QSizeF(glWindow->size()), QSizeF(16, 16));
+    QVERIFY(qAbs(squareDrawn.width() - squareExpected.width()) <= slack);
+    QVERIFY(qAbs(squareDrawn.height() - squareExpected.height()) <= slack);
+
+    // Cleared and painted (the paint releases the texture and draws black): none.
+    QVERIFY(GpuDisplayWindow::clearIfActive());
+    QImage cleared;
+    QString clearedReason;
+    static_cast<void>(GpuDisplayWindow::grabPresentedFramebufferIfActive(&cleared, &clearedReason));
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+
+    host.reset();
+    QVERIFY(!GpuDisplayWindow::isActive());
+    qunsetenv(GpuDisplayWindow::environmentVariableName());
 }
 
 int main(int argc, char ** argv)
