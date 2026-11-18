@@ -2809,6 +2809,35 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     foreach ($k in $ddA.Keys) { Assert-That ((Test-CredentialText $ddA[$k]) -and (Get-CredentialHitLine $ddA[$k]) -gt 0) "DENY-BY-DEFAULT-1 r1 adversary $k refuses" $ddA[$k] }
     $ddA8 = "`"pass\U0011FFFFord`": hunter2`n`"pass%77ord`": hunter2"
     Assert-That ((Get-CredentialHitLine $ddA8) -eq 1) 'DENY-BY-DEFAULT-1 r1 adversary A8: the report names the line of the EARLIEST key (a residual key on line 1)' "line=$(Get-CredentialHitLine $ddA8)"
+    # r2 (adversary pass 3 A1-A4, one normal form): every finding's input and sibling, plus a generated sweep of an escaped key after ANY predecessor character
+    $ddR2 = [ordered]@{
+        'p3 A1 an escaped key after a colon inside a name'        = '{"db:password":"hunter2"}'
+        'p3 A1 sibling: after an equals sign inside a name'       = '{"db=password":"hunter2"}'
+        'p3 A1 sibling: a residual key after a colon'             = '{"db:pass\U0011FFFFord":"hunter2"}'
+        'p3 A2 a nested same-name entry in an attribute pair'     = '<entry key="password"><entry></entry>hunter2</entry>'
+        'p3 A2 twin: a nested same-name secret element'           = '<password><password></password>hunter2</password>'
+        'p3 A2 sibling: an unclosed child as the pair content'    = '<entry key="password"><entry></entry>'
+        'p3 A3 a DTD entity in a connection-string key'           = '<!DOCTYPE add [<!ENTITY w "w">]><add name="Main" connectionString="Pass&w;ord=hunter2" />'
+        'p3 A4 a non-ASCII DTD entity name in a key attribute'    = ('<!DOCTYPE add [<!ENTITY ' + $ddE + ' "w">]><add key="pass&' + $ddE + ';ord" value="hunter2" />')
+        'p3 A4 sibling: a non-ASCII entity in a JSON key'         = ('{"pass&' + $ddE + ';ord": "hunter2"}')
+        'p3 nested: an escaped entity that decodes to a char ref' = '{"pass&amp;#119;ord": "hunter2"}'
+        'p3 mask: a decoded key whose value decodes to null'      = '{"db:password": \156ull}'
+    }
+    foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
+    $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
+    foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
+        foreach ($esc in @('w', '\x77', '&#119;', '&#x77;', '\167', '%77', ('`u{77}'), '&amp;#119;', '\U0011FFFF', '&w;', ('&' + $ddE + ';'))) {
+            foreach ($wrap in @('json', 'xml')) {
+                $t = $(if ($wrap -eq 'json') { '{"' + $pre + 'pass' + $esc + 'ord":"hunter2"}' } else { '<add key="' + $pre + 'pass' + $esc + 'ord" value="hunter2" />' })
+                $ddR2N++
+                if (-not (Test-CredentialText $t)) { $ddR2Miss.Add($t) }
+            }
+        }
+    }
+    Assert-That ($ddR2Miss.Count -eq 0 -and $ddR2N -ge 170) "DENY-BY-DEFAULT-1 r2 generated sweep: all $ddR2N escaped keys after a predecessor character refuse" ("misses=$($ddR2Miss.Count): " + (($ddR2Miss | Select-Object -First 8) -join '; '))
+    $ddA6 = "machine h login u password hunter2`n{`"password`":`"hunter3`"}"
+    Assert-That ((Get-CredentialHitLine $ddA6) -eq 1) 'DENY-BY-DEFAULT-1 r2 advisory A6: the report names the netrc line (line 1), not the later key' "line=$(Get-CredentialHitLine $ddA6)"
+    foreach ($ok in @('{"note": "a &amp; b"}', '<add key="Theme" value="a &amp; b" />', '{"name": "caf&#233;"}')) { Assert-That (-not (Test-CredentialText $ok)) "DENY-BY-DEFAULT-1 r2 must-pass: $ok is not a credential" $ok }
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r1 adversary role guard') {
         Assert-That (Test-CredentialNamePresent '{"api%2Fkey": ""}') 'DENY-BY-DEFAULT-1 r1 adversary A3 role guard: a percent-encoded slash spelling names a secret'
         Assert-That (Test-CredentialNamePresent "[`"pass\U0011FFFFord`"]`nvalue=`"`"") 'DENY-BY-DEFAULT-1 r1 adversary A7 role guard: a table header with an undecodable escape names a secret'
@@ -2845,7 +2874,9 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         @{ N = 5; Url = ('file:///' + ((New-Scratch 'dd-s3-absent5') -replace '\\', '/') + '/absent.git?t=x'); Tok = @('?t=x') },
         # r1 adversary pass 2 A2: an encoded line break or a non-UTF-8 byte inside the token
         @{ N = 6; Url = ('file:///' + ((New-Scratch 'dd-s3-absent6') -replace '\\', '/') + '/absent.git?token=fake-token-0006%0Atail'); Tok = @('fake-token-0006') },
-        @{ N = 7; Url = ('file:///' + ((New-Scratch 'dd-s3-absent7') -replace '\\', '/') + '/absent.git?token=fake-token-0007%FF'); Tok = @('fake-token-0007') }
+        @{ N = 7; Url = ('file:///' + ((New-Scratch 'dd-s3-absent7') -replace '\\', '/') + '/absent.git?token=fake-token-0007%FF'); Tok = @('fake-token-0007') },
+        # r2 (adversary pass 3 A5): a SHORT query split at a decoded line break keeps its delimiter-bearing first piece
+        @{ N = 8; Url = ('file:///' + ((New-Scratch 'dd-s3-absent8') -replace '\\', '/') + '/absent.git?t=x%0Ay'); Tok = @('?t=x') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"

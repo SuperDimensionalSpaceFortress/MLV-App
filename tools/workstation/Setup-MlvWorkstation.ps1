@@ -200,7 +200,8 @@ $script:UrlSecretParts = [System.Collections.Generic.List[string]]::new()
 function Add-UrlSecretPart([string]$Part, [int]$MinLength = 6) {
     $latin = [regex]::Replace("$Part", '%([0-9A-Fa-f]{2})', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
     $forms = @("$Part", $(try { [Uri]::UnescapeDataString("$Part") } catch { "$Part" }), $latin)
-    $forms += @($forms | ForEach-Object { $_ -split '[^\x20-\x7E]+' } | Where-Object { $_.Length -ge 6 })
+    # r2 (pass 3 A5): a piece that still carries the part's own delimiter ('?t=x' before a decoded line break, 'u:pw@' after one) keeps the delimiter's minimum length
+    $forms += @($forms | ForEach-Object { $_ -split '[^\x20-\x7E]+' } | Where-Object { $_.Length -ge 6 -or ($MinLength -lt 6 -and $_.Length -ge [Math]::Max(1, $MinLength) -and $_ -match '^[?#].|.@$') })
     foreach ($p in $forms) {
         if ($p.Length -ge [Math]::Max(1, $MinLength) -and -not $script:UrlSecretParts.Contains($p)) { $script:UrlSecretParts.Add($p) }
     }
@@ -1104,6 +1105,8 @@ $CredentialNameWords = 'SECRET|PASS[_.\-]*W(?:OR)?D|PRIVATE[_.\-]*KEY|API[_.\-]*
 #      key (ConvertFrom-CredentialEscapes: YAML/JSON/TOML, XML character references, PowerShell backtick, octal, Python \N{}, URL %NN), and a key that still holds an
 #      escape it could not decode is secret-named (deny by default). An XML element whose key= / name= attribute VALUE is secret-named and that carries any other
 #      non-exempt attribute or content is a hit (Get-CredentialXmlAttrPairHitIndex). The generated sweep covers every escape form and the attribute pair.
+#      r2: the second pass reads ONE normal form (Get-CredentialNormalForm: the whole text decoded to a fixed point, with a mask of decoded characters that keeps a
+#      decoded value off the exemption list); an XML element's content runs to its depth-matched close tag.
 #   NOT covered: a key name built from pieces at run time ('$k = "pass" + "word"'), a value produced by run-time evaluation, and a secret under a key whose name
 #   says nothing (only the known token shapes in $SecretPatterns catch those).
 # The r14 exemption list that r15 retires (kept here as the record of what changed): an unquoted boolean / null word (true, false, none, nil, undefined); a TOKEN
@@ -1295,12 +1298,34 @@ function Test-CredentialFlowContext {
 # XML element's content); only its outer whitespace is trimmed. Exempt: the empty string, '""', "''", 'null', '~', '[]', '{}', '***' (each compared exactly,
 # case-sensitive), an env reference '${NAME}' and a placeholder '<words>' (each anchored over the whole value). Everything else is a credential, including any text
 # after an empty container ('[]hunter2'), a quoted literal ('"x"'), a boolean ('false'), a number ('4096') and a mapping ('{ type: x }'). Over-refusal is accepted.
+# r2 (the one normalisation step, Get-CredentialNormalForm): in the DECODED pass, $script:CredentialDecodedMask marks every character a decode produced. A value whose
+# span [$From, $To) holds one is NEVER exempt (deny by default: '"password": \156ull' reads as 'password: null' only because the value was decoded too).
+# -Xml: an XML element's content is never the '<words>' placeholder ('<entry key="password"><entry></entry>hunter2</entry>': '<entry>' is a child element).
+$script:CredentialDecodedMask = $null
 function Test-CredentialValueExempt {
-    param([string]$Raw)
+    param([string]$Raw, [int]$From = -1, [int]$To = -1, [switch]$Xml)
+    if ($From -ge 0 -and $null -ne $script:CredentialDecodedMask) {
+        $mk = $script:CredentialDecodedMask
+        $a = [Math]::Min($From, $mk.Length); $b = [Math]::Min([Math]::Max($To, $a), $mk.Length)
+        if ($b -gt $a -and $mk.IndexOf('1', $a, $b - $a) -ge 0) { return $false }
+    }
     $s = $(if ($null -eq $Raw) { '' } else { $Raw.Trim() })
     if ($s.Length -eq 0) { return $true }
     if ($script:CredentialExemptLiterals -ccontains $s) { return $true }
+    if ($Xml -and $s.StartsWith('<')) { return $false }
     return $script:CredentialPlaceholderRegex.IsMatch($s)
+}
+
+# r2 (pass 3 A2, and its pre-existing twin in Get-CredentialXmlHitIndex): the index of the close tag that MATCHES the element opened just before $Start (depth-aware: a
+# nested '<name>' opens one more level, '<name/>' none), -1 when it is never closed.
+function Get-CredentialXmlCloseIndex {
+    param([string]$Text, [string]$Name, [int]$Start)
+    $depth = 1
+    foreach ($t in [regex]::new('(?i)<(/?)' + [regex]::Escape($Name) + '(?=[\s/>])[^<>]*>').Matches($Text, $Start)) {
+        if ($t.Groups[1].Value -eq '/') { $depth--; if ($depth -eq 0) { return $t.Index } }
+        elseif (-not $t.Value.EndsWith('/>')) { $depth++ }
+    }
+    return -1
 }
 
 # DENY-BY-DEFAULT-1 S1 (deny by default): an escape that is still in the text after ConvertFrom-CredentialEscapes could not be decoded (an out-of-range '\U0011FFFF',
@@ -1310,10 +1335,13 @@ function Test-CredentialValueExempt {
 # r1 adversary A3: a '%NN' still in a key after decoding (it decodes to a character that is not a name character, '%20') is undecodable too ('a%20b=c' refuses: accepted
 # over-refusal). A backtick before a letter is NOT an introducer (a Markdown code span '`token`: x' would refuse everywhere); '`u{' is.
 # r1 adversary pass 2 A3: an XML entity reference other than the five predefined ones ('&w;' declared in a DTD) is undecodable here too.
-$script:CredentialResidualIntro = '(?:\\N\{[^}\n]*\}|(?<!\\)\\[xuUN0-7]|&#|`u\{[0-9A-Fa-f]*\}?|%[0-9A-Fa-f]{2}|&(?!(?:amp|lt|gt|quot|apos);)[A-Za-z_][A-Za-z0-9_.\-]*;)'
+# r2 (pass 3 A4): an entity NAME is any run of XML name characters, non-ASCII included ('&' + U+00E9 + ';'); only what cannot stand in a name ends it.
+# r2 (pass 3 A1, defect class "a key is found only after a listed predecessor"): a residual key starts after ANY character (no lookbehind), so 'db:pass&w;ord=' and
+# 'db=pass\U0011FFFFord:' are keys too. Over-refusal is accepted.
+$script:CredentialResidualIntro = '(?:\\N\{[^}\n]*\}|(?<!\\)\\[xuUN0-7]|&#|`u\{[0-9A-Fa-f]*\}?|%[0-9A-Fa-f]{2}|&(?!(?:amp|lt|gt|quot|apos);)[^\s&;<>"''=]+;)'
 $script:CredentialResidualUnit = '(?:\\N\{[^}\n]*\}|`u\{[0-9A-Fa-f]*\}?|[^\s"''=:,{}\[\]()<>])'
 $script:CredentialResidualIntroRegex = [regex]::new($script:CredentialResidualIntro)
-$script:CredentialResidualKeyRegex = [regex]::new('(?<![^\s"''{\[,(<>?&;])(' + $script:CredentialResidualUnit + '*?' + $script:CredentialResidualIntro + $script:CredentialResidualUnit + '*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))')
+$script:CredentialResidualKeyRegex = [regex]::new('(' + $script:CredentialResidualUnit + '*?' + $script:CredentialResidualIntro + $script:CredentialResidualUnit + '*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))')
 
 # The one key/value rule: the index of the first secret-named key that carries a value, -1 when there is none.
 # DENY-BY-DEFAULT-1: with -Residual a key that holds an undecodable escape ($script:CredentialResidualKeyRegex) is a candidate too, and always secret-named.
@@ -1339,6 +1367,7 @@ function Get-CredentialKeyValueHitIndex {
         # or the enclosing close); a quoted run or a container that crosses line breaks is followed to its close.
         $end = Get-CredentialRawValueEnd -Text $Text -At $p -Flow $flow
         $raw = $Text.Substring($p, $end - $p)
+        $vFrom = $p   # r2: the value's span for the decoded-character mask (Test-CredentialValueExempt -From -To)
         if ($sep -eq ':') {
             $ls0 = $(if ($keyStart -eq 0) { 0 } else { $Text.LastIndexOf("`n", $keyStart - 1) + 1 })
             $keyIndent = 0
@@ -1357,7 +1386,7 @@ function Get-CredentialKeyValueHitIndex {
             # continuation 'password: ""\n  hunter2'), comment lines included and never ending it
             if (-not $flow) {
                 $more = Get-CredentialIndentedBlock -Text $Text -From $end -KeyIndent $keyIndent -KeepComments $true
-                if ($more.Trim()) { $raw = $raw + "`n" + $more }
+                if ($more.Trim()) { $raw = $raw + "`n" + $more; $end = $n }   # r2: the mask span runs to the end (over-refusal only)
             }
         }
         # r16 (adversary pass 15 A1, deny by default): 'k=' with nothing after it on its line takes the next line that is neither blank nor a '#' comment as its value,
@@ -1372,7 +1401,7 @@ function Get-CredentialKeyValueHitIndex {
                 $end = $qEnd
             }
         }
-        if (Test-CredentialValueExempt $raw) { continue }
+        if (Test-CredentialValueExempt $raw -From $vFrom -To $end) { continue }
         return $keyStart
     }
     return -1
@@ -1402,9 +1431,9 @@ function Get-CredentialXmlHitIndex {
         if (-not (Get-CredentialKeyClass ($name -replace '^.*:', ''))) { continue }
         if ($xm.Value.EndsWith('/>')) { continue }   # '<password/>', '<password x="1" />': no content at all (its attributes are judged by the line form)
         $start = $xm.Index + $xm.Length
-        $close = [regex]::new('(?i)</' + [regex]::Escape($name) + '\s*>').Match($Text, $start)
-        $content = $(if ($close.Success) { $Text.Substring($start, $close.Index - $start) } else { $Text.Substring($start) })
-        if (Test-CredentialValueExempt $content) { continue }
+        $ci = Get-CredentialXmlCloseIndex -Text $Text -Name $name -Start $start   # r2 (pass 3 A2 pre-existing twin): depth-aware, '<password><password></password>x</password>'
+        if ($ci -lt 0) { $ci = $Text.Length }
+        if (Test-CredentialValueExempt $Text.Substring($start, $ci - $start) -From $start -To $ci -Xml) { continue }
         return $xm.Index
     }
     return -1
@@ -1425,11 +1454,13 @@ function Get-CredentialTableHitIndex {
         if (-not (Get-CredentialKeyClass $name) -and -not ($Residual -and $script:CredentialResidualIntroRegex.IsMatch($heads[$h].Groups[1].Value))) { continue }
         $from = $heads[$h].Index + $heads[$h].Length
         $to = $(if ($h + 1 -lt $heads.Count) { $heads[$h + 1].Index } else { $Text.Length })
+        $lo = $from
         foreach ($line in @($Text.Substring($from, $to - $from) -split "`n")) {
+            $lFrom = $lo; $lo += $line.Length + 1
             $l = $line.Trim()
             if (-not $l -or $l.StartsWith('#')) { continue }
             $kv = [regex]::Match($l, '^[^=:]*[=:]\s*(.*)$')
-            if (-not $kv.Success -or -not (Test-CredentialValueExempt $kv.Groups[1].Value)) { return $heads[$h].Index }
+            if (-not $kv.Success -or -not (Test-CredentialValueExempt $kv.Groups[1].Value -From $lFrom -To ($lFrom + $line.Length))) { return $heads[$h].Index }
         }
     }
     return -1
@@ -1455,7 +1486,8 @@ function Get-CredentialXmlAttrPairHitIndex {
     param([string]$Text, [bool]$Residual = $false)
     foreach ($tm in $script:CredentialXmlStartTagRegex.Matches($Text)) {
         $attrs = @(foreach ($am in $script:CredentialXmlAttrRegex.Matches($tm.Groups[2].Value)) {
-                [pscustomobject]@{ N = ($am.Groups[1].Value -replace '^.*:', '').ToLowerInvariant(); V = $(if ($am.Groups[2].Success) { $am.Groups[2].Value } else { $am.Groups[3].Value }) }
+                $vg = $(if ($am.Groups[2].Success) { $am.Groups[2] } else { $am.Groups[3] })
+                [pscustomobject]@{ N = ($am.Groups[1].Value -replace '^.*:', '').ToLowerInvariant(); V = $vg.Value; At = $tm.Groups[2].Index + $vg.Index }
             })
         $namer = -1
         for ($j = 0; $j -lt $attrs.Count; $j++) {
@@ -1464,12 +1496,13 @@ function Get-CredentialXmlAttrPairHitIndex {
             if ((Get-CredentialKeyClass ($dv -replace '\s', '')) -or $script:CredentialResidualIntroRegex.IsMatch($dv)) { $namer = $j; break }
         }
         if ($namer -lt 0) { continue }
-        for ($j = 0; $j -lt $attrs.Count; $j++) { if ($j -ne $namer -and -not (Test-CredentialValueExempt $attrs[$j].V)) { return $tm.Index } }
+        for ($j = 0; $j -lt $attrs.Count; $j++) { if ($j -ne $namer -and -not (Test-CredentialValueExempt $attrs[$j].V -From $attrs[$j].At -To ($attrs[$j].At + $attrs[$j].V.Length))) { return $tm.Index } }
         if ($tm.Groups[3].Value -ne '/') {
             $start = $tm.Index + $tm.Length
-            $close = [regex]::new('(?i)</' + [regex]::Escape($tm.Groups[1].Value) + '\s*>').Match($Text, $start)
-            $content = $(if ($close.Success) { $Text.Substring($start, $close.Index - $start) } else { $Text.Substring($start) })
-            if (-not (Test-CredentialValueExempt $content)) { return $tm.Index }
+            # r2 (pass 3 A2): depth-aware close, and XML content is never the '<words>' placeholder
+            $ci = Get-CredentialXmlCloseIndex -Text $Text -Name $tm.Groups[1].Value -Start $start
+            if ($ci -lt 0) { $ci = $Text.Length }
+            if (-not (Test-CredentialValueExempt $Text.Substring($start, $ci - $start) -From $start -To $ci -Xml)) { return $tm.Index }
         }
     }
     return -1
@@ -1505,12 +1538,16 @@ function Get-CredentialHitIndex {
 $script:CredentialPyNames = @{ 'LOW LINE' = '_'; 'HYPHEN-MINUS' = '-'; 'FULL STOP' = '.'; 'SOLIDUS' = '/' }
 $credDigitNames = @('ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE')
 for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyNames['DIGIT ' + $credDigitNames[$credDigit]] = [string]$credDigit }
-$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})')
-function Test-CredentialEscapesPresent([string]$Text) { return ("$Text" -match '\\[uUxN0-7/\n]|&#|`|%[0-9A-Fa-f]{2}') }
-function ConvertFrom-CredentialEscapes([string]$Text) {
-    $eval = [System.Text.RegularExpressions.MatchEvaluator]{
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
+$script:CredentialEntities = @{ 'amp' = '&'; 'lt' = '<'; 'gt' = '>'; 'quot' = '"'; 'apos' = "'" }
+# r2: true when the normaliser has anything to do in the text: an escape it decodes changes the text, or an undecodable one is left (deny by default). It is derived from the
+# normaliser itself, so no escape form can be missing from a separate trigger list (pass 3 A3: '&w;' had no trigger and the residual rule never ran).
+function Test-CredentialEscapesPresent([string]$Text) { return ($script:CredentialResidualIntroRegex.IsMatch("$Text") -or ((ConvertFrom-CredentialEscapes $Text) -cne "$Text")) }
+function ConvertFrom-CredentialEscapes([string]$Text) { return (Get-CredentialNormalForm $Text).Text }
+$script:CredentialEscapeEval = {
         param($m)
         $g = $m.Groups
+        if ($g['ent'].Success) { return $script:CredentialEntities[$g['ent'].Value] }
         if ($g['nl'].Success) { return '' }
         if ($g['sl'].Success) { return '/' }
         if ($g['x'].Success) { return [string][char][Convert]::ToInt32($g['x'].Value, 16) }
@@ -1533,22 +1570,39 @@ function ConvertFrom-CredentialEscapes([string]$Text) {
         if ($codePoint -gt 0x10FFFF -or ($codePoint -ge 0xD800 -and $codePoint -le 0xDFFF)) { return $m.Value }
         return [char]::ConvertFromUtf32([int]$codePoint)
     }
-    # r1 adversary A3: repeated until NOTHING changes (no pass cap). Every replacement is shorter than what it replaces, so the loop ends; a 5-deep nesting is decoded too.
-    $s = "$Text"
-    while ($true) {
-        $next = $script:CredentialEscapeRegex.Replace($s, $eval)
-        if ($next -ceq $s) { break }
-        $s = $next
-    }
-    return $s
-}
 
-# r1 adversary pass 2 A1: decode escapes in KEY NAMES only (a run of name characters that a separator follows, and the name of a '[table]' header), never in a value.
-# The run may hold an escaped line break ('"pass\<newline>  word"', r25) and a '\N{...}' or '`u{...}' unit.
-$script:CredentialAnyKeyRegex = [regex]::new('(?<![^\s"''{\[,(<>?&;])((?:\\\n[ \t]*|\\N\{[^}\n]*\}|`u\{[0-9A-Fa-f]*\}?|[^\s"''=:,{}\[\]()<>])+)(?=(?:\s*["''\]\)\}])*\s*(?::|=(?!=)))')
-function ConvertFrom-CredentialKeyEscapes([string]$Text) {
-    $s = $script:CredentialAnyKeyRegex.Replace("$Text", [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ConvertFrom-CredentialEscapes $m.Value })
-    return $script:CredentialTableHeaderRegex.Replace($s, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) ConvertFrom-CredentialEscapes $m.Value })
+# r2 DEFECT CLASS (r1 found 16 decoder gaps one at a time): the detector decoded escaped and entity forms by a LIST OF SPECIAL CASES (key names only, after a listed
+# predecessor character, behind a separate trigger list). Get-CredentialNormalForm is the ONE normalisation step every check reads: the WHOLE text, every escape form
+# ($script:CredentialEscapeRegex: \uXXXX \UXXXXXXXX \xXX \/ the escaped line break, octal, \N{NAME}, &#N; &#xN;, the five predefined &name; entities, `u{N}, `letter, %XX)
+# decoded to a FIXED POINT (nesting included: '&amp;#119;' is '&#119;' is 'w'), line separators made one '\n' at every step. It also returns a MASK ('1' for each
+# character a decode produced, '0' for each one copied as written), so the exemption list can never be met by a decoded value (Test-CredentialValueExempt -From -To):
+# a value is decoded for the key and token rules, and judged as written for the exemption. What the step cannot decode stays as written and is deny by default
+# ($script:CredentialResidualKeyRegex, $script:CredentialResidualIntroRegex). Each replacement is no longer than what it replaces and the loop stops when nothing changes.
+function Invoke-CredentialMaskedReplace {
+    param([string]$S, [string]$Mask, [regex]$Regex, [scriptblock]$Eval)
+    $sb = [System.Text.StringBuilder]::new(); $mb = [System.Text.StringBuilder]::new(); $last = 0; $changed = $false
+    foreach ($m in $Regex.Matches($S)) {
+        $r = [string](& $Eval $m)
+        if ($r -ceq $m.Value) { continue }
+        [void]$sb.Append($S, $last, $m.Index - $last); [void]$mb.Append($Mask, $last, $m.Index - $last)
+        [void]$sb.Append($r); [void]$mb.Append('1', $r.Length)
+        $last = $m.Index + $m.Length; $changed = $true
+    }
+    if (-not $changed) { return $null }
+    [void]$sb.Append($S, $last, $S.Length - $last); [void]$mb.Append($Mask, $last, $S.Length - $last)
+    return [pscustomobject]@{ Text = $sb.ToString(); Mask = $mb.ToString() }
+}
+$script:CredentialLineBreakEval = { param($m) "`n" }
+function Get-CredentialNormalForm([string]$Text) {
+    $s = "$Text"; $mask = [string]::new([char]'0', $s.Length)
+    while ($true) {
+        $r = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
+        if ($r) { $s = $r.Text; $mask = $r.Mask }
+        $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
+        if ($b) { $s = $b.Text; $mask = $b.Mask }
+        if (-not $r -and -not $b) { break }
+    }
+    return [pscustomobject]@{ Text = $s; Mask = $mask }
 }
 
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
@@ -1572,17 +1626,16 @@ function Get-CredentialHitLine {
     $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
     # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
     $idx = Get-CredentialHitIndex $Text
-    if ($idx -lt 0 -and (Test-CredentialEscapesPresent $Text)) {
-        # r1 adversary pass 2 A1: a decoded VALUE can become an exempt literal ('"password": \156ull' would read as '"password": null'), so the rules that judge a value
-        # against the exemption list run on a copy in which only KEY NAMES and table header names are decoded (ConvertFrom-CredentialKeyEscapes); every value stays raw.
-        # The whole-text decoded copy is judged only by the rules that have no exemption at all (the known token shapes and netrc).
-        $whole = $script:CredentialLineBreakRegex.Replace((ConvertFrom-CredentialEscapes $Text), "`n")
-        $m = $script:SecretShapeRegex.Match($whole)
-        $wIdx = $(if ($m.Success) { $m.Index } else { Get-CredentialNetrcHitIndex $whole })
-        $Text = ConvertFrom-CredentialKeyEscapes $Text   # r23 (pass 27 A1): \u, \U, \x and \/ escapes, not only \u; DENY-BY-DEFAULT-1: every form a reader decodes in a key
-        $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
-        $idx = Get-CredentialHitIndex -Text $Text -Residual $true   # DENY-BY-DEFAULT-1: a key still holding an undecodable escape is secret-named
-        if ($idx -lt 0 -and $wIdx -ge 0) { $Text = $whole; $idx = $wIdx }
+    if ($idx -lt 0) {
+        # r2: the decoded pass reads the ONE normal form (Get-CredentialNormalForm: the whole text decoded to a fixed point). It runs whenever the normal form differs from
+        # the text or an undecodable escape is left in it, so no trigger list can skip it (pass 3 A3). Every rule reads the decoded text; the mask keeps a decoded value
+        # off the exemption list (r1 pass 2 A1: '"password": \156ull'); a key still holding an undecodable escape is secret-named (-Residual, deny by default).
+        $nf = Get-CredentialNormalForm $Text
+        if ($nf.Text -cne $Text -or $script:CredentialResidualIntroRegex.IsMatch($Text)) {
+            $Text = $nf.Text
+            $script:CredentialDecodedMask = $nf.Mask
+            try { $idx = Get-CredentialHitIndex -Text $Text -Residual $true } finally { $script:CredentialDecodedMask = $null }
+        }
     }
     if ($idx -lt 0) { return 0 }
     # the line of the KEY (a block-form value sits on a later line; the report names where the secret-named key stands)
