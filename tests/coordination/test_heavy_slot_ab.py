@@ -519,7 +519,12 @@ def test_the_driver_never_removes_the_switch_file():
     text = DRIVER.read_text(encoding="ascii")
     for rx in (r"Remove-Item", r"::Delete\(", r"\.Delete\(", r"Clear-Content", r"\bdel\b", r"\brm\b"):
         assert not re.search(rx, text), rx
-    assert "REVERTED" in text and "[IO.File]::Move" in text, "revert is an atomic rewrite"
+    # r6 (a): the atomic temp-and-move lives in the ONE shared writer, which the driver's Write-AtomicText calls
+    assert "REVERTED" in text and "Write-HeavySlotAbFile -Path $Path -Text $Text" in text, "revert is an atomic rewrite through the shared writer"
+    module = MODULE.read_text(encoding="ascii")
+    writer = re.search(r"(?s)function Write-HeavySlotAbFile \{(.*?)\n\}", module).group(1)
+    assert "[IO.File]::Move($tmp, $Path, $true)" in writer and "FileMode]::CreateNew" in writer
+    assert "[IO.File]::Delete($tmp)" in writer and "Delete($Path" not in writer, "the writer only ever removes its own temp name"
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
