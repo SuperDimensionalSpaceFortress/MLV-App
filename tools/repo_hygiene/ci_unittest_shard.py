@@ -777,10 +777,10 @@ def describe_error(error: BaseException) -> str:
     """
     try:
         return f"{type(error).__name__}: {error}"
-    except Exception:  # noqa: BLE001 - __str__ (or __repr__) of the exception raised
+    except BaseException:  # noqa: BLE001 - __str__ (or __repr__) of the exception raised, even a SystemExit
         try:
             return type(error).__name__
-        except Exception:  # noqa: BLE001 - not even the type name is readable
+        except BaseException:  # noqa: BLE001 - not even the type name is readable
             return "unprintable exception"
 
 
@@ -814,26 +814,33 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
                 os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:  # the group is already gone
                 pass
-    except Exception as error:  # noqa: BLE001 - an audit hook or a patched run may raise any type
+    except BaseException as error:  # noqa: BLE001 - an audit hook may raise any type, SystemExit included
         return describe_error(error)
     return None
 
 
+WORKER_REAP_SECONDS = 10.0  # how long a killed worker may take to be reaped before it is reported unended
+TERMINATE_BOUND_SECONDS = TREE_KILL_SECONDS + WORKER_REAP_SECONDS + 5.0  # one worker's whole termination
+
+
 def terminate(proc: subprocess.Popen[bytes], *, reap: bool = True) -> str | None:
     """Kill ``proc`` and its process tree (and reap it when ``reap``); the error text when either the
-    worker or its tree could not be ended, else ``None``. It never raises.
+    worker or its tree could not be ended, else ``None``. It never raises, and nothing in it waits without
+    a bound.
 
-    Callers end every owned worker through this, so one worker that cannot be killed (``PermissionError``
-    or anything else) never stops the kill of the others; a worker that could not be killed is not waited
-    on (that wait would never return), and the worker is killed even when its tree could not be.
+    Callers end every owned worker through this, so one worker that cannot be killed (``PermissionError``,
+    a ``SystemExit`` from an audit hook, anything) never stops the kill of the others; a worker that could
+    not be killed is not waited on, and the worker is killed even when its tree could not be.
     """
     tree_error = _kill_tree(proc)
     tree_note = f"its process tree was not ended ({tree_error})" if tree_error else None
     try:
         proc.kill()
         if reap:
-            proc.wait()
-    except Exception as error:  # noqa: BLE001 - nothing a kill raises may stop the others being killed
+            proc.wait(timeout=WORKER_REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        return f"the worker did not exit {WORKER_REAP_SECONDS:g} s after its kill" + (f"; {tree_note}" if tree_note else "")
+    except BaseException as error:  # noqa: BLE001 - nothing a kill raises may stop the others being killed
         return describe_error(error) + (f"; {tree_note}" if tree_note else "")
     return tree_note
 
@@ -842,14 +849,16 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
     """``terminate`` every worker at the same time (one thread each); the error text or ``None`` per worker.
 
     Each ``terminate`` can block for ``TREE_KILL_SECONDS`` in ``taskkill``, so ending the workers one
-    after the other would kill the last one that many seconds per worker late. It never raises.
+    after the other would kill the last one that many seconds per worker late. It never raises and never
+    waits longer than ``TERMINATE_BOUND_SECONDS`` in all: a worker whose termination has not finished
+    (or whose thread died) reads as unended, never as a clean kill.
     """
-    results: list[str | None] = [None] * len(procs)
+    results: list[str | None] = ["its termination did not complete"] * len(procs)
 
     def one(position: int) -> None:
         try:
             results[position] = terminate(procs[position], reap=reap)
-        except Exception as error:  # noqa: BLE001 - terminate never raises; a patched one might
+        except BaseException as error:  # noqa: BLE001 - terminate never raises; a patched one might
             results[position] = describe_error(error)
 
     threads: list[threading.Thread] = []
@@ -861,8 +870,9 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
             one(position)
         else:
             threads.append(thread)
+    end = time.monotonic() + TERMINATE_BOUND_SECONDS
     for thread in threads:
-        thread.join()
+        thread.join(max(0.0, end - time.monotonic()))
     return results
 
 
@@ -913,7 +923,7 @@ class DeadlineKiller:
                 try:
                     if proc.poll() is not None:
                         continue  # a failure already on record stays: the parent reports it
-                except Exception as exc:  # noqa: BLE001 - the watchdog thread must survive anything
+                except BaseException as exc:  # noqa: BLE001 - the watchdog thread must survive anything
                     self.failed[number] = describe_error(exc)
                     continue
                 due.append((number, proc))
@@ -935,7 +945,10 @@ class DeadlineKiller:
 
     def _run(self) -> None:
         while not self._stopped.wait(self._slice):
-            self._kill_due()
+            try:
+                self._kill_due()
+            except BaseException:  # noqa: BLE001 - one bad slice must not end the watchdog; the next one retries
+                pass
 
     def stop(self) -> None:
         self._stopped.set()
@@ -991,6 +1004,7 @@ def run_parallel(
     logs: list[Path] = []
     codes: list[int | None] = []
     procs: list[tuple[subprocess.Popen[bytes], IO[bytes]]] = []
+    printed = False  # the grouped worker logs have started to go out
     stuck: set[int] = set()  # 1-based workers the OS would not let the parent kill
     merged: dict[str, float] = {}
     cap_minutes = job_cap_minutes(profile, env)
@@ -1082,6 +1096,7 @@ def run_parallel(
             if record:
                 merged.update({key: float(value) for key, value in record["seconds"].items()})
         watch.check()  # a share crossed since the last poll is reported before any worker log
+        printed = True  # from here the logs go out in order; a failure later must not print them twice
         for number, (path, code, record) in enumerate(zip(logs, codes, records, strict=True), start=1):
             print(f"===== worker {number}/{len(logs)} exit {code} =====", flush=True)
             print(path.read_text(encoding="utf-8", errors="replace"), end="", flush=True)
@@ -1105,6 +1120,13 @@ def run_parallel(
                 problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
             with contextlib.suppress(OSError):
                 log.close()
+        if sys.exc_info()[0] is not None and not printed:
+            # An exception (a launch that raised, say) skipped the grouped logs: the workers that ran keep
+            # their output, which is deleted with the work dir just below.
+            for number, (path, (proc, _log)) in enumerate(zip(logs, procs, strict=True), start=1):
+                with contextlib.suppress(Exception):
+                    print(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====", flush=True)
+                    print(path.read_text(encoding="utf-8", errors="replace"), end="", flush=True)
         killer.stop()
         report_unended()
         watch.stop()

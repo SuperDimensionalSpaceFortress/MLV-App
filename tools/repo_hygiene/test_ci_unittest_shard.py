@@ -1671,6 +1671,112 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIsNotNone(result, "128 read as a clean kill although the root's descendants may survive")
         self.assertIn("not confirmed", result)
 
+    # r7 adversary pass 11 A1: SystemExit / KeyboardInterrupt raised inside a kill (an audit hook can raise
+    # either) must neither stop the worker being killed nor read as a successful kill.
+    def test_a_system_exit_from_a_kill_is_reported_and_the_worker_is_still_killed(self) -> None:
+        class ExitInStr(RuntimeError):
+            def __str__(self) -> str:
+                raise SystemExit(77)
+
+        for error in (SystemExit(77), KeyboardInterrupt(), ExitInStr("x")):
+            with self.subTest(error=type(error).__name__), self._tree_kill_fails(error):
+                proc = self._pid_proc()
+                result = shard.terminate(proc)
+                self.assertIsNotNone(result, "a kill that raised read as a clean kill")
+                self.assertEqual(proc.returncode, -9, "the worker itself is still killed")
+
+    def test_the_watchdog_does_not_record_a_kill_that_exited_the_thread_as_a_success(self) -> None:
+        killer = shard.DeadlineKiller(1.0, lambda: 2.0, slice_seconds=3600)
+        with self._tree_kill_fails(SystemExit(77)):
+            proc = self._pid_proc()
+            killer.add(proc)
+        self.assertNotIn(1, killer.killed)
+        self.assertIn(1, killer.failed)
+
+    def test_a_termination_thread_that_dies_reads_as_a_failure(self) -> None:
+        def dies(proc: object, *, reap: bool = True) -> str | None:
+            raise SystemExit(77)
+
+        with mock.patch.object(shard, "terminate", dies):
+            results = shard.terminate_all([self._RunningProc()])
+        self.assertEqual(len(results), 1)
+        self.assertIsNotNone(results[0])
+
+    # r7 adversary pass 11 A2: nothing in a kill waits without a bound.
+    def test_a_worker_that_never_reaps_after_its_kill_is_reported_not_waited_on_forever(self) -> None:
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class Unreapable(self._RunningProc):
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is None:
+                    release.wait(timeout=5.0)  # pending I/O: the process object is never signalled
+                raise subprocess.TimeoutExpired("fake", timeout)
+
+        proc = Unreapable()
+        with mock.patch.object(shard, "WORKER_REAP_SECONDS", 0.05):
+            started = time.monotonic()
+            result = shard.terminate(proc)
+        self.assertLess(time.monotonic() - started, 3.0, "terminate waited on the worker without a bound")
+        self.assertIsNotNone(result)
+        self.assertIn("did not exit", result)
+
+    def test_terminate_all_gives_up_on_a_termination_that_never_returns(self) -> None:
+        release = threading.Event()
+        self.addCleanup(release.set)
+        first, second = self._RunningProc(), self._RunningProc()
+
+        def hangs(proc: object, *, reap: bool = True) -> str | None:
+            if proc is first:
+                release.wait(timeout=8.0)
+            return None
+
+        with mock.patch.object(shard, "terminate", hangs), mock.patch.object(shard, "TERMINATE_BOUND_SECONDS", 0.3):
+            started = time.monotonic()
+            results = shard.terminate_all([first, second])
+        self.assertLess(time.monotonic() - started, 4.0, "terminate_all joined a thread without a bound")
+        self.assertIsNotNone(results[0], "a termination that did not finish read as a clean kill")
+        self.assertIn("did not complete", results[0])
+        self.assertIsNone(results[1])
+
+    # r7 adversary pass 11 A3: a worker that finished keeps its output when a later launch raises.
+    def test_a_launch_error_still_prints_the_output_of_workers_that_finished(self) -> None:
+        root, tests, tag = self._fixture()
+        calls: list[int] = []
+
+        class Finished:
+            returncode = 1
+
+            def poll(self) -> int:
+                return 1
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 1
+
+            def kill(self) -> None:
+                pass
+
+        def popen(*args: object, **kwargs: object) -> object:
+            calls.append(1)
+            if len(calls) == 2:
+                raise PermissionError(5, "second launch denied")
+            kwargs["stdout"].write(b"FAIL: test_x\nfx-boom\n")
+            kwargs["stdout"].flush()
+            return Finished()
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=popen),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(PermissionError),
+        ):
+            shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        self.assertIn("fx-boom", out.getvalue(), "worker 1's finished output was deleted unprinted")
+
     # r6 adversary pass 8 A2: a log opened for a worker whose launch then fails is closed, not leaked.
     def test_a_launch_that_fails_closes_the_log_it_opened(self) -> None:
         root, tests, tag = self._fixture()
