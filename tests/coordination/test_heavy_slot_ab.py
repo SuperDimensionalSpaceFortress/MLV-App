@@ -1475,3 +1475,187 @@ def test_r4_B1_a_frozen_future_row_cannot_hide_a_stalled_feed(tmp_path, me):
         assert code == 3 and w.receipt()["reason"].startswith("stale-feed"), (code, w.text())
     finally:
         w.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# round r5 (head 5c232129): adversary pass 4 (A1-A7 introduced majors), each fed its own input. Every test fails on 5c232129.
+# ---------------------------------------------------------------------------------------------------------------------------
+def test_r4b_A1_a_blocks_start_is_the_attempt_that_landed_not_the_start_of_a_retry_loop(tmp_path, me):
+    w = World(tmp_path, "retrystart", me)
+    holder = None
+    try:
+        proc = w.start(0.01, 0.07)     # 36 s window, 4.2 s blocks
+        assert _wait(lambda: (w.switch_doc() or {}).get("state") == "A", 60), w.text()
+        holder = open(w.switch, "rb")  # block 1's rewrite (due at 4.2 s) cannot replace the file while this is open
+        time.sleep(7.0)
+        released = datetime.now(UTC)
+        holder.close()
+        holder = None
+        assert proc.wait(timeout=120) == 0, w.text()
+        row = next(r for r in w.blocks() if r["block"] == 1)
+        assert _parse_iso(row["startUtc"]) >= released - timedelta(milliseconds=150), f"startUtc {row['startUtc']} predates the release {released}: tickets run under A would be attributed to B"
+    finally:
+        if holder:
+            holder.close()
+        w.close()
+
+
+@pytest.mark.parametrize("what", ["ledger", "receipts"])
+def test_r4b_A2_a_source_that_existed_at_the_baseline_and_is_gone_ends_the_window_aborted(tmp_path, me, what):
+    w = World(tmp_path, "gone-" + what, me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        if what == "ledger":
+            os.rename(w.hs / "ledger.jsonl", w.hs / "ledger.gone")
+        else:
+            os.rename(w.hs / "receipts", w.hs / "receipts.gone")
+        code = proc.wait(timeout=90)
+        want = "ledger-unreadable" if what == "ledger" else "receipt-unreadable"
+        assert code == 3, (code, w.text())
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith(want), w.receipt()
+    finally:
+        w.close()
+
+
+@pytest.mark.parametrize("which,needle", [("ledger", "ledger.jsonl is missing"), ("receipts", "receipts directory is missing")])
+def test_r4b_A2_the_evaluator_is_inconclusive_when_the_ledger_or_the_receipts_dir_is_missing(tmp_path, which, needle):
+    win, hs = build_window(tmp_path, "missing-" + which)
+    if which == "ledger":
+        (hs / "ledger.jsonl").unlink()
+    else:
+        shutil.rmtree(hs / "receipts")
+    v, _ = evaluate(tmp_path, "missing-" + which, win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and needle in v["reason"], v
+
+
+@pytest.mark.parametrize("tail,want", [
+    ('{"at":"%s","event":"unguarded","ticket":"u9","label":"mlv:X:build","reason":"t"}', "unguarded"),
+    ('{"at": "2026-11', "ledger-unreadable"),
+])
+def test_r4b_A3_an_unterminated_last_ledger_record_is_read_in_the_final_sweep_never_held_back_for_ever(tmp_path, me, tail, want):
+    w = World(tmp_path, "tail-" + want, me)
+    try:
+        proc = w.start(0.004, 0.2, poll=5)     # polls at ~0, 5, 10 s; the window ends at 14.4 s
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        end = _parse_iso(w.blocks()[0]["windowEndUtc"])
+        assert _wait(lambda: datetime.now(UTC) >= end - timedelta(seconds=1.6), 60)
+        text = (tail % iso(datetime.now(UTC))) if "%s" in tail else tail
+        with open(w.hs / "ledger.jsonl", "ab") as fh:
+            fh.write(text.encode("ascii"))      # no trailing newline
+        assert proc.wait(timeout=60) == 3, w.text()
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith(want), w.receipt()
+        assert w.switch_doc()["state"] == "REVERTED"
+    finally:
+        w.close()
+
+
+def test_r4b_A4_the_switch_temp_file_name_may_not_be_a_read_only_input(tmp_path, me):
+    w = World(tmp_path, "tmpalias", me)
+    try:
+        w.feed.close()
+        tmp_feed = Path(str(w.switch) + ".tmp")
+        _write_feed_rows(tmp_feed, [datetime.now()])
+        before = tmp_feed.read_bytes()
+        w.switch.write_text(json.dumps(switch_doc(me)), encoding="ascii")    # an existing switch: the first write is the revert, through <switch>.tmp
+        args = w.args(0.004, 0.05)
+        args[args.index("-CoreTempFeed") + 1] = str(tmp_feed)
+        out = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=path-overlap" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert tmp_feed.read_bytes() == before, "the feed was overwritten through the switch's temp name"
+    finally:
+        w.close()
+
+
+def test_r4b_A4_an_evaluator_output_that_is_a_symlink_onto_an_input_is_refused(tmp_path):
+    win, hs = build_window(tmp_path, "outalias")
+    try:
+        os.symlink(hs / "ledger.jsonl", win / "ab-holds.jsonl")
+    except OSError:
+        pytest.skip("no symlink rights on this host")
+    before = (hs / "ledger.jsonl").read_bytes()
+    out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / "outalias" / "event.txt")])
+    assert out.returncode == 2 and "AB_EVAL_REFUSED output-alias" in out.stdout, (out.returncode, out.stdout, out.stderr)
+    assert (hs / "ledger.jsonl").read_bytes() == before, "the evaluator truncated the ledger through the alias"
+
+
+@pytest.mark.parametrize("kind", ["receipt-empty-class", "receipt-missing-class", "held-empty-class"])
+def test_r4b_A5_a_receipt_or_held_record_with_no_class_is_not_shared(tmp_path, me, kind):
+    w = World(tmp_path, kind, me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: w.blocks(), 60), w.text()
+        if kind.startswith("receipt"):
+            rec = {"ticket": "x9", "wholeMachine": False}
+            if kind == "receipt-empty-class":
+                rec["class"] = ""
+            (w.hs / "receipts" / (datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "888Z-1-abcdef.json")).write_text(json.dumps(rec), encoding="ascii")
+        else:
+            w.add_holder("h9", 0, cls="")
+        code = proc.wait(timeout=90)
+        assert code == 3, (code, w.text())
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith("exclusive-admit"), w.receipt()
+    finally:
+        w.close()
+
+
+def test_r4b_A6_a_nan_commit_reading_is_unknown_not_above_the_floor(tmp_path, me):
+    w = World(tmp_path, "nancommit", me)
+    try:
+        w.memory.write_text(json.dumps({"freeCommitGB": "NaN", "freePhysGB": "NaN"}), encoding="ascii")
+        out = subprocess.run(w.args(0.004, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=low-commit" in out.stdout, (out.returncode, out.stdout, out.stderr)
+    finally:
+        w.close()
+
+
+def test_r4b_A6_a_nan_disk_reading_is_unknown_not_above_the_floor(tmp_path, me):
+    w = World(tmp_path, "nandisk", me)
+    try:
+        w.disk.write_text(json.dumps({"freeGiB": "NaN"}), encoding="ascii")
+        out = subprocess.run(w.args(0.004, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=low-disk" in out.stdout, (out.returncode, out.stdout, out.stderr)
+    finally:
+        w.close()
+
+
+def test_r4b_A6_a_feed_whose_only_temperature_is_nan_is_unreadable_never_cool(tmp_path, me):
+    w = World(tmp_path, "nantemp", me)
+    try:
+        w.feed.close()
+        now = datetime.now()
+        w.feed_path.write_text(FEED_HEADER + now.strftime("%d.%m.%Y,%H:%M:%S.") + f"{now.microsecond // 1000:03d}" + ",20.0,NaN,40.0,No,No\n", encoding="ascii")
+        out = subprocess.run(w.args(0.004, 0.05), capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=feed-unreadable" in out.stdout, (out.returncode, out.stdout, out.stderr)
+    finally:
+        w.close()
+
+
+def test_r4b_A6_an_infinite_free_commit_in_b_samples_is_unknown_not_a_pass(tmp_path):
+    win, hs = build_window(tmp_path, "infcommit")
+    rows = [json.loads(line) for line in (win / "ab-samples.jsonl").read_text(encoding="utf-8").splitlines()]
+    for r in rows:
+        if r["state"] == "B":
+            r["free_commit_gb"] = "1e999"
+    (win / "ab-samples.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="ascii")
+    v, _ = evaluate(tmp_path, "infcommit", win, hs)
+    assert v["verdict"] == "INCONCLUSIVE" and "free commit" in v["reason"], v
+
+
+def test_r4b_A7_a_feed_clock_that_runs_backwards_ends_the_window_closed(tmp_path, me):
+    w = World(tmp_path, "clockback", me)
+    try:
+        proc = w.start(0.01, 0.2)
+        assert _wait(lambda: len(w.samples()) >= 3, 60), w.text()
+        w.feed.paused = True
+        time.sleep(0.5)
+        with open(w.feed_path, "a", encoding="ascii") as fh:     # a row 25 s ahead (inside the 30 s skew), then correctly dated rows resume below it
+            fut = datetime.now() + timedelta(seconds=25)
+            fh.write(fut.strftime("%d.%m.%Y,%H:%M:%S.") + f"{fut.microsecond // 1000:03d}" + ",20.0,60.0,40.0,No,No\n")
+        time.sleep(1.0)      # at least two polls read the future row first
+        w.feed.paused = False
+        code = proc.wait(timeout=90)
+        assert code == 3, (code, w.text())
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith("feed-time-regressed"), w.receipt()
+    finally:
+        w.close()
