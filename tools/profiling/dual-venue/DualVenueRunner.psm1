@@ -4533,7 +4533,11 @@ $script:ExportCdngLlrawprocChildren = @('llrawproc_dark_frame', 'llrawproc_verti
 $script:ExportCdngProducerPartition = @('raw_read', 'raw_decode', 'raw_unpack', 'llrawproc', 'dng_header', 'dng_pack', 'dng_compress_encode', 'payload_clone')
 $script:ExportCdngLlrawprocPartition = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso',
     'llrawproc_chroma_smooth', 'llrawproc_other')
-$script:ExportCdngLlrawprocDisjointFrontier = @('llrawproc_dual_iso', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock')
+# r16 (adversary r15 A1): the disjoint set is the seven timed children (dng.c:571-577) PLUS the two lock times llrawproc.c takes outside every one of their windows (refine :6063-6130 sits between the
+# dual_iso windows :5591-6019 and :6210-6219 and before focus_pixels :6140; publish :6288 / :7053 follows chroma_smooth); dark_frame 80 + dual_iso 1 + publish_lock 80 inside a 100 ms llrawproc read PASS
+# when only dual_iso and the locks were held. llrawproc_other is the remainder (it retains the locks) and shared_lock / pre_dualiso_fix overlap the children, so none of those three is a member.
+$script:ExportCdngLlrawprocDisjointFrontier = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso',
+    'llrawproc_chroma_smooth', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock')
 
 # r8 fix 3 (adversary pass 10 A2): DISJOINT siblings together are inside their parent too: each below its parent is no proof that the pair is (10 + 10 ms inside a 10 ms parent).
 # Each group is (the disjoint children, the parent); the rendered tree's groups below.

@@ -884,6 +884,37 @@ class ExportEvidenceTests(unittest.TestCase):
                 self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
         self.assertEqual(got[3]["outcome"], "PASS", got[3])
 
+    def test_r16_pass15_a1_every_disjoint_llrawproc_child_and_the_outside_lock_times_are_held_together(self) -> None:
+        """adversary r15 A1 (= pass14 A1): the held frontier was only dual_iso + the two locks, so a timed child beside them was unjudged: dark_frame 80 + dual_iso 1 + publish_lock 80 (161 ms of
+        disjoint work: llrawproc.c times the seven children in disjoint windows and takes the refine lock (:6063-6130) and the publish lock (:6288-6292) outside every one of them) inside a 100 ms
+        llrawproc read PASS. The seven timed children plus the two locks are held together inside llrawproc and, with the producer's other members, inside producer_frame; llrawproc_ms may be absent."""
+        children = ("llrawproc_dark_frame_ms", "llrawproc_vertical_stripes_ms", "llrawproc_focus_pixels_ms", "llrawproc_bad_pixels_ms", "llrawproc_pattern_noise_ms", "llrawproc_chroma_smooth_ms")
+
+        def profile(set_rows: dict, drop_total: bool = False) -> str:
+            doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+            for r in doc["frames"]:
+                for k in CDNG_STAGES:
+                    if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                        r[k] = 0.0
+                if drop_total:
+                    r.pop("llrawproc_ms", None)
+                r.update(set_rows)
+            return json.dumps(doc)
+        profiles = []
+        for child in children:
+            profiles.append(profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0}))
+            profiles.append(profile({"producer_frame_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0}, drop_total=True))
+        refine = profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_dualiso_refine_lock_ms": 80.0})
+        control = profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 69.0,
+                           "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0})
+        proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in profiles + [refine, control]])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(len(profiles) + 1):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
+
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string
         passed the shape and threw at the generator's double cast after a lease was spent."""
