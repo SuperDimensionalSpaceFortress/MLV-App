@@ -469,7 +469,9 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
   A budget the **agent** would refuse (`jobTimeoutSec` plus the runner's 120 s submit margin past the agent's 86400 s cap) is refused with
   `DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED` **before any claim or lease**: `Invoke-VenueLeaseBatch.ps1` asks the generator's `-PreflightBudgetOnly` mode
   (the same `Get-ExportJobTimeBudget`, over the resolved clip's real size) in its preflight for every form (`-LegPlan` item, `-LegSet`, `-LegSpec`) and ends
-  `EXPORT_TIME_BUDGET_EXCEEDED` with nothing submitted. A clip this host cannot resolve is not refused there (its size is unknowable); the leg's generator still refuses it.
+  `EXPORT_TIME_BUDGET_EXCEEDED` with nothing submitted. When this host cannot resolve the clip (its size is unknowable), the preflight asks for the clip-independent floor
+  (`-DescribeTimeBudgetBytes 0`, the same function with no identity read). A window whose floor alone is past the cap (for example `maxFrames=100000`) is refused the same
+  way. A window whose floor fits is not refused there, and the leg's generator still refuses the unresolvable clip.
   If the preflight cannot read or parse the leg spec it is checking (for example a transient sharing violation after the shape check read it), the batch does not skip the
   budget check: it refuses with `SPEC_READ_FAILED`, before any claim or lease, in every form.* **Frame window**: `EXPORT_CAPTURED` asserts the batch exported the requested `maxFrames`. A different count is `INVALID` (`EXPORT_FRAMES_MISMATCH`) unless the leg's
   criteria carry `framesExported eq <maxFrames>`, which then decides (the shipped legs: `FAIL`). A criterion that only names the metric (`ge 0`, `ne`, `le`, `eq` of
