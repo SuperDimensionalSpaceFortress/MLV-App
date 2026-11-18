@@ -1203,7 +1203,7 @@ try {
         'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst',
         'renew-exit-stamp-late-known-limit', 'renew-gap-reverted-step-known-limit', 'renew-gap-reverted-step-base-neighbour',
         'renew-call-start-before-process-start', 'renew-gap-prestart-stall-no-false-stop', 'renew-gap-reverted-step-record-wall-demotes',
-        'renew-gap-exhausted-start-pair-no-false-stop', 'renew-gap-exhausted-start-pair-stale-demotes')
+        'renew-gap-exhausted-start-pair-no-false-stop', 'renew-gap-exhausted-start-pair-stale-demotes', 'renew-gap-unknown-prev-record-ends-at-collection')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -5853,6 +5853,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # the old regex over the call's extent accepted, binds nothing and is not wired (proved on a synthetic loop below).
         $rsIsWired = {
             param($Cmd)
+            # r6 (adversary pass 12 advisory A2): the walk itself must run in the foreground: a walk sent to the background (`... -OnEach { tick } &`)
+            # runs its callback in a job, never on this agent's lease.
+            if ($Cmd.Parent -is [System.Management.Automation.Language.PipelineAst] -and $Cmd.Parent.Background) { return $false }
             $els = @($Cmd.CommandElements)
             for ($i = 0; $i -lt $els.Count; $i++) {
                 $e = $els[$i]
@@ -5884,9 +5887,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($rsNegCalls.Count -eq 3 -and @($rsNegCalls | Where-Object { & $rsIsWired $_ }).Count -eq 0) "renew-slow-monitor-slice: the wiring guard refuses a begin-block throw, a throwing param default and a backgrounded tick: calls=$($rsNegCalls.Count)"
         # r6 (adversary pass 11 A2, sol r5 hardening): a tick given any argument (a throwing subexpression, a splat, a switch, a value) or a
         # redirection is NOT wired; the bare shipped form still is.
-        $rsArg = [System.Management.Automation.Language.Parser]::ParseInput('Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick $(throw ''skip'') }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick @u }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick -WhatIf }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick 1 }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick 2>$(throw ''skip'') }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick }', [ref]$null, [ref]$null)
+        $rsArg = [System.Management.Automation.Language.Parser]::ParseInput('Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick $(throw ''skip'') }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick @u }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick -WhatIf }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick 1 }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick 2>$(throw ''skip'') }; foreach ($d in @(Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick } &)) { }; foreach ($d in @(Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick })) { }', [ref]$null, [ref]$null)
         $rsArgCalls = @($rsArg.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' }, $true))
-        Assert-True ($rsArgCalls.Count -eq 6 -and @($rsArgCalls[0..4] | Where-Object { & $rsIsWired $_ }).Count -eq 0 -and (& $rsIsWired $rsArgCalls[5])) "renew-slow-monitor-slice: the wiring guard refuses a tick given an argument (`$(throw 'skip'), a splat, a switch, a value) or a redirection, and accepts the bare shipped form: calls=$($rsArgCalls.Count) wired=$(@($rsArgCalls | ForEach-Object { [bool](& $rsIsWired $_) }) -join ',')"
+        Assert-True ($rsArgCalls.Count -eq 7 -and @($rsArgCalls[0..5] | Where-Object { & $rsIsWired $_ }).Count -eq 0 -and (& $rsIsWired $rsArgCalls[6])) "renew-slow-monitor-slice: the wiring guard refuses a tick given an argument (`$(throw 'skip'), a splat, a switch, a value) or a redirection, and a backgrounded walk (pass 12 A2), and accepts the bare shipped form: calls=$($rsArgCalls.Count) wired=$(@($rsArgCalls | ForEach-Object { [bool](& $rsIsWired $_) }) -join ',')"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
     }
@@ -5950,7 +5953,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # "renewed" is its record wall time (recordWalls). -NoRecordWallOut prints nothing (a heavy-slot.py output without that field).
         param([double]$QuerySec, [double]$ExitAfterSec, [int]$Rc, [datetime]$PrevWall, [datetime]$WalkStartWall, [double]$MonoAdvanceToWalk, [switch]$NoWalk, [double]$WallStepSec = 0, [double]$ExitWallOffsetSec = 0,
             [double]$StampDelaySec = 0, [double]$RecordWallStepSec = 0, [double]$RecordWallStepAtSec = 0, [double]$PreTickSec = 0, [switch]$NoRecordWallOut,
-            [double[]]$RenewedEpochs = @(), $PrevRecordEpochSec = $null)   # r5 (adversary pass 9 A2): literal "renewed" values, and the previous success's
+            [double[]]$RenewedEpochs = @(), $PrevRecordEpochSec = $null, [switch]$NoPrevRecord)   # r5 (adversary pass 9 A2): literal "renewed" values, and the previous success's record time
+        # r6 (adversary pass 12 A1): the previous success's record time defaults to PrevWall (that success was a renew of this fake, which always
+        # prints "renewed"; the value equals the call-start fallback r5 used, so no r5 reading changes). The agent now credits the exit stamp only
+        # when this record time is known too; -NoPrevRecord leaves it unknown (an activation anchor, or a renew output without "renewed").
+        if ($null -eq $PrevRecordEpochSec -and -not $NoPrevRecord) { $PrevRecordEpochSec = ($PrevWall.ToUniversalTime() - [datetime]::UnixEpoch).Ticks / 10000000.0 }
         $rcSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch; a = $script:Admission }
         try {
             return & {
@@ -6432,6 +6439,57 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $exWant = @($exVariants | Where-Object { Test-Case $_.case }).Count
         Assert-True ($exResults.Count -eq $exWant) "renew-gap-exhausted-start-pair: every selected variant ran ($(@($exResults.Keys) -join ','))"
         $results.renewGapExhaustedStartPair = $exResults
+    }
+    # r6 (adversary pass 12 A1, introduced by r5; its exact input): E = 1801440000, monotonic 1000 + t. Activation at t-20. R1 starts at t0 (wall
+    # E; variant exhausted: wall E-0.6, unknown), records at t3 during a temporary -30 s wall step (record E-27), returns rc 0 with an active flag
+    # WITHOUT "renewed", and is collected at t5 after the wall is restored. R2 starts at t100, records, exits and stamps at t105 with renewed
+    # E+105, and is collected at t130. heavy-slot.py's record gap is 132 s. 28cdf0e4 credited R2's exit stamp although R1's record time was
+    # unknown, read 105 s (exhausted: 105.6 s) and did not demote; base a7278cbd ends that gap at the collection (130 s) and demotes. Variant
+    # rc-slow-slice drives the real renew tick on renew-collect-after-slow-slice's input with no previous record time: the gap ends at the
+    # collection (125 s), as base, never at the exit stamp (43 s).
+    if (Test-Case 'renew-gap-unknown-prev-record-ends-at-collection') {
+        $upResults = [ordered]@{}
+        foreach ($upV in @('known-wall', 'exhausted')) {
+            $upSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch; a = $script:Admission }
+            try {
+                $upOut = & {
+                    $upE = 1801440000.0
+                    $script:UpNowUtc = [datetime]::UnixEpoch.AddSeconds($upE + 5)
+                    $script:UpMono = 1005.0
+                    function Get-Date { return $script:UpNowUtc.ToLocalTime() }
+                    function Get-AgentMonotonicSec { return $script:UpMono }
+                    function New-UpCall([double]$ExitSec, [double]$ExitWallSec) {
+                        return [pscustomobject]@{ ok = $true; exitStamp = [pscustomobject]@{ Stamped = $true; ExitMonoSec = 1000.0 + $ExitSec; ExitUtc = [datetime]::UnixEpoch.AddSeconds($upE + $ExitWallSec) } }
+                    }
+                    $r1Wall = [datetime]::UnixEpoch.AddSeconds($(if ($upV -ceq 'exhausted') { $upE - 0.6 } else { $upE })).ToLocalTime()
+                    $lease = [pscustomobject]@{ ok = $true; jobId = 'up'; label = 'quiet-lease mlv'; proc = [pscustomobject]@{ HasExited = $false; ExitCode = $null }; pid = 4000
+                        active = [pscustomobject]@{ slot = 1; held = '1:4000'; until = [long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 2700) }
+                        activeAt = [datetime]::UnixEpoch.AddSeconds($upE - 20).ToLocalTime(); activeAtMono = 980.0; lastRenewStart = $null; lastRenewStartMono = $null; lastRenewOkStart = $null; lastRenewOkStartMono = $null
+                        renewCall = $null; renewStarts = 2; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0; renewOkMaxGapSec = 0 }
+                    $script:QuietLease = $lease; $script:QuietLeaseWaiting = $null; $script:LeaseBatch = $null
+                    $script:Admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ seq = 1; token = 'up' } }
+                    # t5: R1 collected (rc 0, no "renewed"; its stamp at t3 read the stepped wall E-27).
+                    Register-QuietLeaseRenewOk -Lease $lease -CallStarted $r1Wall -CallStartedMono 1000.0 -CallStartedWallKnown ($upV -cne 'exhausted') -Call (New-UpCall 3 -27) -RecordEpochSec $null
+                    $gap1 = [double]$lease.renewOkMaxGapSec
+                    # t130: R2 collected (renewed E+105; its stamp at t105).
+                    $script:UpNowUtc = [datetime]::UnixEpoch.AddSeconds($upE + 130); $script:UpMono = 1130.0
+                    Register-QuietLeaseRenewOk -Lease $lease -CallStarted ([datetime]::UnixEpoch.AddSeconds($upE + 100).ToLocalTime()) -CallStartedMono 1100.0 -CallStartedWallKnown $true -Call (New-UpCall 105 105) -RecordEpochSec ($upE + 105)
+                    $stop = Get-LeaseBatchJobStop -Admission $script:Admission -Lease $lease
+                    [pscustomobject]@{ gap1 = $gap1; okMaxGapSec = [double]$lease.renewOkMaxGapSec; gapSec = (Get-QuietLeaseRenewOkGapSec -Lease $lease); stop = $(if ($null -ne $stop) { $stop.reason } else { $null }) }
+                }
+            }
+            finally { $script:QuietLease = $upSaved.q; $script:QuietLeaseWaiting = $upSaved.w; $script:LeaseBatch = $upSaved.b; $script:Admission = $upSaved.a }
+            $upTxt = "variant=$upV " + ($upOut | ConvertTo-Json -Compress)
+            $upHi = if ($upV -ceq 'exhausted') { 130.7 } else { 130.1 }
+            Assert-True ($upOut.gap1 -ge 25 - 0.01 -and $upOut.gap1 -le 25.1) "renew-gap-unknown-prev-record-ends-at-collection: R1 (no 'renewed') closes the activation gap at its collection, t5 (25 s): $upTxt"
+            Assert-True ($upOut.okMaxGapSec -ge 130 - 0.01 -and $upOut.okMaxGapSec -le $upHi -and $upOut.gapSec -gt 120 -and $upOut.stop -ceq 'demoted') "renew-gap-unknown-prev-record-ends-at-collection: with R1's record time unknown, R2's exit stamp is not credited; the gap ends at the collection (130 s, as base a7278cbd), over 120 s, and the job is demoted (heavy-slot.py's record gap is 132 s): $upTxt"
+            $upResults[$upV] = $upOut
+        }
+        $upRc = Invoke-RcCase -QuerySec 85 -ExitAfterSec 3 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(40) -MonoAdvanceToWalk 40 -NoPrevRecord
+        $upRcTxt = $upRc | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($upRc.ok -eq 1 -and [Math]::Abs($upRc.atMonoSec - 125) -lt 0.01 -and $upRc.okMaxGapSec -ge 125 - 0.01 -and $upRc.okMaxGapSec -le 125.1 -and $upRc.stop -ceq 'demoted') "renew-gap-unknown-prev-record-ends-at-collection (rc-slow-slice): with no previous record time the real renew tick ends the gap at the collection (125 s), as base, never at the exit stamp (43 s): $upRcTxt"
+        $upResults['rc-slow-slice'] = $upRc
+        $results.renewGapUnknownPrevRecordEndsAtCollection = $upResults
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

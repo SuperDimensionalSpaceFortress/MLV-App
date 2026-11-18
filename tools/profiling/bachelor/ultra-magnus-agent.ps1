@@ -3734,7 +3734,8 @@ function Register-QuietLeaseRenewOk {
     #        before the exit stamp (record wall t0+131, stamp t0+105) now reads 131 s and demotes (renew-gap-reverted-step-known-limit, flipped
     #        in r5). Any reading that says stale demotes; none can shorten the gap. The record gap is taken in epoch seconds as doubles, the
     #        arithmetic heavy-slot.py does on time.time(), never through DateTime ticks (adversary pass 9 A2: 120.00000024 s read exactly 120).
-    #        r5 (adversary pass 9 A1): the exit stamp ends the gap ONLY when the record time was read too. Without it (an output with no readable
+    #        r5 (adversary pass 9 A1): the exit stamp ends the gap ONLY when the record time was read too (r6, pass 12 A1: this renew's AND the
+    #        previous success's record time; see below). Without it (an output with no readable
     #        "renewed"), a reverted step cannot be ruled out, so the gap ends at the collection, as base a7278cbd: a late collection then reads
     #        long (a false demotion, the safe direction), never a missed one.
     # r6 (sol r5 B1 = adversary pass 11 A1): -CallStartedWallKnown $false (Start-HeavySlotCli exhausted its start-pair re-reads) marks this
@@ -3744,13 +3745,17 @@ function Register-QuietLeaseRenewOk {
     # so never later than the child's record: it can only read the gap long, a false demotion, the safe direction, as base). Any reading that
     # says stale still demotes; a known anchor ($null counts as known: a call or lease from before r6) is measured as in r5.
     param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallStartedMono = $null, $Call = $null, $RecordEpochSec = $null, $CallStartedWallKnown = $null)
+    # r6 (adversary pass 12 A1, introduced by r5): the exit stamp ends the gap only when heavy-slot.py's record time is known at BOTH ends (this
+    # renew's and the previous success's). With the previous record unknown (the activation anchor, or a renew whose output had no "renewed"),
+    # a backward wall step at that record cannot be ruled out (record wall E-27 while its call started at wall E: heavy-slot.py's gap 132 s
+    # where the call starts and the stamp read 105 s), so the gap ends at the collection, as base a7278cbd: never shorter than base.
     $nowWall = Get-Date
     $nowMono = Get-AgentMonotonicSec
-    $at = if ($null -ne $Call -and $null -ne $RecordEpochSec) { Get-QuietLeaseRenewOkAt -Call $Call -NowWall $nowWall -NowMono $nowMono } else { [pscustomobject]@{ wall = $nowWall; mono = $nowMono; fromExit = $false } }
     $useOk = $null -ne $Lease.lastRenewOkStart
     $prev = if ($useOk) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
     $prevMono = if ($useOk) { $Lease.lastRenewOkStartMono } else { $Lease.activeAtMono }
     $prevRecord = if ($useOk) { $Lease.lastRenewOkRecordEpochSec } else { $null }
+    $at = if ($null -ne $Call -and $null -ne $RecordEpochSec -and $null -ne $prevRecord) { Get-QuietLeaseRenewOkAt -Call $Call -NowWall $nowWall -NowMono $nowMono } else { [pscustomobject]@{ wall = $nowWall; mono = $nowMono; fromExit = $false } }
     if ($null -ne $prev) {
         if (Test-RenewGapFromWallUnknown -Lease $Lease -UseOk $useOk -PrevMono $prevMono -PrevRecord $prevRecord -ToRecord $RecordEpochSec) {
             $gap = [Math]::Max([double]$at.mono - [double]$prevMono, [double]$RecordEpochSec - [double]$prevRecord)
@@ -3913,7 +3918,7 @@ function Update-QuietLeaseRenew {
             $r = Receive-HeavySlotCli -Call $c
             $Lease.renewCall = $null
             # r5 (sol r4 A2): the renew's own record wall time (its printed flag's "renewed") is a further reading of the gap; $null (none printed)
-            # ends the gap at this collection, never at the exit stamp (adversary pass 9 A1).
+            # ends the gap at this collection, never at the exit stamp (adversary pass 9 A1); so does an unknown PREVIOUS record time (r6, pass 12 A1).
             # r6 (sol r5 B1): the call's startedWallKnown travels with its anchor.
             if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started -CallStartedMono $c.startedMono -CallStartedWallKnown $c.startedWallKnown -Call $c -RecordEpochSec (Get-RenewRecordEpochSec -Stdout $r.stdout) }
             else {
