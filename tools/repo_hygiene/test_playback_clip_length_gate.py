@@ -2727,6 +2727,51 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                                              "void g() { QKeyEvent const press( QEvent::KeyPress, 32, {} ); }\n"})
         self.assertTrue(any("synthesized key event" in p for p in problems), problems)
 
+    # r6 (adversary pass on 4adb9c0d A1 A2, HUB RULING HUB-TICK 20261118T1142Z): the exemption was decided by a backward
+    # text walk that guessed the template context, and each stop character it knew (a C-style cast's `(`, a `{` inside a
+    # balanced group) let one more spelling through. The rule is inverted: a QKeyEvent pointer / reference is exempt ONLY
+    # as a function or lambda parameter declarator, or in a named-cast statement, in a plain block context; anything
+    # else is flagged.
+    _R6_PRESS = " press{ QEvent::KeyPress, 32, Qt::NoModifier };"
+    _R6_TYPE_COMPUTATIONS = {
+        "A1 decltype over a C-style cast": "std::remove_pointer_t<decltype((QKeyEvent*)nullptr)>" + _R6_PRESS,
+        "A1 __typeof__ over a C-style cast": "std::remove_pointer_t<__typeof__((QKeyEvent*)nullptr)>" + _R6_PRESS,
+        "A2 a brace inside a balanced parenthesised argument":
+            "std::remove_pointer_t<std::enable_if_t<(sizeof(int{}) > 0), QKeyEvent*>>" + _R6_PRESS,
+        "a functional-cast brace before the argument":
+            "std::remove_pointer_t<std::conditional_t<decltype(0){} == 0, QKeyEvent*, int>>" + _R6_PRESS,
+        "a lambda parameter inside a decltype":
+            "std::remove_pointer_t<decltype([](QKeyEvent* e) { return e; }(nullptr))>" + _R6_PRESS,
+        "a lambda parameter in a lambda body inside a decltype":
+            "std::remove_pointer_t<decltype([]{ auto f = [](QKeyEvent* e) { return e; }; return f(nullptr); }())>"
+            + _R6_PRESS,
+        "a function type argument": "std::remove_pointer_t<std::function<void(QKeyEvent*)>*>" + _R6_PRESS,
+        "a parameter list in a template argument with a comma":
+            "std::tuple_element_t<1, std::tuple<int, QKeyEvent*, int>> p = nullptr;",
+        "a C-style cast statement": "auto *k = (QKeyEvent*)nullptr;",
+        "a member pointer": "struct Holder { QKeyEvent *held; };",
+        "a local pointer with no cast": "QKeyEvent *k = nullptr;",
+        "a default argument": "void f( QKeyEvent *e = nullptr );",
+        "a cast inside a call argument": "g( static_cast<QKeyEvent*>( nullptr ) );",
+    }
+
+    def test_r6_a1_a2_a_key_event_pointer_outside_a_declarator_or_cast_statement_is_a_synthesized_key(self) -> None:
+        for name, injected in self._R6_TYPE_COMPUTATIONS.items():
+            with self.subTest(name):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    def test_r6_a1_a2_the_real_key_event_reads_stay_exempt(self) -> None:
+        # The three real sites: a handler declaration, its definition, and FocusGuard's cast of the delivered event.
+        for text in ("class D : public QDialog\n{\n    Q_OBJECT\nprotected:\n    void keyPressEvent( QKeyEvent *event ) override;\n};\n",
+                     "void D::keyPressEvent( QKeyEvent *event )\n{\n    event->ignore();\n}\n",
+                     "namespace N\n{\nclass G : public QObject\n{\npublic:\n    bool eventFilter( QObject *watched, QEvent *event ) "
+                     "override\n    {\n        if( event->type() != QEvent::ShortcutOverride ) return false;\n"
+                     "        QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );\n        return keyEvent->key();\n    }\n};\n}\n",
+                     "void f()\n{\n    auto h = []( QKeyEvent *e ) { return e->key(); };\n}\n",
+                     "int g( QEvent *e ) { return static_cast<QKeyEvent*>( e )->key(); }\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+
     def test_r3_p2_a2_a_qualified_qkeyevent_include_is_not_a_synthesized_key(self) -> None:
         for text in ("#include <QtGui/QKeyEvent>\n", "#include <qevent.h>\n", '#include "QKeyEvent"\n'):
             with self.subTest(text):

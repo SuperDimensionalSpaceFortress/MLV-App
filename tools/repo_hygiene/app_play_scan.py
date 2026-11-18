@@ -259,62 +259,172 @@ _KEY_EVENT_REF_TAIL = r"\s*(?:(?:const|volatile)\b\s*)*[*&]"
 _KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!" + _KEY_EVENT_REF_TAIL + r")|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
                         r"|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
 # r5 (adversary pass on f422d164 A2): the pointer / reference exemption hid `std::remove_pointer_t<QKeyEvent*> press{...}`,
-# a type trait that names the OBJECT type. A `QKeyEvent` pointer or reference that sits inside a template argument list is
-# a delivered-event read only directly inside a cast (static_cast<QKeyEvent*>( event )); inside anything else it is flagged.
+# a type trait that names the OBJECT type.
+# r6 (adversary pass on 4adb9c0d A1 A2, HUB RULING HUB-TICK 20261118T1142Z): r5 decided the exemption with a backward text
+# walk that GUESSED the template context, and every stop character it knew (a C-style cast's `(`, a `{` inside a balanced
+# group) let one more spelling scan clean. The rule is inverted and fail-closed: a `QKeyEvent` pointer / reference is a
+# delivered-event read ONLY where it is matched POSITIVELY (_key_event_ref_is_delivered_read): (a) a function or lambda
+# parameter declarator, or (b) a statement that is exactly a named cast of a delivered event. Everything else -- a
+# template argument, a decltype, a C-style cast, a member, a local, a default argument -- is flagged, reviewed here.
 _KEY_EVENT_REF = re.compile(r"\bQKeyEvent\b(?=" + _KEY_EVENT_REF_TAIL + r")")
-_TEMPLATE_CAST_NAMES = frozenset({"static_cast", "dynamic_cast", "reinterpret_cast", "const_cast", "qobject_cast"})
+_CLOSE_OF = {"(": ")", "[": "]", "{": "}"}
+_CV = r"(?:(?:const|volatile)\b\s*)*"
+_ACCESS_LABELS = re.compile(
+    r"^\s*(?:(?:(?:public|protected|private)(?:\s+(?:slots|Q_SLOTS))?|signals|Q_SIGNALS)\s*:(?!:)\s*)*")
+# A depth-filtered prefix: nested ( ) [ ] { } groups are shown as an empty pair, so only the statement's own tokens remain.
+_FUNC_NAME = r"[\w\s:~]*[\w~]"                    # `void StatusDialog::keyPressEvent`, `bool eventFilter`, `~X`
+_LAMBDA_INTRO = r"(?:[\w\s:]*=\s*)?\[\]"           # `auto inspect = []` (captures are a nested group)
+_DECL_SPECS = (r"(?:\s*(?:(?:const|volatile|override|final|noexcept|mutable|Q_DECL_OVERRIDE)\b|noexcept\s*\(\)"
+               r"|->\s*[\w:]+\s*[*&]?))*")
+_CTOR_INIT = r"(?:\s*:\s*[\w:]+\s*(?:\(\)|\{\})(?:\s*,\s*[\w:]+\s*(?:\(\)|\{\}))*)?"
+_PARAM_LIST_OWNER = re.compile(rf"(?:{_FUNC_NAME}|{_LAMBDA_INTRO})")
+# A parenthesis after one of these is an operand, not a parameter list (GCC's __typeof__ even takes a type).
+_NOT_A_PARAM_LIST_OWNER = re.compile(
+    r"\b(?:decltype|typeof|__typeof__|__typeof|sizeof|alignof|_Alignof|__alignof__|typeid|noexcept|return|throw|co_return"
+    r"|co_yield|co_await|new|delete|if|for|while|switch|catch|case|static_assert|requires|operator)$")
+# What a brace that opens a BLOCK follows: a function / lambda head, a class / namespace head, a control statement, or
+# nothing (a bare block). A brace after anything else (`int{}`, `decltype(0){}`, `+[]{` in a template argument) is an
+# expression, so it neither ends a statement nor counts as a plain block context.
+_BLOCK_PREFIX = re.compile(
+    rf"(?:|(?:class|struct|union|namespace|enum)\b[\w\s:,]*|(?:else\s+)?(?:if|for|while|switch|catch)\s*\(\)"
+    rf"|else|do|try|(?:{_FUNC_NAME}|{_LAMBDA_INTRO})\s*\(\){_DECL_SPECS}{_CTOR_INIT})")
+# A function body of any return type (`inline QList<ActionBinding> bindings() { ... }`) also ENDS a statement, so the
+# next declaration's prefix starts after it. It is not thereby a plain block context: that is _BLOCK_PREFIX, strictly.
+_FUNCTION_BODY_HEAD = re.compile(rf"\(\){_DECL_SPECS}{_CTOR_INIT}$")
+# (a) one parameter: cv QKeyEvent cv [*&] cv name, nothing else (no default argument, no template, no array).
+_KEY_EVENT_PARAM = re.compile(rf"\s*(?:(?:const|volatile)\s+)*QKeyEvent\s*{_CV}[*&]\s*{_CV}(?:\w+)?\s*")
+_PARAM_LIST_END = re.compile(
+    r"\s*(?:[{;]|=\s*(?:0|default|delete)\b|->|(?:const|volatile|override|final|noexcept|mutable|Q_DECL_OVERRIDE)\b)")
+# (b) the whole statement: `[cv] QKeyEvent|auto cv* name = <named cast><cv QKeyEvent cv*>( ... ) [->member()] ;`, or the
+# same cast assigned to a name or returned. The cast operand is a nested group, scanned on its own (a ref inside it has
+# a parenthesis as its context, so it is flagged).
+_KEY_EVENT_CAST_STATEMENT = re.compile(
+    rf"\s*(?:(?:(?:const|volatile)\s+)*(?:QKeyEvent|auto)\s*{_CV}[*&]\s*{_CV}\w+\s*=|\w+\s*=|return)\s*"
+    rf"(?:static_cast|dynamic_cast|reinterpret_cast|const_cast|qobject_cast)\s*<\s*(?:(?:const|volatile)\s+)*"
+    rf"QKeyEvent\s*{_CV}[*&]\s*{_CV}>\s*\(\)(?:\s*->\s*\w+\s*\(\))?\s*")
 
 
-def _enclosing_template_name(blank: str, pos: int) -> str | None:
-    """The identifier before the unmatched `<` that encloses `pos` (``""`` when none), or None outside template arguments.
+class _Brackets:
+    """The ( ) [ ] { } structure of one comment- and literal-blanked file (preprocessor lines blanked too).
 
-    Walks back over the statement with NO length cap (adversary pass on d3ad0b0f A2: a 600-character cap returned "no
-    template", which the caller treats as exempt, on long whitespace), never past a ; { } or an UNMATCHED opening
-    parenthesis (a parameter list). A balanced parenthesised group is skipped whole: angle brackets inside it are
-    comparisons or nested expressions, and the template argument list can open before it."""
-    depth = 0
-    paren = 0
-    i = pos - 1
-    while i >= 0:
-        c = blank[i]
-        if c in ";{}":
-            return None
-        if c == ")":
-            paren += 1
-        elif c == "(":
-            if paren == 0:
-                return None
-            paren -= 1
-        elif paren:
-            pass
-        elif c == ">":
-            if i > 0 and blank[i - 1] == "-":     # `->` is not a closing angle bracket
-                i -= 1
+    Angle brackets are NOT tracked: `<` is also a comparison. Nothing here guesses a template context; the exemption is
+    granted only on a positive structural match, so any structure this cannot read (an unbalanced file, an unknown
+    prefix) leaves the reference flagged."""
+
+    def __init__(self, blank: str) -> None:
+        self.text = _DIRECTIVE_LINE.sub(lambda m: " " * len(m.group(0)), blank)
+        self.closer: dict[int, int] = {}
+        self.opener: dict[int, int] = {}
+        self.parent: dict[int, int] = {}
+        self.broken = False
+        self._prefix_memo: dict[int, tuple[str, list[int]]] = {}
+        stack: list[int] = []
+        for i, c in enumerate(self.text):
+            if c in "([{":
+                self.parent[i] = stack[-1] if stack else -1
+                stack.append(i)
+            elif c in ")]}":
+                if not stack or _CLOSE_OF[self.text[stack[-1]]] != c:
+                    self.broken = True
+                    return
+                self.closer[stack[-1]] = i
+                self.opener[i] = stack.pop()
+        self.broken = bool(stack)
+
+    def enclosing(self, pos: int) -> int:
+        """The innermost opener whose group holds `pos` (-1 at file level)."""
+        i = pos - 1
+        while i >= 0:
+            c = self.text[i]
+            if c in ")]}":
+                i = self.opener[i] - 1
+                continue
+            if c in "([{":
+                return i
+            i -= 1
+        return -1
+
+    def items(self, start: int, end: int) -> list[tuple[str, int]]:
+        """The tokens of [start, end) at that depth: a nested group becomes its empty pair."""
+        out: list[tuple[str, int]] = []
+        i = start
+        while i < end:
+            c = self.text[i]
+            if c in "([{":
+                out.append((c + _CLOSE_OF[c], i))
+                i = self.closer[i] + 1
+                continue
+            out.append((c, i))
+            i += 1
+        return out
+
+    def prefix(self, pos: int) -> str:
+        """The depth-filtered text of the statement that `pos` sits in, from its start up to `pos`.
+
+        A statement starts after its parent opener, a `;`, or a `{ }` group whose own prefix makes it a BLOCK."""
+        parent = self.enclosing(pos)
+        buf: list[str] = []
+        for token, at in self.items(parent + 1, pos):
+            if token == ";":
+                buf = []
+            elif token == "{}" and (_BLOCK_PREFIX.fullmatch(head := _ACCESS_LABELS.sub("", "".join(buf)).strip())
+                                    or _FUNCTION_BODY_HEAD.search(head)):
+                buf = []
             else:
-                depth += 1
-        elif c == "<":
-            if depth == 0:
-                end = i
-                while end > 0 and blank[end - 1].isspace():
-                    end -= 1
-                start = end
-                while start > 0 and (blank[start - 1].isalnum() or blank[start - 1] == "_"):
-                    start -= 1
-                return blank[start:end]
-            depth -= 1
-        i -= 1
-    return None
+                buf.append(token)
+        return _ACCESS_LABELS.sub("", "".join(buf)).strip()
+
+    def block_context(self, opener: int) -> bool:
+        """True when `opener` and every group around it is a BLOCK brace (never a ( ) or [ ] or an expression brace)."""
+        while opener != -1:
+            if self.text[opener] != "{" or not _BLOCK_PREFIX.fullmatch(self.prefix(opener)):
+                return False
+            opener = self.parent[opener]
+        return True
 
 
-def _statement_start(blank: str, pos: int) -> int:
-    """Offset just after the last ; { } before `pos` (0 when there is none)."""
-    return max(blank.rfind(";", 0, pos), blank.rfind("{", 0, pos), blank.rfind("}", 0, pos)) + 1
-
-
-# r5 (adversary pass on d3ad0b0f A1): `std::remove_pointer_t<decltype(static_cast<QKeyEvent*>(nullptr))> press{...}` names the
-# OBJECT type through a cast that is only an operand. The cast exemption therefore holds only in a statement with no
-# type-computing operator in front of it (fail-closed: such a statement is reviewed here).
-_TYPE_OF_EXPRESSION = re.compile(r"\b(?:decltype|typeof|__typeof__|__typeof|declval)\b")
+def _key_event_ref_is_delivered_read(brackets: _Brackets, pos: int) -> bool:
+    """Whether the `QKeyEvent` pointer / reference at `pos` is one of the two reviewed delivered-event reads."""
+    if brackets.broken:
+        return False
+    text = brackets.text
+    parent = brackets.enclosing(pos)
+    # (a) a parameter declarator: the innermost group is a parameter list owned by a named function or a lambda, in a
+    # plain block context, and the list is followed by what follows a declarator.
+    if parent != -1 and text[parent] == "(":
+        close = brackets.closer[parent]
+        tokens = brackets.items(parent + 1, close)
+        flat = "".join(token for token, _ in tokens)
+        if "=" in flat or not _PARAM_LIST_END.match(text, close + 1):
+            return False
+        index = next((k for k, (_, at) in enumerate(tokens) if at == pos), None)
+        if index is None:
+            return False
+        before = "".join(token for token, _ in tokens[:index])
+        angle = before.replace("->", "")
+        if angle.count("<") != angle.count(">"):     # a comma inside a template argument list is not a parameter break
+            return False
+        start = before.rfind(",") + 1
+        rest = "".join(token for token, _ in tokens[index:])
+        end = rest.find(",")
+        segment = before[start:] + (rest if end < 0 else rest[:end])
+        if not _KEY_EVENT_PARAM.fullmatch(segment):
+            return False
+        owner = brackets.prefix(parent)
+        if not _PARAM_LIST_OWNER.fullmatch(owner) or _NOT_A_PARAM_LIST_OWNER.search(owner):
+            return False
+        return brackets.block_context(brackets.enclosing(parent))
+    # (b) a named-cast statement in a plain block context.
+    if parent != -1 and not brackets.block_context(parent):
+        return False
+    tail = []
+    for token, _ in brackets.items(pos, brackets.closer[parent] if parent != -1 else len(text)):
+        if token == ";":
+            break
+        tail.append(token)
+    else:
+        return False
+    return bool(_KEY_EVENT_CAST_STATEMENT.fullmatch(brackets.prefix(pos) + "".join(tail)))
 # r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
 _KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
 # PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
@@ -701,10 +811,10 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             if any(start <= match.start() < end for start, end in include_spans):
                 continue
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
+        brackets = None
         for match in _KEY_EVENT_REF.finditer(blank):
-            enclosing = _enclosing_template_name(blank, match.start())
-            if enclosing is not None and (enclosing not in _TEMPLATE_CAST_NAMES or _TYPE_OF_EXPRESSION.search(
-                    blank, _statement_start(blank, match.start()), match.start())):
+            brackets = brackets or _Brackets(blank)
+            if not _key_event_ref_is_delivered_read(brackets, match.start()):
                 problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
         for match in _EVENT_POST.finditer(blank):
             key = (path, match.group(1))
