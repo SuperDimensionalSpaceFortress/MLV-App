@@ -628,9 +628,12 @@ def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
         try:
             return function(*args, **kwargs)
         except SystemExit as error:
-            if error.code:
+            # Decided on the code's own value, never through its methods: an int subclass can make
+            # ``bool()``, ``==`` or ``repr()`` raise a ``SystemExit(0)`` from inside this handler.
+            code = error.code
+            if not (code is None or (isinstance(code, int) and int.__eq__(code, 0) is True)):
                 raise
-            emit_error(f"{function.__name__} was ended by {describe_error(error)} (code {error.code!r}), which is not a pass")
+            emit_error(f"{function.__name__} was ended by {describe_error(error)} (code {'None' if code is None else 0}), which is not a pass")
             raise SystemExit(1) from error
 
     return guarded
@@ -1027,7 +1030,8 @@ class DeadlineKiller:
 
     def add(self, proc: subprocess.Popen[bytes]) -> None:
         with self._lock:
-            self._procs.append(proc)
+            if not any(known is proc for known in self._procs):  # a registration finished after an interrupt is not doubled
+                self._procs.append(proc)
         self._kill_due()
 
     def _kill_due(self) -> None:
@@ -1183,17 +1187,26 @@ def run_parallel(
                 log.close()
                 problems.append(f"worker {number}/{len(groups)} not launched: the deadline passed while launching")
                 continue
+            proc = None
             try:
                 proc = subprocess.Popen(
                     command, cwd=root_dir, env=child_env, stdin=subprocess.DEVNULL, stdout=log,
                     stderr=subprocess.STDOUT, creationflags=no_window_flags(), **session_kwargs(),
                 )
+                procs.append((proc, log))
+                logs.append(home / "log.txt")
+                killer.add(proc)  # from here the deadline is enforced even while the next launch blocks
             except BaseException:
-                log.close()  # not yet in procs: the cleanup below would never close it before the rmtree
+                log.close()  # a launch that failed is not in procs: the cleanup below would never close it
+                if proc is not None:
+                    # The worker exists but its registration was cut short (an interrupt between the launch and
+                    # the lists): finish it, so the cleanup below kills it, reports its log and keeps the lists paired.
+                    if not any(known is proc for known, _known_log in procs):
+                        procs.append((proc, log))
+                    while len(logs) < len(procs):
+                        logs.append(home / "log.txt")
+                    killer.add(proc)
                 raise
-            procs.append((proc, log))
-            logs.append(home / "log.txt")
-            killer.add(proc)  # from here the deadline is enforced even while the next launch blocks
         watch.check()  # a budget already spent when the workers launch is reported at once
         late = late_workers([proc for proc, _log in procs], deadline, clock)
         running = [number for number, (proc, _log) in enumerate(procs, start=1) if proc.poll() is None]

@@ -2441,6 +2441,77 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(result.started_ids, ["shared"])
         self.assertEqual(result.skipped_by_fixture(members), ["shared"], "the fixture-skipped member was dropped by id")
 
+    # r11 adversary A2 (pass 19): the zero-exit guard must not call methods of the code it is judging.
+    def test_the_zero_exit_guard_does_not_run_methods_of_an_exotic_exit_code(self) -> None:
+        class NonzeroThatExitsZeroWhenTested(int):
+            def __bool__(self) -> bool:
+                raise SystemExit(0)
+
+        class ZeroThatExitsZeroWhenShown(int):
+            def __repr__(self) -> str:
+                raise SystemExit(0)
+
+        for label, code in (
+            ("a nonzero code whose __bool__ raises SystemExit(0)", NonzeroThatExitsZeroWhenTested(1)),
+            ("a zero code whose __repr__ raises SystemExit(0)", ZeroThatExitsZeroWhenShown(0)),
+        ):
+            with self.subTest(label):
+                def ended() -> int:
+                    raise SystemExit(code)
+
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                    shard.never_exits_zero(ended)()
+                self.assertFalse(int.__eq__(caught.exception.code, 0), "a run cut short ended with a zero exit")
+
+    # r11 adversary A1 (pass 19): an interrupt after the worker exists but before it is registered must not leave it running.
+    def test_an_interrupt_between_the_launch_and_its_registration_still_ends_the_worker(self) -> None:
+        import inspect
+
+        run = inspect.unwrap(shard.run_parallel)
+        lines, first = inspect.getsourcelines(run)
+        for label, before in (("before the lists", "procs.append((proc, log))"), ("before the pairing", "logs.append(home / \"log.txt\")")):
+            with self.subTest(label):
+                target = first + next(n for n, text in enumerate(lines) if text.strip() == before)
+                root, tests, tag = self._fixture()
+                procs = [self._RunningProc(), self._RunningProc()]
+                calls: list[int] = []
+                fired: list[int] = []
+
+                def popen(*args: object, **kwargs: object) -> object:
+                    calls.append(1)
+                    return procs[len(calls) - 1]
+
+                def local(frame: object, event: str, arg: object) -> object:
+                    if event == "line" and frame.f_lineno == target and not fired:
+                        fired.append(1)
+                        raise KeyboardInterrupt
+                    return local
+
+                def tracer(frame: object, event: str, arg: object) -> object:
+                    return local if frame.f_code is run.__code__ else None
+
+                out, err = io.StringIO(), io.StringIO()
+                raised: BaseException | None = None
+                with (
+                    mock.patch.object(shard.subprocess, "Popen", side_effect=popen),
+                    contextlib.redirect_stdout(out),
+                    contextlib.redirect_stderr(err),
+                ):
+                    sys.settrace(tracer)
+                    try:
+                        shard.run_parallel(
+                            tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                            repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+                        )
+                    except BaseException as error:  # noqa: BLE001
+                        raised = error
+                    finally:
+                        sys.settrace(None)
+                for kept in re.findall(r"kept at (.+)$", err.getvalue(), re.MULTILINE):
+                    self.addCleanup(shutil.rmtree, kept, True)
+                self.assertIsInstance(raised, KeyboardInterrupt, repr(raised) + err.getvalue())
+                self.assertEqual(procs[0].returncode, -9, "the launched worker was left running")
+
     def test_a_worker_timing_too_large_for_float_is_unreadable_not_an_exception(self) -> None:
         path = Path(tempfile.mkdtemp(prefix="fxw-")) / "result.json"
         self.addCleanup(shutil.rmtree, path.parent, True)
