@@ -1763,21 +1763,61 @@ function Test-CredentialDecodeLimitError($ErrorRecord) {
 }
 # -OnStage { param($LevelText, $LevelMask) <index or -1> }: called on every decode level, shallowest first; the first level it returns an index >= 0 for stops the loop
 # (.Hit is that index, .Text and .Mask that level). Without a hit, .Text and .Mask are the fixed point and .Levels the number of levels (0 when nothing decodes).
-function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null) {
+# r6 (adversary pass 13 A2, defect class: a residual escape whose framing a decode destroys on the SAME level that exposes or keeps it; '{"ab\\U0011FFFF cd":"x"}' decodes
+# '\\' and ' ' together, so the level text holds the key 'ab\U0011FFFF cd' whose blank ends the residual key rule's name run, and the raw text was never judged for residuals):
+# the RESIDUAL VIEW of a text: the escapes whose decoded value is '\', '&', '%' or a backtick (the only characters an escape INTRODUCER can start with: '\\' '&amp;' '&#92;' '%5C',
+# a decoded '\' that exposes '\U0011FFFF') are decoded, to a fixed point (nested forms included); every OTHER escape that would decode, and every doubled quote that would collapse, is
+# replaced by the same number of 'z' characters, a plain name character no decode can turn into a framing character. So a residual escape that a decode exposes is visible, and no
+# decode that happens on the same level can destroy its framing (a blank, a quote, a colon, a bracket). An escape that cannot be decoded is kept as written. The view is not the
+# same length as the text (the exposing decodes shorten it): it is judged without the decoded-character mask, and a hit index counts lines in the VIEW.
+# Get-CredentialNormalForm hands the view of EACH level's text, the raw text included, to -OnView BEFORE that level is decoded.
+function Get-CredentialResidualView([string]$Text) {
+    $t = $Text
+    for ($pass = 0; $pass -le $script:CredentialMaxDecodeStages; $pass++) {
+        $sb = [System.Text.StringBuilder]::new(); $last = 0; $changed = $false
+        foreach ($m in $script:CredentialEscapeRegex.Matches($t)) {
+            $r = [string](& $script:CredentialEscapeEval $m)
+            if ($r -ceq $m.Value) { continue }
+            [void]$sb.Append($t, $last, $m.Index - $last)
+            if ($r.Length -eq 1 -and '\&%`'.Contains($r)) { [void]$sb.Append($r) } else { [void]$sb.Append('z', $m.Length) }
+            $last = $m.Index + $m.Length; $changed = $true
+        }
+        if (-not $changed) { break }
+        [void]$sb.Append($t, $last, $t.Length - $last)
+        $t = $sb.ToString()
+    }
+    if ($t.Contains("''") -or $t.Contains('""')) {
+        $t = $script:CredentialQuoteRunRegex.Replace($t, { param($m) $v = $m.Value; $q = [string]$v[0]; if ($v.Length -lt 4) { return $v }; return $q + $v.Substring(1, $v.Length - 2).Replace($q + $q, 'zz') + $q })
+        $t = $script:CredentialQuoteNearNameRegex.Replace($t, 'zz')
+    }
+    return $t
+}
+function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null, [scriptblock]$OnView = $null) {
     $s = "$Text"; $mask = [string]::new([char]'0', $s.Length)
     $levels = 0; $hit = -1
     while ($true) {
-        $r = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
-        if ($r) { $s = $r.Text; $mask = $r.Mask }
-        $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
-        if ($b) { $s = $b.Text; $mask = $b.Mask }
-        # r6 (sol r5 A2): the doubled quote, on the same level (see $script:CredentialQuoteRunRegex); only when the text holds a doubled quote at all
+        # r6 (adversary pass 13 A2): the residual view of the text about to be decoded (see Get-CredentialResidualView); a hit ends the walk on the view (same length as the level text)
+        if ($OnView -and $script:CredentialResidualIntroRegex.IsMatch($s)) {
+            $vw = Get-CredentialResidualView $s
+            $got = @(& $OnView $vw $mask)
+            if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $vw; Mask = $mask; Levels = $levels; Hit = [int]$got[-1] } }
+        }
+        # r6 (adversary pass 13 A1, defect class: decode order): a doubled quote belongs to the OUTER reader (PowerShell, YAML, CSV), so it is collapsed on a level of its own, BEFORE
+        # the escapes and character references that the string holds are decoded and judged ('$x = ''<add key=''''k'''' value=''''hunt&#39;er2'''' />''' must reach the XML rule with
+        # its quoting intact: collapsing it on the same level as '&#39;' leaves 'value=''hunt''er2''' and no start tag). Only when the text holds a doubled quote at all.
         $q1 = $null; $q2 = $null
         if ($s.Contains("''") -or $s.Contains('""')) {
             $q1 = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialQuoteRunRegex -Eval $script:CredentialQuoteRunEval
             if ($q1) { $s = $q1.Text; $mask = $q1.Mask }
             $q2 = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialQuoteNearNameRegex -Eval $script:CredentialQuoteNearNameEval
             if ($q2) { $s = $q2.Text; $mask = $q2.Mask }
+        }
+        $r = $null; $b = $null
+        if (-not $q1 -and -not $q2) {
+            $r = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
+            if ($r) { $s = $r.Text; $mask = $r.Mask }
+            $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
+            if ($b) { $s = $b.Text; $mask = $b.Mask }
         }
         if (-not $r -and -not $b -and -not $q1 -and -not $q2) { break }
         $levels++
@@ -1818,7 +1858,8 @@ function Get-CredentialHitLine {
             # the text or an undecodable escape is left in it, so no trigger list can skip it (pass 3 A3). Every rule reads the decoded text; the mask keeps a decoded value
             # off the exemption list (r1 pass 2 A1: '"password": \156ull'); a key still holding an undecodable escape is secret-named (-Residual, deny by default).
             # r2 pass 6 A1: every decode level, shallowest first. r4 (sol r3 A3): each level is judged as it is produced and then dropped (-OnStage), never kept.
-            $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) $script:CredentialDecodedMask = $lvMask; try { Get-CredentialHitIndex -Text $lvText -Residual $true } finally { $script:CredentialDecodedMask = $null } }
+            # r6 (adversary pass 13 A2): -OnView judges the residual view of every text BEFORE it is decoded (the same rules, with -Residual), so a decode that destroys a residual key's framing cannot hide it
+            $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) $script:CredentialDecodedMask = $lvMask; try { Get-CredentialHitIndex -Text $lvText -Residual $true } finally { $script:CredentialDecodedMask = $null } } -OnView { param($vwText, $vwMask) $script:CredentialDecodedMask = $null; Get-CredentialHitIndex -Text $vwText -Residual $true }
             if ($nf.Hit -ge 0) { $idx = $nf.Hit; $Text = $nf.Text }
             elseif ($nf.Levels -eq 0 -and $script:CredentialResidualIntroRegex.IsMatch($Text)) {
                 # a text with only undecodable escapes has no level: it is judged as its own normal form
@@ -2213,7 +2254,7 @@ function Test-CredentialNamePresent {
         # (config.toml 'xml = "<add key=''p a s s w o r d'' value='''' />"' has no tag until it is decoded)
         # r5 (sol r4 A1, defect class: a check that runs on the fixed point only): the residual key and residual table header rules run at EVERY level too, as in the content
         # guard (Get-CredentialHitLine judges every level with -Residual), so a residual that a deeper decode turns into a blank ('ab\\U0011FFFF\\u0020cd') still names a secret
-        $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) if ((Test-CredentialNameWordPresent $lvText) -or (Get-CredentialXmlAttrPairHitIndex -Text $lvText -NameOnly) -ge 0 -or (Test-CredentialResidualNamePresent $lvText)) { 0 } else { -1 } }
+        $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) if ((Test-CredentialNameWordPresent $lvText) -or (Get-CredentialXmlAttrPairHitIndex -Text $lvText -NameOnly) -ge 0 -or (Test-CredentialResidualNamePresent $lvText)) { 0 } else { -1 } } -OnView { param($vwText, $vwMask) if (Test-CredentialResidualNamePresent $vwText) { 0 } else { -1 } }   # r6 (adversary pass 13 A2): the residual view of each text before it is decoded
         if ($nf.Hit -ge 0) { return $true }
         # the fixed point, and a text with no decode level at all (it is its own normal form)
         if (Test-CredentialResidualNamePresent $nf.Text) { return $true }

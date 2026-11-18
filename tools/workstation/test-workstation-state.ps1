@@ -2892,12 +2892,25 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     $ddR2['r6 sol r5 A2 sibling: doubled single quotes around an element-form pair'] = ('$xml = ''<entry key=''''password''''>hunter2</entry>''')
     $ddR2['r6 sol r5 A2 sibling: doubled quotes around a slash-led key'] = ('$xml = ''<add key=''''/password'''' value=''''hunter2'''' />''')
     $ddR2['r6 sol r5 A2 sibling: a doubled quote pair with no enclosing run (adjacent to name characters)'] = ('x ''''password'''' value=''''hunter2'''' <add key=''''password'''' value=''''hunter2'''' />')
+    # r6 adversary pass 13 A1 (defect class: decode order): the doubled quote belongs to the OUTER reader, so it collapses on a level of its own BEFORE a character reference inside the string is decoded
+    $ddR2['r6 adv p13 A1 a char-ref apostrophe in a doubled-quote PowerShell string'] = ('$xml = ''<add key=''''pass&#119;ord'''' value=''''hunt&#39;er2'''' />''')
+    $ddR2['r6 adv p13 A1 sibling: a char-ref quote in a doubled-double-quote string'] = ('$xml = "<add key=""pass&#119;ord"" value=""hunt&#34;er2"" />"')
+    $ddR2['r6 adv p13 A1 sibling: a hex char-ref apostrophe in a YAML single-quoted string'] = ('xml: ''<add key=''''pass&#x77;ord'''' value=''''hunt&#x27;er2'''' />''')
+    # r6 adversary pass 13 A2 (defect class: a residual escape whose framing a decode destroys on the SAME level): the residual key / table header stays visible whatever a same-level decode makes of its framing
+    $ddBsA2 = [string][char]92
+    foreach ($ddD in @('0020', '0009', '000A', '0022', '0027', '003A', '003D', '002C', '005D')) {
+        foreach ($ddX in @(($ddBsA2 + $ddBsA2), $ddBsA2)) {
+            $ddR2["r6 adv p13 A2 key: residual after '$ddX', then \u$ddD"] = ('{"ab' + $ddX + 'U0011FFFF' + $ddBsA2 + 'u' + $ddD + 'cd":"hunter2"}')
+            $ddR2["r6 adv p13 A2 header: residual after '$ddX', then \u$ddD"] = ('["ab' + $ddX + 'U0011FFFF' + $ddBsA2 + 'u' + $ddD + 'cd"]' + "`n" + 'x="hunter2"')
+        }
+    }
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     # r6 must-pass: the decode of a backtick before any character and of a doubled quote never turns an empty literal, a plain value or a Markdown code span into a credential
     foreach ($ddOkR6 in @('<add key="password" value="" />', '<add key="password" value=""/>', "<add key='password' value=''/>", "password: ''", 'password: ""', '{"a":"","b":"x"}', '$msg = ''it''''s a plain note''', '$msg = "say ""hi"" to the team"', ('a ' + $ddBq + '/ path note: plain'), ('the ' + $ddBq + 'theme' + $ddBq + ' setting'))) {
         Assert-That (-not (Test-CredentialText $ddOkR6)) "DENY-BY-DEFAULT-1 r6 must-pass: $ddOkR6 is not a credential" $ddOkR6
     }
-    $ddR2Miss =[System.Collections.Generic.List[string]]::new(); $ddR2N = 0
+    Assert-That (-not (Test-CredentialText ('{"caf' + [string][char]92 + 'u00e9": "x", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r6 must-pass: a decodable accent escape in a key is not a credential (the residual view does not refuse it)'
+    $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
     foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
         foreach ($esc in @('w', '\x77', '&#119;', '&#x77;', '\167', '%77', ('`u{77}'), '&amp;#119;', '\U0011FFFF', '&w;', ('&' + $ddE + ';'))) {
             foreach ($wrap in @('json', 'xml')) {
@@ -2969,6 +2982,17 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         }
         Assert-That ($ddA4Miss.Count -eq 0 -and $ddA4N -eq 10) "DENY-BY-DEFAULT-1 r6 sol r5 A1-A2 role guard: all $ddA4N backtick-punctuation and doubled-quote forms name a secret" ("misses=$($ddA4Miss.Count): " + (($ddA4Miss | Select-Object -First 6) -join '; '))
         Assert-That (-not (Test-CredentialNamePresent '{"theme": "dark", "note": "say ""hi"" and it''''s fine"}')) 'DENY-BY-DEFAULT-1 r6 role guard must-pass: doubled quotes in a plain note name no secret'
+        # r6 adversary pass 13 A1-A2: a char-ref in a doubled-quote string, and a residual escape whose framing a same-level decode destroys, name a secret in the role guard too
+        $ddA5Miss = [System.Collections.Generic.List[string]]::new(); $ddA5N = 0
+        $ddBsR = [string][char]92
+        foreach ($ddT in @(('xml: ''<add key=''''p a s s&#119;o r d'''' value=''''hunt&#39;er2'''' />'''), ('$xml = "<add key=""pass&#119;ord"" value="""" />"'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+        foreach ($ddD in @('0020', '0009', '000A', '0022', '0027', '003A', '003D', '002C', '005D')) {
+            foreach ($ddX in @(($ddBsR + $ddBsR), $ddBsR)) {
+                foreach ($ddT in @(('{"ab' + $ddX + 'U0011FFFF' + $ddBsR + 'u' + $ddD + 'cd":""}'), ('["ab' + $ddX + 'U0011FFFF' + $ddBsR + 'u' + $ddD + 'cd"]' + "`n" + 'x=""'))) { $ddA5N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA5Miss.Add($ddT) } }
+            }
+        }
+        Assert-That ($ddA5Miss.Count -eq 0 -and $ddA5N -eq 38) "DENY-BY-DEFAULT-1 r6 adv p13 A1-A2 role guard: all $ddA5N forms name a secret" ("misses=$($ddA5Miss.Count): " + (($ddA5Miss | Select-Object -First 4) -join '; '))
+        Assert-That (-not (Test-CredentialNamePresent ('{"caf' + $ddBsR + 'u00e9": "x", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r6 role guard must-pass: a decodable accent escape in a key names no secret (the residual view does not refuse it)'
         # must-pass: the new escapes do not make a plain Windows path in a settings file name a secret
         Assert-That (-not (Test-CredentialNamePresent ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 role guard must-pass: a JSON Windows path with \P \L \a \e \v \_ sequences names no secret'
         Assert-That (-not (Test-CredentialText ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 must-pass: a JSON Windows path with \P \L sequences is not a credential'
