@@ -553,6 +553,8 @@ $s = New-Stub $env:GS_STUB
 $process = $s.p; $stdoutTask = $s.o; $stderrTask = $s.e
 . ([scriptblock]::Create($env:GS_DERIVE))
 $hardLimitMs = [int64]$effectiveProcessTimeoutMs
+# r11: GS_PREWAIT lets a stub finish BEFORE the wait region runs, the state a runner that was descheduled between its remaining-time read and its wait sees
+if ($env:GS_PREWAIT) { [void]$process.WaitForExit(30000) }
 $sw = [Diagnostics.Stopwatch]::StartNew()
 . ([scriptblock]::Create($env:GS_WAIT))
 $waitedMs = [int]$sw.ElapsedMilliseconds
@@ -572,9 +574,10 @@ class LegDerivedHardDeadline(unittest.TestCase):
     stated setup/teardown allowance, never above the job's -ProcessTimeoutMs), so a short leg under a one-hour job timeout is ended at the leg's
     deadline whether its log never appeared (the watchdog is unarmed) or keeps growing (its quiet clock keeps restarting)."""
 
-    def _run_runner_wiring(self, stub: str, sample_ms: int) -> dict:
+    def _run_runner_wiring(self, stub: str, sample_ms: int, prewait: bool = False) -> dict:
+        extra = {"GS_PREWAIT": "1"} if prewait else {}
         return run_ps(_RUNNER_HARNESS, GS_STUB=stub, GS_SAMPLE_MS=str(sample_ms),
-                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION))
+                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION), **extra)
 
     def _assert_ended_at_the_leg_deadline(self, out: dict) -> None:
         # the observed behaviour first: the stub never exits within 20 s, so only a leg-derived deadline can end it sooner
@@ -844,7 +847,8 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
     def test_both_runner_wait_branches_record_the_exhausted_budget_and_hand_it_to_the_boundary(self) -> None:
         wait = _runner_snippet(*_WAIT_REGION)
         record = "$waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs"
-        self.assertEqual(2, wait.count(record), "the host-load branch and the log-only branch both record it, from the process's own lifetime")
+        # r11 (adversary f24a2aed A2): each branch records it at the deadline-expired exit AND at the exit seen by the wait itself
+        self.assertEqual(4, wait.count(record), "the host-load branch and the log-only branch both record it, from the process's own lifetime, at both exits")
         self.assertNotIn("$waitBudgetExhausted = $true", wait, "elapsed time alone never says the app was still running at the deadline (r10 sol A1, 3534e113)")
         self.assertIn("-DeadlineReached:$waitBudgetExhausted", wait)
         for marker in ("if ($hostLoadRemainingMs -le 0) {", "if ($noProgressRemainingMs -le 0) {"):
@@ -870,6 +874,84 @@ if (-not $s.p.HasExited) { $s.p.Kill($true) }
 
     def test_a_process_that_outlived_its_budget_before_exiting_is_a_deadline_hit(self) -> None:
         self.assertTrue(self._exhausted("Start-Sleep -Seconds 3", 500, 30000), "the exit came after the deadline: not a completion")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class ProcessLifetimeIsMeasuredInUtcNotLocalClockTime(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r11 (adversary f24a2aed A1, major, introduced): Process.StartTime and Process.ExitTime are local times, so the
+    lifetime that decides "did the app exit inside its budget" was wrong by the whole offset change when a daylight-saving step fell inside the process's
+    life: an app that ran 700 ms across spring-forward measured 3600700 ms (a timeout, exit 124), one that ran 2000 ms across fall-back measured
+    -3598000 ms. Class: a duration taken as the difference of two local wall-clock readings."""
+
+    def test_the_lifetime_of_a_process_that_straddles_a_local_offset_change_is_its_real_duration(self) -> None:
+        out = run_ps(r"""
+$tz = [TimeZoneInfo]::Local
+$rows = @()
+$t = [datetime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+$end = [datetime]::new(2027, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+while ($t -lt $end) {
+    $n = $t.AddHours(1)
+    if ($tz.GetUtcOffset($t) -ne $tz.GetUtcOffset($n)) {
+        # the process starts 300 ms before the step and exits 700 ms after it: a real life of 1000 ms
+        $start = $n.AddMilliseconds(-300).ToLocalTime(); $exit = $n.AddMilliseconds(700).ToLocalTime()
+        $rows += [pscustomobject]@{ real = (Get-GuiSmokeProcessLifetimeMs -StartTime $start -ExitTime $exit); naive = ($exit - $start).TotalMilliseconds }
+    }
+    $t = $n
+}
+[pscustomobject]@{ rows = @($rows) } | ConvertTo-Json -Compress -Depth 4
+""")
+        rows = out["rows"]
+        if not any(abs(row["naive"] - 1000) > 1 for row in rows):
+            self.skipTest("this host's time zone has no offset change in 2026, so a local-time subtraction cannot be wrong here")
+        for row in rows:
+            self.assertAlmostEqual(1000.0, row["real"], delta=1, msg="the lifetime followed the local offset change (a 1000 ms life read as %s ms)" % row["naive"])
+
+    def test_the_budget_check_takes_the_lifetime_from_the_utc_helper(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"\.ExitTime\s*-\s*\$\w+\.StartTime", "no bare local-time subtraction of a process's start and exit")
+        self.assertIn("Get-GuiSmokeProcessLifetimeMs -StartTime $Process.StartTime -ExitTime $Process.ExitTime", code)
+        self.assertIn("$ExitTime.ToUniversalTime() - $StartTime.ToUniversalTime()", code)
+        self.assertRegex(text.split("Export-ModuleMember", 1)[1], r"Get-GuiSmokeProcessLifetimeMs")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class AnExitSeenByTheWaitItselfAfterTheDeadlineIsATimeout(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r11 (adversary f24a2aed A2, major, introduced): r10 judged the deadline only on the branch where the remaining
+    time reached zero. A runner descheduled between its remaining-time read (100 ms left) and its WaitForExit(100) saw WaitForExit return true on an app
+    that exited at 1100 ms of a 1000 ms budget, broke without the lifetime check and reported outcome=exited exitCode=0 timedOut=false. The tests below
+    reproduce that state by letting the stub finish before the wait region runs. Class: a budget exhaustion judged on one wait branch and forgotten on its
+    sibling (both sampling branches, each with two exits)."""
+
+    # the stub lives 3.3 s plus its own start-up against a 3000 ms leg-derived deadline (2000 ms leg + 1000 ms allowance)
+    _LATE_EXIT = "Start-Sleep -Milliseconds 3300; exit 0"
+
+    def _run_runner_wiring(self, stub: str, sample_ms: int, prewait: bool = False) -> dict:
+        extra = {"GS_PREWAIT": "1"} if prewait else {}
+        return run_ps(_RUNNER_HARNESS, GS_STUB=stub, GS_SAMPLE_MS=str(sample_ms),
+                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION), **extra)
+
+    def _late(self, sample_ms: int) -> dict:
+        return self._run_runner_wiring(self._LATE_EXIT, sample_ms, prewait=True)
+
+    def _assert_late_exit_is_a_timeout(self, out: dict) -> None:
+        self.assertTrue(out["timedOut"], "an app that lived longer than the leg-derived deadline was reported as a clean exit")
+        self.assertEqual("timeout", out["outcome"])
+        self.assertEqual(124, out["exitCode"])
+        self.assertEqual(3000, out["timeoutMs"], "the receipt names the whole budget")
+
+    def test_a_late_exit_seen_by_the_wait_is_a_timeout_in_the_log_only_branch(self) -> None:
+        self._assert_late_exit_is_a_timeout(self._late(0))
+
+    def test_a_late_exit_seen_by_the_wait_is_a_timeout_in_the_host_load_branch(self) -> None:
+        self._assert_late_exit_is_a_timeout(self._late(500))
+
+    def test_an_exit_inside_the_budget_keeps_its_native_exit_in_both_branches(self) -> None:
+        for sample_ms in (0, 500):
+            out = self._run_runner_wiring("exit 0", sample_ms, prewait=True)
+            self.assertFalse(out["timedOut"], "sample_ms=%d: an app that exited inside its budget is not a timeout" % sample_ms)
+            self.assertEqual("exited", out["outcome"])
+            self.assertEqual(0, out["exitCode"])
 
 
 if __name__ == "__main__":

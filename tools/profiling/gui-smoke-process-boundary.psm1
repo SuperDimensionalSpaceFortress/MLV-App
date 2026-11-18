@@ -274,6 +274,21 @@ function Test-GuiSmokeLogProgressStalled {
 # on a share can spend the rest of the budget after the app already exited cleanly. The process's own lifetime decides. A process still running is
 # exhausted; one that exited is exhausted only if it lived longer than the budget; a lifetime that cannot be read for an exited process is NOT
 # exhausted (the finalize look then reports the exit it sees, as before).
+# r11 (adversary f24a2aed A1): Process.StartTime and ExitTime are LOCAL times, and the difference of two local readings moves by the whole offset change when
+# a daylight-saving step falls inside the process's life (+3600000 ms across spring-forward, -3598000 ms for a 2 s life across fall-back). The lifetime is
+# therefore the difference of the two instants taken as UTC.
+function Get-GuiSmokeProcessLifetimeMs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [datetime]$StartTime,
+        [Parameter(Mandatory)]
+        [datetime]$ExitTime
+    )
+
+    return ($ExitTime.ToUniversalTime() - $StartTime.ToUniversalTime()).TotalMilliseconds
+}
+
 function Test-GuiSmokeWaitBudgetExhausted {
     [CmdletBinding()]
     param(
@@ -286,7 +301,7 @@ function Test-GuiSmokeWaitBudgetExhausted {
 
     try {
         if (-not $Process.HasExited) { return $true }
-        return (($Process.ExitTime - $Process.StartTime).TotalMilliseconds -gt $BudgetMs)
+        return ((Get-GuiSmokeProcessLifetimeMs -StartTime $Process.StartTime -ExitTime $Process.ExitTime) -gt $BudgetMs)
     }
     catch {
         return $false
@@ -462,4 +477,4 @@ function Wait-GuiSmokeProcessBounded {
     }
 }
 
-Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeLegHardLimitMs, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, Test-GuiSmokeWaitBudgetExhausted, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled
+Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeLegHardLimitMs, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, Test-GuiSmokeWaitBudgetExhausted, Get-GuiSmokeProcessLifetimeMs, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled
