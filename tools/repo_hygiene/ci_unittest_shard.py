@@ -244,10 +244,20 @@ def plan_workers(
     return [sorted(key for name in bucket for key in items[name]) for bucket in assign(counts, workers, item_weights) if bucket]
 
 
+_LINE_BREAKS = re.compile("[\\\\\r\n\x0b\x0c\x1c\x1d\x1e\x85  ]")
+
+
+def one_line(test_id: str) -> str:
+    """``test_id`` on a single line, reversibly: a backslash or any character ``str.splitlines`` breaks
+    on becomes ``\\uXXXX`` (a backslash too, so an id holding a literal ``\\n`` stays distinct from one
+    holding a newline). An id with none of them, which is every ordinary one, is returned unchanged."""
+    return _LINE_BREAKS.sub(lambda match: f"\\u{ord(match[0]):04x}", test_id)
+
+
 def write_manifest(path: Path, ids: list[str]) -> None:
-    """The ids that ran, sorted, one per line: two runs of one shard are equal iff the files are."""
+    """The ids that ran, sorted, one per line (``one_line``): two runs of one shard are equal iff the files are."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(f"{test_id}\n" for test_id in sorted(ids)), encoding="utf-8", newline="\n")
+    path.write_text("".join(f"{one_line(test_id)}\n" for test_id in sorted(ids)), encoding="utf-8", newline="\n")
 
 
 def plan_buckets(
@@ -313,7 +323,8 @@ def verify_partition(profile: str, shards: int, heavy_path: Path = HEAVY_SET_PAT
     return 1 if problems else 0
 
 
-_FIXTURE_SKIP = re.compile(r"^(setUpClass|setUpModule) \((.+)\)$")
+# DOTALL and \Z: a class name may hold a line break, which `.` and `$` would not span
+_FIXTURE_SKIP = re.compile(r"\A(setUpClass|setUpModule) \((.+)\)\Z", re.DOTALL)
 
 
 class ClassTimingResult(unittest.TextTestResult):
@@ -723,6 +734,15 @@ def _worker_record(path: Path) -> dict | None:
     return record if ok else None
 
 
+def read_log(path: Path) -> tuple[str, str | None]:
+    """A worker's log and ``None``, or ``""`` and the error text when it cannot be read: one unreadable
+    log must not cost the others their output, so a read error is returned, never raised."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace"), None
+    except Exception as error:  # noqa: BLE001 - any failure to read (a lock, a vanished file, a bad device)
+        return "", describe_error(error)
+
+
 WORKER_WATCH_SLICE_SECONDS = 0.2
 
 
@@ -854,6 +874,7 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
     (or whose thread died) reads as unended, never as a clean kill.
     """
     results: list[str | None] = ["its termination did not complete"] * len(procs)
+    end = time.monotonic() + TERMINATE_BOUND_SECONDS  # the whole bound, from before the first thread is started
 
     def one(position: int) -> None:
         try:
@@ -861,16 +882,32 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
         except BaseException as error:  # noqa: BLE001 - terminate never raises; a patched one might
             results[position] = describe_error(error)
 
+    def inline(position: int) -> None:
+        """No thread to be had: end the worker here, but only while a whole tree kill still fits in the
+        bound. Past that point the worker is killed without the tree kill (which can block) and without
+        a wait, and reads as unended, so the total never exceeds the bound however many threads fail."""
+        if end - time.monotonic() >= TREE_KILL_SECONDS:
+            try:  # no reap: a tree kill is the only wait left in it that fits in what is left of the bound
+                results[position] = terminate(procs[position], reap=False)
+            except BaseException as error:  # noqa: BLE001 - terminate never raises; a patched one might
+                results[position] = describe_error(error)
+            return
+        try:
+            procs[position].kill()
+        except BaseException as error:  # noqa: BLE001 - nothing a kill raises may stop the others being killed
+            results[position] = describe_error(error)
+        else:
+            results[position] = "no thread was available to end its process tree, so the tree is not confirmed ended"
+
     threads: list[threading.Thread] = []
     for position in range(len(procs)):
         thread = threading.Thread(target=one, args=(position,), name="shard-terminate", daemon=True)
         try:
             thread.start()
-        except Exception:  # noqa: BLE001 - no thread to be had: end this worker here, it is still ended
-            one(position)
+        except Exception:  # noqa: BLE001 - no thread to be had (the OS refused one)
+            inline(position)
         else:
             threads.append(thread)
-    end = time.monotonic() + TERMINATE_BOUND_SECONDS
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
     return results
@@ -1005,6 +1042,7 @@ def run_parallel(
     codes: list[int | None] = []
     procs: list[tuple[subprocess.Popen[bytes], IO[bytes]]] = []
     printed = False  # the grouped worker logs have started to go out
+    unread: list[int] = []  # 1-based workers whose log could not be read: the work dir is kept for them
     stuck: set[int] = set()  # 1-based workers the OS would not let the parent kill
     merged: dict[str, float] = {}
     cap_minutes = job_cap_minutes(profile, env)
@@ -1030,9 +1068,9 @@ def run_parallel(
                 stuck.add(number)
                 problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
 
-    watch.start()
-    killer.start()
     try:
+        watch.start()  # inside the try: a thread that cannot be started still gets the cleanup below
+        killer.start()
         for number, classes in enumerate(groups, start=1):
             home = work / f"w{number}"
             temp = home / "tmp"
@@ -1099,7 +1137,12 @@ def run_parallel(
         printed = True  # from here the logs go out in order; a failure later must not print them twice
         for number, (path, code, record) in enumerate(zip(logs, codes, records, strict=True), start=1):
             print(f"===== worker {number}/{len(logs)} exit {code} =====", flush=True)
-            print(path.read_text(encoding="utf-8", errors="replace"), end="", flush=True)
+            text, unreadable = read_log(path)
+            if unreadable is None:
+                print(text, end="", flush=True)
+            else:  # the other workers' logs are still printed, and this one is kept (see the cleanup)
+                unread.append(number)
+                problems.append(f"worker {number}/{len(logs)} log could not be read ({unreadable}); kept at {work}")
             if code not in (0, 1, 5):
                 problems.append(f"worker {number}/{len(logs)} exited {code}")
             elif record is None:
@@ -1126,11 +1169,18 @@ def run_parallel(
             for number, (path, (proc, _log)) in enumerate(zip(logs, procs, strict=True), start=1):
                 with contextlib.suppress(Exception):
                     print(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====", flush=True)
-                    print(path.read_text(encoding="utf-8", errors="replace"), end="", flush=True)
+                text, unreadable = read_log(path)
+                if unreadable is None:
+                    with contextlib.suppress(Exception):
+                        print(text, end="", flush=True)
+                else:
+                    unread.append(number)
+                    problems.append(f"worker {number}/{len(logs)} log could not be read ({unreadable}); kept at {work}")
         killer.stop()
         report_unended()
         watch.stop()
-        shutil.rmtree(work, ignore_errors=True)
+        if not unread:  # a log that could not be read is evidence nobody has seen: it is never deleted
+            shutil.rmtree(work, ignore_errors=True)
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             for problem in problems:
                 print(f"ERROR: {problem}", file=sys.stderr)
@@ -1208,10 +1258,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {label} {index}/{of} holds no tests", file=sys.stderr)
         return 1
     if args.list:
-        print("\n".join(bucket))
+        print("\n".join(one_line(key) for key in bucket))
         return 0
     if args.list_tests:
-        print("\n".join(test.id() for test in members))
+        print("\n".join(one_line(test.id()) for test in members))
         return 0
     print(f"{label} {index}/{of}: {len(bucket)} classes, {len(members)} tests", flush=True)
     manifest_name = args.manifest or os.environ.get(MANIFEST_ENV, "")

@@ -1799,9 +1799,151 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(len(handles), 1)
         self.assertTrue(handles[0].closed, "the log handle of the worker whose launch failed was left open")
 
+    # r8 sol r7 B1: a termination thread that cannot be started must not stretch the cleanup past its total bound.
+    def test_termination_thread_exhaustion_keeps_the_total_cleanup_bound(self) -> None:
+        now = [0.0]
+
+        def tree(proc: object) -> str | None:
+            now[0] += 3.0  # each tree termination takes 3 s of the (fake) clock
+            return None
+
+        procs = [self._pid_proc() for _ in range(7)]
+        with (
+            mock.patch.object(shard, "time", types.SimpleNamespace(monotonic=lambda: now[0])),
+            mock.patch.object(shard.threading.Thread, "start", side_effect=RuntimeError("can't start new thread")),
+            mock.patch.object(shard, "_kill_tree", tree),
+        ):
+            results = shard.terminate_all(procs)
+        self.assertLessEqual(now[0], shard.TERMINATE_BOUND_SECONDS, "seven serial inline kills overran the total bound")
+        self.assertEqual([proc.returncode for proc in procs], [-9] * 7, "every worker is still killed")
+        self.assertEqual(len(results), 7)
+
+    # r8 sol r7 B2: one unreadable worker log must not discard the readable failure logs of the others.
+    @staticmethod
+    def _log_one_unreadable() -> object:
+        real = Path.read_text
+
+        def read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "log.txt" and self.parent.name == "w1":
+                raise PermissionError(5, "log is locked")
+            return real(self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", read_text)
+
+    @staticmethod
+    def _finished_popen(calls: list[int], raise_on: int | None = None) -> Callable[..., object]:
+        class Finished:
+            returncode = 1
+
+            def poll(self) -> int:
+                return 1
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 1
+
+            def kill(self) -> None:
+                pass
+
+        def popen(*args: object, **kwargs: object) -> object:
+            calls.append(1)
+            if raise_on is not None and len(calls) == raise_on:
+                raise PermissionError(5, "launch denied")
+            kwargs["stdout"].write(b"FAIL: test_bad\nfx-boom-%d\n" % len(calls))
+            kwargs["stdout"].flush()
+            return Finished()
+
+        return popen
+
+    def test_one_unreadable_worker_log_does_not_discard_the_other_workers_logs(self) -> None:
+        root, tests, tag = self._fixture()
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=self._finished_popen([])),
+            self._log_one_unreadable(),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        kept = re.search(r"kept at (.+)$", err.getvalue(), re.MULTILINE)
+        if kept:
+            self.addCleanup(shutil.rmtree, kept[1], True)
+        self.assertEqual(code, 1)
+        self.assertIn("fx-boom-2", out.getvalue(), "worker 2's readable failure output was discarded")
+        self.assertIn("worker 1/2 log could not be read", err.getvalue(), "the unreadable log went unreported")
+        self.assertIsNotNone(kept, "the unread evidence was deleted instead of kept: " + err.getvalue())
+        self.assertTrue(Path(kept[1], "w1", "log.txt").exists(), "the unread log is gone")
+
+    def test_a_launch_error_with_one_unreadable_log_still_prints_the_others_and_names_the_unread_one(self) -> None:
+        root, tests, tag = self._fixture()
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=self._finished_popen([], raise_on=3)),
+            self._log_one_unreadable(),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(PermissionError),
+        ):
+            shard.run_parallel(
+                tests, "ubuntu", 1, 1, 3, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        kept = re.search(r"kept at (.+)$", err.getvalue(), re.MULTILINE)
+        if kept:
+            self.addCleanup(shutil.rmtree, kept[1], True)
+        self.assertIn("fx-boom-2", out.getvalue(), "worker 2's readable output was discarded")
+        self.assertIn("worker 1/2 log could not be read", err.getvalue(), "the unread log was deleted silently")
+        self.assertIsNotNone(kept, "the unread evidence was deleted: " + err.getvalue())
+
+    # r8 sol r7 B3: a test identity that holds a line break is kept whole in the manifest and in fixture accounting.
+    def test_a_manifest_keeps_one_line_per_id_whatever_the_id_holds(self) -> None:
+        sink = Path(tempfile.mkdtemp(prefix="fxw-m-"))
+        self.addCleanup(shutil.rmtree, sink, True)
+
+        def written(ids: list[str]) -> str:
+            path = sink / "m.txt"
+            shard.write_manifest(path, ids)
+            return path.read_text(encoding="utf-8")
+
+        self.assertNotEqual(written(["a\nb"]), written(["a", "b"]), "one id with a newline equals two ids")
+        for odd in ("a\nb", "a\r\nb", "a\x85b", "a b", "a\x0bb", "a\\nb"):
+            with self.subTest(odd=odd):
+                self.assertEqual(len(written([odd, "z"]).splitlines()), 2)
+        self.assertNotEqual(written(["a\nb"]), written(["a\\nb"]), "an escaped id collides with a literal backslash id")
+        self.assertEqual(written(["tools.x.Y.test_b", "tools.x.Y.test_a"]), "tools.x.Y.test_a\ntools.x.Y.test_b\n")
+
+    def test_a_fixture_skip_of_a_class_whose_name_holds_a_newline_is_accounted_for(self) -> None:
+        odd = (
+            "import unittest\n"
+            "def _skip(cls):\n    raise unittest.SkipTest('accepted fixture skip')\n"
+            "Odd = type('Odd\\nName', (unittest.TestCase,), "
+            "{'__module__': __name__, 'setUpClass': classmethod(_skip), 'test_it': lambda self: None})\n"
+        )
+        root, tests, tag = self._fixture(sources={"a": self._GOOD, "b": odd})
+        serial_manifest = root / "manifest-serial.txt"
+        with contextlib.redirect_stdout(io.StringIO()):
+            serial = shard.run_shard(
+                tests, "ubuntu", 1, 1, clock=time.monotonic, environ={}, stream=io.StringIO(), manifest=serial_manifest
+            )
+        self.assertEqual(serial, 0)
+        code, out, err, manifest = self._parallel(root, tests, tag, 2)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(manifest.read_text(encoding="utf-8"), serial_manifest.read_text(encoding="utf-8"))
+
+    def test_a_fixture_skip_holder_with_a_newline_in_its_class_is_parsed(self) -> None:
+        clock = FakeClock()
+        case = _fake_case(clock, "Odd\nName", 0.0)
+        case.__class__.__module__ = "mod_nl"
+        result = shard.ClassTimingResult(io.StringIO(), True, 0, clock=clock)
+        holder = f"setUpClass (mod_nl.{type(case).__qualname__})"
+        result.addSkip(types.SimpleNamespace(id=lambda: holder), "class fixture")
+        self.assertEqual(result.skipped_by_fixture([case]), [case.id()])
+
     # r4 adversary A2 (pass 4): a worker whose only class skips in a fixture but whose cleanup fails
     # runs no test; serial fails it (exit 1 with the others' tests run), so the parallel shard must too.
-    _GOOD = "import unittest\nclass FxGoodTests(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+    _GOOD ="import unittest\nclass FxGoodTests(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
     _BAD_CLASS_CLEANUP = (
         "import unittest\n"
         "def _boom():\n    raise RuntimeError('cleanup-boom')\n"
