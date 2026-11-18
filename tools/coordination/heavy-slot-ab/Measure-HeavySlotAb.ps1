@@ -80,7 +80,8 @@ trap { Write-Output ("AB_EVAL_ERROR {0}: {1}" -f $_.Exception.GetType().Name, $_
 function ConvertTo-DoubleOrNull($v) {
     if ($null -eq $v -or "$v" -eq '') { return $null }
     $d = 0.0
-    if ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, $inv, [ref]$d)) { return $d }
+    # NaN and +-Infinity ("NaN", "1e999") are unknown, never a number a threshold can be compared with (adversary r4 A6)
+    if ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, $inv, [ref]$d) -and [double]::IsFinite($d)) { return $d }
     return $null
 }
 function Test-PathInside([string]$Child, [string]$Parent) {
@@ -92,6 +93,16 @@ function Test-PathInside([string]$Child, [string]$Parent) {
 # This script is read-only against HeavySlot: the verdict, holds log and headroom summary go under -WindowDir, which therefore may
 # never be (or lie under) the HeavySlot dir (adversary r2 A7).
 if (Test-PathInside $WindowDir $HeavySlotDir) { Write-Output "AB_EVAL_REFUSED path-overlap (the window dir $WindowDir is, or lies under, the HeavySlot dir $HeavySlotDir; this evaluator never writes there)"; exit 2 }
+# The three files this script WRITES may not be an alias (a symlink or hard-to-see junction) into the HeavySlot dir or onto one of the inputs it
+# reads, whatever the window dir itself looks like (adversary r4 A4).
+$outputNames = 'ab-verdict.json', 'ab-holds.jsonl', 'ab-headroom-summary.json'
+$inputRealPaths = @('ab-blocks.jsonl', 'ab-samples.jsonl', 'ab-receipt.json') | ForEach-Object { (Resolve-HeavySlotAbRealPath (Join-Path $WindowDir $_)).TrimEnd('\', '/') }
+foreach ($on in $outputNames) {
+    $outReal = (Resolve-HeavySlotAbRealPath (Join-Path $WindowDir $on)).TrimEnd('\', '/')
+    if ((Test-PathInside $outReal $HeavySlotDir) -or ($inputRealPaths -contains $outReal)) {
+        Write-Output "AB_EVAL_REFUSED output-alias ($on resolves to $outReal, which is inside the HeavySlot dir or is one of the inputs this evaluator reads)"; exit 2
+    }
+}
 
 # Every input line that does not parse is COUNTED per file name, never silently dropped: the verdict prints the counts (input_problems).
 $script:badLines = @{}
@@ -443,6 +454,9 @@ else {
     if ($A.overall.n_closed -lt $MinTicketsPerArm -or $B.overall.n_closed -lt $MinTicketsPerArm) { $inconclusive.Add("live closed tickets per arm A=$($A.overall.n_closed) B=$($B.overall.n_closed) (need $MinTicketsPerArm each)") }
     if ($A.build.n_closed -lt $MinBuildsPerArm -or $B.build.n_closed -lt $MinBuildsPerArm) { $inconclusive.Add("builds per arm A=$($A.build.n_closed) B=$($B.build.n_closed) (need $MinBuildsPerArm each)") }
     if ([double]$rawStats['2'].minutes -lt $MinHolders2Minutes) { $inconclusive.Add(("holders>=2 time {0:N3} min (need {1})" -f [double]$rawStats['2'].minutes, $MinHolders2Minutes)) }
+    # A ledger or receipts dir that is not there cannot be read as "no events": it hides every reaped row and every ticket (adversary r4 A2)
+    if (-not (Test-Path -LiteralPath (Join-Path $HeavySlotDir 'ledger.jsonl') -PathType Leaf)) { $inconclusive.Add('the HeavySlot ledger.jsonl is missing, so dead holders and reaped rows cannot be told') }
+    if (-not (Test-Path -LiteralPath (Join-Path $HeavySlotDir 'receipts') -PathType Container)) { $inconclusive.Add('the HeavySlot receipts directory is missing, so no ticket can be read') }
     if ($bCommitUnknown -gt 0) { $inconclusive.Add("$bCommitUnknown B sample(s) have no free commit reading, so the B minimum free commit is unknown") }
     if ($receiptsUnreadable.Count -gt 0) { $inconclusive.Add(("{0} receipt(s) written during the window cannot be read ({1}): the tickets in them are unknown" -f $receiptsUnreadable.Count, (($receiptsUnreadable | Select-Object -First 3) -join ', '))) }
     if ($bPytestCount2 -lt $MinBPytestAtSlotCount2) { $inconclusive.Add("B pytest tickets that ran at slotCount 2: $bPytestCount2 of $bPytestN (need $MinBPytestAtSlotCount2): the switch may never have reached the tool") }

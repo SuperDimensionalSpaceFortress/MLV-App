@@ -106,9 +106,21 @@ function ConvertTo-UtcInstant($v) {
 }
 
 function Write-AtomicText([string]$Path, [string]$Text) {
-    $tmp = '{0}.tmp-{1}' -f $Path, $PID
+    # The temp name is FIXED (<path>.tmp, no pid) so the containment check can name it before anything is written: one driver per switch
+    # and one per window dir, so nothing else ever uses it (adversary r4 A4).
+    $tmp = $Path + '.tmp'
     [IO.File]::WriteAllText($tmp, $Text, $utf8)
     [IO.File]::Move($tmp, $Path, $true)
+}
+
+function ConvertTo-FiniteOrNull($v) {
+    # A finite double or $null. NaN and +-Infinity (a probe file saying "NaN", a feed cell "1e999") are UNKNOWN, never a number a floor can
+    # be compared with: every comparison against NaN is false, which would read as "above the floor" (adversary r4 A6).
+    if ($null -eq $v) { return $null }
+    if ($v -is [double] -or $v -is [single] -or $v -is [decimal]) { $d0 = [double]$v; if ([double]::IsFinite($d0)) { return $d0 } else { return $null } }
+    $d = 0.0
+    if ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, $inv, [ref]$d) -and [double]::IsFinite($d)) { return $d }
+    return $null
 }
 
 function Add-JsonLine([string]$Path, $Obj) {
@@ -156,12 +168,11 @@ function Read-Feed {
             if ($f.Count -le $iTemp -or $f[0] -eq 'Date') { continue }
             $dt = [DateTime]::MinValue
             if (-not [DateTime]::TryParseExact(('{0} {1}' -f $f[$iDate], $f[$iTime]), 'dd.MM.yyyy HH:mm:ss.fff', $inv, [Globalization.DateTimeStyles]::None, [ref]$dt)) { continue }
-            $temp = 0.0
-            if (-not [double]::TryParse($f[$iTemp], [Globalization.NumberStyles]::Float, $inv, [ref]$temp)) { continue }
+            $temp = ConvertTo-FiniteOrNull $f[$iTemp]
+            if ($null -eq $temp) { continue }     # NaN / Infinity / unparseable temperature: the row is invalid, never "cool"
             $cpu = $null; $w = $null
-            $x = 0.0
-            if ($iCpu -ge 0 -and $f.Count -gt $iCpu -and [double]::TryParse($f[$iCpu], [Globalization.NumberStyles]::Float, $inv, [ref]$x)) { $cpu = $x }
-            if ($iW -ge 0 -and $f.Count -gt $iW -and [double]::TryParse($f[$iW], [Globalization.NumberStyles]::Float, $inv, [ref]$x)) { $w = $x }
+            if ($iCpu -ge 0 -and $f.Count -gt $iCpu) { $cpu = ConvertTo-FiniteOrNull $f[$iCpu] }
+            if ($iW -ge 0 -and $f.Count -gt $iW) { $w = ConvertTo-FiniteOrNull $f[$iW] }
             $rowUtc = [TimeZoneInfo]::ConvertTimeToUtc($dt, [TimeZoneInfo]::Local)
             if ($rowUtc -gt [DateTime]::UtcNow.AddSeconds($FeedFutureSkewSeconds)) { $script:feedFuture++; continue }
             $rows.Add([pscustomobject]@{ utc = $rowUtc; cpu = $cpu; temp = $temp; watts = $w })
@@ -174,7 +185,7 @@ function Read-Feed {
 function Get-MemoryProbe {
     # @{ commit; phys } in GB, or $null per field when unreadable.
     if ($MemoryProbeFile) {
-        try { $m = Get-Content -LiteralPath $MemoryProbeFile -Raw | ConvertFrom-Json; return [pscustomobject]@{ commit = [double]$m.freeCommitGB; phys = [double]$m.freePhysGB } }
+        try { $m = Get-Content -LiteralPath $MemoryProbeFile -Raw | ConvertFrom-Json; return [pscustomobject]@{ commit = (ConvertTo-FiniteOrNull $m.freeCommitGB); phys = (ConvertTo-FiniteOrNull $m.freePhysGB) } }
         catch { return [pscustomobject]@{ commit = $null; phys = $null } }
     }
     # Raw doubles: the floors are compared against the exact reading and only the printed text is ever rounded (adversary r2 A8).
@@ -188,7 +199,7 @@ function Get-MemoryProbe {
 function Get-DiskProbe {
     if ($DiskProbeBytes -ge 0) { return ($DiskProbeBytes / 1GB) }
     if ($DiskProbeFile) {
-        try { return [double]((Get-Content -LiteralPath $DiskProbeFile -Raw | ConvertFrom-Json).freeGiB) } catch { return $null }
+        try { return (ConvertTo-FiniteOrNull ((Get-Content -LiteralPath $DiskProbeFile -Raw | ConvertFrom-Json).freeGiB)) } catch { return $null }
     }
     try { return ([double][IO.DriveInfo]::new('C').AvailableFreeSpace / 1GB) } catch { return $null }
 }
@@ -252,6 +263,7 @@ function Get-LiveHolders {
 }
 
 # ---- switch ------------------------------------------------------------------------------------------------------------------
+$script:switchAttemptStart = [DateTime]::UtcNow
 $script:windowStart = [DateTime]::MinValue
 $script:windowEnd = [DateTime]::MinValue
 $script:selfTicks = 0
@@ -270,6 +282,7 @@ function Set-Switch([string]$State, [int]$Count, [int]$Block) {
     $giveUp = [DateTime]::UtcNow.AddSeconds($SwitchRetrySeconds)
     $jitter = New-Object System.Random
     while ($true) {
+        $script:switchAttemptStart = [DateTime]::UtcNow    # the start of the attempt that finally lands is the block's real start (adversary r4 A1)
         try { Write-AtomicText $SwitchPath $text; return } catch { $lastError = $_ }
         if ([DateTime]::UtcNow -ge $giveUp) { break }
         Start-Sleep -Milliseconds (10 + $jitter.Next(0, 30))
@@ -297,12 +310,15 @@ $script:ledgerFailed = $false
 $script:receiptStuck = @()
 $script:finalSweep = $false
 $script:heldUnreadable = 0
+$script:ledgerExisted = $false
+$script:receiptDirExisted = $false
 function Get-LedgerFinding {
     # The first ledger row since window start that is an `unguarded` event or an admit with class != shared / wholeMachine; $null if none.
     # FAIL CLOSED: a read that fails sets $script:ledgerFailed and leaves the offset where it was, so nothing is lost and the caller counts
     # the failure (two in a row, or a failed final sweep, end the window: "no finding" is only ever said about a ledger that was READ).
     $script:ledgerFailed = $false
-    if (-not (Test-Path -LiteralPath $script:ledgerPath)) { return $null }
+    # a ledger that existed at the baseline and is now GONE (renamed, deleted) is an unread source, not an empty one (adversary r4 A2)
+    if (-not (Test-Path -LiteralPath $script:ledgerPath)) { if ($script:ledgerExisted) { $script:ledgerFailed = $true }; return $null }
     try {
         $lfs = [IO.File]::Open($script:ledgerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
         try {
@@ -315,15 +331,27 @@ function Get-LedgerFinding {
         finally { $lfs.Dispose() }
         $txt = [Text.Encoding]::UTF8.GetString($lb, 0, $lg)
         $cut = $txt.LastIndexOf("`n")
-        if ($cut -lt 0) { return $null }
-        $script:ledgerOffset += $utf8.GetByteCount($txt.Substring(0, $cut + 1))
-        foreach ($line in ($txt.Substring(0, $cut) -split "`n")) {
+        $body = if ($cut -ge 0) { $txt.Substring(0, $cut + 1) } else { '' }
+        $tail = $txt.Substring($body.Length)     # the unterminated last record, if any: normally a write still in flight
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($l0 in ($body -split "`n")) { $lines.Add($l0) }
+        if ($script:finalSweep -and $tail.Trim()) {
+            # The window is over, so nothing more will complete that record: an unterminated tail that parses is READ (an `unguarded` row
+            # with no trailing newline must still end the window), one that does not parse is an unread source (adversary r4 A3).
+            $probe = $null
+            try { $probe = $tail | ConvertFrom-Json } catch { $probe = $null }
+            if ($null -eq $probe) { $script:ledgerFailed = $true; return $null }
+            $lines.Add($tail)
+            $body = $txt
+        }
+        $script:ledgerOffset += $utf8.GetByteCount($body)
+        foreach ($line in $lines) {
             if (-not $line.Trim()) { continue }
             try { $e = $line | ConvertFrom-Json } catch { continue }
             $at = ConvertTo-UtcInstant $e.at
             if ($null -eq $at -or $at -lt $script:windowStart) { continue }
             if ([string]$e.event -eq 'unguarded') { return "unguarded ledger event ticket=$($e.ticket)" }
-            if ([string]$e.event -eq 'admit' -and ([string]$e.class -ne 'shared' -or $e.wholeMachine -eq $true)) { return "exclusive-admit ticket=$($e.ticket) class=$($e.class)" }
+            if ([string]$e.event -eq 'admit' -and ([string]$e.class -cne 'shared' -or $e.wholeMachine -eq $true)) { return "exclusive-admit ticket=$($e.ticket) class=$($e.class)" }
         }
     }
     catch { $script:ledgerFailed = $true }
@@ -336,7 +364,10 @@ function Get-ReceiptFinding {
     # all, in the final sweep) is never skipped: its name goes to $script:receiptStuck and the caller ends the window (receipt-unreadable).
     $script:receiptStuck = @()
     $stuck = New-Object System.Collections.Generic.List[string]
-    if (-not (Test-Path -LiteralPath $script:receiptDir -PathType Container)) { return $null }
+    if (-not (Test-Path -LiteralPath $script:receiptDir -PathType Container)) {
+        if ($script:receiptDirExisted) { $script:receiptStuck = @('(the receipts directory that existed at the window start is gone)') }
+        return $null
+    }
     foreach ($rf in [IO.Directory]::GetFiles($script:receiptDir, '*.json')) {
         $nm = [IO.Path]::GetFileName($rf)
         if ($script:knownReceipts.Contains($nm)) { continue }
@@ -349,7 +380,8 @@ function Get-ReceiptFinding {
         }
         [void]$script:knownReceipts.Add($nm)
         if ($rc.wholeMachine -eq $true) { return "exclusive-admit receipt=$nm wholeMachine=true" }
-        if ($rc.class -and [string]$rc.class -ne 'shared') { return "exclusive-admit receipt=$nm class=$($rc.class)" }
+        # fail closed: a receipt whose class is missing or empty is not "shared" (adversary r4 A5)
+        if ([string]$rc.class -cne 'shared') { return "exclusive-admit receipt=$nm class=$($rc.class)" }
     }
     $script:receiptStuck = $stuck.ToArray()
     return $null
@@ -395,7 +427,7 @@ if (-not $createdNew) { Write-Refused 'driver-running' }
 # (adversary r2 A7): a SwitchPath pointed into the HeavySlot dir would overwrite heavy-slot itself.
 $readOnlyInputs = @($HeavySlotDir, $FastSuitesPath, $CoreTempFeed, $MemoryProbeFile, $EventProbeFile, $DiskProbeFile) | Where-Object { $_ }
 foreach ($ro in $readOnlyInputs) {
-    foreach ($w in @($SwitchPath, ($SwitchPath + '.lock'), $WindowDir)) {
+    foreach ($w in @($SwitchPath, ($SwitchPath + '.lock'), ($SwitchPath + '.tmp'), $WindowDir)) {
         if (Test-PathInside $w $ro) { Write-Refused "path-overlap ($w is, or lies under, the read-only input $ro)" }
     }
 }
@@ -462,8 +494,10 @@ try {
     # ---- window: the ledger / receipt BASELINES are taken first, then the clock starts, so nothing appended in between can be missed
     # (adversary r2 A3; events older than the start are still filtered out by their own timestamp) ---------------------------------------
     $script:ledgerPath = Join-Path $HeavySlotDir 'ledger.jsonl'
-    $script:ledgerOffset = if (Test-Path -LiteralPath $script:ledgerPath) { (Get-Item -LiteralPath $script:ledgerPath).Length } else { 0 }
+    $script:ledgerExisted = [bool](Test-Path -LiteralPath $script:ledgerPath)
+    $script:ledgerOffset = if ($script:ledgerExisted) { (Get-Item -LiteralPath $script:ledgerPath).Length } else { 0 }
     $script:receiptDir = Join-Path $HeavySlotDir 'receipts'
+    $script:receiptDirExisted = [bool](Test-Path -LiteralPath $script:receiptDir -PathType Container)
     $script:knownReceipts = New-Object 'System.Collections.Generic.HashSet[string]'
     if (Test-Path -LiteralPath $script:receiptDir -PathType Container) { foreach ($rf0 in [IO.Directory]::GetFiles($script:receiptDir, '*.json')) { [void]$script:knownReceipts.Add([IO.Path]::GetFileName($rf0)) } }
     $script:windowStart = [DateTime]::UtcNow
@@ -494,8 +528,8 @@ try {
             # startUtc is taken BEFORE the write (adversary r3 A10): a reader can see the new state from the instant the file is replaced, so a
             # driver that is descheduled after the write must not log a start later than the state a ticket actually read. The row also
             # carries switchWrittenUtc, the moment the write returned.
-            $startedAt = [DateTime]::UtcNow
             Set-Switch $blockState $cnt $blockIndex
+            $startedAt = $script:switchAttemptStart    # taken just before the attempt that landed, not before a retry loop that may have run for seconds
             $writtenAt = [DateTime]::UtcNow
             $switchTouched = $true
             if ($PostSwitchDelaySeconds -gt 0) { Start-Sleep -Milliseconds ([int]($PostSwitchDelaySeconds * 1000)) }   # test seam: descheduled right after the write
@@ -525,6 +559,9 @@ try {
         $keepFrom = $now.AddSeconds(-[Math]::Max($CapWindowSeconds, $WarmWindowSeconds) - 5)
         while ($rowWin.Count -gt 0 -and $rowWin[0].utc -lt $keepFrom) { $rowWin.RemoveAt(0) }
         $newest = if ($rows.Count -gt 0) { $rows[-1] } else { $null }
+        # The feed's own clock must not run backwards: a newest row older than the newest row already ingested means the host clock was
+        # stepped back (or the feed was rewritten), and the watermark would then hide every correctly dated row (adversary r4 A7). End closed.
+        $clockBack = ($null -ne $newest -and $null -ne $prevRowUtc -and $newest.utc -lt $prevRowUtc.AddSeconds(-2))
         $feedAge = if ($newest) { [Math]::Max(0.0, ($now - $newest.utc).TotalSeconds) } else { [double]::PositiveInfinity }
         $mem = Get-MemoryProbe
         $disk = Get-DiskProbe
@@ -544,6 +581,7 @@ try {
         # ---- hard aborts -----------------------------------------------------------------------------------------------------
         $why = $null
         if (Test-Path -LiteralPath $stopFile) { $why = 'stop-file' }
+        if (-not $why -and $clockBack) { $why = ('feed-time-regressed the newest feed row ({0}) is older than one already read ({1}): the host clock stepped back or the feed was rewritten' -f (Get-IsoUtc $newest.utc), (Get-IsoUtc $prevRowUtc)) }
         if (-not $why) {
             $capFrom = $now.AddSeconds(-$CapWindowSeconds)
             $hot = ($rowWin.ToArray() | Where-Object { $_.utc -ge $capFrom -and $_.temp -ge $CapTempC } | Measure-Object -Property dt -Sum).Sum
@@ -568,7 +606,7 @@ try {
         }
         if (-not $why -and ($null -eq $disk -or $disk -lt $MinFreeDiskGiB)) { $why = "low-disk C:=${disk}GiB" }
         if (-not $why) {
-            if (@($holders | Where-Object { $_.whole -or ($_.cls -and $_.cls -ne 'shared') }).Count -gt 0) { $why = 'exclusive-admit (a live holder is class != shared or wholeMachine)' }
+            if (@($holders | Where-Object { $_.whole -or ($_.cls -cne 'shared') }).Count -gt 0) { $why = 'exclusive-admit (a live holder is class != shared or wholeMachine)' }
         }
         # FAIL CLOSED on every evidence source (adversary r3 A3): "no finding" is only said about a source that was READ. Two failed reads of
         # the ledger in a row, an unparseable held record on two polls in a row, or a receipt that never parses all end the window.
