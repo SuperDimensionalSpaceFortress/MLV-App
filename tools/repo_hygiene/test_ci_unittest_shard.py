@@ -2001,6 +2001,179 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIn("worker 1/2 log could not be read", err.getvalue(), "the unread log was deleted silently")
         self.assertIsNotNone(kept, "the unread evidence was deleted: " + err.getvalue())
 
+    # r9 sol r8 A2: a SystemExit(0) (an audit hook can raise one anywhere) while a worker log is read must not turn a
+    # failing shard green or delete evidence nobody has seen.
+    @staticmethod
+    def _read_raises(name: str, worker: str, error: Callable[[], BaseException]) -> object:
+        real = Path.read_text
+
+        def read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == name and self.parent.name == worker:
+                raise error()
+            return real(self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", read_text)
+
+    class _ClosingOut(io.StringIO):
+        broken = False
+
+        def write(self, text: str) -> int:
+            if self.broken:
+                raise BrokenPipeError(32, "the consumer closed the pipe")
+            return super().write(text)
+
+    def test_a_system_exit_zero_while_a_log_is_read_is_a_failure_that_keeps_the_log(self) -> None:
+        root, tests, tag = self._fixture()
+        out, err = io.StringIO(), io.StringIO()
+        code, raised = None, None
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=self._finished_popen([])),
+            self._read_raises("log.txt", "w1", lambda: SystemExit(0)),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                code = shard.run_parallel(
+                    tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+                )
+            except SystemExit as error:
+                raised = error
+        kept = re.search(r"kept at (.+)$", err.getvalue(), re.MULTILINE)
+        if kept:
+            self.addCleanup(shutil.rmtree, kept[1], True)
+        self.assertIsNone(raised, "a SystemExit(0) from a log read escaped as a green exit")
+        self.assertEqual(code, 1)
+        self.assertIn("fx-boom-2", out.getvalue(), "worker 2's log was not attempted after worker 1's read exited")
+        self.assertIsNotNone(kept, "the unread evidence was deleted: " + err.getvalue())
+        self.assertTrue(Path(kept[1], "w1", "log.txt").exists(), "the unread log is gone")
+
+    def test_a_system_exit_zero_in_the_fallback_log_read_keeps_the_log_and_the_others(self) -> None:
+        root, tests, tag = self._fixture()
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=self._finished_popen([], raise_on=3)),
+            self._read_raises("log.txt", "w1", lambda: SystemExit(0)),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(PermissionError),
+        ):
+            shard.run_parallel(
+                tests, "ubuntu", 1, 1, 3, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        kept = re.search(r"kept at (.+)$", err.getvalue(), re.MULTILINE)
+        if kept:
+            self.addCleanup(shutil.rmtree, kept[1], True)
+        self.assertIn("fx-boom-2", out.getvalue())
+        self.assertIsNotNone(kept, "the unread evidence was deleted: " + err.getvalue())
+
+    def test_a_system_exit_zero_reading_a_result_is_a_missing_result_not_a_green_exit(self) -> None:
+        root, tests, tag = self._fixture()
+        out, err = io.StringIO(), io.StringIO()
+        code, raised = None, None
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=self._finished_popen([])),
+            self._read_raises("result.json", "w1", lambda: SystemExit(0)),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                code = shard.run_parallel(
+                    tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+                )
+            except SystemExit as error:
+                raised = error
+        self.assertIsNone(raised, "a SystemExit(0) from a result read escaped as a green exit")
+        self.assertEqual(code, 1)
+        self.assertIn("fx-boom-1", out.getvalue())
+        self.assertIn("worker 1/2 wrote no readable result", err.getvalue())
+
+    def test_a_system_exit_zero_from_anywhere_in_the_run_leaves_a_nonzero_exit_and_the_logs(self) -> None:
+        root, tests, tag = self._fixture()
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=self._finished_popen([])),
+            mock.patch.object(shard, "late_workers", side_effect=SystemExit(0)),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            shard.run_parallel(
+                tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+            )
+        self.assertTrue(raised.exception.code, "an interrupted run exited 0")
+        self.assertIn("fx-boom-1", out.getvalue(), "the workers' output was lost with the interruption")
+        self.assertIn("fx-boom-2", out.getvalue())
+        self.assertIn("ERROR:", err.getvalue())
+
+    # r9 sol r8 A1: a stdout that closes before the final SHARD_SLOWEST block must not stop the retained log
+    # locations and the other failures from being reported, nor the exit code from being returned.
+    def test_a_stdout_closed_before_the_slowest_block_still_reports_the_kept_logs_and_fails(self) -> None:
+        root, tests, tag = self._fixture()
+        calls: list[int] = []
+        real = self._finished_popen(calls)
+
+        def popen(*args: object, **kwargs: object) -> object:
+            command = args[0]
+            spec = json.loads(Path(command[command.index("--worker-spec") + 1]).read_text(encoding="utf-8"))
+            Path(spec["result"]).write_text(
+                json.dumps({"ids": [], "skipped_ids": [], "seconds": {"fx.A": 1.0}, "tests_run": 0, "ok": False}),
+                encoding="utf-8",
+            )
+            proc = real(*args, **kwargs)
+            out.broken = len(calls) == 2  # closed once the last launch is done, before any grouped header
+            return proc
+
+        out, err = self._ClosingOut(), io.StringIO()
+        code, raised = None, None
+        with (
+            mock.patch.object(shard.subprocess, "Popen", side_effect=popen),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                code = shard.run_parallel(
+                    tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+                )
+            except BrokenPipeError as error:
+                raised = error
+        kept = re.search(r"kept at (.+)$", err.getvalue(), re.MULTILINE)
+        if kept:
+            self.addCleanup(shutil.rmtree, kept[1], True)
+        self.assertIsNone(raised, "the SHARD_SLOWEST print raised before any problem was reported")
+        self.assertEqual(code, 1)
+        self.assertIsNotNone(kept, "the retained log location was never reported: " + err.getvalue())
+        self.assertIn("SHARD_SLOWEST could not be printed", err.getvalue())
+
+    def test_a_stdout_closed_before_the_serial_report_keeps_the_test_outcome(self) -> None:
+        clock = FakeClock()
+        out, err = self._ClosingOut(), io.StringIO()
+
+        class Probe(unittest.TestCase):
+            def test_one(self) -> None:
+                clock.advance(1.0)
+                out.broken = True
+
+        Probe.__module__ = "fake_mod"
+        Probe.__qualname__ = "Probe"
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = shard.run_shard([Probe("test_one")], "ubuntu", 1, 1, clock=clock, environ={}, stream=io.StringIO())
+        self.assertEqual(code, 0, "the test outcome was replaced by the diagnostic print's error")
+        self.assertIn("SHARD_SLOWEST could not be printed", err.getvalue())
+
+    def test_a_budget_warning_that_cannot_be_printed_does_not_raise_and_goes_to_stderr(self) -> None:
+        closed, err = self._ClosingOut(), io.StringIO()
+        closed.broken = True
+        watch = shard.BudgetWatch("ubuntu", 1, 3, 1.0, 0.0, lambda: 100.0, lambda: {"a.A": 1.0}, out=closed)
+        with contextlib.redirect_stderr(err):
+            watch.check()
+        self.assertTrue(watch.warned)
+        self.assertIn("::warning title=Shard budget::", err.getvalue())
+
     # r8 sol r7 B3: a test identity that holds a line break is kept whole in the manifest and in fixture accounting.
     def test_a_manifest_keeps_one_line_per_id_whatever_the_id_holds(self) -> None:
         sink = Path(tempfile.mkdtemp(prefix="fxw-m-"))

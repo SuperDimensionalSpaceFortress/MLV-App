@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import math
 import os
@@ -598,7 +599,9 @@ class BudgetWatch:
             )
             if lines:
                 self.warned = True
-                print("\n".join(lines), file=self._out if self._out is not None else sys.stdout, flush=True)
+                text = "\n".join(lines) + "\n"
+                if emit_text(text, self._out) is not None:  # a closed stdout: the warning goes to stderr instead
+                    emit_text(text, sys.stderr)
 
     def start(self) -> None:
         self._thread.start()
@@ -613,6 +616,25 @@ class BudgetWatch:
             self.check()
 
 
+def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
+    """A ``SystemExit`` with a falsy code (an audit hook can raise one anywhere) is not a pass: it is
+    reported and becomes ``SystemExit(1)``, so a run that was cut short cannot end green. A ``SystemExit``
+    with a real code, and every other exception, passes through untouched."""
+
+    @functools.wraps(function)
+    def guarded(*args: object, **kwargs: object) -> int:
+        try:
+            return function(*args, **kwargs)
+        except SystemExit as error:
+            if error.code:
+                raise
+            emit_error(f"{function.__name__} was ended by {describe_error(error)} (code {error.code!r}), which is not a pass")
+            raise SystemExit(1) from error
+
+    return guarded
+
+
+@never_exits_zero
 def run_shard(
     members: list[unittest.TestCase],
     profile: str,
@@ -676,11 +698,13 @@ def run_shard(
         seconds = made[0].snapshot() if made else {}
         if seconds:
             watch.check()
-            print("\n".join(slowest_block(profile, index, of, clock() - begin, seconds)), file=out, flush=True)
+            failed = emit_text("\n".join(slowest_block(profile, index, of, clock() - begin, seconds)) + "\n", out)
+            if failed is not None:  # informational: the exit code stays the test outcome
+                emit_text(f"SHARD_SLOWEST could not be printed ({failed})\n", sys.stderr)
     if manifest is not None and made:
         write_manifest(manifest, made[0].started_ids)
     if result.testsRun == 0:
-        print("ERROR: no tests ran", file=sys.stderr)
+        emit_error("no tests ran")
         return 5
     return 0 if result.wasSuccessful() else 1
 
@@ -695,7 +719,7 @@ def run_worker(spec_path: Path) -> int:
     units = group_units(collect_tests(spec["start_dir"], spec["pattern"], spec["top_level_dir"]))
     missing = [key for key in spec["classes"] if key not in units]
     if missing:
-        print("ERROR: a class the shard assigned is not collected by discover: " + ", ".join(missing), file=sys.stderr)
+        emit_error("a class the shard assigned is not collected by discover: " + ", ".join(missing))
         return 1
     members = shard_tests(units, spec["classes"])
     result = unittest.TextTestRunner(verbosity=2, resultclass=ClassTimingResult).run(ClassTimingSuite(members))
@@ -711,7 +735,7 @@ def run_worker(spec_path: Path) -> int:
     if not result.wasSuccessful():  # a failed fixture cleanup fails a worker that ran no test, as it does serially
         return 1
     if ran == 0:
-        print("ERROR: no tests ran", file=sys.stderr)
+        emit_error("no tests ran")
         return 5
     return 0
 
@@ -719,7 +743,9 @@ def run_worker(spec_path: Path) -> int:
 def _worker_record(path: Path) -> dict | None:
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except BaseException as error:  # noqa: BLE001 - unreadable, not JSON, too deep, or an audit hook's SystemExit: no result
+        if isinstance(error, KeyboardInterrupt):
+            raise
         return None
     ok = (
         isinstance(record, dict)
@@ -736,26 +762,46 @@ def _worker_record(path: Path) -> dict | None:
 
 def read_log(path: Path) -> tuple[str, str | None]:
     """A worker's log and ``None``, or ``""`` and the error text when it cannot be read: one unreadable
-    log must not cost the others their output, so a read error is returned, never raised."""
+    log must not cost the others their output, so a read error is returned, never raised.
+
+    Everything but a ``KeyboardInterrupt`` is contained, ``SystemExit`` included: an audit hook can raise
+    one from a read, and ``SystemExit(0)`` let through would end the shard green with the log deleted."""
     try:
         return path.read_text(encoding="utf-8", errors="replace"), None
-    except Exception as error:  # noqa: BLE001 - any failure to read (a lock, a vanished file, a bad device)
+    except BaseException as error:  # noqa: BLE001 - a lock, a vanished file, a bad device, an audit hook's SystemExit
+        if isinstance(error, KeyboardInterrupt):
+            raise
         return "", describe_error(error)
 
 
-def emit_log(text: str) -> str | None:
-    """Print a worker's log to stdout; ``None``, or the error text when it still cannot be printed.
+def emit_text(text: str, stream: TextIO | None = None) -> str | None:
+    """Print ``text`` (no newline added) to ``stream`` (else the live stdout); ``None``, or the error text
+    when it cannot be printed. It never raises, so a diagnostic cannot replace the exit code.
 
-    A worker may write bytes that decode to characters the parent's stdout cannot encode (a cp1252
-    console, a child with its own ``PYTHONIOENCODING``): those are replaced, never allowed to raise, and
-    whatever is raised anyway is returned, so one log never costs the others their output.
+    A worker may write bytes that decode to characters the stream cannot encode (a cp1252 console, a
+    child with its own ``PYTHONIOENCODING``): those are replaced, never allowed to raise, and whatever is
+    raised anyway (a closed or broken pipe, an unknown codec, an audit hook's ``SystemExit``) is returned.
+    Only a ``KeyboardInterrupt`` passes.
     """
     try:
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"), end="", flush=True)
-    except Exception as error:  # noqa: BLE001 - a closed or broken stdout, an unknown codec
+        target = sys.stdout if stream is None else stream
+        encoding = getattr(target, "encoding", None) or "utf-8"
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"), end="", file=target, flush=True)
+    except BaseException as error:  # noqa: BLE001 - see above
+        if isinstance(error, KeyboardInterrupt):
+            raise
         return describe_error(error)
     return None
+
+
+def emit_log(text: str) -> str | None:
+    """Print a worker's log to stdout (``emit_text``): ``None``, or the error text when it cannot be."""
+    return emit_text(text)
+
+
+def emit_error(problem: str) -> None:
+    """``ERROR: <problem>`` to stderr; a stderr that cannot be written leaves nothing else to try."""
+    emit_text(f"ERROR: {problem}\n", sys.stderr)
 
 
 WORKER_WATCH_SLICE_SECONDS = 0.2
@@ -1013,6 +1059,7 @@ class DeadlineKiller:
             self._thread.join()
 
 
+@never_exits_zero
 def run_parallel(
     members: list[unittest.TestCase],
     profile: str,
@@ -1061,7 +1108,7 @@ def run_parallel(
     logs: list[Path] = []
     codes: list[int | None] = []
     procs: list[tuple[subprocess.Popen[bytes], IO[bytes]]] = []
-    printed = False  # the grouped worker logs have started to go out
+    handled = 0  # how many of the grouped worker logs (in order) are fully dealt with: the rest are the fallback's
     unread: list[int] = []  # 1-based workers whose log could not be read: the work dir is kept for them
     stuck: set[int] = set()  # 1-based workers the OS would not let the parent kill
     merged: dict[str, float] = {}
@@ -1154,7 +1201,6 @@ def run_parallel(
             if record:
                 merged.update({key: float(value) for key, value in record["seconds"].items()})
         watch.check()  # a share crossed since the last poll is reported before any worker log
-        printed = True  # from here the logs go out in order; a failure later must not print them twice
         for number, (path, code, record) in enumerate(zip(logs, codes, records, strict=True), start=1):
             header_error = emit_log(f"===== worker {number}/{len(logs)} exit {code} =====\n")  # a closed stdout raises here too
             text, unreadable = read_log(path)
@@ -1172,6 +1218,7 @@ def run_parallel(
                 problems.append(f"worker {number}/{len(logs)} recorded a failed run but exited {code}")
             elif code == 5 and record["tests_run"] != 0:  # 5 is "no tests ran", never the exit of a run that ran some
                 problems.append(f"worker {number}/{len(logs)} exited 5 after running {record['tests_run']} tests")
+            handled = number  # a failure later prints only the logs after this one, never one twice
     finally:
         # An exception above must not leave a worker running: every owned worker is attempted, one that
         # cannot be killed is reported, and the watchdog keeps enforcing the deadline until they are done.
@@ -1184,14 +1231,19 @@ def run_parallel(
                 problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
             with contextlib.suppress(OSError):
                 log.close()
-        if sys.exc_info()[0] is not None and not printed:
-            # An exception (a launch that raised, say) skipped the grouped logs: the workers that ran keep
-            # their output, which is deleted with the work dir just below.
+        if sys.exc_info()[0] is not None:
+            # An exception (a launch that raised, say) skipped the grouped logs, or cut them short: every
+            # worker from the first one not fully dealt with keeps its output, which is deleted with the
+            # work dir just below.
             for number, (path, (proc, _log)) in enumerate(zip(logs, procs, strict=True), start=1):
+                if number <= handled:
+                    continue
                 header_error = None
                 try:
                     header_error = emit_log(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====\n")
-                except Exception as error:  # noqa: BLE001 - poll() itself raised
+                except BaseException as error:  # noqa: BLE001 - poll() itself raised (SystemExit included)
+                    if isinstance(error, KeyboardInterrupt):
+                        raise
                     header_error = describe_error(error)
                 text, unreadable = read_log(path)
                 verb = "read"
@@ -1207,8 +1259,8 @@ def run_parallel(
             shutil.rmtree(work, ignore_errors=True)
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             for problem in problems:
-                print(f"ERROR: {problem}", file=sys.stderr)
-    ran = sorted(item for record in records if record for item in record["ids"])
+                emit_error(problem)
+    ran =sorted(item for record in records if record for item in record["ids"])
     # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
     accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])
     expected = sorted(test.id() for test in members)
@@ -1222,9 +1274,11 @@ def run_parallel(
         write_manifest(manifest, ran)
     total = clock() - begin
     if merged:
-        print("\n".join(slowest_block(profile, index, of, total, merged)), file=out, flush=True)
+        failed = emit_text("\n".join(slowest_block(profile, index, of, total, merged)) + "\n", out)
+        if failed is not None:  # the queued problems (the kept-log paths) are still reported below
+            problems.append(f"SHARD_SLOWEST could not be printed ({failed})")
     for problem in problems:
-        print(f"ERROR: {problem}", file=sys.stderr)
+        emit_error(problem)
     if problems or any(code == 1 for code in codes):
         return 1
     return 5 if not ran else 0
