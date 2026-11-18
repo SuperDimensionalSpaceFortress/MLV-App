@@ -3484,8 +3484,15 @@ function Start-HeavySlotCli {
         $si.Environment["HEAVY_SLOT_DIR"] = $HeavySlotDir
         $si.Environment["HEAVY_SLOT_FEED"] = $HeavySlotFeed
         [void]$si.Environment.Remove("HEAVY_SLOT_HELD")
-        $startedWall = Get-Date
-        $startedMono = Get-AgentMonotonicSec
+        # r5 (adversary pass 10 A1): the pair is read as monotonic, wall, monotonic and kept only when the two monotonic readings are within
+        # 0.5 s (else read again, at most 3 times): a stall BETWEEN the wall and the monotonic reading (wall t0, monotonic t0+90) no longer leaves
+        # the wall anchor 90 s early. The later monotonic reading is the anchor; the wall reading lies inside the bracket.
+        for ($pairTry = 0; $pairTry -lt 3; $pairTry++) {
+            $m1 = Get-AgentMonotonicSec
+            $startedWall = Get-Date
+            $startedMono = Get-AgentMonotonicSec
+            if (($startedMono - $m1) -le 0.5) { break }
+        }
         $p = [System.Diagnostics.Process]::Start($si)
         # BACHELOR-LEASE-RENEW-MARGIN-1 r2: startedMono (a Get-AgentMonotonicSec reading) beside started, and exitStamp (New-RenewExitStamp: the
         # call's exit stamped in-process; $null when unavailable), which Get-QuietLeaseRenewOkAt uses to end a successful renew's gap at its exit.
@@ -3761,7 +3768,9 @@ function Get-RenewRecordEpochSec {
     try {
         $line = @($Stdout -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 1
         if (-not $line) { return $null }
-        $o = $line | ConvertFrom-Json -ErrorAction Stop
+        # adversary pass 10 A3: only a JSON OBJECT root (a one-element array would unroll into its object and pass the checks below)
+        if (-not ([string]$line).TrimStart().StartsWith('{')) { return $null }
+        $o = ConvertFrom-Json -InputObject $line -ErrorAction Stop
         if ($null -eq $o -or $o -isnot [System.Management.Automation.PSCustomObject] -or $null -eq $o.PSObject.Properties['renewed']) { return $null }
         $v = $o.renewed
         if (-not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [decimal])) { return $null }

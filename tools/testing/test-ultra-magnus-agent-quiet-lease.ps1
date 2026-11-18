@@ -114,8 +114,7 @@ $liftBatch = @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Get-QuietLea
 # lease-batch r2 (the renew-gap demotion): the same, asserted by the demoted case after it has shown the behaviour.
 $liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'ConvertTo-RenewGapCeilingSec',   # the last: BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2)
     'Get-AgentMonotonicSec', 'Get-RenewGapSec', 'Get-QuietLeaseRenewOkAt', 'Initialize-RenewExitStamp', 'New-RenewExitStamp',   # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (pass 3 A1, A2): optional, so the r2 cases run RED on 591ea10f
-    'Get-RenewRecordEpochSec', 'ConvertTo-RenewEpochSec',   # r5 (sol r4 A2): optional, so renew-gap-reverted-step-record-wall-demotes runs RED on 75fc6509
-    'Get-RenewRecordWallUtc')   # 4717ce59's name for it (adversary pass 9): lifted only when present, so that RED runs there on behaviour
+    'Get-RenewRecordEpochSec', 'ConvertTo-RenewEpochSec')   # r5 (sol r4 A2): optional, so renew-gap-reverted-step-record-wall-demotes runs RED on 75fc6509
 # lease-batch r3 (sol r2 B1, B2): the same, asserted by the r3 cases after they have shown the behaviour.
 $liftBatchR3 = @('Test-LeaseBatchClosePending', 'Get-LeaseBatchJobStop')
 $batchLifted = [System.Collections.Generic.List[string]]::new()
@@ -5858,8 +5857,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 if ($e -isnot [System.Management.Automation.Language.CommandParameterAst] -or $e.ParameterName -ne 'OnEach') { continue }
                 $arg = if ($null -ne $e.Argument) { $e.Argument } elseif ($i + 1 -lt $els.Count) { $els[$i + 1] } else { $null }
                 if ($arg -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) { return $false }
-                $stmts = @($arg.ScriptBlock.EndBlock.Statements)
-                if ($stmts.Count -ne 1 -or $stmts[0] -isnot [System.Management.Automation.Language.PipelineAst] -or @($stmts[0].PipelineElements).Count -ne 1) { return $false }
+                # r5 (adversary pass 10 A4; sol r4's EndBlock-only hardening): nothing else in the callback runs first or instead: no param block
+                # (a throwing default), no begin/process/dynamicparam block, and the tick is not sent to the background (&).
+                $sb = $arg.ScriptBlock
+                if ($null -ne $sb.ParamBlock -or $null -ne $sb.BeginBlock -or $null -ne $sb.ProcessBlock -or $null -ne $sb.DynamicParamBlock -or $null -eq $sb.EndBlock) { return $false }
+                $stmts = @($sb.EndBlock.Statements)
+                if ($stmts.Count -ne 1 -or $stmts[0] -isnot [System.Management.Automation.Language.PipelineAst] -or @($stmts[0].PipelineElements).Count -ne 1 -or $stmts[0].Background) { return $false }
                 $inner = $stmts[0].PipelineElements[0]
                 return ($inner -is [System.Management.Automation.Language.CommandAst] -and $inner.GetCommandName() -eq 'Invoke-QuietLeaseRenewTick')
             }
@@ -5870,6 +5873,10 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $rsSynth = [System.Management.Automation.Language.Parser]::ParseInput('while (-not $jobProcess.HasExited) { Get-DescendantProcessIdentities <# -OnEach { Invoke-QuietLeaseRenewTick } #> -ParentProcessId 1; Get-DescendantProcessIdentities -OnEach:{ Invoke-QuietLeaseRenewTick } -ParentProcessId 2 }', [ref]$null, [ref]$null)
         $rsSynthCalls = @($rsSynth.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' }, $true))
         Assert-True ($rsSynthCalls.Count -eq 2 -and -not (& $rsIsWired $rsSynthCalls[0]) -and (& $rsIsWired $rsSynthCalls[1])) "renew-slow-monitor-slice: the wiring guard reads the AST (a commented-out -OnEach is NOT wired, a colon-form -OnEach:{ Invoke-QuietLeaseRenewTick } is): calls=$($rsSynthCalls.Count)"
+        # r5 (adversary pass 10 A4, sol r4 hardening): a callback that throws before the tick (begin block, param default) or backgrounds it is NOT wired.
+        $rsNeg = [System.Management.Automation.Language.Parser]::ParseInput('Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { begin { throw ''skip'' } end { Invoke-QuietLeaseRenewTick } }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { param($u = $(throw ''skip'')) Invoke-QuietLeaseRenewTick }; Get-DescendantProcessIdentities -ParentProcessId 1 -OnEach { Invoke-QuietLeaseRenewTick & }', [ref]$null, [ref]$null)
+        $rsNegCalls = @($rsNeg.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' }, $true))
+        Assert-True ($rsNegCalls.Count -eq 3 -and @($rsNegCalls | Where-Object { & $rsIsWired $_ }).Count -eq 0) "renew-slow-monitor-slice: the wiring guard refuses a begin-block throw, a throwing param default and a backgrounded tick: calls=$($rsNegCalls.Count)"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
     }
@@ -6134,7 +6141,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         if ($batchLifted -contains 'Get-RenewRecordEpochSec') {
             $rwU = Get-RenewRecordEpochSec -Stdout "noise`n{`"state`":`"active`",`"renewed`":1801440120.0000005}"
             Assert-True ($rwU -is [double] -and $rwU -eq 1801440120.0000005) "Get-RenewRecordEpochSec reads the last line's 'renewed' epoch as the double heavy-slot.py wrote: $rwU"
-            foreach ($bad in @('', 'not json', '{"state":"active"}', '{"renewed":"x"}', '{"renewed":-5}', '{"renewed":null}', '[1,2]', '1801440120.5')) {
+            foreach ($bad in @('', 'not json', '{"state":"active"}', '{"renewed":"x"}', '{"renewed":-5}', '{"renewed":null}', '[1,2]', '1801440120.5', '[{"renewed":1794988843}]')) {
                 Assert-True ($null -eq (Get-RenewRecordEpochSec -Stdout $bad)) "Get-RenewRecordEpochSec: an unusable output reads `$null (the gap then ends at the collection): [$bad]"
             }
         }
@@ -6194,12 +6201,19 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     # The call's start readings come from the REAL Start-HeavySlotCli (its child, the fake heavy-slot.py `status`, is stopped at once); the stall
     # is a variable-write breakpoint on its $si (the ProcessStartInfo), which advances both virtual clocks 90 s once; the child's record and exit
     # are virtual (launch + 3 s, + 30 s), and the renew prints its flag with "renewed" (its record wall time), as the fake heavy-slot.py does.
+    # Variant pair-stall (adversary pass 10 A1, introduced major on e554c25e): the same trace with the 90 s stall falling BETWEEN the call's wall
+    # and monotonic start readings (right after the first Get-Date inside Start-HeavySlotCli). e554c25e kept wall t0 / monotonic t0+90 and read
+    # 125 s (demoted); the pair is now re-read until its monotonic bracket is tight.
+    $psVariants = @('setup-stall', 'pair-stall')
+    $psResults = [ordered]@{}
+    foreach ($psVariant in $psVariants) {
     if (Test-Case 'renew-gap-prestart-stall-no-false-stop') {
         Reset-Case @{ request = 'active' }
         Sync-FakeStatus
         $psRealStart = ${function:Start-HeavySlotCli}
         $psSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch; a = $script:Admission }
-        $script:PsStallSec = 90.0
+        $script:PsStallSec = if ($psVariant -ceq 'setup-stall') { 90.0 } else { 0.0 }
+        $script:PsStallAfterWallSec = if ($psVariant -ceq 'pair-stall') { 90.0 } else { 0.0 }
         $psBp = Set-PSBreakpoint -Variable si -Mode Write -Action {
             if ($script:PsStallSec -gt 0) { $script:PsNowUtc = $script:PsNowUtc.AddSeconds($script:PsStallSec); $script:PsMono += $script:PsStallSec; $script:PsStallSec = 0 }
         }
@@ -6213,7 +6227,13 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $script:PsExitAfter = [System.Collections.Generic.Queue[double]]::new()
                 foreach ($x in @(3.0, 30.0, 30.0, 30.0)) { $script:PsExitAfter.Enqueue($x) }
                 $script:PsCalls = [System.Collections.Generic.List[object]]::new()
-                function Get-Date { return $script:PsNowUtc.ToLocalTime() }
+                function Get-Date {
+                    $v = $script:PsNowUtc.ToLocalTime()
+                    if ($script:PsStallAfterWallSec -gt 0 -and @(Get-PSCallStack | Where-Object { $_.Command -eq 'Start-HeavySlotCli' -and $_.ScriptName }).Count -gt 0) {
+                        $script:PsNowUtc = $script:PsNowUtc.AddSeconds($script:PsStallAfterWallSec); $script:PsMono += $script:PsStallAfterWallSec; $script:PsStallAfterWallSec = 0
+                    }
+                    return $v
+                }
                 function Get-AgentMonotonicSec { return $script:PsMono }
                 function Step-PsClock([double]$Sec) { $script:PsNowUtc = $script:PsNowUtc.AddSeconds($Sec); $script:PsMono += $Sec }
                 function Start-HeavySlotCli {
@@ -6256,20 +6276,25 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $s2 = Get-LeaseBatchJobStop -Admission $script:Admission -Lease $lease
                 $stops.Add($(if ($null -ne $s2) { $s2.reason } else { $null }))
                 [pscustomobject]@{ starts = $lease.renewStarts; ok = $lease.renewsOk; failures = $lease.renewFailures; slow = $lease.renewSlow; okMaxGapSec = [double]$lease.renewOkMaxGapSec
-                    gapAt95 = $gapAt95; gapSec = (Get-QuietLeaseRenewOkGapSec -Lease $lease); stops = @($stops); atMonoSec = $script:PsMono - 1000.0; calls = @($script:PsCalls); stallLeft = $script:PsStallSec }
+                    gapAt95 = $gapAt95; gapSec = (Get-QuietLeaseRenewOkGapSec -Lease $lease); stops = @($stops); atMonoSec = $script:PsMono - 1000.0; calls = @($script:PsCalls); stallLeft = $script:PsStallSec + $script:PsStallAfterWallSec }
             }
         }
         finally {
             if ($null -ne $psBp) { Remove-PSBreakpoint -Breakpoint $psBp }
             $script:QuietLease = $psSaved.q; $script:QuietLeaseWaiting = $psSaved.w; $script:LeaseBatch = $psSaved.b; $script:Admission = $psSaved.a
         }
-        $psTxt = $psOut | ConvertTo-Json -Compress -Depth 5
+        $psTxt = "variant=$psVariant " + ($psOut | ConvertTo-Json -Compress -Depth 5)
         Assert-True ($psOut.stallLeft -eq 0 -and $psOut.calls.Count -ge 2 -and [Math]::Abs([double]$psOut.calls[0].launchSec - 90) -lt 0.01 -and [Math]::Abs([double]$psOut.calls[0].recordSec - 93) -lt 0.01 -and [Math]::Abs([double]$psOut.calls[1].launchSec - 95) -lt 0.01 -and [Math]::Abs([double]$psOut.calls[1].recordSec - 125) -lt 0.01) "renew-gap-prestart-stall-no-false-stop: the trace ran as given (stall 0 -> 90 s before the first launch; records at t0+93 and t0+125): $psTxt"
         Assert-True ($psOut.ok -eq 2 -and $psOut.failures -eq 0 -and $psOut.slow -eq 0 -and [Math]::Abs($psOut.atMonoSec - 130) -lt 0.01) "renew-gap-prestart-stall-no-false-stop: both renews succeeded and were collected (t0+95, t0+130): $psTxt"
         Assert-True ([double]$psOut.calls[0].startedSec -ge 90 - 0.01) "renew-gap-prestart-stall-no-false-stop: the first call's start reading is the one taken after the pre-launch stall (t0+90), immediately before Process.Start, not the top of the call (t0): startedSec=$($psOut.calls[0].startedSec): $psTxt"
         Assert-True ($psOut.okMaxGapSec -le 115 -and $psOut.gapSec -le 115 -and $psOut.okMaxGapSec -ge 113) "renew-gap-prestart-stall-no-false-stop: the largest successful-renew gap reads heavy-slot.py's 113 s (at most 115), never the inflated 125 s: $psTxt"
         Assert-True ($null -eq $psOut.stops[0] -and $null -eq $psOut.stops[1]) "renew-gap-prestart-stall-no-false-stop: the healthy batch (record gaps 113 s and 32 s) is never stopped: $psTxt"
-        $results.renewGapPrestartStallNoFalseStop = $psOut
+        $psResults[$psVariant] = $psOut
+    }
+    }
+    if (Test-Case 'renew-gap-prestart-stall-no-false-stop') {
+        Assert-True ($psResults.Count -eq 2) "renew-gap-prestart-stall-no-false-stop: both variants ran ($(@($psResults.Keys) -join ','))"
+        $results.renewGapPrestartStallNoFalseStop = $psResults
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }
