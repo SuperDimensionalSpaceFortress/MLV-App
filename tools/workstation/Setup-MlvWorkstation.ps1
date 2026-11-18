@@ -262,6 +262,24 @@ function Register-UrlSecretParts {
     }
 }
 
+# r4 (sol r3 A2, defect class: matching a secret by a spelling git may print differently). Git prints a decoded control byte as a line break and a high byte as itself, a
+# replacement character or its bare hex digits ('?t=%0A%80qzv' gave a continuation line '80qzv' that no registered spelling matched), so no finite list of spellings is
+# known to be complete. FAIL CLOSED instead: true when a text holds a 'scheme://' url that carries a secret part (a query, a fragment or userinfo before an '@') and whose
+# text after the scheme, as written or with every '%XX' decoded byte by byte, holds any character outside printable ASCII. Invoke-Native (and the lease read) then
+# withholds the child's whole output from the log and the console, printing only how many lines were withheld.
+function Test-UrlSecretUnprintable([string]$Text) {
+    foreach ($m in [regex]::Matches("$Text", '(?i)[a-z][a-z0-9+.\-]*://([^\r\n]*)')) {
+        $rest = $m.Groups[1].Value
+        $sl = $rest.IndexOfAny([char[]]@('/', '?', '#'))
+        $auth = $(if ($sl -ge 0) { $rest.Substring(0, $sl) } else { $rest })
+        if ($rest.IndexOfAny([char[]]@('?', '#')) -lt 0 -and $auth.IndexOf('@') -lt 0) { continue }
+        $latin = [regex]::Replace($rest, '%([0-9A-Fa-f]{2})', { param($x) [string][char][Convert]::ToInt32($x.Groups[1].Value, 16) })
+        if ($rest -match '[^\x20-\x7E]' -or $latin -match '[^\x20-\x7E]') { return $true }
+    }
+    # a literal line break inside the argument itself (the url continues on the next line of the text)
+    return ("$Text" -match '(?i)[a-z][a-z0-9+.\-]*://[^\r\n]*[\r\n]')
+}
+
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'MANUAL', 'OK')][string]$Level = 'INFO')
     # r17 F2: the one sink for the console and the setup log; no line it writes carries a URL's userinfo or query string, whichever caller printed the URL
@@ -323,9 +341,16 @@ function Invoke-Native {
     $PSNativeCommandUseErrorActionPreference = $false
     foreach ($a in @($Arguments)) { Register-UrlSecretParts $a }   # DENY-BY-DEFAULT-1 S3: before the command line and before anything the child echoes back
     Write-Log ("  > {0} {1}" -f $Exe, ($Arguments -join ' '))
+    # r4 (sol r3 A2): an argument whose url secret holds a byte git may print in an unknown form: the child's output is withheld whole (fail closed)
+    $withhold = @(@($Arguments) | Where-Object { Test-UrlSecretUnprintable $_ }).Count -gt 0
     $out = Invoke-GitTraceScrubbed { & $Exe @Arguments 2>&1 }   # r17 F3: no inherited GIT_TRACE* destination
     $code = $LASTEXITCODE
-    foreach ($o in @($out)) { if ("$o".Trim()) { Write-Log ("    {0}" -f "$o".TrimEnd()) } }
+    if ($withhold) {
+        $nOut = @(@($out) | Where-Object { "$_".Trim() }).Count
+        if ($nOut -gt 0) { Write-Log ("    ({0} line(s) of output withheld: an argument carries a url secret with a byte outside printable ASCII, which the child may print in a form this log cannot redact)" -f $nOut) }
+    } else {
+        foreach ($o in @($out)) { if ("$o".Trim()) { Write-Log ("    {0}" -f "$o".TrimEnd()) } }
+    }
     if ($OkCodes -notcontains $code -and -not $AllowFail) { throw "$Exe exited $code" }
     return $code
 }
@@ -480,8 +505,13 @@ function Get-HubLease {
     if (-not $url) { return @{ Error = "remote '$LeaseRemote' has no url" } }
     $why = Get-RemoteUrlRefusal -Urls @($url) -Rules $lr.Rules -Names $lr.Names   # r23 A1: a url that is also a remote name is refused
     if ($why) { return @{ Error = $why } }
+    Register-UrlSecretParts $url   # r4 (sol r3 A2 sibling): git's own error text may quote this url without its scheme; its secret parts are redacted in every later line
     $ls = Invoke-GitTraceScrubbed { & git -C $Repo ls-remote $url $LeaseRef 2>&1 }   # r17 F3: every native git call drops GIT_TRACE*
-    if ($LASTEXITCODE -ne 0) { return @{ Error = "ls-remote failed: $($ls -join ' ')" } }
+    if ($LASTEXITCODE -ne 0) {
+        # r4 (sol r3 A2 sibling): the same fail-closed rule as Invoke-Native; the lines are joined here, so a continuation would not even start a line
+        if (Test-UrlSecretUnprintable $url) { return @{ Error = "ls-remote failed (exit $LASTEXITCODE; its $(@($ls).Count) output line(s) withheld: the remote url carries a secret with a byte outside printable ASCII)" } }
+        return @{ Error = "ls-remote failed: $($ls -join ' ')" }
+    }
     $line = @($ls | Where-Object { "$_" -match '^[0-9a-f]{40}\s' }) | Select-Object -First 1
     if (-not $line) { return @{ Error = $null; Exists = $false; Sha = ''; Holder = ''; Data = $null; Url = $url } }
     $sha = ("$line" -split '\s+')[0]
@@ -1384,7 +1414,9 @@ function Get-CredentialXmlCloseIndex {
 $script:CredentialResidualIntro = '(?:\\N\{[^}\n]*\}|(?<!\\)\\[xuUN0-7]|&#|`u\{[0-9A-Fa-f]*\}?|%[0-9A-Fa-f]{2}|&(?!(?:amp|lt|gt|quot|apos);)[^\s&;<>"''=]+;)'
 $script:CredentialResidualUnit = '(?:\\N\{[^}\n]*\}|`u\{[0-9A-Fa-f]*\}?|[^\s"''=:,{}\[\]()<>])'
 $script:CredentialResidualIntroRegex = [regex]::new($script:CredentialResidualIntro)
-$script:CredentialResidualKeyRegex = [regex]::new('(' + $script:CredentialResidualUnit + '*?' + $script:CredentialResidualIntro + $script:CredentialResidualUnit + '*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))')
+# r4 (sol r3 A3 sibling, unbounded work): the lazy unit run before the introducer is quadratic on a long run of name characters, so this rule runs only when the text holds an
+# introducer at all, and under a match timeout: a timeout is the typed CREDENTIAL_DECODE_LIMIT refusal (Test-CredentialDecodeLimitError), deny by default.
+$script:CredentialResidualKeyRegex = [regex]::new('(' + $script:CredentialResidualUnit + '*?' + $script:CredentialResidualIntro + $script:CredentialResidualUnit + '*)((?:\s*["''\]\)\}])*)\s*(:|=(?!=))', [System.Text.RegularExpressions.RegexOptions]::None, [TimeSpan]::FromSeconds(20))
 
 # The one key/value rule: the index of the first secret-named key that carries a value, -1 when there is none.
 # DENY-BY-DEFAULT-1: with -Residual a key that holds an undecodable escape ($script:CredentialResidualKeyRegex) is a candidate too, and always secret-named.
@@ -1393,7 +1425,7 @@ function Get-CredentialKeyValueHitIndex {
     $n = $Text.Length
     $cands = [System.Collections.Generic.List[object]]::new()
     foreach ($m in $script:CredentialKeyRegex.Matches($Text)) { $cands.Add([pscustomobject]@{ M = $m; Residual = $false }) }
-    if ($Residual) { foreach ($m in $script:CredentialResidualKeyRegex.Matches($Text)) { $cands.Add([pscustomobject]@{ M = $m; Residual = $true }) } }
+    if ($Residual -and $script:CredentialResidualIntroRegex.IsMatch($Text)) { foreach ($m in $script:CredentialResidualKeyRegex.Matches($Text)) { $cands.Add([pscustomobject]@{ M = $m; Residual = $true }) } }
     # r1 adversary A8: in text order, so the first hit (and the line the report names) is the earliest key of either kind
     foreach ($cand in @($cands | Sort-Object { $_.M.Groups[1].Index })) {
         $m = $cand.M
@@ -1542,13 +1574,15 @@ function Get-CredentialXmlAttrPairHitIndex {
         $namer = -1
         for ($j = 0; $j -lt $attrs.Count; $j++) {
             if ($script:CredentialXmlNameAttrs -notcontains $attrs[$j].N) { continue }
-            # r3 pass 7 A2: the value is judged at EVERY decode level (Get-CredentialDecodeLevels), not only the fixed point: 'auth&#92;u0068eader' is 'authheader'
+            # r3 pass 7 A2: the value is judged at EVERY decode level, not only the fixed point: 'auth&#92;u0068eader' is 'authheader'
             # (a secret name) to a reader that decodes once, and only the deeper 'authheader' is a plain word
             # (an escape still standing at a shallower level is decodable by definition: the undecodable residual is judged on the fixed point only)
-            $lv = @(Get-CredentialDecodeLevels $attrs[$j].V); if ($lv.Count -eq 0) { $lv = @($attrs[$j].V) }
-            if ($script:CredentialResidualIntroRegex.IsMatch($lv[-1])) { $namer = $j; break }
-            foreach ($dv in $lv) { if (Get-CredentialKeyClass ($dv -replace '\s', '')) { $namer = $j; break } }
-            if ($namer -ge 0) { break }
+            # r4 (sol r3 A1, defect class: a judge that drops the spelling AS WRITTEN once a decode exists): the RAW value is the first candidate ('authheader' is
+            # a strong name as written, a plain word decoded); then every level as it is produced (r4 A3: none retained; past the bound the caller refuses typed)
+            $v = $attrs[$j].V
+            if (Get-CredentialKeyClass ($v -replace '\s', '')) { $namer = $j; break }
+            $vnf = Get-CredentialNormalForm $v -OnStage { param($lvText, $lvMask) if (Get-CredentialKeyClass ($lvText -replace '\s', '')) { 0 } else { -1 } }
+            if ($vnf.Hit -ge 0 -or $script:CredentialResidualIntroRegex.IsMatch($vnf.Text)) { $namer = $j; break }
         }
         if ($namer -lt 0) { continue }
         if ($NameOnly) { return $tm.Index }
@@ -1658,22 +1692,42 @@ $script:CredentialLineBreakEval = { param($m) "`n" }
 # r2 pass 6 A1 (defect class: over-decoding can REMOVE a hit): a reader decodes ONCE ('password\u0020suffix' is the key 'password suffix'); the fixed
 # point decodes on to 'password suffix', which no candidate matches. Every decode LEVEL is therefore kept (.Stages, one per pass of the loop, each with its mask) and the
 # decoded pass judges each one: the first level a reader may stop at, every deeper level a nested reader may reach.
-function Get-CredentialNormalForm([string]$Text) {
+# r4 (sol r3 A3, defect class: unbounded input; nested entities decode one layer per pass, so '&' + 'amp;' x 1e6 (4 MB, below the scan cap) needed a million passes and
+# kept every level's full text and mask: terabytes before a verdict). Two hard bounds, both REFUSING typed (CREDENTIAL_DECODE_LIMIT, deny by default), never truncating:
+#   - at most $script:CredentialMaxDecodeStages decode levels; a text that still changes after them is refused (a reader may decode it further than this judge did);
+#   - no level is RETAINED: each one is handed to the judge (-OnStage) as it is produced and dropped, so memory is the current text and mask only (two copies of the input).
+# A regex match timeout (RegexMatchTimeoutException) in a credential rule is the same typed refusal (Test-CredentialDecodeLimitError).
+$script:CredentialMaxDecodeStages = 16
+$script:CredentialDecodeLimitTag = 'CREDENTIAL_DECODE_LIMIT'
+function New-CredentialDecodeLimitError([string]$Why) { return [System.InvalidOperationException]::new("$($script:CredentialDecodeLimitTag) $Why (refused, deny by default)") }
+function Test-CredentialDecodeLimitError($ErrorRecord) {
+    $e = $(if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord })
+    while ($e) {
+        if ($e -is [System.Text.RegularExpressions.RegexMatchTimeoutException] -or "$($e.Message)".StartsWith($script:CredentialDecodeLimitTag)) { return $true }
+        $e = $e.InnerException
+    }
+    return $false
+}
+# -OnStage { param($LevelText, $LevelMask) <index or -1> }: called on every decode level, shallowest first; the first level it returns an index >= 0 for stops the loop
+# (.Hit is that index, .Text and .Mask that level). Without a hit, .Text and .Mask are the fixed point and .Levels the number of levels (0 when nothing decodes).
+function Get-CredentialNormalForm([string]$Text, [scriptblock]$OnStage = $null) {
     $s = "$Text"; $mask = [string]::new([char]'0', $s.Length)
-    $stages = [System.Collections.Generic.List[object]]::new()
+    $levels = 0; $hit = -1
     while ($true) {
         $r = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeEval
         if ($r) { $s = $r.Text; $mask = $r.Mask }
         $b = Invoke-CredentialMaskedReplace -S $s -Mask $mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
         if ($b) { $s = $b.Text; $mask = $b.Mask }
         if (-not $r -and -not $b) { break }
-        $stages.Add([pscustomobject]@{ Text = $s; Mask = $mask })
+        $levels++
+        if ($levels -gt $script:CredentialMaxDecodeStages) { throw (New-CredentialDecodeLimitError "the text still decodes after $($script:CredentialMaxDecodeStages) levels") }
+        if ($OnStage) {
+            $got = @(& $OnStage $s $mask)
+            if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { $hit = [int]$got[-1]; break }
+        }
     }
-    return [pscustomobject]@{ Text = $s; Mask = $mask; Stages = $stages }
+    return [pscustomobject]@{ Text = $s; Mask = $mask; Levels = $levels; Hit = $hit }
 }
-# r3 pass 7 A2 (defect class: a judge that reads only the fixed point): every DECODED level of the text, shallowest first, the fixed point last (none when nothing decodes).
-# Each site that decodes a piece on its own (an XML naming attribute value, the Import role guard) judges every level, exactly as the decoded pass of Get-CredentialHitLine does.
-function Get-CredentialDecodeLevels([string]$Text) { return @((Get-CredentialNormalForm $Text).Stages | ForEach-Object { $_.Text }) }
 
 # True when the text carries a credential: a known token shape, or a secret-named key with a value (the Export scan's own patterns). The text is
 # judged as written AND with its JSON \uXXXX escapes decoded (p5 A1: '{"api_key":"x"}' says api_key). The Export scan and the Import host-side
@@ -1694,22 +1748,27 @@ function Get-CredentialHitLine {
     # The rules below (block form, indented lines, next value line, the hit line) all walk '\n'; a CR-only file used to look like one line and its block value was
     # never found. This rewrites separators only, never a value's characters, so the raw-value rule still judges the text as written.
     $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
-    # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
-    $idx = Get-CredentialHitIndex $Text
-    if ($idx -lt 0) {
-        # r2: the decoded pass reads the ONE normal form (Get-CredentialNormalForm: the whole text decoded to a fixed point). It runs whenever the normal form differs from
-        # the text or an undecodable escape is left in it, so no trigger list can skip it (pass 3 A3). Every rule reads the decoded text; the mask keeps a decoded value
-        # off the exemption list (r1 pass 2 A1: '"password": \156ull'); a key still holding an undecodable escape is secret-named (-Residual, deny by default).
-        $nf = Get-CredentialNormalForm $Text
-        if ($nf.Text -cne $Text -or $script:CredentialResidualIntroRegex.IsMatch($Text)) {
-            # r2 pass 6 A1: every decode level, shallowest first (a text with only undecodable escapes has none: it is judged as its own normal form)
-            $levels = @($nf.Stages); if ($levels.Count -eq 0) { $levels = @($nf) }
-            foreach ($lv in $levels) {
-                $script:CredentialDecodedMask = $lv.Mask
-                try { $idx = Get-CredentialHitIndex -Text $lv.Text -Residual $true } finally { $script:CredentialDecodedMask = $null }
-                if ($idx -ge 0) { $Text = $lv.Text; break }
+    $script:CredentialDecodeLimitHit = $false
+    try {
+        # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
+        $idx = Get-CredentialHitIndex $Text
+        if ($idx -lt 0) {
+            # r2: the decoded pass reads the ONE normal form (Get-CredentialNormalForm: the whole text decoded to a fixed point). It runs whenever the normal form differs from
+            # the text or an undecodable escape is left in it, so no trigger list can skip it (pass 3 A3). Every rule reads the decoded text; the mask keeps a decoded value
+            # off the exemption list (r1 pass 2 A1: '"password": \156ull'); a key still holding an undecodable escape is secret-named (-Residual, deny by default).
+            # r2 pass 6 A1: every decode level, shallowest first. r4 (sol r3 A3): each level is judged as it is produced and then dropped (-OnStage), never kept.
+            $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) $script:CredentialDecodedMask = $lvMask; try { Get-CredentialHitIndex -Text $lvText -Residual $true } finally { $script:CredentialDecodedMask = $null } }
+            if ($nf.Hit -ge 0) { $idx = $nf.Hit; $Text = $nf.Text }
+            elseif ($nf.Levels -eq 0 -and $script:CredentialResidualIntroRegex.IsMatch($Text)) {
+                # a text with only undecodable escapes has no level: it is judged as its own normal form
+                $script:CredentialDecodedMask = $nf.Mask
+                try { $idx = Get-CredentialHitIndex -Text $nf.Text -Residual $true } finally { $script:CredentialDecodedMask = $null }
             }
         }
+    } catch {
+        # r4 (sol r3 A3): past the decode bound (or a rule's match timeout) the text is REFUSED, typed, on line 1: deny by default, never a partial verdict
+        if (Test-CredentialDecodeLimitError $_) { $script:CredentialDecodeLimitHit = $true; return 1 }
+        throw
     }
     if ($idx -lt 0) { return 0 }
     # the line of the KEY (a block-form value sits on a later line; the report names where the secret-named key stands)
@@ -1762,6 +1821,8 @@ function Get-StagedFileVerdictDetail {
     if ($ms.Length -gt $MaxScanBytes) { return @{ Why = 'larger than the scan limit'; Line = 0 } }
     try { $t = ConvertFrom-ImportBytes $ms.ToArray() } catch { return @{ Why = 'unreadable'; Line = 0 } }
     $line = Get-CredentialHitLine $t
+    # r4 (sol r3 A3): the typed decode-limit refusal is named as such (it is still a credential-pattern refusal: the file is removed and listed)
+    if ($line -gt 0 -and $script:CredentialDecodeLimitHit) { return @{ Why = "credential pattern ($($script:CredentialDecodeLimitTag): more than $($script:CredentialMaxDecodeStages) decode levels or a rule's match timeout, deny by default)"; Line = $line } }
     if ($line -gt 0) { return @{ Why = 'credential pattern'; Line = $line } }
     return @{ Why = ''; Line = 0 }
 }
@@ -2080,29 +2141,37 @@ function Move-ForeignClaims {
 function Test-CredentialNamePresent {
     param([string]$Text)
     if (-not $Text) { return $false }
-    $texts = @($Text)
-    # r2 pass 6 A3: an XML naming attribute that names a secret ('p a s s w o r d': blanks removed first) counts with or without an escape in the text
-    if ((Get-CredentialXmlAttrPairHitIndex -Text $Text -NameOnly) -ge 0) { return $true }
-    if (Test-CredentialEscapesPresent $Text) {
-        $dec = ConvertFrom-CredentialEscapes $Text   # r23 (pass 27 A1 sibling): the same decoder as the content guard (DENY-BY-DEFAULT-1: every escape form it decodes)
-        # DENY-BY-DEFAULT-1 sibling: a key in the decoded copy that still holds an undecodable escape names a secret, as in the content guard (deny by default)
-        if ($script:CredentialResidualKeyRegex.IsMatch($dec)) { return $true }
-        # r1 adversary A7 sibling: a table header ('["pass\U0011FFFFord"]') or an XML naming attribute value holding one counts the same
-        foreach ($hm in $script:CredentialTableHeaderRegex.Matches($dec)) { if ($script:CredentialResidualIntroRegex.IsMatch($hm.Groups[1].Value)) { return $true } }
-        if ((Get-CredentialXmlAttrPairHitIndex -Text $Text -NameOnly) -ge 0) { return $true }   # r2 pass 4 A4: a name, whatever the value
-        # r3 pass 7 A2: every decode level is searched for a secret name, not only the fixed point $dec (the last level): a reader that decodes once sees the first
-        $texts += @(Get-CredentialDecodeLevels $Text)
-        $texts += $dec
-    }
-    foreach ($t in $texts) {
-        # r16 (adversary pass 15 A2): the seen set is CASE-SENSITIVE (ordinal). The classifier splits camelCase, so 'authHeader' (auth + header: secret-named) and
-        # 'authheader' (one word: not) get different answers; a case-insensitive @{} table skipped the camelCase spelling after its benign lowercase twin.
-        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($w in [regex]::Matches($t, '[A-Za-z0-9_.\-/\\]+')) {   # r19 pass 22 A1: '/' and '\' stand inside a name word, as in the key pattern
-            $v = $w.Value
-            if (-not $seen.Add($v)) { continue }
-            if (Get-CredentialKeyClass $v) { return $true }
+    try {
+        # r2 pass 6 A3: an XML naming attribute that names a secret ('p a s s w o r d': blanks removed first) counts with or without an escape in the text
+        # (r2 pass 4 A4: a name, whatever the value; r4 sol r3 A1: its raw spelling and every decode level, Get-CredentialXmlAttrPairHitIndex)
+        if ((Get-CredentialXmlAttrPairHitIndex -Text $Text -NameOnly) -ge 0) { return $true }
+        if (Test-CredentialNameWordPresent $Text) { return $true }
+        # r3 pass 7 A2: every decode level is searched for a secret name, not only the fixed point (a reader that decodes once sees the first). r23 (pass 27 A1 sibling):
+        # the same decoder as the content guard. r4 (sol r3 A3): each level is judged as it is produced and dropped; past the bound the text names a secret (deny by default).
+        $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) if (Test-CredentialNameWordPresent $lvText) { 0 } else { -1 } }
+        if ($nf.Hit -ge 0) { return $true }
+        $dec = $nf.Text
+        if ($script:CredentialResidualIntroRegex.IsMatch($dec)) {
+            # DENY-BY-DEFAULT-1 sibling: a key in the decoded copy that still holds an undecodable escape names a secret, as in the content guard (deny by default)
+            if ($script:CredentialResidualKeyRegex.IsMatch($dec)) { return $true }
+            # r1 adversary A7 sibling: a table header ('["pass\U0011FFFFord"]') holding one counts the same
+            foreach ($hm in $script:CredentialTableHeaderRegex.Matches($dec)) { if ($script:CredentialResidualIntroRegex.IsMatch($hm.Groups[1].Value)) { return $true } }
         }
+    } catch {
+        if (Test-CredentialDecodeLimitError $_) { return $true }   # r4 (sol r3 A3): the typed decode-limit refusal, deny by default
+        throw
+    }
+    return $false
+}
+# True when a word of the text is secret-named (Get-CredentialKeyClass).
+function Test-CredentialNameWordPresent([string]$Text) {
+    # r16 (adversary pass 15 A2): the seen set is CASE-SENSITIVE (ordinal). The classifier splits camelCase, so 'authHeader' (auth + header: secret-named) and
+    # 'authheader' (one word: not) get different answers; a case-insensitive @{} table skipped the camelCase spelling after its benign lowercase twin.
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($w in [regex]::Matches("$Text", '[A-Za-z0-9_.\-/\\]+')) {   # r19 pass 22 A1: '/' and '\' stand inside a name word, as in the key pattern
+        $v = $w.Value
+        if (-not $seen.Add($v)) { continue }
+        if (Get-CredentialKeyClass $v) { return $true }
     }
     return $false
 }

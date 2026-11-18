@@ -2838,6 +2838,14 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     # r3 pass 7 A2: an XML naming attribute VALUE is judged at every decode level too (its first level names a secret, the deeper fixed point does not)
     $ddR2['p7 A2 an XML key whose first decode level names a secret'] = '<add key="&#97;uth&#92;u0068eader" value="hunter2" />'
     $ddR2['p7 A2 sibling: the same key in a JSON pair'] = '{"\x61uth\x5cu0068eader": "hunter2"}'
+    # r4 (sol r3 A1, defect class: a judge that drops the spelling AS WRITTEN once a decode exists): the raw naming value is a candidate too, beside every decode level
+    # ($ddU is backslash + 'u0068', the escaped 'h', built here so no editor or encoder can decode it in the source)
+    $ddU = [string][char]92 + 'u0068'
+    $ddR2['r4 A1 a raw strong XML naming value that also decodes'] = ('<add key="auth' + $ddU + 'eader" value="hunter2" />')
+    $ddR2['r4 A1 sibling: the same with single quotes'] = ("<add key='auth" + $ddU + "eader' value='hunter2' />")
+    $ddR2['r4 A1 sibling: a raw strong spaced naming value that decodes'] = ('<add key="a u t h' + $ddU + 'eader" value="hunter2" />')
+    # r4 (sol r3 hardening): raw benign, first decode level strong, fixed point benign, so only a judge of the intermediate level refuses it
+    $ddR2['r4 hardening: a JSON key strong only at its first decode level'] = '{"&#97;uth&#92;u0068eader": "hunter2"}'
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
     foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
@@ -2863,6 +2871,11 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         # r3 pass 7 A2: the role guard judges every decode level, not only the fixed point (hosts.yml '"\x61uth\x5cu0068eader": ""' is one decode away from a strong 'auth' name, two from the plain word 'authheader')
         Assert-That (Test-CredentialNamePresent '"\x61uth\x5cu0068eader": ""') 'DENY-BY-DEFAULT-1 r3 adversary p7 A2 role guard: a key whose first decode level names a secret (empty value)'
         Assert-That (Test-CredentialNamePresent '<add key="&#97;uth&#92;u0068eader" value="" />') 'DENY-BY-DEFAULT-1 r3 adversary p7 A2 role guard: the same as an XML naming attribute with an empty value'
+        # r4 (sol r3 A1): the raw spelling of a naming value that also decodes still names a secret (spaced, so the word scan alone misses it)
+        $ddU2 = [string][char]92 + 'u0068'
+        Assert-That (Test-CredentialNamePresent ('<add key="a u t h' + $ddU2 + 'eader" value="" />')) 'DENY-BY-DEFAULT-1 r4 A1 role guard: a raw strong spaced XML naming value that decodes names a secret'
+        Assert-That (Test-CredentialNamePresent ("xml = `"<add key='a u t h" + $ddU2 + "eader' value='' />`"")) 'DENY-BY-DEFAULT-1 r4 A1 role guard: the same inside a config.toml string'
+        Assert-That (-not (Test-CredentialNamePresent ('<add key="t h' + $ddU2 + 'eme" value="" />'))) 'DENY-BY-DEFAULT-1 r4 A1 role guard must-pass: a raw benign naming value that decodes names nothing'
     }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
@@ -2883,6 +2896,22 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         $zf = [IO.Compression.ZipFile]::Open($zp, 'Create')
         try { $e = $zf.CreateEntry('home-claude/machine/app.config'); $sw = [IO.StreamWriter]::new($e.Open()); $sw.Write($ddG[1]); $sw.Dispose() } finally { $zf.Dispose() }
         Assert-That (@(Get-ArchiveCredentialHits -Zip $zp).Count -eq 1) "DENY-BY-DEFAULT-1 $($ddG[0]) archive re-check: the zip entry is a hit" $ddG[1]
+    }
+    # r4 (sol r3 A3, defect class: unbounded input): nested entities decode one layer per pass. Past $script:CredentialMaxDecodeStages levels the text is REFUSED (typed
+    # CREDENTIAL_DECODE_LIMIT, deny by default) by every guard, in bounded time and memory, and no level is retained as a full copy.
+    $ddDeep = '{"note":"&' + ('amp;' * 40) + '"}'
+    Assert-That (Test-CredentialText $ddDeep) 'DENY-BY-DEFAULT-1 r4 A3: a text that needs more decode levels than the bound refuses (deny by default)' $ddDeep
+    Assert-That (Test-CredentialNamePresent $ddDeep) 'DENY-BY-DEFAULT-1 r4 A3 role guard: the same text counts as naming a secret (deny by default)'
+    Assert-That (Test-CredentialNamePresent ('<add key="&' + ('amp;' * 40) + '" value="" />')) 'DENY-BY-DEFAULT-1 r4 A3 role guard: an XML naming value past the bound counts as naming a secret'
+    Assert-That (-not (Test-CredentialText ('{"note":"&' + ('amp;' * 6) + '"}'))) 'DENY-BY-DEFAULT-1 r4 A3 must-pass: a shallow nesting within the bound is not a credential'
+    if (Test-Has 'New-CredentialDecodeLimitError' 'DENY-BY-DEFAULT-1 r4 A3') {
+        $ddDeepSt = New-Scratch 'dd-r4-a3-stage'; [IO.File]::WriteAllText((Join-Path $ddDeepSt 'note.json'), $ddDeep)
+        $ddDeepWhy = (Get-StagedFileVerdictDetail -File ([IO.FileInfo]::new((Join-Path $ddDeepSt 'note.json')))).Why
+        Assert-That ("$ddDeepWhy".Contains('CREDENTIAL_DECODE_LIMIT')) 'DENY-BY-DEFAULT-1 r4 A3 export: the staged verdict names the typed decode-limit refusal' "why=$ddDeepWhy"
+        # the reviewer's input shape, a 4 MB text below the scan cap: it must finish (it used to need terabytes) and refuse
+        $ddHuge = '{"note":"&' + ('amp;' * 1000000) + '"}'
+        $ddSw = [Diagnostics.Stopwatch]::StartNew(); $ddHugeHit = Test-CredentialText $ddHuge; $ddSw.Stop()
+        Assert-That ($ddHugeHit -and $ddSw.Elapsed.TotalSeconds -lt 120) 'DENY-BY-DEFAULT-1 r4 A3: a 4 MB nesting below the scan cap refuses in bounded time' "hit=$ddHugeHit seconds=$([int]$ddSw.Elapsed.TotalSeconds)"
     }
 }
 # S3: a Clone whose url carries a query token: neither the console nor the setup log ever holds the token, also where git echoes the url without its scheme
@@ -2915,7 +2944,12 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         @{ N = 18; Url = ('file:///' + ((New-Scratch 'dd-s3-absent18') -replace '\\', '/') + '/absent%22x-18.git#%80qzt'); Tok = @('qzt') },
         @{ N = 19; Url = ('file:///' + ((New-Scratch 'dd-s3-absent19') -replace '\\', '/') + '/absent%0Ax-19.git?%80qzu'); Tok = @('qzu') },
         @{ N = 20; Url = ('file:///' + ((New-Scratch 'dd-s3-absent20') -replace '\\', '/') + '/absent%0D%0Ax-20.git?qzk'); Tok = @('qzk') },
-        @{ N = 21; Url = ('file:///' + ((New-Scratch 'dd-s3-absent21') -replace '\\', '/') + '/absent-21%0A?%80qzj'); Tok = @('qzj') }
+        @{ N = 21; Url = ('file:///' + ((New-Scratch 'dd-s3-absent21') -replace '\\', '/') + '/absent-21%0A?%80qzj'); Tok = @('qzj') },
+        # r4 (sol r3 A2, defect class: matching a secret by a spelling git may print differently): a line break then a high byte in the query or fragment; git prints a
+        # continuation line '80qzh' that no registered spelling matches. The output of a native call whose url secret holds such a byte is withheld (fail closed).
+        @{ N = 22; Url = ('file:///' + ((New-Scratch 'dd-s3-absent22') -replace '\\', '/') + '/absent-22.git?t=%0A%80qzh'); Tok = @('qzh') },
+        @{ N = 23; Url = ('file:///' + ((New-Scratch 'dd-s3-absent23') -replace '\\', '/') + '/absent-23.git#t=%0A%80qzg'); Tok = @('qzg') },
+        @{ N = 24; Url = ('file:///' + ((New-Scratch 'dd-s3-absent24') -replace '\\', '/') + '/absent-24.git?t=%0D%9Fqzf'); Tok = @('qzf') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
@@ -2935,6 +2969,15 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         Assert-That ($ddlog.Length -gt 0 -and $ddLeakLog.Count -eq 0) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the setup log never holds the url's query token" $ddlog
         Assert-That ($ddLeakOut.Count -eq 0) "DENY-BY-DEFAULT-1 S3 clone ($($ddc.N)): the console never shows the url's query token" $ddout
         $script:Failures.Clear()
+    }
+    # r4 (sol r3 A2): the fail-closed predicate shared by Invoke-Native and the lease read (Get-HubLease)
+    if (Test-Has 'Test-UrlSecretUnprintable' 'DENY-BY-DEFAULT-1 r4 A2') {
+        foreach ($ddW in @('file:///C:/x.git?t=%0A%80qzv', 'file:///C:/x.git#t=%0A%80qzv', 'https://h.example/r.git?t=%FF', 'https://u:p%0Aw@h.example/r.git', 'file:///C:/a%0Ab.git?t=x')) {
+            Assert-That (Test-UrlSecretUnprintable $ddW) "DENY-BY-DEFAULT-1 r4 A2: output is withheld for $ddW"
+        }
+        foreach ($ddK in @('https://github.com/o/r.git', 'file:///C:/a%0Ab.git', 'https://h.example/r.git?t=plain-token', 'git@github.com:o/r.git')) {
+            Assert-That (-not (Test-UrlSecretUnprintable $ddK)) "DENY-BY-DEFAULT-1 r4 A2 must-pass: output is shown for $ddK"
+        }
     }
     # r1 adversary A5: a registered part that is also a scheme ('?https:') never breaks a url apart before the scheme rule redacts its short password
     if (Test-Has 'Register-UrlSecretParts' 'DENY-BY-DEFAULT-1 r1 adversary A5') {
