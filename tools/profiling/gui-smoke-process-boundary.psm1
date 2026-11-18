@@ -292,6 +292,9 @@ function Wait-GuiSmokeProcessBounded {
         # The caller's chunk loop saw the app log stop advancing for -NoProgressWindowMs: end the wait at once (a 1 ms look for an exit that
         # raced the verdict, then the tree kill below) with the typed outcome process_no_progress.
         [switch]$NoProgressStalled,
+        # r10 (adversary 412ce3e0 A1): the caller's chunked wait ran the whole leg-derived budget out with the process still running. An exit that
+        # lands inside this call's 1 ms floor look is not a completion: the deadline was already missed, so the leg is a timeout, no look at all.
+        [switch]$DeadlineReached,
         [ValidateRange(0, 3600000)]
         [int]$NoProgressWindowMs = 0
     )
@@ -330,8 +333,10 @@ function Wait-GuiSmokeProcessBounded {
     $waitMs = if ($NoProgressStalled) { 1 } else { $TimeoutMs }
 
     try {
-        $terminationConfirmed = $Process.WaitForExit($waitMs)
-        if ($terminationConfirmed) { $exitObservedTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp(); $exitObservedAtUtc = [datetime]::UtcNow }
+        if (-not $DeadlineReached) {
+            $terminationConfirmed = $Process.WaitForExit($waitMs)
+            if ($terminationConfirmed) { $exitObservedTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp(); $exitObservedAtUtc = [datetime]::UtcNow }
+        }
     }
     catch {
         # round 7 (sol MINOR, same class as the two sanitizations already below): record only the

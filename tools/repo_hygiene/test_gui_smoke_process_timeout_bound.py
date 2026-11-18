@@ -813,5 +813,42 @@ class OwnerInputLegSilenceWindowKeepsTheReadAllowance(unittest.TestCase):
         self.assertEqual(187000 + 60000, self._runner_window(120000), "the 120 s setup/teardown default is not a read allowance")
 
 
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class DeadlineReachedWaitIsATimeoutEvenWhenTheProcessExitsInTheLastLook(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r10 (adversary 412ce3e0 A1, major, introduced): the chunked wait ends when the leg-derived hard deadline is
+    exhausted with the process still running, but the finalize wait that follows keeps a 1 ms floor, so a process that exits inside that look (or
+    between the last chunk and the check) was reported outcome=exited exitCode=0 timedOut=false. The base classified an unsuccessful wait at the
+    deadline as a timeout. Class: a budget exhaustion is observed in one place and forgotten in the next (both sampling branches share it)."""
+
+    def _wait(self, switch: str) -> dict:
+        return run_ps(r"""
+$s = New-Stub 'exit 0'
+[void]$s.p.WaitForExit(30000)
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 3000 %s
+[pscustomobject]@{ timedOut = $r.timedOut; outcome = $r.outcome; exitCode = $r.exitCode; failures = @($r.failures) } | ConvertTo-Json -Compress
+""" % switch)
+
+    def test_a_process_that_exits_in_the_last_look_after_the_deadline_is_still_a_timeout(self) -> None:
+        out = self._wait("-DeadlineReached")
+        self.assertTrue(out["timedOut"])
+        self.assertEqual("timeout", out["outcome"])
+        self.assertEqual(124, out["exitCode"], "an exit after the deadline is not a successful completion")
+        self.assertIn("3000 ms", " ".join(out["failures"]), "the receipt names the whole budget")
+
+    def test_without_the_deadline_flag_an_exited_process_is_still_a_clean_exit(self) -> None:
+        out = self._wait("")
+        self.assertFalse(out["timedOut"])
+        self.assertEqual("exited", out["outcome"])
+        self.assertEqual(0, out["exitCode"])
+
+    def test_both_runner_wait_branches_record_the_exhausted_budget_and_hand_it_to_the_boundary(self) -> None:
+        wait = _runner_snippet(*_WAIT_REGION)
+        self.assertEqual(2, wait.count("$waitBudgetExhausted = $true"), "the host-load branch and the log-only branch both record it")
+        self.assertIn("-DeadlineReached:$waitBudgetExhausted", wait)
+        for marker in ("if ($hostLoadRemainingMs -le 0) {", "if ($noProgressRemainingMs -le 0) {"):
+            start = wait.index(marker)
+            self.assertIn("$waitBudgetExhausted = $true", wait[start:wait.index("break", start)], marker)
+
+
 if __name__ == "__main__":
     unittest.main()

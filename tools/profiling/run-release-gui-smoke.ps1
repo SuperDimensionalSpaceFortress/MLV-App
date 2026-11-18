@@ -2002,12 +2002,16 @@ $noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noP
 # r3 (adversary 797947a7 A2): no chunked wait may outlast a fraction of the window, or a short window would permit one chunk (up to 60 s) of silence.
 $noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs
 $noProgressStalled = $false
+# r10 (adversary 412ce3e0 A1): set when either chunked wait ran the leg-derived budget out with the process still running; the finalize wait below
+# then treats a late exit as the timeout it is, not as a completion.
+$waitBudgetExhausted = $false
 if ($HostLoadSampleIntervalMs -gt 0) {
     $hostLoadSampleLoopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $hostLoadLastSampleAtMs = [int64]0
     while ($true) {
         $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
         if ($hostLoadRemainingMs -le 0) {
+            $waitBudgetExhausted = $true
             break
         }
         $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))
@@ -2040,6 +2044,7 @@ else {
     while ($true) {
         $noProgressRemainingMs = $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds
         if ($noProgressRemainingMs -le 0) {
+            $waitBudgetExhausted = $true
             break
         }
         if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
@@ -2066,6 +2071,7 @@ $processBoundary = Wait-GuiSmokeProcessBounded `
     -TimeoutMs $hostLoadFinalizeTimeoutMs `
     -ReportedTimeoutMs $effectiveProcessTimeoutMs `
     -NoProgressStalled:$noProgressStalled `
+    -DeadlineReached:$waitBudgetExhausted `
     -NoProgressWindowMs $noProgressWindowMs
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
