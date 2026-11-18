@@ -64,6 +64,11 @@
 #   `-File <that script path>`: the action's <Command> is pwsh/powershell, the FIRST -File (no -Command/-EncodedCommand before it,
 #   no positional token before it) is that absolute path, and the agent's own arguments after it name no other root (-Root, or a
 #   positional first argument, must be this folder; a path mentioned only in the description or a later argument does not count).
+#   The RUNNING instance must say the same: its own command line (Win32_Process.CommandLine of the heartbeat pid, read under a
+#   deadline; an unreadable one, for example another user's process without elevation, is a refusal) is held to the same rule, so a
+#   task definition edited after the instance started cannot bind while the live agent serves another root. The replacement that
+#   /Run starts is held to it too, and must have STARTED at or after /Run (no tolerance: the old agent never counts as new).
+#   A path with no drive (/bench, \bench) never names a place on Windows: it resolves against another process's current drive.
 #   The root itself must also list (a root whose listing is denied is DEPLOY_REFUSED_UNREADABLE, even for a no-op).
 #   The idle gate keeps the End from stranding a lease: with running\, inbox\ and slot-holders\ empty, nothing is lost.
 #   Waits use a monotonic Stopwatch, never the wall clock, and EVERY read of the venue is under a deadline: a listing, a heartbeat
@@ -104,6 +109,11 @@ $agentName = 'ultra-magnus-agent.ps1'
 # ONE tolerance for "same process start": the heartbeat's processStartUtc against the live process (alive check) and the old
 # heartbeat against the new one (replacement check). Same iff the gap is within it, in BOTH checks (VenueChain.psm1 uses 2 s too).
 $script:StartToleranceSec = 2
+# Windows or not: the one platform switch. On Windows a path that starts with ONE separator and no drive (\bench, /bench) is
+# resolved against the CURRENT DRIVE of whichever process reads it, so it never names a place (Test-AbsolutePathText); a runspace's
+# ExecutionPolicy can be set only on Windows (Invoke-Bounded); a process's command line comes from Win32_Process there and from
+# /proc elsewhere (Get-ProcessArgv). The tests flip it in a dot-sourced session to prove both readings on either host.
+$script:OnWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
 # the longest a single read of the venue (a listing, the heartbeat) may take before it counts as unanswered
 $script:ReadTimeoutSec = 20
 # the file a bounded runspace dot-sources to get this script's functions (empty only if the host gives no path)
@@ -144,7 +154,8 @@ function Invoke-Bounded {
     # Returns [pscustomobject]@{ timedOut; error; ok; value }: ok is the truth of the last output, value is the last output.
     param([scriptblock]$Script, [long]$TimeoutMs, [hashtable]$Variables = @{})
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    $iss.ExecutionPolicy = [Microsoft.PowerShell.ExecutionPolicy]::Bypass
+    # ExecutionPolicy is a Windows-only setting: assigning it on Linux makes Open() throw "Operation is not supported on this platform"
+    if ($script:OnWindows) { $iss.ExecutionPolicy = [Microsoft.PowerShell.ExecutionPolicy]::Bypass }
     $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('__self', $script:SelfPath)
@@ -215,10 +226,14 @@ function Wait-Until {
 }
 
 function Test-AbsolutePathText {
-    # A drive path, a UNC path or a rooted POSIX path. A relative path is resolved against a working directory this script cannot
-    # see for another process (a task's WorkingDirectory, the agent's own cwd), so it never counts as naming a place.
+    # A drive path (C:\x), a UNC path (\\host\share) or, off Windows only, a rooted POSIX path (/x). A relative path is resolved
+    # against a working directory this script cannot see for another process (a task's WorkingDirectory, the agent's own cwd), and on
+    # Windows so is a rooted-without-drive path (/bench, \bench): it lands on the CURRENT DRIVE of the process that resolves it, so
+    # the task may serve D:\bench while C:\bench was the one checked idle. Neither counts as naming a place.
     param([string]$P)
-    return ($P -match '^([A-Za-z]:[\\/]|\\\\|/)')
+    if ($P -match '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])') { return $true }
+    if ($script:OnWindows) { return $false }
+    return ($P -match '^/')
 }
 
 function Test-SamePath {
@@ -358,17 +373,66 @@ function Test-NewHeartbeatIsLiveAgent {
     # A restart is confirmed only by a heartbeat from a process that EXISTS with the recorded start time, names THIS machine and this
     # root's script, is not this deployer, and (with -NotBeforeUtc) was STARTED at or after the moment the task was started: a
     # process that was already running when /Run was issued is not the replacement, whatever its heartbeat claims.
-    param($Beat, [string]$AgentScript, $NotBeforeUtc = $null)
+    # With -NotBeforeUtc the start is compared EXACTLY, with no tolerance, and against BOTH the start the heartbeat claims and the start
+    # the OS reports for the pid: /Run cannot create a process before it is called, so a process that began even a moment earlier
+    # (the old agent, or a stray one) is not the replacement. (The tolerance belongs to "same process" checks, never to "newer than".)
+    # With -CheckCommandLine the process's OWN command line must run this script with this root (Test-HostArgvRunsScript).
+    param($Beat, [string]$AgentScript, $NotBeforeUtc = $null, [switch]$CheckCommandLine)
     if ($null -eq $Beat) { return $false }
     if ([string]::IsNullOrWhiteSpace($Beat.start)) { return $false }
     if (-not [string]::Equals($Beat.host, $env:COMPUTERNAME, [StringComparison]::OrdinalIgnoreCase)) { return $false }
     if ($Beat.pid -eq $PID) { return $false }
     if (-not (Test-SamePath -A $Beat.agentScript -B $AgentScript)) { return $false }
     if ($null -ne $NotBeforeUtc) {
-        try { if ((ConvertTo-UtcStart -Text $Beat.start) -lt ([datetime]$NotBeforeUtc).AddSeconds(-$script:StartToleranceSec)) { return $false } }
+        try {
+            $notBefore = ([datetime]$NotBeforeUtc).ToUniversalTime()
+            if ((ConvertTo-UtcStart -Text $Beat.start) -lt $notBefore) { return $false }
+            $proc = Get-Process -Id $Beat.pid -ErrorAction SilentlyContinue
+            if ($null -eq $proc -or $proc.StartTime.ToUniversalTime() -lt $notBefore) { return $false }
+        }
         catch { return $false }
     }
-    return (Test-AgentProcessAlive -Beat $Beat -RequireStart)
+    if (-not (Test-AgentProcessAlive -Beat $Beat -RequireStart)) { return $false }
+    if ($CheckCommandLine) {
+        try { $argv = Get-ProcessArgv -ProcessId $Beat.pid } catch { return $false }
+        if (-not (Test-ArgvBindsScript -Argv $argv -AgentScript $AgentScript)) { return $false }
+    }
+    return $true
+}
+
+function Get-ProcessArgv {
+    # The process's OWN argument vector, read from the OS, never from a file the agent (or anyone) wrote: Win32_Process.CommandLine on
+    # Windows (decoded by Split-TaskArguments), /proc/<pid>/cmdline elsewhere. Returns @{ ok; tokens } (executable first), ok=$false when
+    # the process is gone or its command line cannot be read (another user's process without elevation reads as empty).
+    param([int]$ProcessId)
+    $none = [pscustomobject]@{ ok = $false; tokens = @() }
+    if ($script:OnWindows) {
+        $c = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+        if ($null -eq $c -or [string]::IsNullOrWhiteSpace($c.CommandLine)) { return $none }
+        return (Split-TaskArguments -Text $c.CommandLine)
+    }
+    $raw = [System.IO.File]::ReadAllText("/proc/$ProcessId/cmdline")
+    $parts = @($raw.Split([char]0) | Where-Object { $_ -ne '' })
+    if ($parts.Count -lt 1) { return $none }
+    return [pscustomobject]@{ ok = $true; tokens = $parts }
+}
+
+function Get-ProcessArgvBounded {
+    # Get-ProcessArgv under the read deadline (WMI can stall); no answer reads as unreadable, never a hang with the lock held.
+    param([int]$ProcessId)
+    $r = Invoke-Bounded -Script { Get-ProcessArgv -ProcessId $ProcId } -TimeoutMs ($script:ReadTimeoutSec * 1000) -Variables @{ ProcId = $ProcessId }
+    if ($r.timedOut -or $null -ne $r.error) { return $null }
+    return $r.value
+}
+
+function Test-ArgvBindsScript {
+    # A process argv (from Get-ProcessArgv) is a PowerShell host that runs <AgentScript> with this script's root.
+    param($Argv, [string]$AgentScript)
+    if ($null -eq $Argv -or -not $Argv.ok) { return $false }
+    $all = @($Argv.tokens)
+    if ($all.Count -lt 1) { return $false }
+    $rest = @(); if ($all.Count -gt 1) { $rest = @($all[1..($all.Count - 1)]) }
+    return (Test-HostArgvRunsScript -Exe $all[0] -Tokens $rest -AgentScript $AgentScript)
 }
 
 function Test-BeatIsDifferentProcess {
@@ -466,18 +530,26 @@ function Test-TaskXmlRunsScript {
     # task for an unusual path still binds.
     param([string]$Xml, [string]$AgentScript)
     try { $doc = [xml]$Xml } catch { return $false }
-    $expectedRoot = $AgentScript -replace '[\\/][^\\/]*$', ''
     $actions = @($doc.SelectNodes("//*[local-name()='Actions']/*"))
     if ($actions.Count -ne 1 -or $actions[0].LocalName -ne 'Exec') { return $false }
     $exec = $actions[0]
     $cmdNode = $exec.SelectSingleNode("*[local-name()='Command']")
     $argNode = $exec.SelectSingleNode("*[local-name()='Arguments']")
     if ($null -eq $cmdNode -or $null -eq $argNode) { return $false }
-    $leaf = [regex]::Match($cmdNode.InnerText.Trim().Trim('"'), '[^\\/]+$').Value
-    if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { return $false }
     $split = Split-TaskArguments -Text $argNode.InnerText
     if (-not $split.ok) { return $false }
-    $tokens = @($split.tokens)
+    return (Test-HostArgvRunsScript -Exe $cmdNode.InnerText -Tokens @($split.tokens) -AgentScript $AgentScript)
+}
+
+function Test-HostArgvRunsScript {
+    # THE one reading of "this command line runs <AgentScript> serving this root", shared by the task definition (what the task WILL
+    # start) and the live process (what is RUNNING now: a definition edited after the instance started binds only the definition).
+    # $Exe is the host executable, $Tokens the arguments after it, already decoded (Split-TaskArguments or /proc).
+    param([string]$Exe, [string[]]$Tokens, [string]$AgentScript)
+    $expectedRoot = $AgentScript -replace '[\\/][^\\/]*$', ''
+    $leaf = [regex]::Match($Exe.Trim().Trim('"'), '[^\\/]+$').Value
+    if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { return $false }
+    $tokens = @($Tokens)
     $hostFlags = @('NoProfile', 'nop', 'NoLogo', 'nol', 'NonInteractive', 'noni')
     $policies = @('Bypass', 'RemoteSigned', 'Unrestricted', 'AllSigned', 'Restricted', 'Default', 'Undefined')
     $styles = @('Hidden', 'Normal', 'Minimized', 'Maximized')
@@ -497,7 +569,7 @@ function Test-TaskXmlRunsScript {
         return $false
     }
     if ($null -eq $scriptPath) { return $false }
-    if ($scriptPath -notmatch '^([A-Za-z]:[\\/]|\\\\|/)') { return $false }
+    if (-not (Test-AbsolutePathText -P $scriptPath)) { return $false }
     if (-not (Test-SamePath -A $scriptPath -B $AgentScript)) { return $false }
     $rest = @(); if ($i -lt $tokens.Count) { $rest = @($tokens[$i..($tokens.Count - 1)]) }
     $parsed = Get-TaskRootFromScriptArgs -ScriptArgs $rest
@@ -523,6 +595,15 @@ function Get-RestartBindingRefusal {
     }
     if (-not (Test-AgentProcessAlive -Beat $beat -RequireStart)) {
         return "heartbeat pid=$($beat.pid) is not a live agent process with the recorded start time; start the agent task by hand, then deploy"
+    }
+    # the RUNNING instance's own command line, read from the OS: a task definition edited after the instance started would bind the
+    # definition while the live agent still serves another root. Both must say: a PowerShell host, -File <this script>, this root.
+    $argv = Get-ProcessArgvBounded -ProcessId $beat.pid
+    if ($null -eq $argv -or -not $argv.ok) {
+        return "the command line of heartbeat pid=$($beat.pid) could not be read (the process is gone, WMI did not answer in $($script:ReadTimeoutSec) s, or it belongs to another user: run elevated), so the root the live agent serves is unconfirmed"
+    }
+    if (-not (Test-ArgvBindsScript -Argv $argv -AgentScript $AgentScript)) {
+        return "heartbeat pid=$($beat.pid) is not running -File $AgentScript for this root (its own command line differs); ending the task would stop an agent serving another root"
     }
     $xml = $null
     try {
@@ -570,7 +651,7 @@ function Invoke-AgentRestart {
     if ($run.exitCode -ne 0) { return @{ why = "schtasks /Run $TaskName exited $($run.exitCode)"; warn = $warn } }
     $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript; runAt = $runAt } -Condition {
         $now = Read-Heartbeat
-        ($null -ne $now) -and ($now.ageSec -lt 30) -and (Test-BeatIsDifferentProcess -Old $before -New $now) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $runAt)
+        ($null -ne $now) -and ($now.ageSec -lt 30) -and (Test-BeatIsDifferentProcess -Old $before -New $now) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $runAt -CheckCommandLine)
     } -PollMs 1000
     if (-not $up) { return @{ why = 'no heartbeat from a new LIVE agent process within 60 s of schtasks /Run'; warn = $warn } }
     return @{ why = $null; warn = $warn }

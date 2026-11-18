@@ -12,6 +12,7 @@ DEPLOY_REFUSED_LEASE 11, DEPLOY_REFUSED_UNREADABLE 12, DEPLOY_SHA_MISMATCH 13, D
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -26,8 +27,13 @@ SCRIPT = ROOT / "tools" / "profiling" / "bachelor" / "Deploy-BachelorAgent.ps1"
 AGENT_NAME = "ultra-magnus-agent.ps1"
 PWSH = shutil.which("pwsh")
 
-OLD = b"# old agent\r\nWrite-Output 'old'\r\n"
+# OLD sleeps so a test can start it as a LIVE agent process (`pwsh -File <venue>\ultra-magnus-agent.ps1`); nothing else runs it.
+OLD = b"# old agent\r\nStart-Sleep -Seconds 120\r\nWrite-Output 'old'\r\n"
 NEW = b"# new agent\r\nWrite-Output 'new'\r\n"
+# The host name every test uses. The script compares a heartbeat's host with $env:COMPUTERNAME; that variable exists on Windows only
+# (on Linux it is unset), so the tests SET it for the processes they start, which makes the restart-binding cases platform-neutral.
+BENCH_HOST = "BENCHTEST"
+BENCH_ENV = dict(os.environ, COMPUTERNAME=BENCH_HOST)
 
 
 def sha(data: bytes) -> str:
@@ -66,7 +72,25 @@ class DeployBachelorAgent(unittest.TestCase):
             "-Source", str(source if source is not None else self.source),
             *extra,
         ]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+
+    def start_of(self, pid: int) -> str:
+        """The UTC start time of a live process, as the agent's heartbeat writes it (processStartUtc)."""
+        return subprocess.run(
+            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % pid],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+
+    def live_agent(self, *script_args: str):
+        """A LIVE process that runs the venue's agent script the way the task does: `pwsh -NoProfile -File <agent> [args]`.
+        Returns (pid, utc start text). The command line is what Get-ProcessArgv reads (Win32_Process on Windows, /proc elsewhere)."""
+        p = subprocess.Popen([PWSH, "-NoProfile", "-File", str(self.venue / AGENT_NAME), *script_args])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        return p.pid, self.start_of(p.pid)
+
+    def write_beat(self, pid: int, start: str, agent: Path | None = None) -> None:
+        (self.venue / "heartbeat.txt").write_text(
+            'alive x pid=%d host=%s generation=1 processStartUtc=%s agentScript="%s"\r\n'
+            % (pid, BENCH_HOST, start, agent if agent is not None else self.venue / AGENT_NAME))
 
     def rollbacks(self) -> list[Path]:
         return sorted(self.venue.glob("rollback-*"))
@@ -283,8 +307,7 @@ class DeployBachelorAgent(unittest.TestCase):
     def test_a4_restart_is_bound_to_the_agent_whose_root_was_checked(self) -> None:
         # A4: a copied heartbeat (host matches, but agentScript is the LIVE agent's path) must not let an idle backup root
         # stand in for a busy live agent: the schtasks End would hit the live task.
-        import os
-        self._beat(os.environ.get("COMPUTERNAME", "HOST"), r"C:\live-agent\ultra-magnus-agent.ps1")
+        self._beat(BENCH_HOST, r"C:\live-agent\ultra-magnus-agent.ps1")
         r = self.run_deploy("-RestartMode", "when-idle")
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
@@ -292,25 +315,17 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assert_untouched()
 
     def test_a4_restart_refuses_when_the_heartbeat_process_is_not_alive(self) -> None:
-        import os
         done = subprocess.run([PWSH, "-NoProfile", "-Command", "$PID"], capture_output=True, text=True, timeout=60)
         dead_pid = int(done.stdout.strip())
-        self._beat(os.environ.get("COMPUTERNAME", "HOST"), str(self.venue / AGENT_NAME), pid=dead_pid)
+        self._beat(BENCH_HOST, str(self.venue / AGENT_NAME), pid=dead_pid)
         r = self.run_deploy("-RestartMode", "when-idle")
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
         self.assert_untouched()
 
     def test_a4_restart_refuses_when_the_task_does_not_run_this_roots_agent(self) -> None:
-        import os
-        me = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
-        self.addCleanup(lambda: (me.kill(), me.wait()))
-        start = subprocess.run(
-            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % me.pid],
-            capture_output=True, text=True, timeout=60).stdout.strip()
-        (self.venue / "heartbeat.txt").write_text(
-            'alive x pid=%d host=%s generation=1 processStartUtc=%s agentScript="%s"\r\n'
-            % (me.pid, os.environ.get("COMPUTERNAME", "HOST"), start, self.venue / AGENT_NAME))
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
         xml = Path(self._tmp.name) / "task.xml"
         xml.write_text('<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-File "C:\\live-agent\\ultra-magnus-agent.ps1"</Arguments></Exec></Actions></Task>')
         r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml))
@@ -321,7 +336,7 @@ class DeployBachelorAgent(unittest.TestCase):
 
     def _dot_source(self, body: str):
         cmd = ". '%s' -VenueRoot '%s'; %s" % (psq(SCRIPT), psq(self.venue), body)
-        return subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        return subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
 
     def _sleeper(self):
         """A live process that is not the deployer (the deployer is never its own replacement); returns (pid, utc start text)."""
@@ -397,15 +412,8 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(self._task_xml_case("malformed", mine, "<Task><Actions>"), "False")
 
     def test_b1_description_only_task_xml_refuses_end_to_end(self) -> None:
-        import os
-        me = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
-        self.addCleanup(lambda: (me.kill(), me.wait()))
-        start = subprocess.run(
-            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % me.pid],
-            capture_output=True, text=True, timeout=60).stdout.strip()
-        (self.venue / "heartbeat.txt").write_text(
-            'alive x pid=%d host=%s generation=1 processStartUtc=%s agentScript="%s"\r\n'
-            % (me.pid, os.environ.get("COMPUTERNAME", "HOST"), start, self.venue / AGENT_NAME))
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
         xml = Path(self._tmp.name) / "task-desc.xml"
         xml.write_text(
             "<Task><RegistrationInfo><Description>backup of %s</Description></RegistrationInfo><Actions><Exec><Command>pwsh.exe</Command>"
@@ -463,7 +471,7 @@ class DeployBachelorAgent(unittest.TestCase):
         # It must be DETECTED and typed (the agent's own startup recovery then adopts or requeues it).
         arriving = Path(self._tmp.name) / "arriving-restart.ps1"
         arriving.write_text(
-            "param([string]$VenueRoot)\r\nSet-Content -LiteralPath (Join-Path $VenueRoot 'inbox\\late.job.ps1') -Value 'x'\r\n", encoding="ascii")
+            "param([string]$VenueRoot)\r\nSet-Content -LiteralPath (Join-Path (Join-Path $VenueRoot 'inbox') 'late.job.ps1') -Value 'x'\r\n", encoding="ascii")
         r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(arriving))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("DEPLOY_WARN_ARRIVED_DURING_RESTART running=0 inbox=1", r.stdout)
@@ -604,16 +612,11 @@ class DeployBachelorAgent(unittest.TestCase):
         # pass 4 A5: the binding was proved before the deploy; a heartbeat rewritten without a start (PID 4 is a live system process)
         # must not be stopped. Invoke-AgentRestart re-proves the binding first; the task name is one that does not exist, so a regression
         # that reached schtasks could not touch a real task.
-        import os
-        me = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
-        self.addCleanup(lambda: (me.kill(), me.wait()))
-        start = subprocess.run(
-            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % me.pid],
-            capture_output=True, text=True, timeout=60).stdout.strip()
+        pid, start = self.live_agent()
         agent = self.venue / AGENT_NAME
-        good = 'alive x pid=%d host=BENCHTEST generation=1 processStartUtc=%s agentScript="%s"\r\n' % (me.pid, start, agent)
+        good = 'alive x pid=%d host=BENCHTEST generation=1 processStartUtc=%s agentScript="%s"\r\n' % (pid, start, agent)
         # the same live pid, but the heartbeat now carries NO processStartUtc: it no longer identifies a process
-        bad = 'alive x pid=%d host=BENCHTEST generation=1 agentScript="%s"\r\n' % (me.pid, agent)
+        bad = 'alive x pid=%d host=BENCHTEST generation=1 agentScript="%s"\r\n' % (pid, agent)
         xml = Path(self._tmp.name) / "task-p4a5.xml"
         xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
         beat = self.venue / "heartbeat.txt"
@@ -626,8 +629,7 @@ class DeployBachelorAgent(unittest.TestCase):
             "Copy-Item -LiteralPath '%s' -Destination '%s' -Force; "
             "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
         ) % (psq(SCRIPT), psq(self.venue), psq(xml), psq(agent), psq(later), psq(beat), psq(agent))
-        env = dict(os.environ, COMPUTERNAME="BENCHTEST")
-        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=env)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("first=bound", r.stdout)
         self.assertIn("why=the agent binding no longer holds, so nothing was stopped", r.stdout)
@@ -689,6 +691,127 @@ class DeployBachelorAgent(unittest.TestCase):
             self.assertIsNotNone(m, line)
             self.assertNotEqual(m.group(2), m.group(3), "alive and different are exact opposites for one pid and one start gap: " + line)
         self.assertEqual([re.match(r"d(\S+) alive=(\w+)", l).group(2) for l in lines], ["True", "True", "False"])
+
+    # ---- adversary pass 6 findings (A1..A3 of dea7c6ce): each test failed on dea7c6ce ----
+
+    def test_p6a1_a_rooted_path_without_a_drive_never_names_a_place_on_windows(self) -> None:
+        # pass 6 A1: "-Root /bench" is resolved against the CURRENT DRIVE of the process that reads it, so the task may serve D:\bench
+        # while C:\bench was checked idle. The switch is flipped inside one session so both readings run on any host.
+        body = (
+            "function T($p){ [string](Test-AbsolutePathText -P $p) };"
+            "$script:OnWindows=$true;"
+            "'win-slash='+(T '/bench'); 'win-backslash='+(T '\\bench'); 'win-drive='+(T 'C:\\bench'); 'win-drive-fwd='+(T 'C:/bench');"
+            "'win-unc='+(T '\\\\srv\\share\\x'); 'win-unc-fwd='+(T '//srv/share/x'); 'win-lone-unc='+(T '\\\\'); 'win-rel='+(T 'bench'); 'win-drive-rel='+(T 'C:bench');"
+            "$script:OnWindows=$false;"
+            "'posix-slash='+(T '/bench'); 'posix-rel='+(T 'bench')"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(
+            r.stdout.split(),
+            ["win-slash=False", "win-backslash=False", "win-drive=True", "win-drive-fwd=True", "win-unc=True", "win-unc-fwd=True",
+             "win-lone-unc=False", "win-rel=False", "win-drive-rel=False", "posix-slash=True", "posix-rel=False"], r.stdout + r.stderr)
+
+    def test_p6a1_a_task_whose_root_or_script_has_no_drive_does_not_bind_on_windows(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        for name, args in (("root-slash", "-NoProfile -File %s -Root /bench" % mine), ("root-backslash", "-NoProfile -File %s -Root \\bench" % mine),
+                           ("script-slash", "-NoProfile -File /bench/ultra-magnus-agent.ps1")):
+            xml = "<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>%s</Arguments></Exec></Actions></Task>" % args
+            f = Path(self._tmp.name) / ("task-p6a1-%s.xml" % name)
+            f.write_text(xml, encoding="utf-8")
+            r = self._dot_source("$script:OnWindows=$true; Test-TaskXmlRunsScript -Xml (Get-Content -Raw -LiteralPath '%s') -AgentScript '%s'" % (psq(f), psq(mine)))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(r.stdout.strip(), "False", name)
+        # the same drive-less text is legitimate off Windows, where "/" is the root of the one filesystem
+        xml = "<Task><Actions><Exec><Command>pwsh</Command><Arguments>-NoProfile -File /bench/ultra-magnus-agent.ps1 -Root /bench</Arguments></Exec></Actions></Task>"
+        f = Path(self._tmp.name) / "task-p6a1-posix.xml"
+        f.write_text(xml, encoding="utf-8")
+        r = self._dot_source("$script:OnWindows=$false; Test-TaskXmlRunsScript -Xml (Get-Content -Raw -LiteralPath '%s') -AgentScript '/bench/ultra-magnus-agent.ps1'" % psq(f))
+        self.assertEqual(r.stdout.strip(), "True", r.stdout + r.stderr)
+
+    def test_p6a1_no_path_check_is_spelled_out_a_second_time(self) -> None:
+        # sibling sweep: the inline drive-or-slash regex that sat in Test-TaskXmlRunsScript is the same decision as Test-AbsolutePathText
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(code.count("[A-Za-z]:[\\\\/]"), 1, "one place decides what an absolute path is")
+
+    def test_p6a2_the_replacement_must_start_after_run_with_no_tolerance(self) -> None:
+        # pass 6 A2: a process that began 1 s before /Run is not the replacement (the old code let it in: start - 2 s tolerance)
+        pid, s = self._sleeper()
+        body = (
+            "$s='%s'; $a='%s'; $sp=%d;"
+            "function B($p,$st,$sc){ [pscustomobject]@{pid=$p;host=$env:COMPUTERNAME;start=$st;agentScript=$sc;ageSec=1} };"
+            "$st=[DateTimeOffset]::Parse($s,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime;"
+            "'started-1s-before-run='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -NotBeforeUtc $st.AddSeconds(1));"
+            "'started-0.5s-before-run='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -NotBeforeUtc $st.AddSeconds(0.5));"
+            "'started-after-run='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -NotBeforeUtc $st.AddSeconds(-0.5));"
+            # the heartbeat CLAIMS a later start (within the same-process tolerance) than the OS reports: the OS value decides
+            "$claim=$st.AddSeconds(1.5).ToString('o');"
+            "'claim-later-than-os='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $claim $a) -AgentScript $a -NotBeforeUtc $st.AddSeconds(1))"
+        ) % (s, psq(self.venue / AGENT_NAME), pid)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(
+            r.stdout.split(),
+            ["started-1s-before-run=False", "started-0.5s-before-run=False", "started-after-run=True", "claim-later-than-os=False"], r.stdout + r.stderr)
+
+    def test_p6a2_the_started_after_run_compare_has_no_tolerance_term(self) -> None:
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertIsNone(re.search(r"AddSeconds\(-\$script:StartToleranceSec\)", code), "no tolerance subtracted from a 'newer than' bound")
+
+    def test_p6a3_the_live_process_command_line_is_what_binds(self) -> None:
+        # pass 6 A3: the task DEFINITION says -File <agent> (bound), but the RUNNING instance was started with -Root C:\other-root, so
+        # ending the task stops an agent serving another root. The live command line is read from the OS and must bind too.
+        pid, start = self.live_agent("-Root", r"C:\other-root")
+        self.write_beat(pid, start)
+        xml = Path(self._tmp.name) / "task-p6a3.xml"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>"
+                       % (self.venue / AGENT_NAME), encoding="utf-8")
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml))
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assertIn("pid=%d" % pid, r.stdout)
+        self.assertIn("command line", r.stdout)
+        self.assert_untouched()
+
+    def test_p6a3_a_live_process_serving_this_root_binds_and_others_do_not(self) -> None:
+        xml = Path(self._tmp.name) / "task-p6a3b.xml"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>"
+                       % (self.venue / AGENT_NAME), encoding="utf-8")
+        agent = self.venue / AGENT_NAME
+        verdicts = {}
+        for name, args in (("no-root-arg", ()), ("same-root", ("-Root", str(self.venue))), ("other-root", ("-Root", r"C:\other-root")),
+                           ("positional-root", (r"C:\other-root",)), ("verbose", ("-Verbose",))):
+            pid, start = self.live_agent(*args)
+            self.write_beat(pid, start)
+            cmd = (". '%s' -VenueRoot '%s' -TaskXmlFile '%s'; $x = Get-RestartBindingRefusal -AgentScript '%s'; if ($null -eq $x) { 'bound' } else { 'refused:' + $x }"
+                   % (psq(SCRIPT), psq(self.venue), psq(xml), psq(agent)))
+            r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            verdicts[name] = r.stdout.strip().split(":")[0]
+        self.assertEqual(verdicts, {"no-root-arg": "bound", "same-root": "bound", "other-root": "refused", "positional-root": "refused", "verbose": "refused"})
+
+    def test_p6a3_a_process_whose_command_line_cannot_be_read_is_refused_not_assumed(self) -> None:
+        # the pid is gone (or unreadable): the root it served is unconfirmed, so the answer is a refusal, never "bound"
+        done = subprocess.run([PWSH, "-NoProfile", "-Command", "$PID"], capture_output=True, text=True, timeout=60)
+        r = self._dot_source("$a = Get-ProcessArgvBounded -ProcessId %d; if ($null -eq $a) { 'null' } else { 'ok=' + $a.ok }" % int(done.stdout.strip()))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(r.stdout.strip(), ("null", "ok=False"))
+
+    def test_p6a3_the_replacement_is_also_checked_by_its_own_command_line(self) -> None:
+        # sibling of A3 at the OTHER place the live agent is named: the replacement that /Run started must itself run this script and root
+        pid_ok, s_ok = self.live_agent()
+        pid_other, s_other = self.live_agent("-Root", r"C:\other-root")
+        agent = psq(self.venue / AGENT_NAME)
+        body = (
+            "$a='%s';"
+            "function B($p,$st){ [pscustomobject]@{pid=$p;host=$env:COMPUTERNAME;start=$st;agentScript=$a;ageSec=1} };"
+            "'ok='+(Test-NewHeartbeatIsLiveAgent -Beat (B %d '%s') -AgentScript $a -CheckCommandLine);"
+            "'other-root='+(Test-NewHeartbeatIsLiveAgent -Beat (B %d '%s') -AgentScript $a -CheckCommandLine);"
+            "'other-root-unchecked='+(Test-NewHeartbeatIsLiveAgent -Beat (B %d '%s') -AgentScript $a)"
+        ) % (agent, pid_ok, s_ok, pid_other, s_other, pid_other, s_other)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["ok=True", "other-root=False", "other-root-unchecked=True"], r.stdout + r.stderr)
 
     def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
         # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.
