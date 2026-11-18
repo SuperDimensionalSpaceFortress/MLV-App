@@ -2116,6 +2116,7 @@ from tools.repo_hygiene.app_play_scan import (  # noqa: E402
     LOOP_OFF_ENTRY_MARKERS,
     PINNED_EVENT_SITES,
     PINNED_HELPER_BODIES,
+    PINNED_KEY_SPACE_BINDINGS,
     PLAY_SOURCES,
     REVIEWED_PROGRAMMATIC_PLAY_SITES,
     REVIEWED_PROGRAMMATIC_STOP_SITES,
@@ -2362,6 +2363,66 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
 
     def test_the_two_pinned_postevent_sites_pass(self) -> None:
         self.assertEqual(self._event_dispatch_problems(dict(self._PINNED_POST_FIXTURE)), [])
+
+    # -- PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one key table -------------
+    # (PlayerShortcutBinding::bindings(); before, MainWindow.ui carried it). A binding is not an event: exactly the
+    # reviewed expression, at the reviewed path and count, is exempt from the synthesized-key scan. Nothing else is.
+
+    _SPACE_TABLE = "platform/qt/PlayerShortcutBinding.h"
+    _SPACE_BINDING = ("inline void t() { table << ActionBinding{ QStringLiteral( \"actionPlay\" ),\n"
+                      "    { { QKeySequence( Qt::Key_Space ), KeyKind::Primary } } }; }\n")
+
+    @staticmethod
+    def _key_synth_problems(sources: dict[str, str]) -> list[str]:
+        # Fixture text is not a whole tree, so the other scans report it; only the key-synthesis rows are under test.
+        return [p for p in scan_app_play_sources(sources) if "synthesized key event" in p or "Space shortcut binding" in p]
+
+    def test_the_space_binding_pin_is_exactly_the_one_reviewed_site(self) -> None:
+        self.assertEqual(PINNED_KEY_SPACE_BINDINGS, {"platform/qt/PlayerShortcutBinding.h": 1})
+
+    def test_the_reviewed_space_shortcut_binding_passes(self) -> None:
+        self.assertEqual(self._key_synth_problems({self._SPACE_TABLE: self._SPACE_BINDING}), [])
+
+    def test_the_real_key_table_holds_exactly_the_reviewed_binding(self) -> None:
+        self.assertIn(self._SPACE_TABLE, self.sources)
+        blank, _ = strip_cpp(self.sources[self._SPACE_TABLE])
+        self.assertEqual(len(re.findall(r"\bKey_Space\b", blank)), 1)
+        self.assertEqual(len(re.findall(r"\bQKeySequence\s*\(\s*Qt\s*::\s*Key_Space\s*\)", blank)), 1)
+
+    def test_a_second_space_binding_in_the_key_table_fails(self) -> None:
+        text = self._SPACE_BINDING + "inline QKeySequence u() { return QKeySequence( Qt::Key_Space ); }\n"
+        problems = self._key_synth_problems({self._SPACE_TABLE: text})
+        self.assertEqual(sum("synthesized key event" in p for p in problems), 2, problems)
+        self.assertIn(f"{self._SPACE_TABLE}: 2 Space shortcut binding(s), 1 reviewed "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+
+    def test_a_space_binding_in_any_other_file_fails(self) -> None:
+        for path in ("platform/qt/MainWindow.cpp", "platform/qt/OtherWidget.h", "src/batch/Thing.cpp"):
+            with self.subTest(path):
+                problems = self._key_synth_problems({path: self._SPACE_BINDING})
+                self.assertIn(f"{path}:2: synthesized key event (the Play shortcut is Space)", problems)
+
+    def test_every_other_space_key_in_the_key_table_still_fails(self) -> None:
+        others = {
+            "a synthesized Space key event": "QKeyEvent press( QEvent::KeyPress, Qt::Key_Space, Qt::NoModifier );",
+            "a heap Space key event": "auto *e = new QKeyEvent( QEvent::KeyPress, Qt::Key_Space, {} );",
+            "a bare Space key code": "const int k = Qt::Key_Space;",
+            "a modified Space binding": "const QKeySequence s( QKeySequence( Qt::SHIFT | Qt::Key_Space ) );",
+            "a QTest key click": "QTest::keyClick( w, Qt::Key_Space );",
+        }
+        for name, injected in others.items():
+            with self.subTest(name):
+                text = self._SPACE_BINDING + "inline void v() { " + injected + " }\n"
+                problems = self._key_synth_problems({self._SPACE_TABLE: text})
+                self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:3: synthesized key event") for p in problems),
+                                problems)
+
+    def test_the_binding_exemption_needs_the_exact_expression(self) -> None:
+        # A Key_Space merely NEAR a QKeySequence is not the reviewed expression.
+        for text in ("QKeySequence( Qt::Key_Space + 0 )", "QKeySequence( k ), Qt::Key_Space", "QKeySequence( Key_Space )"):
+            with self.subTest(text):
+                problems = self._key_synth_problems({self._SPACE_TABLE: "inline void w() { f( " + text + " ); }\n"})
+                self.assertTrue(any("synthesized key event" in p for p in problems), problems)
 
     def test_a_third_postevent_fails_the_scan(self) -> None:
         third = "\nvoid h() { QCoreApplication::postEvent( this, new QKeyEvent( QEvent::KeyPress, 0, {} ) ); }\n"

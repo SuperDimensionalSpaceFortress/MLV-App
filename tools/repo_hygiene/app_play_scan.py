@@ -249,6 +249,13 @@ _HANDLER_START = re.compile(r"\bon_actionPlay_(?:triggered|toggled)\s*\(\s*(?!fa
 _SET_PLAYING = re.compile(r"\bsetPlaying\s*\(")
 _INVOKE_METHOD = re.compile(r"\binvokeMethod\s*\([^;]*?\w*[Aa]ctionPlay\w*")
 _KEY_SYNTH = re.compile(r"\bQKeyEvent\s*(?:\w+\s*)?\(|\bKey_Space\b|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
+# PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
+# (PlayerShortcutBinding::bindings(), handed to QAction::setShortcuts(); before, MainWindow.ui carried it). A binding is
+# not an event. Only the exact expression ``QKeySequence( Qt::Key_Space )``, at the reviewed path and EXACT count, is
+# exempt from the synthesized-key scan; a second binding, a binding in another file, a modified-Space sequence or a
+# QKeyEvent / QTest call built with Key_Space still fails.
+PINNED_KEY_SPACE_BINDINGS = {"platform/qt/PlayerShortcutBinding.h": 1}
+_SPACE_BINDING = re.compile(r"\bQKeySequence\s*\(\s*Qt\s*::\s*Key_Space\s*\)")
 _EVENT_POST = re.compile(r"\b(?:postEvent|sendEvent|sendSpontaneousEvent)\s*\(")
 # The event dispatches that exist today: MyApplication's event filter forwarding to the main window, and the two
 # Look Assist analysis holds, which re-post at landing a clone of an event the user or the OS already delivered
@@ -523,7 +530,16 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             problems.append(f"{path}:{_line_of(blank, match.start())}: setPlaying( call")
         for match in _INVOKE_METHOD.finditer(keep):
             problems.append(f"{path}:{_line_of(keep, match.start())}: invokeMethod naming the Play action")
+        space_bindings = [(m.start(), m.end()) for m in _SPACE_BINDING.finditer(blank)]
+        reviewed_bindings = PINNED_KEY_SPACE_BINDINGS.get(path, 0)
+        bindings_reviewed = len(space_bindings) == reviewed_bindings
+        if space_bindings and not bindings_reviewed:
+            problems.append(f"{path}: {len(space_bindings)} Space shortcut binding(s), {reviewed_bindings} reviewed "
+                            "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)")
         for match in _KEY_SYNTH.finditer(blank):
+            if bindings_reviewed and match.group(0) == "Key_Space" and any(
+                    start <= match.start() < end for start, end in space_bindings):
+                continue
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
         for match in _EVENT_POST.finditer(blank):
             key = (path, re.sub(r"\W", "", match.group(0)))
