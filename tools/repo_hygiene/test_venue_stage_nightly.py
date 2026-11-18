@@ -109,6 +109,8 @@ switch ($env:FAKE_ASSEMBLE) {
     'slot-busy' { "BUILD_SLOT_BUSY label=attr3-assemble:$($SourceCommit.Substring(0, 12)) heldBy=[pid=1 label=peer] waitedSec=1200 utc=fixture"; exit 3 }
     'fail' { 'RESULT=ASSEMBLE_FAILED STEP=make EXIT=15'; exit 15 }
     'sleep' { Start-Sleep -Seconds 300; exit 0 }
+    # slow (VENUE-NIGHTLY-MONOTONIC-DEADLINE-1): FAKE_ASSEMBLE_SLEEP seconds late, then a normal assemble (no exit: it falls through)
+    'slow' { Start-Sleep -Seconds ([int]$env:FAKE_ASSEMBLE_SLEEP) }
 }
 $s = $SourceCommit.Substring(0, 12)
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -1662,6 +1664,61 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertFalse(pid_alive(pid), "the assembler outlived the cap")
         self.assertEqual(self.submissions(), [])
 
+    # ---------------------------------------------------------------- VENUE-NIGHTLY-MONOTONIC-DEADLINE-1: a backward wall-clock step never re-grants the cap
+    # -TestClockStepBackSec 3600 makes every wall-clock read the driver makes after its deadline is armed 3600 s EARLIER (an NTP correction, a VM resume, a
+    # manual set); each case below uses a step larger than the whole budget. The driver's children and the share module read the REAL clock, so only what
+    # the driver itself decides (and the bound it prints or passes before the child starts) is judged here.
+    BACK = "3600"
+
+    def test_a_backward_clock_step_never_re_grants_the_cap_to_a_running_child(self) -> None:
+        # (a) a 10 s cap, an assembler that needs 70 s: the cap ends it at 10 s whatever the wall clock says. A wall-clock budget found 3610 s left and waited it out.
+        self.built_dll_pair()
+        t0 = time.monotonic()
+        p = self.run_driver("-MaxTotalSec", "10", "-TestClockStepBackSec", self.BACK, env={"FAKE_ASSEMBLE": "slow", "FAKE_ASSEMBLE_SLEEP": "70"}, timeout=200)
+        took = time.monotonic() - t0
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertLess(took, 55, f"the call ran {took:.0f} s under a 10 s cap: the step re-granted it\n{p.stdout}")
+        self.assertIn("the assembler was still running at the 10 s cap and was killed", p.stdout)
+        self.assertEqual(self.submissions(), [])
+
+    def test_a_backward_clock_step_never_lets_an_answer_after_the_true_deadline_be_acted_on(self) -> None:
+        # (b) the soundness read's cap is sampled, a 12 s scheduling delay follows, and the true 10 s deadline passes before the read is made. With a wall-clock
+        # budget the step read as 3598 s left, so the dead read was an ordinary unreachable share (exit 41); the cap really ran out, so it is STAGE_CAP_EXCEEDED.
+        self.stage_cache()
+        p = self.run_driver("-MaxTotalSec", "10", "-TestClockStepBackSec", self.BACK, "-TestSoundnessPostCapDelayMs", "12000", "-TestSoundnessCapAt", "first",
+                            probe="5", timeout=200)
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertNotIn("STAGE_SKIP_ALREADY", [r["outcome"] for r in self.rows()])
+        self.nothing_built_or_submitted()
+
+    def test_a_backward_step_between_the_hand_off_and_the_modules_sample_never_re_grants_the_soundness_read(self) -> None:
+        # adversary A1 on c253316d: Sync-NightlyDeadline projects the monotonic budget into a UTC instant, and VenueChain.psm1 reads it back against ITS wall clock. A
+        # correction landing in that gap (-TestWallStepAfterSyncSec -60) made the module see 60 s more than was left, and the stale -CallCapSec (sampled before the
+        # 12 s scheduling delay) was all that bounded the stuck read: it ran 17 s from a point with 5 s left. The hand-off now also carries the Stopwatch and its end
+        # (-CallBudgetClock/-CallBudgetEndSec, the lease batch's form), which no wall clock can move, so the read ends at the 20 s cap.
+        self.stage_cache()
+        p = self.run_driver("-MaxTotalSec", "20", "-TestSoundnessPostCapDelayMs", "12000", "-TestSoundnessReadDelayMs", "600000", "-TestWallStepAfterSyncSec", "-60",
+                            "-TestSoundnessCapAt", "first", probe="20", timeout=200)
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        total = self.result(p.stdout)["timings"]["totalSec"]
+        self.assertLess(total, 24.0, f"the call ran {total} s under a 20 s cap: the step re-granted the read\n{p.stdout}")
+        self.nothing_built_or_submitted()
+
+    def test_a_backward_clock_step_never_hands_a_child_a_later_bound_than_the_true_remaining_budget(self) -> None:
+        # (c) the assembler's heavy-slot bound is an absolute instant in the (stepped) wall clock: now + what is left on the monotonic clock. The original
+        # start + 600 s instant is 3600 s LATER than that in the stepped clock, which is the extra wait a child would be given.
+        self.built_dll_pair()
+        before = datetime.now(timezone.utc)
+        p = self.run_driver("-MaxTotalSec", "600", "-TestClockStepBackSec", self.BACK)
+        self.assertEqual(len(self.calls("ASSEMBLE")), 1, p.stdout + p.stderr)
+        raw = re.search(r" hsdeadline=(\S+)$", self.calls("ASSEMBLE")[0]).group(1)
+        m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d+)Z", raw)
+        self.assertIsNotNone(m, raw)
+        got = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) + timedelta(microseconds=int(m.group(2)[:6]))
+        true_end = before + timedelta(seconds=600 - int(self.BACK))
+        self.assertLessEqual(got, true_end + timedelta(seconds=15), f"{raw}: later than start + 600 s on the monotonic clock ({true_end:%H:%M:%S}, stepped back {self.BACK} s)")
+        self.assertGreaterEqual(got, true_end - timedelta(seconds=5), f"{raw}: earlier than the budget really left")
+
     # ---------------------------------------------------------------- static guards
     def test_the_driver_never_deletes_enumerates_schedules_or_starts_the_app(self) -> None:
         text = DRIVER.read_text(encoding="utf-8")
@@ -1677,6 +1734,25 @@ class VenueStageNightlyTests(unittest.TestCase):
 
 class SoundnessReadCapNeverZeroTests(unittest.TestCase):
     # r9 (Grok G12 on #814): source-text tests, so no @requires_windows_pwsh; they run on every runner
+    def test_monotonic_budget_no_decision_subtracts_the_wall_clock(self) -> None:
+        # VENUE-NIGHTLY-MONOTONIC-DEADLINE-1: the budget ("time left", "past the deadline", "elapsed", every timings.*Sec) reads the Stopwatch through the one
+        # helper; the absolute $script:Deadline is only what is HANDED OUT. The wall clock has ONE read (Get-WallUtc) and is never subtracted from or against a deadline.
+        text = DRIVER.read_text(encoding="utf-8")
+        code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(code.count("[DateTime]::UtcNow"), 1, "the wall clock has one read, inside Get-WallUtc")
+        self.assertIn("function Get-WallUtc", code)
+        self.assertIn("[Diagnostics.Stopwatch]::StartNew()", code)
+        self.assertEqual(re.findall(r"\$script:Deadline\s*-\s*\(Get-WallUtc\)|\(Get-WallUtc\)\s*-\s*\$script:Deadline", code), [], "a budget decision subtracts the wall clock from the deadline")
+        self.assertEqual(re.findall(r"\(\(Get-WallUtc\)\s*-\s*\$(?:t0|startedUtc)\)", code), [], "a duration is taken from the wall clock")
+        left = re.search(r"(?m)^function Get-NightlyLeftSec \{(.*)\}\s*$", code)
+        self.assertIsNotNone(left, "the one helper every budget site reads")
+        self.assertNotIn("Get-WallUtc", left.group(1))
+        self.assertGreaterEqual(code.count("Get-NightlyLeftSec"), 10)
+        # adversary A1 on c253316d: every soundness read is also handed the monotonic budget (a wall clock stepping between the UTC projection and the module's sample cannot move it)
+        calls = [l for l in code.splitlines() if "Get-VenueStagedBuildManifest -AgentShare" in l]
+        self.assertTrue(calls)
+        self.assertTrue(all("-CallBudgetClock $script:Sw -CallBudgetEndSec $script:BudgetSec" in l for l in calls), calls)
+
     def test_r9_g13_the_soundness_read_refusals_name_what_was_submitted_per_path(self) -> None:
         # Grok G13: the final verify runs after the stage job was submitted, so its refusals never say "nothing was submitted"; step 4 and step 8 still do.
         text = DRIVER.read_text(encoding="utf-8")
@@ -1883,6 +1959,7 @@ class StageNotAfterTypedExitTests(unittest.TestCase):
             "function Assert-VenueFree { param($w) }\n"
             "function Assert-StagePackageSideFile { param($Side, $JobId, $FailToken) }\n"
             "function Get-RemainingSec { 600 }\n"
+            "function Sync-NightlyDeadline { }\n"   # VENUE-NIGHTLY-MONOTONIC-DEADLINE-1: the real one re-derives $script:Deadline from the monotonic budget; here the fixture sets it
             "function Say { param($m) [Console]::Out.WriteLine(\"SAY $m\") }\n"
             "function Invoke-Child { [Console]::Out.WriteLine('CHILD_STARTED'); [pscustomobject]@{ timedOut = $false; exit = 0; out = 'UMRUN_RETURNED'; err = '' } }\n"
             "function Stop-Nightly([string]$Reason, [string]$Detail = '') { [Console]::Out.WriteLine(\"STOP $Reason $Detail\"); exit 50 }\n"
