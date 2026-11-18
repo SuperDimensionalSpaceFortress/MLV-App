@@ -76,7 +76,7 @@ foreach ($name in @('Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'ConvertFr
 $script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
 $script:LeaseSnapshotProbeSec = 30
 # BACHELOR-LEASE-BATCH-LEGS-1 r5: Invoke-QueuedJob and the lease wait call the lease-batch block (no batch is open here); lifted when present.
-foreach ($name in @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Test-LeaseBatchClosePending', 'Get-QuietLeaseRemainingSec', 'Get-QuietLeaseRenewOkGapSec',
+foreach ($name in @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Test-LeaseBatchClosePending', 'Get-QuietLeaseRemainingSec', 'Get-QuietLeaseRenewOkGapSec', 'ConvertTo-RenewGapCeilingSec',
         'Get-LeaseBatchAdmission', 'Open-LeaseBatch', 'Use-LeaseBatchForJob', 'Get-LeaseBatchJobStop', 'Complete-LeaseBatchJob', 'Write-LeaseBatchReceipt', 'Close-LeaseBatch',
         'Close-LeaseBatchAfterRelease', 'Sync-LeaseBatchForJob')) {
     $fn = Find-Function $name
