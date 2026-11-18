@@ -214,8 +214,18 @@ function Wait-Until {
     }
 }
 
+function Test-AbsolutePathText {
+    # A drive path, a UNC path or a rooted POSIX path. A relative path is resolved against a working directory this script cannot
+    # see for another process (a task's WorkingDirectory, the agent's own cwd), so it never counts as naming a place.
+    param([string]$P)
+    return ($P -match '^([A-Za-z]:[\\/]|\\\\|/)')
+}
+
 function Test-SamePath {
+    # Two ABSOLUTE paths that name the same place (case-insensitive, a trailing separator ignored). A relative path on either side is
+    # never "the same": it would be resolved against this process's cwd, which is not where the other process resolves it.
     param([string]$A, [string]$B)
+    if (-not (Test-AbsolutePathText -P $A) -or -not (Test-AbsolutePathText -P $B)) { return $false }
     try {
         $x = [System.IO.Path]::GetFullPath($A).TrimEnd('\', '/')
         $y = [System.IO.Path]::GetFullPath($B).TrimEnd('\', '/')
@@ -345,11 +355,19 @@ function Test-AgentProcessAlive {
 }
 
 function Test-NewHeartbeatIsLiveAgent {
-    # A restart is confirmed only by a heartbeat from a process that EXISTS with the recorded start time and runs this root's script.
-    param($Beat, [string]$AgentScript)
+    # A restart is confirmed only by a heartbeat from a process that EXISTS with the recorded start time, names THIS machine and this
+    # root's script, is not this deployer, and (with -NotBeforeUtc) was STARTED at or after the moment the task was started: a
+    # process that was already running when /Run was issued is not the replacement, whatever its heartbeat claims.
+    param($Beat, [string]$AgentScript, $NotBeforeUtc = $null)
     if ($null -eq $Beat) { return $false }
     if ([string]::IsNullOrWhiteSpace($Beat.start)) { return $false }
+    if (-not [string]::Equals($Beat.host, $env:COMPUTERNAME, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ($Beat.pid -eq $PID) { return $false }
     if (-not (Test-SamePath -A $Beat.agentScript -B $AgentScript)) { return $false }
+    if ($null -ne $NotBeforeUtc) {
+        try { if ((ConvertTo-UtcStart -Text $Beat.start) -lt ([datetime]$NotBeforeUtc).AddSeconds(-$script:StartToleranceSec)) { return $false } }
+        catch { return $false }
+    }
     return (Test-AgentProcessAlive -Beat $Beat -RequireStart)
 }
 
@@ -391,7 +409,9 @@ function Split-TaskArguments {
             $inQuote = -not $inQuote; $has = $true; $i++
             continue
         }
-        if ((-not $inQuote) -and [char]::IsWhiteSpace($ch)) {
+        # Windows separates arguments at a space or a tab ONLY: a no-break space (U+00A0), a newline or any other Unicode space stays
+        # inside the argument, so splitting on it would show a command line the process never receives
+        if ((-not $inQuote) -and ($ch -eq [char]' ' -or $ch -eq [char]9)) {
             if ($has) { $tokens.Add($sb.ToString()); [void]$sb.Clear(); $has = $false }
             $i++
             continue
@@ -544,12 +564,13 @@ function Invoke-AgentRestart {
     $gone = Wait-Until -TimeoutSec 30 -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
     if (-not $gone) { return @{ why = "agent pid $($before.pid) still alive 30 s after schtasks /End"; warn = $null } }
     $warn = Get-ArrivalWarning
+    $runAt = [DateTime]::UtcNow
     $run = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName) -TimeoutSec 30
     if ($run.timedOut) { return @{ why = "schtasks /Run $TaskName did not return within 30 s"; warn = $warn } }
     if ($run.exitCode -ne 0) { return @{ why = "schtasks /Run $TaskName exited $($run.exitCode)"; warn = $warn } }
-    $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript } -Condition {
+    $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript; runAt = $runAt } -Condition {
         $now = Read-Heartbeat
-        ($null -ne $now) -and ($now.ageSec -lt 30) -and (Test-BeatIsDifferentProcess -Old $before -New $now) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript)
+        ($null -ne $now) -and ($now.ageSec -lt 30) -and (Test-BeatIsDifferentProcess -Old $before -New $now) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $runAt)
     } -PollMs 1000
     if (-not $up) { return @{ why = 'no heartbeat from a new LIVE agent process within 60 s of schtasks /Run'; warn = $warn } }
     return @{ why = $null; warn = $warn }

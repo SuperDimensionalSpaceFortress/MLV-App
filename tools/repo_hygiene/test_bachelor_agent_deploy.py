@@ -323,23 +323,41 @@ class DeployBachelorAgent(unittest.TestCase):
         cmd = ". '%s' -VenueRoot '%s'; %s" % (psq(SCRIPT), psq(self.venue), body)
         return subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
 
+    def _sleeper(self):
+        """A live process that is not the deployer (the deployer is never its own replacement); returns (pid, utc start text)."""
+        me = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
+        self.addCleanup(lambda: (me.kill(), me.wait()))
+        start = subprocess.run(
+            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % me.pid],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        return me.pid, start
+
     def test_a5_a_new_heartbeat_confirms_a_restart_only_for_a_live_matching_process(self) -> None:
         # A5: a heartbeat written by an agent that already died is not a restart.
+        # pass 5 A3: nor is one that names another machine, is the deployer itself, or was started before the task was.
+        pid, s = self._sleeper()
         body = (
-            "$me=Get-Process -Id $PID; $s=$me.StartTime.ToUniversalTime().ToString('o'); $a='%s';"
-            "function B($p,$st,$sc){ [pscustomobject]@{pid=$p;host='H';start=$st;agentScript=$sc;ageSec=1} };"
-            "'live='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID $s $a) -AgentScript $a);"
+            "$s='%s'; $a='%s'; $sp=%d;"
+            "function B($p,$st,$sc,$h=$env:COMPUTERNAME){ [pscustomobject]@{pid=$p;host=$h;start=$st;agentScript=$sc;ageSec=1} };"
+            "'live='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a);"
             "'dead='+(Test-NewHeartbeatIsLiveAgent -Beat (B 2147480000 $s $a) -AgentScript $a);"
-            "'wrongstart='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID '2001-01-01T00:00:00.0000000Z' $a) -AgentScript $a);"
-            "'nostart='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID '' $a) -AgentScript $a);"
-            "'wrongscript='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID $s 'C:\\other.ps1') -AgentScript $a);"
-            "'null='+(Test-NewHeartbeatIsLiveAgent -Beat $null -AgentScript $a)"
-        ) % psq(self.venue / AGENT_NAME)
+            "'wrongstart='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp '2001-01-01T00:00:00.0000000Z' $a) -AgentScript $a);"
+            "'nostart='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp '' $a) -AgentScript $a);"
+            "'wrongscript='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s 'C:\\other.ps1') -AgentScript $a);"
+            "'null='+(Test-NewHeartbeatIsLiveAgent -Beat $null -AgentScript $a);"
+            "'foreignhost='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a 'SOME-OTHER-HOST') -AgentScript $a);"
+            "$me=Get-Process -Id $PID; $ms=$me.StartTime.ToUniversalTime().ToString('o');"
+            "'deployer='+(Test-NewHeartbeatIsLiveAgent -Beat (B $PID $ms $a) -AgentScript $a);"
+            "$st=[DateTimeOffset]::Parse($s,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime;"
+            "'ranbefore='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -NotBeforeUtc $st.AddSeconds(-30));"
+            "'ranafter='+(Test-NewHeartbeatIsLiveAgent -Beat (B $sp $s $a) -AgentScript $a -NotBeforeUtc $st.AddSeconds(30))"
+        ) % (s, psq(self.venue / AGENT_NAME), pid)
         r = self._dot_source(body)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(
             r.stdout.split(),
-            ["live=True", "dead=False", "wrongstart=False", "nostart=False", "wrongscript=False", "null=False"], r.stdout + r.stderr)
+            ["live=True", "dead=False", "wrongstart=False", "nostart=False", "wrongscript=False", "null=False",
+             "foreignhost=False", "deployer=False", "ranbefore=True", "ranafter=False"], r.stdout + r.stderr)
 
     def test_a6_waits_are_bounded_by_a_monotonic_clock(self) -> None:
         # A6: Get-Date moves with the wall clock; a step back of an hour would stretch a 60 s wait to an hour.
@@ -504,6 +522,34 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(self._exec_task_case("root-same-abbrev", "pwsh.exe", base + " -Roo C:\\BENCH"), "True")
         self.assertEqual(self._exec_task_case("root-same-slash", "pwsh.exe", base + " -Root C:\\bench\\"), "True")
         self.assertEqual(self._exec_task_case("root-same-quoted-slash", "pwsh.exe", base + " -Root &quot;c:\\BENCH\\\\&quot;"), "True")
+
+    def test_p5a1_a_relative_path_never_names_a_place(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        base = "-NoProfile -File %s" % mine
+        # pass 5 A1: -Root . resolves against the TASK's working directory, which this process cannot see
+        for name, root in (("dot", "."), ("dotdot", "..\\bench"), ("bare", "bench"), ("drive-relative", "C:bench"), ("tilde", "~")):
+            self.assertEqual(self._exec_task_case("root-rel-" + name, "pwsh.exe", base + " -Root " + root), "False", root)
+        # the same class at the other sites that compare paths: a relative path is never "the same" as the absolute one in this cwd
+        body = (
+            "Set-Location -LiteralPath '%s';"
+            "'rel='+(Test-SamePath -A 'ultra-magnus-agent.ps1' -B '%s');"
+            "'reldot='+(Test-SamePath -A '.' -B '%s');"
+            "'abs='+(Test-SamePath -A '%s' -B '%s')"
+        ) % (psq(self.venue), psq(self.venue / AGENT_NAME), psq(self.venue), psq(self.venue), psq(str(self.venue) + "\\"))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["rel=False", "reldot=False", "abs=True"], r.stdout + r.stderr)
+        self.assertEqual(self._exec_task_case("script-rel", "pwsh.exe", "-NoProfile -File .\\ultra-magnus-agent.ps1"), "False")
+
+    def test_p5a2_only_a_space_or_a_tab_separates_task_arguments(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        # pass 5 A2: U+00A0 is not a separator for CreateProcess; "-NoProfile<NBSP>-File" is ONE argument, so the script never runs
+        self.assertEqual(self._exec_task_case("nbsp", "pwsh.exe", "-NoProfile&#160;-File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("nbsp-after-file", "pwsh.exe", "-NoProfile -File&#160;%s" % mine), "False")
+        self.assertEqual(self._exec_task_case("newline", "pwsh.exe", "-NoProfile&#10;-File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("ideographic", "pwsh.exe", "-NoProfile&#12288;-File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("tab", "pwsh.exe", "-NoProfile&#9;-File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("two-spaces", "pwsh.exe", "-NoProfile  -File %s" % mine), "True")
 
     def test_p4a6_the_task_arguments_are_decoded_as_windows_decodes_them(self) -> None:
         mine = r"C:\bench\ultra-magnus-agent.ps1"
