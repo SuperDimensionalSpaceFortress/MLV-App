@@ -58,31 +58,42 @@ inline bool windowToScene( const QPointF &windowPos, const QSizeF &window, const
         && windowPos.y() >= r.top() && windowPos.y() < r.bottom();
 }
 
-// How far, in scene pixels, a pick may land outside the scene and still count as its edge
-// pixel. The scene is an integer size (drawFrameReady sets it from int sceneWidth and
-// sceneHeight), while paintGL letterboxes with the display aspect it was handed (for the CUDA
-// texture route, the clip's own stretched size), so the two pictures differ by less than one
-// scene pixel in total, under half a scene pixel per edge (adversary A3, r1). The mapper has
-// no read of paintGL's display size (GpuDisplayWindow exposes none), so it allows that bound.
-inline constexpr double sceneEdgeSlack() { return 0.5; }
-
-// Window position -> the scene pixel a picker click selects, as the slots take it. False on
-// the black bars (beyond sceneEdgeSlack()) or for empty geometry. A hit is clamped to the
-// last pixel, [0, ceil(width) - 1] x [0, ceil(height) - 1], so no pick names a row or column
-// one past the image (adversary A2, r1: the slots' own guard is "x > width").
-inline bool pickPixel( const QPointF &windowPos, const QSizeF &window, const QSizeF &scene, int *x, int *y )
+inline bool halfOpenContains( const QRectF &r, const QPointF &p )
 {
-    QPointF p;
-    if( letterboxRect( window, scene ).isEmpty() ) return false;
-    windowToScene( windowPos, window, scene, &p );
-    const double slack = sceneEdgeSlack();
-    if( p.x() < -slack || p.y() < -slack
-     || p.x() >= scene.width() + slack || p.y() >= scene.height() + slack )
-        return false;
+    return !r.isEmpty() && p.x() >= r.left() && p.x() < r.right() && p.y() >= r.top() && p.y() < r.bottom();
+}
+
+// Window position -> the scene pixel a picker click selects, as the slots take it.
+//
+// paintGL letterboxes with the display size it was handed, which is NOT always the scene's
+// aspect: the image route hands it the scene-sized image, but the CUDA texture route hands it
+// the clip's own stretched size (mainWindowGpuTexturePresentDisplaySize), while the scene is
+// computed with integer division before the stretch (computeDisplaySceneGeometry), so under an
+// anamorphic stretch the two pictures can differ by several scene pixels (adversary r1 pass 1
+// A3, pass 2 A1). GpuDisplayWindow exposes no read of its display size, so the caller passes
+// both candidates: primaryDisplay (the route that presented last) and otherDisplay. An empty
+// candidate means the scene.
+//  - A click counts when it is inside EITHER candidate's letterbox (half-open), so a click on
+//    the displayed picture is never dropped whichever route drew it; a click outside both is on
+//    the black bars and selects nothing.
+//  - It is mapped through the primary candidate's letterbox, then clamped to a real pixel,
+//    [0, ceil(width) - 1] x [0, ceil(height) - 1], so no pick names a row or column one past
+//    the image (adversary r1 pass 1 A2: the slots' own guard is "x > width").
+inline bool pickPixel( const QPointF &windowPos, const QSizeF &window, const QSizeF &scene,
+                       const QSizeF &primaryDisplay, const QSizeF &otherDisplay, int *x, int *y )
+{
+    if( scene.width() <= 0.0 || scene.height() <= 0.0 ) return false;
+    const auto orScene = [&scene]( const QSizeF &d ) { return ( d.width() > 0.0 && d.height() > 0.0 ) ? d : scene; };
+    const QRectF primary = letterboxRect( window, orScene( primaryDisplay ) );
+    const QRectF other = letterboxRect( window, orScene( otherDisplay ) );
+    if( primary.isEmpty() ) return false;
+    if( !halfOpenContains( primary, windowPos ) && !halfOpenContains( other, windowPos ) ) return false;
+    const double sx = ( windowPos.x() - primary.x() ) / primary.width() * scene.width();
+    const double sy = ( windowPos.y() - primary.y() ) / primary.height() * scene.height();
     const int lastX = int( std::ceil( scene.width() ) ) - 1;
     const int lastY = int( std::ceil( scene.height() ) ) - 1;
-    int px = int( std::floor( p.x() ) );
-    int py = int( std::floor( p.y() ) );
+    int px = int( std::floor( sx ) );
+    int py = int( std::floor( sy ) );
     px = px < 0 ? 0 : ( px > lastX ? lastX : px );
     py = py < 0 ? 0 : ( py > lastY ? lastY : py );
     if( x ) *x = px;

@@ -3943,18 +3943,23 @@ void GuiSmokeTest::glWindowViewerInput_edgePicksStayInsideTheImage()
     window.resize(1920, 1080);
     installRecordingForwarder(&window, &rec); // scene 1920x804, letterboxed to y 138..942
     rec.bpArmed = true;
+    // The edge itself is one past the picture (half-open): no pick, so never row 804.
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 942), QPointF(960, 942));
+    QCOMPARE(rec.bpCalls, 0);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 941.9), QPointF(960, 941.9));
     QCOMPARE(rec.bpCalls, 1);
     QCOMPARE(rec.lastPick, QPoint(960, 803));
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1920, 540), QPointF(1920, 540));
+    QCOMPARE(rec.bpCalls, 1);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1919.9, 540), QPointF(1919.9, 540));
     QCOMPARE(rec.bpCalls, 2);
     QCOMPARE(rec.lastPick, QPoint(1919, 402));
     rec.bpArmed = false;
     rec.wbArmed = true;
-    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1920, 942), QPointF(1920, 942));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1919.9, 941.9), QPointF(1919.9, 941.9));
     QCOMPARE(rec.wbCalls, 1);
     QCOMPARE(rec.lastPick, QPoint(1919, 803));
-    // Well inside the bottom bar: still nothing.
+    // Inside the bottom bar: nothing.
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 944), QPointF(960, 944));
     QCOMPARE(rec.wbCalls, 1);
 }
@@ -3968,8 +3973,16 @@ void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
     GlWindowInputRecorder rec;
     QWindow window;
     window.resize(1000, 1000);
+    // Adversary r1 pass 2 A1 is the same class under an anamorphic stretch: a 1920x420 clip at
+    // stretchY 3 has a 1000x654 scene (integer division before the stretch) but the texture
+    // route draws a 1920x1260 display, from y 171.875 (the scene's letterbox starts at 173).
+    QSizeF scene(1000, 418);
+    QSizeF texture(1920, 804);
+    bool textureLast = true;
     gpu_window_input::Forwarder::Hooks hooks;
-    hooks.sceneSize = []() { return QSizeF(1000, 418); };
+    hooks.sceneSize = [&scene]() { return scene; };
+    hooks.textureDisplaySize = [&texture]() { return texture; };
+    hooks.textureRouteLast = [&textureLast]() { return textureLast; };
     hooks.wbArmed = [&rec]() { return rec.wbArmed; };
     hooks.bpArmed = [&rec]() { return rec.bpArmed; };
     hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
@@ -3979,9 +3992,28 @@ void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
     deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
     QCOMPARE(rec.wbCalls, 1);
     QCOMPARE(rec.lastPick, QPoint(500, 0));
-    // A full scene pixel above the picture is on the bar: nothing.
-    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 289.9), QPointF(500, 289.9));
-    QCOMPARE(rec.wbCalls, 1);
+    // Image route last: the click is still on a candidate picture, so it picks (clamped).
+    textureLast = false;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
+    QCOMPARE(rec.wbCalls, 2);
+    QCOMPARE(rec.lastPick, QPoint(500, 0));
+    // Above both pictures is the bar: nothing.
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.5), QPointF(500, 290.5));
+    QCOMPARE(rec.wbCalls, 2);
+
+    scene = QSizeF(1000, 654);
+    texture = QSizeF(1920, 1260);
+    textureLast = true;
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 172), QPointF(500, 172));
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(500, 0));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    QCOMPARE(rec.bpCalls, 2);
+    QCOMPARE(rec.lastPick, QPoint(500, 327));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 171.8), QPointF(500, 171.8));
+    QCOMPARE(rec.bpCalls, 2);
 }
 
 int main(int argc, char ** argv)

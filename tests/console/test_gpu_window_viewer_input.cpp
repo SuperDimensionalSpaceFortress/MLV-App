@@ -180,63 +180,89 @@ TEST(GpuWindowViewerInput, C5_PressIsOnViewer)
     ASSERT_FALSE(pressIsOnViewer(false, nullptr, nullptr));
 }
 
-TEST(GpuWindowViewerInput, C7_PickPixelStaysInsideTheImageAndAllowsTheRoundingSlack)
+TEST(GpuWindowViewerInput, C7_PickPixelStaysInsideTheImageAndFollowsTheDrawnPicture)
 {
     using gpu_window_input::pickPixel;
+    const QSizeF none;
     int x = -1;
     int y = -1;
-    // A2: the bottom and right edges (scene y == 804, x == 1920) clamp to the last pixel.
-    ASSERT_TRUE(pickPixel(QPointF(960, 942), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    // Adversary r1 pass 1 A2: the picture is half-open, and a hit is clamped to a real pixel.
+    ASSERT_FALSE(pickPixel(QPointF(960, 942), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(960, 941.9), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
     ASSERT_EQ(960, x);
     ASSERT_EQ(803, y);
-    // Pillarbox (1080x1080 in 1920x1080, picture x 420..1500): its right edge clamps to the last
-    // column; the far right of the window is on the bar.
-    ASSERT_FALSE(pickPixel(QPointF(1920, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), &x, &y));
-    ASSERT_TRUE(pickPixel(QPointF(1500, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(1920, 540), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(1919.9, 540), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    ASSERT_EQ(1919, x);
+    ASSERT_EQ(402, y);
+    // Pillarbox (1080x1080 in 1920x1080, picture x 420..1500).
+    ASSERT_FALSE(pickPixel(QPointF(1500, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), none, none, &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(1499.5, 540), QSizeF(1920, 1080), QSizeF(1080, 1080), none, none, &x, &y));
     ASSERT_EQ(1079, x);
     ASSERT_EQ(540, y);
-    ASSERT_TRUE(pickPixel(QPointF(0, 138), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(0, 138), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
     ASSERT_EQ(0, x);
     ASSERT_EQ(0, y);
-    ASSERT_TRUE(pickPixel(QPointF(960, 540), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(960, 540), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
     ASSERT_EQ(960, x);
     ASSERT_EQ(402, y);
-    // A3: a 1920x804 clip fit into a 1000x1000 window has a 1000x418 scene; paintGL's picture
-    // (display aspect) starts at y 290.625, the scene-aspect rect at 291. A click between picks
-    // the top row; a full scene pixel above it is on the bar.
-    ASSERT_TRUE(pickPixel(QPointF(500, 290.75), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
+
+    // Adversary r1 pass 1 A3: 1920x804 clip fit into 1000x1000 has a 1000x418 scene; the CUDA texture
+    // route draws the 1920x804 display size, starting at y 290.625; the scene's letterbox starts at 291.
+    const QSizeF w1000(1000, 1000);
+    const QSizeF scene418(1000, 418);
+    const QSizeF tex804(1920, 804);
+    ASSERT_TRUE(pickPixel(QPointF(500, 290.75), w1000, scene418, tex804, scene418, &x, &y)); // texture route drew it
     ASSERT_EQ(500, x);
     ASSERT_EQ(0, y);
-    ASSERT_TRUE(pickPixel(QPointF(500, 709.3), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
-    ASSERT_EQ(417, y);
-    ASSERT_FALSE(pickPixel(QPointF(500, 289.9), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
-    ASSERT_FALSE(pickPixel(QPointF(500, 710.6), QSizeF(1000, 1000), QSizeF(1000, 418), &x, &y));
-    // The slack is exactly half a scene pixel (scene 1920x804 in 1920x1080: 1 window px = 1 scene px).
-    ASSERT_NEAR(0.5, gpu_window_input::sceneEdgeSlack(), 0.0);
-    ASSERT_TRUE(pickPixel(QPointF(960, 137.6), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_TRUE(pickPixel(QPointF(500, 290.75), w1000, scene418, scene418, tex804, &x, &y)); // image route last, still on a candidate
     ASSERT_EQ(0, y);
-    ASSERT_FALSE(pickPixel(QPointF(960, 137.4), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
-    ASSERT_TRUE(pickPixel(QPointF(960, 942.4), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
-    ASSERT_EQ(803, y);
-    ASSERT_FALSE(pickPixel(QPointF(960, 942.6), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(500, 290.5), w1000, scene418, tex804, scene418, &x, &y));  // above both: the bar
+    ASSERT_FALSE(pickPixel(QPointF(500, 290.75), w1000, scene418, none, none, &x, &y));       // no texture candidate: off the scene picture
+
+    // Adversary r1 pass 2 A1: clip 1920x420 at stretchY 3 in a 1000x1000 window. The scene is
+    // 1000x654 (integer division before the stretch) but the texture route draws a 1920x1260
+    // display, 656.25 high from y 171.875; the scene's letterbox starts at y 173.
+    const QSizeF scene654(1000, 654);
+    const QSizeF tex1260(1920, 1260);
+    ASSERT_TRUE(pickPixel(QPointF(500, 172), w1000, scene654, tex1260, scene654, &x, &y));
+    ASSERT_EQ(500, x);
+    ASSERT_EQ(0, y);
+    ASSERT_TRUE(pickPixel(QPointF(500, 828.0), w1000, scene654, tex1260, scene654, &x, &y));
+    ASSERT_EQ(653, y);
+    ASSERT_FALSE(pickPixel(QPointF(500, 171.8), w1000, scene654, tex1260, scene654, &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(500, 828.2), w1000, scene654, tex1260, scene654, &x, &y));
+    // ...and its centre maps to the scene centre through the drawn picture.
+    ASSERT_TRUE(pickPixel(QPointF(500, 500), w1000, scene654, tex1260, scene654, &x, &y));
+    ASSERT_EQ(327, y);
+    // Width sibling: clip 1080x1922 at stretchX 2 in 1200x1000: scene 1122x1000, texture display
+    // 2160x1922 drawn from x 38.08; the scene's letterbox starts at x 39.
+    ASSERT_TRUE(pickPixel(QPointF(38.4, 500), QSizeF(1200, 1000), QSizeF(1122, 1000), QSizeF(2160, 1922), QSizeF(1122, 1000), &x, &y));
+    ASSERT_EQ(0, x);
+    ASSERT_FALSE(pickPixel(QPointF(38.0, 500), QSizeF(1200, 1000), QSizeF(1122, 1000), QSizeF(2160, 1922), QSizeF(1122, 1000), &x, &y));
+
     // Bars and empty geometry.
-    ASSERT_FALSE(pickPixel(QPointF(960, 20), QSizeF(1920, 1080), QSizeF(1920, 804), &x, &y));
-    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(1920, 1080), QSizeF(), &x, &y));
-    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(), QSizeF(1920, 804), &x, &y));
-    // Every hit over a dense sweep of the window is a real pixel.
-    for (int wy = 0; wy <= 1080; wy += 3)
+    ASSERT_FALSE(pickPixel(QPointF(960, 20), QSizeF(1920, 1080), QSizeF(1920, 804), none, none, &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(1920, 1080), QSizeF(), tex804, none, &x, &y));
+    ASSERT_FALSE(pickPixel(QPointF(10, 10), QSizeF(), QSizeF(1920, 804), none, none, &x, &y));
+    // Every hit over a dense sweep, either route first, is a real pixel.
+    for (int route = 0; route < 2; ++route)
     {
-        for (int wx = 0; wx <= 1920; wx += 7)
+        const QSizeF primary = route ? tex1260 : scene654;
+        const QSizeF other = route ? scene654 : tex1260;
+        for (int wy = 0; wy <= 1000; wy += 3)
         {
-            if (pickPixel(QPointF(wx + 0.5, wy + 0.5), QSizeF(1920, 1080), QSizeF(1000, 418), &x, &y))
+            for (int wx = 0; wx <= 1000; wx += 7)
             {
-                ASSERT_TRUE(x >= 0 && x <= 999);
-                ASSERT_TRUE(y >= 0 && y <= 417);
+                if (pickPixel(QPointF(wx + 0.5, wy + 0.5), w1000, scene654, primary, other, &x, &y))
+                {
+                    ASSERT_TRUE(x >= 0 && x <= 999);
+                    ASSERT_TRUE(y >= 0 && y <= 653);
+                }
             }
         }
     }
 }
-
 TEST(GpuWindowViewerInput, C8_DropPathsMatchTheScenesFilesDroppedList)
 {
     // A1: the scene's dropEvent hands openMlvSet every toLocalFile() path, in order, skipping

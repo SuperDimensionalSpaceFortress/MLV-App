@@ -83,6 +83,31 @@ TEST(GpuWindowViewerInputWiring, W3_HooksCallTheViewerPathsOwnSlots)
     ASSERT_TRUE(body.contains(QStringLiteral("installEventFilter( new gpu_window_input::Forwarder( glWindow")));
 }
 
+TEST(GpuWindowViewerInputWiring, W5_PickMappingUsesTheTextureRoutesOwnDisplaySize)
+{
+    // Adversary r1 pass 1 A3 / pass 2 A1: the CUDA texture route letterboxes with the clip's own
+    // stretched size, not the scene's. The hook must compute it as that route does: the same
+    // helper, the clip's width and height, and the same stretch reads the prep task carries.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source, kDefinition, kNextDefinition);
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "mainWindowGpuTexturePresentDisplaySize( static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ), getHorizontalStretchFactor( false ), getVerticalStretchFactor( false ) )")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "m_lastPresentedRequestContextValid && m_lastPresentedRequestContext.gpuPlaybackReconTexturePresentRequested")));
+    // The route side of the mirror: the texture present's display size and the task's stretch.
+    ASSERT_TRUE(source.contains(QStringLiteral("? static_cast<int>( getMlvWidth( m_pMlvObject ) )")));
+    ASSERT_TRUE(source.contains(QStringLiteral("? static_cast<int>( getMlvHeight( m_pMlvObject ) )")));
+    const int helperAt = source.indexOf(QStringLiteral("mainWindowGpuTexturePresentDisplaySize(\n"));
+    ASSERT_TRUE(helperAt >= 0);
+    const QString helperCall = source.mid(helperAt, 300);
+    ASSERT_TRUE(helperCall.contains(QStringLiteral("task.stretchX")));
+    ASSERT_TRUE(helperCall.contains(QStringLiteral("task.stretchY")));
+    ASSERT_TRUE(source.contains(QStringLiteral("task.stretchX = stretchX;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("const double stretchX = getHorizontalStretchFactor(false);")));
+    ASSERT_TRUE(source.contains(QStringLiteral("const double stretchY = getVerticalStretchFactor(false);")));
+}
+
 TEST(GpuWindowViewerInputWiring, W4_GlDropOpensLikeTheSceneNotLikeTheTopLevelWindow)
 {
     // Adversary A1 (r1): the QGraphicsView path's drop is GraphicsPickerScene::dropEvent ->

@@ -32,6 +32,10 @@ public:
     struct Hooks
     {
         std::function<QSizeF()> sceneSize;
+        // The display size paintGL letterboxes with on the CUDA texture route (empty = none), and
+        // whether that route presented last; see pickPixel. Unset = the scene for both routes.
+        std::function<QSizeF()> textureDisplaySize;
+        std::function<bool()> textureRouteLast;
         std::function<bool()> wbArmed;
         std::function<bool()> bpArmed;
         std::function<void(int, int)> pickWhiteBalance;
@@ -83,9 +87,12 @@ public:
         case Route::PickBadPixel:
         {
             const QSizeF scene = m_hooks.sceneSize ? m_hooks.sceneSize() : QSizeF();
+            const QSizeF texture = m_hooks.textureDisplaySize ? m_hooks.textureDisplaySize() : QSizeF();
+            const bool textureLast = m_hooks.textureRouteLast ? m_hooks.textureRouteLast() : false;
             int x = 0;
             int y = 0;
-            if( pickPixel( pos, QSizeF( m_window->size() ), scene, &x, &y ) )
+            if( pickPixel( pos, QSizeF( m_window->size() ), scene,
+                           textureLast ? texture : scene, textureLast ? scene : texture, &x, &y ) )
             {
                 const bool white = wb;
                 if( white && m_hooks.pickWhiteBalance ) m_hooks.pickWhiteBalance( x, y );
