@@ -2849,6 +2849,11 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     # r4 adversary pass 9 A3: a quoted '/>' inside a secret-named element's start tag is not a self-closing tag
     $ddR2['r4 pass 9 A3 a quoted /> in a secret element start tag'] = '<password note="/>">hunter2</password>'
     $ddR2['r4 pass 9 A3 sibling: single quotes'] = "<password note='/>'>hunter2</password>"
+    # r4 adversary pass 10 A1-A2: the escaped backslash and the one-letter escapes a JSON reader decodes ($ddBs is one backslash, built so no encoder can decode it)
+    $ddBs = [string][char]92
+    $ddR2['r4 pass 10 A1 an escaped backslash before an undecodable escape in a key'] = ('{"pass' + $ddBs + $ddBs + 'U0011FFFFord":"hunter2"}')
+    $ddR2['r4 pass 10 A2 an escaped line break inside an XML naming value in JSON'] = ('{"xml":"<add key=''pass' + $ddBs + 'nword'' value=''hunter2'' />"}')
+    $ddR2['r4 pass 10 A2 sibling: an escaped tab'] = ('{"xml":"<add key=''pass' + $ddBs + 'tword'' value=''hunter2'' />"}')
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
     foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
@@ -2882,6 +2887,9 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         # r4 adversary pass 9 A1: an XML naming attribute that exists only once the text is decoded (config.toml with an escaped '<' and '>') names a secret too
         $ddLt = [string][char]92 + 'u003C'; $ddGt = [string][char]92 + 'u003E'
         Assert-That (Test-CredentialNamePresent ("xml = `"" + $ddLt + "add key='p a s s w o r d' value='' /" + $ddGt + "`"")) 'DENY-BY-DEFAULT-1 r4 pass 9 A1 role guard: a spaced XML naming value that appears only after decoding names a secret'
+        $ddBs2 = [string][char]92
+        Assert-That (Test-CredentialNamePresent ('{"pass' + $ddBs2 + $ddBs2 + 'U0011FFFFord":""}')) 'DENY-BY-DEFAULT-1 r4 pass 10 A1 role guard: an escaped backslash before an undecodable escape names a secret'
+        Assert-That (Test-CredentialNamePresent ('{"xml":"<add key=''pass' + $ddBs2 + 'nword'' value='''' />"}')) 'DENY-BY-DEFAULT-1 r4 pass 10 A2 role guard: an escaped line break inside an XML naming value names a secret'
     }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {

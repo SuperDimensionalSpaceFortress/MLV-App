@@ -1643,8 +1643,13 @@ function Get-CredentialHitIndex {
 $script:CredentialPyNames = @{ 'LOW LINE' = '_'; 'HYPHEN-MINUS' = '-'; 'FULL STOP' = '.'; 'SOLIDUS' = '/' }
 $credDigitNames = @('ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE')
 for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyNames['DIGIT ' + $credDigitNames[$credDigit]] = [string]$credDigit }
-$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
+# r4 (adversary pass 10 A1-A2, defect class: an escape a reader decodes that the normaliser left as written): JSON, YAML, TOML and C also decode the escaped backslash
+# '\\' (so '"pass\\U0011FFFFord"' is the key 'pass\U0011FFFFord', whose undecodable escape is deny by default) and the one-letter escapes '\n' '\t' '\r' '\b' '\f' '\"'
+# ('<add key=''pass\nword'' .../>' inside a JSON string is the naming value 'pass<LF>word', 'password' once its blanks are removed). Each is decoded on its own level.
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
 $script:CredentialEntities = @{ 'amp' = '&'; 'lt' = '<'; 'gt' = '>'; 'quot' = '"'; 'apos' = "'" }
+$script:CredentialOneLetterEscapes = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+foreach ($credOne in @(@('n', "`n"), @('t', "`t"), @('r', "`r"), @('b', [string][char]8), @('f', [string][char]12), @('"', '"'))) { $script:CredentialOneLetterEscapes[$credOne[0]] = $credOne[1] }
 # r2: true when the normaliser has anything to do in the text: an escape it decodes changes the text, or an undecodable one is left (deny by default). It is derived from the
 # normaliser itself, so no escape form can be missing from a separate trigger list (pass 3 A3: '&w;' had no trigger and the residual rule never ran).
 function Test-CredentialEscapesPresent([string]$Text) { return ($script:CredentialResidualIntroRegex.IsMatch("$Text") -or ((ConvertFrom-CredentialEscapes $Text) -cne "$Text")) }
@@ -1655,6 +1660,8 @@ $script:CredentialEscapeEval = {
         if ($g['ent'].Success) { return $script:CredentialEntities[$g['ent'].Value] }
         if ($g['nl'].Success) { return '' }
         if ($g['sl'].Success) { return '/' }
+        if ($g['bs'].Success) { return '\' }   # r4 pass 10 A1
+        if ($g['one'].Success) { return $script:CredentialOneLetterEscapes[$g['one'].Value] }   # r4 pass 10 A2
         if ($g['x'].Success) { return [string][char][Convert]::ToInt32($g['x'].Value, 16) }
         if ($g['psl'].Success) { if ('0abefnrtv'.Contains($g['psl'].Value)) { return $m.Value }; return $g['psl'].Value }
         if ($g['nm'].Success) {
