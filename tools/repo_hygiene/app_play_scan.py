@@ -254,8 +254,40 @@ _INVOKE_METHOD = re.compile(r"\binvokeMethod\s*\([^;]*?\w*[Aa]ctionPlay\w*")
 # pointer of a key event is caught too, on purpose (fail-closed: review it here). A type ALIAS of it, pointer or
 # not, is caught as well, since an alias can construct one without naming the type.
 # r3 (adversary pass on c1216855 A3, advisory): `QKeyEvent const *` / `QKeyEvent const &` is a pointer / reference too.
-_KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!\s*(?:const\b\s*)?[*&])|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
+# r5 (adversary pass on f422d164 A3, advisory): `volatile` qualifies a pointer / reference like `const` does.
+_KEY_EVENT_REF_TAIL = r"\s*(?:(?:const|volatile)\b\s*)*[*&]"
+_KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!" + _KEY_EVENT_REF_TAIL + r")|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
                         r"|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
+# r5 (adversary pass on f422d164 A2): the pointer / reference exemption hid `std::remove_pointer_t<QKeyEvent*> press{...}`,
+# a type trait that names the OBJECT type. A `QKeyEvent` pointer or reference that sits inside a template argument list is
+# a delivered-event read only directly inside a cast (static_cast<QKeyEvent*>( event )); inside anything else it is flagged.
+_KEY_EVENT_REF = re.compile(r"\bQKeyEvent\b(?=" + _KEY_EVENT_REF_TAIL + r")")
+_TEMPLATE_CAST_NAMES = frozenset({"static_cast", "dynamic_cast", "reinterpret_cast", "const_cast", "qobject_cast"})
+
+
+def _enclosing_template_name(blank: str, pos: int) -> str | None:
+    """The identifier before the unmatched `<` that encloses `pos` (``""`` when none), or None outside template arguments.
+
+    Walks back over the declaration (never past a ; { } or an opening parenthesis, which is a parameter list)."""
+    depth = 0
+    i = pos - 1
+    low = max(0, pos - 600)
+    while i >= low:
+        c = blank[i]
+        if c in ";{}(":
+            return None
+        if c == ">":
+            if i > 0 and blank[i - 1] == "-":     # `->` is not a closing angle bracket
+                i -= 1
+            else:
+                depth += 1
+        elif c == "<":
+            if depth == 0:
+                name = re.search(r"(\w*)\s*$", blank[:i])
+                return name.group(1) if name else ""
+            depth -= 1
+        i -= 1
+    return None
 # r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
 _KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
 # PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
@@ -293,10 +325,16 @@ KEY_TABLE_SOURCE = "platform/qt/PlayerShortcutBinding.h"
 KEY_TABLE_REVIEWED_DIRECTIVES = {
     "#ifndef PLAYERSHORTCUTBINDING_H": 1, "#define PLAYERSHORTCUTBINDING_H": 1, "#ifdef Q_OS_WIN": 1, "#endif": 2}
 _DIRECTIVE_LINE = re.compile(r"^[ \t\f\v]*#.*$", re.MULTILINE)
-# r3 (adversary pass on c1216855 A1): a quoted include of an unscanned fragment carried a macro over the statement. The
-# key table includes only a Qt class header (<QKeySequence>, <QtGui/QKeyEvent>) or a standard library header
-# (<algorithm>): no quotes, no extension, no path. Anything else is a directive change reviewed here.
-_INCLUDE_DIRECTIVE = re.compile(r"#\s*include\s*<\s*(?:(?:Qt\w*/)?Q\w+|[a-z_][a-z0-9_]*)\s*>")
+# r3 (adversary pass on c1216855 A1): a quoted include of an unscanned fragment carried a macro over the statement.
+# r5 (adversary pass on f422d164 A1): the r3 SHAPE rule (any Qt-looking or lowercase extensionless name) still admitted an
+# extensionless project fragment (<shortcut_compat>) that no loader scans. The key table now includes ONLY these headers,
+# by exact name (what platform/qt/PlayerShortcutBinding.h includes today): a new include is a change reviewed here.
+KEY_TABLE_REVIEWED_INCLUDES = frozenset({
+    "QAbstractButton", "QAbstractItemView", "QAbstractSlider", "QAbstractSpinBox", "QAction", "QApplication", "QComboBox",
+    "QCoreApplication", "QDebug", "QDialog", "QDialogButtonBox", "QDockWidget", "QEvent", "QHeaderView", "QKeyEvent",
+    "QKeySequence", "QLineEdit", "QList", "QMenu", "QPlainTextEdit", "QPointer", "QShortcut", "QStringList",
+    "QTableWidget", "QTextEdit", "QVBoxLayout", "QWidget", "algorithm", "cmath"})
+_INCLUDE_DIRECTIVE = re.compile(r"#\s*include\s*<\s*(\w+)\s*>")
 # r3 (adversary pass on fce56625 A1): a form feed / vertical tab before `#` hid a directive. Fail-closed on the class:
 # ANY control character but tab, newline and carriage return, anywhere in the key table.
 _PREPROCESSOR_RESPELL = re.compile(r"%:|\?\?[=/'()!<>\-]|\\[ \t\r]*$|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", re.MULTILINE)
@@ -328,13 +366,15 @@ def _scan_key_table_preprocessor(path: str, text: str, keep: str) -> list[str]:
     seen: dict[str, int] = {}
     for match in _DIRECTIVE_LINE.finditer(keep):
         directive = re.sub(r"^#\s*", "#", _normalise(match.group(0)))
-        if _INCLUDE_DIRECTIVE.fullmatch(directive):
+        include = _INCLUDE_DIRECTIVE.fullmatch(directive)
+        if include and include.group(1) in KEY_TABLE_REVIEWED_INCLUDES:
             continue
         if directive in KEY_TABLE_REVIEWED_DIRECTIVES:
             seen[directive] = seen.get(directive, 0) + 1
             continue
         problems.append(f"{path}:{_line_of(keep, match.start())}: preprocessor directive `{directive}` in the key table "
-                        "(only the include guard, #include and the reviewed #ifdef Q_OS_WIN / #endif are allowed)")
+                        "(only the include guard, an #include of a header in KEY_TABLE_REVIEWED_INCLUDES and the reviewed "
+                        "#ifdef Q_OS_WIN / #endif are allowed)")
     for directive, expected in KEY_TABLE_REVIEWED_DIRECTIVES.items():
         if seen.get(directive, 0) != expected:
             problems.append(f"{path}: reviewed preprocessor directive `{directive}` x{seen.get(directive, 0)}, pinned "
@@ -634,6 +674,10 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             if any(start <= match.start() < end for start, end in include_spans):
                 continue
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
+        for match in _KEY_EVENT_REF.finditer(blank):
+            enclosing = _enclosing_template_name(blank, match.start())
+            if enclosing is not None and enclosing not in _TEMPLATE_CAST_NAMES:
+                problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
         for match in _EVENT_POST.finditer(blank):
             key = (path, match.group(1))
             event_counts[key] = event_counts.get(key, 0) + 1

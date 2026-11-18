@@ -2610,6 +2610,13 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         "a quoted include of a project header": ('#include "LocalHelper.h"', ""),
         "an angle include of a fragment": ("#include <compat.inc>", ""),
         "an angle include of a path": ("#include <../platform/qt/compat.h>", ""),
+        # r5 adversary pass (f422d164 A1): an extensionless angle include of a project fragment, and a Qt-looking name,
+        # carried a macro over the statement unscanned. The key table includes ONLY the reviewed headers, by name.
+        "an extensionless angle include of a fragment around the statement":
+            ("#include <shortcut_compat>", "#include <shortcut_restore>"),
+        "a Qt-looking angle include of a fragment": ("#include <QShortcutCompat>", "#include <QShortcutRestore>"),
+        "a module-qualified angle include that is not reviewed": ("#include <QtGui/QShortcutCompat>", ""),
+        "a standard-library-looking include that is not reviewed": ("#include <type_traits>", ""),
     }
 
     def _key_table_with(self, before: str, after: str) -> dict[str, str]:
@@ -2655,11 +2662,43 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                 self.assertIn("platform/qt/MainWindow.cpp:1: #define of QKeySequence, a token of the reviewed Space "
                               "binding statement", problems)
 
-    def test_r3_p3_a1_the_key_table_may_include_qt_and_standard_headers(self) -> None:
-        for include in ("#include <QtGui/QKeyEvent>", "#include <QKeySequence>", "#include <type_traits>"):
+    def test_r3_p3_a1_the_key_table_may_include_only_its_reviewed_headers(self) -> None:
+        # r5 (adversary pass on f422d164 A1): the shape rule (any Qt-looking or lowercase name) is replaced by the exact
+        # reviewed set, so no extensionless project fragment can be spelled as a library header.
+        for include in ("#include <QKeySequence>", "#include <algorithm>", "#include <QAction>"):
             with self.subTest(include):
                 problems = scan_app_play_sources(self._key_table_with(include, ""))
                 self.assertFalse([p for p in problems if "preprocessor" in p], problems)
+
+    def test_r5_a1_the_reviewed_include_set_is_exactly_what_the_real_key_table_includes(self) -> None:
+        blank, _ = strip_cpp(self.sources[self._SPACE_TABLE])
+        real = set(re.findall(r"^[ \t]*#[ \t]*include[ \t]*<[ \t]*(\w+)[ \t]*>", blank, re.MULTILINE))
+        self.assertEqual(real, set(_app_play_scan.KEY_TABLE_REVIEWED_INCLUDES))
+        self.assertEqual(len(re.findall(r"^[ \t]*#[ \t]*include\b", blank, re.MULTILINE)), len(real))   # none quoted/pathed
+
+    def test_r5_a2_a_key_event_pointer_or_reference_as_a_template_argument_is_a_synthesized_key(self) -> None:
+        # adversary pass on f422d164 A2: `QKeyEvent*` in any template argument list but a cast's built a key event.
+        for injected in ("std::remove_pointer_t<QKeyEvent*> press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::remove_reference_t<QKeyEvent&> press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::decay_t<QKeyEvent&> press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::remove_pointer_t< const QKeyEvent * > press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::remove_pointer<std::add_pointer_t<QKeyEvent*>>::type press{ QEvent::KeyPress, 32, {} };",
+                         "std::tuple<int, QKeyEvent*>* t = nullptr;"):
+            with self.subTest(injected):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    def test_r5_a2_casts_and_parameter_lists_with_a_delivered_key_event_stay_clean(self) -> None:
+        for text in ("QKeyEvent *k = static_cast<QKeyEvent*>( e );\n", "auto *k = dynamic_cast< QKeyEvent const * >( e );\n",
+                     "auto *k = reinterpret_cast<QKeyEvent *>( e );\n", "auto *k = const_cast<QKeyEvent*>( p );\n",
+                     "auto *k = qobject_cast<QKeyEvent*>( e );\n",
+                     "void f( QObject *o, QKeyEvent *e, std::vector<int> v, QKeyEvent const &c );\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+
+    def test_r5_a3_a_volatile_qualified_pointer_or_reference_is_not_a_synthesized_key(self) -> None:
+        for text in ("void inspect(QKeyEvent volatile *event);\n", "void inspect(QKeyEvent const volatile &event);\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
 
     def test_r3_p3_a3_a_const_qualified_pointer_or_reference_is_not_a_synthesized_key(self) -> None:
         for text in ("auto inspect = [](QKeyEvent const *e) { return e->key(); };\n",
