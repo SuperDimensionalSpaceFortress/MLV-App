@@ -5845,8 +5845,29 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $rsQj =$ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-QueuedJob' }, $true)
         $rsLoop = if ($null -ne $rsQj) { $rsQj.Find({ param($n) $n -is [System.Management.Automation.Language.WhileStatementAst] -and $n.Condition.Extent.Text -match '\$jobProcess\.HasExited' }, $true) } else { $null }
         $rsCalls = if ($null -ne $rsLoop) { @($rsLoop.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq'Get-DescendantProcessIdentities' }, $true)) } else { @() }
-        $rsWired = @($rsCalls | Where-Object { $_.Extent.Text -match '-OnEach\s*\{\s*Invoke-QuietLeaseRenewTick\s*\}' })
+        # r4 (adversary pass 7 A3): "wired" is read from the AST, never from the call's text: the -OnEach parameter (space or colon form) must be
+        # bound to a script block whose one statement is Invoke-QuietLeaseRenewTick. A block comment inside the call carrying that text, which
+        # the old regex over the call's extent accepted, binds nothing and is not wired (proved on a synthetic loop below).
+        $rsIsWired = {
+            param($Cmd)
+            $els = @($Cmd.CommandElements)
+            for ($i = 0; $i -lt $els.Count; $i++) {
+                $e = $els[$i]
+                if ($e -isnot [System.Management.Automation.Language.CommandParameterAst] -or $e.ParameterName -ne 'OnEach') { continue }
+                $arg = if ($null -ne $e.Argument) { $e.Argument } elseif ($i + 1 -lt $els.Count) { $els[$i + 1] } else { $null }
+                if ($arg -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) { return $false }
+                $stmts = @($arg.ScriptBlock.EndBlock.Statements)
+                if ($stmts.Count -ne 1 -or $stmts[0] -isnot [System.Management.Automation.Language.PipelineAst] -or @($stmts[0].PipelineElements).Count -ne 1) { return $false }
+                $inner = $stmts[0].PipelineElements[0]
+                return ($inner -is [System.Management.Automation.Language.CommandAst] -and $inner.GetCommandName() -eq 'Invoke-QuietLeaseRenewTick')
+            }
+            return $false
+        }
+        $rsWired = @($rsCalls | Where-Object { & $rsIsWired $_ })
         Assert-True ($rsCalls.Count -ge 1 -and $rsWired.Count -eq $rsCalls.Count) "renew-slow-monitor-slice: the job monitor loop passes the renew tick into every descendant walk it runs (calls=$($rsCalls.Count) wired=$($rsWired.Count))"
+        $rsSynth = [System.Management.Automation.Language.Parser]::ParseInput('while (-not $jobProcess.HasExited) { Get-DescendantProcessIdentities <# -OnEach { Invoke-QuietLeaseRenewTick } #> -ParentProcessId 1; Get-DescendantProcessIdentities -OnEach:{ Invoke-QuietLeaseRenewTick } -ParentProcessId 2 }', [ref]$null, [ref]$null)
+        $rsSynthCalls = @($rsSynth.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-DescendantProcessIdentities' }, $true))
+        Assert-True ($rsSynthCalls.Count -eq 2 -and -not (& $rsIsWired $rsSynthCalls[0]) -and (& $rsIsWired $rsSynthCalls[1])) "renew-slow-monitor-slice: the wiring guard reads the AST (a commented-out -OnEach is NOT wired, a colon-form -OnEach:{ Invoke-QuietLeaseRenewTick } is): calls=$($rsSynthCalls.Count)"
         Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
         $results.renewSlowMonitorSlice = $rsOut
     }
