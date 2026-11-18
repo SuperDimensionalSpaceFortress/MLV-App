@@ -876,7 +876,8 @@ class ExportEvidenceTests(unittest.TestCase):
         publish = profile({**base, "llrawproc_publish_lock_ms": 90.0})
         refine = profile({**base, "llrawproc_dualiso_refine_lock_ms": 90.0})
         no_total = profile({"producer_frame_ms": 100.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_publish_lock_ms": 90.0}, drop_total=True)
-        control = profile({**base, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0})
+        # (r17, adversary pass17 A1: shared_lock accumulates the refine and publish times, llrawproc.c:6131 / :6293, so a valid control publishes it at least their sum)
+        control = profile({**base, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_shared_lock_ms": 20.0})
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in (publish, refine, no_total, control)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in (0, 1, 2):
@@ -907,7 +908,7 @@ class ExportEvidenceTests(unittest.TestCase):
             profiles.append(profile({"producer_frame_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0}, drop_total=True))
         refine = profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_dualiso_refine_lock_ms": 80.0})
         control = profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 69.0,
-                           "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0})
+                           "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_shared_lock_ms": 20.0})   # (r17: pass17 A1, see the r13 control)
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in profiles + [refine, control]])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(profiles) + 1):
@@ -956,12 +957,37 @@ class ExportEvidenceTests(unittest.TestCase):
             with self.subTest(control=i):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
 
+    def test_r17_pass17_a1_the_lock_times_shared_lock_accumulates_are_inside_it(self) -> None:
+        """adversary pass17 A1: llrawproc.c adds the refine and publish lock times to shared_lock (:6131, :6293, :7058), so each, and their disjoint sum, is inside it. refine 10 + publish 10
+        beside a 0 ms shared_lock (the old r13 control) read PASS. The table's contains column derives the pairs and the group."""
+        def profile(set_rows: dict) -> str:
+            doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+            for r in doc["frames"]:
+                for k in CDNG_STAGES:
+                    if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                        r[k] = 0.0
+                r.update(set_rows)
+            return json.dumps(doc)
+        base = {"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_other_ms": 70.0}
+        bad = [profile({**base, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_shared_lock_ms": 0.0}),   # the adversary's input
+               profile({**base, "llrawproc_dualiso_refine_lock_ms": 30.0, "llrawproc_shared_lock_ms": 10.0}),                                     # one member above it
+               profile({**base, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_shared_lock_ms": 15.0})]  # each below, the sum above
+        control = profile({**base, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_shared_lock_ms": 25.0})
+        proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in bad + [control]])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(len(bad)):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "llrawproc_shared_lock" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
+
     def test_r17_every_disjoint_group_is_derived_from_the_stage_window_table(self) -> None:
         """CDNG-STAGE-WINDOW-TABLE-1: the groups the reader holds are every maximal pairwise-disjoint set of each parent's descendants in ExportCdngStageWindowTable, recomputed here from the
         table alone (no shared code), so a sixth member cannot be hand-missed; and the table names every CDNG producer stage plus the llrawproc total, so a new timer cannot be left out of it."""
         proc, got = run_pwsh_json(f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
                                   "& (Get-Module DualVenueRunner) { [ordered]@{ table = @($script:ExportCdngStageWindowTable); stages = @($script:ExportCdngProducerStages); "
-                                  "groups = @(foreach ($g in $script:ExportCdngSumGroups) { [ordered]@{ members = @($g[0]); parent = [string]$g[1] } }) } } | ConvertTo-Json -Compress -Depth 6")
+                                  "groups = @(foreach ($g in $script:ExportCdngSumGroups) { [ordered]@{ members = @($g[0]); parent = [string]$g[1] } }); "
+                                  "pairs = @(foreach ($p in $script:ExportCdngContainedPairs) { , @($p) }) } } | ConvertTo-Json -Compress -Depth 6")
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         rows = {r["name"]: r for r in got["table"]}
         self.assertEqual(set(rows), set(got["stages"]) | {"llrawproc"})
@@ -1011,8 +1037,9 @@ class ExportEvidenceTests(unittest.TestCase):
             return True
 
         expected = set()
-        for parent in {r["parent"] for r in rows.values()}:
-            desc = [n for n in rows if parent in chain(n)[1:]]
+        containers = {n: r["contains"] for n, r in rows.items() if r.get("contains")}   # (pass17 A1: a row that accumulates others contains them)
+        for parent in {r["parent"] for r in rows.values()} | set(containers):
+            desc = list(containers[parent]) if parent in containers else [n for n in rows if parent in chain(n)[1:]]
             nbr = {v: {w for w in desc if w != v and not overlap(v, w)} for v in desc}
             best: list[set] = []
 
@@ -1032,6 +1059,8 @@ class ExportEvidenceTests(unittest.TestCase):
                     expected.add((frozenset(c), parent))
         derived = {(frozenset(g["members"]), g["parent"]) for g in got["groups"]}
         self.assertEqual(derived, expected)
+        self.assertEqual({tuple(p) for p in got["pairs"]}, {(m, n) for n, ms in containers.items() for m in ms})
+        self.assertIn((frozenset({"llrawproc_dualiso_refine_lock", "llrawproc_publish_lock"}), "llrawproc_shared_lock"), derived)
         # (the pass16 A1 member is in a derived group, and so is every earlier round's)
         self.assertIn((frozenset({"llrawproc_vertical_stripes", "llrawproc_pattern_noise", "llrawproc_dual_iso", "llrawproc_chroma_smooth", "llrawproc_shared_lock"}), "llrawproc"), derived)
 
