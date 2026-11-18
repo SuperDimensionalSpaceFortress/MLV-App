@@ -60,7 +60,10 @@
 #   one loop: never `schtasks /End` by a name that can be re-pointed, never a kill by name), wait until that pid is gone (start time
 #   checked), re-read the task definition, schtasks.exe /Run /TN \MlvAgentBachelor, wait for a heartbeat from a new LIVE agent
 #   process. The host options before -File may only be -NoProfile/-NoLogo/-NonInteractive, -ExecutionPolicy Bypass|RemoteSigned|
-#   Unrestricted (Restricted, AllSigned, Default and Undefined would keep the replacement from running) and -WindowStyle. It acts on THIS
+#   Unrestricted (Restricted, AllSigned, Default and Undefined would keep the replacement from running) and -WindowStyle, and
+#   -NoProfile is REQUIRED (a profile can set the agent's -Root default, so an argv that names no -Root would serve an unseen root).
+#   Right before /Run the task must show no running instance (IgnoreNew would make /Run a no-op and confirm an earlier instance), and a
+#   wall clock stepped against a monotonic watch during the restart makes the "started at or after /Run" proof void. It acts on THIS
 #   machine's task list, so -RestartMode when-idle is refused (16) before anything changes unless ALL hold: heartbeat.txt
 #   names this machine as host=; its agentScript= is <VenueRoot>\ultra-magnus-agent.ps1 (a copied heartbeat from another
 #   root fails here); its pid is alive with the recorded start time; and the task's own XML has an executable action
@@ -132,6 +135,8 @@ $script:OnWindows = ([System.Environment]::OSVersion.Platform -eq [System.Platfo
 $script:ReadTimeoutSec = 20
 # how long the restart waits for the stopped agent's process to go (the tests shorten it)
 $script:StopWaitSec = 30
+# how long the restart waits for the scheduler to show NO running instance of the task before /Run (the tests shorten it)
+$script:TaskIdleWaitSec = 15
 # the file a bounded runspace dot-sources to get this script's functions (empty only if the host gives no path)
 $script:SelfPath = $PSCommandPath
 
@@ -375,6 +380,14 @@ function ConvertTo-UtcStart {
     return [DateTimeOffset]::Parse($Text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime
 }
 
+function Test-ClockStepped {
+    # The wall clock moved differently from a monotonic Stopwatch since both were read together ($Utc0 at the moment $Watch started):
+    # the clock was stepped (NTP, a manual set, a VM resume) by more than the one start-time tolerance.
+    param([datetime]$Utc0, [System.Diagnostics.Stopwatch]$Watch)
+    $expected = $Utc0.ToUniversalTime() + $Watch.Elapsed
+    return ([Math]::Abs(([DateTime]::UtcNow - $expected).TotalSeconds) -gt $script:StartToleranceSec)
+}
+
 function Test-AgentProcessAlive {
     # Alive AND the same process the heartbeat recorded (pid plus start time, so a reused pid does not count).
     param($Beat, [switch]$RequireStart)
@@ -597,11 +610,18 @@ function Test-HostArgvRunsScript {
     # start) and the live process (what is RUNNING now: a definition edited after the instance started binds only the definition).
     # $Exe is the host executable, $Tokens the arguments after it, already decoded (Split-TaskArguments or /proc).
     param([string]$Exe, [string[]]$Tokens, [string]$AgentScript)
+    # the script's folder. A script directly under a drive root (R:\agent.ps1) has the folder R:\, never "R:" (drive-relative: the current
+    # directory of that drive); a script directly under the POSIX root has the folder /
     $expectedRoot = $AgentScript -replace '[\\/][^\\/]*$', ''
+    if ($expectedRoot -match '^[A-Za-z]:$') { $expectedRoot += '\' }
+    elseif ($expectedRoot -eq '' -and $AgentScript -match '^/') { $expectedRoot = '/' }
     $leaf = [regex]::Match($Exe.Trim().Trim('"'), '[^\\/]+$').Value
     if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { return $false }
     $tokens = @($Tokens)
     $hostFlags = @('NoProfile', 'nop', 'NoLogo', 'nol', 'NonInteractive', 'noni')
+    # -NoProfile is REQUIRED: without it the host loads a profile, which can set PSDefaultParameterValues for the agent's -Root and so
+    # point the agent at a root this check never saw (the argv then names no -Root, and the default is whatever the profile says)
+    $sawNoProfile = $false
     # only the policies under which a LOCAL, unsigned script runs: Restricted and AllSigned (and Default / Undefined, which resolve to
     # Restricted on a Windows client) would keep the replacement script from running, so the restart would stop the agent and not bring it back
     $policies = @('Bypass', 'RemoteSigned', 'Unrestricted')
@@ -616,12 +636,13 @@ function Test-HostArgvRunsScript {
         }
         if ($t.Length -lt 2 -or ($t[0] -ne [char]'-' -and $t[0] -ne [char]'/')) { return $false }
         $name = $t.Substring(1)
-        if ($hostFlags -contains $name) { $i++; continue }
+        if ($hostFlags -contains $name) { if ($name -eq 'NoProfile' -or $name -eq 'nop') { $sawNoProfile = $true }; $i++; continue }
         # a valued option takes ONLY one of its known values (a value of -File, or a path, would shift what the host runs)
         if ($hostValued.ContainsKey($name) -and $i + 1 -lt $tokens.Count -and $hostValued[$name] -contains $tokens[$i + 1]) { $i += 2; continue }
         return $false
     }
     if ($null -eq $scriptPath) { return $false }
+    if (-not $sawNoProfile) { return $false }
     if (-not (Test-AbsolutePathText -P $scriptPath)) { return $false }
     if (-not (Test-SamePath -A $scriptPath -B $AgentScript)) { return $false }
     $rest = @(); if ($i -lt $tokens.Count) { $rest = @($tokens[$i..($tokens.Count - 1)]) }
@@ -770,6 +791,10 @@ function Invoke-AgentRestart {
     # stop the INSTANCE the binding proved (its pid AND its recorded start), not "the task" by a name that can be re-pointed or re-run in
     # the meantime. The stop judges idle once more itself, with the instance in hand and right before Stop(), so the last idle read
     # above is only an early out. Its answer is three-valued: 'unknown' (no answer in time, or Stop() raised) may still have stopped the agent.
+    # a wall clock and a monotonic watch, read together: if they disagree later, the clock was stepped, and every "started at or after
+    # /Run" comparison below (which reads the wall clock) can no longer be trusted
+    $clockUtc0 = [DateTime]::UtcNow
+    $clockWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $stop = Stop-TaskInstanceBounded -ProcessId $before.pid -StartText $before.start
     if ($stop.outcome -eq 'not-stopped') {
         if ($null -ne $stop.busy) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $(@($stop.busy) -join '; ')"; warn = $null } }
@@ -789,6 +814,15 @@ function Invoke-AgentRestart {
     if (-not (Test-TaskXmlRunsScript -Xml $nowXml.xml -AgentScript $AgentScript)) {
         return @{ why = "the old agent is stopped but the task was NOT started: its definition changed and no longer runs -File $AgentScript for this root"; warn = $warn }
     }
+    # /Run with the task's default IgnoreNew policy does NOT start a second instance: if a trigger (or anything else) already started one
+    # after the old agent exited, /Run succeeds and that earlier instance would be attested as the replacement. So the task must have NO
+    # running instance right before /Run (it may take a moment for the scheduler to drop the instance whose process just exited)
+    $idleTask = Wait-Until -TimeoutSec $script:TaskIdleWaitSec -Condition { $tp = Get-TaskRunningPids; $tp.ok -and (@($tp.pids).Count -eq 0) }
+    if (-not $idleTask) {
+        $left = Get-TaskRunningPidsBounded
+        $what = $(if ($null -eq $left) { 'its running instances could not be read from the Task Scheduler' } else { "task $TaskName already has a running instance (pid $(@($left) -join ',')) that this restart did not start, so /Run would not start a new one and the replacement could not be proved" })
+        return @{ why = "the old agent is stopped but the task was NOT started: $what"; warn = $warn }
+    }
     $runAt = [DateTime]::UtcNow
     $run = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName) -TimeoutSec 30
     if ($run.timedOut) { return @{ why = "schtasks /Run $TaskName did not return within 30 s"; warn = $warn } }
@@ -802,6 +836,9 @@ function Invoke-AgentRestart {
         Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $runAt -CheckCommandLine -TaskPids $tp.pids
     } -PollMs 1000
     if (-not $up) { return @{ why = 'no heartbeat from a new LIVE agent process within 60 s of schtasks /Run'; warn = $warn } }
+    if (Test-ClockStepped -Utc0 $clockUtc0 -Watch $clockWatch) {
+        return @{ why = 'the system clock was stepped during the restart, so "started at or after /Run" cannot be proved for the new agent; verify it by hand'; warn = $warn }
+    }
     return @{ why = $null; warn = $warn }
 }
 

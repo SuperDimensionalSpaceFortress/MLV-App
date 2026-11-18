@@ -410,10 +410,10 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(self._task_xml_case("later", mine, task("-File &quot;C:\\busy-root\\ultra-magnus-agent.ps1&quot; " + mine)), "False")
         self.assertEqual(self._task_xml_case("quoted", mine, task("-NoProfile -File &quot;%s&quot;" % mine)), "True")
         self.assertEqual(self._task_xml_case("bare", mine, task("-NoProfile -File %s" % mine)), "True")
-        self.assertEqual(self._task_xml_case("case", mine, task("-File &quot;C:\\BENCH\\Ultra-Magnus-Agent.ps1&quot;")), "True")
+        self.assertEqual(self._task_xml_case("case", mine, task("-NoProfile -File &quot;C:\\BENCH\\Ultra-Magnus-Agent.ps1&quot;")), "True")
         # XML-escaped path: the correct task for a root with an ampersand must still bind
         amp = r"C:\Bench & Jobs\ultra-magnus-agent.ps1"
-        self.assertEqual(self._task_xml_case("amp", amp, task("-File &quot;C:\\Bench &amp; Jobs\\ultra-magnus-agent.ps1&quot;")), "True")
+        self.assertEqual(self._task_xml_case("amp", amp, task("-NoProfile -File &quot;C:\\Bench &amp; Jobs\\ultra-magnus-agent.ps1&quot;")), "True")
         self.assertEqual(self._task_xml_case("nofile", mine, task("-NoProfile")), "False")
         self.assertEqual(self._task_xml_case("malformed", mine, "<Task><Actions>"), "False")
 
@@ -506,7 +506,7 @@ class DeployBachelorAgent(unittest.TestCase):
         # the real shapes still bind
         self.assertEqual(self._exec_task_case("full-path-host", "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoProfile -File %s%s%s" % (q, mine, q)), "True")
         self.assertEqual(self._exec_task_case("ps51", "powershell.exe", "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File %s" % mine), "True")
-        self.assertEqual(self._exec_task_case("noexe", "pwsh", "-NoLogo -NonInteractive -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("noexe", "pwsh", "-NoProfile -NoLogo -NonInteractive -File %s" % mine), "True")
         # a relative script resolves against a working directory this check cannot see
         self.assertEqual(self._exec_task_case("relative", "pwsh.exe", "-File ultra-magnus-agent.ps1"), "False")
 
@@ -1098,6 +1098,73 @@ class DeployBachelorAgent(unittest.TestCase):
         out, marker = self._stop_case("no-such-path", task_path="\\Other")
         self.assertEqual(out.get("outcome"), "not-stopped", out)
         self.assertFalse(marker.exists())
+
+    # ---- adversary pass 10 findings (A1..A3 of ca2a5a75): each test failed on ca2a5a750 ----
+
+    def test_p10a1_a_host_that_loads_a_profile_does_not_bind_the_root(self) -> None:
+        # pass 10 A1: with no -NoProfile the host loads a profile, and a profile can set PSDefaultParameterValues['ultra-magnus-agent.ps1:Root'],
+        # so a task or live argv that names NO -Root can serve another root than the one checked idle. -NoProfile is required (definition and live argv).
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        self.assertEqual(self._exec_task_case("p10-profile", "pwsh.exe", "-ExecutionPolicy Bypass -File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("p10-bare", "pwsh.exe", "-File %s" % mine), "False")
+        self.assertEqual(self._exec_task_case("p10-noprofile", "pwsh.exe", "-NoProfile -ExecutionPolicy Bypass -File %s" % mine), "True")
+        self.assertEqual(self._exec_task_case("p10-nop", "pwsh.exe", "-nop -File %s" % mine), "True")
+        body = (
+            "function A($t){ [pscustomobject]@{ ok = $true; tokens = $t } };"
+            "'profile='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s');"
+            "'noprofile='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-File','%s')) -AgentScript '%s')"
+        ) % (psq(mine), psq(mine), psq(mine), psq(mine))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["profile=False", "noprofile=True"], r.stdout + r.stderr)
+
+    def test_p10a3_an_explicit_root_that_is_a_drive_root_binds(self) -> None:
+        # pass 10 A3: the script folder of R:\ultra-magnus-agent.ps1 is R:\, and it was computed as "R:" (drive-relative), so the matching
+        # -Root R:\ was refused. The same must hold for a UNC share root and for a subfolder.
+        body = (
+            "'drive='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','R:\\ultra-magnus-agent.ps1','-Root','R:\\') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
+            "'drive-no-root='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','R:\\ultra-magnus-agent.ps1') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
+            "'drive-other='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','R:\\ultra-magnus-agent.ps1','-Root','R:\\busy') -AgentScript 'R:\\ultra-magnus-agent.ps1');"
+            "'sub='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','C:\\bench\\ultra-magnus-agent.ps1','-Root','C:\\bench') -AgentScript 'C:\\bench\\ultra-magnus-agent.ps1');"
+            "'sub-other='+(Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens @('-NoProfile','-File','C:\\bench\\ultra-magnus-agent.ps1','-Root','C:\\busy') -AgentScript 'C:\\bench\\ultra-magnus-agent.ps1')"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["drive=True", "drive-no-root=True", "drive-other=False", "sub=True", "sub-other=False"], r.stdout + r.stderr)
+
+    def test_p10a2_the_clock_stepping_back_does_not_let_an_earlier_instance_confirm_the_replacement(self) -> None:
+        # pass 10 A2: after the old agent exits a trigger starts PID 4200; the clock steps back; runAt (a wall-clock read) is now BEFORE
+        # that start, and /Run is ignored (IgnoreNew): the instance that existed before /Run confirmed the restart. Two closures:
+        # a step of the wall clock against a monotonic watch is detected, and the task must have no running instance right before /Run.
+        body = (
+            "$sw=[Diagnostics.Stopwatch]::StartNew();"
+            "'steady='+(Test-ClockStepped -Utc0 ([DateTime]::UtcNow) -Watch $sw);"
+            "'back='+(Test-ClockStepped -Utc0 ([DateTime]::UtcNow.AddSeconds(30)) -Watch $sw);"
+            "'forward='+(Test-ClockStepped -Utc0 ([DateTime]::UtcNow.AddSeconds(-30)) -Watch $sw)"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["steady=False", "back=True", "forward=True"], r.stdout + r.stderr)
+
+    def test_p10a2_a_task_that_already_runs_an_instance_is_not_started(self) -> None:
+        pid, start = self.live_agent()
+        agent = self.venue / AGENT_NAME
+        xml = Path(self._tmp.name) / "task-p10a2.xml"
+        xml.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File \"%s\"</Arguments></Exec></Actions></Task>" % agent, encoding="utf-8")
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText) Stop-Process -Id $ProcessId -Force; [pscustomobject]@{ outcome = 'stopped'; why = $null; busy = $null } };"
+            "$script:TaskIdleWaitSec = 2;"   # the wait for the scheduler to drop the old instance is shortened for the test
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (pid, start, psq(agent), psq(agent))
+        # the scheduler (the -TaskPidsFile seam) still lists an instance, pid 4200, that a trigger started after the old agent exited
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s' -TaskPidsFile '%s'; %s" % (
+            psq(SCRIPT), psq(self.venue), psq(xml), psq(self.task_pids(4200, name="p10a2")), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("already has a running instance", r.stdout)
+        self.assertNotIn("schtasks /Run", r.stdout, "/Run is not issued when an instance already runs")
 
     def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
         # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.
