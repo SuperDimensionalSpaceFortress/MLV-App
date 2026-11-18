@@ -60,6 +60,7 @@ def cdng_profile(frames: int, dual_iso_ms: float = 30.0, success: bool = True, b
         stage = {k: 1.0 for k in CDNG_STAGES}
         stage["raw_read_ms"] = 4.0
         stage["llrawproc_dual_iso_ms"] = dual_iso_ms
+        stage["llrawproc_ms"] = 40.0   # r8: the llrawproc total contains its llrawproc_* children (the 30 ms dual-ISO one included)
         stage["dng_compress_encode_ms"] = 10.0
         stage["producer_frame_ms"] = 50.0 + (i % 3)
         row = {"clip": "view-0", "frame_index": i, "raw_input_state": "x", "raw_output_state": "y", "success": success and i >= failed}
@@ -546,6 +547,32 @@ class ExportEvidenceTests(unittest.TestCase):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
 
+    def test_r8_a1b_a_stage_timed_longer_than_the_stage_that_contains_it_is_invalid(self) -> None:
+        """adversary r8 pass 9 A1: raw_uint16 at 900 ms inside a 40 ms debayered_frame (share 16x), and a CDNG raw_read / llrawproc_other of 900 ms inside a 50 ms producer frame
+        and a 5 ms llrawproc total, read PASS under empty criteria. Every child's mean is held to its parent's (5 % + 1 ms slack); an absent parent or child is skipped."""
+        def stage_with(**ms) -> str:
+            every = ("raw_uint16_disk_read", "raw_uint16_decompress", "raw_uint16", "llrawproc", "debayered_frame", "processing", "processed16_total")
+            return self.stage_lines({s: range(30) for s in every}, ms)
+        def cdng_with(**fields) -> str:
+            doc = json.loads(cdng_profile(30))
+            for r in doc["frames"]:
+                r.update(fields)
+            return json.dumps(doc)
+        cases = [prores_case(stage=stage_with(raw_uint16=900.0), criteria=[]),                         # 0: the finding
+                 prores_case(stage=stage_with(raw_uint16_disk_read=30.0), criteria=[]),                # 1: disk_read 30 > raw_uint16 9
+                 prores_case(stage=stage_with(llrawproc=500.0), criteria=[]),                          # 2: llrawproc past debayered_frame
+                 prores_case(stage=stage_with(processing=200.0), criteria=[]),                         # 3: a top-level child past processed16_total
+                 cdng_case(profile=cdng_with(raw_read_ms=900.0), criteria=[]),                         # 4: a producer stage past producer_frame_ms
+                 cdng_case(profile=cdng_with(llrawproc_ms=5.0, llrawproc_other_ms=20.0), criteria=[]), # 5: a llrawproc child past llrawproc_ms
+                 prores_case(criteria=[]), cdng_case(criteria=[])]                                    # 6, 7: controls
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(6):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual((got[6]["outcome"], got[7]["outcome"]), ("PASS", "PASS"), got[6:])
+
     def test_r8_a3_a_manifest_count_or_total_that_is_not_a_json_integer_is_invalid(self) -> None:
         """adversary r7 pass A3 (advisory): count [1] / "1" and totalBytes [1000] / "1000" were stringified and parsed, so a non-integer shape read PASS. Only a JSON integer is one."""
         def manifest(count, total) -> str:
@@ -715,7 +742,8 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         return path
 
     def write_export_artifacts(self, frames: int, profile: bool = True, venue: str = "bachelor", fmt: str = "cdng-lossless",
-                               exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None, stage: str | None = None) -> None:
+                               exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None, stage: str | None = None,
+                               source_commit: str | None = None) -> None:
         a = self.artifacts
         if a.exists():
             shutil.rmtree(a)
@@ -723,7 +751,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
         exported = frames if exported is None else exported
         summary = {"schema": "export-stage-job.v1", "result": result, "legType": "export", "format": fmt, "maxFrames": frames,
                    "dualIsoExpected": True, "clipId": "M16-1243", "backend": "cpu", "declaredVenue": venue, "venue": observed_venue or venue,
-                   "sourceCommit": self.sha, "buildManifestSha256": self.build_sha, "receiptSha256": leg(EXPORT_LEGS[0])["export"]["receiptSha256"],
+                   "sourceCommit": source_commit or self.sha, "buildManifestSha256": self.build_sha, "receiptSha256": leg(EXPORT_LEGS[0])["export"]["receiptSha256"],
                    "exportWallSeconds": 30.0, "appExitCode": 0, "timedOut": False, "fixtureRehearsal": False}
         (a / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
         (a / "batch.log").write_text(batch_log(exported), encoding="utf-8")
@@ -733,7 +761,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
             (a / "output-manifest.json").write_text(output_manifest(1, "mov"), encoding="utf-8")
             return
         if profile:
-            (a / "export-profile.json").write_text(cdng_profile(frames, build_id=self.sha), encoding="utf-8")
+            (a / "export-profile.json").write_text(cdng_profile(frames, build_id=source_commit or self.sha), encoding="utf-8")
         (a / "output-manifest.json").write_text(output_manifest(exported), encoding="utf-8")
 
     def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "") -> dict:
@@ -774,6 +802,19 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                 got = self.validate(r, spec, evidence_dir=str(work))
                 self.assertFalse(got["valid"], got)
                 self.assertIn(got["status"], ("INVALID", "INCOMPLETE"), got)
+
+    def test_r8_a3b_an_export_built_from_another_commit_than_the_requested_one_is_invalid_at_write(self) -> None:
+        """adversary r8 pass 9 A3: the leg took ExpectedBuildId from the job's OWN summary.sourceCommit and never compared that to the requested SourceCommit, so a summary and
+        profile that both named another commit passed. The writer binds the requested commit: the reader's expected build is the request, and the identity loop compares it."""
+        spec = self.export_spec(maxframes=30)
+        self.write_export_artifacts(30, source_commit="f" * 40)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertTrue("sourceCommit" in receipt["outcomeDetail"] or "EXPORT_PROFILE_FOREIGN" in receipt["outcomeDetail"], receipt["outcomeDetail"])
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
 
     def test_r8_a4_an_out_of_range_or_non_integer_um_run_exit_code_is_a_typed_invalid_not_a_throw(self) -> None:
         """adversary r7 pass A4: um-run.json exitCode 2147483648 (valid Int64) passed the null-only guard and the [int] narrowing threw before Test-DvReceiptValid returned.
@@ -1126,7 +1167,7 @@ class ExportJobGeneratorTests(unittest.TestCase):
         self.assertIn("if ($timedOut -and -not $killConfirmed) { 'EXPORT_KILL_UNCONFIRMED' }", text)
         self.assertIn("EXPORT_KILL_UNCONFIRMED = 48", text)
         self.assertIn("killConfirmed = $killConfirmed", text, "the summary records whether the tree was confirmed dead")
-        self.assertLess(text.index("$killConfirmed = $true"), text.index("$manifest.deleted = Remove-ExportOutput"), "the kill is settled before any output is read or deleted")
+        self.assertLess(text.index("$killConfirmed = $true"), text.index("$manifest.deleted = $(try { Remove-ExportOutput }"), "the kill is settled before any output is read or deleted")
         proc, got = run_pwsh_json("$e = [pscustomobject]@{ metrics = [pscustomobject]@{}; stages = $null; problems = @(); classMismatch = $false; classDetail = $null }\n"
                                   "[ordered]@{ unconfirmed = (Get-DvExportOutcome -ResultToken 'EXPORT_KILL_UNCONFIRMED' -ExitCode 48 -Evidence $e -Criteria @()).outcome; "
                                   "timeout = (Get-DvExportOutcome -ResultToken 'EXPORT_TIMEOUT' -ExitCode 40 -Evidence $e -Criteria @()).outcome } | ConvertTo-Json -Compress")

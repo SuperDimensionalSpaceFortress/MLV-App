@@ -4513,6 +4513,28 @@ $script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and 
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
 $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json')
 
+# r8 fix 2 (adversary r8 A1): the PARENT/CHILD half of the stage schema. A published share is of work the stage's parent contains: a child whose mean exceeds its parent's is
+# no measurement of this run (raw_uint16 at 900 ms inside a 40 ms debayered_frame read a 16x share and PASSed). Pairs are child -> parent, over the stage rows' means, with the
+# slack two clocks and rounding can honestly show (5 % + 1 ms); a pair whose parent or child is wholly absent is skipped (a stage the app did not run is permitted).
+$script:ExportStageContainTolerance = 1.05
+$script:ExportStageContainSlackMs = 1.0
+$script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw_uint16_disk_read', 'raw_uint16'), @('raw_uint16_decompress', 'raw_uint16'), @('llrawproc', 'debayered_frame'),
+    @('debayered_frame', 'processed16_total'), @('processing', 'processed16_total'))
+$script:ExportCdngLlrawprocChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_pre_dualiso_fix',
+    'llrawproc_dual_iso', 'llrawproc_chroma_smooth', 'llrawproc_shared_lock', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock', 'llrawproc_other')
+
+function Get-DvExportContainmentProblem {
+    # $null, or the EXPORT_STAGE_CONTAINMENT_MISMATCH problem naming the first child (and the count) whose mean exceeds its parent's. $Means: stage name -> mean ms ($null = absent).
+    param($Means, $Pairs)
+    $bad = [System.Collections.Generic.List[string[]]]::new()   # (a list of pairs: a pipeline would unroll a one-pair result into its two names)
+    foreach ($pair in $Pairs) {
+        $c = $Means[$pair[0]]; $p = $Means[$pair[1]]
+        if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) { $bad.Add([string[]]@($pair[0], $pair[1])) }
+    }
+    if ($bad.Count -eq 0) { return $null }
+    "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $($Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $($Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
+}
+
 function Get-DvExportInt64($Value) {
     # r8 (adversary r7 pass A3): the export writers emit these figures as JSON integers; ConvertTo-DvInt64 stringifies first, so [1] and "1" read as 1. Only a JSON integer is
     # one here, anything else is $null (absent), which every caller already types.
@@ -4756,6 +4778,12 @@ function Get-DvExportEvidence {
                                   dngCompressPlacement = (Get-DvProp $profile 'dng_compress_placement'); asyncWriterCanOverlapDngCompress = (Get-DvProp $profile 'async_writer_can_overlap_dng_compress')
                                   largestStage = $(if ($largest.Count) { [string]$largest[0] } else { $null }) }
             if ($largest.Count) { $m.largestStage = [string]$largest[0]; $m.largestStageShare = $rowsOut[[string]$largest[0]].share }
+            # r8 fix 2 (adversary r8 A1): every producer stage is inside producer_frame_ms and every llrawproc_* child is inside llrawproc_ms
+            $means = @{ producer_frame = $denRow.meanMs; llrawproc = $stages.llrawprocTotal.meanMs }
+            foreach ($name in $script:ExportCdngProducerStages) { $means[$name] = $rowsOut[$name].meanMs }
+            $pairs = @(foreach ($name in $script:ExportCdngProducerStages) { , @($name, 'producer_frame') }) + @(foreach ($name in $script:ExportCdngLlrawprocChildren) { , @($name, 'llrawproc') })
+            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs
+            if ($null -ne $containment) { $problems.Add($containment) }
             # adversary r2 A2: a capture is a stage-share measurement; successful rows with no producer_frame_ms (or no producer stage figure at all) measured none
             if ($ok.Count -gt 0 -and ($denRow.samples -ne $ok.Count -or $null -eq $denRow.meanMs -or [double]$denRow.meanMs -le 0 -or $largest.Count -eq 0)) {
                 $problems.Add("EXPORT_PROFILE_ABSENT: the profile carries no producer_frame_ms and per-stage timings for its $($ok.Count) successful frame(s) ($($denRow.samples) with a denominator, $($largest.Count) producer stage row(s)), so no stage share can be read")
@@ -4802,6 +4830,11 @@ function Get-DvExportEvidence {
             # adversary r6 A1: equal sample COUNTS are not the same window; each child must also be timed on exactly the frames processed16_total is timed on
             # r7 (A1 + Dot I2): that holds for EVERY stage the table publishes a share for, at every depth: a disjoint child or nested stage (raw_uint16, its disk_read and
             # decompress, llrawproc) is timed on exactly processed16_total's frames or on none at all (a stage the app did not run is absent, never partial)
+            # r8 fix 2 (adversary r8 A1): and each stage's mean is inside the stage that contains it (the rendered stage tree in $script:ExportRenderedContainment)
+            $means = @{}
+            foreach ($name in $script:ExportRenderedStages) { $means[$name] = $rowsOut[$name].meanMs }
+            $containment = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportRenderedContainment
+            if ($null -ne $containment) { $problems.Add($containment) }
             $p16Frames = $perStage['processed16_total']
             $missingChild = @($script:ExportRenderedTopLevel | Where-Object { $rowsOut[$_].samples -ne $p16.samples })
             if ($m.stageFramesSeen -gt 0 -and ($null -eq $p16.meanMs -or [double]$p16.meanMs -le 0 -or $missingChild.Count -gt 0)) {

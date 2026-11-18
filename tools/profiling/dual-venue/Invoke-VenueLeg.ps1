@@ -745,7 +745,7 @@ if ($isExport) {
     $exportSummary = $null
     if ($exportTexts.ContainsKey('summary.json')) { try { $exportSummary = $exportTexts['summary.json'] | ConvertFrom-Json -ErrorAction Stop } catch { $exportSummary = $null } }
     $exportEvidence = Get-DvExportEvidence -Format ([string]$spec.export.format) -MaxFrames ([int]$spec.export.maxFrames) -DualIsoExpected ([bool]$spec.export.dualIsoExpected) `
-        -ExpectedBuildId ([string](Get-DvProp $exportSummary 'sourceCommit')) -ProfileText ([string]$exportTexts['export-profile.json']) -StageLogText ([string]$exportTexts['stage-timing.log']) `
+        -ExpectedBuildId $SourceCommit -ProfileText ([string]$exportTexts['export-profile.json']) -StageLogText ([string]$exportTexts['stage-timing.log']) `
         -BatchLogText ([string]$exportTexts['batch.log']) -OutputManifestText ([string]$exportTexts['output-manifest.json'])
     $receipt.metrics = $exportEvidence.metrics
     $receipt.export.stages = $exportEvidence.stages
@@ -756,7 +756,7 @@ if ($isExport) {
     elseif ($null -eq $exportSummary) { $identityProblems += 'EVIDENCE_ABSENT: the job published no readable summary.json' }
     else {
         foreach ($pair in @(@('schema', 'export-stage-job.v1'), @('legType', 'export'), @('format', [string]$spec.export.format), @('clipId', [string]$spec.clipId), @('backend', 'cpu'),
-                            @('declaredVenue', $Venue), @('venue', $Venue), @('buildManifestSha256', $BuildManifestSha256), @('receiptSha256', [string]$spec.export.receiptSha256), @('result', [string]$token))) {
+                            @('declaredVenue', $Venue), @('venue', $Venue), @('buildManifestSha256', $BuildManifestSha256), @('sourceCommit', $SourceCommit), @('receiptSha256', [string]$spec.export.receiptSha256), @('result', [string]$token))) {
             if ([string](Get-DvProp $exportSummary $pair[0]) -cne $pair[1]) { $identityProblems += "EXPORT_SUMMARY_MISMATCH: summary.json $($pair[0]) is not the leg's" }
         }
         if ([string](Get-DvProp $exportSummary 'maxFrames') -cne [string]$spec.export.maxFrames) { $identityProblems += 'EXPORT_SUMMARY_MISMATCH: summary.json maxFrames is not the leg''s' }

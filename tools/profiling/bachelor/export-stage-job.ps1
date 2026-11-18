@@ -344,7 +344,10 @@ try {
     $stageEvidence = if ($Format -eq 'cdng-lossless') { $profilePath } else { $stageLog }
     $stagePresent = (Test-Path -LiteralPath $stageEvidence -PathType Leaf) -and ((Get-Item -LiteralPath $stageEvidence).Length -gt 0)
     $outputs = @()
-    if (Test-Path -LiteralPath $outDir) {
+    # r8 fix 2 (adversary r8 A2): with the tree NOT confirmed dead a survivor (ffmpeg) may still hold the .mov without read sharing, and hashing it threw into the finally before any
+    # result was typed. Nothing is enumerated or hashed then: the output count is 0, the delete below is attempted and its failure is recorded (deleted=false), and the run
+    # ends EXPORT_KILL_UNCONFIRMED with its summary published.
+    if (-not ($timedOut -and -not $killConfirmed) -and (Test-Path -LiteralPath $outDir)) {
         $outputs = @(Get-ChildItem -LiteralPath $outDir -Recurse -File -Filter $(if ($Format -eq 'cdng-lossless') { '*.dng' } else { '*.mov' }) | Sort-Object FullName)
     }
     $manifest = [ordered]@{ schema = 'export-stage-output-manifest.v1'; kind = $(if ($Format -eq 'cdng-lossless') { 'dng' } else { 'mov' }); count = $outputs.Count
@@ -366,7 +369,7 @@ try {
     $exitFor = @{ EXPORT_CAPTURED = 0; EXPORT_TIMEOUT = 40; EXPORT_NO_FRAMES = 41; EXPORT_FRAMES_SHORT = 42; EXPORT_PROFILE_ABSENT = 43; EXPORT_OUTPUT_MISMATCH = 44; EXPORT_EXIT_NONZERO = 46; EXPORT_KILL_UNCONFIRMED = 48 }
 
     # --- publish ONLY the records; then delete the exported footage from the venue-local work dir -------------------------------------------------------------------
-    $manifest.deleted = Remove-ExportOutput
+    $manifest.deleted = $(try { Remove-ExportOutput } catch { Write-JobTrace "export output delete error=$([string]$_.CategoryInfo.Reason)"; $false })   # a locked survivor makes this false, never a missing terminal
     if (Test-Path -LiteralPath $batchLog -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $batchLog -Destination (Join-Path $Pub 'batch.log')) }
     if (Test-Path -LiteralPath $stageEvidence -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $stageEvidence -Destination (Join-Path $Pub ([IO.Path]::GetFileName($stageEvidence)))) }
     Save-Json $manifest (Join-Path $Pub 'output-manifest.json')
