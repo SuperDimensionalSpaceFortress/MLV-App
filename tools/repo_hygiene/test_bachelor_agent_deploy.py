@@ -343,6 +343,90 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.split(), ["never=False", "sec=1", "now=True"], r.stdout + r.stderr)
 
+    # ---- adversary r2 findings (B1..B4): each test failed on e039c604 ----
+
+    def _task_xml_case(self, name: str, agent_script: str, xml: str) -> str:
+        f = Path(self._tmp.name) / ("task-%s.xml" % name)
+        f.write_text(xml, encoding="utf-8")
+        r = self._dot_source("Test-TaskXmlRunsScript -Xml (Get-Content -Raw -LiteralPath '%s') -AgentScript '%s'" % (f, agent_script))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout.strip()
+
+    def test_b1_task_binding_reads_the_executable_action_not_any_mention(self) -> None:
+        def task(args: str, desc: str = "") -> str:
+            return ("<Task><RegistrationInfo><Description>%s</Description></RegistrationInfo><Actions><Exec>"
+                    "<Command>pwsh.exe</Command><Arguments>%s</Arguments></Exec></Actions></Task>") % (desc, args)
+
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        # the other root's busy agent, with my path only in the description (the adversary's input)
+        self.assertEqual(self._task_xml_case("desc", mine, task("-File &quot;C:\\busy-root\\ultra-magnus-agent.ps1&quot;", "backup of " + mine)), "False")
+        # a mention in a later argument is not the script the task runs
+        self.assertEqual(self._task_xml_case("later", mine, task("-File &quot;C:\\busy-root\\ultra-magnus-agent.ps1&quot; " + mine)), "False")
+        self.assertEqual(self._task_xml_case("quoted", mine, task("-NoProfile -File &quot;%s&quot;" % mine)), "True")
+        self.assertEqual(self._task_xml_case("bare", mine, task("-NoProfile -File %s -Foo" % mine)), "True")
+        self.assertEqual(self._task_xml_case("case", mine, task("-File &quot;C:\\BENCH\\Ultra-Magnus-Agent.ps1&quot;")), "True")
+        # XML-escaped path: the correct task for a root with an ampersand must still bind
+        amp = r"C:\Bench & Jobs\ultra-magnus-agent.ps1"
+        self.assertEqual(self._task_xml_case("amp", amp, task("-File &quot;C:\\Bench &amp; Jobs\\ultra-magnus-agent.ps1&quot;")), "True")
+        self.assertEqual(self._task_xml_case("nofile", mine, task("-NoProfile")), "False")
+        self.assertEqual(self._task_xml_case("malformed", mine, "<Task><Actions>"), "False")
+
+    def test_b1_description_only_task_xml_refuses_end_to_end(self) -> None:
+        import os
+        me = subprocess.Popen([PWSH, "-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        self.addCleanup(lambda: (me.kill(), me.wait()))
+        start = subprocess.run(
+            [PWSH, "-NoProfile", "-Command", "(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o')" % me.pid],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        (self.venue / "heartbeat.txt").write_text(
+            'alive x pid=%d host=%s generation=1 processStartUtc=%s agentScript="%s"\r\n'
+            % (me.pid, os.environ.get("COMPUTERNAME", "HOST"), start, self.venue / AGENT_NAME))
+        xml = Path(self._tmp.name) / "task-desc.xml"
+        xml.write_text(
+            "<Task><RegistrationInfo><Description>backup of %s</Description></RegistrationInfo><Actions><Exec><Command>pwsh.exe</Command>"
+            "<Arguments>-File \"C:\\busy-root\\ultra-magnus-agent.ps1\"</Arguments></Exec></Actions></Task>" % (self.venue / AGENT_NAME),
+            encoding="utf-8")
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml))
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assert_untouched()
+
+    def test_b2_a_condition_observed_after_the_deadline_is_not_accepted(self) -> None:
+        body = (
+            "$s=[Diagnostics.Stopwatch]::StartNew();"
+            "'slowcond='+(Wait-Until -TimeoutSec 1 -Condition { Start-Sleep -Milliseconds 1500; $true });"
+            "$g=[Diagnostics.Stopwatch]::StartNew();"
+            "'late='+(Wait-Until -TimeoutSec 1 -PollMs 900 -Condition { $g.Elapsed.TotalSeconds -gt 1.05 });"
+            "'inside='+(Wait-Until -TimeoutSec 5 -PollMs 100 -Condition { $s.Elapsed.TotalSeconds -gt 0 })"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["slowcond=False", "late=False", "inside=True"], r.stdout + r.stderr)
+
+    def test_b3_a_replacement_with_a_reused_pid_is_a_different_process(self) -> None:
+        body = (
+            "function B($p,$st){ [pscustomobject]@{pid=$p;start=$st} };"
+            "'samepid_newstart='+(Test-BeatIsDifferentProcess -Old (B 4242 '2026-11-18T14:00:00.0000000Z') -New (B 4242 '2026-11-18T18:00:01.0000000Z'));"
+            "'same='+(Test-BeatIsDifferentProcess -Old (B 4242 '2026-11-18T14:00:00.0000000Z') -New (B 4242 '2026-11-18T14:00:00.5000000Z'));"
+            "'newpid='+(Test-BeatIsDifferentProcess -Old (B 4242 '2026-11-18T14:00:00.0000000Z') -New (B 4244 '2026-11-18T14:00:00.0000000Z'));"
+            "'nostart='+(Test-BeatIsDifferentProcess -Old (B 4242 '') -New (B 4242 ''))"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["samepid_newstart=True", "same=False", "newpid=True", "nostart=False"], r.stdout + r.stderr)
+
+    def test_b4_a_root_that_cannot_be_listed_is_unreadable_even_for_a_noop(self) -> None:
+        import os
+        who = "%s\\%s" % (os.environ.get("USERDOMAIN", ""), os.environ.get("USERNAME", ""))
+        (self.venue / AGENT_NAME).write_bytes(NEW)
+        # deny List-Directory on the ROOT only (no inheritance), as the adversary's input; the children stay listable
+        subprocess.run(["icacls", str(self.venue), "/deny", "%s:(RD)" % who], check=True, capture_output=True)
+        self.addCleanup(lambda: subprocess.run(["icacls", str(self.venue), "/remove:d", who], capture_output=True))
+        r = self.run_deploy()
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_UNREADABLE", r.stdout)
+        self.assertNotIn("DEPLOY_NOOP", r.stdout)
+
     def test_a1_work_that_arrives_during_the_restart_is_reported_not_hidden(self) -> None:
         # A1: no admission barrier exists in the agent, so a job landing during the restart cannot be prevented from here.
         # It must be DETECTED and typed (the agent's own startup recovery then adopts or requeues it).

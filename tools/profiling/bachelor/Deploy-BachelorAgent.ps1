@@ -60,7 +60,9 @@
 #   name), schtasks.exe /Run /TN \MlvAgentBachelor, wait for a heartbeat from a new LIVE agent process. It acts on THIS
 #   machine's task list, so -RestartMode when-idle is refused (16) before anything changes unless ALL hold: heartbeat.txt
 #   names this machine as host=; its agentScript= is <VenueRoot>\ultra-magnus-agent.ps1 (a copied heartbeat from another
-#   root fails here); its pid is alive with the recorded start time; and the task's own XML names that same script path.
+#   root fails here); its pid is alive with the recorded start time; and the task's own XML has an executable action
+#   `-File <that script path>` (a path mentioned only in the description or a later argument does not count).
+#   The root itself must also list (a root whose listing is denied is DEPLOY_REFUSED_UNREADABLE, even for a no-op).
 #   The idle gate keeps the End from stranding a lease: with running\, inbox\ and slot-holders\ empty, nothing is lost.
 #   Waits use a monotonic Stopwatch, never the wall clock.
 #
@@ -121,12 +123,18 @@ function Write-BytesAtomic {
 
 function Wait-Until {
     # Bounded by a monotonic Stopwatch: a wall-clock step cannot stretch or cut the wait.
+    # A condition counts only if it was OBSERVED true inside the window: the deadline is checked before it is evaluated and again
+    # after (a slow read that crosses the deadline is a timeout), and the sleep never runs past the deadline.
     param([int]$TimeoutSec, [scriptblock]$Condition, [int]$PollMs = 500)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($true) {
-        if (& $Condition) { return $true }
         if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { return $false }
-        Start-Sleep -Milliseconds $PollMs
+        $ok = & $Condition
+        if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { return $false }
+        if ($ok) { return $true }
+        $leftMs = [int](($TimeoutSec - $sw.Elapsed.TotalSeconds) * 1000)
+        if ($leftMs -le 0) { return $false }
+        Start-Sleep -Milliseconds ([Math]::Min($PollMs, $leftMs))
     }
 }
 
@@ -143,6 +151,12 @@ function Test-SamePath {
 function Get-VenueState {
     # Reads the three folders the idle judgement rests on. Any failure to list one is "unreadable", never "empty".
     $state = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @() }
+    # the root itself must list too: lock creation and file reads can succeed where enumeration is denied
+    try { [void]@([System.IO.Directory]::EnumerateFileSystemEntries($VenueRoot) | Select-Object -First 1) }
+    catch {
+        $state.unreadable = "the venue root cannot be listed: $($_.Exception.Message)"
+        return [pscustomobject]$state
+    }
     foreach ($d in @('inbox', 'running', 'slot-holders')) {
         if (-not (Test-Path -LiteralPath (Join-Path $VenueRoot $d) -PathType Container)) {
             $state.unreadable = "folder $d\ is missing under $VenueRoot"
@@ -238,6 +252,35 @@ function Test-NewHeartbeatIsLiveAgent {
     return (Test-AgentProcessAlive -Beat $Beat -RequireStart)
 }
 
+function Test-BeatIsDifferentProcess {
+    # A restart yields a different PROCESS, not necessarily a different pid number: a reused pid with another start time counts.
+    param($Old, $New)
+    if ($Old.pid -ne $New.pid) { return $true }
+    if ([string]::IsNullOrWhiteSpace($Old.start) -or [string]::IsNullOrWhiteSpace($New.start)) { return $false }
+    try {
+        $a = [DateTimeOffset]::Parse($Old.start, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
+        $b = [DateTimeOffset]::Parse($New.start, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
+        return ([Math]::Abs(($a.UtcDateTime - $b.UtcDateTime).TotalSeconds) -ge 2)
+    }
+    catch { return $false }
+}
+
+function Test-TaskXmlRunsScript {
+    # The task's EXECUTABLE action must run -File <AgentScript>. A mention elsewhere (Description, a later argument) is not the
+    # script the task runs, and XML escapes (&amp;) are decoded by the parser, so a correct task for an unusual path still binds.
+    param([string]$Xml, [string]$AgentScript)
+    try { $doc = [xml]$Xml } catch { return $false }
+    foreach ($exec in @($doc.SelectNodes("//*[local-name()='Exec']"))) {
+        $argNode = $exec.SelectSingleNode("*[local-name()='Arguments']")
+        if ($null -eq $argNode) { continue }
+        $m = [regex]::Match($argNode.InnerText, '(?i)(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))')
+        if (-not $m.Success) { continue }
+        $file = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+        if (Test-SamePath -A $file -B $AgentScript) { return $true }
+    }
+    return $false
+}
+
 function Get-RestartBindingRefusal {
     # -RestartMode when-idle without -RestartScript: the schtasks End/Run act on THIS machine's task, so the root that was checked
     # idle must be the root of the agent that task runs. Returns a reason string, or $null when bound.
@@ -263,8 +306,8 @@ function Get-RestartBindingRefusal {
         }
     }
     catch { return "task $TaskName could not be read: $($_.Exception.Message)" }
-    if ($xml.IndexOf($AgentScript, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-        return "task $TaskName does not run $AgentScript; ending it would stop a different agent"
+    if (-not (Test-TaskXmlRunsScript -Xml $xml -AgentScript $AgentScript)) {
+        return "task $TaskName does not run -File $AgentScript in an executable action; ending it would stop a different agent"
     }
     return $null
 }
@@ -290,7 +333,7 @@ function Invoke-AgentRestart {
     if ($LASTEXITCODE -ne 0) { return @{ why = "schtasks /Run $TaskName exited $LASTEXITCODE"; warn = $warn } }
     $up = Wait-Until -TimeoutSec 60 -Condition {
         $now = Read-Heartbeat
-        ($null -ne $now) -and ($now.ageSec -lt 30) -and ($now.pid -ne $before.pid) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript)
+        ($null -ne $now) -and ($now.ageSec -lt 30) -and (Test-BeatIsDifferentProcess -Old $before -New $now) -and (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript)
     } -PollMs 1000
     if (-not $up) { return @{ why = 'no heartbeat from a new LIVE agent process within 60 s of schtasks /Run'; warn = $warn } }
     return @{ why = $null; warn = $warn }
