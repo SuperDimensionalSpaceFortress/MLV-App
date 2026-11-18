@@ -5786,6 +5786,57 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("-ExportBudgetSpecReadFault is an offline test seam", r.stderr)
         self.assertEqual(self.kinds(), [])
 
+    def test_r18_sibling_an_over_cap_window_whose_clip_does_not_resolve_is_refused_by_the_clip_independent_floor(self) -> None:
+        # EXPORT-VENUE-LEG-1 r18 sibling sweep (class: an unreadable input read as "no refusal" on the way to a claim): a clip the preflight child cannot resolve made the child fail with
+        # no budget marker, and Get-ExportBudgetRefusal returned '', '' -- yet maxFrames=100000 needs 400000 s of export wait alone, past the agent's 86400 s cap whatever the clip's size
+        # (sol r17: even a one-byte clip needs 400788 s submitted). The batch now asks the generator's -DescribeTimeBudgetBytes 0 (the clip-independent floor) when the clip did not
+        # resolve, and refuses EXPORT_TIME_BUDGET_EXCEEDED before any claim when that floor alone passes the cap. A window whose floor fits is still left to the leg's generator.
+        floor_calls = self.case / "budget-floor-r18.calls"
+        fake = self.case / "fake-export-budget-r18-unresolved.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "if ($DescribeTimeBudgetBytes -ge 0) {\n"
+                        "    Add-Content -LiteralPath $env:FAKE_FLOOR_FILE -Value \"$DescribeTimeBudgetBytes $MaxFrames\"\n"
+                        "    if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of a $DescribeTimeBudgetBytes-byte clip need a job timeout past the agent's cap\" }\n"
+                        "    return [pscustomobject]@{ jobTimeoutSec = 1 }\n"
+                        "}\n"
+                        "throw \"DUAL_VENUE_EXPORT_RESOLVER_ABSENT the clip $ClipId does not resolve on this host\"\n", encoding="utf-8")
+        shipped = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+
+        def spec_with(frames: int) -> Path:
+            doc = json.loads(json.dumps(shipped))
+            doc["export"]["maxFrames"] = frames
+            p = self.case / f"export-r18-unresolved-{frames}.json"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            return p
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, floor_calls):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+        over = spec_with(20000)
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                reset()
+                if mode == "-LegSpec":
+                    r = self.run_batch([over], "-ExportBudgetScript", str(fake), FAKE_FLOOR_FILE=str(floor_calls))
+                    line = "BATCH_USAGE EXPORT_TIME_BUDGET_EXCEEDED"
+                else:
+                    r = self.run_plan(self.write_plan([self.item(over, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), FAKE_FLOOR_FILE=str(floor_calls))
+                    line = "LEG_PLAN_REFUSED reason=EXPORT_TIME_BUDGET_EXCEEDED item=1 "
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened for an over-cap window whose clip did not resolve. " + out)
+                self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted. " + out)
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn(line, r.stderr, out)
+                self.assertIn("clip-independent", r.stderr, out)
+                self.assertEqual(floor_calls.read_text(encoding="utf-8").split(), ["0", "20000"], out)
+        # control: a window whose floor fits is not refused by the budget check when the clip does not resolve (the leg's generator still refuses the clip, typed, as before)
+        reset()
+        r = self.run_batch([spec_with(480)], "-ExportBudgetScript", str(fake), FAKE_FLOOR_FILE=str(floor_calls))
+        self.assertNotIn("EXPORT_TIME_BUDGET_EXCEEDED", r.stdout + r.stderr, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertNotIn("EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stdout + r.stderr, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertEqual(floor_calls.read_text(encoding="utf-8").split(), ["0", "480"])
+
     def test_r11_export_a_budget_preflight_that_never_returns_is_killed_and_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r11 (sol r9 B1, EXPORT-BUDGET-PREFLIGHT-CHILD-DEADLINE-1; fable H1 EXPORT-LEGSET-BUDGET-PREFLIGHT-TEST-1): the preflight child (the export generator's
         # -PreflightBudgetOnly mode, which resolves the clip) was waited for with no deadline, so a hung resolver held the batch before any claim forever. It now runs as a bounded
