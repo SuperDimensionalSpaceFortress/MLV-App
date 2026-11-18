@@ -1194,7 +1194,7 @@ try {
         'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable',
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
-        'lease-seam-census-self-pid')
+        'lease-seam-census-self-pid', 'renew-slow-monitor-slice')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -5755,6 +5755,82 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $script:AgentProcess = $pcSavedAgentProcess
             foreach ($f2 in @(Get-ChildItem -LiteralPath $fx -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'jPc[HP]*' })) { Remove-Item -LiteralPath $f2.FullName -Force -ErrorAction SilentlyContinue }
         }
+    }
+    # ------------------------------------------------------------ BACHELOR-LEASE-RENEW-MARGIN-1 r1: a slow monitor slice keeps the renew gap well inside 120 s
+    # #834's fullscreen-s1 CUDA leg on Bachelor was demoted (exit 124) 2 of 2: renews started 75-95 s apart (cadence 60 s, ticked once per job-monitor
+    # slice) and the agent measured the gap between successful renews to the NEXT slice's collection, 123.8-125.7 s > LeaseRenewStaleSec 120. Here
+    # every monitor slice takes 70-90 s of VIRTUAL time (Get-Date is a virtual clock), spent in the slice's descendant walk (Get-CimInstance and
+    # Get-ProcessIdentity stubbed, each step advancing the clock), and the slice is driven in the agent's own order: walk (with the agent's -OnEach
+    # tick when it has one), Invoke-QuietLeaseRenewTick, gap check, heartbeat, the 5 s wait. The agent's REAL Update-QuietLeaseRenew,
+    # Receive-HeavySlotCli, Register-QuietLeaseRenewOk and Get-QuietLeaseRenewOkGapSec run, at the agent's DEFAULT LeaseRenewSec and
+    # LeaseRenewTimeoutSec; only Start-HeavySlotCli returns a fake renew process that exits 3 s (virtual) after its start.
+    # Asserted: the successful-renew gap the agent measures (and would demote on) stays < 90 s at every slice end, it never under-reads the gap
+    # between the fake heavy-slot.py's renew records, and the monitor loop passes the tick into its walk.
+    # RED on fork/master a7278cbd: cadence 60 s, one tick per slice, gap measured to the collection -> about two slices (150+ s).
+    if (Test-Case 'renew-slow-monitor-slice') {
+        $rsSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch }
+        try {
+            $rsOut = & {
+                $LeaseRenewSec = [int]$paramDefaults['LeaseRenewSec']
+                $LeaseRenewTimeoutSec = [int]$paramDefaults['LeaseRenewTimeoutSec']
+                $script:RsNow = [datetime]::new(2026, 11, 18, 2, 0, 0, [DateTimeKind]::Local)
+                $script:RsRecords = [System.Collections.Generic.List[datetime]]::new()
+                $script:RsOpCost = 9.0
+                function Get-Date { return $script:RsNow }
+                function Step-RsClock([double]$Sec) { $script:RsNow = $script:RsNow.AddSeconds($Sec) }
+                function Get-CimInstance {
+                    [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
+                    Step-RsClock $script:RsOpCost
+                    if ($Filter -ceq 'ParentProcessId=4000') { return @(4001, 4002, 4003, 4004 | ForEach-Object { [pscustomobject]@{ ProcessId = $_ } }) }
+                    return @()
+                }
+                function Get-ProcessIdentity { param([int]$ProcessId) Step-RsClock $script:RsOpCost; return [pscustomobject]@{ exists = $true; processId = $ProcessId; startEpochMs = 1 } }
+                function Start-HeavySlotCli {
+                    param([string[]]$Arguments, [string]$Python = '', [string]$Script = '')
+                    $started = Get-Date
+                    $p = [pscustomobject]@{ exitAt = $started.AddSeconds(3); ExitCode = 0; recorded = $false }
+                    $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $script:RsNow -ge $this.exitAt }
+                    $p | Add-Member -MemberType ScriptProperty -Name ExitTime -Value { if ($script:RsNow -ge $this.exitAt) { $this.exitAt } else { throw 'not exited' } }
+                    $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) if (-not $this.recorded) { $this.recorded = $true; $script:RsRecords.Add($this.exitAt) }; return $true }
+                    $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+                    $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) }
+                    $done = [System.Threading.Tasks.Task]::FromResult('')
+                    return [pscustomobject]@{ ok = $true; proc = $p; out = $done; err = $done; started = $started; why = $null }
+                }
+                $wrapper = [pscustomobject]@{ HasExited = $false; ExitCode = $null }
+                $t0 = Get-Date
+                $lease = [pscustomobject]@{ ok = $true; jobId = 'rs-slow-slice'; label = 'quiet-lease mlv'; proc = $wrapper; pid = 4000; active = [pscustomobject]@{ slot = 1; held = '1:4000'; until = 9999999999 }
+                    activeAt = $t0; lastRenewStart = $t0; lastRenewOkStart = $null; renewCall = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0; renewOkMaxGapSec = 0 }
+                $script:QuietLease = $lease; $script:QuietLeaseWaiting = $null; $script:LeaseBatch = $null
+                $hasOnEach = (Get-Command Get-DescendantProcessIdentities).Parameters.ContainsKey('OnEach')
+                $slices = [System.Collections.Generic.List[object]]::new()
+                # Slice lengths (walk + 5 s wait): 70-90 s, the 90 s ones twice; 9 clock steps per walk (5 CIM queries, 4 identities).
+                foreach ($target in @(70, 90, 80, 75, 90, 85, 72, 88)) {
+                    $sliceStart = Get-Date
+                    $script:RsOpCost = ($target - 5) / 9.0
+                    $walk = if ($hasOnEach) { @(Get-DescendantProcessIdentities -ParentProcessId 4000 -OnEach { Invoke-QuietLeaseRenewTick }) } else { @(Get-DescendantProcessIdentities -ParentProcessId 4000) }
+                    Invoke-QuietLeaseRenewTick
+                    $gap = Get-QuietLeaseRenewOkGapSec -Lease $lease
+                    Step-RsClock 5
+                    $slices.Add([ordered]@{ sliceSec = [Math]::Round(((Get-Date) - $sliceStart).TotalSeconds, 1); walked = $walk.Count; okGapAtCheckSec = $gap })
+                }
+                Invoke-QuietLeaseRenewTick   # collects the last renew in flight
+                $recGaps = @(for ($i = 1; $i -lt $script:RsRecords.Count; $i++) { ($script:RsRecords[$i] - $script:RsRecords[$i - 1]).TotalSeconds })
+                $firstRec = if ($script:RsRecords.Count -gt 0) { ($script:RsRecords[0] - $t0).TotalSeconds } else { 1e9 }
+                [pscustomobject]@{ renewSec = $LeaseRenewSec; hasOnEach = $hasOnEach; slices = @($slices); starts = $lease.renewStarts; ok = $lease.renewsOk; failures = $lease.renewFailures; slow = $lease.renewSlow
+                    okMaxGapSec = $lease.renewOkMaxGapSec; checkMaxGapSec = [double](@($slices | ForEach-Object { [double]$_.okGapAtCheckSec }) | Measure-Object -Maximum).Maximum
+                    recordMaxGapSec = [double](@(@($recGaps) + @($firstRec)) | Measure-Object -Maximum).Maximum; records = $script:RsRecords.Count }
+            }
+        }
+        finally { $script:QuietLease = $rsSaved.q; $script:QuietLeaseWaiting = $rsSaved.w; $script:LeaseBatch = $rsSaved.b }
+        $rsTxt = $rsOut | ConvertTo-Json -Depth 5 -Compress
+        Assert-True (@($rsOut.slices | Where-Object { $_.sliceSec -lt 70 -or $_.sliceSec -gt 90 }).Count -eq 0) "renew-slow-monitor-slice: every modelled monitor slice takes 70-90 s: $rsTxt"
+        Assert-True ($rsOut.failures -eq 0 -and $rsOut.slow -eq 0 -and $rsOut.ok -ge 1) "renew-slow-monitor-slice: the renews succeed (late is the only fault modelled): $rsTxt"
+        Assert-True ($rsOut.okMaxGapSec -lt 90 -and $rsOut.checkMaxGapSec -lt 90) "renew-slow-monitor-slice: with 70-90 s monitor slices the gap between SUCCESSFUL renews stays < 90 s (stale limit $($script:LeaseRenewStaleSec) s); measured okMaxGapSec=$($rsOut.okMaxGapSec) checkMaxGapSec=$($rsOut.checkMaxGapSec): $rsTxt"
+        Assert-True ($rsOut.okMaxGapSec + 0.05 -ge $rsOut.recordMaxGapSec) "renew-slow-monitor-slice: the agent's measured gap never under-reads heavy-slot.py's gap between renew records (okMaxGapSec=$($rsOut.okMaxGapSec) recordMaxGapSec=$($rsOut.recordMaxGapSec))"
+        Assert-True ($agentText.Contains('Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -OnEach { Invoke-QuietLeaseRenewTick }')) "renew-slow-monitor-slice: the job monitor loop passes the renew tick into its descendant walk"
+        Assert-True ([int]$paramDefaults['LeaseRenewSec'] -le 30) "renew-slow-monitor-slice: the agent's default LeaseRenewSec is at most a quarter of the 120 s stale limit (got $($paramDefaults['LeaseRenewSec']))"
+        $results.renewSlowMonitorSlice = $rsOut
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

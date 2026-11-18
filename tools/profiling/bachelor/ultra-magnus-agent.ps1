@@ -242,8 +242,10 @@ param(
     [int]$LeasePendingMaxSec = 1800,
     # Renew cadence and the bound on one renew call. heavy-slot.py reads a lease not renewed for renew_stale_s (120 s) as an
     # ordinary holder, so the ranges keep interval + timeout under 120 s. A slow or failed renew is logged, never fatal.
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: 30 s, not 60 (quarter of the stale limit). At 60 s a fullscreen-s1 CUDA leg's slow
+    # monitor slices (renew starts 75-95 s apart) put the gap between successful renews at 123.8-125.7 s, over 120: demoted.
     [ValidateRange(1, 60)]
-    [int]$LeaseRenewSec = 60,
+    [int]$LeaseRenewSec = 30,
     [ValidateRange(1, 30)]
     [int]$LeaseRenewTimeoutSec = 30,
     # After a refused (exit 75), failed or abandoned request the job stays claimed in the gate and asks again after this.
@@ -636,12 +638,17 @@ function Test-ProcessIdentityMatch {
 }
 
 function Get-DescendantProcessIdentities {
-    param([Parameter(Mandatory = $true)][int]$ParentProcessId)
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: -OnEach runs before every CIM query of the walk. The job monitor passes its quiet-lease
+    # renew tick, because this walk (two CIM queries per descendant) is the slow step of a monitor slice under a heavy leg's
+    # load: a renew due mid-walk starts mid-walk, not one whole slice later. It must never wait; nothing it returns is kept.
+    param([Parameter(Mandatory = $true)][int]$ParentProcessId, [scriptblock]$OnEach = $null)
 
+    if ($null -ne $OnEach) { $null = & $OnEach }
     $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction SilentlyContinue)
     foreach ($child in $children) {
         $childProcessId = [int]$child.ProcessId
-        Get-DescendantProcessIdentities -ParentProcessId $childProcessId
+        Get-DescendantProcessIdentities -ParentProcessId $childProcessId -OnEach $OnEach
+        if ($null -ne $OnEach) { $null = & $OnEach }
         Get-ProcessIdentity -ProcessId $childProcessId
     }
 }
@@ -3280,8 +3287,9 @@ function Wait-HeavySlotAdmission {
 #      The feed's sustained-heat verdict is recorded in the admission, not acted on: the lease is the quiet machine and the
 #      legs keep their own <= 20 % CPU quiescence check at each leg start (playback-attr-3-cuda-job.ps1), which now runs
 #      after the lease is active because the job is only launched then.
-#   3. RENEW. `lease renew --label "quiet-lease mlv"` every LeaseRenewSec (60 s), from the agent's own loops (the job monitor
-#      and the gate wait call Invoke-QuietLeaseRenewTick), never from a separate process: renewals stop when the agent
+#   3. RENEW. `lease renew --label "quiet-lease mlv"` every LeaseRenewSec (30 s since BACHELOR-LEASE-RENEW-MARGIN-1; was 60), from
+#      the agent's own loops (the job monitor slice AND its descendant walk, the inbox loop's parked-batch hold, and the gate wait
+#      through a light job's monitor call Invoke-QuietLeaseRenewTick), never from a separate process: renewals stop when the agent
 #      stops, so a dead agent's lease goes stale at heavy-slot.py's renew_stale_s (120 s) and stops being exclusive. A renew
 #      runs in the background; one slower than LeaseRenewTimeoutSec is killed and logged, and neither a slow nor a failed
 #      renew ends the job. Immediately before the child is created one renew is run to completion and must return the
@@ -3441,8 +3449,11 @@ function Receive-HeavySlotCli {
     try { if ($Call.out.Wait(2000)) { $o = [string]$Call.out.Result } } catch { }
     try { if ($Call.err.Wait(2000)) { $e = [string]$Call.err.Result } } catch { }
     $rc = $p.ExitCode
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: when the call exited (local time, as Get-Date), read before Dispose; $null when unreadable.
+    $exitedAt = $null
+    try { $exitedAt = [datetime]$p.ExitTime } catch { $exitedAt = $null }
     $p.Dispose()
-    return [pscustomobject]@{ done = $true; rc = $rc; stdout = $o.Trim(); stderr = $e.Trim(); why = $null }
+    return [pscustomobject]@{ done = $true; rc = $rc; stdout = $o.Trim(); stderr = $e.Trim(); why = $null; exitedAt = $exitedAt }
 }
 
 function Stop-HeavySlotCli {
@@ -3618,10 +3629,17 @@ function Register-QuietLeaseRenewOk {
     # lease-batch r2: a renew that returned rc 0. heavy-slot.py demotes a lease not renewed for renew_stale_s (120 s), so the
     # gap that matters is between SUCCESSFUL renews (activation counts as the first). Measured from the previous success's
     # call start to now (the result's collection), an upper bound on heavy-slot.py's own gap: it never under-reads one.
-    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted)
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r1: measured to -CallEnded (the renew process's exit) when given, not to the collection.
+    # heavy-slot.py records the renew before its process exits, so the exit is still an upper bound; the collection waited for
+    # the next monitor slice, which on a slow slice added a whole slice to every gap (95 s start-to-start read as 125.7 s).
+    # A CallEnded outside [CallStarted, now] (unreadable or a clock step) falls back to now, the old, never-shorter bound.
+    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallEnded = $null)
+    $now = Get-Date
+    $end = $now
+    if ($CallEnded -is [datetime] -and $CallEnded -ge $CallStarted -and $CallEnded -le $now) { $end = $CallEnded }
     $prev = if ($null -ne $Lease.lastRenewOkStart) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
     if ($null -ne $prev) {
-        $gap = ((Get-Date) - $prev).TotalSeconds
+        $gap = ($end - $prev).TotalSeconds
         if ($gap -gt $Lease.renewOkMaxGapSec) { $Lease.renewOkMaxGapSec = [Math]::Round($gap, 1) }
     }
     $Lease.lastRenewOkStart = $CallStarted
@@ -3649,7 +3667,7 @@ function Update-QuietLeaseRenew {
         if ($c.proc.HasExited) {
             $r = Receive-HeavySlotCli -Call $c
             $Lease.renewCall = $null
-            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started }
+            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started -CallEnded $r.exitedAt }
             else {
                 $Lease.renewFailures++
                 Add-AgentLogLine "quiet-lease: renew-failed job=$($Lease.jobId) rc=$($r.rc) out=[$($r.stdout)] err=[$($r.stderr)]; not fatal (the lease goes stale at 120 s without a renew)"
@@ -4533,7 +4551,9 @@ function Invoke-QueuedJob {
                 $launchedPersisted = Write-StartedMarkerVerified -Path $markerPath -Marker $marker
                 if ($launchedPersisted) { Add-AgentLogLine "launched marker job=$jobId pid=$($jobProcess.Id) verified on retry" }
             }
-            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id)) {
+            # BACHELOR-LEASE-RENEW-MARGIN-1 r1: the renew tick also runs inside this walk (before each CIM query), the slow step of
+            # a slice under a heavy leg, so a renew due mid-walk is started (and one that exited is collected) there, not a slice later.
+            foreach ($descendant in @(Get-DescendantProcessIdentities -ParentProcessId $jobProcess.Id -OnEach { Invoke-QuietLeaseRenewTick })) {
                 if ($descendant.exists) {
                     $trackedDescendants["$($descendant.processId):$($descendant.startEpochMs)"] = $descendant
                 }
