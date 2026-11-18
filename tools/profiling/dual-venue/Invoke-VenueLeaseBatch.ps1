@@ -238,6 +238,9 @@ param(
     # r8 (adversary r7 A3): the export generator the export-budget preflight calls (Get-ExportBudgetRefusal). Default: tools/profiling/bachelor/export-stage-job.ps1. Offline only: refused
     # with the real um-run.ps1, so a production run can never swap the budget check out.
     [string]$ExportBudgetScript = '',
+    # r18 (sol r17 B1, EXPORT-VENUE-LEG-1-OPEN-18-2): the export-budget preflight's own read of the leg spec (Get-ExportBudgetRefusal) throws, as a transient sharing violation there would,
+    # while every other read of the spec succeeds. Offline only: refused with the real um-run.ps1.
+    [switch]$ExportBudgetSpecReadFault,
     # r4 (sol r3 B1): '<claim|open>:<existence|identity|spec>=<sec>' makes that guard's read of that kind take <sec> longer, so a test can time a slow file system read inside
     # the guard. Offline only: refused with the real um-run.ps1, like the two probe seams above. r5 (sol r4 B1): '<guard>:rundir=<sec>' delays every read of -RunDir itself, in that
     # guard's worker and on the main thread after it (Wait-RunDirReadSeam), as a -RunDir that stopped answering would. r6: and every TEMP read after it that reaches -RunDir (Get-TempReadSeamMs).
@@ -273,6 +276,7 @@ if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
 }
 if ($umRunIsReal -and ($StagedBuildProbeScript -or $ArtifactProbeScript)) { Stop-Usage '-StagedBuildProbeScript and -ArtifactProbeScript are offline test seams: with the real um-run.ps1 the staged build is read from the share' }
 if ($umRunIsReal -and $ExportBudgetScript) { Stop-Usage '-ExportBudgetScript is an offline test seam: with the real um-run.ps1 the export budget is always read from the real export generator' }
+if ($umRunIsReal -and $ExportBudgetSpecReadFault) { Stop-Usage '-ExportBudgetSpecReadFault is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
 if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }
 # r11 (sol r9 B1): the export-budget preflight child's bounds (Get-ExportBudgetRefusal): a hard cap per child, and the seconds kept back from the room before -DeadlineUtc for the typed refusal
 $script:ExportBudgetPreflightCapSec = 120
@@ -1356,7 +1360,10 @@ function Get-ExportBudgetRefusal([string]$Path) {
     # The generator's own -PreflightBudgetOnly mode (the SAME Get-ExportJobTimeBudget, over the resolved clip's real size) is asked here, in the preflight, before any claim or lease.
     # Returns 'EXPORT_TIME_BUDGET_EXCEEDED', <the generator's reason>, or '', '' for a leg that is not an export, a spec the shape predicates refuse (they own that), and a clip
     # this host cannot resolve (the leg's generator still refuses it, typed, as before: the budget of an unreadable clip is unknowable here).
-    try { $spec = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return '', '' }
+    try {
+        if ($ExportBudgetSpecReadFault) { throw [IO.IOException]::new("EXPORT_BUDGET_SPEC_READ_FAULT seam: the process cannot access the file '$Path' because it is being used by another process") }
+        $spec = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+    } catch { return '', '' }
     if ($spec -isnot [System.Management.Automation.PSCustomObject] -or [string](Get-DvProp $spec 'legType') -cne 'export') { return '', '' }
     $export = Get-DvProp $spec 'export'
     $clipId = [string](Get-DvProp $spec 'clipId'); $format = [string](Get-DvProp $export 'format'); $frames = Get-DvProp $export 'maxFrames'

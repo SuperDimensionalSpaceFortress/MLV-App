@@ -5725,6 +5725,67 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("-ExportBudgetScript is an offline test seam", r.stderr)
         self.assertEqual(self.kinds(), [])
 
+    def test_r18_export_a_spec_read_failure_in_the_budget_preflight_is_refused_before_the_claim_in_every_mode(self) -> None:
+        # EXPORT-VENUE-LEG-1 r18 (sol r17 B1 = EXPORT-VENUE-LEG-1-OPEN-18-2 = adversary pass18 A2): Get-ExportBudgetRefusal caught a failed read of the spec and returned two empty
+        # strings, which every caller (-LegPlan, -LegSet, -LegSpec) read as "no refusal". The shape check's own read had succeeded, so an over-cap window (here 20000 frames, which the
+        # stand-in refuses past 19000 as the real budget does for that clip) went on to a claim and a lease. The seam -ExportBudgetSpecReadFault makes ONLY the preflight's read throw,
+        # as a transient sharing violation would. A read failure is now the typed refusal SPEC_READ_FAILED before any claim or lease, and the budget child is never started.
+        called = self.case / "budget-child-r18.called"
+        fake = self.case / "fake-export-budget-r18.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 20000
+        over = self.case / "export-r18-over.json"
+        over.write_text(json.dumps(doc), encoding="utf-8")
+        legset_name = f"zz-r18-spec-read-{uuid.uuid4().hex[:8]}"
+        legset_path = DV / "legsets" / f"{legset_name}.json"
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, called):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+
+        def assert_refused(mode: str, r: subprocess.CompletedProcess, line: str) -> None:
+            out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+            self.assertFalse(self.claim_path.exists(), f"{mode}: a claim was written for an over-cap window whose budget was never checked. " + out)
+            self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened. " + out)
+            self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted: no open, no probe, no leg. " + out)
+            self.assertEqual(r.returncode, 2, out)
+            self.assertIn(line, r.stderr, out)
+            self.assertFalse(called.exists(), f"{mode}: the budget child was started on a spec the preflight could not read. " + out)
+
+        reset()
+        r = self.run_batch([over], "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadFault", FAKE_BUDGET_PID_FILE=str(called))
+        assert_refused("-LegSpec", r, "BATCH_USAGE SPEC_READ_FAILED")
+        reset()
+        r = self.run_plan(self.write_plan([self.item(over, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadFault", FAKE_BUDGET_PID_FILE=str(called))
+        assert_refused("-LegPlan", r, "LEG_PLAN_REFUSED reason=SPEC_READ_FAILED item=1 ")
+        # -LegSet: a set under legsets/ naming an over-cap copy beside it (the real legsets/ directory is the only place the batch reads one; both removed in the finally)
+        over_in_legs = DV / "legs" / f"{legset_name}.json"
+        over_in_legs.write_text(json.dumps(doc), encoding="utf-8")
+        legset_path.write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": legset_name, "card": doc["card"], "clipId": doc["clipId"],
+                                           "description": "r18 test stand-in, removed by the test", "legs": [f"legs/{legset_name}.json"]}), encoding="utf-8")
+        try:
+            reset()
+            args, e = self.batch_cmd([over], "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadFault", FAKE_BUDGET_PID_FILE=str(called))
+            args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", legset_name]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            assert_refused("-LegSet", r, "BATCH_USAGE SPEC_READ_FAILED")
+        finally:
+            legset_path.unlink(missing_ok=True)
+            over_in_legs.unlink(missing_ok=True)
+        # the seam is refused with the real um-run.ps1, as every other offline seam is
+        reset()
+        args, e = self.batch_cmd([over], "-ExportBudgetSpecReadFault")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-ExportBudgetSpecReadFault is an offline test seam", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
     def test_r11_export_a_budget_preflight_that_never_returns_is_killed_and_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r11 (sol r9 B1, EXPORT-BUDGET-PREFLIGHT-CHILD-DEADLINE-1; fable H1 EXPORT-LEGSET-BUDGET-PREFLIGHT-TEST-1): the preflight child (the export generator's
         # -PreflightBudgetOnly mode, which resolves the clip) was waited for with no deadline, so a hung resolver held the batch before any claim forever. It now runs as a bounded
