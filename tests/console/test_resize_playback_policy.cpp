@@ -8,6 +8,7 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/ResizePlaybackPolicy.h"
+#include "../../platform/qt/PlaybackSlotRelease.h"
 
 #include <QFile>
 #include <QRegularExpression>
@@ -192,6 +193,51 @@ TEST(ResizePlaybackPolicyWiring, A1TheKeepPlayingResizeRetiresEveryFrameOfTheOld
     ASSERT_TRUE(prepReady.contains(QStringLiteral("playbackPrepCompletedResultShouldPresent(")));
     const QString ready = mainWindowFunction(QStringLiteral("void MainWindow::drawFrameReady("));
     ASSERT_TRUE(ready.contains(QStringLiteral("requestContext.presentationGeneration != activeGeneration")));
+}
+
+// Adversary A1 on 4bbdcd9a, its literal input: 100 frames, cut 1..100, Loop off, Play, CUDA recon texture route,
+// MLVAPP_PHASE3_FRAME_SLOT_COUNT=1, MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=2. Frame 10 presented; the resize invalidates
+// (generation G -> G+1) while speculative frame 11 of G renders in the sole slot. It is published Ready with G later:
+// both target-aware acquisitions skip it, the prune skipped other generations, so the G+1 redraw waited for that slot
+// forever. Such a slot is released; a Presenting slot, a non-lookahead slot or one of the active generation never is.
+TEST(ResizePlaybackPolicy, A1bARetiredGenerationsReadyLookaheadSlotIsReleased)
+{
+    const uint64_t G = 41;
+    ASSERT_TRUE(playbackRetiredLookaheadSlotReleases(PlaybackSlotHold::Ready, true, G, G + 1));     // the A1 input
+    ASSERT_FALSE(playbackRetiredLookaheadSlotReleases(PlaybackSlotHold::Ready, true, G + 1, G + 1)); // the active one
+    ASSERT_FALSE(playbackRetiredLookaheadSlotReleases(PlaybackSlotHold::Ready, true, G + 2, G + 1)); // never a newer one
+    ASSERT_FALSE(playbackRetiredLookaheadSlotReleases(PlaybackSlotHold::Presenting, true, G, G + 1)); // pinned by its borrower
+    ASSERT_FALSE(playbackRetiredLookaheadSlotReleases(PlaybackSlotHold::Other, true, G, G + 1));      // still rendering
+    ASSERT_FALSE(playbackRetiredLookaheadSlotReleases(PlaybackSlotHold::Ready, false, G, G + 1));     // a non-lookahead slot
+}
+
+TEST(ResizePlaybackPolicyWiring, A1bEverySiteThatSkipsARetiredLookaheadSlotFreesItFirst)
+{
+    QString source = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    source.remove(QRegularExpression(QStringLiteral("//[^\\n]*")));
+    ASSERT_FALSE(source.isEmpty());
+    // the class: the two target-aware acquisitions and the forward-window prune each skip another generation's lookahead slot
+    const char *sites[] = {
+        "bool RenderFrameThread::acquireOldestGpuTextureNoReadbackReadyFrameForPlaybackTarget(",
+        "bool RenderFrameThread::acquireLatestReadyFrameForPlaybackTarget(",
+        "int RenderFrameThread::prunePlaybackLookaheadOutsideForwardWindow(",
+    };
+    for (const char *site : sites)
+    {
+        const int at = source.indexOf(QString::fromLatin1(site));
+        ASSERT_TRUE(at >= 0);
+        const int next = source.indexOf(QStringLiteral("\n}\n"), at);
+        const QString body = source.mid(at, next - at);
+        const int release = body.indexOf(QStringLiteral("releaseRetiredPlaybackLookaheadSlotsLocked( activeGeneration );"));
+        const int skip = body.indexOf(QStringLiteral("presentationGeneration != activeGeneration"));
+        ASSERT_TRUE(release > 0);
+        ASSERT_TRUE(skip > release);
+    }
+    const int helper = source.indexOf(QStringLiteral("int RenderFrameThread::releaseRetiredPlaybackLookaheadSlotsLocked( uint64_t activeGeneration )"));
+    ASSERT_TRUE(helper >= 0);
+    const QString helperBody = source.mid(helper, source.indexOf(QStringLiteral("\n}\n"), helper) - helper);
+    ASSERT_TRUE(helperBody.contains(QStringLiteral("playbackRetiredLookaheadSlotReleases( hold,")));
+    ASSERT_TRUE(helperBody.contains(QStringLiteral("m_waitCondition.wakeAll();")));
 }
 
 TEST(ResizePlaybackPolicyWiring, TheStoppedRedrawAndTheLookAssistHoldAreUnchanged)
