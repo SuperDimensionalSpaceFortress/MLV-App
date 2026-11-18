@@ -1678,8 +1678,16 @@ $script:CredentialQuoteNearNameEval = { param($m) $m.Value.Substring(0, 1) }
 # r6 (adversary pass 14 A1-A2): the characters an escape starts with (the gate of the residual view), and the two halves of the escape decoder (outer reader: backslash and backtick forms;
 # inner reader: XML character references, XML entities, URL '%NN'), used to judge each half alone on a level that holds both (Get-CredentialNormalForm)
 $script:CredentialEscapeStarts = [char[]]@([char]92, [char]38, [char]37, [char]96)
-$script:CredentialEscapeOuterEval = { param($m) $g = $m.Groups; if ($g['ent'].Success -or $g['dec'].Success -or $g['hex'].Success -or $g['pct'].Success) { return $m.Value }; return (& $script:CredentialEscapeEval $m) }
-$script:CredentialEscapeInnerEval = { param($m) $g = $m.Groups; if ($g['ent'].Success -or $g['dec'].Success -or $g['hex'].Success -or $g['pct'].Success) { return (& $script:CredentialEscapeEval $m) }; return $m.Value }
+# r8 (adversary pass 16 A1, defect class: an alternative reading judged ONE step and then discarded, the readers split too coarsely): a text can be read by up to THREE nested readers, and
+# each one decodes only its own escapes: family 0 the backslash forms (JSON, Python, C: \uXXXX \xXX \" \/ octal \N{..}), family 1 the PowerShell backtick forms (`" `$ `` `n `u{N}), family 2 the
+# markup forms (&#N; &#xN; &name; %XX). '$x = "<add key=`"password`" value=`"hunt"er2`" />"' is a PowerShell string that holds an intact XML pair after the PowerShell reader alone; decoding the
+# backslash form on the same level turns " into a quote inside the value and ends the pair. Each family's own partial decode is an alternative (Get-CredentialDecodeChildren).
+$script:CredentialEscapeFamilyOf = { param($m) $g = $m.Groups; if ($g['ent'].Success -or $g['dec'].Success -or $g['hex'].Success -or $g['pct'].Success) { return 2 }; if ($g['psu'].Success -or $g['psq'].Success -or $g['psl'].Success) { return 1 }; return 0 }
+$script:CredentialEscapeFamilyEvals = @(
+    { param($m) if ((& $script:CredentialEscapeFamilyOf $m) -eq 0) { return (& $script:CredentialEscapeEval $m) }; return $m.Value },
+    { param($m) if ((& $script:CredentialEscapeFamilyOf $m) -eq 1) { return (& $script:CredentialEscapeEval $m) }; return $m.Value },
+    { param($m) if ((& $script:CredentialEscapeFamilyOf $m) -eq 2) { return (& $script:CredentialEscapeEval $m) }; return $m.Value }
+)
 $script:CredentialPsControls = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
 foreach ($credPs in @(@('0', [string][char]0), @('a', [string][char]7), @('b', [string][char]8), @('e', [string][char]27), @('f', [string][char]12), @('n', "`n"), @('r', "`r"), @('t', "`t"), @('v', [string][char]11))) { $script:CredentialPsControls[$credPs[0]] = $credPs[1] }
 $script:CredentialOneLetterEscapes = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
@@ -1840,11 +1848,14 @@ function Get-CredentialDecodeChildren([string]$S, [string]$Mask, [bool]$Alternat
     if ($q1 -or $q2) { return [pscustomobject]@{ Text = $S; Mask = $Mask } }
     $kids = [System.Collections.Generic.List[object]]::new()
     if ($Alternatives) {
-        Use-CredentialViewBudget (2 * $S.Length)
-        $po = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeOuterEval
-        $pi = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialEscapeRegex -Eval $script:CredentialEscapeInnerEval
-        if ($po -and $pi) {
-            foreach ($part in @($po, $pi)) {
+        Use-CredentialViewBudget ($script:CredentialEscapeFamilyEvals.Count * $S.Length)
+        $parts = [System.Collections.Generic.List[object]]::new()
+        foreach ($famEval in $script:CredentialEscapeFamilyEvals) {
+            $pf = Invoke-CredentialMaskedReplace -S $S -Mask $Mask -Regex $script:CredentialEscapeRegex -Eval $famEval
+            if ($pf) { $parts.Add($pf) }
+        }
+        if ($parts.Count -gt 1) {
+            foreach ($part in $parts) {
                 $pb = Invoke-CredentialMaskedReplace -S $part.Text -Mask $part.Mask -Regex $script:CredentialLineBreakRegex -Eval $script:CredentialLineBreakEval
                 $kids.Add($(if ($pb) { $pb } else { $part }))
             }

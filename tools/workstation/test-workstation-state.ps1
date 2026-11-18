@@ -2940,6 +2940,28 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     Assert-That ($ddR7RoleMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r7 sol r6 A1 generated sweep, role guard: all $($ddR7Gen.Count) name a secret" ("misses=$($ddR7RoleMiss.Count): " + (($ddR7RoleMiss | Select-Object -First 3) -join '; '))
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r7 A1 role guard') { Assert-That (Test-CredentialNamePresent $ddJ) 'DENY-BY-DEFAULT-1 r7 sol r6 A1 role guard: the reviewer input names a secret' $ddJ }
+    # r8 (adversary pass 16 A1, defect class: an alternative reading judged one step and then discarded; the readers were split two ways, outer and inner, not by reader): a PowerShell string whose
+    # backtick-quotes frame an intact XML pair and whose value holds a BACKSLASH quote spelling. The PowerShell reader alone leaves the pair intact; decoding the backslash form on the same level
+    # puts a quote inside the value and ends the pair. The literal reviewer input first, then every spelling x both naming attributes x with and without a markup reference, then the mirror
+    # (the backslash reader frames the pair, a PowerShell `u{22} sits in the value).
+    $ddR8Gen = [System.Collections.Generic.List[string]]::new()
+    $ddR8Gen.Add('$xml = "<add key=' + $ddBqA2 + '"p a s s w o r d' + $ddBqA2 + '" value=' + $ddBqA2 + '"hunt' + $ddBsA2 + 'u0022er2' + $ddBqA2 + '" />"')
+    foreach ($ddEsc in @('u0022', 'x22', 'U00000022')) {
+        foreach ($ddAttr in @('key', 'name')) {
+            foreach ($ddTail in @('', '&#34;x')) {
+                $ddR8Gen.Add('$xml = "<add ' + $ddAttr + '=' + $ddBqA2 + '"password' + $ddBqA2 + '" value=' + $ddBqA2 + '"hunt' + $ddBsA2 + $ddEsc + 'er2' + $ddTail + $ddBqA2 + '" />"')
+            }
+        }
+    }
+    foreach ($ddPsq in @('u{22}', 'u{0022}')) { $ddR8Gen.Add('{"x":"<add key=' + $ddBsA2 + '"p a s s w o r d' + $ddBsA2 + '" value=' + $ddBsA2 + '"hunt' + $ddBqA2 + $ddPsq + 'er2' + $ddBsA2 + '" />"}') }
+    $ddR8Miss = @($ddR8Gen | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR8Miss.Count -eq 0 -and $ddR8Gen.Count -eq 15) "DENY-BY-DEFAULT-1 r8 adv p16 A1: all $($ddR8Gen.Count) readings of a PowerShell-framed or JSON-framed XML pair with a second reader's quote in the value refuse" ("misses=$($ddR8Miss.Count): " + (($ddR8Miss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r8 A1 role guard') {
+        $ddR8RoleMiss = @($ddR8Gen | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR8RoleMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r8 adv p16 A1 role guard: all $($ddR8Gen.Count) name a secret" ("misses=$($ddR8RoleMiss.Count): " + (($ddR8RoleMiss | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText ('$xml = "<add key=' + $ddBqA2 + '"theme' + $ddBqA2 + '" value=' + $ddBqA2 + '"a' + $ddBsA2 + 'u0022b' + $ddBqA2 + '" />"'))) 'DENY-BY-DEFAULT-1 r8 must-pass: a PowerShell-framed pair with a backslash quote in a plain value is not a credential'
+    Assert-That (-not (Test-CredentialText ('{"x":"<add key=' + $ddBsA2 + '"theme' + $ddBsA2 + '" value=' + $ddBsA2 + '"a' + $ddBqA2 + 'u{22}b' + $ddBsA2 + '" />"}'))) 'DENY-BY-DEFAULT-1 r8 must-pass: a JSON-framed pair with a PowerShell quote in a plain value is not a credential'
     # r7 must-pass: nested JSON with an entity and no credential is not refused, nor is a nested note with a plain quote reference
     foreach ($ddOkR7 in @(('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"a &amp; b' + $ddBsA2 + '"}"}'), ('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"say &#34;hi&#34;' + $ddBsA2 + '"}"}'), ('{"payload":"<add key=' + $ddBsA2 + '"theme' + $ddBsA2 + '" value=' + $ddBsA2 + '"dark&#34;x' + $ddBsA2 + '" />"}'))) {
         Assert-That (-not (Test-CredentialText $ddOkR7)) "DENY-BY-DEFAULT-1 r7 must-pass: $ddOkR7 is not a credential" $ddOkR7
