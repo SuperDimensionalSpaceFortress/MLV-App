@@ -3057,10 +3057,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         lastDrawnPlaybackPosition = -1;
         m_playbackRedrawAfterResize = false;
     }
-    else if( resize_playback_policy::suppressDuplicatePlaybackDraw( m_frameChanged,
-                                                                    ui->horizontalSliderPosition->value(),
-                                                                    lastDrawnPlaybackPosition,
-                                                                    m_playbackRedrawAfterResize ) )
+    else if( resize_playback_policy::suppressDuplicatePlaybackDraw( m_frameChanged, ui->horizontalSliderPosition->value(), lastDrawnPlaybackPosition, m_playbackRedrawAfterResize ) )
     {
         /* Fast timer polling (mlvappPlaybackTimerIntervalMs) can mark the
          * frame changed on ticks where elapsed-time pacing advanced zero

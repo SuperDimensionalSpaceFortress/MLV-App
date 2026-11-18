@@ -161,9 +161,8 @@ TEST(ResizePlaybackPolicyWiring, A2TheKeepPlayingResizeArmsOneRedrawThatTheTickC
     ASSERT_FALSE(tick.isEmpty());
     const int suppress = tick.indexOf(QStringLiteral("resize_playback_policy::suppressDuplicatePlaybackDraw( m_frameChanged,"));
     ASSERT_TRUE(suppress >= 0);
-    ASSERT_TRUE(tick.mid(suppress, 600).simplified().contains(QStringLiteral(
-        "suppressDuplicatePlaybackDraw( m_frameChanged, ui->horizontalSliderPosition->value(), lastDrawnPlaybackPosition, "
-        "m_playbackRedrawAfterResize ) )")));
+    // the full argument list, verbatim on one line, so every bool argument is pinned (POLICY-CALLSITE-BOOL-MUTATION-SMOKE-1)
+    ASSERT_TRUE(tick.mid(suppress, 600).contains(QStringLiteral("resize_playback_policy::suppressDuplicatePlaybackDraw( m_frameChanged, ui->horizontalSliderPosition->value(), lastDrawnPlaybackPosition, m_playbackRedrawAfterResize ) )")));
     ASSERT_FALSE(tick.contains(QStringLiteral("ui->horizontalSliderPosition->value() == lastDrawnPlaybackPosition")));
     // one draw consumes it; a stopped Play forgets it
     const int draw = tick.indexOf(QStringLiteral("m_frameChanged = false; "), suppress);
