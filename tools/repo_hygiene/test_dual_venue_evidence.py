@@ -15850,6 +15850,18 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.log(mutate=lambda i, b, e: (b.replace("position=10 ", 'diagnostic="lost position=10 tail" ', 1) if i == 0 else b, e)), (4, 3, 3, 3), False),
             "r3-A5: a stray bare word on the summary makes it unreadable": (
                 self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok extra"), (4, 4, 4, 4), False),
+            # r3 adversary pass on 90451806 (A1, A2): a keep_playing record is validated like a toggle record; every session= of a playback_smoke record is read
+            "r3-b-A1: every keep_playing record repeats event= (a repeated key makes the record unusable, so it is no keep evidence)": (
+                self.log().replace(self.KEEP, self.KEEP + " event=resize.redraw_stopped"), (4, 4, 0, 4), False),
+            "r3-b-A1: every keep_playing record carries an empty duplicate event=": (
+                self.log().replace(self.KEEP, self.KEEP + " event="), (4, 4, 0, 4), False),
+            "r3-b-A1: every keep_playing record carries a quoted field": (
+                self.log().replace(self.KEEP, self.KEEP + ' diagnostic="x"'), (4, 4, 0, 4), False),
+            "r3-b-A2: `session=4 session=3` after the marker (the later session=3 does not hide session=4)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.start session=4 session=3\n", 1), (0, 0, 0, 0), False),
+            "r3-b-A2: session=4 with a quoted `session=3` after it": (
+                self.log().replace("playback_smoke.measured_session id=3\n", 'playback_smoke.measured_session id=3\nplayback_smoke.start session=4 diagnostic="lost session=3 tail"\n', 1),
+                (0, 0, 0, 0), False),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (

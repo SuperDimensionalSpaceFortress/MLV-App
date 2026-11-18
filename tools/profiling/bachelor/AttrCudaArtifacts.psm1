@@ -7453,10 +7453,17 @@ function Get-AttrCudaWindowToggleEvidence {
     } elseif (-not $markerIds.ContainsKey($wanted)) { $anomalies.Add('measured-session-marker-absent'); $start = $lines.Count }
     # r3 (adversary A4 on 1f00a482): the window closes at the next marker of ANOTHER session AND at any playback_smoke record that names another session
     # (`playback_smoke.start session=4 ...`), as the runner's own due-wake reader closes its window, so a foreign Play's toggles are never credited here
+    # r3 (adversary A2 on 90451806): EVERY `session=` of such a record is read (a greedy match let a later `session=3` hide `session=4`, and a quoted `session=3`
+    # likewise), and the record closes the window when any of them is not this session; a marker is read the same way by every `id=`
     if ($windowId -ne '') {
         for ($i = $start + 1; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^playback_smoke\.measured_session id=(?<id>\S+)(\s|$)') { if ($Matches['id'] -cne $windowId) { $end = $i; break } }
-            elseif ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+ (?:.* )?session=(?<sid>\S*)(\s|$)' -and $Matches['sid'] -cne $windowId) { $end = $i; break }
+            if ($lines[$i] -match '^playback_smoke\.measured_session(\s|$)') {
+                foreach ($idMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])id=(?<v>[^\s]*)')) { if ($idMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+            }
+            elseif ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(\s|$)') {
+                foreach ($sessionMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])session=(?<v>[^\s]*)')) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+            }
+            if ($end -le $i) { break }
         }
     }
 
@@ -7467,29 +7474,40 @@ function Get-AttrCudaWindowToggleEvidence {
     $summaries = @()
     $maxIndex = -1
     $lastToggleLine = -1
+    # r3 (adversary A1 on 90451806, and A1/A5 on 1f00a482): ONE record reader for every record this function counts. A record is WELL FORMED only when its tail is a
+    # location (or absent) and every token after the record name is one `<key>=<value>` with no quote in the value; a key repeated in it (an empty value counts) makes
+    # it unusable too. A quoted field value, a bare word, a stray tail or a repeated key makes the whole record unusable (the app writes none of these in a record
+    # here), so a `<key>=` inside quoted text is never a field. The quote characters are listed by code point (the straight and typographic quotes and the backtick).
+    $quoteChars = [char[]](0x22, 0x27, 0x60, 0x2018, 0x2019, 0x201C, 0x201D)
+    $readRecord = {
+        param([string]$text, [int]$at)
+        $fields = @{}
+        $unusable = $badTail.Contains($at)
+        foreach ($token in ($text -split ' ' | Select-Object -Skip 1)) {
+            $eq = $token.IndexOf('=')
+            if ($eq -lt 1 -or $token.IndexOfAny($quoteChars) -ge 0 -or $token.Substring(0, $eq) -cnotmatch '^[A-Za-z0-9_]+$') { $unusable = $true; continue }
+            $key = $token.Substring(0, $eq)
+            if ($fields.ContainsKey($key)) { $unusable = $true }
+            $fields[$key] = $token.Substring($eq + 1)
+        }
+        @{ values = $fields; unusable = $unusable }
+    }
     for ($i = $start; $i -lt $end; $i++) {
         $line = $lines[$i]
-        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') { if (-not $badTail.Contains($i)) { $keepLines += $i }; continue }
+        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') {
+            $keepRecord = & $readRecord $line $i
+            if (-not $keepRecord.unusable -and $keepRecord.values['event'] -ceq 'resize.keep_playing') { $keepLines += $i }
+            continue
+        }
         # r3 (adversary A2 on 1f00a482): a toggle record is any record that starts with the name (phase= need not come first), so a record with index= before
         # phase= is read, ordered and counted like the rest, never skipped
         $isSummary = $line -match '^gui_smoke\.window_toggles(\s|$)'
         if (-not $isSummary -and $line -notmatch '^gui_smoke\.window_toggle(\s|$)') { continue }
         if (-not $isSummary -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
-        $values = @{}
-        $repeatedKey = $false
-        # r3 (adversary A1 and A5 on 1f00a482): a record is WELL FORMED only when its tail is a location (or absent) and every token after the record name is one
-        # `<key>=<value>` with no quote in the value; a quoted field value, a bare word or a stray tail makes the whole record unusable (the app writes none of these
-        # in a toggle record), so a `<key>=` inside quoted text is never a field
-        $wellFormed = -not $badTail.Contains($i)
-        foreach ($token in ($line -split ' ' | Select-Object -Skip 1)) {
-            if ($token -cnotmatch '^[A-Za-z0-9_]+=[^\s"''`‘’“”]*$') { $wellFormed = $false; break }
-        }
-        if (-not $wellFormed) { $repeatedKey = $true }
-        # r3 (B2): the value may be EMPTY (`[^\s]*`), so a key repeated with no value (` position=`, ` requested=`) still counts as repeated; an empty value is never a usable one
-        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]*)')) {
-            if ($values.ContainsKey($match.Groups['key'].Value)) { $repeatedKey = $true }
-            $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
-        }
+        # (r3 B2: the value may be EMPTY, so a key repeated with no value, ` position=` or ` requested=`, is repeated and the record unusable)
+        $record = & $readRecord $line $i
+        $values = $record.values
+        $repeatedKey = $record.unusable
         if ($isSummary) { $summaries += , @{ values = $values; repeated = $repeatedKey; line = $i }; continue }
         [int]$index = -1
         if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0 -and $index -lt 1000)) {
