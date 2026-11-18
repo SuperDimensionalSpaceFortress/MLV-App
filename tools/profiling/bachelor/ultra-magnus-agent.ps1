@@ -2139,9 +2139,6 @@ $script:StageGrammarDefault = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-
 $script:QuietLeaseLabel = "quiet-lease mlv"
 # lease-batch r2: heavy-slot.py's renew_stale_s. A lease with no successful renew for longer is demoted (non-exclusive).
 $script:LeaseRenewStaleSec = 120
-# BACHELOR-LEASE-RENEW-MARGIN-1 r2: a renew call's own exit time is trusted (Get-QuietLeaseRenewOkAt) only while its wall and monotonic elapsed
-# times agree within this many seconds; a larger disagreement is a clock step, and the collection time is used instead.
-$script:LeaseRenewClockSkewSec = 1.0
 # lease-batch r3: a batch job still running this long before its lease's until= is stopped (Get-LeaseBatchJobStop).
 $script:LeaseBatchJobGuardSec = 10
 $script:QuietLease = $null
@@ -2234,6 +2231,50 @@ namespace MlvApp.Agent {
     }
 }
 $null = Initialize-LeaseProbeWatchdog
+
+function Initialize-RenewExitStamp {
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1; pass 4 A1, A2): a heavy-slot.py call's EXIT is stamped in-process, on a thread-pool
+    # thread (Process.Exited), with Stopwatch and DateTime.UtcNow, so a renew that succeeded early in a slow monitor step (an 85 s CIM query) is
+    # credited at its exit, not at its collection, and nothing reads the call's own wall-clock ExitTime (a clock step or a DST change can skew
+    # that). The stamp is taken after the exit, so it never reads earlier than the exit on either clock. Compiled once at agent start (never on
+    # the wait loop); $false when it cannot be, and then every success is measured at its collection, as before r2.
+    if ($null -ne ('MlvApp.Agent.RenewExitStamp' -as [type])) { return $true }
+    try {
+        Add-Type -TypeDefinition @"
+namespace MlvApp.Agent {
+    public sealed class RenewExitStamp {
+        private long _mono;
+        private long _utcTicks;
+        public RenewExitStamp(System.Diagnostics.Process proc) {
+            if (proc == null) { throw new System.ArgumentNullException("proc"); }
+            proc.EnableRaisingEvents = true;
+            proc.Exited += OnExited;
+            if (proc.HasExited) { Stamp(); }
+        }
+        private void OnExited(object sender, System.EventArgs e) { Stamp(); }
+        private void Stamp() {
+            long utc = System.DateTime.UtcNow.Ticks;
+            long mono = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (System.Threading.Interlocked.CompareExchange(ref _utcTicks, utc, 0) == 0) { System.Threading.Interlocked.Exchange(ref _mono, mono); }
+        }
+        public bool Stamped { get { return System.Threading.Interlocked.Read(ref _utcTicks) != 0 && System.Threading.Interlocked.Read(ref _mono) != 0; } }
+        public double ExitMonoSec { get { return System.Threading.Interlocked.Read(ref _mono) / (double)System.Diagnostics.Stopwatch.Frequency; } }
+        public System.DateTime ExitUtc { get { return new System.DateTime(System.Threading.Interlocked.Read(ref _utcTicks), System.DateTimeKind.Utc); } }
+    }
+}
+"@ -ErrorAction Stop
+    }
+    catch { return $false }
+    return ($null -ne ('MlvApp.Agent.RenewExitStamp' -as [type]))
+}
+$null = Initialize-RenewExitStamp
+
+function New-RenewExitStamp {
+    # A RenewExitStamp on a started heavy-slot.py process, or $null (the type did not load, or the constructor threw). Never throws.
+    param($Process)
+    if ($null -eq $Process -or $null -eq ('MlvApp.Agent.RenewExitStamp' -as [type])) { return $null }
+    try { return [MlvApp.Agent.RenewExitStamp]::new([System.Diagnostics.Process]$Process) } catch { return $null }
+}
 # lease-batch r1: the parked (or in-use) batch lease, and "the admitted batch job launched and ended" for Exit-HeavySlot.
 $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
@@ -3426,9 +3467,9 @@ function Start-HeavySlotCli {
         $si.Environment["HEAVY_SLOT_FEED"] = $HeavySlotFeed
         [void]$si.Environment.Remove("HEAVY_SLOT_HELD")
         $p = [System.Diagnostics.Process]::Start($si)
-        # BACHELOR-LEASE-RENEW-MARGIN-1 r2: startedMono (a Get-AgentMonotonicSec reading) beside started; Get-QuietLeaseRenewOkAt measures the
-        # renew's own exit against both. Read as Process.Start returns, still before heavy-slot.py can write anything (python start-up alone is longer).
-        return [pscustomobject]@{ ok = $true; proc = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync(); started = (Get-Date); startedMono = (Get-AgentMonotonicSec); why = $null }
+        # BACHELOR-LEASE-RENEW-MARGIN-1 r2: startedMono (a Get-AgentMonotonicSec reading) beside started, and exitStamp (New-RenewExitStamp: the
+        # call's exit stamped in-process; $null when unavailable), which Get-QuietLeaseRenewOkAt uses to end a successful renew's gap at its exit.
+        return [pscustomobject]@{ ok = $true; proc = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync(); started = (Get-Date); startedMono = (Get-AgentMonotonicSec); exitStamp = (New-RenewExitStamp -Process $p); why = $null }
     }
     catch {
         $msg = "heavy-slot.py $($Arguments -join ' ') failed to start: $($_.Exception.Message)"
@@ -3454,11 +3495,8 @@ function Receive-HeavySlotCli {
     try { if ($Call.out.Wait(2000)) { $o = [string]$Call.out.Result } } catch { }
     try { if ($Call.err.Wait(2000)) { $e = [string]$Call.err.Result } } catch { }
     $rc = $p.ExitCode
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r2: the exit time is read BEFORE Dispose (a disposed Process has none); $null when it cannot be read.
-    $exitTime = $null
-    try { $exitTime = [datetime]$p.ExitTime } catch { $exitTime = $null }
     $p.Dispose()
-    return [pscustomobject]@{ done = $true; rc = $rc; stdout = $o.Trim(); stderr = $e.Trim(); exitTime = $exitTime; why = $null }
+    return [pscustomobject]@{ done = $true; rc = $rc; stdout = $o.Trim(); stderr = $e.Trim(); why = $null }
 }
 
 function Stop-HeavySlotCli {
@@ -3642,14 +3680,14 @@ function Register-QuietLeaseRenewOk {
     # clock step it can read shorter than heavy-slot.py's gap, adversary A1); the collection is now prompt instead, because the
     # job monitor's descendant walk ticks the renew too. The gap is rounded UP to 0.1 s (ConvertTo-RenewGapCeilingSec), so
     # 120.04 s never reads 120.0 and slips past a strict "> 120" guard (adversary A2).
-    # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1): with -Call (the renew tick's collection), the gap ends at the renew's OWN exit
-    # (Get-QuietLeaseRenewOkAt), not at its collection: a renew that succeeded at t0+43 but was collected at t0+125 behind an 85 s monitor query
-    # closed a 43 s gap, not 125 s. The exit is used only when no clock step happened since the call started; else the collection, as before.
-    # Every gap is Get-RenewGapSec: the larger of the UTC wall gap and the monotonic gap (pass 3 A2: a DST fall-back no longer reads negative).
-    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallStartedMono = $null, $Call = $null, $ExitTime = $null)
+    # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1): with -Call (the renew tick's collection), the gap ends at the renew's in-process EXIT
+    # STAMP (Get-QuietLeaseRenewOkAt), not at its collection: a renew that succeeded at t0+43 but was collected at t0+125 behind an 85 s monitor
+    # query closed a 43 s gap, not 125 s. No stamp: the collection, as before. Every gap is Get-RenewGapSec: the larger of the UTC wall gap and
+    # the monotonic gap (pass 3 A2: a DST fall-back no longer reads negative; pass 4 A2: a wall step during the call cannot shrink it).
+    param([Parameter(Mandatory = $true)]$Lease, [Parameter(Mandatory = $true)][datetime]$CallStarted, $CallStartedMono = $null, $Call = $null)
     $nowWall = Get-Date
     $nowMono = Get-AgentMonotonicSec
-    $at = if ($null -ne $Call) { Get-QuietLeaseRenewOkAt -Call $Call -ExitTime $ExitTime -NowWall $nowWall -NowMono $nowMono } else { [pscustomobject]@{ wall = $nowWall; mono = $nowMono; fromExit = $false } }
+    $at = if ($null -ne $Call) { Get-QuietLeaseRenewOkAt -Call $Call -NowWall $nowWall -NowMono $nowMono } else { [pscustomobject]@{ wall = $nowWall; mono = $nowMono; fromExit = $false } }
     $useOk = $null -ne $Lease.lastRenewOkStart
     $prev = if ($useOk) { $Lease.lastRenewOkStart } else { $Lease.activeAt }
     $prevMono = if ($useOk) { $Lease.lastRenewOkStartMono } else { $Lease.activeAtMono }
@@ -3680,26 +3718,23 @@ function Get-RenewGapSec {
 
 function Get-QuietLeaseRenewOkAt {
     # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (adversary pass 3 A1): the LATEST moment a collected, successful renew call can have written heavy-slot.py's
-    # renew record, as @{ wall; mono; fromExit }. That is the call's own exit (its record is written before it exits), when it can be trusted: the
-    # call carries startedMono, the wall and monotonic time elapsed since its start agree within LeaseRenewClockSkewSec (no clock step since the
-    # call started, so its ExitTime is on the same clock as its start), and the exit falls inside [start, now]. The disagreement found is added,
-    # so the result never reads earlier than the real exit. Anything else (no startedMono, a step, an unreadable or out-of-range ExitTime) is the
-    # collection, now: never earlier than the record, as before r2.
-    # -ExitTime is the call's exit as Receive-HeavySlotCli read it before disposing the process ($null: unknown, so the collection).
-    param([Parameter(Mandatory = $true)]$Call, $ExitTime, [Parameter(Mandatory = $true)][datetime]$NowWall, [Parameter(Mandatory = $true)][double]$NowMono)
+    # renew record, as @{ wall; mono; fromExit }. The record is written before the call exits, so that is the call's in-process exit stamp
+    # (Initialize-RenewExitStamp: Stopwatch and UtcNow read on Process.Exited, after the exit, on both clocks). The stamp is read as taken: no
+    # offset is added to a local time (pass 4 A1: AddSeconds on a local time across a DST change), and the process's own wall-clock ExitTime is
+    # never used (pass 4 A2: a wall step during the call made it read 20 s early). A missing, unfinished or unreadable stamp, or one later than
+    # now on the monotonic clock, is the collection, now: never earlier than the record, as before r2.
+    param([Parameter(Mandatory = $true)]$Call, [Parameter(Mandatory = $true)][datetime]$NowWall, [Parameter(Mandatory = $true)][double]$NowMono)
     $now = [pscustomobject]@{ wall = $NowWall; mono = $NowMono; fromExit = $false }
-    if ($null -eq $Call.startedMono -or $null -eq $Call.started -or $null -eq $ExitTime) { return $now }
-    $startUtc = ([datetime]$Call.started).ToUniversalTime()
-    $wallEl = ($NowWall.ToUniversalTime() - $startUtc).TotalSeconds
-    $monoEl = $NowMono - [double]$Call.startedMono
-    $skew = [Math]::Abs($wallEl - $monoEl)
-    if ($monoEl -lt 0 -or $skew -gt $script:LeaseRenewClockSkewSec) { return $now }
-    $exitOff = $null
-    try { $exitOff = (([datetime]$ExitTime).ToUniversalTime() - $startUtc).TotalSeconds } catch { return $now }
-    if ($null -eq $exitOff -or $exitOff -lt 0) { return $now }
-    $off = $exitOff + $skew
-    if ($off -ge $monoEl -or $off -ge $wallEl) { return $now }
-    return [pscustomobject]@{ wall = ([datetime]$Call.started).AddSeconds($off); mono = [double]$Call.startedMono + $off; fromExit = $true }
+    $s = $Call.exitStamp
+    if ($null -eq $s) { return $now }
+    try {
+        if (-not $s.Stamped) { return $now }
+        $em = [double]$s.ExitMonoSec
+        $eu = [datetime]$s.ExitUtc
+    }
+    catch { return $now }
+    if ($eu.Kind -ne [DateTimeKind]::Utc -or $em -gt $NowMono) { return $now }
+    return [pscustomobject]@{ wall = $eu; mono = $em; fromExit = $true }
 }
 
 function Get-QuietLeaseRenewOkGapSec {
@@ -3740,7 +3775,7 @@ function Update-QuietLeaseRenew {
         if ($c.proc.HasExited) {
             $r = Receive-HeavySlotCli -Call $c
             $Lease.renewCall = $null
-            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started -CallStartedMono $c.startedMono -Call $c -ExitTime $r.exitTime }
+            if ($r.rc -eq 0) { $Lease.renewsOk++; Register-QuietLeaseRenewOk -Lease $Lease -CallStarted $c.started -CallStartedMono $c.startedMono -Call $c }
             else {
                 $Lease.renewFailures++
                 Add-AgentLogLine "quiet-lease: renew-failed job=$($Lease.jobId) rc=$($r.rc) out=[$($r.stdout)] err=[$($r.stderr)]; not fatal (the lease goes stale at 120 s without a renew)"

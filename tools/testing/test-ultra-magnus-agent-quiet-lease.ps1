@@ -113,7 +113,7 @@ $liftBatch = @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Get-QuietLea
     'Use-LeaseBatchForJob', 'Complete-LeaseBatchJob', 'Write-LeaseBatchReceipt', 'Close-LeaseBatch', 'Sync-LeaseBatchForJob', 'Update-LeaseBatchHold')
 # lease-batch r2 (the renew-gap demotion): the same, asserted by the demoted case after it has shown the behaviour.
 $liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'ConvertTo-RenewGapCeilingSec',   # the last: BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2)
-    'Get-AgentMonotonicSec', 'Get-RenewGapSec', 'Get-QuietLeaseRenewOkAt')   # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (pass 3 A1, A2): optional, so the r2 cases run RED on 591ea10f
+    'Get-AgentMonotonicSec', 'Get-RenewGapSec', 'Get-QuietLeaseRenewOkAt', 'Initialize-RenewExitStamp', 'New-RenewExitStamp')   # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (pass 3 A1, A2): optional, so the r2 cases run RED on 591ea10f
 # lease-batch r3 (sol r2 B1, B2): the same, asserted by the r3 cases after they have shown the behaviour.
 $liftBatchR3 = @('Test-LeaseBatchClosePending', 'Get-LeaseBatchJobStop')
 $batchLifted = [System.Collections.Generic.List[string]]::new()
@@ -121,6 +121,8 @@ foreach ($name in $liftBatch + $liftBatchR2 + $liftBatchR3) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)); $batchLifted.Add($name) }
 }
+# BACHELOR-LEASE-RENEW-MARGIN-1 r2: the agent compiles its renew exit stamp at start; so does this suite (the real Start-HeavySlotCli attaches one).
+if ($batchLifted -contains 'Initialize-RenewExitStamp') { Assert-True (Initialize-RenewExitStamp) "the agent's RenewExitStamp type compiles and loads" }
 # not-after r1: lifted when present. A missing one is recorded, not thrown, so the cases above still run against a base agent
 # and each not-after case fails on behaviour (or on "agent defines ..." in notafter-pure).
 $liftNotAfter = @('Get-JobNotAfterVerdict', 'Get-QuietLeaseAdmitTimeout', 'New-LeaseReleaseRecord', 'Publish-NotAfterExpiredResult', 'Read-JobNotAfterSidecar')
@@ -435,8 +437,6 @@ $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
 # lease-batch r2: heavy-slot.py's renew_stale_s, as the agent assigns it (asserted in the demoted case).
 $script:LeaseRenewStaleSec = 120
-# BACHELOR-LEASE-RENEW-MARGIN-1 r2: the agent's clock-step tolerance for trusting a renew's own exit (asserted against its assignment in the r2 case).
-$script:LeaseRenewClockSkewSec = 1.0
 # lease-batch r3: a batch job is stopped this long before its lease's until= (asserted against the agent's assignment in the r3 case).
 $script:LeaseBatchJobGuardSec = 10
 $script:Admission = $null
@@ -1198,7 +1198,7 @@ try {
         'lease-seam-command-mode', 'lease-seam-wrapper-host', 'fixture-census-probe-error', 'fake-release-readable-deadline', 'fake-release-unreadable-then-readable-deadline',
         'fake-release-unreadable-deadline', 'lease-seam-unowned-never-killed', 'fake-release-absent-after-deadline', 'fake-release-absent-before-deadline',
         'lease-seam-census-self-pid', 'renew-slow-monitor-slice', 'renew-gap-clock-step', 'renew-gap-round-up',
-        'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback')
+        'renew-collect-after-slow-slice', 'renew-stale-still-demotes', 'renew-gap-dst-fallback', 'renew-exit-stamp-transient-step', 'renew-exit-stamp-dst')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -5887,39 +5887,49 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     # the last success (01:59:50, daylight) and now (01:01:55, standard) while 125 s really pass: the gap reads at least 125 s and the job is demoted.
     function Invoke-RcCase {
         # -WallStepSec: the wall clock (only) steps by this much at the end of the query, after the renew has exited (a clock step).
-        param([double]$QuerySec, [double]$ExitAfterSec, [int]$Rc, [datetime]$PrevWall, [datetime]$WalkStartWall, [double]$MonoAdvanceToWalk, [switch]$NoWalk, [double]$WallStepSec = 0)
+        # -ExitWallOffsetSec: the wall clock read this much off at the moment the renew exited (a transient step, restored by the collection):
+        # the call's wall-clock ExitTime and its exit stamp's UtcNow both carry it; its monotonic exit does not.
+        # The virtual wall clock is kept in UTC and Get-Date returns it as local time (ToLocalTime), like the real Get-Date across a DST change.
+        param([double]$QuerySec, [double]$ExitAfterSec, [int]$Rc, [datetime]$PrevWall, [datetime]$WalkStartWall, [double]$MonoAdvanceToWalk, [switch]$NoWalk, [double]$WallStepSec = 0, [double]$ExitWallOffsetSec = 0)
         $rcSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch; a = $script:Admission }
         try {
             return & {
                 $LeaseRenewSec = [int]$paramDefaults['LeaseRenewSec']
                 $LeaseRenewTimeoutSec = [int]$paramDefaults['LeaseRenewTimeoutSec']
-                $script:RcNow = $WalkStartWall
+                $script:RcNowUtc = $WalkStartWall.ToUniversalTime()
                 $script:RcMono = 1000.0 + $MonoAdvanceToWalk
                 $script:RcRecords = [System.Collections.Generic.List[double]]::new()
-                $script:RcExitAfter = $ExitAfterSec; $script:RcRc = $Rc; $script:RcQuery = $QuerySec; $script:RcWallStep = $WallStepSec
-                function Get-Date { return $script:RcNow }
+                $script:RcExitAfter = $ExitAfterSec; $script:RcRc = $Rc; $script:RcQuery = $QuerySec; $script:RcWallStep = $WallStepSec; $script:RcExitWallOff = $ExitWallOffsetSec
+                function Get-Date { return $script:RcNowUtc.ToLocalTime() }
                 function Get-AgentMonotonicSec { return $script:RcMono }
-                function Step-RcClock([double]$Sec) { $script:RcNow = $script:RcNow.AddSeconds($Sec); $script:RcMono += $Sec }
+                function Step-RcClock([double]$Sec) { $script:RcNowUtc = $script:RcNowUtc.AddSeconds($Sec); $script:RcMono += $Sec }
                 function Get-CimInstance {
                     [CmdletBinding()] param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
                     Step-RcClock $script:RcQuery
-                    $script:RcNow = $script:RcNow.AddSeconds($script:RcWallStep); $script:RcWallStep = 0
+                    $script:RcNowUtc = $script:RcNowUtc.AddSeconds($script:RcWallStep); $script:RcWallStep = 0
                     return @()
                 }
                 function Get-ProcessIdentity { param([int]$ProcessId) return [pscustomobject]@{ exists = $true; processId = $ProcessId; startEpochMs = 1 } }
                 function Start-HeavySlotCli {
                     param([string[]]$Arguments, [string]$Python = '', [string]$Script = '')
                     $started = Get-Date; $startedMono = $script:RcMono
-                    $p = [pscustomobject]@{ exitAt = $started.AddSeconds($script:RcExitAfter); exitMono = $startedMono + $script:RcExitAfter; ExitCode = $script:RcRc; disposed = $false }
+                    $exitUtc = $script:RcNowUtc.AddSeconds($script:RcExitAfter + $script:RcExitWallOff)
+                    $p = [pscustomobject]@{ exitAt = $exitUtc.ToLocalTime(); exitMono = $startedMono + $script:RcExitAfter; ExitCode = $script:RcRc; disposed = $false }
                     $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $script:RcMono -ge $this.exitMono }
-                    # Like a real Process: no ExitTime before the exit, and none after Dispose (so the agent must read it before disposing).
+                    # Like a real Process: no ExitTime before the exit, and none after Dispose.
                     $p | Add-Member -MemberType ScriptProperty -Name ExitTime -Value { if ($this.disposed) { throw 'disposed' }; if ($script:RcMono -ge $this.exitMono) { $this.exitAt } else { throw 'not exited' } }
                     $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) return $true }
                     $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.disposed = $true }
                     $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) }
+                    # The in-process exit stamp (the agent's RenewExitStamp shape): Stamped once the process has exited, with that moment's
+                    # monotonic and UTC wall readings.
+                    $st = [pscustomobject]@{ stampMono = $p.exitMono; stampUtc = $exitUtc }
+                    $st | Add-Member -MemberType ScriptProperty -Name Stamped -Value { $script:RcMono -ge $this.stampMono }
+                    $st | Add-Member -MemberType ScriptProperty -Name ExitMonoSec -Value { $this.stampMono }
+                    $st | Add-Member -MemberType ScriptProperty -Name ExitUtc -Value { $this.stampUtc }
                     $script:RcRecords.Add($startedMono + $script:RcExitAfter - 1000.0)
                     $done = [System.Threading.Tasks.Task]::FromResult('')
-                    return [pscustomobject]@{ ok = $true; proc = $p; out = $done; err = $done; started = $started; startedMono = $startedMono; why = $null }
+                    return [pscustomobject]@{ ok = $true; proc = $p; out = $done; err = $done; started = $started; startedMono = $startedMono; exitStamp = $st; why = $null }
                 }
                 $wrapper = [pscustomobject]@{ HasExited = $false; ExitCode = $null }
                 $until = [long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 2700)
@@ -5948,15 +5958,15 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         Assert-True ($null -eq $rc.stop) "renew-collect-after-slow-slice: a renew that succeeded at t0+43 (collected at t0+125 behind an 85 s query) does not demote the batch job: $rcTxt"
         Assert-True ($rc.okMaxGapSec -ge 43 -and $rc.okMaxGapSec -le 45) "renew-collect-after-slow-slice: the closed gap reads the renew's own success (43 s, an upper bound on heavy-slot.py's), not its collection (125 s): $rcTxt"
         Assert-True ($rc.gapSec -ge 85 -and $rc.gapSec -le 87) "renew-collect-after-slow-slice: the open gap is measured from the renew's call start (t0+40) to the check (t0+125), never under 85 s: $rcTxt"
-        # The same input with a +20 s wall-clock step after the renew exited: its exit is no longer trusted, the collection is used (as before r2),
-        # and the gap reads at least the collection's (wall 145 s, monotonic 125 s): demoted, the safe direction.
+        # The same input with a +20 s wall-clock step AFTER the renew exited: the exit stamp was taken at the exit (43 s on both clocks), and the open
+        # gap carries the step on the wall clock (t0+40 to wall t0+145 = 105 s, as heavy-slot.py would see it on this host): not demoted.
         $rs = Invoke-RcCase -QuerySec 85 -ExitAfterSec 3 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(40) -MonoAdvanceToWalk 40 -WallStepSec 20
         $rsTxt2 = $rs | ConvertTo-Json -Compress -Depth 4
-        Assert-True ($rs.ok -eq 1 -and $rs.okMaxGapSec -ge 145 -and $rs.stop -ceq 'demoted') "renew-collect-after-slow-slice: after a wall-clock step the renew's own exit is not trusted and the collection's gap (>= 145 s) demotes: $rsTxt2"
-        Assert-True ($agentText -match '\$script:LeaseRenewClockSkewSec = 1\.0\b') "renew-collect-after-slow-slice: the agent's clock-step tolerance is 1.0 s (the value this suite runs with)"
-        # The fake Start-HeavySlotCli above stands in for the real one; the real one must carry the same monotonic start reading.
-        Assert-True ((Get-FunctionBody 'Start-HeavySlotCli').Contains('startedMono = (Get-AgentMonotonicSec)')) "renew-collect-after-slow-slice: the real Start-HeavySlotCli records startedMono beside started"
-        $results.renewCollectAfterSlowSlice = [ordered]@{ noStep = $rc; wallStep = $rs }
+        Assert-True ($rs.ok -eq 1 -and $rs.okMaxGapSec -ge 43 -and $rs.okMaxGapSec -le 45 -and $rs.gapSec -ge 105 -and $null -eq $rs.stop) "renew-collect-after-slow-slice: a wall step after the exit leaves the stamped 43 s gap, the open gap reads the step (>= 105 s), not demoted: $rsTxt2"
+        # The fake Start-HeavySlotCli above stands in for the real one; the real one must carry the same monotonic start reading and exit stamp.
+        $hsBody = Get-FunctionBody 'Start-HeavySlotCli'
+        Assert-True ($hsBody.Contains('startedMono = (Get-AgentMonotonicSec)') -and $hsBody.Contains('exitStamp = (New-RenewExitStamp -Process $p)')) "renew-collect-after-slow-slice: the real Start-HeavySlotCli records startedMono and an exit stamp beside started"
+        $results.renewCollectAfterSlowSlice = [ordered]@{ noStep = $rc; wallStepAfterExit = $rs }
     }
     if (Test-Case 'renew-stale-still-demotes') {
         $rf = Invoke-RcCase -QuerySec 85 -ExitAfterSec 3 -Rc 1 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(40) -MonoAdvanceToWalk 40
@@ -5969,14 +5979,36 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $results.renewStaleStillDemotes = [ordered]@{ failed = $rf; lateExit = $rl }
     }
     if (Test-Case 'renew-gap-dst-fallback') {
-        # America/Chicago 2026-11-01: 01:59:50 CDT (06:59:50Z) is the last success; now is 01:01:55 CST (07:01:55Z), 125 s later. The local wall
-        # clock reads 3475 s BACKWARD; the monotonic clock reads 125 s. No renew is started (-NoWalk, and the tick sees a negative wall gap on base).
+        # The local wall READING goes from 01:59:50 to 01:01:55 (3475 s backward, as across the America/Chicago 2026-11-01 fall-back) while the
+        # monotonic clock reads 125 s. Pass 4 A3: these constructed local values carry no DST flag, so on any host they model a backward wall step
+        # of that size, not the real fall-back instants (those are renew-exit-stamp-dst). No renew is started (-NoWalk; on base the tick's gap is negative).
         $dPrev = [datetime]::new(2026, 11, 1, 1, 59, 50, [DateTimeKind]::Local)
         $dNow = [datetime]::new(2026, 11, 1, 1, 1, 55, [DateTimeKind]::Local)
         $dd = Invoke-RcCase -QuerySec 0 -ExitAfterSec 200 -Rc 0 -PrevWall $dPrev -WalkStartWall $dNow -MonoAdvanceToWalk 125 -NoWalk
         $ddTxt = $dd | ConvertTo-Json -Compress -Depth 4
-        Assert-True ($dd.gapSec -ge 125 -and $dd.stop -ceq 'demoted') "renew-gap-dst-fallback: 125 s really passed across a DST fall-back (local wall -3475 s): the gap reads >= 125 s and the batch job is demoted: $ddTxt"
+        Assert-True ($dd.gapSec -ge 125 -and $dd.stop -ceq 'demoted') "renew-gap-dst-fallback: 125 s really passed while the local wall reading fell back 3475 s: the gap reads >= 125 s and the batch job is demoted: $ddTxt"
         $results.renewGapDstFallback = $dd
+    }
+    # Adversary pass 4 on 92e3c123 (both introduced, major). A2: the wall clock steps back 20 s while the renew runs and is restored before the
+    # collection (both endpoints agree, so an endpoint check sees no step): the renew starts at t0+100 and exits at real t0+125 with wall t0+105;
+    # collected at t0+130. The monotonic gap from the last success (t0) is 125 s: demoted. 92e3c123 trusted ExitTime and read 105 s.
+    if (Test-Case 'renew-exit-stamp-transient-step') {
+        $tt = Invoke-RcCase -QuerySec 30 -ExitAfterSec 25 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(100) -MonoAdvanceToWalk 100 -ExitWallOffsetSec -20
+        $ttTxt = $tt | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($tt.ok -eq 1 -and $tt.okMaxGapSec -ge 125 -and $tt.stop -ceq 'demoted') "renew-exit-stamp-transient-step: a renew whose exit read 20 s early on a transiently stepped wall clock still closes a >= 125 s gap (monotonic) and the job is demoted: $ttTxt"
+        $results.renewExitStampTransientStep = $tt
+    }
+    # A1: real America/Chicago fall-back instants, built from UTC (ToLocalTime keeps the DST flag): last success 06:59:20Z (mono 1000), the renew
+    # starts at 06:59:50Z (mono 1030) and exits at 07:00:03Z, collected at 07:01:00Z (mono 1100). Closed gap 43 s, open gap 70 s: NOT demoted.
+    # 92e3c123 added the exit offset to a LOCAL start (AddSeconds across the change) and read 3643 s: demoted. On a host without that change
+    # (not America/Chicago) the same instants are ordinary, and the case still asserts the same gaps.
+    if (Test-Case 'renew-exit-stamp-dst') {
+        $u = { param($s) [datetime]::Parse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime() }
+        $tz = [TimeZoneInfo]::Local.Id
+        $td = Invoke-RcCase -QuerySec 70 -ExitAfterSec 13 -Rc 0 -PrevWall (& $u '2026-11-01T06:59:20Z') -WalkStartWall (& $u '2026-11-01T06:59:50Z') -MonoAdvanceToWalk 30
+        $tdTxt = $td | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($td.ok -eq 1 -and $td.okMaxGapSec -ge 43 -and $td.okMaxGapSec -le 44 -and $td.gapSec -ge 70 -and $td.gapSec -le 71 -and $null -eq $td.stop) "renew-exit-stamp-dst (host zone $tz): across the fall-back the closed gap reads 43 s and the open gap 70 s, not demoted: $tdTxt"
+        $results.renewExitStampDst = [ordered]@{ hostZone = $tz; result = $td }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }
