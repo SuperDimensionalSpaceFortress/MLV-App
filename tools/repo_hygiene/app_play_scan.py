@@ -280,17 +280,58 @@ def _statement_pattern(statement: str) -> re.Pattern[str]:
 SPACE_BINDING_STATEMENT_IDENTIFIERS = frozenset(
     token for statement, _ in PINNED_KEY_SPACE_BINDINGS.values() for token in re.findall(r"[A-Za-z_]\w*", statement))
 _DEFINE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)", re.MULTILINE)
-# notify( with an argument dispatches an event like sendEvent (r2 adversary pass 2 A2); a no-argument call of a local
-# callable named notify does not.
-_EVENT_POST = re.compile(r"\b(?:postEvent|sendEvent|sendSpontaneousEvent)\s*\(|\bnotify\s*\((?!\s*\))")
+# r3 (adversary pass 3 A1, HUB RULING HUB-TICK 20261118T1142Z): a digraph `%:define` or a spliced `#de\<nl>fine` re-spelled
+# that macro. The scan guards against an accidental or refactor-made synthesized Play key, not deliberate obfuscation, so
+# the class is closed with one fail-closed rule instead of a preprocessor: in the ONE pinned key-table file a directive
+# other than the include guard, an #include and the reviewed Windows-only key (`#ifdef Q_OS_WIN` / `#endif`, by exact
+# count) fails, and so does any digraph %:, any trigraph, or any line ending in a backslash, anywhere in the file
+# (comments and literals included: a spliced comment swallows the next line). Other files keep the _DEFINE check only.
+KEY_TABLE_SOURCE = "platform/qt/PlayerShortcutBinding.h"
+KEY_TABLE_REVIEWED_DIRECTIVES = {
+    "#ifndef PLAYERSHORTCUTBINDING_H": 1, "#define PLAYERSHORTCUTBINDING_H": 1, "#ifdef Q_OS_WIN": 1, "#endif": 2}
+_DIRECTIVE_LINE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
+_INCLUDE_DIRECTIVE = re.compile(r'#\s*include\s*(?:<[^<>"\n]+>|"[^<>"\n]+")')
+_PREPROCESSOR_RESPELL = re.compile(r"%:|\?\?[=/'()!<>\-]|\\[ \t\r]*$", re.MULTILINE)
+# r3 (adversary pass 3 A2, same ruling): a grouped `(qApp->notify)( w, e )` or `(QCoreApplication::sendEvent)(...)` escaped
+# a `name(` match. EVERY identifier mention of a dispatch name is counted against the pinned sites: a call, a grouping, a
+# member pointer alike.
+_EVENT_POST = re.compile(r"\b(postEvent|sendEvent|sendSpontaneousEvent|notify)\b")
 # The event dispatches that exist today: MyApplication's event filter forwarding to the main window, and the two
 # Look Assist analysis holds, which re-post at landing a clone of an event the user or the OS already delivered
 # (LookAssistAnalysisPump.h: held input; MainWindow.cpp: a held FileOpen). Neither makes up an event.
+# r3: the two local std::function callables NAMED notify are mentions too, pinned by file and count (reviewed: neither
+# dispatches a QEvent): FocusPixelMapManager.cpp's download-ready callback (parameter, capture, call) and
+# SyncDownloadWaiter.h's resolve callable (declaration, hand-off to connectReady).
 PINNED_EVENT_SITES = {
     ("platform/qt/MyApplication.h", "sendEvent"): 1,
     ("platform/qt/LookAssistAnalysisPump.h", "postEvent"): 1,
     ("platform/qt/MainWindow.cpp", "postEvent"): 1,
+    ("platform/qt/FocusPixelMapManager.cpp", "notify"): 3,
+    ("platform/qt/SyncDownloadWaiter.h", "notify"): 2,
 }
+
+
+def _scan_key_table_preprocessor(path: str, text: str, keep: str) -> list[str]:
+    """r3 A1: the fail-closed preprocessor rule for the one pinned key-table file."""
+    problems: list[str] = []
+    for match in _PREPROCESSOR_RESPELL.finditer(text):
+        problems.append(f"{path}:{_line_of(text, match.start())}: a digraph %:, a trigraph or a line splice in the key "
+                        "table (fail-closed: the preprocessor can re-spell the reviewed binding)")
+    seen: dict[str, int] = {}
+    for match in _DIRECTIVE_LINE.finditer(keep):
+        directive = re.sub(r"^#\s*", "#", _normalise(match.group(0)))
+        if _INCLUDE_DIRECTIVE.fullmatch(directive):
+            continue
+        if directive in KEY_TABLE_REVIEWED_DIRECTIVES:
+            seen[directive] = seen.get(directive, 0) + 1
+            continue
+        problems.append(f"{path}:{_line_of(keep, match.start())}: preprocessor directive `{directive}` in the key table "
+                        "(only the include guard, #include and the reviewed #ifdef Q_OS_WIN / #endif are allowed)")
+    for directive, expected in KEY_TABLE_REVIEWED_DIRECTIVES.items():
+        if seen.get(directive, 0) != expected:
+            problems.append(f"{path}: reviewed preprocessor directive `{directive}` x{seen.get(directive, 0)}, pinned "
+                            f"x{expected} (a directive change is reviewed in app_play_scan.py KEY_TABLE_REVIEWED_DIRECTIVES)")
+    return problems
 _ACTION_PLAY = re.compile(r"\bactionPlay\b")
 _ACTION_LOOP = re.compile(r"\bactionLoop\b")
 _GATED_CALL = re.compile(r'\bprogrammaticPlay\s*\(\s*"([^"]+)"\s*,')
@@ -573,6 +614,8 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             if match.group(1) in SPACE_BINDING_STATEMENT_IDENTIFIERS:
                 problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token of the "
                                 "reviewed Space binding statement")
+        if path == KEY_TABLE_SOURCE:
+            problems.extend(_scan_key_table_preprocessor(path, text, keep))
         include_spans = [(m.start(), m.end()) for m in _KEY_EVENT_INCLUDE.finditer(blank)]
         for match in _KEY_SYNTH.finditer(blank):
             if bindings_reviewed and match.group(0) == "Key_Space" and any(
@@ -582,7 +625,7 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
                 continue
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
         for match in _EVENT_POST.finditer(blank):
-            key = (path, re.sub(r"\W", "", match.group(0)))
+            key = (path, match.group(1))
             event_counts[key] = event_counts.get(key, 0) + 1
         for match in _GATED_CALL.finditer(keep):
             site_counts[match.group(1)] = site_counts.get(match.group(1), 0) + 1

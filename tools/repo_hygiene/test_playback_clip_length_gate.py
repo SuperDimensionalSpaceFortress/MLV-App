@@ -2112,6 +2112,7 @@ class PlaybackLauncherScanTests(unittest.TestCase):
 
 # The scanner itself lives in tools/repo_hygiene/app_play_scan.py (ENFORCE-2 round 2: exact pins, a real tokenizer,
 # whole-text matching; no `allowlisted:` comment can exempt a line any more).
+from tools.repo_hygiene import app_play_scan as _app_play_scan  # noqa: E402
 from tools.repo_hygiene.app_play_scan import (  # noqa: E402
     LOOP_OFF_ENTRY_MARKERS,
     PINNED_EVENT_SITES,
@@ -2128,11 +2129,12 @@ from tools.repo_hygiene.app_play_scan import (  # noqa: E402
 
 _BUILD_DIR_NAMES = {"moc", "obj", "rcc", "ui", "release", "debug"}
 # r2 adversary pass 2: also every includer of the key table, every notify( dispatch, and every #define of a token of
-# the reviewed Space binding statement (a macro in an including file rewrites the binding).
+# the reviewed Space binding statement (a macro in an including file rewrites the binding). r3 A2: every MENTION of
+# notify (a grouped `(qApp->notify)(...)` or a member pointer has no `notify(`), as the scan now counts mentions.
 _PLAY_RELEVANT = re.compile(
     r"actionPlay|actionLoop|setPlaying|invokeMethod|QKeyEvent|Key_Space|postEvent|sendEvent|"
     r"sendSpontaneousEvent|programmaticPlay|programmaticStop|QTest\s*::\s*key|keyClick|PlayerShortcutBinding|"
-    r"\bnotify\s*\(|#\s*define\s+(?:" + "|".join(sorted(SPACE_BINDING_STATEMENT_IDENTIFIERS)) + r")\b")
+    r"\bnotify\b|#\s*define\s+(?:" + "|".join(sorted(SPACE_BINDING_STATEMENT_IDENTIFIERS)) + r")\b")
 
 
 def _load_play_sources() -> dict[str, str]:
@@ -2359,10 +2361,13 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         return [p for p in scan_app_play_sources(sources) if p.startswith("event dispatch ")]
 
     def test_the_event_dispatch_pin_is_exactly_the_three_declared_sites(self) -> None:
+        # r3 A2: every MENTION is counted, so the two reviewed local callables named notify (no QEvent) are pinned too.
         self.assertEqual(PINNED_EVENT_SITES, {
             ("platform/qt/MyApplication.h", "sendEvent"): 1,
             ("platform/qt/LookAssistAnalysisPump.h", "postEvent"): 1,
             ("platform/qt/MainWindow.cpp", "postEvent"): 1,
+            ("platform/qt/FocusPixelMapManager.cpp", "notify"): 3,
+            ("platform/qt/SyncDownloadWaiter.h", "notify"): 2,
         })
 
     def test_the_two_pinned_postevent_sites_pass(self) -> None:
@@ -2500,9 +2505,10 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
     def test_r2_p2_a2_notify_with_an_event_is_a_dispatch_that_must_be_pinned(self) -> None:
         self._assert_caught(self._inject_after_measured_loop_off("qApp->notify( this, nullptr );"),
                             "event dispatch notify in platform/qt/MainWindow.cpp x1")
-        # A local callable named notify, called with no arguments, dispatches nothing.
+        # r3 A2 (HUB RULING HUB-TICK 20261118T1142Z): a local callable named notify is counted too (fail-closed); it
+        # passes only at a pinned, reviewed file and count, never by a looser rule.
         self.assertEqual(self._event_dispatch_problems({"platform/qt/X.cpp": "auto f = [notify](bool) { notify(); };\n"}),
-                         [])
+                         ["event dispatch notify in platform/qt/X.cpp x2: not a pinned site (the Play shortcut can be synthesized)"])
 
     def test_r2_p2_a2_reading_a_delivered_key_event_is_not_a_synthesized_key(self) -> None:
         for text in ("#include <QKeyEvent>\n", "void keyPressEvent( QKeyEvent *event ) override;\n",
@@ -2514,6 +2520,96 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         # FocusGuard reads the ShortcutOverride the user's key produced; reading an event is not making one.
         text = "bool f( QEvent *event ) { QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event ); return keyEvent; }\n"
         self.assertEqual(self._key_synth_problems({self._SPACE_TABLE: text}), [])
+
+    # r3 (adversary pass 3 on f64af6f5, HUB RULING HUB-TICK 20261118T1142Z: close each class with one cheap fail-closed
+    # rule, never chase spellings). A1: a digraph `%:define` or a spliced `#de\<nl>fine` re-spelled a macro over the
+    # unchanged table statement. The class is "the preprocessor in the key table": in the ONE pinned key-table file any
+    # directive but the include guard, an #include and the reviewed `#ifdef Q_OS_WIN` / `#endif` fails, and so does any
+    # digraph %:, any trigraph, or any line ending in a backslash, anywhere in the file (comments and literals included).
+    _TABLE_STATEMENT_LINE = '    table << ActionBinding{ QStringLiteral( "actionPlay" ),'
+    _R3_A1_DIRECTIVES = {
+        "a digraph #define around the statement":
+            ("%:define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", "%:undef QKeySequence"),
+        "a backslash-newline spliced #define":
+            ("#de\\\nfine QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", "#undef QKeySequence"),
+        "a trigraph #define": ("??=define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", ""),
+        "an #undef": ("#undef QKeySequence", ""),
+        "an #if around the statement": ("#if 1", "#endif"),
+        "another #ifdef": ("#ifdef Q_OS_MAC", "#endif"),
+        "a #pragma push_macro": ('#pragma push_macro("QKeySequence")', ""),
+        "a #line": ("#line 1", ""),
+        "a #define of a token outside the statement": ("#  define OTHER_MACRO 1", ""),
+        "an #include_next": ("#include_next <QKeySequence>", ""),
+        "a comment that splices the next line into itself": ("// a note \\", ""),
+    }
+
+    def _key_table_with(self, before: str, after: str) -> dict[str, str]:
+        mutated = self._mutated(self._TABLE_STATEMENT_LINE, before + "\n" + self._TABLE_STATEMENT_LINE, path=self._SPACE_TABLE)
+        if after:
+            mutated[self._SPACE_TABLE] = mutated[self._SPACE_TABLE].replace(
+                "KeyKind::Primary } } };", "KeyKind::Primary } } };\n" + after, 1)
+        return mutated
+
+    def test_r3_a1_any_other_preprocessor_use_in_the_key_table_fails(self) -> None:
+        for name, (before, after) in self._R3_A1_DIRECTIVES.items():
+            with self.subTest(name):
+                problems = scan_app_play_sources(self._key_table_with(before, after))
+                self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:") and "preprocessor" in p for p in problems),
+                                problems)
+
+    def test_r3_a1_the_key_table_directive_pin_is_exactly_the_reviewed_set(self) -> None:
+        self.assertEqual(_app_play_scan.KEY_TABLE_SOURCE, self._SPACE_TABLE)
+        self.assertEqual(_app_play_scan.KEY_TABLE_REVIEWED_DIRECTIVES, {
+            "#ifndef PLAYERSHORTCUTBINDING_H": 1, "#define PLAYERSHORTCUTBINDING_H": 1, "#ifdef Q_OS_WIN": 1, "#endif": 2})
+
+    def test_r3_a1_a_vanished_or_duplicated_reviewed_directive_fails(self) -> None:
+        for name, mutated in {
+                "the Windows #ifdef removed": self._mutated("#ifdef Q_OS_WIN\n", "", path=self._SPACE_TABLE),
+                "a second Windows #ifdef": self._key_table_with("#ifdef Q_OS_WIN", "#endif")}.items():
+            with self.subTest(name):
+                problems = scan_app_play_sources(mutated)
+                self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:") and "preprocessor" in p for p in problems),
+                                problems)
+
+    def test_r3_a1_other_scanned_files_keep_the_identifier_define_rule_only(self) -> None:
+        # The fail-closed directive rule is for the one key-table file; elsewhere only a #define of a statement token fails.
+        for text in ("#undef QKeySequence\n", "#if 1\n#endif\n", "#define OTHER_MACRO 1\n", "// a note \\\n"):
+            with self.subTest(text):
+                problems = scan_app_play_sources({"platform/qt/OtherWidget.h": text})
+                self.assertFalse([p for p in problems if "preprocessor" in p or "#define of" in p], problems)
+
+    # A2: a parenthesised `(qApp->notify)( w, e )` or a grouped `(QCoreApplication::sendEvent)(...)` escaped _EVENT_POST,
+    # which required `name(`. The class is "a dispatch named any other way": EVERY identifier mention of postEvent,
+    # sendEvent, sendSpontaneousEvent or notify is counted against the pinned sites (a call, a grouping, a pointer).
+    _R3_A2_MUTANTS = {
+        "(qApp->notify)( this, nullptr );": "event dispatch notify in platform/qt/MainWindow.cpp x1",
+        "(QCoreApplication::sendEvent)( this, nullptr );": "event dispatch sendEvent in platform/qt/MainWindow.cpp x1",
+        "(QCoreApplication::postEvent)( this, nullptr );": "event dispatch postEvent in platform/qt/MainWindow.cpp x2",
+        "auto dispatch = &QCoreApplication::sendSpontaneousEvent;":
+            "event dispatch sendSpontaneousEvent in platform/qt/MainWindow.cpp x1",
+        "auto dispatch = std::mem_fn( &QApplication::notify );": "event dispatch notify in platform/qt/MainWindow.cpp x1",
+    }
+
+    def test_r3_a2_every_mention_of_a_dispatch_name_is_counted(self) -> None:
+        for injected, needle in self._R3_A2_MUTANTS.items():
+            with self.subTest(injected):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), needle)
+
+    def test_r3_a2_a_grouped_notify_in_the_focus_guard_is_caught(self) -> None:
+        anchor = "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );"
+        self._assert_caught(self._mutated(anchor, anchor + "\n        (qApp->notify)( QApplication::focusWidget(), keyEvent );",
+                                          path=self._SPACE_TABLE),
+                            "event dispatch notify in platform/qt/PlayerShortcutBinding.h x1")
+
+    def test_r3_a2_every_file_that_mentions_a_dispatch_name_is_loaded(self) -> None:
+        for text in ("(qApp->notify)( w, e );\n", "connectReady(notify)\n", "auto p = &QCoreApplication::postEvent;\n",
+                     "(QCoreApplication::sendSpontaneousEvent)( w, e );\n"):
+            with self.subTest(text):
+                self.assertRegex(text, _PLAY_RELEVANT)
+        # The two local callables named notify are loaded and pinned by file and count (reviewed, not a looser rule).
+        for path in ("platform/qt/FocusPixelMapManager.cpp", "platform/qt/SyncDownloadWaiter.h"):
+            with self.subTest(path):
+                self.assertIn(path, self.sources)
 
     def test_the_binding_exemption_needs_the_exact_expression(self) -> None:
         # A Key_Space merely NEAR a QKeySequence is not the reviewed expression.
