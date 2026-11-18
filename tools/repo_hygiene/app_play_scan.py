@@ -62,12 +62,12 @@ REVIEWED_PROGRAMMATIC_STOP_SITES = {
 # ENFORCE-3: EVERY place that stops a Play, by enclosing MainWindow function: (raw ``actionPlay->setChecked( false )``,
 # ``on_actionPlay_triggered( false )``, ``programmaticStop(``). A count that differs -- or a function that is not
 # listed -- is a new stop site and fails the scan until it is reviewed HERE. The user-input handlers (close, open,
-# export, import, session, resize, show-file) stop Play because the USER did something; the three automation entries
+# export, import, session, show-file) stop Play because the USER did something (a resize no longer does:
+# PLAYER-FULLSCREEN-KEEPS-PLAYING-1, ResizePlaybackPolicy.h, so resizeEvent is unlisted); the three automation entries
 # (the autoplay poll in the constructor, the smoke, the profile) and the two engine stops are pinned separately below.
 REVIEWED_PLAY_STOPS = {
     "MainWindow::MainWindow": (1, 1, 0),                              # autoplay poll lambda: after programmaticPlayState
     "MainWindow::closeEvent": (1, 1, 0),
-    "MainWindow::resizeEvent": (1, 0, 0),
     "MainWindow::showFileInEditor": (1, 0, 0),
     "MainWindow::openDngFolderDialog": (1, 0, 0),
     "MainWindow::on_actionOpen_triggered": (1, 0, 0),

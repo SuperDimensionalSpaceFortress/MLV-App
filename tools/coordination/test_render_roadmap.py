@@ -248,6 +248,50 @@ class OutputShapeTests(unittest.TestCase):
         self.assertIn("gitignored", text)
         self.assertNotIn("dual-lane/queue.json", text)
 
+    def test_header_states_the_true_refresh_cadence_not_a_check_caller(self) -> None:
+        # No caller runs `--check`; the hub renders an untracked live copy hourly and a drift
+        # detector may file a refresh card. The tracked header must say that, not claim a check.
+        text = render_roadmap.render(load_fixture())
+        self.assertNotIn("The hub checks freshness with `--check`", text)
+        self.assertIn("heartbeat/roadmap-live.md", text)
+        self.assertIn("every hour", text)
+        self.assertIn("7 or more days old", text)
+        self.assertIn("refresh card", text)
+        self.assertIn("`--check` is manual; no CI runs it", text)
+        # the drift detector compares card names, priorities and the WORDS of the scope notes above the open table (whitespace-normalised): not the
+        # generated stamp, the Drain section, a state-only change or the parked notes (r3 sol blocker D-06: "notes differ" claimed all of them)
+        # (the header must not use the word "scope": a queue without scope notes renders none, see ScopeNoteTests)
+        self.assertIn("open cards, priorities or pre-table note words differ", text)
+        self.assertNotIn("or notes differ", text)
+        # r4 (sol + opus blocker): the filing promise is conditional. The detector reads every table row's priority as an integer and throws on
+        # anything else, so a render holding a row it cannot read (the capped owner summary row's "-" priority, an empty state, a boolean or
+        # out-of-Int64 priority) is verdict=unknown and files nothing. The header must say so; "this file is" names the tracked file, not the live copy.
+        self.assertIn("a drift detector may file a refresh card, or none if a row will not parse.", text)
+        # r5 (sol adversary A1, major): "files" promised a card, but the detector has more gates than the parse (it never files twice in 7 days,
+        # nor when a card for the day exists, nor while its state or the ledger is unreadable). The header says "may", never an unconditional "files".
+        self.assertNotIn("detector files", text)
+        self.assertIn("If they differ, `card-queue.json`\nwins", text)
+        self.assertIn("When this file is\n7 or more days old and its open cards", text)
+
+    def test_the_header_condition_matches_a_render_the_detector_cannot_read(self) -> None:
+        # The case the header's "or none" names, built from the real renderer: more owner asks of another kind than OWNER_LIST_MAX makes the
+        # renderer append a summary row whose priority cell is "-", which the detector refuses (roadmap-tracked-drift.ps1 priority-not-integer).
+        data = load_fixture()
+        data["rows"] = [dict(card="OWN-%02d" % i, kind="hub-tooling", priority=3, state="queued",
+                             source_ledger_stamp="2026-10-20T00:00:00Z", origin="owner") for i in range(render_roadmap.OWNER_LIST_MAX + 1)]
+        text = render_roadmap.render(data)
+        self.assertIn("| - | ... and 1 more open owner asks of another kind (card-queue.json) | - | - | - | - |", text)
+        self.assertIn("or none if a row will not parse", text)
+
+    def test_the_bare_tier_header_drops_the_false_claim_at_master_s_byte_count(self) -> None:
+        # The bare tier is held to master's byte count (the 20000-byte window): its true sentence is the same 40 bytes as the false one it replaces.
+        false_claim = "The hub checks freshness with `--check`."
+        true_claim = "`--check` is manual; no hub job runs it."
+        self.assertEqual(len(true_claim.encode("utf-8")), len(false_claim.encode("utf-8")))
+        base = render_roadmap._render_base(load_fixture())
+        self.assertNotIn("checks freshness", base)
+        self.assertIn("re-render, do not edit by hand. " + true_claim + "\n", base)
+
     def test_ends_with_one_newline_and_has_no_carriage_returns(self) -> None:
         text = render_roadmap.render(load_fixture())
         self.assertTrue(text.endswith("\n") and not text.endswith("\n\n"))
@@ -1266,6 +1310,9 @@ class R4DepthTests(unittest.TestCase):
         self.assertLessEqual(render_roadmap.MAX_NESTING, 100)   # a bound that would not stop the 3,000-deep input is no bound
 
 
+# ROADMAP-RENDER-CHECK-CI-1: the one deliberate difference from fork/master's header below is the freshness sentence. Master said "The hub checks
+# freshness with `--check`." (40 bytes; no caller runs it). The pinned copy says the true thing in the SAME 40 bytes, so every byte count the
+# window tests pin (19999, 20000, 19989 ...) still means "master's size".
 # (r5, review-pr835-opus-r4 blocker + hardening) master's renderer, embedded as it stood on fork/master before this card. The budget
 # window tests measure "fits at base" against THIS copy, never against the renderer under test: a change to the shared header or to
 # any other shared text moves the new renderer and this copy apart, which turns them red. Stamps in these boards are plain Z-stamps,
@@ -1279,7 +1326,7 @@ mirror of the frozen dual-lane `queue.json`, whose 16 rows had mostly landed. Th
 card-queue file lives under `.claude-state/hub-autopilot/`, which is gitignored and absent
 from every hosted checkout, so this file is the only place a reviewer without local state
 can see the open product backlog. Where the two disagree, `card-queue.json` wins:
-re-render, do not edit by hand. The hub checks freshness with `--check`.
+re-render, do not edit by hand. `--check` is manual; no hub job runs it.
 
 Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
@@ -1582,6 +1629,22 @@ class R10LastTierTests(unittest.TestCase):
                 self.assertEqual(render_roadmap.main(["--card-queue", str(q), "--out", str(out), "--check"]), 0)
                 self.assertLessEqual(render_roadmap._budget_size(out.read_bytes().decode("utf-8")), ROADMAP_BUDGET_BYTES)
         self.assertIn("0001-01-07", render_roadmap.render(self.data([], 9059, "0001-01-06T23:30:00-01:00")))   # the UTC window the loader validated
+
+    # ROADMAP-RENDER-CHECK-CI-1 r2 (adversary A2, introduced major): a longer full-tier header moved the tier boundary, so a board that fit the
+    # owner-aware tier before (19771 CRLF bytes) fell through to the bare tier at 20001 and was read by textual day: four offset-stamped landings
+    # (merged 2026-10-16T23:30:00-01:00 = UTC 2026-10-17) vanished. Class: a header edit that is not budget-neutral in the full tier.
+    def test_a2_the_header_fix_does_not_move_a_near_budget_board_into_the_bare_tier(self) -> None:
+        rows = [row("PRODUCT-%03d" % i, "queued", "2026-09-01T00:00:00Z") for i in range(300)]
+        rows += [row("MERGED-%d" % i, "merged", "2026-09-01T00:00:00Z", merged_utc="2026-10-16T23:30:00-01:00") for i in range(4)]
+        text = render_roadmap.render(self.data(rows, 406))
+        self.assertFalse(text.startswith(MASTER_HEADER), "this board fit the owner-aware tier before the header fix; it must not fall to the bare tier")
+        self.assertIn("| 2026-10-17 | 4 | 0 |", text)   # the four landings, on their UTC day
+        self.assertLessEqual(render_roadmap._budget_size(text), ROADMAP_BUDGET_BYTES)
+
+    def test_the_full_tier_header_is_budget_neutral_against_the_header_it_replaced(self) -> None:
+        # 970 CRLF bytes is what the full header cost before ROADMAP-RENDER-CHECK-CI-1; a different number moves every board's tier boundary.
+        self.assertEqual(render_roadmap._budget_size(render_roadmap.HEADER), 970)
+        self.assertEqual(render_roadmap._budget_size(render_roadmap.HEADER_BASE), 880)
 
     def test_pass2_a1_an_over_budget_board_with_no_base_rendering_is_refused_with_exit_2(self) -> None:
         tmp = tempfile.TemporaryDirectory()

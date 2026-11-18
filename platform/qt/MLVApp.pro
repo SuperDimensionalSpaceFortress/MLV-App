@@ -397,6 +397,7 @@ HEADERS += MainWindow.h \
            PlaybackRouteStagedSlotPolicy.h \
            PlaybackReconWarmRunPolicy.h \
            ResizeStillDrawingWait.h \
+           ResizePlaybackPolicy.h \
            PlaybackReconWarmRun.h \
            PlaybackGpuClockKickPolicy.h \
            PlaybackAudioGate.h \
@@ -412,6 +413,7 @@ HEADERS += MainWindow.h \
            LookLabelPolicy.h \
            LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
+           PlayerShortcutBinding.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \

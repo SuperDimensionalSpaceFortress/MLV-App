@@ -16,6 +16,7 @@
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackScaleLabel.h"
+#include "PlayerShortcutBinding.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
 #include "LogLineField.h"
@@ -25,6 +26,7 @@
 #include "VisualCaptureSourceDifference.h"
 #include "ClipOpenAbortPolicy.h"
 #include "ResizeStillDrawingWait.h"
+#include "ResizePlaybackPolicy.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -3053,9 +3055,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( !ui->actionPlay->isChecked() )
     {
         lastDrawnPlaybackPosition = -1;
+        m_playbackRedrawAfterResize = false;
     }
-    else if( m_frameChanged
-          && ui->horizontalSliderPosition->value() == lastDrawnPlaybackPosition )
+    else if( resize_playback_policy::suppressDuplicatePlaybackDraw( m_frameChanged, ui->horizontalSliderPosition->value(), lastDrawnPlaybackPosition, m_playbackRedrawAfterResize ) )
     {
         /* Fast timer polling (mlvappPlaybackTimerIntervalMs) can mark the
          * frame changed on ticks where elapsed-time pacing advanced zero
@@ -3067,6 +3069,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( m_frameChanged && !m_dontDraw && !m_inOpeningProcess )
     {
         m_frameChanged = false; //first do this, if there are changes between rendering
+        m_playbackRedrawAfterResize = false;
         if( ui->actionPlay->isChecked() )
         {
             lastDrawnPlaybackPosition = ui->horizontalSliderPosition->value();
@@ -3218,16 +3221,18 @@ bool MainWindow::waitForResizeStillDrawing( const QString &site )
 //Window resized -> scale picture
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
-    //If opening files just quit here
-    if( m_inOpeningProcess )
+    // PLAYER-FULLSCREEN-KEEPS-PLAYING-1: a resize (a fullscreen toggle, a maximize/restore, a window drag) no longer
+    // stops Play. Every playback drawFrame() sizes its scene from the current geometry (computeDisplaySceneGeometry) and
+    // finishPresentedFrame re-anchors the gradient on a changed scene, so Play needs no redraw here. Nothing is stopped,
+    // so nothing is resumed: a resume would be a programmatic Play, which ENFORCE-2 (app_play_scan.py) forbids here.
+    switch( resize_playback_policy::decide( m_inOpeningProcess, m_lookAssistPump.sessionOpen(), ui->actionPlay->isChecked() ) )
     {
+    case resize_playback_policy::Action::AcceptOnly:
+        //If opening files just quit here
         event->accept();
         return;
-    }
-
-    // A resize is not user input, so it arrives during a Look Assist analysis. Its redraw waits for landing.
-    if( m_lookAssistPump.sessionOpen() )
-    {
+    case resize_playback_policy::Action::HoldForLookAssist:
+        // A resize is not user input, so it arrives during a Look Assist analysis. Its redraw waits for landing.
         event->accept();
         if( !m_lookAssistResizeHeld )
         {
@@ -3240,11 +3245,28 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             } );
         }
         return;
+    case resize_playback_policy::Action::KeepPlaying:
+        // Adversary A1: a frame already requested, prepared or in flight was scaled for the OLD scene and would land on it.
+        // The display-change invalidation (the one a mid-Play scale change uses) drops and cancels that generation.
+        invalidatePlaybackPrepForDisplayChange( "resize-keep-playing" );
+        // Adversary A2: the playback tick redraws the current position at the new geometry even when Play holds one frame
+        // (a collapsed looped range), past its duplicate-position suppression. The tick draws it, not this handler.
+        m_playbackRedrawAfterResize = true;
+        m_frameChanged = true;
+        // The redrawn frame lands on the new scene; the flag makes finishPresentedFrame re-anchor the gradient there.
+        if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() ) m_zoomModeChanged = true;
+        logInteractionEvent( QStringLiteral("resize.keep_playing"),
+                             QStringLiteral("width=%1 height=%2 fullscreen=%3")
+                                 .arg( event->size().width() )
+                                 .arg( event->size().height() )
+                                 .arg( bool01( isFullScreen() ) ) );
+        event->accept();
+        return;
+    case resize_playback_policy::Action::RedrawStopped:
+        // Play is off here; the audio stop is a backstop only
+        m_pAudioPlayback->stop(); //Stop audio explicitely
+        break;
     }
-
-    //Stop playback if active
-    ui->actionPlay->setChecked( false );
-    m_pAudioPlayback->stop(); //Stop audio explicitely
 
     if( m_fileLoaded )
     {
@@ -13538,6 +13560,8 @@ void MainWindow::initGui( void )
     //Rename selected clip (only one! selected clip)
     connect( ui->actionRename, SIGNAL( triggered() ), this, SLOT( renameActiveClip() ) );
     addAction( ui->actionRename );
+    //Fullscreen hides the menu bar and toolbar; carry the player shortcuts on the window too
+    PlayerShortcutBinding::bindToWindow( this );
 }
 
 //Initialize the library
@@ -26882,8 +26906,9 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
     // repeat regardless.
     // CUDA-PERF-DISPLAY-MODE-AB-1: the same holds for a --windowed leg, which
     // placePlaybackSmokeWindowWindowed() has MAXIMIZED before the second call. Un-maximizing
-    // it here resizes the window, and resizeEvent() unchecks Play -- measured on bachelor:
+    // it here resizes the window, and resizeEvent() unchecked Play -- measured on bachelor:
     // the windowed leg's Play stopped 37 ms after the trigger with 0 frames presented.
+    // (Since PLAYER-FULLSCREEN-KEEPS-PLAYING-1 a resize keeps Play; keeping the state still avoids the relayout.)
     const bool wasFullScreen = isFullScreen();
     const bool keepWindowState = wasFullScreen || isMaximized();
     if( !keepWindowState ) showNormal();

@@ -8,6 +8,7 @@
 #include "../../platform/qt/Histogram.h"
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
 #include "../../platform/qt/PlaybackScopesDuringPlayback.h"
+#include "../../platform/qt/PlayerShortcutBinding.h"
 #include "../../platform/qt/ScopesLabel.h"
 #include "../../platform/qt/VectorScope.h"
 #include "../../platform/qt/WaveFormMonitor.h"
@@ -26,7 +27,11 @@
 #include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLineEdit>
+#include <QMainWindow>
 #include <QMap>
+#include <QMenu>
+#include <QMenuBar>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
@@ -35,9 +40,12 @@
 #include <QScopeGuard>
 #include <QScreen>
 #include <QScrollBar>
+#include <QSpinBox>
+#include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWindow>
+#include <QXmlStreamReader>
 #include <QtTest/QtTest>
 
 #include <cmath>
@@ -613,6 +621,12 @@ class GuiSmokeTest : public QObject
 private slots:
     void rgb16DisplayReferencePreservesEndpoints();
     void checkedStateUpdatesPalette();
+    void fullscreenLiveShortcuts_uiTableMatchesBindingList();
+    void fullscreenLiveShortcuts_hiddenBarsWithoutBindingAreDead();
+    void fullscreenLiveShortcuts_hiddenBarsWithBindingFireOnce();
+    void fullscreenLiveShortcuts_visibleBarsWithBindingFireExactlyOnce();
+    void fullscreenLiveShortcuts_textInputsKeepTheirKeys();
+    void fullscreenLiveShortcuts_otherTopLevelWindowDoesNotFire();
     void mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes();
     void mainWindowGpuPreviewPolicyScopesVetoOnlyWhenDisplayed();
     void mainWindowGpuPreviewPolicyHideScopesVetoesNothingWhilePlaying();
@@ -686,6 +700,330 @@ void GuiSmokeTest::checkedStateUpdatesPalette()
 
     button.setChecked(false);
     QCOMPARE(button.palette().color(QPalette::Button), original_button);
+}
+
+namespace
+{
+// PLAYER-FULLSCREEN-SHORTCUTS-LIVE-1. One row per key the player must keep live in fullscreen.
+// uiShortcut is the MainWindow.ui <string> (nullptr = a key MainWindow.cpp adds in code: F11 on
+// Windows, MainWindow.cpp `ui->actionFullscreen->setShortcuts(...)`).
+struct LiveShortcutKey
+{
+    const char *actionName;
+    const char *uiShortcut;
+    Qt::Key key;
+    Qt::KeyboardModifiers modifiers;
+};
+
+QVector<LiveShortcutKey> live_shortcut_keys()
+{
+    QVector<LiveShortcutKey> keys = {
+        { "actionPlay",             "Space",  Qt::Key_Space,  Qt::NoModifier },
+        { "actionGoto_First_Frame", "X",      Qt::Key_X,      Qt::NoModifier },
+        { "actionPreviousFrame",    ",",      Qt::Key_Comma,  Qt::NoModifier },
+        { "actionNextFrame",        ".",      Qt::Key_Period, Qt::NoModifier },
+        { "actionZoomFit",          "F",      Qt::Key_F,      Qt::NoModifier },
+        { "actionZoom100",          "Ctrl+0", Qt::Key_0,      Qt::ControlModifier },
+        { "actionFullscreen",       "Ctrl+F", Qt::Key_F,      Qt::ControlModifier },
+    };
+#ifdef Q_OS_WIN
+    keys.append( { "actionFullscreen", nullptr, Qt::Key_F11, Qt::NoModifier } );
+#endif
+    return keys;
+}
+
+// A stand-in for MainWindow's carriers of the 7 actions: QActions parented to the window (as uic
+// does), a "Playback" menu in the menu bar holding all 7 (MainWindow.ui menuPlayback), a toolbar
+// holding Goto/Prev/Play/Next (MainWindow.ui mainToolBar), and a central widget with a
+// focusable non-text viewer, a QLineEdit and a QSpinBox.
+class FullscreenShortcutMirror
+{
+public:
+    FullscreenShortcutMirror()
+    {
+        window.resize( 640, 360 );
+        // A widget menu bar on every platform (adversary A1): a macOS native menu bar does not
+        // show as a QWidget and counts as visible for shortcut matching even when hidden, which
+        // would break both the visible-bars case and the hidden-bars control.
+        window.menuBar()->setNativeMenuBar( false );
+        QMenu *playback = window.menuBar()->addMenu( QStringLiteral( "Playback" ) );
+        toolBar = window.addToolBar( QStringLiteral( "mainToolBar" ) );
+        const QVector<LiveShortcutKey> keys = live_shortcut_keys();
+        for( const QString &name : PlayerShortcutBinding::liveActionNames() )
+        {
+            QAction *a = new QAction( name, &window );
+            a->setObjectName( name );
+            QList<QKeySequence> sequences;
+            for( const LiveShortcutKey &k : keys )
+            {
+                if( name != QLatin1String( k.actionName ) ) continue;
+                sequences << ( k.uiShortcut ? QKeySequence( QString::fromLatin1( k.uiShortcut ) )
+                                            : QKeySequence( QKeyCombination( k.modifiers, k.key ) ) );
+            }
+            a->setShortcuts( sequences );
+            playback->addAction( a );
+            counts.insert( name, 0 );
+            QObject::connect( a, &QAction::triggered, &window, [this, name]() { ++counts[name]; } );
+        }
+        for( const char *name : { "actionGoto_First_Frame", "actionPreviousFrame", "actionPlay", "actionNextFrame" } )
+            toolBar->addAction( action( QLatin1String( name ) ) );
+
+        QWidget *central = new QWidget( &window );
+        QVBoxLayout *layout = new QVBoxLayout( central );
+        viewer = new QWidget( central );
+        viewer->setObjectName( QStringLiteral( "viewer" ) );
+        viewer->setFocusPolicy( Qt::StrongFocus );
+        viewer->setMinimumSize( 160, 90 );
+        lineEdit = new QLineEdit( central );
+        spinBox = new QSpinBox( central );
+        layout->addWidget( viewer );
+        layout->addWidget( lineEdit );
+        layout->addWidget( spinBox );
+        window.setCentralWidget( central );
+    }
+
+    QAction *action( const QString &name )
+    {
+        return window.findChild<QAction*>( name, Qt::FindDirectChildrenOnly );
+    }
+
+    void hideBars()
+    {
+        window.menuBar()->hide();
+        toolBar->hide();
+    }
+
+    bool showAndActivate( bool fullscreen )
+    {
+        if( fullscreen ) window.showFullScreen();
+        else window.show();
+        window.activateWindow();
+        return QTest::qWaitForWindowActive( &window );
+    }
+
+    int total() const
+    {
+        int sum = 0;
+        for( const int c : counts ) sum += c;
+        return sum;
+    }
+
+    QMainWindow window;
+    QToolBar *toolBar = nullptr;
+    QWidget *viewer = nullptr;
+    QLineEdit *lineEdit = nullptr;
+    QSpinBox *spinBox = nullptr;
+    QMap<QString, int> counts;
+};
+
+// Presses every live key on `target`, one at a time, and checks the deltas: the key's own
+// action fires `expectedPerKey` times and no other action fires.
+void press_live_keys_and_check( FullscreenShortcutMirror &m, QWidget *target, int expectedPerKey )
+{
+    for( const LiveShortcutKey &k : live_shortcut_keys() )
+    {
+        const QMap<QString, int> before = m.counts;
+        QTest::keyClick( target, k.key, k.modifiers );
+        for( auto it = m.counts.cbegin(); it != m.counts.cend(); ++it )
+        {
+            const int delta = it.value() - before.value( it.key() );
+            const int expected = ( it.key() == QLatin1String( k.actionName ) ) ? expectedPerKey : 0;
+            QVERIFY2( delta == expected,
+                      qPrintable( QStringLiteral( "key %1 (mods 0x%2): action %3 fired %4 time(s), expected %5" )
+                                  .arg( QKeySequence( QKeyCombination( k.modifiers, k.key ) ).toString() )
+                                  .arg( int( k.modifiers ), 0, 16 )
+                                  .arg( it.key() ).arg( delta ).arg( expected ) ) );
+        }
+    }
+}
+
+} // namespace
+
+void GuiSmokeTest::fullscreenLiveShortcuts_uiTableMatchesBindingList()
+{
+    // The binding list, this test's key table and MainWindow.ui must agree: same 7 actions, in
+    // the same order, each with exactly the .ui shortcut the mirror window uses.
+    const QVector<LiveShortcutKey> keys = live_shortcut_keys();
+    QStringList tableNames;
+    for( const LiveShortcutKey &k : keys )
+        if( !tableNames.contains( QLatin1String( k.actionName ) ) ) tableNames << QLatin1String( k.actionName );
+    QCOMPARE( PlayerShortcutBinding::liveActionNames(), tableNames );
+    QCOMPARE( PlayerShortcutBinding::liveActionNames().size(), 7 );
+
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/MainWindow.ui" ) );
+    QVERIFY2( !path.isEmpty(), "MainWindow.ui not found" );
+    QFile file( path );
+    QVERIFY( file.open( QIODevice::ReadOnly ) );
+    QXmlStreamReader xml( &file );
+    QMap<QString, int> actionDefinitions;
+    QMap<QString, QStringList> shortcutsByAction;
+    QMap<QString, int> addActionUses;
+    QString currentAction;
+    int depth = 0;
+    int actionDepth = -1;
+    bool inShortcutProperty = false;
+    while( !xml.atEnd() )
+    {
+        xml.readNext();
+        if( xml.isStartElement() )
+        {
+            ++depth;
+            const QString name = xml.attributes().value( QStringLiteral( "name" ) ).toString();
+            if( xml.name() == QLatin1String( "action" ) )
+            {
+                currentAction = name;
+                actionDepth = depth;
+                ++actionDefinitions[name];
+            }
+            else if( xml.name() == QLatin1String( "addaction" ) )
+            {
+                ++addActionUses[name];
+            }
+            else if( !currentAction.isEmpty() && depth == actionDepth + 1
+                  && xml.name() == QLatin1String( "property" ) && name == QLatin1String( "shortcut" ) )
+            {
+                inShortcutProperty = true;
+            }
+            else if( inShortcutProperty && xml.name() == QLatin1String( "string" ) )
+            {
+                shortcutsByAction[currentAction] << xml.readElementText();
+                --depth; // readElementText() consumed the end element
+            }
+        }
+        else if( xml.isEndElement() )
+        {
+            if( xml.name() == QLatin1String( "property" ) ) inShortcutProperty = false;
+            if( depth == actionDepth )
+            {
+                currentAction.clear();
+                actionDepth = -1;
+            }
+            --depth;
+        }
+    }
+    QVERIFY2( !xml.hasError(), qPrintable( xml.errorString() ) );
+
+    for( const QString &name : PlayerShortcutBinding::liveActionNames() )
+    {
+        QStringList expected;
+        for( const LiveShortcutKey &k : keys )
+            if( name == QLatin1String( k.actionName ) && k.uiShortcut ) expected << QLatin1String( k.uiShortcut );
+        QVERIFY2( actionDefinitions.value( name ) == 1,
+                  qPrintable( QStringLiteral( "%1 defined %2 time(s) in MainWindow.ui" ).arg( name ).arg( actionDefinitions.value( name ) ) ) );
+        QVERIFY2( shortcutsByAction.value( name ) == expected,
+                  qPrintable( QStringLiteral( "%1: .ui shortcut [%2], table [%3]" )
+                              .arg( name, shortcutsByAction.value( name ).join( QLatin1Char( '|' ) ), expected.join( QLatin1Char( '|' ) ) ) ) );
+        QVERIFY2( addActionUses.value( name ) >= 1,
+                  qPrintable( QStringLiteral( "%1 is not on any menu or toolbar in MainWindow.ui" ).arg( name ) ) );
+    }
+}
+
+void GuiSmokeTest::fullscreenLiveShortcuts_hiddenBarsWithoutBindingAreDead()
+{
+    // CONTROL: the defect. Menu bar and toolbar hidden (as on_actionFullscreen_triggered() does),
+    // window fullscreen and active, nothing bound to the window -> no key reaches its action.
+    FullscreenShortcutMirror m;
+    m.hideBars();
+    QVERIFY( m.showAndActivate( true ) );
+    m.viewer->setFocus();
+    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
+    press_live_keys_and_check( m, &m.window, 0 );
+    if( QTest::currentTestFailed() ) return;
+    QCOMPARE( m.total(), 0 );
+}
+
+void GuiSmokeTest::fullscreenLiveShortcuts_hiddenBarsWithBindingFireOnce()
+{
+    FullscreenShortcutMirror m;
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    for( const QString &name : PlayerShortcutBinding::liveActionNames() )
+        QVERIFY( m.window.actions().contains( m.action( name ) ) );
+    m.hideBars();
+    QVERIFY( m.showAndActivate( true ) );
+    m.viewer->setFocus();
+    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
+    press_live_keys_and_check( m, &m.window, 1 );
+    if( QTest::currentTestFailed() ) return;
+    QCOMPARE( m.total(), live_shortcut_keys().size() );
+}
+
+void GuiSmokeTest::fullscreenLiveShortcuts_visibleBarsWithBindingFireExactlyOnce()
+{
+    // Windowed: menu bar and toolbar visible AND the window bound. One action is one shortcut-map
+    // entry however many widgets carry it, so each key fires once (no ambiguity, no double fire).
+    FullscreenShortcutMirror m;
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    // A second bind leaves the window's actions as they are -- no remove/re-append reorder past
+    // an unrelated action added in between (adversary pass 2 A1).
+    QAction *extra = new QAction( QStringLiteral( "Extra" ), &m.window );
+    m.window.addAction( extra );
+    const QList<QAction*> before = m.window.actions();
+    QCOMPARE( before.size(), 8 );
+    QCOMPARE( before.last(), extra );
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    QCOMPARE( m.window.actions(), before );
+    QVERIFY( m.showAndActivate( false ) );
+    QVERIFY( !m.window.menuBar()->isNativeMenuBar() );
+    QVERIFY( m.window.menuBar()->isVisible() );
+    QVERIFY( m.toolBar->isVisible() );
+    m.viewer->setFocus();
+    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
+    press_live_keys_and_check( m, &m.window, 1 );
+    if( QTest::currentTestFailed() ) return;
+    QCOMPARE( m.total(), live_shortcut_keys().size() );
+}
+
+void GuiSmokeTest::fullscreenLiveShortcuts_textInputsKeepTheirKeys()
+{
+    // Text inputs claim printable keys in ShortcutOverride; binding to the window must not steal
+    // Space , . X F from them.
+    FullscreenShortcutMirror m;
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    m.hideBars();
+    QVERIFY( m.showAndActivate( true ) );
+    const Qt::Key printable[] = { Qt::Key_Space, Qt::Key_Comma, Qt::Key_Period, Qt::Key_X, Qt::Key_F };
+
+    m.lineEdit->setFocus();
+    QTRY_COMPARE( QApplication::focusWidget(), static_cast<QWidget*>( m.lineEdit ) );
+    for( const Qt::Key key : printable ) QTest::keyClick( m.lineEdit, key );
+    QCOMPARE( m.total(), 0 );
+    QCOMPARE( m.lineEdit->text(), QStringLiteral( " ,.xf" ) );
+
+    m.spinBox->setFocus();
+    QTRY_COMPARE( QApplication::focusWidget(), static_cast<QWidget*>( m.spinBox ) );
+    for( const Qt::Key key : printable ) QTest::keyClick( m.spinBox, key );
+    QCOMPARE( m.total(), 0 );
+}
+
+void GuiSmokeTest::fullscreenLiveShortcuts_otherTopLevelWindowDoesNotFire()
+{
+    // Window scope kept (never Qt::ApplicationShortcut): with another top-level window active,
+    // no live key fires the player's actions.
+    FullscreenShortcutMirror m;
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    m.hideBars();
+    QVERIFY( m.showAndActivate( true ) );
+
+    QWidget other;
+    other.setWindowTitle( QStringLiteral( "other top-level" ) );
+    other.setFocusPolicy( Qt::StrongFocus );
+    other.resize( 200, 100 );
+    other.show();
+    other.activateWindow();
+    QVERIFY( QTest::qWaitForWindowActive( &other ) );
+    QTRY_COMPARE( QApplication::activeWindow(), &other );
+    press_live_keys_and_check( m, &other, 0 );
+    if( QTest::currentTestFailed() ) return;
+    QCOMPARE( m.total(), 0 );
+
+    // Positive control in the same process: back on the player window, Space fires again.
+    other.hide();
+    m.window.activateWindow();
+    QVERIFY( QTest::qWaitForWindowActive( &m.window ) );
+    m.viewer->setFocus();
+    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
+    QTest::keyClick( &m.window, Qt::Key_Space );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionPlay" ) ), 1 );
 }
 
 void GuiSmokeTest::mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes()

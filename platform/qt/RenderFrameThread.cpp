@@ -1499,6 +1499,8 @@ bool RenderFrameThread::acquireOldestGpuTextureNoReadbackReadyFrameForPlaybackTa
     uint64_t activeGeneration )
 {
     QMutexLocker locker(&m_mutex);
+    // fix 2 (adversary A1 on 4bbdcd9a): a retired generation's lookahead slot is skipped below, so it is freed here
+    releaseRetiredPlaybackLookaheadSlotsLocked( activeGeneration );
     int readySlotIndex = -1;
     uint64_t oldestRequestSerial = 0;
     for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
@@ -1546,6 +1548,8 @@ bool RenderFrameThread::acquireLatestReadyFrameForPlaybackTarget(
     uint64_t activeGeneration )
 {
     QMutexLocker locker(&m_mutex);
+    // fix 2 (adversary A1 on 4bbdcd9a): a retired generation's lookahead slot is skipped below, so it is freed here
+    releaseRetiredPlaybackLookaheadSlotsLocked( activeGeneration );
     int readySlotIndex = -1;
     uint64_t latestRequestSerial = 0;
     for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
@@ -1692,6 +1696,8 @@ int RenderFrameThread::prunePlaybackLookaheadOutsideForwardWindow(
     }
     m_renderFrame = !m_renderRequests.empty();
 
+    // fix 2 (adversary A1 on 4bbdcd9a): the loop below looks only at the active generation; a retired one is freed here
+    pruned += releaseRetiredPlaybackLookaheadSlotsLocked( activeGeneration );
     for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
     {
         FrameSlot &slot = m_frameSlots[i];
@@ -3979,6 +3985,35 @@ int RenderFrameThread::findFreeSlotLocked() const
         return i;
     }
     return -1;
+}
+
+int RenderFrameThread::releaseRetiredPlaybackLookaheadSlotsLocked( uint64_t activeGeneration )
+{
+    int released = 0;
+    for( int i = 0; i < static_cast<int>(m_frameSlots.size()); ++i )
+    {
+        const FrameSlot &slot = m_frameSlots[i];
+        const SlotState state = slot.state.load( std::memory_order_acquire );
+        const PlaybackSlotHold hold =
+            ( slot.presenting || state == SlotState::Presenting || i == m_presentingSlotIndex ) ? PlaybackSlotHold::Presenting
+          : ( slot.ready && i != m_renderingSlotIndex ) ? PlaybackSlotHold::Ready
+          : PlaybackSlotHold::Other;
+        if( !playbackRetiredLookaheadSlotReleases( hold,
+                                                   slot.presentationContext.playbackLookaheadRequest,
+                                                   slot.presentationContext.presentationGeneration,
+                                                   activeGeneration ) )
+        {
+            continue;
+        }
+        releaseSlotLocked( i );
+        ++released;
+    }
+    if( released > 0 )
+    {
+        m_frameReady = (findLatestReadySlotLocked() >= 0);
+        m_waitCondition.wakeAll();
+    }
+    return released;
 }
 
 void RenderFrameThread::releaseSlotLocked( int slotIndex )

@@ -898,6 +898,9 @@ private:
     uint8_t m_previewMode;
     uint8_t m_wbMode;
     bool m_frameChanged;
+    // PLAYER-FULLSCREEN-KEEPS-PLAYING-1 (adversary A2): a resize during Play redraws the current position once, past
+    // timerFrameEvent's duplicate-position suppression (a Play that holds one frame never advances to redraw it).
+    bool m_playbackRedrawAfterResize = false;
     int m_currentFrameIndex;
     double m_newPosDropMode;
     bool m_dontDraw;

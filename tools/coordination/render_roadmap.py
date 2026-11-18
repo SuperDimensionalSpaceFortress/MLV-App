@@ -83,7 +83,38 @@ DECLARED_RX = re.compile(r"declared@(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
 DECLARED_TOKEN_RX = re.compile(r"declared@(\S*)")
 TOKEN_TRAILING_PUNCT = ".,;:)]}'\""
 
+# What this file's freshness really rests on (ROADMAP-RENDER-CHECK-CI-1): no caller runs `--check`, so the header must not say the hub does.
+# It is exactly as many budget bytes as the header it replaced (970): a longer header moves every board's tier boundary, and a board
+# pushed from an owner-aware tier into the bare one is read by textual day instead of UTC day (adversary r2 A2). The stale "whose 16 rows
+# had mostly landed" history sentence is what paid for the longer freshness text.
+# What the drift detector (board-local roadmap-tracked-drift.ps1) really compares: card names, priorities and the WORDS of the scope notes above
+# the open table (whitespace-normalised). Not the parked notes, not state or kind, not the generated stamp or the Drain section (r3 sol D-06).
+# It also reads every table row's priority as an integer and throws on anything else, which files nothing (verdict=unknown): the capped owner
+# summary row ("-" priority, the "... and N more" row emitted near line 474), an empty state, a boolean or out-of-Int64 priority. The header says "or none if a row will not
+# parse" for that (r4 sol + opus blocker). Even a readable drift files only when no card was filed in the last 7 days, none exists for the
+# day, and its state file and the ledger read: so the header says "may file", never "files" (r5 sol adversary A1). The parse mismatch itself is the detector's, board-local and outside this PR (OPEN, see the PR comment).
 HEADER = """\
+# MLV-App product roadmap
+
+Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`.
+That file sits under `.claude-state/hub-autopilot/`,
+gitignored, absent from hosted checkouts, so this is the only place a reviewer
+without local state sees the open backlog. If they differ, `card-queue.json`
+wins: re-render, do not edit by hand. The hub renders a copy to
+`.claude-state/heartbeat/roadmap-live.md` every hour. When this file is
+7 or more days old and its open cards, priorities or pre-table note words differ from the queue,
+a drift detector may file a refresh card, or none if a row will not parse. `--check` is manual; no CI runs it.
+
+Only rows with `kind` of `product` or `playback` are shown, plus owner asks
+(`origin` = `owner`) of any kind. Hub-tooling, factory, hygiene and ci-flake cards are
+tooling churn, not counted. Unclassified rows are not counted, even if
+the card name says PLAYBACK, unless the owner asked.
+"""
+# The bare (last) render tier is master's file for every board without a resolved owner park (a resolved one is labelled with its
+# resolution, or left out, in _render_base; tied rows are ordered), so it carries master's header: the longer HEADER above would
+# push a board that fit the budget on master over it (r4 blocker). Master's one false sentence ("The hub checks freshness with `--check`.",
+# 40 bytes) is replaced by a true one of the SAME 40 bytes, so every board's byte count in this tier is still exactly master's.
+HEADER_BASE = """\
 # MLV-App product roadmap
 
 Rendered by `tools/coordination/render_roadmap.py` from the board's `card-queue.json`
@@ -92,17 +123,8 @@ mirror of the frozen dual-lane `queue.json`, whose 16 rows had mostly landed. Th
 card-queue file lives under `.claude-state/hub-autopilot/`, which is gitignored and absent
 from every hosted checkout, so this file is the only place a reviewer without local state
 can see the open product backlog. Where the two disagree, `card-queue.json` wins:
-re-render, do not edit by hand. The hub checks freshness with `--check`.
+re-render, do not edit by hand. `--check` is manual; no hub job runs it.
 
-Only rows with `kind` of `product` or `playback` are shown, plus owner asks
-(`origin` = `owner`) of any kind. Other hub-tooling, factory, hygiene and ci-flake cards are
-tooling churn and are not counted here. Rows the board has not classified are not counted
-either, even when the card name says PLAYBACK, unless the owner asked for them.
-"""
-# The bare (last) render tier is master's file for every board without a resolved owner park (a resolved one is labelled with its
-# resolution, or left out, in _render_base; tied rows are ordered), so it carries master's header: the longer HEADER above would
-# push a board that fit the budget on master over it (r4 blocker).
-HEADER_BASE = HEADER.split("\nOnly rows with", 1)[0] + """
 Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory,
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.

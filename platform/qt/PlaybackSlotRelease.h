@@ -26,4 +26,20 @@ inline bool playbackCancelReleasesSlot( PlaybackSlotHold hold,
         && hold == PlaybackSlotHold::Ready;
 }
 
+// PLAYER-FULLSCREEN-KEEPS-PLAYING-1 r1 fix 2 (adversary A1 on 4bbdcd9a): a display-change invalidation mid-Play cancels the
+// old generation's queued requests and Ready slots, but a slot still RENDERING then is published Ready later, carrying the
+// old generation. A lookahead slot is acquired only for the active generation and the forward-window prune looks only at
+// the active generation, so that slot was never freed: with one frame slot the next request waited for it forever. A
+// Ready lookahead slot of an OLDER generation can never be presented, so it is released; a Presenting one stays pinned
+// (its borrower releases it by serial), and a slot of the active (or a newer) generation is never touched.
+inline bool playbackRetiredLookaheadSlotReleases( PlaybackSlotHold hold,
+                                                  bool lookaheadRequest,
+                                                  uint64_t slotGeneration,
+                                                  uint64_t activeGeneration )
+{
+    return hold == PlaybackSlotHold::Ready
+        && lookaheadRequest
+        && slotGeneration < activeGeneration;
+}
+
 #endif

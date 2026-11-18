@@ -1561,7 +1561,7 @@
    "tools.repo_hygiene.test_venue_stage_nightly.NonFiniteBudgetEndpointTests": 2.3,
    "tools.repo_hygiene.test_venue_stage_nightly.SoundnessReadCapNeverZeroTests": 0.1,
    "tools.repo_hygiene.test_venue_stage_nightly.StageNotAfterTypedExitTests": 1.2,
-   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 435.2,
+   "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 482.6,
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 1.5,
    "tools.repo_hygiene.test_venue_start_cap.LeaseBatchWiringTests": 0.0,
    "tools.repo_hygiene.test_venue_start_cap.StartCapAdversaryPass2Tests": 5.5,
