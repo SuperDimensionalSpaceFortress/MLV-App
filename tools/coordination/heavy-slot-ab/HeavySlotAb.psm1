@@ -104,7 +104,8 @@ function Resolve-HeavySlotAbRealPath {
 # ---- (a) WRITE SAFETY --------------------------------------------------------------------------------------------------------------
 function Test-HeavySlotAbWriteAlias {
     # Why $Path may NOT be written, or $null. A name that exists and is a reparse point (symlink, junction), a directory, or a file with
-    # more than one hard link (PowerShell LinkType 'HardLink': NumberOfLinks > 1) may alias another file, which a write would change.
+    # more than one name (NumberOfLinks > 1) may alias another file, which a write would change. This function only DETECTS a second
+    # name; nothing in this tool ever creates one (OWNER-FOOTAGE-NO-HARDLINK-1).
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Path)
     $it = $null
@@ -116,7 +117,9 @@ function Test-HeavySlotAbWriteAlias {
     }
     if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) { return 'a reparse point (symlink or junction)' }
     if ($it.PSIsContainer) { return 'a directory' }
-    if ([string]$it.LinkType -eq 'HardLink') { return 'a hard link (the file has more than one name)' }
+    # Reparse points and directories returned above, so on what is left (a regular file) PowerShell sets LinkType only when the file has
+    # more than one name. Any non-empty LinkType is therefore a second name: refuse it without naming the link kind.
+    if (-not [string]::IsNullOrEmpty([string]$it.LinkType)) { return 'a file with more than one name (link count > 1)' }
     return $null
 }
 

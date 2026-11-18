@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -280,6 +281,42 @@ def _reader_counts(tmp: Path, switch: Path) -> int:
     return int(_read_counts(tmp, {"x": switch})["x"])
 
 
+def _is_live_b(doc) -> bool:
+    return bool(doc) and doc.get("state") == "B" and doc.get("count") == 2
+
+
+def _read_during_b(w: "World", tmp: Path, timeout=120):
+    """r8 (CI run 44317290799 shard 8/8): the reader's answer DURING a B block, by handshake, not by timing.
+
+    A cold pwsh reader on a loaded hosted runner (17 drivers at once) can start after the 12 s B block has already rolled to A, and then
+    reads 1 for a reason the test is not asking about. The driver rewrites the switch file only when a block changes or it reverts, so a
+    read counts only when the switch file is BYTE-IDENTICAL, and a live B / count 2, both before and after the reader ran. When the file
+    changed during the read, that read is no evidence either way, and the next B block is read again. When the bracket holds and the
+    reader still says 1, that is the defect, returned at once. Returns (count or None, attempts); attempts name every bracket tried."""
+    end = time.monotonic() + timeout
+    attempts = []
+    while time.monotonic() < end:
+        def b_bytes():
+            try:
+                raw = w.switch.read_bytes()
+                return raw if _is_live_b(json.loads(raw.decode("utf-8"))) else None
+            except (OSError, ValueError):
+                return None
+        before = _wait(b_bytes, max(0.1, end - time.monotonic()))
+        if not before:
+            break
+        got = _reader_counts(tmp, w.switch)
+        try:
+            after = w.switch.read_bytes()
+        except OSError:
+            after = None
+        held = after == before
+        attempts.append({"read": got, "bracket_held": held})
+        if held:
+            return got, attempts
+    return None, attempts
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # 2. hard aborts: each reverts the switch to count 1 within a few polls and the receipt names the reason
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -331,7 +368,7 @@ def _run_abort(root: Path, name: str, me: dict) -> dict:
         result["proc"] = proc
         sees_b = _wait(lambda: (w.switch_doc() or {}).get("state") == "B" and (w.switch_doc() or {}).get("count") == 2, 60)
         result["saw_b"] = bool(sees_b)
-        result["reader_before"] = _reader_counts(root / name, w.switch) if sees_b else None
+        result["reader_before"], result["reader_attempts"] = _read_during_b(w, root / name) if sees_b else (None, [])
         flipped = datetime.now(UTC)
         flip(w)
         result["flipped"] = flipped
@@ -358,12 +395,47 @@ def abort_results(tmp_path_factory, me):
         return {name: fut.result() for name, fut in futures.items()}
 
 
+class _SwitchOnly:
+    def __init__(self, switch: Path):
+        self.switch = switch
+
+
+def test_r8_a_read_whose_b_block_rolled_during_the_read_is_discarded_and_read_again(tmp_path, me, monkeypatch):
+    # CI run 44317290799 shard 8/8: the B block rolled to A while a slow reader started, the reader said 1, the test failed. The handshake
+    # must discard that read (the switch bytes changed) and read again in the next B block, with no sleep standing in for the ordering.
+    switch = tmp_path / "switch.json"
+    b1 = json.dumps(switch_doc(me))
+    switch.write_text(b1, encoding="ascii")
+    calls = []
+
+    def fake_reader(_tmp, path):
+        calls.append(1)
+        if len(calls) == 1:
+            path.write_text(json.dumps(switch_doc(me, state="A", count=1)), encoding="ascii")   # the block rolled under the reader
+            threading.Timer(0.3, lambda: path.write_text(json.dumps(switch_doc(me, windowStartUtc=iso(datetime.now(UTC)))), encoding="ascii")).start()
+            return 1
+        return 2
+
+    monkeypatch.setattr(sys.modules[__name__], "_reader_counts", fake_reader)
+    got, attempts = _read_during_b(_SwitchOnly(switch), tmp_path, timeout=10)
+    assert got == 2 and attempts == [{"read": 1, "bracket_held": False}, {"read": 2, "bracket_held": True}], attempts
+
+
+def test_r8_a_read_inside_a_held_b_bracket_that_says_1_is_returned_not_retried(tmp_path, me, monkeypatch):
+    # The other half: the handshake must not hide a real reader defect by retrying until it happens to see 2.
+    switch = tmp_path / "switch.json"
+    switch.write_text(json.dumps(switch_doc(me)), encoding="ascii")
+    monkeypatch.setattr(sys.modules[__name__], "_reader_counts", lambda _tmp, _path: 1)
+    got, attempts = _read_during_b(_SwitchOnly(switch), tmp_path, timeout=10)
+    assert got == 1 and attempts == [{"read": 1, "bracket_held": True}], attempts
+
+
 @pytest.mark.parametrize("name", sorted(ABORTS))
 def test_each_hard_abort_reverts_the_switch_and_names_its_reason(abort_results, name):
     r = abort_results[name]
     _extra, _setup, _flip, _delay, reason, max_samples = ABORTS[name]
     assert r["saw_b"], f"the driver never reached a B block: {r['text']}"
-    assert r["reader_before"] == 2, "the reader must read 2 during the B block, before the abort condition"
+    assert r["reader_before"] == 2, ("the reader must read 2 during the B block, before the abort condition", r["reader_attempts"], r["text"])
     assert r["exit"] == 3, r["text"]
     assert r["receipt"] is not None and r["receipt"]["state"] == "ABORTED", r["text"]
     assert r["receipt"]["reason"].startswith(reason), r["receipt"]
@@ -419,7 +491,8 @@ def test_killing_the_driver_makes_the_reader_return_1_at_once(tmp_path, me):
     try:
         proc = w.start(0.2, 0.2)
         assert _wait(lambda: (w.switch_doc() or {}).get("state") == "B", 60), w.text()
-        assert _reader_counts(tmp_path, w.switch) == 2
+        got, attempts = _read_during_b(w, tmp_path)   # r8: by handshake on the switch bytes, not by how fast pwsh starts
+        assert got == 2, (attempts, w.text())
         proc.kill()
         proc.wait(timeout=30)
         doc = w.switch_doc()
