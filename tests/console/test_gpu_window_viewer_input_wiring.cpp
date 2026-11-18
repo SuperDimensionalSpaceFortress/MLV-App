@@ -98,16 +98,54 @@ TEST(GpuWindowViewerInputWiring, W5_PickMappingReadsTheRectPaintGlDrew)
     ASSERT_TRUE(body.contains(QStringLiteral(
         "return gpu_window_input::drawnPictureRect( p.valid, p.framebufferWidth, p.framebufferHeight, p.devicePixelRatio, p.scaleX, p.scaleY );")));
     ASSERT_TRUE(body.contains(QStringLiteral("if( !paintedWindow ) return QRectF();")));
-    // r1's reconstructions are gone from the hooks.
+    // r1's reconstructions are gone from the hooks, and the drawn-picture hook reads nothing live.
     ASSERT_FALSE(body.contains(QStringLiteral("textureDisplaySize")));
     ASSERT_FALSE(body.contains(QStringLiteral("textureRouteLast")));
     ASSERT_FALSE(body.contains(QStringLiteral("gpuPlaybackReconTexturePresentRequested")));
-    ASSERT_FALSE(body.contains(QStringLiteral("StretchFactor")));
     ASSERT_FALSE(body.contains(QStringLiteral("mainWindowGpuTexturePresentDisplaySize")));
+    const int drawnAt = body.indexOf(QStringLiteral("hooks.drawnPicture = "));
+    ASSERT_TRUE(drawnAt >= 0);
+    const int drawnEnd = body.indexOf(QStringLiteral("    };\n"), drawnAt);
+    ASSERT_TRUE(drawnEnd > drawnAt);
+    const QString drawnHook = body.mid(drawnAt, drawnEnd - drawnAt);
+    ASSERT_FALSE(drawnHook.contains(QStringLiteral("StretchFactor")));
+    ASSERT_FALSE(drawnHook.contains(QStringLiteral("m_pScene")));
+    ASSERT_FALSE(drawnHook.contains(QStringLiteral("m_pMlvObject")));
     // The getter is a const read on the window (no static that could read another window).
     const QString header = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.h"));
     ASSERT_TRUE(header.contains(QStringLiteral("    PaintedPicture lastPaintedPicture(void) const;")));
     ASSERT_TRUE(header.contains(QStringLiteral("    PaintedPicture m_lastPaintedPicture;")));
+}
+
+TEST(GpuWindowViewerInputWiring, W6_PickSceneIsTheBasisTheSlotsConvertFrom)
+{
+    // Adversary r2 pass 1 A1: at 100% the slots divide the scene point by the CURRENT stretch, so
+    // the forwarder maps into the raw clip at that stretch; in fit mode they scale by raw / scene,
+    // so it maps into the scene rect. Both slots keep exactly that conversion.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source, kDefinition, kNextDefinition);
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "return gpu_window_input::pickerSceneSize( ui->actionZoomFit->isChecked(), m_pScene->sceneRect().size(), "
+        "static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ), "
+        "getHorizontalStretchFactor( false ), getVerticalStretchFactor( false ) );")));
+    const QString slotConversion = QStringLiteral(
+        "    if( ui->actionZoomFit->isChecked() )\n"
+        "    {\n"
+        "        x *= getMlvWidth( m_pMlvObject ) / m_pScene->width();\n"
+        "        y *= getMlvHeight( m_pMlvObject ) / m_pScene->height();\n"
+        "    }\n"
+        "    else\n"
+        "    {\n"
+        "        x /= getHorizontalStretchFactor(false);\n"
+        "        y /= getVerticalStretchFactor(false);\n"
+        "    }\n");
+    const QString wb = functionBody(source, QStringLiteral("void MainWindow::whiteBalancePicked( int x, int y )"),
+                                    QStringLiteral("findMlvWhiteBalance("));
+    const QString bp = functionBody(source, QStringLiteral("void MainWindow::badPixelPicked( int x, int y )"),
+                                    QStringLiteral("BadPixelFileHandler::isPixelIncluded("));
+    ASSERT_TRUE(wb.contains(slotConversion));
+    ASSERT_TRUE(bp.contains(slotConversion));
 }
 
 TEST(GpuWindowViewerInputWiring, W4_GlDropOpensLikeTheSceneNotLikeTheTopLevelWindow)

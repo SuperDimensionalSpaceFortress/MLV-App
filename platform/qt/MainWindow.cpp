@@ -26038,7 +26038,11 @@ void MainWindow::selectAllFiles( void )
 void MainWindow::installGlWindowViewerInput( QWindow *glWindow )
 {
     gpu_window_input::Forwarder::Hooks hooks;
-    hooks.sceneSize = [this]() { return m_pScene ? m_pScene->sceneRect().size() : QSizeF(); };
+    // The basis the picker slots convert from (fit: the scene rect; 100%: the clip at the current stretch).
+    hooks.sceneSize = [this]() {
+        if( !m_pScene || !m_pMlvObject ) return QSizeF();
+        return gpu_window_input::pickerSceneSize( ui->actionZoomFit->isChecked(), m_pScene->sceneRect().size(), static_cast<int>( getMlvWidth( m_pMlvObject ) ), static_cast<int>( getMlvHeight( m_pMlvObject ) ), getHorizontalStretchFactor( false ), getVerticalStretchFactor( false ) );
+    };
     // The picture rect the GL window's last paintGL actually drew, whichever route presented and
     // whatever the stretch controls say now (empty before any frame: no pick). The forwarder is a
     // child of glWindow, so this pointer outlives every call.

@@ -695,6 +695,7 @@ private slots:
     void glWindowViewerInput_edgePicksStayInsideTheImage();
     void glWindowViewerInput_roundedSceneEdgeStillPicks();
     void glWindowViewerInput_noDrawnPictureIsNoPick();
+    void glWindowViewerInput_getterRefusesWhileAFrameIsHandedOver();
     void glWindowViewerInput_getterRecordsThePaintedPicture();
 };
 
@@ -4061,6 +4062,48 @@ void GuiSmokeTest::glWindowViewerInput_noDrawnPictureIsNoPick()
                                                p.devicePixelRatio, p.scaleX, p.scaleY).isEmpty());
 }
 
+void GuiSmokeTest::glWindowViewerInput_getterRefusesWhileAFrameIsHandedOver()
+{
+    // Adversary r2 pass 1 A2: a painted clear, then a hand-over that restores a texture without
+    // painting, must not bring the pre-clear picture back. The getter reports a picture only while
+    // the last paintGL drew one and nothing has been handed over since. Offscreen: the paint is
+    // stood in for by the state paintGL leaves (friend access); the hand-overs are the real calls.
+    GpuDisplayWindow win;
+    QOpenGLTexture texture(QOpenGLTexture::Target2D); // never created: no GL call
+    const GpuDisplayWindow::PaintedPicture painted{ true, 2000, 2000, 2.0, 1.0f, 0.418f };
+    const auto standInForADrawingPaint = [&]() {
+        win.m_lastPaintedPicture = painted;
+        win.m_texture = &texture;
+        win.m_texturePresentationActive = true;
+    };
+    standInForADrawingPaint();
+    QVERIFY(win.lastPaintedPicture().valid);
+    QCOMPARE(win.lastPaintedPicture().scaleY, 0.418f);
+
+    // A frame handed over and not painted yet: none (the picture on screen is about to change).
+    QImage frame(16, 8, QImage::Format_RGB888);
+    frame.fill(Qt::gray);
+    win.setPresentedImage(frame, QSize(1920, 804));
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // A clear: none.
+    standInForADrawingPaint();
+    win.clearPresented();
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // A paint that drew nothing (paintGL's no-texture branch) leaves the flag false; a texture that
+    // comes back without a paint (recon adoption at submit) does not revive the old picture.
+    standInForADrawingPaint();
+    win.m_texturePresentationActive = false;
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // No texture at all: none.
+    standInForADrawingPaint();
+    win.m_texture = nullptr;
+    QVERIFY(!win.lastPaintedPicture().valid);
+    win.m_texture = nullptr;
+}
+
 void GuiSmokeTest::glWindowViewerInput_getterRecordsThePaintedPicture()
 {
     MLV_SKIP_OR_FAIL_IF_OFFSCREEN("the GL window's paintGL needs a platform plugin that can create an OpenGL context");
@@ -4105,14 +4148,22 @@ void GuiSmokeTest::glWindowViewerInput_getterRecordsThePaintedPicture()
                         .arg(drawn.x()).arg(drawn.y()).arg(drawn.width()).arg(drawn.height())
                         .arg(expected.x()).arg(expected.y()).arg(expected.width()).arg(expected.height())));
 
-    // A new frame handed over but not painted yet: the getter still describes the picture on screen.
+    // A new frame handed over but not painted yet: none until it is painted (adversary r2 pass 1 A2),
+    // then the new picture.
     QImage square(16, 16, QImage::Format_RGB888);
     square.fill(qRgb(200, 10, 30));
     QVERIFY(GpuDisplayWindow::presentImageIfActive(square));
-    const GpuDisplayWindow::PaintedPicture before = glWindow->lastPaintedPicture();
-    QVERIFY(before.valid);
-    QCOMPARE(before.scaleX, p.scaleX);
-    QCOMPARE(before.scaleY, p.scaleY);
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+    QImage grabbedSquare;
+    QString squareReason;
+    QVERIFY(GpuDisplayWindow::grabPresentedFramebufferIfActive(&grabbedSquare, &squareReason));
+    const GpuDisplayWindow::PaintedPicture after = glWindow->lastPaintedPicture();
+    QVERIFY(after.valid);
+    const QRectF squareDrawn = gpu_window_input::drawnPictureRect(after.valid, after.framebufferWidth, after.framebufferHeight,
+                                                                  after.devicePixelRatio, after.scaleX, after.scaleY);
+    const QRectF squareExpected = gpu_window_input::letterboxRect(QSizeF(glWindow->size()), QSizeF(16, 16));
+    QVERIFY(qAbs(squareDrawn.width() - squareExpected.width()) <= slack);
+    QVERIFY(qAbs(squareDrawn.height() - squareExpected.height()) <= slack);
 
     // Cleared and painted (the paint releases the texture and draws black): none.
     QVERIFY(GpuDisplayWindow::clearIfActive());

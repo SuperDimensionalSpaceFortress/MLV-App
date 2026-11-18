@@ -228,8 +228,11 @@ QString GpuDisplayWindow::lookLabelDrawnTextIfActive()
 
 GpuDisplayWindow::PaintedPicture GpuDisplayWindow::lastPaintedPicture() const
 {
-    // No texture (cleared or torn down): the next paint draws black, so report none rather than the old picture.
-    if ( !m_texture ) return PaintedPicture();
+    // A picture only while the last paintGL drew one and nothing has been handed over since: every
+    // hand-over, clear and no-frame paint drops m_texturePresentationActive, and only a paint that
+    // drew sets it again, so a pre-clear picture never comes back (adversary r2 pass 1 A2). No
+    // texture (cleared or torn down): the next paint draws black, so none either.
+    if ( !m_texture || !m_texturePresentationActive ) return PaintedPicture();
     return m_lastPaintedPicture;
 }
 

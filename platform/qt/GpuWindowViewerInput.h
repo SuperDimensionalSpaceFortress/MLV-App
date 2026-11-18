@@ -81,6 +81,22 @@ inline QRectF drawnPictureRect( bool valid, int framebufferWidth, int framebuffe
     return QRectF( ( 1.0 - scaleX ) * 0.5 * w, ( 1.0 - scaleY ) * 0.5 * h, scaleX * w, scaleY * h );
 }
 
+// The scene size a pick is mapped into: the basis MainWindow::whiteBalancePicked / badPixelPicked
+// convert from. In fit mode they scale by raw / scene, so it is the scene rect's own size; at 100%
+// they divide by the CURRENT stretch, so it is the raw clip at that stretch. Mapped proportionally
+// through the drawn picture into this size, a pick lands on the raw pixel the picture shows, even
+// when the stretch changed after the picture was drawn (adversary r2 pass 1 A1: the painted scene
+// divided by the new stretch named raw row 630 of a 420-row clip). Empty (no pick) when the clip
+// size or stretch is not a positive finite number.
+inline QSizeF pickerSceneSize( bool zoomFit, const QSizeF &sceneRect, int rawWidth, int rawHeight,
+                               double stretchX, double stretchY )
+{
+    if( zoomFit ) return sceneRect;
+    if( rawWidth <= 0 || rawHeight <= 0 ) return QSizeF();
+    if( !std::isfinite( stretchX ) || !std::isfinite( stretchY ) || stretchX <= 0.0 || stretchY <= 0.0 ) return QSizeF();
+    return QSizeF( rawWidth * stretchX, rawHeight * stretchY );
+}
+
 // Window position -> the scene pixel a picker click selects, as the slots take it.
 //
 // drawn is the picture rect the last paintGL actually drew (drawnPictureRect). paintGL letterboxes

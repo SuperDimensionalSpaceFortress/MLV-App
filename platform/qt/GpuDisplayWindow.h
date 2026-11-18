@@ -185,9 +185,10 @@ public:
     /* PLAYER-GL-WINDOW-INPUT-PARITY-1 r2: what the last paintGL() that drew a frame letterboxed it with -- its
      * framebuffer size, the device pixel ratio, and the quad's half-extents sx/sy from the fit block -- so viewer
      * picks map through the picture actually on screen (gpu_window_input::drawnPictureRect), not a guess from the
-     * requested route or the live stretch. valid is false before any frame was drawn and while the window holds no
-     * texture. Read-only: paintGL records it with one plain member store; nothing painted or presented changes.
-     * GUI-thread only. */
+     * requested route or the live stretch. valid is false before any frame was drawn, while the window holds no
+     * texture, and from any hand-over, clear or no-frame paint until a paintGL draws again (a pick then is refused,
+     * never mapped through a picture that is no longer, or not yet, on screen). Read-only: paintGL records it with
+     * one plain member store; nothing painted or presented changes. GUI-thread only. */
     struct PaintedPicture
     {
         bool valid = false;

@@ -337,6 +337,82 @@ TEST(GpuWindowViewerInput, C9d_NoPaintYetIsNoPick)
     ASSERT_EQ(-1, y);
 }
 
+namespace
+{
+// MainWindow::whiteBalancePicked / badPixelPicked's own scene -> raw conversion, verbatim in arithmetic
+// (wiring W6 pins the slot text): fit mode scales by raw / scene, 100% divides by the CURRENT stretch.
+QPoint slotRaw(int x, int y, bool zoomFit, int rawW, int rawH, double sceneW, double sceneH, double stretchX, double stretchY)
+{
+    if (zoomFit)
+    {
+        x *= rawW / sceneW;
+        y *= rawH / sceneH;
+    }
+    else
+    {
+        x /= stretchX;
+        y /= stretchY;
+    }
+    return QPoint(x, y);
+}
+} // namespace
+
+TEST(GpuWindowViewerInput, C11_StretchChangeAt100PercentPicksTheDisplayedRawPixel)
+{
+    // Adversary r2 pass 1 A1: raw 1920x420, Zoom Fit off, painted at stretchY 3 (display and scene
+    // 1920x1260) in a 1000x1000 window at DPR 2; stretchY is then set to 1 before another frame lands.
+    // The centre click shows raw row 210; the slot divides by the current stretch (1).
+    // (Red on 1d1960eb, whose hook handed pickPixel the painted scene rect 1920x1260: raw row 630.)
+    using gpu_window_input::pickerSceneSize;
+    const QRectF drawn = paintedRect(1000, 1000, 2.0, 1920, 1260);
+    const QSizeF paintedScene(1920, 1260); // the scene rect is still the painted frame's
+    const QSizeF hookScene = pickerSceneSize(false, paintedScene, 1920, 420, 1.0, 1.0);
+    ASSERT_NEAR(1920.0, hookScene.width(), 1e-9);
+    ASSERT_NEAR(420.0, hookScene.height(), 1e-9);
+    int x = -1;
+    int y = -1;
+    // Just off the centre, so no float ulp sits on a pixel boundary.
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, hookScene, &x, &y));
+    const QPoint raw = slotRaw(x, y, false, 1920, 420, paintedScene.width(), paintedScene.height(), 1.0, 1.0);
+    ASSERT_EQ(960, raw.x());
+    ASSERT_EQ(210, raw.y());
+    // Unchanged stretch (3) gives the same raw pixel.
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, pickerSceneSize(false, paintedScene, 1920, 420, 1.0, 3.0), &x, &y));
+    const QPoint same = slotRaw(x, y, false, 1920, 420, paintedScene.width(), paintedScene.height(), 1.0, 3.0);
+    ASSERT_EQ(960, same.x());
+    ASSERT_EQ(210, same.y());
+    // Fit mode: the slots scale by raw / scene rect, so the scene rect is the basis, whatever the stretch.
+    const QSizeF fitScene(1000, 654);
+    const QSizeF fitHook = pickerSceneSize(true, fitScene, 1920, 420, 1.0, 1.0);
+    ASSERT_NEAR(1000.0, fitHook.width(), 1e-9);
+    ASSERT_NEAR(654.0, fitHook.height(), 1e-9);
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, fitHook, &x, &y));
+    const QPoint fitRaw = slotRaw(x, y, true, 1920, 420, fitScene.width(), fitScene.height(), 1.0, 1.0);
+    ASSERT_TRUE(fitRaw.x() >= 959 && fitRaw.x() <= 961);   // the slot's own int truncation: within one pixel
+    ASSERT_TRUE(fitRaw.y() >= 209 && fitRaw.y() <= 211);
+    // Not a usable clip size or stretch: no basis, so no pick.
+    ASSERT_TRUE(pickerSceneSize(false, paintedScene, 0, 420, 1.0, 1.0).isEmpty());
+    ASSERT_TRUE(pickerSceneSize(false, paintedScene, 1920, 420, 0.0, 1.0).isEmpty());
+    ASSERT_TRUE(pickerSceneSize(false, paintedScene, 1920, 420, 1.0, std::nan("")).isEmpty());
+    ASSERT_FALSE(gpu_window_input::pickPixel(QPointF(500.3, 500.3), drawn, pickerSceneSize(false, paintedScene, 0, 0, 1.0, 1.0), &x, &y));
+}
+
+TEST(GpuWindowViewerInput, C11b_StretchXChangeAt100PercentPicksTheDisplayedRawColumn)
+{
+    // Horizontal sibling: raw 1080x1922 painted at stretchX 2 (scene 2160x1922) in 1200x1000; stretchX
+    // set to 1 before the next frame; the centre click shows raw column 540.
+    // (Red on 1d1960eb: column 1080, past the image, and the slots' "x > width" guard let it through.)
+    const QRectF drawn = paintedRect(1200, 1000, 1.0, 2160, 1922);
+    const QSizeF paintedScene(2160, 1922);
+    const QSizeF hookScene = gpu_window_input::pickerSceneSize(false, paintedScene, 1080, 1922, 1.0, 1.0);
+    int x = -1;
+    int y = -1;
+    ASSERT_TRUE(gpu_window_input::pickPixel(QPointF(600.3, 500.3), drawn, hookScene, &x, &y));
+    const QPoint raw = slotRaw(x, y, false, 1080, 1922, paintedScene.width(), paintedScene.height(), 1.0, 1.0);
+    ASSERT_EQ(540, raw.x());
+    ASSERT_EQ(961, raw.y());
+}
+
 TEST(GpuWindowViewerInput, C10_DrawnPictureRectIsTheQuadPaintGlDrew)
 {
     using gpu_window_input::drawnPictureRect;
@@ -443,6 +519,16 @@ TEST(GpuWindowViewerInput, C6_PaintGlFitBlockIsUnchanged)
     ASSERT_FALSE(between.contains(QStringLiteral("fbw =")));
     ASSERT_FALSE(between.contains(QStringLiteral("fbh =")));
     ASSERT_FALSE(between.contains(QStringLiteral("dpr =")));
-    // The getter reports none while the window holds no texture.
-    ASSERT_TRUE(source.contains(QStringLiteral("if ( !m_texture ) return PaintedPicture();\n    return m_lastPaintedPicture;")));
+    // The getter reports none while the window holds no texture, and from any hand-over, clear or
+    // no-frame paint until a paint draws again (adversary r2 pass 1 A2): the flag paintGL sets only
+    // after it drew, and drops in its no-frame branch.
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "    if ( !m_texture || !m_texturePresentationActive ) return PaintedPicture();\n    return m_lastPaintedPicture;")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "    activeProgram->release();\n    m_texturePresentationActive = true;\n")));
+    const int noFrameAt = source.indexOf(QStringLiteral(
+        "    if ( !m_texture || !activeProgram || width() <= 0 || height() <= 0 || reconRefused )\n    {\n        m_texturePresentationActive = false;\n"), paintAt);
+    ASSERT_TRUE(noFrameAt > paintAt && noFrameAt < fitAt);
+    // Exactly one place sets it true: the end of a drawing paint.
+    ASSERT_EQ(1, source.count(QStringLiteral("m_texturePresentationActive = true;")));
 }
