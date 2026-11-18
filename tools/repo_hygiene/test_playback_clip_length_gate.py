@@ -2117,6 +2117,7 @@ from tools.repo_hygiene.app_play_scan import (  # noqa: E402
     PINNED_EVENT_SITES,
     PINNED_HELPER_BODIES,
     PINNED_KEY_SPACE_BINDINGS,
+    SPACE_BINDING_STATEMENT_IDENTIFIERS,
     PLAY_SOURCES,
     REVIEWED_PROGRAMMATIC_PLAY_SITES,
     REVIEWED_PROGRAMMATIC_STOP_SITES,
@@ -2126,9 +2127,12 @@ from tools.repo_hygiene.app_play_scan import (  # noqa: E402
 )
 
 _BUILD_DIR_NAMES = {"moc", "obj", "rcc", "ui", "release", "debug"}
+# r2 adversary pass 2: also every includer of the key table, every notify( dispatch, and every #define of a token of
+# the reviewed Space binding statement (a macro in an including file rewrites the binding).
 _PLAY_RELEVANT = re.compile(
     r"actionPlay|actionLoop|setPlaying|invokeMethod|QKeyEvent|Key_Space|postEvent|sendEvent|"
-    r"sendSpontaneousEvent|programmaticPlay|programmaticStop|QTest\s*::\s*key|keyClick")
+    r"sendSpontaneousEvent|programmaticPlay|programmaticStop|QTest\s*::\s*key|keyClick|PlayerShortcutBinding|"
+    r"\bnotify\s*\(|#\s*define\s+(?:" + "|".join(sorted(SPACE_BINDING_STATEMENT_IDENTIFIERS)) + r")\b")
 
 
 def _load_play_sources() -> dict[str, str]:
@@ -2456,6 +2460,55 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                 with self.subTest(injected=injected, path=path):
                     problems = self._key_synth_problems({path: "inline void z( int k ) {\n    " + injected + "\n}\n"})
                     self.assertIn(f"{path}:2: synthesized key event (the Play shortcut is Space)", problems)
+
+    # r2 adversary pass 2 (629995bd). A1: a macro rewrote the unchanged statement into Shift+Space. A2: an array
+    # declarator, a type alias and explicit template arguments built a QKeyEvent unseen; qApp->notify dispatched it.
+
+    def test_r2_p2_a1_a_macro_over_a_token_of_the_reviewed_statement_fails(self) -> None:
+        statement_line = "    table << ActionBinding{ QStringLiteral( \"actionPlay\" ),"
+        mutated = self._mutated(statement_line, "#define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))\n"
+                                + statement_line, path=self._SPACE_TABLE)
+        mutated[self._SPACE_TABLE] = mutated[self._SPACE_TABLE].replace(
+            "KeyKind::Primary } } };", "KeyKind::Primary } } };\n#undef QKeySequence", 1)
+        problems = scan_app_play_sources(mutated)
+        self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:") and "#define of QKeySequence" in p for p in problems),
+                        problems)
+        for name in ("Key_Space", "KeyKind", "Primary", "ActionBinding", "QStringLiteral", "table", "Qt"):
+            for path in (self._SPACE_TABLE, "platform/qt/MainWindow.cpp"):
+                with self.subTest(name=name, path=path):
+                    problems = scan_app_play_sources({path: f"#define {name} x\n"})
+                    self.assertIn(f"{path}:1: #define of {name}, a token of the reviewed Space binding statement", problems)
+
+    def test_r2_p2_a1_every_includer_of_the_key_table_and_every_such_macro_is_loaded(self) -> None:
+        self.assertRegex('#include "PlayerShortcutBinding.h"\n', _PLAY_RELEVANT)
+        self.assertRegex("#define QKeySequence(k) k\n", _PLAY_RELEVANT)
+        self.assertRegex("#  define Key_Space 0\n", _PLAY_RELEVANT)
+        self.assertRegex("qApp->notify( this, &press );\n", _PLAY_RELEVANT)
+
+    def test_r2_p2_a2_every_other_spelling_of_a_qkeyevent_is_a_synthesized_key(self) -> None:
+        for injected in ("QKeyEvent press[1]{{ QEvent::KeyPress, 32, Qt::NoModifier }};",
+                         "using Event = QKeyEvent;\n    Event press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "using EventPtr = QKeyEvent*;",
+                         "typedef QKeyEvent Event;",
+                         "typedef QKeyEvent *EventPtr;",
+                         "auto e = std::make_unique<QKeyEvent, QEvent::Type, int, Qt::KeyboardModifiers>( "
+                         "QEvent::KeyPress, 32, Qt::NoModifier );",
+                         "auto e = std::unique_ptr<QKeyEvent>();"):   # fail-closed: a key-event owner is reviewed here
+            with self.subTest(injected):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    def test_r2_p2_a2_notify_with_an_event_is_a_dispatch_that_must_be_pinned(self) -> None:
+        self._assert_caught(self._inject_after_measured_loop_off("qApp->notify( this, nullptr );"),
+                            "event dispatch notify in platform/qt/MainWindow.cpp x1")
+        # A local callable named notify, called with no arguments, dispatches nothing.
+        self.assertEqual(self._event_dispatch_problems({"platform/qt/X.cpp": "auto f = [notify](bool) { notify(); };\n"}),
+                         [])
+
+    def test_r2_p2_a2_reading_a_delivered_key_event_is_not_a_synthesized_key(self) -> None:
+        for text in ("#include <QKeyEvent>\n", "void keyPressEvent( QKeyEvent *event ) override;\n",
+                     "void f( const QKeyEvent &event );\n", "void g( QKeyEvent* event );\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
 
     def test_r2_a1_a_cast_of_a_delivered_key_event_is_not_a_synthesized_key(self) -> None:
         # FocusGuard reads the ShortcutOverride the user's key produced; reading an event is not making one.

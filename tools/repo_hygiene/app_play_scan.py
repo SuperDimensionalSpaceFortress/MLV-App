@@ -248,10 +248,14 @@ _LOOP_SAFE_BEFORE = re.compile(r"addAction\s*\(\s*ui\s*->\s*$")
 _HANDLER_START = re.compile(r"\bon_actionPlay_(?:triggered|toggled)\s*\(\s*(?!false\b|bool\b)\S")
 _SET_PLAYING = re.compile(r"\bsetPlaying\s*\(")
 _INVOKE_METHOD = re.compile(r"\binvokeMethod\s*\([^;]*?\w*[Aa]ctionPlay\w*")
-# A QKeyEvent CONSTRUCTION in any spelling -- parentheses, braces (r2 adversary A1: ``QKeyEvent press{ ... }`` was
-# missed), or a make_unique / make_shared template argument -- not a pointer or a cast of a delivered event.
-_KEY_SYNTH = re.compile(r"\bQKeyEvent\s*(?:\w+\s*)?[({]|\bQKeyEvent\s*>\s*[({]|\bKey_Space\b|\bQTest\s*::\s*key\w*"
-                        r"|\bkeyClick\s*\(")
+# The QKeyEvent TYPE, used as anything but a pointer or a reference to an event Qt already delivered (a handler
+# parameter, a cast of the filter's event) -- so every construction spelling is caught without listing spellings:
+# parentheses, braces, an array declarator, a template argument (r2 adversary A1 and pass 2 A2). An owning smart
+# pointer of a key event is caught too, on purpose (fail-closed: review it here). A type ALIAS of it, pointer or
+# not, is caught as well, since an alias can construct one without naming the type.
+_KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!\s*[*&])|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
+                        r"|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
+_KEY_EVENT_INCLUDE = re.compile(r"#\s*include\s*<\s*QKeyEvent\s*>")
 # PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
 # (PlayerShortcutBinding::bindings(), handed to QAction::setShortcuts(); before, MainWindow.ui carried it). A binding is
 # not an event. Only the ``Key_Space`` inside the exact (comment-stripped, whitespace-normalised) table STATEMENT
@@ -271,7 +275,14 @@ def _statement_pattern(statement: str) -> re.Pattern[str]:
     """A whole-token regex for a pinned, whitespace-normalised statement: whitespace may vary, nothing else."""
     tokens = re.findall(r'"(?:[^"\\]|\\.)*"|\w+|[^\w\s]', statement)   # a string literal is one token
     return re.compile(r"(?<!\w)" + r"\s*".join(re.escape(token) for token in tokens))
-_EVENT_POST = re.compile(r"\b(?:postEvent|sendEvent|sendSpontaneousEvent)\s*\(")
+# r2 adversary pass 2 A1: a macro over a token of the pinned statement (``#define QKeySequence(key) ...``) changes the
+# binding while the text still matches. Any #define of one of those identifiers, in any scanned source, fails.
+SPACE_BINDING_STATEMENT_IDENTIFIERS = frozenset(
+    token for statement, _ in PINNED_KEY_SPACE_BINDINGS.values() for token in re.findall(r"[A-Za-z_]\w*", statement))
+_DEFINE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)", re.MULTILINE)
+# notify( with an argument dispatches an event like sendEvent (r2 adversary pass 2 A2); a no-argument call of a local
+# callable named notify does not.
+_EVENT_POST = re.compile(r"\b(?:postEvent|sendEvent|sendSpontaneousEvent)\s*\(|\bnotify\s*\((?!\s*\))")
 # The event dispatches that exist today: MyApplication's event filter forwarding to the main window, and the two
 # Look Assist analysis holds, which re-post at landing a clone of an event the user or the OS already delivered
 # (LookAssistAnalysisPump.h: held input; MainWindow.cpp: a held FileOpen). Neither makes up an event.
@@ -558,9 +569,16 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             problems.append(f"{path}: the reviewed Space binding statement x{len(statement_spans)}, pinned "
                             f"x{reviewed_bindings} (a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)")
         bindings_reviewed = space_bindings == reviewed_bindings == len(statement_spans)
+        for match in _DEFINE.finditer(blank):
+            if match.group(1) in SPACE_BINDING_STATEMENT_IDENTIFIERS:
+                problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token of the "
+                                "reviewed Space binding statement")
+        include_spans = [(m.start(), m.end()) for m in _KEY_EVENT_INCLUDE.finditer(blank)]
         for match in _KEY_SYNTH.finditer(blank):
             if bindings_reviewed and match.group(0) == "Key_Space" and any(
                     start <= match.start() < end for start, end in statement_spans):
+                continue
+            if any(start <= match.start() < end for start, end in include_spans):
                 continue
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
         for match in _EVENT_POST.finditer(blank):
