@@ -284,14 +284,17 @@ TEST(GuiSmokeDisplaySelectWiring, PostPlacementForegroundRequestKeepsTheWindowed
 {
     // CUDA-PERF-DISPLAY-MODE-AB-1: the SECOND forcePlaybackSmokeWindowForeground() call runs
     // after placement, so on a --windowed leg the window is maximized by then. resizeEvent()
-    // stops Play on every resize, so a showNormal()/SW_SHOWNORMAL there un-maximized the
+    // stopped Play on every resize, so a showNormal()/SW_SHOWNORMAL there un-maximized the
     // window and ended the measured Play ~40 ms after the trigger (bachelor, 0 frames).
+    // PLAYER-FULLSCREEN-KEEPS-PLAYING-1: a resize no longer stops Play (ResizePlaybackPolicy.h);
+    // keeping the window state still avoids a needless relayout mid-measurement.
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString resizeBody = functionBody(source,
         QStringLiteral("void MainWindow::resizeEvent(QResizeEvent *event)"),
         QStringLiteral("void MainWindow::changeEvent( QEvent *event )"));
     ASSERT_FALSE(resizeBody.isEmpty());
-    ASSERT_TRUE(resizeBody.contains(QStringLiteral("ui->actionPlay->setChecked( false );")));
+    ASSERT_FALSE(resizeBody.contains(QStringLiteral("ui->actionPlay->setChecked( false );")));
+    ASSERT_TRUE(resizeBody.contains(QStringLiteral("case resize_playback_policy::Action::KeepPlaying:")));
 
     const QString body = functionBody(source,
         QStringLiteral("void MainWindow::forcePlaybackSmokeWindowForeground( void )"),

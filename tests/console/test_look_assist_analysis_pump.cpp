@@ -650,8 +650,13 @@ TEST(LookAssistAnalysisPumpWiring, ACurveWidgetResizeOnlyRedrawsAndNeverWritesTh
     ASSERT_EQ( 2, widgets );
     // MainWindow's resize waits for the landing.
     const QString mainResize = functionBody( mainWindowSource(), QStringLiteral( "void MainWindow::resizeEvent(" ) );
-    const int held = mainResize.indexOf( QStringLiteral( "if( m_lookAssistPump.sessionOpen() )" ) );
-    ASSERT_TRUE( held >= 0 );
+    // PLAYER-FULLSCREEN-KEEPS-PLAYING-1: the session check is one input of resize_playback_policy::decide, whose
+    // HoldForLookAssist case holds the resize ahead of every other case (Play included) and of the redraw.
+    const int decide = mainResize.indexOf( QStringLiteral( "resize_playback_policy::decide( m_inOpeningProcess, m_lookAssistPump.sessionOpen()," ) );
+    const int held = mainResize.indexOf( QStringLiteral( "case resize_playback_policy::Action::HoldForLookAssist:" ) );
+    ASSERT_TRUE( decide >= 0 );
+    ASSERT_TRUE( held > decide );
+    ASSERT_TRUE( held < mainResize.indexOf( QStringLiteral( "m_lookAssistPump.hold(" ) ) );
     ASSERT_TRUE( held < mainResize.indexOf( QStringLiteral( "drawFrame();" ) ) );
 }
 
