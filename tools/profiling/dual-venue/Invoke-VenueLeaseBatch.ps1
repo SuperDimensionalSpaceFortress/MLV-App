@@ -1358,13 +1358,20 @@ function Get-ExportBudgetRefusal([string]$Path) {
     # r8 (adversary r7 A3): an export leg whose job budget the agent would refuse (DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED: the submitted timeout passes the agent's 86400 s cap) used to be
     # refused only by the generator Invoke-VenueLeg runs AFTER the batch's lease was open, so an impossible window spent a lease (and its 30 min cooldown) on a refusal known in advance.
     # The generator's own -PreflightBudgetOnly mode (the SAME Get-ExportJobTimeBudget, over the resolved clip's real size) is asked here, in the preflight, before any claim or lease.
-    # Returns 'EXPORT_TIME_BUDGET_EXCEEDED', <the generator's reason>, or '', '' for a leg that is not an export, a spec the shape predicates refuse (they own that), and a clip
+    # Returns 'EXPORT_TIME_BUDGET_EXCEEDED', <the generator's reason>, 'SPEC_READ_FAILED' (r18: the spec could not be read or parsed here), or '', '' for a leg that is not an export, export fields the shape predicates refuse (they own that), and a clip
     # this host cannot resolve (the leg's generator still refuses it, typed, as before: the budget of an unreadable clip is unknowable here).
+    # r18 (sol r17 B1, EXPORT-VENUE-LEG-1-OPEN-18-2 = adversary pass18 A2): every caller runs this AFTER the shape check, whose own read of the same file parsed one JSON object. A read
+    # here that throws (a transient sharing violation, the share not answering), bytes that no longer parse, or a root that is no longer one object is NOT "no refusal": it used to return
+    # '', '', every caller (-LegPlan, -LegSet, -LegSpec) went on, and no later check repeats the budget, so an over-cap window reached a claim and a lease. It is the typed refusal
+    # SPEC_READ_FAILED, which all three callers already turn into an exit 2 before any claim or lease (they act on any non-empty code), and no budget child is started.
     try {
         if ($ExportBudgetSpecReadFault) { throw [IO.IOException]::new("EXPORT_BUDGET_SPEC_READ_FAULT seam: the process cannot access the file '$Path' because it is being used by another process") }
-        $spec = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
-    } catch { return '', '' }
-    if ($spec -isnot [System.Management.Automation.PSCustomObject] -or [string](Get-DvProp $spec 'legType') -cne 'export') { return '', '' }
+        $specBytes = [IO.File]::ReadAllBytes($Path)
+    } catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the export budget preflight could not read the leg spec ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
+    try { $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
+    catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec no longer parses on the export budget preflight's read ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
+    if ($spec -isnot [System.Management.Automation.PSCustomObject]) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec is no longer one JSON object on the export budget preflight's read, so its job budget is unchecked; no claim or lease is taken on it" }
+    if ([string](Get-DvProp $spec 'legType') -cne 'export') { return '', '' }
     $export = Get-DvProp $spec 'export'
     $clipId = [string](Get-DvProp $spec 'clipId'); $format = [string](Get-DvProp $export 'format'); $frames = Get-DvProp $export 'maxFrames'
     if ($clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}\z' -or $format -cnotin @('cdng-lossless', 'prores') -or -not ($frames -is [int] -or $frames -is [long]) -or $frames -lt 24 -or $frames -gt 100000) { return '', '' }
