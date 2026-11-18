@@ -4533,6 +4533,7 @@ $script:ExportCdngLlrawprocChildren = @('llrawproc_dark_frame', 'llrawproc_verti
 $script:ExportCdngProducerPartition = @('raw_read', 'raw_decode', 'raw_unpack', 'llrawproc', 'dng_header', 'dng_pack', 'dng_compress_encode', 'payload_clone')
 $script:ExportCdngLlrawprocPartition = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso',
     'llrawproc_chroma_smooth', 'llrawproc_other')
+$script:ExportCdngLlrawprocDisjointFrontier = @('llrawproc_dual_iso', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock')
 
 # r8 fix 3 (adversary pass 10 A2): DISJOINT siblings together are inside their parent too: each below its parent is no proof that the pair is (10 + 10 ms inside a 10 ms parent).
 # Each group is (the disjoint children, the parent); the rendered tree's groups below.
@@ -4834,7 +4835,13 @@ function Get-DvExportEvidence {
             # (adversary r13 A2: llrawproc_ms is an optional total; without it the producer partition had one member short of two and was skipped, leaving 80 ms of disjoint work inside a 50 ms producer
             # unjudged. The third group is the producer partition with the llrawproc TOTAL replaced by its own partition, which holds whether or not the total is published.)
             $producerFlat = @($script:ExportCdngProducerPartition | Where-Object { $_ -cne 'llrawproc' }) + @($script:ExportCdngLlrawprocPartition)
-            $cdngSumGroups = @(@(@($script:ExportCdngProducerPartition), 'producer_frame'), @(@($script:ExportCdngLlrawprocPartition), 'llrawproc'), @(@($producerFlat), 'producer_frame'))
+            # (adversary r13-2 A1: llrawproc_other is total less the seven timed children, so the lock times it RETAINS are not in the partition, and a profile may publish one beside a too-small
+            # llrawproc_other (dual_iso 30 + publish_lock 90 inside a 100 ms total read PASS). llrawproc.c takes the refine lock (:6130) and the publish lock (:6292, :7057) OUTSIDE every dual_iso
+            # window (:5560-6219, :6890-6954), so dual_iso and the two locks are disjoint and are held together inside llrawproc, and, with the producer's other members, inside producer_frame.)
+            $llrawprocFrontier = @($script:ExportCdngLlrawprocDisjointFrontier)
+            $producerFrontier = @(@($script:ExportCdngProducerPartition | Where-Object { $_ -cne 'llrawproc' }) + $llrawprocFrontier)
+            $cdngSumGroups = @(@(@($script:ExportCdngProducerPartition), 'producer_frame'), @(@($script:ExportCdngLlrawprocPartition), 'llrawproc'), @(@($producerFlat), 'producer_frame'),
+                               @(@($llrawprocFrontier), 'llrawproc'), @(@($producerFrontier), 'producer_frame'))
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs -SumGroups $cdngSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed

@@ -829,6 +829,32 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and "inside producer_frame mean" in p for p in got[0]["problems"]), got[0])
         self.assertEqual(got[1]["outcome"], "PASS", got[1])
 
+    def test_r13_pass13_a1_dual_iso_and_the_lock_times_outside_its_window_are_held_inside_llrawproc(self) -> None:
+        """adversary r13 pass 13 A1: llrawproc_other retains the lock times, so dual_iso 30 + publish_lock 90 (disjoint windows, llrawproc.c:6210-6219 vs :6292) inside a 100 ms llrawproc total
+        read PASS beside a too-small llrawproc_other (70). The disjoint frontier is held inside llrawproc and, with the producer's other members, inside producer_frame. Same for the refine lock."""
+        def profile(set_rows: dict, drop_total: bool = False) -> str:
+            doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+            for r in doc["frames"]:
+                for k in CDNG_STAGES:
+                    if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                        r[k] = 0.0
+                if drop_total:
+                    r.pop("llrawproc_ms", None)
+                r.update(set_rows)
+            return json.dumps(doc)
+        base = {"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_other_ms": 70.0}
+        publish = profile({**base, "llrawproc_publish_lock_ms": 90.0})
+        refine = profile({**base, "llrawproc_dualiso_refine_lock_ms": 90.0})
+        no_total = profile({"producer_frame_ms": 100.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_publish_lock_ms": 90.0}, drop_total=True)
+        control = profile({**base, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0})
+        proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in (publish, refine, no_total, control)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in (0, 1, 2):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p for p in got[i]["problems"]), got[i])
+        self.assertEqual(got[3]["outcome"], "PASS", got[3])
+
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string
         passed the shape and threw at the generator's double cast after a lease was spent."""
