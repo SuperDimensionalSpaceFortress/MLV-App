@@ -1651,7 +1651,7 @@ for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyName
 # ('<add key=''pass\nword'' .../>' inside a JSON string is the naming value 'pass<LF>word', 'password' once its blanks are removed). Each is decoded on its own level.
 # r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): the rest of the YAML double-quoted escape table is decoded on its own level
 # too: '\v' (VT), '\a' (BEL), '\e' (ESC), '\L' (U+2028) and '\P' (U+2029), '\_' (U+00A0), '\ ' (a blank) and '\<TAB>'. '\0' and '\N' stay undecoded, which the residual rule refuses.
-$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psq>["''`$])|`(?<psl>[\s\S])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"''?vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psq>["''`$])|`(?<psl>[\s\S])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
 $script:CredentialEntities = @{ 'amp' = '&'; 'lt' = '<'; 'gt' = '>'; 'quot' = '"'; 'apos' = "'" }
 # r5 (adversary pass 12 A1, defect class: an escape a reader decodes that the normaliser left as written): the special PowerShell backtick escapes were kept as written
 # ('"pass`nword"' is 'pass<LF>word' to PowerShell); each is decoded on its own level now, and a backtick-escaped quote, '$' or backtick is that character ('`"password`"' frames an XML pair).
@@ -1691,7 +1691,7 @@ $script:CredentialEscapeFamilyEvals = @(
 $script:CredentialPsControls = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
 foreach ($credPs in @(@('0', [string][char]0), @('a', [string][char]7), @('b', [string][char]8), @('e', [string][char]27), @('f', [string][char]12), @('n', "`n"), @('r', "`r"), @('t', "`t"), @('v', [string][char]11))) { $script:CredentialPsControls[$credPs[0]] = $credPs[1] }
 $script:CredentialOneLetterEscapes = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
-foreach ($credOne in @(@('n', "`n"), @('t', "`t"), @('r', "`r"), @('b', [string][char]8), @('f', [string][char]12), @('"', '"'),
+foreach ($credOne in @(@('n', "`n"), @('t', "`t"), @('r', "`r"), @('b', [string][char]8), @('f', [string][char]12), @('"', '"'), @("'", "'"), @('?', '?'),
         @('v', [string][char]11), @('a', [string][char]7), @('e', [string][char]27), @('L', [string][char]0x2028), @('P', [string][char]0x2029), @('_', [string][char]0xA0), @(' ', ' '), @("`t", "`t"))) { $script:CredentialOneLetterEscapes[$credOne[0]] = $credOne[1] }
 # r2: true when the normaliser has anything to do in the text: an escape it decodes changes the text, or an undecodable one is left (deny by default). It is derived from the
 # normaliser itself, so no escape form can be missing from a separate trigger list (pass 3 A3: '&w;' had no trigger and the residual rule never ran).
@@ -1954,6 +1954,7 @@ function Get-CredentialHitLine {
     # never found. This rewrites separators only, never a value's characters, so the raw-value rule still judges the text as written.
     $Text = $script:CredentialLineBreakRegex.Replace($Text, "`n")
     $script:CredentialDecodeLimitHit = $false
+    $hitMask = $null
     try {
         # r14: the one shape-agnostic rule (Get-CredentialHitIndex: known token shapes, the key/value rule in its line, block and flow forms, netrc records).
         $idx = Get-CredentialHitIndex $Text
@@ -1964,7 +1965,7 @@ function Get-CredentialHitLine {
             # r2 pass 6 A1: every decode level, shallowest first. r4 (sol r3 A3): each level is judged as it is produced and then dropped (-OnStage), never kept.
             # r6 (adversary pass 13 A2): -OnView judges the residual view of every text BEFORE it is decoded (the same rules, with -Residual), so a decode that destroys a residual key's framing cannot hide it
             $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) $script:CredentialDecodedMask = $lvMask; try { Get-CredentialHitIndex -Text $lvText -Residual $true } finally { $script:CredentialDecodedMask = $null } } -OnView { param($vwText, $vwMask) $script:CredentialDecodedMask = $null; Get-CredentialHitIndex -Text $vwText -Residual $true }
-            if ($nf.Hit -ge 0) { $idx = $nf.Hit; $Text = $nf.Text }
+            if ($nf.Hit -ge 0) { $idx = $nf.Hit; $Text = $nf.Text; $hitMask = $nf.Mask }
             elseif ($nf.Levels -eq 0 -and $script:CredentialResidualIntroRegex.IsMatch($Text)) {
                 # a text with only undecodable escapes has no level: it is judged as its own normal form
                 $script:CredentialDecodedMask = $nf.Mask
@@ -1978,7 +1979,13 @@ function Get-CredentialHitLine {
     }
     if ($idx -lt 0) { return 0 }
     # the line of the KEY (a block-form value sits on a later line; the report names where the secret-named key stands)
-    return ($Text.Substring(0, $idx).Split("`n").Count)
+    # r8 (adversary pass 17 A2, defect class: the reported line counted a line break that a DECODE produced): '{"note":"\n","password":"x"}' is ONE source line, and the decoded text holds
+    # two. A line break counts only where the mask says it stands as written ('0'); one a decode produced ('1': '\n', 'U+2028', '&#10;') is not a source line. The mask maps the
+    # decoded text one to one, so it is used when it has the same length (a hit in the residual view, which is shorter, falls back to counting every line break).
+    $hm = $(if ($hitMask -and $hitMask.Length -eq $Text.Length) { $hitMask } else { $null })
+    $lineNo = 1; $nl = $Text.IndexOf("`n")
+    while ($nl -ge 0 -and $nl -lt $idx) { if (-not $hm -or $hm[$nl] -eq '0') { $lineNo++ }; $nl = $Text.IndexOf("`n", $nl + 1) }
+    return $lineNo
 }
 $ExcludeFiles = @('*.log', '*.err', '*.bak*', '*.tmp', '*.lock', '*.pid', '*.sqlite*', '*.jsonl', '.credentials.json', '.claude.json',
     'auth.json', '*.pem', '*.pfx', '*.p12', '*.key', '*.ppk', 'id_rsa*', 'id_ed25519*', '*_id', '*_id.pub', '*.kdbx', '.env', '*.env',

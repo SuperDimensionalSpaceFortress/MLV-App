@@ -2962,6 +2962,30 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     }
     Assert-That (-not (Test-CredentialText ('$xml = "<add key=' + $ddBqA2 + '"theme' + $ddBqA2 + '" value=' + $ddBqA2 + '"a' + $ddBsA2 + 'u0022b' + $ddBqA2 + '" />"'))) 'DENY-BY-DEFAULT-1 r8 must-pass: a PowerShell-framed pair with a backslash quote in a plain value is not a credential'
     Assert-That (-not (Test-CredentialText ('{"x":"<add key=' + $ddBsA2 + '"theme' + $ddBsA2 + '" value=' + $ddBsA2 + '"a' + $ddBqA2 + 'u{22}b' + $ddBsA2 + '" />"}'))) 'DENY-BY-DEFAULT-1 r8 must-pass: a JSON-framed pair with a PowerShell quote in a plain value is not a credential'
+    # r8 (adversary pass 17 A1, defect class: an escape a reader decodes that the normaliser left as written): Python, JavaScript and C decode an escaped apostrophe '\'' and C decodes '\?'.
+    # A Python source line that frames an XML pair with escaped apostrophes holds the pair only after that decode.
+    $ddR8Ap = [System.Collections.Generic.List[string]]::new()
+    $ddR8Ap.Add('xml = ' + "'" + '<add key=' + $ddBsA2 + "'" + 'p a s s w o r d' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter2' + $ddBsA2 + "'" + ' />' + "'")
+    $ddR8Ap.Add('xml = ' + "'" + '<add name=' + $ddBsA2 + "'" + 'password' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter2' + $ddBsA2 + "'" + ' />' + "'")
+    $ddR8Ap.Add('{"x":"<add key=' + $ddBsA2 + "'" + 'password' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter2' + $ddBsA2 + "'" + ' />"}')
+    $ddR8Ap.Add('xml = ' + "'" + '<add key=' + $ddBsA2 + "'" + 'password' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'hunter' + $ddBsA2 + '?2' + $ddBsA2 + "'" + ' />' + "'")
+    $ddR8ApMiss = @($ddR8Ap | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR8ApMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r8 adv p17 A1: all $($ddR8Ap.Count) escaped-apostrophe or escaped-question-mark spellings of an XML naming pair refuse" ("misses=$($ddR8ApMiss.Count): " + (($ddR8ApMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r8 A1 apostrophe role guard') {
+        $ddR8ApRole = @($ddR8Ap | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR8ApRole.Count -eq 0) "DENY-BY-DEFAULT-1 r8 adv p17 A1 role guard: all $($ddR8Ap.Count) name a secret" ("misses=$($ddR8ApRole.Count): " + (($ddR8ApRole | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText ('xml = ' + "'" + '<add key=' + $ddBsA2 + "'" + 'theme' + $ddBsA2 + "'" + ' value=' + $ddBsA2 + "'" + 'dark' + $ddBsA2 + "'" + ' />' + "'"))) 'DENY-BY-DEFAULT-1 r8 must-pass: an escaped-apostrophe pair that names no secret is not a credential'
+    # r8 (adversary pass 17 A2, defect class: the reported line counted a line break that a decode produced): the line is the line of the SOURCE, not of the decoded copy
+    $ddR8Line = @(
+        @{ T = ('{"note":"' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded \n before the key on one source line' },
+        @{ T = ('{"note":"' + $ddBsA2 + 'u2028","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded U+2028' },
+        @{ T = ('{"note":"a&#10;b","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded &#10;' },
+        @{ T = ('{"note":"' + $ddBsA2 + 'n' + $ddBsA2 + 'n' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'three decoded line breaks' },
+        @{ T = ('{"note":"' + $ddBsA2 + 'n"}' + "`n" + '{"' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 2; N = 'a decoded \n on line 1, the key on source line 2' },
+        @{ T = ("x`n`n" + '{"note":"' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 3; N = 'two real line breaks then a decoded one' }
+    )
+    foreach ($ddRl in $ddR8Line) { $ddGot = Get-CredentialHitLine $ddRl.T; Assert-That ($ddGot -eq $ddRl.Want) "DENY-BY-DEFAULT-1 r8 adv p17 A2 source line: $($ddRl.N) reports line $($ddRl.Want)" "got=$ddGot text=$($ddRl.T)" }
     # r7 must-pass: nested JSON with an entity and no credential is not refused, nor is a nested note with a plain quote reference
     foreach ($ddOkR7 in @(('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"a &amp; b' + $ddBsA2 + '"}"}'), ('{"payload":"{' + $ddBsA2 + '"note' + $ddBsA2 + '":' + $ddBsA2 + '"say &#34;hi&#34;' + $ddBsA2 + '"}"}'), ('{"payload":"<add key=' + $ddBsA2 + '"theme' + $ddBsA2 + '" value=' + $ddBsA2 + '"dark&#34;x' + $ddBsA2 + '" />"}'))) {
         Assert-That (-not (Test-CredentialText $ddOkR7)) "DENY-BY-DEFAULT-1 r7 must-pass: $ddOkR7 is not a credential" $ddOkR7
