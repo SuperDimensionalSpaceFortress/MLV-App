@@ -114,7 +114,8 @@ $liftBatch = @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Get-QuietLea
 # lease-batch r2 (the renew-gap demotion): the same, asserted by the demoted case after it has shown the behaviour.
 $liftBatchR2 = @('Register-QuietLeaseRenewOk', 'Get-QuietLeaseRenewOkGapSec', 'ConvertTo-RenewGapCeilingSec',   # the last: BACHELOR-LEASE-RENEW-MARGIN-1 r1 (adversary A2)
     'Get-AgentMonotonicSec', 'Get-RenewGapSec', 'Get-QuietLeaseRenewOkAt', 'Initialize-RenewExitStamp', 'New-RenewExitStamp',   # BACHELOR-LEASE-RENEW-MARGIN-1 r2 (pass 3 A1, A2): optional, so the r2 cases run RED on 591ea10f
-    'Get-RenewRecordWallUtc')   # r5 (sol r4 A2): optional, so renew-gap-reverted-step-record-wall-demotes runs RED on 75fc6509
+    'Get-RenewRecordEpochSec', 'ConvertTo-RenewEpochSec',   # r5 (sol r4 A2): optional, so renew-gap-reverted-step-record-wall-demotes runs RED on 75fc6509
+    'Get-RenewRecordWallUtc')   # 4717ce59's name for it (adversary pass 9): lifted only when present, so that RED runs there on behaviour
 # lease-batch r3 (sol r2 B1, B2): the same, asserted by the r3 cases after they have shown the behaviour.
 $liftBatchR3 = @('Test-LeaseBatchClosePending', 'Get-LeaseBatchJobStop')
 $batchLifted = [System.Collections.Generic.List[string]]::new()
@@ -5931,7 +5932,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         # r5 (sol r4 A2): the fake renew prints heavy-slot.py's flag JSON, as the fake heavy-slot.py above does (o["renewed"] = time.time()):
         # "renewed" is its record wall time (recordWalls). -NoRecordWallOut prints nothing (a heavy-slot.py output without that field).
         param([double]$QuerySec, [double]$ExitAfterSec, [int]$Rc, [datetime]$PrevWall, [datetime]$WalkStartWall, [double]$MonoAdvanceToWalk, [switch]$NoWalk, [double]$WallStepSec = 0, [double]$ExitWallOffsetSec = 0,
-            [double]$StampDelaySec = 0, [double]$RecordWallStepSec = 0, [double]$RecordWallStepAtSec = 0, [double]$PreTickSec = 0, [switch]$NoRecordWallOut)
+            [double]$StampDelaySec = 0, [double]$RecordWallStepSec = 0, [double]$RecordWallStepAtSec = 0, [double]$PreTickSec = 0, [switch]$NoRecordWallOut,
+            [double[]]$RenewedEpochs = @(), $PrevRecordEpochSec = $null)   # r5 (adversary pass 9 A2): literal "renewed" values, and the previous success's
         $rcSaved = @{ q = $script:QuietLease; w = $script:QuietLeaseWaiting; b = $script:LeaseBatch; a = $script:Admission }
         try {
             return & {
@@ -5942,6 +5944,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $script:RcRecords = [System.Collections.Generic.List[double]]::new()
                 $script:RcExitAfter = $ExitAfterSec; $script:RcRc = $Rc; $script:RcQuery = $QuerySec; $script:RcWallStep = $WallStepSec; $script:RcExitWallOff = $ExitWallOffsetSec
                 $script:RcStampDelay = $StampDelaySec; $script:RcRecStep = $RecordWallStepSec; $script:RcRecStepAt = $RecordWallStepAtSec; $script:RcNoRecOut = [bool]$NoRecordWallOut
+                $script:RcRenewed = [System.Collections.Generic.Queue[double]]::new(); foreach ($x in $RenewedEpochs) { $script:RcRenewed.Enqueue($x) }
                 $script:RcPrevUtc = $PrevWall.ToUniversalTime()
                 $script:RcRecordWalls = [System.Collections.Generic.List[double]]::new()
                 function Get-Date { return $script:RcNowUtc.ToLocalTime() }
@@ -5975,7 +5978,9 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                     $recWallUtc = if ($script:RcRecStep -ne 0) { $startedUtc.AddSeconds($script:RcRecStepAt + $script:RcRecStep) } else { $exitUtc }
                     $script:RcRecordWalls.Add(($recWallUtc - $script:RcPrevUtc).TotalSeconds)
                     $done = [System.Threading.Tasks.Task]::FromResult('')
-                    $outTxt = if ($script:RcNoRecOut -or $script:RcRc -ne 0) { '' } else { ([ordered]@{ label = 'quiet-lease mlv'; pid = 4000; state = 'active'; slot = 1; renewed = ([DateTimeOffset]::new($recWallUtc).ToUnixTimeMilliseconds() / 1000.0) } | ConvertTo-Json -Compress) }
+                    $renewedVal = if ($script:RcRenewed.Count -gt 0) { $script:RcRenewed.Dequeue() } else { [DateTimeOffset]::new($recWallUtc).ToUnixTimeMilliseconds() / 1000.0 }
+                    # A literal "renewed" is written with round-trip precision ("R"), as Python's json.dumps writes a float.
+                    $outTxt = if ($script:RcNoRecOut -or $script:RcRc -ne 0) { '' } else { '{"label": "quiet-lease mlv", "pid": 4000, "state": "active", "slot": 1, "renewed": ' + $renewedVal.ToString('R', [Globalization.CultureInfo]::InvariantCulture) + '}' }
                     $outTask = [System.Threading.Tasks.Task]::FromResult($outTxt)
                     return [pscustomobject]@{ ok = $true; proc = $p; out = $outTask; err = $done; started = $started; startedMono = $startedMono; exitStamp = $st; why = $null }
                 }
@@ -5984,6 +5989,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $lease = [pscustomobject]@{ ok = $true; jobId = 'rc-collect'; label = 'quiet-lease mlv'; proc = $wrapper; pid = 4000; active = [pscustomobject]@{ slot = 1; held = '1:4000'; until = $until }
                     activeAt = $PrevWall.AddSeconds(-600); activeAtMono = 400.0; lastRenewStart = $PrevWall; lastRenewStartMono = 1000.0; lastRenewOkStart = $PrevWall; lastRenewOkStartMono = 1000.0
                     renewCall = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0; renewOkMaxGapSec = 0 }
+                if ($null -ne $PrevRecordEpochSec) {
+                    # The previous success's own record time: r5's field, and 4717ce59's DateTime field (so the RED runs there on behaviour).
+                    $lease | Add-Member -NotePropertyName lastRenewOkRecordEpochSec -NotePropertyValue ([double]$PrevRecordEpochSec) -Force
+                    $lease | Add-Member -NotePropertyName lastRenewOkRecordWallUtc -NotePropertyValue ([datetime]::UnixEpoch.AddTicks([long]([double]$PrevRecordEpochSec * 10000000))) -Force
+                }
                 $script:QuietLease = $lease; $script:QuietLeaseWaiting = $null; $script:LeaseBatch = $null
                 $script:Admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ seq = 1; token = 'rc' } }
                 # The agent's slice order: walk (with the -OnEach tick), the slice's own tick, the batch bound check.
@@ -6102,25 +6112,34 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
     # r5 (sol r4 A2, the RED for the fix; the exact trace): previous success wall/mono t0; the renew starts at t0+100; a +30 s wall step at mono
     # t0+101 makes heavy-slot.py's record wall t0+131; the step is reverted before the exit stamp at t0+105; collected at t0+130. heavy-slot.py
     # judges staleness on its record's own time (131 s since the last), so the agent must demote. RED on 75fc6509 (closed 105, open 30, stop null).
-    # Control: the same input when the renew's output carries no "renewed" (an older or different heavy-slot.py): the r4 bound remains (105 s,
-    # not demoted). That is the NON-PROMISE the PR names, pinned so a successor sees it, never a property this PR claims.
+    # Control (adversary pass 9 A1, introduced major on 4717ce59): the same input when the renew's output carries no "renewed" (an older or
+    # different heavy-slot.py). 4717ce59 still ended the gap at the exit stamp (105 s, not demoted); a reverted step cannot be ruled out without
+    # the record time, so the gap ends at the collection (130 s, demoted), as base a7278cbd does.
+    # Precision (adversary pass 9 A2, introduced major on 4717ce59): the previous record at epoch 1801440000.0000002 and this one at
+    # 1801440120.0000005 are 120.00000024 s apart (in doubles, as heavy-slot.py subtracts time.time() values): over the strict 120 s bound.
+    # 4717ce59 converted both to DateTime ticks first and read exactly 120.0 (not demoted); the gap must read over 120 and demote.
     if (Test-Case 'renew-gap-reverted-step-record-wall-demotes') {
         $rw = Invoke-RcCase -QuerySec 30 -ExitAfterSec 5 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(100) -MonoAdvanceToWalk 100 -RecordWallStepSec 30 -RecordWallStepAtSec 1
         $rwTxt = $rw | ConvertTo-Json -Compress -Depth 4
         Assert-True ($rw.ok -eq 1 -and [Math]::Abs([double]$rw.recordWalls[0] - 131) -lt 0.01 -and [Math]::Abs($rw.atMonoSec - 130) -lt 0.01) "renew-gap-reverted-step-record-wall-demotes: heavy-slot.py recorded the renew at wall t0+131 and the agent collected it (ok) at t0+130: $rwTxt"
         Assert-True ($rw.okMaxGapSec -ge 131 -and $rw.gapSec -gt 120 -and $rw.stop -ceq 'demoted') "renew-gap-reverted-step-record-wall-demotes: the gap the agent enforces is the max of the monotonic/sample gap (105 s) and the record's own wall gap (131 s), so the job is demoted where heavy-slot.py sees a stale lease: $rwTxt"
+        $rpPrev = [DateTimeOffset]::FromUnixTimeSeconds(1801439999).UtcDateTime.ToLocalTime()
+        $rp = Invoke-RcCase -QuerySec 30 -ExitAfterSec 5 -Rc 0 -PrevWall $rpPrev -WalkStartWall $rpPrev.AddSeconds(101) -MonoAdvanceToWalk 101 -RenewedEpochs @(1801440120.0000005) -PrevRecordEpochSec 1801440000.0000002
+        $rpTxt = $rp | ConvertTo-Json -Compress -Depth 4
+        Assert-True ($rp.ok -eq 1 -and [Math]::Abs($rp.atMonoSec - 131) -lt 0.01) "renew-gap-reverted-step-record-wall-demotes (precision): the renew started at +101, exited at +106 and was collected (ok) at +131: $rpTxt"
+        Assert-True ($rp.okMaxGapSec -gt 120 -and $rp.gapSec -gt 120 -and $rp.stop -ceq 'demoted') "renew-gap-reverted-step-record-wall-demotes (precision, adversary pass 9 A2): records 120.00000024 s apart read over 120 s and the job is demoted: $rpTxt"
         $rn = Invoke-RcCase -QuerySec 30 -ExitAfterSec 5 -Rc 0 -PrevWall $rcT0 -WalkStartWall $rcT0.AddSeconds(100) -MonoAdvanceToWalk 100 -RecordWallStepSec 30 -RecordWallStepAtSec 1 -NoRecordWallOut
         $rnTxt = $rn | ConvertTo-Json -Compress -Depth 4
-        Assert-True ($rn.ok -eq 1 -and $rn.okMaxGapSec -ge 105 -and $rn.okMaxGapSec -le 106 -and $null -eq $rn.stop) "renew-gap-reverted-step-record-wall-demotes (control, NON-PROMISE): with no 'renewed' in the renew output the reverted step stays unseen (105 s, not demoted): $rnTxt"
-        if ($batchLifted -contains 'Get-RenewRecordWallUtc') {
-            $rwU = Get-RenewRecordWallUtc -Stdout "noise`n{`"state`":`"active`",`"renewed`":1763431331.5}"
-            Assert-True ($null -ne $rwU -and $rwU.Kind -eq [DateTimeKind]::Utc -and [Math]::Abs(([DateTimeOffset]::new($rwU).ToUnixTimeMilliseconds() / 1000.0) - 1763431331.5) -lt 0.001) "Get-RenewRecordWallUtc reads the last line's 'renewed' epoch as UTC: $rwU"
-            foreach ($bad in @('', 'not json', '{"state":"active"}', '{"renewed":"x"}', '{"renewed":-5}', '{"renewed":null}', '[1,2]')) {
-                Assert-True ($null -eq (Get-RenewRecordWallUtc -Stdout $bad)) "Get-RenewRecordWallUtc: an unusable output reads `$null (the sample gap alone stands): [$bad]"
+        Assert-True ($rn.ok -eq 1 -and $rn.okMaxGapSec -ge 130 -and $rn.okMaxGapSec -le 130.1 -and $rn.stop -ceq 'demoted') "renew-gap-reverted-step-record-wall-demotes (control, adversary pass 9 A1): with no 'renewed' in the renew output the gap ends at the collection (130 s), never at the exit stamp (105 s), and the job is demoted: $rnTxt"
+        if ($batchLifted -contains 'Get-RenewRecordEpochSec') {
+            $rwU = Get-RenewRecordEpochSec -Stdout "noise`n{`"state`":`"active`",`"renewed`":1801440120.0000005}"
+            Assert-True ($rwU -is [double] -and $rwU -eq 1801440120.0000005) "Get-RenewRecordEpochSec reads the last line's 'renewed' epoch as the double heavy-slot.py wrote: $rwU"
+            foreach ($bad in @('', 'not json', '{"state":"active"}', '{"renewed":"x"}', '{"renewed":-5}', '{"renewed":null}', '[1,2]', '1801440120.5')) {
+                Assert-True ($null -eq (Get-RenewRecordEpochSec -Stdout $bad)) "Get-RenewRecordEpochSec: an unusable output reads `$null (the gap then ends at the collection): [$bad]"
             }
         }
-        else { Assert-True $false "agent defines Get-RenewRecordWallUtc (r5, sol r4 A2)" }
-        $results.renewGapRevertedStepRecordWallDemotes = [ordered]@{ withRecordWall = $rw; noRecordWall = $rn }
+        else { Assert-True $false "agent defines Get-RenewRecordEpochSec (r5, sol r4 A2)" }
+        $results.renewGapRevertedStepRecordWallDemotes = [ordered]@{ withRecordWall = $rw; noRecordWall = $rn; precision = $rp }
     }
     # r4 (adversary pass 6 A3, introduced major): a renew call's start must be read BEFORE Process.Start. Read after it, a parent descheduled
     # between the start and the reading anchors the next gap after the child's renew record (child starts 0, records and exits 3, parent reads
@@ -6221,7 +6240,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 $lease = [pscustomobject]@{ ok = $true; jobId = 'ps-stall'; label = 'quiet-lease mlv'; proc = [pscustomobject]@{ HasExited = $false; ExitCode = $null }; pid = 4000
                     active = [pscustomobject]@{ slot = 1; held = '1:4000'; until = [long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 2700) }
                     activeAt = $psT0.AddSeconds(-600); activeAtMono = 400.0; lastRenewStart = $prevWall; lastRenewStartMono = 980.0; lastRenewOkStart = $prevWall; lastRenewOkStartMono = 980.0
-                    lastRenewOkRecordWallUtc = $prevWall.ToUniversalTime()
+                    lastRenewOkRecordEpochSec = ([DateTimeOffset]::new($prevWall.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0)
                     renewCall = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0; renewOkMaxGapSec = 0 }
                 $script:QuietLease = $lease; $script:QuietLeaseWaiting = $null; $script:LeaseBatch = $null
                 $script:Admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ seq = 1; token = 'ps' } }
