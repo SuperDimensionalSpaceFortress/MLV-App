@@ -2826,6 +2826,66 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             with self.subTest(text):
                 self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
 
+    # r7 (sol r6 blocker, HUB RULING 2026-11-18 ROUND_TAIL): a C++14 digit separator (`1'000`) inside a number is part of the
+    # number. The lexer read it as a character-literal opener, blanked the rest of the line (and its newline) and hid every
+    # construction after it, in the pinned key-table file and in every file the other consumers scan.
+    _R7_PRESS = " QKeyEvent press{ QEvent::KeyPress, 32, Qt::NoModifier };"
+    _R7_SEPARATED_PRESS = {
+        "decimal": "int delay = 1'000;" + _R7_PRESS,
+        "alias": "int delay = 1'000; using Event=QKeyEvent; Event press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+        "hex": "int delay = 0x1'000;" + _R7_PRESS,
+        "binary": "int delay = 0b1'0;" + _R7_PRESS,
+        "suffixed": "unsigned delay = 1'000u;" + _R7_PRESS,
+        "floating": "float delay = 1'000.5f;" + _R7_PRESS,
+        "exponent": "double delay = 1'0e+1'0;" + _R7_PRESS,
+        "leading dot": "double delay = .5'5;" + _R7_PRESS,
+        "two separators": "long delay = 1'000'000;" + _R7_PRESS,
+    }
+
+    def test_r7_a_digit_separator_never_hides_a_key_event_construction_in_the_key_table(self) -> None:
+        for name, injected in self._R7_SEPARATED_PRESS.items():
+            with self.subTest(name):
+                self._assert_caught(self._mutated(self._FOCUS_GUARD_CAST, self._FOCUS_GUARD_CAST + "\n        " + injected,
+                                                  path=self._SPACE_TABLE), "synthesized key event")
+
+    def test_r7_a_digit_separator_never_hides_a_protected_token_from_any_consumer(self) -> None:
+        # One control per consumer the sol r6 class sweep named. Each runs twice: with a plain number (the twin must be
+        # caught, so the control is valid) and with a digit separator (must be caught too).
+        cast = self._FOCUS_GUARD_CAST
+        controls = {
+            "reference check": (lambda n: self._mutated(cast, cast + "\n        int delay = " + n + "; auto copy = *keyEvent;",
+                                                        path=self._SPACE_TABLE), "key event"),
+            "type-of": (lambda n: self._mutated(cast, cast + "\n        int delay = " + n + "; decltype(delay) twin = delay;",
+                                                path=self._SPACE_TABLE), "type-of operator"),
+            "dispatch": (lambda n: self._inject_after_measured_loop_off("int delay = " + n + "; (qApp->notify)( this, nullptr );"),
+                         "event dispatch notify in platform/qt/MainWindow.cpp x1"),
+            "following-line macro": (lambda n: {"platform/qt/OtherWidget.h": "int delay = " + n + ";\n#define Primary Secondary\n"},
+                                     "#define of Primary"),
+            "synthesis": (lambda n: self._mutated(cast, cast + "\n        int delay = " + n + ";" + self._R7_PRESS,
+                                                  path=self._SPACE_TABLE), "synthesized key event"),
+        }
+        for name, (build, needle) in controls.items():
+            for number in ("1000", "1'000", "0x1'000", "0b1'0", "1'000u", "1'000.5f"):
+                with self.subTest(name + " " + number):
+                    self._assert_caught(build(number), needle)
+
+    def test_r7_real_character_literals_and_strings_are_still_lexed_as_literals(self) -> None:
+        # Literals only (green before and after the fix): the separator rule must not touch a real literal.
+        literals = ("char a = 'a'; char b = '\\''; char c = u8'x'; char16_t d = u'y'; char32_t e = U'z'; wchar_t f = L'w';\n"
+                    "const char *s = \"it's\"; char g = '1'; char h = '2'; char i = '0'; auto j = (1 == 1) ? 'a' : 'b';\n")
+        blank, keep = strip_cpp(literals)
+        self.assertEqual(blank, ("char a = ' '; char b = '  '; char c = u8' '; char16_t d = u' '; char32_t e = U' '; wchar_t f = L' ';\n"
+                                 "const char *s = \"    \"; char g = ' '; char h = ' '; char i = ' '; auto j = (1 == 1) ? ' ' : ' ';\n"))
+        self.assertEqual(keep, literals)
+        # The same literals beside separated numbers: numbers stay whole and the literals around them still blank.
+        mixed = "int n = 1'000; char a = 'a'; int m = 0x1'000; const char *s = \"it's\"; char b = '\\''; float f = 1'0.5f;\n"
+        blank, keep = strip_cpp(mixed)
+        self.assertEqual(blank, "int n = 1'000; char a = ' '; int m = 0x1'000; const char *s = \"    \"; char b = '  '; float f = 1'0.5f;\n")
+        self.assertEqual(keep, mixed)
+        # A key-event spelling inside a literal is still not a construction, with a separated number on the same line.
+        literal = "const char *s = \"QKeyEvent press{}\"; char c = 'Q'; int n = 1'000;\nchar x = 'K';\n"
+        self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": literal}), [])
+
     def test_r3_p2_a2_a_qualified_qkeyevent_include_is_not_a_synthesized_key(self) -> None:
         for text in ("#include <QtGui/QKeyEvent>\n", "#include <qevent.h>\n", '#include "QKeyEvent"\n'):
             with self.subTest(text):

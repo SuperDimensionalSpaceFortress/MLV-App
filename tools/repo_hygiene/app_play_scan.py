@@ -582,6 +582,11 @@ _WALL_CLOCK_PLAY_LOOP = re.compile(r"\bwhile\s*\([^{;]*\belapsed\s*\(\s*\)[^{;]*
 _STOP_CALL = re.compile(r'programmaticStop\s*\(\s*"([^"]+)"')
 
 
+_DIGITS = "0123456789"
+# C++14 [lex.ppnumber]: pp-number: digit | . digit | pp-number (digit | identifier-nondigit | ' digit | ' nondigit | e+ | e- | p+ | p- | .)
+_PP_NUMBER = re.compile(r"\.?[0-9](?:[eEpP][+-]|'[0-9A-Za-z_]|[0-9A-Za-z_.])*")
+
+
 def strip_cpp(text: str) -> tuple[str, str]:
     """(code with comments removed and string/char literals BLANKED, code with comments removed and literals kept).
 
@@ -620,6 +625,15 @@ def strip_cpp(text: str) -> tuple[str, str]:
                     keep.append(ch)
                 i = end
                 continue
+        # r7 (sol r6 blocker): a C++14 digit separator (`1'000`, `0x1'000`, `1'000.5f`) is part of the number, never a
+        # character-literal opener. A pp-number begins at a digit (or `.digit`) that does not continue an identifier, so
+        # `u8'x'` / `L'x'` (the digit 8 continues the identifier u8) stay literals; it is consumed whole, as [lex.ppnumber].
+        if (c in _DIGITS or (c == "." and nxt in _DIGITS)) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            number = _PP_NUMBER.match(text, i)
+            blank.append(number.group(0))
+            keep.append(number.group(0))
+            i = number.end()
+            continue
         if c in "\"'":
             quote = c
             j = i + 1
