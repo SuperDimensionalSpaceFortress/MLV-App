@@ -67,6 +67,24 @@ function ConvertTo-UtcTime($v) {
     if ($v -is [DateTimeOffset]) { return $v.UtcDateTime }
     try { return [DateTimeOffset]::Parse([string]$v, $inv, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime } catch { return $null }
 }
+# Any unexpected terminating error ends as a typed line and exit 3, never as a bare stack trace (adversary r2 A6).
+trap { Write-Output ("AB_EVAL_ERROR {0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message); exit 3 }
+
+function ConvertTo-DoubleOrNull($v) {
+    if ($null -eq $v -or "$v" -eq '') { return $null }
+    $d = 0.0
+    if ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, $inv, [ref]$d)) { return $d }
+    return $null
+}
+function Test-PathInside([string]$Child, [string]$Parent) {
+    $c = ([IO.Path]::GetFullPath($Child)).TrimEnd('\', '/')
+    $p = ([IO.Path]::GetFullPath($Parent)).TrimEnd('\', '/')
+    return ($c -ieq $p) -or $c.StartsWith($p + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+# This script is read-only against HeavySlot: the verdict, holds log and headroom summary go under -WindowDir, which therefore may
+# never be (or lie under) the HeavySlot dir (adversary r2 A7).
+if (Test-PathInside $WindowDir $HeavySlotDir) { Write-Output "AB_EVAL_REFUSED path-overlap (the window dir $WindowDir is, or lies under, the HeavySlot dir $HeavySlotDir; this evaluator never writes there)"; exit 2 }
+
 function Read-JsonLines([string]$Path) {
     $out = New-Object System.Collections.Generic.List[object]
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $out.ToArray() }
@@ -103,8 +121,9 @@ function Write-EarlyVerdict([string]$Verdict, [string]$Reason) {
 $blocksRaw = @(Read-JsonLines (Join-Path $WindowDir 'ab-blocks.jsonl'))
 # a block row is usable only when every field the evaluation reads parses (adversary r1 A10: a stray {} must not reach the date maths)
 $blocks = @($blocksRaw | Where-Object {
-        $null -ne $_ -and $null -ne $_.PSObject.Properties['block'] -and [string]$_.state -and $null -ne (ConvertTo-UtcTime $_.startUtc) -and $null -ne (ConvertTo-UtcTime $_.endUtc) -and
-        $null -ne (ConvertTo-UtcTime $_.windowStartUtc) -and $null -ne (ConvertTo-UtcTime $_.windowEndUtc) })
+        $null -ne $_ -and $null -ne $_.PSObject.Properties['block'] -and ($_.block -is [int] -or $_.block -is [long]) -and ([string]$_.state -cin 'A', 'B') -and
+        $null -ne (ConvertTo-UtcTime $_.startUtc) -and $null -ne (ConvertTo-UtcTime $_.endUtc) -and $null -ne (ConvertTo-UtcTime $_.windowStartUtc) -and
+        $null -ne (ConvertTo-UtcTime $_.windowEndUtc) -and (ConvertTo-UtcTime $_.windowStartUtc) -lt (ConvertTo-UtcTime $_.windowEndUtc) })
 $samples = @(Read-JsonLines (Join-Path $WindowDir 'ab-samples.jsonl'))
 $receiptPath = Join-Path $WindowDir 'ab-receipt.json'
 $driverReceipt = $null
@@ -137,7 +156,23 @@ if (-not $winEnd -and $samples.Count -gt 0) { $winEnd = ConvertTo-UtcTime $sampl
 if (-not $winEnd) { $winEnd = $winPlannedEnd }
 # only this window's samples (a stray row from outside it never reaches the split)
 $samples = @($samples | Where-Object { $t0 = ConvertTo-UtcTime $_.utc; $null -ne $t0 -and $t0 -ge $winStart -and $t0 -le $winEnd })
-$blockList = @(foreach ($b in $blocks) { [pscustomobject]@{ index = [int]$b.block; state = [string]$b.state; start = (ConvertTo-UtcTime $b.startUtc); end = (ConvertTo-UtcTime $b.endUtc) } })
+# every sample row is parsed ONCE here; a row whose utc or holders does not parse is skipped, a numeric field that does not parse reads as unknown
+$psamples = @(foreach ($sm in $samples) {
+        $hd = ConvertTo-DoubleOrNull $sm.holders
+        if ($null -eq $hd) { continue }
+        [pscustomobject]@{ t = (ConvertTo-UtcTime $sm.utc); holders = [int]$hd; temp = (ConvertTo-DoubleOrNull $sm.temp_c); cpu = (ConvertTo-DoubleOrNull $sm.cpu_pct)
+            freq = (ConvertTo-DoubleOrNull $sm.freq_mhz); commit = (ConvertTo-DoubleOrNull $sm.free_commit_gb); state = [string]$sm.state }
+    })
+$psamples = @($psamples | Sort-Object { $_.t.Ticks })
+# A block lasts from the moment its state was REALLY applied (startUtc) until the next block was applied (or the window ended): the
+# scheduled endUtc is informational, so a slow poll that skipped or delayed a block cannot make the attribution lie (adversary r2 A2).
+$orderedBlocks = @($blocks | Sort-Object { (ConvertTo-UtcTime $_.startUtc).Ticks })
+$blockList = @(for ($bi = 0; $bi -lt $orderedBlocks.Count; $bi++) {
+        $b = $orderedBlocks[$bi]
+        $bStart = if ($bi -eq 0) { $winStart } else { ConvertTo-UtcTime $b.startUtc }
+        $bEnd = if ($bi + 1 -lt $orderedBlocks.Count) { ConvertTo-UtcTime $orderedBlocks[$bi + 1].startUtc } else { $winEnd }
+        [pscustomobject]@{ index = [int]$b.block; state = [string]$b.state; start = $bStart; end = $bEnd }
+    })
 function Get-BlockOf($t) {
     if ($null -eq $t -or $t -lt $winStart -or $t -ge $winEnd) { return $null }
     foreach ($b in $blockList) { if ($t -ge $b.start -and $t -lt $b.end) { return $b } }
@@ -199,6 +234,9 @@ $bPytestN = 0
 $holdCrossEdge = 0
 $holds = New-Object System.Collections.Generic.List[object]
 foreach ($k in $tickets.ToArray()) {
+    # A receipt that closed after window end + grace is a dead (or hopelessly slow) holder even when its ledger admit row is missing
+    # (the producer's ledger append is advisory): the receipt itself says when it finished (adversary r2 A1).
+    if ($null -ne $k.fin -and $k.fin -gt $deadline -and -not $dead.ContainsKey($k.ticket)) { $dead[$k.ticket] = $k.label }
     if ($dead.ContainsKey($k.ticket)) { $excludedDead++; continue }
     if ($pending.ContainsKey($k.ticket)) { $excludedPending++; continue }
     $be = Get-BlockOf $k.enq
@@ -208,7 +246,8 @@ foreach ($k in $tickets.ToArray()) {
     if ($admitted) {
         $ba = Get-BlockOf $k.adm
         if (-not $ba -or $ba.index -ne $be.index) { $spill.Add([pscustomobject]@{ ticket = $k.ticket; label = $k.label; enqueuedBlock = $be.index; admittedBlock = $(if ($ba) { $ba.index } else { $null }) }); continue }
-        $wait = if ($null -ne $k.waitedMs) { [double]$k.waitedMs / 1000.0 } else { ($k.adm - $k.enq).TotalSeconds }
+        $wms = ConvertTo-DoubleOrNull $k.waitedMs
+        $wait = if ($null -ne $wms) { $wms / 1000.0 } else { ($k.adm - $k.enq).TotalSeconds }
         $hold = ($k.fin - $k.adm).TotalSeconds
         $bf = Get-BlockOf $k.fin
         if (-not $bf -or $bf.index -ne $be.index) { $holdCrossEdge++ }
@@ -240,9 +279,9 @@ foreach ($s in 'A', 'B') {
 # For every live closed hold: the peak live-holder count over its samples ([admit, finish]; with none inside, the first sample at or
 # after admit within two polls, else the last one before), the hottest and mean package temp and the median frequency over those samples.
 # holders_peak >= 2 means the hold overlapped another; <= 1 means it ran alone. ab-holds.jsonl carries one row per hold (adversary r1 A6).
-$pollGuess = if ($driverReceipt -and $driverReceipt.pollSeconds) { [double]$driverReceipt.pollSeconds } else { 15.0 }
-$sampRows = @(foreach ($sm in $samples) { [pscustomobject]@{ t = (ConvertTo-UtcTime $sm.utc).Ticks; holders = [int]$sm.holders; temp = $sm.temp_c; freq = $sm.freq_mhz } })
-$sampRows = @($sampRows | Sort-Object t)
+$pollGuess = 15.0
+if ($driverReceipt) { $pg = ConvertTo-DoubleOrNull $driverReceipt.pollSeconds; if ($null -ne $pg -and $pg -gt 0) { $pollGuess = $pg } }
+$sampRows = @(foreach ($ps in $psamples) { [pscustomobject]@{ t = $ps.t.Ticks; holders = $ps.holders; temp = $ps.temp; freq = $ps.freq } })
 $sTicks = [long[]]@($sampRows | ForEach-Object { $_.t })
 $holdRows = New-Object System.Collections.Generic.List[object]
 foreach ($h0 in $holds.ToArray()) {
@@ -294,14 +333,16 @@ foreach ($grp in 'A', 'B', 'all') {
 # ---- samples, split by live holders --------------------------------------------------------------------------------------------
 $groups = @{ '0' = New-Object System.Collections.Generic.List[object]; '1' = New-Object System.Collections.Generic.List[object]; '2' = New-Object System.Collections.Generic.List[object] }
 $allB = New-Object System.Collections.Generic.List[object]
-for ($i = 0; $i -lt $samples.Count; $i++) {
-    $s = $samples[$i]
-    $t = ConvertTo-UtcTime $s.utc
-    $next = if ($i + 1 -lt $samples.Count) { ConvertTo-UtcTime $samples[$i + 1].utc } else { $null }
-    $dt = if ($next) { [Math]::Min(($next - $t).TotalSeconds, 2 * $pollGuess) } else { $pollGuess }
-    $h = [int]$s.holders
+for ($i = 0; $i -lt $psamples.Count; $i++) {
+    $s = $psamples[$i]
+    $t = $s.t
+    # the time a sample stands for: up to the next sample, but never more than two polls and never past the window end
+    $toEnd = [Math]::Max(0.0, ($winEnd - $t).TotalSeconds)
+    $dt = if ($i + 1 -lt $psamples.Count) { [Math]::Min(($psamples[$i + 1].t - $t).TotalSeconds, 2 * $pollGuess) } else { $pollGuess }
+    $dt = [Math]::Min($dt, $toEnd)
+    $h = $s.holders
     $key = if ($h -ge 2) { '2' } elseif ($h -eq 1) { '1' } else { '0' }
-    $row = [pscustomobject]@{ dt = [Math]::Max(0.0, $dt); temp = $s.temp_c; cpu = $s.cpu_pct; freq = $s.freq_mhz; commit = $s.free_commit_gb; state = [string]$s.state }
+    $row = [pscustomobject]@{ dt = [Math]::Max(0.0, $dt); temp = $s.temp; cpu = $s.cpu; freq = $s.freq; commit = $s.commit; state = $s.state }
     $groups[$key].Add($row)
     if ($row.state -eq 'B') { $allB.Add($row) }
 }

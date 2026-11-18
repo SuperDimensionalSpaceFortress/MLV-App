@@ -32,6 +32,11 @@
   answers 1 once the process is gone). One window per directory: a -WindowDir that already holds ab-blocks.jsonl, ab-samples.jsonl or
   ab-receipt.json is refused (window-dir-used). A System Event 2004 count that cannot be read twice in a row aborts the window
   (event-2004-unreadable). Holders are exact (pid + start ticks) and a feed row counts as 2+ holders only when both bracketing polls saw 2+.
+  Round 2 of the adversary pass: ONE driver per switch, whatever -MutexName says (an exclusive lock file <SwitchPath>.lock is held for the
+  life of the process and never removed); the switch, its lock and the window dir may not be, or lie under, anything the driver only reads
+  (path-overlap); a preflight read that fails is a refusal (preflight-failed), never an abort; a refusal whose revert cannot be proven
+  exits 4; the ledger and receipt baselines are taken BEFORE the window clock starts and one last sweep runs after the final poll; the
+  block applied is the one due NOW by the clock (a slow poll skips blocks), and the blocks log's startUtc is when the state was applied.
   ASCII-only on purpose.
 #>
 [CmdletBinding()]
@@ -50,6 +55,7 @@ param(
     [string]$PinSha = '691efb4c2cc1b98cd5a7379e03a2bb5b9eebaa1174a03b11ee7a48741fc06534',
     [string]$MutexName = 'Global\MLV-HeavySlotAbDriver',
     [switch]$NoPerfProbe,              # test seam: skip the processor performance query
+    [double]$ProbeDelaySeconds = 0,    # test seam: sleep this long before each poll's probes (a slow host)
     [double]$CapTempC = 95,
     [double]$CapSeconds = 60,
     [double]$CapWindowSeconds = 300,
@@ -237,63 +243,149 @@ function Set-Switch([string]$State, [int]$Count, [int]$Block) {
     throw $lastError
 }
 
-# ---- preflight ----------------------------------------------------------------------------------------------------------------
+function Get-FullPathSafe([string]$p) { try { return [IO.Path]::GetFullPath($p) } catch { return $p } }
+function Test-PathInside([string]$Child, [string]$Parent) {
+    # $true when $Child is $Parent or lies under it (case-insensitive, full paths).
+    $c = (Get-FullPathSafe $Child).TrimEnd('\', '/')
+    $p = (Get-FullPathSafe $Parent).TrimEnd('\', '/')
+    return ($c -ieq $p) -or $c.StartsWith($p + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
+# ---- ledger / receipt scanners (state lives in script scope so the end-of-window sweep continues where the last poll stopped) --------
+$script:ledgerPath = ''
+$script:ledgerOffset = 0
+$script:receiptDir = ''
+$script:knownReceipts = $null
+$script:receiptTries = @{}
+
+function Get-LedgerFinding {
+    # The first ledger row since window start that is an `unguarded` event or an admit with class != shared / wholeMachine; $null if none.
+    if (-not (Test-Path -LiteralPath $script:ledgerPath)) { return $null }
+    try {
+        $lfs = [IO.File]::Open($script:ledgerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try {
+            if ($lfs.Length -lt $script:ledgerOffset) { $script:ledgerOffset = 0 }
+            [void]$lfs.Seek($script:ledgerOffset, [IO.SeekOrigin]::Begin)
+            $lb = New-Object byte[] ([int]($lfs.Length - $script:ledgerOffset))
+            $lg = 0
+            while ($lg -lt $lb.Length) { $k = $lfs.Read($lb, $lg, $lb.Length - $lg); if ($k -le 0) { break }; $lg += $k }
+        }
+        finally { $lfs.Dispose() }
+        $txt = [Text.Encoding]::UTF8.GetString($lb, 0, $lg)
+        $cut = $txt.LastIndexOf("`n")
+        if ($cut -lt 0) { return $null }
+        $script:ledgerOffset += $utf8.GetByteCount($txt.Substring(0, $cut + 1))
+        foreach ($line in ($txt.Substring(0, $cut) -split "`n")) {
+            if (-not $line.Trim()) { continue }
+            try { $e = $line | ConvertFrom-Json } catch { continue }
+            $at = ConvertTo-UtcInstant $e.at
+            if ($null -eq $at -or $at -lt $script:windowStart) { continue }
+            if ([string]$e.event -eq 'unguarded') { return "unguarded ledger event ticket=$($e.ticket)" }
+            if ([string]$e.event -eq 'admit' -and ([string]$e.class -ne 'shared' -or $e.wholeMachine -eq $true)) { return "exclusive-admit ticket=$($e.ticket) class=$($e.class)" }
+        }
+    }
+    catch { }
+    return $null
+}
+
+function Get-ReceiptFinding {
+    # A NEW receipt file (not in the start-of-window baseline), whatever time its name carries, read until it parses: wholeMachine true or
+    # class != shared. A name is marked seen only after it parsed; after 200 failed reads it is given up on.
+    if (-not (Test-Path -LiteralPath $script:receiptDir -PathType Container)) { return $null }
+    foreach ($rf in [IO.Directory]::GetFiles($script:receiptDir, '*.json')) {
+        $nm = [IO.Path]::GetFileName($rf)
+        if ($script:knownReceipts.Contains($nm)) { continue }
+        $rc = $null
+        try { $rc = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json } catch { $rc = $null }
+        if ($null -eq $rc) {
+            $script:receiptTries[$nm] = [int]$script:receiptTries[$nm] + 1
+            if ($script:receiptTries[$nm] -ge 200) { [void]$script:knownReceipts.Add($nm) }
+            continue
+        }
+        [void]$script:knownReceipts.Add($nm)
+        if ($rc.wholeMachine -eq $true) { return "exclusive-admit receipt=$nm wholeMachine=true" }
+        if ($rc.class -and [string]$rc.class -ne 'shared') { return "exclusive-admit receipt=$nm class=$($rc.class)" }
+    }
+    return $null
+}
+
+# ---- preflight: nothing in this part writes anything (a refusal leaves at most the empty <switch>.lock file) -----------------
 $createdNew = $false
 $mutex = $null
 try { $mutex = [Threading.Mutex]::new($true, $MutexName, [ref]$createdNew) } catch { Write-Refused "mutex-unavailable ($($_.Exception.GetType().Name))" }
 if (-not $createdNew) { Write-Refused 'driver-running' }
 
+# The files this driver WRITES (the switch and its lock / temp names, the window dir) must never be, or lie under, anything it only READS
+# (adversary r2 A7): a SwitchPath pointed into the HeavySlot dir would overwrite heavy-slot itself.
+$readOnlyInputs = @($HeavySlotDir, $FastSuitesPath, $CoreTempFeed, $MemoryProbeFile, $EventProbeFile, $DiskProbeFile) | Where-Object { $_ }
+foreach ($ro in $readOnlyInputs) {
+    foreach ($w in @($SwitchPath, ($SwitchPath + '.lock'), $WindowDir)) {
+        if (Test-PathInside $w $ro) { Write-Refused "path-overlap ($w is, or lies under, the read-only input $ro)" }
+    }
+}
+if (Test-PathInside $SwitchPath $WindowDir) { Write-Refused "path-overlap (the switch $SwitchPath lies under the window dir $WindowDir)" }
+
+# ONE live driver per SWITCH, whatever -MutexName says: an exclusive lock file beside the switch is held for the life of the process
+# (adversary r2 A10). It is never removed; a refusal leaves it as an empty file.
+$script:switchLock = $null
+try {
+    $lockDir = Split-Path -Parent $SwitchPath
+    if ($lockDir) { New-Item -ItemType Directory -Path $lockDir -Force | Out-Null }
+    $script:switchLock = [IO.File]::Open(($SwitchPath + '.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+}
+catch { Write-Refused "driver-running (the switch lock $SwitchPath.lock is held by another driver, or cannot be taken: $($_.Exception.GetType().Name))" }
+
 $self = Get-Process -Id $PID
 $script:selfTicks = $self.StartTime.ToUniversalTime().Ticks
 $script:windowStart = [DateTime]::UtcNow
 $script:windowEnd = $script:windowStart.AddHours($Hours)
-$exit = 0
 $final = $null
 $switchTouched = $false
+$blockIndex = -1
+$nSamples = 0
 try {
-    # An existing switch file is reverted first (a rewrite, never a removal). Only this driver, mutex owner, may do it.
-    if (Test-Path -LiteralPath $SwitchPath -PathType Leaf) {
-        try { Set-Switch 'REVERTED' 1 -1 } catch { Write-Refused "switch-revert-failed ($($_.Exception.GetType().Name))" }
+    try {
+        # An existing switch file is reverted first (a rewrite, never a removal). Only this driver, owner of mutex and lock, may do it.
+        if (Test-Path -LiteralPath $SwitchPath -PathType Leaf) {
+            try { Set-Switch 'REVERTED' 1 -1 } catch { Write-Refused "switch-revert-failed ($($_.Exception.GetType().Name))" }
+        }
+        $pinActual = 'missing'
+        $hsCli = Join-Path (Join-Path $HeavySlotDir 'bin') 'heavy-slot.ps1'
+        if (Test-Path -LiteralPath $hsCli -PathType Leaf) { $pinActual = (Get-FileHash -LiteralPath $hsCli -Algorithm SHA256).Hash.ToLowerInvariant() }
+        if ($pinActual -ne $PinSha.Trim().ToLowerInvariant()) { Write-Refused "heavy-slot-sha-mismatch actual=$pinActual" }
+        $fsText = if (Test-Path -LiteralPath $FastSuitesPath -PathType Leaf) { [IO.File]::ReadAllText($FastSuitesPath) } else { '' }
+        if ($fsText -notmatch '(?m)^[^\r\n]*HEAVY_SLOT_AB_READER v1') { Write-Refused 'fast-suites-reader-marker-missing' }
+        $feed0 = @(Read-Feed)
+        if ($feed0.Count -eq 0) { Write-Refused 'feed-unreadable' }
+        $feedAge0 = ([DateTime]::UtcNow - $feed0[-1].utc).TotalSeconds
+        if ($feedAge0 -gt $PreflightFeedSeconds) { Write-Refused ('feed-stale age={0:N0}s' -f $feedAge0) }
+        $mem0 = Get-MemoryProbe
+        if ($null -eq $mem0.commit -or $mem0.commit -lt $PreflightCommitGB) { Write-Refused "low-commit free=$($mem0.commit)GB" }
+        $disk0 = Get-DiskProbe
+        if ($null -eq $disk0 -or $disk0 -lt $MinFreeDiskGiB) { Write-Refused "low-disk free=${disk0}GiB" }
+        # One directory holds ONE window: the three streams are append-only, so a directory that already holds one would blend two windows
+        # into one evaluation (adversary r1 A1).
+        foreach ($leftover in 'ab-blocks.jsonl', 'ab-samples.jsonl', 'ab-receipt.json') {
+            if (Test-Path -LiteralPath (Join-Path $WindowDir $leftover)) { Write-Refused "window-dir-used ($leftover already exists in $WindowDir; give each window its own directory)" }
+        }
     }
-    $pinActual = 'missing'
-    $hsCli = Join-Path (Join-Path $HeavySlotDir 'bin') 'heavy-slot.ps1'
-    if (Test-Path -LiteralPath $hsCli -PathType Leaf) { $pinActual = (Get-FileHash -LiteralPath $hsCli -Algorithm SHA256).Hash.ToLowerInvariant() }
-    if ($pinActual -ne $PinSha.Trim().ToLowerInvariant()) { Write-Refused "heavy-slot-sha-mismatch actual=$pinActual" }
-    $fsText = if (Test-Path -LiteralPath $FastSuitesPath -PathType Leaf) { [IO.File]::ReadAllText($FastSuitesPath) } else { '' }
-    if ($fsText -notmatch '(?m)^[^\r\n]*HEAVY_SLOT_AB_READER v1') { Write-Refused 'fast-suites-reader-marker-missing' }
-    $feed0 = @(Read-Feed)
-    if ($feed0.Count -eq 0) { Write-Refused 'feed-unreadable' }
-    $feedAge0 = ([DateTime]::UtcNow - $feed0[-1].utc).TotalSeconds
-    if ($feedAge0 -gt $PreflightFeedSeconds) { Write-Refused ('feed-stale age={0:N0}s' -f $feedAge0) }
-    $mem0 = Get-MemoryProbe
-    if ($null -eq $mem0.commit -or $mem0.commit -lt $PreflightCommitGB) { Write-Refused "low-commit free=$($mem0.commit)GB" }
-    $disk0 = Get-DiskProbe
-    if ($null -eq $disk0 -or $disk0 -lt $MinFreeDiskGiB) { Write-Refused "low-disk free=${disk0}GiB" }
-    # One directory holds ONE window: the three streams are append-only, so a directory that already holds one would blend two windows
-    # into one evaluation (adversary r1 A1).
-    foreach ($leftover in 'ab-blocks.jsonl', 'ab-samples.jsonl', 'ab-receipt.json') {
-        if (Test-Path -LiteralPath (Join-Path $WindowDir $leftover)) { Write-Refused "window-dir-used ($leftover already exists in $WindowDir; give each window its own directory)" }
+    catch {
+        # any preflight read that fails (a locked file, a bad path) is a refusal, never an abort of a window that has not started (adversary r2 A5)
+        Write-Refused ("preflight-failed ($($_.Exception.GetType().Name)): $($_.Exception.Message)")
     }
     New-Item -ItemType Directory -Path $WindowDir -Force | Out-Null
-    $swDir = Split-Path -Parent $SwitchPath
-    if ($swDir) { New-Item -ItemType Directory -Path $swDir -Force | Out-Null }
 
-    # ---- window -------------------------------------------------------------------------------------------------------------
+    # ---- window: the ledger / receipt BASELINES are taken first, then the clock starts, so nothing appended in between can be missed
+    # (adversary r2 A3; events older than the start are still filtered out by their own timestamp) ---------------------------------------
+    $script:ledgerPath = Join-Path $HeavySlotDir 'ledger.jsonl'
+    $script:ledgerOffset = if (Test-Path -LiteralPath $script:ledgerPath) { (Get-Item -LiteralPath $script:ledgerPath).Length } else { 0 }
+    $script:receiptDir = Join-Path $HeavySlotDir 'receipts'
+    $script:knownReceipts = New-Object 'System.Collections.Generic.HashSet[string]'
+    if (Test-Path -LiteralPath $script:receiptDir -PathType Container) { foreach ($rf0 in [IO.Directory]::GetFiles($script:receiptDir, '*.json')) { [void]$script:knownReceipts.Add([IO.Path]::GetFileName($rf0)) } }
     $script:windowStart = [DateTime]::UtcNow
     $script:windowEnd = $script:windowStart.AddHours($Hours)
     $blockLen = [TimeSpan]::FromMinutes($BlockMinutes)
-    $blockIndex = -1
     $blockState = ''
-    $nextEdge = $script:windowStart
-    $ledgerPath = Join-Path $HeavySlotDir 'ledger.jsonl'
-    $ledgerOffset = if (Test-Path -LiteralPath $ledgerPath) { (Get-Item -LiteralPath $ledgerPath).Length } else { 0 }
-    $receiptDir = Join-Path $HeavySlotDir 'receipts'
-    # Receipts: the names present at window start are the baseline. Any NEW name is read, whatever time its name carries (a ticket that
-    # queued before the window still writes its receipt when it finishes inside it, adversary r1 A5), and is retried until it parses
-    # (a half-written receipt must not be marked seen, A4); after 200 failed reads of one name it is given up on.
-    $knownReceipts = New-Object 'System.Collections.Generic.HashSet[string]'
-    $receiptTries = @{}
-    if (Test-Path -LiteralPath $receiptDir -PathType Container) { foreach ($rf0 in [IO.Directory]::GetFiles($receiptDir, '*.json')) { [void]$knownReceipts.Add([IO.Path]::GetFileName($rf0)) } }
     $lastRowUtc = $script:windowStart
     $rowWin = New-Object System.Collections.Generic.List[object]
     $prevRowUtc = $null
@@ -301,26 +393,30 @@ try {
     $badMem = 0
     $badEvent = 0
     $nextEventCheck = $script:windowStart
-    $nSamples = 0
     Write-Output ("AB_DRIVER start={0} end={1} hours={2} blockMinutes={3} pollSeconds={4} switch={5}" -f (Get-IsoUtc $script:windowStart), (Get-IsoUtc $script:windowEnd), $Hours, $BlockMinutes, $PollSeconds, $SwitchPath)
 
     while ($true) {
         $now = [DateTime]::UtcNow
-        # block edge: rewrite the switch atomically and log the block
-        if ($now -ge $nextEdge -and $now -lt $script:windowEnd) {
-            $blockIndex++
+        if ($now -ge $script:windowEnd) { break }
+        # The block that is due NOW (by the clock, not "the next one"): a slow poll skips whole blocks instead of running a schedule that
+        # lags the state actually applied (adversary r2 A2). The row's startUtc is the moment the state was really applied.
+        $due = [int][Math]::Floor(($now - $script:windowStart).TotalSeconds / $blockLen.TotalSeconds)
+        if ($due -gt $blockIndex) {
+            $blockIndex = $due
             $blockState = if ($blockIndex % 2 -eq 0) { 'A' } else { 'B' }
             $cnt = if ($blockState -eq 'B') { 2 } else { 1 }
             Set-Switch $blockState $cnt $blockIndex
             $switchTouched = $true
-            $blockEnd = $nextEdge.Add($blockLen); if ($blockEnd -gt $script:windowEnd) { $blockEnd = $script:windowEnd }
-            Add-JsonLine $blocksFile ([ordered]@{ utc = (Get-IsoUtc $now); block = $blockIndex; state = $blockState; count = $cnt; startUtc = (Get-IsoUtc $nextEdge); endUtc = (Get-IsoUtc $blockEnd); windowStartUtc = (Get-IsoUtc $script:windowStart); windowEndUtc = (Get-IsoUtc $script:windowEnd) })
-            Write-Output ("AB_BLOCK block={0} state={1} count={2} utc={3}" -f $blockIndex, $blockState, $cnt, (Get-IsoUtc $now))
-            $nextEdge = $nextEdge.Add($blockLen)
+            $appliedAt = [DateTime]::UtcNow
+            $schedStart = $script:windowStart.AddTicks($blockLen.Ticks * $blockIndex)
+            $blockEnd = $schedStart.Add($blockLen); if ($blockEnd -gt $script:windowEnd) { $blockEnd = $script:windowEnd }
+            Add-JsonLine $blocksFile ([ordered]@{ utc = (Get-IsoUtc $appliedAt); block = $blockIndex; state = $blockState; count = $cnt; startUtc = (Get-IsoUtc $appliedAt); scheduledStartUtc = (Get-IsoUtc $schedStart); endUtc = (Get-IsoUtc $blockEnd); windowStartUtc = (Get-IsoUtc $script:windowStart); windowEndUtc = (Get-IsoUtc $script:windowEnd) })
+            Write-Output ("AB_BLOCK block={0} state={1} count={2} utc={3}" -f $blockIndex, $blockState, $cnt, (Get-IsoUtc $appliedAt))
         }
-        if ($now -ge $script:windowEnd) { break }
 
         # ---- sample ----------------------------------------------------------------------------------------------------------
+        if ($ProbeDelaySeconds -gt 0) { Start-Sleep -Milliseconds ([int]($ProbeDelaySeconds * 1000)) }   # test seam: slow probes
+        $now = [DateTime]::UtcNow
         $holders = @(Get-LiveHolders)
         $rows = @(Read-Feed)
         $newRows = @($rows | Where-Object { $_.utc -gt $lastRowUtc })
@@ -382,67 +478,34 @@ try {
         if (-not $why) {
             if (@($holders | Where-Object { $_.whole -or ($_.cls -and $_.cls -ne 'shared') }).Count -gt 0) { $why = 'exclusive-admit (a live holder is class != shared or wholeMachine)' }
         }
-        if (-not $why -and (Test-Path -LiteralPath $ledgerPath)) {
-            try {
-                $lfs = [IO.File]::Open($ledgerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
-                try {
-                    if ($lfs.Length -lt $ledgerOffset) { $ledgerOffset = 0 }
-                    [void]$lfs.Seek($ledgerOffset, [IO.SeekOrigin]::Begin)
-                    $lb = New-Object byte[] ([int]($lfs.Length - $ledgerOffset))
-                    $lg = 0
-                    while ($lg -lt $lb.Length) { $k = $lfs.Read($lb, $lg, $lb.Length - $lg); if ($k -le 0) { break }; $lg += $k }
-                }
-                finally { $lfs.Dispose() }
-                $txt = [Text.Encoding]::UTF8.GetString($lb, 0, $lg)
-                $cut = $txt.LastIndexOf("`n")
-                if ($cut -ge 0) {
-                    $ledgerOffset += $utf8.GetByteCount($txt.Substring(0, $cut + 1))
-                    foreach ($line in ($txt.Substring(0, $cut) -split "`n")) {
-                        if (-not $line.Trim()) { continue }
-                        try { $e = $line | ConvertFrom-Json } catch { continue }
-                        $at = ConvertTo-UtcInstant $e.at
-                        if ($null -eq $at -or $at -lt $script:windowStart) { continue }
-                        if ([string]$e.event -eq 'unguarded') { $why = "unguarded ledger event ticket=$($e.ticket)"; break }
-                        if ([string]$e.event -eq 'admit' -and ([string]$e.class -ne 'shared' -or $e.wholeMachine -eq $true)) { $why = "exclusive-admit ticket=$($e.ticket) class=$($e.class)"; break }
-                    }
-                }
-            }
-            catch { }
-        }
-        if (-not $why -and (Test-Path -LiteralPath $receiptDir -PathType Container)) {
-            foreach ($rf in [IO.Directory]::GetFiles($receiptDir, '*.json')) {
-                $nm = [IO.Path]::GetFileName($rf)
-                if ($knownReceipts.Contains($nm)) { continue }
-                $rc = $null
-                try { $rc = Get-Content -LiteralPath $rf -Raw | ConvertFrom-Json } catch { $rc = $null }
-                if ($null -eq $rc) {
-                    $receiptTries[$nm] = [int]$receiptTries[$nm] + 1
-                    if ($receiptTries[$nm] -ge 200) { [void]$knownReceipts.Add($nm) }
-                    continue
-                }
-                [void]$knownReceipts.Add($nm)   # marked seen only after it PARSED
-                if ($rc.wholeMachine -eq $true) { $why = "exclusive-admit receipt=$nm wholeMachine=true"; break }
-                if ($rc.class -and [string]$rc.class -ne 'shared') { $why = "exclusive-admit receipt=$nm class=$($rc.class)"; break }
-            }
-        }
+        if (-not $why) { $why = Get-LedgerFinding }
+        if (-not $why) { $why = Get-ReceiptFinding }
         if ($why) { $final = @{ state = 'ABORTED'; reason = $why }; break }
 
         # sleep to the next poll, never past the next block edge or the window end
         $sleepMs = $PollSeconds * 1000.0
+        $nextEdge = $script:windowStart.AddTicks($blockLen.Ticks * ($blockIndex + 1))
         $toEdge = (($nextEdge - [DateTime]::UtcNow).TotalMilliseconds)
         $toEnd = (($script:windowEnd - [DateTime]::UtcNow).TotalMilliseconds)
         $sleepMs = [Math]::Min($sleepMs, [Math]::Min($toEdge, $toEnd))
         if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Ceiling($sleepMs)) }
     }
-    if (-not $final) { $final = @{ state = 'DONE'; reason = 'window-complete' } }
+    if (-not $final) {
+        # The window ran out: one last sweep of the ledger and the receipts, so an unguarded event or an exclusive admit that landed after
+        # the final poll still ends the window as ABORTED (adversary r2 A3).
+        $late = Get-LedgerFinding
+        if (-not $late) { $late = Get-ReceiptFinding }
+        $final = if ($late) { @{ state = 'ABORTED'; reason = $late } } else { @{ state = 'DONE'; reason = 'window-complete' } }
+    }
 }
 catch {
     if (-not $final) { $final = @{ state = 'ABORTED'; reason = ('driver-exception: ' + $_.Exception.Message) } }
 }
 finally {
     # Every exit path: the switch goes back to count 1 first (an atomic rewrite, 5 tries, then read back to PROVE it), then the receipt is
-    # written, then the mutex is released. A revert that cannot be proven is recorded as REVERT_FAILED and exits 4, never as REVERTED
-    # (adversary r1 A9); the reader still answers 1 once this process is gone, because the driver pid it checks no longer exists.
+    # written, then the mutex and the switch lock are released. A revert that cannot be proven is recorded as REVERT_FAILED and exits 4 on
+    # EVERY path, a refusal included (an `exit` in a finally replaces the pending exit code); the reader still answers 1 once this
+    # process is gone, because the driver pid it checks no longer exists.
     $revertFailed = $false
     $revertWhy = ''
     if ($switchTouched -or (Test-Path -LiteralPath $SwitchPath -PathType Leaf)) {
@@ -472,7 +535,8 @@ finally {
     }
     if ($final) { Write-Output ("AB_{0} reason={1}" -f $(if ($final.state -eq 'DONE') { 'DONE' } else { 'ABORT' }), $final.reason) }
     if ($mutex) { try { $mutex.ReleaseMutex() } catch { }; $mutex.Dispose() }
+    if ($script:switchLock) { $script:switchLock.Dispose() }
+    if ($revertFailed) { exit 4 }
 }
-if ($revertFailed) { exit 4 }
 if ($final -and $final.state -eq 'ABORTED') { exit 3 }
 exit 0

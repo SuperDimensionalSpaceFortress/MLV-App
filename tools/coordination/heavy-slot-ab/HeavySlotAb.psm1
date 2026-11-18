@@ -40,6 +40,7 @@ function Get-HeavySlotAbStatus {
         }
         $end = & $toUtc $o.endUtc
         $start = & $toUtc $o.windowStartUtc
+        if ($Now.ToUniversalTime() -lt $start) { return (& $fail 'not-started') }   # a clock stepped back must not enable a window that has not begun
         if ($Now.ToUniversalTime() -ge $end) { return (& $fail 'expired') }
         if ($end -le $start -or ($end - $start) -gt [TimeSpan]::FromHours(25)) { return (& $fail 'window-over-25h') }
         if (-not ($o.driverPid -is [int] -or $o.driverPid -is [long]) -or [long]$o.driverPid -lt 1) { return (& $fail 'driver-pid') }

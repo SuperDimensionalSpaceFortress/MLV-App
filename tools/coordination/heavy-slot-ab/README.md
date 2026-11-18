@@ -90,6 +90,21 @@ Verdict (every threshold is printed in the json):
 * **Per hold.** The evaluator writes `ab-holds.jsonl` (one row per live closed hold: wait, hold, peak live holders, hottest and mean temp, median frequency)
   and `holds_by_holders` in the verdict (holders_1 / holders_2_plus / holders_unknown, per arm and overall). An exit that landed after window end + grace is a dead holder.
 
+## Rules the adversary pass added (r2)
+
+* **One driver per switch.** Besides the named mutex, the driver holds an exclusive lock file `<SwitchPath>.lock` for its whole life (never removed), so a second
+  driver with another `-MutexName` but the same switch is refused. A refusal leaves at most that empty lock file.
+* **Read-only means read-only.** The switch, its lock and the window dir may not be, or lie under, the HeavySlot dir or any input the driver only reads (`path-overlap`);
+  the evaluator refuses a window dir under the HeavySlot dir (`AB_EVAL_REFUSED`).
+* **Preflight failures are refusals.** A locked or unreadable input is `preflight-failed` (exit 2), never an abort; a refusal whose revert cannot be proven exits 4.
+* **No gap at the edges.** The ledger and receipt baselines are taken before the window clock starts, and one last sweep runs after the final poll.
+* **The blocks log is what was applied.** Each tick applies the block due NOW by the clock (a slow poll skips blocks); a row's `startUtc` is the moment the state was applied
+  and the evaluator attributes by those moments (a block lasts until the next one was applied).
+* **Evaluator hygiene.** Block rows need an integer `block`, state A or B and parseable times, else `AB_EVAL_NO_INPUT` (exit 2); unparseable sample fields read as unknown;
+  any other error is `AB_EVAL_ERROR` (exit 3); a receipt that closed after window end + grace is a dead holder even without a ledger admit row;
+  each sample stands for at most the time left to window end.
+* **Reader.** A switch whose window has not started is count 1 (a clock stepped back); the file is read with delete sharing.
+
 ## Known limits
 
 * The slot-1 object is not keeper-owned during the window (`HeavySlot-KeepObjects` keeps slot 0 only), so every heavy-slot run in a

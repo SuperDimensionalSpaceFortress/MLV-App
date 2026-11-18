@@ -98,6 +98,8 @@ def test_reader_returns_2_only_for_a_valid_live_b_window(tmp_path, me):
         "wrong-schema": (switch_doc(me, schema="heavy-slot-ab.v2"), 1),
         "lowercase-state": (switch_doc(me, state="b"), 1),
         "expired": (switch_doc(me, windowStartUtc=iso(now - timedelta(hours=2)), endUtc=iso(now - timedelta(seconds=5))), 1),
+        # adversary r2 A8: a live B driver whose window has not begun (a clock stepped back) must not enable count 2
+        "not-started": (switch_doc(me, windowStartUtc=iso(now + timedelta(hours=1)), endUtc=iso(now + timedelta(hours=2))), 1),
         "window-over-25h": (switch_doc(me, windowStartUtc=iso(now - timedelta(hours=1)), endUtc=iso(now + timedelta(hours=24, minutes=1))), 1),
         "end-before-start": (switch_doc(me, windowStartUtc=iso(now + timedelta(hours=2)), endUtc=iso(now + timedelta(hours=1))), 1),
         "driver-dead": (switch_doc(me, driverPid=me["dead_pid"]), 1),
@@ -217,19 +219,19 @@ class World:
         with open(self.hs / "ledger.jsonl", "a", encoding="ascii") as fh:
             fh.write(json.dumps(row) + "\n")
 
-    def args(self, hours, block_minutes, extra=()):
+    def args(self, hours, block_minutes, extra=(), poll=POLL):
         return [
             PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(DRIVER),
-            "-WindowDir", str(self.window), "-Hours", str(hours), "-BlockMinutes", str(block_minutes), "-PollSeconds", str(POLL),
+            "-WindowDir", str(self.window), "-Hours", str(hours), "-BlockMinutes", str(block_minutes), "-PollSeconds", str(poll),
             "-SwitchPath", str(self.switch), "-HeavySlotDir", str(self.hs), "-CoreTempFeed", str(self.feed_path),
             "-MemoryProbeFile", str(self.memory), "-EventProbeFile", str(self.event), "-DiskProbeFile", str(self.disk),
             "-FastSuitesPath", str(self.fast), "-PinSha", self.pin, "-MutexName", self.mutex, "-NoPerfProbe", *extra,
         ]
 
-    def start(self, hours, block_minutes, extra=()):
+    def start(self, hours, block_minutes, extra=(), poll=POLL):
         out = open(self.stdout, "ab")
         err = open(self.stderr, "ab")
-        return subprocess.Popen(self.args(hours, block_minutes, extra), stdout=out, stderr=err)
+        return subprocess.Popen(self.args(hours, block_minutes, extra, poll), stdout=out, stderr=err)
 
     def text(self):
         return self.stdout.read_text(errors="replace") + self.stderr.read_text(errors="replace")
@@ -990,4 +992,190 @@ def test_a_reader_that_keeps_opening_the_switch_never_ends_the_window(tmp_path, 
         assert reads[0] > 100, "the reader must really have been busy"
     finally:
         stop.set()
+        w.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# adversary pass r2 (cdb24411): one test per finding, fed the finding's own input
+# ---------------------------------------------------------------------------------------------------------------------------
+def _append_sample(win: Path, row: dict):
+    with open(win / "ab-samples.jsonl", "a", encoding="ascii") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def test_r2_A1_a_receipt_that_closed_after_the_grace_is_dead_even_without_a_ledger_admit_row(tmp_path):
+    win, hs = build_window(tmp_path, "norow")
+    end = block_start(N_BLOCKS)
+    rec = {"ticket": "late1", "label": "mlv:LATE:build", "class": "shared", "wholeMachine": False, "slotCount": 1, "slots": [0], "enqueuedAt": iso7(end - timedelta(minutes=5)),
+           "admittedAt": iso7(end - timedelta(minutes=1)), "finishedAt": iso7(end + timedelta(minutes=90, seconds=1)), "waitedMs": 240000, "exit": {"source": "child", "code": 0}}
+    (hs / "receipts" / "late1.json").write_text(json.dumps(rec), encoding="ascii")    # no admit and no exit row for it in the ledger at all
+    v, _ = evaluate(tmp_path, "norow", win, hs, now=end + timedelta(hours=2))
+    assert v["dead_holders"]["count"] == 1 and v["dead_holders"]["tickets"] == ["late1"], v["dead_holders"]
+    assert v["arms"]["B"]["build"]["n_closed"] == 15
+    assert not any(json.loads(line)["ticket"] == "late1" for line in (win / "ab-holds.jsonl").read_text(encoding="utf-8").splitlines())
+
+
+def test_r2_A2_the_blocks_log_is_the_state_really_applied_when_the_host_is_slow(tmp_path, me):
+    w = World(tmp_path, "slowhost", me)
+    try:
+        proc = w.start(0.004, 0.02, ["-ProbeDelaySeconds", "2.0"])   # 14.4 s window, 1.2 s blocks, every poll stalls 2 s
+        assert proc.wait(timeout=120) == 0, w.text()
+        rows = w.blocks()
+        assert len(rows) >= 3, rows
+        parse = lambda s: datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+        start = parse(rows[0]["windowStartUtc"])
+        for r in rows:
+            assert abs((parse(r["utc"]) - parse(r["startUtc"])).total_seconds()) < 0.3, f"startUtc must be when the state was applied: {r}"
+            idx = int((parse(r["startUtc"]) - start).total_seconds() // 1.2)
+            assert r["block"] in (idx, idx - 1) and r["state"] == "AB"[r["block"] % 2], r
+        assert [r["block"] for r in rows] == sorted(r["block"] for r in rows)
+    finally:
+        w.close()
+
+
+def test_r2_A2_the_evaluator_attributes_by_when_a_block_was_applied_not_by_the_schedule(tmp_path):
+    win, hs = build_window(tmp_path, "latehost")
+    rows = [json.loads(line) for line in (win / "ab-blocks.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows[1]["startUtc"] = iso(block_start(1) + timedelta(minutes=10))     # block 1 (B) was applied 10 minutes late
+    (win / "ab-blocks.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="ascii")
+    enq = block_start(1) + timedelta(minutes=5)
+    _add_ticket(hs, "lateB", "mlv:LATE:build", enq, enq + timedelta(seconds=20), enq + timedelta(seconds=80))
+    v, _ = evaluate(tmp_path, "latehost", win, hs)
+    holds = {json.loads(line)["ticket"]: json.loads(line) for line in (win / "ab-holds.jsonl").read_text(encoding="utf-8").splitlines()}
+    assert holds["lateB"]["arm"] == "A", "at +5 min block 1 had not been applied yet: the state in force was A"
+    assert holds["lateB"]["block"] == 0
+    # every B ticket enqueued in block 1's first 4.5 min now belongs to the A that was really in force (5 builds), plus lateB itself
+    assert v["arms"]["A"]["build"]["n_closed"] == 21 and v["arms"]["B"]["build"]["n_closed"] == 10
+
+
+def test_r2_A3_an_unguarded_event_after_the_last_poll_still_ends_the_window_aborted(tmp_path, me):
+    w = World(tmp_path, "lateevent", me)
+    try:
+        proc = w.start(0.004, 0.2, poll=5)     # polls at ~0, 5, 10 s; the window ends at 14.4 s
+        assert _wait(lambda: w.blocks(), 60)
+        end = datetime.strptime(w.blocks()[0]["windowEndUtc"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+        assert _wait(lambda: datetime.now(UTC) >= end - timedelta(seconds=1.6), 60)
+        w.append_ledger({"at": iso(datetime.now(UTC)), "event": "unguarded", "ticket": "late-u", "label": "mlv:X:build", "reason": "t"})
+        assert proc.wait(timeout=60) == 3, w.text()
+        assert w.receipt()["state"] == "ABORTED" and w.receipt()["reason"].startswith("unguarded"), w.receipt()
+        assert w.switch_doc()["state"] == "REVERTED"
+    finally:
+        w.close()
+
+
+def test_r2_A4_a_refusal_whose_revert_cannot_be_proven_exits_4_not_2(tmp_path, me):
+    w = World(tmp_path, "refuserevert", me)
+    holder = None
+    try:
+        w.switch.write_text(json.dumps(switch_doc(me)), encoding="ascii")    # a live count-2 switch left by something else
+        holder = open(w.switch, "rb")                                        # and a reader that will not let go
+        out = subprocess.run(w.args(0.05, 0.05), capture_output=True, text=True, timeout=120)
+        holder.close()
+        holder = None
+        assert out.returncode == 4, (out.returncode, out.stdout, out.stderr)
+        assert "AB_REVERT_FAILED" in out.stdout and "AB_REFUSED" in out.stdout
+        assert not w.window.exists()
+    finally:
+        if holder:
+            holder.close()
+        w.close()
+
+
+def _lock_exclusively(path: Path):
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    handle = k32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)    # GENERIC_READ, share mode 0 (nothing), OPEN_EXISTING
+    assert handle not in (None, wintypes.HANDLE(-1).value), "could not lock the file for the test"
+    return lambda: k32.CloseHandle(handle)
+
+
+@pytest.mark.parametrize("which", ["fast-suites", "heavy-slot-cli"])
+def test_r2_A5_a_preflight_read_that_fails_is_a_refusal_not_an_abort(tmp_path, me, which):
+    w = World(tmp_path, "locked-" + which, me)
+    release = None
+    try:
+        target = w.fast if which == "fast-suites" else w.hs / "bin" / "heavy-slot.ps1"
+        release = _lock_exclusively(target)
+        out = subprocess.run(w.args(0.05, 0.05), capture_output=True, text=True, timeout=120)
+        release()
+        release = None
+        assert out.returncode == 2 and "AB_REFUSED reason=preflight-failed" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert not w.window.exists() and not w.switch.exists()
+    finally:
+        if release:
+            release()
+        w.close()
+
+
+def test_r2_A6_unparseable_block_rows_are_no_input_and_unparseable_samples_are_skipped(tmp_path):
+    for name, row in (("blockx", {"block": "x", "state": "A", "startUtc": iso(T0), "endUtc": iso(block_start(1)), "windowStartUtc": iso(T0), "windowEndUtc": iso(block_start(6))}),
+                      ("statec", {"block": 0, "state": "C", "startUtc": iso(T0), "endUtc": iso(block_start(1)), "windowStartUtc": iso(T0), "windowEndUtc": iso(block_start(6))})):
+        win, hs = build_window(tmp_path, name)
+        (win / "ab-blocks.jsonl").write_text(json.dumps(row) + "\n", encoding="ascii")
+        out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / name / "event.txt")])
+        assert out.returncode == 2 and "AB_EVAL_NO_INPUT" in out.stdout, (name, out.returncode, out.stdout, out.stderr)
+    win, hs = build_window(tmp_path, "badsample")
+    _append_sample(win, {"utc": iso(block_start(1) + timedelta(minutes=1, seconds=30)), "block": 1, "state": "B", "holders": "x", "temp_c": "hot", "cpu_pct": 60.0, "freq_mhz": 4400.0})
+    _append_sample(win, {"utc": "not-a-date", "holders": 2})
+    v, _ = evaluate(tmp_path, "badsample", win, hs)
+    assert v["verdict"] == "ADOPT", v
+
+
+def test_r2_A7_the_driver_never_writes_over_what_it_only_reads(tmp_path, me):
+    w = World(tmp_path, "overlap", me)
+    try:
+        cli = w.hs / "bin" / "heavy-slot.ps1"
+        before = cli.read_bytes()
+        args = w.args(0.05, 0.05)
+        args[args.index("-SwitchPath") + 1] = str(cli)
+        out = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=path-overlap" in out.stdout, (out.returncode, out.stdout, out.stderr)
+        assert cli.read_bytes() == before, "heavy-slot.ps1 was overwritten"
+        args = w.args(0.05, 0.05)
+        args[args.index("-WindowDir") + 1] = str(w.hs / "window")
+        out = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        assert out.returncode == 2 and "AB_REFUSED reason=path-overlap" in out.stdout and not (w.hs / "window").exists(), (out.stdout, out.stderr)
+    finally:
+        w.close()
+
+
+def test_r2_A7_the_evaluator_refuses_a_window_dir_under_the_heavy_slot_dir(tmp_path):
+    win, hs = build_window(tmp_path, "evaloverlap")
+    for item in win.iterdir():
+        shutil.copy(item, hs / item.name)
+    out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(hs), "-HeavySlotDir", str(hs), "-SkipHeadroom"])
+    assert out.returncode == 2 and "AB_EVAL_REFUSED" in out.stdout, (out.returncode, out.stdout, out.stderr)
+    assert not (hs / "ab-verdict.json").exists() and not (hs / "ab-holds.jsonl").exists()
+
+
+def test_r2_A9_the_holders_minutes_never_run_past_the_window_end(tmp_path):
+    win, hs = build_window(tmp_path, "lastsample")
+    receipt = json.loads((win / "ab-receipt.json").read_text(encoding="utf-8"))
+    receipt["pollSeconds"] = 7200.0
+    (win / "ab-receipt.json").write_text(json.dumps(receipt), encoding="ascii")
+    row = {"utc": iso(block_start(N_BLOCKS) - timedelta(seconds=60)), "block": 5, "state": "B", "holders": 2, "temp_c": 80.0, "cpu_pct": 60.0, "freq_mhz": 4400.0, "free_commit_gb": 60.0}
+    (win / "ab-samples.jsonl").write_text(json.dumps(row) + "\n", encoding="ascii")
+    v, _ = evaluate(tmp_path, "lastsample", win, hs)
+    minutes = v["samples_by_live_holders"]["holders_2_plus"]["minutes"]
+    assert 0.9 <= minutes <= 1.01, f"one sample 60 s before the window end stands for 60 s, not {minutes} min"
+
+
+def test_r2_A10_a_second_driver_with_another_mutex_name_but_the_same_switch_is_refused(tmp_path, me):
+    w = World(tmp_path, "sameswitch", me)
+    try:
+        first = w.start(0.2, 0.2)
+        assert _wait(lambda: (w.switch_doc() or {}).get("driverPid") == first.pid, 60), w.text()
+        args = w.args(0.2, 0.2)
+        args[args.index("-WindowDir") + 1] = str(w.root / "window-b")
+        args[args.index("-MutexName") + 1] = "Global\\MLV-HeavySlotAbDriver-other-" + uuid.uuid4().hex[:8]
+        second = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        assert second.returncode == 2 and "AB_REFUSED reason=driver-running" in second.stdout, (second.returncode, second.stdout, second.stderr)
+        assert not (w.root / "window-b").exists()
+        assert (w.switch_doc() or {}).get("driverPid") == first.pid and (w.switch_doc() or {}).get("state") in ("A", "B")
+        (w.window / "ab-stop").write_text("stop", encoding="ascii")
+        assert first.wait(timeout=60) == 3
+    finally:
         w.close()
