@@ -2854,6 +2854,14 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     $ddR2['r4 pass 10 A1 an escaped backslash before an undecodable escape in a key'] = ('{"pass' + $ddBs + $ddBs + 'U0011FFFFord":"hunter2"}')
     $ddR2['r4 pass 10 A2 an escaped line break inside an XML naming value in JSON'] = ('{"xml":"<add key=''pass' + $ddBs + 'nword'' value=''hunter2'' />"}')
     $ddR2['r4 pass 10 A2 sibling: an escaped tab'] = ('{"xml":"<add key=''pass' + $ddBs + 'tword'' value=''hunter2'' />"}')
+    # r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): the YAML whitespace escapes \L \P \v (and the control escapes \a \e) in an XML naming value
+    $ddR2['r5 sol r4 A2 a YAML \L (U+2028) in an XML naming value'] = ('xml: "<add key=''pass' + $ddBs + 'Lword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \P (U+2029) in an element-form pair'] = ('xml: "<entry key=''pass' + $ddBs + 'Pword''>hunter2</entry>"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \v (VT)'] = ('xml: "<add key=''pass' + $ddBs + 'vword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \e (ESC)'] = ('xml: "<add key=''pass' + $ddBs + 'eword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \a (BEL)'] = ('xml: "<add key=''pass' + $ddBs + 'aword'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \_ (NBSP)'] = ('xml: "<add key=''pass' + $ddBs + '_word'' value=''hunter2'' />"')
+    $ddR2['r5 sol r4 A2 sibling: a YAML \L in a JSON string'] = ('{"xml":"<add key=''pass' + $ddBs + 'Lword'' value=''hunter2'' />"}')
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
     foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
@@ -2890,6 +2898,25 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         $ddBs2 = [string][char]92
         Assert-That (Test-CredentialNamePresent ('{"pass' + $ddBs2 + $ddBs2 + 'U0011FFFFord":""}')) 'DENY-BY-DEFAULT-1 r4 pass 10 A1 role guard: an escaped backslash before an undecodable escape names a secret'
         Assert-That (Test-CredentialNamePresent ('{"xml":"<add key=''pass' + $ddBs2 + 'nword'' value='''' />"}')) 'DENY-BY-DEFAULT-1 r4 pass 10 A2 role guard: an escaped line break inside an XML naming value names a secret'
+        # r5 (sol r4 A1, defect class: a check that runs on the fixed point only): an intermediate residual key or table header that a deeper decode destroys keeps the role verdict true.
+        # The generated sweep puts every framing-destroying decode (a blank, a tab, a line break, a double and a single quote, a colon, an equals sign) after the residual.
+        $ddA1Miss = [System.Collections.Generic.List[string]]::new(); $ddA1N = 0
+        foreach ($ddD in @('0020', '0009', '000A', '0022', '0027', '003A', '003D', '002C', '005D')) {
+            $ddA1Keys = @(('{"ab' + $ddBs2 + $ddBs2 + 'U0011FFFF' + $ddBs2 + $ddBs2 + 'u' + $ddD + 'cd":""}'), ('["ab' + $ddBs2 + $ddBs2 + 'U0011FFFF' + $ddBs2 + $ddBs2 + 'u' + $ddD + 'cd"]' + "`n" + 'x=""'), ('<add key=''ab' + $ddBs2 + $ddBs2 + 'U0011FFFF' + $ddBs2 + $ddBs2 + 'u' + $ddD + 'cd'' value='''' />'))
+            foreach ($ddT in $ddA1Keys) { $ddA1N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA1Miss.Add($ddT) } }
+        }
+        Assert-That ($ddA1Miss.Count -eq 0 -and $ddA1N -eq 27) "DENY-BY-DEFAULT-1 r5 sol r4 A1 role guard: all $ddA1N intermediate residual keys and headers keep a true verdict" ("misses=$($ddA1Miss.Count): " + (($ddA1Miss | Select-Object -First 4) -join '; '))
+        # r5 (sol r4 A2): the YAML whitespace and control escapes in an XML naming value name a secret whatever the value (an empty one included)
+        $ddA2Miss = [System.Collections.Generic.List[string]]::new(); $ddA2N = 0
+        foreach ($ddL in @('L', 'P', 'v', 'e', 'a', '_', ' ')) {
+            foreach ($ddT in @(('xml: "<add key=''pass' + $ddBs2 + $ddL + 'word'' value='''' />"'), ('xml: "<entry key=''pass' + $ddBs2 + $ddL + 'word''></entry>"'), ('{"xml":"<add name=''pass' + $ddBs2 + $ddL + 'word'' value='''' />"}'))) {
+                $ddA2N++; if (-not (Test-CredentialNamePresent $ddT)) { $ddA2Miss.Add($ddT) }
+            }
+        }
+        Assert-That ($ddA2Miss.Count -eq 0 -and $ddA2N -eq 21) "DENY-BY-DEFAULT-1 r5 sol r4 A2 role guard: all $ddA2N YAML-escape XML naming values name a secret" ("misses=$($ddA2Miss.Count): " + (($ddA2Miss | Select-Object -First 4) -join '; '))
+        # must-pass: the new escapes do not make a plain Windows path in a settings file name a secret
+        Assert-That (-not (Test-CredentialNamePresent ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 role guard must-pass: a JSON Windows path with \P \L \a \e \v \_ sequences names no secret'
+        Assert-That (-not (Test-CredentialText ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 must-pass: a JSON Windows path with \P \L sequences is not a credential'
     }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {

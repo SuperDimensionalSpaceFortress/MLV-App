@@ -1595,8 +1595,10 @@ function Get-CredentialXmlAttrPairHitIndex {
             # r4 (sol r3 A1, defect class: a judge that drops the spelling AS WRITTEN once a decode exists): the RAW value is the first candidate ('authheader' is
             # a strong name as written, a plain word decoded); then every level as it is produced (r4 A3: none retained; past the bound the caller refuses typed)
             $v = $attrs[$j].V
-            if (Get-CredentialKeyClass ($v -replace '\s', '')) { $namer = $j; break }
-            $vnf = Get-CredentialNormalForm $v -OnStage { param($lvText, $lvMask) if (Get-CredentialKeyClass ($lvText -replace '\s', '')) { 0 } else { -1 } }
+            # r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): blanks AND control characters are removed first (a decoded
+            # '\L' '\P' '\v' is a blank; a decoded '\a' '\e' '\b' is a control character a reader may drop), so 'pass\Lword' is 'password'
+            if (Get-CredentialKeyClass ($v -replace '[\s\p{Cc}]', '')) { $namer = $j; break }
+            $vnf = Get-CredentialNormalForm $v -OnStage { param($lvText, $lvMask) if (Get-CredentialKeyClass ($lvText -replace '[\s\p{Cc}]', '')) { 0 } else { -1 } }
             if ($vnf.Hit -ge 0 -or $script:CredentialResidualIntroRegex.IsMatch($vnf.Text)) { $namer = $j; break }
         }
         if ($namer -lt 0) { continue }
@@ -1646,10 +1648,13 @@ for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyName
 # r4 (adversary pass 10 A1-A2, defect class: an escape a reader decodes that the normaliser left as written): JSON, YAML, TOML and C also decode the escaped backslash
 # '\\' (so '"pass\\U0011FFFFord"' is the key 'pass\U0011FFFFord', whose undecodable escape is deny by default) and the one-letter escapes '\n' '\t' '\r' '\b' '\f' '\"'
 # ('<add key=''pass\nword'' .../>' inside a JSON string is the naming value 'pass<LF>word', 'password' once its blanks are removed). Each is decoded on its own level.
-$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
+# r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): the rest of the YAML double-quoted escape table is decoded on its own level
+# too: '\v' (VT), '\a' (BEL), '\e' (ESC), '\L' (U+2028) and '\P' (U+2029), '\_' (U+00A0), '\ ' (a blank) and '\<TAB>'. '\0' and '\N' stay undecoded, which the residual rule refuses.
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
 $script:CredentialEntities = @{ 'amp' = '&'; 'lt' = '<'; 'gt' = '>'; 'quot' = '"'; 'apos' = "'" }
 $script:CredentialOneLetterEscapes = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
-foreach ($credOne in @(@('n', "`n"), @('t', "`t"), @('r', "`r"), @('b', [string][char]8), @('f', [string][char]12), @('"', '"'))) { $script:CredentialOneLetterEscapes[$credOne[0]] = $credOne[1] }
+foreach ($credOne in @(@('n', "`n"), @('t', "`t"), @('r', "`r"), @('b', [string][char]8), @('f', [string][char]12), @('"', '"'),
+        @('v', [string][char]11), @('a', [string][char]7), @('e', [string][char]27), @('L', [string][char]0x2028), @('P', [string][char]0x2029), @('_', [string][char]0xA0), @(' ', ' '), @("`t", "`t"))) { $script:CredentialOneLetterEscapes[$credOne[0]] = $credOne[1] }
 # r2: true when the normaliser has anything to do in the text: an escape it decodes changes the text, or an undecodable one is left (deny by default). It is derived from the
 # normaliser itself, so no escape form can be missing from a separate trigger list (pass 3 A3: '&w;' had no trigger and the residual rule never ran).
 function Test-CredentialEscapesPresent([string]$Text) { return ($script:CredentialResidualIntroRegex.IsMatch("$Text") -or ((ConvertFrom-CredentialEscapes $Text) -cne "$Text")) }
@@ -2172,19 +2177,24 @@ function Test-CredentialNamePresent {
         # the same decoder as the content guard. r4 (sol r3 A3): each level is judged as it is produced and dropped; past the bound the text names a secret (deny by default).
         # r4 (adversary pass 9 A1, defect class: a check that runs on the raw text only): EVERY name check runs at every level, the XML naming attribute included
         # (config.toml 'xml = "<add key=''p a s s w o r d'' value='''' />"' has no tag until it is decoded)
-        $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) if ((Test-CredentialNameWordPresent $lvText) -or (Get-CredentialXmlAttrPairHitIndex -Text $lvText -NameOnly) -ge 0) { 0 } else { -1 } }
+        # r5 (sol r4 A1, defect class: a check that runs on the fixed point only): the residual key and residual table header rules run at EVERY level too, as in the content
+        # guard (Get-CredentialHitLine judges every level with -Residual), so a residual that a deeper decode turns into a blank ('ab\\U0011FFFF\\u0020cd') still names a secret
+        $nf = Get-CredentialNormalForm $Text -OnStage { param($lvText, $lvMask) if ((Test-CredentialNameWordPresent $lvText) -or (Get-CredentialXmlAttrPairHitIndex -Text $lvText -NameOnly) -ge 0 -or (Test-CredentialResidualNamePresent $lvText)) { 0 } else { -1 } }
         if ($nf.Hit -ge 0) { return $true }
-        $dec = $nf.Text
-        if ($script:CredentialResidualIntroRegex.IsMatch($dec)) {
-            # DENY-BY-DEFAULT-1 sibling: a key in the decoded copy that still holds an undecodable escape names a secret, as in the content guard (deny by default)
-            if ($script:CredentialResidualKeyRegex.IsMatch($dec)) { return $true }
-            # r1 adversary A7 sibling: a table header ('["pass\U0011FFFFord"]') holding one counts the same
-            foreach ($hm in $script:CredentialTableHeaderRegex.Matches($dec)) { if ($script:CredentialResidualIntroRegex.IsMatch($hm.Groups[1].Value)) { return $true } }
-        }
+        # the fixed point, and a text with no decode level at all (it is its own normal form)
+        if (Test-CredentialResidualNamePresent $nf.Text) { return $true }
     } catch {
         if (Test-CredentialDecodeLimitError $_) { return $true }   # r4 (sol r3 A3): the typed decode-limit refusal, deny by default
         throw
     }
+    return $false
+}
+# DENY-BY-DEFAULT-1 sibling: a key in the (decoded) text that still holds an undecodable escape names a secret, as in the content guard (deny by default), and so does a
+# table header ('["pass\U0011FFFFord"]') holding one (r1 adversary A7 sibling). Called on every decode level and on the fixed point (r5, sol r4 A1).
+function Test-CredentialResidualNamePresent([string]$Text) {
+    if (-not $script:CredentialResidualIntroRegex.IsMatch("$Text")) { return $false }
+    if ($script:CredentialResidualKeyRegex.IsMatch($Text)) { return $true }
+    foreach ($hm in $script:CredentialTableHeaderRegex.Matches($Text)) { if ($script:CredentialResidualIntroRegex.IsMatch($hm.Groups[1].Value)) { return $true } }
     return $false
 }
 # True when a word of the text is secret-named (Get-CredentialKeyClass).
