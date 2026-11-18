@@ -7387,9 +7387,10 @@ function Get-AttrCudaWindowToggleEvidence {
       interaction_trace event=resize.keep_playing ...
     Toggle i is DRIVEN when it has exactly one begin and one end, in log order, the same kind, parseable, and after the previous toggle's end.
     It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both,
-    and the window size changed (end != begin; for fs_off, end != the previous fs_on's end size, which is the state fs_off leaves). It ADVANCED
+    and the window size changed (end != begin; an fs_off must also end at a size other than the preceding fs_on's end, the fullscreen size). It ADVANCED
     when it is driven and position_end > position_begin and presented_serial_end > presented_serial_begin. A duplicate, unordered, missing or
-    unparseable record makes that toggle count for NOTHING (fail closed). Returns requested / driven / keptPlaying / advanced / reason
+    unparseable record (a key repeated inside one record included) makes that toggle count for NOTHING (fail closed). Records are read from the app's
+    record body only: the log prefix and the Qt location suffix are cut first. Returns requested / driven / keptPlaying / advanced / reason
     (reason = ok only when every requested toggle was driven, kept playing and advanced).
     #>
     [CmdletBinding()]
@@ -7399,10 +7400,18 @@ function Get-AttrCudaWindowToggleEvidence {
         [string]$LogText
     )
 
-    $lines = @($LogText -split "`r?`n")
+    # Each run-log line is reduced to the record body the app wrote: the optional `[utc] [LEVEL] [0x<thread>] ` prefix is dropped and the Qt location suffix
+    # (` (<file>:<line>)`, written last; the app's own record bodies here hold no other ` (`) is cut at its first ` (`, so a path in the suffix can never
+    # supply a field or a marker. A record counts only where it STARTS the body. A key that repeats inside one record makes that record unusable.
+    $lines = @($LogText -split "`r?`n" | ForEach-Object {
+        $body = [regex]::Replace($_, '^\s*(?:\[[^\]]*\]\s*)*', '')
+        $cut = $body.IndexOf(' (', [StringComparison]::Ordinal)
+        if ($cut -ge 0) { $body = $body.Substring(0, $cut) }
+        $body
+    })
     $start = 0
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match 'playback_smoke\.measured_session id=') { $start = $i }
+        if ($lines[$i] -match '^playback_smoke\.measured_session id=') { $start = $i }
     }
     $anomalies = [System.Collections.Generic.List[string]]::new()
     $records = @{}
@@ -7412,11 +7421,15 @@ function Get-AttrCudaWindowToggleEvidence {
     $maxIndex = -1
     for ($i = $start; $i -lt $lines.Count; $i++) {
         $line = $lines[$i]
-        if ($line -match 'interaction_trace event=resize\.keep_playing(\s|$)') { $keepLines.Add($i); continue }
-        if ($line -match 'gui_smoke\.window_toggles requested=(?<n>\d+)(\s|$)') { $summaryRequested.Add([int]$Matches['n']); continue }
-        if ($line -notmatch 'gui_smoke\.window_toggle phase=') { continue }
+        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') { $keepLines.Add($i); continue }
+        if ($line -match '^gui_smoke\.window_toggles requested=(?<n>\d{1,6})(\s|$)') { $summaryRequested.Add([int]$Matches['n']); continue }
+        if ($line -notmatch '^gui_smoke\.window_toggle phase=') { continue }
         $values = @{}
-        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) { $values[$match.Groups['key'].Value] = $match.Groups['value'].Value }
+        $repeatedKey = $false
+        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) {
+            if ($values.ContainsKey($match.Groups['key'].Value)) { $repeatedKey = $true }
+            $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
+        }
         [int]$index = -1
         if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0)) {
             $anomalies.Add('unparseable-record-without-index')
@@ -7429,7 +7442,7 @@ function Get-AttrCudaWindowToggleEvidence {
         [long]$elapsed = -1
         $window = $null
         if ($values.ContainsKey('window') -and ([string]$values['window']) -match '^(?<w>\d+)x(?<h>\d+)$') { $window = $Matches['w'] + 'x' + $Matches['h'] }
-        $usable = ($values['phase'] -eq 'begin' -or $values['phase'] -eq 'end') -and
+        $usable = (-not $repeatedKey) -and ($values['phase'] -eq 'begin' -or $values['phase'] -eq 'end') -and
             $values.ContainsKey('kind') -and
             $values.ContainsKey('play_checked') -and [int]::TryParse([string]$values['play_checked'], [ref]$playChecked) -and ($playChecked -eq 0 -or $playChecked -eq 1) -and
             $values.ContainsKey('position') -and [int]::TryParse([string]$values['position'], [ref]$position) -and
@@ -7472,12 +7485,12 @@ function Get-AttrCudaWindowToggleEvidence {
         $driven++
         $keepBetween = 0
         foreach ($k in $keepLines) { if ($k -gt $b.line -and $k -lt $e.line) { $keepBetween++ } }
-        $referenceWindow = $b.window
-        if ($b.kind -eq 'fs_off' -and $null -ne $previousEnd -and $previousKind -eq 'fs_on') { $referenceWindow = $previousEnd.window }
         $problems = [System.Collections.Generic.List[string]]::new()
         if ($keepBetween -lt 1) { $problems.Add('no-keep-playing-between') }
         if ($b.playChecked -ne 1 -or $e.playChecked -ne 1) { $problems.Add('play-not-checked') }
-        if ($e.window -eq $referenceWindow) { $problems.Add('window-size-unchanged') }
+        # the window must end at a size other than it began at; an fs_off must also LEAVE the size the preceding fs_on ended at (the fullscreen size)
+        if ($e.window -eq $b.window) { $problems.Add('window-size-unchanged') }
+        if ($b.kind -eq 'fs_off' -and $null -ne $previousEnd -and $previousKind -eq 'fs_on' -and $e.window -eq $previousEnd.window) { $problems.Add('window-still-fullscreen-size') }
         if ($problems.Count -eq 0) { $kept++ } else { $anomalies.Add("toggle-${t}:" + ($problems -join '+')) }
         if ($e.position -gt $b.position -and $e.serial -gt $b.serial) { $advanced++ } else { $anomalies.Add("toggle-${t}:not-advanced") }
         $previousEndLine = $e.line

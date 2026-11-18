@@ -10940,6 +10940,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                            .arg( QString::fromLatin1( smoke_window_toggle_schedule::kindName( toggle.kind ) ) )
                            .arg( toggleNowMs )
                            .arg( windowToggleSnapshot() );
+                // At most one phase per loop turn: an overdue next toggle begins on the next turn, never in this one.
+                break;
             }
             else
             {

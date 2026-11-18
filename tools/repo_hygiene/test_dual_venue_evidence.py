@@ -1219,10 +1219,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         """VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1: -MidPlayWindowToggles adds MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES to the app's env list exactly once
         and the windowToggles* scalars to the success summary (one region, bracketed); absent, the job is the text it was. The runner maps
         generatorArgs.midPlayWindowToggles true for any leg (outside the forceLookAssist branch); the schema types it as a boolean."""
-        plain = self.generate(GENERATOR, "mpwt-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        windowed = ["-DisplayMode", "windowed"]   # adversary A4: the switch needs a windowed job, and -DisplayMode windowed itself edits the template
+        plain = self.generate(GENERATOR, "mpwt-plain.job.ps1", windowed).read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertNotIn("MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES", plain)
         self.assertNotIn("windowTogglesDriven", plain)
-        job = self.generate(GENERATOR, "mpwt-on.job.ps1", ["-MidPlayWindowToggles"])
+        job = self.generate(GENERATOR, "mpwt-on.job.ps1", [*windowed, "-MidPlayWindowToggles"])
         self.assertEqual(self.parse_errors(job), 0)
         text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
         line = "    'MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES=fs_on@4000,fs_off@8000,restore@12000,maximize@16000',\n"
@@ -1248,15 +1249,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["midPlayWindowToggles"]["type"], "boolean")
         module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         self.assertIn("'dueWakeDeliveryPost', 'midPlayWindowToggles')", module)
+        # adversary A5: the request evidence gates the leg and re-derives in the receipt validator, and is exported
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn("Get-DvWindowToggleRequestEvidence", module.split("Export-ModuleMember", 1)[1])
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $runLogText", runner)
+
+    def test_the_mid_play_window_toggles_on_a_fullscreen_generation_are_refused(self) -> None:
+        """Adversary A4 on ead7bbdb: -MidPlayWindowToggles without -DisplayMode windowed (the fullscreen default) throws, so no job clears its own toggles."""
+        out = self.tmp / "mpwt-fullscreen.job.ps1"
+        proc = run_pwsh(self.generator_command(GENERATOR, out, ["-MidPlayWindowToggles"]))
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_NOT_WINDOWED", proc.stdout + proc.stderr)
+        self.assertFalse(out.exists())
 
     def test_a_job_template_without_the_env_list_site_refuses_the_mid_play_window_toggles(self) -> None:
         """The anchor must match exactly once, or the generator throws DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING (never a silent no-env job)."""
         source = GENERATOR.read_text(encoding="utf-8")
         anchor = '[regex]"(?<ind>[ \\t]*)\'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1\',(?<nl>\\r?\\n)"'
-        block = source.index("if ($MidPlayWindowToggles) {")
-        self.assertIn(anchor, source[block:block + 400], "the toggle arm's own anchor, the one the throw below guards")
-        self.assertIn("throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING", source[block:block + 900])
-        self.assertIn("Matches($text).Count -ne 1", source[block:block + 700])
+        start = source.index("if ($MidPlayWindowToggles) {")
+        arm = source[start:source.index("$wtOpen = ", start)]   # the arm's env-line half: up to where the summary region begins
+        self.assertIn(anchor, arm, "the toggle arm's own anchor, the one the throw below guards")
+        self.assertIn("if ($windowToggleEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING", arm)
+        self.assertLess(arm.index("DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING"), arm.index("$windowToggleEnvAnchor.Replace($text"), "the throw comes before the edit")
 
     def test_the_team_partition_reaches_the_apps_env_only_when_asked(self) -> None:
         """CPU-S1-FS-SPIKE-TEAM-PARTITION-1: -ReconOmpThreads r -PrepOmpThreads p add MLVAPP_PLAYBACK_RECON_OMP_THREADS=r and MLVAPP_PLAYBACK_PREP_OMP_THREADS=p
@@ -15600,7 +15614,9 @@ class MidPlayWindowToggleLegSpecTests(unittest.TestCase):
     M16-1457 native cells; the schema keeps the key off a fullscreen leg, and no other leg sets it."""
 
     GATES = [{"metric": "windowTogglesDriven", "op": "eq", "value": 4}, {"metric": "windowTogglesKeptPlaying", "op": "eq", "value": 4},
-             {"metric": "windowTogglesAdvanced", "op": "eq", "value": 4}]
+             {"metric": "windowTogglesAdvanced", "op": "eq", "value": 4},
+             # adversary A2 on ead7bbdb: the requested count and the parser's own reason are gated too, so an anomaly or a fifth toggle never passes
+             {"metric": "windowTogglesRequested", "op": "eq", "value": 4}, {"metric": "windowToggleEvidenceReason", "op": "eq", "value": "ok"}]
 
     def setUp(self) -> None:
         try:
@@ -15754,6 +15770,25 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "an end of another kind": (self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", kind="restore") if i == 1 else e)), (4, 3, 3, 3), False),
             "records of an earlier session before the last measured_session marker are not read": (
                 self.log(prefix=(self.toggle(0, "begin"), self.toggle(0, "begin"), "playback_smoke.measured_session id=2")), (4, 4, 4, 4), True),
+            "A1: a log prefix and a location suffix whose path holds position=0 (the suffix is not the record)": (
+                self.log(mutate=lambda i, b, e: ("[2026-11-18T16:00:00.000Z] [INFO] [0x1a2c] " + b + " (C:/build position=0 sandbox/platform/qt/MainWindow.cpp:10901)",
+                                                 "[2026-11-18T16:00:09.000Z] [INFO] [0x1a2c] " + e + " (C:/build position=0 sandbox/platform/qt/MainWindow.cpp:10938)")), (4, 4, 4, 4), True),
+            "A1: a key repeated inside one begin record makes the toggle count for nothing": (
+                self.log(mutate=lambda i, b, e: (b + " position=0" if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "a marker that does not start the record body is no record": (
+                self.log(summary=("echo gui_smoke.window_toggle phase=begin index=0 kind=fs_on at_ms=1 elapsed_ms=1 play_checked=1 position=1 presented_serial=1 window=1x1 "
+                                  "fullscreen=0 maximized=0\ngui_smoke.window_toggles requested=4 driven=4 reason=ok")), (4, 4, 4, 4), True),
+            "A2: a duplicate summary line is an anomaly (the criteria refuse it through the reason)": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok\ngui_smoke.window_toggles requested=4 driven=4 reason=ok"), (4, 4, 4, 4), False),
+            "A2: a fifth toggle: requested 5 and an unfinished index 4": (
+                self.log(summary=("gui_smoke.window_toggle phase=begin index=4 kind=restore at_ms=24000 elapsed_ms=24007 play_checked=1 position=510 presented_serial=5100 "
+                                  "window=1920x1040 fullscreen=0 maximized=1\ngui_smoke.window_toggles requested=5 driven=4 reason=incomplete")), (5, 4, 4, 4), False),
+            "A3: fs_off begins and ends at the same size (it never left the fullscreen size either way)": (
+                self.log(mutate=lambda i, b, e: (self.toggle(1, "begin", window="1920x1040") if i == 1 else b, self.toggle(1, "end", window="1920x1040") if i == 1 else e)),
+                (4, 4, 3, 4), False),
+            "A3: fs_off ends at the fullscreen size fs_on ended at, though it began elsewhere": (
+                self.log(mutate=lambda i, b, e: (self.toggle(1, "begin", window="1280x693") if i == 1 else b, self.toggle(1, "end", window="1920x1080") if i == 1 else e)),
+                (4, 4, 3, 4), False),
             "two toggles only (the loop exit cut the rest short)": (
                 "\n".join(self.log(summary="gui_smoke.window_toggles requested=4 driven=2 reason=incomplete").split("\n")[:11] +
                           ["gui_smoke.window_toggles requested=4 driven=2 reason=incomplete"]), (4, 2, 2, 2), False),
@@ -15766,6 +15801,41 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), expected, e)
                 self.assertEqual(got["passes"], [passes, passes], f"{name}: {e}")
                 self.assertEqual(e["reason"] == "ok", passes, e)
+
+    def test_adversary_a4_the_live_validator_refuses_the_key_on_a_leg_that_is_not_windowed(self) -> None:
+        windowed = json.loads((DV / "legs/m16-1457-native-windowed-s2-fstoggle.json").read_text(encoding="utf-8"))
+        fullscreen = json.loads((DV / "legs/m16-1457-native-fullscreen-s1.json").read_text(encoding="utf-8"))
+        fullscreen["generatorArgs"]["midPlayWindowToggles"] = True
+        no_mode = {k: v for k, v in windowed.items() if k != "displayMode"}
+        for name, spec, refused in (("a windowed leg", windowed, False), ("a fullscreen leg", fullscreen, True), ("no display mode (the fullscreen default)", no_mode, True),
+                                    ("the key false on a fullscreen leg", dict(fullscreen, generatorArgs=dict(fullscreen["generatorArgs"], midPlayWindowToggles=False)), False)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n@{ r = (Get-DvLegSpecShapeRefusal -Spec $s) } | ConvertTo-Json -Compress", DVE_SPEC=json.dumps(spec))
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                if refused:
+                    self.assertIn("midPlayWindowToggles needs displayMode", out["r"] or "")
+                else:
+                    self.assertIsNone(out["r"])
+
+    def test_adversary_a5_a_leg_that_names_no_toggles_is_invalid_when_its_log_shows_them(self) -> None:
+        toggle = self.toggle(0, "begin")
+        summary = "gui_smoke.window_toggles requested=4 driven=4 reason=ok"
+        refusal = "gui_smoke.window_toggles requested=4 driven=0 reason=not_windowed"
+        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        cases = (("an ordinary leg, toggles in its log", {}, toggle, True),
+                 ("an ordinary leg, the summary line only", {}, summary, True),
+                 ("an ordinary leg, the app's not_windowed refusal", {}, refusal, True),
+                 ("an ordinary leg behind a log prefix and a location suffix", {}, "[2026-11-18T16:00:00.000Z] [INFO] [0x1a2c] " + toggle + " (C:/x/MainWindow.cpp:10901)", True),
+                 ("an ordinary leg, a clean log", {}, "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 n=1", False),
+                 ("an ordinary leg, the marker inside another record's location path", {}, "playback_smoke.frame session=3 n=1 (C:/gui_smoke.window_toggle phase=begin/x.cpp:1)", False),
+                 ("an ordinary leg, a marker that does not start the body", {}, "echo " + toggle, False),
+                 ("a leg that asks, with toggles", asks, toggle + "\n" + summary, False),
+                 ("a leg whose key is false, with toggles", {"generatorArgs": {"midPlayWindowToggles": False}}, toggle, True))
+        proc, out = run_pwsh_evidence_cases("Get-DvWindowToggleRequestEvidence", [(spec, log) for _, spec, log, _ in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, blocks), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(v["blocks"], blocks, v)
 
     def test_a_summary_without_the_scalars_fails_both_legs_criteria(self) -> None:
         script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
@@ -15781,7 +15851,8 @@ class WindowToggleEvidenceTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         for got in json.loads(proc.stdout):
             self.assertEqual((got["a"], got["s"]), (False, False))
-            self.assertEqual(sorted(f.split(":")[0] for f in got["failures"]), ["windowTogglesAdvanced", "windowTogglesDriven", "windowTogglesKeptPlaying"])
+            self.assertEqual(sorted(f.split(":")[0] for f in got["failures"]),
+                             ["windowToggleEvidenceReason", "windowTogglesAdvanced", "windowTogglesDriven", "windowTogglesKeptPlaying", "windowTogglesRequested"])
 
 
 class DueWakeDeliveryLegSpecTests(unittest.TestCase):

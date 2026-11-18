@@ -1048,6 +1048,13 @@ if ($outcome -in @('PASS', 'FAIL') -and $dueWakeDeliveryVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but DUE_WAKE_DELIVERY_NOT_HONOURED: $($dueWakeDeliveryVerdict.reason). A run whose due-wake delivery is not the one its leg names (post when it asks, otherwise send) is no measurement of that arm"
     $outcome = 'INVALID'
 }
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1, FAIL CLOSED (adversary A5): a leg that names no midPlayWindowToggles whose run log shows window toggles was moved
+# by MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES inherited from the launcher's environment: no measurement of its declared shape.
+$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $runLogText
+if ($outcome -in @('PASS', 'FAIL') -and $windowToggleRequestVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but WINDOW_TOGGLES_INHERITED: $($windowToggleRequestVerdict.reason)"
+    $outcome = 'INVALID'
+}
 # CPU-S1-FS-SPIKE-TEAM-PARTITION-1, FAIL CLOSED: a leg that asks for the OpenMP team partition counts only when the measured session's own
 # playback_smoke.omp_teams record reports partition=r+p (recon_omp=r, prep_omp=p, override=0); a value in the launcher's env block is a request, not
 # engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask blocks only when the app reports one.

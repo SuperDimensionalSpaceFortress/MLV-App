@@ -148,4 +148,7 @@ TEST(SmokeWindowToggleScheduleWiring, TheToggleBlockNeverStartsOrStopsPlayAndNev
     ASSERT_FALSE(block.contains(QStringLiteral("msleep")));
     ASSERT_FALSE(block.contains(QStringLiteral("QEventLoop")));
     ASSERT_FALSE(block.contains(QStringLiteral("processEvents")));
+    // at most one phase per loop turn (adversary A6 on ead7bbdb): the begin gates (previous not ended, not yet due), the settled end and the
+    // not-yet-settled wait each leave the turn with a break, so an overdue next toggle begins on the next turn
+    ASSERT_TRUE(block.count(QStringLiteral("break;")) >= 4);
 }

@@ -18,7 +18,9 @@
         { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" },
         { "metric": "windowTogglesDriven", "op": "eq", "value": 4 },
         { "metric": "windowTogglesKeptPlaying", "op": "eq", "value": 4 },
-        { "metric": "windowTogglesAdvanced", "op": "eq", "value": 4 }
+        { "metric": "windowTogglesAdvanced", "op": "eq", "value": 4 },
+        { "metric": "windowTogglesRequested", "op": "eq", "value": 4 },
+        { "metric": "windowToggleEvidenceReason", "op": "eq", "value": "ok" }
       ]
     },
     "supplementary": {
@@ -28,7 +30,9 @@
         { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" },
         { "metric": "windowTogglesDriven", "op": "eq", "value": 4 },
         { "metric": "windowTogglesKeptPlaying", "op": "eq", "value": 4 },
-        { "metric": "windowTogglesAdvanced", "op": "eq", "value": 4 }
+        { "metric": "windowTogglesAdvanced", "op": "eq", "value": 4 },
+        { "metric": "windowTogglesRequested", "op": "eq", "value": 4 },
+        { "metric": "windowToggleEvidenceReason", "op": "eq", "value": "ok" }
       ]
     }
   }

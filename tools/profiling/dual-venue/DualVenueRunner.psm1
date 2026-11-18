@@ -2017,6 +2017,33 @@ function Get-DvDueWakeDelivered {
     'delivered'
 }
 
+function Get-DvWindowToggleRequestEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A5 on ead7bbdb): a leg that does NOT name generatorArgs.midPlayWindowToggles must have driven no window
+    toggle. The app honours MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES from any process environment, so a variable inherited from the launcher would move the window
+    of an ordinary windowed leg (and its job, plain, publishes no windowToggles* scalar to show it). `blocks` is true when such a leg's run log carries a
+    gui_smoke.window_toggle or gui_smoke.window_toggles record, read from the app's record body only (Get-DvLogRecordBodies cuts the log prefix and the Qt
+    location suffix). A leg that asks is judged by its own windowToggles* criteria, not here. Pure and shared: the runner gates on it and Test-DvReceiptValid
+    re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    $requested = ($raw -is [bool]) -and $raw
+    $mentions = 0
+    foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
+        # (the body still starts with the optional `[utc] [LEVEL] [0x<thread>] ` prefix; a record counts only where it starts the body after it)
+        if ($line -match '^\s*(?:\[[^\]]*\]\s*)*gui_smoke\.window_toggles? ') { $mentions++ }
+    }
+    $blocks = (-not $requested) -and ($mentions -gt 0)
+    [pscustomobject]@{
+        requested = $requested
+        mentions = $mentions
+        blocks = $blocks
+        reason = $(if ($blocks) { "WINDOW_TOGGLES_INHERITED: the run log carries $mentions gui_smoke.window_toggle record(s) but the leg does not name midPlayWindowToggles (MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES came from the launcher's environment)" } else { $null })
+    }
+}
+
 function Get-DvDueWakeDeliveryEvidence {
     <#
     .SYNOPSIS
@@ -3231,6 +3258,16 @@ function Get-DvLegSpecShapeRefusal {
             $switchProp = $genArgsProp.Value.PSObject.Properties[$switchName]
             if ($null -ne $switchProp -and $switchProp.Value -isnot [bool]) {
                 return "generatorArgs.$switchName must be JSON true or false (it is $(ConvertTo-Json -InputObject $switchProp.Value -Compress -Depth 3))"
+            }
+        }
+        # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A4 on ead7bbdb): the mid-play window toggles are a WINDOWED leg's instrument (the app clears
+        # them on any other leg and drives nothing). The schema's allOf rule says so for a committed spec; this is the live check, for the leg and every batch
+        # preflight, so a spec that names the key on a fullscreen leg (or no display mode at all, the fullscreen default) never reaches a lease.
+        $midPlayToggleProp = $genArgsProp.Value.PSObject.Properties['midPlayWindowToggles']
+        if ($null -ne $midPlayToggleProp -and $midPlayToggleProp.Value -is [bool] -and $midPlayToggleProp.Value) {
+            $displayModeProp = $Spec.PSObject.Properties['displayMode']
+            if ($null -eq $displayModeProp -or $displayModeProp.Value -isnot [string] -or $displayModeProp.Value -cne 'windowed') {
+                return 'generatorArgs.midPlayWindowToggles needs displayMode "windowed" (the app drives the toggles on a windowed leg only)'
             }
         }
         # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A3 and A4 on 84d66a4b): a PRESENT team-partition key is a whole number from 1 to 16 -- a JSON int, the
@@ -4824,6 +4861,9 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedDueWakeDelivery) { $invalid.Add('DUE_WAKE_DELIVERY_NOT_FROM_EVIDENCE: the receipt carries a dueWakeDelivery block but its committed leg spec names no dueWakeDeliveryPost') }
+            # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r1 (adversary A5): a leg that names no midPlayWindowToggles but whose run log shows window toggles was moved by an inherited env
+            $windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText
+            if ($windowToggleRequestVerdict.blocks) { $invalid.Add("WINDOW_TOGGLES_INHERITED: $($windowToggleRequestVerdict.reason)") }
             # CPU-S1-FS-SPIKE-TEAM-PARTITION-1: a leg that asks for the team partition the app did not report at exactly r+p (or whose report is unreadable, or
             # absent because the binary emits none), or a control leg whose app reports a partition, is no measurement of its arm; the receipt's own
             # teamPartition block is re-derived like the reconReleaseDeferred block.
@@ -5657,6 +5697,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt

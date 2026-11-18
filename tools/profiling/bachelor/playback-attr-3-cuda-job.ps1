@@ -6569,6 +6569,8 @@ if ($DueWakeDeliveryPost) {
 # the windowToggles* scalars (Get-AttrCudaWindowToggleEvidence over the run log) to the success summary, only when asked. Each anchor must match exactly once, or the
 # generator throws (the leg's criteria bind the scalars; an absent one fails the leg, Test-DvCriteria).
 if ($MidPlayWindowToggles) {
+    # adversary A4 on ead7bbdb: the app drives the toggles on a windowed leg only; a fullscreen job would clear them and publish zero toggles
+    if ($DisplayMode -ne 'windowed') { throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_NOT_WINDOWED -MidPlayWindowToggles needs -DisplayMode windowed' }
     $windowToggleEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
     if ($windowToggleEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_MID_PLAY_WINDOW_TOGGLES_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES to' }
     $text = $windowToggleEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
