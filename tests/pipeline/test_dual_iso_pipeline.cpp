@@ -12721,7 +12721,13 @@ TEST(DualIsoPipeline, Phase4B_NonDualIsoScaleEightWorks)
     const std::vector<uint8_t> scaled8 = fixture.renderFrame8Scaled(0, 1, 8);
     ASSERT_EQ(static_cast<std::size_t>(full_w / 8) * (full_h / 8) * 3u, scaled8.size());
     ASSERT_EQ(8, fixture.video()->playback_scale_factor_active);
-    ASSERT_EQ(3, mlv_phase4bv2_last_path_taken());
+    /* The non-HQ x8 route is the full-recon post-downsample fallback
+     * (mlv_render_scaled_rgb16), which never writes the thread-local route
+     * tag: 0 = "v2 entry not invoked / rejected before path selection". This
+     * used to assert 3, which was only the tag the previous test on this
+     * thread (the x4 test) left behind; the scale-1 render above now clears
+     * the tag (LOOK-LABEL-PLAYBACK-INFO-1 r13), so it reads 0 on any order. */
+    ASSERT_EQ(0, mlv_phase4bv2_last_path_taken());
     ASSERT_EQ(std::string("not HQ Dual ISO; full-recon post-downsample fallback"),
               std::string(mlv_phase4bv2_last_fallback_reason()));
 
