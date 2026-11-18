@@ -655,16 +655,34 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
     # attribute into a property that answers ``None`` while the real traceback is there.
     link = _TRACEBACK_SLOT.__get__(error, BaseException)
     while link is not None:
+        candidate = None
         try:
-            candidate = link.tb_frame.f_locals.get("self")
-            if isinstance(candidate, subprocess.Popen):
-                # The first ``Popen`` met walking inward is the constructor the launch called: every frame
-                # below it (an audit hook, a callback) can hold some OTHER live ``Popen`` as its own ``self``,
-                # which is not this launch's child and must never be adopted, so the search ends here.
-                return _created_child(candidate, link)
+            found = link.tb_frame.f_locals.get("self")
+            if isinstance(found, subprocess.Popen):
+                candidate = found
         except BaseException:  # noqa: BLE001 - a frame that cannot be read is skipped; recovery never replaces the launch's own error
             pass
+        if candidate is not None:
+            # The first ``Popen`` met walking inward is the constructor the launch called: every frame
+            # below it (an audit hook, a callback) can hold some OTHER live ``Popen`` as its own ``self``,
+            # which is not this launch's child and must never be adopted, so the search ends here, whether
+            # or not the recovery below could read it (a recovery that fails answers for THIS constructor
+            # alone and never walks on to a deeper one).
+            try:
+                return _created_child(candidate, link)
+            except BaseException:  # noqa: BLE001 - the recovery itself was denied or interrupted
+                return _stored_child(candidate)
         link = link.tb_next
+    return None
+
+
+def _stored_child(candidate: subprocess.Popen[bytes]) -> subprocess.Popen[bytes] | None:
+    """``candidate`` when it already holds a live child's pid, read without anything that can be denied; else ``None``."""
+    try:
+        if candidate.pid is not None and candidate.returncode is None:
+            return candidate
+    except BaseException:  # noqa: BLE001 - not even the stored pid could be read: nothing here is known to be a child
+        pass
     return None
 
 
@@ -715,12 +733,37 @@ def is_interrupt(error: BaseException) -> bool:
 
 
 _EXIT_CODE_SLOT = SystemExit.code  # the member descriptor: reads the stored code, whatever a subclass defines
+_EXIT_STATUS_MODULUS = 256  # POSIX keeps the low 8 bits of an exit status; a Windows DWORD keeps the low 32 (a multiple of 256)
+
+
+def _reads_as_success(code: object) -> bool:
+    """Whether the process would exit 0 for ``SystemExit(code)``: ``None``, or an integer congruent to zero.
+
+    A nonzero integer whose low bits are all zero still ends the process with status 0 (``4294967296`` as a
+    Windows DWORD, ``256`` as a POSIX status), so it is no failure code: the test is the residue, not ``== 0``.
+    Only ``type()``, ``issubclass`` and the ``int`` methods are used, never the code's own (an int subclass can
+    make ``%``, ``==``, ``bool()`` or ``repr()`` raise a ``SystemExit(0)``)."""
+    if code is None:
+        return True
+    return issubclass(type(code), int) and int.__eq__(int.__mod__(code, _EXIT_STATUS_MODULUS), 0) is True
+
+
+def _code_text(code: object) -> str:
+    """The exit code for the message, without calling the code's own ``__repr__`` (``int.__repr__`` also
+    refuses an integer past the interpreter's digit limit, which is no reason to lose the message)."""
+    if code is None:
+        return "None"
+    try:
+        return int.__repr__(code)  # type: ignore[arg-type]
+    except BaseException:  # noqa: BLE001 - a huge integer
+        return "a multiple of 256"
 
 
 def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
-    """A ``SystemExit`` with a falsy code (an audit hook can raise one anywhere) is not a pass: it is
+    """A ``SystemExit`` that would end the process with status 0 (a ``None`` or falsy code, or an integer
+    congruent to zero such as ``4294967296``; an audit hook can raise one anywhere) is not a pass: it is
     reported and becomes ``SystemExit(1)``, so a run that was cut short cannot end green. A ``SystemExit``
-    with a real code, and every other exception, passes through untouched."""
+    with a real failing code, and every other exception, passes through untouched."""
 
     @functools.wraps(function)
     def guarded(*args: object, **kwargs: object) -> int:
@@ -733,12 +776,12 @@ def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
             # The code is read from ``SystemExit``'s own slot, not through ``error.code``: a subclass can
             # turn that attribute into a property that raises ``SystemExit(0)``.
             code = _EXIT_CODE_SLOT.__get__(error, SystemExit)
-            if not (code is None or (issubclass(type(code), int) and int.__eq__(code, 0) is True)):
+            if not _reads_as_success(code):
                 if type(error) is SystemExit:
                     raise
                 # A subclass's own ``code`` is read again by the interpreter at exit: end with a plain one.
                 raise SystemExit(code) from error
-            emit_error(f"{function.__name__} was ended by {describe_error(error)} (code {'None' if code is None else 0}), which is not a pass")
+            emit_error(f"{function.__name__} was ended by {describe_error(error)} (code {_code_text(code)}), which is not a pass")
             raise SystemExit(1) from error
 
     return guarded
@@ -1017,13 +1060,42 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
             if done.returncode != 0:
                 return f"taskkill exited {done.returncode}"
         else:
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:  # the group is already gone
-                pass
+            _kill_group_of_unreaped(proc, pid)
     except BaseException as error:  # noqa: BLE001 - an audit hook may raise any type, SystemExit included
         return describe_error(error)
     return None
+
+
+GROUP_KILL_LOCK_SECONDS = 0.5  # how long a kill waits for a reap that is running right now
+
+
+def _kill_group_of_unreaped(proc: subprocess.Popen[bytes], pgid: int) -> None:
+    """``SIGKILL`` the worker's process group, but only while the worker is still UNREAPED.
+
+    The group id is the worker's pid, and the OS hands a pid out again once the worker has been reaped, so a
+    signal sent after the reap can land in a stranger's group. Two threads end the same worker (the parent
+    and the deadline watchdog), and one of them may have reaped it already: a worker with a ``returncode``
+    owns no group any more and gets no signal. ``Popen`` keeps its reap under ``_waitpid_lock``, so the look
+    at ``returncode`` and the signal are taken under it when it can be had: a reap that runs at that moment
+    finishes first and is seen. (A lock held by an untimed ``wait`` for a worker that is still alive is
+    given up after ``GROUP_KILL_LOCK_SECONDS``: the signal is what makes that wait return.)"""
+    lock = getattr(proc, "_waitpid_lock", None)
+    held = False
+    try:
+        if lock is not None:
+            try:
+                held = bool(lock.acquire(timeout=GROUP_KILL_LOCK_SECONDS))
+            except BaseException:  # noqa: BLE001 - not a lock we can take: the returncode look below still applies
+                held = False
+        if proc.returncode is not None:  # reaped: its pid, and so its group id, may belong to someone else now
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:  # the group is already gone
+            pass
+    finally:
+        if held:
+            lock.release()  # type: ignore[union-attr]
 
 
 WORKER_REAP_SECONDS = 10.0  # how long a killed worker may take to be reaped before it is reported unended
@@ -1082,7 +1154,8 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
         """No thread to be had: end the worker here WITHOUT anything that can wait. On Windows the tree kill
         is a ``taskkill`` launch (process creation sits outside its own timeout) and the reap is a wait,
         so neither runs: the worker is killed and the tree is reported as not confirmed. On POSIX the tree
-        kill is a ``killpg``, which never waits. A requested reap is one look (``poll``): a worker not seen
+        kill is a ``killpg``, which never waits (it takes ``_waitpid_lock`` for at most ``GROUP_KILL_LOCK_SECONDS``,
+        and that lock is only ever held for the length of a reap here). A requested reap is one look (``poll``): a worker not seen
         gone is reported. So the total never exceeds the bound however many threads fail."""
         proc = procs[position]
         notes: list[str] = []
@@ -1121,6 +1194,40 @@ def terminate_all(procs: list[subprocess.Popen[bytes]], *, reap: bool = True) ->
         except BaseException:  # noqa: BLE001 - an interrupt while waiting must not leave the other workers unwaited and unreported
             continue
     return results
+
+
+TERMINATE_ATTEMPTS = 2  # an interrupt lands once; a second go at the whole termination is enough to outlast it
+
+
+def end_running_workers(procs: Sequence[subprocess.Popen[bytes]]) -> tuple[dict[int, str | None], BaseException | None]:
+    """End every worker in ``procs`` still running: ``({1-based number: error text or None}, first interrupt)``.
+
+    The look at who is still running is itself a call an interrupt (or an audit hook's exit) can land in, and
+    nothing ahead of ``terminate_all`` may keep it from running. A worker that cannot be looked at is ended
+    as if it were running, and a look that was cut short ends every worker. Whatever was raised is returned,
+    never raised here: the caller finishes the cleanup first and then lets the first one out."""
+    first: BaseException | None = None
+    leftover: list[int] = []
+    try:
+        for number, proc in enumerate(procs, start=1):
+            try:
+                running = proc.poll() is None
+            except BaseException as error:  # noqa: BLE001 - poll raised: its state is unknown, so the worker is ended
+                first = first or error
+                running = True
+            if running:
+                leftover.append(number)
+    except BaseException as error:  # noqa: BLE001 - the census loop itself was cut short: end every worker
+        first = first or error
+        leftover = list(range(1, len(procs) + 1))
+    results: list[str | None] = ["its termination did not complete"] * len(leftover)
+    for _attempt in range(TERMINATE_ATTEMPTS):
+        try:
+            results = terminate_all([procs[number - 1] for number in leftover])
+            break
+        except BaseException as error:  # noqa: BLE001 - terminate_all never raises; an interrupt can still land in it
+            first = first or error
+    return dict(zip(leftover, results, strict=True)), first
 
 
 class DeadlineKiller:
@@ -1259,6 +1366,8 @@ def run_parallel(
     handled = 0  # how many of the grouped worker logs (in order) are fully dealt with: the rest are the fallback's
     unread: list[int] = []  # 1-based workers whose log could not be read: the work dir is kept for them
     stuck: set[int] = set()  # 1-based workers the OS would not let the parent kill
+    ended_late: dict[int, str | None] = {}  # the final cleanup's per-worker termination result
+    census_error: BaseException | None = None  # an interrupt met while ending the leftover workers, re-raised after the cleanup
     merged: dict[str, float] = {}
     cap_minutes = job_cap_minutes(profile, env)
     budget_begin, origin = budget_origin(env, clock, begin, wall_clock, cap_minutes)
@@ -1388,8 +1497,12 @@ def run_parallel(
     finally:
         # An exception above must not leave a worker running: every owned worker is attempted, one that
         # cannot be killed is reported, and the watchdog keeps enforcing the deadline until they are done.
-        leftover = [number for number, (proc, _log) in enumerate(procs, start=1) if proc.poll() is None]
-        ended_late = dict(zip(leftover, terminate_all([procs[number - 1][0] for number in leftover]), strict=True))
+        for _attempt in range(TERMINATE_ATTEMPTS):  # the call itself can be interrupted too: it is made once more
+            try:
+                ended_late, census_error = end_running_workers([proc for proc, _log in procs])
+                break
+            except BaseException as error:  # noqa: BLE001 - end_running_workers returns what it meets; this is an interrupt in the call
+                census_error = census_error or error
         for number, (proc, log) in enumerate(procs, start=1):
             error = ended_late.get(number)
             if error is not None and number not in stuck:
@@ -1431,6 +1544,8 @@ def run_parallel(
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             for problem in problems:
                 emit_error(problem)
+        elif census_error is not None:
+            raise census_error  # an interrupt met in the census is not lost: it goes out once every worker has been ended
     ran =sorted(item for record in records if record for item in record["ids"])
     # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
     accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])

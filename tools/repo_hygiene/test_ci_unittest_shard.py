@@ -2645,6 +2645,195 @@ class ShardExitCodeTests(unittest.TestCase):
             found = shard.half_built_worker(error)
         self.assertIsNone(found, "an unrelated running Popen was taken for the launch's child")
 
+    # r16 sol r15 A1: a recovery that fails on the nearest constructor must stop there, never walk on to a deeper Popen.
+    def test_half_built_worker_never_adopts_a_deeper_popen_when_the_nearest_recovery_fails(self) -> None:
+        unrelated = subprocess.Popen.__new__(subprocess.Popen)
+        unrelated.pid = 99
+        unrelated.returncode = None
+        real_created = shard._created_child
+        calls: list[object] = []
+
+        def created_child(candidate: object, link: object) -> object:
+            calls.append(candidate)
+            if len(calls) == 1:
+                raise RuntimeError("an audit hook denied the frame read")  # the nearest constructor's recovery
+            return real_created(candidate, link)  # type: ignore[arg-type]
+
+        def audit_callback(self: object) -> None:
+            raise KeyboardInterrupt
+
+        class NothingCreated(subprocess.Popen):  # type: ignore[type-arg]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = None  # type: ignore[assignment]
+                self.returncode = None
+                audit_callback(unrelated)
+
+        found: object = "unset"
+        try:
+            NothingCreated([sys.executable])
+        except KeyboardInterrupt as error:
+            with mock.patch.object(shard, "_created_child", created_child):
+                found = shard.half_built_worker(error)
+        self.assertIsNot(found, unrelated, "a Popen from a deeper frame was taken for the launch's child")
+        self.assertIsNone(found)
+
+    def test_half_built_worker_still_hands_over_a_child_whose_pid_was_stored_when_the_recovery_fails(self) -> None:
+        class StoredPid(subprocess.Popen):  # type: ignore[type-arg]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = 424242  # type: ignore[assignment]
+                self.returncode = None
+                raise KeyboardInterrupt
+
+        found: object = None
+        try:
+            StoredPid([sys.executable])
+        except KeyboardInterrupt as error:
+            with mock.patch.object(shard, "_created_child", side_effect=RuntimeError("denied")):
+                found = shard.half_built_worker(error)
+        self.assertIsNotNone(found, "the child whose pid the constructor had stored was dropped")
+        self.assertEqual(found.pid, 424242)  # type: ignore[union-attr]
+
+    # r16 sol r15 A2: an interrupt at the final cleanup census must not skip ending the owned workers.
+    def test_an_interrupt_in_the_final_census_still_ends_every_owned_worker(self) -> None:
+        class InterruptedOnce(self._RunningProc):  # type: ignore[valid-type, misc]
+            fired = False
+
+            def poll(self) -> int | None:
+                if not InterruptedOnce.fired:
+                    InterruptedOnce.fired = True
+                    raise KeyboardInterrupt  # the first look at any worker: the final census (a launch failed before any other)
+                return super().poll()
+
+        procs = [InterruptedOnce(), InterruptedOnce(), self._RunningProc()]
+        raised: BaseException | None = None
+        with mock.patch.object(shard, "_kill_tree", return_value=None):
+            try:
+                _code, _err, raised = self._run_with_fake_workers(procs, launch_error_after=2)
+            except BaseException as error:  # noqa: BLE001 - the interrupt itself, on a head that lets it out
+                raised = error
+        self.assertTrue(InterruptedOnce.fired, "the census interrupt never fired: the test does not exercise the cleanup")
+        self.assertEqual([proc.returncode for proc in procs[:2]], [-9, -9], f"a worker was left running (raised {raised!r})")
+        self.assertIsInstance(raised, OSError, "the launch's own error is the one that propagates")
+
+    def test_end_running_workers_ends_every_worker_when_a_look_at_one_is_interrupted(self) -> None:
+        class PollRaises(self._RunningProc):  # type: ignore[valid-type, misc]
+            def poll(self) -> int | None:
+                if self.kill_calls == 0:
+                    raise KeyboardInterrupt
+                return super().poll()
+
+        procs = [PollRaises(), self._RunningProc()]
+        with mock.patch.object(shard, "_kill_tree", return_value=None):
+            ended, interrupt = shard.end_running_workers(procs)  # type: ignore[arg-type]
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9])
+        self.assertEqual(sorted(ended), [1, 2])
+        self.assertIsInstance(interrupt, KeyboardInterrupt, "the interrupt is handed back, not swallowed")
+
+    def test_end_running_workers_goes_again_when_terminate_all_is_interrupted(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc()]
+        real = shard.terminate_all
+        calls: list[int] = []
+
+        def terminate_all(group: list, **kwargs: object) -> list:
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return real(group, **kwargs)
+
+        with mock.patch.object(shard, "_kill_tree", return_value=None), mock.patch.object(shard, "terminate_all", terminate_all):
+            ended, interrupt = shard.end_running_workers(procs)  # type: ignore[arg-type]
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9], "a worker was left running")
+        self.assertEqual(ended, {1: None, 2: None})
+        self.assertIsInstance(interrupt, KeyboardInterrupt)
+
+    def test_an_interrupt_met_in_the_final_cleanup_is_raised_once_the_workers_are_ended(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc(), self._RunningProc()]
+        with (
+            mock.patch.object(shard, "end_running_workers", return_value=({}, KeyboardInterrupt("census"))),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self._run_with_fake_workers(procs, past_deadline=True)
+
+    # r16 sol r15 A3: a stale process-group id (the worker is already reaped) must never be signalled.
+    class _GroupProc:
+        def __init__(self, returncode: int | None) -> None:
+            self.pid = 424242
+            self.returncode = returncode
+
+    def _posix_kill(self, proc: object) -> tuple[str | None, list[tuple[int, int]]]:
+        sent: list[tuple[int, int]] = []
+        with (
+            mock.patch.object(shard.os, "name", "posix"),
+            mock.patch.object(shard.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), create=True),
+            mock.patch.object(shard.signal, "SIGKILL", 9, create=True),
+        ):
+            result = shard._kill_tree(proc)  # type: ignore[arg-type]
+        return result, sent
+
+    def test_a_reaped_worker_gets_no_group_signal(self) -> None:
+        result, sent = self._posix_kill(self._GroupProc(-9))
+        self.assertEqual(sent, [], "a group id that may belong to a stranger now was signalled")
+        self.assertIsNone(result)
+
+    def test_an_unreaped_worker_still_gets_its_group_signal(self) -> None:
+        result, sent = self._posix_kill(self._GroupProc(None))
+        self.assertEqual(sent, [(424242, 9)])
+        self.assertIsNone(result)
+
+    def test_a_reap_running_while_the_group_is_killed_is_seen_before_any_signal(self) -> None:
+        proc = self._GroupProc(None)
+        proc._waitpid_lock = threading.Lock()  # type: ignore[attr-defined]
+        proc._waitpid_lock.acquire()  # type: ignore[attr-defined]  # the other thread is inside its reap
+        outcome: list[tuple[str | None, list[tuple[int, int]]]] = []
+        sent: list[tuple[int, int]] = []
+
+        def kill() -> None:
+            outcome.append((shard._kill_tree(proc), sent))  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(shard.os, "name", "posix"),
+            mock.patch.object(shard.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), create=True),
+            mock.patch.object(shard.signal, "SIGKILL", 9, create=True),
+        ):
+            thread = threading.Thread(target=kill)
+            thread.start()
+            time.sleep(0.1)  # the kill is now waiting on the lock
+            proc.returncode = -9  # the reap finishes ...
+            proc._waitpid_lock.release()  # type: ignore[attr-defined]  # ... and lets go of the lock
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(sent, [], "the group was signalled after the other thread had reaped the worker")
+
+    # r16 sol r15 A4: an exit code congruent to zero is a zero exit however large it is.
+    def test_the_zero_exit_guard_fails_an_integer_code_that_the_os_reads_as_zero(self) -> None:
+        class ModRaises(int):
+            def __mod__(self, other: object) -> int:
+                raise SystemExit(0)
+
+        for code in (2**32, -(2**32), 2**33, 256, -256, 10**5000, ModRaises(256)):
+            def ended() -> int:
+                raise SystemExit(code)
+
+            outcome: SystemExit | None = None
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    shard.never_exits_zero(ended)()
+                except SystemExit as error:
+                    outcome = error
+            with self.subTest(code_bits=int.bit_length(code)):
+                self.assertIsNotNone(outcome, "the guard let the run return normally")
+                final = SystemExit.code.__get__(outcome, SystemExit)
+                self.assertEqual(final, 1, "a code that exits as 0 was preserved")
+
+    def test_the_zero_exit_guard_keeps_every_real_failing_code(self) -> None:
+        for code in (1, 2, 3, 5, 255, 257, 0xC0000005, -1, True):
+            def ended() -> int:
+                raise SystemExit(code)
+
+            with self.subTest(code=code), self.assertRaises(SystemExit) as caught:
+                shard.never_exits_zero(ended)()
+            self.assertEqual(caught.exception.code, code)
+
     # r13 adversary pass 22 A3: an exit raised where terminate_all starts a thread must not stop the other kills.
     def test_terminate_all_still_ends_every_worker_when_a_thread_start_raises_an_exit(self) -> None:
         procs = [self._RunningProc(), self._RunningProc()]
