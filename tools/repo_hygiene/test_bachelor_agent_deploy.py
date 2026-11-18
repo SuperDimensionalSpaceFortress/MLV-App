@@ -887,6 +887,69 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn("why=the venue is no longer idle, so the agent was not stopped", r.stdout)
         self.assertIn("inbox=1", r.stdout)
 
+    # ---- adversary pass 8 findings (A1..A2 of d6311001): each test failed on d6311001e ----
+
+    def test_p8a1_a_host_execution_policy_that_blocks_the_script_is_refused(self) -> None:
+        # pass 8 A1: -ExecutionPolicy Restricted passed the allowlist, so the agent was stopped and its replacement could not run
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        for pol in ("Restricted", "AllSigned", "Default", "Undefined", "restricted"):
+            for flag in ("-ExecutionPolicy", "-ep"):
+                self.assertEqual(self._exec_task_case("pol-" + pol + flag, "pwsh.exe", "-NoProfile %s %s -File %s" % (flag, pol, mine)), "False", pol + flag)
+        for pol in ("Bypass", "RemoteSigned", "Unrestricted", "bypass"):
+            self.assertEqual(self._exec_task_case("pol-ok-" + pol, "pwsh.exe", "-NoProfile -ExecutionPolicy %s -File %s" % (pol, mine)), "True", pol)
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"\$policies\s*=", code)), 1, "one allowlist decides, for the definition and the live process alike")
+
+    def test_p8a1_the_live_process_is_held_to_the_same_host_option_allowlist(self) -> None:
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        body = (
+            "function A($t){ [pscustomobject]@{ ok = $true; tokens = $t } };"
+            "'restricted='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-ExecutionPolicy','Restricted','-File','%s')) -AgentScript '%s');"
+            "'bypass='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s')"
+        ) % (psq(mine), psq(mine), psq(mine), psq(mine))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["restricted=False", "bypass=True"], r.stdout + r.stderr)
+
+    def test_p8a2_the_stop_acts_on_the_proved_instance_never_on_a_task_name(self) -> None:
+        # pass 8 A2: `schtasks /End /TN <name>` stops whatever the name resolves to at that moment (another admin re-pointed the task and
+        # started another instance after the binding). The stop is now an instance stop by the proved pid; here the scheduler has no such
+        # instance, so nothing is stopped, the answer is immediate, and the live agent is untouched.
+        pid, start = self.live_agent()
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            "$t=[Diagnostics.Stopwatch]::StartNew(); $r = Invoke-AgentRestart -AgentScript '%s';"
+            "'why=' + $r.why; 'fast=' + ($t.Elapsed.TotalSeconds -lt 25); 'alive=' + [bool](Get-Process -Id %d -ErrorAction SilentlyContinue)"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME), pid)
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest'; %s" % (psq(SCRIPT), psq(self.venue), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("nothing was stopped", r.stdout)
+        self.assertIn("fast=True", r.stdout)
+        self.assertIn("alive=True", r.stdout)
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"'/End'", "no `schtasks /End /TN <name>`: the stop is an instance stop by pid")
+
+    def test_p8a2_the_task_definition_is_read_again_right_before_it_is_started(self) -> None:
+        # pass 8 A2, second half: a definition edited after the binding is launched by /Run before any attestation. It is re-read as the
+        # last step before the start; a definition that no longer runs this script is not started (the old agent is down, and said so).
+        pid, start = self.live_agent()
+        busy = Path(self._tmp.name) / "task-busy.xml"
+        busy.write_text("<Task><Actions><Exec><Command>pwsh.exe</Command><Arguments>-NoProfile -File C:\\busy\\ultra-magnus-agent.ps1</Arguments></Exec></Actions></Task>", encoding="utf-8")
+        body = (
+            "$b=[pscustomobject]@{pid=%d;host=$env:COMPUTERNAME;start='%s';agentScript='%s';ageSec=1};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat=$b; return $null };"
+            # stand-in for the scheduler's instance stop (a real one needs the real task): it ends the live agent, as a stop would
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId) Stop-Process -Id $ProcessId -Force; [pscustomobject]@{ ok = $true; why = $null } };"
+            "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
+        ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME))
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; %s" % (psq(SCRIPT), psq(self.venue), psq(busy), body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("the old agent is stopped but the task was NOT started", r.stdout)
+        self.assertIn("its definition changed", r.stdout)
+
     def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
         # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.
         src = Path(__file__).read_text(encoding="utf-8")

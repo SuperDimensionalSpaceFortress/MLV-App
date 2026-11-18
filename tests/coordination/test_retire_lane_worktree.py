@@ -4433,7 +4433,7 @@ UNRESOLVED_EXECUTED_SITES = {
          "Read-HeartbeatBounded, Get-ProcessArgvBounded, Get-TaskRunningPidsBounded and the Wait-Until conditions in Invoke-AgentRestart: a directory "
          "listing, a heartbeat read, a process command-line read (Win32_Process / /proc), a Task Scheduler read (IRunningTask, read-only), a process-alive "
          "check), which the AST scans as code; none launches a process. The deployer's only child process is schtasks.exe, started by Invoke-BoundedProcess "
-         "with a fixed /Query, /End or /Run argument list and the task name"),
+         "with a fixed /Query or /Run argument list and the task name (the stop is a Task Scheduler API instance stop by pid, not a process launch)"),
     ],
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
         ("-ExecutionPolicy Bypass -Command $cmd 1>",

@@ -56,8 +56,11 @@
 #   The agent has no self-restart. Its one start path is the Task Scheduler task \MlvAgentBachelor, named in
 #   ultra-magnus-agent.ps1:259 and :393-404 (the task that starts it; its start also takes the single-instance mutex,
 #   ultra-magnus-agent.ps1:4675-4681, so a start while the old agent lives exits at once). Restart is therefore:
-#   schtasks.exe /End /TN \MlvAgentBachelor, wait until the pid in heartbeat.txt is gone (start time checked, never a kill by
-#   name), schtasks.exe /Run /TN \MlvAgentBachelor, wait for a heartbeat from a new LIVE agent process. It acts on THIS
+#   stop the task's running INSTANCE whose pid the binding proved (Task Scheduler IRunningTask.Stop on that pid, found and stopped in
+#   one loop: never `schtasks /End` by a name that can be re-pointed, never a kill by name), wait until that pid is gone (start time
+#   checked), re-read the task definition, schtasks.exe /Run /TN \MlvAgentBachelor, wait for a heartbeat from a new LIVE agent
+#   process. The host options before -File may only be -NoProfile/-NoLogo/-NonInteractive, -ExecutionPolicy Bypass|RemoteSigned|
+#   Unrestricted (Restricted, AllSigned, Default and Undefined would keep the replacement from running) and -WindowStyle. It acts on THIS
 #   machine's task list, so -RestartMode when-idle is refused (16) before anything changes unless ALL hold: heartbeat.txt
 #   names this machine as host=; its agentScript= is <VenueRoot>\ultra-magnus-agent.ps1 (a copied heartbeat from another
 #   root fails here); its pid is alive with the recorded start time; and the task's own XML has an executable action
@@ -71,7 +74,10 @@
 #   The heartbeat pid must also BE the task's running instance: the Task Scheduler is asked (IRunningTask.EnginePID, the pid of the
 #   Exec action's process) and must name exactly one instance, that pid; a process that only writes a matching heartbeat is not what
 #   `schtasks /End` stops. The replacement must be the task's new instance by the same test. Idle is judged once more AFTER all of
-#   this binding and immediately before the End, because the binding's reads can each take up to a deadline. -TaskPidsFile is the seam.
+#   this binding and immediately before the stop, because the binding's reads can each take up to a deadline. -TaskPidsFile is the
+#   seam for the scheduler's running pids. Residual (stated): the definition is re-read immediately before /Run, and the replacement
+#   is attested after it, but an edit in the instant between the two cannot be excluded from here; a replacement that fails the
+#   attestation is DEPLOY_RESTART_FAILED, never reported as restarted.
 #   A path with no drive (/bench, \bench) never names a place on Windows: it resolves against another process's current drive.
 #   The root itself must also list (a root whose listing is denied is DEPLOY_REFUSED_UNREADABLE, even for a no-op).
 #   The idle gate keeps the End from stranding a lease: with running\, inbox\ and slot-holders\ empty, nothing is lost.
@@ -89,7 +95,7 @@
 #   ultra-magnus-agent.ps1:4688-4690) adopts, requeues or ends what a restart finds; the hub verifies after such a warning.
 #
 # Test seams: -RestartScript <ps1> replaces the schtasks steps with `& <ps1> -VenueRoot <root>` (non-zero exit = failed);
-# -TaskXmlFile <xml> is read instead of `schtasks /Query /XML`; -TestCorruptAfterWrite appends a byte to the venue copy after
+# -TaskXmlFile <xml> is read instead of `schtasks /Query /XML`; -TaskPidsFile <txt> instead of the scheduler's running pids; -TestCorruptAfterWrite appends a byte to the venue copy after
 # the rename, to prove the sha-mismatch restore. Dot-sourcing the script (`. <script> -VenueRoot <x>`) loads only the functions.
 # The tests (tools/repo_hygiene/test_bachelor_agent_deploy.py) run only on a temp dir. Never point this script at the real
 # venue from a test, a lane or a producer: a deploy there is the owner's or the hub's call.
@@ -591,7 +597,9 @@ function Test-HostArgvRunsScript {
     if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { return $false }
     $tokens = @($Tokens)
     $hostFlags = @('NoProfile', 'nop', 'NoLogo', 'nol', 'NonInteractive', 'noni')
-    $policies = @('Bypass', 'RemoteSigned', 'Unrestricted', 'AllSigned', 'Restricted', 'Default', 'Undefined')
+    # only the policies under which a LOCAL, unsigned script runs: Restricted and AllSigned (and Default / Undefined, which resolve to
+    # Restricted on a Windows client) would keep the replacement script from running, so the restart would stop the agent and not bring it back
+    $policies = @('Bypass', 'RemoteSigned', 'Unrestricted')
     $styles = @('Hidden', 'Normal', 'Minimized', 'Maximized')
     $hostValued = @{ ExecutionPolicy = $policies; ep = $policies; WindowStyle = $styles; w = $styles }
     $scriptPath = $null; $i = 0
@@ -616,6 +624,50 @@ function Test-HostArgvRunsScript {
     if (-not $parsed.ok) { return $false }
     if ($null -ne $parsed.root -and -not (Test-SamePath -A $parsed.root -B $expectedRoot)) { return $false }
     return $true
+}
+
+function Get-TaskXml {
+    # The task's CURRENT definition (schtasks /Query /XML, bounded; -TaskXmlFile is the test seam). Returns @{ ok; xml; why }.
+    $no = { param($why) [pscustomobject]@{ ok = $false; xml = $null; why = $why } }
+    try {
+        if ($TaskXmlFile -ne '') { return [pscustomobject]@{ ok = $true; xml = [System.IO.File]::ReadAllText($TaskXmlFile); why = $null } }
+        $q = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Query', '/TN', $TaskName, '/XML') -TimeoutSec 30
+        if ($q.timedOut) { return (& $no "task $TaskName did not answer schtasks /Query within 30 s") }
+        if ($q.exitCode -ne 0) { return (& $no "task $TaskName could not be queried (exit $($q.exitCode))") }
+        return [pscustomobject]@{ ok = $true; xml = $q.output; why = $null }
+    }
+    catch { return (& $no "task $TaskName could not be read: $($_.Exception.Message)") }
+}
+
+function Stop-TaskInstanceByPid {
+    # Stops ONE running instance of the task: the one whose process is $ProcessId, found and stopped in the same loop through the Task
+    # Scheduler (IRunningTask.Stop). `schtasks /End /TN <name>` stops whatever the NAME resolves to when it runs, and the name, the
+    # definition and the running instance can all change between the binding and that call; this acts on the identity the binding
+    # proved. Returns @{ ok; why }. Windows only (the scheduler API); off Windows it never stops anything.
+    param([int]$ProcessId)
+    try {
+        if (-not $script:OnWindows) { return [pscustomobject]@{ ok = $false; why = 'the Task Scheduler API exists on Windows only' } }
+        $svc = New-Object -ComObject 'Schedule.Service'
+        $svc.Connect()
+        $want = '\' + $TaskName.TrimStart('\')
+        foreach ($rt in $svc.GetRunningTasks(1)) {
+            if ([string]::Equals([string]$rt.Path, $want, [StringComparison]::OrdinalIgnoreCase) -and [int]$rt.EnginePID -eq $ProcessId) {
+                $rt.Stop()
+                return [pscustomobject]@{ ok = $true; why = $null }
+            }
+        }
+        return [pscustomobject]@{ ok = $false; why = "task $TaskName has no running instance with pid=$ProcessId any more" }
+    }
+    catch { return [pscustomobject]@{ ok = $false; why = "stopping the instance failed: $($_.Exception.Message)" } }
+}
+
+function Stop-TaskInstanceBounded {
+    # Stop-TaskInstanceByPid under a deadline (the scheduler can stall): no answer is a failure, and nothing is assumed stopped.
+    param([int]$ProcessId)
+    $r = Invoke-Bounded -Script { Stop-TaskInstanceByPid -ProcessId $ProcId } -TimeoutMs 30000 -Variables @{ ProcId = $ProcessId }
+    if ($r.timedOut) { return [pscustomobject]@{ ok = $false; why = 'the Task Scheduler did not answer the stop within 30 s' } }
+    if ($null -ne $r.error -or $null -eq $r.value) { return [pscustomobject]@{ ok = $false; why = "the stop returned no answer ($($r.error))" } }
+    return $r.value
 }
 
 function Get-RestartBindingRefusal {
@@ -645,18 +697,9 @@ function Get-RestartBindingRefusal {
     if (-not (Test-ArgvBindsScript -Argv $argv -AgentScript $AgentScript)) {
         return "heartbeat pid=$($beat.pid) is not running -File $AgentScript for this root (its own command line differs); ending the task would stop an agent serving another root"
     }
-    $xml = $null
-    try {
-        if ($TaskXmlFile -ne '') { $xml = [System.IO.File]::ReadAllText($TaskXmlFile) }
-        else {
-            $q = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Query', '/TN', $TaskName, '/XML') -TimeoutSec 30
-            if ($q.timedOut) { return "task $TaskName did not answer schtasks /Query within 30 s" }
-            if ($q.exitCode -ne 0) { return "task $TaskName could not be queried (exit $($q.exitCode))" }
-            $xml = $q.output
-        }
-    }
-    catch { return "task $TaskName could not be read: $($_.Exception.Message)" }
-    if (-not (Test-TaskXmlRunsScript -Xml $xml -AgentScript $AgentScript)) {
+    $x = Get-TaskXml
+    if (-not $x.ok) { return $x.why }
+    if (-not (Test-TaskXmlRunsScript -Xml $x.xml -AgentScript $AgentScript)) {
         return "task $TaskName does not run -File $AgentScript in an executable action; ending it would stop a different agent"
     }
     # the pid the heartbeat names must be the pid of the task's RUNNING instance: End stops that instance and no other, so a process in
@@ -690,11 +733,19 @@ function Invoke-AgentRestart {
     # work can land meanwhile, so idle is judged AGAIN as the last step before the End (the check before the binding is only the early out)
     $last = Get-Refusals
     if ($null -ne $last) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $($last.lines -join '; ')"; warn = $null } }
-    $end = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/End', '/TN', $TaskName) -TimeoutSec 30
-    if ($end.timedOut) { return @{ why = "schtasks /End $TaskName did not return within 30 s"; warn = $null } }
+    # stop the INSTANCE the binding proved (its pid), not "the task" by a name that can be re-pointed or re-run in the meantime
+    $stop = Stop-TaskInstanceBounded -ProcessId $before.pid
+    if (-not $stop.ok) { return @{ why = "could not stop agent pid=$($before.pid); nothing was stopped: $($stop.why)"; warn = $null } }
     $gone = Wait-Until -TimeoutSec 30 -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
-    if (-not $gone) { return @{ why = "agent pid $($before.pid) still alive 30 s after schtasks /End"; warn = $null } }
+    if (-not $gone) { return @{ why = "agent pid $($before.pid) still alive 30 s after its task instance was stopped"; warn = $null } }
     $warn = Get-ArrivalWarning
+    # the definition can be edited between the binding and now, and /Run STARTS whatever it says: read it again, as the last step
+    # before the start, and refuse to start a definition that no longer runs this script and root (the old agent is down: said so)
+    $nowXml = Get-TaskXml
+    if (-not $nowXml.ok) { return @{ why = "the old agent is stopped but the task was NOT started: $($nowXml.why)"; warn = $warn } }
+    if (-not (Test-TaskXmlRunsScript -Xml $nowXml.xml -AgentScript $AgentScript)) {
+        return @{ why = "the old agent is stopped but the task was NOT started: its definition changed and no longer runs -File $AgentScript for this root"; warn = $warn }
+    }
     $runAt = [DateTime]::UtcNow
     $run = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName) -TimeoutSec 30
     if ($run.timedOut) { return @{ why = "schtasks /Run $TaskName did not return within 30 s"; warn = $warn } }
