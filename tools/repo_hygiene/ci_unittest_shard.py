@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, TextIO
@@ -353,6 +354,7 @@ class ClassTimingResult(unittest.TextTestResult):
         self._current: str | None = None
         self.class_seconds: dict[str, float] = {}
         self.started_ids: list[str] = []
+        self._started_members: set[int] = set()  # by identity: two members may share one id()
         self.fixture_skips: list[tuple[str, str]] = []
 
     def addSkip(self, test: unittest.TestCase, reason: str) -> None:  # noqa: N802
@@ -365,13 +367,12 @@ class ClassTimingResult(unittest.TextTestResult):
 
     def skipped_by_fixture(self, members: list[unittest.TestCase]) -> list[str]:
         """Ids of ``members`` that never started because their class or module fixture skipped."""
-        started = set(self.started_ids)
         classes = {name for kind, name in self.fixture_skips if kind == "setUpClass"}
         modules = {name for kind, name in self.fixture_skips if kind == "setUpModule"}
         return [
             test.id()
             for test in members
-            if test.id() not in started and (unit_key(test) in classes or type(test).__module__ in modules)
+            if id(test) not in self._started_members and (unit_key(test) in classes or type(test).__module__ in modules)
         ]
 
     def startTestRun(self) -> None:  # noqa: N802
@@ -381,6 +382,7 @@ class ClassTimingResult(unittest.TextTestResult):
 
     def startTest(self, test: unittest.TestCase) -> None:  # noqa: N802
         self.started_ids.append(test.id())
+        self._started_members.add(id(test))  # the member is held by the suite for the whole run: no id reuse
         self.enter(unit_key(test))
         super().startTest(test)
 
@@ -740,7 +742,14 @@ def run_worker(spec_path: Path) -> int:
     return 0
 
 
-def _worker_record(path: Path) -> dict | None:
+MAX_CLASS_SECONDS = 10_000_000.0  # about 115 days: past any job cap, and a bound that NaN, inf and a huge int all fail
+
+
+def _worker_record(path: Path, assigned: Sequence[unittest.TestCase] | None = None) -> dict | None:
+    """The worker's result record, or ``None`` when it is missing, malformed or contradicts itself.
+
+    With ``assigned`` (the members this worker was given) the record must also agree with them: it may
+    time only their classes and name only their ids, so one worker cannot report another's work."""
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except BaseException as error:  # noqa: BLE001 - unreadable, not JSON, too deep, or an audit hook's SystemExit: no result
@@ -754,13 +763,18 @@ def _worker_record(path: Path) -> dict | None:
         and isinstance(record.get("skipped_ids"), list)
         and all(isinstance(item, str) for item in record["skipped_ids"])
         and isinstance(record.get("seconds"), dict)
-        and all(type(value) in (int, float) and math.isfinite(value) and value >= 0 for value in record["seconds"].values())
+        and all(type(value) in (int, float) and 0 <= value <= MAX_CLASS_SECONDS for value in record["seconds"].values())
         and type(record.get("tests_run")) is int
         # unittest counts a test when it starts, and ``started_ids`` is appended at the same moment, so a
         # real worker's count is exactly its id count: a record that says otherwise is not one it wrote.
         and record["tests_run"] == len(record["ids"])
         and type(record.get("ok")) is bool
     )
+    if ok and assigned is not None:
+        owned = {unit_key(test) for test in assigned}
+        left = Counter(record["ids"]) + Counter(record["skipped_ids"])
+        left.subtract(Counter(test.id() for test in assigned))
+        ok = set(record["seconds"]) <= owned and not any(count > 0 for count in left.values())
     return record if ok else None
 
 
@@ -1199,8 +1213,8 @@ def run_parallel(
             log.close()
             codes.append(proc.returncode)
         report_unended()
-        for path in logs:
-            records.append(_worker_record(path.with_name("result.json")))
+        for path, classes in zip(logs, groups, strict=False):  # logs is a prefix of groups: a launch can stop early
+            records.append(_worker_record(path.with_name("result.json"), [test for key in classes for test in units[key]]))
         for record in records:
             if record:
                 merged.update({key: float(value) for key, value in record["seconds"].items()})
@@ -1274,10 +1288,13 @@ def run_parallel(
     accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])
     expected = sorted(test.id() for test in members)
     if accounted != expected:
-        missing, extra = sorted(set(expected) - set(accounted)), sorted(set(accounted) - set(expected))
+        # By multiplicity: two members may share one id(), so a set difference would say 0/0/0 over a real gap.
+        want, got = Counter(expected), Counter(accounted)
+        missing = sum((want - got).values())
+        extra = sum(count for item, count in got.items() if item not in want)
+        repeated = sum(count - want[item] for item, count in got.items() if item in want and count > want[item])
         problems.append(
-            f"the workers' ids are not exactly the shard's: {len(missing)} missing, {len(extra)} extra, "
-            f"{len(accounted) - len(set(accounted))} repeated"
+            f"the workers' ids are not exactly the shard's: {missing} missing, {extra} extra, {repeated} repeated"
         )
     if manifest is not None and not problems:
         write_manifest(manifest, ran)

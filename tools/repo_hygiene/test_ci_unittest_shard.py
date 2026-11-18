@@ -2134,7 +2134,7 @@ class ShardExitCodeTests(unittest.TestCase):
             command = args[0]
             spec = json.loads(Path(command[command.index("--worker-spec") + 1]).read_text(encoding="utf-8"))
             Path(spec["result"]).write_text(
-                json.dumps({"ids": [], "skipped_ids": [], "seconds": {"fx.A": 1.0}, "tests_run": 0, "ok": False}),
+                json.dumps({"ids": [], "skipped_ids": [], "seconds": {spec["classes"][0]: 1.0}, "tests_run": 0, "ok": False}),
                 encoding="utf-8",
             )
             proc = real(*args, **kwargs)
@@ -2365,6 +2365,88 @@ class ShardExitCodeTests(unittest.TestCase):
                     )
                 self.assertEqual(code, 1, err.getvalue())
                 self.assertIn("wrote no readable result", err.getvalue())
+
+    # r11 adversary A1 (pass 18): a record must also agree with what THIS worker was assigned, not only with itself.
+    def test_a_worker_record_naming_classes_or_ids_it_was_not_assigned_fails_the_shard(self) -> None:
+        def foreign_timing(record: dict, _other_ids: list[str]) -> None:
+            record["seconds"] = {"other.D": 900.0}
+
+        def foreign_id(record: dict, other_ids: list[str]) -> None:
+            record["ids"] = record["ids"] + other_ids[:1]
+            record["tests_run"] = len(record["ids"])
+
+        for label, mutate in (("a timing for an unassigned class", foreign_timing), ("an id of another worker", foreign_id)):
+            with self.subTest(label):
+                root, tests, tag = self._fixture()
+                assigned: dict[str, list[str]] = {}
+
+                class LiarPopen:
+                    def __init__(self, command: list[str], **kwargs: object) -> None:
+                        spec = json.loads(Path(command[command.index("--worker-spec") + 1]).read_text(encoding="utf-8"))
+                        key = spec["result"]
+                        assigned[key] = [t.id() for t in tests if f"{type(t).__module__}.{type(t).__qualname__}" in spec["classes"]]
+                        others = [i for k, ids in assigned.items() if k != key for i in ids]
+                        record = {"ids": list(assigned[key]), "skipped_ids": [], "seconds": {}, "tests_run": len(assigned[key]), "ok": True}
+                        mutate(record, others or [t.id() for t in tests])
+                        Path(key).write_text(json.dumps(record), encoding="utf-8")
+                        self.returncode = 0
+
+                    def poll(self) -> int:
+                        return 0
+
+                    def wait(self, timeout: float | None = None) -> int:
+                        return 0
+
+                    def kill(self) -> None:
+                        pass
+
+                out, err = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(shard.subprocess, "Popen", LiarPopen),
+                    contextlib.redirect_stdout(out),
+                    contextlib.redirect_stderr(err),
+                ):
+                    code = shard.run_parallel(
+                        tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                        repo_root=REPO_ROOT, pins={}, environ={}, timeout=120.0,
+                    )
+                self.assertEqual(code, 1, out.getvalue() + err.getvalue())
+                self.assertNotIn("other.D", out.getvalue(), "an unassigned class's timing reached the report")
+
+    # r11 adversary A2 (pass 18): two members sharing one id() must both be accounted when their fixture skips.
+    def test_a_fixture_skip_is_accounted_per_member_not_per_id(self) -> None:
+        class SharedA(unittest.TestCase):
+            def id(self) -> str:  # noqa: A003 - the point of the test: two distinct members, one id
+                return "shared"
+
+            def test_one(self) -> None:
+                pass
+
+        class SharedB(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls) -> None:
+                raise unittest.SkipTest("fixture")
+
+            def id(self) -> str:  # noqa: A003
+                return "shared"
+
+            def test_one(self) -> None:
+                pass
+
+        members = [SharedA("test_one"), SharedB("test_one")]
+        result = unittest.TextTestRunner(stream=io.StringIO(), resultclass=shard.ClassTimingResult).run(
+            shard.ClassTimingSuite(members)
+        )
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(result.started_ids, ["shared"])
+        self.assertEqual(result.skipped_by_fixture(members), ["shared"], "the fixture-skipped member was dropped by id")
+
+    def test_a_worker_timing_too_large_for_float_is_unreadable_not_an_exception(self) -> None:
+        path = Path(tempfile.mkdtemp(prefix="fxw-")) / "result.json"
+        self.addCleanup(shutil.rmtree, path.parent, True)
+        text = '{"ids": ["m.C.test_a"], "skipped_ids": [], "seconds": {"m.C": 1' + "0" * 309 + '}, "tests_run": 1, "ok": true}'
+        path.write_text(text, encoding="utf-8")
+        self.assertIsNone(shard._worker_record(path))
 
     def test_a_worker_result_whose_counts_or_timings_contradict_itself_is_unreadable(self) -> None:
         path = Path(tempfile.mkdtemp(prefix="fxw-")) / "result.json"
