@@ -3037,6 +3037,24 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     )
     $ddR9SibMiss = @($ddR9Sib | Where-Object { -not (Test-CredentialText $_) })
     Assert-That ($ddR9SibMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 sibling sweep: all $($ddR9Sib.Count) other record forms refuse" ("misses=$($ddR9SibMiss.Count): " + (($ddR9SibMiss | Select-Object -First 3) -join '; '))
+    # r9 (adversary pass 18 A1, defect class: an alternative reading judged without the residual-view check): a text with BOTH an outer-reader escape and a markup reference is also walked
+    # as its markup-only reading ('&#58;' decoded, the backslash forms left), and that reading's residual view ('\\U0011FFFF' exposed, '\n' neutralised) was never judged.
+    $ddR9Rv = [System.Collections.Generic.List[string]]::new()
+    foreach ($ddR9Frame in @(
+            @{ Gap = ($ddBsA2 + 'n'); Name = 'a decoded line break' }, @{ Gap = ($ddBsA2 + 'u0020'); Name = 'a decoded blank' }, @{ Gap = ($ddBsA2 + 't'); Name = 'a decoded tab' })) {
+        $ddR9RvKey = 'ab' + $ddBsA2 + $ddBsA2 + 'U0011FFFF' + $ddR9Frame.Gap + 'cd'
+        $ddR9Rv.Add('{"' + $ddR9RvKey + '"&#58;"x"}')
+        $ddR9Rv.Add('{"' + $ddR9RvKey + '"&#x3a;"x"}')
+        $ddR9Rv.Add('&#91;"' + $ddR9RvKey + '"&#93;' + "`n" + 'x="hunter2"')
+        $ddR9Rv.Add($ddR9RvKey + '&#61;x')
+    }
+    $ddR9RvMiss = @($ddR9Rv | Where-Object { -not (Test-CredentialText $_) })
+    Assert-That ($ddR9RvMiss.Count -eq 0) "DENY-BY-DEFAULT-1 r9 adv p18 A1: all $($ddR9Rv.Count) markup-only readings that expose an undecodable escape refuse" ("misses=$($ddR9RvMiss.Count): " + (($ddR9RvMiss | Select-Object -First 3) -join '; '))
+    if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r9 A1 role guard') {
+        $ddR9RvRole = @($ddR9Rv | Where-Object { -not (Test-CredentialNamePresent $_) })
+        Assert-That ($ddR9RvRole.Count -eq 0) "DENY-BY-DEFAULT-1 r9 adv p18 A1 role guard: all $($ddR9Rv.Count) name a secret" ("misses=$($ddR9RvRole.Count): " + (($ddR9RvRole | Select-Object -First 3) -join '; '))
+    }
+    Assert-That (-not (Test-CredentialText ('{"ab' + $ddBsA2 + 'ncd"&#58;"x"}'))) 'DENY-BY-DEFAULT-1 r9 adv p18 A1 must-pass: a decodable key with a markup reference is not a credential'
     # r8 (adversary pass 17 A2, defect class: the reported line counted a line break that a decode produced): the line is the line of the SOURCE, not of the decoded copy
     $ddR8Line = @(
         @{ T = ('{"note":"' + $ddBsA2 + 'n","' + $ddBsA2 + 'u0070assword":"hunter2"}'); Want = 1; N = 'a decoded \n before the key on one source line' },

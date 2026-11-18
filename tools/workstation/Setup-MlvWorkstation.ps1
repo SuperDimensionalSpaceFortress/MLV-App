@@ -1874,18 +1874,32 @@ function Get-CredentialDecodeChildren([string]$S, [string]$Mask, [bool]$Alternat
     $kids.Add([pscustomobject]@{ Text = $S; Mask = $Mask })
     return $kids.ToArray()
 }
-function Find-CredentialBranchHit([string]$S, [string]$Mask, [int]$Level, [scriptblock]$OnStage, $Seen) {
+# r10 (adversary pass 18 A1, defect class: an alternative decode reading judged WITHOUT the residual-view check): the residual view of a text (Get-CredentialResidualView) is judged
+# before that text is decoded, on the walk's own levels AND on every node of an alternative reading. A markup-only reading ('{"ab\\U0011FFFF\ncd"&#58;"x"}' with only '&#58;' decoded)
+# exposes an undecodable escape that its NEXT decode pairs with a line break, so its view must be judged too. One helper, used by both: $null when the view holds no undecodable escape
+# or no hit, else the hit (.Text is the VIEW, as the walk's own hit has always been).
+function Find-CredentialViewHit([string]$S, [string]$Mask, [int]$Level, [scriptblock]$OnView) {
+    if (-not $OnView -or $S.IndexOfAny($script:CredentialEscapeStarts) -lt 0) { return $null }
+    $vw = Get-CredentialResidualView $S
+    if (-not $script:CredentialResidualIntroRegex.IsMatch($vw)) { return $null }
+    $got = @(& $OnView $vw $Mask)
+    if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $vw; Mask = $Mask; Levels = $Level; Hit = [int]$got[-1] } }
+    return $null
+}
+function Find-CredentialBranchHit([string]$S, [string]$Mask, [int]$Level, [scriptblock]$OnStage, $Seen, [scriptblock]$OnView = $null) {
     if (-not $Seen.Add((Get-CredentialTextKey $S $Mask))) { return $null }
     $script:CredentialBranchNodes++
     if ($script:CredentialBranchNodes -gt $script:CredentialMaxBranchNodes) { throw (New-CredentialDecodeLimitError "the text can be decoded in more than $($script:CredentialMaxBranchNodes) different orders") }
     Use-CredentialViewBudget (3 * $S.Length)
     $got = @(& $OnStage $S $Mask)
     if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $S; Mask = $Mask; Levels = $Level; Hit = [int]$got[-1] } }
+    $viewHit = Find-CredentialViewHit $S $Mask $Level $OnView
+    if ($viewHit) { return $viewHit }
     $kids = @(Get-CredentialDecodeChildren $S $Mask $true)
     if ($kids.Count -eq 0) { return $null }
     if ($Level + 1 -gt $script:CredentialMaxDecodeStages) { throw (New-CredentialDecodeLimitError "the text still decodes after $($script:CredentialMaxDecodeStages) levels") }
     foreach ($kid in $kids) {
-        $found = Find-CredentialBranchHit $kid.Text $kid.Mask ($Level + 1) $OnStage $Seen
+        $found = Find-CredentialBranchHit $kid.Text $kid.Mask ($Level + 1) $OnStage $Seen $OnView
         if ($found) { return $found }
     }
     return $null
@@ -1903,13 +1917,9 @@ function Get-CredentialNormalFormWalk([string]$Text, [scriptblock]$OnStage = $nu
         # r6 (adversary pass 13 A2): the residual view of the text about to be decoded (see Get-CredentialResidualView); a hit ends the walk on the view (same length as the level text)
         # r6 (adversary pass 14 A1): the view is built whenever the text holds a character an escape starts with ('\', '&', '%', a backtick), NOT only when an introducer already stands in it:
         # '{"ab\\U0011FFFF\ncd":"x"}' has no introducer until its '\\' is decoded. It is judged only when the VIEW holds an undecodable escape.
-        if ($OnView -and $s.IndexOfAny($script:CredentialEscapeStarts) -ge 0) {
-            $vw = Get-CredentialResidualView $s
-            if ($script:CredentialResidualIntroRegex.IsMatch($vw)) {
-                $got = @(& $OnView $vw $mask)
-                if ($got.Count -gt 0 -and [int]$got[-1] -ge 0) { return [pscustomobject]@{ Text = $vw; Mask = $mask; Levels = $levels; Hit = [int]$got[-1] } }
-            }
-        }
+        # r10 (adversary pass 18 A1): the same check on every node of an alternative reading (Find-CredentialViewHit, called by Find-CredentialBranchHit too)
+        $viewHit = Find-CredentialViewHit $s $mask $levels $OnView
+        if ($viewHit) { return $viewHit }
         # r6 (adversary pass 13 A1, defect class: decode order): a doubled quote belongs to the OUTER reader (PowerShell, YAML, CSV), so it is collapsed on a level of its own, BEFORE
         # the escapes and character references that the string holds are decoded and judged ('$x = ''<add key=''''k'''' value=''''hunt&#39;er2'''' />''' must reach the XML rule with
         # its quoting intact: collapsing it on the same level as '&#39;' leaves 'value=''hunt''er2''' and no start tag). Only when the text holds a doubled quote at all.
@@ -1926,7 +1936,7 @@ function Get-CredentialNormalFormWalk([string]$Text, [scriptblock]$OnStage = $nu
             if (-not $seen) { $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal) }
             [void]$seen.Add((Get-CredentialTextKey $next.Text $next.Mask))   # the combined step is judged below, by the walk itself
             for ($ki = 0; $ki -lt $kids.Count - 1; $ki++) {
-                $found = Find-CredentialBranchHit $kids[$ki].Text $kids[$ki].Mask $levels $OnStage $seen
+                $found = Find-CredentialBranchHit $kids[$ki].Text $kids[$ki].Mask $levels $OnStage $seen $OnView
                 if ($found) { return $found }
             }
         }
