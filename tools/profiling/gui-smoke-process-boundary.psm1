@@ -53,10 +53,14 @@ function Get-GuiSmokeNoProgressWindowMs {
         [ValidateRange(0, 3600000)]
         [int64]$OverrideMs = 0,
         [ValidateRange(0, 3600000)]
-        [int64]$CeilingMs = 0
+        [int64]$CeilingMs = 0,
+        # r10 (adversary A1): the accepted owner-input read allowance (the part of the hard deadline beyond the default 120 s setup/teardown)
+        # also covers a synchronous load that writes no log line, so the silence window carries it too.
+        [ValidateRange(0, 3600000)]
+        [int64]$ReadAllowanceMs = 0
     )
 
-    $window = if ($OverrideMs -gt 0) { $OverrideMs } else { $LegBudgetMs + $MarginMs }
+    $window = if ($OverrideMs -gt 0) { $OverrideMs } else { $LegBudgetMs + $MarginMs + $ReadAllowanceMs }
     if ($CeilingMs -gt 0 -and $window -gt $CeilingMs) { $window = $CeilingMs }
     return [int64]$window
 }

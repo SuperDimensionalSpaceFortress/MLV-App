@@ -776,5 +776,42 @@ Import-Module $env:GS_BUDGET -Force
             self.assertIn(name, exports)
 
 
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class OwnerInputLegSilenceWindowKeepsTheReadAllowance(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r9 (adversary 38406862 A1, major): r8 made the HARD deadline of an owner-input leg keep its accepted app read
+    allowance, but the SILENCE window (leg budget + 60 s, armed at the app's first log line) still did not: a healthy synchronous load of the owner clip
+    that writes no log line for longer than that window was killed at about 247 s despite a 1285000 ms hard deadline. Class: a budget the runner accepts
+    for one wait is dropped by a sibling wait (the three Test-GuiSmokeLogProgressStalled call sites all read the one window)."""
+
+    def test_helper_widens_the_window_by_the_read_allowance_and_the_hard_deadline_still_caps_it(self) -> None:
+        out = run_ps(r"""
+[pscustomobject]@{
+    none = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 187000 -CeilingMs 1285000
+    widened = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 187000 -ReadAllowanceMs 600000 -CeilingMs 1285000
+    capped = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 187000 -ReadAllowanceMs 1152000 -CeilingMs 1285000
+    overrideWins = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 187000 -ReadAllowanceMs 600000 -OverrideMs 90000 -CeilingMs 1285000
+} | ConvertTo-Json -Compress
+""")
+        self.assertEqual(187000 + 60000, out["none"], "no read allowance: the window is unchanged")
+        self.assertEqual(187000 + 60000 + 600000, out["widened"])
+        self.assertEqual(1285000, out["capped"], "the window never outlasts the hard deadline")
+        self.assertEqual(90000, out["overrideWins"], "an explicit -NoProgressTimeoutMs still replaces the derived window")
+
+    def _runner_window(self, allowance_ms: int) -> int:
+        out = run_ps(
+            "$NoProgressTimeoutMs = 0; $LegHardLimitAllowanceMs = " + str(allowance_ms) + "; $derivedProcessTimeoutMs = 187000; $effectiveProcessTimeoutMs = 1285000\n"
+            "$logRoot = $env:GS_TMP\n" + _runner_snippet("$noProgressOverrideMs = if", "$noProgressWatch = New-GuiSmokeLogProgressWatch") +
+            "\n[pscustomobject]@{ window = [int64]$noProgressWindowMs } | ConvertTo-Json -Compress")
+        return int(out["window"])
+
+    def test_the_runner_hands_an_accepted_owner_read_allowance_to_the_silence_window(self) -> None:
+        # the adversary's input: runner -LegHardLimitAllowanceMs 1272000 (120 s setup/teardown + 1152 s read) under a 1285000 ms hard deadline
+        self.assertEqual(1285000, self._runner_window(1272000), "the silence watchdog killed a healthy load at 247 s: it did not keep the read allowance")
+
+    def test_a_leg_with_no_declared_allowance_keeps_its_leg_budget_window(self) -> None:
+        self.assertEqual(187000 + 60000, self._runner_window(0))
+        self.assertEqual(187000 + 60000, self._runner_window(120000), "the 120 s setup/teardown default is not a read allowance")
+
+
 if __name__ == "__main__":
     unittest.main()

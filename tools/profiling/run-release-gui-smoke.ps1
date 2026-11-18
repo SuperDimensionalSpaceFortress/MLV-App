@@ -1997,7 +1997,7 @@ $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
 # adds the input re-read there). The watch arms at the app's first log line; before that only the whole budget bounds the wait.
 # r4 (adversary b0a33ba9 A5): an explicit -NoProgressTimeoutMs below 1000 ms is clamped up to 1000 ms (0 stays "derived from the leg")
 $noProgressOverrideMs = if ($NoProgressTimeoutMs -gt 0) { [Math]::Max(1000, $NoProgressTimeoutMs) } else { 0 }
-$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $effectiveProcessTimeoutMs
+$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $effectiveProcessTimeoutMs -ReadAllowanceMs ([Math]::Max(0, $LegHardLimitAllowanceMs - 120000))
 $noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noProgressWindowMs
 # r3 (adversary 797947a7 A2): no chunked wait may outlast a fraction of the window, or a short window would permit one chunk (up to 60 s) of silence.
 $noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs
