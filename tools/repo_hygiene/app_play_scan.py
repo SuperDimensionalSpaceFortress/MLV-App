@@ -292,16 +292,26 @@ _BLOCK_PREFIX = re.compile(
 # next declaration's prefix starts after it. It is not thereby a plain block context: that is _BLOCK_PREFIX, strictly.
 _FUNCTION_BODY_HEAD = re.compile(rf"\(\){_DECL_SPECS}{_CTOR_INIT}$")
 # (a) one parameter: cv QKeyEvent cv [*&] cv name, nothing else (no default argument, no template, no array).
-_KEY_EVENT_PARAM = re.compile(rf"\s*(?:(?:const|volatile)\s+)*QKeyEvent\s*{_CV}[*&]\s*{_CV}(?:\w+)?\s*")
+_KEY_EVENT_PARAM = re.compile(rf"\s*(?:(?:const|volatile)\s+)*QKeyEvent\s*{_CV}[*&]\s*{_CV}(?P<name>\w+)?\s*")
 _PARAM_LIST_END = re.compile(
     r"\s*(?:[{;]|=\s*(?:0|default|delete)\b|->|(?:const|volatile|override|final|noexcept|mutable|Q_DECL_OVERRIDE)\b)")
-# (b) the whole statement: `[cv] QKeyEvent|auto cv* name = <named cast><cv QKeyEvent cv*>( ... ) [->member()] ;`, or the
-# same cast assigned to a name or returned. The cast operand is a nested group, scanned on its own (a ref inside it has
-# a parenthesis as its context, so it is flagged).
+# The members a delivered key event is READ through (r6 adversary pass on c1f09601 A1: anything else -- clone() -- may
+# build one). A new member is reviewed here.
+_KEY_EVENT_READ_MEMBERS = (r"(?:key|modifiers|accept|ignore|setAccepted|isAccepted|type|text|isAutoRepeat|count|spontaneous"
+                           r"|nativeScanCode|nativeVirtualKey|nativeModifiers|keyCombination|matches)\b")
+_KEY_EVENT_READ_USE = re.compile(rf"\s*(?:->|\.)\s*{_KEY_EVENT_READ_MEMBERS}\s*\(")   # `.` for a reference
+# (b) the whole statement: `[cv] QKeyEvent|auto cv* name = <named cast><cv QKeyEvent cv*>( ... );`, the same cast
+# assigned to a name, or the cast read through one reviewed member (`return static_cast<QKeyEvent*>( e )->key();`).
+# The cast operand is a nested group, scanned on its own (a ref inside it has a parenthesis as its context: flagged).
+_KEY_EVENT_CAST = (rf"(?:static_cast|dynamic_cast|reinterpret_cast|const_cast|qobject_cast)\s*<\s*(?:(?:const|volatile)\s+)*"
+                   rf"QKeyEvent\s*{_CV}[*&]\s*{_CV}>\s*\(\)")
 _KEY_EVENT_CAST_STATEMENT = re.compile(
-    rf"\s*(?:(?:(?:const|volatile)\s+)*(?:QKeyEvent|auto)\s*{_CV}[*&]\s*{_CV}\w+\s*=|\w+\s*=|return)\s*"
-    rf"(?:static_cast|dynamic_cast|reinterpret_cast|const_cast|qobject_cast)\s*<\s*(?:(?:const|volatile)\s+)*"
-    rf"QKeyEvent\s*{_CV}[*&]\s*{_CV}>\s*\(\)(?:\s*->\s*\w+\s*\(\))?\s*")
+    rf"\s*(?:(?:(?:const|volatile)\s+)*(?:QKeyEvent|auto)\s*{_CV}[*&]\s*{_CV}(?P<name>\w+)\s*=\s*{_KEY_EVENT_CAST}"
+    rf"|(?P<assigned>\w+)\s*=\s*{_KEY_EVENT_CAST}"
+    rf"|(?:return\s+|[\w\s:]*\w\s*=\s*)?{_KEY_EVENT_CAST}\s*->\s*{_KEY_EVENT_READ_MEMBERS}\s*\(\))\s*")
+# r6 adversary pass on c1f09601 A1: a type-of operator computes a type from an EXPRESSION, so it can name the object type
+# of a delivered key event with no QKeyEvent spelled. No scanned source uses one; a new use is reviewed here.
+_TYPE_OF_OPERATOR = re.compile(r"\b(?:decltype|typeof|__typeof__|__typeof)\b")
 
 
 class _Brackets:
@@ -383,10 +393,11 @@ class _Brackets:
         return True
 
 
-def _key_event_ref_is_delivered_read(brackets: _Brackets, pos: int) -> bool:
-    """Whether the `QKeyEvent` pointer / reference at `pos` is one of the two reviewed delivered-event reads."""
+def _key_event_ref_is_delivered_read(brackets: _Brackets, pos: int) -> tuple[str, int, int] | None:
+    """The binding of the `QKeyEvent` pointer / reference at `pos` when it is one of the two reviewed delivered-event reads
+    -- (bound name or "", scope start, scope end) -- or None when it is anything else (flagged)."""
     if brackets.broken:
-        return False
+        return None
     text = brackets.text
     parent = brackets.enclosing(pos)
     # (a) a parameter declarator: the innermost group is a parameter list owned by a named function or a lambda, in a
@@ -396,35 +407,75 @@ def _key_event_ref_is_delivered_read(brackets: _Brackets, pos: int) -> bool:
         tokens = brackets.items(parent + 1, close)
         flat = "".join(token for token, _ in tokens)
         if "=" in flat or not _PARAM_LIST_END.match(text, close + 1):
-            return False
+            return None
         index = next((k for k, (_, at) in enumerate(tokens) if at == pos), None)
         if index is None:
-            return False
+            return None
         before = "".join(token for token, _ in tokens[:index])
         angle = before.replace("->", "")
         if angle.count("<") != angle.count(">"):     # a comma inside a template argument list is not a parameter break
-            return False
+            return None
         start = before.rfind(",") + 1
         rest = "".join(token for token, _ in tokens[index:])
         end = rest.find(",")
         segment = before[start:] + (rest if end < 0 else rest[:end])
-        if not _KEY_EVENT_PARAM.fullmatch(segment):
-            return False
+        param = _KEY_EVENT_PARAM.fullmatch(segment)
+        if not param:
+            return None
         owner = brackets.prefix(parent)
         if not _PARAM_LIST_OWNER.fullmatch(owner) or _NOT_A_PARAM_LIST_OWNER.search(owner):
-            return False
-        return brackets.block_context(brackets.enclosing(parent))
+            return None
+        outer = brackets.enclosing(parent)
+        if not brackets.block_context(outer):
+            return None
+        # The parameter's scope is the body that follows the list (none for a declaration).
+        for token, at in brackets.items(close + 1, brackets.closer[outer] if outer != -1 else len(text)):
+            if token == ";":
+                return param.group("name") or "", at, at
+            if token == "{}":
+                return param.group("name") or "", at, brackets.closer[at]
+        return None
     # (b) a named-cast statement in a plain block context.
     if parent != -1 and not brackets.block_context(parent):
-        return False
+        return None
+    scope_end = brackets.closer[parent] if parent != -1 else len(text)
     tail = []
-    for token, _ in brackets.items(pos, brackets.closer[parent] if parent != -1 else len(text)):
+    for token, at in brackets.items(pos, scope_end):
         if token == ";":
-            break
+            statement = _KEY_EVENT_CAST_STATEMENT.fullmatch(brackets.prefix(pos) + "".join(tail))
+            return (statement.group("name") or statement.group("assigned") or "", at, scope_end) if statement else None
         tail.append(token)
-    else:
-        return False
-    return bool(_KEY_EVENT_CAST_STATEMENT.fullmatch(brackets.prefix(pos) + "".join(tail)))
+    return None
+
+
+def _scan_key_event_reads(path: str, blank: str) -> list[str]:
+    """r6: every QKeyEvent pointer / reference is a reviewed delivered-event read, and what a read binds is only READ.
+
+    r6 adversary pass on c1f09601 A1: an exempt read bound a name, and a later statement built a key event from it with no
+    QKeyEvent spelled (`std::remove_pointer_t<decltype(keyType)> press{...}`, or a lambda that returns its parameter). The
+    class is "a delivered key event used to build one", closed fail-closed: a name a read binds is used, in its scope, only
+    as `name->` one of the reviewed read members, or as a whole call argument (handing the event on); a dereference, a
+    copy, a subscript, a clone, an alias or a return is flagged."""
+    problems: list[str] = []
+    brackets = None
+    bindings: set[tuple[str, int, int]] = set()
+    for match in _KEY_EVENT_REF.finditer(blank):
+        brackets = brackets or _Brackets(blank)
+        binding = _key_event_ref_is_delivered_read(brackets, match.start())
+        if binding is None:
+            problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
+        elif binding[0]:
+            bindings.add(binding)
+    for name, start, end in sorted(bindings, key=lambda b: b[1]):
+        for use in re.compile(rf"\b{re.escape(name)}\b").finditer(blank, start, end):
+            if _KEY_EVENT_READ_USE.match(blank, use.end()):
+                continue
+            if re.search(r"[(,]\s*$", blank[max(0, use.start() - 64):use.start()]) and re.match(r"\s*[,)]", blank[use.end():]):
+                continue
+            problems.append(f"{path}:{_line_of(blank, use.start())}: synthesized key event (the delivered key event `{name}` is "
+                            "used as anything but a reviewed member read or a whole call argument: a copy, a clone or a "
+                            "type computed from it builds a key event)")
+    return problems
 # r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
 _KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
 # PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
@@ -811,11 +862,11 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             if any(start <= match.start() < end for start, end in include_spans):
                 continue
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
-        brackets = None
-        for match in _KEY_EVENT_REF.finditer(blank):
-            brackets = brackets or _Brackets(blank)
-            if not _key_event_ref_is_delivered_read(brackets, match.start()):
-                problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
+        problems.extend(_scan_key_event_reads(path, blank))
+        for match in _TYPE_OF_OPERATOR.finditer(blank):
+            problems.append(f"{path}:{_line_of(blank, match.start())}: type-of operator {match.group(0)} (a type computed from "
+                            "an expression can name a delivered key event's type with no QKeyEvent spelled; reviewed in "
+                            "app_play_scan.py)")
         for match in _EVENT_POST.finditer(blank):
             key = (path, match.group(1))
             event_counts[key] = event_counts.get(key, 0) + 1

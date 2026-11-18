@@ -2574,7 +2574,9 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
 
     def test_r2_a1_a_cast_of_a_delivered_key_event_is_not_a_synthesized_key(self) -> None:
         # FocusGuard reads the ShortcutOverride the user's key produced; reading an event is not making one.
-        text = "bool f( QEvent *event ) { QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event ); return keyEvent; }\n"
+        # r6 (adversary pass on c1f09601 A1): a name a read binds is only READ (a bare `return keyEvent;` hands the pointer
+        # to a deduced type, so it is flagged now); the fixture reads it through a reviewed member, as FocusGuard does.
+        text = "bool f( QEvent *event ) { QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event ); return keyEvent->key(); }\n"
         # r5: the key table must hold its one reviewed binding (a count of zero fails), so the fixture carries it.
         self.assertEqual(self._key_synth_problems({self._SPACE_TABLE: self._SPACE_BINDING + text}), [])
 
@@ -2759,6 +2761,34 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         for name, injected in self._R6_TYPE_COMPUTATIONS.items():
             with self.subTest(name):
                 self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    # r6 adversary pass on c1f09601 A1: an exempt read binds a name, and a LATER statement computes the object type from it
+    # (no QKeyEvent spelled there). The class is "a delivered key event used to build one": no scanned source may use a
+    # type-of operator, and a name an exempt read binds is used only as a reviewed member read or a whole call argument.
+    _R6_P2_BUILT_FROM_A_READ = {
+        "A1 decltype of a cast-bound pointer": "auto *keyType = static_cast<QKeyEvent*>(nullptr); "
+                                               "std::remove_pointer_t<decltype(keyType)>" + _R6_PRESS,
+        "A1 __typeof__ of a cast-bound pointer": "auto *keyType = static_cast<QKeyEvent*>(nullptr); "
+                                                 "std::remove_pointer_t<__typeof__(keyType)>" + _R6_PRESS,
+        "A1 a lambda that returns its key-event parameter": "auto f = [](QKeyEvent* e) { return e; }; "
+                                                            "std::remove_pointer_t<decltype(f(nullptr))>" + _R6_PRESS,
+        "a copy through a dereference": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto copy = *k;",
+        "a copy through a subscript": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto copy = k[0];",
+        "a clone": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto *c = k->clone();",
+        "an alias pointer": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto *alias = k;",
+        "a parameter that escapes": "auto f = [](QKeyEvent *e) { auto copy = *e; };",
+    }
+
+    def test_r6_p2_a1_a_key_event_built_from_a_delivered_read_is_a_synthesized_key(self) -> None:
+        for name, injected in self._R6_P2_BUILT_FROM_A_READ.items():
+            with self.subTest(name):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "key event")
+
+    def test_r6_p2_a1_no_scanned_source_computes_a_type_from_an_expression(self) -> None:
+        for text in ("int f() { int a = 0; decltype(a) b = a; return b; }\n", "__typeof__(1) x = 1;\n", "typeof(1) y = 1;\n"):
+            with self.subTest(text):
+                problems = scan_app_play_sources({"platform/qt/OtherWidget.h": text})
+                self.assertTrue(any("type-of operator" in p for p in problems), problems)
 
     def test_r6_a1_a2_the_real_key_event_reads_stay_exempt(self) -> None:
         # The three real sites: a handler declaration, its definition, and FocusGuard's cast of the delivered event.
