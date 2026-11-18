@@ -752,6 +752,43 @@ class ExportEvidenceTests(unittest.TestCase):
                 self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p and "the disjoint stages" in p and f"inside {inside} mean" in p for p in got[i]["problems"]), got[i])
         self.assertEqual(got[2]["outcome"], "PASS", got[2])
 
+    def test_r11_adversary_a1_nested_render_stages_are_held_inside_debayered_frame_when_raw_uint16_is_absent(self) -> None:
+        """adversary r11 A1: raw_uint16 is a stage the app may not publish, which skipped both child pairs and their sum group: raw_uint16_disk_read and raw_uint16_decompress at 900 ms each
+        inside a 41 ms debayered_frame read PASS with 16x shares. The nested stages are held inside debayered_frame whether or not raw_uint16 is there."""
+        def log(disk: float, decomp: float, n: int = 480) -> str:
+            return "".join(f"[mlv-stage-timing] frame={i} stage={s} ms={ms:.3f}\n" for i in range(n)
+                           for s, ms in (("processed16_total", 56.0), ("debayered_frame", 41.0), ("processing", 15.0), ("raw_uint16_disk_read", disk), ("raw_uint16_decompress", decomp)))
+        criteria = leg("m16-1243-export-prores")["criteria"]["acceptance"]["cpu"]
+
+        def case(disk: float, decomp: float) -> dict:
+            return prores_case(maxFrames=480, stage=log(disk, decomp), batch=batch_log(480, verified=480, elapsed=60.0), criteria=criteria)
+        proc, got = evidence_cases([case(900.0, 900.0), case(3.0, 5.0), case(30.0, 30.0)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[0]["problems"]), got[0])
+        self.assertEqual(got[1]["outcome"], "PASS", got[1])   # control: small nested stages
+        self.assertEqual(got[2]["outcome"], "INVALID", got[2])   # 30 + 30 ms together do not fit a 41 ms parent beside... each fits, the SUM (60) does not
+        self.assertTrue(any("the disjoint stages" in p for p in got[2]["problems"]), got[2])
+
+    def test_r11_adversary_a2_the_llrawproc_remainder_and_its_lock_times_are_not_added_twice(self) -> None:
+        """adversary r11 A2: dng.c computes llrawproc_other as the llrawproc total less its seven timed children, so it RETAINS the lock times published beside it. A consistent profile
+        (producer 120, llrawproc 100 = dual_iso 30 + other 70, shared_lock 10 inside the 70) read INVALID because the groups added the lock to the remainder."""
+        def profile(producer: float) -> str:
+            doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+            for r in doc["frames"]:
+                for k in CDNG_STAGES:
+                    if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                        r[k] = 0.0
+                r.update({"producer_frame_ms": producer, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_other_ms": 70.0, "llrawproc_shared_lock_ms": 10.0})
+            return json.dumps(doc)
+        cases = [cdng_case(dualIsoExpected=True, profile=profile(p), criteria=[]) for p in (120.0, 102.0)]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in (0, 1):
+            with self.subTest(case=i):
+                self.assertFalse(any("EXPORT_STAGE_CONTAINMENT_MISMATCH" in p for p in got[i]["problems"]), got[i])
+                self.assertEqual(got[i]["outcome"], "PASS", got[i])
+
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string
         passed the shape and threw at the generator's double cast after a lease was spent."""
@@ -1242,6 +1279,14 @@ class ExportJobGeneratorTests(unittest.TestCase):
                                   "[ordered]@{ unconfirmed = (Get-DvExportOutcome -ResultToken 'EXPORT_KILL_UNCONFIRMED' -ExitCode 48 -Evidence $e -Criteria @()).outcome; "
                                   "timeout = (Get-DvExportOutcome -ResultToken 'EXPORT_TIMEOUT' -ExitCode 40 -Evidence $e -Criteria @()).outcome } | ConvertTo-Json -Compress")
         self.assertEqual(got, {"unconfirmed": "INVALID", "timeout": "FAIL"}, proc.stdout + proc.stderr)
+
+    def test_r11_adversary_a3_the_stage_record_size_read_cannot_cost_the_typed_kill_terminal(self) -> None:
+        """adversary r11 A3: after an unconfirmed kill the stage record can be removed or locked between Test-Path and Get-Item; that unguarded read threw into the finally and bypassed
+        EXPORT_KILL_UNCONFIRMED, the summary and exit 48. The read is best effort like every other file access on that path."""
+        text = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertNotIn("$stagePresent = (Test-Path -LiteralPath $stageEvidence -PathType Leaf) -and ((Get-Item -LiteralPath $stageEvidence).Length -gt 0)", text)
+        self.assertRegex(text, r"\$stagePresent = try \{ \(Test-Path -LiteralPath \$stageEvidence -PathType Leaf\) -and \(\(Get-Item -LiteralPath \$stageEvidence -ErrorAction Stop\)\.Length -gt 0\) \} catch \{")
+        self.assertLess(text.index("$stagePresent = try {"), text.index("$result = $(if ($timedOut -and -not $killConfirmed)"), "the read is settled before the result is typed")
 
     def test_every_schema_valid_quiescence_threshold_binds(self) -> None:
         """adversary r1 A5: the schema admits any threshold in (0, 100]; the generator binds each one (0.05 was refused by ValidateRange(0.1, 100))."""

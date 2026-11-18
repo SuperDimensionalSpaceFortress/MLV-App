@@ -344,7 +344,9 @@ try {
     $exported = if ($done.Count -eq 1) { [int64]$done[0].Groups['e'].Value } else { $null }
     $verified = @([regex]::Matches($logText, '(?m)^\[BATCH\] RENDER_VERIFIED \S+ decoded_frames=(?<n>[0-9]+)\b'))
     $stageEvidence = if ($Format -eq 'cdng-lossless') { $profilePath } else { $stageLog }
-    $stagePresent = (Test-Path -LiteralPath $stageEvidence -PathType Leaf) -and ((Get-Item -LiteralPath $stageEvidence).Length -gt 0)
+    # (adversary r11 A3: the same best-effort rule for the stage record's size: a survivor of an unconfirmed kill can remove or lock it between Test-Path and Get-Item, which threw into the finally
+    # and cost the typed terminal; an unreadable record is an absent one, and the classification below decides from the timeout first)
+    $stagePresent = try { (Test-Path -LiteralPath $stageEvidence -PathType Leaf) -and ((Get-Item -LiteralPath $stageEvidence -ErrorAction Stop).Length -gt 0) } catch { Write-JobTrace "step export stage record size error=$([string]$_.CategoryInfo.Reason)"; $false }
     $outputs = @()
     # r8 fix 2 (adversary r8 A2): with the tree NOT confirmed dead a survivor (ffmpeg) may still hold the .mov without read sharing, and hashing it threw into the finally before any
     # result was typed. Nothing is enumerated or hashed then: the output count is 0, the delete below is attempted and its failure is recorded (deleted=false), and the run

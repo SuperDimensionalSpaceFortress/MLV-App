@@ -277,6 +277,7 @@ if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachel
 # r11 (sol r9 B1): the export-budget preflight child's bounds (Get-ExportBudgetRefusal): a hard cap per child, and the seconds kept back from the room before -DeadlineUtc for the typed refusal
 $script:ExportBudgetPreflightCapSec = 120
 $script:ExportBudgetPreflightReserveSec = 2
+$script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one budget the killed child's kill wait and stream waits share, taken out of the room before the bound is set)
 foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
@@ -1365,10 +1366,13 @@ function Get-ExportBudgetRefusal([string]$Path) {
     # batch before any claim for ever. It is now a BOUNDED child: the room left before -DeadlineUtc (less $script:ExportBudgetPreflightReserveSec for the refusal) under a hard cap. No room, or
     # a child still running at its bound (killed with its tree; the kill is confirmed or said to be unconfirmed), is the typed refusal EXPORT_BUDGET_PREFLIGHT_TIMEOUT, which all three callers
     # turn into an exit 2 before any claim or lease. A clip that merely cannot be resolved stays what it was (the generator refuses it later, typed): only the HANG is refused here.
-    $room = ($deadline - [DateTime]::UtcNow).TotalSeconds - $script:ExportBudgetPreflightReserveSec
-    $boundSec = [int][Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
-    if ($boundSec -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
-    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec
+    # (adversary r11 A4: the room is compared as a DOUBLE before any Int32 narrowing: a -DeadlineUtc far in the past is a room of billions of negative seconds, which no [int] holds; A6: the child's
+    # post-bound cleanup waits (kill, both streams) share $script:ExportBudgetPreflightCleanupMs, which is taken out of the room too, so the whole call ends before -DeadlineUtc)
+    $room = ($deadline - [DateTime]::UtcNow).TotalSeconds - $script:ExportBudgetPreflightReserveSec - ($script:ExportBudgetPreflightCleanupMs / 1000.0)
+    $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
+    if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
+    $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
+    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
     if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }

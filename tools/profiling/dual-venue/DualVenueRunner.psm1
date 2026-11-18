@@ -4518,14 +4518,24 @@ $script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.jso
 # slack two clocks and rounding can honestly show (5 % + 1 ms); a pair whose parent or child is wholly absent is skipped (a stage the app did not run is permitted).
 $script:ExportStageContainTolerance = 1.05
 $script:ExportStageContainSlackMs = 1.0
+# (adversary r11 A1: raw_uint16 is a stage the app may not publish, which skipped both of its child pairs; the transitive pairs hold disk_read and decompress inside debayered_frame whether or not
+# raw_uint16 is present, as the stage tree above nests them)
 $script:ExportRenderedContainment = @(@('raw_uint16', 'debayered_frame'), @('raw_uint16_disk_read', 'raw_uint16'), @('raw_uint16_decompress', 'raw_uint16'), @('llrawproc', 'debayered_frame'),
-    @('debayered_frame', 'processed16_total'), @('processing', 'processed16_total'))
+    @('raw_uint16_disk_read', 'debayered_frame'), @('raw_uint16_decompress', 'debayered_frame'), @('debayered_frame', 'processed16_total'), @('processing', 'processed16_total'))
 $script:ExportCdngLlrawprocChildren = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_pre_dualiso_fix',
     'llrawproc_dual_iso', 'llrawproc_chroma_smooth', 'llrawproc_shared_lock', 'llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock', 'llrawproc_other')
 
+# r11 (adversary r11 A2): the DISJOINT partitions of the CDNG stage tree (src/dng/dng.c:569-605). producer_frame = raw_read + raw_decode + raw_unpack + the llrawproc TOTAL + dng_header + dng_pack +
+# dng_compress_encode + payload_clone (the llrawproc_* children are inside the total, so they are not in this list); llrawproc = the seven timed children + llrawproc_other (its remainder, which also
+# holds pre_dualiso_fix and the shared / refine / publish lock times: those are NOT in this partition).
+$script:ExportCdngProducerPartition = @('raw_read', 'raw_decode', 'raw_unpack', 'llrawproc', 'dng_header', 'dng_pack', 'dng_compress_encode', 'payload_clone')
+$script:ExportCdngLlrawprocPartition = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels', 'llrawproc_pattern_noise', 'llrawproc_dual_iso',
+    'llrawproc_chroma_smooth', 'llrawproc_other')
+
 # r8 fix 3 (adversary pass 10 A2): DISJOINT siblings together are inside their parent too: each below its parent is no proof that the pair is (10 + 10 ms inside a 10 ms parent).
 # Each group is (the disjoint children, the parent); the rendered tree's groups below.
-$script:ExportRenderedSumGroups = @(@(@('debayered_frame', 'processing'), 'processed16_total'), @(@('raw_uint16', 'llrawproc'), 'debayered_frame'), @(@('raw_uint16_disk_read', 'raw_uint16_decompress'), 'raw_uint16'))
+$script:ExportRenderedSumGroups = @(@(@('debayered_frame', 'processing'), 'processed16_total'), @(@('raw_uint16', 'llrawproc'), 'debayered_frame'), @(@('raw_uint16_disk_read', 'raw_uint16_decompress'), 'raw_uint16'),
+    @(@('raw_uint16_disk_read', 'raw_uint16_decompress'), 'debayered_frame'))
 
 function Get-DvExportContainmentProblem {
     # $null, or the EXPORT_STAGE_CONTAINMENT_MISMATCH problem naming the first child (and the count) whose mean exceeds its parent's, or the first disjoint group whose summed means do.
@@ -4812,7 +4822,9 @@ function Get-DvExportEvidence {
             # inside it, as the rendered call below holds its disjoint siblings; each below the parent was no proof that their sum is (40 + 30 + 30 + 40 ms inside a 41 ms producer_frame).
             # The llrawproc_* children are the partition of llrawproc (llrawproc_other is its remainder; dng.c clamps it at 0, which the 5 % + 1 ms slack covers), held together inside it the same way.
             # Replayed over the eight real receipts (638671c5, 0fc26d37, 2fcd3cf4, 64185ab8, dbd2fc28, f23fa981, 1e9153b6, 01905cfe): all still pass both groups.
-            $cdngSumGroups = @(@(@($script:ExportCdngProducerStages), 'producer_frame'), @(@($script:ExportCdngLlrawprocChildren), 'llrawproc'))
+            # (adversary r11 A2: the two groups are the PARTITIONS dng.c emits, not every stage with a name: llrawproc_other is total - the seven timed children, so it RETAINS pre_dualiso_fix and the
+            # three lock times, which are published beside it and must not be added to it again; and the llrawproc children are inside the llrawproc TOTAL, which the producer partition counts once)
+            $cdngSumGroups = @(@(@($script:ExportCdngProducerPartition), 'producer_frame'), @(@($script:ExportCdngLlrawprocPartition), 'llrawproc'))
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs -SumGroups $cdngSumGroups
             if ($null -ne $containment) { $problems.Add($containment) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed

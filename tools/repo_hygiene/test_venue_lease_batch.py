@@ -5803,6 +5803,22 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
         self.assertEqual(self.kinds(), [])
         self.assertFalse(self.claim_path.exists(), "no claim was written")
+        # adversary r11 A4: a -DeadlineUtc far in the past is a room of billions of negative seconds; narrowing that to an Int32 threw before the no-room test, so the scalar and set forms
+        # lost the typed refusal and the plan form reported a generic LEG_PLAN_INVALID. The room is compared as a double first.
+        for p in (self.events, self.claim_path, pid_file):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 ", r.stderr)
+        self.assertNotIn("LEG_PLAN_INVALID", r.stderr)
+        self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
 
     def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
         # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
