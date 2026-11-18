@@ -2862,6 +2862,20 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     $ddR2['r5 sol r4 A2 sibling: a YAML \a (BEL)'] = ('xml: "<add key=''pass' + $ddBs + 'aword'' value=''hunter2'' />"')
     $ddR2['r5 sol r4 A2 sibling: a YAML \_ (NBSP)'] = ('xml: "<add key=''pass' + $ddBs + '_word'' value=''hunter2'' />"')
     $ddR2['r5 sol r4 A2 sibling: a YAML \L in a JSON string'] = ('{"xml":"<add key=''pass' + $ddBs + 'Lword'' value=''hunter2'' />"}')
+    # r5 adversary pass 12 A1 (defect class: an escape a reader decodes that the normaliser left as written, the PowerShell form): a backtick-escaped quote frames an XML pair inside
+    # a PowerShell string, and the special backtick escapes (`n `t `r `a `b `e `f `v `0) are blanks or control characters inside a naming value ($ddBq is one backtick)
+    $ddBq = [string][char]0x60
+    $ddR2['r5 adv p12 A1 a backtick-escaped double quote frames the XML pair'] = ('$xml = "<add key=' + $ddBq + '"password' + $ddBq + '" value=' + $ddBq + '"hunter2' + $ddBq + '" />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-n inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'nword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-t inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'tword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-r inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'rword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-v inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'vword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-e inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'eword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-a inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'aword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-b inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'bword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-f inside the naming value'] = ('$xml = "<add key=''pass' + $ddBq + 'fword'' value=''hunter2'' />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-escaped quote and a backtick-n together'] = ('$xml = "<add key=' + $ddBq + '"pass' + $ddBq + 'nword' + $ddBq + '" value=' + $ddBq + '"hunter2' + $ddBq + '" />"')
+    $ddR2['r5 adv p12 A1 sibling: a backtick-escaped single quote frames the pair'] = ('$xml = "<add key=' + $ddBq + '''password' + $ddBq + ''' value=' + $ddBq + '''hunter2' + $ddBq + ''' />"')
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
     foreach ($pre in @('db:', 'db=', 'a.b:', 'x/', 'x?', 'x|', 'x#', 'x@')) {
@@ -2914,6 +2928,14 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
             }
         }
         Assert-That ($ddA2Miss.Count -eq 0 -and $ddA2N -eq 21) "DENY-BY-DEFAULT-1 r5 sol r4 A2 role guard: all $ddA2N YAML-escape XML naming values name a secret" ("misses=$($ddA2Miss.Count): " + (($ddA2Miss | Select-Object -First 4) -join '; '))
+        # r5 adversary pass 12 A1: the PowerShell backtick forms in an XML naming value or around its quotes name a secret whatever the value
+        $ddBq2 = [string][char]0x60
+        $ddA3Miss = [System.Collections.Generic.List[string]]::new(); $ddA3N = 0
+        foreach ($ddL in @('n', 't', 'r', 'v', 'e', 'a', 'b', 'f')) {
+            $ddA3N++; $ddT = ('$xml = "<add key=''pass' + $ddBq2 + $ddL + 'word'' value='''' />"'); if (-not (Test-CredentialNamePresent $ddT)) { $ddA3Miss.Add($ddT) }
+        }
+        $ddA3N++; $ddT = ('$xml = "<add key=' + $ddBq2 + '"password' + $ddBq2 + '" value=' + $ddBq2 + '"' + $ddBq2 + '" />"'); if (-not (Test-CredentialNamePresent $ddT)) { $ddA3Miss.Add($ddT) }
+        Assert-That ($ddA3Miss.Count -eq 0 -and $ddA3N -eq 9) "DENY-BY-DEFAULT-1 r5 adv p12 A1 role guard: all $ddA3N PowerShell backtick forms in an XML naming value name a secret" ("misses=$($ddA3Miss.Count): " + (($ddA3Miss | Select-Object -First 4) -join '; '))
         # must-pass: the new escapes do not make a plain Windows path in a settings file name a secret
         Assert-That (-not (Test-CredentialNamePresent ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 role guard must-pass: a JSON Windows path with \P \L \a \e \v \_ sequences names no secret'
         Assert-That (-not (Test-CredentialText ('{"path": "C:' + $ddBs2 + $ddBs2 + 'Program Files' + $ddBs2 + $ddBs2 + 'Local' + $ddBs2 + $ddBs2 + 'Logs", "theme": "dark"}'))) 'DENY-BY-DEFAULT-1 r5 must-pass: a JSON Windows path with \P \L sequences is not a credential'

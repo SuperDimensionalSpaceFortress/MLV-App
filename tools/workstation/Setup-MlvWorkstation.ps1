@@ -1650,8 +1650,13 @@ for ($credDigit = 0; $credDigit -lt 10; $credDigit++) { $script:CredentialPyName
 # ('<add key=''pass\nword'' .../>' inside a JSON string is the naming value 'pass<LF>word', 'password' once its blanks are removed). Each is decoded on its own level.
 # r5 (sol r4 A2, defect class: an escape a reader decodes that the normaliser left as written): the rest of the YAML double-quoted escape table is decoded on its own level
 # too: '\v' (VT), '\a' (BEL), '\e' (ESC), '\L' (U+2028) and '\P' (U+2029), '\_' (U+00A0), '\ ' (a blank) and '\<TAB>'. '\0' and '\N' stay undecoded, which the residual rule refuses.
-$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
+$script:CredentialEscapeRegex = [regex]::new('\\(?:u(?<u4>[0-9a-fA-F]{4})|U(?<u8>[0-9a-fA-F]{8})|x(?<x>[0-9a-fA-F]{2})|(?<sl>/)|(?<nl>\n[ \t]*)|(?<bs>\\)|(?<one>[ntrbf"vaeLP_ \t])|(?<oct>[0-7]{3})|N\{(?<nm>[A-Za-z0-9 \-]+)\})|&#(?<dec>[0-9]{1,8});|&#[xX](?<hex>[0-9a-fA-F]{1,8});|`u\{(?<psu>[0-9a-fA-F]{1,8})\}|`(?<psq>["''`$])|`(?<psl>[A-Za-z0-9_.\-])|%(?<pct>[0-9A-Fa-f]{2})|&(?<ent>amp|lt|gt|quot|apos);')
 $script:CredentialEntities = @{ 'amp' = '&'; 'lt' = '<'; 'gt' = '>'; 'quot' = '"'; 'apos' = "'" }
+# r5 (adversary pass 12 A1, defect class: an escape a reader decodes that the normaliser left as written): the special PowerShell backtick escapes were kept as written
+# ('"pass`nword"' is 'pass<LF>word' to PowerShell); each is decoded on its own level now, and a backtick-escaped quote, '$' or backtick is that character ('`"password`"' frames an XML pair).
+# (ordinal: '`N' is the letter N, only '`n' is a line break)
+$script:CredentialPsControls = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+foreach ($credPs in @(@('0', [string][char]0), @('a', [string][char]7), @('b', [string][char]8), @('e', [string][char]27), @('f', [string][char]12), @('n', "`n"), @('r', "`r"), @('t', "`t"), @('v', [string][char]11))) { $script:CredentialPsControls[$credPs[0]] = $credPs[1] }
 $script:CredentialOneLetterEscapes = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
 foreach ($credOne in @(@('n', "`n"), @('t', "`t"), @('r', "`r"), @('b', [string][char]8), @('f', [string][char]12), @('"', '"'),
         @('v', [string][char]11), @('a', [string][char]7), @('e', [string][char]27), @('L', [string][char]0x2028), @('P', [string][char]0x2029), @('_', [string][char]0xA0), @(' ', ' '), @("`t", "`t"))) { $script:CredentialOneLetterEscapes[$credOne[0]] = $credOne[1] }
@@ -1668,7 +1673,8 @@ $script:CredentialEscapeEval = {
         if ($g['bs'].Success) { return '\' }   # r4 pass 10 A1
         if ($g['one'].Success) { return $script:CredentialOneLetterEscapes[$g['one'].Value] }   # r4 pass 10 A2
         if ($g['x'].Success) { return [string][char][Convert]::ToInt32($g['x'].Value, 16) }
-        if ($g['psl'].Success) { if ('0abefnrtv'.Contains($g['psl'].Value)) { return $m.Value }; return $g['psl'].Value }
+        if ($g['psq'].Success) { return $g['psq'].Value }   # r5 adversary pass 12 A1: a backtick-escaped quote, '$' or backtick is that character
+        if ($g['psl'].Success) { if ($script:CredentialPsControls.ContainsKey($g['psl'].Value)) { return $script:CredentialPsControls[$g['psl'].Value] }; return $g['psl'].Value }
         if ($g['nm'].Success) {
             $nm = $g['nm'].Value.ToUpperInvariant()
             $lm = [regex]::Match($nm, '^LATIN (SMALL|CAPITAL) LETTER ([A-Z])$')
