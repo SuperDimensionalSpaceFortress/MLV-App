@@ -199,6 +199,7 @@ $script:UrlSecretParts = [System.Collections.Generic.List[string]]::new()
 # break, or follows the mid-line byte. It is recorded as a HEAD at any length; Write-Log redacts a head (and the rest of its word) only where it starts a line or follows
 # a redacted part, so a short head never blanks ordinary words elsewhere.
 $script:UrlSecretHeads = [System.Collections.Generic.List[string]]::new()
+$script:UrlSecretAnchors = [System.Collections.Generic.List[string]]::new()
 # r1 adversary pass 2 A2: a decoded part can hold a line break ('%0A': git's output is split there) or a byte that is not UTF-8 ('%FF'), so the part is also decoded
 # byte by byte (Latin-1) and every piece between two characters that are not printable ASCII is recorded on its own (from 6 characters on).
 function Add-UrlSecretPart([string]$Part, [int]$MinLength = 6) {
@@ -221,6 +222,13 @@ function Register-UrlSecretParts {
         $q = $rest.IndexOfAny([char[]]@('?', '#'))
         if ($q -ge 0) {
             Add-UrlSecretPart $rest.Substring($q + 1).TrimEnd(); Add-UrlSecretPart $rest.Substring($q).TrimEnd() 2
+            # r2 pass 5 A2/A3 (defect class: matching the secret by its own spelling, which git may print differently): the text BEFORE the '?' or '#' (the path git echoes
+            # without the scheme) is an ANCHOR, as written and decoded; Write-Log drops everything after an anchor's '?' or '#' to the end of the line, exactly as the
+            # scheme rule does for a 'scheme://' url, whatever bytes, embedded urls or rewritten text follow.
+            $anc = $rest.Substring(0, $q)
+            # git prints a file:// path with its leading '/' ('/C:/r.git?x') or without it ('C:/r.git#x', the fragment form), so both spellings are anchors
+            $ancForms = @($anc, $(try { [Uri]::UnescapeDataString($anc) } catch { $anc }))
+            foreach ($a in @($ancForms + @($ancForms | ForEach-Object { $_.TrimStart('/') }))) { if ($a.Length -ge 2 -and -not $script:UrlSecretAnchors.Contains($a)) { $script:UrlSecretAnchors.Add($a) } }
             # r2 pass 4 A3 (defect class: redaction-order dependence): the scheme rule runs first and rewrites an EMBEDDED url ('&redirect=https://h/x?q=1' becomes
             # '...https://h/x?***'), so the whole registered part no longer matches. Everything up to and including each embedded 'scheme://' survives that rule unchanged,
             # so each such prefix is recorded too.
@@ -245,6 +253,8 @@ function Write-Log {
     # r17 F2: the one sink for the console and the setup log; no line it writes carries a URL's userinfo or query string, whichever caller printed the URL
     # (a remote-mismatch refusal, a native command line, git's own error text quoting a remote)
     $Message = ConvertTo-RedactedUrlText $Message
+    # r2 pass 5 A2/A3: after the scheme rule (r1 A5 order), an anchor's '?' or '#' drops the rest of the line
+    foreach ($a in @($script:UrlSecretAnchors | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(' + [regex]::Escape($a) + ')[?#][^\r\n]*', '$1?***') }
     # DENY-BY-DEFAULT-1 S3: then every registered url secret part, wherever it stands (git's echo of a url without its scheme included); longest first (r1 A5: after the scheme rule)
     foreach ($p in @($script:UrlSecretParts | Sort-Object Length -Descending)) { $Message = $Message.Replace($p, '***') }
     # r2 pass 4 A2: a recorded HEAD (and the rest of its word) where it starts the line or follows a redacted part
@@ -1607,16 +1617,22 @@ $script:CredentialEscapeEval = {
 # ($script:CredentialResidualKeyRegex, $script:CredentialResidualIntroRegex). Each replacement is no longer than what it replaces and the loop stops when nothing changes.
 function Invoke-CredentialMaskedReplace {
     param([string]$S, [string]$Mask, [regex]$Regex, [scriptblock]$Eval)
-    $sb = [System.Text.StringBuilder]::new(); $mb = [System.Text.StringBuilder]::new(); $last = 0; $changed = $false
+    $sb = [System.Text.StringBuilder]::new(); $mb = [System.Text.StringBuilder]::new(); $last = 0; $changed = $false; $pendingMark = $false; $pendingAt = 0
     foreach ($m in $Regex.Matches($S)) {
         $r = [string](& $Eval $m)
         if ($r -ceq $m.Value) { continue }
         [void]$sb.Append($S, $last, $m.Index - $last); [void]$mb.Append($Mask, $last, $m.Index - $last)
+        if ($pendingMark -and $mb.Length -gt $pendingAt) { $mb[$pendingAt] = '1' }
+        $pendingMark = $false
         [void]$sb.Append($r); [void]$mb.Append('1', $r.Length)
+        # r2 pass 5 A1 (defect class: a decode that DELETES leaves no mark): an empty replacement (the escaped line break) marks the characters on both sides of where it
+        # stood, so '"password": \<newline>  null' (a decoded backslash that joins the next line) never reads as an exempt 'null'.
+        if ($r.Length -eq 0) { if ($mb.Length -gt 0) { $mb[$mb.Length - 1] = '1' }; $pendingMark = $true; $pendingAt = $mb.Length }
         $last = $m.Index + $m.Length; $changed = $true
     }
     if (-not $changed) { return $null }
     [void]$sb.Append($S, $last, $S.Length - $last); [void]$mb.Append($Mask, $last, $S.Length - $last)
+    if ($pendingMark -and $mb.Length -gt $pendingAt) { $mb[$pendingAt] = '1' }
     return [pscustomobject]@{ Text = $sb.ToString(); Mask = $mb.ToString() }
 }
 $script:CredentialLineBreakEval = { param($m) "`n" }

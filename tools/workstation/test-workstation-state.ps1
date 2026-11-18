@@ -2828,6 +2828,10 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         'p4 A1 sibling: a decoded line break ends the value'      = "pass\x77ord: \u000a"
         'p4 A1 sibling: a decoded # makes the value line a comment' = "`"password`":`n\x23 hunter2"
         'p4 A1 sibling: a decoded = in an ini-style value'        = "pass\x77ord=\x26#10;hunter2"
+        # r2 pass 5 A1: a decode that DELETES (a decoded backslash joins the next line) still marks the value
+        'p5 A1 a decoded backslash joins a null line'             = "`"password`": \`n  null"
+        'p5 A1 sibling: the same in a table body'                 = "[`"password`"]`nx = \`n  null"
+        'p5 A1 sibling: a raw escaped line break before null'     = "`"password`": \`n  null"
     }
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
@@ -2888,7 +2892,11 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         @{ N = 8; Url = ('file:///' + ((New-Scratch 'dd-s3-absent8') -replace '\\', '/') + '/absent.git?t=x%0Ay'); Tok = @('?t=x') },
         # r2 pass 4 A2: the short piece AFTER the decoded line break (git prints it at the start of its own line); A3: an embedded url in the query
         @{ N = 9; Url = ('file:///' + ((New-Scratch 'dd-s3-absent9') -replace '\\', '/') + '/absent.git?t=%0Aqzv'); Tok = @('qzv') },
-        @{ N = 10; Url = ('file:///' + ((New-Scratch 'dd-s3-absent10') -replace '\\', '/') + '/absent.git?token=fake-token-0010&redirect=https://h.example/x?q=1'); Tok = @('fake-token-0010') }
+        @{ N = 10; Url = ('file:///' + ((New-Scratch 'dd-s3-absent10') -replace '\\', '/') + '/absent.git?token=fake-token-0010&redirect=https://h.example/x?q=1'); Tok = @('fake-token-0010') },
+        # r2 pass 5 A2: a non-UTF-8 byte right after the delimiter ('?' and '#'); A3: the secret inside an embedded url's path
+        @{ N = 11; Url = ('file:///' + ((New-Scratch 'dd-s3-absent11') -replace '\\', '/') + '/absent.git?%80qzv'); Tok = @('qzv') },
+        @{ N = 12; Url = ('file:///' + ((New-Scratch 'dd-s3-absent12') -replace '\\', '/') + '/absent.git#%80qzw'); Tok = @('qzw') },
+        @{ N = 13; Url = ('file:///' + ((New-Scratch 'dd-s3-absent13') -replace '\\', '/') + '/absent.git?token=https://h.example/SECRET0013?x=y'); Tok = @('SECRET0013') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
