@@ -41,7 +41,7 @@ import threading
 import time
 import unittest
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, TextIO
 
@@ -199,9 +199,19 @@ def assign(units: dict[str, int], shards: int, weights: dict[str, float]) -> lis
     return [sorted(bucket) for bucket in buckets]
 
 
+def module_order(units: dict[str, list[unittest.TestCase]], keys: Iterable[str]) -> list[str]:
+    """``keys`` ordered by module, then by class key, so every module's classes are adjacent.
+
+    Sorting the dotted keys alone is not enough: ``pkg.A``, ``pkg.child.B`` and ``pkg.z`` sort in that
+    order, which puts module ``pkg.child`` between two classes of module ``pkg``, and unittest runs
+    ``pkg``'s module fixtures twice.
+    """
+    return sorted(keys, key=lambda key: (type(units[key][0]).__module__, key))
+
+
 def shard_tests(units: dict[str, list[unittest.TestCase]], bucket: list[str]) -> list[unittest.TestCase]:
     """The bucket's tests, class-contiguous and module-contiguous so fixtures run once."""
-    return [test for key in sorted(bucket) for test in units[key]]
+    return [test for key in module_order(units, bucket) for test in units[key]]
 
 
 def worker_count(environ: Mapping[str, str]) -> int:
@@ -243,7 +253,11 @@ def plan_workers(
         items.setdefault(PINNED_GROUP if module in pins else module, []).append(key)
     counts = {name: sum(len(units[key]) for key in keys) for name, keys in items.items()}
     item_weights = {name: sum(unit_weight(key, len(units[key]), weights) for key in keys) for name, keys in items.items()}
-    return [sorted(key for name in bucket for key in items[name]) for bucket in assign(counts, workers, item_weights) if bucket]
+    return [
+        module_order(units, [key for name in bucket for key in items[name]])
+        for bucket in assign(counts, workers, item_weights)
+        if bucket
+    ]
 
 
 _LINE_BREAKS = re.compile("[\\\\\r\n\x0b\x0c\x1c\x1d\x1e\x85  ]")
@@ -618,6 +632,15 @@ class BudgetWatch:
             self.check()
 
 
+def is_interrupt(error: BaseException) -> bool:
+    """Whether ``error`` is a ``KeyboardInterrupt``, decided on its real type.
+
+    ``isinstance`` falls back to ``error.__class__`` when the type test fails, and an exception can make
+    that attribute raise (an audit hook's ``SystemExit(0)`` is enough). ``type()`` never reads it.
+    """
+    return issubclass(type(error), KeyboardInterrupt)
+
+
 def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
     """A ``SystemExit`` with a falsy code (an audit hook can raise one anywhere) is not a pass: it is
     reported and becomes ``SystemExit(1)``, so a run that was cut short cannot end green. A ``SystemExit``
@@ -628,10 +651,11 @@ def never_exits_zero(function: Callable[..., int]) -> Callable[..., int]:
         try:
             return function(*args, **kwargs)
         except SystemExit as error:
-            # Decided on the code's own value, never through its methods: an int subclass can make
-            # ``bool()``, ``==`` or ``repr()`` raise a ``SystemExit(0)`` from inside this handler.
+            # Decided on the code's own value, never through its methods or attributes: an int subclass can
+            # make ``bool()``, ``==``, ``repr()`` or ``__class__`` (which ``isinstance`` reads) raise a
+            # ``SystemExit(0)`` from inside this handler. ``type()`` and ``int.__eq__`` read none of them.
             code = error.code
-            if not (code is None or (isinstance(code, int) and int.__eq__(code, 0) is True)):
+            if not (code is None or (issubclass(type(code), int) and int.__eq__(code, 0) is True)):
                 raise
             emit_error(f"{function.__name__} was ended by {describe_error(error)} (code {'None' if code is None else 0}), which is not a pass")
             raise SystemExit(1) from error
@@ -756,7 +780,7 @@ def _worker_record(path: Path, assigned: Sequence[unittest.TestCase] | None = No
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except BaseException as error:  # noqa: BLE001 - unreadable, not JSON, too deep, or an audit hook's SystemExit: no result
-        if isinstance(error, KeyboardInterrupt):
+        if is_interrupt(error):
             raise
         return None
     ok = (
@@ -790,7 +814,7 @@ def read_log(path: Path) -> tuple[str, str | None]:
     try:
         return path.read_text(encoding="utf-8", errors="replace"), None
     except BaseException as error:  # noqa: BLE001 - a lock, a vanished file, a bad device, an audit hook's SystemExit
-        if isinstance(error, KeyboardInterrupt):
+        if is_interrupt(error):
             raise
         return "", describe_error(error)
 
@@ -809,7 +833,7 @@ def emit_text(text: str, stream: TextIO | None = None) -> str | None:
         encoding = getattr(target, "encoding", None) or "utf-8"
         print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"), end="", file=target, flush=True)
     except BaseException as error:  # noqa: BLE001 - see above
-        if isinstance(error, KeyboardInterrupt):
+        if is_interrupt(error):
             raise
         return describe_error(error)
     return None
@@ -899,7 +923,7 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
     while it is still running, so the window is the one between the poll and the ``taskkill``.)
     """
     pid = getattr(proc, "pid", None)
-    if not isinstance(pid, int):
+    if not issubclass(type(pid), int):
         return None
     try:
         if os.name == "nt":
@@ -1273,7 +1297,7 @@ def run_parallel(
                 try:
                     header_error = emit_log(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====\n")
                 except BaseException as error:  # noqa: BLE001 - poll() itself raised (SystemExit included)
-                    if isinstance(error, KeyboardInterrupt):
+                    if is_interrupt(error):
                         raise
                     header_error = describe_error(error)
                 text, unreadable = read_log(path)

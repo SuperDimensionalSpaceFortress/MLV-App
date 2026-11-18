@@ -185,6 +185,33 @@ class CoverageTests(unittest.TestCase):
             collapsed_modules = [m for index, m in enumerate(modules) if index == 0 or m != modules[index - 1]]
             self.assertEqual(len(collapsed_modules), len(set(collapsed_modules)))
 
+    # r12 sol r11 A2: a package and its child module interleave when classes sort by dotted string.
+    def test_a_package_and_its_child_module_run_each_module_fixture_once(self) -> None:
+        calls: list[str] = []
+        modules: dict[str, types.ModuleType] = {}
+        for name in ("pkg", "pkg.child", "other"):
+            module = types.ModuleType(name)
+            module.setUpModule = lambda name=name: calls.append(name)  # type: ignore[attr-defined]
+            modules[name] = module
+        cases = []
+        for module_name, class_name in (("pkg", "A"), ("pkg", "z"), ("pkg.child", "B"), ("other", "D")):
+            cls = type(class_name, (unittest.TestCase,), {"test_one": lambda self: None, "__module__": module_name})
+            cases.append(cls("test_one"))
+        units = shard.group_units(cases)
+        weights = {"pkg.A": 0.1, "pkg.z": 0.1, "pkg.child.B": 0.1, "other.D": 10.0}
+        groups = shard.plan_workers(units, 2, weights, {})
+        self.assertEqual(sorted(key for group in groups for key in group), sorted(units))
+        orders = [shard.shard_tests(units, group) for group in groups] + [shard.shard_tests(units, sorted(units))]
+        for members in orders:
+            with self.subTest(classes=[shard.unit_key(test) for test in members]):
+                calls.clear()
+                with mock.patch.dict(sys.modules, modules):
+                    result = unittest.TextTestRunner(stream=io.StringIO(), resultclass=shard.ClassTimingResult).run(
+                        shard.ClassTimingSuite(members)
+                    )
+                self.assertTrue(result.wasSuccessful())
+                self.assertEqual(len(calls), len(set(calls)), f"a module fixture ran twice: {calls}")
+
     def test_no_collected_module_failed_to_import(self) -> None:
         self.assertEqual(shard.import_failures(_TESTS), [])
 
@@ -2462,6 +2489,52 @@ class ShardExitCodeTests(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
                     shard.never_exits_zero(ended)()
                 self.assertFalse(int.__eq__(caught.exception.code, 0), "a run cut short ended with a zero exit")
+
+    # r12 sol r11 A1: an exit code whose __class__ raises SystemExit(0) (isinstance reads __class__) must not end green.
+    def test_the_zero_exit_guard_does_not_read_the_class_attribute_of_an_exit_code(self) -> None:
+        def explode(self: object) -> type:
+            raise SystemExit(0)
+
+        class ClassAttributeExits:
+            __class__ = property(explode)  # type: ignore[assignment]
+
+        code = ClassAttributeExits()
+
+        def ended() -> int:
+            raise SystemExit(code)
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            shard.never_exits_zero(ended)()
+        raised = caught.exception.code
+        zero = issubclass(type(raised), int) and int.__eq__(raised, 0) is True
+        self.assertFalse(zero, "a run cut short ended with a zero exit")
+        self.assertIsNotNone(raised, "a non-integer exit code is nonzero (exit 1), never None")
+
+    # r12 sibling sweep of A1: the ``isinstance(error, KeyboardInterrupt)`` handlers read the error's __class__ too.
+    def test_a_handler_does_not_read_the_class_attribute_of_the_error_it_contains(self) -> None:
+        def explode(self: object) -> type:
+            raise SystemExit(0)
+
+        class ClassAttributeExits(SystemExit):
+            __class__ = property(explode)  # type: ignore[assignment]
+
+        text = unreadable = emitted = None
+        escaped = False
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                Path, "read_text", side_effect=ClassAttributeExits(0)
+            ):
+                text, unreadable = shard.read_log(Path(tmp) / "log.txt")
+            with mock.patch("builtins.print", side_effect=ClassAttributeExits(0)):
+                emitted = shard.emit_text("x", io.StringIO())
+        except SystemExit:
+            escaped = True  # failed below, outside the handler: the runner must not chain to the hostile error
+        self.assertFalse(escaped, "a SystemExit escaped a handler that was meant to contain it")
+        self.assertEqual(text, "")
+        self.assertIsNotNone(unreadable)
+        self.assertIsNotNone(emitted)
+        self.assertFalse(shard.is_interrupt(ClassAttributeExits(0)))
+        self.assertTrue(shard.is_interrupt(KeyboardInterrupt()))
 
     # r11 adversary A1 (pass 19): an interrupt after the worker exists but before it is registered must not leave it running.
     def test_an_interrupt_between_the_launch_and_its_registration_still_ends_the_worker(self) -> None:
