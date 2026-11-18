@@ -195,6 +195,10 @@ function ConvertTo-RedactedUrlText {
 # r1 adversary A5: Write-Log applies the scheme rule (ConvertTo-RedactedUrlText) FIRST and the recorded parts after it, so a recorded part that is also a scheme or a host
 # ('?https:') can never break the url apart before the scheme rule has redacted it.
 $script:UrlSecretParts = [System.Collections.Generic.List[string]]::new()
+# r2 pass 4 A2 (defect class: a short secret piece dropped by a length filter): a piece that FOLLOWS a split ('abc' in '?t=%0Aabc') starts the line git prints after the
+# break, or follows the mid-line byte. It is recorded as a HEAD at any length; Write-Log redacts a head (and the rest of its word) only where it starts a line or follows
+# a redacted part, so a short head never blanks ordinary words elsewhere.
+$script:UrlSecretHeads = [System.Collections.Generic.List[string]]::new()
 # r1 adversary pass 2 A2: a decoded part can hold a line break ('%0A': git's output is split there) or a byte that is not UTF-8 ('%FF'), so the part is also decoded
 # byte by byte (Latin-1) and every piece between two characters that are not printable ASCII is recorded on its own (from 6 characters on).
 function Add-UrlSecretPart([string]$Part, [int]$MinLength = 6) {
@@ -202,6 +206,10 @@ function Add-UrlSecretPart([string]$Part, [int]$MinLength = 6) {
     $forms = @("$Part", $(try { [Uri]::UnescapeDataString("$Part") } catch { "$Part" }), $latin)
     # r2 (pass 3 A5): a piece that still carries the part's own delimiter ('?t=x' before a decoded line break, 'u:pw@' after one) keeps the delimiter's minimum length
     $forms += @($forms | ForEach-Object { $_ -split '[^\x20-\x7E]+' } | Where-Object { $_.Length -ge 6 -or ($MinLength -lt 6 -and $_.Length -ge [Math]::Max(1, $MinLength) -and $_ -match '^[?#].|.@$') })
+    foreach ($f in @($forms)) {
+        $pieces = @($f -split '[^\x20-\x7E]+')
+        for ($k = 1; $k -lt $pieces.Count; $k++) { $h = $pieces[$k].Trim(); if ($h -and -not $script:UrlSecretHeads.Contains($h)) { $script:UrlSecretHeads.Add($h) } }
+    }
     foreach ($p in $forms) {
         if ($p.Length -ge [Math]::Max(1, $MinLength) -and -not $script:UrlSecretParts.Contains($p)) { $script:UrlSecretParts.Add($p) }
     }
@@ -211,7 +219,16 @@ function Register-UrlSecretParts {
     foreach ($m in [regex]::Matches("$Text", '(?i)([a-z][a-z0-9+.\-]*)://([^\r\n]*)')) {
         $rest = $m.Groups[2].Value
         $q = $rest.IndexOfAny([char[]]@('?', '#'))
-        if ($q -ge 0) { Add-UrlSecretPart $rest.Substring($q + 1).TrimEnd(); Add-UrlSecretPart $rest.Substring($q).TrimEnd() 2 }
+        if ($q -ge 0) {
+            Add-UrlSecretPart $rest.Substring($q + 1).TrimEnd(); Add-UrlSecretPart $rest.Substring($q).TrimEnd() 2
+            # r2 pass 4 A3 (defect class: redaction-order dependence): the scheme rule runs first and rewrites an EMBEDDED url ('&redirect=https://h/x?q=1' becomes
+            # '...https://h/x?***'), so the whole registered part no longer matches. Everything up to and including each embedded 'scheme://' survives that rule unchanged,
+            # so each such prefix is recorded too.
+            foreach ($em in [regex]::Matches($rest.Substring($q), '(?i)[a-z][a-z0-9+.\-]*://')) {
+                $pre = $rest.Substring($q, $em.Index + $em.Length)
+                Add-UrlSecretPart $pre 2; Add-UrlSecretPart $pre.Substring(1)
+            }
+        }
         $sl = $rest.IndexOfAny([char[]]@('/', '?', '#'))
         $auth = $(if ($sl -ge 0) { $rest.Substring(0, $sl) } else { $rest })
         $at = $auth.LastIndexOf('@')
@@ -230,6 +247,8 @@ function Write-Log {
     $Message = ConvertTo-RedactedUrlText $Message
     # DENY-BY-DEFAULT-1 S3: then every registered url secret part, wherever it stands (git's echo of a url without its scheme included); longest first (r1 A5: after the scheme rule)
     foreach ($p in @($script:UrlSecretParts | Sort-Object Length -Descending)) { $Message = $Message.Replace($p, '***') }
+    # r2 pass 4 A2: a recorded HEAD (and the rest of its word) where it starts the line or follows a redacted part
+    foreach ($h in @($script:UrlSecretHeads | Sort-Object Length -Descending)) { $Message = [regex]::Replace($Message, '(^\s*|\*\*\*[^\s''"]*?)' + [regex]::Escape($h) + '[^\s''"]*', '$1***') }
     $line = '{0} [{1}] {2}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $Level, $Message
     if (-not $isGate) {
         $color = @{ INFO = 'Gray'; WARN = 'Yellow'; ERROR = 'Red'; MANUAL = 'Cyan'; OK = 'Green' }[$Level]
@@ -1367,7 +1386,10 @@ function Get-CredentialKeyValueHitIndex {
         # or the enclosing close); a quoted run or a container that crosses line breaks is followed to its close.
         $end = Get-CredentialRawValueEnd -Text $Text -At $p -Flow $flow
         $raw = $Text.Substring($p, $end - $p)
-        $vFrom = $p   # r2: the value's span for the decoded-character mask (Test-CredentialValueExempt -From -To)
+        # r2: the span the decoded-character mask is read over (Test-CredentialValueExempt -From -To). r2 pass 4 A1 (defect class: a decoded character that SHAPES the
+        # value, not only one inside it): the span runs from the separator itself (a decoded blank before 'null' is skipped by the reader above), through the character that
+        # ENDS the value (a decoded ',' or line break), and over every line a block-form lookup reads (a decoded '#' turns a line into a comment).
+        $vFrom = $m.Groups[3].Index; $vTo = $end + 1
         if ($sep -eq ':') {
             $ls0 = $(if ($keyStart -eq 0) { 0 } else { $Text.LastIndexOf("`n", $keyStart - 1) + 1 })
             $keyIndent = 0
@@ -1376,6 +1398,7 @@ function Get-CredentialKeyValueHitIndex {
             # '#' comment (at ANY indent; the comment lines between are part of the raw value) and the record that line opens.
             if (-not $raw.Trim() -and (Test-CredentialAtLineEnd -Text $Text -At $end)) {
                 $q = Get-CredentialNextValueLine $Text $end
+                $vTo = $n
                 if ($q -ge 0) {
                     $qEnd = Get-CredentialRawValueEnd -Text $Text -At $q -Flow $flow
                     $raw = $Text.Substring($end, $qEnd - $end)
@@ -1395,13 +1418,14 @@ function Get-CredentialKeyValueHitIndex {
         # (exempt). Over-refusal is accepted: an ini 'password=' followed by an unrelated 'user=bob' line is now refused (the file is named in SECRET-SCAN.txt).
         if ($sep -ne ':' -and -not $raw.Trim() -and (Test-CredentialAtLineEnd -Text $Text -At $end)) {
             $q = Get-CredentialNextValueLine $Text $end
+            $vTo = $n
             if ($q -ge 0) {
                 $qEnd = Get-CredentialRawValueEnd -Text $Text -At $q -Flow $flow
                 $raw = $Text.Substring($end, $qEnd - $end)
                 $end = $qEnd
             }
         }
-        if (Test-CredentialValueExempt $raw -From $vFrom -To $end) { continue }
+        if (Test-CredentialValueExempt $raw -From $vFrom -To ([Math]::Max($vTo, $end + 1))) { continue }
         return $keyStart
     }
     return -1
@@ -1433,7 +1457,7 @@ function Get-CredentialXmlHitIndex {
         $start = $xm.Index + $xm.Length
         $ci = Get-CredentialXmlCloseIndex -Text $Text -Name $name -Start $start   # r2 (pass 3 A2 pre-existing twin): depth-aware, '<password><password></password>x</password>'
         if ($ci -lt 0) { $ci = $Text.Length }
-        if (Test-CredentialValueExempt $Text.Substring($start, $ci - $start) -From $start -To $ci -Xml) { continue }
+        if (Test-CredentialValueExempt $Text.Substring($start, $ci - $start) -From ($start - 1) -To ($ci + 1) -Xml) { continue }   # r2 pass 4 A1 sibling: the delimiters too
         return $xm.Index
     }
     return -1
@@ -1460,7 +1484,7 @@ function Get-CredentialTableHitIndex {
             $l = $line.Trim()
             if (-not $l -or $l.StartsWith('#')) { continue }
             $kv = [regex]::Match($l, '^[^=:]*[=:]\s*(.*)$')
-            if (-not $kv.Success -or -not (Test-CredentialValueExempt $kv.Groups[1].Value -From $lFrom -To ($lFrom + $line.Length))) { return $heads[$h].Index }
+            if (-not $kv.Success -or -not (Test-CredentialValueExempt $kv.Groups[1].Value -From $lFrom -To ($lFrom + $line.Length + 1))) { return $heads[$h].Index }
         }
     }
     return -1
@@ -1482,8 +1506,10 @@ function Get-CredentialTableHitIndex {
 $script:CredentialXmlStartTagRegex = [regex]::new('<(?![!?/])([^\s<>/="'']+)((?:\s+[^\s<>/="'']+\s*=\s*(?:"[^"]*"|''[^'']*''))+)\s*(/?)>')
 $script:CredentialXmlAttrRegex = [regex]::new('([^\s<>/="'']+)\s*=\s*(?:"([^"]*)"|''([^'']*)'')')
 $script:CredentialXmlNameAttrs = @('key', 'name', 'id', 'property', 'variable', 'setting', 'param', 'parameter', 'field')
+# r2 pass 4 A4: -NameOnly returns the first start tag whose naming attribute is secret-named (or holds an undecodable escape) WHATEVER the other values are; the Import
+# credential-ROLE guard (Test-CredentialNamePresent) asks whether a name is present, not whether a value is.
 function Get-CredentialXmlAttrPairHitIndex {
-    param([string]$Text, [bool]$Residual = $false)
+    param([string]$Text, [bool]$Residual = $false, [switch]$NameOnly)
     foreach ($tm in $script:CredentialXmlStartTagRegex.Matches($Text)) {
         $attrs = @(foreach ($am in $script:CredentialXmlAttrRegex.Matches($tm.Groups[2].Value)) {
                 $vg = $(if ($am.Groups[2].Success) { $am.Groups[2] } else { $am.Groups[3] })
@@ -1496,13 +1522,14 @@ function Get-CredentialXmlAttrPairHitIndex {
             if ((Get-CredentialKeyClass ($dv -replace '\s', '')) -or $script:CredentialResidualIntroRegex.IsMatch($dv)) { $namer = $j; break }
         }
         if ($namer -lt 0) { continue }
-        for ($j = 0; $j -lt $attrs.Count; $j++) { if ($j -ne $namer -and -not (Test-CredentialValueExempt $attrs[$j].V -From $attrs[$j].At -To ($attrs[$j].At + $attrs[$j].V.Length))) { return $tm.Index } }
+        if ($NameOnly) { return $tm.Index }
+        for ($j = 0; $j -lt $attrs.Count; $j++) { if ($j -ne $namer -and -not (Test-CredentialValueExempt $attrs[$j].V -From ($attrs[$j].At - 1) -To ($attrs[$j].At + $attrs[$j].V.Length + 1))) { return $tm.Index } }
         if ($tm.Groups[3].Value -ne '/') {
             $start = $tm.Index + $tm.Length
             # r2 (pass 3 A2): depth-aware close, and XML content is never the '<words>' placeholder
             $ci = Get-CredentialXmlCloseIndex -Text $Text -Name $tm.Groups[1].Value -Start $start
             if ($ci -lt 0) { $ci = $Text.Length }
-            if (-not (Test-CredentialValueExempt $Text.Substring($start, $ci - $start) -From $start -To $ci -Xml)) { return $tm.Index }
+            if (-not (Test-CredentialValueExempt $Text.Substring($start, $ci - $start) -From ($start - 1) -To ($ci + 1) -Xml)) { return $tm.Index }
         }
     }
     return -1
@@ -2013,7 +2040,7 @@ function Test-CredentialNamePresent {
         if ($script:CredentialResidualKeyRegex.IsMatch($dec)) { return $true }
         # r1 adversary A7 sibling: a table header ('["pass\U0011FFFFord"]') or an XML naming attribute value holding one counts the same
         foreach ($hm in $script:CredentialTableHeaderRegex.Matches($dec)) { if ($script:CredentialResidualIntroRegex.IsMatch($hm.Groups[1].Value)) { return $true } }
-        if ((Get-CredentialXmlAttrPairHitIndex -Text $Text) -ge 0) { return $true }
+        if ((Get-CredentialXmlAttrPairHitIndex -Text $Text -NameOnly) -ge 0) { return $true }   # r2 pass 4 A4: a name, whatever the value
         $texts += $dec
     }
     foreach ($t in $texts) {

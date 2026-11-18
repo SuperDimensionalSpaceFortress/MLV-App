@@ -2822,6 +2822,12 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
         'p3 A4 sibling: a non-ASCII entity in a JSON key'         = ('{"pass&' + $ddE + ';ord": "hunter2"}')
         'p3 nested: an escaped entity that decodes to a char ref' = '{"pass&amp;#119;ord": "hunter2"}'
         'p3 mask: a decoded key whose value decodes to null'      = '{"db:password": \156ull}'
+        # r2 pass 4 A1: a decoded character that SHAPES the value (its terminator, a blank the reader skips, a '#' that makes a later line a comment)
+        'p4 A1 a decoded comma ends the value'                    = '{"pass\x77ord": \x26#44;hunter2}'
+        'p4 A1 sibling: a decoded blank before null'              = '{"pass\x77ord": \x26#32;null}'
+        'p4 A1 sibling: a decoded line break ends the value'      = "pass\x77ord: \u000a"
+        'p4 A1 sibling: a decoded # makes the value line a comment' = "`"password`":`n\x23 hunter2"
+        'p4 A1 sibling: a decoded = in an ini-style value'        = "pass\x77ord=\x26#10;hunter2"
     }
     foreach ($k in $ddR2.Keys) { Assert-That ((Test-CredentialText $ddR2[$k]) -and (Get-CredentialHitLine $ddR2[$k]) -gt 0) "DENY-BY-DEFAULT-1 r2 adversary $k refuses" $ddR2[$k] }
     $ddR2Miss = [System.Collections.Generic.List[string]]::new(); $ddR2N = 0
@@ -2841,6 +2847,9 @@ if ($fnLoaded -and (Test-Has 'Test-CredentialText' 'DENY-BY-DEFAULT-1') -and (Te
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 r1 adversary role guard') {
         Assert-That (Test-CredentialNamePresent '{"api%2Fkey": ""}') 'DENY-BY-DEFAULT-1 r1 adversary A3 role guard: a percent-encoded slash spelling names a secret'
         Assert-That (Test-CredentialNamePresent "[`"pass\U0011FFFFord`"]`nvalue=`"`"") 'DENY-BY-DEFAULT-1 r1 adversary A7 role guard: a table header with an undecodable escape names a secret'
+        # r2 pass 4 A4: a residual XML naming attribute names a secret whatever its value (an empty one included), also inside a config.toml string
+        Assert-That (Test-CredentialNamePresent "<add key='pass&w;ord' value='' />") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: a residual XML naming attribute with an empty value names a secret'
+        Assert-That (Test-CredentialNamePresent "xml = `"<add key='pass&w;ord' value='' />`"") 'DENY-BY-DEFAULT-1 r2 adversary p4 A4 role guard: the same inside a config.toml string'
     }
     # sibling: the Import credential-ROLE guard (Test-CredentialNamePresent) reads a key name with the same decoder and the same deny-by-default residual rule
     if (Test-Has 'Test-CredentialNamePresent' 'DENY-BY-DEFAULT-1 role guard') {
@@ -2876,7 +2885,10 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
         @{ N = 6; Url = ('file:///' + ((New-Scratch 'dd-s3-absent6') -replace '\\', '/') + '/absent.git?token=fake-token-0006%0Atail'); Tok = @('fake-token-0006') },
         @{ N = 7; Url = ('file:///' + ((New-Scratch 'dd-s3-absent7') -replace '\\', '/') + '/absent.git?token=fake-token-0007%FF'); Tok = @('fake-token-0007') },
         # r2 (adversary pass 3 A5): a SHORT query split at a decoded line break keeps its delimiter-bearing first piece
-        @{ N = 8; Url = ('file:///' + ((New-Scratch 'dd-s3-absent8') -replace '\\', '/') + '/absent.git?t=x%0Ay'); Tok = @('?t=x') }
+        @{ N = 8; Url = ('file:///' + ((New-Scratch 'dd-s3-absent8') -replace '\\', '/') + '/absent.git?t=x%0Ay'); Tok = @('?t=x') },
+        # r2 pass 4 A2: the short piece AFTER the decoded line break (git prints it at the start of its own line); A3: an embedded url in the query
+        @{ N = 9; Url = ('file:///' + ((New-Scratch 'dd-s3-absent9') -replace '\\', '/') + '/absent.git?t=%0Aqzv'); Tok = @('qzv') },
+        @{ N = 10; Url = ('file:///' + ((New-Scratch 'dd-s3-absent10') -replace '\\', '/') + '/absent.git?token=fake-token-0010&redirect=https://h.example/x?q=1'); Tok = @('fake-token-0010') }
     )
     foreach ($ddc in $ddCases) {
         $ddws = New-Scratch "dd-s3-clone-$($ddc.N)"
