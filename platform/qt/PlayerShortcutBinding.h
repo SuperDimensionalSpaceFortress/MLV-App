@@ -76,7 +76,9 @@ inline QString aliasRetireNote()
     return QStringLiteral( "old key, retires with PLAYER-JKL-SHUTTLE-1" );
 }
 
-// THE player key table.
+// THE player key table (standard NLE/player keys). Not bound here on purpose: Esc and Q
+// (MainWindow QShortcuts), M (bad-pixel edit), I (Clip Info), Up/Down (PLAYER-MUTE-VOLUME-1),
+// L, and K as play/pause (PLAYER-JKL-SHUTTLE-1).
 inline QList<ActionBinding> bindings()
 {
     QList<ActionBinding> table;
@@ -86,13 +88,35 @@ inline QList<ActionBinding> bindings()
 #ifdef Q_OS_WIN
     fullscreen << KeyBinding{ QKeySequence( Qt::Key_F11 ), KeyKind::Secondary };
 #endif
+    // Qt::Key_Enter also matches numpad Enter (Qt::KeypadModifier): QShortcutMap retries a
+    // keypad key without the modifier.
+    fullscreen << KeyBinding{ QKeySequence( Qt::Key_Return ), KeyKind::Secondary }
+               << KeyBinding{ QKeySequence( Qt::Key_Enter ), KeyKind::Secondary };
     table << ActionBinding{ QStringLiteral( "actionFullscreen" ), fullscreen };
     table << ActionBinding{ QStringLiteral( "actionPreviousFrame" ),
-                            { { QKeySequence( Qt::Key_Comma ), KeyKind::Primary } } };
+                            { { QKeySequence( Qt::Key_Left ), KeyKind::Primary },
+                              { QKeySequence( Qt::Key_Comma ), KeyKind::Secondary } } };
     table << ActionBinding{ QStringLiteral( "actionNextFrame" ),
-                            { { QKeySequence( Qt::Key_Period ), KeyKind::Primary } } };
+                            { { QKeySequence( Qt::Key_Right ), KeyKind::Primary },
+                              { QKeySequence( Qt::Key_Period ), KeyKind::Secondary } } };
+    table << ActionBinding{ QStringLiteral( "actionSeekBackwardOneSecond" ),
+                            { { QKeySequence( Qt::SHIFT | Qt::Key_Left ), KeyKind::Primary } } };
+    table << ActionBinding{ QStringLiteral( "actionSeekForwardOneSecond" ),
+                            { { QKeySequence( Qt::SHIFT | Qt::Key_Right ), KeyKind::Primary } } };
     table << ActionBinding{ QStringLiteral( "actionGoto_First_Frame" ),
-                            { { QKeySequence( Qt::Key_X ), KeyKind::Primary } } };
+                            { { QKeySequence( Qt::Key_Home ), KeyKind::Primary },
+                              { QKeySequence( Qt::Key_X ), KeyKind::Alias } } };
+    table << ActionBinding{ QStringLiteral( "actionGoto_Last_Frame" ),
+                            { { QKeySequence( Qt::Key_End ), KeyKind::Primary } } };
+    table << ActionBinding{ QStringLiteral( "actionLoop" ),
+                            { { QKeySequence( Qt::CTRL | Qt::Key_L ), KeyKind::Primary } } };
+    table << ActionBinding{ QStringLiteral( "actionPrevious_Clip" ),
+                            { { QKeySequence( Qt::Key_PageUp ), KeyKind::Primary },
+                              { QKeySequence( Qt::Key_J ), KeyKind::Alias } } };
+    table << ActionBinding{ QStringLiteral( "actionNext_Clip" ),
+                            { { QKeySequence( Qt::Key_PageDown ), KeyKind::Primary },
+                              { QKeySequence( Qt::Key_K ), KeyKind::Alias } } };
+    // F stays Zoom: fit (the grading-inspection key wins over a player-only meaning).
     table << ActionBinding{ QStringLiteral( "actionZoomFit" ),
                             { { QKeySequence( Qt::Key_F ), KeyKind::Primary } } };
     table << ActionBinding{ QStringLiteral( "actionZoom100" ),
@@ -192,7 +216,10 @@ public:
     bool eventFilter( QObject *watched, QEvent *event ) override
     {
         Q_UNUSED( watched );
-        Q_UNUSED( event );
+        if( event->type() != QEvent::ShortcutOverride ) return false;
+        QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );
+        if( focusOwnsKey( QApplication::focusWidget(), keyEvent->key(), keyEvent->modifiers(), m_exempt.data() ) )
+            keyEvent->accept();
         return false;
     }
 
@@ -239,8 +266,48 @@ inline QString keysText( const QList<QKeySequence> &sequences )
 // QShortcut that carries a whatsThis() description (by description).
 inline QList<ShortcutRow> shortcutRows( QWidget *window )
 {
-    Q_UNUSED( window );
-    return QList<ShortcutRow>();
+    QList<ShortcutRow> rows;
+    if( !window ) return rows;
+
+    QStringList tableNames;
+    for( const ActionBinding &binding : bindings() )
+    {
+        tableNames << binding.objectName;
+        QAction *action = window->findChild<QAction*>( binding.objectName, Qt::FindDirectChildrenOnly );
+        if( !action ) continue;
+        QStringList aliases;
+        for( const KeyBinding &key : binding.keys )
+            if( key.kind == KeyKind::Alias && action->shortcuts().contains( key.sequence ) )
+                aliases << key.sequence.toString( QKeySequence::NativeText );
+        rows << ShortcutRow{ plainActionText( action->text() ), keysText( action->shortcuts() ),
+                             aliases.isEmpty() ? QString()
+                                               : QStringLiteral( "%1: %2" ).arg( aliases.join( QStringLiteral( ", " ) ),
+                                                                                aliasRetireNote() ) };
+    }
+
+    QList<ShortcutRow> others;
+    const QList<QAction*> actions = window->findChildren<QAction*>( QString(), Qt::FindDirectChildrenOnly );
+    for( QAction *action : actions )
+    {
+        if( tableNames.contains( action->objectName() ) ) continue;
+        if( action->shortcuts().isEmpty() || !action->isVisible() ) continue;
+        others << ShortcutRow{ plainActionText( action->text() ), keysText( action->shortcuts() ), QString() };
+    }
+    std::stable_sort( others.begin(), others.end(), []( const ShortcutRow &a, const ShortcutRow &b )
+                      { return a.action.compare( b.action, Qt::CaseInsensitive ) < 0; } );
+    rows << others;
+
+    QList<ShortcutRow> described;
+    const QList<QShortcut*> shortcuts = window->findChildren<QShortcut*>( QString(), Qt::FindDirectChildrenOnly );
+    for( QShortcut *shortcut : shortcuts )
+    {
+        if( shortcut->whatsThis().isEmpty() || shortcut->keys().isEmpty() ) continue;
+        described << ShortcutRow{ shortcut->whatsThis(), keysText( shortcut->keys() ), QString() };
+    }
+    std::stable_sort( described.begin(), described.end(), []( const ShortcutRow &a, const ShortcutRow &b )
+                      { return a.action.compare( b.action, Qt::CaseInsensitive ) < 0; } );
+    rows << described;
+    return rows;
 }
 
 inline QDialog *createShortcutsDialog( QWidget *window )

@@ -13111,6 +13111,7 @@ void MainWindow::initGui( void )
     pQualityCycle->setContext( Qt::ApplicationShortcut );
     connect( pQualityCycle, &QShortcut::activated,
              this, &MainWindow::cyclePlaybackQualityMode );
+    pQualityCycle->setWhatsThis( tr( "Cycle playback quality" ) ); //listed in Help > Keyboard Shortcuts
 
 #ifdef Q_OS_LINUX
     //if not doing this, some elements are covered by the scrollbar on Linux only
@@ -13138,18 +13139,13 @@ void MainWindow::initGui( void )
     QPixmap pic = QPixmap::fromImage( m_pAudioWave->getMonoWave( NULL, 0, 100, devicePixelRatio() ) );
     pic.setDevicePixelRatio( devicePixelRatio() );
     ui->labelAudioTrack->setPixmap( pic );
-#ifdef Q_OS_WIN
-    //F11 is the standard Windows fullscreen key; keep the existing Ctrl+F too
-    ui->actionFullscreen->setShortcuts( QList<QKeySequence>()
-                                         << ui->actionFullscreen->shortcut()
-                                         << QKeySequence( Qt::Key_F11 ) );
-#endif
     //Esc exits fullscreen (no-op otherwise -- MainWindow has no other Escape handler)
     QShortcut *pFullscreenEscape = new QShortcut( QKeySequence( Qt::Key_Escape ), this );
     connect( pFullscreenEscape, &QShortcut::activated, this, [this]()
     {
         if( ui->actionFullscreen->isChecked() ) ui->actionFullscreen->trigger();
     } );
+    pFullscreenEscape->setWhatsThis( tr( "Exit fullscreen" ) ); //listed in Help > Keyboard Shortcuts
     //Disable caching by default to avoid crashes
     //ui->actionCaching->setVisible( false );
     //Hide deflicker target - no one knows what it does...
@@ -13540,7 +13536,11 @@ void MainWindow::initGui( void )
     connect( ui->actionRename, SIGNAL( triggered() ), this, SLOT( renameActiveClip() ) );
     addAction( ui->actionRename );
     //Fullscreen hides the menu bar and toolbar; carry the player shortcuts on the window too
+    //(the ONE key table, F11 on Windows included, lives in PlayerShortcutBinding.h)
     PlayerShortcutBinding::bindToWindow( this );
+    //Focused inputs keep their navigation keys (Left/Right/Home/End/PgUp/PgDown/Return/Enter);
+    //the seek bar is exempt, so it and the viewer get the player keys
+    qApp->installEventFilter( new PlayerShortcutBinding::FocusGuard( ui->horizontalSliderPosition, this ) );
 }
 
 //Initialize the library
@@ -22928,6 +22928,34 @@ void MainWindow::on_actionGoto_First_Frame_triggered()
     {
         ui->horizontalSliderPosition->setValue( cutInFrame );
         m_newPosDropMode = cutInFrame;
+    }
+
+    //Sync audio if playback and audio active
+    if( ui->actionAudioOutput->isChecked()
+     && ui->actionDropFrameMode->isChecked()
+     && ui->actionPlay->isChecked() )
+    {
+        requestPlaybackAudioSync();
+    }
+}
+
+//Jump to last frame (mirror of on_actionGoto_First_Frame_triggered)
+void MainWindow::on_actionGoto_Last_Frame_triggered()
+{
+    const int frames = ( m_fileLoaded && m_pMlvObject ) ? getMlvFrames( m_pMlvObject ) : 0;
+    const int cutOutFrame = playback_frame_range::clampFrameIndex( ui->spinBoxCutOut->value() - 1, frames );
+    //If actual position is cut out, we jump to the last frame
+    if( ui->horizontalSliderPosition->value() == cutOutFrame )
+    {
+        const int lastFrame = playback_frame_range::clampFrameIndex( frames - 1, frames );
+        ui->horizontalSliderPosition->setValue( lastFrame );
+        m_newPosDropMode = lastFrame;
+    }
+    //Else we jump to cut out
+    else
+    {
+        ui->horizontalSliderPosition->setValue( cutOutFrame );
+        m_newPosDropMode = cutOutFrame;
     }
 
     //Sync audio if playback and audio active
@@ -33599,6 +33627,30 @@ void MainWindow::on_actionNextFrame_triggered()
 void MainWindow::on_actionPreviousFrame_triggered()
 {
     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() - 1 );
+}
+
+//Jump back one second (one clip-framerate's worth of frames; the slider clamps at its range)
+void MainWindow::on_actionSeekBackwardOneSecond_triggered()
+{
+    if( !m_fileLoaded ) return;
+    const int step = qMax( 1, qRound( getMlvFramerate( m_pMlvObject ) ) );
+    ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() - step );
+}
+
+//Jump forward one second
+void MainWindow::on_actionSeekForwardOneSecond_triggered()
+{
+    if( !m_fileLoaded ) return;
+    const int step = qMax( 1, qRound( getMlvFramerate( m_pMlvObject ) ) );
+    ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + step );
+}
+
+//Help > Keyboard Shortcuts: generated from the live actions (PlayerShortcutBinding.h)
+void MainWindow::on_actionKeyboardShortcuts_triggered()
+{
+    QDialog *dialog = PlayerShortcutBinding::createShortcutsDialog( this );
+    dialog->setAttribute( Qt::WA_DeleteOnClose );
+    dialog->open();
 }
 
 //En-/disable all raw corrections
