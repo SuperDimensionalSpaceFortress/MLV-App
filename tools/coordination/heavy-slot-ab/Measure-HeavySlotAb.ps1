@@ -34,6 +34,7 @@ param(
     [string]$HeavySlotDir = 'C:\ProgramData\HeavySlot',
     [string]$HostHeadroomScript = '',
     [switch]$SkipHeadroom,
+    [switch]$WaitForGrace,              # wait until the driver's endedUtc + DeadGraceMinutes before reading anything (the hub's launcher uses it)
     [string]$EventProbeFile = '',       # test seam: a file holding the number of System Event 2004 rows in the window
     [DateTime]$Now = [DateTime]::UtcNow,
     [int]$MinTicketsPerArm = 20,
@@ -91,6 +92,16 @@ $receiptPath = Join-Path $WindowDir 'ab-receipt.json'
 $driverReceipt = $null
 if (Test-Path -LiteralPath $receiptPath -PathType Leaf) { try { $driverReceipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json } catch { $driverReceipt = $null } }
 if ($blocks.Count -eq 0) { Write-Output 'AB_EVAL_NO_INPUT no ab-blocks.jsonl rows'; exit 2 }
+if ($WaitForGrace -and $driverReceipt) {
+    # The hub arms this from the receipt, i.e. at window end. A ticket still running then must be able to close (and a dead holder be
+    # told from a slow one) before anything is judged, so wait here for window end + the grace, then re-read the clock.
+    $endedAt = ConvertTo-UtcTime $driverReceipt.endedUtc
+    if ($endedAt) {
+        $until = $endedAt.AddMinutes($DeadGraceMinutes)
+        while ([DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds ([int][Math]::Max(100, [Math]::Min(30000, ($until - [DateTime]::UtcNow).TotalMilliseconds))) }
+        $Now = [DateTime]::UtcNow
+    }
+}
 
 $winStart = ConvertTo-UtcTime $blocks[0].windowStartUtc
 $winPlannedEnd = ConvertTo-UtcTime $blocks[0].windowEndUtc

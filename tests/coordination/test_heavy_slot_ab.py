@@ -738,3 +738,19 @@ def test_the_evaluator_never_writes_under_the_heavy_slot_dir_and_saves_the_headr
     assert before == after
     assert json.loads((win / "ab-headroom-summary.json").read_text(encoding="utf-8")) == {"mode": "Summary"}
     assert (win / "ab-verdict.json").exists()
+
+
+def test_the_evaluator_waits_for_window_end_plus_the_grace_when_asked(tmp_path):
+    win, hs = build_window(tmp_path, "grace", dead=1)
+    receipt_path = win / "ab-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["endedUtc"] = iso(datetime.now(UTC))   # the window "ended" just now: the hub arms the evaluator from this receipt
+    receipt_path.write_text(json.dumps(receipt), encoding="ascii")
+    started = time.monotonic()
+    out = _ps(["-File", str(EVALUATOR), "-WindowDir", str(win), "-HeavySlotDir", str(hs), "-SkipHeadroom", "-EventProbeFile", str(tmp_path / "grace" / "event.txt"),
+               "-WaitForGrace", "-DeadGraceMinutes", "0.04"])
+    assert out.returncode == 0, out.stderr
+    assert time.monotonic() - started >= 2.0, "it must sit out the 0.04 min (2.4 s) grace before judging"
+    v = json.loads((win / "ab-verdict.json").read_text(encoding="utf-8"))
+    assert v["window"]["evaluatedEarly"] is False
+    assert v["dead_holders"]["count"] == 1 and v["dead_holders"]["pending_before_grace"] == 0
