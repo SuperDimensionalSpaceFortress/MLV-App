@@ -20,6 +20,10 @@
 #include "../common/test_runtime.h"
 
 #include <QApplication>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QFile>
 #include <QFontInfo>
 #include <QFrame>
@@ -30,6 +34,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLineEdit>
+#include <QListView>
 #include <QMainWindow>
 #include <QMap>
 #include <QMenu>
@@ -39,12 +44,19 @@
 #include <QOpenGLFunctions>
 #include <QPalette>
 #include <QPaintEvent>
+#include <QPlainTextEdit>
+#include <QPointer>
 #include <QScopeGuard>
 #include <QScreen>
 #include <QScrollBar>
+#include <QShortcut>
+#include <QSlider>
 #include <QSpinBox>
+#include <QStringListModel>
 #include <QStyleHints>
+#include <QTableWidget>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWindow>
@@ -624,12 +636,20 @@ class GuiSmokeTest : public QObject
 private slots:
     void rgb16DisplayReferencePreservesEndpoints();
     void checkedStateUpdatesPalette();
-    void fullscreenLiveShortcuts_uiTableMatchesBindingList();
-    void fullscreenLiveShortcuts_hiddenBarsWithoutBindingAreDead();
-    void fullscreenLiveShortcuts_hiddenBarsWithBindingFireOnce();
-    void fullscreenLiveShortcuts_visibleBarsWithBindingFireExactlyOnce();
-    void fullscreenLiveShortcuts_textInputsKeepTheirKeys();
-    void fullscreenLiveShortcuts_otherTopLevelWindowDoesNotFire();
+    void playerShortcutMap_tableIsTheStandardMap();
+    void playerShortcutMap_uiActionsExist();
+    void playerShortcutMap_bindAppliesExactlyTheTable();
+    void playerShortcutMap_hiddenBarsWithoutBindingAreDead();
+    void playerShortcutMap_everyKeyFiresWindowedAndFullscreen();
+    void playerShortcutMap_textInputsKeepPrintableKeys();
+    void playerShortcutMap_focusGuardInputsKeepNavigationKeys();
+    void playerShortcutMap_focusGuardControlWithoutGuardInputsLoseKeys();
+    void playerShortcutMap_exemptSeekBarAndViewerGetPlayerKeys();
+    void playerShortcutMap_disabledActionDoesNotFire();
+    void playerShortcutMap_otherTopLevelWindowDoesNotFire();
+    void playerShortcutMap_glContainerFocus();
+    void playerShortcutMap_helpRowsAreGeneratedFromLiveActions();
+    void playerShortcutMap_oneSecondSeekTargetNeverOverflows();
     void mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes();
     void mainWindowGpuPreviewPolicyScopesVetoOnlyWhenDisplayed();
     void mainWindowGpuPreviewPolicyHideScopesVetoesNothingWhilePlaying();
@@ -727,63 +747,135 @@ void GuiSmokeTest::checkedStateUpdatesPalette()
 
 namespace
 {
-// PLAYER-FULLSCREEN-SHORTCUTS-LIVE-1. One row per key the player must keep live in fullscreen.
-// uiShortcut is the MainWindow.ui <string> (nullptr = a key MainWindow.cpp adds in code: F11 on
-// Windows, MainWindow.cpp `ui->actionFullscreen->setShortcuts(...)`).
-struct LiveShortcutKey
+// PLAYER-STANDARD-SHORTCUT-MAP-1 (absorbs PLAYER-FULLSCREEN-SHORTCUTS-LIVE-1's table). This is the
+// TEST ORACLE: the design's key map written out literally, so a change to the product table
+// (PlayerShortcutBinding::bindings()) that does not match the design reds
+// playerShortcutMap_tableIsTheStandardMap. It is not product data and nothing in the product
+// reads it.
+using PlayerShortcutBinding::KeyKind;
+
+struct OracleKey
 {
-    const char *actionName;
-    const char *uiShortcut;
-    Qt::Key key;
-    Qt::KeyboardModifiers modifiers;
+    QKeySequence sequence;
+    KeyKind kind;
 };
 
-QVector<LiveShortcutKey> live_shortcut_keys()
+struct OracleAction
 {
-    QVector<LiveShortcutKey> keys = {
-        { "actionPlay",             "Space",  Qt::Key_Space,  Qt::NoModifier },
-        { "actionGoto_First_Frame", "X",      Qt::Key_X,      Qt::NoModifier },
-        { "actionPreviousFrame",    ",",      Qt::Key_Comma,  Qt::NoModifier },
-        { "actionNextFrame",        ".",      Qt::Key_Period, Qt::NoModifier },
-        { "actionZoomFit",          "F",      Qt::Key_F,      Qt::NoModifier },
-        { "actionZoom100",          "Ctrl+0", Qt::Key_0,      Qt::ControlModifier },
-        { "actionFullscreen",       "Ctrl+F", Qt::Key_F,      Qt::ControlModifier },
-    };
-#ifdef Q_OS_WIN
-    keys.append( { "actionFullscreen", nullptr, Qt::Key_F11, Qt::NoModifier } );
-#endif
-    return keys;
+    QString name;
+    QList<OracleKey> keys;
+};
+
+QKeySequence seq( const char *portable )
+{
+    return QKeySequence( QString::fromLatin1( portable ), QKeySequence::PortableText );
 }
 
-// A stand-in for MainWindow's carriers of the 7 actions: QActions parented to the window (as uic
-// does), a "Playback" menu in the menu bar holding all 7 (MainWindow.ui menuPlayback), a toolbar
-// holding Goto/Prev/Play/Next (MainWindow.ui mainToolBar), and a central widget with a
-// focusable non-text viewer, a QLineEdit and a QSpinBox.
-class FullscreenShortcutMirror
+QList<OracleAction> standard_map_oracle()
+{
+    QList<OracleKey> fullscreen{ { seq( "Ctrl+F" ), KeyKind::Primary } };
+#ifdef Q_OS_WIN
+    fullscreen << OracleKey{ seq( "F11" ), KeyKind::Secondary };
+#endif
+    fullscreen << OracleKey{ seq( "Return" ), KeyKind::Secondary }
+               << OracleKey{ seq( "Enter" ), KeyKind::Secondary };
+    QList<OracleAction> map;
+    map << OracleAction{ QStringLiteral( "actionPlay" ),                  { { seq( "Space" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionFullscreen" ),            fullscreen }
+        << OracleAction{ QStringLiteral( "actionPreviousFrame" ),         { { seq( "Left" ), KeyKind::Primary }, { seq( "," ), KeyKind::Secondary } } }
+        << OracleAction{ QStringLiteral( "actionNextFrame" ),             { { seq( "Right" ), KeyKind::Primary }, { seq( "." ), KeyKind::Secondary } } }
+        << OracleAction{ QStringLiteral( "actionSeekBackwardOneSecond" ), { { seq( "Shift+Left" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionSeekForwardOneSecond" ),  { { seq( "Shift+Right" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionGoto_First_Frame" ),      { { seq( "Home" ), KeyKind::Primary }, { seq( "X" ), KeyKind::Alias } } }
+        << OracleAction{ QStringLiteral( "actionGoto_Last_Frame" ),       { { seq( "End" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionLoop" ),                  { { seq( "Ctrl+L" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionPrevious_Clip" ),         { { seq( "PgUp" ), KeyKind::Primary }, { seq( "J" ), KeyKind::Alias } } }
+        << OracleAction{ QStringLiteral( "actionNext_Clip" ),             { { seq( "PgDown" ), KeyKind::Primary }, { seq( "K" ), KeyKind::Alias } } }
+        << OracleAction{ QStringLiteral( "actionZoomFit" ),               { { seq( "F" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionZoom100" ),               { { seq( "Ctrl+0" ), KeyKind::Primary } } };
+    return map;
+}
+
+QList<QKeySequence> oracle_sequences( const OracleAction &row )
+{
+    QList<QKeySequence> sequences;
+    for( const OracleKey &k : row.keys ) sequences << k.sequence;
+    return sequences;
+}
+
+QString kind_name( KeyKind kind )
+{
+    switch( kind )
+    {
+    case KeyKind::Primary: return QStringLiteral( "Primary" );
+    case KeyKind::Secondary: return QStringLiteral( "Secondary" );
+    case KeyKind::Alias: return QStringLiteral( "Alias" );
+    }
+    return QStringLiteral( "?" );
+}
+
+// One physical key press and the action it must reach.
+struct KeyPress
+{
+    QString action;
+    Qt::Key key;
+    Qt::KeyboardModifiers modifiers;
+    QString label;
+};
+
+QList<KeyPress> oracle_key_presses()
+{
+    QList<KeyPress> presses;
+    for( const OracleAction &row : standard_map_oracle() )
+        for( const OracleKey &k : row.keys )
+        {
+            const QKeyCombination c = k.sequence[0];
+            presses << KeyPress{ row.name, c.key(), c.keyboardModifiers(), k.sequence.toString() };
+        }
+    // Numpad Enter arrives as Qt::Key_Enter + Qt::KeypadModifier.
+    presses << KeyPress{ QStringLiteral( "actionFullscreen" ), Qt::Key_Enter, Qt::KeypadModifier,
+                         QStringLiteral( "keypad Enter" ) };
+    return presses;
+}
+
+// The navigation keys the focus guard keeps for input widgets.
+QList<KeyPress> navigation_key_presses()
+{
+    QList<KeyPress> presses;
+    const struct { Qt::Key key; Qt::KeyboardModifiers modifiers; const char *label; } keys[] = {
+        { Qt::Key_Left, Qt::NoModifier, "Left" },       { Qt::Key_Right, Qt::NoModifier, "Right" },
+        { Qt::Key_Up, Qt::NoModifier, "Up" },           { Qt::Key_Down, Qt::NoModifier, "Down" },
+        { Qt::Key_Home, Qt::NoModifier, "Home" },       { Qt::Key_End, Qt::NoModifier, "End" },
+        { Qt::Key_PageUp, Qt::NoModifier, "PgUp" },     { Qt::Key_PageDown, Qt::NoModifier, "PgDown" },
+        { Qt::Key_Return, Qt::NoModifier, "Return" },   { Qt::Key_Enter, Qt::KeypadModifier, "keypad Enter" },
+        { Qt::Key_Left, Qt::ShiftModifier, "Shift+Left" }, { Qt::Key_Right, Qt::ShiftModifier, "Shift+Right" },
+    };
+    for( const auto &k : keys )
+        presses << KeyPress{ QString(), k.key, k.modifiers, QString::fromLatin1( k.label ) };
+    return presses;
+}
+
+// A stand-in for MainWindow: every table action parented to the window (as uic does), a
+// "Playback" menu in a WIDGET menu bar holding all of them (MainWindow.ui menuPlayback), a
+// toolbar holding Goto/Prev/Play/Next (mainToolBar), a focusable non-input viewer, the seek bar
+// (the FocusGuard's exempt widget) and one of each input-widget class the guard protects.
+// Actions start with NO shortcuts: every key comes from bindToWindow() (or applyOracleShortcuts()).
+class PlayerShortcutMirror
 {
 public:
-    FullscreenShortcutMirror()
+    PlayerShortcutMirror()
     {
-        window.resize( 640, 360 );
-        // A widget menu bar on every platform (adversary A1): a macOS native menu bar does not
-        // show as a QWidget and counts as visible for shortcut matching even when hidden, which
-        // would break both the visible-bars case and the hidden-bars control.
+        window.resize( 800, 600 );
+        // A widget menu bar on every platform (#846 adversary A1): a macOS native menu bar does
+        // not show as a QWidget and counts as visible for shortcut matching even when hidden.
         window.menuBar()->setNativeMenuBar( false );
         QMenu *playback = window.menuBar()->addMenu( QStringLiteral( "Playback" ) );
         toolBar = window.addToolBar( QStringLiteral( "mainToolBar" ) );
-        const QVector<LiveShortcutKey> keys = live_shortcut_keys();
-        for( const QString &name : PlayerShortcutBinding::liveActionNames() )
+        for( const OracleAction &row : standard_map_oracle() )
         {
-            QAction *a = new QAction( name, &window );
+            const QString name = row.name;
+            QAction *a = new QAction( QStringLiteral( "&" ) + name, &window );
             a->setObjectName( name );
-            QList<QKeySequence> sequences;
-            for( const LiveShortcutKey &k : keys )
-            {
-                if( name != QLatin1String( k.actionName ) ) continue;
-                sequences << ( k.uiShortcut ? QKeySequence( QString::fromLatin1( k.uiShortcut ) )
-                                            : QKeySequence( QKeyCombination( k.modifiers, k.key ) ) );
-            }
-            a->setShortcuts( sequences );
             playback->addAction( a );
             counts.insert( name, 0 );
             QObject::connect( a, &QAction::triggered, &window, [this, name]() { ++counts[name]; } );
@@ -791,23 +883,59 @@ public:
         for( const char *name : { "actionGoto_First_Frame", "actionPreviousFrame", "actionPlay", "actionNextFrame" } )
             toolBar->addAction( action( QLatin1String( name ) ) );
 
-        QWidget *central = new QWidget( &window );
-        QVBoxLayout *layout = new QVBoxLayout( central );
+        central = new QWidget( &window );
+        layout = new QVBoxLayout( central );
         viewer = new QWidget( central );
         viewer->setObjectName( QStringLiteral( "viewer" ) );
         viewer->setFocusPolicy( Qt::StrongFocus );
         viewer->setMinimumSize( 160, 90 );
-        lineEdit = new QLineEdit( central );
+        seekBar = new QSlider( Qt::Horizontal, central );
+        seekBar->setObjectName( QStringLiteral( "horizontalSliderPosition" ) );
+        seekBar->setRange( 0, 100 );
+        seekBar->setValue( 50 );
+        slider = new QSlider( Qt::Horizontal, central );
+        slider->setRange( 0, 100 );
+        slider->setValue( 50 );
         spinBox = new QSpinBox( central );
-        layout->addWidget( viewer );
-        layout->addWidget( lineEdit );
-        layout->addWidget( spinBox );
+        spinBox->setRange( 0, 100 );
+        spinBox->setValue( 50 );
+        doubleSpinBox = new QDoubleSpinBox( central );
+        doubleSpinBox->setRange( 0.0, 100.0 );
+        doubleSpinBox->setSingleStep( 1.0 );
+        doubleSpinBox->setValue( 50.0 );
+        listView = new QListView( central );
+        listView->setModel( new QStringListModel( QStringList() << "r0" << "r1" << "r2" << "r3" << "r4", listView ) );
+        listView->setCurrentIndex( listView->model()->index( 0, 0 ) );
+        comboBox = new QComboBox( central );
+        comboBox->addItems( QStringList() << "c0" << "c1" << "c2" );
+        lineEdit = new QLineEdit( central );
+        plainTextEdit = new QPlainTextEdit( central );
+        for( QWidget *w : std::initializer_list<QWidget*>{ viewer, seekBar, slider, spinBox, doubleSpinBox,
+                                                          listView, comboBox, lineEdit, plainTextEdit } )
+            layout->addWidget( w );
         window.setCentralWidget( central );
+    }
+
+    ~PlayerShortcutMirror()
+    {
+        if( guard ) qApp->removeEventFilter( guard );
     }
 
     QAction *action( const QString &name )
     {
         return window.findChild<QAction*>( name, Qt::FindDirectChildrenOnly );
+    }
+
+    // What MainWindow::initGui() installs right after bindToWindow().
+    void installGuard()
+    {
+        guard = new PlayerShortcutBinding::FocusGuard( seekBar, &window );
+        qApp->installEventFilter( guard );
+    }
+
+    void applyOracleShortcuts()
+    {
+        for( const OracleAction &row : standard_map_oracle() ) action( row.name )->setShortcuts( oracle_sequences( row ) );
     }
 
     void hideBars()
@@ -816,12 +944,23 @@ public:
         toolBar->hide();
     }
 
+    // Windowed: bars visible. Fullscreen: bars hidden, as on_actionFullscreen_triggered() does.
     bool showAndActivate( bool fullscreen )
     {
-        if( fullscreen ) window.showFullScreen();
+        if( fullscreen )
+        {
+            hideBars();
+            window.showFullScreen();
+        }
         else window.show();
         window.activateWindow();
         return QTest::qWaitForWindowActive( &window );
+    }
+
+    bool focusOn( QWidget *w )
+    {
+        w->setFocus( Qt::OtherFocusReason );
+        return QTest::qWaitFor( [w]() { return QApplication::focusWidget() == w; }, 2000 );
     }
 
     int total() const
@@ -833,198 +972,371 @@ public:
 
     QMainWindow window;
     QToolBar *toolBar = nullptr;
+    QWidget *central = nullptr;
+    QVBoxLayout *layout = nullptr;
     QWidget *viewer = nullptr;
-    QLineEdit *lineEdit = nullptr;
+    QSlider *seekBar = nullptr;
+    QSlider *slider = nullptr;
     QSpinBox *spinBox = nullptr;
+    QDoubleSpinBox *doubleSpinBox = nullptr;
+    QListView *listView = nullptr;
+    QComboBox *comboBox = nullptr;
+    QLineEdit *lineEdit = nullptr;
+    QPlainTextEdit *plainTextEdit = nullptr;
+    QPointer<PlayerShortcutBinding::FocusGuard> guard;
     QMap<QString, int> counts;
 };
 
-// Presses every live key on `target`, one at a time, and checks the deltas: the key's own
-// action fires `expectedPerKey` times and no other action fires.
-void press_live_keys_and_check( FullscreenShortcutMirror &m, QWidget *target, int expectedPerKey )
+QString press_label( const KeyPress &k )
 {
-    for( const LiveShortcutKey &k : live_shortcut_keys() )
+    return QStringLiteral( "%1 (key 0x%2 mods 0x%3)" ).arg( k.label ).arg( int( k.key ), 0, 16 ).arg( int( k.modifiers ), 0, 16 );
+}
+
+// Presses each key on `target`, one at a time: the key's own action fires `expectedPerKey`
+// times and no other action fires.
+void press_and_check( PlayerShortcutMirror &m, QWidget *target, const QList<KeyPress> &presses,
+                      int expectedPerKey, const QString &context )
+{
+    for( const KeyPress &k : presses )
     {
         const QMap<QString, int> before = m.counts;
         QTest::keyClick( target, k.key, k.modifiers );
         for( auto it = m.counts.cbegin(); it != m.counts.cend(); ++it )
         {
             const int delta = it.value() - before.value( it.key() );
-            const int expected = ( it.key() == QLatin1String( k.actionName ) ) ? expectedPerKey : 0;
+            const int expected = ( it.key() == k.action ) ? expectedPerKey : 0;
             QVERIFY2( delta == expected,
-                      qPrintable( QStringLiteral( "key %1 (mods 0x%2): action %3 fired %4 time(s), expected %5" )
-                                  .arg( QKeySequence( QKeyCombination( k.modifiers, k.key ) ).toString() )
-                                  .arg( int( k.modifiers ), 0, 16 )
-                                  .arg( it.key() ).arg( delta ).arg( expected ) ) );
+                      qPrintable( QStringLiteral( "%1: key %2: action %3 fired %4 time(s), expected %5" )
+                                  .arg( context, press_label( k ), it.key() ).arg( delta ).arg( expected ) ) );
         }
     }
 }
 
-} // namespace
-
-void GuiSmokeTest::fullscreenLiveShortcuts_uiTableMatchesBindingList()
+// The facts MainWindow.ui states about actions, menus and shortcut strings.
+struct UiFacts
 {
-    // The binding list, this test's key table and MainWindow.ui must agree: same 7 actions, in
-    // the same order, each with exactly the .ui shortcut the mirror window uses.
-    const QVector<LiveShortcutKey> keys = live_shortcut_keys();
-    QStringList tableNames;
-    for( const LiveShortcutKey &k : keys )
-        if( !tableNames.contains( QLatin1String( k.actionName ) ) ) tableNames << QLatin1String( k.actionName );
-    QCOMPARE( PlayerShortcutBinding::liveActionNames(), tableNames );
-    QCOMPARE( PlayerShortcutBinding::liveActionNames().size(), 7 );
+    QMap<QString, int> actionDefinitions;          // <action name=...> count
+    QMap<QString, QStringList> menusByAction;      // <addaction> inside a QMenu widget
+    QMap<QString, QStringList> shortcutsByOwner;   // <property name="shortcut"><string> of an action or widget
+};
 
+bool parse_main_window_ui( UiFacts &facts, QString &error )
+{
     const QString path = repo_file_path( QStringLiteral( "platform/qt/MainWindow.ui" ) );
-    QVERIFY2( !path.isEmpty(), "MainWindow.ui not found" );
+    if( path.isEmpty() ) { error = QStringLiteral( "MainWindow.ui not found" ); return false; }
     QFile file( path );
-    QVERIFY( file.open( QIODevice::ReadOnly ) );
+    if( !file.open( QIODevice::ReadOnly ) ) { error = QStringLiteral( "cannot open %1" ).arg( path ); return false; }
     QXmlStreamReader xml( &file );
-    QMap<QString, int> actionDefinitions;
-    QMap<QString, QStringList> shortcutsByAction;
-    QMap<QString, int> addActionUses;
-    QString currentAction;
-    int depth = 0;
-    int actionDepth = -1;
-    bool inShortcutProperty = false;
+    struct Element { QString tag; QString name; QString cls; };
+    QVector<Element> stack;
     while( !xml.atEnd() )
     {
         xml.readNext();
         if( xml.isStartElement() )
         {
-            ++depth;
-            const QString name = xml.attributes().value( QStringLiteral( "name" ) ).toString();
-            if( xml.name() == QLatin1String( "action" ) )
+            const Element e{ xml.name().toString(),
+                             xml.attributes().value( QStringLiteral( "name" ) ).toString(),
+                             xml.attributes().value( QStringLiteral( "class" ) ).toString() };
+            if( e.tag == QLatin1String( "string" ) && stack.size() >= 2
+             && stack.last().tag == QLatin1String( "property" ) && stack.last().name == QLatin1String( "shortcut" ) )
             {
-                currentAction = name;
-                actionDepth = depth;
-                ++actionDefinitions[name];
+                facts.shortcutsByOwner[stack.at( stack.size() - 2 ).name] << xml.readElementText();
+                continue; // readElementText() consumed the end element
             }
-            else if( xml.name() == QLatin1String( "addaction" ) )
-            {
-                ++addActionUses[name];
-            }
-            else if( !currentAction.isEmpty() && depth == actionDepth + 1
-                  && xml.name() == QLatin1String( "property" ) && name == QLatin1String( "shortcut" ) )
-            {
-                inShortcutProperty = true;
-            }
-            else if( inShortcutProperty && xml.name() == QLatin1String( "string" ) )
-            {
-                shortcutsByAction[currentAction] << xml.readElementText();
-                --depth; // readElementText() consumed the end element
-            }
+            if( e.tag == QLatin1String( "action" ) ) ++facts.actionDefinitions[e.name];
+            if( e.tag == QLatin1String( "addaction" ) && !stack.isEmpty()
+             && stack.last().tag == QLatin1String( "widget" ) && stack.last().cls == QLatin1String( "QMenu" ) )
+                facts.menusByAction[e.name] << stack.last().name;
+            stack.push_back( e );
         }
-        else if( xml.isEndElement() )
+        else if( xml.isEndElement() && !stack.isEmpty() )
         {
-            if( xml.name() == QLatin1String( "property" ) ) inShortcutProperty = false;
-            if( depth == actionDepth )
-            {
-                currentAction.clear();
-                actionDepth = -1;
-            }
-            --depth;
+            stack.pop_back();
         }
     }
-    QVERIFY2( !xml.hasError(), qPrintable( xml.errorString() ) );
+    if( xml.hasError() ) { error = xml.errorString(); return false; }
+    return true;
+}
 
-    for( const QString &name : PlayerShortcutBinding::liveActionNames() )
+} // namespace
+
+void GuiSmokeTest::playerShortcutMap_tableIsTheStandardMap()
+{
+    // The product table equals the design table: same actions in the same order, same sequences
+    // in the same order, same kinds.
+    const QList<PlayerShortcutBinding::ActionBinding> table = PlayerShortcutBinding::bindings();
+    const QList<OracleAction> oracle = standard_map_oracle();
+    QStringList oracleNames;
+    for( const OracleAction &row : oracle ) oracleNames << row.name;
+    QCOMPARE( PlayerShortcutBinding::liveActionNames(), oracleNames );
+    QCOMPARE( table.size(), oracle.size() );
+    for( int i = 0; i < oracle.size(); ++i )
     {
-        QStringList expected;
-        for( const LiveShortcutKey &k : keys )
-            if( name == QLatin1String( k.actionName ) && k.uiShortcut ) expected << QLatin1String( k.uiShortcut );
-        QVERIFY2( actionDefinitions.value( name ) == 1,
-                  qPrintable( QStringLiteral( "%1 defined %2 time(s) in MainWindow.ui" ).arg( name ).arg( actionDefinitions.value( name ) ) ) );
-        QVERIFY2( shortcutsByAction.value( name ) == expected,
-                  qPrintable( QStringLiteral( "%1: .ui shortcut [%2], table [%3]" )
-                              .arg( name, shortcutsByAction.value( name ).join( QLatin1Char( '|' ) ), expected.join( QLatin1Char( '|' ) ) ) ) );
-        QVERIFY2( addActionUses.value( name ) >= 1,
-                  qPrintable( QStringLiteral( "%1 is not on any menu or toolbar in MainWindow.ui" ).arg( name ) ) );
+        QCOMPARE( table.at( i ).objectName, oracle.at( i ).name );
+        QCOMPARE( table.at( i ).keys.size(), oracle.at( i ).keys.size() );
+        for( int k = 0; k < oracle.at( i ).keys.size(); ++k )
+        {
+            QCOMPARE( table.at( i ).keys.at( k ).sequence, oracle.at( i ).keys.at( k ).sequence );
+            QVERIFY2( table.at( i ).keys.at( k ).kind == oracle.at( i ).keys.at( k ).kind,
+                      qPrintable( QStringLiteral( "%1 key %2: kind %3, design %4" )
+                                  .arg( oracle.at( i ).name, oracle.at( i ).keys.at( k ).sequence.toString(),
+                                        kind_name( table.at( i ).keys.at( k ).kind ), kind_name( oracle.at( i ).keys.at( k ).kind ) ) ) );
+        }
+        QVERIFY( table.at( i ).keys.first().kind == KeyKind::Primary );
     }
+
+    // No sequence twice across the table (one key, one action).
+    QList<QKeySequence> all;
+    for( const PlayerShortcutBinding::ActionBinding &row : table )
+        for( const PlayerShortcutBinding::KeyBinding &k : row.keys )
+        {
+            QVERIFY2( !all.contains( k.sequence ), qPrintable( QStringLiteral( "%1 bound twice" ).arg( k.sequence.toString() ) ) );
+            all << k.sequence;
+        }
+
+    // No table key collides with any other shortcut MainWindow.ui declares (actions and tool
+    // buttons), nor with the keys MainWindow.cpp creates in code (Q, Esc) or reserves for later
+    // cards (Up/Down: PLAYER-MUTE-VOLUME-1; L: PLAYER-JKL-SHUTTLE-1).
+    UiFacts facts;
+    QString error;
+    QVERIFY2( parse_main_window_ui( facts, error ), qPrintable( error ) );
+    for( auto it = facts.shortcutsByOwner.cbegin(); it != facts.shortcutsByOwner.cend(); ++it )
+    {
+        if( oracleNames.contains( it.key() ) ) continue;
+        for( const QString &s : it.value() )
+            QVERIFY2( !all.contains( QKeySequence( s, QKeySequence::PortableText ) ),
+                      qPrintable( QStringLiteral( "table key %1 collides with %2 in MainWindow.ui" ).arg( s, it.key() ) ) );
+    }
+    for( const char *other : { "M", "I", "Q", "Esc", "Up", "Down", "L" } )
+        QVERIFY2( !all.contains( seq( other ) ), qPrintable( QStringLiteral( "table binds reserved key %1" ).arg( QLatin1String( other ) ) ) );
 }
 
-void GuiSmokeTest::fullscreenLiveShortcuts_hiddenBarsWithoutBindingAreDead()
+void GuiSmokeTest::playerShortcutMap_uiActionsExist()
 {
-    // CONTROL: the defect. Menu bar and toolbar hidden (as on_actionFullscreen_triggered() does),
-    // window fullscreen and active, nothing bound to the window -> no key reaches its action.
-    FullscreenShortcutMirror m;
-    m.hideBars();
-    QVERIFY( m.showAndActivate( true ) );
-    m.viewer->setFocus();
-    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
-    press_live_keys_and_check( m, &m.window, 0 );
-    if( QTest::currentTestFailed() ) return;
-    QCOMPARE( m.total(), 0 );
+    // Every table action exists once in MainWindow.ui, sits on a menu, and any shortcut string
+    // the .ui carries for it is one of its table sequences. Help > Keyboard Shortcuts exists.
+    UiFacts facts;
+    QString error;
+    QVERIFY2( parse_main_window_ui( facts, error ), qPrintable( error ) );
+    for( const OracleAction &row : standard_map_oracle() )
+    {
+        QVERIFY2( facts.actionDefinitions.value( row.name ) == 1,
+                  qPrintable( QStringLiteral( "%1 defined %2 time(s) in MainWindow.ui" ).arg( row.name ).arg( facts.actionDefinitions.value( row.name ) ) ) );
+        QVERIFY2( !facts.menusByAction.value( row.name ).isEmpty(),
+                  qPrintable( QStringLiteral( "%1 is on no menu in MainWindow.ui" ).arg( row.name ) ) );
+        const QList<QKeySequence> sequences = oracle_sequences( row );
+        for( const QString &s : facts.shortcutsByOwner.value( row.name ) )
+            QVERIFY2( sequences.contains( QKeySequence( s, QKeySequence::PortableText ) ),
+                      qPrintable( QStringLiteral( "%1: .ui shortcut %2 is not in its table set" ).arg( row.name, s ) ) );
+    }
+    QCOMPARE( facts.actionDefinitions.value( QStringLiteral( "actionKeyboardShortcuts" ) ), 1 );
+    QVERIFY( facts.menusByAction.value( QStringLiteral( "actionKeyboardShortcuts" ) ).contains( QStringLiteral( "menuHelp" ) ) );
 }
 
-void GuiSmokeTest::fullscreenLiveShortcuts_hiddenBarsWithBindingFireOnce()
+void GuiSmokeTest::playerShortcutMap_bindAppliesExactlyTheTable()
 {
-    FullscreenShortcutMirror m;
-    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
-    for( const QString &name : PlayerShortcutBinding::liveActionNames() )
-        QVERIFY( m.window.actions().contains( m.action( name ) ) );
-    m.hideBars();
-    QVERIFY( m.showAndActivate( true ) );
-    m.viewer->setFocus();
-    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
-    press_live_keys_and_check( m, &m.window, 1 );
-    if( QTest::currentTestFailed() ) return;
-    QCOMPARE( m.total(), live_shortcut_keys().size() );
-}
-
-void GuiSmokeTest::fullscreenLiveShortcuts_visibleBarsWithBindingFireExactlyOnce()
-{
-    // Windowed: menu bar and toolbar visible AND the window bound. One action is one shortcut-map
-    // entry however many widgets carry it, so each key fires once (no ambiguity, no double fire).
-    FullscreenShortcutMirror m;
-    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    PlayerShortcutMirror m;
+    const QList<OracleAction> oracle = standard_map_oracle();
+    // A stray key set before the bind (as a .ui string would be) is replaced, not kept.
+    m.action( QStringLiteral( "actionPlay" ) )->setShortcuts( { seq( "Space" ), seq( "Ctrl+Shift+P" ) } );
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), int( oracle.size() ) );
+    for( const OracleAction &row : oracle )
+    {
+        QAction *a = m.action( row.name );
+        QVERIFY( a );
+        QCOMPARE( a->shortcuts(), oracle_sequences( row ) );
+        QCOMPARE( a->shortcut(), row.keys.first().sequence );
+        QVERIFY( m.window.actions().contains( a ) );
+    }
     // A second bind leaves the window's actions as they are -- no remove/re-append reorder past
-    // an unrelated action added in between (adversary pass 2 A1).
+    // an unrelated action added in between (#846 adversary pass 2 A1).
     QAction *extra = new QAction( QStringLiteral( "Extra" ), &m.window );
     m.window.addAction( extra );
     const QList<QAction*> before = m.window.actions();
-    QCOMPARE( before.size(), 8 );
+    QCOMPARE( before.size(), int( oracle.size() ) + 1 );
     QCOMPARE( before.last(), extra );
-    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), int( oracle.size() ) );
     QCOMPARE( m.window.actions(), before );
-    QVERIFY( m.showAndActivate( false ) );
-    QVERIFY( !m.window.menuBar()->isNativeMenuBar() );
-    QVERIFY( m.window.menuBar()->isVisible() );
-    QVERIFY( m.toolBar->isVisible() );
-    m.viewer->setFocus();
-    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
-    press_live_keys_and_check( m, &m.window, 1 );
-    if( QTest::currentTestFailed() ) return;
-    QCOMPARE( m.total(), live_shortcut_keys().size() );
 }
 
-void GuiSmokeTest::fullscreenLiveShortcuts_textInputsKeepTheirKeys()
+void GuiSmokeTest::playerShortcutMap_hiddenBarsWithoutBindingAreDead()
 {
-    // Text inputs claim printable keys in ShortcutOverride; binding to the window must not steal
-    // Space , . X F from them.
-    FullscreenShortcutMirror m;
-    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
-    m.hideBars();
+    // CONTROL (#846's defect): bars hidden, window fullscreen and active, the keys set on the
+    // actions but nothing bound to the window -> no key reaches its action.
+    PlayerShortcutMirror m;
+    m.applyOracleShortcuts();
     QVERIFY( m.showAndActivate( true ) );
-    const Qt::Key printable[] = { Qt::Key_Space, Qt::Key_Comma, Qt::Key_Period, Qt::Key_X, Qt::Key_F };
+    QVERIFY( m.focusOn( m.viewer ) );
+    press_and_check( m, &m.window, oracle_key_presses(), 0, QStringLiteral( "unbound fullscreen" ) );
+    if( QTest::currentTestFailed() ) return;
+    QCOMPARE( m.total(), 0 );
+}
 
-    m.lineEdit->setFocus();
-    QTRY_COMPARE( QApplication::focusWidget(), static_cast<QWidget*>( m.lineEdit ) );
+void GuiSmokeTest::playerShortcutMap_everyKeyFiresWindowedAndFullscreen()
+{
+    // Bars visible + windowed, then bars hidden + fullscreen; viewer focused; the guard installed
+    // as MainWindow installs it. Every sequence (aliases J K X and Return/Enter/keypad Enter
+    // included) fires its own action exactly once and no other.
+    for( const bool fullscreen : { false, true } )
+    {
+        PlayerShortcutMirror m;
+        QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), int( standard_map_oracle().size() ) );
+        m.installGuard();
+        QVERIFY( m.showAndActivate( fullscreen ) );
+        if( !fullscreen )
+        {
+            QVERIFY( m.window.menuBar()->isVisible() );
+            QVERIFY( m.toolBar->isVisible() );
+        }
+        QVERIFY( m.focusOn( m.viewer ) );
+        const QList<KeyPress> presses = oracle_key_presses();
+        press_and_check( m, &m.window, presses, 1, fullscreen ? QStringLiteral( "fullscreen" ) : QStringLiteral( "windowed" ) );
+        if( QTest::currentTestFailed() ) return;
+        QCOMPARE( m.total(), int( presses.size() ) );
+    }
+}
+
+void GuiSmokeTest::playerShortcutMap_textInputsKeepPrintableKeys()
+{
+    // Text inputs claim printable keys in ShortcutOverride; the window binding must not steal
+    // Space , . X F J K from them.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QVERIFY( m.showAndActivate( true ) );
+    const Qt::Key printable[] = { Qt::Key_Space, Qt::Key_Comma, Qt::Key_Period, Qt::Key_X, Qt::Key_F, Qt::Key_J, Qt::Key_K };
+
+    QVERIFY( m.focusOn( m.lineEdit ) );
     for( const Qt::Key key : printable ) QTest::keyClick( m.lineEdit, key );
     QCOMPARE( m.total(), 0 );
-    QCOMPARE( m.lineEdit->text(), QStringLiteral( " ,.xf" ) );
+    QCOMPARE( m.lineEdit->text(), QStringLiteral( " ,.xfjk" ) );
 
-    m.spinBox->setFocus();
-    QTRY_COMPARE( QApplication::focusWidget(), static_cast<QWidget*>( m.spinBox ) );
+    QVERIFY( m.focusOn( m.spinBox ) );
     for( const Qt::Key key : printable ) QTest::keyClick( m.spinBox, key );
     QCOMPARE( m.total(), 0 );
 }
 
-void GuiSmokeTest::fullscreenLiveShortcuts_otherTopLevelWindowDoesNotFire()
+void GuiSmokeTest::playerShortcutMap_focusGuardInputsKeepNavigationKeys()
 {
-    // Window scope kept (never Qt::ApplicationShortcut): with another top-level window active,
-    // no live key fires the player's actions.
-    FullscreenShortcutMirror m;
-    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), 7 );
-    m.hideBars();
+    // With an input widget focused, windowed AND fullscreen, the navigation keys fire no player
+    // action and the widget does its own thing with them.
+    for( const bool fullscreen : { false, true } )
+    {
+        const QString mode = fullscreen ? QStringLiteral( "fullscreen" ) : QStringLiteral( "windowed" );
+        PlayerShortcutMirror m;
+        PlayerShortcutBinding::bindToWindow( &m.window );
+        m.installGuard();
+        QVERIFY( m.showAndActivate( fullscreen ) );
+
+        QVERIFY( m.focusOn( m.spinBox ) );
+        QTest::keyClick( m.spinBox, Qt::Key_Up );
+        QCOMPARE( m.spinBox->value(), 51 );
+        QVERIFY( m.focusOn( m.doubleSpinBox ) );
+        QTest::keyClick( m.doubleSpinBox, Qt::Key_Up );
+        QCOMPARE( m.doubleSpinBox->value(), 51.0 );
+        QVERIFY( m.focusOn( m.slider ) );
+        QTest::keyClick( m.slider, Qt::Key_Right );
+        QCOMPARE( m.slider->value(), 51 );
+        QTest::keyClick( m.slider, Qt::Key_End );
+        QCOMPARE( m.slider->value(), m.slider->maximum() );
+        QVERIFY( m.focusOn( m.listView ) );
+        QTest::keyClick( m.listView, Qt::Key_Down );
+        QCOMPARE( m.listView->currentIndex().row(), 1 );
+        QTest::keyClick( m.listView, Qt::Key_End );
+        QCOMPARE( m.listView->currentIndex().row(), 4 );
+        QVERIFY( m.focusOn( m.lineEdit ) );
+        QSignalSpy returnPressed( m.lineEdit, &QLineEdit::returnPressed );
+        QTest::keyClick( m.lineEdit, Qt::Key_Return );
+        QCOMPARE( returnPressed.count(), 1 );
+        QCOMPARE( m.total(), 0 );
+
+        for( QWidget *w : std::initializer_list<QWidget*>{ m.spinBox, m.doubleSpinBox, m.slider, m.listView,
+                                                          m.comboBox, m.lineEdit, m.plainTextEdit } )
+        {
+            QVERIFY( m.focusOn( w ) );
+            press_and_check( m, w, navigation_key_presses(), 0,
+                             QStringLiteral( "%1 %2 focused" ).arg( mode, QString::fromLatin1( w->metaObject()->className() ) ) );
+            if( QTest::currentTestFailed() ) return;
+        }
+        QCOMPARE( m.total(), 0 );
+    }
+}
+
+void GuiSmokeTest::playerShortcutMap_focusGuardControlWithoutGuardInputsLoseKeys()
+{
+    // CONTROL: the guard is load-bearing. Without it, a focused slider loses Right to
+    // actionNextFrame and a focused spin box loses Return to actionFullscreen.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    QVERIFY( m.showAndActivate( true ) );
+    QVERIFY( m.focusOn( m.slider ) );
+    QTest::keyClick( m.slider, Qt::Key_Right );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionNextFrame" ) ), 1 );
+    QCOMPARE( m.slider->value(), 50 );
+    QVERIFY( m.focusOn( m.spinBox ) );
+    QTest::keyClick( m.spinBox, Qt::Key_Return );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionFullscreen" ) ), 1 );
+
+    // The pure predicate agrees: input classes own the key, the exempt widget and the viewer do not.
+    using PlayerShortcutBinding::FocusGuard;
+    QVERIFY( FocusGuard::focusOwnsKey( m.slider, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( FocusGuard::focusOwnsKey( m.spinBox, Qt::Key_Enter, Qt::KeypadModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.seekBar, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.viewer, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.slider, Qt::Key_Right, Qt::ControlModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.lineEdit, Qt::Key_Space, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( nullptr, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+}
+
+void GuiSmokeTest::playerShortcutMap_exemptSeekBarAndViewerGetPlayerKeys()
+{
+    // The seek bar (the guard's exempt widget) and the viewer keep the player keys.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QVERIFY( m.showAndActivate( true ) );
+    QList<KeyPress> presses;
+    presses << KeyPress{ QStringLiteral( "actionNextFrame" ), Qt::Key_Right, Qt::NoModifier, QStringLiteral( "Right" ) }
+            << KeyPress{ QStringLiteral( "actionGoto_First_Frame" ), Qt::Key_Home, Qt::NoModifier, QStringLiteral( "Home" ) }
+            << KeyPress{ QStringLiteral( "actionGoto_Last_Frame" ), Qt::Key_End, Qt::NoModifier, QStringLiteral( "End" ) }
+            << KeyPress{ QStringLiteral( "actionSeekForwardOneSecond" ), Qt::Key_Right, Qt::ShiftModifier, QStringLiteral( "Shift+Right" ) };
+    for( QWidget *w : std::initializer_list<QWidget*>{ m.seekBar, m.viewer } )
+    {
+        QVERIFY( m.focusOn( w ) );
+        press_and_check( m, w, presses, 1, QString::fromLatin1( w->metaObject()->className() ) );
+        if( QTest::currentTestFailed() ) return;
+    }
+    QCOMPARE( m.seekBar->value(), 50 ); // the action took the key, the slider did not step
+    QCOMPARE( m.total(), 2 * int( presses.size() ) );
+}
+
+void GuiSmokeTest::playerShortcutMap_disabledActionDoesNotFire()
+{
+    // CoS #846 prevention: a disabled table action's keys fire nothing -- not it, not another
+    // action that might match the key next.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QVERIFY( m.showAndActivate( true ) );
+    QVERIFY( m.focusOn( m.viewer ) );
+    QAction *next = m.action( QStringLiteral( "actionNextFrame" ) );
+    next->setEnabled( false );
+    QTest::keyClick( &m.window, Qt::Key_Right );
+    QTest::keyClick( &m.window, Qt::Key_Period );
+    QCOMPARE( m.total(), 0 );
+    next->setEnabled( true );
+    QTest::keyClick( &m.window, Qt::Key_Right );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionNextFrame" ) ), 1 );
+    QCOMPARE( m.total(), 1 );
+}
+
+void GuiSmokeTest::playerShortcutMap_otherTopLevelWindowDoesNotFire()
+{
+    // Window scope kept (never an application-wide context): with another top-level window
+    // active, no table key fires the player's actions.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
     QVERIFY( m.showAndActivate( true ) );
 
     QWidget other;
@@ -1035,7 +1347,7 @@ void GuiSmokeTest::fullscreenLiveShortcuts_otherTopLevelWindowDoesNotFire()
     other.activateWindow();
     QVERIFY( QTest::qWaitForWindowActive( &other ) );
     QTRY_COMPARE( QApplication::activeWindow(), &other );
-    press_live_keys_and_check( m, &other, 0 );
+    press_and_check( m, &other, oracle_key_presses(), 0, QStringLiteral( "other window" ) );
     if( QTest::currentTestFailed() ) return;
     QCOMPARE( m.total(), 0 );
 
@@ -1043,10 +1355,155 @@ void GuiSmokeTest::fullscreenLiveShortcuts_otherTopLevelWindowDoesNotFire()
     other.hide();
     m.window.activateWindow();
     QVERIFY( QTest::qWaitForWindowActive( &m.window ) );
-    m.viewer->setFocus();
-    QTRY_COMPARE( QApplication::focusWidget(), m.viewer );
+    QVERIFY( m.focusOn( m.viewer ) );
     QTest::keyClick( &m.window, Qt::Key_Space );
     QCOMPARE( m.counts.value( QStringLiteral( "actionPlay" ) ), 1 );
+}
+
+void GuiSmokeTest::playerShortcutMap_glContainerFocus()
+{
+    // The GL viewer path: a native child QWindow inside a window container has focus. The key
+    // event goes to the QWindow, not to a widget; the window-scoped table action must still fire.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QWindow *child = new QWindow();
+    QWidget *container = QWidget::createWindowContainer( child, m.central );
+    container->setMinimumSize( 160, 90 );
+    container->setFocusPolicy( Qt::StrongFocus );
+    m.layout->addWidget( container );
+    QVERIFY( m.showAndActivate( true ) );
+    container->setFocus( Qt::OtherFocusReason );
+    child->requestActivate();
+    if( !QTest::qWaitFor( [child]() { return QGuiApplication::focusWindow() == child; }, 2000 ) )
+        QSKIP( "the QPA did not make the container's child QWindow the focus window; "
+               "GL path UNMEASURED offscreen; venue proof owed by the umbrella smoke" );
+    QTest::keyClick( child, Qt::Key_Right );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionNextFrame" ) ), 1 );
+    QCOMPARE( m.total(), 1 );
+}
+
+void GuiSmokeTest::playerShortcutMap_oneSecondSeekTargetNeverOverflows()
+{
+    // Adversary pass 2 A1 (95d6cb1c): a 201-frame clip whose accepted metadata says 2147483648
+    // fps (or 2147483647), paused at 100: Shift+Left/Right must clamp to the slider range, never
+    // overflow an int on the way there.
+    using PlayerShortcutBinding::oneSecondSeekTarget;
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483648.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483648.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483647.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483647.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 2147483647, 25.0, +1, 0, 2147483647 ), 2147483647 );
+    QCOMPARE( oneSecondSeekTarget( -2147483647 - 1, 25.0, -1, -2147483647 - 1, 0 ), -2147483647 - 1 );
+    QCOMPARE( oneSecondSeekTarget( 100, 1e300, +1, 0, 200 ), 200 );
+    // Ordinary rates: one second of frames, rounded, at least one frame.
+    QCOMPARE( oneSecondSeekTarget( 100, 25.0, +1, 0, 200 ), 125 );
+    QCOMPARE( oneSecondSeekTarget( 100, 23.976, -1, 0, 200 ), 76 );
+    QCOMPARE( oneSecondSeekTarget( 100, 0.4, +1, 0, 200 ), 101 );
+    // No usable rate: one frame.
+    QCOMPARE( oneSecondSeekTarget( 100, 0.0, +1, 0, 200 ), 101 );
+    QCOMPARE( oneSecondSeekTarget( 100, -30.0, -1, 0, 200 ), 99 );
+    QCOMPARE( oneSecondSeekTarget( 100, std::numeric_limits<double>::quiet_NaN(), +1, 0, 200 ), 101 );
+    QCOMPARE( oneSecondSeekTarget( 100, std::numeric_limits<double>::infinity(), -1, 0, 200 ), 99 );
+    // Clamped at the ends; an empty range stays at its minimum.
+    QCOMPARE( oneSecondSeekTarget( 10, 25.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 190, 25.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 0, 25.0, +1, 0, -1 ), 0 );
+}
+
+void GuiSmokeTest::playerShortcutMap_helpRowsAreGeneratedFromLiveActions()
+{
+    // Help > Keyboard Shortcuts is built from the live actions: table rows first in table order,
+    // then every other window action with a key, then described QShortcuts. A new action shows
+    // up with no list edit anywhere.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    QAction *unrelated = new QAction( QStringLiteral( "Zz &Unrelated" ), &m.window );
+    unrelated->setShortcut( seq( "Ctrl+Shift+Y" ) );
+    new QAction( QStringLiteral( "No key" ), &m.window );                 // no shortcut: not listed
+    QAction *hidden = new QAction( QStringLiteral( "Hidden" ), &m.window );
+    hidden->setShortcut( seq( "Ctrl+Shift+H" ) );
+    hidden->setVisible( false );                                           // a dead key: not listed
+    QShortcut *described = new QShortcut( seq( "Esc" ), &m.window );
+    described->setWhatsThis( QStringLiteral( "Exit fullscreen" ) );
+    new QShortcut( seq( "Q" ), &m.window );                               // undescribed: listed by its owner's name
+    // Adversary A1 (pass 1, 0142890b): keys that live OFF the window's direct children must be
+    // listed too -- a tool button's own shortcut (MainWindow.ui M, Shift+I), a QShortcut owned by
+    // a child widget (GraphicsZoomView zoom in/out) and an action in a submenu (QRecentFilesMenu
+    // Ctrl+R). A dialog's keys are its own and stay out.
+    QToolButton *badPixels = new QToolButton( m.central );
+    badPixels->setToolTip( QStringLiteral( "Select Bad Pixels" ) );
+    badPixels->setShortcut( seq( "M" ) );
+    QToolButton *cutIn = new QToolButton( m.central );
+    cutIn->setText( QStringLiteral( "&In" ) );
+    cutIn->setShortcut( seq( "Shift+I" ) );
+    QShortcut *zoomIn = new QShortcut( QKeySequence::ZoomIn, m.viewer );
+    zoomIn->setWhatsThis( QStringLiteral( "Zoom in" ) );
+    QMenu *recent = m.window.menuBar()->actions().first()->menu()->addMenu( QStringLiteral( "Recent" ) );
+    recent->addAction( QStringLiteral( "1 recent session" ) )->setShortcut( seq( "Ctrl+R" ) );
+    QDialog *otherWindow = new QDialog( &m.window );
+    QAction *dialogAction = new QAction( QStringLiteral( "Dialog action" ), otherWindow );
+    dialogAction->setShortcut( seq( "Ctrl+Shift+D" ) );
+    otherWindow->addAction( dialogAction );
+    new QShortcut( seq( "Ctrl+Shift+G" ), otherWindow );
+    QToolButton *dialogButton = new QToolButton( otherWindow );
+    dialogButton->setShortcut( seq( "Ctrl+Shift+B" ) );
+
+    const QList<PlayerShortcutBinding::ShortcutRow> rows = PlayerShortcutBinding::shortcutRows( &m.window );
+    const QList<OracleAction> oracle = standard_map_oracle();
+    QStringList listed;
+    for( const PlayerShortcutBinding::ShortcutRow &r : rows ) listed << r.action + QStringLiteral( " = " ) + r.keys;
+    const QString eq = QStringLiteral( " = " );
+    const int n = int( oracle.size() );
+    const QStringList expectedExtras = QStringList()
+        << QStringLiteral( "1 recent session" ) + eq + seq( "Ctrl+R" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "In" ) + eq + seq( "Shift+I" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Select Bad Pixels" ) + eq + seq( "M" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Zz Unrelated" ) + eq + seq( "Ctrl+Shift+Y" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Exit fullscreen" ) + eq + seq( "Esc" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "QMainWindow" ) + eq + seq( "Q" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Zoom in" ) + eq + PlayerShortcutBinding::keysText( zoomIn->keys() );
+    QCOMPARE( listed.mid( n ), expectedExtras );
+    QCOMPARE( rows.size(), n + int( expectedExtras.size() ) );
+    for( int i = 0; i < oracle.size(); ++i )
+    {
+        const OracleAction &row = oracle.at( i );
+        QCOMPARE( rows.at( i ).action, row.name ); // the text "&<name>" without the mnemonic
+        QCOMPARE( rows.at( i ).keys, PlayerShortcutBinding::keysText( m.action( row.name )->shortcuts() ) );
+        bool hasAlias = false;
+        for( const OracleKey &k : row.keys )
+        {
+            QVERIFY2( rows.at( i ).keys.contains( k.sequence.toString( QKeySequence::NativeText ) ),
+                      qPrintable( QStringLiteral( "%1 row lacks %2" ).arg( row.name, k.sequence.toString() ) ) );
+            if( k.kind == KeyKind::Alias )
+            {
+                hasAlias = true;
+                QVERIFY( rows.at( i ).note.contains( k.sequence.toString( QKeySequence::NativeText ) ) );
+            }
+        }
+        QCOMPARE( rows.at( i ).note.contains( PlayerShortcutBinding::aliasRetireNote() ), hasAlias );
+    }
+    // Nothing from the dialog, which is its own window with its own keys.
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( QStringLiteral( "Dialog action" ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+G" ).toString( QKeySequence::NativeText ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+B" ).toString( QKeySequence::NativeText ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+H" ).toString( QKeySequence::NativeText ) ) );
+
+    std::unique_ptr<QDialog> dialog( PlayerShortcutBinding::createShortcutsDialog( &m.window ) );
+    QVERIFY( dialog );
+    QTableWidget *table = dialog->findChild<QTableWidget*>();
+    QVERIFY( table );
+    QCOMPARE( table->rowCount(), int( rows.size() ) );
+    QCOMPARE( table->columnCount(), 3 );
+    QVERIFY( table->editTriggers() == QAbstractItemView::NoEditTriggers );
+    for( int r = 0; r < rows.size(); ++r )
+    {
+        QCOMPARE( table->item( r, 0 )->text(), rows.at( r ).action );
+        QCOMPARE( table->item( r, 1 )->text(), rows.at( r ).keys );
+        QCOMPARE( table->item( r, 2 )->text(), rows.at( r ).note );
+        QVERIFY( !( table->item( r, 0 )->flags() & Qt::ItemIsEditable ) );
+    }
+    QVERIFY( dialog->findChild<QDialogButtonBox*>() );
 }
 
 void GuiSmokeTest::mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes()

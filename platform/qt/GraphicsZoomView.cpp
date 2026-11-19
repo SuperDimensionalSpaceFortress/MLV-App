@@ -25,6 +25,9 @@ GraphicsZoomView::GraphicsZoomView(QWidget *parent) :
 
     m_pZoomInSc = new QShortcut( QKeySequence::ZoomIn, this, SLOT( shortCutZoomIn() ) );
     m_pZoomOutSc = new QShortcut( QKeySequence::ZoomOut, this, SLOT( shortCutZoomOut() ) );
+    //Named in Help > Keyboard Shortcuts (PlayerShortcutBinding::shortcutRows)
+    m_pZoomInSc->setWhatsThis( tr( "Zoom in" ) );
+    m_pZoomOutSc->setWhatsThis( tr( "Zoom out" ) );
 }
 
 //Destructor

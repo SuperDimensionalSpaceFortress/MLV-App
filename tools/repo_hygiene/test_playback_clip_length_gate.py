@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import (
@@ -2112,10 +2113,13 @@ class PlaybackLauncherScanTests(unittest.TestCase):
 
 # The scanner itself lives in tools/repo_hygiene/app_play_scan.py (ENFORCE-2 round 2: exact pins, a real tokenizer,
 # whole-text matching; no `allowlisted:` comment can exempt a line any more).
+from tools.repo_hygiene import app_play_scan as _app_play_scan  # noqa: E402
 from tools.repo_hygiene.app_play_scan import (  # noqa: E402
     LOOP_OFF_ENTRY_MARKERS,
     PINNED_EVENT_SITES,
     PINNED_HELPER_BODIES,
+    PINNED_KEY_SPACE_BINDINGS,
+    SPACE_BINDING_STATEMENT_IDENTIFIERS,
     PLAY_SOURCES,
     REVIEWED_PROGRAMMATIC_PLAY_SITES,
     REVIEWED_PROGRAMMATIC_STOP_SITES,
@@ -2125,13 +2129,21 @@ from tools.repo_hygiene.app_play_scan import (  # noqa: E402
 )
 
 _BUILD_DIR_NAMES = {"moc", "obj", "rcc", "ui", "release", "debug"}
+# r2 adversary pass 2: also every includer of the key table, every notify( dispatch, and every #define of a token of
+# the reviewed Space binding statement (a macro in an including file rewrites the binding). r3 A2: every MENTION of
+# notify (a grouped `(qApp->notify)(...)` or a member pointer has no `notify(`), as the scan now counts mentions.
 _PLAY_RELEVANT = re.compile(
     r"actionPlay|actionLoop|setPlaying|invokeMethod|QKeyEvent|Key_Space|postEvent|sendEvent|"
-    r"sendSpontaneousEvent|programmaticPlay|programmaticStop|QTest\s*::\s*key|keyClick")
+    r"sendSpontaneousEvent|programmaticPlay|programmaticStop|QTest\s*::\s*key|keyClick|PlayerShortcutBinding|"
+    r"\bnotify\b|#\s*define\s+(?:" + "|".join(sorted(SPACE_BINDING_STATEMENT_IDENTIFIERS)) + r")\b")
 
 
 def _load_play_sources() -> dict[str, str]:
     sources = {path: (ROOT / path).read_text(encoding="utf-8") for path in PLAY_SOURCES}
+    # r5: every pinned file is always scanned. A pinned file whose mentions all vanished no longer matches _PLAY_RELEVANT
+    # and would otherwise leave the scan, hiding the vanished pin; a deleted pinned file raises here (a red test).
+    for pinned in sorted({path for path, _ in PINNED_EVENT_SITES} | set(PINNED_KEY_SPACE_BINDINGS)):
+        sources.setdefault(pinned, (ROOT / pinned).read_text(encoding="utf-8"))
     # Every other C++ translation unit under platform/qt and src that can reach the Play / Loop action at all.
     # Generated and build output (a shadow or in-tree build dir, uic's ui_*.h) is not source.
     for base in ("platform/qt", "src"):
@@ -2354,14 +2366,650 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         return [p for p in scan_app_play_sources(sources) if p.startswith("event dispatch ")]
 
     def test_the_event_dispatch_pin_is_exactly_the_three_declared_sites(self) -> None:
+        # r3 A2: every MENTION is counted, so the two reviewed local callables named notify (no QEvent) are pinned too.
         self.assertEqual(PINNED_EVENT_SITES, {
             ("platform/qt/MyApplication.h", "sendEvent"): 1,
             ("platform/qt/LookAssistAnalysisPump.h", "postEvent"): 1,
             ("platform/qt/MainWindow.cpp", "postEvent"): 1,
+            ("platform/qt/FocusPixelMapManager.cpp", "notify"): 3,
+            ("platform/qt/SyncDownloadWaiter.h", "notify"): 2,
         })
 
     def test_the_two_pinned_postevent_sites_pass(self) -> None:
         self.assertEqual(self._event_dispatch_problems(dict(self._PINNED_POST_FIXTURE)), [])
+
+    # -- PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one key table -------------
+    # (PlayerShortcutBinding::bindings(); before, MainWindow.ui carried it). A binding is not an event: exactly the
+    # reviewed expression, at the reviewed path and count, is exempt from the synthesized-key scan. Nothing else is.
+
+    _SPACE_TABLE = "platform/qt/PlayerShortcutBinding.h"
+    _SPACE_BINDING = ("inline void t() { table << ActionBinding{ QStringLiteral( \"actionPlay\" ),\n"
+                      "    { { QKeySequence( Qt::Key_Space ), KeyKind::Primary } } }; }\n")
+
+    @staticmethod
+    def _key_synth_problems(sources: dict[str, str]) -> list[str]:
+        # Fixture text is not a whole tree, so the other scans report it; only the key-synthesis rows are under test.
+        return [p for p in scan_app_play_sources(sources)
+                if "synthesized key event" in p or "Space shortcut binding" in p or "Space binding statement" in p]
+
+    def test_the_space_binding_pin_is_exactly_the_one_reviewed_site(self) -> None:
+        self.assertEqual(PINNED_KEY_SPACE_BINDINGS, {"platform/qt/PlayerShortcutBinding.h": (
+            'table << ActionBinding{ QStringLiteral( "actionPlay" ), '
+            '{ { QKeySequence( Qt::Key_Space ), KeyKind::Primary } } };', 1)})
+
+    def test_the_reviewed_space_shortcut_binding_passes(self) -> None:
+        self.assertEqual(self._key_synth_problems({self._SPACE_TABLE: self._SPACE_BINDING}), [])
+
+    def test_the_real_key_table_holds_exactly_the_reviewed_binding(self) -> None:
+        self.assertIn(self._SPACE_TABLE, self.sources)
+        blank, _ = strip_cpp(self.sources[self._SPACE_TABLE])
+        self.assertEqual(len(re.findall(r"\bKey_Space\b", blank)), 1)
+        self.assertEqual(len(re.findall(r"\bQKeySequence\s*\(\s*Qt\s*::\s*Key_Space\s*\)", blank)), 1)
+        # r2 adversary A1: and that one expression sits in the reviewed table statement, nowhere else.
+        _, keep = strip_cpp(self.sources[self._SPACE_TABLE])
+        statement, count = PINNED_KEY_SPACE_BINDINGS[self._SPACE_TABLE]
+        self.assertEqual(re.sub(r"\s+", " ", keep).count(statement), count)
+
+    # r5 (sol r4 blocker, fable key3 r4 APPROVE hardening): the exact-count guards must fail a count of ZERO too. A pinned
+    # Space statement that is deleted or retargeted, and a pinned event site whose mentions all disappear, scanned clean.
+
+    def _space_statement_span(self) -> tuple[str, int, int]:
+        # The span indexes the comment-stripped text (comments are removed, literals kept), so mutate that text.
+        statement, _ = PINNED_KEY_SPACE_BINDINGS[self._SPACE_TABLE]
+        _, keep = strip_cpp(self.sources[self._SPACE_TABLE])
+        match = _app_play_scan._statement_pattern(statement).search(keep)
+        self.assertIsNotNone(match, "the pinned Space statement is missing from the real key table")
+        return keep, match.start(), match.end()
+
+    def test_r5_the_pinned_space_statement_deleted_fails(self) -> None:
+        text, start, end = self._space_statement_span()
+        mutated = dict(self.sources)
+        mutated[self._SPACE_TABLE] = text[:start] + text[end:]
+        problems = scan_app_play_sources(mutated)
+        self.assertIn(f"{self._SPACE_TABLE}: 0 Space shortcut binding(s), 1 reviewed "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+        self.assertIn(f"{self._SPACE_TABLE}: the reviewed Space binding statement x0, pinned x1 "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+
+    def test_r5_the_pinned_space_statement_retargeted_to_another_key_fails(self) -> None:
+        text, start, end = self._space_statement_span()
+        retargeted = text[start:end].replace("Qt::Key_Space", "Qt::Key_P")
+        self.assertNotEqual(retargeted, text[start:end])
+        mutated = dict(self.sources)
+        mutated[self._SPACE_TABLE] = text[:start] + retargeted + text[end:]
+        problems = scan_app_play_sources(mutated)
+        self.assertIn(f"{self._SPACE_TABLE}: 0 Space shortcut binding(s), 1 reviewed "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+        self.assertIn(f"{self._SPACE_TABLE}: the reviewed Space binding statement x0, pinned x1 "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+
+    def test_r5_a_pinned_event_site_whose_mentions_all_vanish_fails(self) -> None:
+        for (path, name), pinned in PINNED_EVENT_SITES.items():
+            with self.subTest(path=path, name=name):
+                text = self.sources[path]
+                self.assertEqual(len(re.findall(rf"\b{name}\b", strip_cpp(text)[0])), pinned)
+                mutated = dict(self.sources)
+                mutated[path] = re.sub(rf"\b{name}\b", "renamedAway", text)
+                problems = scan_app_play_sources(mutated)
+                self.assertTrue(any(p.startswith(f"event dispatch {name} in {path} x0, pinned x{pinned}")
+                                    for p in problems), problems)
+
+    def test_r5_the_real_loader_always_scans_every_pinned_file(self) -> None:
+        # A pinned file whose mentions all vanish would no longer match _PLAY_RELEVANT and silently leave the scan.
+        pinned_paths = {path for path, _ in PINNED_EVENT_SITES} | set(PINNED_KEY_SPACE_BINDINGS)
+        self.assertLessEqual(pinned_paths, set(self.sources))
+        with mock.patch.dict(globals(), {"_PLAY_RELEVANT": re.compile(r"(?!)")}):   # nothing matches any more
+            self.assertLessEqual(pinned_paths, set(_load_play_sources()))
+
+    def test_a_second_space_binding_in_the_key_table_fails(self) -> None:
+        text = self._SPACE_BINDING + "inline QKeySequence u() { return QKeySequence( Qt::Key_Space ); }\n"
+        problems = self._key_synth_problems({self._SPACE_TABLE: text})
+        self.assertEqual(sum("synthesized key event" in p for p in problems), 2, problems)
+        self.assertIn(f"{self._SPACE_TABLE}: 2 Space shortcut binding(s), 1 reviewed "
+                      "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+
+    def test_a_space_binding_in_any_other_file_fails(self) -> None:
+        for path in ("platform/qt/MainWindow.cpp", "platform/qt/OtherWidget.h", "src/batch/Thing.cpp"):
+            with self.subTest(path):
+                problems = self._key_synth_problems({path: self._SPACE_BINDING})
+                self.assertIn(f"{path}:2: synthesized key event (the Play shortcut is Space)", problems)
+
+    def test_every_other_space_key_in_the_key_table_still_fails(self) -> None:
+        others = {
+            "a synthesized Space key event": "QKeyEvent press( QEvent::KeyPress, Qt::Key_Space, Qt::NoModifier );",
+            "a heap Space key event": "auto *e = new QKeyEvent( QEvent::KeyPress, Qt::Key_Space, {} );",
+            "a bare Space key code": "const int k = Qt::Key_Space;",
+            "a modified Space binding": "const QKeySequence s( QKeySequence( Qt::SHIFT | Qt::Key_Space ) );",
+            "a QTest key click": "QTest::keyClick( w, Qt::Key_Space );",
+        }
+        for name, injected in others.items():
+            with self.subTest(name):
+                text = self._SPACE_BINDING + "inline void v() { " + injected + " }\n"
+                problems = self._key_synth_problems({self._SPACE_TABLE: text})
+                self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:3: synthesized key event") for p in problems),
+                                problems)
+
+    # r2 adversary A1 (f85cb8e9): the exemption keyed on the bare expression anywhere in the file, so the reviewed
+    # QKeySequence could be moved into a lambda that also builds a brace-initialised QKeyEvent (which _KEY_SYNTH did
+    # not see), or wrapped into a modified-Space sequence, and the whole tree still scanned clean.
+    _A1_MUTANTS = {
+        "a lambda that brace-builds a QKeyEvent from the reviewed sequence":
+            "([]() { const auto s = QKeySequence( Qt::Key_Space ); "
+            "QKeyEvent press{ QEvent::KeyPress, s[0].key(), Qt::NoModifier }; return s; }())",
+        "a modified Space sequence wrapped around the reviewed expression":
+            "QKeySequence( Qt::SHIFT | QKeySequence( Qt::Key_Space )[0].toCombined() )",
+    }
+
+    def test_r2_a1_the_reviewed_expression_moved_out_of_its_table_statement_fails(self) -> None:
+        for name, replacement in self._A1_MUTANTS.items():
+            with self.subTest(name):
+                mutated = self._mutated("QKeySequence( Qt::Key_Space )", replacement, path=self._SPACE_TABLE)
+                problems = self._key_synth_problems(mutated)
+                self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:") and "synthesized key event" in p
+                                    for p in problems), problems)
+                self.assertIn(f"{self._SPACE_TABLE}: the reviewed Space binding statement x0, pinned x1 "
+                              "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)", problems)
+
+    def test_r2_a1_a_brace_or_template_built_qkeyevent_is_a_synthesized_key(self) -> None:
+        # No Key_Space token at all: the construction itself is the finding, in every file.
+        for injected in ("QKeyEvent press{ QEvent::KeyPress, k, Qt::NoModifier };",
+                         "QKeyEvent press { QEvent::KeyPress, k, Qt::NoModifier };",
+                         "auto e = QKeyEvent{ QEvent::KeyPress, k, Qt::NoModifier };",
+                         "auto e = std::make_unique<QKeyEvent>( QEvent::KeyPress, k, Qt::NoModifier );",
+                         "auto e = std::make_shared< QKeyEvent >( QEvent::KeyPress, k, Qt::NoModifier );"):
+            for path in (self._SPACE_TABLE, "platform/qt/MainWindow.cpp"):
+                with self.subTest(injected=injected, path=path):
+                    problems = self._key_synth_problems({path: "inline void z( int k ) {\n    " + injected + "\n}\n"})
+                    self.assertIn(f"{path}:2: synthesized key event (the Play shortcut is Space)", problems)
+
+    # r2 adversary pass 2 (629995bd). A1: a macro rewrote the unchanged statement into Shift+Space. A2: an array
+    # declarator, a type alias and explicit template arguments built a QKeyEvent unseen; qApp->notify dispatched it.
+
+    def test_r2_p2_a1_a_macro_over_a_token_of_the_reviewed_statement_fails(self) -> None:
+        statement_line = "    table << ActionBinding{ QStringLiteral( \"actionPlay\" ),"
+        mutated = self._mutated(statement_line, "#define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))\n"
+                                + statement_line, path=self._SPACE_TABLE)
+        mutated[self._SPACE_TABLE] = mutated[self._SPACE_TABLE].replace(
+            "KeyKind::Primary } } };", "KeyKind::Primary } } };\n#undef QKeySequence", 1)
+        problems = scan_app_play_sources(mutated)
+        self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:") and "#define of QKeySequence" in p for p in problems),
+                        problems)
+        for name in ("Key_Space", "KeyKind", "Primary", "ActionBinding", "QStringLiteral", "table", "Qt"):
+            for path in (self._SPACE_TABLE, "platform/qt/MainWindow.cpp"):
+                with self.subTest(name=name, path=path):
+                    problems = scan_app_play_sources({path: f"#define {name} x\n"})
+                    self.assertIn(f"{path}:1: #define of {name}, a token of the reviewed Space binding statement", problems)
+
+    def test_r2_p2_a1_every_includer_of_the_key_table_and_every_such_macro_is_loaded(self) -> None:
+        self.assertRegex('#include "PlayerShortcutBinding.h"\n', _PLAY_RELEVANT)
+        self.assertRegex("#define QKeySequence(k) k\n", _PLAY_RELEVANT)
+        self.assertRegex("#  define Key_Space 0\n", _PLAY_RELEVANT)
+        self.assertRegex("qApp->notify( this, &press );\n", _PLAY_RELEVANT)
+
+    def test_r2_p2_a2_every_other_spelling_of_a_qkeyevent_is_a_synthesized_key(self) -> None:
+        for injected in ("QKeyEvent press[1]{{ QEvent::KeyPress, 32, Qt::NoModifier }};",
+                         "using Event = QKeyEvent;\n    Event press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "using EventPtr = QKeyEvent*;",
+                         "typedef QKeyEvent Event;",
+                         "typedef QKeyEvent *EventPtr;",
+                         "auto e = std::make_unique<QKeyEvent, QEvent::Type, int, Qt::KeyboardModifiers>( "
+                         "QEvent::KeyPress, 32, Qt::NoModifier );",
+                         "auto e = std::unique_ptr<QKeyEvent>();"):   # fail-closed: a key-event owner is reviewed here
+            with self.subTest(injected):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    def test_r2_p2_a2_notify_with_an_event_is_a_dispatch_that_must_be_pinned(self) -> None:
+        self._assert_caught(self._inject_after_measured_loop_off("qApp->notify( this, nullptr );"),
+                            "event dispatch notify in platform/qt/MainWindow.cpp x1")
+        # r3 A2 (HUB RULING HUB-TICK 20261118T1142Z): a local callable named notify is counted too (fail-closed); it
+        # passes only at a pinned, reviewed file and count, never by a looser rule.
+        self.assertEqual(self._event_dispatch_problems({"platform/qt/X.cpp": "auto f = [notify](bool) { notify(); };\n"}),
+                         ["event dispatch notify in platform/qt/X.cpp x2: not a pinned site (the Play shortcut can be synthesized)"])
+
+    def test_r2_p2_a2_reading_a_delivered_key_event_is_not_a_synthesized_key(self) -> None:
+        for text in ("#include <QKeyEvent>\n", "void keyPressEvent( QKeyEvent *event ) override;\n",
+                     "void f( const QKeyEvent &event );\n", "void g( QKeyEvent* event );\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+
+    def test_r2_a1_a_cast_of_a_delivered_key_event_is_not_a_synthesized_key(self) -> None:
+        # FocusGuard reads the ShortcutOverride the user's key produced; reading an event is not making one.
+        # r6 (adversary pass on c1f09601 A1): a name a read binds is only READ (a bare `return keyEvent;` hands the pointer
+        # to a deduced type, so it is flagged now); the fixture reads it through a reviewed member, as FocusGuard does.
+        text = "bool f( QEvent *event ) { QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event ); return keyEvent->key(); }\n"
+        # r5: the key table must hold its one reviewed binding (a count of zero fails), so the fixture carries it.
+        self.assertEqual(self._key_synth_problems({self._SPACE_TABLE: self._SPACE_BINDING + text}), [])
+
+    # r3 (adversary pass 3 on f64af6f5, HUB RULING HUB-TICK 20261118T1142Z: close each class with one cheap fail-closed
+    # rule, never chase spellings). A1: a digraph `%:define` or a spliced `#de\<nl>fine` re-spelled a macro over the
+    # unchanged table statement. The class is "the preprocessor in the key table": in the ONE pinned key-table file any
+    # directive but the include guard, an #include and the reviewed `#ifdef Q_OS_WIN` / `#endif` fails, and so does any
+    # digraph %:, any trigraph, or any line ending in a backslash, anywhere in the file (comments and literals included).
+    _TABLE_STATEMENT_LINE = '    table << ActionBinding{ QStringLiteral( "actionPlay" ),'
+    _R3_A1_DIRECTIVES = {
+        "a digraph #define around the statement":
+            ("%:define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", "%:undef QKeySequence"),
+        "a backslash-newline spliced #define":
+            ("#de\\\nfine QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", "#undef QKeySequence"),
+        "a trigraph #define": ("??=define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", ""),
+        "an #undef": ("#undef QKeySequence", ""),
+        "an #if around the statement": ("#if 1", "#endif"),
+        "another #ifdef": ("#ifdef Q_OS_MAC", "#endif"),
+        "a #pragma push_macro": ('#pragma push_macro("QKeySequence")', ""),
+        "a #line": ("#line 1", ""),
+        "a #define of a token outside the statement": ("#  define OTHER_MACRO 1", ""),
+        "an #include_next": ("#include_next <QKeySequence>", ""),
+        "a comment that splices the next line into itself": ("// a note \\", ""),
+        # r3 adversary pass on fce56625 A1: a form feed or vertical tab is whitespace before `#` to the compiler.
+        "a form feed before a #define":
+            ("\f#define QKeySequence(key) QKeySequence(int(key) | int(Qt::SHIFT))", "\f#undef QKeySequence"),
+        "a vertical tab before an #undef": ("\v#undef QKeySequence", ""),
+        "a control character anywhere in the file": ("// a note \x0c with a form feed", ""),
+        # r3 adversary pass on c1216855 A1: a quoted include of an unscanned fragment carried the macro in. Only a Qt
+        # class header or a standard library header may be included by the key table.
+        "a quoted include of a fragment around the statement":
+            ('#include "player-shortcut-key-compat.inc"', '#include "player-shortcut-key-compat-end.inc"'),
+        "a quoted include of a project header": ('#include "LocalHelper.h"', ""),
+        "an angle include of a fragment": ("#include <compat.inc>", ""),
+        "an angle include of a path": ("#include <../platform/qt/compat.h>", ""),
+        # r5 adversary pass (f422d164 A1): an extensionless angle include of a project fragment, and a Qt-looking name,
+        # carried a macro over the statement unscanned. The key table includes ONLY the reviewed headers, by name.
+        "an extensionless angle include of a fragment around the statement":
+            ("#include <shortcut_compat>", "#include <shortcut_restore>"),
+        "a Qt-looking angle include of a fragment": ("#include <QShortcutCompat>", "#include <QShortcutRestore>"),
+        "a module-qualified angle include that is not reviewed": ("#include <QtGui/QShortcutCompat>", ""),
+        "a standard-library-looking include that is not reviewed": ("#include <type_traits>", ""),
+    }
+
+    def _key_table_with(self, before: str, after: str) -> dict[str, str]:
+        mutated = self._mutated(self._TABLE_STATEMENT_LINE, before + "\n" + self._TABLE_STATEMENT_LINE, path=self._SPACE_TABLE)
+        if after:
+            mutated[self._SPACE_TABLE] = mutated[self._SPACE_TABLE].replace(
+                "KeyKind::Primary } } };", "KeyKind::Primary } } };\n" + after, 1)
+        return mutated
+
+    def test_r3_a1_any_other_preprocessor_use_in_the_key_table_fails(self) -> None:
+        for name, (before, after) in self._R3_A1_DIRECTIVES.items():
+            with self.subTest(name):
+                problems = scan_app_play_sources(self._key_table_with(before, after))
+                self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:") and "preprocessor" in p for p in problems),
+                                problems)
+
+    def test_r3_a1_the_key_table_directive_pin_is_exactly_the_reviewed_set(self) -> None:
+        self.assertEqual(_app_play_scan.KEY_TABLE_SOURCE, self._SPACE_TABLE)
+        self.assertEqual(_app_play_scan.KEY_TABLE_REVIEWED_DIRECTIVES, {
+            "#ifndef PLAYERSHORTCUTBINDING_H": 1, "#define PLAYERSHORTCUTBINDING_H": 1, "#ifdef Q_OS_WIN": 1, "#endif": 2})
+
+    def test_r3_a1_a_vanished_or_duplicated_reviewed_directive_fails(self) -> None:
+        for name, mutated in {
+                "the Windows #ifdef removed": self._mutated("#ifdef Q_OS_WIN\n", "", path=self._SPACE_TABLE),
+                "a second Windows #ifdef": self._key_table_with("#ifdef Q_OS_WIN", "#endif")}.items():
+            with self.subTest(name):
+                problems = scan_app_play_sources(mutated)
+                self.assertTrue(any(p.startswith(f"{self._SPACE_TABLE}:") and "preprocessor" in p for p in problems),
+                                problems)
+
+    def test_r3_a1_other_scanned_files_keep_the_identifier_define_rule_only(self) -> None:
+        # The fail-closed directive rule is for the one key-table file; elsewhere only a #define of a statement token fails.
+        for text in ("#undef QKeySequence\n", "#if 1\n#endif\n", "#define OTHER_MACRO 1\n", "// a note \\\n"):
+            with self.subTest(text):
+                problems = scan_app_play_sources({"platform/qt/OtherWidget.h": text})
+                self.assertFalse([p for p in problems if "preprocessor" in p or "#define of" in p], problems)
+
+    def test_r3_p2_a1_a_form_feed_or_vertical_tab_before_a_define_is_still_a_define(self) -> None:
+        # The sibling: the identifier #define check every other scanned file keeps.
+        for lead in ("\f", "\v", " \f\t"):
+            with self.subTest(repr(lead)):
+                problems = scan_app_play_sources({"platform/qt/MainWindow.cpp": lead + "#define QKeySequence(k) k\n"})
+                self.assertIn("platform/qt/MainWindow.cpp:1: #define of QKeySequence, a token of the reviewed Space "
+                              "binding statement", problems)
+
+    def test_r3_p3_a1_the_key_table_may_include_only_its_reviewed_headers(self) -> None:
+        # r5 (adversary pass on f422d164 A1): the shape rule (any Qt-looking or lowercase name) is replaced by the exact
+        # reviewed set, so no extensionless project fragment can be spelled as a library header.
+        for include in ("#include <QKeySequence>", "#include <algorithm>", "#include <QAction>"):
+            with self.subTest(include):
+                problems = scan_app_play_sources(self._key_table_with(include, ""))
+                self.assertFalse([p for p in problems if "preprocessor" in p], problems)
+
+    def test_r5_a1_the_reviewed_include_set_is_exactly_what_the_real_key_table_includes(self) -> None:
+        blank, _ = strip_cpp(self.sources[self._SPACE_TABLE])
+        real = set(re.findall(r"^[ \t]*#[ \t]*include[ \t]*<[ \t]*(\w+)[ \t]*>", blank, re.MULTILINE))
+        self.assertEqual(real, set(_app_play_scan.KEY_TABLE_REVIEWED_INCLUDES))
+        self.assertEqual(len(re.findall(r"^[ \t]*#[ \t]*include\b", blank, re.MULTILINE)), len(real))   # none quoted/pathed
+
+    def test_r5_a2_a_key_event_pointer_or_reference_as_a_template_argument_is_a_synthesized_key(self) -> None:
+        # adversary pass on f422d164 A2: `QKeyEvent*` in any template argument list but a cast's built a key event.
+        for injected in ("std::remove_pointer_t<QKeyEvent*> press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::remove_reference_t<QKeyEvent&> press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::decay_t<QKeyEvent&> press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::remove_pointer_t< const QKeyEvent * > press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+                         "std::remove_pointer<std::add_pointer_t<QKeyEvent*>>::type press{ QEvent::KeyPress, 32, {} };",
+                         "std::tuple<int, QKeyEvent*>* t = nullptr;"):
+            with self.subTest(injected):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    def test_r5_p2_a1_a2_a_type_computed_from_a_key_event_pointer_is_a_synthesized_key(self) -> None:
+        # adversary pass on d3ad0b0f A1: a decltype over a cast named the object type; A2: a 600-character lookback cap
+        # returned "no template" (exempt) on long whitespace. Also parentheses inside the template argument list.
+        press = " press{ QEvent::KeyPress, 32, Qt::NoModifier };"
+        for name, injected in {
+                "decltype over a static_cast": "std::remove_pointer_t<decltype(static_cast<QKeyEvent*>(nullptr))>" + press,
+                "__typeof__ over a cast": "std::remove_pointer_t<__typeof__(static_cast<QKeyEvent*>(nullptr))>" + press,
+                "declval": "std::remove_pointer_t<decltype(std::declval<QKeyEvent*>())>" + press,
+                "600 spaces": "std::remove_pointer_t<" + " " * 600 + "QKeyEvent*>" + press,
+                "5000 spaces": "std::remove_pointer_t<" + " " * 5000 + "QKeyEvent*>" + press,
+                "5000 newlines": "std::remove_pointer_t<" + "\n" * 5000 + "QKeyEvent*>" + press,
+                "a parenthesised expression before it":
+                    "std::remove_pointer_t<std::enable_if_t<(sizeof(int)>1), QKeyEvent*>>" + press}.items():
+            with self.subTest(name):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    def test_r5_a2_casts_and_parameter_lists_with_a_delivered_key_event_stay_clean(self) -> None:
+        for text in ("QKeyEvent *k = static_cast<QKeyEvent*>( e );\n", "auto *k = dynamic_cast< QKeyEvent const * >( e );\n",
+                     "auto *k = reinterpret_cast<QKeyEvent *>( e );\n", "auto *k = const_cast<QKeyEvent*>( p );\n",
+                     "auto *k = qobject_cast<QKeyEvent*>( e );\n",
+                     "void f( QObject *o, QKeyEvent *e, std::vector<int> v, QKeyEvent const &c );\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+
+    def test_r5_a3_a_volatile_qualified_pointer_or_reference_is_not_a_synthesized_key(self) -> None:
+        for text in ("void inspect(QKeyEvent volatile *event);\n", "void inspect(QKeyEvent const volatile &event);\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+
+    def test_r3_p3_a3_a_const_qualified_pointer_or_reference_is_not_a_synthesized_key(self) -> None:
+        for text in ("auto inspect = [](QKeyEvent const *e) { return e->key(); };\n",
+                     "auto inspect = [](QKeyEvent const &e) { return e.key(); };\n",
+                     "void f( QKeyEvent const* event );\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+        # A const-qualified OBJECT is still a construction.
+        problems = self._key_synth_problems({"platform/qt/StatusDialog.h":
+                                             "void g() { QKeyEvent const press( QEvent::KeyPress, 32, {} ); }\n"})
+        self.assertTrue(any("synthesized key event" in p for p in problems), problems)
+
+    # r6 (adversary pass on 4adb9c0d A1 A2, HUB RULING HUB-TICK 20261118T1142Z): the exemption was decided by a backward
+    # text walk that guessed the template context, and each stop character it knew (a C-style cast's `(`, a `{` inside a
+    # balanced group) let one more spelling through. The rule is inverted: a QKeyEvent pointer / reference is exempt ONLY
+    # as a function or lambda parameter declarator, or in a named-cast statement, in a plain block context; anything
+    # else is flagged.
+    _R6_PRESS = " press{ QEvent::KeyPress, 32, Qt::NoModifier };"
+    _R6_TYPE_COMPUTATIONS = {
+        "A1 decltype over a C-style cast": "std::remove_pointer_t<decltype((QKeyEvent*)nullptr)>" + _R6_PRESS,
+        "A1 __typeof__ over a C-style cast": "std::remove_pointer_t<__typeof__((QKeyEvent*)nullptr)>" + _R6_PRESS,
+        "A2 a brace inside a balanced parenthesised argument":
+            "std::remove_pointer_t<std::enable_if_t<(sizeof(int{}) > 0), QKeyEvent*>>" + _R6_PRESS,
+        "a functional-cast brace before the argument":
+            "std::remove_pointer_t<std::conditional_t<decltype(0){} == 0, QKeyEvent*, int>>" + _R6_PRESS,
+        "a lambda parameter inside a decltype":
+            "std::remove_pointer_t<decltype([](QKeyEvent* e) { return e; }(nullptr))>" + _R6_PRESS,
+        "a lambda parameter in a lambda body inside a decltype":
+            "std::remove_pointer_t<decltype([]{ auto f = [](QKeyEvent* e) { return e; }; return f(nullptr); }())>"
+            + _R6_PRESS,
+        "a function type argument": "std::remove_pointer_t<std::function<void(QKeyEvent*)>*>" + _R6_PRESS,
+        "a parameter list in a template argument with a comma":
+            "std::tuple_element_t<1, std::tuple<int, QKeyEvent*, int>> p = nullptr;",
+        "a C-style cast statement": "auto *k = (QKeyEvent*)nullptr;",
+        "a member pointer": "struct Holder { QKeyEvent *held; };",
+        "a local pointer with no cast": "QKeyEvent *k = nullptr;",
+        "a default argument": "void f( QKeyEvent *e = nullptr );",
+        "a cast inside a call argument": "g( static_cast<QKeyEvent*>( nullptr ) );",
+    }
+
+    def test_r6_a1_a2_a_key_event_pointer_outside_a_declarator_or_cast_statement_is_a_synthesized_key(self) -> None:
+        for name, injected in self._R6_TYPE_COMPUTATIONS.items():
+            with self.subTest(name):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "synthesized key event")
+
+    # r6 adversary pass on c1f09601 A1: an exempt read binds a name, and a LATER statement computes the object type from it
+    # (no QKeyEvent spelled there). The class is "a delivered key event used to build one": no scanned source may use a
+    # type-of operator, and a name an exempt read binds is used only as a reviewed member read or a whole call argument.
+    _R6_P2_BUILT_FROM_A_READ = {
+        "A1 decltype of a cast-bound pointer": "auto *keyType = static_cast<QKeyEvent*>(nullptr); "
+                                               "std::remove_pointer_t<decltype(keyType)>" + _R6_PRESS,
+        "A1 __typeof__ of a cast-bound pointer": "auto *keyType = static_cast<QKeyEvent*>(nullptr); "
+                                                 "std::remove_pointer_t<__typeof__(keyType)>" + _R6_PRESS,
+        "A1 a lambda that returns its key-event parameter": "auto f = [](QKeyEvent* e) { return e; }; "
+                                                            "std::remove_pointer_t<decltype(f(nullptr))>" + _R6_PRESS,
+        "a copy through a dereference": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto copy = *k;",
+        "a copy through a subscript": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto copy = k[0];",
+        "a clone": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto *c = k->clone();",
+        "an alias pointer": "QKeyEvent *k = static_cast<QKeyEvent*>( nullptr ); auto *alias = k;",
+        "a parameter that escapes": "auto f = [](QKeyEvent *e) { auto copy = *e; };",
+    }
+
+    def test_r6_p2_a1_a_key_event_built_from_a_delivered_read_is_a_synthesized_key(self) -> None:
+        for name, injected in self._R6_P2_BUILT_FROM_A_READ.items():
+            with self.subTest(name):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "key event")
+
+    # r6 adversary pass on a91a899d A1: grouping parentheses `(keyEvent)` were read as a whole call argument; A2: a whole
+    # argument handed the event to a generic lambda that cloned or copied it. Handing a delivered event on is allowed
+    # ONLY as the single argument of a qualified base key handler (`QDialog::keyPressEvent( event )`).
+    _FOCUS_GUARD_CAST = "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );"
+    _R6_P3_HANDED_ON = (
+        "auto *copy = (keyEvent)->clone();",
+        "auto copy = *(keyEvent);",
+        "auto *alias = (keyEvent); auto copy = *alias;",
+        "auto *copy = [](auto *source) { return source->clone(); }(keyEvent);",
+        "auto copy = [](auto *source) { return *source; }(keyEvent);",
+        "auto *copy = make( keyEvent );",
+        "auto *copy = keyPressEvent( keyEvent );",
+        "QDialog::keyPressEvent( keyEvent, 1 );",
+    )
+
+    def test_r6_p3_a1_a2_a_delivered_key_event_is_handed_on_only_to_a_base_key_handler(self) -> None:
+        for injected in self._R6_P3_HANDED_ON:
+            with self.subTest(injected):
+                self._assert_caught(self._mutated(self._FOCUS_GUARD_CAST, self._FOCUS_GUARD_CAST + "\n        " + injected,
+                                                  path=self._SPACE_TABLE), "synthesized key event")
+        # The real hand-on stays exempt (StatusDialog.cpp passes its event to QDialog::keyPressEvent).
+        text = "void D::keyPressEvent( QKeyEvent *event )\n{\n    QDialog::keyPressEvent( event );\n}\n"
+        self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.cpp": text}), [])
+
+    def test_r6_p2_a1_no_scanned_source_computes_a_type_from_an_expression(self) -> None:
+        for text in ("int f() { int a = 0; decltype(a) b = a; return b; }\n", "__typeof__(1) x = 1;\n", "typeof(1) y = 1;\n"):
+            with self.subTest(text):
+                problems = scan_app_play_sources({"platform/qt/OtherWidget.h": text})
+                self.assertTrue(any("type-of operator" in p for p in problems), problems)
+
+    def test_r6_a1_a2_the_real_key_event_reads_stay_exempt(self) -> None:
+        # The three real sites: a handler declaration, its definition, and FocusGuard's cast of the delivered event.
+        for text in ("class D : public QDialog\n{\n    Q_OBJECT\nprotected:\n    void keyPressEvent( QKeyEvent *event ) override;\n};\n",
+                     "void D::keyPressEvent( QKeyEvent *event )\n{\n    event->ignore();\n}\n",
+                     "namespace N\n{\nclass G : public QObject\n{\npublic:\n    bool eventFilter( QObject *watched, QEvent *event ) "
+                     "override\n    {\n        if( event->type() != QEvent::ShortcutOverride ) return false;\n"
+                     "        QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );\n        return keyEvent->key();\n    }\n};\n}\n",
+                     "void f()\n{\n    auto h = []( QKeyEvent *e ) { return e->key(); };\n}\n",
+                     "int g( QEvent *e ) { return static_cast<QKeyEvent*>( e )->key(); }\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+
+    # r7 (sol r6 blocker, HUB RULING 2026-11-18 ROUND_TAIL): a C++14 digit separator (`1'000`) inside a number is part of the
+    # number. The lexer read it as a character-literal opener, blanked the rest of the line (and its newline) and hid every
+    # construction after it, in the pinned key-table file and in every file the other consumers scan.
+    _R7_PRESS = " QKeyEvent press{ QEvent::KeyPress, 32, Qt::NoModifier };"
+    _R7_SEPARATED_PRESS = {
+        "decimal": "int delay = 1'000;" + _R7_PRESS,
+        "alias": "int delay = 1'000; using Event=QKeyEvent; Event press{ QEvent::KeyPress, 32, Qt::NoModifier };",
+        "hex": "int delay = 0x1'000;" + _R7_PRESS,
+        "binary": "int delay = 0b1'0;" + _R7_PRESS,
+        "suffixed": "unsigned delay = 1'000u;" + _R7_PRESS,
+        "floating": "float delay = 1'000.5f;" + _R7_PRESS,
+        "exponent": "double delay = 1'0e+1'0;" + _R7_PRESS,
+        "leading dot": "double delay = .5'5;" + _R7_PRESS,
+        "two separators": "long delay = 1'000'000;" + _R7_PRESS,
+    }
+
+    def test_r7_a_digit_separator_never_hides_a_key_event_construction_in_the_key_table(self) -> None:
+        for name, injected in self._R7_SEPARATED_PRESS.items():
+            with self.subTest(name):
+                self._assert_caught(self._mutated(self._FOCUS_GUARD_CAST, self._FOCUS_GUARD_CAST + "\n        " + injected,
+                                                  path=self._SPACE_TABLE), "synthesized key event")
+
+    def test_r7_a_digit_separator_never_hides_a_protected_token_from_any_consumer(self) -> None:
+        # One control per consumer the sol r6 class sweep named. Each runs twice: with a plain number (the twin must be
+        # caught, so the control is valid) and with a digit separator (must be caught too).
+        cast = self._FOCUS_GUARD_CAST
+        controls = {
+            "reference check": (lambda n: self._mutated(cast, cast + "\n        int delay = " + n + "; auto copy = *keyEvent;",
+                                                        path=self._SPACE_TABLE), "key event"),
+            "type-of": (lambda n: self._mutated(cast, cast + "\n        int delay = " + n + "; decltype(delay) twin = delay;",
+                                                path=self._SPACE_TABLE), "type-of operator"),
+            "dispatch": (lambda n: self._inject_after_measured_loop_off("int delay = " + n + "; (qApp->notify)( this, nullptr );"),
+                         "event dispatch notify in platform/qt/MainWindow.cpp x1"),
+            "following-line macro": (lambda n: {"platform/qt/OtherWidget.h": "int delay = " + n + ";\n#define Primary Secondary\n"},
+                                     "#define of Primary"),
+            "synthesis": (lambda n: self._mutated(cast, cast + "\n        int delay = " + n + ";" + self._R7_PRESS,
+                                                  path=self._SPACE_TABLE), "synthesized key event"),
+        }
+        for name, (build, needle) in controls.items():
+            for number in ("1000", "1'000", "0x1'000", "0b1'0", "1'000u", "1'000.5f"):
+                with self.subTest(name + " " + number):
+                    self._assert_caught(build(number), needle)
+
+    def test_r7_real_character_literals_and_strings_are_still_lexed_as_literals(self) -> None:
+        # Literals only (green before and after the fix): the separator rule must not touch a real literal.
+        literals = ("char a = 'a'; char b = '\\''; char c = u8'x'; char16_t d = u'y'; char32_t e = U'z'; wchar_t f = L'w';\n"
+                    "const char *s = \"it's\"; char g = '1'; char h = '2'; char i = '0'; auto j = (1 == 1) ? 'a' : 'b';\n")
+        blank, keep = strip_cpp(literals)
+        self.assertEqual(blank, ("char a = ' '; char b = '  '; char c = u8' '; char16_t d = u' '; char32_t e = U' '; wchar_t f = L' ';\n"
+                                 "const char *s = \"    \"; char g = ' '; char h = ' '; char i = ' '; auto j = (1 == 1) ? ' ' : ' ';\n"))
+        self.assertEqual(keep, literals)
+        # The same literals beside separated numbers: numbers stay whole and the literals around them still blank.
+        mixed = "int n = 1'000; char a = 'a'; int m = 0x1'000; const char *s = \"it's\"; char b = '\\''; float f = 1'0.5f;\n"
+        blank, keep = strip_cpp(mixed)
+        self.assertEqual(blank, "int n = 1'000; char a = ' '; int m = 0x1'000; const char *s = \"    \"; char b = '  '; float f = 1'0.5f;\n")
+        self.assertEqual(keep, mixed)
+        # A key-event spelling inside a literal is still not a construction, with a separated number on the same line.
+        literal = "const char *s = \"QKeyEvent press{}\"; char c = 'Q'; int n = 1'000;\nchar x = 'K';\n"
+        self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": literal}), [])
+
+    # r8 (sol r7 blocker, HUB RULING 2026-11-18 ROUND_TAIL): the named-cast exemption read the cast's operand group as an
+    # empty `()`, so a cast whose operand PRODUCES an event (`event->clone()`) passed as a read of the delivered event. A cast
+    # is exempt only when its operand is the bare identifier of the delivered event; any other operand (a call, a member
+    # access, `->clone()`, a nested cast, a dereference) is never exempt.
+    _R8_FOCUS_GUARD_CAST_RE = "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );"
+    _R8_CLONE_OPERANDS = {
+        "typed declaration, clone": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event->clone() );",
+        "auto declaration, clone": "auto *keyEvent = static_cast<QKeyEvent*>( event->clone() );",
+        "dynamic_cast declaration, clone": "QKeyEvent *keyEvent = dynamic_cast<QKeyEvent*>( event->clone() );",
+        "qobject_cast declaration, clone": "QKeyEvent *keyEvent = qobject_cast<QKeyEvent*>( event->clone() );",
+        "reinterpret_cast declaration, clone": "QKeyEvent *keyEvent = reinterpret_cast<QKeyEvent*>( event->clone() );",
+        "a call": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( cloneOf( event ) );",
+        "a call with no argument": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( makeEvent() );",
+        "a member access": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( holder.event );",
+        "an arrow member access": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( holder->event );",
+        "a dereference": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( *eventPointer );",
+        "a nested cast": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( static_cast<QEvent*>( event ) );",
+        "a subscript": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( events[0] );",
+        "a qualified name": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( Holder::event );",
+        "a grouped operand": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( ( event ) );",
+        "a ternary": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( ok ? event : other );",
+        "a new expression": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( new QEvent( QEvent::KeyPress ) );",
+        "an empty operand": "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( );",
+    }
+
+    def test_r8_a_cast_whose_operand_produces_an_event_is_a_synthesized_key_in_the_declaration_form(self) -> None:
+        for name, injected in self._R8_CLONE_OPERANDS.items():
+            with self.subTest(name):
+                self._assert_caught(self._mutated(self._R8_FOCUS_GUARD_CAST_RE, injected, path=self._SPACE_TABLE),
+                                    "synthesized key event")
+
+    def test_r8_a_cast_whose_operand_produces_an_event_is_a_synthesized_key_in_the_assignment_and_inline_forms(self) -> None:
+        cast = self._R8_FOCUS_GUARD_CAST_RE
+        for name, injected in {
+                "assignment, clone": "keyEvent = static_cast<QKeyEvent*>( event->clone() );",
+                "assignment, call": "keyEvent = static_cast<QKeyEvent*>( cloneOf( event ) );",
+                "an inline member read through a clone cast": "int copiedKey = static_cast<QKeyEvent*>( event->clone() )->key();",
+                "a return of a member read through a clone cast": "return static_cast<QKeyEvent*>( event->clone() )->key();",
+                "an inline member read through a call cast": "int copiedKey = static_cast<QKeyEvent*>( cloneOf( event ) )->key();",
+                "a bare inline cast of a clone": "static_cast<QKeyEvent*>( event->clone() )->accept();"}.items():
+            with self.subTest(name):
+                self._assert_caught(self._mutated(cast, cast + "\n        " + injected, path=self._SPACE_TABLE),
+                                    "synthesized key event")
+
+    def test_r8_a_cast_whose_operand_produces_an_event_is_caught_in_a_fixture_file(self) -> None:
+        # The same class off the real table: a fixture file, so no pinned-site machinery is involved.
+        for name, injected in self._R8_CLONE_OPERANDS.items():
+            with self.subTest(name):
+                text = "bool f( QObject *w, QEvent *event )\n{\n    " + injected + "\n    return keyEvent->key();\n}\n"
+                problems = self._key_synth_problems({"platform/qt/StatusDialog.h": text})
+                self.assertTrue(any("synthesized key event" in p for p in problems), problems)
+
+    def test_r8_a_cast_of_the_bare_delivered_event_identifier_stays_exempt(self) -> None:
+        # Negative controls: the real tree scans clean, and every bare-identifier cast (any spacing, any cast keyword, a
+        # member read through it) is still a read of the delivered event.
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        head = "bool f( QObject *w, QEvent *event )\n{\n"
+        bound = "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );\n"
+        for text in (bound + "    return true;\n",
+                     "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>(event);\n    return true;\n",
+                     "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>(\n        event\n    );\n    return true;\n",
+                     "    QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event_ );\n    return true;\n",
+                     "    auto *keyEvent = dynamic_cast<QKeyEvent*>( event );\n    return true;\n",
+                     "    auto *keyEvent = qobject_cast<QKeyEvent*>( e );\n    return true;\n",
+                     "    keyEvent = static_cast<QKeyEvent*>( event );\n    return true;\n",
+                     "    int k = static_cast<QKeyEvent*>( event )->key();\n    return k;\n",
+                     "    return static_cast<QKeyEvent*>( event )->key();\n"):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": head + text + "}\n"}), [])
+
+    def test_r8_a_trailing_dot_at_the_end_of_a_file_with_no_final_newline_does_not_crash_the_lexer(self) -> None:
+        # adversary pass on 70336ec9 A3 (advisory, introduced by r7): `.` as the LAST character took the leading-dot number
+        # branch because an empty `nxt` is "in" the digit string, then dereferenced a failed regex match.
+        for text in ("#define DOT .", "// QKeyEvent: a comment only\n#define DOT .", ".", "int x = 1.", "int x = 0x1'0", "x = 5 ."):
+            with self.subTest(text):
+                blank, keep = strip_cpp(text)
+                self.assertTrue(blank.endswith(text[-1]), blank)   # the last token survives (comment text is blanked)
+                self.assertTrue(keep.endswith(text[-1]), keep)
+                scan_app_play_sources({"platform/qt/OtherWidget.h": text})
+
+    def test_r3_p2_a2_a_qualified_qkeyevent_include_is_not_a_synthesized_key(self) -> None:
+        for text in ("#include <QtGui/QKeyEvent>\n", "#include <qevent.h>\n", '#include "QKeyEvent"\n'):
+            with self.subTest(text):
+                self.assertEqual(self._key_synth_problems({"platform/qt/StatusDialog.h": text}), [])
+
+    # A2: a parenthesised `(qApp->notify)( w, e )` or a grouped `(QCoreApplication::sendEvent)(...)` escaped _EVENT_POST,
+    # which required `name(`. The class is "a dispatch named any other way": EVERY identifier mention of postEvent,
+    # sendEvent, sendSpontaneousEvent or notify is counted against the pinned sites (a call, a grouping, a pointer).
+    _R3_A2_MUTANTS = {
+        "(qApp->notify)( this, nullptr );": "event dispatch notify in platform/qt/MainWindow.cpp x1",
+        "(QCoreApplication::sendEvent)( this, nullptr );": "event dispatch sendEvent in platform/qt/MainWindow.cpp x1",
+        "(QCoreApplication::postEvent)( this, nullptr );": "event dispatch postEvent in platform/qt/MainWindow.cpp x2",
+        "auto dispatch = &QCoreApplication::sendSpontaneousEvent;":
+            "event dispatch sendSpontaneousEvent in platform/qt/MainWindow.cpp x1",
+        "auto dispatch = std::mem_fn( &QApplication::notify );": "event dispatch notify in platform/qt/MainWindow.cpp x1",
+    }
+
+    def test_r3_a2_every_mention_of_a_dispatch_name_is_counted(self) -> None:
+        for injected, needle in self._R3_A2_MUTANTS.items():
+            with self.subTest(injected):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), needle)
+
+    def test_r3_a2_a_grouped_notify_in_the_focus_guard_is_caught(self) -> None:
+        anchor = "QKeyEvent *keyEvent = static_cast<QKeyEvent*>( event );"
+        self._assert_caught(self._mutated(anchor, anchor + "\n        (qApp->notify)( QApplication::focusWidget(), keyEvent );",
+                                          path=self._SPACE_TABLE),
+                            "event dispatch notify in platform/qt/PlayerShortcutBinding.h x1")
+
+    def test_r3_a2_every_file_that_mentions_a_dispatch_name_is_loaded(self) -> None:
+        for text in ("(qApp->notify)( w, e );\n", "connectReady(notify)\n", "auto p = &QCoreApplication::postEvent;\n",
+                     "(QCoreApplication::sendSpontaneousEvent)( w, e );\n"):
+            with self.subTest(text):
+                self.assertRegex(text, _PLAY_RELEVANT)
+        # The two local callables named notify are loaded and pinned by file and count (reviewed, not a looser rule).
+        for path in ("platform/qt/FocusPixelMapManager.cpp", "platform/qt/SyncDownloadWaiter.h"):
+            with self.subTest(path):
+                self.assertIn(path, self.sources)
+
+    def test_the_binding_exemption_needs_the_exact_expression(self) -> None:
+        # A Key_Space merely NEAR a QKeySequence is not the reviewed expression.
+        for text in ("QKeySequence( Qt::Key_Space + 0 )", "QKeySequence( k ), Qt::Key_Space", "QKeySequence( Key_Space )"):
+            with self.subTest(text):
+                problems = self._key_synth_problems({self._SPACE_TABLE: "inline void w() { f( " + text + " ); }\n"})
+                self.assertTrue(any("synthesized key event" in p for p in problems), problems)
 
     def test_a_third_postevent_fails_the_scan(self) -> None:
         third = "\nvoid h() { QCoreApplication::postEvent( this, new QKeyEvent( QEvent::KeyPress, 0, {} ) ); }\n"
