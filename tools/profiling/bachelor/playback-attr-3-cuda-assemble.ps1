@@ -35,8 +35,15 @@
 # Exit codes: 2 source, 3 DLL-pair manifest missing, 4 DLL-pair manifest does not bind,
 # 12 qmake discovery, 13 qmake, 14 mingw32-make discovery, 15 make, 16 release exe missing,
 # 17 windeployqt discovery, 18 windeployqt, 19 DLL-pair deploy, 21 MinGW runtime deploy,
+# 22 runtime donor dir, 28 ffmpeg.exe install (step ffmpegExeInstall: the pinned payload did not install and verify),
 # 23 launch probe, 20 packaging, 24 publish partials, 25 publish rename, 26 publish manifest,
 # 27 no heavy-slot deadline (STAGE_NO_HEAVY_SLOT_DEADLINE: MLV_HEAVY_SLOT_DEADLINE_UTC absent or blank; nothing written, no ticket taken).
+#
+# FFMPEG.EXE. Every package carries ffmpeg.exe beside MLVApp.exe, installed from the pinned in-repo payload
+# (tools/gates/vendored-native-payloads.json id ffmpeg-windows-x86_64, platform/qt/FFmpeg/ffmpegWin64.zip) by
+# tools/repo_hygiene/extract_vendored_native_payload --verify-installed, the same install the hosted Windows release runs.
+# build.json records it as ffmpegExeDeployed plus ffmpegExe { payloadId, bytes, sha256 }. The FFmpeg av*/sw* DLLs still
+# come only from the optional -RuntimeDonorDir (ffmpegRuntimeDeployed).
 #
 # Usage (MLV_HEAVY_SLOT_DEADLINE_UTC must be set: Invoke-VenueStageChain.ps1 and the nightly set it; for a manual run set it yourself, ISO-8601):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-assemble.ps1 `
@@ -79,6 +86,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
+# Install-PinnedVendoredPayload (the bounded ffmpeg.exe install below), shared with tools/build-release.ps1.
+Import-Module (Join-Path $PSScriptRoot '..\..\release-runtime-admission.psm1') -Force
 
 $StepLog = [System.Collections.Specialized.OrderedDictionary]::new()
 function Say([string]$Message) { Write-Host "[attr3-assemble] $Message" }
@@ -313,6 +322,34 @@ if (-not [string]::IsNullOrWhiteSpace($RuntimeDonorDir)) {
 }
 $StepLog['runtimeDonor'] = 0
 
+# --- ffmpeg.exe from the pinned in-repo payload --------------------------------------------------
+# EXPORT-PRORES-FFMPEG-EXE-PACKAGE-1: a ProRes export leg runs the package's own ffmpeg.exe, found beside MLVApp.exe
+# (export-stage-job.ps1 refuses EXPORT_TOOLING_ABSENT without it), and no donor dir ever carried one. So it is installed
+# here on EVERY assemble, outside the optional donor step above, by the extractor and flags the hosted Windows release
+# uses: platform/qt/FFmpeg/ffmpegWin64.zip, member ffmpeg.exe, both sha-pinned in tools/gates/vendored-native-payloads.json
+# and re-verified after the atomic install. $RepoRoot is the git checkout (the manifest validator runs git ls-files; the
+# git-archive $SourceTree has no .git); the pins, not that checkout's revision, decide the bytes.
+$ffmpegPayloadId = 'ffmpeg-windows-x86_64'
+$ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $RepoRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir $releaseDir -TimeoutSec 600
+@("exitCode=$($ffmpegInstall.exitCode) timedOut=$($ffmpegInstall.timedOut) ok=$($ffmpegInstall.ok) reason=$($ffmpegInstall.reason)", '--- stdout', $ffmpegInstall.stdout, '--- stderr', $ffmpegInstall.stderr) |
+    Set-Content -LiteralPath (Join-Path $logDir 'ffmpeg-exe-install.log') -Encoding UTF8
+if (-not $ffmpegInstall.ok) { Complete-Failed 28 'ffmpegExeInstall' "ffmpeg.exe was not installed from the pinned payload $ffmpegPayloadId : $($ffmpegInstall.reason) (see logs\ffmpeg-exe-install.log)" }
+$ffmpegExePath = Join-Path $releaseDir 'ffmpeg.exe'
+$ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.path, $ffmpegExePath, [StringComparison]::OrdinalIgnoreCase) })
+if ($ffmpegRows.Count -ne 1 -or -not (Test-Path -LiteralPath $ffmpegExePath -PathType Leaf)) {
+    Complete-Failed 28 'ffmpegExeInstall' "the pinned payload $ffmpegPayloadId did not install $ffmpegExePath (installed: $(@($ffmpegInstall.installed | ForEach-Object { $_.path }) -join ', '))"
+}
+$ffmpegExe = [ordered]@{
+    payloadId = $ffmpegPayloadId
+    bytes = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
+    sha256 = Get-ShaLower $ffmpegExePath
+}
+if ($ffmpegExe.sha256 -cne [string]$ffmpegRows[0].sha256 -or $ffmpegExe.bytes -ne [long]$ffmpegRows[0].bytes) {
+    Complete-Failed 28 'ffmpegExeInstall' "$ffmpegExePath changed after the extractor verified it"
+}
+Say "FFMPEG.EXE installed from $ffmpegPayloadId bytes=$($ffmpegExe.bytes) sha256=$($ffmpegExe.sha256)"
+$StepLog['ffmpegExeInstall'] = 0
+
 # --- prove the package launches ----------------------------------------------------------------
 # Sanitized PATH so the ONLY DLLs that can resolve are the ones just deployed beside the exe;
 # the Qt/MinGW bins still on this process's PATH would otherwise mask an incomplete deploy.
@@ -421,6 +458,9 @@ $buildManifest = [ordered]@{
     }
     ffmpegRuntimeDeployed = $ffmpegRuntimeDeployed
     ffmpegRuntimeFiles = @($ffmpegNames)
+    # ffmpeg.exe beside the exe, from the pinned payload; the bytes and sha256 are read from the installed file.
+    ffmpegExeDeployed = $true
+    ffmpegExe = $ffmpegExe
     launchProbe = $launchProbe
     identity = [ordered]@{ injectedFromPinnedSourceCommit = $true; sha = $SourceCommit; dirty = 0 }
     # The verified archive the exe was compiled from; its zip comment declared $SourceCommit.

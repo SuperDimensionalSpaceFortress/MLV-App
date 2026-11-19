@@ -8,7 +8,9 @@
 #    runnable standalone: windeployqt (Qt DLLs + platforms/ imageformats/ ... plugin subdirs)
 #    + the MinGW runtime DLLs (incl. libgomp-1, which --compiler-runtime misses) + the non-Qt
 #    payload (FFmpeg av*/sw*, CUDA cudart64_12 + igpu_recon_cuda, pixel_maps/releases data)
-#    admitted from a fully deployed donor release tree. Copying ONLY the exe used to leave the
+#    admitted from a fully deployed donor release tree, plus ffmpeg.exe installed on every build from the
+#    sha-pinned in-repo payload (vendored-native-payloads.json ffmpeg-windows-x86_64, via
+#    extract_vendored_native_payload --verify-installed). Copying ONLY the exe used to leave the
 #    artifact with no DLLs beside it, so launching it died in the loader with 0xC0000135
 #    (STATUS_DLL_NOT_FOUND) BEFORE main(), silently breaking any reviewer/gate pointed at it.
 #  - PROVES runnability: launches the stamped exe with a sanitized PATH (system dirs only) so
@@ -17,7 +19,8 @@
 # Usage: pwsh -NoProfile -File tools\build-release.ps1 [-AllowDirty] [-OutRoot <dir>] [-RuntimeDonorDir <dir>]
 # Exit codes: 5=dirty tree (no -AllowDirty); 6=provenance stamp sha != HEAD; 7=runtime deploy
 #   failed (windeployqt or a required MinGW runtime DLL missing); 8=artifact not self-contained
-#   (launch probe died with a DLL-load NTSTATUS, e.g. 0xC0000135).
+#   (launch probe died with a DLL-load NTSTATUS, e.g. 0xC0000135); 9=ffmpeg.exe was not installed and verified from
+#   the pinned payload.
 param(
     [string]$SourceRoot = (Resolve-Path "$PSScriptRoot\..").Path,
     [string]$QtBin      = "C:\Qt\6.10.2\mingw_64\bin",
@@ -124,6 +127,7 @@ $deploy = [ordered]@{
     mingwRuntimeDlls   = @()
     runtimeExtras      = @()
     runtimeExtrasDonor = $null
+    ffmpegExe          = $null
     selfContained      = $false
 }
 
@@ -180,8 +184,31 @@ if ($donor) {
     }
 } else {
     Write-Host "WARN: no runtime donor dir found (looked at -RuntimeDonorDir, platform/qt/build-release|build-current/release);" -ForegroundColor Yellow
-    Write-Host "      FFmpeg/CUDA/data not mirrored. The exe will START (Qt+MinGW deployed) but FFmpeg/GPU features are unavailable in this artifact." -ForegroundColor Yellow
+    Write-Host "      FFmpeg DLLs/CUDA/data not mirrored. The exe will START (Qt+MinGW deployed) but those features are unavailable in this artifact." -ForegroundColor Yellow
 }
+
+# 3b) ffmpeg.exe (EXPORT-PRORES-FFMPEG-EXE-PACKAGE-1). Rendered export (ProRes and the other ffmpeg codecs) runs an
+#     ffmpeg.exe beside the app, and no donor admission above names one. Install it on EVERY build from the pinned
+#     in-repo payload (tools/gates/vendored-native-payloads.json id ffmpeg-windows-x86_64, platform/qt/FFmpeg/ffmpegWin64.zip)
+#     with the same extractor and --verify-installed the hosted Windows release runs. Bounded; a failure stops the build.
+$ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $SourceRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir (Resolve-Path -LiteralPath $dest).Path -TimeoutSec 600
+$ffmpegExePath = Join-Path $dest 'ffmpeg.exe'
+$ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.name, 'ffmpeg.exe', [StringComparison]::OrdinalIgnoreCase) })
+if (-not $ffmpegInstall.ok -or $ffmpegRows.Count -ne 1 -or -not (Test-Path -LiteralPath $ffmpegExePath -PathType Leaf)) {
+    Write-Host "FAIL: ffmpeg.exe was not installed from the pinned payload ffmpeg-windows-x86_64: $($ffmpegInstall.reason)" -ForegroundColor Red
+    if ($ffmpegInstall.stderr) { Write-Host $ffmpegInstall.stderr }
+    exit 9
+}
+$deploy.ffmpegExe = [ordered]@{
+    payloadId = 'ffmpeg-windows-x86_64'
+    bytes     = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
+    sha256    = (Get-FileHash -LiteralPath $ffmpegExePath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+if ($deploy.ffmpegExe.sha256 -cne [string]$ffmpegRows[0].sha256 -or $deploy.ffmpegExe.bytes -ne [long]$ffmpegRows[0].bytes) {
+    Write-Host "FAIL: $ffmpegExePath changed after the extractor verified it" -ForegroundColor Red
+    exit 9
+}
+Write-Host "OK: ffmpeg.exe installed from the pinned payload (sha256 $($deploy.ffmpegExe.sha256))" -ForegroundColor Green
 
 # 4) Prove runnability. Launch the stamped exe with a SANITIZED PATH (system dirs only) so the
 #    ONLY DLLs that can resolve are the ones just deployed beside it -- otherwise the Qt/MinGW
