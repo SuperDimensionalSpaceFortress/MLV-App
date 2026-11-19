@@ -5074,8 +5074,9 @@ function Wait-AttrCudaProcessTreeGone {
     A SURVIVOR, in one scan, is (a) a recorded member (or the root) whose pid shows with its recorded creation time, or with no readable creation time (a reuse
     cannot be told apart then), or (b) r1 fix iteration (adversary A1 on 2223cc4d): any live process whose ParentProcessId chain reaches the root or a recorded
     member, so a child started after the snapshot by a member that then exited is still found. The same pid with ANOTHER creation time is a reused number, not a
-    survivor by (a); children on a reused number are adopted by (b), which can only leave the kill unconfirmed. Budget (adversary A3): a scan is bounded by the time
-    left, at CIM's own floor of 1 s; a scan that ENDS past -WaitMs confirms nothing, and -WaitMs 0 is no time to confirm. Returns
+    survivor by (a); children on a reused number are adopted by (b), which can only leave the kill unconfirmed. A descendant (b) finds stays recorded for every later
+    scan. Budget (adversary A3 on 2223cc4d, A2 on 348c4357): a scan starts only while CIM's 1 s floor is left, under a timeout no longer than what is left; a scan
+    that ENDS past -WaitMs confirms nothing, and a -WaitMs under 1 s is no time to confirm. Returns
     [pscustomobject]@{ confirmed; survivors; error }: confirmed is $true only when the snapshot's ok is the boolean $true and a scan that ended inside -WaitMs showed
     no survivor. Anything else is $false (fail closed). Never throws. -Scan is the test seam: a scriptblock returning the rows of one scan.
     #>
@@ -5083,22 +5084,32 @@ function Wait-AttrCudaProcessTreeGone {
     if ($null -eq $Snapshot -or $Snapshot.ok -isnot [bool] -or -not $Snapshot.ok -or $null -eq $Snapshot.rootProcessId -or $null -eq $Snapshot.rootCreationTicks) {
         return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: $(if ($null -eq $Snapshot) { 'no snapshot' } else { [string]$Snapshot.error })" }
     }
-    if ($WaitMs -le 0) { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = 'no-time-to-confirm' } }
-    $recorded = @{ ([int64]$Snapshot.rootProcessId) = [int64]$Snapshot.rootCreationTicks }
-    foreach ($m in @($Snapshot.members)) { $recorded[[int64]$m.processId] = [int64]$m.creationTicks }
+    # r1 fix 2 (adversary A3 advisory on 348c4357): a snapshot whose identities do not convert is an unknown tree, never a throw.
+    $recorded = @{}
+    try {
+        $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
+        foreach ($m in @($Snapshot.members)) { $recorded[[int64]$m.processId] = [int64]$m.creationTicks }
+    } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot identity" } }
+    # r1 fix 2 (adversary A2 on 348c4357): a scan is STARTED only while at least $scanFloorMs (CIM's own 1 s OperationTimeoutSec floor) is left, under a timeout no
+    # longer than what is left, and no sleep runs into that floor; so no scan is granted past the bound. A bound under 1 s is no time to confirm.
+    $scanFloorMs = 1000
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $survivors = @()
-    $lastError = 'survivors'
-    while ($true) {
+    $lastError = 'no-time-to-confirm'
+    while (($WaitMs - $clock.ElapsedMilliseconds) -ge $scanFloorMs) {
         try {
-            $leftSec = [int][Math]::Max(1, [Math]::Ceiling(($WaitMs - $clock.ElapsedMilliseconds) / 1000.0))
+            $leftSec = [int][Math]::Max(1, [Math]::Floor(($WaitMs - $clock.ElapsedMilliseconds) / 1000.0))
             $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
             $byParent = @{}
+            $rowTicks = @{}
             $found = [System.Collections.Generic.List[int64]]::new()
             foreach ($row in $rows) {
                 if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
                 $rowPid = [int64]$row.ProcessId
-                if ($recorded.ContainsKey($rowPid) -and ($null -eq $row.CreationDate -or ([datetime]$row.CreationDate).ToUniversalTime().Ticks -eq $recorded[$rowPid])) { $found.Add($rowPid) }
+                $ticks = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
+                $rowTicks[$rowPid] = $ticks
+                # a recorded identity with no known creation time ($null: found by the walk with none readable) matches its pid whatever the creation time
+                if ($recorded.ContainsKey($rowPid) -and ($null -eq $ticks -or $null -eq $recorded[$rowPid] -or [int64]$ticks -eq [int64]$recorded[$rowPid])) { $found.Add($rowPid) }
                 if ($null -ne $row.ParentProcessId) {
                     $parentKey = [int64]$row.ParentProcessId
                     if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = [System.Collections.Generic.List[int64]]::new() }
@@ -5107,23 +5118,28 @@ function Wait-AttrCudaProcessTreeGone {
             }
             $seen = [System.Collections.Generic.HashSet[int64]]::new()
             $queue = [System.Collections.Generic.Queue[int64]]::new()
-            foreach ($k in $recorded.Keys) { [void]$seen.Add([int64]$k); $queue.Enqueue([int64]$k) }
+            foreach ($k in @($recorded.Keys)) { [void]$seen.Add([int64]$k); $queue.Enqueue([int64]$k) }
+            $discovered = [System.Collections.Generic.List[int64]]::new()
             while ($queue.Count -gt 0) {
                 $parentPid = $queue.Dequeue()
                 if (-not $byParent.ContainsKey($parentPid)) { continue }
                 foreach ($childPid in $byParent[$parentPid]) {
                     if (-not $seen.Add($childPid)) { continue }
                     $found.Add($childPid)
+                    $discovered.Add($childPid)
                     $queue.Enqueue($childPid)
                 }
             }
+            # r1 fix 2 (adversary A1 on 348c4357): a descendant the walk found is recorded from then on, so a later scan still sees it after its parent exits.
+            foreach ($d in $discovered) { $recorded[$d] = $rowTicks[$d] }
             $survivors = @($found | Sort-Object -Unique)
             $lastError = 'survivors'
             if ($clock.ElapsedMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
             if ($survivors.Count -eq 0) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
         } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
-        if ($clock.ElapsedMilliseconds -ge $WaitMs) { break }
-        Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Min(250, $WaitMs - $clock.ElapsedMilliseconds)))
+        $sleepMs = [Math]::Min(250, $WaitMs - $clock.ElapsedMilliseconds - $scanFloorMs)
+        if ($sleepMs -lt 0) { break }
+        if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int]$sleepMs) }
     }
     [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = $lastError }
 }
