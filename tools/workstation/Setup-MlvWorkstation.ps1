@@ -1162,9 +1162,7 @@ function Get-GitHubSshProbeVerdict {
 # mapping, a junction, a symbolic link and an 8.3 short name to the real long path; the volume serial plus file index identify one file whatever its spelling or case. Returns
 # @{ Final; Id } or $null when the path cannot be opened or the native call is unavailable (callers fail closed). Id is '' when the volume reports no file index.
 $script:PathIdentityOverride = $null   # test seam: a scriptblock taking the path and returning @{ Final; Id } or $null
-function Get-PathIdentity {
-    param([string]$Path)
-    if ($script:PathIdentityOverride) { return (& $script:PathIdentityOverride $Path) }
+function Initialize-PathIdentityType {
     if (-not ('MlvSetup.PathIdentity' -as [type])) {
         try {
             Add-Type -ErrorAction Stop -TypeDefinition @'
@@ -1195,17 +1193,50 @@ namespace MlvSetup {
                 return new string[] { sb.ToString(), id };
             }
         }
+        // r4 pass 9: the canonical path of the file an OPEN handle refers to (where a file this code just created physically is, whatever its path spells now), or null
+        public static string FinalPath(SafeFileHandle h) {
+            StringBuilder sb = new StringBuilder(4096);
+            uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+            if (n == 0 || n >= sb.Capacity) return null;
+            return sb.ToString();
+        }
     }
 }
 '@
-        } catch { return $null }
+        } catch { return $false }
     }
+    return $true
+}
+function Format-FinalPathName([string]$Final) {
+    if ($Final.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { return ('\\' + $Final.Substring(8)) }
+    if ($Final.StartsWith('\\?\', [StringComparison]::Ordinal)) { return $Final.Substring(4) }
+    return $Final
+}
+function Get-PathIdentity {
+    param([string]$Path)
+    if ($script:PathIdentityOverride) { return (& $script:PathIdentityOverride $Path) }
+    if (-not (Initialize-PathIdentityType)) { return $null }
     try { $q = [MlvSetup.PathIdentity]::Query([IO.Path]::GetFullPath($Path)) } catch { return $null }
     if (-not $q) { return $null }
-    $final = "$($q[0])"
-    if ($final.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { $final = '\\' + $final.Substring(8) }
-    elseif ($final.StartsWith('\\?\', [StringComparison]::Ordinal)) { $final = $final.Substring(4) }
-    return @{ Final = $final; Id = "$($q[1])" }
+    return @{ Final = (Format-FinalPathName "$($q[0])"); Id = "$($q[1])" }
+}
+# '' when the canonical path of the file behind an open handle cannot be read
+function Get-HandleFinalPath($Handle) {
+    if (-not (Initialize-PathIdentityType)) { return '' }
+    try { $f = [MlvSetup.PathIdentity]::FinalPath($Handle) } catch { return '' }
+    if (-not $f) { return '' }
+    return (Format-FinalPathName "$f")
+}
+# Removes the given files (retried for about 2 s, whatever the caller's -WhatIf / -Confirm preference) and returns the ones that are still there.
+function Remove-ProbeConfigFiles {
+    param([string[]]$Paths)
+    $list = @(@($Paths) | Where-Object { $_ } | Select-Object -Unique)
+    for ($try = 0; $try -lt 20; $try++) {
+        foreach ($p in $list) { try { Remove-Item -LiteralPath $p -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { } }   # a non-empty directory in its place throws even under SilentlyContinue
+        if (@($list | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    return @($list | Where-Object { Test-Path -LiteralPath $_ })
 }
 
 # r3 A3 (class: a location judged by its spelling, not by where it physically is): true when -Path, or any ancestor of it, has a '.ssh' segment, or is a link (directory junction or symbolic
@@ -1274,31 +1305,39 @@ function Invoke-GitHubSshProbe {
     }
     if (-not $cfgDir) { return @{ Authenticated = $false; Detail = 'no temp folder outside a .ssh directory is available for the probe config (ssh was not run)' } }
     $cfgPath = Join-Path $cfgDir ("mlv-ssh-probe-" + [guid]::NewGuid().ToString('N') + '.conf')
-    # r4 A2 (class: a check-then-use gap on a location): the folder was judged a moment ago, and a junction can be re-pointed between that judgement and the write. So the write is
-    # followed by a look at where the file PHYSICALLY landed (its canonical path from the file system): under a '.ssh' folder, or unresolvable -> the file is removed there and the probe
-    # fails closed before ssh runs. The physical path is also what the cleanup deletes, so a junction re-pointed after the write cannot hide the file that was created.
-    $cfgPhysical = ''; $cfgFail = ''
+    # r4 A2 / pass 9 (class: a mutable path used after it was checked): the folder was judged a moment ago, and a junction can be re-pointed between that judgement and any later use of
+    # the path. So after the folder check the config is only ever handled by where it PHYSICALLY is: it is created with CreateNew (a file that already exists is never opened, so
+    # only a file this call created is ever touched), its canonical path is read from the creating HANDLE (not from the path again), and that physical path is what ssh is given
+    # (-F), what the cleanup deletes and what the leftover report names. Under a '.ssh' folder, or an unreadable location -> that file is removed and the probe fails closed before
+    # ssh runs, through the same retrying removal and PROBE_CONFIG_NOT_DELETED report as after a probe.
+    $cfgPhysical = ''; $cfgFail = ''; $cfgCreated = $false
+    $cfgBytes = [Text.Encoding]::ASCII.GetBytes((($cfgLines -join "`n") + "`n"))
     if ($script:SshProbeConfigRaceHook) { & $script:SshProbeConfigRaceHook 'before-write' $cfgDir }   # test seam: a re-point between the folder check and the write
+    $cfgStream = $null
     try {
-        [IO.File]::WriteAllText($cfgPath, (($cfgLines -join "`n") + "`n"), [Text.Encoding]::ASCII)
-        $cid = Get-PathIdentity -Path $cfgPath
-        if (-not $cid -or -not $cid.Final) { $cfgFail = 'the probe config location could not be resolved after it was written' }
-        else {
-            $cfgPhysical = "$($cid.Final)"
-            if (@($cfgPhysical -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { $cfgFail = 'the probe config landed under a .ssh folder (the temp folder changed after it was checked)' }
-        }
+        $cfgStream = [IO.FileStream]::new($cfgPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $cfgCreated = $true
+        $cfgStream.Write($cfgBytes, 0, $cfgBytes.Length); $cfgStream.Flush()
+        $cfgPhysical = Get-HandleFinalPath $cfgStream.SafeFileHandle
+        if (-not $cfgPhysical) { $cfgFail = 'the probe config location could not be resolved after it was written' }
+        elseif (@($cfgPhysical -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { $cfgFail = 'the probe config landed under a .ssh folder (the temp folder changed after it was checked)' }
     } catch { $cfgFail = "the probe's ssh config could not be written ($($_.Exception.Message))" }
+    finally { if ($cfgStream) { try { $cfgStream.Dispose() } catch { } } }
+    if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'after-create' $cfgDir $cfgPhysical } catch { } }   # test seam: another process holds the file that was just created
     if ($cfgFail) {
-        foreach ($rp in @(@($cfgPath, $cfgPhysical) | Where-Object { $_ } | Select-Object -Unique)) { try { Remove-Item -LiteralPath $rp -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { } }
+        $gone = @()
+        if ($cfgCreated) { $gone = @(Remove-ProbeConfigFiles @($(if ($cfgPhysical) { $cfgPhysical } else { $cfgPath }))) }   # only a file this call created is removed
+        if ($gone.Count -gt 0) { return @{ Authenticated = $false; Detail = "PROBE_CONFIG_NOT_DELETED $($gone -join ', ') could not be removed ($cfgFail; ssh was not run; delete it by hand)" } }
         return @{ Authenticated = $false; Detail = "$cfgFail (ssh was not run)" }
     }
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
         # the same options again on the command line (they win over the file): a second, independent statement of the no-run / no-write contract
         $sshOpts = @('BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes', 'CheckHostIP=no', 'UpdateHostKeys=no', 'ControlMaster=no', 'ControlPath=none', 'PermitLocalCommand=no', 'RemoteCommand=none', 'ClearAllForwardings=yes', 'ForwardAgent=no')
-        foreach ($a in @('-F', $cfgPath) + $keyArgs + @('-T') + @($sshOpts | ForEach-Object { '-o'; $_ }) + @('git@github.com')) { $psi.ArgumentList.Add($a) }
+        foreach ($a in @('-F', $cfgPhysical) + $keyArgs + @('-T') + @($sshOpts | ForEach-Object { '-o'; $_ }) + @('git@github.com')) { $psi.ArgumentList.Add($a) }
         $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
         $proc = $null; $verdict = $null
+        if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'before-ssh' $cfgDir $cfgPhysical } catch { } }   # test seam: a re-point between the physical check and ssh reading its -F file
         try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { $verdict = @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
         if (-not $verdict) {
             # r4 H1 (class: a child process whose termination is assumed): once ssh has started, EVERY way out of this block ends with the child terminated and the outcome known. A throw
@@ -1329,17 +1368,12 @@ function Invoke-GitHubSshProbe {
     } finally {
         # adversary pass 4 A4: this is the probe's own temp file, so it is removed whatever the caller's -WhatIf / -Confirm preference is (Verify runs the probe under -WhatIf too).
         # adversary pass 5 A5: a removal that fails (a scanner or another process holds the file) is retried for about 2 s
-        # r4 A2: both the path the probe was given and the physical path the file landed at are removed and checked (a junction re-pointed since the write makes the first one stale)
-        if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'after-ssh' $cfgDir } catch { } }   # test seam: a re-point between the ssh run and the cleanup
-        $cleanup = @(@($cfgPath, $cfgPhysical) | Where-Object { $_ } | Select-Object -Unique)
-        for ($try = 0; $try -lt 20; $try++) {
-            foreach ($cp in $cleanup) { try { Remove-Item -LiteralPath $cp -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { } }   # a non-empty directory in its place throws even under SilentlyContinue
-            if (@($cleanup | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) { break }
-            Start-Sleep -Milliseconds 100
-        }
+        # r4 A2 / pass 9: only the PHYSICAL path of the file this call created is removed and checked: the path the probe was handed can be re-pointed (a junction) at a folder that holds an
+        # unrelated file of the same name, which must never be deleted
+        if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'after-ssh' $cfgDir $cfgPhysical } catch { } }   # test seam: a re-point between the ssh run and the cleanup
+        $leftover = @(Remove-ProbeConfigFiles @($cfgPhysical))
     }
     # a config that is still there after the retries is a failed probe, whatever ssh said (fail closed: the contract is that the probe leaves nothing behind)
-    $leftover = @($cleanup | Where-Object { Test-Path -LiteralPath $_ })
     if ($leftover.Count -gt 0) { return @{ Authenticated = $false; Detail = "PROBE_CONFIG_NOT_DELETED $($leftover -join ', ') could not be removed after the probe (delete it by hand); the probe result is not used" } }
     return $verdict
 }

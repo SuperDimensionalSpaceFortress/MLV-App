@@ -3904,9 +3904,34 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
         Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'under a \.ssh folder' -and $pr.Detail -match 'ssh was not run' -and -not (Test-Path -LiteralPath $spArgs) -and @(Get-ChildItem -LiteralPath $spA2Ssh -Force).Count -eq 0) 'SSH-PUSHURL-1 r4 A2 probe: a temp folder junction re-pointed at .ssh after it was checked -> the config that landed there is removed, ssh is not run, nothing is left under .ssh' "$($pr.Detail) args=$(Test-Path -LiteralPath $spArgs) left=$(@(Get-ChildItem -LiteralPath $spA2Ssh -Force).Count)"
         [IO.Directory]::Delete($spA2Link); [void](New-Item -ItemType Junction -Path $spA2Link -Target $spA2Plain)
         Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
-        $script:SshProbeConfigRaceHook = { param($phase, $dir) if ($phase -ceq 'after-ssh') { [IO.Directory]::Delete($script:spA2Cfg.Link); [void](New-Item -ItemType Junction -Path $script:spA2Cfg.Link -Target $script:spA2Cfg.Other) } }
+        # pass 9 A1: re-pointed after the ssh run, at a folder that holds an UNRELATED file with the same name: that file is never deleted, and the config that was created is
+        $script:SshProbeConfigRaceHook = { param($phase, $dir, $phys) if ($phase -ceq 'after-ssh') { [IO.File]::WriteAllText((Join-Path $script:spA2Cfg.Other (Split-Path -Leaf $phys)), 'KEEP'); [IO.Directory]::Delete($script:spA2Cfg.Link); [void](New-Item -ItemType Junction -Path $script:spA2Cfg.Link -Target $script:spA2Cfg.Other) } }
         try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey } finally { $script:SshProbeConfigRaceHook = $null }
-        Assert-That ($pr.Authenticated -eq $true -and @(Get-ChildItem -LiteralPath $spA2Plain -Filter 'mlv-ssh-probe-*.conf' -Force).Count -eq 0 -and @(Get-ChildItem -LiteralPath $spA2Other -Force).Count -eq 0) 'SSH-PUSHURL-1 r4 A2 probe: a junction re-pointed after the ssh run -> the config that was created is still removed from where it physically landed (a stale path does not hide it)' "$($pr.Detail) left=$(@(Get-ChildItem -LiteralPath $spA2Plain -Force | ForEach-Object { $_.Name }) -join ',')"
+        $spKeepFiles = @(Get-ChildItem -LiteralPath $spA2Other -Force)
+        Assert-That ($pr.Authenticated -eq $true -and @(Get-ChildItem -LiteralPath $spA2Plain -Filter 'mlv-ssh-probe-*.conf' -Force).Count -eq 0 -and $spKeepFiles.Count -eq 1 -and [IO.File]::ReadAllText($spKeepFiles[0].FullName) -ceq 'KEEP') 'SSH-PUSHURL-1 r4 pass9 A1 probe: a junction re-pointed after the ssh run -> the created config is removed from where it physically landed and an unrelated same-name file behind the re-pointed junction is never deleted' "$($pr.Detail) plain=$(@(Get-ChildItem -LiteralPath $spA2Plain -Force | ForEach-Object { $_.Name }) -join ',') other=$(@($spKeepFiles | ForEach-Object { $_.Name }) -join ',')"
+        foreach ($spKf in $spKeepFiles) { Remove-Item -LiteralPath $spKf.FullName -Force }
+        # pass 9 A2: re-pointed after the physical check and before ssh reads its -F file, at a folder that holds a planted config of the same name: ssh is handed the physical file
+        [IO.Directory]::Delete($spA2Link); [void](New-Item -ItemType Junction -Path $spA2Link -Target $spA2Plain)
+        Remove-Item -LiteralPath $spArgs, $spCfgCopy -Force -ErrorAction SilentlyContinue
+        $script:SshProbeConfigRaceHook = { param($phase, $dir, $phys) if ($phase -ceq 'before-ssh') { [IO.File]::WriteAllText((Join-Path $script:spA2Cfg.Other (Split-Path -Leaf $phys)), 'PLANTED Include C:/Users/x/.ssh/config'); [IO.Directory]::Delete($script:spA2Cfg.Link); [void](New-Item -ItemType Junction -Path $script:spA2Cfg.Link -Target $script:spA2Cfg.Other) } }
+        try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey } finally { $script:SshProbeConfigRaceHook = $null }
+        $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
+        $cfgText = $(if (Test-Path -LiteralPath $spCfgCopy) { [IO.File]::ReadAllText($spCfgCopy) } else { '' })
+        Assert-That ($cfgText -match '(?m)^Host github\.com' -and $cfgText -notmatch 'PLANTED' -and $argText -notmatch 'tmplink') 'SSH-PUSHURL-1 r4 pass9 A2 probe: ssh is given the physical path of the config this call created, so a junction re-pointed before ssh reads it cannot make ssh parse another file' "args=$argText`ncfg=$cfgText"
+        foreach ($spKf in @(Get-ChildItem -LiteralPath $spA2Other -Force)) { Remove-Item -LiteralPath $spKf.FullName -Force }
+        # pass 9 A3: the config landed under .ssh through a re-pointed junction and another process holds it open without delete sharing: the leftover is reported, never silent
+        [IO.Directory]::Delete($spA2Link); [void](New-Item -ItemType Junction -Path $spA2Link -Target $spA2Plain)
+        Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+        $script:spA3Hold = $null
+        $script:SshProbeConfigRaceHook = { param($phase, $dir, $phys)
+            if ($phase -ceq 'before-write') { [IO.Directory]::Delete($script:spA2Cfg.Link); [void](New-Item -ItemType Junction -Path $script:spA2Cfg.Link -Target $script:spA2Cfg.Ssh) }
+            if ($phase -ceq 'after-create' -and $phys) { $script:spA3Hold = [IO.File]::Open($phys, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) }
+        }
+        try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey } finally { $script:SshProbeConfigRaceHook = $null }
+        $spA3Left = @(Get-ChildItem -LiteralPath $spA2Ssh -Filter 'mlv-ssh-probe-*.conf' -Force)
+        if ($script:spA3Hold) { $script:spA3Hold.Dispose() }
+        foreach ($spKf in $spA3Left) { Remove-Item -LiteralPath $spKf.FullName -Force -ErrorAction SilentlyContinue }
+        Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'PROBE_CONFIG_NOT_DELETED' -and $pr.Detail -match 'ssh was not run' -and -not (Test-Path -LiteralPath $spArgs) -and $spA3Left.Count -eq 1) 'SSH-PUSHURL-1 r4 pass9 A3 probe: a config that landed under .ssh and cannot be removed is reported as PROBE_CONFIG_NOT_DELETED (ssh not run), not dropped silently' "$($pr.Detail) left=$($spA3Left.Count)"
     } finally {
         $env:TEMP = $sv.T; $env:TMP = $sv.M; $env:LOCALAPPDATA = $sv.L; $script:SshProbeConfigRaceHook = $null
         if (Test-Path -LiteralPath $spA2Link) { [IO.Directory]::Delete($spA2Link) }
