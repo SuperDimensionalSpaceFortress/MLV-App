@@ -31,9 +31,11 @@
 #   4. the venue copy already has that sha -> DEPLOY_NOOP, exit 0 (idempotent; nothing is touched, busy or not).
 #      With -RestartMode when-idle a no-op still writes nothing, but the live agent may be running an OLDER script it read before
 #      the file was written (a copy-only deploy, or a crash after the write): the restart binding below must hold, and the agent is
-#      restarted (the step 8 path, on the same idle gate) iff it did not start clearly after the file time (Get-NoopRestartDecision;
-#      the file time is the latest of write, creation and CHANGE time, because a copy can carry the first two over from its source).
-#      An agent start or file time that cannot be read is `restarted=no reason=unreadable`, exit 12, never a silent success.
+#      restarted (the step 8 path, on the same idle gate). No file or process time proves which bytes a running agent loaded (a copy
+#      can carry old file times, a clock step reorders any two wall-clock times), so a when-idle no-op never reports "current": it
+#      restarts, and prints the times as information only (agentAfterFile=; Get-NoopRestartDecision). -RestartMode none = no restart.
+#      On the real path a heartbeat whose start cannot be read is a binding refusal (16); with the -RestartScript seam (no binding)
+#      it is `restarted=no reason=unreadable`, exit 12, never a silent success.
 #   5. busy or leased -> typed refusal, nothing changed (table below). Busy is ONE predicate ($script:LiveWorkRules): an
 #      inbox\*.job.ps1, a running\*.started.json or an unresolved marker tmp, each read with the agent's own call; any other
 #      entry is an ignored leftover (DEPLOY_IGNORED_LEFTOVERS, printed after step 2): not busy, and never deleted, moved or
@@ -47,10 +49,11 @@
 #
 # Typed lines (stdout) and exit codes - the hub parses these
 #   DEPLOY_NOOP sha=<s>                                          0   (-RestartMode none: this exact line, busy or not)
-#   DEPLOY_NOOP sha=<s> restarted=yes reason=agent-predates-file pid=<n> agentStartUtc=<t> fileUtc=<t>    0   (when-idle)
-#   DEPLOY_NOOP sha=<s> restarted=no reason=current <same fields>                                            0   (when-idle)
+#   DEPLOY_NOOP sha=<s> restarted=yes reason=loaded-script-unproven pid=<n> agentStartUtc=<t> fileUtc=<t|unreadable> agentAfterFile=<yes|no|unknown>
+#                                                                0   (when-idle; the times are information, never the decision)
 #   DEPLOY_NOOP sha=<s> restarted=no reason=<unreadable|no-live-agent|restart-host-refused|busy|restart-failed> ...
-#                                                                12|16|16|10 or 11|14 (when-idle; after the matching typed line)
+#                                                                12|16|16|10 or 11|14 (when-idle; after the matching typed line;
+#                                                                unreadable and no-live-agent: the -RestartScript seam only)
 #   DEPLOY_DRYRUN action=<deploy|noop> sha=<s> restart=<mode>   0   (-RestartMode none)
 #   DEPLOY_DRYRUN action=deploy sha=<s> restart=when-idle decision=<restart-if-idle wouldExit=0|refuse wouldExit=16 why=<..>>   0
 #   DEPLOY_DRYRUN action=noop sha=<s> restart=when-idle decision=<restart|no-restart> reason=<as DEPLOY_NOOP> wouldExit=<n> ...  0
@@ -1087,18 +1090,23 @@ public static class MlvDeployFileTimes {
 function Get-NoopRestartDecision {
     # BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1: the venue copy already has the source sha, so nothing is written; with -RestartMode when-idle
     # the question is whether the LIVE agent runs that file or an older one it read before the file was written (a copy-only deploy, or a
-    # crash after the write). A PowerShell host reads the whole -File script when it starts, so the agent runs the file iff it STARTED
-    # AFTER the file was last written. Returns @{ restart; reason; detail; code }:
-    #   restart=$true  reason=agent-predates-file  the agent's start is not clearly after the file time (within the tolerance counts as
-    #                                              before: a restart of an idle agent is safe, an agent left on old code is the defect)
-    #   restart=$false reason=current         code 0   the agent started more than $script:StartToleranceSec after the file time
-    #   restart=$false reason=unreadable      code 12  the agent's start or the file time could not be read (never a silent success)
-    #   restart=$false reason=no-live-agent   code 16  the heartbeat pid is not a live process with its recorded start
+    # crash after the write). NOTHING ON THIS SIDE CAN PROVE WHICH BYTES A RUNNING PROCESS LOADED: the agent records no hash of its own
+    # script, and "it started after the file was written" compares two WALL-CLOCK times. A copy can carry its source's write and creation
+    # times (adversary pass 1 A1 of 100e87dc: Copy-Item, robocopy), and a clock stepped back after the agent started makes a copy that
+    # landed LATER read as EARLIER, change time included (pass 2 A1 of a4389eb1: NTP, a manual set, a VM resume). So a when-idle no-op
+    # never attests "current": it restarts the live agent (on the binding and the idle gate, like a deploy) and prints the times as
+    # INFORMATION only (agentAfterFile=yes|no|unknown). The one way to say "do not restart" is -RestartMode none.
+    # Returns @{ restart; reason; detail; code }:
+    #   restart=$true  reason=loaded-script-unproven         the live agent is identified; it is restarted
+    #   restart=$false reason=unreadable      code 12  (the -RestartScript seam only) the heartbeat start cannot be read, so the live
+    #                                                  process cannot be identified; never a silent success
+    #   restart=$false reason=no-live-agent   code 16  (the -RestartScript seam only) the heartbeat pid is not a live process with its start
+    # On the real path the restart binding has already proved the live agent (it refuses with 16 BEFORE this runs, an unreadable
+    # heartbeat start included), so there this always returns restart=$true.
     # $Beat: the heartbeat the restart binding proved (it carries osStart, the start the OS reported for the pid), or $null when no binding
     # ran (the -RestartScript seam), in which case the heartbeat is read here and held to the same "live, with its recorded start" test.
-    # The file time is the LATEST of LastWriteTimeUtc, CreationTimeUtc and the change time (Get-FileChangeTimeUtc). A copy can carry the
-    # write AND the creation time over from its source (Copy-Item keeps the write time, robocopy both), so either one alone could read
-    # an agent as current that never loaded the file; the change time moves with every write and no copy carries it over.
+    # The file time printed is the LATEST of LastWriteTimeUtc, CreationTimeUtc and the change time (Get-FileChangeTimeUtc); a file time
+    # that cannot be read is printed as unreadable and changes nothing (the decision does not depend on it).
     param([string]$AgentScript, $Beat)
     $unreadable = { param([string]$Why) return @{ restart = $false; reason = 'unreadable'; detail = $Why; code = 12 } }
     $startText = $null
@@ -1121,19 +1129,21 @@ function Get-NoopRestartDecision {
     }
     try { $agentStart = ConvertTo-UtcStart -Text $startText }
     catch { return (& $unreadable "the agent start $startText is not a time") }
+    # information only: the times never decide (see above), so an unreadable one is printed as such and the agent is still restarted
+    $fileText = 'unreadable'
+    $after = 'unknown'
     try {
         $item = Get-Item -LiteralPath $AgentScript -ErrorAction Stop
         $fileUtc = $item.LastWriteTimeUtc
         if ($item.CreationTimeUtc -gt $fileUtc) { $fileUtc = $item.CreationTimeUtc }
         $changeUtc = Get-FileChangeTimeUtc -Path $AgentScript
         if ($changeUtc -gt $fileUtc) { $fileUtc = $changeUtc }
+        $fileText = $fileUtc.ToString('o')
+        $after = $(if (($agentStart - $fileUtc).TotalSeconds -gt $script:StartToleranceSec) { 'yes' } else { 'no' })
     }
-    catch { return (& $unreadable "the time of $AgentScript could not be read: $($_.Exception.Message)") }
-    $detail = "pid=$($Beat.pid) agentStartUtc=$($agentStart.ToString('o')) fileUtc=$($fileUtc.ToString('o'))"
-    if (($agentStart - $fileUtc).TotalSeconds -gt $script:StartToleranceSec) {
-        return @{ restart = $false; reason = 'current'; detail = $detail; code = 0 }
-    }
-    return @{ restart = $true; reason = 'agent-predates-file'; detail = $detail; code = 0 }
+    catch { $fileText = 'unreadable(' + ([string]$_.Exception.Message -replace '\s+', '_') + ')' }
+    $detail = "pid=$($Beat.pid) agentStartUtc=$($agentStart.ToString('o')) fileUtc=$fileText agentAfterFile=$after"
+    return @{ restart = $true; reason = 'loaded-script-unproven'; detail = $detail; code = 0 }
 }
 
 # Dot-sourced (`. <script> -VenueRoot <x>`): the functions above only.
@@ -1207,8 +1217,8 @@ try {
         }
     }
 
-    # 4b. a no-op with -RestartMode when-idle: restart the agent iff it predates the file (Get-NoopRestartDecision), on the same idle gate
-    # and the same restart path as a deploy. Nothing is written either way.
+    # 4b. a no-op with -RestartMode when-idle: restart the live agent (Get-NoopRestartDecision: which bytes it loaded cannot be proved),
+    # on the same idle gate and the same restart path as a deploy. Nothing is written either way.
     if ($isNoop) {
         # a dry run's refusals stay refusals (adversary A2 of 100e87dc): busy, leased or unreadable is judged BEFORE any dry-run report
         # below, whatever restart decision would follow, exactly as a dry deploy judges it before its DEPLOY_DRYRUN line

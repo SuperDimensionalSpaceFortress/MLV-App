@@ -1678,17 +1678,22 @@ class DeployBachelorAgent(unittest.TestCase):
         before = (self.venue / AGENT_NAME).stat().st_mtime_ns
         r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes\b" % sha(OLD))
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven .*\bagentAfterFile=no\b" % sha(OLD))
         self.assertTrue(self.marker.exists(), "the restart ran")
         self.assertEqual((self.venue / AGENT_NAME).stat().st_mtime_ns, before, "a no-op still does not rewrite the file")
         self.assertEqual(self.rollbacks(), [], "a no-op still makes no rollback folder")
 
-    def test_noop2_a_noop_leaves_an_agent_that_started_after_the_file_alone(self) -> None:
+    def test_noop2_an_agent_that_seems_to_start_after_the_file_is_still_restarted(self) -> None:
+        # adversary pass 2 A1 of a4389eb1: "started after the file" was read from two wall-clock times, and a clock stepped back after the
+        # agent started (or a copy that carries its source's times, pass 1 A1) makes a copy landed LATER read as EARLIER. No file time
+        # proves which bytes a running process loaded, so a when-idle NOOP never attests "current": it restarts the bound, idle agent and
+        # prints the times as information only (agentAfterFile=). -RestartMode none is the way to say "do not restart".
         self._noop_venue_with_live_agent(agent_first=False)
         r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=current\b" % sha(OLD))
-        self.assertFalse(self.marker.exists(), "an agent that already runs the file is not restarted")
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven .*\bagentAfterFile=yes\b" % sha(OLD))
+        self.assertNotIn("reason=current", r.stdout)
+        self.assertTrue(self.marker.exists(), "the restart ran")
 
     def test_noop3_a_noop_whose_agent_start_cannot_be_read_fails_closed(self) -> None:
         self.source.write_bytes(OLD)
@@ -1740,7 +1745,7 @@ class DeployBachelorAgent(unittest.TestCase):
         self._noop_venue_with_live_agent(agent_first=True)
         r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-RestartScript", str(self.restart))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=restart reason=agent-predates-file wouldExit=0\b" % sha(OLD))
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=restart reason=loaded-script-unproven wouldExit=0\b" % sha(OLD))
         self.assertFalse(self.marker.exists(), "a dry run never restarts")
         # and a bound deploy dry run names its decision too
         (self.venue / AGENT_NAME).write_bytes(NEW)
@@ -1776,7 +1781,7 @@ class DeployBachelorAgent(unittest.TestCase):
                            check=True, capture_output=True, text=True, timeout=60)
         r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=agent-predates-file\b" % sha(OLD))
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven .*\bagentAfterFile=no\b" % sha(OLD))
         self.assertTrue(self.marker.exists(), "the agent that predates the copy is restarted")
 
     def test_noop_a2_a_busy_or_leased_venue_is_still_a_refusal_in_a_when_idle_noop_dry_run(self) -> None:
