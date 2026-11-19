@@ -199,10 +199,16 @@ if (-not $ffmpegInstall.ok -or $ffmpegRows.Count -ne 1 -or -not (Test-Path -Lite
     if ($ffmpegInstall.stderr) { Write-Host $ffmpegInstall.stderr }
     exit 9
 }
-$deploy.ffmpegExe = [ordered]@{
-    payloadId = 'ffmpeg-windows-x86_64'
-    bytes     = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
-    sha256    = (Get-FileHash -LiteralPath $ffmpegExePath -Algorithm SHA256).Hash.ToLowerInvariant()
+try {
+    $deploy.ffmpegExe = [ordered]@{
+        payloadId = 'ffmpeg-windows-x86_64'
+        bytes     = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
+        sha256    = (Get-FileHash -LiteralPath $ffmpegExePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+} catch {
+    # A locked installed file is the typed failure, never an exception past it (adversary 32bf39a9-A2).
+    Write-Host "FAIL: the installed $ffmpegExePath could not be read back: $($_.Exception.Message)" -ForegroundColor Red
+    exit 9
 }
 if ($deploy.ffmpegExe.sha256 -cne [string]$ffmpegRows[0].sha256 -or $deploy.ffmpegExe.bytes -ne [long]$ffmpegRows[0].bytes) {
     Write-Host "FAIL: $ffmpegExePath changed after the extractor verified it" -ForegroundColor Red
@@ -225,7 +231,7 @@ $cleanPath = @(
     $env:SystemRoot,
     (Join-Path $env:SystemRoot 'System32\Wbem')
 ) -join ';'
-$probeExit = $null; $probeTimedOut = $false
+$probeExit = $null; $probeTimedOut = $false; $probeKillConfirmed = $null; $probeKillError = ''
 $savedPath = $env:Path
 try {
     $env:Path = $cleanPath
@@ -234,7 +240,12 @@ try {
         -RedirectStandardOutput (Join-Path $probeDir 'out.txt') `
         -RedirectStandardError  (Join-Path $probeDir 'err.txt')
     if ($p.WaitForExit(30000)) { $probeExit = $p.ExitCode }
-    else { try { $p.Kill() } catch {}; $probeTimedOut = $true }
+    else {
+        # Confirmed or said to be unconfirmed (adversary 32bf39a9-A3): a Kill that threw is never reported as killed.
+        $probeStop = Stop-PinnedPayloadChild -Process $p
+        $probeKillConfirmed = [bool]$probeStop.exited; $probeKillError = [string]$probeStop.killError
+        $probeTimedOut = $true
+    }
 } finally {
     $env:Path = $savedPath
     Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -246,13 +257,15 @@ $launchProbe = [ordered]@{
     sanitizedPath    = $true
     exitCode         = $probeExit
     timedOut         = $probeTimedOut
+    killConfirmed    = $probeKillConfirmed
     dllLoadFailure   = $probeDllFailure
     statusDllNotFound = ($probeExit -eq -1073741515)
 }
 if ($probeDllFailure) {
     Write-Host ("FAIL: artifact is NOT self-contained -- launch probe exited 0x{0:X8} (DLL load failure)" -f ([uint32]$probeExit)) -ForegroundColor Red
 } elseif ($probeTimedOut) {
-    Write-Host "WARN: launch probe timed out after 30s (killed); could not confirm self-contained launch" -ForegroundColor Yellow
+    $killNote = if ($probeKillConfirmed) { 'killed, exit seen' } else { "kill NOT confirmed, pid $($p.Id) may still run$(if ($probeKillError) { ": $probeKillError" })" }
+    Write-Host "WARN: launch probe timed out after 30s ($killNote); could not confirm self-contained launch" -ForegroundColor Yellow
 } elseif ($probeExit -ne 0) {
     Write-Host "NOTE: launch probe resolved all DLLs (no 0xC0000135) but --batch --help returned $probeExit (likely environment, e.g. no interactive desktop)" -ForegroundColor Yellow
 } else {

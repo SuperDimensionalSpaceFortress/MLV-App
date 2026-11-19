@@ -144,6 +144,9 @@ class JobAndManifestAgreeTests(unittest.TestCase):
 
 @unittest.skipUnless(PWSH, "needs pwsh for the PowerShell AST")
 class ScriptsInstallUnconditionallyTests(unittest.TestCase):
+    # adversary 32bf39a9-A4: the output dir is pinned EXACTLY (a substring match accepted (Join-Path $releaseDir 'other')).
+    EXACT_OUTPUT_DIR = {"releaseDir": "$releaseDir", "dest": "(Resolve-Path -LiteralPath $dest).Path"}
+
     def _assert_one_unconditional_install(self, path: Path, output_variable: str) -> dict:
         record = _ffmpeg_record()
         calls = _install_calls(_commands(path))
@@ -152,7 +155,7 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         named = {k.lower(): v for k, v in call["named"].items()}
         self.assertEqual(named.get("payloadid", {}).get("value"), PAYLOAD_ID, call["text"])
         self.assertEqual(named.get("archivereference", {}).get("value"), PurePosixPath(record["path"]).name, call["text"])
-        self.assertIn("$" + output_variable, named.get("outputdir", {}).get("text", ""), call["text"])
+        self.assertEqual(named.get("outputdir", {}).get("text", ""), self.EXACT_OUTPUT_DIR[output_variable], call["text"])
         self.assertIn("reporoot", named, call["text"])
         guarded = sorted(set(call["ancestors"]) & GUARDING_NODES)
         self.assertEqual(guarded, [], f"{path.name}:{call['line']} the install sits under {guarded}: it must run on every build")
@@ -209,6 +212,36 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertRegex(text[: text.index("param(")], r"9=ffmpeg\.exe")
         self.assertIn("$deploy.ffmpegExe = [ordered]@{", text)
 
+    def test_every_ffmpeg_step_that_can_throw_is_caught_and_typed(self) -> None:
+        # adversary 32bf39a9-A2: a locked install log or a FileShare.None handle on the installed ffmpeg.exe threw past the typed failure
+        # (exit 28 / exit 9). Every read of the installed file and the log write sit under a try.
+        for path, needles in (
+            (ASSEMBLER, ("Set-Content -LiteralPath (Join-Path $logDir 'ffmpeg-exe-install.log')", "Get-Item -LiteralPath $ffmpegExePath",
+                         "Get-ShaLower $ffmpegExePath")),
+            (BUILD_RELEASE, ("Get-Item -LiteralPath $ffmpegExePath", "Get-FileHash -LiteralPath $ffmpegExePath")),
+        ):
+            commands = _commands(path)
+            for needle in needles:
+                with self.subTest(script=path.name, site=needle):
+                    sites = [c for c in commands if c["text"].startswith(needle.split(" ", 1)[0]) and needle in c["text"]]
+                    self.assertTrue(sites, f"{needle} not found in {path.name}")
+                    for site in sites:
+                        self.assertIn("TryStatementAst", site["ancestors"], f"{path.name}:{site['line']} {needle} can throw past the typed failure")
+
+    def test_a_timeout_reports_the_kill_only_when_it_is_confirmed(self) -> None:
+        # adversary 32bf39a9-A3: a Kill that threw and a wait that did not see the exit were discarded and the reason still said "killed".
+        text = _normalised(HELPER_MODULE)
+        self.assertIn("function Stop-PinnedPayloadChild {", text)
+        body = text[text.index(f"function {HELPER} {{"):]
+        self.assertIn("$stop = Stop-PinnedPayloadChild -Process $process", body)
+        self.assertIn("$result.killConfirmed = [bool]$stop.exited", body)
+        self.assertIn("the kill was NOT confirmed", body)
+        release = _normalised(BUILD_RELEASE)
+        self.assertNotIn("try { $p.Kill() } catch {}", release)
+        self.assertIn("killConfirmed    = $probeKillConfirmed", release)
+        assembler = _normalised(ASSEMBLER)
+        self.assertNotIn("try { $probe.Kill() } catch { }", assembler)
+
     def test_the_helper_runs_the_extractor_with_verify_installed_bounded(self) -> None:
         text = _normalised(HELPER_MODULE)
         start = text.index(f"function {HELPER} {{")
@@ -224,22 +257,37 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertEqual(flat[-1], "--verify-installed")
         self.assertIn("$psi.WorkingDirectory = $RepoRoot", body)
         self.assertIn("$process.WaitForExit($TimeoutSec * 1000)", body)
-        self.assertIn("$process.Kill($true)", body)
-        self.assertIn(f"Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, {HELPER}", text)
+        stop = text[text.index("function Stop-PinnedPayloadChild {"): text.index(f"function {HELPER} {{")]
+        self.assertIn("$Process.Kill($true)", stop, "the timeout kill must take the whole tree")
+        self.assertIn(f"Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, {HELPER}, Stop-PinnedPayloadChild", text)
+        # adversary 32bf39a9-A1: every inherited GIT_* variable is dropped from the child's environment.
+        self.assertIn("if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }", body)
+
+    def test_an_install_into_another_folder_is_refused_by_the_guard(self) -> None:
+        # adversary 32bf39a9-A4: (Join-Path $releaseDir 'other') passed the substring check; the exact pin must refuse it.
+        text = ASSEMBLER.read_text(encoding="utf-8")
+        needle = "-OutputDir $releaseDir -TimeoutSec"
+        self.assertEqual(text.count(needle), 1)
+        with tempfile.TemporaryDirectory(prefix="ffx-mutant-") as tmp:
+            mutant = Path(tmp) / ASSEMBLER.name
+            mutant.write_text(text.replace(needle, "-OutputDir (Join-Path $releaseDir 'other') -TimeoutSec"), encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                self._assert_one_unconditional_install(mutant, "releaseDir")
 
 
 @unittest.skipUnless(os.name == "nt" and PWSH and shutil.which("py"), "needs Windows, pwsh and py.exe")
 class HelperBehaviourTests(unittest.TestCase):
     """The real helper on the real in-repo archive."""
 
-    def _run(self, output_dir: str, archive_reference: str = "ffmpegWin64.zip") -> dict:
+    def _run(self, output_dir: str, archive_reference: str = "ffmpegWin64.zip", *, extra_env: dict | None = None, prelude: str = "") -> dict:
         module = str(HELPER_MODULE).replace("'", "''")
         script = (
-            f"Import-Module '{module}' -Force\n"
+            prelude
+            + f"Import-Module '{module}' -Force\n"
             f"$r = {HELPER} -RepoRoot $env:FFX_REPO -PayloadId '{PAYLOAD_ID}' -ArchiveReference $env:FFX_ARCHIVE -OutputDir $env:FFX_OUT -TimeoutSec 600\n"
             "$r | Select-Object ok, reason, exitCode, timedOut, installed | ConvertTo-Json -Depth 4 -Compress\n"
         )
-        env = dict(os.environ, FFX_REPO=str(ROOT), FFX_ARCHIVE=archive_reference, FFX_OUT=output_dir)
+        env = dict(os.environ, FFX_REPO=str(ROOT), FFX_ARCHIVE=archive_reference, FFX_OUT=output_dir, **(extra_env or {}))
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
                               capture_output=True, text=True, timeout=900, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -274,6 +322,44 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertEqual(result["exitCode"], 1)
         self.assertIn("archive reference mismatch", result["reason"])
         self.assertEqual(list(out.iterdir()), [])
+
+    def test_an_inherited_git_variable_never_reaches_the_extractor(self) -> None:
+        # adversary 32bf39a9-A1: GIT_TRACE2_EVENT (and any GIT_*) survived into Python and its `git ls-files`, which appends to the named
+        # file; aimed at a tracked script of the checkout, the install wrote into the checkout and still returned ok. The trace targets
+        # here are temp files, so the test itself never writes into the repo.
+        out = self.tmp / "out"
+        out.mkdir()
+        traces = {name: self.tmp / f"{name.lower()}.log" for name in ("GIT_TRACE2_EVENT", "GIT_TRACE", "GIT_TRACE2")}
+        result = self._run(str(out), extra_env={name: str(path) for name, path in traces.items()})
+        self.assertTrue(result["ok"], result)
+        for name, path in traces.items():
+            self.assertFalse(path.exists(), f"{name} reached a git child: {path} was written")
+
+    def test_a_hash_that_throws_returns_a_typed_failure_instead_of_throwing(self) -> None:
+        # adversary 32bf39a9-A2: a FileShare.None handle on the installed ffmpeg.exe makes the helper's own hash throw. Get-FileHash is
+        # shadowed by a global function that throws the same way, so the helper must return ok=false with the reason, not throw.
+        out = self.tmp / "out"
+        out.mkdir()
+        result = self._run(str(out), prelude="function global:Get-FileHash { throw 'simulated FileShare.None lock on the installed file' }\n")
+        self.assertFalse(result["ok"], result)
+        self.assertIn("simulated FileShare.None lock", result["reason"])
+
+    def test_a_kill_that_throws_and_a_wait_that_fails_are_reported_unconfirmed(self) -> None:
+        # adversary 32bf39a9-A3: Kill(true) threw Win32Exception(5) and the confirming wait returned false; both were discarded.
+        module = str(HELPER_MODULE).replace("'", "''")
+        script = (
+            f"$m = Import-Module '{module}' -Force -PassThru\n"
+            "$fake = [pscustomobject]@{ Id = 4242 }\n"
+            "$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value { throw [System.ComponentModel.Win32Exception]::new(5) }\n"
+            "$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $false }\n"
+            "$r = & $m { param($p) Stop-PinnedPayloadChild -Process $p } $fake\n"
+            "$r | ConvertTo-Json -Compress\n"
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        stop = json.loads(proc.stdout)
+        self.assertFalse(stop["exited"], stop)
+        self.assertTrue(stop["killError"], stop)
 
     def test_a_path_that_is_not_fully_qualified_is_refused_before_any_child(self) -> None:
         for bad in ("relative\\out", "C:drive-relative", "\\rooted-no-drive"):

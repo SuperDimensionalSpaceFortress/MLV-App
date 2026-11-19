@@ -27,8 +27,28 @@ function Test-ReviewedReleaseRuntimeExtraName {
 # re-hashes the in-repo archive and every selected member against the manifest before and after the atomic
 # install, so the bytes cannot depend on which revision RepoRoot has checked out. RepoRoot must be a git
 # checkout (the manifest validator runs git ls-files). The child is synchronous and bounded: past
-# TimeoutSec its whole tree is killed and the result says timedOut. Nothing here throws on a failed
-# install; the caller reads .ok and stops with its own typed failure.
+# TimeoutSec its whole tree is killed and the result says timedOut (and killConfirmed, whether the exit was
+# seen). Nothing here throws on a failed install, including a locked installed file (adversary 32bf39a9-A2);
+# the caller reads .ok and stops with its own typed failure.
+
+# Kills a timed-out child's whole tree and reports whether its exit was SEEN; a Kill that throws (access
+# denied) or a wait that times out is never reported as killed (adversary 32bf39a9-A3).
+function Stop-PinnedPayloadChild {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Process,
+
+        [ValidateRange(0, 600000)]
+        [int]$ConfirmMs = 10000
+    )
+    $killError = ''
+    try { $Process.Kill($true) } catch { $killError = $_.Exception.Message }
+    $exited = $false
+    try { $exited = [bool]$Process.WaitForExit($ConfirmMs) } catch { if (-not $killError) { $killError = "the exit could not be awaited: $($_.Exception.Message)" } }
+    return [pscustomobject][ordered]@{ exited = $exited; killError = $killError }
+}
+
 function Install-PinnedVendoredPayload {
     [CmdletBinding()]
     param(
@@ -53,14 +73,48 @@ function Install-PinnedVendoredPayload {
     )
 
     $result = [ordered]@{
-        ok        = $false
-        reason    = ''
-        exitCode  = $null
-        timedOut  = $false
-        stdout    = ''
-        stderr    = ''
-        installed = @()
+        ok            = $false
+        reason        = ''
+        exitCode      = $null
+        timedOut      = $false
+        killConfirmed = $null
+        stdout        = ''
+        stderr        = ''
+        installed     = @()
     }
+    # Every step fills $result; anything that throws (a locked installed file, an unreadable report) is a
+    # typed ok=false here, never an exception past the caller's own failure branch.
+    try {
+        $null = Invoke-PinnedPayloadInstall -Result $result -RepoRoot $RepoRoot -PayloadId $PayloadId -ArchiveReference $ArchiveReference -OutputDir $OutputDir -TimeoutSec $TimeoutSec
+    } catch {
+        $result.ok = $false
+        $result.installed = @()
+        $result.reason = "the install could not be completed or verified: $($_.Exception.Message)"
+    }
+    return [pscustomobject]$result
+}
+
+function Invoke-PinnedPayloadInstall {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.Specialized.OrderedDictionary]$Result,
+
+        [Parameter(Mandatory)]
+        [string]$RepoRoot,
+
+        [Parameter(Mandatory)]
+        [string]$PayloadId,
+
+        [Parameter(Mandatory)]
+        [string]$ArchiveReference,
+
+        [Parameter(Mandatory)]
+        [string]$OutputDir,
+
+        [Parameter(Mandatory)]
+        [int]$TimeoutSec
+    )
     # A drive-relative (C:dir) or rooted-but-driveless (\dir) path resolves against process state the
     # child does not share, so both paths must be fully qualified.
     foreach ($pair in @(@('RepoRoot', $RepoRoot), @('OutputDir', $OutputDir))) {
@@ -96,6 +150,12 @@ function Install-PinnedVendoredPayload {
     # path; and the checkout is not written to (no __pycache__).
     foreach ($name in @('PYTHONPATH', 'PYTHONHOME', 'PYTHONSAFEPATH', 'PYTHONSTARTUP')) { [void]$psi.Environment.Remove($name) }
     $psi.Environment['PYTHONDONTWRITEBYTECODE'] = '1'
+    # No inherited GIT_* variable reaches the manifest validator's git children (adversary 32bf39a9-A1): GIT_TRACE2_EVENT
+    # naming a tracked file appends to it, and GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE would aim git ls-files at another
+    # repository. git then reads only RepoRoot, the working directory.
+    foreach ($name in @($psi.Environment.Keys)) {
+        if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }
+    }
 
     try {
         $process = [System.Diagnostics.Process]::Start($psi)
@@ -107,9 +167,11 @@ function Install-PinnedVendoredPayload {
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSec * 1000)) {
-            try { $process.Kill($true) } catch { }
-            [void]$process.WaitForExit(10000)
             $result.timedOut = $true
+            $stop = Stop-PinnedPayloadChild -Process $process
+            $result.killConfirmed = [bool]$stop.exited
+            $childPid = $process.Id
+            $killError = [string]$stop.killError
         } else {
             $process.WaitForExit()
             $result.exitCode = $process.ExitCode
@@ -120,7 +182,11 @@ function Install-PinnedVendoredPayload {
         $process.Dispose()
     }
     if ($result.timedOut) {
-        $result.reason = "the extractor was still running after $TimeoutSec s and was killed"
+        $result.reason = if ($result.killConfirmed) {
+            "the extractor was still running after $TimeoutSec s; its process tree was killed and its exit seen"
+        } else {
+            "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid may still be running$(if ($killError) { "; kill error: $killError" }))"
+        }
         return [pscustomobject]$result
     }
     if ($result.exitCode -ne 0) {
@@ -176,4 +242,4 @@ function Install-PinnedVendoredPayload {
     return [pscustomobject]$result
 }
 
-Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, Install-PinnedVendoredPayload
+Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, Install-PinnedVendoredPayload, Stop-PinnedPayloadChild

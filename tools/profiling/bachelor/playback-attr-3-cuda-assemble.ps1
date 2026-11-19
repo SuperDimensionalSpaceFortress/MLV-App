@@ -331,18 +331,28 @@ $StepLog['runtimeDonor'] = 0
 # git-archive $SourceTree has no .git); the pins, not that checkout's revision, decide the bytes.
 $ffmpegPayloadId = 'ffmpeg-windows-x86_64'
 $ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $RepoRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir $releaseDir -TimeoutSec 600
-@("exitCode=$($ffmpegInstall.exitCode) timedOut=$($ffmpegInstall.timedOut) ok=$($ffmpegInstall.ok) reason=$($ffmpegInstall.reason)", '--- stdout', $ffmpegInstall.stdout, '--- stderr', $ffmpegInstall.stderr) |
-    Set-Content -LiteralPath (Join-Path $logDir 'ffmpeg-exe-install.log') -Encoding UTF8
+# The log is evidence, not a gate: a log that cannot be written (locked) is said and never throws past the typed
+# failure below (adversary 32bf39a9-A2).
+try {
+    @("exitCode=$($ffmpegInstall.exitCode) timedOut=$($ffmpegInstall.timedOut) killConfirmed=$($ffmpegInstall.killConfirmed) ok=$($ffmpegInstall.ok) reason=$($ffmpegInstall.reason)", '--- stdout', $ffmpegInstall.stdout, '--- stderr', $ffmpegInstall.stderr) |
+        Set-Content -LiteralPath (Join-Path $logDir 'ffmpeg-exe-install.log') -Encoding UTF8
+} catch {
+    Say "LOG logs\ffmpeg-exe-install.log not written: $($_.Exception.Message)"
+}
 if (-not $ffmpegInstall.ok) { Complete-Failed 28 'ffmpegExeInstall' "ffmpeg.exe was not installed from the pinned payload $ffmpegPayloadId : $($ffmpegInstall.reason) (see logs\ffmpeg-exe-install.log)" }
 $ffmpegExePath = Join-Path $releaseDir 'ffmpeg.exe'
 $ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.path, $ffmpegExePath, [StringComparison]::OrdinalIgnoreCase) })
 if ($ffmpegRows.Count -ne 1 -or -not (Test-Path -LiteralPath $ffmpegExePath -PathType Leaf)) {
     Complete-Failed 28 'ffmpegExeInstall' "the pinned payload $ffmpegPayloadId did not install $ffmpegExePath (installed: $(@($ffmpegInstall.installed | ForEach-Object { $_.path }) -join ', '))"
 }
-$ffmpegExe = [ordered]@{
-    payloadId = $ffmpegPayloadId
-    bytes = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
-    sha256 = Get-ShaLower $ffmpegExePath
+try {
+    $ffmpegExe = [ordered]@{
+        payloadId = $ffmpegPayloadId
+        bytes = [long](Get-Item -LiteralPath $ffmpegExePath -Force).Length
+        sha256 = Get-ShaLower $ffmpegExePath
+    }
+} catch {
+    Complete-Failed 28 'ffmpegExeInstall' "the installed $ffmpegExePath could not be read back: $($_.Exception.Message)"
 }
 if ($ffmpegExe.sha256 -cne [string]$ffmpegRows[0].sha256 -or $ffmpegExe.bytes -ne [long]$ffmpegRows[0].bytes) {
     Complete-Failed 28 'ffmpegExeInstall' "$ffmpegExePath changed after the extractor verified it"
@@ -367,7 +377,9 @@ if (-not $SkipLaunchProbe) {
         $probe = Start-Process -FilePath $releaseExe -ArgumentList '--batch', '--help' `
             -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden
         if (-not $probe.WaitForExit(120000)) {
-            try { $probe.Kill() } catch { }
+            # The kill is confirmed or the failure says it is not (adversary 32bf39a9-A3, sibling of the ffmpeg install's).
+            $probeStop = Stop-PinnedPayloadChild -Process $probe
+            $probeKillNote = if ($probeStop.exited) { 'killed, exit seen' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
             $launchProbe.timedOut = $true
         } else {
             $launchProbe.exitCode = $probe.ExitCode
@@ -375,7 +387,7 @@ if (-not $SkipLaunchProbe) {
         $launchProbe.ran = $true
     } finally { $env:PATH = $savedPath }
     if ($launchProbe.timedOut -or [int]$launchProbe.exitCode -ne 0) {
-        Complete-Failed 23 'launchProbe' "the deployed exe did not run standalone (exit=$($launchProbe.exitCode) timedOut=$($launchProbe.timedOut)); a DLL-load status here means the package is not self-contained"
+        Complete-Failed 23 'launchProbe' "the deployed exe did not run standalone (exit=$($launchProbe.exitCode) timedOut=$($launchProbe.timedOut)$(if ($launchProbe.timedOut) { " $probeKillNote" })); a DLL-load status here means the package is not self-contained"
     }
 }
 $StepLog['launchProbe'] = 0
