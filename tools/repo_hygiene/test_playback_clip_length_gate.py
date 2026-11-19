@@ -3205,7 +3205,7 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         self.assertTrue(any("unreviewed Play stop in MainWindow::resizeEvent" in p for p in problems), problems)
 
     def test_player_toolbar_transport_buttons_1_the_stop_button_is_one_reviewed_user_input_stop(self) -> None:
-        # PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1: the Stop button pauses (the closeEvent user-pause form), then seeks to cut in.
+        # PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1: the Stop button seeks to cut in, then pauses (the closeEvent user-pause form).
         from tools.repo_hygiene.app_play_scan import REVIEWED_PLAY_STOPS
         self.assertEqual(REVIEWED_PLAY_STOPS["MainWindow::on_actionStop_triggered"], (1, 1, 0))
 

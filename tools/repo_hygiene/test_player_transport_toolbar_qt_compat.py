@@ -11,6 +11,7 @@ the QMouseEvent::position() guard of PR 856 r3 (test_qt6_only_api_guard.py on th
 """
 from __future__ import annotations
 
+import bisect
 import re
 import unittest
 from pathlib import Path
@@ -20,7 +21,9 @@ ROOT = Path(__file__).resolve().parents[2]
 SCOPED_HEADERS = (ROOT / "platform" / "qt" / "PlayerTransportToolbar.h",)
 
 # API -> the first Qt (major, minor) that has it. A member access (`.x` / `->x`, optionally
-# qualified: `img.QImage::flipped`) or a `QImage::x` name (a member pointer) both count.
+# qualified: `img.QImage::flipped`) or a `QImage::x` name (a member pointer) both count, with any
+# whitespace, including a line break, CR or CRLF, between the accessor and the name or between
+# `QImage` and `::` (r4).
 NEWER_THAN_QT5_API = {
     "flipped": (6, 9),  # QImage::flipped(Qt::Orientations)
     "flip": (6, 9),  # QImage::flip(Qt::Orientations)
@@ -39,16 +42,45 @@ DIRECTIVE = re.compile(rf"^\s*{_HASH}\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$
 # hides the call from API_CALL, so the name in the #define itself counts (adversary r2 A2).
 DEFINE = re.compile(rf"^\s*{_HASH}\s*define\b(.*)$")
 BARE_NAME = re.compile(rf"\b({_NAMES})\b")
-# Only the plain condition counts: a negated or compound one is "other" (fail closed).
+# Only the plain condition counts: a negated or compound one is "other" (fail closed). Each
+# argument is a pp-number, read as a C preprocessor integer literal by _pp_int (r4, fable key3 r3).
+_PP_NUMBER = r"(\.?\d(?:[eEpP][+-]|'[0-9A-Za-z_]|[0-9A-Za-z_.])*)"
 VERSION_CHECK = re.compile(
-    r"QT_VERSION\s*(>=|<)\s*QT_VERSION_CHECK\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*\d+\s*\)"
+    rf"QT_VERSION\s*(>=|<)\s*QT_VERSION_CHECK\s*\(\s*{_PP_NUMBER}\s*,\s*{_PP_NUMBER}\s*,\s*{_PP_NUMBER}\s*\)"
+)
+_INT_LITERAL = re.compile(
+    r"(?:0[xX](?P<hex>[0-9A-Fa-f](?:'?[0-9A-Fa-f])*)|0[bB](?P<bin>[01](?:'?[01])*)"
+    r"|(?P<oct>0(?:'?[0-7])*)|(?P<dec>[1-9](?:'?[0-9])*))"
+    r"(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?"
 )
 RAW_STRING_OPEN = re.compile(r'([^()\\\s"]{0,16})\(')
 
 
+def _pp_int(token: str) -> int | None:
+    """The value the preprocessor gives an integer literal (leading 0 octal, 0x hex, 0b binary,
+    ' digit separators, u/l/ll suffixes), or None when it is not one: an unparsable version
+    argument makes the condition "other", which is never trusted."""
+    literal = _INT_LITERAL.fullmatch(token)
+    if not literal:
+        return None
+    for group, base in (("hex", 16), ("bin", 2), ("oct", 8), ("dec", 10)):
+        digits = literal.group(group)
+        if digits is not None:
+            value = int(digits.replace("'", ""), base)
+            return value if value < 2**63 else None  # past intmax_t the #if is ill-formed
+    return None
+
+
+def _qt_version_value(major: int, minor: int, patch: int) -> int:
+    # QT_VERSION_CHECK(major, minor, patch) is ((major << 16) | (minor << 8) | (patch)).
+    return (major << 16) | (minor << 8) | patch
+
+
 def _logical_lines(text: str) -> list[tuple[int, str]]:
     """(physical start line, logical line): backslash splices joined; comments and the contents of
-    string, char and raw-string literals blanked, so a name inside them never counts."""
+    string, char and raw-string literals blanked, so a name inside them never counts. CRLF and a
+    lone CR end a line as LF does, and an unterminated ' or " ends at the line end."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     out: list[tuple[int, str]] = []
     current: list[str] = []
     start = line = 1
@@ -61,7 +93,7 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
             i += 2
             continue
         if ch == "\n":
-            if state == "line_comment":
+            if state in ("line_comment", "string", "char"):
                 state = "code"
             line += 1
             if state == "block_comment":
@@ -120,17 +152,33 @@ def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
     """(line, api name, line text) for each call outside an arm that compiles only on a Qt new
     enough for that API."""
     # Each frame: [kind, version, arm_floor]. kind "ge" (#if QT_VERSION >= V), "lt" (#if QT_VERSION
-    # < V) or "other"; arm_floor is the lowest Qt the current arm can compile on, or None.
+    # < V) or "other"; V and arm_floor are QT_VERSION_CHECK values, arm_floor the lowest Qt the
+    # current arm can compile on, or None.
     stack: list[list] = []
     found: list[tuple[int, str, str]] = []
+
+    def trusted(api: str, floors: tuple[int, ...]) -> bool:
+        needed = _qt_version_value(*NEWER_THAN_QT5_API[api], 0)
+        return any(floor >= needed for floor in floors)
+
+    # r4 (r3 keys sol B1, opus, fable key3): the member access may span lines (`image.` then
+    # `flipped` on the next line, or `QImage` then `::flipped`), so API_CALL runs once over the
+    # code lines joined by "\n", directive and #define lines left empty; each match is mapped
+    # back to the line its NAME is on and judged by the arms open there.
+    starts: list[int] = []  # offset of each logical line in `joined`
+    lines: list[tuple[int, str, tuple[int, ...]]] = []  # (line number, text, floors)
+    parts: list[str] = []
+    offset = 0
     for number, line in _logical_lines(text):
+        code = ""
         directive = DIRECTIVE.match(line)
         if directive:
             keyword, rest = directive.group(1), directive.group(2)
             if keyword in ("if", "ifdef", "ifndef"):
                 check = VERSION_CHECK.fullmatch(rest.strip()) if keyword == "if" else None
-                if check:
-                    version = (int(check.group(2)), int(check.group(3)))
+                args = [_pp_int(check.group(k)) for k in (2, 3, 4)] if check else [None]
+                if check and None not in args:
+                    version = _qt_version_value(*args)
                     if check.group(1) == ">=":
                         stack.append(["ge", version, version])
                     else:
@@ -144,13 +192,25 @@ def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
                 stack[-1][2] = version if kind == "lt" else None
             elif keyword == "endif" and stack:
                 stack.pop()
-            continue
-        floors = [frame[2] for frame in stack if frame[2] is not None]
-        define = DEFINE.match(line)
-        for match in (BARE_NAME.finditer(define.group(1)) if define else API_CALL.finditer(line)):
-            needed = NEWER_THAN_QT5_API[match.group(1)]
-            if not any(floor >= needed for floor in floors):
-                found.append((number, match.group(1), line.strip()))
+            floors: tuple[int, ...] = ()
+        else:
+            floors = tuple(frame[2] for frame in stack if frame[2] is not None)
+            define = DEFINE.match(line)
+            if define:
+                for match in BARE_NAME.finditer(define.group(1)):
+                    if not trusted(match.group(1), floors):
+                        found.append((number, match.group(1), line.strip()))
+            else:
+                code = line
+        starts.append(offset)
+        lines.append((number, line, floors))
+        parts.append(code)
+        offset += len(code) + 1
+    for match in API_CALL.finditer("\n".join(parts)):
+        number, line, floors = lines[bisect.bisect_right(starts, match.start(1)) - 1]
+        if not trusted(match.group(1), floors):
+            found.append((number, match.group(1), line.strip()))
+    found.sort(key=lambda hit: hit[0])
     return found
 
 
@@ -289,6 +349,96 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             "#define MIRROR mirrored\n"
         )
         self.assertEqual(unguarded_newer_api_calls(guarded_alias), [])
+
+    def test_scanner_sees_a_line_break_inside_the_member_access(self) -> None:
+        # r3 keys on fcbae668 (sol B1, opus, fable key3): each input used to return no finding,
+        # because the matcher ran per logical line. Whitespace, including a line break, CR or CRLF,
+        # between the accessor and the name, or between QImage and ::, is inside the grammar.
+        for source, api in (
+            ("return image.\nflipped(Qt::Horizontal);\n", "flipped"),
+            ("return image->\nflipped(Qt::Horizontal);\n", "flipped"),
+            ("auto f = &QImage::\nflipped;\n", "flipped"),
+            ("return image.QImage::\nflipped(Qt::Horizontal);\n", "flipped"),
+            ("auto p = event->\nposition();\n", "position"),
+            ("return image.\r\nflipped(Qt::Horizontal);\r\n", "flipped"),
+            ("auto f = &QImage ::\nflipped;\n", "flipped"),
+            ("auto f = &QImage\n::flipped;\n", "flipped"),
+            ("return image\n.\nflipped();\n", "flipped"),
+            ("return image. /* c */\n// line\nflipped();\n", "flipped"),
+            ("return image.\r\r\nflipped();\n", "flipped"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual([a for _, a, _ in unguarded_newer_api_calls(source)], [api])
+        # The finding names the line the API name is on.
+        self.assertEqual(
+            [(n, a) for n, a, _ in unguarded_newer_api_calls("x();\nreturn image.\nflipped();\n")],
+            [(3, "flipped")],
+        )
+
+    def test_a_line_break_member_access_is_judged_at_the_name(self) -> None:
+        # The name token is what needs the newer Qt: inside the arm it is guarded, outside it is not.
+        guarded = (
+            "return image.\n"
+            "#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)\n"
+            "flipped( Qt::Horizontal );\n"
+            "#else\n"
+            "mirrored( true, false );\n"
+            "#endif\n"
+        )
+        self.assertEqual(unguarded_newer_api_calls(guarded), [])
+        unguarded = (
+            "#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)\n"
+            "return image.\n"
+            "#endif\n"
+            "flipped( Qt::Horizontal );\n"
+        )
+        self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(unguarded)], [(4, "flipped")])
+
+    def test_version_arguments_are_read_as_preprocessor_integer_literals(self) -> None:
+        # fable key3 r3: 010 is octal 8, so this arm also compiles on Qt 6.8 and is not a guard.
+        def arm(major: str, minor: str, patch: str = "0", op: str = ">=") -> str:
+            body = "return image.flipped();\n"
+            other = "return image.mirrored( true, false );\n"
+            head = f"#if QT_VERSION {op} QT_VERSION_CHECK( {major}, {minor}, {patch} )\n"
+            return head + (body + "#else\n" + other if op == ">=" else other + "#else\n" + body) + "#endif\n"
+
+        flagged = (
+            ("6", "010", "0"),  # octal 8
+            ("6", "0x8", "0"),  # hex 8
+            ("6", "0b1000", "0"),  # binary 8
+            ("6", "08", "0"),  # not a valid octal literal: unparsable is never a pass
+            ("6", "9.0", "0"),  # not an integer literal
+            ("6", "9z", "0"),  # not a preprocessor integer suffix
+            ("6", "9", "0x"),  # a malformed patch is unparsable too
+            ("6", "8", "255"),  # 6.8.255 is still below 6.9
+        )
+        for args in flagged:
+            for op in (">=", "<"):
+                with self.subTest(args=args, op=op):
+                    self.assertEqual([a for _, a, _ in unguarded_newer_api_calls(arm(*args, op=op))], ["flipped"])
+        accepted = (
+            ("6", "011", "0"),  # octal 9
+            ("6", "0x9", "0"),
+            ("6", "0X0A", "0"),
+            ("6", "0b1001", "0"),
+            ("6", "1'0", "0"),  # 10, digit separator
+            ("6u", "9U", "0ul"),
+            ("6LL", "9llu", "0"),
+            ("06", "9", "0"),
+            ("6", "8", "256"),  # QT_VERSION_CHECK is (6<<16)|(8<<8)|256 == 6.9.0
+            ("7", "0", "0"),
+        )
+        for args in accepted:
+            for op in (">=", "<"):
+                with self.subTest(args=args, op=op):
+                    self.assertEqual(unguarded_newer_api_calls(arm(*args, op=op)), [])
+
+    def test_an_apostrophe_in_directive_text_does_not_hide_later_code(self) -> None:
+        # An unterminated ' or " ends at the line end, as the preprocessor reads it.
+        for directive in ("#error it's Qt 6 only", '#warning "unterminated', "#pragma message 'x"):
+            with self.subTest(directive=directive):
+                fixture = f"{directive}\nreturn image.flipped();\n"
+                self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(fixture)], [(2, "flipped")])
 
     def test_names_that_only_contain_an_api_name_do_not_count(self) -> None:
         fixture = "auto a = img.flippedCopy(); auto b = flipped(); auto c = s.positions();\n"
