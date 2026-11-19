@@ -129,6 +129,15 @@ INERT_INSTANCE |= frozenset("""
 # IsNaN / IsInfinity because Windows PowerShell 5.1 has no double::IsFinite. A side-effecting call in the same body is still a finding
 # (test_a_raw_pub_write_added_to_a_real_spliced_helper_is_caught; ...IsNaNIsAPurePredicateButAWriteBesideItIsStillCaught below).
 INERT_STATIC |= frozenset("double::IsNaN".split())
+# EXPORT-KILL-DESCENDANT-CONFIRM-1 r2: the process-tree helpers (Get-AttrCudaProcessTreeSnapshot, Wait-AttrCudaProcessTreeGone) walk the rows of one Win32_Process scan in memory.
+# Math::Floor / Max / Min are the same pure arithmetic as Math::Abs / Ceiling / Round above; HashSet / List / Queue of int64 or object are the same in-memory collections as the
+# HashSet[int] / List[string] / Stack[...] entries above, and .Enqueue() / .Dequeue() are the queue twins of .Push() / .Pop(). None opens, writes, moves or deletes anything. A
+# side-effecting call in the same body is still a finding (the allowlist rows below pin each body's exact set).
+INERT_STATIC |= frozenset("""
+Math::Floor Math::Max Math::Min System.Collections.Generic.HashSet[int64]::new System.Collections.Generic.List[int64]::new
+System.Collections.Generic.Queue[int64]::new System.Collections.Generic.Queue[object]::new
+""".split())
+INERT_INSTANCE |= frozenset(".Dequeue() .Enqueue()".split())
 # Read-only: they return data and cannot create, write, move or delete anything.
 INERT_STATIC |= frozenset("""
 Environment::GetFolderPath IO.DriveInfo::new IO.File::OpenRead IO.File::ReadAllBytes IO.File::ReadAllLines
@@ -341,6 +350,11 @@ for _name, _count in (("ConvertFrom-GuiSmokeDisplayLog", 3), ("Find-AttrCudaFail
 _allow("ConvertFrom-GuiSmokeDisplayLog", _IN_MEMORY, ("R1", "New-Object System.Collections.Generic.List[object]", 1))
 _allow("Find-AttrCudaFailedSmokeDisplayLog", _IN_MEMORY, ("R1", "New-Object System.Collections.Generic.List[string]", 1))
 _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
+# EXPORT-KILL-DESCENDANT-CONFIRM-1 r2: $unknown is the body's own `{ param([string]$Why) [pscustomobject]@{ ... } }` (defined on its first line, a pure object builder).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 4))
+_allow("Wait-AttrCudaProcessTreeGone",
+       "test-only seam: runs the caller's -Scan block (a stand-in for the Win32_Process scan) only when a test passed one; production passes none and reads Get-CimInstance, a read-only query",
+       ("R3", "& $Scan", 1))
 _allow("Get-AttrCudaPresentMonDisplayReport", _LOCAL_BLOCK, ("R3", "& $buildWindow", 2), ("R3", "& $unavailable", 7))
 _allow("Get-AttrCudaSelfHealMetrics", _LOCAL_BLOCK,
        ("R3", "& $count", 4), ("R3", "& $field", 2), ("R3", "& $fps", 2), ("R3", "& $iniFlag", 2), ("R3", "& $readJson", 3),
