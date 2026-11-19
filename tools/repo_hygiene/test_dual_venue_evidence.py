@@ -16472,7 +16472,15 @@ class WindowToggleEvidenceTests(unittest.TestCase):
         repeated = self.log().replace("\ngui_smoke.window_toggles ", "\n" + self.R11_MARKER + "gui_smoke.window_toggles ", 1)
         no_accept = json.loads(json.dumps(full))
         del no_accept["criteria"]["acceptance"]
+        # r11b (r11 adversary A1 on 7d6aea0a): an empty supplementary set, and both sets keyed by a backend the spec does not name
+        empty_supp = json.loads(json.dumps(full))
+        empty_supp["criteria"]["supplementary"] = {}
+        cpu_keyed = json.loads(json.dumps(full))
+        for set_name in ("acceptance", "supplementary"):
+            cpu_keyed["criteria"][set_name] = {"cpu": cpu_keyed["criteria"][set_name]["cuda"]}
         cases = [
+            ("r11b adversary input 1: criteria.supplementary = {}", empty_supp, incomplete, True),
+            ("r11b adversary input 2: both sets keyed cpu while backends = [cuda]", cpu_keyed, incomplete, True),
             ("adversary input 1: windowToggleEvidenceReason removed, an honest reason=incomplete", without("windowToggleEvidenceReason"), incomplete, True),
             ("adversary input 2: windowToggleEvidenceReason removed, a repeated measured_session marker", without("windowToggleEvidenceReason"), repeated, True),
             ("windowTogglesKeptPlaying removed", without("windowTogglesKeptPlaying"), incomplete, True),

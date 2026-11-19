@@ -2054,8 +2054,8 @@ function Get-DvWindowToggleCriteriaGap {
     .SYNOPSIS
     VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r11 (r11 adversary A1 on b82002ec, its input: an fstoggle spec with windowToggleEvidenceReason removed from both role
     criteria arrays, over an honest reason=summary-reason-incomplete): a leg that names generatorArgs.midPlayWindowToggles relies on its CRITERIA to fail an honest
-    non-ok toggle proof (the reconcile gate passes it as "what the log derives"), so every role array of criteria.acceptance (at least one) and of
-    criteria.supplementary (when present) must bind all five: windowTogglesRequested / Driven / KeptPlaying / Advanced eq 4 (the job's schedule) and
+    non-ok toggle proof (the reconcile gate passes it as "what the log derives"), so criteria.acceptance and criteria.supplementary must both be present, each
+    must hold an array for every backend the spec names, and every array must bind all five: windowTogglesRequested / Driven / KeptPlaying / Advanced eq 4 (the job's schedule) and
     windowToggleEvidenceReason eq "ok". Returns the gap text, or $null. A leg that does not ask returns $null.
     #>
     param([Parameter(Mandatory)]$Spec)
@@ -2063,16 +2063,18 @@ function Get-DvWindowToggleCriteriaGap {
     if (-not (($raw -is [bool]) -and $raw)) { return $null }
     $required = @(@('windowTogglesRequested', '4'), @('windowTogglesDriven', '4'), @('windowTogglesKeptPlaying', '4'), @('windowTogglesAdvanced', '4'), @('windowToggleEvidenceReason', 'ok'))
     $criteria = Get-DvProp $Spec 'criteria'
-    $roleArrays = 0
+    # r11b (r11 adversary A1 on 7d6aea0a, inputs: criteria.supplementary = {}, and both sets keyed cpu while backends = ["cuda"]): BOTH sets must be present, and
+    # each must hold a role array for EVERY backend the spec names (the array Test-DvCriteria judges; a missing one passes vacuously), each binding all five
+    $backends = @(Get-DvProp $Spec 'backends' | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    if ($backends.Count -lt 1) { return 'the spec names no backend, so no criteria array is judged' }
     foreach ($setName in 'acceptance', 'supplementary') {
         $set = Get-DvProp $criteria $setName
-        if ($null -eq $set) {
-            if ($setName -ceq 'acceptance') { return 'criteria.acceptance is absent, so nothing fails a non-ok toggle proof' }
-            continue
-        }
+        if ($null -eq $set) { return "criteria.$setName is absent, so nothing fails a non-ok toggle proof" }
         if ($set -isnot [System.Management.Automation.PSCustomObject]) { return "criteria.$setName is not one JSON object" }
+        foreach ($backend in $backends) {
+            if ($null -eq $set.PSObject.Properties[$backend]) { return "criteria.$setName has no $backend array (a backend the spec names), so nothing fails a non-ok toggle proof" }
+        }
         foreach ($role in $set.PSObject.Properties) {
-            if ($setName -ceq 'acceptance') { $roleArrays++ }
             $rows = @($role.Value)
             foreach ($need in $required) {
                 $bound = @($rows | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq $need[0] -and [string](Get-DvProp $_ 'op') -ceq 'eq' -and [string](Get-DvProp $_ 'value') -ceq $need[1] })
@@ -2080,7 +2082,6 @@ function Get-DvWindowToggleCriteriaGap {
             }
         }
     }
-    if ($roleArrays -lt 1) { return 'criteria.acceptance has no role array, so nothing fails a non-ok toggle proof' }
     $null
 }
 
