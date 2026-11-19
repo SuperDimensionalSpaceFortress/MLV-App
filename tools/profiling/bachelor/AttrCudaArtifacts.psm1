@@ -5073,9 +5073,12 @@ function Wait-AttrCudaProcessTreeGone {
     .DESCRIPTION
     A SURVIVOR, in one scan, is (a) a recorded member (or the root) whose pid shows with its recorded creation time, or with no readable creation time (a reuse
     cannot be told apart then), or (b) r1 fix iteration (adversary A1 on 2223cc4d): any live process whose ParentProcessId chain reaches the root or a recorded
-    member, so a child started after the snapshot by a member that then exited is still found. The same pid with ANOTHER creation time is a reused number, not a
-    survivor by (a); children on a reused number are adopted by (b), which can only leave the kill unconfirmed. A descendant (b) finds stays recorded for every later
-    scan. Budget (adversary A3 on 2223cc4d, A2 on 348c4357): a scan starts only while CIM's 1 s floor is left, under a timeout no longer than what is left; a scan
+    member, so a child started after the snapshot by a member that then exited is still found, or (c) r3 (adversary A1 on 4d69f211): any live process whose
+    ancestry cannot be proved -- climbing ParentProcessId while the parent is in the scan and no younger than the child, the climb stops at a process created after the
+    root (or with no readable creation time) whose parent is gone, younger, or unreadable -- so a grandchild whose parents both exited is never confirmed gone. The same
+    pid with ANOTHER creation time is a reused number, not a survivor by (a); it is still adopted by (b) or (c) on its own row (r3, adversary A2 on 4d69f211: identity
+    is pid and creation time, a recorded number never hides a new process), which can only leave the kill unconfirmed. A survivor (b) or (c) finds stays recorded for
+    every later scan. Budget (adversary A3 on 2223cc4d, A2 on 348c4357): a scan starts only while CIM's 1 s floor is left, under a timeout no longer than what is left; a scan
     that ENDS past -WaitMs confirms nothing, and a -WaitMs under 1 s is no time to confirm. Returns
     [pscustomobject]@{ confirmed; survivors; error }: confirmed is $true only when the snapshot's ok is the boolean $true and a scan that ended inside -WaitMs showed
     no survivor. Anything else is $false (fail closed). Never throws. -Scan is the test seam: a scriptblock returning the rows of one scan.
@@ -5102,12 +5105,14 @@ function Wait-AttrCudaProcessTreeGone {
             $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
             $byParent = @{}
             $rowTicks = @{}
+            $rowParent = @{}
             $found = [System.Collections.Generic.List[int64]]::new()
             foreach ($row in $rows) {
                 if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
                 $rowPid = [int64]$row.ProcessId
                 $ticks = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
                 $rowTicks[$rowPid] = $ticks
+                $rowParent[$rowPid] = $(if ($null -eq $row.ParentProcessId) { $null } else { [int64]$row.ParentProcessId })
                 # a recorded identity with no known creation time ($null: found by the walk with none readable) matches its pid whatever the creation time
                 if ($recorded.ContainsKey($rowPid) -and ($null -eq $ticks -or $null -eq $recorded[$rowPid] -or [int64]$ticks -eq [int64]$recorded[$rowPid])) { $found.Add($rowPid) }
                 if ($null -ne $row.ParentProcessId) {
@@ -5116,20 +5121,45 @@ function Wait-AttrCudaProcessTreeGone {
                     $byParent[$parentKey].Add($rowPid)
                 }
             }
-            $seen = [System.Collections.Generic.HashSet[int64]]::new()
+            # r3 (adversary A2 on 4d69f211): identity is (pid, creation time). The walk is seeded by the recorded pid NUMBERS ($expanded: whose children were read), but a
+            # live row is adopted by its own entry in $adopted, never pre-seeded, so a NEW process on a reused member number whose parent is a member is a survivor.
+            $expanded = [System.Collections.Generic.HashSet[int64]]::new()
+            $adopted = [System.Collections.Generic.HashSet[int64]]::new()
             $queue = [System.Collections.Generic.Queue[int64]]::new()
-            foreach ($k in @($recorded.Keys)) { [void]$seen.Add([int64]$k); $queue.Enqueue([int64]$k) }
+            foreach ($k in @($recorded.Keys)) { [void]$expanded.Add([int64]$k); $queue.Enqueue([int64]$k) }
             $discovered = [System.Collections.Generic.List[int64]]::new()
             while ($queue.Count -gt 0) {
                 $parentPid = $queue.Dequeue()
                 if (-not $byParent.ContainsKey($parentPid)) { continue }
                 foreach ($childPid in $byParent[$parentPid]) {
-                    if (-not $seen.Add($childPid)) { continue }
-                    $found.Add($childPid)
-                    $discovered.Add($childPid)
-                    $queue.Enqueue($childPid)
+                    if ($adopted.Add($childPid)) { $found.Add($childPid); $discovered.Add($childPid) }
+                    if ($expanded.Add($childPid)) { $queue.Enqueue($childPid) }
                 }
             }
+            # r3 (adversary A1 on 4d69f211): a live row the walk did not reach can still descend from the tree when its chain is broken (202 started 203, then 201 and 202
+            # exited). Climb ParentProcessId while the parent is in this scan and no younger than the child (a younger holder of the number is a reuse, not the parent).
+            # Where the climb stops, the top's parent is gone or unprovable; if that top was created after the root, or its creation time is unreadable, ancestry is
+            # unproven and every row on the climb is a survivor (fail closed), recorded from then on. A top older than the root predates the tree and is not in it.
+            $rootTicks = [int64]$Snapshot.rootCreationTicks
+            $unproven = @{}
+            foreach ($start in @($rowTicks.Keys)) {
+                if ($adopted.Contains([int64]$start) -or $unproven.ContainsKey([int64]$start)) { continue }
+                $climb = [System.Collections.Generic.List[int64]]::new()
+                $cur = [int64]$start
+                $verdict = $false
+                while ($true) {
+                    if ($unproven.ContainsKey($cur)) { $verdict = $unproven[$cur]; break }
+                    if ($adopted.Contains($cur)) { $verdict = $true; break }
+                    $climb.Add($cur)
+                    $curTicks = $rowTicks[$cur]
+                    $up = $rowParent[$cur]
+                    if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -le [int64]$curTicks) { $cur = $up; continue }
+                    $verdict = ($null -eq $curTicks) -or ([int64]$curTicks -gt $rootTicks)
+                    break
+                }
+                foreach ($q in $climb) { $unproven[$q] = $verdict }
+            }
+            foreach ($q in @($unproven.Keys)) { if ($unproven[$q] -and $adopted.Add([int64]$q)) { $found.Add([int64]$q); $discovered.Add([int64]$q) } }
             # r1 fix 2 (adversary A1 on 348c4357): a descendant the walk found is recorded from then on, so a later scan still sees it after its parent exits.
             foreach ($d in $discovered) { $recorded[$d] = $rowTicks[$d] }
             $survivors = @($found | Sort-Object -Unique)

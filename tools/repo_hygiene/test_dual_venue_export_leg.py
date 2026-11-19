@@ -2306,7 +2306,8 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         got = self.snapshot_and_wait(
             "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
             "$alive = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 201 100 $t.AddSeconds(1))) }\n"
-            "$reused = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 201 4 $t.AddMinutes(5))) }\n"
+            # r3 (A1 on 4d69f211): a real scan always holds pid 4 (System, older than everything); without it the reused 201 would have no provable parent
+            "$reused = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 4 0 $t.AddDays(-1)), (Row 201 4 $t.AddMinutes(5))) }\n"
             "$unread = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 201 4 $null)) }\n"
             "$failed = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { throw 'wmi down' }\n"
             "$unknown = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = $false; members = @(); error = 'scan-failed: x' }) -WaitMs 1200\n"
@@ -2402,6 +2403,68 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertTrue(got["childStarted"] and got["childAlive"], f"the seam left a live descendant after the root exited: {got}")
         self.assertTrue(got["timedOut"], got)
         self.assertFalse(got["killConfirmed"], f"a live descendant is never a confirmed kill: {got}")
+
+    def test_r3_a_late_grandchild_whose_parents_are_gone_is_a_survivor(self) -> None:
+        """r3, adversary A1 on 4d69f211. After the snapshot, member 201 starts 202, 202 starts 203, then 201 and 202 exit: the scan shows only 203, whose parent is gone.
+        Its ancestry cannot be proved either way, and it was created after the root, so it is a survivor (fail closed). Same for a parent pid that a YOUNGER process
+        now holds (a reused number cannot be 203's parent). Controls: a process whose live parent is older (pid 4, System) and an orphan created before the root are
+        not survivors."""
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$orphan = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)))) }\n"
+            "$young = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)), (Row 202 4 $t.AddSeconds(9)))) }\n"
+            "$chain = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 202 777 $t.AddSeconds(3)), (Row 203 202 $t.AddSeconds(4)))) }\n"
+            "$unrelated = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 500 4 $t.AddSeconds(4)), (Row 600 999 $t.AddHours(-1)))) }\n"
+            "[ordered]@{ orphan = $orphan.confirmed; orphanSurvivors = @($orphan.survivors); young = $young.confirmed; youngSurvivors = @($young.survivors);\n"
+            "            chain = $chain.confirmed; chainSurvivors = @($chain.survivors); unrelated = $unrelated.confirmed } | ConvertTo-Json -Compress")
+        self.assertFalse(got["orphan"], f"a late grandchild with no provable ancestry is never confirmed gone: {got}")
+        self.assertEqual(got["orphanSurvivors"], [203], got)
+        self.assertFalse(got["young"], got)
+        self.assertEqual(got["youngSurvivors"], [203], f"a parent younger than its child is a reused number, not the parent: {got}")
+        self.assertFalse(got["chain"], got)
+        self.assertEqual(sorted(got["chainSurvivors"]), [202, 203], got)
+        self.assertTrue(got["unrelated"], f"a process under a live older parent, or an orphan older than the root, is not the tree: {got}")
+
+    def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
+        """r3, adversary A2 on 4d69f211. Old member 201 exits; the root starts a NEW child that reuses pid 201 (another creation time). It is not the recorded identity,
+        but its parent is the root, so the walk adopts it: identity is (pid, creation time), and a recorded pid number never hides a new process."""
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$reuse = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(5)))) }\n"
+            "$grand = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(5)), (Row 300 201 $t.AddSeconds(6)))) }\n"
+            "[ordered]@{ reuse = $reuse.confirmed; reuseSurvivors = @($reuse.survivors); grand = $grand.confirmed; grandSurvivors = @($grand.survivors) } | ConvertTo-Json -Compress")
+        self.assertFalse(got["reuse"], f"a new child of the root on a reused member pid is a survivor: {got}")
+        self.assertEqual(got["reuseSurvivors"], [201], got)
+        self.assertFalse(got["grand"], got)
+        self.assertEqual(sorted(got["grandSurvivors"]), [201, 300], got)
+
+    def test_r3_the_bounded_process_starts_no_tree_scan_once_its_cleanup_budget_is_spent(self) -> None:
+        """r3, adversary A3 on 4d69f211. Invoke-VenueBoundedProcess checked the ORIGINAL -CleanupWaitMs once, then gave the snapshot scan floor(CleanupWaitMs/1000) s
+        after the helper source loaded. Here the source takes 1600 ms to load under a 1500 ms budget: no scan may start, and the kill is unconfirmed. With 5000 ms
+        and a 1200 ms load, the scan gets at most the remaining whole seconds (3), never the original 5."""
+        module = DV / "VenueChain.psm1"
+        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec) $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
+                "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
+                "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
+        got = json.loads(run_pwsh(["-Command",
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
+            f"$global:fakeSrc = @'\n{fake}\n'@\n"
+            "& $m { function script:Get-VenueProcessTreeHelperSource { Start-Sleep -Milliseconds $global:srcDelay; $global:fakeSrc } }\n"
+            "$exe = (Get-Process -Id $PID).Path; $out = [ordered]@{}\n"
+            "foreach ($case in @(@('spent', 1600, 1500), @('left', 1200, 5000))) {\n"
+            "    $global:snapCalls = 0; $global:snapTimeout = $null; $global:srcDelay = $case[1]\n"
+            "    $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 1 -CleanupWaitMs $case[2]\n"
+            "    $out[$case[0]] = [ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; snapCalls = $global:snapCalls; snapTimeout = $global:snapTimeout }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 4"], timeout=300).stdout.strip().splitlines()[-1])
+        self.assertTrue(got["spent"]["timedOut"], got)
+        self.assertEqual(got["spent"]["snapCalls"], 0, f"no tree scan starts after the cleanup budget is spent: {got}")
+        self.assertFalse(got["spent"]["killConfirmed"], f"a tree never scanned is an unconfirmed kill: {got}")
+        self.assertEqual(got["left"]["snapCalls"], 1, got)
+        self.assertLessEqual(got["left"]["snapTimeout"], 3, f"the scan gets only the whole seconds that remain: {got}")
 
 
 if __name__ == "__main__":

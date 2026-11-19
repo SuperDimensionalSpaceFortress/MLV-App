@@ -1717,7 +1717,9 @@ function Invoke-VenueBoundedProcess {
         # (r1 fix iteration, adversary A3 on 2223cc4d: a snapshot that ends past the budget is no snapshot, and the tree wait gets only what is left; each CIM scan has a 1 s floor)
         $tree = $null
         # (r1 fix 2, adversary A2 on 348c4357: the snapshot scan starts only when CIM's 1 s floor fits the budget; under 1 s the tree is unknown, an unconfirmed kill)
-        if ($CleanupWaitMs -ge 1000) { try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -OperationTimeoutSec ([int][Math]::Floor($CleanupWaitMs / 1000.0)) } catch { $tree = $null } }
+        # (r3, adversary A3 on 4d69f211: the budget is re-read from the one $cleanup stopwatch AFTER the helper source loads, and the scan gets only the whole seconds
+        # still left; when less than the 1 s floor is left no scan starts and the tree is unknown)
+        if ($CleanupWaitMs -ge 1000) { try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $leftMs = $CleanupWaitMs - $cleanup.ElapsedMilliseconds; if ($leftMs -ge 1000) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -OperationTimeoutSec ([int][Math]::Floor($leftMs / 1000.0)) } } catch { $tree = $null } }
         if ($cleanup.ElapsedMilliseconds -ge $CleanupWaitMs) { $tree = $null }
         try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
         $treeGone = $(if ($null -eq $tree) { $false } else { [bool](Wait-AttrCudaProcessTreeGone -Snapshot $tree -WaitMs ([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))).confirmed })
