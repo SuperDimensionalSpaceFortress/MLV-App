@@ -35,7 +35,9 @@ Refused, never read:
   * a trigraph (``??=``, ``??/``, ...) anywhere in the file;
   * a header-name (after ``#include``, ``__has_include(``, ``#pragma GCC dependency``, ...) whose
     ``<...>`` holds ``/*``, ``//``, a quote or a backslash, or whose ``"..."`` holds a backslash,
-    and ``__has_include`` and its kin in a #define (adversary r5 pass 8 A1);
+    and ``__has_include`` and its kin in a #define (adversary r5 pass 8 A1); this is checked on
+    the raw text and again in the lexer, on the comment-blanked logical line, so a comment that
+    spans lines before the header-name does not hide it (adversary r5 pass 9 A1);
   * a digraph (``<:``, ``:>``, ``<%``, ``%>``, ``%:``) in code;
   * a raw string literal (``R"``, ``u8R"``, ...): its d-chars and body are not modelled;
   * a backslash in code outside a literal (a universal-character-name can spell a name);
@@ -106,6 +108,12 @@ HEADER_NAME_UNREADABLE = re.compile(
     r"\b(?:\w*include\w*|__has_\w+|dependency|import|\w*embed\w*)\b[^\n<\"]*"
     r"(?:<[^>\n]*(?:/[*/]|['\"\\])|\"[^\"\n]*\\)"
 )
+# The same context on the lexer's comment-blanked logical line, which a comment spanning lines
+# joins (adversary r5 pass 9 A1: `__has_include /*\n*/ (<a/*>)` slipped past the raw-text regex).
+# HEADER_NAME_KEYWORD ends where a header-name may start; HEADER_NAME_OPEN is inside a `<...>` one.
+_HEADER_NAME_KEYWORD = r"(?:^\s*#\s*(?:\w*include\w*|\w*embed\w*)|\b__has_\w+\s*\(|\bdependency|\bimport)\s*"
+HEADER_NAME_KEYWORD = re.compile(_HEADER_NAME_KEYWORD + r"$")
+HEADER_NAME_OPEN = re.compile(_HEADER_NAME_KEYWORD + r"<[^>]*$")
 HAS_OPERATOR = re.compile(r"\b__has_\w+")
 # Refused in code (comments and literal bodies blanked).
 DIGRAPH = re.compile(r"<:|:>|<%|%>|%:")
@@ -199,6 +207,17 @@ def _logical_lines(text: str) -> tuple[list[Line], list[tuple[int, str]]]:
             continue
         nxt = text[i + 1] if i + 1 < n else ""
         if state == "code":
+            # Inside a `<...>` header-name, /*, //, quotes and a backslash are plain text; in a
+            # "..." one a backslash is (adversary r5 pass 9 A1). The lexer would read them as a
+            # comment, a literal or an escape, so the header-name is refused.
+            if (ch == "/" and nxt in ("/", "*")) or ch in ("\"", "'", "\\"):
+                code = "".join(current)
+                if HEADER_NAME_OPEN.search(code):
+                    return out, [(line, "header-name")]
+                if ch == '"' and HEADER_NAME_KEYWORD.search(code):
+                    close = re.compile(r'["\n\\]').search(text, i + 1)
+                    if close and close.group(0) == "\\":
+                        return out, [(line, "header-name")]
             if ch == "/" and nxt == "/":
                 state = "line_comment"
                 i += 2
@@ -817,6 +836,35 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         # A plain header-name, also with a trailing comment, is read.
         self.assertEqual(unguarded_newer_api_calls(
             '#include <QImage> // x\n#include "Player.h" /* y */\n#if __has_include(<QImage>)\n#endif\n'), [])
+
+    def test_a_header_name_after_a_line_spanning_comment_is_refused(self) -> None:
+        # adversary r5 pass 9 A1 (c804f5b6): a comment that spans lines between __has_include and its
+        # `(<a/*>)` hid the header-name from the raw-text regex, and the lexer read its `/*` as a
+        # comment. r6 checks the header-name context in the lexer, on the comment-blanked line.
+        pass9 = "#if __has_include /*\n*/ (<a/*>)\n#endif\nreturn image.flipped(Qt::Horizontal); /* */\n"
+        for source, line in (
+            (pass9, 2),
+            (pass9.replace("\n", "\r\n"), 2),
+            (pass9.replace("\n", "\r"), 2),
+            ("#if __has_include( /*\n*/ <a//b>)\n#endif\nreturn image.flipped();\n", 2),
+            ("# /*\n*/ include <a'b>\nreturn image.flipped();\n", 2),
+            ("#include /*\n*/ <a\"b>\nreturn image.flipped();\n", 2),
+            ("#include /*\n*/ <a\\b>\nreturn image.flipped();\n", 2),
+            ("#pragma GCC dependency /*\n*/ <a/*>\nreturn image.flipped(); /* */\n", 2),
+            ("#include /*\n*/ \"a\\\" \" /*\nreturn image.flipped(); /* */\n", 2),
+            ("#if __has_include /*\n*/ (\"a\\\" \" /*)\n#endif\nreturn image.flipped(); /* */\n", 2),
+        ):
+            with self.subTest(source=source):
+                self.assertRefused(source, ["header-name"], [line])
+        for api in NEWER_THAN_QT5_API:
+            with self.subTest(api=api):
+                self.assertRefused(pass9.replace("flipped", api), ["header-name"], [2])
+        hits = unguarded_newer_api_calls(self._header_with_branch(pass9))
+        self.assertTrue(hits)
+        self.assertTrue(all(api.startswith("REFUSED") for _, api, _ in hits), hits)
+        # A readable header-name, with comments around it, is still read.
+        self.assertEqual(unguarded_newer_api_calls(
+            "#if __has_include /*\n*/ (<QImage>) // y\n#endif\n#include /* a\n b */ \"Player.h\" /* c */\n"), [])
 
     def test_every_api_name_token_is_a_use(self) -> None:
         # r5: the token rule is fail closed: a bare call, a macro argument (of any macro, defined
