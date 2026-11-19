@@ -4743,7 +4743,8 @@ def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_e
     # (3b) r5 fix 2 (adversary 1b823896 A3): a positive allowlist, so a write shape no blacklist names is refused too: the only .NET file call is
     # Open, and the only commands are the listing, the pipeline stage and the test-seam sleep
     # (-2 r1, adversary r16 A4: both read case-insensitively, as PowerShell resolves them)
-    assert [m.lower() for m in re.findall(r"(?i)\[System\.IO\.File\]::(\w+)", body)] == ["open"] and {c.lower() for c in re.findall(r"(?i)\b[a-z]+-[a-z]\w*", body)} <= {"get-childitem", "foreach-object", "start-sleep"}, "the probe may only list, open for reading and sleep"
+    # (-2 r1, adversary 0a7510a1 A2: the command-position words too, so an alias is a command like its cmdlet name)
+    assert [m.lower() for m in re.findall(r"(?i)\[System\.IO\.File\]::(\w+)", body)] == ["open"] and ({c.lower() for c in re.findall(r"(?i)\b[a-z]+-[a-z]\w*", body)} | _gui_smoke_log_probe_command_words(body)) <= {"get-childitem", "foreach-object", "start-sleep"}, "the probe may only list, open for reading and sleep"
     # (4) the wait is $job.Finished.WaitOne(ms) bounded by the absolute end (entry stopwatch + budget)
     assert "$Watch.Pending.Finished.WaitOne($waitMs)" in code and "[Math]::Min([int]$Watch.ProbeWaitMs, $leftMs)" in code, "the wait is Finished.WaitOne bounded by what is left"
     # (5) completion receives the job's output then removes the job
@@ -4754,6 +4755,22 @@ def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_e
     assert "$Watch.Pending.StopJobAsync()" in stop and "WaitOne" not in stop and "Wait-Job" not in stop, "stop is StopJobAsync, never a wait"
     # (7) a hung probe is waited on once: the wait is 0 ms once it has outrun its wait
     assert "$waitMs = if ($Watch.Hung) { 0 } else" in code and "$Watch.Hung = $true" in code, "a hung probe is only looked at, never re-waited past the budget"
+
+
+_PROBE_KEYWORDS = {"if", "elseif", "else", "foreach", "for", "while", "do", "until", "try", "catch", "finally", "return", "break", "continue", "switch",
+                   "throw", "in", "param", "function", "filter", "begin", "process", "end", "trap", "exit", "data"}
+
+
+def _gui_smoke_log_probe_command_words(body: str) -> set:
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary 0a7510a1 A2): every bare word in COMMAND POSITION (a line or statement start, after a pipe, an
+    open brace or parenthesis, or an assignment), lowercased, keywords left out, so an alias (`ni`, `sc`, `rm`) is a command like its cmdlet name. The
+    hyphenated-name regex alone missed every alias."""
+    words = set()
+    for m in re.finditer(r"(?m)(?:^|[;|{(=])[ \t]*([A-Za-z][\w-]*)", body):
+        word = m.group(1).lower()
+        if word not in _PROBE_KEYWORDS:
+            words.add(word)
+    return words
 
 
 def _gui_smoke_log_probe_purity_problems(body: str) -> list:
@@ -4778,7 +4795,7 @@ def _gui_smoke_log_probe_purity_problems(body: str) -> list:
     for shape in ("StreamWriter", "FileStream", "BinaryWriter", "TextWriter", "StringWriter", "WriteLine", "Flush", "::new", "New-Object", "CopyTo", "WriteByte"):
         if shape.lower() in rest.lower():
             problems.append(f"shape {shape}")
-    commands = {c.lower() for c in re.findall(r"(?i)\b[a-z]+-[a-z]\w*", body)}
+    commands = {c.lower() for c in re.findall(r"(?i)\b[a-z]+-[a-z]\w*", body)} | _gui_smoke_log_probe_command_words(body)
     problems += [f"command {c}" for c in sorted(commands - {"get-childitem", "foreach-object", "start-sleep"})]
     # r6 (adversary 2d33c39f A2): a computed member name, [System.IO.File]::('Write'+'AllText')(...) or $o.$name(...), is invisible to the member allowlist
     if re.search(r"(?:::|\.)\s*[(\$'\"]", body):
@@ -4837,6 +4854,11 @@ def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_wr
         # -2 r1 (adversary 81e7f8b2 A4): a backtick-escaped member name is the same member to PowerShell
         "backtick-escaped property assignment": "$file.IsRea`dOnly = $true\n",
         "backtick-escaped command": "Set-Con`tent -LiteralPath $file.FullName -Value 'overwritten'\n",
+        # -2 r1 (adversary 0a7510a1 A2): an alias is the cmdlet it names, in every command position
+        "new-item alias": "ni -Path $file.FullName -ItemType File -Force\n",
+        "set-content alias after a pipe": "'overwritten' | sc -LiteralPath $file.FullName\n",
+        "remove-item alias in a subexpression": "$null = (rm $file.FullName)\n",
+        "remove-item alias assigned": "$gone = del $file.FullName\n",
     }
     for label, injected in mutations.items():
         mutated = body.replace(anchor, anchor + injected, 1)

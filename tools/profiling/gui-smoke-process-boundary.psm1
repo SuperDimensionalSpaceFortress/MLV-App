@@ -169,7 +169,7 @@ function Get-GuiSmokeSilenceExpiryMs {
 }
 
 # -2 r1: one chunk wait of the runner's loops, read from the launch stamp at the call: min(-ChunkMs, D - now, max(1, E - now)). 0 = the deadline D has been
-# reached (no wait may start). -ExpiryMs < 0 = the watch is not armed (no silence verdict: D alone bounds the wait).
+# reached (no wait may start). -ExpiryMs < 0 = the watch is not armed or no window can run out by L (no silence verdict: D alone bounds the wait).
 function Get-GuiSmokeChunkWaitMs {
     [CmdletBinding()]
     param(
@@ -427,8 +427,11 @@ function Test-GuiSmokeLogProgressStalled {
         # one-way: the first `gui_smoke.` the app logs ends the load (its clip is open); the leg window alone applies from then on
         if ($marked) { $Watch.Phase = 'LOADED' }
     }
-    $Watch.ActiveWindowMs = if ([string]$Watch.Phase -eq 'LOADED') { $Watch.WindowMs } else { $Watch.LoadWindowMs }
     $Watch.ExpiryMs = Get-GuiSmokeLogProgressExpiryMs -Watch $Watch
+    # the window in force is the SILENCE that runs out at E, E - P (adversary 0a7510a1 A1): while LOADING with E = WL (the allowance from the launch) it is
+    # WL - P, never WL itself, so a stall never claims more silence than the log had. With no expiry it is the phase's own window.
+    $Watch.ActiveWindowMs = if ($Watch.Armed -and [double]$Watch.ExpiryMs -ge 0) { [int64][Math]::Round([double]$Watch.ExpiryMs - [double]$Watch.LastProgressMs) }
+        elseif ([string]$Watch.Phase -eq 'LOADED') { $Watch.WindowMs } else { $Watch.LoadWindowMs }
     if (-not $Watch.Armed) { return $false }
     # r15 (adversary d872def7 A2): at or past the deadline no stall verdict is passed: the caller's loop is ending on the whole budget, which then decides
     # the leg (timeout, not process_no_progress)

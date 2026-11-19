@@ -39,6 +39,7 @@
         "tools.repo_hygiene.test_dual_venue_evidence.VisualExposureFloorTests",
         "tools.repo_hygiene.test_dual_venue_paired_seek.PairedSeekImageContentTests",
         "tools.repo_hygiene.test_dual_venue_paired_seek.PairedSeekInPassPartnerTests",
+        "tools.repo_hygiene.test_gui_smoke_process_timeout_bound.AWindowThatCannotRunOutByTheLimitMakesNoSilenceVerdict",
         "tools.repo_hygiene.test_gui_smoke_process_timeout_bound.LegDerivedHardDeadline",
         "tools.repo_hygiene.test_gui_smoke_process_timeout_bound.LogProgressWatchdog",
         "tools.repo_hygiene.test_gui_smoke_process_timeout_bound.NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms",

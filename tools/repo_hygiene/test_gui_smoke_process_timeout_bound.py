@@ -1595,7 +1595,8 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
 """)
         plain, marked = out["plain"], out["marked"]
         self.assertEqual("LOADING", plain["phase"], "growth without gui_smoke. keeps the watch LOADING")
-        self.assertEqual(20000, plain["active"])
+        # adversary 0a7510a1 A1: the window in force is the silence that runs out at E (E - P), not the load allowance from the launch
+        self.assertEqual(round(plain["expiry"] - plain["p"]), plain["active"])
         self.assertAlmostEqual(max(20000, plain["p"] + 800), plain["expiry"], delta=0.01)
         self.assertEqual("LOADING", out["half"], "half a marker is not the marker")
         self.assertEqual("LOADED", marked["phase"], "interaction_trace event=gui_smoke.playback_policy switches the watch to LOADED (split across two reads)")
@@ -1677,6 +1678,44 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         self.assertEqual(-1, out["past"], "a window that runs out after L is no expiry, never one capped at L")
         self.assertEqual(6000, out["loadFits"], "while LOADING the load allowance from the launch holds: E = max(WL, P + W)")
         self.assertEqual(-1, out["loadPast"])
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class AStallReportsTheSilenceThatRanOutNotTheLoadAllowance(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary 0a7510a1 A1, major): while LOADING, E = max(WL, P + W) is anchored at the launch, so a log whose
+    last growth was credited at P and that then stays silent expires at WL with WL - P of silence; the watch still reported WL as the window, and the
+    boundary wrote "MLVApp made no log progress for WL ms" and published WL as noProgressWindowMs (owner leg: 1399000 ms claimed, 247000 ms real). The
+    window in force is E - P."""
+
+    def test_a_loading_stall_reports_wl_minus_p_and_the_boundary_prose_carries_it(self) -> None:
+        # scaled: W = 800, WL = 3000; the log arms at once, grows (no marker) at about 1 s, then stays silent; E = WL = 3000, silence about 2000 ms
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'loadingstall'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value '[2026-11-19T10:00:00.000Z] [info] [0x1a2b] Qt start-up (main.cpp:1)'
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
+$since = { [double]([Diagnostics.Stopwatch]::GetTimestamp() - $launch) * 1000.0 / [Diagnostics.Stopwatch]::Frequency }
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 3000 -LimitMs 30000 -LaunchTimestamp $launch -ProbeWaitMs 1000
+$stalled = $false; $grown = $false
+while ((& $since) -lt 6000 -and -not $stalled) {
+    if (-not $grown -and (& $since) -ge 1000) { Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:01.000Z] [info] [0x1a2b] a start-up growth (main.cpp:2)'; $grown = $true }
+    $stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 32000)
+    Start-Sleep -Milliseconds 50
+}
+$s = New-Stub ('& "' + $env:GS_PWSH + '" -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"')
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 5000 -NoProgressStalled -NoProgressWindowMs ([int64]$w.ActiveWindowMs)
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ stalled = $stalled; phase = $w.Phase; p = $w.LastProgressMs; expiry = $w.ExpiryMs; active = [int64]$w.ActiveWindowMs; window = $r.noProgressWindowMs
+    failures = @($r.failures) } | ConvertTo-Json -Compress -Depth 4
+""")
+        self.assertTrue(out["stalled"])
+        self.assertEqual("LOADING", out["phase"])
+        self.assertEqual(3000, out["expiry"], "E = WL while the allowance from the launch is the later end")
+        silence = round(out["expiry"] - out["p"])
+        self.assertGreaterEqual(silence, 800, "the silence that ran out is at least one leg window")
+        self.assertEqual(silence, out["active"], "a LOADING stall reported %s ms of silence, but the log was silent for %s ms (E - P)" % (out["active"], silence))
+        self.assertEqual(silence, out["window"])
+        self.assertTrue(any(("no log progress for %d ms" % silence) in f for f in out["failures"]), out["failures"])
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
