@@ -1448,15 +1448,12 @@ class GuiSmokeResultCarriesHostLoadTests(unittest.TestCase):
         call_text = source[call_start:call_end]
         self.assertNotIn("-SampleIntervalMs", call_text)
         self.assertNotIn("-OnSample", call_text)
-        self.assertIn("-TimeoutMs $hostLoadFinalizeTimeoutMs", call_text)
-        # And the finalize timeout must trace back to the sampling loop's own elapsed time, not an
-        # independent/unbound value.
-        finalize_computation = source.index("$hostLoadFinalizeTimeoutMs = [Math]::Max(1,")
-        self.assertLess(
-            finalize_computation, call_start,
-            "hostLoadFinalizeTimeoutMs must be computed from the sampling loop's real elapsed "
-            "time before the finalize call consumes it",
-        )
+        # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1: the finalize wait is no longer a remainder precomputed before the call (a runner descheduled
+        # between that computation and the call spent it twice); the boundary computes it from the launch stamp and the whole budget itself.
+        self.assertIn("-TimeoutMs $effectiveProcessTimeoutMs", call_text)
+        self.assertIn("-LifetimeBudgetMs $effectiveProcessTimeoutMs", call_text)
+        self.assertIn("-LaunchTimestamp $startTimestamp", call_text)
+        self.assertNotIn("$hostLoadFinalizeTimeoutMs", source, "the precomputed finalize remainder is gone")
 
     def test_verdict_call_is_wired_with_the_observed_max_sample_gap(self) -> None:
         # round 6 (astra MAJOR -- "enforcement tests check TOKENS, not behaviour"): astra's exact

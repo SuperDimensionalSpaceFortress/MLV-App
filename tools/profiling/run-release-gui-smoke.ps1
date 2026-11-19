@@ -12,6 +12,14 @@ param(
                            # recommended 30s settled-validation window. Both lanes use a generous window.
     [ValidateRange(0, 3600000)]
     [int]$ProcessTimeoutMs = 0,
+    # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: how long the app's own log may stay silent before the leg is ended as process_no_progress.
+    # 0 = derived from the leg (its derived process budget + 60 s), capped at the whole process timeout; never from -ProcessTimeoutMs.
+    [ValidateRange(0, 3600000)]
+    [int]$NoProgressTimeoutMs = 0,
+    # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6: the setup/teardown allowance added to the leg budget to form the process's hard deadline
+    # (app start-up, clip open, teardown); 0 = 120000 ms. The deadline never exceeds -ProcessTimeoutMs.
+    [ValidateRange(0, 3600000)]
+    [int]$LegHardLimitAllowanceMs = 0,
     [ValidateRange(0, 1000000)]
     [int]$TargetPresentedFrames = 0,
     [int]$StartFrame = 0,
@@ -1686,6 +1694,9 @@ if (-not [string]::IsNullOrWhiteSpace($GpuPlaybackReconBackend)) {
     $launchEnv["MLVAPP_GPU_PLAYBACK_RECON_BACKEND"] = $GpuPlaybackReconBackend
 }
 Add-EnvironmentPairs -Target $launchEnv -Pairs $ExtraEnvironment
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r3 (adversary 797947a7 A3): the app's log directory is the one the no-progress watchdog and the evidence read use,
+# so no -ExtraEnvironment pair may move it.
+$launchEnv["MLVAPP_CRASH_FORENSICS_LOG_DIR"] = $logRoot
 if ($CpuPlayPaceInformational) {
     $launchEnv[$script:GuiSmokePaceModeEnvironment] = "informational"
 }
@@ -1760,11 +1771,11 @@ $derivedProcessTimeoutMs = [Math]::Ceiling(
 if ($derivedProcessTimeoutMs -gt 3600000) {
     throw "Derived GUI-smoke process timeout exceeds the 3600000 ms safety ceiling; pass a smaller bounded workload."
 }
-$effectiveProcessTimeoutMs = if ($ProcessTimeoutMs -gt 0) {
-    $ProcessTimeoutMs
-} else {
-    [Math]::Max(1000, [int]$derivedProcessTimeoutMs)
-}
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 B1): the process's HARD deadline is derived from the LEG (leg budget + a 120 s setup/teardown
+# allowance, -LegHardLimitAllowanceMs to widen it) and capped by -ProcessTimeoutMs, never equal to a job-sized -ProcessTimeoutMs by itself. It is the
+# one budget every wait below uses (no log yet, a growing log, the finalize, the receipt), so a short leg under a one-hour job timeout ends at its
+# own deadline even when the silence watchdog is unarmed or keeps being restarted.
+$effectiveProcessTimeoutMs = [int](Get-GuiSmokeLegHardLimitMs -LegBudgetMs $derivedProcessTimeoutMs -JobTimeoutMs $ProcessTimeoutMs -AllowanceMs $LegHardLimitAllowanceMs)
 
 if ($DryRun) {
     $dryRunResult = [pscustomobject]@{
@@ -1907,6 +1918,8 @@ else {
     [void]$envBlock.Remove("MLVAPP_GPU_PLAYBACK_RECON_BACKEND")
 }
 Add-EnvironmentPairs -Target $envBlock -Pairs $ExtraEnvironment
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r3 (adversary 797947a7 A3): re-assert the log directory the watchdog watches (see the $launchEnv path above).
+$envBlock["MLVAPP_CRASH_FORENSICS_LOG_DIR"] = $logRoot
 # ENFORCE-4 r2 (sol BLOCKER): the per-run nonce the app echoes on its playback_smoke.summary (run_nonce=); the loop verdict below
 # judges only a summary that carries it. Set AFTER -ExtraEnvironment so a caller cannot choose the nonce it is judged against.
 $envBlock["MLVAPP_RUN_NONCE"] = $runNonce
@@ -1939,6 +1952,8 @@ $startUtc = [datetime]::UtcNow
 # the receipt's elapsedMonoMs (launch..end, monotonic) lets a reader check the two wall stamps against each other: a wall-clock excursion that lands
 # on only one of startedAtUtc / endedAtUtc shows as a disagreement between the wall launch..end and elapsedMonoMs.
 $startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
+# r16 (sol r15 B2): $startTimestamp is the ONE clock the process budget and the exit verdict use; $startUtc is the receipt's wall stamp only and judges nothing
+# (r15 judged an exited app's lifetime from it; a wall-clock step inside the life moved that verdict).
 $process = [System.Diagnostics.Process]::Start($startInfo)
 $screenshotCapture = $null
 $windowScreenshotCapture = $null
@@ -1978,36 +1993,117 @@ $stderrTask = $process.StandardError.ReadToEndAsync()
 # meaningfully measure (no round-trip of any kind), and adding no extra wall-clock time at all
 # (the sampling happens inside intervals the code was already spending blocked in WaitForExit).
 $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: a leg whose app log stops advancing (one stopped at gui_smoke.foreground_request and held the venue for the
+# whole 3600 s) is ended after a no-progress window, not after the caller's whole process budget. The watch arms at the app's first log line; before
+# that only the whole budget bounds the wait.
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1: ONE launch-anchored model (gui-smoke-process-boundary.psm1 header). Every time is ms since $startTimestamp:
+#   D = H = $effectiveProcessTimeoutMs; M = probe wait + 1000; L = max(min(1000, H), H - M)                     Get-GuiSmokeWatchdogLimitMs
+#   leg window  W  = min(leg + 60000, L)                                    leg = $derivedProcessTimeoutMs
+#   load window WL = min(leg + 60000 + max(0, A - 120000), L)               A   = -LegHardLimitAllowanceMs (setup 120 s + read)
+#   an explicit -NoProgressTimeoutMs replaces both and is capped at the same L (one invariant, no exception)
+#   E = max(WL, P + W) while the app is LOADING (no `gui_smoke.` record yet), P + W once it is LOADED; past L, none (D decides)   Get-GuiSmokeSilenceExpiryMs
+# No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL).
+# r4 (adversary b0a33ba9 A5): an explicit -NoProgressTimeoutMs below 1000 ms is clamped up to 1000 ms (0 stays "derived from the leg")
+$noProgressOverrideMs = if ($NoProgressTimeoutMs -gt 0) { [Math]::Max(1000, $NoProgressTimeoutMs) } else { 0 }
+$noProgressProbeWaitMs = 1000
+$noProgressLimitMs = Get-GuiSmokeWatchdogLimitMs -HardMs $effectiveProcessTimeoutMs -ProbeWaitMs $noProgressProbeWaitMs
+$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $noProgressLimitMs
+$noProgressLoadWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $noProgressLimitMs -ReadAllowanceMs ([Math]::Max(0, $LegHardLimitAllowanceMs - 120000))
+$noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noProgressWindowMs -LoadWindowMs $noProgressLoadWindowMs -LimitMs $noProgressLimitMs -LaunchTimestamp $startTimestamp -ProbeWaitMs $noProgressProbeWaitMs
+# r3 (adversary 797947a7 A2): no chunked wait may outlast a fraction of the window, or a short window would permit one chunk (up to 60 s) of silence.
+$noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs
+$noProgressStalled = $false
+# r10 (adversary 412ce3e0 A1, 3534e113 A1): set when either chunked wait ran the leg-derived budget out under a process that was still running (or that
+# outlived the budget before exiting), judged from the process's own lifetime, never from elapsed time alone; the finalize wait below then treats
+# a late exit as the timeout it is, while an app that exited inside the budget keeps its native exit classification.
+$waitBudgetExhausted = $false
+# r16 (sol r15 B1, B2): ONE clock for the whole budget, the monotonic launch stamp $startTimestamp (read just before Process.Start). -2 r1: no remainder is
+# carried from one statement to a later one: each chunk wait is read from the launch stamp at the call (Get-GuiSmokeChunkWaitMs: min(chunk, D - now,
+# max(1, E - now)), 0 once D is reached), each probe takes D itself, and the finalize computes its own wait. $lastAliveMs is the app's last monotonic
+# sighting running: the time read just BEFORE a chunk wait that then timed out (the app was running at that wait's end, so at that earlier instant too).
+# -2 r1 (adversary r16 A2): $exitSeenByMs is the FIRST monotonic sighting of the exit (-1 = none), kept once set: read right after a chunk wait that saw
+# the exit, or stored by Test-GuiSmokeWaitBudgetExhausted when it sees one; the boundary judges the exit from it and never dates it again.
+$lastAliveMs = [double]0
+$exitSeenByMs = [double]-1
 if ($HostLoadSampleIntervalMs -gt 0) {
-    $hostLoadSampleLoopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $hostLoadLastSampleAtMs = [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)
     while ($true) {
-        $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
-        if ($hostLoadRemainingMs -le 0) {
+        $aliveCheckMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp
+        $hostLoadChunkMs = Get-GuiSmokeChunkWaitMs -ChunkMs ([Math]::Min($HostLoadSampleIntervalMs, $noProgressChunkMs)) -LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs
+        if ($hostLoadChunkMs -le 0) {
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs)
             break
         }
-        $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, $hostLoadRemainingMs)
         if ($process.WaitForExit($hostLoadChunkMs)) {
+            if ($exitSeenByMs -lt 0) { $exitSeenByMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp }
             break
         }
+        $lastAliveMs = $aliveCheckMs
+        # r3: the chunk can now be shorter than the sampling interval (it follows the no-progress window), so a sample is taken only once the
+        # configured -HostLoadSampleIntervalMs has passed since the last one; the host-load cadence is unchanged.
+        if (([int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) - $hostLoadLastSampleAtMs) -lt $HostLoadSampleIntervalMs) {
+            if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
+                $noProgressStalled = $true
+                # r15 (adversary d872def7 A2): a stall verdict reached at or past the whole budget is judged against it, as the two waiting branches do.
+                # -2 r4: "at D" is the module's rule, under 1 ms of the budget left (floor), the same as Get-GuiSmokeChunkWaitMs; the three sites share it
+                if ([Math]::Floor([double]$effectiveProcessTimeoutMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)) -le 0) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
+                break
+            }
+            continue
+        }
+        $hostLoadLastSampleAtMs = [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)
         $newSample = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectProcess $process `
             -SkipEvidenceCollection
         $hostLoadDuringSamples.Add($newSample)
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
+            $noProgressStalled = $true
+            if ([Math]::Floor([double]$effectiveProcessTimeoutMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)) -le 0) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
+            break
+        }
     }
-    $hostLoadSampleLoopElapsedMs = [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
 }
 else {
-    $hostLoadSampleLoopElapsedMs = 0
+    # interior host-load sampling is off: the same chunked wait, watching the log only
+    while ($true) {
+        $aliveCheckMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp
+        $noProgressChunkWaitMs = Get-GuiSmokeChunkWaitMs -ChunkMs $noProgressChunkMs -LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs
+        if ($noProgressChunkWaitMs -le 0) {
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs)
+            break
+        }
+        if ($process.WaitForExit($noProgressChunkWaitMs)) {
+            if ($exitSeenByMs -lt 0) { $exitSeenByMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp }
+            break
+        }
+        $lastAliveMs = $aliveCheckMs
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
+            $noProgressStalled = $true
+            if ([Math]::Floor([double]$effectiveProcessTimeoutMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)) -le 0) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
+            break
+        }
+    }
 }
-# Whatever wall-clock time the sampling loop already spent waiting counts against the overall
-# process timeout budget -- the finalize wait below only needs to cover what's left. The 1ms floor
-# never actually extends an already-finished leg: WaitForExit on an already-exited process returns
-# TRUE immediately regardless of the timeout value passed to it.
-$hostLoadFinalizeTimeoutMs = [Math]::Max(1, $effectiveProcessTimeoutMs - $hostLoadSampleLoopElapsedMs)
+# the time since LAUNCH the chunked wait ended at (r16: the one clock, not a loop stopwatch)
+$hostLoadSampleLoopElapsedMs = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)
+# the worker runspace behind the log probe is released (a probe still hung on a stalled share is abandoned, never waited on)
+Stop-GuiSmokeLogProgressWatch -Watch $noProgressWatch
+# the window in force when the wait ended (WL while the app was LOADING, W once it logged `gui_smoke.`) is the one the receipt and the stall prose report
+$noProgressWindowMs = [int64]$noProgressWatch.ActiveWindowMs
+# -2 r1: the finalize computes its own wait from the launch stamp at the call (max(1, H - time since launch)); -TimeoutMs is only its fallback. The 1 ms
+# floor never extends an already-finished leg: WaitForExit on an already-exited process returns TRUE at once.
 $processBoundary = Wait-GuiSmokeProcessBounded `
     -Process $process `
     -StandardOutputTask $stdoutTask `
     -StandardErrorTask $stderrTask `
-    -TimeoutMs $hostLoadFinalizeTimeoutMs
+    -TimeoutMs $effectiveProcessTimeoutMs `
+    -ReportedTimeoutMs $effectiveProcessTimeoutMs `
+    -NoProgressStalled:$noProgressStalled `
+    -DeadlineReached:$waitBudgetExhausted `
+    -NoProgressWindowMs $noProgressWindowMs `
+    -LifetimeBudgetMs $effectiveProcessTimeoutMs `
+    -LaunchTimestamp $startTimestamp `
+    -LastAliveMs $lastAliveMs `
+    -ExitSeenByMs $exitSeenByMs
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
@@ -2471,7 +2567,14 @@ $colorArtifactScanPassed =
 $validationFailures = @()
 $validationFailures += $captureBindingFailures
 if ($processBoundary.timedOut) {
-    $validationFailures += "MLVApp exceeded its fail-closed process timeout and was terminated."
+    # r4 (adversary b0a33ba9 A4): the typed outcome decides, so an early no-progress stop does not also print the whole-timeout message
+    if ($processBoundary.outcome -eq 'process_no_progress') {
+        $validationFailures += "MLVApp's log made no progress for $noProgressWindowMs ms (process_no_progress); the leg was ended before the whole $($processBoundary.timeoutMs) ms budget."
+    }
+    else {
+        # r6 (sol r5 H2): "was terminated" only when the boundary SAW the exit; a failed kill or an unseen exit says so
+        $validationFailures += "MLVApp exceeded its fail-closed process timeout and " + $(if ($processBoundary.terminationConfirmed) { "was terminated." } else { "its termination was not confirmed." })
+    }
 }
 if ($processExitCode -ne 0) {
     $validationFailures += "MLVApp exited with effective code $processExitCode."
@@ -2936,6 +3039,13 @@ $result = [pscustomobject]@{
         nativeExitCode = $processBoundary.nativeExitCode
         timedOut = [bool]$processBoundary.timedOut
         timeoutMs = [int]$processBoundary.timeoutMs
+        # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: timeoutMs above is the WHOLE budget; the fields below are added beside it, none renamed.
+        # outcome is exited | timeout | process_no_progress; legBudgetMs is the runner's own derived leg budget (the no-progress window's base).
+        outcome = [string]$processBoundary.outcome
+        finalWaitMs = [int]$processBoundary.finalWaitMs
+        noProgress = [bool]$processBoundary.noProgress
+        noProgressWindowMs = [int]$noProgressWindowMs
+        legBudgetMs = [int]$derivedProcessTimeoutMs
         treeKillAttempted = [bool]$processBoundary.treeKillAttempted
         treeKillSucceeded = [bool]$processBoundary.treeKillSucceeded
         terminationConfirmed = [bool]$processBoundary.terminationConfirmed
