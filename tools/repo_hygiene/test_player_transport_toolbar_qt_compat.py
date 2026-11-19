@@ -68,6 +68,9 @@ It proves one thing about the scoped headers: no API name token stands outside a
 from __future__ import annotations
 
 import re
+import subprocess
+import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -164,46 +167,52 @@ _INT_LITERAL = re.compile(
 #       A comment, a line break or a splice between the accessor and the name, a bare name, a macro
 #       alias and a using-declaration all reach it (adversary r1 A1 on 792b6c2e); or
 #   (3) the lexer does not read the text (a trigraph, a control byte, a raw string, a backslash in
-#       code, an unreadable header-name) and it holds the substring `flip` or a `\u`/`\U`
-#       universal-character-name anywhere, NUL bytes ignored (a UTF-16 file) and every splice,
-#       `??/` included, joined.
-# Every file under the roots is read, whatever its suffix (adversary r1 A2: MLVApp.pro compiles .cc
-# files), but a binary one (a NUL byte and no C-family suffix: an object file, a PNG, a zip) and a
-# documentation or build-system file that no read file #includes (BUILD_OR_DOC_SUFFIXES, Makefile*).
+#       code, an unreadable header-name) and, with NULs dropped (a UTF-16 file), every splice joined
+#       (`??/` and a NUL before the break included) and every universal-character-name decoded
+#       (`\uXXXX`, `\UXXXXXXXX`, `\u{...}`, `\N{...}`), a flipped or flip token stands anywhere in it,
+#       comments and literals included.
+# Every file git can carry under the roots is read, whatever its suffix or content: tracked, and
+# untracked but not ignored (adversary r1 A2 on 792b6c2e: a suffix allowlist skipped the .cc files
+# MLVApp.pro compiles; pass 2 A1, A2 on 54e0a825: a doc/build-file filter was beaten by an #include
+# its regex did not read). A binary file is read too: only the exact token counts, and a PNG or zip
+# under the roots has none. Without a git work tree at the root, every file under the roots is read.
 # NON-PROMISE: it is a tripwire for the Qt 6.9 QImage names only. A name assembled by a token paste
-# (`##`) or by a macro defined in another file is not seen; the strict scanner refuses a paste in the
-# scoped files, and it is the strict scanner, not this tripwire, that judges a use guarded or not.
+# (`##`) or by a macro defined in another file is not seen (the strict scanner refuses a paste in the
+# scoped files); a file outside platform/qt and src, and a git-ignored one (a PR cannot carry it; a
+# force-added file is tracked and read), are not read; a source charset other than UTF-8, or UTF-16
+# holding ASCII, is not decoded. It is the strict scanner, not this tripwire, that judges a use
+# guarded or not.
 QT69_MEMBER_USE = re.compile(r"(?:\.|->|::)[ \t]*(?:flipped|flip)\b")
 QT69_NAME = re.compile(r"\b(?:flipped|flip)\b")
-QT69_UNLEXED = re.compile(r"flip|\\[uU]")
 TRIGRAPH_SPLICE = re.compile(r"\?\?/[ \t\f\v]*\n")
-TRIPWIRE_ROOTS = (ROOT / "platform" / "qt", ROOT / "src")
-C_FAMILY_SUFFIXES = frozenset((
-    ".c", ".cc", ".cp", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hp", ".hpp", ".hxx", ".h++", ".inl",
-    ".ipp", ".tpp", ".tcc", ".txx", ".inc", ".m", ".mm", ".ixx", ".cppm", ".cu", ".cuh",
-))
-# Documentation and build-system files (and any file named Makefile*: qmake writes Makefile.Debug and
-# Makefile.Release into platform/qt) are not read, unless a read file #includes one by name.
-BUILD_OR_DOC_SUFFIXES = frozenset((
-    ".md", ".txt", ".htm", ".html", ".pro", ".pri", ".qrc", ".qss", ".cmake", ".stash", ".user", ".yml",
-    ".yaml", ".sh", ".command", ".plist", ".desktop",
-))
-INCLUDE_TARGET = re.compile(r"^[ \t]*#[ \t]*(?:include|import|embed)\w*[ \t]*[<\"]([^>\"\n]+)[>\"]", re.M)
+UCN = re.compile(r"\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]+)\}|N\{([^}\n]*)\})")
+TRIPWIRE_ROOTS = ("platform/qt", "src")
+
+
+def _decode_ucn(match: re.Match) -> str:
+    digits = match.group(1) or match.group(2) or match.group(3)
+    if digits:
+        value = int(digits, 16)
+        return chr(value) if value < 0x110000 else "?"
+    try:
+        return unicodedata.lookup(match.group(4))
+    except KeyError:
+        return "?"
 
 
 def _reaches_qt69_name(text: str) -> bool:
     if QT69_MEMBER_USE.search(text):
         return True
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Every splice joined, a `??/` one and one with a NUL before the line break (GCC) included: no
-    # rule fires on a text that then holds neither `flip` nor a UCN, so only such a text is lexed.
-    joined = TRIGRAPH_SPLICE.sub("", SPLICE.sub("", text.replace("\x00", "")))
-    if not QT69_UNLEXED.search(joined):
-        return False
+    joined = UCN.sub(_decode_ucn, TRIGRAPH_SPLICE.sub("", SPLICE.sub("", text.replace("\x00", ""))))
+    if "flip" not in joined:
+        return False  # no rule can fire, so only such a text is lexed
     if CONTROL_BYTE.search(text) or TRIGRAPH.search(text):
-        return True  # (3): not lexed, and `flip` or a UCN is in it
+        return bool(QT69_NAME.search(joined))  # (3)
     lines, refused = _logical_lines(SPLICE.sub("", text))
-    return bool(refused) or any(QT69_NAME.search(line) for _, line, _ in lines)
+    if refused:
+        return bool(QT69_NAME.search(joined))  # (3)
+    return any(QT69_NAME.search(line) for _, line, _ in lines)  # (2)
 
 
 def files_needing_scan(texts: dict[str, str]) -> set[str]:
@@ -211,38 +220,33 @@ def files_needing_scan(texts: dict[str, str]) -> set[str]:
     return {key for key, text in texts.items() if _reaches_qt69_name(text)}
 
 
-def _is_c_family(path: Path) -> bool:
-    return path.suffix.lower() in C_FAMILY_SUFFIXES
+def _tripwire_paths(root: Path) -> list[Path]:
+    """Every file git can carry under the roots (tracked, plus untracked and not ignored); every file
+    under them when `root` is not the top of a git work tree."""
+    try:
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=120)
+        listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--others",
+                                 "--exclude-standard", "--", *TRIPWIRE_ROOTS], capture_output=True, timeout=300)
+        git_ok = (top.returncode == 0 and listed.returncode == 0
+                  and Path(top.stdout.strip()).resolve() == root.resolve())
+    except (OSError, subprocess.SubprocessError):
+        git_ok = False
+    if git_ok:
+        paths = [root / name for name in listed.stdout.decode("utf-8", "surrogateescape").split("\0") if name]
+    else:
+        paths = [root / sub for sub in TRIPWIRE_ROOTS]
+    files: set[Path] = set()
+    for path in paths:
+        if path.is_dir():  # the no-git fallback, or a submodule gitlink
+            files.update(p for p in path.rglob("*") if p.is_file())
+        elif path.is_file():
+            files.add(path)
+    return sorted(files)
 
 
-def _is_build_or_doc(path: Path) -> bool:
-    return path.suffix.lower() in BUILD_OR_DOC_SUFFIXES or path.name.lower().startswith("makefile")
-
-
-def _tripwire_texts() -> dict[str, str]:
-    texts: dict[str, str] = {}
-    for root in TRIPWIRE_ROOTS:
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
-            data = path.read_bytes()
-            if b"\x00" in data and not _is_c_family(path):
-                continue  # binary: an object file, an image, an archive
-            texts[str(path)] = data.decode("utf-8", errors="replace")
-    return _compiler_inputs(texts)
-
-
-def _compiler_inputs(texts: dict[str, str]) -> dict[str, str]:
-    """`texts` without the documentation and build-system files that no other file #includes."""
-    included = {
-        target.replace("\\", "/").rsplit("/", 1)[-1].lower()
-        for key, text in texts.items() if not _is_build_or_doc(Path(key))
-        for target in INCLUDE_TARGET.findall(text)
-    }
-    return {
-        key: text for key, text in texts.items()
-        if not _is_build_or_doc(Path(key)) or Path(key).name.lower() in included
-    }
+def _tripwire_texts(root: Path = ROOT) -> dict[str, str]:
+    return {str(path): path.read_bytes().decode("utf-8", errors="replace") for path in _tripwire_paths(root)}
 
 
 def _pp_int(token: str) -> int | None:
@@ -528,24 +532,30 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), set())
 
-    def test_an_unlexable_file_is_flagged_when_it_holds_the_name_or_a_ucn(self) -> None:
+    def test_an_unlexable_text_is_read_for_the_name_after_ucns_and_splices(self) -> None:
         # Where the lexer refuses (a raw string, a backslash in code, a header-name it cannot read, a
-        # trigraph or a control byte), the tripwire fails toward scanning: any `flip` substring or
-        # universal-character-name flags the file; a refused file with neither is not a use.
+        # trigraph or a control byte), the tripwire fails toward scanning: it looks for a flipped or
+        # flip token anywhere, comments and literals included, once NULs are dropped, every splice is
+        # joined and every universal-character-name is decoded.
         for text in ('auto s = R"(x)"; auto f = &QImage::fl\\u0069pped;', 'auto s = R"(x)"; // flip',
                      "auto p = img.fl\\u0069pped();", "auto p = img.fl\\U00000069pped();",
+                     "auto p = img.fl\\u{69}pped();", "auto p = img.fl\\N{LATIN SMALL LETTER I}pped();",
                      "??= x(); flip", "x();\x00 flipped", "f\x00l\x00i\x00p\x00p\x00e\x00d\x00",
                      "auto p = img.fl??/\nipped();", "auto p = img.fl\\\x00\nipped();"):
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), {"f"})
-        for text in ('auto s = R"(x)";', "auto c = \\n;", "??= x();"):
+        # A refused text without the token: a Windows path is not a UCN, a binary with `flipX` is not
+        # the name, and a UCN that decodes to an identifier character joins the token it touches.
+        for text in ('auto s = R"(x)";', "auto c = \\n;", "??= x();", 'auto s = R"(C:\\Users\\a)"; // flippedCopy',
+                     "x();\x00 flippedCopy", "\x89PNG\x00\x01flipX\x7f\\u0066lipz", "auto p = \\u00e9flipped;"):
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), set())
 
-    def test_the_tripwire_reads_every_source_file_whatever_its_suffix(self) -> None:
-        # adversary r1 A2 (792b6c2e): the suffix allowlist skipped the .cc files MLVApp.pro compiles
-        # (src/librtprocess/src/demosaic/ahd.cc, MLVApp.pro:301-314). Every file under the roots is
-        # read, but a binary one (a NUL byte) whose suffix is not a C-family source suffix.
+    def test_the_tripwire_reads_every_file_under_the_roots(self) -> None:
+        # adversary r1 A2 (792b6c2e): a suffix allowlist skipped the .cc files MLVApp.pro compiles
+        # (MLVApp.pro:301-314). adversary r1 pass 2 A1, A2 (54e0a825): the doc/build-file filter that
+        # replaced it was beaten by an #include its regex did not read, and by a transitive one.
+        # Every file git can carry under the roots is read now, whatever its suffix or content.
         texts = _tripwire_texts()
         ahd = ROOT / "src" / "librtprocess" / "src" / "demosaic" / "ahd.cc"
         self.assertTrue(str(ahd) in texts, f"the tripwire does not read {ahd}")
@@ -553,41 +563,34 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         injected[str(ahd)] = ("#include <QImage>\nstatic QImage qt69Readback(const QImage &image) "
                               "{ return image.flipped(Qt::Vertical); }\n" + texts[str(ahd)])
         self.assertIn(str(ahd), files_needing_scan(injected))
-        for root in TRIPWIRE_ROOTS:
-            for path in root.rglob("*"):
-                if (path.is_file() and not _is_build_or_doc(path)
-                        and (b"\x00" not in path.read_bytes() or _is_c_family(path))):
-                    with self.subTest(path=str(path.relative_to(ROOT))):
-                        self.assertTrue(str(path) in texts, f"the tripwire does not read {path}")
-        for name in ("README.md", "CMakeLists.txt", "MLVApp.pro", "Makefile", "Makefile.Debug", ".qmake.stash"):
-            with self.subTest(name=name):
-                self.assertTrue(_is_build_or_doc(Path(name)))
-        for name in ("ahd.cc", "dualiso_mix_chroma_avx2.inc", "config.h.in", "MLVApp.rc", "QImage", "a.fpm"):
-            with self.subTest(name=name):
-                self.assertFalse(_is_build_or_doc(Path(name)))
-
-    def test_an_included_build_or_doc_file_is_still_read(self) -> None:
-        # A .txt or .md that C++ #includes is compiler input, so it is read like a source file.
-        doc = {"src/k/notes.TXT": "return image.flipped(Qt::Vertical);\n", "src/k/Makefile": "flip.o: a\n"}
-        self.assertEqual(_compiler_inputs({**doc, "src/k/a.cpp": "x();\n"}), {"src/k/a.cpp": "x();\n"})
-        for line in ('#include "notes.txt"', "  # include <k/notes.txt>", '#include "..\\k\\NOTES.txt"',
-                     '#import "notes.txt"', "#include_next <notes.txt>"):
-            with self.subTest(line=line):
-                inputs = _compiler_inputs({**doc, "src/k/a.cpp": line + "\n"})
-                self.assertIn("src/k/notes.TXT", inputs)
-                self.assertNotIn("src/k/Makefile", inputs)
-                self.assertEqual(files_needing_scan(inputs), {"src/k/notes.TXT"})
-        # A build or doc file that #includes another does not make it compiler input.
-        self.assertNotIn("src/k/notes.TXT", _compiler_inputs({**doc, "src/k/b.md": '#include "notes.txt"\n'}))
-        for name in ("a.cc", "a.cxx", "a.c++", "a.hh", "a.hxx", "a.inl", "a.ipp", "a.tpp", "a.inc", "a.CPP",
-                     "a.H", "a.mm"):
-            with self.subTest(name=name):
-                self.assertTrue(_is_c_family(Path(name)))
-        # An extensionless text file is read like any text file; an extensionless binary (a Linux
-        # build of MLVApp in the tree) is not.
-        for name in ("a.o", "a.png", "a.zip", "a.exe", "MLVApp"):
-            with self.subTest(name=name):
-                self.assertFalse(_is_c_family(Path(name)))
+        tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", *TRIPWIRE_ROOTS],
+                                 capture_output=True, check=True).stdout.decode("utf-8").split("\0")
+        unread = sorted(name for name in tracked if name and (ROOT / name).is_file() and str(ROOT / name) not in texts)
+        self.assertEqual(len(unread), 0, f"the tripwire does not read tracked files: {unread[:20]}")
+        # The pass 2 inputs, in a tree that is not a git work tree (every file under the roots).
+        payload = (b"#include <QImage>\nstatic QImage qt69Readback(const QImage &image) "
+                   b"{ return image.flipped(Qt::Vertical); }\n")
+        files = {
+            "platform/qt/GpuDisplayViewport.cpp":
+                b'#include /*orientation*/ "qt69-readback.txt"\n#include "qt69-outer.md"\nx();\n',
+            "platform/qt/qt69-readback.txt": payload,
+            "platform/qt/qt69-outer.md": b'#include "qt69-inner.txt"\n',
+            "platform/qt/qt69-inner.txt": payload,
+            "platform/qt/Makefile.qt69.cpp": payload,
+            "platform/qt/Makefile": b"GpuDisplayWindow.o: C:\\Users\\x\\flipper.cpp\n",
+            "src/k/nul.txt": b"x();\x00 auto f = flipped;\n",
+            "src/k/icon.png": b"\x89PNG\x00\x01flipX\x00",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, data in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes(data)
+            texts = _tripwire_texts(root)
+            self.assertEqual(sorted(texts), sorted(str(root / name) for name in files))
+            expected = ("platform/qt/qt69-readback.txt", "platform/qt/qt69-inner.txt",
+                        "platform/qt/Makefile.qt69.cpp", "src/k/nul.txt")
+            self.assertEqual(files_needing_scan(texts), {str(root / name) for name in expected})
 
     def test_scanner_flags_the_09077b0d_shape(self) -> None:
         # r1's own line: proves the guard bites on the defect it exists for.
