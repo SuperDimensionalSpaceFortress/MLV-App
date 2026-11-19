@@ -328,3 +328,22 @@ TEST(ViewerIdleWiring, EveryTickMarksTheMoveHistoryAndTheHookReadsItForASamePosi
     ASSERT_TRUE(markDoc.contains(QStringLiteral("Non-promises:")));
     ASSERT_TRUE(markDoc.contains(QStringLiteral("coalesces")));
 }
+
+// W9 (r6, adversary pass 9 A1): the tick hands the controller witnessMissing = the hook is not installed, inside the
+// Windows guard and before the switch, so a failed SetWindowsHookExW never leaves the cursor hidden.
+TEST(ViewerIdleWiring, TickGatesTheHideOnTheInstalledRetrievalHook)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString timeout = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    ASSERT_FALSE(timeout.isEmpty());
+    const QString gate = QStringLiteral("in.witnessMissing = !viewer_idle::win_hook::installed();");
+    ASSERT_EQ(1, int(timeout.count(gate)));
+    const int gateAt = timeout.indexOf(gate);
+    ASSERT_TRUE(gateAt < timeout.indexOf(QStringLiteral("switch( m_viewerIdle.onTimeout(")));
+    const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), gateAt);
+    ASSERT_TRUE(guardAt >= 0);
+    ASSERT_TRUE(timeout.indexOf(QStringLiteral("#endif"), guardAt) > gateAt);
+    const QString header = readRepoFile(QStringLiteral("platform/qt/ViewerIdlePolicy.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("&& !i.witnessMissing;")));
+}

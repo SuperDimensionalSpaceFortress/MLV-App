@@ -2443,6 +2443,7 @@ private:
             if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
             if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
             if( markHistory ) viewer_idle::win_hook::markHistory();   // as MainWindow (r6, pass 8 A1)
+            in.witnessMissing = !viewer_idle::win_hook::installed();   // as MainWindow (r6, pass 9 A1)
         }
         else if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;   // the r1 tick
 #endif

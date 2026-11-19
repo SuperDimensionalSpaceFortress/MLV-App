@@ -3761,6 +3761,8 @@ void MainWindow::viewerIdleTimeout( void )
     if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
     if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
     viewer_idle::win_hook::markHistory();
+    // r6 pass 9 A1: no hook (SetWindowsHookExW failed) means no witness for deferred input: a gate, never hide.
+    in.witnessMissing = !viewer_idle::win_hook::installed();
 #endif
     // r3 (adversary r1 pass 4 A1): off Windows the sample above is the only witness, so every rearm is capped at
     // one poll period. Bound (pass 5 A1): an away-and-back that lies entirely between two samples (a late tick

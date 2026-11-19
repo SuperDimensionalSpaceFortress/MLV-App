@@ -787,3 +787,43 @@ TEST(ViewerIdlePolicy, CoalescedExcursionWhileShownRestartsTheIdlePeriod)
     viewer_idle::win_hook::remove();
 }
 #endif
+
+// P14 (r6, adversary pass 9 A1): the Windows hook failed to install (SetWindowsHookExW returned NULL), so input an
+// excluded wait defers has no witness. The pass-9 input: fullscreen at (500,500), the tick at 2000 would hide; with
+// the witness missing it never hides, and a cursor already hidden is shown at the next tick. Control: the
+// e5701666 tick (no witnessMissing gate) hides at 2000 and then only rearms while hidden through the wait.
+TEST(ViewerIdlePolicy, MissingRetrievalWitnessNeverHidesAndShowsAHiddenCursor)
+{
+    viewer_idle::Inputs missing = allPass();
+    missing.witnessMissing = true;
+    ASSERT_FALSE(viewer_idle::mayHide(missing));
+    ASSERT_TRUE(viewer_idle::mayHide(allPass()));
+    int rearm = 0;
+
+    // Control: no gate. Hidden at 2000; the deferred away-and-back leaves every witness empty: hidden at 2050.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 2050, 2000, &rearm, 50)));
+        ASSERT_TRUE(c.hidden());
+    }
+    // The gate: never hidden while the witness is missing.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(missing, 2000, 2000, &rearm, 50)));
+        ASSERT_FALSE(c.hidden());
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(missing, 9000, 2000, &rearm, 50)));
+        ASSERT_FALSE(c.hidden());
+        ASSERT_TRUE(rearm <= 50);
+    }
+    // Hidden, then the hook goes missing: the next tick shows.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(missing, 2050, 2000, &rearm, 50)));
+        ASSERT_FALSE(c.hidden());
+    }
+}

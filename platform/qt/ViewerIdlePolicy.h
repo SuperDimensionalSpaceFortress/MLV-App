@@ -65,12 +65,15 @@ struct Inputs
     bool toolArmed = false;         // WB picker, bad-pixel edit or gradient paint armed
     bool popupOrModalOpen = false;  // a popup (menu) or a modal dialog is open
     bool pointerMoved = false;      // the OS pointer moved since the last look (PointerWatch); not a hide gate
+    bool witnessMissing = false;    // Windows: the thread mouse hook is not installed (r6 pass 9 A1)
 };
 
-/*! \brief The cursor may hide only in real fullscreen, while active, with no tool and no popup/modal. */
+/*! \brief The cursor may hide only in real fullscreen, while active, with no tool and no popup/modal, and (on
+ *         Windows) only while the thread mouse hook is installed: without it input that an excluded wait defers
+ *         has no witness, so a hidden cursor could stay blank for the whole wait (r6 pass 9 A1, fail-safe). */
 inline bool mayHide( const Inputs &i )
 {
-    return i.fullscreen && i.windowActive && !i.toolArmed && !i.popupOrModalOpen;
+    return i.fullscreen && i.windowActive && !i.toolArmed && !i.popupOrModalOpen && !i.witnessMissing;
 }
 
 /*! \brief Whether an event of this type is real mouse activity. A move to the same global position
