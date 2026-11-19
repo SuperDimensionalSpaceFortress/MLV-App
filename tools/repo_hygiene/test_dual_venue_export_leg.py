@@ -92,8 +92,11 @@ def batch_log(exported: int, skipped: int = 0, elapsed: float = 20.0, verified: 
 
 
 def output_manifest(count: int, kind: str = "dng") -> str:
+    # r19 (sol r18 B3): the endpoint records carry their byte size, as export-stage-job.ps1 writes them, and agree with totalBytes (one file: first and last are that file)
+    first = {"name": "a", "bytes": 1000, "sha256": "1" * 64} if count > 0 else None
+    last = ({"name": "a", "bytes": 1000, "sha256": "1" * 64} if count == 1 else {"name": "b", "bytes": 1000, "sha256": "2" * 64}) if count > 0 else None
     return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": kind, "count": count, "totalBytes": count * 1000,
-                       "first": {"name": "a", "sha256": "1" * 64}, "last": {"name": "b", "sha256": "2" * 64}, "deleted": True})
+                       "first": first, "last": last, "deleted": True})
 
 
 EVIDENCE_CALL = ("Get-DvExportEvidence -Format $c.format -MaxFrames ([int]$c.maxFrames) -DualIsoExpected ([bool]$c.dualIsoExpected) -ExpectedBuildId $c.buildId "
@@ -642,6 +645,34 @@ class ExportEvidenceTests(unittest.TestCase):
                 self.assertTrue(any("EXPORT_OUTPUT_MISMATCH" in p and "integer" in p for p in got[i]["problems"]), got[i])
         self.assertEqual(got[5]["outcome"], "PASS", got[5])
 
+    def test_r19_b3_a_manifest_total_that_contradicts_its_endpoint_records_is_invalid(self) -> None:
+        """EXPORT-VENUE-LEG-1 r19 (sol r18 B3 = pass20-A3): totalBytes was checked for type and sign only, never against the first / last records the job writes beside it, so a MOV
+        manifest count=1 totalBytes=1 naming one 1000-byte file, and a DNG manifest count=30 totalBytes=1 with two distinct 1000-byte endpoints, read PASS with outputBytes=1. One file
+        is the whole total (first and last are that file); more files are two distinct endpoints inside the total. Anything else is INVALID EXPORT_OUTPUT_MISMATCH."""
+        def manifest(count: int, kind: str, total: int, first, last) -> str:
+            return json.dumps({"schema": "export-stage-output-manifest.v1", "kind": kind, "count": count, "totalBytes": total, "first": first, "last": last, "deleted": True})
+        one = {"name": "view-0.mov", "bytes": 1000, "sha256": "1" * 64}
+        a = {"name": "000000.dng", "bytes": 1000, "sha256": "1" * 64}
+        b = {"name": "000029.dng", "bytes": 1000, "sha256": "2" * 64}
+        cases = [prores_case(manifest=manifest(1, "mov", 1, one, one)),                                             # 0 sol repro: MOV total 1, a 1000-byte file
+                 cdng_case(manifest=manifest(30, "dng", 1, a, b)),                                                  # 1 sol repro: DNG total 1, two 1000-byte endpoints
+                 prores_case(manifest=manifest(1, "mov", 1000, one, {**one, "name": "other.mov"})),                 # 2 one file, two names
+                 cdng_case(manifest=manifest(30, "dng", 30000, a, a)),                                              # 3 thirty files, one endpoint twice
+                 cdng_case(manifest=manifest(30, "dng", 30000, a, None)),                                           # 4 no last record
+                 cdng_case(manifest=manifest(30, "dng", 30000, a, {**b, "bytes": "1000"})),                         # 5 a byte size that is no integer
+                 prores_case(manifest=manifest(1, "mov", 1000, one, one)),                                          # 6 control: one consistent file
+                 cdng_case(manifest=manifest(30, "dng", 30000, a, b))]                                              # 7 control: sol's consistent DNG
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for i in range(6):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "INVALID", got[i])
+                self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") for p in got[i]["problems"]), got[i])
+        for i in (6, 7):
+            with self.subTest(case=i):
+                self.assertEqual(got[i]["outcome"], "PASS", got[i])
+                self.assertEqual(got[i]["problems"], [], got[i])
+
     def test_r7_a5_a_malformed_profile_container_or_element_is_invalid_before_counting(self) -> None:
         """adversary r6 A5: a JSON null appended to profile frames (frame_count 481), or frames given as one object, read PASS because null elements were filtered and a
         lone object was wrapped. The container must be an array of objects, frame_count must be the array's length, and every element is a record."""
@@ -1148,7 +1179,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
 
     def write_export_artifacts(self, frames: int, profile: bool = True, venue: str = "bachelor", fmt: str = "cdng-lossless",
                                exported: int | None = None, result: str = "EXPORT_CAPTURED", observed_venue: str | None = None, stage: str | None = None,
-                               source_commit: str | None = None) -> None:
+                               source_commit: str | None = None, manifest: str | None = None) -> None:
         a = self.artifacts
         if a.exists():
             shutil.rmtree(a)
@@ -1167,7 +1198,7 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
             return
         if profile:
             (a / "export-profile.json").write_text(cdng_profile(frames, build_id=source_commit or self.sha), encoding="utf-8")
-        (a / "output-manifest.json").write_text(output_manifest(exported), encoding="utf-8")
+        (a / "output-manifest.json").write_text(output_manifest(exported) if manifest is None else manifest, encoding="utf-8")
 
     def validate(self, receipt: dict, spec: Path, dv: Path = DV, evidence_dir: str = "") -> dict:
         rp = self.tmp / "receipt-under-test.json"
@@ -1207,6 +1238,40 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                 got = self.validate(r, spec, evidence_dir=str(work))
                 self.assertFalse(got["valid"], got)
                 self.assertIn(got["status"], ("INVALID", "INCOMPLETE"), got)
+
+    def test_r19_b3_a_contradictory_manifest_total_is_invalid_at_write_and_in_the_receipt_rederivation(self) -> None:
+        """EXPORT-VENUE-LEG-1 r19 (sol r18 B3): the writer (Invoke-VenueLeg.ps1) and the receipt re-derivation (Test-DvReceiptValid) share the reader, so both refuse a manifest
+        whose totalBytes contradicts its endpoint records. Writer: count=30 totalBytes=1 beside two 1000-byte endpoints is INVALID, not PASS. Re-derivation: a PASS receipt whose
+        hashed manifest is swapped for one with the SAME count and totalBytes (so the metrics still match) but endpoints that cannot fit inside that total does not verify."""
+        spec = self.export_spec(maxframes=30)
+        bad = json.dumps({"schema": "export-stage-output-manifest.v1", "kind": "dng", "count": 30, "totalBytes": 1,
+                          "first": {"name": "000000.dng", "bytes": 1000, "sha256": "1" * 64}, "last": {"name": "000029.dng", "bytes": 1000, "sha256": "2" * 64}, "deleted": True})
+        self.write_export_artifacts(30, manifest=bad)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("EXPORT_OUTPUT_MISMATCH", receipt["outcomeDetail"])
+        # the re-derivation: a happy receipt, its manifest swapped (hash claim updated) for one whose endpoints (2 x 20000 bytes) cannot fit in the same 30000-byte total
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(self.validate(receipt, spec)["status"], "VERIFIED_OFFLINE_TEST")
+        evdir = Path(receipt["evidence"]["localEvidenceDir"])
+        work = self.tmp / "ev-r19-b3"
+        if work.exists():
+            shutil.rmtree(work)
+        shutil.copytree(evdir, work)
+        doc = json.loads((work / "export" / "output-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual((doc["count"], doc["totalBytes"]), (30, 30000), doc)
+        doc["first"]["bytes"] = 20000
+        doc["last"]["bytes"] = 20000
+        forged = json.dumps(doc).encode("utf-8")
+        (work / "export" / "output-manifest.json").write_bytes(forged)
+        r = json.loads(json.dumps(receipt))
+        r["export"]["files"]["output-manifest.json"] = hashlib.sha256(forged).hexdigest()
+        got = self.validate(r, spec, evidence_dir=str(work))
+        self.assertFalse(got["valid"], got)
+        self.assertIn(got["status"], ("INVALID", "INCOMPLETE"), got)
 
     def test_r8_a3b_an_export_built_from_another_commit_than_the_requested_one_is_invalid_at_write(self) -> None:
         """adversary r8 pass 9 A3: the leg took ExpectedBuildId from the job's OWN summary.sourceCommit and never compared that to the requested SourceCommit, so a summary and

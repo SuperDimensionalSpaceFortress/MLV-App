@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import ast
+import hashlib
 import json
 import os
 import re
@@ -409,8 +410,10 @@ throw "fake um-run: unexpected job $JobId"
 # share's outbox (admission.leaseBatch on the current lease, or another one when the call index is in FAKE_LEG_LOSE), a receipt and its summary.json
 # (pre-load FAKE_LEG_PRELOADS), and DVE_OUTCOME from FAKE_LEG_OUTCOMES. Each call is logged with UTC ticks and its -LeaseBatch.
 FAKE_LEG = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ReceiptRoot = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ReceiptRoot = '', [string]$ExpectSpecSha256 = '')
 $share = $env:FAKE_SHARE
+# r19 (sol r18 B1): FAKE_LEG_SPEC_SHA records the -ExpectSpecSha256 each call was given beside the sha256 of the spec bytes it would run
+if ($env:FAKE_LEG_SPEC_SHA) { Add-Content -LiteralPath $env:FAKE_LEG_SPEC_SHA -Value ("expect={0} read={1}" -f $ExpectSpecSha256, (Get-FileHash -LiteralPath $LegSpec -Algorithm SHA256).Hash.ToLowerInvariant()) }
 # LEASE-BATCH-RECEIPT-ROOT-1: one line per call saying whether -ReceiptRoot was passed at all (absent and empty are different: the batch must forward NOTHING when it has none)
 Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'leg-receiptroot.log') -Value ("bound={0} root={1}" -f $PSBoundParameters.ContainsKey('ReceiptRoot'), $ReceiptRoot)
 $st = Get-Content -LiteralPath (Join-Path $share 'fake-agent-state.json') -Raw | ConvertFrom-Json
@@ -3440,7 +3443,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
 
 # LEASE-BATCH-MULTI-BUILD-1: a wrapper around fake-leg.ps1 that records the build, backend and spec each leg was called with, then runs the fake leg unchanged.
 FAKE_LEG_ARGS = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ExpectSpecSha256 = '')
 Add-Content -LiteralPath $env:FAKE_LEG_ARGS -Value (([ordered]@{ leaf = [IO.Path]::GetFileNameWithoutExtension($LegSpec); sourceCommit = $SourceCommit; buildManifestSha256 = $BuildManifestSha256; backend = $Backend; leaseBatch = $LeaseBatch }) | ConvertTo-Json -Compress)
 & (Join-Path $PSScriptRoot 'fake-leg.ps1') @PSBoundParameters
 exit $LASTEXITCODE
@@ -5864,6 +5867,109 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted. " + out)
                 self.assertEqual(r.returncode, 2, out)
                 self.assertIn(line, r.stderr, out)
+
+    def test_r19_b1_a_spec_changed_after_the_budget_judged_it_never_reaches_a_lease_or_a_leg(self) -> None:
+        # EXPORT-VENUE-LEG-1 r19 (sol r18 B1 = pass20-A1): the budget preflight judged a 480-frame window, then the same file became maxFrames=100000 (sol's repro: it still passes the
+        # shape predicate, and its zero-byte budget floor is past the agent's cap) while the batch waited. The plan guard repeated the shape check only and the scalar forms checked
+        # no content at all, so the lease opened and the leg ran on bytes the budget never judged. The stand-in budget child rewrites the spec right after the batch read it, as a
+        # change during the wait would. The batch records the judged bytes' sha256 and refuses SPEC_CHANGED_AFTER_PREFLIGHT before any lease or leg.
+        fake = self.case / "fake-export-budget-r19-b1.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "if ($env:FAKE_MUTATE_SPEC) { Copy-Item -LiteralPath $env:FAKE_MUTATE_FROM -Destination $env:FAKE_MUTATE_SPEC -Force }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 480
+        judged_text = json.dumps(doc)
+        doc["export"]["maxFrames"] = 100000
+        changed = self.case / "export-r19-b1-changed.json"
+        changed.write_text(json.dumps(doc), encoding="utf-8")
+        spec = self.case / "export-r19-b1.json"
+        shas = self.case / "leg-spec-sha-r19.log"
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, shas):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+            spec.write_text(judged_text, encoding="utf-8")
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                reset()
+                env = {"FAKE_MUTATE_SPEC": str(spec), "FAKE_MUTATE_FROM": str(changed), "FAKE_LEG_SPEC_SHA": str(shas)}
+                if mode == "-LegSpec":
+                    r = self.run_batch([spec], "-ExportBudgetScript", str(fake), **env)
+                else:
+                    r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), **env)
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertIn('"maxFrames": 100000', spec.read_text(encoding="utf-8"), "the stand-in did not change the spec, so the test proves nothing. " + out)
+                self.assertEqual([k for k in self.kinds() if k.startswith("LEG")], [], f"{mode}: a leg ran on a spec the budget never judged. " + out)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened on a spec the budget never judged. " + out)
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+        # control: an unchanged spec runs, and the leg is handed the sha256 of exactly the bytes the budget judged (the leg re-checks its own read against it)
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=f"control {mode}"):
+                reset()
+                if mode == "-LegSpec":
+                    r = self.run_batch([spec], "-ExportBudgetScript", str(fake), FAKE_LEG_SPEC_SHA=str(shas))
+                else:
+                    r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), FAKE_LEG_SPEC_SHA=str(shas))
+                out = f"control {mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+                want = hashlib.sha256(spec.read_bytes()).hexdigest()
+                rows = shas.read_text(encoding="utf-8").splitlines() if shas.exists() else []
+                self.assertTrue(rows, "no leg ran on the unchanged spec. " + out)
+                for row in rows:
+                    self.assertEqual(row, f"expect={want} read={want}", out)
+
+    def test_r19_b1_the_leg_refuses_spec_bytes_that_are_not_the_ones_the_budget_judged(self) -> None:
+        # r19 (sol r18 B1, the dispatch site Invoke-VenueLeg.ps1:225): the bytes the LEG reads are the bytes run, so the leg compares them with -ExpectSpecSha256 and throws
+        # DVE_LEG_SPEC_CHANGED before it generates or submits anything. Structural: the parameter, the comparison right after the one read, and the batch passing it at the launch.
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("[Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{64}\\z')][string]$ExpectSpecSha256 = ''", leg)
+        read_at = leg.index("$specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)")
+        check_at = leg.index("if ($readSpecSha -cne $ExpectSpecSha256) { throw \"DVE_LEG_SPEC_CHANGED")
+        self.assertLess(read_at, check_at)
+        self.assertLess(check_at, leg.index("$spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate"), "the check runs on the one read, before the spec is used")
+        batch = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("$lArgs += @('-ExpectSpecSha256', [string]$script:SpecBudgetSha256[[string]$leg.spec])", batch)
+
+    def test_r19_b2_a_stalled_budget_spec_read_is_bounded_by_the_deadline_and_refused_before_the_claim(self) -> None:
+        # EXPORT-VENUE-LEG-1 r19 (sol r18 B2 = pass20-A2): the budget preflight's own read of the spec was a synchronous ReadAllBytes BEFORE the remaining-room check, so a share that
+        # stopped answering there (every earlier read of the spec had answered) held the batch past -DeadlineUtc. The seam -ExportBudgetSpecReadDelaySec makes only that read answer
+        # after 300 s. It is bounded by the room before -DeadlineUtc and refused EXPORT_BUDGET_PREFLIGHT_TIMEOUT before any claim, long before the read would have answered.
+        fake = self.case / "fake-export-budget-r19-b2.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        spec = self.case / "export-r19-b2.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        for mode, room in (("-LegSpec", 30), ("-LegPlan", 100)):
+            with self.subTest(mode=mode):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=room))
+                t0 = time.monotonic()
+                if mode == "-LegSpec":
+                    r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadDelaySec", "300", "-DeadlineUtc", deadline)
+                    line = "BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT"
+                else:
+                    r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadDelaySec", "300", "-DeadlineUtc", deadline)
+                    line = "LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 "
+                took = time.monotonic() - t0
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn(line, r.stderr, out)
+                self.assertIn("read of the leg spec did not answer", r.stderr, out)
+                self.assertLess(took, room + 15, f"{mode}: the stalled read held the batch past -DeadlineUtc. " + out)
+                self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted. " + out)
+                self.assertFalse(self.claim_path.exists(), f"{mode}: no claim was written. " + out)
+        # the seam is refused with the real um-run.ps1
+        args, e = self.batch_cmd([spec], "-ExportBudgetSpecReadDelaySec", "5")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-ExportBudgetSpecReadDelaySec is an offline test seam", r.stderr)
 
     def test_r11_export_a_budget_preflight_that_never_returns_is_killed_and_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r11 (sol r9 B1, EXPORT-BUDGET-PREFLIGHT-CHILD-DEADLINE-1; fable H1 EXPORT-LEGSET-BUDGET-PREFLIGHT-TEST-1): the preflight child (the export generator's
