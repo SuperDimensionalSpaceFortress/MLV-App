@@ -71,6 +71,9 @@ param(
     # BACHELOR-LEASE-BATCH-LEGS-1: the batch token of Invoke-VenueLeaseBatch.ps1. The leg's job id then ends "-lb<token>", so the venue agent runs
     # it on that batch's parked quiet lease instead of requesting one (ultra-magnus-agent.ps1, lease-batch block). Nothing else about the leg changes.
     [Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{12}$')][string]$LeaseBatch = '',
+    # EXPORT-VENUE-LEG-1 r19 (sol r18 B1): the sha256 of the RAW spec bytes the lease batch's export-budget preflight judged. When given, the bytes this leg reads must be those bytes,
+    # or the leg refuses DVE_LEG_SPEC_CHANGED before anything is generated or submitted: a lease is never spent on a spec the budget did not judge. Empty (every other caller): no check.
+    [Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{64}\z')][string]$ExpectSpecSha256 = '',
     [string]$Actor = '',
     # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored). Must sit under a
     # `.claude-state` directory in production (a receipt and its evidence name an owner clip's run).
@@ -223,6 +226,11 @@ if ($null -ne $table) {
 }
 
 $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
+if ($ExpectSpecSha256) {
+    # r19 (sol r18 B1): the bytes read above are the bytes this leg runs; they must be the ones the batch's budget preflight judged (raw sha256, no line-ending normalisation)
+    $readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($specBytes)) -replace '-', '').ToLowerInvariant()
+    if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not the $ExpectSpecSha256 the lease batch's export budget preflight judged; nothing is generated or submitted" }
+}
 # Line endings are normalised on BOTH sides of the committed-spec lookup (Get-DvLegSpecSha256): on this VM's default checkout (autocrlf=true) the working
 # copy is CRLF and the committed blob is LF, and a raw-byte hash would refuse every committed spec as LEG_SPEC_NOT_COMMITTED (fable r1 B2).
 $legSpecSha256 = Get-DvLegSpecSha256 $specBytes

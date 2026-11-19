@@ -4773,6 +4773,33 @@ function Get-DvExportInt64($Value) {
 
 function Get-DvExportRound($Value) { if ($null -eq $Value) { return $null }; [math]::Round([double]$Value, 6) }
 
+function Get-DvExportManifestEndpointProblem($Manifest, [int64]$Count, [int64]$TotalBytes) {
+    # EXPORT-VENUE-LEG-1 r19 (sol r18 B3 = pass20-A3): totalBytes is the published outputBytes, and the job writes it beside the first and last file it hashed
+    # (export-stage-job.ps1: first/last = { name, bytes, sha256 } of the sorted outputs). The total was checked for type and sign only, so count=1 totalBytes=1 beside a 1000-byte
+    # .mov, or 30 .dng files totalling 1 byte beside two 1000-byte endpoints, read PASS with outputBytes=1. The total is reconciled with its parts: one file is the whole total (first
+    # and last are that one file); more than one file are two distinct endpoints that fit inside the total; none is a zero total and no endpoint. Anything else is the text of the
+    # problem ($null when the manifest agrees with itself). The writer and the receipt re-derivation read it through Get-DvExportEvidence, so all three agree.
+    $first = Get-DvProp $Manifest 'first'; $last = Get-DvProp $Manifest 'last'
+    if ($Count -eq 0) {
+        if ($TotalBytes -ne 0) { return "output-manifest.json lists no file but totalBytes $TotalBytes" }
+        if ($null -ne $first -or $null -ne $last) { return 'output-manifest.json lists no file but names a first or last file' }
+        return $null
+    }
+    if ($first -isnot [System.Management.Automation.PSCustomObject] -or $last -isnot [System.Management.Automation.PSCustomObject]) { return "output-manifest.json lists $Count file(s) but its first and last records are not both objects, so totalBytes $TotalBytes cannot be reconciled with them" }
+    $fn = Get-DvProp $first 'name'; $ln = Get-DvProp $last 'name'
+    $fb = Get-DvExportInt64 (Get-DvProp $first 'bytes'); $lb = Get-DvExportInt64 (Get-DvProp $last 'bytes')
+    if ($fn -isnot [string] -or $ln -isnot [string] -or [string]::IsNullOrEmpty($fn) -or [string]::IsNullOrEmpty($ln)) { return 'output-manifest.json first and last records do not both carry a file name' }
+    if ($null -eq $fb -or $null -eq $lb -or $fb -lt 0 -or $lb -lt 0) { return 'output-manifest.json first and last records do not both carry a non-negative integer byte size' }
+    if ($Count -eq 1) {
+        if ($fn -cne $ln) { return "output-manifest.json lists one file but its first ('$fn') and last ('$ln') records name different files" }
+        if ($fb -ne $TotalBytes -or $lb -ne $TotalBytes) { return "output-manifest.json lists one file of $fb bytes (last record $lb) but totalBytes $TotalBytes" }
+        return $null
+    }
+    if ($fn -ceq $ln) { return "output-manifest.json lists $Count files but its first and last records name the same file '$fn'" }
+    if (($fb + $lb) -gt $TotalBytes) { return "output-manifest.json lists $Count files totalling $TotalBytes bytes, fewer than its first ($fb) and last ($lb) files alone" }
+    $null
+}
+
 # --- r7 (adversary r6 A1-A5, Dot I2): ONE record schema for everything the export reader reads, not one check per finding ----------------------------------------
 # Every profile frame and every stage-log record is validated against these tables BEFORE a count, a mean or a share is taken, and a record that does not conform
 # is a typed problem (EXPORT_RECORD_INVALID: type / null / finite / range; EXPORT_STAGE_WINDOW_MISMATCH: a stage not timed on exactly the frames its denominator is),
@@ -4950,6 +4977,11 @@ function Get-DvExportEvidence {
             elseif ($kind -cne $wantKind) { $problems.Add("EXPORT_OUTPUT_MISMATCH: output-manifest.json lists '$kind' output, a $Format export writes $wantKind") }
             elseif ($Format -ceq 'prores') { if ($count -ne 1) { $problems.Add("EXPORT_OUTPUT_MISMATCH: a ProRes export writes one .mov; the manifest lists $count") } }
             elseif ($null -ne $m.framesExported -and $count -ne $m.framesExported) { $problems.Add("EXPORT_OUTPUT_MISMATCH: the manifest lists $count .dng file(s) but the batch exported $($m.framesExported)") }
+            # r19 (sol r18 B3): the published total agrees with the endpoint records it was written beside, or the manifest is no evidence of outputBytes
+            if ($null -ne $count -and $null -ne $bytes -and $count -ge 0 -and $bytes -ge 0) {
+                $endpointProblem = Get-DvExportManifestEndpointProblem -Manifest $manifest -Count $count -TotalBytes $bytes
+                if ($endpointProblem) { $problems.Add("EXPORT_OUTPUT_MISMATCH: $endpointProblem") }
+            }
             # adversary r2 A3: the exported frames / .mov are derived from the owner's footage and must be gone from the venue; a job whose delete failed (a reader held
             # a file open) says deleted=false, and a manifest with no boolean true is no proof of the delete either
             $deleted = Get-DvProp $manifest 'deleted'
