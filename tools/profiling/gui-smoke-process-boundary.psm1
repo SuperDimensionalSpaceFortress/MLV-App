@@ -267,6 +267,9 @@ function Test-GuiSmokeLogProgressStalled {
         }
     }
     if (-not $Watch.Armed) { return $false }
+    # r15 (adversary d872def7 A2): a call that has spent the whole budget it was given (the probe blocked until the budget ran out, so its late result was
+    # ignored above) is not a stall verdict: the caller's loop is ending on the whole budget, which then decides the leg (timeout, not process_no_progress)
+    if ([int64]$entryClock.ElapsedMilliseconds -ge [int64]$BudgetRemainingMs) { return $false }
     return ($Watch.Quiet.ElapsedMilliseconds -ge $Watch.WindowMs)
 }
 
@@ -314,6 +317,17 @@ function Test-GuiSmokeLifetimeExceedsBudget {
     return ($wallMs -gt $BudgetMs)
 }
 
+# The monotonic time since the runner's launch stamp (Stopwatch.GetTimestamp() read before Process.Start), in ms; -1 when no stamp was given.
+function Get-GuiSmokeSinceLaunchMs {
+    [CmdletBinding()]
+    param(
+        [int64]$LaunchTimestamp = 0
+    )
+
+    if ($LaunchTimestamp -le 0) { return -1.0 }
+    return [double]([System.Diagnostics.Stopwatch]::GetTimestamp() - $LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency
+}
+
 function Test-GuiSmokeWaitBudgetExhausted {
     [CmdletBinding()]
     param(
@@ -323,17 +337,25 @@ function Test-GuiSmokeWaitBudgetExhausted {
         [ValidateRange(0, 3600000)]
         [int64]$BudgetMs,
         # Stopwatch.GetTimestamp() read before the process was started; 0 = not known
-        [int64]$LaunchTimestamp = 0
+        [int64]$LaunchTimestamp = 0,
+        # r15 (hosted CI on 1477a490, ubuntu only): the wall instant (UTC) the caller read just before Process.Start, right after LaunchTimestamp; MinValue = not
+        # known. Process.StartTime of a process that has ALREADY EXITED is not readable on Linux (.NET derives it from /proc/<pid>/stat, gone once the child is
+        # reaped, so the read throws and the catch below used to turn that into "not exhausted": every late exit read as a clean one). The launch instant exists
+        # on every OS and is read in the same wall-clock domain as Process.ExitTime, so it is the lifetime's start whenever the caller has one; StartTime is only
+        # the fallback of a caller that has none. The lifetime then also includes Process.Start's own spawn time (milliseconds), never less than the real life.
+        [datetime]$LaunchUtc = [datetime]::MinValue
     )
 
     try {
         if (-not $Process.HasExited) { return $true }
-        $sinceLaunchMs = -1.0
-        if ($LaunchTimestamp -gt 0) {
-            $sinceLaunchMs = [double]([System.Diagnostics.Stopwatch]::GetTimestamp() - $LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency
-        }
+        $sinceLaunchMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $LaunchTimestamp
         if ($sinceLaunchMs -ge 0 -and $sinceLaunchMs -le $BudgetMs) { return $false }
-        $wallMs = Get-GuiSmokeProcessLifetimeMs -StartTime $Process.StartTime -ExitTime $Process.ExitTime
+        $wallMs = if ($LaunchUtc.Ticks -gt 0) {
+            Get-GuiSmokeProcessLifetimeMs -StartTime $LaunchUtc -ExitTime $Process.ExitTime
+        }
+        else {
+            Get-GuiSmokeProcessLifetimeMs -StartTime $Process.StartTime -ExitTime $Process.ExitTime
+        }
         return (Test-GuiSmokeLifetimeExceedsBudget -BudgetMs $BudgetMs -WallLifetimeMs $wallMs -SinceLaunchMs $sinceLaunchMs)
     }
     catch {
@@ -373,7 +395,9 @@ function Wait-GuiSmokeProcessBounded {
         # saw, the expired deadline): an app that outlived the budget before exiting is a timeout, one that exited inside it keeps its native exit.
         [ValidateRange(0, 3600000)]
         [int64]$LifetimeBudgetMs = 0,
-        [int64]$LaunchTimestamp = 0
+        [int64]$LaunchTimestamp = 0,
+        # r15: the wall instant (UTC) read just before the launch (see Test-GuiSmokeWaitBudgetExhausted); MinValue = not known
+        [datetime]$LaunchUtc = [datetime]::MinValue
     )
 
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3-6: this used to chop the wait into chunks and
@@ -415,13 +439,19 @@ function Wait-GuiSmokeProcessBounded {
             $terminationConfirmed = $Process.WaitForExit($waitMs)
             if ($terminationConfirmed) {
                 $exitObservedTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp(); $exitObservedAtUtc = [datetime]::UtcNow
-                if ($LifetimeBudgetMs -gt 0 -and (Test-GuiSmokeWaitBudgetExhausted -Process $Process -BudgetMs $LifetimeBudgetMs -LaunchTimestamp $LaunchTimestamp)) {
+                if ($LifetimeBudgetMs -gt 0 -and (Test-GuiSmokeWaitBudgetExhausted -Process $Process -BudgetMs $LifetimeBudgetMs -LaunchTimestamp $LaunchTimestamp -LaunchUtc $LaunchUtc)) {
                     # the exit is real but came after the whole budget was spent: it is not a completion. The timeout path below ends the (already
                     # exited) tree and reports the whole budget, exactly as for an app still running at the deadline.
                     $terminationConfirmed = $false
                     $overrunRecognized = $true
                     $exitObservedTimestamp = $null; $exitObservedAtUtc = $null
                 }
+            }
+            elseif ($NoProgressStalled -and $LifetimeBudgetMs -gt 0 -and (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $LaunchTimestamp) -ge $LifetimeBudgetMs) {
+                # r15 (adversary d872def7 A2): the stall verdict came at or past the whole budget (a log probe that blocked on a share spent the rest of
+                # it) and the 1 ms look still sees the app running: it was alive AT the deadline, so the leg is a timeout, not a stall that ended it
+                # early. The monotonic time since launch is the clock the budget was anchored on (r11 fix 6).
+                $overrunRecognized = $true
             }
         }
     }

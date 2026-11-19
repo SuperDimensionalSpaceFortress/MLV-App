@@ -1952,6 +1952,10 @@ $startUtc = [datetime]::UtcNow
 # the receipt's elapsedMonoMs (launch..end, monotonic) lets a reader check the two wall stamps against each other: a wall-clock excursion that lands
 # on only one of startedAtUtc / endedAtUtc shows as a disagreement between the wall launch..end and elapsedMonoMs.
 $startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
+# r15 (hosted CI on 1477a490, ubuntu only): the wall instant of the launch, read right AFTER the monotonic stamp and before Process.Start, so the boundary measures an
+# exited app's lifetime from it. Process.StartTime of an exited child is not readable on Linux, and a wall lifetime from this instant cannot read longer than the
+# monotonic time since the stamp (the stamp came first).
+$launchUtc = [datetime]::UtcNow
 $process = [System.Diagnostics.Process]::Start($startInfo)
 $screenshotCapture = $null
 $windowScreenshotCapture = $null
@@ -2012,7 +2016,7 @@ if ($HostLoadSampleIntervalMs -gt 0) {
     while ($true) {
         $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
         if ($hostLoadRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $launchUtc
             break
         }
         $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))
@@ -2024,6 +2028,8 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         if (([int64]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds - $hostLoadLastSampleAtMs) -lt $HostLoadSampleIntervalMs) {
             if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds))) {
                 $noProgressStalled = $true
+                # r15 (adversary d872def7 A2): a stall verdict reached at or past the whole budget is judged against it, as the two waiting branches do
+                if ([int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $launchUtc }
                 break
             }
             continue
@@ -2034,6 +2040,7 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         $hostLoadDuringSamples.Add($newSample)
         if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds))) {
             $noProgressStalled = $true
+            if ([int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $launchUtc }
             break
         }
     }
@@ -2045,7 +2052,7 @@ else {
     while ($true) {
         $noProgressRemainingMs = $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds
         if ($noProgressRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $launchUtc
             break
         }
         if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
@@ -2053,6 +2060,7 @@ else {
         }
         if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds))) {
             $noProgressStalled = $true
+            if ([int]$noProgressLoopStopwatch.ElapsedMilliseconds -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $launchUtc }
             break
         }
     }
@@ -2075,7 +2083,8 @@ $processBoundary = Wait-GuiSmokeProcessBounded `
     -DeadlineReached:$waitBudgetExhausted `
     -NoProgressWindowMs $noProgressWindowMs `
     -LifetimeBudgetMs $effectiveProcessTimeoutMs `
-    -LaunchTimestamp $startTimestamp
+    -LaunchTimestamp $startTimestamp `
+    -LaunchUtc $launchUtc
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
