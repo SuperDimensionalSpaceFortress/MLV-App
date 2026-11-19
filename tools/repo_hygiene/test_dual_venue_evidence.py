@@ -16190,6 +16190,121 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertIn("session-boundary-unreadable", out[name], out)
 
+    # r8 (keys sol / fable / opus key3 r7 B1 on 152845be; catalogue row DC-01b: `<name><U+212A> rest` -> the record is counted, unusable or unreadable, never
+    # skipped): under PowerShell's case-insensitive -match .NET folds U+212A (Kelvin sign) and U+0130 into [A-Za-z0-9_], so a record name glued to one of them
+    # read as a LONGER name and the record was skipped. Every record-name class and terminator is now ASCII matched case-sensitively, (?-i:[A-Za-z0-9_]).
+    R8_FOLDS = (("U+212A", "K"), ("U+0130", "İ"))
+    R8_MARKER = "playback_smoke.measured_session id=3\n"
+
+    def r8_reader_rows(self) -> list[tuple[str, str, str | None, int | None]]:
+        """(site and character, log, anomaly the reason must name or None, driven count or None): one row per reader site per folding character."""
+        rows = []
+        for label, ch in self.R8_FOLDS:
+            rows += [
+                (f"AttrCudaArtifacts summary terminator, {label} (the keys' repro)",
+                 self.log() + f"\ngui_smoke.window_toggles{ch} requested=4 driven=0 reason=incomplete", "duplicate-window-toggles-summary", None),
+                (f"AttrCudaArtifacts toggle terminator, a duplicate begin of toggle 1 named with {label}",
+                 self.log(mutate=lambda i, b, e, ch=ch: (b + "\n" + b.replace("gui_smoke.window_toggle ", f"gui_smoke.window_toggle{ch} ", 1) if i == 1 else b, e)),
+                 None, 3),
+                (f"AttrCudaArtifacts marker terminator, the measured marker itself named with {label}",
+                 self.log().replace(self.R8_MARKER, f"playback_smoke.measured_session{ch} id=3\n", 1), "session-boundary-unreadable", None),
+                (f"AttrCudaArtifacts marker terminator, a later marker of session 4 named with {label} (the keys' repro)",
+                 self.log().replace(self.R8_MARKER, self.R8_MARKER + f"playback_smoke.measured_session{ch} id=4\n", 1), "session-boundary-unreadable", None),
+                (f"AttrCudaArtifacts generic playback name, {label} glued after it",
+                 self.log().replace(self.R8_MARKER, self.R8_MARKER + f"playback_smoke.frame{ch} n=1\n", 1), "session-boundary-unreadable", None),
+                (f"AttrCudaArtifacts generic playback name, {label} at its start (a name that begins with it is a record too)",
+                 self.log().replace(self.R8_MARKER, self.R8_MARKER + f"playback_smoke.{ch}frame session=4\n", 1), "session-boundary-unreadable", None),
+            ]
+        return rows
+
+    def test_r8_b1_a_record_name_glued_to_a_folding_character_is_counted_never_skipped(self) -> None:
+        """r8 (keys r7 B1, sites AttrCudaArtifacts.psm1 marker / generic name / summary / toggle selectors): each row's record is counted, so the reason is not ok,
+        neither shipped leg passes, and the row's own anomaly (or driven count) shows WHICH reader counted it."""
+        rows = self.r8_reader_rows()
+        out = self.run_cases([self.log()] + [log for _, log, _, _ in rows])
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        self.assertEqual(out[0]["passes"], [True, True], out[0])
+        for (name, _, why, driven), got in zip(rows, out[1:], strict=True):
+            with self.subTest(case=name):
+                self.assertNotEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [False, False], got)
+                if why is not None:
+                    self.assertIn(why, got["e"]["reason"], got)
+                if driven is not None:
+                    self.assertEqual(got["e"]["driven"], driven, got)
+
+    def test_r8_b1_the_request_reader_counts_a_toggle_name_glued_to_a_folding_character(self) -> None:
+        """r8 (keys r7 B1, site DualVenueRunner.psm1 Get-DvWindowToggleRequestEvidence): an ordinary leg whose log carries a toggle-named record glued to U+212A or
+        U+0130 blocks (the keys' repro: `gui_smoke.window_toggles<U+212A> requested=4 driven=4 reason=ok` gave mentions=0 blocks=false)."""
+        cases = []
+        for label, ch in self.R8_FOLDS:
+            cases += [(f"the keys' summary repro, {label}", {}, f"gui_smoke.window_toggles{ch} requested=4 driven=4 reason=ok", True),
+                      (f"a toggle record, {label}", {}, f"gui_smoke.window_toggle{ch} phase=begin index=0", True),
+                      (f"a toggle record behind the log prefix, {label}", {"generatorArgs": {"midPlayWindowToggles": False}},
+                       f"[2026-11-19T13:00:00.000Z] [INFO] [0x1a2c] gui_smoke.window_toggle{ch} phase=begin index=0", True)]
+        cases.append(("control: a longer ASCII record name is another record", {}, "gui_smoke.window_toggles_note x=1", False))
+        proc, out = run_pwsh_evidence_cases("Get-DvWindowToggleRequestEvidence", [(spec, log) for _, spec, log, _ in cases])
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, blocks), v in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(v["blocks"], blocks, v)
+
+    def test_r8_b1_the_reconcile_gate_and_the_job_embedded_reader_refuse_the_folding_spellings(self) -> None:
+        """r8 (keys r7 B1, propagation sites DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence, used by Test-DvReceiptValid and Invoke-VenueLeg.ps1, and the
+        job generator's embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over the keys' logs are INVALID, and the embedded reader does not derive ok."""
+        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        rows = self.r8_reader_rows()
+        with tempfile.TemporaryDirectory(prefix="wt-r8-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _, _ in rows]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, _), got in zip(rows, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertNotEqual(got["derived"], "ok", got)
+        logs = {"clean": self.log(), **{f"row{n}": log for n, (_, log, _, _) in enumerate(rows)}}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        embedded = json.loads(proc.stdout)
+        self.assertEqual(embedded["clean"], "ok", embedded)
+        for n, (name, _, _, _) in enumerate(rows):
+            with self.subTest(gate="embedded job reader", case=name):
+                self.assertNotEqual(embedded[f"row{n}"], "ok", embedded)
+
+    def test_r8_b1_every_record_name_class_of_the_toggle_readers_is_case_sensitive_ascii(self) -> None:
+        """r8 (keys r7 B1, the CLASS): the toggle reader holds ONE name-character definition, (?-i:[A-Za-z0-9_]) (its own copy: the job embeds its source), and no
+        bare [A-Za-z0-9_] is left as a record-name class or terminator inside a -match; the request reader uses the module's $script:DvNameChar."""
+        attr = ATTR_MODULE.read_text(encoding="utf-8")
+        reader = attr.split("function Get-AttrCudaWindowToggleEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertEqual(reader.count("$nameChar = '(?-i:[A-Za-z0-9_])'"), 1)
+        for bare in ("(?![A-Za-z0-9_])", "(?<![A-Za-z0-9_])", "\\.[A-Za-z0-9_]+"):
+            with self.subTest(reader="Get-AttrCudaWindowToggleEvidence", bare=bare):
+                self.assertNotIn(bare, reader)
+        for use in ("ndow_toggles(?!' + $nameChar + ')", "ndow_toggle(?!' + $nameChar + ')", "measured_sess[Ii]on(?!' + $nameChar + ')",
+                    "'^playback_smoke\\.' + $nameChar + '+( |$)'"):
+            with self.subTest(reader="Get-AttrCudaWindowToggleEvidence", use=use):
+                self.assertIn(use, reader)
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        request = module.split("function Get-DvWindowToggleRequestEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertNotIn("(?![A-Za-z0-9_])", request)
+        self.assertIn("ndow_toggles?(?!' + $script:DvNameChar + ')", request)
+        self.assertEqual(re.findall(r"\$script:DvNameChar = '([^']*)'", module), ["(?-i:[A-Za-z0-9_])"])
+
     def test_r3_b4_a_requested_leg_must_back_its_scalars_with_the_hashed_run_log(self) -> None:
         """r3 B4 (sol): requested-toggle success is reconciled with the hashed run log, in the writer and in receipt validation, by the one shared reader
         Get-DvWindowToggleReconcileEvidence (the log's own derivation, never the summary scalars, decides)."""

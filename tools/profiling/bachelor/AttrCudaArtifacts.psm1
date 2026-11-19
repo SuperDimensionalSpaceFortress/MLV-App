@@ -7425,6 +7425,11 @@ function Get-AttrCudaWindowToggleEvidence {
     # r3 (adversary A1 on 1f00a482): the cut tail must BE a location, ` (<path>:<digits>)` to the very end of the line with a path of at least one character (the
     # runner's Get-DvLogRecordBody rule); any other tail (`(reason=incomplete)`, text after the `)`, no line number) is no location, so its record is unreadable
     # ($badTail) and a keep_playing line carrying it counts for nothing. It may refuse; it never forges.
+    # r8 (keys sol / fable / opus key3 r7 B1 on 152845be, inputs: `gui_smoke.window_toggles<U+212A> requested=4 driven=0 reason=incomplete` and U+0130): the ONE name
+    # character of every record-name class and terminator below, ASCII [A-Za-z0-9_] matched CASE-SENSITIVELY even inside a -match (DualVenueRunner.psm1's
+    # $script:DvNameChar; this function is embedded in the job, so it holds its own copy). Under IgnoreCase .NET folds U+212A (Kelvin sign) and U+0130 into [A-Za-z],
+    # so a record name glued to one of them was skipped instead of counted; with (?-i:...) every non-ASCII neighbour ends the name and the record is counted
+    $nameChar = '(?-i:[A-Za-z0-9_])'
     $badTail = [System.Collections.Generic.HashSet[int]]::new()
     $lines = [System.Collections.Generic.List[string]]::new()
     # r5 (adversary A1 on 129eb94b): a line ends at CRLF, a bare CR or a bare LF, so a lone CR never hides a second record inside one line
@@ -7482,7 +7487,7 @@ function Get-AttrCudaWindowToggleEvidence {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         # r7 (r7 adversary A2 on be8fb7b6, its input: `playback_smoke.measured_session:id=4`): the name ends at ANY non-name character, never only at whitespace, so a
         # name glued to a colon (or any other character) is a marker candidate, read here, and unclean unless one plain space or the line end follows the name
-        if ($lines[$i] -notmatch '^playback_smoke\.measured_sess[Ii]on(?![A-Za-z0-9_])') { continue }
+        if ($lines[$i] -notmatch ('^playback_smoke\.measured_sess[Ii]on(?!' + $nameChar + ')')) { continue }
         $clean = -not $badTail.Contains($i)
         if ($lines[$i] -cmatch '[^\t\x20-\x7E]' -or $lines[$i] -cnotmatch '^[^ \t]+(?: [^ \t]+)*$' -or $lines[$i] -notmatch '^playback_smoke\.measured_sess[Ii]on( |$)') { $clean = $false }
         $keysSeen = @{}
@@ -7525,7 +7530,9 @@ function Get-AttrCudaWindowToggleEvidence {
             # closes the window and names itself; the keys are read in any case (`SESSION=4` is a declaration too)
             # r7 (r7 adversary A2 on be8fb7b6): a playback_smoke record name ends at ANY non-name character (`playback_smoke.start:session=4` is a record), and one whose name
             # is not followed by one plain space or the line end is an unreadable boundary: it closes the window and names itself
-            if ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(?![A-Za-z0-9_])' -and ($badTail.Contains($i) -or $lines[$i] -notmatch '^playback_smoke\.[A-Za-z0-9_]+( |$)')) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+            # r8 (keys r7 B1, input: `playback_smoke.frame<U+212A> n=1`): the name is $nameChar+ (case-sensitive ASCII), so a U+212A / U+0130 glued to it ends the name and
+            # the record is unreadable; and ANY record that starts `playback_smoke.` is a candidate, so a name that begins with such a character is unreadable too, never skipped
+            if ($lines[$i] -match '^playback_smoke\.' -and ($badTail.Contains($i) -or $lines[$i] -notmatch ('^playback_smoke\.' + $nameChar + '+( |$)'))) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
             elseif ($markerId.ContainsKey($i)) {
                 # r5 (adversary A1 on 732bcb96): a marker is read by its id= AND its session=; one with no id= (`playback_smoke.measured_session session=4`, or the bare name) or with any
                 # session= is no clean marker of this session, so it closes the window and names itself, as every other playback_smoke record that names a session does
@@ -7533,8 +7540,8 @@ function Get-AttrCudaWindowToggleEvidence {
                 if (-not $markerClean[$i]) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
                 elseif ($markerId[$i] -cne $windowId) { $end = $i }
             }
-            elseif ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+( |$)') {
-                foreach ($sessionMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)')) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+            elseif ($lines[$i] -match ('^playback_smoke\.' + $nameChar + '+( |$)')) {
+                foreach ($sessionMatch in [regex]::Matches($lines[$i], ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)'))) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
             }
             if ($end -le $i) { break }
         }
@@ -7563,8 +7570,10 @@ function Get-AttrCudaWindowToggleEvidence {
         # phase= is read, ordered and counted like the rest, never skipped
         # r7 (r7 adversary A2 on be8fb7b6, its inputs: `gui_smoke.window_toggles: requested=4 ...`, `gui_smoke.window_toggle: phase=begin ...`): a record name ends at ANY
         # non-name character, never only at whitespace, so a name glued to a colon (or a TAB, or the line end) is still a summary / toggle record: counted, ordered and checked
-        $isSummary = $line -match '^gu[Ii]_smoke\.w[Ii]ndow_toggles(?![A-Za-z0-9_])'
-        $isToggle = (-not $isSummary) -and ($line -match '^gu[Ii]_smoke\.w[Ii]ndow_toggle(?![A-Za-z0-9_])')
+        # r8 (keys r7 B1, input: `gui_smoke.window_toggles<U+212A> requested=4 driven=0 reason=incomplete`): the terminator is (?!$nameChar), case-sensitive ASCII, so a
+        # U+212A / U+0130 glued to the name ends it: the record is a summary / toggle record, unusable for its non-ASCII character, and counted (a duplicate is seen)
+        $isSummary = $line -match ('^gu[Ii]_smoke\.w[Ii]ndow_toggles(?!' + $nameChar + ')')
+        $isToggle = (-not $isSummary) -and ($line -match ('^gu[Ii]_smoke\.w[Ii]ndow_toggle(?!' + $nameChar + ')'))
         if (-not ($isKeep -or $isSummary -or $isToggle)) { continue }
         if ($isToggle -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
         # (r3 B2: the value may be EMPTY, so a key repeated with no value, ` position=` or ` requested=`, is repeated and the record unusable)

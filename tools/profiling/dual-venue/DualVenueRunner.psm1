@@ -2036,7 +2036,9 @@ function Get-DvWindowToggleRequestEvidence {
         # r4 (adversary A2 on 0b915c19): the letter i is the class [Ii], so a host culture that does not fold an upper-case I (tr-TR) still counts GUI_SMOKE.WINDOW_TOGGLE
         # r7 (r7 adversary A1 on be8fb7b6, its inputs: `gui_smoke.window_toggles<TAB>requested=4 ...` and the bare name): the name ends at ANY non-name character or the
         # line end, never only at a literal space, so a toggle-named record in any spelling is a mention (fail closed: an ordinary leg blocks)
-        if ($line -match '^\s*(?:\[[^\]]*\]\s*)*gu[Ii]_smoke\.w[Ii]ndow_toggles?(?![A-Za-z0-9_])') { $mentions++ }
+        # r8 (keys r7 B1, input: `gui_smoke.window_toggles<U+212A> requested=4 driven=4 reason=ok` on an ordinary leg): the terminator is (?!$script:DvNameChar), ASCII
+        # matched case-sensitively, so a U+212A / U+0130 glued to the name ends it and the record is a mention (under -match a bare [A-Za-z0-9_] folded them in)
+        if ($line -match ('^\s*(?:\[[^\]]*\]\s*)*gu[Ii]_smoke\.w[Ii]ndow_toggles?(?!' + $script:DvNameChar + ')')) { $mentions++ }
     }
     $blocks = (-not $requested) -and ($mentions -gt 0)
     [pscustomobject]@{
