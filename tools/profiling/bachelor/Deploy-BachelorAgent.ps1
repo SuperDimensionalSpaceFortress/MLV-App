@@ -75,7 +75,7 @@
 #   machine's task list, so -RestartMode when-idle is refused (16) before anything changes unless ALL hold: heartbeat.txt
 #   names this machine as host=; its agentScript= is <VenueRoot>\ultra-magnus-agent.ps1 (a copied heartbeat from another
 #   root fails here); its pid is alive with the recorded start time; and the task's own XML has an executable action
-#   `-File <that script path>`: the action's <Command> is pwsh/powershell, the FIRST -File (no -Command/-EncodedCommand before it,
+#   `-File <that script path>`: the action's <Command> is pwsh/powershell (or the one wrapper form below), the FIRST -File (no -Command/-EncodedCommand before it,
 #   no positional token before it) is that absolute path, and the agent's own arguments after it name no other root (-Root, or a
 #   positional first argument, must be this folder; a path mentioned only in the description or a later argument does not count).
 #   The RUNNING instance must say the same: its own command line (Win32_Process.CommandLine of the heartbeat pid, read under a
@@ -84,7 +84,14 @@
 #   /Run starts is held to it too, and must have STARTED at or after /Run (no tolerance: the old agent never counts as new).
 #   The heartbeat pid must also BE the task's running instance: the Task Scheduler is asked (IRunningTask.EnginePID, the pid of the
 #   Exec action's process) and must name exactly one instance, that pid; a process that only writes a matching heartbeat is not what
-#   `schtasks /End` stops. The replacement must be the task's new instance by the same test. Idle is judged once more AFTER all of
+#   `schtasks /End` stops. The replacement must be the task's new instance by the same test.
+#   THE ONE WRAPPER FORM (BACHELOR-DEPLOY-RESTART-WRAPPER-BINDING-1): the venue task runs the agent through C:\mlvtmp\mlv-hidden.exe
+#   (the 2026-10-23 no-console-flash hardening): <Command> is exactly that path ($script:HiddenWrapperPath), its arguments are the
+#   wrapper's own flags (only --stdout/--stderr <absolute path> and --label <name>, each once), then `--`, then a pwsh/powershell host
+#   whose argv is held to the rule above. Any other wrapper shape refuses with a typed TASK_* reason (Get-UnwrappedHostCommand). The
+#   instance is then the wrapper, and the agent is its ONE live PowerShell child (zero or two-plus children refuse with a typed INSTANCE_*
+#   reason): that child must be the heartbeat pid. The stop ends the wrapper instance (pid and OS start) and then that child (pid and OS
+#   start), and the replacement must be the single PowerShell child of a NEW wrapper instance, both started at or after /Run. Idle is judged once more AFTER all of
 #   this binding, and again INSIDE the stop routine with the instance object in hand and immediately before Stop() (the scheduler
 #   lookup can take up to its deadline too). The stop acts on pid AND the recorded start (a reused pid is another instance). Its answer is
 #   three-valued: stopped / not-stopped (Stop() never called) / unknown (no answer in time, or Stop() raised: it may have been applied,
@@ -189,6 +196,12 @@ $script:StopWaitSec = 30
 $script:TaskIdleWaitSec = 15
 # the file a bounded runspace dot-sources to get this script's functions (empty only if the host gives no path)
 $script:SelfPath = $PSCommandPath
+# THE one wrapper a task action may run the agent through (BACHELOR-DEPLOY-RESTART-WRAPPER-BINDING-1): the 2026-10-23 no-console-flash
+# hardening made \MlvAgentBachelor run C:\mlvtmp\mlv-hidden.exe, which starts the PowerShell host named after its `--` as its child.
+# Only this path is the wrapper, and only these of its own flags are read, each once and with a value (anything else refuses):
+#   --stdout <absolute path>  --stderr <absolute path>  --label <name>
+$script:HiddenWrapperPath = 'C:\mlvtmp\mlv-hidden.exe'
+$script:HiddenWrapperFlags = @('stdout', 'stderr', 'label')
 
 function Out-Typed { param([string]$Line) Write-Output $Line }
 
@@ -752,18 +765,245 @@ function Test-TaskXmlRunsScript {
     # keep the script from running, so it is refused, not skipped. The FIRST -File is the absolute agent path, and the agent's own
     # arguments name no other root (Get-TaskRootFromScriptArgs). A second action of any kind refuses. A mention elsewhere
     # (Description, a later -File) is not the script the task runs. XML escapes (&amp;) are decoded by the parser, so a correct
-    # task for an unusual path still binds.
+    # task for an unusual path still binds. The one wrapper form is read by Get-TaskXmlBinding (which this returns the verdict of).
     param([string]$Xml, [string]$AgentScript)
-    try { $doc = [xml]$Xml } catch { return $false }
+    return [bool](Get-TaskXmlBinding -Xml $Xml -AgentScript $AgentScript).ok
+}
+
+function Get-TaskXmlBinding {
+    # Test-TaskXmlRunsScript with its reason. Returns @{ ok; wrapped; why }: wrapped = the action runs the agent through the one wrapper
+    # ($script:HiddenWrapperPath), so the task's running instance is the wrapper and the agent is its single PowerShell child; why is a
+    # typed reason (a TASK_* code, then the detail) when ok is false.
+    param([string]$Xml, [string]$AgentScript)
+    $no = { param($why) [pscustomobject]@{ ok = $false; wrapped = $false; why = $why } }
+    try { $doc = [xml]$Xml } catch { return (& $no 'TASK_XML_UNREADABLE the task definition is not well-formed XML') }
     $actions = @($doc.SelectNodes("//*[local-name()='Actions']/*"))
-    if ($actions.Count -ne 1 -or -not [string]::Equals([string]$actions[0].LocalName, 'Exec', [System.StringComparison]::Ordinal)) { return $false }
+    if ($actions.Count -ne 1 -or -not [string]::Equals([string]$actions[0].LocalName, 'Exec', [System.StringComparison]::Ordinal)) {
+        return (& $no "TASK_ACTIONS the task has $($actions.Count) action(s), not exactly one Exec action")
+    }
     $exec = $actions[0]
     $cmdNode = $exec.SelectSingleNode("*[local-name()='Command']")
     $argNode = $exec.SelectSingleNode("*[local-name()='Arguments']")
-    if ($null -eq $cmdNode -or $null -eq $argNode) { return $false }
+    if ($null -eq $cmdNode -or $null -eq $argNode) { return (& $no 'TASK_ACTIONS the Exec action has no Command or no Arguments') }
     $split = Split-TaskArguments -Text $argNode.InnerText
-    if (-not $split.ok) { return $false }
-    return (Test-HostArgvRunsScript -Exe $cmdNode.InnerText -Tokens @($split.tokens) -AgentScript $AgentScript)
+    if (-not $split.ok) { return (& $no 'TASK_ARGUMENTS_UNREADABLE the Arguments cannot be split the way the process receives them') }
+    $u = Get-UnwrappedHostCommand -Exe $cmdNode.InnerText -Tokens @($split.tokens)
+    if (-not $u.ok) { return (& $no $u.why) }
+    if (-not (Test-HostArgvRunsScript -Exe $u.exe -Tokens @($u.tokens) -AgentScript $AgentScript)) {
+        $where = $(if ($u.wrapped) { 'the PowerShell host after the wrapper''s --' } else { 'the PowerShell host' })
+        return (& $no "TASK_HOST_ARGV $where does not run -File $AgentScript for this root with the allowed host options (-NoProfile and -ExecutionPolicy required)")
+    }
+    return [pscustomobject]@{ ok = $true; wrapped = [bool]$u.wrapped; why = $null }
+}
+
+function Get-UnwrappedHostCommand {
+    # The PowerShell host a task action starts, read through the one wrapper form. Returns @{ ok; wrapped; exe; tokens; why }.
+    #   <Command> pwsh/powershell                     -> that host and its arguments (wrapped = false)
+    #   <Command> $script:HiddenWrapperPath           -> the wrapper's own flags (an allowlist: --stdout/--stderr <absolute path>,
+    #                                                    --label <name>, each once), then `--`, then a pwsh/powershell host and its
+    #                                                    arguments (wrapped = true)
+    # Anything else refuses with a typed reason: another command (TASK_NOT_HOST), an mlv-hidden.exe anywhere but the tracked path
+    # (TASK_WRAPPER_PATH), a wrapper flag outside the allowlist or without its value (TASK_WRAPPER_FLAG), no `--` (TASK_WRAPPER_NO_SEPARATOR),
+    # or a command after `--` that is not a PowerShell host (TASK_WRAPPER_NOT_HOST). The flags are matched exactly (ordinal): a spelling
+    # the wrapper might read differently is refused, never guessed at.
+    param([string]$Exe, [string[]]$Tokens)
+    $no = { param($why) [pscustomobject]@{ ok = $false; wrapped = $false; exe = $null; tokens = @(); why = $why } }
+    $hostLeaf = '(?i)\A(pwsh|powershell)(\.exe)?\z'
+    $plain = $Exe.Trim().Trim('"')
+    if ($plain -match '[\x00-\x1f\x7f]') { return (& $no 'TASK_NOT_HOST the Command holds a control character') }
+    $leaf = [regex]::Match($plain, '[^\\/]+\z').Value
+    if ($leaf -match $hostLeaf) { return [pscustomobject]@{ ok = $true; wrapped = $false; exe = $Exe; tokens = @($Tokens); why = $null } }
+    if ($leaf -notmatch '(?i)\Amlv-hidden(\.exe)?\z') { return (& $no "TASK_NOT_HOST the Command $plain is neither a PowerShell host nor the wrapper $($script:HiddenWrapperPath)") }
+    if (-not (Test-SamePath -A $plain -B $script:HiddenWrapperPath)) { return (& $no "TASK_WRAPPER_PATH the wrapper $plain is not the tracked wrapper $($script:HiddenWrapperPath)") }
+    $tokens = @($Tokens)
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $i = 0
+    while ($true) {
+        if ($i -ge $tokens.Count) { return (& $no 'TASK_WRAPPER_NO_SEPARATOR the wrapper arguments have no -- before the command it starts') }
+        $t = [string]$tokens[$i]
+        if ($t -match '[\x00-\x1f\x7f]') { return (& $no 'TASK_WRAPPER_FLAG a wrapper argument holds a control character') }
+        if ([string]::Equals($t, '--', [System.StringComparison]::Ordinal)) { $i++; break }
+        $m = [regex]::Match($t, '\A--([a-z]+)\z')
+        $name = $(if ($m.Success) { $m.Groups[1].Value } else { '' })
+        $known = $false
+        foreach ($f in $script:HiddenWrapperFlags) { if ([string]::Equals($f, $name, [System.StringComparison]::Ordinal)) { $known = $true } }
+        if (-not $known) { return (& $no "TASK_WRAPPER_FLAG the wrapper argument '$t' is not one of --stdout, --stderr, --label") }
+        if (-not $seen.Add($name)) { return (& $no "TASK_WRAPPER_FLAG the wrapper flag --$name is given twice") }
+        if ($i + 1 -ge $tokens.Count) { return (& $no "TASK_WRAPPER_FLAG the wrapper flag --$name has no value") }
+        $v = [string]$tokens[$i + 1]
+        if ($v -match '[\x00-\x1f\x7f]') { return (& $no "TASK_WRAPPER_FLAG the value of --$name holds a control character") }
+        if ([string]::Equals($name, 'label', [System.StringComparison]::Ordinal)) {
+            if ($v -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z') { return (& $no "TASK_WRAPPER_FLAG the --label value '$v' is not a plain name") }
+        }
+        elseif (-not (Test-AbsolutePathText -P $v)) { return (& $no "TASK_WRAPPER_FLAG the --$name value '$v' is not an absolute path") }
+        $i += 2
+    }
+    if ($i -ge $tokens.Count) { return (& $no 'TASK_WRAPPER_NOT_HOST the wrapper starts nothing after --') }
+    $hostExe = [string]$tokens[$i]
+    $hostPlain = $hostExe.Trim().Trim('"')
+    if ([regex]::Match($hostPlain, '[^\\/]+\z').Value -notmatch $hostLeaf) { return (& $no "TASK_WRAPPER_NOT_HOST the wrapper starts $hostPlain, not a PowerShell host") }
+    $rest = @(); if ($i + 1 -lt $tokens.Count) { $rest = @($tokens[($i + 1)..($tokens.Count - 1)]) }
+    return [pscustomobject]@{ ok = $true; wrapped = $true; exe = $hostExe; tokens = $rest; why = $null }
+}
+
+function Get-ChildProcesses {
+    # The processes whose parent is $ProcessId, read from the OS (Win32_Process on Windows, /proc/<pid>/stat elsewhere): @{ pid; name }.
+    # Throws when the OS cannot be asked (the caller reads that as unconfirmed, never as "no child").
+    param([int]$ProcessId)
+    $out = [System.Collections.Generic.List[object]]::new()
+    if ($script:OnWindows) {
+        foreach ($c in @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction Stop)) {
+            if ($null -eq $c) { continue }
+            $out.Add([pscustomobject]@{ pid = [int]$c.ProcessId; name = [string]$c.Name })
+        }
+        # unrolled on purpose: the caller collects with @(), and a wrapped array would read as ONE child whose name is every name
+        return $out.ToArray()
+    }
+    foreach ($d in [System.IO.Directory]::EnumerateDirectories('/proc')) {
+        $leaf = [System.IO.Path]::GetFileName($d)
+        if ($leaf -notmatch '\A[0-9]+\z') { continue }
+        try { $stat = [System.IO.File]::ReadAllText("$d/stat") } catch { continue }
+        # "<pid> (<comm>) <state> <ppid> ...": comm may hold spaces and parentheses, so the fields follow the LAST ')'
+        $open = $stat.IndexOf('('); $close = $stat.LastIndexOf(')')
+        if ($open -lt 0 -or $close -lt $open -or ($close + 2) -ge $stat.Length) { continue }
+        $fields = $stat.Substring($close + 2).Split(' ')
+        if ($fields.Count -lt 2) { continue }
+        $ppid = 0
+        if (-not [int]::TryParse($fields[1], [ref]$ppid) -or $ppid -ne $ProcessId) { continue }
+        $out.Add([pscustomobject]@{ pid = [int]$leaf; name = $stat.Substring($open + 1, $close - $open - 1) })
+    }
+    return $out.ToArray()
+}
+
+function Resolve-TaskAgentPid {
+    # Which process is the AGENT of the task's running instance. Returns @{ ok; agentPid; instancePid; instanceStart; why }.
+    # Exactly one running instance, always. Unwrapped, the instance's process IS the agent. Wrapped, the instance's process is the
+    # wrapper, and the agent is its ONE live PowerShell child (pwsh/powershell, started at or after the wrapper, so a child of an earlier
+    # process that held the same pid does not count): no such child, or two or more, is a typed refusal (INSTANCE_NO_AGENT_CHILD,
+    # INSTANCE_AGENT_CHILDREN), never a guess. instanceStart is the OS start of the instance's process (the stop is handed it).
+    # Wrapped, the instance's OWN command line (read from the OS) must start the tracked wrapper and, after its first `--`, a host that
+    # runs -File <AgentScript> for this root (INSTANCE_NOT_WRAPPER): an instance started from an older definition is not trusted on the
+    # strength of the current one. The census is taken TWICE around the start reads, and the instance and the child must be the same
+    # processes (pid and OS start) both times (INSTANCE_CHANGED): a pid reused between the listing and the read is not the child.
+    # agentStart is the OS start of the child as read here; the callers hold the heartbeat pid to it exactly.
+    # A read that THROWS (Process.StartTime of a process that exited after it was listed, or any other read of a process) is never an
+    # answer: the whole resolve is the typed refusal INSTANCE_CHANGED (Resolve-TaskAgentPidReads does the reads), so the binding refuses
+    # and the replacement poll is unconfirmed (DEPLOY_RESTART_FAILED at its deadline), never an unhandled DEPLOY_ERROR.
+    param($InstancePids, [bool]$Wrapped, [string]$AgentScript = '')
+    try { return (Resolve-TaskAgentPidReads -InstancePids $InstancePids -Wrapped $Wrapped -AgentScript $AgentScript) }
+    catch {
+        return [pscustomobject]@{ ok = $false; agentPid = 0; instancePid = 0; instanceStart = $null; agentStart = $null
+            why = "INSTANCE_CHANGED a process of the running instance of task $TaskName exited or could not be read while it was read, so it is not confirmed: $($_.Exception.Message)" }
+    }
+}
+
+function Resolve-TaskAgentPidReads {
+    # The reads of Resolve-TaskAgentPid (see there); it may throw, and only Resolve-TaskAgentPid calls it.
+    param($InstancePids, [bool]$Wrapped, [string]$AgentScript = '')
+    $no = { param($why) [pscustomobject]@{ ok = $false; agentPid = 0; instancePid = 0; instanceStart = $null; agentStart = $null; why = $why } }
+    $p = @($InstancePids)
+    if ($p.Count -ne 1) { return (& $no "task $TaskName has $($p.Count) running instance(s) ($($p -join ',')), not exactly one; the stop would not act on the agent that was checked") }
+    $inst = [int]$p[0]
+    $proc = Get-LiveProcess -ProcessId $inst
+    if (-not $Wrapped) {
+        $st = $(if ($null -ne $proc) { $proc.StartTime.ToUniversalTime().ToString('o') } else { $null })
+        return [pscustomobject]@{ ok = $true; agentPid = $inst; instancePid = $inst; instanceStart = $st; why = $null }
+    }
+    if ($null -eq $proc) { return (& $no "INSTANCE_GONE the wrapper instance pid=$inst of task $TaskName is not a running process") }
+    $instStart = $proc.StartTime.ToUniversalTime()
+    try { $instArgv = Get-ProcessArgv -ProcessId $inst } catch { $instArgv = $null }
+    if ($null -eq $instArgv -or -not $instArgv.ok) { return (& $no "INSTANCE_ARGV_UNREADABLE the command line of wrapper instance pid=$inst could not be read, so it is not confirmed to be the wrapper") }
+    if (-not (Test-WrapperInstanceArgv -Argv $instArgv -AgentScript $AgentScript)) {
+        return (& $no "INSTANCE_NOT_WRAPPER the running instance pid=$inst of task $TaskName was not started as $($script:HiddenWrapperPath) -- <a host running -File $AgentScript for this root>")
+    }
+    $sameStart = { param($pp, $at) ($null -ne $pp) -and ([Math]::Abs(($pp.StartTime.ToUniversalTime() - $at).TotalMilliseconds) -le $script:OsStartToleranceMs) }
+    try { $kids = @(Get-ChildProcesses -ProcessId $inst) }
+    catch { return (& $no "INSTANCE_CHILDREN_UNREADABLE the children of wrapper instance pid=${inst} could not be read: $($_.Exception.Message)") }
+    $agents = @(); $agentStarts = @{}
+    foreach ($k in $kids) {
+        if ([regex]::Match([string]$k.name, '[^\\/]+\z').Value -notmatch '(?i)\A(pwsh|powershell)(\.exe)?\z') { continue }
+        $kp = Get-LiveProcess -ProcessId ([int]$k.pid)
+        if ($null -eq $kp) { continue }
+        $ks = $kp.StartTime.ToUniversalTime()
+        if ($ks -lt $instStart.AddMilliseconds(-1 * $script:OsStartToleranceMs)) { continue }
+        $agents += [int]$k.pid
+        $agentStarts[[int]$k.pid] = $ks
+    }
+    if ($agents.Count -eq 0) { return (& $no "INSTANCE_NO_AGENT_CHILD the wrapper instance pid=$inst of task $TaskName has no PowerShell child, so no agent process is matched to it") }
+    if ($agents.Count -gt 1) { return (& $no "INSTANCE_AGENT_CHILDREN the wrapper instance pid=$inst of task $TaskName has $($agents.Count) PowerShell children ($($agents -join ',')), not exactly one") }
+    $agent = [int]$agents[0]
+    $agentStart = $agentStarts[$agent]
+    # the second census, AFTER the start reads: the child is still listed under this instance, and both are still the processes read above
+    try { $again = @(Get-ChildProcesses -ProcessId $inst) }
+    catch { return (& $no "INSTANCE_CHILDREN_UNREADABLE the children of wrapper instance pid=${inst} could not be read again: $($_.Exception.Message)") }
+    # ... and it is STILL the only live PowerShell child (the same filter as the first census): a second one that appeared meanwhile
+    # makes the cardinality unproved, so it refuses like two children do
+    $still = $false; $hostKids = 0
+    foreach ($k in $again) {
+        if ([regex]::Match([string]$k.name, '[^\\/]+\z').Value -notmatch '(?i)\A(pwsh|powershell)(\.exe)?\z') { continue }
+        $kp2 = Get-LiveProcess -ProcessId ([int]$k.pid)
+        if ($null -eq $kp2 -or $kp2.StartTime.ToUniversalTime() -lt $instStart.AddMilliseconds(-1 * $script:OsStartToleranceMs)) { continue }
+        $hostKids++
+        if ([int]$k.pid -eq $agent) { $still = $true }
+    }
+    if (-not $still -or $hostKids -ne 1 -or -not (& $sameStart (Get-LiveProcess -ProcessId $inst) $instStart) -or -not (& $sameStart (Get-LiveProcess -ProcessId $agent) $agentStart)) {
+        return (& $no "INSTANCE_CHANGED the wrapper instance pid=$inst or its agent child pid=$agent changed while it was read (exited, or the pid now names another process)")
+    }
+    return [pscustomobject]@{ ok = $true; agentPid = $agent; instancePid = $inst; instanceStart = $instStart.ToString('o'); agentStart = $agentStart.ToString('o'); why = $null }
+}
+
+function Test-WrapperInstanceArgv {
+    # The LIVE wrapper instance's own argv (Get-ProcessArgv: executable first) starts the tracked wrapper, and after its first `--` a
+    # PowerShell host whose argv runs -File <AgentScript> for this root (Test-HostArgvRunsScript). The wrapper's own flags are checked in
+    # the definition (Get-UnwrappedHostCommand); here they are not re-read, since they name only its logs and label, not what it starts.
+    param($Argv, [string]$AgentScript)
+    if ($null -eq $Argv -or -not $Argv.ok) { return $false }
+    $all = @($Argv.tokens)
+    if ($all.Count -lt 3) { return $false }
+    $exe = ([string]$all[0]).Trim().Trim('"')
+    if ($exe -match '[\x00-\x1f\x7f]' -or -not (Test-SamePath -A $exe -B $script:HiddenWrapperPath)) { return $false }
+    $k = -1
+    for ($j = 1; $j -lt $all.Count; $j++) { if ([string]::Equals([string]$all[$j], '--', [System.StringComparison]::Ordinal)) { $k = $j; break } }
+    if ($k -lt 0 -or $k + 1 -ge $all.Count) { return $false }
+    $rest = @(); if ($k + 2 -lt $all.Count) { $rest = @($all[($k + 2)..($all.Count - 1)]) }
+    return (Test-HostArgvRunsScript -Exe ([string]$all[$k + 1]) -Tokens $rest -AgentScript $AgentScript)
+}
+
+function Resolve-TaskAgentPidBounded {
+    # Resolve-TaskAgentPid under the read deadline (WMI can stall); no answer is a typed refusal, never a hang with the lock held.
+    param($InstancePids, [bool]$Wrapped, [string]$AgentScript = '')
+    $r = Invoke-Bounded -Script { Resolve-TaskAgentPid -InstancePids $Ip -Wrapped $W -AgentScript $As } -TimeoutMs ($script:ReadTimeoutSec * 1000) -Variables @{ Ip = @($InstancePids); W = $Wrapped; As = $AgentScript }
+    if ($r.timedOut) { return [pscustomobject]@{ ok = $false; agentPid = 0; instancePid = 0; instanceStart = $null; why = "INSTANCE_CHILDREN_UNREADABLE reading the agent process of task $TaskName did not answer within $($script:ReadTimeoutSec) s" } }
+    if ($null -ne $r.error -or $null -eq $r.value) { return [pscustomobject]@{ ok = $false; agentPid = 0; instancePid = 0; instanceStart = $null; why = "INSTANCE_CHILDREN_UNREADABLE reading the agent process of task $TaskName failed: $($r.error)" } }
+    return $r.value
+}
+
+function Test-ReplacementIsTaskAgent {
+    # ONE poll of "the restart is confirmed": a fresh heartbeat from a different process than $Before, that is the agent of the task's
+    # ONE running instance (Resolve-TaskAgentPid: the instance itself, or with -Wrapped its single PowerShell child), and that passes
+    # Test-NewHeartbeatIsLiveAgent (this host, this script and root, its own command line, started at or after /Run). Wrapped, the
+    # instance must be a NEW wrapper too: its own process started at or after /Run, so the old wrapper never counts.
+    param($Before, [string]$AgentScript, $RunAt, [bool]$Wrapped)
+    $now = Read-Heartbeat
+    if (($null -eq $now) -or ($now.ageSec -ge 30) -or -not (Test-BeatIsDifferentProcess -Old $Before -New $now)) { return $false }
+    $tp = Get-TaskRunningPids
+    if (-not $tp.ok) { return $false }
+    $map = Resolve-TaskAgentPid -InstancePids $tp.pids -Wrapped $Wrapped -AgentScript $AgentScript
+    if (-not $map.ok) { return $false }
+    if ($Wrapped) {
+        try { if ((ConvertTo-UtcStart -Text ([string]$map.instanceStart)) -lt ([datetime]$RunAt).ToUniversalTime()) { return $false } }
+        catch { return $false }
+    }
+    if (-not (Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $RunAt -CheckCommandLine -TaskPids @([int]$map.agentPid))) { return $false }
+    if ($Wrapped) {
+        # the heartbeat pid is STILL the child the census read (same OS start), not a process that reused its pid after the census
+        try {
+            $lp = Get-LiveProcess -ProcessId ([int]$now.pid)
+            if ($null -eq $lp -or [Math]::Abs(($lp.StartTime.ToUniversalTime() - (ConvertTo-UtcStart -Text ([string]$map.agentStart))).TotalMilliseconds) -gt $script:OsStartToleranceMs) { return $false }
+        }
+        catch { return $false }
+    }
+    return $true
 }
 
 function Test-HostArgvRunsScript {
@@ -863,10 +1103,21 @@ function Stop-TaskInstanceByPid {
     #   'not-stopped'  Stop() was never called: no instance with that pid and start, the venue was busy (busy = the refusal lines), or the
     #                  scheduler failed BEFORE the call
     #   'unknown'      Stop() was called and raised: whether it was applied is not known, so the caller re-observes the pid
-    param([int]$ProcessId, [string]$StartText)
+    # With -ChildPid (a wrapped task: $ProcessId is the wrapper instance, the agent is its proved PowerShell child) the child's proved OS
+    # start $ChildStartText must be given, but the child itself is NOT checked before Stop(): a child that is already gone (or whose pid
+    # another process now holds) does not block stopping the wrapper. After Stop() the child is ended only if the process under its pid
+    # is STILL the proved child (pid AND OS start, read through the one handle Kill() then uses): stopping the wrapper need not end its
+    # child, and the child is the agent that holds the single-instance mutex. Anything else under that pid is left alone.
+    param([int]$ProcessId, [string]$StartText, [int]$ChildPid = 0, [string]$ChildStartText = '')
     $notStopped = { param($why, $busy = $null) [pscustomobject]@{ outcome = 'not-stopped'; why = $why; busy = $busy } }
+    $isProved = { param($proc, $text) [Math]::Abs(($proc.StartTime.ToUniversalTime() - (ConvertTo-UtcStart -Text $text)).TotalMilliseconds) -le $script:OsStartToleranceMs }
     try {
         if ([string]::IsNullOrWhiteSpace($StartText)) { return (& $notStopped 'the proved start time of the agent is missing, so no instance can be identified') }
+        if ($ChildPid -gt 0) {
+            if ([string]::IsNullOrWhiteSpace($ChildStartText)) { return (& $notStopped "the proved start time of the agent child pid=$ChildPid is missing, so the child cannot be identified") }
+            # the proved child already gone (no process under its pid, or one with another start: a reuse) is fine: the wrapper is still
+            # stopped, and after Stop() only a process that is STILL the proved child is ended (never whatever holds the pid now)
+        }
         $mine = $null
         $want = '\' + $TaskName.TrimStart('\')
         foreach ($rt in @(Get-RunningTaskInstances)) {
@@ -888,6 +1139,16 @@ function Stop-TaskInstanceByPid {
     catch { return (& $notStopped "looking for the instance failed: $($_.Exception.Message)") }
     try { $mine.Stop() }
     catch { return [pscustomobject]@{ outcome = 'unknown'; why = "IRunningTask.Stop raised: $($_.Exception.Message)"; busy = $null } }
+    if ($ChildPid -gt 0) {
+        # the wrapper instance is stopped; end its agent child by the proved pid and start (a pid reused since is another process)
+        try {
+            $child = Get-LiveProcess -ProcessId $ChildPid
+            # the handle is opened FIRST and kept by the Process object: the start check and Kill() then act on that one handle, and
+            # an open handle keeps the pid from being reused in between (two separate opens by pid could reach two processes)
+            if ($null -ne $child -and $null -ne $child.Handle -and (& $isProved $child $ChildStartText)) { $child.Kill() }
+        }
+        catch { return [pscustomobject]@{ outcome = 'unknown'; why = "the wrapper instance was stopped, but ending its agent child pid=$ChildPid raised: $($_.Exception.Message)"; busy = $null } }
+    }
     return [pscustomobject]@{ outcome = 'stopped'; why = $null; busy = $null }
 }
 
@@ -895,8 +1156,8 @@ function Stop-TaskInstanceBounded {
     # Stop-TaskInstanceByPid under a deadline (the scheduler can stall). The deadline covers the lookup, the idle read and Stop(), so a
     # timeout cannot tell whether Stop() ran: it is 'unknown', never "nothing was stopped" (a COM call that outlives the deadline may
     # still have been applied). The caller re-observes the pid.
-    param([int]$ProcessId, [string]$StartText)
-    $r = Invoke-Bounded -Script { Stop-TaskInstanceByPid -ProcessId $ProcId -StartText $StartAt } -TimeoutMs 60000 -Variables @{ ProcId = $ProcessId; StartAt = $StartText }
+    param([int]$ProcessId, [string]$StartText, [int]$ChildPid = 0, [string]$ChildStartText = '')
+    $r = Invoke-Bounded -Script { Stop-TaskInstanceByPid -ProcessId $ProcId -StartText $StartAt -ChildPid $KidPid -ChildStartText $KidStart } -TimeoutMs 60000 -Variables @{ ProcId = $ProcessId; StartAt = $StartText; KidPid = $ChildPid; KidStart = $ChildStartText }
     if ($r.timedOut) { return [pscustomobject]@{ outcome = 'unknown'; why = 'the Task Scheduler did not answer the stop within 60 s'; busy = $null } }
     if ($null -ne $r.error -or $null -eq $r.value) { return [pscustomobject]@{ outcome = 'unknown'; why = "the stop returned no answer ($($r.error))"; busy = $null } }
     return $r.value
@@ -941,15 +1202,37 @@ function Get-RestartBindingRefusal {
     }
     $x = Get-TaskXml
     if (-not $x.ok) { return $x.why }
-    if (-not (Test-TaskXmlRunsScript -Xml $x.xml -AgentScript $AgentScript)) {
-        return "task $TaskName does not run -File $AgentScript in an executable action; ending it would stop a different agent"
+    $tb = Get-TaskXmlBinding -Xml $x.xml -AgentScript $AgentScript
+    if (-not $tb.ok) {
+        return "task $TaskName does not run -File $AgentScript in an executable action; ending it would stop a different agent ($($tb.why))"
     }
-    # the pid the heartbeat names must be the pid of the task's RUNNING instance: End stops that instance and no other, so a process in
-    # another session that writes a matching heartbeat (and a task instance serving a different root) must not satisfy this
+    # the pid the heartbeat names must be the AGENT of the task's RUNNING instance: the stop acts on that instance and no other, so a
+    # process in another session that writes a matching heartbeat (and a task instance serving a different root) must not satisfy this.
+    # Unwrapped, the agent is the instance's own process; wrapped, it is the wrapper instance's single PowerShell child.
     $running = Get-TaskRunningPidsBounded
     if ($null -eq $running) { return "task $TaskName running instances could not be read from the Task Scheduler, so the process it would end is unconfirmed" }
-    if (@($running).Count -ne 1) { return "task $TaskName has $(@($running).Count) running instance(s) ($(@($running) -join ',')), not exactly one; the stop would not act on the agent that was checked" }
-    if ([int]$running[0] -ne [int]$beat.pid) { return "task $TaskName is running pid=$($running[0]), not heartbeat pid=$($beat.pid): the live agent that was checked is not the task instance that ending the task would stop" }
+    $map = Resolve-TaskAgentPidBounded -InstancePids @($running) -Wrapped ([bool]$tb.wrapped) -AgentScript $AgentScript
+    if (-not $map.ok) { return $map.why }
+    if ($tb.wrapped -and [int]$map.agentPid -eq [int]$beat.pid) {
+        # the child the census read must be the process the heartbeat pid named at the OS start read above (osStart), not a reuse of it
+        try {
+            if ([Math]::Abs(((ConvertTo-UtcStart -Text ([string]$map.agentStart)) - (ConvertTo-UtcStart -Text ([string]$beat.osStart))).TotalMilliseconds) -gt $script:OsStartToleranceMs) {
+                return "INSTANCE_CHANGED heartbeat pid=$($beat.pid) is not the same process as the agent child the census read (its OS start differs)"
+            }
+        }
+        catch { return "INSTANCE_CHANGED the OS start of agent child pid=$($map.agentPid) could not be compared: $($_.Exception.Message)" }
+    }
+    if ([int]$map.agentPid -ne [int]$beat.pid) {
+        if ($tb.wrapped) { return "task $TaskName wrapper instance pid=$($map.instancePid) runs agent child pid=$($map.agentPid), not heartbeat pid=$($beat.pid): the live agent that was checked is not the task instance that the stop would end" }
+        return "task $TaskName is running pid=$($map.instancePid), not heartbeat pid=$($beat.pid): the live agent that was checked is not the task instance that ending the task would stop"
+    }
+    if ($tb.wrapped) {
+        # the stop acts on the WRAPPER instance (its pid and its OS start) and then on the agent child (the heartbeat pid and its osStart)
+        if ([string]::IsNullOrWhiteSpace([string]$map.instanceStart)) { return "the OS start time of wrapper instance pid=$($map.instancePid) could not be read" }
+        Add-Member -InputObject $beat -NotePropertyName wrapped -NotePropertyValue $true -Force
+        Add-Member -InputObject $beat -NotePropertyName instancePid -NotePropertyValue ([int]$map.instancePid) -Force
+        Add-Member -InputObject $beat -NotePropertyName instanceOsStart -NotePropertyValue ([string]$map.instanceStart) -Force
+    }
     $script:BoundBeat = $beat
     return $null
 }
@@ -983,7 +1266,13 @@ function Invoke-AgentRestart {
     $clockUtc0 = [DateTime]::UtcNow
     $clockWatch = [System.Diagnostics.Stopwatch]::StartNew()
     # the start handed to the stop is the one the OS reported for the pid at the binding (osStart), compared with a tight tolerance there
-    $stop = Stop-TaskInstanceBounded -ProcessId $before.pid -StartText $(if (-not [string]::IsNullOrWhiteSpace([string]$before.osStart)) { [string]$before.osStart } else { [string]$before.start })
+    $agentStart = $(if (-not [string]::IsNullOrWhiteSpace([string]$before.osStart)) { [string]$before.osStart } else { [string]$before.start })
+    $stopArgs = @{ ProcessId = [int]$before.pid; StartText = $agentStart }
+    # a wrapped task: the instance the scheduler stops is the wrapper; its agent child (the heartbeat pid) is ended after it
+    if ($null -ne $before.PSObject.Properties['wrapped'] -and [bool]$before.wrapped) {
+        $stopArgs = @{ ProcessId = [int]$before.instancePid; StartText = [string]$before.instanceOsStart; ChildPid = [int]$before.pid; ChildStartText = $agentStart }
+    }
+    $stop = Stop-TaskInstanceBounded @stopArgs
     if ([string]::Equals([string]$stop.outcome, 'not-stopped', [System.StringComparison]::Ordinal)) {
         if ($null -ne $stop.busy) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $(@($stop.busy) -join '; ')"; warn = $null } }
         return @{ why = "could not stop agent pid=$($before.pid); nothing was stopped: $($stop.why)"; warn = $null }
@@ -1009,20 +1298,20 @@ function Invoke-AgentRestart {
     # root (the old agent is down: said so)
     $nowXml = Get-TaskXml
     if (-not $nowXml.ok) { return @{ why = "the old agent is stopped but the task was NOT started: $($nowXml.why)"; warn = $warn } }
-    if (-not (Test-TaskXmlRunsScript -Xml $nowXml.xml -AgentScript $AgentScript)) {
-        return @{ why = "the old agent is stopped but the task was NOT started: its definition changed and no longer runs -File $AgentScript for this root"; warn = $warn }
+    $nowBind = Get-TaskXmlBinding -Xml $nowXml.xml -AgentScript $AgentScript
+    if (-not $nowBind.ok) {
+        return @{ why = "the old agent is stopped but the task was NOT started: its definition changed and no longer runs -File $AgentScript for this root ($($nowBind.why))"; warn = $warn }
     }
     $runAt = Get-RunLowerBound -Utc0 $clockUtc0 -Watch $clockWatch
     $run = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName) -TimeoutSec 30
     if ($run.timedOut) { return @{ why = "schtasks /Run $TaskName did not return within 30 s"; warn = $warn } }
     if ($run.exitCode -ne 0) { return @{ why = "schtasks /Run $TaskName exited $($run.exitCode)"; warn = $warn } }
-    $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript; runAt = $runAt } -Condition {
-        $now = Read-Heartbeat
-        if (($null -eq $now) -or ($now.ageSec -ge 30) -or -not (Test-BeatIsDifferentProcess -Old $before -New $now)) { return $false }
-        # the replacement is the task's own new instance (not just a process that wrote a heartbeat), and it runs this script and root
-        $tp = Get-TaskRunningPids
-        if (-not $tp.ok) { return $false }
-        Test-NewHeartbeatIsLiveAgent -Beat $now -AgentScript $AgentScript -NotBeforeUtc $runAt -CheckCommandLine -TaskPids $tp.pids
+    # the replacement is the task's own new instance (not just a process that wrote a heartbeat) or, wrapped, the single PowerShell child
+    # of a NEW wrapper instance, and it runs this script and root (Test-ReplacementIsTaskAgent). A poll whose read throws (a process
+    # that exits while it is read) is UNCONFIRMED, never confirmation and never a throw out of Wait-Until: the restart then ends
+    # DEPLOY_RESTART_FAILED at the deadline, not DEPLOY_ERROR (which says a write failed before the swap finished)
+    $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript; runAt = $runAt; wrapped = [bool]$nowBind.wrapped } -Condition {
+        try { Test-ReplacementIsTaskAgent -Before $before -AgentScript $AgentScript -RunAt $runAt -Wrapped $wrapped } catch { $false }
     } -PollMs 1000
     if (-not $up) { return @{ why = 'no heartbeat from a new LIVE agent process within 60 s of schtasks /Run'; warn = $warn } }
     if (Test-ClockStepped -Utc0 $clockUtc0 -Watch $clockWatch) {
