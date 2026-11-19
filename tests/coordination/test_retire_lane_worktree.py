@@ -4764,8 +4764,12 @@ _PROBE_KEYWORDS = {"if", "elseif", "else", "foreach", "for", "while", "do", "unt
 def _gui_smoke_log_probe_command_words(body: str) -> set:
     """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary 0a7510a1 A2): every bare word in COMMAND POSITION (a line or statement start, after a pipe, an
     open brace or parenthesis, or an assignment), lowercased, keywords left out, so an alias (`ni`, `sc`, `rm`) is a command like its cmdlet name. The
-    hyphenated-name regex alone missed every alias."""
+    hyphenated-name regex alone missed every alias.
+
+    -2 r3 (adversary 7643a514 A2): a block comment (`<#x#> ni ...`) is blank space to PowerShell, so it is blanked before the scan (a word behind it is
+    in command position); _gui_smoke_log_probe_purity_problems also refuses any block comment, since the probe has none."""
     words = set()
+    body = re.sub(r"(?s)<#.*?#>", " ", body)
     for m in re.finditer(r"(?m)(?:^|[;|{(=])[ \t]*([A-Za-z][\w-]*)", body):
         word = m.group(1).lower()
         if word not in _PROBE_KEYWORDS:
@@ -4807,6 +4811,9 @@ def _gui_smoke_log_probe_purity_problems(body: str) -> list:
     # shape above misses it. The probe has no escape at all, so any backtick is refused.
     if "`" in body:
         problems.append("escape character")
+    # -2 r3 (adversary 7643a514 A2): a block comment can move a word out of every raw-text position above; the probe has none, so any is refused
+    if "<#" in body:
+        problems.append("block comment")
     return problems
 
 
@@ -4859,6 +4866,10 @@ def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_wr
         "set-content alias after a pipe": "'overwritten' | sc -LiteralPath $file.FullName\n",
         "remove-item alias in a subexpression": "$null = (rm $file.FullName)\n",
         "remove-item alias assigned": "$gone = del $file.FullName\n",
+        # -2 r3 (adversary 7643a514 A2): a block comment before the word hid it from command position
+        "new-item alias behind a block comment": "<#x#> ni -Path $file.FullName -ItemType File -Force\n",
+        "set-content alias behind a block comment after a statement": "$null = 1; <#x#> sc -LiteralPath $file.FullName -Value 'x'\n",
+        "remove-item alias behind a multi-line block comment": "<#\nx\n#> rm $file.FullName\n",
     }
     for label, injected in mutations.items():
         mutated = body.replace(anchor, anchor + injected, 1)

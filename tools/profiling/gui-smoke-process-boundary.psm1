@@ -617,9 +617,12 @@ function Wait-GuiSmokeProcessBounded {
     }
     else { $TimeoutMs }
     $waitMs = if ($NoProgressStalled) { 1 } else { $budgetWaitMs }
+    # -2 r3 (adversary 7643a514 A1): the wait this call selected and started (1 on a stall verdict), 0 when none started (the deadline was already reached)
+    $finalWaitMs = 0
 
     try {
         if (-not $DeadlineReached) {
+            $finalWaitMs = $waitMs
             $terminationConfirmed = $Process.WaitForExit($waitMs)
             if ($terminationConfirmed) {
                 $exitObservedTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp(); $exitObservedAtUtc = [datetime]::UtcNow
@@ -746,9 +749,9 @@ function Wait-GuiSmokeProcessBounded {
 
     [pscustomobject]@{
         timedOut = $timedOut
-        # the WHOLE budget (VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1); finalWaitMs is the remainder this call itself waited
+        # the WHOLE budget (VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1); finalWaitMs is the wait this call itself selected and started (0 = none)
         timeoutMs = $reportedTimeoutMs
-        finalWaitMs = $budgetWaitMs
+        finalWaitMs = $finalWaitMs
         outcome = $(if ($noProgress) { 'process_no_progress' } elseif ($timedOut) { 'timeout' } elseif ($exitTimeUncertain) { 'exit_time_uncertain' } else { 'exited' })
         exitTimeUncertain = [bool]($exitTimeUncertain -and -not $timedOut)
         noProgress = $noProgress

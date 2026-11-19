@@ -69,6 +69,21 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
         self.assertEqual(124, out["exitCode"])
         self.assertTrue(out["hasExited"])
 
+    def test_final_wait_records_the_wait_this_call_selected_not_the_budget(self) -> None:
+        # -2 r3 (adversary 7643a514 A1): a stall verdict waits 1 ms and a reached deadline waits not at all, so finalWaitMs is 1 and 0 there, never the
+        # budget remainder the call did not wait (600000 for both before)
+        out = run_ps(r"""
+$s1 = New-Stub 'Start-Sleep -Seconds 120'
+$stalled = Wait-GuiSmokeProcessBounded -Process $s1.p -StandardOutputTask $s1.o -StandardErrorTask $s1.e -TimeoutMs 600000 -ReportedTimeoutMs 600000 -NoProgressStalled -NoProgressWindowMs 1500
+$s2 = New-Stub 'Start-Sleep -Seconds 120'
+$deadline = Wait-GuiSmokeProcessBounded -Process $s2.p -StandardOutputTask $s2.o -StandardErrorTask $s2.e -TimeoutMs 600000 -ReportedTimeoutMs 600000 -DeadlineReached
+[pscustomobject]@{ stalled = $stalled.finalWaitMs; stalledOutcome = $stalled.outcome; deadline = $deadline.finalWaitMs; deadlineOutcome = $deadline.outcome } | ConvertTo-Json -Compress
+""")
+        self.assertEqual("process_no_progress", out["stalledOutcome"])
+        self.assertEqual(1, out["stalled"], "a stall verdict waits 1 ms: " + repr(out))
+        self.assertEqual("timeout", out["deadlineOutcome"])
+        self.assertEqual(0, out["deadline"], "no wait starts once the deadline is reached: " + repr(out))
+
     def test_without_a_reported_budget_the_wait_time_is_still_the_reported_timeout(self) -> None:
         out = run_ps(r"""
 $s = New-Stub 'Start-Sleep -Seconds 120'
