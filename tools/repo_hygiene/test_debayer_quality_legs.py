@@ -234,6 +234,43 @@ class DebayerQualityJobTests(unittest.TestCase):
                 self.assertIn("REFUSED DUAL_VENUE_EXPORT_QUALITY_INVALID", proc.stdout, proc.stdout + proc.stderr)
                 self.assertIn(want, proc.stdout)
 
+    def test_a_format_spelled_in_another_case_is_still_a_prores_export(self) -> None:
+        # adversary r1 A5: the ValidateSet admits -Format ProRes (case-insensitive), and the job compares `$Format -eq 'prores'`; the quality check said "not prores"
+        with tempfile.TemporaryDirectory() as d:
+            qf = Path(d) / "q.json"
+            qf.write_text(json.dumps(QUALITY), encoding="utf-8")
+            proc = run_pwsh(["-Command", f"try {{ & '{EXPORT_JOB}' -ClipId M16-1243 -Format ProRes -MaxFrames 120 -QualityJson (Get-Content -Raw '{qf}') -ErrorAction Stop; 'NOT REFUSED' }} catch {{ 'REFUSED ' + $_.Exception.Message }}"])
+        self.assertNotIn("DUAL_VENUE_EXPORT_QUALITY_INVALID", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("REFUSED DUAL_VENUE_EXPORT_ARG_MISSING -SourceCommit", proc.stdout, "it got past the quality check to the next required argument")
+
+    def test_the_time_budget_counts_the_quality_pass_before_its_cap(self) -> None:
+        # adversary r1 A1: the quality pass's term was added AFTER the cap check, so the lease batch's preflight passed a 10000-frame quality leg of M16-1243
+        # (3395457024 bytes) at ~47 ks submitted and the generator then submitted ~92 ks, past the agent's 86400 s cap, once the lease was open.
+        def budget(*extra: str) -> tuple:
+            proc = run_pwsh(["-Command", f"try {{ & '{EXPORT_JOB}' -DescribeTimeBudgetBytes 3395457024 -MaxFrames {extra[0]} {' '.join(extra[1:])} -ErrorAction Stop | ConvertTo-Json -Compress }} catch {{ 'REFUSED ' + $_.Exception.Message }}"])
+            out = proc.stdout.strip()
+            return (None, out) if out.startswith("REFUSED") else (json.loads(out), out)
+        plain, out = budget("10000")
+        self.assertIsNotNone(plain, out)
+        self.assertEqual(plain["qualitySec"], 0)
+        refused, out = budget("10000", "-QualityBudget")
+        self.assertIsNone(refused, "the same window with the quality pass is past the cap and is refused before any lease")
+        self.assertIn("DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED", out)
+        self.assertIn("of it the quality pass", out)
+        small, out = budget("120")
+        withq, out = budget("120", "-QualityBudget")
+        self.assertEqual(withq["qualitySec"], small["exportTimeoutSec"] + 1800 + 120, out)
+        self.assertEqual(withq["jobTimeoutSec"], small["jobTimeoutSec"] + withq["qualitySec"])
+        # one term, read by the generation run too (no second addition after the cap check), from the one constant the job's metric wait reads
+        src = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("Get-ExportJobTimeBudget -ClipBytes $clipBytes -Frames $MaxFrames -Quality:($null -ne $qualityObject)", src)
+        self.assertNotIn("$jobTimeoutSec + $exportTimeoutSec + 1800", src)
+        self.assertIn("$QualityMetricTimeoutSec = __QUALITY_METRIC_TIMEOUT_SEC__", self.template)
+        # and the lease batch's preflight asks for that total for a quality leg, in both of its children
+        batch = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertIn("$qualityArgs = @(if ($null -ne (Get-DvProp $export 'quality')) { '-QualityBudget' })", batch)
+        self.assertEqual(batch.count("[string][int]$frames) + $qualityArgs) -TimeoutSec"), 2)
+
 
 def quality_doc(debayer: int = 5, frames=(3, 7, 11, 15, 19, 23)) -> dict:
     names = ["none", "simple", "bilinear", "lmmse", "igv", "amaze", "ahd", "rcd", "dcb"]
@@ -297,6 +334,23 @@ class QualityEvidenceReaderTests(unittest.TestCase):
                     self.assertIn(leg_invalid, row["legInvalid"])
                 self.assertIn(needle, row["detail"], row)
         self.assertEqual((rows[0]["debayer"], rows[0]["isoValue"]), ("amaze", 1600))
+
+    def test_the_checker_refuses_every_per_frame_shape_its_schema_refuses(self) -> None:
+        # adversary r1 A6: a perFrame row with a key the schema does not name, repeated tile indices, or repeated frames passed the shared checker
+        def doc(mutate) -> str:
+            q = quality_doc()
+            mutate(q)
+            return json.dumps(q)
+        texts = [doc(lambda q: q["perFrame"][0].update(unexpected="x")),
+                 doc(lambda q: q["perFrame"][0].update(flatTiles=[0] * 16)),
+                 doc(lambda q: q["perFrame"][1].update(edgeTiles=[16] * 16)),
+                 doc(lambda q: q["perFrame"][0].pop("metrics")),
+                 json.dumps(quality_doc(frames=(3, 3, 11, 15, 19, 23)))]
+        rows = self.evidence([self.case(t, summary_quality(t)) for t in texts])
+        for i, row in enumerate(rows):
+            with self.subTest(case=i):
+                self.assertEqual(row["verdict"], "INVALID", row)
+                self.assertIn("EXPORT_QUALITY_SCHEMA_INVALID", row["detail"], row)
 
 
 EXPORT_QUALITY_STUB_GENERATOR = r"""

@@ -4581,6 +4581,7 @@ function Get-DvDebayerQualityRefusal {
     $frames = @($Quality.frames)
     $rows = @($Quality.perFrame)
     if ($frames.Count -ne @($Quality.captureOffsets).Count -or $rows.Count -ne $frames.Count) { return 'quality.json frames / perFrame do not hold one row per capture offset' }
+    if (@($frames | Where-Object { -not ((& $isInt $_) -and $_ -ge 0) }).Count -gt 0 -or @($frames | ForEach-Object { [int64]$_ } | Sort-Object -Unique).Count -ne $frames.Count) { return 'quality.json frames are not distinct frame indices' }
     $metricStages = @($stages | Where-Object { $_ -cin @('S3_debayer', 'S4_processing') })
     $checkMetrics = {
         param($m)
@@ -4597,6 +4598,8 @@ function Get-DvDebayerQualityRefusal {
     for ($i = 0; $i -lt $rows.Count; $i++) {
         $r = $rows[$i]
         if ($r -isnot [System.Management.Automation.PSCustomObject]) { return "quality.json perFrame[$i] is not an object" }
+        # adversary r1 A6: the schema's additionalProperties false on a row
+        foreach ($p in $r.PSObject.Properties) { if ($p.Name -cnotin @('frame', 'sha256', 'flatTiles', 'edgeTiles', 'metrics')) { return "quality.json perFrame[$i] carries $($p.Name), which its schema does not name" } }
         if (-not (Test-DvJsonEquivalent (Get-DvProp $r 'frame') $frames[$i])) { return "quality.json perFrame[$i].frame is not frames[$i]" }
         $sha = Get-DvProp $r 'sha256'
         if ($sha -isnot [System.Management.Automation.PSCustomObject]) { return "quality.json perFrame[$i].sha256 is not an object" }
@@ -4605,6 +4608,8 @@ function Get-DvDebayerQualityRefusal {
         foreach ($k in 'flatTiles', 'edgeTiles') {
             $t = Get-DvProp $r $k; $t = @($t)   # (assigned, then wrapped: Get-DvProp returns an array as ONE object)
             if ($t.Count -ne [int]$Quality.tilesPerClass -or @($t | Where-Object { -not ((& $isInt $_) -and $_ -ge 0) }).Count -gt 0) { return "quality.json perFrame[$i].$k is not tilesPerClass tile indices" }
+            # adversary r1 A6: the schema's uniqueItems (tiles are integers here, so a numeric distinct count is exact)
+            if (@($t | ForEach-Object { [int64]$_ } | Sort-Object -Unique).Count -ne $t.Count) { return "quality.json perFrame[$i].$k repeats a tile index" }
         }
         if (-not (& $checkMetrics (Get-DvProp $r 'metrics'))) { return "quality.json perFrame[$i].metrics is not one metric set per scored stage" }
     }

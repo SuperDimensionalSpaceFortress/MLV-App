@@ -49,6 +49,9 @@ param(
     [switch]$PreflightBudgetOnly,
     # EXPORT-DEBAYER-QUALITY-1: the leg spec's export.quality as compact JSON (Invoke-VenueLeg passes it; empty = no quality pass). Prores only.
     [string]$QualityJson = '',
+    # adversary r1 A1: with -PreflightBudgetOnly or -DescribeTimeBudgetBytes, judge the budget WITH the quality pass (the lease batch passes it for a leg whose spec carries
+    # export.quality). A generation run needs no switch: a -QualityJson adds the same term.
+    [switch]$QualityBudget,
     [string]$OutFile,
     [string]$RepoRoot = '',
     [string]$VenueTablePath = ''
@@ -61,6 +64,8 @@ $ArtifactsModule = Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1'
 $OwnerFootageModule = Join-Path $PSScriptRoot 'AttrCudaOwnerFootage.psm1'
 # EXPORT-DEBAYER-QUALITY-1: the venue-side metric script, embedded inline (base64) with its sha256 baked at generation
 $QualityScriptPath = Join-Path $PSScriptRoot '..\dual-venue\debayer_quality.py'
+# the metric's wait inside the job (baked into the template as __QUALITY_METRIC_TIMEOUT_SEC__) and the time budget's quality term read this ONE value
+$QualityMetricTimeoutSec = 1800
 # The job-side conventions the playback job template defines, extracted from that template (never re-typed here).
 $SharedTemplateFunctions = @('Assert-UnderMlvTmp', 'Save-Json', 'Write-JobTrace', 'Get-Sha', 'Get-Mean')
 # The AttrCuda helpers the job calls directly; their callees are added by closure below.
@@ -99,7 +104,7 @@ $QualityJson = '__QUALITY_JSON__'
 $QualityScriptBase64 = '__QUALITY_SCRIPT_BASE64__'
 $QualityScriptSha256 = '__QUALITY_SCRIPT_SHA256__'
 $QualityRunFrames = 24
-$QualityMetricTimeoutSec = 1800
+$QualityMetricTimeoutSec = __QUALITY_METRIC_TIMEOUT_SEC__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -586,7 +591,9 @@ function Get-ExportJobTimeBudget {
     # ($UmRunMaxJobTimeoutSec); Invoke-VenueLeg adds $RunnerSubmitMarginSec to recommendedJobTimeoutSec before it submits. A window whose budget passes that is REFUSED
     # here with a typed reason, before any lease is spent -- never clamped, because an export cut short by a smaller wait is not the export that was asked for. The sums
     # are int64 so no out-of-range figure throws an untyped cast.
-    param([int64]$ClipBytes, [int]$Frames)
+    # EXPORT-DEBAYER-QUALITY-1 (adversary r1 A1): -Quality adds the quality pass (one more export wait of the same bound, which the job reuses, the metric's
+    # $QualityMetricTimeoutSec and a 120 s margin) BEFORE the cap check, so the preflight that refuses a window before a lease judges the same total the job submits.
+    param([int64]$ClipBytes, [int]$Frames, [switch]$Quality)
     $UmRunMaxJobTimeoutSec = [int64]86400
     $RunnerSubmitMarginSec = [int64]120
     Import-Module $ArtifactsModule -Force
@@ -596,14 +603,16 @@ function Get-ExportJobTimeBudget {
     $exportTimeoutSec = [int64]([Math]::Max(900, 4 * [int64]$Frames)) + $identityReadSec
     $quiescenceSec = [int64](3 * 12 + 30)
     $jobTimeoutSec = $identityReadSec + $quiescenceSec + $exportTimeoutSec + 600
+    $qualitySec = [int64]0
+    if ($Quality) { $qualitySec = $exportTimeoutSec + [int64]$QualityMetricTimeoutSec + 120; $jobTimeoutSec += $qualitySec }
     if ($jobTimeoutSec + $RunnerSubmitMarginSec -gt $UmRunMaxJobTimeoutSec) {
-        throw "DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $Frames frames of a $ClipBytes-byte clip need a job timeout of $jobTimeoutSec s ($($jobTimeoutSec + $RunnerSubmitMarginSec) s submitted), past the agent's $UmRunMaxJobTimeoutSec s cap; export a shorter window"
+        throw "DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $Frames frames of a $ClipBytes-byte clip need a job timeout of $jobTimeoutSec s ($($jobTimeoutSec + $RunnerSubmitMarginSec) s submitted$(if ($Quality) { ", $qualitySec s of it the quality pass" })), past the agent's $UmRunMaxJobTimeoutSec s cap; export a shorter window"
     }
-    [pscustomobject]@{ identityReadSec = [int]$identityReadSec; exportTimeoutSec = [int]$exportTimeoutSec; quiescenceSec = [int]$quiescenceSec; jobTimeoutSec = [int]$jobTimeoutSec }
+    [pscustomobject]@{ identityReadSec = [int]$identityReadSec; exportTimeoutSec = [int]$exportTimeoutSec; quiescenceSec = [int]$quiescenceSec; qualitySec = [int]$qualitySec; jobTimeoutSec = [int]$jobTimeoutSec }
 }
 if ($DescribeTimeBudgetBytes -ge 0) {
     if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
-    return (Get-ExportJobTimeBudget -ClipBytes $DescribeTimeBudgetBytes -Frames $MaxFrames)
+    return (Get-ExportJobTimeBudget -ClipBytes $DescribeTimeBudgetBytes -Frames $MaxFrames -Quality:$QualityBudget)
 }
 
 $ast = Get-PlaybackGeneratorAst
@@ -626,7 +635,8 @@ if ($DescribeTemplate) {
 # typed, so a direct caller cannot emit a quality pass on a CDNG export or past the capture harness's 64 frames.
 $qualityObject = $null
 if (-not [string]::IsNullOrWhiteSpace($QualityJson)) {
-    if ($Format -cne 'prores') { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID -QualityJson is for a prores export only' }
+    # adversary r1 A5: case-insensitive, like the ValidateSet that admitted it and the job's own `$Format -eq 'prores'` (a -Format ProRes is a prores export)
+    if ($Format -ne 'prores') { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID -QualityJson is for a prores export only' }
     try { $qualityObject = $QualityJson | ConvertFrom-Json -ErrorAction Stop } catch { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID -QualityJson does not parse' }
     $qOffsets = @($qualityObject.captureOffsets)
     if ($qOffsets.Count -lt 1 -or $qOffsets.Count -gt 64) { throw 'DUAL_VENUE_EXPORT_QUALITY_INVALID captureOffsets must hold 1 to 64 frames (more than 64 capture frames is refused)' }
@@ -672,7 +682,7 @@ if ($PreflightBudgetOnly) {
     if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
     $preflightBytes = [int64]0
     foreach ($p in $ownerParts) { $preflightBytes += [int64]$p.length }
-    return (Get-ExportJobTimeBudget -ClipBytes $preflightBytes -Frames $MaxFrames)   # the same function, the same refusal the generation below makes
+    return (Get-ExportJobTimeBudget -ClipBytes $preflightBytes -Frames $MaxFrames -Quality:($QualityBudget -or $null -ne $qualityObject))   # the same function, the same refusal the generation below makes
 }
 
 # r20 (adversary pass 24 A2): the batch receipt is read ONCE, here (after the preflight's return: r8 A3, that mode reads no receipt), before git or the job text; these bytes are
@@ -690,11 +700,10 @@ if ($LASTEXITCODE -ne 0) { throw 'DUAL_VENUE_EXPORT_SOURCE_COMMIT_UNKNOWN -Sourc
 
 $clipBytes = [int64]0
 foreach ($p in $ownerParts) { $clipBytes += [int64]$p.length }
-$timeBudget = Get-ExportJobTimeBudget -ClipBytes $clipBytes -Frames $MaxFrames
+# EXPORT-DEBAYER-QUALITY-1 (adversary r1 A1): the quality pass's term (one more export wait, the metric's bound) is inside the budget, before its cap check
+$timeBudget = Get-ExportJobTimeBudget -ClipBytes $clipBytes -Frames $MaxFrames -Quality:($null -ne $qualityObject)
 $exportTimeoutSec = $timeBudget.exportTimeoutSec
 $jobTimeoutSec = $timeBudget.jobTimeoutSec
-# EXPORT-DEBAYER-QUALITY-1: the quality pass adds one more bounded export wait (the job reuses $ExportTimeoutSec for it) and the metric's own 1800 s bound
-if ($null -ne $qualityObject) { $jobTimeoutSec = [int]($jobTimeoutSec + $exportTimeoutSec + 1800 + 120) }
 
 $short = $SourceCommit.Substring(0, 12)
 $tokens = [ordered]@{
@@ -723,6 +732,7 @@ $tokens = [ordered]@{
     QUALITY_SCRIPT_BASE64 = $(if ($null -ne $qualityObject) { [Convert]::ToBase64String($qualityScriptBytes) } else { '' })
     QUALITY_SCRIPT_SHA256 = $(if ($null -ne $qualityObject) { $qualityScriptSha256 } else { '' })
     PYTHON_RESOLVER = $pythonResolverText
+    QUALITY_METRIC_TIMEOUT_SEC = [string]$QualityMetricTimeoutSec
 }
 # (one pass: a substituted value is never rescanned; the embedded and shared texts carry __SCRATCH_ROOT__ themselves, so they are expanded first)
 $tokens.EMBEDDED_FUNCTIONS = $embedding.text

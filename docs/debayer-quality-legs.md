@@ -35,6 +35,10 @@ A quality leg's plan cell is `cpu-export-prores-<legId>`, so the six legs of one
    S4 buffer. It never holds a capture, a frame, a path or a file name. Then the job deletes the captures and the quality run's `.mov` by
    ownership proof. If `captureDeleted` is false, the leg is `INVALID` (`EXPORT_CAPTURE_NOT_DELETED`).
 
+**Time budget.** The quality pass adds one more export wait plus the metric's 1800 s bound and a 120 s margin. `Get-ExportJobTimeBudget -Quality`
+adds this term *before* the agent's 86400 s cap check. The lease batch's preflight passes `-QualityBudget` for a quality leg, so a window that
+would fit only without the pass is refused (`DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED`) before a lease is taken.
+
 `summary.json.quality` records the pass, and `Get-DvExportQualityEvidence` (`DualVenueRunner.psm1`) reads it. The receipt writer and
 `Test-DvReceiptValid` both use that one reader, so `receipt.export.quality` is re-derived from the re-hashed files, never trusted.
 If a requested frame or stage has no capture, the result is `EXPORT_QUALITY_CAPTURE_ABSENT`, which is `INVALID`.
@@ -71,7 +75,11 @@ the published receipts and re-hashes every input against `receipt.export.files`.
   class minimum. When two are within 2% on detail, the lower `debayerMsMean` wins. **fastestAcceptable**: the lowest `debayerMsMean` whose three
   ratios are each within 5% of the recommended one's. The rule is computed on `S4_processing`. `s3AgreesWithS4` records whether S3 picks the same
   debayer.
-* **Integrity**: the S2 sha256s must be identical across a clip's debayers (`DEBAYER_INPUT_DIVERGED`), and the S3 sha256s must be pairwise
-  distinct on every frame (`DEBAYER_NOT_APPLIED`). A class is `measured` only when all six debayers PASS with a captured quality pass.
+* NCGE is signed (EDGE minus FLAT energy). A non-positive bilinear NCGE gives no `detailRatio`, and the 2% tie band is measured down from
+  `|best|`, so it always holds the best.
+* **Integrity**: a clip's six debayers are compared only when they measured the same way: the same `stages`, `tileSize`, `tilesPerClass`,
+  `captureOffsets`, `frames` and `border` (`DEBAYER_QUALITY_PARAMS_DIVERGED`). The S2 sha256s must be identical (`DEBAYER_INPUT_DIVERGED`), as must
+  the FLAT/EDGE tile sets on every frame (`DEBAYER_TILES_DIVERGED`). The S3 sha256s (S4 when no leg captured S3) must be present
+  (`DEBAYER_CAPTURE_INCOMPLETE`) and pairwise distinct on every frame (`DEBAYER_NOT_APPLIED`). A class is `measured` only when all six debayers PASS with a captured quality pass.
   The low and high non-dual-ISO bands are emitted as `unmeasured`. `DEBAYER-ADVISOR-1` must never extrapolate into an unmeasured row.
 * `debayer-rule-table.json` is committed only from real PASS receipts.

@@ -1479,6 +1479,9 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $clipId = [string](Get-DvProp $spec 'clipId'); $format = [string](Get-DvProp $export 'format'); $frames = Get-DvProp $export 'maxFrames'
     if ($clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}\z' -or $format -cnotin @('cdng-lossless', 'prores') -or -not ($frames -is [int] -or $frames -is [long]) -or $frames -lt 24 -or $frames -gt 100000) { return '', '' }
     $pwshExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    # EXPORT-DEBAYER-QUALITY-1 (adversary r1 A1): a leg whose spec carries export.quality submits the quality pass's term too, so both children below judge that
+    # total (-QualityBudget), the one the generator submits; without it a window that fits only without the pass was let through to its lease.
+    $qualityArgs = @(if ($null -ne (Get-DvProp $export 'quality')) { '-QualityBudget' })
     # r11 (sol r9 B1, EXPORT-BUDGET-PREFLIGHT-CHILD-DEADLINE-1): the child resolves the clip (a gate script, a share read) and used to be waited for with no deadline, so a hung resolver held the
     # batch before any claim for ever. It is now a BOUNDED child: the room left before -DeadlineUtc (less $script:ExportBudgetPreflightReserveSec for the refusal) under a hard cap. No room, or
     # a child still running at its bound (killed with its tree; the kill is confirmed or said to be unconfirmed), is the typed refusal EXPORT_BUDGET_PREFLIGHT_TIMEOUT, which all three callers
@@ -1489,7 +1492,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
-    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList (@('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) + $qualityArgs) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
     if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
@@ -1502,7 +1505,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor
-    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList (@('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) + $qualityArgs) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
     if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }

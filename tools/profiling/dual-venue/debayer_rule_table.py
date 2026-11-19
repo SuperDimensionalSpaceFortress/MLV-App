@@ -12,8 +12,12 @@ Rule (thresholds live in the emitted JSON; the rule is computed on S4_processing
     the class minimum; two within 2% on detail are separated by the lower debayerMsMean.
   * fastestAcceptable = the lowest debayerMsMean whose three ratios are each within 5% of the recommended one's.
   * s3AgreesWithS4 = the same rule on S3_debayer picks the same recommended debayer.
-Cross-leg integrity (typed refusals): S2 sha256s identical across the debayers of a clip (DEBAYER_INPUT_DIVERGED); S3 sha256s pairwise
-distinct per frame (DEBAYER_NOT_APPLIED). A class needs all six debayers PASS with a captured quality pass, else it stays "unmeasured".
+  * a non-positive bilinear NCGE gives no detailRatio (NCGE is signed; its sign would invert "more detail"), and the 2% tie band is measured
+    from |best| so it always holds the best.
+Cross-leg integrity (typed refusals): the same stages, tileSize, tilesPerClass, captureOffsets, frames and border on every debayer of a clip
+(DEBAYER_QUALITY_PARAMS_DIVERGED); S2 sha256s identical (DEBAYER_INPUT_DIVERGED); identical FLAT/EDGE tile sets per frame (DEBAYER_TILES_DIVERGED);
+S3 sha256s (S4 when no leg captured S3) present (DEBAYER_CAPTURE_INCOMPLETE) and pairwise distinct per frame (DEBAYER_NOT_APPLIED). A class
+needs all six debayers PASS with a captured quality pass, else it stays "unmeasured".
 DEBAYER-ADVISOR-1 must never extrapolate into an unmeasured row.
 
 Usage:  py -3 tools/profiling/dual-venue/debayer_rule_table.py --receipt <r.json> [--receipt ...] --out <table.json>
@@ -110,18 +114,36 @@ def load_leg(receipt_path: str) -> dict:
     }
 
 
+# adversary r1 A3/A4: the six legs of one clip are compared only when they measured the SAME way. A leg with fewer stages, another tile size or tile count,
+# other frames or another border is a valid pass on its own and an incomparable sample beside the others.
+COMPARED_PARAMS = ("stages", "tileSize", "tilesPerClass", "captureOffsets", "frames", "border")
+
+
 def check_integrity(legs: list) -> None:
     """legs: the six debayer legs of ONE clip."""
+    clip = legs[0]["clipId"]
+    params = {json.dumps([lg["quality"].get(k) for k in COMPARED_PARAMS], sort_keys=True) for lg in legs}
+    if len(params) != 1:
+        raise RuleTableError("DEBAYER_QUALITY_PARAMS_DIVERGED", f"{clip}: the debayer legs did not measure with the same {', '.join(COMPARED_PARAMS)}")
     s2 = {}
     for lg in legs:
         s2[lg["debayer"]] = tuple(row["sha256"].get("S2_post_dualiso") for row in lg["quality"]["perFrame"])
-    if len(set(s2.values())) != 1:
-        raise RuleTableError("DEBAYER_INPUT_DIVERGED", f"{legs[0]['clipId']}: the S2 (Bayer input) sha256s differ across debayers")
+    if len(set(s2.values())) != 1 or None in next(iter(s2.values())):
+        raise RuleTableError("DEBAYER_INPUT_DIVERGED", f"{clip}: the S2 (Bayer input) sha256s differ across debayers")
     frames = len(next(iter(s2.values())))
+    # the tile sets come from S2 alone, so with one S2 and one set of parameters they are one population; a difference is refused, never averaged over
     for i in range(frames):
-        s3 = [lg["quality"]["perFrame"][i]["sha256"].get("S3_debayer") for lg in legs]
-        if len(set(s3)) != len(s3):
-            raise RuleTableError("DEBAYER_NOT_APPLIED", f"{legs[0]['clipId']}: two debayers produced the same S3 buffer on frame row {i}")
+        tiles = {json.dumps([lg["quality"]["perFrame"][i].get("flatTiles"), lg["quality"]["perFrame"][i].get("edgeTiles")]) for lg in legs}
+        if len(tiles) != 1:
+            raise RuleTableError("DEBAYER_TILES_DIVERGED", f"{clip}: the FLAT/EDGE tile sets differ across debayers on frame row {i}")
+    # S3 when the legs captured it (all or none, by the parameter check above), else S4: two debayers with one output buffer did not both apply
+    stage = STAGE_CHECK if STAGE_CHECK in (legs[0]["quality"].get("stages") or [STAGE_CHECK]) else STAGE_BASIS
+    for i in range(frames):
+        hashes = [lg["quality"]["perFrame"][i]["sha256"].get(stage) for lg in legs]
+        if None in hashes:
+            raise RuleTableError("DEBAYER_CAPTURE_INCOMPLETE", f"{clip}: a debayer leg has no {stage} sha256 on frame row {i}")
+        if len(set(hashes)) != len(hashes):
+            raise RuleTableError("DEBAYER_NOT_APPLIED", f"{clip}: two debayers produced the same {stage} buffer on frame row {i}")
 
 
 def ratios(by: dict, stage: str) -> dict:
@@ -130,7 +152,8 @@ def ratios(by: dict, stage: str) -> dict:
     for name, lg in by.items():
         m = lg["quality"]["metrics"][stage]
         out[name] = {
-            "detailRatio": m["ncge"] / ref["ncge"] if ref["ncge"] else None,
+            # adversary r1 A2: ncge is signed (EDGE minus FLAT energy); a non-positive reference would invert "more detail", so it gives no ratio
+            "detailRatio": m["ncge"] / ref["ncge"] if ref["ncge"] > 0 else None,
             "noiseRatio": m["sigmaY"] / ref["sigmaY"] if ref["sigmaY"] else None,
             "chromaNoiseRatio": m["sigmaC"] / ref["sigmaC"] if ref["sigmaC"] else None,
             "falseColourRatio": m["fc"] / ref["fc"] if ref["fc"] else None,
@@ -151,7 +174,8 @@ def apply_rule(per: dict, times: dict) -> tuple:
     if not ok:
         return None, None
     best = max(per[n]["detailRatio"] for n in ok)
-    near = [n for n in ok if per[n]["detailRatio"] >= best * (1.0 - THRESHOLDS["detailTieFraction"])]
+    # adversary r1 A2: the tie band is measured from |best| down, so it always holds the best itself, whatever the sign
+    near = [n for n in ok if per[n]["detailRatio"] >= best - abs(best) * THRESHOLDS["detailTieFraction"]]
     rec = sorted(near, key=lambda n: (times[n], -per[n]["detailRatio"], n))[0]
     tol = THRESHOLDS["fastestWithinFraction"]
 

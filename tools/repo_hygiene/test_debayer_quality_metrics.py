@@ -243,16 +243,29 @@ FIXTURE = {"bilinear": (1.00, 1.00, 1.00, 10.0), "amaze": (1.50, 1.05, 0.72, 60.
            "dcb": (1.42, 1.02, 0.75, 25.0), "lmmse": (1.20, 0.98, 0.70, 40.0), "igv": (1.55, 1.30, 1.20, 45.0)}
 
 
-def fixture_leg(clip: str, name: str, ratios: tuple, s2: str = "a" * 64, s3: str | None = None, outcome: str = "PASS", s3_ratios: tuple | None = None) -> dict:
+def fixture_leg(clip: str, name: str, ratios: tuple, s2: str = "a" * 64, s3: str | None = None, outcome: str = "PASS", s3_ratios: tuple | None = None,
+                quality_over: dict | None = None, frame_over: dict | None = None, no_s3: bool = False, ref_ncge: float | None = None) -> dict:
     ms = ratios[3]
+    ncge0 = REF["ncge"] if ref_ncge is None else ref_ncge
 
     def mset(r):
-        return {"ncge": REF["ncge"] * r[0], "sigmaY": REF["sigmaY"] * r[1], "sigmaC1": 4.0, "sigmaC2": 4.0, "sigmaC": REF["sigmaC"], "fc": REF["fc"] * r[2]}
+        return {"ncge": ncge0 * r[0], "sigmaY": REF["sigmaY"] * r[1], "sigmaC1": 4.0, "sigmaC2": 4.0, "sigmaC": REF["sigmaC"], "fc": REF["fc"] * r[2]}
     s3sha = s3 or hashlib.sha256(name.encode()).hexdigest()
+    s4sha = hashlib.sha256(b"s4-" + name.encode()).hexdigest()
+    metrics = {"S4_processing": mset(ratios), "S3_debayer": mset(s3_ratios or ratios)}
+    hashes = {"S2_post_dualiso": s2, "S3_debayer": s3sha, "S4_processing": s4sha}
+    stages = ["S2_post_dualiso", "S3_debayer", "S4_processing"]
+    if no_s3:
+        del metrics["S3_debayer"], hashes["S3_debayer"]
+        stages = ["S2_post_dualiso", "S4_processing"]
+    frame = {"frame": 3, "flatTiles": [0, 1], "edgeTiles": [5, 6], "sha256": hashes}
+    frame.update(frame_over or {})
+    quality = {"metrics": metrics, "perFrame": [frame], "stages": stages, "tileSize": 64, "tilesPerClass": 16,
+               "captureOffsets": [3], "frames": [3], "border": 4}
+    quality.update(quality_over or {})
     return {"receiptId": f"{clip}-{name}", "clipId": clip, "legId": f"x-{name}", "outcome": outcome, "qualityVerdict": "PASS", "debayer": name,
             "receiptDebayer": 0, "dualIso": True, "isoValue": 1600, "sourceCommit": "c" * 40, "buildManifestSha256": "d" * 64,
-            "quality": {"metrics": {"S4_processing": mset(ratios), "S3_debayer": mset(s3_ratios or ratios)},
-                        "perFrame": [{"sha256": {"S2_post_dualiso": s2, "S3_debayer": s3sha, "S4_processing": "e" * 64}}]},
+            "quality": quality,
             "exportWallSeconds": 20.0 + ms, "times": {"debayerMsMean": ms, "debayerMsP10": ms - 1, "debayerMsP90": ms + 1}}
 
 
@@ -287,6 +300,51 @@ class RuleTableTests(unittest.TestCase):
         self.assertEqual(cm.exception.token, "DEBAYER_INPUT_DIVERGED")
         with self.assertRaises(rt.RuleTableError) as cm:
             rt.build_table(fixture_legs(dcb={"s3": hashlib.sha256(b"rcd").hexdigest()}))
+        self.assertEqual(cm.exception.token, "DEBAYER_NOT_APPLIED")
+
+    def test_a_negative_detail_never_crashes_the_rule(self) -> None:
+        # adversary r1 A2: ncge is EDGE minus FLAT gradient energy, so it is signed. With bilinear +100 and every other debayer -100 the best detail
+        # ratio was -1, the 2% tie band (>= best * 0.98) held nothing, and sorted(near)[0] raised IndexError.
+        legs = [fixture_leg("M16-1243", n, (1.0 if n == "bilinear" else -1.0, 1.0, 1.0, FIXTURE[n][3])) for n in rt.DEBAYERS]
+        row = [c for c in rt.build_table(legs)["classes"] if c["status"] == "measured"][0]
+        self.assertEqual(row["recommended"], "dcb", "every candidate ties at -1: the fastest of them")
+        self.assertAlmostEqual(row["perDebayer"]["rcd"]["detailRatio"], -1.0)
+        # a non-positive REFERENCE detail has no ratio at all (its sign would invert "more detail"), so no debayer is recommended on it
+        neg = [fixture_leg("M16-1243", n, FIXTURE[n], ref_ncge=-100.0) for n in rt.DEBAYERS]
+        row = [c for c in rt.build_table(neg)["classes"] if c["status"] == "measured"][0]
+        self.assertIsNone(row["perDebayer"]["amaze"]["detailRatio"])
+        self.assertEqual((row["recommended"], row["fastestAcceptable"]), (None, None))
+
+    def test_a_leg_whose_quality_parameters_differ_is_refused(self) -> None:
+        # adversary r1 A3: IGV requested no S3, so its S3 hash was None (five distinct hashes plus None passed DEBAYER_NOT_APPLIED) and the S3 ratios raised KeyError.
+        legs = fixture_legs()
+        legs[5] = fixture_leg("M16-1243", "igv", FIXTURE["igv"], no_s3=True)
+        with self.assertRaises(rt.RuleTableError) as cm:
+            rt.build_table(legs)
+        self.assertEqual(cm.exception.token, "DEBAYER_QUALITY_PARAMS_DIVERGED")
+        # adversary r1 A4: bilinear scored 1 tile per class against the others' 16 -- valid passes each, incomparable samples together
+        with self.assertRaises(rt.RuleTableError) as cm:
+            rt.build_table(fixture_legs(bilinear={"quality_over": {"tilesPerClass": 1}}))
+        self.assertEqual(cm.exception.token, "DEBAYER_QUALITY_PARAMS_DIVERGED")
+        for key, value in (("tileSize", 32), ("captureOffsets", [7]), ("frames", [7]), ("border", 2), ("stages", ["S2_post_dualiso", "S4_processing", "S3_debayer"])):
+            with self.subTest(key=key), self.assertRaises(rt.RuleTableError) as cm:
+                rt.build_table(fixture_legs(rcd={"quality_over": {key: value}}))
+            self.assertEqual(cm.exception.token, "DEBAYER_QUALITY_PARAMS_DIVERGED")
+        # the same parameters but a different tile population on a frame (the tile sets are S2-derived, so they must be identical)
+        with self.assertRaises(rt.RuleTableError) as cm:
+            rt.build_table(fixture_legs(lmmse={"frame_over": {"edgeTiles": [5, 7]}}))
+        self.assertEqual(cm.exception.token, "DEBAYER_TILES_DIVERGED")
+
+    def test_six_legs_that_all_skip_s3_are_measured_on_s4_alone(self) -> None:
+        legs = [fixture_leg("M16-1243", n, FIXTURE[n], no_s3=True) for n in rt.DEBAYERS]
+        row = [c for c in rt.build_table(legs)["classes"] if c["status"] == "measured"][0]
+        self.assertEqual(row["recommended"], "rcd")
+        self.assertIsNone(row["s3AgreesWithS4"])
+        # without S3 the debayer-applied check reads S4: two debayers with one S4 buffer are refused
+        same = [fixture_leg("M16-1243", n, FIXTURE[n], no_s3=True) for n in rt.DEBAYERS]
+        same[2]["quality"]["perFrame"][0]["sha256"]["S4_processing"] = same[1]["quality"]["perFrame"][0]["sha256"]["S4_processing"]
+        with self.assertRaises(rt.RuleTableError) as cm:
+            rt.build_table(same)
         self.assertEqual(cm.exception.token, "DEBAYER_NOT_APPLIED")
 
     def test_unmeasured_rows_are_emitted_and_a_class_short_of_six_passes_stays_unmeasured(self) -> None:
