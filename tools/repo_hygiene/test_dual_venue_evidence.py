@@ -15710,6 +15710,13 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 f"play_checked={play} position={position or pos} presented_serial={serial} window={window} fullscreen={cls.FLAGS[i][1][0]} maximized={cls.FLAGS[i][1][1]}")
 
     KEEP = "interaction_trace event=resize.keep_playing width=1920 height=1080 fullscreen=1"
+    # r5: the app's own records with a ` (` inside a quoted value (no location suffix: a venue build writes none, LogLineField.h:86-89)
+    R5_S1_RECORD = ('playback_smoke.gpu_dualiso_recon_scale_summary session=3 reduced_recon_frames=0 full_recon_frames=0 recon_scale_last=0 session_scale=1 '
+                    'session_reason="preview scale 1 (full resolution)" fallback_reason_last="" clip_dims_busy_refusals=0 retained_outstanding=3')
+    R5_CONFORM_RECORD = ('playback_smoke.summary session=3 reason=ok elapsed_ms=25000 presented_frames=599 presented_fps=23.96 frame_telemetry=1 '
+                         'gui_fps_status_text="Playback: 24 fps (59.94 -> 24)" gui_fps_status_value=24 avg_playback_prep_pre_enqueue_ms=0.1')
+    R5_FALLBACK_RECORD = ('playback_smoke.cpu_dualiso_recon_scale_summary session=3 reduced_recon_frames=0 full_recon_frames=0 recon_scale_last=0 avg_fullres_fixes_ms=0 '
+                          'avg_downsample_ms=0 fallback_reason_last="transform (upside down) enabled" notch_frames=0 avg_notch_ms=0')
 
     @classmethod
     def log(cls, *, drop_keep: int | None = None, mutate=None, summary: str | None = "gui_smoke.window_toggles requested=4 driven=4 reason=ok", prefix=()) -> str:
@@ -15885,6 +15892,33 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.log().replace("playback_smoke.measured_session id=3\n",
                                    "playback_smoke.measured_session id=3 (C:/b x/MainWindow.cpp:10)\nplayback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:11)\n", 1),
                 (4, 4, 4, 4), True),
+            # r5 (opus/fable key3 r4 B1 on 292d4279): the location suffix is found structurally (the first ` (` OUTSIDE a quoted `key="..."` value, closing `:<digits>)` at the end of the
+            # line), never by the first ` (` of the body. The three record texts below are the app's own (MainWindow.cpp:24849 / :32233-32247 / :31312 / :32217; the first is
+            # smoke-run.log:2697 of lane-HFR-NATIVE-M16-1457-VENUE-EVIDENCE-MINI3-1-r6-20261117T0237Z bfdd7bb0 with its session id 1 -> 3); a venue build writes NO location suffix
+            "r5-B1: the real s1 scale-1 record (session_reason=\"preview scale 1 (full resolution)\", no location suffix) is record content, not a boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD + "\n", 1), (4, 4, 4, 4), True),
+            "r5-B1: the same record behind the log prefix": (
+                self.log().replace("playback_smoke.measured_session id=3\n",
+                                   "[2026-11-17T02:59:54.750Z] [INFO] [0x1fac4] playback_smoke.measured_session id=3\n[2026-11-17T03:00:20.032Z] [INFO] [0x1fac4] " + self.R5_S1_RECORD + "\n", 1),
+                (4, 4, 4, 4), True),
+            "r5-B1: the same record with its real location suffix after the quoted value": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD + " (C:/b x/MainWindow.cpp:24849)\n", 1),
+                (4, 4, 4, 4), True),
+            "r5-B1: a conformed playback_smoke.summary (gui_fps_status_text=\"Playback: 24 fps (59.94 -> 24)\")": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_CONFORM_RECORD + "\n", 1), (4, 4, 4, 4), True),
+            "r5-B1: the conformed summary with its real location suffix": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_CONFORM_RECORD + " (C:/b x/MainWindow.cpp:31312)\n", 1),
+                (4, 4, 4, 4), True),
+            "r5-B1: a cpu_dualiso summary whose fallback_reason_last=\"...\" value holds ` (`": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_FALLBACK_RECORD + "\n", 1), (4, 4, 4, 4), True),
+            "r5-B1: a quoted value with ` (` and a real location suffix of ANOTHER session still closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n",
+                                   "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD.replace("session=3", "session=4") + " (C:/b x/MainWindow.cpp:24849)\n", 1), (0, 0, 0, 0), False),
+            "r5-B1: a quoted value with ` (` followed by a tail that is no location (`(session=4)`) is still an unreadable boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\n" + self.R5_S1_RECORD + " (session=4)\n", 1), (0, 0, 0, 0), False),
+            "r5-B1: a quoted span that holds an `=` and ` (` (`note=\"a (session=4) b\"`) is no quoted value, so its tail is no location": (
+                self.log().replace("playback_smoke.measured_session id=3\n", 'playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 note="a (session=4) b"\n', 1),
+                (0, 0, 0, 0), False),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (

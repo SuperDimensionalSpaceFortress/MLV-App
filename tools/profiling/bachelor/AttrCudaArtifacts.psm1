@@ -7414,8 +7414,14 @@ function Get-AttrCudaWindowToggleEvidence {
     )
 
     # Each run-log line is reduced to the record body the app wrote: the optional `[utc] [LEVEL] [0x<thread>] ` prefix is dropped and the Qt location suffix
-    # (` (<file>:<line>)`, written last; the app's own record bodies here hold no other ` (`) is cut at its first ` (`, so a path in the suffix can never
+    # (` (<file>:<line>)`, written last) is cut at its first ` (` that lies OUTSIDE a quoted `key="..."` value, so a path in the suffix can never
     # supply a field or a marker. A record counts only where it STARTS the body. A key that repeats inside one record makes that record unusable.
+    # r5 (key3 r4 B1 on 292d4279): the app's own record bodies DO hold ` (` in free text, always inside a double-quoted value (session_reason="preview scale 1 (full
+    # resolution)", gui_fps_status_text="Playback: 24 fps (59.94 -> 24)", fallback_reason_last="..."), and a venue build writes no location at all, so a first-` (` cut
+    # read every healthy record of that shape as a bad tail. The location is therefore found the way DualVenueRunner.psm1's Get-DvLocationOpenIndex finds it (this
+    # function is embedded in the job and cannot call it): a quoted value opens at `="` whose key ([A-Za-z0-9_]+) starts the line or follows a space, and it is stepped
+    # over only when it closes at the first `"` that ends the line or is followed by a space and holds no `=`; a span that holds an `=` is no quoted value, so its
+    # ` (` stays a location candidate and its tail (not a location) makes the record unreadable, as before.
     # r3 (adversary A1 on 1f00a482): the cut tail must BE a location, ` (<path>:<digits>)` to the very end of the line with a path of at least one character (the
     # runner's Get-DvLogRecordBody rule); any other tail (`(reason=incomplete)`, text after the `)`, no line number) is no location, so its record is unreadable
     # ($badTail) and a keep_playing line carrying it counts for nothing. It may refuse; it never forges.
@@ -7423,7 +7429,28 @@ function Get-AttrCudaWindowToggleEvidence {
     $lines = [System.Collections.Generic.List[string]]::new()
     foreach ($rawLine in @($LogText -split "`r?`n")) {
         $body = [regex]::Replace($rawLine, '^\s*(?:\[[^\]]*\]\s*)*', '')
-        $cut = $body.IndexOf(' (', [StringComparison]::Ordinal)
+        $cut = -1
+        $scanAt = 0
+        $parenAt = -2
+        $quoteAt = -2
+        while ($scanAt -lt $body.Length) {
+            if ($parenAt -ne -1 -and $parenAt -lt $scanAt) { $parenAt = $body.IndexOf(' (', $scanAt, [StringComparison]::Ordinal) }
+            if ($parenAt -lt 0) { break }
+            if ($quoteAt -ne -1 -and $quoteAt -lt $scanAt) { $quoteAt = $body.IndexOf('="', $scanAt, [StringComparison]::Ordinal) }
+            if ($quoteAt -ge 0 -and $quoteAt -lt $parenAt) {
+                # is `="` a value opener: a non-empty ASCII key that starts the line or follows a space
+                $keyAt = $quoteAt - 1
+                while ($keyAt -ge 0 -and (($body[$keyAt] -ge [char]'A' -and $body[$keyAt] -le [char]'Z') -or ($body[$keyAt] -ge [char]'a' -and $body[$keyAt] -le [char]'z') -or ($body[$keyAt] -ge [char]'0' -and $body[$keyAt] -le [char]'9') -or $body[$keyAt] -ceq [char]'_')) { $keyAt-- }
+                if ($keyAt -lt $quoteAt - 1 -and ($keyAt -lt 0 -or $body[$keyAt] -ceq [char]' ')) {
+                    $closeAt = $body.IndexOf('"', $quoteAt + 2, [StringComparison]::Ordinal)
+                    if ($closeAt -ge 0 -and ($closeAt -eq $body.Length - 1 -or $body[$closeAt + 1] -ceq [char]' ') -and $body.IndexOf('=', $quoteAt + 2, $closeAt - $quoteAt - 2, [StringComparison]::Ordinal) -lt 0) { $scanAt = $closeAt + 1; continue }
+                }
+                $scanAt = $quoteAt + 2
+                continue
+            }
+            $cut = $parenAt
+            break
+        }
         if ($cut -ge 0) {
             $tail = $body.Substring($cut)
             $digitAt = $tail.Length - 2
