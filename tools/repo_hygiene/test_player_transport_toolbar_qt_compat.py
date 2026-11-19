@@ -48,7 +48,15 @@ Refused, never read:
   * any other directive name (``#include_next``, ``#import``, ``#embed``, a ``# 12 "f"`` line
     marker, ...: adversary r5 A2), and a C++20 ``import``/``module`` line, which can import macros;
   * a character in code outside printable ASCII, tab, VT and FF (a BOM, NBSP, U+2028, a control
-    character, a non-ASCII identifier: adversary r5 A1).
+    character, a non-ASCII identifier: adversary r5 A1);
+  * ``control-byte`` (r7, sol r6 B1): a NUL or any other C0 control byte but tab, LF, CR, VT and
+    FF, or DEL, anywhere in the raw text, comments and literals included, before lexing. GCC reads
+    NUL as whitespace before a spliced line break, so ``\\`` + NUL + newline is a splice to it; the
+    scanner does not model that and refuses the byte instead;
+  * an ``include_alias`` token anywhere in the raw text (r7, fable r6 H2), as ``header-name``: its
+    arguments are header-names the lexer does not know;
+  * a ``$`` in code (r7, fable r6 H3): compilers accept it in identifiers by default, so it moves
+    where a pp-number ends.
 
 Non-promises: the scanner does not preprocess. It does not follow #include, does not expand a
 macro defined in another file (an external macro that pastes pieces into an API name is not
@@ -98,8 +106,15 @@ MODULE_DIRECTIVE = re.compile(r"^\s*(?:export\s+)?(?:import|module)\b")
 DEFINE = re.compile(r"^\s*#\s*define\s+(\w+)(\([^)]*\))?(.*)$")
 VERSION_MACRO_REDEFINED = re.compile(r"^\s*#\s*(?:define|undef)\s+QT_VERSION(?:_CHECK)?\b")
 # Refused in the raw text, anywhere (comments and literals included): translation phases 1-2
-# are what the scanner does not model, so it refuses every input where they change the text.
+# are what the scanner does not model, so it refuses every input where they change the text, as
+# far as the forms below reach. SPLICE allows only the ISO whitespace before the line break; a
+# compiler that reads more as whitespace there (GCC: NUL) is covered by CONTROL_BYTE (r7, sol r6
+# B1), which refuses every C0 control byte but tab, LF, CR, VT and FF, and DEL.
 SPLICE = re.compile(r"\\[ \t\f\v]*\n")
+CONTROL_BYTE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+# `#pragma include_alias(<a>, <b>)` (Microsoft extension) takes header-names in a context the
+# lexer does not track; any include_alias token is refused (r7, fable r6 H2).
+INCLUDE_ALIAS = re.compile(r"\binclude_alias\b")
 TRIGRAPH = re.compile(r"\?\?[=/'()!<>\-]")
 # After #include, __has_include( and the like, `<...>` is a header-name, where /*, //, quotes and
 # a backslash are plain text; in `"..."` a backslash is plain text too. The lexer reads them as a
@@ -118,6 +133,9 @@ HAS_OPERATOR = re.compile(r"\b__has_\w+")
 # Refused in code (comments and literal bodies blanked).
 DIGRAPH = re.compile(r"<:|:>|<%|%>|%:")
 TOKEN_PASTE = re.compile(r"##")
+# GCC, Clang and MSVC accept `$` in identifiers by default; the pp-number model does not, so a `$`
+# in code is refused (r7, fable r6 H3: `a$1'x'` read as a digit separator hid a later call).
+DOLLAR = re.compile(r"\$")
 # Only the plain condition counts: a negated or compound one is "other" (fail closed). Each
 # argument is a pp-number, read as a C preprocessor integer literal by _pp_int (r4, fable key3 r3).
 _PP_NUMBER = r"(\.?\d(?:[eEpP][+-]|'[0-9A-Za-z_]|[0-9A-Za-z_.])*)"
@@ -263,7 +281,8 @@ def _refused_forms(lines: list[Line]) -> list[tuple[int, str]]:
     refused: list[tuple[int, str]] = []
     defined = {m.group(1) for _, line, _ in lines if (m := DEFINE.match(line))}
     for number, line, where in lines:
-        for kind, pattern in (("digraph", DIGRAPH), ("token-paste", TOKEN_PASTE), ("non-ascii", NOT_PRINTABLE_ASCII)):
+        for kind, pattern in (("digraph", DIGRAPH), ("token-paste", TOKEN_PASTE), ("non-ascii", NOT_PRINTABLE_ASCII),
+                              ("dollar", DOLLAR)):
             refused.extend((_physical(where, m.start(), number), kind) for m in pattern.finditer(line))
         name = DIRECTIVE_NAME.match(line)
         if name and name.group(1) not in MODELLED_DIRECTIVES:
@@ -292,7 +311,8 @@ def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
     physical_lines = text.split("\n")
     refused = [
         (text.count("\n", 0, m.start()) + 1, kind)
-        for kind, pattern in (("splice", SPLICE), ("trigraph", TRIGRAPH), ("header-name", HEADER_NAME_UNREADABLE))
+        for kind, pattern in (("control-byte", CONTROL_BYTE), ("splice", SPLICE), ("trigraph", TRIGRAPH),
+                              ("header-name", HEADER_NAME_UNREADABLE), ("header-name", INCLUDE_ALIAS))
         for m in pattern.finditer(text)
     ]
     lines: list[Line] = []
@@ -795,7 +815,10 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         self.assertTrue(all(api.startswith("REFUSED") for _, api, _ in hits), hits)
         for prefix in (" ", " ", "　", "\x1c", "\x00", "​"):
             with self.subTest(prefix=repr(prefix)):
-                self.assertRefused(f"x();\n{prefix}#undef Y\n", ["non-ascii"], [2])
+                # r7: a C0 control byte (\x1c, \x00) is refused earlier, in the raw text, as
+                # control-byte (test_a_control_byte_anywhere_is_refused); it is still never read.
+                kind = "control-byte" if prefix < " " else "non-ascii"
+                self.assertRefused(f"x();\n{prefix}#undef Y\n", [kind], [2])
         # In a comment or a literal it is text.
         self.assertEqual(unguarded_newer_api_calls('// ﻿ café\nauto s = "é";\n'), [])
 
@@ -865,6 +888,55 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         # A readable header-name, with comments around it, is still read.
         self.assertEqual(unguarded_newer_api_calls(
             "#if __has_include /*\n*/ (<QImage>) // y\n#endif\n#include /* a\n b */ \"Player.h\" /* c */\n"), [])
+
+    def test_a_control_byte_anywhere_is_refused(self) -> None:
+        # sol r6 B1 (c9119076): GCC reads a NUL between a backslash and the line break as
+        # whitespace, so the splice closed a comment or literal the scanner kept open, and the call
+        # after it was live while the scan returned []. r7 does not model that: any C0 control byte
+        # but tab, LF, CR, VT and FF (and DEL) anywhere in the raw text is refused before lexing.
+        nul = "\\\x00"
+        for template in (
+            "/* x *" + nul + "\n/ return image.{api}(Qt::Horizontal); /* */\n",
+            'const char *s = "a' + nul + '\n"; return image.{api}(Qt::Horizontal);\n',
+            "auto c = 'a" + nul + "\n'; return image.{api}(Qt::Horizontal);\n",
+        ):
+            for api in NEWER_THAN_QT5_API:
+                for eol in ("\n", "\r\n", "\r"):
+                    source = template.format(api=api).replace("\n", eol)
+                    with self.subTest(source=source):
+                        self.assertRefused(source, ["control-byte"], [1])
+            branch = template.format(api="flipped")
+            with self.subTest(header_branch=branch):
+                hits = unguarded_newer_api_calls(self._header_with_branch(branch))
+                self.assertTrue(hits)
+                self.assertTrue(all(api == "REFUSED control-byte" for _, api, _ in hits), hits)
+        # Every other C0 byte and DEL is refused too, in a comment, a literal or code.
+        for byte in [chr(c) for c in range(0x20) if chr(c) not in "\t\n\r\v\f"] + ["\x7f"]:
+            for source in (f"x();\n// a{byte}b\n", f'x();\nauto s = "{byte}";\n', f"x();\n{byte}#undef Y\n"):
+                with self.subTest(byte=repr(byte), source=source):
+                    self.assertRefused(source, ["control-byte"], [2])
+        # Tab, VT and FF are read, in code and in a comment.
+        self.assertEqual(unguarded_newer_api_calls("\tx();\v\f// a\tb\v\f\n"), [])
+
+    def test_include_alias_is_refused(self) -> None:
+        # fable r6 H2: `#pragma include_alias` reads header-names the lexer does not know; with a
+        # comment spanning lines before its `<a/*>`, the `/*` hid a later call. r7 refuses the token.
+        source = "#pragma include_alias( /*\n*/ <a/*>, <b>)\nreturn image.flipped(Qt::Horizontal); /* */\n"
+        for text in (source, source.replace("\n", "\r\n"), '#pragma include_alias("a.h", "b.h")\n'):
+            with self.subTest(text=text):
+                self.assertRefused(text, ["header-name"], [1])
+        hits = unguarded_newer_api_calls(self._header_with_branch(source))
+        self.assertTrue(hits)
+        self.assertTrue(all(api.startswith("REFUSED") for _, api, _ in hits), hits)
+
+    def test_a_dollar_in_code_is_refused(self) -> None:
+        # fable r6 H3: compilers accept `$` in identifiers, so `a$1'x'` is an identifier and a char
+        # literal to them, but the scanner read `1'x` as a pp-number and its next ' opened a char
+        # literal that hid the call. r7 refuses a `$` in code; in a comment or a literal it is text.
+        source = "#define SECOND(a, b) b\nreturn SECOND(a$1'x', image.flipped(Qt::Horizontal));\n"
+        self.assertRefused(source, ["dollar"], [2])
+        self.assertRefused("auto a$b = 1;\n", ["dollar"], [1])
+        self.assertEqual(unguarded_newer_api_calls('// $x\nauto s = "$"; auto c = \'$\';\n'), [])
 
     def test_every_api_name_token_is_a_use(self) -> None:
         # r5: the token rule is fail closed: a bare call, a macro argument (of any macro, defined
