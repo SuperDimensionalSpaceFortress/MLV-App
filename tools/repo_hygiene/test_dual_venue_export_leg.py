@@ -2236,7 +2236,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
                 "$psi = [Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)\n"
                 f"foreach ($a in @('-NoProfile', '-Command', @'\n{TREE_ROOT_COMMAND.format(pid_file=pid_file)}\n'@)) {{ $psi.ArgumentList.Add($a) }}\n"
                 "$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true\n"
-                "$childPid = $null\n"
+                "$childPid = $null; $fixtureStart = [datetime]::Now.AddSeconds(-1)\n"
                 "try {\n" + block +
                 f"    $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }}\n"
                 "    $childAlive = ($null -ne $childPid) -and ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue))\n"
@@ -2244,7 +2244,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
                 "                childAlive = $childAlive; trace = @($traceLines) } | ConvertTo-Json -Compress\n"
                 "} finally {\n"
                 f"    if ($null -eq $childPid) {{ $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }} }}\n"
-                "    if ($null -ne $childPid) { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue }\n"
+                "    if ($null -ne $childPid) { $cp = Get-Process -Id $childPid -ErrorAction SilentlyContinue; if ($null -ne $cp -and $cp.StartTime -ge $fixtureStart) { $cp.Kill() } }\n"
                 "    if ($null -ne $app -and -not $app.HasExited) { $app.Kill($true) }\n"
                 "}\n", encoding="utf-8")
             proc = run_pwsh(["-File", str(script)], timeout=300)
@@ -2294,7 +2294,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             "$gone = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 201 100 $t))\n"
             "[ordered]@{ ok = $s.ok; members = @($s.members | ForEach-Object { $_.processId }); bad = $bad.ok; badWhy = $bad.error; rootGone = $gone.ok; rootGoneWhy = $gone.error } | ConvertTo-Json -Compress")
         self.assertTrue(got["ok"], got)
-        self.assertEqual(sorted(got["members"]), [201, 202], "the child and grandchild are members; an older process on the root's reused pid and a stranger are not")
+        # r1 fix iteration (adversary A2 on 2223cc4d): a child that reads three hours older than its parent (a clock stepped back) is still a member; creation times
+        # never order the walk, so a process on a reused pid is adopted too, which can only leave the kill unconfirmed. A stranger (parent 4) is not.
+        self.assertEqual(sorted(got["members"]), [201, 202, 300], "the walk follows ParentProcessId alone")
         self.assertFalse(got["bad"], got)
         self.assertIn("descendant-unreadable", got["badWhy"])
         self.assertFalse(got["rootGone"], got)
@@ -2320,6 +2322,28 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertFalse(got["unknown"], got)
         self.assertFalse(got["none"], got)
 
+    def test_r1_fix_the_wait_rewalks_late_descendants_keeps_its_bound_and_takes_only_a_boolean_ok(self) -> None:
+        """r1 fix iteration on 2223cc4d. A1: member 201 starts 202 after the snapshot and exits before the kill; 202 (parent 201) is a survivor. A3: -WaitMs 0 is
+        no time to confirm, and an empty scan that ENDS past the bound confirms nothing. A6: ok='false' (a string) is not the boolean $true."""
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$late = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 400 -Scan { @((Row 202 201 $t.AddSeconds(5)), (Row 203 202 $t.AddSeconds(6)), (Row 400 4 $t)) }\n"
+            "$rootChild = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 400 -Scan { @((Row 205 100 $t.AddSeconds(7))) }\n"
+            "$zero = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 0 -Scan { @() }\n"
+            "$slow = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 300 -Scan { Start-Sleep -Milliseconds 700; @() }\n"
+            "$str = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = 'false'; rootProcessId = 100; rootCreationTicks = 1; members = @(); error = 'scan-failed: denied' }) -WaitMs 400 -Scan { @() }\n"
+            "$empty = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 400 -Scan { @((Row 400 4 $t)) }\n"
+            "[ordered]@{ late = $late.confirmed; lateSurvivors = @($late.survivors); rootChild = $rootChild.confirmed; zero = $zero.confirmed; slow = $slow.confirmed;\n"
+            "            slowWhy = $slow.error; str = $str.confirmed; empty = $empty.confirmed } | ConvertTo-Json -Compress")
+        self.assertFalse(got["late"], got)
+        self.assertEqual(sorted(got["lateSurvivors"]), [202, 203], got)
+        self.assertFalse(got["rootChild"], "a child the root started after the snapshot is a survivor too")
+        self.assertFalse(got["zero"], got)
+        self.assertFalse(got["slow"], got)
+        self.assertEqual(got["slowWhy"], "scan-ended-past-the-bound", got)
+        self.assertFalse(got["str"], got)
+        self.assertTrue(got["empty"], "a tree with no live member and no live descendant is confirmed gone")
+
     def test_the_venue_bounded_process_confirms_its_kill_by_the_whole_tree(self) -> None:
         """Sibling (pass 26 A1 siblings): Invoke-VenueBoundedProcess (VenueChain.psm1) confirmed its kill by the root's HasExited; Invoke-VenueLeaseBatch.ps1 reads that
         killConfirmed for both export budget preflight children. A descendant that outlives the root now leaves it unconfirmed."""
@@ -2338,7 +2362,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             script.write_text(
                 "$ErrorActionPreference = 'Stop'\n"
                 f"Import-Module '{module}' -Force -DisableNameChecking\n"
-                "$childPid = $null\n"
+                "$childPid = $null; $fixtureStart = [datetime]::Now.AddSeconds(-1)\n"
                 "try {\n"
                 f"    $r = Invoke-VenueBoundedProcess -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-Command', @'\n{TREE_ROOT_COMMAND.format(pid_file=pid_file)}\n'@) -TimeoutSec 6 -CleanupWaitMs 3000\n"
                 f"    $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }}\n"
@@ -2346,7 +2370,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
                 "    [ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; childStarted = ($null -ne $childPid); childAlive = $childAlive } | ConvertTo-Json -Compress\n"
                 "} finally {\n"
                 f"    if ($null -eq $childPid) {{ $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }} }}\n"
-                "    if ($null -ne $childPid) { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue }\n"
+                "    if ($null -ne $childPid) { $cp = Get-Process -Id $childPid -ErrorAction SilentlyContinue; if ($null -ne $cp -and $cp.StartTime -ge $fixtureStart) { $cp.Kill() } }\n"
                 "}\n", encoding="utf-8")
             proc = run_pwsh(["-File", str(script)], timeout=300)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
