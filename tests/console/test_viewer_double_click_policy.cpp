@@ -158,7 +158,7 @@ TEST(ViewerDoubleClickPolicy, P2f_A1A2r1p2_MovementOrAFullIntervalStartsANewSequ
 TEST(ViewerDoubleClickPolicy, P2g_A3r1p2_WrappedNativeTimestampsCannotLoseTheArmedRecord)
 {
     // Adversary r1 pass 2 A3: GL path, WB-armed first press at native 4294967200, Qt pairs the
-    // second press at 100 after a 32-bit wrap and flags it. The gate reads no timestamp.
+    // second press at 100 after a 32-bit wrap and flags it. The gate measures no timestamp.
     Gate gate;
     gate.notePress(true, false);
     gate.notePress(false, true);
@@ -176,6 +176,49 @@ TEST(ViewerDoubleClickPolicy, P2h_ACompletedSuppressedPairDoesNotPoisonTheNextPa
     gate.notePress(false, false);
     gate.notePress(false, true);
     ASSERT_TRUE(gate.decide(Qt::LeftButton, Qt::NoModifier, readyState()));
+}
+
+TEST(ViewerDoubleClickPolicy, P2i_A2r1p3_AnUnflaggedPressElsewhereStartsAnUnarmedRecord)
+{
+    // Adversary r1 pass 3 A2: WB-armed viewer press at t=1000; WB off; Qt's first press of the
+    // new pair lands in the layout gap outside the viewer at t=10000 (unflagged); the second press
+    // on the viewer is flagged. The double-click must toggle.
+    Gate gate;
+    gate.notePress(true, false, 1000);
+    gate.noteOtherPress(false, 10000);
+    gate.notePress(false, true, 10100);
+    ASSERT_FALSE(gate.armedAtFirstPress());
+    ASSERT_TRUE(gate.decide(Qt::LeftButton, Qt::NoModifier, readyState()));
+}
+
+TEST(ViewerDoubleClickPolicy, P2j_A2r1p3_TheSamePressReachingAnotherObjectKeepsTheRecord)
+{
+    // One physical press reaches the top-level window first, then the viewport, then (ignored)
+    // the QGraphicsView parent; all carry its timestamp. An armed viewer press stays armed.
+    {
+        Gate gate;
+        gate.noteOtherPress(false, 5000); // the top-level QWidgetWindow sees it first
+        gate.notePress(true, false, 5000); // then the viewport
+        gate.noteOtherPress(false, 5000); // then the propagated copy to the QGraphicsView
+        ASSERT_TRUE(gate.armedAtFirstPress());
+        ASSERT_FALSE(gate.decide(Qt::LeftButton, Qt::NoModifier, readyState()));
+    }
+    {
+        // A flagged second press elsewhere never resets the record either.
+        Gate gate;
+        gate.notePress(true, false, 6000);
+        gate.noteOtherPress(true, 6100);
+        ASSERT_TRUE(gate.armedAtFirstPress());
+    }
+}
+
+TEST(ViewerDoubleClickPolicy, P5_A1r1p3_GradientHandleClaimsOnlyOnTheDisplayedView)
+{
+    ASSERT_TRUE(viewer_dblclick::gradientHandleClaims(true, true, true));
+    // GL path: the QGraphicsView is hidden; its scene item still reads visible and under the mouse.
+    ASSERT_FALSE(viewer_dblclick::gradientHandleClaims(false, true, true));
+    ASSERT_FALSE(viewer_dblclick::gradientHandleClaims(true, false, true));
+    ASSERT_FALSE(viewer_dblclick::gradientHandleClaims(true, true, false));
 }
 
 TEST(ViewerDoubleClickPolicy, P3_IsViewerTargetKeysOnIdentity)

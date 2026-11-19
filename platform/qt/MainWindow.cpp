@@ -3734,7 +3734,9 @@ viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( void ) const
     if( m_fileLoaded && m_pGradientElement && m_pGradientElement->gradientGraphicsElement() )
     {
         const QGraphicsItem *handle = m_pGradientElement->gradientGraphicsElement();
-        s.gradientHandleHovered = handle->isVisible() && handle->isUnderMouse();
+        //Only a handle drawn on the active viewer claims the click: on the GL path the view is hidden
+        //but its scene item still reads visible (adversary r1 pass 3 A1)
+        s.gradientHandleHovered = viewer_dblclick::gradientHandleClaims( ui->graphicsView->isVisible(), handle->isVisible(), handle->isUnderMouse() );
     }
     return s;
 }

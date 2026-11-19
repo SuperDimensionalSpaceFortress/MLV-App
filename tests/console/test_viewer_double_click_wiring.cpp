@@ -140,7 +140,8 @@ TEST(ViewerDoubleClickWiring, W4_StateReaderCoversEveryToolAndGuardsTheGradientP
     ASSERT_TRUE(body.contains(QStringLiteral("s.gradientPaintArmed = ui->toolButtonGradientPaint->isChecked();")));
 
     const int guardAt = body.indexOf(QStringLiteral("if( m_fileLoaded && m_pGradientElement && m_pGradientElement->gradientGraphicsElement() )"));
-    const int hoverAt = body.indexOf(QStringLiteral("s.gradientHandleHovered = handle->isVisible() && handle->isUnderMouse();"));
+    // Adversary r1 pass 3 A1: the handle counts only while the QGraphicsView is the visible display.
+    const int hoverAt = body.indexOf(QStringLiteral("s.gradientHandleHovered = viewer_dblclick::gradientHandleClaims( ui->graphicsView->isVisible(), handle->isVisible(), handle->isUnderMouse() );"));
     ASSERT_TRUE(guardAt >= 0);
     ASSERT_TRUE(hoverAt > guardAt);
     // The gradient pointer is never dereferenced ahead of the guard.
