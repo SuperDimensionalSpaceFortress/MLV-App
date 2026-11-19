@@ -1655,6 +1655,110 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn('sys.platform == "win32"', src[max(0, i - 260):i])
         self.assertIn('shutil.which("icacls")', src[max(0, i - 260):i])
 
+    # ---- BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1: a NOOP with -RestartMode when-idle restarts an agent that predates the file ------
+    # At 7d2ff913 the NOOP branch exited 0 before the restart, so an agent whose new file was already in place (a copy-only deploy, or
+    # a crash after the write) kept the old script in memory, and a -DryRun with when-idle exited 16 on the binding instead of reporting.
+
+    def _noop_venue_with_live_agent(self, agent_first: bool):
+        """The venue copy IS the source (a NOOP), and a live agent runs it. agent_first: the agent started BEFORE the file was written
+        (it has the old script in memory); otherwise the file was written, then the agent started more than the tolerance later."""
+        self.source.write_bytes(OLD)                 # OLD sleeps, so the live agent stays alive
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        if not agent_first:
+            time.sleep(3)                            # > $script:StartToleranceSec (2 s): the agent clearly starts after the file
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
+        if agent_first:
+            later = time.time() + 30                 # the file was (re)written after the agent started
+            os.utime(self.venue / AGENT_NAME, (later, later))
+        return pid, start
+
+    def test_noop1_a_noop_restarts_an_agent_that_predates_the_file(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        before = (self.venue / AGENT_NAME).stat().st_mtime_ns
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes\b" % sha(OLD))
+        self.assertTrue(self.marker.exists(), "the restart ran")
+        self.assertEqual((self.venue / AGENT_NAME).stat().st_mtime_ns, before, "a no-op still does not rewrite the file")
+        self.assertEqual(self.rollbacks(), [], "a no-op still makes no rollback folder")
+
+    def test_noop2_a_noop_leaves_an_agent_that_started_after_the_file_alone(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=False)
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=current\b" % sha(OLD))
+        self.assertFalse(self.marker.exists(), "an agent that already runs the file is not restarted")
+
+    def test_noop3_a_noop_whose_agent_start_cannot_be_read_fails_closed(self) -> None:
+        self.source.write_bytes(OLD)
+        for label, beat in (("no-heartbeat", None),
+                            ("no-start", 'alive x pid=%d host=%s generation=1 agentScript="%s"\r\n' % (os.getpid(), BENCH_HOST, self.venue / AGENT_NAME)),
+                            ("bad-start", 'alive x pid=%d host=%s generation=1 processStartUtc=not-a-time agentScript="%s"\r\n' % (os.getpid(), BENCH_HOST, self.venue / AGENT_NAME))):
+            with self.subTest(label=label):
+                hb = self.venue / "heartbeat.txt"
+                if beat is None:
+                    hb.unlink(missing_ok=True)
+                else:
+                    hb.write_text(beat)
+                r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+                self.assertNotEqual(r.returncode, 0, "never a silent success: " + r.stdout + r.stderr)
+                self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=unreadable\b" % sha(OLD))
+                self.assertFalse(self.marker.exists())
+
+    def test_noop4_a_noop_that_needs_a_restart_on_a_busy_venue_refuses(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        (self.venue / "inbox" / "j1.job.ps1").write_text("x")
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_BUSY running=0 inbox=1", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=busy\b" % sha(OLD))
+        self.assertFalse(self.marker.exists(), "a busy venue is never restarted")
+
+    def test_noop5_a_noop_with_when_idle_on_the_real_path_is_held_to_the_binding(self) -> None:
+        # no -RestartScript: the restart would act on this machine's task, so the binding must hold (no heartbeat here) - never exit 0
+        self.source.write_bytes(OLD)
+        r = self.run_deploy("-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=restart-host-refused\b" % sha(OLD))
+
+    def test_noop6_a_dry_run_with_when_idle_reports_the_binding_instead_of_exiting_16(self) -> None:
+        # the deploy action, the real path, no heartbeat: the binding cannot hold; a dry run says so and exits 0, changing nothing
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=deploy sha=%s restart=when-idle decision=refuse wouldExit=16 " % sha(NEW))
+        self.assertNotIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assert_untouched()
+        # the same on a NOOP
+        self.source.write_bytes(OLD)
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=no-restart reason=restart-host-refused wouldExit=16 " % sha(OLD))
+
+    def test_noop7_a_dry_run_names_the_restart_decision_and_never_restarts(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=restart reason=agent-predates-file wouldExit=0\b" % sha(OLD))
+        self.assertFalse(self.marker.exists(), "a dry run never restarts")
+        # and a bound deploy dry run names its decision too
+        (self.venue / AGENT_NAME).write_bytes(NEW)
+        self.source.write_bytes(OLD)
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=deploy sha=%s restart=when-idle decision=restart-if-idle wouldExit=0\b" % sha(OLD))
+        self.assertFalse(self.marker.exists())
+
+    def test_noop8_a_noop_with_the_default_restart_mode_is_unchanged(self) -> None:
+        # -RestartMode none keeps the exact contract line (the hub parses it), busy or not
+        (self.venue / AGENT_NAME).write_bytes(NEW)
+        (self.venue / "inbox" / "j1.job.ps1").write_text("x")
+        for extra in ((), ("-DryRun",)):
+            r = self.run_deploy(*extra)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s\s*$" % sha(NEW))
+
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.
         r = subprocess.run(
