@@ -1431,30 +1431,35 @@ class DeadlineKiller:
         """Kill every running worker that is due. The lock is held only to pick them and to record the
         result, never across a kill (a ``taskkill`` can block for its whole bound): ``add`` and the other
         workers' kills are never held up behind it, and the due workers are ended at the same time."""
-        with self._lock:
-            if self._clock() < self._deadline:
-                return
-            due: list[tuple[int, subprocess.Popen[bytes]]] = []
-            for number, proc in enumerate(self._procs, start=1):
-                if number in self.killed or number in self._inflight:
-                    continue  # ended already, or another thread is ending it right now
-                try:
-                    if proc.poll() is not None:
-                        continue  # a failure already on record stays: the parent reports it
-                except BaseException as exc:  # noqa: BLE001 - the watchdog thread must survive anything
-                    self.failed[number] = describe_error(exc)
-                    continue
-                due.append((number, proc))
-                self._inflight.add(number)
-        if not due:
-            return
-        errors: list[str | None] = ["the kill did not complete"] * len(due)
+        due: list[tuple[int, subprocess.Popen[bytes]]] = []
+        errors: list[str | None] | None = None
+        # The ``try`` starts BEFORE the first ``_inflight`` mark: whatever fails after one (an allocation, the kill,
+        # a malformed result), the ``finally`` clears every mark first, so the next slice retries those workers.
         try:
+            with self._lock:
+                if self._clock() < self._deadline:
+                    return
+                for number, proc in enumerate(self._procs, start=1):
+                    if number in self.killed or number in self._inflight:
+                        continue  # ended already, or another thread is ending it right now
+                    try:
+                        if proc.poll() is not None:
+                            continue  # a failure already on record stays: the parent reports it
+                    except BaseException as exc:  # noqa: BLE001 - the watchdog thread must survive anything
+                        self.failed[number] = describe_error(exc)
+                        continue
+                    due.append((number, proc))
+                    self._inflight.add(number)
+            if not due:
+                return
             errors = terminate_all([proc for _number, proc in due], reap=False)
         finally:
             with self._lock:
-                for (number, _proc), error in zip(due, errors, strict=True):
+                for number, _proc in due:  # first, and allocating nothing: no mark outlives this slice
                     self._inflight.discard(number)
+                known = errors is not None and len(errors) == len(due)
+                for index, (number, _proc) in enumerate(due):
+                    error = errors[index] if known else "the kill did not complete"  # type: ignore[index]
                     if error is None:
                         self.killed.add(number)
                         self.failed.pop(number, None)
@@ -1523,6 +1528,7 @@ def run_parallel(
     logs: list[Path] = []
     codes: list[int | None] = []
     procs: list[tuple[subprocess.Popen[bytes], IO[bytes]]] = []
+    loose: list[IO[bytes]] = []  # the logs of workers never launched: closed again by the cleanup (``close_logs``)
     handled = 0  # how many of the grouped worker logs (in order) are fully dealt with: the rest are the fallback's
     unread: list[int] = []  # 1-based workers whose log could not be read: the work dir is kept for them
     stuck: set[int] = set()  # 1-based workers the OS would not let the parent kill
@@ -1579,18 +1585,35 @@ def run_parallel(
         ended_late, returned = end_running_workers([proc for proc, _log in procs])
         return handed_back(returned)  # the interrupt it met and contained (if any): kept by the driver
 
+    def close_log(log: IO[bytes]) -> bool:
+        """Close ``log``, made again (at most ``CLEANUP_ATTEMPTS`` tries) while it is still open: an interrupt can land
+        before the handle is released, and an open handle keeps the work dir from being removed. Each interrupt met
+        is kept for the driver; ``True`` once the log is closed (a close that returns, or a log that reads closed)."""
+        for _attempt in range(CLEANUP_ATTEMPTS):
+            try:
+                log.close()
+                return True
+            except BaseException as close_error:  # noqa: BLE001 - kept; the other logs are still closed
+                if not isinstance(close_error, OSError):  # a failed flush is not the run's outcome
+                    met.append(close_error)
+            try:
+                if log.closed:
+                    return True
+            except BaseException as read_error:  # noqa: BLE001 - unknown is not closed: tried again
+                met.append(read_error)
+        return False
+
     def close_logs() -> None:  # a worker the census could not end is recorded once; every log is closed
         for number, (_proc, log) in enumerate(procs, start=1):
             error = ended_late.get(number)
             if error is not None and number not in stuck:
                 note(f"worker {number}/{len(procs)} could not be terminated: {error}")
                 stuck.add(number)
-            try:
-                log.close()
-            except OSError:
-                pass
-            except BaseException as close_error:  # noqa: BLE001 - kept; the other logs are still closed
-                met.append(close_error)
+            if not close_log(log):  # its handle keeps the dir: said, and the dir is kept (``keeping``)
+                note(f"worker {number}/{len(procs)} log could not be closed; {kept_at}")
+        for log in loose:  # the log of a worker never launched: not evidence, but its handle is still released
+            if not close_log(log):
+                note(f"a worker log could not be closed; {kept_at}")
 
     def print_left_logs() -> None:
         """An exception in flight (a launch that raised, say) skipped the grouped logs or cut them short: every
@@ -1726,9 +1749,10 @@ def run_parallel(
             ]
             # The last step before the launch, after every blocking one (spec write, status line, log
             # open): a worker is never started once the deadline has passed.
-            if clock() >= deadline:
-                log.close()
+            if clock() >= deadline:  # recorded first, and the log known to the cleanup, before the close is tried
                 problems.append(f"worker {number}/{len(groups)} not launched: the deadline passed while launching")
+                loose.append(log)
+                log.close()
                 continue
             proc = None
             try:
@@ -1755,7 +1779,8 @@ def run_parallel(
                 else:
                     # A launch that failed with no child is not in procs: the cleanup below would never close its
                     # log. Closed only after the child (if any) is adopted, so a close that fails cannot outrank
-                    # that, and never replaces the launch's own error.
+                    # that, and never replaces the launch's own error. Known to the cleanup first: it closes it again.
+                    loose.append(log)
                     with contextlib.suppress(Exception):
                         log.close()
                 raise

@@ -4261,6 +4261,77 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIn("kept at", err)
         self.assertEqual(removed, [], "a work dir a problem says is kept was removed")
 
+    # ---- r22, adversary pass 35 A1: a watchdog slice that fails after marking a worker in flight must not strand it. ----
+    def test_r22_adv35_a1_a_slice_that_fails_after_the_inflight_mark_leaves_the_worker_retryable(self) -> None:
+        now = [0.0]
+        killer = shard.DeadlineKiller(1.0, lambda: now[0])
+        proc = self._RunningProc()
+        killer.add(proc)  # not due yet
+        now[0] = 2.0
+        killed: list[object] = []
+        fired = [False]
+
+        def local(frame: types.FrameType, event: str, arg: object) -> object:
+            if fired[0] or event != "line":
+                return None if fired[0] else local
+            if armed[0]:  # the first line after ``if not due:`` with workers due: the mark is already set
+                fired[0] = True
+                raise MemoryError("slice allocation")
+            armed[0] = linecache.getline(frame.f_code.co_filename, frame.f_lineno).strip().startswith("if not due:")
+            return local
+
+        armed = [False]
+
+        def tracer(frame: types.FrameType, event: str, arg: object) -> object:
+            if event == "call" and not fired[0] and frame.f_code is shard.DeadlineKiller._kill_due.__code__:
+                return local
+            return None
+
+        with mock.patch.object(shard, "terminate_all", lambda procs, reap=True: [killed.extend(procs)] and [None] * len(procs)):
+            with self.assertRaises(MemoryError), self._traced(tracer):
+                killer._kill_due()
+            self.assertTrue(fired[0], "the failure was never injected after the mark")
+            killer._kill_due()  # the next slice
+        self.assertEqual(killed, [proc], "a failed slice left the worker marked in flight: no later slice ever ends it")
+        self.assertEqual(killer.killed, {1})
+        self.assertEqual(killer._inflight, set())
+
+    # ---- r22, adversary pass 35 A2: a log close interrupted before the handle is released is made again. ----
+    def test_r22_adv35_a2_a_log_close_interrupted_before_the_release_is_made_again(self) -> None:
+        real_open = Path.open
+        reals: dict[str, object] = {}
+        closes: list[str] = []
+
+        class EarlyInterruptLog:
+            def __init__(self, real: object, name: str) -> None:
+                self._real, self._name = real, name
+
+            def close(self) -> None:
+                closes.append(self._name)
+                if self._name == "w1" and closes.count("w1") == 1:
+                    raise KeyboardInterrupt("close before release")
+                self._real.close()  # type: ignore[attr-defined]
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+        def path_open(path: Path, *args: object, **kwargs: object) -> object:
+            opened = real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path.name == "log.txt" and args[:1] == ("wb",):
+                reals[path.parent.name] = opened
+                self.addCleanup(opened.close)
+                return EarlyInterruptLog(opened, path.parent.name)
+            return opened
+
+        raised, err = self._run_to_exception(
+            self._finished_popen([], raise_on=2), extra=mock.patch.object(Path, "open", path_open),
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised) + err)
+        self.assertGreaterEqual(closes.count("w1"), 2, "the interrupted close was never made again")
+        self.assertTrue(reals["w1"].closed, "worker 1's log handle was left open")  # type: ignore[attr-defined]
+        self.assertTrue(reals["w2"].closed, "the never-launched worker's log handle was left open")  # type: ignore[attr-defined]
+        self.assertIn("kept at", err)
+
     # ---- r22, adversary pass 34 advisories in scope: A2 (serial watch started outside the try), A3 (attempts=0). ----
     def test_r22_adv34_a2_an_interrupt_right_after_the_serial_watch_starts_still_stops_it(self) -> None:
         original = shard.BudgetWatch.start
