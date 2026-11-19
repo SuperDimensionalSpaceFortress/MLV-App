@@ -14,6 +14,7 @@ from __future__ import annotations
 import bisect
 import re
 import unittest
+from collections import Counter
 from pathlib import Path
 
 
@@ -42,6 +43,10 @@ DIRECTIVE = re.compile(rf"^\s*{_HASH}\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$
 # hides the call from API_CALL, so the name in the #define itself counts (adversary r2 A2).
 DEFINE = re.compile(rf"^\s*{_HASH}\s*define\b(.*)$")
 BARE_NAME = re.compile(rf"\b({_NAMES})\b")
+# The guard trusts Qt's own QT_VERSION / QT_VERSION_CHECK, so a #define or #undef of either makes
+# every later version arm "other" (adversary r4 A3).
+TOKEN_PASTE = re.compile(r"##|%:%:")
+VERSION_MACRO_REDEFINED = re.compile(rf"^\s*{_HASH}\s*(?:define|undef)\s+QT_VERSION(?:_CHECK)?\b")
 # Only the plain condition counts: a negated or compound one is "other" (fail closed). Each
 # argument is a pp-number, read as a C preprocessor integer literal by _pp_int (r4, fable key3 r3).
 _PP_NUMBER = r"(\.?\d(?:[eEpP][+-]|'[0-9A-Za-z_]|[0-9A-Za-z_.])*)"
@@ -71,20 +76,39 @@ def _pp_int(token: str) -> int | None:
     return None
 
 
-def _qt_version_value(major: int, minor: int, patch: int) -> int:
-    # QT_VERSION_CHECK(major, minor, patch) is ((major << 16) | (minor << 8) | (patch)).
-    return (major << 16) | (minor << 8) | patch
+def _qt_version_value(major: int, minor: int, patch: int) -> int | None:
+    """QT_VERSION_CHECK(major, minor, patch) is ((major << 16) | (minor << 8) | (patch)). A value
+    of 2**31 or more is None: the preprocessor's intmax_t / uintmax_t arithmetic can overflow or
+    wrap there (adversary r4 A4: (2**48 + 5ULL) << 16 wraps to 0x050900), and no Qt is near it."""
+    value = (major << 16) | (minor << 8) | patch
+    return value if value < 2**31 else None
 
 
-def _logical_lines(text: str) -> list[tuple[int, str]]:
-    """(physical start line, logical line): backslash splices joined; comments and the contents of
-    string, char and raw-string literals blanked, so a name inside them never counts. CRLF and a
-    lone CR end a line as LF does, and an unterminated ' or " ends at the line end."""
+# Translation phase 1 where trigraphs are on (C++14 and older with -trigraphs or a strict -std).
+_TRIGRAPH = re.compile(r"\?\?[=/'()!<>\-]")
+_TRIGRAPH_CHAR = {"=": "#", "/": "\\", "'": "^", "(": "[", ")": "]", "!": "|", "<": "{", ">": "}", "-": "~"}
+
+
+def _translate_trigraphs(text: str) -> str:
+    return _TRIGRAPH.sub(lambda m: _TRIGRAPH_CHAR[m.group(0)[2]], text)
+
+
+def _logical_lines(text: str) -> list[tuple[int, str, list[int]]]:
+    """(physical start line, logical line, physical line of each character): backslash splices
+    joined; comments and the contents of string, char and raw-string literals blanked, so a name
+    inside them never counts. CRLF and a lone CR end a line as LF does, and an unterminated ' or "
+    ends at the line end."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    out: list[tuple[int, str]] = []
+    out: list[tuple[int, str, list[int]]] = []
     current: list[str] = []
+    where: list[int] = []  # physical line of each character in `current` (adversary r4 A5)
     start = line = 1
     state = "code"  # code | line_comment | block_comment | string | char
+
+    def emit(chars: str) -> None:
+        current.extend(chars)
+        where.extend([line] * len(chars))
+
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
@@ -99,8 +123,8 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
             if state == "block_comment":
                 i += 1
                 continue
-            out.append((start, "".join(current)))
-            current, start = [], line
+            out.append((start, "".join(current), where))
+            current, where, start = [], [], line
             i += 1
             continue
         nxt = text[i + 1] if i + 1 < n else ""
@@ -111,12 +135,12 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
                 continue
             if ch == "/" and nxt == "*":
                 state = "block_comment"
-                current.append(" ")
+                emit(" ")
                 i += 2
                 continue
             token = re.search(r"[\w'.]*$", "".join(current)).group(0)
             if ch == "'" and token[:1].isdigit():
-                current.append(ch)  # a digit separator (1'000), not a char literal
+                emit(ch)  # a digit separator (1'000), not a char literal
                 i += 1
                 continue
             if ch == '"' and re.search(r"\w*$", token).group(0) in ("R", "LR", "uR", "UR", "u8R"):
@@ -125,12 +149,12 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
                 if close >= 0:
                     end = close + len(opened.group(1)) + 2
                     line += text.count("\n", i, end)
-                    current.append('""')
+                    emit('""')
                     i = end
                     continue
             if ch in "\"'":
                 state = "string" if ch == '"' else "char"
-            current.append(ch)
+            emit(ch)
         elif state == "block_comment":
             if ch == "*" and nxt == "/":
                 state = "code"
@@ -142,43 +166,64 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
                 continue
             if ch == ('"' if state == "string" else "'"):
                 state = "code"
-                current.append(ch)
+                emit(ch)
         i += 1
-    out.append((start, "".join(current)))
+    out.append((start, "".join(current), where))
     return out
 
 
 def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
     """(line, api name, line text) for each call outside an arm that compiles only on a Qt new
-    enough for that API."""
+    enough for that API. The text is read twice, as written and with trigraphs translated (a
+    `??/` splice exists only where trigraphs are on, adversary r4 A1), and a finding in either
+    reading counts; a call both readings see is one finding."""
+    plain = _scan(text)
+    found = list(plain)
+    left = Counter((n, api) for n, api, _ in plain)
+    for hit in _scan(_translate_trigraphs(text)):
+        if left[hit[:2]]:
+            left[hit[:2]] -= 1
+        else:
+            found.append(hit)
+    found.sort(key=lambda hit: hit[0])
+    return found
+
+
+def _scan(text: str) -> list[tuple[int, str, str]]:
     # Each frame: [kind, version, arm_floor]. kind "ge" (#if QT_VERSION >= V), "lt" (#if QT_VERSION
     # < V) or "other"; V and arm_floor are QT_VERSION_CHECK values, arm_floor the lowest Qt the
     # current arm can compile on, or None.
     stack: list[list] = []
     found: list[tuple[int, str, str]] = []
+    redefined = False  # a #define / #undef of QT_VERSION or QT_VERSION_CHECK was seen (A3)
 
     def trusted(api: str, floors: tuple[int, ...]) -> bool:
         needed = _qt_version_value(*NEWER_THAN_QT5_API[api], 0)
         return any(floor >= needed for floor in floors)
 
+    def physical(where: list[int], k: int, number: int) -> int:
+        return where[k] if 0 <= k < len(where) else number
+
     # r4 (r3 keys sol B1, opus, fable key3): the member access may span lines (`image.` then
     # `flipped` on the next line, or `QImage` then `::flipped`), so API_CALL runs once over the
     # code lines joined by "\n", directive and #define lines left empty; each match is mapped
-    # back to the line its NAME is on and judged by the arms open there.
-    starts: list[int] = []  # offset of each logical line in `joined`
-    lines: list[tuple[int, str, tuple[int, ...]]] = []  # (line number, text, floors)
+    # back to the physical line its NAME is on and judged by the arms open there.
+    starts: list[int] = []  # offset of each logical line in the joined text
+    lines: list[tuple[int, str, list[int], tuple[int, ...]]] = []  # (start line, text, where, floors)
     parts: list[str] = []
     offset = 0
-    for number, line in _logical_lines(text):
+    for number, line, where in _logical_lines(text):
         code = ""
+        if VERSION_MACRO_REDEFINED.match(line):
+            redefined = True
         directive = DIRECTIVE.match(line)
         if directive:
             keyword, rest = directive.group(1), directive.group(2)
             if keyword in ("if", "ifdef", "ifndef"):
                 check = VERSION_CHECK.fullmatch(rest.strip()) if keyword == "if" else None
                 args = [_pp_int(check.group(k)) for k in (2, 3, 4)] if check else [None]
-                if check and None not in args:
-                    version = _qt_version_value(*args)
+                version = None if redefined or None in args else _qt_version_value(*args)
+                if check and version is not None:
                     if check.group(1) == ">=":
                         stack.append(["ge", version, version])
                     else:
@@ -197,19 +242,24 @@ def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
             floors = tuple(frame[2] for frame in stack if frame[2] is not None)
             define = DEFINE.match(line)
             if define:
-                for match in BARE_NAME.finditer(define.group(1)):
+                # A token paste can spell any name (`a ## b`, then JOIN(flip,ped)), and the scan
+                # does not expand macros, so a paste is itself a finding (adversary r4 A2).
+                for match in TOKEN_PASTE.finditer(line, define.start(1)):
+                    found.append((physical(where, match.start(), number), "##", line.strip()))
+                for match in BARE_NAME.finditer(line, define.start(1)):
                     if not trusted(match.group(1), floors):
-                        found.append((number, match.group(1), line.strip()))
+                        found.append((physical(where, match.start(1), number), match.group(1), line.strip()))
             else:
                 code = line
         starts.append(offset)
-        lines.append((number, line, floors))
+        lines.append((number, line, where, floors))
         parts.append(code)
         offset += len(code) + 1
     for match in API_CALL.finditer("\n".join(parts)):
-        number, line, floors = lines[bisect.bisect_right(starts, match.start(1)) - 1]
+        index = bisect.bisect_right(starts, match.start(1)) - 1
+        number, line, where, floors = lines[index]
         if not trusted(match.group(1), floors):
-            found.append((number, match.group(1), line.strip()))
+            found.append((physical(where, match.start(1) - starts[index], number), match.group(1), line.strip()))
     found.sort(key=lambda hit: hit[0])
     return found
 
@@ -439,6 +489,78 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             with self.subTest(directive=directive):
                 fixture = f"{directive}\nreturn image.flipped();\n"
                 self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(fixture)], [(2, "flipped")])
+
+    def test_a_trigraph_splice_is_read_both_ways(self) -> None:
+        # adversary r4 A1 (8a66187d): `??/` is a backslash only where trigraphs are on, so a finding
+        # in either reading counts. Here the trigraph reading closes the arm before the call...
+        closes_arm = "#if QT_VERSION >= QT_VERSION_CHECK(6,9,0)\n#en??/\ndif\nreturn image.flipped();\n"
+        self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(closes_arm)], [(4, "flipped")])
+        # ...and here the plain reading keeps the call out of the comment.
+        ends_comment = "// note ??/\nreturn image.flipped();\n"
+        self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(ends_comment)], [(2, "flipped")])
+        # One call is one finding, even when both readings see it.
+        self.assertEqual(len(unguarded_newer_api_calls("auto p = i.flipped(); auto q = i.flipped();\n")), 2)
+
+    def test_a_token_paste_in_a_define_is_a_finding(self) -> None:
+        # adversary r4 A2: the scan does not expand macros, so it refuses a paste instead of
+        # following it, wherever the #define sits.
+        for source in (
+            "#define JOIN(a,b) a ## b\nreturn image.JOIN(flip,ped)(Qt::Horizontal);\n",
+            "#define JOIN(a,b) a%:%:b\n",
+            "#define JOIN(a,b) a ??=??= b\n",
+            "#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)\n#define JOIN(a,b) a##b\n#endif\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual([a for _, a, _ in unguarded_newer_api_calls(source)], ["##"])
+        # `#` stringizing and a `##` in a comment or string are not pastes.
+        self.assertEqual(unguarded_newer_api_calls('#define S(x) #x /* a ## b */ "##"\n'), [])
+
+    def test_a_redefined_version_macro_is_never_trusted(self) -> None:
+        # adversary r4 A3: the guard trusts Qt's own QT_VERSION / QT_VERSION_CHECK, so a #define or
+        # #undef of either in the scanned text makes every later arm untrusted.
+        ge_form = (
+            "#if QT_VERSION >= QT_VERSION_CHECK( 6, 9, 0 )\n"
+            "    return image.flipped( Qt::Horizontal );\n"
+            "#else\n"
+            "    return image.mirrored( true, false );\n"
+            "#endif\n"
+        )
+        for prefix in (
+            "#undef QT_VERSION_CHECK\n#define QT_VERSION_CHECK(a,b,c) 0\n",
+            "#define QT_VERSION_CHECK(a, b, c) 0\n",
+            "#undef QT_VERSION\n",
+            "#define QT_VERSION 0x070000\n",
+            "%:  define QT_VERSION 0x070000\n",
+        ):
+            with self.subTest(prefix=prefix):
+                fixture = prefix + ge_form
+                line = prefix.count("\n") + 2
+                self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(fixture)], [(line, "flipped")])
+        # A name that only starts with the macro name is not a redefinition.
+        self.assertEqual(unguarded_newer_api_calls("#define QT_VERSION_CHECKED 1\n" + ge_form), [])
+
+    def test_a_version_past_the_preprocessor_range_is_never_trusted(self) -> None:
+        # adversary r4 A4: (2**48 + 5ULL) << 16 wraps to 0x050900 in 64-bit preprocessing.
+        for major in ("281474976710661ULL", "32768", "0x8000"):
+            for op in (">=", "<"):
+                with self.subTest(major=major, op=op):
+                    body, other = "return image.flipped();\n", "return image.mirrored( true, false );\n"
+                    arms = body + "#else\n" + other if op == ">=" else other + "#else\n" + body
+                    fixture = f"#if QT_VERSION {op} QT_VERSION_CHECK({major},9,0)\n{arms}#endif\n"
+                    self.assertEqual([a for _, a, _ in unguarded_newer_api_calls(fixture)], ["flipped"])
+
+    def test_a_finding_names_the_physical_line_of_the_name(self) -> None:
+        # adversary r4 A5: a multi-line comment or raw string before the call on the same logical line.
+        for source in (
+            "/* x\n */ return image.flipped();\n",
+            'auto r = R"(a\nb)"; return image.flipped();\n',
+            "auto a = 1; /* one\n two */ auto p = e->\nposition();\n",
+        ):
+            with self.subTest(source=source):
+                expected = source.rstrip("\n").count("\n") + 1
+                self.assertEqual([n for n, _, _ in unguarded_newer_api_calls(source)], [expected])
+        alias = "#define A /* x\n */ flipped\n"
+        self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(alias)], [(2, "flipped")])
 
     def test_names_that_only_contain_an_api_name_do_not_count(self) -> None:
         fixture = "auto a = img.flippedCopy(); auto b = flipped(); auto c = s.positions();\n"
