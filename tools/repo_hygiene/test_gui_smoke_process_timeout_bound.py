@@ -1022,5 +1022,51 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
             self.assertEqual(0, out["exitCode"])
 
 
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class AnOverrunRecognizedAfterAStallVerdictCarriesTheTimeoutReasonNotTheStallOne(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r14 (adversary 9af35de9 A2, major, introduced): once the boundary recognizes that a confirmed exit came after the
+    whole budget (or the caller already said the deadline was reached) the leg is a timeout, but the stall flag the caller passed was still read afterwards,
+    so the typed outcome stayed process_no_progress with a prose "ended before the whole budget" line for an app that outlived the budget (exit 124 was
+    right, the reason was not). Class: a stale flag read after a state transition."""
+
+    def _call(self, stub: str, switches: str, budget_args: str) -> dict:
+        return run_ps(r"""
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
+$s = New-Stub '%s'
+[void]$s.p.WaitForExit(30000)
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 3000 -NoProgressWindowMs 1000 -LaunchTimestamp $launch %s %s
+[pscustomobject]@{ timedOut = $r.timedOut; outcome = $r.outcome; noProgress = $r.noProgress; window = $r.noProgressWindowMs; exitCode = $r.exitCode; failures = @($r.failures) } | ConvertTo-Json -Compress
+""" % (stub, switches, budget_args))
+
+    def _assert_plain_timeout(self, out: dict) -> None:
+        self.assertTrue(out["timedOut"])
+        self.assertEqual(124, out["exitCode"])
+        self.assertEqual("timeout", out["outcome"], "an overrun is a timeout, whatever the caller's stall flag said before the look")
+        self.assertFalse(out["noProgress"])
+        self.assertIsNone(out["window"], "no stall window is reported for a leg that was not ended by a stall")
+        text = " ".join(out["failures"])
+        self.assertNotIn("process_no_progress", text)
+        self.assertIn("exceeded the fail-closed process timeout of 3000 ms", text)
+
+    def test_a_stall_verdict_followed_by_an_exit_after_the_budget_is_typed_as_a_timeout(self) -> None:
+        self._assert_plain_timeout(self._call("exit 0", "-NoProgressStalled", "-LifetimeBudgetMs 1"))
+
+    def test_a_stall_flag_together_with_the_reached_deadline_is_typed_as_a_timeout(self) -> None:
+        self._assert_plain_timeout(self._call("exit 0", "-NoProgressStalled -DeadlineReached", ""))
+
+    def test_a_stall_verdict_over_a_process_still_running_is_still_process_no_progress(self) -> None:
+        out = self._call("Start-Sleep -Seconds 30", "-NoProgressStalled", "-LifetimeBudgetMs 600000")
+        self.assertTrue(out["timedOut"])
+        self.assertEqual("process_no_progress", out["outcome"])
+        self.assertTrue(out["noProgress"])
+        self.assertEqual(1000, out["window"])
+        self.assertEqual(124, out["exitCode"])
+
+    def test_the_timeout_read_of_the_stall_flag_happens_after_the_overrun_is_decided(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("$noProgress = [bool]$NoProgressStalled\n", code, "the stall flag is combined with the overrun verdict, never copied alone")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -398,6 +398,7 @@ function Wait-GuiSmokeProcessBounded {
     $treeKillSucceeded = $false
     $terminationConfirmed = $false
     $noProgress = $false
+    $overrunRecognized = $false
     # CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 r2 (Dot pr-780 S1): the wall-clock moment a WaitForExit call returned true, i.e. when termination was
     # confirmed, stamped BEFORE the stream drain below (which can run up to 2 x $StreamDrainMs past the exit while a child holds an inherited
     # handle). $null when termination was never confirmed. The caller's own end stamp, taken after this function returns, includes that drain.
@@ -418,6 +419,7 @@ function Wait-GuiSmokeProcessBounded {
                     # the exit is real but came after the whole budget was spent: it is not a completion. The timeout path below ends the (already
                     # exited) tree and reports the whole budget, exactly as for an app still running at the deadline.
                     $terminationConfirmed = $false
+                    $overrunRecognized = $true
                     $exitObservedTimestamp = $null; $exitObservedAtUtc = $null
                 }
             }
@@ -431,7 +433,10 @@ function Wait-GuiSmokeProcessBounded {
 
     if (-not $terminationConfirmed) {
         $timedOut = $true
-        $noProgress = [bool]$NoProgressStalled
+        # r14 (adversary 9af35de9 A2): the caller's stall flag is a verdict about the moment it broke its wait. An overrun this call recognized afterwards
+        # (a late exit past the whole budget, or the caller's own reached deadline) makes the leg a timeout: the stall reason would claim the leg ended
+        # before its budget, so it is read only while neither overrun fact is true.
+        $noProgress = [bool]$NoProgressStalled -and -not $overrunRecognized -and -not [bool]$DeadlineReached
         if ($noProgress) {
             # r6 (sol r5 H2, VENUE-SMOKE-KILL-PROSE-UNCONFIRMED-1): this line is written BEFORE the kill below, so it says termination was
             # REQUESTED; "termination was confirmed" is added only once the post-kill wait has seen the exit.
