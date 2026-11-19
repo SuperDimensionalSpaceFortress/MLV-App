@@ -3516,6 +3516,26 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     $r = Invoke-SpRun $spR3 $spAuth -VerifyOnly
     Assert-That ($r.Failures -contains 'PUSHURL_FOREIGN remote=fork') 'SSH-PUSHURL-1 verify: a foreign pushurl while ssh authenticates is a typed failure PUSHURL_FOREIGN' ($r.Failures -join ',')
 
+    # --- adversary pass 1 (head 8011aa9c): A1 Verify of a refused remote, A3 a pushurl that appears while ssh is probed, A4 unsafe configured pushurls, A5 a non-[bool] verdict
+    $r = Invoke-SpRun $spR4 $spAuth -VerifyOnly
+    Assert-That ($r.Failures -contains 'PUSHURL_REFUSED remote=fork') 'SSH-PUSHURL-1 A1 verify: a refused remote (insteadOf over the fork url) is a typed Verify failure PUSHURL_REFUSED, never a silent pass' ($r.Failures -join ',')
+    $script:spA3Repo = New-SpRepo 'toctou'
+    $spRace = { & git -C $script:spA3Repo config --add remote.fork.pushurl 'https://github.com/SuperDimensionalSpaceFortress/MLV-App'; @{ Authenticated = $true; Detail = 'authenticated' } }
+    $r = Invoke-SpRun $script:spA3Repo $spRace
+    Assert-That (@(Get-SpCfg $script:spA3Repo 'remote.fork.pushurl').Count -eq 1 -and (Get-SpCfg $script:spA3Repo 'remote.fork.pushurl') -ceq 'https://github.com/SuperDimensionalSpaceFortress/MLV-App') 'SSH-PUSHURL-1 A3 setup: a pushurl that appeared while ssh was probed is never overwritten' ((Get-SpCfg $script:spA3Repo 'remote.fork.pushurl') -join ',')
+    Assert-That ($r.Failures -contains 'PUSHURL_CHANGED_DURING_PROBE remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY') 'SSH-PUSHURL-1 A3 setup: that race is a typed failure and prints no SSH_PUSH_READY' "$($r.Failures -join ',')`n$($r.Log)"
+    foreach ($spBadPush in @("git@github.com:SuperDimensionalSpaceFortress/MLV-App.git`n", 'alias', '-oProxyCommand=x')) {
+        $d = Get-SpDecision @($spU) @($spBadPush) $spAuth @() @('alias')
+        Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) "SSH-PUSHURL-1 A4 decide: an unsafe configured pushurl ('$($spBadPush -replace "`n", '\n')') -> REFUSED before the probe" "$($d.Decision) calls=$script:spCalls"
+    }
+    $d = Get-SpDecision @($spU) @($spS) $spAuth @('git@github.com:')
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 A4 decide: a pushurl rewritten by an insteadOf rule -> REFUSED before the probe' $d.Decision
+    foreach ($spVerdict in @(@{ Authenticated = 'false'; Detail = 'x' }, @{ Authenticated = 'true'; Detail = 'x' }, @{ Authenticated = 1; Detail = 'x' }, @{ Detail = 'no verdict' }, $null, 'authenticated')) {
+        $spProbeBad = { $spVerdict }.GetNewClosure()
+        $d = Get-SpDecision @($spU) @() $spProbeBad
+        Assert-That ($d.Decision -ceq 'UNREGISTERED') "SSH-PUSHURL-1 A5 decide: a probe verdict that is not a [bool] Authenticated ($($spVerdict | ConvertTo-Json -Compress)) never authenticates" $d.Decision
+    }
+
     # --- the real probe runner against a fake ssh.cmd: arguments are non-interactive, the verdict follows its exit code, and a hang is killed at the time bound
     $spDir = New-Scratch 'sp-fake-ssh'
     $spArgs = Join-Path $spDir 'args.txt'
@@ -3525,7 +3545,7 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20
     $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
     Assert-That ($pr.Authenticated -eq $true) 'SSH-PUSHURL-1 probe: a client that prints "successfully authenticated" and exits 1 is authenticated' $pr.Detail
-    Assert-That ($argText -match '-T' -and $argText -match 'BatchMode=yes' -and $argText -match 'ConnectTimeout=' -and $argText -match 'StrictHostKeyChecking=yes' -and $argText -match 'git@github\.com') 'SSH-PUSHURL-1 probe: ssh -T runs with BatchMode=yes, ConnectTimeout and StrictHostKeyChecking=yes (never interactive, never writes known_hosts)' $argText
+    Assert-That ($argText -match '-T' -and $argText -match 'BatchMode=yes' -and $argText -match 'ConnectTimeout=' -and $argText -match 'StrictHostKeyChecking=yes' -and $argText -match 'UpdateHostKeys=no' -and $argText -match 'ControlMaster=no' -and $argText -match 'ControlPath=none' -and $argText -match 'git@github\.com') 'SSH-PUSHURL-1 probe: ssh -T runs with BatchMode=yes, ConnectTimeout, StrictHostKeyChecking=yes, UpdateHostKeys=no, ControlMaster=no, ControlPath=none (never interactive, writes nothing under ~/.ssh)' $argText
     $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-denied.cmd') -TimeoutSec 20
     Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'Permission denied') 'SSH-PUSHURL-1 probe: a refused key is not authenticated' $pr.Detail
     $swSp = [Diagnostics.Stopwatch]::StartNew()

@@ -1152,7 +1152,9 @@ function Invoke-GitHubSshProbe {
     if (-not $SshExe) { $c = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $SshExe = $c.Source } }
     if (-not $SshExe) { return @{ Authenticated = $false; Detail = 'the OpenSSH client (ssh) is not installed' } }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
-    foreach ($a in @('-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=yes', 'git@github.com')) { $psi.ArgumentList.Add($a) }
+    # adversary pass 1 A2 (class: every way ssh itself writes under ~/.ssh): StrictHostKeyChecking=yes adds no host key, UpdateHostKeys=no stops OpenSSH rewriting known_hosts after a
+    # successful login (it does that even under yes), and ControlMaster=no / ControlPath=none stop a user's ControlPersist from leaving a multiplexing socket behind
+    foreach ($a in @('-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', 'git@github.com')) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
     $proc = $null
     try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
@@ -1188,7 +1190,15 @@ function Get-SshPushUrlDecision {
     if (-not $ssh) { return @{ Decision = 'SKIPPED'; PushUrl = ''; Reason = "remote.fork.url $(Format-RemoteUrlForLog $fetch) is not a plain github.com https or git@ url" } }
     $why = Get-RemoteUrlRefusal -Urls @($ssh) -Rules $Rules -Names $Names
     if ($why) { return @{ Decision = 'REFUSED'; PushUrl = $ssh; Reason = $why } }
+    # adversary pass 1 A4: every configured push url gets the same refusal as the fetch url, BEFORE the probe (a control character, a rewrite rule or a remote name in a pushurl
+    # is something Git would not connect to as written)
+    foreach ($pu in $PushUrls) {
+        $why = Get-RemoteUrlRefusal -Urls @("$pu") -Rules $Rules -Names $Names
+        if ($why) { return @{ Decision = 'REFUSED'; PushUrl = $ssh; Reason = "remote.fork.pushurl: $why" } }
+    }
     $p = & $Probe
+    # adversary pass 1 A5: only a real [bool] $true authenticates; a string 'false' or a missing verdict is not an authentication
+    if ($p -isnot [hashtable] -or $p.Authenticated -isnot [bool]) { return @{ Decision = 'UNREGISTERED'; PushUrl = $ssh; Reason = 'the probe returned no [bool] Authenticated verdict' } }
     if (-not $p.Authenticated) { return @{ Decision = 'UNREGISTERED'; PushUrl = $ssh; Reason = "$($p.Detail)" } }
     $effective = @($(if ($PushUrls.Count) { $PushUrls } else { $Urls }))   # @(): a one-element array out of $( ) is a scalar string, whose [0] is its first character
     if ($effective.Count -eq 1 -and "$($effective[0])" -ceq $ssh) { return @{ Decision = 'NOOP'; PushUrl = $ssh; Reason = 'pushes already go to the SSH form' } }
@@ -1218,6 +1228,14 @@ function Invoke-SshPushUrl {
                 Write-Log "SSH_PUSHURL_MISSING remote=fork expected=$ssh (ssh authenticates but remote.fork.pushurl is not set to it: run -Phase Clone)" 'ERROR'
                 $script:Failures.Add('SSH_PUSHURL_MISSING remote=fork')
             } else {
+                # adversary pass 1 A3: the probe takes seconds and the decision above read the config BEFORE it. Re-read both urls right before the write and write only when
+                # they are exactly what the decision saw; a writer that set a pushurl meanwhile is a foreign value and is never overwritten.
+                $nowUrls = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url')
+                $nowPush = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
+                if ((($nowUrls -join "`n") -cne ($urls -join "`n")) -or (($nowPush -join "`n") -cne ($push -join "`n"))) {
+                    $script:Failures.Add('PUSHURL_CHANGED_DURING_PROBE remote=fork')
+                    throw "PUSHURL_CHANGED_DURING_PROBE remote.fork.url or remote.fork.pushurl changed while ssh was probed (pushurl now: $((@($nowPush | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')); nothing was written, re-run -Phase Clone"
+                }
                 [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh))
                 $back = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
                 if ($back.Count -ne 1 -or "$($back[0])" -cne $ssh) { $script:Failures.Add('SSH_PUSHURL_NOT_APPLIED remote=fork'); throw "SSH_PUSHURL_NOT_APPLIED remote.fork.pushurl reads back as '$($back -join ' | ')', expected $ssh" }
@@ -1229,7 +1247,11 @@ function Invoke-SshPushUrl {
             Write-Log "PUSHURL_FOREIGN remote=fork $($d.Reason): left as it is (never overwritten)" 'MANUAL'
             if ($VerifyOnly) { $script:Failures.Add('PUSHURL_FOREIGN remote=fork') }
         }
-        'REFUSED' { Write-Log "PUSHURL_REFUSED remote=fork $($d.Reason): remote.fork.pushurl was not changed" 'MANUAL' }
+        'REFUSED' {
+            Write-Log "PUSHURL_REFUSED remote=fork $($d.Reason): remote.fork.pushurl was not changed" 'MANUAL'
+            # adversary pass 1 A1: Verify cannot confirm the push url of a refused remote (the probe was never run), so it fails closed like the Clone phase's CLONE_REMOTE_MISMATCH
+            if ($VerifyOnly) { $script:Failures.Add('PUSHURL_REFUSED remote=fork') }
+        }
         default { Write-Log "SSH_PUSHURL skipped: $($d.Reason)" }
     }
 }
