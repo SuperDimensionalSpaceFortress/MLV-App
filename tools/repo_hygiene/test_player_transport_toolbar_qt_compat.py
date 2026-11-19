@@ -8,6 +8,8 @@ and MainWindow.cpp includes the header, so the Qt 5 release kit failed to compil
 reads the header's text and fails on any call to an API newer than Qt 5.15 that is not inside an
 arm of a ``QT_VERSION`` check that compiles only on a Qt new enough for it. Same defect class as
 the QMouseEvent::position() guard of PR 856 r3 (test_qt6_only_api_guard.py on that branch).
+The scope now includes GpuDisplayWindow.cpp (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1), and a
+tripwire fails when any other file under platform/qt or src reaches a QImage::flipped/flip name.
 
 GRAMMAR (r5, fail closed; hub STOP RULE 20261119T0912Z). The scanner reads a file only where it
 is certain what a compiler sees. Anything else it REFUSES: the file is reported unprovable (one
@@ -71,7 +73,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCOPED_HEADERS = (ROOT / "platform" / "qt" / "PlayerTransportToolbar.h",)
+# Index 0 stays PlayerTransportToolbar.h: _header_with_branch and two tests read SCOPED_HEADERS[0].
+SCOPED_HEADERS = (
+    ROOT / "platform" / "qt" / "PlayerTransportToolbar.h",
+    ROOT / "platform" / "qt" / "GpuDisplayWindow.cpp",
+)
 
 # API -> the first Qt (major, minor) that has it.
 NEWER_THAN_QT5_API = {
@@ -147,6 +153,30 @@ _INT_LITERAL = re.compile(
     r"|(?P<oct>0(?:'?[0-7])*)|(?P<dec>[1-9](?:'?[0-9])*))"
     r"(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?"
 )
+
+
+# Tripwire (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1): a member or qualified access of a Qt 6.9
+# QImage name. It reads the raw text, comments and literals included, on purpose: it fails toward
+# scanning. NON-PROMISE: it is a tripwire for the Qt 6.9 QImage names only. A bare `flipped(` with
+# no accessor, a split-line access with a newline before the name, and a macro alias are left to
+# the strict scanner of the scoped files; this only decides which files must be scoped.
+QT69_MEMBER_USE = re.compile(r"(?:\.|->|::)[ \t]*(?:flipped|flip)\b")
+TRIPWIRE_ROOTS = (ROOT / "platform" / "qt", ROOT / "src")
+TRIPWIRE_SUFFIXES = frozenset((".c", ".cpp", ".h", ".hpp", ".m", ".mm"))
+
+
+def files_needing_scan(texts: dict[str, str]) -> set[str]:
+    """The keys of `texts` whose raw text has a member or qualified access of flipped or flip."""
+    return {key for key, text in texts.items() if QT69_MEMBER_USE.search(text)}
+
+
+def _tripwire_texts() -> dict[str, str]:
+    texts: dict[str, str] = {}
+    for root in TRIPWIRE_ROOTS:
+        for path in sorted(root.rglob("*")):
+            if path.suffix in TRIPWIRE_SUFFIXES and path.is_file():
+                texts[str(path)] = path.read_bytes().decode("utf-8", errors="replace")
+    return texts
 
 
 def _pp_int(token: str) -> int | None:
@@ -387,6 +417,28 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
                     "A REFUSED finding is a form the scanner does not read (see its GRAMMAR): "
                     + "; ".join(f"line {n}: {api}: {src}" for n, api, src in hits),
                 )
+
+    def test_every_file_reaching_a_qt69_qimage_name_is_scoped(self) -> None:
+        # Tripwire: an unscoped file with `.flipped`, `->flip`, `::flipped`, ... fails here, so the
+        # strict scanner above is made to read it. See QT69_MEMBER_USE for what it does not promise.
+        scoped = {str(path) for path in SCOPED_HEADERS}
+        unscoped = sorted(files_needing_scan(_tripwire_texts()) - scoped)
+        self.assertFalse(
+            unscoped,
+            "a file reaches QImage::flipped/flip (Qt 6.9+); add the file to SCOPED_HEADERS so the "
+            "strict scanner reads it: " + "; ".join(unscoped),
+        )
+
+    def test_the_tripwire_flags_member_and_qualified_accesses_only(self) -> None:
+        flagged = ("img.flipped(Qt::Vertical)", "p->flip(Qt::Horizontal)", "&QImage::flipped", "img . flipped")
+        for text in flagged:
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # GpuDisplayViewport.cpp:43 on 284f00be has the first one, in a comment.
+        not_flagged = ("vertically flipped (upside down)", "y-flipped", "flippedCopy", "unflipped()")
+        for text in not_flagged:
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
 
     def test_scanner_flags_the_09077b0d_shape(self) -> None:
         # r1's own line: proves the guard bites on the defect it exists for.
