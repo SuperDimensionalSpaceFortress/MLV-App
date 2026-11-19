@@ -298,93 +298,15 @@ function Get-GuiSmokeProcessLifetimeMs {
 #     and the exit time cannot be told, so it fails closed (exhausted);
 #   - otherwise the wall lifetime decides.
 # With no launch stamp (-1) only the wall lifetime is available and it decides alone.
-#
-# r12 (adversary f1811e78 A1): the bound alone cannot tell a stepped wall clock from an honest one once the OBSERVATION is late (a runner that resumed
-# 2200 ms after launch, behind a 1000 ms budget, sees a wall lifetime of 500 ms for a real 2000 ms life after a -1500 ms step, and 1200 ms for a real 700 ms
-# life after a +500 ms step; both are inside [0, since-launch]). A late observation needs an exit time that does not depend on when the runner looks and
-# is not a wall reading: the Process.Exited callback runs on a thread-pool thread the moment the OS reports the exit and stamps the MONOTONIC clock
-# (GuiSmokeExitStamp). The lifetime is then that stamp minus the launch stamp, and it decides alone. The wall reasoning above remains only as the fallback
-# for a call that has no stamp (a caller that did not attach one, or an exit whose callback has not run yet).
-if (-not ('GuiSmokeExitStamp' -as [type])) {
-    try {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Diagnostics;
-using System.Threading;
-
-public sealed class GuiSmokeExitStamp
-{
-    private long _timestamp;
-
-    public long Timestamp { get { return Interlocked.Read(ref _timestamp); } }
-
-    public GuiSmokeExitStamp(Process process)
-    {
-        process.Exited += OnExited;
-        process.EnableRaisingEvents = true;
-    }
-
-    private void OnExited(object sender, EventArgs e)
-    {
-        Interlocked.CompareExchange(ref _timestamp, Stopwatch.GetTimestamp(), 0);
-    }
-}
-'@
-    }
-    catch {
-        # a host that cannot compile (a locked-down language mode) keeps the wall-clock fallback
-    }
-}
-
-# Attach the exit stamp right after Process.Start. $null when it cannot be attached; every consumer treats $null as "no stamp".
-function New-GuiSmokeExitStamp {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [System.Diagnostics.Process]$Process
-    )
-
-    try { return [GuiSmokeExitStamp]::new($Process) } catch { return $null }
-}
-
-# The exit-stamp lifetime in ms (monotonic exit stamp minus the launch stamp), or $null when it is not known. The callback is a thread-pool hop behind
-# the exit, so a stamp that is not there yet is waited for a bounded moment; this is only reached when the exit has already been confirmed.
-function Get-GuiSmokeExitStampLifetimeMs {
-    [CmdletBinding()]
-    param(
-        [object]$ExitStamp = $null,
-        [int64]$LaunchTimestamp = 0,
-        [ValidateRange(0, 5000)]
-        [int]$GraceMs = 250
-    )
-
-    if ($null -eq $ExitStamp -or $LaunchTimestamp -le 0) { return $null }
-    try {
-        $look = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($true) {
-            $stamp = [int64]$ExitStamp.Timestamp
-            if ($stamp -gt 0) { return ([double]($stamp - $LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency) }
-            if ($look.ElapsedMilliseconds -ge $GraceMs) { return $null }
-            [System.Threading.Thread]::Sleep(5)
-        }
-    }
-    catch {
-        return $null
-    }
-}
-
 function Test-GuiSmokeLifetimeExceedsBudget {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [double]$BudgetMs,
         [Nullable[double]]$WallLifetimeMs = $null,
-        [double]$SinceLaunchMs = -1,
-        # r12: the monotonic exit-stamp lifetime when the exit callback stamped it; it decides alone (no wall reading, no observation delay)
-        [Nullable[double]]$MonotonicLifetimeMs = $null
+        [double]$SinceLaunchMs = -1
     )
 
-    if ($null -ne $MonotonicLifetimeMs) { return ([double]$MonotonicLifetimeMs -gt $BudgetMs) }
     if ($SinceLaunchMs -ge 0 -and $SinceLaunchMs -le $BudgetMs) { return $false }
     if ($null -eq $WallLifetimeMs) { return $false }
     $wallMs = [double]$WallLifetimeMs
@@ -401,9 +323,7 @@ function Test-GuiSmokeWaitBudgetExhausted {
         [ValidateRange(0, 3600000)]
         [int64]$BudgetMs,
         # Stopwatch.GetTimestamp() read before the process was started; 0 = not known
-        [int64]$LaunchTimestamp = 0,
-        # r12: the exit stamp New-GuiSmokeExitStamp attached right after the launch ($null = none)
-        [object]$ExitStamp = $null
+        [int64]$LaunchTimestamp = 0
     )
 
     try {
@@ -413,11 +333,6 @@ function Test-GuiSmokeWaitBudgetExhausted {
             $sinceLaunchMs = [double]([System.Diagnostics.Stopwatch]::GetTimestamp() - $LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency
         }
         if ($sinceLaunchMs -ge 0 -and $sinceLaunchMs -le $BudgetMs) { return $false }
-        # past the budget on the observer's clock the exit time is in question: the monotonic exit stamp answers it without the wall clock
-        $monoMs = Get-GuiSmokeExitStampLifetimeMs -ExitStamp $ExitStamp -LaunchTimestamp $LaunchTimestamp
-        if ($null -ne $monoMs) {
-            return (Test-GuiSmokeLifetimeExceedsBudget -BudgetMs $BudgetMs -SinceLaunchMs $sinceLaunchMs -MonotonicLifetimeMs $monoMs)
-        }
         $wallMs = Get-GuiSmokeProcessLifetimeMs -StartTime $Process.StartTime -ExitTime $Process.ExitTime
         return (Test-GuiSmokeLifetimeExceedsBudget -BudgetMs $BudgetMs -WallLifetimeMs $wallMs -SinceLaunchMs $sinceLaunchMs)
     }
@@ -458,9 +373,7 @@ function Wait-GuiSmokeProcessBounded {
         # saw, the expired deadline): an app that outlived the budget before exiting is a timeout, one that exited inside it keeps its native exit.
         [ValidateRange(0, 3600000)]
         [int64]$LifetimeBudgetMs = 0,
-        [int64]$LaunchTimestamp = 0,
-        # r12 (adversary f1811e78 A1): the exit stamp attached right after the launch; the exit is then dated on the monotonic clock, not the wall clock
-        [object]$ExitStamp = $null
+        [int64]$LaunchTimestamp = 0
     )
 
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3-6: this used to chop the wait into chunks and
@@ -501,7 +414,7 @@ function Wait-GuiSmokeProcessBounded {
             $terminationConfirmed = $Process.WaitForExit($waitMs)
             if ($terminationConfirmed) {
                 $exitObservedTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp(); $exitObservedAtUtc = [datetime]::UtcNow
-                if ($LifetimeBudgetMs -gt 0 -and (Test-GuiSmokeWaitBudgetExhausted -Process $Process -BudgetMs $LifetimeBudgetMs -LaunchTimestamp $LaunchTimestamp -ExitStamp $ExitStamp)) {
+                if ($LifetimeBudgetMs -gt 0 -and (Test-GuiSmokeWaitBudgetExhausted -Process $Process -BudgetMs $LifetimeBudgetMs -LaunchTimestamp $LaunchTimestamp)) {
                     # the exit is real but came after the whole budget was spent: it is not a completion. The timeout path below ends the (already
                     # exited) tree and reports the whole budget, exactly as for an app still running at the deadline.
                     $terminationConfirmed = $false
@@ -611,4 +524,4 @@ function Wait-GuiSmokeProcessBounded {
     }
 }
 
-Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeLegHardLimitMs, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, Test-GuiSmokeWaitBudgetExhausted, Test-GuiSmokeLifetimeExceedsBudget, Get-GuiSmokeProcessLifetimeMs, New-GuiSmokeExitStamp, Get-GuiSmokeExitStampLifetimeMs, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled
+Export-ModuleMember -Function Wait-GuiSmokeProcessBounded, Get-GuiSmokeLegHardLimitMs, Get-GuiSmokeNoProgressWindowMs, Get-GuiSmokeNoProgressChunkMs, Test-GuiSmokeWaitBudgetExhausted, Test-GuiSmokeLifetimeExceedsBudget, Get-GuiSmokeProcessLifetimeMs, New-GuiSmokeLogProgressWatch, Stop-GuiSmokeLogProgressWatch, Test-GuiSmokeLogProgressStalled

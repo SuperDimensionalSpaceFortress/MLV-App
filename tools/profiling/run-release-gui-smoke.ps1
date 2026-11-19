@@ -1953,9 +1953,6 @@ $startUtc = [datetime]::UtcNow
 # on only one of startedAtUtc / endedAtUtc shows as a disagreement between the wall launch..end and elapsedMonoMs.
 $startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
 $process = [System.Diagnostics.Process]::Start($startInfo)
-# r12 (adversary f1811e78 A1): the exit is dated on the monotonic clock by the Process.Exited callback, so a wall-clock step or a late observation by this
-# runner cannot move the lifetime the budget is judged against ($null when it cannot be attached: the wall-clock fallback then applies)
-$exitStamp = New-GuiSmokeExitStamp -Process $process
 $screenshotCapture = $null
 $windowScreenshotCapture = $null
 $fpsStatusCropCapture = $null
@@ -2015,7 +2012,7 @@ if ($HostLoadSampleIntervalMs -gt 0) {
     while ($true) {
         $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
         if ($hostLoadRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -ExitStamp $exitStamp
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp
             break
         }
         $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))
@@ -2048,7 +2045,7 @@ else {
     while ($true) {
         $noProgressRemainingMs = $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds
         if ($noProgressRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -ExitStamp $exitStamp
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp
             break
         }
         if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
@@ -2078,8 +2075,7 @@ $processBoundary = Wait-GuiSmokeProcessBounded `
     -DeadlineReached:$waitBudgetExhausted `
     -NoProgressWindowMs $noProgressWindowMs `
     -LifetimeBudgetMs $effectiveProcessTimeoutMs `
-    -LaunchTimestamp $startTimestamp `
-    -ExitStamp $exitStamp
+    -LaunchTimestamp $startTimestamp
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
