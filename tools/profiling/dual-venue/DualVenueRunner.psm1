@@ -4544,26 +4544,30 @@ $script:ExportCdngStageWindowTable = @(
     [ordered]@{ name = 'dng_pack'; parent = 'producer_frame'; windows = @('dng.c#dng_pack') }                         # dng.c:2643-2650, :2741-2748, :2820-2836, :2863-2865, :2898-2914
     [ordered]@{ name = 'dng_compress_encode'; parent = 'producer_frame'; windows = @('dng.c#dng_compress_encode') }   # dng.c:2426-2440 (dng_compress_image_profiled, called at :2567-2578 / :3138-3149)
     [ordered]@{ name = 'payload_clone'; parent = 'producer_frame'; windows = @('dng.c#payload_clone') }               # dng.c:3726-3728, :3781-3783
-    # llrawproc's children (src/mlv/llrawproc/llrawproc.c; main path applyLLRawProcObject :5014-6329, scaled path :6606-7076). The seven timed children (dng.c:571-577):
-    [ordered]@{ name = 'llrawproc_dark_frame'; parent = 'llrawproc'; windows = @('llrawproc.c:5168-5188', 'llrawproc.c:5385-5392', 'llrawproc.c:6826-6833') }
+    # llrawproc's children (src/mlv/llrawproc/llrawproc.c). EXPORT-CDNG-STAGE-CONTAINMENT-1: ONLY the code path CDNG export runs. dng.c:103 calls applyLLRawProcObject, which is
+    # applyLLRawProcObjectWorker(..., NULL, 0) (:6411-6413; body :5008-6331, every timer reset at :5027-5039). The scaled path llrawproc_apply_with_dims_internal (:6598-7076) is
+    # playback-only, so none of its lines is a window here; and the literal 0 is stop_before_dual_iso, so the block at :5461-5472 never runs on export. The test Guard
+    # (CdngStageContainmentGateTests) re-derives every window below from the C sources by call-site reachability from dng.c's call. The seven timed children (dng.c:571-577):
+    [ordered]@{ name = 'llrawproc_dark_frame'; parent = 'llrawproc'; windows = @('llrawproc.c:5168-5188', 'llrawproc.c:5385-5392') }
     [ordered]@{ name = 'llrawproc_vertical_stripes'; parent = 'llrawproc'; windows = @('llrawproc.c:5290-5300', 'llrawproc.c:5397-5404') }
     [ordered]@{ name = 'llrawproc_focus_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5321-5341', 'llrawproc.c:5409-5420', 'llrawproc.c:6140-6151') }
     # (bad_pixels calls llrawproc_reset_force_bad_pixel_search, :4688-4696, only from inside its windows, :5438 and :6174)
     [ordered]@{ name = 'llrawproc_bad_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5346-5372', 'llrawproc.c:5425-5440', 'llrawproc.c:6161-6176', 'llrawproc.c:4688-4696') }
     [ordered]@{ name = 'llrawproc_pattern_noise'; parent = 'llrawproc'; windows = @('llrawproc.c:5445-5458') }
-    # (dual_iso: main :5560-5586, :5591-6019, :6210-6219; scaled :6863-6887, :6890-6954 and the notch :6964-6969 added at :6970)
-    [ordered]@{ name = 'llrawproc_dual_iso'; parent = 'llrawproc'; windows = @('llrawproc.c:5560-5586', 'llrawproc.c:5591-6019', 'llrawproc.c:6210-6219', 'llrawproc.c:6863-6887', 'llrawproc.c:6890-6954', 'llrawproc.c:6964-6969') }
-    [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6258-6271', 'llrawproc.c:7022-7032') }
+    # (dual_iso: :5560-5586, :5591-6019, :6210-6219)
+    [ordered]@{ name = 'llrawproc_dual_iso'; parent = 'llrawproc'; windows = @('llrawproc.c:5560-5586', 'llrawproc.c:5591-6019', 'llrawproc.c:6210-6219') }
+    [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6258-6271') }
     # The lock times. shared_lock: the first lock :5142-5288 (or :5142-5376 when the stripes block :5285-5317 does not run; both lie inside the two windows listed), the stripes publish lock
-    # :5302-5312 and the relock :5314-5376, the reset lock :4688-4696 (:4696), the scaled snapshot lock :6731-6815, AND the refine and publish lock times added to it (:6131, :6293, :7058).
+    # :5302-5312 and the relock :5314-5376, the reset lock :4688-4696 (:4696), AND the refine and publish lock times added to it (:6131, :6293).
     # (adversary pass17 A1: because shared_lock ACCUMULATES the refine and publish lock times, it CONTAINS them: each, and their disjoint sum, is inside shared_lock; contains = those rows)
-    [ordered]@{ name = 'llrawproc_shared_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:5142-5288', 'llrawproc.c:5302-5376', 'llrawproc.c:4688-4696', 'llrawproc.c:6731-6815',
-        'llrawproc.c:6063-6130', 'llrawproc.c:6288-6292', 'llrawproc.c:7053-7057'); contains = @('llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock') }
+    [ordered]@{ name = 'llrawproc_shared_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:5142-5288', 'llrawproc.c:5302-5376', 'llrawproc.c:4688-4696',
+        'llrawproc.c:6063-6130', 'llrawproc.c:6288-6292'); contains = @('llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock') }
     [ordered]@{ name = 'llrawproc_dualiso_refine_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6063-6130') }
-    [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6288-6292', 'llrawproc.c:7053-7057') }
-    # pre_dualiso_fix is apply_start .. :5463 (:5014-5463). The scaled path does not reset it (:6615-6625 resets every other timer, not this one), so a scaled call may carry a previous
-    # call's value: it is given that whole call (:6606-7076) as a window.
-    [ordered]@{ name = 'llrawproc_pre_dualiso_fix'; parent = 'llrawproc'; windows = @('llrawproc.c:5014-5463', 'llrawproc.c:6606-7076') }
+    [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6288-6292') }
+    # pre_dualiso_fix: the worker resets it (:5036) and writes it only inside `if (stop_before_dual_iso)` (:5461-5463), which export's literal 0 never enters, so on export it accrues
+    # NOWHERE and has no window (r17 key3 B1: the row carried the scaled call :6606-7076, which met dual_iso's scaled windows and kept it out of every group). A row with no window meets
+    # no other row, so it joins every disjoint group: any value export publishes for it is work outside every timed window of llrawproc, and is held inside llrawproc with the rest.
+    [ordered]@{ name = 'llrawproc_pre_dualiso_fix'; parent = 'llrawproc'; windows = @() }
     # llrawproc_other is the total less the seven timed children (dng.c:579-604), so it retains pre_dualiso_fix and the lock times
     [ordered]@{ name = 'llrawproc_other'; parent = 'llrawproc'; windows = @(); remainderOf = @('llrawproc_dark_frame', 'llrawproc_vertical_stripes', 'llrawproc_focus_pixels', 'llrawproc_bad_pixels',
         'llrawproc_pattern_noise', 'llrawproc_dual_iso', 'llrawproc_chroma_smooth') }
@@ -4725,32 +4729,6 @@ function Get-DvExportContainmentProblem {
     }
     if ($bad.Count -eq 0) { return $null }
     "EXPORT_STAGE_CONTAINMENT_MISMATCH: $($bad.Count) stage(s) are timed longer than the stage that contains them (first: $($bad[0][0]) mean $($Means[$bad[0][0]]) ms inside $($bad[0][1]) mean $($Means[$bad[0][1]]) ms), so their shares are of work this run's frames do not hold"
-}
-
-$script:ExportContainmentAdvisoryCard = 'EXPORT-CDNG-STAGE-CONTAINMENT-1'
-function Get-DvExportContainmentAdvisories {
-    # r18 (hub STOP RULE 2026-11-18T17:26:25Z): EVERY finding of the CDNG disjoint-stage containment check (each disjoint group whose summed means exceed its parent's, each contained pair whose
-    # child exceeds its container), with the same tolerance as Get-DvExportContainmentProblem, as advisory strings. Never a problem and never a verdict input until
-    # EXPORT-CDNG-STAGE-CONTAINMENT-1 makes the window table trustworthy; an empty array when nothing exceeds.
-    param($Means, $Pairs = @(), $SumGroups = @())
-    $out = [System.Collections.Generic.List[string]]::new()
-    $tail = "(advisory pending $($script:ExportContainmentAdvisoryCard): recorded only, never a problem or a verdict input)"
-    foreach ($group in $SumGroups) {
-        $present = @($group[0] | Where-Object { $null -ne $Means[$_] })
-        $parent = $Means[[string]$group[1]]
-        if ($present.Count -lt 2 -or $null -eq $parent) { continue }
-        $sum = 0.0; foreach ($n in $present) { $sum += [double]$Means[$n] }
-        if ($sum -gt [double]$parent * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) {
-            $out.Add("EXPORT_STAGE_CONTAINMENT_ADVISORY: the disjoint stages $($present -join ' + ') total $([math]::Round($sum, 6)) ms (mean) inside $($group[1]) mean $parent ms $tail")
-        }
-    }
-    foreach ($pair in $Pairs) {
-        $c = $Means[$pair[0]]; $p = $Means[$pair[1]]
-        if ($null -ne $c -and $null -ne $p -and [double]$c -gt [double]$p * $script:ExportStageContainTolerance + $script:ExportStageContainSlackMs) {
-            $out.Add("EXPORT_STAGE_CONTAINMENT_ADVISORY: $($pair[0]) mean $c ms is timed longer than $($pair[1]) mean $p ms, which contains it $tail")
-        }
-    }
-    , [string[]]$out.ToArray()
 }
 
 # r11 (sol r9 B2 (a), fable r9 B2; EXPORT-VENUE-LEG-1): the OUTERMOST containment: the measured per-frame work is inside the batch's own DONE elapsed. A DONE elapsed shorter than the
@@ -4957,7 +4935,7 @@ function Get-DvExportEvidence {
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
-    $containmentAdvisory = @()   # r18 (EXPORT-CDNG-STAGE-CONTAINMENT-1): the CDNG disjoint-stage containment findings, advisory only (see the CDNG branch)
+    $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape the leg runner writes (receipt.export.containmentAdvisory): EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
     # -- the batch log: exactly one DONE line for the one clip
     # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
     $done = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] DONE (?<base>.+?) exported=(?<e>[0-9]{1,15}) skipped=(?<s>[0-9]{1,15}) elapsed=(?<t>[0-9]{1,12}(?:\.[0-9]{1,9})?)\r?$'))
@@ -5068,13 +5046,13 @@ function Get-DvExportEvidence {
             # llrawproc_other (dual_iso 30 + publish_lock 90 inside a 100 ms total read PASS).)
             # r17 (pass16 A1, CDNG-STAGE-WINDOW-TABLE-1): every one of these groups, and every other maximal disjoint group, is DERIVED from $script:ExportCdngStageWindowTable
             # (Get-DvExportCdngDisjointGroups): each llrawproc group inside llrawproc and, with the producer's other members, inside producer_frame, whether or not llrawproc_ms is published.
-            # r18 (hub STOP RULE 2026-11-18T17:26:25Z; split to EXPORT-CDNG-STAGE-CONTAINMENT-1): that DISJOINT-STAGE check -- the table-derived sum groups and the table-derived contained pairs
-            # (pass17 A1: refine and publish inside the shared_lock they accumulate into; pass18 A1: inside llrawproc_other) -- no longer gates. Every finding it makes is recorded in
-            # containmentAdvisory, never in problems, so it never turns a PASS into a FAIL or INVALID (r17 keys: the table's pre_dualiso_fix row still carries a window the export never runs).
-            # The r8 parent/child pairs above (each stage inside the stage that contains it) still gate.
+            # EXPORT-CDNG-STAGE-CONTAINMENT-1 r1: that DISJOINT-STAGE check -- the table-derived sum groups and the table-derived contained pairs (pass17 A1: refine and publish inside the
+            # shared_lock they accumulate into; pass18 A1: inside llrawproc_other) -- GATES again (r18 had made it advisory while the table carried windows export never runs). The table now
+            # holds only the code path CDNG export reaches, so a finding is an EXPORT_STAGE_CONTAINMENT_MISMATCH problem; this branch is the CDNG profile's only, so it gates CDNG legs only.
             $containment = Get-DvExportContainmentProblem -Means $means -Pairs $pairs
             if ($null -ne $containment) { $problems.Add($containment) }
-            $containmentAdvisory = Get-DvExportContainmentAdvisories -Means $means -Pairs $script:ExportCdngContainedPairs -SumGroups $script:ExportCdngSumGroups
+            $disjoint = Get-DvExportContainmentProblem -Means $means -Pairs $script:ExportCdngContainedPairs -SumGroups $script:ExportCdngSumGroups
+            if ($null -ne $disjoint) { $problems.Add($disjoint) }
             # r11 (sol r9 B2 (a)): and the producer's per-frame work is inside the batch's own elapsed
             $wallContainment = Get-DvExportWallContainmentProblem -WallSeconds $m.wallSeconds -Frames $m.framesExported -StageName 'producer_frame' -StageMeanMs $denRow.meanMs
             if ($null -ne $wallContainment) { $problems.Add($wallContainment) }

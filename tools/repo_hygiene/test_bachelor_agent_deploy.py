@@ -165,12 +165,187 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assert_untouched()
 
     def test_refuse_busy_inbox(self) -> None:
+        # BACHELOR-DEPLOY-BUSY-CHECK-STALE-ARTIFACTS-1: inbox= counts the JOBS the agent picks up (*.job.ps1); the companion
+        # meta.json is not a job by itself, so it is an ignored entry (the job beside it still refuses)
         (self.venue / "inbox" / "j2.job.ps1").write_text("x")
         (self.venue / "inbox" / "j2.meta.json").write_text("{}")
         r = self.run_deploy()
         self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
-        self.assertIn("DEPLOY_REFUSED_BUSY running=0 inbox=2", r.stdout)
+        self.assertIn("DEPLOY_REFUSED_BUSY running=0 inbox=1 ignored=1", r.stdout)
         self.assert_untouched()
+
+    # ---- BACHELOR-DEPLOY-BUSY-CHECK-STALE-ARTIFACTS-1: busy = what the agent itself treats as live work ----------------------
+    # The names below are copies of what the hub found on the venue on 2026-11-19 (running=4 inbox=34 with the agent idle).
+    RUNNING_LEFTOVERS = ("x.started.json.stale-3", "y.started.json.stale-638973216000000000",
+                         "z.started.json.0123456789abcdef0123456789abcdef.tmp.stale-1")
+    INBOX_LEFTOVERS = ("foo.exe", "bar.zip", "a.tmp", "b.tmp", ".umrun-clock-probe", "y.meta.tmp", "j7.meta.json")
+
+    def plant_leftovers(self) -> int:
+        for name in self.RUNNING_LEFTOVERS:
+            (self.venue / "running" / name).write_text("{}")
+        for name in self.INBOX_LEFTOVERS:
+            # the two .tmp files are zero-byte, as on the venue
+            (self.venue / "inbox" / name).write_bytes(b"" if name.endswith(".tmp") and name != "y.meta.tmp" else b"x")
+        (self.venue / "inbox" / "staged-dir.job.ps1").mkdir()   # a DIRECTORY with a job name: the agent lists -File only
+        return len(self.RUNNING_LEFTOVERS) + len(self.INBOX_LEFTOVERS) + 1
+
+    def leftover_snapshot(self) -> dict:
+        return {p.relative_to(self.venue).as_posix(): (p.is_dir(), p.read_bytes() if p.is_file() else b"")
+                for d in ("inbox", "running") for p in sorted((self.venue / d).iterdir())}
+
+    def test_s1_leftovers_alone_are_not_busy_and_are_counted(self) -> None:
+        n = self.plant_leftovers()
+        r = self.run_deploy("-DryRun")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_DRYRUN action=deploy", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_IGNORED_LEFTOVERS ignored=%d " % n)
+        self.assertNotIn("DEPLOY_REFUSED_BUSY", r.stdout)
+
+    def test_s1_a_deploy_over_leftovers_leaves_every_leftover_in_place(self) -> None:
+        self.plant_leftovers()
+        before = self.leftover_snapshot()
+        r = self.run_deploy()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_OK sha=%s " % sha(NEW))
+        self.assertEqual(self.leftover_snapshot(), before, "the deploy never deletes, moves or rewrites a leftover")
+
+    def test_s2_a_live_job_among_leftovers_still_refuses(self) -> None:
+        n = self.plant_leftovers()
+        cases = (
+            ("inbox", "q1.job.ps1", "running=0 inbox=1 ignored=%d" % n),
+            ("inbox", "Q2.JOB.PS1", "running=0 inbox=1 ignored=%d" % n),              # the agent's -Filter is case-insensitive
+            ("running", "q3.started.json", "running=1 inbox=0 ignored=%d" % n),
+            ("running", "q4.started.json.0123456789abcdef0123456789abcdef.tmp", "running=1 inbox=0 ignored=%d" % n),   # Get-MarkerTempFiles
+            ("running", "q5.started.json.tmp", "running=1 inbox=0 ignored=%d" % n),   # the legacy shared marker tmp
+        )
+        for folder, name, want in cases:
+            with self.subTest(name=name):
+                f = self.venue / folder / name
+                f.write_text("{}")
+                try:
+                    r = self.run_deploy("-DryRun")
+                    self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+                    self.assertIn("DEPLOY_REFUSED_BUSY " + want, r.stdout)
+                finally:
+                    f.unlink()
+        r = self.run_deploy()
+        self.assertEqual(r.returncode, 0, "with the live job gone the same venue deploys: " + r.stdout + r.stderr)
+
+    def test_s2_a_held_lease_among_leftovers_still_refuses(self) -> None:
+        self.plant_leftovers()
+        (self.venue / "slot-holders" / "lb-1.lease.json").write_text("{}")
+        r = self.run_deploy("-DryRun")
+        self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_LEASE lb-1.lease.json", r.stdout)
+        self.assertNotIn("DEPLOY_REFUSED_BUSY", r.stdout)
+
+    def test_s3_the_post_restart_check_reads_the_same_predicate(self) -> None:
+        self.plant_leftovers()
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("DEPLOY_WARN_ARRIVED_DURING_RESTART", r.stdout, "leftovers are not work that arrived")
+        self.assertIn("restarted=yes", r.stdout)
+        late = Path(self._tmp.name) / "late.ps1"
+        late.write_text(
+            "param([string]$VenueRoot)\r\nSet-Content -LiteralPath (Join-Path (Join-Path $VenueRoot 'running') 'late.started.json') -Value '{}'\r\n",
+            encoding="ascii")
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(late))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_WARN_ARRIVED_DURING_RESTART running=1 inbox=0", r.stdout)
+
+    def test_s5_a_root_with_a_wildcard_character_refuses_unreadable(self) -> None:
+        # adversary A1: the agent lists its inbox with a positional (wildcard-reading) -Path, so on C:\bench[1] its pickup set is not
+        # what a literal listing sees (it may even be another folder's). The deploy cannot read the agent's pickup set there: it refuses.
+        for leaf in ("venue[1]", "venue`x"):
+            with self.subTest(root=leaf):
+                odd = Path(self._tmp.name) / leaf
+                for d in ("inbox", "running", "slot-holders"):
+                    (odd / d).mkdir(parents=True)
+                (odd / AGENT_NAME).write_bytes(OLD)
+                (odd / "inbox" / "q1.job.ps1").write_text("Write-Output 'q1'")
+                r = self.run_deploy("-DryRun", venue=odd)
+                self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+                self.assertRegex(r.stdout, r"(?m)^DEPLOY_REFUSED_UNREADABLE .*wildcard")
+                self.assertNotIn("DEPLOY_REFUSED_BUSY", r.stdout)
+
+    TMP_MARKER = "q.started.json.0123456789abcdef0123456789abcdef.tmp"
+
+    def test_s6_a_marker_promoted_between_two_listings_is_still_busy(self) -> None:
+        # adversary pass 2 A1: running\ is read by two rules; the agent renames its marker tmp to the final marker AFTER the
+        # final-marker listing and BEFORE the tmp listing, so each listing alone misses it. The folder changed under the listings,
+        # so they are taken again, and the second round sees the final marker.
+        (self.venue / "running" / self.TMP_MARKER).write_text('{"jobId":"q","phase":"launched"}')
+        r = self._dot_source(
+            "$script:orig = ${function:Get-LiveWorkNames}; $script:done = $false; "
+            "function Get-LiveWorkNames { param([string]$Dir, $Rule, [string[]]$Entries) "
+            "  $out = @(& $script:orig -Dir $Dir -Rule $Rule -Entries $Entries); "
+            "  if (-not $script:done -and $Rule.what -eq 'marker') { $script:done = $true; "
+            "    Rename-Item -LiteralPath (Join-Path $Dir '%s') -NewName 'q.started.json' }; "
+            "  $out }; "
+            "$s = Get-VenueStateRaw; 'promoted=' + $script:done + ' running=' + $s.running + ' unreadable=' + $s.unreadable" % self.TMP_MARKER)
+        self.assertIn("promoted=True running=1 unreadable=", r.stdout, r.stdout + r.stderr)
+
+    def test_s6_a_folder_that_never_holds_still_is_unreadable_not_idle(self) -> None:
+        r = self._dot_source(
+            "$script:orig = ${function:Get-LiveWorkNames}; $script:n = 0; "
+            "function Get-LiveWorkNames { param([string]$Dir, $Rule, [string[]]$Entries) "
+            "  $out = @(& $script:orig -Dir $Dir -Rule $Rule -Entries $Entries); "
+            "  if ($Rule.what -eq 'marker-tmp') { $script:n++; Set-Content -LiteralPath (Join-Path $Dir ('churn-' + $script:n + '.txt')) -Value x }; "
+            "  $out }; "
+            "$s = Get-VenueStateRaw; 'rounds=' + $script:n + ' running=' + $s.running + ' unreadable=' + $s.unreadable")
+        self.assertRegex(r.stdout, r"rounds=5 running=0 unreadable=folder running\\ changed during each of 5 listings", r.stdout + r.stderr)
+
+    def test_s4_the_predicate_is_the_agents_own_calls_defined_once(self) -> None:
+        text = SCRIPT.read_text(encoding="ascii")
+        agent = (SCRIPT.parent / AGENT_NAME).read_text(encoding="utf-8-sig")
+        # every rule names the agent's own call; if the agent changes its pickup or marker patterns this reds
+        self.assertIn("Get-ChildItem $inbox -Filter *.job.ps1 -File", agent)
+        self.assertIn("Get-ChildItem -LiteralPath $running -Filter *.started.json -File", agent)
+        self.assertIn('if ($f.Name -like "*.started.json")', agent)
+        tmp_re = r"'^(?<id>.+)\.started\.json(\.[0-9a-f]{32})?\.tmp$'"
+        self.assertIn("[regex]::Match($f.Name, %s)" % tmp_re, agent)
+        self.assertIn('-Filter "*.lease.json" -File', agent)
+        self.assertIn('-Filter "*.holder.json" -File', agent)
+        self.assertIn('"$id.acquired.json"', agent)
+        # adversary A3: EVERY listing of a folder the predicate reads, at every site, uses the pattern the table copies; a change at
+        # ONE site (the pickup loop, or only the exempt-job list) is drift too, so the guard reads each site, not "somewhere"
+        # adversary pass 2 A2: each site is pinned by its WHOLE call (pattern AND options: an added -Force would make the agent
+        # pick up hidden files the deploy ignores), and the list of sites is exact (a new or changed listing reds)
+        pinned = [
+            "Get-ChildItem -LiteralPath $running -File -ErrorAction Stop",                                         # Get-MarkerTempFiles
+            "Get-ChildItem -LiteralPath $running -Filter *.started.json -File -ErrorAction SilentlyContinue",       # Get-RunningMarkerJobIds
+            "Get-ChildItem -LiteralPath $slotHolders -Filter \"*.holder.json\" -File -ErrorAction SilentlyContinue",
+            "Get-ChildItem -LiteralPath $slotHolders -File -ErrorAction SilentlyContinue",                         # startup side-file cleanup
+            "Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue",                         # exempt-job list
+            "Get-ChildItem -LiteralPath $slotHolders -Filter \"*.lease.json\" -File -ErrorAction SilentlyContinue",
+            "Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue",                         # pickup loop
+        ]
+
+        def drift(agent_text: str) -> list:
+            sites = [s.rstrip() for s in re.findall(r"Get-ChildItem\b[^\n|)]*?\$(?:inbox|running|slotHolders)\b[^\n|)]*", agent_text)]
+            return [] if sites == pinned else sites
+        self.assertEqual(drift(agent), [], "every listing of a predicate folder is the call the deploy's table copies")
+        # the guard itself: a change at ONE pickup site (the exempt list only, then the pickup loop only) is caught
+        exempt = "$exemptJobs = Get-ChildItem $inbox -Filter *.job.ps1 -File"
+        pickup = "$jobs = Get-ChildItem $inbox -Filter *.job.ps1 -File"
+        for site in (exempt, pickup):
+            for mutant in (site.replace("*.job.ps1", "*.queued.ps1"), site + " -Force"):
+                with self.subTest(mutated=mutant):
+                    self.assertEqual(agent.count(site), 1, site)
+                    self.assertNotEqual(drift(agent.replace(site, mutant)), [])
+        # ... and the deploy spells each pattern ONCE, in its one table
+        for token in ("'*.job.ps1'", "'*.started.json'", tmp_re, r"'\.(lease|holder|acquired)\.json\z'"):
+            self.assertEqual(text.count(token), 1, "%s is spelled exactly once in the deploy script" % token)
+        self.assertEqual(len(re.findall(r"EnumerateFileSystemEntries\(\(Join-Path \$VenueRoot '(inbox|running)'\)\)", text)), 0,
+                         "no second, any-entry count of inbox\\ or running\\")
+        # adversary A2: the promise is about THIS script only; the replacement agent's own startup cleanup is named, not hidden
+        self.assertIn("Stop-StaleHeavySlotHolders", text)
+        self.assertNotRegex(text, r"(?i)ignored leftover[^\n]*never touched\b(?![^\n]*by this)")
+        # both idle judgements (the refusal and the arrival warning) read the one state function
+        for fn in ("Get-Refusals", "Get-ArrivalWarning"):
+            body = re.search(r"(?s)function %s \{(.*?)\n\}" % fn, text).group(1)
+            self.assertIn("Get-VenueState", body, fn)
 
     def test_refuse_lease_held(self) -> None:
         (self.venue / "slot-holders" / "lb-abc.lease.json").write_text("{}")
