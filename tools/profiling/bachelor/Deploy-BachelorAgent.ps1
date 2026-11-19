@@ -31,7 +31,8 @@
 #   4. the venue copy already has that sha -> DEPLOY_NOOP, exit 0 (idempotent; nothing is touched, busy or not).
 #      With -RestartMode when-idle a no-op still writes nothing, but the live agent may be running an OLDER script it read before
 #      the file was written (a copy-only deploy, or a crash after the write): the restart binding below must hold, and the agent is
-#      restarted (the step 8 path, on the same idle gate) iff it did not start clearly after the file time (Get-NoopRestartDecision).
+#      restarted (the step 8 path, on the same idle gate) iff it did not start clearly after the file time (Get-NoopRestartDecision;
+#      the file time is the latest of write, creation and CHANGE time, because a copy can carry the first two over from its source).
 #      An agent start or file time that cannot be read is `restarted=no reason=unreadable`, exit 12, never a silent success.
 #   5. busy or leased -> typed refusal, nothing changed (table below). Busy is ONE predicate ($script:LiveWorkRules): an
 #      inbox\*.job.ps1, a running\*.started.json or an unresolved marker tmp, each read with the agent's own call; any other
@@ -54,7 +55,7 @@
 #   DEPLOY_DRYRUN action=deploy sha=<s> restart=when-idle decision=<restart-if-idle wouldExit=0|refuse wouldExit=16 why=<..>>   0
 #   DEPLOY_DRYRUN action=noop sha=<s> restart=when-idle decision=<restart|no-restart> reason=<as DEPLOY_NOOP> wouldExit=<n> ...  0
 #                 (a dry run REPORTS the restart decision, including a binding that does not hold, instead of exiting 16/12;
-#                 a busy, leased or unreadable venue is still a refusal)
+#                 a busy, leased or unreadable venue is still a refusal, judged before any of these lines, NOOP or deploy)
 #   DEPLOY_OK sha=<s> rollback=<path|none> restarted=<yes|no>    0
 #   DEPLOY_WARN_ARRIVED_DURING_RESTART running=<n> inbox=<n> ... 0  (printed before DEPLOY_OK; see "Residual race")
 #   DEPLOY_IGNORED_LEFTOVERS ignored=<n> (<per folder>) ...      -  (informational, after step 2, only when n > 0; no exit of its own)
@@ -1044,6 +1045,45 @@ function Invoke-AgentRestart {
     return @{ why = $null; warn = $warn }
 }
 
+function Get-FileChangeTimeUtc {
+    # The file's CHANGE time: NTFS ChangeTime (FILE_BASIC_INFO, GetFileInformationByHandleEx) on Windows, the inode status-change time
+    # (ctime) elsewhere. Every write, rename and metadata change moves it to "now", and no copy tool carries it over from the source
+    # (Copy-Item and robocopy set LastWriteTime and CreationTime, never ChangeTime; a Unix ctime cannot be set at all), so unlike the
+    # write and creation times it cannot read older than the moment the bytes landed. Throws when it cannot be read.
+    param([string]$Path)
+    if ($script:OnWindows) {
+        if ($null -eq ('MlvDeployFileTimes' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class MlvDeployFileTimes {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_BASIC_INFO { public long CreationTime; public long LastAccessTime; public long LastWriteTime; public long ChangeTime; public uint FileAttributes; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out FILE_BASIC_INFO info, uint size);
+    public static DateTime ChangeTimeUtc(string path) {
+        using (SafeFileHandle h = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+            FILE_BASIC_INFO info;
+            if (!GetFileInformationByHandleEx(h, 0, out info, (uint)Marshal.SizeOf(typeof(FILE_BASIC_INFO)))) {
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return DateTime.FromFileTimeUtc(info.ChangeTime);
+        }
+    }
+}
+'@
+        }
+        return [MlvDeployFileTimes]::ChangeTimeUtc($Path)
+    }
+    $stat = (Get-Item -LiteralPath $Path -ErrorAction Stop).UnixStat
+    if ($null -ne $stat -and $null -ne $stat.StatusChangeTime) { return ([datetime]$stat.StatusChangeTime).ToUniversalTime() }
+    $epoch = ([string](& stat -c '%Z' -- $Path)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $epoch -notmatch '\A\d+\z') { throw "stat -c %Z gave no change time for $Path" }
+    return [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch).UtcDateTime
+}
+
 function Get-NoopRestartDecision {
     # BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1: the venue copy already has the source sha, so nothing is written; with -RestartMode when-idle
     # the question is whether the LIVE agent runs that file or an older one it read before the file was written (a copy-only deploy, or a
@@ -1056,9 +1096,9 @@ function Get-NoopRestartDecision {
     #   restart=$false reason=no-live-agent   code 16  the heartbeat pid is not a live process with its recorded start
     # $Beat: the heartbeat the restart binding proved (it carries osStart, the start the OS reported for the pid), or $null when no binding
     # ran (the -RestartScript seam), in which case the heartbeat is read here and held to the same "live, with its recorded start" test.
-    # The file time is the LATER of LastWriteTimeUtc and CreationTimeUtc: this script's own write (temp, then rename) sets both to the
-    # moment of the write, but a copy that keeps the source's write time (Copy-Item, robocopy) gives a fresh creation time only, and a
-    # write time from the past would otherwise read an agent as current that never loaded the file.
+    # The file time is the LATEST of LastWriteTimeUtc, CreationTimeUtc and the change time (Get-FileChangeTimeUtc). A copy can carry the
+    # write AND the creation time over from its source (Copy-Item keeps the write time, robocopy both), so either one alone could read
+    # an agent as current that never loaded the file; the change time moves with every write and no copy carries it over.
     param([string]$AgentScript, $Beat)
     $unreadable = { param([string]$Why) return @{ restart = $false; reason = 'unreadable'; detail = $Why; code = 12 } }
     $startText = $null
@@ -1085,6 +1125,8 @@ function Get-NoopRestartDecision {
         $item = Get-Item -LiteralPath $AgentScript -ErrorAction Stop
         $fileUtc = $item.LastWriteTimeUtc
         if ($item.CreationTimeUtc -gt $fileUtc) { $fileUtc = $item.CreationTimeUtc }
+        $changeUtc = Get-FileChangeTimeUtc -Path $AgentScript
+        if ($changeUtc -gt $fileUtc) { $fileUtc = $changeUtc }
     }
     catch { return (& $unreadable "the time of $AgentScript could not be read: $($_.Exception.Message)") }
     $detail = "pid=$($Beat.pid) agentStartUtc=$($agentStart.ToString('o')) fileUtc=$($fileUtc.ToString('o'))"
@@ -1168,6 +1210,15 @@ try {
     # 4b. a no-op with -RestartMode when-idle: restart the agent iff it predates the file (Get-NoopRestartDecision), on the same idle gate
     # and the same restart path as a deploy. Nothing is written either way.
     if ($isNoop) {
+        # a dry run's refusals stay refusals (adversary A2 of 100e87dc): busy, leased or unreadable is judged BEFORE any dry-run report
+        # below, whatever restart decision would follow, exactly as a dry deploy judges it before its DEPLOY_DRYRUN line
+        if ($DryRun) {
+            $dryRef = Get-Refusals
+            if ($null -ne $dryRef) {
+                foreach ($l in $dryRef.lines) { Out-Typed $l }
+                exit $dryRef.code
+            }
+        }
         if ($null -ne $bind) {
             Out-Typed "DEPLOY_DRYRUN action=noop sha=$srcSha restart=$RestartMode decision=no-restart reason=restart-host-refused wouldExit=16 why=$bind"
             exit 0

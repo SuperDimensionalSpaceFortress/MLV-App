@@ -1759,6 +1759,51 @@ class DeployBachelorAgent(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s\s*$" % sha(NEW))
 
+    # ---- adversary pass 1 of 100e87dc (A1, A2): each test failed on 100e87dc ----------------------------------------------------
+
+    def test_noop_a1_a_copy_that_keeps_old_write_and_creation_times_still_restarts(self) -> None:
+        # A1: a copy-only deploy with Copy-Item / robocopy keeps the source's LastWriteTimeUtc (and robocopy its CreationTimeUtc), so both
+        # read OLDER than the agent; the agent never loaded these bytes. Only the change time (NTFS ChangeTime, Unix ctime) cannot be
+        # carried over by a copy, so an agent is "current" only when it started after THAT too.
+        self._noop_venue_with_live_agent(agent_first=False)
+        agent = self.venue / AGENT_NAME
+        agent.write_bytes(OLD)                           # the copy lands after the agent started ...
+        past = time.time() - 3 * 86400
+        os.utime(agent, (past, past))                    # ... carrying an old write time
+        if sys.platform == "win32":                      # ... and an old creation time (settable on Windows only)
+            subprocess.run([PWSH, "-NoProfile", "-Command",
+                            "(Get-Item -LiteralPath '%s').CreationTimeUtc = [DateTime]::UtcNow.AddDays(-4)" % psq(agent)],
+                           check=True, capture_output=True, text=True, timeout=60)
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=agent-predates-file\b" % sha(OLD))
+        self.assertTrue(self.marker.exists(), "the agent that predates the copy is restarted")
+
+    def test_noop_a2_a_busy_or_leased_venue_is_still_a_refusal_in_a_when_idle_noop_dry_run(self) -> None:
+        # A2: every dry-run report on the NOOP path (binding refused, no restart needed, restart needed) came before the busy check
+        self.source.write_bytes(OLD)
+        cases = (("binding-refused", ()), ("restart-script", ("-RestartScript", str(self.restart))))
+        for label, extra in cases:
+            for folder, name, code, needle in (("inbox", "j1.job.ps1", 10, "DEPLOY_REFUSED_BUSY running=0 inbox=1"),
+                                               ("slot-holders", "lb-1.lease.json", 11, "DEPLOY_REFUSED_LEASE lb-1.lease.json")):
+                with self.subTest(label=label, name=name):
+                    f = self.venue / folder / name
+                    f.write_text("x")
+                    try:
+                        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", *extra)
+                        self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+                        self.assertIn(needle, r.stdout)
+                        self.assertNotIn("DEPLOY_DRYRUN", r.stdout)
+                    finally:
+                        f.unlink()
+        # an agent that started after the file (no restart needed) on a busy venue: the dry run still refuses
+        self._noop_venue_with_live_agent(agent_first=False)
+        (self.venue / "inbox" / "j1.job.ps1").write_text("x")
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertNotIn("DEPLOY_DRYRUN", r.stdout)
+        self.assertFalse(self.marker.exists())
+
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.
         r = subprocess.run(
