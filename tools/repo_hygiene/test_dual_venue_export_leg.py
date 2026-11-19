@@ -115,16 +115,6 @@ def evidence_cases(cases: list[dict]):
                              "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
 
 
-def assert_containment_advisory(tc: unittest.TestCase, row: dict, *needles: str) -> None:
-    """r18 (hub STOP RULE 2026-11-18T17:26:25Z; EXPORT-CDNG-STAGE-CONTAINMENT-1): a CDNG disjoint-stage containment finding is ADVISORY. It is recorded in containmentAdvisory, never
-    in problems, and never turns the outcome: a run with no other problem and an agreeing dual-ISO class still reads PASS."""
-    tc.assertFalse(any("EXPORT_STAGE_CONTAINMENT" in p for p in row["problems"]), row)
-    tc.assertTrue(any(p.startswith("EXPORT_STAGE_CONTAINMENT_ADVISORY: ") and "EXPORT-CDNG-STAGE-CONTAINMENT-1" in p and all(n in p for n in needles)
-                      for p in row["containmentAdvisory"]), row)
-    if not row["problems"] and not row["classMismatch"]:
-        tc.assertEqual(row["outcome"], "PASS", row)
-
-
 def cdng_case(**over) -> dict:
     c = {"format": "cdng-lossless", "maxFrames": 30, "dualIsoExpected": True, "buildId": BUILD_ID, "profile": cdng_profile(30), "stage": None,
          "batch": batch_log(30), "manifest": output_manifest(30), "token": "EXPORT_CAPTURED", "exit": 0,
@@ -834,11 +824,10 @@ class ExportEvidenceTests(unittest.TestCase):
         cases = [cdng_case(dualIsoExpected=False, profile=p, criteria=[]) for p in (producer_sum, children_sum, control)]
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        # (r18: advisory pending EXPORT-CDNG-STAGE-CONTAINMENT-1, recorded and never gating)
+        # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again, as r11 shipped it; r18 had made it advisory)
         for i, inside in ((0, "producer_frame"), (1, "llrawproc")):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages", f"inside {inside} mean")
-                self.assertEqual(got[i]["outcome"], "PASS", got[i])
+                assert_containment_gates(self, got[i], "the disjoint stages", f"inside {inside} mean")
         self.assertEqual(got[2]["outcome"], "PASS", got[2])
         self.assertEqual(got[2]["containmentAdvisory"], [], got[2])
 
@@ -915,8 +904,7 @@ class ExportEvidenceTests(unittest.TestCase):
         control = profile({"producer_frame_ms": 50.0, "raw_read_ms": 10.0, "llrawproc_dark_frame_ms": 10.0, "llrawproc_dual_iso_ms": 10.0})
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in (over, control)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        assert_containment_advisory(self, got[0], "the disjoint stages", "inside producer_frame mean")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
-        self.assertEqual(got[0]["outcome"], "PASS", got[0])
+        assert_containment_gates(self, got[0], "the disjoint stages", "inside producer_frame mean")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         self.assertEqual(got[1]["outcome"], "PASS", got[1])
         self.assertEqual(got[1]["containmentAdvisory"], [], got[1])
 
@@ -943,7 +931,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in (0, 1, 2):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
+                assert_containment_gates(self, got[i], "the disjoint stages")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         self.assertEqual(got[3]["outcome"], "PASS", got[3])
         self.assertEqual(got[3]["containmentAdvisory"], [], got[3])
 
@@ -974,7 +962,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(profiles) + 1):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
+                assert_containment_gates(self, got[i], "the disjoint stages")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
         self.assertEqual(got[-1]["containmentAdvisory"], [], got[-1])
 
@@ -1012,7 +1000,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(bad)):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
+                assert_containment_gates(self, got[i], "the disjoint stages")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         for i in range(len(bad), len(bad) + len(controls)):
             with self.subTest(control=i):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
@@ -1043,9 +1031,8 @@ class ExportEvidenceTests(unittest.TestCase):
         for i in range(len(bad)):
             with self.subTest(case=i):
                 container = "llrawproc_shared_lock" if i < 3 else "llrawproc_other"
-                # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1: a contained-pair line names "than <container>", a group line "inside <container>")
-                self.assertTrue(any(f"inside {container}" in p or f"than {container}" in p for p in got[i]["containmentAdvisory"]), got[i])
-                assert_containment_advisory(self, got[i])
+                # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again; a group line and a contained-pair line both name "inside <container>")
+                assert_containment_gates(self, got[i], f"inside {container}")
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
         self.assertEqual(got[-1]["containmentAdvisory"], [], got[-1])
 
@@ -1136,7 +1123,11 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIn((frozenset({"llrawproc_dualiso_refine_lock", "llrawproc_publish_lock"}), "llrawproc_shared_lock"), derived)
         self.assertIn((frozenset({"llrawproc_dualiso_refine_lock", "llrawproc_publish_lock"}), "llrawproc_other"), derived)
         # (the pass16 A1 member is in a derived group, and so is every earlier round's)
-        self.assertIn((frozenset({"llrawproc_vertical_stripes", "llrawproc_pattern_noise", "llrawproc_dual_iso", "llrawproc_chroma_smooth", "llrawproc_shared_lock"}), "llrawproc"), derived)
+        # (EXPORT-CDNG-STAGE-CONTAINMENT-1: pre_dualiso_fix has no export window, so it meets no row and joins every maximal group; r17 key3 B1's pair is held)
+        self.assertIn((frozenset({"llrawproc_vertical_stripes", "llrawproc_pattern_noise", "llrawproc_dual_iso", "llrawproc_chroma_smooth", "llrawproc_shared_lock",
+                                  "llrawproc_pre_dualiso_fix"}), "llrawproc"), derived)
+        self.assertTrue(all("llrawproc_pre_dualiso_fix" in g["members"] for g in got["groups"] if g["parent"] in ("llrawproc", "producer_frame") and "llrawproc" not in g["members"]),
+                        got["groups"])   # (a group holding the llrawproc TOTAL holds none of its children)
 
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string
@@ -1359,8 +1350,11 @@ def table_vs_export_problems(table: list, derived: dict) -> list:
             spans.append((a, z))
             if not all(derived["live"](ln) for ln in (a, z)):
                 problems.append(f"{name}: window {w} is not in code CDNG export reaches")
+        own = set(derived["windows"].get(name, ()))
+        for inner in derived["contains"].get(name, ()):   # (a timer that accumulates another one accrues in that one's windows too: shared_lock += refine / publish)
+            own |= set(derived["windows"].get(inner, ()))
         for w, (a, z) in zip(wins, spans):
-            if any(sa <= z and a <= sz for sa, sz in derived["windows"].get(name, ())):
+            if any(sa <= z and a <= sz for sa, sz in own):
                 continue
             # (a callee's lines count when every one of its live call sites is inside the row's other windows: the table's header rule)
             owners = [f for f in derived["reachable"] if f != "applyLLRawProcObjectWorker" and any(fa <= a and z <= fz for fa, fz in derived["funcLines"].get(f, []))]
@@ -1468,8 +1462,9 @@ class CdngStageContainmentGateTests(unittest.TestCase):
                               cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_pre_dualiso_fix_ms": 80.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_other_ms": 20.0},
                                                 drop_total=True),
                               cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_other_ms": 20.0})])
-        assert_containment_gates(self, got[0], "the disjoint stages", "llrawproc_pre_dualiso_fix", "inside llrawproc mean")
-        assert_containment_gates(self, got[1], "the disjoint stages", "llrawproc_pre_dualiso_fix")
+        for i in (0, 1):   # (the first group over its parent is named: with the producer's other members inside producer_frame, or inside llrawproc)
+            with self.subTest(case=i):
+                assert_containment_gates(self, got[i], "the disjoint stages", "llrawproc_pre_dualiso_fix", "llrawproc_dual_iso")
         self.assert_controls_pass(got[2:])
 
     def test_guard_the_window_table_equals_what_cdng_export_reaches_in_the_c_sources(self) -> None:
