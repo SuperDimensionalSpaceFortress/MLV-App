@@ -148,5 +148,13 @@ TEST(ViewerIdleWiring, InputsReadWindowStateAndToolsAndSurfacesReadGlWindowFresh
     ASSERT_FALSE(timeout.isEmpty());
     ASSERT_TRUE(timeout.contains(QStringLiteral("in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );")));
     ASSERT_TRUE(timeout.contains(QStringLiteral("case viewer_idle::Tick::Show:")));
+    // Adversary pass 2 A1: a move away and back between two ticks leaves the sampled position unchanged, so
+    // on Windows the tick also asks whether a WM_MOUSEMOVE is still queued (an input-excluded wait leaves
+    // it there), guarded to Windows.
+    const int queueAt = timeout.indexOf(QStringLiteral("GetQueueStatus( QS_MOUSEMOVE )"));
+    ASSERT_TRUE(queueAt >= 0);
+    const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), queueAt);
+    ASSERT_TRUE(guardAt >= 0);
+    ASSERT_TRUE(timeout.indexOf(QStringLiteral("#endif"), guardAt) > queueAt);
     ASSERT_EQ(3, int(timeout.count(QStringLiteral("m_viewerIdleTimer->start( ms );"))));
 }

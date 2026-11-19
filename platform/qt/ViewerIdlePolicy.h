@@ -71,12 +71,14 @@ inline bool isActivity( QEvent::Type type, const QPointF &globalNow, const QPoin
 }
 
 /*! \brief Events that show the cursor at once whatever the mouse did: a modal dialog blocking the
- *         window or a deactivation (no mouse event reaches a blocked window), and a context menu. */
+ *         window or a deactivation (no mouse event reaches a blocked window), a context menu, and a
+ *         window state change (real fullscreen can end without actionFullscreen toggling). */
 inline bool forcesRestore( QEvent::Type type )
 {
     return type == QEvent::WindowBlocked
         || type == QEvent::WindowDeactivate
-        || type == QEvent::ContextMenu;
+        || type == QEvent::ContextMenu
+        || type == QEvent::WindowStateChange;
 }
 
 /*! \brief The OS pointer position seen at the last look. moved() reports a change since then. Integer
@@ -161,8 +163,17 @@ public:
             }
             return Tick::Rearm;
         }
+        if( !mayHide( in ) )
+        {
+            // A gate fails (fullscreen really left, inactive, tool, popup/modal): never stay hidden.
+            if( m_hidden )
+            {
+                m_hidden = false;
+                return Tick::Show;
+            }
+            return Tick::Rearm;
+        }
         if( m_hidden ) return Tick::Rearm;          // keep watching the pointer while hidden
-        if( !mayHide( in ) ) return Tick::Rearm;
         const qint64 elapsed = nowMs < m_lastActivity ? 0 : nowMs - m_lastActivity;
         if( elapsed < idleMs )
         {

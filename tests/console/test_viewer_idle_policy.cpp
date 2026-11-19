@@ -203,6 +203,30 @@ TEST(ViewerIdlePolicy, PointerMovedWithoutEventsShowsAndDefersTheHide)
     ASSERT_EQ(tickValue(viewer_idle::Tick::None), tickValue(off.onTimeout(moved, 5000, 2000, &rearm)));
 }
 
+// Adversary pass 2 A2: real fullscreen can end without actionFullscreen toggling (a window-manager
+// restore). The state change restores at once, and any failing gate seen while hidden shows the cursor.
+TEST(ViewerIdlePolicy, HiddenCursorShowsWhenAGateFailsOrTheWindowStateChanges)
+{
+    ASSERT_TRUE(viewer_idle::forcesRestore(QEvent::WindowStateChange));
+
+    for (int gate = 0; gate < 4; ++gate)
+    {
+        viewer_idle::Controller c;
+        int rearm = -1;
+        c.setFullscreen(true, 0);
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm)));
+        viewer_idle::Inputs in = allPass();
+        if (gate == 0) in.fullscreen = false;
+        if (gate == 1) in.windowActive = false;
+        if (gate == 2) in.toolArmed = true;
+        if (gate == 3) in.popupOrModalOpen = true;
+        rearm = -1;
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 2500, 2000, &rearm)));
+        ASSERT_EQ(2000, rearm);
+        ASSERT_FALSE(c.hidden());
+    }
+}
+
 TEST(ViewerIdlePolicy, PointerWatchReportsOnlyAChangeSinceTheLastLook)
 {
     viewer_idle::PointerWatch w;

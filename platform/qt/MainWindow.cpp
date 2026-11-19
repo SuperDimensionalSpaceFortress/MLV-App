@@ -3735,6 +3735,11 @@ void MainWindow::viewerIdleTimeout( void )
     // A wait that excludes user input still runs this timer but delivers no mouse event: the OS pointer
     // position is the witness for movement the event path did not see.
     in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );
+#ifdef Q_OS_WIN
+    // A move away and back between two ticks leaves the sampled position unchanged. Such a wait leaves the
+    // WM_MOUSEMOVE queued for this (GUI) thread, which owns both viewer surfaces, so ask the queue too.
+    if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;
+#endif
     switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms ) )
     {
     case viewer_idle::Tick::Hide:

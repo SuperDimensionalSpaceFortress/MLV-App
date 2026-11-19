@@ -2114,7 +2114,11 @@ void GuiSmokeTest::viewerCursorAutohide_pointerMovedWhileInputExcludedRestores()
     viewer_idle::Surfaces surfaces;
     surfaces.viewport = &viewport;
 
-    QCursor::setPos( QPoint( 3000, 3000 ) );
+    // Positions inside the primary screen, so a native platform does not clip both to the same edge point.
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QVERIFY( screen != nullptr );
+    const QPoint start = screen->geometry().center();
+    QCursor::setPos( start );
     ViewerIdleHarness harness( surfaces, 40 );
     qApp->installEventFilter( &harness );
     auto removeFilter = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
@@ -2122,7 +2126,7 @@ void GuiSmokeTest::viewerCursorAutohide_pointerMovedWhileInputExcludedRestores()
     QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
 
     harness.inputExcluded = true;
-    QCursor::setPos( QPoint( 3010, 3000 ) );
+    QCursor::setPos( start + QPoint( 10, 0 ) );
     QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::OpenHandCursor, 1000 );
     QVERIFY( !harness.hidden() );
     harness.inputExcluded = false;
