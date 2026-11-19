@@ -15931,6 +15931,18 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 session=4\n", 1), (4, 4, 4, 4), False),
             "r5-A2: toggle 1 begins (elapsed_ms=1) before toggle 0 ended (elapsed_ms=6007) on the one producer clock": (
                 self.log().replace("elapsed_ms=8007", "elapsed_ms=1").replace("elapsed_ms=10007", "elapsed_ms=2001"), (4, 3, 3, 3), False),
+            # r5 adversary pass on 129eb94b (A1): the records are split on the plain space only, so a TAB (or any other character outside printable ASCII) inside a value hid a `key=`
+            # and a bare CR hid a whole record in one line; a counted record holding such a character is unusable, and a bare CR ends a line
+            "r5b-A1: a TAB inside an extra summary value hides `requested=5`": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok extra=x\trequested=5"), (4, 4, 4, 4), False),
+            "r5b-A1: a TAB inside an extra begin value hides `position=999`": (
+                self.log(mutate=lambda i, b, e: (b + " extra=x\tposition=999" if i == 0 else b, e)), (4, 3, 3, 3), False),
+            "r5b-A1: a TAB inside an extra keep_playing value hides `event=resize.redraw_stopped`": (
+                self.log().replace(self.KEEP, self.KEEP + " extra=x\tevent=resize.redraw_stopped"), (4, 4, 0, 4), False),
+            "r5b-A1: a bare CR after the summary hides a duplicate begin of toggle 0 in the same physical line": (
+                self.log() + " extra=x\r" + self.toggle(0, "begin"), (4, 3, 3, 3), False),
+            "r5b-A1: a no-break space (U+00A0) inside an extra begin value hides `position=999`": (
+                self.log(mutate=lambda i, b, e: (b + " extra=x" + chr(0xA0) + "position=999" if i == 0 else b, e)), (4, 3, 3, 3), False),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (

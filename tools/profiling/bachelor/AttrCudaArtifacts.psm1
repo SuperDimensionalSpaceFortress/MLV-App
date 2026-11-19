@@ -7427,7 +7427,8 @@ function Get-AttrCudaWindowToggleEvidence {
     # ($badTail) and a keep_playing line carrying it counts for nothing. It may refuse; it never forges.
     $badTail = [System.Collections.Generic.HashSet[int]]::new()
     $lines = [System.Collections.Generic.List[string]]::new()
-    foreach ($rawLine in @($LogText -split "`r?`n")) {
+    # r5 (adversary A1 on 129eb94b): a line ends at CRLF, a bare CR or a bare LF, so a lone CR never hides a second record inside one line
+    foreach ($rawLine in @($LogText -split '\r\n|\r|\n')) {
         $body = [regex]::Replace($rawLine, '^\s*(?:\[[^\]]*\]\s*)*', '')
         $cut = -1
         $scanAt = 0
@@ -7535,6 +7536,9 @@ function Get-AttrCudaWindowToggleEvidence {
         # (r3 B2: the value may be EMPTY, so a key repeated with no value, ` position=` or ` requested=`, is repeated and the record unusable)
         $values = @{}
         $repeatedKey = $badTail.Contains($i)
+        # r5 (adversary A1 on 129eb94b): the tokens are split on the plain space only, so a TAB or any other character outside printable ASCII inside a value would hide a
+        # `<key>=` (`extra=x<TAB>requested=5`); the app writes none in a record here (log_line_field::fieldValue maps every control and every space), so such a record is unusable
+        if ($line -cmatch '[^\x20-\x7E]') { $repeatedKey = $true }
         foreach ($token in ($line -split ' ' | Select-Object -Skip 1)) {
             $eq = $token.IndexOf('=')
             if ($eq -lt 1 -or $token -match '[\x22\x27\x60\p{Pi}\p{Pf}]' -or $token.Substring(0, $eq) -cnotmatch '^[A-Za-z0-9_]+$') { $repeatedKey = $true; continue }
