@@ -33,6 +33,7 @@
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "LookAssistAnalysisPump.h"
 #include "LookLabelPolicy.h"                        // look_label::LabelGrade member below (r16)
+#include "ViewerCursorSurfaces.h"                   // PLAYER-CURSOR-AUTOHIDE-1 viewer_idle members below
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
@@ -908,6 +909,20 @@ private:
     bool m_dontDraw;
     bool m_frameStillDrawing;
     bool m_fileLoaded = false;
+    // PLAYER-CURSOR-AUTOHIDE-1: fullscreen cursor auto-hide (one idle clock, shared later by
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1; no second timer).
+    viewer_idle::Surfaces viewerIdleSurfaces( void ) const;
+    viewer_idle::Inputs viewerIdleInputs( void ) const;
+    void viewerIdleRestore( void );
+    void viewerIdleFullscreenChanged( bool on );
+    void viewerIdleTimeout( void );
+    void viewerIdleNoteEvent( QObject *watched, QEvent *event );
+    QTimer *m_viewerIdleTimer = nullptr;
+    QElapsedTimer m_viewerIdleClock;
+    viewer_idle::Controller m_viewerIdle;
+    viewer_idle::CursorHider m_viewerCursorHider;
+    QPoint m_viewerIdleLastGlobal;
+    bool m_viewerIdleHaveLast = false;
     bool m_inOpeningProcess;
     bool m_setSliders;
     int m_timerId;

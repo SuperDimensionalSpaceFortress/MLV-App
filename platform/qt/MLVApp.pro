@@ -411,6 +411,8 @@ HEADERS += MainWindow.h \
            PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            LookLabelPolicy.h \
+           ViewerIdlePolicy.h \
+           ViewerCursorSurfaces.h \
            LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
            PlayerShortcutBinding.h \

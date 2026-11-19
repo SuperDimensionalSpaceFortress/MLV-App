@@ -12,6 +12,7 @@
 #include "../../platform/qt/PlayerShortcutBinding.h"
 #include "../../platform/qt/ScopesLabel.h"
 #include "../../platform/qt/VectorScope.h"
+#include "../../platform/qt/ViewerCursorSurfaces.h"
 #include "../../platform/qt/WaveFormMonitor.h"
 #include "../../platform/qt/ZebraThresholds.h"
 #include "../common/image_regression.h"
@@ -19,6 +20,7 @@
 #include "../common/test_runtime.h"
 
 #include <QApplication>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFontInfo>
 #include <QFrame>
@@ -42,6 +44,7 @@
 #include <QScreen>
 #include <QScrollBar>
 #include <QSpinBox>
+#include <QTimer>
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -665,6 +668,11 @@ private slots:
     void mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOneRequiresLibraryReadyFirst();
     void mainWindowGpuPreviewPolicyClassifiesPlaybackPipelineStatus();
     void mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback();
+    // PLAYER-CURSOR-AUTOHIDE-1: fullscreen cursor auto-hide on the two viewer surfaces.
+    void viewerCursorAutohide_hideBlanksBothSurfacesAndRestoreGivesBackTheToolCursor();
+    void viewerCursorAutohide_restoreLeavesAnUnsetViewportCursorUnset();
+    void viewerCursorAutohide_restoreKeepsACursorSetWhileHidden();
+    void viewerCursorAutohide_idleTimerHidesAndRealMovementOrBlockingRestores();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -1840,6 +1848,219 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback()
               QStringLiteral( "GPU Tex NR" ) );
     QVERIFY( QString::fromLatin1( mainWindowScopePerformanceHintText() )
                  .contains( QStringLiteral( "Hide the edit area with E" ) ) );
+}
+
+namespace
+{
+// PLAYER-CURSOR-AUTOHIDE-1: drives the same Controller / CursorHider / eventIsActivity calls that
+// MainWindow::viewerIdleNoteEvent, viewerIdleRestore and viewerIdleTimeout make, with a short idle
+// interval so the live single-shot timer can be observed in a test.
+class ViewerIdleHarness : public QObject
+{
+public:
+    ViewerIdleHarness( const viewer_idle::Surfaces &surfaces, int idleMs )
+        : m_surfaces( surfaces ), m_idleMs( idleMs )
+    {
+        inputs.fullscreen = true;
+        inputs.windowActive = true;
+        m_clock.start();
+        m_timer.setSingleShot( true );
+        QObject::connect( &m_timer, &QTimer::timeout, this, [this]() { timeout(); } );
+    }
+
+    void enterFullscreen()
+    {
+        m_idle.setFullscreen( true, m_clock.elapsed() );
+        m_haveLast = false;
+        m_timer.start( m_idleMs );
+    }
+
+    void leaveFullscreen()
+    {
+        m_timer.stop();
+        if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
+        m_idle.setFullscreen( false, m_clock.elapsed() );
+    }
+
+    bool hidden() const { return m_idle.hidden(); }
+
+    viewer_idle::Inputs inputs;
+
+protected:
+    bool eventFilter( QObject *watched, QEvent *event ) override
+    {
+        note( event );
+        return QObject::eventFilter( watched, event );
+    }
+
+private:
+    void restoreNow()
+    {
+        if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
+        if( m_idle.fullscreen() )
+        {
+            m_idle.noteActivity( m_clock.elapsed() );
+            if( !m_timer.isActive() ) m_timer.start( m_idleMs );
+        }
+    }
+
+    void note( QEvent *event )
+    {
+        if( !m_idle.fullscreen() ) return;
+        if( viewer_idle::forcesRestore( event->type() ) )
+        {
+            restoreNow();
+            return;
+        }
+        if( viewer_idle::eventIsActivity( event, &m_lastGlobal, &m_haveLast ) )
+        {
+            if( m_idle.noteActivity( m_clock.elapsed() ) ) m_hider.restore( m_surfaces );
+            if( !m_timer.isActive() ) m_timer.start( m_idleMs );
+        }
+    }
+
+    void timeout()
+    {
+        int ms = 0;
+        switch( m_idle.onTimeout( inputs, m_clock.elapsed(), m_idleMs, &ms ) )
+        {
+        case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); break;
+        case viewer_idle::Tick::Rearm: m_timer.start( ms ); break;
+        case viewer_idle::Tick::None: break;
+        }
+    }
+
+    viewer_idle::Surfaces m_surfaces;
+    int m_idleMs;
+    viewer_idle::Controller m_idle;
+    viewer_idle::CursorHider m_hider;
+    QTimer m_timer;
+    QElapsedTimer m_clock;
+    QPoint m_lastGlobal;
+    bool m_haveLast = false;
+};
+
+// A plain mouse move with no button held. The (type, local, global, button, buttons, modifiers)
+// constructor exists in Qt 5 and Qt 6 alike.
+QMouseEvent viewerIdleMove( const QPoint &global )
+{
+    return QMouseEvent( QEvent::MouseMove, QPointF( 5, 5 ), QPointF( global ),
+                        Qt::NoButton, Qt::NoButton, Qt::NoModifier );
+}
+} // namespace
+
+// G1
+void GuiSmokeTest::viewerCursorAutohide_hideBlanksBothSurfacesAndRestoreGivesBackTheToolCursor()
+{
+    QWidget viewport;
+    viewport.setCursor( Qt::OpenHandCursor );
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+    viewer_idle::CursorHider hider;
+
+    hider.hide( surfaces );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    hider.restore( surfaces );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+
+    // Null surfaces are skipped.
+    hider.hide( viewer_idle::Surfaces() );
+    hider.restore( viewer_idle::Surfaces() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+}
+
+// G2
+void GuiSmokeTest::viewerCursorAutohide_restoreLeavesAnUnsetViewportCursorUnset()
+{
+    // A child widget, like the QGraphicsView viewport: QWidget::unsetCursor() clears WA_SetCursor only
+    // on a non-window widget.
+    QWidget view;
+    QWidget viewport( &view );
+    QVERIFY( !viewport.testAttribute( Qt::WA_SetCursor ) );
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    viewer_idle::CursorHider hider;
+
+    hider.hide( surfaces );
+    QVERIFY( viewport.testAttribute( Qt::WA_SetCursor ) );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    hider.restore( surfaces );
+    QVERIFY( !viewport.testAttribute( Qt::WA_SetCursor ) );
+}
+
+// G3: a viewer tool armed while hidden has set its own cursor; restore must not overwrite it.
+void GuiSmokeTest::viewerCursorAutohide_restoreKeepsACursorSetWhileHidden()
+{
+    QWidget viewport;
+    viewport.setCursor( Qt::OpenHandCursor );
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+    viewer_idle::CursorHider hider;
+
+    hider.hide( surfaces );
+    viewport.setCursor( Qt::CrossCursor );
+    gl.setCursor( Qt::CrossCursor );
+    hider.restore( surfaces );
+    QCOMPARE( viewport.cursor().shape(), Qt::CrossCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::CrossCursor );
+}
+
+// G4: the live single-shot timer hides; a real move restores at once; a same-position move does
+// not; a modal blocking the window restores.
+void GuiSmokeTest::viewerCursorAutohide_idleTimerHidesAndRealMovementOrBlockingRestores()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto removeFilter = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+
+    harness.enterFullscreen();
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+
+    QMouseEvent moveA = viewerIdleMove( QPoint( 100, 100 ) );
+    QCoreApplication::sendEvent( &viewport, &moveA );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+    QVERIFY( !harness.hidden() );
+
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QMouseEvent sameA = viewerIdleMove( QPoint( 100, 100 ) );
+    QCoreApplication::sendEvent( &viewport, &sameA );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+
+    QEvent blocked( QEvent::WindowBlocked );
+    QCoreApplication::sendEvent( &viewport, &blocked );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( !harness.hidden() );
+
+    // While a gate fails (a tool armed) the timer only rearms: the cursor stays shown.
+    harness.inputs.toolArmed = true;
+    QTest::qWait( 200 );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    harness.inputs.toolArmed = false;
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    harness.leaveFullscreen();
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()

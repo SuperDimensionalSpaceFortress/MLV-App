@@ -1546,6 +1546,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "PlaybackScaling.h"
 #include "PlaybackSwapInterval.h"
 #include "LookLabelPolicy.h"
+#include "ViewerCursorSurfaces.h"
 #include "ZebraThresholds.h"
 #include "batch/WorkerThreadCount.h"
 #include "ExportSettingsDialog.h"
@@ -2363,6 +2364,15 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 
     setAcceptDrops(true);
     qApp->installEventFilter( this );
+    //PLAYER-CURSOR-AUTOHIDE-1: fullscreen cursor auto-hide (input/cursor only)
+    m_viewerIdleClock.start();
+    m_viewerIdleTimer = new QTimer( this );
+    m_viewerIdleTimer->setSingleShot( true );
+    connect( m_viewerIdleTimer, &QTimer::timeout, this, [this]() { viewerIdleTimeout(); } );
+    connect( ui->actionFullscreen, &QAction::toggled, this, [this]( bool on ) { viewerIdleFullscreenChanged( on ); } );
+    connect( ui->actionWhiteBalancePicker, &QAction::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
+    connect( ui->toolButtonBadPixelsSearchMethodEdit, &QAbstractButton::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
+    connect( ui->toolButtonGradientPaint, &QAbstractButton::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
 
     //Set bools for draw rules
     m_dontDraw = true;
@@ -3665,6 +3675,90 @@ bool MainWindow::nativeEvent( const QByteArray &eventType, void *message, long *
 }
 #endif
 
+// PLAYER-CURSOR-AUTOHIDE-1: in fullscreen the cursor hides after viewer_idle::kIdleHideMs() with no mouse
+// activity, on both viewer surfaces, and comes back at once on real movement, press or wheel, on leaving
+// fullscreen, on a context menu, a blocking modal or deactivation, and when a viewer tool is armed.
+// Start/stop is actionFullscreen's toggled(bool); the decision also needs isFullScreen() because
+// showFullScreen() is asynchronous. Input and cursor only: no paint, present or swap code.
+viewer_idle::Surfaces MainWindow::viewerIdleSurfaces( void ) const
+{
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = ui->graphicsView->viewport();
+    surfaces.glWindow = GpuDisplayWindow::activeWindow();   // read fresh: the GL window comes and goes
+    return surfaces;
+}
+
+viewer_idle::Inputs MainWindow::viewerIdleInputs( void ) const
+{
+    viewer_idle::Inputs in;
+    in.fullscreen = ui->actionFullscreen->isChecked() && isFullScreen();
+    in.windowActive = isActiveWindow();
+    in.toolArmed = ui->actionWhiteBalancePicker->isChecked()
+                || ui->toolButtonBadPixelsSearchMethodEdit->isChecked()
+                || ui->toolButtonGradientPaint->isChecked();
+    in.popupOrModalOpen = QApplication::activePopupWidget() || QApplication::activeModalWidget();
+    return in;
+}
+
+void MainWindow::viewerIdleRestore( void )
+{
+    if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+    if( m_viewerIdle.fullscreen() )
+    {
+        m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
+        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
+    }
+}
+
+void MainWindow::viewerIdleFullscreenChanged( bool on )
+{
+    if( on )
+    {
+        m_viewerIdle.setFullscreen( true, m_viewerIdleClock.elapsed() );
+        m_viewerIdleHaveLast = false;
+        m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
+    }
+    else
+    {
+        m_viewerIdleTimer->stop();
+        if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        m_viewerIdle.setFullscreen( false, m_viewerIdleClock.elapsed() );
+    }
+}
+
+void MainWindow::viewerIdleTimeout( void )
+{
+    int ms = 0;
+    switch( m_viewerIdle.onTimeout( viewerIdleInputs(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms ) )
+    {
+    case viewer_idle::Tick::Hide:
+        m_viewerCursorHider.hide( viewerIdleSurfaces() );
+        break;
+    case viewer_idle::Tick::Rearm:
+        m_viewerIdleTimer->start( ms );
+        break;
+    case viewer_idle::Tick::None:
+        break;
+    }
+}
+
+void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
+{
+    Q_UNUSED( watched );
+    if( !m_viewerIdle.fullscreen() ) return;
+    if( viewer_idle::forcesRestore( event->type() ) )
+    {
+        viewerIdleRestore();
+        return;
+    }
+    if( viewer_idle::eventIsActivity( event, &m_viewerIdleLastGlobal, &m_viewerIdleHaveLast ) )
+    {
+        // The timer is not restarted on every move: the timestamp plus Rearm covers it.
+        if( m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() ) ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
+    }
+}
+
 //Disable WBPicker if picture is left and if mouse is clicked somewhere else
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
@@ -3710,6 +3804,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         //setPreviewMode();
         m_frameChanged = true;
     }
+    viewerIdleNoteEvent( watched, event );   //PLAYER-CURSOR-AUTOHIDE-1
     return QWidget::eventFilter(watched, event);
 }
 
