@@ -675,6 +675,7 @@ private slots:
     void viewerDoubleClick_otherButtonModifierSettingOrNoClipDoNotToggle();
     void viewerDoubleClick_otherWidgetDoesNotToggle();
     void viewerDoubleClick_toolArmedAtFirstPressSuppresses();
+    void viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequence();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
     void gpuViewportZebraProcessingMatchesCpuReference();
     void gpuViewportPreviewProcessingMatchesCpuReference();
@@ -4262,9 +4263,10 @@ public:
 };
 
 void deliverViewerMouse(QObject *receiver, QEvent::Type type, Qt::MouseButton button,
-                        Qt::KeyboardModifiers modifiers = Qt::NoModifier, quint64 timestampMs = 0)
+                        Qt::KeyboardModifiers modifiers = Qt::NoModifier, quint64 timestampMs = 0,
+                        const QPointF & pos = QPointF(10, 10))
 {
-    QMouseEvent event(type, QPointF(10, 10), QPointF(10, 10), button,
+    QMouseEvent event(type, pos, pos, button,
                       type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::MouseButtons(button), modifiers);
     if (timestampMs != 0) {
         event.setTimestamp(timestampMs);
@@ -4373,6 +4375,26 @@ void GuiSmokeTest::viewerDoubleClick_toolArmedAtFirstPressSuppresses()
     deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, later + interval / 4);
     QVERIFY(f.fullscreen.isChecked());
     QCOMPARE(f.viewport.doubleClicks, 1);
+}
+
+void GuiSmokeTest::viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequence()
+{
+    // Adversary A1 (r1, dd9f5441): a press on the gradient handle at (100,100), then within the
+    // interval a press far away with nothing armed, then a double-click there. Qt does not pair
+    // presses farther apart than the double-click distance, so the far press starts a new
+    // sequence and its double-click must toggle.
+    const quint64 interval = static_cast<quint64>(qMax(4, doubleClickIntervalMs()));
+    ViewerDoubleClickFixture f;
+    f.state.gradientHandleHovered = true;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000, QPointF(100, 100));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 20, QPointF(100, 100));
+    f.state.gradientHandleHovered = false;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4 + 1, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 2, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 2, QPointF(500, 500));
+    QVERIFY(f.fullscreen.isChecked());
+    QCOMPARE(f.viewport.doubleClicks, 0);
 }
 
 int main(int argc, char ** argv)

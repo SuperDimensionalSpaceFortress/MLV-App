@@ -7,6 +7,7 @@
 #define VIEWERDOUBLECLICKPOLICY_H
 
 #include <QObject>
+#include <QPointF>
 #include <Qt>
 #include <QtGlobal>
 
@@ -64,21 +65,28 @@ class Gate
 {
 public:
     /*! \brief Record a left press on the viewer.
-     *  \param armedNow             anyToolArmed() at this press
-     *  \param createdDoubleClick   Qt flagged this press as the one that made a double-click
-     *  \param timestampMs          the press's event timestamp
-     *  \param doubleClickIntervalMs the platform double-click interval */
-    void notePress( bool armedNow, bool createdDoubleClick, quint64 timestampMs, int doubleClickIntervalMs )
+     *  \param armedNow              anyToolArmed() at this press
+     *  \param timestampMs           the press's event timestamp
+     *  \param doubleClickIntervalMs the platform double-click interval
+     *  \param globalPos             the press's global (screen) position; both display paths share it
+     *  \param doubleClickDistancePx the platform double-click distance
+     *
+     *  A press continues the recorded sequence only when it pairs with the recorded press the way
+     *  Qt pairs a double-click: inside the interval AND no farther than the distance on either
+     *  axis. Anything else starts a new sequence, so an armed press elsewhere never suppresses a
+     *  later double-click (adversary A1, r1). Qt's own "created a double-click" flag is not used:
+     *  Qt sets it only when that same time and distance rule holds for the pair, so it adds nothing,
+     *  and treating it as enough on its own would pair a press with an older, unrelated record. */
+    void notePress( bool armedNow, quint64 timestampMs, int doubleClickIntervalMs,
+                    const QPointF &globalPos, int doubleClickDistancePx )
     {
-        if( createdDoubleClick ) return; // the second press of a double-click: keep the first press's record
-        if( m_armed && timestampMs >= m_timestampMs
-         && timestampMs - m_timestampMs <= static_cast<quint64>( doubleClickIntervalMs < 0 ? 0 : doubleClickIntervalMs ) )
+        if( m_armed && pairsWithRecord( timestampMs, doubleClickIntervalMs, globalPos, doubleClickDistancePx ) )
         {
-            return; // a second press inside the window that Qt did not flag: still the same sequence
+            return; // the second press of this double-click: keep the first press's armed record
         }
-        // A timestamp that went backwards (wrap or a reset clock) counts as outside the window.
         m_armed = armedNow;
         m_timestampMs = timestampMs;
+        m_globalPos = globalPos;
     }
 
     bool armedAtFirstPress() const { return m_armed; }
@@ -89,8 +97,23 @@ public:
     }
 
 private:
+    bool pairsWithRecord( quint64 timestampMs, int doubleClickIntervalMs,
+                          const QPointF &globalPos, int doubleClickDistancePx ) const
+    {
+        const qreal distance = doubleClickDistancePx < 0 ? 0 : doubleClickDistancePx;
+        if( qAbs( globalPos.x() - m_globalPos.x() ) > distance || qAbs( globalPos.y() - m_globalPos.y() ) > distance )
+        {
+            return false; // too far apart to be one double-click
+        }
+        // A timestamp that went backwards (wrap or a reset clock) counts as outside the window.
+        if( timestampMs < m_timestampMs ) return false;
+        const quint64 window = static_cast<quint64>( doubleClickIntervalMs < 0 ? 0 : doubleClickIntervalMs );
+        return timestampMs - m_timestampMs <= window;
+    }
+
     bool m_armed = false;
     quint64 m_timestampMs = 0;
+    QPointF m_globalPos;
 };
 
 } // namespace viewer_dblclick
