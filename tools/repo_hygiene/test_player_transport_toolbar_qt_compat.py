@@ -33,9 +33,14 @@ NEWER_THAN_QT5_API = {
     "scenePosition": (6, 0),
 }
 _NAMES = "|".join(sorted(NEWER_THAN_QT5_API, key=len, reverse=True))
+# Any qualified name counts, not only `QImage::name`: an alias (`using Image = QImage;` then
+# `&Image::flipped`), `decltype(image)::` or a template `...>::` hides the class (adversary r4 pass 5 A3).
 API_CALL = re.compile(
-    rf"(?:(?:->|\.)\s*(?:::\s*)?(?:\w+\s*::\s*)*|\bQImage\s*::\s*)({_NAMES})\b"
+    rf"(?:(?:->|\.)\s*(?:::\s*)?(?:\w+\s*::\s*)*|[\w>)]\s*::\s*)({_NAMES})\b"
 )
+# The scan does not expand macros, so an API name in the arguments of a function-like macro the
+# text defines counts where the macro is used (`APPLY(image, flipped)`, adversary r4 pass 5 A2).
+FUNCTION_LIKE_DEFINE = re.compile(r"^\s*(?:#|%:|\?\?=)\s*define\s+(\w+)\(")
 # `%:` is the digraph and `??=` the (pre-C++17) trigraph spelling of `#` (adversary r2 A2).
 _HASH = r"(?:#|%:|\?\?=)"
 DIRECTIVE = re.compile(rf"^\s*{_HASH}\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
@@ -58,7 +63,9 @@ _INT_LITERAL = re.compile(
     r"|(?P<oct>0(?:'?[0-7])*)|(?P<dec>[1-9](?:'?[0-9])*))"
     r"(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?"
 )
-RAW_STRING_OPEN = re.compile(r'([^()\\\s"]{0,16})\(')
+# A d-char is anything but space, parens, backslash and control characters; `"` is legal, so
+# R""(//)"" is a raw string (adversary r4 pass 5 A4).
+RAW_STRING_OPEN = re.compile(r"([^()\\\s]{0,16})\(")
 
 
 def _pp_int(token: str) -> int | None:
@@ -91,6 +98,22 @@ _TRIGRAPH_CHAR = {"=": "#", "/": "\\", "'": "^", "(": "[", ")": "]", "!": "|", "
 
 def _translate_trigraphs(text: str) -> str:
     return _TRIGRAPH.sub(lambda m: _TRIGRAPH_CHAR[m.group(0)[2]], text)
+
+
+# GCC and Clang splice a backslash followed by spaces or tabs and a line break; MSVC does not
+# (adversary r4 pass 5 A1).
+_WHITESPACE_SPLICE = re.compile(r"\\[ \t\f\v]+(?=\r\n|\n|\r)")
+
+
+def _splice_trailing_whitespace(text: str) -> str:
+    return _WHITESPACE_SPLICE.sub(lambda m: "\\", text)
+
+
+def _readings(text: str) -> list[str]:
+    """Each way a compiler may read the text in translation phases 1-2: trigraphs off or on,
+    and a backslash-whitespace-newline spliced or not."""
+    trigraphs = _translate_trigraphs(text)
+    return [text, trigraphs, _splice_trailing_whitespace(text), _splice_trailing_whitespace(trigraphs)]
 
 
 def _logical_lines(text: str) -> list[tuple[int, str, list[int]]]:
@@ -174,17 +197,18 @@ def _logical_lines(text: str) -> list[tuple[int, str, list[int]]]:
 
 def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
     """(line, api name, line text) for each call outside an arm that compiles only on a Qt new
-    enough for that API. The text is read twice, as written and with trigraphs translated (a
-    `??/` splice exists only where trigraphs are on, adversary r4 A1), and a finding in either
-    reading counts; a call both readings see is one finding."""
-    plain = _scan(text)
-    found = list(plain)
-    left = Counter((n, api) for n, api, _ in plain)
-    for hit in _scan(_translate_trigraphs(text)):
-        if left[hit[:2]]:
-            left[hit[:2]] -= 1
-        else:
-            found.append(hit)
+    enough for that API. The text is scanned in every reading of _readings (a `??/` splice exists
+    only where trigraphs are on, adversary r4 A1; a backslash-space splice only on GCC and Clang,
+    pass 5 A1), and a finding in any reading counts; a call several readings see is one finding."""
+    found: list[tuple[int, str, str]] = []
+    kept: Counter = Counter()
+    for reading in _readings(text):
+        seen: Counter = Counter()
+        for hit in _scan(reading):
+            seen[hit[:2]] += 1
+            if seen[hit[:2]] > kept[hit[:2]]:
+                kept[hit[:2]] += 1
+                found.append(hit)
     found.sort(key=lambda hit: hit[0])
     return found
 
@@ -255,11 +279,23 @@ def _scan(text: str) -> list[tuple[int, str, str]]:
         lines.append((number, line, where, floors))
         parts.append(code)
         offset += len(code) + 1
-    for match in API_CALL.finditer("\n".join(parts)):
-        index = bisect.bisect_right(starts, match.start(1)) - 1
+    joined = "\n".join(parts)
+    names: dict[int, str] = {m.start(1): m.group(1) for m in API_CALL.finditer(joined)}
+    macros = sorted({m.group(1) for _, line, _, _ in lines if (m := FUNCTION_LIKE_DEFINE.match(line))})
+    if macros:
+        invocation = re.compile(r"\b(?:" + "|".join(map(re.escape, macros)) + r")\s*\(")
+        for call in invocation.finditer(joined):
+            depth, end = 1, call.end()
+            while end < len(joined) and depth:
+                depth += {"(": 1, ")": -1}.get(joined[end], 0)
+                end += 1
+            for match in BARE_NAME.finditer(joined, call.end(), end):
+                names.setdefault(match.start(1), match.group(1))
+    for position, api in sorted(names.items()):
+        index = bisect.bisect_right(starts, position) - 1
         number, line, where, floors = lines[index]
-        if not trusted(match.group(1), floors):
-            found.append((physical(where, match.start(1) - starts[index], number), match.group(1), line.strip()))
+        if not trusted(api, floors):
+            found.append((physical(where, position - starts[index], number), api, line.strip()))
     found.sort(key=lambda hit: hit[0])
     return found
 
@@ -501,11 +537,64 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         # One call is one finding, even when both readings see it.
         self.assertEqual(len(unguarded_newer_api_calls("auto p = i.flipped(); auto q = i.flipped();\n")), 2)
 
+    def test_a_splice_with_trailing_whitespace_is_read_both_ways(self) -> None:
+        # adversary r4 pass 5 A1 (202596e2): GCC splices a backslash followed by spaces or tabs and
+        # a line break; MSVC does not. A finding in either reading counts.
+        paste = "#define JOIN(a,b) a #\\ \n# b\nreturn image.JOIN(flipp,ed)(Qt::Horizontal);\n"
+        self.assertIn("##", [a for _, a, _ in unguarded_newer_api_calls(paste)])
+        closes_arm = "#if QT_VERSION >= QT_VERSION_CHECK(6,9,0)\n#en\\\t \ndif\nreturn image.flipped();\n"
+        self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(closes_arm)], [(4, "flipped")])
+        ends_comment = "// note \\  \nreturn image.flipped();\n"
+        self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(ends_comment)], [(2, "flipped")])
+
+    def test_an_api_name_passed_to_a_function_like_macro_is_a_finding(self) -> None:
+        # adversary r4 pass 5 A2: the scan does not expand macros, so an API name in the arguments
+        # of a function-like macro this text defines counts where the macro is used.
+        for source in (
+            "#define APPLY(i, member) (i).member(Qt::Horizontal)\nreturn APPLY(image, flipped);\n",
+            "#define CALL( f ) image.f()\nauto p = CALL(\n  position );\n",
+            "#define WRAP(x) x\nreturn WRAP( g( image.mirrored(), flip ) );\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(len(unguarded_newer_api_calls(source)), 1)
+                self.assertGreaterEqual(unguarded_newer_api_calls(source)[0][0], 2)
+        guarded = (
+            "#define APPLY(i, member) (i).member(Qt::Horizontal)\n"
+            "#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)\nreturn APPLY(image, flipped);\n#endif\n"
+            "return APPLY(image, mirrored);\n"
+        )
+        self.assertEqual(unguarded_newer_api_calls(guarded), [])
+
+    def test_any_qualified_api_name_is_a_finding(self) -> None:
+        # adversary r4 pass 5 A3: an alias (`using Image = QImage;`) hides the class name, so any
+        # `X::name` counts, not only `QImage::name`.
+        for source in (
+            "using Image = QImage;\nauto fn = &Image::flipped;\n",
+            "typedef QImage I;\nauto fn = &I :: flip;\n",
+            "auto fn = &decltype(image)::flipped;\n",
+            "auto fn = &std::remove_cvref_t<decltype(image)>::flipped;\n",
+            "auto p = &QMouseEvent::position;\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(len(unguarded_newer_api_calls(source)), 1)
+
+    def test_a_raw_string_delimiter_may_hold_a_quote(self) -> None:
+        # adversary r4 pass 5 A4: `"` is a legal d-char, so R""(//)"" is a raw string.
+        for source in ('auto s = R""(//)""; return image.flipped(Qt::Horizontal);\n',
+                       'auto s = R"a"b(/* )a"b"; return image.flipped();\n'):
+            with self.subTest(source=source):
+                self.assertEqual([a for _, a, _ in unguarded_newer_api_calls(source)], ["flipped"])
+
     def test_a_token_paste_in_a_define_is_a_finding(self) -> None:
         # adversary r4 A2: the scan does not expand macros, so it refuses a paste instead of
         # following it, wherever the #define sits.
+        # adversary's own input: the paste, and (pass 5 A2) `flip` passed to the macro JOIN.
+        self.assertEqual(
+            [(n, a) for n, a, _ in unguarded_newer_api_calls(
+                "#define JOIN(a,b) a ## b\nreturn image.JOIN(flip,ped)(Qt::Horizontal);\n")],
+            [(1, "##"), (2, "flip")],
+        )
         for source in (
-            "#define JOIN(a,b) a ## b\nreturn image.JOIN(flip,ped)(Qt::Horizontal);\n",
             "#define JOIN(a,b) a%:%:b\n",
             "#define JOIN(a,b) a ??=??= b\n",
             "#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)\n#define JOIN(a,b) a##b\n#endif\n",
