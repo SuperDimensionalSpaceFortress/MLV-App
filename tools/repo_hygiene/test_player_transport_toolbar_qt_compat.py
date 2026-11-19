@@ -155,28 +155,94 @@ _INT_LITERAL = re.compile(
 )
 
 
-# Tripwire (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1): a member or qualified access of a Qt 6.9
-# QImage name. It reads the raw text, comments and literals included, on purpose: it fails toward
-# scanning. NON-PROMISE: it is a tripwire for the Qt 6.9 QImage names only. A bare `flipped(` with
-# no accessor, a split-line access with a newline before the name, and a macro alias are left to
-# the strict scanner of the scoped files; this only decides which files must be scoped.
+# Tripwire (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1): which files the strict scanner must read.
+# A file under platform/qt or src needs the scan when
+#   (1) its raw text, comments and literals included (on purpose: it fails toward scanning), has a
+#       member or qualified access of flipped or flip (QT69_MEMBER_USE); or
+#   (2) with CR and CRLF read as LF and every backslash-newline splice joined, the strict scanner's
+#       lexer (comments and literal bodies blanked) finds a flipped or flip identifier token in code.
+#       A comment, a line break or a splice between the accessor and the name, a bare name, a macro
+#       alias and a using-declaration all reach it (adversary r1 A1 on 792b6c2e); or
+#   (3) the lexer does not read the text (a trigraph, a control byte, a raw string, a backslash in
+#       code, an unreadable header-name) and it holds the substring `flip` or a `\u`/`\U`
+#       universal-character-name anywhere, NUL bytes ignored (a UTF-16 file) and every splice,
+#       `??/` included, joined.
+# Every file under the roots is read, whatever its suffix (adversary r1 A2: MLVApp.pro compiles .cc
+# files), but a binary one (a NUL byte and no C-family suffix: an object file, a PNG, a zip) and a
+# documentation or build-system file that no read file #includes (BUILD_OR_DOC_SUFFIXES, Makefile*).
+# NON-PROMISE: it is a tripwire for the Qt 6.9 QImage names only. A name assembled by a token paste
+# (`##`) or by a macro defined in another file is not seen; the strict scanner refuses a paste in the
+# scoped files, and it is the strict scanner, not this tripwire, that judges a use guarded or not.
 QT69_MEMBER_USE = re.compile(r"(?:\.|->|::)[ \t]*(?:flipped|flip)\b")
+QT69_NAME = re.compile(r"\b(?:flipped|flip)\b")
+QT69_UNLEXED = re.compile(r"flip|\\[uU]")
+TRIGRAPH_SPLICE = re.compile(r"\?\?/[ \t\f\v]*\n")
 TRIPWIRE_ROOTS = (ROOT / "platform" / "qt", ROOT / "src")
-TRIPWIRE_SUFFIXES = frozenset((".c", ".cpp", ".h", ".hpp", ".m", ".mm"))
+C_FAMILY_SUFFIXES = frozenset((
+    ".c", ".cc", ".cp", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hp", ".hpp", ".hxx", ".h++", ".inl",
+    ".ipp", ".tpp", ".tcc", ".txx", ".inc", ".m", ".mm", ".ixx", ".cppm", ".cu", ".cuh",
+))
+# Documentation and build-system files (and any file named Makefile*: qmake writes Makefile.Debug and
+# Makefile.Release into platform/qt) are not read, unless a read file #includes one by name.
+BUILD_OR_DOC_SUFFIXES = frozenset((
+    ".md", ".txt", ".htm", ".html", ".pro", ".pri", ".qrc", ".qss", ".cmake", ".stash", ".user", ".yml",
+    ".yaml", ".sh", ".command", ".plist", ".desktop",
+))
+INCLUDE_TARGET = re.compile(r"^[ \t]*#[ \t]*(?:include|import|embed)\w*[ \t]*[<\"]([^>\"\n]+)[>\"]", re.M)
+
+
+def _reaches_qt69_name(text: str) -> bool:
+    if QT69_MEMBER_USE.search(text):
+        return True
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Every splice joined, a `??/` one and one with a NUL before the line break (GCC) included: no
+    # rule fires on a text that then holds neither `flip` nor a UCN, so only such a text is lexed.
+    joined = TRIGRAPH_SPLICE.sub("", SPLICE.sub("", text.replace("\x00", "")))
+    if not QT69_UNLEXED.search(joined):
+        return False
+    if CONTROL_BYTE.search(text) or TRIGRAPH.search(text):
+        return True  # (3): not lexed, and `flip` or a UCN is in it
+    lines, refused = _logical_lines(SPLICE.sub("", text))
+    return bool(refused) or any(QT69_NAME.search(line) for _, line, _ in lines)
 
 
 def files_needing_scan(texts: dict[str, str]) -> set[str]:
-    """The keys of `texts` whose raw text has a member or qualified access of flipped or flip."""
-    return {key for key, text in texts.items() if QT69_MEMBER_USE.search(text)}
+    """The keys of `texts` whose text reaches a flipped or flip name (see the tripwire above)."""
+    return {key for key, text in texts.items() if _reaches_qt69_name(text)}
+
+
+def _is_c_family(path: Path) -> bool:
+    return path.suffix.lower() in C_FAMILY_SUFFIXES
+
+
+def _is_build_or_doc(path: Path) -> bool:
+    return path.suffix.lower() in BUILD_OR_DOC_SUFFIXES or path.name.lower().startswith("makefile")
 
 
 def _tripwire_texts() -> dict[str, str]:
     texts: dict[str, str] = {}
     for root in TRIPWIRE_ROOTS:
         for path in sorted(root.rglob("*")):
-            if path.suffix in TRIPWIRE_SUFFIXES and path.is_file():
-                texts[str(path)] = path.read_bytes().decode("utf-8", errors="replace")
-    return texts
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            if b"\x00" in data and not _is_c_family(path):
+                continue  # binary: an object file, an image, an archive
+            texts[str(path)] = data.decode("utf-8", errors="replace")
+    return _compiler_inputs(texts)
+
+
+def _compiler_inputs(texts: dict[str, str]) -> dict[str, str]:
+    """`texts` without the documentation and build-system files that no other file #includes."""
+    included = {
+        target.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        for key, text in texts.items() if not _is_build_or_doc(Path(key))
+        for target in INCLUDE_TARGET.findall(text)
+    }
+    return {
+        key: text for key, text in texts.items()
+        if not _is_build_or_doc(Path(key)) or Path(key).name.lower() in included
+    }
 
 
 def _pp_int(token: str) -> int | None:
@@ -434,11 +500,94 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         for text in flagged:
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), {"f"})
-        # GpuDisplayViewport.cpp:43 on 284f00be has the first one, in a comment.
-        not_flagged = ("vertically flipped (upside down)", "y-flipped", "flippedCopy", "unflipped()")
+        # GpuDisplayViewport.cpp:43 on 284f00be has the first one, in a comment, and :1382 the second.
+        # Since adversary r1 A1 a bare `flipped` token in code is a use, so the prose two are fed as
+        # the comments they are in the tree.
+        not_flagged = ("/* vertically flipped (upside down) */", "// y-flipped", "flippedCopy", "unflipped()")
         for text in not_flagged:
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_the_tripwire_sees_through_comments_line_breaks_and_splices(self) -> None:
+        # adversary r1 A1 (792b6c2e): a comment between the accessor and the name hid the call from
+        # the raw regex. Its input, on the real GpuDisplayViewport.cpp, and every sibling form.
+        viewport = (ROOT / "platform" / "qt" / "GpuDisplayViewport.cpp").read_text(encoding="utf-8")
+        self.assertIn('if ( image.save(path, "PNG") )', viewport)
+        a1 = viewport.replace('if ( image.save(path, "PNG") )',
+                              'if ( image./*orientation*/flipped(Qt::Vertical).save(path, "PNG") )')
+        self.assertEqual(files_needing_scan({"GpuDisplayViewport.cpp": a1}), {"GpuDisplayViewport.cpp"})
+        for text in ("img./*c*/flipped()", "img->/* a\n b */flip(Qt::Horizontal)", "img.// c\nflipped()",
+                     "img.\nflipped()", "img\n.\nflip()", "&QImage::\r\nflipped", "img.fl\\\nipped()",
+                     "img.fl\\ \r\nipped()", "img./**/ /**/flipped()", "auto f = flipped;",
+                     "#define F flipped\nimg.F();", "using QImage::flip;", "x(); img.flipped(); /* */"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A name only in a comment or a string literal is not a use, as the strict scanner reads it.
+        for text in ('auto s = "flipped"; // y-flipped\n', "/* img. */ x(); /* flipped */\n",
+                     "auto c = 'f'; // flip\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_an_unlexable_file_is_flagged_when_it_holds_the_name_or_a_ucn(self) -> None:
+        # Where the lexer refuses (a raw string, a backslash in code, a header-name it cannot read, a
+        # trigraph or a control byte), the tripwire fails toward scanning: any `flip` substring or
+        # universal-character-name flags the file; a refused file with neither is not a use.
+        for text in ('auto s = R"(x)"; auto f = &QImage::fl\\u0069pped;', 'auto s = R"(x)"; // flip',
+                     "auto p = img.fl\\u0069pped();", "auto p = img.fl\\U00000069pped();",
+                     "??= x(); flip", "x();\x00 flipped", "f\x00l\x00i\x00p\x00p\x00e\x00d\x00",
+                     "auto p = img.fl??/\nipped();", "auto p = img.fl\\\x00\nipped();"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        for text in ('auto s = R"(x)";', "auto c = \\n;", "??= x();"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_the_tripwire_reads_every_source_file_whatever_its_suffix(self) -> None:
+        # adversary r1 A2 (792b6c2e): the suffix allowlist skipped the .cc files MLVApp.pro compiles
+        # (src/librtprocess/src/demosaic/ahd.cc, MLVApp.pro:301-314). Every file under the roots is
+        # read, but a binary one (a NUL byte) whose suffix is not a C-family source suffix.
+        texts = _tripwire_texts()
+        ahd = ROOT / "src" / "librtprocess" / "src" / "demosaic" / "ahd.cc"
+        self.assertTrue(str(ahd) in texts, f"the tripwire does not read {ahd}")
+        injected = dict(texts)
+        injected[str(ahd)] = ("#include <QImage>\nstatic QImage qt69Readback(const QImage &image) "
+                              "{ return image.flipped(Qt::Vertical); }\n" + texts[str(ahd)])
+        self.assertIn(str(ahd), files_needing_scan(injected))
+        for root in TRIPWIRE_ROOTS:
+            for path in root.rglob("*"):
+                if (path.is_file() and not _is_build_or_doc(path)
+                        and (b"\x00" not in path.read_bytes() or _is_c_family(path))):
+                    with self.subTest(path=str(path.relative_to(ROOT))):
+                        self.assertTrue(str(path) in texts, f"the tripwire does not read {path}")
+        for name in ("README.md", "CMakeLists.txt", "MLVApp.pro", "Makefile", "Makefile.Debug", ".qmake.stash"):
+            with self.subTest(name=name):
+                self.assertTrue(_is_build_or_doc(Path(name)))
+        for name in ("ahd.cc", "dualiso_mix_chroma_avx2.inc", "config.h.in", "MLVApp.rc", "QImage", "a.fpm"):
+            with self.subTest(name=name):
+                self.assertFalse(_is_build_or_doc(Path(name)))
+
+    def test_an_included_build_or_doc_file_is_still_read(self) -> None:
+        # A .txt or .md that C++ #includes is compiler input, so it is read like a source file.
+        doc = {"src/k/notes.TXT": "return image.flipped(Qt::Vertical);\n", "src/k/Makefile": "flip.o: a\n"}
+        self.assertEqual(_compiler_inputs({**doc, "src/k/a.cpp": "x();\n"}), {"src/k/a.cpp": "x();\n"})
+        for line in ('#include "notes.txt"', "  # include <k/notes.txt>", '#include "..\\k\\NOTES.txt"',
+                     '#import "notes.txt"', "#include_next <notes.txt>"):
+            with self.subTest(line=line):
+                inputs = _compiler_inputs({**doc, "src/k/a.cpp": line + "\n"})
+                self.assertIn("src/k/notes.TXT", inputs)
+                self.assertNotIn("src/k/Makefile", inputs)
+                self.assertEqual(files_needing_scan(inputs), {"src/k/notes.TXT"})
+        # A build or doc file that #includes another does not make it compiler input.
+        self.assertNotIn("src/k/notes.TXT", _compiler_inputs({**doc, "src/k/b.md": '#include "notes.txt"\n'}))
+        for name in ("a.cc", "a.cxx", "a.c++", "a.hh", "a.hxx", "a.inl", "a.ipp", "a.tpp", "a.inc", "a.CPP",
+                     "a.H", "a.mm"):
+            with self.subTest(name=name):
+                self.assertTrue(_is_c_family(Path(name)))
+        # An extensionless text file is read like any text file; an extensionless binary (a Linux
+        # build of MLVApp in the tree) is not.
+        for name in ("a.o", "a.png", "a.zip", "a.exe", "MLVApp"):
+            with self.subTest(name=name):
+                self.assertFalse(_is_c_family(Path(name)))
 
     def test_scanner_flags_the_09077b0d_shape(self) -> None:
         # r1's own line: proves the guard bites on the defect it exists for.
