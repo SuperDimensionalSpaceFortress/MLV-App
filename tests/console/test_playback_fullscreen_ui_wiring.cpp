@@ -348,21 +348,32 @@ TEST(PlayerToolbarTransportButtons, PlaybackMenuOffersStopRightAfterPlayAndStopH
     ASSERT_FALSE(action.contains(QStringLiteral("name=\"shortcut\"")));
 }
 
-TEST(PlayerToolbarTransportButtons, StopPausesFirstThenSeeksToCutIn)
+TEST(PlayerToolbarTransportButtons, StopSeeksToCutInThenPausesAndNothingRunsAfterThePause)
 {
-    // T3: the user-pause form, then the clamped cut-in seek. Never the Goto First Frame toggle,
+    // T3: the clamped cut-in seek, then the user-pause form. Never the Goto First Frame toggle,
     // which jumps to 0 when the position already is cut in.
+    // Adversary A1 on 3802e3b4: the pause runs processEvents() (clip with audio), which can deliver a
+    // key pressed after Stop (End: slider 99). A seek AFTER the pause overwrote it with cut in. So the
+    // seek comes first and the pause is the last thing the slot does: input it delivers wins.
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString body = functionBody(source,
         QStringLiteral("void MainWindow::on_actionStop_triggered()"),
         QStringLiteral("\n}"));
     ASSERT_FALSE(body.isEmpty());
+    const int seek = body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"));
+    const int track = body.indexOf(QStringLiteral("m_newPosDropMode = cutInFrame;"));
     const int setChecked = body.indexOf(QStringLiteral("ui->actionPlay->setChecked( false );"));
     const int paused = body.indexOf(QStringLiteral("on_actionPlay_triggered( false );"));
-    const int seek = body.indexOf(QStringLiteral("horizontalSliderPosition->setValue("));
-    ASSERT_TRUE(setChecked >= 0);
+    ASSERT_TRUE(seek >= 0);
+    ASSERT_TRUE(track > seek);
+    ASSERT_TRUE(setChecked > track);
     ASSERT_TRUE(paused > setChecked);
-    ASSERT_TRUE(seek > paused);
+    // After the pause call only the closing braces remain: no seek, no return, nothing that could
+    // overwrite input the pause delivered.
+    const QString afterPause = body.mid(paused + int(QStringLiteral("on_actionPlay_triggered( false );").size()));
+    ASSERT_EQ(std::string(), afterPause.simplified().remove(QLatin1Char('}')).remove(QLatin1Char(' ')).toStdString());
+    ASSERT_EQ(1, int(body.count(QStringLiteral("horizontalSliderPosition->setValue("))));
+    ASSERT_EQ(1, int(body.count(QStringLiteral("m_newPosDropMode ="))));
     ASSERT_TRUE(body.contains(QStringLiteral("PlayerTransportToolbar::stopTargetFrame( ui->spinBoxCutIn->value()")));
     ASSERT_FALSE(body.contains(QStringLiteral("on_actionGoto_First_Frame_triggered")));
 }

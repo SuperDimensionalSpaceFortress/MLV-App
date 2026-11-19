@@ -22995,18 +22995,22 @@ void MainWindow::on_actionGoto_Last_Frame_triggered()
     }
 }
 
-//Stop: pause and return to cut in (PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1)
+//Stop: return to cut in and pause (PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1)
+//The seek comes first: the pause can deliver queued input (processEvents when the clip has audio),
+//and a key pressed after Stop (End, Home, a frame step) must win over Stop's seek, never be overwritten
 void MainWindow::on_actionStop_triggered()
 {
+    if( m_fileLoaded && m_pMlvObject )
+    {
+        const int cutInFrame = PlayerTransportToolbar::stopTargetFrame( ui->spinBoxCutIn->value(), getMlvFrames( m_pMlvObject ) );
+        ui->horizontalSliderPosition->setValue( cutInFrame );
+        m_newPosDropMode = cutInFrame;
+    }
     if( ui->actionPlay->isChecked() )
     {
         ui->actionPlay->setChecked( false );
         on_actionPlay_triggered( false );
     }
-    if( !m_fileLoaded || !m_pMlvObject ) return;
-    const int cutInFrame = PlayerTransportToolbar::stopTargetFrame( ui->spinBoxCutIn->value(), getMlvFrames( m_pMlvObject ) );
-    ui->horizontalSliderPosition->setValue( cutInFrame );
-    m_newPosDropMode = cutInFrame;
 }
 
 //Export clip
