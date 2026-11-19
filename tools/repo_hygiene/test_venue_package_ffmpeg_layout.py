@@ -761,7 +761,10 @@ class RecordOnlyInstallTests(unittest.TestCase):
             code = extractor.main(self._argv("--record-only", "--transaction-id", tx))
         self.assertEqual(code, 1, err.getvalue())
         self.assertIn(f".vendored-payload-transaction-{tx}", seen)
-        self.assertEqual(list(self.out.iterdir()), [], "the rollback restores the folder and removes its transaction")
+        # The rollback deletes nothing by path (adversary 63af8daa-A1): the published (pinned, staged-verified) file stays, no
+        # original existed, so the transaction folder is removed and the failure names the file left in place.
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["ffmpeg.exe"], "only the published file remains; the transaction is removed")
+        self.assertIn("published files left in place", err.getvalue())
         for bad in ("../escape", "0123456789ABCDEF0123456789ABCDEF", "short"):
             with self.subTest(transaction_id=bad), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertEqual(extractor.main(self._argv("--record-only", "--transaction-id", bad)), 1)

@@ -1399,7 +1399,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
         with mock.patch(
             "tools.repo_hygiene.extract_vendored_native_payload.os.replace",
             side_effect=fail_second_publication,
-        ), self.assertRaisesRegex(PayloadIntegrityError, "all originals restored"):
+        ), self.assertRaisesRegex(PayloadIntegrityError, "rollback incomplete") as raised:
             extract_payload_record(
                 self.root,
                 record,
@@ -1409,10 +1409,75 @@ class VendoredNativePayloadTests(unittest.TestCase):
             )
 
         self.assertEqual(publication_count, 2)
-        self.assertEqual((output_dir / "tool.exe").read_bytes(), old_executable)
+        # adversary 63af8daa-A1: the rollback deletes nothing by path, so the published tool.exe (the verified staged bytes)
+        # stays and its original is kept in the transaction folder; library.dll was never published, so its original goes back.
+        self.assertEqual((output_dir / "tool.exe").read_bytes(), executable)
         self.assertEqual((output_dir / "library.dll").read_bytes(), old_library)
-        self.assertFalse(any(output_dir.glob(".vendored-payload-transaction-*")))
+        transactions = list(output_dir.glob(".vendored-payload-transaction-*"))
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual([p.name for p in transactions[0].iterdir()], ["tool.exe"])
+        self.assertEqual((transactions[0] / "tool.exe").read_bytes(), old_executable)
+        self.assertIn(f"destination present; backup kept at {transactions[0] / 'tool.exe'}", str(raised.exception))
         self.assertFalse(any(output_dir.glob(".*.tmp")))
+
+    def test_rollback_never_unlinks_a_destination_a_concurrent_install_replaced(self) -> None:
+        # adversary 63af8daa-A1: P's rollback read its published file's identity, and Q completed a verified replacement before
+        # P's unlink by pathname, so Q's file was deleted and OLD restored. Q's replacement is injected immediately before any
+        # unlink of a destination; nothing may remove it.
+        executable = _fake_pe(fill=b"new executable")
+        library = _fake_pe(fill=b"new library", dll=True)
+        path = self._write_zip(
+            [
+                ("tool.exe", executable, stat.S_IFREG | 0o755),
+                ("library.dll", library, stat.S_IFREG | 0o755),
+            ]
+        )
+        record = self._two_member_record(path, executable, library)
+        output_dir = self.root / "installed"
+        output_dir.mkdir()
+        (output_dir / "tool.exe").write_bytes(b"OLD tool")
+        destinations = {output_dir / "tool.exe", output_dir / "library.dll"}
+        real_unlink = Path.unlink
+        real_remove = os.remove
+
+        def q_replaces_then(path_text: str) -> None:
+            q_temporary = output_dir / f"q-{Path(path_text).name}.part"
+            q_temporary.write_bytes(b"Q-PINNED " + Path(path_text).name.encode())
+            os.replace(q_temporary, path_text)
+
+        def racing_unlink(self_path: Path, missing_ok: bool = False) -> None:
+            if self_path in destinations:
+                q_replaces_then(str(self_path))
+            real_unlink(self_path, missing_ok=missing_ok)
+
+        def racing_remove(path_text, *args, **kwargs) -> None:
+            if Path(path_text) in destinations:
+                q_replaces_then(str(path_text))
+            real_remove(path_text, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", racing_unlink), mock.patch(
+            "tools.repo_hygiene.extract_vendored_native_payload.os.remove", side_effect=racing_remove
+        ), mock.patch(
+            "tools.repo_hygiene.extract_vendored_native_payload.verify_installed_payload",
+            side_effect=PayloadIntegrityError("transient installed-verification sharing violation"),
+        ), self.assertRaises(PayloadIntegrityError) as raised:
+            extract_payload_record(
+                self.root,
+                record,
+                output_dir,
+                archive_reference="fixture.zip",
+                verify_installed=True,
+            )
+
+        for name in ("tool.exe", "library.dll"):
+            self.assertTrue((output_dir / name).is_file(), f"{name} was deleted by the rollback: {raised.exception}")
+        self.assertNotEqual((output_dir / "tool.exe").read_bytes(), b"OLD tool", "OLD must not be put back over a file")
+        transactions = list(output_dir.glob(".vendored-payload-transaction-*"))
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual((transactions[0] / "tool.exe").read_bytes(), b"OLD tool")
+        message = str(raised.exception)
+        self.assertIn(f"destination present; backup kept at {transactions[0] / 'tool.exe'}", message)
+        self.assertIn(f"published files left in place (a rollback never deletes by path): {output_dir / 'library.dll'}", message)
 
     def test_rollback_never_overwrites_or_deletes_a_concurrent_installs_file(self) -> None:
         # adversary 32501f50-A1 (Python sibling): during P's failed publication a concurrent install Q atomically published its
