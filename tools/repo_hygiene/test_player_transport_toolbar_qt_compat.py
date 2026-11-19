@@ -17,8 +17,8 @@ is certain what a compiler sees. Anything else it REFUSES: the file is reported 
 
 Read:
   * comments (``//``, ``/* */``) and the bodies of ordinary string and character literals are
-    blanked; an unterminated ' or " ends at the line end; a ' inside a pp-number is a digit
-    separator; CR, LF and CRLF each end a line;
+    blanked; an unterminated ' or " ends at the line end; a ' inside a pp-number is lexed as a
+    digit separator (and then refused, below); CR, LF and CRLF each end a line;
   * every identifier token that IS an API name of NEWER_THAN_QT5_API is a use, wherever it
     stands: a member access (also one split across lines), a qualified name, a macro argument,
     a #define body, a conditional directive or a bare call. Each use is judged by the arms open
@@ -58,7 +58,9 @@ Refused, never read:
   * an ``include_alias`` token anywhere in the raw text (r7, fable r6 H2), as ``header-name``: its
     arguments are header-names the lexer does not know;
   * a ``$`` in code (r7, fable r6 H3): compilers accept it in identifiers by default, so it moves
-    where a pp-number ends.
+    where a pp-number ends;
+  * a digit separator in code (``1'000``; card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1 r2): the Qt 5
+    Linux kit compiles C++11 (MLVApp.pro:176), where the ' ends the number and opens a char literal.
 
 Non-promises: the scanner does not preprocess. It does not follow #include, does not expand a
 macro defined in another file (an external macro that pastes pieces into an API name is not
@@ -166,8 +168,8 @@ _INT_LITERAL = re.compile(
 #       lexer (comments and literal bodies blanked) finds a flipped or flip identifier token in code.
 #       A comment, a line break or a splice between the accessor and the name, a bare name, a macro
 #       alias and a using-declaration all reach it (adversary r1 A1 on 792b6c2e); or
-#   (3) the lexer does not read the text (a trigraph, a control byte, a raw string, a backslash in
-#       code, an unreadable header-name) and, with NULs dropped (a UTF-16 file), every splice joined
+#   (3) the lexer does not read the text, or cannot trust where its tokens and literals end, and,
+#       with NULs dropped (a UTF-16 file), every splice joined
 #       (`??/` and a NUL before the break included) and every universal-character-name decoded
 #       (`\uXXXX`, `\UXXXXXXXX`, `\u{...}`, `\N{...}`), a flipped or flip token stands anywhere in it,
 #       comments and literals included.
@@ -187,6 +189,19 @@ QT69_NAME = re.compile(r"\b(?:flipped|flip)\b")
 TRIGRAPH_SPLICE = re.compile(r"\?\?/[ \t\f\v]*\n")
 UCN = re.compile(r"\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]+)\}|N\{([^}\n]*)\})")
 TRIPWIRE_ROOTS = ("platform/qt", "src")
+# Rule 3 inputs (r2, adversary r1 pass 3 A1 on e6717ff8: rule 2 lexed a text whose token ends it
+# could not trust). In the raw text, and again with every splice joined: a control byte, a trigraph,
+# a header-name the lexer cannot read and an include_alias token (a `%:include <a/*>` is not anchored
+# at `#`, so the lexer read its `/*` as a comment). Then the lexer's own refusals (a raw string, a
+# backslash in code, an unreadable header-name) and these kinds of _refused_forms, each of which moves
+# where a token or a literal ends: `$` and a non-ASCII character join an identifier the lexer ends
+# early, so a following ' reads as a digit separator; a digit separator is the end of the number and
+# a char literal to C++11 and C99; a digraph can open a directive whose header-name the lexer reads
+# as a comment or a literal. The other kinds (a token paste, macro indirection, an unknown directive,
+# a redefined version macro) leave every token where the lexer put it, so they stay with rule 2: sent
+# to rule 3 they would flag three files whose only flip token is in a comment.
+UNLEXED_RAW_FORMS = (CONTROL_BYTE, TRIGRAPH, HEADER_NAME_UNREADABLE, INCLUDE_ALIAS)
+TOKEN_BOUNDARY_KINDS = frozenset(("dollar", "non-ascii", "digit-separator", "digraph"))
 
 
 def _decode_ucn(match: re.Match) -> str:
@@ -207,10 +222,11 @@ def _reaches_qt69_name(text: str) -> bool:
     joined = UCN.sub(_decode_ucn, TRIGRAPH_SPLICE.sub("", SPLICE.sub("", text.replace("\x00", ""))))
     if "flip" not in joined:
         return False  # no rule can fire, so only such a text is lexed
-    if CONTROL_BYTE.search(text) or TRIGRAPH.search(text):
+    spliced = SPLICE.sub("", text)
+    if any(pattern.search(form) for form in (text, spliced) for pattern in UNLEXED_RAW_FORMS):
         return bool(QT69_NAME.search(joined))  # (3)
-    lines, refused = _logical_lines(SPLICE.sub("", text))
-    if refused:
+    lines, refused = _logical_lines(spliced)
+    if refused or any(kind in TOKEN_BOUNDARY_KINDS for _, kind in _refused_forms(lines)):
         return bool(QT69_NAME.search(joined))  # (3)
     return any(QT69_NAME.search(line) for _, line, _ in lines)  # (2)
 
@@ -384,6 +400,11 @@ def _refused_forms(lines: list[Line]) -> list[tuple[int, str]]:
         for kind, pattern in (("digraph", DIGRAPH), ("token-paste", TOKEN_PASTE), ("non-ascii", NOT_PRINTABLE_ASCII),
                               ("dollar", DOLLAR)):
             refused.extend((_physical(where, m.start(), number), kind) for m in pattern.finditer(line))
+        # r2 (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1): a pp-number the lexer read with a digit
+        # separator. C++11 (the Qt 5 Linux kit, MLVApp.pro:176) and C99 end the number at the ', which
+        # opens a char literal there, so where the literal ends is not certain.
+        refused.extend((_physical(where, token.start(1) + token.group(1).index("'"), number), "digit-separator")
+                       for token in _PP_TOKEN.finditer(line) if token.group(1) and "'" in token.group(1))
         name = DIRECTIVE_NAME.match(line)
         if name and name.group(1) not in MODELLED_DIRECTIVES:
             refused.append((_physical(where, name.start(1), number), "unknown-directive"))
@@ -551,6 +572,59 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), set())
 
+    def test_the_tripwire_does_not_lex_a_text_whose_token_ends_it_cannot_trust(self) -> None:
+        # adversary r1 pass 3 A1 (e6717ff8): a `$` joins `a$1` into one identifier for the compiler,
+        # but the lexer read `1'x` as a pp-number with a digit separator, and its next ' opened a char
+        # literal that hid the call. Its input, on the real GpuDisplayViewport.cpp (in memory).
+        viewport = (ROOT / "platform" / "qt" / "GpuDisplayViewport.cpp").read_text(encoding="utf-8")
+        anchor = '    if ( image.save(path, "PNG") )'
+        self.assertIn(anchor, viewport)
+        a1 = viewport.replace(anchor, "#define MLV_REVIEW_SECOND(a, b) b\n    const QImage reviewImage = "
+                              "MLV_REVIEW_SECOND(a$1'x', image . /*orientation*/ flipped(Qt::Vertical));\n"
+                              "#undef MLV_REVIEW_SECOND\n" + anchor)
+        self.assertEqual(files_needing_scan({"GpuDisplayViewport.cpp": a1}), {"GpuDisplayViewport.cpp"})
+        # Every sibling form that moves where a token or a literal ends goes to rule 3: a non-ASCII
+        # identifier character (U+00B7); a digit separator, which the Qt 5 Linux kit (C++11,
+        # MLVApp.pro:176) and a C99 file read as the end of the number and a char literal; a digraph
+        # directive whose header-name the lexer reads as a comment, also with a line-spanning comment
+        # or a splice before it; and an include_alias header-name.
+        call = "image . /**/ flipped(Qt::Vertical));\n"
+        hidden = "auto r = image .\nflipped(Qt::Vertical); // */\n"
+        for text in ("#define S(a, b) b\nauto r = S(a$1'x', " + call,
+                     "#define S(a, b) b\nauto r = S(a·1'x', " + call,
+                     "#define S(a, b) b\nauto r = S(1'x', " + call,
+                     "%:include <QImage/*>\n" + hidden, "%: include /*\n*/ <QImage/*>\n" + hidden,
+                     "%:inc\\\nlude <QImage/*>\n" + hidden, "#pragma include_alias(<a/*>, <b>)\n" + hidden,
+                     "auto n = 1'000; // flipped\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # Proven inert, read by rule 2 or already by rule 3: `@` and a backtick are single tokens to
+        # GCC, Clang and MSVC; a splice inside a literal is joined before lexing, as phase 2 does; a raw
+        # string after a `$` and a UCN in a literal.
+        for text in ('auto s = @"x"; auto r = ' + call, "auto s = `a`; auto r = " + call,
+                     'auto s = "a\\\n"; auto r = ' + call, "auto c = 'a\\\n'; auto r = " + call,
+                     'auto s = a$R"(x)"; auto r = ' + call, 'auto s = "\\u0022"; auto r = ' + call):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A text with none of the names is still not flagged, whatever it holds.
+        for text in ("auto n = 1'000; auto s = a$b; %:include <a/*>\n", "auto r = a·b; // mirrored\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_a_digit_separator_in_code_is_refused(self) -> None:
+        # r2 sibling of adversary r1 pass 3 A1: the Qt 5 Linux kit compiles C++11 (MLVApp.pro:176),
+        # where `1'x'` is the number 1 and a char literal, not a pp-number; read as C++14 the next '
+        # opened a char literal that hid the call. A digit separator in code is refused.
+        self.assertRefused("#define S(a, b) b\nreturn S(1'x', image.flipped(Qt::Horizontal));\n",
+                           ["digit-separator"], [2])
+        for source in ("const int n = 1'000;\n", "auto d = .5'0;\n", "auto h = 0x1'f;\n",
+                       "#if QT_VERSION >= QT_VERSION_CHECK(6, 1'0, 0)\n#endif\n"):
+            with self.subTest(source=source):
+                self.assertRefused(source, ["digit-separator"], [1])
+        # A ' after a number that no digit or nondigit follows is a char literal, and in a comment or a
+        # literal a separator is text.
+        self.assertEqual(unguarded_newer_api_calls("auto c = f(1,'x'); // 1'000\nauto s = \"2'0\";\n"), [])
+
     def test_the_tripwire_reads_every_file_under_the_roots(self) -> None:
         # adversary r1 A2 (792b6c2e): a suffix allowlist skipped the .cc files MLVApp.pro compiles
         # (MLVApp.pro:301-314). adversary r1 pass 2 A1, A2 (54e0a825): the doc/build-file filter that
@@ -677,7 +751,8 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         )
         self.assertEqual(unguarded_newer_api_calls(fixture), [])
         self.assertEqual(len(unguarded_newer_api_calls('const char *s = "//"; auto p = i.flipped();\n')), 1)
-        self.assertEqual(len(unguarded_newer_api_calls("const int n = 1'000; auto p = i.flipped();\n")), 1)
+        # r2: a digit separator is refused (test_a_digit_separator_in_code_is_refused).
+        self.assertRefused("const int n = 1'000; auto p = i.flipped();\n", ["digit-separator"], [1])
 
     def assertRefused(self, source: str, kinds: list[str], lines: list[int] | None = None) -> None:
         # r5 GRAMMAR: a refused form makes the whole file unprovable; only refusals are reported.
@@ -793,7 +868,6 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             ("6", "0x9", "0"),
             ("6", "0X0A", "0"),
             ("6", "0b1001", "0"),
-            ("6", "1'0", "0"),  # 10, digit separator
             ("6u", "9U", "0ul"),
             ("6LL", "9llu", "0"),
             ("06", "9", "0"),
@@ -862,6 +936,11 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
                        "F(1'é\"', image.flipped());\n"):
             with self.subTest(source=source):
                 self.assertEqual(len(unguarded_newer_api_calls(source)), 1)
+        # r2: each separator above is now refused as such, and `1'"'` / `1'é"'` are char literals.
+        for source, kind in (("auto d = .5'0; return image.flipped();\n", "REFUSED digit-separator"),
+                             ("F(1'\"', image.flipped());\n", "flipped"), ("F(1'é\"', image.flipped());\n", "flipped")):
+            with self.subTest(source=source):
+                self.assertEqual([api for _, api, _ in unguarded_newer_api_calls(source)], [kind])
         # A char literal after an identifier with a digit (u8'x') is still a literal.
         self.assertEqual(unguarded_newer_api_calls("auto c = u8'f'; auto d = U'\"'; x();\n"), [])
         self.assertEqual(len(unguarded_newer_api_calls("auto c = u8'\"'; auto p = i.flipped();\n")), 1)
@@ -1138,7 +1217,7 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         # literal to them, but the scanner read `1'x` as a pp-number and its next ' opened a char
         # literal that hid the call. r7 refuses a `$` in code; in a comment or a literal it is text.
         source = "#define SECOND(a, b) b\nreturn SECOND(a$1'x', image.flipped(Qt::Horizontal));\n"
-        self.assertRefused(source, ["dollar"], [2])
+        self.assertRefused(source, ["dollar", "digit-separator"], [2])  # r2: `1'x` is refused too
         self.assertRefused("auto a$b = 1;\n", ["dollar"], [1])
         self.assertEqual(unguarded_newer_api_calls('// $x\nauto s = "$"; auto c = \'$\';\n'), [])
 
