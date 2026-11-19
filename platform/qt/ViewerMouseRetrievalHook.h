@@ -18,9 +18,11 @@
  *
  * r6 (key B1): Windows coalesces queued moves, so an away-and-back before the thread takes its queue
  * arrives as one WM_MOUSEMOVE at the starting pixel, and by position it is the same as a synthesized move.
- * While the cursor is hidden (the tick calls markHistory() when it hides), such a same-position move reads
- * the system move history (GetMouseMovePointsEx) and counts as movement iff the pointer was at another
- * position after the mark (MoveHistoryMark). The read happens only for a same-position move while marked.
+ * In fullscreen, shown or hidden (install() and then every idle tick call markHistory()), such a same-position
+ * move reads the system move history (GetMouseMovePointsEx) and counts as movement iff the pointer was at
+ * another position after the mark (MoveHistoryMark). So a coalesced excursion both restores a hidden cursor
+ * and restarts the idle period of a shown one (pass 8 A1). The read happens only for a same-position move
+ * while marked; the mark is one read per tick.
  *
  * GetLastInputInfo was rejected because a key press counts as input there, and a key press must not
  * bring the cursor back.
@@ -117,15 +119,16 @@ inline HistoryReader &historyReader()
     return r;
 }
 
-/*! \brief The history as it was when the cursor hid. GUI thread only, like the witness. */
+/*! \brief The history as it was at the last mark (entering fullscreen, then each tick). GUI thread only. */
 inline MoveHistoryMark &historyMark()
 {
     static MoveHistoryMark m;
     return m;
 }
 
-/*! \brief Called by the idle tick when it hides the cursor: marks the history at the cursor position. If the
- *         position or the history cannot be read, the mark is cleared (the r5 position rule stands). */
+/*! \brief Called by install() and by every idle tick after it read the witness: marks the history at the cursor
+ *         position. If the position or the history cannot be read, the mark is cleared (the r5 position rule
+ *         stands until the next mark). */
 inline void markHistory()
 {
     POINT pt;
@@ -156,7 +159,7 @@ inline LRESULT CALLBACK proc( int code, WPARAM wParam, LPARAM lParam )
                 if( historyMark().leftSinceMark( points, n, pos.x(), pos.y() ) ) witness().noteExcursion();
             }
             witness().note( kind, pos, code == HC_ACTION );
-            // Movement is pending, so the cursor shows at the next tick and the next hide marks afresh.
+            // Movement is pending, so the next tick counts it (and shows a hidden cursor) and marks afresh.
             if( witness().pending() ) historyMark().unmark();
         }
     }
@@ -169,7 +172,7 @@ inline bool install()
     POINT pt;
     if( GetCursorPos( &pt ) ) witness().seed( QPoint( pt.x, pt.y ) );
     else witness().reset();
-    historyMark().unmark();
+    markHistory();   // r6 pass 8 A1: from the first moment in fullscreen, shown or hidden
     if( !hookHandle() ) hookHandle() = SetWindowsHookExW( WH_MOUSE, proc, nullptr, GetCurrentThreadId() );
     return hookHandle() != nullptr;
 }

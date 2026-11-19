@@ -2355,6 +2355,7 @@ public:
         m_pointer.seed( QCursor::pos() );
 #ifdef Q_OS_WIN
         hookInstalled = viewer_idle::win_hook::install();
+        if( !markHistory ) viewer_idle::win_hook::historyMark().unmark();
 #endif
         m_timer.start( firstLookMs() );
     }
@@ -2381,8 +2382,9 @@ public:
     bool positionSampleOnly = false;
     // r3: MainWindow passes viewer_idle::kPointerPollMs(); 0 keeps the uncapped tick (the pass-4 control).
     int pollMs = 0;
-    // r6 (key B1): MainWindow marks the system move history when it hides; false is the r5 tick (RED control).
-    bool markHistoryOnHide = true;
+    // r6 (key B1, pass 8 A1): install() and every MainWindow tick mark the system move history; false marks
+    // nothing (install's mark is undone), which is the r5 tick (RED control).
+    bool markHistory = true;
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -2440,18 +2442,13 @@ private:
         {
             if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
             if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
+            if( markHistory ) viewer_idle::win_hook::markHistory();   // as MainWindow (r6, pass 8 A1)
         }
         else if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;   // the r1 tick
 #endif
         switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms, pollMs ) )
         {
-        case viewer_idle::Tick::Hide:
-            m_hider.hide( m_surfaces );
-#ifdef Q_OS_WIN
-            if( markHistoryOnHide ) viewer_idle::win_hook::markHistory();   // as MainWindow (r6 key B1)
-#endif
-            m_timer.start( ms );
-            break;
+        case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); m_timer.start( ms ); break;
         case viewer_idle::Tick::Show: m_hider.restore( m_surfaces ); m_timer.start( ms ); break;
         case viewer_idle::Tick::Rearm: m_timer.start( ms ); break;
         case viewer_idle::Tick::None: break;
@@ -2752,8 +2749,8 @@ viewer_idle::HistoryPoint viewerIdlePoint( int x, int y, quint32 time )
 // G10 (r6, key B1, the sol catalogue row): hidden fullscreen; the pointer goes away and back before the GUI thread
 // takes its queue, and Windows coalesces that into ONE WM_MOUSEMOVE at the starting pixel. It reaches the hook proc
 // and, as a same-position QMouseEvent, the event path. Expected: the cursor comes back on both viewer surfaces.
-// The witness is the system move history marked at the hide (scripted here: the test must not move the real
-// pointer). Control: the r5 tick, which marks nothing, keeps both hidden.
+// The witness is the system move history, marked on entering fullscreen and at every tick (scripted here: the
+// test must not move the real pointer). Control: the r5 tick, which marks nothing, keeps both hidden.
 void GuiSmokeTest::viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces()
 {
     QWidget viewport;
@@ -2783,7 +2780,7 @@ void GuiSmokeTest::viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfac
 
     for( const bool markOnHide : { false, true } )
     {
-        harness.markHistoryOnHide = markOnHide;
+        harness.markHistory = markOnHide;
         viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 990 ) } );
         harness.enterFullscreen();
         QVERIFY( harness.hookInstalled );

@@ -51,9 +51,9 @@ inline constexpr int kIdleHideMs() { return 2000; }
  *         least this far apart and later when the GUI thread is busy (a Qt timer may fire late), so no poll
  *         period makes that a guarantee. Off Windows such an excursion is seen when the wait returns and Qt
  *         delivers its deferred mouse events, if the move it leaves differs from the last one (the event
- *         path). On Windows the thread mouse hook sees it when the move is taken from the queue, and while
- *         the cursor is hidden a move that Windows coalesced back to the starting pixel is checked against
- *         the system move history (MoveHistoryMark, r6 key B1). The poll does not change when the cursor
+ *         path). On Windows the thread mouse hook sees it when the move is taken from the queue, and in
+ *         fullscreen a move that Windows coalesced back to the starting pixel is checked against the
+ *         system move history (MoveHistoryMark, r6 key B1). The poll does not change when the cursor
  *         hides (the activity timestamp decides that). */
 inline constexpr int kPointerPollMs() { return 50; }
 
@@ -154,7 +154,7 @@ enum class RetrievedKind { Move, Button, Wheel };
  * a move: it discards a button-less WM_MOUSEMOVE at the position of the last one (Windows synthesizes
  * those when a window appears under the cursor). A move at the same position can still be real: Windows
  * coalesces queued moves, so an away-and-back before the thread takes the queue leaves one WM_MOUSEMOVE at
- * the starting pixel (r6, key B1). The hook tells it apart with MoveHistoryMark and then calls
+ * the starting pixel (r6, key B1). The hook tells it apart with MoveHistoryMark (marked each tick) and calls
  * noteExcursion(); this class stays the position rule.
  * A button or wheel message counts when it is removed from the queue (a peek that leaves it there is seen
  * again when it is removed). The event path clears the witness when it notes activity itself, so input
@@ -230,7 +230,7 @@ inline bool operator==( const HistoryPoint &a, const HistoryPoint &b )
     return a.x == b.x && a.y == b.y && a.time == b.time;
 }
 
-/*! \brief PLAYER-CURSOR-AUTOHIDE-1 r6 (key B1): did the pointer really leave its pixel since the cursor hid?
+/*! \brief PLAYER-CURSOR-AUTOHIDE-1 r6 (key B1): did the pointer really leave its pixel since the last look?
  *
  * Windows coalesces queued mouse moves: a move away and back before the GUI thread takes its queue leaves ONE
  * WM_MOUSEMOVE at the starting pixel. By position that message cannot be told from the synthesized moves
@@ -239,16 +239,18 @@ inline bool operator==( const HistoryPoint &a, const HistoryPoint &b )
  * pointer positions with their time stamps (GetMouseMovePointsEx). A synthesized move adds no point at
  * another position; a real excursion does.
  *
- * Grammar: when the idle tick hides the cursor it marks the history (a copy of it, newest first). While
- * marked, a move retrieved at the position of the last retrieved move reads the history again. The points
+ * Grammar: on entering fullscreen, and at every idle tick after it read the witness, the history is marked (a
+ * copy of it, newest first), shown or hidden alike (pass 8 A1: a coalesced excursion while shown restarts the
+ * idle period, so the cursor never hides right after real movement). While marked, a move retrieved at the
+ * position of the last retrieved move reads the history again. The points
  * newer than the mark are the ones in front of the first place where the marked copy lines up with the new
  * list (newest first, every overlapping point equal, x, y and time). The move is real movement iff one of
  * those newer points is at another position than the move. If the marked copy no longer lines up anywhere
  * (more new points than the history holds), any point at another position counts.
  *
- * Non-promises: an unmarked history (no point at the cursor position, the read failed, or the cursor is not
- * hidden) never counts, so the r5 position rule stands; and an excursion completed between the hide decision
- * and the mark is part of the marked copy, so it is not seen until the next real move. */
+ * Non-promises: an unmarked history (no point at the cursor position, or the read failed) never counts, so the
+ * r5 position rule stands until the next mark; and an excursion completed in the instant between a tick's read
+ * of the witness and its mark is part of the marked copy, so it is not seen until the next real move. */
 class MoveHistoryMark
 {
 public:

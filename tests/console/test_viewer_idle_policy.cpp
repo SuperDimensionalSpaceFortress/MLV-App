@@ -723,9 +723,67 @@ TEST(ViewerIdlePolicy, RetrievalHookSeesACoalescedAwayAndBackOnlyThroughTheMarke
 
     viewer_idle::win_hook::historyReader() = saved;
     // The real reader runs: a point that is not in the history is -1, never a crash.
+    viewer_idle::win_hook::remove();
     viewer_idle::HistoryPoint out[viewer_idle::MoveHistoryMark::kMaxPoints];
     const int n = viewer_idle::win_hook::readSystemHistory(QPoint(-31000, -31000), out,
                                                            viewer_idle::MoveHistoryMark::kMaxPoints);
     ASSERT_TRUE(n >= -1 && n <= viewer_idle::MoveHistoryMark::kMaxPoints);
+}
+
+// P13 (r6, adversary pass 8 A1): the cursor is SHOWN, last activity at 0, both trackers at (500,500). The tick at
+// 1950 sees nothing and marks the history (as every MainWindow tick does). In an input-excluded wait the pointer
+// goes to (510,500) at 1960 and back at 1980; Windows coalesces that into one WM_MOUSEMOVE at (500,500), removed at
+// 1985. The tick at 2000 must not hide 20 ms after real movement: the excursion restarts the idle period. Control:
+// an unmarked history (the 78630f2d mark-at-hide-only tick) hides at 2000.
+TEST(ViewerIdlePolicy, CoalescedExcursionWhileShownRestartsTheIdlePeriod)
+{
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = scriptedHistory;
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = 500;
+    back.pt.y = 500;
+    for (const bool markEachTick : {false, true})
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        viewer_idle::PointerWatch sampled;
+        sampled.seed(QPoint(500, 500));
+        viewer_idle::win_hook::witness().seed(QPoint(500, 500));
+        viewer_idle::win_hook::historyMark().unmark();
+        int rearm = 0;
+
+        // Tick at 1950: nothing moved; then the mark.
+        setScript({hp(500, 500, 900), hp(490, 500, 890)});
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = sampled.moved(QPoint(500, 500));
+        if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
+        if (markEachTick) viewer_idle::win_hook::markHistory();
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(in, 1950, 2000, &rearm, 50)));
+        ASSERT_FALSE(c.hidden());
+
+        // The coalesced excursion is retrieved at 1985.
+        setScript({hp(500, 500, 1980), hp(510, 500, 1960), hp(500, 500, 900), hp(490, 500, 890)});
+        viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&back));
+
+        // Tick at 2000.
+        in = allPass();
+        in.pointerMoved = sampled.moved(QPoint(500, 500));
+        if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
+        const viewer_idle::Tick tick = c.onTimeout(in, 2000, 2000, &rearm, 50);
+        if (markEachTick)
+        {
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(tick));
+            ASSERT_FALSE(c.hidden());
+            // The idle period restarted at 2000: still shown at 3999, hidden at 4000.
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 3999, 2000, &rearm, 50)));
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 4000, 2000, &rearm, 50)));
+        }
+        else
+        {
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(tick));   // the defect: 20 ms after movement
+        }
+    }
+    viewer_idle::win_hook::historyReader() = saved;
+    viewer_idle::win_hook::remove();
 }
 #endif
