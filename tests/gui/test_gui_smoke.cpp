@@ -2394,6 +2394,10 @@ public:
     // r7 (adversary pass 11 A1): MainWindow's isFullScreen() at a tick (false: the window manager restored it).
     bool windowReallyFullscreen = true;
     bool timerActive() const { return m_timer.isActive(); }
+    // r8 (adversary pass 11 A1): false is the 5426572e tick, which never asks the window's real state (RED control).
+    bool windowStateTick = true;
+    // r8: how many ticks ran (a RED control proves "still polling" by tick count, not by wall time).
+    int ticks = 0;
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -2441,14 +2445,17 @@ private:
 
     void timeout()
     {
+        ++ticks;
         // As MainWindow (r7, adversary pass 11 A1): fullscreen left without the action leaves the idle machinery.
-        if( m_idle.windowLeftFullscreen( windowReallyFullscreen, m_clock.elapsed(), m_idleMs ) )
+        if( windowStateTick && m_idle.windowLeftFullscreen( windowReallyFullscreen, m_clock.elapsed(), m_idleMs ) )
         {
             leaveFullscreen();
             return;
         }
         int ms = 0;
         viewer_idle::Inputs in = inputs;
+        // As MainWindow::viewerIdleInputs (r8): the hide gate is the action's check AND isFullScreen().
+        in.fullscreen = inputs.fullscreen && windowReallyFullscreen;
         // As MainWindow: a logical QPoint, so a sub-logical-pixel move is not seen here (r4 bound, PointerWatch).
         in.pointerMoved = m_pointer.moved( QCursor::pos() );
 #ifdef Q_OS_WIN
@@ -3019,6 +3026,23 @@ void GuiSmokeTest::viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheId
     harness.pollMs = 10;
     harness.inputExcluded = true;
     auto cleanup = qScopeGuard( [&harness]() { harness.leaveFullscreen(); } );
+
+    // r8 RED control: the 5426572e tick (no window-state check) on the same input keeps polling with the hook
+    // installed. Proven by tick count: ten more ticks after the restore, and the timer and hook are still live.
+    harness.windowStateTick = false;
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    harness.windowReallyFullscreen = false;
+    const int redTicksAtRestore = harness.ticks;
+    QTRY_VERIFY_WITH_TIMEOUT( harness.ticks >= redTicksAtRestore + 10, 5000 );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );   // the isFullScreen() gate shows it (not stranded)
+    QVERIFY( harness.timerActive() );
+    QVERIFY( viewer_idle::win_hook::installed() );
+    harness.leaveFullscreen();
+    QVERIFY( !viewer_idle::win_hook::installed() );
+    harness.windowStateTick = true;
+    harness.windowReallyFullscreen = true;
 
     harness.enterFullscreen();
     QVERIFY( harness.hookInstalled );
