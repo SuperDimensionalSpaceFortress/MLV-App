@@ -1207,9 +1207,32 @@ namespace MlvSetup {
     }
     return $true
 }
+# r6 B1 (class: a lossy path transformation): the native '\\?\' prefix is dropped ONLY when the ordinary spelling names exactly the same file. Win32 path parsing removes a trailing dot or
+# space from every segment (judge. becomes judge, a different folder), maps a reserved device name (CON, NUL.x, COM1 ...) to a device, and a path of MAX_PATH or more is not usable by
+# a program that is not long-path aware: for those the native spelling is kept, which is the only exact one. A caller that must hand the path to another program refuses a native
+# spelling (see Invoke-GitHubSshProbe); a caller that only deletes or compares uses it as it is.
+function Test-OrdinarySpellingExact([string]$Plain) {
+    if ($Plain.Length -ge 260) { return $false }
+    $segs = @($Plain -split '\\')
+    for ($i = 0; $i -lt $segs.Count; $i++) {
+        $s = "$($segs[$i])"
+        if (-not $s) { continue }
+        if ($i -eq 0 -and $s -match '^[A-Za-z]:$') { continue }                       # the drive
+        if ($s.EndsWith('.') -or $s.EndsWith(' ')) { return $false }
+        if ($s.Contains(':')) { return $false }                                         # a stream name or a device-like segment
+        if ((($s -split '\.', 2)[0]).TrimEnd(' ') -match '^(?i:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3])$') { return $false }
+    }
+    return $true
+}
 function Format-FinalPathName([string]$Final) {
-    if ($Final.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { return ('\\' + $Final.Substring(8)) }
-    if ($Final.StartsWith('\\?\', [StringComparison]::Ordinal)) { return $Final.Substring(4) }
+    if ($Final.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        $plain = '\\' + $Final.Substring(8)
+        if ((Test-OrdinarySpellingExact $plain)) { return $plain } else { return $Final }
+    }
+    if ($Final.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+        $plain = $Final.Substring(4)
+        if ((Test-OrdinarySpellingExact $plain)) { return $plain } else { return $Final }
+    }
     return $Final
 }
 function Get-PathIdentity {
@@ -1321,6 +1344,9 @@ function Invoke-GitHubSshProbe {
         $cfgPhysical = Get-HandleFinalPath $cfgStream.SafeFileHandle
         if (-not $cfgPhysical) { $cfgFail = 'the probe config location could not be resolved after it was written' }
         elseif (@($cfgPhysical -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { $cfgFail = 'the probe config landed under a .ssh folder (the temp folder changed after it was checked)' }
+        # r6 B1: a physical path that keeps its native '\\?\' spelling has no ordinary spelling that names the same file (a folder ending in a dot or space, a device name, a path of MAX_PATH or
+        # more), so ssh cannot be handed that exact file: refused before ssh runs, and the cleanup below removes the file by this exact native path
+        elseif ($cfgPhysical.StartsWith('\\?\', [StringComparison]::Ordinal)) { $cfgFail = 'the probe config landed at a path that has no ordinary spelling (a folder name ending in a dot or space, a device name, or a path over 259 characters), so ssh could not be given that exact file' }
     } catch { $cfgFail = "the probe's ssh config could not be written ($($_.Exception.Message))" }
     finally { if ($cfgStream) { try { $cfgStream.Dispose() } catch { } } }
     if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'after-create' $cfgDir $cfgPhysical } catch { } }   # test seam: another process holds the file that was just created

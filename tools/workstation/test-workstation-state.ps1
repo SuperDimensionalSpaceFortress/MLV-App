@@ -3932,6 +3932,69 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
         if ($script:spA3Hold) { $script:spA3Hold.Dispose() }
         foreach ($spKf in $spA3Left) { Remove-Item -LiteralPath $spKf.FullName -Force -ErrorAction SilentlyContinue }
         Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'PROBE_CONFIG_NOT_DELETED' -and $pr.Detail -match 'ssh was not run' -and -not (Test-Path -LiteralPath $spArgs) -and $spA3Left.Count -eq 1) 'SSH-PUSHURL-1 r4 pass9 A3 probe: a config that landed under .ssh and cannot be removed is reported as PROBE_CONFIG_NOT_DELETED (ssh not run), not dropped silently' "$($pr.Detail) left=$($spA3Left.Count)"
+
+        # r6 B1 (sol r5 on 00a7664b; class: a lossy path transformation): a final path that only the native \\?\ spelling can name (a trailing dot or space, a reserved device name, a long path) must
+        # keep that spelling, because the ordinary spelling names ANOTHER directory (judge. is judge). Pure part first.
+        Assert-That ((Format-FinalPathName '\\?\C:\x\judge.\f.conf') -ceq '\\?\C:\x\judge.\f.conf' -and (Format-FinalPathName '\\?\C:\x\judge \f.conf') -ceq '\\?\C:\x\judge \f.conf' -and (Format-FinalPathName '\\?\C:\x\CON\f.conf') -ceq '\\?\C:\x\CON\f.conf' -and (Format-FinalPathName '\\?\C:\x\nul.d\f.conf') -ceq '\\?\C:\x\nul.d\f.conf' -and (Format-FinalPathName '\\?\UNC\srv\share\d.\f.conf') -ceq '\\?\UNC\srv\share\d.\f.conf' -and (Format-FinalPathName ('\\?\C:\' + ('a' * 250) + '\f.conf')) -ceq ('\\?\C:\' + ('a' * 250) + '\f.conf')) 'SSH-PUSHURL-1 r6 B1 pure: a final path whose ordinary spelling would name another file (trailing dot or space, device name, over MAX_PATH) keeps its native prefix'
+        Assert-That ((Format-FinalPathName '\\?\C:\x\ok.d\f.conf') -ceq 'C:\x\ok.d\f.conf' -and (Format-FinalPathName '\\?\UNC\srv\share\d\f.conf') -ceq '\\srv\share\d\f.conf' -and (Format-FinalPathName 'C:\already\plain') -ceq 'C:\already\plain' -and (Format-FinalPathName '\\?\C:\x\console\f.conf') -ceq 'C:\x\console\f.conf') 'SSH-PUSHURL-1 r6 B1 pure: an ordinary final path is still shown in its ordinary spelling (no false positive: a dot inside a name, a name that merely starts with a device name)'
+        if (-not ('MlvTest.RawJunction' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace MlvTest {
+    public static class RawJunction {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[] inBuf, uint inLen, IntPtr outBuf, uint outLen, out uint ret, IntPtr ov);
+        // an empty directory 'link' becomes a junction whose stored NT target is exactly ntTarget (for example \??\C:\a\judge.): mklink and New-Item normalise a trailing dot away
+        public static void Create(string link, string ntTarget) {
+            byte[] sub = Encoding.Unicode.GetBytes(ntTarget);
+            int dataLen = 8 + sub.Length + 2 + 2;
+            byte[] buf = new byte[8 + dataLen];
+            BitConverter.GetBytes(0xA0000003u).CopyTo(buf, 0);
+            BitConverter.GetBytes((ushort)dataLen).CopyTo(buf, 4);
+            BitConverter.GetBytes((ushort)0).CopyTo(buf, 8);
+            BitConverter.GetBytes((ushort)sub.Length).CopyTo(buf, 10);
+            BitConverter.GetBytes((ushort)(sub.Length + 2)).CopyTo(buf, 12);
+            BitConverter.GetBytes((ushort)0).CopyTo(buf, 14);
+            sub.CopyTo(buf, 16);
+            using (SafeFileHandle h = CreateFileW(link, 0x40000000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+                if (h.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                uint ret;
+                if (!DeviceIoControl(h, 0x000900A4, buf, (uint)buf.Length, IntPtr.Zero, 0, out ret, IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+    }
+}
+'@
+        }
+        $spB1n = New-Scratch 'sp-r6b1'
+        $spB1nDir = '\\?\' + (Join-Path $spB1n 'judge.')
+        $spB1nLink = Join-Path $spB1n 'tmplink'
+        [void][IO.Directory]::CreateDirectory($spB1nDir); [void][IO.Directory]::CreateDirectory($spB1nLink)
+        [MlvTest.RawJunction]::Create($spB1nLink, '\??\' + (Join-Path $spB1n 'judge.'))
+        try {
+            $env:TEMP = $spB1nLink; $env:TMP = $spB1nLink; $env:LOCALAPPDATA = $spA2Local
+            Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+            $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+            $spB1nLeft = @([IO.Directory]::GetFiles($spB1nDir))
+            $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
+            Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'ssh was not run' -and $pr.Detail -notmatch 'PROBE_CONFIG_NOT_DELETED' -and $argText -eq '' -and $spB1nLeft.Count -eq 0) 'SSH-PUSHURL-1 r6 B1 probe: a temp folder whose physical path ends in a dot (junction to \??\dir\judge.) -> ssh is not run with a path that names another folder, and the config that was created there is removed' "$($pr.Detail) args=$argText left=$($spB1nLeft -join ',')"
+            # the same folder, but another process holds the created file open: the leftover is reported by its exact native path, never missed
+            $script:spB1nHold = $null
+            $script:SshProbeConfigRaceHook = { param($phase, $dir, $phys) if ($phase -ceq 'after-create' -and $phys) { $script:spB1nHold = [IO.File]::Open($phys, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read) } }
+            try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey } finally { $script:SshProbeConfigRaceHook = $null }
+            $spB1nLeft = @([IO.Directory]::GetFiles($spB1nDir))
+            if ($script:spB1nHold) { $script:spB1nHold.Dispose() }
+            foreach ($spKf in $spB1nLeft) { Remove-Item -LiteralPath $spKf -Force -ErrorAction SilentlyContinue }
+            Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'PROBE_CONFIG_NOT_DELETED' -and $pr.Detail -match [regex]::Escape('\\?\') -and $spB1nLeft.Count -eq 1) 'SSH-PUSHURL-1 r6 B1 probe: a config behind a trailing-dot folder that cannot be removed is reported as PROBE_CONFIG_NOT_DELETED with its exact native path, not dropped silently' "$($pr.Detail) left=$($spB1nLeft.Count)"
+        } finally {
+            if ($script:spB1nHold) { try { $script:spB1nHold.Dispose() } catch { } }
+            if (Test-Path -LiteralPath $spB1nLink) { [IO.Directory]::Delete($spB1nLink) }
+        }
     } finally {
         $env:TEMP = $sv.T; $env:TMP = $sv.M; $env:LOCALAPPDATA = $sv.L; $script:SshProbeConfigRaceHook = $null
         if (Test-Path -LiteralPath $spA2Link) { [IO.Directory]::Delete($spA2Link) }
