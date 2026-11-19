@@ -15919,6 +15919,18 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "r5-B1: a quoted span that holds an `=` and ` (` (`note=\"a (session=4) b\"`) is no quoted value, so its tail is no location": (
                 self.log().replace("playback_smoke.measured_session id=3\n", 'playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 note="a (session=4) b"\n', 1),
                 (0, 0, 0, 0), False),
+            # r5 adversary pass on 732bcb96 (A1, A2): a measured_session record that names another session by session= closes the window too; a toggle begins no earlier than the
+            # previous toggle's end on the producer's one elapsed clock
+            "r5-A1: `playback_smoke.measured_session session=4` right after the marker closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session session=4\n", 1), (0, 0, 0, 0), False),
+            "r5-A1: a bare `playback_smoke.measured_session` (no id=) right after the marker is an unreadable boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\n", 1), (0, 0, 0, 0), False),
+            "r5-A1: a marker `id=3 session=4` is no clean marker of session 3": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 session=4\n", 1), (4, 4, 4, 4), False),
+            "r5-A1: a later marker `id=3 session=4` is no clean marker of session 3 either": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 session=4\n", 1), (4, 4, 4, 4), False),
+            "r5-A2: toggle 1 begins (elapsed_ms=1) before toggle 0 ended (elapsed_ms=6007) on the one producer clock": (
+                self.log().replace("elapsed_ms=8007", "elapsed_ms=1").replace("elapsed_ms=10007", "elapsed_ms=2001"), (4, 3, 3, 3), False),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (
@@ -15959,6 +15971,27 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertNotEqual(out[name], "ok", f"{name}: a foreign session read as the measured one")
         self.assertTrue(out["request-blocks"], "an upper-case GUI_SMOKE.WINDOW_TOGGLE record is a toggle record under tr-TR too")
+
+    def test_adversary_r5_a3_a_duplicate_toggle_record_with_an_upper_case_i_is_counted_under_tr_tr(self) -> None:
+        """r5 adversary pass on 732bcb96 (A3): under tr-TR an upper-case I does not fold to i, so `guI_smoke.wIndow_toggle` (a duplicate begin of toggle 0, appended after the summary)
+        was not read as a toggle record: no duplicate, no post-summary record. The three record-name patterns write the letter i as the class [Ii]."""
+        toggle = self.toggle(0, "begin")
+        logs = {
+            "an upper-case I duplicate begin after the summary": self.log() + "\n" + toggle.replace("gui_smoke.window_toggle", "guI_smoke.wIndow_toggle"),
+            "an upper-case I summary after the last toggle (a second summary)": self.log() + "\n" + "guI_smoke.wIndow_toggles requested=4 driven=4 reason=ok",
+        }
+        script = ("$ErrorActionPreference = 'Stop'; [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('tr-TR')\n"
+                  f"Import-Module '{ATTR_MODULE}' -Force\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{ culture = [System.Globalization.CultureInfo]::CurrentCulture.Name }\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3'; $out[$p.Name] = $e.reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc, out = run_pwsh_json(script, DVE_LOGS=json.dumps(logs))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["culture"], "tr-TR")
+        for name in logs:
+            with self.subTest(case=name):
+                self.assertNotEqual(out[name], "ok", f"{name}: an upper-case I record went unread")
 
     def test_adversary_a4_the_live_validator_refuses_the_key_on_a_leg_that_is_not_windowed(self) -> None:
         windowed = json.loads((DV / "legs/m16-1457-native-windowed-s2-fstoggle.json").read_text(encoding="utf-8"))

@@ -7473,7 +7473,8 @@ function Get-AttrCudaWindowToggleEvidence {
             if ($wanted -eq '' -or $Matches['id'] -ceq $wanted) { $start = $i }
             # r4 (adversary A1 on 16530f5b): a marker whose cut tail is no location is unreadable (`id=3 (id=4)` hides an id=), never a clean marker of its id
             # r4 (adversary A1 on 0b915c19): and so is a marker that declares an id more than once (`id=3 id=4`): the first is not the whole marker
-            if ($badTail.Contains($i) -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=').Count -gt 1) { $anomalies.Add('session-boundary-unreadable') }
+            # r5 (adversary A1 on 732bcb96): and so is a marker that also names a session= (`id=3 session=4`): the app's marker is `id=<n>` alone, so a session= on it is no clean marker
+            if ($badTail.Contains($i) -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=').Count -gt 1 -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=').Count -gt 0) { $anomalies.Add('session-boundary-unreadable') }
         }
     }
     # r3 (A5 of the first r3 round): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
@@ -7493,7 +7494,11 @@ function Get-AttrCudaWindowToggleEvidence {
             # closes the window and names itself; the keys are read in any case (`SESSION=4` is a declaration too)
             if ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(\s|$)' -and $badTail.Contains($i)) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
             elseif ($lines[$i] -match '^playback_smoke\.measured_sess[Ii]on(\s|$)') {
-                foreach ($idMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=(?<v>[^\s]*)')) { if ($idMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+                # r5 (adversary A1 on 732bcb96): a marker is read by its id= AND its session=; one with no id= (`playback_smoke.measured_session session=4`, or the bare name) or with any
+                # session= is no clean marker of this session, so it closes the window and names itself, as every other playback_smoke record that names a session does
+                $markerIdMatches = [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=(?<v>[^\s]*)')
+                if ($markerIdMatches.Count -eq 0 -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=').Count -gt 0) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                foreach ($idMatch in $markerIdMatches) { if ($idMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
             }
             elseif ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(\s|$)') {
                 foreach ($sessionMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)')) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
@@ -7518,11 +7523,13 @@ function Get-AttrCudaWindowToggleEvidence {
     # admits it with no allowlist row.
     for ($i = $start; $i -lt $end; $i++) {
         $line = $lines[$i]
-        $isKeep = $line -match '^interaction_trace event=resize\.keep_playing(\s|$)'
+        # r5 (adversary A3 on 732bcb96): the letter i of each record name is the class [Ii], so a host culture that does not fold an upper-case I (tr-TR) still reads
+        # `guI_smoke.wIndow_toggle` as a toggle record (a duplicate or a post-summary record is counted, never skipped)
+        $isKeep = $line -match '^[Ii]nteract[Ii]on_trace event=resize\.keep_play[Ii]ng(\s|$)'
         # r3 (adversary A2 on 1f00a482): a toggle record is any record that starts with the name (phase= need not come first), so a record with index= before
         # phase= is read, ordered and counted like the rest, never skipped
-        $isSummary = $line -match '^gui_smoke\.window_toggles(\s|$)'
-        $isToggle = (-not $isSummary) -and ($line -match '^gui_smoke\.window_toggle(\s|$)')
+        $isSummary = $line -match '^gu[Ii]_smoke\.w[Ii]ndow_toggles(\s|$)'
+        $isToggle = (-not $isSummary) -and ($line -match '^gu[Ii]_smoke\.w[Ii]ndow_toggle(\s|$)')
         if (-not ($isKeep -or $isSummary -or $isToggle)) { continue }
         if ($isToggle -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
         # (r3 B2: the value may be EMPTY, so a key repeated with no value, ` position=` or ` requested=`, is repeated and the record unusable)
@@ -7609,6 +7616,7 @@ function Get-AttrCudaWindowToggleEvidence {
     $kept = 0
     $advanced = 0
     $previousEndLine = -1
+    [long]$previousEndElapsed = -1
     $previousEnd = $null
     $previousKind = ''
     for ($t = 0; $t -lt $requested; $t++) {
@@ -7619,7 +7627,9 @@ function Get-AttrCudaWindowToggleEvidence {
         if ($rec.begin.Count -ne 1 -or $rec.end.Count -ne 1) { $anomalies.Add("toggle-${t}:duplicate-or-missing-phase"); $previousEnd = $null; continue }
         $b = $rec.begin[0]
         $e = $rec.end[0]
-        if ($e.line -le $b.line -or $e.kind -ne $b.kind -or $e.elapsed -lt $b.elapsed -or $b.line -le $previousEndLine) {
+        # r5 (adversary A2 on 732bcb96): the elapsed_ms of every record is read off the producer's ONE clock, so a toggle also begins no earlier than the previous driven toggle's
+        # end (`$previousEndElapsed`), not only after it in log order and within its own pair
+        if ($e.line -le $b.line -or $e.kind -ne $b.kind -or $e.elapsed -lt $b.elapsed -or $b.line -le $previousEndLine -or $b.elapsed -lt $previousEndElapsed) {
             $anomalies.Add("toggle-${t}:unordered"); $previousEnd = $null; continue
         }
         if ($t -ge $expectedKinds.Count -or $b.kind -ne $expectedKinds[$t]) { $anomalies.Add("toggle-${t}:unexpected-kind"); $previousEnd = $null; continue }
@@ -7643,6 +7653,7 @@ function Get-AttrCudaWindowToggleEvidence {
         if ($problems.Count -eq 0) { $kept++ } else { $anomalies.Add("toggle-${t}:" + ($problems -join '+')) }
         if ($e.position -gt $b.position -and $e.serial -gt $b.serial) { $advanced++ } else { $anomalies.Add("toggle-${t}:not-advanced") }
         $previousEndLine = $e.line
+        $previousEndElapsed = $e.elapsed
         $previousEnd = $e
         $previousKind = $b.kind
     }
