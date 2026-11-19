@@ -2012,14 +2012,11 @@ if ($HostLoadSampleIntervalMs -gt 0) {
     while ($true) {
         $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
         if ($hostLoadRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp
             break
         }
         $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))
         if ($process.WaitForExit($hostLoadChunkMs)) {
-            # r11 (adversary f24a2aed A2): an exit seen by the wait itself can still be one that outlived the budget (the runner was descheduled
-            # between the remaining-time read and the wait), so the lifetime decides here too.
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs
             break
         }
         # r3: the chunk can now be shorter than the sampling interval (it follows the no-progress window), so a sample is taken only once the
@@ -2048,12 +2045,10 @@ else {
     while ($true) {
         $noProgressRemainingMs = $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds
         if ($noProgressRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp
             break
         }
         if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
-            # r11 (adversary f24a2aed A2): same as the host-load branch above.
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs
             break
         }
         if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, $effectiveProcessTimeoutMs - [int]$noProgressLoopStopwatch.ElapsedMilliseconds))) {
@@ -2078,7 +2073,9 @@ $processBoundary = Wait-GuiSmokeProcessBounded `
     -ReportedTimeoutMs $effectiveProcessTimeoutMs `
     -NoProgressStalled:$noProgressStalled `
     -DeadlineReached:$waitBudgetExhausted `
-    -NoProgressWindowMs $noProgressWindowMs
+    -NoProgressWindowMs $noProgressWindowMs `
+    -LifetimeBudgetMs $effectiveProcessTimeoutMs `
+    -LaunchTimestamp $startTimestamp
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
