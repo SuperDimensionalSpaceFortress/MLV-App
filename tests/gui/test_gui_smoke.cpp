@@ -43,6 +43,7 @@
 #include <QScreen>
 #include <QScrollBar>
 #include <QSpinBox>
+#include <QStyleHints>
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -676,6 +677,8 @@ private slots:
     void viewerDoubleClick_otherWidgetDoesNotToggle();
     void viewerDoubleClick_toolArmedAtFirstPressSuppresses();
     void viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequence();
+    void viewerDoubleClick_newSequenceAfterAMovedOrSlowPressToggles();
+    void viewerDoubleClick_glWindowRealQtPairingKeepsTheFirstPressRecord();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
     void gpuViewportZebraProcessingMatchesCpuReference();
     void gpuViewportPreviewProcessingMatchesCpuReference();
@@ -4248,7 +4251,17 @@ public:
 
     bool eventFilter(QObject *watched, QEvent *event) override
     {
-        if (viewer_dblclick::filterEvent(gate, watched, event, &viewport, &gl, [this]() { return state; })) {
+        if (watched == &gl && event->type() == QEvent::MouseButtonDblClick) ++glDoubleClicksSeen;
+        if (watched == &gl && event->type() == QEvent::MouseButtonPress
+         && static_cast<QMouseEvent *>(event)->flags().testFlag(Qt::MouseEventCreatedDoubleClick)) ++glFlaggedPressesSeen;
+        const auto stateFn = [this]() {
+            const viewer_dblclick::ViewerState now = state;
+            if (disarmAfterFirstRead) { // a one-shot tool (gradient paint) turns itself off after its click
+                state.wbArmed = state.bpArmed = state.gradientPaintArmed = state.gradientHandleHovered = false;
+            }
+            return now;
+        };
+        if (viewer_dblclick::filterEvent(gate, watched, event, &viewport, &gl, stateFn)) {
             fullscreen.trigger();
             return true;
         }
@@ -4257,6 +4270,9 @@ public:
 
     viewer_dblclick::Gate gate;
     viewer_dblclick::ViewerState state;
+    bool disarmAfterFirstRead = false;
+    int glDoubleClicksSeen = 0;
+    int glFlaggedPressesSeen = 0;
     DoubleClickCountingWidget viewport;
     QWindow gl;
     QAction fullscreen;
@@ -4363,8 +4379,7 @@ void GuiSmokeTest::viewerDoubleClick_toolArmedAtFirstPressSuppresses()
     deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000);
     f.state.gradientPaintArmed = false;
     deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 8);
-    // The second press of the double-click, inside the interval (not flagged here).
-    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4);
+    // Widget path: Qt hands the widget only the double-click for the second click, never its press.
     deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4);
     QVERIFY(!f.fullscreen.isChecked());
     QCOMPARE(f.viewport.doubleClicks, 1);
@@ -4395,6 +4410,56 @@ void GuiSmokeTest::viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequenc
     deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 2, QPointF(500, 500));
     QVERIFY(f.fullscreen.isChecked());
     QCOMPARE(f.viewport.doubleClicks, 0);
+}
+
+void GuiSmokeTest::viewerDoubleClick_newSequenceAfterAMovedOrSlowPressToggles()
+{
+    // Adversary pass 2 (65c29245) A1 and A2, on the widget path (Qt never hands a widget the
+    // second press of a double-click, only the double-click). A1: WB-armed press at (100,100)
+    // t=1000, the cursor moves away and back (Qt resets pairing), an unarmed press at t=1100,
+    // the double-click at t=1200. A2: the same with the unarmed press at t=1400 (exactly one
+    // interval later: Qt starts a new sequence) and the double-click at t=1500. Both toggle.
+    const quint64 interval = 400;
+    for (int variant = 0; variant < 2; ++variant) {
+        ViewerDoubleClickFixture f;
+        const quint64 t0 = 1000;
+        const quint64 unarmedAt = variant == 0 ? t0 + 100 : t0 + interval;
+        f.state.wbArmed = true;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, t0, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, t0 + 10, QPointF(100, 100));
+        f.state.wbArmed = false;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, unarmedAt, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, unarmedAt + 10, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, unarmedAt + 100, QPointF(100, 100));
+        QVERIFY2(f.fullscreen.isChecked(), qPrintable(QStringLiteral("variant %1 (A%2) did not toggle").arg(variant).arg(variant + 1)));
+        QCOMPARE(f.viewport.doubleClicks, 0);
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_glWindowRealQtPairingKeepsTheFirstPressRecord()
+{
+    // GL path through Qt's own pairing (adversary r1 pass 2 A3): QTest feeds the window system,
+    // so QGuiApplication forms the double-click, flags the second press and sends the
+    // double-click. A tool armed at the first press only (it turns itself off after the first
+    // read) still suppresses; with nothing armed the same gesture toggles.
+    {
+        ViewerDoubleClickFixture f;
+        f.gl.resize(64, 64);
+        f.state.gradientPaintArmed = true;
+        f.disarmAfterFirstRead = true;
+        QTest::mouseDClick(&f.gl, Qt::LeftButton, Qt::NoModifier, QPoint(10, 10));
+        QCOMPARE(f.glDoubleClicksSeen, 1);
+        QCOMPARE(f.glFlaggedPressesSeen, 1);
+        QVERIFY(!f.state.gradientPaintArmed); // it really was off by the double-click
+        QVERIFY(!f.fullscreen.isChecked());
+    }
+    {
+        ViewerDoubleClickFixture f;
+        f.gl.resize(64, 64);
+        QTest::mouseDClick(&f.gl, Qt::LeftButton, Qt::NoModifier, QPoint(10, 10));
+        QCOMPARE(f.glDoubleClicksSeen, 1);
+        QVERIFY(f.fullscreen.isChecked());
+    }
 }
 
 int main(int argc, char ** argv)

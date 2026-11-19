@@ -7,7 +7,6 @@
 #define VIEWERDOUBLECLICKPOLICY_H
 
 #include <QObject>
-#include <QPointF>
 #include <Qt>
 #include <QtGlobal>
 
@@ -56,37 +55,29 @@ inline bool shouldToggle( Qt::MouseButton button, Qt::KeyboardModifiers modifier
         && !armedAtFirstPress;
 }
 
-/*! \brief Remembers whether a tool was armed at the press that started the current click sequence.
+/*! \brief Remembers whether a tool was armed at the press that started the current double-click.
  *
  *  Why: gradient paint switches itself off on the first click's release (gradientFinalPosPicked
  *  unchecks it), so by the time the double-click arrives the tool reads as off. Without this
- *  record, finishing a gradient with a quick second click would also toggle fullscreen. */
+ *  record, finishing a gradient with a quick second click would also toggle fullscreen.
+ *
+ *  Which press started it is Qt's decision, not ours: Qt pairs two presses into a double-click
+ *  (interval, distance, same button, no movement or other button in between, on its own native
+ *  timestamps) and marks the second press with Qt::MouseEventCreatedDoubleClick. A widget is never
+ *  handed that second press (only the double-click); a QWindow gets it, flagged. So the first press
+ *  of any double-click is the last left press on the viewer that Qt did NOT flag. The gate records
+ *  every unflagged press and skips flagged ones; it re-derives no interval, distance or timestamp
+ *  rule of its own (adversary r1 A1/A2/A3: each re-derived rule drifted from Qt's). */
 class Gate
 {
 public:
     /*! \brief Record a left press on the viewer.
-     *  \param armedNow              anyToolArmed() at this press
-     *  \param timestampMs           the press's event timestamp
-     *  \param doubleClickIntervalMs the platform double-click interval
-     *  \param globalPos             the press's global (screen) position; both display paths share it
-     *  \param doubleClickDistancePx the platform double-click distance
-     *
-     *  A press continues the recorded sequence only when it pairs with the recorded press the way
-     *  Qt pairs a double-click: inside the interval AND no farther than the distance on either
-     *  axis. Anything else starts a new sequence, so an armed press elsewhere never suppresses a
-     *  later double-click (adversary A1, r1). Qt's own "created a double-click" flag is not used:
-     *  Qt sets it only when that same time and distance rule holds for the pair, so it adds nothing,
-     *  and treating it as enough on its own would pair a press with an older, unrelated record. */
-    void notePress( bool armedNow, quint64 timestampMs, int doubleClickIntervalMs,
-                    const QPointF &globalPos, int doubleClickDistancePx )
+     *  \param armedNow           anyToolArmed() at this press
+     *  \param createdDoubleClick Qt flagged this press as the second press of a double-click */
+    void notePress( bool armedNow, bool createdDoubleClick )
     {
-        if( m_armed && pairsWithRecord( timestampMs, doubleClickIntervalMs, globalPos, doubleClickDistancePx ) )
-        {
-            return; // the second press of this double-click: keep the first press's armed record
-        }
+        if( createdDoubleClick ) return; // the second press of Qt's pair: keep the first press's record
         m_armed = armedNow;
-        m_timestampMs = timestampMs;
-        m_globalPos = globalPos;
     }
 
     bool armedAtFirstPress() const { return m_armed; }
@@ -97,23 +88,7 @@ public:
     }
 
 private:
-    bool pairsWithRecord( quint64 timestampMs, int doubleClickIntervalMs,
-                          const QPointF &globalPos, int doubleClickDistancePx ) const
-    {
-        const qreal distance = doubleClickDistancePx < 0 ? 0 : doubleClickDistancePx;
-        if( qAbs( globalPos.x() - m_globalPos.x() ) > distance || qAbs( globalPos.y() - m_globalPos.y() ) > distance )
-        {
-            return false; // too far apart to be one double-click
-        }
-        // A timestamp that went backwards (wrap or a reset clock) counts as outside the window.
-        if( timestampMs < m_timestampMs ) return false;
-        const quint64 window = static_cast<quint64>( doubleClickIntervalMs < 0 ? 0 : doubleClickIntervalMs );
-        return timestampMs - m_timestampMs <= window;
-    }
-
     bool m_armed = false;
-    quint64 m_timestampMs = 0;
-    QPointF m_globalPos;
 };
 
 } // namespace viewer_dblclick

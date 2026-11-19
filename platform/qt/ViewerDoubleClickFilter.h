@@ -8,9 +8,7 @@
 #include "ViewerDoubleClickPolicy.h"
 
 #include <QEvent>
-#include <QGuiApplication>
 #include <QMouseEvent>
-#include <QStyleHints>
 
 #include <functional>
 
@@ -36,22 +34,11 @@ inline bool filterEvent( Gate &gate, const QObject *watched, QEvent *event, cons
     {
         if( button == Qt::LeftButton )
         {
-            // Pair presses by time AND distance, the rule Qt itself uses to make a double-click.
-            // Global position: the viewport and the GL window have different local coordinates.
-            const QStyleHints *hints = QGuiApplication::styleHints();
-            const int intervalMs = hints ? hints->mouseDoubleClickInterval() : 400;
-#if QT_VERSION >= QT_VERSION_CHECK( 5, 14, 0 )
-            const int distancePx = hints ? hints->mouseDoubleClickDistance() : 5;
-#else
-            const int distancePx = 5; // Qt's default platform-theme double-click distance
-#endif
-#if QT_VERSION >= QT_VERSION_CHECK( 6, 0, 0 )
-            const QPointF globalPos = mouse->globalPosition();
-#else
-            const QPointF globalPos = mouse->screenPos();
-#endif
-            gate.notePress( state ? anyToolArmed( state() ) : false,
-                            static_cast<quint64>( mouse->timestamp() ), intervalMs, globalPos, distancePx );
+            // Qt has already decided whether this press is the second press of a double-click;
+            // the gate keeps the first press's record across it (see Gate).
+            const bool createdDoubleClick = mouse->flags().testFlag( Qt::MouseEventCreatedDoubleClick );
+            const bool armedNow = ( !createdDoubleClick && state ) ? anyToolArmed( state() ) : false;
+            gate.notePress( armedNow, createdDoubleClick );
         }
         return false;
     }

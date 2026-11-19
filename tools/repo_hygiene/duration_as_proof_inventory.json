@@ -3278,16 +3278,6 @@
       ]
     },
     {
-      "path": "platform/qt/ViewerDoubleClickPolicy.h",
-      "anchor": "const quint64 window = static_cast < quint64 > ( doubleClickIntervalMs < 0 ? 0 : doubleClickIntervalMs ) ;",
-      "class": "value_fallback_select",
-      "clock": "other",
-      "justification": "PLAYER-DOUBLECLICK-FULLSCREEN-1: viewer_dblclick::Gate::pairsWithRecord clamps a negative platform double-click interval to 0 before comparing two mouse-event timestamps (is this press inside the double-click window?). An input-handling window test on event timestamps, not a stage duration; it never claims that anything ran.",
-      "lines": [
-        110
-      ]
-    },
-    {
       "path": "tests/gui/test_gui_smoke.cpp",
       "anchor": "if ( timestampMs != 0 ) {",
       "class": "not_run_proof_structural",
