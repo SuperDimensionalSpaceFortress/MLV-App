@@ -481,6 +481,14 @@ class HelperBehaviourTests(unittest.TestCase):
                 self.assertIn("not a fully qualified path", result["reason"])
 
 
+def _short_spelling(path: Path) -> Path:
+    """The 8.3 spelling of an existing path, or the path itself where the volume generates no short names."""
+    import ctypes
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+    return Path(buffer.value) if 0 < length < len(buffer) else path
+
+
 @unittest.skipUnless(os.name == "nt" and PWSH, "needs Windows and pwsh")
 class PublicationCheckBehaviourTests(unittest.TestCase):
     """adversary ae560106-A1: the bytes are re-read at the point of publication (zip entry; held file during the manifest write)."""
@@ -488,7 +496,18 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="ffx-publish-")
         self.addCleanup(self._tmp.cleanup)
-        self.tmp = Path(self._tmp.name)
+        # PR 862 r4: the hosted runner's TEMP is an 8.3 spelling (C:\Users\RUNNER~1\...) and PowerShell reports a child's FullName by
+        # its long name, so a string comparison of paths failed there only. Every test here runs under a short spelling where the
+        # volume has one, so that difference reproduces on any Windows host.
+        long_named = Path(self._tmp.name) / "a-folder-name-longer-than-eight-dot-three"
+        long_named.mkdir()
+        self.tmp = _short_spelling(long_named)
+
+    def _assert_backup_reported(self, result: dict, backup: Path) -> None:
+        # The error must name THIS backup file (same file on disk), however PowerShell spells the path (PR 862 r4 F1/F2).
+        marker = "destination present; backup kept at "
+        named = [e.split(marker, 1)[1] for e in result["errors"] if marker in e]
+        self.assertTrue(any(os.path.exists(p) and os.path.samefile(p, backup) for p in named), result)
 
     def _ps(self, body: str, **env: str) -> dict:
         module = str(HELPER_MODULE).replace("'", "''")
@@ -587,7 +606,7 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertEqual(result["restored"], [], result)
         self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"NEW")
         self.assertEqual((mine / "ffmpeg.exe").read_bytes(), b"ORIGINAL")
-        self.assertTrue(any("destination present; backup kept at" in e and str(mine / "ffmpeg.exe") in e for e in result["errors"]), result)
+        self._assert_backup_reported(result, mine / "ffmpeg.exe")
         # killed before its transaction began: nothing to restore, and that is not an error.
         none = self._restore(self.tmp / "no-such-dir", self.MINE)
         self.assertEqual((none["restored"], none["errors"], none["found"]), ([], [], False))
@@ -613,7 +632,7 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertEqual((result["restored"], result["found"]), ([], True), result)
         self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"Q-PINNED")
         self.assertEqual((mine / "ffmpeg.exe").read_bytes(), b"P-OLD")
-        self.assertTrue(any("destination present; backup kept at" in e and str(mine / "ffmpeg.exe") in e for e in result["errors"]), result)
+        self._assert_backup_reported(result, mine / "ffmpeg.exe")
         self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"Q-OLD")
 
     def test_a_transaction_that_cannot_be_listed_is_an_error_never_silence(self) -> None:
