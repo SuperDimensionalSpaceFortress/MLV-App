@@ -21,6 +21,17 @@ one excludes the other runs.
 Coverage is proven, not assumed: ``--verify-partition`` fails unless every shard's and
 every heavy part's test ids, taken together, are exactly the ids plain ``unittest discover``
 collects, each once, no heavy class is missing from discover, and no module failed to import.
+
+Cleanup is one mechanism: the final cleanup of a run (``run_shard``, ``run_parallel``) is an ordered list of
+named steps (stop a watchdog, end the workers, print a log, remove the work dir, report the problems) run by
+``run_cleanup``. Every step runs; an exception met inside a step, or at its entry, is kept, the step is made
+again (bounded), and the first exception met goes out only after the last step, the report, has run. The report
+itself (``report_problems``) writes a problem whose write was interrupted again before it moves on.
+
+NON-PROMISE: an exception injected inside the driver's own frame, or in its caller's frame around the call
+(between bytecodes, outside any step), is not defended; CPython gives no way to defend a frame against itself.
+The guarantee is per step: an interrupt anywhere inside a step, or at a step's entry, never skips a later step
+or the reporting.
 """
 
 from __future__ import annotations
@@ -608,6 +619,49 @@ def stop_thread(stopped: threading.Event, thread: threading.Thread) -> BaseExcep
     return attempt(once)
 
 
+def handed_back(met: BaseException | None) -> BaseException | None:
+    """What a cleanup step hands the driver for an interrupt a helper met and contained (``BudgetWatch.stop``,
+    ``end_running_workers``): that interrupt, or ``None`` while another exception is already in flight, which is
+    the one that goes out (the run is not a pass either way). Called from inside the step, so ``sys.exc_info``
+    is the exception the ``finally`` around the driver is handling, if any."""
+    return met if sys.exc_info()[0] is None else None
+
+
+def run_cleanup(
+    steps: Sequence[tuple[str, Callable[[], object]]],
+    met: list[BaseException] | None = None,
+    attempts: int = CLEANUP_ATTEMPTS,
+) -> None:
+    """THE cleanup driver: run EVERY step, in order; the first exception met is raised once the last one has run.
+
+    A step is a named zero-argument callable that is safe to make again. Each call is made inside this frame's
+    ``try``, so an exception raised anywhere in the step, at its very first line included (and in anything it
+    calls), is kept and the step is made again, at most ``attempts`` times; then the next step runs, whatever
+    happened. A step may also RETURN an exception it met and contained (``BudgetWatch.stop`` hands back the
+    interrupt it met): that is kept too, and the step is not made again. ``met`` is the list everything is kept
+    in, in the order met, so a later step can see whether anything was (``run_parallel`` skips its accounting
+    then); the first entry is what goes out. Every final cleanup in this module (``run_shard``,
+    ``run_parallel``) is one call of this, so no cleanup step and no report can be skipped by one before it.
+
+    NON-PROMISE: an exception injected inside this function's own frame, or in its caller's frame around the
+    call, between bytecodes and outside any step, is not defended: CPython gives no way to defend a frame
+    against itself. The guarantee is per step, as above.
+    """
+    kept: list[BaseException] = [] if met is None else met
+    for _name, step in steps:
+        for _attempt in range(attempts):
+            try:
+                returned = step()
+            except BaseException as error:  # noqa: BLE001 - kept, the step made again, and the next one still run
+                kept.append(error)
+                continue
+            if issubclass(type(returned), BaseException):  # ``type()``: ``isinstance`` would read ``__class__``
+                kept.append(returned)  # type: ignore[arg-type]
+            break
+    if kept:
+        raise kept[0]
+
+
 class BudgetWatch:
     """Prints the budget warning once, the moment the shard passes ``BUDGET_WARN_SHARE`` of its cap.
 
@@ -897,21 +951,26 @@ def run_shard(
         made.append(result)
         return result
 
-    runner = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=make_result)
-    watch.start()
-    stop_error: BaseException | None = None
-    try:
-        result = runner.run(ClassTimingSuite(members))
-    finally:
-        stop_error = watch.stop()
+    def stop_watch() -> BaseException | None:  # the interrupt it met (if any) is handed back to the driver
+        return handed_back(watch.stop())
+
+    def report_slowest() -> None:
         seconds = made[0].snapshot() if made else {}
         if seconds:
             watch.check()
             failed = emit_text("\n".join(slowest_block(profile, index, of, clock() - begin, seconds)) + "\n", out)
             if failed is not None:  # informational: the exit code stays the test outcome
                 emit_text(f"SHARD_SLOWEST could not be printed ({failed})\n", sys.stderr)
-    if stop_error is not None:  # an interrupt met while the watchdog was stopped is not lost: the run is not a pass
-        raise stop_error
+
+    # The final cleanup, run by ``run_cleanup``: both steps run whatever the other met, and an interrupt met in
+    # either (or in the run) is not lost: the first one goes out once both are done, so the run is not a pass.
+    cleanup = (("stop the budget watch", stop_watch), ("print the slowest classes", report_slowest))
+    runner = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=make_result)
+    watch.start()
+    try:
+        result = runner.run(ClassTimingSuite(members))
+    finally:
+        run_cleanup(cleanup)
     if manifest is not None and made:
         write_manifest(manifest, made[0].started_ids)
     if result.testsRun == 0:
@@ -1031,18 +1090,31 @@ def emit_error(problem: str) -> None:
     emit_text(f"ERROR: {problem}\n", sys.stderr)
 
 
-def report_problems(problems: Sequence[str]) -> BaseException | None:
-    """``emit_error`` for EVERY problem; the first exception met, if any, is returned and never raised.
+def report_problems(
+    problems: Sequence[str], cursor: list[int] | None = None, attempts: int = CLEANUP_ATTEMPTS
+) -> BaseException | None:
+    """``emit_error`` for EVERY problem, in order; the first exception met, if any, is returned and never raised.
 
-    ``emit_text`` lets a ``KeyboardInterrupt`` through, and one landing in the first line must not cost the
-    others (the kept-log paths are the evidence): the caller raises what comes back once all are said."""
+    ``emit_text`` lets a ``KeyboardInterrupt`` through. A problem whose write it cuts short is written AGAIN
+    (at most ``attempts`` tries) before the next one is said, because it may be the only line that says where
+    the kept evidence is; after the last try the remaining problems are still said. The caller raises what
+    comes back once all are said.
+
+    ``cursor`` (a one-item list) is the index of the next problem to say, advanced past each one once it is
+    dealt with: a caller that makes this call again after it was cut short (``run_cleanup``) goes on from
+    there and never says the earlier ones twice."""
+    at = [0] if cursor is None else cursor
     first: BaseException | None = None
-    for problem in problems:
-        try:
-            emit_error(problem)
-        except BaseException as error:  # noqa: BLE001 - the remaining problems are still said
-            if first is None:  # never ``first or error``: truth-testing an exception can itself raise
-                first = error
+    while at[0] < len(problems):
+        for _attempt in range(attempts):
+            try:
+                emit_error(problems[at[0]])
+            except BaseException as error:  # noqa: BLE001 - this problem is written again; the rest are still said
+                if first is None:  # never ``first or error``: truth-testing an exception can itself raise
+                    first = error
+                continue
+            break
+        at[0] += 1
     return first
 
 
@@ -1454,7 +1526,7 @@ def run_parallel(
     unread: list[int] = []  # 1-based workers whose log could not be read: the work dir is kept for them
     stuck: set[int] = set()  # 1-based workers the OS would not let the parent kill
     ended_late: dict[int, str | None] = {}  # the final cleanup's per-worker termination result
-    census_error: BaseException | None = None  # an interrupt met while ending the leftover workers, re-raised after the cleanup
+    met: list[BaseException] = []  # every exception the final cleanup met, in order; ``run_cleanup`` raises the first
     merged: dict[str, float] = {}
     cap_minutes = job_cap_minutes(profile, env)
     budget_begin, origin = budget_origin(env, clock, begin, wall_clock, cap_minutes)
@@ -1478,6 +1550,143 @@ def run_parallel(
             if number not in stuck:
                 stuck.add(number)
                 problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
+
+    def note(problem: str) -> None:  # a cleanup step can be made again: what it records is recorded once
+        if problem not in problems:
+            problems.append(problem)
+
+    # ---- The final cleanup: one step each, run in this order by ``run_cleanup`` from the ``finally`` below. ----
+    # Every step runs whatever an earlier one met; an exception met in a step (at its first line too) is kept and
+    # the step made again; the first one met goes out only after the last step, the report, has run. Each step is
+    # safe to make again: a cursor (``handled``, ``said``) or a once-only record (``stuck``, ``note``) says where
+    # one that was cut short stops.
+    ran: list[str] = []  # the sorted ids the workers ran (set by ``account``)
+    tail = [False]  # whether the run's own accounting follows (``decide_tail``)
+    said = [0]  # the report's cursor: the next problem to say
+
+    def end_workers() -> BaseException | None:  # an exception left the run early: no worker may be left running
+        nonlocal ended_late
+        ended_late, returned = end_running_workers([proc for proc, _log in procs])
+        return handed_back(returned)  # the interrupt it met and contained (if any): kept by the driver
+
+    def close_logs() -> None:  # a worker the census could not end is recorded once; every log is closed
+        for number, (_proc, log) in enumerate(procs, start=1):
+            error = ended_late.get(number)
+            if error is not None and number not in stuck:
+                stuck.add(number)
+                problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
+            try:
+                log.close()
+            except OSError:
+                pass
+            except BaseException as close_error:  # noqa: BLE001 - kept; the other logs are still closed
+                met.append(close_error)
+
+    def print_left_logs() -> None:
+        """An exception in flight (a launch that raised, say) skipped the grouped logs or cut them short: every
+        worker from the first one not fully dealt with (``handled``, the cursor) has its log printed here, or
+        recorded as kept, because the work dir is deleted below otherwise."""
+        nonlocal handled
+        if sys.exc_info()[0] is None:
+            return
+        for number, (path, (proc, _log)) in enumerate(zip(logs, procs, strict=True), start=1):
+            if number <= handled:
+                continue
+            header_error = None
+            try:
+                header_error = emit_log(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====\n")
+            except BaseException as error:  # noqa: BLE001 - poll() itself raised (SystemExit included)
+                if is_interrupt(error):
+                    met.append(error)  # raised once the problems and the kept paths are reported
+                header_error = describe_error(error)
+            try:
+                text, unreadable = read_log(path)  # re-raises an interrupt: the log is then unread, and kept
+            except BaseException as error:  # noqa: BLE001
+                met.append(error)
+                text, unreadable = "", describe_error(error)
+            verb = "read"
+            if unreadable is None:
+                try:
+                    printed = emit_log(text)  # re-raises an interrupt: the log is then not fully printed, and kept
+                except BaseException as error:  # noqa: BLE001
+                    met.append(error)
+                    printed = describe_error(error)
+                unreadable, verb = printed or header_error, "printed"
+            if unreadable is not None and number not in unread:
+                unread.append(number)
+                problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
+            handled = number
+
+    def stop_killer() -> BaseException | None:  # the watchdog kept enforcing the deadline until now
+        return handed_back(killer.stop())
+
+    def stop_watch() -> BaseException | None:
+        return handed_back(watch.stop())
+
+    def note_kept() -> None:  # where evidence nobody has seen stays is said, once
+        if stuck and not unread:  # a worker still running can write to its log after this
+            note(
+                "worker(s) " + ", ".join(str(number) for number in sorted(stuck))
+                + f" could not be ended and may still write to their logs; kept at {work}"
+            )
+        if handled < len(logs) and not unread and not stuck:  # the logs ``print_left_logs`` could not get to
+            note(f"worker log(s) {handled + 1}-{len(logs)} could not all be printed; kept at {work}")
+
+    def remove_work() -> None:  # unseen output (an unread or unprinted log, a live worker) is evidence: never deleted
+        if not unread and not stuck and handled >= len(logs):
+            shutil.rmtree(work, ignore_errors=True)
+
+    def decide_tail() -> None:  # the run's own accounting follows only a cleanup that met nothing, nothing in flight
+        tail[0] = sys.exc_info()[0] is None and not met
+
+    def account() -> None:
+        if not tail[0]:
+            return
+        ran[:] = sorted(item for record in records if record for item in record["ids"])
+        # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
+        accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])
+        expected = sorted(test.id() for test in members)
+        if accounted != expected:
+            # By multiplicity: two members may share one id(), so a set difference would say 0/0/0 over a real gap.
+            want, got = Counter(expected), Counter(accounted)
+            missing = sum((want - got).values())
+            extra = sum(count for item, count in got.items() if item not in want)
+            repeated = sum(count - want[item] for item, count in got.items() if item in want and count > want[item])
+            note(f"the workers' ids are not exactly the shard's: {missing} missing, {extra} extra, {repeated} repeated")
+
+    def write_ids() -> None:
+        if tail[0] and manifest is not None and not problems:
+            write_manifest(manifest, ran)
+
+    def report_slowest() -> None:
+        if not (tail[0] and merged):
+            return
+        try:
+            failed = emit_text("\n".join(slowest_block(profile, index, of, clock() - begin, merged)) + "\n", out)
+        except BaseException as error:  # noqa: BLE001 - kept; the queued problems (the kept-log paths) are still said
+            met.append(error)
+            failed = describe_error(error)
+        if failed is not None:
+            note(f"SHARD_SLOWEST could not be printed ({failed})")
+
+    def report() -> BaseException | None:  # last: everything recorded is said, from where a cut-short try stopped
+        return report_problems(problems, said)
+
+    cleanup = (
+        ("end the workers still running", end_workers),
+        ("close the logs", close_logs),
+        ("print the logs an exception skipped", print_left_logs),
+        ("stop the deadline watchdog", stop_killer),
+        ("record the workers it could not end", report_unended),
+        ("stop the budget watch", stop_watch),
+        ("say where kept evidence stays", note_kept),
+        ("remove the work dir", remove_work),
+        ("decide the accounting", decide_tail),
+        ("account for the ids", account),
+        ("write the manifest", write_ids),
+        ("print the slowest classes", report_slowest),
+        ("report the problems", report),
+    )
 
     try:
         watch.start()  # inside the try: a thread that cannot be started still gets the cleanup below
@@ -1582,130 +1791,11 @@ def run_parallel(
                 problems.append(f"worker {number}/{len(logs)} exited 5 after running {record['tests_run']} tests")
             handled = number  # a failure later prints only the logs after this one, never one twice
     finally:
-        # An exception above must not leave a worker running: every owned worker is attempted, one that
-        # cannot be killed is reported, and the watchdog keeps enforcing the deadline until they are done.
-        first_interrupt: BaseException | None = None  # the first interrupt met in the call itself, kept over any later result
-        # The first exception met closing or reading a log below. None of those sites may leave the cleanup: the
-        # watchdogs still have to be stopped, the problems and the kept paths said, and the work dir judged; it is
-        # raised once that is done.
-        loose_error: BaseException | None = None
-        for _attempt in range(TERMINATE_ATTEMPTS):  # the call itself can be interrupted too: it is made once more
-            try:
-                ended_late, returned_error = end_running_workers([proc for proc, _log in procs])
-            except BaseException as error:  # noqa: BLE001 - end_running_workers returns what it meets; this is an interrupt in the call
-                if first_interrupt is None:
-                    first_interrupt = error
-                continue
-            census_error = returned_error if first_interrupt is None else first_interrupt
-            break
-        else:
-            census_error = first_interrupt
-        for number, (proc, log) in enumerate(procs, start=1):
-            error = ended_late.get(number)
-            if error is not None and number not in stuck:
-                stuck.add(number)
-                problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
-            try:
-                log.close()
-            except OSError:
-                pass
-            except BaseException as error:  # noqa: BLE001 - an interrupt met closing a log: the other logs are still closed
-                if loose_error is None:
-                    loose_error = error
-        if sys.exc_info()[0] is not None:
-            # An exception (a launch that raised, say) skipped the grouped logs, or cut them short: every
-            # worker from the first one not fully dealt with keeps its output, which is deleted with the
-            # work dir just below.
-            for number, (path, (proc, _log)) in enumerate(zip(logs, procs, strict=True), start=1):
-                if number <= handled:
-                    continue
-                header_error = None
-                try:
-                    header_error = emit_log(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====\n")
-                except BaseException as error:  # noqa: BLE001 - poll() itself raised (SystemExit included)
-                    if is_interrupt(error) and loose_error is None:
-                        loose_error = error  # raised below, after the problems and the kept paths are reported
-                    header_error = describe_error(error)
-                try:
-                    text, unreadable = read_log(path)  # re-raises an interrupt: the log is then unread, and kept
-                except BaseException as error:  # noqa: BLE001
-                    if loose_error is None:
-                        loose_error = error
-                    text, unreadable = "", describe_error(error)
-                verb = "read"
-                if unreadable is None:
-                    try:
-                        printed = emit_log(text)  # re-raises an interrupt: the log is then not fully printed, and kept
-                    except BaseException as error:  # noqa: BLE001
-                        if loose_error is None:
-                            loose_error = error
-                        printed = describe_error(error)
-                    unreadable, verb = printed or header_error, "printed"
-                if unreadable is not None:
-                    unread.append(number)
-                    problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
-        killer_error = killer.stop()
-        # Every step from here to the report is guarded (``attempt``): an interrupt met in one is kept, the steps
-        # after it still run, and it goes out once the problems are said. ``report_unended`` and the removal are
-        # safe to make again (the first records each worker once; ``rmtree`` finishes what it left half done).
-        unended_error = attempt(report_unended)
-        watch_error = watch.stop()
-        if stuck and not unread:  # a worker still running can write to its log after this: say where it stays
-            problems.append(
-                "worker(s) " + ", ".join(str(number) for number in sorted(stuck))
-                + f" could not be ended and may still write to their logs; kept at {work}"
-            )
-        removal_error = None
-        if not unread and not stuck:  # unseen output (unread log, live worker) is evidence: never deleted
-            removal_error = attempt(lambda: shutil.rmtree(work, ignore_errors=True))
-        for met in (unended_error, removal_error):  # compared with ``is None``: never truth-test an exception
-            if loose_error is None:
-                loose_error = met
-        if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
-            reported_error = report_problems(problems)
-            if loose_error is None:
-                loose_error = reported_error
-            if loose_error is not None:
-                raise loose_error
-        else:
-            # An interrupt met in the census or while a watchdog was stopped is not lost: it goes out once every
-            # worker has been ended, the first one met first (compared with ``is None``: an exception's own
-            # truth value is its class's business).
-            pending = next((met for met in (census_error, loose_error, killer_error, watch_error) if met is not None), None)
-            if pending is not None:
-                # Raising skips the report at the end of the run, and the work dir may be kept for an unread log or
-                # a worker still running: what was recorded, and where the evidence stays, is said before it goes out.
-                report_problems(problems)  # the interrupt already met outranks one met while saying it
-                raise pending
-    ran =sorted(item for record in records if record for item in record["ids"])
-    # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
-    accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])
-    expected = sorted(test.id() for test in members)
-    if accounted != expected:
-        # By multiplicity: two members may share one id(), so a set difference would say 0/0/0 over a real gap.
-        want, got = Counter(expected), Counter(accounted)
-        missing = sum((want - got).values())
-        extra = sum(count for item, count in got.items() if item not in want)
-        repeated = sum(count - want[item] for item, count in got.items() if item in want and count > want[item])
-        problems.append(
-            f"the workers' ids are not exactly the shard's: {missing} missing, {extra} extra, {repeated} repeated"
-        )
-    if manifest is not None and not problems:
-        write_manifest(manifest, ran)
-    total = clock() - begin
-    late_error: BaseException | None = None  # met printing the timings or the problems, raised once all are said
-    if merged:
-        try:
-            failed = emit_text("\n".join(slowest_block(profile, index, of, total, merged)) + "\n", out)
-        except BaseException as error:  # noqa: BLE001 - an interrupt must not cost the queued problems their report
-            late_error, failed = error, describe_error(error)
-        if failed is not None:  # the queued problems (the kept-log paths) are still reported below
-            problems.append(f"SHARD_SLOWEST could not be printed ({failed})")
-    reported_late = report_problems(problems)
-    if late_error is None:
-        late_error = reported_late
-    if late_error is not None:
-        raise late_error
+        # An exception above must not leave a worker running, a watchdog running or a recorded problem unsaid:
+        # ``cleanup`` (above) is every step of that, and the driver runs each of them whatever the others met. With
+        # nothing met and nothing in flight the run's own accounting and report ran as its last steps; otherwise the
+        # first exception met goes out from here, once the problems and the kept paths are said.
+        run_cleanup(cleanup, met)
     if problems or any(code == 1 for code in codes):
         return 1
     return 5 if not ran else 0

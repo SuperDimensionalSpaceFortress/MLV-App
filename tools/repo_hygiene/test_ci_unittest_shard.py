@@ -14,7 +14,7 @@ import time
 import types
 import unittest
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest import mock
 
@@ -3921,6 +3921,216 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(len(warned), 1, out)
         self.assertEqual(sum(line.startswith("::warning") for line in lines), 1, out)
         self.assertLess(warned[0], first_log, "the warning came only after the workers had finished")
+
+    # ---- r21, sol r20 A1/A2 (adversary pass 33): an interrupt landing in, or at the entry of, a cleanup step. ----
+    # Closed by ONE mechanism, ``run_cleanup``; these tests inject a one-shot KeyboardInterrupt at the FIRST line of a
+    # chosen frame through ``sys.settrace`` (the way the sol key reproduced both findings).
+    @staticmethod
+    @contextlib.contextmanager
+    def _traced(tracer: Callable[..., object]) -> Iterator[None]:
+        sys.settrace(tracer)  # type: ignore[arg-type]
+        try:
+            yield
+        finally:
+            sys.settrace(None)
+
+    def _interrupt_at_entry(self, pick: Callable[[types.FrameType], bool], marker: str = "step-entry") -> object:
+        """At the first line of the first frame ``pick`` accepts, raise ``KeyboardInterrupt(marker)``, once."""
+        fired: list[int] = []
+
+        def local(frame: types.FrameType, event: str, arg: object) -> object:
+            if event == "line" and not fired:
+                fired.append(1)
+                raise KeyboardInterrupt(marker)
+            return None
+
+        def tracer(frame: types.FrameType, event: str, arg: object) -> object:
+            if event == "call" and not fired and pick(frame):
+                return local
+            return None
+
+        return self._traced(tracer)
+
+    def _recorded_watchdogs(self) -> tuple[list[object], dict[str, type]]:
+        made: list[object] = []
+        test = self
+
+        def record(base: type) -> type:
+            class Recorded(base):  # type: ignore[valid-type, misc]
+                def __init__(self, *args: object, **kwargs: object) -> None:
+                    super().__init__(*args, **kwargs)
+                    made.append(self)
+                    ShardExitCodeTests._release_on_cleanup(test, self)
+
+            return Recorded
+
+        return made, {"DeadlineKiller": record(shard.DeadlineKiller), "BudgetWatch": record(shard.BudgetWatch)}
+
+    def _assert_watchdogs_stopped(self, made: list[object], count: int) -> None:
+        self.assertEqual(len(made), count)
+        for watchdog in made:
+            name = type(watchdog).__mro__[1].__name__
+            self.assertTrue(watchdog._stopped.is_set(), f"{name}'s stop flag was never set")  # type: ignore[attr-defined]
+            self.assertFalse(watchdog._thread.is_alive(), f"{name} was left running")  # type: ignore[attr-defined]
+
+    def _parallel_with(self, extra: object | None = None, **patches: object) -> tuple[BaseException | None, str, list[object]]:
+        """``run_parallel`` over two finished workers, worker 1's log unreadable (so its dir is kept and the kept path
+        is the evidence), with the watchdogs recorded."""
+        made, watchdogs = self._recorded_watchdogs()
+        raised, err = self._run_to_exception(self._finished_popen([]), extra=extra, **{**watchdogs, **patches})
+        return raised, err, made
+
+    def _serial_with(self, extra: object) -> tuple[BaseException | None, str, list[object]]:
+        """``run_shard`` over one passing test, with its budget watch recorded."""
+        clock = FakeClock()
+
+        class Probe(unittest.TestCase):
+            def test_one(self) -> None:
+                clock.advance(1.0)
+
+        Probe.__module__ = "fake_mod"
+        Probe.__qualname__ = "Probe"
+        made, watchdogs = self._recorded_watchdogs()
+        out = io.StringIO()
+        raised: BaseException | None = None
+        with (
+            mock.patch.object(shard, "BudgetWatch", watchdogs["BudgetWatch"]),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+            extra,  # type: ignore[attr-defined]
+        ):
+            try:
+                shard.run_shard([Probe("test_one")], "ubuntu", 1, 1, clock=clock, environ={}, stream=io.StringIO())
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        return raised, out.getvalue(), made
+
+    def _assert_parallel_reported(self, raised: BaseException | None, err: str, made: list[object], marker: str) -> None:
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised) + err)
+        self.assertEqual(str(raised), marker)
+        self._assert_watchdogs_stopped(made, 2)
+        self.assertIn("worker 1/2 log could not be read", err, "the recorded problem was never said")
+        self.assertIn("kept at", err, "the location of the retained evidence was never said")
+
+    def test_r21_sol_a1_an_interrupted_write_of_the_sole_kept_path_is_written_again(self) -> None:
+        raised, err, made = self._parallel_with(err=self._FlakyStderr())
+        self._assert_parallel_reported(raised, err, made, "report-write")
+
+    def test_r21_sol_a2_an_interrupt_at_either_watchdog_stops_entry_still_stops_both_and_reports(self) -> None:
+        for nth in (1, 2):  # the deadline watchdog's stop, then the budget watch's
+            with self.subTest(stop=nth):
+                calls = [0]
+
+                def pick(frame: types.FrameType, nth: int = nth) -> bool:
+                    if frame.f_code is shard.stop_thread.__code__:
+                        calls[0] += 1
+                        return calls[0] == nth
+                    return False
+
+                raised, err, made = self._parallel_with(self._interrupt_at_entry(pick))
+                self._assert_parallel_reported(raised, err, made, "step-entry")
+
+    def test_r21_sol_a2_an_interrupt_at_the_entry_of_recording_the_unended_workers_still_stops_and_reports(self) -> None:
+        driver = getattr(getattr(shard, "run_cleanup", None), "__code__", None)  # None before r21 (no driver)
+
+        def pick(frame: types.FrameType) -> bool:
+            code, back = frame.f_code, frame.f_back
+            if code is shard.attempt.__code__:  # e25b06df: ``attempt(report_unended)``
+                return getattr(frame.f_locals.get("step"), "__name__", "") == "report_unended"
+            return code.co_name == "report_unended" and back is not None and driver is not None and back.f_code is driver
+
+        raised, err, made = self._parallel_with(self._interrupt_at_entry(pick))
+        self._assert_parallel_reported(raised, err, made, "step-entry")
+
+    def test_r21_sol_a2_an_interrupt_at_the_report_entry_still_says_every_problem(self) -> None:
+        raised, err, made = self._parallel_with(
+            self._interrupt_at_entry(lambda frame: frame.f_code is shard.report_problems.__code__)
+        )
+        self._assert_parallel_reported(raised, err, made, "step-entry")
+
+    def test_r21_sol_a2_the_serial_path_stops_its_watch_and_prints_the_slowest_after_an_interrupt_at_the_stop(self) -> None:
+        raised, out, made = self._serial_with(self._interrupt_at_entry(lambda frame: frame.f_code is shard.stop_thread.__code__))
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertEqual(str(raised), "step-entry")
+        self._assert_watchdogs_stopped(made, 1)
+        self.assertIn("SHARD_SLOWEST", out, "the serial report was skipped by the interrupt")
+
+    def _driver_steps(self, run: Callable[[object], tuple[BaseException | None, str, list[object]]]) -> list[str]:
+        """The names of the steps the cleanup driver ran in a clean run, read from the driver's own frame, and proven
+        to be exactly the calls the driver made itself (one per step), so injecting at the k-th such call is step k."""
+        driver = shard.run_cleanup.__code__
+        names: list[str] = []
+        direct = [0]
+
+        def tracer(frame: types.FrameType, event: str, arg: object) -> object:
+            if event == "call":
+                if frame.f_code is driver:
+                    names.extend(name for name, _step in frame.f_locals["steps"])
+                elif frame.f_back is not None and frame.f_back.f_code is driver:
+                    direct[0] += 1
+            return None
+
+        raised, _text, _made = run(self._traced(tracer))
+        self.assertIsNone(raised, "the clean control run raised")
+        self.assertGreater(len(names), 0, "the cleanup was not run by the driver")
+        self.assertEqual(direct[0], len(names), "the driver made a call that is not one of its steps")
+        return names
+
+    def _at_driver_step(self, k: int) -> object:
+        driver = shard.run_cleanup.__code__
+        seen = [0]
+
+        def pick(frame: types.FrameType) -> bool:
+            if frame.f_back is not None and frame.f_back.f_code is driver:
+                seen[0] += 1
+                return seen[0] == k + 1
+            return False
+
+        return self._interrupt_at_entry(pick)
+
+    def test_r21_an_interrupt_at_the_entry_of_every_parallel_cleanup_step_skips_no_later_step_or_report(self) -> None:
+        names = self._driver_steps(self._parallel_with)  # the control: two finished workers that exit 1 return, never raise
+        self.assertEqual(names[-1], "report the problems", "the report is not the driver's last step")
+        for k, name in enumerate(names):
+            with self.subTest(step=name):
+                raised, err, made = self._parallel_with(self._at_driver_step(k))
+                self._assert_parallel_reported(raised, err, made, "step-entry")
+
+    def test_r21_an_interrupt_at_the_entry_of_every_serial_cleanup_step_skips_no_later_step_or_report(self) -> None:
+        names = self._driver_steps(self._serial_with)
+        for k, name in enumerate(names):
+            with self.subTest(step=name):
+                raised, out, made = self._serial_with(self._at_driver_step(k))
+                self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+                self.assertEqual(str(raised), "step-entry")
+                self._assert_watchdogs_stopped(made, 1)
+                self.assertIn("SHARD_SLOWEST", out, f"an interrupt at {name!r} skipped the serial report")
+
+    def test_r21_run_cleanup_runs_every_step_and_raises_the_first_exception_after_the_last(self) -> None:
+        ran: list[str] = []
+        tries = {"b": 0}
+
+        def a() -> None:
+            ran.append("a")
+            raise KeyboardInterrupt("first")
+
+        def b() -> None:
+            tries["b"] += 1
+            ran.append("b")
+            if tries["b"] < 3:
+                raise OSError("again")
+
+        def c() -> BaseException:
+            ran.append("c")
+            return KeyboardInterrupt("returned")
+
+        met: list[BaseException] = []
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            shard.run_cleanup((("a", a), ("b", b), ("c", c), ("d", lambda: ran.append("d"))), met)
+        self.assertEqual(str(caught.exception), "first")
+        self.assertEqual(ran, ["a"] * shard.CLEANUP_ATTEMPTS + ["b", "b", "b", "c", "d"], "a step was skipped or not made again")
+        self.assertEqual([str(error) for error in met], ["first"] * shard.CLEANUP_ATTEMPTS + ["again", "again", "returned"])
+        shard.run_cleanup((("quiet", lambda: None),))  # nothing met: nothing raised
 
 
 class TimingsTests(unittest.TestCase):
