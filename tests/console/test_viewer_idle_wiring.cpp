@@ -242,3 +242,32 @@ TEST(ViewerIdleWiring, TickPassesThePollCapOnEveryPlatformAndEveryStartIsOnePoll
         QStringLiteral("void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )"));
     ASSERT_EQ(1, int(note.count(pollStart)));
 }
+
+// W7 (r4, adversary r1 pass 6 A1): the sampled witness is QCursor::pos(), a logical QPoint, and Qt has no public
+// sub-logical-pixel cursor position. The sub-logical-pixel bound is stated as a non-promise next to the
+// between-samples bound, in the policy header (PointerWatch, file comment) and at the tick that samples, and no
+// text there still claims integer positions are enough. P10 pins the behaviour.
+TEST(ViewerIdleWiring, SampledWitnessStatesItsSubLogicalPixelBound)
+{
+    const QString header = readRepoFile(QStringLiteral("platform/qt/ViewerIdlePolicy.h"));
+    ASSERT_FALSE(header.isEmpty());
+    ASSERT_FALSE(header.contains(QStringLiteral("Integer positions are enough")));
+    const int watchAt = header.indexOf(QStringLiteral("class PointerWatch"));
+    ASSERT_TRUE(watchAt > 0);
+    const int docAt = header.lastIndexOf(QStringLiteral("/*!"), watchAt);
+    ASSERT_TRUE(docAt >= 0);
+    const QString watchDoc = header.mid(docAt, watchAt - docAt);
+    ASSERT_TRUE(watchDoc.contains(QStringLiteral("Sub-logical-pixel bound")));
+    ASSERT_TRUE(watchDoc.contains(QStringLiteral("less than one logical pixel")));
+    ASSERT_TRUE(watchDoc.contains(QStringLiteral("one logical pixel or more")));
+    ASSERT_TRUE(watchDoc.contains(QStringLiteral("non-promise")));
+    const int fileDocEnd = header.indexOf(QStringLiteral("#ifndef VIEWERIDLEPOLICY_H"));
+    ASSERT_TRUE(fileDocEnd > 0);
+    ASSERT_TRUE(header.left(fileDocEnd).contains(QStringLiteral("less than one logical pixel")));
+
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString timeout = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    ASSERT_FALSE(timeout.isEmpty());
+    ASSERT_TRUE(timeout.contains(QStringLiteral("less than one logical pixel")));
+}

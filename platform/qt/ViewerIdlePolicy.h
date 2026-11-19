@@ -20,7 +20,9 @@
  * idle period even inside such a wait. The caller passes kPointerPollMs() as the poll cap, so the tick
  * asks for a look every poll period, shown or hidden. Off Windows that is the whole witness: a move away
  * and back that lies entirely between two consecutive samples is seen only when the wait delivers its
- * events (see kPointerPollMs for the exact bound); on Windows the thread mouse hook sees it at once.
+ * events (see kPointerPollMs for the exact bound); on Windows the thread mouse hook sees it at once. The
+ * sample is in logical pixels, so off Windows a persistent move of less than one logical pixel is not seen
+ * by it either (see PointerWatch for that bound); any real mouse event still restores through the event path.
  */
 
 #ifndef VIEWERIDLEPOLICY_H
@@ -40,13 +42,13 @@ inline constexpr int kIdleHideMs() { return 2000; }
 /*! \brief The requested gap between two looks at the OS pointer while fullscreen (r3, adversary r1 pass 4 A1).
  *         Off Windows the sampled position is the only witness for movement an input-excluded wait does not
  *         deliver, so it is sampled every poll period rather than once per idle period. The exact bound
- *         (r3, pass 5 A1): a move is seen at the first tick that samples the pointer away from the last
- *         sample. A move away and back that lies entirely between two consecutive samples is NOT seen by
- *         the sample; the samples are at least this far apart and later when the GUI thread is busy (a Qt
- *         timer may fire late), so no poll period makes that a guarantee. Such an excursion is seen when
- *         the wait returns and Qt delivers its deferred mouse events (the event path), and on Windows at
- *         once by the thread mouse hook. The poll does not change when the cursor hides (the activity
- *         timestamp decides that). */
+ *         (r3, pass 5 A1): a move is seen at the first tick that samples the pointer one logical pixel or
+ *         more away from the last sample (a smaller move is PointerWatch's r4 bound). A move away and back
+ *         that lies entirely between two consecutive samples is NOT seen by the sample; the samples are at
+ *         least this far apart and later when the GUI thread is busy (a Qt timer may fire late), so no poll
+ *         period makes that a guarantee. Such an excursion is seen when the wait returns and Qt delivers
+ *         its deferred mouse events (the event path), and on Windows at once by the thread mouse hook. The
+ *         poll does not change when the cursor hides (the activity timestamp decides that). */
 inline constexpr int kPointerPollMs() { return 50; }
 
 /*! \brief What the window looks like at the moment the hide timer fires. */
@@ -96,8 +98,18 @@ inline bool forcesRestore( QEvent::Type type )
         || type == QEvent::WindowStateChange;
 }
 
-/*! \brief The OS pointer position seen at the last look. moved() reports a change since then. Integer
- *         positions are enough here: it is the backstop for undelivered input, not the event path. */
+/*! \brief The OS pointer position seen at the last look, in logical pixels (the caller passes QCursor::pos()).
+ *         moved() reports a change since then. It is the backstop for input a wait does not deliver, not the
+ *         event path.
+ *
+ * Sub-logical-pixel bound (r4, adversary r1 pass 6 A1), a non-promise like the between-samples bound in
+ * kPointerPollMs: QCursor::pos() is the native position divided by the scale factor and rounded to a QPoint,
+ * and Qt has no public sub-logical-pixel cursor position (the native one is QPA-private; platform natives such as
+ * xcb or Cocoa are not used). At a device-pixel ratio above 1 (X11 at scale 3, a Retina Mac) a persistent move of
+ * less than one logical pixel can round to the same QPoint as the last look, so the sample does NOT see it, at
+ * any tick. A displacement of one logical pixel or more on either axis always changes the rounded point and is
+ * seen at the next sample. The smaller move is seen when the wait returns and Qt delivers its events (isActivity
+ * compares unrounded QPointF positions), and on Windows at once by the thread mouse hook (physical pixels). */
 class PointerWatch
 {
 public:

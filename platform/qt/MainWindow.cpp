@@ -3746,8 +3746,8 @@ void MainWindow::viewerIdleTimeout( void )
 {
     int ms = 0;
     viewer_idle::Inputs in = viewerIdleInputs();
-    // A wait that excludes user input still runs this timer but delivers no mouse event: the OS pointer
-    // position is the witness for movement the event path did not see.
+    // An input-excluded wait runs this timer but delivers no mouse event: the OS pointer position is the witness. It
+    // is a logical QPoint, so a held move of less than one logical pixel is not seen by it (r4 bound, PointerWatch).
     in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );
 #ifdef Q_OS_WIN
     // A move away and back between two ticks leaves the sampled position unchanged. Qt's excluded wait takes

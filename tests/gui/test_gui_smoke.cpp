@@ -2415,6 +2415,7 @@ private:
     {
         int ms = 0;
         viewer_idle::Inputs in = inputs;
+        // As MainWindow: a logical QPoint, so a sub-logical-pixel move is not seen here (r4 bound, PointerWatch).
         in.pointerMoved = m_pointer.moved( QCursor::pos() );
 #ifdef Q_OS_WIN
         if( positionSampleOnly ) {}

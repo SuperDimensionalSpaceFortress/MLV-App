@@ -43,7 +43,7 @@
       "clock": "other",
       "justification": "PLAYER-CURSOR-AUTOHIDE-1 r3: viewer_idle::Controller::onTimeout caps the next idle-timer interval at the caller's poll period; a non-positive pollMs means no cap (old callers). A config-value decision about how soon to look at the pointer again, never whether any stage ran.",
       "lines": [
-        238
+        250
       ]
     },
     {
@@ -53,7 +53,7 @@
       "clock": "other",
       "justification": "PLAYER-CURSOR-AUTOHIDE-1 r3 P8: pins that the constant poll period is positive (a constexpr config value), so the cap it feeds is real. Structural, cannot distinguish ran from did not run.",
       "lines": [
-        331
+        332
       ]
     },
     {

@@ -7,6 +7,7 @@
 
 #include <QEvent>
 #include <QPoint>
+#include <QPointF>
 
 namespace
 {
@@ -445,6 +446,102 @@ TEST(ViewerIdlePolicy, SampledWitnessBoundIsAnExcursionBetweenTwoSamplesAndTheOt
         in.pointerMoved = s.moved(QPoint(510, 500));
         ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 2080, 2000, &rearm, poll)));
         ASSERT_FALSE(c.hidden());
+    }
+}
+
+// P10 (r4, adversary r1 pass 6 A1): the sub-logical-pixel bound of the sampled witness, with the adversary's
+// input. QCursor::pos() is the native position rounded to a logical QPoint (QHighDpi divides by the scale factor
+// and rounds), and Qt has no public sub-logical-pixel cursor position. At scale 3 a persistent move from native
+// (300,300) to (301,300) rounds to the same QPoint(100,100), so the sample alone does not see it at any tick: that
+// is the documented non-promise, pinned here so no comment or PR text claims more. What does see it: the event path
+// once the wait delivers the move (positions compared unrounded), and on Windows the retrieval witness (the hook's
+// own physical pixels). A displacement of one logical pixel or more on either axis always changes the rounded point,
+// at every scale factor, so it is always seen at the next sample.
+TEST(ViewerIdlePolicy, SampledWitnessBoundIsASubLogicalPixelMoveAndTheOtherWitnessesCoverIt)
+{
+    const int poll = viewer_idle::kPointerPollMs();
+    // The QHighDpi fromNative rounding for a point at screen origin (0,0): (pos / scale), each axis qRound-ed.
+    auto logical = [](const QPoint &native, qreal scale) {
+        return QPoint(qRound(native.x() / scale), qRound(native.y() / scale));
+    };
+    const qreal scale = 3.0;
+    const QPoint before(300, 300);
+    const QPoint after(301, 300);
+    ASSERT_TRUE(logical(before, scale) == QPoint(100, 100));
+    ASSERT_TRUE(logical(after, scale) == QPoint(100, 100));   // the adversary's input rounds to one point
+
+    viewer_idle::Controller hidden;
+    hidden.setFullscreen(true, 0);
+    int rearm = 0;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(hidden.onTimeout(allPass(), 2000, 2000, &rearm, poll)));
+
+    // The sample alone (off Windows): moved at 2010 and held there, every tick to 6000 stays hidden, past 4050.
+    {
+        viewer_idle::Controller c = hidden;
+        viewer_idle::PointerWatch s;
+        s.seed(logical(before, scale));
+        qint64 now = 2000 + rearm;
+        qint64 lastTick = 0;
+        int ticks = 0;
+        while (now <= 6000 && ticks < 1000)
+        {
+            ++ticks;
+            viewer_idle::Inputs in = allPass();
+            in.pointerMoved = s.moved(logical(now >= 2010 ? after : before, scale));
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(in, now, 2000, &rearm, poll)));
+            ASSERT_TRUE(c.hidden());
+            lastTick = now;
+            now += rearm;
+        }
+        ASSERT_TRUE(lastTick > 4050);
+
+        // The wait returns and Qt delivers the move: the event path compares unrounded positions and restores.
+        const QPointF globalBefore(before.x() / scale, before.y() / scale);
+        const QPointF globalAfter(after.x() / scale, after.y() / scale);
+        ASSERT_TRUE(viewer_idle::isActivity(QEvent::MouseMove, globalAfter, globalBefore, true));
+        ASSERT_TRUE(c.noteActivity(6010));
+        ASSERT_FALSE(c.hidden());
+    }
+
+    // Windows: the hook records physical pixels, so the same one-pixel move shows at the next tick.
+    {
+        viewer_idle::Controller c = hidden;
+        viewer_idle::PointerWatch s;
+        s.seed(logical(before, scale));
+        viewer_idle::RetrievalWitness w;
+        w.seed(before);
+        w.note(viewer_idle::RetrievedKind::Move, after, true);
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = s.moved(logical(after, scale));
+        ASSERT_FALSE(in.pointerMoved);
+        if (w.take()) in.pointerMoved = true;
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 2050, 2000, &rearm, poll)));
+        ASSERT_FALSE(c.hidden());
+    }
+
+    // The bound is below one logical pixel and no wider: a displacement of ceil(scale) native pixels (one logical
+    // pixel or more) on either axis changes the rounded point from every starting pixel, at every scale factor.
+    const qreal scales[] = { 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0 };
+    for (const qreal f : scales)
+    {
+        const int step = int(f) < f ? int(f) + 1 : int(f);
+        for (int x = -40; x <= 40; ++x)
+        {
+            const QPoint from(x, x + 7);
+            viewer_idle::PointerWatch s;
+            s.seed(logical(from, f));
+            ASSERT_TRUE(s.moved(logical(QPoint(x + step, x + 7), f)));
+            s.seed(logical(from, f));
+            ASSERT_TRUE(s.moved(logical(QPoint(x - step, x + 7), f)));
+            s.seed(logical(from, f));
+            ASSERT_TRUE(s.moved(logical(QPoint(x, x + 7 + step), f)));
+        }
+    }
+    // At scale 1 there is no sub-logical pixel: every one-pixel move is seen.
+    {
+        viewer_idle::PointerWatch s;
+        s.seed(logical(before, 1.0));
+        ASSERT_TRUE(s.moved(logical(after, 1.0)));
     }
 }
 
