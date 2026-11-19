@@ -290,13 +290,15 @@ function Test-GuiSmokeLogProgressStalled {
         # -2 r1: D, the hard deadline in ms since the watch's launch stamp (0 = none given). The probe is never waited on past it (adversary 57a7a5c9 A2),
         # no probe starts once it is reached, a result that lands at or after it is ignored, and no stall verdict is passed at or after it (the whole
         # budget decides then, adversary d872def7 A2). Every reading is the time since the launch, so no entry stopwatch or remaining budget is carried.
+        # -2 r4 (merge_group run 44580541419): D is REACHED once under 1 ms of it is left, floor(D - now) <= 0 -- the rule of Get-GuiSmokeChunkWaitMs and
+        # of the probe wait below, which round D - now DOWN so a wait cut to D ends up to 1 ms before it. An exact `now -ge D` read that end as budget left.
         [ValidateRange(0, 3600000)]
         [int64]$DeadlineMs = 0
     )
 
     $launch = [int64]$Watch.LaunchTimestamp
     # no budget left: no probe is started (a pending one is only looked at, 0 ms)
-    if ($null -eq $Watch.Pending -and ($DeadlineMs -le 0 -or (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch) -lt $DeadlineMs)) {
+    if ($null -eq $Watch.Pending -and ($DeadlineMs -le 0 -or [Math]::Floor([double]$DeadlineMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch)) -gt 0)) {
         $probeRoot = [string]$Watch.LogRoot
         $probeDelayMs = [int]$Watch.ProbeDelayMs
         $probeOpenDelayMs = [int]$Watch.ProbeOpenDelayMs
@@ -371,7 +373,7 @@ function Test-GuiSmokeLogProgressStalled {
             $Watch.Hung = $true
         }
         # a result that lands once the deadline is reached is ignored: the caller's loop is ending on the whole budget, not on this log
-        if ($DeadlineMs -le 0 -or (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch) -lt $DeadlineMs) { $entries = $landed }
+        if ($DeadlineMs -le 0 -or [Math]::Floor([double]$DeadlineMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch)) -gt 0) { $entries = $landed }
     }
     # the poll's one reading of the launch clock: P for whatever this poll credits, and the time the verdict compares with E
     $nowMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch
@@ -438,7 +440,7 @@ function Test-GuiSmokeLogProgressStalled {
     if (-not $Watch.Armed) { return $false }
     # r15 (adversary d872def7 A2): at or past the deadline no stall verdict is passed: the caller's loop is ending on the whole budget, which then decides
     # the leg (timeout, not process_no_progress)
-    if ($DeadlineMs -gt 0 -and $nowMs -ge $DeadlineMs) { return $false }
+    if ($DeadlineMs -gt 0 -and [Math]::Floor([double]$DeadlineMs - $nowMs) -le 0) { return $false }
     # E < 0: no window can run out by L (adversary 81e7f8b2 A2), so no silence verdict: D decides
     if ([double]$Watch.ExpiryMs -lt 0) { return $false }
     return ($nowMs -ge [double]$Watch.ExpiryMs)

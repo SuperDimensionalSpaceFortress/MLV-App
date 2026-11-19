@@ -2044,8 +2044,9 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         if (([int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) - $hostLoadLastSampleAtMs) -lt $HostLoadSampleIntervalMs) {
             if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
                 $noProgressStalled = $true
-                # r15 (adversary d872def7 A2): a stall verdict reached at or past the whole budget is judged against it, as the two waiting branches do
-                if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
+                # r15 (adversary d872def7 A2): a stall verdict reached at or past the whole budget is judged against it, as the two waiting branches do.
+                # -2 r4: "at D" is the module's rule, under 1 ms of the budget left (floor), the same as Get-GuiSmokeChunkWaitMs; the three sites share it
+                if ([Math]::Floor([double]$effectiveProcessTimeoutMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)) -le 0) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
                 break
             }
             continue
@@ -2056,7 +2057,7 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         $hostLoadDuringSamples.Add($newSample)
         if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
             $noProgressStalled = $true
-            if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
+            if ([Math]::Floor([double]$effectiveProcessTimeoutMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)) -le 0) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
             break
         }
     }
@@ -2077,7 +2078,7 @@ else {
         $lastAliveMs = $aliveCheckMs
         if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
             $noProgressStalled = $true
-            if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
+            if ([Math]::Floor([double]$effectiveProcessTimeoutMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)) -le 0) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
             break
         }
     }

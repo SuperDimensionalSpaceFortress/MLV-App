@@ -1265,7 +1265,74 @@ Stop-GuiSmokeLogProgressWatch -Watch $w2
             tail = wait[site:wait.index("break", site)]
             self.assertIn("Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs", tail,
                           "a stall verdict reached at or past the whole budget is judged against it before the boundary types the leg")
-            self.assertIn("-ge $effectiveProcessTimeoutMs", tail)
+            # -2 r4: "at D" is the module's rule (under 1 ms of the budget left), never an exact `-ge`
+            self.assertIn("[Math]::Floor([double]$effectiveProcessTimeoutMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)) -le 0", tail)
+            self.assertFalse("-ge $effectiveProcessTimeoutMs" in tail, "an exact comparison with D reads a time under 1 ms before it as budget left")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TheDeadlineIsReachedWithUnderOneMsOfItLeft(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r4 (merge_group run 44580541419, ubuntu shard 1/4: test_the_probe_returns_no_stall_verdict_once_the_whole_budget_is_spent
+    read a stall verdict). Every wait cut to the deadline D rounds D - now DOWN to whole ms (r3: no wait passes D), so it ends up to 1 ms BEFORE D, and
+    Get-GuiSmokeChunkWaitMs already reads under 1 ms left as D reached. Test-GuiSmokeLogProgressStalled compared its reading after the probe wait with D
+    exactly, so a probe wait cut to D that ended 0.5 ms short of it passed a stall verdict at the deadline. One rule now: D is reached once floor(D - now) <= 0.
+    The module's own Get-GuiSmokeSinceLaunchMs is replaced in the module scope by a scripted clock, so each reading is placed exactly and the verdict does not
+    depend on how precisely the host's wait returns. Class: one deadline with two definitions of reached."""
+
+    def _scripted(self, readings: str, deadline_ms: int) -> dict:
+        return run_ps(r"""
+$m = Get-Module gui-smoke-process-boundary
+$dir = Join-Path $env:GS_TMP 'scriptedclock'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
+# armed on the real clock (P is well under a second after the watch's own launch), so E = P + 50 is long past at every scripted reading below
+for ($i = 0; $i -lt 5 -and (-not $w.Armed -or $null -ne $w.Pending); $i++) {
+    if ($null -ne $w.Pending) { [void]$w.Pending.Finished.WaitOne(30000) }
+    [void](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 3600000)
+}
+if (-not $w.Armed -or $null -ne $w.Pending) { throw 'the arming probe did not finish' }
+# the next probe blocks for the rest of the test: it never answers, as on a stalled share
+$w.ProbeDelayMs = 600000
+$global:ScriptedReadings = [Collections.Generic.Queue[double]]::new()
+foreach ($v in @(%s)) { $global:ScriptedReadings.Enqueue([double]$v) }
+$global:ScriptedLast = [double]0
+& $m {
+    function script:Get-GuiSmokeSinceLaunchMs {
+        param([Nullable[int64]]$LaunchTimestamp = $null)
+        if ($global:ScriptedReadings.Count -gt 0) { $global:ScriptedLast = $global:ScriptedReadings.Dequeue() }
+        return $global:ScriptedLast
+    }
+}
+$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs %d)
+$started = $null -ne $w.Pending
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ stalled = $stalled; started = $started } | ConvertTo-Json -Compress
+""" % (readings, deadline_ms))
+
+    def test_a_probe_wait_cut_to_the_deadline_that_ends_half_a_ms_short_of_it_passes_no_stall_verdict(self) -> None:
+        # the CI interleaving: a probe starts 200 ms before D, its wait floor(D - now) = 200 ms runs out, and the reading after it is D - 0.5
+        out = self._scripted("19800, 19800, 19999.5", 20000)
+        self.assertTrue(out["started"])
+        self.assertFalse(out["stalled"], "the wait ran to the deadline (under 1 ms of it left): the whole budget decides, not a stall verdict")
+
+    def test_no_probe_starts_and_no_verdict_passes_with_under_one_ms_left(self) -> None:
+        out = self._scripted("19999.5", 20000)
+        self.assertFalse(out["started"], "under 1 ms left is the deadline: no probe may start (Get-GuiSmokeChunkWaitMs starts no wait there either)")
+        self.assertFalse(out["stalled"])
+
+    def test_a_quiet_watch_with_a_whole_ms_left_still_reports_the_stall(self) -> None:
+        # the rule is under 1 ms, not a wider margin: a verdict read 1 ms before D is a stall verdict inside the budget
+        out = self._scripted("19800, 19800, 19999", 20000)
+        self.assertTrue(out["stalled"])
+
+    def test_the_chunk_wait_and_the_stall_verdict_agree_on_when_the_deadline_is_reached(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        body = code[code.index("function Test-GuiSmokeLogProgressStalled"):code.index("function Get-GuiSmokeProcessLifetimeMs")]
+        self.assertFalse("-lt $DeadlineMs" in body, "an exact comparison with D reads a wait cut to D (ending under 1 ms before it) as budget left")
+        self.assertFalse("$nowMs -ge $DeadlineMs" in body)
+        self.assertEqual(4, body.count("[Math]::Floor([double]$DeadlineMs - "),
+                         "the probe start, the probe wait, the landed result and the verdict all take the chunk wait's rule")
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
