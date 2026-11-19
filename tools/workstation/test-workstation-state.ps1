@@ -66,6 +66,8 @@ $fnWs = New-Scratch 'fn-ws'
 $fnLoaded = $true
 try { . $setup -Phase Verify -StateRoot $fnState -Workspace $fnWs -UltraMagnusHeartbeatPath $ultra -BachelorHeartbeatPath $bach }
 catch { $fnLoaded = $false; Assert-That $false 'setup script loads by dot-sourcing (functions only, no phase runs)' $_.Exception.Message }
+# SSH-PUSHURL-1: no test ever runs the real 'ssh -T git@github.com' (the network): the Clone-phase tests below get a probe that does not authenticate (a MANUAL line, no config change)
+if ($fnLoaded) { $script:SshProbeOverride = { @{ Authenticated = $false; Detail = 'test seam: no network' } } }
 if ($fnLoaded) {
     $r = @(Test-ShareHeartbeatPreflight -UltraMagnusPath $ultra -BachelorPath $bach)
     Assert-That ($r.Count -eq 0) 'preflight fn: two existing scratch files pass' "failed=$($r -join ',')"
@@ -189,6 +191,8 @@ $okPaths = @('-UltraMagnusHeartbeatPath', $ultra, '-BachelorHeartbeatPath', $bac
 $wsA = New-MeterRepo 'ws-meter-a' $okBody $okBody
 $mA = Invoke-Setup (New-Scratch 'home-a') (@('-Phase', 'Verify', '-StateRoot', (New-Scratch 'state-a'), '-Workspace', $wsA, '-SourceHost', 'NOT-THIS-HOST') + $okPaths)
 Assert-That ($mA.Exit -eq 0 -and (Test-Path -LiteralPath (Join-Path $wsA 'MLV-App\.claude-state\disk-hygiene\installed.marker')) -and (Test-Path -LiteralPath (Join-Path $wsA 'MLV-App\.claude-state\hub-autopilot\installed.marker'))) 'meters (c): Verify ran -Install of BOTH meters' "exit=$($mA.Exit)`n$($mA.Out)"
+
+Assert-That ($mA.Out.Contains('--- fork push url') -and $mA.Out.Contains('SSH_PUSHURL skipped: no clone')) 'SSH-PUSHURL-1: Verify reports the fork push url section and skips (no probe, no network) when there is no clone' $mA.Out
 
 $wsB = New-MeterRepo 'ws-meter-b' $sbpBody $okBody
 $mB = Invoke-Setup (New-Scratch 'home-b') (@('-Phase', 'Verify', '-StateRoot', (New-Scratch 'state-b'), '-Workspace', $wsB, '-SourceHost', 'NOT-THIS-HOST') + $okPaths)
@@ -3376,6 +3380,160 @@ if ($fnLoaded -and (Test-Has 'Invoke-PhaseClone' 'DENY-BY-DEFAULT-1 S3')) {
             Assert-That (@(@($ddL.Tok) | Where-Object { $ddLlog.Contains($_) -or $ddLout.Contains($_) }).Count -eq 0) "DENY-BY-DEFAULT-1 r8 lease sink ($($ddL.N)): neither the setup log nor the console holds the lease url's token" "log=$ddLlog`nout=$ddLout"
         }
     }
+}
+
+# ================================================================ SETUP-MLVWORKSTATION-SSH-PUSHURL-1: remote.fork.pushurl is the SSH form when ssh -T git@github.com authenticates
+if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Test-Has 'ConvertTo-GitHubSshUrl' 'SSH-PUSHURL-1') -and (Test-Has 'Invoke-SshPushUrl' 'SSH-PUSHURL-1') -and (Test-Has 'Invoke-GitHubSshProbe' 'SSH-PUSHURL-1') -and (Test-Has 'Get-GitHubSshProbeVerdict' 'SSH-PUSHURL-1')) {
+    $spU = 'https://github.com/SuperDimensionalSpaceFortress/MLV-App.git'
+    $spS = 'git@github.com:SuperDimensionalSpaceFortress/MLV-App.git'
+    # --- the SSH-form derivation (pure)
+    Assert-That ((ConvertTo-GitHubSshUrl $spU) -ceq $spS) 'SSH-PUSHURL-1 derive: https .git url -> git@github.com:owner/repo.git' (ConvertTo-GitHubSshUrl $spU)
+    Assert-That ((ConvertTo-GitHubSshUrl 'https://github.com/SuperDimensionalSpaceFortress/MLV-App') -ceq $spS) 'SSH-PUSHURL-1 derive: no .git suffix gains one'
+    Assert-That ((ConvertTo-GitHubSshUrl 'https://github.com/SuperDimensionalSpaceFortress/MLV-App/') -ceq $spS) 'SSH-PUSHURL-1 derive: a trailing slash is dropped'
+    Assert-That ((ConvertTo-GitHubSshUrl $spS) -ceq $spS) 'SSH-PUSHURL-1 derive: the ssh form maps to itself'
+    Assert-That ((ConvertTo-GitHubSshUrl 'git@github.com:SuperDimensionalSpaceFortress/MLV-App') -ceq $spS) 'SSH-PUSHURL-1 derive: an ssh form without .git gains it'
+    foreach ($spBad in @('https://x-token:abc@github.com/o/r.git', 'https://evil.example/o/r.git', 'https://github.com.evil.example/o/r.git', 'https://github.com:8443/o/r.git', 'https://github.com/o/r.git?x=1', 'https://github.com/o/r.git#x',
+            "https://github.com/o/r.git`n", 'https://github.com/o/r/extra', 'http://github.com/o/r.git', 'ssh://git@github.com/o/r.git', 'https://github.com/o/..', 'https://github.com/./r', 'git@github.com:o/r.git/', 'GIT@github.com:o/r.git', 'C:/repos/x', '')) {
+        Assert-That ((ConvertTo-GitHubSshUrl $spBad) -ceq '') "SSH-PUSHURL-1 derive: '$($spBad -replace "`n", '\n')' is not a plain github url (empty, never guessed)" (ConvertTo-GitHubSshUrl $spBad)
+    }
+    # --- the probe verdict (pure)
+    $v = Get-GitHubSshProbeVerdict 1 "Hi someone! You've successfully authenticated, but GitHub does not provide shell access."
+    Assert-That ($v.Authenticated -eq $true) 'SSH-PUSHURL-1 verdict: exit 1 + "successfully authenticated" = authenticated'
+    $v = Get-GitHubSshProbeVerdict 255 'git@github.com: Permission denied (publickey).'
+    Assert-That ($v.Authenticated -eq $false -and $v.Detail -match 'Permission denied') 'SSH-PUSHURL-1 verdict: exit 255 is not authenticated and keeps the reason' $v.Detail
+    Assert-That ((Get-GitHubSshProbeVerdict 255 "successfully authenticated").Authenticated -eq $false) 'SSH-PUSHURL-1 verdict: the text without exit 1 is not authenticated'
+    Assert-That ((Get-GitHubSshProbeVerdict 1 '').Authenticated -eq $false) 'SSH-PUSHURL-1 verdict: exit 1 without the text is not authenticated'
+
+    # --- the decision (pure). $spCalls counts probe invocations: a refused remote must never reach the network
+    $script:spCalls = 0
+    $spAuth = { $script:spCalls++; @{ Authenticated = $true; Detail = 'authenticated' } }
+    $spNo = { $script:spCalls++; @{ Authenticated = $false; Detail = 'ssh exited 255 (Permission denied (publickey).)' } }
+    function Get-SpDecision([string[]]$Urls, [string[]]$Push, [scriptblock]$Probe, [string[]]$Rules = @(), [string[]]$Names = @()) {
+        $script:spCalls = 0
+        return (Get-SshPushUrlDecision -Urls $Urls -PushUrls $Push -ExpectedUrl $spU -Rules $Rules -Names $Names -Probe $Probe)
+    }
+    $d = Get-SpDecision @($spU) @() $spAuth
+    Assert-That ($d.Decision -ceq 'READY' -and $d.PushUrl -ceq $spS) 'SSH-PUSHURL-1 decide: https fetch url, no pushurl, ssh authenticates -> READY with the ssh form' "$($d.Decision) $($d.PushUrl)"
+    $d = Get-SpDecision @($spU) @($spU) $spAuth
+    Assert-That ($d.Decision -ceq 'READY') 'SSH-PUSHURL-1 decide: a pushurl equal to the https url is replaced (READY)' $d.Decision
+    $d = Get-SpDecision @($spU) @($spS) $spAuth
+    Assert-That ($d.Decision -ceq 'NOOP') 'SSH-PUSHURL-1 decide: an existing equal pushurl is a no-op' $d.Decision
+    $d = Get-SpDecision @($spS) @() $spAuth
+    Assert-That ($d.Decision -ceq 'NOOP') 'SSH-PUSHURL-1 decide: a fetch url that is already the ssh form pushes over ssh (no-op)' $d.Decision
+    foreach ($spF in @(@('https://github.com/SuperDimensionalSpaceFortress/MLV-App'), @('git@github.com:superdimensionalspacefortress/mlv-app.git'), @($spS, $spU), @('ssh://git@github.com/SuperDimensionalSpaceFortress/MLV-App.git'), @('https://github.com/ilia3101/MLV-App.git'))) {
+        $d = Get-SpDecision @($spU) $spF $spAuth
+        Assert-That ($d.Decision -ceq 'FOREIGN') "SSH-PUSHURL-1 decide: a pushurl that is neither the https url nor the ssh form ($($spF -join ' + ')) is FOREIGN, never overwritten" $d.Decision
+    }
+    $d = Get-SpDecision @($spU) @() $spNo
+    Assert-That ($d.Decision -ceq 'UNREGISTERED' -and $d.Reason -match 'Permission denied') 'SSH-PUSHURL-1 decide: ssh does not authenticate -> UNREGISTERED with the reason' "$($d.Decision) $($d.Reason)"
+    $d = Get-SpDecision @($spU) @($spS) $spNo
+    Assert-That ($d.Decision -ceq 'UNREGISTERED') 'SSH-PUSHURL-1 decide: an ssh pushurl whose key does not authenticate is still reported UNREGISTERED' $d.Decision
+    $d = Get-SpDecision @($spU) @() $spAuth @('https://github.com/')
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 decide: an insteadOf rule that rewrites the https url -> REFUSED, no probe' "$($d.Decision) calls=$script:spCalls"
+    $d = Get-SpDecision @($spU) @() $spAuth @('git@github.com:')
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 decide: an insteadOf rule that rewrites the ssh form -> REFUSED, no probe' "$($d.Decision) calls=$script:spCalls"
+    $d = Get-SpDecision @($spU) @() $spAuth @() @($spU)
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 decide: a url that is also a remote name -> REFUSED, no probe' $d.Decision
+    $d = Get-SpDecision @('https://github.com/ilia3101/MLV-App.git') @() $spAuth
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 decide: a fork remote that names another repository -> REFUSED, no probe' $d.Decision
+    $d = Get-SpDecision @($spU, 'https://github.com/example/other.git') @() $spAuth
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 decide: two fork urls -> REFUSED, no probe' $d.Decision
+    $d = Get-SpDecision @() @() $spAuth
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 decide: no fork url -> REFUSED, no probe' $d.Decision
+    $d = Get-SpDecision @("$spU`n") @() $spAuth
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 decide: a control character in the fork url -> REFUSED, no probe' $d.Decision
+    $d = Get-SshPushUrlDecision -Urls @('C:/repos/x') -PushUrls @() -ExpectedUrl 'C:/repos/x' -Rules @() -Names @() -Probe $spAuth
+    Assert-That ($d.Decision -ceq 'SKIPPED') 'SSH-PUSHURL-1 decide: a non-github fork url is SKIPPED' $d.Decision
+
+    # --- Setup and Verify against a real scratch repository (the probe is a stub; git is real)
+    function New-SpRepo([string]$Name, [string]$Push = '', [string]$InsteadOf = '') {
+        $ws = New-Scratch "sp-$Name"
+        $rp = Join-Path $ws 'MLV-App'; [void][IO.Directory]::CreateDirectory($rp); & git -C $rp init -q 2>$null
+        & git -C $rp remote add fork $spU; & git -C $rp remote add origin $UpstreamUrl
+        if ($Push) { & git -C $rp config --add remote.fork.pushurl $Push }
+        if ($InsteadOf) { & git -C $rp config "url.$InsteadOf.insteadOf" 'https://github.com/' }
+        return $rp
+    }
+    function Invoke-SpRun([string]$RepoPath, [scriptblock]$Probe, [switch]$VerifyOnly) {
+        $sv = @{ Repo = $script:Repo; Log = $script:LogFile }
+        $script:Repo = $RepoPath; $Repo = $RepoPath
+        $script:LogFile = Join-Path (Split-Path -Parent $RepoPath) 'sp.log'
+        $script:Failures.Clear(); $script:Manual.Clear()
+        $thrown = ''
+        try { if ($VerifyOnly) { Invoke-SshPushUrl -VerifyOnly -Probe $Probe } else { Invoke-SshPushUrl -Probe $Probe } } catch { $thrown = $_.Exception.Message }
+        $log = $(if (Test-Path -LiteralPath $script:LogFile) { [IO.File]::ReadAllText($script:LogFile) } else { '' })
+        $res = @{ Log = $log; Failures = @($script:Failures); Manual = @($script:Manual); Thrown = $thrown }
+        $script:Failures.Clear(); $script:Manual.Clear()
+        $script:Repo = $sv.Repo; $Repo = $sv.Repo; $script:LogFile = $sv.Log
+        return $res
+    }
+    function Get-SpCfg([string]$RepoPath, [string]$Key) { return @(& git -C $RepoPath config --local --get-all $Key 2>$null) }
+
+    $spR1 = New-SpRepo 'ready'
+    $r = Invoke-SpRun $spR1 $spAuth
+    Assert-That ((Get-SpCfg $spR1 'remote.fork.pushurl') -ceq $spS -and @(Get-SpCfg $spR1 'remote.fork.pushurl').Count -eq 1) 'SSH-PUSHURL-1 setup: remote.fork.pushurl is set to the ssh form' ((Get-SpCfg $spR1 'remote.fork.pushurl') -join ',')
+    Assert-That ((Get-SpCfg $spR1 'remote.fork.url') -ceq $spU) 'SSH-PUSHURL-1 setup: the https fetch url is untouched' ((Get-SpCfg $spR1 'remote.fork.url') -join ',')
+    Assert-That (@(Get-SpCfg $spR1 'remote.origin.pushurl').Count -eq 0 -and (Get-SpCfg $spR1 'remote.origin.url') -ceq $UpstreamUrl) 'SSH-PUSHURL-1 setup: origin (the upstream, never pushed to) is untouched'
+    Assert-That (@(Get-SpCfg $spR1 'credential.helper').Count -eq 0) 'SSH-PUSHURL-1 setup: credential.helper is not changed'
+    Assert-That ($r.Log -match [regex]::Escape("SSH_PUSH_READY remote=fork pushurl=$spS") -and $r.Failures.Count -eq 0 -and $r.Manual.Count -eq 0) 'SSH-PUSHURL-1 setup: prints SSH_PUSH_READY remote=fork pushurl=<url>, no failure, no MANUAL line' "$($r.Log)`nfail=$($r.Failures -join ',')"
+    $r = Invoke-SpRun $spR1 $spAuth
+    Assert-That (@(Get-SpCfg $spR1 'remote.fork.pushurl').Count -eq 1 -and (Get-SpCfg $spR1 'remote.fork.pushurl') -ceq $spS -and $r.Failures.Count -eq 0) 'SSH-PUSHURL-1 setup: a second run is idempotent (still exactly one pushurl, the ssh form)'
+    $spR1b = New-SpRepo 'ready-httpspush' $spU
+    $r = Invoke-SpRun $spR1b $spAuth
+    Assert-That ((Get-SpCfg $spR1b 'remote.fork.pushurl') -ceq $spS -and @(Get-SpCfg $spR1b 'remote.fork.pushurl').Count -eq 1) 'SSH-PUSHURL-1 setup: a pushurl equal to the https url is replaced by the ssh form' ((Get-SpCfg $spR1b 'remote.fork.pushurl') -join ',')
+
+    $spR2 = New-SpRepo 'unregistered'
+    $r = Invoke-SpRun $spR2 $spNo
+    Assert-That (@(Get-SpCfg $spR2 'remote.fork.pushurl').Count -eq 0 -and $r.Failures.Count -eq 0) 'SSH-PUSHURL-1 setup: an unregistered key changes nothing and is not a failure' ($r.Failures -join ',')
+    Assert-That (@($r.Manual | Where-Object { $_ -match '^SSH_KEY_UNREGISTERED remote=fork' }).Count -eq 1 -and $r.Log -match '\[MANUAL\] SSH_KEY_UNREGISTERED') 'SSH-PUSHURL-1 setup: an unregistered key is one owner-only MANUAL line SSH_KEY_UNREGISTERED' ($r.Manual -join "`n")
+    Assert-That ($r.Log -notmatch 'SSH_PUSH_READY') 'SSH-PUSHURL-1 setup: no SSH_PUSH_READY line when the key does not authenticate'
+
+    $spFp = 'https://github.com/SuperDimensionalSpaceFortress/MLV-App'
+    $spR3 = New-SpRepo 'foreign' $spFp
+    $r = Invoke-SpRun $spR3 $spAuth
+    Assert-That ((Get-SpCfg $spR3 'remote.fork.pushurl') -ceq $spFp) 'SSH-PUSHURL-1 setup: a foreign pushurl is left as it is' ((Get-SpCfg $spR3 'remote.fork.pushurl') -join ',')
+    Assert-That (@($r.Manual | Where-Object { $_ -match '^PUSHURL_FOREIGN remote=fork' }).Count -eq 1 -and $r.Failures.Count -eq 0) 'SSH-PUSHURL-1 setup: a foreign pushurl is reported PUSHURL_FOREIGN (MANUAL, not a failure)' ($r.Manual -join "`n")
+
+    $script:spCalls = 0
+    $spR4 = New-SpRepo 'rule' '' 'git@github.com:'
+    $r = Invoke-SpRun $spR4 $spAuth
+    Assert-That (@(Get-SpCfg $spR4 'remote.fork.pushurl').Count -eq 0 -and $script:spCalls -eq 0 -and @($r.Manual | Where-Object { $_ -match '^PUSHURL_REFUSED remote=fork' }).Count -eq 1) 'SSH-PUSHURL-1 setup: a url.<base>.insteadOf rule over the fork url -> PUSHURL_REFUSED, nothing changed, no probe' "calls=$script:spCalls $($r.Manual -join "`n")"
+
+    $spR5 = New-SpRepo 'swapped'
+    & git -C $spR5 remote set-url fork 'https://github.com/ilia3101/MLV-App.git'
+    $script:spCalls = 0
+    $r = Invoke-SpRun $spR5 $spAuth
+    Assert-That (@(Get-SpCfg $spR5 'remote.fork.pushurl').Count -eq 0 -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 setup: a fork remote that names another repository is never given a pushurl' ((Get-SpCfg $spR5 'remote.fork.pushurl') -join ',')
+
+    # --- Verify (read-only): READY and FOREIGN are typed failures, UNREGISTERED is a MANUAL line, NOOP passes; the config is never written
+    $spV1 = New-SpRepo 'v-missing'
+    $r = Invoke-SpRun $spV1 $spAuth -VerifyOnly
+    Assert-That ($r.Failures -contains 'SSH_PUSHURL_MISSING remote=fork' -and $r.Log -match 'SSH_PUSHURL_MISSING remote=fork expected=' -and @(Get-SpCfg $spV1 'remote.fork.pushurl').Count -eq 0) 'SSH-PUSHURL-1 verify: ssh authenticates but the pushurl is missing -> typed failure SSH_PUSHURL_MISSING, config not written' ($r.Failures -join ',')
+    $r = Invoke-SpRun $spV1 $spNo -VerifyOnly
+    Assert-That ($r.Failures.Count -eq 0 -and @($r.Manual | Where-Object { $_ -match '^SSH_KEY_UNREGISTERED' }).Count -eq 1) 'SSH-PUSHURL-1 verify: a probe that does not authenticate is a MANUAL line, not a failure' ($r.Failures -join ',')
+    $r = Invoke-SpRun $spR1 $spAuth -VerifyOnly
+    Assert-That ($r.Failures.Count -eq 0 -and $r.Log -match [regex]::Escape("SSH_PUSH_READY remote=fork pushurl=$spS")) 'SSH-PUSHURL-1 verify: the ssh pushurl passes and prints SSH_PUSH_READY' ($r.Failures -join ',')
+    $r = Invoke-SpRun $spR3 $spAuth -VerifyOnly
+    Assert-That ($r.Failures -contains 'PUSHURL_FOREIGN remote=fork') 'SSH-PUSHURL-1 verify: a foreign pushurl while ssh authenticates is a typed failure PUSHURL_FOREIGN' ($r.Failures -join ',')
+
+    # --- the real probe runner against a fake ssh.cmd: arguments are non-interactive, the verdict follows its exit code, and a hang is killed at the time bound
+    $spDir = New-Scratch 'sp-fake-ssh'
+    $spArgs = Join-Path $spDir 'args.txt'
+    [IO.File]::WriteAllText((Join-Path $spDir 'ssh-ok.cmd'), "@echo off`r`necho %*> `"%~dp0args.txt`"`r`necho Hi tester! You've successfully authenticated, but GitHub does not provide shell access. 1>&2`r`nexit /b 1`r`n")
+    [IO.File]::WriteAllText((Join-Path $spDir 'ssh-denied.cmd'), "@echo off`r`necho git@github.com: Permission denied (publickey). 1>&2`r`nexit /b 255`r`n")
+    [IO.File]::WriteAllText((Join-Path $spDir 'ssh-hang.cmd'), "@echo off`r`nping -n 60 127.0.0.1 >nul`r`nexit /b 1`r`n")
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20
+    $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
+    Assert-That ($pr.Authenticated -eq $true) 'SSH-PUSHURL-1 probe: a client that prints "successfully authenticated" and exits 1 is authenticated' $pr.Detail
+    Assert-That ($argText -match '-T' -and $argText -match 'BatchMode=yes' -and $argText -match 'ConnectTimeout=' -and $argText -match 'StrictHostKeyChecking=yes' -and $argText -match 'git@github\.com') 'SSH-PUSHURL-1 probe: ssh -T runs with BatchMode=yes, ConnectTimeout and StrictHostKeyChecking=yes (never interactive, never writes known_hosts)' $argText
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-denied.cmd') -TimeoutSec 20
+    Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'Permission denied') 'SSH-PUSHURL-1 probe: a refused key is not authenticated' $pr.Detail
+    $swSp = [Diagnostics.Stopwatch]::StartNew()
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-hang.cmd') -TimeoutSec 2
+    $swSp.Stop()
+    Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'did not answer' -and $swSp.Elapsed.TotalSeconds -lt 30) 'SSH-PUSHURL-1 probe: a client that hangs is killed at the time bound (not authenticated)' "$($pr.Detail) after $([int]$swSp.Elapsed.TotalSeconds) s"
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'absent-ssh.exe')
+    Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'could not be started') 'SSH-PUSHURL-1 probe: a missing client is not authenticated and says why' $pr.Detail
 }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))

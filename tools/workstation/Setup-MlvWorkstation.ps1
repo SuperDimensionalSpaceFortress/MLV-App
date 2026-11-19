@@ -984,6 +984,8 @@ function Invoke-PhaseClone {
                 throw "CLONE_TRACKING_FAILED $Repo 'git branch --set-upstream-to=fork/master master' exited $trackCode (the local master does not track fork/master; create or check out master, then re-run -Phase Clone)"
             }
         }
+        # SETUP-MLVWORKSTATION-SSH-PUSHURL-1: push over SSH when this host's GitHub key authenticates; the https fetch url is untouched (see Invoke-SshPushUrl)
+        Invoke-Step 'fork push url: SSH when ssh -T git@github.com authenticates (remote.fork.pushurl; fetch stays https)' { Invoke-SshPushUrl }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $DoctrineRepo '.git'))) {
         Invoke-Step "Clone doctrine bus into $DoctrineRepo" {
@@ -1116,7 +1118,124 @@ function Test-GitRemoteUrlSame {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Phase: Qt (the repo pins Qt 6.10.2 win64_mingw + MinGW 13.1 via hash-locked aqtinstall)
+# Fork push url over SSH (SETUP-MLVWORKSTATION-SSH-PUSHURL-1). The global credential.helper is 'manager' (Invoke-PhasePackages), so every https push rides an OAuth token
+# that an account event can kill. When 'ssh -T git@github.com' authenticates, remote.fork.pushurl is set to the SSH form of the fork url and the https FETCH url stays as it
+# is. It lives in the repo's own config (not ~/.gitconfig), so a Codex lane with a separate HOME pushes the same way. This code never creates, copies, prints or registers a
+# key and never touches ~/.ssh (the probe is BatchMode with StrictHostKeyChecking=yes, so not even known_hosts is written); an unregistered key is an owner-only MANUAL line.
+# credential.helper is NOT changed here. Only 'fork' is handled: 'origin' is the upstream ilia3101 repository, which is fetched and never pushed to.
+# ---------------------------------------------------------------------------------------------
+# '' when the url is not a plain github.com https or 'git@' ssh url of owner/repo; otherwise the SSH form 'git@github.com:owner/repo.git'. The owner and repo alphabet is
+# [A-Za-z0-9._-] (\z, not $, so a trailing LF is never matched); an https url with userinfo, a port, a query or another host gives ''.
+function ConvertTo-GitHubSshUrl {
+    param([string]$Url)
+    $m = [regex]::Match("$Url", '^(?:https://github\.com/|git@github\.com:)([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?\z', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $m.Success) { return '' }
+    if ($m.Value.StartsWith('git@', [StringComparison]::OrdinalIgnoreCase) -and $m.Value -cnotmatch '^git@github\.com:[^/]+/[^/]+$') { return '' }   # the ssh form is exact: no trailing slash, lower-case user and host
+    $owner = $m.Groups[1].Value; $repoName = $m.Groups[2].Value
+    if ($owner -match '^\.+$' -or $repoName -match '^\.+$') { return '' }
+    return "git@github.com:$owner/$repoName.git"
+}
+
+# What 'ssh -T git@github.com' said: authenticated only on exit 1 with GitHub's "successfully authenticated" text (exit 255 is a refused key, a host key or a network error).
+function Get-GitHubSshProbeVerdict {
+    param([int]$ExitCode, [string]$Output)
+    if ($ExitCode -eq 1 -and "$Output" -match '(?i)successfully authenticated') { return @{ Authenticated = $true; Detail = 'authenticated' } }
+    $first = @("$Output" -split "[`r`n]+" | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $text = $(if ($first.Count) { "$($first[0])".Trim() } else { 'no output' })
+    if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
+    return @{ Authenticated = $false; Detail = "ssh exited $ExitCode ($text)" }
+}
+
+# The probe: ssh -T git@github.com, never interactive (BatchMode, no password prompt, no host-key prompt and no known_hosts write), bounded by ConnectTimeout and a hard kill.
+function Invoke-GitHubSshProbe {
+    param([string]$SshExe = '', [int]$TimeoutSec = 20)
+    if (-not $SshExe) { $c = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $SshExe = $c.Source } }
+    if (-not $SshExe) { return @{ Authenticated = $false; Detail = 'the OpenSSH client (ssh) is not installed' } }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
+    foreach ($a in @('-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=yes', 'git@github.com')) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    $proc = $null
+    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
+    try {
+        $proc.StandardInput.Close()
+        $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            try { $proc.Kill($true) } catch { }
+            return @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
+        }
+        $proc.WaitForExit()
+        return (Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)"))
+    } finally { $proc.Dispose() }
+}
+
+# PURE decision (no process, no config read): what to do with remote <fork>'s push url. -Urls = every remote.fork.url, -PushUrls = every remote.fork.pushurl (empty when unset),
+# -Rules / -Names = Get-RemoteUrlContext. -Probe is invoked only after every url check passed (a refused remote never reaches the network). Returns @{ Decision; PushUrl; Reason }:
+#   REFUSED       not a single url naming the fork, or a rewrite rule / remote name makes a url something Git would not connect to: change nothing
+#   SKIPPED       the fork url is not a github.com https or ssh url: nothing to do
+#   UNREGISTERED  ssh -T did not authenticate: SSH_KEY_UNREGISTERED (owner-only); change nothing
+#   NOOP          pushes already go to exactly the SSH form
+#   READY         authenticated and the push url is unset (or equals the https fetch url): set pushurl to PushUrl
+#   FOREIGN       authenticated but a push url is neither the fetch url nor the SSH form: left as it is (fail closed)
+function Get-SshPushUrlDecision {
+    param([string[]]$Urls, [string[]]$PushUrls, [string]$ExpectedUrl, [string[]]$Rules, [string[]]$Names, [scriptblock]$Probe)
+    $Urls = @($Urls); $PushUrls = @($PushUrls)
+    if ($Urls.Count -ne 1) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = "remote.fork.url holds $($Urls.Count) value(s), expected exactly one" } }
+    $fetch = "$($Urls[0])"
+    $why = Get-RemoteUrlRefusal -Urls @($fetch) -Rules $Rules -Names $Names
+    if ($why) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = $why } }
+    if (-not (Test-GitRemoteUrlSame $fetch $ExpectedUrl)) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = "remote.fork.url $(Format-RemoteUrlForLog $fetch) does not name $ExpectedUrl" } }
+    $ssh = ConvertTo-GitHubSshUrl $fetch
+    if (-not $ssh) { return @{ Decision = 'SKIPPED'; PushUrl = ''; Reason = "remote.fork.url $(Format-RemoteUrlForLog $fetch) is not a plain github.com https or git@ url" } }
+    $why = Get-RemoteUrlRefusal -Urls @($ssh) -Rules $Rules -Names $Names
+    if ($why) { return @{ Decision = 'REFUSED'; PushUrl = $ssh; Reason = $why } }
+    $p = & $Probe
+    if (-not $p.Authenticated) { return @{ Decision = 'UNREGISTERED'; PushUrl = $ssh; Reason = "$($p.Detail)" } }
+    $effective = @($(if ($PushUrls.Count) { $PushUrls } else { $Urls }))   # @(): a one-element array out of $( ) is a scalar string, whose [0] is its first character
+    if ($effective.Count -eq 1 -and "$($effective[0])" -ceq $ssh) { return @{ Decision = 'NOOP'; PushUrl = $ssh; Reason = 'pushes already go to the SSH form' } }
+    if ($PushUrls.Count -eq 0 -or ($PushUrls.Count -eq 1 -and "$($PushUrls[0])" -ceq $fetch)) { return @{ Decision = 'READY'; PushUrl = $ssh; Reason = 'ssh authenticates' } }
+    return @{ Decision = 'FOREIGN'; PushUrl = $ssh; Reason = "remote.fork.pushurl is $((@($PushUrls | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', '), neither the fetch url nor $ssh" }
+}
+
+# Test seam: a scriptblock that returns @{ Authenticated; Detail } instead of running ssh (the tests never touch the network).
+$script:SshProbeOverride = $null
+
+# Applies (or, with -VerifyOnly, only reports) the decision for the clone at $Repo. Setup: sets remote.fork.pushurl on READY. Verify: a READY or FOREIGN outcome is a typed
+# failure (the probe authenticates, so the push url must already be the SSH form); a probe that does not authenticate is a MANUAL line, never a failure.
+function Invoke-SshPushUrl {
+    param([switch]$VerifyOnly, [scriptblock]$Probe = $null)
+    if (-not $Probe) { $Probe = $(if ($script:SshProbeOverride) { $script:SshProbeOverride } else { { Invoke-GitHubSshProbe } }) }
+    if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) { Write-Log "SSH_PUSHURL skipped: no clone at $Repo yet"; return }
+    $urls = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url')
+    if ($urls.Count -eq 0) { Write-Log "SSH_PUSHURL skipped: $Repo has no 'fork' remote"; return }
+    $push = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
+    $ctx = Get-RemoteUrlContext -RepoDir $Repo
+    $d = Get-SshPushUrlDecision -Urls $urls -PushUrls $push -ExpectedUrl $ForkUrl -Rules $ctx.Rules -Names $ctx.Names -Probe $Probe
+    $ssh = $d.PushUrl
+    switch ($d.Decision) {
+        'NOOP' { Write-Log "SSH_PUSH_READY remote=fork pushurl=$ssh" 'OK' }
+        'READY' {
+            if ($VerifyOnly) {
+                Write-Log "SSH_PUSHURL_MISSING remote=fork expected=$ssh (ssh authenticates but remote.fork.pushurl is not set to it: run -Phase Clone)" 'ERROR'
+                $script:Failures.Add('SSH_PUSHURL_MISSING remote=fork')
+            } else {
+                [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh))
+                $back = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
+                if ($back.Count -ne 1 -or "$($back[0])" -cne $ssh) { $script:Failures.Add('SSH_PUSHURL_NOT_APPLIED remote=fork'); throw "SSH_PUSHURL_NOT_APPLIED remote.fork.pushurl reads back as '$($back -join ' | ')', expected $ssh" }
+                Write-Log "SSH_PUSH_READY remote=fork pushurl=$ssh" 'OK'
+            }
+        }
+        'UNREGISTERED' { Write-Log "SSH_KEY_UNREGISTERED remote=fork ($($d.Reason)): owner-only. Register this host's GitHub key (owner-only checklist step 2, gh ssh-key add) and trust github.com once with ssh; no key was created, copied or registered, and remote.fork.pushurl was not changed" 'MANUAL' }
+        'FOREIGN' {
+            Write-Log "PUSHURL_FOREIGN remote=fork $($d.Reason): left as it is (never overwritten)" 'MANUAL'
+            if ($VerifyOnly) { $script:Failures.Add('PUSHURL_FOREIGN remote=fork') }
+        }
+        'REFUSED' { Write-Log "PUSHURL_REFUSED remote=fork $($d.Reason): remote.fork.pushurl was not changed" 'MANUAL' }
+        default { Write-Log "SSH_PUSHURL skipped: $($d.Reason)" }
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Phase: Qt(the repo pins Qt 6.10.2 win64_mingw + MinGW 13.1 via hash-locked aqtinstall)
 # ---------------------------------------------------------------------------------------------
 function Invoke-PhaseQt {
     $qmake = Join-Path $QtRoot "$QtVersion\mingw_64\bin\qmake.exe"
@@ -3324,6 +3443,11 @@ function Invoke-PhaseVerify {
     Write-Log "PAUSED kill switch: $(Test-Path (Join-Path $StateRoot 'PAUSED'))"
     [void](Show-HubLease)
     if (Get-Command gh -ErrorAction SilentlyContinue) { Invoke-GitTraceScrubbed { & gh auth status *> $null }; Write-Log "gh auth: $(if ($LASTEXITCODE -eq 0) { 'signed in' } else { 'NOT signed in' })" }
+    Write-Log '--- fork push url (SSH when the GitHub key authenticates; read-only here)'
+    if (Test-Path -LiteralPath (Join-Path $Repo '.git')) {
+        try { Invoke-SshPushUrl -VerifyOnly }
+        catch { Write-Log "SSH_PUSHURL_CHECK_FAILED $($_.Exception.Message)" 'ERROR'; $script:Failures.Add('SSH_PUSHURL_CHECK_FAILED remote=fork') }
+    } else { Write-Log "SSH_PUSHURL skipped: no clone at $Repo yet" }
     Write-Log '--- venue shares (fail closed: README step 6b)'
     foreach ($bad in @(Test-ShareHeartbeatPreflight -UltraMagnusPath $UltraMagnusHeartbeatPath -BachelorPath $BachelorHeartbeatPath)) { $script:Failures.Add("SHARE_PREFLIGHT_FAILED $bad") }
     Write-Log '--- meter installs (disk-auto-reclaim pin, pwsh auto-repin)'
