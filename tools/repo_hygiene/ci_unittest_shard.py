@@ -626,8 +626,8 @@ class BudgetWatch:
     def stop(self) -> BaseException | None:
         """Tell the thread to stop and wait for it; the interrupt met while waiting (if any), never raised here:
         the caller finishes its cleanup first and then lets it out, so a cancellation is not turned into a pass."""
-        self._stopped.set()
         try:
+            self._stopped.set()  # inside the try: setting the event is a call an interrupt can land in too
             if self._thread.is_alive():
                 self._thread.join()
         except BaseException as error:  # noqa: BLE001 - a daemon already told to stop; the cleanup after it must still run
@@ -997,6 +997,21 @@ def emit_error(problem: str) -> None:
     emit_text(f"ERROR: {problem}\n", sys.stderr)
 
 
+def report_problems(problems: Sequence[str]) -> BaseException | None:
+    """``emit_error`` for EVERY problem; the first exception met, if any, is returned and never raised.
+
+    ``emit_text`` lets a ``KeyboardInterrupt`` through, and one landing in the first line must not cost the
+    others (the kept-log paths are the evidence): the caller raises what comes back once all are said."""
+    first: BaseException | None = None
+    for problem in problems:
+        try:
+            emit_error(problem)
+        except BaseException as error:  # noqa: BLE001 - the remaining problems are still said
+            if first is None:  # never ``first or error``: truth-testing an exception can itself raise
+                first = error
+    return first
+
+
 WORKER_WATCH_SLICE_SECONDS = 0.2
 
 
@@ -1349,8 +1364,8 @@ class DeadlineKiller:
     def stop(self) -> BaseException | None:
         """Tell the thread to stop and wait for it; the interrupt met while waiting (if any), never raised here:
         the caller finishes its cleanup first and then lets it out, so a cancellation is not turned into a pass."""
-        self._stopped.set()
         try:
+            self._stopped.set()  # inside the try: setting the event is a call an interrupt can land in too
             if self._thread.is_alive():
                 self._thread.join()
         except BaseException as error:  # noqa: BLE001 - a daemon already told to stop; the cleanup after it must still run
@@ -1612,8 +1627,9 @@ def run_parallel(
         if not unread and not stuck:  # unseen output (unread log, live worker) is evidence: never deleted
             shutil.rmtree(work, ignore_errors=True)
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
-            for problem in problems:
-                emit_error(problem)
+            reported_error = report_problems(problems)
+            if loose_error is None:
+                loose_error = reported_error
             if loose_error is not None:
                 raise loose_error
         else:
@@ -1624,8 +1640,7 @@ def run_parallel(
             if pending is not None:
                 # Raising skips the report at the end of the run, and the work dir may be kept for an unread log or
                 # a worker still running: what was recorded, and where the evidence stays, is said before it goes out.
-                for problem in problems:
-                    emit_error(problem)
+                report_problems(problems)  # the interrupt already met outranks one met while saying it
                 raise pending
     ran =sorted(item for record in records if record for item in record["ids"])
     # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
@@ -1643,12 +1658,19 @@ def run_parallel(
     if manifest is not None and not problems:
         write_manifest(manifest, ran)
     total = clock() - begin
+    late_error: BaseException | None = None  # met printing the timings or the problems, raised once all are said
     if merged:
-        failed = emit_text("\n".join(slowest_block(profile, index, of, total, merged)) + "\n", out)
+        try:
+            failed = emit_text("\n".join(slowest_block(profile, index, of, total, merged)) + "\n", out)
+        except BaseException as error:  # noqa: BLE001 - an interrupt must not cost the queued problems their report
+            late_error, failed = error, describe_error(error)
         if failed is not None:  # the queued problems (the kept-log paths) are still reported below
             problems.append(f"SHARD_SLOWEST could not be printed ({failed})")
-    for problem in problems:
-        emit_error(problem)
+    reported_late = report_problems(problems)
+    if late_error is None:
+        late_error = reported_late
+    if late_error is not None:
+        raise late_error
     if problems or any(code == 1 for code in codes):
         return 1
     return 5 if not ran else 0

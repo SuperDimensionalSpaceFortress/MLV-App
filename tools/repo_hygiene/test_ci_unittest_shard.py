@@ -3112,10 +3112,11 @@ class ShardExitCodeTests(unittest.TestCase):
 
     # r18 sol r17 A3: a cleanup interrupt that is raised after the run must not swallow what the run recorded.
     def _run_to_exception(
-        self, popen: Callable[..., object], workers: int = 2, extra: object | None = None, **patches: object
+        self, popen: Callable[..., object], workers: int = 2, extra: object | None = None,
+        err: io.StringIO | None = None, **patches: object,
     ) -> tuple[BaseException | None, str]:
         root, tests, tag = self._fixture()
-        err = io.StringIO()
+        err = io.StringIO() if err is None else err
         raised: BaseException | None = None
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(shard.subprocess, "Popen", side_effect=popen))
@@ -3276,6 +3277,94 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIn("worker 1/2 log could not be read", err, "the recorded problem was lost to the interrupt")
         self.assertIn("kept at", err)
         self.assertEqual(killer.stops, [1], "the deadline watchdog was never stopped")
+
+    # r18 adversary pass 31 A1: setting a watchdog's stop event is a call an interrupt can land in, like the join after it.
+    class _FlakyEvent(threading.Event):
+        def __init__(self) -> None:
+            super().__init__()
+            self.raised = False
+
+        def set(self) -> None:
+            super().set()
+            if not self.raised:
+                self.raised = True
+                raise KeyboardInterrupt("stop-set")
+
+    def test_an_interrupt_setting_the_deadline_watchdogs_stop_event_is_returned_not_raised(self) -> None:
+        killer = shard.DeadlineKiller(1e9, lambda: 0.0)
+        killer._stopped = self._FlakyEvent()  # type: ignore[assignment]
+        killer.start()
+        returned = killer.stop()
+        self.assertIsInstance(returned, KeyboardInterrupt, "the interrupt was raised out of stop()")
+
+    def test_an_interrupt_setting_the_budget_watchs_stop_event_is_returned_not_raised(self) -> None:
+        watch = shard.BudgetWatch("ubuntu", 1, 1, 40.0, 0.0, lambda: 0.0, lambda: {})
+        watch._stopped = self._FlakyEvent()  # type: ignore[assignment]
+        watch.start()
+        returned = watch.stop()
+        self.assertIsInstance(returned, KeyboardInterrupt, "the interrupt was raised out of stop()")
+
+    def test_a_watchdog_stop_event_interrupt_still_stops_the_other_watchdog_and_reports_the_problems(self) -> None:
+        stops: list[int] = []
+
+        class FlakyKiller(shard.DeadlineKiller):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+                self._stopped = ShardExitCodeTests._FlakyEvent()  # type: ignore[assignment]
+
+        class CountingWatch(shard.BudgetWatch):
+            def stop(self) -> BaseException | None:
+                stops.append(1)
+                return super().stop()
+
+        raised, err = self._run_to_exception(self._finished_popen([]), DeadlineKiller=FlakyKiller, BudgetWatch=CountingWatch)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertEqual(stops, [1], "the budget watch was never stopped after the deadline watchdog's stop was interrupted")
+        self.assertIn("log could not be read", err)
+        self.assertIn("kept at", err)
+
+    # r18 adversary pass 31 A2: an interrupt met saying one problem must not cost the others (the kept paths) their line.
+    class _FlakyStderr(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.raised = False
+
+        def write(self, text: str) -> int:
+            if text.startswith("ERROR:") and not self.raised:
+                self.raised = True
+                raise KeyboardInterrupt("report-write")
+            return super().write(text)
+
+    def test_an_interrupt_while_a_problem_is_reported_still_reports_the_others_and_the_kept_path(self) -> None:
+        real = Path.read_text
+
+        def read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "log.txt" and self.parent.name in {"w1", "w2"}:
+                raise PermissionError(5, "log is locked")
+            return real(self, *args, **kwargs)
+
+        raised, err = self._run_to_exception(
+            self._finished_popen([], raise_on=3), workers=3, extra=mock.patch.object(Path, "read_text", read_text),
+            err=self._FlakyStderr(),
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("worker 2/2 log could not be read", err, "the problem after the interrupted write was never said")
+        self.assertIn("kept at", err)
+
+    def test_an_interrupt_while_the_final_problems_are_reported_still_reports_the_rest(self) -> None:
+        real = Path.read_text
+
+        def read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "log.txt":
+                raise PermissionError(5, "log is locked")
+            return real(self, *args, **kwargs)
+
+        raised, err = self._run_to_exception(
+            self._finished_popen([]), extra=mock.patch.object(Path, "read_text", read_text), err=self._FlakyStderr(),
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("worker 2/2 log could not be read", err, "the problem after the interrupted write was never said")
+        self.assertIn("kept at", err)
 
     # r16 sol r15 A4: an exit code congruent to zero is a zero exit however large it is.
     def test_the_zero_exit_guard_fails_an_integer_code_that_the_os_reads_as_zero(self) -> None:
