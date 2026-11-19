@@ -6045,7 +6045,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             p.unlink(missing_ok=True)
         r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1)), FAKE_BUDGET_PID_FILE=str(pid_file))
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        # r19 (adversary pass 22 A1): with no room left no spec read starts either, so the refusal can now come at the first read (SPEC_READ_TIMEOUT), before the budget's own
+        noroom = r"BATCH_USAGE (EXPORT_BUDGET_PREFLIGHT_TIMEOUT|SPEC_READ_TIMEOUT) "
+        self.assertRegex(r.stderr, noroom)
         self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
         self.assertEqual(self.kinds(), [])
         self.assertFalse(self.claim_path.exists(), "no claim was written")
@@ -6055,14 +6057,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             p.unlink(missing_ok=True)
         r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        # adversary pass 22 A1: a deadline long gone starts NO read (a 1 s floor read the spec anyway and refused only at the budget): the first read is the typed refusal
+        self.assertIn("BATCH_USAGE SPEC_READ_TIMEOUT ", r.stderr)
         self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
         for p in (self.events, self.leg_args, self.claim_path):
             p.unlink(missing_ok=True)
         shutil.rmtree(self.run_dir, ignore_errors=True)
         r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 ", r.stderr)
+        # (r19: the plan file's own bounded read refuses first with no room: LEG_PLAN_UNREADABLE, still typed and never LEG_PLAN_INVALID)
+        self.assertRegex(r.stderr, r"LEG_PLAN_REFUSED reason=(EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 |SPEC_READ_TIMEOUT item=1 |LEG_PLAN_UNREADABLE )")
         self.assertNotIn("LEG_PLAN_INVALID", r.stderr)
         self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
 

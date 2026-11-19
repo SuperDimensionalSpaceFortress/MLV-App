@@ -4790,8 +4790,12 @@ function Get-DvExportManifestEndpointProblem($Manifest, [int64]$Count, [int64]$T
     $fb = Get-DvExportInt64 (Get-DvProp $first 'bytes'); $lb = Get-DvExportInt64 (Get-DvProp $last 'bytes')
     if ($fn -isnot [string] -or $ln -isnot [string] -or [string]::IsNullOrEmpty($fn) -or [string]::IsNullOrEmpty($ln)) { return 'output-manifest.json first and last records do not both carry a file name' }
     if ($null -eq $fb -or $null -eq $lb -or $fb -lt 0 -or $lb -lt 0) { return 'output-manifest.json first and last records do not both carry a non-negative integer byte size' }
+    # adversary pass 22 A2 (on d8ad4c8d): the content hash is part of the record too: each is a sha256, and one file has one hash
+    $fh = Get-DvProp $first 'sha256'; $lh = Get-DvProp $last 'sha256'
+    if ($fh -isnot [string] -or $lh -isnot [string] -or $fh -cnotmatch '^[0-9a-fA-F]{64}\z' -or $lh -cnotmatch '^[0-9a-fA-F]{64}\z') { return 'output-manifest.json first and last records do not both carry a sha256 (64 hex)' }
     if ($Count -eq 1) {
         if ($fn -cne $ln) { return "output-manifest.json lists one file but its first ('$fn') and last ('$ln') records name different files" }
+        if (-not [string]::Equals($fh, $lh, [StringComparison]::OrdinalIgnoreCase)) { return "output-manifest.json lists one file '$fn' but its first and last records carry different sha256 ($fh, $lh)" }
         if ($fb -ne $TotalBytes -or $lb -ne $TotalBytes) { return "output-manifest.json lists one file of $fb bytes (last record $lb) but totalBytes $TotalBytes" }
         return $null
     }

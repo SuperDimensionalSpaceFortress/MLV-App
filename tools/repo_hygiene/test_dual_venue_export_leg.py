@@ -660,15 +660,17 @@ class ExportEvidenceTests(unittest.TestCase):
                  cdng_case(manifest=manifest(30, "dng", 30000, a, a)),                                              # 3 thirty files, one endpoint twice
                  cdng_case(manifest=manifest(30, "dng", 30000, a, None)),                                           # 4 no last record
                  cdng_case(manifest=manifest(30, "dng", 30000, a, {**b, "bytes": "1000"})),                         # 5 a byte size that is no integer
-                 prores_case(manifest=manifest(1, "mov", 1000, one, one)),                                          # 6 control: one consistent file
-                 cdng_case(manifest=manifest(30, "dng", 30000, a, b))]                                              # 7 control: sol's consistent DNG
+                 prores_case(manifest=manifest(1, "mov", 1000, {**one, "sha256": "a" * 64}, {**one, "sha256": "b" * 64})),  # 6 adversary pass 22 A2: one file, two hashes
+                 cdng_case(manifest=manifest(30, "dng", 30000, a, {**b, "sha256": "not a hash"})),                  # 7 an endpoint with no sha256
+                 prores_case(manifest=manifest(1, "mov", 1000, one, one)),                                          # 8 control: one consistent file
+                 cdng_case(manifest=manifest(30, "dng", 30000, a, b))]                                              # 9 control: sol's consistent DNG
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        for i in range(6):
+        for i in range(8):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") for p in got[i]["problems"]), got[i])
-        for i in (6, 7):
+        for i in (8, 9):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
                 self.assertEqual(got[i]["problems"], [], got[i])
