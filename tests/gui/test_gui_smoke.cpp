@@ -696,6 +696,10 @@ private slots:
     void viewerCursorAutohide_idleTimerHidesAndRealMovementOrBlockingRestores();
     void viewerCursorAutohide_subPixelMoveRestores();
     void viewerCursorAutohide_pointerMovedWhileInputExcludedRestores();
+#ifdef Q_OS_WIN
+    void viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces();
+#endif
+    void viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -2612,6 +2616,125 @@ void GuiSmokeTest::viewerCursorAutohide_pointerMovedWhileInputExcludedRestores()
     QVERIFY( !harness.hidden() );
     harness.inputExcluded = false;
     harness.leaveFullscreen();
+}
+
+#ifdef Q_OS_WIN
+// G7 (r2, adversary r1 pass 3 A1): in an input-excluded wait Qt's dispatcher takes WM_MOUSEMOVE off the Win32
+// queue into its own deferred queue. A move away and back between two ticks then leaves the sampled position
+// unchanged and the queue empty, and no Qt event arrives. The thread mouse hook sees both moves as they are
+// taken; the tick reads it and both surfaces (viewport and GL window) get their cursor back within one idle
+// period. Control: the r1 tick (sample + queue status only) keeps both hidden for many idle periods.
+// Windows-only: the witness is a Win32 thread WH_MOUSE hook (r3 hub ruling: compiled on Windows, no skip branch).
+void GuiSmokeTest::viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QVERIFY( screen != nullptr );
+    const QPoint start = screen->geometry().center();
+    QCursor::setPos( start );
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+    } );
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );   // a real WH_MOUSE hook for this (GUI) thread
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    // The wait begins; the pointer goes away and back. These are the two moves the system hands the hook
+    // while Qt's dispatcher removes them (PM_REMOVE) and defers them. The sampled position never changes.
+    harness.inputExcluded = true;
+    harness.readRetrievalWitness = false;
+    viewer_idle::win_hook::witness().seed( QPoint( 500, 500 ) );
+    MOUSEHOOKSTRUCT away = {};
+    away.pt.x = 510;
+    away.pt.y = 500;
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = 500;
+    back.pt.y = 500;
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &away ) );
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+    QCOMPARE( QCursor::pos(), start );
+
+    QTest::qWait( 300 );   // about seven idle periods of the r1 tick
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+
+    harness.readRetrievalWitness = true;   // the r2 tick
+    QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::OpenHandCursor, 1000 );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+    QVERIFY( !harness.hidden() );
+
+    // A synthesized move to the last position (Qt discards those too) does not bring it back again.
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+    QTest::qWait( 200 );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    harness.inputExcluded = false;
+    harness.leaveFullscreen();
+    QVERIFY( !viewer_idle::win_hook::installed() );
+}
+#endif
+
+// G8 (Dot 0d82fed): a viewer surface replaced while the cursor is hidden. MainWindow::viewerIdleSurfaces() reads
+// both surfaces fresh at every hide/restore; the viewport is replaced by QGraphicsView::setViewport (as
+// GpuDisplayViewport does, which deletes the old one) and the GL window comes and goes. Restore must touch only
+// the live surfaces, never a deleted one, and leave a new surface's own cursor state alone; the next hide
+// blanks the new surfaces and the restore after it gives them back exactly what they had.
+void GuiSmokeTest::viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces()
+{
+    QGraphicsView view;
+    view.viewport()->setCursor( Qt::OpenHandCursor );
+    QPointer<QWidget> oldViewport = view.viewport();
+    auto gl1 = std::make_unique<QWindow>();
+    viewer_idle::Surfaces before;
+    before.viewport = view.viewport();
+    before.glWindow = gl1.get();
+    viewer_idle::CursorHider hider;
+    hider.hide( before );
+    QCOMPARE( view.viewport()->cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl1->cursor().shape(), Qt::BlankCursor );
+
+    // Replaced while hidden.
+    QWidget *fresh = new QWidget;
+    view.setViewport( fresh );
+    QVERIFY( oldViewport.isNull() );   // QAbstractScrollArea deleted the hidden viewport
+    gl1.reset();
+    QWindow gl2;
+    gl2.setCursor( Qt::CrossCursor );   // the new GL window carries its own cursor
+    viewer_idle::Surfaces after;
+    after.viewport = view.viewport();
+    after.glWindow = &gl2;
+    QCOMPARE( after.viewport, fresh );
+    const bool freshHadOwn = fresh->testAttribute( Qt::WA_SetCursor );
+    const Qt::CursorShape freshShape = fresh->cursor().shape();
+    QVERIFY( freshShape != Qt::BlankCursor );
+
+    hider.restore( after );
+    QCOMPARE( fresh->testAttribute( Qt::WA_SetCursor ), freshHadOwn );
+    QCOMPARE( fresh->cursor().shape(), freshShape );
+    QCOMPARE( gl2.cursor().shape(), Qt::CrossCursor );
+
+    hider.hide( after );
+    QCOMPARE( fresh->cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl2.cursor().shape(), Qt::BlankCursor );
+    hider.restore( after );
+    QCOMPARE( fresh->testAttribute( Qt::WA_SetCursor ), freshHadOwn );
+    QCOMPARE( fresh->cursor().shape(), freshShape );
+    QVERIFY( gl2.cursor().shape() != Qt::BlankCursor );
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()
