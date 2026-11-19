@@ -60,15 +60,24 @@ function Get-PinnedPayloadTreeRows {
             if ($null -eq $known -or $null -eq $row.startUtc -or $row.startUtc -eq $known) { $rows += $row }
         }
     }
+    # Adversary 183fe59d-A1: a member that exited may have its id reused. Children started at or after the replacement's start are
+    # the replacement's, never this tree's.
+    $listedStart = @{}
+    foreach ($row in $Table) { $listedStart[[int]$row.id] = $row.startUtc }
     $queue = [System.Collections.Generic.Queue[int]]::new()
     foreach ($id in @($Members.Keys)) { $queue.Enqueue([int]$id) }
     while ($queue.Count) {
         $parent = $queue.Dequeue()
         $parentStart = $Members[$parent]
+        $replacedAt = $null
+        if ($null -ne $parentStart -and $listedStart.ContainsKey($parent) -and $null -ne $listedStart[$parent] -and $listedStart[$parent] -ne $parentStart) {
+            $replacedAt = $listedStart[$parent]
+        }
         foreach ($row in $Table) {
             $id = [int]$row.id
             if ([int]$row.parentId -ne $parent -or $Members.ContainsKey($id)) { continue }
             if ($null -ne $parentStart -and $null -ne $row.startUtc -and $row.startUtc -lt $parentStart) { continue }
+            if ($null -ne $replacedAt -and $null -ne $row.startUtc -and $row.startUtc -ge $replacedAt) { continue }
             $Members[$id] = $row.startUtc
             $rows += $row
             $queue.Enqueue($id)
@@ -99,16 +108,19 @@ function Stop-PinnedPayloadChild {
         $members[[int]$Process.Id] = if ($rootRow.Count) { $rootRow[0].startUtc } else { $null }
         $null = Get-PinnedPayloadTreeRows -Table $before -Members $members
     } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
+    $provenBeforeKill = $members.Clone()
     $killError = ''
     try { $null = $Process.Kill($true) } catch { $killError = $_.Exception.Message }
     $exited = $false
     try { $exited = [bool]$Process.WaitForExit($ConfirmMs) } catch { if (-not $killError) { $killError = "the exit could not be awaited: $($_.Exception.Message)" } }
     if (-not $treeError) {
         try {
-            # A member or descendant still listed after Kill($true) is ended by id only when its UTC start still matches the
-            # listing (a reused id is never killed); one still listed after that leaves the tree unconfirmed.
+            # A descendant still listed after Kill($true) is ended by id only when the listing taken while the root was alive
+            # proved it (same id and UTC start) and its start still matches: a reused id or a process first seen after the kill
+            # is never killed (adversary 183fe59d-A1). Any one still listed after that leaves the tree unconfirmed.
             foreach ($row in @(Get-PinnedPayloadTreeRows -Table @(& $ProcessTable) -Members $members)) {
-                if ($null -eq $row.startUtc -or [int]$row.id -eq [int]$Process.Id) { continue }
+                $id = [int]$row.id
+                if ($id -eq [int]$Process.Id -or -not $provenBeforeKill.ContainsKey($id) -or $null -eq $row.startUtc -or $null -eq $provenBeforeKill[$id] -or $row.startUtc -ne $provenBeforeKill[$id]) { continue }
                 try {
                     $survivor = [System.Diagnostics.Process]::GetProcessById([int]$row.id)
                     try {

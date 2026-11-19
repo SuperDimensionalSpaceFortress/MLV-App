@@ -501,6 +501,22 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertFalse(unlisted["confirmed"], unlisted)
         self.assertIn("simulated Win32_Process access denied", unlisted["killError"])
 
+    def test_a_reused_member_id_never_adopts_the_replacements_children(self) -> None:
+        # adversary 183fe59d-A1: child 5151 exited between the listings and an unrelated process took id 5151 (parent 9000) and
+        # started 6262. Neither is this tree's: the kill is confirmed and neither is counted (nor, being unproven, killed).
+        root = self._row(4242, 1, "2026-11-19T10:00:00Z")
+        child = self._row(5151, 4242, "2026-11-19T10:00:01Z")
+        replacement = self._row(5151, 9000, "2026-11-19T10:00:03Z")
+        its_child = self._row(6262, 5151, "2026-11-19T10:00:04Z")
+        reused = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({replacement}, {its_child})")
+        self.assertTrue(reused["confirmed"], reused)
+        # a child the ORIGINAL 5151 started before the id was reused is still this tree's.
+        late_replacement = self._row(5151, 9000, "2026-11-19T10:00:05Z")
+        ours = self._row(6262, 5151, "2026-11-19T10:00:02Z")
+        orphan = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({late_replacement}, {ours})")
+        self.assertFalse(orphan["confirmed"], orphan)
+        self.assertIn("6262 still running", orphan["killError"])
+
     def test_the_real_process_table_lists_this_process_with_its_parent_and_a_utc_start(self) -> None:
         module = str(HELPER_MODULE).replace("'", "''")
         script = (
