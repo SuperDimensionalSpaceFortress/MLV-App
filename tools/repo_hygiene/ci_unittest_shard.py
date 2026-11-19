@@ -274,7 +274,8 @@ def one_line(test_id: str) -> str:
 def write_manifest(path: Path, ids: list[str]) -> None:
     """The ids that ran, sorted, one per line (``one_line``): two runs of one shard are equal iff the files are."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(f"{one_line(test_id)}\n" for test_id in sorted(ids)), encoding="utf-8", newline="\n")
+    # ``backslashreplace``: a lone surrogate in an id (a test named from arbitrary text) is written as ``\udXXX``, not a crash.
+    path.write_text("".join(f"{one_line(test_id)}\n" for test_id in sorted(ids)), encoding="utf-8", errors="backslashreplace", newline="\n")
 
 
 def plan_buckets(
@@ -568,6 +569,45 @@ def budget_warning(
     ]
 
 
+CLEANUP_ATTEMPTS = 3  # an interrupt lands once; a cleanup step is repeatable, so it is made again after one
+
+
+def attempt(step: Callable[[], object], attempts: int = CLEANUP_ATTEMPTS) -> BaseException | None:
+    """Run ``step`` until it completes (at most ``attempts`` times); the FIRST exception met, if any, is returned, never raised.
+
+    A step of a final cleanup (stopping a thread, removing the work dir) can be interrupted anywhere inside the
+    call, so one call is not enough and an interrupt must not leave the cleanup before the steps after it ran:
+    the caller raises what comes back once every step is done. A step run again must be safe to run again.
+    The first exception is kept with ``is None``: an exception's own truth value is its class's business.
+    """
+    first: BaseException | None = None
+    for _attempt in range(attempts):
+        try:
+            step()
+        except BaseException as error:  # noqa: BLE001 - see above
+            if first is None:
+                first = error
+            continue
+        return first
+    return first
+
+
+def stop_thread(stopped: threading.Event, thread: threading.Thread) -> BaseException | None:
+    """Tell a watchdog thread to stop and wait for it; the first interrupt met (if any) is returned, never raised.
+
+    Setting the event and the wait are both calls an interrupt can land in, the set BEFORE the flag is stored
+    included, so the pair is made again after one: a ``stop`` that returns has set the flag and joined unless the
+    interrupts outlast every attempt. The caller finishes its cleanup first and then lets the interrupt out, so a
+    cancellation is not turned into a pass."""
+
+    def once() -> None:
+        stopped.set()
+        if thread.is_alive():
+            thread.join()
+
+    return attempt(once)
+
+
 class BudgetWatch:
     """Prints the budget warning once, the moment the shard passes ``BUDGET_WARN_SHARE`` of its cap.
 
@@ -626,13 +666,7 @@ class BudgetWatch:
     def stop(self) -> BaseException | None:
         """Tell the thread to stop and wait for it; the interrupt met while waiting (if any), never raised here:
         the caller finishes its cleanup first and then lets it out, so a cancellation is not turned into a pass."""
-        try:
-            self._stopped.set()  # inside the try: setting the event is a call an interrupt can land in too
-            if self._thread.is_alive():
-                self._thread.join()
-        except BaseException as error:  # noqa: BLE001 - a daemon already told to stop; the cleanup after it must still run
-            return error
-        return None
+        return stop_thread(self._stopped, self._thread)
 
     def _poll(self) -> None:
         while not self._stopped.wait(self._poll_seconds):
@@ -754,7 +788,7 @@ def is_interrupt(error: BaseException) -> bool:
 
 
 _EXIT_CODE_SLOT = SystemExit.code  # the member descriptor: reads the stored code, whatever a subclass defines
-_EXIT_STATUS_MODULUS = 256  # POSIX keeps the low 8 bits of an exit status; a Windows DWORD keeps the low 32 (a multiple of 256)
+_EXIT_STATUS_MODULUS = 2**32 if os.name == "nt" else 256  # POSIX keeps the low 8 bits of an exit status; a Windows DWORD all 32 (256 is a real failing code there)
 
 
 def _reads_as_success(code: object) -> bool:
@@ -1364,13 +1398,7 @@ class DeadlineKiller:
     def stop(self) -> BaseException | None:
         """Tell the thread to stop and wait for it; the interrupt met while waiting (if any), never raised here:
         the caller finishes its cleanup first and then lets it out, so a cancellation is not turned into a pass."""
-        try:
-            self._stopped.set()  # inside the try: setting the event is a call an interrupt can land in too
-            if self._thread.is_alive():
-                self._thread.join()
-        except BaseException as error:  # noqa: BLE001 - a daemon already told to stop; the cleanup after it must still run
-            return error
-        return None
+        return stop_thread(self._stopped, self._thread)
 
 
 @never_exits_zero
@@ -1617,15 +1645,22 @@ def run_parallel(
                     unread.append(number)
                     problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
         killer_error = killer.stop()
-        report_unended()
+        # Every step from here to the report is guarded (``attempt``): an interrupt met in one is kept, the steps
+        # after it still run, and it goes out once the problems are said. ``report_unended`` and the removal are
+        # safe to make again (the first records each worker once; ``rmtree`` finishes what it left half done).
+        unended_error = attempt(report_unended)
         watch_error = watch.stop()
         if stuck and not unread:  # a worker still running can write to its log after this: say where it stays
             problems.append(
                 "worker(s) " + ", ".join(str(number) for number in sorted(stuck))
                 + f" could not be ended and may still write to their logs; kept at {work}"
             )
+        removal_error = None
         if not unread and not stuck:  # unseen output (unread log, live worker) is evidence: never deleted
-            shutil.rmtree(work, ignore_errors=True)
+            removal_error = attempt(lambda: shutil.rmtree(work, ignore_errors=True))
+        for met in (unended_error, removal_error):  # compared with ``is None``: never truth-test an exception
+            if loose_error is None:
+                loose_error = met
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             reported_error = report_problems(problems)
             if loose_error is None:

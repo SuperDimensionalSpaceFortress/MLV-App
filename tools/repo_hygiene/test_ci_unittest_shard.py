@@ -3366,6 +3366,180 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIn("worker 2/2 log could not be read", err, "the problem after the interrupted write was never said")
         self.assertIn("kept at", err)
 
+    # r20 pass 32 A1: an interrupt met BEFORE the stop flag is set (not after it, as in pass 31) must not leave the watchdog running.
+    class _EarlyFlakyEvent(threading.Event):
+        def __init__(self, times: int = 1) -> None:
+            super().__init__()
+            self.left = times
+
+        def set(self) -> None:
+            if self.left > 0:
+                self.left -= 1
+                raise KeyboardInterrupt("stop-set before the flag")
+            super().set()
+
+    def _release_on_cleanup(self, watchdog: object) -> None:
+        def release() -> None:
+            threading.Event.set(watchdog._stopped)  # type: ignore[attr-defined]
+            watchdog._thread.join(5)  # type: ignore[attr-defined]
+
+        self.addCleanup(release)
+
+    def test_an_interrupt_before_the_stop_flag_is_set_still_stops_both_watchdog_threads(self) -> None:
+        clock = time.monotonic
+        for times in (1, 2):
+            for make in (
+                lambda: shard.BudgetWatch("ubuntu", 1, 1, 40.0, clock(), clock, lambda: {}, poll_seconds=0.05, out=io.StringIO()),
+                lambda: shard.DeadlineKiller(clock() + 600, clock, 0.05),
+            ):
+                watchdog = make()
+                watchdog._stopped = self._EarlyFlakyEvent(times)  # type: ignore[assignment]
+                watchdog.start()
+                self._release_on_cleanup(watchdog)
+                with self.subTest(kind=type(watchdog).__name__, interrupts=times):
+                    returned = watchdog.stop()
+                    self.assertIsInstance(returned, KeyboardInterrupt, "the interrupt met was not handed back")
+                    self.assertTrue(watchdog._stopped.is_set(), "stop() returned without ever setting the stop flag")  # type: ignore[attr-defined]
+                    self.assertFalse(watchdog._thread.is_alive(), "the watchdog thread is still running after stop()")  # type: ignore[attr-defined]
+
+    def test_run_parallel_leaves_no_watchdog_running_after_an_interrupt_before_a_stop_flag(self) -> None:
+        made: list[object] = []
+
+        def early(base: type) -> type:
+            class Early(base):  # type: ignore[valid-type, misc]
+                def __init__(self, *args: object, **kwargs: object) -> None:
+                    super().__init__(*args, **kwargs)
+                    self._stopped = ShardExitCodeTests._EarlyFlakyEvent()
+                    made.append(self)
+                    ShardExitCodeTests._release_on_cleanup(test, self)
+
+            return Early
+
+        test = self
+        raised, err = self._run_to_exception(
+            self._finished_popen([]), DeadlineKiller=early(shard.DeadlineKiller), BudgetWatch=early(shard.BudgetWatch),
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertEqual(len(made), 2)
+        for watchdog in made:
+            self.assertFalse(watchdog._thread.is_alive(), f"{type(watchdog).__mro__[1].__name__} was left running")  # type: ignore[attr-defined]
+        self.assertIn("log could not be read", err)
+        self.assertIn("kept at", err)
+
+    def test_run_shard_leaves_no_watchdog_running_after_an_interrupt_before_the_stop_flag(self) -> None:
+        clock = FakeClock()
+        made: list[object] = []
+
+        class Probe(unittest.TestCase):
+            def test_one(self) -> None:
+                clock.advance(1.0)
+
+        Probe.__module__ = "fake_mod"
+        Probe.__qualname__ = "Probe"
+
+        class Early(shard.BudgetWatch):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)
+                self._stopped = ShardExitCodeTests._EarlyFlakyEvent()
+                made.append(self)
+
+        with (
+            mock.patch.object(shard, "BudgetWatch", Early),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            try:
+                shard.run_shard([Probe("test_one")], "ubuntu", 1, 1, clock=clock, environ={}, stream=io.StringIO())
+            finally:
+                for watchdog in made:
+                    self._release_on_cleanup(watchdog)
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made[0]._thread.is_alive(), "the serial budget watch was left running")  # type: ignore[attr-defined]
+
+    # r20 pass 32 A2: every step of the final cleanup is guarded, so an interrupt there still says what was recorded.
+    def _run_all_launches_refused(self, extra: object) -> tuple[BaseException | None, str]:
+        root, tests, tag = self._fixture()
+        err = io.StringIO()
+        raised: BaseException | None = None
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(extra)  # type: ignore[arg-type]
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            try:
+                shard.run_parallel(
+                    tests, "ubuntu", 1, 1, 2, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, environ={}, timeout=-1.0,
+                )
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        return raised, err.getvalue()
+
+    def test_an_interrupt_removing_the_work_dir_still_reports_the_recorded_problems(self) -> None:
+        real = shutil.rmtree
+        removed: list[str] = []
+
+        def rmtree(path: object, *args: object, **kwargs: object) -> None:
+            if "mlv-ci-workers-" in str(path):
+                removed.append(str(path))
+                if len(removed) == 1:
+                    raise KeyboardInterrupt("rmtree interrupted")
+            real(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        raised, err = self._run_all_launches_refused(mock.patch.object(shard.shutil, "rmtree", rmtree))
+        for path in removed:
+            self.addCleanup(real, path, True)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("not launched: the deadline passed while launching", err, "the recorded problems were lost to the interrupt")
+        self.assertEqual(len(removed), 2, "the removal was not retried after the interrupt")
+        self.assertFalse(Path(removed[0]).exists(), "the work dir was left behind")
+
+    def test_an_interrupt_reporting_the_unended_workers_still_reports_the_recorded_problems(self) -> None:
+        reads = [0]
+
+        class FlakyFailed(dict):  # type: ignore[type-arg]
+            def items(self) -> object:
+                reads[0] += 1
+                if reads[0] == 2:  # 1: the run's own report; 2: the cleanup's
+                    raise KeyboardInterrupt("report_unended interrupted")
+                return super().items()
+
+        class Killer(shard.DeadlineKiller):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+                self.failed = FlakyFailed()
+
+        raised, err = self._run_all_launches_refused(mock.patch.object(shard, "DeadlineKiller", Killer))
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("not launched: the deadline passed while launching", err, "the recorded problems were lost to the interrupt")
+
+    # r20 pass 32 A3: on Windows the exit status is a 32-bit word, so 256 is a real failing code there.
+    def test_the_zero_exit_guard_keeps_256_where_the_exit_status_is_a_32_bit_word(self) -> None:
+        for code in (256, -256, 512, 2**32 + 256):
+            def ended() -> int:
+                raise SystemExit(code)
+
+            with (
+                self.subTest(code=code),
+                mock.patch.object(shard, "_EXIT_STATUS_MODULUS", 2**32),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                shard.never_exits_zero(ended)()
+            self.assertEqual(caught.exception.code, code)
+
+    def test_the_exit_status_modulus_is_the_platform_s(self) -> None:
+        self.assertEqual(shard._EXIT_STATUS_MODULUS, 2**32 if os.name == "nt" else 256)
+
+    # r20 pass 31 advisory: a lone surrogate in a test id must not stop the manifest from being written.
+    def test_write_manifest_survives_a_lone_surrogate_in_a_test_id(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="fxm-"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        target = folder / "ids.txt"
+        shard.write_manifest(target, ["pkg.T.test_ok", "pkg.T.test_\ud800_odd"])
+        lines = target.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1], "pkg.T.test_\\ud800_odd")
+
     # r16 sol r15 A4: an exit code congruent to zero is a zero exit however large it is.
     def test_the_zero_exit_guard_fails_an_integer_code_that_the_os_reads_as_zero(self) -> None:
         class ModRaises(int):
@@ -3377,7 +3551,7 @@ class ShardExitCodeTests(unittest.TestCase):
                 raise SystemExit(code)
 
             outcome: SystemExit | None = None
-            with contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(shard, "_EXIT_STATUS_MODULUS", 256):  # the POSIX reading
                 try:
                     shard.never_exits_zero(ended)()
                 except SystemExit as error:
