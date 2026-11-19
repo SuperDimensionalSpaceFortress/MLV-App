@@ -384,6 +384,7 @@ private slots:
 
     void on_actionGoto_First_Frame_triggered();
     void on_actionGoto_Last_Frame_triggered();
+    void on_actionStop_triggered();
     void on_actionExport_triggered();
     void on_actionExportCurrentFrame_triggered();
     void on_checkBoxHighLightReconstruction_toggled(bool checked);
