@@ -876,7 +876,7 @@ private:
     bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
     bool m_doubleClickViewerFullscreen = true; // PLAYER-DOUBLECLICK-FULLSCREEN-1: the persisted "Double-Click Viewer Toggles Fullscreen" setting
     viewer_dblclick::Gate m_viewerDoubleClickGate; // first-press tool record for the viewer double-click
-    viewer_dblclick::ViewerState viewerDoubleClickState( void ) const;
+    viewer_dblclick::ViewerState viewerDoubleClickState( const QObject *target, const QPointF &pos ) const;
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
     // Phase 4F-toolbar: Playback Quality dropdown on the main toolbar. The
     // button is a second view onto the same Playback Quality QActions used

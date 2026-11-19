@@ -4712,8 +4712,12 @@ public:
         if (watched == &gl && event->type() == QEvent::MouseButtonDblClick) ++glDoubleClicksSeen;
         if (watched == &gl && event->type() == QEvent::MouseButtonPress
          && static_cast<QMouseEvent *>(event)->flags().testFlag(Qt::MouseEventCreatedDoubleClick)) ++glFlaggedPressesSeen;
-        const auto stateFn = [this]() {
-            const viewer_dblclick::ViewerState now = state;
+        const auto stateFn = [this](const QObject *target, const QPointF &pos) {
+            lastTarget = target;
+            viewer_dblclick::ViewerState now = state;
+            if (!handleAt.isNull() && target == &viewport && (pos - handleAt).manhattanLength() < 2.0) {
+                now.gradientHandleHovered = true; // a handle hit-tested at the event's own position
+            }
             if (disarmAfterFirstRead) { // a one-shot tool (gradient paint) turns itself off after its click
                 state.wbArmed = state.bpArmed = state.gradientPaintArmed = state.gradientHandleHovered = false;
             }
@@ -4729,6 +4733,8 @@ public:
     viewer_dblclick::Gate gate;
     viewer_dblclick::ViewerState state;
     bool disarmAfterFirstRead = false;
+    QPointF handleAt;                       // null: no handle anywhere
+    const QObject *lastTarget = nullptr;    // the surface the reader was last handed
     int glDoubleClicksSeen = 0;
     int glFlaggedPressesSeen = 0;
     DoubleClickCountingWidget viewport;
@@ -4926,24 +4932,40 @@ void GuiSmokeTest::viewerDoubleClick_firstPressOutsideTheViewerStartsAnUnarmedRe
     // Qt's first press of the next pair lands just outside the viewer (a layout gap of the same
     // native window) at t=10000; the second press on the viewer is flagged and never reaches the
     // widget; the double-click goes to the viewport at t=10100. It must toggle.
-    {
+    // Every native press reaches a QWindow (the top-level QWidgetWindow) before any widget, so the
+    // gap press is delivered to a window here. r2 pass 4 A2: a distinct press may reuse the
+    // recorded press's timestamp (native injection); it still starts a new unarmed record.
+    for (int reuseTimestamp = 0; reuseTimestamp < 2; ++reuseTimestamp) {
         ViewerDoubleClickFixture f;
-        DoubleClickCountingWidget gap;
+        QWindow topLevelWindow;
         f.state.wbArmed = true;
         deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 1000);
         deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 1010);
         f.state.wbArmed = false;
-        deliverViewerMouse(&gap, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 10000);
-        deliverViewerMouse(&gap, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 10010);
-        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 10100);
-        QVERIFY(f.fullscreen.isChecked());
+        const quint64 gapAt = reuseTimestamp ? 1000 : 10000;
+        deliverViewerMouse(&topLevelWindow, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, gapAt);
+        deliverViewerMouse(&topLevelWindow, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, gapAt + 10);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, gapAt + 100);
+        QVERIFY2(f.fullscreen.isChecked(), qPrintable(QStringLiteral("reuseTimestamp=%1 did not toggle").arg(reuseTimestamp)));
         QCOMPARE(f.viewport.doubleClicks, 0);
     }
-    // The same physical press reaching the top-level window first and the QGraphicsView parent
-    // after the viewport (one timestamp) keeps an armed viewer record: the double-click passes through.
+    // r2 pass 4 A1: the handle is hit-tested at the event's own position, which the reader is
+    // handed; the live cursor plays no part. A press on the handle at (100,55) suppresses.
     {
         ViewerDoubleClickFixture f;
-        DoubleClickCountingWidget topLevel;
+        f.handleAt = QPointF(100, 55);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 30000, QPointF(100, 55));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 30010, QPointF(100, 55));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 30100, QPointF(100, 55));
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+        QCOMPARE(f.lastTarget, static_cast<const QObject *>(&f.viewport));
+    }
+    // The same physical press reaching the top-level window first and the QGraphicsView parent
+    // after the viewport keeps an armed viewer record: the double-click passes through.
+    {
+        ViewerDoubleClickFixture f;
+        QWindow topLevel;
         DoubleClickCountingWidget view;
         f.state.gradientPaintArmed = true;
         deliverViewerMouse(&topLevel, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 20000);

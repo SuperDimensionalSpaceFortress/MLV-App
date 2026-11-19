@@ -61,7 +61,8 @@ TEST(ViewerDoubleClickWiring, W1_EventFilterHandlesTheDoubleClickOnceAndSwallows
     // Both display paths are named, and the state is read lazily from the member reader.
     const QString block = body.mid(callAt, moveAt - callAt);
     ASSERT_TRUE(block.contains(QStringLiteral("GpuDisplayWindow::activeWindow()")));
-    ASSERT_TRUE(block.contains(QStringLiteral("[this]() { return viewerDoubleClickState(); }")));
+    // r2 pass 4 A1: the reader is handed the event's own target and position, never the live cursor.
+    ASSERT_TRUE(block.contains(QStringLiteral("[this]( const QObject *target, const QPointF &pos ) { return viewerDoubleClickState( target, pos ); }")));
     const int triggerAt = block.indexOf(QStringLiteral("ui->actionFullscreen->trigger();"));
     const int returnAt = block.indexOf(QStringLiteral("return true;"));
     ASSERT_TRUE(triggerAt >= 0);
@@ -130,7 +131,7 @@ TEST(ViewerDoubleClickWiring, W4_StateReaderCoversEveryToolAndGuardsTheGradientP
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString body = functionBody(source,
-        QStringLiteral("viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( void ) const"),
+        QStringLiteral("viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( const QObject *target, const QPointF &pos ) const"),
         QStringLiteral("\n}\n"));
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral("s.enabled = m_doubleClickViewerFullscreen;")));
@@ -141,7 +142,11 @@ TEST(ViewerDoubleClickWiring, W4_StateReaderCoversEveryToolAndGuardsTheGradientP
 
     const int guardAt = body.indexOf(QStringLiteral("if( m_fileLoaded && m_pGradientElement && m_pGradientElement->gradientGraphicsElement() )"));
     // Adversary r1 pass 3 A1: the handle counts only while the QGraphicsView is the visible display.
-    const int hoverAt = body.indexOf(QStringLiteral("s.gradientHandleHovered = viewer_dblclick::gradientHandleClaims( ui->graphicsView->isVisible(), handle->isVisible(), handle->isUnderMouse() );"));
+    // r2 pass 4 A1: hit-tested at the event's position on the viewport (QGraphicsView::items takes
+    // viewport coordinates), never isUnderMouse(), which reads the live OS cursor.
+    const int hoverAt = body.indexOf(QStringLiteral("s.gradientHandleHovered = viewer_dblclick::gradientHandleClaims( onView, handle->isVisible(), onView && ui->graphicsView->items( pos.toPoint() ).contains( handle ) );"));
+    ASSERT_TRUE(body.contains(QStringLiteral("const bool onView = target == ui->graphicsView->viewport() && ui->graphicsView->isVisible();")));
+    ASSERT_FALSE(body.contains(QStringLiteral("isUnderMouse")));
     ASSERT_TRUE(guardAt >= 0);
     ASSERT_TRUE(hoverAt > guardAt);
     // The gradient pointer is never dereferenced ahead of the guard.

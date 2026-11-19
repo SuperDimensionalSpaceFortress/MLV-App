@@ -3674,7 +3674,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     endGuiPresentIdleWait();
     //PLAYER-DOUBLECLICK-FULLSCREEN-1: a left double-click on the viewer (either display path) toggles fullscreen, once, and is swallowed
     if( viewer_dblclick::filterEvent( m_viewerDoubleClickGate, watched, event, ui->graphicsView->viewport(),
-                                      GpuDisplayWindow::activeWindow(), [this]() { return viewerDoubleClickState(); } ) )
+                                      GpuDisplayWindow::activeWindow(), [this]( const QObject *target, const QPointF &pos ) { return viewerDoubleClickState( target, pos ); } ) )
     {
         ui->actionFullscreen->trigger();
         return true;
@@ -3723,7 +3723,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 
 //PLAYER-DOUBLECLICK-FULLSCREEN-1: the viewer's tool state for the double-click decision. The gradient
 //handle is read only with a clip loaded: m_pGradientElement has no initializer before initGui sets it.
-viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( void ) const
+viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( const QObject *target, const QPointF &pos ) const
 {
     viewer_dblclick::ViewerState s;
     s.enabled = m_doubleClickViewerFullscreen;
@@ -3733,10 +3733,12 @@ viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( void ) const
     s.gradientPaintArmed = ui->toolButtonGradientPaint->isChecked();
     if( m_fileLoaded && m_pGradientElement && m_pGradientElement->gradientGraphicsElement() )
     {
-        const QGraphicsItem *handle = m_pGradientElement->gradientGraphicsElement();
+        QGraphicsItem *handle = m_pGradientElement->gradientGraphicsElement();
         //Only a handle drawn on the active viewer claims the click: on the GL path the view is hidden
-        //but its scene item still reads visible (adversary r1 pass 3 A1)
-        s.gradientHandleHovered = viewer_dblclick::gradientHandleClaims( ui->graphicsView->isVisible(), handle->isVisible(), handle->isUnderMouse() );
+        //but its scene item still reads visible (adversary r1 pass 3 A1). It is hit-tested at the
+        //event's own viewport position, never the live cursor (r2 pass 4 A1)
+        const bool onView = target == ui->graphicsView->viewport() && ui->graphicsView->isVisible();
+        s.gradientHandleHovered = viewer_dblclick::gradientHandleClaims( onView, handle->isVisible(), onView && ui->graphicsView->items( pos.toPoint() ).contains( handle ) );
     }
     return s;
 }

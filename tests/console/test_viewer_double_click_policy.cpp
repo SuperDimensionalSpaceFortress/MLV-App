@@ -183,33 +183,46 @@ TEST(ViewerDoubleClickPolicy, P2i_A2r1p3_AnUnflaggedPressElsewhereStartsAnUnarme
     // Adversary r1 pass 3 A2: WB-armed viewer press at t=1000; WB off; Qt's first press of the
     // new pair lands in the layout gap outside the viewer at t=10000 (unflagged); the second press
     // on the viewer is flagged. The double-click must toggle.
+    // The gap press reaches the top-level QWidgetWindow (a QWindow) first.
     Gate gate;
-    gate.notePress(true, false, 1000);
-    gate.noteOtherPress(false, 10000);
-    gate.notePress(false, true, 10100);
+    gate.notePress(true, false);
+    gate.noteWindowPress(false);
+    gate.notePress(false, true);
     ASSERT_FALSE(gate.armedAtFirstPress());
     ASSERT_TRUE(gate.decide(Qt::LeftButton, Qt::NoModifier, readyState()));
 }
 
-TEST(ViewerDoubleClickPolicy, P2j_A2r1p3_TheSamePressReachingAnotherObjectKeepsTheRecord)
+TEST(ViewerDoubleClickPolicy, P2j_A2r1p3_TheSamePressReachingTheWindowFirstKeepsTheViewerRecord)
 {
-    // One physical press reaches the top-level window first, then the viewport, then (ignored)
-    // the QGraphicsView parent; all carry its timestamp. An armed viewer press stays armed.
+    // One physical press reaches the top-level QWidgetWindow first, then the viewport (the
+    // QGraphicsView parent's propagated copy is a widget delivery, never counted). An armed viewer
+    // press stays armed.
     {
         Gate gate;
-        gate.noteOtherPress(false, 5000); // the top-level QWidgetWindow sees it first
-        gate.notePress(true, false, 5000); // then the viewport
-        gate.noteOtherPress(false, 5000); // then the propagated copy to the QGraphicsView
+        gate.noteWindowPress(false); // the top-level QWidgetWindow sees it first
+        gate.notePress(true, false); // then the viewport
         ASSERT_TRUE(gate.armedAtFirstPress());
         ASSERT_FALSE(gate.decide(Qt::LeftButton, Qt::NoModifier, readyState()));
     }
     {
-        // A flagged second press elsewhere never resets the record either.
+        // A flagged second press at the window never resets the record either.
         Gate gate;
-        gate.notePress(true, false, 6000);
-        gate.noteOtherPress(true, 6100);
+        gate.notePress(true, false);
+        gate.noteWindowPress(true);
         ASSERT_TRUE(gate.armedAtFirstPress());
     }
+}
+
+TEST(ViewerDoubleClickPolicy, P2k_A2r2p4_ADistinctPressElsewhereReusingTheTimestampStillResets)
+{
+    // r2 pass 4 A2: armed viewer press at 1000; a distinct gap press reuses timestamp 1000 (native
+    // injection). The gate reads no timestamp at all, so the window press resets the record.
+    Gate gate;
+    gate.notePress(true, false);
+    gate.noteWindowPress(false);
+    gate.notePress(false, true);
+    ASSERT_FALSE(gate.armedAtFirstPress());
+    ASSERT_TRUE(gate.decide(Qt::LeftButton, Qt::NoModifier, readyState()));
 }
 
 TEST(ViewerDoubleClickPolicy, P5_A1r1p3_GradientHandleClaimsOnlyOnTheDisplayedView)

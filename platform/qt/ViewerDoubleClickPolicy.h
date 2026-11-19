@@ -81,35 +81,31 @@ inline bool shouldToggle( Qt::MouseButton button, Qt::KeyboardModifiers modifier
  *
  *  Qt's first press need not land on the viewer: it can land just outside (a layout gap in the
  *  same native window) and still pair with a second press on the viewer. So an unflagged left press
- *  to ANY other object also starts a new record, unarmed (adversary r1 pass 3 A2). One physical
- *  press reaches several objects (the top-level QWidgetWindow before the viewport, the QGraphicsView
- *  and its parents after it when the viewport ignores it); QApplication copies the press's
- *  timestamp onto each propagated copy, so a press elsewhere that carries the recorded press's
- *  timestamp is that same press and leaves the record alone. The timestamp is only compared for
- *  identity, never measured. */
+ *  delivered to any other QWindow starts a new record, unarmed (adversary r1 pass 3 A2). Every
+ *  native press reaches a QWindow first (the top-level QWidgetWindow, before any widget in it; or the
+ *  GL display window, which is a viewer itself), so this sees each physical press exactly once and
+ *  before the viewport records it. Widget deliveries elsewhere (the QGraphicsView and its parents
+ *  receiving the viewport's ignored press) are copies of a press already seen and are not counted.
+ *  No timestamp is read, even for identity (r2 pass 4 A2: injected input can reuse one). */
 class Gate
 {
 public:
     /*! \brief Record a left press on the viewer.
      *  \param armedNow           anyToolArmed() at this press
-     *  \param createdDoubleClick Qt flagged this press as the second press of a double-click
-     *  \param pressId            the press's event timestamp, used only as its identity */
-    void notePress( bool armedNow, bool createdDoubleClick, quint64 pressId = 0 )
+     *  \param createdDoubleClick Qt flagged this press as the second press of a double-click */
+    void notePress( bool armedNow, bool createdDoubleClick )
     {
         if( createdDoubleClick ) return; // the second press of Qt's pair: keep the first press's record
         m_armed = armedNow;
-        m_pressId = pressId;
     }
 
-    /*! \brief Record a left press delivered to any object other than the two display surfaces.
-     *  An unflagged press there is a new first press with no viewer tool armed, unless it is a copy
-     *  of the press already recorded (same \a pressId). */
-    void noteOtherPress( bool createdDoubleClick, quint64 pressId )
+    /*! \brief Record a left press delivered to a QWindow that is not a display surface (for a
+     *  widget, its top-level QWidgetWindow). An unflagged one starts a new first press with no
+     *  viewer tool armed; the viewport's own delivery of the same press, which follows, re-records. */
+    void noteWindowPress( bool createdDoubleClick )
     {
         if( createdDoubleClick ) return;
-        if( pressId == m_pressId ) return; // the recorded press reaching another object
         m_armed = false;
-        m_pressId = pressId;
     }
 
     bool armedAtFirstPress() const { return m_armed; }
@@ -121,7 +117,6 @@ public:
 
 private:
     bool m_armed = false;
-    quint64 m_pressId = 0;
 };
 
 } // namespace viewer_dblclick

@@ -16,11 +16,15 @@
 namespace viewer_dblclick
 {
 
+/*! \brief The viewer's tool state for one event: handed the display surface the event was
+ *  delivered to and the event's own position in it (never the live cursor: r2 pass 4 A1). */
+using StateReader = std::function<ViewerState( const QObject *target, const QPointF &pos )>;
+
 /*! \brief Returns true when the caller should toggle fullscreen and swallow the event.
  *  A press is never swallowed: it only updates the gate's first-press record. \a state is called
  *  lazily, only for events on a display surface. */
 inline bool filterEvent( Gate &gate, const QObject *watched, QEvent *event, const QObject *viewport,
-                         const QObject *glWindow, const std::function<ViewerState()> &state )
+                         const QObject *glWindow, const StateReader &state )
 {
     if( !event ) return false;
     const QEvent::Type type = event->type();
@@ -40,14 +44,15 @@ inline bool filterEvent( Gate &gate, const QObject *watched, QEvent *event, cons
             const bool createdDoubleClick = mouse->flags().testFlag( Qt::MouseEventCreatedDoubleClick );
             if( onViewer )
             {
-                const bool armedNow = ( !createdDoubleClick && state ) ? anyToolArmed( state() ) : false;
-                gate.notePress( armedNow, createdDoubleClick, mouse->timestamp() );
+                const bool armedNow = ( !createdDoubleClick && state ) ? anyToolArmed( state( watched, mouse->position() ) ) : false;
+                gate.notePress( armedNow, createdDoubleClick );
             }
-            else
+            else if( watched && watched->isWindowType() )
             {
                 // A first press Qt may pair from outside the viewer: a new, unarmed record
-                // (adversary r1 pass 3 A2). No state() read for presses elsewhere.
-                gate.noteOtherPress( createdDoubleClick, mouse->timestamp() );
+                // (adversary r1 pass 3 A2). The QWindow sees each native press once, before any
+                // widget; no state() read for presses elsewhere.
+                gate.noteWindowPress( createdDoubleClick );
             }
         }
         return false;
@@ -56,7 +61,7 @@ inline bool filterEvent( Gate &gate, const QObject *watched, QEvent *event, cons
     if( !onViewer ) return false;
 
     if( !state ) return false;
-    return gate.decide( button, modifiers, state() );
+    return gate.decide( button, modifiers, state( watched, mouse->position() ) );
 }
 
 } // namespace viewer_dblclick
