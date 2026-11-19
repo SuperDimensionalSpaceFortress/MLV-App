@@ -2054,7 +2054,8 @@ function Get-DvWindowToggleReconcileEvidence {
     .SYNOPSIS
     VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r3 (sol B4 on 11def8e4): a leg that NAMES generatorArgs.midPlayWindowToggles must have its windowToggles* scalars
     (windowTogglesRequested / Driven / KeptPlaying / Advanced and windowToggleEvidenceReason) backed by the hashed run log. They are re-derived here from the
-    log with the job's own reader (Get-AttrCudaWindowToggleEvidence, over the measured session Get-DvSmokeSummaryFields names, none when it is unreadable) and
+    log with the job's own reader (Get-AttrCudaWindowToggleEvidence, over the measured session Get-DvSmokeSummaryFields names; r11: an UNREADABLE one blocks with
+    WINDOW_TOGGLES_SESSION_UNREADABLE and is never handed to the reader as no id) and
     compared field for field with the metrics; `blocks` is true when any of the five is absent or differs, so a summary whose toggle records were removed from
     the log (and the log-hash references refreshed) is INVALID, never a PASS. An honest failure (the scalars are exactly what the log derives, reason not ok)
     does not block: the criteria FAIL it. A leg that does not ask is not judged here (Get-DvWindowToggleRequestEvidence is its gate). Pure and shared: the
@@ -2065,6 +2066,17 @@ function Get-DvWindowToggleReconcileEvidence {
     $requested = ($raw -is [bool]) -and $raw
     if (-not $requested) { return [pscustomobject]@{ requested = $false; blocks = $false; reason = $null; derived = $null } }
     $sessionRead = Get-DvSmokeSummaryFields -LogText $LogText
+    # r11 (sol r10 A2, opus key3 r10 H1 on 7fc447b9, input: the healthy log with id=3x / session=3x): an UNREADABLE measured session (a malformed first marker, or
+    # with no marker a malformed first summary) names no session, so it REFUSES requested-toggle proof with a typed reason; before r11 it became the empty id and the
+    # reader's automatic selection picked the only marker (3x) and derived ok. The derived evidence is the refusal itself, never a reader result
+    if ($sessionRead.sessionUnreadable -eq $true) {
+        return [pscustomobject]@{
+            requested = $true
+            blocks = $true
+            reason = 'WINDOW_TOGGLES_SESSION_UNREADABLE: the leg names midPlayWindowToggles but the run log''s measured playback_smoke session is unreadable (Get-DvSmokeSummaryFields sessionUnreadable), so no toggle record is the measured Play''s; requested-toggle proof is refused, never derived by automatic session selection'
+            derived = [pscustomobject]@{ requested = 0; driven = 0; keptPlaying = 0; advanced = 0; reason = 'measured-session-unreadable' }
+        }
+    }
     $session = $(if ($null -ne $sessionRead.session) { [string]$sessionRead.session } else { '' })
     $module = Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1') -PassThru -DisableNameChecking
     $derived = & $module { param([string]$t, [string]$s) Get-AttrCudaWindowToggleEvidence -LogText $t -MeasuredSessionId $s } ([string]$LogText) $session

@@ -7385,9 +7385,11 @@ function Get-AttrCudaWindowToggleEvidence {
       gui_smoke.window_toggle phase=begin|end index= kind= elapsed_ms= play_checked= position= presented_serial= window=WxH fullscreen= maximized=
       gui_smoke.window_toggles requested= driven= reason=            (exactly one, after the loop)
       interaction_trace event=resize.keep_playing ...
-    The measured session is the one -MeasuredSessionId names (the job's own measured-session read): its records are the lines from that session's
+    The measured session is the one -MeasuredSessionId names (the job's own measured-session read): its records are the lines from that session's FIRST
     playback_smoke.measured_session marker up to the next marker of ANOTHER session. With no id, the log must carry markers of ONE session only (more is
-    ambiguous, none is absent: reason names either) and the last marker starts the window.
+    ambiguous, none is absent: reason names either) and its first marker starts the window. The app writes the marker once per process, so a second marker of
+    the window's id (anywhere in the log, before or after a foreign marker) is a broken session: reason names measured-session-marker-repeated and the proof is
+    never ok; the repeat neither reopens a window a foreign marker closed nor moves the window's start past earlier records.
     The job's schedule is fixed (fs_on, fs_off, restore, maximize at indexes 0..3). Toggle i is DRIVEN when it has exactly one begin and one end, in log
     order, parseable (a key repeated inside one record is not), the same kind, a kind of the schedule at its index, and after the previous toggle's end.
     It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both, the
@@ -7506,14 +7508,22 @@ function Get-AttrCudaWindowToggleEvidence {
         $markerId[$i] = $firstId
         $markerClean[$i] = $clean
     }
+    # r11 (sol r10 A1 and opus key3 r10 B1 on 7fc447b9, inputs: marker + toggle(0,begin) + marker + rest, and `id=3`, `id=4`, `id=3` + the healthy log): the window
+    # starts at the FIRST marker of the session (before r11 the LAST one, so a repeated marker erased a duplicate record before it, or reopened a window a foreign marker
+    # had closed), and every marker of an id is counted ($markerCount): a second marker of the window's id is a broken session (the app writes the marker once per
+    # process, MainWindow.h m_playbackSmokeMeasuredSessionLogged), so it names itself (measured-session-marker-repeated), never a reopened or replaced window
+    $markerCount = @{}
+    $firstMatch = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if (-not $markerId.ContainsKey($i)) { continue }
         if ($null -ne $markerId[$i] -and $markerId[$i] -cne '') {
             $markerIds[$markerId[$i]] = $true
-            if ($wanted -eq '' -or $markerId[$i] -ceq $wanted) { $start = $i }
+            $markerCount[$markerId[$i]] = 1 + $(if ($markerCount.ContainsKey($markerId[$i])) { [int]$markerCount[$markerId[$i]] } else { 0 })
+            if ($firstMatch -lt 0 -and ($wanted -eq '' -or $markerId[$i] -ceq $wanted)) { $firstMatch = $i }
         }
         if (-not $markerClean[$i]) { $anomalies.Add('session-boundary-unreadable') }
     }
+    if ($firstMatch -ge 0) { $start = $firstMatch }
     # r3 (A5 of the first r3 round): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
     $windowId = $wanted
     if ($wanted -eq '') {
@@ -7521,6 +7531,7 @@ function Get-AttrCudaWindowToggleEvidence {
         elseif ($markerIds.Count -eq 0) { $anomalies.Add('measured-session-marker-absent') }
         else { $windowId = [string]@($markerIds.Keys)[0] }
     } elseif (-not $markerIds.ContainsKey($wanted)) { $anomalies.Add('measured-session-marker-absent'); $start = $lines.Count }
+    if ($windowId -ne '' -and $markerCount.ContainsKey($windowId) -and [int]$markerCount[$windowId] -gt 1) { $anomalies.Add('measured-session-marker-repeated') }
     # r3 (adversary A4 on 1f00a482): the window closes at the next marker of ANOTHER session AND at any playback_smoke record that names another session
     # (`playback_smoke.start session=4 ...`), as the runner's own due-wake reader closes its window, so a foreign Play's toggles are never credited here
     # r3 (adversary A2 on 90451806): EVERY `session=` of such a record is read (a greedy match let a later `session=3` hide `session=4`, and a quoted `session=3`
@@ -7538,6 +7549,8 @@ function Get-AttrCudaWindowToggleEvidence {
                 # r5 (adversary A1 on 732bcb96): a marker is read by its id= AND its session=; one with no id= (`playback_smoke.measured_session session=4`, or the bare name) or with any
                 # session= is no clean marker of this session, so it closes the window and names itself, as every other playback_smoke record that names a session does
                 # r7 (r6 adversary A2): by the ONE marker reader above, so a key stated twice (any spacing) or a marker spaced otherwise closes it and names itself too
+                # r11 (sol r10 A1): a clean marker of the window's OWN id neither closes nor restarts the window (it was counted above as
+                # measured-session-marker-repeated, so the proof is not ok); the window started at the first marker and runs to the next marker of another id
                 if (-not $markerClean[$i]) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
                 elseif ($markerId[$i] -cne $windowId) { $end = $i }
             }

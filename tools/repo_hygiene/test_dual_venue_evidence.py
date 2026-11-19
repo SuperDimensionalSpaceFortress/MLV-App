@@ -15797,7 +15797,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "toggle 2's end logged before its begin": (
                 self.log(mutate=lambda i, b, e: (e, b) if i == 2 else (b, e)), (4, 3, 3, 3), False),
             "an end of another kind": (self.log(mutate=lambda i, b, e: (b, self.toggle(1, "end", kind="restore") if i == 1 else e)), (4, 3, 3, 3), False),
-            "records of an earlier session before the last measured_session marker are not read": (
+            "records of an earlier session before the measured session's (first) marker are not read": (
                 self.log(prefix=(self.toggle(0, "begin"), self.toggle(0, "begin"), "playback_smoke.measured_session id=2")), (4, 4, 4, 4), True),
             "A1: a log prefix and a location suffix whose path holds position=0 (the suffix is not the record)": (
                 self.log(mutate=lambda i, b, e: ("[2026-11-18T16:00:00.000Z] [INFO] [0x1a2c] " + b + " (C:/build position=0 sandbox/platform/qt/MainWindow.cpp:10901)",
@@ -15902,9 +15902,11 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "r4b-A3: `playback_smoke.frame session=3 <Kelvin sign>session=4` right after the marker closes the window": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 " + chr(0x212A) + "session=4\n", 1),
                 (0, 0, 0, 0), False),
+            # r11 (sol r10 A1): every "later marker" row below now reads (0, 0, 0, 0), not (4, 4, 4, 4): the window starts at the FIRST marker of the session, and a later
+            # unclean marker is an unreadable boundary that closes it there (before r11 the later marker, the LAST one of id 3, restarted the window); still never ok
             "r4b-A3: a later marker `id=3 <Kelvin sign>id=4` declares two ids (the Kelvin sign is no name character), so it is unreadable and names itself": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 " + chr(0x212A) + "id=4\n", 1),
-                (4, 4, 4, 4), False),
+                (0, 0, 0, 0), False),
             "r4-A1: a boundary record with a REAL location tail is still read and the window stays open": (
                 self.log().replace("playback_smoke.measured_session id=3\n",
                                    "playback_smoke.measured_session id=3 (C:/b x/MainWindow.cpp:10)\nplayback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:11)\n", 1),
@@ -15945,7 +15947,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "r5-A1: a marker `id=3 session=4` is no clean marker of session 3": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 session=4\n", 1), (4, 4, 4, 4), False),
             "r5-A1: a later marker `id=3 session=4` is no clean marker of session 3 either": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 session=4\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 session=4\n", 1), (0, 0, 0, 0), False),
             "r5-A2: toggle 1 begins (elapsed_ms=1) before toggle 0 ended (elapsed_ms=6007) on the one producer clock": (
                 self.log().replace("elapsed_ms=8007", "elapsed_ms=1").replace("elapsed_ms=10007", "elapsed_ms=2001"), (4, 3, 3, 3), False),
             # r5 adversary pass on 129eb94b (A1): the records are split on the plain space only, so a TAB (or any other character outside printable ASCII) inside a value hid a `key=`
@@ -15963,17 +15965,17 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             # r7 (r6 adversary pass on 1ee5e122, A2): ONE measured_session marker reader. Its tokens are split on any run of spaces or TABs, and a key stated more than once
             # (id= or any other, any case) is session-boundary-unreadable however it is spaced; a marker spaced other than the app's one plain space is unreadable too
             "r7-A2: the adversary's later marker `  id=3 id=3` (a doubled space before id=, id stated twice)": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=3 id=3\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=3 id=3\n", 1), (0, 0, 0, 0), False),
             "r7-A2: the adversary's later marker with a TAB before id= (`\\tid=3 id=3`)": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3 id=3\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3 id=3\n", 1), (0, 0, 0, 0), False),
             "r7-A2: a later marker with id stated twice across a TAB (`id=3\\tid=3`)": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3\tid=3\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3\tid=3\n", 1), (0, 0, 0, 0), False),
             "r7-A2: the canonical one-space duplicate `id=3 id=3` (the control the adversary compared with)": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 id=3\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 id=3\n", 1), (0, 0, 0, 0), False),
             "r7-A2: a later marker `id=3  ID=3` (the key in another case, a doubled space between)": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3  ID=3\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3  ID=3\n", 1), (0, 0, 0, 0), False),
             "r7-A2: a later marker that states another key twice (`id=3 x=1 x=1`)": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 x=1 x=1\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 x=1 x=1\n", 1), (0, 0, 0, 0), False),
             "r7-A2 sibling :7472/:7478: the ONLY marker spaced with a doubled space (`  id=3`) is no clean marker": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session  id=3\n", 1), (4, 4, 4, 4), False),
             "r7-A2 sibling :7472/:7478: the ONLY marker spaced with a TAB (`\\tid=3`) is no clean marker": (
@@ -15983,7 +15985,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "r7-A2 sibling :7501: a later doubled-space marker of ANOTHER session (`  id=4`) closes the window": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=4\n", 1), (0, 0, 0, 0), False),
             "r7-A2 sibling :7501: a later TAB-spaced marker that also names session= (`\\tid=3\\tsession=4`) is no clean marker": (
-                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3\tsession=4\n", 1), (4, 4, 4, 4), False),
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3\tsession=4\n", 1), (0, 0, 0, 0), False),
             # r7 adversary pass on be8fb7b6 (A2): a record name ends at ANY non-name character, never only at whitespace; a name not followed by one plain space or the line end
             # makes its record unusable (a toggle / summary) or an unreadable boundary (a measured_session marker or any playback_smoke record)
             "r7b-A2: the adversary's appended `gui_smoke.window_toggles: requested=4 driven=0 reason=incomplete` is a second summary": (
@@ -16448,6 +16450,115 @@ class WindowToggleEvidenceTests(unittest.TestCase):
         self.assertIn('"gui_smoke.window_toggle phase=end index=%1 kind=%2 elapsed_ms=%3 %4"', main)
         header = (ROOT / "platform" / "qt" / "SmokeWindowToggleSchedule.h").read_text(encoding="utf-8")
         self.assertIn("if( msText.empty() || msText.size() > 9 ) return detail::reject( \"bad_ms\" );", header)
+
+    R11_MARKER = "playback_smoke.measured_session id=3\n"
+
+    def r11_a1_rows(self) -> list[tuple[str, str, str, str, tuple[int, int, int, int]]]:
+        """r11 (sol r10 A1 and opus key3 r10 B1 on 7fc447b9): (name, log, session, typed reason, counts). The window is the FIRST marker of the session, closed at the
+        next marker of ANY other id; a second marker of the same id is itself evidence of a broken session (the app writes one per process), so it names itself."""
+        m = self.R11_MARKER
+        b0 = self.toggle(0, "begin")
+        return [
+            ("sol r10 A1 / opus r10 trace 2: a duplicate toggle-0 begin before a repeated id=3 marker is seen, never erased",
+             self.log().replace(m, m + b0 + "\n" + m, 1), "3", "measured-session-marker-repeated", (4, 3, 3, 3)),
+            ("sol r10 A1 / opus r10 trace 1: id=3, then a foreign id=4, then a repeated id=3 and the healthy log (the window closed at id=4 stays closed)",
+             m + "playback_smoke.measured_session id=4\n" + self.log(), "3", "measured-session-marker-repeated", (0, 0, 0, 0)),
+            ("a repeated id=3 marker after the toggles and before the summary (no duplicate record): the repeat alone is non-ok",
+             self.log().replace("\ngui_smoke.window_toggles ", "\n" + m + "gui_smoke.window_toggles ", 1), "3", "measured-session-marker-repeated", (4, 4, 4, 4)),
+            ("no explicit id: a duplicate toggle-0 begin before a repeated id=3 marker (the window is the first marker's)",
+             self.log().replace(m, m + b0 + "\n" + m, 1), "", "measured-session-marker-repeated", (4, 3, 3, 3)),
+        ]
+
+    def test_r11_a1_a_repeated_matching_marker_never_reopens_or_replaces_the_measured_window(self) -> None:
+        """r11 (sol r10 A1, opus key3 r10 B1, site AttrCudaArtifacts.psm1 Get-AttrCudaWindowToggleEvidence): an explicit -MeasuredSessionId binds the FIRST marker of
+        that id, the window closes at the next marker of another id, and a repeated marker of the window's id makes the proof non-ok with a typed reason."""
+        rows = self.r11_a1_rows()
+        out = self.run_cases([self.log(), self.log()] + [log for _, log, _, _, _ in rows], sessions=["3", ""] + [s for _, _, s, _, _ in rows])
+        for got in out[:2]:
+            self.assertEqual(got["e"]["reason"], "ok", got)
+            self.assertEqual(got["passes"], [True, True], got)
+        for (name, _, _, why, counts), got in zip(rows, out[2:], strict=True):
+            with self.subTest(case=name):
+                e = got["e"]
+                self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), counts, got)
+                self.assertIn(why, e["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+        # the docstring and the window comment state the same rule the code runs
+        reader = ATTR_MODULE.read_text(encoding="utf-8").split("function Get-AttrCudaWindowToggleEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("measured-session-marker-repeated", reader)
+        self.assertNotIn("the last marker starts the window", reader)
+
+    def test_r11_a1_the_reconcile_gate_and_the_job_embedded_reader_refuse_a_repeated_marker(self) -> None:
+        """r11 (sol r10 A1 siblings: DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence, used by Test-DvReceiptValid and Invoke-VenueLeg.ps1, and the job's
+        embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over every r11 A1 row are INVALID, and the embedded reader names the repeated marker."""
+        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        rows = [r for r in self.r11_a1_rows() if r[2] == "3"]
+        with tempfile.TemporaryDirectory(prefix="wt-r11-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _, _, _ in rows]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, why, _), got in zip(rows, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertIn(why, got["derived"], got)
+        logs = {"clean": self.log(), **{f"row{n}": log for n, (_, log, _, _, _) in enumerate(rows)}}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        embedded = json.loads(proc.stdout)
+        self.assertEqual(embedded["clean"], "ok", embedded)
+        for n, (name, _, _, why, _) in enumerate(rows):
+            with self.subTest(gate="embedded job reader", case=name):
+                self.assertIn(why, embedded[f"row{n}"], embedded)
+
+    def test_r11_a2_an_unreadable_measured_session_refuses_requested_toggle_proof(self) -> None:
+        """r11 (sol r10 A2, opus key3 r10 H1, site DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence): when Get-DvSmokeSummaryFields reads the measured session
+        as UNREADABLE, the reconcile gate refuses the toggle proof with a typed reason and never hands an empty id to the reader's automatic session selection."""
+        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        m = self.R11_MARKER
+        cases = [
+            ("sol r10 A2: id=3x and session=3x (the reader would auto-select the only marker, 3x)", self.log().replace("id=3", "id=3x").replace("session=3", "session=3x"), ok),
+            ("a first marker id=3.5", self.log().replace(m, "playback_smoke.measured_session id=3.5\n", 1), ok),
+            ("a first marker id=3x over metrics the auto-selecting reader would derive", self.log().replace("id=3", "id=3x").replace("session=3", "session=3x"), "DERIVE"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="wt-r11a2-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": metrics} for _, log, metrics in cases]
+                                       + [{"spec": asks, "log": self.log(), "metrics": ok}]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $m = $_.metrics\n"
+                "  if ($m -is [string]) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId ''\n"
+                "    $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason } }\n"
+                "  $s = Get-DvSmokeSummaryFields -LogText ([string]$_.log)\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ unreadable = $s.sessionUnreadable; blocks = $r.blocks; reason = [string]$r.reason; derived = [string]$r.derived.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out[-1]["unreadable"], out[-1]["blocks"], out[-1]["derived"]), (False, False, "ok"), out[-1])
+        for (name, _, _), got in zip(cases, out[:-1], strict=True):
+            with self.subTest(case=name):
+                self.assertTrue(got["unreadable"], got)
+                self.assertTrue(got["blocks"], got)
+                self.assertIn("WINDOW_TOGGLES_SESSION_UNREADABLE", got["reason"], got)
+                self.assertIn("measured-session-unreadable", got["derived"], got)
 
     def test_r3_b4_a_requested_leg_must_back_its_scalars_with_the_hashed_run_log(self) -> None:
         """r3 B4 (sol): requested-toggle success is reconciled with the hashed run log, in the writer and in receipt validation, by the one shared reader
