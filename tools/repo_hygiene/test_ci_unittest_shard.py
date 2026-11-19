@@ -2748,6 +2748,132 @@ class ShardExitCodeTests(unittest.TestCase):
             self._run_with_fake_workers(procs, past_deadline=True)
         self.assertEqual(str(caught.exception), "first")
 
+    # r17 sol r16 A3 (second form): an unreadable outer constructor frame must not let an inner constructor's Popen through.
+    def test_half_built_worker_never_adopts_a_callbacks_own_constructor_when_the_outer_frames_cannot_be_read(self) -> None:
+        class Inner(subprocess.Popen):  # type: ignore[type-arg]
+            """Keeps the stdlib ``Popen.__init__`` frame; only the OS launch is replaced."""
+
+            def _execute_child(self, *args: object, **kwargs: object) -> None:
+                self.pid = 99  # type: ignore[assignment]
+                raise KeyboardInterrupt
+
+        def callback() -> None:
+            Inner(["callback-owned-child"])
+
+        class Outer(subprocess.Popen):  # type: ignore[type-arg]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = None  # type: ignore[assignment]
+                self.returncode = None
+                callback()
+
+        class Link:
+            """The OUTER constructor's frame read is denied (an audit hook's doing); every other frame reads."""
+
+            def __init__(self, real: types.TracebackType, state: dict[str, bool]) -> None:
+                self._real, self._state = real, state
+
+            @property
+            def tb_frame(self) -> types.FrameType:
+                if self._real.tb_frame.f_code.co_name == "__init__" and not self._state["denied"]:
+                    self._state["denied"] = True
+                    raise RuntimeError("an audit hook denied the frame read")
+                return self._real.tb_frame
+
+            @property
+            def tb_next(self) -> object:
+                return None if self._real.tb_next is None else Link(self._real.tb_next, self._state)
+
+        class Slot:
+            def __get__(self, error: BaseException, owner: type) -> object:
+                return Link(error.__traceback__, {"denied": False})  # type: ignore[arg-type]
+
+        found: object = "unset"
+        try:
+            Outer(["worker"])
+        except KeyboardInterrupt as error:
+            with mock.patch.object(shard, "_TRACEBACK_SLOT", Slot()):
+                found = shard.half_built_worker(error)
+        self.assertIsNone(found, "a callback's own Popen was taken for the launch's child")
+
+    # r17 sol r16 A2: truth-testing a saved exception must not be how the first one is kept.
+    def test_end_running_workers_keeps_the_first_exception_whatever_its_truth_value(self) -> None:
+        class Hostile(KeyboardInterrupt):
+            def __bool__(self) -> bool:
+                raise SystemExit(0)
+
+        class Falsy(KeyboardInterrupt):
+            def __bool__(self) -> bool:
+                return False
+
+        for first_type in (Hostile, Falsy):
+            polls = [first_type("first"), OSError("second")]
+
+            class Poller(self._RunningProc):  # type: ignore[valid-type, misc]
+                def poll(self) -> int | None:
+                    if polls and self.kill_calls == 0:
+                        raise polls.pop(0)
+                    return super().poll()
+
+            procs = [Poller(), Poller()]
+            with self.subTest(first=first_type.__name__), mock.patch.object(shard, "_kill_tree", return_value=None):
+                ended, interrupt = shard.end_running_workers(procs)  # type: ignore[arg-type]
+                self.assertEqual([proc.returncode for proc in procs], [-9, -9], "a worker was left running")
+                self.assertIsInstance(interrupt, first_type, "the first exception met was replaced")
+
+    # r17 sol r16 A1: an interrupt met while a watchdog is stopped is raised once the cleanup is done, never dropped.
+    def test_an_interrupt_met_while_the_serial_watchdog_is_stopped_is_raised(self) -> None:
+        clock = FakeClock()
+
+        class Probe(unittest.TestCase):
+            def test_one(self) -> None:
+                clock.advance(1.0)
+
+        Probe.__module__ = "fake_mod"
+        Probe.__qualname__ = "Probe"
+        real_stop = shard.BudgetWatch.stop
+
+        def stop(self: object) -> BaseException | None:
+            real_stop(self)  # type: ignore[arg-type]
+            return KeyboardInterrupt("cancel during stop")
+
+        with (
+            mock.patch.object(shard.BudgetWatch, "stop", stop),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            shard.run_shard([Probe("test_one")], "ubuntu", 1, 1, clock=clock, environ={}, stream=io.StringIO())
+
+    def test_the_watchdog_stops_hand_back_the_interrupt_they_meet_instead_of_swallowing_it(self) -> None:
+        class DeadThread:
+            def is_alive(self) -> bool:
+                raise KeyboardInterrupt("cancel during stop")
+
+        for make in (
+            lambda: shard.BudgetWatch("ubuntu", 1, 1, 10.0, 0.0, time.monotonic, dict),
+            lambda: shard.DeadlineKiller(1e12, time.monotonic),
+        ):
+            watchdog = make()
+            watchdog._thread = DeadThread()  # type: ignore[attr-defined]
+            with self.subTest(kind=type(watchdog).__name__):
+                self.assertIsInstance(watchdog.stop(), KeyboardInterrupt)
+
+    def test_an_interrupt_met_while_a_watchdog_is_stopped_is_raised_by_run_parallel_after_the_cleanup(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc()]
+        real_stop = shard.DeadlineKiller.stop
+
+        def stop(self: object) -> BaseException | None:
+            real_stop(self)  # type: ignore[arg-type]
+            return KeyboardInterrupt("cancel during stop")
+
+        with (
+            mock.patch.object(shard.DeadlineKiller, "stop", stop),
+            mock.patch.object(shard, "_kill_tree", return_value=None),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self._run_with_fake_workers(procs, past_deadline=True)
+        self.assertEqual([proc.returncode for proc in procs], [-9, -9], "a worker was left running")
+
     # r16 sol r15 A2: an interrupt at the final cleanup census must not skip ending the owned workers.
     def test_an_interrupt_in_the_final_census_still_ends_every_owned_worker(self) -> None:
         class InterruptedOnce(self._RunningProc):  # type: ignore[valid-type, misc]

@@ -623,13 +623,16 @@ class BudgetWatch:
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> BaseException | None:
+        """Tell the thread to stop and wait for it; the interrupt met while waiting (if any), never raised here:
+        the caller finishes its cleanup first and then lets it out, so a cancellation is not turned into a pass."""
         self._stopped.set()
         try:
             if self._thread.is_alive():
                 self._thread.join()
-        except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
-            pass
+        except BaseException as error:  # noqa: BLE001 - a daemon already told to stop; the cleanup after it must still run
+            return error
+        return None
 
     def _poll(self) -> None:
         while not self._stopped.wait(self._poll_seconds):
@@ -637,15 +640,6 @@ class BudgetWatch:
 
 
 _TRACEBACK_SLOT = BaseException.__traceback__  # the member descriptor: reads the stored traceback, whatever a subclass defines
-_STDLIB_POPEN = getattr(sys.modules.get("subprocess"), "Popen", None)  # looked up, not read as an attribute (see _windows_handle_type)
-_POPEN_CONSTRUCTOR_CODES = frozenset(
-    code
-    for code in (
-        getattr(getattr(_STDLIB_POPEN, "__init__", None), "__code__", None),
-        getattr(getattr(_STDLIB_POPEN, "_execute_child", None), "__code__", None),
-    )
-    if code is not None
-)  # the stdlib constructor's own frames: the only ones trusted to be "this launch" once a frame went unreadable
 
 
 def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
@@ -663,18 +657,17 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
     # Read from ``BaseException``'s own slot, never through ``error.__traceback__``: a subclass can turn that
     # attribute into a property that answers ``None`` while the real traceback is there.
     link = _TRACEBACK_SLOT.__get__(error, BaseException)
-    unreadable = False  # a frame could not be read: it may have been the constructor's own
     while link is not None:
         candidate = None
         try:
-            frame = link.tb_frame
-            found = frame.f_locals.get("self")
-            # Once a frame was unreadable the nearest constructor may be the one that was hidden, so a later
-            # ``Popen`` counts only as ``Popen``'s own constructor frame: a callback below it is never the child.
-            if isinstance(found, subprocess.Popen) and (not unreadable or frame.f_code in _POPEN_CONSTRUCTOR_CODES):
+            found = link.tb_frame.f_locals.get("self")
+            if isinstance(found, subprocess.Popen):
                 candidate = found
-        except BaseException:  # noqa: BLE001 - a frame that cannot be read is skipped; recovery never replaces the launch's own error
-            unreadable = True
+        except BaseException:  # noqa: BLE001 - recovery never replaces the launch's own error
+            # A frame that cannot be read may be the constructor's own, and every ``Popen`` below it (a
+            # callback's, even another constructor's) can no longer be told from this launch's child: the
+            # search ends here, on nothing, rather than adopt a process this launch did not create.
+            return None
         if candidate is not None:
             # The first ``Popen`` met walking inward is the constructor the launch called: every frame
             # below it (an audit hook, a callback) can hold some OTHER live ``Popen`` as its own ``self``,
@@ -857,16 +850,19 @@ def run_shard(
 
     runner = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=make_result)
     watch.start()
+    stop_error: BaseException | None = None
     try:
         result = runner.run(ClassTimingSuite(members))
     finally:
-        watch.stop()
+        stop_error = watch.stop()
         seconds = made[0].snapshot() if made else {}
         if seconds:
             watch.check()
             failed = emit_text("\n".join(slowest_block(profile, index, of, clock() - begin, seconds)) + "\n", out)
             if failed is not None:  # informational: the exit code stays the test outcome
                 emit_text(f"SHARD_SLOWEST could not be printed ({failed})\n", sys.stderr)
+    if stop_error is not None:  # an interrupt met while the watchdog was stopped is not lost: the run is not a pass
+        raise stop_error
     if manifest is not None and made:
         write_manifest(manifest, made[0].started_ids)
     if result.testsRun == 0:
@@ -1235,12 +1231,14 @@ def end_running_workers(procs: Sequence[subprocess.Popen[bytes]]) -> tuple[dict[
             try:
                 running = proc.poll() is None
             except BaseException as error:  # noqa: BLE001 - poll raised: its state is unknown, so the worker is ended
-                first = first or error
+                if first is None:  # never ``first or error``: truth-testing an exception can itself raise
+                    first = error
                 running = True
             if running:
                 leftover.append(number)
     except BaseException as error:  # noqa: BLE001 - the census loop itself was cut short: end every worker
-        first = first or error
+        if first is None:
+            first = error
         leftover = list(range(1, len(procs) + 1))
     results: list[str | None] = ["its termination did not complete"] * len(leftover)
     for _attempt in range(TERMINATE_ATTEMPTS):
@@ -1248,7 +1246,8 @@ def end_running_workers(procs: Sequence[subprocess.Popen[bytes]]) -> tuple[dict[
             results = terminate_all([procs[number - 1] for number in leftover])
             break
         except BaseException as error:  # noqa: BLE001 - terminate_all never raises; an interrupt can still land in it
-            first = first or error
+            if first is None:
+                first = error
     return dict(zip(leftover, results, strict=True)), first
 
 
@@ -1327,13 +1326,16 @@ class DeadlineKiller:
             except BaseException:  # noqa: BLE001 - one bad slice must not end the watchdog; the next one retries
                 pass
 
-    def stop(self) -> None:
+    def stop(self) -> BaseException | None:
+        """Tell the thread to stop and wait for it; the interrupt met while waiting (if any), never raised here:
+        the caller finishes its cleanup first and then lets it out, so a cancellation is not turned into a pass."""
         self._stopped.set()
         try:
             if self._thread.is_alive():
                 self._thread.join()
-        except BaseException:  # noqa: BLE001 - a daemon already told to stop; an interrupt while waiting must not skip the cleanup after it
-            pass
+        except BaseException as error:  # noqa: BLE001 - a daemon already told to stop; the cleanup after it must still run
+            return error
+        return None
 
 
 @never_exits_zero
@@ -1559,9 +1561,9 @@ def run_parallel(
                 if unreadable is not None:
                     unread.append(number)
                     problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
-        killer.stop()
+        killer_error = killer.stop()
         report_unended()
-        watch.stop()
+        watch_error = watch.stop()
         if stuck and not unread:  # a worker still running can write to its log after this: say where it stays
             problems.append(
                 "worker(s) " + ", ".join(str(number) for number in sorted(stuck))
@@ -1572,8 +1574,13 @@ def run_parallel(
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             for problem in problems:
                 emit_error(problem)
-        elif census_error is not None:
-            raise census_error  # an interrupt met in the census is not lost: it goes out once every worker has been ended
+        else:
+            # An interrupt met in the census or while a watchdog was stopped is not lost: it goes out once every
+            # worker has been ended, the first one met first (compared with ``is None``: an exception's own
+            # truth value is its class's business).
+            pending = next((met for met in (census_error, killer_error, watch_error) if met is not None), None)
+            if pending is not None:
+                raise pending
     ran =sorted(item for record in records if record for item in record["ids"])
     # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
     accounted = sorted(ran + [item for record in records if record for item in record["skipped_ids"]])
