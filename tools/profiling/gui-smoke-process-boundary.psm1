@@ -338,7 +338,7 @@ function Test-GuiSmokeWaitBudgetExhausted {
         [int64]$BudgetMs,
         # Stopwatch.GetTimestamp() read before the process was started; 0 = not known
         [int64]$LaunchTimestamp = 0,
-        # r15 (hosted CI on 1477a490, ubuntu only): the wall instant (UTC) the caller read just before Process.Start, right after LaunchTimestamp; MinValue = not
+        # r15 (hosted CI on 1477a490, ubuntu only): the wall instant (UTC) the caller read just before Process.Start (the runner's $startUtc); MinValue = not
         # known. Process.StartTime of a process that has ALREADY EXITED is not readable on Linux (.NET derives it from /proc/<pid>/stat, gone once the child is
         # reaped, so the read throws and the catch below used to turn that into "not exhausted": every late exit read as a clean one). The launch instant exists
         # on every OS and is read in the same wall-clock domain as Process.ExitTime, so it is the lifetime's start whenever the caller has one; StartTime is only

@@ -550,9 +550,8 @@ $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
 $logRoot = Join-Path $env:GS_TMP 'legdeadline'; New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 $env:GS_LOG = Join-Path $logRoot 'mlvapp-1.log'
 # r11 fix 6: the runner's own monotonic launch stamp, read just before the process is started
+$startUtc = [datetime]::UtcNow
 $startTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
-# r15: and on the wall clock, read right after the stamp and before the launch (the runner's $launchUtc): the start of the lifetime the boundary judges
-$launchUtc = [datetime]::UtcNow
 $s = New-Stub $env:GS_STUB
 $process = $s.p; $stdoutTask = $s.o; $stderrTask = $s.e
 . ([scriptblock]::Create($env:GS_DERIVE))
@@ -1084,7 +1083,7 @@ class ALateExitIsJudgedFromTheLaunchInstantNotFromAStartTimeReadAfterTheExit(uni
     still answers. On Linux .NET derives StartTime from /proc/<pid>/stat, which is gone once the child is reaped, so the read throws; the function's catch
     (gui-smoke-process-boundary.psm1, `catch { return $false }`) turned the throw into "not exhausted", so every late exit read as a clean one -- exactly the
     five tests whose stub outlived its budget (the in-budget tests expect false and passed on both). The lifetime is now measured from the wall instant the
-    runner reads just before Process.Start ($launchUtc), which exists on every OS, so no read of a dead process's start time decides a verdict.
+    runner reads just before Process.Start ($startUtc), which exists on every OS, so no read of a dead process's start time decides a verdict.
     Class: a clock read taken after the thing it describes is gone."""
 
     def test_the_launch_instant_decides_the_lifetime_whatever_the_process_start_time_would_read(self) -> None:
@@ -1112,17 +1111,20 @@ $s = New-Stub 'exit 0'
         self.assertIn("-LaunchUtc $LaunchUtc", wait, "the boundary hands the launch instant to its own budget check")
 
     def test_the_runner_reads_the_launch_instant_before_the_launch_and_hands_it_to_every_judging_call(self) -> None:
+        # the launch instant is the runner's existing $startUtc (also the receipt's startedAtUtc), read before the monotonic stamp and before Process.Start; a
+        # second variable would also not exist in the harnesses that execute the runner's launch reads as written (test_core_partition_leg's exit-stamp driver)
         source = RUNNER.read_text(encoding="utf-8")
+        utc = source.index("$startUtc = [datetime]::UtcNow")
         stamp = source.index("$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()")
-        utc = source.index("$launchUtc = [datetime]::UtcNow")
         start = source.index("$process = [System.Diagnostics.Process]::Start($startInfo)")
-        self.assertLess(stamp, utc, "stamp first, wall instant after it: the wall lifetime cannot read longer than the monotonic time since launch")
-        self.assertLess(utc, start)
+        self.assertLess(utc, stamp)
+        self.assertLess(stamp, start)
+        self.assertNotIn("$launchUtc", source, "one launch instant, not two")
         wait = _runner_snippet(*_WAIT_REGION)
-        paired = len(re.findall(r"-LaunchTimestamp \$startTimestamp[ `\r\n]+-LaunchUtc \$launchUtc", wait))
+        paired = len(re.findall(r"-LaunchTimestamp \$startTimestamp[ `\r\n]+-LaunchUtc \$startUtc", wait))
         self.assertEqual(paired, wait.count("-LaunchTimestamp $startTimestamp"),
                          "every call that takes the monotonic stamp takes the launch instant with it (the boundary call continues on the next line)")
-        self.assertGreaterEqual(wait.count("-LaunchUtc $launchUtc"), 6, "two budget checks, three stall sites and the boundary call")
+        self.assertGreaterEqual(wait.count("-LaunchUtc $startUtc"), 6, "two budget checks, three stall sites and the boundary call")
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
@@ -1191,7 +1193,7 @@ Stop-GuiSmokeLogProgressWatch -Watch $w2
         self.assertEqual(3, len(sites), "the host-load branch has two stall sites and the log-only branch one")
         for site in sites:
             tail = wait[site:wait.index("break", site)]
-            self.assertIn("Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $launchUtc", tail,
+            self.assertIn("Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $startUtc", tail,
                           "a stall verdict reached at or past the whole budget is judged against it before the boundary types the leg")
             self.assertIn("-ge $effectiveProcessTimeoutMs", tail)
 
