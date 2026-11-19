@@ -952,6 +952,36 @@ TEST(ViewerIdlePolicy, QueuedSynthesizedSamePositionMoveLeavesTheCursorHiddenAnd
 }
 #endif
 
+// P17 (r7, adversary pass 11 A1): fullscreen entered at 0 and hidden at 2000; at 2101 the window manager restores the
+// window without the action (isFullScreen() false, the action still checked). The next tick must leave the idle
+// machinery. Before the window is first seen fullscreen (showFullScreen() is asynchronous) it waits out the grace
+// period; a backwards clock leaves; not fullscreen never asks to leave; entering again starts a fresh look.
+TEST(ViewerIdlePolicy, WindowLeftFullscreenWithoutTheActionAsksTheCallerToLeave)
+{
+    viewer_idle::Controller c;
+    ASSERT_FALSE(c.windowLeftFullscreen(false, 0, 2000));   // not fullscreen
+    c.setFullscreen(true, 0);
+    ASSERT_FALSE(c.windowLeftFullscreen(false, 50, 2000));  // showFullScreen() still pending
+    ASSERT_FALSE(c.windowLeftFullscreen(true, 100, 2000));
+    int rearm = 0;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+    ASSERT_FALSE(c.windowLeftFullscreen(true, 2050, 2000));
+    ASSERT_TRUE(c.windowLeftFullscreen(false, 2101, 2000));  // the pass-11 input
+    c.setFullscreen(false, 2101);
+    ASSERT_FALSE(c.hidden());
+    ASSERT_FALSE(c.windowLeftFullscreen(false, 2150, 2000));
+
+    // Never seen fullscreen: leaves once the grace period is over (or the clock went backwards).
+    c.setFullscreen(true, 3000);
+    ASSERT_FALSE(c.windowLeftFullscreen(false, 4999, 2000));
+    ASSERT_TRUE(c.windowLeftFullscreen(false, 5000, 2000));
+    ASSERT_TRUE(c.windowLeftFullscreen(false, 2999, 2000));
+    // Entering again forgets the earlier sighting.
+    ASSERT_FALSE(c.windowLeftFullscreen(true, 5000, 2000));
+    c.setFullscreen(true, 6000);
+    ASSERT_FALSE(c.windowLeftFullscreen(false, 6050, 2000));
+}
+
 // P14 (r6, adversary pass 9 A1): the Windows hook failed to install (SetWindowsHookExW returned NULL), so input an
 // excluded wait defers has no witness. The pass-9 input: fullscreen at (500,500), the tick at 2000 would hide; with
 // the witness missing it never hides, and a cursor already hidden is shown at the next tick. Control: the

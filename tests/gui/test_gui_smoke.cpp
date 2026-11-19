@@ -703,6 +703,7 @@ private slots:
     void viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces();
     void viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow();
     void viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHidden();
+    void viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheIdleMachinery();
 #endif
     void viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces();
     void viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack();
@@ -2390,6 +2391,9 @@ public:
     bool queueStatusTick = false;
     // r7: how many ticks returned Show (a control that re-hides one idle period later is still seen).
     int shows = 0;
+    // r7 (adversary pass 11 A1): MainWindow's isFullScreen() at a tick (false: the window manager restored it).
+    bool windowReallyFullscreen = true;
+    bool timerActive() const { return m_timer.isActive(); }
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -2437,6 +2441,12 @@ private:
 
     void timeout()
     {
+        // As MainWindow (r7, adversary pass 11 A1): fullscreen left without the action leaves the idle machinery.
+        if( m_idle.windowLeftFullscreen( windowReallyFullscreen, m_clock.elapsed(), m_idleMs ) )
+        {
+            leaveFullscreen();
+            return;
+        }
         int ms = 0;
         viewer_idle::Inputs in = inputs;
         // As MainWindow: a logical QPoint, so a sub-logical-pixel move is not seen here (r4 bound, PointerWatch).
@@ -2988,6 +2998,47 @@ void GuiSmokeTest::viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHi
         harness.leaveFullscreen();
         QVERIFY( !viewer_idle::win_hook::installed() );
     }
+}
+
+// G13 (r7, adversary pass 11 A1): enter fullscreen, hidden after one idle period; then the window manager restores
+// the window without the action (isFullScreen() false, the action still checked) and the pointer stays still.
+// Expected: both surfaces are shown, the hook is removed and the idle timer stops. And a window not yet seen
+// fullscreen (showFullScreen() pending) is given one idle period before the same exit.
+void GuiSmokeTest::viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheIdleMachinery()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.inputExcluded = true;
+    auto cleanup = qScopeGuard( [&harness]() { harness.leaveFullscreen(); } );
+
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    harness.windowReallyFullscreen = false;
+    QTRY_VERIFY_WITH_TIMEOUT( !viewer_idle::win_hook::installed(), 1000 );
+    QVERIFY( !harness.timerActive() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+    QVERIFY( !harness.hidden() );
+
+    // Never seen fullscreen: polled for one idle period, then the same exit; it never hides meanwhile.
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_VERIFY_WITH_TIMEOUT( !viewer_idle::win_hook::installed(), 1000 );
+    QVERIFY( !harness.timerActive() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    harness.windowReallyFullscreen = true;
 }
 #endif
 

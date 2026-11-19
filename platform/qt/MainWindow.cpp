@@ -3745,6 +3745,13 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
 
 void MainWindow::viewerIdleTimeout( void )
 {
+    // r7 (adversary pass 11 A1): fullscreen left without the action (the window manager restored the window, the
+    // action stays checked): leave the idle machinery exactly as the action's exit does (timer, hook, cursor).
+    if( m_viewerIdle.windowLeftFullscreen( isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() ) )
+    {
+        viewerIdleFullscreenChanged( false );
+        return;
+    }
     int ms = 0;
     viewer_idle::Inputs in = viewerIdleInputs();
     // An input-excluded wait runs this timer but delivers no mouse event: the OS pointer position is the witness. It

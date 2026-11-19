@@ -357,3 +357,28 @@ TEST(ViewerIdleWiring, TickGatesTheHideOnTheInstalledRetrievalHook)
     const QString header = readRepoFile(QStringLiteral("platform/qt/ViewerIdlePolicy.h"));
     ASSERT_TRUE(header.contains(QStringLiteral("&& !i.witnessMissing;")));
 }
+
+// W10 (r7, adversary pass 11 A1): the tick first asks the controller whether fullscreen was left without the action
+// (isFullScreen() false after the window was seen fullscreen, or never seen within one idle period), on every platform,
+// and then leaves through the action's own exit path (timer, hook, cursor) and returns before any rearm.
+TEST(ViewerIdleWiring, TickLeavesTheIdleMachineryWhenFullscreenWasLeftWithoutTheAction)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString timeout = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    ASSERT_FALSE(timeout.isEmpty());
+    const QString ask = QStringLiteral(
+        "if( m_viewerIdle.windowLeftFullscreen( isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() ) )");
+    ASSERT_EQ(1, int(timeout.count(ask)));
+    const int askAt = timeout.indexOf(ask);
+    const int leaveAt = timeout.indexOf(QStringLiteral("viewerIdleFullscreenChanged( false );"), askAt);
+    const int returnAt = timeout.indexOf(QStringLiteral("return;"), leaveAt);
+    ASSERT_TRUE(leaveAt > askAt);
+    ASSERT_TRUE(returnAt > leaveAt);
+    ASSERT_TRUE(returnAt < timeout.indexOf(QStringLiteral("viewer_idle::Inputs in = viewerIdleInputs();")));
+    ASSERT_TRUE(timeout.lastIndexOf(QStringLiteral("#ifdef"), askAt) < 0);
+    const QString changed = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleFullscreenChanged( bool on )"));
+    ASSERT_TRUE(changed.contains(QStringLiteral("m_viewerIdleTimer->stop();")));
+    ASSERT_TRUE(changed.contains(QStringLiteral("viewer_idle::win_hook::remove();")));
+}

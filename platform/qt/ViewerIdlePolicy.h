@@ -352,16 +352,35 @@ public:
     /*! \brief Entering fullscreen starts the idle clock; leaving it clears the hidden state. */
     void setFullscreen( bool on, qint64 nowMs )
     {
+        m_sawWindowFullscreen = false;
         if( on )
         {
             m_fullscreen = true;
             m_lastActivity = nowMs;
+            m_enteredAt = nowMs;
         }
         else
         {
             m_fullscreen = false;
             m_hidden = false;
         }
+    }
+
+    /*! \brief r7 (adversary pass 11 A1): the window's real fullscreen state at a tick. True iff the caller must
+     *         leave the idle machinery (stop the timer, remove the hook, show the cursor) because fullscreen was left
+     *         without the action (the window manager restored the window): the window was seen really fullscreen at
+     *         a tick and is not now, or it was never seen fullscreen within graceMs of entering (showFullScreen() is
+     *         asynchronous, so the first looks may precede it). False when not fullscreen. */
+    bool windowLeftFullscreen( bool reallyFullscreen, qint64 nowMs, qint64 graceMs )
+    {
+        if( !m_fullscreen ) return false;
+        if( reallyFullscreen )
+        {
+            m_sawWindowFullscreen = true;
+            return false;
+        }
+        if( m_sawWindowFullscreen ) return true;
+        return nowMs - m_enteredAt >= graceMs || nowMs < m_enteredAt;
     }
 
     /*! \brief Records activity. Returns true iff the cursor was hidden (the caller restores it). */
@@ -436,6 +455,8 @@ private:
 
     bool m_fullscreen = false;
     bool m_hidden = false;
+    bool m_sawWindowFullscreen = false;
+    qint64 m_enteredAt = 0;
     qint64 m_lastActivity = 0;
 };
 
