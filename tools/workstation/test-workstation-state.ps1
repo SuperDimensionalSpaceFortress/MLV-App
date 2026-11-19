@@ -3749,6 +3749,65 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
         Remove-Item -LiteralPath $spL.FullName -Force -ErrorAction SilentlyContinue
     }
 
+    # --- r3 (adversary pass 6 on 03de6529): A1 include origin, A4 post-write snapshot throws, A5 take-back wording, A3 temp dir behind a junction
+    # A1: git labels a value read from an include.path file with the INCLUDING file's scope (local); a HOME-dependent include must not count as a repository push url
+    $spInc = Join-Path (New-Scratch 'sp-r3a1') 'push-include.gitconfig'; [IO.File]::WriteAllText($spInc, "[remote `"fork`"]`n`tpushurl = $spS`n")
+    $spRp = New-SpRepo 'r3a1-include'; & git -C $spRp config include.path ($spInc -replace '\\', '/')
+    $r = Invoke-SpRun $spRp $spAuth
+    Assert-That ($r.Log -notmatch 'SSH_PUSH_READY' -and @($r.Manual | Where-Object { $_ -match '^PUSHURL_FOREIGN remote=fork' }).Count -eq 1 -and @(Get-SpCfg $spRp 'remote.fork.pushurl').Count -eq 0) 'SSH-PUSHURL-1 r3 A1 setup: an ssh push url that comes from an include.path file is not a ready repository push url (PUSHURL_FOREIGN, no SSH_PUSH_READY, nothing written)' "manual=$($r.Manual -join '|')`n$($r.Log)"
+    $r = Invoke-SpRun $spRp $spAuth -VerifyOnly
+    Assert-That ($r.Failures -contains 'PUSHURL_FOREIGN remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY') 'SSH-PUSHURL-1 r3 A1 verify: the same included push url is a typed failure PUSHURL_FOREIGN' "fail=$($r.Failures -join ',')`n$($r.Log)"
+    # the snapshot itself: the included value is in Push, not in LocalPush
+    $svRepo = $script:Repo; $script:Repo = $spRp; $Repo = $spRp
+    try { $spSn = Get-SshPushUrlConfigSnapshot } finally { $script:Repo = $svRepo; $Repo = $svRepo }
+    Assert-That (@($spSn.Push).Count -eq 1 -and @($spSn.LocalPush).Count -eq 0 -and @($spSn.LocalUrls).Count -eq 1) 'SSH-PUSHURL-1 r3 A1 snapshot: an included push url is in Push but not in LocalPush; the repository fork url is still local' ($spSn | ConvertTo-Json -Compress)
+    # no regression: a linked worktree's own config (git prints an absolute origin there) still counts as the repository config
+    $spRpMain = New-SpRepo 'r3a1-main'
+    $spWt = Join-Path (New-Scratch 'sp-r3a1-wt') 'MLV-App'; & git -C $spRpMain worktree add --orphan -b r3a1-wt $spWt 2>$null | Out-Null
+    $r = Invoke-SpRun $spWt $spAuth
+    Assert-That ((Get-SpCfg $spWt 'remote.fork.pushurl') -ceq $spS -and $r.Log -match [regex]::Escape("SSH_PUSH_READY remote=fork pushurl=$spS") -and $r.Failures.Count -eq 0) 'SSH-PUSHURL-1 r3 A1 worktree: in a linked worktree the common git dir config is the repository config (pushurl set, SSH_PUSH_READY)' "fail=$($r.Failures -join ',')`n$($r.Log)"
+
+    # A4: the post-write snapshot throws (a legacy remote alias file appears together with a foreign push url): the run still takes back its own value and reports the race typed
+    $spRp = New-SpRepo 'r3a4-legacy'
+    $script:spCasRepo = $spRp
+    $script:SshPushUrlAfterWriteHook = {
+        & git -C $script:spCasRepo config --add remote.fork.pushurl 'https://github.com/example/other.git'
+        $spLd = Join-Path $script:spCasRepo '.git\remotes'; [void][IO.Directory]::CreateDirectory($spLd); [IO.File]::WriteAllText((Join-Path $spLd 'legacy'), 'URL: https://example.invalid/unused.git')
+    }
+    try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlAfterWriteHook = $null }
+    $spVals = @(Get-SpCfg $spRp 'remote.fork.pushurl')
+    Assert-That ($r.Failures -contains 'PUSHURL_CHANGED_DURING_PROBE remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY' -and @($spVals | Where-Object { $_ -ceq $spS }).Count -eq 0 -and @($spVals | Where-Object { $_ -ceq 'https://github.com/example/other.git' }).Count -eq 1) 'SSH-PUSHURL-1 r3 A4 setup: when the post-write snapshot throws, our value is still taken back, the foreign one stays and the race is a typed failure' "vals=$($spVals -join ' | ') fail=$($r.Failures -join ',')`nthrown=$($r.Thrown)"
+    Assert-That ($r.Thrown -match 'PUSHURL_CHANGED_DURING_PROBE' -and $r.Thrown -match 'LEASE_LEGACY_REMOTE_ALIAS_PRESENT' -and $r.Thrown -match 'our value was taken back') 'SSH-PUSHURL-1 r3 A4 setup: the diagnostic names the exception text that stopped the re-read and says our value was taken back' $r.Thrown
+
+    # A5: a take-back whose --unset finds no match (a writer removed ours first) says the value is already gone, not that it is still set
+    $spRp = New-SpRepo 'r3a5-gone'
+    $script:spCasRepo = $spRp
+    $script:SshPushUrlAfterWriteHook = { & git -C $script:spCasRepo config --add remote.fork.pushurl 'https://github.com/example/other.git' }
+    $script:SshPushUrlTakeBackHook = { & git -C $script:spCasRepo config --unset remote.fork.pushurl '^git@github\.com:SuperDimensionalSpaceFortress/MLV-App\.git$' }
+    try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlAfterWriteHook = $null; $script:SshPushUrlTakeBackHook = $null }
+    Assert-That ($r.Failures -contains 'PUSHURL_CHANGED_DURING_PROBE remote=fork' -and $r.Thrown -match 'already gone' -and $r.Thrown -notmatch 'still set' -and $r.Thrown -notmatch 'our value was taken back') 'SSH-PUSHURL-1 r3 A5 setup: when our value was already removed by another writer the message says it is already gone, never that it is still set' $r.Thrown
+
+    # A3: a TEMP / TMP that is a directory junction into a .ssh folder (or lies below such a junction) is not used for the probe config
+    $spJb = New-Scratch 'sp-r3a3'
+    $spJReal = Join-Path $spJb 'fake\.ssh'; [void][IO.Directory]::CreateDirectory((Join-Path $spJReal 'sub'))
+    $spJLocal = New-Scratch 'sp-r3a3-localappdata'; [void][IO.Directory]::CreateDirectory((Join-Path $spJLocal 'Temp'))
+    $spJ1 = Join-Path $spJb 'tmplink'; $spJ2 = Join-Path $spJb 'tmplink2'
+    [void](New-Item -ItemType Junction -Path $spJ1 -Target $spJReal); [void](New-Item -ItemType Junction -Path $spJ2 -Target $spJReal)
+    $sv = @{ T = $env:TEMP; M = $env:TMP; L = $env:LOCALAPPDATA }
+    try {
+        foreach ($spJCase in @(@{ N = 'the temp dir itself is a junction into .ssh'; Dir = $spJ1 }, @{ N = 'an ancestor of the temp dir is a junction into .ssh'; Dir = (Join-Path $spJ2 'sub') })) {
+            Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+            $env:TEMP = $spJCase.Dir; $env:TMP = $spJCase.Dir; $env:LOCALAPPDATA = $spJLocal
+            $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+            $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
+            Assert-That ($argText -match [regex]::Escape((Join-Path $spJLocal 'Temp')) -and $argText -notmatch 'tmplink') "SSH-PUSHURL-1 r3 A3 probe: $($spJCase.N) -> the config goes to %LOCALAPPDATA%\Temp, never through the junction" "$argText"
+        }
+        Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+        $env:TEMP = $spJ1; $env:TMP = $spJ1; $env:LOCALAPPDATA = $spJ2
+        $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+        Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'no temp folder' -and -not (Test-Path -LiteralPath $spArgs)) 'SSH-PUSHURL-1 r3 A3 probe: every temp candidate behind a .ssh junction -> fail closed, ssh not run' "$($pr.Detail)"
+    } finally { $env:TEMP = $sv.T; $env:TMP = $sv.M; $env:LOCALAPPDATA = $sv.L; foreach ($spJx in @($spJ1, $spJ2)) { if (Test-Path -LiteralPath $spJx) { [IO.Directory]::Delete($spJx) } } }
+
     # A6: Verify of an existing clone without a fork remote is a typed failure; no clone yet stays a skip
     $spNoFork = New-Scratch 'sp-nofork'; $spNfRepo = Join-Path $spNoFork 'MLV-App'; [void][IO.Directory]::CreateDirectory($spNfRepo); & git -C $spNfRepo init -q 2>$null; & git -C $spNfRepo remote add origin $UpstreamUrl
     $r = Invoke-SpRun $spNfRepo $spAuth -VerifyOnly
