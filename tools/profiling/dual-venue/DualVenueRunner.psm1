@@ -2594,7 +2594,8 @@ function Get-DvLegSetPlan {
             if ($b -notin @($s.spec.backends)) { continue }
             $mode = $(if ($null -ne (Get-DvProp $s.spec 'displayMode')) { [string]$s.spec.displayMode } else { 'fullscreen' })
             # EXPORT-VENUE-LEG-1: an export leg plays nothing and has no display mode; its cell is its format, so both formats of one clip are two cells
-            $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
+            # EXPORT-DEBAYER-QUALITY-1: a quality leg's cell also carries its leg id, so the six debayer legs of one clip (one format) are six cells
+            $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" + $(if ($null -ne (Get-DvProp $s.spec.export 'quality')) { "-$([string]$s.spec.legId)" } else { '' }) } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
             $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
@@ -3212,7 +3213,7 @@ function Read-DvContactFrames {
 $script:LegTypes = @('speed', 'look', 'export')   # leg-spec.schema.json properties.legType.enum
 # EXPORT-VENUE-LEG-1: the export block's fields and formats (leg-spec.schema.json properties.export), and the only generatorArgs key an export leg takes
 $script:ExportFormats = @('cdng-lossless', 'prores')
-$script:ExportFields = @('format', 'maxFrames', 'receipt', 'receiptSha256', 'dualIsoExpected')
+$script:ExportFields = @('format', 'maxFrames', 'receipt', 'receiptSha256', 'dualIsoExpected', 'quality')   # quality: optional, EXPORT-DEBAYER-QUALITY-1
 $script:ExportExcludedKeys = @('look', 'displayMode', 'visualCapture', 'visualCaptureOptOutReason', 'acceptedEffectiveScale', 'presentTearingExpectedReason')
 $script:ExportGeneratorArgs = @('cpuQuiescenceThresholdPercent')
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
@@ -3265,6 +3266,47 @@ function Get-DvExportShapeRefusal {
     if (-not ($receiptSha -is [string] -and $receiptSha -cmatch '^[0-9a-f]{64}(?![\s\S])')) { return 'export.receiptSha256 must be 64 lowercase hex digits' }
     $dualIso = Get-DvProp $ex 'dualIsoExpected'
     if ($dualIso -isnot [bool]) { return "export.dualIsoExpected must be JSON true or false (it is $(ConvertTo-Json -InputObject $dualIso -Compress -Depth 3))" }
+    $qualityProp = $ex.PSObject.Properties['quality']
+    if ($null -ne $qualityProp) { return (Get-DvExportQualityShapeRefusal -Quality $qualityProp.Value -Format $format) }
+    $null
+}
+
+# EXPORT-DEBAYER-QUALITY-1: export.quality (leg-spec.schema.json properties.export.properties.quality), refused the same way: prores only, the fields and their
+# ranges, at most 64 capture frames (pipeline_stage_capture.c CAPTURE_FRAMES_MAX) and each offset inside the 24-frame quality run. Returns the refusal text, or $null.
+$script:ExportQualityFields = @('captureOffsets', 'stages', 'tileSize', 'tilesPerClass')
+$script:ExportQualityStages = @('S2_post_dualiso', 'S3_debayer', 'S4_processing')
+$script:ExportQualityRunFrames = 24
+function Get-DvExportQualityShapeRefusal {
+    param($Quality, [string]$Format)
+    if ($Format -cne 'prores') { return "export.quality is for a prores export only (format is $Format): the quality pass scores the rendered pipeline's debayer" }
+    if ($Quality -isnot [System.Management.Automation.PSCustomObject]) { return 'export.quality must be a single JSON object' }
+    foreach ($p in $Quality.PSObject.Properties) {
+        if ($p.Name -cnotin $script:ExportQualityFields) { return "export.quality.$($p.Name) is not a quality field ($($script:ExportQualityFields -join ', '))" }
+    }
+    foreach ($k in $script:ExportQualityFields) { if ($null -eq $Quality.PSObject.Properties[$k]) { return "export.quality needs $k" } }
+    $isInt = { param($v) ($v -is [int] -or $v -is [long]) }
+    $offsets = $Quality.captureOffsets
+    if ($offsets -isnot [array] -or $offsets.Count -lt 1) { return 'export.quality.captureOffsets must be a non-empty array of whole numbers' }
+    if ($offsets.Count -gt 64) { return "export.quality.captureOffsets lists $($offsets.Count) frames: more than 64 capture frames (the capture harness keeps at most 64)" }
+    $seenOffsets = @{}
+    foreach ($o in $offsets) {
+        if (-not (& $isInt $o) -or $o -lt 0 -or $o -ge $script:ExportQualityRunFrames) { return "export.quality.captureOffsets entries must be whole numbers from 0 to $($script:ExportQualityRunFrames - 1) (the quality run exports $($script:ExportQualityRunFrames) frames)" }
+        if ($seenOffsets.ContainsKey([int64]$o)) { return 'export.quality.captureOffsets must not repeat a frame' }
+        $seenOffsets[[int64]$o] = $true
+    }
+    $stages = $Quality.stages
+    if ($stages -isnot [array] -or $stages.Count -lt 2) { return 'export.quality.stages must be an array of at least two stage names' }
+    $seenStages = @{}
+    foreach ($s in $stages) {
+        if (-not ($s -is [string] -and $s -cin $script:ExportQualityStages)) { return "export.quality.stages entries must be among $($script:ExportQualityStages -join ', ')" }
+        if ($seenStages.ContainsKey($s)) { return 'export.quality.stages must not repeat a stage' }
+        $seenStages[$s] = $true
+    }
+    foreach ($need in 'S2_post_dualiso', 'S4_processing') { if (-not $seenStages.ContainsKey($need)) { return "export.quality.stages must include $need" } }
+    $tile = $Quality.tileSize
+    if (-not ((& $isInt $tile) -and $tile -ge 8 -and $tile -le 512 -and $tile % 2 -eq 0)) { return 'export.quality.tileSize must be an even whole number from 8 to 512' }
+    $per = $Quality.tilesPerClass
+    if (-not ((& $isInt $per) -and $per -ge 1 -and $per -le 256)) { return 'export.quality.tilesPerClass must be a whole number from 1 to 256' }
     $null
 }
 
@@ -4511,7 +4553,102 @@ $script:ExportRenderedStages = @('raw_uint16', 'raw_uint16_disk_read', 'raw_uint
 $script:ExportRenderedTopLevel = @('debayered_frame', 'processing')
 $script:ExportRenderedNesting = 'raw_uint16 (and its disk_read, decompress) and llrawproc nest inside debayered_frame; debayered_frame and processing are disjoint children of processed16_total, the share denominator'
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
-$script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json')
+$script:ExportEvidenceFiles = @('summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json', 'quality.json')   # quality.json: EXPORT-DEBAYER-QUALITY-1
+
+# EXPORT-DEBAYER-QUALITY-1: quality.json's shape (debayer-quality.schema.json), refused typed. Returns the refusal text, or $null.
+$script:DebayerQualityTopKeys = @('schema', 'card', 'result', 'receiptDebayer', 'debayer', 'captureOffsets', 'frames', 'stages', 'tileSize', 'tilesPerClass', 'border', 'isoValue', 'levelSource', 'cfaSource', 'perFrame', 'metrics')
+$script:DebayerQualityMetricKeys = @('ncge', 'sigmaY', 'sigmaC1', 'sigmaC2', 'sigmaC', 'fc')
+# platform/qt/ReceiptSettings.h:16 enum DebayerAlgorithm{ None = 0, Simple, Bilinear, LMMSE, IGV, AMaZE, AHD, RCD, DCB }
+$script:ReceiptDebayerNames = @('none', 'simple', 'bilinear', 'lmmse', 'igv', 'amaze', 'ahd', 'rcd', 'dcb')
+function Get-DvDebayerQualityRefusal {
+    param($Quality, $SpecQuality)
+    if ($Quality -isnot [System.Management.Automation.PSCustomObject]) { return 'quality.json is not one JSON object' }
+    foreach ($p in $Quality.PSObject.Properties) { if ($p.Name -cnotin $script:DebayerQualityTopKeys) { return "quality.json carries $($p.Name), which its schema does not name" } }
+    foreach ($k in $script:DebayerQualityTopKeys) { if ($null -eq $Quality.PSObject.Properties[$k]) { return "quality.json has no $k" } }
+    $isInt = { param($v) ($v -is [int] -or $v -is [long]) }
+    $isNum = { param($v) (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and [double]::IsFinite([double]$v)) }
+    if ([string]$Quality.schema -cne 'mlv-app/debayer-quality/v1' -or [string]$Quality.card -cne 'EXPORT-DEBAYER-QUALITY-1' -or [string]$Quality.result -cne 'QUALITY_CAPTURED') { return 'quality.json schema, card or result is not the debayer quality pass''s' }
+    if (-not ((& $isInt $Quality.receiptDebayer) -and $Quality.receiptDebayer -ge 0 -and $Quality.receiptDebayer -le 8)) { return 'quality.json receiptDebayer is not a receipt debayer value (0..8)' }
+    if ([string]$Quality.debayer -cne $script:ReceiptDebayerNames[[int]$Quality.receiptDebayer]) { return 'quality.json debayer is not the name of its receiptDebayer' }
+    if (-not ((& $isInt $Quality.isoValue) -and $Quality.isoValue -ge 0)) { return 'quality.json isoValue is not a whole number' }
+    if ([string]$Quality.levelSource -cnotin @('rawi', 'observed') -or [string]$Quality.cfaSource -cnotin @('rawi', 'default-rggb') -or -not ((& $isInt $Quality.border) -and $Quality.border -eq 32)) { return 'quality.json levelSource, cfaSource or border is not the metric script''s' }
+    if ($null -ne $SpecQuality) {
+        foreach ($k in 'captureOffsets', 'stages', 'tileSize', 'tilesPerClass') {
+            if (-not (Test-DvJsonEquivalent (Get-DvProp $Quality $k) (Get-DvProp $SpecQuality $k))) { return "quality.json $k is not the leg spec's export.quality.$k" }
+        }
+    }
+    $stages = @($Quality.stages)
+    $frames = @($Quality.frames)
+    $rows = @($Quality.perFrame)
+    if ($frames.Count -ne @($Quality.captureOffsets).Count -or $rows.Count -ne $frames.Count) { return 'quality.json frames / perFrame do not hold one row per capture offset' }
+    $metricStages = @($stages | Where-Object { $_ -cin @('S3_debayer', 'S4_processing') })
+    $checkMetrics = {
+        param($m)
+        if ($m -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+        if (@($m.PSObject.Properties.Name | Where-Object { $_ -cnotin $metricStages }).Count -gt 0) { return $false }
+        foreach ($st in $metricStages) {
+            $set = Get-DvProp $m $st
+            if ($set -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+            if (@($set.PSObject.Properties.Name | Where-Object { $_ -cnotin $script:DebayerQualityMetricKeys }).Count -gt 0) { return $false }
+            foreach ($k in $script:DebayerQualityMetricKeys) { $v = Get-DvProp $set $k; if (-not (& $isNum $v)) { return $false }; if ($k -cne 'ncge' -and [double]$v -lt 0) { return $false } }
+        }
+        $true
+    }
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        if ($r -isnot [System.Management.Automation.PSCustomObject]) { return "quality.json perFrame[$i] is not an object" }
+        if (-not (Test-DvJsonEquivalent (Get-DvProp $r 'frame') $frames[$i])) { return "quality.json perFrame[$i].frame is not frames[$i]" }
+        $sha = Get-DvProp $r 'sha256'
+        if ($sha -isnot [System.Management.Automation.PSCustomObject]) { return "quality.json perFrame[$i].sha256 is not an object" }
+        if (-not (Test-DvJsonEquivalent @($sha.PSObject.Properties.Name | Sort-Object) @($stages | Sort-Object))) { return "quality.json perFrame[$i].sha256 does not name exactly the captured stages" }
+        foreach ($st in $stages) { if ([string](Get-DvProp $sha $st) -cnotmatch '^[0-9a-f]{64}(?![\s\S])') { return "quality.json perFrame[$i].sha256.$st is not a sha256" } }
+        foreach ($k in 'flatTiles', 'edgeTiles') {
+            $t = Get-DvProp $r $k; $t = @($t)   # (assigned, then wrapped: Get-DvProp returns an array as ONE object)
+            if ($t.Count -ne [int]$Quality.tilesPerClass -or @($t | Where-Object { -not ((& $isInt $_) -and $_ -ge 0) }).Count -gt 0) { return "quality.json perFrame[$i].$k is not tilesPerClass tile indices" }
+        }
+        if (-not (& $checkMetrics (Get-DvProp $r 'metrics'))) { return "quality.json perFrame[$i].metrics is not one metric set per scored stage" }
+    }
+    if (-not (& $checkMetrics $Quality.metrics)) { return 'quality.json metrics is not one metric set per scored stage' }
+    $null
+}
+
+# EXPORT-DEBAYER-QUALITY-1: the quality pass's verdict, from the hashed summary.json quality record and quality.json. One reader for the receipt writer (Invoke-VenueLeg)
+# and the validator (Test-DvExportReceiptValid), so a receipt's export.quality block is re-derived, never trusted. legInvalid is set when the pass left captures behind
+# (EXPORT_CAPTURE_NOT_DELETED: the whole leg is INVALID); verdict is the quality result's own: PASS, INVALID, VENUE_TOOLING or SKIPPED (the timed run did not capture).
+function Get-DvExportQualityEvidence {
+    param($SpecQuality, $Summary, [string]$QualityText, [string]$QualitySha256, [string]$TimedResult)
+    $rec = [ordered]@{ requested = $true; result = $null; verdict = $null; detail = $null; captureDeleted = $null; receiptDebayer = $null; debayer = $null; isoValue = $null
+                       qualitySha256 = $null; frames = @(); legInvalid = $null }
+    $sq = Get-DvProp $Summary 'quality'
+    if ($null -eq $sq) {
+        $rec.verdict = $(if ($TimedResult -ceq 'EXPORT_CAPTURED') { 'INVALID' } else { 'SKIPPED' })
+        $rec.detail = 'EXPORT_QUALITY_RECORD_ABSENT: summary.json carries no quality record'
+        return [pscustomobject]$rec
+    }
+    $rec.result = [string](Get-DvProp $sq 'result')
+    $rec.captureDeleted = Get-DvProp $sq 'captureDeleted'
+    $rec.receiptDebayer = Get-DvProp $sq 'receiptDebayer'
+    $sqFrames = Get-DvProp $sq 'frames'; $rec.frames = @($sqFrames)
+    if ($rec.captureDeleted -isnot [bool] -or -not $rec.captureDeleted) { $rec.legInvalid = 'EXPORT_CAPTURE_NOT_DELETED: the quality pass did not prove its captures and its output deleted from the venue' }
+    switch -CaseSensitive ($rec.result) {
+        'QUALITY_CAPTURED' {
+            if ([string]::IsNullOrEmpty($QualityText)) { $rec.verdict = 'INVALID'; $rec.detail = 'EXPORT_QUALITY_ABSENT: the pass reports QUALITY_CAPTURED but quality.json is not in the published files'; break }
+            if ([string](Get-DvProp $sq 'qualitySha256') -cne $QualitySha256) { $rec.verdict = 'INVALID'; $rec.detail = 'EXPORT_QUALITY_HASH_MISMATCH: quality.json does not hash to the sha256 summary.json records'; break }
+            $q = $null
+            try { $q = $QualityText | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { $q = $null }
+            $why = Get-DvDebayerQualityRefusal -Quality $q -SpecQuality $SpecQuality
+            if ($null -ne $why) { $rec.verdict = 'INVALID'; $rec.detail = "EXPORT_QUALITY_SCHEMA_INVALID: $why"; break }
+            if (-not (Test-DvJsonEquivalent $q.receiptDebayer $rec.receiptDebayer)) { $rec.verdict = 'INVALID'; $rec.detail = 'EXPORT_QUALITY_DEBAYER_MISMATCH: quality.json receiptDebayer is not the carried receipt''s debayer'; break }
+            if (-not (Test-DvJsonEquivalent @($q.frames) $rec.frames)) { $rec.verdict = 'INVALID'; $rec.detail = 'EXPORT_QUALITY_FRAMES_MISMATCH: quality.json frames are not the frames the job captured'; break }
+            $rec.debayer = [string]$q.debayer; $rec.isoValue = $q.isoValue; $rec.qualitySha256 = $QualitySha256
+            $rec.verdict = 'PASS'; $rec.detail = "QUALITY_CAPTURED: $($rec.debayer), $(@($q.frames).Count) frame(s)"
+        }
+        'EXPORT_QUALITY_TOOLING_ABSENT' { $rec.verdict = 'VENUE_TOOLING'; $rec.detail = 'EXPORT_QUALITY_TOOLING_ABSENT: the venue has no Python 3 for the metric (the timed export result stands)' }
+        'EXPORT_QUALITY_SKIPPED' { $rec.verdict = $(if ($TimedResult -ceq 'EXPORT_CAPTURED') { 'INVALID' } else { 'SKIPPED' }); $rec.detail = "EXPORT_QUALITY_SKIPPED: $([string](Get-DvProp $sq 'detail'))" }
+        default { $rec.verdict = 'INVALID'; $rec.detail = "$(if ([string]::IsNullOrEmpty($rec.result)) { 'EXPORT_QUALITY_RESULT_ABSENT' } else { $rec.result }): the quality pass measured nothing" }
+    }
+    [pscustomobject]$rec
+}
 
 # r8 fix 2 (adversary r8 A1): the PARENT/CHILD half of the stage schema. A published share is of work the stage's parent contains: a child whose mean exceeds its parent's is
 # no measurement of this run (raw_uint16 at 900 ms inside a 40 ms debayered_frame read a 16x share and PASSed). Pairs are child -> parent, over the stage rows' means, with the
@@ -5278,6 +5415,17 @@ function Test-DvExportReceiptValid {
             $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
             $criteria = Get-DvProp (Get-DvProp (Get-DvProp $contract 'criteria') $role) 'cpu'
             $derived = Get-DvExportOutcome -ResultToken ([string](Get-DvProp $umRun 'resultToken')) -ExitCode ([int]$exit) -Evidence $ev -Criteria $criteria
+            # EXPORT-DEBAYER-QUALITY-1: a quality leg's export.quality block is re-derived from the hashed summary.json and quality.json (re-hashed above, as every listed file
+            # is), checked against its schema and the carried receipt's debayer value; a pass that measured nothing it should have, or left captures behind, is INVALID.
+            $specQuality = Get-DvProp $specExport 'quality'
+            if ($null -ne $specQuality) {
+                $qSha = $(if ($null -ne $files -and $null -ne (Get-DvProp $files 'quality.json')) { [string](Get-DvProp $files 'quality.json') } else { '' })
+                $qd = Get-DvExportQualityEvidence -SpecQuality $specQuality -Summary $summary -QualityText ([string]$texts['quality.json']) -QualitySha256 $qSha -TimedResult ([string](Get-DvProp $umRun 'resultToken'))
+                if (-not (Test-DvJsonEquivalent (Get-DvProp $exportBlock 'quality') (ConvertFrom-Json (ConvertTo-Json $qd -Depth 8 -Compress)))) { $Invalid.Add('EXPORT_QUALITY_NOT_FROM_EVIDENCE: export.quality is not the quality record of the hashed files') }
+                if ($null -ne $qd.legInvalid) { $Invalid.Add([string]$qd.legInvalid) }
+                if ($qd.verdict -ceq 'INVALID') { $Invalid.Add("EXPORT_QUALITY_INVALID: $($qd.detail)") }
+            }
+            elseif ($null -ne (Get-DvProp $exportBlock 'quality')) { $Invalid.Add('EXPORT_QUALITY_NOT_FROM_EVIDENCE: the receipt carries export.quality but its leg spec asks for no quality pass') }
             if ($derived.outcome -cnotin @('PASS', 'FAIL')) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
             elseif ($derived.outcome -cne $Outcome) { $Invalid.Add("OUTCOME_NOT_DERIVED: the export evidence and the leg's criteria derive $($derived.outcome) but the receipt says $Outcome") }
         }
@@ -6534,4 +6682,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
+    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Get-DvExportQualityEvidence, Get-DvDebayerQualityRefusal, Get-DvExportQualityShapeRefusal, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
