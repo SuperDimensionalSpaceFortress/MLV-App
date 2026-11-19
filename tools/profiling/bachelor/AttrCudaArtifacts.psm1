@@ -7466,17 +7466,45 @@ function Get-AttrCudaWindowToggleEvidence {
     $start = 0
     $end = $lines.Count
     $wanted = [string]$MeasuredSessionId
+    # r7 (r6 adversary A2 on 1ee5e122, its input: `playback_smoke.measured_session  id=3 id=3`, and a TAB for the doubled space): ONE marker reader, used by the marker
+    # loop and the window loop below. Before r7 the marker loop read an exact one-space `id=` and the window loop a loose name, so a marker spaced otherwise skipped the
+    # duplicate check in both. Every record that starts with the marker's name is read here by its tokens, split on any run of spaces or TABs; its id is the first
+    # `id=` token's value (any case), and it is a CLEAN marker only when its cut tail is a location (or absent), it holds no character outside printable ASCII but the TAB,
+    # its tokens are separated by one plain space each (the app writes `playback_smoke.measured_session id=<n>`, MainWindow.cpp), every token is one `<key>=<value>` with an
+    # ASCII name key and a value holding no `=` and no quote, no key is stated twice in any case or spacing (`id=3 id=3`, `id=3  ID=3`, `x=1 x=1`), the id is stated with a
+    # non-empty value and no session key is stated. Anything else is session-boundary-unreadable, however it is spaced.
+    # r4 (adversary A2 on 0b915c19): the letter i of a boundary pattern is the class [Ii] and the keys are compared as ASCII lower case, so neither the host culture (tr-TR does
+    # not fold an upper-case I) nor ignore-case folding (the Kelvin sign folds to k) decides what is read; a non-ASCII key character makes the token no key, so the marker unclean
+    # r4 (adversary A1 on 16530f5b): a marker whose cut tail is no location is unreadable (`id=3 (id=4)` hides an id=), never a clean marker of its id
+    # r5 (adversary A1 on 732bcb96): and so is a marker that also names a session= (`id=3 session=4`): the app's marker is `id=<n>` alone
+    $markerId = @{}
+    $markerClean = @{}
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        # r4 (adversary A2 on 0b915c19): the letter i of a boundary pattern is the class [Ii] and the keys are explicit [Ss][Ee]... classes, so neither the host culture (tr-TR does
-        # not fold an upper-case I) nor ignore-case folding (the Kelvin sign folds to k, which an ignore-case ASCII lookbehind then took for a name character) decides what is read
-        if ($lines[$i] -match '^playback_smoke\.measured_sess[Ii]on [Ii][Dd]=(?<id>\S+)(\s|$)') {
-            $markerIds[$Matches['id']] = $true
-            if ($wanted -eq '' -or $Matches['id'] -ceq $wanted) { $start = $i }
-            # r4 (adversary A1 on 16530f5b): a marker whose cut tail is no location is unreadable (`id=3 (id=4)` hides an id=), never a clean marker of its id
-            # r4 (adversary A1 on 0b915c19): and so is a marker that declares an id more than once (`id=3 id=4`): the first is not the whole marker
-            # r5 (adversary A1 on 732bcb96): and so is a marker that also names a session= (`id=3 session=4`): the app's marker is `id=<n>` alone, so a session= on it is no clean marker
-            if ($badTail.Contains($i) -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=').Count -gt 1 -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=').Count -gt 0) { $anomalies.Add('session-boundary-unreadable') }
+        if ($lines[$i] -notmatch '^playback_smoke\.measured_sess[Ii]on(\s|$)') { continue }
+        $clean = -not $badTail.Contains($i)
+        if ($lines[$i] -cmatch '[^\t\x20-\x7E]' -or $lines[$i] -cnotmatch '^[^ \t]+(?: [^ \t]+)*$') { $clean = $false }
+        $keysSeen = @{}
+        $firstId = $null
+        foreach ($token in ($lines[$i] -split '[ \t]+' | Select-Object -Skip 1)) {
+            if ($token -ceq '') { continue }
+            $eq = $token.IndexOf('=')
+            if ($eq -lt 1 -or $token.Substring(0, $eq) -cnotmatch '^[A-Za-z0-9_]+$' -or $token.Substring($eq + 1) -match '[=\x22\x27\x60\p{Pi}\p{Pf}]') { $clean = $false; continue }
+            $markerKey = $token.Substring(0, $eq).ToLowerInvariant()
+            if ($keysSeen.ContainsKey($markerKey)) { $clean = $false }
+            $keysSeen[$markerKey] = $true
+            if ($markerKey -ceq 'id' -and $null -eq $firstId) { $firstId = $token.Substring($eq + 1) }
         }
+        if ($null -eq $firstId -or $firstId -ceq '' -or $keysSeen.ContainsKey('session')) { $clean = $false }
+        $markerId[$i] = $firstId
+        $markerClean[$i] = $clean
+    }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if (-not $markerId.ContainsKey($i)) { continue }
+        if ($null -ne $markerId[$i] -and $markerId[$i] -cne '') {
+            $markerIds[$markerId[$i]] = $true
+            if ($wanted -eq '' -or $markerId[$i] -ceq $wanted) { $start = $i }
+        }
+        if (-not $markerClean[$i]) { $anomalies.Add('session-boundary-unreadable') }
     }
     # r3 (A5 of the first r3 round): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
     $windowId = $wanted
@@ -7494,12 +7522,12 @@ function Get-AttrCudaWindowToggleEvidence {
             # r4 (adversary A1 on 16530f5b): a playback_smoke record whose cut tail is no location is an unreadable boundary (`session=3 (session=4)` hides a session=), so it
             # closes the window and names itself; the keys are read in any case (`SESSION=4` is a declaration too)
             if ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(\s|$)' -and $badTail.Contains($i)) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
-            elseif ($lines[$i] -match '^playback_smoke\.measured_sess[Ii]on(\s|$)') {
+            elseif ($markerId.ContainsKey($i)) {
                 # r5 (adversary A1 on 732bcb96): a marker is read by its id= AND its session=; one with no id= (`playback_smoke.measured_session session=4`, or the bare name) or with any
                 # session= is no clean marker of this session, so it closes the window and names itself, as every other playback_smoke record that names a session does
-                $markerIdMatches = [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=(?<v>[^\s]*)')
-                if ($markerIdMatches.Count -eq 0 -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=').Count -gt 0) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
-                foreach ($idMatch in $markerIdMatches) { if ($idMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+                # r7 (r6 adversary A2): by the ONE marker reader above, so a key stated twice (any spacing) or a marker spaced otherwise closes it and names itself too
+                if (-not $markerClean[$i]) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                elseif ($markerId[$i] -cne $windowId) { $end = $i }
             }
             elseif ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(\s|$)') {
                 foreach ($sessionMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)')) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }

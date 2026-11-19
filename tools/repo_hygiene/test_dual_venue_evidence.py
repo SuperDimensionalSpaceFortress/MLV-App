@@ -15960,6 +15960,32 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.log() + " extra=x\r" + self.toggle(0, "begin"), (4, 3, 3, 3), False),
             "r5b-A1: a no-break space (U+00A0) inside an extra begin value hides `position=999`": (
                 self.log(mutate=lambda i, b, e: (b + " extra=x" + chr(0xA0) + "position=999" if i == 0 else b, e)), (4, 3, 3, 3), False),
+            # r7 (r6 adversary pass on 1ee5e122, A2): ONE measured_session marker reader. Its tokens are split on any run of spaces or TABs, and a key stated more than once
+            # (id= or any other, any case) is session-boundary-unreadable however it is spaced; a marker spaced other than the app's one plain space is unreadable too
+            "r7-A2: the adversary's later marker `  id=3 id=3` (a doubled space before id=, id stated twice)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=3 id=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2: the adversary's later marker with a TAB before id= (`\\tid=3 id=3`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3 id=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2: a later marker with id stated twice across a TAB (`id=3\\tid=3`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3\tid=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2: the canonical one-space duplicate `id=3 id=3` (the control the adversary compared with)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 id=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2: a later marker `id=3  ID=3` (the key in another case, a doubled space between)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3  ID=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2: a later marker that states another key twice (`id=3 x=1 x=1`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 x=1 x=1\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 sibling :7472/:7478: the ONLY marker spaced with a doubled space (`  id=3`) is no clean marker": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session  id=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 sibling :7472/:7478: the ONLY marker spaced with a TAB (`\\tid=3`) is no clean marker": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session\tid=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 sibling :7478: the ONLY marker with a doubled-space duplicate (`  id=3 id=3`)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session  id=3 id=3\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 sibling :7501: a later doubled-space marker of ANOTHER session (`  id=4`) closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=4\n", 1), (0, 0, 0, 0), False),
+            "r7-A2 sibling :7501: a later TAB-spaced marker that also names session= (`\\tid=3\\tsession=4`) is no clean marker": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3\tsession=4\n", 1), (4, 4, 4, 4), False),
+            "r7-A2 control: a log prefix and the app's one-space marker still read clean": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] playback_smoke.measured_session id=3\n", 1), (4, 4, 4, 4), True),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (
@@ -16050,12 +16076,90 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                  ("an ordinary leg, the marker inside another record's location path", {}, "playback_smoke.frame session=3 n=1 (C:/gui_smoke.window_toggle phase=begin/x.cpp:1)", False),
                  ("an ordinary leg, a marker that does not start the body", {}, "echo " + toggle, False),
                  ("a leg that asks, with toggles", asks, toggle + "\n" + summary, False),
-                 ("a leg whose key is false, with toggles", {"generatorArgs": {"midPlayWindowToggles": False}}, toggle, True))
+                 ("a leg whose key is false, with toggles", {"generatorArgs": {"midPlayWindowToggles": False}}, toggle, True),
+                 # r7 (r6 adversary pass on 1ee5e122, A1): a bare CR ends a record exactly like LF and CRLF, in the one shared splitter (Get-DvLogRecordBodies)
+                 ("r7-A1: the adversary's input, the toggle summary CR-joined behind a frame record", {}, "playback_smoke.frame session=3 n=1\r" + summary, True),
+                 ("r7-A1 control: the same records LF-joined", {}, "playback_smoke.frame session=3 n=1\n" + summary, True),
+                 ("r7-A1 control: the same records CRLF-joined", {}, "playback_smoke.frame session=3 n=1\r\n" + summary, True),
+                 ("r7-A1: a toggle record CR-joined behind a frame record, behind the log prefix", {},
+                  "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] playback_smoke.frame session=3 n=1\r[2026-11-19T08:00:01.000Z] [INFO] [0x1a2c] " + toggle, True),
+                 ("r7-A1: a toggle record CR-joined behind a record whose location suffix holds ` (`", {},
+                  "playback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:1)\r" + toggle, True),
+                 ("r7-A1: a CR-joined toggle record on a leg that asks is judged by its criteria, not here", asks, "playback_smoke.frame session=3 n=1\r" + toggle, False))
         proc, out = run_pwsh_evidence_cases("Get-DvWindowToggleRequestEvidence", [(spec, log) for _, spec, log, _ in cases])
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         for (name, _, _, blocks), v in zip(cases, out, strict=True):
             with self.subTest(case=name):
                 self.assertEqual(v["blocks"], blocks, v)
+
+    def test_r7_a1_a_bare_cr_ends_a_record_in_the_one_shared_splitter(self) -> None:
+        """r7 (r6 adversary pass on 1ee5e122, A1, sibling DualVenueRunner.psm1:2936): Get-DvLogRecordBodies split on LF only (`r?`n), so a bare CR left a whole record behind
+        the body before it. A record ends at CRLF, a bare CR or a bare LF, everywhere the runner reads run-log records: the look-assist reader's raw lines (:2517) split by
+        the same rule, index for index. Every gate reaches the toggle request reader through it (Test-DvReceiptValid :5765, Invoke-VenueLeg.ps1:1153)."""
+        proc, out = run_pwsh_json("$t = [string]($env:DVE_LOG | ConvertFrom-Json)\n"
+                                  "$b = & (Get-Module DualVenueRunner) { param([string]$x) Get-DvLogRecordBodies -LogText $x } $t\n"
+                                  "@{ bodies = @($b) } | ConvertTo-Json -Compress",
+                                  DVE_LOG=json.dumps("a session=1\rb session=2\r\nc session=3\nd session=4 (C:/x/y.cpp:1)\re"))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["bodies"], ["a session=1", "b session=2", "c session=3", "d session=4", "e"])
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"\$script:DvLogLineBreak = '([^']*)'", module), [r"\r\n|\r|\n"], "one shared line-break rule")
+        bodies = module.split("function Get-DvLogRecordBodies", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("$LogText -split $script:DvLogLineBreak", bodies)
+        self.assertNotIn('-split "`r?`n"', bodies)
+        self.assertIn("$rawLines = $LogText -split $script:DvLogLineBreak", module)
+        self.assertNotIn('$rawLines = $LogText -split "`r?`n"', module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("$windowToggleRequestVerdict = Get-DvWindowToggleRequestEvidence -Spec $spec -LogText $ev.logText", module)
+
+    R7_A2_LOG_MARKER = "playback_smoke.measured_session  id=3 id=3"
+
+    def test_r7_a2_the_reconcile_gate_refuses_ok_scalars_over_a_doubled_space_duplicate_marker(self) -> None:
+        """r7 (r6 adversary pass on 1ee5e122, A2, siblings DualVenueRunner.psm1:2066 / :5768 and Invoke-VenueLeg.ps1:1159): the reconcile gate re-derives the scalars with
+        Get-AttrCudaWindowToggleEvidence, so ok scalars over the adversary's log (a later `  id=3 id=3` marker) are not what the log derives and the leg is INVALID."""
+        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        marker = "playback_smoke.measured_session id=3\n"
+        logs = (("the adversary's doubled space", self.log().replace(marker, marker + self.R7_A2_LOG_MARKER + "\n", 1)),
+                ("a TAB instead of the doubled space", self.log().replace(marker, marker + "playback_smoke.measured_session\tid=3 id=3\n", 1)))
+        with tempfile.TemporaryDirectory(prefix="wt-r7-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log in logs]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = $r.reason; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _), got in zip(logs, out, strict=True):
+            with self.subTest(case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertIn("session-boundary-unreadable", got["derived"])
+
+    def test_r7_a2_the_job_embedded_reader_refuses_a_doubled_space_duplicate_marker(self) -> None:
+        """r7 (r6 adversary pass on 1ee5e122, A2, siblings playback-attr-3-cuda-job.ps1:6583 / :6586): the toggle job embeds the reader's source extracted from the module
+        (Get-AttrCudaEmbeddedFunctionSource) and calls it on the raw log; the EMBEDDED copy, defined alone in a fresh scope, refuses the adversary's marker too."""
+        marker = "playback_smoke.measured_session id=3\n"
+        logs = {"doubled": self.log().replace(marker, marker + self.R7_A2_LOG_MARKER + "\n", 1),
+                "tab": self.log().replace(marker, marker + "playback_smoke.measured_session\tid=3 id=3\n", 1),
+                "clean": self.log()}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["clean"], "ok", out)
+        for name in ("doubled", "tab"):
+            with self.subTest(case=name):
+                self.assertIn("session-boundary-unreadable", out[name], out)
 
     def test_r3_b4_a_requested_leg_must_back_its_scalars_with_the_hashed_run_log(self) -> None:
         """r3 B4 (sol): requested-toggle success is reconciled with the hashed run log, in the writer and in receipt validation, by the one shared reader

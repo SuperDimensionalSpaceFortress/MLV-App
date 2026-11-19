@@ -2514,7 +2514,7 @@ function Get-DvLookAssistEvidence {
         if (-not [string]::IsNullOrEmpty($LogText)) {
             # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
             # r27: the raw lines, index for index with the bodies (Get-DvLogRecordBodies splits the same way and keeps every line), for the discarded text
-            $rawLines = $LogText -split "`r?`n"
+            $rawLines = $LogText -split $script:DvLogLineBreak
             $bodies = Get-DvLogRecordBodies -LogText $LogText
             for ($li = 0; $li -lt $bodies.Count; $li++) {
                 $line = $bodies[$li]
@@ -2889,6 +2889,10 @@ function Get-DvLogRecordDiscardedText {
 # (log_line_field::fieldValue maps every C0 control to '_'), so a masked `<key>=` is no `<key>=` for any reader, and a value stays one token.
 $script:DvQuotedEqualsMask = [char]0x1A
 $script:DvQuoteChars = [char[]]@([char]'"', [char]"'")
+# VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r7 (r6 adversary A1 on 1ee5e122, its input: `playback_smoke.frame session=3 n=1<CR>gui_smoke.window_toggles ...`): the ONE
+# rule for where a run-log record ends: CRLF, a bare CR or a bare LF (the job's Get-AttrCudaWindowToggleEvidence splits the same way). An LF-only split left a
+# CR-joined record behind the body before it, so no reader saw it. Get-DvLogRecordBodies and every raw-line list kept index for index with it split by this.
+$script:DvLogLineBreak = '\r\n|\r|\n'
 
 function ConvertTo-DvQuoteMaskedBody {
     <#
@@ -2933,7 +2937,8 @@ function Get-DvLogRecordBodies {
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
-    $lines = $LogText -split "`r?`n"
+    # r7 (r6 adversary A1): a bare CR ends a record too ($script:DvLogLineBreak)
+    $lines = $LogText -split $script:DvLogLineBreak
     # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
     for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
     # r24: only a body that holds a quote can hold a quoted span; the rest are returned as they are without a call
