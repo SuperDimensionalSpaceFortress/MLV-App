@@ -30,7 +30,8 @@
 #   4. the venue copy already has that sha -> DEPLOY_NOOP, exit 0 (idempotent; nothing is touched, busy or not).
 #   5. busy or leased -> typed refusal, nothing changed (table below). Busy is ONE predicate ($script:LiveWorkRules): an
 #      inbox\*.job.ps1, a running\*.started.json or an unresolved marker tmp, each read with the agent's own call; any other
-#      entry is an ignored leftover (DEPLOY_IGNORED_LEFTOVERS, printed after step 2), never deleted, moved or counted as busy.
+#      entry is an ignored leftover (DEPLOY_IGNORED_LEFTOVERS, printed after step 2): not busy, and never deleted, moved or
+#      rewritten by this script (a restarted agent's own startup cleanup still runs; see $script:LiveWorkRules).
 #   6. keep the previous agent at <VenueRoot>\rollback-<utc>\ultra-magnus-agent.ps1 (verified), then write the new agent as
 #      a temp file beside it and rename it over the agent (the old file is never half-written).
 #   7. re-read the venue copy; its sha must equal the source's. Else DEPLOY_SHA_MISMATCH and the rollback copy is put back.
@@ -329,8 +330,10 @@ function Test-SamePath {
 # read with the agent's own call (ultra-magnus-agent.ps1). Get-VenueStateRaw is the only reader, and every idle judgement goes through
 # it: the pre-deploy refusal (Get-Refusals), the re-checks inside the restart (Get-Refusals again) and the arrival warning after the
 # old agent stopped (Get-ArrivalWarning). Every other entry in inbox\, running\ and slot-holders\ is an IGNORED leftover: counted and
-# printed (ignored=<n>), never touched (the agent never picks it up, so a restart cannot strand it). A folder that cannot be listed
-# is DEPLOY_REFUSED_UNREADABLE, never "empty".
+# printed (ignored=<n>), and not deleted, moved or rewritten by this script (the agent never picks it up as work, so a restart
+# cannot strand it). The agent's OWN startup cleanup is not this script's promise: with -RestartMode when-idle the replacement
+# agent runs Stop-StaleHeavySlotHolders, which removes its slot-holders\ side files (*.release, *.tmp), as at any agent start.
+# A folder that cannot be listed is DEPLOY_REFUSED_UNREADABLE, never "empty"; so is a root with a wildcard character (Get-VenueStateRaw).
 #   folder        what           how                                                   the agent's own call
 #   inbox\        a job          -Filter <job pattern> -File                           the pickup loop and the exempt-job list (Get-ChildItem $inbox -Filter <it> -File)
 #   running\      a marker       -Filter <marker pattern> -File, then -like the same   Get-RunningMarkerJobIds
@@ -372,6 +375,13 @@ function Get-VenueStateRaw {
     # Reads the three folders the idle judgement rests on, through the one predicate ($script:LiveWorkRules). Any failure to list
     # one is "unreadable", never "empty". running / inbox / leases are live work only; ignored counts every other entry.
     $state = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @(); ignored = 0; ignoredBy = '' }
+    # the agent lists its inbox with a POSITIONAL -Path (Get-ChildItem $inbox -Filter ...), which reads [ ] * ? and the backtick as
+    # wildcard syntax: under a root such as C:\bench[1] its pickup set is not the literal folder's (it may be C:\bench1\inbox, or
+    # nothing). This script lists literally, so it cannot read the agent's pickup set there, and it refuses rather than guess.
+    if ($VenueRoot -match '[\[\]\*\?`]') {
+        $state.unreadable = "the venue root $VenueRoot holds a wildcard character ([ ] * ? or a backtick): the agent lists inbox\ with a wildcard-reading -Path, so the jobs it would pick up cannot be read here; use a root without one"
+        return [pscustomobject]$state
+    }
     # the root itself must list too: lock creation and file reads can succeed where enumeration is denied
     try { [void]@([System.IO.Directory]::EnumerateFileSystemEntries($VenueRoot) | Select-Object -First 1) }
     catch {
@@ -1029,7 +1039,7 @@ try {
     }
     # the leftovers the busy predicate ignores, so the operator sees them (informational; it changes no outcome or exit code)
     if ($readable.ignored -gt 0) {
-        Out-Typed "DEPLOY_IGNORED_LEFTOVERS ignored=$($readable.ignored) ($($readable.ignoredBy)): not work the agent picks up; left in place, clear them by hand (quarantine, never discard)"
+        Out-Typed "DEPLOY_IGNORED_LEFTOVERS ignored=$($readable.ignored) ($($readable.ignoredBy)): not work the agent picks up; this deploy leaves them in place, clear them by hand (quarantine, never discard)"
     }
     $dest = Join-Path $VenueRoot $agentName
 

@@ -254,6 +254,21 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("DEPLOY_WARN_ARRIVED_DURING_RESTART running=1 inbox=0", r.stdout)
 
+    def test_s5_a_root_with_a_wildcard_character_refuses_unreadable(self) -> None:
+        # adversary A1: the agent lists its inbox with a positional (wildcard-reading) -Path, so on C:\bench[1] its pickup set is not
+        # what a literal listing sees (it may even be another folder's). The deploy cannot read the agent's pickup set there: it refuses.
+        for leaf in ("venue[1]", "venue`x"):
+            with self.subTest(root=leaf):
+                odd = Path(self._tmp.name) / leaf
+                for d in ("inbox", "running", "slot-holders"):
+                    (odd / d).mkdir(parents=True)
+                (odd / AGENT_NAME).write_bytes(OLD)
+                (odd / "inbox" / "q1.job.ps1").write_text("Write-Output 'q1'")
+                r = self.run_deploy("-DryRun", venue=odd)
+                self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+                self.assertRegex(r.stdout, r"(?m)^DEPLOY_REFUSED_UNREADABLE .*wildcard")
+                self.assertNotIn("DEPLOY_REFUSED_BUSY", r.stdout)
+
     def test_s4_the_predicate_is_the_agents_own_calls_defined_once(self) -> None:
         text = SCRIPT.read_text(encoding="ascii")
         agent = (SCRIPT.parent / AGENT_NAME).read_text(encoding="utf-8-sig")
@@ -266,11 +281,32 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn('-Filter "*.lease.json" -File', agent)
         self.assertIn('-Filter "*.holder.json" -File', agent)
         self.assertIn('"$id.acquired.json"', agent)
+        # adversary A3: EVERY listing of a folder the predicate reads, at every site, uses the pattern the table copies; a change at
+        # ONE site (the pickup loop, or only the exempt-job list) is drift too, so the guard reads each site, not "somewhere"
+        def drift(agent_text: str) -> list:
+            bad = []
+            for var, allowed, at_least in (("inbox", {"*.job.ps1"}, 2), ("running", {"*.started.json"}, 1),
+                                           ("slotHolders", {"*.lease.json", "*.holder.json"}, 2)):
+                sites = re.findall(r"Get-ChildItem\s+(?:-LiteralPath\s+)?\$%s\b[^\n|]*?-Filter\s+\"?([^\s\"]+)\"?" % var, agent_text)
+                if len(sites) < at_least or set(sites) != allowed:
+                    bad.append((var, sites))
+            return bad
+        self.assertEqual(drift(agent), [], "every -Filter listing of a predicate folder uses the pattern the deploy copies")
+        # the guard itself: a change at ONE pickup site (the exempt list only, then the pickup loop only) is caught
+        exempt = "$exemptJobs = Get-ChildItem $inbox -Filter *.job.ps1 -File"
+        pickup = "$jobs = Get-ChildItem $inbox -Filter *.job.ps1 -File"
+        for site in (exempt, pickup):
+            with self.subTest(mutated=site):
+                self.assertEqual(agent.count(site), 1, site)
+                self.assertNotEqual(drift(agent.replace(site, site.replace("*.job.ps1", "*.queued.ps1"))), [])
         # ... and the deploy spells each pattern ONCE, in its one table
         for token in ("'*.job.ps1'", "'*.started.json'", tmp_re, r"'\.(lease|holder|acquired)\.json\z'"):
             self.assertEqual(text.count(token), 1, "%s is spelled exactly once in the deploy script" % token)
         self.assertEqual(len(re.findall(r"EnumerateFileSystemEntries\(\(Join-Path \$VenueRoot '(inbox|running)'\)\)", text)), 0,
                          "no second, any-entry count of inbox\\ or running\\")
+        # adversary A2: the promise is about THIS script only; the replacement agent's own startup cleanup is named, not hidden
+        self.assertIn("Stop-StaleHeavySlotHolders", text)
+        self.assertNotRegex(text, r"(?i)ignored leftover[^\n]*never touched\b(?![^\n]*by this)")
         # both idle judgements (the refusal and the arrival warning) read the one state function
         for fn in ("Get-Refusals", "Get-ArrivalWarning"):
             body = re.search(r"(?s)function %s \{(.*?)\n\}" % fn, text).group(1)
