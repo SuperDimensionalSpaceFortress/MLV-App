@@ -408,9 +408,11 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
 # not UTF-8 is a failure, never a replacement character that two different values share). -Regexp reads 'git config -z --get-regexp' records ('<key><LF><value>').
 # An unset key is an empty list; a failed read throws GIT_CONFIG_READ_FAILED (never an empty list).
 function Get-GitConfigValuesRaw {
-    param([string]$RepoDir, [string]$Key, [switch]$Regexp)
+    # -Local (SSH-PUSHURL-1 pass 2 A3): only the repository's own config file; without it git merges the system, global and repository values (and a value outside the repository is not seen by a Codex lane with another HOME)
+    param([string]$RepoDir, [string]$Key, [switch]$Regexp, [switch]$Local)
     $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-    foreach ($a in @('-C', $RepoDir, 'config', '-z', $(if ($Regexp) { '--get-regexp' } else { '--get-all' }), $Key)) { $psi.ArgumentList.Add($a) }
+    $cfgArgs = @('-C', $RepoDir, 'config', '-z') + $(if ($Local) { @('--local') } else { @() }) + @($(if ($Regexp) { '--get-regexp' } else { '--get-all' }), $Key)
+    foreach ($a in $cfgArgs) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
     $proc = Invoke-GitTraceScrubbed { [System.Diagnostics.Process]::Start($psi) }   # r17 F3: the child inherits no GIT_TRACE* destination
     $ms = [IO.MemoryStream]::new()
@@ -1152,9 +1154,12 @@ function Invoke-GitHubSshProbe {
     if (-not $SshExe) { $c = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $SshExe = $c.Source } }
     if (-not $SshExe) { return @{ Authenticated = $false; Detail = 'the OpenSSH client (ssh) is not installed' } }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
-    # adversary pass 1 A2 (class: every way ssh itself writes under ~/.ssh): StrictHostKeyChecking=yes adds no host key, UpdateHostKeys=no stops OpenSSH rewriting known_hosts after a
-    # successful login (it does that even under yes), and ControlMaster=no / ControlPath=none stop a user's ControlPersist from leaving a multiplexing socket behind
-    foreach ($a in @('-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', 'git@github.com')) { $psi.ArgumentList.Add($a) }
+    # adversary pass 1 A2 and pass 2 A2 (class: everything an inherited ssh config could make the probe DO beyond asking GitHub who this key is): StrictHostKeyChecking=yes adds no
+    # host key, UpdateHostKeys=no stops OpenSSH rewriting known_hosts after a successful login (it does that even under yes), ControlMaster=no / ControlPath=none stop a user's
+    # ControlPersist from leaving a multiplexing socket behind, PermitLocalCommand=no stops a LocalCommand, RemoteCommand=none and ClearAllForwardings / ForwardAgent=no stop a
+    # remote command or a forwarding. The user's own config is otherwise kept: Host github.com carries the IdentityFile the key probe has to use.
+    $sshOpts = @('BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes', 'UpdateHostKeys=no', 'ControlMaster=no', 'ControlPath=none', 'PermitLocalCommand=no', 'RemoteCommand=none', 'ClearAllForwardings=yes', 'ForwardAgent=no')
+    foreach ($a in @('-T') + @($sshOpts | ForEach-Object { '-o'; $_ }) + @('git@github.com')) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
     $proc = $null
     try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
@@ -1179,9 +1184,14 @@ function Invoke-GitHubSshProbe {
 #   READY         authenticated and the push url is unset (or equals the https fetch url): set pushurl to PushUrl
 #   FOREIGN       authenticated but a push url is neither the fetch url nor the SSH form: left as it is (fail closed)
 function Get-SshPushUrlDecision {
-    param([string[]]$Urls, [string[]]$PushUrls, [string]$ExpectedUrl, [string[]]$Rules, [string[]]$Names, [scriptblock]$Probe)
+    # -Urls / -PushUrls are read across every config scope (what Git uses); -LocalUrls / -LocalPushUrls are the repository's own config file only (what a lane with another HOME sees).
+    # A caller that passes no Local list says they are the same (pass 2 A3).
+    param([string[]]$Urls, [string[]]$PushUrls, [string[]]$LocalUrls, [string[]]$LocalPushUrls, [string]$ExpectedUrl, [string[]]$Rules, [string[]]$Names, [scriptblock]$Probe)
     $Urls = @($Urls); $PushUrls = @($PushUrls)
+    $LocalUrls = $(if ($PSBoundParameters.ContainsKey('LocalUrls')) { @($LocalUrls) } else { $Urls })
+    $LocalPushUrls = $(if ($PSBoundParameters.ContainsKey('LocalPushUrls')) { @($LocalPushUrls) } else { $PushUrls })
     if ($Urls.Count -ne 1) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = "remote.fork.url holds $($Urls.Count) value(s), expected exactly one" } }
+    if (($LocalUrls -join "`n") -cne ($Urls -join "`n")) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = 'remote.fork.url is not set only in the repository config (a global or system value counts too)' } }
     $fetch = "$($Urls[0])"
     $why = Get-RemoteUrlRefusal -Urls @($fetch) -Rules $Rules -Names $Names
     if ($why) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = $why } }
@@ -1200,7 +1210,10 @@ function Get-SshPushUrlDecision {
     # adversary pass 1 A5: only a real [bool] $true authenticates; a string 'false' or a missing verdict is not an authentication
     if ($p -isnot [hashtable] -or $p.Authenticated -isnot [bool]) { return @{ Decision = 'UNREGISTERED'; PushUrl = $ssh; Reason = 'the probe returned no [bool] Authenticated verdict' } }
     if (-not $p.Authenticated) { return @{ Decision = 'UNREGISTERED'; PushUrl = $ssh; Reason = "$($p.Detail)" } }
-    $effective = @($(if ($PushUrls.Count) { $PushUrls } else { $Urls }))   # @(): a one-element array out of $( ) is a scalar string, whose [0] is its first character
+    # adversary pass 2 A3: a push url that Git merges in from the global or system config is not in the repository config, so a lane with another HOME would not push over ssh: it is
+    # neither counted as the ssh form nor replaced (a second pushurl in the repository would also make Git push to both)
+    if (($LocalPushUrls -join "`n") -cne ($PushUrls -join "`n")) { return @{ Decision = 'FOREIGN'; PushUrl = $ssh; Reason = 'remote.fork.pushurl is also set outside the repository config (global or system), which a lane with another HOME would not see' } }
+    $effective = @($(if ($PushUrls.Count) { $PushUrls } else { $Urls }))   # @():a one-element array out of $( ) is a scalar string, whose [0] is its first character
     if ($effective.Count -eq 1 -and "$($effective[0])" -ceq $ssh) { return @{ Decision = 'NOOP'; PushUrl = $ssh; Reason = 'pushes already go to the SSH form' } }
     if ($PushUrls.Count -eq 0 -or ($PushUrls.Count -eq 1 -and "$($PushUrls[0])" -ceq $fetch)) { return @{ Decision = 'READY'; PushUrl = $ssh; Reason = 'ssh authenticates' } }
     return @{ Decision = 'FOREIGN'; PushUrl = $ssh; Reason = "remote.fork.pushurl is $((@($PushUrls | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', '), neither the fetch url nor $ssh" }
@@ -1208,6 +1221,24 @@ function Get-SshPushUrlDecision {
 
 # Test seam: a scriptblock that returns @{ Authenticated; Detail } instead of running ssh (the tests never touch the network).
 $script:SshProbeOverride = $null
+$script:SshPushUrlWriteHook = $null   # test seam: runs right before the pushurl write
+
+# A git config value-pattern (POSIX ERE) that matches exactly this value: '^' + the value with every regex metacharacter escaped + '$'.
+function ConvertTo-GitValueRegex([string]$Value) { return ('^' + [regex]::Replace("$Value", '([.^$*+?()\[\]{}|\\])', '\$1') + '$') }
+
+# Everything the push url decision depends on, read once: the fork urls and push urls (every scope, and the repository's own file), the url rewrite rules and the remote names.
+function Get-SshPushUrlConfigSnapshot {
+    $ctx = Get-RemoteUrlContext -RepoDir $Repo
+    return @{
+        Urls      = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url')
+        LocalUrls = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url' -Local)
+        Push      = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
+        LocalPush = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl' -Local)
+        Rules     = [string[]]@($ctx.Rules)
+        Names     = [string[]]@($ctx.Names)
+    }
+}
+function Get-SshPushUrlSnapshotKey($Snapshot) { return ((@('Urls', 'LocalUrls', 'Push', 'LocalPush', 'Rules', 'Names') | ForEach-Object { "$_=" + (@($Snapshot[$_]) -join [string][char]0x1F) }) -join [string][char]0x1E) }
 
 # Applies (or, with -VerifyOnly, only reports) the decision for the clone at $Repo. Setup: sets remote.fork.pushurl on READY. Verify: a READY or FOREIGN outcome is a typed
 # failure (the probe authenticates, so the push url must already be the SSH form); a probe that does not authenticate is a MANUAL line, never a failure.
@@ -1215,12 +1246,19 @@ function Invoke-SshPushUrl {
     param([switch]$VerifyOnly, [scriptblock]$Probe = $null)
     if (-not $Probe) { $Probe = $(if ($script:SshProbeOverride) { $script:SshProbeOverride } else { { Invoke-GitHubSshProbe } }) }
     if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) { Write-Log "SSH_PUSHURL skipped: no clone at $Repo yet"; return }
-    $urls = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url')
-    if ($urls.Count -eq 0) { Write-Log "SSH_PUSHURL skipped: $Repo has no 'fork' remote"; return }
-    $push = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
-    $ctx = Get-RemoteUrlContext -RepoDir $Repo
-    $d = Get-SshPushUrlDecision -Urls $urls -PushUrls $push -ExpectedUrl $ForkUrl -Rules $ctx.Rules -Names $ctx.Names -Probe $Probe
+    $snap = Get-SshPushUrlConfigSnapshot
+    if ($snap.Urls.Count -eq 0) { Write-Log "SSH_PUSHURL skipped: $Repo has no 'fork' remote"; return }
+    $d = Get-SshPushUrlDecision -Urls $snap.Urls -LocalUrls $snap.LocalUrls -PushUrls $snap.Push -LocalPushUrls $snap.LocalPush -ExpectedUrl $ForkUrl -Rules $snap.Rules -Names $snap.Names -Probe $Probe
     $ssh = $d.PushUrl
+    # adversary pass 2 A1 / A4: the probe takes seconds and the decision used the configuration as it was BEFORE it. A READY or NOOP verdict (the two that claim an ssh push) is
+    # only kept when the urls, the push urls in every scope, the rewrite rules and the remote names are still exactly what the decision saw.
+    if ($d.Decision -ceq 'READY' -or $d.Decision -ceq 'NOOP') {
+        $after = Get-SshPushUrlConfigSnapshot
+        if ((Get-SshPushUrlSnapshotKey $snap) -cne (Get-SshPushUrlSnapshotKey $after)) {
+            $script:Failures.Add('PUSHURL_CHANGED_DURING_PROBE remote=fork')
+            throw "PUSHURL_CHANGED_DURING_PROBE the fork urls, push urls, url rewrite rules or remote names changed while ssh was probed (push urls now: $((@($after.Push | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')); nothing was written, re-run the phase"
+        }
+    }
     switch ($d.Decision) {
         'NOOP' { Write-Log "SSH_PUSH_READY remote=fork pushurl=$ssh" 'OK' }
         'READY' {
@@ -1228,17 +1266,19 @@ function Invoke-SshPushUrl {
                 Write-Log "SSH_PUSHURL_MISSING remote=fork expected=$ssh (ssh authenticates but remote.fork.pushurl is not set to it: run -Phase Clone)" 'ERROR'
                 $script:Failures.Add('SSH_PUSHURL_MISSING remote=fork')
             } else {
-                # adversary pass 1 A3: the probe takes seconds and the decision above read the config BEFORE it. Re-read both urls right before the write and write only when
-                # they are exactly what the decision saw; a writer that set a pushurl meanwhile is a foreign value and is never overwritten.
-                $nowUrls = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url')
-                $nowPush = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
-                if ((($nowUrls -join "`n") -cne ($urls -join "`n")) -or (($nowPush -join "`n") -cne ($push -join "`n"))) {
-                    $script:Failures.Add('PUSHURL_CHANGED_DURING_PROBE remote=fork')
-                    throw "PUSHURL_CHANGED_DURING_PROBE remote.fork.url or remote.fork.pushurl changed while ssh was probed (pushurl now: $((@($nowPush | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')); nothing was written, re-run -Phase Clone"
-                }
-                [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh))
+                # adversary pass 2 A1: compare-and-set, not read-then-write. An UNSET pushurl is written with --add (it never replaces anything); an https pushurl equal to the fetch
+                # url is replaced with --replace-all restricted to that exact value (git does it under its own config lock, and a value that is no longer there matches nothing,
+                # so it is only appended to). Either way a foreign value that appeared between the re-read and the write is never removed: the read-back then holds more than
+                # our value, we take back exactly ours, and the run fails typed.
+                if ($script:SshPushUrlWriteHook) { & $script:SshPushUrlWriteHook }   # test seam: a writer that lands between the re-read above and the write below
+                if ($snap.Push.Count -eq 0) { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--add', 'remote.fork.pushurl', $ssh)) }
+                else { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh, (ConvertTo-GitValueRegex "$($snap.Push[0])"))) }
                 $back = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
-                if ($back.Count -ne 1 -or "$($back[0])" -cne $ssh) { $script:Failures.Add('SSH_PUSHURL_NOT_APPLIED remote=fork'); throw "SSH_PUSHURL_NOT_APPLIED remote.fork.pushurl reads back as '$($back -join ' | ')', expected $ssh" }
+                if ($back.Count -ne 1 -or "$($back[0])" -cne $ssh) {
+                    if (@($back | Where-Object { "$_" -ceq $ssh }).Count -gt 0) { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--unset-all', 'remote.fork.pushurl', (ConvertTo-GitValueRegex $ssh)) -AllowFail) }
+                    $script:Failures.Add('PUSHURL_CHANGED_DURING_PROBE remote=fork')
+                    throw "PUSHURL_CHANGED_DURING_PROBE remote.fork.pushurl read back as '$((@($back | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ' | ')' after the write, expected only $ssh; our value was taken back and every other value was left as it is"
+                }
                 Write-Log "SSH_PUSH_READY remote=fork pushurl=$ssh" 'OK'
             }
         }
@@ -1257,7 +1297,7 @@ function Invoke-SshPushUrl {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Phase: Qt(the repo pins Qt 6.10.2 win64_mingw + MinGW 13.1 via hash-locked aqtinstall)
+# Phase: Qt (the repo pins Qt 6.10.2 win64_mingw + MinGW 13.1 via hash-locked aqtinstall)
 # ---------------------------------------------------------------------------------------------
 function Invoke-PhaseQt {
     $qmake = Join-Path $QtRoot "$QtVersion\mingw_64\bin\qmake.exe"
