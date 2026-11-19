@@ -32,6 +32,51 @@ function Test-ReviewedReleaseRuntimeExtraName {
 # seen). Nothing here throws on a failed install, including a locked installed file (adversary 32bf39a9-A2);
 # the caller reads .ok and stops with its own typed failure.
 
+# Adversary b5fce5a9-A1: Kill($true) finds descendants by comparing LOCAL start times, so a child started just after a DST
+# fall-back fold reads as older than its parent and is left running while the root's exit reads as confirmed. The tree is
+# therefore also derived here from parent ids and UTC start times. Rows: { id; parentId; startUtc } (startUtc $null = unknown).
+function Get-PinnedPayloadProcessTable {
+    $parents = @{}
+    foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop)) {
+        $parents[[int]$row.ProcessId] = [int]$row.ParentProcessId
+    }
+    foreach ($process in [System.Diagnostics.Process]::GetProcesses()) {
+        $startUtc = $null
+        try { $startUtc = $process.StartTime.ToUniversalTime() } catch { $startUtc = $null }
+        if ($parents.ContainsKey($process.Id)) { [pscustomobject]@{ id = $process.Id; parentId = $parents[$process.Id]; startUtc = $startUtc } }
+        $process.Dispose()
+    }
+}
+
+# Adds to Members (id -> startUtc) every row that descends from a member: its parent id is a member's and it did not start before
+# that member (UTC; an older process holds a reused parent id). An unknown start on either side counts as a descendant (fail closed).
+# Returns the rows that are, or descend from, a member and are still listed: a member with an equal or unknown start counts.
+function Get-PinnedPayloadTreeRows {
+    param([object[]]$Table, [hashtable]$Members)
+    $rows = @()
+    foreach ($row in $Table) {
+        if ($Members.ContainsKey([int]$row.id)) {
+            $known = $Members[[int]$row.id]
+            if ($null -eq $known -or $null -eq $row.startUtc -or $row.startUtc -eq $known) { $rows += $row }
+        }
+    }
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+    foreach ($id in @($Members.Keys)) { $queue.Enqueue([int]$id) }
+    while ($queue.Count) {
+        $parent = $queue.Dequeue()
+        $parentStart = $Members[$parent]
+        foreach ($row in $Table) {
+            $id = [int]$row.id
+            if ([int]$row.parentId -ne $parent -or $Members.ContainsKey($id)) { continue }
+            if ($null -ne $parentStart -and $null -ne $row.startUtc -and $row.startUtc -lt $parentStart) { continue }
+            $Members[$id] = $row.startUtc
+            $rows += $row
+            $queue.Enqueue($id)
+        }
+    }
+    return $rows
+}
+
 # Kills a timed-out child's whole tree and reports whether its exit was SEEN; a Kill that throws (access
 # denied) or a wait that times out is never reported as killed (adversary 32bf39a9-A3).
 function Stop-PinnedPayloadChild {
@@ -41,12 +86,41 @@ function Stop-PinnedPayloadChild {
         $Process,
 
         [ValidateRange(0, 600000)]
-        [int]$ConfirmMs = 10000
+        [int]$ConfirmMs = 10000,
+
+        [scriptblock]$ProcessTable = { Get-PinnedPayloadProcessTable }
     )
+    # The tree as it stands while the root is alive (adversary b5fce5a9-A1): a listing that fails leaves the kill unconfirmed.
+    $treeError = ''
+    $members = @{}
+    try {
+        $before = @(& $ProcessTable)
+        $rootRow = @($before | Where-Object { [int]$_.id -eq [int]$Process.Id })
+        $members[[int]$Process.Id] = if ($rootRow.Count) { $rootRow[0].startUtc } else { $null }
+        $null = Get-PinnedPayloadTreeRows -Table $before -Members $members
+    } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
     $killError = ''
     try { $null = $Process.Kill($true) } catch { $killError = $_.Exception.Message }
     $exited = $false
     try { $exited = [bool]$Process.WaitForExit($ConfirmMs) } catch { if (-not $killError) { $killError = "the exit could not be awaited: $($_.Exception.Message)" } }
+    if (-not $treeError) {
+        try {
+            # A member or descendant still listed after Kill($true) is ended by id only when its UTC start still matches the
+            # listing (a reused id is never killed); one still listed after that leaves the tree unconfirmed.
+            foreach ($row in @(Get-PinnedPayloadTreeRows -Table @(& $ProcessTable) -Members $members)) {
+                if ($null -eq $row.startUtc -or [int]$row.id -eq [int]$Process.Id) { continue }
+                try {
+                    $survivor = [System.Diagnostics.Process]::GetProcessById([int]$row.id)
+                    try {
+                        if ($survivor.StartTime.ToUniversalTime() -eq $row.startUtc) { $survivor.Kill(); $null = $survivor.WaitForExit($ConfirmMs) }
+                    } finally { $survivor.Dispose() }
+                } catch { $null = $_ }
+            }
+            $left = @(Get-PinnedPayloadTreeRows -Table @(& $ProcessTable) -Members $members)
+            if ($left.Count) { $treeError = "descendant pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill" }
+        } catch { $treeError = "the process tree could not be listed after the kill: $($_.Exception.Message)" }
+    }
+    if ($treeError) { $killError = if ($killError) { "$killError; $treeError" } else { $treeError } }
     # The ROOT's exit is not the tree's: a Kill(true) that threw (a descendant it could not end) leaves the tree
     # unconfirmed even when the root exited (adversary 6627beef-A1).
     return [pscustomobject][ordered]@{ exited = $exited; killError = $killError; confirmed = ($exited -and -not $killError) }

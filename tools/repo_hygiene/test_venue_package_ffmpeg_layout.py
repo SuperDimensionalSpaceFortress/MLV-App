@@ -441,14 +441,21 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("simulated FileShare.None lock", result["reason"])
 
-    def _stop(self, kill: str, wait: str) -> dict:
+    @staticmethod
+    def _row(pid: int, parent: int, utc: str) -> str:
+        return f"[pscustomobject]@{{ id = {pid}; parentId = {parent}; startUtc = [datetime]::Parse('{utc}').ToUniversalTime() }}"
+
+    def _stop(self, kill: str, wait: str, before: str = "@()", after: str = "@()") -> dict:
+        # The process table is injected (before the kill, then every later listing), so no real process with these ids is consulted.
         module = str(HELPER_MODULE).replace("'", "''")
         script = (
             f"$m = Import-Module '{module}' -Force -PassThru\n"
+            "$global:ffxListings = 0\n"
+            f"$table = {{ $global:ffxListings++; if ($global:ffxListings -eq 1) {{ {before} }} else {{ {after} }} }}\n"
             "$fake = [pscustomobject]@{ Id = 4242 }\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value {{ {kill} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ {wait} }}\n"
-            "$r = & $m { param($p) Stop-PinnedPayloadChild -Process $p } $fake\n"
+            "$r = & $m { param($p, $t) Stop-PinnedPayloadChild -Process $p -ProcessTable $t } $fake $table\n"
             "$r | ConvertTo-Json -Compress\n"
         )
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
@@ -471,6 +478,40 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertIn("descendant", stop["killError"])
         clean = self._stop("$null", "$true")
         self.assertTrue(clean["confirmed"], clean)
+
+    def test_a_descendant_kill_true_missed_across_the_dst_fold_leaves_the_kill_unconfirmed(self) -> None:
+        # adversary b5fce5a9-A1: py.exe started 06:59:59Z and its extractor 07:00:01Z on 2026-11-01 (the Central fall-back fold), so by
+        # LOCAL time the child is older than its parent and Kill($true) leaves it running; the root's exit then read as confirmed.
+        root = self._row(4242, 1, "2026-11-01T06:59:59Z")
+        child = self._row(5151, 4242, "2026-11-01T07:00:01Z")
+        missed = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({child})")
+        self.assertFalse(missed["confirmed"], missed)
+        self.assertIn("5151 still running", missed["killError"])
+        # the extractor's own child outlives a dead intermediate: still found through the listing taken while the root was alive.
+        leaf = self._row(6262, 5151, "2026-11-01T07:00:03Z")
+        orphaned = self._stop("$null", "$true", before=f"@({root}, {child}, {leaf})", after=f"@({leaf})")
+        self.assertFalse(orphaned["confirmed"], orphaned)
+        self.assertIn("6262 still running", orphaned["killError"])
+        # an older process holding a reused parent id is not the root's descendant; a tree that is gone after the kill is confirmed.
+        older = self._row(7373, 4242, "2026-11-01T06:00:00Z")
+        gone = self._stop("$null", "$true", before=f"@({root}, {child}, {older})", after=f"@({older})")
+        self.assertTrue(gone["confirmed"], gone)
+        # a listing that fails is never read as an empty tree.
+        unlisted = self._stop("$null", "$true", before="throw 'simulated Win32_Process access denied'")
+        self.assertFalse(unlisted["confirmed"], unlisted)
+        self.assertIn("simulated Win32_Process access denied", unlisted["killError"])
+
+    def test_the_real_process_table_lists_this_process_with_its_parent_and_a_utc_start(self) -> None:
+        module = str(HELPER_MODULE).replace("'", "''")
+        script = (
+            f"$m = Import-Module '{module}' -Force -PassThru\n"
+            "$row = @(& $m { Get-PinnedPayloadProcessTable } | Where-Object { $_.id -eq $PID })[0]\n"
+            "[ordered]@{ parent = $row.parentId; kind = [string]$row.startUtc.Kind } | ConvertTo-Json -Compress\n"
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result, {"parent": os.getpid(), "kind": "Utc"})
 
     def test_a_path_that_is_not_fully_qualified_is_refused_before_any_child(self) -> None:
         for bad in ("relative\\out", "C:drive-relative", "\\rooted-no-drive"):
