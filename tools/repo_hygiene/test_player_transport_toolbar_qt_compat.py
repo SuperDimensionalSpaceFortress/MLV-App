@@ -33,6 +33,9 @@ Refused, never read:
   * a backslash-newline splice anywhere in the file, comments and literals included, also with
     spaces or tabs before the line break (adversary r4 pass 6 A1 and every splice sibling);
   * a trigraph (``??=``, ``??/``, ...) anywhere in the file;
+  * a header-name (after ``#include``, ``__has_include(``, ``#pragma GCC dependency``, ...) whose
+    ``<...>`` holds ``/*``, ``//``, a quote or a backslash, or whose ``"..."`` holds a backslash,
+    and ``__has_include`` and its kin in a #define (adversary r5 pass 8 A1);
   * a digraph (``<:``, ``:>``, ``<%``, ``%>``, ``%:``) in code;
   * a raw string literal (``R"``, ``u8R"``, ...): its d-chars and body are not modelled;
   * a backslash in code outside a literal (a universal-character-name can spell a name);
@@ -96,6 +99,14 @@ VERSION_MACRO_REDEFINED = re.compile(r"^\s*#\s*(?:define|undef)\s+QT_VERSION(?:_
 # are what the scanner does not model, so it refuses every input where they change the text.
 SPLICE = re.compile(r"\\[ \t\f\v]*\n")
 TRIGRAPH = re.compile(r"\?\?[=/'()!<>\-]")
+# After #include, __has_include( and the like, `<...>` is a header-name, where /*, //, quotes and
+# a backslash are plain text; in `"..."` a backslash is plain text too. The lexer reads them as a
+# comment, a literal or an escape, so such a header-name is refused (adversary r5 pass 8 A1).
+HEADER_NAME_UNREADABLE = re.compile(
+    r"\b(?:\w*include\w*|__has_\w+|dependency|import|\w*embed\w*)\b[^\n<\"]*"
+    r"(?:<[^>\n]*(?:/[*/]|['\"\\])|\"[^\"\n]*\\)"
+)
+HAS_OPERATOR = re.compile(r"\b__has_\w+")
 # Refused in code (comments and literal bodies blanked).
 DIGRAPH = re.compile(r"<:|:>|<%|%>|%:")
 TOKEN_PASTE = re.compile(r"##")
@@ -244,6 +255,10 @@ def _refused_forms(lines: list[Line]) -> list[tuple[int, str]]:
             refused.append((number, "version-macro-redefined"))
         define = DEFINE.match(line)
         if define:
+            # __has_include and its kin are operators of #if; spelled through a macro they would
+            # read a header-name the scanner never sees (adversary r5 pass 8 A1 sibling).
+            for name in HAS_OPERATOR.finditer(line, define.start(3)):
+                refused.append((_physical(where, name.start(), number), "header-name"))
             for name in IDENTIFIER.finditer(line, define.start(3)):
                 if name.group(0) in defined:
                     refused.append((_physical(where, name.start(), number), "macro-indirection"))
@@ -258,7 +273,7 @@ def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
     physical_lines = text.split("\n")
     refused = [
         (text.count("\n", 0, m.start()) + 1, kind)
-        for kind, pattern in (("splice", SPLICE), ("trigraph", TRIGRAPH))
+        for kind, pattern in (("splice", SPLICE), ("trigraph", TRIGRAPH), ("header-name", HEADER_NAME_UNREADABLE))
         for m in pattern.finditer(text)
     ]
     lines: list[Line] = []
@@ -783,6 +798,25 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         # The directives the scanner models, and the null directive, are read.
         self.assertEqual(unguarded_newer_api_calls(
             "#pragma once\n#include <QImage>\n#\n#undef X\n#line 10\n#error x\n#warning x\n"), [])
+
+    def test_a_header_name_the_lexer_cannot_read_is_refused(self) -> None:
+        # adversary r5 pass 8 A1 (8354641b): in `<a/*>` after __has_include or #include the `/*` is
+        # header-name text, not a comment; read as one it hid the call. r5 refuses a <...> header-name
+        # holding /*, //, a quote or a backslash, a "..." one holding a backslash, and __has_include
+        # spelled through a #define.
+        branch = "#if __has_include(<a/*>)\n#endif\n    return image.flipped( Qt::Horizontal ); /* */\n"
+        hits = unguarded_newer_api_calls(self._header_with_branch(branch))
+        self.assertTrue(hits)
+        self.assertTrue(all(api.startswith("REFUSED") for _, api, _ in hits), hits)
+        for source in (branch, "#include <a//b>\n", "#include /* c */ <a'b>\n", '#include <a"b>\n',
+                       "#include <a\\b>\n", '#include "a\\" \n', "#include_next <a/*>\n",
+                       "#if __has_include_next(<x//>)\n#endif\n", "#pragma GCC dependency <a/*>\n",
+                       "#define HI __has_include\n"):
+            with self.subTest(source=source):
+                self.assertRefused(source, ["header-name"], [1])
+        # A plain header-name, also with a trailing comment, is read.
+        self.assertEqual(unguarded_newer_api_calls(
+            '#include <QImage> // x\n#include "Player.h" /* y */\n#if __has_include(<QImage>)\n#endif\n'), [])
 
     def test_every_api_name_token_is_a_use(self) -> None:
         # r5: the token rule is fail closed: a bare call, a macro argument (of any macro, defined
