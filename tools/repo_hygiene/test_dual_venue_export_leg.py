@@ -2194,5 +2194,167 @@ class ExportJobGeneratorTests(unittest.TestCase):
             self.assertFalse(out.exists())
 
 
+ARTIFACTS_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+# A root pwsh that starts one child pwsh (its pid goes to the file) and then sleeps: a two-process tree, no app, no clip.
+TREE_ROOT_COMMAND = ("$c = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command','Start-Sleep 90' -NoNewWindow -PassThru; "
+                     "Set-Content -LiteralPath '{pid_file}' -Value $c.Id; Start-Sleep 90")
+
+
+@requires_windows_pwsh
+class ExportKillDescendantConfirmTests(unittest.TestCase):
+    """EXPORT-KILL-DESCENDANT-CONFIRM-1 (adversary pass 26 A1 on 559536d7, split from EXPORT-VENUE-LEG-1 r20). Kill($true) may return, and the root's wait read true,
+    while a descendant (ffmpeg under a ProRes export) is still alive: the .NET contract allows it. The kill was confirmed by the root alone, so the job inspected output
+    a live process held and typed EXPORT_TIMEOUT / 40. The descendants are now recorded before the kill (pid + creation time) and each must be seen gone, or the run is
+    EXPORT_KILL_UNCONFIRMED / 48 and no output is enumerated. The survivor is simulated by turning the tree kill into a root-only kill in a copy of the code (the
+    state the contract permits); no MLVApp, no clip."""
+
+    def export_kill_block(self, survivor: bool) -> dict:
+        """Run the job's own export-wait-through-classification block (sliced from the generator's template) on a real two-process tree that times out."""
+        src = EXPORT_JOB.read_text(encoding="utf-8")
+        start = src.index("    $exportWatch = [Diagnostics.Stopwatch]::StartNew()\n")
+        end_anchor = src.index("    $exitFor = @{", start)
+        end = src.index("\n", end_anchor) + 1
+        block = src[start:end]
+        if survivor:
+            self.assertEqual(block.count("try { $app.Kill($true) }"), 1, "the survivor seam must apply")
+            block = block.replace("try { $app.Kill($true) }", "try { $app.Kill() }")
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            out_dir = work / "out"
+            out_dir.mkdir()
+            (out_dir / "clip.mov").write_bytes(b"not a movie")
+            pid_file = work / "child.pid"
+            script = work / "run.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
+                "$traceLines = [System.Collections.Generic.List[string]]::new()\n"
+                "function Write-JobTrace([string]$Message) { $traceLines.Add($Message) }\n"
+                "function Get-AttrCudaFileSha256Blocks { param($Path, $TracePath, $Label) [pscustomobject]@{ sha256 = 'stub' } }\n"
+                f"$Format = 'prores'; $MaxFrames = 24; $ExportTimeoutSec = 6; $outDir = '{out_dir}'\n"
+                f"$batchLog = '{work / 'batch.log'}'; $profilePath = '{work / 'export-profile.json'}'; $stageLog = '{work / 'stage-timing.log'}'; $Trace = '{work / 'trace.txt'}'\n"
+                "$psi = [Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)\n"
+                f"foreach ($a in @('-NoProfile', '-Command', @'\n{TREE_ROOT_COMMAND.format(pid_file=pid_file)}\n'@)) {{ $psi.ArgumentList.Add($a) }}\n"
+                "$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true\n"
+                "$childPid = $null\n"
+                "try {\n" + block +
+                f"    $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }}\n"
+                "    $childAlive = ($null -ne $childPid) -and ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue))\n"
+                "    [ordered]@{ result = $result; exit = $exitFor[$result]; outputs = $outputs.Count; killConfirmed = $killConfirmed; childStarted = ($null -ne $childPid);\n"
+                "                childAlive = $childAlive; trace = @($traceLines) } | ConvertTo-Json -Compress\n"
+                "} finally {\n"
+                f"    if ($null -eq $childPid) {{ $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }} }}\n"
+                "    if ($null -ne $childPid) { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue }\n"
+                "    if ($null -ne $app -and -not $app.HasExited) { $app.Kill($true) }\n"
+                "}\n", encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertTrue(got["childStarted"], f"the tree had its descendant before the timeout: {got}")
+            return got
+
+    def test_a_descendant_that_outlives_the_root_makes_the_kill_unconfirmed_and_no_output_is_read(self) -> None:
+        got = self.export_kill_block(survivor=True)
+        self.assertTrue(got["childAlive"], f"the seam left a live descendant after the root exited: {got}")
+        self.assertEqual((got["result"], got["exit"]), ("EXPORT_KILL_UNCONFIRMED", 48), got)
+        self.assertFalse(got["killConfirmed"], got)
+        self.assertEqual(got["outputs"], 0, f"no output is enumerated while a descendant may hold it: {got}")
+        self.assertTrue(any("survivors=" in line for line in got["trace"]), f"the survivor pids are traced: {got}")
+
+    def test_control_a_tree_that_is_all_gone_is_an_ordinary_timeout(self) -> None:
+        got = self.export_kill_block(survivor=False)
+        self.assertFalse(got["childAlive"], got)
+        self.assertEqual((got["result"], got["exit"]), ("EXPORT_TIMEOUT", 40), got)
+        self.assertTrue(got["killConfirmed"], got)
+        self.assertEqual(got["outputs"], 1, got)
+
+    def test_the_job_records_the_tree_before_the_kill_and_confirms_it_after_the_root_wait(self) -> None:
+        text = EXPORT_JOB.read_text(encoding="utf-8")
+        snap = text.index("$exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id")
+        kill = text.index("try { $app.Kill($true) }")
+        root_wait = text.index("if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }")
+        tree_wait = text.index("$exportTreeGone = Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000")
+        self.assertLess(snap, kill, "the descendants are recorded while their parents still exist")
+        self.assertLess(root_wait, tree_wait)
+        self.assertLess(tree_wait, text.index("$logText = try {"), "the tree is settled before any output is read")
+        self.assertIn("if (-not $exportTreeGone.confirmed) { $killConfirmed = $false;", text)
+
+    def snapshot_and_wait(self, body: str) -> dict:
+        proc = run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
+                         "$t = [datetime]::new(2026, 11, 19, 12, 0, 0, [DateTimeKind]::Utc)\n"
+                         "function Row($p, $pp, $c) { [pscustomobject]@{ ProcessId = $p; ParentProcessId = $pp; CreationDate = $c } }\n" + body])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_the_snapshot_walks_the_tree_skips_a_reused_parent_pid_and_fails_closed_on_an_unreadable_tree(self) -> None:
+        got = self.snapshot_and_wait(
+            "$rows = @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 202 201 $t.AddSeconds(2)), (Row 300 100 $t.AddHours(-3)), (Row 400 4 $t.AddSeconds(3)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows\n"
+            "$bad = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($rows + @(Row 203 201 $null))\n"
+            "$gone = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 201 100 $t))\n"
+            "[ordered]@{ ok = $s.ok; members = @($s.members | ForEach-Object { $_.processId }); bad = $bad.ok; badWhy = $bad.error; rootGone = $gone.ok; rootGoneWhy = $gone.error } | ConvertTo-Json -Compress")
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(sorted(got["members"]), [201, 202], "the child and grandchild are members; an older process on the root's reused pid and a stranger are not")
+        self.assertFalse(got["bad"], got)
+        self.assertIn("descendant-unreadable", got["badWhy"])
+        self.assertFalse(got["rootGone"], got)
+        self.assertIn("root-not-in-scan", got["rootGoneWhy"])
+
+    def test_the_wait_names_a_survivor_ignores_a_reused_pid_and_fails_closed_on_a_failed_scan(self) -> None:
+        got = self.snapshot_and_wait(
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$alive = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 400 -Scan { @((Row 201 100 $t.AddSeconds(1))) }\n"
+            "$reused = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 400 -Scan { @((Row 201 4 $t.AddMinutes(5))) }\n"
+            "$unread = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 400 -Scan { @((Row 201 4 $null)) }\n"
+            "$failed = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 400 -Scan { throw 'wmi down' }\n"
+            "$unknown = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = $false; members = @(); error = 'scan-failed: x' }) -WaitMs 400\n"
+            "$none = Wait-AttrCudaProcessTreeGone -Snapshot $null -WaitMs 400\n"
+            "[ordered]@{ alive = $alive.confirmed; survivors = @($alive.survivors); reused = $reused.confirmed; unread = $unread.confirmed; failed = $failed.confirmed;\n"
+            "            failedWhy = $failed.error; unknown = $unknown.confirmed; none = $none.confirmed } | ConvertTo-Json -Compress")
+        self.assertFalse(got["alive"], got)
+        self.assertEqual(got["survivors"], [201], got)
+        self.assertTrue(got["reused"], "the same pid with another creation time is a reused number, not a survivor")
+        self.assertFalse(got["unread"], "a member pid whose creation time cannot be read is not known gone")
+        self.assertFalse(got["failed"], got)
+        self.assertIn("scan-failed", got["failedWhy"])
+        self.assertFalse(got["unknown"], got)
+        self.assertFalse(got["none"], got)
+
+    def test_the_venue_bounded_process_confirms_its_kill_by_the_whole_tree(self) -> None:
+        """Sibling (pass 26 A1 siblings): Invoke-VenueBoundedProcess (VenueChain.psm1) confirmed its kill by the root's HasExited; Invoke-VenueLeaseBatch.ps1 reads that
+        killConfirmed for both export budget preflight children. A descendant that outlives the root now leaves it unconfirmed."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            dv = root / "tools" / "profiling" / "dual-venue"
+            shutil.copytree(DV, dv, ignore=shutil.ignore_patterns("__pycache__", "legs", "legsets", "receipts"))
+            (root / "tools" / "profiling" / "bachelor").mkdir(parents=True)
+            shutil.copyfile(ARTIFACTS_MODULE, root / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1")
+            module = dv / "VenueChain.psm1"
+            text = module.read_text(encoding="utf-8")
+            self.assertEqual(text.count("try { $p.Kill($true) }"), 1, "the survivor seam must apply")
+            module.write_text(text.replace("try { $p.Kill($true) }", "try { $p.Kill() }"), encoding="utf-8")
+            pid_file = root / "child.pid"
+            script = root / "run.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{module}' -Force -DisableNameChecking\n"
+                "$childPid = $null\n"
+                "try {\n"
+                f"    $r = Invoke-VenueBoundedProcess -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-Command', @'\n{TREE_ROOT_COMMAND.format(pid_file=pid_file)}\n'@) -TimeoutSec 6 -CleanupWaitMs 3000\n"
+                f"    $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }}\n"
+                "    $childAlive = ($null -ne $childPid) -and ($null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue))\n"
+                "    [ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; childStarted = ($null -ne $childPid); childAlive = $childAlive } | ConvertTo-Json -Compress\n"
+                "} finally {\n"
+                f"    if ($null -eq $childPid) {{ $childPid = try {{ [int](Get-Content -LiteralPath '{pid_file}' -Raw) }} catch {{ $null }} }}\n"
+                "    if ($null -ne $childPid) { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue }\n"
+                "}\n", encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(got["childStarted"] and got["childAlive"], f"the seam left a live descendant after the root exited: {got}")
+        self.assertTrue(got["timedOut"], got)
+        self.assertFalse(got["killConfirmed"], f"a live descendant is never a confirmed kill: {got}")
+
+
 if __name__ == "__main__":
     unittest.main()

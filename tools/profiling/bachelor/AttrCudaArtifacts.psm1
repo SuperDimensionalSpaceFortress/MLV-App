@@ -5011,6 +5011,104 @@ function Get-AttrCudaQuiescenceSample {
     }
 }
 
+function Get-AttrCudaProcessTreeSnapshot {
+    <#
+    .SYNOPSIS
+    EXPORT-KILL-DESCENDANT-CONFIRM-1: the descendants of a LIVE root, each {processId, creationTicks}, recorded BEFORE a tree kill (afterwards their parents are
+    gone and the tree cannot be walked), so Wait-AttrCudaProcessTreeGone can confirm every one of them gone. Kill($true) returning and the root's wait reading
+    true do not prove that: a descendant (ffmpeg under the export) can still run.
+    .DESCRIPTION
+    ONE Win32_Process scan (bounded by -OperationTimeoutSec), walked in memory from the root. Pid numbers are reused, so a row whose ParentProcessId names a member's
+    pid but that was created more than 2 h before that member is an older process that inherited the number, not a child. (2 h, not 0: the scan's creation times are
+    local clock values, and an hour repeated at the end of daylight time can order a real child an hour before its parent. A wrongly adopted process can only make
+    the kill UNCONFIRMED, never confirmed.) Returns [pscustomobject]@{ ok; rootCreationTicks; members; error }. ok is $false -- the tree is NOT known and no caller
+    may confirm it dead -- when the scan throws, the root is not in it, or a row whose parent is a member has no readable pid or creation time. Never throws.
+    -Processes is the test seam: the rows of the scan (ProcessId, ParentProcessId, CreationDate).
+    #>
+    param([Parameter(Mandatory = $true)][int]$RootProcessId, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20)
+    $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootCreationTicks = $null; members = @(); error = $Why } }
+    try {
+        $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+        $reuseToleranceTicks = [TimeSpan]::FromHours(2).Ticks
+        $byParent = @{}
+        $rootTicks = $null
+        foreach ($row in $rows) {
+            if ($null -eq $row) { continue }
+            if ($null -ne $row.ProcessId -and [int64]$row.ProcessId -eq [int64]$RootProcessId) {
+                if ($null -eq $row.CreationDate) { return (& $unknown 'root-creation-unreadable') }
+                $rootTicks = ([datetime]$row.CreationDate).ToUniversalTime().Ticks
+            }
+            if ($null -eq $row.ParentProcessId) { continue }
+            $parentKey = [int64]$row.ParentProcessId
+            if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = [System.Collections.Generic.List[object]]::new() }
+            $byParent[$parentKey].Add($row)
+        }
+        if ($null -eq $rootTicks) { return (& $unknown "root-not-in-scan pid=$RootProcessId") }
+        $members = [System.Collections.Generic.List[object]]::new()
+        $seen = [System.Collections.Generic.HashSet[int64]]::new()
+        [void]$seen.Add([int64]$RootProcessId)
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $queue.Enqueue([pscustomobject]@{ processId = [int64]$RootProcessId; creationTicks = $rootTicks })
+        while ($queue.Count -gt 0) {
+            $parent = $queue.Dequeue()
+            if (-not $byParent.ContainsKey($parent.processId)) { continue }
+            foreach ($child in $byParent[$parent.processId]) {
+                if ($null -eq $child.ProcessId -or $null -eq $child.CreationDate) { return (& $unknown "descendant-unreadable parent=$($parent.processId)") }
+                $childPid = [int64]$child.ProcessId
+                $childTicks = ([datetime]$child.CreationDate).ToUniversalTime().Ticks
+                if ($childTicks -lt ($parent.creationTicks - $reuseToleranceTicks) -or $seen.Contains($childPid)) { continue }
+                [void]$seen.Add($childPid)
+                $member = [pscustomobject]@{ processId = $childPid; creationTicks = $childTicks }
+                $members.Add($member)
+                $queue.Enqueue($member)
+            }
+        }
+        [pscustomobject]@{ ok = $true; rootCreationTicks = $rootTicks; members = @($members); error = $null }
+    } catch { & $unknown "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
+}
+
+function Wait-AttrCudaProcessTreeGone {
+    <#
+    .SYNOPSIS
+    EXPORT-KILL-DESCENDANT-CONFIRM-1: confirm that every member of a Get-AttrCudaProcessTreeSnapshot is gone, one Win32_Process scan every 250 ms for at most -WaitMs.
+    .DESCRIPTION
+    A member is a SURVIVOR while a scan shows its pid with its recorded creation time, or its pid with no readable creation time (a reuse cannot be told apart then).
+    The same pid with ANOTHER creation time is a reused number, not a survivor. Each scan's own bound is the time left (at least 1 s), so a hung scan cannot hold
+    the caller far past -WaitMs. Returns [pscustomobject]@{ confirmed; survivors; error }: confirmed is $true only when the snapshot was ok and a scan that did not
+    fail showed no member. A snapshot that is not ok, a survivor at the bound, or a scan that failed at the bound leave it $false (fail closed). Never throws.
+    -Scan is the test seam: a scriptblock returning the rows of one scan.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan)
+    if ($null -eq $Snapshot -or -not [bool]$Snapshot.ok) {
+        return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: $(if ($null -eq $Snapshot) { 'no snapshot' } else { [string]$Snapshot.error })" }
+    }
+    $members = @($Snapshot.members)
+    if ($members.Count -eq 0) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $survivors = @()
+    $lastError = $null
+    while ($true) {
+        try {
+            $leftSec = [int][Math]::Max(1, [Math]::Ceiling(($WaitMs - $clock.ElapsedMilliseconds) / 1000.0))
+            $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
+            $live = @{}
+            foreach ($row in $rows) {
+                if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
+                $live[[int64]$row.ProcessId] = $(if ($null -eq $row.CreationDate) { 'unreadable' } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
+            }
+            $survivors = @(foreach ($m in $members) {
+                $key = [int64]$m.processId
+                if ($live.ContainsKey($key) -and ($live[$key] -is [string] -or [int64]$live[$key] -eq [int64]$m.creationTicks)) { $key }
+            })
+            $lastError = $null
+            if ($survivors.Count -eq 0) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
+        } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
+        if ($clock.ElapsedMilliseconds -ge $WaitMs) { break }
+        Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Min(250, $WaitMs - $clock.ElapsedMilliseconds)))
+    }
+    [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = $(if ($null -ne $lastError) { $lastError } else { 'survivors' }) }
+}
+
 function Get-AttrCudaProcessCpuSnapshot {
     <#
     .SYNOPSIS
@@ -8284,6 +8382,8 @@ Export-ModuleMember -Function `
     Stop-AttrCudaDisplayWakeKeepAlive, `
     Get-AttrCudaQuiescenceSample, `
     Get-AttrCudaProcessCpuSnapshot, `
+    Get-AttrCudaProcessTreeSnapshot, `
+    Wait-AttrCudaProcessTreeGone, `
     Get-AttrCudaTopCpuProcesses, `
     Get-AttrCudaWindowsDisplayInventory, `
     Get-AttrCudaMeasurementVenue, `
