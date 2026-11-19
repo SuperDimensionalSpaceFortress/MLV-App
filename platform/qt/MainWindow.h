@@ -93,6 +93,7 @@ class SourceWriteGuard;
 class QAction;
 class QElapsedTimer;
 class QScreen;
+class QWindow;
 
 class MainWindow : public QMainWindow
 {
@@ -381,6 +382,7 @@ private slots:
     void on_horizontalSliderVidstabSmoothing_doubleClicked();
 
     void on_actionGoto_First_Frame_triggered();
+    void on_actionGoto_Last_Frame_triggered();
     void on_actionExport_triggered();
     void on_actionExportCurrentFrame_triggered();
     void on_checkBoxHighLightReconstruction_toggled(bool checked);
@@ -558,6 +560,9 @@ private slots:
     void on_toolButtonLumaVsSatReset_clicked();
     void on_actionNextFrame_triggered();
     void on_actionPreviousFrame_triggered();
+    void on_actionSeekBackwardOneSecond_triggered();
+    void on_actionSeekForwardOneSecond_triggered();
+    void on_actionKeyboardShortcuts_triggered();
     void on_checkBoxRawFixEnable_clicked(bool checked);
     void on_checkBoxLutEnable_clicked(bool checked);
     void on_checkBoxFilterEnable_clicked(bool checked);
@@ -660,6 +665,7 @@ private slots:
     void onPlaybackPrepResultReady( void );
 
 private:
+    void installGlWindowViewerInput( QWindow *glWindow );
     struct DisplayPreviewCacheEntry
     {
         bool valid = false;

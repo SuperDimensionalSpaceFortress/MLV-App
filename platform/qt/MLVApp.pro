@@ -431,6 +431,8 @@ HEADERS += MainWindow.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
+    GpuWindowViewerInput.h \
+    GpuWindowViewerInputForwarder.h \
     GpuFieldTelemetry.h \
     GpuFieldTelemetryCore.h \
     GpuDeviceLossBreaker.h \

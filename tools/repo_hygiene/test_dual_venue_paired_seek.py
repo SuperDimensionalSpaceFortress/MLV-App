@@ -804,8 +804,19 @@ PREFLIGHT_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $args[0] 'Invoke-VenueLeaseBatch.ps1'), [ref]$null, [ref]$null)
-$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-LegSpecRefusal' }, $true)
-. ([scriptblock]::Create($fn.Extent.Text))
+# EXPORT-VENUE-LEG-1 r20: Get-LegSpecRefusal plus every function of the script it calls, transitively (r19's bounded read: Read-SpecBytesWithin,
+# Get-SpecReadBoundSec, Get-BytesSha256), so the probe runs the shipped function as the batch runs it and never a copy that lost a helper
+$defs = @{}
+foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { if (-not $defs.ContainsKey($f.Name)) { $defs[$f.Name] = $f } }
+$todo = [System.Collections.Generic.Queue[string]]::new(); $todo.Enqueue('Get-LegSpecRefusal'); $load = [System.Collections.Generic.List[string]]::new()
+while ($todo.Count) {
+    $name = $todo.Dequeue()
+    if ($load.Contains($name) -or -not $defs.ContainsKey($name)) { continue }
+    $load.Add($name)
+    foreach ($c in $defs[$name].Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) { $cn = $c.GetCommandName(); if ($cn) { $todo.Enqueue($cn) } }
+}
+if (-not $load.Contains('Get-LegSpecRefusal')) { throw 'Get-LegSpecRefusal is not defined in Invoke-VenueLeaseBatch.ps1' }
+foreach ($name in $load) { . ([scriptblock]::Create($defs[$name].Extent.Text)) }
 foreach ($p in @($args | Select-Object -Skip 1)) { $r = @(Get-LegSpecRefusal $p 'cpu'); Write-Output ("ROW|" + (Split-Path -Leaf $p) + "|" + $r[0] + "|" + $r[1]) }
 """
 

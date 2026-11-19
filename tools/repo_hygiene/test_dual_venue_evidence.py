@@ -275,6 +275,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in
 FSTOGGLE_LEGS = {"legs/m16-1457-native-windowed-s2-fstoggle.json": "legs/m16-1457-native-windowed-s2.json",
                  "legs/m16-1457-native-windowed-s1-fstoggle.json": "legs/m16-1457-native-windowed-s1.json"}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
+# EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
+EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -4124,7 +4127,11 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("ADVISORY", False))
 
     def test_mutation_without_the_evidence_hash_recheck_an_edited_file_validates(self) -> None:
-        mutated = self.mutated_module([("if ((Get-DvSha256OfBytes $b) -cne $claim) {", "if ($false) {")])
+        # r6: the recheck line exists twice in the module (the capture-evidence loop, then the export loop). The anchor names the capture copy by the text after
+        # the condition ($invalid, then "$($rel"); the export copy ($Invalid, then "export/$name") is proven by test_mutation_without_the_export_hash_recheck_... in
+        # test_dual_venue_export_leg.py.
+        mutated = self.mutated_module([('if ((Get-DvSha256OfBytes $b) -cne $claim) { $invalid.Add("EVIDENCE_HASH_MISMATCH: $($rel',
+                                        'if ($false) { $invalid.Add("EVIDENCE_HASH_MISMATCH: $($rel')])
         repo = self.prod_repo()
         ev = self.evidence("m5")
         receipt = self.receipt_for(repo, ev)
@@ -7726,7 +7733,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.jsonschema.validate(spec, self.schema)
             self.assertTrue(spec["backends"], path.name)
             types.add(spec["legType"])
-        self.assertEqual(types, {"speed", "look"})
+        # EXPORT-VENUE-LEG-1: the four export legs (cpu-only batch export stage timing) are the third leg type
+        self.assertEqual(types, {"speed", "look", "export"})
         # (the speed leg and the classic look leg still run as cuda AND cpu; the scale-2 look leg is cpu-only until the CUDA route honours scale 2)
         for name in ("m16-1243-speed", "m16-1243-look"):
             self.assertEqual(sorted(json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))["backends"]), ["cpu", "cuda"], name)
@@ -7840,9 +7848,18 @@ class LegSpecSchemaTests(unittest.TestCase):
         a leg called native reports a 24 fps run as its evidence. So every such leg names its arm: 'on' for a conform leg, 'off' for every other one."""
         legs = sorted((DV / "legs").glob("m16-145[67]-*.json"))
         self.assertGreater(len(legs), 20)
+        exempt = 0
         for path in legs:
             leg = json.loads(path.read_text(encoding="utf-8"))
+            if leg.get("legType") == "export":
+                # EXPORT-VENUE-LEG-1 r2: an export leg plays nothing (MLVApp --batch), so no arm can silently halve its pace, and naming one would make it INVALID:
+                # Get-DvConformArmVerdict (Invoke-VenueLeg.ps1, run on every PASS/FAIL) finds no playback_smoke.conform line in an export run and blocks, and the
+                # export shape (Get-DvExportShapeRefusal) takes no playbackConform. The export legs are pinned by test_dual_venue_export_leg.
+                self.assertNotIn("playbackConform", leg["generatorArgs"], path.name)
+                exempt += 1
+                continue
             self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on" if "-conform-" in path.name else "off", path.name)
+        self.assertEqual(exempt, 2, "the two M16-1456 export legs are the only exempt ones")
 
     def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
         """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its

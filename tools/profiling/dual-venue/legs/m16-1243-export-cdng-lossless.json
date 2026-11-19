@@ -1,0 +1,37 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-export-cdng-lossless",
+  "card": "EXPORT-VENUE-LEG-1",
+  "legType": "export",
+  "clipId": "M16-1243",
+  "playSeconds": 20,
+  "backends": ["cpu"],
+  "scaleFactor": 1,
+  "generatorArgs": { "cpuQuiescenceThresholdPercent": 20 },
+  "timeouts": { "queueWaitSec": 1800, "extraClaimedWaitSec": 2400 },
+  "export": {
+    "format": "cdng-lossless",
+    "maxFrames": 480,
+    "receipt": "look-receipts/export-owner-hq-dualiso.marxml",
+    "receiptSha256": "2f57f11f95fa9a0eac428f256ad596b1706fe9c9a2f9dfef8411815f970bab6a",
+    "dualIsoExpected": true
+  },
+  "criteria": {
+    "acceptance": {
+      "cpu": [
+        { "metric": "framesExported", "op": "eq", "value": 480 },
+        { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
+        { "metric": "profileFramesSucceeded", "op": "eq", "value": 480 },
+        { "metric": "dualIsoClassAgrees", "op": "eq", "value": true }
+      ]
+    },
+    "supplementary": {
+      "cpu": [
+        { "metric": "framesExported", "op": "eq", "value": 480 },
+        { "metric": "exportFramesFailed", "op": "eq", "value": 0 },
+        { "metric": "profileFramesSucceeded", "op": "eq", "value": 480 },
+        { "metric": "dualIsoClassAgrees", "op": "eq", "value": true }
+      ]
+    }
+  }
+}

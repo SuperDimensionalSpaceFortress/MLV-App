@@ -185,6 +185,7 @@
     <addaction name="actionCheckForUpdates"/>
     <addaction name="actionAutoCheckForUpdates"/>
     <addaction name="separator"/>
+    <addaction name="actionKeyboardShortcuts"/>
     <addaction name="actionHelp"/>
    </widget>
    <widget class="QMenu" name="menuPlayback">
@@ -268,9 +269,12 @@
      <addaction name="menuPlaybackAutoTargetFps"/>
     </widget>
     <addaction name="actionGoto_First_Frame"/>
+    <addaction name="actionSeekBackwardOneSecond"/>
     <addaction name="actionPreviousFrame"/>
     <addaction name="actionPlay"/>
     <addaction name="actionNextFrame"/>
+    <addaction name="actionSeekForwardOneSecond"/>
+    <addaction name="actionGoto_Last_Frame"/>
     <addaction name="actionLoop"/>
     <addaction name="separator"/>
     <addaction name="actionPrevious_Clip"/>
@@ -10960,6 +10964,38 @@ QGroupBox::indicator:checked:disabled {
   <action name="actionHelp">
    <property name="text">
     <string>Help</string>
+   </property>
+  </action>
+  <action name="actionKeyboardShortcuts">
+   <property name="text">
+    <string>Keyboard Shortcuts...</string>
+   </property>
+   <property name="toolTip">
+    <string>List every keyboard shortcut</string>
+   </property>
+  </action>
+  <action name="actionSeekBackwardOneSecond">
+   <property name="text">
+    <string>Back 1 Second</string>
+   </property>
+   <property name="toolTip">
+    <string>Jump back one second...</string>
+   </property>
+  </action>
+  <action name="actionSeekForwardOneSecond">
+   <property name="text">
+    <string>Forward 1 Second</string>
+   </property>
+   <property name="toolTip">
+    <string>Jump forward one second...</string>
+   </property>
+  </action>
+  <action name="actionGoto_Last_Frame">
+   <property name="text">
+    <string>Goto Last Frame</string>
+   </property>
+   <property name="toolTip">
+    <string>Jump to last frame...</string>
    </property>
   </action>
   <action name="actionFcpxmlSelectionAssistant">

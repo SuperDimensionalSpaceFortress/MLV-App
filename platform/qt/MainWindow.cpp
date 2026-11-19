@@ -1539,6 +1539,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDebayer.h"
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "GpuWindowViewerInputForwarder.h"
 #include "GpuFieldTelemetry.h"
 #include "GpuDeviceLossBreaker.h"
 #include "MainWindowGpuPreviewPolicy.h"
@@ -3685,14 +3686,15 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     }
     else if( event->type() == QEvent::MouseButtonPress )
     {
-        if( !ui->graphicsView->underMouse()
+        const bool onViewer = gpu_window_input::pressIsOnViewer( ui->graphicsView->underMouse(), watched, GpuDisplayWindow::activeWindow() );
+        if( !onViewer
          && !ui->toolButtonWb->underMouse()
          && ui->actionWhiteBalancePicker->isChecked() )
         {
             ui->toolButtonWb->setChecked( false );
             ui->actionWhiteBalancePicker->setChecked( false );
         }
-        else if( !ui->graphicsView->underMouse()
+        else if( !onViewer
               && !ui->toolButtonBadPixelsSearchMethodEdit->underMouse()
               && !ui->toolButtonBadPixelsCrosshairEnable->underMouse() )
         {
@@ -13266,6 +13268,7 @@ void MainWindow::initGui( void )
     pQualityCycle->setContext( Qt::ApplicationShortcut );
     connect( pQualityCycle, &QShortcut::activated,
              this, &MainWindow::cyclePlaybackQualityMode );
+    pQualityCycle->setWhatsThis( tr( "Cycle playback quality" ) ); //listed in Help > Keyboard Shortcuts
 
 #ifdef Q_OS_LINUX
     //if not doing this, some elements are covered by the scrollbar on Linux only
@@ -13293,18 +13296,13 @@ void MainWindow::initGui( void )
     QPixmap pic = QPixmap::fromImage( m_pAudioWave->getMonoWave( NULL, 0, 100, devicePixelRatio() ) );
     pic.setDevicePixelRatio( devicePixelRatio() );
     ui->labelAudioTrack->setPixmap( pic );
-#ifdef Q_OS_WIN
-    //F11 is the standard Windows fullscreen key; keep the existing Ctrl+F too
-    ui->actionFullscreen->setShortcuts( QList<QKeySequence>()
-                                         << ui->actionFullscreen->shortcut()
-                                         << QKeySequence( Qt::Key_F11 ) );
-#endif
     //Esc exits fullscreen (no-op otherwise -- MainWindow has no other Escape handler)
     QShortcut *pFullscreenEscape = new QShortcut( QKeySequence( Qt::Key_Escape ), this );
     connect( pFullscreenEscape, &QShortcut::activated, this, [this]()
     {
         if( ui->actionFullscreen->isChecked() ) ui->actionFullscreen->trigger();
     } );
+    pFullscreenEscape->setWhatsThis( tr( "Exit fullscreen" ) ); //listed in Help > Keyboard Shortcuts
     //Disable caching by default to avoid crashes
     //ui->actionCaching->setVisible( false );
     //Hide deflicker target - no one knows what it does...
@@ -13374,6 +13372,8 @@ void MainWindow::initGui( void )
     connect( m_pScene, SIGNAL( wbPicked(int,int) ), this, SLOT( whiteBalancePicked(int,int) ) );
     connect( m_pScene, SIGNAL( bpPicked(int,int) ), this, SLOT( badPixelPicked(int,int) ) );
     connect( m_pScene, SIGNAL( filesDropped(QStringList) ), this, SLOT( openMlvSet(QStringList) ) );
+    //PLAYER-GL-WINDOW-INPUT-PARITY-1: the GL display window feeds the viewer's mouse input to the same slots as the scene
+    if( QWindow *glWindow = GpuDisplayWindow::activeWindow() ) installGlWindowViewerInput( glWindow );
 
     //Prepare gradient elements
     QPolygon polygon;
@@ -13695,7 +13695,11 @@ void MainWindow::initGui( void )
     connect( ui->actionRename, SIGNAL( triggered() ), this, SLOT( renameActiveClip() ) );
     addAction( ui->actionRename );
     //Fullscreen hides the menu bar and toolbar; carry the player shortcuts on the window too
+    //(the ONE key table, F11 on Windows included, lives in PlayerShortcutBinding.h)
     PlayerShortcutBinding::bindToWindow( this );
+    //Focused inputs keep their navigation keys (Left/Right/Home/End/PgUp/PgDown/Return/Enter);
+    //the seek bar is exempt, so it and the viewer get the player keys
+    qApp->installEventFilter( new PlayerShortcutBinding::FocusGuard( ui->horizontalSliderPosition, this ) );
 }
 
 //Initialize the library
@@ -23094,6 +23098,34 @@ void MainWindow::on_actionGoto_First_Frame_triggered()
     }
 }
 
+//Jump to last frame (mirror of on_actionGoto_First_Frame_triggered)
+void MainWindow::on_actionGoto_Last_Frame_triggered()
+{
+    const int frames = ( m_fileLoaded && m_pMlvObject ) ? getMlvFrames( m_pMlvObject ) : 0;
+    const int cutOutFrame = playback_frame_range::clampFrameIndex( ui->spinBoxCutOut->value() - 1, frames );
+    //If actual position is cut out, we jump to the last frame
+    if( ui->horizontalSliderPosition->value() == cutOutFrame )
+    {
+        const int lastFrame = playback_frame_range::clampFrameIndex( frames - 1, frames );
+        ui->horizontalSliderPosition->setValue( lastFrame );
+        m_newPosDropMode = lastFrame;
+    }
+    //Else we jump to cut out
+    else
+    {
+        ui->horizontalSliderPosition->setValue( cutOutFrame );
+        m_newPosDropMode = cutOutFrame;
+    }
+
+    //Sync audio if playback and audio active
+    if( ui->actionAudioOutput->isChecked()
+     && ui->actionDropFrameMode->isChecked()
+     && ui->actionPlay->isChecked() )
+    {
+        requestPlaybackAudioSync();
+    }
+}
+
 //Export clip
 void MainWindow::on_actionExport_triggered()
 {
@@ -26162,6 +26194,43 @@ void MainWindow::selectAllFiles( void )
 {
     if( m_previewMode == 4 ) ui->tableViewSession->selectAll();
     else ui->listViewSession->selectAll();
+}
+
+//PLAYER-GL-WINDOW-INPUT-PARITY-1: route GL-window clicks, right-clicks and drops into the QGraphicsView path's own slots
+void MainWindow::installGlWindowViewerInput( QWindow *glWindow )
+{
+    gpu_window_input::Forwarder::Hooks hooks;
+    // What the picker slots convert the handed scene integers with, read at the click (their own reads).
+    hooks.pickBasis = [this]() {
+        gpu_window_input::PickBasis basis;
+        if( !m_pScene || !m_pMlvObject ) return basis;
+        basis.zoomFit = ui->actionZoomFit->isChecked();
+        basis.sceneRect = m_pScene->sceneRect().size();
+        basis.rawWidth = static_cast<int>( getMlvWidth( m_pMlvObject ) );
+        basis.rawHeight = static_cast<int>( getMlvHeight( m_pMlvObject ) );
+        basis.stretchX = getHorizontalStretchFactor( false );
+        basis.stretchY = getVerticalStretchFactor( false );
+        return basis;
+    };
+    // The picture rect the GL window's last paintGL actually drew, whichever route presented and
+    // whatever the stretch controls say now (empty before any frame: no pick). The forwarder is a
+    // child of glWindow, so this pointer outlives every call.
+    GpuDisplayWindow *const paintedWindow = qobject_cast<GpuDisplayWindow *>( glWindow );
+    hooks.drawnPicture = [paintedWindow]() {
+        if( !paintedWindow ) return QRectF();
+        const GpuDisplayWindow::PaintedPicture p = paintedWindow->lastPaintedPicture();
+        return gpu_window_input::drawnPictureRect( p.valid, p.framebufferWidth, p.framebufferHeight, p.devicePixelRatio, p.scaleX, p.scaleY );
+    };
+    hooks.wbArmed = [this]() { return ui->actionWhiteBalancePicker->isChecked(); };
+    hooks.bpArmed = [this]() { return ui->toolButtonBadPixelsSearchMethodEdit->isChecked(); };
+    hooks.pickWhiteBalance = [this]( int x, int y ) { whiteBalancePicked( x, y ); };
+    hooks.pickBadPixel = [this]( int x, int y ) { badPixelPicked( x, y ); };
+    // The menu slot maps through the (hidden) view's mapToGlobal; mapFromGlobal is its exact inverse.
+    hooks.contextMenuAtGlobal = [this]( const QPoint &globalPos ) { pictureCustomContextMenuRequested( ui->graphicsView->mapFromGlobal( globalPos ) ); };
+    hooks.dragEnter = [this]( QDragEnterEvent *e ) { dragEnterEvent( e ); };
+    // The scene's own drop route (filesDropped -> openMlvSet), not the top-level window's dropEvent.
+    hooks.openFiles = [this]( const QStringList &paths ) { openMlvSet( paths ); };
+    glWindow->installEventFilter( new gpu_window_input::Forwarder( glWindow, std::move( hooks ) ) );
 }
 
 //Contextmenu on picture
@@ -33755,6 +33824,33 @@ void MainWindow::on_actionNextFrame_triggered()
 void MainWindow::on_actionPreviousFrame_triggered()
 {
     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() - 1 );
+}
+
+//Jump back one second (one clip-framerate's worth of frames, clamped to the slider range;
+//computed overflow-safe, the rate comes from clip metadata)
+void MainWindow::on_actionSeekBackwardOneSecond_triggered()
+{
+    if( !m_fileLoaded || !m_pMlvObject ) return;
+    ui->horizontalSliderPosition->setValue( PlayerShortcutBinding::oneSecondSeekTarget(
+        ui->horizontalSliderPosition->value(), getMlvFramerate( m_pMlvObject ), -1,
+        ui->horizontalSliderPosition->minimum(), ui->horizontalSliderPosition->maximum() ) );
+}
+
+//Jump forward one second
+void MainWindow::on_actionSeekForwardOneSecond_triggered()
+{
+    if( !m_fileLoaded || !m_pMlvObject ) return;
+    ui->horizontalSliderPosition->setValue( PlayerShortcutBinding::oneSecondSeekTarget(
+        ui->horizontalSliderPosition->value(), getMlvFramerate( m_pMlvObject ), +1,
+        ui->horizontalSliderPosition->minimum(), ui->horizontalSliderPosition->maximum() ) );
+}
+
+//Help > Keyboard Shortcuts: generated from the live actions (PlayerShortcutBinding.h)
+void MainWindow::on_actionKeyboardShortcuts_triggered()
+{
+    QDialog *dialog = PlayerShortcutBinding::createShortcutsDialog( this );
+    dialog->setAttribute( Qt::WA_DeleteOnClose );
+    dialog->open();
 }
 
 //En-/disable all raw corrections

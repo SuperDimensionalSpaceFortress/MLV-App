@@ -71,6 +71,9 @@ param(
     # BACHELOR-LEASE-BATCH-LEGS-1: the batch token of Invoke-VenueLeaseBatch.ps1. The leg's job id then ends "-lb<token>", so the venue agent runs
     # it on that batch's parked quiet lease instead of requesting one (ultra-magnus-agent.ps1, lease-batch block). Nothing else about the leg changes.
     [Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{12}$')][string]$LeaseBatch = '',
+    # EXPORT-VENUE-LEG-1 r19 (sol r18 B1): the sha256 of the RAW spec bytes the lease batch's export-budget preflight judged. When given, the bytes this leg reads must be those bytes,
+    # or the leg refuses DVE_LEG_SPEC_CHANGED before anything is generated or submitted: a lease is never spent on a spec the budget did not judge. Empty (every other caller): no check.
+    [Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{64}\z')][string]$ExpectSpecSha256 = '',
     [string]$Actor = '',
     # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored). Must sit under a
     # `.claude-state` directory in production (a receipt and its evidence name an owner clip's run).
@@ -130,7 +133,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Set') {
 
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = (Resolve-Path (Join-Path $here '..\..\..')).Path }
 if ([string]::IsNullOrWhiteSpace($UmRunScript)) { $UmRunScript = Join-Path $here '..\um-run.ps1' }
-if ([string]::IsNullOrWhiteSpace($GeneratorScript)) { $GeneratorScript = Join-Path $here '..\bachelor\playback-attr-3-cuda-job.ps1' }
+# EXPORT-VENUE-LEG-1: an export leg's default generator is ..\bachelor\export-stage-job.ps1 (chosen once the spec is read, below)
+$generatorDefaulted = [string]::IsNullOrWhiteSpace($GeneratorScript)
+if ($generatorDefaulted) { $GeneratorScript = Join-Path $here '..\bachelor\playback-attr-3-cuda-job.ps1' }
 if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
     # .claude-state is gitignored, so a worktree has none: resolve the MAIN checkout from the git common dir.
     $common = (& git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null)
@@ -221,6 +226,11 @@ if ($null -ne $table) {
 }
 
 $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
+if ($ExpectSpecSha256) {
+    # r19 (sol r18 B1): the bytes read above are the bytes this leg runs; they must be the ones the batch's budget preflight judged (raw sha256, no line-ending normalisation)
+    $readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($specBytes)) -replace '-', '').ToLowerInvariant()
+    if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not the $ExpectSpecSha256 the lease batch's export budget preflight judged; nothing is generated or submitted" }
+}
 # Line endings are normalised on BOTH sides of the committed-spec lookup (Get-DvLegSpecSha256): on this VM's default checkout (autocrlf=true) the working
 # copy is CRLF and the committed blob is LF, and a raw-byte hash would refuse every committed spec as LEG_SPEC_NOT_COMMITTED (fable r1 B2).
 $legSpecSha256 = Get-DvLegSpecSha256 $specBytes
@@ -236,6 +246,9 @@ if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backend
 if ($Backend -notin @($spec.backends)) { throw "DVE_LEG_SPEC_INVALID backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', '))" }
 # (r9, adversary r8 cc8061a2 A1: Get-DvLegSpecShapeRefusal above refused every legType that is not one enum string, so this compares a string, case-sensitively)
 $isLook = ($spec.legType -ceq 'look')
+# EXPORT-VENUE-LEG-1: an export leg runs one headless CPU batch export on the venue (its shape was checked above: cpu, scale 1, an export block, no playback keys)
+$isExport = ($spec.legType -ceq 'export')
+if ($isExport -and $generatorDefaulted) { $GeneratorScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }
 # The settled-playback window the job passes to the smoke runner (generator -PlaySeconds). The generator's own default
 # is 25; the owner's floor (20 s, 10 s for an HFR clip: HFR-10S-1) is enforced here, at its lowest, before anything is
 # submitted, and at the clip's own value by the venue's runner and the app.
@@ -265,6 +278,12 @@ $receipt.scale = $scale
 # DUAL-VENUE-DISPLAY-MATRIX-1: EVERY receipt says the display mode the leg asked for (the spec's optional displayMode; none = full screen); the mode the app ran in is UNKNOWN until a run log says (step 7).
 $display = Get-DvDisplayEvidence -Spec $spec -LogText $null
 $receipt.display = $display
+# EXPORT-VENUE-LEG-1: an export leg plays nothing, so its receipt carries no scale or display block; it carries the export block instead (filled in at step 7).
+if ($isExport) {
+    $receipt.scale = $null; $receipt.display = $null
+    $receipt.export = [ordered]@{ format = [string]$spec.export.format; maxFrames = $spec.export.maxFrames; dualIsoExpected = $spec.export.dualIsoExpected
+                                  receiptSha256 = [string]$spec.export.receiptSha256; files = $null; stages = $null; problems = @(); containmentAdvisory = @(); verdict = $null }
+}
 # PLAYBACK-VISUAL-INSPECTION-1: EVERY speed-leg receipt says whether captures were asked for; what they show is filled in once the job has published them (step 7).
 if ($visualRequest.applies) {
     $receipt.visual = Read-DvVisualCaptures -Requested $visualRequest.requested -OptOutReason $visualRequest.optOutReason -ArtifactsDir '' -EvidenceDir '' -LegId ([string]$spec.legId)
@@ -469,6 +488,15 @@ try {
             [IO.File]::WriteAllBytes($lookReceiptPath, $lookReceipt.bytes)
         }
     }
+    # EXPORT-VENUE-LEG-1: the export leg's batch receipt (-r), read the same way: COMMITTED at the admission head (offline: HEAD), bound by export.receiptSha256.
+    $exportReceiptPath = $null
+    if ($isExport) {
+        $exportCommit = if ($OfflineTestMode) { [string](& git -C $RepoRoot rev-parse --verify HEAD 2>$null) } else { [string]$sources.headCommit }
+        $exportReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $exportCommit.Trim() -Look ([pscustomobject]@{ receipt = [string]$spec.export.receipt; receiptSha256 = [string]$spec.export.receiptSha256 })
+        if (-not ($exportReceipt.ok -and $exportReceipt.present)) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        $exportReceiptPath = Join-Path $workDirResolved "$jobStem.export-receipt.marxml"
+        [IO.File]::WriteAllBytes($exportReceiptPath, $exportReceipt.bytes)
+    }
 
     # --- 3. generate the job (local, no I/O on the venue) ----------------------------------------------
     # The generator resolves the clip by ID (it refuses a path, a fixture under 20 s, an unknown or unconsented id).
@@ -569,6 +597,19 @@ try {
         $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
         if ($null -ne $lookReceiptPath) { $gen['LookReceiptPath'] = $lookReceiptPath }
     }
+    # EXPORT-VENUE-LEG-1: an export job takes its own arguments only (no scale, display, look or playback switch; generatorArgs carries only the quiescence threshold)
+    if ($isExport) {
+        $gen = @{
+            SourceCommit = $SourceCommit; BuildManifestSha256 = $BuildManifestSha256; ClipId = [string]$spec.clipId; OutFile = $jobFile; RepoRoot = $RepoRoot
+            Venue = $Venue; Backend = $Backend; PlaySeconds = $playSeconds; Format = [string]$spec.export.format; MaxFrames = [int]$spec.export.maxFrames
+            ReceiptPath = $exportReceiptPath; DualIsoExpected = [bool]$spec.export.dualIsoExpected
+            # r20 (adversary pass 24 A2): the generator checks the bytes it reads from ReceiptPath against the committed hash, so a file replaced after line 498 wrote it is refused
+            ExpectReceiptSha256 = [string]$spec.export.receiptSha256
+        }
+        if ($OfflineTestMode -and -not [string]::IsNullOrWhiteSpace($VenueTablePath)) { $gen['VenueTablePath'] = $VenueTablePath }
+        $exportGenArgs = Get-DvProp $spec 'generatorArgs'
+        if ($null -ne (Get-DvProp $exportGenArgs 'cpuQuiescenceThresholdPercent')) { $gen['CpuQuiescenceThresholdPercent'] = [double]$exportGenArgs.cpuQuiescenceThresholdPercent }
+    }
     try {
         $genOut = @(& $GeneratorScript @gen)
     } catch {
@@ -644,8 +685,11 @@ try {
     $buildJson = "$cacheShare\playback-attr-3-cuda-$short-build.json"
     if (-not (Test-Path -LiteralPath $buildJson -PathType Leaf)) { Stop-Leg 'DEVICE_UNAVAILABLE' "BUILD_NOT_STAGED: no build manifest for $short on this venue" }
     if ((Get-DvSha256OfFile $buildJson) -ne $BuildManifestSha256) { Stop-Leg 'DEVICE_UNAVAILABLE' "BUILD_NOT_STAGED: the staged build manifest for $short is not sha256 $BuildManifestSha256 (a different build is never substituted)" }
-    $runnerDir = "$cacheShare\$($generated.smokeRunnerClosureDirName)"
-    if (-not (Test-Path -LiteralPath $runnerDir -PathType Container)) { Stop-Leg 'DEVICE_UNAVAILABLE' "SMOKE_RUNNER_NOT_STAGED: $($generated.smokeRunnerClosureDirName) is not in this venue's cache" }
+    # (EXPORT-VENUE-LEG-1: an export job runs MLVApp.exe --batch from the staged package and no smoke runner, so it needs no runner closure)
+    if (-not $isExport) {
+        $runnerDir = "$cacheShare\$($generated.smokeRunnerClosureDirName)"
+        if (-not (Test-Path -LiteralPath $runnerDir -PathType Container)) { Stop-Leg 'DEVICE_UNAVAILABLE' "SMOKE_RUNNER_NOT_STAGED: $($generated.smokeRunnerClosureDirName) is not in this venue's cache" }
+    }
 
     # --- 6. submit (the venue's settings are isolated by the app; the receipt proves it from the run log) -----
     $timeoutSec = [int]$generated.recommendedJobTimeoutSec + 120
@@ -684,6 +728,62 @@ if ($stdout -match 'ARTIFACTS=(?<p>\S+)') { $artifactsShare = ConvertTo-ShareSid
 $summary = $null; $manifest = $null
 $resultJson = $null; $runLogText = $null; $runLogSha = $null
 $evidenceDir = Join-Path $evidenceBase $receipt.receiptId
+# --- EXPORT-VENUE-LEG-1: an export leg is decided HERE, before any playback evidence gate. The job published only summary.json, batch.log, the stage profile
+# (export-profile.json) or stage-timing log, and output-manifest.json (the exported footage stayed on the venue and was deleted there). Each is copied into
+# <evidence>\export, hashed there into receipt.export.files, and read back by Get-DvExportEvidence; the outcome is Get-DvExportOutcome's, the same rule
+# Test-DvReceiptValid re-derives. A captured run whose identity, evidence or dual-ISO class does not bind is INVALID, never PASS or FAIL.
+if ($isExport) {
+    $exportFiles = [ordered]@{}; $exportTexts = @{}; $collected = $false
+    if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
+        $exportDir = Join-Path $evidenceDir 'export'
+        Invoke-DvCollect 'mkdir' $exportDir { New-Item -ItemType Directory -Force -Path $exportDir | Out-Null }
+        foreach ($name in 'summary.json', 'batch.log', 'export-profile.json', 'stage-timing.log', 'output-manifest.json') {
+            $src = Join-Path $artifactsShare $name
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { continue }
+            $dst = Join-Path $exportDir $name
+            Invoke-DvCollect 'copy' $src { Copy-Item -LiteralPath $src -Destination $dst }
+            $exportBytes = [byte[]](Invoke-DvCollect 'read' $dst { , [IO.File]::ReadAllBytes($dst) })
+            $exportFiles[$name] = Get-DvSha256OfBytes $exportBytes
+            $exportTexts[$name] = [Text.UTF8Encoding]::new($false).GetString($exportBytes).TrimStart([char]0xFEFF)
+        }
+        $umRunLocal = Join-Path $evidenceDir 'um-run.json'
+        $umRunBytes = [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ schema = 'mlv-app/dual-venue-um-run/v1'; exitCode = $exitCode; resultToken = $token } | ConvertTo-Json -Compress) + "`n")
+        Invoke-DvCollect 'write' $umRunLocal { [IO.File]::WriteAllBytes($umRunLocal, $umRunBytes) }
+        $receipt.evidence.umRunJsonSha256 = Get-DvSha256OfBytes $umRunBytes
+        $receipt.evidence.localEvidenceDir = $evidenceDir
+        if ($exportFiles.Contains('summary.json')) { $receipt.evidence.summaryJsonSha256 = $exportFiles['summary.json'] }
+        $collected = $true
+    }
+    $receipt.export.files = $exportFiles
+    $exportSummary = $null
+    if ($exportTexts.ContainsKey('summary.json')) { try { $exportSummary = $exportTexts['summary.json'] | ConvertFrom-Json -ErrorAction Stop } catch { $exportSummary = $null } }
+    $exportEvidence = Get-DvExportEvidence -Format ([string]$spec.export.format) -MaxFrames ([int]$spec.export.maxFrames) -DualIsoExpected ([bool]$spec.export.dualIsoExpected) `
+        -ExpectedBuildId $SourceCommit -ProfileText ([string]$exportTexts['export-profile.json']) -StageLogText ([string]$exportTexts['stage-timing.log']) `
+        -BatchLogText ([string]$exportTexts['batch.log']) -OutputManifestText ([string]$exportTexts['output-manifest.json'])
+    $receipt.metrics = $exportEvidence.metrics
+    $receipt.export.stages = $exportEvidence.stages
+    $receipt.export.problems = @($exportEvidence.problems)
+    # r18 (EXPORT-CDNG-STAGE-CONTAINMENT-1): the CDNG disjoint-stage containment findings, beside the problems and never among them: advisory, no verdict input
+    $receipt.export.containmentAdvisory = @($exportEvidence.containmentAdvisory)
+    # the run IS the leg the receipt names: the hashed summary.json's own identity (the validator checks the same fields)
+    $identityProblems = @()
+    if (-not $collected) { $identityProblems += 'EVIDENCE_ABSENT: the job published no artifacts directory' }
+    elseif ($null -eq $exportSummary) { $identityProblems += 'EVIDENCE_ABSENT: the job published no readable summary.json' }
+    else {
+        foreach ($pair in @(@('schema', 'export-stage-job.v1'), @('legType', 'export'), @('format', [string]$spec.export.format), @('clipId', [string]$spec.clipId), @('backend', 'cpu'),
+                            @('declaredVenue', $Venue), @('venue', $Venue), @('buildManifestSha256', $BuildManifestSha256), @('sourceCommit', $SourceCommit), @('receiptSha256', [string]$spec.export.receiptSha256), @('result', [string]$token))) {
+            if ([string](Get-DvProp $exportSummary $pair[0]) -cne $pair[1]) { $identityProblems += "EXPORT_SUMMARY_MISMATCH: summary.json $($pair[0]) is not the leg's" }
+        }
+        if ([string](Get-DvProp $exportSummary 'maxFrames') -cne [string]$spec.export.maxFrames) { $identityProblems += 'EXPORT_SUMMARY_MISMATCH: summary.json maxFrames is not the leg''s' }
+    }
+    $exportCriteria = Get-DvProp (Get-DvProp (Get-DvProp $spec 'criteria') ([string]$role)) 'cpu'
+    $exportOutcome = Get-DvExportOutcome -ResultToken $token -ExitCode $exitCode -Evidence $exportEvidence -Criteria $exportCriteria
+    $exportFinal = $exportOutcome.outcome; $exportDetail = [string]$exportOutcome.detail
+    if ($exportFinal -cin @('PASS', 'FAIL') -and $identityProblems.Count -gt 0) { $exportFinal = 'INVALID'; $exportDetail = "the job result derives $($exportOutcome.outcome) but the run does not bind: $($identityProblems -join '; ')" }
+    $receipt.export.verdict = $exportFinal
+    Write-Output ("DVE_EXPORT format={0} framesExported={1} exportFps={2} largestStage={3} problems={4}" -f $spec.export.format, $exportEvidence.metrics.framesExported, $exportEvidence.metrics.exportFps, $exportEvidence.metrics.largestStage, @($exportEvidence.problems).Count)
+    Complete-Receipt $exportFinal $exportDetail
+}
 if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
     Invoke-DvCollect 'mkdir' $evidenceDir { New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null }
     # The run's OWN records are copied into the LOCAL evidence directory (under .claude-state in production: they name an owner clip's
