@@ -15871,6 +15871,16 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 (0, 0, 0, 0), False),
             "r4-A1: a marker `id=3 (id=4)` is no readable marker of session 3": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 (id=4)\n", 1), (4, 4, 4, 4), False),
+            # r4 adversary pass on 0b915c19 (A1, A3; A2 is the culture test below): every id= of a marker is read, and a key glued to a non-ASCII letter (the Kelvin sign folds to k under
+            # ignore-case) is still a key
+            "r4b-A1: a marker `id=3 id=4` supplies no clean measured session": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 id=4\n", 1), (4, 4, 4, 4), False),
+            "r4b-A3: `playback_smoke.frame session=3 <Kelvin sign>session=4` right after the marker closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 " + chr(0x212A) + "session=4\n", 1),
+                (0, 0, 0, 0), False),
+            "r4b-A3: a later marker `id=3 <Kelvin sign>id=4` declares two ids (the Kelvin sign is no name character), so it is unreadable and names itself": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session id=3 " + chr(0x212A) + "id=4\n", 1),
+                (4, 4, 4, 4), False),
             "r4-A1: a boundary record with a REAL location tail is still read and the window stays open": (
                 self.log().replace("playback_smoke.measured_session id=3\n",
                                    "playback_smoke.measured_session id=3 (C:/b x/MainWindow.cpp:10)\nplayback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:11)\n", 1),
@@ -15890,6 +15900,31 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), expected, e)
                 self.assertEqual(got["passes"], [passes, passes], f"{name}: {e}")
                 self.assertEqual(e["reason"] == "ok", passes, e)
+
+    def test_adversary_r4_a2_the_boundary_and_request_readers_do_not_depend_on_the_host_culture(self) -> None:
+        """r4 adversary pass on 0b915c19 (A2): under tr-TR an upper-case I does not fold to i, so an upper-case marker, an upper-case key or an upper-case toggle record was not
+        read and a foreign session (or an inherited toggle) went unseen. The letter i is written as a class in the boundary and request patterns."""
+        marker = "playback_smoke.measured_session id=3\n"
+        logs = {
+            "key SESSION=4": self.log().replace(marker, marker + "playback_smoke.frame session=3 SESSION=4\n", 1),
+            "upper-case marker": self.log().replace(marker, marker + "PLAYBACK_SMOKE.MEASURED_SESSION ID=4\n", 1),
+            "upper-case measured_session with id=4": self.log().replace(marker, marker + "playback_smoke.MEASURED_SESSION id=4\n", 1),
+        }
+        script = ("$ErrorActionPreference = 'Stop'; [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('tr-TR')\n"
+                  f"Import-Module '{ATTR_MODULE}' -Force; Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{ culture = [System.Globalization.CultureInfo]::CurrentCulture.Name }\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3'; $out[$p.Name] = $e.reason }\n"
+                  "$spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{} }\n"
+                  "$out['request-blocks'] = (Get-DvWindowToggleRequestEvidence -Spec $spec -LogText 'GUI_SMOKE.WINDOW_TOGGLE phase=begin index=0').blocks\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc, out = run_pwsh_json(script, DVE_LOGS=json.dumps(logs))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["culture"], "tr-TR")
+        for name in logs:
+            with self.subTest(case=name):
+                self.assertNotEqual(out[name], "ok", f"{name}: a foreign session read as the measured one")
+        self.assertTrue(out["request-blocks"], "an upper-case GUI_SMOKE.WINDOW_TOGGLE record is a toggle record under tr-TR too")
 
     def test_adversary_a4_the_live_validator_refuses_the_key_on_a_leg_that_is_not_windowed(self) -> None:
         windowed = json.loads((DV / "legs/m16-1457-native-windowed-s2-fstoggle.json").read_text(encoding="utf-8"))

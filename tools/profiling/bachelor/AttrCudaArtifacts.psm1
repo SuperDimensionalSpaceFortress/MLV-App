@@ -7439,11 +7439,14 @@ function Get-AttrCudaWindowToggleEvidence {
     $end = $lines.Count
     $wanted = [string]$MeasuredSessionId
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^playback_smoke\.measured_session id=(?<id>\S+)(\s|$)') {
+        # r4 (adversary A2 on 0b915c19): the letter i of a boundary pattern is the class [Ii] and the keys are explicit [Ss][Ee]... classes, so neither the host culture (tr-TR does
+        # not fold an upper-case I) nor ignore-case folding (the Kelvin sign folds to k, which an ignore-case ASCII lookbehind then took for a name character) decides what is read
+        if ($lines[$i] -match '^playback_smoke\.measured_sess[Ii]on [Ii][Dd]=(?<id>\S+)(\s|$)') {
             $markerIds[$Matches['id']] = $true
             if ($wanted -eq '' -or $Matches['id'] -ceq $wanted) { $start = $i }
             # r4 (adversary A1 on 16530f5b): a marker whose cut tail is no location is unreadable (`id=3 (id=4)` hides an id=), never a clean marker of its id
-            if ($badTail.Contains($i)) { $anomalies.Add('session-boundary-unreadable') }
+            # r4 (adversary A1 on 0b915c19): and so is a marker that declares an id more than once (`id=3 id=4`): the first is not the whole marker
+            if ($badTail.Contains($i) -or [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=').Count -gt 1) { $anomalies.Add('session-boundary-unreadable') }
         }
     }
     # r3 (A5 of the first r3 round): with no id the log must carry exactly ONE session's marker; none is no measured session at all, never "read the whole log"
@@ -7462,11 +7465,11 @@ function Get-AttrCudaWindowToggleEvidence {
             # r4 (adversary A1 on 16530f5b): a playback_smoke record whose cut tail is no location is an unreadable boundary (`session=3 (session=4)` hides a session=), so it
             # closes the window and names itself; the keys are read in any case (`SESSION=4` is a declaration too)
             if ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(\s|$)' -and $badTail.Contains($i)) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
-            elseif ($lines[$i] -match '^playback_smoke\.measured_session(\s|$)') {
-                foreach ($idMatch in [regex]::Matches($lines[$i], '(?i)(?<![A-Za-z0-9_])id=(?<v>[^\s]*)')) { if ($idMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+            elseif ($lines[$i] -match '^playback_smoke\.measured_sess[Ii]on(\s|$)') {
+                foreach ($idMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ii][Dd]=(?<v>[^\s]*)')) { if ($idMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
             }
             elseif ($lines[$i] -match '^playback_smoke\.[A-Za-z0-9_]+(\s|$)') {
-                foreach ($sessionMatch in [regex]::Matches($lines[$i], '(?i)(?<![A-Za-z0-9_])session=(?<v>[^\s]*)')) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+                foreach ($sessionMatch in [regex]::Matches($lines[$i], '(?<![A-Za-z0-9_])[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)')) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
             }
             if ($end -le $i) { break }
         }

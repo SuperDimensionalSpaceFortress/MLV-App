@@ -2033,7 +2033,8 @@ function Get-DvWindowToggleRequestEvidence {
     $mentions = 0
     foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
         # (the body still starts with the optional `[utc] [LEVEL] [0x<thread>] ` prefix; a record counts only where it starts the body after it)
-        if ($line -match '^\s*(?:\[[^\]]*\]\s*)*gui_smoke\.window_toggles? ') { $mentions++ }
+        # r4 (adversary A2 on 0b915c19): the letter i is the class [Ii], so a host culture that does not fold an upper-case I (tr-TR) still counts GUI_SMOKE.WINDOW_TOGGLE
+        if ($line -match '^\s*(?:\[[^\]]*\]\s*)*gu[Ii]_smoke\.w[Ii]ndow_toggles? ') { $mentions++ }
     }
     $blocks = (-not $requested) -and ($mentions -gt 0)
     [pscustomobject]@{
