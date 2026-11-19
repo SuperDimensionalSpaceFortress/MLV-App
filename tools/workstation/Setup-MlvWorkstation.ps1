@@ -408,9 +408,13 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
 # not UTF-8 is a failure, never a replacement character that two different values share). -Regexp reads 'git config -z --get-regexp' records ('<key><LF><value>').
 # An unset key is an empty list; a failed read throws GIT_CONFIG_READ_FAILED (never an empty list).
 function Get-GitConfigValuesRaw {
-    param([string]$RepoDir, [string]$Key, [switch]$Regexp)
+    # -Local (SSH-PUSHURL-1 pass 2 A3): only the repository's own config file; without it git merges the system, global and repository values (and a value outside the repository is not seen by a Codex lane with another HOME)
+    # -List (SSH-PUSHURL-1 pass 5 A2): 'git config -z --list --show-scope --show-origin', every key of every scope in ONE git run (the tokens come in threes: <scope>, <origin> as 'file:<path>',
+    # and <key><LF><value>; r3 A1: the origin tells a value of the repository's own config file from one that an include.path file brought in, which git labels with the including file's scope); -Key is not used
+    param([string]$RepoDir, [string]$Key, [switch]$Regexp, [switch]$Local, [switch]$List)
     $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-    foreach ($a in @('-C', $RepoDir, 'config', '-z', $(if ($Regexp) { '--get-regexp' } else { '--get-all' }), $Key)) { $psi.ArgumentList.Add($a) }
+    $cfgArgs = @('-C', $RepoDir, 'config', '-z') + $(if ($List) { @('--list', '--show-scope', '--show-origin') } else { @($(if ($Local) { @('--local') } else { @() })) + @($(if ($Regexp) { '--get-regexp' } else { '--get-all' }), $Key) })
+    foreach ($a in $cfgArgs) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
     $proc = Invoke-GitTraceScrubbed { [System.Diagnostics.Process]::Start($psi) }   # r17 F3: the child inherits no GIT_TRACE* destination
     $ms = [IO.MemoryStream]::new()
@@ -464,6 +468,13 @@ function Get-RemoteUrlContext {
     # r26 (sol r25 B1; HUB RULING fail closed): Git reads legacy aliases from remotes/<name> and branches/<name> of the COMMON git dir, which in a linked worktree is not
     # '$RepoDir\.git' (a file there): the r23 census missed them and a url string could resolve as an alias while the guard compared the literal. Alias files are no longer
     # parsed: ANY entry under remotes\ or branches\ of the common or the per-worktree git dir refuses typed LEASE_LEGACY_REMOTE_ALIAS_PRESENT (move it aside to proceed).
+    Assert-NoLegacyRemoteAlias -RepoDir $RepoDir
+    return @{ Rules = [string[]]$rules; Names = [string[]]$names.ToArray() }
+}
+
+# the legacy alias census of Get-RemoteUrlContext (r26), as a function of its own so the one-read SSH push url snapshot shares it: throws LEASE_LEGACY_REMOTE_ALIAS_PRESENT
+function Assert-NoLegacyRemoteAlias {
+    param([string]$RepoDir)
     foreach ($gd in @(Get-GitDirsResolved -RepoDir $RepoDir)) {
         foreach ($legacy in 'remotes', 'branches') {
             $ld = Join-Path $gd $legacy
@@ -472,7 +483,6 @@ function Get-RemoteUrlContext {
             if ($entry) { throw "LEASE_LEGACY_REMOTE_ALIAS_PRESENT $($entry.FullName) is a legacy remote alias entry (refused, never parsed: Git could resolve a url argument through it; move it aside and re-run)" }
         }
     }
-    return @{ Rules = [string[]]$rules; Names = [string[]]$names.ToArray() }
 }
 
 # r26 (sol r25 B1): the per-worktree and the common git dir of -RepoDir, as Git resolves them ('git rev-parse --path-format=absolute --git-dir --git-common-dir').
@@ -984,6 +994,8 @@ function Invoke-PhaseClone {
                 throw "CLONE_TRACKING_FAILED $Repo 'git branch --set-upstream-to=fork/master master' exited $trackCode (the local master does not track fork/master; create or check out master, then re-run -Phase Clone)"
             }
         }
+        # SETUP-MLVWORKSTATION-SSH-PUSHURL-1: push over SSH when this host's GitHub key authenticates; the https fetch url is untouched (see Invoke-SshPushUrl)
+        Invoke-Step 'fork push url: SSH when ssh -T git@github.com authenticates (remote.fork.pushurl; fetch stays https)' { Invoke-SshPushUrl }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $DoctrineRepo '.git'))) {
         Invoke-Step "Clone doctrine bus into $DoctrineRepo" {
@@ -1113,6 +1125,516 @@ function Test-GitRemoteUrlSame {
     }
     $x = & $norm $A; $y = & $norm $B
     return ($x.Length -gt 0 -and $x -ceq $y)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Fork push url over SSH (SETUP-MLVWORKSTATION-SSH-PUSHURL-1). The global credential.helper is 'manager' (Invoke-PhasePackages), so every https push rides an OAuth token
+# that an account event can kill. When 'ssh -T git@github.com' authenticates, remote.fork.pushurl is set to the SSH form of the fork url and the https FETCH url stays as it
+# is. It lives in the repo's own config (not ~/.gitconfig), so a Codex lane with a separate HOME pushes the same way. This code never creates, copies, prints or registers a
+# key and never writes under ~/.ssh (the probe runs with its own generated -F config, so the user's ssh config is never parsed, and with BatchMode, StrictHostKeyChecking=yes,
+# CheckHostIP=no and UpdateHostKeys=no, so not even known_hosts is written); an unregistered key is an owner-only MANUAL line.
+# credential.helper is NOT changed here. Only 'fork' is handled: 'origin' is the upstream ilia3101 repository, which is fetched and never pushed to.
+# ---------------------------------------------------------------------------------------------
+# '' when the url is not a plain github.com https or 'git@' ssh url of owner/repo; otherwise the SSH form 'git@github.com:owner/repo.git'. The owner and repo alphabet is
+# [A-Za-z0-9._-] (\z, not $, so a trailing LF is never matched); an https url with userinfo, a port, a query or another host gives ''.
+function ConvertTo-GitHubSshUrl {
+    param([string]$Url)
+    $m = [regex]::Match("$Url", '^(?:https://github\.com/|git@github\.com:)([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?\z', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $m.Success) { return '' }
+    if ($m.Value.StartsWith('git@', [StringComparison]::OrdinalIgnoreCase) -and $m.Value -cnotmatch '^git@github\.com:[^/]+/[^/]+$') { return '' }   # the ssh form is exact: no trailing slash, lower-case user and host
+    $owner = $m.Groups[1].Value; $repoName = $m.Groups[2].Value
+    if ($owner -match '^\.+$' -or $repoName -match '^\.+$') { return '' }
+    return "git@github.com:$owner/$repoName.git"
+}
+
+# What 'ssh -T git@github.com' said: authenticated only on exit 1 with GitHub's "successfully authenticated" text (exit 255 is a refused key, a host key or a network error).
+function Get-GitHubSshProbeVerdict {
+    param([int]$ExitCode, [string]$Output)
+    if ($ExitCode -eq 1 -and "$Output" -match '(?i)successfully authenticated') { return @{ Authenticated = $true; Detail = 'authenticated' } }
+    $first = @("$Output" -split "[`r`n]+" | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $text = $(if ($first.Count) { "$($first[0])".Trim() } else { 'no output' })
+    if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
+    return @{ Authenticated = $false; Detail = "ssh exited $ExitCode ($text)" }
+}
+
+# r4 B1 / B2 (class: a location or a file identity judged by its spelling, where only the file system knows what a path is): the canonical path and the file identity of an EXISTING
+# path as the file system reports them, from one handle that follows the whole link chain: GetFinalPathNameByHandle resolves a SUBST drive, a DOS device
+# mapping, a junction, a symbolic link and an 8.3 short name to the real long path; the volume serial plus file index identify one file whatever its spelling or case. Returns
+# @{ Final; Id } or $null when the path cannot be opened or the native call is unavailable (callers fail closed). Id is '' when the volume reports no file index.
+$script:PathIdentityOverride = $null   # test seam: a scriptblock taking the path and returning @{ Final; Id } or $null
+function Initialize-PathIdentityType {
+    if (-not ('MlvSetup.PathIdentity' -as [type])) {
+        try {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace MlvSetup {
+    public static class PathIdentity {
+        [StructLayout(LayoutKind.Sequential)]
+        struct ByHandleInfo { public uint Attrs, C1, C2, A1, A2, W1, W2, Vol, SizeHigh, SizeLow, Links, IdHigh, IdLow; }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder buffer, uint length, uint flags);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandle(SafeFileHandle h, out ByHandleInfo info);
+        // { final path, file identity } or null; access 0 (no data access), share all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (opens a directory too); a reparse point is followed
+        public static string[] Query(string path) {
+            using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (h.IsInvalid) return null;
+                StringBuilder sb = new StringBuilder(4096);
+                uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+                if (n == 0 || n >= sb.Capacity) return null;
+                ByHandleInfo info;
+                string id = "";
+                if (GetFileInformationByHandle(h, out info) && (info.IdHigh != 0 || info.IdLow != 0)) id = info.Vol.ToString("x8") + ":" + info.IdHigh.ToString("x8") + info.IdLow.ToString("x8");
+                return new string[] { sb.ToString(), id };
+            }
+        }
+        // r4 pass 9: the canonical path of the file an OPEN handle refers to (where a file this code just created physically is, whatever its path spells now), or null
+        public static string FinalPath(SafeFileHandle h) {
+            StringBuilder sb = new StringBuilder(4096);
+            uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+            if (n == 0 || n >= sb.Capacity) return null;
+            return sb.ToString();
+        }
+    }
+}
+'@
+        } catch { return $false }
+    }
+    return $true
+}
+# r6 B1 (class: a lossy path transformation): the native '\\?\' prefix is dropped ONLY when the ordinary spelling names exactly the same file. Win32 path parsing removes a trailing dot or
+# space from every segment (judge. becomes judge, a different folder), maps a reserved device name (CON, NUL.x, COM1 ...) to a device, and a path of MAX_PATH or more is not usable by
+# a program that is not long-path aware: for those the native spelling is kept, which is the only exact one. A caller that must hand the path to another program refuses a native
+# spelling (see Invoke-GitHubSshProbe); a caller that only deletes or compares uses it as it is.
+function Test-OrdinarySpellingExact([string]$Plain) {
+    if ($Plain.Length -ge 260) { return $false }
+    $segs = @($Plain -split '\\')
+    for ($i = 0; $i -lt $segs.Count; $i++) {
+        $s = "$($segs[$i])"
+        if (-not $s) { continue }
+        if ($i -eq 0 -and $s -match '^[A-Za-z]:$') { continue }                       # the drive
+        if ($s.EndsWith('.') -or $s.EndsWith(' ')) { return $false }
+        if ($s.Contains(':')) { return $false }                                         # a stream name or a device-like segment
+        if ((($s -split '\.', 2)[0]).TrimEnd(' ') -match '^(?i:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3])$') { return $false }
+    }
+    return $true
+}
+function Format-FinalPathName([string]$Final) {
+    if ($Final.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        $plain = '\\' + $Final.Substring(8)
+        if ((Test-OrdinarySpellingExact $plain)) { return $plain } else { return $Final }
+    }
+    if ($Final.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+        $plain = $Final.Substring(4)
+        if ((Test-OrdinarySpellingExact $plain)) { return $plain } else { return $Final }
+    }
+    return $Final
+}
+function Get-PathIdentity {
+    param([string]$Path)
+    if ($script:PathIdentityOverride) { return (& $script:PathIdentityOverride $Path) }
+    if (-not (Initialize-PathIdentityType)) { return $null }
+    try { $q = [MlvSetup.PathIdentity]::Query([IO.Path]::GetFullPath($Path)) } catch { return $null }
+    if (-not $q) { return $null }
+    return @{ Final = (Format-FinalPathName "$($q[0])"); Id = "$($q[1])" }
+}
+# '' when the canonical path of the file behind an open handle cannot be read
+function Get-HandleFinalPath($Handle) {
+    if (-not (Initialize-PathIdentityType)) { return '' }
+    try { $f = [MlvSetup.PathIdentity]::FinalPath($Handle) } catch { return '' }
+    if (-not $f) { return '' }
+    return (Format-FinalPathName "$f")
+}
+# Removes the given files (retried for about 2 s, whatever the caller's -WhatIf / -Confirm preference) and returns the ones that are still there.
+function Remove-ProbeConfigFiles {
+    param([string[]]$Paths)
+    $list = @(@($Paths) | Where-Object { $_ } | Select-Object -Unique)
+    for ($try = 0; $try -lt 20; $try++) {
+        foreach ($p in $list) { try { Remove-Item -LiteralPath $p -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { } }   # a non-empty directory in its place throws even under SilentlyContinue
+        if (@($list | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    return @($list | Where-Object { Test-Path -LiteralPath $_ })
+}
+
+# r3 A3 (class: a location judged by its spelling, not by where it physically is): true when -Path, or any ancestor of it, has a '.ssh' segment, or is a link (directory junction or symbolic
+# link) whose resolved target does (checked again on the target, up to 8 hops). A link that cannot be resolved counts as under .ssh (fail closed).
+# r4 B1: and when the file system's own canonical path of the nearest existing ancestor has one (a SUBST drive or a DOS device mapping keeps its drive spelling in every .NET path and
+# has no LinkTarget); a path whose canonical form cannot be read counts as under .ssh.
+function Test-PathUnderSshDirectory {
+    param([string]$Path, [int]$Depth = 0)
+    if ($Depth -gt 8) { return $true }
+    $full = [IO.Path]::GetFullPath($Path)
+    if (@($full -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { return $true }
+    $anchor = $full
+    while ($anchor -and -not (Test-Path -LiteralPath $anchor)) {
+        $up = Split-Path -Parent $anchor
+        if (-not $up -or $up -ceq $anchor) { $anchor = ''; break }
+        $anchor = $up
+    }
+    if (-not $anchor) { return $true }
+    $canon = Get-PathIdentity -Path $anchor
+    if (-not $canon -or -not $canon.Final) { return $true }
+    if (@("$($canon.Final)" -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { return $true }
+    $d = $full
+    while ($d) {
+        $item = Get-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.LinkTarget) {
+            try { $target = $item.ResolveLinkTarget($true) } catch { return $true }
+            if (-not $target) { return $true }
+            if (Test-PathUnderSshDirectory -Path $target.FullName -Depth ($Depth + 1)) { return $true }
+        }
+        $parent = Split-Path -Parent $d
+        if (-not $parent -or $parent -ceq $d) { break }
+        $d = $parent
+    }
+    return $false
+}
+
+# The probe: ssh -T git@github.com with its own generated -F config (the user's ssh config is not read), never interactive (BatchMode, no password prompt, no host-key prompt and
+# no known_hosts write), bounded by ConnectTimeout and a hard kill.
+function Invoke-GitHubSshProbe {
+    # -KeyFile is the key the Ssh phase configures for github.com; a test passes a scratch path. -TimeoutSec is clamped to 1..600 (pass 3 A7: WaitForExit takes int milliseconds)
+    param([string]$SshExe = '', [int]$TimeoutSec = 20, [string]$KeyFile = '')
+    $TimeoutSec = [Math]::Min(600, [Math]::Max(1, $TimeoutSec))
+    if (-not $SshExe) { $c = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $SshExe = $c.Source } }
+    if (-not $SshExe) { return @{ Authenticated = $false; Detail = 'the OpenSSH client (ssh) is not installed' } }
+    if (-not $KeyFile) { $KeyFile = Join-Path (Join-Path $env:USERPROFILE '.ssh') 'id_ed25519_github' }
+    # adversary pass 3 A1 + A2 (class: the probe parsed the USER's whole ssh config, which can run commands while it is parsed (Match exec) and can turn on writes under ~/.ssh
+    # (CheckHostIP appends the IP's host key to known_hosts even under StrictHostKeyChecking=yes)). The user's config is never read: ssh runs with -F <a minimal config this probe
+    # writes into the temp folder and deletes afterwards>, and -F also drops the system-wide ssh_config. The generated config holds only what the probe needs: the key the Ssh
+    # phase configures (when that file exists) and options that make the probe run nothing and write nothing: StrictHostKeyChecking=yes adds no host key, CheckHostIP=no and
+    # UpdateHostKeys=no stop the two known_hosts writes that remain, ControlMaster=no / ControlPath=none leave no multiplexing socket, PermitLocalCommand=no, RemoteCommand=none,
+    # ClearAllForwardings=yes and ForwardAgent=no stop a local or remote command and any forwarding. known_hosts is still read (the host key is checked against it).
+    $cfgLines = [Collections.Generic.List[string]]::new()
+    $cfgLines.Add('Host github.com'); $cfgLines.Add('    HostName github.com'); $cfgLines.Add('    User git')
+    # adversary pass 4 A3: the key file goes on the command line (-i, handed over as UTF-16 and so exact for a profile path like C:\Users\Jose-with-accent), never into the config
+    # file, which is plain ASCII and would turn a non-ASCII character of the path into '?' (IdentitiesOnly then missed the key). The config carries no path at all.
+    $keyArgs = @()
+    if (Test-Path -LiteralPath $KeyFile -PathType Leaf) { $keyArgs = @('-i', $KeyFile); $cfgLines.Add('    IdentitiesOnly yes') }
+    foreach ($o in @('BatchMode yes', 'ConnectTimeout 10', 'StrictHostKeyChecking yes', 'CheckHostIP no', 'UpdateHostKeys no', 'ControlMaster no', 'ControlPath none', 'PermitLocalCommand no', 'RemoteCommand none', 'ClearAllForwardings yes', 'ForwardAgent no')) { $cfgLines.Add("    $o") }
+    # adversary pass 5 A4: the config is never written beneath a '.ssh' directory (a TEMP / TMP that points into ~/.ssh would otherwise put it there): the first of the temp folder and
+    # %LOCALAPPDATA%\Temp that exists and has no '.ssh' path segment is used; none = the probe fails closed without running ssh
+    $cfgDir = ''
+    foreach ($cand in @([IO.Path]::GetTempPath(), $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Temp' } else { '' }))) {
+        if (-not $cand -or -not (Test-Path -LiteralPath $cand -PathType Container)) { continue }
+        $full = [IO.Path]::GetFullPath($cand)
+        if (-not (Test-PathUnderSshDirectory $full)) { $cfgDir = $full; break }
+    }
+    if (-not $cfgDir) { return @{ Authenticated = $false; Detail = 'no temp folder outside a .ssh directory is available for the probe config (ssh was not run)' } }
+    $cfgPath = Join-Path $cfgDir ("mlv-ssh-probe-" + [guid]::NewGuid().ToString('N') + '.conf')
+    # r4 A2 / pass 9 (class: a mutable path used after it was checked): the folder was judged a moment ago, and a junction can be re-pointed between that judgement and any later use of
+    # the path. So after the folder check the config is only ever handled by where it PHYSICALLY is: it is created with CreateNew (a file that already exists is never opened, so
+    # only a file this call created is ever touched), its canonical path is read from the creating HANDLE (not from the path again), and that physical path is what ssh is given
+    # (-F), what the cleanup deletes and what the leftover report names. Under a '.ssh' folder, or an unreadable location -> that file is removed and the probe fails closed before
+    # ssh runs, through the same retrying removal and PROBE_CONFIG_NOT_DELETED report as after a probe.
+    $cfgPhysical = ''; $cfgFail = ''; $cfgCreated = $false
+    $cfgBytes = [Text.Encoding]::ASCII.GetBytes((($cfgLines -join "`n") + "`n"))
+    if ($script:SshProbeConfigRaceHook) { & $script:SshProbeConfigRaceHook 'before-write' $cfgDir }   # test seam: a re-point between the folder check and the write
+    $cfgStream = $null
+    try {
+        $cfgStream = [IO.FileStream]::new($cfgPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $cfgCreated = $true
+        $cfgStream.Write($cfgBytes, 0, $cfgBytes.Length); $cfgStream.Flush()
+        $cfgPhysical = Get-HandleFinalPath $cfgStream.SafeFileHandle
+        if (-not $cfgPhysical) { $cfgFail = 'the probe config location could not be resolved after it was written' }
+        elseif (@($cfgPhysical -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { $cfgFail = 'the probe config landed under a .ssh folder (the temp folder changed after it was checked)' }
+        # r6 B1: a physical path that keeps its native '\\?\' spelling has no ordinary spelling that names the same file (a folder ending in a dot or space, a device name, a path of MAX_PATH or
+        # more), so ssh cannot be handed that exact file: refused before ssh runs, and the cleanup below removes the file by this exact native path
+        elseif ($cfgPhysical.StartsWith('\\?\', [StringComparison]::Ordinal)) { $cfgFail = 'the probe config landed at a path that has no ordinary spelling (a folder name ending in a dot or space, a device name, or a path over 259 characters), so ssh could not be given that exact file' }
+    } catch { $cfgFail = "the probe's ssh config could not be written ($($_.Exception.Message))" }
+    finally { if ($cfgStream) { try { $cfgStream.Dispose() } catch { } } }
+    if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'after-create' $cfgDir $cfgPhysical } catch { } }   # test seam: another process holds the file that was just created
+    if ($cfgFail) {
+        $gone = @()
+        if ($cfgCreated) { $gone = @(Remove-ProbeConfigFiles @($(if ($cfgPhysical) { $cfgPhysical } else { $cfgPath }))) }   # only a file this call created is removed
+        if ($gone.Count -gt 0) { return @{ Authenticated = $false; Detail = "PROBE_CONFIG_NOT_DELETED $($gone -join ', ') could not be removed ($cfgFail; ssh was not run; delete it by hand)" } }
+        return @{ Authenticated = $false; Detail = "$cfgFail (ssh was not run)" }
+    }
+    try {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
+        # the same options again on the command line (they win over the file): a second, independent statement of the no-run / no-write contract
+        $sshOpts = @('BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes', 'CheckHostIP=no', 'UpdateHostKeys=no', 'ControlMaster=no', 'ControlPath=none', 'PermitLocalCommand=no', 'RemoteCommand=none', 'ClearAllForwardings=yes', 'ForwardAgent=no')
+        foreach ($a in @('-F', $cfgPhysical) + $keyArgs + @('-T') + @($sshOpts | ForEach-Object { '-o'; $_ }) + @('git@github.com')) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+        $proc = $null; $verdict = $null
+        if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'before-ssh' $cfgDir $cfgPhysical } catch { } }   # test seam: a re-point between the physical check and ssh reading its -F file
+        try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { $verdict = @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
+        if (-not $verdict) {
+            # r4 H1 (class: a child process whose termination is assumed): once ssh has started, EVERY way out of this block ends with the child terminated and the outcome known. A throw
+            # after the start (the stdin close, a read task) is a failed verdict, never an escape with the child still running; a kill that throws is retried and then checked.
+            $pid_ = $proc.Id
+            try {
+                if ($script:SshProbeAfterStartHook) { & $script:SshProbeAfterStartHook $proc }   # test seam: a failure right after the process started
+                $proc.StandardInput.Close()
+                $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+                    $verdict = @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
+                } else {
+                    # r8 B1 (class: an unbounded wait on a redirected pipe): the client has exited, but a descendant it started (a wrapper's background command) can keep the redirected
+                    # stdout/stderr handles open, so the pipes never reach EOF and a bare .Result would wait for that descendant. The output is collected under its own bound; a pipe that
+                    # stays open is a typed failed verdict, and the config cleanup below still runs.
+                    $proc.WaitForExit()
+                    if (-not [Threading.Tasks.Task]::WaitAll(@($outTask, $errTask), 3000)) {
+                        $verdict = @{ Authenticated = $false; Detail = 'ssh exited but its output stayed open for more than 3 s (a process it started still holds the output pipes); the probe result is not used' }
+                    } else {
+                        $verdict = Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)")
+                    }
+                }
+            } catch {
+                $verdict = @{ Authenticated = $false; Detail = "the ssh probe failed after ssh started ($($_.Exception.Message))" }
+            } finally {
+                $stopped = $false
+                for ($k = 0; $k -lt 3 -and -not $stopped; $k++) {
+                    try { if (-not $proc.HasExited) { $proc.Kill($true); [void]$proc.WaitForExit(5000) } } catch { }
+                    try { $stopped = $proc.HasExited } catch { $stopped = $false }
+                }
+                if (-not $stopped) { $verdict = @{ Authenticated = $false; Detail = "ssh (pid $pid_) could not be terminated after the probe; the probe result is not used" } }
+                $proc.Dispose()
+            }
+        }
+    } finally {
+        # adversary pass 4 A4: this is the probe's own temp file, so it is removed whatever the caller's -WhatIf / -Confirm preference is (Verify runs the probe under -WhatIf too).
+        # adversary pass 5 A5: a removal that fails (a scanner or another process holds the file) is retried for about 2 s
+        # r4 A2 / pass 9: only the PHYSICAL path of the file this call created is removed and checked: the path the probe was handed can be re-pointed (a junction) at a folder that holds an
+        # unrelated file of the same name, which must never be deleted
+        if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'after-ssh' $cfgDir $cfgPhysical } catch { } }   # test seam: a re-point between the ssh run and the cleanup
+        $leftover = @(Remove-ProbeConfigFiles @($cfgPhysical))
+    }
+    # a config that is still there after the retries is a failed probe, whatever ssh said (fail closed: the contract is that the probe leaves nothing behind)
+    if ($leftover.Count -gt 0) { return @{ Authenticated = $false; Detail = "PROBE_CONFIG_NOT_DELETED $($leftover -join ', ') could not be removed after the probe (delete it by hand); the probe result is not used" } }
+    return $verdict
+}
+
+# PURE decision (no process, no config read): what to do with remote <fork>'s push url. -Urls = every remote.fork.url, -PushUrls = every remote.fork.pushurl (empty when unset),
+# -Rules / -Names = Get-RemoteUrlContext. -Probe is invoked only after every url check passed (a refused remote never reaches the network). Returns @{ Decision; PushUrl; Reason }:
+#   REFUSED       not a single url naming the fork, or a rewrite rule / remote name makes a url something Git would not connect to: change nothing
+#   SKIPPED       the fork url is not a github.com https or ssh url: nothing to do
+#   UNREGISTERED  ssh -T did not authenticate: SSH_KEY_UNREGISTERED (owner-only); change nothing
+#   NOOP          pushes already go to exactly the SSH form
+#   READY         authenticated and the push url is unset (or equals the https fetch url): set pushurl to PushUrl
+#   FOREIGN       authenticated but a push url is neither the fetch url nor the SSH form: left as it is (fail closed)
+# adversary pass 3 A4: a rewrite rule or a remote name that holds a control character (or starts with '-') cannot be compared as a string with certainty, so it is unsafe: '' when
+# every rule and name is plain, otherwise the typed REMOTE_URL_UNSAFE reason.
+function Get-SshContextRefusal {
+    param([string[]]$Rules, [string[]]$Names)
+    foreach ($x in @(@($Rules) | ForEach-Object { @{ K = 'url rewrite rule'; V = "$_" } }) + @(@($Names) | ForEach-Object { @{ K = 'remote name'; V = "$_" } })) {
+        if (Test-RemoteUrlUnsafe "$($x.V)") { return "REMOTE_URL_UNSAFE a $($x.K) holds a control character or starts with '-' (refused: it cannot be compared with certainty)" }   # pass 4 A5: a leading '-' too
+    }
+    return ''
+}
+
+function Get-SshPushUrlDecision {
+    # -Urls / -PushUrls are read across every config scope (what Git uses); -LocalUrls / -LocalPushUrls are the repository's own config file only (what a lane with another HOME sees).
+    # A caller that passes no Local list says they are the same (pass 2 A3).
+    param([string[]]$Urls, [string[]]$PushUrls, [string[]]$LocalUrls, [string[]]$LocalPushUrls, [string]$ExpectedUrl, [string[]]$Rules, [string[]]$Names, [scriptblock]$Probe)
+    $Urls = @($Urls); $PushUrls = @($PushUrls)
+    $LocalUrls = $(if ($PSBoundParameters.ContainsKey('LocalUrls')) { @($LocalUrls) } else { $Urls })
+    $LocalPushUrls = $(if ($PSBoundParameters.ContainsKey('LocalPushUrls')) { @($LocalPushUrls) } else { $PushUrls })
+    if ($Urls.Count -ne 1) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = "remote.fork.url holds $($Urls.Count) value(s), expected exactly one" } }
+    if (($LocalUrls -join "`n") -cne ($Urls -join "`n")) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = 'remote.fork.url is not set only in the repository config (a global or system value counts too)' } }
+    $fetch = "$($Urls[0])"
+    $why = Get-SshContextRefusal -Rules $Rules -Names $Names
+    if ($why) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = $why } }
+    $why = Get-RemoteUrlRefusal -Urls @($fetch) -Rules $Rules -Names $Names
+    if ($why) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = $why } }
+    if (-not (Test-GitRemoteUrlSame $fetch $ExpectedUrl)) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = "remote.fork.url $(Format-RemoteUrlForLog $fetch) does not name $ExpectedUrl" } }
+    $ssh = ConvertTo-GitHubSshUrl $fetch
+    if (-not $ssh) { return @{ Decision = 'SKIPPED'; PushUrl = ''; Reason = "remote.fork.url $(Format-RemoteUrlForLog $fetch) is not a plain github.com https or git@ url" } }
+    $why = Get-RemoteUrlRefusal -Urls @($ssh) -Rules $Rules -Names $Names
+    if ($why) { return @{ Decision = 'REFUSED'; PushUrl = $ssh; Reason = $why } }
+    # adversary pass 1 A4: every configured push url gets the same refusal as the fetch url, BEFORE the probe (a control character, a rewrite rule or a remote name in a pushurl
+    # is something Git would not connect to as written)
+    foreach ($pu in $PushUrls) {
+        $why = Get-RemoteUrlRefusal -Urls @("$pu") -Rules $Rules -Names $Names
+        if ($why) { return @{ Decision = 'REFUSED'; PushUrl = $ssh; Reason = "remote.fork.pushurl: $why" } }
+    }
+    $p = & $Probe
+    # adversary pass 1 A5: only a real [bool] $true authenticates; a string 'false' or a missing verdict is not an authentication
+    if ($p -isnot [hashtable] -or $p.Authenticated -isnot [bool]) { return @{ Decision = 'UNREGISTERED'; PushUrl = $ssh; Reason = 'the probe returned no [bool] Authenticated verdict' } }
+    if (-not $p.Authenticated) { return @{ Decision = 'UNREGISTERED'; PushUrl = $ssh; Reason = "$($p.Detail)" } }
+    # adversary pass 2 A3: a push url that Git merges in from the global or system config is not in the repository config, so a lane with another HOME would not push over ssh: it is
+    # neither counted as the ssh form nor replaced (a second pushurl in the repository would also make Git push to both)
+    if (($LocalPushUrls -join "`n") -cne ($PushUrls -join "`n")) { return @{ Decision = 'FOREIGN'; PushUrl = $ssh; Reason = 'remote.fork.pushurl is also set outside the repository config (global or system), which a lane with another HOME would not see' } }
+    # r4 B3 (class: an implicit default accepted where the contract names an explicit value): NOOP is exactly ONE repository-config push url equal to the SSH form. A fork FETCH url that is
+    # already the SSH form with no push url set is not a NOOP: it is READY below (Setup writes the explicit push url, Verify reports SSH_PUSHURL_MISSING).
+    if ($PushUrls.Count -eq 1 -and "$($PushUrls[0])" -ceq $ssh) { return @{ Decision = 'NOOP'; PushUrl = $ssh; Reason = 'pushes already go to the SSH form' } }
+    if ($PushUrls.Count -eq 0 -or ($PushUrls.Count -eq 1 -and "$($PushUrls[0])" -ceq $fetch)) { return @{ Decision = 'READY'; PushUrl = $ssh; Reason = 'ssh authenticates' } }
+    return @{ Decision = 'FOREIGN'; PushUrl = $ssh; Reason = "remote.fork.pushurl is $((@($PushUrls | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', '), neither the fetch url nor $ssh" }
+}
+
+# Test seam: a scriptblock that returns @{ Authenticated; Detail } instead of running ssh (the tests never touch the network).
+$script:SshProbeOverride = $null
+$script:SshProbeAfterStartHook = $null   # test seam: runs inside the probe right after ssh started (may throw)
+$script:SshProbeConfigRaceHook = $null   # test seam: runs inside the probe with ('before-write' | 'after-ssh', the temp folder that was checked)
+$script:SshPushUrlWriteHook = $null   # test seam: runs right before the pushurl write
+$script:SshPushUrlAfterWriteHook = $null   # test seam: runs right after the write, before the post-write snapshot
+$script:SshPushUrlTakeBackHook = $null   # test seam: runs right before the take-back of our value
+
+# A git config value-pattern (POSIX ERE) that matches exactly this value: '^' + the value with every regex metacharacter escaped + '$'.
+function ConvertTo-GitValueRegex([string]$Value) { return ('^' + [regex]::Replace("$Value", '([.^$*+?()\[\]{}|\\])', '\$1') + '$') }
+
+# r3 A1: true when a 'git config --show-origin' origin ('file:<path>') names exactly -File (a full path). git prints a path relative to its working directory (-RepoDir) for the
+# repository's own config in an ordinary clone and an absolute one in a linked worktree; an origin that is not a 'file:' one (command line, stdin, blob) is never the repository's file.
+function Test-GitConfigOriginIsFile {
+    param([string]$Origin, [string]$RepoDir, [string]$File)
+    if (-not "$Origin".StartsWith('file:', [StringComparison]::Ordinal)) { return $false }
+    try { $p = "$Origin".Substring(5); $full = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $RepoDir $p })) } catch { return $false }
+    # r4 B2 (class: file identity judged by a case-folded spelling): an exact spelling match is the file; any other spelling (another case, a short name, a link) is the same file only when
+    # the file system says so (volume serial + file index), since a case-sensitive directory holds 'Repo' and 'repo' as two files. No identity for either side -> not the file (fail closed).
+    if ([string]::Equals($full, $File, [StringComparison]::Ordinal)) { return $true }
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf) -or -not (Test-Path -LiteralPath $File -PathType Leaf)) { return $false }
+    $a = Get-PathIdentity -Path $full; $b = Get-PathIdentity -Path $File
+    if (-not $a -or -not $b -or -not $a.Id -or -not $b.Id) { return $false }
+    return ("$($a.Id)" -ceq "$($b.Id)")
+}
+
+# Everything the push url decision depends on, read once: the fork urls and push urls (every scope, and the repository's own file), the url rewrite rules and the remote names.
+function Get-SshPushUrlConfigSnapshot {
+    # adversary pass 5 A2 (class: a snapshot assembled from several git runs can mix two states of the configuration): every field comes from ONE 'git config -z --list --show-scope'
+    # run, so urls, push urls, rewrite rules and remote names are one read of each config file, never a rule read before a writer and a url read after it.
+    Assert-NoLegacyRemoteAlias -RepoDir $Repo
+    # r3 A1 (class: a value is judged by a label that does not say where it is stored): a value is the REPOSITORY's own only when git labels it scope=local AND its origin is the repository's
+    # own config file (the common git dir's 'config'); a value from an include.path file carries the including file's scope, but lives in a file a lane with another HOME may not have.
+    $ownCfg = [IO.Path]::GetFullPath((Join-Path @(Get-GitDirsResolved -RepoDir $Repo)[1] 'config'))
+    $tok = @(Get-GitConfigValuesRaw -RepoDir $Repo -List)
+    $urls = [Collections.Generic.List[string]]::new(); $localUrls = [Collections.Generic.List[string]]::new(); $push = [Collections.Generic.List[string]]::new(); $localPush = [Collections.Generic.List[string]]::new()
+    $rules = [Collections.Generic.List[string]]::new(); $names = [Collections.Generic.List[string]]::new()
+    if ($tok.Count % 3 -ne 0) { throw "GIT_CONFIG_READ_FAILED git config --list --show-scope --show-origin printed $($tok.Count) token(s), expected scope/origin/entry triples" }
+    for ($i = 0; $i -lt $tok.Count; $i += 3) {
+        $scope = "$($tok[$i])"; $origin = "$($tok[$i + 1])"; $entry = "$($tok[$i + 2])"
+        $nl = $entry.IndexOf("`n"); $key = $(if ($nl -ge 0) { $entry.Substring(0, $nl) } else { $entry }); $val = $(if ($nl -ge 0) { $entry.Substring($nl + 1) } else { '' })
+        $own = ($scope -ceq 'local' -and (Test-GitConfigOriginIsFile -Origin $origin -RepoDir $Repo -File $ownCfg))
+        if ($key -ceq 'remote.fork.url') { $urls.Add($val); if ($own) { $localUrls.Add($val) } }
+        elseif ($key -ceq 'remote.fork.pushurl') { $push.Add($val); if ($own) { $localPush.Add($val) } }
+        if ($key -match '^url\..*\.(insteadof|pushinsteadof)$') { $rules.Add($val) }
+        if ($key.StartsWith('remote.', [StringComparison]::Ordinal)) { $dot = $key.LastIndexOf('.'); if ($dot -gt 7) { $names.Add($key.Substring(7, $dot - 7)) } }
+    }
+    return @{ Urls = [string[]]$urls.ToArray(); LocalUrls = [string[]]$localUrls.ToArray(); Push = [string[]]$push.ToArray(); LocalPush = [string[]]$localPush.ToArray(); Rules = [string[]]$rules.ToArray(); Names = [string[]]$names.ToArray() }
+}
+# adversary pass 3 A4: an unambiguous key. Every list is '<count>[<length>:<value>,...]' (a value is read by its length, so no value can look like a separator): the old
+# U+001F / U+001E join made ["a<US>b"] and ["a","b"] one key.
+function Get-SshPushUrlSnapshotKey($Snapshot) {
+    return ((@('Urls', 'LocalUrls', 'Push', 'LocalPush', 'Rules', 'Names') | ForEach-Object {
+        $items = @($Snapshot[$_] | ForEach-Object { "$_" })
+        "$_=$($items.Count)[" + (($items | ForEach-Object { "$($_.Length):$_" }) -join ',') + ']'
+    }) -join ';')
+}
+
+# Applies (or, with -VerifyOnly, only reports) the decision for the clone at $Repo. Setup: sets remote.fork.pushurl on READY. Verify: a READY or FOREIGN outcome is a typed
+# failure (the probe authenticates, so the push url must already be the SSH form); a probe that does not authenticate is a MANUAL line, never a failure.
+function Invoke-SshPushUrl {
+    param([switch]$VerifyOnly, [scriptblock]$Probe = $null)
+    if (-not $Probe) { $Probe = $(if ($script:SshProbeOverride) { $script:SshProbeOverride } else { { Invoke-GitHubSshProbe } }) }
+    if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) { Write-Log "SSH_PUSHURL skipped: no clone at $Repo yet"; return }
+    $snap = Get-SshPushUrlConfigSnapshot
+    if ($snap.Urls.Count -eq 0) {
+        # adversary pass 3 A6: Verify cannot confirm the push url of a clone that has no 'fork' remote (the Clone phase fails such a repo too), so there it is a typed failure, never a skip.
+        # A clone that does not exist yet (above) stays a skip.
+        if ($VerifyOnly) { Write-Log "SSH_PUSHURL_MISSING remote=fork: $Repo has no 'fork' remote, so no push url can be confirmed (run -Phase Clone)" 'ERROR'; $script:Failures.Add('SSH_PUSHURL_MISSING remote=fork') }
+        else { Write-Log "SSH_PUSHURL skipped: $Repo has no 'fork' remote" }
+        return
+    }
+    $d = Get-SshPushUrlDecision -Urls $snap.Urls -LocalUrls $snap.LocalUrls -PushUrls $snap.Push -LocalPushUrls $snap.LocalPush -ExpectedUrl $ForkUrl -Rules $snap.Rules -Names $snap.Names -Probe $Probe
+    $ssh = $d.PushUrl
+    # adversary pass 2 A1 / A4: the probe takes seconds and the decision used the configuration as it was BEFORE it. A READY or NOOP verdict (the two that claim an ssh push) is
+    # only kept when the urls, the push urls in every scope, the rewrite rules and the remote names are still exactly what the decision saw.
+    if ($d.Decision -ceq 'READY' -or $d.Decision -ceq 'NOOP') {
+        $after = Get-SshPushUrlConfigSnapshot
+        if ((Get-SshPushUrlSnapshotKey $snap) -cne (Get-SshPushUrlSnapshotKey $after)) {
+            $script:Failures.Add('PUSHURL_CHANGED_DURING_PROBE remote=fork')
+            throw "PUSHURL_CHANGED_DURING_PROBE the fork urls, push urls, url rewrite rules or remote names changed while ssh was probed (push urls now: $((@($after.Push | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', ')); nothing was written, re-run the phase"
+        }
+    }
+    switch ($d.Decision) {
+        'NOOP' { Write-Log "SSH_PUSH_READY remote=fork pushurl=$ssh" 'OK' }
+        'READY' {
+            if ($VerifyOnly) {
+                Write-Log "SSH_PUSHURL_MISSING remote=fork expected=$ssh (ssh authenticates but remote.fork.pushurl is not set to it: run -Phase Clone)" 'ERROR'
+                $script:Failures.Add('SSH_PUSHURL_MISSING remote=fork')
+            } else {
+                # adversary pass 2 A1: compare-and-set, not read-then-write. An UNSET pushurl is written with --add (it never replaces anything); an https pushurl equal to the fetch
+                # url is replaced with --replace-all restricted to that exact value (git does it under its own config lock, and a value that is no longer there matches nothing,
+                # so it is only appended to). Either way a foreign value that appeared between the re-read and the write is never removed: the read-back then holds more than
+                # our value, we take back exactly ours, and the run fails typed.
+                if ($script:SshPushUrlWriteHook) { & $script:SshPushUrlWriteHook }   # test seam: a writer that lands between the re-read above and the write below
+                if ($snap.Push.Count -eq 0) { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--add', 'remote.fork.pushurl', $ssh)) }
+                else { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh, (ConvertTo-GitValueRegex "$($snap.Push[0])"))) }
+                if ($script:SshPushUrlAfterWriteHook) { & $script:SshPushUrlAfterWriteHook }   # test seam: a writer that lands right after the write
+                # adversary pass 4 A1 (class: a verdict computed from a read that is older than the read it is checked against): ONE snapshot after the write ($post) decides everything
+                # below, push urls included (ours / others come from $post.Push, never from an earlier read-back), so a push url that changed after the write is seen by the very
+                # checks that decide the outcome.
+                # r3 A4 (class: a throw before the cleanup): the re-read can throw (the legacy remote alias census, an unreadable config, LEASE_GIT_DIR_UNRESOLVED), and it then used to leave
+                # both push urls in place with no typed failure. A throw is now a refusal like any other: ownership falls back to the repository config read on its own (one --local --get-all, no
+                # census), our single copy is taken back, and the failure is recorded with the exception text. When even that read fails, nothing is taken back (ownership is unknown).
+                $post = $null; $postPush = @(); $refusal = ''; $ours = 0; $others = 0; $scopeMismatch = $false
+                try {
+                $post = Get-SshPushUrlConfigSnapshot
+                # adversary pass 5 A1: ownership is judged on the REPOSITORY's own push urls (LocalPush), and a push url that Git also merges in from the global or system config is a
+                # failure of its own ($scopeMismatch): the value this run wrote lives in the repository config, so a copy elsewhere must not stand in for it
+                $ours = @($post.LocalPush | Where-Object { "$_" -ceq $ssh }).Count; $others = @($post.LocalPush).Count - $ours
+                if ($others -eq 0 -and $ours -ge 2) {
+                    # adversary pass 3 A3: another run wrote the identical value. Two copies of one value are a PASS, normalised to one: the --replace-all is restricted to a pattern that
+                    # matches only our exact value, so it can never remove anything else and never deletes both copies. The outcome is then decided from a fresh snapshot.
+                    [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh, (ConvertTo-GitValueRegex $ssh)))
+                    $post = Get-SshPushUrlConfigSnapshot
+                    $ours = @($post.LocalPush | Where-Object { "$_" -ceq $ssh }).Count; $others = @($post.LocalPush).Count - $ours
+                }
+                $scopeMismatch = ((Get-SshPushUrlSnapshotKey @{ Push = $post.Push }) -cne (Get-SshPushUrlSnapshotKey @{ Push = $post.LocalPush }))
+                # adversary pass 3 A5: the refusal checks of the decision are run again AFTER the write, with the rules and names as they are now (a rule added between the last
+                # snapshot compare and the write rewrites the ssh url, and a push url read back only looks at push urls). The fork url must also still be the one the decision saw.
+                $refusal = Get-SshContextRefusal -Rules $post.Rules -Names $post.Names
+                if (-not $refusal) { $refusal = Get-RemoteUrlRefusal -Urls (@($post.Urls) + @($post.Push)) -Rules $post.Rules -Names $post.Names }
+                if (-not $refusal -and (Get-SshPushUrlSnapshotKey @{ Urls = $post.Urls; LocalUrls = $post.LocalUrls }) -cne (Get-SshPushUrlSnapshotKey @{ Urls = $snap.Urls; LocalUrls = $snap.LocalUrls })) { $refusal = 'the fork url changed during the write' }
+                if (-not $refusal -and $scopeMismatch) { $refusal = 'a push url is also set outside the repository config (global or system, or an include.path file), which a lane with another HOME would not see' }
+                $postPush = @($post.Push)
+                } catch {
+                    $refusal = "the configuration could not be re-read after the write: $($_.Exception.Message)"
+                    $post = $null; $ours = 0; $others = 0
+                    try { $postPush = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl' -Local); $ours = @($postPush | Where-Object { "$_" -ceq $ssh }).Count; $others = $postPush.Count - $ours }
+                    catch { $postPush = @(); $ours = 0; $others = 0; $refusal += "; and the repository push urls could not be read either: $($_.Exception.Message)" }
+                }
+                if ($others -gt 0 -or $ours -ne 1 -or $refusal) {
+                    # take back only a value that is certainly ours: exactly one copy of the ssh url. Two or more copies with a foreign value present are left as they are (we cannot tell
+                    # whose copy is whose, and never delete another run's value). adversary pass 4 A2/A6: the take-back is 'git config --unset' (not --unset-all): git does it under its
+                    # config lock and REFUSES (exit 5, nothing deleted) when more than one value matches, so an identical value another run appended after the snapshot is never deleted
+                    # with ours; and its exit code is what the message reports.
+                    $takeBack = 'no value was taken back'
+                    if ($ours -eq 1) {
+                        if ($script:SshPushUrlTakeBackHook) { & $script:SshPushUrlTakeBackHook }   # test seam: a writer that lands between the snapshot and the take-back
+                        $ub = Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--unset', 'remote.fork.pushurl', (ConvertTo-GitValueRegex $ssh)) -AllowFail
+                        # r4 A1: git config holds no owner for a value, so a copy of the ssh url that another run wrote is indistinguishable from ours (the declared identical-writer limit);
+                        # the message says exactly that and names the copy count, so nobody reads "ours" as proven ownership
+                        if ($ub -eq 0) { $takeBack = 'our value was taken back (one copy of the ssh url was removed; git config cannot tell an identical value that another run wrote from ours, so check remote.fork.pushurl by hand)' }
+                        else {
+                            # r3 A5: the message says what the configuration holds NOW: a --unset that found no match (a writer removed ours first) is "already gone", not "still set"
+                            $left = -1; try { $left = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl' -Local | Where-Object { "$_" -ceq $ssh }).Count } catch { }
+                            $takeBack = $(if ($left -eq 0) { "our value is already gone (git config --unset exited ${ub}: no match)" } elseif ($left -gt 0) { "our value could NOT be taken back (git config --unset exited $ub; it is still set)" } else { "our value could NOT be taken back (git config --unset exited $ub; its state could not be re-read)" })
+                        }
+                    }
+                    $script:Failures.Add('PUSHURL_CHANGED_DURING_PROBE remote=fork')
+                    throw "PUSHURL_CHANGED_DURING_PROBE remote.fork.pushurl read back as '$((@($postPush | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ' | ')' after the write, expected only $ssh$(if ($refusal) { "; $refusal" }); $takeBack and every other value was left as it is"
+                }
+                Write-Log "SSH_PUSH_READY remote=fork pushurl=$ssh" 'OK'
+            }
+        }
+        'UNREGISTERED' { Write-Log "SSH_KEY_UNREGISTERED remote=fork ($($d.Reason)): owner-only. Register this host's GitHub key (owner-only checklist step 2, gh ssh-key add) and trust github.com once with ssh; no key was created, copied or registered, and remote.fork.pushurl was not changed" 'MANUAL' }
+        'FOREIGN' {
+            Write-Log "PUSHURL_FOREIGN remote=fork $($d.Reason): left as it is (never overwritten)" 'MANUAL'
+            if ($VerifyOnly) { $script:Failures.Add('PUSHURL_FOREIGN remote=fork') }
+        }
+        'REFUSED' {
+            Write-Log "PUSHURL_REFUSED remote=fork $($d.Reason): remote.fork.pushurl was not changed" 'MANUAL'
+            # adversary pass 1 A1: Verify cannot confirm the push url of a refused remote (the probe was never run), so it fails closed like the Clone phase's CLONE_REMOTE_MISMATCH
+            if ($VerifyOnly) { $script:Failures.Add('PUSHURL_REFUSED remote=fork') }
+        }
+        default { Write-Log "SSH_PUSHURL skipped: $($d.Reason)" }
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -3324,6 +3846,11 @@ function Invoke-PhaseVerify {
     Write-Log "PAUSED kill switch: $(Test-Path (Join-Path $StateRoot 'PAUSED'))"
     [void](Show-HubLease)
     if (Get-Command gh -ErrorAction SilentlyContinue) { Invoke-GitTraceScrubbed { & gh auth status *> $null }; Write-Log "gh auth: $(if ($LASTEXITCODE -eq 0) { 'signed in' } else { 'NOT signed in' })" }
+    Write-Log '--- fork push url (SSH when the GitHub key authenticates; read-only here)'
+    if (Test-Path -LiteralPath (Join-Path $Repo '.git')) {
+        try { Invoke-SshPushUrl -VerifyOnly }
+        catch { Write-Log "SSH_PUSHURL_CHECK_FAILED $($_.Exception.Message)" 'ERROR'; $script:Failures.Add('SSH_PUSHURL_CHECK_FAILED remote=fork') }
+    } else { Write-Log "SSH_PUSHURL skipped: no clone at $Repo yet" }
     Write-Log '--- venue shares (fail closed: README step 6b)'
     foreach ($bad in @(Test-ShareHeartbeatPreflight -UltraMagnusPath $UltraMagnusHeartbeatPath -BachelorPath $BachelorHeartbeatPath)) { $script:Failures.Add("SHARE_PREFLIGHT_FAILED $bad") }
     Write-Log '--- meter installs (disk-auto-reclaim pin, pwsh auto-repin)'
