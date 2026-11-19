@@ -3306,6 +3306,16 @@
       "lines": [
         109
       ]
+    },
+    {
+      "path": "tests/gui/test_gui_smoke.cpp",
+      "anchor": "if ( timestampMs != 0 ) {",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYER-DOUBLECLICK-FULLSCREEN-1: the gui test's deliverViewerMouse helper sets a synthetic mouse-event timestamp only when the caller passed one (0 = leave Qt's default). Fixture plumbing for the double-click gate tests; no clock is read and nothing is proved by it.",
+      "lines": [
+        4269
+      ]
     }
   ]
 }

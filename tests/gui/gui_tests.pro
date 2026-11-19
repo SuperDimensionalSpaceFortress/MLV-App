@@ -38,6 +38,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuDisplayWindow.h \
     $$REPO_ROOT/platform/qt/GpuWindowViewerInput.h \
     $$REPO_ROOT/platform/qt/GpuWindowViewerInputForwarder.h \
+    $$REPO_ROOT/platform/qt/ViewerDoubleClickPolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerDoubleClickFilter.h \
     $$REPO_ROOT/platform/qt/LookLabelOverlay.h \
     $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
     $$REPO_ROOT/platform/qt/ViewerIdlePolicy.h \
