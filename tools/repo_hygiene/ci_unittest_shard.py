@@ -637,6 +637,15 @@ class BudgetWatch:
 
 
 _TRACEBACK_SLOT = BaseException.__traceback__  # the member descriptor: reads the stored traceback, whatever a subclass defines
+_STDLIB_POPEN = getattr(sys.modules.get("subprocess"), "Popen", None)  # looked up, not read as an attribute (see _windows_handle_type)
+_POPEN_CONSTRUCTOR_CODES = frozenset(
+    code
+    for code in (
+        getattr(getattr(_STDLIB_POPEN, "__init__", None), "__code__", None),
+        getattr(getattr(_STDLIB_POPEN, "_execute_child", None), "__code__", None),
+    )
+    if code is not None
+)  # the stdlib constructor's own frames: the only ones trusted to be "this launch" once a frame went unreadable
 
 
 def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
@@ -654,14 +663,18 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
     # Read from ``BaseException``'s own slot, never through ``error.__traceback__``: a subclass can turn that
     # attribute into a property that answers ``None`` while the real traceback is there.
     link = _TRACEBACK_SLOT.__get__(error, BaseException)
+    unreadable = False  # a frame could not be read: it may have been the constructor's own
     while link is not None:
         candidate = None
         try:
-            found = link.tb_frame.f_locals.get("self")
-            if isinstance(found, subprocess.Popen):
+            frame = link.tb_frame
+            found = frame.f_locals.get("self")
+            # Once a frame was unreadable the nearest constructor may be the one that was hidden, so a later
+            # ``Popen`` counts only as ``Popen``'s own constructor frame: a callback below it is never the child.
+            if isinstance(found, subprocess.Popen) and (not unreadable or frame.f_code in _POPEN_CONSTRUCTOR_CODES):
                 candidate = found
         except BaseException:  # noqa: BLE001 - a frame that cannot be read is skipped; recovery never replaces the launch's own error
-            pass
+            unreadable = True
         if candidate is not None:
             # The first ``Popen`` met walking inward is the constructor the launch called: every frame
             # below it (an audit hook, a callback) can hold some OTHER live ``Popen`` as its own ``self``,
@@ -1060,7 +1073,9 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
             if done.returncode != 0:
                 return f"taskkill exited {done.returncode}"
         else:
-            _kill_group_of_unreaped(proc, pid)
+            unsignalled = _kill_group_of_unreaped(proc, pid)
+            if unsignalled is not None:
+                return unsignalled
     except BaseException as error:  # noqa: BLE001 - an audit hook may raise any type, SystemExit included
         return describe_error(error)
     return None
@@ -1069,30 +1084,37 @@ def _kill_tree(proc: subprocess.Popen[bytes]) -> str | None:
 GROUP_KILL_LOCK_SECONDS = 0.5  # how long a kill waits for a reap that is running right now
 
 
-def _kill_group_of_unreaped(proc: subprocess.Popen[bytes], pgid: int) -> None:
-    """``SIGKILL`` the worker's process group, but only while the worker is still UNREAPED.
+def _kill_group_of_unreaped(proc: subprocess.Popen[bytes], pgid: int) -> str | None:
+    """``SIGKILL`` the worker's process group, but only while the worker is provably UNREAPED; else the reason.
 
     The group id is the worker's pid, and the OS hands a pid out again once the worker has been reaped, so a
     signal sent after the reap can land in a stranger's group. Two threads end the same worker (the parent
     and the deadline watchdog), and one of them may have reaped it already: a worker with a ``returncode``
     owns no group any more and gets no signal. ``Popen`` keeps its reap under ``_waitpid_lock``, so the look
-    at ``returncode`` and the signal are taken under it when it can be had: a reap that runs at that moment
-    finishes first and is seen. (A lock held by an untimed ``wait`` for a worker that is still alive is
-    given up after ``GROUP_KILL_LOCK_SECONDS``: the signal is what makes that wait return.)"""
+    at ``returncode`` and the signal are taken under it: a reap that runs at that moment finishes first and
+    is seen. A lock that cannot be had within ``GROUP_KILL_LOCK_SECONDS`` leaves the reap state unreadable
+    for as long as the signal would take, so no group signal is sent without it: the reason comes back (the
+    tree is not confirmed ended) and ``terminate`` still kills the worker itself."""
     lock = getattr(proc, "_waitpid_lock", None)
     held = False
     try:
         if lock is not None:
             try:
                 held = bool(lock.acquire(timeout=GROUP_KILL_LOCK_SECONDS))
-            except BaseException:  # noqa: BLE001 - not a lock we can take: the returncode look below still applies
+            except BaseException:  # noqa: BLE001 - not a lock we can take: treated like one that stayed taken
                 held = False
+            if not held:
+                return (
+                    "the worker's reap lock could not be taken, so its process group was not signalled "
+                    "(its process tree is not confirmed ended)"
+                )
         if proc.returncode is not None:  # reaped: its pid, and so its group id, may belong to someone else now
-            return
+            return None
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:  # the group is already gone
             pass
+        return None
     finally:
         if held:
             lock.release()  # type: ignore[union-attr]
@@ -1497,12 +1519,18 @@ def run_parallel(
     finally:
         # An exception above must not leave a worker running: every owned worker is attempted, one that
         # cannot be killed is reported, and the watchdog keeps enforcing the deadline until they are done.
+        first_interrupt: BaseException | None = None  # the first interrupt met in the call itself, kept over any later result
         for _attempt in range(TERMINATE_ATTEMPTS):  # the call itself can be interrupted too: it is made once more
             try:
-                ended_late, census_error = end_running_workers([proc for proc, _log in procs])
-                break
+                ended_late, returned_error = end_running_workers([proc for proc, _log in procs])
             except BaseException as error:  # noqa: BLE001 - end_running_workers returns what it meets; this is an interrupt in the call
-                census_error = census_error or error
+                if first_interrupt is None:
+                    first_interrupt = error
+                continue
+            census_error = returned_error if first_interrupt is None else first_interrupt
+            break
+        else:
+            census_error = first_interrupt
         for number, (proc, log) in enumerate(procs, start=1):
             error = ended_late.get(number)
             if error is not None and number not in stuck:

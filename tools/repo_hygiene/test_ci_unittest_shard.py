@@ -2693,6 +2693,61 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIsNotNone(found, "the child whose pid the constructor had stored was dropped")
         self.assertEqual(found.pid, 424242)  # type: ignore[union-attr]
 
+    # r17 sol r16 A3: when the constructor's own frames cannot be read, a deeper callback's Popen is still not the child.
+    def test_half_built_worker_never_adopts_a_deeper_popen_when_the_constructor_frames_cannot_be_read(self) -> None:
+        unrelated = subprocess.Popen.__new__(subprocess.Popen)
+        unrelated.pid = 99
+        unrelated.returncode = None
+
+        def audit_callback(self: object) -> None:
+            raise KeyboardInterrupt
+
+        class NothingCreated(subprocess.Popen):  # type: ignore[type-arg]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = None  # type: ignore[assignment]
+                self.returncode = None
+                audit_callback(unrelated)
+
+        class Link:
+            """A traceback link whose frame read is denied for the constructor's own frame (an audit hook's doing)."""
+
+            def __init__(self, real: types.TracebackType) -> None:
+                self._real = real
+
+            @property
+            def tb_frame(self) -> types.FrameType:
+                if self._real.tb_frame.f_code.co_name == "__init__":
+                    raise RuntimeError("an audit hook denied the frame read")
+                return self._real.tb_frame
+
+            @property
+            def tb_next(self) -> object:
+                return None if self._real.tb_next is None else Link(self._real.tb_next)
+
+        class Slot:
+            def __get__(self, error: BaseException, owner: type) -> object:
+                return Link(error.__traceback__)  # type: ignore[arg-type]
+
+        found: object = "unset"
+        try:
+            NothingCreated([sys.executable])
+        except KeyboardInterrupt as error:
+            with mock.patch.object(shard, "_TRACEBACK_SLOT", Slot()):
+                found = shard.half_built_worker(error)
+        self.assertIsNot(found, unrelated, "a Popen from a deeper frame was taken for the launch's child")
+        self.assertIsNone(found)
+
+    # r17 sol r16 A1: the first interrupt met in the final census is kept when the retry then completes.
+    def test_the_first_census_interrupt_is_raised_when_the_retry_of_the_census_succeeds(self) -> None:
+        procs = [self._RunningProc(), self._RunningProc()]
+        results = [KeyboardInterrupt("first"), ({}, None)]  # the first call is interrupted, the retry completes normally
+        with (
+            mock.patch.object(shard, "end_running_workers", side_effect=results),
+            self.assertRaises(KeyboardInterrupt) as caught,
+        ):
+            self._run_with_fake_workers(procs, past_deadline=True)
+        self.assertEqual(str(caught.exception), "first")
+
     # r16 sol r15 A2: an interrupt at the final cleanup census must not skip ending the owned workers.
     def test_an_interrupt_in_the_final_census_still_ends_every_owned_worker(self) -> None:
         class InterruptedOnce(self._RunningProc):  # type: ignore[valid-type, misc]
@@ -2803,6 +2858,18 @@ class ShardExitCodeTests(unittest.TestCase):
             thread.join(10)
         self.assertFalse(thread.is_alive())
         self.assertEqual(sent, [], "the group was signalled after the other thread had reaped the worker")
+
+    # r17 sol r16 A2: a lock that cannot be had is no proof of "unreaped": no group signal goes out unlocked.
+    def test_no_group_signal_goes_out_when_the_reap_lock_cannot_be_taken(self) -> None:
+        proc = self._GroupProc(None)
+        proc._waitpid_lock = threading.Lock()  # type: ignore[attr-defined]
+        proc._waitpid_lock.acquire()  # type: ignore[attr-defined]  # another thread keeps it past the bound
+        self.addCleanup(proc._waitpid_lock.release)  # type: ignore[attr-defined]
+        with mock.patch.object(shard, "GROUP_KILL_LOCK_SECONDS", 0.05):
+            result, sent = self._posix_kill(proc)
+        self.assertEqual(sent, [], "the group was signalled with the reap state unread under its lock")
+        self.assertIsNotNone(result, "the unsignalled tree was reported as ended")
+        self.assertIn("not confirmed", result or "")
 
     # r16 sol r15 A4: an exit code congruent to zero is a zero exit however large it is.
     def test_the_zero_exit_guard_fails_an_integer_code_that_the_os_reads_as_zero(self) -> None:
