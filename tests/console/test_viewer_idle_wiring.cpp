@@ -139,4 +139,14 @@ TEST(ViewerIdleWiring, InputsReadWindowStateAndToolsAndSurfacesReadGlWindowFresh
         QStringLiteral("void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )"));
     ASSERT_FALSE(note.isEmpty());
     ASSERT_TRUE(note.contains(QStringLiteral("if( !m_viewerIdle.fullscreen() ) return;")));
+    ASSERT_TRUE(note.contains(QStringLiteral("m_viewerIdlePointer.seed( QCursor::pos() );")));
+
+    // Adversary A2: every tick also asks the OS pointer, so movement during a wait that excludes user input
+    // (no mouse event delivered, timers still run) keeps / brings the cursor back; Hide and Show re-arm.
+    const QString timeout = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    ASSERT_FALSE(timeout.isEmpty());
+    ASSERT_TRUE(timeout.contains(QStringLiteral("in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );")));
+    ASSERT_TRUE(timeout.contains(QStringLiteral("case viewer_idle::Tick::Show:")));
+    ASSERT_EQ(3, int(timeout.count(QStringLiteral("m_viewerIdleTimer->start( ms );"))));
 }

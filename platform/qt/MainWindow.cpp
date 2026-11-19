@@ -3705,6 +3705,7 @@ void MainWindow::viewerIdleRestore( void )
     if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
     if( m_viewerIdle.fullscreen() )
     {
+        m_viewerIdlePointer.seed( QCursor::pos() );
         m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
     }
@@ -3716,6 +3717,7 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
     {
         m_viewerIdle.setFullscreen( true, m_viewerIdleClock.elapsed() );
         m_viewerIdleHaveLast = false;
+        m_viewerIdlePointer.seed( QCursor::pos() );
         m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
     }
     else
@@ -3729,10 +3731,19 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
 void MainWindow::viewerIdleTimeout( void )
 {
     int ms = 0;
-    switch( m_viewerIdle.onTimeout( viewerIdleInputs(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms ) )
+    viewer_idle::Inputs in = viewerIdleInputs();
+    // A wait that excludes user input still runs this timer but delivers no mouse event: the OS pointer
+    // position is the witness for movement the event path did not see.
+    in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );
+    switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms ) )
     {
     case viewer_idle::Tick::Hide:
         m_viewerCursorHider.hide( viewerIdleSurfaces() );
+        m_viewerIdleTimer->start( ms );   // keep watching the pointer while hidden
+        break;
+    case viewer_idle::Tick::Show:
+        m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        m_viewerIdleTimer->start( ms );
         break;
     case viewer_idle::Tick::Rearm:
         m_viewerIdleTimer->start( ms );
@@ -3754,6 +3765,7 @@ void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
     if( viewer_idle::eventIsActivity( event, &m_viewerIdleLastGlobal, &m_viewerIdleHaveLast ) )
     {
         // The timer is not restarted on every move: the timestamp plus Rearm covers it.
+        m_viewerIdlePointer.seed( QCursor::pos() );
         if( m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() ) ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
     }

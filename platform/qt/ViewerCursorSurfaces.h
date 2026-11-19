@@ -70,9 +70,9 @@ private:
 };
 
 /*! \brief Whether this event is real mouse activity (see isActivity). For mouse button and move events
- *         the global position is compared with, then stored in, *lastGlobal / *haveLast; other events
- *         leave the stored position alone. */
-inline bool eventIsActivity( const QEvent *event, QPoint *lastGlobal, bool *haveLast )
+ *         the unrounded global position is compared with, then stored in, *lastGlobal / *haveLast; other
+ *         events leave the stored position alone. */
+inline bool eventIsActivity( const QEvent *event, QPointF *lastGlobal, bool *haveLast )
 {
     if( !event ) return false;
     const QEvent::Type type = event->type();
@@ -86,9 +86,9 @@ inline bool eventIsActivity( const QEvent *event, QPoint *lastGlobal, bool *have
         const QMouseEvent *mouse = dynamic_cast<const QMouseEvent *>( event );
         if( !mouse ) return false;
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        const QPoint global = mouse->globalPosition().toPoint();
+        const QPointF global = mouse->globalPosition();
 #else
-        const QPoint global = mouse->globalPos();
+        const QPointF global = mouse->screenPos();
 #endif
         const bool activity = isActivity( type, global, *lastGlobal, *haveLast );
         *lastGlobal = global;
@@ -98,7 +98,7 @@ inline bool eventIsActivity( const QEvent *event, QPoint *lastGlobal, bool *have
     case QEvent::Wheel:
         return true;
     default:
-        return isActivity( type, QPoint(), QPoint(), false );
+        return isActivity( type, QPointF(), QPointF(), false );
     }
 }
 

@@ -10,7 +10,14 @@
  *
  * The Controller holds plain values only. Time is milliseconds from a monotonic clock the caller
  * supplies, so a test drives it with a fake clock. The caller owns one single-shot timer: it starts
- * it on entering fullscreen, and onTimeout() says whether to hide now or rearm for how long.
+ * it on entering fullscreen, and onTimeout() says whether to hide, show or just wait, and for how long
+ * to restart the timer.
+ *
+ * Mouse events are not the only witness of movement. A wait that excludes user input (a nested
+ * processEvents / QEventLoop with ExcludeUserInputEvents, e.g. SyncDownloadWaiter) still runs timers but
+ * delivers no mouse event, so each timer tick also compares the OS pointer position (PointerWatch):
+ * movement keeps the cursor shown, and while hidden the tick keeps watching so it comes back within one
+ * idle period even inside such a wait.
  */
 
 #ifndef VIEWERIDLEPOLICY_H
@@ -18,6 +25,7 @@
 
 #include <QEvent>
 #include <QPoint>
+#include <QPointF>
 #include <QtGlobal>
 
 namespace viewer_idle
@@ -33,6 +41,7 @@ struct Inputs
     bool windowActive = false;      // the main window is the active window
     bool toolArmed = false;         // WB picker, bad-pixel edit or gradient paint armed
     bool popupOrModalOpen = false;  // a popup (menu) or a modal dialog is open
+    bool pointerMoved = false;      // the OS pointer moved since the last look (PointerWatch); not a hide gate
 };
 
 /*! \brief The cursor may hide only in real fullscreen, while active, with no tool and no popup/modal. */
@@ -42,8 +51,10 @@ inline bool mayHide( const Inputs &i )
 }
 
 /*! \brief Whether an event of this type is real mouse activity. A move to the same global position
- *         (Windows and Qt synthesize those) is not activity; press, release, double-click and wheel are. */
-inline bool isActivity( QEvent::Type type, const QPoint &globalNow, const QPoint &globalLast, bool haveLast )
+ *         (Windows and Qt synthesize those) is not activity; press, release, double-click and wheel are.
+ *         Positions are compared unrounded: at a fractional device-pixel ratio one physical pixel is less
+ *         than one logical pixel, and it is still real movement. */
+inline bool isActivity( QEvent::Type type, const QPointF &globalNow, const QPointF &globalLast, bool haveLast )
 {
     switch( type )
     {
@@ -68,8 +79,33 @@ inline bool forcesRestore( QEvent::Type type )
         || type == QEvent::ContextMenu;
 }
 
-/*! \brief What the caller does when its single-shot idle timer fires. */
-enum class Tick { None, Hide, Rearm };
+/*! \brief The OS pointer position seen at the last look. moved() reports a change since then. Integer
+ *         positions are enough here: it is the backstop for undelivered input, not the event path. */
+class PointerWatch
+{
+public:
+    void seed( const QPoint &pos )
+    {
+        m_last = pos;
+        m_have = true;
+    }
+
+    /*! \brief True iff pos differs from the last look (false on the first look). Remembers pos. */
+    bool moved( const QPoint &pos )
+    {
+        const bool changed = m_have && pos != m_last;
+        seed( pos );
+        return changed;
+    }
+
+private:
+    QPoint m_last;
+    bool m_have = false;
+};
+
+/*! \brief What the caller does when its single-shot idle timer fires. For Hide, Show and Rearm the caller
+ *         also restarts the timer for *rearmMs; None (not fullscreen) leaves it stopped. */
+enum class Tick { None, Hide, Show, Rearm };
 
 /*! \brief The idle state machine. No Qt objects; the caller supplies the clock and owns the timer. */
 class Controller
@@ -107,16 +143,26 @@ public:
         return wasHidden;
     }
 
-    /*! \brief The timer fired. Hide, or rearm the timer for *rearmMs, or do nothing. */
+    /*! \brief The timer fired. Hide, show (the pointer moved while hidden), or keep waiting; for all three
+     *         *rearmMs is the next timer interval. None only when not fullscreen. */
     Tick onTimeout( const Inputs &in, qint64 nowMs, int idleMs, int *rearmMs )
     {
         if( !m_fullscreen ) return Tick::None;
-        if( m_hidden ) return Tick::None;
-        if( !mayHide( in ) )
+        if( idleMs < 1 ) idleMs = 1;
+        if( rearmMs ) *rearmMs = idleMs;
+        if( in.pointerMoved )
         {
-            if( rearmMs ) *rearmMs = idleMs;
+            // Movement the event path did not see (input excluded by a wait): it is activity.
+            m_lastActivity = nowMs;
+            if( m_hidden )
+            {
+                m_hidden = false;
+                return Tick::Show;
+            }
             return Tick::Rearm;
         }
+        if( m_hidden ) return Tick::Rearm;          // keep watching the pointer while hidden
+        if( !mayHide( in ) ) return Tick::Rearm;
         const qint64 elapsed = nowMs < m_lastActivity ? 0 : nowMs - m_lastActivity;
         if( elapsed < idleMs )
         {

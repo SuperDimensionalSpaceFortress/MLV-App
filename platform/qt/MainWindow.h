@@ -921,8 +921,9 @@ private:
     QElapsedTimer m_viewerIdleClock;
     viewer_idle::Controller m_viewerIdle;
     viewer_idle::CursorHider m_viewerCursorHider;
-    QPoint m_viewerIdleLastGlobal;
+    QPointF m_viewerIdleLastGlobal;
     bool m_viewerIdleHaveLast = false;
+    viewer_idle::PointerWatch m_viewerIdlePointer;
     bool m_inOpeningProcess;
     bool m_setSliders;
     int m_timerId;

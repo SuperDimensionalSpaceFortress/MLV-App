@@ -59,6 +59,9 @@ TEST(ViewerIdlePolicy, ActivityIgnoresSamePositionMovesAndNonMouseEvents)
     ASSERT_FALSE(viewer_idle::isActivity(QEvent::MouseMove, a, a, true));
     ASSERT_TRUE(viewer_idle::isActivity(QEvent::MouseMove, b, a, true));
     ASSERT_TRUE(viewer_idle::isActivity(QEvent::MouseMove, a, a, false));
+    // Adversary A1: positions are compared unrounded; one physical pixel at 300% is 1/3 logical pixel.
+    ASSERT_TRUE(viewer_idle::isActivity(QEvent::MouseMove, QPointF(100.0 + 1.0 / 3.0, 100.0), QPointF(100.0, 100.0), true));
+    ASSERT_FALSE(viewer_idle::isActivity(QEvent::MouseMove, QPointF(100.25, 7.5), QPointF(100.25, 7.5), true));
 
     ASSERT_TRUE(viewer_idle::isActivity(QEvent::MouseButtonPress, a, a, true));
     ASSERT_TRUE(viewer_idle::isActivity(QEvent::MouseButtonRelease, a, a, true));
@@ -92,8 +95,13 @@ TEST(ViewerIdlePolicy, ControllerHidesAfterIdleAndActivityRestartsTheClock)
     ASSERT_FALSE(c.hidden());
 
     ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm)));
+    ASSERT_EQ(2000, rearm);
     ASSERT_TRUE(c.hidden());
-    ASSERT_EQ(tickValue(viewer_idle::Tick::None), tickValue(c.onTimeout(allPass(), 2001, 2000, &rearm)));
+    // While hidden the tick only keeps watching the pointer (adversary A2): no second hide, still hidden.
+    rearm = -1;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 2001, 2000, &rearm)));
+    ASSERT_EQ(2000, rearm);
+    ASSERT_TRUE(c.hidden());
 
     ASSERT_TRUE(c.noteActivity(2500));
     ASSERT_FALSE(c.hidden());
@@ -147,12 +155,64 @@ TEST(ViewerIdlePolicy, ControllerLeaveFullscreenBackwardsClockAndForceShown)
     ASSERT_EQ(2000, rearm);
     ASSERT_FALSE(back.hidden());
 
+    // Adversary A3: a non-positive idle interval never turns a backwards clock into a hide.
+    viewer_idle::Controller nonPositive;
+    nonPositive.setFullscreen(true, 5000);
+    rearm = -1;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(nonPositive.onTimeout(allPass(), 100, -1, &rearm)));
+    ASSERT_TRUE(rearm >= 1);
+    ASSERT_FALSE(nonPositive.hidden());
+
     viewer_idle::Controller f;
     f.setFullscreen(true, 0);
     ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(f.onTimeout(allPass(), 2000, 2000, &rearm)));
     ASSERT_TRUE(f.forceShown());
     ASSERT_FALSE(f.hidden());
     ASSERT_FALSE(f.forceShown());
+}
+
+// Adversary A2: a wait that excludes user input delivers no mouse event but still runs the timer. The OS
+// pointer moving is then activity: it shows a hidden cursor, and it keeps a shown cursor from hiding.
+TEST(ViewerIdlePolicy, PointerMovedWithoutEventsShowsAndDefersTheHide)
+{
+    viewer_idle::Controller c;
+    int rearm = -1;
+    c.setFullscreen(true, 0);
+    viewer_idle::Inputs moved = allPass();
+    moved.pointerMoved = true;
+
+    // Shown, pointer moving every tick with no event delivered: never hides.
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(moved, 2000, 2000, &rearm)));
+    ASSERT_EQ(2000, rearm);
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(moved, 4000, 2000, &rearm)));
+    ASSERT_FALSE(c.hidden());
+    // The pointer stops: hides one idle period after the last movement seen.
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 6000, 2000, &rearm)));
+    ASSERT_TRUE(c.hidden());
+    // Hidden, then the pointer moves with input excluded: the next tick shows it.
+    rearm = -1;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(moved, 8000, 2000, &rearm)));
+    ASSERT_EQ(2000, rearm);
+    ASSERT_FALSE(c.hidden());
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 9999, 2000, &rearm)));
+    ASSERT_EQ(1, rearm);
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 10000, 2000, &rearm)));
+
+    // Not fullscreen: pointer movement changes nothing.
+    viewer_idle::Controller off;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::None), tickValue(off.onTimeout(moved, 5000, 2000, &rearm)));
+}
+
+TEST(ViewerIdlePolicy, PointerWatchReportsOnlyAChangeSinceTheLastLook)
+{
+    viewer_idle::PointerWatch w;
+    ASSERT_FALSE(w.moved(QPoint(10, 10)));   // first look only remembers
+    ASSERT_FALSE(w.moved(QPoint(10, 10)));
+    ASSERT_TRUE(w.moved(QPoint(11, 10)));
+    ASSERT_FALSE(w.moved(QPoint(11, 10)));
+    w.seed(QPoint(50, 60));
+    ASSERT_FALSE(w.moved(QPoint(50, 60)));
+    ASSERT_TRUE(w.moved(QPoint(50, 61)));
 }
 
 // P4

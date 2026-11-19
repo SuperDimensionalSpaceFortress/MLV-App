@@ -673,6 +673,8 @@ private slots:
     void viewerCursorAutohide_restoreLeavesAnUnsetViewportCursorUnset();
     void viewerCursorAutohide_restoreKeepsACursorSetWhileHidden();
     void viewerCursorAutohide_idleTimerHidesAndRealMovementOrBlockingRestores();
+    void viewerCursorAutohide_subPixelMoveRestores();
+    void viewerCursorAutohide_pointerMovedWhileInputExcludedRestores();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -1872,6 +1874,7 @@ public:
     {
         m_idle.setFullscreen( true, m_clock.elapsed() );
         m_haveLast = false;
+        m_pointer.seed( QCursor::pos() );
         m_timer.start( m_idleMs );
     }
 
@@ -1885,11 +1888,13 @@ public:
     bool hidden() const { return m_idle.hidden(); }
 
     viewer_idle::Inputs inputs;
+    // Emulates a wait that excludes user input (SyncDownloadWaiter-style): input events are not noted.
+    bool inputExcluded = false;
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
     {
-        note( event );
+        if( !inputExcluded ) note( event );
         return QObject::eventFilter( watched, event );
     }
 
@@ -1899,6 +1904,7 @@ private:
         if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
         if( m_idle.fullscreen() )
         {
+            m_pointer.seed( QCursor::pos() );
             m_idle.noteActivity( m_clock.elapsed() );
             if( !m_timer.isActive() ) m_timer.start( m_idleMs );
         }
@@ -1914,6 +1920,7 @@ private:
         }
         if( viewer_idle::eventIsActivity( event, &m_lastGlobal, &m_haveLast ) )
         {
+            m_pointer.seed( QCursor::pos() );
             if( m_idle.noteActivity( m_clock.elapsed() ) ) m_hider.restore( m_surfaces );
             if( !m_timer.isActive() ) m_timer.start( m_idleMs );
         }
@@ -1922,9 +1929,12 @@ private:
     void timeout()
     {
         int ms = 0;
-        switch( m_idle.onTimeout( inputs, m_clock.elapsed(), m_idleMs, &ms ) )
+        viewer_idle::Inputs in = inputs;
+        in.pointerMoved = m_pointer.moved( QCursor::pos() );
+        switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms ) )
         {
-        case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); break;
+        case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); m_timer.start( ms ); break;
+        case viewer_idle::Tick::Show: m_hider.restore( m_surfaces ); m_timer.start( ms ); break;
         case viewer_idle::Tick::Rearm: m_timer.start( ms ); break;
         case viewer_idle::Tick::None: break;
         }
@@ -1936,8 +1946,9 @@ private:
     viewer_idle::CursorHider m_hider;
     QTimer m_timer;
     QElapsedTimer m_clock;
-    QPoint m_lastGlobal;
+    QPointF m_lastGlobal;
     bool m_haveLast = false;
+    viewer_idle::PointerWatch m_pointer;
 };
 
 // A plain mouse move with no button held. The (type, local, global, button, buttons, modifiers)
@@ -2061,6 +2072,61 @@ void GuiSmokeTest::viewerCursorAutohide_idleTimerHidesAndRealMovementOrBlockingR
     harness.leaveFullscreen();
     QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
     QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+}
+
+// G5 (adversary A1): at a fractional device-pixel ratio one physical pixel is a sub-logical-pixel
+// global move; it is real movement and must restore the cursor.
+void GuiSmokeTest::viewerCursorAutohide_subPixelMoveRestores()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto removeFilter = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+    harness.enterFullscreen();
+
+    QMouseEvent first( QEvent::MouseMove, QPointF( 5, 5 ), QPointF( 100.0, 100.0 ),
+                       Qt::NoButton, Qt::NoButton, Qt::NoModifier );
+    QCoreApplication::sendEvent( &viewport, &first );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    QMouseEvent onePhysicalPixel( QEvent::MouseMove, QPointF( 5.333333, 5 ), QPointF( 100.0 + 1.0 / 3.0, 100.0 ),
+                                  Qt::NoButton, Qt::NoButton, Qt::NoModifier );
+    QCoreApplication::sendEvent( &viewport, &onePhysicalPixel );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( !harness.hidden() );
+    harness.leaveFullscreen();
+}
+
+// G6 (adversary A2): while a wait excludes user input, timers still run but mouse events are not
+// delivered. The OS pointer moving must still keep the cursor shown / bring it back.
+void GuiSmokeTest::viewerCursorAutohide_pointerMovedWhileInputExcludedRestores()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+
+    QCursor::setPos( QPoint( 3000, 3000 ) );
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto removeFilter = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+    harness.enterFullscreen();
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    harness.inputExcluded = true;
+    QCursor::setPos( QPoint( 3010, 3000 ) );
+    QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::OpenHandCursor, 1000 );
+    QVERIFY( !harness.hidden() );
+    harness.inputExcluded = false;
+    harness.leaveFullscreen();
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()
