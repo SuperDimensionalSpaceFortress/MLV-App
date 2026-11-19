@@ -982,6 +982,66 @@ TEST(ViewerIdlePolicy, WindowLeftFullscreenWithoutTheActionAsksTheCallerToLeave)
     ASSERT_FALSE(c.windowLeftFullscreen(false, 6050, 2000));
 }
 
+// P18 (r10, sol r9 B1 / carried A1-pass12): sol's row. Entered through the action at 0, hidden at 2000; native exit at
+// 2101 (the action stays checked) is a Stop; the tick at 2150 does nothing; native re-entry at 2300 with the action
+// still checked is a Start (the action's toggled() never fires), after which asking again records the sighting; the
+// pointer stays still until 10000, so the cursor hides again at 4300 and stays hidden. A repeated change is None; the
+// action unchecked stops a running machinery and never starts one; a pending entry waits out its grace.
+// Control: the r9 lifecycle (start only on the action's toggle) never hides again after the native exit.
+TEST(ViewerIdlePolicy, WindowStateChangeRestartsTheMachineryOnNativeReentryWithTheActionChecked)
+{
+    auto lifecycle = [](viewer_idle::Lifecycle l) { return int(l); };
+    const int none = lifecycle(viewer_idle::Lifecycle::None);
+    const int start = lifecycle(viewer_idle::Lifecycle::Start);
+    const int stop = lifecycle(viewer_idle::Lifecycle::Stop);
+    int rearm = 0;
+
+    // Control: the r9 lifecycle. After the native exit nothing restarts; every later tick is None and never hides.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        ASSERT_FALSE(c.windowLeftFullscreen(true, 50, 2000));
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+        ASSERT_TRUE(c.windowLeftFullscreen(false, 2150, 2000));
+        c.setFullscreen(false, 2150);
+        ASSERT_EQ(tickValue(viewer_idle::Tick::None), tickValue(c.onTimeout(allPass(), 10000, 2000, &rearm, 50)));
+        ASSERT_FALSE(c.hidden());
+    }
+
+    viewer_idle::Controller c;
+    ASSERT_EQ(none, lifecycle(c.onWindowState(false, false, 0, 2000)));
+    c.setFullscreen(true, 0);                                                  // the action's toggled(true)
+    ASSERT_EQ(none, lifecycle(c.onWindowState(true, false, 10, 2000)));        // showFullScreen() pending: grace
+    ASSERT_EQ(none, lifecycle(c.onWindowState(true, true, 20, 2000)));         // seen fullscreen
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+    ASSERT_EQ(stop, lifecycle(c.onWindowState(true, false, 2101, 2000)));      // native exit, action checked
+    c.setFullscreen(false, 2101);
+    ASSERT_FALSE(c.hidden());
+    ASSERT_FALSE(c.windowLeftFullscreen(false, 2150, 2000));                   // the tick at 2150
+    ASSERT_EQ(tickValue(viewer_idle::Tick::None), tickValue(c.onTimeout(allPass(), 2150, 2000, &rearm, 50)));
+    ASSERT_EQ(none, lifecycle(c.onWindowState(true, false, 2200, 2000)));      // still out: nothing to stop
+    ASSERT_EQ(start, lifecycle(c.onWindowState(true, true, 2300, 2000)));      // native re-entry, action checked
+    c.setFullscreen(true, 2300);
+    ASSERT_EQ(none, lifecycle(c.onWindowState(true, true, 2300, 2000)));       // the sighting
+    ASSERT_EQ(none, lifecycle(c.onWindowState(true, true, 2400, 2000)));       // repeated: idempotent
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 4299, 2000, &rearm, 50)));
+    ASSERT_FALSE(c.hidden());
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 4300, 2000, &rearm, 50)));
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 10000, 2000, &rearm, 50)));
+    ASSERT_TRUE(c.hidden());
+
+    // The action unchecked: a running machinery stops; a stopped one never starts, really fullscreen or not.
+    ASSERT_EQ(stop, lifecycle(c.onWindowState(false, true, 10050, 2000)));
+    c.setFullscreen(false, 10050);
+    ASSERT_EQ(none, lifecycle(c.onWindowState(false, true, 10100, 2000)));
+    ASSERT_EQ(none, lifecycle(c.onWindowState(false, false, 10150, 2000)));
+
+    // A pending entry (never seen fullscreen) waits out its grace, then stops.
+    c.setFullscreen(true, 20000);
+    ASSERT_EQ(none, lifecycle(c.onWindowState(true, false, 21999, 2000)));
+    ASSERT_EQ(stop, lifecycle(c.onWindowState(true, false, 22000, 2000)));
+}
+
 // P14 (r6, adversary pass 9 A1): the Windows hook failed to install (SetWindowsHookExW returned NULL), so input an
 // excluded wait defers has no witness. The pass-9 input: fullscreen at (500,500), the tick at 2000 would hide; with
 // the witness missing it never hides, and a cursor already hidden is shown at the next tick. Control: the

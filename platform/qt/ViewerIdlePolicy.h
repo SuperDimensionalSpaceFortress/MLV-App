@@ -345,6 +345,10 @@ inline bool queuedMouseIsActivity( const QueueLook &q )
  *         also restarts the timer for *rearmMs; None (not fullscreen) leaves it stopped. */
 enum class Tick { None, Hide, Show, Rearm };
 
+/*! \brief r10 (sol r9 B1): what the caller does with the idle machinery when the window's state changes. Start and
+ *         Stop go through the Fullscreen action's own entry and exit paths (timer, hook, cursor). */
+enum class Lifecycle { None, Start, Stop };
+
 /*! \brief The idle state machine. No Qt objects; the caller supplies the clock and owns the timer. */
 class Controller
 {
@@ -381,6 +385,20 @@ public:
         }
         if( m_sawWindowFullscreen ) return true;
         return nowMs - m_enteredAt >= graceMs || nowMs < m_enteredAt;
+    }
+
+    /*! \brief r10 (sol r9 B1, carried A1-pass12): the window's state changed (QEvent::WindowStateChange: native exit or
+     *         re-entry, restore from minimize, a display change that re-enters). Start when the machinery is stopped,
+     *         the action is checked and the window is really fullscreen: the window manager made it fullscreen again
+     *         without the action, which never toggles. Stop when it runs and the action is unchecked, or the window
+     *         left real fullscreen (windowLeftFullscreen: after being seen in it, or once the entry grace is over).
+     *         None otherwise, so a repeated state change is idempotent. A Start is followed by asking again, which
+     *         records the sighting (None). */
+    Lifecycle onWindowState( bool actionChecked, bool reallyFullscreen, qint64 nowMs, qint64 graceMs )
+    {
+        if( !m_fullscreen ) return actionChecked && reallyFullscreen ? Lifecycle::Start : Lifecycle::None;
+        if( !actionChecked ) return Lifecycle::Stop;
+        return windowLeftFullscreen( reallyFullscreen, nowMs, graceMs ) ? Lifecycle::Stop : Lifecycle::None;
     }
 
     /*! \brief Records activity. Returns true iff the cursor was hidden (the caller restores it). */

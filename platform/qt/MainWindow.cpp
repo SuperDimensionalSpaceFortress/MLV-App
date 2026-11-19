@@ -3335,6 +3335,9 @@ void MainWindow::changeEvent( QEvent *event )
     {
         ++m_playbackSmokeFullscreenLostCount;
     }
+    // PLAYER-CURSOR-AUTOHIDE-1 r10 (sol r9 B1): every real-fullscreen transition reaches the idle lifecycle, including
+    // those that bypass the Fullscreen action (native re-entry, restore from minimize). Not a smoke-only branch.
+    if( event->type() == QEvent::WindowStateChange ) viewerIdleWindowStateChanged();
 }
 
 // Intercept FileOpen events
@@ -3684,7 +3687,8 @@ bool MainWindow::nativeEvent( const QByteArray &eventType, void *message, long *
 // PLAYER-CURSOR-AUTOHIDE-1: in fullscreen the cursor hides after viewer_idle::kIdleHideMs() with no mouse
 // activity, on both viewer surfaces, and comes back at once on real movement, press or wheel, on leaving
 // fullscreen, on a context menu, a blocking modal or deactivation, and when a viewer tool is armed.
-// Start/stop is actionFullscreen's toggled(bool); the decision also needs isFullScreen() because
+// Start/stop is actionFullscreen's toggled(bool), plus every window state change (r10: native re-entry with the
+// action checked starts it, a native exit stops it); the decision also needs isFullScreen() because
 // showFullScreen() is asynchronous. Input and cursor only: no paint, present or swap code.
 viewer_idle::Surfaces MainWindow::viewerIdleSurfaces( void ) const
 {
@@ -3741,6 +3745,28 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
 #endif
         if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
         m_viewerIdle.setFullscreen( false, m_viewerIdleClock.elapsed() );
+    }
+}
+
+// r10 (sol r9 B1, carried A1-pass12): a window state change starts or stops the idle machinery through the action's
+// own entry and exit paths. Native exit used to be seen only by the next tick, and native re-entry with the action
+// still checked never fires toggled(), so nothing restarted the machinery and the cursor stayed visible. Idempotent:
+// a repeated change asks again and gets None. Before the constructor creates the timer there is nothing to drive.
+void MainWindow::viewerIdleWindowStateChanged( void )
+{
+    if( !m_viewerIdleTimer ) return;
+    switch( m_viewerIdle.onWindowState( ui->actionFullscreen->isChecked(), isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() ) )
+    {
+    case viewer_idle::Lifecycle::Start:
+        viewerIdleFullscreenChanged( true );
+        // Record the sighting at once, so a native exit before the first tick is a Stop, not an entry grace.
+        m_viewerIdle.onWindowState( ui->actionFullscreen->isChecked(), isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() );
+        break;
+    case viewer_idle::Lifecycle::Stop:
+        viewerIdleFullscreenChanged( false );
+        break;
+    case viewer_idle::Lifecycle::None:
+        break;
     }
 }
 

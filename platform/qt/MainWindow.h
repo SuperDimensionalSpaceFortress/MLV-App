@@ -925,6 +925,7 @@ private:
     viewer_idle::Inputs viewerIdleInputs( void ) const;
     void viewerIdleRestore( void );
     void viewerIdleFullscreenChanged( bool on );
+    void viewerIdleWindowStateChanged( void );
     void viewerIdleTimeout( void );
     void viewerIdleNoteEvent( QObject *watched, QEvent *event );
     QTimer *m_viewerIdleTimer = nullptr;

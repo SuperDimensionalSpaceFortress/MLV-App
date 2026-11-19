@@ -710,6 +710,7 @@ private slots:
     void viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow();
     void viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHidden();
     void viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheIdleMachinery();
+    void viewerCursorAutohide_nativeFullscreenReentryRestartsTheIdleMachinery();
 #endif
     void viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces();
     void viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack();
@@ -2509,6 +2510,7 @@ public:
 
     void enterFullscreen()
     {
+        ++entries;
         m_idle.setFullscreen( true, m_clock.elapsed() );
         m_haveLast = false;
         m_pointer.seed( QCursor::pos() );
@@ -2555,6 +2557,24 @@ public:
     bool windowStateTick = true;
     // r8: how many ticks ran (a RED control proves "still polling" by tick count, not by wall time).
     int ticks = 0;
+    // r10 (sol r9 B1): the Fullscreen action's check, and how many times the idle machinery was started.
+    bool actionChecked = true;
+    int entries = 0;
+
+    // r10 (sol r9 B1): as MainWindow::changeEvent on QEvent::WindowStateChange (native exit, native re-entry,
+    // restore from minimize), with the window's real state in windowReallyFullscreen.
+    void windowStateChanged()
+    {
+        switch( m_idle.onWindowState( actionChecked, windowReallyFullscreen, m_clock.elapsed(), m_idleMs ) )
+        {
+        case viewer_idle::Lifecycle::Start:
+            enterFullscreen();
+            m_idle.onWindowState( actionChecked, windowReallyFullscreen, m_clock.elapsed(), m_idleMs );
+            break;
+        case viewer_idle::Lifecycle::Stop: leaveFullscreen(); break;
+        case viewer_idle::Lifecycle::None: break;
+        }
+    }
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -3220,6 +3240,71 @@ void GuiSmokeTest::viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheId
     QVERIFY( !harness.timerActive() );
     QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
     harness.windowReallyFullscreen = true;
+}
+
+// G14 (r10, sol r9 B1 / carried A1-pass12): sol's row, scaled to a 40 ms idle period: entered through the action,
+// hidden after one idle period; the window manager restores the window (native exit, the action stays checked) and
+// a tick follows; then the window is made fullscreen again natively, the action still checked, and the pointer stays
+// still. Expected: re-entry restarts the idle machinery (hook, timer) and the cursor hides again one idle period
+// later. The same holds for a second exit and re-entry (restore from minimize). A duplicate state change while
+// fullscreen starts nothing; a window made fullscreen with the action unchecked starts nothing.
+void GuiSmokeTest::viewerCursorAutohide_nativeFullscreenReentryRestartsTheIdleMachinery()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.inputExcluded = true;
+    auto cleanup = qScopeGuard( [&harness]() { harness.leaveFullscreen(); } );
+
+    harness.enterFullscreen();   // the action's toggled(true)
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    for( int cycle = 0; cycle < 2; ++cycle )
+    {
+        // Native exit, the action still checked: the state change and the next tick leave the idle machinery.
+        harness.windowReallyFullscreen = false;
+        harness.windowStateChanged();
+        QTRY_VERIFY_WITH_TIMEOUT( !viewer_idle::win_hook::installed(), 1000 );
+        QVERIFY( !harness.timerActive() );
+        QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+
+        // Native re-entry, the action still checked, the pointer still: hidden again after one idle period.
+        const int entriesBefore = harness.entries;
+        harness.windowReallyFullscreen = true;
+        harness.windowStateChanged();
+        QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::BlankCursor, 2000 );
+        QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+        QCOMPARE( harness.entries, entriesBefore + 1 );
+        QVERIFY( viewer_idle::win_hook::installed() );
+        QVERIFY( harness.timerActive() );
+
+        // A duplicate state change while really fullscreen starts nothing and leaves it hidden.
+        harness.windowStateChanged();
+        QCOMPARE( harness.entries, entriesBefore + 1 );
+        QVERIFY( harness.hidden() );
+    }
+
+    // The action unchecked (its own toggled(false) already left): a window made fullscreen starts nothing.
+    harness.leaveFullscreen();
+    harness.actionChecked = false;
+    harness.windowReallyFullscreen = false;
+    harness.windowStateChanged();
+    harness.windowReallyFullscreen = true;
+    const int entriesUnchecked = harness.entries;
+    harness.windowStateChanged();
+    QCOMPARE( harness.entries, entriesUnchecked );
+    QVERIFY( !harness.timerActive() );
+    QVERIFY( !viewer_idle::win_hook::installed() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
 }
 #endif
 

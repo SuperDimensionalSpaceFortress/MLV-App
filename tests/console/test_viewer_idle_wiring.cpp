@@ -382,3 +382,36 @@ TEST(ViewerIdleWiring, TickLeavesTheIdleMachineryWhenFullscreenWasLeftWithoutThe
     ASSERT_TRUE(changed.contains(QStringLiteral("m_viewerIdleTimer->stop();")));
     ASSERT_TRUE(changed.contains(QStringLiteral("viewer_idle::win_hook::remove();")));
 }
+
+// W11 (r10, sol r9 B1 / carried A1-pass12): every real-fullscreen transition reaches the idle lifecycle, not only the
+// action's toggle. changeEvent (after the base class and the smoke latch) hands every QEvent::WindowStateChange to
+// viewerIdleWindowStateChanged(), which asks the controller with the action's check and the window's real state and
+// starts the machinery through the action's own entry path (native re-entry, restore from minimize) or stops it
+// through the action's own exit path, before the next tick would.
+TEST(ViewerIdleWiring, EveryWindowStateChangeStartsOrStopsTheIdleMachinery)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString change = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::changeEvent( QEvent *event )"));
+    ASSERT_FALSE(change.isEmpty());
+    const QString call = QStringLiteral(
+        "if( event->type() == QEvent::WindowStateChange ) viewerIdleWindowStateChanged();");
+    ASSERT_EQ(1, int(change.count(call)));
+    ASSERT_TRUE(change.indexOf(call) > change.indexOf(QStringLiteral("++m_playbackSmokeFullscreenLostCount;")));
+    ASSERT_TRUE(change.indexOf(QStringLiteral("QMainWindow::changeEvent( event );")) < change.indexOf(call));
+
+    const QString sync = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleWindowStateChanged( void )"));
+    ASSERT_FALSE(sync.isEmpty());
+    ASSERT_TRUE(sync.contains(QStringLiteral("if( !m_viewerIdleTimer ) return;")));
+    ASSERT_TRUE(sync.contains(QStringLiteral(
+        "m_viewerIdle.onWindowState( ui->actionFullscreen->isChecked(), isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() )")));
+    ASSERT_EQ(1, int(sync.count(QStringLiteral("viewerIdleFullscreenChanged( true );"))));
+    ASSERT_EQ(1, int(sync.count(QStringLiteral("viewerIdleFullscreenChanged( false );"))));
+    ASSERT_TRUE(sync.indexOf(QStringLiteral("case viewer_idle::Lifecycle::Start:"))
+                < sync.indexOf(QStringLiteral("viewerIdleFullscreenChanged( true );")));
+    ASSERT_TRUE(sync.indexOf(QStringLiteral("case viewer_idle::Lifecycle::Stop:"))
+                < sync.indexOf(QStringLiteral("viewerIdleFullscreenChanged( false );")));
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("void viewerIdleWindowStateChanged( void );")));
+}
