@@ -1224,12 +1224,13 @@ def _c_strip(text: str) -> str:
 
 def _c_splice(text: str) -> str:
     """C text with every backslash-newline spliced (translation phase 2), the line count kept: a spliced logical line is followed by as many empty lines as it absorbed."""
-    lines, out, i = text.split("\n"), [], 0
+    # (adversary pass 2 A2: the ??/ trigraph is a backslash, and a backslash followed only by blanks before the newline splices too, as GCC reads it)
+    lines, out, i = text.replace("??/", "\\").split("\n"), [], 0
     while i < len(lines):
         cur, extra = lines[i], 0
-        while cur.rstrip("\r").endswith("\\") and i + 1 < len(lines):
+        while cur.rstrip(" \t\r").endswith("\\") and i + 1 < len(lines):
             i += 1
-            cur, extra = cur.rstrip("\r")[:-1] + lines[i], extra + 1
+            cur, extra = cur.rstrip(" \t\r")[:-1] + lines[i], extra + 1
         out.append(cur)
         out.extend([""] * extra)
         i += 1
@@ -1273,6 +1274,12 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
     per function, and any accrual write the derivation could not read (each one is a failure: a site the guard cannot see is not a site it vouches for)."""
     dng = _c_strip(_c_splice(dng_text))
     llr = _c_strip(_c_splice(llr_text))
+    uw = llr   # (adversary r1 A2: `(g_x) = v` is `g_x = v`; a parenthesized identifier that is no argument list is unwrapped IN PLACE, so offsets and lines are unchanged)
+    while True:
+        nxt = re.sub(r"(?<![\w)\]])\(\s*[A-Za-z_]\w*\s*\)", lambda m: " " + m.group(0)[1:-1] + " ", uw)
+        if nxt == uw:
+            break
+        uw = nxt
     line_of = lambda s, off: s.count("\n", 0, off) + 1   # noqa: E731
     entries = sorted(set(re.findall(r"\b(applyLLRawProcObject\w*)\s*\(", dng)))
     funcs = _c_functions(llr)
@@ -1288,9 +1295,12 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
         reach[name] = bound
         for params, b0, b1 in funcs[name]:
             body = llr[b0:b1]
+            # (adversary pass 2 A5: a literal binds a parameter only while the body never writes it or takes its address)
+            eff = {p: v for p, v in bound.items()
+                   if not re.search(rf"(?<![\w.>])(?:&\s*{p}(?!\w)|{p}\s*(?:[-+*/%&|^]?=(?!=)|<<=|>>=|\+\+|--)|(?:\+\+|--)\s*{p}(?!\w))", uw[b0:b1])}
             dead = []
             for m in re.finditer(r"\bif\s*\(\s*(!?)\s*([A-Za-z_]\w*)\s*\)\s*\{", body):
-                if m.group(2) in bound and (bound[m.group(2)] == 0) != (m.group(1) == "!"):
+                if m.group(2) in eff and (eff[m.group(2)] == 0) != (m.group(1) == "!"):
                     k = b0 + m.end() - 1
                     dead.append((k, _match_close(llr, k, "{", "}")))
             dead_spans += [(line_of(llr, a), line_of(llr, z - 1)) for a, z in dead]
@@ -1308,8 +1318,6 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
                     if re.fullmatch(r"\d+", a):
                         cb[pn] = int(a)
                 todo.append((callee, cb))
-    lines = llr.split("\n")
-
     def live(ln: int) -> bool:
         return any(a <= ln <= z for spans in live_spans.values() for a, z in spans) and not any(a <= ln <= z for a, z in dead_spans)
 
@@ -1319,41 +1327,55 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
     targets = {f"g_llrawproc_last_{t}_ms": f"llrawproc_{t}" for t in LLRP_TIMERS}
     targets.update({f"{t}_ms": f"llrawproc_{t}" for t in LLRP_LOCAL_ACCUMULATORS})
     alt = "|".join(sorted(map(re.escape, targets), key=len, reverse=True))
-    target_re = re.compile(r"(?<![\w.>])(" + alt + r")\s*(\+=|=)(?!=)\s*([^;]*)")
-    # (adversary r1 A2: any OTHER write of a timer -- -=, *=, /=, ++, -- -- is a site this derivation does not read, so it is reported, never skipped)
-    other_write_re = re.compile(r"(?<![\w.>])(" + alt + r")\s*(-=|\*=|/=|\+\+|--)|(\+\+|--)\s*(" + alt + r")(?!\w)")
-    for idx, raw in enumerate(lines):
-        ln = idx + 1
-        if not live(ln):
+    uw_lines = uw.split("\n")
+    # adversary r1 A1/A2 (pass 2): FAIL CLOSED over whole statements. Every occurrence of a timer name in live code (or on any #define line) must be accounted for: the lvalue of
+    # a `<timer> = ...;` / `<timer> += ...;` statement (which may span lines), or the whole right-hand side of one (a copy, or one timer accumulating another). Any other
+    # occurrence -- &timer, a macro or call argument, ++ / -- / -= / *=, a subscript, a pointer write -- is a write this derivation cannot read, and is reported.
+    write_re = re.compile(r"(?<![\w.>])(" + alt + r")\s*(\+=|=)(?!=)([^;{}]*);")
+    handled: set = set()
+    for m in write_re.finditer(uw):
+        ln, end_ln = line_of(uw, m.start(1)), line_of(uw, m.end() - 1)
+        if not (live(ln) and live(end_ln)):
             continue
-        text = raw
-        while True:   # (adversary r1 A2: `(g_x) = v` is `g_x = v`: unwrap a parenthesized identifier that is not a call's or a subscript's argument list)
-            unwrapped = re.sub(r"(?<![\w)\]])\(\s*([A-Za-z_]\w*)\s*\)", r" \1 ", text)
-            if unwrapped == text:
-                break
-            text = unwrapped
-        if other_write_re.search(text):
-            unread.append(f"llrawproc.c:{ln}: {text.strip()}")
-        for m in target_re.finditer(text):
-            row, rhs = targets[m.group(1)], m.group(3).strip()
-            if re.fullmatch(r"0(\.0*)?", rhs) or rhs in targets and targets[rhs] == row:
-                continue   # a reset, or the copy of the worker's local accumulator into its global (the local's sites are the windows)
-            if rhs in targets:
-                contains.setdefault(row, set()).add(targets[rhs])
-                continue
-            d = re.search(r"\(\s*(?:mlv_stage_timing_now\(\)|[A-Za-z_]\w*)\s*-\s*([A-Za-z_]\w*)\s*\)", rhs)
-            if not d:
-                unread.append(f"llrawproc.c:{ln}: {text.strip()}")
-                continue
-            start = None
-            for j in range(idx, -1, -1):
-                if re.search(rf"\b{re.escape(d.group(1))}\s*=(?!=)", lines[j]) and live(j + 1):
-                    start = j + 1
-                    break
-            if start is None:
-                unread.append(f"llrawproc.c:{ln}: no assignment of {d.group(1)} before the accrual")
-                continue
-            windows.setdefault(row, set()).add((start, ln))
+        handled.add(m.start(1))
+        row, rhs = targets[m.group(1)], " ".join(m.group(3).split())
+        if re.fullmatch(r"0(\.0*)?", rhs):
+            continue   # a reset
+        if rhs in targets:
+            handled.add(m.start(3) + m.group(3).index(rhs))
+            if targets[rhs] != row:
+                contains.setdefault(row, set()).add(targets[rhs])   # (one timer accumulating another); else the copy of the worker's local accumulator into its global
+            continue
+        d = re.fullmatch(r"\(\s*(?:mlv_stage_timing_now\s*\(\s*\)|[A-Za-z_]\w*)\s*-\s*([A-Za-z_]\w*)\s*\)\s*\*\s*1000\.0", rhs)
+        if not d:
+            unread.append(f"llrawproc.c:{ln}: {' '.join(m.group(0).split())}")
+            continue
+        starts = [s for s in re.finditer(rf"(?<![\w.>]){re.escape(d.group(1))}\s*=(?!=)", uw[:m.start(1)]) if live(line_of(uw, s.start()))]
+        if not starts:
+            unread.append(f"llrawproc.c:{ln}: no assignment of {d.group(1)} before the accrual")
+            continue
+        windows.setdefault(row, set()).add((line_of(uw, starts[-1].start()), end_ln))
+    is_directive = lambda ln: uw_lines[ln - 1].lstrip().startswith("#")   # noqa: E731
+    for m in re.finditer(r"(?<![\w.>])(" + alt + r")(?!\w)", uw):
+        ln = line_of(uw, m.start())
+        if m.start() not in handled and live(ln) and not is_directive(ln):
+            unread.append(f"llrawproc.c:{ln}: {m.group(1)} is used in a way this derivation cannot read: {uw_lines[ln - 1].strip()}")
+    # (a macro whose body names a timer -- the LLRP_LAST_RUN_TIMING X-macro, :7181 -- or names such a macro, writes the timers wherever it is EXPANDED: an expansion in
+    # export-reachable code is a write this derivation cannot read)
+    defs = [(m.group(1), m.group(2)) for m in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(.*)$", uw, re.M)]
+    tainted = {n for n, body in defs if re.search(r"(?<![\w.>])(" + alt + r")(?!\w)", body)}
+    grew = True
+    while grew:
+        grew = False
+        for n, body in defs:
+            if n not in tainted and any(re.search(rf"(?<!\w){re.escape(t)}(?!\w)", body) for t in tainted):
+                tainted.add(n)
+                grew = True
+    for n in sorted(tainted):
+        for m in re.finditer(rf"(?<!\w){re.escape(n)}(?!\w)", uw):
+            ln = line_of(uw, m.start())
+            if live(ln) and not is_directive(ln):
+                unread.append(f"llrawproc.c:{ln}: the macro {n}, which names a timer, is expanded in export-reachable code")
     return {"entries": entries, "reachable": sorted(reach), "live": live, "windows": windows, "contains": contains, "calls": calls, "unread": unread,
             "funcLines": {n: [(line_of(llr, b0), line_of(llr, b1 - 1)) for _p, b0, b1 in v] for n, v in funcs.items()}}
 
@@ -1381,10 +1403,11 @@ def table_vs_export_problems(table: list, derived: dict) -> list:
         for w, (a, z) in zip(wins, spans):
             held = [(sa, sz) for sa, sz in own if sa <= z and a <= sz]
             if held:
-                # (adversary r1 A1: the window is EXACTLY the hull of the accrual windows it holds, so a widened row -- dual_iso as the whole worker -- is refused)
-                lo, hi = min(sa for sa, _ in held), max(sz for _, sz in held)
-                if (lo, hi) != (a, z):
-                    problems.append(f"{name}: window {w} is not the hull llrawproc.c:{lo}-{hi} of the export-reachable accrual windows it holds")
+                # (adversary r1 A1, pass 2 A3: the window's lines are EXACTLY the union of the accrual windows it holds -- no wider, and no untimed gap between two of them,
+                # so dual_iso widened to the whole worker, or to :5560-6219 across the refine lock, is refused)
+                covered = set().union(*(range(sa, sz + 1) for sa, sz in held))
+                if covered != set(range(a, z + 1)):
+                    problems.append(f"{name}: window {w} is not the union of the export-reachable accrual windows it holds {sorted(held)}")
                 continue
             # (a callee's lines count when every one of its live call sites is inside the row's other windows: the table's header rule)
             owners = [f for f in derived["reachable"] if f != "applyLLRawProcObjectWorker" and any(fa <= a and z <= fz for fa, fz in derived["funcLines"].get(f, []))]
@@ -1398,9 +1421,30 @@ def table_vs_export_problems(table: list, derived: dict) -> list:
         missing = derived["contains"].get(name, set()) - set(r.get("contains") or [])
         if missing:
             problems.append(f"{name}: accumulates {sorted(missing)} but its contains column does not name them")
+        extra = set(r.get("contains") or []) - derived["contains"].get(name, set())
+        if extra:
+            problems.append(f"{name}: its contains column names {sorted(extra)}, which it does not accumulate")
     for name in derived["windows"]:
         if name not in rows:
             problems.append(f"{name}: an export-reachable timer with no table row")
+    # (adversary pass 2 A4: the rest of the table's structure is compared too: one row per name; every published llrawproc timer (dng.c:571-601) is a row whose parent is
+    # llrawproc and whose windows are llrawproc.c line ranges only; llrawproc_other is the remainder of exactly the seven timed children (dng.c:579-604) and has no window)
+    names = [r["name"] for r in table]
+    problems += [f"{n}: duplicated row" for n in sorted({n for n in names if names.count(n) > 1})]
+    expected = {f"llrawproc_{t}" for t in LLRP_TIMERS} | {"llrawproc_other"}
+    problems += [f"{n}: a published llrawproc timer with no table row" for n in sorted(expected - set(rows))]
+    for name, r in rows.items():
+        if not name.startswith("llrawproc_"):
+            continue
+        if name not in expected:
+            problems.append(f"{name}: not a timer dng.c publishes")
+        if r.get("parent") != "llrawproc":
+            problems.append(f"{name}: parent {r.get('parent')!r}, not llrawproc")
+        problems += [f"{name}: window {w} is not an llrawproc.c line range" for w in (r.get("windows") or []) if not rng.match(w)]
+        if name == "llrawproc_other" and (set(r.get("remainderOf") or []) != {f"llrawproc_{t}" for t in LLRP_LOCAL_ACCUMULATORS} or r.get("windows")):
+            problems.append(f"{name}: not the windowless remainder of the seven timed children")
+        elif name != "llrawproc_other" and r.get("remainderOf"):
+            problems.append(f"{name}: carries a remainderOf column")
     return problems
 
 
@@ -1524,11 +1568,49 @@ class CdngStageContainmentGateTests(unittest.TestCase):
         llr = LLRAWPROC_C.read_text(encoding="utf-8", errors="replace")
         anchor = "applyLLRawProcObjectWorker(video, raw_image_buff, raw_image_size, NULL, 0);"
         self.assertEqual(llr.count(anchor), 1)
+        dng = DNG_C.read_text(encoding="utf-8", errors="replace")
+        # (pass 2 A1/A2: a statement split across lines, a pointer or subscript write, a macro argument, a blank after the splice backslash, the ??/ trigraph splice)
         for spelling in ("(g_llrawproc_last_pre_dualiso_fix_ms) = 80.0;", "g_llrawproc_last_pre_dual\\\niso_fix_ms = 80.0;", "g_llrawproc_last_pre_dualiso_fix_ms -= 1.0;",
-                         "++g_llrawproc_last_dual_iso_ms;"):
+                         "++g_llrawproc_last_dual_iso_ms;", "g_llrawproc_last_pre_dualiso_fix_ms\n = 80.0;", "double *p = &g_llrawproc_last_pre_dualiso_fix_ms; *p = 80.0;",
+                         "(&g_llrawproc_last_pre_dualiso_fix_ms)[0] = 80.0;", "SET_TIMER(g_llrawproc_last_pre_dualiso_fix_ms, 80.0);",
+                         "g_llrawproc_last_pre_dual\\ \niso_fix_ms = 80.0;", "g_llrawproc_last_pre_dual??/\niso_fix_ms = 80.0;"):
             with self.subTest(spelling=spelling):
-                mutated = derive_export_timer_windows(DNG_C.read_text(encoding="utf-8", errors="replace"), llr.replace(anchor, anchor + " " + spelling))
+                mutated = derive_export_timer_windows(dng, llr.replace(anchor, anchor + " " + spelling))
                 self.assertTrue(mutated["unread"] or "llrawproc_pre_dualiso_fix" in mutated["windows"], spelling)
+        # (pass 2 A2: the worker's local accumulators too, by pointer and by a macro that names one; and an X-macro naming the timers expanded on the export path)
+        local_anchor = "double chroma_smooth_ms = 0.0;"   # (its FIRST occurrence is the worker's declaration, llrawproc.c:5063; the second is the scaled path's)
+        self.assertLess(llr.index(local_anchor), llr.index("void applyLLRawProcObject(mlvObject_t"))
+        for spelling in ("double *q = &dark_frame_ms; *q = 80.0;", "SET_TIMER(dual_iso_ms, 80.0);"):
+            with self.subTest(local=spelling):
+                self.assertTrue(derive_export_timer_windows(dng, llr.replace(local_anchor, local_anchor + " " + spelling, 1))["unread"], spelling)
+        with self.subTest(xmacro="LLRP_LAST_RUN_TIMING"):
+            self.assertIn("LLRP_LAST_RUN_TIMING", llr)
+            self.assertTrue(derive_export_timer_windows(dng, llr.replace(anchor, anchor + " LLRP_LAST_RUN_TIMING(SOMETHING)"))["unread"])
+        # (pass 2 A5: a literal binds stop_before_dual_iso only while the body never writes it: reassigned before its if, the block is live and pre_dualiso_fix accrues)
+        gate = "if (stop_before_dual_iso)"
+        self.assertEqual(llr.count(gate), 1)
+        mutated = derive_export_timer_windows(dng, llr.replace(gate, "stop_before_dual_iso = 1; " + gate))
+        self.assertTrue(mutated["unread"] or "llrawproc_pre_dualiso_fix" in mutated["windows"])
+        # (pass 2 A3/A4: a window across an untimed gap, a wrong parent, an extra contains entry, a token window, a removed or duplicated row are refused)
+        def table_mutant(fn) -> list:
+            t = json.loads(json.dumps(got))
+            fn(t)
+            return table_vs_export_problems(t, derived)
+
+        def row(t: list, name: str) -> dict:
+            return next(r for r in t if r["name"] == name)
+        mutants = {
+            "dual_iso across the refine lock": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", ["llrawproc.c:5560-6219"]),
+            "pre_dualiso_fix parent": lambda t: row(t, "llrawproc_pre_dualiso_fix").__setitem__("parent", "unmeasured"),
+            "extra contains": lambda t: row(t, "llrawproc_dual_iso").__setitem__("contains", ["llrawproc_publish_lock"]),
+            "token window": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", row(t, "llrawproc_dual_iso")["windows"] + ["dng.c#raw_read"]),
+            "removed pre row": lambda t: t.remove(row(t, "llrawproc_pre_dualiso_fix")),
+            "duplicated row": lambda t: t.append(json.loads(json.dumps(row(t, "llrawproc_dual_iso")))),
+            "other not the remainder": lambda t: row(t, "llrawproc_other").__setitem__("remainderOf", ["llrawproc_dual_iso"]),
+        }
+        for label, fn in mutants.items():
+            with self.subTest(table=label):
+                self.assertTrue(table_mutant(fn), label)
 
 
 @requires_windows_pwsh
