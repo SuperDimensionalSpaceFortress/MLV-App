@@ -20,6 +20,18 @@ namespace viewer_dblclick
  *  delivered to and the event's own position in it (never the live cursor: r2 pass 4 A1). */
 using StateReader = std::function<ViewerState( const QObject *target, const QPointF &pos )>;
 
+/*! \brief The event's own position in its receiver. QMouseEvent::position() is Qt 6.0+ only and
+ *  Qt 5 (the macOS Intel release kit, docs/11-build-macos-linux.md) has localPos(); same precedent
+ *  as GpuWindowViewerInputForwarder.h (PR 856 r3, opus key3 r2 H1). */
+inline QPointF eventPosition( const QMouseEvent *mouse )
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    return mouse->position();
+#else
+    return mouse->localPos();
+#endif
+}
+
 /*! \brief Returns true when the caller should toggle fullscreen and swallow the event.
  *  A press is never swallowed: it only updates the gate's first-press record. \a state is called
  *  lazily, only for events on a display surface. */
@@ -44,7 +56,7 @@ inline bool filterEvent( Gate &gate, const QObject *watched, QEvent *event, cons
             const bool createdDoubleClick = mouse->flags().testFlag( Qt::MouseEventCreatedDoubleClick );
             if( onViewer )
             {
-                const bool armedNow = ( !createdDoubleClick && state ) ? anyToolArmed( state( watched, mouse->position() ) ) : false;
+                const bool armedNow = ( !createdDoubleClick && state ) ? anyToolArmed( state( watched, eventPosition( mouse ) ) ) : false;
                 gate.notePress( armedNow, createdDoubleClick );
             }
             else if( watched && watched->isWindowType() )
@@ -61,7 +73,7 @@ inline bool filterEvent( Gate &gate, const QObject *watched, QEvent *event, cons
     if( !onViewer ) return false;
 
     if( !state ) return false;
-    return gate.decide( button, modifiers, state( watched, mouse->position() ) );
+    return gate.decide( button, modifiers, state( watched, eventPosition( mouse ) ) );
 }
 
 } // namespace viewer_dblclick
