@@ -174,6 +174,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
     $$REPO_ROOT/platform/qt/ViewerIdlePolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerMouseRetrievalHook.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/PlaybackTexturePresentSplit.h \

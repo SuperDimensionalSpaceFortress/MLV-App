@@ -413,6 +413,7 @@ HEADERS += MainWindow.h \
            LookLabelPolicy.h \
            ViewerIdlePolicy.h \
            ViewerCursorSurfaces.h \
+           ViewerMouseRetrievalHook.h \
            LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
            PlayerShortcutBinding.h \

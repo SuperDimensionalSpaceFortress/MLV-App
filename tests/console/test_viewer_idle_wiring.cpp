@@ -151,10 +151,56 @@ TEST(ViewerIdleWiring, InputsReadWindowStateAndToolsAndSurfacesReadGlWindowFresh
     // Adversary pass 2 A1: a move away and back between two ticks leaves the sampled position unchanged, so
     // on Windows the tick also asks whether a WM_MOUSEMOVE is still queued (an input-excluded wait leaves
     // it there), guarded to Windows.
-    const int queueAt = timeout.indexOf(QStringLiteral("GetQueueStatus( QS_MOUSEMOVE )"));
+    // r2 sibling sweep: a button still queued is the same undelivered input, so the queue question is QS_MOUSE.
+    const int queueAt = timeout.indexOf(QStringLiteral("GetQueueStatus( QS_MOUSE )"));
     ASSERT_TRUE(queueAt >= 0);
     const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), queueAt);
     ASSERT_TRUE(guardAt >= 0);
     ASSERT_TRUE(timeout.indexOf(QStringLiteral("#endif"), guardAt) > queueAt);
     ASSERT_EQ(3, int(timeout.count(QStringLiteral("m_viewerIdleTimer->start( ms );"))));
+}
+
+// W5 (r2, adversary r1 pass 3 A1): Qt's excluded wait defers the WM_MOUSEMOVE out of the Win32 queue, so the
+// tick also reads the thread mouse hook's witness, before the switch and inside the Windows guard. The hook is
+// installed on entering fullscreen and removed on leaving it and in the destructor, and both event-path
+// activity notes clear it so delivered input is not counted again at the next tick.
+TEST(ViewerIdleWiring, TickReadsTheRetrievalHookInstalledOnlyWhileFullscreen)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("#include \"ViewerMouseRetrievalHook.h\"")));
+
+    const QString timeout = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    ASSERT_FALSE(timeout.isEmpty());
+    const QString take = QStringLiteral("if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;");
+    const int takeAt = timeout.indexOf(take);
+    ASSERT_TRUE(takeAt >= 0);
+    ASSERT_EQ(1, int(timeout.count(take)));
+    const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), takeAt);
+    ASSERT_TRUE(guardAt >= 0);
+    ASSERT_TRUE(timeout.indexOf(QStringLiteral("#endif"), guardAt) > takeAt);
+    ASSERT_TRUE(takeAt > timeout.indexOf(QStringLiteral("in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );")));
+    ASSERT_TRUE(takeAt < timeout.indexOf(QStringLiteral("switch( m_viewerIdle.onTimeout(")));
+
+    const QString changed = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleFullscreenChanged( bool on )"));
+    ASSERT_FALSE(changed.isEmpty());
+    const int installAt = changed.indexOf(QStringLiteral("viewer_idle::win_hook::install();"));
+    const int elseAt = changed.indexOf(QStringLiteral("else"));
+    const int removeAt = changed.indexOf(QStringLiteral("viewer_idle::win_hook::remove();"));
+    ASSERT_TRUE(installAt >= 0);
+    ASSERT_TRUE(elseAt > installAt);
+    ASSERT_TRUE(removeAt > elseAt);
+
+    const QString dtor = functionBodyToBrace(source, QStringLiteral("MainWindow::~MainWindow()"));
+    ASSERT_FALSE(dtor.isEmpty());
+    ASSERT_TRUE(dtor.contains(QStringLiteral("viewer_idle::win_hook::remove();")));
+
+    const QString clear = QStringLiteral("viewer_idle::win_hook::witness().clear();");
+    const QString note = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )"));
+    ASSERT_EQ(1, int(note.count(clear)));
+    const QString restore = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleRestore( void )"));
+    ASSERT_EQ(1, int(restore.count(clear)));
 }

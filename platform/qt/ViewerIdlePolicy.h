@@ -105,6 +105,74 @@ private:
     bool m_have = false;
 };
 
+/*! \brief The kind of a mouse message taken from the thread's input queue. */
+enum class RetrievedKind { Move, Button, Wheel };
+
+/*! \brief Mouse input seen at the moment the thread takes it from its input queue, before any Qt event
+ *         exists for it (on Windows a thread-local WH_MOUSE hook, ViewerMouseRetrievalHook.h).
+ *
+ * An input-excluded wait takes WM_MOUSEMOVE off the Win32 queue into Qt's own deferred queue, so a move
+ * away and back between two ticks reaches neither the sampled position (PointerWatch) nor the Win32 queue
+ * status, and no Qt event is delivered until the wait returns. The retrieval is the one point Qt cannot
+ * defer, so it is the witness that survives (PLAYER-CURSOR-AUTOHIDE-1 r2 A1).
+ *
+ * A move counts only when its position differs from the last retrieved move. That is how Qt itself reads
+ * a move: it discards a button-less WM_MOUSEMOVE at the position of the last one (Windows synthesizes
+ * those when a window appears under the cursor), so this never counts input the event path would not.
+ * A button or wheel message counts when it is removed from the queue (a peek that leaves it there is seen
+ * again when it is removed). The event path clears the witness when it notes activity itself, so input
+ * that was delivered is not counted a second time at the next tick. Positions are the hook's own
+ * coordinates (physical pixels); they are compared only with each other. */
+class RetrievalWitness
+{
+public:
+    /*! \brief Starts a fresh look: pos is where the pointer is now; nothing is pending. */
+    void seed( const QPoint &pos )
+    {
+        m_last = pos;
+        m_have = true;
+        m_pending = false;
+    }
+
+    /*! \brief Forgets the position too (no pointer position was available). */
+    void reset()
+    {
+        m_have = false;
+        m_pending = false;
+    }
+
+    /*! \brief One mouse message taken from (removed true) or peeked in (removed false) the queue. */
+    void note( RetrievedKind kind, const QPoint &pos, bool removed )
+    {
+        if( kind == RetrievedKind::Move )
+        {
+            if( !m_have || pos != m_last ) m_pending = true;
+            m_last = pos;
+            m_have = true;
+            return;
+        }
+        if( removed ) m_pending = true;
+    }
+
+    /*! \brief The event path saw the input itself: nothing is pending (the last position is kept). */
+    void clear() { m_pending = false; }
+
+    /*! \brief True iff input was seen since the last take/clear/seed. Clears it. */
+    bool take()
+    {
+        const bool was = m_pending;
+        m_pending = false;
+        return was;
+    }
+
+    bool pending() const { return m_pending; }
+
+private:
+    QPoint m_last;
+    bool m_have = false;
+    bool m_pending = false;
+};
+
 /*! \brief What the caller does when its single-shot idle timer fires. For Hide, Show and Rearm the caller
  *         also restarts the timer for *rearmMs; None (not fullscreen) leaves it stopped. */
 enum class Tick { None, Hide, Show, Rearm };

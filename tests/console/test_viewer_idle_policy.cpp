@@ -3,6 +3,7 @@
 #include "../common/minitest.h"
 
 #include "../../platform/qt/ViewerIdlePolicy.h"
+#include "../../platform/qt/ViewerMouseRetrievalHook.h"
 
 #include <QEvent>
 #include <QPoint>
@@ -244,3 +245,123 @@ TEST(ViewerIdlePolicy, IdleHideIsTwoSeconds)
 {
     ASSERT_EQ(2000, viewer_idle::kIdleHideMs());
 }
+
+// P5 (r2, adversary r1 pass 3 A1): the retrieval witness sees a move away and back that leaves the sampled
+// position unchanged, ignores a synthesized move to the last position (Qt discards those too), counts a
+// removed button or wheel, and is cleared by take/clear/seed.
+TEST(ViewerIdlePolicy, RetrievalWitnessSeesAwayAndBackAndIgnoresSamePositionMoves)
+{
+    viewer_idle::RetrievalWitness w;
+    w.seed(QPoint(500, 500));
+    ASSERT_FALSE(w.pending());
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(500, 500), true);   // synthesized, same position
+    ASSERT_FALSE(w.take());
+
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(510, 500), true);   // away
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(500, 500), true);   // and back
+    viewer_idle::PointerWatch sampled;
+    sampled.seed(QPoint(500, 500));
+    ASSERT_FALSE(sampled.moved(QPoint(500, 500)));   // the sample alone misses it
+    ASSERT_TRUE(w.take());
+    ASSERT_FALSE(w.take());                          // taken once
+
+    // A peek that leaves a move in the queue counts it once; its removal at the same position does not again.
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(520, 500), false);
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(520, 500), true);
+    ASSERT_TRUE(w.take());
+    ASSERT_FALSE(w.take());
+
+    // Buttons and wheel count when removed, not when only peeked.
+    w.note(viewer_idle::RetrievedKind::Button, QPoint(520, 500), false);
+    ASSERT_FALSE(w.take());
+    w.note(viewer_idle::RetrievedKind::Button, QPoint(520, 500), true);
+    ASSERT_TRUE(w.take());
+    w.note(viewer_idle::RetrievedKind::Wheel, QPoint(520, 500), true);
+    ASSERT_TRUE(w.take());
+
+    // The event path delivered it: clear keeps the position, so the same position stays not-new.
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(530, 500), true);
+    w.clear();
+    ASSERT_FALSE(w.take());
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(530, 500), true);
+    ASSERT_FALSE(w.take());
+
+    // No position known: the first move counts.
+    w.reset();
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(530, 500), true);
+    ASSERT_TRUE(w.take());
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(540, 500), true);
+    w.seed(QPoint(540, 500));
+    ASSERT_FALSE(w.take());
+}
+
+// P6: a tick that reads the witness turns an away-and-back the sample missed into Show while hidden.
+TEST(ViewerIdlePolicy, RetrievalWitnessReadAtTheTickShowsTheHiddenCursor)
+{
+    viewer_idle::Controller c;
+    c.setFullscreen(true, 0);
+    int rearm = 0;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm)));
+    viewer_idle::PointerWatch sampled;
+    sampled.seed(QPoint(500, 500));
+    viewer_idle::RetrievalWitness w;
+    w.seed(QPoint(500, 500));
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(510, 500), true);
+    w.note(viewer_idle::RetrievedKind::Move, QPoint(500, 500), true);
+
+    viewer_idle::Inputs without = allPass();
+    without.pointerMoved = sampled.moved(QPoint(500, 500));
+    viewer_idle::Controller old = c;   // the r1 tick read only the sample: it stays hidden
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(old.onTimeout(without, 4000, 2000, &rearm)));
+    ASSERT_TRUE(old.hidden());
+
+    viewer_idle::Inputs with = allPass();
+    with.pointerMoved = sampled.moved(QPoint(500, 500));
+    if (w.take()) with.pointerMoved = true;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(with, 4000, 2000, &rearm)));
+    ASSERT_FALSE(c.hidden());
+}
+
+#ifdef Q_OS_WIN
+// P7: the WH_MOUSE procedure maps each mouse message to its kind, records the hook position, passes every
+// message on, and the hook installs for this thread and removes cleanly.
+TEST(ViewerIdlePolicy, RetrievalHookProcRecordsMouseMessagesAndInstallsForThisThread)
+{
+    viewer_idle::RetrievedKind kind = viewer_idle::RetrievedKind::Wheel;
+    ASSERT_TRUE(viewer_idle::win_hook::kindOfMessage(WM_MOUSEMOVE, &kind));
+    ASSERT_TRUE(kind == viewer_idle::RetrievedKind::Move);
+    ASSERT_TRUE(viewer_idle::win_hook::kindOfMessage(WM_NCMOUSEMOVE, &kind));
+    ASSERT_TRUE(kind == viewer_idle::RetrievedKind::Move);
+    ASSERT_TRUE(viewer_idle::win_hook::kindOfMessage(WM_LBUTTONDOWN, &kind));
+    ASSERT_TRUE(kind == viewer_idle::RetrievedKind::Button);
+    ASSERT_TRUE(viewer_idle::win_hook::kindOfMessage(WM_XBUTTONUP, &kind));
+    ASSERT_TRUE(kind == viewer_idle::RetrievedKind::Button);
+    ASSERT_TRUE(viewer_idle::win_hook::kindOfMessage(WM_MOUSEHWHEEL, &kind));
+    ASSERT_TRUE(kind == viewer_idle::RetrievedKind::Wheel);
+    ASSERT_FALSE(viewer_idle::win_hook::kindOfMessage(WM_KEYDOWN, &kind));   // a key press is not mouse input
+    ASSERT_FALSE(viewer_idle::win_hook::kindOfMessage(WM_TIMER, &kind));
+
+    viewer_idle::win_hook::witness().seed(QPoint(500, 500));
+    MOUSEHOOKSTRUCT away = {};
+    away.pt.x = 510;
+    away.pt.y = 500;
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = 500;
+    back.pt.y = 500;
+    viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&away));
+    viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&back));
+    ASSERT_TRUE(viewer_idle::win_hook::witness().take());
+    viewer_idle::win_hook::proc(HC_ACTION, WM_KEYDOWN, reinterpret_cast<LPARAM>(&away));
+    viewer_idle::win_hook::proc(-1, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&away));   // code < 0: not ours
+    viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, 0);
+    ASSERT_FALSE(viewer_idle::win_hook::witness().take());
+
+    ASSERT_TRUE(viewer_idle::win_hook::install());
+    ASSERT_TRUE(viewer_idle::win_hook::installed());
+    ASSERT_TRUE(viewer_idle::win_hook::install());   // idempotent
+    viewer_idle::win_hook::remove();
+    ASSERT_FALSE(viewer_idle::win_hook::installed());
+    viewer_idle::win_hook::remove();
+    ASSERT_FALSE(viewer_idle::win_hook::witness().pending());
+}
+#endif

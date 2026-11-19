@@ -72,6 +72,7 @@
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
+#include "../../platform/qt/ViewerMouseRetrievalHook.h"   // after <windows.h>
 
 // MLV_REQUIRE_GL_TESTS=1 turns an offscreen-platform skip into a hard failure, for the GL
 // window capture/race tests that must not silently skip on a run that is supposed to have
@@ -2332,12 +2333,18 @@ public:
         m_idle.setFullscreen( true, m_clock.elapsed() );
         m_haveLast = false;
         m_pointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        hookInstalled = viewer_idle::win_hook::install();
+#endif
         m_timer.start( m_idleMs );
     }
 
     void leaveFullscreen()
     {
         m_timer.stop();
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::remove();
+#endif
         if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
         m_idle.setFullscreen( false, m_clock.elapsed() );
     }
@@ -2347,6 +2354,9 @@ public:
     viewer_idle::Inputs inputs;
     // Emulates a wait that excludes user input (SyncDownloadWaiter-style): input events are not noted.
     bool inputExcluded = false;
+    // r2: false reproduces the r1 tick, which did not read the thread mouse hook's witness (RED control).
+    bool readRetrievalWitness = true;
+    bool hookInstalled = false;
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -2362,6 +2372,9 @@ private:
         if( m_idle.fullscreen() )
         {
             m_pointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+            viewer_idle::win_hook::witness().clear();
+#endif
             m_idle.noteActivity( m_clock.elapsed() );
             if( !m_timer.isActive() ) m_timer.start( m_idleMs );
         }
@@ -2378,6 +2391,9 @@ private:
         if( viewer_idle::eventIsActivity( event, &m_lastGlobal, &m_haveLast ) )
         {
             m_pointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+            viewer_idle::win_hook::witness().clear();
+#endif
             if( m_idle.noteActivity( m_clock.elapsed() ) ) m_hider.restore( m_surfaces );
             if( !m_timer.isActive() ) m_timer.start( m_idleMs );
         }
@@ -2388,6 +2404,14 @@ private:
         int ms = 0;
         viewer_idle::Inputs in = inputs;
         in.pointerMoved = m_pointer.moved( QCursor::pos() );
+#ifdef Q_OS_WIN
+        if( readRetrievalWitness )
+        {
+            if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
+            if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
+        }
+        else if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;   // the r1 tick
+#endif
         switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms ) )
         {
         case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); m_timer.start( ms ); break;

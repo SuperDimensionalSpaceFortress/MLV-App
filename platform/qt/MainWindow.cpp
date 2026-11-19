@@ -1598,6 +1598,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include <windows.h>
 #endif
 #include "OutputDirIdentity.h"
+#include "ViewerMouseRetrievalHook.h"   // PLAYER-CURSOR-AUTOHIDE-1 r2: after <windows.h>, like the two above
 #include "VisualCaptureSourceGuard.h"
 
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height);
@@ -2636,6 +2637,9 @@ MainWindow::~MainWindow()
 {
     playback_paint_credit::setSink( nullptr, nullptr );
     preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
+#ifdef Q_OS_WIN
+    viewer_idle::win_hook::remove();   // PLAYER-CURSOR-AUTOHIDE-1 r2: closed while still fullscreen
+#endif
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
@@ -3706,6 +3710,9 @@ void MainWindow::viewerIdleRestore( void )
     if( m_viewerIdle.fullscreen() )
     {
         m_viewerIdlePointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::witness().clear();
+#endif
         m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
     }
@@ -3718,11 +3725,18 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
         m_viewerIdle.setFullscreen( true, m_viewerIdleClock.elapsed() );
         m_viewerIdleHaveLast = false;
         m_viewerIdlePointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        // Adversary r1 pass 3 A1: the witness that survives Qt deferring input in an excluded wait.
+        viewer_idle::win_hook::install();
+#endif
         m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
     }
     else
     {
         m_viewerIdleTimer->stop();
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::remove();
+#endif
         if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
         m_viewerIdle.setFullscreen( false, m_viewerIdleClock.elapsed() );
     }
@@ -3736,9 +3750,12 @@ void MainWindow::viewerIdleTimeout( void )
     // position is the witness for movement the event path did not see.
     in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );
 #ifdef Q_OS_WIN
-    // A move away and back between two ticks leaves the sampled position unchanged. Such a wait leaves the
-    // WM_MOUSEMOVE queued for this (GUI) thread, which owns both viewer surfaces, so ask the queue too.
-    if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;
+    // A move away and back between two ticks leaves the sampled position unchanged. Qt's excluded wait takes
+    // the WM_MOUSEMOVE off this (GUI) thread's queue into its own deferred queue, so the queue status alone
+    // misses it: the thread mouse hook saw it when it was taken (both viewer surfaces are this thread's).
+    // Read the hook first, then whatever input is still queued, untaken (moves and buttons alike).
+    if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
+    if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
 #endif
     switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms ) )
     {
@@ -3771,6 +3788,9 @@ void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
     {
         // The timer is not restarted on every move: the timestamp plus Rearm covers it.
         m_viewerIdlePointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::witness().clear();   // delivered: the hook's sighting of it is not new movement
+#endif
         if( m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() ) ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
     }
