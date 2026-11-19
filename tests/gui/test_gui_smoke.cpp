@@ -702,6 +702,7 @@ private slots:
     void viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces();
     void viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces();
     void viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow();
+    void viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHidden();
 #endif
     void viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces();
     void viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack();
@@ -2385,6 +2386,10 @@ public:
     // r6 (key B1, pass 8 A1): install() and every MainWindow tick mark the system move history; false marks
     // nothing (install's mark is undone), which is the r5 tick (RED control).
     bool markHistory = true;
+    // r7 (key B1): true is the b03e08c5 tick, whose queue fallback counts any queued mouse input (RED control).
+    bool queueStatusTick = false;
+    // r7: how many ticks returned Show (a control that re-hides one idle period later is still seen).
+    int shows = 0;
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -2441,8 +2446,17 @@ private:
         else if( readRetrievalWitness )
         {
             if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
-            if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
-            if( markHistory ) viewer_idle::win_hook::markHistory();   // as MainWindow (r6, pass 8 A1)
+            if( queueStatusTick )
+            {
+                // The b03e08c5 tick (r7 RED control): any queued mouse input counts, then the mark.
+                if( HIWORD( viewer_idle::win_hook::queueStatusReader()( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
+                viewer_idle::win_hook::markHistory();
+            }
+            else if( markHistory )
+            {
+                if( viewer_idle::win_hook::lookAtQueue() ) in.pointerMoved = true;   // as MainWindow (r7, key B1)
+            }
+            else if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;   // the r5 tick
             in.witnessMissing = !viewer_idle::win_hook::installed();   // as MainWindow (r6, pass 9 A1)
         }
         else if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;   // the r1 tick
@@ -2450,7 +2464,7 @@ private:
         switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms, pollMs ) )
         {
         case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); m_timer.start( ms ); break;
-        case viewer_idle::Tick::Show: m_hider.restore( m_surfaces ); m_timer.start( ms ); break;
+        case viewer_idle::Tick::Show: ++shows; m_hider.restore( m_surfaces ); m_timer.start( ms ); break;
         case viewer_idle::Tick::Rearm: m_timer.start( ms ); break;
         case viewer_idle::Tick::None: break;
         }
@@ -2872,6 +2886,108 @@ void GuiSmokeTest::viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow()
     QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
     QVERIFY( harness.hidden() );
     harness.leaveFullscreen();
+}
+
+namespace
+{
+// r7 (key B1): a scripted cursor position and queue status, so a test controls what GetCursorPos and
+// GetQueueStatus say without moving the real pointer or queuing real input.
+QPoint g_viewerIdleCursor( 500, 500 );
+DWORD g_viewerIdleQueueStatus = 0;
+// The control's pointer keeps moving (one pixel per read), so its shown state lasts instead of re-hiding one idle
+// period after the show.
+bool g_viewerIdleCursorWalks = false;
+bool viewerIdleScriptedCursor( QPoint *at )
+{
+    if( g_viewerIdleCursorWalks ) g_viewerIdleCursor.rx() += 1;
+    *at = g_viewerIdleCursor;
+    return true;
+}
+DWORD viewerIdleScriptedQueueStatus( UINT flags )
+{
+    return g_viewerIdleQueueStatus & ( ( DWORD( flags ) << 16 ) | flags );
+}
+} // namespace
+
+// G12 (r7, key B1, the sol r6 catalogue row): hidden fullscreen, the pointer stationary at (500,500) with an unchanged
+// move history and an empty witness. A nonactivating window shown under the cursor makes Windows synthesize a move at
+// (500,500); it is still queued at the tick (GetQueueStatus(QS_MOUSE) = 0x00020002). Expected: both viewer surfaces
+// stay hidden. RED control: the b03e08c5 tick (any queued mouse input counts) shows both. Control: a queued move with
+// the cursor at another point (510,500) shows both.
+void GuiSmokeTest::viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHidden()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader savedHistory = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::CursorReader savedCursor = viewer_idle::win_hook::cursorReader();
+    viewer_idle::win_hook::QueueStatusReader savedQueue = viewer_idle::win_hook::queueStatusReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    viewer_idle::win_hook::cursorReader() = viewerIdleScriptedCursor;
+    viewer_idle::win_hook::queueStatusReader() = viewerIdleScriptedQueueStatus;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.inputExcluded = true;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, savedHistory, savedCursor, savedQueue]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = savedHistory;
+        viewer_idle::win_hook::cursorReader() = savedCursor;
+        viewer_idle::win_hook::queueStatusReader() = savedQueue;
+        g_viewerIdleQueueStatus = 0;
+        g_viewerIdleCursorWalks = false;
+        g_viewerIdleCursor = QPoint( 500, 500 );
+    } );
+    const QPoint start( 500, 500 );
+
+    // 0: the b03e08c5 tick (RED control); 1: the r7 tick (the row); 2: the r7 tick, cursor elsewhere (control).
+    for( int run = 0; run < 3; ++run )
+    {
+        harness.queueStatusTick = run == 0;
+        g_viewerIdleQueueStatus = 0;
+        g_viewerIdleCursor = start;
+        viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 990 ) } );
+        harness.enterFullscreen();
+        QVERIFY( harness.hookInstalled );
+        QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+        QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+        viewer_idle::win_hook::witness().seed( start );
+
+        // The synthesized move is queued (QS_MOUSEMOVE in the high and low words); the history is unchanged.
+        if( run == 2 )
+        {
+            g_viewerIdleCursor = QPoint( 510, 500 );
+            g_viewerIdleCursorWalks = true;
+            viewerIdleSetScript( { viewerIdlePoint( 510, 500, 1200 ), viewerIdlePoint( start.x(), start.y(), 1000 ),
+                                   viewerIdlePoint( 490, 500, 990 ) } );
+        }
+        g_viewerIdleQueueStatus = 0x00020002;
+        if( run == 1 )
+        {
+            QTest::qWait( 300 );   // many poll periods with the move still queued
+            QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+            QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+            QVERIFY( harness.hidden() );
+        }
+        else
+        {
+            QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::OpenHandCursor, 1000 );
+            QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+            QVERIFY( !harness.hidden() );
+            QVERIFY( harness.shows > 0 );
+        }
+        g_viewerIdleQueueStatus = 0;
+        g_viewerIdleCursorWalks = false;
+        harness.leaveFullscreen();
+        QVERIFY( !viewer_idle::win_hook::installed() );
+    }
 }
 #endif
 

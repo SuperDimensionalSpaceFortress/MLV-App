@@ -152,11 +152,16 @@ TEST(ViewerIdleWiring, InputsReadWindowStateAndToolsAndSurfacesReadGlWindowFresh
     // on Windows the tick also asks whether a WM_MOUSEMOVE is still queued (an input-excluded wait leaves
     // it there), guarded to Windows.
     // r2 sibling sweep: a button still queued is the same undelivered input, so the queue question is QS_MOUSE.
-    const int queueAt = timeout.indexOf(QStringLiteral("GetQueueStatus( QS_MOUSE )"));
+    // r7 (key B1): the tick asks it through lookAtQueue (QueueLook grammar), never as a bare status test.
+    const int queueAt = timeout.indexOf(QStringLiteral("if( viewer_idle::win_hook::lookAtQueue() ) in.pointerMoved = true;"));
     ASSERT_TRUE(queueAt >= 0);
+    ASSERT_FALSE(timeout.contains(QStringLiteral("GetQueueStatus(")));
     const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), queueAt);
     ASSERT_TRUE(guardAt >= 0);
     ASSERT_TRUE(timeout.indexOf(QStringLiteral("#endif"), guardAt) > queueAt);
+    const QString hookSource = readRepoFile(QStringLiteral("platform/qt/ViewerMouseRetrievalHook.h"));
+    const QString look = functionBodyToBrace(hookSource, QStringLiteral("inline bool lookAtQueue()"));
+    ASSERT_TRUE(look.contains(QStringLiteral("queueStatusReader()( QS_MOUSE )")));
     ASSERT_EQ(3, int(timeout.count(QStringLiteral("m_viewerIdleTimer->start( ms );"))));
 }
 
@@ -283,16 +288,21 @@ TEST(ViewerIdleWiring, EveryTickMarksTheMoveHistoryAndTheHookReadsItForASamePosi
     const QString timeout = functionBodyToBrace(source,
         QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
     ASSERT_FALSE(timeout.isEmpty());
-    const QString mark = QStringLiteral("viewer_idle::win_hook::markHistory();");
+    // r7 (key B1, opus H1): the tick's mark is lookAtQueue's, made BEFORE it reads the queue status, with the one
+    // history read that judged the queued input against the previous mark.
+    const QString mark = QStringLiteral("if( viewer_idle::win_hook::lookAtQueue() ) in.pointerMoved = true;");
     ASSERT_EQ(1, int(timeout.count(mark)));
-    ASSERT_EQ(1, int(source.count(mark)));
+    ASSERT_EQ(0, int(source.count(QStringLiteral("viewer_idle::win_hook::markHistory();"))));
     const int markAt = timeout.indexOf(mark);
-    const int queueAt = timeout.indexOf(QStringLiteral("if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;"));
+    const QString lookBody = functionBodyToBrace(readRepoFile(QStringLiteral("platform/qt/ViewerMouseRetrievalHook.h")),
+                                                 QStringLiteral("inline bool lookAtQueue()"));
+    const int lookMarkAt = lookBody.indexOf(QStringLiteral("q.haveCursor = markHistoryAt( &q.cursor, &q.leftSinceMark );"));
+    const int queueAt = lookBody.indexOf(QStringLiteral("queueStatusReader()( QS_MOUSE )"));
     const int takeAt = timeout.indexOf(QStringLiteral("if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;"));
     const int switchAt = timeout.indexOf(QStringLiteral("switch( m_viewerIdle.onTimeout("));
     ASSERT_TRUE(takeAt >= 0);
-    ASSERT_TRUE(queueAt > takeAt);
-    ASSERT_TRUE(markAt > queueAt);
+    ASSERT_TRUE(lookMarkAt >= 0 && queueAt > lookMarkAt);
+    ASSERT_TRUE(markAt > takeAt);
     ASSERT_TRUE(markAt < switchAt);
     const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), markAt);
     ASSERT_TRUE(guardAt >= 0);

@@ -24,6 +24,9 @@
  * and restarts the idle period of a shown one (pass 8 A1). The read happens only for a same-position move
  * while marked; the mark is one read per tick.
  *
+ * r7 (key B1): input still on the queue at a tick is judged by lookAtQueue() (QueueLook grammar), not by the
+ * queue status alone, so a move Windows synthesizes at the cursor's position does not show a hidden cursor.
+ *
  * GetLastInputInfo was rejected because a key press counts as input there, and a key press must not
  * bring the cursor back.
  */
@@ -126,19 +129,86 @@ inline MoveHistoryMark &historyMark()
     return m;
 }
 
-/*! \brief Called by install() and by every idle tick after it read the witness: marks the history at the cursor
- *         position. If the position or the history cannot be read, the mark is cleared (the r5 position rule
- *         stands until the next mark). */
-inline void markHistory()
+/*! \brief Reads the cursor position (GetCursorPos, physical pixels; a test supplies a scripted one). */
+inline bool readSystemCursor( QPoint *at )
 {
     POINT pt;
-    HistoryPoint points[MoveHistoryMark::kMaxPoints];
-    if( !GetCursorPos( &pt ) )
+    if( !at || !GetCursorPos( &pt ) ) return false;
+    *at = QPoint( pt.x, pt.y );
+    return true;
+}
+using CursorReader = bool (*)( QPoint *at );
+inline CursorReader &cursorReader()
+{
+    static CursorReader r = readSystemCursor;
+    return r;
+}
+
+/*! \brief The thread's queue status (GetQueueStatus; a test supplies a scripted one). */
+inline DWORD readSystemQueueStatus( UINT flags ) { return GetQueueStatus( flags ); }
+using QueueStatusReader = DWORD (*)( UINT flags );
+inline QueueStatusReader &queueStatusReader()
+{
+    static QueueStatusReader r = readSystemQueueStatus;
+    return r;
+}
+
+/*! \brief Where the cursor was at the last mark (install or the last tick); have is false when it was not read. */
+struct LastLook
+{
+    QPoint pos;
+    bool have = false;
+};
+inline LastLook &lastLook()
+{
+    static LastLook l;
+    return l;
+}
+
+/*! \brief Reads the cursor and the history ONCE: *leftSinceMark (optional) is that history judged against the
+ *         previous mark (MoveHistoryMark::leftSinceMark), then the same read becomes the mark and the cursor the
+ *         last look. If the position cannot be read, the mark and the last look are cleared and false is returned;
+ *         a history that cannot be read clears the mark (the r5 position rule stands until the next mark). */
+inline bool markHistoryAt( QPoint *cursor, bool *leftSinceMark )
+{
+    if( leftSinceMark ) *leftSinceMark = false;
+    QPoint at;
+    if( !cursorReader()( &at ) )
     {
         historyMark().unmark();
-        return;
+        lastLook().have = false;
+        return false;
     }
-    historyMark().mark( points, historyReader()( QPoint( pt.x, pt.y ), points, MoveHistoryMark::kMaxPoints ) );
+    HistoryPoint points[MoveHistoryMark::kMaxPoints];
+    const int n = historyReader()( at, points, MoveHistoryMark::kMaxPoints );
+    if( leftSinceMark ) *leftSinceMark = historyMark().leftSinceMark( points, n, at.x(), at.y() );
+    historyMark().mark( points, n );
+    lastLook().pos = at;
+    lastLook().have = true;
+    if( cursor ) *cursor = at;
+    return true;
+}
+
+/*! \brief Called by install(): marks the history at the cursor position (markHistoryAt). */
+inline void markHistory()
+{
+    markHistoryAt( nullptr, nullptr );
+}
+
+/*! \brief r7 (key B1, opus H1): every idle tick, after it read the witness. Marks the history first (one read,
+ *         judged against the previous mark), then reads the queue status, and returns true iff the mouse input
+ *         still queued is activity by the QueueLook grammar (ViewerIdlePolicy.h). Removes nothing from the queue
+ *         and retrieves nothing, so the hook does not run inside it. */
+inline bool lookAtQueue()
+{
+    QueueLook q;
+    q.haveLastLook = lastLook().have;
+    q.lastLook = lastLook().pos;
+    q.haveCursor = markHistoryAt( &q.cursor, &q.leftSinceMark );
+    const DWORD queued = HIWORD( queueStatusReader()( QS_MOUSE ) );
+    q.buttonQueued = ( queued & QS_MOUSEBUTTON ) != 0;
+    q.moveQueued = ( queued & QS_MOUSEMOVE ) != 0;
+    return queuedMouseIsActivity( q );
 }
 
 /*! \brief The WH_MOUSE procedure. Records, never consumes: the message always goes on to the next hook. */
@@ -187,6 +257,7 @@ inline void remove()
     }
     witness().reset();
     historyMark().unmark();
+    lastLook().have = false;
 }
 
 inline bool installed() { return hookHandle() != nullptr; }

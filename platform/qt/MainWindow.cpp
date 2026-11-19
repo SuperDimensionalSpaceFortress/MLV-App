@@ -3756,11 +3756,12 @@ void MainWindow::viewerIdleTimeout( void )
     // misses it: the thread mouse hook saw it when it was taken (both viewer surfaces are this thread's). If
     // Windows coalesced the excursion into one move back at the starting pixel, the hook tells it from a
     // synthesized move by the system move history (r6 key B1, MoveHistoryMark), shown or hidden (pass 8 A1).
-    // Read the hook first, then whatever input is still queued, untaken (moves and buttons alike); then mark the
-    // history, so the next same-position move is judged against this look.
+    // Read the hook first, then look at whatever input is still queued, untaken (r7 key B1, QueueLook): a queued
+    // button or wheel counts; a queued move counts only if the pointer really moved (Windows synthesizes moves at
+    // an unchanged position). The look marks the history BEFORE it reads the queue (opus H1), with the one read
+    // that judged it, so the next same-position move is judged against this look.
     if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
-    if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
-    viewer_idle::win_hook::markHistory();
+    if( viewer_idle::win_hook::lookAtQueue() ) in.pointerMoved = true;
     // r6 pass 9 A1: no hook (SetWindowsHookExW failed) means no witness for deferred input: a gate, never hide.
     in.witnessMissing = !viewer_idle::win_hook::installed();
 #endif

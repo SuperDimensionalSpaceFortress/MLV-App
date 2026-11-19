@@ -251,9 +251,14 @@ inline bool operator==( const HistoryPoint &a, const HistoryPoint &b )
  * those newer points is at another position than the move. If the marked copy no longer lines up anywhere
  * (more new points than the history holds), any point at another position counts.
  *
+ * r7 (key B1, opus H1): the tick's mark is also its look at the queue (QueueLook): ONE history read is judged
+ * against the previous mark and then becomes the new mark, and the queue status is read after it. The hook runs
+ * only inside this thread's message retrieval, and the tick retrieves nothing between its witness read, that
+ * history read and the status read, so an excursion is judged against the previous mark (already taken: by the
+ * hook; still queued: by the tick) or is newer than the new one; none falls between them.
+ *
  * Non-promises: an unmarked history (no point at the cursor position, or the read failed) never counts, so the
- * r5 position rule stands until the next mark; and an excursion completed in the instant between a tick's read
- * of the witness and its mark is part of the marked copy, so it is not seen until the next real move. */
+ * r5 position rule stands until the next mark. */
 class MoveHistoryMark
 {
 public:
@@ -301,6 +306,40 @@ private:
     HistoryPoint m_points[kMaxPoints];
     int m_count = 0;
 };
+
+/*! \brief PLAYER-CURSOR-AUTOHIDE-1 r7 (key B1): one idle tick's look at the mouse input still on the GUI thread's
+ *         queue, the input the hook has not seen yet (on Windows GetQueueStatus HIWORD, read without removing it).
+ *
+ * Windows synthesizes a WM_MOUSEMOVE at an unchanged position (a window shown or hidden under the cursor, a
+ * cursor change, activation), so "a move is queued" alone is not movement (round 1: same position is not
+ * activity). Queued moves are coalesced into one, made at retrieval with the newest position, so the queued
+ * message says nothing about where the pointer went in between; the pointer's own record does.
+ *
+ * Grammar: a queued button or wheel message is activity. A queued move is activity iff the cursor (physical
+ * pixels, the hook's coordinates) is not where it was at the last look, or the system move history has a point at
+ * another position newer than the last look's mark (a coalesced away-and-back still on the queue). A queued move
+ * whose cursor or last look cannot be read counts (unknown never strands a hidden cursor). Nothing queued is not
+ * activity. So a synthesized same-position move leaves a hidden cursor hidden and the idle clock untouched. */
+struct QueueLook
+{
+    bool buttonQueued = false;   // a button or wheel message is still queued (QS_MOUSEBUTTON)
+    bool moveQueued = false;     // a move is still queued (QS_MOUSEMOVE)
+    bool haveCursor = false;     // the cursor position was read at this look
+    QPoint cursor;
+    bool haveLastLook = false;   // the cursor position was read at the last look (install or the last tick)
+    QPoint lastLook;
+    bool leftSinceMark = false;  // MoveHistoryMark::leftSinceMark of this look's history against the last mark
+};
+
+/*! \brief The QueueLook grammar: true iff the queued mouse input is activity. */
+inline bool queuedMouseIsActivity( const QueueLook &q )
+{
+    if( q.buttonQueued ) return true;
+    if( !q.moveQueued ) return false;
+    if( !q.haveCursor || !q.haveLastLook ) return true;
+    if( q.cursor != q.lastLook ) return true;
+    return q.leftSinceMark;
+}
 
 /*! \brief What the caller does when its single-shot idle timer fires. For Hide, Show and Rearm the caller
  *         also restarts the timer for *rearmMs; None (not fullscreen) leaves it stopped. */

@@ -786,6 +786,170 @@ TEST(ViewerIdlePolicy, CoalescedExcursionWhileShownRestartsTheIdlePeriod)
     viewer_idle::win_hook::historyReader() = saved;
     viewer_idle::win_hook::remove();
 }
+
+namespace
+{
+QPoint g_cursor(500, 500);
+DWORD g_queueStatus = 0;
+bool scriptedCursor(QPoint *at)
+{
+    *at = g_cursor;
+    return true;
+}
+DWORD scriptedQueueStatus(UINT flags)
+{
+    return g_queueStatus & ((DWORD(flags) << 16) | flags);
+}
+// The b03e08c5 tick's queue fallback and mark (the r7 RED control): any queued mouse input counts.
+bool b03e08c5QueueFallback()
+{
+    const bool moved = (HIWORD(viewer_idle::win_hook::queueStatusReader()(QS_MOUSE)) & QS_MOUSE) != 0;
+    viewer_idle::win_hook::markHistory();
+    return moved;
+}
+} // namespace
+
+// P15 (r7, key B1, the sol r6 catalogue row): the QueueLook grammar. A queued button or wheel counts; a queued move
+// counts iff the cursor is not where it was at the last look, or the history has a point elsewhere newer than the last
+// mark; unknown counts; nothing queued does not.
+TEST(ViewerIdlePolicy, QueueLookCountsAQueuedMoveOnlyWhenThePointerReallyMoved)
+{
+    viewer_idle::QueueLook q;
+    ASSERT_FALSE(viewer_idle::queuedMouseIsActivity(q));   // nothing queued
+    q.buttonQueued = true;
+    ASSERT_TRUE(viewer_idle::queuedMouseIsActivity(q));    // a button or wheel
+    q.buttonQueued = false;
+    q.moveQueued = true;
+    ASSERT_TRUE(viewer_idle::queuedMouseIsActivity(q));    // a move, cursor unknown
+    q.haveCursor = true;
+    q.cursor = QPoint(500, 500);
+    ASSERT_TRUE(viewer_idle::queuedMouseIsActivity(q));    // a move, no last look
+    q.haveLastLook = true;
+    q.lastLook = QPoint(500, 500);
+    ASSERT_FALSE(viewer_idle::queuedMouseIsActivity(q));   // the row: a synthesized move at the sampled position
+    q.leftSinceMark = true;
+    ASSERT_TRUE(viewer_idle::queuedMouseIsActivity(q));    // a coalesced away-and-back still queued
+    q.leftSinceMark = false;
+    q.cursor = QPoint(510, 500);
+    ASSERT_TRUE(viewer_idle::queuedMouseIsActivity(q));    // the control: a move at another point
+    q.cursor = QPoint(500, 500);
+    q.buttonQueued = true;
+    ASSERT_TRUE(viewer_idle::queuedMouseIsActivity(q));    // a button behind a synthesized move
+}
+
+// P16 (r7, key B1, the sol r6 repro): hidden at 2000 ms, sample and retrieved position (500,500), unchanged history,
+// empty witness. A nonactivating window visibility change makes Windows synthesize a move at (500,500) that is still
+// queued during the 2050 ms tick: GetQueueStatus(QS_MOUSE) = 0x00020002. The r7 tick stays hidden; the b03e08c5 tick
+// (RED control) shows. Shown variant: the same queued move at 1950 does not reset the idle clock (hides at 2000).
+// Control: the queued move with the cursor at (510,500) shows. H1: an away-and-back completed before the tick's mark
+// whose coalesced move is still queued is judged against the previous mark and shows.
+TEST(ViewerIdlePolicy, QueuedSynthesizedSamePositionMoveLeavesTheCursorHiddenAndTheIdleClockAlone)
+{
+    viewer_idle::win_hook::HistoryReader savedHistory = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::CursorReader savedCursor = viewer_idle::win_hook::cursorReader();
+    viewer_idle::win_hook::QueueStatusReader savedQueue = viewer_idle::win_hook::queueStatusReader();
+    viewer_idle::win_hook::historyReader() = scriptedHistory;
+    viewer_idle::win_hook::cursorReader() = scriptedCursor;
+    viewer_idle::win_hook::queueStatusReader() = scriptedQueueStatus;
+    int rearm = 0;
+
+    // The row, then its RED control (run 0: the r7 tick; run 1: the b03e08c5 tick).
+    for (int run = 0; run < 2; ++run)
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        g_cursor = QPoint(500, 500);
+        g_queueStatus = 0;
+        viewer_idle::PointerWatch sampled;
+        sampled.seed(QPoint(500, 500));
+        viewer_idle::win_hook::witness().seed(QPoint(500, 500));
+        setScript({hp(500, 500, 900), hp(490, 500, 890)});
+        viewer_idle::win_hook::markHistory();   // install()
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+        viewer_idle::win_hook::markHistory();   // the 2000 tick's mark
+
+        g_queueStatus = 0x00020002;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = sampled.moved(QPoint(500, 500));
+        if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
+        if (run == 0 ? viewer_idle::win_hook::lookAtQueue() : b03e08c5QueueFallback()) in.pointerMoved = true;
+        const viewer_idle::Tick tick = c.onTimeout(in, 2050, 2000, &rearm, 50);
+        if (run == 0)
+        {
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(tick));
+            ASSERT_TRUE(c.hidden());
+        }
+        else
+        {
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(tick));   // the defect
+            ASSERT_FALSE(c.hidden());
+        }
+    }
+
+    // Shown: the queued synthesized move at 1950 does not reset the idle clock.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        g_cursor = QPoint(500, 500);
+        g_queueStatus = 0;
+        setScript({hp(500, 500, 900)});
+        viewer_idle::win_hook::markHistory();
+        g_queueStatus = 0x00020002;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = viewer_idle::win_hook::lookAtQueue();
+        ASSERT_FALSE(in.pointerMoved);
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(in, 1950, 2000, &rearm, 50)));
+        in.pointerMoved = viewer_idle::win_hook::lookAtQueue();
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(in, 2000, 2000, &rearm, 50)));
+    }
+
+    // Control: the queued move with the cursor at another point shows.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        g_cursor = QPoint(500, 500);
+        g_queueStatus = 0;
+        setScript({hp(500, 500, 900)});
+        viewer_idle::win_hook::markHistory();
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+        g_cursor = QPoint(510, 500);
+        setScript({hp(510, 500, 2010), hp(500, 500, 900)});
+        g_queueStatus = 0x00020002;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = viewer_idle::win_hook::lookAtQueue();
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 2050, 2000, &rearm, 50)));
+    }
+
+    // H1: hidden, marked at 2000; away to (510,500) and back before the 2050 tick's mark, the coalesced move still
+    // queued. The one read is judged against the 2000 mark: it shows. A button still queued shows as well.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        g_cursor = QPoint(500, 500);
+        g_queueStatus = 0;
+        setScript({hp(500, 500, 900)});
+        viewer_idle::win_hook::markHistory();
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 2000, 2000, &rearm, 50)));
+        setScript({hp(500, 500, 2040), hp(510, 500, 2020), hp(500, 500, 900)});
+        g_queueStatus = 0x00020002;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = viewer_idle::win_hook::lookAtQueue();
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 2050, 2000, &rearm, 50)));
+        // That read is the new mark: the same queued move at the next tick is not movement again.
+        ASSERT_FALSE(viewer_idle::win_hook::lookAtQueue());
+        g_queueStatus = 0x00040004;   // QS_MOUSEBUTTON
+        ASSERT_TRUE(viewer_idle::win_hook::lookAtQueue());
+    }
+
+    g_queueStatus = 0;
+    viewer_idle::win_hook::historyReader() = savedHistory;
+    viewer_idle::win_hook::cursorReader() = savedCursor;
+    viewer_idle::win_hook::queueStatusReader() = savedQueue;
+    viewer_idle::win_hook::remove();
+    // The real readers run: nothing is queued on this console thread, so the look is not activity.
+    ASSERT_FALSE(viewer_idle::win_hook::lookAtQueue());
+    viewer_idle::win_hook::remove();
+}
 #endif
 
 // P14 (r6, adversary pass 9 A1): the Windows hook failed to install (SetWindowsHookExW returned NULL), so input an
