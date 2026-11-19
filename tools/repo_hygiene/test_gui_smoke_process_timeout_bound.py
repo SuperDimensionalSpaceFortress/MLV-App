@@ -553,6 +553,7 @@ $env:GS_LOG = Join-Path $logRoot 'mlvapp-1.log'
 $startTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
 $s = New-Stub $env:GS_STUB
 $process = $s.p; $stdoutTask = $s.o; $stderrTask = $s.e
+$exitStamp = New-GuiSmokeExitStamp -Process $process
 . ([scriptblock]::Create($env:GS_DERIVE))
 $hardLimitMs = [int64]$effectiveProcessTimeoutMs
 # r11: GS_PREWAIT lets a stub finish BEFORE the wait region runs, the state a runner that was descheduled between its remaining-time read and its wait sees
@@ -1020,6 +1021,84 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
             self.assertFalse(out["timedOut"], "sample_ms=%d: an app that exited inside its budget is not a timeout" % sample_ms)
             self.assertEqual("exited", out["outcome"])
             self.assertEqual(0, out["exitCode"])
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TheExitIsDatedOnTheMonotonicClockByTheExitCallback(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r12 (adversary f1811e78 A1, major, introduced): with a LATE observation the monotonic time since launch only
+    brackets the exit, so a stepped wall clock was indistinguishable from an honest one: a real 2000 ms life behind a -1500 ms step read 500 ms (inside a
+    1000 ms budget, reported as a clean exit) and a real 700 ms life behind a +500 ms step read 1200 ms (a timeout). Class: an exit time inferred from
+    readings that move (a wall clock, the observer's own delay) where the exit itself can be stamped on the monotonic clock."""
+
+    def test_the_classifier_trusts_the_monotonic_exit_lifetime_over_every_wall_or_observation_reading(self) -> None:
+        out = run_ps(r"""
+function V($budget, $wall, $since, $mono) { [bool](Test-GuiSmokeLifetimeExceedsBudget -BudgetMs $budget -WallLifetimeMs $wall -SinceLaunchMs $since -MonotonicLifetimeMs $mono) }
+[pscustomobject]@{
+    lateLookRealLifeOverBudgetWallSaysInside = V 1000 500 2200 2000     # the adversary's case 1: a -1500 ms step
+    lateLookRealLifeInsideBudgetWallSaysOver = V 1000 1200 2200 700     # the adversary's case 2: a +500 ms step
+    monotonicOnlyInside = V 1000 $null 2200 999
+    monotonicOnlyOver = V 1000 $null 2200 1001
+    unstampedKeepsTheWallFallback = [bool](Test-GuiSmokeLifetimeExceedsBudget -BudgetMs 1000 -WallLifetimeMs 1100 -SinceLaunchMs 1200)
+} | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["lateLookRealLifeOverBudgetWallSaysInside"], "a 2000 ms life against a 1000 ms budget was read as 500 ms and passed")
+        self.assertFalse(out["lateLookRealLifeInsideBudgetWallSaysOver"], "a 700 ms life was read as 1200 ms and became a timeout")
+        self.assertFalse(out["monotonicOnlyInside"])
+        self.assertTrue(out["monotonicOnlyOver"])
+        self.assertTrue(out["unstampedKeepsTheWallFallback"])
+
+    def test_the_exit_callback_stamps_the_exit_when_it_happens_not_when_the_runner_looks(self) -> None:
+        # the stub lives ~1 s; the runner "stalls" 2.5 s before it looks, so the time since launch is far past a 1500 ms budget while the exit was inside it
+        out = run_ps(r"""
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
+$s = New-Stub 'Start-Sleep -Milliseconds 600; exit 3'
+$stamp = New-GuiSmokeExitStamp -Process $s.p
+[void]$s.p.WaitForExit(30000)
+[System.Threading.Thread]::Sleep(2500)
+$life = Get-GuiSmokeExitStampLifetimeMs -ExitStamp $stamp -LaunchTimestamp $launch
+$e = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 1500 -LaunchTimestamp $launch -ExitStamp $stamp
+$late = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 100 -LaunchTimestamp $launch -ExitStamp $stamp
+[pscustomobject]@{ stamped = ($null -ne $stamp); life = $life; insideBudget = [bool]$e; overBudget = [bool]$late } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["stamped"], "the exit stamp could not be attached")
+        self.assertLess(out["life"], 2000, "the stamp followed the runner's late look (%s ms) instead of the exit" % out["life"])
+        self.assertGreater(out["life"], 100)
+        self.assertFalse(out["insideBudget"], "an app that exited inside the budget is judged by its exit, not by the late look")
+        self.assertTrue(out["overBudget"], "an app that outlived a 100 ms budget is a timeout")
+
+    def test_a_late_look_at_an_in_budget_exit_keeps_the_native_exit_through_the_boundary(self) -> None:
+        out = run_ps(r"""
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
+$s = New-Stub 'exit 7'
+$stamp = New-GuiSmokeExitStamp -Process $s.p
+[void]$s.p.WaitForExit(30000)
+[System.Threading.Thread]::Sleep(1500)
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 1200 -LifetimeBudgetMs 1200 -LaunchTimestamp $launch -ExitStamp $stamp
+[pscustomobject]@{ timedOut = $r.timedOut; outcome = $r.outcome; exitCode = $r.exitCode } | ConvertTo-Json -Compress
+""")
+        self.assertFalse(out["timedOut"], "the look came 1.5 s after launch, past a 1.2 s budget, but the app exited inside it")
+        self.assertEqual("exited", out["outcome"])
+        self.assertEqual(7, out["exitCode"])
+
+    def test_a_missing_stamp_is_never_an_error(self) -> None:
+        out = run_ps(r"""
+$none = Get-GuiSmokeExitStampLifetimeMs -ExitStamp $null -LaunchTimestamp 5
+$unset = Get-GuiSmokeExitStampLifetimeMs -ExitStamp ([pscustomobject]@{ Timestamp = 0 }) -LaunchTimestamp 5 -GraceMs 20
+[pscustomobject]@{ none = ($null -eq $none); unset = ($null -eq $unset) } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["none"])
+        self.assertTrue(out["unset"], "a callback that has not run falls back to the wall-clock reasoning after a bounded grace")
+
+    def test_the_runner_attaches_the_stamp_right_after_the_launch_and_hands_it_to_every_judgement(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        launch = source.index("$process = [System.Diagnostics.Process]::Start($startInfo)")
+        attach = source.index("$exitStamp = New-GuiSmokeExitStamp -Process $process")
+        self.assertLess(launch, attach)
+        self.assertLess(attach, source.index("$stdoutTask = $process.StandardOutput.ReadToEndAsync()"), "attached before anything else can delay the callback registration")
+        wait = _runner_snippet(*_WAIT_REGION)
+        self.assertEqual(2, wait.count("-LaunchTimestamp $startTimestamp -ExitStamp $exitStamp"), "both inline checks")
+        call = wait[wait.index("$processBoundary = Wait-GuiSmokeProcessBounded"):]
+        self.assertIn("-ExitStamp $exitStamp", call)
 
 
 if __name__ == "__main__":
