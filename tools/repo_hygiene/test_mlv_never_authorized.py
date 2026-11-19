@@ -8023,6 +8023,9 @@ def _derive_claim_carriers(root=REPO_ROOT):
 _CLAIM_CARRIERS_PINNED = (
     # DUAL-VENUE-EVIDENCE-1 r2: the dual-venue runner and its doc name a consented clip id.  Read: none asserts the
     # exclusivity claim (the needle below ran clean over each); they describe the per-venue consent gate.
+    # EXPORT-DEBAYER-QUALITY-1 r1: the debayer quality doc and the hub rule table say no consented clip has a measured non-dual-ISO class yet.
+    # Read: neither asserts the exclusivity claim (the needle below runs clean over both); they name the open clip-class card.
+    "docs/debayer-quality-legs.md",
     "docs/dual-venue-evidence.md",
     "docs/never-authorized.json",
     "tools/gates/resolve_consented_clip.py",
@@ -8042,6 +8045,7 @@ _CLAIM_CARRIERS_PINNED = (
     # New-VenueSheetPair.ps1 does.  Read: it asserts no exclusivity claim (the needle below runs clean over it).
     "tools/profiling/dual-venue/New-VenueFlavorPair.ps1",
     "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
+    "tools/profiling/dual-venue/debayer_rule_table.py",
     "tools/profiling/dual-venue/leg-spec.schema.json",
     "tools/repo_hygiene/test_attr3_footage_presence_job.py",
     "tools/repo_hygiene/test_dual_venue_evidence.py",

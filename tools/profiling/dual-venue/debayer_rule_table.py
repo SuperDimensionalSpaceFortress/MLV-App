@@ -1,6 +1,6 @@
 """EXPORT-DEBAYER-QUALITY-1: the debayer rule table, built HUB-SIDE and OFFLINE from published dual-venue export receipts only.
 
-Inputs are receipt JSON files (Invoke-VenueLeg.ps1, legType "export" with export.quality). Each receipt's evidence directory holds the
+Inputs are dual-venue export receipt JSON files (legType "export" with export.quality), as the leg runner writes them. Each receipt's evidence directory holds the
 hashed files the venue published (export/quality.json, export/stage-timing.log, export/summary.json); every one is re-hashed against
 receipt.export.files before it is read. No capture, frame or footage is ever an input (they never leave the venue).
 
