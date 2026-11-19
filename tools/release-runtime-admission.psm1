@@ -52,11 +52,13 @@ function Stop-PinnedPayloadChild {
     return [pscustomobject][ordered]@{ exited = $exited; killError = $killError; confirmed = ($exited -and -not $killError) }
 }
 
-# Puts back every original a killed extractor left in a transaction folder it created (extract_vendored_native_payload.py
-# _publish_staged_transaction moves each existing destination into .vendored-payload-transaction-*\<name> before it installs the
-# replacement). Only folders NOT in -Preexisting are touched. Moves only, never a delete: the backup replaces whatever now sits at
+# Puts back every original a killed extractor left in ITS transaction folder (extract_vendored_native_payload.py
+# _publish_staged_transaction moves each existing destination into .vendored-payload-transaction-<TransactionId>\<name> before it
+# installs the replacement). Only that exact folder, named by the caller's --transaction-id, is touched: another install sharing
+# the output folder keeps its own (adversary 78d626ed-A1). Moves only, never a delete: the backup replaces whatever now sits at
 # the destination (all-or-nothing, as the Python rollback does), and the emptied folder is left for the failed build to report.
-# Never throws; returns { restored, errors }.
+# A folder or file that cannot be listed or moved is an error in the result, never silence (adversary 78d626ed-A3).
+# Never throws; returns { restored, errors, found }.
 function Restore-PinnedPayloadTransaction {
     [CmdletBinding()]
     param(
@@ -64,29 +66,39 @@ function Restore-PinnedPayloadTransaction {
         [ValidateNotNullOrEmpty()]
         [string]$OutputDir,
 
-        [AllowEmptyCollection()]
-        [string[]]$Preexisting = @()
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{32}\z')]
+        [string]$TransactionId
     )
     $restored = @()
     $errors = @()
+    $folder = Join-Path $OutputDir ".vendored-payload-transaction-$TransactionId"
     try {
-        $folders = @(Get-ChildItem -LiteralPath $OutputDir -Force -Directory -Filter '.vendored-payload-transaction-*' -ErrorAction Stop |
-            Where-Object { $Preexisting -notcontains $_.Name -and -not $_.LinkType })
+        $item = Get-Item -LiteralPath $folder -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        # Killed before its transaction began: no original was moved.
+        return [pscustomobject][ordered]@{ restored = @(); errors = @(); found = $false }
     } catch {
-        return [pscustomobject][ordered]@{ restored = @(); errors = @("the output folder could not be listed: $($_.Exception.Message)") }
+        return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder could not be read: $($_.Exception.Message)"); found = $true }
     }
-    foreach ($folder in $folders) {
-        foreach ($backup in @(Get-ChildItem -LiteralPath $folder.FullName -Force -File -ErrorAction SilentlyContinue)) {
-            if ($backup.LinkType) { $errors += "$($backup.FullName) is a link; not restored"; continue }
-            try {
-                [System.IO.File]::Move($backup.FullName, (Join-Path $OutputDir $backup.Name), $true)
-                $restored += $backup.Name
-            } catch {
-                $errors += "$($backup.Name): $($_.Exception.Message)"
-            }
+    if (-not $item.PSIsContainer -or $item.LinkType) {
+        return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder is not a plain folder; nothing restored"); found = $true }
+    }
+    try {
+        $backups = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction Stop)
+    } catch {
+        return [pscustomobject][ordered]@{ restored = @(); errors = @("$folder could not be listed: $($_.Exception.Message)"); found = $true }
+    }
+    foreach ($backup in $backups) {
+        if ($backup.PSIsContainer -or $backup.LinkType) { $errors += "$($backup.FullName) is not a plain file; not restored"; continue }
+        try {
+            [System.IO.File]::Move($backup.FullName, (Join-Path $OutputDir $backup.Name), $true)
+            $restored += $backup.Name
+        } catch {
+            $errors += "$($backup.Name): $($_.Exception.Message)"
         }
     }
-    return [pscustomobject][ordered]@{ restored = $restored; errors = $errors }
+    return [pscustomobject][ordered]@{ restored = $restored; errors = $errors; found = $true }
 }
 
 function Install-PinnedVendoredPayload {
@@ -181,7 +193,10 @@ function Invoke-PinnedPayloadInstall {
     # drop the working directory from sys.path and with it the tools package.
     # --record-only (adversary ae560106-A2): validate the named record alone. The full manifest validation walks every
     # tracked file and opens a prefix of each, owner clip fixtures included; the hosted workflows keep that full check.
-    foreach ($argument in @('-3', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $OutputDir, '--record-only', '--verify-installed')) {
+    # --transaction-id (adversary 78d626ed-A1): this child's publication transaction folder is named by this call, so a timeout
+    # recovery below restores exactly this child's originals and never another install's sharing the folder.
+    $transactionId = [guid]::NewGuid().ToString('N')
+    foreach ($argument in @('-3', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $OutputDir, '--transaction-id', $transactionId, '--record-only', '--verify-installed')) {
         [void]$psi.ArgumentList.Add([string]$argument)
     }
     $psi.WorkingDirectory = $RepoRoot
@@ -200,9 +215,6 @@ function Invoke-PinnedPayloadInstall {
         if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }
     }
 
-    # The extractor's own transaction folders already in OutputDir before this child starts; only a NEW one is this child's
-    # (adversary f92303b7-A1, reconciled below after a confirmed timeout kill).
-    $preexistingTransactions = @(Get-ChildItem -LiteralPath $OutputDir -Force -Directory -Filter '.vendored-payload-transaction-*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
     try {
         $process = [System.Diagnostics.Process]::Start($psi)
     } catch {
@@ -237,7 +249,7 @@ function Invoke-PinnedPayloadInstall {
         # the replacement bypasses the Python rollback and leaves the destination missing. Once the kill is CONFIRMED (no child can
         # still move files) the originals are put back; with an unconfirmed kill nothing is touched, since the child may still run.
         if ($result.killConfirmed) {
-            $restore = Restore-PinnedPayloadTransaction -OutputDir $OutputDir -Preexisting $preexistingTransactions
+            $restore = Restore-PinnedPayloadTransaction -OutputDir $OutputDir -TransactionId $transactionId
             $result.transactionRestored = @($restore.restored)
             $result.reason += "; transaction reconciled: restored [$(@($restore.restored) -join ', ')]$(if (@($restore.errors).Count) { ", errors [$(@($restore.errors) -join '; ')]" })"
         } else {
@@ -321,6 +333,9 @@ function Open-PinnedFileHold {
     $hold = [ordered]@{ ok = $false; reason = ''; bytes = $null; sha256 = ''; stream = $null }
     $stream = $null
     try {
+        # A relative path means the PowerShell location, as it does for the cmdlets that installed and read the file; .NET alone
+        # would resolve it against the process directory (adversary 78d626ed-A2).
+        $Path = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($Path)
         $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
         $hold.bytes = [long]$stream.Length
         $hold.sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
@@ -365,6 +380,8 @@ function Test-PinnedZipMember {
     $zip = $null
     try {
         Add-Type -AssemblyName System.IO.Compression
+        # Relative = the PowerShell location, as for Compress-Archive that wrote it (adversary 78d626ed-A2).
+        $ZipPath = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($ZipPath)
         $stream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
         $check.zipSha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
         $null = $stream.Seek(0, [System.IO.SeekOrigin]::Begin)

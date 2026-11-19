@@ -293,6 +293,8 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertEqual(flat[-1], "--verify-installed")
         # adversary ae560106-A2: the local install validates the named record alone, never the tracked-file census.
         self.assertEqual(flat.count("--record-only"), 1, "the local install must pass --record-only")
+        # adversary 78d626ed-A1: the child is told the transaction folder its timeout recovery will open.
+        self.assertEqual(flat[flat.index("--transaction-id") + 1], "$transactionId")
         self.assertIn("$psi.WorkingDirectory = $RepoRoot", body)
         self.assertIn("$process.WaitForExit($TimeoutSec * 1000)", body)
         stop = text[text.index("function Stop-PinnedPayloadChild {"): text.index(f"function {HELPER} {{")]
@@ -530,16 +532,19 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("could not be read as a zip", result["reason"])
 
-    def _restore(self, out: Path, preexisting: list[str]) -> dict:
+    MINE = "0123456789abcdef0123456789abcdef"
+    OTHER = "fedcba9876543210fedcba9876543210"
+
+    def _restore(self, out: Path, transaction_id: str, prelude: str = "") -> dict:
         module = str(HELPER_MODULE).replace("'", "''")
         script = (
-            f"$m = Import-Module '{module}' -Force -PassThru\n"
-            "$pre = @(ConvertFrom-Json $env:FFX_PRE)\n"
-            "$r = & $m { param($o, $p) Restore-PinnedPayloadTransaction -OutputDir $o -Preexisting $p } $env:FFX_OUT $pre\n"
+            prelude
+            + f"$m = Import-Module '{module}' -Force -PassThru\n"
+            "$r = & $m { param($o, $t) Restore-PinnedPayloadTransaction -OutputDir $o -TransactionId $t } $env:FFX_OUT $env:FFX_TX\n"
             "$r | ConvertTo-Json -Compress\n"
         )
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
-                              timeout=120, env=dict(os.environ, FFX_OUT=str(out), FFX_PRE=json.dumps(preexisting or ["-none-"])))
+                              timeout=120, env=dict(os.environ, FFX_OUT=str(out), FFX_TX=transaction_id))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
 
@@ -547,38 +552,81 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         # adversary f92303b7-A1: the extractor moved the original ffmpeg.exe into its transaction backup and was killed (timeout)
         # before the replacement landed; the Python rollback never ran, so ffmpeg.exe was absent and OLD stayed in the backup.
         out = self.tmp / "out"
-        killed = out / ".vendored-payload-transaction-killed"
-        killed.mkdir(parents=True)
-        (killed / "ffmpeg.exe").write_bytes(b"OLD")
-        older = out / ".vendored-payload-transaction-older"
-        older.mkdir()
-        (older / "x.dll").write_bytes(b"KEEP")
-        result = self._restore(out, [older.name])
+        mine = out / f".vendored-payload-transaction-{self.MINE}"
+        mine.mkdir(parents=True)
+        (mine / "ffmpeg.exe").write_bytes(b"OLD")
+        result = self._restore(out, self.MINE)
         self.assertEqual(result["restored"], ["ffmpeg.exe"], result)
         self.assertEqual(result["errors"], [], result)
         self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"OLD")
-        self.assertEqual(list(killed.iterdir()), [], "the backup must be moved out, not copied")
-        self.assertEqual((older / "x.dll").read_bytes(), b"KEEP", "a transaction folder that predates the child is never touched")
-        self.assertFalse((out / "x.dll").exists())
+        self.assertEqual(list(mine.iterdir()), [], "the backup must be moved out, not copied")
         # killed after the replacement was published but before the backup was cleaned: the original wins (all-or-nothing).
-        killed2 = out / ".vendored-payload-transaction-killed2"
-        killed2.mkdir()
-        (killed2 / "ffmpeg.exe").write_bytes(b"ORIGINAL")
+        (mine / "ffmpeg.exe").write_bytes(b"ORIGINAL")
         (out / "ffmpeg.exe").write_bytes(b"NEW")
-        result = self._restore(out, [older.name, killed.name])
+        result = self._restore(out, self.MINE)
         self.assertEqual(result["restored"], ["ffmpeg.exe"], result)
         self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"ORIGINAL")
-        missing = self._restore(self.tmp / "no-such-dir", [])
-        self.assertEqual(missing["restored"], [])
-        self.assertTrue(missing["errors"], "an unlistable folder is reported, never thrown")
+        # killed before its transaction began: nothing to restore, and that is not an error.
+        none = self._restore(self.tmp / "no-such-dir", self.MINE)
+        self.assertEqual((none["restored"], none["errors"], none["found"]), ([], [], False))
+
+    def test_recovery_never_touches_another_installs_transaction(self) -> None:
+        # adversary 78d626ed-A1: a concurrent install Q sharing the output folder had moved OLD into ITS transaction and published the
+        # pinned file; P's timeout recovery restored Q's backup over Q's file. Recovery now opens only the folder named by its own id.
+        out = self.tmp / "shared"
+        other = out / f".vendored-payload-transaction-{self.OTHER}"
+        other.mkdir(parents=True)
+        (other / "ffmpeg.exe").write_bytes(b"Q-OLD")
+        (out / "ffmpeg.exe").write_bytes(b"Q-PINNED")
+        result = self._restore(out, self.MINE)
+        self.assertEqual((result["restored"], result["errors"], result["found"]), ([], [], False), result)
+        self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"Q-PINNED")
+        self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"Q-OLD")
+
+    def test_a_transaction_that_cannot_be_listed_is_an_error_never_silence(self) -> None:
+        # adversary 78d626ed-A3: a backup listing that failed (ListDirectory denied) was dropped by SilentlyContinue and recovery
+        # said "reconciled" with nothing restored. Get-ChildItem is shadowed by a global function that throws like a denied listing.
+        out = self.tmp / "out"
+        mine = out / f".vendored-payload-transaction-{self.MINE}"
+        mine.mkdir(parents=True)
+        (mine / "ffmpeg.exe").write_bytes(b"OLD")
+        result = self._restore(out, self.MINE, prelude="function global:Get-ChildItem { throw 'simulated ListDirectory access denied' }\n")
+        self.assertEqual(result["restored"], [], result)
+        self.assertTrue(any("simulated ListDirectory access denied" in e for e in result["errors"]), result)
+        self.assertTrue(result["found"])
+        (out / f".vendored-payload-transaction-{self.OTHER}").write_bytes(b"not a folder")
+        result = self._restore(out, self.OTHER)
+        self.assertTrue(result["errors"], "a transaction path that is not a plain folder is reported")
+
+    def test_relative_paths_mean_the_powershell_location(self) -> None:
+        # adversary 78d626ed-A2: build-release -OutRoot '.\artifacts' from another location installed and read back the file through
+        # PowerShell paths while File.Open resolved the same relative path against the process directory, refusing a good file.
+        here = self.tmp / "ps-location"
+        here.mkdir()
+        (here / "ffmpeg.exe").write_bytes(b"pinned")
+        good = self._zip("good.zip", {"ffmpeg.exe": b"pinned"})
+        (here / "good.zip").write_bytes(good.read_bytes())
+        elsewhere = self.tmp / "process-dir"
+        elsewhere.mkdir()
+        result = self._ps(
+            "Set-Location -LiteralPath $env:FFX_HERE\n"
+            "[System.Environment]::CurrentDirectory = $env:FFX_ELSEWHERE\n"
+            "$h = Open-PinnedFileHold -Path '.\\ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes 6\n"
+            "if ($h.stream) { $h.stream.Dispose() }\n"
+            "$z = Test-PinnedZipMember -ZipPath 'good.zip' -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes 6\n"
+            "[ordered]@{ hold = $h.ok; holdReason = $h.reason; zip = $z.ok; zipReason = $z.reason } | ConvertTo-Json -Compress\n",
+            FFX_HERE=str(here), FFX_ELSEWHERE=str(elsewhere), FFX_SHA=hashlib.sha256(b"pinned").hexdigest())
+        self.assertTrue(result["hold"], result)
+        self.assertTrue(result["zip"], result)
 
     def test_the_timeout_branch_reconciles_only_after_a_confirmed_kill(self) -> None:
         text = _normalised(HELPER_MODULE)
         body = text[text.index(f"function {HELPER} {{"):]
-        snapshot = body.index("$preexistingTransactions = @(Get-ChildItem -LiteralPath $OutputDir")
-        self.assertLess(snapshot, body.index("[System.Diagnostics.Process]::Start($psi)"), "the pre-existing folders must be listed before the child starts")
+        self.assertLess(body.index("$transactionId = [guid]::NewGuid().ToString('N')"), body.index("[System.Diagnostics.Process]::Start($psi)"))
+        self.assertIn("'--transaction-id', $transactionId,", body, "the child must be told the transaction folder the recovery opens")
+        self.assertNotIn("preexistingTransactions", body, "recovery is by exact id, never by which folders look new")
         branch = body[body.index("if ($result.timedOut) {"): body.index("if ($result.exitCode -ne 0) {")]
-        self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$restore = Restore-PinnedPayloadTransaction -OutputDir \$OutputDir -Preexisting \$preexistingTransactions\n")
+        self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$restore = Restore-PinnedPayloadTransaction -OutputDir \$OutputDir -TransactionId \$transactionId\n")
         self.assertIn("was NOT reconciled", branch)
         restore = text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
         self.assertNotRegex(restore, r"Remove-Item|::Delete\(", "the reconciliation only moves files back, it never deletes")
@@ -677,6 +725,32 @@ class RecordOnlyInstallTests(unittest.TestCase):
         full.assert_called_once()
         self.assertIn("full validation ran", err.getvalue())
         self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_the_transaction_folder_is_the_one_the_wrapper_names(self) -> None:
+        # adversary 78d626ed-A1: the wrapper's timeout recovery opens .vendored-payload-transaction-<id> only, so the extractor must
+        # publish through exactly that folder, and refuse an id that is not plain hex (no path can be smuggled in).
+        import io
+        from unittest import mock
+        from tools.repo_hygiene import extract_vendored_native_payload as extractor
+        from tools.repo_hygiene.vendored_native_payloads import PayloadIntegrityError
+
+        tx = "0123456789abcdef0123456789abcdef"
+        seen: list[str] = []
+
+        def stop_after_publication(record, output_dir):
+            seen.extend(p.name for p in Path(output_dir).iterdir())
+            raise PayloadIntegrityError("stop after publication")
+
+        with mock.patch.object(extractor, "verify_installed_payload", stop_after_publication), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = extractor.main(self._argv("--record-only", "--transaction-id", tx))
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertIn(f".vendored-payload-transaction-{tx}", seen)
+        self.assertEqual(list(self.out.iterdir()), [], "the rollback restores the folder and removes its transaction")
+        for bad in ("../escape", "0123456789ABCDEF0123456789ABCDEF", "short"):
+            with self.subTest(transaction_id=bad), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertEqual(extractor.main(self._argv("--record-only", "--transaction-id", bad)), 1)
+                self.assertIn("transaction id must be 32 lowercase hex characters", err.getvalue())
 
     def test_record_only_still_refuses_a_record_whose_member_hash_is_wrong(self) -> None:
         import io

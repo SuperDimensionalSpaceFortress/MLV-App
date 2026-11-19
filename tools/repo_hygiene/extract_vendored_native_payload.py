@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -145,11 +146,20 @@ def _publish_staged_transaction(
     output_dir: Path,
     *,
     verify_installed: bool,
+    transaction_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Publish every staged file or restore every original destination."""
+    """Publish every staged file or restore every original destination.
+
+    With ``transaction_id`` the transaction folder is ``.vendored-payload-transaction-<id>``, created exclusively, so a
+    wrapper that kills this process can put back exactly its originals and no other install's (adversary 78d626ed-A1).
+    """
     label = str(record.get("id") or "payload")
     try:
-        transaction_dir = Path(tempfile.mkdtemp(prefix=".vendored-payload-transaction-", dir=output_dir))
+        if transaction_id is None:
+            transaction_dir = Path(tempfile.mkdtemp(prefix=".vendored-payload-transaction-", dir=output_dir))
+        else:
+            transaction_dir = output_dir / f".vendored-payload-transaction-{transaction_id}"
+            transaction_dir.mkdir()
     except OSError as exc:
         raise PayloadIntegrityError(f"{label} cannot create publication transaction: {exc}") from exc
 
@@ -219,6 +229,7 @@ def extract_payload_record(
     *,
     archive_reference: str,
     verify_installed: bool = False,
+    transaction_id: str | None = None,
 ) -> dict[str, Any]:
     """Revalidate, stage, and atomically replace all selected outputs."""
     label = str(record.get("id") or "payload")
@@ -298,6 +309,7 @@ def extract_payload_record(
             record,
             output_dir,
             verify_installed=verify_installed,
+            transaction_id=transaction_id,
         )
     finally:
         for temporary, _, _ in staged:
@@ -324,8 +336,11 @@ def extract_payload(
     archive_reference: str,
     verify_installed: bool = False,
     record_only: bool = False,
+    transaction_id: str | None = None,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
+    _require(transaction_id is None or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is not None,
+             f"transaction id must be 32 lowercase hex characters: {transaction_id!r}")
     if record_only:
         _, record, manifest_sha256 = load_record_only_snapshot(repo_root, manifest_path, payload_id)
     else:
@@ -337,6 +352,7 @@ def extract_payload(
         output_dir,
         archive_reference=archive_reference,
         verify_installed=verify_installed,
+        transaction_id=transaction_id,
     )
     result["manifest_sha256"] = manifest_sha256
     return result
@@ -355,6 +371,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--record-only", action="store_true",
                         help="validate only the named payload record (archive and member bytes, binary identity), "
                              "never the repository-wide tracked-file census; for local packaging installs")
+    parser.add_argument("--transaction-id", default=None,
+                        help="32 lowercase hex characters naming the publication transaction folder, so a wrapper that "
+                             "kills this process can restore exactly its originals")
     args = parser.parse_args(argv)
     try:
         result = extract_payload(
@@ -365,6 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             archive_reference=args.archive_reference,
             verify_installed=args.verify_installed,
             record_only=args.record_only,
+            transaction_id=args.transaction_id,
         )
     except (OSError, PayloadIntegrityError) as exc:
         print(f"vendored native payload extraction: FAIL: {exc}", file=sys.stderr)
