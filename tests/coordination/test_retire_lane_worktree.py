@@ -4693,6 +4693,127 @@ def test_launcher_census_stub_executed_string_interpolates_only_its_own_values()
         assert launch not in command, launch
 
 
+def test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_only_reads_the_log_directory():
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r4 (adversary b0a33ba9 A3), restated for the r5 design: the watchdog's probe is no longer a string run
+    on a runspace (the one AddScript site r4 classified) but a literal -Parallel job, so there is nothing to classify; the probe lists and opens
+    mlvapp-*.log files read-only and launches nothing; the runner never supplies the probe or its test delay."""
+    path = "tools/profiling/gui-smoke-process-boundary.psm1"
+    t = (REPO / path).read_text(encoding="utf-8")
+    assert path not in UNRESOLVED_EXECUTED_SITES, "the module has no executed string: nothing to classify (r4's AddScript entry is gone with the site)"
+    assert t.count(".AddScript(") == 0, "the module gained an executed string: classify it"
+    assert "$script:GuiSmokeLogLengthProbe" not in t, "the string-built probe (r4's here-string) is gone: the probe is a literal scriptblock"
+    assert "[string]$ProbeScript" not in t and "[int]$ProbeDelayMs = 0" in t, "the only seam is the data-only -ProbeDelayMs, never a script"
+    start = t.index("ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {")
+    probe = t[start:t.index("\n        }\n        $Watch.Hung = $false", start)]
+    # (-File is not listed: Get-ChildItem's own -File switch is in the probe; a pwsh -File launch needs pwsh, which is)
+    for launch in ("Start-Process", "-EncodedCommand", "-Command", "Invoke-Expression", "iex", "Create(", "AddScript", "cmd", "pwsh",
+                   "Invoke-Command", "&", "Out-File", "Set-Content", "Remove-Item", "WriteAll", ".Write(", "Delete(", "SetLength",
+                   "FileAccess]::Write", "FileAccess]::ReadWrite", "FileMode]::Create", "FileMode]::Truncate", "FileMode]::Append"):
+        assert launch not in probe, f"the log probe now carries {launch!r}: it must only list and read"
+    assert "Get-ChildItem -LiteralPath $using:probeRoot" in probe and "[System.IO.FileAccess]::Read" in probe
+    runner = (REPO / "tools/profiling/run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+    assert "-ProbeScript" not in runner and "-ProbeDelayMs" not in runner, "the runner must not hand the watchdog a script or a test delay of its own"
+
+
+def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_executed_string():
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r5 (the r4 sibling sweep): the watchdog's probe is a LITERAL ForEach-Object -Parallel scriptblock
+    run as a one-thread background job, not a string built at run time, so no census (this one, the AttrCuda closure scan, the pinned
+    dual-venue baseline generator's closure scan) sees an executed-string site in the module. One assert per property."""
+    path = "tools/profiling/gui-smoke-process-boundary.psm1"
+    t = (REPO / path).read_text(encoding="utf-8")
+    code = "\n".join(line for line in t.splitlines() if not line.lstrip().startswith("#"))
+    # (1) no executed-string site, and none of the shapes the closure census flags in every closure file
+    flagged = [s for s in (".AddScript(", ".AddCommand(", ".InvokeScript(", ".NewScriptBlock(", "[scriptblock]::", "[System.Management.Automation.PowerShell]",
+                           "Invoke-Expression", "Start-ThreadJob", "Start-Job", "Invoke-Command", "Add-Type", "Start-Process", "Import-Module")
+               if s in code]
+    assert not flagged and not re.search(r"(?i)\biex\b", code), f"the module carries executed-string shapes {flagged}: it must stay a literal scriptblock"
+    # (2) the probe is a literal -Parallel scriptblock, one thread, as a job
+    start = code.index("ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {")
+    probe = code[start:code.index("\n        }\n", start)]
+    assert code.count("-Parallel {") == 1 and "-ThrottleLimit 1 -AsJob" in probe.splitlines()[0], "one literal -Parallel scriptblock, -ThrottleLimit 1, -AsJob"
+    # (3) the scriptblock reads only under the log root it is handed
+    body = probe.split("\n", 1)[1]
+    writers = [v for v in ("Start-Process", "-EncodedCommand", "-Command", "Out-File", "Set-Content", "Add-Content", "Remove-Item", "Move-Item",
+                           "Copy-Item", "New-Item", "Clear-Content", "Rename-Item", "pwsh", "&",
+                           # r5 (adversary 9fdf9e1a A3): a .NET write the cmdlet names above do not cover
+                           "WriteAll", ".Write(", "Delete(", "SetLength", "FileAccess]::Write", "FileAccess]::ReadWrite", "FileMode]::Create",
+                           "FileMode]::Truncate", "FileMode]::Append", "FileMode]::OpenOrCreate") if v in body]
+    assert not writers and "Get-ChildItem -LiteralPath $using:probeRoot" in body and "[System.IO.FileAccess]::Read" in body, f"the probe must only list and read: {writers}"
+    # (3b) r5 fix 2 (adversary 1b823896 A3): a positive allowlist, so a write shape no blacklist names is refused too: the only .NET file call is
+    # Open, and the only commands are the listing, the pipeline stage and the test-seam sleep
+    assert re.findall(r"\[System\.IO\.File\]::(\w+)", body) == ["Open"] and set(re.findall(r"\b[A-Z][a-z]+-[A-Z]\w+", body)) <= {"Get-ChildItem", "ForEach-Object", "Start-Sleep"}, "the probe may only list, open for reading and sleep"
+    # (4) the wait is $job.Finished.WaitOne(ms) bounded by the absolute end (entry stopwatch + budget)
+    assert "$Watch.Pending.Finished.WaitOne($waitMs)" in code and "[Math]::Min([int]$Watch.ProbeWaitMs, $leftMs)" in code, "the wait is Finished.WaitOne bounded by what is left"
+    # (5) completion receives the job's output then removes the job
+    done = code[code.index("$Watch.Pending.Finished.WaitOne($waitMs)"):]
+    assert 0 <= done.index("Receive-Job -Job $Watch.Pending") < done.index("Remove-Job -Job $Watch.Pending"), "Receive-Job, then Remove-Job"
+    # (6) Stop-GuiSmokeLogProgressWatch asks a pending job to stop and never waits on it
+    stop = code[code.index("function Stop-GuiSmokeLogProgressWatch"):code.index("function Test-GuiSmokeLogProgressStalled")]
+    assert "$Watch.Pending.StopJobAsync()" in stop and "WaitOne" not in stop and "Wait-Job" not in stop, "stop is StopJobAsync, never a wait"
+    # (7) a hung probe is waited on once: the wait is 0 ms once it has outrun its wait
+    assert "$waitMs = if ($Watch.Hung) { 0 } else" in code and "$Watch.Hung = $true" in code, "a hung probe is only looked at, never re-waited past the budget"
+
+
+def _gui_smoke_log_probe_purity_problems(body: str) -> list:
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 H1): the .NET surface a read-only log probe may touch, as a positive allowlist over the probe
+    body: the types it may name, the members it may call, and no writer/stream constructor. Returns the problems (empty = pure)."""
+    problems = []
+    types = set(re.findall(r"\[([A-Za-z][\w.]*)\]", body))
+    allowed_types = {"int64", "System.IO.File", "System.IO.FileMode", "System.IO.FileAccess", "System.IO.FileShare"}
+    problems += [f"type [{t}]" for t in sorted(types - allowed_types)]
+    members = set(re.findall(r"\.([A-Za-z]\w*)\(", body)) | set(re.findall(r"::(\w+)\(", body))
+    problems += [f"member call .{m}(" for m in sorted(members - {"Open", "Dispose"})]
+    # a writer or stream built any way at all (constructor, ::new, New-Object, a type accelerator) is refused by name too
+    for shape in ("StreamWriter", "FileStream", "BinaryWriter", "TextWriter", "StringWriter", "WriteLine", "Flush", "::new", "New-Object", "CopyTo", "WriteByte"):
+        if shape in body:
+            problems.append(f"shape {shape}")
+    # r6 (adversary 2d33c39f A2): a computed member name, [System.IO.File]::('Write'+'AllText')(...) or $o.$name(...), is invisible to the member allowlist
+    if re.search(r"(?:::|\.)\s*[(\$'\"]", body):
+        problems.append("computed member access")
+    # r8 (sol r6 hardening): a property assignment ($file.IsReadOnly = $true, $file.LastWriteTimeUtc = ..., += too) writes through a member with no call at all
+    if re.search(r"[\w\]\)}](?:\.\w+|::\w+)+\s*(?:[-+*/%]?=(?!=)|\+\+|--)|(?:\+\+|--)\s*[\$(\[][\w\]\).:$]*(?:\.\w+|::\w+)", body):
+        problems.append("property assignment")
+    return problems
+
+
+def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_write_mutations():
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 H1): an in-memory [IO.StreamWriter]::new(...) + WriteLine survived both r5 purity guards. The
+    shipped probe passes the type/member allowlist; each writer mutation, inserted into the probe's own foreach, is refused. ADDITIVE: the r4/r5
+    purity tests above are unchanged."""
+    t = (REPO / "tools/profiling/gui-smoke-process-boundary.psm1").read_text(encoding="utf-8")
+    code = "\n".join(line for line in t.splitlines() if not line.lstrip().startswith("#"))
+    start = code.index("ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {")
+    body = code[start:code.index("\n        }\n", start)].split("\n", 1)[1]
+    assert _gui_smoke_log_probe_purity_problems(body) == [], "the shipped probe must be pure"
+    anchor = "                $length = [int64]-1\n"
+    assert anchor in body
+    mutations = {
+        "streamwriter accelerator": "$sink = [IO.StreamWriter]::new($file.FullName, $true); $sink.WriteLine('x'); $sink.Dispose()\n",
+        "streamwriter full name": "$sink = [System.IO.StreamWriter]::new($file.FullName, $true); $sink.WriteLine('x'); $sink.Dispose()\n",
+        "streamwriter new-object": "$sink = New-Object System.IO.StreamWriter($file.FullName); $sink.Write('x'); $sink.Dispose()\n",
+        "filestream append": "$sink = [System.IO.FileStream]::new($file.FullName, [System.IO.FileMode]::Append); $sink.Dispose()\n",
+        "file create text": "$sink = [System.IO.File]::CreateText($file.FullName); $sink.Dispose()\n",
+        "opened stream written": "$stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open); $stream.WriteByte(1); $stream.Dispose()\n",
+        "in memory writer": "$sink = [IO.StringWriter]::new(); $sink.WriteLine('x')\n",
+        "computed static member": "[System.IO.File]::('Write'+'AllText')($file.FullName, 'overwritten')\n",
+        "computed instance member": "$name = 'Write'; $stream.$name([byte[]]@(1), 0, 1)\n",
+        # r8 (sol r6 hardening, adversary A1): a property assignment mutates a listed file with no call, no type and no constructor at all
+        "property assignment read-only flag": "$file.IsReadOnly = $true\n",
+        "property assignment last write time": "$file.LastWriteTimeUtc = '2020-01-01T00:00:00Z'\n",
+        "compound property assignment": "$file.Attributes += 'Hidden'\n",
+        "nested property assignment": "$file.Directory.Attributes = 'Hidden'\n",
+        "parenthesised property assignment": "($file).IsReadOnly = $true\n",
+        "static property assignment": "[System.IO.File]::Foo = 1\n",
+        # r16 (sol r15 / fable key3 r15 hardening, adversary A3): an increment or decrement writes through a member with no '=' at all
+        "postfix property increment": "$file.Attributes++\n",
+        "prefix property increment": "++$file.Attributes\n",
+        "postfix property decrement": "$file.Attributes--\n",
+    }
+    for label, injected in mutations.items():
+        mutated = body.replace(anchor, anchor + injected, 1)
+        assert _gui_smoke_log_probe_purity_problems(mutated), f"the purity guard let a writer mutation through: {label}"
+
+
 # --- LANE-RETIRE-LAUNCH-SITE-CENSUS-1 / LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census classifies launch SITES, not files.
 # These fixtures run against synthetic source text through the same seam the real census uses (_encoded_sites, _detached_sites,
 # _census_problems), so a site the census cannot see fails here without anyone adding a real launcher script to the repo.
