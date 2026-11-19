@@ -3888,6 +3888,14 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     $spH1Alive = $false; if ($script:spH1Pid -gt 0) { try { $spP = [Diagnostics.Process]::GetProcessById($script:spH1Pid); if ($spP.StartTime -eq $script:spH1Start) { $spH1Alive = -not $spP.HasExited; if ($spH1Alive) { $spP.Kill($true) } } } catch { } }
     Assert-That ($spH1Thrown -eq '' -and $pr.Authenticated -eq $false -and $pr.Detail -match 'failed after ssh started' -and $script:spH1Pid -gt 0 -and -not $spH1Alive) 'SSH-PUSHURL-1 r4 H1 probe: a failure after ssh started is a failed verdict (no throw) and the ssh child is terminated' "thrown=$spH1Thrown detail=$($pr.Detail) pid=$($script:spH1Pid) alive=$spH1Alive"
 
+    # r8 (sol r7 on e9ef745c) B1 (class: an unbounded wait on a redirected pipe): the ssh wrapper exits (answering "authenticated") but a descendant it started keeps the redirected stdout/
+    # stderr handles open, so the pipes do not reach EOF. The read of the output must be bounded too: a typed 'output' verdict well inside the descendant's lifetime, not a wait for its end.
+    [IO.File]::WriteAllText((Join-Path $spDir 'ssh-leaky.cmd'), "@echo off`r`nstart `"`" /b ping.exe -n 12 127.0.0.1`r`necho Hi tester! You've successfully authenticated, but GitHub does not provide shell access. 1>&2`r`nexit /b 1`r`n")
+    $swLeak = [Diagnostics.Stopwatch]::StartNew()
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-leaky.cmd') -TimeoutSec 1 -KeyFile $spKey
+    $swLeak.Stop()
+    Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'output' -and $pr.Detail -notmatch 'PROBE_CONFIG_NOT_DELETED' -and $swLeak.Elapsed.TotalSeconds -lt 8) 'SSH-PUSHURL-1 r8 B1 probe: a wrapper that exits while a descendant holds the output pipes open -> a typed output-timeout verdict (not authenticated) well before the descendant ends, config removed' "$($pr.Detail) after $([int]$swLeak.Elapsed.TotalSeconds) s"
+
     # r4 (adversary pass 8 on d30b74ba) A2: a junction re-pointed between the temp-folder check and the write, or between the ssh run and the cleanup
     $spA2 = New-Scratch 'sp-r4a2'
     $spA2Plain = Join-Path $spA2 'plain'; $spA2Other = Join-Path $spA2 'other'; $spA2Ssh = Join-Path $spA2 'u\.ssh'; $spA2Link = Join-Path $spA2 'tmplink'

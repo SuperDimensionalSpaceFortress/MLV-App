@@ -1376,8 +1376,15 @@ function Invoke-GitHubSshProbe {
                 if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
                     $verdict = @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
                 } else {
+                    # r8 B1 (class: an unbounded wait on a redirected pipe): the client has exited, but a descendant it started (a wrapper's background command) can keep the redirected
+                    # stdout/stderr handles open, so the pipes never reach EOF and a bare .Result would wait for that descendant. The output is collected under its own bound; a pipe that
+                    # stays open is a typed failed verdict, and the config cleanup below still runs.
                     $proc.WaitForExit()
-                    $verdict = Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)")
+                    if (-not [Threading.Tasks.Task]::WaitAll(@($outTask, $errTask), 3000)) {
+                        $verdict = @{ Authenticated = $false; Detail = 'ssh exited but its output stayed open for more than 3 s (a process it started still holds the output pipes); the probe result is not used' }
+                    } else {
+                        $verdict = Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)")
+                    }
                 }
             } catch {
                 $verdict = @{ Authenticated = $false; Detail = "the ssh probe failed after ssh started ($($_.Exception.Message))" }
