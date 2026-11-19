@@ -1222,6 +1222,20 @@ def _c_strip(text: str) -> str:
     return "".join(out)
 
 
+def _c_splice(text: str) -> str:
+    """C text with every backslash-newline spliced (translation phase 2), the line count kept: a spliced logical line is followed by as many empty lines as it absorbed."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        cur, extra = lines[i], 0
+        while cur.rstrip("\r").endswith("\\") and i + 1 < len(lines):
+            i += 1
+            cur, extra = cur.rstrip("\r")[:-1] + lines[i], extra + 1
+        out.append(cur)
+        out.extend([""] * extra)
+        i += 1
+    return "\n".join(out)
+
+
 def _match_close(s: str, i: int, open_c: str, close_c: str) -> int:
     """The index just past the bracket that closes s[i] (s[i] == open_c)."""
     depth = 0
@@ -1257,8 +1271,8 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
     global (or of the worker's local accumulator) from `(<now or end> - <start>)`; its window is <start's last assignment line>..<the accrual line>. A write of one timer from
     another (`g_shared += g_refine`) is a CONTAINS relation. Returns the reachable live function line spans, the windows per row, the contains relations, the call lines
     per function, and any accrual write the derivation could not read (each one is a failure: a site the guard cannot see is not a site it vouches for)."""
-    dng = _c_strip(dng_text)
-    llr = _c_strip(llr_text)
+    dng = _c_strip(_c_splice(dng_text))
+    llr = _c_strip(_c_splice(llr_text))
     line_of = lambda s, off: s.count("\n", 0, off) + 1   # noqa: E731
     entries = sorted(set(re.findall(r"\b(applyLLRawProcObject\w*)\s*\(", dng)))
     funcs = _c_functions(llr)
@@ -1304,11 +1318,22 @@ def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
     unread: list = []
     targets = {f"g_llrawproc_last_{t}_ms": f"llrawproc_{t}" for t in LLRP_TIMERS}
     targets.update({f"{t}_ms": f"llrawproc_{t}" for t in LLRP_LOCAL_ACCUMULATORS})
-    target_re = re.compile(r"(?<![\w.>])(" + "|".join(sorted(map(re.escape, targets), key=len, reverse=True)) + r")\s*(\+=|=)(?!=)\s*([^;]*)")
-    for idx, text in enumerate(lines):
+    alt = "|".join(sorted(map(re.escape, targets), key=len, reverse=True))
+    target_re = re.compile(r"(?<![\w.>])(" + alt + r")\s*(\+=|=)(?!=)\s*([^;]*)")
+    # (adversary r1 A2: any OTHER write of a timer -- -=, *=, /=, ++, -- -- is a site this derivation does not read, so it is reported, never skipped)
+    other_write_re = re.compile(r"(?<![\w.>])(" + alt + r")\s*(-=|\*=|/=|\+\+|--)|(\+\+|--)\s*(" + alt + r")(?!\w)")
+    for idx, raw in enumerate(lines):
         ln = idx + 1
         if not live(ln):
             continue
+        text = raw
+        while True:   # (adversary r1 A2: `(g_x) = v` is `g_x = v`: unwrap a parenthesized identifier that is not a call's or a subscript's argument list)
+            unwrapped = re.sub(r"(?<![\w)\]])\(\s*([A-Za-z_]\w*)\s*\)", r" \1 ", text)
+            if unwrapped == text:
+                break
+            text = unwrapped
+        if other_write_re.search(text):
+            unread.append(f"llrawproc.c:{ln}: {text.strip()}")
         for m in target_re.finditer(text):
             row, rhs = targets[m.group(1)], m.group(3).strip()
             if re.fullmatch(r"0(\.0*)?", rhs) or rhs in targets and targets[rhs] == row:
@@ -1354,7 +1379,12 @@ def table_vs_export_problems(table: list, derived: dict) -> list:
         for inner in derived["contains"].get(name, ()):   # (a timer that accumulates another one accrues in that one's windows too: shared_lock += refine / publish)
             own |= set(derived["windows"].get(inner, ()))
         for w, (a, z) in zip(wins, spans):
-            if any(sa <= z and a <= sz for sa, sz in own):
+            held = [(sa, sz) for sa, sz in own if sa <= z and a <= sz]
+            if held:
+                # (adversary r1 A1: the window is EXACTLY the hull of the accrual windows it holds, so a widened row -- dual_iso as the whole worker -- is refused)
+                lo, hi = min(sa for sa, _ in held), max(sz for _, sz in held)
+                if (lo, hi) != (a, z):
+                    problems.append(f"{name}: window {w} is not the hull llrawproc.c:{lo}-{hi} of the export-reachable accrual windows it holds")
                 continue
             # (a callee's lines count when every one of its live call sites is inside the row's other windows: the table's header rule)
             owners = [f for f in derived["reachable"] if f != "applyLLRawProcObjectWorker" and any(fa <= a and z <= fz for fa, fz in derived["funcLines"].get(f, []))]
@@ -1481,14 +1511,24 @@ class CdngStageContainmentGateTests(unittest.TestCase):
                                   "& (Get-Module DualVenueRunner) { @($script:ExportCdngStageWindowTable) } | ConvertTo-Json -Compress -Depth 6 -AsArray")
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(table_vs_export_problems(got, derived), [])
-        # (negative control: the base's pre_dualiso_fix row, and a scaled-path window on any row, are refused)
-        for name, extra in (("llrawproc_pre_dualiso_fix", ["llrawproc.c:5014-5463", "llrawproc.c:6606-7076"]), ("llrawproc_dual_iso", ["llrawproc.c:6890-6954"])):
-            with self.subTest(mutant=name):
+        # (negative control: the base's pre_dualiso_fix row, and a scaled-path window on any row, are refused; adversary r1 A1: so is a row widened to the whole worker)
+        for name, extra, replace in (("llrawproc_pre_dualiso_fix", ["llrawproc.c:5014-5463", "llrawproc.c:6606-7076"], False),
+                                     ("llrawproc_dual_iso", ["llrawproc.c:6890-6954"], False), ("llrawproc_dual_iso", ["llrawproc.c:5014-6329"], True)):
+            with self.subTest(mutant=name, extra=extra):
                 mutant = json.loads(json.dumps(got))
                 for r in mutant:
                     if r["name"] == name:
-                        r["windows"] = list(dict.fromkeys(list(r.get("windows") or []) + extra))
+                        r["windows"] = extra if replace else list(dict.fromkeys(list(r.get("windows") or []) + extra))
                 self.assertTrue(any(p.startswith(f"{name}: window") for p in table_vs_export_problems(mutant, derived)), name)
+        # (adversary r1 A2: a timer write the derivation cannot read is reported, whatever its C spelling: a parenthesized lvalue, a backslash-newline inside the name, another operator)
+        llr = LLRAWPROC_C.read_text(encoding="utf-8", errors="replace")
+        anchor = "applyLLRawProcObjectWorker(video, raw_image_buff, raw_image_size, NULL, 0);"
+        self.assertEqual(llr.count(anchor), 1)
+        for spelling in ("(g_llrawproc_last_pre_dualiso_fix_ms) = 80.0;", "g_llrawproc_last_pre_dual\\\niso_fix_ms = 80.0;", "g_llrawproc_last_pre_dualiso_fix_ms -= 1.0;",
+                         "++g_llrawproc_last_dual_iso_ms;"):
+            with self.subTest(spelling=spelling):
+                mutated = derive_export_timer_windows(DNG_C.read_text(encoding="utf-8", errors="replace"), llr.replace(anchor, anchor + " " + spelling))
+                self.assertTrue(mutated["unread"] or "llrawproc_pre_dualiso_fix" in mutated["windows"], spelling)
 
 
 @requires_windows_pwsh
