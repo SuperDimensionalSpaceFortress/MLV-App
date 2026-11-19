@@ -886,6 +886,19 @@ function Resolve-TaskAgentPid {
     # strength of the current one. The census is taken TWICE around the start reads, and the instance and the child must be the same
     # processes (pid and OS start) both times (INSTANCE_CHANGED): a pid reused between the listing and the read is not the child.
     # agentStart is the OS start of the child as read here; the callers hold the heartbeat pid to it exactly.
+    # A read that THROWS (Process.StartTime of a process that exited after it was listed, or any other read of a process) is never an
+    # answer: the whole resolve is the typed refusal INSTANCE_CHANGED (Resolve-TaskAgentPidReads does the reads), so the binding refuses
+    # and the replacement poll is unconfirmed (DEPLOY_RESTART_FAILED at its deadline), never an unhandled DEPLOY_ERROR.
+    param($InstancePids, [bool]$Wrapped, [string]$AgentScript = '')
+    try { return (Resolve-TaskAgentPidReads -InstancePids $InstancePids -Wrapped $Wrapped -AgentScript $AgentScript) }
+    catch {
+        return [pscustomobject]@{ ok = $false; agentPid = 0; instancePid = 0; instanceStart = $null; agentStart = $null
+            why = "INSTANCE_CHANGED a process of the running instance of task $TaskName exited or could not be read while it was read, so it is not confirmed: $($_.Exception.Message)" }
+    }
+}
+
+function Resolve-TaskAgentPidReads {
+    # The reads of Resolve-TaskAgentPid (see there); it may throw, and only Resolve-TaskAgentPid calls it.
     param($InstancePids, [bool]$Wrapped, [string]$AgentScript = '')
     $no = { param($why) [pscustomobject]@{ ok = $false; agentPid = 0; instancePid = 0; instanceStart = $null; agentStart = $null; why = $why } }
     $p = @($InstancePids)
@@ -1090,9 +1103,11 @@ function Stop-TaskInstanceByPid {
     #   'not-stopped'  Stop() was never called: no instance with that pid and start, the venue was busy (busy = the refusal lines), or the
     #                  scheduler failed BEFORE the call
     #   'unknown'      Stop() was called and raised: whether it was applied is not known, so the caller re-observes the pid
-    # With -ChildPid (a wrapped task: $ProcessId is the wrapper instance, the agent is its proved PowerShell child) the child must still be
-    # the proved process (pid AND its OS start $ChildStartText) before Stop(), and after Stop() it is ended by that pid too: stopping the
-    # wrapper need not end its child, and the child is the agent that holds the single-instance mutex. A child that is already gone is fine.
+    # With -ChildPid (a wrapped task: $ProcessId is the wrapper instance, the agent is its proved PowerShell child) the child's proved OS
+    # start $ChildStartText must be given, but the child itself is NOT checked before Stop(): a child that is already gone (or whose pid
+    # another process now holds) does not block stopping the wrapper. After Stop() the child is ended only if the process under its pid
+    # is STILL the proved child (pid AND OS start, read through the one handle Kill() then uses): stopping the wrapper need not end its
+    # child, and the child is the agent that holds the single-instance mutex. Anything else under that pid is left alone.
     param([int]$ProcessId, [string]$StartText, [int]$ChildPid = 0, [string]$ChildStartText = '')
     $notStopped = { param($why, $busy = $null) [pscustomobject]@{ outcome = 'not-stopped'; why = $why; busy = $busy } }
     $isProved = { param($proc, $text) [Math]::Abs(($proc.StartTime.ToUniversalTime() - (ConvertTo-UtcStart -Text $text)).TotalMilliseconds) -le $script:OsStartToleranceMs }
@@ -1128,7 +1143,9 @@ function Stop-TaskInstanceByPid {
         # the wrapper instance is stopped; end its agent child by the proved pid and start (a pid reused since is another process)
         try {
             $child = Get-LiveProcess -ProcessId $ChildPid
-            if ($null -ne $child -and (& $isProved $child $ChildStartText)) { $child.Kill() }
+            # the handle is opened FIRST and kept by the Process object: the start check and Kill() then act on that one handle, and
+            # an open handle keeps the pid from being reused in between (two separate opens by pid could reach two processes)
+            if ($null -ne $child -and $null -ne $child.Handle -and (& $isProved $child $ChildStartText)) { $child.Kill() }
         }
         catch { return [pscustomobject]@{ outcome = 'unknown'; why = "the wrapper instance was stopped, but ending its agent child pid=$ChildPid raised: $($_.Exception.Message)"; busy = $null } }
     }
@@ -1290,9 +1307,11 @@ function Invoke-AgentRestart {
     if ($run.timedOut) { return @{ why = "schtasks /Run $TaskName did not return within 30 s"; warn = $warn } }
     if ($run.exitCode -ne 0) { return @{ why = "schtasks /Run $TaskName exited $($run.exitCode)"; warn = $warn } }
     # the replacement is the task's own new instance (not just a process that wrote a heartbeat) or, wrapped, the single PowerShell child
-    # of a NEW wrapper instance, and it runs this script and root (Test-ReplacementIsTaskAgent)
+    # of a NEW wrapper instance, and it runs this script and root (Test-ReplacementIsTaskAgent). A poll whose read throws (a process
+    # that exits while it is read) is UNCONFIRMED, never confirmation and never a throw out of Wait-Until: the restart then ends
+    # DEPLOY_RESTART_FAILED at the deadline, not DEPLOY_ERROR (which says a write failed before the swap finished)
     $up = Wait-Until -TimeoutSec 60 -Variables @{ before = $before; AgentScript = $AgentScript; runAt = $runAt; wrapped = [bool]$nowBind.wrapped } -Condition {
-        Test-ReplacementIsTaskAgent -Before $before -AgentScript $AgentScript -RunAt $runAt -Wrapped $wrapped
+        try { Test-ReplacementIsTaskAgent -Before $before -AgentScript $AgentScript -RunAt $runAt -Wrapped $wrapped } catch { $false }
     } -PollMs 1000
     if (-not $up) { return @{ why = 'no heartbeat from a new LIVE agent process within 60 s of schtasks /Run'; warn = $warn } }
     if (Test-ClockStepped -Utc0 $clockUtc0 -Watch $clockWatch) {

@@ -1967,6 +1967,171 @@ class DeployBachelorAgent(unittest.TestCase):
         # the child named as the instance: it has no PowerShell child of its own
         self.assertEqual(check("child-as-instance", self.task_pids(kids[0], name="wrap-repl-child"), -1, True), "child-as-instance=False")
 
+    # ---- r2 (sol r1 B1, fable r1 blocker, key3 hardening on ff974f72): a process that exits while it is read ----
+    # RED on ff974f72f4a2b9a6b59b6e0f7e60c78b5685f636: Resolve-TaskAgentPid read Process.StartTime outside any try, the replacement poll
+    # called it unguarded, Wait-Until rethrew and the deploy ended DEPLOY_ERROR exit 15 instead of DEPLOY_RESTART_FAILED exit 14.
+
+    # Get-LiveProcess whose N-th call (counted in $script:LiveN) returns the live process with a StartTime getter that throws, as
+    # .NET's does for a process that exited after it was listed; $script:ThrowAt = 0 throws nowhere.
+    LIVE_THROW_PS = (
+        "$realLive = ${function:Get-LiveProcess}; $script:LiveN = 0; $script:ThrowAt = 0;"
+        "function Get-LiveProcess { param([int]$ProcessId) $script:LiveN++; $p = & $realLive -ProcessId $ProcessId;"
+        "  if ($null -ne $p -and $script:LiveN -eq $script:ThrowAt) { $o = [pscustomobject]@{ Id = $p.Id };"
+        "    Add-Member -InputObject $o -MemberType ScriptProperty -Name StartTime -Value { throw [System.InvalidOperationException]::new('No process is associated with this object.') };"
+        "    return $o };"
+        "  $p };"
+    )
+    OLD_BEAT_PS = "[pscustomobject]@{pid=999999;start='2026-11-19T00:00:00.0000000Z'}"
+
+    def _dot_source_pids(self, pids_file: Path, body: str, xml_file: Path | None = None):
+        xml = " -TaskXmlFile '%s'" % psq(xml_file) if xml_file is not None else ""
+        cmd = ". '%s' -VenueRoot '%s' -TaskPidsFile '%s'%s; %s" % (psq(SCRIPT), psq(self.venue), psq(pids_file), xml, body)
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=240, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line), r
+
+    def test_wrap_a_start_read_that_throws_in_the_replacement_poll_is_an_unconfirmed_poll(self) -> None:
+        # sol r1 B1: task instance W (the wrapper), its one pwsh child C wrote a fresh heartbeat; C (or W) exits between Get-LiveProcess
+        # and its first StartTime read. Every process read of the poll is made to throw in turn: each poll is False, never a throw.
+        wpid, kids = self.wrapped_agent(1)
+        self.write_beat(kids[0], self.start_of(kids[0]))
+        agent = psq(self.venue / AGENT_NAME)
+        poll = "(Test-ReplacementIsTaskAgent -Before %s -AgentScript '%s' -RunAt $ra -Wrapped $true)" % (self.OLD_BEAT_PS, agent)
+        body = self.LIVE_THROW_PS + (
+            "$ra = (Get-Process -Id %d).StartTime.ToUniversalTime().AddSeconds(-1);"
+            "$script:LiveN = 0; $script:ThrowAt = 0; 'steady=' + %s; $calls = $script:LiveN; 'calls=' + $calls;"
+            "for ($k = 1; $k -le $calls; $k++) { $script:LiveN = 0; $script:ThrowAt = $k;"
+            "  try { 'poll' + $k + '=' + %s } catch { 'poll' + $k + '=THREW ' + $_.Exception.Message } };"
+            "$script:LiveN = 0; $script:ThrowAt = 0; $m = Resolve-TaskAgentPid -InstancePids @(%d) -Wrapped $true -AgentScript '%s'; $rc = $script:LiveN;"
+            "'resolveCalls=' + $rc;"
+            "for ($k = 1; $k -le $rc; $k++) { $script:LiveN = 0; $script:ThrowAt = $k;"
+            "  try { $m = Resolve-TaskAgentPid -InstancePids @(%d) -Wrapped $true -AgentScript '%s'; 'resolve' + $k + '=' + $m.ok + ' ' + $m.why }"
+            "  catch { 'resolve' + $k + '=THREW ' + $_.Exception.Message } };"
+            "$script:LiveN = 0; $script:ThrowAt = 1;"
+            "try { $u = Resolve-TaskAgentPid -InstancePids @(%d) -Wrapped $false -AgentScript '%s'; 'unwrapped=' + $u.ok + ' ' + $u.why }"
+            "catch { 'unwrapped=THREW ' + $_.Exception.Message }"
+        ) % (wpid, poll, poll, wpid, agent, wpid, agent, wpid, agent)
+        vals, r = self._dot_source_pids(self.task_pids(wpid, name="wrap-throw"), body)
+        self.assertEqual(vals.get("steady"), "True", r.stdout + r.stderr)
+        calls = int(vals.get("calls", "0"))
+        self.assertGreaterEqual(calls, 6, vals)   # the wrapper, the child twice, both re-reads, and the poll's own re-read
+        for k in range(1, calls + 1):
+            self.assertEqual(vals.get("poll%d" % k), "False", ("a process read that throws is an unconfirmed poll", k, vals))
+        rc = int(vals.get("resolveCalls", "0"))
+        self.assertEqual(rc, 5, vals)
+        for k in range(1, rc + 1):
+            self.assertTrue(vals.get("resolve%d" % k, "").startswith("False INSTANCE_CHANGED "), (k, vals))
+        self.assertTrue(vals.get("unwrapped", "").startswith("False INSTANCE_CHANGED "), vals)
+
+    def _wrapped_restart(self, label: str, child_start_throws: bool) -> dict:
+        """Invoke-AgentRestart on a wrapped task up to the REAL replacement wait: the binding, the stop, the two waits before /Run and
+        /Run itself are stand-ins; the replacement Wait-Until is the script's own (its condition runs in its own runspace, bound by
+        -Variables). The stand-in wrapper W and its pwsh child C are the new instance; /Run is placed 1 s before W started. With
+        child_start_throws the runspace's Get-LiveProcess hands back C with a StartTime getter that throws (C exiting mid-read)."""
+        wpid, kids = self.wrapped_agent(1)
+        self.write_beat(kids[0], self.start_of(kids[0]))
+        agent = psq(self.venue / AGENT_NAME)
+        shim_line = ""
+        if child_start_throws:
+            shim = Path(self._tmp.name) / ("wrap-restart-shim-%s.ps1" % label)
+            shim.write_text(
+                "param($VenueRoot, $TaskName, $TaskXmlFile, $TaskPidsFile)\n"
+                ". '%s' -VenueRoot $VenueRoot -TaskName $TaskName -TaskXmlFile $TaskXmlFile -TaskPidsFile $TaskPidsFile\n"
+                "$shimLive = ${function:Get-LiveProcess}\n"
+                "function Get-LiveProcess { param([int]$ProcessId) $p = & $shimLive -ProcessId $ProcessId\n"
+                "  if ($null -ne $p -and $ProcessId -eq %d) { $o = [pscustomobject]@{ Id = $p.Id }\n"
+                "    Add-Member -InputObject $o -MemberType ScriptProperty -Name StartTime -Value { throw [System.InvalidOperationException]::new('No process is associated with this object.') }\n"
+                "    return $o }\n"
+                "  $p }\n" % (psq(SCRIPT), kids[0]), encoding="utf-8")
+            shim_line = "$script:SelfPath = '%s';" % psq(shim)
+        body = shim_line + (
+            "$script:WU = 0; $realWU = ${function:Wait-Until};"
+            "function Wait-Until { param([int]$TimeoutSec, [scriptblock]$Condition, [int]$PollMs = 500, [hashtable]$Variables = @{})"
+            "  $script:WU++; if ($script:WU -lt 3) { return $true }"
+            "  & $realWU -TimeoutSec $TimeoutSec -Condition $Condition -PollMs $PollMs -Variables $Variables };"
+            "$b = [pscustomobject]@{pid=999999;host=$env:COMPUTERNAME;start='2026-11-19T00:00:00.0000000Z';osStart='2026-11-19T00:00:00.0000000Z';"
+            "  agentScript='%s';ageSec=1;wrapped=$true;instancePid=999998;instanceOsStart='2026-11-19T00:00:00.0000000Z'};"
+            "function Get-RestartBindingRefusal { param($AgentScript) $script:BoundBeat = $b; return $null };"
+            "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText, [int]$ChildPid = 0, [string]$ChildStartText = '')"
+            "  [pscustomobject]@{ outcome = 'stopped'; why = $null; busy = $null } };"
+            "$ra = (Get-Process -Id %d).StartTime.ToUniversalTime().AddSeconds(-1);"
+            "function Get-RunLowerBound { param($Utc0, $Watch) $ra };"
+            "function Invoke-BoundedProcess { param([string]$FilePath, [string[]]$Arguments = @(), [int]$TimeoutSec = 30)"
+            "  [pscustomobject]@{ timedOut = $false; exitCode = 0; output = ''; errorText = '' } };"
+            "try { $r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why; 'waits=' + $script:WU } catch { 'threw=' + $_.Exception.Message }"
+        ) % (agent, wpid, agent)
+        vals, _ = self._dot_source_pids(self.task_pids(wpid, name="wrap-restart-%s" % label), body, self._venue_xml_file("restart-%s" % label))
+        return vals
+
+    def test_wrap_the_restart_confirms_a_wrapped_replacement_through_its_wait_until_binding(self) -> None:
+        # key3 DEPLOY-WRAPPED-RESTART-WAITUNTIL-BINDING-TEST-1: the replacement condition gets `wrapped` from Invoke-AgentRestart's
+        # -Variables; a renamed key leaves $wrapped null, the poll reads the instance unwrapped and the restart is never confirmed
+        vals = self._wrapped_restart("confirm", False)
+        self.assertNotIn("threw", vals, vals)
+        self.assertEqual((vals.get("why"), vals.get("waits")), ("", "3"), vals)
+
+    def test_wrap_a_start_read_that_throws_in_the_restart_wait_is_restart_failed_not_deploy_error(self) -> None:
+        # sol r1 B1 end to end through Wait-Until's runspace: the child's StartTime getter throws on every poll; the restart ends with
+        # the typed restart-failure reason (DEPLOY_RESTART_FAILED, exit 14) at the 60 s deadline, never a throw (DEPLOY_ERROR, exit 15)
+        vals = self._wrapped_restart("throws", True)
+        self.assertNotIn("threw", vals, vals)
+        self.assertEqual(vals.get("why"), "no heartbeat from a new LIVE agent process within 60 s of schtasks /Run", vals)
+
+    def test_wrap_the_second_census_rereads_both_starts(self) -> None:
+        # fable BACHELOR-DEPLOY-WRAPPER-BINDING-TEST-PINS-1 (:936): after the second census the wrapper or the child reads with another
+        # OS start (the pid now names another process) while the child is still the one listed: INSTANCE_CHANGED, never a binding
+        wpid, kids = self.wrapped_agent(1)
+        body = (
+            "$script:Census = 0; $realKids = ${function:Get-ChildProcesses}; $realLive = ${function:Get-LiveProcess}; $script:ShiftPid = 0;"
+            "function Get-ChildProcesses { param([int]$ProcessId) $script:Census++; & $realKids -ProcessId $ProcessId };"
+            "function Get-LiveProcess { param([int]$ProcessId) $p = & $realLive -ProcessId $ProcessId;"
+            "  if ($null -ne $p -and $script:Census -ge 2 -and $ProcessId -eq $script:ShiftPid) { return [pscustomobject]@{ Id = $p.Id; StartTime = $p.StartTime.AddSeconds(1) } };"
+            "  $p };"
+            "foreach ($c in @(@('none', 0), @('wrapper', %d), @('child', %d))) { $script:Census = 0; $script:ShiftPid = $c[1];"
+            "  $m = Resolve-TaskAgentPid -InstancePids @(%d) -Wrapped $true -AgentScript '%s'; $c[0] + '=' + $m.ok + ' ' + $m.why }"
+        ) % (wpid, kids[0], wpid, psq(self.venue / AGENT_NAME))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        vals = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        self.assertEqual(vals.get("none", "").strip(), "True", vals)
+        self.assertTrue(vals.get("wrapper", "").startswith("False INSTANCE_CHANGED "), vals)
+        self.assertTrue(vals.get("child", "").startswith("False INSTANCE_CHANGED "), vals)
+
+    def test_wrap_the_replacement_poll_rechecks_the_child_start(self) -> None:
+        # fable TEST-PINS-1 (:985-992): the heartbeat pid reads, at the poll's last read, with another OS start than the child the
+        # census read (a reuse after the census): not confirmed
+        wpid, kids = self.wrapped_agent(1)
+        self.write_beat(kids[0], self.start_of(kids[0]))
+        poll = "(Test-ReplacementIsTaskAgent -Before %s -AgentScript '%s' -RunAt $ra -Wrapped $true)" % (self.OLD_BEAT_PS, psq(self.venue / AGENT_NAME))
+        body = (
+            "$realLive = ${function:Get-LiveProcess}; $script:LiveN = 0; $script:ShiftAt = 0;"
+            "function Get-LiveProcess { param([int]$ProcessId) $script:LiveN++; $p = & $realLive -ProcessId $ProcessId;"
+            "  if ($null -ne $p -and $script:LiveN -eq $script:ShiftAt) { return [pscustomobject]@{ Id = $p.Id; StartTime = $p.StartTime.AddSeconds(1) } };"
+            "  $p };"
+            "$ra = (Get-Process -Id %d).StartTime.ToUniversalTime().AddSeconds(-1);"
+            "$script:LiveN = 0; 'steady=' + %s; $n = $script:LiveN;"
+            "$script:LiveN = 0; $script:ShiftAt = $n; 'lastShifted=' + %s"
+        ) % (wpid, poll, poll)
+        vals, r = self._dot_source_pids(self.task_pids(wpid, name="wrap-recheck"), body)
+        self.assertEqual((vals.get("steady"), vals.get("lastShifted")), ("True", "False"), r.stdout + r.stderr)
+
+    def test_wrap_the_binding_holds_the_census_child_to_the_os_start_it_read(self) -> None:
+        # fable TEST-PINS-1 (:1199-1207): the census child has the heartbeat pid but another OS start than the one the binding read for
+        # that pid (osStart): INSTANCE_CHANGED, never bound
+        wpid, kids = self.wrapped_agent(1)
+        self.write_beat(kids[0], self.start_of(kids[0]))
+        body = (
+            "$realB = ${function:Resolve-TaskAgentPidBounded}; $script:Shift = 0;"
+            "function Resolve-TaskAgentPidBounded { param($InstancePids, [bool]$Wrapped, [string]$AgentScript = '')"
+            "  $m = & $realB -InstancePids $InstancePids -Wrapped $Wrapped -AgentScript $AgentScript;"
+            "  if ($m.ok -and $script:Shift -ne 0) { $m.agentStart = [datetime]::Parse([string]$m.agentStart, $null, 'RoundtripKind').AddSeconds($script:Shift).ToString('o') };"
+            "  $m };"
+            "foreach ($s in @(0, 1)) { $script:Shift = $s; $x = Get-RestartBindingRefusal -AgentScript '%s'; 'shift' + $s + '=' + ($null -eq $x) + ' ' + $x }"
+        ) % psq(self.venue / AGENT_NAME)
+        vals, r = self._dot_source_pids(self.task_pids(wpid, name="wrap-osstart"), body, self._venue_xml_file("osstart"))
+        self.assertEqual(vals.get("shift0", "").strip(), "True", r.stdout + r.stderr)
+        self.assertTrue(vals.get("shift1", "").startswith("False INSTANCE_CHANGED heartbeat pid=%d " % kids[0]), vals)
+
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.
         r = subprocess.run(
