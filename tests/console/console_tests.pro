@@ -68,6 +68,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_fullscreen_ui_wiring.cpp \
     $$REPO_ROOT/tests/console/test_gpu_window_viewer_input.cpp \
     $$REPO_ROOT/tests/console/test_gpu_window_viewer_input_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_double_click_policy.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_double_click_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
     $$REPO_ROOT/tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp \
     $$REPO_ROOT/tests/console/test_llrawproc_residual_telemetry_wiring.cpp \
@@ -143,6 +145,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/DualIsoLevelSyncPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFrameRange.h \
     $$REPO_ROOT/platform/qt/GpuWindowViewerInput.h \
+    $$REPO_ROOT/platform/qt/ViewerDoubleClickPolicy.h \
     $$REPO_ROOT/platform/qt/OutputDirIdentity.h \
     $$REPO_ROOT/platform/qt/AutomationSettings.h \
     $$REPO_ROOT/platform/qt/HubHostPlaybackGuard.h \

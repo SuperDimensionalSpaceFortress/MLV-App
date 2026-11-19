@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import ast
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -408,8 +410,10 @@ throw "fake um-run: unexpected job $JobId"
 # share's outbox (admission.leaseBatch on the current lease, or another one when the call index is in FAKE_LEG_LOSE), a receipt and its summary.json
 # (pre-load FAKE_LEG_PRELOADS), and DVE_OUTCOME from FAKE_LEG_OUTCOMES. Each call is logged with UTC ticks and its -LeaseBatch.
 FAKE_LEG = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ReceiptRoot = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ReceiptRoot = '', [string]$ExpectSpecSha256 = '')
 $share = $env:FAKE_SHARE
+# r19 (sol r18 B1): FAKE_LEG_SPEC_SHA records the -ExpectSpecSha256 each call was given beside the sha256 of the spec bytes it would run
+if ($env:FAKE_LEG_SPEC_SHA) { Add-Content -LiteralPath $env:FAKE_LEG_SPEC_SHA -Value ("expect={0} read={1}" -f $ExpectSpecSha256, (Get-FileHash -LiteralPath $LegSpec -Algorithm SHA256).Hash.ToLowerInvariant()) }
 # LEASE-BATCH-RECEIPT-ROOT-1: one line per call saying whether -ReceiptRoot was passed at all (absent and empty are different: the batch must forward NOTHING when it has none)
 Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'leg-receiptroot.log') -Value ("bound={0} root={1}" -f $PSBoundParameters.ContainsKey('ReceiptRoot'), $ReceiptRoot)
 $st = Get-Content -LiteralPath (Join-Path $share 'fake-agent-state.json') -Raw | ConvertFrom-Json
@@ -3439,7 +3443,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
 
 # LEASE-BATCH-MULTI-BUILD-1: a wrapper around fake-leg.ps1 that records the build, backend and spec each leg was called with, then runs the fake leg unchanged.
 FAKE_LEG_ARGS = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ExpectSpecSha256 = '')
 Add-Content -LiteralPath $env:FAKE_LEG_ARGS -Value (([ordered]@{ leaf = [IO.Path]::GetFileNameWithoutExtension($LegSpec); sourceCommit = $SourceCommit; buildManifestSha256 = $BuildManifestSha256; backend = $Backend; leaseBatch = $LeaseBatch }) | ConvertTo-Json -Compress)
 & (Join-Path $PSScriptRoot 'fake-leg.ps1') @PSBoundParameters
 exit $LASTEXITCODE
@@ -5665,6 +5669,406 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
                 self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r8_export_a_window_the_agent_job_cap_refuses_is_refused_before_the_claim_in_every_mode(self) -> None:
+        # EXPORT-VENUE-LEG-1 r8 (adversary r7 A3): maxFrames=20000 on the shipped 3.4 GB ProRes leg is a job the agent refuses (submitted timeout past 86400 s), but only the
+        # generator Invoke-VenueLeg runs AFTER the lease opened said so. The batch now asks the export generator's -PreflightBudgetOnly mode in its preflight; -ExportBudgetScript
+        # is the offline seam (a stand-in that refuses past 19000 frames, as the real budget does for that clip), and is refused with the real um-run.ps1.
+        fake = self.case / "fake-export-budget.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        shipped = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+
+        def spec_with(frames: int) -> Path:
+            doc = json.loads(json.dumps(shipped))
+            doc["export"]["maxFrames"] = frames
+            p = self.case / f"export-{frames}.json"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            return p
+        over = spec_with(20000)
+        for p in (self.events, self.claim_path):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([over], "-ExportBudgetScript", str(fake))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE EXPORT_TIME_BUDGET_EXCEEDED", r.stderr)
+        self.assertIn("DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        # the plan form: the whole plan is refused at the item, with nothing submitted
+        plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(over, "B", self.commit_a)])
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        r = self.run_plan(plan, "-ExportBudgetScript", str(fake))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=EXPORT_TIME_BUDGET_EXCEEDED item=2 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        # a window inside the cap is not refused by this check (it may go on to run, which is not this test's concern)
+        ok = spec_with(480)
+        for p in (self.events, self.claim_path):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([ok], "-ExportBudgetScript", str(fake))
+        self.assertNotIn("EXPORT_TIME_BUDGET_EXCEEDED", r.stdout + r.stderr, r.stdout + r.stderr)
+
+    def test_r8_export_the_budget_seam_is_refused_with_the_real_um_run(self) -> None:
+        # a production run can never swap the budget check out: with the real um-run.ps1 the seam is a usage error
+        fake = self.case / "fake-export-budget-real.ps1"
+        fake.write_text("[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        for p in (self.events, self.claim_path):
+            p.unlink(missing_ok=True)
+        spec = self.case / "plain.json"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        args, e = self.batch_cmd([spec], "-ExportBudgetScript", str(fake))
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-ExportBudgetScript is an offline test seam", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    def test_r18_export_a_spec_read_failure_in_the_budget_preflight_is_refused_before_the_claim_in_every_mode(self) -> None:
+        # EXPORT-VENUE-LEG-1 r18 (sol r17 B1 = EXPORT-VENUE-LEG-1-OPEN-18-2 = adversary pass18 A2): Get-ExportBudgetRefusal caught a failed read of the spec and returned two empty
+        # strings, which every caller (-LegPlan, -LegSet, -LegSpec) read as "no refusal". The shape check's own read had succeeded, so an over-cap window (here 20000 frames, which the
+        # stand-in refuses past 19000 as the real budget does for that clip) went on to a claim and a lease. The seam -ExportBudgetSpecReadFault makes ONLY the preflight's read throw,
+        # as a transient sharing violation would. A read failure is now the typed refusal SPEC_READ_FAILED before any claim or lease, and the budget child is never started.
+        called = self.case / "budget-child-r18.called"
+        fake = self.case / "fake-export-budget-r18.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 20000
+        over = self.case / "export-r18-over.json"
+        over.write_text(json.dumps(doc), encoding="utf-8")
+        legset_name = f"zz-r18-spec-read-{uuid.uuid4().hex[:8]}"
+        legset_path = DV / "legsets" / f"{legset_name}.json"
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, called):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+
+        def assert_refused(mode: str, r: subprocess.CompletedProcess, line: str) -> None:
+            out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+            self.assertFalse(self.claim_path.exists(), f"{mode}: a claim was written for an over-cap window whose budget was never checked. " + out)
+            self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened. " + out)
+            self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted: no open, no probe, no leg. " + out)
+            self.assertEqual(r.returncode, 2, out)
+            self.assertIn(line, r.stderr, out)
+            self.assertFalse(called.exists(), f"{mode}: the budget child was started on a spec the preflight could not read. " + out)
+
+        reset()
+        r = self.run_batch([over], "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadFault", FAKE_BUDGET_PID_FILE=str(called))
+        assert_refused("-LegSpec", r, "BATCH_USAGE SPEC_READ_FAILED")
+        reset()
+        r = self.run_plan(self.write_plan([self.item(over, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadFault", FAKE_BUDGET_PID_FILE=str(called))
+        assert_refused("-LegPlan", r, "LEG_PLAN_REFUSED reason=SPEC_READ_FAILED item=1 ")
+        # -LegSet: a set under legsets/ naming an over-cap copy beside it (the real legsets/ directory is the only place the batch reads one; both removed in the finally)
+        over_in_legs = DV / "legs" / f"{legset_name}.json"
+        over_in_legs.write_text(json.dumps(doc), encoding="utf-8")
+        legset_path.write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": legset_name, "card": doc["card"], "clipId": doc["clipId"],
+                                           "description": "r18 test stand-in, removed by the test", "legs": [f"legs/{legset_name}.json"]}), encoding="utf-8")
+        try:
+            reset()
+            args, e = self.batch_cmd([over], "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadFault", FAKE_BUDGET_PID_FILE=str(called))
+            args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", legset_name]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            assert_refused("-LegSet", r, "BATCH_USAGE SPEC_READ_FAILED")
+        finally:
+            legset_path.unlink(missing_ok=True)
+            over_in_legs.unlink(missing_ok=True)
+        # the seam is refused with the real um-run.ps1, as every other offline seam is
+        reset()
+        args, e = self.batch_cmd([over], "-ExportBudgetSpecReadFault")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-ExportBudgetSpecReadFault is an offline test seam", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    def test_r18_sibling_an_over_cap_window_whose_clip_does_not_resolve_is_refused_by_the_clip_independent_floor(self) -> None:
+        # EXPORT-VENUE-LEG-1 r18 sibling sweep (class: an unreadable input read as "no refusal" on the way to a claim): a clip the preflight child cannot resolve made the child fail with
+        # no budget marker, and Get-ExportBudgetRefusal returned '', '' -- yet maxFrames=100000 needs 400000 s of export wait alone, past the agent's 86400 s cap whatever the clip's size
+        # (sol r17: even a one-byte clip needs 400788 s submitted). The batch now asks the generator's -DescribeTimeBudgetBytes 0 (the clip-independent floor) when the clip did not
+        # resolve, and refuses EXPORT_TIME_BUDGET_EXCEEDED before any claim when that floor alone passes the cap. A window whose floor fits is still left to the leg's generator.
+        floor_calls = self.case / "budget-floor-r18.calls"
+        fake = self.case / "fake-export-budget-r18-unresolved.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "if ($DescribeTimeBudgetBytes -ge 0) {\n"
+                        "    Add-Content -LiteralPath $env:FAKE_FLOOR_FILE -Value \"$DescribeTimeBudgetBytes $MaxFrames\"\n"
+                        "    if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of a $DescribeTimeBudgetBytes-byte clip need a job timeout past the agent's cap\" }\n"
+                        "    return [pscustomobject]@{ jobTimeoutSec = 1 }\n"
+                        "}\n"
+                        "throw \"DUAL_VENUE_EXPORT_RESOLVER_ABSENT the clip $ClipId does not resolve on this host\"\n", encoding="utf-8")
+        shipped = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+
+        def spec_with(frames: int) -> Path:
+            doc = json.loads(json.dumps(shipped))
+            doc["export"]["maxFrames"] = frames
+            p = self.case / f"export-r18-unresolved-{frames}.json"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            return p
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, floor_calls):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+        over = spec_with(20000)
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                reset()
+                if mode == "-LegSpec":
+                    r = self.run_batch([over], "-ExportBudgetScript", str(fake), FAKE_FLOOR_FILE=str(floor_calls))
+                    line = "BATCH_USAGE EXPORT_TIME_BUDGET_EXCEEDED"
+                else:
+                    r = self.run_plan(self.write_plan([self.item(over, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), FAKE_FLOOR_FILE=str(floor_calls))
+                    line = "LEG_PLAN_REFUSED reason=EXPORT_TIME_BUDGET_EXCEEDED item=1 "
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened for an over-cap window whose clip did not resolve. " + out)
+                self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted. " + out)
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn(line, r.stderr, out)
+                self.assertIn("clip-independent", r.stderr, out)
+                self.assertEqual(floor_calls.read_text(encoding="utf-8").split(), ["0", "20000"], out)
+        # control: a window whose floor fits is not refused by the budget check when the clip does not resolve (the leg's generator still refuses the clip, typed, as before)
+        reset()
+        r = self.run_batch([spec_with(480)], "-ExportBudgetScript", str(fake), FAKE_FLOOR_FILE=str(floor_calls))
+        self.assertNotIn("EXPORT_TIME_BUDGET_EXCEEDED", r.stdout + r.stderr, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertNotIn("EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stdout + r.stderr, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertEqual(floor_calls.read_text(encoding="utf-8").split(), ["0", "480"])
+
+    def test_r18_adversary_a1_a_budget_floor_that_cannot_be_evaluated_is_refused_before_the_claim(self) -> None:
+        # adversary pass 19 A1 (on 410b5e09, introduced): the floor child itself can fail with no marker (its module import held without read sharing, as the first child's was), and
+        # the floor fallback read only the marker, never the floor's exit, so an over-cap window still returned "no refusal" and reached a claim and a lease. The floor reads no clip,
+        # so a floor that cannot be evaluated is not "unknowable": it is the typed refusal EXPORT_BUDGET_PREFLIGHT_FAILED before any claim or lease.
+        fake = self.case / "fake-export-budget-r18-a1.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "throw \"Import-Module: the process cannot access the file 'AttrCudaArtifacts.psm1' because it is being used by another process\"\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 100000
+        over = self.case / "export-r18-a1-over.json"
+        over.write_text(json.dumps(doc), encoding="utf-8")
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                if mode == "-LegSpec":
+                    r = self.run_batch([over], "-ExportBudgetScript", str(fake))
+                    line = "BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_FAILED"
+                else:
+                    r = self.run_plan(self.write_plan([self.item(over, "A", self.commit_a)]), "-ExportBudgetScript", str(fake))
+                    line = "LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_FAILED item=1 "
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened on a window whose budget floor could not be evaluated. " + out)
+                self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted. " + out)
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn(line, r.stderr, out)
+
+    def test_r19_b1_a_spec_changed_after_the_budget_judged_it_never_reaches_a_lease_or_a_leg(self) -> None:
+        # EXPORT-VENUE-LEG-1 r19 (sol r18 B1 = pass20-A1): the budget preflight judged a 480-frame window, then the same file became maxFrames=100000 (sol's repro: it still passes the
+        # shape predicate, and its zero-byte budget floor is past the agent's cap) while the batch waited. The plan guard repeated the shape check only and the scalar forms checked
+        # no content at all, so the lease opened and the leg ran on bytes the budget never judged. The stand-in budget child rewrites the spec right after the batch read it, as a
+        # change during the wait would. The batch records the judged bytes' sha256 and refuses SPEC_CHANGED_AFTER_PREFLIGHT before any lease or leg.
+        fake = self.case / "fake-export-budget-r19-b1.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "if ($env:FAKE_MUTATE_SPEC) { Copy-Item -LiteralPath $env:FAKE_MUTATE_FROM -Destination $env:FAKE_MUTATE_SPEC -Force }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 480
+        judged_text = json.dumps(doc)
+        doc["export"]["maxFrames"] = 100000
+        changed = self.case / "export-r19-b1-changed.json"
+        changed.write_text(json.dumps(doc), encoding="utf-8")
+        spec = self.case / "export-r19-b1.json"
+        shas = self.case / "leg-spec-sha-r19.log"
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, shas):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+            spec.write_text(judged_text, encoding="utf-8")
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=mode):
+                reset()
+                env = {"FAKE_MUTATE_SPEC": str(spec), "FAKE_MUTATE_FROM": str(changed), "FAKE_LEG_SPEC_SHA": str(shas)}
+                if mode == "-LegSpec":
+                    r = self.run_batch([spec], "-ExportBudgetScript", str(fake), **env)
+                else:
+                    r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), **env)
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertIn('"maxFrames": 100000', spec.read_text(encoding="utf-8"), "the stand-in did not change the spec, so the test proves nothing. " + out)
+                self.assertEqual([k for k in self.kinds() if k.startswith("LEG")], [], f"{mode}: a leg ran on a spec the budget never judged. " + out)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened on a spec the budget never judged. " + out)
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+        # control: an unchanged spec runs, and the leg is handed the sha256 of exactly the bytes the budget judged (the leg re-checks its own read against it)
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=f"control {mode}"):
+                reset()
+                if mode == "-LegSpec":
+                    r = self.run_batch([spec], "-ExportBudgetScript", str(fake), FAKE_LEG_SPEC_SHA=str(shas))
+                else:
+                    r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), FAKE_LEG_SPEC_SHA=str(shas))
+                out = f"control {mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+                want = hashlib.sha256(spec.read_bytes()).hexdigest()
+                rows = shas.read_text(encoding="utf-8").splitlines() if shas.exists() else []
+                self.assertTrue(rows, "no leg ran on the unchanged spec. " + out)
+                for row in rows:
+                    self.assertEqual(row, f"expect={want} read={want}", out)
+
+    def test_r19_b1_the_leg_refuses_spec_bytes_that_are_not_the_ones_the_budget_judged(self) -> None:
+        # r19 (sol r18 B1, the dispatch site Invoke-VenueLeg.ps1:225): the bytes the LEG reads are the bytes run, so the leg compares them with -ExpectSpecSha256 and throws
+        # DVE_LEG_SPEC_CHANGED before it generates or submits anything. Structural: the parameter, the comparison right after the one read, and the batch passing it at the launch.
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("[Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{64}\\z')][string]$ExpectSpecSha256 = ''", leg)
+        read_at = leg.index("$specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)")
+        check_at = leg.index("if ($readSpecSha -cne $ExpectSpecSha256) { throw \"DVE_LEG_SPEC_CHANGED")
+        self.assertLess(read_at, check_at)
+        self.assertLess(check_at, leg.index("$spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate"), "the check runs on the one read, before the spec is used")
+        batch = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("$lArgs += @('-ExpectSpecSha256', [string]$script:SpecBudgetSha256[[string]$leg.spec])", batch)
+
+    def test_r19_b2_a_stalled_budget_spec_read_is_bounded_by_the_deadline_and_refused_before_the_claim(self) -> None:
+        # EXPORT-VENUE-LEG-1 r19 (sol r18 B2 = pass20-A2): the budget preflight's own read of the spec was a synchronous ReadAllBytes BEFORE the remaining-room check, so a share that
+        # stopped answering there (every earlier read of the spec had answered) held the batch past -DeadlineUtc. The seam -ExportBudgetSpecReadDelaySec makes only that read answer
+        # after 300 s. It is bounded by the room before -DeadlineUtc and refused EXPORT_BUDGET_PREFLIGHT_TIMEOUT before any claim, long before the read would have answered.
+        fake = self.case / "fake-export-budget-r19-b2.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        spec = self.case / "export-r19-b2.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        for mode, room in (("-LegSpec", 30), ("-LegPlan", 100)):
+            with self.subTest(mode=mode):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=room))
+                t0 = time.monotonic()
+                if mode == "-LegSpec":
+                    r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadDelaySec", "300", "-DeadlineUtc", deadline)
+                    line = "BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT"
+                else:
+                    r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-ExportBudgetSpecReadDelaySec", "300", "-DeadlineUtc", deadline)
+                    line = "LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 "
+                took = time.monotonic() - t0
+                out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn(line, r.stderr, out)
+                self.assertIn("read of the leg spec did not answer", r.stderr, out)
+                self.assertLess(took, room + 15, f"{mode}: the stalled read held the batch past -DeadlineUtc. " + out)
+                self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted. " + out)
+                self.assertFalse(self.claim_path.exists(), f"{mode}: no claim was written. " + out)
+        # the seam is refused with the real um-run.ps1
+        args, e = self.batch_cmd([spec], "-ExportBudgetSpecReadDelaySec", "5")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-ExportBudgetSpecReadDelaySec is an offline test seam", r.stderr)
+
+    def test_r11_export_a_budget_preflight_that_never_returns_is_killed_and_refused_before_the_claim_in_every_mode(self) -> None:
+        # EXPORT-VENUE-LEG-1 r11 (sol r9 B1, EXPORT-BUDGET-PREFLIGHT-CHILD-DEADLINE-1; fable H1 EXPORT-LEGSET-BUDGET-PREFLIGHT-TEST-1): the preflight child (the export generator's
+        # -PreflightBudgetOnly mode, which resolves the clip) was waited for with no deadline, so a hung resolver held the batch before any claim forever. It now runs as a bounded
+        # child (the room left before -DeadlineUtc, under a hard cap), is killed and confirmed dead on expiry, and the batch ends with the typed refusal before any claim or lease,
+        # in -LegSpec, -LegPlan and -LegSet. The stand-in sleeps forever and records its pid, so the test also proves the child did not outlive the batch.
+        pid_file = self.case / "budget-child.pid"
+        fake = self.case / "fake-export-budget-hang.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n"
+                        "while ($true) { Start-Sleep -Seconds 60 }\n", encoding="utf-8")
+        shipped = (DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8")
+        spec = self.case / "export-hang.json"
+        spec.write_text(shipped, encoding="utf-8")
+        shipped_doc = json.loads(shipped)
+        legset_name = f"zz-r11-budget-hang-{uuid.uuid4().hex[:8]}"
+        legset_path = DV / "legsets" / f"{legset_name}.json"
+        short = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30))
+        # the plan and set forms spend their preamble (module import, spec predicates) before the preflight on a loaded host: more room, so the child is started and then bound by it
+        longer = lambda: utc_iso(datetime.now(timezone.utc) + timedelta(seconds=100))  # noqa: E731
+
+        def assert_child_gone(mode: str, r: subprocess.CompletedProcess) -> None:
+            self.assertTrue(pid_file.exists(), f"{mode}: the stand-in never started, so the kill path was not exercised: {r.stderr}")
+            pid = pid_file.read_text(encoding="utf-8").strip().lstrip("﻿")
+            alive = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=60).stdout
+            self.assertNotRegex(alive, rf"\b{re.escape(pid)}\b", f"{mode}: the hung preflight child {pid} was left running")
+
+        def assert_nothing_started(mode: str, r: subprocess.CompletedProcess) -> None:
+            self.assertEqual(r.returncode, 2, f"{mode}: " + r.stdout + r.stderr)
+            self.assertIn("EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr, f"{mode}: " + r.stdout + r.stderr)
+            self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted: no open, no probe, no leg")
+            self.assertFalse(self.claim_path.exists(), f"{mode}: no claim was written")
+            self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: no lease was opened")
+            assert_child_gone(mode, r)
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path, pid_file):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+
+        reset()
+        t0 = time.monotonic()
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", short, FAKE_BUDGET_PID_FILE=str(pid_file))
+        assert_nothing_started("-LegSpec", r)
+        self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        self.assertLess(time.monotonic() - t0, 60, "the preflight was bounded by the room before -DeadlineUtc, not by the child")
+        reset()
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-DeadlineUtc", longer(), FAKE_BUDGET_PID_FILE=str(pid_file))
+        assert_nothing_started("-LegPlan", r)
+        self.assertIn("LEG_PLAN_REFUSED reason=EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 ", r.stderr)
+        # -LegSet: a set under legsets/ naming the shipped export leg (the real legsets/ directory is the only place the batch reads one; removed in the finally)
+        legset_path.write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": legset_name, "card": shipped_doc["card"], "clipId": shipped_doc["clipId"],
+                                           "description": "r11 test stand-in, removed by the test", "legs": ["legs/m16-1243-export-prores.json"]}), encoding="utf-8")
+        try:
+            reset()
+            args, e = self.batch_cmd([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", longer(), FAKE_BUDGET_PID_FILE=str(pid_file))
+            args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", legset_name]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            assert_nothing_started("-LegSet", r)
+            self.assertIn("BATCH_USAGE EXPORT_BUDGET_PREFLIGHT_TIMEOUT", r.stderr)
+        finally:
+            legset_path.unlink(missing_ok=True)
+
+    def test_r11_export_a_budget_preflight_with_no_room_before_the_deadline_never_starts_the_child(self) -> None:
+        # the same class from the other side: with no room left before -DeadlineUtc the child is not started at all (no process to leave behind), and the refusal is the same typed one
+        pid_file = self.case / "budget-child-noroom.pid"
+        fake = self.case / "fake-export-budget-noroom.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        spec = self.case / "export-noroom.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        for p in (self.events, self.claim_path, pid_file):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1)), FAKE_BUDGET_PID_FILE=str(pid_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        # r19 (adversary pass 22 A1): with no room left no spec read starts either, so the refusal can now come at the first read (SPEC_READ_TIMEOUT), before the budget's own
+        noroom = r"BATCH_USAGE (EXPORT_BUDGET_PREFLIGHT_TIMEOUT|SPEC_READ_TIMEOUT) "
+        self.assertRegex(r.stderr, noroom)
+        self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
+        self.assertEqual(self.kinds(), [])
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        # adversary r11 A4: a -DeadlineUtc far in the past is a room of billions of negative seconds; narrowing that to an Int32 threw before the no-room test, so the scalar and set forms
+        # lost the typed refusal and the plan form reported a generic LEG_PLAN_INVALID. The room is compared as a double first.
+        for p in (self.events, self.claim_path, pid_file):
+            p.unlink(missing_ok=True)
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        # adversary pass 22 A1: a deadline long gone starts NO read (a 1 s floor read the spec anyway and refused only at the budget): the first read is the typed refusal
+        self.assertIn("BATCH_USAGE SPEC_READ_TIMEOUT ", r.stderr)
+        self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        # (r19: the plan file's own bounded read refuses first with no room: LEG_PLAN_UNREADABLE, still typed and never LEG_PLAN_INVALID)
+        self.assertRegex(r.stderr, r"LEG_PLAN_REFUSED reason=(EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 |SPEC_READ_TIMEOUT item=1 |LEG_PLAN_UNREADABLE )")
+        self.assertNotIn("LEG_PLAN_INVALID", r.stderr)
+        self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
 
     def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
         # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
@@ -10203,6 +10607,49 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                 if re.search(r"-[ci]?(?:eq|ne|like|notlike|match|notmatch|contains|in|notin)\s+['\"]\.claude-state['\"]|['\"]\.claude-state['\"]\s+-[ci]?(?:eq|ne|like|contains)\b", line, re.I):
                     offenders.append(f"{p.relative_to(ROOT).as_posix()}:{n}: {line.strip()[:140]}")
         self.assertEqual(offenders, [], "a path component compared with .claude-state by a culture-aware operator accepts ignorable code points (U+00AD ...)")
+
+
+@requires_windows_pwsh
+class ScalarSpecGuardSeamTests(unittest.TestCase):
+    """EXPORT-VENUE-LEG-1 r20 (adversary pass 24 A1 on 9b8c4753): the scalar forms (-LegSpec, -LegSet) skip a spec re-read they have no room for ONLY at the open guard,
+    where the lease is held and the leg's own -ExpectSpecSha256 binds the bytes it runs (master read no spec there, so a lease whose room after the open held the leg
+    and no re-read still ran the leg: test_r3_a_leg_still_running_at_lease_end_is_killed_as_a_whole_tree_and_uncounted). Before a lease (the claim guard) no room to
+    re-read the spec is the typed refusal, so a spec changed after the export budget judged it never reaches a lease. With room, every seam compares the bytes.
+    Run on the runner's own functions, lifted from its AST."""
+
+    def _guard(self, seam: str, room: float) -> dict:
+        tmp = tempfile.TemporaryDirectory(prefix="r20-seam-")
+        self.addCleanup(tmp.cleanup)
+        spec = Path(tmp.name) / "changed.json"
+        spec.write_text('{"schema":"mlv-app/dual-venue-leg/v1","note":"the bytes after the preflight"}', encoding="utf-8")
+        names = "'New-GuardBudget', 'Get-InputContentRefusal', 'Set-GuardProgress', 'Wait-GuardReadSeam', 'Read-SpecBytesWithin', 'Get-BytesSha256', 'Get-SpecReadBoundSec'"
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
+                  f"foreach ($n in {names}) {{ . ([scriptblock]::Create($ast.Find({{ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }}, $true).Extent.Text)) }}\n"
+                  "$min = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq '$script:GuardReadMinSec' }, $true)\n"
+                  "if ($min) { . ([scriptblock]::Create($min.Extent.Text)) }\n"
+                  "$legPlanMode = $false; $script:guardProgress = $null; $script:guardDelaySeam = $null\n"
+                  # the export budget judged other bytes (all zeros is no file's sha256): the spec on disk changed after it
+                  f"$script:guardedInputs = @([pscustomobject]@{{ kind = 'spec'; item = 0; path = '{spec}'; backend = ''; specSha256 = ('0' * 64) }})\n"
+                  f"$script:guardBudget = New-GuardBudget {room} 'the {seam} room' 'SHARE_UNREACHABLE' $false '{seam}'\n"
+                  "$hit = Get-InputContentRefusal\n"
+                  "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; noRoom = [bool]$hit.noRoom }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_r20_a1_the_claim_guard_with_no_room_to_reread_a_scalar_spec_refuses_before_any_lease(self) -> None:
+        got = self._guard("claim", 1.0)
+        self.assertEqual((got["code"], got["noRoom"]), ("SHARE_UNREACHABLE", True), f"a 1 s claim-guard room under the 2 s read minimum: {got}")
+
+    def test_r20_a1_the_open_guard_with_no_room_skips_the_scalar_reread_and_leaves_the_binding_to_the_leg(self) -> None:
+        got = self._guard("open", 1.0)
+        self.assertEqual(got["code"], "", f"master parity after the open (the leg's -ExpectSpecSha256 refuses changed bytes): {got}")
+
+    def test_r20_a1_with_room_every_seam_refuses_a_scalar_spec_changed_after_the_budget(self) -> None:
+        for seam in ("claim", "open"):
+            with self.subTest(seam=seam):
+                self.assertEqual(self._guard(seam, 30.0)["code"], "SPEC_CHANGED_AFTER_PREFLIGHT")
 
 
 @requires_windows_pwsh
