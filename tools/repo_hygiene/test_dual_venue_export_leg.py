@@ -2288,7 +2288,8 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
 
     def test_the_snapshot_walks_the_tree_skips_a_reused_parent_pid_and_fails_closed_on_an_unreadable_tree(self) -> None:
         got = self.snapshot_and_wait(
-            "$rows = @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 202 201 $t.AddSeconds(2)), (Row 300 100 $t.AddHours(-3)), (Row 400 4 $t.AddSeconds(3)))\n"
+            # r3 fix 2: a real scan always holds pid 4 (System, older than everything); without it 400 would be an orphan created after the root, i.e. a member
+            "$rows = @((Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 202 201 $t.AddSeconds(2)), (Row 300 100 $t.AddHours(-3)), (Row 400 4 $t.AddSeconds(3)))\n"
             "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows\n"
             "$bad = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($rows + @(Row 203 201 $null))\n"
             "$gone = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 201 100 $t))\n"
@@ -2304,7 +2305,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
 
     def test_the_wait_names_a_survivor_ignores_a_reused_pid_and_fails_closed_on_a_failed_scan(self) -> None:
         got = self.snapshot_and_wait(
-            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
             "$alive = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 201 100 $t.AddSeconds(1))) }\n"
             # r3 (A1 on 4d69f211): a real scan always holds pid 4 (System, older than everything); without it the reused 201 would have no provable parent
             "$reused = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 4 0 $t.AddDays(-1)), (Row 201 4 $t.AddMinutes(5))) }\n"
@@ -2327,7 +2328,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         """r1 fix iteration on 2223cc4d. A1: member 201 starts 202 after the snapshot and exits before the kill; 202 (parent 201) is a survivor. A3: -WaitMs 0 is
         no time to confirm, and an empty scan that ENDS past the bound confirms nothing. A6: ok='false' (a string) is not the boolean $true."""
         got = self.snapshot_and_wait(
-            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
             "$late = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 202 201 $t.AddSeconds(5)), (Row 203 202 $t.AddSeconds(6)), (Row 400 4 $t)) }\n"
             "$rootChild = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @((Row 205 100 $t.AddSeconds(7))) }\n"
             "$zero = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 0 -Scan { @() }\n"
@@ -2349,7 +2350,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         """r1 fix 2 on 348c4357. A1: the first scan finds 202 (parent 201) and 203 (parent 202); the second shows only 203, whose parent is gone: 203 is still a
         survivor. A2: with a survivor that never goes, every scan starts while CIM's 1 s floor is still left, and a bound under 1 s runs no scan at all."""
         got = self.snapshot_and_wait(
-            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
             "$n = [ref]0\n"
             "$kept = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1600 -Scan { $n.Value++; if ($n.Value -eq 1) { @((Row 202 201 $t.AddSeconds(5)), (Row 203 202 $t.AddSeconds(6))) } else { @((Row 203 202 $t.AddSeconds(6))) } }\n"
             "$sw = [Diagnostics.Stopwatch]::StartNew(); $starts = [System.Collections.Generic.List[double]]::new()\n"
@@ -2410,27 +2411,47 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         now holds (a reused number cannot be 203's parent). Controls: a process whose live parent is older (pid 4, System) and an orphan created before the root are
         not survivors."""
         got = self.snapshot_and_wait(
-            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
             "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
             "$orphan = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)))) }\n"
             "$young = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)), (Row 202 4 $t.AddSeconds(9)))) }\n"
             "$chain = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 202 777 $t.AddSeconds(3)), (Row 203 202 $t.AddSeconds(4)))) }\n"
             "$unrelated = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 500 4 $t.AddSeconds(4)), (Row 600 999 $t.AddHours(-1)))) }\n"
+            # r3 fix 2 (adversary A1 on 6b788356): after a one-hour clock rollback 203 reads OLDER than the root; it is still no outsider the snapshot saw
+            "$rollback = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddHours(-1).AddSeconds(4)))) }\n"
+            # a pre-snapshot orphan (its parent 202 already gone) created after the root is a member of the snapshot itself
+            "$pre = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddSeconds(4)), (Row 600 999 $t.AddHours(-1))))\n"
+            "$preWait = Wait-AttrCudaProcessTreeGone -Snapshot $pre -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(4)), (Row 600 999 $t.AddHours(-1)))) }\n"
+            # adversary A2 advisory on 6b788356: a snapshot missing its fields under strict mode is an unknown tree, never a throw
+            "Set-StrictMode -Version Latest\n"
+            "$bare = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{}) -WaitMs 1200 -Scan { @() }\n"
+            "$noErr = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = $false }) -WaitMs 1200 -Scan { @() }\n"
+            "Set-StrictMode -Off\n"
             "[ordered]@{ orphan = $orphan.confirmed; orphanSurvivors = @($orphan.survivors); young = $young.confirmed; youngSurvivors = @($young.survivors);\n"
-            "            chain = $chain.confirmed; chainSurvivors = @($chain.survivors); unrelated = $unrelated.confirmed } | ConvertTo-Json -Compress")
+            "            chain = $chain.confirmed; chainSurvivors = @($chain.survivors); unrelated = $unrelated.confirmed;\n"
+            "            rollback = $rollback.confirmed; rollbackSurvivors = @($rollback.survivors); preMembers = @($pre.members | ForEach-Object { $_.processId });\n"
+            "            preOthers = @($pre.others.Keys | Sort-Object); preWait = $preWait.confirmed; bare = $bare.confirmed; noErr = $noErr.confirmed; noErrWhy = $noErr.error } | ConvertTo-Json -Compress")
         self.assertFalse(got["orphan"], f"a late grandchild with no provable ancestry is never confirmed gone: {got}")
         self.assertEqual(got["orphanSurvivors"], [203], got)
         self.assertFalse(got["young"], got)
         self.assertEqual(got["youngSurvivors"], [203], f"a parent younger than its child is a reused number, not the parent: {got}")
         self.assertFalse(got["chain"], got)
         self.assertEqual(sorted(got["chainSurvivors"]), [202, 203], got)
-        self.assertTrue(got["unrelated"], f"a process under a live older parent, or an orphan older than the root, is not the tree: {got}")
+        self.assertTrue(got["unrelated"], f"a process under a live older outsider, or an outsider the snapshot saw, is not the tree: {got}")
+        self.assertFalse(got["rollback"], f"a clock stepped back never proves a late orphan predates the tree: {got}")
+        self.assertEqual(got["rollbackSurvivors"], [203], got)
+        self.assertEqual(sorted(got["preMembers"]), [201, 203], f"an orphan created after the root is a snapshot member: {got}")
+        self.assertEqual(got["preOthers"], [0, 4, 600], got)
+        self.assertFalse(got["preWait"], got)
+        self.assertFalse(got["bare"], got)
+        self.assertFalse(got["noErr"], got)
+        self.assertIn("tree-unknown", got["noErrWhy"])
 
     def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
         """r3, adversary A2 on 4d69f211. Old member 201 exits; the root starts a NEW child that reuses pid 201 (another creation time). It is not the recorded identity,
         but its parent is the root, so the walk adopts it: identity is (pid, creation time), and a recorded pid number never hides a new process."""
         got = self.snapshot_and_wait(
-            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t), (Row 600 999 $t.AddHours(-1)))\n"
             "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
             "$reuse = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(5)))) }\n"
             "$grand = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(5)), (Row 300 201 $t.AddSeconds(6)))) }\n"
