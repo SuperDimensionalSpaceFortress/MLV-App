@@ -115,16 +115,6 @@ def evidence_cases(cases: list[dict]):
                              "| ConvertTo-Json -Compress -Depth 8 -AsArray", DVE_CASES=str(path))
 
 
-def assert_containment_advisory(tc: unittest.TestCase, row: dict, *needles: str) -> None:
-    """r18 (hub STOP RULE 2026-11-18T17:26:25Z; EXPORT-CDNG-STAGE-CONTAINMENT-1): a CDNG disjoint-stage containment finding is ADVISORY. It is recorded in containmentAdvisory, never
-    in problems, and never turns the outcome: a run with no other problem and an agreeing dual-ISO class still reads PASS."""
-    tc.assertFalse(any("EXPORT_STAGE_CONTAINMENT" in p for p in row["problems"]), row)
-    tc.assertTrue(any(p.startswith("EXPORT_STAGE_CONTAINMENT_ADVISORY: ") and "EXPORT-CDNG-STAGE-CONTAINMENT-1" in p and all(n in p for n in needles)
-                      for p in row["containmentAdvisory"]), row)
-    if not row["problems"] and not row["classMismatch"]:
-        tc.assertEqual(row["outcome"], "PASS", row)
-
-
 def cdng_case(**over) -> dict:
     c = {"format": "cdng-lossless", "maxFrames": 30, "dualIsoExpected": True, "buildId": BUILD_ID, "profile": cdng_profile(30), "stage": None,
          "batch": batch_log(30), "manifest": output_manifest(30), "token": "EXPORT_CAPTURED", "exit": 0,
@@ -834,11 +824,10 @@ class ExportEvidenceTests(unittest.TestCase):
         cases = [cdng_case(dualIsoExpected=False, profile=p, criteria=[]) for p in (producer_sum, children_sum, control)]
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        # (r18: advisory pending EXPORT-CDNG-STAGE-CONTAINMENT-1, recorded and never gating)
+        # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again, as r11 shipped it; r18 had made it advisory)
         for i, inside in ((0, "producer_frame"), (1, "llrawproc")):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages", f"inside {inside} mean")
-                self.assertEqual(got[i]["outcome"], "PASS", got[i])
+                assert_containment_gates(self, got[i], "the disjoint stages", f"inside {inside} mean")
         self.assertEqual(got[2]["outcome"], "PASS", got[2])
         self.assertEqual(got[2]["containmentAdvisory"], [], got[2])
 
@@ -915,8 +904,7 @@ class ExportEvidenceTests(unittest.TestCase):
         control = profile({"producer_frame_ms": 50.0, "raw_read_ms": 10.0, "llrawproc_dark_frame_ms": 10.0, "llrawproc_dual_iso_ms": 10.0})
         proc, got = evidence_cases([cdng_case(dualIsoExpected=True, profile=p, criteria=[]) for p in (over, control)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        assert_containment_advisory(self, got[0], "the disjoint stages", "inside producer_frame mean")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
-        self.assertEqual(got[0]["outcome"], "PASS", got[0])
+        assert_containment_gates(self, got[0], "the disjoint stages", "inside producer_frame mean")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         self.assertEqual(got[1]["outcome"], "PASS", got[1])
         self.assertEqual(got[1]["containmentAdvisory"], [], got[1])
 
@@ -943,7 +931,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in (0, 1, 2):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
+                assert_containment_gates(self, got[i], "the disjoint stages")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         self.assertEqual(got[3]["outcome"], "PASS", got[3])
         self.assertEqual(got[3]["containmentAdvisory"], [], got[3])
 
@@ -974,7 +962,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(profiles) + 1):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
+                assert_containment_gates(self, got[i], "the disjoint stages")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
         self.assertEqual(got[-1]["containmentAdvisory"], [], got[-1])
 
@@ -1012,7 +1000,7 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for i in range(len(bad)):
             with self.subTest(case=i):
-                assert_containment_advisory(self, got[i], "the disjoint stages")   # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1)
+                assert_containment_gates(self, got[i], "the disjoint stages")   # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again)
         for i in range(len(bad), len(bad) + len(controls)):
             with self.subTest(control=i):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
@@ -1043,9 +1031,8 @@ class ExportEvidenceTests(unittest.TestCase):
         for i in range(len(bad)):
             with self.subTest(case=i):
                 container = "llrawproc_shared_lock" if i < 3 else "llrawproc_other"
-                # (r18: advisory, EXPORT-CDNG-STAGE-CONTAINMENT-1: a contained-pair line names "than <container>", a group line "inside <container>")
-                self.assertTrue(any(f"inside {container}" in p or f"than {container}" in p for p in got[i]["containmentAdvisory"]), got[i])
-                assert_containment_advisory(self, got[i])
+                # (EXPORT-CDNG-STAGE-CONTAINMENT-1: gating again; a group line and a contained-pair line both name "inside <container>")
+                assert_containment_gates(self, got[i], f"inside {container}")
         self.assertEqual(got[-1]["outcome"], "PASS", got[-1])
         self.assertEqual(got[-1]["containmentAdvisory"], [], got[-1])
 
@@ -1136,7 +1123,11 @@ class ExportEvidenceTests(unittest.TestCase):
         self.assertIn((frozenset({"llrawproc_dualiso_refine_lock", "llrawproc_publish_lock"}), "llrawproc_shared_lock"), derived)
         self.assertIn((frozenset({"llrawproc_dualiso_refine_lock", "llrawproc_publish_lock"}), "llrawproc_other"), derived)
         # (the pass16 A1 member is in a derived group, and so is every earlier round's)
-        self.assertIn((frozenset({"llrawproc_vertical_stripes", "llrawproc_pattern_noise", "llrawproc_dual_iso", "llrawproc_chroma_smooth", "llrawproc_shared_lock"}), "llrawproc"), derived)
+        # (EXPORT-CDNG-STAGE-CONTAINMENT-1: pre_dualiso_fix has no export window, so it meets no row and joins every maximal group; r17 key3 B1's pair is held)
+        self.assertIn((frozenset({"llrawproc_vertical_stripes", "llrawproc_pattern_noise", "llrawproc_dual_iso", "llrawproc_chroma_smooth", "llrawproc_shared_lock",
+                                  "llrawproc_pre_dualiso_fix"}), "llrawproc"), derived)
+        self.assertTrue(all("llrawproc_pre_dualiso_fix" in g["members"] for g in got["groups"] if g["parent"] in ("llrawproc", "producer_frame") and "llrawproc" not in g["members"]),
+                        got["groups"])   # (a group holding the llrawproc TOTAL holds none of its children)
 
     def test_the_export_threshold_is_a_number_in_range_in_the_shape(self) -> None:
         """adversary r2 pass 2 A6: generatorArgs.cpuQuiescenceThresholdPercent is refused by the shape unless it is a number in (0, 100]; an object / bool / string
@@ -1173,6 +1164,453 @@ Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Obj
 Set-Content -LiteralPath $OutFile -Value "# stub export job"
 [pscustomobject]@{ outFile = $OutFile; recommendedJobTimeoutSec = 900; clipContentSha256 = $cfg.clipContentSha256; playSeconds = $PlaySeconds; fixtureRehearsal = $false; legType = 'export' }
 """
+
+
+# --- EXPORT-CDNG-STAGE-CONTAINMENT-1: the CDNG disjoint-stage containment check gates again, on a window table that holds only what CDNG export runs -------------
+SRC = ROOT / "src"
+LLRAWPROC_C = SRC / "mlv" / "llrawproc" / "llrawproc.c"
+DNG_C = SRC / "dng" / "dng.c"
+# the llrawproc timers dng.c publishes (dng.c:571-601) -> the table row each one is
+LLRP_TIMERS = ("dark_frame", "vertical_stripes", "focus_pixels", "bad_pixels", "pattern_noise", "pre_dualiso_fix", "dual_iso", "chroma_smooth", "shared_lock",
+               "dualiso_refine_lock", "publish_lock")
+LLRP_LOCAL_ACCUMULATORS = ("dark_frame", "vertical_stripes", "focus_pixels", "bad_pixels", "pattern_noise", "dual_iso", "chroma_smooth")   # (copied to the globals at the worker's end)
+
+
+def cdng_zero_profile(set_rows: dict, drop_total: bool = False) -> str:
+    """A CDNG profile with every producer and llrawproc stage 0 except set_rows (the writer stages stay at 1 ms)."""
+    doc = json.loads(cdng_profile(30, dual_iso_ms=0.0))
+    for r in doc["frames"]:
+        for k in CDNG_STAGES:
+            if k not in ("writer_queue_wait_ms", "writer_completion_lag_ms", "disk_write_ms"):
+                r[k] = 0.0
+        if drop_total:
+            r.pop("llrawproc_ms", None)
+        r.update(set_rows)
+    return json.dumps(doc)
+
+
+def assert_containment_gates(tc: unittest.TestCase, row: dict, *needles: str) -> None:
+    """EXPORT-CDNG-STAGE-CONTAINMENT-1: a CDNG disjoint-stage containment finding GATES: it is an EXPORT_STAGE_CONTAINMENT_MISMATCH problem and the outcome is INVALID."""
+    tc.assertTrue(any(p.startswith("EXPORT_STAGE_CONTAINMENT_MISMATCH: ") and all(n in p for n in needles) for p in row["problems"]), row)
+    tc.assertEqual(row["outcome"], "INVALID", row)
+
+
+def _c_strip(text: str) -> str:
+    """C text with comments, string and char literals blanked (newlines kept, so offsets and line numbers are unchanged)."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(re.sub(r"[^\n]", " ", text[i:j]))
+            i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            out.append(c + re.sub(r"[^\n]", " ", text[i + 1:j]) + c)
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _c_splice(text: str) -> str:
+    """C text with every backslash-newline spliced (translation phase 2), the line count kept: a spliced logical line is followed by as many empty lines as it absorbed."""
+    # (adversary pass 2 A2: the ??/ trigraph is a backslash, and a backslash followed only by blanks before the newline splices too, as GCC reads it)
+    lines, out, i = text.replace("??/", "\\").split("\n"), [], 0
+    while i < len(lines):
+        cur, extra = lines[i], 0
+        while cur.rstrip(" \t\r").endswith("\\") and i + 1 < len(lines):
+            i += 1
+            cur, extra = cur.rstrip(" \t\r")[:-1] + lines[i], extra + 1
+        out.append(cur)
+        out.extend([""] * extra)
+        i += 1
+    return "\n".join(out)
+
+
+def _match_close(s: str, i: int, open_c: str, close_c: str) -> int:
+    """The index just past the bracket that closes s[i] (s[i] == open_c)."""
+    depth = 0
+    while i < len(s):
+        depth += (s[i] == open_c) - (s[i] == close_c)
+        i += 1
+        if depth == 0:
+            return i
+    raise AssertionError(f"unbalanced {open_c}{close_c}")
+
+
+def _c_functions(s: str) -> dict:
+    """name -> [(params text, body start offset, body end offset)] for every function DEFINITION (a column-0 declarator whose parameter list is followed by '{')."""
+    funcs: dict = {}
+    for m in re.finditer(r"^[A-Za-z_][\w \t*]*?\b([A-Za-z_]\w*)[ \t]*\(", s, re.M):
+        if m.group(1) in ("if", "while", "for", "switch", "return", "sizeof"):
+            continue
+        close = _match_close(s, m.end() - 1, "(", ")")
+        j = close
+        while j < len(s) and s[j] in " \t\r\n":
+            j += 1
+        if j < len(s) and s[j] == "{":
+            funcs.setdefault(m.group(1), []).append((s[m.end():close - 1], j, _match_close(s, j, "{", "}")))
+    return funcs
+
+
+def derive_export_timer_windows(dng_text: str, llr_text: str) -> dict:
+    """Re-derive, from the C sources alone, which llrawproc timer accrual sites CDNG export can reach.
+
+    The root is dng.c's one llrawproc entry call (apply_llrawproc_locked, dng.c:103). Reachability is the call graph over llrawproc.c's function definitions from that
+    entry; integer literals the entry passes bind the callee's parameters, and an `if (<param>)` block whose parameter is bound to 0 is dead (dng.c -> applyLLRawProcObject ->
+    applyLLRawProcObjectWorker(..., NULL, 0), llrawproc.c:6411-6413, so the stop_before_dual_iso block at :5461-5472 never runs on export). An accrual site is a write of a timer
+    global (or of the worker's local accumulator) from `(<now or end> - <start>)`; its window is <start's last assignment line>..<the accrual line>. A write of one timer from
+    another (`g_shared += g_refine`) is a CONTAINS relation. Returns the reachable live function line spans, the windows per row, the contains relations, the call lines
+    per function, and any accrual write the derivation could not read (each one is a failure: a site the guard cannot see is not a site it vouches for)."""
+    dng = _c_strip(_c_splice(dng_text))
+    llr = _c_strip(_c_splice(llr_text))
+    uw = llr   # (adversary r1 A2: `(g_x) = v` is `g_x = v`; a parenthesized identifier that is no argument list is unwrapped IN PLACE, so offsets and lines are unchanged)
+    while True:
+        nxt = re.sub(r"(?<![\w)\]])\(\s*[A-Za-z_]\w*\s*\)", lambda m: " " + m.group(0)[1:-1] + " ", uw)
+        if nxt == uw:
+            break
+        uw = nxt
+    line_of = lambda s, off: s.count("\n", 0, off) + 1   # noqa: E731
+    entries = sorted(set(re.findall(r"\b(applyLLRawProcObject\w*)\s*\(", dng)))
+    funcs = _c_functions(llr)
+    reach: dict = {}   # name -> bound params
+    todo = [(e, {}) for e in entries]
+    dead_spans: list = []
+    live_spans: dict = {}
+    calls: dict = {}   # callee -> [call line]
+    while todo:
+        name, bound = todo.pop()
+        if name in reach or name not in funcs:
+            continue
+        reach[name] = bound
+        for params, b0, b1 in funcs[name]:
+            body = llr[b0:b1]
+            # (adversary pass 2 A5: a literal binds a parameter only while the body never writes it or takes its address)
+            eff = {p: v for p, v in bound.items()
+                   if not re.search(rf"(?<![\w.>])(?:&\s*{p}(?!\w)|{p}\s*(?:[-+*/%&|^]?=(?!=)|<<=|>>=|\+\+|--)|(?:\+\+|--)\s*{p}(?!\w))", uw[b0:b1])}
+            dead = []
+            for m in re.finditer(r"\bif\s*\(\s*(!?)\s*([A-Za-z_]\w*)\s*\)\s*\{", body):
+                if m.group(2) in eff and (eff[m.group(2)] == 0) != (m.group(1) == "!"):
+                    k = b0 + m.end() - 1
+                    dead.append((k, _match_close(llr, k, "{", "}")))
+            dead_spans += [(line_of(llr, a), line_of(llr, z - 1)) for a, z in dead]
+            live_spans.setdefault(name, []).append((line_of(llr, b0), line_of(llr, b1 - 1)))
+            for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body):
+                callee, off = m.group(1), b0 + m.start()
+                if callee not in funcs or any(a <= off < z for a, z in dead):
+                    continue
+                calls.setdefault(callee, []).append(line_of(llr, off))
+                cb = {}
+                args_end = _match_close(llr, b0 + m.end() - 1, "(", ")")
+                args = [a.strip() for a in llr[b0 + m.end():args_end - 1].split(",")]
+                pnames = [re.findall(r"([A-Za-z_]\w*)\s*$", p.strip())[0] if re.findall(r"([A-Za-z_]\w*)\s*$", p.strip()) else "" for p in funcs[callee][0][0].split(",")]
+                for pn, a in zip(pnames, args):
+                    if re.fullmatch(r"\d+", a):
+                        cb[pn] = int(a)
+                todo.append((callee, cb))
+    def live(ln: int) -> bool:
+        return any(a <= ln <= z for spans in live_spans.values() for a, z in spans) and not any(a <= ln <= z for a, z in dead_spans)
+
+    windows: dict = {}
+    contains: dict = {}
+    unread: list = []
+    targets = {f"g_llrawproc_last_{t}_ms": f"llrawproc_{t}" for t in LLRP_TIMERS}
+    targets.update({f"{t}_ms": f"llrawproc_{t}" for t in LLRP_LOCAL_ACCUMULATORS})
+    alt = "|".join(sorted(map(re.escape, targets), key=len, reverse=True))
+    uw_lines = uw.split("\n")
+    # adversary r1 A1/A2 (pass 2): FAIL CLOSED over whole statements. Every occurrence of a timer name in live code (or on any #define line) must be accounted for: the lvalue of
+    # a `<timer> = ...;` / `<timer> += ...;` statement (which may span lines), or the whole right-hand side of one (a copy, or one timer accumulating another). Any other
+    # occurrence -- &timer, a macro or call argument, ++ / -- / -= / *=, a subscript, a pointer write -- is a write this derivation cannot read, and is reported.
+    write_re = re.compile(r"(?<![\w.>])(" + alt + r")\s*(\+=|=)(?!=)([^;{}]*);")
+    handled: set = set()
+    for m in write_re.finditer(uw):
+        ln, end_ln = line_of(uw, m.start(1)), line_of(uw, m.end() - 1)
+        if not (live(ln) and live(end_ln)):
+            continue
+        handled.add(m.start(1))
+        row, rhs = targets[m.group(1)], " ".join(m.group(3).split())
+        if re.fullmatch(r"0(\.0*)?", rhs):
+            continue   # a reset
+        if rhs in targets:
+            handled.add(m.start(3) + m.group(3).index(rhs))
+            if targets[rhs] != row:
+                contains.setdefault(row, set()).add(targets[rhs])   # (one timer accumulating another); else the copy of the worker's local accumulator into its global
+            continue
+        d = re.fullmatch(r"\(\s*(?:mlv_stage_timing_now\s*\(\s*\)|[A-Za-z_]\w*)\s*-\s*([A-Za-z_]\w*)\s*\)\s*\*\s*1000\.0", rhs)
+        if not d:
+            unread.append(f"llrawproc.c:{ln}: {' '.join(m.group(0).split())}")
+            continue
+        starts = [s for s in re.finditer(rf"(?<![\w.>]){re.escape(d.group(1))}\s*=(?!=)", uw[:m.start(1)]) if live(line_of(uw, s.start()))]
+        if not starts:
+            unread.append(f"llrawproc.c:{ln}: no assignment of {d.group(1)} before the accrual")
+            continue
+        windows.setdefault(row, set()).add((line_of(uw, starts[-1].start()), end_ln))
+    is_directive = lambda ln: uw_lines[ln - 1].lstrip().startswith("#")   # noqa: E731
+    for m in re.finditer(r"(?<![\w.>])(" + alt + r")(?!\w)", uw):
+        ln = line_of(uw, m.start())
+        if m.start() not in handled and live(ln) and not is_directive(ln):
+            unread.append(f"llrawproc.c:{ln}: {m.group(1)} is used in a way this derivation cannot read: {uw_lines[ln - 1].strip()}")
+    # (a macro whose body names a timer -- the LLRP_LAST_RUN_TIMING X-macro, :7181 -- or names such a macro, writes the timers wherever it is EXPANDED: an expansion in
+    # export-reachable code is a write this derivation cannot read)
+    defs = [(m.group(1), m.group(2)) for m in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(.*)$", uw, re.M)]
+    tainted = {n for n, body in defs if re.search(r"(?<![\w.>])(" + alt + r")(?!\w)", body)}
+    grew = True
+    while grew:
+        grew = False
+        for n, body in defs:
+            if n not in tainted and any(re.search(rf"(?<!\w){re.escape(t)}(?!\w)", body) for t in tainted):
+                tainted.add(n)
+                grew = True
+    for n in sorted(tainted):
+        for m in re.finditer(rf"(?<!\w){re.escape(n)}(?!\w)", uw):
+            ln = line_of(uw, m.start())
+            if live(ln) and not is_directive(ln):
+                unread.append(f"llrawproc.c:{ln}: the macro {n}, which names a timer, is expanded in export-reachable code")
+    return {"entries": entries, "reachable": sorted(reach), "live": live, "windows": windows, "contains": contains, "calls": calls, "unread": unread,
+            "funcLines": {n: [(line_of(llr, b0), line_of(llr, b1 - 1)) for _p, b0, b1 in v] for n, v in funcs.items()}}
+
+
+def table_vs_export_problems(table: list, derived: dict) -> list:
+    """Every way the module's ExportCdngStageWindowTable differs from the export-reachable derivation (an empty list when it equals it)."""
+    rng = re.compile(r"^llrawproc\.c:(\d+)-(\d+)$")
+    problems = []
+    rows = {r["name"]: r for r in table}
+    for name, r in rows.items():
+        wins = [w for w in (r.get("windows") or []) if w.startswith("llrawproc.c")]
+        spans = []
+        for w in wins:
+            m = rng.match(w)
+            if not m:
+                problems.append(f"{name}: unreadable window {w}")
+                continue
+            a, z = int(m.group(1)), int(m.group(2))
+            spans.append((a, z))
+            if not all(derived["live"](ln) for ln in (a, z)):
+                problems.append(f"{name}: window {w} is not in code CDNG export reaches")
+        own = set(derived["windows"].get(name, ()))
+        for inner in derived["contains"].get(name, ()):   # (a timer that accumulates another one accrues in that one's windows too: shared_lock += refine / publish)
+            own |= set(derived["windows"].get(inner, ()))
+        for w, (a, z) in zip(wins, spans):
+            held = [(sa, sz) for sa, sz in own if sa <= z and a <= sz]
+            if held:
+                # (adversary r1 A1, pass 2 A3: the window's lines are EXACTLY the union of the accrual windows it holds -- no wider, and no untimed gap between two of them,
+                # so dual_iso widened to the whole worker, or to :5560-6219 across the refine lock, is refused)
+                covered = set().union(*(range(sa, sz + 1) for sa, sz in held))
+                if covered != set(range(a, z + 1)):
+                    problems.append(f"{name}: window {w} is not the union of the export-reachable accrual windows it holds {sorted(held)}")
+                continue
+            # (a callee's lines count when every one of its live call sites is inside the row's other windows: the table's header rule)
+            owners = [f for f in derived["reachable"] if f != "applyLLRawProcObjectWorker" and any(fa <= a and z <= fz for fa, fz in derived["funcLines"].get(f, []))]
+            others = [s for s in spans if s != (a, z)]
+            if owners and all(derived["calls"].get(f) and all(any(oa <= c <= oz for oa, oz in others) for c in derived["calls"][f]) for f in owners):
+                continue
+            problems.append(f"{name}: window {w} holds no accrual site CDNG export reaches")
+        for sa, sz in sorted(derived["windows"].get(name, ())):
+            if not any(a <= sa and sz <= z for a, z in spans):
+                problems.append(f"{name}: the export-reachable accrual window llrawproc.c:{sa}-{sz} is not in the row")
+        missing = derived["contains"].get(name, set()) - set(r.get("contains") or [])
+        if missing:
+            problems.append(f"{name}: accumulates {sorted(missing)} but its contains column does not name them")
+        extra = set(r.get("contains") or []) - derived["contains"].get(name, set())
+        if extra:
+            problems.append(f"{name}: its contains column names {sorted(extra)}, which it does not accumulate")
+    for name in derived["windows"]:
+        if name not in rows:
+            problems.append(f"{name}: an export-reachable timer with no table row")
+    # (adversary pass 2 A4: the rest of the table's structure is compared too: one row per name; every published llrawproc timer (dng.c:571-601) is a row whose parent is
+    # llrawproc and whose windows are llrawproc.c line ranges only; llrawproc_other is the remainder of exactly the seven timed children (dng.c:579-604) and has no window)
+    names = [r["name"] for r in table]
+    problems += [f"{n}: duplicated row" for n in sorted({n for n in names if names.count(n) > 1})]
+    expected = {f"llrawproc_{t}" for t in LLRP_TIMERS} | {"llrawproc_other"}
+    problems += [f"{n}: a published llrawproc timer with no table row" for n in sorted(expected - set(rows))]
+    for name, r in rows.items():
+        if not name.startswith("llrawproc_"):
+            continue
+        if name not in expected:
+            problems.append(f"{name}: not a timer dng.c publishes")
+        if r.get("parent") != "llrawproc":
+            problems.append(f"{name}: parent {r.get('parent')!r}, not llrawproc")
+        problems += [f"{name}: window {w} is not an llrawproc.c line range" for w in (r.get("windows") or []) if not rng.match(w)]
+        if name == "llrawproc_other" and (set(r.get("remainderOf") or []) != {f"llrawproc_{t}" for t in LLRP_LOCAL_ACCUMULATORS} or r.get("windows")):
+            problems.append(f"{name}: not the windowless remainder of the seven timed children")
+        elif name != "llrawproc_other" and r.get("remainderOf"):
+            problems.append(f"{name}: carries a remainderOf column")
+    return problems
+
+
+@requires_windows_pwsh
+class CdngStageContainmentGateTests(unittest.TestCase):
+    """EXPORT-CDNG-STAGE-CONTAINMENT-1 (split from EXPORT-VENUE-LEG-1 / #838 by the hub STOP RULE of 2026-11-18T17:26:25Z): the six members #838 found one round at a time, each
+    built from its round's repro, now GATE (INVALID EXPORT_STAGE_CONTAINMENT_MISMATCH) on CDNG-profile legs, and the window table is the code path CDNG export runs."""
+
+    def run_cases(self, profiles: list, dual_iso: bool = True) -> list:
+        proc, got = evidence_cases([cdng_case(dualIsoExpected=dual_iso, profile=p, criteria=[]) for p in profiles])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        return got
+
+    def assert_controls_pass(self, rows: list) -> None:
+        for i, row in enumerate(rows):
+            with self.subTest(control=i):
+                self.assertFalse(any("EXPORT_STAGE_CONTAINMENT" in p for p in row["problems"]), row)
+                self.assertEqual(row["outcome"], "PASS", row)
+
+    def test_member_r11_disjoint_producer_stages_and_llrawproc_children_gate_inside_their_parents(self) -> None:
+        """r11 (fable r9 B2): 40 + 30 + 30 + 40 ms of disjoint producer stages inside a 41 ms producer_frame, and dark 40 + stripes 30 + focus 30 inside a 41 ms llrawproc."""
+        got = self.run_cases([cdng_zero_profile({"raw_read_ms": 40.0, "raw_decode_ms": 30.0, "dng_pack_ms": 30.0, "payload_clone_ms": 40.0, "producer_frame_ms": 41.0}),
+                              cdng_zero_profile({"llrawproc_dark_frame_ms": 40.0, "llrawproc_vertical_stripes_ms": 30.0, "llrawproc_focus_pixels_ms": 30.0, "llrawproc_ms": 41.0,
+                                                 "producer_frame_ms": 200.0}),
+                              cdng_zero_profile({"raw_read_ms": 10.0, "raw_decode_ms": 10.0, "dng_pack_ms": 10.0, "payload_clone_ms": 10.0, "llrawproc_dark_frame_ms": 5.0,
+                                                 "llrawproc_vertical_stripes_ms": 5.0, "llrawproc_ms": 10.0, "producer_frame_ms": 60.0})], dual_iso=False)
+        assert_containment_gates(self, got[0], "the disjoint stages", "inside producer_frame mean")
+        assert_containment_gates(self, got[1], "the disjoint stages", "inside llrawproc mean")
+        self.assert_controls_pass(got[2:])
+
+    def test_member_r13_disjoint_producer_work_gates_inside_producer_frame_without_the_llrawproc_total(self) -> None:
+        """r13 (adversary r13 A2): llrawproc_ms absent; raw_read 20 + dark_frame 30 + dual_iso 30 inside a 50 ms producer_frame."""
+        got = self.run_cases([cdng_zero_profile({"producer_frame_ms": 50.0, "raw_read_ms": 20.0, "llrawproc_dark_frame_ms": 30.0, "llrawproc_dual_iso_ms": 30.0}, drop_total=True),
+                              cdng_zero_profile({"producer_frame_ms": 50.0, "raw_read_ms": 10.0, "llrawproc_dark_frame_ms": 10.0, "llrawproc_dual_iso_ms": 10.0}, drop_total=True)])
+        assert_containment_gates(self, got[0], "the disjoint stages", "inside producer_frame mean")
+        self.assert_controls_pass(got[1:])
+
+    def test_member_r13_2_dual_iso_and_the_lock_times_gate_inside_llrawproc(self) -> None:
+        """r13-2 (adversary r13 pass 13 A1): dual_iso 30 + publish_lock 90 (or refine_lock 90) inside a 100 ms llrawproc beside a 70 ms llrawproc_other; and with llrawproc_ms absent."""
+        base = {"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_other_ms": 70.0}
+        got = self.run_cases([cdng_zero_profile({**base, "llrawproc_publish_lock_ms": 90.0, "llrawproc_shared_lock_ms": 90.0}),
+                              cdng_zero_profile({**base, "llrawproc_dualiso_refine_lock_ms": 90.0, "llrawproc_shared_lock_ms": 90.0}),
+                              cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_dual_iso_ms": 30.0, "llrawproc_publish_lock_ms": 90.0, "llrawproc_shared_lock_ms": 90.0}, drop_total=True),
+                              cdng_zero_profile({**base, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0, "llrawproc_shared_lock_ms": 20.0})])
+        for i in range(3):
+            with self.subTest(case=i):
+                assert_containment_gates(self, got[i], "the disjoint stages")
+        self.assert_controls_pass(got[3:])
+
+    def test_member_r15_every_timed_child_and_the_outside_lock_times_gate_together(self) -> None:
+        """r15 (adversary pass14/15 A1): dark_frame 80 + dual_iso 1 + publish_lock 80 inside a 100 ms llrawproc (each timed child in turn), also with llrawproc_ms absent."""
+        children = ("llrawproc_dark_frame_ms", "llrawproc_vertical_stripes_ms", "llrawproc_focus_pixels_ms", "llrawproc_bad_pixels_ms", "llrawproc_pattern_noise_ms", "llrawproc_chroma_smooth_ms")
+        bad = []
+        for child in children:
+            row = {"producer_frame_ms": 100.0, child: 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_other_ms": 19.0, "llrawproc_publish_lock_ms": 80.0, "llrawproc_shared_lock_ms": 80.0}
+            bad += [cdng_zero_profile({**row, "llrawproc_ms": 100.0}), cdng_zero_profile(row, drop_total=True)]
+        got = self.run_cases(bad + [cdng_zero_profile({"producer_frame_ms": 120.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 20.0, "llrawproc_dual_iso_ms": 1.0,
+                                                       "llrawproc_other_ms": 69.0, "llrawproc_publish_lock_ms": 10.0, "llrawproc_dualiso_refine_lock_ms": 10.0,
+                                                       "llrawproc_shared_lock_ms": 20.0})])
+        for i in range(len(bad)):
+            with self.subTest(case=i):
+                assert_containment_gates(self, got[i], "the disjoint stages")
+        self.assert_controls_pass(got[len(bad):])
+
+    def test_member_r16_disjoint_work_with_the_shared_lock_gates_inside_its_parent(self) -> None:
+        """r16 (adversary pass16 A1): dual_iso 80 + shared_lock 80 + other 20 inside a 100 ms llrawproc (also with llrawproc_ms absent); raw_read 80 + dual_iso 1 + shared_lock 80
+        inside a 100 ms producer_frame; chroma_smooth 60 + shared_lock 60 inside a 100 ms llrawproc."""
+        got = self.run_cases([
+            cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_shared_lock_ms": 80.0, "llrawproc_other_ms": 20.0}),
+            cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_shared_lock_ms": 80.0, "llrawproc_other_ms": 20.0}, drop_total=True),
+            cdng_zero_profile({"producer_frame_ms": 100.0, "raw_read_ms": 80.0, "llrawproc_dual_iso_ms": 1.0, "llrawproc_shared_lock_ms": 80.0}, drop_total=True),
+            cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_chroma_smooth_ms": 60.0, "llrawproc_shared_lock_ms": 60.0, "llrawproc_other_ms": 40.0}),
+            # controls: shared_lock overlaps dark_frame / bad_pixels (its first lock window holds them) and retains the refine and publish times
+            cdng_zero_profile({"producer_frame_ms": 110.0, "llrawproc_ms": 100.0, "llrawproc_dark_frame_ms": 40.0, "llrawproc_bad_pixels_ms": 20.0, "llrawproc_dual_iso_ms": 30.0,
+                               "llrawproc_shared_lock_ms": 65.0, "llrawproc_dualiso_refine_lock_ms": 3.0, "llrawproc_publish_lock_ms": 2.0, "llrawproc_other_ms": 10.0}),
+            cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 50.0, "llrawproc_shared_lock_ms": 50.0, "llrawproc_other_ms": 50.0})])
+        for i in range(4):
+            with self.subTest(case=i):
+                assert_containment_gates(self, got[i], "the disjoint stages")
+        self.assert_controls_pass(got[4:])
+
+    def test_member_r17_pre_dualiso_fix_beside_dual_iso_gates_inside_llrawproc(self) -> None:
+        """r17 (fable/opus key3 B1 on b35c279b): the open repro. CDNG profile, 30 frames, producer_frame 100, llrawproc 100, pre_dualiso_fix 80, dual_iso 80, other 20 read PASS with
+        problems=[]: the table's pre_dualiso_fix row carried the scaled path's whole call (llrawproc.c:6606-7076), which export never runs, so it met dual_iso's scaled windows. On the
+        export path (applyLLRawProcObjectWorker(..., NULL, 0)) pre_dualiso_fix accrues nowhere (its one main-path write, :5463, is the stop_before_dual_iso block), so its 80 ms is
+        work outside every window, and 80 + 80 do not fit inside a 100 ms llrawproc."""
+        got = self.run_cases([cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_pre_dualiso_fix_ms": 80.0, "llrawproc_dual_iso_ms": 80.0,
+                                                 "llrawproc_other_ms": 20.0}),
+                              cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_pre_dualiso_fix_ms": 80.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_other_ms": 20.0},
+                                                drop_total=True),
+                              cdng_zero_profile({"producer_frame_ms": 100.0, "llrawproc_ms": 100.0, "llrawproc_dual_iso_ms": 80.0, "llrawproc_other_ms": 20.0})])
+        for i in (0, 1):   # (the first group over its parent is named: with the producer's other members inside producer_frame, or inside llrawproc)
+            with self.subTest(case=i):
+                assert_containment_gates(self, got[i], "the disjoint stages", "llrawproc_pre_dualiso_fix", "llrawproc_dual_iso")
+        self.assert_controls_pass(got[2:])
+
+    def test_guard_the_window_table_equals_what_cdng_export_reaches_in_the_c_sources(self) -> None:
+        """The Guard: re-derive, from dng.c and llrawproc.c alone (no module code), the llrawproc timer accrual sites CDNG export reaches by call-site reachability from dng.c's
+        applyLLRawProcObject call, and assert the module's table equals it. It fails if a row carries a window export cannot reach (the r17 class), if a reachable accrual site
+        is outside its row, or if a row's window holds no reachable site; and it is proven to bite on the base's pre_dualiso_fix row."""
+        derived = derive_export_timer_windows(DNG_C.read_text(encoding="utf-8", errors="replace"), LLRAWPROC_C.read_text(encoding="utf-8", errors="replace"))
+        self.assertEqual(derived["entries"], ["applyLLRawProcObject"], "dng.c must reach llrawproc only through applyLLRawProcObject")
+        self.assertIn("applyLLRawProcObjectWorker", derived["reachable"])
+        self.assertNotIn("llrawproc_apply_with_dims_internal", derived["reachable"], "the scaled path is playback-only")
+        self.assertEqual(derived["unread"], [], "an accrual write the guard cannot read")
+        self.assertNotIn("llrawproc_pre_dualiso_fix", derived["windows"], "pre_dualiso_fix accrues only in the stop_before_dual_iso block export never runs")
+        proc, got = run_pwsh_json(f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                                  "& (Get-Module DualVenueRunner) { @($script:ExportCdngStageWindowTable) } | ConvertTo-Json -Compress -Depth 6 -AsArray")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(table_vs_export_problems(got, derived), [])
+        # (negative control: the base's pre_dualiso_fix row, and a scaled-path window on any row, are refused; adversary r1 A1: so is a row widened to the whole worker)
+        for name, extra, replace in (("llrawproc_pre_dualiso_fix", ["llrawproc.c:5014-5463", "llrawproc.c:6606-7076"], False),
+                                     ("llrawproc_dual_iso", ["llrawproc.c:6890-6954"], False), ("llrawproc_dual_iso", ["llrawproc.c:5014-6329"], True)):
+            with self.subTest(mutant=name, extra=extra):
+                mutant = json.loads(json.dumps(got))
+                for r in mutant:
+                    if r["name"] == name:
+                        r["windows"] = extra if replace else list(dict.fromkeys(list(r.get("windows") or []) + extra))
+                self.assertTrue(any(p.startswith(f"{name}: window") for p in table_vs_export_problems(mutant, derived)), name)
+        # (adversary r1 A2: a timer write the derivation cannot read is reported, whatever its C spelling: a parenthesized lvalue, a backslash-newline inside the name, another operator)
+        llr = LLRAWPROC_C.read_text(encoding="utf-8", errors="replace")
+        anchor = "applyLLRawProcObjectWorker(video, raw_image_buff, raw_image_size, NULL, 0);"
+        self.assertEqual(llr.count(anchor), 1)
+        dng = DNG_C.read_text(encoding="utf-8", errors="replace")
+        # (pass 2 A1/A2: a statement split across lines, a pointer or subscript write, a macro argument, a blank after the splice backslash, the ??/ trigraph splice)
+        for spelling in ("(g_llrawproc_last_pre_dualiso_fix_ms) = 80.0;", "g_llrawproc_last_pre_dual\\\niso_fix_ms = 80.0;", "g_llrawproc_last_pre_dualiso_fix_ms -= 1.0;",
+                         "++g_llrawproc_last_dual_iso_ms;", "g_llrawproc_last_pre_dualiso_fix_ms\n = 80.0;", "double *p = &g_llrawproc_last_pre_dualiso_fix_ms; *p = 80.0;",
+                         "(&g_llrawproc_last_pre_dualiso_fix_ms)[0] = 80.0;", "SET_TIMER(g_llrawproc_last_pre_dualiso_fix_ms, 80.0);",
+                         "g_llrawproc_last_pre_dual\\ \niso_fix_ms = 80.0;", "g_llrawproc_last_pre_dual??/\niso_fix_ms = 80.0;"):
+            with self.subTest(spelling=spelling):
+                mutated = derive_export_timer_windows(dng, llr.replace(anchor, anchor + " " + spelling))
+                self.assertTrue(mutated["unread"] or "llrawproc_pre_dualiso_fix" in mutated["windows"], spelling)
+        # (pass 2 A2: the worker's local accumulators too, by pointer and by a macro that names one; and an X-macro naming the timers expanded on the export path)
+        local_anchor = "double chroma_smooth_ms = 0.0;"   # (its FIRST occurrence is the worker's declaration, llrawproc.c:5063; the second is the scaled path's)
+        self.assertLess(llr.index(local_anchor), llr.index("void applyLLRawProcObject(mlvObject_t"))
+        for spelling in ("double *q = &dark_frame_ms; *q = 80.0;", "SET_TIMER(dual_iso_ms, 80.0);"):
+            with self.subTest(local=spelling):
+                self.assertTrue(derive_export_timer_windows(dng, llr.replace(local_anchor, local_anchor + " " + spelling, 1))["unread"], spelling)
+        with self.subTest(xmacro="LLRP_LAST_RUN_TIMING"):
+            self.assertIn("LLRP_LAST_RUN_TIMING", llr)
+            self.assertTrue(derive_export_timer_windows(dng, llr.replace(anchor, anchor + " LLRP_LAST_RUN_TIMING(SOMETHING)"))["unread"])
+        # (pass 2 A5: a literal binds stop_before_dual_iso only while the body never writes it: reassigned before its if, the block is live and pre_dualiso_fix accrues)
+        gate = "if (stop_before_dual_iso)"
+        self.assertEqual(llr.count(gate), 1)
+        mutated = derive_export_timer_windows(dng, llr.replace(gate, "stop_before_dual_iso = 1; " + gate))
+        self.assertTrue(mutated["unread"] or "llrawproc_pre_dualiso_fix" in mutated["windows"])
+        # (pass 2 A3/A4: a window across an untimed gap, a wrong parent, an extra contains entry, a token window, a removed or duplicated row are refused)
+        def table_mutant(fn) -> list:
+            t = json.loads(json.dumps(got))
+            fn(t)
+            return table_vs_export_problems(t, derived)
+
+        def row(t: list, name: str) -> dict:
+            return next(r for r in t if r["name"] == name)
+        mutants = {
+            "dual_iso across the refine lock": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", ["llrawproc.c:5560-6219"]),
+            "pre_dualiso_fix parent": lambda t: row(t, "llrawproc_pre_dualiso_fix").__setitem__("parent", "unmeasured"),
+            "extra contains": lambda t: row(t, "llrawproc_dual_iso").__setitem__("contains", ["llrawproc_publish_lock"]),
+            "token window": lambda t: row(t, "llrawproc_dual_iso").__setitem__("windows", row(t, "llrawproc_dual_iso")["windows"] + ["dng.c#raw_read"]),
+            "removed pre row": lambda t: t.remove(row(t, "llrawproc_pre_dualiso_fix")),
+            "duplicated row": lambda t: t.append(json.loads(json.dumps(row(t, "llrawproc_dual_iso")))),
+            "other not the remainder": lambda t: row(t, "llrawproc_other").__setitem__("remainderOf", ["llrawproc_dual_iso"]),
+        }
+        for label, fn in mutants.items():
+            with self.subTest(table=label):
+                self.assertTrue(table_mutant(fn), label)
 
 
 @requires_windows_pwsh
