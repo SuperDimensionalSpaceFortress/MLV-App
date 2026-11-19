@@ -532,6 +532,25 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("could not be read as a zip", result["reason"])
 
+    def test_the_zip_check_refuses_an_entry_that_extracts_over_the_member(self) -> None:
+        # adversary 9bd36192-A1: a zip holding the pinned ffmpeg.exe FOLLOWED by ./ffmpeg.exe (MZwrong) passed, because only the
+        # literal name was counted; Expand-Archive -Force then wrote the alias over the pinned file. Every entry name must be
+        # canonical (no ., .., empty, trailing-dot/space, 8.3 or stream segment), and no two entries may name one path.
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        for alias in ("./ffmpeg.exe", ".\\ffmpeg.exe", "/ffmpeg.exe", "sub/../ffmpeg.exe", "ffmpeg.exe.", "ffmpeg.exe ",
+                      "FFMPEG~1.EXE", "ffmpeg.exe::$DATA", "sub//x.dll"):
+            with self.subTest(alias=alias):
+                bad = self._zip(f"alias-{abs(hash(alias))}.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload, alias: b"MZwrong"})
+                result = self._check_zip(bad, payload)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("not a canonical entry name", result["reason"])
+        twin = self._zip("twin.zip", {"ffmpeg.exe": payload, "pixel_maps/a.fpm": b"a", "PIXEL_MAPS/A.FPM": b"b"})
+        result = self._check_zip(twin, payload)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("name one extracted path", result["reason"])
+        good = self._zip("good-tree.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload, "pixel_maps/": b"", "pixel_maps/a.fpm": b"a"})
+        self.assertTrue(self._check_zip(good, payload)["ok"], "a canonical tree with a directory entry passes")
+
     MINE = "0123456789abcdef0123456789abcdef"
     OTHER = "fedcba9876543210fedcba9876543210"
 
@@ -611,6 +630,10 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         (out / f".vendored-payload-transaction-{self.OTHER}").write_bytes(b"not a folder")
         result = self._restore(out, self.OTHER)
         self.assertTrue(result["errors"], "a transaction path that is not a plain folder is reported")
+        # adversary 9bd36192-A4: an output path on a missing drive threw from Join-Path before the first try.
+        result = self._restore(Path("NO_SUCH_REVIEW_DRIVE:\\out"), self.MINE, prelude="$ErrorActionPreference = 'Stop'\n")
+        self.assertEqual((result["restored"], result["found"]), ([], True), result)
+        self.assertTrue(result["errors"], result)
 
     def test_relative_paths_mean_the_powershell_location(self) -> None:
         # adversary 78d626ed-A2: build-release -OutRoot '.\artifacts' from another location installed and read back the file through
@@ -761,10 +784,7 @@ class RecordOnlyInstallTests(unittest.TestCase):
             code = extractor.main(self._argv("--record-only", "--transaction-id", tx))
         self.assertEqual(code, 1, err.getvalue())
         self.assertIn(f".vendored-payload-transaction-{tx}", seen)
-        # The rollback deletes nothing by path (adversary 63af8daa-A1): the published (pinned, staged-verified) file stays, no
-        # original existed, so the transaction folder is removed and the failure names the file left in place.
-        self.assertEqual(sorted(p.name for p in self.out.iterdir()), ["ffmpeg.exe"], "only the published file remains; the transaction is removed")
-        self.assertIn("published files left in place", err.getvalue())
+        self.assertEqual(list(self.out.iterdir()), [], "the rollback restores the folder and removes its transaction")
         for bad in ("../escape", "0123456789ABCDEF0123456789ABCDEF", "short"):
             with self.subTest(transaction_id=bad), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
                 self.assertEqual(extractor.main(self._argv("--record-only", "--transaction-id", bad)), 1)

@@ -140,31 +140,6 @@ def verify_installed_payload(record: dict[str, Any], output_dir: Path) -> list[d
     return results
 
 
-def _restore_backup_without_overwrite(backup: Path, destination: Path) -> None:
-    """Move ``backup`` back to ``destination`` only when nothing sits there; never overwrite (adversary 32501f50-A1).
-
-    The move itself refuses an existing destination (``os.rename`` on Windows, ``os.link`` elsewhere), so a file that
-    appears after the check is never clobbered either. An occupied destination keeps its file and the backup stays.
-    """
-    kept = PayloadIntegrityError(f"destination present; backup kept at {backup}")
-    if os.path.lexists(destination):
-        raise kept
-    try:
-        if os.name == "nt":
-            os.rename(backup, destination)
-        else:
-            os.link(backup, destination)
-    except FileExistsError as exc:
-        raise kept from exc
-    except OSError as exc:
-        raise PayloadIntegrityError(f"{exc}; backup kept at {backup}") from exc
-    if os.name != "nt":
-        try:
-            os.unlink(backup)
-        except OSError as exc:
-            raise PayloadIntegrityError(f"original restored, but its backup link {backup} could not be removed: {exc}") from exc
-
-
 def _publish_staged_transaction(
     staged: list[tuple[Path, Path, dict[str, Any]]],
     record: dict[str, Any],
@@ -173,13 +148,10 @@ def _publish_staged_transaction(
     verify_installed: bool,
     transaction_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Publish every staged file; on failure put back every original whose destination is free.
+    """Publish every staged file or restore every original destination (all-or-nothing, unchanged from the base).
 
-    The rollback deletes and overwrites nothing by path (adversaries 32501f50-A1, 63af8daa-A1): no check of a path's file
-    identity survives until a later unlink or replace of that path, so a concurrent install's verified file could be the
-    one removed. A destination this transaction published keeps the staged file (already verified as the pinned bytes
-    before publication); every original that cannot go back onto an absent destination stays in the transaction folder,
-    and the failure names each kept backup and each published file left in place.
+    The rollback assumes one install per output folder at a time: it has no lock against a concurrent install sharing the
+    folder (pre-existing; adversary 32501f50-A1's Python sibling, listed OPEN in PR 862 for a locking successor card).
 
     With ``transaction_id`` the transaction folder is ``.vendored-payload-transaction-<id>``, created exclusively, so a
     wrapper that kills this process can put back exactly its originals and no other install's (adversary 78d626ed-A1).
@@ -217,14 +189,15 @@ def _publish_staged_transaction(
         installed = verify_installed_payload(record, output_dir) if verify_installed else []
     except (OSError, PayloadIntegrityError) as exc:
         rollback_errors: list[str] = []
-        left_in_place: list[str] = []
         for _, destination, _ in reversed(staged):
             try:
+                if destination in published:
+                    _require(not destination.is_symlink(),
+                             f"published destination became a symlink during rollback: {destination}")
+                    destination.unlink(missing_ok=True)
                 backup = backups.get(destination)
                 if backup is not None and backup.exists():
-                    _restore_backup_without_overwrite(backup, destination)
-                elif destination in published:
-                    left_in_place.append(str(destination))
+                    os.replace(backup, destination)
             except (OSError, PayloadIntegrityError) as rollback_exc:
                 rollback_errors.append(f"{destination}: {rollback_exc}")
         if not rollback_errors:
@@ -233,8 +206,6 @@ def _publish_staged_transaction(
             except OSError as rollback_exc:
                 rollback_errors.append(f"transaction cleanup: {rollback_exc}")
         detail = f"; rollback incomplete ({'; '.join(rollback_errors)})" if rollback_errors else "; all originals restored"
-        if left_in_place:
-            detail += f"; published files left in place (a rollback never deletes by path): {', '.join(left_in_place)}"
         raise PayloadIntegrityError(f"{label} publication transaction failed: {exc}{detail}") from exc
 
     cleanup_errors: list[str] = []

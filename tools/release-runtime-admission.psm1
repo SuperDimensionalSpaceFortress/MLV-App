@@ -73,8 +73,10 @@ function Restore-PinnedPayloadTransaction {
     )
     $restored = @()
     $errors = @()
-    $folder = Join-Path $OutputDir ".vendored-payload-transaction-$TransactionId"
+    $folder = "$OutputDir\.vendored-payload-transaction-$TransactionId"
     try {
+        # Inside the try: a path Join-Path cannot resolve (a missing drive) is a typed error, never a throw (adversary 9bd36192-A4).
+        $folder = Join-Path $OutputDir ".vendored-payload-transaction-$TransactionId" -ErrorAction Stop
         $item = Get-Item -LiteralPath $folder -Force -ErrorAction Stop
     } catch [System.Management.Automation.ItemNotFoundException] {
         # Killed before its transaction began: no original was moved.
@@ -399,7 +401,30 @@ function Test-PinnedZipMember {
         $check.zipSha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
         $null = $stream.Seek(0, [System.IO.SeekOrigin]::Begin)
         $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
-        $entries = @($zip.Entries | Where-Object { [string]::Equals(([string]$_.FullName).Replace('\', '/'), $MemberName, [StringComparison]::OrdinalIgnoreCase) })
+        # Adversary 9bd36192-A1: Expand-Archive resolves an entry name the way Windows resolves a path, so ./ffmpeg.exe,
+        # sub/../ffmpeg.exe, ffmpeg.exe. or an 8.3 alias extracts OVER the root ffmpeg.exe. Every entry name must therefore be
+        # canonical (both separators accepted; no empty, ., .. or trailing-dot/space segment, no ~<digit> short-name form, no
+        # stream or reserved character), and no two entries may name one extracted path (case-insensitive). Only then does
+        # "exactly one entry named MemberName" mean the extracted file is that entry.
+        $entries = @()
+        $seen = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $zip.Entries) {
+            $raw = [string]$entry.FullName
+            $name = $raw.Replace('\', '/')
+            $isDirectory = $name.EndsWith('/')
+            $path = if ($isDirectory) { $name.Substring(0, $name.Length - 1) } else { $name }
+            $badSegments = @($path.Split('/') | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' -or $_ -match '[. ]\z' -or $_ -match '~[0-9]' -or $_ -match '[:*?"<>|\x00-\x1f]' })
+            if ($path.Length -eq 0 -or $badSegments.Count -gt 0) {
+                $check.reason = "$ZipPath entry '$raw' is not a canonical entry name (it could extract over another entry)"
+                return [pscustomobject]$check
+            }
+            if ($seen.ContainsKey($path)) {
+                $check.reason = "$ZipPath entries '$($seen[$path])' and '$raw' name one extracted path"
+                return [pscustomobject]$check
+            }
+            $seen[$path] = $raw
+            if (-not $isDirectory -and [string]::Equals($path, $MemberName, [StringComparison]::OrdinalIgnoreCase)) { $entries += $entry }
+        }
         if ($entries.Count -ne 1) {
             $check.reason = "$ZipPath holds $($entries.Count) root entries named $MemberName, not exactly one"
             return [pscustomobject]$check
