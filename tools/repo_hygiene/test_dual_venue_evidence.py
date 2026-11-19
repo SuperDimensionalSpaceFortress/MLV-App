@@ -15984,6 +15984,24 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session  id=4\n", 1), (0, 0, 0, 0), False),
             "r7-A2 sibling :7501: a later TAB-spaced marker that also names session= (`\\tid=3\\tsession=4`) is no clean marker": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session\tid=3\tsession=4\n", 1), (4, 4, 4, 4), False),
+            # r7 adversary pass on be8fb7b6 (A2): a record name ends at ANY non-name character, never only at whitespace; a name not followed by one plain space or the line end
+            # makes its record unusable (a toggle / summary) or an unreadable boundary (a measured_session marker or any playback_smoke record)
+            "r7b-A2: the adversary's appended `gui_smoke.window_toggles: requested=4 driven=0 reason=incomplete` is a second summary": (
+                self.log() + "\ngui_smoke.window_toggles: requested=4 driven=0 reason=incomplete", (4, 4, 4, 4), False),
+            "r7b-A2: the adversary's appended duplicate begin of toggle 0 spelled `gui_smoke.window_toggle: ...`": (
+                self.log() + "\n" + self.toggle(0, "begin").replace("gui_smoke.window_toggle ", "gui_smoke.window_toggle: "), (4, 3, 3, 3), False),
+            "r7b-A2: the adversary's later marker `playback_smoke.measured_session:id=4` closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.measured_session:id=4\n", 1), (0, 0, 0, 0), False),
+            "r7b-A2 sibling :7561: the ONLY summary spelled with a TAB after its name is unreadable": (
+                self.log(summary="gui_smoke.window_toggles\trequested=4 driven=4 reason=ok"), (4, 4, 4, 4), False),
+            "r7b-A2 sibling :7561: a toggle 1 begin spelled `gui_smoke.window_toggle:` counts for nothing": (
+                self.log(mutate=lambda i, b, e: (b.replace("gui_smoke.window_toggle ", "gui_smoke.window_toggle:") if i == 1 else b, e)), (4, 3, 3, 3), False),
+            "r7b-A2 sibling :7524/:7532: `playback_smoke.start:session=4` right after the marker closes the window": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.start:session=4\n", 1), (0, 0, 0, 0), False),
+            "r7b-A2 sibling :7524/:7532: `playback_smoke.frame,session=3` (a comma after the name) is an unreadable boundary": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame,session=3\n", 1), (0, 0, 0, 0), False),
+            "r7b-A2 control: a longer record name (`gui_smoke.window_toggles_note x=1`) is another record, not a summary": (
+                self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=ok\ngui_smoke.window_toggles_note x=1"), (4, 4, 4, 4), True),
             "r7-A2 control: a log prefix and the app's one-space marker still read clean": (
                 self.log().replace("playback_smoke.measured_session id=3\n", "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] playback_smoke.measured_session id=3\n", 1), (4, 4, 4, 4), True),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
@@ -16085,7 +16103,15 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                   "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] playback_smoke.frame session=3 n=1\r[2026-11-19T08:00:01.000Z] [INFO] [0x1a2c] " + toggle, True),
                  ("r7-A1: a toggle record CR-joined behind a record whose location suffix holds ` (`", {},
                   "playback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:1)\r" + toggle, True),
-                 ("r7-A1: a CR-joined toggle record on a leg that asks is judged by its criteria, not here", asks, "playback_smoke.frame session=3 n=1\r" + toggle, False))
+                 ("r7-A1: a CR-joined toggle record on a leg that asks is judged by its criteria, not here", asks, "playback_smoke.frame session=3 n=1\r" + toggle, False),
+                 # r7 adversary pass on be8fb7b6 (A1): the request reader's record name ends at ANY non-name character or the line end, never only at a literal space
+                 ("r7b-A1: the adversary's summary with a TAB after its name", {}, "gui_smoke.window_toggles\trequested=4 driven=4 reason=ok", True),
+                 ("r7b-A1: the adversary's bare summary name", {}, "gui_smoke.window_toggles", True),
+                 ("r7b-A1: the adversary's TAB input on a leg whose key is false", {"generatorArgs": {"midPlayWindowToggles": False}},
+                  "gui_smoke.window_toggles\trequested=4 driven=4 reason=ok", True),
+                 ("r7b-A1: a toggle record glued to a colon", {}, "gui_smoke.window_toggle: phase=begin index=0", True),
+                 ("r7b-A1: the bare toggle name behind the log prefix", {}, "[2026-11-19T08:00:00.000Z] [INFO] [0x1a2c] gui_smoke.window_toggle", True),
+                 ("r7b-A1 control: a longer record name is another record", {}, "gui_smoke.window_toggles_note x=1", False))
         proc, out = run_pwsh_evidence_cases("Get-DvWindowToggleRequestEvidence", [(spec, log) for _, spec, log, _ in cases])
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         for (name, _, _, blocks), v in zip(cases, out, strict=True):
@@ -16121,20 +16147,23 @@ class WindowToggleEvidenceTests(unittest.TestCase):
         asks = {"generatorArgs": {"midPlayWindowToggles": True}}
         ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
         marker = "playback_smoke.measured_session id=3\n"
-        logs = (("the adversary's doubled space", self.log().replace(marker, marker + self.R7_A2_LOG_MARKER + "\n", 1)),
-                ("a TAB instead of the doubled space", self.log().replace(marker, marker + "playback_smoke.measured_session\tid=3 id=3\n", 1)))
+        logs = (("the adversary's doubled space", self.log().replace(marker, marker + self.R7_A2_LOG_MARKER + "\n", 1), "session-boundary-unreadable"),
+                ("a TAB instead of the doubled space", self.log().replace(marker, marker + "playback_smoke.measured_session\tid=3 id=3\n", 1), "session-boundary-unreadable"),
+                # r7 adversary pass on be8fb7b6 (A2, siblings :2066 / :5773 / Invoke-VenueLeg.ps1:1159): a colon-spelled record name is still a record
+                ("a colon-spelled second summary", self.log() + "\ngui_smoke.window_toggles: requested=4 driven=0 reason=incomplete", "duplicate-window-toggles-summary"),
+                ("a colon-spelled later marker of session 4", self.log().replace(marker, marker + "playback_smoke.measured_session:id=4\n", 1), "session-boundary-unreadable"))
         with tempfile.TemporaryDirectory(prefix="wt-r7-") as d:
             path = Path(d) / "cases.json"
-            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log in logs]), encoding="utf-8")
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _ in logs]), encoding="utf-8")
             proc, out = run_pwsh_json(
                 "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
                 "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
                 "  [ordered]@{ blocks = $r.blocks; reason = $r.reason; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
-        for (name, _), got in zip(logs, out, strict=True):
+        for (name, _, why), got in zip(logs, out, strict=True):
             with self.subTest(case=name):
                 self.assertTrue(got["blocks"], got)
-                self.assertIn("session-boundary-unreadable", got["derived"])
+                self.assertIn(why, got["derived"])
 
     def test_r7_a2_the_job_embedded_reader_refuses_a_doubled_space_duplicate_marker(self) -> None:
         """r7 (r6 adversary pass on 1ee5e122, A2, siblings playback-attr-3-cuda-job.ps1:6583 / :6586): the toggle job embeds the reader's source extracted from the module

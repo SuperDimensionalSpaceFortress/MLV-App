@@ -2034,7 +2034,9 @@ function Get-DvWindowToggleRequestEvidence {
     foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
         # (the body still starts with the optional `[utc] [LEVEL] [0x<thread>] ` prefix; a record counts only where it starts the body after it)
         # r4 (adversary A2 on 0b915c19): the letter i is the class [Ii], so a host culture that does not fold an upper-case I (tr-TR) still counts GUI_SMOKE.WINDOW_TOGGLE
-        if ($line -match '^\s*(?:\[[^\]]*\]\s*)*gu[Ii]_smoke\.w[Ii]ndow_toggles? ') { $mentions++ }
+        # r7 (r7 adversary A1 on be8fb7b6, its inputs: `gui_smoke.window_toggles<TAB>requested=4 ...` and the bare name): the name ends at ANY non-name character or the
+        # line end, never only at a literal space, so a toggle-named record in any spelling is a mention (fail closed: an ordinary leg blocks)
+        if ($line -match '^\s*(?:\[[^\]]*\]\s*)*gu[Ii]_smoke\.w[Ii]ndow_toggles?(?![A-Za-z0-9_])') { $mentions++ }
     }
     $blocks = (-not $requested) -and ($mentions -gt 0)
     [pscustomobject]@{
