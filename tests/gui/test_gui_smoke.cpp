@@ -700,6 +700,7 @@ private slots:
     void viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces();
 #endif
     void viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces();
+    void viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -2340,7 +2341,7 @@ public:
 #ifdef Q_OS_WIN
         hookInstalled = viewer_idle::win_hook::install();
 #endif
-        m_timer.start( m_idleMs );
+        m_timer.start( firstLookMs() );
     }
 
     void leaveFullscreen()
@@ -2361,6 +2362,10 @@ public:
     // r2: false reproduces the r1 tick, which did not read the thread mouse hook's witness (RED control).
     bool readRetrievalWitness = true;
     bool hookInstalled = false;
+    // r3: the tick off Windows, where the position sample is the only witness (no hook, no queue status).
+    bool positionSampleOnly = false;
+    // r3: MainWindow passes viewer_idle::kPointerPollMs(); 0 keeps the uncapped tick (the pass-4 control).
+    int pollMs = 0;
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -2370,6 +2375,9 @@ protected:
     }
 
 private:
+    // MainWindow starts the timer with kPointerPollMs(); with no cap the first look is one idle period.
+    int firstLookMs() const { return pollMs > 0 && pollMs < m_idleMs ? pollMs : m_idleMs; }
+
     void restoreNow()
     {
         if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
@@ -2380,7 +2388,7 @@ private:
             viewer_idle::win_hook::witness().clear();
 #endif
             m_idle.noteActivity( m_clock.elapsed() );
-            if( !m_timer.isActive() ) m_timer.start( m_idleMs );
+            if( !m_timer.isActive() ) m_timer.start( firstLookMs() );
         }
     }
 
@@ -2399,7 +2407,7 @@ private:
             viewer_idle::win_hook::witness().clear();
 #endif
             if( m_idle.noteActivity( m_clock.elapsed() ) ) m_hider.restore( m_surfaces );
-            if( !m_timer.isActive() ) m_timer.start( m_idleMs );
+            if( !m_timer.isActive() ) m_timer.start( firstLookMs() );
         }
     }
 
@@ -2409,14 +2417,15 @@ private:
         viewer_idle::Inputs in = inputs;
         in.pointerMoved = m_pointer.moved( QCursor::pos() );
 #ifdef Q_OS_WIN
-        if( readRetrievalWitness )
+        if( positionSampleOnly ) {}
+        else if( readRetrievalWitness )
         {
             if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
             if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
         }
         else if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;   // the r1 tick
 #endif
-        switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms ) )
+        switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms, pollMs ) )
         {
         case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); m_timer.start( ms ); break;
         case viewer_idle::Tick::Show: m_hider.restore( m_surfaces ); m_timer.start( ms ); break;
@@ -2735,6 +2744,49 @@ void GuiSmokeTest::viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyThe
     QCOMPARE( fresh->testAttribute( Qt::WA_SetCursor ), freshHadOwn );
     QCOMPARE( fresh->cursor().shape(), freshShape );
     QVERIFY( gl2.cursor().shape() != Qt::BlankCursor );
+}
+
+// G9 (r3, adversary r1 pass 4 A1): off Windows the position sample is the only witness in an input-excluded
+// wait. With the poll cap the live timer samples every poll period, so a move away and back that is over long
+// before one idle period ends still brings the cursor back on both surfaces; the cap does not stop the next hide.
+// The harness's positionSampleOnly tick is the off-Windows tick (no hook, no queue status), so this runs here.
+void GuiSmokeTest::viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QVERIFY( screen != nullptr );
+    const QPoint start = screen->geometry().center();
+    QCursor::setPos( start );
+    ViewerIdleHarness harness( surfaces, 300 );
+    harness.positionSampleOnly = true;
+    harness.pollMs = 10;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+    harness.enterFullscreen();
+    QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::BlankCursor, 2000 );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    harness.inputExcluded = true;
+    QCursor::setPos( start + QPoint( 10, 0 ) );
+    QTest::qWait( 80 );   // away for well under one idle period (300 ms), several poll periods (10 ms)
+    QCursor::setPos( start );
+    QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::OpenHandCursor, 1000 );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+    QVERIFY( !harness.hidden() );
+
+    // Still and excluded: it hides again after the idle period.
+    QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::BlankCursor, 2000 );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    harness.inputExcluded = false;
+    harness.leaveFullscreen();
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()

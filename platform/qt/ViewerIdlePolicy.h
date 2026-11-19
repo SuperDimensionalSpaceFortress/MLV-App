@@ -17,7 +17,9 @@
  * processEvents / QEventLoop with ExcludeUserInputEvents, e.g. SyncDownloadWaiter) still runs timers but
  * delivers no mouse event, so each timer tick also compares the OS pointer position (PointerWatch):
  * movement keeps the cursor shown, and while hidden the tick keeps watching so it comes back within one
- * idle period even inside such a wait.
+ * idle period even inside such a wait. The caller passes kPointerPollMs() as the poll cap, so the tick
+ * looks at least every poll period, shown or hidden (r3: a move away and back within one idle period
+ * is then seen on every platform unless the pointer is away for less than one poll period).
  */
 
 #ifndef VIEWERIDLEPOLICY_H
@@ -33,6 +35,13 @@ namespace viewer_idle
 
 /*! \brief Idle time with no mouse activity before the fullscreen cursor hides. */
 inline constexpr int kIdleHideMs() { return 2000; }
+
+/*! \brief The longest gap between two looks at the OS pointer while fullscreen (r3, adversary r1 pass 4 A1).
+ *         Off Windows the sampled position is the only witness for movement an input-excluded wait does not
+ *         deliver, so it is sampled every poll period rather than once per idle period: a move away and back
+ *         is missed only if the pointer is away for less than one poll period. It does not change when the
+ *         cursor hides (the activity timestamp decides that). */
+inline constexpr int kPointerPollMs() { return 50; }
 
 /*! \brief What the window looks like at the moment the hide timer fires. */
 struct Inputs
@@ -214,8 +223,21 @@ public:
     }
 
     /*! \brief The timer fired. Hide, show (the pointer moved while hidden), or keep waiting; for all three
-     *         *rearmMs is the next timer interval. None only when not fullscreen. */
-    Tick onTimeout( const Inputs &in, qint64 nowMs, int idleMs, int *rearmMs )
+     *         *rearmMs is the next timer interval. None only when not fullscreen. A positive pollMs caps
+     *         every *rearmMs (shown or hidden), so the caller looks at the pointer at least that often;
+     *         0 or less is no cap. */
+    Tick onTimeout( const Inputs &in, qint64 nowMs, int idleMs, int *rearmMs, int pollMs = 0 )
+    {
+        const Tick tick = decide( in, nowMs, idleMs, rearmMs );
+        if( tick != Tick::None && rearmMs && pollMs > 0 && *rearmMs > pollMs ) *rearmMs = pollMs;
+        return tick;
+    }
+
+    bool hidden() const { return m_hidden; }
+    bool fullscreen() const { return m_fullscreen; }
+
+private:
+    Tick decide( const Inputs &in, qint64 nowMs, int idleMs, int *rearmMs )
     {
         if( !m_fullscreen ) return Tick::None;
         if( idleMs < 1 ) idleMs = 1;
@@ -253,10 +275,6 @@ public:
         return Tick::Hide;
     }
 
-    bool hidden() const { return m_hidden; }
-    bool fullscreen() const { return m_fullscreen; }
-
-private:
     bool m_fullscreen = false;
     bool m_hidden = false;
     qint64 m_lastActivity = 0;

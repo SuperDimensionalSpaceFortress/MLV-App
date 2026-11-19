@@ -3714,7 +3714,7 @@ void MainWindow::viewerIdleRestore( void )
         viewer_idle::win_hook::witness().clear();
 #endif
         m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
-        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
+        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
     }
 }
 
@@ -3729,7 +3729,7 @@ void MainWindow::viewerIdleFullscreenChanged( bool on )
         // Adversary r1 pass 3 A1: the witness that survives Qt deferring input in an excluded wait.
         viewer_idle::win_hook::install();
 #endif
-        m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
+        m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );   // first look after one poll period (r3)
     }
     else
     {
@@ -3757,7 +3757,9 @@ void MainWindow::viewerIdleTimeout( void )
     if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
     if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
 #endif
-    switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms ) )
+    // r3 (adversary r1 pass 4 A1): off Windows the sample above is the only witness, so every rearm is capped at
+    // one poll period: a move away and back is seen unless the pointer is away for less than kPointerPollMs().
+    switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms, viewer_idle::kPointerPollMs() ) )
     {
     case viewer_idle::Tick::Hide:
         m_viewerCursorHider.hide( viewerIdleSurfaces() );
@@ -3792,7 +3794,7 @@ void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
         viewer_idle::win_hook::witness().clear();   // delivered: the hook's sighting of it is not new movement
 #endif
         if( m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() ) ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
-        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );
+        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
     }
 }
 

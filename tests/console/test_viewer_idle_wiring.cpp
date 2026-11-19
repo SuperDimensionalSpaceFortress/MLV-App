@@ -204,3 +204,41 @@ TEST(ViewerIdleWiring, TickReadsTheRetrievalHookInstalledOnlyWhileFullscreen)
         QStringLiteral("void MainWindow::viewerIdleRestore( void )"));
     ASSERT_EQ(1, int(restore.count(clear)));
 }
+
+// W6 (r3, adversary r1 pass 4 A1): the position sample is the only witness off Windows, so the tick hands the
+// controller the poll cap (outside any platform guard) and every start of the idle timer is at most one poll
+// period: entering fullscreen, the restore path and the event path start it with kPointerPollMs(), never with
+// the full idle interval.
+TEST(ViewerIdleWiring, TickPassesThePollCapOnEveryPlatformAndEveryStartIsOnePollPeriod)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString timeout = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    ASSERT_FALSE(timeout.isEmpty());
+    const QString call = QStringLiteral(
+        "switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms, "
+        "viewer_idle::kPointerPollMs() ) )");
+    const int callAt = timeout.indexOf(call);
+    ASSERT_TRUE(callAt >= 0);
+    // Not inside a platform guard: the last #ifdef before the call is closed before it.
+    const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef"), callAt);
+    if (guardAt >= 0)
+    {
+        const int endAt = timeout.indexOf(QStringLiteral("#endif"), guardAt);
+        ASSERT_TRUE(endAt >= 0);
+        ASSERT_TRUE(endAt < callAt);
+    }
+
+    const QString pollStart = QStringLiteral("m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );");
+    const QString idleStart = QStringLiteral("m_viewerIdleTimer->start( viewer_idle::kIdleHideMs() );");
+    ASSERT_FALSE(source.contains(idleStart));
+    const QString changed = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleFullscreenChanged( bool on )"));
+    ASSERT_EQ(1, int(changed.count(pollStart)));
+    const QString restore = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleRestore( void )"));
+    ASSERT_EQ(1, int(restore.count(pollStart)));
+    const QString note = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )"));
+    ASSERT_EQ(1, int(note.count(pollStart)));
+}

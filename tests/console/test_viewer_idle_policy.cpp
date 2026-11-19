@@ -322,6 +322,74 @@ TEST(ViewerIdlePolicy, RetrievalWitnessReadAtTheTickShowsTheHiddenCursor)
     ASSERT_FALSE(c.hidden());
 }
 
+// P8 (r3, adversary r1 pass 4 A1): off Windows the position sample is the only witness during an input-excluded
+// wait. Sampled once per idle period, a move away at 2100 and back at 2200 is invisible (the adversary's input);
+// with the poll cap every rearm is at most kPointerPollMs(), so a sample lands while the pointer is away and the
+// cursor shows within one idle period. The cap never changes when the cursor hides.
+TEST(ViewerIdlePolicy, PollCapSamplesThePointerOftenEnoughToSeeAnAwayAndBack)
+{
+    ASSERT_TRUE(viewer_idle::kPointerPollMs() > 0);
+    ASSERT_TRUE(viewer_idle::kPointerPollMs() <= 50);
+    const int poll = viewer_idle::kPointerPollMs();
+
+    // Where the pointer is at time t: away from 2100 until 2200, at (500,500) otherwise.
+    auto pointerAt = [](qint64 t) { return (t >= 2100 && t < 2200) ? QPoint(510, 500) : QPoint(500, 500); };
+
+    // Control: no cap (the pass-4 tick). Hidden at 2000, next look at 4000: the pointer is back, it stays hidden.
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        viewer_idle::PointerWatch sampled;
+        sampled.seed(pointerAt(0));
+        int rearm = 0;
+        qint64 now = 2000;
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), now, 2000, &rearm)));
+        ASSERT_EQ(2000, rearm);
+        now += rearm;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = sampled.moved(pointerAt(now));
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(in, now, 2000, &rearm)));
+        ASSERT_TRUE(c.hidden());
+    }
+
+    // With the cap: follow the rearm intervals the controller hands back, sampling the pointer at each tick.
+    viewer_idle::Controller c;
+    c.setFullscreen(true, 0);
+    viewer_idle::PointerWatch sampled;
+    sampled.seed(pointerAt(0));
+    int rearm = 0;
+    qint64 now = poll;
+    qint64 hiddenAt = -1;
+    qint64 shownAt = -1;
+    int ticks = 0;
+    while (now <= 6000 && shownAt < 0 && ticks < 1000)
+    {
+        ++ticks;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = sampled.moved(pointerAt(now));
+        const viewer_idle::Tick t = c.onTimeout(in, now, 2000, &rearm, poll);
+        ASSERT_TRUE(rearm >= 1);
+        ASSERT_TRUE(rearm <= poll);   // every rearm, shown or hidden, is capped
+        if (t == viewer_idle::Tick::Hide) hiddenAt = now;
+        if (t == viewer_idle::Tick::Show) shownAt = now;
+        now += rearm;
+    }
+    ASSERT_EQ(2000, int(hiddenAt));   // the cap does not move the hide
+    ASSERT_TRUE(shownAt >= 2100);
+    ASSERT_TRUE(shownAt <= 2100 + poll);
+    ASSERT_FALSE(c.hidden());
+
+    // pollMs 0 or negative is no cap (old callers); a cap above the interval changes nothing.
+    viewer_idle::Controller d;
+    d.setFullscreen(true, 0);
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(d.onTimeout(allPass(), 500, 2000, &rearm, 0)));
+    ASSERT_EQ(1500, rearm);
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(d.onTimeout(allPass(), 500, 2000, &rearm, -5)));
+    ASSERT_EQ(1500, rearm);
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(d.onTimeout(allPass(), 500, 2000, &rearm, 5000)));
+    ASSERT_EQ(1500, rearm);
+}
+
 #ifdef Q_OS_WIN
 // P7: the WH_MOUSE procedure maps each mouse message to its kind, records the hook position, passes every
 // message on, and the hook installs for this thread and removes cleanly.
