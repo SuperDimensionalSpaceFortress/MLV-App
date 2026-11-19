@@ -1546,6 +1546,26 @@ $at = { param($ms) [Diagnostics.Stopwatch]::GetTimestamp() - [int64]($ms * $hz /
         self.assertTrue(950 <= out["toDeadline"] <= 1000, out)
         self.assertEqual(0, out["deadlinePassed"], "no wait starts once D is reached")
 
+    def test_a_chunk_wait_never_passes_the_deadline_by_a_rounded_up_fraction(self) -> None:
+        # -2 r3 (adversary 5a5ba9ad A1): Ceiling(D - now) granted a 1 ms wait when less than 1 ms was left (0.5 ms past D). The wait is now Floor(D - now): at
+        # most what is left when the call reads the clock, which is at most what was left just before the call. 200 trials, 0.95 ms left at the stamp.
+        out = run_ps(r"""
+$hz = [Diagnostics.Stopwatch]::Frequency
+$over = 0; $worst = ''
+for ($i = 0; $i -lt 200; $i++) {
+    $launch = [Diagnostics.Stopwatch]::GetTimestamp() - [int64]((1000 - 0.95 - ($i % 5)) * $hz / 1000)
+    $t0 = [Diagnostics.Stopwatch]::GetTimestamp()
+    $wait = Get-GuiSmokeChunkWaitMs -ChunkMs 4000 -LaunchTimestamp $launch -DeadlineMs 1000 -ExpiryMs -1
+    $leftBefore = [Math]::Max(0.0, 1000 - ([double]($t0 - $launch) * 1000.0 / $hz))
+    if ($wait -gt $leftBefore) { $over++; $worst = "wait=$wait left_before=$leftBefore" }
+}
+[pscustomobject]@{ over = $over; worst = $worst } | ConvertTo-Json -Compress
+""")
+        self.assertEqual(0, out["over"], "a chunk wait went past the deadline: " + repr(out))
+        text = MODULE.read_text(encoding="utf-8")
+        body = text[text.index("function Get-GuiSmokeChunkWaitMs"):text.index("function New-GuiSmokeLogProgressWatch")]
+        self.assertNotIn("[Math]::Ceiling($left)", body, "the deadline term is never rounded up")
+
     def test_a_launch_stamp_at_or_below_zero_is_a_real_moment_not_no_launch(self) -> None:
         # -2 r3 (hosted run 44531859108, F1): a stamp a fixed time before GetTimestamp() is <= 0 on a runner booted less than that time ago (the counter starts
         # near boot), and the old `-le 0` sentinel read it as "no launch" (since = -1, the full chunk, no deadline). No launch is now an OMITTED stamp ($null);

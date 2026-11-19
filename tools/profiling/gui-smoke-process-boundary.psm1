@@ -186,8 +186,10 @@ function Get-GuiSmokeChunkWaitMs {
 
     $now = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $LaunchTimestamp
     $left = [double]$DeadlineMs - $now
+    # -2 r3 (adversary 5a5ba9ad A1): the deadline term rounds DOWN, so no wait passes D (Ceiling granted 1 ms with under 1 ms left); under 1 ms left is 0
+    $left = [Math]::Floor($left)
     if ($left -le 0) { return 0 }
-    $wait = [Math]::Min([double]$ChunkMs, [Math]::Ceiling($left))
+    $wait = [Math]::Min([double]$ChunkMs, $left)
     if ($ExpiryMs -ge 0) { $wait = [Math]::Min($wait, [Math]::Max(1.0, [Math]::Ceiling($ExpiryMs - $now))) }
     return [int]$wait
 }
@@ -613,7 +615,8 @@ function Wait-GuiSmokeProcessBounded {
     # -2 r1: with a launch stamp and the whole budget the wait is what is left of the budget at THIS moment, max(1, budget - time since launch), read here;
     # -TimeoutMs (a remainder the caller computed earlier) is only the fallback for a caller without them
     $budgetWaitMs = if ($null -ne $LaunchTimestamp -and $LifetimeBudgetMs -gt 0) {
-        [int][Math]::Max(1, [Math]::Ceiling([double]$LifetimeBudgetMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $LaunchTimestamp)))
+        # -2 r3 (adversary 5a5ba9ad A1 sibling): rounded down, so the wait is never past the budget except the documented 1 ms floor look
+        [int][Math]::Max(1, [Math]::Floor([double]$LifetimeBudgetMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $LaunchTimestamp)))
     }
     else { $TimeoutMs }
     $waitMs = if ($NoProgressStalled) { 1 } else { $budgetWaitMs }
