@@ -678,6 +678,17 @@ class ExportEvidenceTests(unittest.TestCase):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
                 self.assertEqual(got[i]["problems"], [], got[i])
 
+    def test_r20_a1_endpoints_near_int64_max_cannot_use_up_the_total_through_a_double_rounding(self) -> None:
+        """EXPORT-VENUE-LEG-1 r20 (adversary pass 25 A1 on d65eec9b): first.bytes 9223372036854775806 + last.bytes 1 + one byte for each of the 28 files between overflowed Int64
+        into a double, whose rounding read the sum as within totalBytes 9223372036854775807, so a manifest whose endpoints use the whole total read PASS. The sums are exact now."""
+        top = 9223372036854775807
+        doc = {"schema": "export-stage-output-manifest.v1", "kind": "dng", "count": 30, "totalBytes": top, "deleted": True,
+               "first": {"name": "000000.dng", "bytes": top - 1, "sha256": "1" * 64}, "last": {"name": "000029.dng", "bytes": 1, "sha256": "2" * 64}}
+        proc, got = evidence_cases([cdng_case(manifest=json.dumps(doc))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") for p in got[0]["problems"]), got[0])
+
     def test_r7_a5_a_malformed_profile_container_or_element_is_invalid_before_counting(self) -> None:
         """adversary r6 A5: a JSON null appended to profile frames (frame_count 481), or frames given as one object, read PASS because null elements were filtered and a
         lone object was wrapped. The container must be an array of objects, frame_count must be the array's length, and every element is a record."""

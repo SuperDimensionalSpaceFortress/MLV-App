@@ -4803,8 +4803,11 @@ function Get-DvExportManifestEndpointProblem($Manifest, [int64]$Count, [int64]$T
     # adversary pass 23 A1 (on 18592ea9): every produced file has bytes (the reader's own rule for the total), so the endpoints are at least 1 byte each, two files ARE the two
     # endpoints, and N files leave at least one byte for each of the N - 2 between them: 24 DNG files totalling 2000 bytes beside two 1000-byte endpoints is no output
     if ($fb -lt 1 -or $lb -lt 1) { return "output-manifest.json lists $Count files but its first ($fb bytes) or last ($lb bytes) record is an empty file" }
-    if ($Count -eq 2 -and ($fb + $lb) -ne $TotalBytes) { return "output-manifest.json lists two files of $fb and $lb bytes but totalBytes $TotalBytes" }
-    if (($fb + $lb + ($Count - 2)) -gt $TotalBytes) { return "output-manifest.json lists $Count files totalling $TotalBytes bytes, too few for its first ($fb) and last ($lb) files and one byte for each of the $($Count - 2) between them" }
+    # EXPORT-VENUE-LEG-1 r20 (adversary pass 25 A1 on d65eec9b): the sums are [decimal], never Int64: two endpoints near Int64.MaxValue overflowed $fb + $lb into a DOUBLE, whose
+    # rounding read 9223372036854775806 + 1 + 478 as not past totalBytes 9223372036854775807, and a manifest whose endpoints use the whole total passed. A decimal holds any sum here exactly.
+    $endpointBytes = [decimal]$fb + [decimal]$lb
+    if ($Count -eq 2 -and $endpointBytes -ne [decimal]$TotalBytes) { return "output-manifest.json lists two files of $fb and $lb bytes but totalBytes $TotalBytes" }
+    if (($endpointBytes + ([decimal]$Count - 2)) -gt [decimal]$TotalBytes) { return "output-manifest.json lists $Count files totalling $TotalBytes bytes, too few for its first ($fb) and last ($lb) files and one byte for each of the $($Count - 2) between them" }
     $null
 }
 
