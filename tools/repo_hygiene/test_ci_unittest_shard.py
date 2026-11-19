@@ -3111,7 +3111,9 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertIsNone(found, "a pid-only child was accepted on Windows")
 
     # r18 sol r17 A3: a cleanup interrupt that is raised after the run must not swallow what the run recorded.
-    def _run_to_exception(self, popen: Callable[..., object], workers: int = 2, **patches: object) -> tuple[BaseException | None, str]:
+    def _run_to_exception(
+        self, popen: Callable[..., object], workers: int = 2, extra: object | None = None, **patches: object
+    ) -> tuple[BaseException | None, str]:
         root, tests, tag = self._fixture()
         err = io.StringIO()
         raised: BaseException | None = None
@@ -3120,6 +3122,8 @@ class ShardExitCodeTests(unittest.TestCase):
             for name, value in patches.items():
                 stack.enter_context(mock.patch.object(shard, name, value))
             stack.enter_context(self._log_one_unreadable())
+            if extra is not None:
+                stack.enter_context(extra)  # type: ignore[arg-type]
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             stack.enter_context(contextlib.redirect_stderr(err))
             try:
@@ -3187,6 +3191,91 @@ class ShardExitCodeTests(unittest.TestCase):
         raised, err = self._run_to_exception(popen)
         self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
         self.assertIn("kept at", err, "an interrupt in the fallback left without reporting the kept log")
+
+    # r18 adversary pass 30 A1: an interrupt met reading, printing or closing a log in the cleanup must not leave it early.
+    class _CountingKiller(shard.DeadlineKiller):
+        stops: list[int] = []
+
+        def stop(self) -> BaseException | None:
+            self.stops.append(1)
+            return super().stop()
+
+    def _counting_killer(self) -> type:
+        class Killer(self._CountingKiller):
+            stops: list[int] = []
+
+        return Killer
+
+    def test_an_interrupt_reading_a_fallback_log_still_reports_every_log_and_stops_the_watchdogs(self) -> None:
+        real = Path.read_text
+
+        def read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "log.txt" and self.parent.name == "w1":
+                raise PermissionError(5, "log is locked")  # recorded first, so a later interrupt must not lose it
+            if self.name == "log.txt" and self.parent.name == "w2":
+                raise KeyboardInterrupt("log read interrupted")
+            return real(self, *args, **kwargs)
+
+        killer = self._counting_killer()
+        raised, err = self._run_to_exception(
+            self._finished_popen([], raise_on=3), workers=3, extra=mock.patch.object(Path, "read_text", read_text),
+            DeadlineKiller=killer,
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("worker 1/2 log could not be read", err)
+        self.assertIn("worker 2/2 log could not be read", err, "the interrupted read left the cleanup before reporting")
+        self.assertIn("kept at", err)
+        self.assertEqual(killer.stops, [1], "the deadline watchdog was never stopped")
+
+    def test_an_interrupt_printing_a_fallback_log_still_reports_every_log_and_stops_the_watchdogs(self) -> None:
+        real_emit = shard.emit_log
+
+        def emit_log(text: str) -> str | None:
+            if "fx-boom-2" in text:
+                raise KeyboardInterrupt("log print interrupted")
+            return real_emit(text)
+
+        killer = self._counting_killer()
+        raised, err = self._run_to_exception(
+            self._finished_popen([], raise_on=3), workers=3, emit_log=emit_log, DeadlineKiller=killer,
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("worker 2/2 log could not be printed", err, "the interrupted print left the cleanup before reporting")
+        self.assertIn("kept at", err)
+        self.assertEqual(killer.stops, [1], "the deadline watchdog was never stopped")
+
+    def test_an_interrupt_closing_a_log_still_closes_the_rest_reports_and_stops_the_watchdogs(self) -> None:
+        real_open = Path.open
+        closes: list[str] = []
+
+        class InterruptingLog:
+            def __init__(self, real: object, name: str) -> None:
+                self._real, self._name = real, name
+
+            def close(self) -> None:
+                closes.append(self._name)
+                self._real.close()  # type: ignore[attr-defined]
+                if self._name == "w1" and closes.count("w1") == 2:  # the cleanup's close, not the run's own
+                    raise KeyboardInterrupt("log close interrupted")
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+        def path_open(self: Path, *args: object, **kwargs: object) -> object:
+            opened = real_open(self, *args, **kwargs)
+            if self.name == "log.txt" and args[:1] == ("wb",):
+                return InterruptingLog(opened, self.parent.name)
+            return opened
+
+        killer = self._counting_killer()
+        raised, err = self._run_to_exception(
+            self._finished_popen([]), extra=mock.patch.object(Path, "open", path_open), DeadlineKiller=killer,
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertEqual(closes.count("w2"), 2, "a log after the interrupted close was never closed by the cleanup")
+        self.assertIn("worker 1/2 log could not be read", err, "the recorded problem was lost to the interrupt")
+        self.assertIn("kept at", err)
+        self.assertEqual(killer.stops, [1], "the deadline watchdog was never stopped")
 
     # r16 sol r15 A4: an exit code congruent to zero is a zero exit however large it is.
     def test_the_zero_exit_guard_fails_an_integer_code_that_the_os_reads_as_zero(self) -> None:

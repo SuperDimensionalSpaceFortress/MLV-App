@@ -1542,6 +1542,10 @@ def run_parallel(
         # An exception above must not leave a worker running: every owned worker is attempted, one that
         # cannot be killed is reported, and the watchdog keeps enforcing the deadline until they are done.
         first_interrupt: BaseException | None = None  # the first interrupt met in the call itself, kept over any later result
+        # The first exception met closing or reading a log below. None of those sites may leave the cleanup: the
+        # watchdogs still have to be stopped, the problems and the kept paths said, and the work dir judged; it is
+        # raised once that is done.
+        loose_error: BaseException | None = None
         for _attempt in range(TERMINATE_ATTEMPTS):  # the call itself can be interrupted too: it is made once more
             try:
                 ended_late, returned_error = end_running_workers([proc for proc, _log in procs])
@@ -1558,9 +1562,13 @@ def run_parallel(
             if error is not None and number not in stuck:
                 stuck.add(number)
                 problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
-            with contextlib.suppress(OSError):
+            try:
                 log.close()
-        fallback_interrupt: BaseException | None = None  # met while reading the fallback logs, raised once everything is said
+            except OSError:
+                pass
+            except BaseException as error:  # noqa: BLE001 - an interrupt met closing a log: the other logs are still closed
+                if loose_error is None:
+                    loose_error = error
         if sys.exc_info()[0] is not None:
             # An exception (a launch that raised, say) skipped the grouped logs, or cut them short: every
             # worker from the first one not fully dealt with keeps its output, which is deleted with the
@@ -1572,13 +1580,24 @@ def run_parallel(
                 try:
                     header_error = emit_log(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====\n")
                 except BaseException as error:  # noqa: BLE001 - poll() itself raised (SystemExit included)
-                    if is_interrupt(error) and fallback_interrupt is None:
-                        fallback_interrupt = error  # raised below, after the problems and the kept paths are reported
+                    if is_interrupt(error) and loose_error is None:
+                        loose_error = error  # raised below, after the problems and the kept paths are reported
                     header_error = describe_error(error)
-                text, unreadable = read_log(path)
+                try:
+                    text, unreadable = read_log(path)  # re-raises an interrupt: the log is then unread, and kept
+                except BaseException as error:  # noqa: BLE001
+                    if loose_error is None:
+                        loose_error = error
+                    text, unreadable = "", describe_error(error)
                 verb = "read"
                 if unreadable is None:
-                    unreadable, verb = emit_log(text) or header_error, "printed"
+                    try:
+                        printed = emit_log(text)  # re-raises an interrupt: the log is then not fully printed, and kept
+                    except BaseException as error:  # noqa: BLE001
+                        if loose_error is None:
+                            loose_error = error
+                        printed = describe_error(error)
+                    unreadable, verb = printed or header_error, "printed"
                 if unreadable is not None:
                     unread.append(number)
                     problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
@@ -1595,13 +1614,13 @@ def run_parallel(
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             for problem in problems:
                 emit_error(problem)
-            if fallback_interrupt is not None:
-                raise fallback_interrupt
+            if loose_error is not None:
+                raise loose_error
         else:
             # An interrupt met in the census or while a watchdog was stopped is not lost: it goes out once every
             # worker has been ended, the first one met first (compared with ``is None``: an exception's own
             # truth value is its class's business).
-            pending = next((met for met in (census_error, killer_error, watch_error) if met is not None), None)
+            pending = next((met for met in (census_error, loose_error, killer_error, watch_error) if met is not None), None)
             if pending is not None:
                 # Raising skips the report at the end of the run, and the work dir may be kept for an unread log or
                 # a worker still running: what was recorded, and where the evidence stays, is said before it goes out.
