@@ -68,6 +68,7 @@ REVIEWED_PROGRAMMATIC_STOP_SITES = {
 REVIEWED_PLAY_STOPS = {
     "MainWindow::MainWindow": (1, 1, 0),                              # autoplay poll lambda: after programmaticPlayState
     "MainWindow::closeEvent": (1, 1, 0),
+    "MainWindow::on_actionStop_triggered": (1, 1, 0),   # user input: the Stop button seeks to cut in, then pauses
     "MainWindow::showFileInEditor": (1, 0, 0),
     "MainWindow::openDngFolderDialog": (1, 0, 0),
     "MainWindow::on_actionOpen_triggered": (1, 0, 0),
