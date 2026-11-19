@@ -3578,7 +3578,7 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     # --- the real probe runner against a fake ssh.cmd: arguments are non-interactive, the verdict follows its exit code, and a hang is killed at the time bound
     $spDir = New-Scratch 'sp-fake-ssh'
     $spArgs = Join-Path $spDir 'args.txt'
-    [IO.File]::WriteAllText((Join-Path $spDir 'ssh-ok.cmd'), "@echo off`r`necho %*> `"%~dp0args.txt`"`r`necho Hi tester! You've successfully authenticated, but GitHub does not provide shell access. 1>&2`r`nexit /b 1`r`n")
+    [IO.File]::WriteAllText((Join-Path $spDir 'ssh-ok.cmd'), "@echo off`r`necho %*> `"%~dp0args.txt`"`r`ncopy /y %2 `"%~dp0cfg-copy.txt`" >nul`r`necho Hi tester! You've successfully authenticated, but GitHub does not provide shell access. 1>&2`r`nexit /b 1`r`n")
     [IO.File]::WriteAllText((Join-Path $spDir 'ssh-denied.cmd'), "@echo off`r`necho git@github.com: Permission denied (publickey). 1>&2`r`nexit /b 255`r`n")
     [IO.File]::WriteAllText((Join-Path $spDir 'ssh-hang.cmd'), "@echo off`r`nping -n 60 127.0.0.1 >nul`r`nexit /b 1`r`n")
     $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20
@@ -3593,6 +3593,80 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'did not answer' -and $swSp.Elapsed.TotalSeconds -lt 30) 'SSH-PUSHURL-1 probe: a client that hangs is killed at the time bound (not authenticated)' "$($pr.Detail) after $([int]$swSp.Elapsed.TotalSeconds) s"
     $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'absent-ssh.exe')
     Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'could not be started') 'SSH-PUSHURL-1 probe: a missing client is not authenticated and says why' $pr.Detail
+
+    # --- adversary pass 3 (head 59eb14f4): A1+A2 the probe never parses the user's ssh config, A3 identical concurrent writes, A4+A5 the snapshot is as strong as the decision, A6 Verify without a fork remote, A7 timeout clamp
+    $spKey = Join-Path $spDir 'id_ed25519_github'; [IO.File]::WriteAllText($spKey, 'not a real key, a scratch file that only has to exist')
+    $spCfgCopy = Join-Path $spDir 'cfg-copy.txt'; if (Test-Path -LiteralPath $spCfgCopy) { Remove-Item -LiteralPath $spCfgCopy -Force }
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+    $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
+    $cfgText = $(if (Test-Path -LiteralPath $spCfgCopy) { [IO.File]::ReadAllText($spCfgCopy) } else { '' })
+    $cfgPathUsed = [regex]::Match($argText, '-F\s+"?([^"]+?\.conf)"?\s').Groups[1].Value
+    Assert-That ($argText -match '^\s*-F\s' -and $cfgPathUsed -and $cfgPathUsed -notmatch '[\\/]\.ssh[\\/]' -and $argText -match 'CheckHostIP=no') 'SSH-PUSHURL-1 pass3 A1/A2 probe: ssh runs with -F <a generated config outside ~/.ssh> first, so the user ssh config (Match exec) is never parsed, and CheckHostIP=no' $argText
+    Assert-That ($cfgText -match '(?m)^Host github\.com' -and $cfgText -match '(?m)^\s+CheckHostIP no' -and $cfgText -match '(?m)^\s+UpdateHostKeys no' -and $cfgText -match '(?m)^\s+StrictHostKeyChecking yes' -and $cfgText -match '(?m)^\s+BatchMode yes' -and $cfgText -match '(?m)^\s+PermitLocalCommand no') 'SSH-PUSHURL-1 pass3 A1/A2 probe: the generated config holds Host github.com with CheckHostIP no, UpdateHostKeys no, StrictHostKeyChecking yes, BatchMode yes, PermitLocalCommand no' $cfgText
+    Assert-That ($cfgText -notmatch '(?mi)^\s*(Match|Include|ProxyCommand|LocalCommand)\b' -and $cfgText -notmatch '(?i)\bexec\b') 'SSH-PUSHURL-1 pass3 A1/A2 probe: the generated config carries no Match, Include, ProxyCommand, LocalCommand or exec' $cfgText
+    Assert-That ($cfgText -match '(?m)^\s+IdentityFile\s+"?[^"\r\n]*id_ed25519_github"?' -and $cfgText -match '(?m)^\s+IdentitiesOnly yes') 'SSH-PUSHURL-1 pass3 A1/A2 probe: when the key file the Ssh phase configures exists it is the one IdentityFile (IdentitiesOnly yes)' $cfgText
+    Assert-That ($cfgPathUsed -and -not (Test-Path -LiteralPath $cfgPathUsed)) 'SSH-PUSHURL-1 pass3 A1/A2 probe: the generated config file is deleted after the probe' $cfgPathUsed
+    Remove-Item -LiteralPath $spCfgCopy -Force -ErrorAction SilentlyContinue
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile (Join-Path $spDir 'absent-key')
+    $cfgText = $(if (Test-Path -LiteralPath $spCfgCopy) { [IO.File]::ReadAllText($spCfgCopy) } else { '' })
+    Assert-That ($cfgText -match '(?m)^Host github\.com' -and $cfgText -notmatch 'IdentityFile' -and $cfgText -notmatch 'IdentitiesOnly') 'SSH-PUSHURL-1 pass3 A1/A2 probe: without the key file there is no IdentityFile line (ssh then tries the agent and the default keys)' $cfgText
+    foreach ($spTo in @(-1, 0, 2147484, [int]::MaxValue)) {
+        $spThrown = ''
+        try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec $spTo -KeyFile $spKey } catch { $spThrown = $_.Exception.Message }
+        Assert-That ($spThrown -eq '' -and $pr -is [hashtable] -and $pr.Authenticated -is [bool]) "SSH-PUSHURL-1 pass3 A7 probe: -TimeoutSec $spTo is clamped to 1..600 and never throws after ssh started" "$spThrown"
+    }
+
+    # A3: two identical values after a write are a PASS (normalised to one), never a delete of both
+    $spS2 = $spS
+    foreach ($spCase in @(@{ N = 'a3-unset'; Push = ''; Hook = { & git -C $script:spCasRepo config --add remote.fork.pushurl 'git@github.com:SuperDimensionalSpaceFortress/MLV-App.git' } },
+                          @{ N = 'a3-https'; Push = $spU; Hook = { & git -C $script:spCasRepo config --replace-all remote.fork.pushurl 'git@github.com:SuperDimensionalSpaceFortress/MLV-App.git' } })) {
+        $spRp = New-SpRepo $spCase.N $spCase.Push
+        $script:spCasRepo = $spRp; $script:SshPushUrlWriteHook = $spCase.Hook
+        try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlWriteHook = $null }
+        $spVals = @(Get-SpCfg $spRp 'remote.fork.pushurl')
+        Assert-That ($spVals.Count -eq 1 -and $spVals[0] -ceq $spS2 -and $r.Failures.Count -eq 0 -and $r.Log -match [regex]::Escape("SSH_PUSH_READY remote=fork pushurl=$spS2")) "SSH-PUSHURL-1 pass3 A3 setup ($($spCase.N)): another run wrote the identical ssh pushurl -> PASS, exactly one value left, never both deleted" "vals=$($spVals -join ' | ') fail=$($r.Failures -join ',')`n$($r.Log)"
+    }
+    # A3 (the other direction): our value plus a foreign one -> only our single copy is taken back
+    $spRp = New-SpRepo 'a3-foreign'
+    $script:spCasRepo = $spRp; $script:SshPushUrlWriteHook = { & git -C $script:spCasRepo config --add remote.fork.pushurl 'ssh://git@example.invalid/x.git' }
+    try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlWriteHook = $null }
+    $spVals = @(Get-SpCfg $spRp 'remote.fork.pushurl')
+    Assert-That ($spVals.Count -eq 1 -and $spVals[0] -ceq 'ssh://git@example.invalid/x.git' -and $r.Failures -contains 'PUSHURL_CHANGED_DURING_PROBE remote=fork') 'SSH-PUSHURL-1 pass3 A3 setup: a foreign value written during the write survives, only our one copy is taken back, typed failure' "vals=$($spVals -join ' | ')"
+
+    # A4: a control character in a rule is unsafe, and the snapshot key tells ["a<US>b"] from ["a","b"]
+    $spUs = [string][char]0x1F
+    foreach ($spBadRules in @(@("git@github.com:${spUs}x"), @("git@github.com:`nx"), @("git@github.com:`r"))) {
+        $d = Get-SpDecision @($spU) @() $spAuth $spBadRules @()
+        Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) "SSH-PUSHURL-1 pass3 A4 decide: a rewrite rule holding a control character ($(($spBadRules[0] -replace "[\x00-\x1F]", '?'))) -> REFUSED, no probe" "$($d.Decision) calls=$script:spCalls"
+    }
+    $d = Get-SpDecision @($spU) @() $spAuth @() @("al${spUs}ias")
+    Assert-That ($d.Decision -ceq 'REFUSED' -and $script:spCalls -eq 0) 'SSH-PUSHURL-1 pass3 A4 decide: a remote name holding a control character -> REFUSED, no probe' $d.Decision
+    $spSnapA = @{ Urls = @($spU); LocalUrls = @($spU); Push = @(); LocalPush = @(); Rules = @("git@github.com:${spUs}x"); Names = @('origin', 'fork') }
+    $spSnapB = @{ Urls = @($spU); LocalUrls = @($spU); Push = @(); LocalPush = @(); Rules = @('git@github.com:', 'x'); Names = @('origin', 'fork') }
+    Assert-That ((Get-SshPushUrlSnapshotKey $spSnapA) -cne (Get-SshPushUrlSnapshotKey $spSnapB)) 'SSH-PUSHURL-1 pass3 A4 snapshot key: ["git@github.com:<US>x"] and ["git@github.com:","x"] are different keys' (Get-SshPushUrlSnapshotKey $spSnapA)
+    $spSnapC = @{ Urls = @($spU); LocalUrls = @($spU); Push = @('a'); LocalPush = @(); Rules = @(); Names = @() }
+    $spSnapD = @{ Urls = @($spU); LocalUrls = @($spU); Push = @(); LocalPush = @('a'); Rules = @(); Names = @() }
+    Assert-That ((Get-SshPushUrlSnapshotKey $spSnapC) -cne (Get-SshPushUrlSnapshotKey $spSnapD)) 'SSH-PUSHURL-1 pass3 A4 snapshot key: the same value in Push and in LocalPush is a different key' (Get-SshPushUrlSnapshotKey $spSnapC)
+    Assert-That ((Get-SshPushUrlSnapshotKey $spSnapB) -ceq (Get-SshPushUrlSnapshotKey @{ Urls = @($spU); LocalUrls = @($spU); Push = @(); LocalPush = @(); Rules = @('git@github.com:', 'x'); Names = @('origin', 'fork') })) 'SSH-PUSHURL-1 pass3 A4 snapshot key: equal snapshots have equal keys'
+
+    # A5: a rewrite rule that lands between the last snapshot compare and the write: our value is taken back, typed failure, no SSH_PUSH_READY
+    $spRp = New-SpRepo 'a5-rule-before-write'
+    $script:spCasRepo = $spRp; $script:SshPushUrlWriteHook = { & git -C $script:spCasRepo config 'url.https://example.invalid/.insteadOf' 'git@github.com:' }
+    try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlWriteHook = $null }
+    Assert-That (@(Get-SpCfg $spRp 'remote.fork.pushurl').Count -eq 0 -and $r.Failures -contains 'PUSHURL_CHANGED_DURING_PROBE remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY') 'SSH-PUSHURL-1 pass3 A5 setup: an insteadOf rule added after the final snapshot compare and before the write -> our value is taken back, typed failure, no SSH_PUSH_READY' "vals=$((Get-SpCfg $spRp 'remote.fork.pushurl') -join ' | ') fail=$($r.Failures -join ',')`n$($r.Log)"
+    $spRp = New-SpRepo 'a5-rule-https' $spU
+    $script:spCasRepo = $spRp; $script:SshPushUrlWriteHook = { & git -C $script:spCasRepo config 'url.https://example.invalid/.insteadOf' 'git@github.com:' }
+    try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlWriteHook = $null }
+    Assert-That (@(Get-SpCfg $spRp 'remote.fork.pushurl' | Where-Object { $_ -ceq $spS }).Count -eq 0 -and $r.Failures -contains 'PUSHURL_CHANGED_DURING_PROBE remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY') 'SSH-PUSHURL-1 pass3 A5 setup: the same rule when an https pushurl was replaced -> the ssh value is gone again, typed failure' "vals=$((Get-SpCfg $spRp 'remote.fork.pushurl') -join ' | ')"
+
+    # A6: Verify of an existing clone without a fork remote is a typed failure; no clone yet stays a skip
+    $spNoFork = New-Scratch 'sp-nofork'; $spNfRepo = Join-Path $spNoFork 'MLV-App'; [void][IO.Directory]::CreateDirectory($spNfRepo); & git -C $spNfRepo init -q 2>$null; & git -C $spNfRepo remote add origin $UpstreamUrl
+    $r = Invoke-SpRun $spNfRepo $spAuth -VerifyOnly
+    Assert-That ($r.Failures -contains 'SSH_PUSHURL_MISSING remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY') 'SSH-PUSHURL-1 pass3 A6 verify: an existing clone with no fork remote is a typed failure SSH_PUSHURL_MISSING, not a skip' ($r.Failures -join ',')
+    $r = Invoke-SpRun $spNfRepo $spAuth
+    Assert-That ($r.Failures.Count -eq 0 -and @(Get-SpCfg $spNfRepo 'remote.fork.pushurl').Count -eq 0) 'SSH-PUSHURL-1 pass3 A6 setup: the Clone-phase call on a clone without a fork remote still only skips (the Clone phase reports the missing remote itself)' ($r.Failures -join ',')
+    $r = Invoke-SpRun (Join-Path $spNoFork 'absent-clone') $spAuth -VerifyOnly
+    Assert-That ($r.Failures.Count -eq 0 -and $r.Log -match 'no clone at') 'SSH-PUSHURL-1 pass3 A6 verify: no clone yet stays a skip' "$($r.Log)"
 }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))

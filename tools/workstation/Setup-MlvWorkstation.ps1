@@ -1123,7 +1123,8 @@ function Test-GitRemoteUrlSame {
 # Fork push url over SSH (SETUP-MLVWORKSTATION-SSH-PUSHURL-1). The global credential.helper is 'manager' (Invoke-PhasePackages), so every https push rides an OAuth token
 # that an account event can kill. When 'ssh -T git@github.com' authenticates, remote.fork.pushurl is set to the SSH form of the fork url and the https FETCH url stays as it
 # is. It lives in the repo's own config (not ~/.gitconfig), so a Codex lane with a separate HOME pushes the same way. This code never creates, copies, prints or registers a
-# key and never touches ~/.ssh (the probe is BatchMode with StrictHostKeyChecking=yes, so not even known_hosts is written); an unregistered key is an owner-only MANUAL line.
+# key and never writes under ~/.ssh (the probe runs with its own generated -F config, so the user's ssh config is never parsed, and with BatchMode, StrictHostKeyChecking=yes,
+# CheckHostIP=no and UpdateHostKeys=no, so not even known_hosts is written); an unregistered key is an owner-only MANUAL line.
 # credential.helper is NOT changed here. Only 'fork' is handled: 'origin' is the upstream ilia3101 repository, which is fetched and never pushed to.
 # ---------------------------------------------------------------------------------------------
 # '' when the url is not a plain github.com https or 'git@' ssh url of owner/repo; otherwise the SSH form 'git@github.com:owner/repo.git'. The owner and repo alphabet is
@@ -1148,31 +1149,47 @@ function Get-GitHubSshProbeVerdict {
     return @{ Authenticated = $false; Detail = "ssh exited $ExitCode ($text)" }
 }
 
-# The probe: ssh -T git@github.com, never interactive (BatchMode, no password prompt, no host-key prompt and no known_hosts write), bounded by ConnectTimeout and a hard kill.
+# The probe: ssh -T git@github.com with its own generated -F config (the user's ssh config is not read), never interactive (BatchMode, no password prompt, no host-key prompt and
+# no known_hosts write), bounded by ConnectTimeout and a hard kill.
 function Invoke-GitHubSshProbe {
-    param([string]$SshExe = '', [int]$TimeoutSec = 20)
+    # -KeyFile is the key the Ssh phase configures for github.com; a test passes a scratch path. -TimeoutSec is clamped to 1..600 (pass 3 A7: WaitForExit takes int milliseconds)
+    param([string]$SshExe = '', [int]$TimeoutSec = 20, [string]$KeyFile = '')
+    $TimeoutSec = [Math]::Min(600, [Math]::Max(1, $TimeoutSec))
     if (-not $SshExe) { $c = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $SshExe = $c.Source } }
     if (-not $SshExe) { return @{ Authenticated = $false; Detail = 'the OpenSSH client (ssh) is not installed' } }
-    $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
-    # adversary pass 1 A2 and pass 2 A2 (class: everything an inherited ssh config could make the probe DO beyond asking GitHub who this key is): StrictHostKeyChecking=yes adds no
-    # host key, UpdateHostKeys=no stops OpenSSH rewriting known_hosts after a successful login (it does that even under yes), ControlMaster=no / ControlPath=none stop a user's
-    # ControlPersist from leaving a multiplexing socket behind, PermitLocalCommand=no stops a LocalCommand, RemoteCommand=none and ClearAllForwardings / ForwardAgent=no stop a
-    # remote command or a forwarding. The user's own config is otherwise kept: Host github.com carries the IdentityFile the key probe has to use.
-    $sshOpts = @('BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes', 'UpdateHostKeys=no', 'ControlMaster=no', 'ControlPath=none', 'PermitLocalCommand=no', 'RemoteCommand=none', 'ClearAllForwardings=yes', 'ForwardAgent=no')
-    foreach ($a in @('-T') + @($sshOpts | ForEach-Object { '-o'; $_ }) + @('git@github.com')) { $psi.ArgumentList.Add($a) }
-    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
-    $proc = $null
-    try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
+    if (-not $KeyFile) { $KeyFile = Join-Path (Join-Path $env:USERPROFILE '.ssh') 'id_ed25519_github' }
+    # adversary pass 3 A1 + A2 (class: the probe parsed the USER's whole ssh config, which can run commands while it is parsed (Match exec) and can turn on writes under ~/.ssh
+    # (CheckHostIP appends the IP's host key to known_hosts even under StrictHostKeyChecking=yes)). The user's config is never read: ssh runs with -F <a minimal config this probe
+    # writes into the temp folder and deletes afterwards>, and -F also drops the system-wide ssh_config. The generated config holds only what the probe needs: the key the Ssh
+    # phase configures (when that file exists) and options that make the probe run nothing and write nothing: StrictHostKeyChecking=yes adds no host key, CheckHostIP=no and
+    # UpdateHostKeys=no stop the two known_hosts writes that remain, ControlMaster=no / ControlPath=none leave no multiplexing socket, PermitLocalCommand=no, RemoteCommand=none,
+    # ClearAllForwardings=yes and ForwardAgent=no stop a local or remote command and any forwarding. known_hosts is still read (the host key is checked against it).
+    $cfgLines = [Collections.Generic.List[string]]::new()
+    $cfgLines.Add('Host github.com'); $cfgLines.Add('    HostName github.com'); $cfgLines.Add('    User git')
+    if (Test-Path -LiteralPath $KeyFile -PathType Leaf) { $cfgLines.Add('    IdentityFile "' + ($KeyFile -replace '\\', '/') + '"'); $cfgLines.Add('    IdentitiesOnly yes') }
+    foreach ($o in @('BatchMode yes', 'ConnectTimeout 10', 'StrictHostKeyChecking yes', 'CheckHostIP no', 'UpdateHostKeys no', 'ControlMaster no', 'ControlPath none', 'PermitLocalCommand no', 'RemoteCommand none', 'ClearAllForwardings yes', 'ForwardAgent no')) { $cfgLines.Add("    $o") }
+    $cfgPath = Join-Path ([IO.Path]::GetTempPath()) ("mlv-ssh-probe-" + [guid]::NewGuid().ToString('N') + '.conf')
+    try { [IO.File]::WriteAllText($cfgPath, (($cfgLines -join "`n") + "`n"), [Text.Encoding]::ASCII) }
+    catch { Remove-Item -LiteralPath $cfgPath -Force -ErrorAction SilentlyContinue; return @{ Authenticated = $false; Detail = "the probe's ssh config could not be written ($($_.Exception.Message))" } }
     try {
-        $proc.StandardInput.Close()
-        $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
-        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-            try { $proc.Kill($true) } catch { }
-            return @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
-        }
-        $proc.WaitForExit()
-        return (Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)"))
-    } finally { $proc.Dispose() }
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
+        # the same options again on the command line (they win over the file): a second, independent statement of the no-run / no-write contract
+        $sshOpts = @('BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes', 'CheckHostIP=no', 'UpdateHostKeys=no', 'ControlMaster=no', 'ControlPath=none', 'PermitLocalCommand=no', 'RemoteCommand=none', 'ClearAllForwardings=yes', 'ForwardAgent=no')
+        foreach ($a in @('-F', $cfgPath, '-T') + @($sshOpts | ForEach-Object { '-o'; $_ }) + @('git@github.com')) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+        $proc = $null
+        try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
+        try {
+            $proc.StandardInput.Close()
+            $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+                try { $proc.Kill($true) } catch { }
+                return @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
+            }
+            $proc.WaitForExit()
+            return (Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)"))
+        } finally { $proc.Dispose() }
+    } finally { Remove-Item -LiteralPath $cfgPath -Force -ErrorAction SilentlyContinue }
 }
 
 # PURE decision (no process, no config read): what to do with remote <fork>'s push url. -Urls = every remote.fork.url, -PushUrls = every remote.fork.pushurl (empty when unset),
@@ -1183,6 +1200,16 @@ function Invoke-GitHubSshProbe {
 #   NOOP          pushes already go to exactly the SSH form
 #   READY         authenticated and the push url is unset (or equals the https fetch url): set pushurl to PushUrl
 #   FOREIGN       authenticated but a push url is neither the fetch url nor the SSH form: left as it is (fail closed)
+# adversary pass 3 A4: a rewrite rule or a remote name that holds a control character (or starts with '-') cannot be compared as a string with certainty, so it is unsafe: '' when
+# every rule and name is plain, otherwise the typed REMOTE_URL_UNSAFE reason.
+function Get-SshContextRefusal {
+    param([string[]]$Rules, [string[]]$Names)
+    foreach ($x in @(@($Rules) | ForEach-Object { @{ K = 'url rewrite rule'; V = "$_" } }) + @(@($Names) | ForEach-Object { @{ K = 'remote name'; V = "$_" } })) {
+        if ("$($x.V)" -match '[\x00-\x1F\x7F]') { return "REMOTE_URL_UNSAFE a $($x.K) holds a control character (refused: it cannot be compared with certainty)" }
+    }
+    return ''
+}
+
 function Get-SshPushUrlDecision {
     # -Urls / -PushUrls are read across every config scope (what Git uses); -LocalUrls / -LocalPushUrls are the repository's own config file only (what a lane with another HOME sees).
     # A caller that passes no Local list says they are the same (pass 2 A3).
@@ -1193,6 +1220,8 @@ function Get-SshPushUrlDecision {
     if ($Urls.Count -ne 1) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = "remote.fork.url holds $($Urls.Count) value(s), expected exactly one" } }
     if (($LocalUrls -join "`n") -cne ($Urls -join "`n")) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = 'remote.fork.url is not set only in the repository config (a global or system value counts too)' } }
     $fetch = "$($Urls[0])"
+    $why = Get-SshContextRefusal -Rules $Rules -Names $Names
+    if ($why) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = $why } }
     $why = Get-RemoteUrlRefusal -Urls @($fetch) -Rules $Rules -Names $Names
     if ($why) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = $why } }
     if (-not (Test-GitRemoteUrlSame $fetch $ExpectedUrl)) { return @{ Decision = 'REFUSED'; PushUrl = ''; Reason = "remote.fork.url $(Format-RemoteUrlForLog $fetch) does not name $ExpectedUrl" } }
@@ -1238,7 +1267,14 @@ function Get-SshPushUrlConfigSnapshot {
         Names     = [string[]]@($ctx.Names)
     }
 }
-function Get-SshPushUrlSnapshotKey($Snapshot) { return ((@('Urls', 'LocalUrls', 'Push', 'LocalPush', 'Rules', 'Names') | ForEach-Object { "$_=" + (@($Snapshot[$_]) -join [string][char]0x1F) }) -join [string][char]0x1E) }
+# adversary pass 3 A4: an unambiguous key. Every list is '<count>[<length>:<value>,...]' (a value is read by its length, so no value can look like a separator): the old
+# U+001F / U+001E join made ["a<US>b"] and ["a","b"] one key.
+function Get-SshPushUrlSnapshotKey($Snapshot) {
+    return ((@('Urls', 'LocalUrls', 'Push', 'LocalPush', 'Rules', 'Names') | ForEach-Object {
+        $items = @($Snapshot[$_] | ForEach-Object { "$_" })
+        "$_=$($items.Count)[" + (($items | ForEach-Object { "$($_.Length):$_" }) -join ',') + ']'
+    }) -join ';')
+}
 
 # Applies (or, with -VerifyOnly, only reports) the decision for the clone at $Repo. Setup: sets remote.fork.pushurl on READY. Verify: a READY or FOREIGN outcome is a typed
 # failure (the probe authenticates, so the push url must already be the SSH form); a probe that does not authenticate is a MANUAL line, never a failure.
@@ -1247,7 +1283,13 @@ function Invoke-SshPushUrl {
     if (-not $Probe) { $Probe = $(if ($script:SshProbeOverride) { $script:SshProbeOverride } else { { Invoke-GitHubSshProbe } }) }
     if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git'))) { Write-Log "SSH_PUSHURL skipped: no clone at $Repo yet"; return }
     $snap = Get-SshPushUrlConfigSnapshot
-    if ($snap.Urls.Count -eq 0) { Write-Log "SSH_PUSHURL skipped: $Repo has no 'fork' remote"; return }
+    if ($snap.Urls.Count -eq 0) {
+        # adversary pass 3 A6: Verify cannot confirm the push url of a clone that has no 'fork' remote (the Clone phase fails such a repo too), so there it is a typed failure, never a skip.
+        # A clone that does not exist yet (above) stays a skip.
+        if ($VerifyOnly) { Write-Log "SSH_PUSHURL_MISSING remote=fork: $Repo has no 'fork' remote, so no push url can be confirmed (run -Phase Clone)" 'ERROR'; $script:Failures.Add('SSH_PUSHURL_MISSING remote=fork') }
+        else { Write-Log "SSH_PUSHURL skipped: $Repo has no 'fork' remote" }
+        return
+    }
     $d = Get-SshPushUrlDecision -Urls $snap.Urls -LocalUrls $snap.LocalUrls -PushUrls $snap.Push -LocalPushUrls $snap.LocalPush -ExpectedUrl $ForkUrl -Rules $snap.Rules -Names $snap.Names -Probe $Probe
     $ssh = $d.PushUrl
     # adversary pass 2 A1 / A4: the probe takes seconds and the decision used the configuration as it was BEFORE it. A READY or NOOP verdict (the two that claim an ssh push) is
@@ -1274,10 +1316,25 @@ function Invoke-SshPushUrl {
                 if ($snap.Push.Count -eq 0) { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--add', 'remote.fork.pushurl', $ssh)) }
                 else { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh, (ConvertTo-GitValueRegex "$($snap.Push[0])"))) }
                 $back = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
-                if ($back.Count -ne 1 -or "$($back[0])" -cne $ssh) {
-                    if (@($back | Where-Object { "$_" -ceq $ssh }).Count -gt 0) { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--unset-all', 'remote.fork.pushurl', (ConvertTo-GitValueRegex $ssh)) -AllowFail) }
+                $ours = @($back | Where-Object { "$_" -ceq $ssh }).Count; $others = $back.Count - $ours
+                if ($others -eq 0 -and $ours -ge 2) {
+                    # adversary pass 3 A3: another run wrote the identical value. Two copies of one value are a PASS, normalised to one: the --replace-all is restricted to a pattern that
+                    # matches only our exact value, so it can never remove anything else and never deletes both copies.
+                    [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh, (ConvertTo-GitValueRegex $ssh)))
+                    $back = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
+                    $ours = @($back | Where-Object { "$_" -ceq $ssh }).Count; $others = $back.Count - $ours
+                }
+                # adversary pass 3 A5: the refusal checks of the decision are run again AFTER the write, with the rules and names as they are now (a rule added between the last
+                # snapshot compare and the write rewrites the ssh url, and the read-back above only looks at push urls)
+                $post = Get-SshPushUrlConfigSnapshot
+                $refusal = Get-SshContextRefusal -Rules $post.Rules -Names $post.Names
+                if (-not $refusal) { $refusal = Get-RemoteUrlRefusal -Urls (@($post.Urls) + @($post.Push)) -Rules $post.Rules -Names $post.Names }
+                if ($others -gt 0 -or $ours -ne 1 -or $refusal) {
+                    # take back only a value that is certainly ours: exactly one copy of the ssh url. Two or more copies with a foreign value present are left as they are (we cannot tell
+                    # whose copy is whose, and never delete another run's value)
+                    if ($ours -eq 1) { [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--unset-all', 'remote.fork.pushurl', (ConvertTo-GitValueRegex $ssh)) -AllowFail) }
                     $script:Failures.Add('PUSHURL_CHANGED_DURING_PROBE remote=fork')
-                    throw "PUSHURL_CHANGED_DURING_PROBE remote.fork.pushurl read back as '$((@($back | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ' | ')' after the write, expected only $ssh; our value was taken back and every other value was left as it is"
+                    throw "PUSHURL_CHANGED_DURING_PROBE remote.fork.pushurl read back as '$((@($back | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ' | ')' after the write, expected only $ssh$(if ($refusal) { "; $refusal" }); $(if ($ours -eq 1) { 'our value was taken back' } else { 'no value was taken back' }) and every other value was left as it is"
                 }
                 Write-Log "SSH_PUSH_READY remote=fork pushurl=$ssh" 'OK'
             }
