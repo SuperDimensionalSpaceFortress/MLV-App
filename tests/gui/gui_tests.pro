@@ -49,6 +49,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/Histogram.h \
     $$REPO_ROOT/platform/qt/MainWindowGpuPreviewPolicy.h \
     $$REPO_ROOT/platform/qt/PlayerShortcutBinding.h \
+    $$REPO_ROOT/platform/qt/PlayerTransportToolbar.h \
     $$REPO_ROOT/platform/qt/ScopesLabel.h \
     $$REPO_ROOT/platform/qt/VectorScope.h \
     $$REPO_ROOT/platform/qt/WaveFormMonitor.h \

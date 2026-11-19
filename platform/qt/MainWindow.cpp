@@ -17,6 +17,7 @@
 #include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackScaleLabel.h"
 #include "PlayerShortcutBinding.h"
+#include "PlayerTransportToolbar.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
 #include "LogLineField.h"
@@ -13745,6 +13746,8 @@ void MainWindow::initGui( void )
     //Focused inputs keep their navigation keys (Left/Right/Home/End/PgUp/PgDown/Return/Enter);
     //the seek bar is exempt, so it and the viewer get the player keys
     qApp->installEventFilter( new PlayerShortcutBinding::FocusGuard( ui->horizontalSliderPosition, this ) );
+    //Transport cluster icons and key tooltips; must run after bindToWindow (tooltips read the live keys)
+    PlayerTransportToolbar::finish( ui->mainToolBar, this );
 }
 
 //Initialize the library
@@ -23168,6 +23171,24 @@ void MainWindow::on_actionGoto_Last_Frame_triggered()
      && ui->actionPlay->isChecked() )
     {
         requestPlaybackAudioSync();
+    }
+}
+
+//Stop: return to cut in and pause (PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1)
+//The seek comes first: the pause can deliver queued input (processEvents when the clip has audio),
+//and a key pressed after Stop (End, Home, a frame step) must win over Stop's seek, never be overwritten
+void MainWindow::on_actionStop_triggered()
+{
+    if( m_fileLoaded && m_pMlvObject )
+    {
+        const int cutInFrame = PlayerTransportToolbar::stopTargetFrame( ui->spinBoxCutIn->value(), getMlvFrames( m_pMlvObject ) );
+        ui->horizontalSliderPosition->setValue( cutInFrame );
+        m_newPosDropMode = cutInFrame;
+    }
+    if( ui->actionPlay->isChecked() )
+    {
+        ui->actionPlay->setChecked( false );
+        on_actionPlay_triggered( false );
     }
 }
 

@@ -417,6 +417,7 @@ HEADERS += MainWindow.h \
            LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
            PlayerShortcutBinding.h \
+           PlayerTransportToolbar.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \
