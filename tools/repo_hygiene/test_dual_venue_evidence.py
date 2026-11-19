@@ -16507,6 +16507,87 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 if blocks:
                     self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
 
+    def r12_multi_backend_cases(self) -> list[tuple[str, dict, str | None]]:
+        """r12 (sol r11 B1 on d3b176e3): (name, spec, the typed gap text expected, or None for no gap). Sol's repro: the committed s1 fstoggle spec with its cuda
+        criteria rows copied to cpu in BOTH sets, in both backend orders; then the same spec with one selected backend's array removed or its binding dropped."""
+        full = self.fstoggle_spec()
+        def multi(order: list[str], drop: tuple[str, str] | None = None, unbind: tuple[str, str] | None = None) -> dict:
+            spec = json.loads(json.dumps(full))
+            spec["backends"] = list(order)
+            for set_name in ("acceptance", "supplementary"):
+                cuda_rows = spec["criteria"][set_name]["cuda"]
+                spec["criteria"][set_name]["cpu"] = json.loads(json.dumps(cuda_rows))
+            if drop is not None:
+                del spec["criteria"][drop[0]][drop[1]]
+            if unbind is not None:
+                rows = spec["criteria"][unbind[0]][unbind[1]]
+                spec["criteria"][unbind[0]][unbind[1]] = [r for r in rows if r.get("metric") != "windowToggleEvidenceReason"]
+            return spec
+        return [
+            ("sol r11 B1 repro: backends [cpu, cuda], complete bindings in both sets -> no criteria gap", multi(["cpu", "cuda"]), None),
+            ("sol r11 B1 repro: backends [cuda, cpu], complete bindings in both sets -> no criteria gap", multi(["cuda", "cpu"]), None),
+            ("control: the committed single-cuda spec -> no criteria gap", full, None),
+            ("backends [cpu, cuda] with criteria.supplementary.cpu removed -> refusal naming cpu", multi(["cpu", "cuda"], drop=("supplementary", "cpu")),
+             "criteria.supplementary has no cpu array"),
+            ("backends [cuda, cpu] with criteria.acceptance.cuda removed -> refusal naming cuda", multi(["cuda", "cpu"], drop=("acceptance", "cuda")),
+             "criteria.acceptance has no cuda array"),
+            ("backends [cpu, cuda] with criteria.acceptance.cpu not binding windowToggleEvidenceReason -> refusal", multi(["cpu", "cuda"], unbind=("acceptance", "cpu")),
+             "criteria.acceptance.cpu does not bind windowToggleEvidenceReason eq ok"),
+        ]
+
+    def test_r12_sol_b1_a_multi_backend_spec_is_judged_per_backend_never_as_one_joined_name(self) -> None:
+        """r12 (sol r11 B1 on d3b176e3, site DualVenueRunner.psm1 Get-DvWindowToggleCriteriaGap; reached by Get-DvWindowToggleReconcileEvidence, which the leg writer
+        Invoke-VenueLeg.ps1 and Test-DvReceiptValid both call): Get-DvProp hands the backends array over as ONE pipeline object, and a [string] cast of it joined
+        ["cpu","cuda"] into 'cpu cuda'. The guard iterates the backend values: complete multi-backend bindings in either order are no gap, and a missing or unbound
+        selected-backend array is still the typed refusal."""
+        cases = self.r12_multi_backend_cases()
+        with tempfile.TemporaryDirectory(prefix="wt-r12b1-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": self.log()} for _, spec, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "  $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = [string]$r.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, gap), got in zip(cases, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                if gap is None:
+                    self.assertFalse(got["blocks"], got)
+                    self.assertNotIn("cpu cuda", got["reason"], got)
+                    self.assertNotIn("cuda cpu", got["reason"], got)
+                else:
+                    self.assertTrue(got["blocks"], got)
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
+                    self.assertIn(gap, got["reason"], got)
+
+    def test_r12_fable_note_the_preflight_refuses_an_unbound_criteria_set_with_the_reconcilers_typed_reason(self) -> None:
+        """r12 (fable r11 hardening note on d3b176e3: the preflight shape refusal did not catch an empty criteria.supplementary that the reconciler later reads as
+        WINDOW_TOGGLES_CRITERIA_UNBOUND): Get-DvLegSpecShapeRefusal, the leg's and every batch preflight's live check, refuses a requested leg whose criteria do not
+        bind the five scalars for every backend it names, with the SAME typed reason, before a lease opens; a complete binding (single or multi-backend) is admitted."""
+        empty_supp = self.fstoggle_spec()
+        empty_supp["criteria"]["supplementary"] = {}
+        cases = [(name, spec, gap) for name, spec, gap in self.r12_multi_backend_cases()]
+        cases.append(("fable r11 note: criteria.supplementary = {} -> refusal", empty_supp, "criteria.supplementary has no cuda array"))
+        with tempfile.TemporaryDirectory(prefix="wt-r12pre-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec} for _, spec, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { [ordered]@{ r = [string](Get-DvLegSpecShapeRefusal -Spec $_.spec) } }) | ConvertTo-Json -Compress -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, gap), got in zip(cases, out, strict=True):
+            with self.subTest(gate="preflight", case=name):
+                if gap is None:
+                    self.assertEqual(got["r"], "", got)
+                else:
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["r"], got)
+                    self.assertIn(gap, got["r"], got)
+
     def r11_a1_rows(self) -> list[tuple[str, str, str, str, tuple[int, int, int, int]]]:
         """r11 (sol r10 A1 and opus key3 r10 B1 on 7fc447b9): (name, log, session, typed reason, counts). The window is the FIRST marker of the session, closed at the
         next marker of ANY other id; a second marker of the same id is itself evidence of a broken session (the app writes one per process), so it names itself."""

@@ -2065,7 +2065,16 @@ function Get-DvWindowToggleCriteriaGap {
     $criteria = Get-DvProp $Spec 'criteria'
     # r11b (r11 adversary A1 on 7d6aea0a, inputs: criteria.supplementary = {}, and both sets keyed cpu while backends = ["cuda"]): BOTH sets must be present, and
     # each must hold a role array for EVERY backend the spec names (the array Test-DvCriteria judges; a missing one passes vacuously), each binding all five
-    $backends = @(Get-DvProp $Spec 'backends' | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    # r12 (sol r11 B1 on d3b176e3, input: backends ["cpu","cuda"] with complete cpu and cuda arrays in both sets): Get-DvProp hands the backends array over as ONE
+    # pipeline object, so piping it straight into a [string] cast joined it into 'cpu cuda' and refused a valid spec. The value is held first and @() enumerates its
+    # elements; each is one backend NAME (a JSON string, the schema's enum), and an entry that is not a string is refused by name, never cast
+    $backendsValue = Get-DvProp $Spec 'backends'
+    $backends = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @($backendsValue)) {
+        if ($null -eq $entry) { continue }
+        if ($entry -isnot [string]) { return "the spec's backends holds a non-string entry ($(ConvertTo-Json -InputObject $entry -Compress -Depth 3)), so no criteria array is named by it" }
+        $backends.Add($entry)
+    }
     if ($backends.Count -lt 1) { return 'the spec names no backend, so no criteria array is judged' }
     foreach ($setName in 'acceptance', 'supplementary') {
         $set = Get-DvProp $criteria $setName
@@ -3427,6 +3436,10 @@ function Get-DvLegSpecShapeRefusal {
             if ($null -eq $displayModeProp -or $displayModeProp.Value -isnot [string] -or $displayModeProp.Value -cne 'windowed') {
                 return 'generatorArgs.midPlayWindowToggles needs displayMode "windowed" (the app drives the toggles on a windowed leg only)'
             }
+            # r12 (fable r11 note on d3b176e3, input: criteria.supplementary = {}): the criteria that fail an honest non-ok toggle proof are checked here too, by the
+            # reconciler's own Get-DvWindowToggleCriteriaGap and with its typed reason, so an unbound leg is refused before a lease opens, not only after its run
+            $toggleCriteriaGap = Get-DvWindowToggleCriteriaGap -Spec $Spec
+            if ($null -ne $toggleCriteriaGap) { return "WINDOW_TOGGLES_CRITERIA_UNBOUND: the leg names midPlayWindowToggles but $toggleCriteriaGap" }
         }
         # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A3 and A4 on 84d66a4b): a PRESENT team-partition key is a whole number from 1 to 16 -- a JSON int, the
         # convention look.contactSheetFrames uses (a JSON number with a fraction, 12.0 included, parses to a double and is no whole number here), never null --
