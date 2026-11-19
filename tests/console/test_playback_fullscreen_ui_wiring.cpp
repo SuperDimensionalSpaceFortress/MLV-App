@@ -12,7 +12,10 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
+#include <QDir>
+#include <QDirIterator>
 #include <QFile>
+#include <QFileInfo>
 #include <QRegularExpression>
 #include <QString>
 #include <QStringList>
@@ -275,6 +278,144 @@ TEST(PlaybackFullscreenUiWiring, HelpMenuOffersKeyboardShortcuts)
         QStringLiteral("\n}"));
     ASSERT_FALSE(slot.isEmpty());
     ASSERT_TRUE(slot.contains(QStringLiteral("PlayerShortcutBinding::createShortcutsDialog( this )")));
+}
+
+namespace
+{
+
+QStringList addactionNames(const QString & block)
+{
+    QStringList names;
+    QRegularExpressionMatchIterator it =
+        QRegularExpression(QStringLiteral("<addaction name=\"(\\w+)\"/>")).globalMatch(block);
+    while (it.hasNext()) names << it.next().captured(1);
+    return names;
+}
+
+} // namespace
+
+TEST(PlayerToolbarTransportButtons, MainToolBarCarriesTheClusterInOrderAndMatchesTheHeaderList)
+{
+    // PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1 T1: literal oracle, then a drift guard against the ONE list.
+    const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
+    const QString toolbar = functionBody(ui,
+        QStringLiteral("<widget class=\"QToolBar\" name=\"mainToolBar\">"),
+        QStringLiteral("</widget>"));
+    ASSERT_FALSE(toolbar.isEmpty());
+    const QStringList all = addactionNames(toolbar);
+    const int first = all.indexOf(QStringLiteral("actionGoto_First_Frame"));
+    ASSERT_TRUE(first >= 0);
+    const QStringList cluster = all.mid(first);
+    const QStringList oracle{
+        QStringLiteral("actionGoto_First_Frame"), QStringLiteral("actionPreviousFrame"),
+        QStringLiteral("actionPlay"), QStringLiteral("actionStop"), QStringLiteral("actionNextFrame"),
+        QStringLiteral("actionGoto_Last_Frame"), QStringLiteral("actionLoop"), QStringLiteral("separator"),
+        QStringLiteral("actionAudioOutput"), QStringLiteral("separator"), QStringLiteral("actionZoomFit"),
+        QStringLiteral("actionZoom100"), QStringLiteral("actionFullscreen") };
+    ASSERT_EQ(oracle.join(QStringLiteral(",")).toStdString(), cluster.join(QStringLiteral(",")).toStdString());
+
+    const QString header = readRepoFile(QStringLiteral("platform/qt/PlayerTransportToolbar.h"));
+    const QString list = functionBody(header,
+        QStringLiteral("inline QStringList clusterActionNames()"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(list.isEmpty());
+    QStringList headerNames;
+    QRegularExpressionMatchIterator it =
+        QRegularExpression(QStringLiteral("QStringLiteral\\( \"(\\w+)\" \\)")).globalMatch(list);
+    while (it.hasNext()) headerNames << it.next().captured(1);
+    QStringList withoutSeparators = cluster;
+    withoutSeparators.removeAll(QStringLiteral("separator"));
+    ASSERT_EQ(withoutSeparators.join(QStringLiteral(",")).toStdString(), headerNames.join(QStringLiteral(",")).toStdString());
+}
+
+TEST(PlayerToolbarTransportButtons, PlaybackMenuOffersStopRightAfterPlayAndStopHasNoShortcut)
+{
+    // T2: K is reserved for PLAYER-JKL-SHUTTLE-1, so Stop stays unbound.
+    const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
+    const QString menu = functionBody(ui,
+        QStringLiteral("<widget class=\"QMenu\" name=\"menuPlayback\">"),
+        QStringLiteral("<widget class=\"QMenu\" name=\"menuView\">"));
+    ASSERT_FALSE(menu.isEmpty());
+    const QStringList names = addactionNames(menu);
+    const int play = names.indexOf(QStringLiteral("actionPlay"));
+    ASSERT_TRUE(play >= 0);
+    ASSERT_TRUE(play + 1 < names.size());
+    ASSERT_EQ(std::string("actionStop"), names.at(play + 1).toStdString());
+    const QString action = functionBody(ui,
+        QStringLiteral("<action name=\"actionStop\">"),
+        QStringLiteral("</action>"));
+    ASSERT_FALSE(action.isEmpty());
+    ASSERT_FALSE(action.contains(QStringLiteral("name=\"shortcut\"")));
+}
+
+TEST(PlayerToolbarTransportButtons, StopSeeksToCutInThenPausesAndNothingRunsAfterThePause)
+{
+    // T3: the clamped cut-in seek, then the user-pause form. Never the Goto First Frame toggle,
+    // which jumps to 0 when the position already is cut in.
+    // Adversary A1 on 3802e3b4: the pause runs processEvents() (clip with audio), which can deliver a
+    // key pressed after Stop (End: slider 99). A seek AFTER the pause overwrote it with cut in. So the
+    // seek comes first and the pause is the last thing the slot does: input it delivers wins.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("void MainWindow::on_actionStop_triggered()"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(body.isEmpty());
+    const int seek = body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"));
+    const int track = body.indexOf(QStringLiteral("m_newPosDropMode = cutInFrame;"));
+    const int setChecked = body.indexOf(QStringLiteral("ui->actionPlay->setChecked( false );"));
+    const int paused = body.indexOf(QStringLiteral("on_actionPlay_triggered( false );"));
+    ASSERT_TRUE(seek >= 0);
+    ASSERT_TRUE(track > seek);
+    ASSERT_TRUE(setChecked > track);
+    ASSERT_TRUE(paused > setChecked);
+    // After the pause call only the closing braces remain: no seek, no return, nothing that could
+    // overwrite input the pause delivered.
+    const QString afterPause = body.mid(paused + int(QStringLiteral("on_actionPlay_triggered( false );").size()));
+    ASSERT_EQ(std::string(), afterPause.simplified().remove(QLatin1Char('}')).remove(QLatin1Char(' ')).toStdString());
+    ASSERT_EQ(1, int(body.count(QStringLiteral("horizontalSliderPosition->setValue("))));
+    ASSERT_EQ(1, int(body.count(QStringLiteral("m_newPosDropMode ="))));
+    ASSERT_TRUE(body.contains(QStringLiteral("PlayerTransportToolbar::stopTargetFrame( ui->spinBoxCutIn->value()")));
+    ASSERT_FALSE(body.contains(QStringLiteral("on_actionGoto_First_Frame_triggered")));
+}
+
+TEST(PlayerToolbarTransportButtons, FinishRunsOnceAtTheEndOfInitGuiAfterTheLiveBinding)
+{
+    // T4: tooltips read the live keys, so finish() must run after bindToWindow().
+    const QString call = QStringLiteral("PlayerTransportToolbar::finish( ui->mainToolBar, this );");
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_EQ(1, int(source.count(call)));
+    ASSERT_EQ(1, int(source.count(QStringLiteral("PlayerTransportToolbar::finish("))));
+    const QString initGui = functionBody(source,
+        QStringLiteral("void MainWindow::initGui( void )"),
+        QStringLiteral("void MainWindow::initLib( void )"));
+    ASSERT_FALSE(initGui.isEmpty());
+    const int callAt = initGui.indexOf(call);
+    ASSERT_TRUE(callAt >= 0);
+    const int bindAt = initGui.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"));
+    const int guardAt = initGui.indexOf(QStringLiteral(
+        "qApp->installEventFilter( new PlayerShortcutBinding::FocusGuard( ui->horizontalSliderPosition, this ) );"));
+    ASSERT_TRUE(bindAt >= 0);
+    ASSERT_TRUE(guardAt > bindAt);
+    ASSERT_TRUE(callAt > guardAt);
+
+    // No other app source calls it.
+    for (const char *base : { "platform/qt", "src" })
+    {
+        const QString root = repo_file_path(QString::fromLatin1(base));
+        ASSERT_FALSE(root.isEmpty());
+        QDirIterator files(root, QStringList{ QStringLiteral("*.cpp"), QStringLiteral("*.h") },
+                           QDir::Files, QDirIterator::Subdirectories);
+        while (files.hasNext())
+        {
+            const QString path = files.next();
+            if (path.endsWith(QStringLiteral("/MainWindow.cpp")) || path.endsWith(QStringLiteral("/PlayerTransportToolbar.h"))) continue;
+            if (path.contains(QStringLiteral("/build")) || QFileInfo(path).fileName().startsWith(QStringLiteral("ui_"))
+                || QFileInfo(path).fileName().startsWith(QStringLiteral("moc_"))) continue;
+            QFile file(path);
+            ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+            ASSERT_FALSE(QString::fromUtf8(file.readAll()).contains(QStringLiteral("PlayerTransportToolbar::finish(")));
+        }
+    }
 }
 
 TEST(PlaybackFullscreenUiWiring, HeaderStillDeclaresTheAction)

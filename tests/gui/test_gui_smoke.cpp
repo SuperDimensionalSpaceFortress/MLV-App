@@ -10,6 +10,7 @@
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
 #include "../../platform/qt/PlaybackScopesDuringPlayback.h"
 #include "../../platform/qt/PlayerShortcutBinding.h"
+#include "../../platform/qt/PlayerTransportToolbar.h"
 #include "../../platform/qt/ScopesLabel.h"
 #include "../../platform/qt/VectorScope.h"
 #include "../../platform/qt/ViewerDoubleClickFilter.h"
@@ -55,6 +56,7 @@
 #include <QStringListModel>
 #include <QStyleHints>
 #include <QTableWidget>
+#include <QTemporaryDir>
 #include <QToolBar>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -650,6 +652,10 @@ private slots:
     void playerShortcutMap_glContainerFocus();
     void playerShortcutMap_helpRowsAreGeneratedFromLiveActions();
     void playerShortcutMap_oneSecondSeekTargetNeverOverflows();
+    void transportToolbar_tooltipsCarryTheLiveKeys();
+    void transportToolbar_finishIsIdempotent();
+    void transportToolbar_runtimeIconsAreDrawn();
+    void transportToolbar_stopTargetFrameIsClampedCutIn();
     void mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes();
     void mainWindowGpuPreviewPolicyScopesVetoOnlyWhenDisplayed();
     void mainWindowGpuPreviewPolicyHideScopesVetoesNothingWhilePlaying();
@@ -1505,6 +1511,157 @@ void GuiSmokeTest::playerShortcutMap_helpRowsAreGeneratedFromLiveActions()
         QVERIFY( !( table->item( r, 0 )->flags() & Qt::ItemIsEditable ) );
     }
     QVERIFY( dialog->findChild<QDialogButtonBox*>() );
+}
+
+namespace
+{
+
+// PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1: a main window carrying the transport cluster (named by
+// PlayerTransportToolbar::clusterActionNames(), in order) on a toolbar, plus a widget like the
+// playback-quality button. Stop and Goto Last Frame have no icon, as in MainWindow.ui.
+class TransportToolbarFixture
+{
+public:
+    TransportToolbarFixture()
+    {
+        bar = new QToolBar( &window );
+        window.addToolBar( bar );
+        QPixmap standIn( 24, 24 );
+        standIn.fill( Qt::gray );
+        const QStringList withoutIcon{ QStringLiteral( "actionStop" ), QStringLiteral( "actionGoto_Last_Frame" ) };
+        const QMap<QString, QString> tips{
+            { QStringLiteral( "actionGoto_First_Frame" ), QStringLiteral( "Jump to first frame..." ) },
+            { QStringLiteral( "actionPlay" ), QStringLiteral( "Play clip..." ) },
+            { QStringLiteral( "actionStop" ), QStringLiteral( "Stop and return to cut in" ) },
+            { QStringLiteral( "actionGoto_Last_Frame" ), QStringLiteral( "Jump to last frame..." ) },
+            { QStringLiteral( "actionAudioOutput" ), QStringLiteral( "Audio Output on Playback" ) } };
+        for( const QString &name : PlayerTransportToolbar::clusterActionNames() )
+        {
+            QAction *action = new QAction( QString( name ).remove( QStringLiteral( "action" ) ), &window );
+            action->setObjectName( name );
+            if( !withoutIcon.contains( name ) ) action->setIcon( QIcon( standIn ) );
+            if( tips.contains( name ) ) action->setToolTip( tips.value( name ) );
+            bar->addAction( action );
+            actions.insert( name, action );
+        }
+        quality = new QToolButton;
+        quality->setToolTip( QStringLiteral( "quality" ) );
+        bar->addWidget( quality );
+    }
+
+    QMainWindow window;
+    QToolBar *bar = nullptr;
+    QToolButton *quality = nullptr;
+    QMap<QString, QAction*> actions;
+};
+
+QStringList transportToolTips( const TransportToolbarFixture &f )
+{
+    QStringList tips;
+    for( const QString &name : PlayerTransportToolbar::clusterActionNames() )
+        tips << f.actions.value( name )->toolTip() << f.bar->widgetForAction( f.actions.value( name ) )->toolTip();
+    return tips;
+}
+
+} // namespace
+
+void GuiSmokeTest::transportToolbar_tooltipsCarryTheLiveKeys()
+{
+    // G1: every table action's tooltip ends with its LIVE keys (set by bindToWindow, never typed
+    // by hand); unbound Stop and Audio Output get none; the quality widget is left alone.
+    TransportToolbarFixture f;
+    PlayerShortcutBinding::bindToWindow( &f.window );
+    PlayerTransportToolbar::finish( f.bar, &f.window );
+    const QStringList table = PlayerShortcutBinding::liveActionNames();
+    int keyed = 0;
+    for( const QString &name : PlayerTransportToolbar::clusterActionNames() )
+    {
+        QAction *action = f.actions.value( name );
+        QVERIFY2( action, qPrintable( name ) );
+        QWidget *button = f.bar->widgetForAction( action );
+        QVERIFY2( button, qPrintable( name ) );
+        QCOMPARE( button->toolTip(), action->toolTip() );
+        if( table.contains( name ) )
+        {
+            QVERIFY2( !action->shortcuts().isEmpty(), qPrintable( name ) );
+            const QString suffix = QStringLiteral( "(" ) + PlayerShortcutBinding::keysText( action->shortcuts() ) + QStringLiteral( ")" );
+            QVERIFY2( action->toolTip().endsWith( suffix ), qPrintable( name + QStringLiteral( ": " ) + action->toolTip() ) );
+            ++keyed;
+        }
+    }
+    QCOMPARE( keyed, 9 );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionStop" ) )->toolTip().contains( QStringLiteral( " (" ) ) );
+    QCOMPARE( f.actions.value( QStringLiteral( "actionStop" ) )->toolTip(), QStringLiteral( "Stop and return to cut in" ) );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionAudioOutput" ) )->toolTip().contains( QStringLiteral( " (" ) ) );
+    // The trailing "..." goes before the keys are appended.
+    QCOMPARE( f.actions.value( QStringLiteral( "actionGoto_Last_Frame" ) )->toolTip(),
+              QStringLiteral( "Jump to last frame (%1)" ).arg( QKeySequence( Qt::Key_End ).toString( QKeySequence::NativeText ) ) );
+    QCOMPARE( f.quality->toolTip(), QStringLiteral( "quality" ) );
+    QCOMPARE( PlayerTransportToolbar::keyedToolTip( QStringLiteral( "Play." ), {} ), QStringLiteral( "Play." ) );
+    QCOMPARE( PlayerTransportToolbar::keyedToolTip( QStringLiteral( "Play clip... " ), { QKeySequence( Qt::Key_P ) } ),
+              QStringLiteral( "Play clip (%1)" ).arg( QKeySequence( Qt::Key_P ).toString( QKeySequence::NativeText ) ) );
+}
+
+void GuiSmokeTest::transportToolbar_finishIsIdempotent()
+{
+    // G2: running finish() again never stacks a second key suffix.
+    TransportToolbarFixture f;
+    PlayerShortcutBinding::bindToWindow( &f.window );
+    PlayerTransportToolbar::finish( f.bar, &f.window );
+    const QStringList once = transportToolTips( f );
+    PlayerTransportToolbar::finish( f.bar, &f.window );
+    QCOMPARE( transportToolTips( f ), once );
+    QCOMPARE( f.quality->toolTip(), QStringLiteral( "quality" ) );
+}
+
+void GuiSmokeTest::transportToolbar_runtimeIconsAreDrawn()
+{
+    // G3: gui_tests does not link ressources.qrc, so stand-in Play / First Frame images are
+    // written to a temporary directory and handed to finish().
+    QTemporaryDir dir;
+    QVERIFY( dir.isValid() );
+    const QColor ink( 200, 30, 40 );
+    QImage play( 24, 24, QImage::Format_ARGB32 );
+    play.fill( Qt::transparent );
+    for( int y = 4; y < 20; ++y )
+        for( int x = 6; x < 6 + ( y < 12 ? y - 3 : 20 - y ); ++x )
+            play.setPixelColor( x, y, ink );
+    play.setPixelColor( 0, 0, QColor( 10, 10, 10, 40 ) );   // a faint pixel first in scan order
+    const QString playPath = dir.filePath( QStringLiteral( "Play.png" ) );
+    QVERIFY( play.save( playPath ) );
+    QImage first( 24, 24, QImage::Format_ARGB32 );
+    first.fill( Qt::transparent );
+    first.setPixelColor( 1, 12, ink );                       // left-only mark
+    const QString firstPath = dir.filePath( QStringLiteral( "FirstFrame.png" ) );
+    QVERIFY( first.save( firstPath ) );
+
+    TransportToolbarFixture f;
+    PlayerShortcutBinding::bindToWindow( &f.window );
+    PlayerTransportToolbar::finish( f.bar, &f.window, firstPath, playPath );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionStop" ) )->icon().isNull() );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionGoto_Last_Frame" ) )->icon().isNull() );
+
+    const QImage stop = PlayerTransportToolbar::stopIcon( playPath ).pixmap( 24, 24 ).toImage().convertToFormat( QImage::Format_ARGB32 );
+    QCOMPARE( stop.size(), QSize( 24, 24 ) );
+    QCOMPARE( stop.pixelColor( 12, 12 ), ink );
+    QCOMPARE( stop.pixelColor( 0, 0 ).alpha(), 0 );
+    QCOMPARE( stop.pixelColor( 23, 23 ).alpha(), 0 );
+    const QImage last = PlayerTransportToolbar::mirroredIcon( firstPath ).pixmap( 24, 24 ).toImage().convertToFormat( QImage::Format_ARGB32 );
+    QCOMPARE( last.pixelColor( 22, 12 ), ink );
+    QCOMPARE( last.pixelColor( 1, 12 ).alpha(), 0 );
+    QVERIFY( PlayerTransportToolbar::stopIcon( dir.filePath( QStringLiteral( "missing.png" ) ) ).isNull() );
+}
+
+void GuiSmokeTest::transportToolbar_stopTargetFrameIsClampedCutIn()
+{
+    // G4: cut in is a 1-based spin value; Stop seeks to its clamped 0-based frame.
+    using PlayerTransportToolbar::stopTargetFrame;
+    QCOMPARE( stopTargetFrame( 1, 100 ), 0 );
+    QCOMPARE( stopTargetFrame( 50, 100 ), 49 );
+    QCOMPARE( stopTargetFrame( 500, 100 ), 99 );
+    QCOMPARE( stopTargetFrame( 5, 0 ), 0 );
+    QCOMPARE( stopTargetFrame( 0, 100 ), 0 );
+    QCOMPARE( stopTargetFrame( std::numeric_limits<int>::min(), 100 ), 0 );
 }
 
 void GuiSmokeTest::mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes()
