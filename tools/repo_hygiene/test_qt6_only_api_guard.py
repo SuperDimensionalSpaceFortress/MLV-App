@@ -24,8 +24,14 @@ SCOPED_HEADERS = (
 # A member access of a Qt 6.0+ only QMouseEvent/QSinglePointEvent accessor: `->position`,
 # `.position`, and the global/scene variants, with or without grouping parentheses before the call
 # (r3 adversary A3: `(e->position)()`). `QMouseEvent::position()` does not match.
-QT6_ONLY_CALL = re.compile(r"(?:->|\.)\s*(?:position|globalPosition|scenePosition)\b")
-DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+# A qualified member name (`e->QMouseEvent::position()`, pass 2 A2) names the same accessor.
+QT6_ONLY_CALL = re.compile(
+    r"(?:->|\.)\s*(?:::\s*)?(?:\w+\s*::\s*)*(?:position|globalPosition|scenePosition)\b"
+)
+# `%:` is the digraph spelling of `#` (pass 2 A3).
+DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+RAW_STRING_PREFIXES = ("R", "LR", "uR", "UR", "u8R")
+RAW_STRING_OPEN = re.compile(r'([^()\\\s"]{0,16})\(')
 # Only the plain condition counts as a Qt 6 branch: a negated or compound one (r3 adversary A1:
 # `!(...)`, `... || 1`, `... && 0`) is "other", so a call under it reads unguarded (fail closed).
 QT6_CHECK = re.compile(
@@ -69,6 +75,20 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
                 current.append(" ")
                 i += 2
                 continue
+            token = re.search(r"[\w'.]*$", "".join(current)).group(0)
+            if ch == "'" and token[:1].isdigit():
+                current.append(ch)  # a digit separator (1'000), not a char literal (pass 2 A1)
+                i += 1
+                continue
+            if ch == '"' and re.search(r"\w*$", token).group(0) in RAW_STRING_PREFIXES:
+                opened = RAW_STRING_OPEN.match(text, i + 1)
+                close = text.find(")" + opened.group(1) + '"', opened.end()) if opened else -1
+                if close >= 0:  # a raw string ends only at )delim" (pass 2 A1)
+                    end = close + len(opened.group(1)) + 2
+                    line += text.count("\n", i, end)
+                    current.append('""')
+                    i = end
+                    continue
             if ch in "\"'":
                 state = "string" if ch == '"' else "char"
             current.append(ch)
@@ -214,6 +234,39 @@ class Qt6OnlyApiGuardTests(unittest.TestCase):
         for call in ("(e->position)()", "(e.globalPosition)()", "( e -> scenePosition ) ( )", "e->posi\\\ntion()"):
             with self.subTest(call=call):
                 self.assertEqual(len(unguarded_qt6_calls(f"auto p = {call};\n")), 1)
+
+    def test_scanner_sees_calls_after_digit_separators_and_raw_strings(self) -> None:
+        # r3 adversary pass 2 A1: a digit separator is not a char literal; a raw string ends at )delim".
+        for prefix in ("const int n = 1'000;", 'const char *s = R"("/*)";', 'auto s = u8R"x(")x";'):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(len(unguarded_qt6_calls(f"{prefix} auto p = e->position();\n")), 1)
+        self.assertEqual(unguarded_qt6_calls('auto s = R"(e->position())";\n'), [])
+
+    def test_scanner_sees_qualified_member_calls(self) -> None:
+        # r3 adversary pass 2 A2: `e->QMouseEvent::position()` names the same accessor.
+        for call in ("e->QMouseEvent::position()", "e.QSinglePointEvent::globalPosition()", "e -> ::QMouseEvent :: scenePosition()"):
+            with self.subTest(call=call):
+                self.assertEqual(len(unguarded_qt6_calls(f"auto p = {call};\n")), 1)
+
+    def test_scanner_reads_digraph_directives(self) -> None:
+        # r3 adversary pass 2 A3: `%:` is the digraph spelling of `#`.
+        mixed = (
+            "#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)\n"
+            "return e->localPos();\n"
+            "%:else\n"
+            "return e->position();\n"
+            "%:endif\n"
+        )
+        self.assertEqual([n for n, _ in unguarded_qt6_calls(mixed)], [4])
+        guarded = (
+            "%: if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)\n"
+            "return e->position();\n"
+            "%:else\n"
+            "return e->localPos();\n"
+            "%:endif\n"
+            "auto q = e->position();\n"
+        )
+        self.assertEqual([n for n, _ in unguarded_qt6_calls(guarded)], [6])
 
     def test_spliced_lines_keep_their_physical_line_numbers(self) -> None:
         fixture = "#define X a \\\n  b\nint y;\nauto p = e->position();\n"
