@@ -32,8 +32,13 @@ _NAMES = "|".join(sorted(NEWER_THAN_QT5_API, key=len, reverse=True))
 API_CALL = re.compile(
     rf"(?:(?:->|\.)\s*(?:::\s*)?(?:\w+\s*::\s*)*|\bQImage\s*::\s*)({_NAMES})\b"
 )
-# `%:` is the digraph spelling of `#`.
-DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+# `%:` is the digraph and `??=` the (pre-C++17) trigraph spelling of `#` (adversary r2 A2).
+_HASH = r"(?:#|%:|\?\?=)"
+DIRECTIVE = re.compile(rf"^\s*{_HASH}\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+# A macro whose body names an API as a bare word (`#define FLIP flipped`, then `image.FLIP()`)
+# hides the call from API_CALL, so the name in the #define itself counts (adversary r2 A2).
+DEFINE = re.compile(rf"^\s*{_HASH}\s*define\b(.*)$")
+BARE_NAME = re.compile(rf"\b({_NAMES})\b")
 # Only the plain condition counts: a negated or compound one is "other" (fail closed).
 VERSION_CHECK = re.compile(
     r"QT_VERSION\s*(>=|<)\s*QT_VERSION_CHECK\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*\d+\s*\)"
@@ -141,7 +146,8 @@ def unguarded_newer_api_calls(text: str) -> list[tuple[int, str, str]]:
                 stack.pop()
             continue
         floors = [frame[2] for frame in stack if frame[2] is not None]
-        for match in API_CALL.finditer(line):
+        define = DEFINE.match(line)
+        for match in (BARE_NAME.finditer(define.group(1)) if define else API_CALL.finditer(line)):
             needed = NEWER_THAN_QT5_API[match.group(1)]
             if not any(floor >= needed for floor in floors):
                 found.append((number, match.group(1), line.strip()))
@@ -263,6 +269,26 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             "%:endif\n"
         )
         self.assertEqual([n for n, _, _ in unguarded_newer_api_calls(fixture)], [4])
+
+    def test_scanner_sees_macro_aliases_and_trigraph_directives(self) -> None:
+        # adversary r2 A2 (da60b814): both inputs used to return no finding.
+        alias = "#define FLIP flipped\nreturn image.FLIP(Qt::Horizontal);\n"
+        self.assertEqual([(n, api) for n, api, _ in unguarded_newer_api_calls(alias)], [(1, "flipped")])
+        trigraph = (
+            "#if QT_VERSION >= QT_VERSION_CHECK(6,9,0)\n"
+            "??=endif\n"
+            "return image.flipped(Qt::Horizontal);\n"
+        )
+        self.assertEqual([n for n, _, _ in unguarded_newer_api_calls(trigraph)], [3])
+        guarded_alias = (
+            "#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)\n"
+            "#define FLIP( i ) ( i ).flipped( Qt::Horizontal )\n"
+            "#else\n"
+            "#define FLIP( i ) ( i ).mirrored( true, false )\n"
+            "#endif\n"
+            "#define MIRROR mirrored\n"
+        )
+        self.assertEqual(unguarded_newer_api_calls(guarded_alias), [])
 
     def test_names_that_only_contain_an_api_name_do_not_count(self) -> None:
         fixture = "auto a = img.flippedCopy(); auto b = flipped(); auto c = s.positions();\n"
