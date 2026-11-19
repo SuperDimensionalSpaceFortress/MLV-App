@@ -1425,6 +1425,14 @@ class DeployBachelorAgent(unittest.TestCase):
             ("restart-script-provider-relative", {"RestartScript": "FileSystem::r.ps1"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
             ("task-xml-provider-relative", {"TaskXmlFile": "FileSystem::t.xml"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
             ("task-pids-provider-relative", {"TaskPidsFile": "FileSystem::p.txt"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            # pass 17 A1: 'FileSystem::C:candidate.ps1' normalizes to 'C:candidate.ps1', which IsPathRooted accepts but is relative to the
+            # per-drive current directory: Test-Path and [System.IO.File] resolve it in different places. Only a FULLY QUALIFIED path passes.
+            ("source-drive-relative", {"Source": "FileSystem::C:candidate.ps1"}, 2, "DEPLOY_SOURCE_MISSING"),
+            ("venue-drive-relative", {"VenueRoot": "FileSystem::C:venue"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("venue-single-separator", {"VenueRoot": "FileSystem::\\venue"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("restart-script-drive-relative", {"RestartScript": "FileSystem::C:r.ps1"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("task-xml-drive-relative", {"TaskXmlFile": "FileSystem::C:t.xml"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("task-pids-drive-relative", {"TaskPidsFile": "FileSystem::C:p.txt"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
         ):
             r = self._run_raw(**given)
             self.assertEqual(r.returncode, code, (label, r.stdout, r.stderr))

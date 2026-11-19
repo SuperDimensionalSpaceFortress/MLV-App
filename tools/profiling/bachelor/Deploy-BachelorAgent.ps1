@@ -143,9 +143,10 @@ foreach ($pathParam in 'Source', 'VenueRoot', 'RestartScript', 'TaskXmlFile', 'T
     try { $pathNormalized = [string]$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($pathValue) }
     catch { $pathWhy = 'cannot be resolved: ' + ([string]$_.Exception.Message -replace '[\r\n]+', ' ') }
     if ($null -eq $pathWhy) {
-        # a normalized path is a file path only when it is rooted: a drive path or a UNC path (a drive-less \x already got the current
-        # drive from the normalization). A relative remainder (x.ps1, PATH, HKEY_LOCAL_MACHINE\Software) is refused.
-        if (-not [System.IO.Path]::IsPathRooted($pathNormalized)) { $pathWhy = "does not name an absolute file path (it resolves to '$pathNormalized')" }
+        # a normalized path is a file path only when it is FULLY QUALIFIED (a drive path or a UNC path, or off Windows a rooted POSIX
+        # path). IsPathRooted is not enough: it accepts C:x and \x, which still depend on a per-drive or per-process current directory
+        # ('FileSystem::C:x.ps1' stays 'C:x.ps1' after the normalization). A relative remainder (x.ps1, PATH, HKEY_LOCAL_MACHINE\Software) is refused.
+        if (-not [System.IO.Path]::IsPathFullyQualified($pathNormalized)) { $pathWhy = "does not name an absolute file path (it resolves to '$pathNormalized')" }
     }
     if ($null -ne $pathWhy) {
         if ($pathDotSourced) { throw "-$pathParam $pathValue $pathWhy" }
