@@ -2571,6 +2571,7 @@ class ShardExitCodeTests(unittest.TestCase):
             def __init__(self, *args: object, **kwargs: object) -> None:
                 super().__init__()
                 self.pid = 424242
+                self._handle = 7  # a real Windows ``Popen`` stores its process handle with the pid
                 made.append(self)
                 raise KeyboardInterrupt  # the child exists; the constructor never returns it
 
@@ -2681,6 +2682,7 @@ class ShardExitCodeTests(unittest.TestCase):
         class StoredPid(subprocess.Popen):  # type: ignore[type-arg]
             def __init__(self, *args: object, **kwargs: object) -> None:
                 self.pid = 424242  # type: ignore[assignment]
+                self._handle = 7  # a real Windows ``Popen`` stores its process handle with the pid
                 self.returncode = None
                 raise KeyboardInterrupt
 
@@ -2954,7 +2956,8 @@ class ShardExitCodeTests(unittest.TestCase):
     def test_a_reaped_worker_gets_no_group_signal(self) -> None:
         result, sent = self._posix_kill(self._GroupProc(-9))
         self.assertEqual(sent, [], "a group id that may belong to a stranger now was signalled")
-        self.assertIsNone(result)
+        self.assertIsNotNone(result, "a reaped leader's unobserved descendants were reported ended")  # r18 sol r17 A2
+        self.assertIn("not confirmed", result or "")
 
     def test_an_unreaped_worker_still_gets_its_group_signal(self) -> None:
         result, sent = self._posix_kill(self._GroupProc(None))
@@ -2996,6 +2999,194 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(sent, [], "the group was signalled with the reap state unread under its lock")
         self.assertIsNotNone(result, "the unsignalled tree was reported as ended")
         self.assertIn("not confirmed", result or "")
+
+    # r18 sol r17 A2: a leader reaped before the kill reaches its group says nothing about its descendants.
+    class _ReapedLeader:
+        def __init__(self) -> None:
+            self.pid = 424242
+            self.returncode: int | None = 0  # reaped by the other thread after the watchdog chose it
+            self.kill_calls = 0
+
+        def poll(self) -> int | None:
+            return None  # the look that selected it, before the reap
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    def test_terminate_does_not_report_a_clean_tree_kill_after_the_leader_was_reaped(self) -> None:
+        sent: list[tuple[int, int]] = []
+        with (
+            mock.patch.object(shard.os, "name", "posix"),
+            mock.patch.object(shard.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), create=True),
+            mock.patch.object(shard.signal, "SIGKILL", 9, create=True),
+        ):
+            result = shard.terminate(self._ReapedLeader())  # type: ignore[arg-type]
+            threaded = shard.terminate_all([self._ReapedLeader()])  # type: ignore[list-item]
+        self.assertEqual(sent, [], "a possibly recycled group id was signalled")
+        self.assertIsNotNone(result, "terminate called a reaped leader's unobserved tree ended")
+        self.assertIn("not confirmed", result or "")
+        self.assertIsNotNone(threaded[0], "terminate_all called a reaped leader's unobserved tree ended")
+
+    def test_the_deadline_watchdog_does_not_record_a_reaped_leaders_tree_as_killed(self) -> None:
+        proc = self._ReapedLeader()
+        killer = shard.DeadlineKiller(0.0, lambda: 1.0)
+        with (
+            mock.patch.object(shard.os, "name", "posix"),
+            mock.patch.object(shard.os, "killpg", lambda pgid, sig: None, create=True),
+            mock.patch.object(shard.signal, "SIGKILL", 9, create=True),
+        ):
+            killer.add(proc)  # type: ignore[arg-type]
+        self.assertEqual(killer.killed, set(), "the watchdog recorded an unconfirmed tree as killed")
+        self.assertIn(1, killer.failed)
+
+    # r18 sol r17 A1: an interrupt while the Windows identity is restored must never leave a child accepted on its pid alone.
+    class _FakeHandle(int):
+        """Stands in for ``subprocess.Handle``, so the Windows branch is exercised on any host."""
+
+    def _interrupted_restore(self, *, always: bool) -> tuple[object, object]:
+        armed = [False]
+        fired = [0]
+
+        class CutShort(subprocess.Popen):  # type: ignore[type-arg]
+            @property
+            def _child_created(self) -> bool:  # type: ignore[override]
+                return bool(self.__dict__.get("created", False))
+
+            @_child_created.setter
+            def _child_created(self, value: bool) -> None:
+                if armed[0] and (always or fired[0] == 0):
+                    fired[0] += 1
+                    raise KeyboardInterrupt("cut short while the identity was restored")
+                self.__dict__["created"] = value
+
+            def _execute_child(self, *args: object, **kwargs: object) -> None:
+                hp, ht, pid, tid = 123, 124, 424242, 1  # noqa: F841 - what CreateProcess returned
+                armed[0] = True
+                raise KeyboardInterrupt("the launch")
+
+        found: object = "unset"
+        built: list[object] = []
+        try:
+            CutShort([sys.executable, "-c", "pass"])
+        except KeyboardInterrupt as error:
+            with mock.patch.object(shard, "_windows_handle_type", return_value=self._FakeHandle):
+                found = shard.half_built_worker(error)
+            built.append(error)
+        if isinstance(found, subprocess.Popen):
+            self.addCleanup(found.__dict__.pop, "created", None)
+        return found, built
+
+    def test_a_one_shot_interrupt_while_the_windows_identity_is_restored_still_yields_a_killable_child(self) -> None:
+        found, _ = self._interrupted_restore(always=False)
+        self.assertIsNotNone(found, "the live child CreateProcess made was dropped")
+        self.assertTrue(hasattr(found, "_handle"), "the child was accepted on its pid alone: no direct kill is possible")
+        self.assertEqual(found.pid, 424242)  # type: ignore[union-attr]
+
+    def test_a_repeated_interrupt_in_the_windows_identity_restore_never_hands_over_a_pid_only_child(self) -> None:
+        found, _ = self._interrupted_restore(always=True)
+        self.assertTrue(
+            found is None or hasattr(found, "_handle"),
+            "a child holding only a pid (no handle) was accepted: its kill raises AttributeError",
+        )
+
+    def test_a_stored_pid_without_a_windows_handle_is_not_an_accepted_child(self) -> None:
+        class StoredPid(subprocess.Popen):  # type: ignore[type-arg]
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = 424242  # type: ignore[assignment]
+                self.returncode = None
+                raise KeyboardInterrupt
+
+        found: object = "unset"
+        try:
+            StoredPid([sys.executable])
+        except KeyboardInterrupt as error:
+            with (
+                mock.patch.object(shard, "_windows_handle_type", return_value=self._FakeHandle),
+                mock.patch.object(shard, "_created_child", side_effect=RuntimeError("denied")),
+            ):
+                found = shard.half_built_worker(error)
+        self.assertIsNone(found, "a pid-only child was accepted on Windows")
+
+    # r18 sol r17 A3: a cleanup interrupt that is raised after the run must not swallow what the run recorded.
+    def _run_to_exception(self, popen: Callable[..., object], workers: int = 2, **patches: object) -> tuple[BaseException | None, str]:
+        root, tests, tag = self._fixture()
+        err = io.StringIO()
+        raised: BaseException | None = None
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(shard.subprocess, "Popen", side_effect=popen))
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(shard, name, value))
+            stack.enter_context(self._log_one_unreadable())
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            try:
+                shard.run_parallel(
+                    tests, "ubuntu", 1, 1, workers, start_dir=str(root), pattern=f"fxw{tag}_*.py", top_level_dir=str(root),
+                    repo_root=REPO_ROOT, pins={}, environ={shard.WORKER_TIMEOUT_ENV: "600"},
+                )
+            except BaseException as error:  # noqa: BLE001
+                raised = error
+        for kept in re.findall(r"kept at (.+)$", err.getvalue(), re.MULTILINE):
+            self.addCleanup(shutil.rmtree, kept, True)
+        return raised, err.getvalue()
+
+    def test_a_killer_stop_interrupt_still_reports_the_unread_log_and_where_it_is_kept(self) -> None:
+        class StopInterrupted(shard.DeadlineKiller):
+            def stop(self) -> BaseException | None:
+                super().stop()
+                return KeyboardInterrupt("stop interrupted")
+
+        raised, err = self._run_to_exception(self._finished_popen([]), DeadlineKiller=StopInterrupted)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("log could not be read", err, "the recorded unread-log problem was dropped with the interrupt")
+        self.assertIn("kept at", err, "the retained evidence's location was never reported")
+
+    def test_a_budget_watch_stop_interrupt_still_reports_the_unread_log_and_where_it_is_kept(self) -> None:
+        class StopInterrupted(shard.BudgetWatch):
+            def stop(self) -> BaseException | None:
+                super().stop()
+                return KeyboardInterrupt("watch stop interrupted")
+
+        raised, err = self._run_to_exception(self._finished_popen([]), BudgetWatch=StopInterrupted)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("log could not be read", err)
+        self.assertIn("kept at", err)
+
+    def test_a_census_interrupt_still_reports_a_worker_that_could_not_be_ended_and_its_kept_dir(self) -> None:
+        raised, err = self._run_to_exception(
+            self._finished_popen([]),
+            end_running_workers=lambda procs: ({1: "kill denied"}, KeyboardInterrupt("census")),
+        )
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("worker 1/2 could not be terminated: kill denied", err)
+        self.assertIn("kept at", err, "the location of a log a live worker may still write to was never reported")
+
+    # Sibling: the fallback's own interrupt used to leave the finally before anything was said or the dir was judged.
+    def test_an_interrupt_while_the_fallback_reads_a_worker_still_reports_the_problems_and_the_kept_log(self) -> None:
+        polls = [0]
+
+        class PollInterrupted(self._RunningProc):  # type: ignore[valid-type, misc]
+            def poll(self) -> int | None:
+                polls[0] += 1
+                if polls[0] == 2:  # 1: the census; 2: the fallback's header
+                    raise KeyboardInterrupt("fallback poll")
+                return super().poll()
+
+        proc = PollInterrupted()
+        calls: list[int] = []
+
+        def popen(*args: object, **kwargs: object) -> object:
+            calls.append(1)
+            if len(calls) > 1:
+                raise OSError("launch failed")
+            return proc
+
+        raised, err = self._run_to_exception(popen)
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertIn("kept at", err, "an interrupt in the fallback left without reporting the kept log")
 
     # r16 sol r15 A4: an exit code congruent to zero is a zero exit however large it is.
     def test_the_zero_exit_guard_fails_an_integer_code_that_the_os_reads_as_zero(self) -> None:
@@ -3101,6 +3292,7 @@ class ShardExitCodeTests(unittest.TestCase):
             def __init__(self, *args: object, **kwargs: object) -> None:
                 super().__init__()
                 self.pid = 424242
+                self._handle = 7  # a real Windows ``Popen`` stores its process handle with the pid
                 made.append(self)
                 raise raises  # the child exists; the constructor never returns it
 

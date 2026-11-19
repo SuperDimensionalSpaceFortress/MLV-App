@@ -674,18 +674,30 @@ def half_built_worker(error: BaseException) -> subprocess.Popen[bytes] | None:
             # which is not this launch's child and must never be adopted, so the search ends here, whether
             # or not the recovery below could read it (a recovery that fails answers for THIS constructor
             # alone and never walks on to a deeper one).
-            try:
-                return _created_child(candidate, link)
-            except BaseException:  # noqa: BLE001 - the recovery itself was denied or interrupted
-                return _stored_child(candidate)
+            for _attempt in range(2):  # an interrupt lands once; the recovery is repeatable, so a second go finishes what it left half done
+                try:
+                    return _created_child(candidate, link)
+                except BaseException:  # noqa: BLE001 - the recovery itself was denied or interrupted
+                    continue
+            return _stored_child(candidate)
         link = link.tb_next
     return None
 
 
+def _has_kill_identity(candidate: subprocess.Popen[bytes]) -> bool:
+    """Whether ``candidate`` holds a LIVE child it can be ended through: a pid, and on Windows the process handle too.
+
+    ``Popen.kill`` on Windows is ``TerminateProcess(self._handle)``, so a pid alone (what ``taskkill`` takes) is no
+    direct-kill identity: a child accepted on its pid alone would be reported ended by a kill that raises."""
+    if candidate.pid is None or candidate.returncode is not None:
+        return False
+    return _windows_handle_type() is None or hasattr(candidate, "_handle")
+
+
 def _stored_child(candidate: subprocess.Popen[bytes]) -> subprocess.Popen[bytes] | None:
-    """``candidate`` when it already holds a live child's pid, read without anything that can be denied; else ``None``."""
+    """``candidate`` when it already holds a live child it can be ended through, read without anything that can be denied; else ``None``."""
     try:
-        if candidate.pid is not None and candidate.returncode is None:
+        if _has_kill_identity(candidate):
             return candidate
     except BaseException:  # noqa: BLE001 - not even the stored pid could be read: nothing here is known to be a child
         pass
@@ -710,21 +722,24 @@ def _created_child(candidate: subprocess.Popen[bytes], link: types.TracebackType
     between leaves ``self.pid`` unset although the child runs. Those two values are taken from that frame
     (only when it is the constructor's own ``_execute_child`` for this ``candidate``) so it can be ended.
     """
-    if candidate.pid is None:
+    handle_type = _windows_handle_type()
+    if candidate.pid is None or (handle_type is not None and not hasattr(candidate, "_handle")):
         walk: types.TracebackType | None = link
         while walk is not None:
             frame = walk.tb_frame
             if frame.f_code.co_name == "_execute_child" and frame.f_locals.get("self") is candidate:
                 pid, handle = frame.f_locals.get("pid"), frame.f_locals.get("hp")
                 if issubclass(type(pid), int) and not issubclass(type(pid), bool):
-                    candidate.pid = pid
+                    # ``Popen``'s own order (flag, handle, then pid): the pid, the value a caller tests, is stored
+                    # last, so an interrupt in between leaves no pid-only child, and the repeat finishes the rest.
                     candidate._child_created = True  # type: ignore[attr-defined]
-                    handle_type = _windows_handle_type()
                     if handle_type is not None and issubclass(type(handle), int) and not hasattr(candidate, "_handle"):
                         candidate._handle = handle_type(handle)  # type: ignore[attr-defined]
+                    if candidate.pid is None:
+                        candidate.pid = pid
                 break
             walk = walk.tb_next
-    if candidate.pid is not None and candidate.returncode is None:
+    if _has_kill_identity(candidate):
         return candidate
     return None
 
@@ -1104,8 +1119,13 @@ def _kill_group_of_unreaped(proc: subprocess.Popen[bytes], pgid: int) -> str | N
                     "the worker's reap lock could not be taken, so its process group was not signalled "
                     "(its process tree is not confirmed ended)"
                 )
-        if proc.returncode is not None:  # reaped: its pid, and so its group id, may belong to someone else now
-            return None
+        if proc.returncode is not None:
+            # Reaped: its pid, and so its group id, may belong to someone else now, so nothing is signalled. The
+            # leader is gone but a descendant of it may not be, and nothing here saw it end: never a clean kill.
+            return (
+                "the worker had already been reaped, so its process group was not signalled "
+                "(its process tree is not confirmed ended)"
+            )
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:  # the group is already gone
@@ -1540,6 +1560,7 @@ def run_parallel(
                 problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
             with contextlib.suppress(OSError):
                 log.close()
+        fallback_interrupt: BaseException | None = None  # met while reading the fallback logs, raised once everything is said
         if sys.exc_info()[0] is not None:
             # An exception (a launch that raised, say) skipped the grouped logs, or cut them short: every
             # worker from the first one not fully dealt with keeps its output, which is deleted with the
@@ -1551,8 +1572,8 @@ def run_parallel(
                 try:
                     header_error = emit_log(f"===== worker {number}/{len(logs)} exit {proc.poll()} =====\n")
                 except BaseException as error:  # noqa: BLE001 - poll() itself raised (SystemExit included)
-                    if is_interrupt(error):
-                        raise
+                    if is_interrupt(error) and fallback_interrupt is None:
+                        fallback_interrupt = error  # raised below, after the problems and the kept paths are reported
                     header_error = describe_error(error)
                 text, unreadable = read_log(path)
                 verb = "read"
@@ -1574,12 +1595,18 @@ def run_parallel(
         if sys.exc_info()[0] is not None:  # no exit code to carry them: say it before the traceback
             for problem in problems:
                 emit_error(problem)
+            if fallback_interrupt is not None:
+                raise fallback_interrupt
         else:
             # An interrupt met in the census or while a watchdog was stopped is not lost: it goes out once every
             # worker has been ended, the first one met first (compared with ``is None``: an exception's own
             # truth value is its class's business).
             pending = next((met for met in (census_error, killer_error, watch_error) if met is not None), None)
             if pending is not None:
+                # Raising skips the report at the end of the run, and the work dir may be kept for an unread log or
+                # a worker still running: what was recorded, and where the evidence stays, is said before it goes out.
+                for problem in problems:
+                    emit_error(problem)
                 raise pending
     ran =sorted(item for record in records if record for item in record["ids"])
     # A class or module fixture that skips never starts its tests (serial counts them as skipped, not run).
