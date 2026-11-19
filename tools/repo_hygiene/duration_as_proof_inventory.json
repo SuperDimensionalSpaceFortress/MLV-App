@@ -3276,6 +3276,26 @@
       "lines": [
         109
       ]
+    },
+    {
+      "path": "platform/qt/ViewerDoubleClickPolicy.h",
+      "anchor": "&& timestampMs - m_timestampMs <= static_cast < quint64 > ( doubleClickIntervalMs < 0 ? 0 : doubleClickIntervalMs ) )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYER-DOUBLECLICK-FULLSCREEN-1: viewer_dblclick::Gate::notePress clamps a negative platform double-click interval to 0 before comparing two mouse-event timestamps (is this press inside the double-click window?). An input-handling window test on event timestamps, not a stage duration; it never claims that anything ran.",
+      "lines": [
+        75
+      ]
+    },
+    {
+      "path": "tests/gui/test_gui_smoke.cpp",
+      "anchor": "if ( timestampMs != 0 ) {",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYER-DOUBLECLICK-FULLSCREEN-1: the gui test's deliverViewerMouse helper sets a synthetic mouse-event timestamp only when the caller passed one (0 = leave Qt's default). Fixture plumbing for the double-click gate tests; no clock is read and nothing is proved by it.",
+      "lines": [
+        4269
+      ]
     }
   ]
 }
