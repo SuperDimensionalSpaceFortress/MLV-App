@@ -169,8 +169,8 @@ _INT_LITERAL = re.compile(
 #       A comment, a line break or a splice between the accessor and the name, a bare name, a macro
 #       alias and a using-declaration all reach it (adversary r1 A1 on 792b6c2e); or
 #   (3) the lexer does not read the text, or cannot trust where its tokens and literals end, and,
-#       with NULs dropped (a UTF-16 file), every splice joined
-#       (`??/` and a NUL before the break included) and every universal-character-name decoded
+#       with NULs dropped (a UTF-16 file) or read as whitespace (GCC), every splice joined (a NUL
+#       before the break included; `??/` both joined and not) and every universal-character-name decoded
 #       (`\uXXXX`, `\UXXXXXXXX`, `\u{...}`, `\N{...}`), a flipped or flip token stands anywhere in it,
 #       comments and literals included.
 # Every file git can carry under the roots is read, whatever its suffix or content: tracked, and
@@ -215,19 +215,32 @@ def _decode_ucn(match: re.Match) -> str:
         return "?"
 
 
+def _rule3_views(text: str) -> list[str]:
+    """Each way a compiler can read an LF-only text that rule 3 searches (r2, adversary r2 pass 1 A1
+    on c541efac): a NUL dropped (a UTF-16 file) and a NUL read as whitespace, as GCC reads it (dropped,
+    `flipped\\0EMPTY` was one identifier); a `??/` splice joined and not joined (GCC and Clang join it
+    only with -trigraphs); every backslash-newline splice joined and every UCN decoded in each."""
+    views = []
+    for nul in ("", " "):
+        spliced = SPLICE.sub("", text.replace("\x00", nul))
+        for view in (TRIGRAPH_SPLICE.sub("", spliced), spliced):
+            views.append(UCN.sub(_decode_ucn, view))
+    return views
+
+
 def _reaches_qt69_name(text: str) -> bool:
     if QT69_MEMBER_USE.search(text):
         return True
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    joined = UCN.sub(_decode_ucn, TRIGRAPH_SPLICE.sub("", SPLICE.sub("", text.replace("\x00", ""))))
-    if "flip" not in joined:
+    views = _rule3_views(text)
+    if not any("flip" in view for view in views):
         return False  # no rule can fire, so only such a text is lexed
     spliced = SPLICE.sub("", text)
     if any(pattern.search(form) for form in (text, spliced) for pattern in UNLEXED_RAW_FORMS):
-        return bool(QT69_NAME.search(joined))  # (3)
+        return any(QT69_NAME.search(view) for view in views)  # (3)
     lines, refused = _logical_lines(spliced)
     if refused or any(kind in TOKEN_BOUNDARY_KINDS for _, kind in _refused_forms(lines)):
-        return bool(QT69_NAME.search(joined))  # (3)
+        return any(QT69_NAME.search(view) for view in views)  # (3)
     return any(QT69_NAME.search(line) for _, line, _ in lines)  # (2)
 
 
@@ -608,6 +621,26 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
                 self.assertEqual(files_needing_scan({"f": text}), {"f"})
         # A text with none of the names is still not flagged, whatever it holds.
         for text in ("auto n = 1'000; auto s = a$b; %:include <a/*>\n", "auto r = a·b; // mirrored\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_rule_3_does_not_merge_a_name_with_what_a_compiler_keeps_apart(self) -> None:
+        # adversary r2 pass 1 A1 (c541efac): rule 3 dropped every NUL, so `flipped\0MLV_REVIEW_EMPTY`
+        # read as one identifier, but GCC reads a NUL as whitespace and the empty macro leaves
+        # image.flipped(Qt::Vertical). Its input, as a header GpuDisplayViewport.cpp includes (in memory).
+        viewport = (ROOT / "platform" / "qt" / "GpuDisplayViewport.cpp").read_text(encoding="utf-8")
+        header = ("#include <QImage>\n#define MLV_REVIEW_EMPTY\ninline QImage qt69Readback(QImage image) {\n"
+                  "    return image .\n        flipped\x00MLV_REVIEW_EMPTY(Qt::Vertical);\n}\n#undef MLV_REVIEW_EMPTY\n")
+        texts = {"GpuDisplayViewport.cpp": '#include "Qt69Readback.h"\n' + viewport, "Qt69Readback.h": header}
+        self.assertEqual(files_needing_scan(texts), {"Qt69Readback.h"})
+        # Siblings: a NUL before the name, and a `??/` splice after it, which GCC and Clang do not join
+        # without -trigraphs. A NUL dropped (a UTF-16 file) and a joined `??/` still count as well.
+        for text in ("x();\nauto r = MLV_E\x00flipped(Qt::Vertical);\n", "x();\nauto r = MLV_E\x00flip;\n",
+                     "auto r = image .\nflipped??/\nMLV_E(Qt::Vertical);\n", "auto r = flip??/\nX;\n",
+                     "f\x00l\x00i\x00p\x00\n", "auto r = image .\nfl??/\nipped();\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        for text in ("x();\x00 flippedCopy\n", "auto r = flippedCopy??/\nX;\n", "x(); \x00unflip\x00ped\n"):
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), set())
 
