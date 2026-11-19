@@ -1360,7 +1360,9 @@ function Get-SpecReadBoundSec {
     $dl = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
     $cap = 120.0
     if ($dl -isnot [datetime]) { return $cap }
-    [Math]::Min($cap, ($dl - [DateTime]::UtcNow).TotalSeconds - 2.0)
+    # never under a 1 s floor: with the room already gone a read that answers at once is still read, so the typed no-room refusals that follow it (EXPORT_BUDGET_PREFLIGHT_TIMEOUT
+    # before the child, the claim loop's DEADLINE) are what they were; a read that does not answer is given up on within max(room - 2 s, 1 s), never held past the deadline
+    [Math]::Max(1.0, [Math]::Min($cap, ($dl - [DateTime]::UtcNow).TotalSeconds - 2.0))
 }
 
 function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0) {
