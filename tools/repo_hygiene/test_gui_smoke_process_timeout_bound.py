@@ -552,7 +552,9 @@ _WAIT_REGION = ("$noProgressOverrideMs = if", "\n$stdout = $processBoundary.stdo
 
 _RUNNER_HARNESS = r"""
 function Get-HostLoadSnapshot { param($TopProcessCount, $SubjectProcess, [switch]$SkipEvidenceCollection) [pscustomobject]@{ sample = 1 } }
-$ProcessTimeoutMs = 3600000; $NoProgressTimeoutMs = 0
+$ProcessTimeoutMs = 3600000
+# -2 r1 (adversary 81e7f8b2 A2): GS_OVERRIDE_MS is an explicit -NoProgressTimeoutMs, for a scaled leg whose window must fit before L after a late arming
+$NoProgressTimeoutMs = if ($env:GS_OVERRIDE_MS) { [int]$env:GS_OVERRIDE_MS } else { 0 }
 # -2 r1: GS_ALLOW_MS widens the hard deadline (H = 2000 + allowance) for a test that needs a scaled H with room for a late arming
 $LegHardLimitAllowanceMs = if ($env:GS_ALLOW_MS) { [int]$env:GS_ALLOW_MS } else { 1000 }
 $derivedProcessTimeoutMs = 2000
@@ -604,6 +606,9 @@ class LegDerivedHardDeadline(unittest.TestCase):
         self.assertEqual(124, out["exitCode"])
         self.assertEqual(3000, out["hardLimitMs"], "leg budget 2000 ms + 1000 ms allowance, under a 3600000 ms job timeout")
         self.assertEqual(3000, out["timeoutMs"], "the receipt names the leg-derived whole budget")
+        # -2 r1 (adversary 81e7f8b2 A2): W = L = 1000 cannot run out by L once the watch has armed, so no silence was proven: the deadline decides
+        # (a log that keeps growing every 500 ms is never a no-progress leg)
+        self.assertEqual("timeout", out["outcome"], "a window that cannot run out by L made a silence verdict (expiry %s ms since launch)" % out["expiryMs"])
 
     def test_hard_limit_is_the_leg_plus_an_allowance_and_never_above_the_job_timeout(self) -> None:
         out = run_ps(r"""
@@ -1400,12 +1405,12 @@ $logRoot = $env:GS_TMP
         out = run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'loadspent'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $log = Join-Path $dir 'mlvapp-1.log'
-Set-Content -LiteralPath $log -Value ('x' * 100) -NoNewline
+Set-Content -LiteralPath $log -Value ('x' * 100)
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 600 -LoadWindowMs 30000 -ProbeWaitMs 2000
 $arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
 Start-Sleep -Milliseconds 900
 $quietLoad = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
-Add-Content -LiteralPath $log -Value 'gui_smoke.foreground_request requested=1 verified=1'
+Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:04.000Z] [info] [0x1a2b] gui_smoke.foreground_request requested=1 verified=1 (MainWindow.cpp:10277)'
 $grew = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
 Start-Sleep -Milliseconds 900
 $stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
@@ -1435,8 +1440,9 @@ _INVARIANT = "No silence expiration is later than L = D - M, whatever time the w
 class TheSilenceModelIsLaunchAnchored(unittest.TestCase):
     """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1: r1-r16 of -1 built the silence wait from DURATIONS (a quiet stopwatch, a remaining budget handed from call to
     call, a finalize remainder computed before the call) and fixed one clock instance per round. One launch-anchored model replaces them: every time is ms
-    since the runner's launch stamp; L = max(min(1000, H), H - M) with M = ProbeWaitMs + 1000; E = min(L, max(WL, P + W)) while LOADING and min(L, P + W)
-    once LOADED. INVARIANT: "No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL)."
+    since the runner's launch stamp; L = max(min(1000, H), H - M) with M = ProbeWaitMs + 1000; E = max(WL, P + W) while LOADING and P + W once LOADED,
+    and a value past L is no expiry at all (adversary 81e7f8b2 A2: a window that cannot run out by L proves no silence, so the deadline decides).
+    INVARIANT: "No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL)."
     """
 
     _H = (1000, 2500, 133000, 1285000, 3600000)
@@ -1464,6 +1470,7 @@ foreach ($h in 1000, 2500, 133000, 1285000, 3600000) {
 """)
         rows = out["rows"]
         self.assertEqual(5 * 2 * 10 * 2, len(rows), "H x override x P x Loaded")
+        none = 0
         for r in rows:
             label = "H=%(h)s P=%(p)s loaded=%(loaded)s override=%(override)s W=%(w)s WL=%(wl)s L=%(l)s E=%(e)s" % r
             self.assertLessEqual(r["e"], r["l"], "an expiry later than L: " + label)
@@ -1471,10 +1478,17 @@ foreach ($h in 1000, 2500, 133000, 1285000, 3600000) {
             self.assertLessEqual(r["wl"], r["l"], label)
             if r["h"] >= 2000 + 1000:
                 self.assertLess(r["l"], r["h"], "L is not below the hard deadline: " + label)
+            # adversary 81e7f8b2 A2: a window that cannot run out by L is NO expiry (-1, the deadline decides), never one capped at L
+            window_end = r["p"] + r["w"] if r["loaded"] else max(r["wl"], r["p"] + r["w"])
+            if window_end > r["l"]:
+                self.assertEqual(-1, r["e"], "a window that cannot run out by L still expires (capped at L, a silence verdict with less than one window): " + label)
+                none += 1
+                continue
+            self.assertEqual(window_end, r["e"], label)
             if not r["loaded"]:
                 self.assertGreaterEqual(r["e"], min(r["l"], r["wl"]), "a LOADING expiry below min(L, WL): " + label)
-            else:
-                self.assertEqual(min(r["l"], r["p"] + r["w"]), r["e"], label)
+        self.assertGreater(none, 0, "the table holds rows whose window cannot run out by L")
+        self.assertLess(none, len(rows), "the table holds rows whose window runs out by L")
 
     def test_the_limit_and_expiry_helpers_are_the_one_copy_of_the_arithmetic(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
@@ -1557,17 +1571,17 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         out = run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'marker'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $log = Join-Path $dir 'mlvapp-1.log'
-Set-Content -LiteralPath $log -Value 'start' -NoNewline
+Set-Content -LiteralPath $log -Value 'start'
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs 30000 -ProbeWaitMs 1000
 function Poll-Until([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 8000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
 Poll-Until { $w.Armed -and $null -eq $w.Pending }
 $len0 = [int64]$w.Files['mlvapp-1.log']
-Add-Content -LiteralPath $log -Value 'a plain growth line without the marker'
+Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:01.000Z] [info] [0x1a2b] a plain growth record without the marker (main.cpp:1)'
 Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len0 -and $null -eq $w.Pending }
 $plain = [pscustomobject]@{ phase = $w.Phase; expiry = $w.ExpiryMs; p = $w.LastProgressMs; active = $w.ActiveWindowMs }
-# a marker split across two reads: the probe re-reads the 16 bytes before the previous high-water mark
+# a marker record split across two reads: the probe re-reads the 257 bytes before the previous high-water mark
 $len1 = [int64]$w.Files['mlvapp-1.log']
-Add-Content -LiteralPath $log -Value 'interaction_trace event=gui_sm' -NoNewline
+Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:02.000Z] [info] [0x1a2b] interaction_trace event=gui_sm' -NoNewline
 Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len1 -and $null -eq $w.Pending }
 $half = [string]$w.Phase
 $len2 = [int64]$w.Files['mlvapp-1.log']
@@ -1582,12 +1596,87 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         plain, marked = out["plain"], out["marked"]
         self.assertEqual("LOADING", plain["phase"], "growth without gui_smoke. keeps the watch LOADING")
         self.assertEqual(20000, plain["active"])
-        self.assertAlmostEqual(min(30000, max(20000, plain["p"] + 800)), plain["expiry"], delta=0.01)
+        self.assertAlmostEqual(max(20000, plain["p"] + 800), plain["expiry"], delta=0.01)
         self.assertEqual("LOADING", out["half"], "half a marker is not the marker")
         self.assertEqual("LOADED", marked["phase"], "interaction_trace event=gui_smoke.playback_policy switches the watch to LOADED (split across two reads)")
         self.assertEqual(800, marked["active"])
-        self.assertAlmostEqual(min(30000, marked["p"] + 800), marked["expiry"], delta=0.01, msg="once LOADED, E = min(L, P + W)")
+        self.assertAlmostEqual(marked["p"] + 800, marked["expiry"], delta=0.01, msg="once LOADED, E = P + W (it is below L here)")
         self.assertTrue(out["stalled"], "a LOADED log silent past P + W is a stall")
+
+    def test_gui_smoke_bytes_inside_another_record_do_not_end_the_load_allowance(self) -> None:
+        """adversary 81e7f8b2 A1 (major): CrashForensics logs the start-up run_metadata record with the whole command line, so an owner input whose path
+        holds `gui_smoke.` put those bytes in the log at start-up and switched the watch to LOADED before the silent load. The marker is a RECORD whose
+        message starts `gui_smoke.` (or `interaction_trace event=gui_smoke.`), at the start of a line."""
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'metadatapath'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value '[2026-11-19T10:00:00.000Z] [info] [0x1a2b] run_metadata={"command_line":["MLVApp.exe","--gui-smoke-play","X:\\owner-input\\gui_smoke.night\\take"]} (CrashForensics.cpp:904)'
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs 30000 -ProbeWaitMs 1000
+function Poll-Until([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 8000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+Poll-Until { $w.Armed -and $null -eq $w.Pending -and [int64]$w.Files['mlvapp-1.log'] -ge 0 }
+$len0 = [int64]$w.Files['mlvapp-1.log']
+# the same bytes later in the start-up, mid-record (a message that quotes the path)
+Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:01.000Z] [info] [0x1a2b] opening X:\owner-input\gui_smoke.night\take (MainWindow.cpp:9700)'
+Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len0 -and $null -eq $w.Pending }
+$start = [pscustomobject]@{ phase = $w.Phase; expiry = $w.ExpiryMs; p = $w.LastProgressMs }
+$len1 = [int64]$w.Files['mlvapp-1.log']
+Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:09.000Z] [info] [0x1a2b] gui_smoke.launch_only played=0 presented_frames=0 frames=24 (MainWindow.cpp:9729)'
+Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len1 -and $null -eq $w.Pending }
+$marked = [string]$w.Phase
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ start = $start; marked = $marked } | ConvertTo-Json -Compress -Depth 4
+""")
+        self.assertEqual("LOADING", out["start"]["phase"], "the bytes gui_smoke. inside a start-up record (an input path) ended the load allowance")
+        self.assertAlmostEqual(max(20000, out["start"]["p"] + 800), out["start"]["expiry"], delta=0.01, msg="the load allowance still holds")
+        self.assertEqual("LOADED", out["marked"], "the app's own gui_smoke.launch_only record still ends the load")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class AWindowThatCannotRunOutByTheLimitMakesNoSilenceVerdict(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary 81e7f8b2 A2, major): capping E at L made a log still growing at L expire AT L, so the poll that
+    credited the growth also returned stalled, with no silence at all, and the leg was reported as process_no_progress for a whole window. A window that
+    cannot run out by L proves no silence by L: there is no expiry (-1) and the hard deadline decides the leg (timeout)."""
+
+    def test_a_loaded_log_that_keeps_growing_past_the_limit_is_never_stalled(self) -> None:
+        # W = 1500, L = 3000, D = 4000; the app is LOADED and logs a record about every 200 ms until 3.9 s since launch (W leaves room for a probe that
+        # starts slowly: a credited gap of a whole window would be a real stall)
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'growingatlimit'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value '[2026-11-19T10:00:00.000Z] [info] [0x1a2b] interaction_trace event=gui_smoke.playback_policy mode=realtime (MainWindow.cpp:9879)'
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
+$since = { [double]([Diagnostics.Stopwatch]::GetTimestamp() - $launch) * 1000.0 / [Diagnostics.Stopwatch]::Frequency }
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1500 -LimitMs 3000 -LaunchTimestamp $launch -ProbeWaitMs 1000
+$stalledAt = -1; $lastP = -1; $noneSeen = $false; $n = 0
+while ((& $since) -lt 3900 -and $stalledAt -lt 0) {
+    $n++
+    Add-Content -LiteralPath $log -Value ('[2026-11-19T10:00:01.000Z] [info] [0x1a2b] frame {0} presented (MainWindow.cpp:1)' -f $n)
+    if (Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 4000) { $stalledAt = [int](& $since); $lastP = [int]$w.LastProgressMs }
+    if ($w.Armed -and [double]$w.ExpiryMs -lt 0) { $noneSeen = $true }
+    Start-Sleep -Milliseconds 200
+}
+$phase = [string]$w.Phase
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ stalledAt = $stalledAt; lastP = $lastP; noneSeen = $noneSeen; phase = $phase } | ConvertTo-Json -Compress
+""")
+        self.assertEqual("LOADED", out["phase"])
+        self.assertEqual(-1, out["stalledAt"], "a log still growing at L was judged stalled at %s ms since launch, its last progress at %s ms"
+                         % (out["stalledAt"], out["lastP"]))
+        self.assertTrue(out["noneSeen"], "once P + W is past L the watch carries no expiry (-1)")
+
+    def test_the_expiry_helper_gives_no_expiry_for_a_window_past_the_limit(self) -> None:
+        out = run_ps(r"""
+[pscustomobject]@{
+    fits = Get-GuiSmokeSilenceExpiryMs -LimitMs 3000 -WindowMs 1000 -LastProgressMs 2000 -Loaded
+    past = Get-GuiSmokeSilenceExpiryMs -LimitMs 3000 -WindowMs 1000 -LastProgressMs 2001 -Loaded
+    loadFits = Get-GuiSmokeSilenceExpiryMs -LimitMs 6000 -WindowMs 1500 -LoadWindowMs 6000 -LastProgressMs 2000
+    loadPast = Get-GuiSmokeSilenceExpiryMs -LimitMs 6000 -WindowMs 1500 -LoadWindowMs 6000 -LastProgressMs 4600
+} | ConvertTo-Json -Compress
+""")
+        self.assertEqual(3000, out["fits"], "a window that runs out exactly at L expires at L")
+        self.assertEqual(-1, out["past"], "a window that runs out after L is no expiry, never one capped at L")
+        self.assertEqual(6000, out["loadFits"], "while LOADING the load allowance from the launch holds: E = max(WL, P + W)")
+        self.assertEqual(-1, out["loadPast"])
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
@@ -1595,13 +1684,18 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary r16 A3, major): r16 anchored the quiet clock at the FIRST observation of the log, so a window of
     H - 1000 armed at 4 s expired at about H + 3000 (owner leg 3603000 ms of 3600000; fixture 136000 ms of 133000): the whole budget always ran out first.
     The r16 test compared durations; these compare TIMES SINCE LAUNCH. The runner's own derivation and wait region run as written, with H = 8000
-    (leg 2000 + allowance 6000), M = 2000, L = 6000, and the app's first log line written at about 2 s."""
+    (leg 2000 + allowance 6000), M = 2000, L = 6000, and the app's first log line written at about 2 s.
+
+    Adversary 81e7f8b2 A2 re-specified the derived case: there W = L = 6000, so a watch armed at about 2 s cannot see a whole window of silence by L, and
+    capping E at L would claim one. No silence verdict is passed (E = -1) and the hard deadline ends the leg as a timeout. A window that fits after the
+    late arming (an explicit -NoProgressTimeoutMs of 2000 ms) still fires by L."""
 
     _DELAYED_ARMING = "Start-Sleep -Milliseconds 2000; Add-Content -LiteralPath $env:GS_LOG -Value 'first line'; Start-Sleep -Seconds 30"
 
-    def _run(self, sample_ms: int) -> dict:
+    def _run(self, sample_ms: int, override_ms: int = 0) -> dict:
+        extra = {"GS_OVERRIDE_MS": str(override_ms)} if override_ms else {}
         return run_ps(_RUNNER_HARNESS, GS_STUB=self._DELAYED_ARMING, GS_SAMPLE_MS=str(sample_ms), GS_ALLOW_MS="6000",
-                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION))
+                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION), **extra)
 
     def _assert_fires_before_the_deadline(self, out: dict, branch: str) -> None:
         hard, margin = 8000, 2000
@@ -1609,6 +1703,7 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self.assertTrue(out["armed"], branch)
         self.assertEqual("process_no_progress", out["outcome"],
                          "%s: the silence watchdog armed late never fired before the hard deadline (the loop ended at %s ms since launch)" % (branch, out["loopEndMs"]))
+        self.assertGreaterEqual(out["expiryMs"], 0, branch)
         self.assertLessEqual(out["expiryMs"], hard - margin, "%s: the expiry, in ms since launch, is later than H - M" % branch)
         # the verdict follows one probe (at most ProbeWaitMs = M - 1000) after E: it lands no later than H - 1000
         self.assertLessEqual(out["loopEndMs"], hard - 1000, "%s: the stall verdict, in ms since launch, is later than H - M + ProbeWaitMs" % branch)
@@ -1616,11 +1711,29 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self.assertEqual(124, out["exitCode"])
         self.assertFalse(out["alive"])
 
-    def test_a_late_arming_still_expires_by_h_minus_m_in_the_log_only_branch(self) -> None:
-        self._assert_fires_before_the_deadline(self._run(0), "log-only")
+    def _assert_the_deadline_decides(self, out: dict, branch: str) -> None:
+        hard = 8000
+        self.assertEqual(hard, out["hardLimitMs"])
+        self.assertTrue(out["armed"], branch)
+        self.assertEqual("timeout", out["outcome"], "%s: a window that cannot run out by L made a silence verdict (expiry %s ms since launch, the loop ended at %s)"
+                         % (branch, out["expiryMs"], out["loopEndMs"]))
+        self.assertEqual(-1, out["expiryMs"], "%s: W = L armed at about 2 s cannot run out by L: no expiry" % branch)
+        self.assertGreaterEqual(out["loopEndMs"], hard - 50, "%s: the leg ended before its hard deadline with no silence verdict" % branch)
+        self.assertTrue(out["timedOut"])
+        self.assertEqual(124, out["exitCode"])
+        self.assertFalse(out["alive"])
 
-    def test_a_late_arming_still_expires_by_h_minus_m_in_the_host_load_branch(self) -> None:
-        self._assert_fires_before_the_deadline(self._run(500), "host-load")
+    def test_a_late_arming_with_a_window_that_fits_expires_by_h_minus_m_in_the_log_only_branch(self) -> None:
+        self._assert_fires_before_the_deadline(self._run(0, override_ms=2000), "log-only")
+
+    def test_a_late_arming_with_a_window_that_fits_expires_by_h_minus_m_in_the_host_load_branch(self) -> None:
+        self._assert_fires_before_the_deadline(self._run(500, override_ms=2000), "host-load")
+
+    def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_log_only_branch(self) -> None:
+        self._assert_the_deadline_decides(self._run(0), "log-only")
+
+    def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_host_load_branch(self) -> None:
+        self._assert_the_deadline_decides(self._run(500), "host-load")
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")

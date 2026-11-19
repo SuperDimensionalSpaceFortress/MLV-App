@@ -8,10 +8,13 @@ Set-StrictMode -Version Latest
 #   L       = max(min(1000, H), H - M)                                          Get-GuiSmokeWatchdogLimitMs
 #   W, WL   the leg window and the load window, both capped at L                Get-GuiSmokeNoProgressWindowMs -CeilingMs L
 #   P       the last credited progress (arming, a growth, a new log name), read at the poll that credited it
-#   phase   LOADING until the bytes `gui_smoke.` are first seen in any mlvapp-*.log (MainWindow logs interaction_trace event=gui_smoke.playback_policy
+#   phase   LOADING until a `gui_smoke.` record is first seen in any mlvapp-*.log (MainWindow logs interaction_trace event=gui_smoke.playback_policy
 #           once openMlvSet returns, gui_smoke.launch_only for a launch-only leg); LOADED from then on (one-way)
-#   E       unarmed: none (D alone); LOADING: min(L, max(WL, P + W)); LOADED: min(L, P + W)          Get-GuiSmokeSilenceExpiryMs
-#   stalled iff armed and now >= E; every chunk wait is min(chunk, D - now, max(1, E - now)) so the check lands at E (Get-GuiSmokeChunkWaitMs).
+#   E       unarmed: none (D alone); LOADING: max(WL, P + W); LOADED: P + W; a value past L is none too (-1: a window that cannot run out by L proves no
+#           silence, so D decides the leg as a timeout)                                     Get-GuiSmokeSilenceExpiryMs
+#   phase   the marker is a log RECORD whose message starts `gui_smoke.` or `interaction_trace event=gui_smoke.` ([ts] [level] [0x<thread>] message), never
+#           those bytes inside another record (a clip path in the start-up run_metadata command line)
+#   stalled iff armed, E >= 0 and now >= E; every chunk wait is min(chunk, D - now, max(1, E - now)) so the check lands at E (Get-GuiSmokeChunkWaitMs).
 # INVARIANT: No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL).
 
 function Get-GuiSmokeTaskText {
@@ -139,8 +142,8 @@ function Get-GuiSmokeWatchdogLimitMs {
     return [int64][Math]::Max([Math]::Min([int64]1000, $HardMs), $HardMs - $margin)
 }
 
-# -2 r1: E, the silence expiry in ms since launch, for an ARMED watch. LOADING: min(L, max(WL, P + W)) -- the load allowance is anchored at the launch, so a
-# late arming cannot push it past L; LOADED: min(L, P + W).
+# -2 r1: E, the silence expiry in ms since launch, for an ARMED watch. LOADING: max(WL, P + W) -- the load allowance is anchored at the launch, so a
+# late arming cannot push it past L; LOADED: P + W. Either one past L is no expiry at all (-1).
 function Get-GuiSmokeSilenceExpiryMs {
     [CmdletBinding()]
     param(
@@ -159,7 +162,10 @@ function Get-GuiSmokeSilenceExpiryMs {
 
     $expiry = $LastProgressMs + $WindowMs
     if (-not $Loaded) { $expiry = [Math]::Max([double]$LoadWindowMs, $expiry) }
-    return [double][Math]::Min([double]$LimitMs, $expiry)
+    # adversary 81e7f8b2 A2: a window that cannot run out by L proves no silence by L, so there is no silence expiry (-1) and the hard deadline D decides
+    # the leg (timeout). Capping it at L instead ended a log still growing at L as process_no_progress with less than one window of silence.
+    if ($expiry -gt [double]$LimitMs) { return [double]-1 }
+    return [double]$expiry
 }
 
 # -2 r1: one chunk wait of the runner's loops, read from the launch stamp at the call: min(-ChunkMs, D - now, max(1, E - now)). 0 = the deadline D has been
@@ -200,7 +206,8 @@ function Get-GuiSmokeChunkWaitMs {
 # -ProbeDelayMs and -ProbeOpenDelayMs are test seams (data only): the probe sleeps that long before it lists, or before each file open, so a
 # probe that hangs on the share (or on one log) can be simulated.
 # -2 r1: the watch carries the launch-anchored model's inputs (LaunchTimestamp, P = LastProgressMs, Phase, W, WL, L) and exposes E as ExpiryMs (-1 while
-# unarmed); there is no quiet stopwatch. The probe also reports whether the bytes it read since the previous high-water mark hold `gui_smoke.` (the phase).
+# unarmed or when no window can run out by L); there is no quiet stopwatch. The probe also reports whether the bytes it read since the previous high-water
+# mark hold a `gui_smoke.` record (the phase).
 function New-GuiSmokeLogProgressWatch {
     [CmdletBinding()]
     param(
@@ -290,8 +297,8 @@ function Test-GuiSmokeLogProgressStalled {
         $probeRoot = [string]$Watch.LogRoot
         $probeDelayMs = [int]$Watch.ProbeDelayMs
         $probeOpenDelayMs = [int]$Watch.ProbeOpenDelayMs
-        # -2 r1: the previous high-water mark of each known log, copied for this probe; the probe reads the bytes from 16 before it (a marker split across
-        # two reads is still seen whole) to the current length, at most the last 1 MiB (a skipped middle only keeps the lenient LOADING bound)
+        # -2 r1: the previous high-water mark of each known log, copied for this probe; the probe reads the bytes from 257 before it (a marker record -- its
+        # [ts] [level] [0x<thread>] prefix is about 50 bytes -- split across two reads is still seen whole, with the newline before it) to the current length, at most the last 1 MiB (a skipped middle only keeps the lenient LOADING bound)
         $probeMarks = @{}
         foreach ($known in @($Watch.Files.Keys)) { $probeMarks[$known] = [int64]$Watch.Files[$known] }
         $Watch.Pending = 1 | ForEach-Object -ThrottleLimit 1 -AsJob -Parallel {
@@ -312,8 +319,12 @@ function Test-GuiSmokeLogProgressStalled {
                         $length = [int64]$stream.Length
                         $from = [int64]0
                         $seen = $marks[$file.Name]
-                        if ($null -ne $seen -and [int64]$seen -gt 16) { $from = [int64]$seen - 16 }
+                        if ($null -ne $seen -and [int64]$seen -gt 256) { $from = [int64]$seen - 256 }
                         if ($length - $from -gt 1048576) { $from = $length - 1048576 }
+                        # one byte before the window too, so a record that starts AT the window still has the newline before it; a window at the
+                        # file's start lets the file's start stand for that newline
+                        if ($from -gt 0) { $from = $from - 1 }
+                        $head = if ($from -eq 0) { '(?:\A|\n)' } else { '\n' }
                         if ($length -gt $from) {
                             $buffer = [byte[]]::new($length - $from)
                             $null = $stream.Seek($from, [System.IO.SeekOrigin]::Begin)
@@ -323,7 +334,9 @@ function Test-GuiSmokeLogProgressStalled {
                                 $step = $stream.Read($buffer, $got, $buffer.Length - $got)
                                 if ($step -le 0) { $more = $false } else { $got += $step }
                             }
-                            if ([System.Text.Encoding]::Latin1.GetString($buffer, 0, $got) -clike '*gui_smoke.*') { $mark = 1 }
+                            # the marker is a RECORD whose message starts `gui_smoke.` (LogLineField recordLine: [ts] [level] [0x<thread>] message), never
+                            # the bytes anywhere: a clip path in the start-up run_metadata command line can hold them (adversary 81e7f8b2 A1)
+                            if ([System.Text.Encoding]::Latin1.GetString($buffer, 0, $got) -cmatch ($head + '\[[^\]\r\n]*\] \[[^\]\r\n]*\] \[0x\w+\] (?:interaction_trace event=)?gui_smoke[.]')) { $mark = 1 }
                         }
                     }
                     finally { $stream.Dispose() }
@@ -420,6 +433,8 @@ function Test-GuiSmokeLogProgressStalled {
     # r15 (adversary d872def7 A2): at or past the deadline no stall verdict is passed: the caller's loop is ending on the whole budget, which then decides
     # the leg (timeout, not process_no_progress)
     if ($DeadlineMs -gt 0 -and $nowMs -ge $DeadlineMs) { return $false }
+    # E < 0: no window can run out by L (adversary 81e7f8b2 A2), so no silence verdict: D decides
+    if ([double]$Watch.ExpiryMs -lt 0) { return $false }
     return ($nowMs -ge [double]$Watch.ExpiryMs)
 }
 

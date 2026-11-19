@@ -2001,7 +2001,7 @@ $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
 #   leg window  W  = min(leg + 60000, L)                                    leg = $derivedProcessTimeoutMs
 #   load window WL = min(leg + 60000 + max(0, A - 120000), L)               A   = -LegHardLimitAllowanceMs (setup 120 s + read)
 #   an explicit -NoProgressTimeoutMs replaces both and is capped at the same L (one invariant, no exception)
-#   E = min(L, max(WL, P + W)) while the app is LOADING (no `gui_smoke.` line yet), min(L, P + W) once it is LOADED       Get-GuiSmokeSilenceExpiryMs
+#   E = max(WL, P + W) while the app is LOADING (no `gui_smoke.` record yet), P + W once it is LOADED; past L, none (D decides)   Get-GuiSmokeSilenceExpiryMs
 # No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL).
 # r4 (adversary b0a33ba9 A5): an explicit -NoProgressTimeoutMs below 1000 ms is clamped up to 1000 ms (0 stays "derived from the leg")
 $noProgressOverrideMs = if ($NoProgressTimeoutMs -gt 0) { [Math]::Max(1000, $NoProgressTimeoutMs) } else { 0 }

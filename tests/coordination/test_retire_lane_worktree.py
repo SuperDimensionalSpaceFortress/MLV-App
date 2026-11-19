@@ -4786,6 +4786,10 @@ def _gui_smoke_log_probe_purity_problems(body: str) -> list:
     # r8 (sol r6 hardening): a property assignment ($file.IsReadOnly = $true, $file.LastWriteTimeUtc = ..., += too) writes through a member with no call at all
     if re.search(r"[\w\]\)}](?:\.\w+|::\w+)+\s*(?:[-+*/%]?=(?!=)|\+\+|--)|(?:\+\+|--)\s*[\$(\[][\w\]\).:$]*(?:\.\w+|::\w+)", body):
         problems.append("property assignment")
+    # -2 r1 (adversary 81e7f8b2 A4): PowerShell drops a backtick before an ordinary letter, so $file.IsRea`dOnly = $true names IsReadOnly while every raw-text
+    # shape above misses it. The probe has no escape at all, so any backtick is refused.
+    if "`" in body:
+        problems.append("escape character")
     return problems
 
 
@@ -4830,6 +4834,9 @@ def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_wr
         "second constructor beside the buffer": "$buffer = [byte[]]::new(1); $sink = [System.IO.MemoryStream]::new($buffer)\n",
         "truncate after seek": "$null = $stream.Seek(0, [System.IO.SeekOrigin]::Begin); $stream.SetLength(0)\n",
         "encoding to bytes then write": "$bytes = [System.Text.Encoding]::Latin1.GetBytes('x'); $stream.Write($bytes, 0, 1)\n",
+        # -2 r1 (adversary 81e7f8b2 A4): a backtick-escaped member name is the same member to PowerShell
+        "backtick-escaped property assignment": "$file.IsRea`dOnly = $true\n",
+        "backtick-escaped command": "Set-Con`tent -LiteralPath $file.FullName -Value 'overwritten'\n",
     }
     for label, injected in mutations.items():
         mutated = body.replace(anchor, anchor + injected, 1)
