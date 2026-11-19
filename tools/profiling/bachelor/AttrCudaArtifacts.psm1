@@ -7428,7 +7428,7 @@ function Get-AttrCudaWindowToggleEvidence {
             $tail = $body.Substring($cut)
             $digitAt = $tail.Length - 2
             while ($digitAt -gt 2 -and $tail[$digitAt] -ge [char]'0' -and $tail[$digitAt] -le [char]'9') { $digitAt-- }
-            if (-not ($tail.EndsWith(')', [StringComparison]::Ordinal) -and $digitAt -lt $tail.Length - 2 -and $digitAt -gt 2 -and $tail[$digitAt] -ceq [char]':')) { [void]$badTail.Add($lines.Count) }
+            if (-not (($tail[$tail.Length - 1] -ceq [char]')') -and $digitAt -lt $tail.Length - 2 -and $digitAt -gt 2 -and $tail[$digitAt] -ceq [char]':')) { [void]$badTail.Add($lines.Count) }
             $body = $body.Substring(0, $cut)
         }
         $lines.Add($body)
@@ -7477,37 +7477,33 @@ function Get-AttrCudaWindowToggleEvidence {
     # r3 (adversary A1 on 90451806, and A1/A5 on 1f00a482): ONE record reader for every record this function counts. A record is WELL FORMED only when its tail is a
     # location (or absent) and every token after the record name is one `<key>=<value>` with no quote in the value; a key repeated in it (an empty value counts) makes
     # it unusable too. A quoted field value, a bare word, a stray tail or a repeated key makes the whole record unusable (the app writes none of these in a record
-    # here), so a `<key>=` inside quoted text is never a field. The quote characters are listed by code point (the straight and typographic quotes and the backtick).
-    $quoteChars = [char[]](0x22, 0x27, 0x60, 0x2018, 0x2019, 0x201C, 0x201D)
-    $readRecord = {
-        param([string]$text, [int]$at)
-        $fields = @{}
-        $unusable = $badTail.Contains($at)
-        foreach ($token in ($text -split ' ' | Select-Object -Skip 1)) {
-            $eq = $token.IndexOf('=')
-            if ($eq -lt 1 -or $token.IndexOfAny($quoteChars) -ge 0 -or $token.Substring(0, $eq) -cnotmatch '^[A-Za-z0-9_]+$') { $unusable = $true; continue }
-            $key = $token.Substring(0, $eq)
-            if ($fields.ContainsKey($key)) { $unusable = $true }
-            $fields[$key] = $token.Substring($eq + 1)
-        }
-        @{ values = $fields; unusable = $unusable }
-    }
+    # here), so a `<key>=` inside quoted text is never a field. The quote characters are the regex class below: the straight double and single quote and the backtick by hex
+    # escape, and every initial or final Unicode quote (the typographic quotes among them) by category, so this file stays ASCII.
+    # r4 (CI R3/R4 on f1def3c8): the reader is INLINE in the one loop below (no scriptblock called with &, no .EndsWith / .IndexOfAny), so the spliced-body scan
+    # admits it with no allowlist row.
     for ($i = $start; $i -lt $end; $i++) {
         $line = $lines[$i]
-        if ($line -match '^interaction_trace event=resize\.keep_playing(\s|$)') {
-            $keepRecord = & $readRecord $line $i
-            if (-not $keepRecord.unusable -and $keepRecord.values['event'] -ceq 'resize.keep_playing') { $keepLines += $i }
-            continue
-        }
+        $isKeep = $line -match '^interaction_trace event=resize\.keep_playing(\s|$)'
         # r3 (adversary A2 on 1f00a482): a toggle record is any record that starts with the name (phase= need not come first), so a record with index= before
         # phase= is read, ordered and counted like the rest, never skipped
         $isSummary = $line -match '^gui_smoke\.window_toggles(\s|$)'
-        if (-not $isSummary -and $line -notmatch '^gui_smoke\.window_toggle(\s|$)') { continue }
-        if (-not $isSummary -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
+        $isToggle = (-not $isSummary) -and ($line -match '^gui_smoke\.window_toggle(\s|$)')
+        if (-not ($isKeep -or $isSummary -or $isToggle)) { continue }
+        if ($isToggle -and $i -gt $lastToggleLine) { $lastToggleLine = $i }
         # (r3 B2: the value may be EMPTY, so a key repeated with no value, ` position=` or ` requested=`, is repeated and the record unusable)
-        $record = & $readRecord $line $i
-        $values = $record.values
-        $repeatedKey = $record.unusable
+        $values = @{}
+        $repeatedKey = $badTail.Contains($i)
+        foreach ($token in ($line -split ' ' | Select-Object -Skip 1)) {
+            $eq = $token.IndexOf('=')
+            if ($eq -lt 1 -or $token -match '[\x22\x27\x60\p{Pi}\p{Pf}]' -or $token.Substring(0, $eq) -cnotmatch '^[A-Za-z0-9_]+$') { $repeatedKey = $true; continue }
+            $fieldKey = $token.Substring(0, $eq)
+            if ($values.ContainsKey($fieldKey)) { $repeatedKey = $true }
+            $values[$fieldKey] = $token.Substring($eq + 1)
+        }
+        if ($isKeep) {
+            if (-not $repeatedKey -and $values['event'] -ceq 'resize.keep_playing') { $keepLines += $i }
+            continue
+        }
         if ($isSummary) { $summaries += , @{ values = $values; repeated = $repeatedKey; line = $i }; continue }
         [int]$index = -1
         if (-not ($values.ContainsKey('index') -and [int]::TryParse([string]$values['index'], [ref]$index) -and $index -ge 0 -and $index -lt 1000)) {
