@@ -3758,7 +3758,8 @@ void MainWindow::viewerIdleTimeout( void )
     if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
 #endif
     // r3 (adversary r1 pass 4 A1): off Windows the sample above is the only witness, so every rearm is capped at
-    // one poll period: a move away and back is seen unless the pointer is away for less than kPointerPollMs().
+    // one poll period. Bound (pass 5 A1): an away-and-back that lies entirely between two samples (a late tick
+    // widens the gap) is seen only when the wait delivers its events; on Windows the hook sees it at once.
     switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms, viewer_idle::kPointerPollMs() ) )
     {
     case viewer_idle::Tick::Hide:

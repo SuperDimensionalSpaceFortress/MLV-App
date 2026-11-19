@@ -2702,7 +2702,9 @@ void GuiSmokeTest::viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSur
 // both surfaces fresh at every hide/restore; the viewport is replaced by QGraphicsView::setViewport (as
 // GpuDisplayViewport does, which deletes the old one) and the GL window comes and goes. Restore must touch only
 // the live surfaces, never a deleted one, and leave a new surface's own cursor state alone; the next hide
-// blanks the new surfaces and the restore after it gives them back exactly what they had.
+// blanks the new surfaces, and the restore after it gives the viewport back exactly what it had and unsets the
+// GL window's cursor (CursorHider does not save a GL cursor: production never sets one on GpuDisplayWindow;
+// r3 pass 5 advisory A2 pins that here rather than claim more).
 void GuiSmokeTest::viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces()
 {
     QGraphicsView view;
@@ -2743,12 +2745,14 @@ void GuiSmokeTest::viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyThe
     hider.restore( after );
     QCOMPARE( fresh->testAttribute( Qt::WA_SetCursor ), freshHadOwn );
     QCOMPARE( fresh->cursor().shape(), freshShape );
-    QVERIFY( gl2.cursor().shape() != Qt::BlankCursor );
+    QCOMPARE( gl2.cursor().shape(), Qt::ArrowCursor );   // unset: the default, not the CrossCursor it had
 }
 
 // G9 (r3, adversary r1 pass 4 A1): off Windows the position sample is the only witness in an input-excluded
 // wait. With the poll cap the live timer samples every poll period, so a move away and back that is over long
-// before one idle period ends still brings the cursor back on both surfaces; the cap does not stop the next hide.
+// before one idle period ends, but spans at least one sample (80 ms away, 10 ms poll), still brings the cursor
+// back on both surfaces; the cap does not stop the next hide. An excursion between two samples is the
+// documented bound (P9), not exercised here.
 // The harness's positionSampleOnly tick is the off-Windows tick (no hook, no queue status), so this runs here.
 void GuiSmokeTest::viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack()
 {

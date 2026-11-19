@@ -390,6 +390,64 @@ TEST(ViewerIdlePolicy, PollCapSamplesThePointerOftenEnoughToSeeAnAwayAndBack)
     ASSERT_EQ(1500, rearm);
 }
 
+// P9 (r3, adversary r1 pass 5 A1): the exact bound of the sampled witness, with the adversary's input. Hidden
+// at 2000; the pointer is away from 2010 to 2070; the tick asked for 2050 fires late, at 2080 (a busy GUI
+// thread). The excursion lies entirely between two samples, so the sample alone cannot see it: that is the
+// documented non-promise, pinned here so no comment or PR text claims more. What does see it: on Windows the
+// retrieval witness (the hook took both moves), and on every platform the event path once the wait delivers
+// the deferred moves. An excursion still in progress at a late tick is seen by the sample.
+TEST(ViewerIdlePolicy, SampledWitnessBoundIsAnExcursionBetweenTwoSamplesAndTheOtherWitnessesCoverIt)
+{
+    const int poll = viewer_idle::kPointerPollMs();
+    viewer_idle::Controller hidden;
+    hidden.setFullscreen(true, 0);
+    int rearm = 0;
+    ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(hidden.onTimeout(allPass(), 2000, 2000, &rearm, poll)));
+    ASSERT_EQ(poll, rearm);   // the tick asks for 2050
+
+    viewer_idle::PointerWatch sampled;
+    sampled.seed(QPoint(500, 500));   // the sample at 2000
+
+    // The sample alone at the late tick (2080): back at (500,500), nothing seen, still hidden.
+    {
+        viewer_idle::Controller c = hidden;
+        viewer_idle::PointerWatch s = sampled;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = s.moved(QPoint(500, 500));
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(in, 2080, 2000, &rearm, poll)));
+        ASSERT_TRUE(c.hidden());
+
+        // The wait returns and Qt delivers the deferred moves: the event path notes activity and restores.
+        ASSERT_TRUE(c.noteActivity(2300));
+        ASSERT_FALSE(c.hidden());
+    }
+
+    // Windows: the hook took both moves when the wait removed them, so the same late tick shows.
+    {
+        viewer_idle::Controller c = hidden;
+        viewer_idle::PointerWatch s = sampled;
+        viewer_idle::RetrievalWitness w;
+        w.seed(QPoint(500, 500));
+        w.note(viewer_idle::RetrievedKind::Move, QPoint(510, 500), true);
+        w.note(viewer_idle::RetrievedKind::Move, QPoint(500, 500), true);
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = s.moved(QPoint(500, 500));
+        if (w.take()) in.pointerMoved = true;
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 2080, 2000, &rearm, poll)));
+        ASSERT_FALSE(c.hidden());
+    }
+
+    // Still away at the late tick (back only at 2090): the sample sees it however late the tick is.
+    {
+        viewer_idle::Controller c = hidden;
+        viewer_idle::PointerWatch s = sampled;
+        viewer_idle::Inputs in = allPass();
+        in.pointerMoved = s.moved(QPoint(510, 500));
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 2080, 2000, &rearm, poll)));
+        ASSERT_FALSE(c.hidden());
+    }
+}
+
 #ifdef Q_OS_WIN
 // P7: the WH_MOUSE procedure maps each mouse message to its kind, records the hook position, passes every
 // message on, and the hook installs for this thread and removes cleanly.

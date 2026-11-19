@@ -18,8 +18,9 @@
  * delivers no mouse event, so each timer tick also compares the OS pointer position (PointerWatch):
  * movement keeps the cursor shown, and while hidden the tick keeps watching so it comes back within one
  * idle period even inside such a wait. The caller passes kPointerPollMs() as the poll cap, so the tick
- * looks at least every poll period, shown or hidden (r3: a move away and back within one idle period
- * is then seen on every platform unless the pointer is away for less than one poll period).
+ * asks for a look every poll period, shown or hidden. Off Windows that is the whole witness: a move away
+ * and back that lies entirely between two consecutive samples is seen only when the wait delivers its
+ * events (see kPointerPollMs for the exact bound); on Windows the thread mouse hook sees it at once.
  */
 
 #ifndef VIEWERIDLEPOLICY_H
@@ -36,11 +37,16 @@ namespace viewer_idle
 /*! \brief Idle time with no mouse activity before the fullscreen cursor hides. */
 inline constexpr int kIdleHideMs() { return 2000; }
 
-/*! \brief The longest gap between two looks at the OS pointer while fullscreen (r3, adversary r1 pass 4 A1).
+/*! \brief The requested gap between two looks at the OS pointer while fullscreen (r3, adversary r1 pass 4 A1).
  *         Off Windows the sampled position is the only witness for movement an input-excluded wait does not
- *         deliver, so it is sampled every poll period rather than once per idle period: a move away and back
- *         is missed only if the pointer is away for less than one poll period. It does not change when the
- *         cursor hides (the activity timestamp decides that). */
+ *         deliver, so it is sampled every poll period rather than once per idle period. The exact bound
+ *         (r3, pass 5 A1): a move is seen at the first tick that samples the pointer away from the last
+ *         sample. A move away and back that lies entirely between two consecutive samples is NOT seen by
+ *         the sample; the samples are at least this far apart and later when the GUI thread is busy (a Qt
+ *         timer may fire late), so no poll period makes that a guarantee. Such an excursion is seen when
+ *         the wait returns and Qt delivers its deferred mouse events (the event path), and on Windows at
+ *         once by the thread mouse hook. The poll does not change when the cursor hides (the activity
+ *         timestamp decides that). */
 inline constexpr int kPointerPollMs() { return 50; }
 
 /*! \brief What the window looks like at the moment the hide timer fires. */
