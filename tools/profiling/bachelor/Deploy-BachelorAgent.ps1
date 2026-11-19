@@ -51,8 +51,8 @@
 #   DEPLOY_NOOP sha=<s>                                          0   (-RestartMode none: this exact line, busy or not)
 #   DEPLOY_NOOP sha=<s> restarted=yes reason=loaded-script-unproven pid=<n> agentStartUtc=<t> fileUtc=<t|unreadable> agentAfterFile=<yes|no|unknown>
 #                                                                0   (when-idle; the times are information, never the decision)
-#   DEPLOY_NOOP sha=<s> restarted=no reason=<unreadable|no-live-agent|restart-host-refused|busy|restart-failed> ...
-#                                                                12|16|16|10 or 11|14 (when-idle; after the matching typed line;
+#   DEPLOY_NOOP sha=<s> restarted=no reason=<unreadable|no-live-agent|restart-host-refused|busy|lease|restart-failed> ...
+#                                                                12|16|16|10|11|14 (when-idle; after the matching typed line;
 #                                                                unreadable and no-live-agent: the -RestartScript seam only)
 #   DEPLOY_DRYRUN action=<deploy|noop> sha=<s> restart=<mode>   0   (-RestartMode none)
 #   DEPLOY_DRYRUN action=deploy sha=<s> restart=when-idle decision=<restart-if-idle wouldExit=0|refuse wouldExit=16 why=<..>>   0
@@ -181,6 +181,18 @@ foreach ($pathParam in 'Source', 'VenueRoot', 'RestartScript', 'TaskXmlFile', 'T
         exit 12
     }
     Set-Variable -Name $pathParam -Value $pathNormalized
+}
+# -RestartMode is reduced to its ONE canonical spelling here, so every later dispatch reads exactly 'none' or 'when-idle' (adversary pass
+# 3 A1 of e7cfa491). ValidateSet compares culture-aware and ignores characters such as a soft hyphen (U+00AD): it accepted
+# 'when<U+00AD>-idle', which no ordinal dispatch below matched, so that run skipped the binding, the refusals and the restart as if it
+# were 'none'. A mode that is not ordinally (case-insensitively) one of the two is a typed refusal, before anything is read or changed.
+if ([string]::Equals([string]$RestartMode, 'when-idle', [System.StringComparison]::OrdinalIgnoreCase)) { $RestartMode = 'when-idle' }
+elseif ([string]::Equals([string]$RestartMode, 'none', [System.StringComparison]::OrdinalIgnoreCase)) { $RestartMode = 'none' }
+else {
+    $modeWhy = "-RestartMode '$RestartMode' is not none or when-idle (it holds a character the parameter check ignores); retype it"
+    if ($pathDotSourced) { throw $modeWhy }
+    Write-Output "DEPLOY_REFUSED_UNREADABLE $modeWhy"
+    exit 12
 }
 $agentName = 'ultra-magnus-agent.ps1'
 # ONE tolerance for "same process start": the heartbeat's processStartUtc against the live process (alive check) and the old
@@ -1087,6 +1099,18 @@ public static class MlvDeployFileTimes {
     return [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch).UtcDateTime
 }
 
+function Get-NoopRefusalReason {
+    # the reason= a NOOP's DEPLOY_NOOP restarted=no line gives for a Get-Refusals code: it names the refusal that was observed
+    # (adversary pass 3 A2 of e7cfa491: an unreadable venue said reason=busy)
+    param([int]$Code)
+    switch ($Code) {
+        10 { return 'busy' }
+        11 { return 'lease' }
+        12 { return 'unreadable' }
+        default { return "refused-$Code" }
+    }
+}
+
 function Get-NoopRestartDecision {
     # BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1: the venue copy already has the source sha, so nothing is written; with -RestartMode when-idle
     # the question is whether the LIVE agent runs that file or an older one it read before the file was written (a copy-only deploy, or a
@@ -1245,7 +1269,7 @@ try {
         $noopRef = Get-Refusals
         if ($null -ne $noopRef) {
             foreach ($l in $noopRef.lines) { Out-Typed $l }
-            if (-not $DryRun) { Out-Typed "DEPLOY_NOOP sha=$srcSha restarted=no reason=busy $($decision.detail)" }
+            if (-not $DryRun) { Out-Typed "DEPLOY_NOOP sha=$srcSha restarted=no reason=$(Get-NoopRefusalReason -Code $noopRef.code) $($decision.detail)" }
             exit $noopRef.code
         }
         if ($DryRun) {

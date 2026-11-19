@@ -1809,6 +1809,37 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertNotIn("DEPLOY_DRYRUN", r.stdout)
         self.assertFalse(self.marker.exists())
 
+    # ---- adversary pass 3 of e7cfa491 (A1 blocking, A2 advisory): each test failed on e7cfa491 -----------------------------------
+
+    def test_noop_p3a1_a_restart_mode_validateset_accepts_but_the_script_does_not_name_is_refused(self) -> None:
+        # pass 3 A1: ValidateSet compares culture-aware and ignores a soft hyphen, so 'when<U+00AD>-idle' passed it, while every dispatch
+        # compares ordinally: the NOOP then printed DEPLOY_NOOP and exited 0 as if -RestartMode none (the deploy path skipped the restart
+        # the same way). A mode that is not ordinally none or when-idle is a typed refusal before anything is read or changed.
+        self.source.write_bytes(OLD)
+        for label, mode in (("soft-hyphen", "when­-idle"), ("soft-hyphen-none", "no­ne")):
+            for venue_bytes in (OLD, NEW):
+                with self.subTest(label=label, noop=venue_bytes == OLD):
+                    (self.venue / AGENT_NAME).write_bytes(venue_bytes)
+                    r = self.run_deploy("-RestartMode", mode)
+                    self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+                    self.assertRegex(r.stdout, r"(?m)^DEPLOY_REFUSED_UNREADABLE -RestartMode ")
+                    self.assertNotIn("DEPLOY_NOOP", r.stdout)
+                    self.assertNotIn("DEPLOY_OK", r.stdout)
+                    self.assertEqual((self.venue / AGENT_NAME).read_bytes(), venue_bytes, "a refused mode changes nothing")
+        # the canonical spellings, in any case, still work
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        for mode in ("none", "NONE", "When-Idle"):
+            with self.subTest(mode=mode):
+                r = self.run_deploy("-DryRun", "-RestartMode", mode, "-RestartScript", str(self.restart))
+                self.assertNotEqual(r.returncode, 12, r.stdout + r.stderr)
+                self.assertNotIn("DEPLOY_REFUSED_UNREADABLE -RestartMode", r.stdout)
+
+    def test_noop_p3a2_the_noop_refusal_reason_names_the_refusal_observed(self) -> None:
+        # pass 3 A2 (advisory): a NOOP whose last idle read found the venue UNREADABLE (code 12) said reason=busy
+        r = self._dot_source("foreach ($c in 10, 11, 12) { 'c' + $c + '=' + (Get-NoopRefusalReason -Code $c) }")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["c10=busy", "c11=lease", "c12=unreadable"], r.stdout + r.stderr)
+
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.
         r = subprocess.run(
