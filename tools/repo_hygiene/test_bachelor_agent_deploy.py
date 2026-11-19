@@ -1208,6 +1208,57 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.split(), ["drive=True", "drive-no-root=True", "drive-other=False", "sub=True", "sub-other=False"], r.stdout + r.stderr)
 
+    def test_p15a1_an_ignorable_character_in_a_host_argument_binds_nothing(self) -> None:
+        # pass 15 A1: PowerShell's -eq / -ceq / -contains / -in on STRINGS are culture-aware, so a soft hyphen (U+00AD) inside "Bypass"
+        # or "-NoProfile" compared equal to the plain word. The check passed, the old agent was stopped, and the host (which compares
+        # by ordinal) rejected the replacement's arguments. The text this check reads must be compared by ordinal, case-insensitively.
+        body = (
+            "$s=[string][char]0xAD; $a='C:\\bench\\ultra-magnus-agent.ps1';"
+            "function Chk($t){ [string](Test-HostArgvRunsScript -Exe 'pwsh.exe' -Tokens $t -AgentScript $a) };"
+            "'plain='+(Chk @('-NoProfile','-ExecutionPolicy','Bypass','-File',$a));"
+            "'case='+(Chk @('-noprofile','-EXECUTIONPOLICY','BYPASS','-File',$a));"
+            "'shy-policy='+(Chk @('-NoProfile','-ExecutionPolicy',('By'+$s+'pass'),'-File',$a));"
+            "'shy-flag='+(Chk @(('-No'+$s+'Profile'),'-ExecutionPolicy','Bypass','-File',$a));"
+            "'shy-name='+(Chk @('-NoProfile',('-Execution'+$s+'Policy'),'Bypass','-File',$a));"
+            "'shy-style='+(Chk @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle',('Hi'+$s+'dden'),'-File',$a));"
+            "'shy-only='+(Chk @('-NoProfile','-ExecutionPolicy','Bypass',$s,'-File',$a))"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(
+            r.stdout.split(),
+            ["plain=True", "case=True", "shy-policy=False", "shy-flag=False", "shy-name=False", "shy-style=False", "shy-only=False"],
+            r.stdout + r.stderr)
+
+    def test_p15a2_a_path_that_compares_equal_to_empty_is_still_made_absolute(self) -> None:
+        # pass 15 A2: U+00AD is not empty but `-ne ''` said it was, so the path was never made absolute: Test-Path validated it under the
+        # PowerShell location and ReadAllBytes read it under the process directory (two different files). Every "is it empty" test on a
+        # path is a length test now.
+        cmd = (
+            "$s=[string][char]0xAD; . '%s' -VenueRoot '%s' -Source $s -RestartScript $s -TaskXmlFile $s -TaskPidsFile $s;"
+            "foreach ($n in 'Source','RestartScript','TaskXmlFile','TaskPidsFile') { $n + '=' + [System.IO.Path]::IsPathRooted([string](Get-Variable -Name $n -ValueOnly)) }"
+        ) % (psq(SCRIPT), psq(self.venue))
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["Source=True", "RestartScript=True", "TaskXmlFile=True", "TaskPidsFile=True"], r.stdout + r.stderr)
+
+    def test_p15_no_string_comparison_operator_is_left_in_the_deployer(self) -> None:
+        # class sweep for pass 15: -eq / -ne / -ceq / -cne / -contains / -notcontains / -in / -notin on two STRINGS are culture-aware.
+        # A comparison of a string with a literal is allowed only where the other side is a char (a char-to-char -eq is ordinal in effect),
+        # an int, $null, or a value the deployer itself generated (a hex digest). Anything else must be [string]::Equals(.., Ordinal*).
+        import re
+        text = SCRIPT.read_text(encoding="utf-8")
+        offenders = []
+        for no, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            code = line
+            for m in re.finditer(r"\s-(?:c|i)?(?:eq|ne|contains|notcontains|in|notin)\s+(?:'[^']*'|\"[^\"]*\")", code):
+                offenders.append("%d: %s" % (no, m.group(0).strip()))
+            for m in re.finditer(r"(?:'[^']*'|\"[^\"]*\")\s+-(?:c|i)?(?:eq|ne|contains|notcontains|in|notin)\s", code):
+                offenders.append("%d: %s" % (no, m.group(0).strip()))
+        self.assertEqual(offenders, [], "string literal compared with a culture-aware operator:\n" + "\n".join(offenders))
+
     def test_p10a2_the_clock_stepping_back_does_not_let_an_earlier_instance_confirm_the_replacement(self) -> None:
         # pass 10 A2: after the old agent exits a trigger starts PID 4200; the clock steps back; runAt (a wall-clock read) is now BEFORE
         # that start, and /Run is ignored (IgnoreNew): the instance that existed before /Run confirmed the restart. Two closures:

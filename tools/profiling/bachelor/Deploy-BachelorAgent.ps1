@@ -131,7 +131,7 @@ $ErrorActionPreference = 'Stop'
 # two agree. (The bounded runspaces get these resolved values.)
 foreach ($pathParam in 'VenueRoot', 'Source', 'RestartScript', 'TaskXmlFile', 'TaskPidsFile') {
     $pathValue = [string](Get-Variable -Name $pathParam -ValueOnly)
-    if ($pathValue -ne '') {
+    if ($pathValue.Length -ne 0) {
         Set-Variable -Name $pathParam -Value $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($pathValue)
     }
 }
@@ -426,7 +426,7 @@ function Get-LiveProcess {
             $stat = [System.IO.File]::ReadAllText("/proc/$ProcessId/stat")
             # "<pid> (<comm>) <state> ...": comm may hold spaces and parentheses, so the state follows the LAST ')'
             $close = $stat.LastIndexOf(')')
-            if ($close -ge 0 -and ($close + 2) -lt $stat.Length -and $stat[$close + 2] -eq 'Z') { return $null }
+            if ($close -ge 0 -and ($close + 2) -lt $stat.Length -and $stat[$close + 2] -eq [char]'Z') { return $null }
         }
         catch { }   # no /proc (another Unix) or the process just exited: the Get-Process answer stands
     }
@@ -503,7 +503,7 @@ function Get-ProcessArgv {
         return (Split-TaskArguments -Text $c.CommandLine)
     }
     $raw = [System.IO.File]::ReadAllText("/proc/$ProcessId/cmdline")
-    $parts = @($raw.Split([char]0) | Where-Object { $_ -ne '' })
+    $parts = @($raw.Split([char]0) | Where-Object { $_.Length -ne 0 })
     if ($parts.Count -lt 1) { return $none }
     return [pscustomobject]@{ ok = $true; tokens = $parts }
 }
@@ -523,7 +523,7 @@ function Get-TaskRunningPids {
     # -TaskPidsFile is the test seam: the pids are read (digits, any separator) from that file instead.
     $no = [pscustomobject]@{ ok = $false; pids = @() }
     try {
-        if ($TaskPidsFile -ne '') {
+        if ($TaskPidsFile.Length -ne 0) {
             $text = [System.IO.File]::ReadAllText($TaskPidsFile)
             return [pscustomobject]@{ ok = $true; pids = @([regex]::Matches($text, '\d+') | ForEach-Object { [int]$_.Value }) }
         }
@@ -657,7 +657,7 @@ function Test-TaskXmlRunsScript {
     param([string]$Xml, [string]$AgentScript)
     try { $doc = [xml]$Xml } catch { return $false }
     $actions = @($doc.SelectNodes("//*[local-name()='Actions']/*"))
-    if ($actions.Count -ne 1 -or $actions[0].LocalName -ne 'Exec') { return $false }
+    if ($actions.Count -ne 1 -or -not [string]::Equals([string]$actions[0].LocalName, 'Exec', [System.StringComparison]::Ordinal)) { return $false }
     $exec = $actions[0]
     $cmdNode = $exec.SelectSingleNode("*[local-name()='Command']")
     $argNode = $exec.SelectSingleNode("*[local-name()='Arguments']")
@@ -680,7 +680,7 @@ function Test-HostArgvRunsScript {
     if ($Exe.Trim() -match '[\x00-\x1f\x7f]') { return $false }   # (the surrounding whitespace of a pretty-printed <Command> is trimmed, not refused)
     $expectedRoot = $AgentScript -replace '[\\/][^\\/]*\z', ''
     if ($expectedRoot -match '\A[A-Za-z]:\z') { $expectedRoot += '\' }
-    elseif ($expectedRoot -eq '' -and $AgentScript -match '\A/') { $expectedRoot = '/' }
+    elseif ($expectedRoot.Length -eq 0 -and $AgentScript -match '\A/') { $expectedRoot = '/' }
     $leaf = [regex]::Match($Exe.Trim().Trim('"'), '[^\\/]+\z').Value
     if ($leaf -notmatch '(?i)\A(pwsh|powershell)(\.exe)?\z') { return $false }
     $tokens = @($Tokens)
@@ -696,6 +696,10 @@ function Test-HostArgvRunsScript {
     $policies = @('Bypass', 'RemoteSigned', 'Unrestricted')
     $styles = @('Hidden', 'Normal', 'Minimized', 'Maximized')
     $hostValued = @{ ExecutionPolicy = $policies; ep = $policies; WindowStyle = $styles; w = $styles }
+    # PowerShell's -eq / -contains / -in on STRINGS are culture-aware (a soft hyphen inside 'Bypass' compares equal to it), while the host
+    # and the .NET Hashtable compare by ordinal: every comparison of host text below is ordinal and case-insensitive, through this one
+    $sameText = { param($a, $b) [string]::Equals([string]$a, [string]$b, [System.StringComparison]::OrdinalIgnoreCase) }
+    $inSet = { param($set, $v) foreach ($x in @($set)) { if (& $sameText $x $v) { return $true } }; return $false }
     $scriptPath = $null; $i = 0
     while ($i -lt $tokens.Count) {
         $t = $tokens[$i]
@@ -705,10 +709,10 @@ function Test-HostArgvRunsScript {
         }
         if ($t.Length -lt 2 -or ($t[0] -ne [char]'-' -and $t[0] -ne [char]'/')) { return $false }
         $name = $t.Substring(1)
-        if ($hostFlags -contains $name) { if ($name -eq 'NoProfile' -or $name -eq 'nop') { $sawNoProfile = $true }; $i++; continue }
+        if (& $inSet $hostFlags $name) { if ((& $sameText $name 'NoProfile') -or (& $sameText $name 'nop')) { $sawNoProfile = $true }; $i++; continue }
         # a valued option takes ONLY one of its known values (a value of -File, or a path, would shift what the host runs)
-        if ($hostValued.ContainsKey($name) -and $i + 1 -lt $tokens.Count -and $hostValued[$name] -contains $tokens[$i + 1]) {
-            if ($name -eq 'ExecutionPolicy' -or $name -eq 'ep') { $sawPolicy = $true }
+        if ($hostValued.ContainsKey($name) -and $i + 1 -lt $tokens.Count -and (& $inSet $hostValued[$name] $tokens[$i + 1])) {
+            if ((& $sameText $name 'ExecutionPolicy') -or (& $sameText $name 'ep')) { $sawPolicy = $true }
             $i += 2; continue
         }
         return $false
@@ -728,7 +732,7 @@ function Get-TaskXml {
     # The task's CURRENT definition (schtasks /Query /XML, bounded; -TaskXmlFile is the test seam). Returns @{ ok; xml; why }.
     $no = { param($why) [pscustomobject]@{ ok = $false; xml = $null; why = $why } }
     try {
-        if ($TaskXmlFile -ne '') { return [pscustomobject]@{ ok = $true; xml = [System.IO.File]::ReadAllText($TaskXmlFile); why = $null } }
+        if ($TaskXmlFile.Length -ne 0) { return [pscustomobject]@{ ok = $true; xml = [System.IO.File]::ReadAllText($TaskXmlFile); why = $null } }
         $q = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Query', '/TN', $TaskName, '/XML') -TimeoutSec 30
         if ($q.timedOut) { return (& $no "task $TaskName did not answer schtasks /Query within 30 s") }
         if ($q.exitCode -ne 0) { return (& $no "task $TaskName could not be queried (exit $($q.exitCode))") }
@@ -856,7 +860,7 @@ function Invoke-AgentRestart {
     param([string]$AgentScript)
     $pre = Get-Refusals
     if ($null -ne $pre) { return @{ why = "the venue is no longer idle, so the agent was not restarted: $($pre.lines -join '; ')"; warn = $null } }
-    if ($RestartScript -ne '') {
+    if ($RestartScript.Length -ne 0) {
         $global:LASTEXITCODE = 0
         try { & $RestartScript -VenueRoot $VenueRoot | Out-Null }
         catch { return @{ why = "restart script threw: $($_.Exception.Message)"; warn = $null } }
@@ -881,14 +885,14 @@ function Invoke-AgentRestart {
     $clockWatch = [System.Diagnostics.Stopwatch]::StartNew()
     # the start handed to the stop is the one the OS reported for the pid at the binding (osStart), compared with a tight tolerance there
     $stop = Stop-TaskInstanceBounded -ProcessId $before.pid -StartText $(if (-not [string]::IsNullOrWhiteSpace([string]$before.osStart)) { [string]$before.osStart } else { [string]$before.start })
-    if ($stop.outcome -eq 'not-stopped') {
+    if ([string]::Equals([string]$stop.outcome, 'not-stopped', [System.StringComparison]::Ordinal)) {
         if ($null -ne $stop.busy) { return @{ why = "the venue is no longer idle, so the agent was not stopped: $(@($stop.busy) -join '; ')"; warn = $null } }
         return @{ why = "could not stop agent pid=$($before.pid); nothing was stopped: $($stop.why)"; warn = $null }
     }
     # 'stopped' or 'unknown': either way the pid is re-observed, and only an OBSERVED exit lets the restart go on to the start
     $gone = Wait-Until -TimeoutSec $script:StopWaitSec -Variables @{ before = $before } -Condition { -not (Test-AgentProcessAlive -Beat $before) }
     if (-not $gone) {
-        if ($stop.outcome -ne 'stopped') { return @{ why = "the stop of agent pid=$($before.pid) has an UNKNOWN outcome ($($stop.why)) and the agent is still alive $($script:StopWaitSec) s later; the task was NOT started"; warn = $null } }
+        if (-not [string]::Equals([string]$stop.outcome, 'stopped', [System.StringComparison]::Ordinal)) { return @{ why = "the stop of agent pid=$($before.pid) has an UNKNOWN outcome ($($stop.why)) and the agent is still alive $($script:StopWaitSec) s later; the task was NOT started"; warn = $null } }
         return @{ why = "agent pid $($before.pid) still alive $($script:StopWaitSec) s after its task instance was stopped"; warn = $null }
     }
     $warn = Get-ArrivalWarning
@@ -929,7 +933,7 @@ function Invoke-AgentRestart {
 }
 
 # Dot-sourced (`. <script> -VenueRoot <x>`): the functions above only.
-if ($MyInvocation.InvocationName -eq '.') { return }
+if ([string]::Equals([string]$MyInvocation.InvocationName, '.', [System.StringComparison]::Ordinal)) { return }
 
 $lock = $null
 try {
@@ -981,7 +985,7 @@ try {
     }
 
     # restart binding precheck: nothing may change if the restart could not be done safely afterwards
-    if ($RestartMode -eq 'when-idle' -and $RestartScript -eq '') {
+    if ([string]::Equals([string]$RestartMode, 'when-idle', [System.StringComparison]::OrdinalIgnoreCase) -and $RestartScript.Length -eq 0) {
         $bind = Get-RestartBindingRefusal -AgentScript $dest
         if ($null -ne $bind) {
             Out-Typed "DEPLOY_REFUSED_RESTART_HOST $bind"
@@ -1049,7 +1053,7 @@ try {
 
     # 8. restart, only when idle at this moment
     $restarted = 'no'
-    if ($RestartMode -eq 'when-idle') {
+    if ([string]::Equals([string]$RestartMode, 'when-idle', [System.StringComparison]::OrdinalIgnoreCase)) {
         $res = Invoke-AgentRestart -AgentScript $dest
         if ($null -ne $res.warn) { Out-Typed $res.warn }
         if ($null -ne $res.why) {
