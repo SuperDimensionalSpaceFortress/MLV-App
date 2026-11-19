@@ -26,6 +26,7 @@
 #include <QString>
 #include <QStringList>
 #include <QToolBar>
+#include <QtGlobal>
 #include <QVariant>
 #include <QWidget>
 #include <QWidgetAction>
@@ -81,11 +82,22 @@ inline void applyKeyTooltips( QToolBar *bar )
 }
 
 // The image at `resource`, flipped horizontally (a null icon when it cannot be read).
+// QImage::flipped() is Qt 6.9+; the macOS Intel release kit is Qt 5, where mirrored( true, false )
+// gives the same pixels (horizontal flip only).
+inline QImage mirroredImage( const QImage &image )
+{
+#if QT_VERSION >= QT_VERSION_CHECK( 6, 9, 0 )
+    return image.flipped( Qt::Horizontal );
+#else
+    return image.mirrored( true, false );
+#endif
+}
+
 inline QIcon mirroredIcon( const QString &resource )
 {
     const QImage image( resource );
     if( image.isNull() ) return QIcon();
-    return QIcon( QPixmap::fromImage( image.flipped( Qt::Horizontal ) ) );
+    return QIcon( QPixmap::fromImage( mirroredImage( image ) ) );
 }
 
 // A Stop square the size of the Play image: transparent, with a centred filled square of 55% of
