@@ -923,9 +923,17 @@ function Resolve-TaskAgentPid {
     # the second census, AFTER the start reads: the child is still listed under this instance, and both are still the processes read above
     try { $again = @(Get-ChildProcesses -ProcessId $inst) }
     catch { return (& $no "INSTANCE_CHILDREN_UNREADABLE the children of wrapper instance pid=${inst} could not be read again: $($_.Exception.Message)") }
-    $still = $false
-    foreach ($k in $again) { if ([int]$k.pid -eq $agent) { $still = $true } }
-    if (-not $still -or -not (& $sameStart (Get-LiveProcess -ProcessId $inst) $instStart) -or -not (& $sameStart (Get-LiveProcess -ProcessId $agent) $agentStart)) {
+    # ... and it is STILL the only live PowerShell child (the same filter as the first census): a second one that appeared meanwhile
+    # makes the cardinality unproved, so it refuses like two children do
+    $still = $false; $hostKids = 0
+    foreach ($k in $again) {
+        if ([regex]::Match([string]$k.name, '[^\\/]+\z').Value -notmatch '(?i)\A(pwsh|powershell)(\.exe)?\z') { continue }
+        $kp2 = Get-LiveProcess -ProcessId ([int]$k.pid)
+        if ($null -eq $kp2 -or $kp2.StartTime.ToUniversalTime() -lt $instStart.AddMilliseconds(-1 * $script:OsStartToleranceMs)) { continue }
+        $hostKids++
+        if ([int]$k.pid -eq $agent) { $still = $true }
+    }
+    if (-not $still -or $hostKids -ne 1 -or -not (& $sameStart (Get-LiveProcess -ProcessId $inst) $instStart) -or -not (& $sameStart (Get-LiveProcess -ProcessId $agent) $agentStart)) {
         return (& $no "INSTANCE_CHANGED the wrapper instance pid=$inst or its agent child pid=$agent changed while it was read (exited, or the pid now names another process)")
     }
     return [pscustomobject]@{ ok = $true; agentPid = $agent; instancePid = $inst; instanceStart = $instStart.ToString('o'); agentStart = $agentStart.ToString('o'); why = $null }
@@ -1092,8 +1100,8 @@ function Stop-TaskInstanceByPid {
         if ([string]::IsNullOrWhiteSpace($StartText)) { return (& $notStopped 'the proved start time of the agent is missing, so no instance can be identified') }
         if ($ChildPid -gt 0) {
             if ([string]::IsNullOrWhiteSpace($ChildStartText)) { return (& $notStopped "the proved start time of the agent child pid=$ChildPid is missing, so the child cannot be identified") }
-            $childNow = Get-LiveProcess -ProcessId $ChildPid
-            if ($null -eq $childNow -or -not (& $isProved $childNow $ChildStartText)) { return (& $notStopped "the agent child pid=$ChildPid with the proved start $ChildStartText is not running any more") }
+            # the proved child already gone (no process under its pid, or one with another start: a reuse) is fine: the wrapper is still
+            # stopped, and after Stop() only a process that is STILL the proved child is ended (never whatever holds the pid now)
         }
         $mine = $null
         $want = '\' + $TaskName.TrimStart('\')

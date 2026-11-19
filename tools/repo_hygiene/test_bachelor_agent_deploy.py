@@ -1868,7 +1868,7 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn("TASK_WRAPPER_PATH", r.stdout)
         self.assert_untouched()
 
-    def _wrapped_stop(self, label: str, child_shift_sec: float = 0) -> tuple[dict, Path, int]:
+    def _wrapped_stop(self, label: str, child_shift_sec: float = 0, kill_child_first: bool = False) -> tuple[dict, Path, int]:
         wpid, kids = self.wrapped_agent(1)
         marker = Path(self._tmp.name) / ("wrap-stop-marker-%s.txt" % label)
         body = (
@@ -1879,10 +1879,12 @@ class DeployBachelorAgent(unittest.TestCase):
             "  @($o) };"
             "$ws=(Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o');"
             "$cs=(Get-Process -Id %d).StartTime.ToUniversalTime().AddSeconds(%s).ToString('o');"
+            "if ($%s) { Stop-Process -Id %d -Force; 'preGone=' + (Wait-Until -TimeoutSec 15 -PollMs 100 -Condition { $null -eq (Get-LiveProcess -ProcessId %d) }) };"
             "$r = Stop-TaskInstanceByPid -ProcessId %d -StartText $ws -ChildPid %d -ChildStartText $cs;"
             "'outcome=' + $r.outcome; 'why=' + $r.why;"
             "$gone = Wait-Until -TimeoutSec 15 -PollMs 100 -Condition { $null -eq (Get-LiveProcess -ProcessId %d) }; 'childGone=' + $gone"
-        ) % (psq(marker), wpid, wpid, kids[0], child_shift_sec, wpid, kids[0], kids[0])
+        ) % (psq(marker), wpid, wpid, kids[0], child_shift_sec, "true" if kill_child_first else "false", kids[0], kids[0],
+             wpid, kids[0], kids[0])
         cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvTest'; %s" % (psq(SCRIPT), psq(self.venue), body)
         r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1894,11 +1896,38 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertTrue(marker.exists(), "the wrapper instance is stopped through the scheduler")
         self.assertEqual(out.get("childGone"), "True", "the agent child is ended by its pid as well")
 
-    def test_wrap_the_stop_refuses_a_child_that_is_not_the_proved_process(self) -> None:
+    def test_wrap_the_stop_never_ends_a_process_that_reused_the_child_pid(self) -> None:
+        # the process under the child's pid has another start than the proved one (a reuse): the proved child is gone, the wrapper is
+        # still stopped (adversary r1 pass 2 A2), and the process that now holds the pid is left alone
         out, marker, _ = self._wrapped_stop("reused", child_shift_sec=-10)
-        self.assertEqual(out.get("outcome"), "not-stopped", out)
-        self.assertFalse(marker.exists(), "nothing is stopped when the child is not the proved one")
-        self.assertEqual(out.get("childGone"), "False", "the child is left alone")
+        self.assertEqual(out.get("outcome"), "stopped", out)
+        self.assertTrue(marker.exists(), "the wrapper instance is stopped")
+        self.assertEqual(out.get("childGone"), "False", "a process that is not the proved child is never ended")
+
+    def test_wrap_a_proved_child_that_is_already_gone_still_lets_the_wrapper_stop(self) -> None:
+        # adversary r1 pass 2 A2 (9d5207a0): child 4300 exited before the stop; the wrapper 4200 is still the proved instance and the
+        # venue is idle. The stop returned not-stopped before the scheduler lookup, and the restart aborted.
+        out, marker, _ = self._wrapped_stop("gone-first", kill_child_first=True)
+        self.assertEqual(out.get("preGone"), "True", out)
+        self.assertEqual(out.get("outcome"), "stopped", out)
+        self.assertTrue(marker.exists(), "the wrapper instance is stopped although its child already exited")
+
+    def test_wrap_a_second_pwsh_child_seen_by_the_second_census_refuses(self) -> None:
+        # adversary r1 pass 2 A1 (9d5207a0): the first census lists one PowerShell child, the second lists it plus another live one; the
+        # cardinality was checked on the first census only, so the wrapper passed with two children
+        wpid, kids = self.wrapped_agent(1)
+        extra, _ = self.live_agent()   # a live pwsh started after the wrapper, presented by the stand-in census as a second child
+        body = (
+            "$script:Census = 0; $real = ${function:Get-ChildProcesses};"
+            "function Get-ChildProcesses { param([int]$ProcessId) $script:Census++; $k = @(& $real -ProcessId $ProcessId);"
+            "  if ($script:Census -ge 2) { $k += [pscustomobject]@{ pid = %d; name = 'pwsh.exe' } }; $k };"
+            "$m = Resolve-TaskAgentPid -InstancePids @(%d) -Wrapped $true -AgentScript '%s'; 'ok=' + $m.ok; 'why=' + $m.why"
+        ) % (extra, wpid, psq(self.venue / AGENT_NAME))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        vals = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        self.assertEqual(vals.get("ok"), "False", vals)
+        self.assertTrue(vals.get("why", "").startswith("INSTANCE_CHANGED "), vals)
 
     def test_wrap_the_restart_hands_the_stop_the_instance_and_the_child(self) -> None:
         body = (
