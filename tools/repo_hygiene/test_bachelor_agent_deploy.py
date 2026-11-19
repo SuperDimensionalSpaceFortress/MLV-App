@@ -42,14 +42,22 @@ VENUE_AGENT = r"C:\mlvtmp\mlv-agent\ultra-magnus-agent.ps1"
 WRAPPER_FLAGS = (r'--stdout "C:\Users\layib\AppData\Local\MagicLantern\task-logs\MlvAgentBachelor.out.log" '
                  r'--stderr "C:\Users\layib\AppData\Local\MagicLantern\task-logs\MlvAgentBachelor.err.log" --label "MlvAgentBachelor"')
 WRAPPER_HOST = r'"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden'
-# A stand-in for the wrapper PROCESS: it waits <delay> s, starts <n> copies of the command after it as its children, prints
-# "W <its own pid> <child pids>" and sleeps. (Its own pid, not the Popen pid: a venv python.exe on Windows is a launcher.)
+# A stand-in for the wrapper PROCESS, started with argv[0] = the tracked wrapper path (so its own command line reads as
+# `C:\mlvtmp\mlv-hidden.exe -c <code> <n> <delay> -- <host argv>`): it waits <delay> s, starts <n> copies of the command after `--` as
+# its children, prints "W <its own pid> <child pids>", and when its stdin closes it ends those children through their own handles (so
+# cleanup never signals a pid number that may have been reused) and exits. (Its own pid, not the Popen pid: a venv python.exe on
+# Windows is a launcher.)
 WRAPPER_PY = (
     "import os, subprocess, sys, time\n"
-    "n = int(sys.argv[1]); time.sleep(float(sys.argv[2])); cmd = sys.argv[3:]\n"
+    "n = int(sys.argv[1]); time.sleep(float(sys.argv[2])); assert sys.argv[3] == '--'; cmd = sys.argv[4:]\n"
     "kids = [subprocess.Popen(cmd) for _ in range(n)]\n"
     "print('W %d %s' % (os.getpid(), ' '.join(str(k.pid) for k in kids)), flush=True)\n"
-    "time.sleep(120)\n"
+    "sys.stdin.read()\n"
+    "for k in kids:\n"
+    "    try:\n"
+    "        k.kill(); k.wait(10)\n"
+    "    except Exception:\n"
+    "        pass\n"
 )
 
 
@@ -1688,26 +1696,71 @@ class DeployBachelorAgent(unittest.TestCase):
     # RED on cbedba9269219774bfa14754c10bc5fc13ad6508: the dry run with -RestartMode when-idle on today's task shape refused
     # DEPLOY_REFUSED_RESTART_HOST (exit 16), and the binding could not match the wrapper instance to the heartbeat (its pwsh child).
 
-    def _kill(self, pid: int) -> None:
-        import signal
+    def _end_stand_in(self, p) -> None:
+        # closing stdin makes the stand-in end its own children by handle; kill it only if it does not exit by itself
         try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-        except OSError:
-            pass
+            p.stdin.close()
+            p.wait(30)
+        except Exception:
+            p.kill()
+            p.wait()
+        p.stdout.close()
 
-    def wrapped_agent(self, children: int = 1, delay: float = 0.0, *script_args: str):
+    def wrapped_agent(self, children: int = 1, delay: float = 0.0, *script_args: str, as_wrapper: bool = True):
         """A stand-in wrapper process with <children> pwsh children, each running the venue agent the way the venue's wrapper does.
+        With as_wrapper its own command line names the tracked wrapper (argv[0]); without it, it reads as plain python.
         Returns (wrapper pid, [child pids])."""
-        cmd = [sys.executable, "-c", WRAPPER_PY, str(children), str(delay),
+        cmd = [WRAPPER_EXE if as_wrapper else sys.executable, "-c", WRAPPER_PY, str(children), str(delay), "--",
                PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(self.venue / AGENT_NAME), *script_args]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        p = subprocess.Popen(cmd, executable=sys.executable, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(self._end_stand_in, p)
         line = p.stdout.readline().split()
         self.assertEqual(line[:1], ["W"], "the stand-in wrapper reported its pids")
-        wpid, kids = int(line[1]), [int(x) for x in line[2:]]
-        for k in kids:
-            self.addCleanup(self._kill, k)
-        self.addCleanup(lambda: (p.kill(), p.wait(), p.stdout.close()))
-        return wpid, kids
+        return int(line[1]), [int(x) for x in line[2:]]
+
+    def test_wrap_a_running_instance_not_started_as_the_wrapper_refuses(self) -> None:
+        # adversary r1 A1 (e0ea4e68): the instance predates the current definition and is NOT the wrapper (here: plain python; on the
+        # venue, cmd.exe /c a multi-root host); its one PowerShell child runs the matching agent and writes a valid heartbeat
+        wpid, kids = self.wrapped_agent(1, as_wrapper=False)
+        self.write_beat(kids[0], self.start_of(kids[0]))
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(self._venue_xml_file("notwrapper")),
+                            "-TaskPidsFile", str(self.task_pids(wpid, name="wrap-notwrapper")))
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST INSTANCE_NOT_WRAPPER", r.stdout)
+        self.assert_untouched()
+        a = psq(VENUE_AGENT)
+        body = (
+            "function A($t){ [pscustomobject]@{ ok = $true; tokens = $t } };"
+            "'venue='+(Test-WrapperInstanceArgv -Argv (A @('C:\\mlvtmp\\mlv-hidden.exe','--label','MlvAgentBachelor','--','C:\\Program Files\\PowerShell\\7\\pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s');"
+            "'cmd='+(Test-WrapperInstanceArgv -Argv (A @('cmd.exe','/c','C:\\ops\\multi-root-host.cmd')) -AgentScript '%s');"
+            "'elsewhere='+(Test-WrapperInstanceArgv -Argv (A @('C:\\temp\\mlv-hidden.exe','--','pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s');"
+            "'no-sep='+(Test-WrapperInstanceArgv -Argv (A @('C:\\mlvtmp\\mlv-hidden.exe','pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s')) -AgentScript '%s');"
+            "'other-script='+(Test-WrapperInstanceArgv -Argv (A @('C:\\mlvtmp\\mlv-hidden.exe','--','pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','C:\\busy\\ultra-magnus-agent.ps1')) -AgentScript '%s');"
+            "'unreadable='+(Test-WrapperInstanceArgv -Argv ([pscustomobject]@{ ok = $false; tokens = @() }) -AgentScript '%s')"
+        ) % (a, a, a, a, a, a, a, a, a)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["venue=True", "cmd=False", "elsewhere=False", "no-sep=False", "other-script=False", "unreadable=False"],
+                         r.stdout + r.stderr)
+
+    def test_wrap_a_child_that_left_the_instance_between_the_reads_refuses(self) -> None:
+        # adversary r1 A2 (e0ea4e68): the census listed child C under wrapper W, then C exited and an unrelated process reused its pid
+        # before its start was read. The census is taken again after the start reads; a child no longer listed under W is not the agent.
+        wpid, kids = self.wrapped_agent(1)
+        body = (
+            "$script:Census = 0; $real = ${function:Get-ChildProcesses};"
+            "function Get-ChildProcesses { param([int]$ProcessId) $script:Census++; if ($script:Census -eq 1) { & $real -ProcessId $ProcessId } else { @() } };"
+            "$m = Resolve-TaskAgentPid -InstancePids @(%d) -Wrapped $true -AgentScript '%s'; 'ok=' + $m.ok; 'why=' + $m.why;"
+            "$script:Census = 0; function Get-ChildProcesses { param([int]$ProcessId) & $real -ProcessId $ProcessId };"
+            "$m2 = Resolve-TaskAgentPid -InstancePids @(%d) -Wrapped $true -AgentScript '%s'; 'steady=' + $m2.ok; 'agent=' + $m2.agentPid;"
+            "'agentStart=' + ($m2.agentStart -eq (Get-Process -Id %d).StartTime.ToUniversalTime().ToString('o'))"
+        ) % (wpid, psq(self.venue / AGENT_NAME), wpid, psq(self.venue / AGENT_NAME), kids[0])
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        vals = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        self.assertEqual(vals.get("ok"), "False", vals)
+        self.assertTrue(vals.get("why", "").startswith("INSTANCE_CHANGED "), vals)
+        self.assertEqual((vals.get("steady"), vals.get("agent"), vals.get("agentStart")), ("True", str(kids[0]), "True"), vals)
 
     def _venue_xml_file(self, name: str, **kw) -> Path:
         f = Path(self._tmp.name) / ("task-wrap-%s.xml" % name)
@@ -1804,10 +1857,10 @@ class DeployBachelorAgent(unittest.TestCase):
         r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(w1, name="wrap-other")))
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("runs agent child pid=%d, not heartbeat pid=%d" % (kids1[0], pid), r.stdout)
-        # a wrapped definition whose instance is the agent itself (the child named as the instance) has no agent child either
+        # a wrapped definition whose instance is the agent itself (the child named as the instance) is not the wrapper
         r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(kids1[0], name="wrap-self")))
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
-        self.assertIn("INSTANCE_NO_AGENT_CHILD", r.stdout)
+        self.assertIn("INSTANCE_NOT_WRAPPER", r.stdout)
         # an end-to-end wrapper-shape refusal carries its typed reason too
         bad = self._venue_xml_file("bad-path", command="C:\\temp\\mlv-hidden.exe")
         r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(bad), "-TaskPidsFile", str(self.task_pids(w1, name="wrap-badpath")))
