@@ -15862,6 +15862,19 @@ class WindowToggleEvidenceTests(unittest.TestCase):
             "r3-b-A2: session=4 with a quoted `session=3` after it": (
                 self.log().replace("playback_smoke.measured_session id=3\n", 'playback_smoke.measured_session id=3\nplayback_smoke.start session=4 diagnostic="lost session=3 tail"\n', 1),
                 (0, 0, 0, 0), False),
+            # r4 adversary pass on 16530f5b (A1): a session boundary record whose cut tail is no location is unreadable, never "the rest of the record"; the keys are read in any case
+            "r4-A1: `playback_smoke.frame session=3 (session=4)` right after the marker (the cut tail may hide a foreign session)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 (session=4)\n", 1),
+                (0, 0, 0, 0), False),
+            "r4-A1: `playback_smoke.frame session=3 SESSION=4` right after the marker (the key is read in any case)": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3\nplayback_smoke.frame session=3 SESSION=4\n", 1),
+                (0, 0, 0, 0), False),
+            "r4-A1: a marker `id=3 (id=4)` is no readable marker of session 3": (
+                self.log().replace("playback_smoke.measured_session id=3\n", "playback_smoke.measured_session id=3 (id=4)\n", 1), (4, 4, 4, 4), False),
+            "r4-A1: a boundary record with a REAL location tail is still read and the window stays open": (
+                self.log().replace("playback_smoke.measured_session id=3\n",
+                                   "playback_smoke.measured_session id=3 (C:/b x/MainWindow.cpp:10)\nplayback_smoke.frame session=3 n=1 (C:/b x/MainWindow.cpp:11)\n", 1),
+                (4, 4, 4, 4), True),
             "A4: the measured session is 2 and the toggles belong to session 3 after its marker": (
                 self.log(prefix=("playback_smoke.measured_session id=2", "playback_smoke.summary session=2 source_advanced=600")), (0, 0, 0, 0), False),
             "two toggles only (the loop exit cut the rest short)": (
