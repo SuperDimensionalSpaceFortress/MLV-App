@@ -291,13 +291,59 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         for flag, value in (("--repo-root", "$RepoRoot"), ("--payload-id", "$PayloadId"), ("--archive-reference", "$ArchiveReference"), ("--output-dir", "$OutputDir")):
             self.assertEqual(flat[flat.index(flag) + 1], value)
         self.assertEqual(flat[-1], "--verify-installed")
+        # adversary ae560106-A2: the local install validates the named record alone, never the tracked-file census.
+        self.assertEqual(flat.count("--record-only"), 1, "the local install must pass --record-only")
         self.assertIn("$psi.WorkingDirectory = $RepoRoot", body)
         self.assertIn("$process.WaitForExit($TimeoutSec * 1000)", body)
         stop = text[text.index("function Stop-PinnedPayloadChild {"): text.index(f"function {HELPER} {{")]
         self.assertIn("$null = $Process.Kill($true)", stop, "the timeout kill must take the whole tree")
-        self.assertIn(f"Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, {HELPER}, Stop-PinnedPayloadChild", text)
+        self.assertIn(f"Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, {HELPER}, Stop-PinnedPayloadChild, Open-PinnedFileHold, Test-PinnedZipMember", text)
         # adversary 32bf39a9-A1: every inherited GIT_* variable is dropped from the child's environment.
         self.assertIn("if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }", body)
+
+    def test_the_assembler_checks_the_ffmpeg_entry_inside_the_staged_zip_before_publishing(self) -> None:
+        # adversary ae560106-A1: ffmpeg.exe deleted after its readback zipped without it, the zip hash validated that incomplete zip,
+        # and build.json still said ffmpegExeDeployed. The entry inside the zip is checked and the published zip hash is the checked one.
+        commands = _commands(ASSEMBLER)
+        checks = [c for c in commands if (c["name"] or "") == "Test-PinnedZipMember"]
+        self.assertEqual(len(checks), 1, "the assembler must check the staged zip's ffmpeg.exe entry exactly once")
+        named = checks[0]["named"]
+        self.assertEqual(named.get("ZipPath", {}).get("variable"), "stagedPkgPath")
+        self.assertEqual(named.get("MemberName", {}).get("value"), "ffmpeg.exe")
+        self.assertEqual(named.get("ExpectedSha256", {}).get("text"), "$ffmpegExe.sha256")
+        self.assertEqual(named.get("ExpectedBytes", {}).get("text"), "$ffmpegExe.bytes")
+        self.assertEqual(sorted(set(checks[0]["ancestors"]) & GUARDING_NODES), [], "the zip check must run on every assemble")
+        zips = [c for c in commands if (c["name"] or "") == "Compress-Archive"]
+        publishes = [c for c in commands if (c["name"] or "") == "Publish-AttrCudaFileCopy"]
+        self.assertTrue(zips and publishes)
+        self.assertLess(zips[0]["offset"], checks[0]["offset"])
+        self.assertLess(checks[0]["offset"], min(p["offset"] for p in publishes), "check the zip before any .partial is published")
+        text = _normalised(ASSEMBLER)
+        self.assertIn("if (-not $pkgFfmpegCheck.ok) { Complete-Failed 28 'ffmpegExeInstall'", text)
+        self.assertEqual(re.findall(r"^\$stagedPkgSha = .*$", text, re.M), ["$stagedPkgSha = $pkgFfmpegCheck.zipSha256"],
+                         "the published zip hash must be the one read with the entry check, never a second read")
+
+    def test_build_release_rehashes_and_holds_ffmpeg_while_the_manifest_is_written(self) -> None:
+        # adversary ae560106-A1 sibling: a delete after the readback (the launch probe runs in between) left build-manifest.json claiming
+        # the deploy. The file is re-hashed right before the manifest and held (FileShare.Read) until the write is done.
+        commands = _commands(BUILD_RELEASE)
+        holds = [c for c in commands if (c["name"] or "") == "Open-PinnedFileHold"]
+        self.assertEqual(len(holds), 1)
+        named = holds[0]["named"]
+        self.assertEqual(named.get("Path", {}).get("variable"), "ffmpegExePath")
+        self.assertEqual(named.get("ExpectedSha256", {}).get("text"), "$deploy.ffmpegExe.sha256")
+        self.assertEqual(named.get("ExpectedBytes", {}).get("text"), "$deploy.ffmpegExe.bytes")
+        self.assertEqual(sorted(set(holds[0]["ancestors"]) & GUARDING_NODES), [])
+        probes = [c for c in commands if (c["name"] or "") == "Start-Process" and c["named"].get("FilePath", {}).get("variable") == "destExe"]
+        writes = [c for c in commands if (c["name"] or "") == "Set-Content" and "build-manifest.json" in c["text"]]
+        self.assertEqual(len(writes), 1)
+        self.assertLess(probes[0]["offset"], holds[0]["offset"], "the re-hash must come after the launch probe")
+        self.assertLess(holds[0]["offset"], writes[0]["offset"])
+        self.assertIn("TryStatementAst", writes[0]["ancestors"], "the manifest write must sit in the try whose finally releases the hold")
+        text = _normalised(BUILD_RELEASE)
+        block = text[text.index("$ffmpegHold = Open-PinnedFileHold"): text.index('Write-Host "OK -> $destExe"')]
+        self.assertRegex(block, r"if \(-not \$ffmpegHold\.ok\) \{\n[^\n]*\n\s*exit 9\n\}")
+        self.assertRegex(block, r"\} finally \{\n\s*\$ffmpegHold\.stream\.Dispose\(\)\n\}")
 
     def test_an_install_into_another_folder_is_refused_by_the_guard(self) -> None:
         # adversary 32bf39a9-A4: (Join-Path $releaseDir 'other') passed the substring check; the exact pin must refuse it.
@@ -431,6 +477,169 @@ class HelperBehaviourTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIsNone(result["exitCode"])
                 self.assertIn("not a fully qualified path", result["reason"])
+
+
+@unittest.skipUnless(os.name == "nt" and PWSH, "needs Windows and pwsh")
+class PublicationCheckBehaviourTests(unittest.TestCase):
+    """adversary ae560106-A1: the bytes are re-read at the point of publication (zip entry; held file during the manifest write)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="ffx-publish-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def _ps(self, body: str, **env: str) -> dict:
+        module = str(HELPER_MODULE).replace("'", "''")
+        script = f"$m = Import-Module '{module}' -Force -PassThru\n" + body
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True, timeout=120, env=dict(os.environ, **env))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def _zip(self, name: str, members: dict[str, bytes]) -> Path:
+        import zipfile
+        path = self.tmp / name
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for member, data in members.items():
+                zf.writestr(member, data)
+        return path
+
+    def _check_zip(self, zip_path: Path, expected: bytes) -> dict:
+        return self._ps(
+            "$r = Test-PinnedZipMember -ZipPath $env:FFX_ZIP -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+            "$r | ConvertTo-Json -Compress\n",
+            FFX_ZIP=str(zip_path), FFX_SHA=hashlib.sha256(expected).hexdigest(), FFX_LEN=str(len(expected)))
+
+    def test_the_zip_check_passes_only_when_the_entry_carries_the_recorded_bytes(self) -> None:
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        good = self._zip("good.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload})
+        result = self._check_zip(good, payload)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["zipSha256"], hashlib.sha256(good.read_bytes()).hexdigest())
+        missing = self._zip("missing.zip", {"MLVApp.exe": b"exe"})
+        result = self._check_zip(missing, payload)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("0 root entries named ffmpeg.exe", result["reason"])
+        stale = self._zip("stale.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": b"other bytes"})
+        result = self._check_zip(stale, payload)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("not the recorded", result["reason"])
+        nested = self._zip("nested.zip", {"sub/ffmpeg.exe": payload})
+        self.assertFalse(self._check_zip(nested, payload)["ok"], "only a root entry beside the exe counts")
+        result = self._check_zip(self.tmp / "absent.zip", payload)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("could not be read as a zip", result["reason"])
+
+    def test_the_file_hold_refuses_a_changed_file_and_blocks_a_delete_while_held(self) -> None:
+        target = self.tmp / "ffmpeg.exe"
+        target.write_bytes(b"pinned")
+        sha = hashlib.sha256(b"pinned").hexdigest()
+        result = self._ps(
+            "$h = Open-PinnedFileHold -Path $env:FFX_FILE -ExpectedSha256 $env:FFX_SHA -ExpectedBytes 6\n"
+            "$deleteRefused = $false\n"
+            "try { Remove-Item -LiteralPath $env:FFX_FILE -Force -ErrorAction Stop } catch { $deleteRefused = $true }\n"
+            "$h.stream.Dispose()\n"
+            "[ordered]@{ ok = $h.ok; deleteRefused = $deleteRefused; stillThere = (Test-Path -LiteralPath $env:FFX_FILE) } | ConvertTo-Json -Compress\n",
+            FFX_FILE=str(target), FFX_SHA=sha)
+        self.assertEqual(result, {"ok": True, "deleteRefused": True, "stillThere": True})
+        result = self._ps(
+            "$h = Open-PinnedFileHold -Path $env:FFX_FILE -ExpectedSha256 $env:FFX_SHA -ExpectedBytes 6\n"
+            "[ordered]@{ ok = $h.ok; reason = $h.reason; stream = ($null -eq $h.stream) } | ConvertTo-Json -Compress\n",
+            FFX_FILE=str(target), FFX_SHA="0" * 64)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["stream"], "a refused hold must not leak an open handle")
+        target.unlink()
+        result = self._ps(
+            "$h = Open-PinnedFileHold -Path $env:FFX_FILE -ExpectedSha256 $env:FFX_SHA -ExpectedBytes 6\n"
+            "[ordered]@{ ok = $h.ok; reason = $h.reason } | ConvertTo-Json -Compress\n",
+            FFX_FILE=str(target), FFX_SHA=sha)
+        self.assertFalse(result["ok"])
+        self.assertIn("could not be opened", result["reason"])
+
+
+class RecordOnlyInstallTests(unittest.TestCase):
+    """adversary ae560106-A2: the local install validates the named record alone and opens no tracked file outside that payload.
+
+    The full validate_manifest enumerates every Git-tracked file and opens a 512-byte prefix of each (owner clip fixtures included).
+    Here the census and the full validator are replaced by functions that fail the test if called, and every file open is recorded:
+    only the manifest, the named archive and the output folder may be touched. The real in-repo archive is used; no clip is opened.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="ffx-record-only-")
+        self.addCleanup(self._tmp.cleanup)
+        self.out = Path(self._tmp.name) / "out"
+        self.out.mkdir()
+
+    def _argv(self, *extra: str) -> list[str]:
+        archive = PurePosixPath(_ffmpeg_record()["path"]).name
+        return ["--repo-root", str(ROOT), "--payload-id", PAYLOAD_ID, "--archive-reference", archive,
+                "--output-dir", str(self.out), "--verify-installed", *extra]
+
+    def test_record_only_never_runs_the_tracked_file_census_or_opens_another_tracked_file(self) -> None:
+        import io
+        from unittest import mock
+        from tools.repo_hygiene import extract_vendored_native_payload as extractor
+        from tools.repo_hygiene import vendored_native_payloads as validator
+
+        opened: list[Path] = []
+        real_path_open = Path.open
+        real_os_open = os.open
+
+        def path_open(self, *args, **kwargs):
+            opened.append(Path(self))
+            return real_path_open(self, *args, **kwargs)
+
+        def os_open(path, *args, **kwargs):
+            opened.append(Path(os.fsdecode(path)))
+            return real_os_open(path, *args, **kwargs)
+
+        census = mock.Mock(side_effect=AssertionError("the tracked-file census ran on the install path"))
+        full = mock.Mock(side_effect=AssertionError("the full manifest validation ran on the install path"))
+        with mock.patch.object(validator, "_git_tracked_artifacts", census), mock.patch.object(extractor, "validate_manifest", full), \
+                mock.patch.object(Path, "open", path_open), mock.patch.object(os, "open", os_open), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = extractor.main(self._argv("--record-only"))
+        self.assertEqual(code, 0)
+        census.assert_not_called()
+        full.assert_not_called()
+        member = next(m for m in _ffmpeg_record()["selected_members"] if m["output_name"] == "ffmpeg.exe")
+        self.assertEqual(hashlib.sha256((self.out / "ffmpeg.exe").read_bytes()).hexdigest(), member["sha256"])
+        allowed = {MANIFEST.resolve(), (ROOT / Path(_ffmpeg_record()["path"])).resolve()}
+        out_root = self.out.resolve()
+        stray = sorted({str(p) for p in opened if p.resolve() not in allowed and not p.resolve().is_relative_to(out_root)})
+        self.assertEqual(stray, [], "the record-only install opened a file outside the manifest, the named archive and the output folder")
+
+    def test_without_record_only_the_full_validation_still_runs(self) -> None:
+        # The hosted workflows never pass --record-only: their full census check is unchanged.
+        import io
+        from unittest import mock
+        from tools.repo_hygiene import extract_vendored_native_payload as extractor
+        from tools.repo_hygiene.vendored_native_payloads import PayloadIntegrityError
+
+        full = mock.Mock(side_effect=PayloadIntegrityError("full validation ran"))
+        with mock.patch.object(extractor, "validate_manifest", full), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = extractor.main(self._argv())
+        self.assertEqual(code, 1)
+        full.assert_called_once()
+        self.assertIn("full validation ran", err.getvalue())
+        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_record_only_still_refuses_a_record_whose_member_hash_is_wrong(self) -> None:
+        import io
+        from unittest import mock
+        from tools.repo_hygiene import extract_vendored_native_payload as extractor
+
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        record = next(r for r in manifest["payloads"] if r.get("id") == PAYLOAD_ID)
+        record["selected_members"][0]["sha256"] = "0" * 64
+        tampered = Path(self._tmp.name) / "tampered-manifest.json"
+        tampered.write_text(json.dumps(manifest), encoding="utf-8")
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = extractor.main(self._argv("--record-only", "--manifest", str(tampered)))
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertIn("sha256 mismatch", err.getvalue())
+        self.assertEqual(list(self.out.iterdir()), [])
 
 
 if __name__ == "__main__":

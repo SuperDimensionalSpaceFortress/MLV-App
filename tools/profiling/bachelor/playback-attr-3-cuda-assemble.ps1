@@ -35,13 +35,15 @@
 # Exit codes: 2 source, 3 DLL-pair manifest missing, 4 DLL-pair manifest does not bind,
 # 12 qmake discovery, 13 qmake, 14 mingw32-make discovery, 15 make, 16 release exe missing,
 # 17 windeployqt discovery, 18 windeployqt, 19 DLL-pair deploy, 21 MinGW runtime deploy,
-# 22 runtime donor dir, 28 ffmpeg.exe install (step ffmpegExeInstall: the pinned payload did not install and verify),
+# 22 runtime donor dir, 28 ffmpeg.exe install (step ffmpegExeInstall: the pinned payload did not install and verify, or the
+#   staged package zip does not carry that exact ffmpeg.exe),
 # 23 launch probe, 20 packaging, 24 publish partials, 25 publish rename, 26 publish manifest,
 # 27 no heavy-slot deadline (STAGE_NO_HEAVY_SLOT_DEADLINE: MLV_HEAVY_SLOT_DEADLINE_UTC absent or blank; nothing written, no ticket taken).
 #
 # FFMPEG.EXE. Every package carries ffmpeg.exe beside MLVApp.exe, installed from the pinned in-repo payload
 # (tools/gates/vendored-native-payloads.json id ffmpeg-windows-x86_64, platform/qt/FFmpeg/ffmpegWin64.zip) by
-# tools/repo_hygiene/extract_vendored_native_payload --verify-installed, the same install the hosted Windows release runs.
+# tools/repo_hygiene/extract_vendored_native_payload --verify-installed (--record-only: that record alone is validated), the
+# install the hosted Windows release runs. The ffmpeg.exe entry inside the staged zip is re-checked against the recorded hash.
 # build.json records it as ffmpegExeDeployed plus ffmpegExe { payloadId, bytes, sha256 }. The FFmpeg av*/sw* DLLs still
 # come only from the optional -RuntimeDonorDir (ffmpegRuntimeDeployed).
 #
@@ -327,8 +329,10 @@ $StepLog['runtimeDonor'] = 0
 # (export-stage-job.ps1 refuses EXPORT_TOOLING_ABSENT without it), and no donor dir ever carried one. So it is installed
 # here on EVERY assemble, outside the optional donor step above, by the extractor and flags the hosted Windows release
 # uses: platform/qt/FFmpeg/ffmpegWin64.zip, member ffmpeg.exe, both sha-pinned in tools/gates/vendored-native-payloads.json
-# and re-verified after the atomic install. $RepoRoot is the git checkout (the manifest validator runs git ls-files; the
-# git-archive $SourceTree has no .git); the pins, not that checkout's revision, decide the bytes.
+# and re-verified after the atomic install. $RepoRoot is the git checkout (the archive's Git tracking is checked with git
+# ls-files on that one path; the git-archive $SourceTree has no .git); the pins, not that checkout's revision, decide the bytes.
+# The helper validates ONLY this record (--record-only, adversary ae560106-A2): no tracked-file census, so no media file is
+# opened, which keeps the NO FOOTAGE promise above.
 $ffmpegPayloadId = 'ffmpeg-windows-x86_64'
 $ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $RepoRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir $releaseDir -TimeoutSec 600
 # The log is evidence, not a gate: a log that cannot be written (locked) is said and never throws past the typed
@@ -404,7 +408,13 @@ try {
 } catch {
     Complete-Failed 20 'package' $_.Exception.Message
 }
-$stagedPkgSha = Get-ShaLower $stagedPkgPath
+# Adversary ae560106-A1: ffmpeg.exe deleted or rewritten after its readback zipped without it while build.json still said
+# ffmpegExeDeployed. The ffmpeg.exe entry INSIDE the staged zip is checked against the recorded sha256 and size, and the zip's
+# own sha256 is read through the same handle, so the hash published below (and round-tripped by every .partial copy) is the
+# hash of the zip whose entry was verified.
+$pkgFfmpegCheck = Test-PinnedZipMember -ZipPath $stagedPkgPath -MemberName 'ffmpeg.exe' -ExpectedSha256 $ffmpegExe.sha256 -ExpectedBytes $ffmpegExe.bytes
+if (-not $pkgFfmpegCheck.ok) { Complete-Failed 28 'ffmpegExeInstall' "the staged package does not carry the installed ffmpeg.exe: $($pkgFfmpegCheck.reason)" }
+$stagedPkgSha = $pkgFfmpegCheck.zipSha256
 $stagedExeSha = Get-ShaLower $stagedExePath
 $stagedDllSha = Get-ShaLower $stagedDllPath
 $StepLog['package'] = 0

@@ -23,10 +23,11 @@ function Test-ReviewedReleaseRuntimeExtraName {
 
 # EXPORT-PRORES-FFMPEG-EXE-PACKAGE-1: install the selected members of one sha-pinned vendored payload
 # (tools/gates/vendored-native-payloads.json) into OutputDir with the same extractor and flags the hosted
-# Windows release uses (.github/workflows/Windows.yml), always with --verify-installed. The extractor
+# Windows release uses (.github/workflows/Windows.yml), always with --verify-installed, plus --record-only: only the
+# named record is validated, never the repository-wide tracked-file census (adversary ae560106-A2). The extractor
 # re-hashes the in-repo archive and every selected member against the manifest before and after the atomic
 # install, so the bytes cannot depend on which revision RepoRoot has checked out. RepoRoot must be a git
-# checkout (the manifest validator runs git ls-files). The child is synchronous and bounded: past
+# checkout (the archive's Git tracking is checked with git ls-files on that one path). The child is synchronous and bounded: past
 # TimeoutSec its whole tree is killed and the result says timedOut (and killConfirmed, whether the exit was
 # seen). Nothing here throws on a failed install, including a locked installed file (adversary 32bf39a9-A2);
 # the caller reads .ok and stops with its own typed failure.
@@ -140,7 +141,9 @@ function Invoke-PinnedPayloadInstall {
     $psi = [System.Diagnostics.ProcessStartInfo]::new($launcher.Source)
     # ArgumentList quotes each element itself, so a path with spaces stays one argument. No -I: it would
     # drop the working directory from sys.path and with it the tools package.
-    foreach ($argument in @('-3', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $OutputDir, '--verify-installed')) {
+    # --record-only (adversary ae560106-A2): validate the named record alone. The full manifest validation walks every
+    # tracked file and opens a prefix of each, owner clip fixtures included; the hosted workflows keep that full check.
+    foreach ($argument in @('-3', '-m', 'tools.repo_hygiene.extract_vendored_native_payload', '--repo-root', $RepoRoot, '--payload-id', $PayloadId, '--archive-reference', $ArchiveReference, '--output-dir', $OutputDir, '--record-only', '--verify-installed')) {
         [void]$psi.ArgumentList.Add([string]$argument)
     }
     $psi.WorkingDirectory = $RepoRoot
@@ -244,4 +247,100 @@ function Invoke-PinnedPayloadInstall {
     return [pscustomobject]$result
 }
 
-Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, Install-PinnedVendoredPayload, Stop-PinnedPayloadChild
+# Adversary ae560106-A1: a delete or a rewrite of the installed ffmpeg.exe after its readback reached the zip or the manifest
+# unnoticed. These two checks read the bytes AT the point of publication. Neither throws; the caller reads .ok.
+
+# Opens Path for reading with FileShare.Read (no writer and no delete can open it while it is held), hashes it through that
+# handle and compares size and sha256. On ok the OPEN stream is returned in .stream: the caller writes its record while
+# holding it and disposes it afterwards, so the file the record describes cannot change in between.
+function Open-PinnedFileHold {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{64}\z')]
+        [string]$ExpectedSha256,
+
+        [Parameter(Mandatory)]
+        [long]$ExpectedBytes
+    )
+    $hold = [ordered]@{ ok = $false; reason = ''; bytes = $null; sha256 = ''; stream = $null }
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $hold.bytes = [long]$stream.Length
+        $hold.sha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+    } catch {
+        if ($stream) { $stream.Dispose() }
+        $hold.reason = "$Path could not be opened and hashed: $($_.Exception.Message)"
+        return [pscustomobject]$hold
+    }
+    if ($hold.sha256 -cne $ExpectedSha256 -or $hold.bytes -ne $ExpectedBytes) {
+        $stream.Dispose()
+        $hold.reason = "$Path is $($hold.bytes) bytes sha256 $($hold.sha256), not the recorded $ExpectedBytes bytes sha256 $ExpectedSha256"
+        return [pscustomobject]$hold
+    }
+    $hold.stream = $stream
+    $hold.ok = $true
+    return [pscustomobject]$hold
+}
+
+# Proves a published zip carries exactly one root entry MemberName whose bytes are the recorded ones. The zip is opened once
+# with FileShare.Read; the whole-file sha256 (.zipSha256) and the entry check read that same handle, so the hash the caller
+# publishes describes the very bytes whose entry was verified.
+function Test-PinnedZipMember {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ZipPath,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9._-]+\z')]
+        [string]$MemberName,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{64}\z')]
+        [string]$ExpectedSha256,
+
+        [Parameter(Mandatory)]
+        [long]$ExpectedBytes
+    )
+    $check = [ordered]@{ ok = $false; reason = ''; zipSha256 = ''; memberBytes = $null; memberSha256 = '' }
+    $stream = $null
+    $zip = $null
+    try {
+        Add-Type -AssemblyName System.IO.Compression
+        $stream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $check.zipSha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant()
+        $null = $stream.Seek(0, [System.IO.SeekOrigin]::Begin)
+        $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
+        $entries = @($zip.Entries | Where-Object { [string]::Equals(([string]$_.FullName).Replace('\', '/'), $MemberName, [StringComparison]::OrdinalIgnoreCase) })
+        if ($entries.Count -ne 1) {
+            $check.reason = "$ZipPath holds $($entries.Count) root entries named $MemberName, not exactly one"
+            return [pscustomobject]$check
+        }
+        $entryStream = $entries[0].Open()
+        try {
+            $check.memberSha256 = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($entryStream)).ToLowerInvariant()
+        } finally { $entryStream.Dispose() }
+        $check.memberBytes = [long]$entries[0].Length
+    } catch {
+        $check.reason = "$ZipPath could not be read as a zip: $($_.Exception.Message)"
+        return [pscustomobject]$check
+    } finally {
+        if ($zip) { $zip.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+    if ($check.memberSha256 -cne $ExpectedSha256 -or $check.memberBytes -ne $ExpectedBytes) {
+        $check.reason = "$ZipPath entry $MemberName is $($check.memberBytes) bytes sha256 $($check.memberSha256), not the recorded $ExpectedBytes bytes sha256 $ExpectedSha256"
+        return [pscustomobject]$check
+    }
+    $check.ok = $true
+    return [pscustomobject]$check
+}
+
+Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, Install-PinnedVendoredPayload, Stop-PinnedPayloadChild, Open-PinnedFileHold, Test-PinnedZipMember

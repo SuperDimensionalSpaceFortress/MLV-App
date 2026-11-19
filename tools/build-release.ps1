@@ -20,7 +20,7 @@
 # Exit codes: 5=dirty tree (no -AllowDirty); 6=provenance stamp sha != HEAD; 7=runtime deploy
 #   failed (windeployqt or a required MinGW runtime DLL missing); 8=artifact not self-contained
 #   (launch probe died with a DLL-load NTSTATUS, e.g. 0xC0000135); 9=ffmpeg.exe was not installed and verified from
-#   the pinned payload.
+#   the pinned payload, or it changed before build-manifest.json was written.
 param(
     [string]$SourceRoot = (Resolve-Path "$PSScriptRoot\..").Path,
     [string]$QtBin      = "C:\Qt\6.10.2\mingw_64\bin",
@@ -282,7 +282,19 @@ $manifest = [ordered]@{
     host = $env:COMPUTERNAME
     selfContained = $deploy.selfContained; deploy = $deploy; launchProbe = $launchProbe
 }
-$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $dest "build-manifest.json") -Encoding UTF8
+# Adversary ae560106-A1: a delete or rewrite of ffmpeg.exe after the readback above (the launch probe runs in between) left the
+# manifest claiming a deploy that was gone. Re-read and re-hash it immediately before the manifest, and HOLD it open (FileShare.Read:
+# no writer, no delete) until build-manifest.json is written, so the deploy.ffmpegExe record describes the file in the artifact.
+$ffmpegHold = Open-PinnedFileHold -Path $ffmpegExePath -ExpectedSha256 $deploy.ffmpegExe.sha256 -ExpectedBytes $deploy.ffmpegExe.bytes
+if (-not $ffmpegHold.ok) {
+    Write-Host "FAIL: ffmpeg.exe changed before build-manifest.json was written: $($ffmpegHold.reason)" -ForegroundColor Red
+    exit 9
+}
+try {
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $dest "build-manifest.json") -Encoding UTF8
+} finally {
+    $ffmpegHold.stream.Dispose()
+}
 Write-Host "OK -> $destExe" -ForegroundColor Green
 Write-Host "    embedded-SHA==HEAD: $shaOk ; self-contained: $($deploy.selfContained) ; manifest written"
 if (-not $shaOk) { exit 6 }

@@ -30,8 +30,40 @@ from .vendored_native_payloads import (
     _safe_member_name,
     _sha256_file,
     _sha256_stream,
+    _validate_archive,
+    _validate_policy,
+    _validate_provenance,
     validate_manifest,
 )
+
+
+def load_record_only_snapshot(
+    repo_root: Path,
+    manifest_path: Path,
+    payload_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Validate ONLY the named active record, never the repository-wide tracked-file census.
+
+    EXPORT-PRORES-FFMPEG-EXE-PACKAGE-1 (adversary ae560106-A2): ``validate_manifest`` enumerates every
+    Git-tracked file and opens a 512-byte prefix of each one, owner clip fixtures included, so a local
+    packaging install that ran it read media and failed when an unrelated fixture was locked. This mode
+    reads the manifest, its policy, and the one record's archive (size, sha256, Git tracking, member
+    summary and limits) and selected members (size, sha256, binary format, machine and kind). The hosted
+    workflows keep the full validation; they never pass ``--record-only``.
+    """
+    manifest_file = manifest_path if manifest_path.is_absolute() else repo_root / manifest_path
+    try:
+        raw = manifest_file.read_bytes()
+    except OSError as exc:
+        raise PayloadIntegrityError(f"cannot read payload manifest {manifest_file}: {exc}") from exc
+    manifest_sha256 = hashlib.sha256(raw).hexdigest()
+    manifest = _parse_manifest_bytes(raw, str(manifest_file))
+    _require(manifest.get("schema_version") == 1, "payload manifest schema_version must be 1")
+    policy = _validate_policy(manifest.get("integrity_policy"))
+    record = _record_for_id(manifest, payload_id)
+    _validate_archive(repo_root, record, policy, selected=True, require_tracked=True)
+    _validate_provenance(record)
+    return manifest, record, manifest_sha256
 
 
 def load_validated_manifest_snapshot(
@@ -291,10 +323,14 @@ def extract_payload(
     *,
     archive_reference: str,
     verify_installed: bool = False,
+    record_only: bool = False,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
-    manifest, manifest_sha256 = load_validated_manifest_snapshot(repo_root, manifest_path)
-    record = _record_for_id(manifest, payload_id)
+    if record_only:
+        _, record, manifest_sha256 = load_record_only_snapshot(repo_root, manifest_path, payload_id)
+    else:
+        manifest, manifest_sha256 = load_validated_manifest_snapshot(repo_root, manifest_path)
+        record = _record_for_id(manifest, payload_id)
     result = extract_payload_record(
         repo_root,
         record,
@@ -316,6 +352,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--verify-installed", action="store_true",
                         help="rehash and re-identify the installed files after atomic replacement")
+    parser.add_argument("--record-only", action="store_true",
+                        help="validate only the named payload record (archive and member bytes, binary identity), "
+                             "never the repository-wide tracked-file census; for local packaging installs")
     args = parser.parse_args(argv)
     try:
         result = extract_payload(
@@ -325,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             archive_reference=args.archive_reference,
             verify_installed=args.verify_installed,
+            record_only=args.record_only,
         )
     except (OSError, PayloadIntegrityError) as exc:
         print(f"vendored native payload extraction: FAIL: {exc}", file=sys.stderr)
