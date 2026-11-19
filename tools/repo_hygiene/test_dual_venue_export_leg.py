@@ -662,15 +662,18 @@ class ExportEvidenceTests(unittest.TestCase):
                  cdng_case(manifest=manifest(30, "dng", 30000, a, {**b, "bytes": "1000"})),                         # 5 a byte size that is no integer
                  prores_case(manifest=manifest(1, "mov", 1000, {**one, "sha256": "a" * 64}, {**one, "sha256": "b" * 64})),  # 6 adversary pass 22 A2: one file, two hashes
                  cdng_case(manifest=manifest(30, "dng", 30000, a, {**b, "sha256": "not a hash"})),                  # 7 an endpoint with no sha256
-                 prores_case(manifest=manifest(1, "mov", 1000, one, one)),                                          # 8 control: one consistent file
-                 cdng_case(manifest=manifest(30, "dng", 30000, a, b))]                                              # 9 control: sol's consistent DNG
+                 cdng_case(manifest=manifest(30, "dng", 2000, a, b)),                                               # 8 adversary pass 23 A1: endpoints use the whole total
+                 cdng_case(manifest=manifest(30, "dng", 30000, {**a, "bytes": 0}, {**b, "bytes": 0})),              # 9 pass 23 A1: empty endpoint files
+                 prores_case(manifest=manifest(1, "mov", 1000, one, one)),                                          # 10 control: one consistent file
+                 cdng_case(manifest=manifest(30, "dng", 30000, a, b)),                                              # 11 control: sol's consistent DNG
+                 cdng_case(manifest=manifest(30, "dng", 2028, a, b))]                                               # 12 control: the tightest consistent total (1 byte each between)
         proc, got = evidence_cases(cases)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        for i in range(8):
+        for i in range(10):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "INVALID", got[i])
                 self.assertTrue(any(p.startswith("EXPORT_OUTPUT_MISMATCH") for p in got[i]["problems"]), got[i])
-        for i in (8, 9):
+        for i in (10, 11, 12):
             with self.subTest(case=i):
                 self.assertEqual(got[i]["outcome"], "PASS", got[i])
                 self.assertEqual(got[i]["problems"], [], got[i])

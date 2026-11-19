@@ -4800,7 +4800,11 @@ function Get-DvExportManifestEndpointProblem($Manifest, [int64]$Count, [int64]$T
         return $null
     }
     if ($fn -ceq $ln) { return "output-manifest.json lists $Count files but its first and last records name the same file '$fn'" }
-    if (($fb + $lb) -gt $TotalBytes) { return "output-manifest.json lists $Count files totalling $TotalBytes bytes, fewer than its first ($fb) and last ($lb) files alone" }
+    # adversary pass 23 A1 (on 18592ea9): every produced file has bytes (the reader's own rule for the total), so the endpoints are at least 1 byte each, two files ARE the two
+    # endpoints, and N files leave at least one byte for each of the N - 2 between them: 24 DNG files totalling 2000 bytes beside two 1000-byte endpoints is no output
+    if ($fb -lt 1 -or $lb -lt 1) { return "output-manifest.json lists $Count files but its first ($fb bytes) or last ($lb bytes) record is an empty file" }
+    if ($Count -eq 2 -and ($fb + $lb) -ne $TotalBytes) { return "output-manifest.json lists two files of $fb and $lb bytes but totalBytes $TotalBytes" }
+    if (($fb + $lb + ($Count - 2)) -gt $TotalBytes) { return "output-manifest.json lists $Count files totalling $TotalBytes bytes, too few for its first ($fb) and last ($lb) files and one byte for each of the $($Count - 2) between them" }
     $null
 }
 
