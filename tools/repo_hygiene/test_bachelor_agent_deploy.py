@@ -944,7 +944,10 @@ class DeployBachelorAgent(unittest.TestCase):
             "function Stop-TaskInstanceBounded { param([int]$ProcessId, [string]$StartText) Stop-Process -Id $ProcessId -Force; [pscustomobject]@{ outcome = 'stopped'; why = $null; busy = $null } };"
             "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
         ) % (pid, start, psq(self.venue / AGENT_NAME), psq(self.venue / AGENT_NAME))
-        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; %s" % (psq(SCRIPT), psq(self.venue), psq(busy), body)
+        # the scheduler has no running instance (the -TaskPidsFile seam: off Windows there is no Task Scheduler to ask, and without it the
+        # idle wait would end the restart before the definition is re-read)
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s' -TaskPidsFile '%s'; %s" % (
+            psq(SCRIPT), psq(self.venue), psq(busy), psq(self.task_pids(name="p8a2-idle")), body)
         r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("the old agent is stopped but the task was NOT started", r.stdout)
@@ -1143,11 +1146,13 @@ class DeployBachelorAgent(unittest.TestCase):
             "%s"
             "$r = Invoke-AgentRestart -AgentScript '%s'; 'why=' + $r.why"
         ) % (pid, start, psq(self.venue / AGENT_NAME), self._unanswered_stop_prelude(pid, kill=True), psq(self.venue / AGENT_NAME))
-        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s'; %s" % (psq(SCRIPT), psq(self.venue), psq(busy), body)
+        cmd = ". '%s' -VenueRoot '%s' -TaskName '\\MlvNoSuchTaskForTest' -TaskXmlFile '%s' -TaskPidsFile '%s'; %s" % (
+            psq(SCRIPT), psq(self.venue), psq(busy), psq(self.task_pids(name="p9a2-idle")), body)
         r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("nothing was stopped", r.stdout)
         self.assertIn("the old agent is stopped but the task was NOT started", r.stdout)
+        self.assertIn("its definition changed", r.stdout, "the restart went past the stop AND the scheduler-idle wait to the definition re-read")
 
     def test_p9a2_an_unanswered_stop_with_the_agent_still_alive_says_unknown_not_nothing(self) -> None:
         pid, start = self.live_agent()
@@ -1261,6 +1266,63 @@ class DeployBachelorAgent(unittest.TestCase):
         # the sibling probes: every process-existence read in the deploy script goes through the one helper
         code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
         self.assertEqual(len(re.findall(r"Get-Process\s+-Id", code)), 1, "only Get-LiveProcess itself reads a pid with Get-Process")
+
+    # ---- adversary pass 12 findings (A1, A2 of ed9bc359; A3, A4 advisories): each test failed on ed9bc359 ----
+
+    def test_r5_a1_a_control_character_in_the_root_argument_is_not_a_root(self) -> None:
+        # pass 12 A1: the task argument "-Root:C:\bench<LF>" matched `^-(..)(:(.*))?$` (`$` matches before a final LF, `.` stops at it), so
+        # the definition bound C:\bench while the agent would receive "C:\bench<LF>" and could not serve the checked root.
+        mine = r"C:\bench\ultra-magnus-agent.ps1"
+        base = "-NoProfile -ExecutionPolicy Bypass -File %s " % mine
+        q = "&quot;"
+        for label, tail in (("lf", q + r"-Root:C:\bench&#10;" + q), ("crlf", q + r"-Root:C:\bench&#13;&#10;" + q),
+                            ("lf-sep", "-Root " + q + r"C:\bench&#10;" + q), ("name-lf", q + "-Root&#10;" + q + r" C:\bench"),
+                            ("tab", q + r"-Root:C:\bench&#9;" + q), ("nul-less-bell", q + r"-Root:C:\bench&#7;" + q)):
+            self.assertEqual(self._exec_task_case("r5a1-" + label, "pwsh.exe", base + tail), "False", label)
+        self.assertEqual(self._exec_task_case("r5a1-ok", "pwsh.exe", base + q + r"-Root:C:\bench" + q), "True")
+        # the live process is held to the same reading (its argv comes from the OS, not from the definition)
+        body = (
+            "function A($t){ [pscustomobject]@{ ok = $true; tokens = $t } };"
+            r"'lf='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s',('-Root:C:\bench'+[char]10))) -AgentScript '%s');"
+            r"'sep='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s','-Root',('C:\bench'+[char]10))) -AgentScript '%s');"
+            r"'ok='+(Test-ArgvBindsScript -Argv (A @('pwsh.exe','-NoProfile','-ExecutionPolicy','Bypass','-File','%s','-Root:C:\bench')) -AgentScript '%s')"
+        ) % (psq(mine), psq(mine), psq(mine), psq(mine), psq(mine), psq(mine))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["lf=False", "sep=False", "ok=True"], r.stdout + r.stderr)
+        # the class: no regex over text that came from a task or a process ends in `$` (it matches before a final newline); \z does not
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(re.findall(r"""-(?:match|notmatch|replace)\s+'[^'\n]*[^\\]\$'""", code), [], "an end-of-text anchor must be \\z")
+        self.assertEqual(re.findall(r"""Match\([^\n]*,\s*'[^'\n]*[^\\]\$'\)""", code), [], "an end-of-text anchor must be \\z")
+
+    def test_r5_a2_the_run_lower_bound_is_never_earlier_than_the_monotonic_expectation(self) -> None:
+        # pass 12 A2: the old agent exits, a trigger starts pid 4200 at 12:00:02.5, the wall clock steps BACK 1 s, and runAt is read as
+        # 12:00:02: the instance that existed before /Run passed "started at or after /Run" and the final step check (2 s) let 1 s through.
+        # runAt is now the LATER of the wall clock and the monotonic expectation, so a backward step cannot move it before an instance.
+        body = (
+            "$sw=[Diagnostics.Stopwatch]::StartNew(); $now=[DateTime]::UtcNow;"
+            "$back = Get-RunLowerBound -Utc0 $now.AddSeconds(5) -Watch $sw;"    # the wall clock is 5 s behind where the watch says it should be
+            "$fwd = Get-RunLowerBound -Utc0 $now.AddSeconds(-5) -Watch $sw;"    # the wall clock is 5 s ahead: the wall clock stands
+            "'back=' + (($back - $now).TotalSeconds -ge 4.5);"
+            "'fwd=' + ((($fwd - $now).TotalSeconds -ge 0) -and (($fwd - $now).TotalSeconds -lt 2))"
+        )
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["back=True", "fwd=True"], r.stdout + r.stderr)
+        code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
+        self.assertRegex(code, r"\$runAt\s*=\s*Get-RunLowerBound\b")
+        self.assertNotRegex(code, r"\$runAt\s*=\s*\[DateTime\]::UtcNow")
+
+    def test_r5_a4_a_bounded_child_with_a_non_positive_timeout_is_killed_not_orphaned(self) -> None:
+        # pass 12 A4 (advisory): -TimeoutSec -1 reached WaitForExit(-1000), which throws after the child was started and before the kill.
+        body = (
+            "$t=[Diagnostics.Stopwatch]::StartNew();"
+            "$r = Invoke-BoundedProcess -FilePath '%s' -Arguments @('-NoProfile','-Command','Start-Sleep -Seconds 120') -TimeoutSec -1;"
+            "'timedOut=' + $r.timedOut; 'fast=' + ($t.Elapsed.TotalSeconds -lt 60)"
+        ) % psq(PWSH)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["timedOut=True", "fast=True"], r.stdout + r.stderr)
 
     def test_p3_hosts_without_icacls_skip_the_acl_case_instead_of_erroring(self) -> None:
         # A4: the Ubuntu shard has pwsh but no icacls; the ACL case carries an explicit platform guard.

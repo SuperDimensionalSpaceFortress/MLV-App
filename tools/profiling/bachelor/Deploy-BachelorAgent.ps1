@@ -218,8 +218,13 @@ function Invoke-BoundedProcess {
     $p = [System.Diagnostics.Process]::Start($psi)
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit([int][Math]::Min([long]$TimeoutSec * 1000, 2000000000L))) {
-        try { $p.Kill($true) } catch { }
+    # the deadline is clamped to 0..2e9 ms: a negative value is not a short deadline to WaitForExit (-1 is "forever", anything lower
+    # throws), and a throw after the child was started would leave it running with no one holding its pid
+    $waitMs = [int][Math]::Min([Math]::Max([long]$TimeoutSec * 1000, 0L), 2000000000L)
+    $exited = $false
+    try { $exited = $p.WaitForExit($waitMs) }
+    finally { if (-not $exited) { try { $p.Kill($true) } catch { } } }
+    if (-not $exited) {
         return [pscustomobject]@{ timedOut = $true; exitCode = $null; output = ''; errorText = '' }
     }
     [void]$outTask.Wait(5000)
@@ -309,7 +314,7 @@ function Get-VenueStateRaw {
         $state.leases = @(
             [System.IO.Directory]::EnumerateFileSystemEntries($holders) |
                 ForEach-Object { [System.IO.Path]::GetFileName($_) } |
-                Where-Object { $_ -match '\.(lease|holder|acquired)\.json$' } |
+                Where-Object { $_ -match '\.(lease|holder|acquired)\.json\z' } |
                 Sort-Object
         )
     }
@@ -412,6 +417,19 @@ function Get-LiveProcess {
         catch { }   # no /proc (another Unix) or the process just exited: the Get-Process answer stands
     }
     return $proc
+}
+
+function Get-RunLowerBound {
+    # The moment every "started at or after /Run" comparison measures from: the LATER of the wall clock now and where the monotonic watch
+    # says the wall clock should be ($Utc0 + $Watch.Elapsed). If the wall clock was stepped BACK after an instance started (a trigger
+    # started pid 4200 at 12:00:02.5, the clock went back 1 s, and runAt would read 12:00:02), the raw wall clock would put /Run
+    # BEFORE that instance and /Run (ignored by IgnoreNew) would be credited with it; the monotonic expectation cannot go back. A step
+    # FORWARD only makes the bound later, which refuses a genuine replacement (the safe side: "verify by hand"), never admits an old one.
+    param([datetime]$Utc0, [System.Diagnostics.Stopwatch]$Watch)
+    $wall = [DateTime]::UtcNow
+    $expected = $Utc0.ToUniversalTime() + $Watch.Elapsed
+    if ($expected -gt $wall) { return $expected }
+    return $wall
 }
 
 function Test-AgentProcessAlive {
@@ -597,14 +615,18 @@ function Get-TaskRootFromScriptArgs {
     $root = $null
     $k = 0
     while ($k -lt $ScriptArgs.Count) {
-        $m = [regex]::Match($ScriptArgs[$k], '^-([A-Za-z]+)(:(.*))?$')
+        # \A ... \z, never ^ ... $: `$` also matches before a FINAL newline, and `.` stops at one, so "-Root:C:\bench<LF>" read as the
+        # root C:\bench while the agent would receive C:\bench<LF>. A control character in an argument is refused outright (it can only
+        # be an attempt to make the checked text differ from the received one); the anchors are the second line of defence.
+        if ([string]$ScriptArgs[$k] -match '[\x00-\x1f\x7f]') { return @{ ok = $false; root = $null } }
+        $m = [regex]::Match([string]$ScriptArgs[$k], '(?s)\A-([A-Za-z]+)(:(.*))?\z')
         if (-not $m.Success) { return @{ ok = $false; root = $null } }
         if ($m.Groups[1].Value.Length -lt 2 -or -not (Test-ParamName -Token ('-' + $m.Groups[1].Value) -Full 'Root')) { return @{ ok = $false; root = $null } }
         if ($null -ne $root) { return @{ ok = $false; root = $null } }
         if ($m.Groups[2].Success) { $val = $m.Groups[3].Value; $k++ }
         elseif ($k + 1 -lt $ScriptArgs.Count) { $val = $ScriptArgs[$k + 1]; $k += 2 }
         else { return @{ ok = $false; root = $null } }
-        if ([string]::IsNullOrWhiteSpace($val)) { return @{ ok = $false; root = $null } }
+        if ([string]::IsNullOrWhiteSpace($val) -or $val -match '[\x00-\x1f\x7f]') { return @{ ok = $false; root = $null } }
         $root = $val
     }
     return @{ ok = $true; root = $root }
@@ -638,11 +660,15 @@ function Test-HostArgvRunsScript {
     param([string]$Exe, [string[]]$Tokens, [string]$AgentScript)
     # the script's folder. A script directly under a drive root (R:\agent.ps1) has the folder R:\, never "R:" (drive-relative: the current
     # directory of that drive); a script directly under the POSIX root has the folder /
-    $expectedRoot = $AgentScript -replace '[\\/][^\\/]*$', ''
-    if ($expectedRoot -match '^[A-Za-z]:$') { $expectedRoot += '\' }
-    elseif ($expectedRoot -eq '' -and $AgentScript -match '^/') { $expectedRoot = '/' }
-    $leaf = [regex]::Match($Exe.Trim().Trim('"'), '[^\\/]+$').Value
-    if ($leaf -notmatch '(?i)^(pwsh|powershell)(\.exe)?$') { return $false }
+    # every token is text that came from a task definition or a process: a control character in one (a newline most of all) makes the
+    # text this check reads differ from the text the host receives, so it binds nothing (and `$` anchors below are \z for the same reason)
+    foreach ($tk in @($Tokens)) { if ([string]$tk -match '[\x00-\x1f\x7f]') { return $false } }
+    if ($Exe.Trim() -match '[\x00-\x1f\x7f]') { return $false }   # (the surrounding whitespace of a pretty-printed <Command> is trimmed, not refused)
+    $expectedRoot = $AgentScript -replace '[\\/][^\\/]*\z', ''
+    if ($expectedRoot -match '\A[A-Za-z]:\z') { $expectedRoot += '\' }
+    elseif ($expectedRoot -eq '' -and $AgentScript -match '\A/') { $expectedRoot = '/' }
+    $leaf = [regex]::Match($Exe.Trim().Trim('"'), '[^\\/]+\z').Value
+    if ($leaf -notmatch '(?i)\A(pwsh|powershell)(\.exe)?\z') { return $false }
     $tokens = @($Tokens)
     $hostFlags = @('NoProfile', 'nop', 'NoLogo', 'nol', 'NonInteractive', 'noni')
     # -NoProfile is REQUIRED: without it the host loads a profile, which can set PSDefaultParameterValues for the agent's -Root and so
@@ -869,7 +895,7 @@ function Invoke-AgentRestart {
     if (-not (Test-TaskXmlRunsScript -Xml $nowXml.xml -AgentScript $AgentScript)) {
         return @{ why = "the old agent is stopped but the task was NOT started: its definition changed and no longer runs -File $AgentScript for this root"; warn = $warn }
     }
-    $runAt = [DateTime]::UtcNow
+    $runAt = Get-RunLowerBound -Utc0 $clockUtc0 -Watch $clockWatch
     $run = Invoke-BoundedProcess -FilePath 'schtasks.exe' -Arguments @('/Run', '/TN', $TaskName) -TimeoutSec 30
     if ($run.timedOut) { return @{ why = "schtasks /Run $TaskName did not return within 30 s"; warn = $warn } }
     if ($run.exitCode -ne 0) { return @{ why = "schtasks /Run $TaskName exited $($run.exitCode)"; warn = $warn } }
