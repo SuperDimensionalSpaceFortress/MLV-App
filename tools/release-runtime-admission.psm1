@@ -55,8 +55,9 @@ function Stop-PinnedPayloadChild {
 # Puts back every original a killed extractor left in ITS transaction folder (extract_vendored_native_payload.py
 # _publish_staged_transaction moves each existing destination into .vendored-payload-transaction-<TransactionId>\<name> before it
 # installs the replacement). Only that exact folder, named by the caller's --transaction-id, is touched: another install sharing
-# the output folder keeps its own (adversary 78d626ed-A1). Moves only, never a delete: the backup replaces whatever now sits at
-# the destination (all-or-nothing, as the Python rollback does), and the emptied folder is left for the failed build to report.
+# the output folder keeps its own (adversary 78d626ed-A1). Moves only, never a delete and never an overwrite: a backup goes back
+# only where the destination is absent; one whose destination is occupied stays in the folder and is named in .errors
+# (adversary 32501f50-A1). The folder is left for the failed build to report.
 # A folder or file that cannot be listed or moved is an error in the result, never silence (adversary 78d626ed-A3).
 # Never throws; returns { restored, errors, found }.
 function Restore-PinnedPayloadTransaction {
@@ -91,11 +92,23 @@ function Restore-PinnedPayloadTransaction {
     }
     foreach ($backup in $backups) {
         if ($backup.PSIsContainer -or $backup.LinkType) { $errors += "$($backup.FullName) is not a plain file; not restored"; continue }
+        $destination = Join-Path $OutputDir $backup.Name
+        # Adversary 32501f50-A1: a backup goes back ONLY onto an absent destination. A file there now is this install's own
+        # replacement or a concurrent install's verified file; either way it is left alone and the original stays in the backup.
+        # The non-overwriting Move is the atomic arbiter (it refuses a destination that appears after the check).
+        if ([System.IO.File]::Exists($destination) -or [System.IO.Directory]::Exists($destination)) {
+            $errors += "$($backup.Name): destination present; backup kept at $($backup.FullName)"
+            continue
+        }
         try {
-            [System.IO.File]::Move($backup.FullName, (Join-Path $OutputDir $backup.Name), $true)
+            [System.IO.File]::Move($backup.FullName, $destination, $false)
             $restored += $backup.Name
         } catch {
-            $errors += "$($backup.Name): $($_.Exception.Message)"
+            if ([System.IO.File]::Exists($destination) -or [System.IO.Directory]::Exists($destination)) {
+                $errors += "$($backup.Name): destination present; backup kept at $($backup.FullName)"
+            } else {
+                $errors += "$($backup.Name): $($_.Exception.Message); backup kept at $($backup.FullName)"
+            }
         }
     }
     return [pscustomobject][ordered]@{ restored = $restored; errors = $errors; found = $true }

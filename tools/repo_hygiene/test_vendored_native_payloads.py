@@ -1414,6 +1414,62 @@ class VendoredNativePayloadTests(unittest.TestCase):
         self.assertFalse(any(output_dir.glob(".vendored-payload-transaction-*")))
         self.assertFalse(any(output_dir.glob(".*.tmp")))
 
+    def test_rollback_never_overwrites_or_deletes_a_concurrent_installs_file(self) -> None:
+        # adversary 32501f50-A1 (Python sibling): during P's failed publication a concurrent install Q atomically published its
+        # own tool.exe over the one P had published and its own library.dll where P had moved the original away. P's rollback
+        # used to delete Q's tool.exe and put both originals back over Q's files. Now a destination P no longer owns is left
+        # alone, every backup that cannot go back onto an absent destination is kept, and the failure names each kept backup.
+        executable = _fake_pe(fill=b"new executable")
+        library = _fake_pe(fill=b"new library", dll=True)
+        path = self._write_zip(
+            [
+                ("tool.exe", executable, stat.S_IFREG | 0o755),
+                ("library.dll", library, stat.S_IFREG | 0o755),
+            ]
+        )
+        record = self._two_member_record(path, executable, library)
+        output_dir = self.root / "installed"
+        output_dir.mkdir()
+        (output_dir / "tool.exe").write_bytes(b"old executable")
+        (output_dir / "library.dll").write_bytes(b"old library")
+
+        real_replace = os.replace
+        publication_count = 0
+
+        def concurrent_install_then_fail(source: os.PathLike | str | bytes, destination: os.PathLike | str | bytes) -> None:
+            nonlocal publication_count
+            if Path(source).name.endswith(".tmp"):
+                publication_count += 1
+                if publication_count == 2:
+                    for name, data in (("tool.exe", b"Q-PINNED tool"), ("library.dll", b"Q-PINNED library")):
+                        q_temporary = output_dir / f"q-{name}.part"
+                        q_temporary.write_bytes(data)
+                        real_replace(q_temporary, output_dir / name)
+                    raise OSError("deterministic second publication failure")
+            real_replace(source, destination)
+
+        with mock.patch(
+            "tools.repo_hygiene.extract_vendored_native_payload.os.replace",
+            side_effect=concurrent_install_then_fail,
+        ), self.assertRaisesRegex(PayloadIntegrityError, "rollback incomplete") as raised:
+            extract_payload_record(
+                self.root,
+                record,
+                output_dir,
+                archive_reference="fixture.zip",
+                verify_installed=True,
+            )
+
+        self.assertEqual((output_dir / "tool.exe").read_bytes(), b"Q-PINNED tool")
+        self.assertEqual((output_dir / "library.dll").read_bytes(), b"Q-PINNED library")
+        transactions = list(output_dir.glob(".vendored-payload-transaction-*"))
+        self.assertEqual(len(transactions), 1, "the transaction folder holding the kept backups stays")
+        self.assertEqual((transactions[0] / "tool.exe").read_bytes(), b"old executable")
+        self.assertEqual((transactions[0] / "library.dll").read_bytes(), b"old library")
+        message = str(raised.exception)
+        for name in ("tool.exe", "library.dll"):
+            self.assertIn(f"destination present; backup kept at {transactions[0] / name}", message)
+
     def test_manifest_snapshot_hash_and_validation_share_the_same_raced_bytes(self) -> None:
         manifest_path = self.root / "manifest.json"
         original = json.dumps({"schema_version": 1, "snapshot": "original"}).encode("utf-8")

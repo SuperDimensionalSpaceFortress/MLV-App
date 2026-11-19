@@ -560,12 +560,15 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertEqual(result["errors"], [], result)
         self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"OLD")
         self.assertEqual(list(mine.iterdir()), [], "the backup must be moved out, not copied")
-        # killed after the replacement was published but before the backup was cleaned: the original wins (all-or-nothing).
+        # killed after the replacement was published but before the backup was cleaned: a file already sits at the destination, so
+        # it is never overwritten (adversary 32501f50-A1); the original stays in the backup and the result says where.
         (mine / "ffmpeg.exe").write_bytes(b"ORIGINAL")
         (out / "ffmpeg.exe").write_bytes(b"NEW")
         result = self._restore(out, self.MINE)
-        self.assertEqual(result["restored"], ["ffmpeg.exe"], result)
-        self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"ORIGINAL")
+        self.assertEqual(result["restored"], [], result)
+        self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"NEW")
+        self.assertEqual((mine / "ffmpeg.exe").read_bytes(), b"ORIGINAL")
+        self.assertTrue(any("destination present; backup kept at" in e and str(mine / "ffmpeg.exe") in e for e in result["errors"]), result)
         # killed before its transaction began: nothing to restore, and that is not an error.
         none = self._restore(self.tmp / "no-such-dir", self.MINE)
         self.assertEqual((none["restored"], none["errors"], none["found"]), ([], [], False))
@@ -581,6 +584,17 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         result = self._restore(out, self.MINE)
         self.assertEqual((result["restored"], result["errors"], result["found"]), ([], [], False), result)
         self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"Q-PINNED")
+        self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"Q-OLD")
+        # adversary 32501f50-A1: P was killed after it moved OLD into ITS OWN transaction, and Q has since published and verified the
+        # pinned file. P's recovery restores only onto an absent destination: Q-PINNED survives and P's backup stays, reported.
+        mine = out / f".vendored-payload-transaction-{self.MINE}"
+        mine.mkdir()
+        (mine / "ffmpeg.exe").write_bytes(b"P-OLD")
+        result = self._restore(out, self.MINE)
+        self.assertEqual((result["restored"], result["found"]), ([], True), result)
+        self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"Q-PINNED")
+        self.assertEqual((mine / "ffmpeg.exe").read_bytes(), b"P-OLD")
+        self.assertTrue(any("destination present; backup kept at" in e and str(mine / "ffmpeg.exe") in e for e in result["errors"]), result)
         self.assertEqual((other / "ffmpeg.exe").read_bytes(), b"Q-OLD")
 
     def test_a_transaction_that_cannot_be_listed_is_an_error_never_silence(self) -> None:
@@ -630,6 +644,7 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertIn("was NOT reconciled", branch)
         restore = text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
         self.assertNotRegex(restore, r"Remove-Item|::Delete\(", "the reconciliation only moves files back, it never deletes")
+        self.assertNotRegex(restore, r"::Move\(.*\$true\)", "a backup is never moved over a destination (adversary 32501f50-A1)")
 
     def test_the_file_hold_refuses_a_changed_file_and_blocks_a_delete_while_held(self) -> None:
         target = self.tmp / "ffmpeg.exe"
