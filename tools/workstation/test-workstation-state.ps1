@@ -3880,12 +3880,43 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     Assert-That ((Test-GitConfigOriginIsFile -Origin "file:$(Join-Path $spB2 'repo\.git\CONFIG-absent')" -RepoDir $spB2 -File $spB2File) -eq $false) 'SSH-PUSHURL-1 r4 B2 origin: a different, absent file is not the repository config'
 
     # H1: a failure right after ssh started must not leave the child running, and must not escape as a throw
-    $script:spH1Pid = 0
-    $script:SshProbeAfterStartHook = { param($p) $script:spH1Pid = $p.Id; throw 'injected failure after ssh started' }
+    $script:spH1Pid = 0; $script:spH1Start = [DateTime]::MinValue
+    $script:SshProbeAfterStartHook = { param($p) $script:spH1Pid = $p.Id; $script:spH1Start = $p.StartTime; throw 'injected failure after ssh started' }
     $spH1Thrown = ''
     try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-hang.cmd') -TimeoutSec 20 -KeyFile $spKey } catch { $spH1Thrown = $_.Exception.Message } finally { $script:SshProbeAfterStartHook = $null }
-    $spH1Alive = $false; if ($script:spH1Pid -gt 0) { try { $spP = [Diagnostics.Process]::GetProcessById($script:spH1Pid); $spH1Alive = -not $spP.HasExited; if ($spH1Alive) { $spP.Kill($true) } } catch { } }
+    # the child is identified by pid AND start time (a reused pid is another process and is never touched)
+    $spH1Alive = $false; if ($script:spH1Pid -gt 0) { try { $spP = [Diagnostics.Process]::GetProcessById($script:spH1Pid); if ($spP.StartTime -eq $script:spH1Start) { $spH1Alive = -not $spP.HasExited; if ($spH1Alive) { $spP.Kill($true) } } } catch { } }
     Assert-That ($spH1Thrown -eq '' -and $pr.Authenticated -eq $false -and $pr.Detail -match 'failed after ssh started' -and $script:spH1Pid -gt 0 -and -not $spH1Alive) 'SSH-PUSHURL-1 r4 H1 probe: a failure after ssh started is a failed verdict (no throw) and the ssh child is terminated' "thrown=$spH1Thrown detail=$($pr.Detail) pid=$($script:spH1Pid) alive=$spH1Alive"
+
+    # r4 (adversary pass 8 on d30b74ba) A2: a junction re-pointed between the temp-folder check and the write, or between the ssh run and the cleanup
+    $spA2 = New-Scratch 'sp-r4a2'
+    $spA2Plain = Join-Path $spA2 'plain'; $spA2Other = Join-Path $spA2 'other'; $spA2Ssh = Join-Path $spA2 'u\.ssh'; $spA2Link = Join-Path $spA2 'tmplink'
+    foreach ($spA2D in @($spA2Plain, $spA2Other, $spA2Ssh)) { [void][IO.Directory]::CreateDirectory($spA2D) }
+    $spA2Local = New-Scratch 'sp-r4a2-localappdata'; [void][IO.Directory]::CreateDirectory((Join-Path $spA2Local 'Temp'))
+    $script:spA2Cfg = @{ Link = $spA2Link; Ssh = $spA2Ssh; Other = $spA2Other }
+    $sv = @{ T = $env:TEMP; M = $env:TMP; L = $env:LOCALAPPDATA }
+    try {
+        [void](New-Item -ItemType Junction -Path $spA2Link -Target $spA2Plain)
+        $env:TEMP = $spA2Link; $env:TMP = $spA2Link; $env:LOCALAPPDATA = $spA2Local
+        Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+        $script:SshProbeConfigRaceHook = { param($phase, $dir) if ($phase -ceq 'before-write') { [IO.Directory]::Delete($script:spA2Cfg.Link); [void](New-Item -ItemType Junction -Path $script:spA2Cfg.Link -Target $script:spA2Cfg.Ssh) } }
+        try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey } finally { $script:SshProbeConfigRaceHook = $null }
+        Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'under a \.ssh folder' -and $pr.Detail -match 'ssh was not run' -and -not (Test-Path -LiteralPath $spArgs) -and @(Get-ChildItem -LiteralPath $spA2Ssh -Force).Count -eq 0) 'SSH-PUSHURL-1 r4 A2 probe: a temp folder junction re-pointed at .ssh after it was checked -> the config that landed there is removed, ssh is not run, nothing is left under .ssh' "$($pr.Detail) args=$(Test-Path -LiteralPath $spArgs) left=$(@(Get-ChildItem -LiteralPath $spA2Ssh -Force).Count)"
+        [IO.Directory]::Delete($spA2Link); [void](New-Item -ItemType Junction -Path $spA2Link -Target $spA2Plain)
+        Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+        $script:SshProbeConfigRaceHook = { param($phase, $dir) if ($phase -ceq 'after-ssh') { [IO.Directory]::Delete($script:spA2Cfg.Link); [void](New-Item -ItemType Junction -Path $script:spA2Cfg.Link -Target $script:spA2Cfg.Other) } }
+        try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey } finally { $script:SshProbeConfigRaceHook = $null }
+        Assert-That ($pr.Authenticated -eq $true -and @(Get-ChildItem -LiteralPath $spA2Plain -Filter 'mlv-ssh-probe-*.conf' -Force).Count -eq 0 -and @(Get-ChildItem -LiteralPath $spA2Other -Force).Count -eq 0) 'SSH-PUSHURL-1 r4 A2 probe: a junction re-pointed after the ssh run -> the config that was created is still removed from where it physically landed (a stale path does not hide it)' "$($pr.Detail) left=$(@(Get-ChildItem -LiteralPath $spA2Plain -Force | ForEach-Object { $_.Name }) -join ',')"
+    } finally {
+        $env:TEMP = $sv.T; $env:TMP = $sv.M; $env:LOCALAPPDATA = $sv.L; $script:SshProbeConfigRaceHook = $null
+        if (Test-Path -LiteralPath $spA2Link) { [IO.Directory]::Delete($spA2Link) }
+    }
+
+    # A1 (disclosure): the take-back message never claims proven ownership of a value that git cannot attribute
+    $spRp = New-SpRepo 'r4a1-message'
+    $script:spCasRepo = $spRp; $script:SshPushUrlAfterWriteHook = { & git -C $script:spCasRepo config --add remote.fork.pushurl 'https://github.com/example/other.git' }
+    try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlAfterWriteHook = $null }
+    Assert-That ($r.Thrown -match 'our value was taken back' -and $r.Thrown -match 'cannot tell an identical value that another run wrote from ours') 'SSH-PUSHURL-1 r4 A1 setup: the take-back message says git config cannot tell an identical value another run wrote from ours' $r.Thrown
 }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))

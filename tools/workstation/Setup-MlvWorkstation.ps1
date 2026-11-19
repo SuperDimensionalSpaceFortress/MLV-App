@@ -1274,8 +1274,24 @@ function Invoke-GitHubSshProbe {
     }
     if (-not $cfgDir) { return @{ Authenticated = $false; Detail = 'no temp folder outside a .ssh directory is available for the probe config (ssh was not run)' } }
     $cfgPath = Join-Path $cfgDir ("mlv-ssh-probe-" + [guid]::NewGuid().ToString('N') + '.conf')
-    try { [IO.File]::WriteAllText($cfgPath, (($cfgLines -join "`n") + "`n"), [Text.Encoding]::ASCII) }
-    catch { Remove-Item -LiteralPath $cfgPath -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue; return @{ Authenticated = $false; Detail = "the probe's ssh config could not be written ($($_.Exception.Message))" } }
+    # r4 A2 (class: a check-then-use gap on a location): the folder was judged a moment ago, and a junction can be re-pointed between that judgement and the write. So the write is
+    # followed by a look at where the file PHYSICALLY landed (its canonical path from the file system): under a '.ssh' folder, or unresolvable -> the file is removed there and the probe
+    # fails closed before ssh runs. The physical path is also what the cleanup deletes, so a junction re-pointed after the write cannot hide the file that was created.
+    $cfgPhysical = ''; $cfgFail = ''
+    if ($script:SshProbeConfigRaceHook) { & $script:SshProbeConfigRaceHook 'before-write' $cfgDir }   # test seam: a re-point between the folder check and the write
+    try {
+        [IO.File]::WriteAllText($cfgPath, (($cfgLines -join "`n") + "`n"), [Text.Encoding]::ASCII)
+        $cid = Get-PathIdentity -Path $cfgPath
+        if (-not $cid -or -not $cid.Final) { $cfgFail = 'the probe config location could not be resolved after it was written' }
+        else {
+            $cfgPhysical = "$($cid.Final)"
+            if (@($cfgPhysical -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { $cfgFail = 'the probe config landed under a .ssh folder (the temp folder changed after it was checked)' }
+        }
+    } catch { $cfgFail = "the probe's ssh config could not be written ($($_.Exception.Message))" }
+    if ($cfgFail) {
+        foreach ($rp in @(@($cfgPath, $cfgPhysical) | Where-Object { $_ } | Select-Object -Unique)) { try { Remove-Item -LiteralPath $rp -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { } }
+        return @{ Authenticated = $false; Detail = "$cfgFail (ssh was not run)" }
+    }
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new($SshExe)
         # the same options again on the command line (they win over the file): a second, independent statement of the no-run / no-write contract
@@ -1313,14 +1329,18 @@ function Invoke-GitHubSshProbe {
     } finally {
         # adversary pass 4 A4: this is the probe's own temp file, so it is removed whatever the caller's -WhatIf / -Confirm preference is (Verify runs the probe under -WhatIf too).
         # adversary pass 5 A5: a removal that fails (a scanner or another process holds the file) is retried for about 2 s
+        # r4 A2: both the path the probe was given and the physical path the file landed at are removed and checked (a junction re-pointed since the write makes the first one stale)
+        if ($script:SshProbeConfigRaceHook) { try { & $script:SshProbeConfigRaceHook 'after-ssh' $cfgDir } catch { } }   # test seam: a re-point between the ssh run and the cleanup
+        $cleanup = @(@($cfgPath, $cfgPhysical) | Where-Object { $_ } | Select-Object -Unique)
         for ($try = 0; $try -lt 20; $try++) {
-            try { Remove-Item -LiteralPath $cfgPath -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { }   # a non-empty directory in its place throws even under SilentlyContinue
-            if (-not (Test-Path -LiteralPath $cfgPath)) { break }
+            foreach ($cp in $cleanup) { try { Remove-Item -LiteralPath $cp -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { } }   # a non-empty directory in its place throws even under SilentlyContinue
+            if (@($cleanup | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0) { break }
             Start-Sleep -Milliseconds 100
         }
     }
     # a config that is still there after the retries is a failed probe, whatever ssh said (fail closed: the contract is that the probe leaves nothing behind)
-    if (Test-Path -LiteralPath $cfgPath) { return @{ Authenticated = $false; Detail = "PROBE_CONFIG_NOT_DELETED $cfgPath could not be removed after the probe (delete it by hand); the probe result is not used" } }
+    $leftover = @($cleanup | Where-Object { Test-Path -LiteralPath $_ })
+    if ($leftover.Count -gt 0) { return @{ Authenticated = $false; Detail = "PROBE_CONFIG_NOT_DELETED $($leftover -join ', ') could not be removed after the probe (delete it by hand); the probe result is not used" } }
     return $verdict
 }
 
@@ -1384,6 +1404,7 @@ function Get-SshPushUrlDecision {
 # Test seam: a scriptblock that returns @{ Authenticated; Detail } instead of running ssh (the tests never touch the network).
 $script:SshProbeOverride = $null
 $script:SshProbeAfterStartHook = $null   # test seam: runs inside the probe right after ssh started (may throw)
+$script:SshProbeConfigRaceHook = $null   # test seam: runs inside the probe with ('before-write' | 'after-ssh', the temp folder that was checked)
 $script:SshPushUrlWriteHook = $null   # test seam: runs right before the pushurl write
 $script:SshPushUrlAfterWriteHook = $null   # test seam: runs right after the write, before the post-write snapshot
 $script:SshPushUrlTakeBackHook = $null   # test seam: runs right before the take-back of our value
@@ -1520,7 +1541,9 @@ function Invoke-SshPushUrl {
                     if ($ours -eq 1) {
                         if ($script:SshPushUrlTakeBackHook) { & $script:SshPushUrlTakeBackHook }   # test seam: a writer that lands between the snapshot and the take-back
                         $ub = Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--unset', 'remote.fork.pushurl', (ConvertTo-GitValueRegex $ssh)) -AllowFail
-                        if ($ub -eq 0) { $takeBack = 'our value was taken back' }
+                        # r4 A1: git config holds no owner for a value, so a copy of the ssh url that another run wrote is indistinguishable from ours (the declared identical-writer limit);
+                        # the message says exactly that and names the copy count, so nobody reads "ours" as proven ownership
+                        if ($ub -eq 0) { $takeBack = 'our value was taken back (one copy of the ssh url was removed; git config cannot tell an identical value that another run wrote from ours, so check remote.fork.pushurl by hand)' }
                         else {
                             # r3 A5: the message says what the configuration holds NOW: a --unset that found no match (a writer removed ours first) is "already gone", not "still set"
                             $left = -1; try { $left = @(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl' -Local | Where-Object { "$_" -ceq $ssh }).Count } catch { }
