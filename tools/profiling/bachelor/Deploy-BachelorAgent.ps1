@@ -20,7 +20,7 @@
 #                 except the restart decision, which a dry run reports (decision= wouldExit=) instead of exiting on it.
 #   -RestartMode  none (default) | when-idle. when-idle restarts the agent after a verified deploy, and only when running\
 #                 and inbox\ still hold no live job and no lease is held at that moment ("live" = the busy predicate below).
-#   -RestartScript, -TaskXmlFile, -TestCorruptAfterWrite  test seams (see below); not for the venue.
+#   -RestartScript, -TaskXmlFile, -TestCorruptAfterWrite, -TestStallFileTimeSec  test seams (see below); not for the venue.
 #
 # What it does, in order (every doubt refuses; nothing is changed before the last refusal check passes)
 #   1. source sha256 (read once; the bytes hashed are the bytes written).
@@ -49,7 +49,7 @@
 #
 # Typed lines (stdout) and exit codes - the hub parses these
 #   DEPLOY_NOOP sha=<s>                                          0   (-RestartMode none: this exact line, busy or not)
-#   DEPLOY_NOOP sha=<s> restarted=yes reason=loaded-script-unproven pid=<n> agentStartUtc=<t> fileUtc=<t|unreadable> agentAfterFile=<yes|no|unknown>
+#   DEPLOY_NOOP sha=<s> restarted=yes reason=loaded-script-unproven pid=<n> agentStartUtc=<t> fileUtc=<t|unreadable(<why>)> agentAfterFile=<yes|no|unknown>
 #                                                                0   (when-idle; the times are information, never the decision)
 #   DEPLOY_NOOP sha=<s> restarted=no reason=<unreadable|no-live-agent|restart-host-refused|busy|lease|restart-failed> ...
 #                                                                12|16|16|10|11|14 (when-idle; after the matching typed line;
@@ -114,7 +114,8 @@
 #   The idle gate keeps the End from stranding a lease: with no live job in running\ or inbox\ and no lease in slot-holders\,
 #   nothing is lost (an ignored leftover is something the agent never picks up, before the restart or after it).
 #   Waits use a monotonic Stopwatch, never the wall clock, and EVERY read of the venue is under a deadline: a listing, a heartbeat
-#   read and each wait condition run in their own runspace (Invoke-Bounded) and a schtasks call runs as a child process
+#   read, a NOOP's informational file-time read (Get-AgentFileTimeBounded) and each wait condition run in their own runspace
+#   (Invoke-Bounded) and a schtasks call runs as a child process
 #   (Invoke-BoundedProcess), so a share that stops answering is a typed refusal or failure at the deadline, never a hang with
 #   deploy.lock held. Not bounded (the deploy's own file I/O, the root's existence check, -RestartScript, the dot-source seam): a stall
 #   there holds the process, and the lock is released when the process is killed (DeleteOnClose).
@@ -128,7 +129,7 @@
 #
 # Test seams: -RestartScript <ps1> replaces the schtasks steps with `& <ps1> -VenueRoot <root>` (non-zero exit = failed);
 # -TaskXmlFile <xml> is read instead of `schtasks /Query /XML`; -TaskPidsFile <txt> instead of the scheduler's running pids; -TestCorruptAfterWrite appends a byte to the venue copy after
-# the rename, to prove the sha-mismatch restore. Dot-sourcing the script (`. <script> -VenueRoot <x>`) loads only the functions.
+# the rename, to prove the sha-mismatch restore; -TestStallFileTimeSec <n> makes a NOOP's file-time read block n s, to prove its deadline. Dot-sourcing the script (`. <script> -VenueRoot <x>`) loads only the functions.
 # The tests (tools/repo_hygiene/test_bachelor_agent_deploy.py) run only on a temp dir. Never point this script at the real
 # venue from a test, a lane or a producer: a deploy there is the owner's or the hub's call.
 #
@@ -144,7 +145,8 @@ param(
     [string]$TaskName = '\MlvAgentBachelor',
     [string]$TaskXmlFile = '',
     [string]$TaskPidsFile = '',
-    [switch]$TestCorruptAfterWrite
+    [switch]$TestCorruptAfterWrite,
+    [int]$TestStallFileTimeSec = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1099,6 +1101,35 @@ public static class MlvDeployFileTimes {
     return [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch).UtcDateTime
 }
 
+function Get-AgentFileTimeText {
+    # The LATEST of LastWriteTimeUtc, CreationTimeUtc and the change time (Get-FileChangeTimeUtc) of $Path, as round-trip text. Every
+    # read here is a synchronous metadata request to the venue, so it is called ONLY inside Invoke-Bounded (Get-AgentFileTimeBounded).
+    param([string]$Path)
+    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $fileUtc = $item.LastWriteTimeUtc
+    if ($item.CreationTimeUtc -gt $fileUtc) { $fileUtc = $item.CreationTimeUtc }
+    $changeUtc = Get-FileChangeTimeUtc -Path $Path
+    if ($changeUtc -gt $fileUtc) { $fileUtc = $changeUtc }
+    return $fileUtc.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-AgentFileTimeBounded {
+    # Get-AgentFileTimeText under the venue read deadline (sol r2 B1 of bf28f1bd): Get-Item, File.OpenHandle with
+    # GetFileInformationByHandleEx, UnixStat, `stat` and the one-time Add-Type compile all run in their own runspace, so a share that
+    # answered the hash and the binding and then stops answering the metadata request ends this read at $script:ReadTimeoutSec, and
+    # the run goes on to the idle check, the typed result and the lock disposal. -TestStallFileTimeSec <n> (a test seam) makes the read
+    # block for n s first, in an uninterruptible call, as a stalled share does. Returns @{ utc = [datetime] or $null; why = $null or the reason }.
+    param([string]$Path)
+    $r = Invoke-Bounded -TimeoutMs ($script:ReadTimeoutSec * 1000) -Variables @{ FileTimePath = $Path; FileTimeStallSec = [int]$TestStallFileTimeSec } -Script {
+        if ($FileTimeStallSec -gt 0) { [System.Threading.Thread]::Sleep([int]$FileTimeStallSec * 1000) }
+        Get-AgentFileTimeText -Path $FileTimePath
+    }
+    if ($r.timedOut) { return @{ utc = $null; why = "no answer within $($script:ReadTimeoutSec) s" } }
+    if ($null -ne $r.error) { return @{ utc = $null; why = [string]$r.error } }
+    try { return @{ utc = (ConvertTo-UtcStart -Text ([string]$r.value)); why = $null } }
+    catch { return @{ utc = $null; why = "the file time '$($r.value)' is not a time" } }
+}
+
 function Get-NoopRefusalReason {
     # the reason= a NOOP's DEPLOY_NOOP restarted=no line gives for a Get-Refusals code: it names the refusal that was observed
     # (adversary pass 3 A2 of e7cfa491: an unreadable venue said reason=busy)
@@ -1129,8 +1160,9 @@ function Get-NoopRestartDecision {
     # heartbeat start included), so there this always returns restart=$true.
     # $Beat: the heartbeat the restart binding proved (it carries osStart, the start the OS reported for the pid), or $null when no binding
     # ran (the -RestartScript seam), in which case the heartbeat is read here and held to the same "live, with its recorded start" test.
-    # The file time printed is the LATEST of LastWriteTimeUtc, CreationTimeUtc and the change time (Get-FileChangeTimeUtc); a file time
-    # that cannot be read is printed as unreadable and changes nothing (the decision does not depend on it).
+    # The file time printed is the LATEST of LastWriteTimeUtc, CreationTimeUtc and the change time (Get-AgentFileTimeBounded, read under
+    # the venue read deadline); a file time that cannot be read in time is printed as unreadable(<why>) and changes nothing (the
+    # decision does not depend on it).
     param([string]$AgentScript, $Beat)
     $unreadable = { param([string]$Why) return @{ restart = $false; reason = 'unreadable'; detail = $Why; code = 12 } }
     $startText = $null
@@ -1153,17 +1185,18 @@ function Get-NoopRestartDecision {
     }
     try { $agentStart = ConvertTo-UtcStart -Text $startText }
     catch { return (& $unreadable "the agent start $startText is not a time") }
-    # information only: the times never decide (see above), so an unreadable one is printed as such and the agent is still restarted
+    # information only: the times never decide (see above), so an unreadable one is printed as such and the agent is still restarted.
+    # The read is bounded (Get-AgentFileTimeBounded): a stall is unreadable(no answer within <n> s) at the deadline, never a hang.
     $fileText = 'unreadable'
     $after = 'unknown'
     try {
-        $item = Get-Item -LiteralPath $AgentScript -ErrorAction Stop
-        $fileUtc = $item.LastWriteTimeUtc
-        if ($item.CreationTimeUtc -gt $fileUtc) { $fileUtc = $item.CreationTimeUtc }
-        $changeUtc = Get-FileChangeTimeUtc -Path $AgentScript
-        if ($changeUtc -gt $fileUtc) { $fileUtc = $changeUtc }
-        $fileText = $fileUtc.ToString('o')
-        $after = $(if (($agentStart - $fileUtc).TotalSeconds -gt $script:StartToleranceSec) { 'yes' } else { 'no' })
+        $ft = Get-AgentFileTimeBounded -Path $AgentScript
+        if ($null -ne $ft.why) { $fileText = 'unreadable(' + ([string]$ft.why -replace '\s+', '_') + ')' }
+        else {
+            $fileUtc = $ft.utc
+            $fileText = $fileUtc.ToString('o')
+            $after = $(if (($agentStart - $fileUtc).TotalSeconds -gt $script:StartToleranceSec) { 'yes' } else { 'no' })
+        }
     }
     catch { $fileText = 'unreadable(' + ([string]$_.Exception.Message -replace '\s+', '_') + ')' }
     $detail = "pid=$($Beat.pid) agentStartUtc=$($agentStart.ToString('o')) fileUtc=$fileText agentAfterFile=$after"

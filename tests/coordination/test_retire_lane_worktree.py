@@ -4433,7 +4433,9 @@ UNRESOLVED_EXECUTED_SITES = {
          "Read-HeartbeatBounded, Get-ProcessArgvBounded, Get-TaskRunningPidsBounded, Stop-TaskInstanceBounded (r4: the Task Scheduler instance stop by pid and "
          "recorded start, with its own idle read before Stop()) and the Wait-Until conditions in Invoke-AgentRestart: a directory "
          "listing, a heartbeat read, a process command-line read (Win32_Process / /proc), a Task Scheduler read (IRunningTask, read-only), a process-alive "
-         "check), which the AST scans as code; none launches a process. The deployer's only child process is schtasks.exe, started by Invoke-BoundedProcess "
+         "check), which the AST scans as code; none launches a process, except Get-AgentFileTimeBounded (BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1 r3: a NOOP's "
+         "informational file-time read, Get-Item plus a read-only handle query) whose off-Windows fallback runs `stat -c %Z -- <the venue agent path>`, "
+         "a fixed argument list. The deployer's only other child process is schtasks.exe, started by Invoke-BoundedProcess "
          "with a fixed /Query or /Run argument list and the task name (the stop is a Task Scheduler API instance stop by pid, not a process launch)"),
     ],
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [

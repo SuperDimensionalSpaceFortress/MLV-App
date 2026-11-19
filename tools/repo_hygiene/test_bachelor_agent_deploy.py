@@ -1840,6 +1840,51 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout.split(), ["c10=busy", "c11=lease", "c12=unreadable"], r.stdout + r.stderr)
 
+    # ---- sol r2 B1 of bf28f1bd: the informational file-time read of a NOOP had no deadline ---------------------------------------
+    # Get-Item and Get-FileChangeTimeUtc (File.OpenHandle + GetFileInformationByHandleEx, or UnixStat / stat) ran synchronously, so a
+    # share that answered the hash and the binding and then stopped answering the metadata request held the run, and deploy.lock with
+    # it, before the idle check, the restart and any typed result. The read now runs under the venue read deadline (Invoke-Bounded,
+    # $script:ReadTimeoutSec); -TestStallFileTimeSec <n> makes it block n s in an uninterruptible call, as a stalled share does.
+    # (The process itself still exits only when the stalled call returns: pwsh's host shutdown waits on an abandoned runspace. That holds
+    # for every Invoke-Bounded read on master and is OPEN as BACHELOR-DEPLOY-BOUNDED-STALL-HOLDS-EXIT-1; the lock and the typed result
+    # are already done by then, which is what these rows pin.)
+
+    def test_noop_b1_a_stalled_file_time_read_ends_at_the_deadline_with_a_typed_result_and_the_lock_released(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        stall = 40                                           # well past the 20 s read deadline
+        t0 = time.time()
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart), "-TestStallFileTimeSec", str(stall))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven .*\bfileUtc=unreadable\(no_answer_within_20_s\) agentAfterFile=unknown\s*$" % sha(OLD))
+        self.assertTrue(self.marker.exists(), "the stalled informational read does not stop the restart")
+        self.assertLess(self.marker.stat().st_mtime - t0, stall - 5, "the restart ran at the read deadline, before the stalled read returned")
+        self.assertFalse((self.venue / "deploy.lock").exists(), "the run released deploy.lock")
+        self.assertEqual(self.rollbacks(), [], "a no-op still makes no rollback folder")
+
+    def test_noop_b1_the_file_time_read_is_bounded_and_an_unreadable_one_never_decides(self) -> None:
+        # the decision function itself, with a 2 s deadline: a stall, then a file that is gone (the read throws inside the bound)
+        f = self.venue / AGENT_NAME
+        gone = self.venue / "no-such-agent.ps1"
+        body = (
+            "$script:ReadTimeoutSec = 2; $TestStallFileTimeSec = 10;"
+            "$beat = @{ pid = $PID; osStart = [DateTime]::UtcNow.ToString('o') };"
+            "$sw = [Diagnostics.Stopwatch]::StartNew();"
+            "$d = Get-NoopRestartDecision -AgentScript '%s' -Beat $beat;"
+            "'stall restart=' + $d.restart + ' secs=' + [int]$sw.Elapsed.TotalSeconds + ' ' + $d.detail;"
+            "$TestStallFileTimeSec = 0;"
+            "$d = Get-NoopRestartDecision -AgentScript '%s' -Beat $beat;"
+            "'gone restart=' + $d.restart + ' ' + $d.detail;"
+            "$d = Get-NoopRestartDecision -AgentScript '%s' -Beat $beat;"
+            "'read restart=' + $d.restart + ' ' + $d.detail"
+        ) % (psq(f), psq(gone), psq(f))
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        m = re.search(r"(?m)^stall restart=True secs=(\d+) .*\bfileUtc=unreadable\(no_answer_within_2_s\) agentAfterFile=unknown\s*$", r.stdout)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self.assertLess(int(m.group(1)), 8, "the stalled read (10 s) ended at its 2 s deadline")
+        self.assertRegex(r.stdout, r"(?m)^gone restart=True .*\bfileUtc=unreadable\(\S+\) agentAfterFile=unknown\s*$")
+        self.assertRegex(r.stdout, r"(?m)^read restart=True .*\bfileUtc=\d{4}-\d\d-\d\dT\S+ agentAfterFile=(yes|no)\s*$")
+
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.
         r = subprocess.run(
