@@ -409,9 +409,10 @@ function Write-AsciiFile([string]$Path, [string]$Text) {
 # An unset key is an empty list; a failed read throws GIT_CONFIG_READ_FAILED (never an empty list).
 function Get-GitConfigValuesRaw {
     # -Local (SSH-PUSHURL-1 pass 2 A3): only the repository's own config file; without it git merges the system, global and repository values (and a value outside the repository is not seen by a Codex lane with another HOME)
-    param([string]$RepoDir, [string]$Key, [switch]$Regexp, [switch]$Local)
+    # -List (SSH-PUSHURL-1 pass 5 A2): 'git config -z --list --show-scope', every key of every scope in ONE git run (the tokens alternate <scope> and <key><LF><value>); -Key is not used
+    param([string]$RepoDir, [string]$Key, [switch]$Regexp, [switch]$Local, [switch]$List)
     $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-    $cfgArgs = @('-C', $RepoDir, 'config', '-z') + $(if ($Local) { @('--local') } else { @() }) + @($(if ($Regexp) { '--get-regexp' } else { '--get-all' }), $Key)
+    $cfgArgs = @('-C', $RepoDir, 'config', '-z') + $(if ($List) { @('--list', '--show-scope') } else { $(if ($Local) { @('--local') } else { @() }) + @($(if ($Regexp) { '--get-regexp' } else { '--get-all' }), $Key) })
     foreach ($a in $cfgArgs) { $psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
     $proc = Invoke-GitTraceScrubbed { [System.Diagnostics.Process]::Start($psi) }   # r17 F3: the child inherits no GIT_TRACE* destination
@@ -466,6 +467,13 @@ function Get-RemoteUrlContext {
     # r26 (sol r25 B1; HUB RULING fail closed): Git reads legacy aliases from remotes/<name> and branches/<name> of the COMMON git dir, which in a linked worktree is not
     # '$RepoDir\.git' (a file there): the r23 census missed them and a url string could resolve as an alias while the guard compared the literal. Alias files are no longer
     # parsed: ANY entry under remotes\ or branches\ of the common or the per-worktree git dir refuses typed LEASE_LEGACY_REMOTE_ALIAS_PRESENT (move it aside to proceed).
+    Assert-NoLegacyRemoteAlias -RepoDir $RepoDir
+    return @{ Rules = [string[]]$rules; Names = [string[]]$names.ToArray() }
+}
+
+# the legacy alias census of Get-RemoteUrlContext (r26), as a function of its own so the one-read SSH push url snapshot shares it: throws LEASE_LEGACY_REMOTE_ALIAS_PRESENT
+function Assert-NoLegacyRemoteAlias {
+    param([string]$RepoDir)
     foreach ($gd in @(Get-GitDirsResolved -RepoDir $RepoDir)) {
         foreach ($legacy in 'remotes', 'branches') {
             $ld = Join-Path $gd $legacy
@@ -474,7 +482,6 @@ function Get-RemoteUrlContext {
             if ($entry) { throw "LEASE_LEGACY_REMOTE_ALIAS_PRESENT $($entry.FullName) is a legacy remote alias entry (refused, never parsed: Git could resolve a url argument through it; move it aside and re-run)" }
         }
     }
-    return @{ Rules = [string[]]$rules; Names = [string[]]$names.ToArray() }
 }
 
 # r26 (sol r25 B1): the per-worktree and the common git dir of -RepoDir, as Git resolves them ('git rev-parse --path-format=absolute --git-dir --git-common-dir').
@@ -1171,7 +1178,16 @@ function Invoke-GitHubSshProbe {
     $keyArgs = @()
     if (Test-Path -LiteralPath $KeyFile -PathType Leaf) { $keyArgs = @('-i', $KeyFile); $cfgLines.Add('    IdentitiesOnly yes') }
     foreach ($o in @('BatchMode yes', 'ConnectTimeout 10', 'StrictHostKeyChecking yes', 'CheckHostIP no', 'UpdateHostKeys no', 'ControlMaster no', 'ControlPath none', 'PermitLocalCommand no', 'RemoteCommand none', 'ClearAllForwardings yes', 'ForwardAgent no')) { $cfgLines.Add("    $o") }
-    $cfgPath = Join-Path ([IO.Path]::GetTempPath()) ("mlv-ssh-probe-" + [guid]::NewGuid().ToString('N') + '.conf')
+    # adversary pass 5 A4: the config is never written beneath a '.ssh' directory (a TEMP / TMP that points into ~/.ssh would otherwise put it there): the first of the temp folder and
+    # %LOCALAPPDATA%\Temp that exists and has no '.ssh' path segment is used; none = the probe fails closed without running ssh
+    $cfgDir = ''
+    foreach ($cand in @([IO.Path]::GetTempPath(), $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Temp' } else { '' }))) {
+        if (-not $cand -or -not (Test-Path -LiteralPath $cand -PathType Container)) { continue }
+        $full = [IO.Path]::GetFullPath($cand)
+        if (@($full -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -eq 0) { $cfgDir = $full; break }
+    }
+    if (-not $cfgDir) { return @{ Authenticated = $false; Detail = 'no temp folder outside a .ssh directory is available for the probe config (ssh was not run)' } }
+    $cfgPath = Join-Path $cfgDir ("mlv-ssh-probe-" + [guid]::NewGuid().ToString('N') + '.conf')
     try { [IO.File]::WriteAllText($cfgPath, (($cfgLines -join "`n") + "`n"), [Text.Encoding]::ASCII) }
     catch { Remove-Item -LiteralPath $cfgPath -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue; return @{ Authenticated = $false; Detail = "the probe's ssh config could not be written ($($_.Exception.Message))" } }
     try {
@@ -1180,22 +1196,33 @@ function Invoke-GitHubSshProbe {
         $sshOpts = @('BatchMode=yes', 'ConnectTimeout=10', 'StrictHostKeyChecking=yes', 'CheckHostIP=no', 'UpdateHostKeys=no', 'ControlMaster=no', 'ControlPath=none', 'PermitLocalCommand=no', 'RemoteCommand=none', 'ClearAllForwardings=yes', 'ForwardAgent=no')
         foreach ($a in @('-F', $cfgPath) + $keyArgs + @('-T') + @($sshOpts | ForEach-Object { '-o'; $_ }) + @('git@github.com')) { $psi.ArgumentList.Add($a) }
         $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
-        $proc = $null
-        try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { return @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
-        try {
-            $proc.StandardInput.Close()
-            $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
-            if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-                try { $proc.Kill($true) } catch { }
-                return @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
-            }
-            $proc.WaitForExit()
-            return (Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)"))
-        } finally { $proc.Dispose() }
+        $proc = $null; $verdict = $null
+        try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { $verdict = @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
+        if (-not $verdict) {
+            try {
+                $proc.StandardInput.Close()
+                $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+                    try { $proc.Kill($true) } catch { }
+                    $verdict = @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
+                } else {
+                    $proc.WaitForExit()
+                    $verdict = Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)")
+                }
+            } finally { $proc.Dispose() }
+        }
     } finally {
-        # adversary pass 4 A4: this is the probe's own temp file, so it is removed whatever the caller's -WhatIf / -Confirm preference is (Verify runs the probe under -WhatIf too)
-        Remove-Item -LiteralPath $cfgPath -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue
+        # adversary pass 4 A4: this is the probe's own temp file, so it is removed whatever the caller's -WhatIf / -Confirm preference is (Verify runs the probe under -WhatIf too).
+        # adversary pass 5 A5: a removal that fails (a scanner or another process holds the file) is retried for about 2 s
+        for ($try = 0; $try -lt 20; $try++) {
+            try { Remove-Item -LiteralPath $cfgPath -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue } catch { }   # a non-empty directory in its place throws even under SilentlyContinue
+            if (-not (Test-Path -LiteralPath $cfgPath)) { break }
+            Start-Sleep -Milliseconds 100
+        }
     }
+    # a config that is still there after the retries is a failed probe, whatever ssh said (fail closed: the contract is that the probe leaves nothing behind)
+    if (Test-Path -LiteralPath $cfgPath) { return @{ Authenticated = $false; Detail = "PROBE_CONFIG_NOT_DELETED $cfgPath could not be removed after the probe (delete it by hand); the probe result is not used" } }
+    return $verdict
 }
 
 # PURE decision (no process, no config read): what to do with remote <fork>'s push url. -Urls = every remote.fork.url, -PushUrls = every remote.fork.pushurl (empty when unset),
@@ -1265,15 +1292,22 @@ function ConvertTo-GitValueRegex([string]$Value) { return ('^' + [regex]::Replac
 
 # Everything the push url decision depends on, read once: the fork urls and push urls (every scope, and the repository's own file), the url rewrite rules and the remote names.
 function Get-SshPushUrlConfigSnapshot {
-    $ctx = Get-RemoteUrlContext -RepoDir $Repo
-    return @{
-        Urls      = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url')
-        LocalUrls = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.url' -Local)
-        Push      = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl')
-        LocalPush = [string[]]@(Get-GitConfigValuesRaw -RepoDir $Repo -Key 'remote.fork.pushurl' -Local)
-        Rules     = [string[]]@($ctx.Rules)
-        Names     = [string[]]@($ctx.Names)
+    # adversary pass 5 A2 (class: a snapshot assembled from several git runs can mix two states of the configuration): every field comes from ONE 'git config -z --list --show-scope'
+    # run, so urls, push urls, rewrite rules and remote names are one read of each config file, never a rule read before a writer and a url read after it.
+    Assert-NoLegacyRemoteAlias -RepoDir $Repo
+    $tok = @(Get-GitConfigValuesRaw -RepoDir $Repo -List)
+    $urls = [Collections.Generic.List[string]]::new(); $localUrls = [Collections.Generic.List[string]]::new(); $push = [Collections.Generic.List[string]]::new(); $localPush = [Collections.Generic.List[string]]::new()
+    $rules = [Collections.Generic.List[string]]::new(); $names = [Collections.Generic.List[string]]::new()
+    if ($tok.Count % 2 -ne 0) { throw "GIT_CONFIG_READ_FAILED git config --list --show-scope printed $($tok.Count) token(s), expected scope/entry pairs" }
+    for ($i = 0; $i -lt $tok.Count; $i += 2) {
+        $scope = "$($tok[$i])"; $entry = "$($tok[$i + 1])"
+        $nl = $entry.IndexOf("`n"); $key = $(if ($nl -ge 0) { $entry.Substring(0, $nl) } else { $entry }); $val = $(if ($nl -ge 0) { $entry.Substring($nl + 1) } else { '' })
+        if ($key -ceq 'remote.fork.url') { $urls.Add($val); if ($scope -ceq 'local') { $localUrls.Add($val) } }
+        elseif ($key -ceq 'remote.fork.pushurl') { $push.Add($val); if ($scope -ceq 'local') { $localPush.Add($val) } }
+        if ($key -match '^url\..*\.(insteadof|pushinsteadof)$') { $rules.Add($val) }
+        if ($key.StartsWith('remote.', [StringComparison]::Ordinal)) { $dot = $key.LastIndexOf('.'); if ($dot -gt 7) { $names.Add($key.Substring(7, $dot - 7)) } }
     }
+    return @{ Urls = [string[]]$urls.ToArray(); LocalUrls = [string[]]$localUrls.ToArray(); Push = [string[]]$push.ToArray(); LocalPush = [string[]]$localPush.ToArray(); Rules = [string[]]$rules.ToArray(); Names = [string[]]$names.ToArray() }
 }
 # adversary pass 3 A4: an unambiguous key. Every list is '<count>[<length>:<value>,...]' (a value is read by its length, so no value can look like a separator): the old
 # U+001F / U+001E join made ["a<US>b"] and ["a","b"] one key.
@@ -1328,19 +1362,23 @@ function Invoke-SshPushUrl {
                 # below, push urls included (ours / others come from $post.Push, never from an earlier read-back), so a push url that changed after the write is seen by the very
                 # checks that decide the outcome.
                 $post = Get-SshPushUrlConfigSnapshot
-                $ours = @($post.Push | Where-Object { "$_" -ceq $ssh }).Count; $others = @($post.Push).Count - $ours
+                # adversary pass 5 A1: ownership is judged on the REPOSITORY's own push urls (LocalPush), and a push url that Git also merges in from the global or system config is a
+                # failure of its own ($scopeMismatch): the value this run wrote lives in the repository config, so a copy elsewhere must not stand in for it
+                $ours = @($post.LocalPush | Where-Object { "$_" -ceq $ssh }).Count; $others = @($post.LocalPush).Count - $ours
                 if ($others -eq 0 -and $ours -ge 2) {
                     # adversary pass 3 A3: another run wrote the identical value. Two copies of one value are a PASS, normalised to one: the --replace-all is restricted to a pattern that
                     # matches only our exact value, so it can never remove anything else and never deletes both copies. The outcome is then decided from a fresh snapshot.
                     [void](Invoke-Native -Exe 'git' -Arguments @('-C', $Repo, 'config', '--replace-all', 'remote.fork.pushurl', $ssh, (ConvertTo-GitValueRegex $ssh)))
                     $post = Get-SshPushUrlConfigSnapshot
-                    $ours = @($post.Push | Where-Object { "$_" -ceq $ssh }).Count; $others = @($post.Push).Count - $ours
+                    $ours = @($post.LocalPush | Where-Object { "$_" -ceq $ssh }).Count; $others = @($post.LocalPush).Count - $ours
                 }
+                $scopeMismatch = ((Get-SshPushUrlSnapshotKey @{ Push = $post.Push }) -cne (Get-SshPushUrlSnapshotKey @{ Push = $post.LocalPush }))
                 # adversary pass 3 A5: the refusal checks of the decision are run again AFTER the write, with the rules and names as they are now (a rule added between the last
                 # snapshot compare and the write rewrites the ssh url, and a push url read back only looks at push urls). The fork url must also still be the one the decision saw.
                 $refusal = Get-SshContextRefusal -Rules $post.Rules -Names $post.Names
                 if (-not $refusal) { $refusal = Get-RemoteUrlRefusal -Urls (@($post.Urls) + @($post.Push)) -Rules $post.Rules -Names $post.Names }
                 if (-not $refusal -and (Get-SshPushUrlSnapshotKey @{ Urls = $post.Urls; LocalUrls = $post.LocalUrls }) -cne (Get-SshPushUrlSnapshotKey @{ Urls = $snap.Urls; LocalUrls = $snap.LocalUrls })) { $refusal = 'the fork url changed during the write' }
+                if (-not $refusal -and $scopeMismatch) { $refusal = 'a push url is also set outside the repository config (global or system), which a lane with another HOME would not see' }
                 if ($others -gt 0 -or $ours -ne 1 -or $refusal) {
                     # take back only a value that is certainly ours: exactly one copy of the ssh url. Two or more copies with a foreign value present are left as they are (we cannot tell
                     # whose copy is whose, and never delete another run's value). adversary pass 4 A2/A6: the take-back is 'git config --unset' (not --unset-all): git does it under its

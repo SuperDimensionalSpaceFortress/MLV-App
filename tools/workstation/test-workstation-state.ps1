@@ -3705,6 +3705,50 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlAfterWriteHook = $null }
     Assert-That ($r.Thrown -match 'our value was taken back' -and @(Get-SpCfg $spRp 'remote.fork.pushurl' | Where-Object { $_ -ceq $spS }).Count -eq 0) 'SSH-PUSHURL-1 pass4 A6 setup: a foreign value next to ours -> exactly our value is taken back and the message says so' "thrown=$($r.Thrown)"
 
+    # pass 5 A1: a push url that exists only OUTSIDE the repository config (another writer adds it globally and unsets the local one) is never SSH_PUSH_READY
+    $spG5 = Join-Path (New-Scratch 'sp-global5') 'global.gitconfig'; [IO.File]::WriteAllText($spG5, '')
+    $spRp = New-SpRepo 'p5a1-scope'
+    $script:spCasRepo = $spRp; $script:spG5 = $spG5
+    $script:SshPushUrlAfterWriteHook = { [IO.File]::WriteAllText($script:spG5, "[remote `"fork`"]`n`tpushurl = git@github.com:SuperDimensionalSpaceFortress/MLV-App.git`n"); & git -C $script:spCasRepo config --unset-all remote.fork.pushurl }
+    $savedGlobal = [Environment]::GetEnvironmentVariable('GIT_CONFIG_GLOBAL'); [Environment]::SetEnvironmentVariable('GIT_CONFIG_GLOBAL', $spG5)
+    try { $r = Invoke-SpRun $spRp $spAuth } finally { $script:SshPushUrlAfterWriteHook = $null; [Environment]::SetEnvironmentVariable('GIT_CONFIG_GLOBAL', $savedGlobal) }
+    Assert-That ($r.Failures -contains 'PUSHURL_CHANGED_DURING_PROBE remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY' -and @(Get-SpCfg $spRp 'remote.fork.pushurl').Count -eq 0) 'SSH-PUSHURL-1 pass5 A1 setup: an ssh push url that lives only in the global config is not a ready local push url (typed failure, no SSH_PUSH_READY)' "fail=$($r.Failures -join ',')`n$($r.Log)"
+
+    # pass 5 A2: the snapshot is built from one git run and still carries every field (urls, push urls per scope, rules, names)
+    $spG6 = Join-Path (New-Scratch 'sp-global6') 'global.gitconfig'; [IO.File]::WriteAllText($spG6, "[remote `"fork`"]`n`tpushurl = $spS`n")
+    $spRp = New-SpRepo 'p5a2-snapshot'; & git -C $spRp config 'url.https://example.invalid/.insteadOf' 'git@example.org:'; & git -C $spRp config 'url.https://example.invalid/.pushInsteadOf' 'push:'
+    $svRepo = $script:Repo; $script:Repo = $spRp; $Repo = $spRp
+    $savedGlobal = [Environment]::GetEnvironmentVariable('GIT_CONFIG_GLOBAL'); [Environment]::SetEnvironmentVariable('GIT_CONFIG_GLOBAL', $spG6)
+    try { $spSn = Get-SshPushUrlConfigSnapshot } finally { [Environment]::SetEnvironmentVariable('GIT_CONFIG_GLOBAL', $savedGlobal); $script:Repo = $svRepo; $Repo = $svRepo }
+    Assert-That (@($spSn.Urls).Count -eq 1 -and $spSn.Urls[0] -ceq $spU -and @($spSn.LocalUrls).Count -eq 1 -and @($spSn.Push).Count -eq 1 -and $spSn.Push[0] -ceq $spS -and @($spSn.LocalPush).Count -eq 0 -and (@($spSn.Rules) -join '|') -ceq 'git@example.org:|push:' -and @($spSn.Names | Where-Object { $_ -ceq 'fork' }).Count -ge 1 -and @($spSn.Names | Where-Object { $_ -ceq 'origin' }).Count -ge 1) 'SSH-PUSHURL-1 pass5 A2 snapshot: one git config --list read carries the fork urls, push urls per scope (global push is not local), both rewrite rule kinds and the remote names' ($spSn | ConvertTo-Json -Compress)
+
+    # pass 5 A4: the probe config is never written beneath a .ssh directory, even when TEMP / TMP point there
+    $spSshTmp = Join-Path (New-Scratch 'sp-tmp-ssh') '.ssh'; [void][IO.Directory]::CreateDirectory($spSshTmp)
+    $spLocal = New-Scratch 'sp-localappdata'; [void][IO.Directory]::CreateDirectory((Join-Path $spLocal 'Temp'))
+    $sv = @{ T = $env:TEMP; M = $env:TMP; L = $env:LOCALAPPDATA }
+    Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+    try {
+        $env:TEMP = $spSshTmp; $env:TMP = $spSshTmp; $env:LOCALAPPDATA = $spLocal
+        $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+        $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
+        Assert-That (@(Get-ChildItem -LiteralPath $spSshTmp -Force).Count -eq 0 -and $argText -match [regex]::Escape((Join-Path $spLocal 'Temp')) -and $pr.Authenticated -eq $true) 'SSH-PUSHURL-1 pass5 A4 probe: with TEMP inside a .ssh folder the config goes to %LOCALAPPDATA%\Temp, nothing is written under .ssh' "$argText"
+        Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+        $env:LOCALAPPDATA = $spSshTmp
+        $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+        Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'no temp folder' -and -not (Test-Path -LiteralPath $spArgs) -and @(Get-ChildItem -LiteralPath $spSshTmp -Force).Count -eq 0) 'SSH-PUSHURL-1 pass5 A4 probe: no temp folder outside .ssh -> fail closed, ssh not run, nothing written' "$($pr.Detail)"
+    } finally { $env:TEMP = $sv.T; $env:TMP = $sv.M; $env:LOCALAPPDATA = $sv.L }
+
+    # pass 5 A5: a config that cannot be deleted fails the probe closed (the fake ssh swaps the file for a non-empty directory, which a plain Remove-Item cannot delete)
+    [IO.File]::WriteAllText((Join-Path $spDir 'ssh-leftover.cmd'), "@echo off`r`ncopy /y %2 `"%~dp0cfg-copy.txt`" >nul`r`ndel /f /q `"%~2`"`r`nmkdir `"%~2`"`r`necho x> `"%~2\keep.txt`"`r`necho Hi tester! You've successfully authenticated, but GitHub does not provide shell access. 1>&2`r`nexit /b 1`r`n")
+    $spBefore = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'mlv-ssh-probe-*.conf' -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-leftover.cmd') -TimeoutSec 20 -KeyFile $spKey
+    $spLeft = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'mlv-ssh-probe-*.conf' -Force -ErrorAction SilentlyContinue | Where-Object { $spBefore -notcontains $_.FullName })
+    Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'PROBE_CONFIG_NOT_DELETED') 'SSH-PUSHURL-1 pass5 A5 probe: a generated config that cannot be deleted makes the probe fail closed (PROBE_CONFIG_NOT_DELETED), even though ssh authenticated' "$($pr.Detail)"
+    foreach ($spL in $spLeft) {
+        foreach ($spK in @(Get-ChildItem -LiteralPath $spL.FullName -Force -File -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $spK.FullName -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $spL.FullName -Force -ErrorAction SilentlyContinue
+    }
+
     # A6: Verify of an existing clone without a fork remote is a typed failure; no clone yet stays a skip
     $spNoFork = New-Scratch 'sp-nofork'; $spNfRepo = Join-Path $spNoFork 'MLV-App'; [void][IO.Directory]::CreateDirectory($spNfRepo); & git -C $spNfRepo init -q 2>$null; & git -C $spNfRepo remote add origin $UpstreamUrl
     $r = Invoke-SpRun $spNfRepo $spAuth -VerifyOnly
