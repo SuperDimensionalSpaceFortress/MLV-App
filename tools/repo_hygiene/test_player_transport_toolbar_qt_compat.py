@@ -21,10 +21,13 @@ Read:
     stands: a member access (also one split across lines), a qualified name, a macro argument,
     a #define body, a conditional directive or a bare call. Each use is judged by the arms open
     at the physical line its name is on;
-  * ``#if``/``#ifdef``/``#ifndef``/``#elif``/``#else``/``#endif``: only ``#if QT_VERSION >=
-    QT_VERSION_CHECK(a, b, c)`` and ``#if QT_VERSION < QT_VERSION_CHECK(a, b, c)``, with a, b and
-    c C preprocessor integer literals, open a trusted arm (the >= arm, or the #else of the <
-    form); every other condition and every #elif arm is untrusted.
+  * ``#if``/``#ifdef``/``#ifndef``/``#elif``/``#elifdef``/``#elifndef``/``#else``/``#endif``:
+    only ``#if QT_VERSION >= QT_VERSION_CHECK(a, b, c)`` and ``#if QT_VERSION <
+    QT_VERSION_CHECK(a, b, c)``, with a, b and c C preprocessor integer literals, open a trusted
+    arm (the >= arm, or the #else of the < form); every other condition and every #elif,
+    #elifdef and #elifndef arm is untrusted;
+  * the other directives it models are ``#define``, ``#undef``, ``#include``, ``#pragma``,
+    ``#error``, ``#warning``, ``#line`` and the null directive ``#``.
 
 Refused, never read:
   * a backslash-newline splice anywhere in the file, comments and literals included, also with
@@ -36,7 +39,11 @@ Refused, never read:
   * a token paste (``##``) in code;
   * macro indirection: a #define whose replacement list names a macro this file #defines
     (adversary r4 pass 6 A2: ``#define INDIRECT APPLY``);
-  * a #define or #undef of QT_VERSION or QT_VERSION_CHECK.
+  * a #define or #undef of QT_VERSION or QT_VERSION_CHECK;
+  * any other directive name (``#include_next``, ``#import``, ``#embed``, a ``# 12 "f"`` line
+    marker, ...: adversary r5 A2), and a C++20 ``import``/``module`` line, which can import macros;
+  * a character in code outside printable ASCII, tab, VT and FF (a BOM, NBSP, U+2028, a control
+    character, a non-ASCII identifier: adversary r5 A1).
 
 Non-promises: the scanner does not preprocess. It does not follow #include, does not expand a
 macro defined in another file (an external macro that pastes pieces into an API name is not
@@ -69,7 +76,19 @@ _NAMES = "|".join(sorted(NEWER_THAN_QT5_API, key=len, reverse=True))
 # past it.
 API_NAME = re.compile(rf"\b({_NAMES})\b")
 IDENTIFIER = re.compile(r"\b[^\W\d]\w*")
-DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b(.*)$")
+# Any other directive name is refused (adversary r5 A2: `#elifdef` was not read); `#` alone is the
+# null directive.
+DIRECTIVE_NAME = re.compile(r"^\s*#\s*(\w*)")
+MODELLED_DIRECTIVES = frozenset((
+    "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif",
+    "define", "undef", "include", "pragma", "error", "warning", "line", "",
+))
+# Every directive pattern is anchored at the line start and `\s` is wider than a compiler's
+# whitespace, so code holds printable ASCII, tab, VT and FF only (adversary r5 A1: a BOM).
+NOT_PRINTABLE_ASCII = re.compile(r"[^\t\v\f\x20-\x7e]")
+# A C++20 module or header-unit import is a directive without `#` and can import macros.
+MODULE_DIRECTIVE = re.compile(r"^\s*(?:export\s+)?(?:import|module)\b")
 # Group 3 is the replacement list; a `(` straight after the name opens a parameter list.
 DEFINE = re.compile(r"^\s*#\s*define\s+(\w+)(\([^)]*\))?(.*)$")
 VERSION_MACRO_REDEFINED = re.compile(r"^\s*#\s*(?:define|undef)\s+QT_VERSION(?:_CHECK)?\b")
@@ -214,8 +233,13 @@ def _refused_forms(lines: list[Line]) -> list[tuple[int, str]]:
     refused: list[tuple[int, str]] = []
     defined = {m.group(1) for _, line, _ in lines if (m := DEFINE.match(line))}
     for number, line, where in lines:
-        for kind, pattern in (("digraph", DIGRAPH), ("token-paste", TOKEN_PASTE)):
+        for kind, pattern in (("digraph", DIGRAPH), ("token-paste", TOKEN_PASTE), ("non-ascii", NOT_PRINTABLE_ASCII)):
             refused.extend((_physical(where, m.start(), number), kind) for m in pattern.finditer(line))
+        name = DIRECTIVE_NAME.match(line)
+        if name and name.group(1) not in MODELLED_DIRECTIVES:
+            refused.append((_physical(where, name.start(1), number), "unknown-directive"))
+        if MODULE_DIRECTIVE.match(line):
+            refused.append((number, "unknown-directive"))
         if VERSION_MACRO_REDEFINED.match(line):
             refused.append((number, "version-macro-redefined"))
         define = DEFINE.match(line)
@@ -279,8 +303,8 @@ def _scan(lines: list[Line]) -> list[tuple[int, str, str]]:
                         stack.append(["lt", version, None])
                 else:
                     stack.append(["other", None, None])
-            elif keyword == "elif" and stack:
-                stack[-1] = ["other", None, None]  # an #elif arm is never trusted
+            elif keyword.startswith("elif") and stack:
+                stack[-1] = ["other", None, None]  # an #elif / #elifdef / #elifndef arm is never trusted
             elif keyword == "else" and stack:
                 kind, version, _ = stack[-1]
                 stack[-1][2] = version if kind == "lt" else None
@@ -723,6 +747,42 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
                 hits = unguarded_newer_api_calls(source)
                 self.assertTrue(hits)
                 self.assertTrue(all(api.startswith("REFUSED") for _, api, _ in hits), hits)
+
+    def test_a_character_outside_printable_ascii_in_code_is_refused(self) -> None:
+        # adversary r5 A1 (4d52622e): a BOM before `#define QT_VERSION_CHECK` hid the anchored
+        # directive, and the later arm was trusted. Every directive pattern is anchored at the line
+        # start, so r5 refuses any character in code outside printable ASCII, tab, VT and FF.
+        bom = "﻿#define QT_VERSION_CHECK(a,b,c) 0\n#if QT_VERSION >= QT_VERSION_CHECK(6,9,0)\n" \
+              "return image.flipped(Qt::Horizontal);\n#endif\n"
+        self.assertRefused(bom, ["non-ascii"], [1])
+        hits = unguarded_newer_api_calls("﻿#define QT_VERSION_CHECK(a,b,c) 0\n"
+                                         + SCOPED_HEADERS[0].read_text(encoding="utf-8"))
+        self.assertTrue(hits)
+        self.assertTrue(all(api.startswith("REFUSED") for _, api, _ in hits), hits)
+        for prefix in (" ", " ", "　", "\x1c", "\x00", "​"):
+            with self.subTest(prefix=repr(prefix)):
+                self.assertRefused(f"x();\n{prefix}#undef Y\n", ["non-ascii"], [2])
+        # In a comment or a literal it is text.
+        self.assertEqual(unguarded_newer_api_calls('// ﻿ café\nauto s = "é";\n'), [])
+
+    def test_a_directive_the_scanner_does_not_model_is_refused(self) -> None:
+        # adversary r5 A2 (4d52622e): `#elifdef` (C++23) was not recognised, so its arm kept the
+        # trusted floor of the `#if` above it. r5 reads `#elifdef`/`#elifndef` as an untrusted
+        # `#elif`, and refuses any directive name it does not model.
+        for api in NEWER_THAN_QT5_API:
+            for keyword in ("elifdef", "elifndef"):
+                with self.subTest(api=api, keyword=keyword):
+                    source = (f"#if QT_VERSION >= QT_VERSION_CHECK(6,9,0)\nreturn image.mirrored(true,false);\n"
+                              f"#{keyword} __cplusplus\nreturn image.{api}(Qt::Horizontal);\n#endif\n")
+                    self.assertEqual([(n, a) for n, a, _ in unguarded_newer_api_calls(source)], [(4, api)])
+        for directive in ("#include_next <QImage>", "#import <x>", "#ident \"x\"", "#assert machine(x)",
+                          "#embed \"x\"", "# 12 \"file.h\"", "#sccs \"x\"", "  # /* c */ unassert x",
+                          "import \"qt_override.h\";", "export import <QImage>;", "module;", "export module m;"):
+            with self.subTest(directive=directive):
+                self.assertRefused(f"x();\n{directive}\n", ["unknown-directive"], [2])
+        # The directives the scanner models, and the null directive, are read.
+        self.assertEqual(unguarded_newer_api_calls(
+            "#pragma once\n#include <QImage>\n#\n#undef X\n#line 10\n#error x\n#warning x\n"), [])
 
     def test_every_api_name_token_is_a_use(self) -> None:
         # r5: the token rule is fail closed: a bare call, a macro argument (of any macro, defined
