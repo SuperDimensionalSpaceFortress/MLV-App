@@ -4709,7 +4709,8 @@ def test_launcher_census_gui_smoke_log_probe_is_a_private_runspace_script_that_o
     for launch in ("Start-Process", "-EncodedCommand", "-Command", "Invoke-Expression", "iex", "Create(", "AddScript", "cmd", "pwsh",
                    "Invoke-Command", "&", "Out-File", "Set-Content", "Remove-Item", "WriteAll", ".Write(", "Delete(", "SetLength",
                    "FileAccess]::Write", "FileAccess]::ReadWrite", "FileMode]::Create", "FileMode]::Truncate", "FileMode]::Append"):
-        assert launch not in probe, f"the log probe now carries {launch!r}: it must only list and read"
+        # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary r16 A4): PowerShell resolves names case-insensitively, so the blacklist does too
+        assert launch.lower() not in probe.lower(), f"the log probe now carries {launch!r}: it must only list and read"
     assert "Get-ChildItem -LiteralPath $using:probeRoot" in probe and "[System.IO.FileAccess]::Read" in probe
     runner = (REPO / "tools/profiling/run-release-gui-smoke.ps1").read_text(encoding="utf-8")
     assert "-ProbeScript" not in runner and "-ProbeDelayMs" not in runner, "the runner must not hand the watchdog a script or a test delay of its own"
@@ -4737,11 +4738,12 @@ def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_e
                            "Copy-Item", "New-Item", "Clear-Content", "Rename-Item", "pwsh", "&",
                            # r5 (adversary 9fdf9e1a A3): a .NET write the cmdlet names above do not cover
                            "WriteAll", ".Write(", "Delete(", "SetLength", "FileAccess]::Write", "FileAccess]::ReadWrite", "FileMode]::Create",
-                           "FileMode]::Truncate", "FileMode]::Append", "FileMode]::OpenOrCreate") if v in body]
+                           "FileMode]::Truncate", "FileMode]::Append", "FileMode]::OpenOrCreate") if v.lower() in body.lower()]
     assert not writers and "Get-ChildItem -LiteralPath $using:probeRoot" in body and "[System.IO.FileAccess]::Read" in body, f"the probe must only list and read: {writers}"
     # (3b) r5 fix 2 (adversary 1b823896 A3): a positive allowlist, so a write shape no blacklist names is refused too: the only .NET file call is
     # Open, and the only commands are the listing, the pipeline stage and the test-seam sleep
-    assert re.findall(r"\[System\.IO\.File\]::(\w+)", body) == ["Open"] and set(re.findall(r"\b[A-Z][a-z]+-[A-Z]\w+", body)) <= {"Get-ChildItem", "ForEach-Object", "Start-Sleep"}, "the probe may only list, open for reading and sleep"
+    # (-2 r1, adversary r16 A4: both read case-insensitively, as PowerShell resolves them)
+    assert [m.lower() for m in re.findall(r"(?i)\[System\.IO\.File\]::(\w+)", body)] == ["open"] and {c.lower() for c in re.findall(r"(?i)\b[a-z]+-[a-z]\w*", body)} <= {"get-childitem", "foreach-object", "start-sleep"}, "the probe may only list, open for reading and sleep"
     # (4) the wait is $job.Finished.WaitOne(ms) bounded by the absolute end (entry stopwatch + budget)
     assert "$Watch.Pending.Finished.WaitOne($waitMs)" in code and "[Math]::Min([int]$Watch.ProbeWaitMs, $leftMs)" in code, "the wait is Finished.WaitOne bounded by what is left"
     # (5) completion receives the job's output then removes the job
@@ -4756,17 +4758,28 @@ def test_launcher_census_gui_smoke_log_probe_is_a_literal_parallel_job_with_no_e
 
 def _gui_smoke_log_probe_purity_problems(body: str) -> list:
     """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r6 (sol r5 H1): the .NET surface a read-only log probe may touch, as a positive allowlist over the probe
-    body: the types it may name, the members it may call, and no writer/stream constructor. Returns the problems (empty = pure)."""
+    body: the types it may name, the members it may call, and no writer/stream constructor. Returns the problems (empty = pure).
+
+    VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1: the probe also READS, from the handle it opened read-only, the bytes since the previous high-water mark (the
+    `gui_smoke.` phase marker), so the allowlist names exactly that read surface and nothing else: the types [System.IO.SeekOrigin] and
+    [System.Text.Encoding] (Latin1 decoding), a [byte[]] buffer made by [byte[]]::new (the one constructor allowed), and the members Seek, Read and
+    GetString. Adversary r16 A4: every name is compared case-insensitively (PowerShell resolves `set-content` and `[system.io.streamwriter]` alike), and
+    the probe's commands are checked here too."""
     problems = []
-    types = set(re.findall(r"\[([A-Za-z][\w.]*)\]", body))
-    allowed_types = {"int64", "System.IO.File", "System.IO.FileMode", "System.IO.FileAccess", "System.IO.FileShare"}
+    # the one constructor allowed: the read buffer; any other ::new is still refused below
+    rest = re.sub(r"(?i)\[byte\[\]\]::new\(", "(", body)
+    types = {t.lower() for t in re.findall(r"\[([A-Za-z][\w.]*(?:\[\])?)\]", body)}
+    allowed_types = {"int64", "byte[]", "system.io.file", "system.io.filemode", "system.io.fileaccess", "system.io.fileshare", "system.io.seekorigin",
+                     "system.text.encoding"}
     problems += [f"type [{t}]" for t in sorted(types - allowed_types)]
-    members = set(re.findall(r"\.([A-Za-z]\w*)\(", body)) | set(re.findall(r"::(\w+)\(", body))
-    problems += [f"member call .{m}(" for m in sorted(members - {"Open", "Dispose"})]
+    members = {m.lower() for m in re.findall(r"\.([A-Za-z]\w*)\s*\(", rest)} | {m.lower() for m in re.findall(r"::(\w+)\s*\(", rest)}
+    problems += [f"member call .{m}(" for m in sorted(members - {"open", "dispose", "seek", "read", "getstring"})]
     # a writer or stream built any way at all (constructor, ::new, New-Object, a type accelerator) is refused by name too
     for shape in ("StreamWriter", "FileStream", "BinaryWriter", "TextWriter", "StringWriter", "WriteLine", "Flush", "::new", "New-Object", "CopyTo", "WriteByte"):
-        if shape in body:
+        if shape.lower() in rest.lower():
             problems.append(f"shape {shape}")
+    commands = {c.lower() for c in re.findall(r"(?i)\b[a-z]+-[a-z]\w*", body)}
+    problems += [f"command {c}" for c in sorted(commands - {"get-childitem", "foreach-object", "start-sleep"})]
     # r6 (adversary 2d33c39f A2): a computed member name, [System.IO.File]::('Write'+'AllText')(...) or $o.$name(...), is invisible to the member allowlist
     if re.search(r"(?:::|\.)\s*[(\$'\"]", body):
         problems.append("computed member access")
@@ -4808,6 +4821,15 @@ def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_wr
         "postfix property increment": "$file.Attributes++\n",
         "prefix property increment": "++$file.Attributes\n",
         "postfix property decrement": "$file.Attributes--\n",
+        # -2 r1 (adversary r16 A4): PowerShell resolves names case-insensitively, so lowercase spellings are refused like the canonical ones
+        "lowercase set-content": "set-content -literalpath $file.FullName -value 'overwritten'\n",
+        "lowercase streamwriter type": "$sink = [system.io.streamwriter]::new($file.FullName, $true); $sink.writeline('x'); $sink.dispose()\n",
+        "lowercase member write on the read stream": "$stream.write($buffer, 0, 1)\n",
+        "lowercase static writer": "[system.io.file]::writeallbytes($file.FullName, $buffer)\n",
+        # -2 r1: the read surface the marker needs does not open a write: the buffer constructor admits nothing else, and a write next to a read is refused
+        "second constructor beside the buffer": "$buffer = [byte[]]::new(1); $sink = [System.IO.MemoryStream]::new($buffer)\n",
+        "truncate after seek": "$null = $stream.Seek(0, [System.IO.SeekOrigin]::Begin); $stream.SetLength(0)\n",
+        "encoding to bytes then write": "$bytes = [System.Text.Encoding]::Latin1.GetBytes('x'); $stream.Write($bytes, 0, 1)\n",
     }
     for label, injected in mutations.items():
         mutated = body.replace(anchor, anchor + injected, 1)

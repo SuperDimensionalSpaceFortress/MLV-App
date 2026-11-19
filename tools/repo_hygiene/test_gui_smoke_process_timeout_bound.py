@@ -109,7 +109,10 @@ class NoProgressWindowComesFromTheLegBudget(unittest.TestCase):
         self.assertIn("-LegBudgetMs $derivedProcessTimeoutMs", call)
         # r4 (adversary b0a33ba9 A5): the override is the runner's >= 1000 ms clamp of -NoProgressTimeoutMs ($noProgressOverrideMs)
         self.assertIn("-OverrideMs $noProgressOverrideMs", call)
-        self.assertIn("-CeilingMs $effectiveProcessTimeoutMs", call)
+        # -2 r1: capped at L (the watchdog limit derived from the hard deadline), the one cap both windows and an override share
+        self.assertIn("-CeilingMs $noProgressLimitMs", call)
+        self.assertIn("$noProgressLimitMs = Get-GuiSmokeWatchdogLimitMs -HardMs $effectiveProcessTimeoutMs -ProbeWaitMs $noProgressProbeWaitMs", source)
+        self.assertNotIn("-BelowCeilingMs", _runner_snippet(*_WAIT_REGION), "-2 r1: no per-window margin; L carries the one margin M")
         # derived from the leg (playback window + settle + margin), so a caller's 3600 s job timeout cannot widen it
         self.assertNotIn("3600", call)
 
@@ -206,9 +209,9 @@ function Trip([scriptblock]$Mutate, [int]$Window = 1200) {
         self.assertEqual(4000, out["c"])
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("$noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs", source)
-        # [Math]::Min takes two arguments (a three-argument call would throw), so the three bounds nest
-        self.assertIn("$hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))", source)
-        self.assertIn("[Math]::Min($noProgressChunkMs, $noProgressRemainingMs)", source)
+        # -2 r1: each chunk wait is min(chunk, D - now, max(1, E - now)), read from the launch stamp by the one helper at the wait
+        self.assertIn("$hostLoadChunkMs = Get-GuiSmokeChunkWaitMs -ChunkMs ([Math]::Min($HostLoadSampleIntervalMs, $noProgressChunkMs)) -LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs", source)
+        self.assertIn("$noProgressChunkWaitMs = Get-GuiSmokeChunkWaitMs -ChunkMs $noProgressChunkMs -LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs", source)
 
     # adversary 797947a7 A3: an -ExtraEnvironment pair must not move the log directory the watchdog (and the runner's own evidence read) uses.
     def test_extra_environment_cannot_redirect_the_log_directory(self) -> None:
@@ -359,7 +362,7 @@ $held.Dispose(); Stop-GuiSmokeLogProgressWatch -Watch $w
 $dir = Join-Path $env:GS_TMP 'budget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeDelayMs 40000 -ProbeWaitMs 1000
 $sw = [Diagnostics.Stopwatch]::StartNew()
-[void](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 50)
+[void](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs ([int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) + 50))
 $cappedMs = [int]$sw.ElapsedMilliseconds
 $w2 = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeDelayMs 40000 -ProbeWaitMs 400
 $sw.Restart()
@@ -373,8 +376,8 @@ Stop-GuiSmokeLogProgressWatch -Watch $w; Stop-GuiSmokeLogProgressWatch -Watch $w
         source = RUNNER.read_text(encoding="utf-8")
         calls = source.count("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch")
         self.assertGreaterEqual(calls, 2)
-        self.assertEqual(calls, source.count("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs"),
-                         "every runner call hands the remaining process budget to the probe wait")
+        self.assertEqual(calls, source.count("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs"),
+                         "every runner call hands the hard deadline (ms since launch) to the probe wait")
 
     # adversary b0a33ba9 A1 (r4): a log unreadable at its first sighting is UNKNOWN, not length 0; becoming readable at an unchanged length is
     # not growth, and only growth beyond the first KNOWN length restarts the quiet clock.
@@ -390,11 +393,12 @@ $armed = [bool]$w.Armed
 Start-Sleep -Milliseconds 1200
 $held.Dispose()
 [void](Test-GuiSmokeLogProgressStalled -Watch $w)
-$quietAfterRestore = [int]$w.Quiet.ElapsedMilliseconds
+# -2 r1: the quiet time is now - P, both read on the watch's launch clock
+$quietAfterRestore = [int]((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $w.LastProgressMs)
 $baseline = [int64]$w.Files['mlvapp-1.log']
 Add-Content -LiteralPath $log -Value 'more' -NoNewline
 [void](Test-GuiSmokeLogProgressStalled -Watch $w)
-$quietAfterGrowth = [int]$w.Quiet.ElapsedMilliseconds
+$quietAfterGrowth = [int]((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $w.LastProgressMs)
 Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ armed = $armed; quietAfterRestore = $quietAfterRestore; baseline = $baseline; quietAfterGrowth = $quietAfterGrowth } | ConvertTo-Json -Compress
 """)
@@ -409,16 +413,19 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         out = run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'nobudget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeWaitMs 1000
+Start-Sleep -Milliseconds 20
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 0)
+# -2 r1: a deadline already reached (1 ms after the watch's launch) is the old zero budget
+$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 1)
 $zeroMs = [int]$sw.ElapsedMilliseconds
 $pendingAfterZero = ($null -ne $w.Pending)
 Stop-GuiSmokeLogProgressWatch -Watch $w
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
 $late = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeDelayMs 600 -ProbeWaitMs 5000
-[void](Test-GuiSmokeLogProgressStalled -Watch $late -BudgetRemainingMs 300)
+$lateDeadline = [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $late.LaunchTimestamp) + 300
+[void](Test-GuiSmokeLogProgressStalled -Watch $late -DeadlineMs $lateDeadline)
 Start-Sleep -Milliseconds 1500
-[void](Test-GuiSmokeLogProgressStalled -Watch $late -BudgetRemainingMs 0)
+[void](Test-GuiSmokeLogProgressStalled -Watch $late -DeadlineMs $lateDeadline)
 $lateArmed = [bool]$late.Armed
 $lateFiles = @($late.Files.Keys).Count
 Stop-GuiSmokeLogProgressWatch -Watch $late
@@ -430,10 +437,12 @@ Stop-GuiSmokeLogProgressWatch -Watch $late
         self.assertFalse(out["lateArmed"], "a probe result that lands after the budget was spent is ignored")
         self.assertEqual(0, out["lateFiles"])
         text = MODULE.read_text(encoding="utf-8")
-        body = text[text.index("function Test-GuiSmokeLogProgressStalled"):text.index("function Wait-GuiSmokeProcessBounded")]
-        self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", body, "an absolute endpoint is taken at function entry")
-        self.assertLess(body.index("[System.Diagnostics.Stopwatch]::StartNew()"), body.index("Finished.WaitOne("))
-        self.assertIn("$BudgetRemainingMs - ", body, "the wait is re-derived from the entry stopwatch just before WaitOne")
+        body = text[text.index("function Test-GuiSmokeLogProgressStalled"):text.index("# r10 (adversary 3534e113 A1)")]
+        # -2 r1: no entry stopwatch and no carried remainder: the probe wait is D minus the time since the watch's launch stamp, read just before WaitOne
+        self.assertNotIn("Stopwatch]::StartNew()", body)
+        self.assertNotIn("BudgetRemainingMs", body)
+        self.assertIn("[double]$DeadlineMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch)", body)
+        self.assertLess(body.index("[double]$DeadlineMs - (Get-GuiSmokeSinceLaunchMs"), body.index("Finished.WaitOne("))
 
     # adversary b0a33ba9 A4 (r4): the early no-progress stop must not also print the whole-timeout message.
     def test_runner_prints_the_no_progress_message_alone_for_a_no_progress_stop(self) -> None:
@@ -486,13 +495,13 @@ class NewLogAnnouncedMidRunIsASignOfLife(unittest.TestCase):
 $dir = Join-Path $env:GS_TMP 'freshannounce'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-a.log') -Value ('x' * 100) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeOpenDelayMs 30000 -ProbeWaitMs 300
-# an armed watch whose app log (a) has been quiet for longer than the window, as after a stall the watchdog has not yet judged
-$w.Files['mlvapp-a.log'] = [int64]100; $w.Armed = $true; $w.Quiet.Restart()
+# an armed watch whose app log (a) has been quiet for longer than the window, as after a stall the watchdog has not yet judged (-2 r1: P is set to now)
+$w.Files['mlvapp-a.log'] = [int64]100; $w.Armed = $true; $w.LastProgressMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp
 Start-Sleep -Milliseconds 1500
-$quietBefore = [int]$w.Quiet.ElapsedMilliseconds
+$quietBefore = [int]((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $w.LastProgressMs)
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-b.log') -Value ('y' * 100) -NoNewline
 $stalledAtAnnouncement = [bool](Test-GuiSmokeLogProgressStalled -Watch $w)
-$quietAfter = [int]$w.Quiet.ElapsedMilliseconds
+$quietAfter = [int]((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $w.LastProgressMs)
 $known = @($w.Files.Keys) -contains 'mlvapp-b.log'
 Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ stalledAtAnnouncement = $stalledAtAnnouncement; quietBefore = $quietBefore; quietAfter = $quietAfter; known = $known } | ConvertTo-Json -Compress
@@ -508,11 +517,11 @@ $dir = Join-Path $env:GS_TMP 'delayedbaseline'; New-Item -ItemType Directory -Fo
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-a.log') -Value ('x' * 100) -NoNewline
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-b.log') -Value ('y' * 100) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 600000 -ProbeOpenDelayMs 1500 -ProbeWaitMs 300
-$w.Files['mlvapp-a.log'] = [int64]100; $w.Armed = $true; $w.Quiet.Restart()
+$w.Files['mlvapp-a.log'] = [int64]100; $w.Armed = $true; $w.LastProgressMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp
 $sw = [Diagnostics.Stopwatch]::StartNew(); $quietAtRead = -1
 while ($sw.ElapsedMilliseconds -lt 15000 -and $quietAtRead -lt 0) {
     [void](Test-GuiSmokeLogProgressStalled -Watch $w)
-    if ($w.Files.ContainsKey('mlvapp-b.log') -and [int64]$w.Files['mlvapp-b.log'] -ge 0) { $quietAtRead = [int]$w.Quiet.ElapsedMilliseconds }
+    if ($w.Files.ContainsKey('mlvapp-b.log') -and [int64]$w.Files['mlvapp-b.log'] -ge 0) { $quietAtRead = [int]((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $w.LastProgressMs) }
     Start-Sleep -Milliseconds 100
 }
 Stop-GuiSmokeLogProgressWatch -Watch $w
@@ -543,7 +552,9 @@ _WAIT_REGION = ("$noProgressOverrideMs = if", "\n$stdout = $processBoundary.stdo
 
 _RUNNER_HARNESS = r"""
 function Get-HostLoadSnapshot { param($TopProcessCount, $SubjectProcess, [switch]$SkipEvidenceCollection) [pscustomobject]@{ sample = 1 } }
-$ProcessTimeoutMs = 3600000; $NoProgressTimeoutMs = 0; $LegHardLimitAllowanceMs = 1000
+$ProcessTimeoutMs = 3600000; $NoProgressTimeoutMs = 0
+# -2 r1: GS_ALLOW_MS widens the hard deadline (H = 2000 + allowance) for a test that needs a scaled H with room for a late arming
+$LegHardLimitAllowanceMs = if ($env:GS_ALLOW_MS) { [int]$env:GS_ALLOW_MS } else { 1000 }
 $derivedProcessTimeoutMs = 2000
 $HostLoadSampleIntervalMs = [int]$env:GS_SAMPLE_MS; $HostLoadTopProcessCount = 3
 $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
@@ -566,7 +577,8 @@ $waitedMs = [int]$sw.ElapsedMilliseconds
 $alive = -not $process.HasExited
 if ($alive) { $process.Kill($true) }
 [pscustomobject]@{ hardLimitMs = $hardLimitMs; waitedMs = $waitedMs; timedOut = [bool]$processBoundary.timedOut; outcome = [string]$processBoundary.outcome
-    timeoutMs = [int]$processBoundary.timeoutMs; exitCode = [int]$processBoundary.exitCode; alive = $alive; samples = $hostLoadDuringSamples.Count } | ConvertTo-Json -Compress
+    timeoutMs = [int]$processBoundary.timeoutMs; exitCode = [int]$processBoundary.exitCode; alive = $alive; samples = $hostLoadDuringSamples.Count
+    loopEndMs = [int]$hostLoadSampleLoopElapsedMs; expiryMs = $noProgressWatch.ExpiryMs; armed = [bool]$noProgressWatch.Armed } | ConvertTo-Json -Compress
 """
 
 _NEVER_EXITS_NO_LOG = "Start-Sleep -Seconds 20"
@@ -815,8 +827,9 @@ class OwnerInputLegSilenceWindowKeepsTheReadAllowance(unittest.TestCase):
 
     def test_the_runner_hands_an_accepted_owner_read_allowance_to_the_silence_window(self) -> None:
         # the adversary's input: runner -LegHardLimitAllowanceMs 1272000 (120 s setup/teardown + 1152 s read) under a 1285000 ms hard deadline.
-        # r16 (fable key3 r15 B1): the window keeps the whole read allowance the deadline leaves room for, and sits 1000 ms BELOW the deadline (it equalled it)
-        self.assertEqual(1285000 - 1000, self._runner_window(1272000), "the silence watchdog killed a healthy load at 247 s: it did not keep the read allowance")
+        # r16 (fable key3 r15 B1): the window keeps the whole read allowance the deadline leaves room for, and sits BELOW the deadline (it equalled it).
+        # -2 r1: the cap is L = H - M, M = probe wait 1000 + 1000 (r16 pinned H - 1000)
+        self.assertEqual(1285000 - 2000, self._runner_window(1272000), "the silence watchdog killed a healthy load at 247 s: it did not keep the read allowance")
         self.assertGreater(self._runner_window(1272000), 187000 + 60000 + 600000, "a 400 s silent load is still inside the load window")
 
     def test_a_leg_with_no_declared_allowance_keeps_its_leg_budget_window(self) -> None:
@@ -859,7 +872,8 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
         self.assertEqual(5, wait.count(record), "both branches record it at the expiry of the wait and at each stall verdict, from the process's own lifetime (r11 fix 6: bounded by the monotonic launch stamp)")
         self.assertNotIn("$waitBudgetExhausted = $true", wait, "elapsed time alone never says the app was still running at the deadline (r10 sol A1, 3534e113)")
         self.assertIn("-DeadlineReached:$waitBudgetExhausted", wait)
-        for marker in ("if ($hostLoadRemainingMs -le 0) {", "if ($noProgressRemainingMs -le 0) {"):
+        # -2 r1: the expiry of the wait is the chunk helper's 0 (D reached), read at the wait
+        for marker in ("if ($hostLoadChunkMs -le 0) {", "if ($noProgressChunkWaitMs -le 0) {"):
             start = wait.index(marker)
             self.assertIn(record, wait[start:wait.index("break", start)], marker)
 
@@ -1140,7 +1154,8 @@ $anHourAgo = [Diagnostics.Stopwatch]::GetTimestamp() - [int64](3600 * $hz)
         self.assertIn("Get-GuiSmokeExitBudgetVerdict -BudgetMs $BudgetMs -LastAliveMs $LastAliveMs -ExitSeenByMs $seenByMs", body)
         wait = code[code.index("function Wait-GuiSmokeProcessBounded"):]
         self.assertNotIn("LaunchUtc", wait)
-        self.assertIn("Get-GuiSmokeExitBudgetVerdict -BudgetMs $LifetimeBudgetMs -LastAliveMs $LastAliveMs -ExitSeenByMs $exitSeenByMs", wait)
+        # -2 r1: the boundary's local bound is $exitBoundMs (PowerShell names are case-insensitive, so it cannot share the -ExitSeenByMs parameter's name)
+        self.assertIn("Get-GuiSmokeExitBudgetVerdict -BudgetMs $LifetimeBudgetMs -LastAliveMs $LastAliveMs -ExitSeenByMs $exitBoundMs", wait)
 
     def test_the_runner_reads_the_launch_instant_before_the_launch_and_hands_it_to_every_judging_call(self) -> None:
         # the monotonic stamp is read before Process.Start (the time since it bounds the life from above); $startUtc stays the receipt's wall stamp, read before
@@ -1203,16 +1218,17 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
 $dir = Join-Path $env:GS_TMP 'spentbudget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
-$arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 20000)
+$arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
 Start-Sleep -Milliseconds 300
 $w.ProbeDelayMs = 1500
-$stalledWithBudgetLeft = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 20000)
+$stalledWithBudgetLeft = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
 Stop-GuiSmokeLogProgressWatch -Watch $w
 $w2 = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
-[void](Test-GuiSmokeLogProgressStalled -Watch $w2 -BudgetRemainingMs 20000)
+[void](Test-GuiSmokeLogProgressStalled -Watch $w2 -DeadlineMs 20000)
 Start-Sleep -Milliseconds 300
 $w2.ProbeDelayMs = 1500
-$stalledPastBudget = [bool](Test-GuiSmokeLogProgressStalled -Watch $w2 -BudgetRemainingMs 200)
+# -2 r1: a deadline 200 ms after this moment, on the watch's launch clock (the old -BudgetRemainingMs 200)
+$stalledPastBudget = [bool](Test-GuiSmokeLogProgressStalled -Watch $w2 -DeadlineMs ([int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w2.LaunchTimestamp) + 200))
 Stop-GuiSmokeLogProgressWatch -Watch $w2
 [pscustomobject]@{ arm = $arm; armed = [bool]$w.Armed; stalledWithBudgetLeft = $stalledWithBudgetLeft; stalledPastBudget = $stalledPastBudget } | ConvertTo-Json -Compress
 """)
@@ -1266,12 +1282,14 @@ class TheProcessBudgetIsSpentFromTheLaunchNotFromALoopStopwatch(unittest.TestCas
         wait = _runner_snippet(*_WAIT_REGION)
         self.assertNotIn("Stopwatch]::StartNew()", wait, "a stopwatch started after the launch is a second budget clock")
         self.assertNotIn("LoopStopwatch", wait)
-        for remaining in ("$hostLoadRemainingMs = [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)",
-                          "$noProgressRemainingMs = [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)",
-                          "$hostLoadSampleLoopElapsedMs = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)"):
-            self.assertIn(remaining, wait)
-        self.assertEqual(3, wait.count("-BudgetRemainingMs ([Math]::Max(0, [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)))"),
-                         "all three probe sites take the remainder from the launch")
+        # -2 r1: no remainder is carried from one statement to a later one: the chunk helper reads the launch clock at the wait, the probe takes D itself,
+        # and the finalize computes its own wait (the precomputed $hostLoadFinalizeTimeoutMs is gone)
+        self.assertEqual(2, wait.count("-LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs"))
+        self.assertIn("$hostLoadSampleLoopElapsedMs = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)", wait)
+        for gone in ("$hostLoadRemainingMs", "$noProgressRemainingMs", "$hostLoadFinalizeTimeoutMs", "-BudgetRemainingMs"):
+            self.assertNotIn(gone, wait)
+        self.assertEqual(3, wait.count("Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs"),
+                         "all three probe sites take the hard deadline on the launch clock")
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
@@ -1370,24 +1388,27 @@ $logRoot = $env:GS_TMP
         self.assertEqual(3600000, out["hard"])
         self.assertLess(out["leg"], out["hard"], "the leg window equalled the hard deadline: the watchdog could never fire first")
         self.assertLess(out["load"], out["hard"], "the load window equalled the hard deadline: the watchdog could never fire first")
+        # -2 r1: capped at L = H - M (M = 2000 at the default probe wait); r16 had H - 1000 = 3599000
+        self.assertEqual(3600000 - 2000, out["load"])
         # a leg whose log stops after its load (the incident) is judged on the leg's own window: minutes, not the hour
         self.assertEqual(187000 + 60000, out["leg"])
         self.assertLessEqual(out["leg"], 300000)
 
     def test_after_the_first_growth_a_stopped_log_is_judged_on_the_leg_window_not_the_load_window(self) -> None:
         # scaled: load window 30 s, leg window 600 ms. The app writes its first line (arms), writes again (the load is over), then stops.
+        # -2 r1: the load ends on the `gui_smoke.` marker that growth carries (the incident's gui_smoke.foreground_request line), not on any growth
         out = run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'loadspent'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $log = Join-Path $dir 'mlvapp-1.log'
 Set-Content -LiteralPath $log -Value ('x' * 100) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 600 -LoadWindowMs 30000 -ProbeWaitMs 2000
-$arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+$arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
 Start-Sleep -Milliseconds 900
-$quietLoad = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+$quietLoad = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
 Add-Content -LiteralPath $log -Value 'gui_smoke.foreground_request requested=1 verified=1'
-$grew = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+$grew = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
 Start-Sleep -Milliseconds 900
-$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 60000)
 $active = [int64]$w.ActiveWindowMs
 Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ arm = $arm; quietLoad = $quietLoad; grew = $grew; stalled = $stalled; active = $active } | ConvertTo-Json -Compress
@@ -1405,6 +1426,255 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         self.assertLess(wait.index("$noProgressWindowMs = [int64]$noProgressWatch.ActiveWindowMs"), wait.index("$processBoundary = Wait-GuiSmokeProcessBounded"))
         source = RUNNER.read_text(encoding="utf-8")
         self.assertNotIn("so it does not widen with a caller's -ProcessTimeoutMs", source, "fable key3 r15 B1: that comment was false for the owner-input leg")
+
+
+_INVARIANT = "No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL)."
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TheSilenceModelIsLaunchAnchored(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1: r1-r16 of -1 built the silence wait from DURATIONS (a quiet stopwatch, a remaining budget handed from call to
+    call, a finalize remainder computed before the call) and fixed one clock instance per round. One launch-anchored model replaces them: every time is ms
+    since the runner's launch stamp; L = max(min(1000, H), H - M) with M = ProbeWaitMs + 1000; E = min(L, max(WL, P + W)) while LOADING and min(L, P + W)
+    once LOADED. INVARIANT: "No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL)."
+    """
+
+    _H = (1000, 2500, 133000, 1285000, 3600000)
+
+    def test_the_invariant_holds_over_the_property_table(self) -> None:
+        out = run_ps(r"""
+$rows = [System.Collections.Generic.List[object]]::new()
+foreach ($h in 1000, 2500, 133000, 1285000, 3600000) {
+    $l = Get-GuiSmokeWatchdogLimitMs -HardMs $h -ProbeWaitMs 1000
+    foreach ($override in $false, $true) {
+        # the runner's own derivation: leg 187000, the generator's largest read allowance, an override of the whole hard deadline (the widest it can ask)
+        $o = if ($override) { $h } else { 0 }
+        $w = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 187000 -OverrideMs $o -CeilingMs $l
+        $wl = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs 187000 -OverrideMs $o -CeilingMs $l -ReadAllowanceMs 3480000
+        foreach ($p in 0, 1, 1000, 4000, [Math]::Floor($h / 2), ($h - $w), ($h - 2000), ($h - 1000), ($h - 1), $h) {
+            $pp = [Math]::Max(0, $p)
+            foreach ($loaded in $false, $true) {
+                $e = Get-GuiSmokeSilenceExpiryMs -LimitMs $l -WindowMs $w -LoadWindowMs $wl -LastProgressMs $pp -Loaded:$loaded
+                $rows.Add([pscustomobject]@{ h = $h; l = $l; w = $w; wl = $wl; p = $pp; loaded = $loaded; override = $override; e = $e })
+            }
+        }
+    }
+}
+[pscustomobject]@{ rows = @($rows) } | ConvertTo-Json -Compress -Depth 4
+""")
+        rows = out["rows"]
+        self.assertEqual(5 * 2 * 10 * 2, len(rows), "H x override x P x Loaded")
+        for r in rows:
+            label = "H=%(h)s P=%(p)s loaded=%(loaded)s override=%(override)s W=%(w)s WL=%(wl)s L=%(l)s E=%(e)s" % r
+            self.assertLessEqual(r["e"], r["l"], "an expiry later than L: " + label)
+            self.assertLessEqual(r["w"], r["l"], label)
+            self.assertLessEqual(r["wl"], r["l"], label)
+            if r["h"] >= 2000 + 1000:
+                self.assertLess(r["l"], r["h"], "L is not below the hard deadline: " + label)
+            if not r["loaded"]:
+                self.assertGreaterEqual(r["e"], min(r["l"], r["wl"]), "a LOADING expiry below min(L, WL): " + label)
+            else:
+                self.assertEqual(min(r["l"], r["p"] + r["w"]), r["e"], label)
+
+    def test_the_limit_and_expiry_helpers_are_the_one_copy_of_the_arithmetic(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn(_INVARIANT, text, "the invariant sentence is stated verbatim in the module header")
+        self.assertIn(_INVARIANT, self.__class__.__doc__ or "")
+        exports = code.split("Export-ModuleMember", 1)[1]
+        for name in ("Get-GuiSmokeWatchdogLimitMs", "Get-GuiSmokeSilenceExpiryMs", "Get-GuiSmokeChunkWaitMs", "Get-GuiSmokeLogProgressExpiryMs"):
+            self.assertIn(name, exports)
+        # the watch's E comes from the helper; the probe wait and the verdict read the launch clock, never a stopwatch
+        watch = code[code.index("function Get-GuiSmokeLogProgressExpiryMs"):code.index("function Stop-GuiSmokeLogProgressWatch")]
+        self.assertIn("Get-GuiSmokeSilenceExpiryMs -LimitMs", watch)
+        stalled = code[code.index("function Test-GuiSmokeLogProgressStalled"):code.index("function Get-GuiSmokeProcessLifetimeMs")]
+        self.assertIn("$Watch.ExpiryMs = Get-GuiSmokeLogProgressExpiryMs -Watch $Watch", stalled)
+        self.assertNotIn("Stopwatch]::StartNew", code, "no stopwatch in the module: every clock is the launch stamp")
+        self.assertNotIn(".Restart(", code)
+        self.assertNotIn("Quiet", code)
+        self.assertEqual(1, code.count("+ $WindowMs"), "P + W is computed once, in Get-GuiSmokeSilenceExpiryMs")
+        self.assertEqual(1, code.count("$ProbeWaitMs + 1000"), "M is computed once, in Get-GuiSmokeWatchdogLimitMs")
+        wait = _runner_snippet(*_WAIT_REGION)
+        self.assertIn("-LimitMs $noProgressLimitMs -LaunchTimestamp $startTimestamp -ProbeWaitMs $noProgressProbeWaitMs", wait)
+        self.assertNotIn("WindowMs +", wait)
+        self.assertNotIn("+ $noProgress", wait)
+
+    def test_the_chunk_wait_lands_on_the_expiry_and_never_passes_the_deadline(self) -> None:
+        out = run_ps(r"""
+$hz = [Diagnostics.Stopwatch]::Frequency
+$at = { param($ms) [Diagnostics.Stopwatch]::GetTimestamp() - [int64]($ms * $hz / 1000) }
+[pscustomobject]@{
+    unarmed = Get-GuiSmokeChunkWaitMs -ChunkMs 4000 -LaunchTimestamp (& $at 1000) -DeadlineMs 600000 -ExpiryMs -1
+    toExpiry = Get-GuiSmokeChunkWaitMs -ChunkMs 4000 -LaunchTimestamp (& $at 1000) -DeadlineMs 600000 -ExpiryMs 2000
+    expiryPassed = Get-GuiSmokeChunkWaitMs -ChunkMs 4000 -LaunchTimestamp (& $at 5000) -DeadlineMs 600000 -ExpiryMs 2000
+    toDeadline = Get-GuiSmokeChunkWaitMs -ChunkMs 4000 -LaunchTimestamp (& $at 599000) -DeadlineMs 600000 -ExpiryMs -1
+    deadlinePassed = Get-GuiSmokeChunkWaitMs -ChunkMs 4000 -LaunchTimestamp (& $at 600500) -DeadlineMs 600000 -ExpiryMs 900000
+} | ConvertTo-Json -Compress
+""")
+        self.assertEqual(4000, out["unarmed"])
+        self.assertTrue(950 <= out["toExpiry"] <= 1000, out)
+        self.assertEqual(1, out["expiryPassed"], "an expiry already passed is checked after a 1 ms look, never skipped")
+        self.assertTrue(950 <= out["toDeadline"] <= 1000, out)
+        self.assertEqual(0, out["deadlinePassed"], "no wait starts once D is reached")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TheLoadAllowanceEndsOnTheGuiSmokeMarker(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary r16 A1, major): r16 ended the load allowance at ANY growth after arming, so the generated
+    owner-input leg (24 GiB at 32 MB/s, hard 1285000 ms, allowance 1272000 ms) that logs one start-up line and then loads silently was killed at about
+    255 s. The phase is now LOADING until the app logs the ASCII bytes `gui_smoke.` (MainWindow logs interaction_trace event=gui_smoke.playback_policy
+    once openMlvSet returns), and LOADED from then on (one-way)."""
+
+    def test_a_start_up_growth_does_not_end_the_load_allowance(self) -> None:
+        # scaled: W = 1500, WL = 6000; the log exists, grows once about 0.5 s after arming, then stays silent; judged at about 3 s since launch
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'startupgrowth'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value 'Qt start-up line' -NoNewline
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
+$since = { [double]([Diagnostics.Stopwatch]::GetTimestamp() - $launch) * 1000.0 / [Diagnostics.Stopwatch]::Frequency }
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1500 -LoadWindowMs 6000 -ProbeWaitMs 300
+$stalledAt = -1; $armedAt = -1; $grownAt = -1
+while ((& $since) -lt 3000 -and $stalledAt -lt 0) {
+    if (Test-GuiSmokeLogProgressStalled -Watch $w) { $stalledAt = [int](& $since) }
+    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int](& $since) }
+    if ($armedAt -ge 0 -and $grownAt -lt 0 -and (& $since) -ge $armedAt + 500) { Add-Content -LiteralPath $log -Value 'a start-up growth line'; $grownAt = [int](& $since) }
+    Start-Sleep -Milliseconds 100
+}
+$credited = [int64]$w.Files['mlvapp-1.log']
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ stalledAt = $stalledAt; armedAt = $armedAt; grownAt = $grownAt; credited = $credited; phase = $w.Phase; expiry = $w.ExpiryMs } | ConvertTo-Json -Compress
+""")
+        self.assertGreaterEqual(out["armedAt"], 0)
+        self.assertGreaterEqual(out["grownAt"], 0)
+        self.assertGreater(out["credited"], len("Qt start-up line"), "the growth was credited")
+        self.assertEqual(-1, out["stalledAt"], "a start-up growth with no gui_smoke. line ended the load allowance: stalled at %s ms since launch, %s ms after the growth"
+                         % (out["stalledAt"], out["stalledAt"] - out["grownAt"]))
+        self.assertEqual("LOADING", out["phase"])
+        self.assertGreaterEqual(out["expiry"], 6000 - 50, "while loading E is never below min(L, WL)")
+
+    def test_the_gui_smoke_marker_switches_the_watch_to_loaded_and_the_leg_window(self) -> None:
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'marker'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value 'start' -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs 30000 -ProbeWaitMs 1000
+function Poll-Until([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 8000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+Poll-Until { $w.Armed -and $null -eq $w.Pending }
+$len0 = [int64]$w.Files['mlvapp-1.log']
+Add-Content -LiteralPath $log -Value 'a plain growth line without the marker'
+Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len0 -and $null -eq $w.Pending }
+$plain = [pscustomobject]@{ phase = $w.Phase; expiry = $w.ExpiryMs; p = $w.LastProgressMs; active = $w.ActiveWindowMs }
+# a marker split across two reads: the probe re-reads the 16 bytes before the previous high-water mark
+$len1 = [int64]$w.Files['mlvapp-1.log']
+Add-Content -LiteralPath $log -Value 'interaction_trace event=gui_sm' -NoNewline
+Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len1 -and $null -eq $w.Pending }
+$half = [string]$w.Phase
+$len2 = [int64]$w.Files['mlvapp-1.log']
+Add-Content -LiteralPath $log -Value 'oke.playback_policy mode=realtime'
+Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len2 -and $null -eq $w.Pending }
+$marked = [pscustomobject]@{ phase = $w.Phase; expiry = $w.ExpiryMs; p = $w.LastProgressMs; active = $w.ActiveWindowMs }
+Start-Sleep -Milliseconds 1000
+$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w)
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ plain = $plain; half = $half; marked = $marked; stalled = $stalled } | ConvertTo-Json -Compress -Depth 4
+""")
+        plain, marked = out["plain"], out["marked"]
+        self.assertEqual("LOADING", plain["phase"], "growth without gui_smoke. keeps the watch LOADING")
+        self.assertEqual(20000, plain["active"])
+        self.assertAlmostEqual(min(30000, max(20000, plain["p"] + 800)), plain["expiry"], delta=0.01)
+        self.assertEqual("LOADING", out["half"], "half a marker is not the marker")
+        self.assertEqual("LOADED", marked["phase"], "interaction_trace event=gui_smoke.playback_policy switches the watch to LOADED (split across two reads)")
+        self.assertEqual(800, marked["active"])
+        self.assertAlmostEqual(min(30000, marked["p"] + 800), marked["expiry"], delta=0.01, msg="once LOADED, E = min(L, P + W)")
+        self.assertTrue(out["stalled"], "a LOADED log silent past P + W is a stall")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary r16 A3, major): r16 anchored the quiet clock at the FIRST observation of the log, so a window of
+    H - 1000 armed at 4 s expired at about H + 3000 (owner leg 3603000 ms of 3600000; fixture 136000 ms of 133000): the whole budget always ran out first.
+    The r16 test compared durations; these compare TIMES SINCE LAUNCH. The runner's own derivation and wait region run as written, with H = 8000
+    (leg 2000 + allowance 6000), M = 2000, L = 6000, and the app's first log line written at about 2 s."""
+
+    _DELAYED_ARMING = "Start-Sleep -Milliseconds 2000; Add-Content -LiteralPath $env:GS_LOG -Value 'first line'; Start-Sleep -Seconds 30"
+
+    def _run(self, sample_ms: int) -> dict:
+        return run_ps(_RUNNER_HARNESS, GS_STUB=self._DELAYED_ARMING, GS_SAMPLE_MS=str(sample_ms), GS_ALLOW_MS="6000",
+                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION))
+
+    def _assert_fires_before_the_deadline(self, out: dict, branch: str) -> None:
+        hard, margin = 8000, 2000
+        self.assertEqual(hard, out["hardLimitMs"])
+        self.assertTrue(out["armed"], branch)
+        self.assertEqual("process_no_progress", out["outcome"],
+                         "%s: the silence watchdog armed late never fired before the hard deadline (the loop ended at %s ms since launch)" % (branch, out["loopEndMs"]))
+        self.assertLessEqual(out["expiryMs"], hard - margin, "%s: the expiry, in ms since launch, is later than H - M" % branch)
+        # the verdict follows one probe (at most ProbeWaitMs = M - 1000) after E: it lands no later than H - 1000
+        self.assertLessEqual(out["loopEndMs"], hard - 1000, "%s: the stall verdict, in ms since launch, is later than H - M + ProbeWaitMs" % branch)
+        self.assertTrue(out["timedOut"])
+        self.assertEqual(124, out["exitCode"])
+        self.assertFalse(out["alive"])
+
+    def test_a_late_arming_still_expires_by_h_minus_m_in_the_log_only_branch(self) -> None:
+        self._assert_fires_before_the_deadline(self._run(0), "log-only")
+
+    def test_a_late_arming_still_expires_by_h_minus_m_in_the_host_load_branch(self) -> None:
+        self._assert_fires_before_the_deadline(self._run(500), "host-load")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TheFirstInBudgetExitSightingIsCarriedToTheVerdict(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary r16 A2, major): the runner's chunk wait saw the app exit inside the budget and broke, but dropped
+    that sighting; a runner descheduled before the finalize let the boundary date the exit again PAST the budget, so a clean exit 0 became
+    exit_time_uncertain/125. The first sighting is now carried (-ExitSeenByMs) and the boundary never dates the exit again. A real exited stub stands in
+    for the FakeProc here: Process.ExitCode is not virtual, so a FakeProc cannot carry the native exit this test must see kept."""
+
+    def test_a_carried_in_budget_sighting_keeps_the_native_exit_although_the_finalize_runs_past_the_budget(self) -> None:
+        out = run_ps(r"""
+$s = New-Stub 'exit 7'
+[void]$s.p.WaitForExit(30000)
+# the launch was 2.1 s ago against a 1000 ms budget: now is past it; the app was last seen running at 500 ms and its exit was first seen at 900 ms
+$launch = [Diagnostics.Stopwatch]::GetTimestamp() - [int64](2.1 * [Diagnostics.Stopwatch]::Frequency)
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 1000 -LifetimeBudgetMs 1000 -LaunchTimestamp $launch -LastAliveMs 500 -ExitSeenByMs 900
+[pscustomobject]@{ outcome = $r.outcome; exitCode = $r.exitCode; timedOut = $r.timedOut; native = $r.nativeExitCode; failures = @($r.failures) } | ConvertTo-Json -Compress
+""")
+        self.assertEqual("exited", out["outcome"], "the boundary dated an exit first seen inside the budget again, after it")
+        self.assertEqual(7, out["exitCode"], "the native exit is kept")
+        self.assertFalse(out["timedOut"])
+
+    def test_the_budget_check_stores_the_first_sighting_and_never_replaces_it(self) -> None:
+        out = run_ps(r"""
+$s = New-Stub 'exit 0'
+[void]$s.p.WaitForExit(30000)
+$launch = [Diagnostics.Stopwatch]::GetTimestamp() - [int64](2.1 * [Diagnostics.Stopwatch]::Frequency)
+$fresh = [double]-1
+$e1 = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 1000 -LaunchTimestamp $launch -LastAliveMs 1500 -ExitSeenByMs ([ref]$fresh)
+$kept = [double]900
+$e2 = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 1000 -LaunchTimestamp $launch -LastAliveMs 0 -ExitSeenByMs ([ref]$kept)
+$e3 = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 1000 -LaunchTimestamp $launch -LastAliveMs 0
+[pscustomobject]@{ e1 = [bool]$e1; fresh = $fresh; e2 = [bool]$e2; kept = $kept; e3 = [bool]$e3 } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["e1"], "seen running past the budget: a deadline hit")
+        self.assertGreaterEqual(out["fresh"], 2000, "the sighting this call made is stored in the carrier")
+        self.assertFalse(out["e2"], "a carried in-budget sighting is not a deadline hit")
+        self.assertEqual(900, out["kept"], "a sighting once set is never replaced")
+        self.assertFalse(out["e3"], "no carrier: unchanged (an exit seen only after the budget is uncertain, not a deadline hit here)")
+
+    def test_the_runner_records_the_first_sighting_at_every_exit_and_hands_it_to_the_boundary(self) -> None:
+        wait = _runner_snippet(*_WAIT_REGION)
+        self.assertIn("$exitSeenByMs = [double]-1", wait)
+        for chunk in ("$process.WaitForExit($hostLoadChunkMs)", "$process.WaitForExit($noProgressChunkWaitMs)"):
+            start = wait.index(chunk)
+            self.assertIn("if ($exitSeenByMs -lt 0) { $exitSeenByMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp }", wait[start:wait.index("break", start)], chunk)
+        self.assertEqual(5, wait.count("-ExitSeenByMs ([ref]$exitSeenByMs)"), "every budget check carries the sighting by reference")
+        self.assertEqual(wait.count("Test-GuiSmokeWaitBudgetExhausted -Process $process"), wait.count("-ExitSeenByMs ([ref]$exitSeenByMs)"))
+        call = wait[wait.index("$processBoundary = Wait-GuiSmokeProcessBounded"):]
+        self.assertIn("-ExitSeenByMs $exitSeenByMs", call)
+        text = MODULE.read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        boundary = code[code.index("function Wait-GuiSmokeProcessBounded"):]
+        self.assertIn("$exitBoundMs = if ($ExitSeenByMs -ge 0) { $ExitSeenByMs }", boundary)
 
 
 if __name__ == "__main__":

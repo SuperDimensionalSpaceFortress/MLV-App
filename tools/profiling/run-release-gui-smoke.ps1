@@ -1995,18 +1995,21 @@ $stderrTask = $process.StandardError.ReadToEndAsync()
 $hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
 # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1: a leg whose app log stops advancing (one stopped at gui_smoke.foreground_request and held the venue for the
 # whole 3600 s) is ended after a no-progress window, not after the caller's whole process budget. The watch arms at the app's first log line; before
-# that only the whole budget bounds the wait. r16 (fable key3 r15 B1): two windows, both derived from the leg and both STRICTLY below the hard deadline
-# H = $effectiveProcessTimeoutMs, so the watchdog can fire first on every leg shape the generator emits (r9-r15 put the owner read allowance into the
-# one window at all times, so for every generated owner-input job it equalled H and could never fire):
-#   leg window  W  = min(leg + 60000, max(min(1000, H), H - 1000))                           leg = $derivedProcessTimeoutMs
-#   load window WL = min(leg + 60000 + max(0, A - 120000), max(min(1000, H), H - 1000))     A   = -LegHardLimitAllowanceMs (setup 120 s + read)
-# WL covers only the app's FIRST silent stretch after the watch arms (a synchronous load of the owner input writes no log line, r9); the first log
-# growth after arming ends it and W applies from then on. An explicit -NoProgressTimeoutMs replaces both and is capped at H.
+# that only the whole budget bounds the wait.
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1: ONE launch-anchored model (gui-smoke-process-boundary.psm1 header). Every time is ms since $startTimestamp:
+#   D = H = $effectiveProcessTimeoutMs; M = probe wait + 1000; L = max(min(1000, H), H - M)                     Get-GuiSmokeWatchdogLimitMs
+#   leg window  W  = min(leg + 60000, L)                                    leg = $derivedProcessTimeoutMs
+#   load window WL = min(leg + 60000 + max(0, A - 120000), L)               A   = -LegHardLimitAllowanceMs (setup 120 s + read)
+#   an explicit -NoProgressTimeoutMs replaces both and is capped at the same L (one invariant, no exception)
+#   E = min(L, max(WL, P + W)) while the app is LOADING (no `gui_smoke.` line yet), min(L, P + W) once it is LOADED       Get-GuiSmokeSilenceExpiryMs
+# No silence expiration is later than L = D - M, whatever time the watch arms; while loading, E is never below min(L, WL).
 # r4 (adversary b0a33ba9 A5): an explicit -NoProgressTimeoutMs below 1000 ms is clamped up to 1000 ms (0 stays "derived from the leg")
 $noProgressOverrideMs = if ($NoProgressTimeoutMs -gt 0) { [Math]::Max(1000, $NoProgressTimeoutMs) } else { 0 }
-$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $effectiveProcessTimeoutMs -BelowCeilingMs 1000
-$noProgressLoadWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $effectiveProcessTimeoutMs -BelowCeilingMs 1000 -ReadAllowanceMs ([Math]::Max(0, $LegHardLimitAllowanceMs - 120000))
-$noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noProgressWindowMs -LoadWindowMs $noProgressLoadWindowMs
+$noProgressProbeWaitMs = 1000
+$noProgressLimitMs = Get-GuiSmokeWatchdogLimitMs -HardMs $effectiveProcessTimeoutMs -ProbeWaitMs $noProgressProbeWaitMs
+$noProgressWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $noProgressLimitMs
+$noProgressLoadWindowMs = Get-GuiSmokeNoProgressWindowMs -LegBudgetMs $derivedProcessTimeoutMs -OverrideMs $noProgressOverrideMs -CeilingMs $noProgressLimitMs -ReadAllowanceMs ([Math]::Max(0, $LegHardLimitAllowanceMs - 120000))
+$noProgressWatch = New-GuiSmokeLogProgressWatch -LogRoot $logRoot -WindowMs $noProgressWindowMs -LoadWindowMs $noProgressLoadWindowMs -LimitMs $noProgressLimitMs -LaunchTimestamp $startTimestamp -ProbeWaitMs $noProgressProbeWaitMs
 # r3 (adversary 797947a7 A2): no chunked wait may outlast a fraction of the window, or a short window would permit one chunk (up to 60 s) of silence.
 $noProgressChunkMs = Get-GuiSmokeNoProgressChunkMs -WindowMs $noProgressWindowMs
 $noProgressStalled = $false
@@ -2014,33 +2017,35 @@ $noProgressStalled = $false
 # outlived the budget before exiting), judged from the process's own lifetime, never from elapsed time alone; the finalize wait below then treats
 # a late exit as the timeout it is, while an app that exited inside the budget keeps its native exit classification.
 $waitBudgetExhausted = $false
-# r16 (sol r15 B1, B2): ONE clock for the whole budget, the monotonic launch stamp $startTimestamp (read just before Process.Start). Every remainder below
-# (each chunk wait, each probe, the finalize) is the whole budget minus the time since LAUNCH, never since a loop stopwatch started after the launch, so
-# setup time between the launch and the loop is spent from the budget and no wait or probe starts once it is gone. $lastAliveMs is the app's last
-# monotonic sighting running: the time read just BEFORE a chunk wait that then timed out (the app was running at that wait's end, so at that earlier
-# instant too). With the moment an exit is seen, it brackets the exit on that one clock; no wall-clock reading judges the exit.
+# r16 (sol r15 B1, B2): ONE clock for the whole budget, the monotonic launch stamp $startTimestamp (read just before Process.Start). -2 r1: no remainder is
+# carried from one statement to a later one: each chunk wait is read from the launch stamp at the call (Get-GuiSmokeChunkWaitMs: min(chunk, D - now,
+# max(1, E - now)), 0 once D is reached), each probe takes D itself, and the finalize computes its own wait. $lastAliveMs is the app's last monotonic
+# sighting running: the time read just BEFORE a chunk wait that then timed out (the app was running at that wait's end, so at that earlier instant too).
+# -2 r1 (adversary r16 A2): $exitSeenByMs is the FIRST monotonic sighting of the exit (-1 = none), kept once set: read right after a chunk wait that saw
+# the exit, or stored by Test-GuiSmokeWaitBudgetExhausted when it sees one; the boundary judges the exit from it and never dates it again.
 $lastAliveMs = [double]0
+$exitSeenByMs = [double]-1
 if ($HostLoadSampleIntervalMs -gt 0) {
     $hostLoadLastSampleAtMs = [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)
     while ($true) {
-        $hostLoadRemainingMs = [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)
-        if ($hostLoadRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs
+        $aliveCheckMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp
+        $hostLoadChunkMs = Get-GuiSmokeChunkWaitMs -ChunkMs ([Math]::Min($HostLoadSampleIntervalMs, $noProgressChunkMs)) -LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs
+        if ($hostLoadChunkMs -le 0) {
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs)
             break
         }
-        $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, [Math]::Min($hostLoadRemainingMs, $noProgressChunkMs))
-        $aliveCheckMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp
         if ($process.WaitForExit($hostLoadChunkMs)) {
+            if ($exitSeenByMs -lt 0) { $exitSeenByMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp }
             break
         }
         $lastAliveMs = $aliveCheckMs
         # r3: the chunk can now be shorter than the sampling interval (it follows the no-progress window), so a sample is taken only once the
         # configured -HostLoadSampleIntervalMs has passed since the last one; the host-load cadence is unchanged.
         if (([int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) - $hostLoadLastSampleAtMs) -lt $HostLoadSampleIntervalMs) {
-            if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)))) {
+            if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
                 $noProgressStalled = $true
                 # r15 (adversary d872def7 A2): a stall verdict reached at or past the whole budget is judged against it, as the two waiting branches do
-                if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs }
+                if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
                 break
             }
             continue
@@ -2049,9 +2054,9 @@ if ($HostLoadSampleIntervalMs -gt 0) {
         $newSample = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectProcess $process `
             -SkipEvidenceCollection
         $hostLoadDuringSamples.Add($newSample)
-        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)))) {
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
             $noProgressStalled = $true
-            if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs }
+            if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
             break
         }
     }
@@ -2059,19 +2064,20 @@ if ($HostLoadSampleIntervalMs -gt 0) {
 else {
     # interior host-load sampling is off: the same chunked wait, watching the log only
     while ($true) {
-        $noProgressRemainingMs = [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)
-        if ($noProgressRemainingMs -le 0) {
-            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs
+        $aliveCheckMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp
+        $noProgressChunkWaitMs = Get-GuiSmokeChunkWaitMs -ChunkMs $noProgressChunkMs -LaunchTimestamp $startTimestamp -DeadlineMs $effectiveProcessTimeoutMs -ExpiryMs $noProgressWatch.ExpiryMs
+        if ($noProgressChunkWaitMs -le 0) {
+            $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs)
             break
         }
-        $aliveCheckMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp
-        if ($process.WaitForExit([Math]::Min($noProgressChunkMs, $noProgressRemainingMs))) {
+        if ($process.WaitForExit($noProgressChunkWaitMs)) {
+            if ($exitSeenByMs -lt 0) { $exitSeenByMs = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp }
             break
         }
         $lastAliveMs = $aliveCheckMs
-        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -BudgetRemainingMs ([Math]::Max(0, [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)))) {
+        if (Test-GuiSmokeLogProgressStalled -Watch $noProgressWatch -DeadlineMs $effectiveProcessTimeoutMs) {
             $noProgressStalled = $true
-            if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs }
+            if ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp) -ge $effectiveProcessTimeoutMs) { $waitBudgetExhausted = Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs -ExitSeenByMs ([ref]$exitSeenByMs) }
             break
         }
     }
@@ -2080,25 +2086,23 @@ else {
 $hostLoadSampleLoopElapsedMs = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)
 # the worker runspace behind the log probe is released (a probe still hung on a stalled share is abandoned, never waited on)
 Stop-GuiSmokeLogProgressWatch -Watch $noProgressWatch
-# r16: the window in force when the wait ended (the load window until the app's first log growth after arming, the leg window after it) is the one the
-# receipt and the stall prose report
+# the window in force when the wait ended (WL while the app was LOADING, W once it logged `gui_smoke.`) is the one the receipt and the stall prose report
 $noProgressWindowMs = [int64]$noProgressWatch.ActiveWindowMs
-# Whatever time has passed since the launch counts against the overall process timeout budget -- the finalize wait below only needs to cover what's
-# left. The 1ms floor never actually extends an already-finished leg: WaitForExit on an already-exited process returns TRUE immediately regardless of
-# the timeout value passed to it.
-$hostLoadFinalizeTimeoutMs = [Math]::Max(1, $effectiveProcessTimeoutMs - $hostLoadSampleLoopElapsedMs)
+# -2 r1: the finalize computes its own wait from the launch stamp at the call (max(1, H - time since launch)); -TimeoutMs is only its fallback. The 1 ms
+# floor never extends an already-finished leg: WaitForExit on an already-exited process returns TRUE at once.
 $processBoundary = Wait-GuiSmokeProcessBounded `
     -Process $process `
     -StandardOutputTask $stdoutTask `
     -StandardErrorTask $stderrTask `
-    -TimeoutMs $hostLoadFinalizeTimeoutMs `
+    -TimeoutMs $effectiveProcessTimeoutMs `
     -ReportedTimeoutMs $effectiveProcessTimeoutMs `
     -NoProgressStalled:$noProgressStalled `
     -DeadlineReached:$waitBudgetExhausted `
     -NoProgressWindowMs $noProgressWindowMs `
     -LifetimeBudgetMs $effectiveProcessTimeoutMs `
     -LaunchTimestamp $startTimestamp `
-    -LastAliveMs $lastAliveMs
+    -LastAliveMs $lastAliveMs `
+    -ExitSeenByMs $exitSeenByMs
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
