@@ -760,7 +760,7 @@ if ($isExport) {
     $receipt.metrics = $exportEvidence.metrics
     $receipt.export.stages = $exportEvidence.stages
     $receipt.export.problems = @($exportEvidence.problems)
-    # r18 (EXPORT-CDNG-STAGE-CONTAINMENT-1): the CDNG disjoint-stage containment findings, beside the problems and never among them: advisory, no verdict input
+    # (r18's advisory channel, always empty since EXPORT-CDNG-STAGE-CONTAINMENT-1 r1: the CDNG disjoint-stage containment findings are problems again, above)
     $receipt.export.containmentAdvisory = @($exportEvidence.containmentAdvisory)
     # the run IS the leg the receipt names: the hashed summary.json's own identity (the validator checks the same fields)
     $identityProblems = @()

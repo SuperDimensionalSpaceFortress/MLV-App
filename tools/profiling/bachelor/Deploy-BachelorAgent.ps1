@@ -18,7 +18,7 @@
 #   -Source       the agent to deploy. Default: ultra-magnus-agent.ps1 beside this script (the tracked file).
 #   -DryRun       run every check and print what would happen; change nothing (it takes no lock). A refusal is still a refusal.
 #   -RestartMode  none (default) | when-idle. when-idle restarts the agent after a verified deploy, and only when running\
-#                 and inbox\ are still empty and no lease is held at that moment.
+#                 and inbox\ still hold no live job and no lease is held at that moment ("live" = the busy predicate below).
 #   -RestartScript, -TaskXmlFile, -TestCorruptAfterWrite  test seams (see below); not for the venue.
 #
 # What it does, in order (every doubt refuses; nothing is changed before the last refusal check passes)
@@ -28,7 +28,10 @@
 #      this process even if killed). Two deployers on one root could each judge "no previous copy" and one would delete the
 #      other's verified deploy; the second is refused (DEPLOY_REFUSED_LOCKED). A leftover deploy.lock is never removed by this script.
 #   4. the venue copy already has that sha -> DEPLOY_NOOP, exit 0 (idempotent; nothing is touched, busy or not).
-#   5. busy or leased -> typed refusal, nothing changed (table below).
+#   5. busy or leased -> typed refusal, nothing changed (table below). Busy is ONE predicate ($script:LiveWorkRules): an
+#      inbox\*.job.ps1, a running\*.started.json or an unresolved marker tmp, each read with the agent's own call; any other
+#      entry is an ignored leftover (DEPLOY_IGNORED_LEFTOVERS, printed after step 2): not busy, and never deleted, moved or
+#      rewritten by this script (a restarted agent's own startup cleanup still runs; see $script:LiveWorkRules).
 #   6. keep the previous agent at <VenueRoot>\rollback-<utc>\ultra-magnus-agent.ps1 (verified), then write the new agent as
 #      a temp file beside it and rename it over the agent (the old file is never half-written).
 #   7. re-read the venue copy; its sha must equal the source's. Else DEPLOY_SHA_MISMATCH and the rollback copy is put back.
@@ -41,8 +44,10 @@
 #   DEPLOY_DRYRUN action=<deploy|noop> sha=<s> restart=<mode>   0
 #   DEPLOY_OK sha=<s> rollback=<path|none> restarted=<yes|no>    0
 #   DEPLOY_WARN_ARRIVED_DURING_RESTART running=<n> inbox=<n> ... 0  (printed before DEPLOY_OK; see "Residual race")
+#   DEPLOY_IGNORED_LEFTOVERS ignored=<n> (<per folder>) ...      -  (informational, after step 2, only when n > 0; no exit of its own)
 #   DEPLOY_SOURCE_MISSING <path>                                 2
-#   DEPLOY_REFUSED_BUSY running=<n> inbox=<n>                    10  (running\ or inbox\ holds anything)
+#   DEPLOY_REFUSED_BUSY running=<n> inbox=<n> ignored=<n>        10  (running\ or inbox\ holds a live job: the busy predicate, step 5;
+#                                                                     running= and inbox= count live work, ignored= every other entry)
 #   DEPLOY_REFUSED_LEASE <what>                                  11  (slot-holders\ holds a *.lease.json, *.holder.json or
 #                                                                     *.acquired.json: a lease is held or a batch is parked)
 #   DEPLOY_REFUSED_UNREADABLE <why>                              12
@@ -89,7 +94,8 @@
 #   attestation is DEPLOY_RESTART_FAILED, never reported as restarted.
 #   A path with no drive (/bench, \bench) never names a place on Windows: it resolves against another process's current drive.
 #   The root itself must also list (a root whose listing is denied is DEPLOY_REFUSED_UNREADABLE, even for a no-op).
-#   The idle gate keeps the End from stranding a lease: with running\, inbox\ and slot-holders\ empty, nothing is lost.
+#   The idle gate keeps the End from stranding a lease: with no live job in running\ or inbox\ and no lease in slot-holders\,
+#   nothing is lost (an ignored leftover is something the agent never picks up, before the restart or after it).
 #   Waits use a monotonic Stopwatch, never the wall clock, and EVERY read of the venue is under a deadline: a listing, a heartbeat
 #   read and each wait condition run in their own runspace (Invoke-Bounded) and a schtasks call runs as a child process
 #   (Invoke-BoundedProcess), so a share that stops answering is a typed refusal or failure at the deadline, never a hang with
@@ -320,10 +326,48 @@ function Test-SamePath {
     catch { return $false }
 }
 
+# THE busy predicate (BACHELOR-DEPLOY-BUSY-CHECK-STALE-ARTIFACTS-1), defined ONCE: what the agent ITSELF acts on as live work, each
+# read with the agent's own call (ultra-magnus-agent.ps1). Get-VenueStateRaw is the only reader, and every idle judgement goes through
+# it: the pre-deploy refusal (Get-Refusals), the re-checks inside the restart (Get-Refusals again) and the arrival warning after the
+# old agent stopped (Get-ArrivalWarning). Every other entry in inbox\, running\ and slot-holders\ is an IGNORED leftover: counted and
+# printed (ignored=<n>), and not deleted, moved or rewritten by this script (the agent never picks it up as work, so a restart
+# cannot strand it). The agent's OWN startup cleanup is not this script's promise: with -RestartMode when-idle the replacement
+# agent runs Stop-StaleHeavySlotHolders, which removes its slot-holders\ side files (*.release, *.tmp), as at any agent start.
+# A folder that cannot be listed is DEPLOY_REFUSED_UNREADABLE, never "empty"; so is a root with a wildcard character (Get-VenueStateRaw).
+#   folder        what           how                                                   the agent's own call
+#   inbox\        a job          -Filter <job pattern> -File                           the pickup loop and the exempt-job list (Get-ChildItem $inbox -Filter <it> -File)
+#   running\      a marker       -Filter <marker pattern> -File, then -like the same   Get-RunningMarkerJobIds
+#   running\      a marker tmp   every file, matched by the agent's regex              Get-MarkerTempFiles (an unresolved launch; the agent's startup recovery reconciles it)
+#   slot-holders\ a lease        EVERY entry whose name ends .lease/.holder/.acquired.json (a superset of the agent's -Filter "*.lease.json" / "*.holder.json" / "$id.acquired.json")
+# A set-aside marker ('<marker>.stale-<ticks>', '.corrupt-<ticks>', a tmp moved aside), a staged exe or zip, a zero-byte .tmp, a probe
+# file, a companion '<id>.meta.json' with no job beside it and a directory are all ignored: the agent reads none of them as work.
+$script:LiveWorkRules = @(
+    [pscustomobject]@{ folder = 'inbox'; what = 'job'; filter = '*.job.ps1'; recheck = $false; regex = $null; entries = $false }
+    [pscustomobject]@{ folder = 'running'; what = 'marker'; filter = '*.started.json'; recheck = $true; regex = $null; entries = $false }
+    [pscustomobject]@{ folder = 'running'; what = 'marker-tmp'; filter = $null; recheck = $false; regex = '^(?<id>.+)\.started\.json(\.[0-9a-f]{32})?\.tmp$'; entries = $false }
+    [pscustomobject]@{ folder = 'slot-holders'; what = 'lease'; filter = $null; recheck = $false; regex = '\.(lease|holder|acquired)\.json\z'; entries = $true }
+)
+
+# how many rounds of listings Get-VenueStateRaw takes of one folder before a folder that keeps changing is called unreadable
+$script:StableListingTries = 5
+
+function Get-LiveWorkNames {
+    # The names in ONE folder that a $script:LiveWorkRules row counts as live work. Get-ChildItem without -Force, exactly as the agent
+    # lists (a hidden file is not one the agent picks up); -ErrorAction Stop, so a listing that fails throws (unreadable), never "none".
+    param([string]$Dir, $Rule, [string[]]$Entries)
+    if ($Rule.entries) { return @($Entries | Where-Object { $_ -match $Rule.regex }) }
+    if ($null -ne $Rule.filter) { $names = @(Get-ChildItem -LiteralPath $Dir -Filter $Rule.filter -File -ErrorAction Stop | ForEach-Object { $_.Name }) }
+    else { $names = @(Get-ChildItem -LiteralPath $Dir -File -ErrorAction Stop | ForEach-Object { $_.Name }) }
+    # the agent re-checks its marker listing with -like on the same pattern (Get-RunningMarkerJobIds); recheck does the same
+    if ($Rule.recheck) { $pattern = $Rule.filter; $names = @($names | Where-Object { $_ -like $pattern }) }
+    if ($null -ne $Rule.regex) { $names = @($names | Where-Object { [regex]::Match($_, $Rule.regex).Success }) }
+    return $names
+}
+
 function Get-VenueState {
     # The listing under a hard deadline: a share that stops answering is "unreadable" (a refusal), never a hang with the lock held.
     $r = Invoke-Bounded -Script { Get-VenueStateRaw } -TimeoutMs ($script:ReadTimeoutSec * 1000)
-    $failed = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @() }
+    $failed = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @(); ignored = 0; ignoredBy = '' }
     if ($r.timedOut) { $failed.unreadable = "listing the venue did not answer within $($script:ReadTimeoutSec) s"; return [pscustomobject]$failed }
     if ($null -ne $r.error) { $failed.unreadable = "listing failed: $($r.error)"; return [pscustomobject]$failed }
     if ($null -eq $r.value) { $failed.unreadable = 'listing returned nothing'; return [pscustomobject]$failed }
@@ -331,8 +375,16 @@ function Get-VenueState {
 }
 
 function Get-VenueStateRaw {
-    # Reads the three folders the idle judgement rests on. Any failure to list one is "unreadable", never "empty".
-    $state = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @() }
+    # Reads the three folders the idle judgement rests on, through the one predicate ($script:LiveWorkRules). Any failure to list
+    # one is "unreadable", never "empty". running / inbox / leases are live work only; ignored counts every other entry.
+    $state = [ordered]@{ unreadable = $null; running = 0; inbox = 0; leases = @(); ignored = 0; ignoredBy = '' }
+    # the agent lists its inbox with a POSITIONAL -Path (Get-ChildItem $inbox -Filter ...), which reads [ ] * ? and the backtick as
+    # wildcard syntax: under a root such as C:\bench[1] its pickup set is not the literal folder's (it may be C:\bench1\inbox, or
+    # nothing). This script lists literally, so it cannot read the agent's pickup set there, and it refuses rather than guess.
+    if ($VenueRoot -match '[\[\]\*\?`]') {
+        $state.unreadable = "the venue root $VenueRoot holds a wildcard character ([ ] * ? or a backtick): the agent lists inbox\ with a wildcard-reading -Path, so the jobs it would pick up cannot be read here; use a root without one"
+        return [pscustomobject]$state
+    }
     # the root itself must list too: lock creation and file reads can succeed where enumeration is denied
     try { [void]@([System.IO.Directory]::EnumerateFileSystemEntries($VenueRoot) | Select-Object -First 1) }
     catch {
@@ -346,15 +398,38 @@ function Get-VenueStateRaw {
         }
     }
     try {
-        $state.running = @([System.IO.Directory]::EnumerateFileSystemEntries((Join-Path $VenueRoot 'running'))).Count
-        $state.inbox = @([System.IO.Directory]::EnumerateFileSystemEntries((Join-Path $VenueRoot 'inbox'))).Count
-        $holders = Join-Path $VenueRoot 'slot-holders'
-        $state.leases = @(
-            [System.IO.Directory]::EnumerateFileSystemEntries($holders) |
-                ForEach-Object { [System.IO.Path]::GetFileName($_) } |
-                Where-Object { $_ -match '\.(lease|holder|acquired)\.json\z' } |
-                Sort-Object
-        )
+        $live = @{}; $ignoredBy = @()
+        foreach ($d in @('inbox', 'running', 'slot-holders')) {
+            $dir = Join-Path $VenueRoot $d
+            # A folder is read by SEVERAL listings (one per rule, plus the entry count). An entry renamed between two of them (the
+            # agent promoting <id>.started.json.<hex>.tmp to <id>.started.json) could be missed by both, so the listings count only
+            # when the folder's full entry set is the SAME before and after them; otherwise they are taken again. A folder that never
+            # holds still for $script:StableListingTries rounds cannot be judged: unreadable, never "idle".
+            $stable = $false
+            for ($try = 1; $try -le $script:StableListingTries -and -not $stable; $try++) {
+                # every entry, hidden or not, files and folders: the denominator of ignored=
+                $entries = @([System.IO.Directory]::EnumerateFileSystemEntries($dir) | ForEach-Object { [System.IO.Path]::GetFileName($_) } | Sort-Object -CaseSensitive)
+                $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($rule in @($script:LiveWorkRules | Where-Object { [string]::Equals($_.folder, $d, [StringComparison]::Ordinal) })) {
+                    foreach ($n in @(Get-LiveWorkNames -Dir $dir -Rule $rule -Entries $entries)) { [void]$names.Add([string]$n) }
+                }
+                $again = @([System.IO.Directory]::EnumerateFileSystemEntries($dir) | ForEach-Object { [System.IO.Path]::GetFileName($_) } | Sort-Object -CaseSensitive)
+                # a file name holds no NUL, so the joined lists are equal exactly when the two sorted listings are (ordinal, case-sensitive)
+                $stable = ($entries.Count -eq $again.Count) -and [string]::Equals(($entries -join "`0"), ($again -join "`0"), [StringComparison]::Ordinal)
+            }
+            if (-not $stable) {
+                $state.unreadable = "folder $d\ changed during each of $($script:StableListingTries) listings, so what it holds cannot be judged"
+                return [pscustomobject]$state
+            }
+            $live[$d] = $names
+            $left = @($entries | Where-Object { -not $names.Contains([string]$_) }).Count
+            $state.ignored += $left
+            $ignoredBy += "$d\ $left"
+        }
+        $state.inbox = $live['inbox'].Count
+        $state.running = $live['running'].Count
+        $state.leases = @($live['slot-holders'] | Sort-Object)
+        $state.ignoredBy = $ignoredBy -join ', '
     }
     catch {
         $state.unreadable = "listing failed: $($_.Exception.Message)"
@@ -370,7 +445,7 @@ function Get-Refusals {
     }
     $lines = @(); $code = 0
     if ($s.running -gt 0 -or $s.inbox -gt 0) {
-        $lines += "DEPLOY_REFUSED_BUSY running=$($s.running) inbox=$($s.inbox)"
+        $lines += "DEPLOY_REFUSED_BUSY running=$($s.running) inbox=$($s.inbox) ignored=$($s.ignored)"
         $code = 10
     }
     if ($s.leases.Count -gt 0) {
@@ -386,7 +461,7 @@ function Get-ArrivalWarning {
     $s = Get-VenueState
     if ($null -ne $s.unreadable) { return "DEPLOY_WARN_ARRIVED_DURING_RESTART unreadable=$($s.unreadable)" }
     if ($s.running -gt 0 -or $s.inbox -gt 0 -or $s.leases.Count -gt 0) {
-        return "DEPLOY_WARN_ARRIVED_DURING_RESTART running=$($s.running) inbox=$($s.inbox) leases=$($s.leases -join ',')"
+        return "DEPLOY_WARN_ARRIVED_DURING_RESTART running=$($s.running) inbox=$($s.inbox) leases=$($s.leases -join ',') ignored=$($s.ignored)"
     }
     return $null
 }
@@ -978,6 +1053,10 @@ try {
     if ($null -ne $readable.unreadable) {
         Out-Typed "DEPLOY_REFUSED_UNREADABLE $($readable.unreadable)"
         exit 12
+    }
+    # the leftovers the busy predicate ignores, so the operator sees them (informational; it changes no outcome or exit code)
+    if ($readable.ignored -gt 0) {
+        Out-Typed "DEPLOY_IGNORED_LEFTOVERS ignored=$($readable.ignored) ($($readable.ignoredBy)): not work the agent picks up; this deploy leaves them in place, clear them by hand (quarantine, never discard)"
     }
     $dest = Join-Path $VenueRoot $agentName
 
