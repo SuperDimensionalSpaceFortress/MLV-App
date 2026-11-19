@@ -590,9 +590,10 @@ def attempt(step: Callable[[], object], attempts: int = CLEANUP_ATTEMPTS) -> Bas
     call, so one call is not enough and an interrupt must not leave the cleanup before the steps after it ran:
     the caller raises what comes back once every step is done. A step run again must be safe to run again.
     The first exception is kept with ``is None``: an exception's own truth value is its class's business.
+    ``attempts`` below 1 still makes one try: a cleanup step is never skipped.
     """
     first: BaseException | None = None
-    for _attempt in range(attempts):
+    for _attempt in range(max(1, attempts)):
         try:
             step()
         except BaseException as error:  # noqa: BLE001 - see above
@@ -645,11 +646,11 @@ def run_cleanup(
 
     NON-PROMISE: an exception injected inside this function's own frame, or in its caller's frame around the
     call, between bytecodes and outside any step, is not defended: CPython gives no way to defend a frame
-    against itself. The guarantee is per step, as above.
+    against itself. The guarantee is per step, as above. ``attempts`` below 1 still makes one try of each step.
     """
     kept: list[BaseException] = [] if met is None else met
     for _name, step in steps:
-        for _attempt in range(attempts):
+        for _attempt in range(max(1, attempts)):
             try:
                 returned = step()
             except BaseException as error:  # noqa: BLE001 - kept, the step made again, and the next one still run
@@ -966,8 +967,8 @@ def run_shard(
     # either (or in the run) is not lost: the first one goes out once both are done, so the run is not a pass.
     cleanup = (("stop the budget watch", stop_watch), ("print the slowest classes", report_slowest))
     runner = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=make_result)
-    watch.start()
     try:
+        watch.start()  # inside the try: an interrupt once the thread runs still gets the cleanup (it stops it)
         result = runner.run(ClassTimingSuite(members))
     finally:
         run_cleanup(cleanup)
@@ -1102,11 +1103,11 @@ def report_problems(
 
     ``cursor`` (a one-item list) is the index of the next problem to say, advanced past each one once it is
     dealt with: a caller that makes this call again after it was cut short (``run_cleanup``) goes on from
-    there and never says the earlier ones twice."""
+    there and never says the earlier ones twice. ``attempts`` below 1 still makes one try of each problem."""
     at = [0] if cursor is None else cursor
     first: BaseException | None = None
     while at[0] < len(problems):
-        for _attempt in range(attempts):
+        for _attempt in range(max(1, attempts)):
             try:
                 emit_error(problems[at[0]])
             except BaseException as error:  # noqa: BLE001 - this problem is written again; the rest are still said
@@ -1545,15 +1546,24 @@ def run_parallel(
     deadline = clock() + limit  # from before the first launch: launching is part of the budget
     killer = DeadlineKiller(deadline, clock)
 
-    def report_unended() -> None:  # what the watchdog could not end (a worker or its tree), once each
-        for number, error in sorted(killer.failed.items()):
-            if number not in stuck:
-                stuck.add(number)
-                problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
-
     def note(problem: str) -> None:  # a cleanup step can be made again: what it records is recorded once
         if problem not in problems:
             problems.append(problem)
+
+    # A once-only marker (``stuck``, ``unread``) is set only AFTER the problem it guards is recorded: one cut short
+    # between the two then leaves the problem recorded (``note`` does not record it twice when the step is made
+    # again), never a marker that makes every later try skip it. ``kept_at`` ties the work dir to what is said:
+    # it is kept whenever a problem says it is, and a kept dir is always said (``note_kept``).
+    kept_at = f"kept at {work}"
+
+    def keeping() -> bool:  # unseen output (an unread or unprinted log, a live worker) is evidence: never deleted
+        return bool(unread or stuck or handled < len(logs) or any(kept_at in problem for problem in problems))
+
+    def report_unended() -> None:  # what the watchdog could not end (a worker or its tree), once each
+        for number, error in sorted(killer.failed.items()):
+            if number not in stuck:
+                note(f"worker {number}/{len(procs)} could not be terminated: {error}")
+                stuck.add(number)
 
     # ---- The final cleanup: one step each, run in this order by ``run_cleanup`` from the ``finally`` below. ----
     # Every step runs whatever an earlier one met; an exception met in a step (at its first line too) is kept and
@@ -1573,8 +1583,8 @@ def run_parallel(
         for number, (_proc, log) in enumerate(procs, start=1):
             error = ended_late.get(number)
             if error is not None and number not in stuck:
+                note(f"worker {number}/{len(procs)} could not be terminated: {error}")
                 stuck.add(number)
-                problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
             try:
                 log.close()
             except OSError:
@@ -1613,8 +1623,8 @@ def run_parallel(
                     printed = describe_error(error)
                 unreadable, verb = printed or header_error, "printed"
             if unreadable is not None and number not in unread:
+                note(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); {kept_at}")
                 unread.append(number)
-                problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
             handled = number
 
     def stop_killer() -> BaseException | None:  # the watchdog kept enforcing the deadline until now
@@ -1631,9 +1641,11 @@ def run_parallel(
             )
         if handled < len(logs) and not unread and not stuck:  # the logs ``print_left_logs`` could not get to
             note(f"worker log(s) {handled + 1}-{len(logs)} could not all be printed; kept at {work}")
+        if keeping() and not any(kept_at in problem for problem in problems):  # a kept dir is never left unsaid
+            note(f"worker evidence {kept_at}")
 
-    def remove_work() -> None:  # unseen output (an unread or unprinted log, a live worker) is evidence: never deleted
-        if not unread and not stuck and handled >= len(logs):
+    def remove_work() -> None:
+        if not keeping():
             shutil.rmtree(work, ignore_errors=True)
 
     def decide_tail() -> None:  # the run's own accounting follows only a cleanup that met nothing, nothing in flight
@@ -1754,9 +1766,9 @@ def run_parallel(
         for number, (proc, log) in enumerate(procs, start=1):
             killed = number in ended
             error = ended.get(number)
-            if error is not None:  # the other workers were still killed with it
-                stuck.add(number)
+            if error is not None:  # the other workers were still killed with it (the problem first, then its marker)
                 problems.append(f"worker {number}/{len(procs)} could not be terminated: {error}")
+                stuck.add(number)
             killed = killed or number in killer.killed
             if killed or number in late:
                 problems.append(
@@ -1779,8 +1791,8 @@ def run_parallel(
             if unreadable is None:
                 unreadable, verb = emit_log(text) or header_error, "printed"
             if unreadable is not None:  # the other workers' logs are still printed, and this one is kept (see the cleanup)
+                problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); {kept_at}")
                 unread.append(number)
-                problems.append(f"worker {number}/{len(logs)} log could not be {verb} ({unreadable}); kept at {work}")
             if code not in (0, 1, 5):
                 problems.append(f"worker {number}/{len(logs)} exited {code}")
             elif record is None:

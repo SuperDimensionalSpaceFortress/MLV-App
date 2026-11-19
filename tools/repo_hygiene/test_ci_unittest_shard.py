@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import linecache
 import os
 import re
 import shutil
@@ -4131,6 +4132,159 @@ class ShardExitCodeTests(unittest.TestCase):
         self.assertEqual(ran, ["a"] * shard.CLEANUP_ATTEMPTS + ["b", "b", "b", "c", "d"], "a step was skipped or not made again")
         self.assertEqual([str(error) for error in met], ["first"] * shard.CLEANUP_ATTEMPTS + ["again", "again", "returned"])
         shard.run_cleanup((("quiet", lambda: None),))  # nothing met: nothing raised
+
+    # ---- r22, adversary pass 34 A1: a once-only marker (``stuck``, ``unread``) set before the problem it guards. ----
+    # The interrupt lands BETWEEN the two statements of the guarded block, whichever order they are in, so the same
+    # test is RED on 53c1491d (marker first: the problem is lost for good) and GREEN once the problem comes first.
+    def _interrupt_inside_block(self, function: str, guard: str, marker: str = "record-gap") -> object:
+        """In the first frame of ``shard``'s ``function``, once the block under the line starting with ``guard`` has
+        run its first statement, raise ``KeyboardInterrupt(marker)`` before its second, once."""
+        state = [0]  # 0: looking for the guard; 1: the guard ran; 2: the block's first statement is running
+
+        def local(frame: types.FrameType, event: str, arg: object) -> object:
+            if state[0] == 3 or event != "line":
+                return None if state[0] == 3 else local
+            line = linecache.getline(frame.f_code.co_filename, frame.f_lineno)
+            text, indent = line.strip(), len(line) - len(line.lstrip())
+            if state[0] == 0 and text.startswith(guard):
+                state[:] = [1, indent]  # type: ignore[list-item]
+            elif state[0] == 1:
+                state[0] = 2 if indent > state[1] else 0  # a guard that was False is not the block
+            elif state[0] == 2:
+                state[0] = 3
+                raise KeyboardInterrupt(marker)
+            return local
+
+        def tracer(frame: types.FrameType, event: str, arg: object) -> object:
+            code = frame.f_code
+            if event == "call" and state[0] == 0 and code.co_name == function and code.co_filename == shard.__file__:
+                return local
+            return None
+
+        return self._traced(tracer)
+
+    @staticmethod
+    def _running_popen() -> Callable[..., object]:
+        class Running:  # never seen to exit: the body's own kill (``terminate_all``) is the one that is refused
+            returncode = 1
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 1
+
+            def kill(self) -> None:
+                pass
+
+        def popen(*args: object, **kwargs: object) -> object:
+            kwargs["stdout"].write(b"fx-running\n")
+            kwargs["stdout"].flush()
+            return Running()
+
+        return popen
+
+    def test_r22_adv34_a1_an_interrupt_between_a_problem_and_its_marker_never_loses_the_problem(self) -> None:
+        class FailedKiller(shard.DeadlineKiller):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)
+                self.failed[1] = "tree kill denied"
+
+        cases = (  # (where, popen, patches, what must be said)
+            (
+                "print_left_logs", "if unreadable is not None and number not in unread",
+                self._finished_popen([], raise_on=2), {}, "worker 1/1 log could not be read",
+            ),
+            (
+                "run_parallel", "if unreadable is not None:  # the other workers' logs",
+                self._finished_popen([]), {}, "worker 1/2 log could not be read",
+            ),
+            (
+                "close_logs", "if error is not None and number not in stuck",
+                self._finished_popen([]), {"end_running_workers": lambda procs: ({1: "kill denied"}, None)},
+                "worker 1/2 could not be terminated: kill denied",
+            ),
+            (
+                "report_unended", "if number not in stuck",
+                self._finished_popen([]), {"DeadlineKiller": FailedKiller},
+                "worker 1/2 could not be terminated: tree kill denied",
+            ),
+            (
+                "run_parallel", "if error is not None:  # the other workers were still killed",
+                self._running_popen(),
+                {
+                    "terminate_all": lambda procs, **_kw: ["kill denied"] * len(procs),
+                    "late_workers": lambda procs, deadline, monotonic=None: set(),
+                    "end_running_workers": lambda procs: ({}, None),
+                },
+                "worker 1/2 could not be terminated: kill denied",
+            ),
+        )
+        for function, guard, popen, patches, said in cases:
+            with self.subTest(at=f"{function}: {guard}"):
+                raised, err = self._run_to_exception(popen, extra=self._interrupt_inside_block(function, guard), **patches)
+                self.assertIsInstance(raised, KeyboardInterrupt, repr(raised) + err)
+                self.assertEqual(str(raised), "record-gap", "the injected interrupt never landed in the block")
+                self.assertIn(said, err, "the problem was lost with its marker already set")
+                self.assertIn("kept at", err, "the work dir was kept without its location being said")
+                self.assertEqual(err.count(said), 1, "a problem made again was said twice")
+
+    def test_r22_a_work_dir_a_problem_says_is_kept_is_never_removed(self) -> None:
+        # The class guard (``keeping``): worker 1's log is locked once, the body records it and is interrupted before
+        # its marker, and the cleanup's second read then succeeds. The problem already says "kept at": the dir stays.
+        real = Path.read_text
+        reads = [0]
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path.name == "log.txt" and path.parent.name == "w1":
+                reads[0] += 1
+                if reads[0] == 1:
+                    raise PermissionError(5, "log is locked once")
+            return real(path, *args, **kwargs)
+
+        removed: list[object] = []
+
+        @contextlib.contextmanager
+        def scene() -> Iterator[None]:
+            with (
+                mock.patch.object(Path, "read_text", read_text),
+                mock.patch.object(shard.shutil, "rmtree", side_effect=lambda path, *a, **k: removed.append(path)),
+                self._interrupt_inside_block("run_parallel", "if unreadable is not None:  # the other workers' logs"),
+            ):
+                yield
+
+        raised, err = self._run_to_exception(self._finished_popen([]), extra=scene())
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised) + err)
+        self.assertEqual(str(raised), "record-gap")
+        self.assertEqual(reads[0], 2, "the cleanup did not read the log again")
+        self.assertIn("worker 1/2 log could not be read (", err)
+        self.assertIn("kept at", err)
+        self.assertEqual(removed, [], "a work dir a problem says is kept was removed")
+
+    # ---- r22, adversary pass 34 advisories in scope: A2 (serial watch started outside the try), A3 (attempts=0). ----
+    def test_r22_adv34_a2_an_interrupt_right_after_the_serial_watch_starts_still_stops_it(self) -> None:
+        original = shard.BudgetWatch.start
+
+        def start(self: object) -> None:
+            original(self)  # type: ignore[arg-type]
+            raise KeyboardInterrupt("after-start")
+
+        raised, _out, made = self._serial_with(mock.patch.object(shard.BudgetWatch, "start", start))
+        self.assertIsInstance(raised, KeyboardInterrupt, repr(raised))
+        self.assertEqual(str(raised), "after-start")
+        self._assert_watchdogs_stopped(made, 1)
+
+    def test_r22_adv34_a3_no_attempts_count_skips_a_cleanup_step_or_a_problem(self) -> None:
+        ran: list[str] = []
+        shard.run_cleanup((("one", lambda: ran.append("one")), ("two", lambda: ran.append("two"))), attempts=0)
+        self.assertEqual(ran, ["one", "two"], "a cleanup step was skipped")
+        self.assertIsNone(shard.attempt(lambda: ran.append("three"), attempts=0))
+        self.assertEqual(ran[-1], "three", "attempt skipped its step")
+        err, cursor = io.StringIO(), [0]
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(shard.report_problems(["kept at C:\\evidence"], cursor, attempts=-1))
+        self.assertIn("ERROR: kept at C:\\evidence", err.getvalue(), "the problem was skipped")
+        self.assertEqual(cursor, [1])
 
 
 class TimingsTests(unittest.TestCase):
