@@ -176,8 +176,8 @@ class DebayerQualityJobTests(unittest.TestCase):
     def test_the_generator_embeds_the_metric_script_with_a_matching_sha256(self) -> None:
         want = hashlib.sha256((DV / "debayer_quality.py").read_bytes()).hexdigest()
         self.assertEqual(self.d["qualityScriptSha256"], want)
-        self.assertTrue(self.d["pythonResolverEmbedded"])
-        for token in ("__QUALITY_JSON__", "__QUALITY_SCRIPT_BASE64__", "__QUALITY_SCRIPT_SHA256__", "__PYTHON_RESOLVER__"):
+        self.assertTrue(self.d["pythonProbeBounded"])
+        for token in ("__QUALITY_JSON__", "__QUALITY_SCRIPT_BASE64__", "__QUALITY_SCRIPT_SHA256__", "__QUALITY_RECEIPT_DEBAYER__", "__QUALITY_CUT_IN__"):
             self.assertIn(token, self.template, token)
         src = EXPORT_JOB.read_text(encoding="utf-8")
         self.assertIn("QUALITY_SCRIPT_BASE64 = $(if ($null -ne $qualityObject) { [Convert]::ToBase64String($qualityScriptBytes) }", src)
@@ -233,6 +233,63 @@ class DebayerQualityJobTests(unittest.TestCase):
                     proc = run_pwsh(["-Command", f"try {{ & '{EXPORT_JOB}' -ClipId M16-1243 -Format {fmt} -MaxFrames 120 -QualityJson (Get-Content -Raw '{qf}') -ErrorAction Stop; 'NOT REFUSED' }} catch {{ 'REFUSED ' + $_.Exception.Message }}"])
                 self.assertIn("REFUSED DUAL_VENUE_EXPORT_QUALITY_INVALID", proc.stdout, proc.stdout + proc.stderr)
                 self.assertIn(want, proc.stdout)
+
+    def test_the_python_probe_is_bounded_isolated_and_scrubbed(self) -> None:
+        # adversary r1 pass 2 A6: the playback resolver's unbounded, non-isolated `python.exe -c` could hang on a venue's sitecustomize/PYTHONPATH before the summary went out
+        t = self.template
+        self.assertNotIn("Resolve-AttrCudaOwnerPython", t, "the unbounded playback resolver is not carried or called")
+        self.assertNotIn("__PYTHON_RESOLVER__", t)
+        probe = t[t.index("function Find-QualityPython"):t.index("function Invoke-ExportQualityPass")]
+        self.assertIn("@('-I', '-c', 'import sys; print(sys.version_info[0])')", probe)
+        self.assertIn("$p.WaitForExit([int]($QualityPythonProbeTimeoutSec * 1000))", probe)
+        self.assertIn("$p.Kill($true)", probe)
+        self.assertIn("Remove-QualityPythonEnvironment $psi", probe)
+        self.assertIn("$QualityPythonProbeTimeoutSec = 30", t)
+        body = t[t.index("function Invoke-ExportQualityPass"):]
+        self.assertIn("$py = Find-QualityPython", body)
+        self.assertLess(body.index("Remove-QualityPythonEnvironment $mpsi"), body.index("$mApp = [Diagnostics.Process]::Start($mpsi)"))
+        scrub = t[t.index("function Remove-QualityPythonEnvironment"):t.index("function Find-QualityPython")]
+        self.assertIn("$_ -like 'PYTHON*' -or $_ -like 'PY_PYTHON*'", scrub)
+        # two bounded probes fit the quality term's 120 s margin
+        self.assertLessEqual(2 * 30 + 2 * 10, 120)
+
+    def test_the_receipt_debayer_and_cut_in_are_read_once_in_their_canonical_form(self) -> None:
+        # adversary r1 pass 2 A4: the job read <debayer> and <cutIn> with a regex, so a commented-out <debayer>7</debayer> labelled AMaZE output as RCD, and <cutIn>+7</cutIn>
+        # (QString::toInt reads 7) placed the captures at the default cut-in. The generator now reads both ONCE from the verified bytes and bakes them.
+        t = self.template
+        # the job parses no receipt text: no regex over it, no '<debayer>' / '<cutIn>' pattern literal
+        self.assertNotIn("'<debayer>", t)
+        self.assertNotIn("'<cutIn>", t)
+        self.assertNotIn("GetString($receiptBytes)", t)
+        self.assertNotIn("GetString($ReceiptBytes)", t)
+        self.assertIn("$cutIn = [int64]$QualityCutIn", t)
+        self.assertIn("receiptDebayer = $QualityReceiptDebayer", t)
+        for leg in LEGS:
+            spec = json.loads((DV / "legs" / f"{leg}.json").read_text(encoding="utf-8"))
+            with self.subTest(leg=leg):
+                proc = run_pwsh(["-Command", f"& '{EXPORT_JOB}' -DescribeQualityReceiptPath '{DV / spec['export']['receipt']}' | ConvertTo-Json -Compress"])
+                got = json.loads(proc.stdout)
+                self.assertEqual(got, {"debayer": DEBAYER_VALUES[leg.rsplit('-', 1)[1]], "cutIn": 1}, proc.stdout + proc.stderr)
+        base = (DV / "look-receipts" / "export-owner-hq-dualiso.marxml").read_text(encoding="utf-8")
+        forged = {"comment": base.replace("<debayer>5</debayer>", "<!-- <debayer>7</debayer> --><debayer>5</debayer>"),
+                  "signed": base.replace("<debayer>5</debayer>", "<debayer>5</debayer><cutIn>+7</cutIn>"),
+                  "two": base.replace("<debayer>5</debayer>", "<debayer>5</debayer><debayer>7</debayer>"),
+                  "charref": base.replace("<debayer>5</debayer>", "<debayer>&#53;</debayer>"),
+                  "spaced": base.replace("<debayer>5</debayer>", "<debayer> 5 </debayer>"),
+                  "cdata": base.replace("<debayer>5</debayer>", "<debayer>5</debayer><![CDATA[x]]>")}
+        with tempfile.TemporaryDirectory() as d:
+            for name, text in forged.items():
+                with self.subTest(forged=name):
+                    p = Path(d) / f"{name}.marxml"
+                    p.write_text(text, encoding="utf-8")
+                    proc = run_pwsh(["-Command", f"try {{ & '{EXPORT_JOB}' -DescribeQualityReceiptPath '{p}' -ErrorAction Stop | ConvertTo-Json -Compress }} catch {{ 'REFUSED ' + $_.Exception.Message }}"])
+                    self.assertIn("REFUSED DUAL_VENUE_EXPORT_QUALITY_INVALID", proc.stdout, proc.stdout + proc.stderr)
+            p = Path(d) / "cut9.marxml"
+            p.write_text(base.replace("<debayer>5</debayer>", "<debayer>5</debayer><cutIn>9</cutIn>"), encoding="utf-8")
+            proc = run_pwsh(["-Command", f"& '{EXPORT_JOB}' -DescribeQualityReceiptPath '{p}' | ConvertTo-Json -Compress"])
+            self.assertEqual(json.loads(proc.stdout), {"debayer": 5, "cutIn": 9})
+        src = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("if ($null -ne $qualityObject -and -not $PreflightBudgetOnly) { $qualityReceipt = Get-ExportQualityReceiptFields -ReceiptBytes $receiptBytes }", src)
 
     def test_a_format_spelled_in_another_case_is_still_a_prores_export(self) -> None:
         # adversary r1 A5: the ValidateSet admits -Format ProRes (case-insensitive), and the job compares `$Format -eq 'prores'`; the quality check said "not prores"
@@ -351,6 +408,25 @@ class QualityEvidenceReaderTests(unittest.TestCase):
             with self.subTest(case=i):
                 self.assertEqual(row["verdict"], "INVALID", row)
                 self.assertIn("EXPORT_QUALITY_SCHEMA_INVALID", row["detail"], row)
+
+    def test_the_checker_refuses_a_field_of_the_wrong_json_type(self) -> None:
+        # adversary r1 pass 2 A2: debayer=['amaze'] read as 'amaze' through a [string] cast and was granted PASS; the rule table then raised TypeError on it
+        def doc(**over) -> str:
+            return json.dumps(dict(quality_doc(), **over))
+        q0 = quality_doc()
+        sha_list = json.loads(json.dumps(q0))
+        sha_list["perFrame"][0]["sha256"]["S4_processing"] = [sha_list["perFrame"][0]["sha256"]["S4_processing"]]
+        texts = [doc(debayer=["amaze"]), doc(schema=["mlv-app/debayer-quality/v1"]), doc(levelSource=["rawi"]), doc(tileSize="64"), doc(tilesPerClass=0),
+                 doc(stages=["S2_post_dualiso", "S4_processing", "S4_processing"]), doc(captureOffsets=[3, 7, 11, 15, 19, "23"]), json.dumps(sha_list)]
+        # (the spec binding is left out so each case reaches the type check itself, not the equality with the leg spec)
+        cases = [dict(self.case(t, summary_quality(t)), spec=None) for t in texts]
+        rows = self.evidence(cases)
+        for i, row in enumerate(rows):
+            with self.subTest(case=i):
+                self.assertEqual(row["verdict"], "INVALID", row)
+                self.assertIn("EXPORT_QUALITY_SCHEMA_INVALID", row["detail"], row)
+        good = json.dumps(q0)
+        self.assertEqual(self.evidence([dict(self.case(good, summary_quality(good)), spec=None)])[0]["verdict"], "PASS")
 
 
 EXPORT_QUALITY_STUB_GENERATOR = r"""

@@ -24,13 +24,21 @@ A quality leg's plan cell is `cpu-export-prores-<legId>`, so the six legs of one
 1. **The timed export**, unchanged. No capture variable is set, so `exportWallSeconds` and `stage-timing.log` carry no capture writes.
 2. **An untimed quality pass**, only when the timed run captured. It uses the same argv with `--max-frames 24`. The job-owned venue-local capture
    dir (`New-AttrCudaOwnedRoot`) goes in `MLVAPP_PIPELINE_CAPTURE_DIR`. `MLVAPP_PIPELINE_CAPTURE_FRAMES` holds the absolute frame indices:
-   `cutIn - 1 + offset`. That is the batch's own cut-in rule (`BatchRunner.cpp:367-389`: a cut-in of 0 reads as 1; the render loop runs
+   `cutIn - 1 + offset`. The generator reads `<cutIn>` and the `<debayer>` label once, from the receipt bytes it verified, and bakes them into
+   the job. A quality leg's receipt must hold them in the one form that both a text read and the app's `QXmlStreamReader` + `QString::toInt`
+   (`ReceiptLoader.cpp:798-810`) read the same way:
+   * no comment, CDATA section or DOCTYPE/ENTITY declaration anywhere;
+   * exactly one `<debayer>N</debayer>`, with N from 0 to 8;
+   * at most one `<cutIn>N</cutIn>`, with N unsigned digits.
+
+   Anything else is refused as `DUAL_VENUE_EXPORT_QUALITY_INVALID`. That is the batch's own cut-in rule (`BatchRunner.cpp:367-389`: a cut-in of 0 reads as 1; the render loop runs
    `frameIndex = cutIn - 1 .. cutOut - 1` at `BatchRunner.cpp:548`). The capture harness keeps at most 64 frames
    (`src/mlv/pipeline_stage_capture.c:19`), and the job scrubs every inherited `MLVAPP_*` variable before it sets its own.
 3. **The metric, on the venue.** `tools/profiling/dual-venue/debayer_quality.py` travels inline as base64 with a sha256 baked in at generation.
-   The job checks that sha256 before it writes the script and again on disk before it runs it, with `-I`. It finds Python 3 the way
-   `Resolve-AttrCudaOwnerPython` does. If the venue has none, the quality verdict is `VENUE_TOOLING` (`EXPORT_QUALITY_TOOLING_ABSENT`) and the timed
-   result stands.
+   The job checks that sha256 before it writes the script and again on disk before it runs it, with `-I`. It looks for `python.exe`, then for
+   `py -3`. Each probe runs with `-I`, with every `PYTHON*` variable removed, and is killed after 30 s (`Find-QualityPython`). The playback
+   resolver's unbounded probe is not used here. If the venue has no Python 3, the quality verdict is `VENUE_TOOLING`
+   (`EXPORT_QUALITY_TOOLING_ABSENT`) and the timed result stands.
 4. **Publish and delete.** The job publishes `quality.json`. It holds scalars, tile indices, `isoValue` and the sha256 of each captured S2, S3 and
    S4 buffer. It never holds a capture, a frame, a path or a file name. Then the job deletes the captures and the quality run's `.mov` by
    ownership proof. If `captureDeleted` is false, the leg is `INVALID` (`EXPORT_CAPTURE_NOT_DELETED`).
@@ -66,7 +74,16 @@ leg's receipt value instead. Successor: `DEBAYER-CAPTURE-LABEL-1`.
 ## The rule table (hub-side, offline)
 
 `tools/profiling/dual-venue/debayer_rule_table.py --receipt <r.json> ... --out tools/profiling/dual-venue/debayer-rule-table.json`. It reads only
-the published receipts and re-hashes every input against `receipt.export.files`. The schema is `debayer-rule-table.schema.json`
+the published receipts and re-hashes every input against `receipt.export.files`.
+
+A leg counts as passed only when the hashed evidence itself shows the pass. All of these must hold:
+* `summary.json` records a captured timed run;
+* `summary.quality` reads `QUALITY_CAPTURED` with `captureDeleted: true`;
+* the `qualitySha256` it records is the published `quality.json`;
+* the receipt carries no `legInvalid`.
+
+A receipt's `outcome` alone never makes a leg pass. A leg with no `quality.json` (for example `VENUE_TOOLING`) still loads. Its class stays
+unmeasured, and the table is still written. The schema is `debayer-rule-table.schema.json`
 (`mlv-app/debayer-rule-table/v1`).
 
 * **Reference: the bilinear floor** of the same clip and stage. AMaZE is not the reference: there is no ground truth, and AMaZE is the owner
@@ -80,6 +97,12 @@ the published receipts and re-hashes every input against `receipt.export.files`.
 * **Integrity**: a clip's six debayers are compared only when they measured the same way: the same `stages`, `tileSize`, `tilesPerClass`,
   `captureOffsets`, `frames` and `border` (`DEBAYER_QUALITY_PARAMS_DIVERGED`). The S2 sha256s must be identical (`DEBAYER_INPUT_DIVERGED`), as must
   the FLAT/EDGE tile sets on every frame (`DEBAYER_TILES_DIVERGED`). The S3 sha256s (S4 when no leg captured S3) must be present
-  (`DEBAYER_CAPTURE_INCOMPLETE`) and pairwise distinct on every frame (`DEBAYER_NOT_APPLIED`). A class is `measured` only when all six debayers PASS with a captured quality pass.
+  (`DEBAYER_CAPTURE_INCOMPLETE`) and pairwise distinct on every frame (`DEBAYER_NOT_APPLIED`). A class is `measured` only when **every** clip in
+  it has all six debayers PASS with a captured quality pass. One incomplete clip keeps the whole class unmeasured, and its reason is recorded.
+  A `quality.json` whose `debayer`, `isoValue`, `perFrame` or `metrics` is the wrong JSON type is refused as `QUALITY_DOC_INVALID`.
+* **Look Assist (pre-existing, out of scope here).** `src/batch/BatchRunner.cpp` applies Look Assist only on the CDNG route (`:1366`). A
+  rendered ProRes export applies the receipt's settings and its debayer, but not `applyHeadlessLookAssist`. So S4 here measures the
+  baseline processing, the same for every debayer. The debayer comparison stands; a "Look Assist shapes S4" claim does not. The fix is a
+  `src/` change, so it is a successor: `EXPORT-PRORES-LOOK-ASSIST-1`.
   The low and high non-dual-ISO bands are emitted as `unmeasured`. `DEBAYER-ADVISOR-1` must never extrapolate into an unmeasured row.
 * `debayer-rule-table.json` is committed only from real PASS receipts.

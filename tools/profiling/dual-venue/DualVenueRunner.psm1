@@ -4567,6 +4567,14 @@ function Get-DvDebayerQualityRefusal {
     foreach ($k in $script:DebayerQualityTopKeys) { if ($null -eq $Quality.PSObject.Properties[$k]) { return "quality.json has no $k" } }
     $isInt = { param($v) ($v -is [int] -or $v -is [long]) }
     $isNum = { param($v) (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and [double]::IsFinite([double]$v)) }
+    # adversary r1 pass 2 A2: every string field IS a string ([string] of a one-element array ['amaze'] reads 'amaze'), and every list holds what the schema names
+    foreach ($k in 'schema', 'card', 'result', 'debayer', 'levelSource', 'cfaSource') { if ($Quality.$k -isnot [string]) { return "quality.json $k is not a string" } }
+    foreach ($k in 'tileSize', 'tilesPerClass') { if (-not (& $isInt $Quality.$k)) { return "quality.json $k is not a whole number" } }
+    if (-not ($Quality.tileSize -ge 8 -and $Quality.tileSize -le 512 -and $Quality.tileSize % 2 -eq 0 -and $Quality.tilesPerClass -ge 1 -and $Quality.tilesPerClass -le 256)) { return 'quality.json tileSize or tilesPerClass is outside the leg schema''s range' }
+    $qStages = Get-DvProp $Quality 'stages'; $qStages = @($qStages)
+    if ($qStages.Count -lt 2 -or @($qStages | Where-Object { $_ -isnot [string] -or $_ -cnotin @('S2_post_dualiso', 'S3_debayer', 'S4_processing') }).Count -gt 0 -or @($qStages | Sort-Object -Unique -CaseSensitive).Count -ne $qStages.Count -or 'S2_post_dualiso' -cnotin $qStages -or 'S4_processing' -cnotin $qStages) { return 'quality.json stages is not a distinct list of the capture stages holding S2_post_dualiso and S4_processing' }
+    $qOffsets = Get-DvProp $Quality 'captureOffsets'; $qOffsets = @($qOffsets)
+    if ($qOffsets.Count -lt 1 -or $qOffsets.Count -gt 64 -or @($qOffsets | Where-Object { -not ((& $isInt $_) -and $_ -ge 0 -and $_ -le 23) }).Count -gt 0 -or @($qOffsets | ForEach-Object { [int64]$_ } | Sort-Object -Unique).Count -ne $qOffsets.Count) { return 'quality.json captureOffsets is not 1..64 distinct offsets 0..23' }
     if ([string]$Quality.schema -cne 'mlv-app/debayer-quality/v1' -or [string]$Quality.card -cne 'EXPORT-DEBAYER-QUALITY-1' -or [string]$Quality.result -cne 'QUALITY_CAPTURED') { return 'quality.json schema, card or result is not the debayer quality pass''s' }
     if (-not ((& $isInt $Quality.receiptDebayer) -and $Quality.receiptDebayer -ge 0 -and $Quality.receiptDebayer -le 8)) { return 'quality.json receiptDebayer is not a receipt debayer value (0..8)' }
     if ([string]$Quality.debayer -cne $script:ReceiptDebayerNames[[int]$Quality.receiptDebayer]) { return 'quality.json debayer is not the name of its receiptDebayer' }
@@ -4604,7 +4612,7 @@ function Get-DvDebayerQualityRefusal {
         $sha = Get-DvProp $r 'sha256'
         if ($sha -isnot [System.Management.Automation.PSCustomObject]) { return "quality.json perFrame[$i].sha256 is not an object" }
         if (-not (Test-DvJsonEquivalent @($sha.PSObject.Properties.Name | Sort-Object) @($stages | Sort-Object))) { return "quality.json perFrame[$i].sha256 does not name exactly the captured stages" }
-        foreach ($st in $stages) { if ([string](Get-DvProp $sha $st) -cnotmatch '^[0-9a-f]{64}(?![\s\S])') { return "quality.json perFrame[$i].sha256.$st is not a sha256" } }
+        foreach ($st in $stages) { if ((Get-DvProp $sha $st) -isnot [string] -or [string](Get-DvProp $sha $st) -cnotmatch '^[0-9a-f]{64}(?![\s\S])') { return "quality.json perFrame[$i].sha256.$st is not a sha256" } }
         foreach ($k in 'flatTiles', 'edgeTiles') {
             $t = Get-DvProp $r $k; $t = @($t)   # (assigned, then wrapped: Get-DvProp returns an array as ONE object)
             if ($t.Count -ne [int]$Quality.tilesPerClass -or @($t | Where-Object { -not ((& $isInt $_) -and $_ -ge 0) }).Count -gt 0) { return "quality.json perFrame[$i].$k is not tilesPerClass tile indices" }

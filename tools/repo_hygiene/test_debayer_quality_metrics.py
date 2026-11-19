@@ -263,7 +263,7 @@ def fixture_leg(clip: str, name: str, ratios: tuple, s2: str = "a" * 64, s3: str
     quality = {"metrics": metrics, "perFrame": [frame], "stages": stages, "tileSize": 64, "tilesPerClass": 16,
                "captureOffsets": [3], "frames": [3], "border": 4}
     quality.update(quality_over or {})
-    return {"receiptId": f"{clip}-{name}", "clipId": clip, "legId": f"x-{name}", "outcome": outcome, "qualityVerdict": "PASS", "debayer": name,
+    return {"receiptId": f"{clip}-{name}", "clipId": clip, "legId": f"x-{name}", "outcome": outcome, "qualityVerdict": "PASS", "evidencePass": True, "debayer": name,
             "receiptDebayer": 0, "dualIso": True, "isoValue": 1600, "sourceCommit": "c" * 40, "buildManifestSha256": "d" * 64,
             "quality": quality,
             "exportWallSeconds": 20.0 + ms, "times": {"debayerMsMean": ms, "debayerMsP10": ms - 1, "debayerMsP90": ms + 1}}
@@ -405,6 +405,63 @@ class RuleTableTests(unittest.TestCase):
             with self.assertRaises(rt.RuleTableError) as cm:
                 rt.load_leg(str(rp))
             self.assertEqual(cm.exception.token, "RECEIPT_EVIDENCE_HASH_MISMATCH")
+
+    @staticmethod
+    def write_leg(td: str, name: str, quality: dict | None, summary_quality: dict, outcome: str = "PASS", leg_invalid=None, verdict: str = "PASS") -> str:
+        ev = Path(td) / f"ev-{name}"
+        (ev / "export").mkdir(parents=True)
+        files = {}
+        texts = [("stage-timing.log", "[mlv-stage-timing] frame=0 stage=debayered_frame ms=12.5\n")]
+        qtext = json.dumps(quality) if quality is not None else None
+        if qtext is not None:
+            texts.append(("quality.json", qtext))
+            summary_quality = dict(summary_quality, qualitySha256=summary_quality.get("qualitySha256", hashlib.sha256(qtext.encode()).hexdigest()))
+        texts.append(("summary.json", json.dumps({"result": "EXPORT_CAPTURED", "exportWallSeconds": 33.0, "quality": summary_quality})))
+        for fname, text in texts:
+            (ev / "export" / fname).write_text(text, encoding="utf-8", newline="\n")
+            files[fname] = hashlib.sha256((ev / "export" / fname).read_bytes()).hexdigest()
+        receipt = {"receiptId": name, "outcome": outcome, "subject": {"clipId": "M16-1243", "legId": name, "sourceCommit": "c" * 40, "buildManifestSha256": "d" * 64},
+                   "evidence": {"localEvidenceDir": str(ev)},
+                   "export": {"dualIsoExpected": True, "files": files, "quality": {"verdict": verdict, "legInvalid": leg_invalid, "receiptDebayer": 7}}}
+        rp = Path(td) / f"{name}.json"
+        rp.write_text(json.dumps(receipt), encoding="utf-8")
+        return str(rp)
+
+    def test_load_leg_rederives_the_quality_pass_from_the_hashed_evidence(self) -> None:
+        # adversary r1 pass 2 A3: a receipt whose top-level outcome was edited to PASS over a pass that left its captures behind (summary.quality.captureDeleted
+        # false, receipt legInvalid set) loaded as a PASS and fed a measured row. The pass is now re-derived from the hashed summary.json, never the receipt's word.
+        q = {"debayer": "rcd", "receiptDebayer": 7, "isoValue": 1600, "metrics": {}, "perFrame": []}
+        good = {"result": "QUALITY_CAPTURED", "captureDeleted": True}
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(rt.load_leg(self.write_leg(td, "ok", q, good))["evidencePass"])
+            self.assertFalse(rt.load_leg(self.write_leg(td, "kept", q, dict(good, captureDeleted=False), leg_invalid="EXPORT_CAPTURE_NOT_DELETED"))["evidencePass"])
+            self.assertFalse(rt.load_leg(self.write_leg(td, "kept2", q, dict(good, captureDeleted=False)))["evidencePass"], "the hashed record alone decides")
+            self.assertFalse(rt.load_leg(self.write_leg(td, "inv", q, good, leg_invalid="EXPORT_CAPTURE_NOT_DELETED"))["evidencePass"])
+            self.assertFalse(rt.load_leg(self.write_leg(td, "sha", q, dict(good, qualitySha256="0" * 64)))["evidencePass"])
+            self.assertFalse(rt.load_leg(self.write_leg(td, "res", q, dict(good, result="EXPORT_QUALITY_TILES_SHORT")))["evidencePass"])
+            # adversary r1 pass 2 A5: a VENUE_TOOLING leg publishes no quality.json; it loads (unmeasured), it never stops the whole table
+            tooling = rt.load_leg(self.write_leg(td, "tool", None, {"result": "EXPORT_QUALITY_TOOLING_ABSENT", "captureDeleted": True}, verdict="VENUE_TOOLING"))
+            self.assertFalse(tooling["evidencePass"])
+            self.assertEqual(tooling["debayer"], "rcd", "named from the receipt's debayer value, so the unmeasured reason can say which one is missing")
+            # adversary r1 pass 2 A2: a debayer that is not one name string is refused typed, never a TypeError later
+            with self.assertRaises(rt.RuleTableError) as cm:
+                rt.load_leg(self.write_leg(td, "arr", dict(q, debayer=["rcd"]), good))
+            self.assertEqual(cm.exception.token, "QUALITY_DOC_INVALID")
+
+    def test_a_class_with_one_incomplete_clip_stays_unmeasured(self) -> None:
+        # adversary r1 pass 2 A1: M16-1243 complete plus M16-1456 without AMaZE (same class) was measured on M16-1243 alone and dropped the M16-1456 reason
+        legs = fixture_legs("M16-1243") + [x for x in fixture_legs("M16-1456") if x["debayer"] != "amaze"]
+        row = [c for c in rt.build_table(legs)["classes"] if c["classKey"]["isoBand"] == "dual"][0]
+        self.assertEqual(row["status"], "unmeasured")
+        self.assertIsNone(row["recommended"])
+        self.assertIn("M16-1456", row["reason"])
+        self.assertIn("amaze", row["reason"])
+        # and a leg whose evidence does not re-derive a pass counts as missing
+        legs = fixture_legs()
+        legs[2]["evidencePass"] = False
+        row = [c for c in rt.build_table(legs)["classes"] if c["classKey"]["isoBand"] == "dual"][0]
+        self.assertEqual(row["status"], "unmeasured")
+        self.assertIn("rcd", row["reason"])
 
 
 if __name__ == "__main__":

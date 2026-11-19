@@ -35,6 +35,9 @@ import sys
 
 SCHEMA = "mlv-app/debayer-rule-table/v1"
 DEBAYERS = ("bilinear", "amaze", "rcd", "dcb", "lmmse", "igv")
+# platform/qt/ReceiptSettings.h:16 enum DebayerAlgorithm{ None = 0, Simple, Bilinear, LMMSE, IGV, AMaZE, AHD, RCD, DCB }
+RECEIPT_DEBAYER_NAMES = ("none", "simple", "bilinear", "lmmse", "igv", "amaze", "ahd", "rcd", "dcb")
+DEBAYER_NAMES = frozenset(RECEIPT_DEBAYER_NAMES)
 REFERENCE = "bilinear"
 STAGE_BASIS = "S4_processing"
 STAGE_CHECK = "S3_debayer"
@@ -94,21 +97,42 @@ def load_leg(receipt_path: str) -> dict:
     files = ex.get("files") or {}
     ev = (r.get("evidence") or {}).get("localEvidenceDir")
     texts = {}
+    base = os.path.basename(receipt_path)
+    # adversary r1 pass 2 A5: quality.json is published only by a pass that measured; a VENUE_TOOLING or failed pass has none, and its leg loads as not-passed
+    # (its class stays unmeasured) instead of stopping the whole table
     for name in ("quality.json", "stage-timing.log", "summary.json"):
         if name not in files or not ev:
-            raise RuleTableError("RECEIPT_EVIDENCE_ABSENT", f"{os.path.basename(receipt_path)}: export.files lists no {name}")
+            if name == "quality.json":
+                continue
+            raise RuleTableError("RECEIPT_EVIDENCE_ABSENT", f"{base}: export.files lists no {name}")
         with open(os.path.join(ev, "export", name), "rb") as fh:
             b = fh.read()
         if _sha(b) != files[name]:
-            raise RuleTableError("RECEIPT_EVIDENCE_HASH_MISMATCH", f"{os.path.basename(receipt_path)}: export/{name} does not hash to export.files")
+            raise RuleTableError("RECEIPT_EVIDENCE_HASH_MISMATCH", f"{base}: export/{name} does not hash to export.files")
         texts[name] = b.decode("utf-8-sig")
-    quality = json.loads(texts["quality.json"])
+    quality = json.loads(texts["quality.json"]) if "quality.json" in texts else None
     summary = json.loads(texts["summary.json"])
+    sq = summary.get("quality") if isinstance(summary, dict) else None
+    sq = sq if isinstance(sq, dict) else {}
+    if quality is not None:
+        # adversary r1 pass 2 A2: the fields this table groups and keys on are typed here, so a malformed document is a typed refusal, never a TypeError later
+        if not isinstance(quality, dict) or not isinstance(quality.get("debayer"), str) or quality["debayer"] not in DEBAYER_NAMES \
+                or not isinstance(quality.get("perFrame"), list) or not isinstance(quality.get("metrics"), dict) \
+                or not (quality.get("isoValue") is None or (isinstance(quality["isoValue"], int) and not isinstance(quality["isoValue"], bool))):
+            raise RuleTableError("QUALITY_DOC_INVALID", f"{base}: quality.json debayer, isoValue, perFrame or metrics is not the metric script's shape")
+    # adversary r1 pass 2 A3: the pass is RE-DERIVED from the hashed evidence (summary.json's quality record and the quality.json bytes), never taken from the receipt's
+    # outcome or verdict alone: a captured timed run, a captured quality pass whose captures were deleted, and the quality.json the record names
+    evidence_pass = (quality is not None and summary.get("result") == "EXPORT_CAPTURED" and sq.get("result") == "QUALITY_CAPTURED"
+                     and sq.get("captureDeleted") is True and sq.get("qualitySha256") == files.get("quality.json")
+                     and q.get("legInvalid") is None and r.get("outcome") == "PASS" and q.get("verdict") == "PASS")
+    rd = q.get("receiptDebayer")
+    debayer = quality["debayer"] if quality is not None else (RECEIPT_DEBAYER_NAMES[rd] if isinstance(rd, int) and not isinstance(rd, bool) and 0 <= rd < len(RECEIPT_DEBAYER_NAMES) else None)
     subject = r.get("subject") or {}
     return {
         "receiptId": r.get("receiptId"), "clipId": subject.get("clipId"), "legId": subject.get("legId"), "outcome": r.get("outcome"),
-        "qualityVerdict": q.get("verdict"), "debayer": quality.get("debayer"), "receiptDebayer": quality.get("receiptDebayer"),
-        "dualIso": bool(ex.get("dualIsoExpected")), "isoValue": quality.get("isoValue"), "sourceCommit": subject.get("sourceCommit"),
+        "qualityVerdict": q.get("verdict"), "evidencePass": evidence_pass, "debayer": debayer,
+        "receiptDebayer": quality.get("receiptDebayer") if quality is not None else rd,
+        "dualIso": bool(ex.get("dualIsoExpected")), "isoValue": quality.get("isoValue") if quality is not None else None, "sourceCommit": subject.get("sourceCommit"),
         "buildManifestSha256": subject.get("buildManifestSha256"), "quality": quality,
         "exportWallSeconds": summary.get("exportWallSeconds"), "times": debayer_times(texts["stage-timing.log"]),
     }
@@ -206,11 +230,13 @@ def build_table(legs: list) -> dict:
     unmeasured_reasons = {}
     for clip in sorted(by_clip):
         group = by_clip[clip]
-        passed = [lg for lg in group if lg["outcome"] == "PASS" and lg["qualityVerdict"] == "PASS"]
+        # adversary r1 pass 2 A3: a leg counts only when its hashed evidence re-derives the pass (load_leg's evidencePass), never on the receipt's outcome alone
+        passed = [lg for lg in group if lg["outcome"] == "PASS" and lg["qualityVerdict"] == "PASS" and lg.get("evidencePass") is True]
         by = {}
         for lg in passed:
             by.setdefault(lg["debayer"], lg)
-        key = (group[0]["dualIso"], iso_band(group[0]["dualIso"], group[0]["isoValue"]))
+        iso = next((lg["isoValue"] for lg in group if lg.get("isoValue") is not None), None)
+        key = (group[0]["dualIso"], iso_band(group[0]["dualIso"], iso))
         missing = [d for d in DEBAYERS if d not in by]
         if missing:
             unmeasured_reasons.setdefault(key, []).append(f"{clip}: no PASS quality receipt for {', '.join(missing)}")
@@ -220,8 +246,9 @@ def build_table(legs: list) -> dict:
         classes.setdefault(key, []).append((clip, {d: by[d] for d in DEBAYERS}))
     rows = []
     for key in sorted(set(classes) | set(unmeasured_reasons) | {(True, "dual"), (False, "low"), (False, "high")}, key=lambda k: (not k[0], k[1])):
-        if key not in classes:
-            reason = "; ".join(unmeasured_reasons.get(key, [])) or "no consented clip of this class has been measured (EXPORT-NODUALISO-CLIP-CLASS-1)"
+        # adversary r1 pass 2 A1: a class is measured only when EVERY clip in it has its six passes; one incomplete clip keeps the whole class unmeasured
+        if key not in classes or key in unmeasured_reasons:
+            reason ="; ".join(unmeasured_reasons.get(key, [])) or "no consented clip of this class has been measured (EXPORT-NODUALISO-CLIP-CLASS-1)"
             rows.append(unmeasured_row(key[0], key[1], reason))
             continue
         clips = classes[key]
