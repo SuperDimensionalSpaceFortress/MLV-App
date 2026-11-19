@@ -2049,6 +2049,41 @@ function Get-DvWindowToggleRequestEvidence {
     }
 }
 
+function Get-DvWindowToggleCriteriaGap {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r11 (r11 adversary A1 on b82002ec, its input: an fstoggle spec with windowToggleEvidenceReason removed from both role
+    criteria arrays, over an honest reason=summary-reason-incomplete): a leg that names generatorArgs.midPlayWindowToggles relies on its CRITERIA to fail an honest
+    non-ok toggle proof (the reconcile gate passes it as "what the log derives"), so every role array of criteria.acceptance (at least one) and of
+    criteria.supplementary (when present) must bind all five: windowTogglesRequested / Driven / KeptPlaying / Advanced eq 4 (the job's schedule) and
+    windowToggleEvidenceReason eq "ok". Returns the gap text, or $null. A leg that does not ask returns $null.
+    #>
+    param([Parameter(Mandatory)]$Spec)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
+    if (-not (($raw -is [bool]) -and $raw)) { return $null }
+    $required = @(@('windowTogglesRequested', '4'), @('windowTogglesDriven', '4'), @('windowTogglesKeptPlaying', '4'), @('windowTogglesAdvanced', '4'), @('windowToggleEvidenceReason', 'ok'))
+    $criteria = Get-DvProp $Spec 'criteria'
+    $roleArrays = 0
+    foreach ($setName in 'acceptance', 'supplementary') {
+        $set = Get-DvProp $criteria $setName
+        if ($null -eq $set) {
+            if ($setName -ceq 'acceptance') { return 'criteria.acceptance is absent, so nothing fails a non-ok toggle proof' }
+            continue
+        }
+        if ($set -isnot [System.Management.Automation.PSCustomObject]) { return "criteria.$setName is not one JSON object" }
+        foreach ($role in $set.PSObject.Properties) {
+            if ($setName -ceq 'acceptance') { $roleArrays++ }
+            $rows = @($role.Value)
+            foreach ($need in $required) {
+                $bound = @($rows | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq $need[0] -and [string](Get-DvProp $_ 'op') -ceq 'eq' -and [string](Get-DvProp $_ 'value') -ceq $need[1] })
+                if ($bound.Count -lt 1) { return "criteria.$setName.$($role.Name) does not bind $($need[0]) eq $($need[1])" }
+            }
+        }
+    }
+    if ($roleArrays -lt 1) { return 'criteria.acceptance has no role array, so nothing fails a non-ok toggle proof' }
+    $null
+}
+
 function Get-DvWindowToggleReconcileEvidence {
     <#
     .SYNOPSIS
@@ -2065,6 +2100,12 @@ function Get-DvWindowToggleReconcileEvidence {
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'midPlayWindowToggles'
     $requested = ($raw -is [bool]) -and $raw
     if (-not $requested) { return [pscustomobject]@{ requested = $false; blocks = $false; reason = $null; derived = $null } }
+    # r11 (r11 adversary A1 on b82002ec): an honest non-ok proof passes this gate and is failed by the criteria, so a requested leg whose criteria do not bind the
+    # five scalars is INVALID here (the leg writer and Test-DvReceiptValid both call this), never a PASS of a non-ok proof
+    $criteriaGap = Get-DvWindowToggleCriteriaGap -Spec $Spec
+    if ($null -ne $criteriaGap) {
+        return [pscustomobject]@{ requested = $true; blocks = $true; reason = "WINDOW_TOGGLES_CRITERIA_UNBOUND: the leg names midPlayWindowToggles but $criteriaGap"; derived = $null }
+    }
     $sessionRead = Get-DvSmokeSummaryFields -LogText $LogText
     # r11 (sol r10 A2, opus key3 r10 H1 on 7fc447b9, input: the healthy log with id=3x / session=3x): an UNREADABLE measured session (a malformed first marker, or
     # with no marker a malformed first summary) names no session, so it REFUSES requested-toggle proof with a typed reason; before r11 it became the empty id and the

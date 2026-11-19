@@ -16087,7 +16087,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
         toggle = self.toggle(0, "begin")
         summary = "gui_smoke.window_toggles requested=4 driven=4 reason=ok"
         refusal = "gui_smoke.window_toggles requested=4 driven=0 reason=not_windowed"
-        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        asks = self.fstoggle_spec()
         cases = (("an ordinary leg, toggles in its log", {}, toggle, True),
                  ("an ordinary leg, the summary line only", {}, summary, True),
                  ("an ordinary leg, the app's not_windowed refusal", {}, refusal, True),
@@ -16146,7 +16146,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     def test_r7_a2_the_reconcile_gate_refuses_ok_scalars_over_a_doubled_space_duplicate_marker(self) -> None:
         """r7 (r6 adversary pass on 1ee5e122, A2, siblings DualVenueRunner.psm1:2066 / :5768 and Invoke-VenueLeg.ps1:1159): the reconcile gate re-derives the scalars with
         Get-AttrCudaWindowToggleEvidence, so ok scalars over the adversary's log (a later `  id=3 id=3` marker) are not what the log derives and the leg is INVALID."""
-        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        asks = self.fstoggle_spec()
         ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
         marker = "playback_smoke.measured_session id=3\n"
         logs = (("the adversary's doubled space", self.log().replace(marker, marker + self.R7_A2_LOG_MARKER + "\n", 1), "session-boundary-unreadable"),
@@ -16254,7 +16254,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     def test_r8_b1_the_reconcile_gate_and_the_job_embedded_reader_refuse_the_folding_spellings(self) -> None:
         """r8 (keys r7 B1, propagation sites DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence, used by Test-DvReceiptValid and Invoke-VenueLeg.ps1, and the
         job generator's embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over the keys' logs are INVALID, and the embedded reader does not derive ok."""
-        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        asks = self.fstoggle_spec()
         ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
         rows = self.r8_reader_rows()
         with tempfile.TemporaryDirectory(prefix="wt-r8-") as d:
@@ -16379,7 +16379,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     def test_r10_a1_the_reconcile_gate_and_the_job_embedded_reader_refuse_an_off_schedule_toggle(self) -> None:
         """r10 (r9 adversary A1, siblings DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence (used by Test-DvReceiptValid and Invoke-VenueLeg.ps1) and the job
         generator's embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over every r10 row are INVALID, and the embedded reader does not derive ok."""
-        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        asks = self.fstoggle_spec()
         ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
         rows = self.r10_rows()
         with tempfile.TemporaryDirectory(prefix="wt-r10-") as d:
@@ -16453,6 +16453,52 @@ class WindowToggleEvidenceTests(unittest.TestCase):
 
     R11_MARKER = "playback_smoke.measured_session id=3\n"
 
+    @staticmethod
+    def fstoggle_spec() -> dict:
+        """r11 (r11 adversary A1): a requested leg is the committed s1 fstoggle spec, whose criteria bind the five scalars (Get-DvWindowToggleCriteriaGap)."""
+        return json.loads((DV / "legs" / "m16-1457-native-windowed-s1-fstoggle.json").read_text(encoding="utf-8"))
+
+    def test_r11_adv_a1_a_requested_leg_whose_criteria_do_not_bind_the_toggle_scalars_is_invalid(self) -> None:
+        """r11 (r11 adversary A1 on b82002ec, site DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence; siblings Invoke-VenueLeg.ps1:1159 and Test-DvReceiptValid,
+        which both call it): an honest non-ok proof is failed only by the criteria, so a requested leg whose criteria drop any of the five bindings is INVALID."""
+        full = self.fstoggle_spec()
+        def without(metric: str) -> dict:
+            spec = json.loads(json.dumps(full))
+            for set_name in ("acceptance", "supplementary"):
+                for role, rows in spec["criteria"][set_name].items():
+                    spec["criteria"][set_name][role] = [r for r in rows if r.get("metric") != metric]
+            return spec
+        incomplete = self.log(summary="gui_smoke.window_toggles requested=4 driven=4 reason=incomplete")
+        repeated = self.log().replace("\ngui_smoke.window_toggles ", "\n" + self.R11_MARKER + "gui_smoke.window_toggles ", 1)
+        no_accept = json.loads(json.dumps(full))
+        del no_accept["criteria"]["acceptance"]
+        cases = [
+            ("adversary input 1: windowToggleEvidenceReason removed, an honest reason=incomplete", without("windowToggleEvidenceReason"), incomplete, True),
+            ("adversary input 2: windowToggleEvidenceReason removed, a repeated measured_session marker", without("windowToggleEvidenceReason"), repeated, True),
+            ("windowTogglesKeptPlaying removed", without("windowTogglesKeptPlaying"), incomplete, True),
+            ("criteria.acceptance absent", no_accept, incomplete, True),
+            ("control: the committed spec over an honest reason=incomplete (a FAIL by the criteria, not INVALID)", full, incomplete, False),
+            ("control: the committed spec over a healthy log", full, self.log(), False),
+        ]
+        with tempfile.TemporaryDirectory(prefix="wt-r11adv-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": log} for _, spec, log, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "  $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = [string]$r.reason }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, _, blocks), got in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(got["blocks"], blocks, got)
+                if blocks:
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
+
     def r11_a1_rows(self) -> list[tuple[str, str, str, str, tuple[int, int, int, int]]]:
         """r11 (sol r10 A1 and opus key3 r10 B1 on 7fc447b9): (name, log, session, typed reason, counts). The window is the FIRST marker of the session, closed at the
         next marker of ANY other id; a second marker of the same id is itself evidence of a broken session (the app writes one per process), so it names itself."""
@@ -16491,7 +16537,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     def test_r11_a1_the_reconcile_gate_and_the_job_embedded_reader_refuse_a_repeated_marker(self) -> None:
         """r11 (sol r10 A1 siblings: DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence, used by Test-DvReceiptValid and Invoke-VenueLeg.ps1, and the job's
         embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over every r11 A1 row are INVALID, and the embedded reader names the repeated marker."""
-        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        asks = self.fstoggle_spec()
         ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
         rows = [r for r in self.r11_a1_rows() if r[2] == "3"]
         with tempfile.TemporaryDirectory(prefix="wt-r11-") as d:
@@ -16528,7 +16574,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     def test_r11_a2_an_unreadable_measured_session_refuses_requested_toggle_proof(self) -> None:
         """r11 (sol r10 A2, opus key3 r10 H1, site DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence): when Get-DvSmokeSummaryFields reads the measured session
         as UNREADABLE, the reconcile gate refuses the toggle proof with a typed reason and never hands an empty id to the reader's automatic session selection."""
-        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        asks = self.fstoggle_spec()
         ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
         m = self.R11_MARKER
         cases = [
@@ -16563,7 +16609,7 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     def test_r3_b4_a_requested_leg_must_back_its_scalars_with_the_hashed_run_log(self) -> None:
         """r3 B4 (sol): requested-toggle success is reconciled with the hashed run log, in the writer and in receipt validation, by the one shared reader
         Get-DvWindowToggleReconcileEvidence (the log's own derivation, never the summary scalars, decides)."""
-        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        asks = self.fstoggle_spec()
         good = self.log()
         summary = "gui_smoke.window_toggles requested=4 driven=4 reason=ok"
         ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
