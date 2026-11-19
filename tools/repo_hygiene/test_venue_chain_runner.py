@@ -1499,6 +1499,25 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         ok = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output hi; exit 3') -TimeoutSec 60; \"$($r.timedOut) $($r.exit) $($r.stdout.Trim())\"")
         self.assertEqual(ok, "False 3 hi")
 
+    def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
+        """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent
+        and holds the inherited stdout (Start-Process -NoNewWindow, 40 s) now costs the ONE -CleanupWaitMs budget, not 15 s per wait. A5: a tree kill that threw is never `killConfirmed`
+        just because the root exited, and a clean kill is."""
+        # (the helper's own elapsed is measured INSIDE pwsh: this test's subprocess also waits for the grandchild that holds its inherited pipe)
+        got = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $sw = [Diagnostics.Stopwatch]::StartNew(); $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command',"
+                        "'Start-Process -FilePath pwsh -ArgumentList ''-NoProfile'',''-Command'',''Start-Sleep 25'' -NoNewWindow; Write-Output hi') -TimeoutSec 60 -CleanupWaitMs 1000; "
+                        "\"$($r.timedOut) $($r.exit) $($r.killConfirmed) $([int]$sw.Elapsed.TotalSeconds)\"")
+        parts = got.split()
+        self.assertEqual(parts[:3], ["False", "0", "True"], got)
+        self.assertLess(int(parts[3]), 10, f"the cleanup waits are one 1 s budget, not 15 s each: {got}")
+        killed = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 5000; "
+                           "\"$($r.timedOut) $($r.killConfirmed)\"")
+        self.assertEqual(killed, "True True")
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("try { $p.Kill($true) } catch { $killErrored = $true }", body, "a tree kill that threw is recorded, not swallowed")
+        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })", body)
+
     def test_staged_manifest_states(self) -> None:
         q = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueStagedBuildManifest -AgentShare '{{}}' -SourceCommit '{SHA}' -TimeoutSec 20; \"$($r.state) $($r.sha256)\""
         self.assertEqual(pwsh_text(q.format(self.um_share)), f"STAGED {self.staged_sha}")

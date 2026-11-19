@@ -434,6 +434,8 @@ HEADERS += MainWindow.h \
     GpuDisplayWindow.h \
     GpuWindowViewerInput.h \
     GpuWindowViewerInputForwarder.h \
+    ViewerDoubleClickPolicy.h \
+    ViewerDoubleClickFilter.h \
     GpuFieldTelemetry.h \
     GpuFieldTelemetryCore.h \
     GpuDeviceLossBreaker.h \

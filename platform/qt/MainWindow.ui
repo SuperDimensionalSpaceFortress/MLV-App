@@ -295,6 +295,7 @@
     <addaction name="actionZoom100"/>
     <addaction name="actionFullscreen"/>
     <addaction name="actionShowLookLabelInFullscreen"/>
+    <addaction name="actionDoubleClickViewerFullscreen"/>
    </widget>
    <widget class="QMenu" name="menuView">
     <property name="title">
@@ -10600,6 +10601,20 @@ QGroupBox::indicator:checked:disabled {
    </property>
    <property name="toolTip">
     <string>Show the current Look Assist look as small text in the bottom-right corner while in fullscreen. The look itself is applied either way.</string>
+   </property>
+  </action>
+  <action name="actionDoubleClickViewerFullscreen">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="checked">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Double-Click Viewer Toggles Fullscreen</string>
+   </property>
+   <property name="toolTip">
+    <string>Double-click the picture to enter or leave fullscreen. Off while a picker, bad-pixel edit or gradient paint is active.</string>
    </property>
   </action>
   <action name="actionCaching">

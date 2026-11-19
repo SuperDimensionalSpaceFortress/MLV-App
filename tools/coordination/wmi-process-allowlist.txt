@@ -15,6 +15,7 @@ tools/coordination/board-health-sweep.ps1 | query-only
 tools/coordination/build-guard.ps1 | query-only
 tools/coordination/invoke-mlv-exclusive.ps1 | query-only
 tools/profiling/bachelor/AttrCudaArtifacts.psm1 | query-only
+tools/profiling/bachelor/Deploy-BachelorAgent.ps1 | query-only
 tools/profiling/bachelor/playback-attr-3-cuda-job.ps1 | query-only
 tools/profiling/bachelor/ultra-magnus-agent.ps1 | query-only
 tools/profiling/dual-venue/Wait-VenueQuiet.ps1 | query-only

@@ -262,17 +262,9 @@ function Stop-DriverScriptMissing([object]$Leg, [string]$PathReason, [string]$Ph
 }
 
 function Get-LegPreLoadMean([string]$ReceiptPath) {
-    # The leg's own pre-load mean, read from the run's summary.json (cpuQuiescence.timeMeanPercent) -- never from the receipt file. Invoke-VenueLeg writes the
-    # receipt as <root>\<card>\<legId>\<venue>\<receiptId>.json and the run evidence to <parent of root>\evidence\<receiptId>. $null when absent.
-    try {
-        if (-not $ReceiptPath) { return $null }
-        $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
-        $summary = Join-Path (Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))) 'summary.json'
-        if (-not (Test-Path -LiteralPath $summary -PathType Leaf)) { return $null }
-        $q = ([IO.File]::ReadAllText($summary) | ConvertFrom-Json).cpuQuiescence
-        if ($null -eq $q -or $null -eq $q.timeMeanPercent) { return $null }
-        [double]$q.timeMeanPercent
-    } catch { $null }
+    # The leg's own pre-load mean (cpuQuiescence.timeMeanPercent of the run's summary, never the receipt file): one reader, VenueChain.psm1's, which knows both the
+    # playback and the export evidence layouts. EXPORT-VENUE-LEG-1 r3: this script's own copy of it had the playback path only. $null when absent.
+    Get-VenueLegPreLoadMean -ReceiptPath $ReceiptPath
 }
 
 function Add-Result([object]$Leg, [string]$Status, [hashtable]$Extra) {

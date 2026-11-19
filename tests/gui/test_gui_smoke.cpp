@@ -13,6 +13,7 @@
 #include "../../platform/qt/PlayerTransportToolbar.h"
 #include "../../platform/qt/ScopesLabel.h"
 #include "../../platform/qt/VectorScope.h"
+#include "../../platform/qt/ViewerDoubleClickFilter.h"
 #include "../../platform/qt/WaveFormMonitor.h"
 #include "../../platform/qt/ZebraThresholds.h"
 #include "../common/image_regression.h"
@@ -53,6 +54,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStringListModel>
+#include <QStyleHints>
 #include <QTableWidget>
 #include <QTemporaryDir>
 #include <QToolBar>
@@ -693,6 +695,17 @@ private slots:
     void mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
+    // PLAYER-DOUBLECLICK-FULLSCREEN-1
+    void viewerDoubleClick_viewportTogglesOnceAndIsSwallowed();
+    void viewerDoubleClick_glWindowTogglesOnce();
+    void viewerDoubleClick_armedToolPassesThrough();
+    void viewerDoubleClick_otherButtonModifierSettingOrNoClipDoNotToggle();
+    void viewerDoubleClick_otherWidgetDoesNotToggle();
+    void viewerDoubleClick_toolArmedAtFirstPressSuppresses();
+    void viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequence();
+    void viewerDoubleClick_newSequenceAfterAMovedOrSlowPressToggles();
+    void viewerDoubleClick_glWindowRealQtPairingKeepsTheFirstPressRecord();
+    void viewerDoubleClick_firstPressOutsideTheViewerStartsAnUnarmedRecord();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
     void gpuViewportZebraProcessingMatchesCpuReference();
     void gpuViewportPreviewProcessingMatchesCpuReference();
@@ -4818,6 +4831,309 @@ void GuiSmokeTest::glWindowViewerInput_getterRecordsThePaintedPicture()
     host.reset();
     QVERIFY(!GpuDisplayWindow::isActive());
     qunsetenv(GpuDisplayWindow::environmentVariableName());
+}
+
+// PLAYER-DOUBLECLICK-FULLSCREEN-1: the viewer double-click filter, driven through a real application
+// event filter exactly as MainWindow::eventFilter calls it. "viewport" stands in for the
+// QGraphicsView viewport, "gl" for the GL display window, "fullscreen" for actionFullscreen.
+namespace
+{
+
+class DoubleClickCountingWidget : public QWidget
+{
+public:
+    int doubleClicks = 0;
+
+protected:
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        ++doubleClicks;
+        event->accept();
+    }
+};
+
+class ViewerDoubleClickFixture : public QObject
+{
+public:
+    ViewerDoubleClickFixture()
+    {
+        fullscreen.setCheckable(true);
+        state.enabled = true;
+        state.clipLoaded = true;
+        qApp->installEventFilter(this);
+    }
+    ~ViewerDoubleClickFixture() override { qApp->removeEventFilter(this); }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == &gl && event->type() == QEvent::MouseButtonDblClick) ++glDoubleClicksSeen;
+        if (watched == &gl && event->type() == QEvent::MouseButtonPress
+         && static_cast<QMouseEvent *>(event)->flags().testFlag(Qt::MouseEventCreatedDoubleClick)) ++glFlaggedPressesSeen;
+        const auto stateFn = [this](const QObject *target, const QPointF &pos) {
+            lastTarget = target;
+            viewer_dblclick::ViewerState now = state;
+            if (!handleAt.isNull() && target == &viewport && (pos - handleAt).manhattanLength() < 2.0) {
+                now.gradientHandleHovered = true; // a handle hit-tested at the event's own position
+            }
+            if (disarmAfterFirstRead) { // a one-shot tool (gradient paint) turns itself off after its click
+                state.wbArmed = state.bpArmed = state.gradientPaintArmed = state.gradientHandleHovered = false;
+            }
+            return now;
+        };
+        if (viewer_dblclick::filterEvent(gate, watched, event, &viewport, &gl, stateFn)) {
+            fullscreen.trigger();
+            return true;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+    viewer_dblclick::Gate gate;
+    viewer_dblclick::ViewerState state;
+    bool disarmAfterFirstRead = false;
+    QPointF handleAt;                       // null: no handle anywhere
+    const QObject *lastTarget = nullptr;    // the surface the reader was last handed
+    int glDoubleClicksSeen = 0;
+    int glFlaggedPressesSeen = 0;
+    DoubleClickCountingWidget viewport;
+    QWindow gl;
+    QAction fullscreen;
+};
+
+void deliverViewerMouse(QObject *receiver, QEvent::Type type, Qt::MouseButton button,
+                        Qt::KeyboardModifiers modifiers = Qt::NoModifier, quint64 timestampMs = 0,
+                        const QPointF & pos = QPointF(10, 10))
+{
+    QMouseEvent event(type, pos, pos, button,
+                      type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::MouseButtons(button), modifiers);
+    if (timestampMs != 0) {
+        event.setTimestamp(timestampMs);
+    }
+    QCoreApplication::sendEvent(receiver, &event);
+}
+
+int doubleClickIntervalMs()
+{
+    return QGuiApplication::styleHints()->mouseDoubleClickInterval();
+}
+
+} // namespace
+
+void GuiSmokeTest::viewerDoubleClick_viewportTogglesOnceAndIsSwallowed()
+{
+    ViewerDoubleClickFixture f;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QCOMPARE(f.fullscreen.isChecked(), true);
+    QCOMPARE(f.viewport.doubleClicks, 0); // swallowed: the scene's double-click press path never runs
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QCOMPARE(f.fullscreen.isChecked(), false); // a second double-click leaves fullscreen
+    QCOMPARE(f.viewport.doubleClicks, 0);
+}
+
+void GuiSmokeTest::viewerDoubleClick_glWindowTogglesOnce()
+{
+    ViewerDoubleClickFixture f;
+    QSignalSpy triggered(&f.fullscreen, &QAction::triggered);
+    deliverViewerMouse(&f.gl, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QCOMPARE(triggered.count(), 1);
+    QCOMPARE(f.fullscreen.isChecked(), true);
+}
+
+void GuiSmokeTest::viewerDoubleClick_armedToolPassesThrough()
+{
+    for (int tool = 0; tool < 4; ++tool) {
+        ViewerDoubleClickFixture f;
+        f.state.wbArmed = tool == 0;
+        f.state.bpArmed = tool == 1;
+        f.state.gradientPaintArmed = tool == 2;
+        f.state.gradientHandleHovered = tool == 3;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+        QVERIFY2(!f.fullscreen.isChecked(), qPrintable(QStringLiteral("tool %1 armed still toggled").arg(tool)));
+        QCOMPARE(f.viewport.doubleClicks, 1); // passed through to the viewer unchanged
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_otherButtonModifierSettingOrNoClipDoNotToggle()
+{
+    {
+        ViewerDoubleClickFixture f;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::RightButton);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
+    {
+        ViewerDoubleClickFixture f;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::ShiftModifier);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
+    {
+        ViewerDoubleClickFixture f;
+        f.state.enabled = false;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
+    {
+        ViewerDoubleClickFixture f;
+        f.state.clipLoaded = false;
+        deliverViewerMouse(&f.gl, QEvent::MouseButtonDblClick, Qt::LeftButton);
+        QVERIFY(!f.fullscreen.isChecked());
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_otherWidgetDoesNotToggle()
+{
+    ViewerDoubleClickFixture f;
+    DoubleClickCountingWidget other;
+    deliverViewerMouse(&other, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QVERIFY(!f.fullscreen.isChecked());
+    QCOMPARE(other.doubleClicks, 1);
+    QCOMPARE(f.viewport.doubleClicks, 0);
+}
+
+void GuiSmokeTest::viewerDoubleClick_toolArmedAtFirstPressSuppresses()
+{
+    const quint64 interval = static_cast<quint64>(qMax(1, doubleClickIntervalMs()));
+    ViewerDoubleClickFixture f;
+    // Gradient paint armed at the first press; it switches itself off on that click's release.
+    f.state.gradientPaintArmed = true;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000);
+    f.state.gradientPaintArmed = false;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 8);
+    // Widget path: Qt hands the widget only the double-click for the second click, never its press.
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4);
+    QVERIFY(!f.fullscreen.isChecked());
+    QCOMPARE(f.viewport.doubleClicks, 1);
+
+    // A later double-click with nothing armed toggles as usual.
+    const quint64 later = 100000 + interval * 10;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, later);
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, later + interval / 4);
+    QVERIFY(f.fullscreen.isChecked());
+    QCOMPARE(f.viewport.doubleClicks, 1);
+}
+
+void GuiSmokeTest::viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequence()
+{
+    // Adversary A1 (r1, dd9f5441): a press on the gradient handle at (100,100), then within the
+    // interval a press far away with nothing armed, then a double-click there. Qt does not pair
+    // presses farther apart than the double-click distance, so the far press starts a new
+    // sequence and its double-click must toggle.
+    const quint64 interval = static_cast<quint64>(qMax(4, doubleClickIntervalMs()));
+    ViewerDoubleClickFixture f;
+    f.state.gradientHandleHovered = true;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000, QPointF(100, 100));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 20, QPointF(100, 100));
+    f.state.gradientHandleHovered = false;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4 + 1, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 2, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 2, QPointF(500, 500));
+    QVERIFY(f.fullscreen.isChecked());
+    QCOMPARE(f.viewport.doubleClicks, 0);
+}
+
+void GuiSmokeTest::viewerDoubleClick_newSequenceAfterAMovedOrSlowPressToggles()
+{
+    // Adversary pass 2 (65c29245) A1 and A2, on the widget path (Qt never hands a widget the
+    // second press of a double-click, only the double-click). A1: WB-armed press at (100,100)
+    // t=1000, the cursor moves away and back (Qt resets pairing), an unarmed press at t=1100,
+    // the double-click at t=1200. A2: the same with the unarmed press at t=1400 (exactly one
+    // interval later: Qt starts a new sequence) and the double-click at t=1500. Both toggle.
+    const quint64 interval = 400;
+    for (int variant = 0; variant < 2; ++variant) {
+        ViewerDoubleClickFixture f;
+        const quint64 t0 = 1000;
+        const quint64 unarmedAt = variant == 0 ? t0 + 100 : t0 + interval;
+        f.state.wbArmed = true;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, t0, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, t0 + 10, QPointF(100, 100));
+        f.state.wbArmed = false;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, unarmedAt, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, unarmedAt + 10, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, unarmedAt + 100, QPointF(100, 100));
+        QVERIFY2(f.fullscreen.isChecked(), qPrintable(QStringLiteral("variant %1 (A%2) did not toggle").arg(variant).arg(variant + 1)));
+        QCOMPARE(f.viewport.doubleClicks, 0);
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_glWindowRealQtPairingKeepsTheFirstPressRecord()
+{
+    // GL path through Qt's own pairing (adversary r1 pass 2 A3): QTest feeds the window system,
+    // so QGuiApplication forms the double-click, flags the second press and sends the
+    // double-click. A tool armed at the first press only (it turns itself off after the first
+    // read) still suppresses; with nothing armed the same gesture toggles.
+    {
+        ViewerDoubleClickFixture f;
+        f.gl.resize(64, 64);
+        f.state.gradientPaintArmed = true;
+        f.disarmAfterFirstRead = true;
+        QTest::mouseDClick(&f.gl, Qt::LeftButton, Qt::NoModifier, QPoint(10, 10));
+        QCOMPARE(f.glDoubleClicksSeen, 1);
+        QCOMPARE(f.glFlaggedPressesSeen, 1);
+        QVERIFY(!f.state.gradientPaintArmed); // it really was off by the double-click
+        QVERIFY(!f.fullscreen.isChecked());
+    }
+    {
+        ViewerDoubleClickFixture f;
+        f.gl.resize(64, 64);
+        QTest::mouseDClick(&f.gl, Qt::LeftButton, Qt::NoModifier, QPoint(10, 10));
+        QCOMPARE(f.glDoubleClicksSeen, 1);
+        QVERIFY(f.fullscreen.isChecked());
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_firstPressOutsideTheViewerStartsAnUnarmedRecord()
+{
+    // Adversary r1 pass 3 A2, widget path: a WB-armed viewer press/release at t=1000, then WB off.
+    // Qt's first press of the next pair lands just outside the viewer (a layout gap of the same
+    // native window) at t=10000; the second press on the viewer is flagged and never reaches the
+    // widget; the double-click goes to the viewport at t=10100. It must toggle.
+    // Every native press reaches a QWindow (the top-level QWidgetWindow) before any widget, so the
+    // gap press is delivered to a window here. r2 pass 4 A2: a distinct press may reuse the
+    // recorded press's timestamp (native injection); it still starts a new unarmed record.
+    for (int reuseTimestamp = 0; reuseTimestamp < 2; ++reuseTimestamp) {
+        ViewerDoubleClickFixture f;
+        QWindow topLevelWindow;
+        f.state.wbArmed = true;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 1000);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 1010);
+        f.state.wbArmed = false;
+        const quint64 gapAt = reuseTimestamp ? 1000 : 10000;
+        deliverViewerMouse(&topLevelWindow, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, gapAt);
+        deliverViewerMouse(&topLevelWindow, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, gapAt + 10);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, gapAt + 100);
+        QVERIFY2(f.fullscreen.isChecked(), qPrintable(QStringLiteral("reuseTimestamp=%1 did not toggle").arg(reuseTimestamp)));
+        QCOMPARE(f.viewport.doubleClicks, 0);
+    }
+    // r2 pass 4 A1: the handle is hit-tested at the event's own position, which the reader is
+    // handed; the live cursor plays no part. A press on the handle at (100,55) suppresses.
+    {
+        ViewerDoubleClickFixture f;
+        f.handleAt = QPointF(100, 55);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 30000, QPointF(100, 55));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 30010, QPointF(100, 55));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 30100, QPointF(100, 55));
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+        QCOMPARE(f.lastTarget, static_cast<const QObject *>(&f.viewport));
+    }
+    // The same physical press reaching the top-level window first and the QGraphicsView parent
+    // after the viewport keeps an armed viewer record: the double-click passes through.
+    {
+        ViewerDoubleClickFixture f;
+        QWindow topLevel;
+        DoubleClickCountingWidget view;
+        f.state.gradientPaintArmed = true;
+        deliverViewerMouse(&topLevel, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 20000);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 20000);
+        deliverViewerMouse(&view, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 20000);
+        f.state.gradientPaintArmed = false; // the one-shot tool turns itself off on release
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 20010);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 20100);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
 }
 
 int main(int argc, char ** argv)
