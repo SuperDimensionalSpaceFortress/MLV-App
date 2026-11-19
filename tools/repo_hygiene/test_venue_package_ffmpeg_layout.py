@@ -530,6 +530,59 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("could not be read as a zip", result["reason"])
 
+    def _restore(self, out: Path, preexisting: list[str]) -> dict:
+        module = str(HELPER_MODULE).replace("'", "''")
+        script = (
+            f"$m = Import-Module '{module}' -Force -PassThru\n"
+            "$pre = @(ConvertFrom-Json $env:FFX_PRE)\n"
+            "$r = & $m { param($o, $p) Restore-PinnedPayloadTransaction -OutputDir $o -Preexisting $p } $env:FFX_OUT $pre\n"
+            "$r | ConvertTo-Json -Compress\n"
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
+                              timeout=120, env=dict(os.environ, FFX_OUT=str(out), FFX_PRE=json.dumps(preexisting or ["-none-"])))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_a_killed_install_gets_its_original_back(self) -> None:
+        # adversary f92303b7-A1: the extractor moved the original ffmpeg.exe into its transaction backup and was killed (timeout)
+        # before the replacement landed; the Python rollback never ran, so ffmpeg.exe was absent and OLD stayed in the backup.
+        out = self.tmp / "out"
+        killed = out / ".vendored-payload-transaction-killed"
+        killed.mkdir(parents=True)
+        (killed / "ffmpeg.exe").write_bytes(b"OLD")
+        older = out / ".vendored-payload-transaction-older"
+        older.mkdir()
+        (older / "x.dll").write_bytes(b"KEEP")
+        result = self._restore(out, [older.name])
+        self.assertEqual(result["restored"], ["ffmpeg.exe"], result)
+        self.assertEqual(result["errors"], [], result)
+        self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"OLD")
+        self.assertEqual(list(killed.iterdir()), [], "the backup must be moved out, not copied")
+        self.assertEqual((older / "x.dll").read_bytes(), b"KEEP", "a transaction folder that predates the child is never touched")
+        self.assertFalse((out / "x.dll").exists())
+        # killed after the replacement was published but before the backup was cleaned: the original wins (all-or-nothing).
+        killed2 = out / ".vendored-payload-transaction-killed2"
+        killed2.mkdir()
+        (killed2 / "ffmpeg.exe").write_bytes(b"ORIGINAL")
+        (out / "ffmpeg.exe").write_bytes(b"NEW")
+        result = self._restore(out, [older.name, killed.name])
+        self.assertEqual(result["restored"], ["ffmpeg.exe"], result)
+        self.assertEqual((out / "ffmpeg.exe").read_bytes(), b"ORIGINAL")
+        missing = self._restore(self.tmp / "no-such-dir", [])
+        self.assertEqual(missing["restored"], [])
+        self.assertTrue(missing["errors"], "an unlistable folder is reported, never thrown")
+
+    def test_the_timeout_branch_reconciles_only_after_a_confirmed_kill(self) -> None:
+        text = _normalised(HELPER_MODULE)
+        body = text[text.index(f"function {HELPER} {{"):]
+        snapshot = body.index("$preexistingTransactions = @(Get-ChildItem -LiteralPath $OutputDir")
+        self.assertLess(snapshot, body.index("[System.Diagnostics.Process]::Start($psi)"), "the pre-existing folders must be listed before the child starts")
+        branch = body[body.index("if ($result.timedOut) {"): body.index("if ($result.exitCode -ne 0) {")]
+        self.assertRegex(branch, r"if \(\$result\.killConfirmed\) \{\n\s*\$restore = Restore-PinnedPayloadTransaction -OutputDir \$OutputDir -Preexisting \$preexistingTransactions\n")
+        self.assertIn("was NOT reconciled", branch)
+        restore = text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
+        self.assertNotRegex(restore, r"Remove-Item|::Delete\(", "the reconciliation only moves files back, it never deletes")
+
     def test_the_file_hold_refuses_a_changed_file_and_blocks_a_delete_while_held(self) -> None:
         target = self.tmp / "ffmpeg.exe"
         target.write_bytes(b"pinned")

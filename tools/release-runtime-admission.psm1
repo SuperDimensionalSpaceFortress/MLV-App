@@ -52,6 +52,43 @@ function Stop-PinnedPayloadChild {
     return [pscustomobject][ordered]@{ exited = $exited; killError = $killError; confirmed = ($exited -and -not $killError) }
 }
 
+# Puts back every original a killed extractor left in a transaction folder it created (extract_vendored_native_payload.py
+# _publish_staged_transaction moves each existing destination into .vendored-payload-transaction-*\<name> before it installs the
+# replacement). Only folders NOT in -Preexisting are touched. Moves only, never a delete: the backup replaces whatever now sits at
+# the destination (all-or-nothing, as the Python rollback does), and the emptied folder is left for the failed build to report.
+# Never throws; returns { restored, errors }.
+function Restore-PinnedPayloadTransaction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutputDir,
+
+        [AllowEmptyCollection()]
+        [string[]]$Preexisting = @()
+    )
+    $restored = @()
+    $errors = @()
+    try {
+        $folders = @(Get-ChildItem -LiteralPath $OutputDir -Force -Directory -Filter '.vendored-payload-transaction-*' -ErrorAction Stop |
+            Where-Object { $Preexisting -notcontains $_.Name -and -not $_.LinkType })
+    } catch {
+        return [pscustomobject][ordered]@{ restored = @(); errors = @("the output folder could not be listed: $($_.Exception.Message)") }
+    }
+    foreach ($folder in $folders) {
+        foreach ($backup in @(Get-ChildItem -LiteralPath $folder.FullName -Force -File -ErrorAction SilentlyContinue)) {
+            if ($backup.LinkType) { $errors += "$($backup.FullName) is a link; not restored"; continue }
+            try {
+                [System.IO.File]::Move($backup.FullName, (Join-Path $OutputDir $backup.Name), $true)
+                $restored += $backup.Name
+            } catch {
+                $errors += "$($backup.Name): $($_.Exception.Message)"
+            }
+        }
+    }
+    return [pscustomobject][ordered]@{ restored = $restored; errors = $errors }
+}
+
 function Install-PinnedVendoredPayload {
     [CmdletBinding()]
     param(
@@ -84,6 +121,7 @@ function Install-PinnedVendoredPayload {
         stdout        = ''
         stderr        = ''
         installed     = @()
+        transactionRestored = @()
     }
     # Every step fills $result; anything that throws (a locked installed file, an unreadable report) is a
     # typed ok=false here, never an exception past the caller's own failure branch.
@@ -162,6 +200,9 @@ function Invoke-PinnedPayloadInstall {
         if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }
     }
 
+    # The extractor's own transaction folders already in OutputDir before this child starts; only a NEW one is this child's
+    # (adversary f92303b7-A1, reconciled below after a confirmed timeout kill).
+    $preexistingTransactions = @(Get-ChildItem -LiteralPath $OutputDir -Force -Directory -Filter '.vendored-payload-transaction-*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
     try {
         $process = [System.Diagnostics.Process]::Start($psi)
     } catch {
@@ -191,6 +232,16 @@ function Invoke-PinnedPayloadInstall {
             "the extractor was still running after $TimeoutSec s; its process tree was killed and its exit seen"
         } else {
             "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid or a descendant may still be running$(if ($killError) { "; kill error: $killError" }))"
+        }
+        # Adversary f92303b7-A1: a kill between the extractor's move of an original into its transaction backup and the install of
+        # the replacement bypasses the Python rollback and leaves the destination missing. Once the kill is CONFIRMED (no child can
+        # still move files) the originals are put back; with an unconfirmed kill nothing is touched, since the child may still run.
+        if ($result.killConfirmed) {
+            $restore = Restore-PinnedPayloadTransaction -OutputDir $OutputDir -Preexisting $preexistingTransactions
+            $result.transactionRestored = @($restore.restored)
+            $result.reason += "; transaction reconciled: restored [$(@($restore.restored) -join ', ')]$(if (@($restore.errors).Count) { ", errors [$(@($restore.errors) -join '; ')]" })"
+        } else {
+            $result.reason += '; its transaction was NOT reconciled (the extractor may still be running)'
         }
         return [pscustomobject]$result
     }
