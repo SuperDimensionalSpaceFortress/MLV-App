@@ -1531,6 +1531,34 @@ $at = { param($ms) [Diagnostics.Stopwatch]::GetTimestamp() - [int64]($ms * $hz /
         self.assertTrue(950 <= out["toDeadline"] <= 1000, out)
         self.assertEqual(0, out["deadlinePassed"], "no wait starts once D is reached")
 
+    def test_a_launch_stamp_at_or_below_zero_is_a_real_moment_not_no_launch(self) -> None:
+        # -2 r3 (hosted run 44531859108, F1): a stamp a fixed time before GetTimestamp() is <= 0 on a runner booted less than that time ago (the counter starts
+        # near boot), and the old `-le 0` sentinel read it as "no launch" (since = -1, the full chunk, no deadline). No launch is now an OMITTED stamp ($null);
+        # every int64 stamp, 0 and negatives included, is a moment on the counter. The stamps here sit at or below 0 on EVERY box, however long it has run.
+        out = run_ps(r"""
+$hz = [Diagnostics.Stopwatch]::Frequency
+$aSecondBeforeTheOrigin = -[int64]$hz
+$w = New-GuiSmokeLogProgressWatch -LogRoot (Join-Path $env:GS_TMP 'nolaunchsentinel') -WindowMs 1000 -LaunchTimestamp $aSecondBeforeTheOrigin
+$keptStamp = [int64]$w.LaunchTimestamp
+Stop-GuiSmokeLogProgressWatch -Watch $w
+$s = New-Stub 'Start-Sleep -Seconds 30'
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 1000 -NoProgressWindowMs 500 -NoProgressStalled -LifetimeBudgetMs 1000 -LaunchTimestamp $aSecondBeforeTheOrigin
+[pscustomobject]@{
+    unset = Get-GuiSmokeSinceLaunchMs
+    origin = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp 0
+    beforeOrigin = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $aSecondBeforeTheOrigin
+    chunkPastDeadline = Get-GuiSmokeChunkWaitMs -ChunkMs 4000 -LaunchTimestamp $aSecondBeforeTheOrigin -DeadlineMs 1000 -ExpiryMs -1
+    watchKeepsStamp = ($keptStamp -eq $aSecondBeforeTheOrigin)
+    boundaryOutcome = $r.outcome
+} | ConvertTo-Json -Compress
+""")
+        self.assertEqual(-1, out["unset"], "an omitted stamp is no launch")
+        self.assertGreaterEqual(out["origin"], 0, "stamp 0 is the counter's origin, a real moment: " + repr(out))
+        self.assertGreaterEqual(out["beforeOrigin"], 1000, "a stamp one second before the origin is at least one second ago: " + repr(out))
+        self.assertEqual(0, out["chunkPastDeadline"], "launched at least 1 s ago against D = 1000 ms: no wait starts: " + repr(out))
+        self.assertTrue(out["watchKeepsStamp"], "the watch keeps the caller's stamp, never replaces it with its own moment: " + repr(out))
+        self.assertEqual("timeout", out["boundaryOutcome"], "the app was alive past the whole budget measured from that stamp: " + repr(out))
+
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
 class TheLoadAllowanceEndsOnTheGuiSmokeMarker(unittest.TestCase):

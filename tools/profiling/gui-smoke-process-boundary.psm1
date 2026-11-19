@@ -229,12 +229,13 @@ function New-GuiSmokeLogProgressWatch {
         # L (Get-GuiSmokeWatchdogLimitMs): no expiry is later than this many ms after the launch. 3600000 = no limit given (the safety ceiling).
         [ValidateRange(1, 3600000)]
         [int64]$LimitMs = 3600000,
-        # the runner's launch stamp (Stopwatch.GetTimestamp() read before Process.Start); 0 = this call's own moment (a watch made without a launch)
-        [int64]$LaunchTimestamp = 0
+        # the runner's launch stamp (Stopwatch.GetTimestamp() read before Process.Start); omitted ($null) = this call's own moment (a watch made without a
+        # launch). -2 r3: every int64 is a moment on the counter, 0 and negatives included (a stamp taken before the counter's origin is still a stamp).
+        [Nullable[int64]]$LaunchTimestamp = $null
     )
 
     $load = [Math]::Max($WindowMs, $LoadWindowMs)
-    $launch = if ($LaunchTimestamp -gt 0) { $LaunchTimestamp } else { [System.Diagnostics.Stopwatch]::GetTimestamp() }
+    $launch = if ($null -ne $LaunchTimestamp) { [int64]$LaunchTimestamp } else { [System.Diagnostics.Stopwatch]::GetTimestamp() }
     [pscustomobject]@{
         LogRoot = $LogRoot
         WindowMs = $WindowMs
@@ -484,14 +485,16 @@ function Get-GuiSmokeExitBudgetVerdict {
 }
 
 # The monotonic time since the runner's launch stamp (Stopwatch.GetTimestamp() read before Process.Start), in ms; -1 when no stamp was given.
+# -2 r3 (hosted run 44531859108): "no stamp" is an OMITTED (or $null) stamp, never a value: the old `-le 0` sentinel read a stamp taken a fixed time before
+# GetTimestamp() as "no launch" on a runner booted less than that time ago (the counter starts near boot). Every int64, 0 and negatives included, is a moment.
 function Get-GuiSmokeSinceLaunchMs {
     [CmdletBinding()]
     param(
-        [int64]$LaunchTimestamp = 0
+        [Nullable[int64]]$LaunchTimestamp = $null
     )
 
-    if ($LaunchTimestamp -le 0) { return -1.0 }
-    return [double]([System.Diagnostics.Stopwatch]::GetTimestamp() - $LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency
+    if ($null -eq $LaunchTimestamp) { return -1.0 }
+    return [double]([System.Diagnostics.Stopwatch]::GetTimestamp() - [int64]$LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency
 }
 
 function Test-GuiSmokeWaitBudgetExhausted {
@@ -502,8 +505,8 @@ function Test-GuiSmokeWaitBudgetExhausted {
         [Parameter(Mandatory)]
         [ValidateRange(0, 3600000)]
         [int64]$BudgetMs,
-        # Stopwatch.GetTimestamp() read before the process was started; 0 = not known
-        [int64]$LaunchTimestamp = 0,
+        # Stopwatch.GetTimestamp() read before the process was started; omitted ($null) = not known (-2 r3: every int64 is a moment, 0 included)
+        [Nullable[int64]]$LaunchTimestamp = $null,
         # r16 (sol r15 B2): the caller's last monotonic sighting of the app running, in ms since launch (0 = only the launch is known)
         [double]$LastAliveMs = 0,
         # -2 r1 (adversary r16 A2): the caller's FIRST sighting of the exit, ms since launch, carried by reference ($null = none carried). When it already
@@ -562,7 +565,8 @@ function Wait-GuiSmokeProcessBounded {
         # saw, the expired deadline): an app that outlived the budget before exiting is a timeout, one that exited inside it keeps its native exit.
         [ValidateRange(0, 3600000)]
         [int64]$LifetimeBudgetMs = 0,
-        [int64]$LaunchTimestamp = 0,
+        # -2 r3: omitted ($null) = not known; every int64 is a moment, 0 and negatives included (Get-GuiSmokeSinceLaunchMs)
+        [Nullable[int64]]$LaunchTimestamp = $null,
         # r16 (sol r15 B2): the caller's last monotonic sighting of the app running, ms since launch (0 = only the launch is known). With the monotonic
         # moment this call sees the exit, it brackets the exit (Get-GuiSmokeExitBudgetVerdict); no wall clock is read.
         [double]$LastAliveMs = 0,
@@ -608,7 +612,7 @@ function Wait-GuiSmokeProcessBounded {
     $reportedTimeoutMs = if ($ReportedTimeoutMs -gt 0) { $ReportedTimeoutMs } else { $TimeoutMs }
     # -2 r1: with a launch stamp and the whole budget the wait is what is left of the budget at THIS moment, max(1, budget - time since launch), read here;
     # -TimeoutMs (a remainder the caller computed earlier) is only the fallback for a caller without them
-    $budgetWaitMs = if ($LaunchTimestamp -gt 0 -and $LifetimeBudgetMs -gt 0) {
+    $budgetWaitMs = if ($null -ne $LaunchTimestamp -and $LifetimeBudgetMs -gt 0) {
         [int][Math]::Max(1, [Math]::Ceiling([double]$LifetimeBudgetMs - (Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $LaunchTimestamp)))
     }
     else { $TimeoutMs }
@@ -626,7 +630,7 @@ function Wait-GuiSmokeProcessBounded {
                     try {
                         # -2 r1 (adversary r16 A2): the caller's first sighting of the exit, when it carries one, is the bound; this look never dates it again
                         $exitBoundMs = if ($ExitSeenByMs -ge 0) { $ExitSeenByMs }
-                        elseif ($LaunchTimestamp -gt 0) { [double]($exitObservedTimestamp - $LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency }
+                        elseif ($null -ne $LaunchTimestamp) { [double]($exitObservedTimestamp - [int64]$LaunchTimestamp) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency }
                         else { [double]-1 }
                         $exitVerdict = Get-GuiSmokeExitBudgetVerdict -BudgetMs $LifetimeBudgetMs -LastAliveMs $LastAliveMs -ExitSeenByMs $exitBoundMs
                     }
