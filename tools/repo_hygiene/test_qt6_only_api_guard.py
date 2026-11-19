@@ -21,17 +21,72 @@ SCOPED_HEADERS = (
     ROOT / "platform" / "qt" / "ViewerDoubleClickPolicy.h",
 )
 
-# A member call of a Qt 6.0+ only QMouseEvent/QSinglePointEvent accessor: `->position()`,
-# `.position()`, and the global/scene variants. `QMouseEvent::position()` in prose does not match.
-QT6_ONLY_CALL = re.compile(r"(?:->|\.)\s*(?:position|globalPosition|scenePosition)\s*\(\s*\)")
+# A member access of a Qt 6.0+ only QMouseEvent/QSinglePointEvent accessor: `->position`,
+# `.position`, and the global/scene variants, with or without grouping parentheses before the call
+# (r3 adversary A3: `(e->position)()`). `QMouseEvent::position()` does not match.
+QT6_ONLY_CALL = re.compile(r"(?:->|\.)\s*(?:position|globalPosition|scenePosition)\b")
 DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
-QT6_CHECK = re.compile(r"QT_VERSION\s*(>=|<)\s*QT_VERSION_CHECK\s*\(\s*6\s*,")
+# Only the plain condition counts as a Qt 6 branch: a negated or compound one (r3 adversary A1:
+# `!(...)`, `... || 1`, `... && 0`) is "other", so a call under it reads unguarded (fail closed).
+QT6_CHECK = re.compile(
+    r"QT_VERSION\s*(>=|<)\s*QT_VERSION_CHECK\s*\(\s*6\s*,\s*\d+\s*,\s*\d+\s*\)"
+)
 
 
-def _strip_comments(text: str) -> str:
-    """Drop /* */ and // comments, keeping line breaks so line numbers stay true."""
-    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
-    return "\n".join(line.split("//", 1)[0] for line in text.split("\n"))
+def _logical_lines(text: str) -> list[tuple[int, str]]:
+    """Return (physical start line, logical line) with backslash-newline splices joined, and
+    comments and string/char literal contents blanked, so line numbers stay true (A2, A3)."""
+    out: list[tuple[int, str]] = []
+    current: list[str] = []
+    start = line = 1
+    state = "code"  # code | line_comment | block_comment | string | char
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] == "\n":  # splice: same logical line
+            line += 1
+            i += 2
+            continue
+        if ch == "\n":
+            if state == "line_comment":
+                state = "code"
+            line += 1
+            if state == "block_comment":
+                i += 1
+                continue
+            out.append((start, "".join(current)))
+            current, start = [], line
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line_comment"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"
+                current.append(" ")
+                i += 2
+                continue
+            if ch in "\"'":
+                state = "string" if ch == '"' else "char"
+            current.append(ch)
+        elif state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+        elif state in ("string", "char"):
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == ('"' if state == "string" else "'"):
+                state = "code"
+                current.append(ch)
+        i += 1
+    out.append((start, "".join(current)))
+    return out
 
 
 def unguarded_qt6_calls(text: str) -> list[tuple[int, str]]:
@@ -40,12 +95,12 @@ def unguarded_qt6_calls(text: str) -> list[tuple[int, str]]:
     # or "other"; arm is "qt6" when the current arm compiles only on Qt 6, else "no".
     stack: list[list[str]] = []
     found: list[tuple[int, str]] = []
-    for number, line in enumerate(_strip_comments(text).split("\n"), start=1):
+    for number, line in _logical_lines(text):
         directive = DIRECTIVE.match(line)
         if directive:
             keyword, rest = directive.group(1), directive.group(2)
             if keyword in ("if", "ifdef", "ifndef"):
-                check = QT6_CHECK.search(rest) if keyword == "if" else None
+                check = QT6_CHECK.fullmatch(rest.strip()) if keyword == "if" else None
                 if check and check.group(1) == ">=":
                     stack.append(["qt6ge", "qt6"])
                 elif check:
@@ -135,6 +190,34 @@ class Qt6OnlyApiGuardTests(unittest.TestCase):
             "auto p = mouse->localPos();\n"
         )
         self.assertEqual(unguarded_qt6_calls(fixture), [])
+
+    def test_scanner_only_trusts_the_plain_version_condition(self) -> None:
+        # r3 adversary A1: a negated or compound condition is not the Qt 6 arm (fail closed).
+        for condition in (
+            "!(QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))",
+            "QT_VERSION >= QT_VERSION_CHECK(6, 0, 0) || 1",
+            "QT_VERSION < QT_VERSION_CHECK(6, 0, 0) && 0",
+        ):
+            with self.subTest(condition=condition):
+                fixture = f"#if {condition}\nreturn e->position();\n#else\nreturn e->position();\n#endif\n"
+                self.assertEqual([n for n, _ in unguarded_qt6_calls(fixture)], [2, 4])
+
+    def test_scanner_sees_calls_next_to_comment_markers_in_string_literals(self) -> None:
+        # r3 adversary A2: "//" or "/*" inside a string literal is not a comment.
+        self.assertEqual(len(unguarded_qt6_calls('const char *s = "//"; auto p = e->position();\n')), 1)
+        fixture = 'const char *a = "/*"; auto p = e->position(); const char *b = "*/";\n'
+        self.assertEqual(len(unguarded_qt6_calls(fixture)), 1)
+        self.assertEqual(len(unguarded_qt6_calls("char c = '\"'; auto p = e->position(); // \"\n")), 1)
+
+    def test_scanner_sees_grouped_and_spliced_member_names(self) -> None:
+        # r3 adversary A3: other legal spellings of the same call.
+        for call in ("(e->position)()", "(e.globalPosition)()", "( e -> scenePosition ) ( )", "e->posi\\\ntion()"):
+            with self.subTest(call=call):
+                self.assertEqual(len(unguarded_qt6_calls(f"auto p = {call};\n")), 1)
+
+    def test_spliced_lines_keep_their_physical_line_numbers(self) -> None:
+        fixture = "#define X a \\\n  b\nint y;\nauto p = e->position();\n"
+        self.assertEqual([n for n, _ in unguarded_qt6_calls(fixture)], [4])
 
 
 if __name__ == "__main__":
