@@ -1381,6 +1381,61 @@ class DeployBachelorAgent(unittest.TestCase):
         r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV, cwd=str(a))
         self.assertIn("DEPLOY_DRYRUN", r.stdout, r.stdout + r.stderr)
 
+    def _run_raw(self, **given: str):
+        """The script with the named parameters passed as the literal TEXT given (a path text no Path object could carry)."""
+        args = {"VenueRoot": str(self.venue), "Source": str(self.source), **given}
+        cmd = [PWSH, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), "-DryRun"]
+        for k, v in args.items():
+            cmd += ["-" + k, v]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=BENCH_ENV)
+
+    def _absent_drive(self) -> str:
+        # a drive letter no PowerShell drive uses: on Windows it is absent (the normalization throws), elsewhere it is an ordinary name
+        for letter in "ZYXWVUTSRQ":
+            if not os.path.exists(letter + ":\\"):
+                return letter
+        self.skipTest("no free drive letter")
+
+    def test_r9_a1_a_path_the_normalization_cannot_resolve_is_a_typed_refusal_not_an_exception(self) -> None:
+        # pass 16 A1: -VenueRoot 'Z:\venue' (no such drive) made GetUnresolvedProviderPathFromPSPath throw at the top of the script, before
+        # the try, so the caller got a raw exception and PowerShell's own exit code instead of the typed refusal. Every path parameter is
+        # normalized INSIDE the typed-refusal boundary: the venue root and the secondary paths refuse as unreadable (12), the source as missing (2).
+        z = self._absent_drive()
+        for label, given, code, typed in (
+            ("venue-absent-drive", {"VenueRoot": z + ":\\venue"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("source-absent-drive", {"Source": z + ":\\src\\agent.ps1"}, 2, "DEPLOY_SOURCE_MISSING"),
+            ("restart-script-absent-drive", {"RestartScript": z + ":\\r.ps1"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("task-xml-absent-drive", {"TaskXmlFile": z + ":\\t.xml"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("task-pids-absent-drive", {"TaskPidsFile": z + ":\\p.txt"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+        ):
+            r = self._run_raw(**given)
+            self.assertEqual(r.returncode, code, (label, r.stdout, r.stderr))
+            self.assertIn(typed, r.stdout, (label, r.stdout, r.stderr))
+            self.assertEqual(r.stderr.strip(), "", (label, "a typed refusal leaves no raw exception on stderr", r.stderr))
+        self.assert_untouched()
+
+    def test_r9_a2_a_provider_qualified_path_that_stays_relative_is_a_typed_refusal(self) -> None:
+        # pass 16 A2: 'FileSystem::x.ps1' normalizes to 'x.ps1' (still relative, resolved later against a directory that differs per API),
+        # and 'Env:\PATH' to 'PATH'. A path that is not absolute after the normalization is refused, whatever provider it names.
+        for label, given, code, typed in (
+            ("venue-provider-relative", {"VenueRoot": "FileSystem::venue"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("venue-full-provider-relative", {"VenueRoot": "Microsoft.PowerShell.Core\\FileSystem::venue"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("venue-other-provider", {"VenueRoot": "Env:\\PATH"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("source-provider-relative", {"Source": "FileSystem::x.ps1"}, 2, "DEPLOY_SOURCE_MISSING"),
+            ("restart-script-provider-relative", {"RestartScript": "FileSystem::r.ps1"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("task-xml-provider-relative", {"TaskXmlFile": "FileSystem::t.xml"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+            ("task-pids-provider-relative", {"TaskPidsFile": "FileSystem::p.txt"}, 12, "DEPLOY_REFUSED_UNREADABLE"),
+        ):
+            r = self._run_raw(**given)
+            self.assertEqual(r.returncode, code, (label, r.stdout, r.stderr))
+            self.assertIn(typed, r.stdout, (label, r.stdout, r.stderr))
+            self.assertEqual(r.stderr.strip(), "", (label, r.stderr))
+        # control: a provider-qualified path that carries an ABSOLUTE path is the same place as the plain one and still deploys (dry run)
+        r = self._run_raw(VenueRoot="FileSystem::" + str(self.venue), Source="FileSystem::" + str(self.source))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_DRYRUN", r.stdout)
+        self.assert_untouched()
+
     def test_r5_a2_the_run_lower_bound_is_never_earlier_than_the_monotonic_expectation(self) -> None:
         # pass 12 A2: the old agent exits, a trigger starts pid 4200 at 12:00:02.5, the wall clock steps BACK 1 s, and runAt is read as
         # 12:00:02: the instance that existed before /Run passed "started at or after /Run" and the final step check (2 s) let 1 s through.

@@ -129,11 +129,34 @@ $ErrorActionPreference = 'Stop'
 # the PROCESS directory to [System.IO.File] / [System.IO.Directory]; the two differ (Set-Location, a profile), so a relative -Source was
 # validated at one place and read from another and a relative -VenueRoot was listed at one place and written at another. After this the
 # two agree. (The bounded runspaces get these resolved values.)
-foreach ($pathParam in 'VenueRoot', 'Source', 'RestartScript', 'TaskXmlFile', 'TaskPidsFile') {
+# The normalization is itself an input read, so it sits INSIDE the typed-refusal boundary: a path it cannot resolve (an absent drive,
+# 'Z:\venue') throws, and a provider-qualified path ('FileSystem::x.ps1', 'Env:\PATH') comes back STILL RELATIVE or not a file path at all.
+# Both are refused with the script's own typed line (the source as DEPLOY_SOURCE_MISSING / 2, every other path as
+# DEPLOY_REFUSED_UNREADABLE / 12), never a raw exception and never a path that is later resolved against a directory that differs per API.
+# A dot-sourced load (a bounded runspace gets already-resolved values) keeps its throw: it has no caller to print a typed line to.
+$pathDotSourced = [string]::Equals([string]$MyInvocation.InvocationName, '.', [System.StringComparison]::Ordinal)
+foreach ($pathParam in 'Source', 'VenueRoot', 'RestartScript', 'TaskXmlFile', 'TaskPidsFile') {
     $pathValue = [string](Get-Variable -Name $pathParam -ValueOnly)
-    if ($pathValue.Length -ne 0) {
-        Set-Variable -Name $pathParam -Value $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($pathValue)
+    if ($pathValue.Length -eq 0) { continue }
+    $pathNormalized = $null
+    $pathWhy = $null
+    try { $pathNormalized = [string]$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($pathValue) }
+    catch { $pathWhy = 'cannot be resolved: ' + ([string]$_.Exception.Message -replace '[\r\n]+', ' ') }
+    if ($null -eq $pathWhy) {
+        # a normalized path is a file path only when it is rooted: a drive path or a UNC path (a drive-less \x already got the current
+        # drive from the normalization). A relative remainder (x.ps1, PATH, HKEY_LOCAL_MACHINE\Software) is refused.
+        if (-not [System.IO.Path]::IsPathRooted($pathNormalized)) { $pathWhy = "does not name an absolute file path (it resolves to '$pathNormalized')" }
     }
+    if ($null -ne $pathWhy) {
+        if ($pathDotSourced) { throw "-$pathParam $pathValue $pathWhy" }
+        if ([string]::Equals($pathParam, 'Source', [System.StringComparison]::Ordinal)) {
+            Write-Output "DEPLOY_SOURCE_MISSING $pathValue ($pathWhy)"
+            exit 2
+        }
+        Write-Output "DEPLOY_REFUSED_UNREADABLE -$pathParam $pathValue $pathWhy"
+        exit 12
+    }
+    Set-Variable -Name $pathParam -Value $pathNormalized
 }
 $agentName = 'ultra-magnus-agent.ps1'
 # ONE tolerance for "same process start": the heartbeat's processStartUtc against the live process (alive check) and the old
