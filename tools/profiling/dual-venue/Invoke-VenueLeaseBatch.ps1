@@ -1250,6 +1250,10 @@ function Get-InputContentRefusal {
         # r4 adversary A1 (pass 1), A2 (pass 2): under 2 s left of the budget no content read STARTS, checked before EACH spec and build read (a spec read comes before the builds,
         # and an earlier read can use up the room): the typed refusal is at once, never after a read that spends the leg reserve
         if (($g.kind -ceq 'spec' -or $g.kind -ceq 'build') -and $null -ne $script:guardBudget -and ($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) -lt $script:GuardReadMinSec) {
+            # r20 (hosted CI on 41f4ffd9, test_r3_a_leg_still_running_at_lease_end_is_killed_as_a_whole_tree_and_uncounted): on master the scalar forms (-LegSpec, -LegSet) read no spec
+            # here, so a lease whose room after the open held the leg and no re-read still ran the leg. That stays so: the scalar form SKIPS a spec re-read it has no room for (it
+            # is not refused), and the bytes the leg runs are still bound to the judged ones by the leg's own -ExpectSpecSha256 (DVE_LEG_SPEC_CHANGED). The plan form keeps r4's refusal.
+            if (-not $legPlanMode) { continue }
             return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; noRoom = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to re-read the $($g.kind) input $($g.path); no leg runs on it" }
         }
         Set-GuardProgress $g "the $($g.kind) input $($g.path)" 'content'
@@ -1259,17 +1263,21 @@ function Get-InputContentRefusal {
             # SPEC_CHANGED_AFTER_PREFLIGHT before the lease opens (the claim guard) and before any leg runs (the open guard); a read with no answer in the budget is SHARE_UNREACHABLE
             # (no answer: a claim-wait pass is read again next poll), as a manifest read is.
             $specBound = $(if ($null -ne $script:guardBudget) { $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds } else { Get-SpecReadBoundSec })
-            if ($g.specSha256) {
-                $rd = Read-SpecBytesWithin $g.path $specBound
-                if ($rd.state -ceq 'TIMEOUT') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = "the leg spec $($g.path) did not answer within $([Math]::Round([Math]::Max(0.0, $specBound), 2)) s of the guard's budget, so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" } }
-                if ($rd.state -cne 'OK') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_READ_FAILED'; why = "the leg spec $($g.path) could not be read again after the preflight ($($rd.error -replace '\s+', ' ')), so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" } }
-                $nowSha = Get-BytesSha256 $rd.bytes
-                if ($nowSha -cne [string]$g.specSha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_CHANGED_AFTER_PREFLIGHT'; why = "the leg spec $($g.path) changed after the export budget preflight judged it (sha256 $nowSha, judged $($g.specSha256)); no lease is spent on bytes the budget did not judge" } }
-            }
+            $noAnswerHit = [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = "the leg spec $($g.path) did not answer within $([Math]::Round([Math]::Max(0.0, $specBound), 2)) s of the guard's budget, so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" }
             if ($legPlanMode) {
-                $specBound = $(if ($null -ne $script:guardBudget) { $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds } else { Get-SpecReadBoundSec })
+                # r20 (hosted CI on 41f4ffd9, test_r12_a2b_a_leg_spec_the_leg_would_throw_on_after_the_wait_is_refused_before_the_lease): master's typed refusals come FIRST, so a spec
+                # changed in the wait into one the leg would throw on is LEG_SPEC_INVALID (or BAD_BACKEND) as on master; only a spec that is still runnable but is not the judged bytes
+                # is SPEC_CHANGED_AFTER_PREFLIGHT. Both come from ONE bounded read (Get-LegSpecRefusal answers '' with the sha256 of the bytes it judged), so no second read can differ.
                 $sr = @(Get-LegSpecRefusal $g.path $g.backend $specBound)
+                if ([string]$sr[0] -ceq 'SPEC_READ_TIMEOUT') { return $noAnswerHit }
                 if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
+                if ($g.specSha256 -and [string]$sr[2] -cne [string]$g.specSha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_CHANGED_AFTER_PREFLIGHT'; why = "the leg spec $($g.path) changed after the export budget preflight judged it (sha256 $($sr[2]), judged $($g.specSha256)); no lease is spent on bytes the budget did not judge" } }
+            } elseif ($g.specSha256) {
+                $specRead = Read-SpecBytesWithin $g.path $specBound
+                if ($specRead.state -ceq 'TIMEOUT') { return $noAnswerHit }
+                if ($specRead.state -cne 'OK') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_READ_FAILED'; why = "the leg spec $($g.path) could not be read again after the preflight ($($specRead.error -replace '\s+', ' ')), so its bytes cannot be compared with the ones the export budget judged; no leg runs on it" } }
+                $nowSha = Get-BytesSha256 $specRead.bytes
+                if ($nowSha -cne [string]$g.specSha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SPEC_CHANGED_AFTER_PREFLIGHT'; why = "the leg spec $($g.path) changed after the export budget preflight judged it (sha256 $nowSha, judged $($g.specSha256)); no lease is spent on bytes the budget did not judge" } }
             }
         } elseif ($g.kind -ceq 'build') {
             # adversary r1 A2, r2 A1: this guard runs between the claim grant and the keeper's start, so it must end inside $ClaimTtlSec less $ClaimRenewSec of the grant or the claim is let go
@@ -1348,7 +1356,7 @@ function Resolve-LegSpecPath([string]$Ref, [string]$BesideDir) {
 
 function Get-LegSpecId([string]$Path) {
     # r19 (sol r18 B2 sibling sweep): a bounded read (no answer before -DeadlineUtc names the leg by its file, as an unreadable spec always did; the spec's content was judged already)
-    $legId = try { $rd = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec); if ($rd.state -cne 'OK') { '' } else { [string](([IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$rd.bytes), $true).ReadToEnd() | ConvertFrom-Json).legId) } } catch { '' }
+    $legId = try { $specRead = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec); if ($specRead.state -cne 'OK') { '' } else { [string](([IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$specRead.bytes), $true).ReadToEnd() | ConvertFrom-Json).legId) } } catch { '' }
     # \z, not $: '$' also matches before a final LF, which would ride into the leg name and then into file names (sol r3 A3)
     if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\z') { $legId = [IO.Path]::GetFileNameWithoutExtension($Path) }
     $legId
@@ -1362,7 +1370,8 @@ function Get-SpecReadBoundSec {
     if ($dl -isnot [datetime]) { return $cap }
     # adversary pass 22 A1 (on d8ad4c8d): no floor. A 1 s floor let a read that started with 0.25 s left end 0.75 s past the deadline; a room under the reserve is a bound of 0, and
     # Read-SpecBytesWithin starts no read on it (TIMEOUT at once), so every caller's typed refusal lands before -DeadlineUtc
-    [Math]::Min($cap, ($dl - [DateTime]::UtcNow).TotalSeconds - 2.0)
+    # r20 (hosted CI on 41f4ffd9, test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand): the first operand is a double in its own text
+    [Math]::Min([double]$cap, ($dl - [DateTime]::UtcNow).TotalSeconds - 2.0)
 }
 
 function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0) {
@@ -1408,12 +1417,15 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     # module predicate the leg calls (Get-DvLegSpecShapeRefusal), and -NoEnumerate as the leg reads it (a one-element array root is an array).
     # r19 (sol r18 B2 sibling :1340): the read is bounded (Read-SpecBytesWithin), by what is left before -DeadlineUtc or by the caller's guard budget; no answer in it is the typed
     # SPEC_READ_TIMEOUT, never a read that holds the batch past its deadline. A read that threw stays what it was (not a JSON object).
-    $rd = Read-SpecBytesWithin $Path $(if ($BoundSec -ge 0) { $BoundSec } else { Get-SpecReadBoundSec })
-    if ($rd.state -ceq 'TIMEOUT') { return 'SPEC_READ_TIMEOUT', "'$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc (or the guard's budget); no claim or lease is taken on it" }
-    $spec = $(if ($rd.state -ceq 'OK') { try { [Text.Encoding]::UTF8.GetString($rd.bytes) | ConvertFrom-Json -NoEnumerate } catch { $null } } else { $null })
+    # r20: the read's result is $specRead, never $rd (rd is the rmdir alias the owner-footage route census refuses as a delete primitive, test_dual_venue_owner_footage_gate.py)
+    $specRead = Read-SpecBytesWithin $Path $(if ($BoundSec -ge 0) { $BoundSec } else { Get-SpecReadBoundSec })
+    if ($specRead.state -ceq 'TIMEOUT') { return 'SPEC_READ_TIMEOUT', "'$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc (or the guard's budget); no claim or lease is taken on it" }
+    $spec = $(if ($specRead.state -ceq 'OK') { try { [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate } catch { $null } } else { $null })
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
     # r19 (sol r18 B1 sibling): the bytes this shape check judged, so the budget preflight can prove it judged the same ones (Get-ExportBudgetRefusal)
-    if ($script:SpecShapeSha256 -is [hashtable]) { $script:SpecShapeSha256[$Path] = Get-BytesSha256 $rd.bytes }
+    # r20: and the third element of a '' answer, so the content guard compares THESE bytes with the judged ones (one read, after master's own typed refusals)
+    $judgedSha = Get-BytesSha256 $specRead.bytes
+    if ($script:SpecShapeSha256 -is [hashtable]) { $script:SpecShapeSha256[$Path] = $judgedSha }
     $shapeRefusal = Get-DvLegSpecShapeRefusal -Spec $spec
     if ($null -ne $shapeRefusal) { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $shapeRefusal" }
     if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
@@ -1426,7 +1438,7 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
         if ([string]::IsNullOrEmpty([string]$spec.card)) { throw 'the spec has no card (Invoke-VenueLeg binds it to New-DvReceipt, which refuses an empty one)' }
         if ([string]::IsNullOrEmpty([string]$spec.legId)) { throw 'the spec has no legId (Invoke-VenueLeg binds it to New-DvReceipt, which refuses an empty one)' }
     } catch { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $($_.Exception.Message -replace '\s+', ' ')" }
-    return '', ''
+    return '', '', $judgedSha
 }
 
 function Get-ExportBudgetRefusal([string]$Path) {
@@ -1445,10 +1457,10 @@ function Get-ExportBudgetRefusal([string]$Path) {
     try {
         if ($ExportBudgetSpecReadFault) { throw [IO.IOException]::new("EXPORT_BUDGET_SPEC_READ_FAULT seam: the process cannot access the file '$Path' because it is being used by another process") }
         $readBound = Get-SpecReadBoundSec
-        $rd = Read-SpecBytesWithin $Path $readBound ($ExportBudgetSpecReadDelaySec * 1000)
-        if ($rd.state -ceq 'TIMEOUT') { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight's read of the leg spec did not answer within $([Math]::Round([Math]::Max(0.0, $readBound), 1)) s (the time left before -DeadlineUtc, less 2 s, under a 120 s cap), so its job budget is unchecked; no claim or lease is taken on it" }
-        if ($rd.state -cne 'OK') { throw [IO.IOException]::new([string]$rd.error) }
-        $specBytes = [byte[]]$rd.bytes
+        $specRead = Read-SpecBytesWithin $Path $readBound ($ExportBudgetSpecReadDelaySec * 1000)
+        if ($specRead.state -ceq 'TIMEOUT') { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight's read of the leg spec did not answer within $([Math]::Round([Math]::Max(0.0, $readBound), 1)) s (the time left before -DeadlineUtc, less 2 s, under a 120 s cap), so its job budget is unchecked; no claim or lease is taken on it" }
+        if ($specRead.state -cne 'OK') { throw [IO.IOException]::new([string]$specRead.error) }
+        $specBytes = [byte[]]$specRead.bytes
     } catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the export budget preflight could not read the leg spec ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
     # r19 (sol r18 B1 = pass20-A1): these are the bytes the budget judges. Their sha256 is recorded, and every later read before a lease or a leg is compared with it
     # (Get-InputContentRefusal; the leg's own read through -ExpectSpecSha256). The shape check's earlier read must have judged the same bytes, or the two checks judged two specs.
@@ -1508,12 +1520,12 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     # fix 2 (adversary r8 fix-1 A1): a root the leg rejects is refused too -- bytes that are not JSON (the leg's ConvertFrom-Json throws) and a JSON null (it parses
     # to $null, which the predicate refuses as not one object); a predicate that throws is a refusal, never an unhandled exit.
     # r19 (sol r18 B2 sibling :1421): a bounded read (Read-SpecBytesWithin); no answer before -DeadlineUtc is the typed SPEC_READ_TIMEOUT (its caller stops on the code itself)
-    $rd = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
-    if ($rd.state -ceq 'TIMEOUT') { return "SPEC_READ_TIMEOUT '$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc; no claim or lease is taken on it" }
-    if ($rd.state -cne 'OK') { return "the leg spec is not valid JSON (it could not be read: $($rd.error -replace '\s+', ' '))" }
-    try { $spec = [Text.Encoding]::UTF8.GetString($rd.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
+    $specRead = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
+    if ($specRead.state -ceq 'TIMEOUT') { return "SPEC_READ_TIMEOUT '$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc; no claim or lease is taken on it" }
+    if ($specRead.state -cne 'OK') { return "the leg spec is not valid JSON (it could not be read: $($specRead.error -replace '\s+', ' '))" }
+    try { $spec = [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
-    $script:SpecShapeSha256[$Path] = Get-BytesSha256 $rd.bytes   # r19 (sol r18 B1 sibling): the bytes this shape check judged
+    $script:SpecShapeSha256[$Path] = Get-BytesSha256 $specRead.bytes  # r19 (sol r18 B1 sibling): the bytes this shape check judged
     try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
