@@ -16305,6 +16305,150 @@ class WindowToggleEvidenceTests(unittest.TestCase):
         self.assertIn("ndow_toggles?(?!' + $script:DvNameChar + ')", request)
         self.assertEqual(re.findall(r"\$script:DvNameChar = '([^']*)'", module), ["(?-i:[A-Za-z0-9_])"])
 
+    # r10 (r9 adversary A1 on 373dcb57, schedule adherence): the reader never read at_ms, so the r9 repro below (only the elapsed_ms pairs changed) read 4/4/4/4/ok and
+    # passed both fstoggle legs. Each helper call changes ONLY the field under attack.
+    @staticmethod
+    def r10_at(b: str, e: str, *, begin_ms: int | None = None, end_ms: int | None = None, at_ms: str | None = None, end_extra: str = "") -> tuple[str, str]:
+        if begin_ms is not None:
+            b = re.sub(r"elapsed_ms=\d+", f"elapsed_ms={begin_ms}", b)
+        if end_ms is not None:
+            e = re.sub(r"elapsed_ms=\d+", f"elapsed_ms={end_ms}", e)
+        if at_ms is not None:
+            # at_ms is the whole replacement text of ` at_ms=<n>` (an empty string drops the field)
+            b = re.sub(r" at_ms=\d+", lambda _m: at_ms, b)
+        return b, e + end_extra
+
+    def r10_rows(self) -> list[tuple[str, str, str, tuple[int, int, int, int]]]:
+        at = self.r10_at
+        return [
+            ("the r9 repro: begin/end elapsed_ms (0,2000),(2000,4000),(4000,6000),(6000,8000) under at_ms 4000/8000/12000/16000",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=2000 * i, end_ms=2000 * i + 2000)), "toggle-0:began-before-at-ms", (4, 4, 0, 4)),
+            ("toggle 2 begins 1 ms before its at_ms (elapsed_ms=11999, at_ms=12000)",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=11999, end_ms=14006) if i == 2 else (b, e)), "toggle-2:began-before-at-ms", (4, 4, 3, 4)),
+            ("toggle 0 states at_ms=4001, off the job's schedule, and begins after it",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=4001") if i == 0 else (b, e)), "toggle-0:off-schedule-at-ms", (4, 4, 3, 4)),
+            ("every at_ms restated as the r9 repro's early times (0/2000/4000/6000) with matching elapsed_ms: self-consistent, not the hook's schedule",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=2000 * i, end_ms=2000 * i + 2000, at_ms=f" at_ms={2000 * i}")), "toggle-3:off-schedule-at-ms", (4, 4, 0, 4)),
+            ("toggle 1's at_ms with a leading zero (08000)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=08000") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms with a sign (+8000)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=+8000") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms empty",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's begin with no at_ms at all",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms="") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms of ten digits (the app's grammar allows at most 9)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=1000000000") if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 2's at_ms written as a decimal fraction (12000.0)",
+             self.log(mutate=lambda i, b, e: at(b, e, at_ms=" at_ms=12000.0") if i == 2 else (b, e)), "toggle-2:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 1's at_ms stated twice",
+             self.log(mutate=lambda i, b, e: (b + " at_ms=8000", e) if i == 1 else (b, e)), "toggle-1:unparseable-record", (4, 3, 3, 3)),
+            ("toggle 3's END record carries an at_ms (the app writes it on the begin record only)",
+             self.log(mutate=lambda i, b, e: at(b, e, end_extra=" at_ms=16000") if i == 3 else (b, e)), "toggle-3:unparseable-record", (4, 3, 3, 3)),
+        ]
+
+    def r10_controls(self) -> list[tuple[str, str]]:
+        at = self.r10_at
+        return [
+            ("every toggle begins exactly at its at_ms", self.log(mutate=lambda i, b, e: at(b, e, begin_ms=4000 * (i + 1), end_ms=4000 * (i + 1) + 2000))),
+            ("toggle 3 begins 1500 ms after its at_ms (an overdue toggle begins late, never early)",
+             self.log(mutate=lambda i, b, e: at(b, e, begin_ms=17500, end_ms=19500) if i == 3 else (b, e))),
+        ]
+
+    def test_r10_a1_a_toggle_that_begins_before_or_off_its_scheduled_at_ms_is_not_kept(self) -> None:
+        """r10 (r9 adversary A1, site AttrCudaArtifacts.psm1 Get-AttrCudaWindowToggleEvidence): a toggle is kept only when its begin's at_ms is the job's schedule for
+        its index and its begin elapsed_ms is no earlier than it; a begin record needs one canonical decimal at_ms= and an end record carries none."""
+        rows = self.r10_rows()
+        controls = self.r10_controls()
+        out = self.run_cases([self.log()] + [log for _, log in controls] + [log for _, log, _, _ in rows])
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        self.assertEqual(out[0]["passes"], [True, True], out[0])
+        for (name, _), got in zip(controls, out[1:1 + len(controls)], strict=True):
+            with self.subTest(control=name):
+                self.assertEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [True, True], got)
+        for (name, _, why, counts), got in zip(rows, out[1 + len(controls):], strict=True):
+            with self.subTest(case=name):
+                e = got["e"]
+                self.assertEqual((e["requested"], e["driven"], e["keptPlaying"], e["advanced"]), counts, got)
+                self.assertIn(why, e["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+
+    def test_r10_a1_the_reconcile_gate_and_the_job_embedded_reader_refuse_an_off_schedule_toggle(self) -> None:
+        """r10 (r9 adversary A1, siblings DualVenueRunner.psm1 Get-DvWindowToggleReconcileEvidence (used by Test-DvReceiptValid and Invoke-VenueLeg.ps1) and the job
+        generator's embedded copy, playback-attr-3-cuda-job.ps1): ok scalars over every r10 row are INVALID, and the embedded reader does not derive ok."""
+        asks = {"generatorArgs": {"midPlayWindowToggles": True}}
+        ok = {"windowTogglesRequested": 4, "windowTogglesDriven": 4, "windowTogglesKeptPlaying": 4, "windowTogglesAdvanced": 4, "windowToggleEvidenceReason": "ok"}
+        rows = self.r10_rows()
+        with tempfile.TemporaryDirectory(prefix="wt-r10-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": asks, "log": log, "metrics": ok} for _, log, _, _ in rows]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object { $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $_.metrics\n"
+                "  [ordered]@{ blocks = $r.blocks; derived = [string]$r.derived.reason } }) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, why, _), got in zip(rows, out, strict=True):
+            with self.subTest(gate="reconcile", case=name):
+                self.assertTrue(got["blocks"], got)
+                self.assertIn(why, got["derived"], got)
+        logs = {"clean": self.log(), **{f"row{n}": log for n, (_, log, _, _) in enumerate(rows)}}
+        script = ("$ErrorActionPreference = 'Stop'\n"
+                  f"$m = Import-Module '{ATTR_MODULE}' -Force -PassThru -DisableNameChecking\n"
+                  f"$src = & $m {{ Get-AttrCudaEmbeddedFunctionSource -ModulePath '{ATTR_MODULE}' -Name @('Get-AttrCudaWindowToggleEvidence') }}\n"
+                  "Remove-Module $m.Name -Force\n"
+                  "if (Get-Command Get-AttrCudaWindowToggleEvidence -ErrorAction SilentlyContinue) { throw 'the module reader is still loaded' }\n"
+                  ". ([scriptblock]::Create([string]$src))\n"
+                  "$cases = $env:DVE_LOGS | ConvertFrom-Json\n"
+                  "$out = [ordered]@{}\n"
+                  "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = (Get-AttrCudaWindowToggleEvidence -LogText ([string]$p.Value) -MeasuredSessionId '3').reason }\n"
+                  "$out | ConvertTo-Json -Compress")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_LOGS": json.dumps(logs)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        embedded = json.loads(proc.stdout)
+        self.assertEqual(embedded["clean"], "ok", embedded)
+        for n, (name, _, why, _) in enumerate(rows):
+            with self.subTest(gate="embedded job reader", case=name):
+                self.assertIn(why, embedded[f"row{n}"], embedded)
+        # every consumer reaches the ONE reader: the receipt validator and the leg writer through the reconcile gate, the job through the embedded source
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        reconcile = module.split("function Get-DvWindowToggleReconcileEvidence", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("Get-AttrCudaWindowToggleEvidence -LogText", reconcile)
+        validator = module.split("function Test-DvReceiptValid", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $ev.logText -Metrics $metrics", validator)
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-DvWindowToggleReconcileEvidence -Spec $spec -LogText $runLogText -Metrics $receipt.metrics", leg)
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        self.assertIn("-Name @('Get-AttrCudaWindowToggleEvidence')", job)
+
+    def test_r10_a1_the_readers_schedule_is_the_jobs_and_the_hook_writes_at_ms_on_the_begin_record_only(self) -> None:
+        """r10 (r9 adversary A1, the CLASS): the schedule the reader holds (kinds and at_ms per index) is taken from the code, never restated: it equals the job's one
+        MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES value, and the hook (MainWindow.cpp stepWindowToggles) begins a toggle only once its clock reaches at_ms and writes
+        at_ms on the begin record, not the end record."""
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        values = re.findall(r"MLVAPP_GUI_SMOKE_MID_PLAY_WINDOW_TOGGLES=([^'\s]+)'", job)
+        self.assertEqual(len(values), 1, values)
+        schedule = [entry.split("@") for entry in values[0].split(",")]
+        attr = ATTR_MODULE.read_text(encoding="utf-8")
+        reader = attr.split("function Get-AttrCudaWindowToggleEvidence", 1)[1].split("\nfunction ", 1)[0]
+        kinds = re.findall(r"\$expectedKinds = @\(([^)]*)\)", reader)
+        ats = re.findall(r"\$expectedAtMs = @\(([^)]*)\)", reader)
+        self.assertEqual(len(kinds), 1, kinds)
+        self.assertEqual(len(ats), 1, ats)
+        self.assertEqual([k.strip().strip("'") for k in kinds[0].split(",")], [k for k, _ in schedule])
+        self.assertEqual([int(a) for a in ats[0].split(",")], [int(a) for _, a in schedule])
+        self.assertEqual([k for k, _ in schedule], list(self.KINDS))
+        self.assertEqual([int(a) for _, a in schedule], [4000 * (i + 1) for i in range(4)])
+        self.assertIn("'^(?:0|[1-9][0-9]{0,8})$'", reader)
+        self.assertIn("off-schedule-at-ms", reader)
+        self.assertIn("began-before-at-ms", reader)
+        main = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8", errors="replace")
+        self.assertIn("if( toggleNowMs < toggle.atMs ) return;", main)
+        self.assertIn('"gui_smoke.window_toggle phase=begin index=%1 kind=%2 at_ms=%3 elapsed_ms=%4 %5"', main)
+        self.assertIn('"gui_smoke.window_toggle phase=end index=%1 kind=%2 elapsed_ms=%3 %4"', main)
+        header = (ROOT / "platform" / "qt" / "SmokeWindowToggleSchedule.h").read_text(encoding="utf-8")
+        self.assertIn("if( msText.empty() || msText.size() > 9 ) return detail::reject( \"bad_ms\" );", header)
+
     def test_r3_b4_a_requested_leg_must_back_its_scalars_with_the_hashed_run_log(self) -> None:
         """r3 B4 (sol): requested-toggle success is reconciled with the hashed run log, in the writer and in receipt validation, by the one shared reader
         Get-DvWindowToggleReconcileEvidence (the log's own derivation, never the summary scalars, decides)."""

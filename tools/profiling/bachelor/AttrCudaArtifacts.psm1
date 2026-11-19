@@ -7393,7 +7393,8 @@ function Get-AttrCudaWindowToggleEvidence {
     It KEPT PLAYING when it is driven, has at least one resize.keep_playing record strictly between its begin and end, play_checked=1 on both, the
     window size changed (end != begin; an fs_off must also end at a size other than the preceding fs_on's end, the fullscreen size), the end state is its
     kind's (fs_on: fullscreen at the end, not at the begin; fs_off: the reverse; restore: neither fullscreen nor maximized; maximize: maximized, not
-    fullscreen) and the end was logged at least 2000 ms after the begin. It ADVANCED when it is driven and position_end > position_begin and
+    fullscreen) and the end was logged at least 2000 ms after the begin, and (r10) its begin's at_ms is the schedule's for its index (4000, 8000, 12000, 16000) and
+    its begin elapsed_ms is no earlier than that at_ms (a begin record needs one canonical decimal at_ms=, an end record carries none). It ADVANCED when it is driven and position_end > position_begin and
     presented_serial_end > presented_serial_begin. The one summary record must be present, whole, with requested= and driven= whole numbers (driven
     equal to what the records show) and reason= ok or incomplete (its own reason is carried through: incomplete names itself in the result, and ok over a
     driven short of requested contradicts itself), and it must come after the last toggle record. A key repeated in a record, even with an empty value, makes
@@ -7548,6 +7549,13 @@ function Get-AttrCudaWindowToggleEvidence {
     }
 
     $expectedKinds = @('fs_on', 'fs_off', 'restore', 'maximize')
+    # r10 (r9 adversary A1 on 373dcb57, its input: the four begin/end elapsed_ms pairs (0,2000),(2000,4000),(4000,6000),(6000,8000) under at_ms 4000/8000/12000/16000,
+    # which read 4/4/4/4/ok): the SCHEDULE is the job's own mid-play window-toggle env value, fs_on@4000,fs_off@8000,restore@12000,maximize@16000 (the one value
+    # playback-attr-3-cuda-job.ps1 adds; a test pins the two equal; the env name is not spelled here because this source is embedded into that job), and the app's stepper (MainWindow.cpp stepWindowToggles) begins toggle i only once its clock reaches
+    # the entry's at_ms and writes that at_ms on the BEGIN record alone. So a begin record is usable only with exactly one canonical decimal at_ms= (no sign, no leading
+    # zero, at most 9 digits: SmokeWindowToggleSchedule.h), an end record carries none, and a toggle KEPT its schedule only when its at_ms is its index's and its begin
+    # elapsed_ms is no earlier than that at_ms. A toggle that began early, or at another time than the schedule states, is not kept playing (it names itself).
+    $expectedAtMs = @(4000, 8000, 12000, 16000)
     $records = @{}
     $poisoned = @{}
     $keepLines = @()
@@ -7620,16 +7628,20 @@ function Get-AttrCudaWindowToggleEvidence {
             $values.ContainsKey('position') -and [int]::TryParse([string]$values['position'], [ref]$position) -and
             $values.ContainsKey('presented_serial') -and ([string]$values['presented_serial'] -cmatch '^[0-9]{1,15}$') -and
             $values.ContainsKey('elapsed_ms') -and ([string]$values['elapsed_ms'] -cmatch '^[0-9]{1,15}$') -and
+            (($values['phase'] -eq 'begin' -and $values.ContainsKey('at_ms') -and ([string]$values['at_ms'] -cmatch '^(?:0|[1-9][0-9]{0,8})$')) -or
+                ($values['phase'] -eq 'end' -and -not $values.ContainsKey('at_ms'))) -and
             ($null -ne $window)
         if (-not $usable) { $poisoned[$index] = $true; continue }
         $serial = [long]$values['presented_serial']
         $elapsed = [long]$values['elapsed_ms']
+        [long]$atMs = -1
+        if ($values['phase'] -eq 'begin') { $atMs = [long]$values['at_ms'] }
         if (-not $records.ContainsKey($index)) { $records[$index] = @{ begin = @(); end = @() } }
         $phaseName = [string]$values['phase']
         $entry = $records[$index]
         $entry[$phaseName] += , [pscustomobject]@{
             line = $i; kind = [string]$values['kind']; playChecked = $playChecked; position = $position; serial = $serial; elapsed = $elapsed; window = $window
-            fullscreen = $fullscreen; maximized = $maximized
+            fullscreen = $fullscreen; maximized = $maximized; atMs = $atMs
         }
     }
 
@@ -7699,6 +7711,9 @@ function Get-AttrCudaWindowToggleEvidence {
         elseif ($b.kind -eq 'maximize') { $stateOk = ($e.fullscreen -eq 0 -and $e.maximized -eq 1) }
         if (-not $stateOk) { $problems.Add('end-state-not-the-kinds') }
         if (($e.elapsed - $b.elapsed) -lt 2000) { $problems.Add('settle-interval-short') }
+        # r10 (r9 adversary A1): the toggle kept the job's schedule: its at_ms is its index's, and it began no earlier than that at_ms on the producer's one clock
+        if ($b.atMs -ne [long]$expectedAtMs[$t]) { $problems.Add('off-schedule-at-ms') }
+        if ($b.elapsed -lt $b.atMs) { $problems.Add('began-before-at-ms') }
         if ($problems.Count -eq 0) { $kept++ } else { $anomalies.Add("toggle-${t}:" + ($problems -join '+')) }
         if ($e.position -gt $b.position -and $e.serial -gt $b.serial) { $advanced++ } else { $anomalies.Add("toggle-${t}:not-advanced") }
         $previousEndLine = $e.line
