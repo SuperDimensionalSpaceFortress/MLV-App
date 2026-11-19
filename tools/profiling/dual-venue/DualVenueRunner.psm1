@@ -4935,7 +4935,7 @@ function Get-DvExportEvidence {
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
-    $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape Invoke-VenueLeg.ps1 writes: EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
+    $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape the leg runner writes (receipt.export.containmentAdvisory): EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
     # -- the batch log: exactly one DONE line for the one clip
     # (r7 A6: the counts are bounded to 15 digits, so a count that does not fit an int64 is no DONE line, typed below, and never an Int64 cast that throws)
     $done = @([regex]::Matches([string]$BatchLogText, '(?m)^\[BATCH\] DONE (?<base>.+?) exported=(?<e>[0-9]{1,15}) skipped=(?<s>[0-9]{1,15}) elapsed=(?<t>[0-9]{1,12}(?:\.[0-9]{1,9})?)\r?$'))
