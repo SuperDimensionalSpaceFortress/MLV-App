@@ -994,9 +994,8 @@ class DeployBachelorAgent(unittest.TestCase):
         out, marker = self._stop_case("same")
         self.assertEqual(out.get("outcome"), "stopped", out)
         self.assertTrue(marker.exists(), "the proved instance is stopped")
-        # (pass 11 A2: the stop compares two OS reads of ONE process, so a 2 s heartbeat-sized tolerance does not apply; see below)
-        out, marker = self._stop_case("sub-tolerance", start_shift_sec=0.02)
-        self.assertEqual(out.get("outcome"), "stopped", out)
+        # (pass 11 A2 / pass 13 A1: the stop compares two OS reads of ONE process, so a 2 s heartbeat-sized tolerance does not apply, and on
+        # Windows the two reads are identical to the tick: see test_r5_a1_a_pid_reused_fifty_ms_later_...)
 
     def test_p11a2_a_pid_reused_half_a_second_later_is_not_the_proved_instance(self) -> None:
         # pass 11 A2: the binding proved pid 4242 at 12:00:00.0; a re-pointed instance reuses pid 4242 at 12:00:00.5. The heartbeat's 2 s
@@ -1294,6 +1293,42 @@ class DeployBachelorAgent(unittest.TestCase):
         code = "\n".join(l for l in SCRIPT.read_text(encoding="ascii").splitlines() if not l.lstrip().startswith("#"))
         self.assertEqual(re.findall(r"""-(?:match|notmatch|replace)\s+'[^'\n]*[^\\]\$'""", code), [], "an end-of-text anchor must be \\z")
         self.assertEqual(re.findall(r"""Match\([^\n]*,\s*'[^'\n]*[^\\]\$'\)""", code), [], "an end-of-text anchor must be \\z")
+
+    def test_r5_a1_a_pid_reused_fifty_ms_later_is_not_the_proved_instance(self) -> None:
+        # pass 13 A1: the binding proved pid 4242 at 12:00:00.000; that instance exited and another instance of the same task reused pid
+        # 4242 at 12:00:00.050. The stop's 100 ms tolerance admitted it (50 > 100 is false), so Stop() hit the new instance. Two reads of
+        # ONE process's start are identical on Windows (the creation time, to the tick), so the tolerance there is zero; elsewhere it is a
+        # clock-jitter allowance far below 60 ms.
+        for label, shift in (("late-60ms", -0.06), ("early-60ms", 0.06), ("late-200ms", -0.2)):
+            out, marker = self._stop_case("r5a1-" + label, start_shift_sec=shift)
+            self.assertEqual(out.get("outcome"), "not-stopped", (label, out))
+            self.assertFalse(marker.exists(), label)
+        if sys.platform == "win32":
+            for label, shift in (("late-20ms", -0.02), ("early-20ms", 0.02), ("one-ms", 0.001)):
+                out, marker = self._stop_case("r5a1w-" + label, start_shift_sec=shift)
+                self.assertEqual(out.get("outcome"), "not-stopped", (label, out))
+                self.assertFalse(marker.exists(), label)
+        out, marker = self._stop_case("r5a1-same")
+        self.assertEqual(out.get("outcome"), "stopped", out)
+        self.assertTrue(marker.exists())
+
+    def test_r5_a2_a_relative_path_names_the_same_place_to_every_api(self) -> None:
+        # pass 13 A2: Test-Path resolves a relative path against the PowerShell location, [System.IO.File]/[Directory] against the process
+        # directory, and the two differ (a profile or Set-Location). Source C:\B\candidate.ps1 was validated and C:\A\candidate.ps1 was
+        # deployed. Every path parameter is made absolute once, at the top, so all APIs name one place.
+        base = Path(self._tmp.name)
+        a, b = base / "cwd-a", base / "loc-b"
+        a.mkdir(); b.mkdir()
+        (a / "candidate.ps1").write_bytes(b"# process-directory copy\r\n")
+        (b / "candidate.ps1").write_bytes(b"# selected copy\r\n")
+        cmd = "Set-Location -LiteralPath '%s'; & '%s' -VenueRoot '%s' -Source candidate.ps1 -DryRun" % (psq(b), psq(SCRIPT), psq(self.venue))
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV, cwd=str(a))
+        self.assertIn("sha=%s" % sha(b"# selected copy\r\n"), r.stdout, r.stdout + r.stderr)
+        self.assertNotIn(sha(b"# process-directory copy\r\n"), r.stdout)
+        # a relative VenueRoot: listed (Directory API) under the same place Test-Path checked
+        cmd = "Set-Location -LiteralPath '%s'; & '%s' -VenueRoot 'venue' -Source '%s' -DryRun" % (psq(base), psq(SCRIPT), psq(self.source))
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120, env=BENCH_ENV, cwd=str(a))
+        self.assertIn("DEPLOY_DRYRUN", r.stdout, r.stdout + r.stderr)
 
     def test_r5_a2_the_run_lower_bound_is_never_earlier_than_the_monotonic_expectation(self) -> None:
         # pass 12 A2: the old agent exits, a trigger starts pid 4200 at 12:00:02.5, the wall clock steps BACK 1 s, and runAt is read as

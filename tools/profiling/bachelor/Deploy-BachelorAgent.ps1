@@ -125,6 +125,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# EVERY path parameter is made absolute, once, here. A relative path means the PowerShell location to Test-Path / Join-Path / Get-Item and
+# the PROCESS directory to [System.IO.File] / [System.IO.Directory]; the two differ (Set-Location, a profile), so a relative -Source was
+# validated at one place and read from another and a relative -VenueRoot was listed at one place and written at another. After this the
+# two agree. (The bounded runspaces get these resolved values.)
+foreach ($pathParam in 'VenueRoot', 'Source', 'RestartScript', 'TaskXmlFile', 'TaskPidsFile') {
+    $pathValue = [string](Get-Variable -Name $pathParam -ValueOnly)
+    if ($pathValue -ne '') {
+        Set-Variable -Name $pathParam -Value $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($pathValue)
+    }
+}
 $agentName = 'ultra-magnus-agent.ps1'
 # ONE tolerance for "same process start": the heartbeat's processStartUtc against the live process (alive check) and the old
 # heartbeat against the new one (replacement check). Same iff the gap is within it, in BOTH checks (VenueChain.psm1 uses 2 s too).
@@ -138,7 +148,11 @@ $script:OnWindows = ([System.Environment]::OSVersion.Platform -eq [System.Platfo
 $script:ReadTimeoutSec = 20
 # two reads of the OS start time of ONE process agree within this (ms); the stop compares the process under a pid with the start the
 # OS reported at the binding, so a pid reused by another instance (even started a fraction of a second later) is not the proved one
-$script:OsStartToleranceMs = 100
+$script:OsStartToleranceMs = $(if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) { 0 } else { 50 })
+# ^ Windows reports a process's creation time to the tick and both reads come from the same FILETIME, so the same process reads
+# IDENTICALLY (the osStart text keeps all 7 fractional digits): a pid reused 50 ms later is a different process and is not stopped.
+# Elsewhere the start is derived from the boot time and the clock at the moment of the read, so two reads differ by the jitter of
+# those clocks; 50 ms covers that and is far below the time a pid takes to be reused.
 # how long the restart waits for the stopped agent's process to go (the tests shorten it)
 $script:StopWaitSec = 30
 # how long the restart waits for the scheduler to show NO running instance of the task before /Run (the tests shorten it)
