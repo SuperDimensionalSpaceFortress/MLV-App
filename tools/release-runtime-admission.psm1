@@ -43,10 +43,12 @@ function Stop-PinnedPayloadChild {
         [int]$ConfirmMs = 10000
     )
     $killError = ''
-    try { $Process.Kill($true) } catch { $killError = $_.Exception.Message }
+    try { $null = $Process.Kill($true) } catch { $killError = $_.Exception.Message }
     $exited = $false
     try { $exited = [bool]$Process.WaitForExit($ConfirmMs) } catch { if (-not $killError) { $killError = "the exit could not be awaited: $($_.Exception.Message)" } }
-    return [pscustomobject][ordered]@{ exited = $exited; killError = $killError }
+    # The ROOT's exit is not the tree's: a Kill(true) that threw (a descendant it could not end) leaves the tree
+    # unconfirmed even when the root exited (adversary 6627beef-A1).
+    return [pscustomobject][ordered]@{ exited = $exited; killError = $killError; confirmed = ($exited -and -not $killError) }
 }
 
 function Install-PinnedVendoredPayload {
@@ -169,7 +171,7 @@ function Invoke-PinnedPayloadInstall {
         if (-not $process.WaitForExit($TimeoutSec * 1000)) {
             $result.timedOut = $true
             $stop = Stop-PinnedPayloadChild -Process $process
-            $result.killConfirmed = [bool]$stop.exited
+            $result.killConfirmed = [bool]$stop.confirmed
             $childPid = $process.Id
             $killError = [string]$stop.killError
         } else {
@@ -185,7 +187,7 @@ function Invoke-PinnedPayloadInstall {
         $result.reason = if ($result.killConfirmed) {
             "the extractor was still running after $TimeoutSec s; its process tree was killed and its exit seen"
         } else {
-            "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid may still be running$(if ($killError) { "; kill error: $killError" }))"
+            "the extractor was still running after $TimeoutSec s and the kill was NOT confirmed (pid $childPid or a descendant may still be running$(if ($killError) { "; kill error: $killError" }))"
         }
         return [pscustomobject]$result
     }

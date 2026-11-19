@@ -191,7 +191,7 @@ if ($donor) {
 #     ffmpeg.exe beside the app, and no donor admission above names one. Install it on EVERY build from the pinned
 #     in-repo payload (tools/gates/vendored-native-payloads.json id ffmpeg-windows-x86_64, platform/qt/FFmpeg/ffmpegWin64.zip)
 #     with the same extractor and --verify-installed the hosted Windows release runs. Bounded; a failure stops the build.
-$ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $SourceRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir (Resolve-Path -LiteralPath $dest).Path -TimeoutSec 600
+$ffmpegInstall = Install-PinnedVendoredPayload -RepoRoot $SourceRoot -PayloadId 'ffmpeg-windows-x86_64' -ArchiveReference 'ffmpegWin64.zip' -OutputDir $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($dest) -TimeoutSec 600
 $ffmpegExePath = Join-Path $dest 'ffmpeg.exe'
 $ffmpegRows = @($ffmpegInstall.installed | Where-Object { [string]::Equals([string]$_.name, 'ffmpeg.exe', [StringComparison]::OrdinalIgnoreCase) })
 if (-not $ffmpegInstall.ok -or $ffmpegRows.Count -ne 1 -or -not (Test-Path -LiteralPath $ffmpegExePath -PathType Leaf)) {
@@ -243,7 +243,7 @@ try {
     else {
         # Confirmed or said to be unconfirmed (adversary 32bf39a9-A3): a Kill that threw is never reported as killed.
         $probeStop = Stop-PinnedPayloadChild -Process $p
-        $probeKillConfirmed = [bool]$probeStop.exited; $probeKillError = [string]$probeStop.killError
+        $probeKillConfirmed = [bool]$probeStop.confirmed; $probeKillError = [string]$probeStop.killError
         $probeTimedOut = $true
     }
 } finally {

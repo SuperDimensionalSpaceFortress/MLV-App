@@ -64,7 +64,15 @@ $rows = foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automa
     }
     [ordered]@{ name = $c.GetCommandName(); offset = $c.Extent.StartOffset; line = $c.Extent.StartLineNumber; text = $c.Extent.Text; ancestors = $anc; named = $named }
 }
-ConvertTo-Json -InputObject @($rows) -Depth 6 -Compress
+$flowTypes = @([System.Management.Automation.Language.ExitStatementAst], [System.Management.Automation.Language.ReturnStatementAst],
+               [System.Management.Automation.Language.ThrowStatementAst], [System.Management.Automation.Language.BreakStatementAst],
+               [System.Management.Automation.Language.ContinueStatementAst])
+$flow = foreach ($s in $ast.FindAll({ param($n) $flowTypes | Where-Object { $n -is $_ } }, $true)) {
+    $anc = @(); $p = $s.Parent
+    while ($p) { $anc += $p.GetType().Name; $p = $p.Parent }
+    [ordered]@{ kind = $s.GetType().Name; offset = $s.Extent.StartOffset; line = $s.Extent.StartLineNumber; text = $s.Extent.Text; ancestors = $anc }
+}
+ConvertTo-Json -InputObject ([ordered]@{ commands = @($rows); flow = @($flow) }) -Depth 7 -Compress
 """
 
 # Node types that make a statement conditional, repeated, deferred or swallowed: the install must sit under none of them.
@@ -74,18 +82,37 @@ GUARDING_NODES = {
     "BinaryExpressionAst", "TernaryExpressionAst", "PipelineChainAst", "SubExpressionAst",
 }
 
+# A statement that ends the script (exit, return, throw, break, continue) ahead of the install is fine only under one of these: a
+# conditional, a loop, a handler or a function body (adversary 6627beef-A3: a top-level `exit 0` before the install passed the guard).
+CONTAINED_FLOW = GUARDING_NODES | {"CatchClauseAst", "StatementBlockAst"}
+
 
 def _normalised(path: Path) -> str:
     return path.read_text(encoding="utf-8").replace("\r\n", "\n")
 
 
+_SCANS: dict[tuple[str, int, int], dict] = {}
+
+
+def _scan(path: Path) -> dict:
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if key not in _SCANS:
+        env = dict(os.environ, FFX_AST_FILE=str(path))
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", AST_SCRIPT],
+                              capture_output=True, text=True, timeout=120, env=env)
+        if proc.returncode != 0:
+            raise AssertionError(f"AST scan of {path} failed: {proc.stdout}{proc.stderr}")
+        _SCANS[key] = json.loads(proc.stdout)
+    return _SCANS[key]
+
+
 def _commands(path: Path) -> list[dict]:
-    env = dict(os.environ, FFX_AST_FILE=str(path))
-    proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", AST_SCRIPT],
-                          capture_output=True, text=True, timeout=120, env=env)
-    if proc.returncode != 0:
-        raise AssertionError(f"AST scan of {path} failed: {proc.stdout}{proc.stderr}")
-    return json.loads(proc.stdout)
+    return _scan(path)["commands"]
+
+
+def _flow(path: Path) -> list[dict]:
+    return _scan(path)["flow"]
 
 
 def _job_expectation() -> tuple[str, str]:
@@ -145,7 +172,9 @@ class JobAndManifestAgreeTests(unittest.TestCase):
 @unittest.skipUnless(PWSH, "needs pwsh for the PowerShell AST")
 class ScriptsInstallUnconditionallyTests(unittest.TestCase):
     # adversary 32bf39a9-A4: the output dir is pinned EXACTLY (a substring match accepted (Join-Path $releaseDir 'other')).
-    EXACT_OUTPUT_DIR = {"releaseDir": "$releaseDir", "dest": "(Resolve-Path -LiteralPath $dest).Path"}
+    # adversary 6627beef-A2: (Resolve-Path -LiteralPath $dest).Path threw (dest renamed) before the helper, past exit 9; the provider
+    # path is resolved against the PowerShell location without requiring the folder, so nothing throws before the helper.
+    EXACT_OUTPUT_DIR = {"releaseDir": "$releaseDir", "dest": "$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($dest)"}
 
     def _assert_one_unconditional_install(self, path: Path, output_variable: str) -> dict:
         record = _ffmpeg_record()
@@ -160,6 +189,8 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         guarded = sorted(set(call["ancestors"]) & GUARDING_NODES)
         self.assertEqual(guarded, [], f"{path.name}:{call['line']} the install sits under {guarded}: it must run on every build")
         self.assertEqual(call["ancestors"].count("ScriptBlockAst"), 1, f"{path.name}:{call['line']} the install is not a top-level statement")
+        early = [s for s in _flow(path) if s["offset"] < call["offset"] and not (set(s["ancestors"]) & CONTAINED_FLOW)]
+        self.assertEqual(early, [], f"{path.name}: an unconditional {[(s['line'], s['text']) for s in early]} ends the script before the install")
         return call
 
     def test_the_assembler_installs_into_the_release_dir_before_the_launch_probe_and_the_zip(self) -> None:
@@ -234,13 +265,18 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertIn("function Stop-PinnedPayloadChild {", text)
         body = text[text.index(f"function {HELPER} {{"):]
         self.assertIn("$stop = Stop-PinnedPayloadChild -Process $process", body)
-        self.assertIn("$result.killConfirmed = [bool]$stop.exited", body)
+        # adversary 6627beef-A1: confirmation is the tree's (no kill error AND the exit seen), never the root's exit alone.
+        self.assertIn("$result.killConfirmed = [bool]$stop.confirmed", body)
+        self.assertIn("confirmed = ($exited -and -not $killError)", text)
         self.assertIn("the kill was NOT confirmed", body)
         release = _normalised(BUILD_RELEASE)
         self.assertNotIn("try { $p.Kill() } catch {}", release)
         self.assertIn("killConfirmed    = $probeKillConfirmed", release)
+        self.assertIn("$probeKillConfirmed = [bool]$probeStop.confirmed", release)
         assembler = _normalised(ASSEMBLER)
         self.assertNotIn("try { $probe.Kill() } catch { }", assembler)
+        self.assertIn("if ($probeStop.confirmed) {", assembler)
+        self.assertNotIn("$probeStop.exited", release + assembler)
 
     def test_the_helper_runs_the_extractor_with_verify_installed_bounded(self) -> None:
         text = _normalised(HELPER_MODULE)
@@ -258,7 +294,7 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
         self.assertIn("$psi.WorkingDirectory = $RepoRoot", body)
         self.assertIn("$process.WaitForExit($TimeoutSec * 1000)", body)
         stop = text[text.index("function Stop-PinnedPayloadChild {"): text.index(f"function {HELPER} {{")]
-        self.assertIn("$Process.Kill($true)", stop, "the timeout kill must take the whole tree")
+        self.assertIn("$null = $Process.Kill($true)", stop, "the timeout kill must take the whole tree")
         self.assertIn(f"Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, {HELPER}, Stop-PinnedPayloadChild", text)
         # adversary 32bf39a9-A1: every inherited GIT_* variable is dropped from the child's environment.
         self.assertIn("if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }", body)
@@ -273,6 +309,19 @@ class ScriptsInstallUnconditionallyTests(unittest.TestCase):
             mutant.write_text(text.replace(needle, "-OutputDir (Join-Path $releaseDir 'other') -TimeoutSec"), encoding="utf-8")
             with self.assertRaises(AssertionError):
                 self._assert_one_unconditional_install(mutant, "releaseDir")
+
+    def test_an_unconditional_exit_before_the_install_is_refused_by_the_guard(self) -> None:
+        # adversary 6627beef-A3: a top-level `exit 0` right before the install kept every other assertion green.
+        for path, anchor, variable in ((ASSEMBLER, "$ffmpegPayloadId = 'ffmpeg-windows-x86_64'", "releaseDir"),
+                                       (BUILD_RELEASE, "$ffmpegInstall = Install-PinnedVendoredPayload", "dest")):
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count(anchor), 1, anchor)
+            for early in ("exit 0", "return", "throw 'stop'"):
+                with self.subTest(script=path.name, statement=early), tempfile.TemporaryDirectory(prefix="ffx-mutant-") as tmp:
+                    mutant = Path(tmp) / path.name
+                    mutant.write_text(text.replace(anchor, early + "\n" + anchor), encoding="utf-8")
+                    with self.assertRaises(AssertionError):
+                        self._assert_one_unconditional_install(mutant, variable)
 
 
 @unittest.skipUnless(os.name == "nt" and PWSH and shutil.which("py"), "needs Windows, pwsh and py.exe")
@@ -344,22 +393,36 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("simulated FileShare.None lock", result["reason"])
 
-    def test_a_kill_that_throws_and_a_wait_that_fails_are_reported_unconfirmed(self) -> None:
-        # adversary 32bf39a9-A3: Kill(true) threw Win32Exception(5) and the confirming wait returned false; both were discarded.
+    def _stop(self, kill: str, wait: str) -> dict:
         module = str(HELPER_MODULE).replace("'", "''")
         script = (
             f"$m = Import-Module '{module}' -Force -PassThru\n"
             "$fake = [pscustomobject]@{ Id = 4242 }\n"
-            "$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value { throw [System.ComponentModel.Win32Exception]::new(5) }\n"
-            "$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $false }\n"
+            f"$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value {{ {kill} }}\n"
+            f"$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ {wait} }}\n"
             "$r = & $m { param($p) Stop-PinnedPayloadChild -Process $p } $fake\n"
             "$r | ConvertTo-Json -Compress\n"
         )
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        stop = json.loads(proc.stdout)
+        return json.loads(proc.stdout)
+
+    def test_a_kill_that_throws_and_a_wait_that_fails_are_reported_unconfirmed(self) -> None:
+        # adversary 32bf39a9-A3: Kill(true) threw Win32Exception(5) and the confirming wait returned false; both were discarded.
+        stop = self._stop("throw [System.ComponentModel.Win32Exception]::new(5)", "$false")
         self.assertFalse(stop["exited"], stop)
+        self.assertFalse(stop["confirmed"], stop)
         self.assertTrue(stop["killError"], stop)
+
+    def test_a_tree_kill_that_throws_is_unconfirmed_even_when_the_root_exits(self) -> None:
+        # adversary 6627beef-A1: Kill(true) ended the root but threw (a descendant could not be terminated) and the root's wait returned
+        # true; the tree must still read as NOT confirmed, since a descendant may survive.
+        stop = self._stop("throw [System.AggregateException]::new('a git descendant could not be terminated')", "$true")
+        self.assertTrue(stop["exited"], stop)
+        self.assertFalse(stop["confirmed"], stop)
+        self.assertIn("descendant", stop["killError"])
+        clean = self._stop("$null", "$true")
+        self.assertTrue(clean["confirmed"], clean)
 
     def test_a_path_that_is_not_fully_qualified_is_refused_before_any_child(self) -> None:
         for bad in ("relative\\out", "C:drive-relative", "\\rooted-no-drive"):

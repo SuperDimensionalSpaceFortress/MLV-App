@@ -379,7 +379,7 @@ if (-not $SkipLaunchProbe) {
         if (-not $probe.WaitForExit(120000)) {
             # The kill is confirmed or the failure says it is not (adversary 32bf39a9-A3, sibling of the ffmpeg install's).
             $probeStop = Stop-PinnedPayloadChild -Process $probe
-            $probeKillNote = if ($probeStop.exited) { 'killed, exit seen' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
+            $probeKillNote = if ($probeStop.confirmed) { 'killed, exit seen' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
             $launchProbe.timedOut = $true
         } else {
             $launchProbe.exitCode = $probe.ExitCode
