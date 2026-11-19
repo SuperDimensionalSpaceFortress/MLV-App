@@ -4760,7 +4760,7 @@ def _gui_smoke_log_probe_purity_problems(body: str) -> list:
     if re.search(r"(?:::|\.)\s*[(\$'\"]", body):
         problems.append("computed member access")
     # r8 (sol r6 hardening): a property assignment ($file.IsReadOnly = $true, $file.LastWriteTimeUtc = ..., += too) writes through a member with no call at all
-    if re.search(r"[\w\]\)}](?:\.\w+|::\w+)+\s*[-+*/%]?=(?!=)", body):
+    if re.search(r"[\w\]\)}](?:\.\w+|::\w+)+\s*(?:[-+*/%]?=(?!=)|\+\+|--)|(?:\+\+|--)\s*[\$(\[][\w\]\).:$]*(?:\.\w+|::\w+)", body):
         problems.append("property assignment")
     return problems
 
@@ -4793,6 +4793,10 @@ def test_launcher_census_gui_smoke_log_probe_rejects_stream_writer_and_member_wr
         "nested property assignment": "$file.Directory.Attributes = 'Hidden'\n",
         "parenthesised property assignment": "($file).IsReadOnly = $true\n",
         "static property assignment": "[System.IO.File]::Foo = 1\n",
+        # r16 (sol r15 / fable key3 r15 hardening, adversary A3): an increment or decrement writes through a member with no '=' at all
+        "postfix property increment": "$file.Attributes++\n",
+        "prefix property increment": "++$file.Attributes\n",
+        "postfix property decrement": "$file.Attributes--\n",
     }
     for label, injected in mutations.items():
         mutated = body.replace(anchor, anchor + injected, 1)

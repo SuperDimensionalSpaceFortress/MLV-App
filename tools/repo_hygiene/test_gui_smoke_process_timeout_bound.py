@@ -558,6 +558,8 @@ $process = $s.p; $stdoutTask = $s.o; $stderrTask = $s.e
 $hardLimitMs = [int64]$effectiveProcessTimeoutMs
 # r11: GS_PREWAIT lets a stub finish BEFORE the wait region runs, the state a runner that was descheduled between its remaining-time read and its wait sees
 if ($env:GS_PREWAIT) { [void]$process.WaitForExit(30000) }
+# r16 (sol r15 B1): GS_SETUP_MS is runner setup time spent between the launch and the wait region (the app keeps running)
+if ($env:GS_SETUP_MS) { Start-Sleep -Milliseconds ([int]$env:GS_SETUP_MS) }
 $sw = [Diagnostics.Stopwatch]::StartNew()
 . ([scriptblock]::Create($env:GS_WAIT))
 $waitedMs = [int]$sw.ElapsedMilliseconds
@@ -804,15 +806,18 @@ class OwnerInputLegSilenceWindowKeepsTheReadAllowance(unittest.TestCase):
         self.assertEqual(90000, out["overrideWins"], "an explicit -NoProgressTimeoutMs still replaces the derived window")
 
     def _runner_window(self, allowance_ms: int) -> int:
+        # r16 (fable key3 r15 B1): the read allowance now lives in the LOAD window (the app's first silent stretch after arming), which is what this reads
         out = run_ps(
             "$NoProgressTimeoutMs = 0; $LegHardLimitAllowanceMs = " + str(allowance_ms) + "; $derivedProcessTimeoutMs = 187000; $effectiveProcessTimeoutMs = 1285000\n"
             "$logRoot = $env:GS_TMP\n" + _runner_snippet("$noProgressOverrideMs = if", "$noProgressWatch = New-GuiSmokeLogProgressWatch") +
-            "\n[pscustomobject]@{ window = [int64]$noProgressWindowMs } | ConvertTo-Json -Compress")
+            "\n[pscustomobject]@{ window = [int64]$noProgressLoadWindowMs } | ConvertTo-Json -Compress")
         return int(out["window"])
 
     def test_the_runner_hands_an_accepted_owner_read_allowance_to_the_silence_window(self) -> None:
-        # the adversary's input: runner -LegHardLimitAllowanceMs 1272000 (120 s setup/teardown + 1152 s read) under a 1285000 ms hard deadline
-        self.assertEqual(1285000, self._runner_window(1272000), "the silence watchdog killed a healthy load at 247 s: it did not keep the read allowance")
+        # the adversary's input: runner -LegHardLimitAllowanceMs 1272000 (120 s setup/teardown + 1152 s read) under a 1285000 ms hard deadline.
+        # r16 (fable key3 r15 B1): the window keeps the whole read allowance the deadline leaves room for, and sits 1000 ms BELOW the deadline (it equalled it)
+        self.assertEqual(1285000 - 1000, self._runner_window(1272000), "the silence watchdog killed a healthy load at 247 s: it did not keep the read allowance")
+        self.assertGreater(self._runner_window(1272000), 187000 + 60000 + 600000, "a 400 s silent load is still inside the load window")
 
     def test_a_leg_with_no_declared_allowance_keeps_its_leg_budget_window(self) -> None:
         self.assertEqual(187000 + 60000, self._runner_window(0))
@@ -858,17 +863,23 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
             start = wait.index(marker)
             self.assertIn(record, wait[start:wait.index("break", start)], marker)
 
-    def _exhausted(self, command: str, budget_ms: int, wait_ms: int) -> bool:
-        # r15: the launch instant the runner reads before Process.Start is passed, as the runner passes it. Process.StartTime of an EXITED child is not
-        # readable on Linux (see ALateExitIsJudgedFromTheLaunchInstantNotFromAStartTimeReadAfterTheExit), so a call without it cannot judge there.
+    def _exhausted(self, command: str, budget_ms: int, wait_ms: int, alive_at_ms: int = -1) -> bool:
+        # r16 (sol r15 B2): the call takes what the runner has, the monotonic launch stamp and its last monotonic sighting of the app running (-LastAliveMs);
+        # alive_at_ms >= 0 takes that sighting at that time since launch, as the runner's chunk loop does (read the clock, then see the app still running)
         out = run_ps(r"""
-$launchUtc = [datetime]::UtcNow
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
 $s = New-Stub '%s'
+$lastAlive = [double]0
+if (%d -ge 0) {
+    while ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch) -lt %d) { Start-Sleep -Milliseconds 20 }
+    $t = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch
+    if (-not $s.p.HasExited) { $lastAlive = $t }
+}
 [void]$s.p.WaitForExit(%d)
-$e = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs %d -LaunchUtc $launchUtc
+$e = Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs %d -LaunchTimestamp $launch -LastAliveMs $lastAlive
 if (-not $s.p.HasExited) { $s.p.Kill($true) }
-[pscustomobject]@{ exhausted = [bool]$e } | ConvertTo-Json -Compress
-""" % (command, wait_ms, budget_ms))
+[pscustomobject]@{ exhausted = [bool]$e; lastAlive = $lastAlive } | ConvertTo-Json -Compress
+""" % (command, alive_at_ms, alive_at_ms, wait_ms, budget_ms))
         return bool(out["exhausted"])
 
     def test_a_process_that_exited_within_its_budget_is_never_a_deadline_hit(self) -> None:
@@ -879,7 +890,8 @@ if (-not $s.p.HasExited) { $s.p.Kill($true) }
         self.assertTrue(self._exhausted("Start-Sleep -Seconds 20", 600000, 300), "an app still alive at the check: the budget ran out under it")
 
     def test_a_process_that_outlived_its_budget_before_exiting_is_a_deadline_hit(self) -> None:
-        self.assertTrue(self._exhausted("Start-Sleep -Seconds 3", 500, 30000), "the exit came after the deadline: not a completion")
+        # r16: "outlived" is a monotonic fact (seen running at 900 ms of a 500 ms budget), no longer a wall lifetime
+        self.assertTrue(self._exhausted("Start-Sleep -Seconds 3", 500, 30000, alive_at_ms=900), "the exit came after the deadline: not a completion")
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
@@ -913,36 +925,36 @@ while ($t -lt $end) {
             self.assertAlmostEqual(1000.0, row["real"], delta=1, msg="the lifetime followed the local offset change (a 1000 ms life read as %s ms)" % row["naive"])
 
     def test_a_wall_clock_step_inside_the_life_never_decides_an_exit_that_the_monotonic_clock_bounds(self) -> None:
-        # r11 fix 6 (adversary 34a08338 A2): UTC does not help against a clock STEP; the monotonic time since launch does
+        # r11 fix 6 (adversary 34a08338 A2): UTC does not help against a clock STEP. r16 (sol r15 B2): no wall reading is an input at all any more; the
+        # exit is bracketed by two monotonic facts (last seen running, exit seen by). The r11 inputs, restated as the facts the runner actually has:
         out = run_ps(r"""
-function V($budget, $wall, $since) { [bool](Test-GuiSmokeLifetimeExceedsBudget -BudgetMs $budget -WallLifetimeMs $wall -SinceLaunchMs $since) }
+function V($budget, $alive, $seen) { [string](Get-GuiSmokeExitBudgetVerdict -BudgetMs $budget -LastAliveMs $alive -ExitSeenByMs $seen) }
 [pscustomobject]@{
-    forwardStepInBudget = V 1000 60700 700          # the adversary's input: +60 s step, a 700 ms life
-    backwardStepOver = V 1000 -58000 2000           # a -60 s step, a real 2000 ms life against a 1000 ms budget
-    forwardStepAfterBudget = V 1000 61200 1200      # stepped AND observed after the budget: the exit time cannot be told, fail closed
-    wallAgreesInBudget = V 1000 900 1200            # a late look at an exit that was inside the budget (the log probe stalled): native exit kept
-    wallAgreesOver = V 1000 1100 1200
-    noLaunchStampInBudget = V 1000 900 -1
-    noLaunchStampOver = V 1000 1100 -1
-    unreadableWall = [bool](Test-GuiSmokeLifetimeExceedsBudget -BudgetMs 1000 -SinceLaunchMs 5000)
+    forwardStepInBudget = V 1000 0 700              # the adversary's input: +60 s step, a 700 ms life seen by 700 ms: inside, whatever the wall said
+    backwardStepOverSeenAlive = V 1000 1500 2000    # a real 2000 ms life, seen running at 1500 ms of a 1000 ms budget: late, whatever the wall said
+    observedAfterBudgetOnly = V 1000 0 1200         # seen only after the budget, never seen running past it: cannot be told
+    noLaunchStamp = V 1000 0 -1
+    seenAliveAtTheBudget = V 1000 1000 1200
+    seenExactlyAtTheBudget = V 1000 0 1000
 } | ConvertTo-Json -Compress
 """)
-        self.assertFalse(out["forwardStepInBudget"], "a 700 ms life was read as 60700 ms and became a timeout")
-        self.assertTrue(out["backwardStepOver"], "a 2000 ms life against a 1000 ms budget was read as -58000 ms and passed")
-        self.assertTrue(out["forwardStepAfterBudget"])
-        self.assertFalse(out["wallAgreesInBudget"])
-        self.assertTrue(out["wallAgreesOver"])
-        self.assertFalse(out["noLaunchStampInBudget"])
-        self.assertTrue(out["noLaunchStampOver"])
-        self.assertFalse(out["unreadableWall"], "an unreadable lifetime keeps the exit the finalize look reports")
+        self.assertEqual("in_budget", out["forwardStepInBudget"], "a 700 ms life was read as 60700 ms and became a timeout")
+        self.assertEqual("late", out["backwardStepOverSeenAlive"], "a 2000 ms life against a 1000 ms budget passed")
+        self.assertEqual("uncertain", out["observedAfterBudgetOnly"], "r16: an exit the monotonic clock cannot place is neither clean nor late")
+        self.assertEqual("uncertain", out["noLaunchStamp"], "r16: with no monotonic stamp only a wall reading could judge, and none does")
+        self.assertEqual("late", out["seenAliveAtTheBudget"])
+        self.assertEqual("in_budget", out["seenExactlyAtTheBudget"])
 
     def test_the_budget_check_takes_the_lifetime_from_the_utc_helper(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         self.assertNotRegex(code, r"\.ExitTime\s*-\s*\$\w+\.StartTime", "no bare local-time subtraction of a process's start and exit")
-        self.assertIn("Get-GuiSmokeProcessLifetimeMs -StartTime $Process.StartTime -ExitTime $Process.ExitTime", code)
+        # the UTC helper stays exported and correct for any reader; r16 (sol r15 B2): no verdict reads a process's wall start or exit time at all
         self.assertIn("$ExitTime.ToUniversalTime() - $StartTime.ToUniversalTime()", code)
         self.assertRegex(text.split("Export-ModuleMember", 1)[1], r"Get-GuiSmokeProcessLifetimeMs")
+        judging = code[code.index("function Get-GuiSmokeExitBudgetVerdict"):]
+        self.assertNotIn(".ExitTime", judging)
+        self.assertNotIn(".StartTime", judging)
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
@@ -964,34 +976,45 @@ class AnExitSeenByTheWaitItselfAfterTheDeadlineIsATimeout(unittest.TestCase):
     def _late(self, sample_ms: int) -> dict:
         return self._run_runner_wiring(self._LATE_EXIT, sample_ms, prewait=True)
 
-    def _assert_late_exit_is_a_timeout(self, out: dict) -> None:
-        self.assertTrue(out["timedOut"], "an app that lived longer than the leg-derived deadline was reported as a clean exit")
-        self.assertEqual("timeout", out["outcome"])
-        self.assertEqual(124, out["exitCode"])
+    def _assert_late_exit_is_never_clean(self, out: dict) -> None:
+        # r16 (sol r15 B2): the harness let the stub finish before the wait region ran, so the runner never saw it running: the monotonic clock knows only
+        # that it exited somewhere between its launch and a moment past the budget. That is reported as uncertain (r11-r15 called it a timeout from the WALL
+        # lifetime, the clock sol showed a step can move); it is still never a clean exit.
+        self.assertNotEqual("exited", out["outcome"], "an app that lived longer than the leg-derived deadline was reported as a clean exit")
+        self.assertNotEqual(0, out["exitCode"])
+        self.assertEqual("exit_time_uncertain", out["outcome"])
+        self.assertEqual(125, out["exitCode"])
         self.assertEqual(3000, out["timeoutMs"], "the receipt names the whole budget")
 
     def test_a_late_exit_seen_by_the_wait_is_a_timeout_in_the_log_only_branch(self) -> None:
-        self._assert_late_exit_is_a_timeout(self._late(0))
+        self._assert_late_exit_is_never_clean(self._late(0))
 
     def test_a_late_exit_seen_by_the_wait_is_a_timeout_in_the_host_load_branch(self) -> None:
-        self._assert_late_exit_is_a_timeout(self._late(500))
+        self._assert_late_exit_is_never_clean(self._late(500))
 
-    def _boundary(self, stub: str, budget_ms: int, stalled: bool) -> dict:
-        # the boundary call exactly as the runner makes it after a stall verdict or any other break: -LifetimeBudgetMs and the launch stamp
+    def _boundary(self, stub: str, budget_ms: int, stalled: bool, alive_at_ms: int = -1) -> dict:
+        # the boundary call exactly as the runner makes it after a stall verdict or any other break: -LifetimeBudgetMs, the launch stamp and (r16) the
+        # runner's last monotonic sighting of the app running, taken at alive_at_ms when it is >= 0
         return run_ps(r"""
 $launch = [Diagnostics.Stopwatch]::GetTimestamp()
-$launchUtc = [datetime]::UtcNow
 $s = New-Stub '%s'
+$lastAlive = [double]0
+if (%d -ge 0) {
+    while ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch) -lt %d) { Start-Sleep -Milliseconds 20 }
+    $t = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch
+    if (-not $s.p.HasExited) { $lastAlive = $t } else { throw 'the stub exited before its sighting' }
+}
 [void]$s.p.WaitForExit(30000)
-$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs %d -LifetimeBudgetMs %d -LaunchTimestamp $launch -LaunchUtc $launchUtc %s
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs %d -LifetimeBudgetMs %d -LaunchTimestamp $launch -LastAliveMs $lastAlive %s
 [pscustomobject]@{ timedOut = $r.timedOut; outcome = $r.outcome; exitCode = $r.exitCode } | ConvertTo-Json -Compress
-""" % (stub, budget_ms, budget_ms, "-NoProgressStalled" if stalled else ""))
+""" % (stub, alive_at_ms, alive_at_ms, budget_ms, budget_ms, "-NoProgressStalled" if stalled else ""))
 
     def test_a_stall_verdict_followed_by_an_exit_after_the_budget_is_a_timeout(self) -> None:
         # r11 fix 6 (adversary 34a08338 A1, major, introduced): the stall break left the deadline flag false, so the 1 ms look saw an app that had already
-        # outlived the budget exit 0 and reported outcome=exited. The stub lives longer than 1 ms, so a 1 ms budget is exceeded by any exit.
-        out = self._boundary("exit 0", 1, stalled=True)
+        # outlived the budget exit 0 and reported outcome=exited. r16: "outlived" is the runner's monotonic sighting of it running at 300 ms of a 100 ms budget.
+        out = self._boundary("Start-Sleep -Milliseconds 1500; exit 0", 100, stalled=True, alive_at_ms=300)
         self.assertTrue(out["timedOut"], "an app that exited after the whole budget was a clean exit behind a stall verdict")
+        self.assertEqual("timeout", out["outcome"])
         self.assertEqual(124, out["exitCode"])
 
     def test_a_stall_verdict_followed_by_an_exit_inside_the_budget_keeps_the_native_exit(self) -> None:
@@ -1036,12 +1059,16 @@ class AnOverrunRecognizedAfterAStallVerdictCarriesTheTimeoutReasonNotTheStallOne
     right, the reason was not). Class: a stale flag read after a state transition."""
 
     def _call(self, stub: str, switches: str, budget_args: str) -> dict:
+        # r16 (sol r15 B2): an overrun is a monotonic fact, the app seen running past the budget; budget_args may carry -LastAliveMs $alive, taken at 300 ms
         return run_ps(r"""
 $launch = [Diagnostics.Stopwatch]::GetTimestamp()
-$launchUtc = [datetime]::UtcNow
 $s = New-Stub '%s'
-[void]$s.p.WaitForExit(30000)
-$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 3000 -NoProgressWindowMs 1000 -LaunchTimestamp $launch -LaunchUtc $launchUtc %s %s
+while ((Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch) -lt 300) { Start-Sleep -Milliseconds 20 }
+$t = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $launch
+$alive = if (-not $s.p.HasExited) { $t } else { [double]0 }
+# 29 s, not 30 s: the 30 s sleeper must still be running after the 300 ms sighting above
+[void]$s.p.WaitForExit(29000)
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 3000 -NoProgressWindowMs 1000 -LaunchTimestamp $launch %s %s
 [pscustomobject]@{ timedOut = $r.timedOut; outcome = $r.outcome; noProgress = $r.noProgress; window = $r.noProgressWindowMs; exitCode = $r.exitCode; failures = @($r.failures) } | ConvertTo-Json -Compress
 """ % (stub, switches, budget_args))
 
@@ -1056,7 +1083,8 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
         self.assertIn("exceeded the fail-closed process timeout of 3000 ms", text)
 
     def test_a_stall_verdict_followed_by_an_exit_after_the_budget_is_typed_as_a_timeout(self) -> None:
-        self._assert_plain_timeout(self._call("exit 0", "-NoProgressStalled", "-LifetimeBudgetMs 1"))
+        # seen running at 300 ms of a 100 ms budget, then exits 0
+        self._assert_plain_timeout(self._call("Start-Sleep -Milliseconds 1500; exit 0", "-NoProgressStalled", "-LifetimeBudgetMs 100 -LastAliveMs $alive"))
 
     def test_a_stall_flag_together_with_the_reached_deadline_is_typed_as_a_timeout(self) -> None:
         self._assert_plain_timeout(self._call("exit 0", "-NoProgressStalled -DeadlineReached", ""))
@@ -1087,32 +1115,36 @@ class ALateExitIsJudgedFromTheLaunchInstantNotFromAStartTimeReadAfterTheExit(uni
     Class: a clock read taken after the thing it describes is gone."""
 
     def test_the_launch_instant_decides_the_lifetime_whatever_the_process_start_time_would_read(self) -> None:
-        # OS-independent proof: the stub really lived well under a minute, so a Process.StartTime-based lifetime is far below 600000 ms on EVERY OS; only a
-        # launch instant an hour in the past can make it exceed that budget. It fails on Windows too if the function still reads StartTime.
+        # OS-independent proof (r16, sol r15 B2): the verdict is taken from the monotonic launch stamp and the caller's monotonic sighting only, so it is the
+        # same on every OS and no read of a dead child's clock (StartTime throws on Linux once it is reaped) can turn a late exit into a clean one
         out = run_ps(r"""
-$now = [datetime]::UtcNow
+$hz = [Diagnostics.Stopwatch]::Frequency
 $s = New-Stub 'exit 0'
 [void]$s.p.WaitForExit(30000)
+$anHourAgo = [Diagnostics.Stopwatch]::GetTimestamp() - [int64](3600 * $hz)
 [pscustomobject]@{
-    anHourAgo = [bool](Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 600000 -LaunchUtc $now.AddHours(-1))
-    justNow = [bool](Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 600000 -LaunchUtc $now)
+    seenRunningPastTheBudget = [bool](Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 600000 -LaunchTimestamp $anHourAgo -LastAliveMs 3000000)
+    justNow = [bool](Test-GuiSmokeWaitBudgetExhausted -Process $s.p -BudgetMs 600000 -LaunchTimestamp ([Diagnostics.Stopwatch]::GetTimestamp()))
 } | ConvertTo-Json -Compress
 """)
-        self.assertTrue(out["anHourAgo"], "the lifetime was not taken from the launch instant the caller supplied")
+        self.assertTrue(out["seenRunningPastTheBudget"], "the app was seen running past its budget on the monotonic clock: that is a deadline hit")
         self.assertFalse(out["justNow"], "an exit inside the budget is not a deadline hit")
 
     def test_the_module_judges_an_exited_process_without_reading_its_start_time_when_a_launch_instant_is_given(self) -> None:
+        # r16 (sol r15 B2): stronger than r15: no judging code reads any wall clock of the process, whatever the caller supplies
         text = MODULE.read_text(encoding="utf-8")
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         body = code[code.index("function Test-GuiSmokeWaitBudgetExhausted"):code.index("function Wait-GuiSmokeProcessBounded")]
-        self.assertIn("-StartTime $LaunchUtc -ExitTime $Process.ExitTime", body)
-        self.assertLess(body.index("-StartTime $LaunchUtc"), body.index("-StartTime $Process.StartTime"), "the launch instant is the first choice; StartTime is only the fallback of a caller that has none")
+        for wall in (".StartTime", ".ExitTime", "LaunchUtc", "UtcNow"):
+            self.assertNotIn(wall, body)
+        self.assertIn("Get-GuiSmokeExitBudgetVerdict -BudgetMs $BudgetMs -LastAliveMs $LastAliveMs -ExitSeenByMs $seenByMs", body)
         wait = code[code.index("function Wait-GuiSmokeProcessBounded"):]
-        self.assertIn("-LaunchUtc $LaunchUtc", wait, "the boundary hands the launch instant to its own budget check")
+        self.assertNotIn("LaunchUtc", wait)
+        self.assertIn("Get-GuiSmokeExitBudgetVerdict -BudgetMs $LifetimeBudgetMs -LastAliveMs $LastAliveMs -ExitSeenByMs $exitSeenByMs", wait)
 
     def test_the_runner_reads_the_launch_instant_before_the_launch_and_hands_it_to_every_judging_call(self) -> None:
-        # the launch instant is the runner's existing $startUtc (also the receipt's startedAtUtc), read before the monotonic stamp and before Process.Start; a
-        # second variable would also not exist in the harnesses that execute the runner's launch reads as written (test_core_partition_leg's exit-stamp driver)
+        # the monotonic stamp is read before Process.Start (the time since it bounds the life from above); $startUtc stays the receipt's wall stamp, read before
+        # it, and (r16) is handed to no judging call. Every judging call takes the stamp with the runner's last monotonic sighting of the app running.
         source = RUNNER.read_text(encoding="utf-8")
         utc = source.index("$startUtc = [datetime]::UtcNow")
         stamp = source.index("$startTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()")
@@ -1121,10 +1153,12 @@ $s = New-Stub 'exit 0'
         self.assertLess(stamp, start)
         self.assertNotIn("$launchUtc", source, "one launch instant, not two")
         wait = _runner_snippet(*_WAIT_REGION)
-        paired = len(re.findall(r"-LaunchTimestamp \$startTimestamp[ `\r\n]+-LaunchUtc \$startUtc", wait))
-        self.assertEqual(paired, wait.count("-LaunchTimestamp $startTimestamp"),
-                         "every call that takes the monotonic stamp takes the launch instant with it (the boundary call continues on the next line)")
-        self.assertGreaterEqual(wait.count("-LaunchUtc $startUtc"), 6, "two budget checks, three stall sites and the boundary call")
+        self.assertNotIn("-LaunchUtc", wait, "r16: no wall instant judges an exit")
+        paired = len(re.findall(r"-LaunchTimestamp \$startTimestamp[ `\r\n]+-LastAliveMs \$lastAliveMs", wait))
+        judging = wait.count("Test-GuiSmokeWaitBudgetExhausted -Process $process") + wait.count("$processBoundary = Wait-GuiSmokeProcessBounded")
+        self.assertEqual(paired, judging,
+                         "every judging call takes the monotonic stamp with the last sighting (the boundary call continues on the next line)")
+        self.assertEqual(6, paired, "two budget checks, three stall sites and the boundary call")
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
@@ -1193,9 +1227,184 @@ Stop-GuiSmokeLogProgressWatch -Watch $w2
         self.assertEqual(3, len(sites), "the host-load branch has two stall sites and the log-only branch one")
         for site in sites:
             tail = wait[site:wait.index("break", site)]
-            self.assertIn("Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LaunchUtc $startUtc", tail,
+            self.assertIn("Test-GuiSmokeWaitBudgetExhausted -Process $process -BudgetMs $effectiveProcessTimeoutMs -LaunchTimestamp $startTimestamp -LastAliveMs $lastAliveMs", tail,
                           "a stall verdict reached at or past the whole budget is judged against it before the boundary types the leg")
             self.assertIn("-ge $effectiveProcessTimeoutMs", tail)
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TheProcessBudgetIsSpentFromTheLaunchNotFromALoopStopwatch(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r16 (sol r15 B1, blocker): both chunked wait branches took their remaining budget from a loop stopwatch started
+    AFTER the launch and the runner's setup, so setup time between Process.Start and the loop was never spent: a 1000 ms budget with 3000 ms of setup still
+    waited about another 1000 ms, and 900 ms of setup granted 1000 ms instead of the remaining 100 ms. Every remainder is now the whole budget minus the
+    monotonic time since the launch stamp. Class: the process budget restarted on a second clock."""
+
+    def _setup(self, setup_ms: int, sample_ms: int) -> dict:
+        return run_ps(_RUNNER_HARNESS, GS_STUB=_NEVER_EXITS_NO_LOG, GS_SAMPLE_MS=str(sample_ms), GS_SETUP_MS=str(setup_ms),
+                      GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION))
+
+    def test_setup_time_after_the_launch_is_spent_from_the_budget_in_both_branches(self) -> None:
+        for sample_ms in (0, 500):
+            out = self._setup(2200, sample_ms)
+            self.assertEqual(3000, out["hardLimitMs"])
+            # 2200 ms of the 3000 ms budget were spent before the wait region: about 800 ms remain, never another whole 3000 ms
+            self.assertLess(out["waitedMs"], 2000, "sample_ms=%d: the wait was granted a fresh budget after the setup" % sample_ms)
+            self.assertTrue(out["timedOut"])
+            self.assertEqual("timeout", out["outcome"])
+            self.assertEqual(124, out["exitCode"])
+            self.assertFalse(out["alive"])
+
+    def test_no_wait_or_probe_starts_once_the_setup_spent_the_whole_budget(self) -> None:
+        for sample_ms in (0, 500):
+            out = self._setup(3300, sample_ms)
+            self.assertLess(out["waitedMs"], 1500, "sample_ms=%d: a wait started after the launch deadline" % sample_ms)
+            self.assertEqual(0, out["samples"], "no interior sample is taken once the budget is gone")
+            self.assertTrue(out["timedOut"])
+            self.assertEqual(124, out["exitCode"])
+
+    def test_the_wait_region_has_no_loop_stopwatch(self) -> None:
+        wait = _runner_snippet(*_WAIT_REGION)
+        self.assertNotIn("Stopwatch]::StartNew()", wait, "a stopwatch started after the launch is a second budget clock")
+        self.assertNotIn("LoopStopwatch", wait)
+        for remaining in ("$hostLoadRemainingMs = [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)",
+                          "$noProgressRemainingMs = [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)",
+                          "$hostLoadSampleLoopElapsedMs = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)"):
+            self.assertIn(remaining, wait)
+        self.assertEqual(3, wait.count("-BudgetRemainingMs ([Math]::Max(0, [int64]$effectiveProcessTimeoutMs - [int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp)))"),
+                         "all three probe sites take the remainder from the launch")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class AnExitTheMonotonicClockCannotPlaceIsReportedAsUncertain(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r16 (sol r15 B2, blocker; fable VENUE-SMOKE-EXITTIME-UNREADABLE-FAILS-OPEN-1): the exit verdict mixed the monotonic
+    time since launch with a WALL lifetime whenever the exit was seen after the budget, so a real 2000 ms life across a -1500 ms step (wall 500 ms, seen at
+    2100 ms of a 1000 ms budget) kept exited/0, and a real 700 ms life across a +600 ms step (wall 1300 ms) became timeout/124. The exit is now bracketed on
+    the monotonic clock alone (last seen running, exit seen by); when that cannot place it on either side of the budget the leg is reported as
+    exit_time_uncertain (exit 125), never clean and never late. An unreadable process state reads as exhausted, never clean.
+    Class: an exit judged on a clock a step can move, and a throw read as a clean answer."""
+
+    def test_sols_two_stepped_lifetimes_are_both_uncertain_and_a_monotonic_sighting_decides(self) -> None:
+        out = run_ps(r"""
+function V($budget, $alive, $seen) { [string](Get-GuiSmokeExitBudgetVerdict -BudgetMs $budget -LastAliveMs $alive -ExitSeenByMs $seen) }
+[pscustomobject]@{ backward = V 1000 0 2100; forward = V 1000 0 2100; seenRunningPast = V 1000 1500 2100; seenInside = V 1000 0 700 } | ConvertTo-Json -Compress
+""")
+        # both of sol's inputs are seen at 2100 ms of a 1000 ms budget with no sighting of the app running past it; the wall lifetime (500 / 1300) is no input
+        self.assertEqual("uncertain", out["backward"])
+        self.assertEqual("uncertain", out["forward"])
+        self.assertEqual("late", out["seenRunningPast"])
+        self.assertEqual("in_budget", out["seenInside"])
+
+    def test_an_exit_seen_only_after_the_budget_is_never_a_clean_exit_whatever_the_wall_lifetime_says(self) -> None:
+        # the stub really lived well under the 1000 ms budget by every wall clock, but the monotonic clock only knows it exited by 2100 ms after the launch
+        # stamp and never saw it running: r15 let the short wall lifetime decide (exited/0); it cannot be placed, so it is uncertain
+        out = run_ps(r"""
+$s = New-Stub 'exit 0'
+[void]$s.p.WaitForExit(30000)
+$launch = [Diagnostics.Stopwatch]::GetTimestamp() - [int64](2.1 * [Diagnostics.Stopwatch]::Frequency)
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 1000 -LifetimeBudgetMs 1000 -LaunchTimestamp $launch
+[pscustomobject]@{ timedOut = $r.timedOut; outcome = $r.outcome; exitCode = $r.exitCode; native = $r.nativeExitCode; confirmed = $r.terminationConfirmed; failures = @($r.failures) } | ConvertTo-Json -Compress
+""")
+        self.assertNotEqual("exited", out["outcome"], "an exit the monotonic clock cannot place inside the budget was reported as a clean one")
+        self.assertEqual("exit_time_uncertain", out["outcome"])
+        self.assertEqual(125, out["exitCode"])
+        self.assertFalse(out["timedOut"], "it is not called a timeout either: the app may have exited inside the budget")
+        self.assertTrue(out["confirmed"])
+        self.assertEqual(0, out["native"], "the native exit is kept as data")
+        self.assertIn("exit_time_uncertain", " ".join(out["failures"]))
+
+    def test_an_exit_seen_inside_the_budget_keeps_its_native_exit_and_a_sighting_past_it_is_a_timeout(self) -> None:
+        out = run_ps(r"""
+$launch = [Diagnostics.Stopwatch]::GetTimestamp()
+$s = New-Stub 'exit 7'
+[void]$s.p.WaitForExit(30000)
+$r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -StandardErrorTask $s.e -TimeoutMs 1 -ReportedTimeoutMs 600000 -LifetimeBudgetMs 600000 -LaunchTimestamp $launch
+$s2 = New-Stub 'exit 0'
+[void]$s2.p.WaitForExit(30000)
+$old = [Diagnostics.Stopwatch]::GetTimestamp() - [int64](2.1 * [Diagnostics.Stopwatch]::Frequency)
+$r2 = Wait-GuiSmokeProcessBounded -Process $s2.p -StandardOutputTask $s2.o -StandardErrorTask $s2.e -TimeoutMs 1 -ReportedTimeoutMs 1000 -LifetimeBudgetMs 1000 -LaunchTimestamp $old -LastAliveMs 1500
+[pscustomobject]@{ inside = $r.outcome; insideCode = $r.exitCode; past = $r2.outcome; pastCode = $r2.exitCode } | ConvertTo-Json -Compress
+""")
+        self.assertEqual("exited", out["inside"])
+        self.assertEqual(7, out["insideCode"])
+        self.assertEqual("timeout", out["past"])
+        self.assertEqual(124, out["pastCode"])
+
+    def test_an_unreadable_process_state_reads_as_exhausted_never_as_clean(self) -> None:
+        # a Process object with no process behind it throws on HasExited; r15's catch returned "not exhausted", so the leg's native exit was kept
+        out = run_ps(r"""
+$old = [Diagnostics.Stopwatch]::GetTimestamp() - [int64](2 * [Diagnostics.Stopwatch]::Frequency)
+[pscustomobject]@{ exhausted = [bool](Test-GuiSmokeWaitBudgetExhausted -Process ([Diagnostics.Process]::new()) -BudgetMs 1000 -LaunchTimestamp $old) } | ConvertTo-Json -Compress
+""")
+        self.assertTrue(out["exhausted"], "a throw was read as a clean answer")
+
+
+@unittest.skipUnless(PWSH, "pwsh not on PATH")
+class TheSilenceWindowIsBelowTheHardDeadlineOnTheGeneratorsOwnerLeg(unittest.TestCase):
+    """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r16 (fable key3 r15 B1, blocker; catalogue row B-05): for every owner-input job the in-tree generator emits, the
+    runner's hard deadline and its silence window both equalled the job's -ProcessTimeoutMs (r9 put the read allowance into the one window at all times), so
+    the watchdog could never fire first and the incident leg (m16-1457-native-fullscreen-s1-nola, log ends at gui_smoke.foreground_request, clamped at the
+    3600 s ceiling) was still held 3600 s. The read allowance now covers only the app's first silent stretch after the watch arms (the load); the first log
+    growth after arming ends it, and both windows are derived strictly below the hard deadline. Class: one window serving two phases with different needs."""
+
+    def _generated_clamped_leg(self) -> dict:
+        # the generator's REAL output for the incident shape: Get-AttrCudaLegTimeBudget clamps at the share smoke ceiling and Get-AttrCudaLegHardLimitArgs
+        # emits the runner argument; the runner's own derive and window text then runs as written
+        out = run_ps(r"""
+Import-Module $env:GS_BUDGET -Force
+$clamp = Get-AttrCudaLegTimeBudget -InputBytes 314572800000 -ColdReadMBps 100 -ReadMargin 1.5 -PlaySeconds 40 -ShareSmokeCeiling
+$emitted = Get-AttrCudaLegHardLimitArgs -RunnerAcceptsAllowance $true -AppReadAllowanceSec $clamp.appReadAllowanceSec
+if ($emitted -notmatch '^ -LegHardLimitAllowanceMs (\d+)$') { throw "unexpected generator text: $emitted" }
+$ProcessTimeoutMs = [int]$clamp.smokeProcessTimeoutMs; $LegHardLimitAllowanceMs = [int]$Matches[1]; $NoProgressTimeoutMs = 0
+$derivedProcessTimeoutMs = 187000   # the runner's derived leg budget for -Seconds 40 (2000*40 + 107000, fable's trace)
+. ([scriptblock]::Create($env:GS_DERIVE))
+$logRoot = $env:GS_TMP
+. ([scriptblock]::Create($env:GS_WINDOWS))
+[pscustomobject]@{ emitted = $emitted; job = $ProcessTimeoutMs; hard = [int64]$effectiveProcessTimeoutMs; leg = [int64]$noProgressWindowMs; load = [int64]$noProgressLoadWindowMs } | ConvertTo-Json -Compress
+""", GS_BUDGET=str(BUDGET_MODULE), GS_DERIVE=_runner_snippet(*_DERIVE_REGION),
+            GS_WINDOWS=_runner_snippet("$noProgressOverrideMs = if", "$noProgressWatch = New-GuiSmokeLogProgressWatch"))
+        return out
+
+    def test_both_windows_are_strictly_below_the_hard_deadline_on_the_generated_clamped_owner_leg(self) -> None:
+        out = self._generated_clamped_leg()
+        self.assertEqual(" -LegHardLimitAllowanceMs 3587000", out["emitted"], "the generator's real argument for the clamped incident leg")
+        self.assertEqual(3600000, out["hard"])
+        self.assertLess(out["leg"], out["hard"], "the leg window equalled the hard deadline: the watchdog could never fire first")
+        self.assertLess(out["load"], out["hard"], "the load window equalled the hard deadline: the watchdog could never fire first")
+        # a leg whose log stops after its load (the incident) is judged on the leg's own window: minutes, not the hour
+        self.assertEqual(187000 + 60000, out["leg"])
+        self.assertLessEqual(out["leg"], 300000)
+
+    def test_after_the_first_growth_a_stopped_log_is_judged_on_the_leg_window_not_the_load_window(self) -> None:
+        # scaled: load window 30 s, leg window 600 ms. The app writes its first line (arms), writes again (the load is over), then stops.
+        out = run_ps(r"""
+$dir = Join-Path $env:GS_TMP 'loadspent'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value ('x' * 100) -NoNewline
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 600 -LoadWindowMs 30000 -ProbeWaitMs 2000
+$arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+Start-Sleep -Milliseconds 900
+$quietLoad = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+Add-Content -LiteralPath $log -Value 'gui_smoke.foreground_request requested=1 verified=1'
+$grew = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+Start-Sleep -Milliseconds 900
+$stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -BudgetRemainingMs 60000)
+$active = [int64]$w.ActiveWindowMs
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ arm = $arm; quietLoad = $quietLoad; grew = $grew; stalled = $stalled; active = $active } | ConvertTo-Json -Compress
+""")
+        self.assertFalse(out["arm"])
+        self.assertFalse(out["quietLoad"], "a silent first stretch (the load) keeps its load window (r9: a healthy silent load is not a stall)")
+        self.assertFalse(out["grew"])
+        self.assertTrue(out["stalled"], "after the load a stopped log must be judged on the leg window, not the load window")
+        self.assertEqual(600, out["active"], "the window reported is the leg window that fired")
+
+    def test_the_runner_reports_the_window_in_force_and_its_comment_no_longer_claims_the_window_ignores_the_allowance(self) -> None:
+        wait = _runner_snippet(*_WAIT_REGION)
+        self.assertIn("-WindowMs $noProgressWindowMs -LoadWindowMs $noProgressLoadWindowMs", wait)
+        self.assertIn("$noProgressWindowMs = [int64]$noProgressWatch.ActiveWindowMs", wait)
+        self.assertLess(wait.index("$noProgressWindowMs = [int64]$noProgressWatch.ActiveWindowMs"), wait.index("$processBoundary = Wait-GuiSmokeProcessBounded"))
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertNotIn("so it does not widen with a caller's -ProcessTimeoutMs", source, "fable key3 r15 B1: that comment was false for the owner-input leg")
 
 
 if __name__ == "__main__":
