@@ -348,6 +348,9 @@ $script:LiveWorkRules = @(
     [pscustomobject]@{ folder = 'slot-holders'; what = 'lease'; filter = $null; recheck = $false; regex = '\.(lease|holder|acquired)\.json\z'; entries = $true }
 )
 
+# how many rounds of listings Get-VenueStateRaw takes of one folder before a folder that keeps changing is called unreadable
+$script:StableListingTries = 5
+
 function Get-LiveWorkNames {
     # The names in ONE folder that a $script:LiveWorkRules row counts as live work. Get-ChildItem without -Force, exactly as the agent
     # lists (a hidden file is not one the agent picks up); -ErrorAction Stop, so a listing that fails throws (unreadable), never "none".
@@ -398,11 +401,25 @@ function Get-VenueStateRaw {
         $live = @{}; $ignoredBy = @()
         foreach ($d in @('inbox', 'running', 'slot-holders')) {
             $dir = Join-Path $VenueRoot $d
-            # every entry, hidden or not, files and folders: the denominator of ignored=
-            $entries = @([System.IO.Directory]::EnumerateFileSystemEntries($dir) | ForEach-Object { [System.IO.Path]::GetFileName($_) })
-            $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            foreach ($rule in @($script:LiveWorkRules | Where-Object { [string]::Equals($_.folder, $d, [StringComparison]::Ordinal) })) {
-                foreach ($n in @(Get-LiveWorkNames -Dir $dir -Rule $rule -Entries $entries)) { [void]$names.Add([string]$n) }
+            # A folder is read by SEVERAL listings (one per rule, plus the entry count). An entry renamed between two of them (the
+            # agent promoting <id>.started.json.<hex>.tmp to <id>.started.json) could be missed by both, so the listings count only
+            # when the folder's full entry set is the SAME before and after them; otherwise they are taken again. A folder that never
+            # holds still for $script:StableListingTries rounds cannot be judged: unreadable, never "idle".
+            $stable = $false
+            for ($try = 1; $try -le $script:StableListingTries -and -not $stable; $try++) {
+                # every entry, hidden or not, files and folders: the denominator of ignored=
+                $entries = @([System.IO.Directory]::EnumerateFileSystemEntries($dir) | ForEach-Object { [System.IO.Path]::GetFileName($_) } | Sort-Object -CaseSensitive)
+                $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($rule in @($script:LiveWorkRules | Where-Object { [string]::Equals($_.folder, $d, [StringComparison]::Ordinal) })) {
+                    foreach ($n in @(Get-LiveWorkNames -Dir $dir -Rule $rule -Entries $entries)) { [void]$names.Add([string]$n) }
+                }
+                $again = @([System.IO.Directory]::EnumerateFileSystemEntries($dir) | ForEach-Object { [System.IO.Path]::GetFileName($_) } | Sort-Object -CaseSensitive)
+                # a file name holds no NUL, so the joined lists are equal exactly when the two sorted listings are (ordinal, case-sensitive)
+                $stable = ($entries.Count -eq $again.Count) -and [string]::Equals(($entries -join "`0"), ($again -join "`0"), [StringComparison]::Ordinal)
+            }
+            if (-not $stable) {
+                $state.unreadable = "folder $d\ changed during each of $($script:StableListingTries) listings, so what it holds cannot be judged"
+                return [pscustomobject]$state
             }
             $live[$d] = $names
             $left = @($entries | Where-Object { -not $names.Contains([string]$_) }).Count

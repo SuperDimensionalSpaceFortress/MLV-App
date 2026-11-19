@@ -269,6 +269,33 @@ class DeployBachelorAgent(unittest.TestCase):
                 self.assertRegex(r.stdout, r"(?m)^DEPLOY_REFUSED_UNREADABLE .*wildcard")
                 self.assertNotIn("DEPLOY_REFUSED_BUSY", r.stdout)
 
+    TMP_MARKER = "q.started.json.0123456789abcdef0123456789abcdef.tmp"
+
+    def test_s6_a_marker_promoted_between_two_listings_is_still_busy(self) -> None:
+        # adversary pass 2 A1: running\ is read by two rules; the agent renames its marker tmp to the final marker AFTER the
+        # final-marker listing and BEFORE the tmp listing, so each listing alone misses it. The folder changed under the listings,
+        # so they are taken again, and the second round sees the final marker.
+        (self.venue / "running" / self.TMP_MARKER).write_text('{"jobId":"q","phase":"launched"}')
+        r = self._dot_source(
+            "$script:orig = ${function:Get-LiveWorkNames}; $script:done = $false; "
+            "function Get-LiveWorkNames { param([string]$Dir, $Rule, [string[]]$Entries) "
+            "  $out = @(& $script:orig -Dir $Dir -Rule $Rule -Entries $Entries); "
+            "  if (-not $script:done -and $Rule.what -eq 'marker') { $script:done = $true; "
+            "    Rename-Item -LiteralPath (Join-Path $Dir '%s') -NewName 'q.started.json' }; "
+            "  $out }; "
+            "$s = Get-VenueStateRaw; 'promoted=' + $script:done + ' running=' + $s.running + ' unreadable=' + $s.unreadable" % self.TMP_MARKER)
+        self.assertIn("promoted=True running=1 unreadable=", r.stdout, r.stdout + r.stderr)
+
+    def test_s6_a_folder_that_never_holds_still_is_unreadable_not_idle(self) -> None:
+        r = self._dot_source(
+            "$script:orig = ${function:Get-LiveWorkNames}; $script:n = 0; "
+            "function Get-LiveWorkNames { param([string]$Dir, $Rule, [string[]]$Entries) "
+            "  $out = @(& $script:orig -Dir $Dir -Rule $Rule -Entries $Entries); "
+            "  if ($Rule.what -eq 'marker-tmp') { $script:n++; Set-Content -LiteralPath (Join-Path $Dir ('churn-' + $script:n + '.txt')) -Value x }; "
+            "  $out }; "
+            "$s = Get-VenueStateRaw; 'rounds=' + $script:n + ' running=' + $s.running + ' unreadable=' + $s.unreadable")
+        self.assertRegex(r.stdout, r"rounds=5 running=0 unreadable=folder running\\ changed during each of 5 listings", r.stdout + r.stderr)
+
     def test_s4_the_predicate_is_the_agents_own_calls_defined_once(self) -> None:
         text = SCRIPT.read_text(encoding="ascii")
         agent = (SCRIPT.parent / AGENT_NAME).read_text(encoding="utf-8-sig")
@@ -283,22 +310,30 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn('"$id.acquired.json"', agent)
         # adversary A3: EVERY listing of a folder the predicate reads, at every site, uses the pattern the table copies; a change at
         # ONE site (the pickup loop, or only the exempt-job list) is drift too, so the guard reads each site, not "somewhere"
+        # adversary pass 2 A2: each site is pinned by its WHOLE call (pattern AND options: an added -Force would make the agent
+        # pick up hidden files the deploy ignores), and the list of sites is exact (a new or changed listing reds)
+        pinned = [
+            "Get-ChildItem -LiteralPath $running -File -ErrorAction Stop",                                         # Get-MarkerTempFiles
+            "Get-ChildItem -LiteralPath $running -Filter *.started.json -File -ErrorAction SilentlyContinue",       # Get-RunningMarkerJobIds
+            "Get-ChildItem -LiteralPath $slotHolders -Filter \"*.holder.json\" -File -ErrorAction SilentlyContinue",
+            "Get-ChildItem -LiteralPath $slotHolders -File -ErrorAction SilentlyContinue",                         # startup side-file cleanup
+            "Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue",                         # exempt-job list
+            "Get-ChildItem -LiteralPath $slotHolders -Filter \"*.lease.json\" -File -ErrorAction SilentlyContinue",
+            "Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue",                         # pickup loop
+        ]
+
         def drift(agent_text: str) -> list:
-            bad = []
-            for var, allowed, at_least in (("inbox", {"*.job.ps1"}, 2), ("running", {"*.started.json"}, 1),
-                                           ("slotHolders", {"*.lease.json", "*.holder.json"}, 2)):
-                sites = re.findall(r"Get-ChildItem\s+(?:-LiteralPath\s+)?\$%s\b[^\n|]*?-Filter\s+\"?([^\s\"]+)\"?" % var, agent_text)
-                if len(sites) < at_least or set(sites) != allowed:
-                    bad.append((var, sites))
-            return bad
-        self.assertEqual(drift(agent), [], "every -Filter listing of a predicate folder uses the pattern the deploy copies")
+            sites = [s.rstrip() for s in re.findall(r"Get-ChildItem\b[^\n|)]*?\$(?:inbox|running|slotHolders)\b[^\n|)]*", agent_text)]
+            return [] if sites == pinned else sites
+        self.assertEqual(drift(agent), [], "every listing of a predicate folder is the call the deploy's table copies")
         # the guard itself: a change at ONE pickup site (the exempt list only, then the pickup loop only) is caught
         exempt = "$exemptJobs = Get-ChildItem $inbox -Filter *.job.ps1 -File"
         pickup = "$jobs = Get-ChildItem $inbox -Filter *.job.ps1 -File"
         for site in (exempt, pickup):
-            with self.subTest(mutated=site):
-                self.assertEqual(agent.count(site), 1, site)
-                self.assertNotEqual(drift(agent.replace(site, site.replace("*.job.ps1", "*.queued.ps1"))), [])
+            for mutant in (site.replace("*.job.ps1", "*.queued.ps1"), site + " -Force"):
+                with self.subTest(mutated=mutant):
+                    self.assertEqual(agent.count(site), 1, site)
+                    self.assertNotEqual(drift(agent.replace(site, mutant)), [])
         # ... and the deploy spells each pattern ONCE, in its one table
         for token in ("'*.job.ps1'", "'*.started.json'", tmp_re, r"'\.(lease|holder|acquired)\.json\z'"):
             self.assertEqual(text.count(token), 1, "%s is spelled exactly once in the deploy script" % token)
