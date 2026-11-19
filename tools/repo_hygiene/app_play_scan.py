@@ -248,21 +248,366 @@ _LOOP_SAFE_BEFORE = re.compile(r"addAction\s*\(\s*ui\s*->\s*$")
 _HANDLER_START = re.compile(r"\bon_actionPlay_(?:triggered|toggled)\s*\(\s*(?!false\b|bool\b)\S")
 _SET_PLAYING = re.compile(r"\bsetPlaying\s*\(")
 _INVOKE_METHOD = re.compile(r"\binvokeMethod\s*\([^;]*?\w*[Aa]ctionPlay\w*")
-_KEY_SYNTH = re.compile(r"\bQKeyEvent\s*(?:\w+\s*)?\(|\bKey_Space\b|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
-_EVENT_POST = re.compile(r"\b(?:postEvent|sendEvent|sendSpontaneousEvent)\s*\(")
+# The QKeyEvent TYPE, used as anything but a pointer or a reference to an event Qt already delivered (a handler
+# parameter, a cast of the filter's event) -- so every construction spelling is caught without listing spellings:
+# parentheses, braces, an array declarator, a template argument (r2 adversary A1 and pass 2 A2). An owning smart
+# pointer of a key event is caught too, on purpose (fail-closed: review it here). A type ALIAS of it, pointer or
+# not, is caught as well, since an alias can construct one without naming the type.
+# r3 (adversary pass on c1216855 A3, advisory): `QKeyEvent const *` / `QKeyEvent const &` is a pointer / reference too.
+# r5 (adversary pass on f422d164 A3, advisory): `volatile` qualifies a pointer / reference like `const` does.
+_KEY_EVENT_REF_TAIL = r"\s*(?:(?:const|volatile)\b\s*)*[*&]"
+_KEY_SYNTH = re.compile(r"\bQKeyEvent\b(?!" + _KEY_EVENT_REF_TAIL + r")|(?:\busing\s+\w+\s*=|\btypedef\b)[^;]*\bQKeyEvent\b|\bKey_Space\b"
+                        r"|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
+# r5 (adversary pass on f422d164 A2): the pointer / reference exemption hid `std::remove_pointer_t<QKeyEvent*> press{...}`,
+# a type trait that names the OBJECT type.
+# r6 (adversary pass on 4adb9c0d A1 A2, HUB RULING HUB-TICK 20261118T1142Z): r5 decided the exemption with a backward text
+# walk that GUESSED the template context, and every stop character it knew (a C-style cast's `(`, a `{` inside a balanced
+# group) let one more spelling scan clean. The rule is inverted and fail-closed: a `QKeyEvent` pointer / reference is a
+# delivered-event read ONLY where it is matched POSITIVELY (_key_event_ref_is_delivered_read): (a) a function or lambda
+# parameter declarator, or (b) a statement that is exactly a named cast of a delivered event. Everything else -- a
+# template argument, a decltype, a C-style cast, a member, a local, a default argument -- is flagged, reviewed here.
+_KEY_EVENT_REF = re.compile(r"\bQKeyEvent\b(?=" + _KEY_EVENT_REF_TAIL + r")")
+_CLOSE_OF = {"(": ")", "[": "]", "{": "}"}
+_CV = r"(?:(?:const|volatile)\b\s*)*"
+_ACCESS_LABELS = re.compile(
+    r"^\s*(?:(?:(?:public|protected|private)(?:\s+(?:slots|Q_SLOTS))?|signals|Q_SIGNALS)\s*:(?!:)\s*)*")
+# A depth-filtered prefix: nested ( ) [ ] { } groups are shown as an empty pair, so only the statement's own tokens remain.
+_FUNC_NAME = r"[\w\s:~]*[\w~]"                    # `void StatusDialog::keyPressEvent`, `bool eventFilter`, `~X`
+_LAMBDA_INTRO = r"(?:[\w\s:]*=\s*)?\[\]"           # `auto inspect = []` (captures are a nested group)
+_DECL_SPECS = (r"(?:\s*(?:(?:const|volatile|override|final|noexcept|mutable|Q_DECL_OVERRIDE)\b|noexcept\s*\(\)"
+               r"|->\s*[\w:]+\s*[*&]?))*")
+_CTOR_INIT = r"(?:\s*:\s*[\w:]+\s*(?:\(\)|\{\})(?:\s*,\s*[\w:]+\s*(?:\(\)|\{\}))*)?"
+_PARAM_LIST_OWNER = re.compile(rf"(?:{_FUNC_NAME}|{_LAMBDA_INTRO})")
+# A parenthesis after one of these is an operand, not a parameter list (GCC's __typeof__ even takes a type).
+_NOT_A_PARAM_LIST_OWNER = re.compile(
+    r"\b(?:decltype|typeof|__typeof__|__typeof|sizeof|alignof|_Alignof|__alignof__|typeid|noexcept|return|throw|co_return"
+    r"|co_yield|co_await|new|delete|if|for|while|switch|catch|case|static_assert|requires|operator)$")
+# What a brace that opens a BLOCK follows: a function / lambda head, a class / namespace head, a control statement, or
+# nothing (a bare block). A brace after anything else (`int{}`, `decltype(0){}`, `+[]{` in a template argument) is an
+# expression, so it neither ends a statement nor counts as a plain block context.
+_BLOCK_PREFIX = re.compile(
+    rf"(?:|(?:class|struct|union|namespace|enum)\b[\w\s:,]*|(?:else\s+)?(?:if|for|while|switch|catch)\s*\(\)"
+    rf"|else|do|try|(?:{_FUNC_NAME}|{_LAMBDA_INTRO})\s*\(\){_DECL_SPECS}{_CTOR_INIT})")
+# A function body of any return type (`inline QList<ActionBinding> bindings() { ... }`) also ENDS a statement, so the
+# next declaration's prefix starts after it. It is not thereby a plain block context: that is _BLOCK_PREFIX, strictly.
+_FUNCTION_BODY_HEAD = re.compile(rf"\(\){_DECL_SPECS}{_CTOR_INIT}$")
+# (a) one parameter: cv QKeyEvent cv [*&] cv name, nothing else (no default argument, no template, no array).
+_KEY_EVENT_PARAM = re.compile(rf"\s*(?:(?:const|volatile)\s+)*QKeyEvent\s*{_CV}[*&]\s*{_CV}(?P<name>\w+)?\s*")
+_PARAM_LIST_END = re.compile(
+    r"\s*(?:[{;]|=\s*(?:0|default|delete)\b|->|(?:const|volatile|override|final|noexcept|mutable|Q_DECL_OVERRIDE)\b)")
+# The members a delivered key event is READ through (r6 adversary pass on c1f09601 A1: anything else -- clone() -- may
+# build one). A new member is reviewed here.
+_KEY_EVENT_READ_MEMBERS = (r"(?:key|modifiers|accept|ignore|setAccepted|isAccepted|type|text|isAutoRepeat|count|spontaneous"
+                           r"|nativeScanCode|nativeVirtualKey|nativeModifiers|keyCombination|matches)\b")
+_KEY_EVENT_READ_USE = re.compile(rf"\s*(?:->|\.)\s*{_KEY_EVENT_READ_MEMBERS}\s*\(")   # `.` for a reference
+# The one reviewed hand-on: `QDialog::keyPressEvent( event )` (the callee is matched just before its opening parenthesis).
+_BASE_KEY_HANDLER_CALL = re.compile(r"\b\w+\s*::\s*(?:keyPressEvent|keyReleaseEvent)\s*$")
+# (b) the whole statement: `[cv] QKeyEvent|auto cv* name = <named cast><cv QKeyEvent cv*>( ... );`, the same cast
+# assigned to a name, or the cast read through one reviewed member (`return static_cast<QKeyEvent*>( e )->key();`).
+# The cast operand is a nested group, scanned on its own (a ref inside it has a parenthesis as its context: flagged).
+_KEY_EVENT_CAST = (rf"(?:static_cast|dynamic_cast|reinterpret_cast|const_cast|qobject_cast)\s*<\s*(?:(?:const|volatile)\s+)*"
+                   rf"QKeyEvent\s*{_CV}[*&]\s*{_CV}>\s*\(\)")
+_KEY_EVENT_CAST_STATEMENT = re.compile(
+    rf"\s*(?:(?:(?:const|volatile)\s+)*(?:QKeyEvent|auto)\s*{_CV}[*&]\s*{_CV}(?P<name>\w+)\s*=\s*{_KEY_EVENT_CAST}"
+    rf"|(?P<assigned>\w+)\s*=\s*{_KEY_EVENT_CAST}"
+    rf"|(?:return\s+|[\w\s:]*\w\s*=\s*)?{_KEY_EVENT_CAST}\s*->\s*{_KEY_EVENT_READ_MEMBERS}\s*\(\))\s*")
+# r8: the one operand a named cast of a delivered key event may have -- the delivered event's own identifier.
+_BARE_IDENTIFIER = re.compile(r"\s*[A-Za-z_]\w*\s*")
+# r6 adversary pass on c1f09601 A1: a type-of operator computes a type from an EXPRESSION, so it can name the object type
+# of a delivered key event with no QKeyEvent spelled. No scanned source uses one; a new use is reviewed here.
+_TYPE_OF_OPERATOR = re.compile(r"\b(?:decltype|typeof|__typeof__|__typeof)\b")
+
+
+class _Brackets:
+    """The ( ) [ ] { } structure of one comment- and literal-blanked file (preprocessor lines blanked too).
+
+    Angle brackets are NOT tracked: `<` is also a comparison. Nothing here guesses a template context; the exemption is
+    granted only on a positive structural match, so any structure this cannot read (an unbalanced file, an unknown
+    prefix) leaves the reference flagged."""
+
+    def __init__(self, blank: str) -> None:
+        self.text = _DIRECTIVE_LINE.sub(lambda m: " " * len(m.group(0)), blank)
+        self.closer: dict[int, int] = {}
+        self.opener: dict[int, int] = {}
+        self.parent: dict[int, int] = {}
+        self.broken = False
+        self._prefix_memo: dict[int, tuple[str, list[int]]] = {}
+        stack: list[int] = []
+        for i, c in enumerate(self.text):
+            if c in "([{":
+                self.parent[i] = stack[-1] if stack else -1
+                stack.append(i)
+            elif c in ")]}":
+                if not stack or _CLOSE_OF[self.text[stack[-1]]] != c:
+                    self.broken = True
+                    return
+                self.closer[stack[-1]] = i
+                self.opener[i] = stack.pop()
+        self.broken = bool(stack)
+
+    def enclosing(self, pos: int) -> int:
+        """The innermost opener whose group holds `pos` (-1 at file level)."""
+        i = pos - 1
+        while i >= 0:
+            c = self.text[i]
+            if c in ")]}":
+                i = self.opener[i] - 1
+                continue
+            if c in "([{":
+                return i
+            i -= 1
+        return -1
+
+    def items(self, start: int, end: int) -> list[tuple[str, int]]:
+        """The tokens of [start, end) at that depth: a nested group becomes its empty pair."""
+        out: list[tuple[str, int]] = []
+        i = start
+        while i < end:
+            c = self.text[i]
+            if c in "([{":
+                out.append((c + _CLOSE_OF[c], i))
+                i = self.closer[i] + 1
+                continue
+            out.append((c, i))
+            i += 1
+        return out
+
+    def prefix(self, pos: int) -> str:
+        """The depth-filtered text of the statement that `pos` sits in, from its start up to `pos`.
+
+        A statement starts after its parent opener, a `;`, or a `{ }` group whose own prefix makes it a BLOCK."""
+        parent = self.enclosing(pos)
+        buf: list[str] = []
+        for token, at in self.items(parent + 1, pos):
+            if token == ";":
+                buf = []
+            elif token == "{}" and (_BLOCK_PREFIX.fullmatch(head := _ACCESS_LABELS.sub("", "".join(buf)).strip())
+                                    or _FUNCTION_BODY_HEAD.search(head)):
+                buf = []
+            else:
+                buf.append(token)
+        return _ACCESS_LABELS.sub("", "".join(buf)).strip()
+
+    def block_context(self, opener: int) -> bool:
+        """True when `opener` and every group around it is a BLOCK brace (never a ( ) or [ ] or an expression brace)."""
+        while opener != -1:
+            if self.text[opener] != "{" or not _BLOCK_PREFIX.fullmatch(self.prefix(opener)):
+                return False
+            opener = self.parent[opener]
+        return True
+
+
+def _key_event_ref_is_delivered_read(brackets: _Brackets, pos: int) -> tuple[str, int, int] | None:
+    """The binding of the `QKeyEvent` pointer / reference at `pos` when it is one of the two reviewed delivered-event reads
+    -- (bound name or "", scope start, scope end) -- or None when it is anything else (flagged)."""
+    if brackets.broken:
+        return None
+    text = brackets.text
+    parent = brackets.enclosing(pos)
+    # (a) a parameter declarator: the innermost group is a parameter list owned by a named function or a lambda, in a
+    # plain block context, and the list is followed by what follows a declarator.
+    if parent != -1 and text[parent] == "(":
+        close = brackets.closer[parent]
+        tokens = brackets.items(parent + 1, close)
+        flat = "".join(token for token, _ in tokens)
+        if "=" in flat or not _PARAM_LIST_END.match(text, close + 1):
+            return None
+        index = next((k for k, (_, at) in enumerate(tokens) if at == pos), None)
+        if index is None:
+            return None
+        before = "".join(token for token, _ in tokens[:index])
+        angle = before.replace("->", "")
+        if angle.count("<") != angle.count(">"):     # a comma inside a template argument list is not a parameter break
+            return None
+        start = before.rfind(",") + 1
+        rest = "".join(token for token, _ in tokens[index:])
+        end = rest.find(",")
+        segment = before[start:] + (rest if end < 0 else rest[:end])
+        param = _KEY_EVENT_PARAM.fullmatch(segment)
+        if not param:
+            return None
+        owner = brackets.prefix(parent)
+        if not _PARAM_LIST_OWNER.fullmatch(owner) or _NOT_A_PARAM_LIST_OWNER.search(owner):
+            return None
+        outer = brackets.enclosing(parent)
+        if not brackets.block_context(outer):
+            return None
+        # The parameter's scope is the body that follows the list (none for a declaration).
+        for token, at in brackets.items(close + 1, brackets.closer[outer] if outer != -1 else len(text)):
+            if token == ";":
+                return param.group("name") or "", at, at
+            if token == "{}":
+                return param.group("name") or "", at, brackets.closer[at]
+        return None
+    # (b) a named-cast statement in a plain block context.
+    if parent != -1 and not brackets.block_context(parent):
+        return None
+    scope_end = brackets.closer[parent] if parent != -1 else len(text)
+    tail: list[tuple[str, int]] = []
+    for token, at in brackets.items(pos, scope_end):
+        if token == ";":
+            statement = _KEY_EVENT_CAST_STATEMENT.fullmatch(brackets.prefix(pos) + "".join(t for t, _ in tail))
+            if not statement or not _cast_operand_is_bare_identifier(brackets, tail):
+                return None
+            return statement.group("name") or statement.group("assigned") or "", at, scope_end
+        tail.append((token, at))
+    return None
+
+
+def _cast_operand_is_bare_identifier(brackets: _Brackets, tail: list[tuple[str, int]]) -> bool:
+    """r8 (sol r7 blocker): the named-cast statement collapses the cast's operand to an empty `()`, so a cast whose operand
+    PRODUCES an event (`static_cast<QKeyEvent*>( event->clone() )`, `( cloneOf( event ) )`) matched as a read of the delivered
+    event. The cast is exempt only when its operand is the bare delivered-event identifier: a call, a member access, a
+    nested cast, a dereference, a subscript, a qualified name, a grouping or an empty operand is never exempt. `tail` is the
+    statement's depth-filtered tokens from the QKeyEvent reference to the `;`; the operand group is the `()` that follows the
+    cast's closing `>` (the statement shape was already matched, so there is exactly one such group)."""
+    operands = 0
+    previous = ""
+    for token, at in tail:
+        if token == "()" and previous == ">":
+            operands += 1
+            if not _BARE_IDENTIFIER.fullmatch(brackets.text, at + 1, brackets.closer[at]):
+                return False
+        if not token.isspace():
+            previous = token
+    return operands == 1
+
+
+def _scan_key_event_reads(path: str, blank: str) -> list[str]:
+    """r6: every QKeyEvent pointer / reference is a reviewed delivered-event read, and what a read binds is only READ.
+
+    r6 adversary pass on c1f09601 A1: an exempt read bound a name, and a later statement built a key event from it with no
+    QKeyEvent spelled (`std::remove_pointer_t<decltype(keyType)> press{...}`, or a lambda that returns its parameter). The
+    class is "a delivered key event used to build one", closed fail-closed: a name a read binds is used, in its scope, only
+    as `name->` one of the reviewed read members, or as a whole call argument (handing the event on); a dereference, a
+    copy, a subscript, a clone, an alias or a return is flagged."""
+    problems: list[str] = []
+    brackets = None
+    bindings: set[tuple[str, int, int]] = set()
+    for match in _KEY_EVENT_REF.finditer(blank):
+        brackets = brackets or _Brackets(blank)
+        binding = _key_event_ref_is_delivered_read(brackets, match.start())
+        if binding is None:
+            problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
+        elif binding[0]:
+            bindings.add(binding)
+    for name, start, end in sorted(bindings, key=lambda b: b[1]):
+        for use in re.compile(rf"\b{re.escape(name)}\b").finditer(blank, start, end):
+            if _KEY_EVENT_READ_USE.match(blank, use.end()):
+                continue
+            # r6 adversary pass on a91a899d A1 A2: "a whole call argument" took grouping parentheses `(keyEvent)->clone()`
+            # for a call and let any callee -- a generic lambda that clones -- take the event. Handing it on is allowed ONLY
+            # as the single argument of a qualified base key handler.
+            group = brackets.enclosing(use.start())
+            if (group != -1 and brackets.text[group] == "(" and blank[group + 1:brackets.closer[group]].strip() == name
+                    and _BASE_KEY_HANDLER_CALL.search(blank, max(0, group - 200), group)):
+                continue
+            problems.append(f"{path}:{_line_of(blank, use.start())}: synthesized key event (the delivered key event `{name}` is "
+                            "used as anything but a reviewed member read or the argument of a base key handler: a copy, a "
+                            "clone or a type computed from it builds a key event)")
+    return problems
+# r3 (adversary pass on fce56625 A2, advisory): a module-qualified include (<QtGui/QKeyEvent>) is an include too.
+_KEY_EVENT_INCLUDE = re.compile(r'#\s*include\s*[<"]\s*(?:\w+/)*QKeyEvent\s*[>"]')
+# PLAYER-STANDARD-SHORTCUT-MAP-1: Space is BOUND as the Play shortcut in the one player key table
+# (PlayerShortcutBinding::bindings(), handed to QAction::setShortcuts(); before, MainWindow.ui carried it). A binding is
+# not an event. Only the ``Key_Space`` inside the exact (comment-stripped, whitespace-normalised) table STATEMENT
+# pinned here, at the reviewed path and EXACT count, is exempt from the synthesized-key scan. r2 adversary A1: keying
+# on the bare ``QKeySequence( Qt::Key_Space )`` expression let it move into a lambda or a modified-Space sequence and
+# still pass. A second binding, a binding in another file, the expression outside its statement, a modified-Space
+# sequence or a QKeyEvent / QTest call built with Key_Space still fails.
+PINNED_KEY_SPACE_BINDINGS = {
+    "platform/qt/PlayerShortcutBinding.h": (
+        'table << ActionBinding{ QStringLiteral( "actionPlay" ), '
+        '{ { QKeySequence( Qt::Key_Space ), KeyKind::Primary } } };', 1),
+}
+_SPACE_BINDING = re.compile(r"\bQKeySequence\s*\(\s*Qt\s*::\s*Key_Space\s*\)")
+
+
+def _statement_pattern(statement: str) -> re.Pattern[str]:
+    """A whole-token regex for a pinned, whitespace-normalised statement: whitespace may vary, nothing else."""
+    tokens = re.findall(r'"(?:[^"\\]|\\.)*"|\w+|[^\w\s]', statement)   # a string literal is one token
+    return re.compile(r"(?<!\w)" + r"\s*".join(re.escape(token) for token in tokens))
+# r2 adversary pass 2 A1: a macro over a token of the pinned statement (``#define QKeySequence(key) ...``) changes the
+# binding while the text still matches. Any #define of one of those identifiers, in any scanned source, fails.
+SPACE_BINDING_STATEMENT_IDENTIFIERS = frozenset(
+    token for statement, _ in PINNED_KEY_SPACE_BINDINGS.values() for token in re.findall(r"[A-Za-z_]\w*", statement))
+# r3 (adversary pass on fce56625 A1): a form feed and a vertical tab are whitespace to the preprocessor too.
+_DEFINE = re.compile(r"^[ \t\f\v]*#[ \t\f\v]*define[ \t\f\v]+([A-Za-z_]\w*)", re.MULTILINE)
+# r3 (adversary pass 3 A1, HUB RULING HUB-TICK 20261118T1142Z): a digraph `%:define` or a spliced `#de\<nl>fine` re-spelled
+# that macro. The scan guards against an accidental or refactor-made synthesized Play key, not deliberate obfuscation, so
+# the class is closed with one fail-closed rule instead of a preprocessor: in the ONE pinned key-table file a directive
+# other than the include guard, an #include and the reviewed Windows-only key (`#ifdef Q_OS_WIN` / `#endif`, by exact
+# count) fails, and so does any digraph %:, any trigraph, or any line ending in a backslash, anywhere in the file
+# (comments and literals included: a spliced comment swallows the next line). Other files keep the _DEFINE check only.
+KEY_TABLE_SOURCE = "platform/qt/PlayerShortcutBinding.h"
+KEY_TABLE_REVIEWED_DIRECTIVES = {
+    "#ifndef PLAYERSHORTCUTBINDING_H": 1, "#define PLAYERSHORTCUTBINDING_H": 1, "#ifdef Q_OS_WIN": 1, "#endif": 2}
+_DIRECTIVE_LINE = re.compile(r"^[ \t\f\v]*#.*$", re.MULTILINE)
+# r3 (adversary pass on c1216855 A1): a quoted include of an unscanned fragment carried a macro over the statement.
+# r5 (adversary pass on f422d164 A1): the r3 SHAPE rule (any Qt-looking or lowercase extensionless name) still admitted an
+# extensionless project fragment (<shortcut_compat>) that no loader scans. The key table now includes ONLY these headers,
+# by exact name (what platform/qt/PlayerShortcutBinding.h includes today): a new include is a change reviewed here.
+KEY_TABLE_REVIEWED_INCLUDES = frozenset({
+    "QAbstractButton", "QAbstractItemView", "QAbstractSlider", "QAbstractSpinBox", "QAction", "QApplication", "QComboBox",
+    "QCoreApplication", "QDebug", "QDialog", "QDialogButtonBox", "QDockWidget", "QEvent", "QHeaderView", "QKeyEvent",
+    "QKeySequence", "QLineEdit", "QList", "QMenu", "QPlainTextEdit", "QPointer", "QShortcut", "QStringList",
+    "QTableWidget", "QTextEdit", "QVBoxLayout", "QWidget", "algorithm", "cmath"})
+_INCLUDE_DIRECTIVE = re.compile(r"#\s*include\s*<\s*(\w+)\s*>")
+# r3 (adversary pass on fce56625 A1): a form feed / vertical tab before `#` hid a directive. Fail-closed on the class:
+# ANY control character but tab, newline and carriage return, anywhere in the key table.
+_PREPROCESSOR_RESPELL = re.compile(r"%:|\?\?[=/'()!<>\-]|\\[ \t\r]*$|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", re.MULTILINE)
+# r3 (adversary pass 3 A2, same ruling): a grouped `(qApp->notify)( w, e )` or `(QCoreApplication::sendEvent)(...)` escaped
+# a `name(` match. EVERY identifier mention of a dispatch name is counted against the pinned sites: a call, a grouping, a
+# member pointer alike.
+_EVENT_POST = re.compile(r"\b(postEvent|sendEvent|sendSpontaneousEvent|notify)\b")
 # The event dispatches that exist today: MyApplication's event filter forwarding to the main window, and the two
 # Look Assist analysis holds, which re-post at landing a clone of an event the user or the OS already delivered
 # (LookAssistAnalysisPump.h: held input; MainWindow.cpp: a held FileOpen). Neither makes up an event.
+# r3: the two local std::function callables NAMED notify are mentions too, pinned by file and count (reviewed: neither
+# dispatches a QEvent): FocusPixelMapManager.cpp's download-ready callback (parameter, capture, call) and
+# SyncDownloadWaiter.h's resolve callable (declaration, hand-off to connectReady).
 PINNED_EVENT_SITES = {
     ("platform/qt/MyApplication.h", "sendEvent"): 1,
     ("platform/qt/LookAssistAnalysisPump.h", "postEvent"): 1,
     ("platform/qt/MainWindow.cpp", "postEvent"): 1,
+    ("platform/qt/FocusPixelMapManager.cpp", "notify"): 3,
+    ("platform/qt/SyncDownloadWaiter.h", "notify"): 2,
 }
+
+
+def _scan_key_table_preprocessor(path: str, text: str, keep: str) -> list[str]:
+    """r3 A1: the fail-closed preprocessor rule for the one pinned key-table file."""
+    problems: list[str] = []
+    for match in _PREPROCESSOR_RESPELL.finditer(text):
+        problems.append(f"{path}:{_line_of(text, match.start())}: a digraph %:, a trigraph or a line splice in the key "
+                        "table (fail-closed: the preprocessor can re-spell the reviewed binding)")
+    seen: dict[str, int] = {}
+    for match in _DIRECTIVE_LINE.finditer(keep):
+        directive = re.sub(r"^#\s*", "#", _normalise(match.group(0)))
+        include = _INCLUDE_DIRECTIVE.fullmatch(directive)
+        if include and include.group(1) in KEY_TABLE_REVIEWED_INCLUDES:
+            continue
+        if directive in KEY_TABLE_REVIEWED_DIRECTIVES:
+            seen[directive] = seen.get(directive, 0) + 1
+            continue
+        problems.append(f"{path}:{_line_of(keep, match.start())}: preprocessor directive `{directive}` in the key table "
+                        "(only the include guard, an #include of a header in KEY_TABLE_REVIEWED_INCLUDES and the reviewed "
+                        "#ifdef Q_OS_WIN / #endif are allowed)")
+    for directive, expected in KEY_TABLE_REVIEWED_DIRECTIVES.items():
+        if seen.get(directive, 0) != expected:
+            problems.append(f"{path}: reviewed preprocessor directive `{directive}` x{seen.get(directive, 0)}, pinned "
+                            f"x{expected} (a directive change is reviewed in app_play_scan.py KEY_TABLE_REVIEWED_DIRECTIVES)")
+    return problems
 _ACTION_PLAY = re.compile(r"\bactionPlay\b")
 _ACTION_LOOP = re.compile(r"\bactionLoop\b")
 _GATED_CALL = re.compile(r'\bprogrammaticPlay\s*\(\s*"([^"]+)"\s*,')
 _WALL_CLOCK_PLAY_LOOP = re.compile(r"\bwhile\s*\([^{;]*\belapsed\s*\(\s*\)[^{;]*\bactionPlay\b|\bwhile\s*\([^{;]*\bactionPlay\b[^{;]*\belapsed\s*\(\s*\)")
 _STOP_CALL = re.compile(r'programmaticStop\s*\(\s*"([^"]+)"')
+
+
+_DIGITS = "0123456789"
+# C++14 [lex.ppnumber]: pp-number: digit | . digit | pp-number (digit | identifier-nondigit | ' digit | ' nondigit | e+ | e- | p+ | p- | .)
+_PP_NUMBER = re.compile(r"\.?[0-9](?:[eEpP][+-]|'[0-9A-Za-z_]|[0-9A-Za-z_.])*")
 
 
 def strip_cpp(text: str) -> tuple[str, str]:
@@ -303,6 +648,15 @@ def strip_cpp(text: str) -> tuple[str, str]:
                     keep.append(ch)
                 i = end
                 continue
+        # r7 (sol r6 blocker): a C++14 digit separator (`1'000`, `0x1'000`, `1'000.5f`) is part of the number, never a
+        # character-literal opener. A pp-number begins at a digit (or `.digit`) that does not continue an identifier, so
+        # `u8'x'` / `L'x'` (the digit 8 continues the identifier u8) stay literals; it is consumed whole, as [lex.ppnumber].
+        if (c in _DIGITS or (c == "." and nxt != "" and nxt in _DIGITS)) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            number = _PP_NUMBER.match(text, i)
+            blank.append(number.group(0))
+            keep.append(number.group(0))
+            i = number.end()
+            continue
         if c in "\"'":
             quote = c
             j = i + 1
@@ -523,10 +877,42 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             problems.append(f"{path}:{_line_of(blank, match.start())}: setPlaying( call")
         for match in _INVOKE_METHOD.finditer(keep):
             problems.append(f"{path}:{_line_of(keep, match.start())}: invokeMethod naming the Play action")
+        # blank and keep are offset-aligned (literals are blanked in place), so a span found in keep -- where the
+        # statement's "actionPlay" literal is still visible -- is a span in blank.
+        space_bindings = len(_SPACE_BINDING.findall(blank))
+        pinned_statement, reviewed_bindings = PINNED_KEY_SPACE_BINDINGS.get(path, ("", 0))
+        statement_spans = ([(m.start(), m.end()) for m in _statement_pattern(pinned_statement).finditer(keep)]
+                           if pinned_statement else [])
+        # r5 (sol r4 blocker): the exact-count checks fail ZERO too. A pinned path has reviewed_bindings > 0, so a deleted or
+        # retargeted binding (count 0) is a mismatch; a path that is not pinned has reviewed_bindings == 0 as before.
+        if space_bindings != reviewed_bindings:
+            problems.append(f"{path}: {space_bindings} Space shortcut binding(s), {reviewed_bindings} reviewed "
+                            "(a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)")
+        if pinned_statement and len(statement_spans) != reviewed_bindings:
+            problems.append(f"{path}: the reviewed Space binding statement x{len(statement_spans)}, pinned "
+                            f"x{reviewed_bindings} (a new binding is reviewed in app_play_scan.py PINNED_KEY_SPACE_BINDINGS)")
+        bindings_reviewed = space_bindings == reviewed_bindings == len(statement_spans)
+        for match in _DEFINE.finditer(blank):
+            if match.group(1) in SPACE_BINDING_STATEMENT_IDENTIFIERS:
+                problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token of the "
+                                "reviewed Space binding statement")
+        if path == KEY_TABLE_SOURCE:
+            problems.extend(_scan_key_table_preprocessor(path, text, keep))
+        include_spans = [(m.start(), m.end()) for m in _KEY_EVENT_INCLUDE.finditer(blank)]
         for match in _KEY_SYNTH.finditer(blank):
+            if bindings_reviewed and match.group(0) == "Key_Space" and any(
+                    start <= match.start() < end for start, end in statement_spans):
+                continue
+            if any(start <= match.start() < end for start, end in include_spans):
+                continue
             problems.append(f"{path}:{_line_of(blank, match.start())}: synthesized key event (the Play shortcut is Space)")
+        problems.extend(_scan_key_event_reads(path, blank))
+        for match in _TYPE_OF_OPERATOR.finditer(blank):
+            problems.append(f"{path}:{_line_of(blank, match.start())}: type-of operator {match.group(0)} (a type computed from "
+                            "an expression can name a delivered key event's type with no QKeyEvent spelled; reviewed in "
+                            "app_play_scan.py)")
         for match in _EVENT_POST.finditer(blank):
-            key = (path, re.sub(r"\W", "", match.group(0)))
+            key = (path, match.group(1))
             event_counts[key] = event_counts.get(key, 0) + 1
         for match in _GATED_CALL.finditer(keep):
             site_counts[match.group(1)] = site_counts.get(match.group(1), 0) + 1
@@ -542,6 +928,12 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
     for key, count in event_counts.items():
         if PINNED_EVENT_SITES.get(key, 0) != count:
             problems.append(f"event dispatch {key[1]} in {key[0]} x{count}: not a pinned site (the Play shortcut can be synthesized)")
+    # r5 (fable key3 r4, APP-PLAY-SCAN-VANISHED-EVENT-PIN-1): a pinned site in a scanned file whose mentions all vanished has no
+    # observed count, so the loop above never saw it. Iterate the pinned table too: zero is a count other than the pinned one.
+    for (pinned_path, pinned_name), pinned_count in PINNED_EVENT_SITES.items():
+        if pinned_path in sources and (pinned_path, pinned_name) not in event_counts:
+            problems.append(f"event dispatch {pinned_name} in {pinned_path} x0, pinned x{pinned_count} (a pinned site vanished: "
+                            "re-review it in app_play_scan.py PINNED_EVENT_SITES)")
 
     # ---- the reviewed site tables ------------------------------------------------------------------------
     reviewed_counts = {site: count for site, (count, _) in REVIEWED_PROGRAMMATIC_PLAY_SITES.items()}
