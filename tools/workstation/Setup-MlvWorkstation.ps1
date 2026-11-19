@@ -1157,13 +1157,76 @@ function Get-GitHubSshProbeVerdict {
     return @{ Authenticated = $false; Detail = "ssh exited $ExitCode ($text)" }
 }
 
+# r4 B1 / B2 (class: a location or a file identity judged by its spelling, where only the file system knows what a path is): the canonical path and the file identity of an EXISTING
+# path as the file system reports them, from one handle that follows the whole link chain: GetFinalPathNameByHandle resolves a SUBST drive, a DOS device
+# mapping, a junction, a symbolic link and an 8.3 short name to the real long path; the volume serial plus file index identify one file whatever its spelling or case. Returns
+# @{ Final; Id } or $null when the path cannot be opened or the native call is unavailable (callers fail closed). Id is '' when the volume reports no file index.
+$script:PathIdentityOverride = $null   # test seam: a scriptblock taking the path and returning @{ Final; Id } or $null
+function Get-PathIdentity {
+    param([string]$Path)
+    if ($script:PathIdentityOverride) { return (& $script:PathIdentityOverride $Path) }
+    if (-not ('MlvSetup.PathIdentity' -as [type])) {
+        try {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace MlvSetup {
+    public static class PathIdentity {
+        [StructLayout(LayoutKind.Sequential)]
+        struct ByHandleInfo { public uint Attrs, C1, C2, A1, A2, W1, W2, Vol, SizeHigh, SizeLow, Links, IdHigh, IdLow; }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder buffer, uint length, uint flags);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandle(SafeFileHandle h, out ByHandleInfo info);
+        // { final path, file identity } or null; access 0 (no data access), share all, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (opens a directory too); a reparse point is followed
+        public static string[] Query(string path) {
+            using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (h.IsInvalid) return null;
+                StringBuilder sb = new StringBuilder(4096);
+                uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+                if (n == 0 || n >= sb.Capacity) return null;
+                ByHandleInfo info;
+                string id = "";
+                if (GetFileInformationByHandle(h, out info) && (info.IdHigh != 0 || info.IdLow != 0)) id = info.Vol.ToString("x8") + ":" + info.IdHigh.ToString("x8") + info.IdLow.ToString("x8");
+                return new string[] { sb.ToString(), id };
+            }
+        }
+    }
+}
+'@
+        } catch { return $null }
+    }
+    try { $q = [MlvSetup.PathIdentity]::Query([IO.Path]::GetFullPath($Path)) } catch { return $null }
+    if (-not $q) { return $null }
+    $final = "$($q[0])"
+    if ($final.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) { $final = '\\' + $final.Substring(8) }
+    elseif ($final.StartsWith('\\?\', [StringComparison]::Ordinal)) { $final = $final.Substring(4) }
+    return @{ Final = $final; Id = "$($q[1])" }
+}
+
 # r3 A3 (class: a location judged by its spelling, not by where it physically is): true when -Path, or any ancestor of it, has a '.ssh' segment, or is a link (directory junction or symbolic
 # link) whose resolved target does (checked again on the target, up to 8 hops). A link that cannot be resolved counts as under .ssh (fail closed).
+# r4 B1: and when the file system's own canonical path of the nearest existing ancestor has one (a SUBST drive or a DOS device mapping keeps its drive spelling in every .NET path and
+# has no LinkTarget); a path whose canonical form cannot be read counts as under .ssh.
 function Test-PathUnderSshDirectory {
     param([string]$Path, [int]$Depth = 0)
     if ($Depth -gt 8) { return $true }
     $full = [IO.Path]::GetFullPath($Path)
     if (@($full -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { return $true }
+    $anchor = $full
+    while ($anchor -and -not (Test-Path -LiteralPath $anchor)) {
+        $up = Split-Path -Parent $anchor
+        if (-not $up -or $up -ceq $anchor) { $anchor = ''; break }
+        $anchor = $up
+    }
+    if (-not $anchor) { return $true }
+    $canon = Get-PathIdentity -Path $anchor
+    if (-not $canon -or -not $canon.Final) { return $true }
+    if (@("$($canon.Final)" -split '[\\/]+' | Where-Object { $_ -ieq '.ssh' }).Count -gt 0) { return $true }
     $d = $full
     while ($d) {
         $item = Get-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
@@ -1222,17 +1285,30 @@ function Invoke-GitHubSshProbe {
         $proc = $null; $verdict = $null
         try { $proc = [System.Diagnostics.Process]::Start($psi) } catch { $verdict = @{ Authenticated = $false; Detail = "ssh could not be started ($($_.Exception.Message))" } }
         if (-not $verdict) {
+            # r4 H1 (class: a child process whose termination is assumed): once ssh has started, EVERY way out of this block ends with the child terminated and the outcome known. A throw
+            # after the start (the stdin close, a read task) is a failed verdict, never an escape with the child still running; a kill that throws is retried and then checked.
+            $pid_ = $proc.Id
             try {
+                if ($script:SshProbeAfterStartHook) { & $script:SshProbeAfterStartHook $proc }   # test seam: a failure right after the process started
                 $proc.StandardInput.Close()
                 $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
                 if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-                    try { $proc.Kill($true) } catch { }
                     $verdict = @{ Authenticated = $false; Detail = "ssh did not answer within $TimeoutSec s" }
                 } else {
                     $proc.WaitForExit()
                     $verdict = Get-GitHubSshProbeVerdict -ExitCode $proc.ExitCode -Output ("$($outTask.Result)`n$($errTask.Result)")
                 }
-            } finally { $proc.Dispose() }
+            } catch {
+                $verdict = @{ Authenticated = $false; Detail = "the ssh probe failed after ssh started ($($_.Exception.Message))" }
+            } finally {
+                $stopped = $false
+                for ($k = 0; $k -lt 3 -and -not $stopped; $k++) {
+                    try { if (-not $proc.HasExited) { $proc.Kill($true); [void]$proc.WaitForExit(5000) } } catch { }
+                    try { $stopped = $proc.HasExited } catch { $stopped = $false }
+                }
+                if (-not $stopped) { $verdict = @{ Authenticated = $false; Detail = "ssh (pid $pid_) could not be terminated after the probe; the probe result is not used" } }
+                $proc.Dispose()
+            }
         }
     } finally {
         # adversary pass 4 A4: this is the probe's own temp file, so it is removed whatever the caller's -WhatIf / -Confirm preference is (Verify runs the probe under -WhatIf too).
@@ -1298,14 +1374,16 @@ function Get-SshPushUrlDecision {
     # adversary pass 2 A3: a push url that Git merges in from the global or system config is not in the repository config, so a lane with another HOME would not push over ssh: it is
     # neither counted as the ssh form nor replaced (a second pushurl in the repository would also make Git push to both)
     if (($LocalPushUrls -join "`n") -cne ($PushUrls -join "`n")) { return @{ Decision = 'FOREIGN'; PushUrl = $ssh; Reason = 'remote.fork.pushurl is also set outside the repository config (global or system), which a lane with another HOME would not see' } }
-    $effective = @($(if ($PushUrls.Count) { $PushUrls } else { $Urls }))   # @():a one-element array out of $( ) is a scalar string, whose [0] is its first character
-    if ($effective.Count -eq 1 -and "$($effective[0])" -ceq $ssh) { return @{ Decision = 'NOOP'; PushUrl = $ssh; Reason = 'pushes already go to the SSH form' } }
+    # r4 B3 (class: an implicit default accepted where the contract names an explicit value): NOOP is exactly ONE repository-config push url equal to the SSH form. A fork FETCH url that is
+    # already the SSH form with no push url set is not a NOOP: it is READY below (Setup writes the explicit push url, Verify reports SSH_PUSHURL_MISSING).
+    if ($PushUrls.Count -eq 1 -and "$($PushUrls[0])" -ceq $ssh) { return @{ Decision = 'NOOP'; PushUrl = $ssh; Reason = 'pushes already go to the SSH form' } }
     if ($PushUrls.Count -eq 0 -or ($PushUrls.Count -eq 1 -and "$($PushUrls[0])" -ceq $fetch)) { return @{ Decision = 'READY'; PushUrl = $ssh; Reason = 'ssh authenticates' } }
     return @{ Decision = 'FOREIGN'; PushUrl = $ssh; Reason = "remote.fork.pushurl is $((@($PushUrls | ForEach-Object { Format-RemoteUrlForLog $_ })) -join ', '), neither the fetch url nor $ssh" }
 }
 
 # Test seam: a scriptblock that returns @{ Authenticated; Detail } instead of running ssh (the tests never touch the network).
 $script:SshProbeOverride = $null
+$script:SshProbeAfterStartHook = $null   # test seam: runs inside the probe right after ssh started (may throw)
 $script:SshPushUrlWriteHook = $null   # test seam: runs right before the pushurl write
 $script:SshPushUrlAfterWriteHook = $null   # test seam: runs right after the write, before the post-write snapshot
 $script:SshPushUrlTakeBackHook = $null   # test seam: runs right before the take-back of our value
@@ -1319,7 +1397,13 @@ function Test-GitConfigOriginIsFile {
     param([string]$Origin, [string]$RepoDir, [string]$File)
     if (-not "$Origin".StartsWith('file:', [StringComparison]::Ordinal)) { return $false }
     try { $p = "$Origin".Substring(5); $full = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $RepoDir $p })) } catch { return $false }
-    return [string]::Equals($full, $File, [StringComparison]::OrdinalIgnoreCase)
+    # r4 B2 (class: file identity judged by a case-folded spelling): an exact spelling match is the file; any other spelling (another case, a short name, a link) is the same file only when
+    # the file system says so (volume serial + file index), since a case-sensitive directory holds 'Repo' and 'repo' as two files. No identity for either side -> not the file (fail closed).
+    if ([string]::Equals($full, $File, [StringComparison]::Ordinal)) { return $true }
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf) -or -not (Test-Path -LiteralPath $File -PathType Leaf)) { return $false }
+    $a = Get-PathIdentity -Path $full; $b = Get-PathIdentity -Path $File
+    if (-not $a -or -not $b -or -not $a.Id -or -not $b.Id) { return $false }
+    return ("$($a.Id)" -ceq "$($b.Id)")
 }
 
 # Everything the push url decision depends on, read once: the fork urls and push urls (every scope, and the repository's own file), the url rewrite rules and the remote names.

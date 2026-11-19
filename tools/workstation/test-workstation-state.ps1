@@ -3418,8 +3418,11 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     Assert-That ($d.Decision -ceq 'READY') 'SSH-PUSHURL-1 decide: a pushurl equal to the https url is replaced (READY)' $d.Decision
     $d = Get-SpDecision @($spU) @($spS) $spAuth
     Assert-That ($d.Decision -ceq 'NOOP') 'SSH-PUSHURL-1 decide: an existing equal pushurl is a no-op' $d.Decision
+    # r4 B3: a fetch url that is already the ssh form is NOT a no-op without an explicit pushurl (the contract is exactly one repository-config pushurl)
     $d = Get-SpDecision @($spS) @() $spAuth
-    Assert-That ($d.Decision -ceq 'NOOP') 'SSH-PUSHURL-1 decide: a fetch url that is already the ssh form pushes over ssh (no-op)' $d.Decision
+    Assert-That ($d.Decision -ceq 'READY' -and $d.PushUrl -ceq $spS) 'SSH-PUSHURL-1 r4 B3 decide: an ssh fetch url with no pushurl is READY (the explicit pushurl is written), never NOOP' "$($d.Decision) $($d.PushUrl)"
+    $d = Get-SpDecision @($spS) @($spS) $spAuth
+    Assert-That ($d.Decision -ceq 'NOOP') 'SSH-PUSHURL-1 r4 B3 decide: an ssh fetch url with exactly one equal ssh pushurl is a no-op' $d.Decision
     foreach ($spF in @(@('https://github.com/SuperDimensionalSpaceFortress/MLV-App'), @('git@github.com:superdimensionalspacefortress/mlv-app.git'), @($spS, $spU), @('ssh://git@github.com/SuperDimensionalSpaceFortress/MLV-App.git'), @('https://github.com/ilia3101/MLV-App.git'))) {
         $d = Get-SpDecision @($spU) $spF $spAuth
         Assert-That ($d.Decision -ceq 'FOREIGN') "SSH-PUSHURL-1 decide: a pushurl that is neither the https url nor the ssh form ($($spF -join ' + ')) is FOREIGN, never overwritten" $d.Decision
@@ -3816,6 +3819,73 @@ if ($fnLoaded -and (Test-Has 'Get-SshPushUrlDecision' 'SSH-PUSHURL-1') -and (Tes
     Assert-That ($r.Failures.Count -eq 0 -and @(Get-SpCfg $spNfRepo 'remote.fork.pushurl').Count -eq 0) 'SSH-PUSHURL-1 pass3 A6 setup: the Clone-phase call on a clone without a fork remote still only skips (the Clone phase reports the missing remote itself)' ($r.Failures -join ',')
     $r = Invoke-SpRun (Join-Path $spNoFork 'absent-clone') $spAuth -VerifyOnly
     Assert-That ($r.Failures.Count -eq 0 -and $r.Log -match 'no clone at') 'SSH-PUSHURL-1 pass3 A6 verify: no clone yet stays a skip' "$($r.Log)"
+
+    # --- r4 (sol review of aedf73a1): B1 SUBST temp drive, B2 case-variant origin, B3 ssh fetch url without a pushurl, H1 child termination
+    # B3 end to end: the fork FETCH url is already the ssh form and no pushurl is set. Setup writes the explicit pushurl; Verify reports SSH_PUSHURL_MISSING and writes nothing.
+    $spRp = New-SpRepo 'r4b3-ssh-fetch'; & git -C $spRp remote set-url fork $spS
+    $r = Invoke-SpRun $spRp $spAuth -VerifyOnly
+    Assert-That ($r.Failures -contains 'SSH_PUSHURL_MISSING remote=fork' -and $r.Log -notmatch 'SSH_PUSH_READY' -and @(Get-SpCfg $spRp 'remote.fork.pushurl').Count -eq 0) 'SSH-PUSHURL-1 r4 B3 verify: an ssh fetch url with no explicit pushurl is the typed failure SSH_PUSHURL_MISSING (not SSH_PUSH_READY), and Verify writes nothing' "fail=$($r.Failures -join ',')`n$($r.Log)"
+    $r = Invoke-SpRun $spRp $spAuth
+    $spVals = @(Get-SpCfg $spRp 'remote.fork.pushurl')
+    Assert-That ($spVals.Count -eq 1 -and $spVals[0] -ceq $spS -and $r.Failures.Count -eq 0 -and $r.Log -match [regex]::Escape("SSH_PUSH_READY remote=fork pushurl=$spS")) 'SSH-PUSHURL-1 r4 B3 setup: an ssh fetch url with no pushurl gets the explicit ssh pushurl written (exactly one value)' "vals=$($spVals -join ' | ') fail=$($r.Failures -join ',')`n$($r.Log)"
+    $r = Invoke-SpRun $spRp $spAuth -VerifyOnly
+    Assert-That ($r.Failures.Count -eq 0 -and $r.Log -match [regex]::Escape("SSH_PUSH_READY remote=fork pushurl=$spS")) 'SSH-PUSHURL-1 r4 B3 verify: once the explicit pushurl is there Verify passes' "fail=$($r.Failures -join ',')`n$($r.Log)"
+
+    # B1: a SUBST drive onto a .ssh folder. The .NET path keeps the drive spelling ('R:\Temp'), has no .ssh segment and no LinkTarget, yet the probe config would be written under .ssh.
+    $spB1 = New-Scratch 'sp-r4b1'
+    $spB1Ssh = Join-Path $spB1 'u\.ssh'; [void][IO.Directory]::CreateDirectory((Join-Path $spB1Ssh 'Temp'))
+    $spB1Ok = Join-Path $spB1 'u\plain'; [void][IO.Directory]::CreateDirectory((Join-Path $spB1Ok 'Temp'))
+    $spB1Local = New-Scratch 'sp-r4b1-localappdata'; [void][IO.Directory]::CreateDirectory((Join-Path $spB1Local 'Temp'))
+    $spB1Used = @([IO.DriveInfo]::GetDrives() | ForEach-Object { "$($_.Name)".Substring(0, 1).ToUpperInvariant() })
+    $spB1Letters = @('Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q', 'P') | Where-Object { $spB1Used -notcontains $_ } | Select-Object -First 2
+    if ($spB1Letters.Count -lt 2) { Assert-That $false 'SSH-PUSHURL-1 r4 B1: two free drive letters for the SUBST fixtures' ($spB1Used -join ',') }
+    else {
+        $spL1 = $spB1Letters[0]; $spL2 = $spB1Letters[1]
+        & subst.exe "${spL1}:" $spB1Ssh; $spS1 = $LASTEXITCODE
+        & subst.exe "${spL2}:" $spB1Ok; $spS2x = $LASTEXITCODE
+        $sv = @{ T = $env:TEMP; M = $env:TMP; L = $env:LOCALAPPDATA }
+        try {
+            Assert-That ($spS1 -eq 0 -and $spS2x -eq 0 -and (Test-Path -LiteralPath "${spL1}:\Temp")) 'SSH-PUSHURL-1 r4 B1 fixture: both SUBST drives were created' "subst exits $spS1 $spS2x"
+            Assert-That ((Test-PathUnderSshDirectory "${spL1}:\Temp") -eq $true) 'SSH-PUSHURL-1 r4 B1 guard: a SUBST drive that maps onto a .ssh folder is under .ssh' "${spL1}:\Temp"
+            Assert-That ((Test-PathUnderSshDirectory "${spL1}:\") -eq $true) 'SSH-PUSHURL-1 r4 B1 guard: the SUBST drive root itself is under .ssh' "${spL1}:\"
+            Assert-That ((Test-PathUnderSshDirectory "${spL2}:\Temp") -eq $false) 'SSH-PUSHURL-1 r4 B1 guard: a SUBST drive onto an ordinary folder is not under .ssh (no false positive)' "${spL2}:\Temp"
+            Assert-That ((Test-PathUnderSshDirectory (Join-Path $spB1Ok 'Temp')) -eq $false -and (Test-PathUnderSshDirectory (Join-Path $spB1Ok 'not-created-yet\x')) -eq $false) 'SSH-PUSHURL-1 r4 B1 guard: an ordinary existing folder and a not-yet-existing child of it are not under .ssh'
+            Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+            $env:TEMP = "${spL1}:\Temp"; $env:TMP = "${spL1}:\Temp"; $env:LOCALAPPDATA = $spB1Local
+            $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+            $argText = $(if (Test-Path -LiteralPath $spArgs) { [IO.File]::ReadAllText($spArgs) } else { '' })
+            Assert-That (@(Get-ChildItem -LiteralPath (Join-Path $spB1Ssh 'Temp') -Force).Count -eq 0 -and $argText -match [regex]::Escape((Join-Path $spB1Local 'Temp')) -and $argText -notmatch [regex]::Escape("${spL1}:") -and $pr.Authenticated -eq $true) 'SSH-PUSHURL-1 r4 B1 probe: TEMP on a SUBST drive onto .ssh -> the config goes to %LOCALAPPDATA%\Temp and nothing is written under the real .ssh folder' "$argText"
+            Remove-Item -LiteralPath $spArgs -Force -ErrorAction SilentlyContinue
+            $env:LOCALAPPDATA = "${spL1}:\"
+            $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-ok.cmd') -TimeoutSec 20 -KeyFile $spKey
+            Assert-That ($pr.Authenticated -eq $false -and $pr.Detail -match 'no temp folder' -and -not (Test-Path -LiteralPath $spArgs) -and @(Get-ChildItem -LiteralPath (Join-Path $spB1Ssh 'Temp') -Force).Count -eq 0) 'SSH-PUSHURL-1 r4 B1 probe: both temp candidates behind a SUBST onto .ssh -> fail closed, ssh not run, nothing written' "$($pr.Detail)"
+        } finally {
+            $env:TEMP = $sv.T; $env:TMP = $sv.M; $env:LOCALAPPDATA = $sv.L
+            & subst.exe "${spL1}:" /d | Out-Null; & subst.exe "${spL2}:" /d | Out-Null
+        }
+    }
+
+    # B2: two spellings that differ only by case are the same file only when the file system says so (a case-sensitive directory holds both as two files)
+    $spB2 = New-Scratch 'sp-r4b2'; [void][IO.Directory]::CreateDirectory((Join-Path $spB2 'repo\.git')); $spB2File = Join-Path $spB2 'repo\.git\config'; [IO.File]::WriteAllText($spB2File, '')
+    $spB2Var = (Join-Path $spB2 'REPO\.GIT\CONFIG')
+    Assert-That ((Test-GitConfigOriginIsFile -Origin "file:$($spB2File -replace '\\', '/')" -RepoDir $spB2 -File $spB2File) -eq $true) 'SSH-PUSHURL-1 r4 B2 origin: the exact spelling is the file'
+    Assert-That ((Test-GitConfigOriginIsFile -Origin "file:$spB2Var" -RepoDir $spB2 -File $spB2File) -eq $true) 'SSH-PUSHURL-1 r4 B2 origin: a case-variant spelling of the SAME file (one identity on a case-insensitive directory) is still the file'
+    $script:PathIdentityOverride = { param($p) @{ Final = "$p"; Id = $(if ("$p" -ceq $script:spB2Exact) { '0001:1' } else { '0001:2' }) } }
+    $script:spB2Exact = $spB2File
+    try { $spB2Distinct = Test-GitConfigOriginIsFile -Origin "file:$spB2Var" -RepoDir $spB2 -File $spB2File } finally { $script:PathIdentityOverride = $null }
+    Assert-That ($spB2Distinct -eq $false) 'SSH-PUSHURL-1 r4 B2 origin: a case-variant spelling that the file system reports as a DIFFERENT file (case-sensitive directory) is not the repository config' "got $spB2Distinct"
+    $script:PathIdentityOverride = { param($p) $null }
+    try { $spB2NoId = Test-GitConfigOriginIsFile -Origin "file:$spB2Var" -RepoDir $spB2 -File $spB2File } finally { $script:PathIdentityOverride = $null }
+    Assert-That ($spB2NoId -eq $false) 'SSH-PUSHURL-1 r4 B2 origin: a case-variant spelling whose identity cannot be read fails closed (not the repository config)' "got $spB2NoId"
+    Assert-That ((Test-GitConfigOriginIsFile -Origin "file:$(Join-Path $spB2 'repo\.git\CONFIG-absent')" -RepoDir $spB2 -File $spB2File) -eq $false) 'SSH-PUSHURL-1 r4 B2 origin: a different, absent file is not the repository config'
+
+    # H1: a failure right after ssh started must not leave the child running, and must not escape as a throw
+    $script:spH1Pid = 0
+    $script:SshProbeAfterStartHook = { param($p) $script:spH1Pid = $p.Id; throw 'injected failure after ssh started' }
+    $spH1Thrown = ''
+    try { $pr = Invoke-GitHubSshProbe -SshExe (Join-Path $spDir 'ssh-hang.cmd') -TimeoutSec 20 -KeyFile $spKey } catch { $spH1Thrown = $_.Exception.Message } finally { $script:SshProbeAfterStartHook = $null }
+    $spH1Alive = $false; if ($script:spH1Pid -gt 0) { try { $spP = [Diagnostics.Process]::GetProcessById($script:spH1Pid); $spH1Alive = -not $spP.HasExited; if ($spH1Alive) { $spP.Kill($true) } } catch { } }
+    Assert-That ($spH1Thrown -eq '' -and $pr.Authenticated -eq $false -and $pr.Detail -match 'failed after ssh started' -and $script:spH1Pid -gt 0 -and -not $spH1Alive) 'SSH-PUSHURL-1 r4 H1 probe: a failure after ssh started is a failed verdict (no throw) and the ssh child is terminated' "thrown=$spH1Thrown detail=$($pr.Detail) pid=$($script:spH1Pid) alive=$spH1Alive"
 }
 
 $gb = Invoke-Setup (New-Scratch 'home-bogus') @('-Phase', 'Bogus', '-StateRoot', (New-Scratch 'state-bogus'), '-Workspace', (New-Scratch 'ws-bogus'))
