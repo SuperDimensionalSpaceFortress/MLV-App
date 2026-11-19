@@ -3204,6 +3204,17 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         self.assertTrue(problems, "the scan did not go red on a resize stop")
         self.assertTrue(any("unreviewed Play stop in MainWindow::resizeEvent" in p for p in problems), problems)
 
+    def test_player_toolbar_transport_buttons_1_the_stop_button_is_one_reviewed_user_input_stop(self) -> None:
+        # PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1: the Stop button pauses (the closeEvent user-pause form), then seeks to cut in.
+        from tools.repo_hygiene.app_play_scan import REVIEWED_PLAY_STOPS
+        self.assertEqual(REVIEWED_PLAY_STOPS["MainWindow::on_actionStop_triggered"], (1, 1, 0))
+
+    def test_player_toolbar_transport_buttons_1_a_second_stop_in_the_stop_slot_fails_by_name(self) -> None:
+        anchor = ("void MainWindow::on_actionStop_triggered()\n{\n    if( ui->actionPlay->isChecked() )\n    {\n"
+                  "        ui->actionPlay->setChecked( false );")
+        problems = scan_app_play_sources(self._mutated(anchor, anchor + "\n        ui->actionPlay->setChecked( false );"))
+        self.assertTrue(any("MainWindow::on_actionStop_triggered" in p and "(2, 1, 0)" in p for p in problems), problems)
+
     def test_enforce3_the_reviewed_stop_table_covers_every_stop_in_the_real_sources(self) -> None:
         from tools.repo_hygiene.app_play_scan import REVIEWED_PLAY_STOPS
         for function in ("MainWindow::MainWindow", "MainWindow::runGuiPlaybackSmoke",

@@ -272,6 +272,7 @@
     <addaction name="actionSeekBackwardOneSecond"/>
     <addaction name="actionPreviousFrame"/>
     <addaction name="actionPlay"/>
+    <addaction name="actionStop"/>
     <addaction name="actionNextFrame"/>
     <addaction name="actionSeekForwardOneSecond"/>
     <addaction name="actionGoto_Last_Frame"/>
@@ -392,8 +393,16 @@
    <addaction name="actionGoto_First_Frame"/>
    <addaction name="actionPreviousFrame"/>
    <addaction name="actionPlay"/>
+   <addaction name="actionStop"/>
    <addaction name="actionNextFrame"/>
+   <addaction name="actionGoto_Last_Frame"/>
    <addaction name="actionLoop"/>
+   <addaction name="separator"/>
+   <addaction name="actionAudioOutput"/>
+   <addaction name="separator"/>
+   <addaction name="actionZoomFit"/>
+   <addaction name="actionZoom100"/>
+   <addaction name="actionFullscreen"/>
   </widget>
   <widget class="QStatusBar" name="statusBar"/>
   <widget class="QDockWidget" name="dockWidgetEdit">
@@ -10996,6 +11005,14 @@ QGroupBox::indicator:checked:disabled {
    </property>
    <property name="toolTip">
     <string>Jump to last frame...</string>
+   </property>
+  </action>
+  <action name="actionStop">
+   <property name="text">
+    <string>Stop</string>
+   </property>
+   <property name="toolTip">
+    <string>Stop and return to cut in</string>
    </property>
   </action>
   <action name="actionFcpxmlSelectionAssistant">
