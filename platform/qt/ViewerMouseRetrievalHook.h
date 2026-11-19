@@ -16,6 +16,12 @@
  * HWND), so one hook covers both display paths. The hook only records into a RetrievalWitness
  * (ViewerIdlePolicy.h); the idle tick reads it.
  *
+ * r6 (key B1): Windows coalesces queued moves, so an away-and-back before the thread takes its queue
+ * arrives as one WM_MOUSEMOVE at the starting pixel, and by position it is the same as a synthesized move.
+ * While the cursor is hidden (the tick calls markHistory() when it hides), such a same-position move reads
+ * the system move history (GetMouseMovePointsEx) and counts as movement iff the pointer was at another
+ * position after the mark (MoveHistoryMark). The read happens only for a same-position move while marked.
+ *
  * GetLastInputInfo was rejected because a key press counts as input there, and a key press must not
  * bring the cursor back.
  */
@@ -80,6 +86,58 @@ inline HHOOK &hookHandle()
     return h;
 }
 
+/*! \brief Reads the system move history from the newest point at `at`, newest first, into out (at most max).
+ *         Returns the point count, 0 for none, -1 when the point is not in the history or the read failed.
+ *         Coordinates as GetMouseMovePointsEx documents them: the query point is masked to 16 bits and a
+ *         returned coordinate above 32767 is a negative one (a monitor left of or above the primary one). */
+inline int readSystemHistory( const QPoint &at, HistoryPoint *out, int max )
+{
+    if( !out || max <= 0 ) return 0;
+    if( max > MoveHistoryMark::kMaxPoints ) max = MoveHistoryMark::kMaxPoints;
+    MOUSEMOVEPOINT query = {};
+    query.x = at.x() & 0x0000FFFF;
+    query.y = at.y() & 0x0000FFFF;
+    MOUSEMOVEPOINT points[MoveHistoryMark::kMaxPoints];
+    const int n = GetMouseMovePointsEx( sizeof( MOUSEMOVEPOINT ), &query, points, max, GMMP_USE_DISPLAY_POINTS );
+    if( n <= 0 ) return n < 0 ? -1 : 0;
+    for( int i = 0; i < n; ++i )
+    {
+        out[i].x = points[i].x > 32767 ? points[i].x - 65536 : points[i].x;
+        out[i].y = points[i].y > 32767 ? points[i].y - 65536 : points[i].y;
+        out[i].time = quint32( points[i].time );
+    }
+    return n;
+}
+
+/*! \brief The history source (readSystemHistory; a test supplies a scripted one). */
+using HistoryReader = int (*)( const QPoint &at, HistoryPoint *out, int max );
+inline HistoryReader &historyReader()
+{
+    static HistoryReader r = readSystemHistory;
+    return r;
+}
+
+/*! \brief The history as it was when the cursor hid. GUI thread only, like the witness. */
+inline MoveHistoryMark &historyMark()
+{
+    static MoveHistoryMark m;
+    return m;
+}
+
+/*! \brief Called by the idle tick when it hides the cursor: marks the history at the cursor position. If the
+ *         position or the history cannot be read, the mark is cleared (the r5 position rule stands). */
+inline void markHistory()
+{
+    POINT pt;
+    HistoryPoint points[MoveHistoryMark::kMaxPoints];
+    if( !GetCursorPos( &pt ) )
+    {
+        historyMark().unmark();
+        return;
+    }
+    historyMark().mark( points, historyReader()( QPoint( pt.x, pt.y ), points, MoveHistoryMark::kMaxPoints ) );
+}
+
 /*! \brief The WH_MOUSE procedure. Records, never consumes: the message always goes on to the next hook. */
 inline LRESULT CALLBACK proc( int code, WPARAM wParam, LPARAM lParam )
 {
@@ -89,7 +147,17 @@ inline LRESULT CALLBACK proc( int code, WPARAM wParam, LPARAM lParam )
         if( kindOfMessage( UINT( wParam ), &kind ) )
         {
             const MOUSEHOOKSTRUCT *mouse = reinterpret_cast<const MOUSEHOOKSTRUCT *>( lParam );
-            witness().note( kind, QPoint( mouse->pt.x, mouse->pt.y ), code == HC_ACTION );
+            const QPoint pos( mouse->pt.x, mouse->pt.y );
+            // r6 (key B1): a move at the last position may be a coalesced away-and-back; the history decides.
+            if( kind == RetrievedKind::Move && historyMark().marked() && witness().samePosition( pos ) )
+            {
+                HistoryPoint points[MoveHistoryMark::kMaxPoints];
+                const int n = historyReader()( pos, points, MoveHistoryMark::kMaxPoints );
+                if( historyMark().leftSinceMark( points, n, pos.x(), pos.y() ) ) witness().noteExcursion();
+            }
+            witness().note( kind, pos, code == HC_ACTION );
+            // Movement is pending, so the cursor shows at the next tick and the next hide marks afresh.
+            if( witness().pending() ) historyMark().unmark();
         }
     }
     return CallNextHookEx( hookHandle(), code, wParam, lParam );
@@ -101,6 +169,7 @@ inline bool install()
     POINT pt;
     if( GetCursorPos( &pt ) ) witness().seed( QPoint( pt.x, pt.y ) );
     else witness().reset();
+    historyMark().unmark();
     if( !hookHandle() ) hookHandle() = SetWindowsHookExW( WH_MOUSE, proc, nullptr, GetCurrentThreadId() );
     return hookHandle() != nullptr;
 }
@@ -114,6 +183,7 @@ inline void remove()
         hookHandle() = nullptr;
     }
     witness().reset();
+    historyMark().unmark();
 }
 
 inline bool installed() { return hookHandle() != nullptr; }

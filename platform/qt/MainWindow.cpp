@@ -3753,18 +3753,23 @@ void MainWindow::viewerIdleTimeout( void )
 #ifdef Q_OS_WIN
     // A move away and back between two ticks leaves the sampled position unchanged. Qt's excluded wait takes
     // the WM_MOUSEMOVE off this (GUI) thread's queue into its own deferred queue, so the queue status alone
-    // misses it: the thread mouse hook saw it when it was taken (both viewer surfaces are this thread's).
+    // misses it: the thread mouse hook saw it when it was taken (both viewer surfaces are this thread's). If
+    // Windows coalesced the excursion into one move back at the starting pixel, the hook tells it from a
+    // synthesized move by the system move history marked at the hide (r6 key B1, MoveHistoryMark).
     // Read the hook first, then whatever input is still queued, untaken (moves and buttons alike).
     if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
     if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
 #endif
     // r3 (adversary r1 pass 4 A1): off Windows the sample above is the only witness, so every rearm is capped at
     // one poll period. Bound (pass 5 A1): an away-and-back that lies entirely between two samples (a late tick
-    // widens the gap) is seen only when the wait delivers its events; on Windows the hook sees it at once.
+    // widens the gap) is seen only when the wait delivers its events; on Windows the hook sees it when it is taken.
     switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms, viewer_idle::kPointerPollMs() ) )
     {
     case viewer_idle::Tick::Hide:
         m_viewerCursorHider.hide( viewerIdleSurfaces() );
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::markHistory();   // r6 key B1: where the pointer had been when the cursor hid
+#endif
         m_viewerIdleTimer->start( ms );   // keep watching the pointer while hidden
         break;
     case viewer_idle::Tick::Show:

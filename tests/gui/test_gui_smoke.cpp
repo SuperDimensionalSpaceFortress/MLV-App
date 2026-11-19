@@ -700,6 +700,8 @@ private slots:
     void viewerCursorAutohide_pointerMovedWhileInputExcludedRestores();
 #ifdef Q_OS_WIN
     void viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces();
+    void viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces();
+    void viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow();
 #endif
     void viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces();
     void viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack();
@@ -2379,6 +2381,8 @@ public:
     bool positionSampleOnly = false;
     // r3: MainWindow passes viewer_idle::kPointerPollMs(); 0 keeps the uncapped tick (the pass-4 control).
     int pollMs = 0;
+    // r6 (key B1): MainWindow marks the system move history when it hides; false is the r5 tick (RED control).
+    bool markHistoryOnHide = true;
 
 protected:
     bool eventFilter( QObject *watched, QEvent *event ) override
@@ -2441,7 +2445,13 @@ private:
 #endif
         switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms, pollMs ) )
         {
-        case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); m_timer.start( ms ); break;
+        case viewer_idle::Tick::Hide:
+            m_hider.hide( m_surfaces );
+#ifdef Q_OS_WIN
+            if( markHistoryOnHide ) viewer_idle::win_hook::markHistory();   // as MainWindow (r6 key B1)
+#endif
+            m_timer.start( ms );
+            break;
         case viewer_idle::Tick::Show: m_hider.restore( m_surfaces ); m_timer.start( ms ); break;
         case viewer_idle::Tick::Rearm: m_timer.start( ms ); break;
         case viewer_idle::Tick::None: break;
@@ -2699,7 +2709,8 @@ void GuiSmokeTest::viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSur
     QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
     QVERIFY( !harness.hidden() );
 
-    // A synthesized move to the last position (Qt discards those too) does not bring it back again.
+    // A synthesized move to the last position (Qt discards those too) does not bring it back again: the system
+    // move history shows no point elsewhere since the hide (r6), so it stays a same-position move.
     QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
     viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
     QTest::qWait( 200 );
@@ -2709,6 +2720,160 @@ void GuiSmokeTest::viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSur
     harness.inputExcluded = false;
     harness.leaveFullscreen();
     QVERIFY( !viewer_idle::win_hook::installed() );
+}
+
+namespace
+{
+// r6 (key B1): a scripted system move history, newest first, so a test controls what GetMouseMovePointsEx says.
+viewer_idle::HistoryPoint g_viewerIdleScript[viewer_idle::MoveHistoryMark::kMaxPoints];
+int g_viewerIdleScriptCount = 0;
+int viewerIdleScriptedHistory( const QPoint &, viewer_idle::HistoryPoint *out, int max )
+{
+    if( g_viewerIdleScriptCount <= 0 ) return -1;
+    const int n = qMin( max, g_viewerIdleScriptCount );
+    for( int i = 0; i < n; ++i ) out[i] = g_viewerIdleScript[i];
+    return n;
+}
+void viewerIdleSetScript( std::initializer_list<viewer_idle::HistoryPoint> points )
+{
+    g_viewerIdleScriptCount = 0;
+    for( const viewer_idle::HistoryPoint &p : points ) g_viewerIdleScript[g_viewerIdleScriptCount++] = p;
+}
+viewer_idle::HistoryPoint viewerIdlePoint( int x, int y, quint32 time )
+{
+    viewer_idle::HistoryPoint p;
+    p.x = x;
+    p.y = y;
+    p.time = time;
+    return p;
+}
+} // namespace
+
+// G10 (r6, key B1, the sol catalogue row): hidden fullscreen; the pointer goes away and back before the GUI thread
+// takes its queue, and Windows coalesces that into ONE WM_MOUSEMOVE at the starting pixel. It reaches the hook proc
+// and, as a same-position QMouseEvent, the event path. Expected: the cursor comes back on both viewer surfaces.
+// The witness is the system move history marked at the hide (scripted here: the test must not move the real
+// pointer). Control: the r5 tick, which marks nothing, keeps both hidden.
+void GuiSmokeTest::viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, saved]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = saved;
+    } );
+    const QPoint start( 500, 500 );
+    const QPoint away( 510, 500 );
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = start.x();
+    back.pt.y = start.y();
+
+    for( const bool markOnHide : { false, true } )
+    {
+        harness.markHistoryOnHide = markOnHide;
+        viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 990 ) } );
+        harness.enterFullscreen();
+        QVERIFY( harness.hookInstalled );
+        // The pointer rests at start: the event path and the hook both last saw it there.
+        QMouseEvent rest = viewerIdleMove( start );
+        QCoreApplication::sendEvent( &viewport, &rest );
+        QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+        QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+        viewer_idle::win_hook::witness().seed( start );
+
+        // Away and back, coalesced: the history has the excursion, the one message is at start.
+        viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1200 ), viewerIdlePoint( away.x(), away.y(), 1100 ),
+                               viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 990 ) } );
+        viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+        QMouseEvent same = viewerIdleMove( start );
+        QCoreApplication::sendEvent( &viewport, &same );
+
+        if( !markOnHide )
+        {
+            QTest::qWait( 300 );   // many poll periods of the r5 tick
+            QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+            QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+            QVERIFY( harness.hidden() );
+        }
+        else
+        {
+            QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::OpenHandCursor, 1000 );
+            QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+            QVERIFY( !harness.hidden() );
+        }
+        harness.leaveFullscreen();
+        QVERIFY( !viewer_idle::win_hook::installed() );
+    }
+}
+
+// G11 (r6, key B1): the app's own hide does not bring the cursor straight back. Hiding sets the cursor and can make
+// Windows synthesize a move at the unchanged position; the history then has no point elsewhere (at most one more at
+// the same pixel), so the cursor stays hidden. Scripted, and then with the real system history and the real hook.
+void GuiSmokeTest::viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, saved]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = saved;
+    } );
+    const QPoint start( 500, 500 );
+    MOUSEHOOKSTRUCT same = {};
+    same.pt.x = start.x();
+    same.pt.y = start.y();
+
+    viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 1000 ) } );
+    harness.enterFullscreen();
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    viewer_idle::win_hook::witness().seed( start );
+    QVERIFY( viewer_idle::win_hook::historyMark().marked() );
+    // The provoked move, with and without a new point at the same pixel.
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &same ) );
+    viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1016 ), viewerIdlePoint( start.x(), start.y(), 1000 ),
+                           viewerIdlePoint( 490, 500, 1000 ) } );
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &same ) );
+    QTest::qWait( 300 );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+    QVERIFY( viewer_idle::win_hook::historyMark().marked() );
+    harness.leaveFullscreen();
+
+    // The real history and hook: the hide's own cursor change does not re-show it.
+    viewer_idle::win_hook::historyReader() = saved;
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QTest::qWait( 300 );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+    harness.leaveFullscreen();
 }
 #endif
 

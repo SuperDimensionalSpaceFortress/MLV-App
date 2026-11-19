@@ -271,3 +271,57 @@ TEST(ViewerIdleWiring, SampledWitnessStatesItsSubLogicalPixelBound)
     ASSERT_FALSE(timeout.isEmpty());
     ASSERT_TRUE(timeout.contains(QStringLiteral("less than one logical pixel")));
 }
+
+// W8 (r6, key B1): Windows coalesces an away-and-back into one move at the starting pixel. The tick marks the
+// system move history right after it hides (inside the Windows guard, once, in the Hide case only); the hook reads
+// the history only for a same-position move while marked, notes an excursion, and unmarks on pending movement and
+// on remove(). No comment still says, without condition, that the hook sees a between-samples excursion at once.
+TEST(ViewerIdleWiring, HideMarksTheMoveHistoryAndTheHookReadsItForASamePositionMove)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString timeout = functionBodyToBrace(source,
+        QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
+    ASSERT_FALSE(timeout.isEmpty());
+    const QString mark = QStringLiteral("viewer_idle::win_hook::markHistory();");
+    ASSERT_EQ(1, int(timeout.count(mark)));
+    ASSERT_EQ(1, int(source.count(mark)));
+    const int hideCaseAt = timeout.indexOf(QStringLiteral("case viewer_idle::Tick::Hide:"));
+    const int hideAt = timeout.indexOf(QStringLiteral("m_viewerCursorHider.hide( viewerIdleSurfaces() );"), hideCaseAt);
+    const int markAt = timeout.indexOf(mark);
+    const int showCaseAt = timeout.indexOf(QStringLiteral("case viewer_idle::Tick::Show:"));
+    ASSERT_TRUE(hideCaseAt >= 0);
+    ASSERT_TRUE(hideAt > hideCaseAt);
+    ASSERT_TRUE(markAt > hideAt);
+    ASSERT_TRUE(markAt < showCaseAt);
+    const int guardAt = timeout.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), markAt);
+    ASSERT_TRUE(guardAt > hideAt);
+    ASSERT_TRUE(timeout.indexOf(QStringLiteral("#endif"), guardAt) > markAt);
+    ASSERT_FALSE(timeout.contains(QStringLiteral("the hook sees it at once")));
+
+    const QString hook = readRepoFile(QStringLiteral("platform/qt/ViewerMouseRetrievalHook.h"));
+    ASSERT_FALSE(hook.isEmpty());
+    const QString proc = functionBodyToBrace(hook,
+        QStringLiteral("inline LRESULT CALLBACK proc( int code, WPARAM wParam, LPARAM lParam )"));
+    ASSERT_FALSE(proc.isEmpty());
+    ASSERT_TRUE(proc.contains(QStringLiteral(
+        "if( kind == RetrievedKind::Move && historyMark().marked() && witness().samePosition( pos ) )")));
+    ASSERT_TRUE(proc.contains(QStringLiteral(
+        "if( historyMark().leftSinceMark( points, n, pos.x(), pos.y() ) ) witness().noteExcursion();")));
+    ASSERT_TRUE(proc.indexOf(QStringLiteral("witness().noteExcursion();"))
+                < proc.indexOf(QStringLiteral("witness().note( kind, pos, code == HC_ACTION );")));
+    ASSERT_TRUE(proc.contains(QStringLiteral("if( witness().pending() ) historyMark().unmark();")));
+    const QString removeBody = functionBodyToBrace(hook, QStringLiteral("inline void remove()"));
+    ASSERT_TRUE(removeBody.contains(QStringLiteral("historyMark().unmark();")));
+    ASSERT_TRUE(hook.contains(QStringLiteral("GetMouseMovePointsEx")));
+
+    const QString header = readRepoFile(QStringLiteral("platform/qt/ViewerIdlePolicy.h"));
+    ASSERT_FALSE(header.contains(QStringLiteral("on Windows the thread mouse hook sees it at once")));
+    ASSERT_FALSE(header.contains(QStringLiteral("and on Windows at once by the thread mouse hook")));
+    const int markClassAt = header.indexOf(QStringLiteral("class MoveHistoryMark"));
+    ASSERT_TRUE(markClassAt > 0);
+    const int markDocAt = header.lastIndexOf(QStringLiteral("/*!"), markClassAt);
+    const QString markDoc = header.mid(markDocAt, markClassAt - markDocAt);
+    ASSERT_TRUE(markDoc.contains(QStringLiteral("Grammar:")));
+    ASSERT_TRUE(markDoc.contains(QStringLiteral("Non-promises:")));
+    ASSERT_TRUE(markDoc.contains(QStringLiteral("coalesces")));
+}

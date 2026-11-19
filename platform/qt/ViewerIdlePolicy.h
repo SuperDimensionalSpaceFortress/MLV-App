@@ -20,7 +20,10 @@
  * idle period even inside such a wait. The caller passes kPointerPollMs() as the poll cap, so the tick
  * asks for a look every poll period, shown or hidden. Off Windows that is the whole witness: a move away
  * and back that lies entirely between two consecutive samples is seen only when the wait delivers its
- * events (see kPointerPollMs for the exact bound); on Windows the thread mouse hook sees it at once. The
+ * events (see kPointerPollMs for the exact bound). On Windows the thread mouse hook sees it when the GUI
+ * thread takes the move from its queue; if Windows has coalesced the excursion into one move back at the
+ * starting pixel, the hook reads the system move history to tell it from a synthesized one (r6, key B1,
+ * MoveHistoryMark, with its stated limits). The
  * sample is in logical pixels, so off Windows a persistent move of less than one logical pixel is not seen
  * by it either (see PointerWatch for that bound); any real mouse event still restores through the event path.
  */
@@ -46,9 +49,12 @@ inline constexpr int kIdleHideMs() { return 2000; }
  *         more away from the last sample (a smaller move is PointerWatch's r4 bound). A move away and back
  *         that lies entirely between two consecutive samples is NOT seen by the sample; the samples are at
  *         least this far apart and later when the GUI thread is busy (a Qt timer may fire late), so no poll
- *         period makes that a guarantee. Such an excursion is seen when the wait returns and Qt delivers
- *         its deferred mouse events (the event path), and on Windows at once by the thread mouse hook. The
- *         poll does not change when the cursor hides (the activity timestamp decides that). */
+ *         period makes that a guarantee. Off Windows such an excursion is seen when the wait returns and Qt
+ *         delivers its deferred mouse events, if the move it leaves differs from the last one (the event
+ *         path). On Windows the thread mouse hook sees it when the move is taken from the queue, and while
+ *         the cursor is hidden a move that Windows coalesced back to the starting pixel is checked against
+ *         the system move history (MoveHistoryMark, r6 key B1). The poll does not change when the cursor
+ *         hides (the activity timestamp decides that). */
 inline constexpr int kPointerPollMs() { return 50; }
 
 /*! \brief What the window looks like at the moment the hide timer fires. */
@@ -109,7 +115,8 @@ inline bool forcesRestore( QEvent::Type type )
  * less than one logical pixel can round to the same QPoint as the last look, so the sample does NOT see it, at
  * any tick. A displacement of one logical pixel or more on either axis always changes the rounded point and is
  * seen at the next sample. The smaller move is seen when the wait returns and Qt delivers its events (isActivity
- * compares unrounded QPointF positions), and on Windows at once by the thread mouse hook (physical pixels). */
+ * compares unrounded QPointF positions), and on Windows by the thread mouse hook when the move is taken from the
+ * queue (physical pixels). */
 class PointerWatch
 {
 public:
@@ -143,9 +150,12 @@ enum class RetrievedKind { Move, Button, Wheel };
  * status, and no Qt event is delivered until the wait returns. The retrieval is the one point Qt cannot
  * defer, so it is the witness that survives (PLAYER-CURSOR-AUTOHIDE-1 r2 A1).
  *
- * A move counts only when its position differs from the last retrieved move. That is how Qt itself reads
+ * By position, a move counts only when it differs from the last retrieved move. That is how Qt itself reads
  * a move: it discards a button-less WM_MOUSEMOVE at the position of the last one (Windows synthesizes
- * those when a window appears under the cursor), so this never counts input the event path would not.
+ * those when a window appears under the cursor). A move at the same position can still be real: Windows
+ * coalesces queued moves, so an away-and-back before the thread takes the queue leaves one WM_MOUSEMOVE at
+ * the starting pixel (r6, key B1). The hook tells it apart with MoveHistoryMark and then calls
+ * noteExcursion(); this class stays the position rule.
  * A button or wheel message counts when it is removed from the queue (a peek that leaves it there is seen
  * again when it is removed). The event path clears the witness when it notes activity itself, so input
  * that was delivered is not counted a second time at the next tick. Positions are the hook's own
@@ -181,6 +191,12 @@ public:
         if( removed ) m_pending = true;
     }
 
+    /*! \brief True iff a move at pos is at the position of the last retrieved move (not new by position). */
+    bool samePosition( const QPoint &pos ) const { return m_have && pos == m_last; }
+
+    /*! \brief Real movement seen another way (r6: the system move history showed an excursion): pending. */
+    void noteExcursion() { m_pending = true; }
+
     /*! \brief The event path saw the input itself: nothing is pending (the last position is kept). */
     void clear() { m_pending = false; }
 
@@ -198,6 +214,87 @@ private:
     QPoint m_last;
     bool m_have = false;
     bool m_pending = false;
+};
+
+/*! \brief One point of the system mouse-move history, newest first (on Windows GetMouseMovePointsEx in
+ *         display points, the hook's physical pixels). time is the system's input time stamp. */
+struct HistoryPoint
+{
+    int x = 0;
+    int y = 0;
+    quint32 time = 0;
+};
+
+inline bool operator==( const HistoryPoint &a, const HistoryPoint &b )
+{
+    return a.x == b.x && a.y == b.y && a.time == b.time;
+}
+
+/*! \brief PLAYER-CURSOR-AUTOHIDE-1 r6 (key B1): did the pointer really leave its pixel since the cursor hid?
+ *
+ * Windows coalesces queued mouse moves: a move away and back before the GUI thread takes its queue leaves ONE
+ * WM_MOUSEMOVE at the starting pixel. By position that message cannot be told from the synthesized moves
+ * Windows sends at an unchanged position (a window shown or hidden under the cursor, a cursor change).
+ * What tells them apart is the system's own record of where the pointer went: the system keeps the last 64
+ * pointer positions with their time stamps (GetMouseMovePointsEx). A synthesized move adds no point at
+ * another position; a real excursion does.
+ *
+ * Grammar: when the idle tick hides the cursor it marks the history (a copy of it, newest first). While
+ * marked, a move retrieved at the position of the last retrieved move reads the history again. The points
+ * newer than the mark are the ones in front of the first place where the marked copy lines up with the new
+ * list (newest first, every overlapping point equal, x, y and time). The move is real movement iff one of
+ * those newer points is at another position than the move. If the marked copy no longer lines up anywhere
+ * (more new points than the history holds), any point at another position counts.
+ *
+ * Non-promises: an unmarked history (no point at the cursor position, the read failed, or the cursor is not
+ * hidden) never counts, so the r5 position rule stands; and an excursion completed between the hide decision
+ * and the mark is part of the marked copy, so it is not seen until the next real move. */
+class MoveHistoryMark
+{
+public:
+    static constexpr int kMaxPoints = 64;
+
+    /*! \brief Copies the history (n points, newest first). n <= 0 (no history, read failed) unmarks. */
+    void mark( const HistoryPoint *newestFirst, int n )
+    {
+        if( !newestFirst || n <= 0 )
+        {
+            m_count = 0;
+            return;
+        }
+        if( n > kMaxPoints ) n = kMaxPoints;
+        for( int i = 0; i < n; ++i ) m_points[i] = newestFirst[i];
+        m_count = n;
+    }
+
+    void unmark() { m_count = 0; }
+
+    bool marked() const { return m_count > 0; }
+
+    /*! \brief True iff a point newer than the mark lies at another position than (x, y). False when unmarked. */
+    bool leftSinceMark( const HistoryPoint *newestFirst, int n, int x, int y ) const
+    {
+        if( !marked() || !newestFirst || n <= 0 ) return false;
+        if( n > kMaxPoints ) n = kMaxPoints;
+        int newer = -1;
+        for( int k = 0; k < n && newer < 0; ++k )
+        {
+            const int overlap = qMin( n - k, m_count );
+            bool lines = true;
+            for( int j = 0; j < overlap && lines; ++j ) lines = newestFirst[k + j] == m_points[j];
+            if( lines ) newer = k;
+        }
+        if( newer < 0 ) newer = n;   // the marked copy scrolled out: every point is newer
+        for( int i = 0; i < newer; ++i )
+        {
+            if( newestFirst[i].x != x || newestFirst[i].y != y ) return true;
+        }
+        return false;
+    }
+
+private:
+    HistoryPoint m_points[kMaxPoints];
+    int m_count = 0;
 };
 
 /*! \brief What the caller does when its single-shot idle timer fires. For Hide, Show and Rearm the caller

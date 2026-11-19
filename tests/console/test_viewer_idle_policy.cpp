@@ -249,7 +249,8 @@ TEST(ViewerIdlePolicy, IdleHideIsTwoSeconds)
 
 // P5 (r2, adversary r1 pass 3 A1): the retrieval witness sees a move away and back that leaves the sampled
 // position unchanged, ignores a synthesized move to the last position (Qt discards those too), counts a
-// removed button or wheel, and is cleared by take/clear/seed.
+// removed button or wheel, and is cleared by take/clear/seed. That is the position rule alone; a coalesced
+// away-and-back (one move at the starting pixel) is the hook's history check plus noteExcursion (r6, P11/P12).
 TEST(ViewerIdlePolicy, RetrievalWitnessSeesAwayAndBackAndIgnoresSamePositionMoves)
 {
     viewer_idle::RetrievalWitness w;
@@ -586,5 +587,145 @@ TEST(ViewerIdlePolicy, RetrievalHookProcRecordsMouseMessagesAndInstallsForThisTh
     ASSERT_FALSE(viewer_idle::win_hook::installed());
     viewer_idle::win_hook::remove();
     ASSERT_FALSE(viewer_idle::win_hook::witness().pending());
+}
+#endif
+
+namespace
+{
+viewer_idle::HistoryPoint hp(int x, int y, quint32 time)
+{
+    viewer_idle::HistoryPoint p;
+    p.x = x;
+    p.y = y;
+    p.time = time;
+    return p;
+}
+} // namespace
+
+// P11 (r6, key B1): MoveHistoryMark tells a coalesced away-and-back from a synthesized same-position move by the
+// system move history. Points newer than the mark are those in front of where the marked copy lines up again.
+TEST(ViewerIdlePolicy, MoveHistoryMarkSeesAnExcursionAfterTheMarkAndNothingElse)
+{
+    const viewer_idle::HistoryPoint marked[] = {hp(500, 500, 1000), hp(490, 500, 990), hp(480, 500, 980)};
+    viewer_idle::MoveHistoryMark m;
+    ASSERT_FALSE(m.marked());
+    ASSERT_FALSE(m.leftSinceMark(marked, 3, 500, 500));   // unmarked never counts (the r5 rule stands)
+    m.mark(marked, 3);
+    ASSERT_TRUE(m.marked());
+
+    // Nothing new: the history is the marked copy.
+    ASSERT_FALSE(m.leftSinceMark(marked, 3, 500, 500));
+    // A synthesized move adds no point elsewhere; even a new point at the same pixel is not movement.
+    const viewer_idle::HistoryPoint samePixel[] = {hp(500, 500, 1300), hp(500, 500, 1000), hp(490, 500, 990)};
+    ASSERT_FALSE(m.leftSinceMark(samePixel, 3, 500, 500));
+    // The sol row: away to (510,500) and back to (500,500) after the mark.
+    const viewer_idle::HistoryPoint awayAndBack[] = {hp(500, 500, 1200), hp(510, 500, 1100), hp(500, 500, 1000),
+                                                     hp(490, 500, 990)};
+    ASSERT_TRUE(m.leftSinceMark(awayAndBack, 4, 500, 500));
+    // The same excursion inside one time-stamp quantum of the mark: order, not time, decides.
+    const viewer_idle::HistoryPoint sameQuantum[] = {hp(500, 500, 1000), hp(510, 500, 1000), hp(500, 500, 1000),
+                                                     hp(490, 500, 990)};
+    ASSERT_TRUE(m.leftSinceMark(sameQuantum, 4, 500, 500));
+    // The approach to the pixel in the mark's own quantum is older than the mark: not counted.
+    const viewer_idle::HistoryPoint approach[] = {hp(500, 500, 1000), hp(490, 500, 1000)};
+    viewer_idle::MoveHistoryMark q;
+    q.mark(approach, 2);
+    ASSERT_FALSE(q.leftSinceMark(approach, 2, 500, 500));
+    // A negative (left monitor) excursion counts like any other.
+    const viewer_idle::HistoryPoint negative[] = {hp(500, 500, 1200), hp(-20, 500, 1100), hp(500, 500, 1000),
+                                                  hp(490, 500, 990)};
+    ASSERT_TRUE(m.leftSinceMark(negative, 4, 500, 500));
+    // The marked copy scrolled out of the history (more new points than it holds): a point elsewhere counts.
+    viewer_idle::HistoryPoint scrolled[viewer_idle::MoveHistoryMark::kMaxPoints];
+    for (int i = 0; i < viewer_idle::MoveHistoryMark::kMaxPoints; ++i)
+        scrolled[i] = hp(500 + (i % 2), 500, 5000u - quint32(i));
+    scrolled[0] = hp(500, 500, 5000);
+    ASSERT_TRUE(m.leftSinceMark(scrolled, viewer_idle::MoveHistoryMark::kMaxPoints, 500, 500));
+    // A failed read (-1) or an empty one never counts.
+    ASSERT_FALSE(m.leftSinceMark(awayAndBack, -1, 500, 500));
+    ASSERT_FALSE(m.leftSinceMark(awayAndBack, 0, 500, 500));
+    // A failed mark unmarks.
+    m.mark(marked, -1);
+    ASSERT_FALSE(m.marked());
+    ASSERT_FALSE(m.leftSinceMark(awayAndBack, 4, 500, 500));
+}
+
+#ifdef Q_OS_WIN
+namespace
+{
+viewer_idle::HistoryPoint g_script[viewer_idle::MoveHistoryMark::kMaxPoints];
+int g_scriptCount = 0;
+int scriptedHistory(const QPoint &, viewer_idle::HistoryPoint *out, int max)
+{
+    if (g_scriptCount <= 0) return -1;
+    const int n = qMin(max, g_scriptCount);
+    for (int i = 0; i < n; ++i) out[i] = g_script[i];
+    return n;
+}
+void setScript(std::initializer_list<viewer_idle::HistoryPoint> points)
+{
+    g_scriptCount = 0;
+    for (const viewer_idle::HistoryPoint &p : points) g_script[g_scriptCount++] = p;
+}
+} // namespace
+
+// P12 (r6, key B1, the sol catalogue row at the hook): hidden, marked at (500,500); the excursion is coalesced into
+// ONE WM_MOUSEMOVE at (500,500). The hook reads the history and the witness is pending. A synthesized same-position
+// move (no point elsewhere in the history) is not pending; an unmarked hook keeps the r5 position rule; any
+// pending movement unmarks, and removing the hook unmarks.
+TEST(ViewerIdlePolicy, RetrievalHookSeesACoalescedAwayAndBackOnlyThroughTheMarkedHistory)
+{
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = scriptedHistory;
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = 500;
+    back.pt.y = 500;
+
+    // The hide marks the history.
+    viewer_idle::win_hook::witness().seed(QPoint(500, 500));
+    setScript({hp(500, 500, 1000), hp(490, 500, 990)});
+    viewer_idle::win_hook::markHistory();
+    ASSERT_TRUE(viewer_idle::win_hook::historyMark().marked());
+
+    // The app's own hide provokes a same-position move: nothing in the history moved.
+    setScript({hp(500, 500, 1050), hp(500, 500, 1000), hp(490, 500, 990)});
+    viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&back));
+    ASSERT_FALSE(viewer_idle::win_hook::witness().take());
+    ASSERT_TRUE(viewer_idle::win_hook::historyMark().marked());
+
+    // Away and back before retrieval, coalesced: one move at the starting pixel.
+    setScript({hp(500, 500, 1200), hp(510, 500, 1100), hp(500, 500, 1050), hp(500, 500, 1000), hp(490, 500, 990)});
+    viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&back));
+    ASSERT_TRUE(viewer_idle::win_hook::witness().take());
+    ASSERT_FALSE(viewer_idle::win_hook::historyMark().marked());   // used up; the next hide marks afresh
+
+    // Unmarked (the cursor is shown, or the mark failed): the r5 position rule.
+    viewer_idle::win_hook::proc(HC_ACTION, WM_NCMOUSEMOVE, reinterpret_cast<LPARAM>(&back));
+    ASSERT_FALSE(viewer_idle::win_hook::witness().take());
+
+    // A mark that cannot be read (no point at the cursor) unmarks.
+    g_scriptCount = 0;
+    viewer_idle::win_hook::markHistory();
+    ASSERT_FALSE(viewer_idle::win_hook::historyMark().marked());
+
+    // A move seen by position unmarks too; remove() unmarks.
+    setScript({hp(500, 500, 1000)});
+    viewer_idle::win_hook::markHistory();
+    MOUSEHOOKSTRUCT away = {};
+    away.pt.x = 510;
+    away.pt.y = 500;
+    viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&away));
+    ASSERT_TRUE(viewer_idle::win_hook::witness().take());
+    ASSERT_FALSE(viewer_idle::win_hook::historyMark().marked());
+    viewer_idle::win_hook::markHistory();
+    viewer_idle::win_hook::remove();
+    ASSERT_FALSE(viewer_idle::win_hook::historyMark().marked());
+
+    viewer_idle::win_hook::historyReader() = saved;
+    // The real reader runs: a point that is not in the history is -1, never a crash.
+    viewer_idle::HistoryPoint out[viewer_idle::MoveHistoryMark::kMaxPoints];
+    const int n = viewer_idle::win_hook::readSystemHistory(QPoint(-31000, -31000), out,
+                                                           viewer_idle::MoveHistoryMark::kMaxPoints);
+    ASSERT_TRUE(n >= -1 && n <= viewer_idle::MoveHistoryMark::kMaxPoints);
 }
 #endif
