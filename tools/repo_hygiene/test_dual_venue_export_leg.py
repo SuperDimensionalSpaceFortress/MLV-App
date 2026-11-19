@@ -1156,7 +1156,7 @@ class ExportEvidenceTests(unittest.TestCase):
 
 
 EXPORT_STUB_GENERATOR = r"""
-param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected)
+param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$Venue,$Backend,$CpuQuiescenceThresholdPercent,$VenueTablePath,$PlaySeconds,$Format,$MaxFrames,$ReceiptPath,$DualIsoExpected,$ExpectReceiptSha256)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Object | ForEach-Object { $_ + '=' + $PSBoundParameters[$_] }) -join ';')
 Set-Content -LiteralPath $OutFile -Value "# stub export job"
@@ -1215,6 +1215,15 @@ class ExportRunnerTests(RunnerHarness, unittest.TestCase):
                                   "[ordered]@{ valid = $v.valid; status = $v.status; reasons = @($v.reasons) } | ConvertTo-Json -Compress")
         self.assertIsNotNone(got, proc.stdout + proc.stderr)
         return got
+
+    def test_r20_a2_the_leg_hands_the_generator_the_specs_committed_receipt_sha256(self) -> None:
+        """r20 (adversary pass 24 A2 on 9b8c4753): the generator is told the receipt hash the spec commits, so the bytes it reads and embeds are checked against it."""
+        spec = self.export_spec(maxframes=30)
+        self.write_export_artifacts(30)
+        proc, receipt, _ = self.run_leg("bachelor", spec, token=("EXPORT_CAPTURED", 0), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-3000:] + proc.stderr[-3000:])
+        want = leg(EXPORT_LEGS[0])["export"]["receiptSha256"]
+        self.assertIn(f"ExpectReceiptSha256={want}", self.gen_log.read_text(encoding="utf-8"))
 
     def test_a_json_null_summary_or_um_run_with_its_hash_updated_does_not_verify(self) -> None:
         """adversary r1 A2: a published document that parses to JSON null (its sha256 claim updated to match) is no evidence, never a PASS."""
@@ -1702,6 +1711,38 @@ class ExportJobGeneratorTests(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0, flag)
                 self.assertIn(flag.lstrip("-"), proc.stdout + proc.stderr)
                 self.assertFalse(out.exists())
+
+    def test_r20_a2_a_receipt_file_that_is_not_the_committed_bytes_is_refused_before_any_job_is_written(self) -> None:
+        """r20 (adversary pass 24 A2 on 9b8c4753): a receipt file replaced after the leg wrote it (here: other bytes than the spec's receiptSha256) is refused typed,
+        DUAL_VENUE_EXPORT_RECEIPT_CHANGED, before git or the job text (and after the preflight's return, r8 A3); the generator refuses to run without the expected hash.
+        The check is the generator's own top-level block, lifted from its AST and run on the replaced file (the owner clip it resolves first is not on a CI host)."""
+        committed = leg(EXPORT_LEGS[0])["export"]["receiptSha256"]
+        text = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertLess(text.index("if ($PreflightBudgetOnly) {\n    if ($MaxFrames"), text.index("DUAL_VENUE_EXPORT_RECEIPT_CHANGED the batch receipt"))
+        self.assertLess(text.index("DUAL_VENUE_EXPORT_RECEIPT_CHANGED the batch receipt"), text.index("& git -C $RepoRoot cat-file"))
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "j.job.ps1"
+            receipt = Path(d) / "replaced.marxml"
+            receipt.write_bytes(b"<receipt>replacement bytes</receipt>")
+            actual = hashlib.sha256(receipt.read_bytes()).hexdigest()
+            self.assertNotEqual(actual, committed)
+            lift = ("$ast = [System.Management.Automation.Language.Parser]::ParseFile('" + str(EXPORT_JOB) + "', [ref]$null, [ref]$null)\n"
+                    "$blocks = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text.Contains('DUAL_VENUE_EXPORT_RECEIPT_CHANGED') })\n"
+                    "if ($blocks.Count -ne 1) { 'BLOCKS ' + $blocks.Count; exit 0 }\n"
+                    "$PreflightBudgetOnly = $false; $ReceiptPath = '" + str(receipt) + "'; $ExpectReceiptSha256 = $args[0]\n"
+                    "try { . ([scriptblock]::Create($blocks[0].Extent.Text)); 'ACCEPTED ' + $receiptSha256 } catch { 'REFUSED ' + $_.Exception.Message }\n")
+            lifter = Path(d) / "lift.ps1"
+            lifter.write_text(lift, encoding="utf-8")
+            for expect, want in ((committed, "REFUSED DUAL_VENUE_EXPORT_RECEIPT_CHANGED"), (actual, "ACCEPTED " + actual)):
+                with self.subTest(expect=expect):
+                    proc = run_pwsh(["-File", str(lifter), expect])
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertTrue(proc.stdout.strip().startswith(want), proc.stdout + proc.stderr)
+            proc = run_pwsh(["-File", str(EXPORT_JOB), "-SourceCommit", "e" * 40, "-BuildManifestSha256", "ab" * 32, "-ClipId", "M16-1243", "-Venue", "bachelor",
+                             "-Backend", "cpu", "-Format", "prores", "-MaxFrames", "480", "-ReceiptPath", str(receipt), "-PlaySeconds", "20", "-OutFile", str(out)])
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("DUAL_VENUE_EXPORT_ARG_MISSING -ExpectReceiptSha256", proc.stdout + proc.stderr)
+            self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":

@@ -10610,6 +10610,49 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
 
 
 @requires_windows_pwsh
+class ScalarSpecGuardSeamTests(unittest.TestCase):
+    """EXPORT-VENUE-LEG-1 r20 (adversary pass 24 A1 on 9b8c4753): the scalar forms (-LegSpec, -LegSet) skip a spec re-read they have no room for ONLY at the open guard,
+    where the lease is held and the leg's own -ExpectSpecSha256 binds the bytes it runs (master read no spec there, so a lease whose room after the open held the leg
+    and no re-read still ran the leg: test_r3_a_leg_still_running_at_lease_end_is_killed_as_a_whole_tree_and_uncounted). Before a lease (the claim guard) no room to
+    re-read the spec is the typed refusal, so a spec changed after the export budget judged it never reaches a lease. With room, every seam compares the bytes.
+    Run on the runner's own functions, lifted from its AST."""
+
+    def _guard(self, seam: str, room: float) -> dict:
+        tmp = tempfile.TemporaryDirectory(prefix="r20-seam-")
+        self.addCleanup(tmp.cleanup)
+        spec = Path(tmp.name) / "changed.json"
+        spec.write_text('{"schema":"mlv-app/dual-venue-leg/v1","note":"the bytes after the preflight"}', encoding="utf-8")
+        names = "'New-GuardBudget', 'Get-InputContentRefusal', 'Set-GuardProgress', 'Wait-GuardReadSeam', 'Read-SpecBytesWithin', 'Get-BytesSha256', 'Get-SpecReadBoundSec'"
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
+                  f"foreach ($n in {names}) {{ . ([scriptblock]::Create($ast.Find({{ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }}, $true).Extent.Text)) }}\n"
+                  "$min = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq '$script:GuardReadMinSec' }, $true)\n"
+                  "if ($min) { . ([scriptblock]::Create($min.Extent.Text)) }\n"
+                  "$legPlanMode = $false; $script:guardProgress = $null; $script:guardDelaySeam = $null\n"
+                  # the export budget judged other bytes (all zeros is no file's sha256): the spec on disk changed after it
+                  f"$script:guardedInputs = @([pscustomobject]@{{ kind = 'spec'; item = 0; path = '{spec}'; backend = ''; specSha256 = ('0' * 64) }})\n"
+                  f"$script:guardBudget = New-GuardBudget {room} 'the {seam} room' 'SHARE_UNREACHABLE' $false '{seam}'\n"
+                  "$hit = Get-InputContentRefusal\n"
+                  "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; noRoom = [bool]$hit.noRoom }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_r20_a1_the_claim_guard_with_no_room_to_reread_a_scalar_spec_refuses_before_any_lease(self) -> None:
+        got = self._guard("claim", 1.0)
+        self.assertEqual((got["code"], got["noRoom"]), ("SHARE_UNREACHABLE", True), f"a 1 s claim-guard room under the 2 s read minimum: {got}")
+
+    def test_r20_a1_the_open_guard_with_no_room_skips_the_scalar_reread_and_leaves_the_binding_to_the_leg(self) -> None:
+        got = self._guard("open", 1.0)
+        self.assertEqual(got["code"], "", f"master parity after the open (the leg's -ExpectSpecSha256 refuses changed bytes): {got}")
+
+    def test_r20_a1_with_room_every_seam_refuses_a_scalar_spec_changed_after_the_budget(self) -> None:
+        for seam in ("claim", "open"):
+            with self.subTest(seam=seam):
+                self.assertEqual(self._guard(seam, 30.0)["code"], "SPEC_CHANGED_AFTER_PREFLIGHT")
+
+
+@requires_windows_pwsh
 class LeaseEndUtcTimezoneTests(unittest.TestCase):
     ENDED = datetime(2026, 10, 25, 1, 19, 14, 720994, tzinfo=timezone.utc)   # the r7 open result's endedUtc
     LEFT = 2699                                                              # a 45 min lease less the open job's run (the r7 figure)

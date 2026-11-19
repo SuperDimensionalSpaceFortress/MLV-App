@@ -1253,7 +1253,9 @@ function Get-InputContentRefusal {
             # r20 (hosted CI on 41f4ffd9, test_r3_a_leg_still_running_at_lease_end_is_killed_as_a_whole_tree_and_uncounted): on master the scalar forms (-LegSpec, -LegSet) read no spec
             # here, so a lease whose room after the open held the leg and no re-read still ran the leg. That stays so: the scalar form SKIPS a spec re-read it has no room for (it
             # is not refused), and the bytes the leg runs are still bound to the judged ones by the leg's own -ExpectSpecSha256 (DVE_LEG_SPEC_CHANGED). The plan form keeps r4's refusal.
-            if (-not $legPlanMode) { continue }
+            # adversary pass 24 A1 (on 9b8c4753): ONLY at the open guard (seam 'open'), where the lease is already held and the leg's own check comes before anything is generated.
+            # The claim and gate guards run BEFORE a lease opens: a spec they had no room to re-read is refused there as in the plan form, so no lease opens on unjudged bytes.
+            if (-not $legPlanMode -and [string]$script:guardBudget.seam -ceq 'open') { continue }
             return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; noRoom = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to re-read the $($g.kind) input $($g.path); no leg runs on it" }
         }
         Set-GuardProgress $g "the $($g.kind) input $($g.path)" 'content'

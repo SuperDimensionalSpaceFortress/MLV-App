@@ -35,6 +35,9 @@ param(
     [ValidateSet('cdng-lossless', 'prores')][string]$Format,
     [ValidateRange(24, 100000)][int]$MaxFrames = 0,
     [string]$ReceiptPath,
+    # r20 (adversary pass 24 A2): the leg spec's committed export.receiptSha256. The bytes this generator reads from -ReceiptPath (the ones it embeds) must hash to it, or the
+    # typed DUAL_VENUE_EXPORT_RECEIPT_CHANGED refusal comes before any job is written: a receipt file replaced after the leg wrote it never becomes an export. Required to generate.
+    [ValidatePattern('^[0-9a-f]{64}\z')][string]$ExpectReceiptSha256,
     [bool]$DualIsoExpected = $false,
     [ValidateRange(10, 3600)][int]$PlaySeconds = 20,
     # the leg schema's range, exactly: (0, 100] (adversary r1 A5: ValidateRange(0.1, 100) refused a schema-valid 0.05)
@@ -479,7 +482,7 @@ if ($DescribeTemplate) {
 }
 
 # --- generation ------------------------------------------------------------------------------------------------------------------------------------------------------
-foreach ($needed in $(if ($PreflightBudgetOnly) { @('ClipId', 'Format') } else { @('SourceCommit', 'BuildManifestSha256', 'ClipId', 'Format', 'ReceiptPath', 'OutFile') })) {
+foreach ($needed in $(if ($PreflightBudgetOnly) { @('ClipId', 'Format') } else { @('SourceCommit', 'BuildManifestSha256', 'ClipId', 'Format', 'ReceiptPath', 'ExpectReceiptSha256', 'OutFile') })) {
     if ([string]::IsNullOrWhiteSpace([string](Get-Variable -Name $needed -ValueOnly))) { throw "DUAL_VENUE_EXPORT_ARG_MISSING -$needed is required" }
 }
 if ($MaxFrames -lt 24) { throw 'DUAL_VENUE_EXPORT_ARG_MISSING -MaxFrames is required (24..100000)' }
@@ -519,12 +522,18 @@ if ($PreflightBudgetOnly) {
     return (Get-ExportJobTimeBudget -ClipBytes $preflightBytes -Frames $MaxFrames)   # the same function, the same refusal the generation below makes
 }
 
+# r20 (adversary pass 24 A2): the batch receipt is read ONCE, here (after the preflight's return: r8 A3, that mode reads no receipt), before git or the job text; these bytes are
+# the ones embedded below, and they must hash to the leg spec's committed receiptSha256 (-ExpectReceiptSha256). The self-derived hash alone proved only that the job carries
+# what this generator read, not what the spec requires: a receipt file replaced after the leg wrote it is the typed refusal, and no job is written.
+if (-not $PreflightBudgetOnly) {
+    $receiptBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $ReceiptPath).Path)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try { $receiptSha256 = ([BitConverter]::ToString($hasher.ComputeHash($receiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
+    if ($receiptSha256 -cne $ExpectReceiptSha256) { throw "DUAL_VENUE_EXPORT_RECEIPT_CHANGED the batch receipt read from -ReceiptPath hashes to $receiptSha256, not the $ExpectReceiptSha256 the leg spec commits (export.receiptSha256); no job is written" }
+}
+
 & git -C $RepoRoot cat-file -e "$SourceCommit^{commit}" 2>$null
 if ($LASTEXITCODE -ne 0) { throw 'DUAL_VENUE_EXPORT_SOURCE_COMMIT_UNKNOWN -SourceCommit is not a commit known to the local repo' }
-
-$receiptBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $ReceiptPath).Path)
-$hasher = [System.Security.Cryptography.SHA256]::Create()
-try { $receiptSha256 = ([BitConverter]::ToString($hasher.ComputeHash($receiptBytes)) -replace '-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
 
 $clipBytes = [int64]0
 foreach ($p in $ownerParts) { $clipBytes += [int64]$p.length }

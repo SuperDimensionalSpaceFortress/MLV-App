@@ -600,6 +600,8 @@ try {
             SourceCommit = $SourceCommit; BuildManifestSha256 = $BuildManifestSha256; ClipId = [string]$spec.clipId; OutFile = $jobFile; RepoRoot = $RepoRoot
             Venue = $Venue; Backend = $Backend; PlaySeconds = $playSeconds; Format = [string]$spec.export.format; MaxFrames = [int]$spec.export.maxFrames
             ReceiptPath = $exportReceiptPath; DualIsoExpected = [bool]$spec.export.dualIsoExpected
+            # r20 (adversary pass 24 A2): the generator checks the bytes it reads from ReceiptPath against the committed hash, so a file replaced after line 498 wrote it is refused
+            ExpectReceiptSha256 = [string]$spec.export.receiptSha256
         }
         if ($OfflineTestMode -and -not [string]::IsNullOrWhiteSpace($VenueTablePath)) { $gen['VenueTablePath'] = $VenueTablePath }
         $exportGenArgs = Get-DvProp $spec 'generatorArgs'
