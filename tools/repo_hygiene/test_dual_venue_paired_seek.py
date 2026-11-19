@@ -414,6 +414,14 @@ class GeneratorArgsBooleanStrictnessTests(RunnerHarness, unittest.TestCase):
         # displayMode windowed: midPlayWindowToggles true is refused on any other display mode (VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 adversary A4), a refusal this
         # strictness test is not about; no other switch reads displayMode
         spec = '{"schema":"mlv-app/dual-venue-leg/v1","legType":"speed","displayMode":"windowed","generatorArgs":{"%s":%s}}' % (name, raw_json)
+        if name == "midPlayWindowToggles":
+            # VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 r12 (fable r11 note): a requested leg is refused unless its criteria bind the five toggle scalars for every
+            # backend it names (WINDOW_TOGGLES_CRITERIA_UNBOUND), another refusal this strictness test is not about, so the spec carries a complete binding
+            rows = [{"metric": m, "op": "eq", "value": 4} for m in ("windowTogglesRequested", "windowTogglesDriven", "windowTogglesKeptPlaying", "windowTogglesAdvanced")]
+            rows.append({"metric": "windowToggleEvidenceReason", "op": "eq", "value": "ok"})
+            spec_obj = json.loads('{"schema":"mlv-app/dual-venue-leg/v1","legType":"speed","displayMode":"windowed"}')
+            spec_obj.update({"backends": ["cuda"], "criteria": {"acceptance": {"cuda": rows}, "supplementary": {"cuda": rows}}})
+            spec = json.dumps(spec_obj)[:-1] + ',"generatorArgs":{"%s":%s}}' % (name, raw_json)
         proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n" + script], env_extra={"DVE_SPEC_JSON": spec})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return next(l for l in proc.stdout.splitlines() if l.startswith("REFUSAL="))[len("REFUSAL="):]
