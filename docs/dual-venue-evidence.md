@@ -445,11 +445,13 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     `writer_queue_wait`, `writer_completion_lag`) are reported apart from the producer stages, because the async writer overlaps the producer.
     Each stage must still fit inside the stage that contains it (a producer stage inside `producer_frame`, an `llrawproc_*` child inside `llrawproc`); a stage that does not is
     `INVALID` (`EXPORT_STAGE_CONTAINMENT_MISMATCH`).
-  * **CDNG disjoint-stage containment is advisory, pending `EXPORT-CDNG-STAGE-CONTAINMENT-1`.** The checks derived from `ExportCdngStageWindowTable` (`DualVenueRunner.psm1`)
-    are: disjoint stages held together inside their parent, and the lock times inside the `llrawproc_shared_lock` / `llrawproc_other` that contain them. Each one they fail is
-    written to `containmentAdvisory` (on the evidence and in `receipt.export`) as an `EXPORT_STAGE_CONTAINMENT_ADVISORY` line. It is never put in `problems`, never turns a
-    `PASS` into a `FAIL` or `INVALID`, and is not re-derived by the receipt check. The reason: the table's `llrawproc_pre_dualiso_fix` row still carries the scaled-path window
-    (`llrawproc.c:6606-7076`), which CDNG export never runs (r17 keys). The stage shares are reported as before.
+  * **CDNG disjoint-stage containment gates (`EXPORT-CDNG-STAGE-CONTAINMENT-1`).** The checks derived from `ExportCdngStageWindowTable` (`DualVenueRunner.psm1`)
+    are: disjoint stages held together inside their parent, and the lock times inside the `llrawproc_shared_lock` / `llrawproc_other` that contain them. One they fail is
+    an `EXPORT_STAGE_CONTAINMENT_MISMATCH` problem, so the leg is `INVALID`; only the CDNG profile runs them. The table holds only the code path CDNG export runs
+    (`dng.c` `applyLLRawProcObject` -> `applyLLRawProcObjectWorker(..., NULL, 0)`): no window of the playback-only scaled path, and none for `llrawproc_pre_dualiso_fix`,
+    which export never accrues, so any value published for it is held inside `llrawproc` with the rest. A test re-derives the table from the C sources by call-site
+    reachability. (r18 had made these checks advisory while the table carried the scaled-path windows; `containmentAdvisory` stays in the evidence and in
+    `receipt.export` as an always-empty array.)
   * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
     `raw_uint16` and `llrawproc` nest inside `debayered_frame`. The batch's `DONE elapsed` starts before the clip opens and also times finish, verify and
     probe, so it is never a denominator. `batchWallPerFrameMs` and `untimedPerFrameMs` (wall per frame minus `processed16_total`: open, pipe write,
