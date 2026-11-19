@@ -215,14 +215,20 @@ def _decode_ucn(match: re.Match) -> str:
         return "?"
 
 
+def _lf_only(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _rule3_views(text: str) -> list[str]:
-    """Each way a compiler can read an LF-only text that rule 3 searches (r2, adversary r2 pass 1 A1
-    on c541efac): a NUL dropped (a UTF-16 file) and a NUL read as whitespace, as GCC reads it (dropped,
+    """Each way a compiler can read the raw text that rule 3 searches (r2, adversary r2 pass 1 A1 on
+    c541efac): a NUL dropped (a UTF-16 file) and a NUL read as whitespace, as GCC reads it (dropped,
     `flipped\\0EMPTY` was one identifier); a `??/` splice joined and not joined (GCC and Clang join it
-    only with -trigraphs); every backslash-newline splice joined and every UCN decoded in each."""
+    only with -trigraphs); every backslash-newline splice joined and every UCN decoded in each. NULs
+    go before CR, LF and CRLF are read as line ends (adversary r2 pass 2 A1 on 1c3a909d: a UTF-16
+    CRLF, `\\r\\0\\n\\0`, read first as two line breaks, left `fl\\nipped` after a splice)."""
     views = []
     for nul in ("", " "):
-        spliced = SPLICE.sub("", text.replace("\x00", nul))
+        spliced = SPLICE.sub("", _lf_only(text.replace("\x00", nul)))
         for view in (TRIGRAPH_SPLICE.sub("", spliced), spliced):
             views.append(UCN.sub(_decode_ucn, view))
     return views
@@ -231,8 +237,8 @@ def _rule3_views(text: str) -> list[str]:
 def _reaches_qt69_name(text: str) -> bool:
     if QT69_MEMBER_USE.search(text):
         return True
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
     views = _rule3_views(text)
+    text = _lf_only(text)
     if not any("flip" in view for view in views):
         return False  # no rule can fire, so only such a text is lexed
     spliced = SPLICE.sub("", text)
@@ -643,6 +649,23 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         for text in ("x();\x00 flippedCopy\n", "auto r = flippedCopy??/\nX;\n", "x(); \x00unflip\x00ped\n"):
             with self.subTest(text=text):
                 self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_rule_3_drops_the_nuls_of_a_utf16_text_before_it_reads_line_ends(self) -> None:
+        # adversary r2 pass 2 A1 (1c3a909d): CR was read as a line end before the NULs were dropped,
+        # so a UTF-16 CRLF (`\r\0\n\0`) became two line breaks and a splice joined only the first one,
+        # leaving `fl\nipped`. Its input, and both names, both byte orders and both splice forms.
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+            for head, tail in (("fl", "ipped"), ("fl", "ip")):
+                for splice in ("\\", "??/", "\\ "):
+                    for eol in ("\r\n", "\r", "\n"):
+                        source = (f"#include <QImage>{eol}inline QImage qt69Readback(const QImage &image) {{{eol}"
+                                  f"    return image .{eol}        {head}{splice}{eol}{tail}(Qt::Vertical);{eol}}}{eol}")
+                        text = source.encode(encoding).decode("utf-8", errors="replace")
+                        with self.subTest(encoding=encoding, name=head + tail, splice=splice, eol=repr(eol)):
+                            self.assertEqual(files_needing_scan({"Qt69Readback.h": text}), {"Qt69Readback.h"})
+        # A UTF-16 text with only a longer name is still not flagged.
+        text = "auto r = image.flippedCopy();\r\n".encode("utf-16").decode("utf-8", errors="replace")
+        self.assertEqual(files_needing_scan({"f": text}), set())
 
     def test_a_digit_separator_in_code_is_refused(self) -> None:
         # r2 sibling of adversary r1 pass 3 A1: the Qt 5 Linux kit compiles C++11 (MLVApp.pro:176),
