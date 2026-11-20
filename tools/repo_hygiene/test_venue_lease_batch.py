@@ -1124,6 +1124,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r3: the runner imports ..\FpsArmGate.psm1 and the dual-venue modules read neighbouring-folder modules; a scratch tree carries them all
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")
         agent = AGENT.read_bytes()
         self.assertEqual(agent.count(b"[int]$LeaseBatchIdleSec = 300,"), 1, "the agent's idle bound moved: update this fixture")
         (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec = " + idle + b","))
@@ -2056,6 +2058,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")   # BENCH-LIGHT-ARM-GAIN-GATES-1 r3: ..\FpsArmGate.psm1 (the runner's import) and the neighbouring-folder modules
         agent = AGENT.read_bytes()
         (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec,"))
         self.runner = tree / "dual-venue" / RUNNER.name

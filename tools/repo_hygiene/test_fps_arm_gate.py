@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +38,9 @@ LEGS_DIR = PROFILING / "dual-venue" / "legs"
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+# Invoke-VenueLeaseBatch.ps1 is a Windows-only runner: on Linux pwsh its input guard cannot resolve the plan's physical path and refuses it as LEG_PLAN_IS_RUN_OUTPUT before the
+# purpose / arm check (hosted Tests run 44737591712, ubuntu shard 3/4). test_venue_lease_batch.py skips its runner tests the same way (requires_windows_pwsh); the Windows shards run these.
+requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows (the lease-batch runner is Windows-only)")
 
 HEAVY_REASON = "fps-verdict-refused:heavy-arm"
 UNKNOWN_REASON = "fps-verdict-refused:unknown-arm"
@@ -365,6 +369,7 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
                                "-DeadlineUtc", "2099-01-01T00:00:00Z"],
                               capture_output=True, text=True, timeout=300, creationflags=_NO_WINDOW)
 
+    @requires_windows_pwsh
     def test_fps_ab_with_a_heavy_leg_is_refused_before_any_claim(self) -> None:
         light = self.spec("fx-light", {"telemetryArm": "LIGHT", "presentTrace": True})
         heavy = self.spec("fx-heavy", {"telemetryArm": "HEAVY"})
@@ -374,6 +379,7 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         self.assertIn(HEAVY_REASON, r.stderr)
         self.assertFalse((self.tmp / "claims").exists(), "nothing was claimed")
 
+    @requires_windows_pwsh
     def test_fps_ab_with_a_leg_that_names_no_arm_is_refused(self) -> None:
         r = self.run_plan([self.spec("fx-a", {"telemetryArm": "LIGHT"}), self.spec("fx-b", {"unpaced": True})], "fps-ab")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
@@ -408,6 +414,7 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.split(), ["JUDGED_HEAVY_READ_LIGHT=UNKNOWN", "SAME_BYTES=LIGHT", "NO_DIGEST=UNKNOWN"])
 
+    @requires_windows_pwsh
     def test_an_unreadable_purpose_is_refused(self) -> None:
         # adversary pass 2 A3: the purpose is judged as parsed. A one-element array, a number and an explicit null are not the scalar string 'fps-ab' / 'stage-attribution'.
         for purpose in ("throughput", ["fps-ab"], ["stage-attribution"], 5, None):
@@ -415,6 +422,7 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
                 r = self.run_plan([self.spec("fx-a", {"telemetryArm": "LIGHT"})], purpose)
                 self.assertIn("LEG_PLAN_REFUSED reason=BAD_PURPOSE", r.stderr, r.stdout + r.stderr)
 
+    @requires_windows_pwsh
     def test_stage_attribution_and_light_fps_plans_get_past_the_arm_check(self) -> None:
         # both fall through to the build-staging check (no build is staged in this fixture), which is a different typed refusal
         heavy = [self.spec("fx-h1", {"telemetryArm": "HEAVY"}), self.spec("fx-h2", {"telemetryArm": "HEAVY"})]
