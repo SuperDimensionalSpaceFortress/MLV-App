@@ -8,6 +8,8 @@ and MainWindow.cpp includes the header, so the Qt 5 release kit failed to compil
 reads the header's text and fails on any call to an API newer than Qt 5.15 that is not inside an
 arm of a ``QT_VERSION`` check that compiles only on a Qt new enough for it. Same defect class as
 the QMouseEvent::position() guard of PR 856 r3 (test_qt6_only_api_guard.py on that branch).
+The scope now includes GpuDisplayWindow.cpp (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1), and a
+tripwire fails when any other file under platform/qt or src reaches a QImage::flipped/flip name.
 
 GRAMMAR (r5, fail closed; hub STOP RULE 20261119T0912Z). The scanner reads a file only where it
 is certain what a compiler sees. Anything else it REFUSES: the file is reported unprovable (one
@@ -15,8 +17,8 @@ is certain what a compiler sees. Anything else it REFUSES: the file is reported 
 
 Read:
   * comments (``//``, ``/* */``) and the bodies of ordinary string and character literals are
-    blanked; an unterminated ' or " ends at the line end; a ' inside a pp-number is a digit
-    separator; CR, LF and CRLF each end a line;
+    blanked; an unterminated ' or " ends at the line end; a ' inside a pp-number is lexed as a
+    digit separator (and then refused, below); CR, LF and CRLF each end a line;
   * every identifier token that IS an API name of NEWER_THAN_QT5_API is a use, wherever it
     stands: a member access (also one split across lines), a qualified name, a macro argument,
     a #define body, a conditional directive or a bare call. Each use is judged by the arms open
@@ -56,7 +58,9 @@ Refused, never read:
   * an ``include_alias`` token anywhere in the raw text (r7, fable r6 H2), as ``header-name``: its
     arguments are header-names the lexer does not know;
   * a ``$`` in code (r7, fable r6 H3): compilers accept it in identifiers by default, so it moves
-    where a pp-number ends.
+    where a pp-number ends;
+  * a digit separator in code (``1'000``; card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1 r2): the Qt 5
+    Linux kit compiles C++11 (MLVApp.pro:176), where the ' ends the number and opens a char literal.
 
 Non-promises: the scanner does not preprocess. It does not follow #include, does not expand a
 macro defined in another file (an external macro that pastes pieces into an API name is not
@@ -66,12 +70,19 @@ It proves one thing about the scoped headers: no API name token stands outside a
 from __future__ import annotations
 
 import re
+import subprocess
+import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCOPED_HEADERS = (ROOT / "platform" / "qt" / "PlayerTransportToolbar.h",)
+# Index 0 stays PlayerTransportToolbar.h: _header_with_branch and two tests read SCOPED_HEADERS[0].
+SCOPED_HEADERS = (
+    ROOT / "platform" / "qt" / "PlayerTransportToolbar.h",
+    ROOT / "platform" / "qt" / "GpuDisplayWindow.cpp",
+)
 
 # API -> the first Qt (major, minor) that has it.
 NEWER_THAN_QT5_API = {
@@ -147,6 +158,198 @@ _INT_LITERAL = re.compile(
     r"|(?P<oct>0(?:'?[0-7])*)|(?P<dec>[1-9](?:'?[0-9])*))"
     r"(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?"
 )
+
+
+# Tripwire (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1): which files the strict scanner must read.
+# A file under platform/qt or src needs the scan when
+#   (1) its raw text, comments and literals included (on purpose: it fails toward scanning), has a
+#       member or qualified access of flipped or flip (QT69_MEMBER_USE); or
+#   (2) with CR and CRLF read as LF and every backslash-newline splice joined, the strict scanner's
+#       lexer (comments and literal bodies blanked) finds a flipped or flip identifier token in code.
+#       A comment, a line break or a splice between the accessor and the name, a bare name, a macro
+#       alias and a using-declaration all reach it (adversary r1 A1 on 792b6c2e); or
+#   (3) the lexer does not read the text, or cannot trust where its tokens and literals end, and,
+#       as it is and (when it has a NUL) read as UTF-16 and UTF-32 of either byte order, so a source
+#       U+0000 is told from the encoding's zero bytes (r3, adversary r3 pass 6 A1),
+#       with NULs dropped (a UTF-16 file) or read as whitespace (GCC), `??/` read as a backslash and
+#       not, every splice joined (a NUL before the break included), and with no escape decoded or
+#       every universal-character-name decoded (`\uXXXX`, `\UXXXXXXXX`, `\u{...}`, `\N{...}`), a
+#       flipped or flip token stands anywhere in it, comments and literals included. Decoding never
+#       deletes text: an escape that names no character stays as it is, and a `\N{...}` span holds
+#       character-name characters only, so it cannot cross a comment or literal end (r3, fable r2 B1).
+# Every file git can carry under the roots is read, whatever its suffix or content: tracked, and
+# untracked but not ignored (adversary r1 A2 on 792b6c2e: a suffix allowlist skipped the .cc files
+# MLVApp.pro compiles; pass 2 A1, A2 on 54e0a825: a doc/build-file filter was beaten by an #include
+# its regex did not read). A binary file is read too: only the exact token counts, and a PNG or zip
+# under the roots has none. Without a git work tree at the root, every file under the roots is read.
+# NON-PROMISE: it is a tripwire for the Qt 6.9 QImage names only. A name assembled by a token paste
+# (`##`) or by a macro defined in another file is not seen (the strict scanner refuses a paste in the
+# scoped files); a file outside platform/qt and src, and a git-ignored one (a PR cannot carry it; a
+# force-added file is tracked and read), are not read; a source charset other than UTF-8, UTF-16 and
+# UTF-32 (both byte orders; rule 3 reads a text with a NUL in each, r3) is not decoded, and no
+# compiler's identifier-character table is modelled. It is the strict scanner, not this tripwire,
+# that judges a use guarded or not.
+QT69_MEMBER_USE = re.compile(r"(?:\.|->|::)[ \t]*(?:flipped|flip)\b")
+QT69_NAME = re.compile(r"\b(?:flipped|flip)\b")
+# r3 (fable r2 B1 on 956d41f8): an escape is decoded only where its whole span could be one escape to
+# a compiler. A character name holds letters, digits, space, `-` and `_` only, so a `\N{...}` span can
+# never cross the `*/`, quote, `)"` or line break that ends a comment or a literal; the old `[^}\n]*`
+# ran from a `\N{` in a comment to a `}` in a later one and swallowed the call between.
+UCN = re.compile(r"\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\{([0-9A-Fa-f]+)\}|N\{([0-9A-Za-z _-]+)\})")
+TRIPWIRE_ROOTS = ("platform/qt", "src")
+# Rule 3 inputs (r2, adversary r1 pass 3 A1 on e6717ff8: rule 2 lexed a text whose token ends it
+# could not trust). In the raw text, and again with every splice joined: a control byte, a trigraph,
+# a header-name the lexer cannot read and an include_alias token (a `%:include <a/*>` is not anchored
+# at `#`, so the lexer read its `/*` as a comment). Then the lexer's own refusals (a raw string, a
+# backslash in code, an unreadable header-name) and these kinds of _refused_forms, each of which moves
+# where a token or a literal ends: `$` and a non-ASCII character join an identifier the lexer ends
+# early, so a following ' reads as a digit separator; a digit separator is the end of the number and
+# a char literal to C++11 and C99; a digraph can open a directive whose header-name the lexer reads
+# as a comment or a literal. The other kinds (a token paste, macro indirection, an unknown directive,
+# a redefined version macro) leave every token where the lexer put it, so they stay with rule 2: sent
+# to rule 3 they would flag three files whose only flip token is in a comment.
+UNLEXED_RAW_FORMS = (CONTROL_BYTE, TRIGRAPH, HEADER_NAME_UNREADABLE, INCLUDE_ALIAS)
+TOKEN_BOUNDARY_KINDS = frozenset(("dollar", "non-ascii", "digit-separator", "digraph"))
+
+
+def _decode_ucn(match: re.Match) -> str:
+    """The character an escape names, or the escape's own text when it names none: a compiler reads
+    no character there either, so decoding never deletes text (r3, fable r2 B1)."""
+    digits = match.group(1) or match.group(2) or match.group(3)
+    if digits:
+        value = int(digits, 16)
+        return chr(value) if value < 0x110000 else match.group(0)
+    try:
+        return unicodedata.lookup(match.group(4))
+    except KeyError:
+        return match.group(0)
+
+
+def _lf_only(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _rule3_views(text: str) -> list[str]:
+    """Each way a compiler can read the raw text that rule 3 searches (r2, adversary r2 pass 1 A1 on
+    c541efac): a NUL dropped (a UTF-16 file) and a NUL read as whitespace, as GCC reads it (dropped,
+    `flipped\\0EMPTY` was one identifier); every `??/` read as a backslash and not (GCC and Clang
+    read it so only with -trigraphs; it then also spells a UCN's backslash: r3); every
+    backslash-newline splice joined in each, and each kept both undecoded and with every UCN
+    decoded (r3, fable r2 B1: only the decoded form was kept, so a decoding that deleted code hid
+    the name from every check). NULs go before CR, LF and CRLF are read as line ends (adversary r2
+    pass 2 A1 on 1c3a909d: a UTF-16 CRLF, `\\r\\0\\n\\0`, read first as two line breaks, left
+    `fl\\nipped` after a splice). A text with a NUL is also read as each wide charset first, so a
+    source U+0000 is told from the encoding's zero bytes (adversary r3 pass 6 A1 on e47e4787: a
+    UTF-16 `flipped\\0EMPTY` read with every zero byte dropped or spaced held no name)."""
+    views = []
+    for source in (text, *_wide_charset_texts(text)):
+        for nul in ("", " "):
+            lf = _lf_only(source.replace("\x00", nul))
+            for form in (lf.replace("??/", "\\"), lf):
+                spliced = SPLICE.sub("", form)
+                views.extend((spliced, UCN.sub(_decode_ucn, spliced)))
+    return views
+
+
+WIDE_CHARSETS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+# Where a view can differ from the text with its NULs dropped or spaced: a `??/`, a backslash that a
+# dropped NUL may join to a UCN's u, U or N, and a splice (a NUL counts as whitespace before its line
+# break). A wide reading with none of them and no `flip` once its NULs are dropped can put no name in
+# any view, so its views are not built: a binary under the roots reads as UTF-16 noise.
+WIDE_VIEW_NEEDED = re.compile(r"\?\?/|\\\x00*[uUN]|\\[ \t\f\v\x00]*[\r\n]")
+
+
+def _wide_bytes_prefilter() -> re.Pattern:
+    """The same four forms, and `flip` with U+0000s between its letters, as raw bytes in UTF-16 and
+    UTF-32 of either byte order, before any decoding: an ASCII character is the 16-bit unit `c\\0`
+    (little-endian) or `\\0c` (big-endian) in all four, and a U+0000 is zero units. Decoding a
+    tracked 38 MB archive four ways took 2.5 s for nothing, and these unit sequences do not occur
+    in compressed bytes."""
+    alternatives = []
+    nul_units = rb"(?:\x00\x00)*"
+    for little in (True, False):
+        def unit(cls: bytes, little: bool = little) -> bytes:
+            return cls + rb"\x00" if little else rb"\x00" + cls
+        alternatives += [
+            nul_units.join(unit(c) for c in (b"f", b"l", b"i", b"p")),
+            nul_units.join(unit(c) for c in (rb"\?", rb"\?", b"/")),
+            unit(rb"\\") + nul_units + unit(b"[uUN]"),
+            unit(rb"\\") + rb"(?:" + unit(rb"[\x00 \t\x0b\x0c]") + rb")*" + unit(rb"[\r\n]"),
+        ]
+    return re.compile(b"|".join(alternatives))
+
+
+WIDE_BYTES_NEEDED = _wide_bytes_prefilter()
+
+
+def _wide_charset_texts(text: str) -> list[str]:
+    """`text`'s bytes read as UTF-16 and UTF-32 in both byte orders, when it has a NUL (an ASCII
+    character in a wide charset always does); a reading is dropped when no view of it can hold a
+    name (WIDE_BYTES_NEEDED, WIDE_VIEW_NEEDED). The bytes are exact for a text read with
+    surrogateescape (_tripwire_texts); a lossy decode can shift the code units after a bad byte."""
+    if "\x00" not in text:
+        return []
+    try:
+        data = text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        data = text.encode("utf-8", "surrogatepass")
+    if not WIDE_BYTES_NEEDED.search(data):
+        return []
+    readings = (data.decode(charset, errors="replace") for charset in WIDE_CHARSETS)
+    return [wide for wide in readings if "flip" in wide.replace("\x00", "") or WIDE_VIEW_NEEDED.search(wide)]
+
+
+def _reaches_qt69_name(text: str) -> bool:
+    if QT69_MEMBER_USE.search(text):
+        return True
+    views = _rule3_views(text)
+    text = _lf_only(text)
+    # The views include the undecoded spliced text rule 2 lexes (r3, fable r2 B1: the pre-check read
+    # only decoded views, so a decoding that deleted the call skipped rules 2 and 3 alike).
+    if not any("flip" in view for view in views):
+        return False  # no rule can fire, so only such a text is lexed
+    spliced = SPLICE.sub("", text)
+    if any(pattern.search(form) for form in (text, spliced) for pattern in UNLEXED_RAW_FORMS):
+        return any(QT69_NAME.search(view) for view in views)  # (3)
+    lines, refused = _logical_lines(spliced)
+    if refused or any(kind in TOKEN_BOUNDARY_KINDS for _, kind in _refused_forms(lines)):
+        return any(QT69_NAME.search(view) for view in views)  # (3)
+    return any(QT69_NAME.search(line) for _, line, _ in lines)  # (2)
+
+
+def files_needing_scan(texts: dict[str, str]) -> set[str]:
+    """The keys of `texts` whose text reaches a flipped or flip name (see the tripwire above)."""
+    return {key for key, text in texts.items() if _reaches_qt69_name(text)}
+
+
+def _tripwire_paths(root: Path) -> list[Path]:
+    """Every file git can carry under the roots (tracked, plus untracked and not ignored); every file
+    under them when `root` is not the top of a git work tree."""
+    try:
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=120)
+        listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--others",
+                                 "--exclude-standard", "--", *TRIPWIRE_ROOTS], capture_output=True, timeout=300)
+        git_ok = (top.returncode == 0 and listed.returncode == 0
+                  and Path(top.stdout.strip()).resolve() == root.resolve())
+    except (OSError, subprocess.SubprocessError):
+        git_ok = False
+    if git_ok:
+        paths = [root / name for name in listed.stdout.decode("utf-8", "surrogateescape").split("\0") if name]
+    else:
+        paths = [root / sub for sub in TRIPWIRE_ROOTS]
+    files: set[Path] = set()
+    for path in paths:
+        if path.is_dir():  # the no-git fallback, or a submodule gitlink
+            files.update(p for p in path.rglob("*") if p.is_file())
+        elif path.is_file():
+            files.add(path)
+    return sorted(files)
+
+
+def _tripwire_texts(root: Path = ROOT) -> dict[str, str]:
+    # surrogateescape keeps the bytes exact, so a wide-charset reading stays aligned (adversary r3 pass 6 A1).
+    return {str(path): path.read_bytes().decode("utf-8", errors="surrogateescape") for path in _tripwire_paths(root)}
 
 
 def _pp_int(token: str) -> int | None:
@@ -284,6 +487,11 @@ def _refused_forms(lines: list[Line]) -> list[tuple[int, str]]:
         for kind, pattern in (("digraph", DIGRAPH), ("token-paste", TOKEN_PASTE), ("non-ascii", NOT_PRINTABLE_ASCII),
                               ("dollar", DOLLAR)):
             refused.extend((_physical(where, m.start(), number), kind) for m in pattern.finditer(line))
+        # r2 (card PLAYER-TOOLBAR-QT5-GPUDISPLAY-FLIPPED-1): a pp-number the lexer read with a digit
+        # separator. C++11 (the Qt 5 Linux kit, MLVApp.pro:176) and C99 end the number at the ', which
+        # opens a char literal there, so where the literal ends is not certain.
+        refused.extend((_physical(where, token.start(1) + token.group(1).index("'"), number), "digit-separator")
+                       for token in _PP_TOKEN.finditer(line) if token.group(1) and "'" in token.group(1))
         name = DIRECTIVE_NAME.match(line)
         if name and name.group(1) not in MODELLED_DIRECTIVES:
             refused.append((_physical(where, name.start(1), number), "unknown-directive"))
@@ -388,6 +596,256 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
                     + "; ".join(f"line {n}: {api}: {src}" for n, api, src in hits),
                 )
 
+    def test_every_file_reaching_a_qt69_qimage_name_is_scoped(self) -> None:
+        # Tripwire: an unscoped file with `.flipped`, `->flip`, `::flipped`, ... fails here, so the
+        # strict scanner above is made to read it. See QT69_MEMBER_USE for what it does not promise.
+        scoped = {str(path) for path in SCOPED_HEADERS}
+        unscoped = sorted(files_needing_scan(_tripwire_texts()) - scoped)
+        self.assertFalse(
+            unscoped,
+            "a file reaches QImage::flipped/flip (Qt 6.9+); add the file to SCOPED_HEADERS so the "
+            "strict scanner reads it: " + "; ".join(unscoped),
+        )
+
+    def test_the_tripwire_flags_member_and_qualified_accesses_only(self) -> None:
+        flagged = ("img.flipped(Qt::Vertical)", "p->flip(Qt::Horizontal)", "&QImage::flipped", "img . flipped")
+        for text in flagged:
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # GpuDisplayViewport.cpp:43 on 284f00be has the first one, in a comment, and :1382 the second.
+        # Since adversary r1 A1 a bare `flipped` token in code is a use, so the prose two are fed as
+        # the comments they are in the tree.
+        not_flagged = ("/* vertically flipped (upside down) */", "// y-flipped", "flippedCopy", "unflipped()")
+        for text in not_flagged:
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_the_tripwire_sees_through_comments_line_breaks_and_splices(self) -> None:
+        # adversary r1 A1 (792b6c2e): a comment between the accessor and the name hid the call from
+        # the raw regex. Its input, on the real GpuDisplayViewport.cpp, and every sibling form.
+        viewport = (ROOT / "platform" / "qt" / "GpuDisplayViewport.cpp").read_text(encoding="utf-8")
+        self.assertIn('if ( image.save(path, "PNG") )', viewport)
+        a1 = viewport.replace('if ( image.save(path, "PNG") )',
+                              'if ( image./*orientation*/flipped(Qt::Vertical).save(path, "PNG") )')
+        self.assertEqual(files_needing_scan({"GpuDisplayViewport.cpp": a1}), {"GpuDisplayViewport.cpp"})
+        for text in ("img./*c*/flipped()", "img->/* a\n b */flip(Qt::Horizontal)", "img.// c\nflipped()",
+                     "img.\nflipped()", "img\n.\nflip()", "&QImage::\r\nflipped", "img.fl\\\nipped()",
+                     "img.fl\\ \r\nipped()", "img./**/ /**/flipped()", "auto f = flipped;",
+                     "#define F flipped\nimg.F();", "using QImage::flip;", "x(); img.flipped(); /* */"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A name only in a comment or a string literal is not a use, as the strict scanner reads it.
+        for text in ('auto s = "flipped"; // y-flipped\n', "/* img. */ x(); /* flipped */\n",
+                     "auto c = 'f'; // flip\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_an_unlexable_text_is_read_for_the_name_after_ucns_and_splices(self) -> None:
+        # Where the lexer refuses (a raw string, a backslash in code, a header-name it cannot read, a
+        # trigraph or a control byte), the tripwire fails toward scanning: it looks for a flipped or
+        # flip token anywhere, comments and literals included, once NULs are dropped, every splice is
+        # joined and every universal-character-name is decoded.
+        for text in ('auto s = R"(x)"; auto f = &QImage::fl\\u0069pped;', 'auto s = R"(x)"; // flip',
+                     "auto p = img.fl\\u0069pped();", "auto p = img.fl\\U00000069pped();",
+                     "auto p = img.fl\\u{69}pped();", "auto p = img.fl\\N{LATIN SMALL LETTER I}pped();",
+                     "??= x(); flip", "x();\x00 flipped", "f\x00l\x00i\x00p\x00p\x00e\x00d\x00",
+                     "auto p = img.fl??/\nipped();", "auto p = img.fl\\\x00\nipped();"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A refused text without the token: a Windows path is not a UCN, a binary with `flipX` is not
+        # the name, and a UCN that decodes to an identifier character joins the token it touches.
+        for text in ('auto s = R"(x)";', "auto c = \\n;", "??= x();", 'auto s = R"(C:\\Users\\a)"; // flippedCopy',
+                     "x();\x00 flippedCopy", "\x89PNG\x00\x01flipX\x7f\\u0066lipz", "auto p = \\u00e9flipped;"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_the_tripwire_does_not_lex_a_text_whose_token_ends_it_cannot_trust(self) -> None:
+        # adversary r1 pass 3 A1 (e6717ff8): a `$` joins `a$1` into one identifier for the compiler,
+        # but the lexer read `1'x` as a pp-number with a digit separator, and its next ' opened a char
+        # literal that hid the call. Its input, on the real GpuDisplayViewport.cpp (in memory).
+        viewport = (ROOT / "platform" / "qt" / "GpuDisplayViewport.cpp").read_text(encoding="utf-8")
+        anchor = '    if ( image.save(path, "PNG") )'
+        self.assertIn(anchor, viewport)
+        a1 = viewport.replace(anchor, "#define MLV_REVIEW_SECOND(a, b) b\n    const QImage reviewImage = "
+                              "MLV_REVIEW_SECOND(a$1'x', image . /*orientation*/ flipped(Qt::Vertical));\n"
+                              "#undef MLV_REVIEW_SECOND\n" + anchor)
+        self.assertEqual(files_needing_scan({"GpuDisplayViewport.cpp": a1}), {"GpuDisplayViewport.cpp"})
+        # Every sibling form that moves where a token or a literal ends goes to rule 3: a non-ASCII
+        # identifier character (U+00B7); a digit separator, which the Qt 5 Linux kit (C++11,
+        # MLVApp.pro:176) and a C99 file read as the end of the number and a char literal; a digraph
+        # directive whose header-name the lexer reads as a comment, also with a line-spanning comment
+        # or a splice before it; and an include_alias header-name.
+        call = "image . /**/ flipped(Qt::Vertical));\n"
+        hidden = "auto r = image .\nflipped(Qt::Vertical); // */\n"
+        for text in ("#define S(a, b) b\nauto r = S(a$1'x', " + call,
+                     "#define S(a, b) b\nauto r = S(a·1'x', " + call,
+                     "#define S(a, b) b\nauto r = S(1'x', " + call,
+                     "%:include <QImage/*>\n" + hidden, "%: include /*\n*/ <QImage/*>\n" + hidden,
+                     "%:inc\\\nlude <QImage/*>\n" + hidden, "#pragma include_alias(<a/*>, <b>)\n" + hidden,
+                     "auto n = 1'000; // flipped\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # Proven inert, read by rule 2 or already by rule 3: `@` and a backtick are single tokens to
+        # GCC, Clang and MSVC; a splice inside a literal is joined before lexing, as phase 2 does; a raw
+        # string after a `$` and a UCN in a literal.
+        for text in ('auto s = @"x"; auto r = ' + call, "auto s = `a`; auto r = " + call,
+                     'auto s = "a\\\n"; auto r = ' + call, "auto c = 'a\\\n'; auto r = " + call,
+                     'auto s = a$R"(x)"; auto r = ' + call, 'auto s = "\\u0022"; auto r = ' + call):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A text with none of the names is still not flagged, whatever it holds.
+        for text in ("auto n = 1'000; auto s = a$b; %:include <a/*>\n", "auto r = a·b; // mirrored\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_rule_3_does_not_merge_a_name_with_what_a_compiler_keeps_apart(self) -> None:
+        # adversary r2 pass 1 A1 (c541efac): rule 3 dropped every NUL, so `flipped\0MLV_REVIEW_EMPTY`
+        # read as one identifier, but GCC reads a NUL as whitespace and the empty macro leaves
+        # image.flipped(Qt::Vertical). Its input, as a header GpuDisplayViewport.cpp includes (in memory).
+        viewport = (ROOT / "platform" / "qt" / "GpuDisplayViewport.cpp").read_text(encoding="utf-8")
+        header = ("#include <QImage>\n#define MLV_REVIEW_EMPTY\ninline QImage qt69Readback(QImage image) {\n"
+                  "    return image .\n        flipped\x00MLV_REVIEW_EMPTY(Qt::Vertical);\n}\n#undef MLV_REVIEW_EMPTY\n")
+        texts = {"GpuDisplayViewport.cpp": '#include "Qt69Readback.h"\n' + viewport, "Qt69Readback.h": header}
+        self.assertEqual(files_needing_scan(texts), {"Qt69Readback.h"})
+        # Siblings: a NUL before the name, and a `??/` splice after it, which GCC and Clang do not join
+        # without -trigraphs. A NUL dropped (a UTF-16 file) and a joined `??/` still count as well.
+        for text in ("x();\nauto r = MLV_E\x00flipped(Qt::Vertical);\n", "x();\nauto r = MLV_E\x00flip;\n",
+                     "auto r = image .\nflipped??/\nMLV_E(Qt::Vertical);\n", "auto r = flip??/\nX;\n",
+                     "f\x00l\x00i\x00p\x00\n", "auto r = image .\nfl??/\nipped();\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        for text in ("x();\x00 flippedCopy\n", "auto r = flippedCopy??/\nX;\n", "x(); \x00unflip\x00ped\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_rule_3_drops_the_nuls_of_a_utf16_text_before_it_reads_line_ends(self) -> None:
+        # adversary r2 pass 2 A1 (1c3a909d): CR was read as a line end before the NULs were dropped,
+        # so a UTF-16 CRLF (`\r\0\n\0`) became two line breaks and a splice joined only the first one,
+        # leaving `fl\nipped`. Its input, and both names, both byte orders and both splice forms.
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+            for head, tail in (("fl", "ipped"), ("fl", "ip")):
+                for splice in ("\\", "??/", "\\ "):
+                    for eol in ("\r\n", "\r", "\n"):
+                        source = (f"#include <QImage>{eol}inline QImage qt69Readback(const QImage &image) {{{eol}"
+                                  f"    return image .{eol}        {head}{splice}{eol}{tail}(Qt::Vertical);{eol}}}{eol}")
+                        text = source.encode(encoding).decode("utf-8", errors="replace")
+                        with self.subTest(encoding=encoding, name=head + tail, splice=splice, eol=repr(eol)):
+                            self.assertEqual(files_needing_scan({"Qt69Readback.h": text}), {"Qt69Readback.h"})
+        # A UTF-16 text with only a longer name is still not flagged.
+        text = "auto r = image.flippedCopy();\r\n".encode("utf-16").decode("utf-8", errors="replace")
+        self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_rule_3_decodes_a_wide_charset_before_it_reads_a_source_nul(self) -> None:
+        # adversary r3 pass 6 A1 (e47e4787): a UTF-16 source holding a real U+0000 (`flipped\0EMPTY`) was
+        # read only with every zero byte dropped (`flippedEMPTY`) or read as a space (`f l i p p e d`), so
+        # neither view held the name. GCC with -finput-charset=UTF-16LE decodes the charset first and then
+        # reads the U+0000 as whitespace. Its input, both names, both byte orders and a BOM, and UTF-32.
+        for head in ("flipped", "flip"):
+            source = f"#define EMPTY\n#define QT69_READBACK(image) image . /**/ {head}\x00EMPTY(Qt::Vertical)\n"
+            for encoding in ("utf-16-le", "utf-16-be", "utf-16", "utf-32-le", "utf-32-be", "utf-32"):
+                text = source.encode(encoding).decode("utf-8", errors="replace")
+                with self.subTest(name=head, encoding=encoding):
+                    self.assertEqual(files_needing_scan({"platform/qt/Qt69Readback.h": text}),
+                                     {"platform/qt/Qt69Readback.h"})
+        # Each route the byte prefilter (WIDE_BYTES_NEEDED) lets through, with the U+0000 after the name:
+        # a UCN, a splice with a U+0000 (whitespace to GCC) before its CRLF, and a `??/` splice.
+        for spelled in ("fl\\u0069pped", "fl\\\x00\r\nipped", "fl??/\nipped"):
+            source = f"auto r = image . /**/ {spelled}\x00EMPTY(Qt::Vertical);\n"
+            for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+                text = source.encode(encoding).decode("utf-8", errors="replace")
+                with self.subTest(spelled=spelled, encoding=encoding):
+                    self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A wide text with only a longer name is still not flagged.
+        for source in ("auto r = image.flippedCopy\x00X();\n", "auto r = image.unflipped();\n"):
+            for encoding in ("utf-16-le", "utf-32-be"):
+                text = source.encode(encoding).decode("utf-8", errors="replace")
+                with self.subTest(source=source, encoding=encoding):
+                    self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_ucn_decoding_never_deletes_text_a_compiler_reads_as_code(self) -> None:
+        # fable r2 B1 (956d41f8): `\N{([^}\n]*)}` ran over comments and literals, so a `\N{` in a comment
+        # and a `}` later on the line swallowed the call between them; the failed name lookup became
+        # `?`, no view held `flip`, and the pre-check returned False before rule 2 or rule 3. A compiler
+        # decodes neither: it sees image.flipped(Qt::Vertical). Fable's two inputs (rule 2, and rule 3
+        # after a raw string), the phase 1 raw-string and escaped-backslash forms, a UCN-spelled name
+        # inside the swallowed span (an undecoded view alone misses it), with a lookup that fails on
+        # the whole span, and a `??/` that spells a UCN's backslash under -trigraphs.
+        call = "auto r = image . /**/ flipped(Qt::Vertical);"
+        for text in ("/* \\N{ */ " + call + " /* } */\n",
+                     'auto s = R"(x)"; /* \\N{ */ ' + call + " /* } */\n",
+                     'const char *a = R"(\\N{)"; QImage r = image./**/flipped(Qt::Vertical); const char *b = "}";\n',
+                     'auto s = "\\\\N{"; QImage r = image./**/flipped(Qt::Vertical); auto t = "}";\n',
+                     "/* \\N{ */ auto r = img.fl\\u0069pped(Qt::Vertical); /* } */\n",
+                     "/* \\N{ */ auto r = img.fl\\u0069pped(); /* LATIN } */\n",
+                     "auto p = img.fl??/u0069pped();\n", "auto p = img.fl??/N{LATIN SMALL LETTER I}pped();\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), {"f"})
+        # A well-formed escape is still decoded, and a name the decoding joins to a letter is not one.
+        for text in ('auto s = R"(\\N{LATIN SMALL LETTER A})"; auto r = x; // flippedCopy\n',
+                     "/* \\N{ */ auto r = img.fl\\u0069ppedCopy(); /* } */\n", "auto p = \\u00e9flipped;\n"):
+            with self.subTest(text=text):
+                self.assertEqual(files_needing_scan({"f": text}), set())
+
+    def test_a_digit_separator_in_code_is_refused(self) -> None:
+        # r2 sibling of adversary r1 pass 3 A1: the Qt 5 Linux kit compiles C++11 (MLVApp.pro:176),
+        # where `1'x'` is the number 1 and a char literal, not a pp-number; read as C++14 the next '
+        # opened a char literal that hid the call. A digit separator in code is refused.
+        self.assertRefused("#define S(a, b) b\nreturn S(1'x', image.flipped(Qt::Horizontal));\n",
+                           ["digit-separator"], [2])
+        for source in ("const int n = 1'000;\n", "auto d = .5'0;\n", "auto h = 0x1'f;\n",
+                       "#if QT_VERSION >= QT_VERSION_CHECK(6, 1'0, 0)\n#endif\n"):
+            with self.subTest(source=source):
+                self.assertRefused(source, ["digit-separator"], [1])
+        # A ' after a number that no digit or nondigit follows is a char literal, and in a comment or a
+        # literal a separator is text.
+        self.assertEqual(unguarded_newer_api_calls("auto c = f(1,'x'); // 1'000\nauto s = \"2'0\";\n"), [])
+
+    def test_the_tripwire_reads_every_file_under_the_roots(self) -> None:
+        # adversary r1 A2 (792b6c2e): a suffix allowlist skipped the .cc files MLVApp.pro compiles
+        # (MLVApp.pro:301-314). adversary r1 pass 2 A1, A2 (54e0a825): the doc/build-file filter that
+        # replaced it was beaten by an #include its regex did not read, and by a transitive one.
+        # Every file git can carry under the roots is read now, whatever its suffix or content.
+        texts = _tripwire_texts()
+        ahd = ROOT / "src" / "librtprocess" / "src" / "demosaic" / "ahd.cc"
+        self.assertTrue(str(ahd) in texts, f"the tripwire does not read {ahd}")
+        injected = dict(texts)
+        injected[str(ahd)] = ("#include <QImage>\nstatic QImage qt69Readback(const QImage &image) "
+                              "{ return image.flipped(Qt::Vertical); }\n" + texts[str(ahd)])
+        self.assertIn(str(ahd), files_needing_scan(injected))
+        tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", *TRIPWIRE_ROOTS],
+                                 capture_output=True, check=True).stdout.decode("utf-8").split("\0")
+        unread = sorted(name for name in tracked if name and (ROOT / name).is_file() and str(ROOT / name) not in texts)
+        self.assertEqual(len(unread), 0, f"the tripwire does not read tracked files: {unread[:20]}")
+        # The pass 2 inputs, in a tree that is not a git work tree (every file under the roots).
+        payload = (b"#include <QImage>\nstatic QImage qt69Readback(const QImage &image) "
+                   b"{ return image.flipped(Qt::Vertical); }\n")
+        files = {
+            "platform/qt/GpuDisplayViewport.cpp":
+                b'#include /*orientation*/ "qt69-readback.txt"\n#include "qt69-outer.md"\nx();\n',
+            "platform/qt/qt69-readback.txt": payload,
+            "platform/qt/qt69-outer.md": b'#include "qt69-inner.txt"\n',
+            "platform/qt/qt69-inner.txt": payload,
+            "platform/qt/Makefile.qt69.cpp": payload,
+            "platform/qt/Makefile": b"GpuDisplayWindow.o: C:\\Users\\x\\flipper.cpp\n",
+            "src/k/nul.txt": b"x();\x00 auto f = flipped;\n",
+            "src/k/icon.png": b"\x89PNG\x00\x01flipX\x00",
+            # adversary r3 pass 6 A1: a UTF-16 header with a source U+0000 after the name. U+82E2 is the
+            # bytes E2 82, a cut UTF-8 sequence that a lossy decode turns into one U+FFFD; the file is
+            # read byte-exact, so its UTF-16 code units stay aligned.
+            "src/k/wide.h": ("// 苢\n#define EMPTY\nauto r = image . /**/ flipped\x00EMPTY(Qt::Vertical);\n"
+                             ).encode("utf-16-le"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, data in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes(data)
+            texts = _tripwire_texts(root)
+            self.assertEqual(sorted(texts), sorted(str(root / name) for name in files))
+            expected = ("platform/qt/qt69-readback.txt", "platform/qt/qt69-inner.txt",
+                        "platform/qt/Makefile.qt69.cpp", "src/k/nul.txt", "src/k/wide.h")
+            self.assertEqual(files_needing_scan(texts), {str(root / name) for name in expected})
+
     def test_scanner_flags_the_09077b0d_shape(self) -> None:
         # r1's own line: proves the guard bites on the defect it exists for.
         fixture = (
@@ -473,7 +931,8 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         )
         self.assertEqual(unguarded_newer_api_calls(fixture), [])
         self.assertEqual(len(unguarded_newer_api_calls('const char *s = "//"; auto p = i.flipped();\n')), 1)
-        self.assertEqual(len(unguarded_newer_api_calls("const int n = 1'000; auto p = i.flipped();\n")), 1)
+        # r2: a digit separator is refused (test_a_digit_separator_in_code_is_refused).
+        self.assertRefused("const int n = 1'000; auto p = i.flipped();\n", ["digit-separator"], [1])
 
     def assertRefused(self, source: str, kinds: list[str], lines: list[int] | None = None) -> None:
         # r5 GRAMMAR: a refused form makes the whole file unprovable; only refusals are reported.
@@ -589,7 +1048,6 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
             ("6", "0x9", "0"),
             ("6", "0X0A", "0"),
             ("6", "0b1001", "0"),
-            ("6", "1'0", "0"),  # 10, digit separator
             ("6u", "9U", "0ul"),
             ("6LL", "9llu", "0"),
             ("06", "9", "0"),
@@ -658,6 +1116,11 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
                        "F(1'é\"', image.flipped());\n"):
             with self.subTest(source=source):
                 self.assertEqual(len(unguarded_newer_api_calls(source)), 1)
+        # r2: each separator above is now refused as such, and `1'"'` / `1'é"'` are char literals.
+        for source, kind in (("auto d = .5'0; return image.flipped();\n", "REFUSED digit-separator"),
+                             ("F(1'\"', image.flipped());\n", "flipped"), ("F(1'é\"', image.flipped());\n", "flipped")):
+            with self.subTest(source=source):
+                self.assertEqual([api for _, api, _ in unguarded_newer_api_calls(source)], [kind])
         # A char literal after an identifier with a digit (u8'x') is still a literal.
         self.assertEqual(unguarded_newer_api_calls("auto c = u8'f'; auto d = U'\"'; x();\n"), [])
         self.assertEqual(len(unguarded_newer_api_calls("auto c = u8'\"'; auto p = i.flipped();\n")), 1)
@@ -934,7 +1397,7 @@ class PlayerTransportToolbarQtCompatTests(unittest.TestCase):
         # literal to them, but the scanner read `1'x` as a pp-number and its next ' opened a char
         # literal that hid the call. r7 refuses a `$` in code; in a comment or a literal it is text.
         source = "#define SECOND(a, b) b\nreturn SECOND(a$1'x', image.flipped(Qt::Horizontal));\n"
-        self.assertRefused(source, ["dollar"], [2])
+        self.assertRefused(source, ["dollar", "digit-separator"], [2])  # r2: `1'x` is refused too
         self.assertRefused("auto a$b = 1;\n", ["dollar"], [1])
         self.assertEqual(unguarded_newer_api_calls('// $x\nauto s = "$"; auto c = \'$\';\n'), [])
 
