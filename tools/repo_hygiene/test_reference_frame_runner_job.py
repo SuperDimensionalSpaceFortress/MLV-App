@@ -462,6 +462,16 @@ class GeneratorTests(_GeneratorCase):
         codes = [code for code, _ in steps]
         self.assertEqual(len(codes), len(set(codes)), f"two documented steps share a code: {steps}")
 
+    def test_both_record_reads_of_the_recon_gate_start_at_the_record_start_in_the_emitted_job(self) -> None:
+        # adversary A1 on 973b6efa: a record is read only where it STARTS the line, after the app's [utc] [LEVEL] [0x<thread>] prefix. The summary-session read
+        # is anchored too (a forged 'playback_smoke.summary session=9 ' inside another record's text must not move the measured session). That forgery cannot
+        # be run end to end -- the capture's own receipt oracle refuses such a log first (exit 43) -- so the anchor is pinned as text; the gpu_summary forgery
+        # runs end to end in EmittedJobOnAFixtureAgentRootTests.
+        on = self.generate_job("recon-on-anchor", "-GpuPlaybackRecon", "on")
+        self.assertIn(r"$reconRecordStart = '^(?:\[[^\]]*\] ){0,3}'", on)
+        self.assertIn(r"[regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.summary session=([0-9]+) ')", on)
+        self.assertIn(r"[regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.gpu_summary session=' + $reconSession + ' (?<rest>.*)$')", on)
+
     def test_a_recon_value_other_than_off_or_on_is_refused_with_a_typed_code_and_no_job_is_written(self) -> None:
         for label, value in (("yes", "yes"), ("upper", "ON"), ("one", "1"), ("empty", "")):
             proc, out = self.generate(f"recon-bad-{label}", "-GpuPlaybackRecon", value)
@@ -653,6 +663,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((self.artifacts() / "capture" / "reference-frame-candidate.json").exists())
 
     # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
+    APP_LOG_PREFIX = "[2026-11-20T00:00:00.000Z] [info] [0x1] "
+
     def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None,
                              more_edits: tuple[tuple[str, str], ...] = (), generator_args: tuple[str, ...] = (),
                              env_probe: Path | None = None, app_log_extra: str = "") -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
@@ -668,7 +680,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         app_dir = self.tmp / "stand-in-app"
         app_dir.mkdir(exist_ok=True)
         log_template = app_dir / "app.log.template"
-        log_template.write_text("t0 playback_smoke.start session=1\nt1 " + oracle_tests._good_line() + "\n" + app_log_extra, encoding="utf-8")
+        # the app's own record prefix ([utc] [LEVEL] [0x<thread>] ), which the recon evidence gate anchors on
+        log_template.write_text(self.APP_LOG_PREFIX + "playback_smoke.start session=1\n" + self.APP_LOG_PREFIX + oracle_tests._good_line() + "\n" + app_log_extra, encoding="utf-8")
         grab = app_dir / "grab.template"
         grab.write_bytes(b"\0" * 65536)
         args_file = app_dir / "app-args.json"
@@ -745,7 +758,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
                          suffix: str = "") -> str:
         """The app's playback_smoke.gpu_summary record (MainWindow.cpp prints exactly these fields), after the stand-in's summary line (session=0).
         suffix is whatever the log's message pattern appends after the six fields (for example a source location)."""
-        return (f"t2 playback_smoke.gpu_summary session={session} cpu_frames={cpu} gpu_preview_frames=0 gpu_recon_readback_frames={recon} "
+        return (f"{EmittedJobOnAFixtureAgentRootTests.APP_LOG_PREFIX}playback_smoke.gpu_summary session={session} cpu_frames={cpu} gpu_preview_frames=0 gpu_recon_readback_frames={recon} "
                 f"gpu_texture_readback_frames={texture_readback} gpu_texture_no_readback_frames={texture_no_readback}{suffix}\n")
 
     def test_a_recon_on_job_launches_the_app_with_the_recon_env_and_records_it_in_result_json(self) -> None:
@@ -817,6 +830,15 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         # the same class without a separating token: a repeated key inside the contiguous key=value run is ambiguous, so it is unproven (never last-wins)
         self.assert_recon_not_proven("recon-duplicate-counter", self.gpu_summary_line(cpu=480, recon=0, suffix=" cpu_frames=0 gpu_recon_readback_frames=480"),
                                      "COUNTER_DUPLICATE")
+
+    # --- adversary A1 on 973b6efa (pass 3, introduced major): a record is read only where it STARTS the record body, never as text inside another record ---
+    FORGED_GPU_SUMMARY = ("playback_smoke.gpu_summary session=0 cpu_frames=0 gpu_preview_frames=0 gpu_recon_readback_frames=480 "
+                          "gpu_texture_readback_frames=0 gpu_texture_no_readback_frames=0 x")
+
+    def test_a_recon_on_capture_whose_later_record_carries_a_forged_gpu_summary_in_its_location_is_not_a_candidate(self) -> None:
+        # the adversary's input: the real record says 480 CPU frames; a LATER record (overlap_summary) carries a build path that spells a whole gpu_summary
+        later = f"{self.APP_LOG_PREFIX}playback_smoke.overlap_summary session=0 frames=480 (C:/b {self.FORGED_GPU_SUMMARY}/platform/qt/MainWindow.cpp:1)\n"
+        self.assert_recon_not_proven("recon-forged-later-record", self.gpu_summary_line(cpu=480, recon=0) + later, "CPU_FRAMES_NONZERO")
 
     def test_a_recon_on_capture_with_the_real_counters_and_a_trailing_source_location_is_still_a_candidate(self) -> None:
         # the gate must not turn a harmless suffix into a false refusal: the location here carries no counter-shaped token

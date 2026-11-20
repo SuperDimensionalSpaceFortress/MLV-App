@@ -375,8 +375,11 @@ if ($captureRc -eq 0) {
         if ($null -eq $reconAppLog) { throw 'APP_LOG_ABSENT' }
         $reconLogLines = @([IO.File]::ReadAllLines($reconAppLog.FullName))
         $reconSession = $null
+        # A record is read only where it STARTS the line, after the app's own prefix ([utc] [LEVEL] [0x<thread>] ), never as text inside another record
+        # (a build path or a source location in a later record's tail can spell a whole summary line).
+        $reconRecordStart = '^(?:\[[^\]]*\] ){0,3}'
         foreach ($reconLine in $reconLogLines) {
-            $reconMatch = [regex]::Match($reconLine, 'playback_smoke\.summary session=([0-9]+) ')
+            $reconMatch = [regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.summary session=([0-9]+) ')
             if ($reconMatch.Success) { $reconSession = $reconMatch.Groups[1].Value }
         }
         if ($null -eq $reconSession) { throw 'SUMMARY_LINE_ABSENT' }
@@ -384,7 +387,7 @@ if ($captureRc -eq 0) {
         $reconFields = $null
         $reconDuplicate = ''
         foreach ($reconLine in $reconLogLines) {
-            $reconMatch = [regex]::Match($reconLine, 'playback_smoke\.gpu_summary session=' + $reconSession + ' (?<rest>.*)$')
+            $reconMatch = [regex]::Match($reconLine, $reconRecordStart + 'playback_smoke\.gpu_summary session=' + $reconSession + ' (?<rest>.*)$')
             if ($reconMatch.Success) {
                 # Only the contiguous run of key=value tokens right after the session is the app's record. Whatever the log's message pattern appends after it
                 # (a source location, which can itself spell counter-shaped text) is never read, and a key repeated inside the run is ambiguous: unproven, never last-wins.
