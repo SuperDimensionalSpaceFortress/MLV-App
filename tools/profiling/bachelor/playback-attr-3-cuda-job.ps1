@@ -7903,7 +7903,8 @@ function Get-ClocksPowerSeries($Values, [string]$MissingReason) {
     if ($v.Count -eq 0) { return ('UNAVAILABLE(' + $MissingReason + ')') }
     $s = @($v | Sort-Object)
     $mid = [int][math]::Floor($s.Count / 2)
-    $med = $(if ($s.Count % 2 -eq 1) { $s[$mid] } else { ($s[$mid - 1] + $s[$mid]) / 2.0 })
+    # halves added, not the sum halved: two huge finite values must not overflow to an infinite median (adversary de9ca8e7 A5)
+    $med = $(if ($s.Count % 2 -eq 1) { $s[$mid] } else { ($s[$mid - 1] / 2.0) + ($s[$mid] / 2.0) })
     [ordered]@{ n = $s.Count; min = [math]::Round($s[0], 3); median = [math]::Round($med, 3); max = [math]::Round($s[$s.Count - 1], 3) }
 }
 
@@ -7977,6 +7978,7 @@ function ConvertFrom-ClocksPowerCpuCsv($Text, [TimeZoneInfo]$Zone) {
     $r.hasPkgPower = ($iPkg -ge 0)
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $num = { param($f, $i) $x = 0.0; if ($i -ge 0 -and $i -lt $f.Count -and [double]::TryParse($f[$i].Trim(), [Globalization.NumberStyles]::Float, $inv, [ref]$x) -and -not [double]::IsNaN($x) -and -not [double]::IsInfinity($x)) { $x } else { $null } }
+    $prevUtc = $null
     for ($k = 1; $k -lt $all.Count; $k++) {
         $r.lines++
         $f = @([regex]::Matches($all[$k], '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
@@ -7990,7 +7992,10 @@ function ConvertFrom-ClocksPowerCpuCsv($Text, [TimeZoneInfo]$Zone) {
         if ($null -ne $perf -and $null -ne $freq) { $eff = [math]::Round($freq * $perf / 100.0, 3) }
         $pkg = $null
         if ($null -ne $raw) { $pkg = [math]::Round($raw / 1000.0, 3) }
-        $r.rows.Add([ordered]@{ stamp = $f[0]; utc = $utc; perfPct = $perf; nominalMhz = $freq; effectiveMhz = $eff; pkgPowerW = $pkg })
+        # adversary de9ca8e7 A1: a typeperf row is an INTERVAL value (a rate counter over the second before its stamp), so it carries where its interval began:
+        # the previous row's stamp (fromUtc); the first row has no known start ($null) and the interval-row window rule leaves it out
+        $r.rows.Add([ordered]@{ stamp = $f[0]; utc = $utc; fromUtc = $prevUtc; perfPct = $perf; nominalMhz = $freq; effectiveMhz = $eff; pkgPowerW = $pkg })
+        $prevUtc = $utc
     }
     if ($r.rows.Count -eq 0) { $r.why = $(if ($r.lines -eq 0) { 'typeperf-no-rows' } else { 'typeperf-unparseable' }) }
     $r
@@ -8092,7 +8097,8 @@ function Get-ClocksPowerCpuSummary($Parsed, $Start, $Window, $Stop = $null, $Clo
         $s.samplesTotal = $Parsed.rows.Count
         if ($Parsed.why) { return (& $fail "unavailable($($Parsed.why))" $Parsed.why) }
         if ($null -ne $Window) { $clockWhy = Get-ClocksPowerClockWhy $Parsed.rows $ClockCheck $true; if ($clockWhy) { return (& $fail "unavailable($clockWhy)" $clockWhy) } }
-        $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window)
+        # typeperf rows are interval values: a row counts only when its whole interval lies inside the window (adversary de9ca8e7 A1)
+        $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window $true)
         $s.samples = $in.Count
         if ($in.Count -eq 0) { return (& $fail 'unavailable(no-rows-in-window)' 'no-rows-in-window') }
         $s.status = $(if ($null -ne $Window) { 'ok' } else { 'partial(no_window)' })
@@ -8113,8 +8119,9 @@ function ConvertFrom-ClocksPowerPowerCfg([string]$Text) {
     [ordered]@{ name = $m.Groups[2].Value.Trim(); guid = $m.Groups[1].Value.ToLowerInvariant() }
 }
 
-# Win32_Battery records -> 'ac' | 'battery' | UNAVAILABLE(reason). BatteryStatus: 1 discharging, 4 low, 5 critical = battery; 2 AC, 3 charged,
-# 6-9 charging, 11 partly charged = on AC; any other value is named, never guessed. No battery record (a desktop) is its own reason.
+# Win32_Battery records -> 'ac' | 'battery' | UNAVAILABLE(reason). BatteryStatus: 1 discharging = battery; 2 (on AC) and 6-9 (charging) = on AC. Those are the
+# only values that say something about the power LINE: fully charged 3, low 4, critical 5, partly charged 11 describe the charge level, so they (and any
+# other value) are named UNAVAILABLE(battery-status-N), never guessed (adversary de9ca8e7 A3). No battery record (a desktop) is its own reason.
 function Get-ClocksPowerAcState($Batteries) {
     $b = @($Batteries)
     if ($b.Count -eq 0) { return 'UNAVAILABLE(no-battery-record)' }
@@ -8122,8 +8129,8 @@ function Get-ClocksPowerAcState($Batteries) {
     foreach ($x in $b) {
         $st = $null
         try { $st = [int]$x.BatteryStatus } catch { $other = 'unreadable'; continue }
-        if (@(2, 3, 6, 7, 8, 9, 11) -contains $st) { $ac = $true }
-        elseif (@(1, 4, 5) -contains $st) { $bat = $true }
+        if (@(2, 6, 7, 8, 9) -contains $st) { $ac = $true }
+        elseif ($st -eq 1) { $bat = $true }
         else { $other = [string]$st }
     }
     if ($ac -and -not $bat) { return 'ac' }
@@ -8149,9 +8156,17 @@ function ConvertFrom-ClocksPowerDisplay($Controllers) {
 # Once per leg, before the measured launch (never inside the window): power plan, AC state, display mode. Each read is its own try.
 function Get-ClocksPowerPlatform {
     $p = [ordered]@{ powerPlan = 'UNAVAILABLE(not-read)'; acState = 'UNAVAILABLE(not-read)'; display = 'UNAVAILABLE(not-read)' }
-    try { $p.powerPlan = ConvertFrom-ClocksPowerPowerCfg ((& powercfg.exe /getactivescheme 2>&1 | ForEach-Object { [string]$_ }) -join "`n") } catch { $p.powerPlan = 'UNAVAILABLE(powercfg-failed)' }
-    try { $p.acState = Get-ClocksPowerAcState @(Get-CimInstance -ClassName Win32_Battery -ErrorAction Stop) } catch { $p.acState = 'UNAVAILABLE(battery-cim-failed)' }
-    try { $p.display = ConvertFrom-ClocksPowerDisplay @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop) } catch { $p.display = 'UNAVAILABLE(display-cim-failed)' }
+    # adversary de9ca8e7 A2: every read here is bounded (powercfg: killed at 4 s; CIM: -OperationTimeoutSec 4), so a provider that never answers costs at most
+    # 4 s each (12 s in all) before the measured launch instead of holding the job
+    try {
+        $pcPath = [string]$env:SystemRoot + '\System32\powercfg.exe'
+        $pc = Invoke-ClocksPowerBounded $pcPath '/getactivescheme' 4000
+        if ($pc.timedOut) { $p.powerPlan = 'UNAVAILABLE(powercfg-timeout)' }
+        elseif (-not $pc.ok) { $p.powerPlan = 'UNAVAILABLE(powercfg-failed)' }
+        else { $p.powerPlan = ConvertFrom-ClocksPowerPowerCfg (($pc.lines) -join "`n") }
+    } catch { $p.powerPlan = 'UNAVAILABLE(powercfg-failed)' }
+    try { $p.acState = Get-ClocksPowerAcState @(Get-CimInstance -ClassName Win32_Battery -OperationTimeoutSec 4 -ErrorAction Stop) } catch { $p.acState = 'UNAVAILABLE(battery-cim-failed)' }
+    try { $p.display = ConvertFrom-ClocksPowerDisplay @(Get-CimInstance -ClassName Win32_VideoController -OperationTimeoutSec 4 -ErrorAction Stop) } catch { $p.display = 'UNAVAILABLE(display-cim-failed)' }
     $p
 }
 
@@ -8171,9 +8186,41 @@ function Resolve-ClocksPowerTypeperf {
 }
 
 # The Energy Meter counter paths this host lists (one short typeperf call, before the measured launch); an empty list when typeperf says nothing
-function Get-ClocksPowerCounterList([string]$TypeperfPath) {
-    try { if (-not [string]::IsNullOrEmpty($TypeperfPath)) { return , @(& $TypeperfPath -qx 'Energy Meter' 2>&1 | ForEach-Object { [string]$_ }) } } catch { }
-    , @()
+function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 4000, [string]$Arguments = '-qx "Energy Meter"') {
+    $r = [ordered]@{ lines = @(); why = $null }
+    if ([string]::IsNullOrEmpty($TypeperfPath)) { return $r }
+    $x = Invoke-ClocksPowerBounded $TypeperfPath $Arguments $TimeoutMs
+    if ($x.timedOut) { $r.why = 'energy-meter-enumeration-timeout' }
+    elseif (-not $x.ok) { $r.why = 'energy-meter-enumeration-failed' }
+    else { $r.lines = @($x.lines) }
+    $r
+}
+
+# adversary de9ca8e7 A2: one short external read, bounded. The tool runs in its own process; when it has not exited inside $TimeoutMs it is killed and the
+# result is timedOut (never waited for). ok = the tool ran to its exit; lines = its stdout. A tool that cannot start is ok=false, timedOut=false. This is the
+# ONLY Process.Start in the clocks helpers besides the two sampler starters, and it is for the pre-launch reads (powercfg, the Energy Meter listing).
+function Invoke-ClocksPowerBounded([string]$Path, [string]$Arguments, [int]$TimeoutMs) {
+    $r = [ordered]@{ ok = $false; timedOut = $false; lines = @() }
+    $p = $null
+    try {
+        $psi = [Diagnostics.ProcessStartInfo]::new($Path, $Arguments)
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $p = [Diagnostics.Process]::Start($psi)
+        $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($TimeoutMs)) {
+            $r.timedOut = $true
+            try { $p.Kill() } catch { }
+            try { [void]$p.WaitForExit(2000) } catch { }
+            return $r
+        }
+        [void]$outTask.Wait(2000); [void]$errTask.Wait(2000)
+        $text = ''
+        if ($outTask.IsCompleted) { $text = [string]$outTask.Result }
+        $r.lines = @($text -split "\r?\n" | Where-Object { $_ -ne '' })
+        $r.ok = $true
+    } catch { $r.ok = $false } finally { try { if ($null -ne $p) { $p.Dispose() } } catch { } }
+    $r
 }
 
 # ONE nvidia-smi for the window. The wake rule and the -f ownership are Start-UtilSampleGpu's. The throttle field is clocks_throttle_reasons.active; a
@@ -8416,7 +8463,7 @@ if ($clocksPowerEmit) {
     $cwOpen = '# BENCH-CLOCKS-POWER-LOG-1 >>>'
     $cwClose = '# BENCH-CLOCKS-POWER-LOG-1 <<<'
     $cwEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Get-ClocksPowerNetStepMs}, ${function:Get-ClocksPowerClockWhy}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
+    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Invoke-ClocksPowerBounded}, ${function:Get-ClocksPowerNetStepMs},${function:Get-ClocksPowerClockWhy}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
     $cwLaunchLine = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
     $cwDoneLine = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
     $cwStart = $cwOpen + "`n" + $cwFunctions + "`n" + "`$clocksPowerBackend = '$(([string]$Backend).ToLowerInvariant())'`n`$clocksPowerIntervalMs = [int]$ClocksPowerIntervalMs`n`$clocksPowerWarmup = `$$(if ([bool]$ClocksPowerWarmup) { 'true' } else { 'false' })`n" + @'
@@ -8447,7 +8494,9 @@ try { $clocksPowerPlatform = Get-ClocksPowerPlatform } catch { }
 try { $clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend (Resolve-UtilSampleNvidiaSmi) $clocksPowerGpuCsv ${function:Get-UtilSampleDgpuState} $clocksPowerIntervalMs } catch { }
 try {
     $clocksPowerTypeperf = Resolve-ClocksPowerTypeperf
-    $clocksPowerPkg = Resolve-ClocksPowerCounters (Get-ClocksPowerCounterList $clocksPowerTypeperf)
+    $clocksPowerList = Get-ClocksPowerCounterList $clocksPowerTypeperf
+    $clocksPowerPkg = Resolve-ClocksPowerCounters $clocksPowerList.lines
+    if ($clocksPowerList.why) { $clocksPowerPkg = [ordered]@{ pkgPath = $null; reason = $clocksPowerList.why } }
     $clocksPowerCounters = @('\Processor Information(_Total)\% Processor Performance', '\Processor Information(_Total)\Processor Frequency')
     if ($null -ne $clocksPowerPkg.pkgPath) { $clocksPowerCounters += [string]$clocksPowerPkg.pkgPath }
     $clocksPowerCpuStart = Start-ClocksPowerCpu $clocksPowerTypeperf $clocksPowerCpuCsv $clocksPowerIntervalMs $clocksPowerCounters
@@ -8518,10 +8567,11 @@ Write-JobTrace "step clocks-power summary status=$($clocksPowerBlock['status']) 
     }
 '@ + "`n    $cwClose`n"
     $text = Edit-ClocksPowerText $text $cwFinallyAnchor ($cwFinally + $cwFinallyAnchor) 'stop and publish the clocks/power samplers in the outer finally at'
-    # the worst stop path: region 2 (each side a kill and a 5 s wait) is 10 s, and the outer finally retries it twice more (20 s), plus the start's 1.2 s
-    # nvidia-smi argument-check wait and the Energy Meter counter listing: 45 s, as the util sampler budgets
-    $timeBudget['clocksPowerSec'] = 45
-    $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 45)
+    # the worst path (adversary de9ca8e7 A2: every pre-launch read is bounded, so this sum is a real bound): the start's four bounded reads (powercfg,
+    # Win32_Battery, Win32_VideoController, typeperf -qx: 4 s each = 16 s) plus the nvidia-smi argument-check wait (1.2 s), region 2 (each side a kill and a
+    # 5 s wait) 10 s, and the outer finally's two more retries (20 s) = 47.2 s, so 50 s
+    $timeBudget['clocksPowerSec'] = 50
+    $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 50)
 }
 
 $outDir = Split-Path -Parent $OutFile

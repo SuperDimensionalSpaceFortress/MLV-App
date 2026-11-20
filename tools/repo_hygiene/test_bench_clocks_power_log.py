@@ -157,7 +157,7 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         self.assertGreaterEqual(text.count("cpu-clocks.csv"), 1)
         # one sampler process per leg: Process.Start only inside the two Start- helpers (each called once), never in a loop
         body = "\n".join(region_re(OPEN, CLOSE).findall(text))
-        self.assertEqual(len(re.findall(r"\[Diagnostics\.Process\]::Start\(", body)), 2, "Start-UtilSampleGpu's nvidia-smi and Start-ClocksPowerCpu's typeperf, nothing else")
+        self.assertEqual(len(re.findall(r"\[Diagnostics\.Process\]::Start\(", body)), 3, "Start-UtilSampleGpu's nvidia-smi, Start-ClocksPowerCpu's typeperf, and Invoke-ClocksPowerBounded's one short read (adversary de9ca8e7 A2), nothing else")
         self.assertEqual(len(re.findall(r"Start-ClocksPowerGpu \$clocksPowerBackend", body)), 1)
         self.assertEqual(len(re.findall(r"Start-ClocksPowerCpu ", body)), 1)
         self.assertNotRegex(body, r"(?is)\b(?:foreach|while|for)\b[^{]*\{[^}]*Start-(?:ClocksPower|UtilSample)(?:Gpu|Cpu)")
@@ -194,6 +194,17 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
             calls = [ln for ln in body.splitlines() if re.search(r"\b" + summary + r"\b", ln) and parsed in ln]
             self.assertEqual(len(calls), 1, f"{summary} is called once with the parsed rows")
             self.assertTrue(calls[0].rstrip().endswith("$clocksPowerClockCheck"), f"{summary} gets the clock check as its 5th argument: {calls[0].strip()}")
+
+    def test_a2_no_pre_launch_read_is_unbounded(self) -> None:
+        text = lf(self.job("cp-cuda"))
+        body = "\n".join(region_re(OPEN, CLOSE).findall(text))
+        self.assertNotRegex(body, r"&\s*powercfg", "powercfg is read through Invoke-ClocksPowerBounded")
+        self.assertNotRegex(body, r"&\s*\$TypeperfPath", "typeperf -qx is read through Invoke-ClocksPowerBounded")
+        cim = [ln for ln in body.splitlines() if "Get-CimInstance" in ln]
+        self.assertTrue(cim, "the platform read queries CIM")
+        for ln in cim:
+            self.assertIn("-OperationTimeoutSec", ln, f"a CIM query that can wait forever: {ln.strip()}")
+        self.assertGreaterEqual(len(re.findall(r"Invoke-ClocksPowerBounded [\$']", body)), 2, "powercfg and the Energy Meter listing each go through it")
 
     def test_c2_a_non_cuda_leg_keeps_the_wake_rule_and_a_cuda_leg_discloses_it(self) -> None:
         text = lf(self.job("cp-cpu"))
@@ -263,10 +274,12 @@ $cpuText = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\BACHELOR\Processo
            "`"11/01/2026 08:00:04.000`",`"50.000000`",`"2000.000000`",`"5000.000000`"`n`"11/01/2026 08:00:05.0"
 $c = ConvertFrom-ClocksPowerCpuCsv $cpuText $cst
 $r['cpuParse'] = @{ rows = $c.rows.Count; torn = $c.tornTail; why = $c.why; hasPkg = $c.hasPkgPower; firstUtc = $c.rows[0].utc.ToString('o'); blank = ($null -eq $c.rows[3].perfPct); eff1 = $c.rows[1].effectiveMhz; eff3 = $c.rows[3].effectiveMhz; pkg1 = $c.rows[1].pkgPowerW }
-$cw = [ordered]@{ startUtc = $ws.AddMilliseconds(500); endUtc = $ws.AddMilliseconds(3500); clockWhy = $null }
+# adversary de9ca8e7 A1: typeperf rows are INTERVAL values (the row stamped T describes the second before T), so a row counts only when its whole interval
+# lies inside the window: the window opens half a second before the first interval row's start here, so rows 1..3 count and row 0 (no known start) does not
+$cw = [ordered]@{ startUtc = $ws.AddMilliseconds(-500); endUtc = $ws.AddMilliseconds(3500); clockWhy = $null }
 $cs = Get-ClocksPowerCpuSummary $c $running $cw $null $ckCpu
 $r['cpuWin'] = $cs
-$noPkgText = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n`"11/01/2026 08:00:01.000`",`"150.0`",`"2000.0`"`n"
+$noPkgText = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n`"11/01/2026 08:00:01.000`",`"150.0`",`"2000.0`"`n`"11/01/2026 08:00:02.000`",`"150.0`",`"2000.0`"`n"
 $np = Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv $noPkgText $cst) $running $cw $null $ckCpu
 $r['cpuNoPkg'] = @{ status = $np.status; pkg = $np.pkgPowerW; eff = $np.effectiveMhz }
 $r['cpuEmpty'] = (Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv '' $cst) $running $cw).status
@@ -276,6 +289,7 @@ $r['cpuNoWindow'] = (Get-ClocksPowerCpuSummary $c $running $null).status
 $ser = Get-ClocksPowerSeries @(3, 1, 2, 4) 'no-rows'
 $r['seriesEven'] = $ser
 $r['seriesEmpty'] = Get-ClocksPowerSeries @($null, $null) 'all-not-supported'
+$r['seriesBig'] = Get-ClocksPowerSeries @(1e308, 1e308) 'x'
 $r['seriesOne'] = Get-ClocksPowerSeries @(7) 'x'
 $blk = Get-ClocksPowerBlock $gs $cs ([ordered]@{ powerPlan = 'UNAVAILABLE(powercfg-failed)'; acState = 'ac'; display = 'UNAVAILABLE(cim-failed)' }) $win $true 1000 'gpu-clocks.csv' 'cpu-clocks.csv'
 $r['block'] = $blk
@@ -291,6 +305,11 @@ $r['acOn'] = Get-ClocksPowerAcState @(@{ BatteryStatus = 2 })
 $r['acOff'] = Get-ClocksPowerAcState @(@{ BatteryStatus = 1 })
 $r['acNoBattery'] = Get-ClocksPowerAcState @()
 $r['acUnknown'] = Get-ClocksPowerAcState @(@{ BatteryStatus = 99 })
+$r['acCharging'] = Get-ClocksPowerAcState @(@{ BatteryStatus = 6 })
+$r['acPartial11'] = Get-ClocksPowerAcState @(@{ BatteryStatus = [uint16]11 })
+$r['acFull3'] = Get-ClocksPowerAcState @(@{ BatteryStatus = [uint16]3 })
+$r['acLow4'] = Get-ClocksPowerAcState @(@{ BatteryStatus = 4 })
+$r['acChargeLevelPlusDischarging'] = Get-ClocksPowerAcState @(@{ BatteryStatus = 11 }, @{ BatteryStatus = 1 })
 $r['display'] = ConvertFrom-ClocksPowerDisplay @(@{ Name = 'NVIDIA GeForce RTX 3060 Laptop GPU'; CurrentHorizontalResolution = 2560; CurrentVerticalResolution = 1440; CurrentRefreshRate = 165 }, @{ Name = 'Intel(R) UHD'; CurrentHorizontalResolution = $null; CurrentVerticalResolution = $null; CurrentRefreshRate = $null })
 $r['displayNone'] = ConvertFrom-ClocksPowerDisplay @()
 $plat = Get-ClocksPowerPlatform
@@ -384,6 +403,7 @@ class ClocksPowerPureHelperTests(unittest.TestCase):
         self.assertEqual(self.r["seriesEven"], {"n": 4, "min": 1.0, "median": 2.5, "max": 4.0})
         self.assertEqual(self.r["seriesOne"], {"n": 1, "min": 7.0, "median": 7.0, "max": 7.0})
         self.assertEqual(self.r["seriesEmpty"], "UNAVAILABLE(all-not-supported)")
+        self.assertEqual(self.r["seriesBig"], {"n": 2, "min": 1e308, "median": 1e308, "max": 1e308}, "adversary de9ca8e7 A5: the median of two huge finite values is not their overflowed sum")
 
     def test_c4_the_block_carries_window_warm_up_platform_and_files(self) -> None:
         b = self.r["block"]
@@ -412,6 +432,12 @@ class ClocksPowerPureHelperTests(unittest.TestCase):
         self.assertEqual((self.r["acOn"], self.r["acOff"]), ("ac", "battery"))
         self.assertEqual(self.r["acNoBattery"], "UNAVAILABLE(no-battery-record)")
         self.assertEqual(self.r["acUnknown"], "UNAVAILABLE(battery-status-99)")
+        # adversary de9ca8e7 A3: only 2 (AC) and 6-9 (charging) are AC-line evidence, only 1 (discharging) is battery evidence; a charge LEVEL (fully charged 3,
+        # low 4, critical 5, partly charged 11) says nothing about the line, so it is named, never guessed
+        self.assertEqual(self.r["acCharging"], "ac")
+        for key, status in (("acPartial11", 11), ("acFull3", 3), ("acLow4", 4)):
+            self.assertEqual(self.r[key], f"UNAVAILABLE(battery-status-{status})", key)
+        self.assertEqual(self.r["acChargeLevelPlusDischarging"], "battery", "a discharging record is battery evidence even beside a charge-level record")
         self.assertEqual(self.r["display"], [{"adapter": "NVIDIA GeForce RTX 3060 Laptop GPU", "width": 2560, "height": 1440, "refreshHz": 165}])
         self.assertEqual(self.r["displayNone"], "UNAVAILABLE(no-active-display-mode)")
         self.assertEqual(sorted(self.r["platformKeys"]), ["acState", "display", "powerPlan"])
@@ -463,6 +489,16 @@ $r['gpuNoWindowNullCheck'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $ru
 $r['gpuFast250'] = St (T { Get-ClocksPowerGpuSummary (Gpu @('18.000', '18.250', '18.500', '18.750')) $running $win $null (Chk 250 0) })
 $r['gpuFast250Gap600'] = St (T { Get-ClocksPowerGpuSummary (Gpu @('18.000', '18.250', '18.850', '19.100')) $running $win $null (Chk 250 0) })
 $r['cpuAdv'] = St (T { Get-ClocksPowerCpuSummary (Cpu $adv) $running $win $null (Chk 1000 0) })
+# adversary de9ca8e7 A1: performance 50 % at second 0, 75 % at second 1, 100 % from second 2 on, frequency 2000 throughout, a row at every second 0..21,
+# the Play window 0.5 s .. 20.5 s. Row 1 is the interval (0 s, 1 s] that straddles the window start, so it is not Play and must not pull the minimum to 1500
+$t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n"
+for ($k = 0; $k -le 21; $k++) {
+    $perfV = $(if ($k -eq 0) { '50.0' } elseif ($k -eq 1) { '75.0' } else { '100.0' })
+    $t += ("`"11/01/2026 08:00:{0:00}.000`",`"{1}`",`"2000.0`"`n" -f $k, $perfV)
+}
+$straddleWin = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 1, 14, 0, 0, 500, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 1, 14, 0, 20, 500, [DateTimeKind]::Utc); clockWhy = $null }
+$r['cpuStraddle'] = T { $s = Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv $t $cst) $running $straddleWin $null (Chk 1000 0); @{ status = St $s; samples = $s.samples; effMin = $s.effectiveMhz.min; perfMin = $s.perfPct.min } }
+$r['cpuRowFrom'] = T { $p = ConvertFrom-ClocksPowerCpuCsv $t $cst; @{ first = ($null -eq $p.rows[0].fromUtc); second = $p.rows[1].fromUtc.ToString('o'); secondUtc = $p.rows[1].utc.ToString('o') } }
 $r['cpuSteady'] = T { $s = Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null (Chk 1000 0); @{ status = St $s; samples = $s.samples } }
 $r['cpuNet600'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null (Chk 1000 600) })
 $r['cpuNullCheck'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null $null })
@@ -504,6 +540,12 @@ class ClocksPowerClockWitnessTests(unittest.TestCase):
     def test_a1_cpu_rows_a_clock_excursion_bent_are_unverified_not_ok(self) -> None:
         self.assertEqual(self.r["cpuAdv"], "unavailable(sample-clock-unverified)", "the CPU analog")
 
+    def test_a1b_cpu_rows_are_interval_rows_and_a_row_straddling_the_window_start_is_not_play(self) -> None:
+        self.assertEqual(self.r["cpuStraddle"], {"status": "ok", "samples": 19, "effMin": 2000.0, "perfMin": 100.0},
+                         "the adversary input: the 50 % / 75 % intervals before Play must not reach the statistics (rows 2..20 are the 19 whole intervals inside 0.5 s..20.5 s)")
+        self.assertEqual(self.r["cpuRowFrom"], {"first": True, "second": "2026-11-01T14:00:00.0000000Z", "secondUtc": "2026-11-01T14:00:01.0000000Z"},
+                         "a row's interval starts at the previous row's stamp; the first row has no known start")
+
     def test_a1_a_net_wall_vs_monotonic_step_over_250_ms_is_unverified_either_way(self) -> None:
         for key in ("gpuNet600", "gpuNetNeg600", "gpuNet251", "cpuNet600"):
             self.assertEqual(self.r[key], "unavailable(sample-clock-unverified)", key)
@@ -517,7 +559,7 @@ class ClocksPowerClockWitnessTests(unittest.TestCase):
 
     def test_a1_a_steady_stream_with_a_clock_check_stays_ok(self) -> None:
         self.assertEqual(self.r["gpuSteady"], {"status": "ok", "samples": 4})
-        self.assertEqual(self.r["cpuSteady"], {"status": "ok", "samples": 4})
+        self.assertEqual(self.r["cpuSteady"], {"status": "ok", "samples": 3}, "typeperf rows are interval rows: the first row (no known start) is not counted")
         self.assertEqual(self.r["gpuFast250"], "ok")
         self.assertEqual(self.r["cpuInterval250OneSecondRows"], "ok", "typeperf -si is whole seconds: the CPU nominal is the interval rounded UP, so 250 ms means 1 s")
         self.assertEqual(self.r["cpuInterval500HalfSecondGaps"], "unavailable(sample-clock-unverified)", "typeperf cannot sample at 500 ms: half-second gaps are not its cadence")
@@ -532,6 +574,61 @@ class ClocksPowerClockWitnessTests(unittest.TestCase):
         self.assertAlmostEqual(self.r["netStep0"], 0.0)
         self.assertAlmostEqual(self.r["netStepFwd"], 600.0, msg="wall advanced 10.6 s while the monotonic clock advanced 10.0 s")
         self.assertAlmostEqual(self.r["netStepBack"], -300.0)
+
+
+# adversary de9ca8e7 A2: the pre-launch reads (powercfg, the two CIM queries, `typeperf -qx "Energy Meter"`) ran synchronously with no bound, so a provider that
+# never answers held the job before the measured launch and the "+45 s" job-timeout allowance bounded nothing. Each is now bounded and typed.
+DRIVER_BOUNDED = r"""
+function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
+function T($sb) { try { & $sb } catch { 'ERR: ' + $_.Exception.Message } }
+$r = [ordered]@{}
+$ping = Join-Path $env:SystemRoot 'System32\ping.exe'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$h = T { Invoke-ClocksPowerBounded $ping '-n 30 127.0.0.1' 800 }
+$r['hangMs'] = $sw.ElapsedMilliseconds
+$r['hang'] = @{ ok = $h.ok; timedOut = $h.timedOut; lines = @($h.lines).Count }
+$ok = T { Invoke-ClocksPowerBounded $ping '-n 1 127.0.0.1' 15000 }
+$r['quick'] = @{ ok = $ok.ok; timedOut = $ok.timedOut; hasLines = (@($ok.lines).Count -gt 0) }
+$missing = T { Invoke-ClocksPowerBounded (Join-Path $env:CP_TMP 'no-such-tool.exe') '-x' 800 }
+$r['missing'] = @{ ok = $missing.ok; timedOut = $missing.timedOut; lines = @($missing.lines).Count }
+$sw.Restart()
+$l = T { Get-ClocksPowerCounterList $ping 800 '-n 30 127.0.0.1' }
+$r['listHangMs'] = $sw.ElapsedMilliseconds
+$r['listHang'] = @{ lines = @($l.lines).Count; why = $l.why }
+$r['listNone'] = T { $x = Get-ClocksPowerCounterList ''; @{ lines = @($x.lines).Count; why = $x.why } }
+$r['listMissing'] = T { $x = Get-ClocksPowerCounterList (Join-Path $env:CP_TMP 'no-such-tool.exe'); @{ lines = @($x.lines).Count; why = $x.why } }
+$r['listOk'] = T { $x = Get-ClocksPowerCounterList $ping 15000 '-n 1 127.0.0.1'; @{ hasLines = (@($x.lines).Count -gt 0); why = $x.why } }
+J $r
+"""
+
+
+@requires_windows_pwsh
+class ClocksPowerBoundedCallTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="clocks-power-bounded-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        script = Path(cls._tmp.name) / "driver.ps1"
+        script.write_text(LIFT + DRIVER_BOUNDED, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_a2_a_tool_that_never_returns_is_killed_and_reported_not_waited_for(self) -> None:
+        self.assertEqual(self.r["hang"], {"ok": False, "timedOut": True, "lines": 0})
+        self.assertLess(self.r["hangMs"], 8000, "an 800 ms bound on a 29 s tool returns in seconds, not at the tool's pace")
+        self.assertEqual(self.r["quick"], {"ok": True, "timedOut": False, "hasLines": True})
+        self.assertEqual(self.r["missing"], {"ok": False, "timedOut": False, "lines": 0}, "a tool that cannot start is a failure, not a hang")
+
+    def test_a2_the_energy_meter_listing_is_bounded_and_typed(self) -> None:
+        self.assertEqual(self.r["listHang"], {"lines": 0, "why": "energy-meter-enumeration-timeout"})
+        self.assertLess(self.r["listHangMs"], 8000)
+        self.assertEqual(self.r["listNone"], {"lines": 0, "why": None}, "no typeperf path: nothing to list, and the start has its own typed reason")
+        self.assertEqual(self.r["listMissing"], {"lines": 0, "why": "energy-meter-enumeration-failed"})
+        self.assertEqual(self.r["listOk"], {"hasLines": True, "why": None})
 
 
 @requires_windows_pwsh
