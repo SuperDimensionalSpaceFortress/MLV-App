@@ -71,7 +71,7 @@ class AssignTests(unittest.TestCase):
     def test_no_shard_is_far_above_the_mean_load(self) -> None:
         # The point of weighting: the longest shard stays near the mean, so wall time is
         # the mean plus setup rather than the unlucky bucket.
-        for profile, shards in (("windows", 7), ("ubuntu", 3)):
+        for profile, shards in (("windows", 8), ("ubuntu", 3)):
             weights = shard.load_weights(profile)
             buckets = shard.assign(_COUNTS, shards, weights)
             loads = [
@@ -122,7 +122,7 @@ class AssignTests(unittest.TestCase):
 class CoverageTests(unittest.TestCase):
     def test_shards_are_an_exact_cover_of_discover(self) -> None:
         expected = sorted(test.id() for test in _TESTS)
-        for profile, shards in (("windows", 7), ("ubuntu", 3)):
+        for profile, shards in (("windows", 8), ("ubuntu", 3)):
             with self.subTest(profile=profile):
                 buckets = shard.assign(_COUNTS, shards, shard.load_weights(profile))
                 covered = sorted(
@@ -133,7 +133,7 @@ class CoverageTests(unittest.TestCase):
     def test_a_shard_keeps_each_class_and_module_contiguous(self) -> None:
         # setUpClass/setUpModule fixtures run once per run of adjacent tests, so a shard
         # must not interleave classes or modules.
-        buckets = shard.assign(_COUNTS, 7, shard.load_weights("windows"))
+        buckets = shard.assign(_COUNTS, 8, shard.load_weights("windows"))
         for bucket in buckets:
             keys = [shard.unit_key(test) for test in shard.shard_tests(_UNITS, bucket)]
             collapsed = [key for index, key in enumerate(keys) if index == 0 or key != keys[index - 1]]
@@ -150,7 +150,7 @@ class CoverageTests(unittest.TestCase):
         # parts; together they must hold every discovered id exactly once. Ubuntu has no heavy
         # set, so its 3-way partition alone must still cover everything.
         expected = sorted(test.id() for test in _TESTS)
-        for profile, shards in (("windows", 7), ("ubuntu", 3)):
+        for profile, shards in (("windows", 8), ("ubuntu", 3)):
             with self.subTest(profile=profile):
                 partition, heavy = shard.plan_buckets(_COUNTS, profile, shards)
                 self.assertEqual(len(partition), shards)
@@ -163,7 +163,7 @@ class CoverageTests(unittest.TestCase):
 
     def test_the_partition_excludes_exactly_the_heavy_set(self) -> None:
         classes, parts = shard.load_heavy_set("windows")
-        partition, heavy = shard.plan_buckets(_COUNTS, "windows", 7)
+        partition, heavy = shard.plan_buckets(_COUNTS, "windows", 8)
         self.assertEqual(len(heavy), parts)
         self.assertEqual(sorted(key for bucket in heavy for key in bucket), sorted(classes))
         self.assertEqual({key for bucket in partition for key in bucket} & set(classes), set())
@@ -194,6 +194,12 @@ HEAVY_RUN = "python -m tools.repo_hygiene.ci_unittest_shard --profile windows --
 # headroom, so a PR that adds tests does not tip a shard over it. Master sat at 1439 of 1440 s
 # (99.9 %) and merge_group run 40233119003 failed at 1445 s.
 MAX_CAP_SHARE_USED = 0.85
+# CI-WINDOWS-UNITTEST-SHARD-HEADROOM-3: the windows light shard count and the heavy part count the
+# workflow runs. Seven light shards sat every shard at 1074 s of weight (150 s of setup on top is the
+# 1224 s limit), so any PR that added a test class went red; eight sit at about 940 s. A change of
+# either count has to change these constants in the same commit as the workflow and the heavy set.
+WINDOWS_LIGHT_SHARDS = 8
+WINDOWS_HEAVY_PARTS = 13
 
 
 def _workflow_job(job_name: str) -> str:
@@ -260,7 +266,7 @@ class ShardDurationBudgetTests(unittest.TestCase):
         self.assertLessEqual(budget, MAX_BUDGET_SECONDS + 1e-6)
         limit = budget * MAX_CAP_SHARE_USED
         weights = shard.load_weights("windows")
-        _partition, heavy = shard.plan_buckets(_COUNTS, "windows", 7)
+        _partition, heavy = shard.plan_buckets(_COUNTS, "windows", 8)
         self.assertTrue(heavy)
         for index, bucket in enumerate(heavy, start=1):
             seconds = SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
@@ -271,6 +277,18 @@ class ShardDurationBudgetTests(unittest.TestCase):
                 f"{MAX_CAP_SHARE_USED:.0%} of its {cap.group(1)} min cap share ({limit:.0f} s); "
                 "raise the heavy set's parts",
             )
+
+    def test_the_workflow_and_heavy_set_carry_the_pinned_shard_and_part_counts(self) -> None:
+        # A future count change is caught here: the workflow's `--of` (partition proof and run step),
+        # its matrix (light shards plus the one tail shard), and the heavy set's parts must all agree
+        # with the constants above, so one cannot move without the others.
+        job = _windows_shard_job()
+        ofs = {int(n) for n in re.findall(r"ci_unittest_shard --profile windows --of (\d+)", job)}
+        self.assertEqual(ofs, {WINDOWS_LIGHT_SHARDS})
+        matrix = re.search(r"(?m)^        shard: \[([0-9, ]+)\]$", job)
+        self.assertIsNotNone(matrix)
+        self.assertEqual(len(matrix.group(1).split(",")), WINDOWS_LIGHT_SHARDS + 1)
+        self.assertEqual(shard.load_heavy_set("windows")[1], WINDOWS_HEAVY_PARTS)
 
     def test_the_expected_time_budget_stays_at_the_original_24_minutes(self) -> None:
         # Raising the job cap 40 -> 50 must not buy a looser per-shard budget: the share
@@ -453,14 +471,14 @@ class HeavySetTests(unittest.TestCase):
             )
             err = io.StringIO()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-                code = shard.verify_partition("windows", 7, heavy_path=path)
+                code = shard.verify_partition("windows", 8, heavy_path=path)
         self.assertEqual(code, 1)
         self.assertIn("tools.repo_hygiene.test_gone.Gone", err.getvalue())
 
     def test_the_partition_proof_covers_the_heavy_parts(self) -> None:
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            code = shard.verify_partition("windows", 7)
+            code = shard.verify_partition("windows", 8)
         self.assertEqual(code, 0, out.getvalue())
         _classes, parts = shard.load_heavy_set("windows")
         for part in range(1, parts + 1):
