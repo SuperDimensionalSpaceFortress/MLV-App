@@ -3717,7 +3717,7 @@ void MainWindow::viewerIdleRestore( void )
     {
         m_viewerIdlePointer.seed( QCursor::pos() );
 #ifdef Q_OS_WIN
-        viewer_idle::win_hook::witness().clear();
+        viewer_idle::win_hook::noteDelivered();   // r11 (pass 15 A1): nothing pending, and the history marked again
 #endif
         m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
@@ -3834,7 +3834,8 @@ void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
         // The timer is not restarted on every move: the timestamp plus Rearm covers it.
         m_viewerIdlePointer.seed( QCursor::pos() );
 #ifdef Q_OS_WIN
-        viewer_idle::win_hook::witness().clear();   // delivered: the hook's sighting of it is not new movement
+        // Delivered: the hook's sighting of it is not new movement; the history is marked again (r11, pass 15 A1).
+        viewer_idle::win_hook::noteDelivered();
 #endif
         if( m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() ) ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );

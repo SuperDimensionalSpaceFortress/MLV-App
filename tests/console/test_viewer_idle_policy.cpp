@@ -787,6 +787,80 @@ TEST(ViewerIdlePolicy, CoalescedExcursionWhileShownRestartsTheIdlePeriod)
     viewer_idle::win_hook::remove();
 }
 
+// P13b (r11, adversary pass 15 A1): shown, idle 2000 ms, poll 50 ms. The tick at 1950 marks (500,500). At 1960 the hook
+// retrieves a move to (510,500), which unmarks the history, and the move is delivered: the event path notes activity
+// at 1960 and clears the witness. In an input-excluded wait the pointer goes to (520,500) at 1970 and back to (510,500)
+// at 1980; the coalesced WM_MOUSEMOVE at (510,500) is retrieved at 1985. Expected: the excursion is seen and the idle
+// period restarts at the 2000 tick (still shown at 3999, hidden at 4000). RED control: the bare clear (the event path
+// before r11) leaves the history unmarked, so the hook judges the move by position alone and the cursor hides at 3960,
+// 1980 ms after real movement.
+TEST(ViewerIdlePolicy, DeliveredMoveMarksAgainSoALaterCoalescedExcursionRestartsTheIdlePeriod)
+{
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = scriptedHistory;
+    MOUSEHOOKSTRUCT away = {};
+    away.pt.x = 510;
+    away.pt.y = 500;
+    for (const bool markOnDelivery : {false, true})
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        viewer_idle::win_hook::witness().seed(QPoint(500, 500));
+        viewer_idle::win_hook::historyMark().unmark();
+        int rearm = 0;
+
+        // Tick at 1950: nothing moved; then the mark (as every MainWindow tick).
+        setScript({hp(500, 500, 900), hp(490, 500, 890)});
+        viewer_idle::Inputs in = allPass();
+        if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
+        viewer_idle::win_hook::markHistory();
+        ASSERT_TRUE(viewer_idle::win_hook::historyMark().marked());
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(in, 1950, 2000, &rearm, 50)));
+
+        // 1960: the hook retrieves the move (it unmarks), then the move is delivered and noted.
+        setScript({hp(510, 500, 1960), hp(500, 500, 900), hp(490, 500, 890)});
+        viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&away));
+        ASSERT_FALSE(viewer_idle::win_hook::historyMark().marked());
+        c.noteActivity(1960);
+        if (markOnDelivery) viewer_idle::win_hook::noteDelivered();
+        else viewer_idle::win_hook::witness().clear();   // the event path before r11 (RED control)
+        ASSERT_EQ(markOnDelivery, viewer_idle::win_hook::historyMark().marked());
+
+        // 1985: the coalesced excursion (to 520 at 1970, back to 510 at 1980) is retrieved at (510,500).
+        setScript({hp(510, 500, 1980), hp(520, 500, 1970), hp(510, 500, 1960), hp(500, 500, 900), hp(490, 500, 890)});
+        viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&away));
+
+        // Tick at 2000.
+        in = allPass();
+        if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
+        ASSERT_EQ(markOnDelivery, in.pointerMoved);
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(in, 2000, 2000, &rearm, 50)));
+        if (markOnDelivery)
+        {
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 3960, 2000, &rearm, 50)));
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Rearm), tickValue(c.onTimeout(allPass(), 3999, 2000, &rearm, 50)));
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 4000, 2000, &rearm, 50)));
+        }
+        else
+        {
+            // The defect: hidden 1980 ms after the movement at 1980.
+            ASSERT_EQ(tickValue(viewer_idle::Tick::Hide), tickValue(c.onTimeout(allPass(), 3960, 2000, &rearm, 50)));
+        }
+
+        // A delivered event with the mark still standing keeps it (no history read).
+        if (markOnDelivery)
+        {
+            viewer_idle::win_hook::markHistory();
+            g_scriptCount = 0;   // a read now would unmark
+            viewer_idle::win_hook::noteDelivered();
+            ASSERT_TRUE(viewer_idle::win_hook::historyMark().marked());
+            ASSERT_FALSE(viewer_idle::win_hook::witness().take());
+        }
+    }
+    viewer_idle::win_hook::historyReader() = saved;
+    viewer_idle::win_hook::remove();
+}
+
 namespace
 {
 QPoint g_cursor(500, 500);

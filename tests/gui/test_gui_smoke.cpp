@@ -2601,7 +2601,7 @@ private:
         {
             m_pointer.seed( QCursor::pos() );
 #ifdef Q_OS_WIN
-            viewer_idle::win_hook::witness().clear();
+            viewer_idle::win_hook::noteDelivered();   // as MainWindow (r11, pass 15 A1)
 #endif
             m_idle.noteActivity( m_clock.elapsed() );
             if( !m_timer.isActive() ) m_timer.start( firstLookMs() );
@@ -2620,7 +2620,7 @@ private:
         {
             m_pointer.seed( QCursor::pos() );
 #ifdef Q_OS_WIN
-            viewer_idle::win_hook::witness().clear();
+            viewer_idle::win_hook::noteDelivered();   // as MainWindow (r11, pass 15 A1)
 #endif
             if( m_idle.noteActivity( m_clock.elapsed() ) ) m_hider.restore( m_surfaces );
             if( !m_timer.isActive() ) m_timer.start( firstLookMs() );

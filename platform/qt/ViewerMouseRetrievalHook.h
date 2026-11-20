@@ -195,6 +195,19 @@ inline void markHistory()
     markHistoryAt( nullptr, nullptr );
 }
 
+/*! \brief r11 (adversary pass 15 A1): the event path saw the input itself (a delivered activity event, or a forced
+ *         restore), so nothing is pending: witness().clear(). A move the hook saw also unmarked the history (proc:
+ *         "the next tick marks afresh"), but with the witness cleared that tick takes nothing, so until it marks, a
+ *         coalesced away-and-back retrieved at the delivered position is judged by position alone and lost (the idle
+ *         period is not restarted and the cursor hides less than one idle period after real movement). So the history
+ *         is marked again here, at the moment the activity is noted: every point the mark absorbs is no newer than that
+ *         activity, and every later one is judged against it. A mark still standing is kept (no read). */
+inline void noteDelivered()
+{
+    witness().clear();
+    if( !historyMark().marked() ) markHistory();
+}
+
 /*! \brief r7 (key B1, opus H1): every idle tick, after it read the witness. Marks the history first (one read,
  *         judged against the previous mark), then reads the queue status, and returns true iff the mouse input
  *         still queued is activity by the QueueLook grammar (ViewerIdlePolicy.h). Removes nothing from the queue

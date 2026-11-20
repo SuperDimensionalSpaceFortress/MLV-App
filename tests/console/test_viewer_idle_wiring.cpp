@@ -201,13 +201,19 @@ TEST(ViewerIdleWiring, TickReadsTheRetrievalHookInstalledOnlyWhileFullscreen)
     ASSERT_FALSE(dtor.isEmpty());
     ASSERT_TRUE(dtor.contains(QStringLiteral("viewer_idle::win_hook::remove();")));
 
-    const QString clear = QStringLiteral("viewer_idle::win_hook::witness().clear();");
+    // r11 (adversary pass 15 A1): both event-path sites clear the witness AND mark the history again (noteDelivered),
+    // never the bare clear, which left the history unmarked until the next tick.
+    const QString delivered = QStringLiteral("viewer_idle::win_hook::noteDelivered();");
+    const QString bareClear = QStringLiteral("viewer_idle::win_hook::witness().clear();");
     const QString note = functionBodyToBrace(source,
         QStringLiteral("void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )"));
-    ASSERT_EQ(1, int(note.count(clear)));
+    ASSERT_EQ(1, int(note.count(delivered)));
+    ASSERT_EQ(0, int(note.count(bareClear)));
     const QString restore = functionBodyToBrace(source,
         QStringLiteral("void MainWindow::viewerIdleRestore( void )"));
-    ASSERT_EQ(1, int(restore.count(clear)));
+    ASSERT_EQ(1, int(restore.count(delivered)));
+    ASSERT_EQ(0, int(restore.count(bareClear)));
+    ASSERT_EQ(0, int(source.count(bareClear)));
 }
 
 // W6 (r3, adversary r1 pass 4 A1): the position sample is the only witness off Windows, so the tick hands the
