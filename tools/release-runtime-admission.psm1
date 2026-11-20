@@ -121,6 +121,45 @@ function Get-PinnedPayloadSurvivors {
     return $survivors.ToArray()
 }
 
+# PR 862 r8 (sol r7 B1 / b4826b52-A1; hub ruling 20261120T1007Z: fail closed, no new attribution of descendants). A descendant whose
+# intermediate parent exited BEFORE the first listing is in no tree a listing can build, so an empty survivor set never proves the tree
+# gone on its own. Every other row of the SAME later listing must be shown NOT to be a descendant, and only two facts show it:
+#  (a) its UTC creation time is strictly earlier than the root's (read through the root's handle): a descendant is created after its root;
+#  (b) its parent id is held, in this same snapshot, by exactly one row that is itself shown by (a) or (b), whose creation time is
+#      strictly earlier than this row's: that process has held the pid from before this row was created until now, so it is the creator.
+# Any other row (creation time unreadable, at or after the root's with no such parent: its parent exited, is newer than it, or is itself
+# only possibly a descendant) is a POSSIBLE orphan descendant and leaves the tree unconfirmed. No dead parent is ever reconstructed.
+# Rows on the ids in Counted (already counted as survivors) are not reported again. Returns the possible orphans' rows.
+function Get-PinnedPayloadPossibleOrphans {
+    param([object[]]$Table, [long]$RootTicks, [System.Collections.Generic.HashSet[int]]$Counted)
+    $rows = @($Table)
+    $ticks = [object[]]::new($rows.Count)
+    $indexById = @{}
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $ticks[$i] = ConvertTo-PinnedPayloadCreationTicks $rows[$i].startUtc
+        $id = [int]$rows[$i].id
+        # A pid listed twice in one snapshot names no single process: it places nothing as a parent.
+        $indexById[$id] = if ($indexById.ContainsKey($id)) { -1 } else { $i }
+    }
+    $placed = [bool[]]::new($rows.Count)
+    for ($i = 0; $i -lt $rows.Count; $i++) { if ($null -ne $ticks[$i] -and [long]$ticks[$i] -lt $RootTicks) { $placed[$i] = $true } }
+    do {
+        $grew = $false
+        for ($i = 0; $i -lt $rows.Count; $i++) {
+            if ($placed[$i] -or $null -eq $ticks[$i]) { continue }
+            $parentId = [int]$rows[$i].parentId
+            if ($parentId -eq [int]$rows[$i].id -or $Counted.Contains($parentId) -or -not $indexById.ContainsKey($parentId)) { continue }
+            $p = [int]$indexById[$parentId]
+            if ($p -lt 0 -or -not $placed[$p] -or $null -eq $ticks[$p] -or [long]$ticks[$p] -ge [long]$ticks[$i]) { continue }
+            $placed[$i] = $true
+            $grew = $true
+        }
+    } while ($grew)
+    $orphans = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $rows.Count; $i++) { if (-not $placed[$i] -and -not $Counted.Contains([int]$rows[$i].id)) { $orphans.Add($rows[$i]) } }
+    return $orphans.ToArray()
+}
+
 # Kills a timed-out child's whole tree and reports whether its exit was SEEN; a Kill that throws (access
 # denied) or a wait that times out is never reported as killed (adversary 32bf39a9-A3).
 function Stop-PinnedPayloadChild {
@@ -174,19 +213,27 @@ function Stop-PinnedPayloadChild {
             # listed for a moment); whatever is still listed then leaves the tree unconfirmed.
             # Every row a poll counts joins the tracked set with its identity, so a later poll still counts its subtree after it exits
             # (adversary df7e3c66-A1). No listing starts with less than one whole second left.
+            # PR 862 r8 (sol r7 B1): the same listing must also hold no POSSIBLE orphan descendant (Get-PinnedPayloadPossibleOrphans); one
+            # still listed when the budget is spent leaves the tree unconfirmed (typed orphan-possible) and no recovery runs.
             $left = @()
+            $orphans = @()
             $listed = $false
             while ($true) {
                 $bound = & $listingSec
                 if ($bound -lt 1) { break }
-                $left = @(Get-PinnedPayloadSurvivors -Table @(& $ProcessTable $bound) -Members $members)
+                $table = @(& $ProcessTable $bound)
+                $left = @(Get-PinnedPayloadSurvivors -Table $table -Members $members)
                 $listed = $true
                 foreach ($row in $left) { if (-not $members.ContainsKey([int]$row.id)) { $members[[int]$row.id] = ConvertTo-PinnedPayloadCreationTicks $row.startUtc } }
-                if (-not $left.Count) { break }
+                $counted = [System.Collections.Generic.HashSet[int]]::new()
+                foreach ($row in $left) { [void]$counted.Add([int]$row.id) }
+                $orphans = @(Get-PinnedPayloadPossibleOrphans -Table $table -RootTicks ([long]$rootTicks) -Counted $counted)
+                if (-not $left.Count -and -not $orphans.Count) { break }
                 [System.Threading.Thread]::Sleep([int][math]::Max(0, [math]::Min(100, $ConfirmMs - $clock.ElapsedMilliseconds)))
             }
             if (-not $listed) { $treeError = "no whole second of the $ConfirmMs ms confirmation budget was left to list the tree after the kill" }
             elseif ($left.Count) { $treeError = "pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill (a member, or a row on a member's parent id that no clock-free fact places outside the tree)" }
+            elseif ($orphans.Count) { $treeError = "orphan-possible: pid(s) $(@($orphans | ForEach-Object { $_.id }) -join ', ') created at or after the root (or at an unreadable time) with no live parent shown outside the tree, so each may be a descendant whose parent exited; the tree is not confirmed" }
             elseif ($clock.ElapsedMilliseconds -gt $ConfirmMs) { $treeError = "the tree was seen gone only after the $ConfirmMs ms confirmation budget was spent ($($clock.ElapsedMilliseconds) ms)" }
         } catch { $treeError = "the process tree could not be listed after the kill: $($_.Exception.Message)" }
     }
@@ -489,6 +536,9 @@ function Open-PinnedFileHold {
         [Parameter(Mandatory)]
         [long]$ExpectedBytes
     )
+    # PR 862 r8 (sol r7 B2): ValidatePattern matches case-insensitively, so it accepts an uppercase digest (as Get-FileHash prints
+    # one); the accepted digest is normalised ONCE here so every accepted case compares to the lowercase hash below.
+    $ExpectedSha256 = $ExpectedSha256.ToLowerInvariant()
     $hold = [ordered]@{ ok = $false; reason = ''; bytes = $null; sha256 = ''; stream = $null }
     $stream = $null
     try {
@@ -534,6 +584,8 @@ function Test-PinnedZipMember {
         [Parameter(Mandatory)]
         [long]$ExpectedBytes
     )
+    # PR 862 r8 (sol r7 B2): the case-insensitively validated digest is normalised once, as in Open-PinnedFileHold.
+    $ExpectedSha256 = $ExpectedSha256.ToLowerInvariant()
     $check = [ordered]@{ ok = $false; reason = ''; zipSha256 = ''; memberBytes = $null; memberSha256 = '' }
     $stream = $null
     $zip = $null

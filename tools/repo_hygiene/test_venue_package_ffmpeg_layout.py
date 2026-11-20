@@ -534,8 +534,16 @@ class HelperBehaviourTests(unittest.TestCase):
         root = self._row(4242, 1, "2026-11-19T10:00:00Z")
         child = self._row(5151, 4242, "2026-11-19T10:00:01Z")
         replacement = self._row(5151, 9000, "2026-11-19T10:00:03Z")
+        # PR 862 r8 (hub ruling 20261120T1007Z, fail closed): the replacement's parent 9000 is in no listing and it was created after the
+        # root, so nothing shows it is not an orphaned descendant: never counted as a survivor, but the tree is not confirmed either.
         alone = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({replacement})")
-        self.assertTrue(alone["confirmed"], alone)
+        self.assertFalse(alone["confirmed"], alone)
+        self.assertIn("orphan-possible", alone["killError"])
+        self.assertNotIn("still running", alone["killError"])
+        # the same replacement whose parent 9000 is a live process older than the root is placed outside: the tree is confirmed.
+        old_parent = self._row(9000, 1, "2026-11-19T09:00:00Z")
+        placed = self._stop("$null", "$true", before=f"@({root}, {child}, {old_parent})", after=f"@({old_parent}, {replacement})")
+        self.assertTrue(placed["confirmed"], placed)
         # adversary 0f5308ad-A3 (r6): a row on 5151's parent id whose creation time reads after the replacement's is placed outside the tree
         # only by the wall clock (a step back makes the original 5151's late child read that way), so it is counted, never killed.
         its_child = self._row(6262, 5151, "2026-11-19T10:00:04Z")
@@ -548,6 +556,57 @@ class HelperBehaviourTests(unittest.TestCase):
         orphan = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({late_replacement}, {ours})")
         self.assertFalse(orphan["confirmed"], orphan)
         self.assertIn("6262 still running", orphan["killError"])
+
+    def test_an_orphan_from_before_the_first_listing_never_confirms_the_tree(self) -> None:
+        # sol r7 B1 / b4826b52-A1: root 4242 started 5151; 5151 started leaf 6262 and exited BEFORE the first listing, so the listing shows
+        # 6262 on a parent id (5151) it does not hold. Kill($true) misses 6262 and the root's wait is true. The tree was confirmed and
+        # recovery ran. Hub ruling 20261120T1007Z: a row created at or after the root whose parent cannot be shown to be a live process
+        # that is itself not a descendant is a POSSIBLE orphan descendant, and the tree is unconfirmed (typed orphan-possible).
+        root = self._row(4242, 1, "2026-11-19T10:00:00Z")
+        leaf = self._row(6262, 5151, "2026-11-19T10:00:02Z")
+        stop = self._stop("$null", "$true", before=f"@({root}, {leaf})", after=f"@({leaf})")
+        self.assertTrue(stop["exited"], stop)
+        self.assertFalse(stop["confirmed"], stop)
+        self.assertIn("orphan-possible", stop["killError"])
+        self.assertIn("6262", stop["killError"])
+        # created at the root's very creation time: still a possible descendant (at OR after).
+        same = self._row(6262, 5151, "2026-11-19T10:00:00Z")
+        tie = self._stop("$null", "$true", before=f"@({root}, {same})", after=f"@({same})")
+        self.assertFalse(tie["confirmed"], tie)
+        self.assertIn("orphan-possible", tie["killError"])
+        # control: the after listing holds only a pre-existing unrelated process (created before the root, its parent long gone).
+        unrelated = self._row(7001, 1, "2026-11-19T09:00:00Z")
+        control = self._stop("$null", "$true", before=f"@({root}, {unrelated})", after=f"@({unrelated})")
+        self.assertTrue(control["confirmed"], control)
+        self.assertEqual(control["killError"], "", control)
+        # a row whose creation time cannot be read is never placed outside the tree.
+        unread = "[pscustomobject]@{ id = 7003; parentId = 1; startUtc = $null }"
+        unknown = self._stop("$null", "$true", before=f"@({root}, {unread})", after=f"@({unread})")
+        self.assertFalse(unknown["confirmed"], unknown)
+        self.assertIn("orphan-possible", unknown["killError"])
+        # a new process whose live parent is older than the root is placed outside; one whose live parent is itself only a possible
+        # orphan, or whose parent reads newer than it (an earlier holder of that pid may have started it), is not.
+        anchor = self._row(8000, 1, "2026-11-19T09:00:00Z")
+        newer_child = self._row(8008, 8000, "2026-11-19T10:00:05Z")
+        grandchild = self._row(8016, 8008, "2026-11-19T10:00:06Z")
+        chain = self._stop("$null", "$true", before=f"@({root}, {anchor})", after=f"@({anchor}, {newer_child}, {grandchild})")
+        self.assertTrue(chain["confirmed"], chain)
+        under_orphan = self._row(8024, 6262, "2026-11-19T10:00:06Z")
+        tainted = self._stop("$null", "$true", before=f"@({root}, {leaf})", after=f"@({leaf}, {under_orphan})")
+        self.assertFalse(tainted["confirmed"], tainted)
+        self.assertIn("8024", tainted["killError"])
+        older_than_parent = self._row(8032, 8008, "2026-11-19T10:00:04Z")
+        reused_parent = self._stop("$null", "$true", before=f"@({root}, {anchor})", after=f"@({anchor}, {newer_child}, {older_than_parent})")
+        self.assertFalse(reused_parent["confirmed"], reused_parent)
+        self.assertIn("8032", reused_parent["killError"])
+
+    def test_the_timeout_recovery_is_refused_for_an_orphan_possible_tree(self) -> None:
+        # sol r7 B1 (psm1:410): recovery runs only on killConfirmed, which is the stop's confirmed; an orphan-possible stop says false.
+        text = _normalised(HELPER_MODULE)
+        self.assertIn("$result.killConfirmed = [bool]$stop.confirmed", text)
+        stop = re.search(r"function Stop-PinnedPayloadChild \{.*?\n\}", text, re.S).group(0)
+        self.assertIn("orphan-possible", stop)
+        self.assertIn("confirmed = ($exited -and -not $killError)", stop)
 
     def test_a_row_whose_identity_and_ancestry_came_from_different_reads_is_never_killed(self) -> None:
         # adversary 0f5308ad-A1/A2 (r6): child 5151 of the root exited and an unrelated process U took its pid between the parent-id read
@@ -912,6 +971,55 @@ class PublicationCheckBehaviourTests(unittest.TestCase):
         restore = text[text.index("function Restore-PinnedPayloadTransaction {"): text.index(f"function {HELPER} {{")]
         self.assertNotRegex(restore, r"Remove-Item|::Delete\(", "the reconciliation only moves files back, it never deletes")
         self.assertNotRegex(restore, r"::Move\(.*\$true\)", "a backup is never moved over a destination (adversary 32501f50-A1)")
+
+    @staticmethod
+    def _case_variants(sha: str) -> dict[str, str]:
+        mixed = "".join(c.upper() if i % 2 else c for i, c in enumerate(sha))
+        return {"lower": sha, "upper": sha.upper(), "mixed": mixed}
+
+    def test_every_accepted_digest_case_matches_the_same_bytes(self) -> None:
+        # sol r7 B2: both helpers' ValidatePattern is case-insensitive, so an uppercase digest (as Get-FileHash prints it) was ACCEPTED
+        # and then compared case-sensitively to a lowercase hash: matching bytes were refused. Each accepted case variant must agree.
+        payload = b"MZ pinned ffmpeg bytes" * 100
+        target = self.tmp / "ffmpeg.exe"
+        target.write_bytes(payload)
+        good = self._zip("case.zip", {"MLVApp.exe": b"exe", "ffmpeg.exe": payload})
+        for label, digest in self._case_variants(hashlib.sha256(payload).hexdigest()).items():
+            with self.subTest(case=label):
+                result = self._ps(
+                    "$h = Open-PinnedFileHold -Path $env:FFX_FILE -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+                    "if ($h.stream) { $h.stream.Dispose() }\n"
+                    "$z = Test-PinnedZipMember -ZipPath $env:FFX_ZIP -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+                    "[ordered]@{ hold = $h.ok; holdReason = $h.reason; zip = $z.ok; zipReason = $z.reason } | ConvertTo-Json -Compress\n",
+                    FFX_FILE=str(target), FFX_ZIP=str(good), FFX_SHA=digest, FFX_LEN=str(len(payload)))
+                self.assertTrue(result["hold"], result)
+                self.assertTrue(result["zip"], result)
+        # a wrong digest in any case is still refused.
+        for label, digest in self._case_variants("0" * 63 + "a").items():
+            with self.subTest(wrong=label):
+                result = self._ps(
+                    "$h = Open-PinnedFileHold -Path $env:FFX_FILE -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+                    "if ($h.stream) { $h.stream.Dispose() }\n"
+                    "$z = Test-PinnedZipMember -ZipPath $env:FFX_ZIP -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+                    "[ordered]@{ hold = $h.ok; zip = $z.ok } | ConvertTo-Json -Compress\n",
+                    FFX_FILE=str(target), FFX_ZIP=str(good), FFX_SHA=digest, FFX_LEN=str(len(payload)))
+                self.assertEqual(result, {"hold": False, "zip": False})
+
+    def test_the_real_pinned_zip_matches_its_member_digest_in_every_case(self) -> None:
+        # sol r7 B2 repro: Test-PinnedZipMember on the real pinned ffmpegWin64.zip (ExpectedBytes=94240768) passed lowercase only.
+        record = _ffmpeg_record()
+        member = next(m for m in record["selected_members"] if m["output_name"] == "ffmpeg.exe")
+        archive = ROOT / Path(record["path"])
+        if archive.stat().st_size != record["bytes"]:
+            self.skipTest(f"{archive} is not the pinned archive here (an LFS pointer or a partial checkout)")
+        for label, digest in self._case_variants(member["sha256"]).items():
+            with self.subTest(case=label):
+                result = self._ps(
+                    "$z = Test-PinnedZipMember -ZipPath $env:FFX_ZIP -MemberName 'ffmpeg.exe' -ExpectedSha256 $env:FFX_SHA -ExpectedBytes ([long]$env:FFX_LEN)\n"
+                    "[ordered]@{ ok = $z.ok; reason = $z.reason; memberSha256 = $z.memberSha256 } | ConvertTo-Json -Compress\n",
+                    FFX_ZIP=str(archive), FFX_SHA=digest, FFX_LEN=str(member["bytes"]))
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["memberSha256"], member["sha256"])
 
     def test_the_file_hold_refuses_a_changed_file_and_blocks_a_delete_while_held(self) -> None:
         target = self.tmp / "ffmpeg.exe"
