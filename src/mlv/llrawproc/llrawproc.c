@@ -3779,6 +3779,35 @@ int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
                                                retained_out, rc_out, timing_out, 0);
 }
 
+/* DUALISO-CONFIGURE-CACHE-1 r3 test-only: one run exactly as the reduced route makes it (reduced_iso_notch=1,
+ * through llrawproc_gpu_playback_run_retained), with the retained output released at once so a later run may
+ * change dims. Only the reduced route passes the notch flag, and it needs a whole MLV frame to get there. */
+int llrpGpuPlaybackReconRunReducedNotchProbeForTesting(const llrpGpuPlaybackReconState_t * state,
+                                                       const uint16_t * raw_input_bayer14,
+                                                       size_t raw_image_size,
+                                                       int * rc_out);
+static int llrawproc_gpu_playback_run_retained(
+    const llrpGpuPlaybackReconState_t * state,
+    const uint16_t * raw_input_bayer14,
+    size_t raw_image_size,
+    llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
+    int * rc_out,
+    llrpGpuPlaybackReconTiming_t * timing_out,
+    int reduced_iso_notch);
+int llrpGpuPlaybackReconRunReducedNotchProbeForTesting(const llrpGpuPlaybackReconState_t * state,
+                                                       const uint16_t * raw_input_bayer14,
+                                                       size_t raw_image_size,
+                                                       int * rc_out)
+{
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained;
+    llrpGpuPlaybackReconTiming_t timing;
+    memset(&retained, 0, sizeof(retained));
+    const int used = llrawproc_gpu_playback_run_retained(state, raw_input_bayer14, raw_image_size,
+                                                         &retained, rc_out, &timing, 1);
+    if(used && retained.token) llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(retained.token);
+    return used;
+}
+
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: reduced_iso_notch=1 only for the reduced
  * route (llrawproc_with_dims_gpu_playback_texture). */
 static int llrawproc_gpu_playback_run_retained(
