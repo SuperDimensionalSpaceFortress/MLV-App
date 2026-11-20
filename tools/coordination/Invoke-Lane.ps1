@@ -2599,6 +2599,7 @@ if ($cfg.engine -eq 'claude') {
     # --settings, measured 2026-11-20T13:03Z) UNLESS the launching environment already carries the inherited
     # auto-memory override variable with a value that forces memory on. This launcher does not clear, pin or detect
     # that variable (owner boundary NA-3 forbids touching that variable family) and no current launcher sets it.
+    # A higher-precedence administrator-managed policy settings file that turns memory on would also win over this key.
     $settingsObj.autoMemoryEnabled = $false
     if (-not $AllowBulkReads) {
         $denyRules = @(

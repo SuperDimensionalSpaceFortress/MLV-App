@@ -639,6 +639,7 @@ def test_editing_settings_json_also_wires_lane_no_background_hook(fixture_tree):
 # settings turn auto memory off unless the launching environment already carries the inherited
 # auto-memory override variable with a value that forces it on. This launcher does not clear that
 # variable (NA-3) and no current launcher sets it, so the guarantee covers the default case only.
+# An administrator-managed policy settings file that turns memory on would also win over the key.
 def test_claude_lane_settings_json_turns_auto_memory_off(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal")
     r=run_lane(cmd,env)
