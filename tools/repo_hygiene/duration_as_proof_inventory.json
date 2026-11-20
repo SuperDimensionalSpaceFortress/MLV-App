@@ -2105,6 +2105,16 @@
     },
     {
       "path": "platform/qt/PlaybackPresentTrace.h",
+      "anchor": "const auto ms = [ ] ( double seconds ) { return seconds > 0.0 ? seconds * 1000.0 : kUnknownMs ; } ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-TRACE-LOWOVERHEAD-1 present trace stage stamps: the parameter is an ABSOLUTE stage-clock timestamp (mlv_stage_timing_now seconds), not a duration, and 0 is the 'never stamped' sentinel; the lambda converts a stamped value to ms and keeps an unstamped one as the unknown marker. A data-validity filter on a diagnostic column; which frames exist and whether a stage ran is decided by the pipeline, never by this compare.",
+      "lines": [
+        104
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackPresentTrace.h",
       "anchor": "if ( row . readyMs >= 0.0 ) row . readyMs -= m_originMs ;",
       "class": "value_fallback_select",
       "clock": "qpc_stage_clock",
@@ -2135,12 +2145,12 @@
     },
     {
       "path": "tests/console/test_playback_present_trace.cpp",
-      "anchor": "ASSERT_NEAR ( 0.0 , trace . rows ( ) [ 0 ] . intervalMs , 1 e - 9 ) ;",
+      "anchor": "ASSERT_NEAR ( 0.0 , trace . row ( 0 ) . intervalMs , 1 e - 9 ) ;",
       "class": "not_run_proof_structural",
       "clock": "other",
       "justification": "Test (injected times, no clock) that a new begin() starts clean: the first row after it has no previous present, so its interval column is 0. Row existence is asserted by rows().size() above.",
       "lines": [
-        128
+        157
       ]
     },
     {

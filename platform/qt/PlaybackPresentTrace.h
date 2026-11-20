@@ -17,6 +17,7 @@
 #ifndef PLAYBACKPRESENTTRACE_H
 #define PLAYBACKPRESENTTRACE_H
 
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -24,7 +25,42 @@
 namespace playback_present_trace
 {
 
-/*! One presented frame. Times are ms since the Play's smoke start; -1 is unknown. */
+/*! PLAYBACK-TRACE-LOWOVERHEAD-1 r1: a stage stamp that is not known (not taken, or the stage did not run for this frame). */
+constexpr double kUnknownMs = -1.0e9;
+
+/*! The per-frame stage stamps the worker threads take, in stage-clock SECONDS (mlv_stage_timing_now()); 0 = not stamped.
+ *  A plain POD that lives on the frame slot and rides to the GUI on the ReadyFrame: each field has exactly ONE writer
+ *  (the thread that owns the slot at that stage), and the slot's hand-over between stages happens under the render
+ *  thread's mutex, so the fields need no atomics and no lock of their own. Nothing here allocates or formats. */
+struct StageStamps
+{
+    double requestS = 0.0;      // the frame was requested
+    double decodeQueueS = 0.0;  // queued for the decode worker
+    double decodeStartS = 0.0;  // decode worker began
+    double decodeEndS = 0.0;    // decode worker finished
+    double reconStartS = 0.0;   // recon worker began
+    double reconEndS = 0.0;     // recon worker finished
+    double renderStartS = 0.0;  // render thread began this frame
+    double drawBeginS = 0.0;    // the GUI thread began drawing it (drawFrameReady's display start)
+};
+
+/*! The process-wide switch for the stage hooks (MLVAPP_PLAYBACK_PRESENT_TRACE, set by the window next to the recorder's own
+ *  switch). One relaxed load per hook: a stamp is a pure timing note, it orders nothing. */
+inline std::atomic<bool> &stampGate()
+{
+    static std::atomic<bool> gate( false );
+    return gate;
+}
+inline bool stampsEnabled() { return stampGate().load( std::memory_order_relaxed ); }
+inline void setStampsEnabled( bool on ) { stampGate().store( on, std::memory_order_relaxed ); }
+
+/*! Takes a stage stamp from a clock value the caller already holds; a no-op when the trace is off. */
+inline void stamp( double &destination, double nowSeconds )
+{
+    if( stampsEnabled() ) destination = nowSeconds;
+}
+
+/*! One presented frame. Times are ms since the Play's smoke start; -1 is unknown (stage stamps: kUnknownMs). */
 struct Row
 {
     int frame = 0;                // displayFrame
@@ -49,6 +85,47 @@ struct Row
     double lastAdvanceMs = -1.0;  // the last advance before this present: the pace target the present answered
     double lastTickDiffMs = 0.0;  // that advance's shaped timeDiff
     int audioSyncs = 0;           // audio re-syncs applied since the previous present
+    // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: this frame's stage stamps (ms since the Play's start; kUnknownMs when not taken).
+    // readyMs, presentMs and prevEndMs above complete the chain request .. present.
+    double reqMs = kUnknownMs;        // requested
+    double dqMs = kUnknownMs;         // queued for decode
+    double dsMs = kUnknownMs;         // decode began
+    double deMs = kUnknownMs;         // decode ended
+    double rsMs = kUnknownMs;         // recon began
+    double reMs = kUnknownMs;         // recon ended
+    double rndMs = kUnknownMs;        // render thread began
+    double drawBeginMs = kUnknownMs;  // GUI draw began
+    double configureMs = kUnknownMs;  // llrawproc dual-ISO configure span (a duration, not a stamp)
+    double h2dMs = kUnknownMs;        // async H2D upload span (a duration, not a stamp)
+
+    /*! Loads the worker stamps (absolute stage-clock seconds; 0 = unknown) as ABSOLUTE ms, ready for notePresent. */
+    void setStages( const StageStamps &s )
+    {
+        const auto ms = []( double seconds ) { return seconds > 0.0 ? seconds * 1000.0 : kUnknownMs; };
+        reqMs = ms( s.requestS );
+        dqMs = ms( s.decodeQueueS );
+        dsMs = ms( s.decodeStartS );
+        deMs = ms( s.decodeEndS );
+        rsMs = ms( s.reconStartS );
+        reMs = ms( s.reconEndS );
+        rndMs = ms( s.renderStartS );
+        drawBeginMs = ms( s.drawBeginS );
+    }
+
+    /*! True when the stamps that are known never run backwards along request .. present (1 = ordered). */
+    bool stagesOrdered() const
+    {
+        const double chain[] = { reqMs, dqMs, dsMs, deMs, rsMs, reMs, rndMs, readyMs, drawBeginMs, presentMs };
+        double last = kUnknownMs;
+        for( double t : chain )
+        {
+            // readyMs uses -1 for unknown; a real rebased stamp is never below -1e8
+            if( t <= kUnknownMs / 2.0 || t == -1.0 ) continue;
+            if( t < last ) return false;
+            last = t;
+        }
+        return true;
+    }
 };
 
 class Recorder
@@ -58,14 +135,16 @@ public:
     void setEnabled( bool enabled ) { m_enabled = enabled; }
     bool enabled() const { return m_enabled; }
 
-    /*! A measured Play starts at \a originMs (absolute ms). Rows of the previous Play are dropped. */
+    /*! A measured Play starts at \a originMs (absolute ms). Rows of the previous Play are dropped. The rows live in a
+     *  FIXED ring of \a expectedRows slots allocated here, once, so a present never allocates; a Play that presents more
+     *  frames than that keeps the newest ones (dropped() says how many were overwritten). */
     void begin( double originMs, size_t expectedRows )
     {
         if( !m_enabled ) return;
         m_active = true;
         m_originMs = originMs;
-        m_rows.clear();
-        m_rows.reserve( expectedRows );
+        m_ring.assign( expectedRows > 0 ? expectedRows : 1, Row() );
+        m_total = 0;
         m_pending = Row();
         m_lastTickMs = -1.0;
         m_lastPresentMs = -1.0;
@@ -116,6 +195,9 @@ public:
         if( !active() ) return;
         row.presentMs -= m_originMs;
         if( row.readyMs >= 0.0 ) row.readyMs -= m_originMs;
+        for( double *stage : { &row.reqMs, &row.dqMs, &row.dsMs, &row.deMs, &row.rsMs, &row.reMs, &row.rndMs,
+                               &row.drawBeginMs } )
+            if( *stage > kUnknownMs / 2.0 ) *stage -= m_originMs;   // a stage may precede the Play's start: it stays negative
         row.intervalMs = m_lastPresentMs >= 0.0 ? row.presentMs - m_lastPresentMs : 0.0;
         row.prevEndMs = m_lastPresentEndMs;
         row.ticks = m_pending.ticks;
@@ -128,7 +210,8 @@ public:
         row.lastTickDiffMs = m_pending.lastTickDiffMs;
         row.grabMs = m_pending.grabMs;
         row.audioSyncs = m_pending.audioSyncs;
-        m_rows.push_back( row );
+        m_ring[m_total % m_ring.size()] = row;   // a fixed slot: no allocation
+        ++m_total;
         m_pending = Row();
         m_lastPresentMs = row.presentMs;
         m_lastTickMs = -1.0;
@@ -141,24 +224,36 @@ public:
         m_lastPresentEndMs = nowMs - m_originMs;
     }
 
-    const std::vector<Row> &rows() const { return m_rows; }
+    /*! The rows kept (at most the ring's size), oldest first: row(0) is the present numbered firstIndex(). */
+    size_t size() const { return m_total < m_ring.size() ? m_total : m_ring.size(); }
+    size_t capacity() const { return m_ring.size(); }
+    size_t total() const { return m_total; }                 // presents recorded this Play
+    size_t dropped() const { return m_total - size(); }      // overwritten by the ring
+    size_t firstIndex() const { return dropped(); }
+    bool empty() const { return size() == 0; }
+    const Row &row( size_t logicalIndex ) const { return m_ring[( firstIndex() + logicalIndex ) % m_ring.size()]; }
+    const Row *storage() const { return m_ring.data(); }     // the ring itself (a test pins that it never moves)
 
-    /*! The column names, in formatRow's order. */
+    /*! The column names, in formatRow's order (new columns are only ever appended). */
     static const char *header()
     {
         return "i,frame,pos,t,iv,ready,uil,draw,render,queue,grab,credit,prev_end,ticks,busy,pred,max_tick_gap,"
-               "adv,adv_frames,last_adv,last_tick_diff,audio_syncs";
+               "adv,adv_frames,last_adv,last_tick_diff,audio_syncs,"
+               "req,dq,ds,de,rs,re,rnd,draw_begin,configure,h2d,stage_ok";
     }
 
     static std::string formatRow( size_t index, const Row &r )
     {
-        char buf[384];
+        char buf[640];
         std::snprintf( buf, sizeof( buf ),
-                       "%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.3f,%d,%d,%d,%.3f,%d,%.4f,%.3f,%.0f,%d",
+                       "%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.3f,%d,%d,%d,%.3f,%d,%.4f,%.3f,%.0f,%d,"
+                       "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
                        static_cast<int>( index ), r.frame, r.position, r.presentMs, r.intervalMs, r.readyMs, r.uiLatencyMs, r.drawMs,
                        r.renderMs, r.queueMs, r.grabMs, r.creditFrames, r.prevEndMs, r.ticks, r.busyTicks,
                        r.predictiveTicks, r.maxTickGapMs, r.advances, r.advancedFrames, r.lastAdvanceMs,
-                       r.lastTickDiffMs, r.audioSyncs );
+                       r.lastTickDiffMs, r.audioSyncs,
+                       r.reqMs, r.dqMs, r.dsMs, r.deMs, r.rsMs, r.reMs, r.rndMs, r.drawBeginMs, r.configureMs, r.h2dMs,
+                       r.stagesOrdered() ? 1 : 0 );
         return std::string( buf );
     }
 
@@ -170,7 +265,8 @@ private:
     double m_lastPresentMs = -1.0;
     double m_lastPresentEndMs = -1.0;
     Row m_pending;
-    std::vector<Row> m_rows;
+    std::vector<Row> m_ring;   // fixed slots, sized once in begin()
+    size_t m_total = 0;        // presents recorded; slot = m_total % m_ring.size()
 };
 
 } // namespace playback_present_trace

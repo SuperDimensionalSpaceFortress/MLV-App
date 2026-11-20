@@ -1965,6 +1965,7 @@ bool RenderFrameThread::acquireReadySlotLocked( ReadyFrame *frame,
         frame->dualIsoBlackDelta = slot.dualIsoBlackDelta;
         frame->presentationContext = slot.presentationContext;
         frame->stageTimingTelemetry = slot.stageTimingTelemetry;
+        frame->traceStamps = slot.traceStamps;
     }
     return true;
 }
@@ -2176,6 +2177,9 @@ void RenderFrameThread::queueDecodeRequestLocked( int slotIndex, const RenderReq
     slot.outputMode = request.outputMode;
     slot.phase3Mode = request.phase3Mode;
     slot.presentationContext = request.presentationContext;
+    // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: present-trace stamps from clock values already held (no clock read, no insert)
+    playback_present_trace::stamp( slot.traceStamps.requestS, request.requestStageTime );
+    playback_present_trace::stamp( slot.traceStamps.decodeQueueS, decodeQueueStageTime );
     if( playbackSmokeTimelineTelemetryEnabled() )
     {
         slot.stageTimingTelemetry.insert(
@@ -2250,6 +2254,7 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
                          "phase3-3b-decoding" );
 
     FrameSlot &slot = m_frameSlots[entry.slotIndex];
+    playback_present_trace::stamp( slot.traceStamps.decodeStartS, decodeStartStageTime );
     if( playbackSmokeTimelineTelemetryEnabled() )
     {
         slot.stageTimingTelemetry.insert(
@@ -2284,6 +2289,7 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
                                          ( mlv_stage_timing_now() - rawStart ) * 1000.0 );
     }
     const double decodeEndStageTime = mlv_stage_timing_now();
+    playback_present_trace::stamp( slot.traceStamps.decodeEndS, decodeEndStageTime );
     if( playbackSmokeTimelineTelemetryEnabled() )
     {
         slot.stageTimingTelemetry.insert(
@@ -2506,6 +2512,7 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                                               mlv_stage_timing_now() );
         }
     };
+    playback_present_trace::stamp( slot.traceStamps.reconStartS, reconStartStageTime );
     if( detailedTimelineTelemetry )
     {
         slot.stageTimingTelemetry.insert(
@@ -3112,6 +3119,9 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
             QStringLiteral("phase3_recon_end_stage_time"),
             mlv_stage_timing_now() );
     }
+    // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: the one clock read the LIGHT path did not have; taken only when the trace is on
+    if( playback_present_trace::stampsEnabled() )
+        slot.traceStamps.reconEndS = mlv_stage_timing_now();
 }
 
 void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
@@ -4190,12 +4200,19 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const uint32_t reconQueuedFrameNumber = slot.queuedRequest.frameNumber;
     const uint64_t reconQueuedRequestSerial = slot.queuedRequest.requestSerial;
     const Debayered16ReconProvenance reconProvenance = slot.reconProvenance;
+    /* PLAYBACK-TRACE-LOWOVERHEAD-1 r1: the workers' present-trace stamps survive resetMetadata, but only for the frame they
+     * belong to: a slot that did not come through the decode queue holds an older frame's stamps (or none). */
+    const playback_present_trace::StageStamps preservedTraceStamps =
+        reconQueuedRequestSerial == m_activeFrameRequestSerial
+            ? slot.traceStamps
+            : playback_present_trace::StageStamps();
     /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: a frame the DecodeWorker decoded reports the worker's snapshot; the
      * render-thread thread-locals describe it only when this thread decoded the frame itself (runSerial).
      * CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: an inline reduced recon snapshots its own decode here too. */
     FrameSlot::RawUint16DecodeTelemetry workerRawTelemetry =
         decodedRawFrame ? slot.rawDecodeTelemetry : FrameSlot::RawUint16DecodeTelemetry();
     slot.resetMetadata();
+    slot.traceStamps = preservedTraceStamps;
     const double prologueAfterResetMetadataStageTime =
         detailedTimelineTelemetry ? mlv_stage_timing_now() : 0.0;
     slot.frameNumber = m_activeFrameNumber;
@@ -4471,6 +4488,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
 
     const double render_start = mlv_stage_timing_now();
+    playback_present_trace::stamp( slot.traceStamps.renderStartS, render_start );
     if( detailedTimelineTelemetry )
     {
         slot.stageTimingTelemetry.insert(

@@ -2486,6 +2486,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     m_timerId = startTimer( 40, Qt::PreciseTimer ); //25fps initially only, is set after import
     m_timerCacheId = startTimer( 1000 ); //1fps
     m_playbackPresentTrace.setEnabled( mlvappPlaybackPresentTraceRequested() );
+    playback_present_trace::setStampsEnabled( m_playbackPresentTrace.enabled() );
 
     //Connect Export Handler
     connect( this, SIGNAL(exportReady()), this, SLOT(exportHandler()) );
@@ -28494,6 +28495,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             traceRow.renderMs = renderWorkMs;
             traceRow.queueMs = queueWaitMs;
             traceRow.creditFrames = m_playbackPaceGuard.creditFrames();
+            // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: the workers' stage stamps, plus configure and H2D from the frame's own keys
+            traceRow.setStages( readyFrame.traceStamps );
+            if( timing.contains( QStringLiteral("llrawproc_dual_iso_split_configure_ms") ) )
+                traceRow.configureMs = telemetryDoubleValue( timing, "llrawproc_dual_iso_split_configure_ms" );
+            if( timing.contains( QStringLiteral("gpu_playback_recon_async_h2d_upload_ms") ) )
+                traceRow.h2dMs = telemetryDoubleValue( timing, "gpu_playback_recon_async_h2d_upload_ms" );
             m_playbackPresentTrace.notePresent( traceRow );
         }
         // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup split, only for a present a presenter ran.
@@ -31780,16 +31787,17 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     if( m_playbackPresentTrace.enabled() )
     {
         const qulonglong traceSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
-        qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace_header session=%1 rows=%2 cols=%3" )
+        // dropped = presents the fixed ring overwrote (the oldest); i below is the present's own number in the Play
+        qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace_header session=%1 rows=%2 dropped=%3 cols=%4" )
                                  .arg( traceSession )
-                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.rows().size() ) )
+                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.size() ) )
+                                 .arg( static_cast<qulonglong>( m_playbackPresentTrace.dropped() ) )
                                  .arg( QLatin1String( playback_present_trace::Recorder::header() ) );
-        const std::vector<playback_present_trace::Row> &traceRows = m_playbackPresentTrace.rows();
-        for( size_t i = 0; i < traceRows.size(); ++i )
+        for( size_t i = 0; i < m_playbackPresentTrace.size(); ++i )
             qInfo().noquote() << QStringLiteral( "playback_smoke.present_trace session=%1 row=%2" )
                                      .arg( traceSession )
-                                     .arg( QString::fromStdString(
-                                         playback_present_trace::Recorder::formatRow( i, traceRows[i] ) ) );
+                                     .arg( QString::fromStdString( playback_present_trace::Recorder::formatRow(
+                                         m_playbackPresentTrace.firstIndex() + i, m_playbackPresentTrace.row( i ) ) ) );
     }
 
     if( perfFieldLogEnabled() )
@@ -36006,6 +36014,7 @@ void MainWindow::drawFrameReady()
     }
 
     const double display_start = mlv_stage_timing_now();
+    playback_present_trace::stamp( readyFrame.traceStamps.drawBeginS, display_start );
     if( m_playbackSmokeTimelineTelemetry )
     {
         readyFrame.stageTimingTelemetry.insert(

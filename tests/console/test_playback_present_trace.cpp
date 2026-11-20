@@ -47,15 +47,44 @@ void driveOnePlay(Recorder &trace)
     trace.end();
 }
 
-QString mainWindowSource()
+QString sourceOf(const QString &relativePath)
 {
-    const QString path = repo_file_path(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString path = repo_file_path(relativePath);
     ASSERT_FALSE(path.isEmpty());
     QFile file(path);
     ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
     QTextStream stream(&file);
     return stream.readAll();
 }
+
+QString mainWindowSource()
+{
+    return sourceOf(QStringLiteral("platform/qt/MainWindow.cpp"));
+}
+
+// PLAYBACK-TRACE-LOWOVERHEAD-1 r1: one frame's worker stamps in stage-clock SECONDS, 2 ms apart per stage from request.
+// Absolute ms with the Play origin at 1000: request 1001, ... draw begin 1016.
+playback_present_trace::StageStamps stagesFrom(double requestS)
+{
+    playback_present_trace::StageStamps s;
+    s.requestS = requestS;
+    s.decodeQueueS = requestS + 0.002;
+    s.decodeStartS = requestS + 0.004;
+    s.decodeEndS = requestS + 0.006;
+    s.reconStartS = requestS + 0.008;
+    s.reconEndS = requestS + 0.020;
+    s.renderStartS = requestS + 0.021;
+    s.drawBeginS = requestS + 0.030;
+    return s;
+}
+
+// RAII: the process-wide stage switch is restored so a test never leaks it into the next.
+struct StampGateScope
+{
+    explicit StampGateScope(bool on) : previous(playback_present_trace::stampsEnabled()) { playback_present_trace::setStampsEnabled(on); }
+    ~StampGateScope() { playback_present_trace::setStampsEnabled(previous); }
+    bool previous;
+};
 
 } // namespace
 
@@ -65,8 +94,8 @@ TEST(PlaybackPresentTrace, OffByDefaultItRecordsAndAllocatesNothing)
     ASSERT_FALSE(trace.enabled());
     driveOnePlay(trace);
     ASSERT_FALSE(trace.active());
-    ASSERT_TRUE(trace.rows().empty());
-    ASSERT_EQ(static_cast<size_t>(0), trace.rows().capacity());
+    ASSERT_TRUE(trace.empty());
+    ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
 }
 
 TEST(PlaybackPresentTrace, SwitchedOffAgainItStaysInert)
@@ -75,8 +104,8 @@ TEST(PlaybackPresentTrace, SwitchedOffAgainItStaysInert)
     trace.setEnabled(true);
     trace.setEnabled(false);
     driveOnePlay(trace);
-    ASSERT_TRUE(trace.rows().empty());
-    ASSERT_EQ(static_cast<size_t>(0), trace.rows().capacity());
+    ASSERT_TRUE(trace.empty());
+    ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
 }
 
 TEST(PlaybackPresentTrace, OnEveryPresentGetsARowWithTheTimerSinceThePreviousPresent)
@@ -85,8 +114,8 @@ TEST(PlaybackPresentTrace, OnEveryPresentGetsARowWithTheTimerSinceThePreviousPre
     trace.setEnabled(true);
     driveOnePlay(trace);
     ASSERT_FALSE(trace.active());   // end() stops recording; the rows stay for the log
-    ASSERT_EQ(static_cast<size_t>(2), trace.rows().size());
-    const Row &a = trace.rows()[0];
+    ASSERT_EQ(static_cast<size_t>(2), trace.size());
+    const Row &a = trace.row(0);
     ASSERT_NEAR(10.0, a.presentMs, 1e-9);
     ASSERT_NEAR(5.0, a.readyMs, 1e-9);
     ASSERT_NEAR(0.0, a.intervalMs, 1e-9);
@@ -94,7 +123,7 @@ TEST(PlaybackPresentTrace, OnEveryPresentGetsARowWithTheTimerSinceThePreviousPre
     ASSERT_EQ(1, a.advances);
     ASSERT_NEAR(1.5, a.lastAdvanceMs, 1e-9);
     ASSERT_NEAR(-1.0, a.prevEndMs, 1e-9);
-    const Row &b = trace.rows()[1];
+    const Row &b = trace.row(1);
     ASSERT_NEAR(51.7, b.presentMs, 1e-9);
     ASSERT_NEAR(41.7, b.intervalMs, 1e-9);
     ASSERT_NEAR(-1.0, b.readyMs, 1e-9);   // an unknown ready time stays unknown, never shifted
@@ -122,10 +151,10 @@ TEST(PlaybackPresentTrace, AHoldIsNotAnAdvanceAndANewPlayStartsClean)
     Row r;
     r.presentMs = 5020.0;
     trace.notePresent(r);
-    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
-    ASSERT_EQ(0, trace.rows()[0].advances);
-    ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
-    ASSERT_NEAR(0.0, trace.rows()[0].intervalMs, 1e-9);
+    ASSERT_EQ(static_cast<size_t>(1), trace.size());
+    ASSERT_EQ(0, trace.row(0).advances);
+    ASSERT_NEAR(-1.0, trace.row(0).lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(0.0, trace.row(0).intervalMs, 1e-9);
 }
 
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
@@ -134,10 +163,217 @@ TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
     trace.setEnabled(true);
     driveOnePlay(trace);
     const std::string header = Recorder::header();
-    const std::string row = Recorder::formatRow(1, trace.rows()[1]);
+    const std::string row = Recorder::formatRow(1, trace.row(1));
     const auto commas = [](const std::string &s) { size_t n = 0; for (char c : s) n += c == ',' ? 1 : 0; return n; };
     ASSERT_EQ(commas(header), commas(row));
     ASSERT_EQ(0u, row.find("1,2,2,51.700,41.700,-1.000,"));
+}
+
+// ---- PLAYBACK-TRACE-LOWOVERHEAD-1 r1: per-frame stage stamps at LIGHT cost ----
+
+TEST(PlaybackPresentTraceStages, AFrameStoresItsStageStampsOrderedAndRebasedToThePlayOrigin)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 16);
+    Row r;
+    r.frame = 7;
+    r.setStages(stagesFrom(1.001));        // request at 1001 ms absolute
+    r.readyMs = 1022.0;
+    r.presentMs = 1035.0;
+    r.configureMs = 6.1;
+    r.h2dMs = 0.4;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.size());
+    const Row &a = trace.row(0);
+    ASSERT_NEAR(1.0, a.reqMs, 1e-6);
+    ASSERT_NEAR(3.0, a.dqMs, 1e-6);
+    ASSERT_NEAR(5.0, a.dsMs, 1e-6);
+    ASSERT_NEAR(7.0, a.deMs, 1e-6);
+    ASSERT_NEAR(9.0, a.rsMs, 1e-6);
+    ASSERT_NEAR(21.0, a.reMs, 1e-6);
+    ASSERT_NEAR(22.0, a.rndMs, 1e-6);
+    ASSERT_NEAR(31.0, a.drawBeginMs, 1e-6);
+    ASSERT_NEAR(22.0, a.readyMs, 1e-9);
+    ASSERT_NEAR(35.0, a.presentMs, 1e-9);
+    ASSERT_NEAR(6.1, a.configureMs, 1e-9);   // a duration: never rebased
+    ASSERT_NEAR(0.4, a.h2dMs, 1e-9);
+    ASSERT_TRUE(a.stagesOrdered());
+    // out of order is reported, not hidden
+    Row bad = a;
+    bad.reMs = 4.0;
+    ASSERT_FALSE(bad.stagesOrdered());
+}
+
+TEST(PlaybackPresentTraceStages, AStageThatWasNeverStampedStaysUnknownAndAStageBeforeThePlayStaysNegative)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    playback_present_trace::StageStamps s = stagesFrom(0.990);   // requested 10 ms before the Play's origin
+    s.reconEndS = 0.0;                                           // this one was never stamped
+    Row r;
+    r.setStages(s);
+    r.presentMs = 1040.0;
+    trace.notePresent(r);
+    const Row &a = trace.row(0);
+    ASSERT_NEAR(-10.0, a.reqMs, 1e-6);
+    ASSERT_TRUE(a.reMs <= playback_present_trace::kUnknownMs / 2.0);
+    ASSERT_TRUE(a.configureMs <= playback_present_trace::kUnknownMs / 2.0);
+    ASSERT_TRUE(a.stagesOrdered());
+}
+
+TEST(PlaybackPresentTraceStages, TheRingKeepsTheNewestRowsWithTheirStagesAndNeverReallocates)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(0.0, 4);
+    const Row *const ring = trace.storage();
+    ASSERT_EQ(static_cast<size_t>(4), trace.capacity());
+    for (int i = 0; i < 10; ++i)
+    {
+        Row r;
+        r.frame = 100 + i;
+        r.setStages(stagesFrom(1.0 + i));   // each present's stages are 1 s apart
+        r.readyMs = 1000.0 * (1.0 + i) + 22.0;
+        r.presentMs = 1000.0 * (1.0 + i) + 35.0;
+        trace.notePresent(r);
+    }
+    ASSERT_EQ(static_cast<size_t>(4), trace.size());
+    ASSERT_EQ(static_cast<size_t>(10), trace.total());
+    ASSERT_EQ(static_cast<size_t>(6), trace.dropped());
+    ASSERT_EQ(static_cast<size_t>(6), trace.firstIndex());
+    ASSERT_EQ(static_cast<size_t>(4), trace.capacity());
+    ASSERT_TRUE(ring == trace.storage());   // a present never moved or grew the storage
+    for (size_t k = 0; k < trace.size(); ++k)
+    {
+        const Row &a = trace.row(k);
+        const int i = 6 + static_cast<int>(k);
+        ASSERT_EQ(100 + i, a.frame);                                   // oldest first
+        ASSERT_NEAR(1000.0 * (1.0 + i), a.reqMs, 1e-6);                // its own stamps, not a neighbour's
+        ASSERT_NEAR(1000.0 * (1.0 + i) + 20.0, a.reMs, 1e-6);
+        ASSERT_TRUE(a.stagesOrdered());
+    }
+}
+
+TEST(PlaybackPresentTraceStages, ANewPlayStartsTheRingClean)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(0.0, 3);
+    for (int i = 0; i < 5; ++i)
+    {
+        Row r;
+        r.frame = i;
+        r.setStages(stagesFrom(1.0 + i));
+        trace.notePresent(r);
+    }
+    trace.begin(0.0, 3);
+    ASSERT_TRUE(trace.empty());
+    ASSERT_EQ(static_cast<size_t>(0), trace.total());
+    ASSERT_EQ(static_cast<size_t>(0), trace.dropped());
+}
+
+TEST(PlaybackPresentTraceStages, TheDumpCarriesTheStagesAndTheHeaderStillMatchesTheRow)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 8);
+    Row r;
+    r.frame = 7;
+    r.position = 7;
+    r.setStages(stagesFrom(1.001));
+    r.readyMs = 1022.0;
+    r.presentMs = 1035.0;
+    r.configureMs = 6.1;
+    r.h2dMs = 0.4;
+    trace.notePresent(r);
+    const std::string header = Recorder::header();
+    const std::string row = Recorder::formatRow(trace.firstIndex(), trace.row(0));
+    const auto commas = [](const std::string &s) { size_t n = 0; for (char c : s) n += c == ',' ? 1 : 0; return n; };
+    ASSERT_EQ(commas(header), commas(row));
+    // the original columns keep their place; the stage columns are appended
+    ASSERT_TRUE(header.find("audio_syncs,req,dq,ds,de,rs,re,rnd,draw_begin,configure,h2d,stage_ok") != std::string::npos);
+    ASSERT_TRUE(row.find(",1.000,3.000,5.000,7.000,9.000,21.000,22.000,31.000,6.100,0.400,1") != std::string::npos);
+}
+
+TEST(PlaybackPresentTraceStages, WithTheSwitchOffTheStageHooksAreNoOps)
+{
+    {
+        StampGateScope off(false);
+        double slotField = 0.0;
+        playback_present_trace::stamp(slotField, 12.5);
+        ASSERT_NEAR(0.0, slotField, 0.0);
+        ASSERT_FALSE(playback_present_trace::stampsEnabled());
+    }
+    {
+        StampGateScope on(true);
+        double slotField = 0.0;
+        playback_present_trace::stamp(slotField, 12.5);
+        ASSERT_NEAR(12.5, slotField, 0.0);
+    }
+    // a disabled recorder takes no stages either, whatever the stamp switch says
+    StampGateScope on(true);
+    Recorder trace;
+    Row r;
+    r.setStages(stagesFrom(1.0));
+    trace.begin(0.0, 8);
+    trace.notePresent(r);
+    ASSERT_TRUE(trace.empty());
+    ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
+}
+
+TEST(PlaybackPresentTraceWiring, EveryStageHookIsOneGuardedStoreOnAKnownThread)
+{
+    const QString render = sourceOf(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    // request and decode-queue: queueDecodeRequestLocked (before the slot is handed to a worker)
+    ASSERT_EQ(1, render.count(QStringLiteral("    playback_present_trace::stamp( slot.traceStamps.requestS, request.requestStageTime );\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral("    playback_present_trace::stamp( slot.traceStamps.decodeQueueS, decodeQueueStageTime );\n")));
+    // decode worker, recon worker, render thread: each reuses a clock value the LIGHT path already holds
+    ASSERT_EQ(1, render.count(QStringLiteral("    playback_present_trace::stamp( slot.traceStamps.decodeStartS, decodeStartStageTime );\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral("    playback_present_trace::stamp( slot.traceStamps.decodeEndS, decodeEndStageTime );\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral("    playback_present_trace::stamp( slot.traceStamps.reconStartS, reconStartStageTime );\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral("    playback_present_trace::stamp( slot.traceStamps.renderStartS, render_start );\n")));
+    // the process stage's resetMetadata() must not wipe them, and only the frame they belong to may keep them
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "    slot.resetMetadata();\n"
+        "    slot.traceStamps = preservedTraceStamps;\n")));
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "        reconQueuedRequestSerial == m_activeFrameRequestSerial\n"
+        "            ? slot.traceStamps\n"
+        "            : playback_present_trace::StageStamps();\n")));
+    // the one clock read the LIGHT path did not have is taken only when the trace is on
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "    if( playback_present_trace::stampsEnabled() )\n"
+        "        slot.traceStamps.reconEndS = mlv_stage_timing_now();\n")));
+    // the slot's stamps ride to the GUI on the ReadyFrame, and a slot reuse clears them
+    ASSERT_EQ(1, render.count(QStringLiteral("        frame->traceStamps = slot.traceStamps;\n")));
+    const QString header = sourceOf(QStringLiteral("platform/qt/RenderFrameThread.h"));
+    ASSERT_EQ(2, header.count(QStringLiteral("playback_present_trace::StageStamps traceStamps;")));
+    ASSERT_EQ(1, header.count(QStringLiteral("            traceStamps = playback_present_trace::StageStamps();")));
+    // no JSON insert, string or lock was added for the stamps
+    ASSERT_FALSE(render.contains(QStringLiteral("traceStamps.requestS = ")));
+}
+
+TEST(PlaybackPresentTraceWiring, TheWindowSwitchesTheStageHooksWithTheRecorderAndReadsThemAtThePresent)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "    m_playbackPresentTrace.setEnabled( mlvappPlaybackPresentTraceRequested() );\n"
+        "    playback_present_trace::setStampsEnabled( m_playbackPresentTrace.enabled() );\n")));
+    // the GUI thread's draw-begin reuses display_start (already read), stored on the ReadyFrame
+    ASSERT_EQ(1, source.count(QStringLiteral("    playback_present_trace::stamp( readyFrame.traceStamps.drawBeginS, display_start );\n")));
+    // the present row takes the stamps, and configure/H2D from the frame's own telemetry keys when they are there
+    ASSERT_EQ(1, source.count(QStringLiteral("            traceRow.setStages( readyFrame.traceStamps );\n")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "            if( timing.contains( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") ) )\n"
+        "                traceRow.configureMs = telemetryDoubleValue( timing, \"llrawproc_dual_iso_split_configure_ms\" );\n")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "            if( timing.contains( QStringLiteral(\"gpu_playback_recon_async_h2d_upload_ms\") ) )\n"
+        "                traceRow.h2dMs = telemetryDoubleValue( timing, \"gpu_playback_recon_async_h2d_upload_ms\" );\n")));
+    // the dump walks the ring oldest-first and says how many rows the ring overwrote
+    ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.row( i )")));
+    ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.dropped()")));
 }
 
 TEST(PlaybackPresentTraceWiring, ReadOnceFromTheEnvironmentAndEveryHookIsGuarded)
