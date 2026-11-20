@@ -632,6 +632,9 @@ int run_scale(const std::string & root, double seconds)
 
 } // namespace
 
+// tests/pipeline/test_lj92_pred1_reader.cpp includes this file to run run_selftest() inside pipeline_tests (so CI runs it);
+// it defines the macro below to leave this main out.
+#ifndef LJ92_PRED1_READER_TOOL_NO_MAIN
 int main(int argc, char ** argv)
 {
     std::string mode, root;
@@ -654,3 +657,4 @@ int main(int argc, char ** argv)
     std::fprintf(stderr, "usage: lj92_pred1_reader_tool --selftest|--bench|--scale [--seed N] [--iters N] [--seconds S] [--root DIR]\n");
     return 2;
 }
+#endif // LJ92_PRED1_READER_TOOL_NO_MAIN
