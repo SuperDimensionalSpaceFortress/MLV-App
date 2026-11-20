@@ -2451,33 +2451,71 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         """r5b, adversary A1 and A2 on 2420b65f, plus advisory A4. A1: the clock is stepped back an hour after the root (T) and member 201 started, and a pre-snapshot
         orphan 203 (parent 202 already gone) reads OLDER than the root; the old code classified it as an outsider and confirmed the kill while it lived. A creation time
         ahead of the clock proves the step, so the snapshot is unknown. A2: the same on the wait side, with a reused parent pid. Controls: a normal clock, and a skew
-        inside the 10 s tolerance, change nothing. A4: a snapshot whose property getter throws is an unknown tree, never a throw."""
+        inside the 2 s tolerance (r6: cut from 10 s; a 5 s rollback is now a step), change nothing. A4: a snapshot whose property getter throws is an unknown tree, never a throw."""
         got = self.snapshot_and_wait(
             "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
             "$rows = @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddHours(-1).AddSeconds(4)), (Row 600 4 $t.AddHours(-2))))\n"
             "$back = $t.AddHours(-1).AddMinutes(10).Ticks\n"
             "$a1 = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $back\n"
             "$a1Control = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddMinutes(5).Ticks\n"
-            "$skew = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddSeconds(-5).Ticks\n"
+            "$skew = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddSeconds(-1).Ticks\n"
+            # r6 (adversary pass 7 A1(b)): a five-second rollback is past the 2 s tolerance, on the snapshot side and on the wait side
+            "$a1b = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -NowTicks $t.AddSeconds(-5).Ticks\n"
             "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 600 4 $t.AddHours(-2)))) -NowTicks $t.AddMinutes(5).Ticks\n"
             "$scan = { @($sys + @((Row 600 4 $t.AddHours(-2)), (Row 202 600 $t.AddMinutes(-1)), (Row 203 202 $t.AddSeconds(4)))) }\n"
             "$a2 = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan $scan -NowTicks $t.AddMinutes(-1).AddSeconds(30).Ticks\n"
             "$a2Control = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(1)))) } -NowTicks $t.AddMinutes(5).Ticks\n"
+            "$a2b = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(1)))) } -NowTicks $t.AddSeconds(-5).Ticks\n"
+            "$a2Skew = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 201 100 $t.AddSeconds(1)))) } -NowTicks $t.AddSeconds(-1).Ticks\n"
             "$getter = [pscustomobject]@{ rootProcessId = 100; rootCreationTicks = 1; members = @(); error = $null }\n"
             "Add-Member -InputObject $getter -MemberType ScriptProperty -Name ok -Value { throw 'snapshot getter failed' }\n"
             "$a4 = Wait-AttrCudaProcessTreeGone -Snapshot $getter -WaitMs 1200 -Scan { @() }\n"
-            "[ordered]@{ a1 = $a1.ok; a1Why = $a1.error; a1Control = $a1Control.ok; skew = $skew.ok; a2 = $a2.confirmed; a2Why = $a2.error; a2Control = $a2Control.confirmed;\n"
+            "[ordered]@{ a1 = $a1.ok; a1Why = $a1.error; a1Control = $a1Control.ok; skew = $skew.ok; a1b = $a1b.ok; a1bWhy = $a1b.error; a2 = $a2.confirmed; a2Why = $a2.error; a2Control = $a2Control.confirmed;\n"
+            "            a2b = $a2b.confirmed; a2bWhy = $a2b.error; a2Skew = $a2Skew.confirmed; a2SkewWhy = $a2Skew.error;\n"
             "            a2ControlSurvivors = @($a2Control.survivors); a4 = $a4.confirmed; a4Why = $a4.error } | ConvertTo-Json -Compress")
         self.assertFalse(got["a1"], f"a creation time ahead of the clock means a stepped-back clock: the tree is unknown: {got}")
         self.assertIn("clock-stepped-back", got["a1Why"], got)
         self.assertTrue(got["a1Control"], f"a normal clock changes nothing: {got}")
-        self.assertTrue(got["skew"], f"a skew inside the 10 s tolerance is not a step: {got}")
+        self.assertTrue(got["skew"], f"a skew inside the 2 s tolerance is not a step: {got}")
+        self.assertFalse(got["a1b"], f"r6 A1(b): a five-second rollback is past the 2 s tolerance: the tree is unknown: {got}")
+        self.assertIn("clock-stepped-back", got["a1bWhy"], got)
+        self.assertFalse(got["a2b"], f"r6 A1(b): a five-second rollback on the wait side is never a confirmed kill: {got}")
+        self.assertIn("clock-stepped-back", got["a2bWhy"], got)
+        self.assertNotIn("clock-stepped-back", str(got["a2SkewWhy"]), f"a 2 s skew on the wait side is inside the tolerance: {got}")
         self.assertFalse(got["a2"], f"a live descendant is never confirmed gone on a stepped-back clock: {got}")
         self.assertIn("clock-stepped-back", got["a2Why"], got)
         self.assertFalse(got["a2Control"], f"a normal clock still names the live recorded member 201 as a survivor: {got}")
         self.assertEqual(got["a2ControlSurvivors"], [201], got)
         self.assertFalse(got["a4"], got)
         self.assertIn("tree-unknown", got["a4Why"], got)
+
+    def test_r6_no_scan_is_granted_with_under_its_one_second_floor_left(self) -> None:
+        """r6, adversary pass 7 A2 on e75704ae. The wait granted `Max(1, floor(left/1000))` s from a budget read earlier, so a scan could start with 950 ms left and end past
+        the bound; Invoke-VenueBoundedProcess did the same from a stored leftMs. Behavior: a -WaitMs under 1 s starts no scan; 1200 ms starts one. Source: the grant re-reads
+        the clock where the timeout is computed, breaks under the floor, and no 1 s minimum is forced on either site."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
+            "$global:scans = 0\n"
+            "$under = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 950 -Scan { $global:scans++; @($sys) }\n"
+            "$underScans = $global:scans; $global:scans = 0\n"
+            "$fits = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { $global:scans++; @($sys) }\n"
+            "[ordered]@{ under = $under.confirmed; underWhy = $under.error; underScans = $underScans; fits = $fits.confirmed; fitsScans = $global:scans } | ConvertTo-Json -Compress")
+        self.assertFalse(got["under"], f"a bound under the 1 s floor is no time to confirm: {got}")
+        self.assertEqual(got["underScans"], 0, f"no scan starts with under 1 s left: {got}")
+        self.assertEqual(got["underWhy"], "no-time-to-confirm", got)
+        self.assertTrue(got["fits"], got)
+        self.assertEqual(got["fitsScans"], 1, got)
+        wait_src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
+        start = wait_src.index("function Wait-AttrCudaProcessTreeGone")
+        body = wait_src[start:wait_src.index("function Get-AttrCudaProcessCpuSnapshot")]
+        self.assertIn("$remainMs = $WaitMs - $clock.ElapsedMilliseconds\n", body)
+        self.assertIn("if ($remainMs -lt $scanFloorMs) { break }", body, "the floor is re-checked where the scan's timeout is granted")
+        self.assertNotIn("[Math]::Max(1,", body, "no 1 s minimum is forced on a scan the budget cannot cover")
+        venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        line = next(ln for ln in venue.splitlines() if "Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id" in ln)
+        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.ElapsedMilliseconds) / 1000.0); if ($grantSec -ge 1)", line)
+        self.assertNotIn("$leftMs", line, "the snapshot timeout is read at the grant, never from a stored value")
 
     def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
         """r3, adversary A2 on 4d69f211. Old member 201 exits; the root starts a NEW child that reuses pid 201 (another creation time). It is not the recorded identity,

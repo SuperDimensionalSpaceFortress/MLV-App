@@ -5066,12 +5066,12 @@ function Get-AttrCudaProcessTreeSnapshot {
     $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
     try {
         $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
-        # r5b fix (adversary A1 on 2420b65f): a creation time AHEAD of the clock (beyond 10 s of skew) proves the clock was stepped back after that process started, so the
+        # r5b fix (adversary A1 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started, so the
         # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
         # -NowTicks is the test seam; the check is inline because VenueChain and DualVenueRunner embed this function alone, by name.
         $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [datetime]::UtcNow.Ticks })
         foreach ($row in $rows) {
-            if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 100000000L)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
+            if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 20000000L)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
         }
         $byParent = @{}
         $rootTicks = $null
@@ -5195,13 +5195,17 @@ function Wait-AttrCudaProcessTreeGone {
     $lastError = 'no-time-to-confirm'
     while (($WaitMs - $clock.ElapsedMilliseconds) -ge $scanFloorMs) {
         try {
-            $leftSec = [int][Math]::Max(1, [Math]::Floor(($WaitMs - $clock.ElapsedMilliseconds) / 1000.0))
+            # r5b fix 2 (adversary A2 on e75704ae): the floor is re-checked at the moment the scan's timeout is granted (the 250 ms sleep and the work since the loop
+            # test have used budget), so a scan never starts, or is granted its 1 s minimum, with less than $scanFloorMs left.
+            $remainMs = $WaitMs - $clock.ElapsedMilliseconds
+            if ($remainMs -lt $scanFloorMs) { break }
+            $leftSec = [int][Math]::Floor($remainMs / 1000.0)
             $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
-            # r5b fix (adversary A2 on 2420b65f): a creation time AHEAD of the clock (beyond 10 s of skew) proves the clock was stepped back after that process started; the
+            # r5b fix (adversary A2 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started; the
             # creation-time ordering of the climb below is then untrustworthy, so the kill is UNCONFIRMED (fail closed), whatever the other rows show.
             $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [datetime]::UtcNow.Ticks })
             foreach ($futureRow in $rows) {
-                if ($null -ne $futureRow -and $null -ne $futureRow.CreationDate -and ([datetime]$futureRow.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 100000000L)) {
+                if ($null -ne $futureRow -and $null -ne $futureRow.CreationDate -and ([datetime]$futureRow.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 20000000L)) {
                     return [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = "clock-stepped-back pid=$($futureRow.ProcessId)" }
                 }
             }
