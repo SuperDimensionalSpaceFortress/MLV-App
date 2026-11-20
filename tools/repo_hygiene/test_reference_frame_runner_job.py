@@ -998,6 +998,29 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
         self.assert_no_candidate_anywhere_in_the_outbox()
 
+    # --- adversary A1 on ac80ede1 (introduced major): the stamp assumes the manifest is a JSON object -------------------------------------------------
+    # A manifest whose root is an ARRAY parses, takes the stamp on every element and serializes back as an array, so the stamp "lands" ($true) but
+    # frame_provenance does not read an array root as stamped, and the voided capture is released and indexed. The stamp therefore requires an object
+    # root; any other root counts as "stamp failed", which sends the job on to the sibling marker and then the quarantine rename.
+    ARRAY_ROOT = "'[{\"status\":\"candidate-unreviewed\"},{\"status\":\"candidate-unreviewed\"}]'"
+    RECON_MANIFEST_ARRAY_ROOT = (RECON_MANIFEST_ANCHOR, RECON_MANIFEST_ANCHOR + "; [IO.File]::WriteAllText($reconManifestPath, " + ARRAY_ROOT + ")")
+    CANDIDATE_MANIFEST_ARRAY_ROOT = ("$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'",
+                                     "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'; [IO.File]::WriteAllText($candidatePath, " + ARRAY_ROOT + ")")
+
+    def test_the_result_gone_and_the_marker_failing_an_unproven_recon_capture_with_an_array_root_manifest_is_not_indexable(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("recon-a1-array228", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0),
+                                                 edit=self.RECON_MANIFEST_ARRAY_ROOT,
+                                                 more_edits=(self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout, "the stamp claimed to land on a manifest whose root is not an object")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_the_225_sibling_a_view_changed_capture_with_an_array_root_manifest_and_no_marker_or_result_is_not_indexable(self) -> None:
+        # the 225 sibling (pre-existing code, same pattern), on a default (no -GpuPlaybackRecon) job: the capture is written straight into the outbox
+        ran, *_ = self.run_stand_in_capture("a1-array225", edit=self.VIEW_CHANGED,
+                                            more_edits=(self.CANDIDATE_MANIFEST_ARRAY_ROOT, self.MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout, "the stamp claimed to land on a manifest whose root is not an object")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
     def test_a_recon_capture_the_job_could_not_void_stays_in_staging_and_result_json_says_where(self) -> None:
         ran, pub = self.run_recon_voided("recon-b1-held", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS, self.RECON_MOVE_FAILS)
         result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))

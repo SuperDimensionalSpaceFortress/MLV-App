@@ -482,6 +482,8 @@ if ($reconEvidence.checked -and -not $reconEvidence.ok) {
         $reconInvalidated = $false
         try {
             $reconDoc = [IO.File]::ReadAllText($reconManifestPath) | ConvertFrom-Json
+            # the stamp is only a stamp on an object root: an array root takes it on every element and serializes back as an array no reader reads as stamped
+            if ($reconDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'MANIFEST_ROOT_NOT_AN_OBJECT' }
             $reconDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
             $reconDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
             $reconDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue $reconInvalidReasons -Force
@@ -840,6 +842,8 @@ if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
     }
     try {
         $candidateDoc = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json
+        # the stamp is only a stamp on an object root (see the same guard in the GPU recon block)
+        if ($candidateDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'MANIFEST_ROOT_NOT_AN_OBJECT' }
         $candidateDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
         $candidateDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
         $candidateDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue $candidateInvalidReasons -Force
