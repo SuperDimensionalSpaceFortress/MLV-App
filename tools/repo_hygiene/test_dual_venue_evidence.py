@@ -16626,6 +16626,56 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                     self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
                     self.assertIn(gap, got["reason"], got)
 
+    def test_r14_adv_a1_a_binding_value_the_evaluator_cannot_match_is_unbound_never_a_late_fail(self) -> None:
+        """r14 (r14 adversary A1 on 1376a142, input: the committed s1 fstoggle spec with windowTogglesDriven's value 4 -> [4] in acceptance.cuda and
+        supplementary.cuda, over a healthy log): Get-DvWindowToggleCriteriaGap read the value through a [string] cast, so [4] read '4' and the spec was admitted,
+        while Test-DvCriteria compares the RAW value (4 -eq @(4) is false) and failed a healthy capture late. A binding counts only when its value is the JSON
+        scalar the evaluator matches: a number for the four counts (as DualVenueRunner.psm1's framesExported binding reads it), a string for the reason. Every
+        non-scalar spelling is the typed WINDOW_TOGGLES_CRITERIA_UNBOUND refusal; a spec the guard admits passes Test-DvCriteria on a healthy log in both sets."""
+        full = self.fstoggle_spec()
+        def with_value(metric: str, value: object, sets: tuple[str, ...] = ("acceptance", "supplementary")) -> dict:
+            spec = json.loads(json.dumps(full))
+            for set_name in sets:
+                for row in spec["criteria"][set_name]["cuda"]:
+                    if row.get("metric") == metric:
+                        row["value"] = value
+            return spec
+        counts = ("windowTogglesRequested", "windowTogglesDriven", "windowTogglesKeptPlaying", "windowTogglesAdvanced")
+        cases = []
+        for metric in counts:
+            cases += [(f"adversary input: {metric} value [4] in both sets", with_value(metric, [4]), True),
+                      (f"{metric} value [4] in supplementary only", with_value(metric, [4], ("supplementary",)), True)]
+        cases += [("windowTogglesDriven value [[4]]", with_value("windowTogglesDriven", [[4]]), True),
+                  ('windowTogglesDriven value ["4"]', with_value("windowTogglesDriven", ["4"]), True),
+                  ('windowTogglesDriven value "4" (a string, not the number the evaluator reads)', with_value("windowTogglesDriven", "4"), True),
+                  ("windowTogglesDriven value {\"v\": 4}", with_value("windowTogglesDriven", {"v": 4}), True),
+                  ("windowTogglesDriven value true", with_value("windowTogglesDriven", True), True),
+                  ('windowToggleEvidenceReason value ["ok"]', with_value("windowToggleEvidenceReason", ["ok"]), True),
+                  ("control: the committed spec", full, False),
+                  ("control: windowTogglesDriven value 4.0 (a JSON number)", with_value("windowTogglesDriven", 4.0), False)]
+        with tempfile.TemporaryDirectory(prefix="wt-r14adv-") as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps([{"spec": spec, "log": self.log()} for _, spec, _ in cases]), encoding="utf-8")
+            proc, out = run_pwsh_json(
+                f"Import-Module '{ATTR_MODULE}' -Force\n"
+                "$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                "@($cases | ForEach-Object {\n"
+                "  $e = Get-AttrCudaWindowToggleEvidence -LogText ([string]$_.log) -MeasuredSessionId '3'\n"
+                "  $m = [pscustomobject]@{ windowTogglesRequested = $e.requested; windowTogglesDriven = $e.driven; windowTogglesKeptPlaying = $e.keptPlaying; windowTogglesAdvanced = $e.advanced; windowToggleEvidenceReason = $e.reason; lookAssistForced = $true; gpuFramesTotal = 599; lookFlavorReported = 'cinematic' }\n"
+                "  $r = Get-DvWindowToggleReconcileEvidence -Spec $_.spec -LogText ([string]$_.log) -Metrics $m\n"
+                "  $a = Test-DvCriteria -Criteria $_.spec.criteria.acceptance.cuda -Metrics $m\n"
+                "  $s = Test-DvCriteria -Criteria $_.spec.criteria.supplementary.cuda -Metrics $m\n"
+                "  [ordered]@{ blocks = $r.blocks; reason = [string]$r.reason; passes = @([bool]$a.pass, [bool]$s.pass) }\n"
+                "}) | ConvertTo-Json -Compress -Depth 5 -AsArray", DVE_CASES=str(path))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for (name, _, blocks), got in zip(cases, out, strict=True):
+            with self.subTest(case=name):
+                self.assertEqual(got["blocks"], blocks, got)
+                if blocks:
+                    self.assertIn("WINDOW_TOGGLES_CRITERIA_UNBOUND", got["reason"], got)
+                else:
+                    self.assertEqual(got["passes"], [True, True], got)
+
     def test_r12_fable_note_the_preflight_refuses_an_unbound_criteria_set_with_the_reconcilers_typed_reason(self) -> None:
         """r12 (fable r11 hardening note on d3b176e3: the preflight shape refusal did not catch an empty criteria.supplementary that the reconciler later reads as
         WINDOW_TOGGLES_CRITERIA_UNBOUND): Get-DvLegSpecShapeRefusal, the leg's and every batch preflight's live check, refuses a requested leg whose criteria do not

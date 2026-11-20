@@ -2087,10 +2087,14 @@ function Get-DvWindowToggleCriteriaGap {
         foreach ($backend in $backends) {
             if ($null -eq $set.PSObject.Properties[$backend]) { return "criteria.$setName has no $backend array (a backend the spec names), so nothing fails a non-ok toggle proof" }
         }
+        # r14 (r14 adversary A1 on 1376a142, input: windowTogglesDriven's value 4 -> [4] in both cuda arrays over a healthy log): a [string] cast read [4] (and ["4"],
+        # ["ok"]) as the bound value, while Test-DvCriteria compares the RAW value (4 -eq @(4) is false), so an unbound spec passed preflight and FAILED a healthy
+        # capture late. A row binds only when its value is the JSON scalar the evaluator matches: a number for the four counts (as the framesExported binding in
+        # Get-DvExportOutcome reads one) and a string for the reason; any other value (array, object, boolean, null, a numeric string) is no binding
         foreach ($role in $set.PSObject.Properties) {
             $rows = @($role.Value)
             foreach ($need in $required) {
-                $bound = @($rows | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq $need[0] -and [string](Get-DvProp $_ 'op') -ceq 'eq' -and [string](Get-DvProp $_ 'value') -ceq $need[1] })
+                $bound = @($rows | Where-Object { $null -ne $_ -and [string](Get-DvProp $_ 'metric') -ceq $need[0] -and [string](Get-DvProp $_ 'op') -ceq 'eq' -and $(if ($need[1] -ceq 'ok') { (Get-DvProp $_ 'value') -is [string] } else { (Get-DvProp $_ 'value') -is [int] -or (Get-DvProp $_ 'value') -is [long] -or (Get-DvProp $_ 'value') -is [double] }) -and [string](Get-DvProp $_ 'value') -ceq $need[1] })
                 if ($bound.Count -lt 1) { return "criteria.$setName.$($role.Name) does not bind $($need[0]) eq $($need[1])" }
             }
         }
