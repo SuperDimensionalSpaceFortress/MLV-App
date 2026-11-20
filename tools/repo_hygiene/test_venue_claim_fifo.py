@@ -953,5 +953,152 @@ $probe = [ordered]@{ schema = 'mlv-app/venue-quiet-probe/v1'; host = 'BACHELOR';
             self.assertTrue(all(b < 128 for b in f.read_bytes()), f"{f.name} is not ASCII")
 
 
+LEASE_RUNNER = DV / "Invoke-VenueLeaseBatch.ps1"
+
+
+@requires_windows_pwsh
+class VenueLeaseBatchFifoTests(unittest.TestCase):
+    """VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1 r2: a lease batch (Invoke-VenueLeaseBatch.ps1) joins the venue's line like a chain does.
+
+    THE 2026-11-20 OVERTAKE, simulated: LJ92 r8 had waited for the Bachelor claim since 08:17:03Z (CLAIM_HELD on a 30 s poll); PLAYBACK-BASELINE-RANGE-1 r3's second batch
+    first asked at 09:01:53Z, and when BENCH-CLOCKS r5 released at 09:24:54Z its poll landed inside the 16 s the claim was free (taken 09:25:10Z) and LJ92 r8's did not: it ended
+    DEADLINE claim-held with 0 of 3 legs run. Lease batches took no ticket (Request-VenueClaim without -UseTicket), so nothing ordered them.
+      * the process case: a foreign claim stands; batch A (a 5 s poll) is waiting; batch B (a 1 s poll) arrives later; the claim frees. A must take it first.
+      * the readiness case (module): a ticket whose holder is in a not-ready wait (phase 'cooldown') never blocks a ready waiter behind it, and keeps its place
+        (when its holder turns ready it is again ahead of every later arrival).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from tools.repo_hygiene import test_venue_lease_batch as lease
+        cls.lease = lease
+        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-fifo-"))
+        for name, text in (("fake-quiet.ps1", lease.FAKE_QUIET), ("fake-umrun.ps1", lease.FAKE_UMRUN), ("fake-leg.ps1", lease.FAKE_LEG)):
+            (cls.tmp / name).write_text(text, encoding="utf-8")
+        cls.spec = cls.tmp / "fx-a.json"
+        cls.spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-a", "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self) -> None:
+        self.case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        self.claims = self.case / "claims"
+        self.claim_path = self.claims / "bachelor.claim.json"
+        self.ticket_dir = self.claims / "bachelor.tickets"
+        self._children: list[subprocess.Popen] = []
+
+    def tearDown(self) -> None:
+        for p in self._children:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+
+    def ps(self, script: str) -> dict:
+        f = self.case / f"scenario-{len(list(self.case.glob('scenario-*.ps1')))}.ps1"
+        f.write_text(f"$ErrorActionPreference = 'Stop'\nImport-Module '{MODULE}' -Force -DisableNameChecking\n$d = '{self.claims}'\n{script}\n", encoding="utf-8")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(f)], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise AssertionError(f"scenario failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
+        return json.loads([l for l in r.stdout.splitlines() if l.strip()][-1])
+
+    def start_batch(self, name: str, claim_poll: int) -> subprocess.Popen:
+        run_dir, share = self.case / f"run-{name}", self.case / f"share-{name}"
+        share.mkdir()
+        (share / "cancel").mkdir()
+        (share / "notafter").mkdir()
+        e = dict(os.environ)
+        e.update({"FAKE_EVENTS": str(self.case / f"events-{name}.log"), "FAKE_SHARE": str(share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case / f"root-{name}"),
+                  "FAKE_CAPS_EVENTS": str(self.case / f"caps-{name}.log")})
+        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(LEASE_RUNNER), "-LegSpec", str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
+                "-BuildManifestSha256", "b" * 64, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"),
+                "-UmRunScript", str(self.tmp / "fake-umrun.ps1"), "-AgentShare", str(share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", str(claim_poll),
+                "-RecheckSec", "1", "-LeaseCooldownSec", "0", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=200))]
+        out_path = self.case / f"stdout-{name}.txt"
+        with open(out_path, "w", encoding="utf-8") as out_file:
+            p = subprocess.Popen(args, stdout=out_file, stderr=subprocess.STDOUT, text=True, env=e)
+        p.out_path = out_path   # type: ignore[attr-defined]
+        p.run_dir = run_dir     # type: ignore[attr-defined]
+        self._children.append(p)
+        return p
+
+    @staticmethod
+    def batch_log(p: subprocess.Popen) -> str:
+        f = Path(p.run_dir) / "batch.log"   # type: ignore[attr-defined]
+        return f.read_text(encoding="utf-8", errors="replace") if f.exists() else ""
+
+    def wait_for(self, predicate, what: str, timeout: float = 90.0) -> None:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if predicate():
+                return
+            time.sleep(0.2)
+        self.fail(f"timed out waiting for {what}")
+
+    def claim_taken_utc(self, p: subprocess.Popen) -> datetime:
+        import re
+        m = re.search(r"CLAIM_TAKEN batch=1 nonce=\S+ expiresUtc=(\S+)", self.batch_log(p))
+        self.assertIsNotNone(m, f"no CLAIM_TAKEN line:\n{self.batch_log(p)}\n{Path(p.out_path).read_text(encoding='utf-8', errors='replace')}")   # type: ignore[attr-defined]
+        return datetime.fromisoformat(m.group(1).replace("Z", "+00:00")[:26] + "+00:00" if "+" not in m.group(1)[-6:] else m.group(1))
+
+    def test_a_lease_batch_that_waited_longer_takes_the_claim_before_a_later_one_that_polls_faster(self) -> None:
+        sleeper = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 180"])
+        self._children.append(sleeper)
+        time.sleep(1.0)
+        foreign = self.ps(f"$r = Request-VenueClaim -Venue bachelor -RunDir 'run-foreign' -Purpose foreign -TtlSec 3600 -ClaimDir $d -OwnerPid {sleeper.pid}\n"
+                          "[pscustomobject]@{ granted = [bool]$r.granted; nonce = $r.claim.nonce } | ConvertTo-Json -Compress")
+        self.assertTrue(foreign["granted"])
+        pa = self.start_batch("A", claim_poll=5)      # arrives first, polls its turn every 5 s
+        self.wait_for(lambda: "CLAIM_HELD" in self.batch_log(pa), "A waiting behind the foreign claim")
+        pb = self.start_batch("B", claim_poll=1)      # arrives later, polls every second
+        self.wait_for(lambda: "CLAIM_HELD" in self.batch_log(pb), "B waiting behind the foreign claim")
+        rel = self.ps(f"[pscustomobject]@{{ rel = (Release-VenueClaim -Venue bachelor -Nonce '{foreign['nonce']}' -ClaimDir $d) }} | ConvertTo-Json -Compress")
+        self.assertEqual(rel["rel"], "RELEASED")
+        for p in (pa, pb):
+            p.wait(timeout=180)
+        outs = [Path(p.out_path).read_text(encoding="utf-8", errors="replace") for p in (pa, pb)]   # type: ignore[attr-defined]
+        self.assertEqual([p.returncode for p in (pa, pb)], [0, 0], "\n----\n".join(outs))
+        self.assertLess(self.claim_taken_utc(pa), self.claim_taken_utc(pb), "B, the later arrival, polled faster and took the claim first: the lease batch is not first-come-first-served")
+        self.assertFalse(self.claim_path.exists(), "a claim was left behind")
+        self.assertEqual(list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else [], [], "a ticket was left behind")
+        self.assertIn("TICKET_TAKEN", self.batch_log(pa))
+
+    READY_FIRST = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$b1 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
+$rel = Release-VenueClaim -Venue bachelor -Nonce $b1.claim.nonce -ClaimDir $d
+$endB = Remove-VenueTicket $B
+Start-Sleep -Milliseconds 30
+$C = New-VenueTicket -Venue bachelor -RunDir 'run-C' -ClaimDir $d
+$phaseBefore = (Get-VenueTickets -Venue bachelor -ClaimDir $d | Where-Object { $_.ticket.runDir -eq 'run-A' }).ticket.phase
+$a1 = Request-VenueClaim -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Ticket $A
+$phaseAfter = (Get-VenueTickets -Venue bachelor -ClaimDir $d | Where-Object { $_.ticket.runDir -eq 'run-A' }).ticket.phase
+$c1 = Request-VenueClaim -Venue bachelor -RunDir 'run-C' -ClaimDir $d -Ticket $C
+$relA = Release-VenueClaim -Venue bachelor -Nonce $a1.claim.nonce -ClaimDir $d
+[pscustomobject]@{ b1 = $b1.state; b1Granted = [bool]$b1.granted; b1Pos = $b1.position; rel = $rel; endB = $endB; c1 = $c1.state; c1Granted = [bool]$c1.granted; phaseBefore = $phaseBefore
+  a1 = $a1.state; a1Granted = [bool]$a1.granted; phaseAfter = $phaseAfter; relA = $relA } | ConvertTo-Json -Compress
+"""
+
+    def test_a_not_ready_ticket_never_blocks_a_ready_waiter_and_keeps_its_place(self) -> None:
+        r = self.ps(self.READY_FIRST)
+        self.assertEqual((r["b1"], r["b1Granted"], r["b1Pos"]), ("TAKEN", True, 2), "A is in a not-ready wait (cooldown): the ready B behind it takes the free claim")
+        self.assertEqual((r["rel"], r["endB"]), ("RELEASED", "REMOVED"))
+        self.assertEqual(r["phaseBefore"], "cooldown")
+        self.assertEqual((r["a1"], r["a1Granted"]), ("TAKEN", True), "A kept its place through B's turn: once A is ready it is ahead of C, which arrived after it, and takes the claim")
+        self.assertEqual(r["phaseAfter"], "waiting", "a request refreshes the caller's ticket to ready")
+        self.assertEqual((r["c1"], r["c1Granted"]), ("QUEUED", False), "C arrived after A and A is now ready ahead of it: C waits behind A")
+        self.assertEqual(r["relA"], "RELEASED")
+
+    def test_the_lease_batch_header_documents_the_ticket(self) -> None:
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        for needle in ("VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1", "-NoTicket", "TICKET_TAKEN", "-UseTicket"):
+            self.assertIn(needle, run)
+        self.assertTrue(all(b < 128 for b in LEASE_RUNNER.read_bytes()), f"{LEASE_RUNNER.name} is not ASCII")
+
+
 if __name__ == "__main__":
     unittest.main()
