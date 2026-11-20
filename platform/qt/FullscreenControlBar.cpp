@@ -224,6 +224,8 @@ void FullscreenControlBarWidget::paintEvent( QPaintEvent *event )
     const fullscreen_bar::Layout l = viewLayout();
     const fullscreen_bar::Feed &feed = m_presenter.feed();
     const qreal dpr = devicePixelRatioF();
+    // The cache is keyed on the device-pixel bar size, which a ratio change can leave equal: re-raster at the new one.
+    if( !m_pixmap.isNull() && !qFuzzyCompare( m_pixmap.devicePixelRatio(), dpr ) ) m_presenter.dropRaster();
     const fullscreen_bar::Raster need = m_presenter.rasterFor( l.bar.size() );
     if( need == fullscreen_bar::Raster::Full || ( need == fullscreen_bar::Raster::Timecode && m_pixmap.isNull() ) )
     {

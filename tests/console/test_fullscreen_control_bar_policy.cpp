@@ -362,3 +362,31 @@ TEST(FullscreenControlBarPolicy, SeekFrameAtClamps)
     ASSERT_EQ(120, k4.bar.height());
     ASSERT_TRUE(fullscreen_bar::summaryLine(0, 0, 0, 0) == QStringLiteral("control_bar.summary raster=0 upload=0 shown_ms=0 shows=0"));
 }
+
+// Adversary r1 pass 1 A3: a seek column narrower than the marker (a tall narrow surface) and a surface shorter than
+// the minimum track/marker height. Every accepted layout keeps the track and the playhead inside the seek column and
+// the bar, at every frame.
+TEST(FullscreenControlBarPolicy, DegenerateLayoutsKeepTrackAndPlayheadInsideTheBar)
+{
+    const QSize sizes[] = { QSize(880, 2160), QSize(1920, 1), QSize(1920, 3), QSize(500, 2160), QSize(1920, 1080),
+                            QSize(13, 7), QSize(4000, 2) };
+    for (const QSize &size : sizes)
+    {
+        const fullscreen_bar::Layout l = fullscreen_bar::layoutFor(size);
+        ASSERT_FALSE(l.bar.isEmpty());
+        ASSERT_TRUE(QRect(QPoint(0, 0), size).contains(l.bar));
+        if (l.seek.isEmpty()) continue;
+        ASSERT_TRUE(l.bar.contains(l.seek));
+        ASSERT_TRUE(l.seek.contains(l.track));
+        for (int frame : { 0, 1, 299, 599 })
+        {
+            const QRect head = fullscreen_bar::playheadRect(l, frame, 600);
+            ASSERT_FALSE(head.isEmpty());
+            ASSERT_TRUE(l.seek.contains(head));
+        }
+    }
+    // The case the adversary traced: seek left=380 width=3 at 880x2160.
+    const fullscreen_bar::Layout tall = fullscreen_bar::layoutFor(QSize(880, 2160));
+    ASSERT_EQ(3, tall.seek.width());
+    ASSERT_EQ(3, fullscreen_bar::playheadRect(tall, 0, 600).width());
+}

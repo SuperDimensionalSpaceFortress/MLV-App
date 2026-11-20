@@ -3833,6 +3833,10 @@ void MainWindow::viewerIdleTimeout( void )
         m_viewerIdleTimer->start( ms );
         break;
     case viewer_idle::Tick::Rearm:
+        // A move the witness saw while the cursor was already shown (its event deferred by an input-excluded wait)
+        // still shows a hidden bar, through the entry-position gate a delivered move uses (adversary r1 A5).
+        if( in.pointerMoved && !fullscreenBarShown() && fullscreen_bar::activityShowsBar( QEvent::MouseMove, &m_fullscreenBarSawMove, m_fullscreenBarEntryPos, QCursor::pos() ) )
+            viewerIdleApplyShown( true, true );
         m_viewerIdleTimer->start( ms );
         break;
     case viewer_idle::Tick::None:

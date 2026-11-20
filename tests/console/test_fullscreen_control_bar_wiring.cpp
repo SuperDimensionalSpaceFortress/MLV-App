@@ -117,9 +117,18 @@ TEST(FullscreenControlBarWiring, PaintGlDrawsTheBarAfterTheLookLabelAndTeardownD
     ASSERT_TRUE(labelLine > 0);
     ASSERT_TRUE(labelLine + 1 < lines.size());
     ASSERT_TRUE(lines.at(labelLine + 1).trimmed().startsWith(QStringLiteral("drawControlBar(fbw, fbh);")));
-    ASSERT_EQ(1, int(paint.count(QStringLiteral("drawControlBar(fbw, fbh);"))));
     // Before the capture readback (the last test of the flag; the first is the no-frame branch).
-    ASSERT_TRUE(paint.indexOf(QStringLiteral("drawControlBar(fbw, fbh);")) < paint.lastIndexOf(QStringLiteral("if ( m_captureReadbackRequested )\n")));
+    ASSERT_TRUE(paint.lastIndexOf(QStringLiteral("drawControlBar(fbw, fbh);")) < paint.lastIndexOf(QStringLiteral("if ( m_captureReadbackRequested )\n")));
+    // Adversary r1 pass 1 A4: the no-frame branch (no clip yet, or a refused recon texture) returns before the frame
+    // draw, yet MainWindow still routes the bar's clicks there, so that branch draws the bar too: the controls a click
+    // can hit are always the controls on screen. Exactly two calls: the no-frame branch and after the look label.
+    ASSERT_EQ(2, int(paint.count(QStringLiteral("drawControlBar(fbw, fbh);"))));
+    const int noFrameAt = paint.indexOf(QStringLiteral("if ( !m_texture || !activeProgram || width() <= 0 || height() <= 0 || reconRefused )"));
+    ASSERT_TRUE(noFrameAt > 0);
+    const int noFrameReturn = paint.indexOf(QStringLiteral("return;"), noFrameAt);
+    const int earlyBar = paint.indexOf(QStringLiteral("drawControlBar(fbw, fbh);"), noFrameAt);
+    ASSERT_TRUE(earlyBar > noFrameAt);
+    ASSERT_TRUE(earlyBar < noFrameReturn);
 
     const QString draw = functionBodyToBrace(source, QStringLiteral("void GpuDisplayWindow::drawControlBar(int fbw, int fbh)"));
     ASSERT_FALSE(draw.isEmpty());
@@ -184,6 +193,16 @@ TEST(FullscreenControlBarWiring, OneIdleClockNoSecondTimer)
     const QString timeout = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleTimeout( void )"));
     ASSERT_TRUE(timeout.contains(QStringLiteral("viewerIdleApplyShown( true, in.pointerMoved );")));
     ASSERT_TRUE(timeout.contains(QStringLiteral("viewerIdleApplyShown( false, false );")));
+    // Adversary r1 pass 1 A5: a move the pointer witness saw while the cursor was already shown (an input-excluded
+    // wait deferred its event) is a Rearm tick, not Show: it still shows a hidden bar, through the same entry-position
+    // gate a delivered move uses.
+    const int rearmAt = timeout.indexOf(QStringLiteral("case viewer_idle::Tick::Rearm:"));
+    ASSERT_TRUE(rearmAt > 0);
+    const QString rearm = timeout.mid(rearmAt);
+    ASSERT_TRUE(rearm.contains(QStringLiteral(
+        "if( in.pointerMoved && !fullscreenBarShown() && fullscreen_bar::activityShowsBar( QEvent::MouseMove, &m_fullscreenBarSawMove, m_fullscreenBarEntryPos, QCursor::pos() ) )")));
+    ASSERT_TRUE(rearm.contains(QStringLiteral("viewerIdleApplyShown( true, true );")));
+    ASSERT_TRUE(rearm.indexOf(QStringLiteral("viewerIdleApplyShown( true, true );")) < rearm.indexOf(QStringLiteral("break;")));
     const QString restore = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleRestore( void )"));
     ASSERT_TRUE(restore.contains(QStringLiteral("viewerIdleApplyShown( true, false );")));
 }
@@ -237,6 +256,17 @@ TEST(FullscreenControlBarWiring, CpuBarIsAnOpaqueChildOfTheViewNotItsViewport)
     ASSERT_TRUE(widget.contains(QStringLiteral("setAttribute( Qt::WA_NoMousePropagation );")));
     ASSERT_TRUE(widget.contains(QStringLiteral("raise();")));
     ASSERT_TRUE(widget.contains(QStringLiteral("event->accept();")));
+
+    // Adversary r1 pass 1 A2: the raster cache is keyed on the bar's device-pixel size, which a DPR change can leave
+    // equal (1920x1080 at 1.0 -> 960x540 at 2.0). A pixmap cached at another ratio is dropped before the raster
+    // decision, so what is drawn always matches the current-ratio layout the clicks are hit-tested against.
+    const int paintAt = widget.indexOf(QStringLiteral("void FullscreenControlBarWidget::paintEvent( QPaintEvent *event )"));
+    ASSERT_TRUE(paintAt > 0);
+    const QString paint = widget.mid(paintAt);
+    const int dropAt = paint.indexOf(QStringLiteral(
+        "if( !m_pixmap.isNull() && !qFuzzyCompare( m_pixmap.devicePixelRatio(), dpr ) ) m_presenter.dropRaster();"));
+    ASSERT_TRUE(dropAt > 0);
+    ASSERT_TRUE(dropAt < paint.indexOf(QStringLiteral("m_presenter.rasterFor( l.bar.size() );")));
 }
 
 // C6: the functions open PR #834 (and #857) own carry no bar code.

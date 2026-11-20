@@ -2477,6 +2477,9 @@ void GpuDisplayWindow::paintGL()
         }
         if ( !m_loggedPaint )
         { qInfo() << "gpu_window paintGL: no texture/program yet (clearing)."; m_loggedPaint = true; }
+        // PLAYER-FULLSCREEN-CONTROL-BAR-1 (adversary r1 A4): the bar's clicks are routed with or without a frame, so
+        // it is drawn here too; returns at once while hidden.
+        drawControlBar(fbw, fbh);
         return;
     }
 

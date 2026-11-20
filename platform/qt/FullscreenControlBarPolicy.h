@@ -87,7 +87,7 @@ inline Layout layoutFor( const QSize &fbDevicePx )
     if( seekRight - seekLeft >= 2 )
     {
         l.seek = QRect( seekLeft, top, seekRight - seekLeft, h );
-        const int th = qMax( 2, h / 12 );
+        const int th = qMin( h, qMax( 2, h / 12 ) );   // never taller than the bar (a 1-line surface)
         l.track = QRect( seekLeft, top + ( h - th ) / 2, seekRight - seekLeft, th );
     }
     return l;
@@ -124,8 +124,10 @@ inline int seekFrameAt( const Layout &l, qreal deviceX, int totalFrames )
 inline QRect playheadRect( const Layout &l, int frame, int totalFrames )
 {
     if( l.seek.width() < 2 ) return QRect();
-    const int w = qMax( 2, l.bar.height() / 10 );
-    const int h = qMax( 4, l.bar.height() / 2 );
+    // Never wider than the seek column (a tall narrow surface) nor taller than the bar (a few-line surface), so the
+    // clamp below always has a valid range.
+    const int w = qMin( l.seek.width(), qMax( 2, l.bar.height() / 10 ) );
+    const int h = qMin( l.bar.height(), qMax( 4, l.bar.height() / 2 ) );
     qreal f = 0.0;
     if( totalFrames > 1 ) f = qBound( 0.0, qreal( frame ) / qreal( totalFrames - 1 ), 1.0 );
     const int cx = l.seek.left() + qRound( f * qreal( l.seek.width() - 1 ) );
