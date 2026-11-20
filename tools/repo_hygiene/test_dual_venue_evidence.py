@@ -16235,6 +16235,28 @@ class WindowToggleEvidenceTests(unittest.TestCase):
                 if driven is not None:
                     self.assertEqual(got["e"]["driven"], driven, got)
 
+    R13_MARKER = "playback_smoke.measured_session id=3\n"
+
+    def test_r13_a1_a_session_declaration_the_app_never_writes_closes_the_window_never_leaves_it_open(self) -> None:
+        """r13 (sol r12 A1 on c69927ab, input: `playback_smoke.start session =4` after the measured marker, which read 4/4/4/4/ok): a playback_smoke record whose tail
+        carries the word `session` as a token that is not `session=` (a space before the `=`, a colon, the bare word, any case, a TAB) is an unreadable boundary, so it
+        closes the window and names itself; a healthy log, a record that states `session=3`, and `session` inside a value stay ok."""
+        bad = ("playback_smoke.start session =4 position=10", "playback_smoke.start session:4 position=10", "playback_smoke.start session",
+               "playback_smoke.start SESSION =4", "playback_smoke.start position=0 session\t=4", "playback_smoke.pace_summary position=0 session =3")
+        good = ("playback_smoke.start session=3 position=10", "playback_smoke.pace_summary note=session position=1", "playback_smoke.pace_summary session_id=9 position=1")
+        logs = [self.log()] + [self.log().replace(self.R13_MARKER, self.R13_MARKER + line + "\n", 1) for line in bad + good]
+        out = self.run_cases(logs)
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        for line, got in zip(bad, out[1:1 + len(bad)], strict=True):
+            with self.subTest(case=line):
+                self.assertNotEqual(got["e"]["reason"], "ok", got)
+                self.assertIn("session-boundary-unreadable", got["e"]["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+        for line, got in zip(good, out[1 + len(bad):], strict=True):
+            with self.subTest(case=line):
+                self.assertEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [True, True], got)
+
     def test_r8_b1_the_request_reader_counts_a_toggle_name_glued_to_a_folding_character(self) -> None:
         """r8 (keys r7 B1, site DualVenueRunner.psm1 Get-DvWindowToggleRequestEvidence): an ordinary leg whose log carries a toggle-named record glued to U+212A or
         U+0130 blocks (the keys' repro: `gui_smoke.window_toggles<U+212A> requested=4 driven=4 reason=ok` gave mentions=0 blocks=false)."""

@@ -7593,6 +7593,14 @@ function Get-AttrCudaWindowToggleEvidence {
             }
             elseif ($lines[$i] -match ('^playback_smoke\.' + $nameChar + '+( |$)')) {
                 foreach ($sessionMatch in [regex]::Matches($lines[$i], ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)'))) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
+                # r13 (sol r12 A1 on c69927ab, input: `playback_smoke.start session =4` after the measured marker, which read 4/4/4/4/ok): the loop above reads only a literal
+                # `session=`, so a declaration the app never writes (`session =4`, `session:4`, a bare `session`) named no other session and left the window open over a foreign
+                # Play's toggles. A word `session` that starts a token of the record tail (after whitespace) and is not directly followed by `=` or a name character is an unreadable
+                # declaration: the record closes the window and names itself, as every other unreadable boundary does
+                if ($end -gt $i) {
+                    $recordTail = [regex]::Replace($lines[$i], ('^playback_smoke\.' + $nameChar + '+'), '')
+                    if ([regex]::IsMatch($recordTail, '(?<!\S)[Ss][Ee][Ss][Ss][Ii][Oo][Nn](?![A-Za-z0-9_=])')) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                }
             }
             if ($end -le $i) { break }
         }
