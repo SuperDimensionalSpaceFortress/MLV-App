@@ -16239,11 +16239,16 @@ class WindowToggleEvidenceTests(unittest.TestCase):
 
     def test_r13_a1_a_session_declaration_the_app_never_writes_closes_the_window_never_leaves_it_open(self) -> None:
         """r13 (sol r12 A1 on c69927ab, input: `playback_smoke.start session =4` after the measured marker, which read 4/4/4/4/ok): a playback_smoke record whose tail
-        carries the word `session` as a token that is not `session=` (a space before the `=`, a colon, the bare word, any case, a TAB) is an unreadable boundary, so it
-        closes the window and names itself; a healthy log, a record that states `session=3`, and `session` inside a value stay ok."""
+        carries a standalone word `session` that is not the key of a `session=` declaration (a space before the `=`, a colon, the bare word, a quoted key, any case, a
+        TAB), and a `playback_smoke.start` that declares no session at all, are unreadable boundaries: each closes the window and names itself; a healthy log, a record
+        that states `session=3`, and a name merely containing the word (`session_id=9`) stay ok."""
         bad = ("playback_smoke.start session =4 position=10", "playback_smoke.start session:4 position=10", "playback_smoke.start session",
-               "playback_smoke.start SESSION =4", "playback_smoke.start position=0 session\t=4", "playback_smoke.pace_summary position=0 session =3")
-        good = ("playback_smoke.start session=3 position=10", "playback_smoke.pace_summary note=session position=1", "playback_smoke.pace_summary session_id=9 position=1")
+               "playback_smoke.start SESSION =4", "playback_smoke.start position=0 session\t=4", "playback_smoke.pace_summary position=0 session =3",
+               # r13b (sol r12 A1 on c52cc719): a quoted key, a start record that declares no session at all, a second session word the key count does not cover, and a
+               # value `session` (the app writes none; the reader fails closed on it)
+               'playback_smoke.start "session"=4 position=10', "playback_smoke.start", "playback_smoke.start position=10", "playback_smoke.start session=3 session =4",
+               'playback_smoke.pace_summary "session"=3 position=1', "playback_smoke.pace_summary note=session position=1")
+        good = ("playback_smoke.start session=3 position=10", "playback_smoke.pace_summary session_id=9 position=1", "playback_smoke.pace_summary position=1")
         logs = [self.log()] + [self.log().replace(self.R13_MARKER, self.R13_MARKER + line + "\n", 1) for line in bad + good]
         out = self.run_cases(logs)
         self.assertEqual(out[0]["e"]["reason"], "ok", out[0])

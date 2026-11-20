@@ -7595,11 +7595,16 @@ function Get-AttrCudaWindowToggleEvidence {
                 foreach ($sessionMatch in [regex]::Matches($lines[$i], ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)'))) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
                 # r13 (sol r12 A1 on c69927ab, input: `playback_smoke.start session =4` after the measured marker, which read 4/4/4/4/ok): the loop above reads only a literal
                 # `session=`, so a declaration the app never writes (`session =4`, `session:4`, a bare `session`) named no other session and left the window open over a foreign
-                # Play's toggles. A word `session` that starts a token of the record tail (after whitespace) and is not directly followed by `=` or a name character is an unreadable
-                # declaration: the record closes the window and names itself, as every other unreadable boundary does
+                # Play's toggles. r13b (sol r12 A1 on c52cc719, inputs: `playback_smoke.start "session"=4`, a bare `playback_smoke.start`, `playback_smoke.start position=10`): the
+                # rule is the CLASS, never a spelling. Every standalone word `session` of the record tail (not glued to a name character; the location was cut off above) must be the
+                # key of a `session=` declaration, so the count of the words equals the count of the keys (a quoted key, a spaced `=`, a colon, a value `session` all differ); and the
+                # Play's own start record (MainWindow.cpp `playback_smoke.start session=%1`) must declare a session at all. A record that fails either closes the window and names
+                # itself, as every other unreadable boundary does
                 if ($end -gt $i) {
                     $recordTail = [regex]::Replace($lines[$i], ('^playback_smoke\.' + $nameChar + '+'), '')
-                    if ([regex]::IsMatch($recordTail, '(?<!\S)[Ss][Ee][Ss][Ss][Ii][Oo][Nn](?![A-Za-z0-9_=])')) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                    $sessionWords = [regex]::Matches($recordTail, ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn](?!' + $nameChar + ')')).Count
+                    $sessionKeys = [regex]::Matches($recordTail, ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=')).Count
+                    if ($sessionWords -ne $sessionKeys -or ($sessionKeys -eq 0 -and $lines[$i] -match ('^playback_smoke\.start(?!' + $nameChar + ')'))) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
                 }
             }
             if ($end -le $i) { break }
