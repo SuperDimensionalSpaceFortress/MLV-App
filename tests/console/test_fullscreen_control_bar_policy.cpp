@@ -482,6 +482,62 @@ TEST(FullscreenControlBarPolicy, StaleOwnershipNeverClaimsDuringAForeignGesture)
     ASSERT_EQ(int(fullscreen_bar::Action::None), int(a));
 }
 
+// Adversary r1 pass 4 A1 (route only, so it builds against 52d0836d for the RED proof): the bar took a left press on
+// Play, the viewer a right press; the left release is lost (capture or focus change) with no press or move after it.
+// The right release is the viewer's (its context menu opens on release): the stale Left never takes another button's
+// release, and it is settled by that release.
+TEST(FullscreenControlBarPolicy, StaleOwnedButtonNeverTakesAnotherButtonsRelease)
+{
+    fullscreen_bar::InputState s;
+    fullscreen_bar::Action a = fullscreen_bar::Action::None;
+    const Qt::MouseButtons both = Qt::LeftButton | Qt::RightButton;
+    ASSERT_TRUE(fullscreen_bar::route(&s, true, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Play, &a));
+    ASSERT_FALSE(fullscreen_bar::route(&s, true, QEvent::MouseButtonPress, Qt::RightButton, both, fullscreen_bar::Part::None, &a));
+    // (The left release is lost here.)
+    ASSERT_FALSE(fullscreen_bar::route(&s, true, QEvent::MouseButtonRelease, Qt::RightButton, Qt::NoButton, fullscreen_bar::Part::None, &a));
+    ASSERT_TRUE(s.owned == Qt::NoButton);
+    // Hidden by then too.
+    fullscreen_bar::InputState h;
+    ASSERT_TRUE(fullscreen_bar::route(&h, true, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Seek, &a));
+    ASSERT_FALSE(fullscreen_bar::route(&h, false, QEvent::MouseButtonPress, Qt::RightButton, both, fullscreen_bar::Part::None, &a));
+    ASSERT_FALSE(fullscreen_bar::route(&h, false, QEvent::MouseButtonRelease, Qt::RightButton, Qt::NoButton, fullscreen_bar::Part::None, &a));
+    ASSERT_TRUE(h.owned == Qt::NoButton);
+    ASSERT_FALSE(h.seekDrag);
+}
+
+// Adversary r1 pass 4 A2: the CPU bar's widget sees only its own events, so MainWindow settles the bar's state from
+// every mouse event in the application. A seek press whose release a popup took, then a fresh left drag begun on the
+// viewer: that press settles the lost ownership and the seek hold, so the fresh drag's wheel over the bar is the
+// viewer's. The bar's own drag keeps its state through a held move and another button's release; a wheel settles
+// nothing.
+TEST(FullscreenControlBarPolicy, SettleFromAnyEventClearsALostRelease)
+{
+    fullscreen_bar::InputState s;
+    ASSERT_EQ(int(fullscreen_bar::Action::Seek),
+              int(fullscreen_bar::onMouse(&s, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Seek)));
+    // The release reached the popup: the releasing button itself is not yet proven gone.
+    fullscreen_bar::settle(&s, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton);
+    ASSERT_TRUE(s.owned == Qt::MouseButtons(Qt::LeftButton));
+    // A fresh left press on the viewer settles it.
+    fullscreen_bar::settle(&s, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton);
+    ASSERT_TRUE(s.owned == Qt::NoButton);
+    ASSERT_FALSE(s.seekDrag);
+    ASSERT_FALSE(fullscreen_bar::claims(s, true, QEvent::Wheel, Qt::NoButton, Qt::LeftButton, fullscreen_bar::Part::Timecode));
+    // A buttonless move anywhere settles too.
+    fullscreen_bar::onMouse(&s, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Seek);
+    fullscreen_bar::settle(&s, QEvent::MouseMove, Qt::NoButton, Qt::NoButton);
+    ASSERT_TRUE(s.owned == Qt::NoButton);
+    ASSERT_FALSE(s.seekDrag);
+    // The bar's own drag keeps its state.
+    fullscreen_bar::onMouse(&s, QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton, fullscreen_bar::Part::Seek);
+    fullscreen_bar::settle(&s, QEvent::MouseMove, Qt::NoButton, Qt::LeftButton);
+    fullscreen_bar::settle(&s, QEvent::MouseButtonRelease, Qt::RightButton, Qt::LeftButton);
+    fullscreen_bar::settle(&s, QEvent::Wheel, Qt::NoButton, Qt::NoButton);
+    ASSERT_TRUE(s.owned == Qt::MouseButtons(Qt::LeftButton));
+    ASSERT_TRUE(s.seekDrag);
+    ASSERT_TRUE(fullscreen_bar::claims(s, true, QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, fullscreen_bar::Part::None));
+}
+
 // Adversary r1 pass 3 A4 (advisory): buttons are the bar's height tall, and square only on a surface at least 4x the
 // bar height wide; narrower, each is a quarter of the surface wide.
 TEST(FullscreenControlBarPolicy, ButtonsAreSquareOnlyOnASurfaceFourBarHeightsWide)

@@ -245,9 +245,9 @@ public:
     static GpuWindowSwapTelemetrySnapshot swapTelemetrySnapshot(void);
 
     /* PLAYER-FULLSCREEN-CONTROL-BAR-1: the fullscreen control bar paintGL() draws over the bottom of the frame
-     * (drawControlBar). shown/feed as MainWindow's idle clock and feed decide; a feed is ignored while hidden. While
-     * playing no update() is asked for (the next frame's paint draws the change); while paused one is. GUI-thread
-     * only; false when no window is active. */
+     * (drawControlBar). shown/feed as MainWindow's idle clock and feed decide; a feed is ignored while hidden. A show
+     * or hide asks for one update() even while playing; a feed-only change asks for one only while paused (playing,
+     * the next frame's paint draws it). GUI-thread only; false when no window is active. */
     static bool setControlBarStateIfActive(bool shown, const fullscreen_bar::Feed &feed, qint64 nowMs);
     /* The bar layout on the active window's framebuffer as paintGL() would draw it now (device pixels; empty when
      * no window is active). */

@@ -6284,6 +6284,10 @@ public:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
         Q_UNUSED(watched);
+        // As MainWindow::fullscreenBarRouteGpuEvent: every non-wheel mouse event settles the bar's stale state.
+        if (const QMouseEvent *mouse = dynamic_cast<const QMouseEvent *>(event)) {
+            fullscreen_bar::settle(&input, event->type(), mouse->button(), mouse->buttons());
+        }
         if (idle.fullscreen() && viewer_idle::eventIsActivity(event, &lastGlobal, &haveLast)) {
             idle.noteActivity(clock.elapsed());
             if (fullscreen_bar::activityShowsBar(event->type(), &sawMove, entryPos, QCursor::pos())) {
@@ -6475,6 +6479,15 @@ void GuiSmokeTest::fullscreenControlBar_wheelDuringAForeignGestureReachesTheView
     QCOMPARE(f.view->wheels, 0);
     sendBarWheel(f.bar, f.onPart(l.timecode), Qt::RightButton);
     QCOMPARE(f.view->wheels, 1);
+
+    // Adversary r1 pass 4 A2: a seek press on the bar whose release is lost (a popup took it), then a fresh left drag
+    // begun on the viewer: its wheel over the bar is the viewer's, and the stale seek no longer holds the bar.
+    sendBarMouse(f.bar, QEvent::MouseButtonPress, f.onPart(l.seek));
+    QVERIFY(f.input.seekDrag);
+    sendBarMouse(f.viewport, QEvent::MouseButtonPress, f.viewport->rect().center());
+    QVERIFY(!f.input.seekDrag);
+    sendBarWheel(f.bar, f.onPart(l.timecode), Qt::LeftButton);
+    QCOMPARE(f.view->wheels, 2);
 }
 
 int main(int argc, char ** argv)

@@ -82,6 +82,16 @@ TEST(FullscreenControlBarWiring, EventFilterRoutesTheBarBeforeTheViewerDoubleCli
     const int noteAt = gpu.indexOf(QStringLiteral("viewerIdleNoteEvent( watched, event );"));
     ASSERT_TRUE(noteAt > 0);
     ASSERT_TRUE(gpu.indexOf(QStringLiteral("return true;"), noteAt) > noteAt);
+    // Adversary r1 pass 4 A2: every non-wheel mouse event in the application (any watched object, either path)
+    // settles the bar's stale ownership, before the hidden-bar early return and the GL-only test.
+    const int settleAt = gpu.indexOf(QStringLiteral("fullscreen_bar::settle( &m_fullscreenBarInput, event->type(), mouse->button(), mouse->buttons() );"));
+    ASSERT_TRUE(settleAt > gpu.indexOf(QStringLiteral("if( event->type() != QEvent::Wheel )")));
+    ASSERT_TRUE(settleAt > gpu.indexOf(QStringLiteral("default:\n        return false;")));
+    ASSERT_TRUE(settleAt < gpu.indexOf(QStringLiteral("if( !fullscreenBarShown() && m_fullscreenBarInput.owned == Qt::NoButton")));
+    ASSERT_TRUE(settleAt < gpu.indexOf(QStringLiteral("if( !gl || watched != gl ) return false;")));
+    const QString policy = readRepoFile(QStringLiteral("platform/qt/FullscreenControlBarPolicy.h"));
+    const QString routeBody = functionBodyToBrace(policy, QStringLiteral("inline bool route( InputState *s,"));
+    ASSERT_TRUE(routeBody.contains(QStringLiteral("settle( s, type, button, buttons );")));
 
     // The actions are the existing ones.
     const QString input = functionBodyToBrace(source,
@@ -210,15 +220,23 @@ TEST(FullscreenControlBarWiring, OneIdleClockNoSecondTimer)
     const int rearmAt = timeout.indexOf(QStringLiteral("case viewer_idle::Tick::Rearm:"));
     ASSERT_TRUE(rearmAt > 0);
     const QString rearm = timeout.mid(rearmAt, timeout.indexOf(QStringLiteral("break;"), rearmAt) - rearmAt);
-    ASSERT_TRUE(rearm.contains(QStringLiteral("if( in.pointerMoved && !fullscreenBarShown() )")));
-    ASSERT_TRUE(rearm.contains(QStringLiteral("m_fullscreenBarSawMove = true;")));
-    ASSERT_TRUE(rearm.contains(QStringLiteral("viewerIdleApplyShown( true, true );")));
+    ASSERT_TRUE(rearm.contains(QStringLiteral("if( in.pointerMoved && !fullscreenBarShown() ) viewerIdleApplyShown( true, true );")));
     ASSERT_FALSE(rearm.contains(QStringLiteral("QCursor::pos()")));
+    // Adversary r1 pass 4 A3: a witnessed move counts as having left the entry position on every tick, whether or not
+    // the bar is shown (set before the tick is decided), so a later return to the entry position shows a hidden bar.
+    const int sawAt = timeout.indexOf(QStringLiteral("if( in.pointerMoved ) m_fullscreenBarSawMove = true;"));
+    ASSERT_TRUE(sawAt > timeout.indexOf(QStringLiteral("in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );")));
+    ASSERT_TRUE(sawAt < timeout.indexOf(QStringLiteral("switch( m_viewerIdle.onTimeout(")));
+    ASSERT_EQ(1, int(source.count(QStringLiteral("m_fullscreenBarSawMove = true;"))));
     // A delivered move is judged at its own position, not the cursor's now (a deferred move delivered after the
-    // pointer came back).
+    // pointer came back), and on every activity, also while the bar is shown (pass 4 A3): only the show is gated.
     const QString note = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )"));
-    ASSERT_TRUE(note.contains(QStringLiteral("m_fullscreenBarEntryPos, m_viewerIdleLastGlobal.toPoint() ) );")));
+    ASSERT_TRUE(note.contains(QStringLiteral("m_fullscreenBarEntryPos, m_viewerIdleLastGlobal.toPoint() );")));
     ASSERT_TRUE(note.indexOf(QStringLiteral("viewer_idle::eventIsActivity( event, &m_viewerIdleLastGlobal")) < note.indexOf(QStringLiteral("m_viewerIdleLastGlobal.toPoint()")));
+    const int judgedAt = note.indexOf(QStringLiteral("const bool showsBar = fullscreen_bar::activityShowsBar( event->type(), &m_fullscreenBarSawMove,"));
+    ASSERT_TRUE(judgedAt > 0);
+    ASSERT_TRUE(judgedAt < note.indexOf(QStringLiteral("if( wasHidden || !fullscreenBarShown() ) viewerIdleApplyShown( true, showsBar );")));
+    ASSERT_EQ(1, int(source.count(QStringLiteral("fullscreen_bar::activityShowsBar("))));
     const QString restore = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleRestore( void )"));
     ASSERT_TRUE(restore.contains(QStringLiteral("viewerIdleApplyShown( true, false );")));
 }

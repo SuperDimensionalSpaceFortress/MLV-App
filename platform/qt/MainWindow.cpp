@@ -3818,6 +3818,9 @@ void MainWindow::viewerIdleTimeout( void )
     // r6 pass 9 A1: no hook (SetWindowsHookExW failed) means no witness for deferred input: a gate, never hide.
     in.witnessMissing = !viewer_idle::win_hook::installed();
 #endif
+    // A witnessed move is real movement (seeded at entry; synthesized same-position moves told apart), whichever tick
+    // it lands on and whether the bar is shown: it counts as having left the entry position (adversary r1 pass 4 A3).
+    if( in.pointerMoved ) m_fullscreenBarSawMove = true;
     // r3 (adversary r1 pass 4 A1): off Windows the sample above is the only witness, so every rearm is capped at
     // one poll period. Bound (pass 5 A1): an away-and-back that lies entirely between two samples (a late tick
     // widens the gap) is seen only when the wait delivers its events; on Windows the hook sees it when it is taken.
@@ -3837,11 +3840,7 @@ void MainWindow::viewerIdleTimeout( void )
         // still shows a hidden bar (adversary r1 A5). The witness is real movement already: the sampled position was
         // seeded at entry, and the hook and the queue look tell a synthesized same-position move from a real one, so
         // an away-and-back that ends at the entry position counts too (pass 2 A4).
-        if( in.pointerMoved && !fullscreenBarShown() )
-        {
-            m_fullscreenBarSawMove = true;
-            viewerIdleApplyShown( true, true );
-        }
+        if( in.pointerMoved && !fullscreenBarShown() ) viewerIdleApplyShown( true, true );
         m_viewerIdleTimer->start( ms );
         break;
     case viewer_idle::Tick::None:
@@ -3870,11 +3869,11 @@ void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
         // move's own position (eventIsActivity just stored it), not the cursor's now: a deferred move delivered after
         // the pointer came back to the entry position still left it (adversary r1 pass 2 A4).
         const bool wasHidden = m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
-        if( wasHidden || !fullscreenBarShown() )
-        {
-            viewerIdleApplyShown( true, fullscreen_bar::activityShowsBar( event->type(), &m_fullscreenBarSawMove,
-                                                                           m_fullscreenBarEntryPos, m_viewerIdleLastGlobal.toPoint() ) );
-        }
+        // Judged on every activity, also while the bar is shown: a departure from the entry position seen while shown
+        // still counts, so a later return there shows a hidden bar (adversary r1 pass 4 A3).
+        const bool showsBar = fullscreen_bar::activityShowsBar( event->type(), &m_fullscreenBarSawMove,
+                                                                m_fullscreenBarEntryPos, m_viewerIdleLastGlobal.toPoint() );
+        if( wasHidden || !fullscreenBarShown() ) viewerIdleApplyShown( true, showsBar );
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
     }
 }
@@ -4024,6 +4023,14 @@ bool MainWindow::fullscreenBarRouteGpuEvent( QObject *watched, QEvent *event )
         break;
     default:
         return false;
+    }
+    // Every mouse event in the application settles the bar's stale ownership, whichever surface it reaches (adversary
+    // r1 pass 4 A2): the CPU widget sees only its own events, so a release it lost (a popup took the grab) is settled
+    // by the next press or move anywhere, before a later wheel claim or the seek hold reads it. The GL route settles too.
+    if( event->type() != QEvent::Wheel )
+    {
+        const QMouseEvent *mouse = static_cast<QMouseEvent *>( event );
+        fullscreen_bar::settle( &m_fullscreenBarInput, event->type(), mouse->button(), mouse->buttons() );
     }
     if( !fullscreenBarShown() && m_fullscreenBarInput.owned == Qt::NoButton && !m_fullscreenBarInput.seekDrag ) return false;
     QWindow *gl = GpuDisplayWindow::activeWindow();
