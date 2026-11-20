@@ -631,6 +631,50 @@ def test_editing_settings_json_also_wires_lane_no_background_hook(fixture_tree):
     assert hook_entry["command"]==q["authority"]["backgroundGateInterpreterPath"]
 
 
+# LANE-AUTO-MEMORY-OFF-1 r2: a headless lane should not use Claude Code auto memory. The key goes in
+# the per-lane settings file (settings key ONLY -- no environment variable, NA-3). Measured r1:
+# the key is honored through --settings. Every Claude-engine lane writes it, whatever its
+# read/edit/bulk-read posture, and the hook and deny rules beside it stay intact.
+# LIMIT (r5): these tests pin what the launcher WRITES, not the effective memory state. The generated
+# settings turn auto memory off unless the launching environment already carries the inherited
+# auto-memory override variable with a value that forces it on. This launcher does not clear that
+# variable (NA-3) and no current launcher sets it, so the guarantee covers the default case only.
+# An administrator-managed policy settings file that turns memory on would also win over the key.
+def test_claude_lane_settings_json_turns_auto_memory_off(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal")
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    settings=json.loads(settings_path_for(receipt).read_text(encoding="utf-8-sig"))
+    assert settings["autoMemoryEnabled"] is False
+    assert settings["hooks"]["PreToolUse"][0]["matcher"]=="Bash|PowerShell"
+    assert settings["permissions"]["deny"]
+
+
+@pytest.mark.parametrize("kwargs",[
+    {"allow_bulk_reads":True},
+    {"editing":True,"allowed_tools":"Read,Write,Edit"},
+],ids=["bulk-reads","editing"])
+def test_claude_lane_auto_memory_is_off_in_every_posture(fixture_tree,kwargs):
+    cmd,env,receipt=prepare(fixture_tree,"normal",**kwargs)
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    settings=json.loads(settings_path_for(receipt).read_text(encoding="utf-8-sig"))
+    assert settings["autoMemoryEnabled"] is False
+    assert settings["hooks"]["PreToolUse"][0]["matcher"]=="Bash|PowerShell"
+
+
+def test_codex_lane_writes_no_settings_file_so_the_auto_memory_key_never_reaches_it(fixture_tree):
+    cache=fixture_tree["root"]/"models_cache.json"
+    cache.write_text(codex_models_cache_text(("gpt-6-sol",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert "--settings" not in argv
+    assert not settings_path_for(receipt).exists()
+
+
 def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixture_tree):
     # LANE-MODEL-CURRENCY-1: the table names a TIER ('sol'), never a pinned slug. A fixture
     # cache (MLV_CODEX_MODELS_CACHE override, never the real ~/.codex/models_cache.json) makes

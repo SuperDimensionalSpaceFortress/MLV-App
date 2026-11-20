@@ -121,7 +121,9 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_present_trace.cpp \
     $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp \
     $$REPO_ROOT/tests/console/test_playback_scale_label.cpp \
-    $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp
+    $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_idle_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_idle_policy.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -174,6 +176,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackPresentTrace.h \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerIdlePolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerMouseRetrievalHook.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/PlaybackTexturePresentSplit.h \
