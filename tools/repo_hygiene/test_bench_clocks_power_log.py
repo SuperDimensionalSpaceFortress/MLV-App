@@ -1091,6 +1091,28 @@ $b5 = T { Get-ClocksPowerBlock $gpuOk $cpuOk $plat $win $false 1000 'gpu-clocks.
 $r['bothOk'] = T { @{ status = $b5.status; reason = $b5.reason; advisory = $b5.gpu.advisory } }
 $b6 = T { Get-ClocksPowerBlock $null $null $null $null $false 1000 'gpu-clocks.csv' 'cpu-clocks.csv' }
 $r['noneAtAll'] = T { @{ status = $b6.status; reason = [string]$b6.reason; advisory = $b6.gpu.advisory } }
+# adversary ade3c7d5 A1: the GPU sampler's executable comes from two fixed local paths, never from a PATH walk (a slow share on PATH cost one
+# synchronous Test-Path per entry before any telemetry deadline was checked)
+$nvRoot = Join-Path $env:CP_TMP 'nv'
+$nvSys = Join-Path $nvRoot 'sysroot'; $nvPf = Join-Path $nvRoot 'pf'; $nvPath = Join-Path $nvRoot 'pathdir'
+foreach ($d in @((Join-Path $nvSys 'System32'), (Join-Path $nvPf 'NVIDIA Corporation\NVSMI'), $nvPath)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+$nvSysExe = Join-Path $nvSys 'System32\nvidia-smi.exe'; $nvPfExe = Join-Path $nvPf 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+[IO.File]::WriteAllText((Join-Path $nvPath 'nvidia-smi.exe'), 'x')
+$oldSys = $env:SystemRoot; $oldPf = $env:ProgramFiles; $oldPath = $env:PATH
+try {
+    $env:SystemRoot = $nvSys; $env:ProgramFiles = $nvPf; $env:PATH = $nvPath
+    $r['nvOnlyOnPath'] = T { Resolve-ClocksPowerNvidiaSmi }
+    [IO.File]::WriteAllText($nvPfExe, 'x')
+    $r['nvNvsmi'] = T { (Resolve-ClocksPowerNvidiaSmi) -ceq $nvPfExe }
+    [IO.File]::WriteAllText($nvSysExe, 'x')
+    $r['nvSystem32First'] = T { (Resolve-ClocksPowerNvidiaSmi) -ceq $nvSysExe }
+    $env:SystemRoot = '\\slow-share-a\win'; $env:ProgramFiles = '\\slow-share-b\pf'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r['nvUnc'] = T { Resolve-ClocksPowerNvidiaSmi }
+    $r['nvUncFast'] = ($sw.ElapsedMilliseconds -lt 2000)
+    $env:SystemRoot = ''; $env:ProgramFiles = ''
+    $r['nvBlank'] = T { Resolve-ClocksPowerNvidiaSmi }
+} finally { $env:SystemRoot = $oldSys; $env:ProgramFiles = $oldPf; $env:PATH = $oldPath }
 J $r
 """
 
@@ -1146,6 +1168,24 @@ class ClocksPowerRoundEightTests(unittest.TestCase):
         self.assertEqual(n["status"], "unavailable")
         self.assertNotIn("gpu=", n["reason"])
         self.assertIn("cpu=", n["reason"])
+
+    def test_r8_a1_the_gpu_sampler_finds_nvidia_smi_in_two_local_paths_and_never_walks_path(self) -> None:
+        self.assertEqual(self.r["nvOnlyOnPath"], "", "an nvidia-smi on PATH only is not found: PATH is never walked")
+        self.assertIs(self.r["nvNvsmi"], True, "the NVSMI folder is the second candidate")
+        self.assertIs(self.r["nvSystem32First"], True, "System32 wins")
+        self.assertEqual(self.r["nvUnc"], "", "a UNC root is skipped, not probed")
+        self.assertIs(self.r["nvUncFast"], True)
+        self.assertEqual(self.r["nvBlank"], "", "a blank root is skipped")
+
+    def test_r8_a1_the_clocks_call_site_uses_the_local_resolver_and_the_job_carries_it(self) -> None:
+        sites = [ln for ln in self.text.splitlines() if "Start-ClocksPowerGpu $clocksPowerBackend" in ln]
+        self.assertEqual(len(sites), 1)
+        self.assertIn("(Resolve-ClocksPowerNvidiaSmi)", sites[0])
+        self.assertNotIn("Resolve-UtilSampleNvidiaSmi", sites[0], "the util sampler's resolver walks PATH")
+        self.assertEqual(self.text.count("${function:Resolve-ClocksPowerNvidiaSmi}"), 1, "the job carries the helper")
+        fn = re.search(r"(?ms)^function Resolve-ClocksPowerNvidiaSmi\b.*?^}", self.text)
+        self.assertIsNotNone(fn)
+        self.assertNotIn("env:PATH", fn.group(0))
 
     def test_r8_the_block_function_never_reads_the_gpu_status(self) -> None:
         block = re.search(r"(?ms)^function Get-ClocksPowerBlock\b.*?^}", self.text)

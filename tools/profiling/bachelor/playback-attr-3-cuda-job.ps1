@@ -8262,6 +8262,20 @@ function Resolve-ClocksPowerTypeperf {
     ''
 }
 
+# adversary ade3c7d5 A1: nvidia-smi.exe for the ADVISORY GPU sampler, from two fixed LOCAL paths only (System32, then the NVSMI folder), '' when absent. The
+# util sampler's resolver walks PATH, and a PATH entry on a slow share would spend the pre-launch telemetry allowance on one synchronous Test-Path per
+# entry before any deadline is checked; the GPU half is disclosure only now, so it never pays that cost. A blank variable or a UNC root is skipped.
+function Resolve-ClocksPowerNvidiaSmi {
+    foreach ($root in @(([string]$env:SystemRoot + '\System32'), ([string]$env:ProgramFiles + '\NVIDIA Corporation\NVSMI'))) {
+        try {
+            if ($root.StartsWith('\')) { continue }
+            $p = $root + '\nvidia-smi.exe'
+            if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+        } catch { }
+    }
+    ''
+}
+
 # The Energy Meter counter paths this host lists (one short typeperf call, before the measured launch); an empty list when typeperf says nothing
 function Get-ClocksPowerCounterList([string]$TypeperfPath, [int]$TimeoutMs = 4000, [string]$Arguments = '-qx "Energy Meter"', $KillAction = $null) {
     $r = [ordered]@{ lines = @(); why = $null }
@@ -8630,7 +8644,7 @@ if ($clocksPowerEmit) {
     $cwOpen = '# BENCH-CLOCKS-POWER-LOG-1 >>>'
     $cwClose = '# BENCH-CLOCKS-POWER-LOG-1 <<<'
     $cwEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Invoke-ClocksPowerBounded}, ${function:Get-ClocksPowerNetStepMs}, ${function:Get-ClocksPowerClockCapture}, ${function:Get-ClocksPowerClockCheck}, ${function:Get-ClocksPowerRowGapStats}, ${function:Get-ClocksPowerClockWhy}, ${function:Test-ClocksPowerPreflightSurvivor}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Invoke-ClocksPowerDStateBounded}, ${function:Get-ClocksPowerRawFileName}, ${function:Read-ClocksPowerSource}, ${function:Test-ClocksPowerPublishedCopy}, ${function:Close-ClocksPowerHold},${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
+    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Invoke-ClocksPowerBounded}, ${function:Get-ClocksPowerNetStepMs}, ${function:Get-ClocksPowerClockCapture}, ${function:Get-ClocksPowerClockCheck}, ${function:Get-ClocksPowerRowGapStats}, ${function:Get-ClocksPowerClockWhy}, ${function:Test-ClocksPowerPreflightSurvivor}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Resolve-ClocksPowerNvidiaSmi},${function:Get-ClocksPowerCounterList}, ${function:Invoke-ClocksPowerDStateBounded}, ${function:Get-ClocksPowerRawFileName}, ${function:Read-ClocksPowerSource}, ${function:Test-ClocksPowerPublishedCopy}, ${function:Close-ClocksPowerHold},${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
     $cwLaunchLine = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
     $cwDoneLine = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
     $cwStart = $cwOpen + "`n" + $cwFunctions + "`n" + "`$clocksPowerBackend = '$(([string]$Backend).ToLowerInvariant())'`n`$clocksPowerIntervalMs = [int]$ClocksPowerIntervalMs`n`$clocksPowerWarmup = `$$(if ([bool]$ClocksPowerWarmup) { 'true' } else { 'false' })`n" + @'
@@ -8700,7 +8714,7 @@ if ($clocksPowerPreflightSurvivor) {
     $clocksPowerGpuStart = [ordered]@{ status = 'unavailable'; reason = 'preflight-child-survived'; why = $null; proc = $null; pid = $null; startTicks = $null; dState = $null; wakeDisclosure = $null; owned = $false; hold = $null; csvPath = $clocksPowerGpuCsv; throttleField = $null }
     $clocksPowerCpuStart = [ordered]@{ status = 'unavailable'; reason = 'preflight-child-survived'; why = $null; proc = $null; pid = $null; owned = $false; hold = $null; csvPath = $clocksPowerCpuCsv; pkgReason = $null }
 } else {
-    try { $clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend (Resolve-UtilSampleNvidiaSmi) $clocksPowerGpuCsv ${function:Get-UtilSampleDgpuState} $clocksPowerIntervalMs } catch { }
+    try { $clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend (Resolve-ClocksPowerNvidiaSmi) $clocksPowerGpuCsv ${function:Get-UtilSampleDgpuState} $clocksPowerIntervalMs } catch { }
     try {
         if (-not $clocksPowerListRead) { throw 'the Energy Meter listing did not run' }
         $clocksPowerCounters = @('\Processor Information(_Total)\% Processor Performance', '\Processor Information(_Total)\Processor Frequency')
