@@ -16240,15 +16240,43 @@ class WindowToggleEvidenceTests(unittest.TestCase):
     def test_r13_a1_a_session_declaration_the_app_never_writes_closes_the_window_never_leaves_it_open(self) -> None:
         """r13 (sol r12 A1 on c69927ab, input: `playback_smoke.start session =4` after the measured marker, which read 4/4/4/4/ok): a playback_smoke record whose tail
         carries a standalone word `session` that is not the key of a `session=` declaration (a space before the `=`, a colon, the bare word, a quoted key, any case, a
-        TAB), and a `playback_smoke.start` that declares no session at all, are unreadable boundaries: each closes the window and names itself; a healthy log, a record
-        that states `session=3`, and a name merely containing the word (`session_id=9`) stay ok."""
+        TAB), and a `playback_smoke.start` that declares no session at all, are unreadable boundaries: each closes the window and names itself; a healthy log and a record
+        that states `session=3` stay ok. (r14: a name merely containing the word, `session_id=9`, was a good row here; under the r14 whitelist it is an unreadable
+        boundary and moved to test_r14_a1's bad rows.)"""
         bad = ("playback_smoke.start session =4 position=10", "playback_smoke.start session:4 position=10", "playback_smoke.start session",
                "playback_smoke.start SESSION =4", "playback_smoke.start position=0 session\t=4", "playback_smoke.pace_summary position=0 session =3",
                # r13b (sol r12 A1 on c52cc719): a quoted key, a start record that declares no session at all, a second session word the key count does not cover, and a
                # value `session` (the app writes none; the reader fails closed on it)
                'playback_smoke.start "session"=4 position=10', "playback_smoke.start", "playback_smoke.start position=10", "playback_smoke.start session=3 session =4",
                'playback_smoke.pace_summary "session"=3 position=1', "playback_smoke.pace_summary note=session position=1")
-        good = ("playback_smoke.start session=3 position=10", "playback_smoke.pace_summary session_id=9 position=1", "playback_smoke.pace_summary position=1")
+        good = ("playback_smoke.start session=3 position=10", "playback_smoke.pace_summary position=1")
+        logs = [self.log()] + [self.log().replace(self.R13_MARKER, self.R13_MARKER + line + "\n", 1) for line in bad + good]
+        out = self.run_cases(logs)
+        self.assertEqual(out[0]["e"]["reason"], "ok", out[0])
+        for line, got in zip(bad, out[1:1 + len(bad)], strict=True):
+            with self.subTest(case=line):
+                self.assertNotEqual(got["e"]["reason"], "ok", got)
+                self.assertIn("session-boundary-unreadable", got["e"]["reason"], got)
+                self.assertEqual(got["passes"], [False, False], got)
+        for line, got in zip(good, out[1 + len(bad):], strict=True):
+            with self.subTest(case=line):
+                self.assertEqual(got["e"]["reason"], "ok", got)
+                self.assertEqual(got["passes"], [True, True], got)
+
+    def test_r14_a1_a_session_text_outside_the_anchored_grammar_is_an_unreadable_boundary(self) -> None:
+        """r14 (keys opus / sol r13 B1 on 5e0fa99f, input: `playback_smoke.start note=session=3` after the measured marker, which read 4/4/4/4/ok; hub ruling
+        20261120T1007Z: a whitelist, not another lexer): after the measured marker a playback_smoke record that holds the text `session` anywhere (any case, inside
+        any key or value), and every `playback_smoke.start`, is readable ONLY in the runner's anchored grammar (DualVenueRunner.psm1 summary / due-wake readers):
+        the record name, one space, `session=<digits>` as the first key, then a space or the line end, with the word `session` stated once. Anything else closes the
+        window and names session-boundary-unreadable, so neither shipped leg passes; the app's own records stay ok."""
+        bad = ("playback_smoke.start note=session=3", "playback_smoke.start x:session=3", "playback_smoke.start -session=3",
+               "playback_smoke.start Session=3", "playback_smoke.start foo_session=3", 'playback_smoke.start "x"session=3',
+               "playback_smoke.pace_summary session_id=9 position=1", "playback_smoke.frame note=session=3 index=1",
+               "playback_smoke.start session=3 note=session=3", "playback_smoke.start position=10 session=3", "playback_smoke.start session=3=4",
+               "playback_smoke.start session=3x position=10", "PLAYBACK_SMOKE.start session=3", "playback_smoke.start session=3\tposition=10",
+               "playback_smoke.frame index=1 SESSION=3")
+        good = ("playback_smoke.start session=3 position=10", "playback_smoke.start session=3", "playback_smoke.pace_summary position=1",
+                'playback_smoke.gpu_dualiso_recon_scale_summary session=3 session_scale=2 session_reason="preview scale 1 (full resolution)"')
         logs = [self.log()] + [self.log().replace(self.R13_MARKER, self.R13_MARKER + line + "\n", 1) for line in bad + good]
         out = self.run_cases(logs)
         self.assertEqual(out[0]["e"]["reason"], "ok", out[0])

@@ -7592,19 +7592,20 @@ function Get-AttrCudaWindowToggleEvidence {
                 elseif ($markerId[$i] -cne $windowId) { $end = $i }
             }
             elseif ($lines[$i] -match ('^playback_smoke\.' + $nameChar + '+( |$)')) {
-                foreach ($sessionMatch in [regex]::Matches($lines[$i], ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=(?<v>[^\s]*)'))) { if ($sessionMatch.Groups['v'].Value -cne $windowId) { $end = $i; break } }
-                # r13 (sol r12 A1 on c69927ab, input: `playback_smoke.start session =4` after the measured marker, which read 4/4/4/4/ok): the loop above reads only a literal
-                # `session=`, so a declaration the app never writes (`session =4`, `session:4`, a bare `session`) named no other session and left the window open over a foreign
-                # Play's toggles. r13b (sol r12 A1 on c52cc719, inputs: `playback_smoke.start "session"=4`, a bare `playback_smoke.start`, `playback_smoke.start position=10`): the
-                # rule is the CLASS, never a spelling. Every standalone word `session` of the record tail (not glued to a name character; the location was cut off above) must be the
-                # key of a `session=` declaration, so the count of the words equals the count of the keys (a quoted key, a spaced `=`, a colon, a value `session` all differ); and the
-                # Play's own start record (MainWindow.cpp `playback_smoke.start session=%1`) must declare a session at all. A record that fails either closes the window and names
-                # itself, as every other unreadable boundary does
-                if ($end -gt $i) {
-                    $recordTail = [regex]::Replace($lines[$i], ('^playback_smoke\.' + $nameChar + '+'), '')
-                    $sessionWords = [regex]::Matches($recordTail, ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn](?!' + $nameChar + ')')).Count
-                    $sessionKeys = [regex]::Matches($recordTail, ('(?<!' + $nameChar + ')[Ss][Ee][Ss][Ss][Ii][Oo][Nn]=')).Count
-                    if ($sessionWords -ne $sessionKeys -or ($sessionKeys -eq 0 -and $lines[$i] -match ('^playback_smoke\.start(?!' + $nameChar + ')'))) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                # r14 (keys opus / sol r13 B1 on 5e0fa99f, input: `playback_smoke.start note=session=3` after the measured marker, which read 4/4/4/4/ok; hub ruling
+                # 20261120T1007Z): a WHITELIST, never another lexer. r13 (`session =4`) and r13b (word count = key count) each read a spelling and each left one open (a
+                # `session=` nested in another key's value counted as a key). Now a playback_smoke record that holds the text `session` ANYWHERE (any case, inside any key or
+                # value), and every `playback_smoke.start` (the Play's own start record, MainWindow.cpp `playback_smoke.start session=%1`, must declare its session), is
+                # readable ONLY in the anchored grammar of the runner's own session readers (DualVenueRunner.psm1 summary selector and due-wake reader; the job's
+                # first-summary selector): the record name, one space, `session=<digits>` as the FIRST key (case-sensitive), then a space or the line end, with the word
+                # `session` (bounded by non-name characters, any case) stated exactly once. Its session is those digits: another one closes the window; any other record
+                # holding `session` closes it and names itself, as every other unreadable boundary does. Every playback_smoke record the app writes has that shape
+                # (`session=%1` first; `session_scale=` / `session_reason=` are other keys, not the word)
+                if ([regex]::Matches($lines[$i], '[Ss][Ee][Ss][Ss][Ii][Oo][Nn]', 'IgnoreCase, CultureInvariant').Count -gt 0 -or $lines[$i] -match ('^playback_smoke\.start(?!' + $nameChar + ')')) {
+                    $declared = $null
+                    if ([regex]::Matches($lines[$i], ('(?<!' + $nameChar + ')session(?!' + $nameChar + ')'), 'IgnoreCase, CultureInvariant').Count -eq 1 -and $lines[$i] -cmatch ('^playback_smoke\.' + $nameChar + '+ session=(?<v>[0-9]+)(?: |$)')) { $declared = $Matches['v'] }
+                    if ($null -eq $declared) { $anomalies.Add('session-boundary-unreadable'); $end = $i }
+                    elseif ($declared -cne $windowId) { $end = $i }
                 }
             }
             if ($end -le $i) { break }
