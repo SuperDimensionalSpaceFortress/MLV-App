@@ -397,6 +397,7 @@ HEADERS += MainWindow.h \
            PlaybackRouteStagedSlotPolicy.h \
            PlaybackReconWarmRunPolicy.h \
            ResizeStillDrawingWait.h \
+           ResizePlaybackPolicy.h \
            PlaybackReconWarmRun.h \
            PlaybackGpuClockKickPolicy.h \
            PlaybackAudioGate.h \
@@ -410,8 +411,13 @@ HEADERS += MainWindow.h \
            PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            LookLabelPolicy.h \
+           ViewerIdlePolicy.h \
+           ViewerCursorSurfaces.h \
+           ViewerMouseRetrievalHook.h \
            LookLabelOverlay.h \
            PlaybackScopesDuringPlayback.h \
+           PlayerShortcutBinding.h \
+           PlayerTransportToolbar.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \
@@ -429,6 +435,10 @@ HEADERS += MainWindow.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
+    GpuWindowViewerInput.h \
+    GpuWindowViewerInputForwarder.h \
+    ViewerDoubleClickPolicy.h \
+    ViewerDoubleClickFilter.h \
     GpuFieldTelemetry.h \
     GpuFieldTelemetryCore.h \
     GpuDeviceLossBreaker.h \

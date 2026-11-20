@@ -34,6 +34,8 @@
 #include "LookAssistAnalysisPump.h"
 #include "LookLabelPolicy.h"                        // look_label::LabelGrade member below (r16)
 #include "PlaybackInfoLabelPolicy.h"                // playback_info_label::Toggles member below
+#include "ViewerCursorSurfaces.h"                   // PLAYER-CURSOR-AUTOHIDE-1 viewer_idle members below
+#include "ViewerDoubleClickPolicy.h"                // viewer_dblclick::Gate member below (PLAYER-DOUBLECLICK-FULLSCREEN-1)
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
@@ -94,6 +96,7 @@ class SourceWriteGuard;
 class QAction;
 class QElapsedTimer;
 class QScreen;
+class QWindow;
 
 class MainWindow : public QMainWindow
 {
@@ -382,6 +385,8 @@ private slots:
     void on_horizontalSliderVidstabSmoothing_doubleClicked();
 
     void on_actionGoto_First_Frame_triggered();
+    void on_actionGoto_Last_Frame_triggered();
+    void on_actionStop_triggered();
     void on_actionExport_triggered();
     void on_actionExportCurrentFrame_triggered();
     void on_checkBoxHighLightReconstruction_toggled(bool checked);
@@ -431,6 +436,7 @@ private slots:
     void on_actionPlaybackShowQualityIndicator_triggered();
     void on_actionPlaybackVSync_triggered();
     void on_actionShowLookLabelInFullscreen_triggered();
+    void on_actionDoubleClickViewerFullscreen_triggered();
     void on_actionPlaybackScopesHide_triggered();
     void on_actionPlaybackScopesThrottled_triggered();
     void on_actionPlaybackScopesLive_triggered();
@@ -559,6 +565,9 @@ private slots:
     void on_toolButtonLumaVsSatReset_clicked();
     void on_actionNextFrame_triggered();
     void on_actionPreviousFrame_triggered();
+    void on_actionSeekBackwardOneSecond_triggered();
+    void on_actionSeekForwardOneSecond_triggered();
+    void on_actionKeyboardShortcuts_triggered();
     void on_checkBoxRawFixEnable_clicked(bool checked);
     void on_checkBoxLutEnable_clicked(bool checked);
     void on_checkBoxFilterEnable_clicked(bool checked);
@@ -661,6 +670,7 @@ private slots:
     void onPlaybackPrepResultReady( void );
 
 private:
+    void installGlWindowViewerInput( QWindow *glWindow );
     struct DisplayPreviewCacheEntry
     {
         bool valid = false;
@@ -907,6 +917,9 @@ private:
     QString m_lookLabelPlayingShown;        // the last drawn corner text sampled at the fps hook while playing
     QString m_lookLabelPlayingSurface;
     int m_lookLabelPlayingSamples = 0;
+    bool m_doubleClickViewerFullscreen = true; // PLAYER-DOUBLECLICK-FULLSCREEN-1: the persisted "Double-Click Viewer Toggles Fullscreen" setting
+    viewer_dblclick::Gate m_viewerDoubleClickGate; // first-press tool record for the viewer double-click
+    viewer_dblclick::ViewerState viewerDoubleClickState( const QObject *target, const QPointF &pos ) const;
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
     // Phase 4F-toolbar: Playback Quality dropdown on the main toolbar. The
     // button is a second view onto the same Playback Quality QActions used
@@ -939,11 +952,30 @@ private:
     uint8_t m_previewMode;
     uint8_t m_wbMode;
     bool m_frameChanged;
+    // PLAYER-FULLSCREEN-KEEPS-PLAYING-1 (adversary A2): a resize during Play redraws the current position once, past
+    // timerFrameEvent's duplicate-position suppression (a Play that holds one frame never advances to redraw it).
+    bool m_playbackRedrawAfterResize = false;
     int m_currentFrameIndex;
     double m_newPosDropMode;
     bool m_dontDraw;
     bool m_frameStillDrawing;
     bool m_fileLoaded = false;
+    // PLAYER-CURSOR-AUTOHIDE-1: fullscreen cursor auto-hide (one idle clock, shared later by
+    // PLAYER-FULLSCREEN-CONTROL-BAR-1; no second timer).
+    viewer_idle::Surfaces viewerIdleSurfaces( void ) const;
+    viewer_idle::Inputs viewerIdleInputs( void ) const;
+    void viewerIdleRestore( void );
+    void viewerIdleFullscreenChanged( bool on );
+    void viewerIdleWindowStateChanged( void );
+    void viewerIdleTimeout( void );
+    void viewerIdleNoteEvent( QObject *watched, QEvent *event );
+    QTimer *m_viewerIdleTimer = nullptr;
+    QElapsedTimer m_viewerIdleClock;
+    viewer_idle::Controller m_viewerIdle;
+    viewer_idle::CursorHider m_viewerCursorHider;
+    QPointF m_viewerIdleLastGlobal;
+    bool m_viewerIdleHaveLast = false;
+    viewer_idle::PointerWatch m_viewerIdlePointer;
     bool m_inOpeningProcess;
     bool m_setSliders;
     int m_timerId;

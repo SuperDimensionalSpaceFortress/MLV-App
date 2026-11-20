@@ -814,6 +814,8 @@ private:
     int findOldestReadySlotLocked( void ) const;
     int findFreeSlotLocked( void ) const;
     void releaseSlotLocked( int slotIndex );
+    // PLAYER-FULLSCREEN-KEEPS-PLAYING-1 r1 fix 2: frees every Ready lookahead slot of a retired generation (PlaybackSlotRelease.h)
+    int releaseRetiredPlaybackLookaheadSlotsLocked( uint64_t activeGeneration );
     void copySlotTelemetryLocked( const FrameSlot &slot );
 
     friend class DecodeWorker;

@@ -489,8 +489,13 @@ TEST(PlaybackConformWiring, PlayStartLoopWrapSeekAndCutInPathsAllRouteThroughThe
 {
     const QString source = mainWindowSource();
     // play start, loop wrap (x2: last-frame loop and drop-frame wrap), seek (slider), go-to-first,
-    // and (MERGE-MASTER r5, AUDIO-A1) the re-arm when a conform control un-conforms the clip during playback
-    ASSERT_EQ(6, countOccurrences(source, QStringLiteral("requestPlaybackAudioSync();")));
+    // (MERGE-MASTER r5, AUDIO-A1) the re-arm when a conform control un-conforms the clip during playback,
+    // and (PLAYER-STANDARD-SHORTCUT-MAP-1) go-to-last, the End-key mirror of go-to-first
+    ASSERT_EQ(7, countOccurrences(source, QStringLiteral("requestPlaybackAudioSync();")));
+    const QString gotoLast = functionBody(source,
+        QStringLiteral("void MainWindow::on_actionGoto_Last_Frame_triggered()"),
+        QStringLiteral("void MainWindow::on_actionExport_triggered()"));
+    ASSERT_EQ(1, countOccurrences(gotoLast, QStringLiteral("requestPlaybackAudioSync();")));
     const QString handling = playbackHandlingBody(source);
     ASSERT_EQ(2, countOccurrences(handling, QStringLiteral("requestPlaybackAudioSync();")));
 }

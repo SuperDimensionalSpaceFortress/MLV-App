@@ -66,6 +66,10 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_gui_smoke_display_select_wiring.cpp \
     $$REPO_ROOT/tests/console/test_display_device_mapping.cpp \
     $$REPO_ROOT/tests/console/test_playback_fullscreen_ui_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_window_viewer_input.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_window_viewer_input_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_double_click_policy.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_double_click_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
     $$REPO_ROOT/tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp \
     $$REPO_ROOT/tests/console/test_llrawproc_residual_telemetry_wiring.cpp \
@@ -104,6 +108,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_route_staged_slot_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_recon_warm_run_policy.cpp \
     $$REPO_ROOT/tests/console/test_resize_still_drawing_wait.cpp \
+    $$REPO_ROOT/tests/console/test_resize_playback_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_gpu_clock_kick_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_warm_output_reuse_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
@@ -117,7 +122,9 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp \
     $$REPO_ROOT/tests/console/test_playback_scale_label.cpp \
     $$REPO_ROOT/tests/console/test_playback_info_label.cpp \
-    $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp
+    $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_idle_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_viewer_idle_policy.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -140,6 +147,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/ExportProcess.h \
     $$REPO_ROOT/platform/qt/DualIsoLevelSyncPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFrameRange.h \
+    $$REPO_ROOT/platform/qt/GpuWindowViewerInput.h \
+    $$REPO_ROOT/platform/qt/ViewerDoubleClickPolicy.h \
     $$REPO_ROOT/platform/qt/OutputDirIdentity.h \
     $$REPO_ROOT/platform/qt/AutomationSettings.h \
     $$REPO_ROOT/platform/qt/HubHostPlaybackGuard.h \
@@ -169,6 +178,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackPresentTrace.h \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerIdlePolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerMouseRetrievalHook.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/PlaybackTexturePresentSplit.h \
@@ -185,6 +196,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackRouteStagedSlotPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
     $$REPO_ROOT/platform/qt/ResizeStillDrawingWait.h \
+    $$REPO_ROOT/platform/qt/ResizePlaybackPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackGpuClockKickPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \

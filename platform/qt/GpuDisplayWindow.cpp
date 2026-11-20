@@ -60,6 +60,17 @@ quint64 g_swapTelemetrySessionId = 0;
 bool g_swapTelemetrySessionActive = false;
 double g_swapTelemetrySessionBeginQpcMs = 0.0;
 
+// GL reads rows bottom-up; QImage rows are top-down. QImage::flipped() is Qt 6.9+; on an older
+// Qt (the macOS Intel release kit is Qt 5) mirrored( false, true ) gives the same pixels.
+QImage verticallyFlipped( const QImage &image )
+{
+#if QT_VERSION >= QT_VERSION_CHECK( 6, 9, 0 )
+    return image.flipped( Qt::Vertical );
+#else
+    return image.mirrored( false, true );
+#endif
+}
+
 bool windowEnvFlagEnabled(const QByteArray &value)
 {
     if ( value.isEmpty() ) return false;
@@ -229,6 +240,16 @@ QString GpuDisplayWindow::lookLabelDrawnTextIfActive()
 {
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     return win ? win->m_lookLabelDrawnText : QString();
+}
+
+GpuDisplayWindow::PaintedPicture GpuDisplayWindow::lastPaintedPicture() const
+{
+    // A picture only while the last paintGL drew one and nothing has been handed over since: every
+    // hand-over, clear and no-frame paint drops m_texturePresentationActive, and only a paint that
+    // drew sets it again, so a pre-clear picture never comes back (adversary r2 pass 1 A2). No
+    // texture (cleared or torn down): the next paint draws black, so none either.
+    if ( !m_texture || !m_texturePresentationActive ) return PaintedPicture();
+    return m_lastPaintedPicture;
 }
 
 namespace
@@ -2489,6 +2510,7 @@ void GpuDisplayWindow::paintGL()
     float sy = 1.0f;
     if ( imgAspect > winAspect ) sy = winAspect / imgAspect;
     else                         sx = imgAspect / winAspect;
+    m_lastPaintedPicture = PaintedPicture{ true, fbw, fbh, dpr, sx, sy };   // PLAYER-GL-WINDOW-INPUT-PARITY-1 r2: read by lastPaintedPicture()
 
     // Interleaved [x, y, u, v]; screen-top maps to texture v=0 (matches the corrected
     // GpuDisplayViewport quad so QImage row 0 / image top shows at the top -> upright).
@@ -2589,7 +2611,7 @@ void GpuDisplayWindow::paintGL()
             else
             {
                 // GL reads bottom-up; QImage rows are top-down.
-                m_captureReadbackImage = grabbed.flipped(Qt::Vertical);
+                m_captureReadbackImage = verticallyFlipped(grabbed);
                 m_captureReadbackSucceeded = true;
                 m_captureReadbackError.clear();
             }
@@ -2612,7 +2634,7 @@ void GpuDisplayWindow::paintGL()
             Q_UNUSED(mk);
             const QString p = QString::fromLocal8Bit(rbDir)
                 + QStringLiteral("/rb_%1.png").arg(rbCounter, 5, 10, QChar('0'));
-            out.mirrored(false, true).save(p, "PNG");   // GL bottom-up -> top-down
+            verticallyFlipped(out).save(p, "PNG");   // GL bottom-up -> top-down
             ++rbCounter;
         }
     }

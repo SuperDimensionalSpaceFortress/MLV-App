@@ -1315,8 +1315,14 @@ function Get-VenueLegPreLoadMean {
     try {
         if (-not $ReceiptPath) { return $null }
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
-        $summary = Join-Path (Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))) 'summary.json'
-        if (-not (Test-Path -LiteralPath $summary -PathType Leaf)) { return $null }
+        $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
+        # A playback leg publishes <evidence>\<receiptId>\summary.json; an export leg publishes <evidence>\<receiptId>\export\summary.json (EXPORT-VENUE-LEG-1 r3: the
+        # first venue proof read UNKNOWN because only the first was looked at). The first that exists is read.
+        $summary = $null
+        foreach ($candidate in @((Join-Path $evidence 'summary.json'), (Join-Path (Join-Path $evidence 'export') 'summary.json'))) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $summary = $candidate; break }
+        }
+        if ($null -eq $summary) { return $null }
         $q = ([IO.File]::ReadAllText($summary) | ConvertFrom-Json).cpuQuiescence
         if ($null -eq $q -or $null -eq $q.timeMeanPercent) { return $null }
         [double]$q.timeMeanPercent
@@ -1674,9 +1680,13 @@ function Invoke-VenueBoundedProcess {
     .SYNOPSIS
     Run one child process and give up on it after -TimeoutSec (the child and its tree are killed). .exit is $null when it timed out.
     .OUTPUTS
-    [pscustomobject]@{ exit; timedOut; stdout; stderr }
+    [pscustomobject]@{ exit; timedOut; killConfirmed; stdout; stderr }. killConfirmed (EXPORT-VENUE-LEG-1 r11) is $true when the child exited on its own, or was killed and HasExited read true after the 15 s wait; a caller that
+    must not leave a child behind reads it.
     #>
-    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec)
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
+          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000)
+    # r11 (adversary r11 A5, A6): after the bound, the kill wait and both stream waits share ONE budget ($CleanupWaitMs: they used to add up to 3 x 15 s past a caller's deadline), and a tree kill
+    # that threw is never "confirmed" because the root happened to exit: killConfirmed needs no kill error AND the root gone.
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
@@ -1684,9 +1694,11 @@ function Invoke-VenueBoundedProcess {
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
     $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
-    if ($timedOut) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(15000) }
-    [void]$outTask.Wait(15000); [void]$errTask.Wait(15000)
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut
+    $killErrored = $false
+    $cleanup = [Diagnostics.Stopwatch]::StartNew()
+    if ($timedOut) { try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
+    [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 

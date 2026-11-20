@@ -204,6 +204,15 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 # is a real unpaced swap-interval-0 leg and carries presentTearingExpectedReason like the headroom and partition legs.
 UTIL_SAMPLE_LEGS = ("legs/m16-1243-utilsample-unpaced-windowed-s1.json",)
 SHIPPED_LEGS = (*SHIPPED_LEGS, *UTIL_SAMPLE_LEGS)
+# CUDA-HEADROOM-24-60-UTIL-FULLSCREEN-SPECS-1: the fullscreen s1/s2 utilisation-sampler copies (generatorArgs.utilSample true, Look Assist ON, cuda), one per
+# tracked source leg, keyed to the source they twin (only legId, card and utilSample differ). The two headroom-stage copies are unpaced swap-interval-0 legs
+# and carry presentTearingExpectedReason like their sources; the two native copies are paced.
+UTIL_FULLSCREEN_STAGE_LEGS = {"legs/m16-1243-headroom-stage-fullscreen-s1-util.json": "legs/m16-1243-headroom-stage-fullscreen-s1.json",
+                              "legs/m16-1243-headroom-stage-fullscreen-s2-util.json": "legs/m16-1243-headroom-stage-fullscreen-s2.json"}
+UTIL_FULLSCREEN_NATIVE_LEGS = {"legs/m16-1457-native-fullscreen-s1-util.json": "legs/m16-1457-native-fullscreen-s1.json",
+                               "legs/m16-1457-native-fullscreen-s2-util.json": "legs/m16-1457-native-fullscreen-s2.json"}
+UTIL_FULLSCREEN_LEGS = {**UTIL_FULLSCREEN_STAGE_LEGS, **UTIL_FULLSCREEN_NATIVE_LEGS}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *UTIL_FULLSCREEN_LEGS)
 # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B (generatorArgs.prepConflatedMove true -> MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1),
 # one per capture-free pace cell the CPU route runs at s2 and s4 (a speed leg, so the post-play visual strips are on by default), keyed to the cell it twins. The
 # OFF arm is the twinned cell itself (env unset).
@@ -261,6 +270,9 @@ HFR_NATIVE_S1_LEGS = ("legs/m16-1457-native-fullscreen-s1.json", "legs/m16-1457-
 # HFR-NATIVE-60FPS-FULLRES-1 r30 (merge of master into #420): #420 already ships the pair in HFR_NATIVE_LEGS, so each file is listed once (a duplicate
 # made LineEndingsCannotHideACommittedFileTests unlink the same checked-out file twice).
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in SHIPPED_LEGS))
+# EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
+EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -4052,7 +4064,11 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("ADVISORY", False))
 
     def test_mutation_without_the_evidence_hash_recheck_an_edited_file_validates(self) -> None:
-        mutated = self.mutated_module([("if ((Get-DvSha256OfBytes $b) -cne $claim) {", "if ($false) {")])
+        # r6: the recheck line exists twice in the module (the capture-evidence loop, then the export loop). The anchor names the capture copy by the text after
+        # the condition ($invalid, then "$($rel"); the export copy ($Invalid, then "export/$name") is proven by test_mutation_without_the_export_hash_recheck_... in
+        # test_dual_venue_export_leg.py.
+        mutated = self.mutated_module([('if ((Get-DvSha256OfBytes $b) -cne $claim) { $invalid.Add("EVIDENCE_HASH_MISMATCH: $($rel',
+                                        'if ($false) { $invalid.Add("EVIDENCE_HASH_MISMATCH: $($rel')])
         repo = self.prod_repo()
         ev = self.evidence("m5")
         receipt = self.receipt_for(repo, ev)
@@ -7706,7 +7722,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.jsonschema.validate(spec, self.schema)
             self.assertTrue(spec["backends"], path.name)
             types.add(spec["legType"])
-        self.assertEqual(types, {"speed", "look"})
+        # EXPORT-VENUE-LEG-1: the four export legs (cpu-only batch export stage timing) are the third leg type
+        self.assertEqual(types, {"speed", "look", "export"})
         # (the speed leg and the classic look leg still run as cuda AND cpu; the scale-2 look leg is cpu-only until the CUDA route honours scale 2)
         for name in ("m16-1243-speed", "m16-1243-look"):
             self.assertEqual(sorted(json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))["backends"]), ["cpu", "cuda"], name)
@@ -7820,9 +7837,18 @@ class LegSpecSchemaTests(unittest.TestCase):
         a leg called native reports a 24 fps run as its evidence. So every such leg names its arm: 'on' for a conform leg, 'off' for every other one."""
         legs = sorted((DV / "legs").glob("m16-145[67]-*.json"))
         self.assertGreater(len(legs), 20)
+        exempt = 0
         for path in legs:
             leg = json.loads(path.read_text(encoding="utf-8"))
+            if leg.get("legType") == "export":
+                # EXPORT-VENUE-LEG-1 r2: an export leg plays nothing (MLVApp --batch), so no arm can silently halve its pace, and naming one would make it INVALID:
+                # Get-DvConformArmVerdict (Invoke-VenueLeg.ps1, run on every PASS/FAIL) finds no playback_smoke.conform line in an export run and blocks, and the
+                # export shape (Get-DvExportShapeRefusal) takes no playbackConform. The export legs are pinned by test_dual_venue_export_leg.
+                self.assertNotIn("playbackConform", leg["generatorArgs"], path.name)
+                exempt += 1
+                continue
             self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on" if "-conform-" in path.name else "off", path.name)
+        self.assertEqual(exempt, 2, "the two M16-1456 export legs are the only exempt ones")
 
     def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
         """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its
@@ -8065,12 +8091,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -8177,6 +8203,26 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
                 self.assertIs(spec["generatorArgs"]["utilSample"], True, path.name)
+            elif spec["card"] == "CUDA-HEADROOM-24-60-UTIL-FULLSCREEN-SPECS-1":   # the fullscreen s1/s2 utilisation-sampler copies of four tracked legs
+                rel = "legs/" + path.name
+                self.assertIn(rel, UTIL_FULLSCREEN_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-(1243-headroom-stage|1457-native)-fullscreen-s[12]-util$", path.name)
+                self.assertEqual(spec["displayMode"], "fullscreen", path.name)
+                self.assertIn("cuda", spec["backends"], path.name)
+                self.assertIs(spec["generatorArgs"]["utilSample"], True, path.name)
+                self.assertIs(spec["generatorArgs"]["forceLookAssist"], True, path.name)   # Look Assist ON (D4b, the owner shape)
+                # the copy is its tracked source except legId, card and utilSample
+                source = json.loads((DV / UTIL_FULLSCREEN_LEGS[rel]).read_text(encoding="utf-8"))
+                source["legId"], source["card"] = spec["legId"], spec["card"]
+                source["generatorArgs"] = dict(source["generatorArgs"], utilSample=True)
+                self.assertEqual(spec, source, path.name)
+                if rel in UTIL_FULLSCREEN_STAGE_LEGS:
+                    self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                    self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+                else:
+                    self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
+                    self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
             elif spec["card"] == "CPU-DUALISO-PREVIEW-SCALE-VERIFY-1":   # the quality-1 Look Assist legs, named by display and scale
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(fullscreen|windowed)-s[24]$", path.name)

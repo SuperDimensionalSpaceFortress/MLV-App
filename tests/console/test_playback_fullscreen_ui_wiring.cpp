@@ -12,8 +12,13 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
+#include <QDir>
+#include <QDirIterator>
 #include <QFile>
+#include <QFileInfo>
+#include <QRegularExpression>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 
 namespace
@@ -43,7 +48,7 @@ TEST(PlaybackFullscreenUiWiring, MenuEntryIsNotForceHidden)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     ASSERT_FALSE(source.contains(QStringLiteral("ui->actionFullscreen->setVisible( false )")));
-    // Still added to the View menu in the .ui -- nothing hides it after setupUi() runs.
+    // Still added to the Playback menu (MainWindow.ui:291) -- nothing hides it after setupUi() runs.
     const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
     ASSERT_TRUE(ui.contains(QStringLiteral("<addaction name=\"actionFullscreen\"/>")));
 }
@@ -61,17 +66,29 @@ TEST(PlaybackFullscreenUiWiring, ContextMenuEntryStillOffersFullscreenWhileActiv
 
 TEST(PlaybackFullscreenUiWiring, F11IsRegisteredOnWindowsAlongsideTheExistingShortcut)
 {
-    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
-    const int at = source.indexOf(QStringLiteral("ui->actionFullscreen->setShortcuts("));
+    // PLAYER-STANDARD-SHORTCUT-MAP-1: F11 lives in the ONE player key table
+    // (PlayerShortcutBinding.h bindings()), on the actionFullscreen row next to Ctrl+F, and
+    // MainWindow.cpp no longer adds it in code.
+    const QString helper = readRepoFile(QStringLiteral("platform/qt/PlayerShortcutBinding.h"));
+    const QString f11 = QStringLiteral("QKeySequence( Qt::Key_F11 )");
+    const int at = helper.indexOf(f11);
     ASSERT_TRUE(at >= 0);
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("Qt::Key_F11"), at + int(f11.size())) < 0);
     // Guarded to Windows: this pin only claims F11 for Q_OS_WIN, per the round brief.
-    const int guardAt = source.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), at);
-    const int guardEndAt = source.indexOf(QStringLiteral("#endif"), at);
+    const int guardAt = helper.lastIndexOf(QStringLiteral("#ifdef Q_OS_WIN"), at);
+    const int guardEndAt = helper.indexOf(QStringLiteral("#endif"), at);
     ASSERT_TRUE(guardAt >= 0);
     ASSERT_TRUE(guardEndAt > at);
-    const QString guarded = source.mid(guardAt, guardEndAt - guardAt);
-    ASSERT_TRUE(guarded.contains(QStringLiteral("ui->actionFullscreen->shortcut()"))); // keeps Ctrl+F from the .ui
-    ASSERT_TRUE(guarded.contains(QStringLiteral("QKeySequence( Qt::Key_F11 )")));
+    ASSERT_TRUE(helper.indexOf(QStringLiteral("#endif"), guardAt) == guardEndAt);
+    const int ctrlFAt = helper.lastIndexOf(
+        QStringLiteral("QList<KeyBinding> fullscreen{ { QKeySequence( Qt::CTRL | Qt::Key_F ), KeyKind::Primary } };"), guardAt);
+    ASSERT_TRUE(ctrlFAt >= 0); // keeps Ctrl+F, first (the key the menu shows)
+    const int rowAt = helper.indexOf(QStringLiteral("QStringLiteral( \"actionFullscreen\" ), fullscreen"), guardEndAt);
+    ASSERT_TRUE(rowAt > guardEndAt);
+
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_FALSE(source.contains(QStringLiteral("ui->actionFullscreen->setShortcuts(")));
+    ASSERT_FALSE(source.contains(QStringLiteral("Qt::Key_F11")));
 
     const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
     const QString actionBlock = functionBody(ui,
@@ -152,6 +169,253 @@ TEST(PlaybackFullscreenUiWiring, SmokeGeometryVerificationUsesTheSameScreenChoic
     ASSERT_TRUE(body.contains(QStringLiteral("QScreen *presentationScreen = this->screen();")));
     ASSERT_TRUE(body.contains(QStringLiteral("presentationScreen = this->screen();")));
     ASSERT_TRUE(body.contains(QStringLiteral("const bool onTarget = ( presentationScreen == target );")));
+}
+
+TEST(PlaybackFullscreenUiWiring, PlayerShortcutsAreBoundToTheWindowAndKeepWindowScope)
+{
+    // PLAYER-FULLSCREEN-SHORTCUTS-LIVE-1: fullscreen hides the menu bar and toolbar, the only
+    // visible carriers of the player actions where the menu bar is a widget (Windows, Linux; a
+    // macOS native menu bar keeps carrying them), so MainWindow binds them to itself as well.
+    // The behaviour is proven by gui_tests fullscreenLiveShortcuts_*; this pins the call site.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("#include \"PlayerShortcutBinding.h\"")));
+    const int bindAt = source.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"));
+    ASSERT_TRUE(bindAt >= 0);
+    ASSERT_TRUE(source.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"), bindAt + 1) < 0);
+    // Inside initGui(), which the constructor calls after ui->setupUi(this) -- the actions
+    // must exist when it runs (bindToWindow() warns for any it cannot find).
+    const QString initGui = functionBody(source,
+        QStringLiteral("void MainWindow::initGui( void )"),
+        QStringLiteral("void MainWindow::initLib( void )"));
+    ASSERT_FALSE(initGui.isEmpty());
+    ASSERT_TRUE(initGui.contains(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );")));
+    const int setupAt = source.indexOf(QStringLiteral("ui->setupUi(this);"));
+    const int initGuiCallAt = source.indexOf(QStringLiteral("    initGui();"), setupAt);
+    ASSERT_TRUE(setupAt >= 0);
+    ASSERT_TRUE(initGuiCallAt > setupAt);
+
+    // Window scope kept: the helper never changes the shortcut context. ApplicationShortcut
+    // would fire while a non-modal dialog (StatusDialog) has focus.
+    const QString helper = readRepoFile(QStringLiteral("platform/qt/PlayerShortcutBinding.h"));
+    ASSERT_FALSE(helper.contains(QStringLiteral("setShortcutContext")));
+    ASSERT_FALSE(helper.contains(QStringLiteral("ApplicationShortcut")));
+    ASSERT_TRUE(helper.contains(QStringLiteral("window->addAction( action );")));
+}
+
+TEST(PlaybackFullscreenUiWiring, FocusGuardIsInstalledOnceRightAfterTheBinding)
+{
+    // PLAYER-STANDARD-SHORTCUT-MAP-1: the table binds navigation keys (Left/Right/Home/End/PgUp/
+    // PgDown/Return/Enter); the guard keeps them with focused input widgets, the seek bar exempt.
+    // Behaviour: gui_tests playerShortcutMap_focusGuard*; this pins the one install site.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString install = QStringLiteral(
+        "qApp->installEventFilter( new PlayerShortcutBinding::FocusGuard( ui->horizontalSliderPosition, this ) );");
+    const int installAt = source.indexOf(install);
+    ASSERT_TRUE(installAt >= 0);
+    ASSERT_TRUE(source.indexOf(install, installAt + 1) < 0);
+    ASSERT_TRUE(source.indexOf(QStringLiteral("PlayerShortcutBinding::FocusGuard(")) == source.indexOf(install) + int(QStringLiteral("qApp->installEventFilter( new ").size()));
+    const QString initGui = functionBody(source,
+        QStringLiteral("void MainWindow::initGui( void )"),
+        QStringLiteral("void MainWindow::initLib( void )"));
+    ASSERT_FALSE(initGui.isEmpty());
+    const int bindAt = initGui.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"));
+    ASSERT_TRUE(bindAt >= 0);
+    ASSERT_TRUE(initGui.indexOf(install) > bindAt);
+}
+
+TEST(PlaybackFullscreenUiWiring, MainWindowSetsNoShortcutOnATableAction)
+{
+    // The live keys of a table action are exactly PlayerShortcutBinding::bindings(); a
+    // setShortcut(s) call in MainWindow.cpp would be a second, hand-kept key list.
+    const QString helper = readRepoFile(QStringLiteral("platform/qt/PlayerShortcutBinding.h"));
+    const QString table = functionBody(helper,
+        QStringLiteral("inline QList<ActionBinding> bindings()"),
+        QStringLiteral("inline QList<QKeySequence> sequencesOf("));
+    ASSERT_FALSE(table.isEmpty());
+    QStringList names;
+    QRegularExpressionMatchIterator it =
+        QRegularExpression(QStringLiteral("QStringLiteral\\( \"(action\\w+)\" \\)")).globalMatch(table);
+    while (it.hasNext()) names << it.next().captured(1);
+    ASSERT_TRUE(names.size() >= 13);
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    for (const QString & name : names)
+    {
+        ASSERT_FALSE(source.contains(QStringLiteral("ui->%1->setShortcut(").arg(name)));
+        ASSERT_FALSE(source.contains(QStringLiteral("ui->%1->setShortcuts(").arg(name)));
+    }
+}
+
+TEST(PlaybackFullscreenUiWiring, OneSecondSeeksGoThroughTheOverflowSafeHelper)
+{
+    // Adversary pass 2 A1 (95d6cb1c): clip metadata can carry an accepted frame rate such as
+    // 2147483648; qRound() of it (or position + step in int) overflows before the slider clamps.
+    // Both seek slots compute the target in PlayerShortcutBinding::oneSecondSeekTarget()
+    // (behaviour: gui_tests playerShortcutMap_oneSecondSeekTargetNeverOverflows).
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    for (const char *slot : { "void MainWindow::on_actionSeekBackwardOneSecond_triggered()",
+                              "void MainWindow::on_actionSeekForwardOneSecond_triggered()" })
+    {
+        const QString body = functionBody(source, QString::fromLatin1(slot), QStringLiteral("\n}"));
+        ASSERT_FALSE(body.isEmpty());
+        ASSERT_TRUE(body.contains(QStringLiteral("PlayerShortcutBinding::oneSecondSeekTarget(")));
+        ASSERT_FALSE(body.contains(QStringLiteral("qRound(")));
+        ASSERT_TRUE(body.contains(QStringLiteral("ui->horizontalSliderPosition->minimum()")));
+        ASSERT_TRUE(body.contains(QStringLiteral("ui->horizontalSliderPosition->maximum()")));
+    }
+}
+
+TEST(PlaybackFullscreenUiWiring, HelpMenuOffersKeyboardShortcuts)
+{
+    const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
+    const QString menuHelp = functionBody(ui,
+        QStringLiteral("<widget class=\"QMenu\" name=\"menuHelp\">"),
+        QStringLiteral("</widget>"));
+    ASSERT_FALSE(menuHelp.isEmpty());
+    ASSERT_TRUE(menuHelp.contains(QStringLiteral("<addaction name=\"actionKeyboardShortcuts\"/>")));
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString slot = functionBody(source,
+        QStringLiteral("void MainWindow::on_actionKeyboardShortcuts_triggered()"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(slot.isEmpty());
+    ASSERT_TRUE(slot.contains(QStringLiteral("PlayerShortcutBinding::createShortcutsDialog( this )")));
+}
+
+namespace
+{
+
+QStringList addactionNames(const QString & block)
+{
+    QStringList names;
+    QRegularExpressionMatchIterator it =
+        QRegularExpression(QStringLiteral("<addaction name=\"(\\w+)\"/>")).globalMatch(block);
+    while (it.hasNext()) names << it.next().captured(1);
+    return names;
+}
+
+} // namespace
+
+TEST(PlayerToolbarTransportButtons, MainToolBarCarriesTheClusterInOrderAndMatchesTheHeaderList)
+{
+    // PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1 T1: literal oracle, then a drift guard against the ONE list.
+    const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
+    const QString toolbar = functionBody(ui,
+        QStringLiteral("<widget class=\"QToolBar\" name=\"mainToolBar\">"),
+        QStringLiteral("</widget>"));
+    ASSERT_FALSE(toolbar.isEmpty());
+    const QStringList all = addactionNames(toolbar);
+    const int first = all.indexOf(QStringLiteral("actionGoto_First_Frame"));
+    ASSERT_TRUE(first >= 0);
+    const QStringList cluster = all.mid(first);
+    const QStringList oracle{
+        QStringLiteral("actionGoto_First_Frame"), QStringLiteral("actionPreviousFrame"),
+        QStringLiteral("actionPlay"), QStringLiteral("actionStop"), QStringLiteral("actionNextFrame"),
+        QStringLiteral("actionGoto_Last_Frame"), QStringLiteral("actionLoop"), QStringLiteral("separator"),
+        QStringLiteral("actionAudioOutput"), QStringLiteral("separator"), QStringLiteral("actionZoomFit"),
+        QStringLiteral("actionZoom100"), QStringLiteral("actionFullscreen") };
+    ASSERT_EQ(oracle.join(QStringLiteral(",")).toStdString(), cluster.join(QStringLiteral(",")).toStdString());
+
+    const QString header = readRepoFile(QStringLiteral("platform/qt/PlayerTransportToolbar.h"));
+    const QString list = functionBody(header,
+        QStringLiteral("inline QStringList clusterActionNames()"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(list.isEmpty());
+    QStringList headerNames;
+    QRegularExpressionMatchIterator it =
+        QRegularExpression(QStringLiteral("QStringLiteral\\( \"(\\w+)\" \\)")).globalMatch(list);
+    while (it.hasNext()) headerNames << it.next().captured(1);
+    QStringList withoutSeparators = cluster;
+    withoutSeparators.removeAll(QStringLiteral("separator"));
+    ASSERT_EQ(withoutSeparators.join(QStringLiteral(",")).toStdString(), headerNames.join(QStringLiteral(",")).toStdString());
+}
+
+TEST(PlayerToolbarTransportButtons, PlaybackMenuOffersStopRightAfterPlayAndStopHasNoShortcut)
+{
+    // T2: K is reserved for PLAYER-JKL-SHUTTLE-1, so Stop stays unbound.
+    const QString ui = readRepoFile(QStringLiteral("platform/qt/MainWindow.ui"));
+    const QString menu = functionBody(ui,
+        QStringLiteral("<widget class=\"QMenu\" name=\"menuPlayback\">"),
+        QStringLiteral("<widget class=\"QMenu\" name=\"menuView\">"));
+    ASSERT_FALSE(menu.isEmpty());
+    const QStringList names = addactionNames(menu);
+    const int play = names.indexOf(QStringLiteral("actionPlay"));
+    ASSERT_TRUE(play >= 0);
+    ASSERT_TRUE(play + 1 < names.size());
+    ASSERT_EQ(std::string("actionStop"), names.at(play + 1).toStdString());
+    const QString action = functionBody(ui,
+        QStringLiteral("<action name=\"actionStop\">"),
+        QStringLiteral("</action>"));
+    ASSERT_FALSE(action.isEmpty());
+    ASSERT_FALSE(action.contains(QStringLiteral("name=\"shortcut\"")));
+}
+
+TEST(PlayerToolbarTransportButtons, StopSeeksToCutInThenPausesAndNothingRunsAfterThePause)
+{
+    // T3: the clamped cut-in seek, then the user-pause form. Never the Goto First Frame toggle,
+    // which jumps to 0 when the position already is cut in.
+    // Adversary A1 on 3802e3b4: the pause runs processEvents() (clip with audio), which can deliver a
+    // key pressed after Stop (End: slider 99). A seek AFTER the pause overwrote it with cut in. So the
+    // seek comes first and the pause is the last thing the slot does: input it delivers wins.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("void MainWindow::on_actionStop_triggered()"),
+        QStringLiteral("\n}"));
+    ASSERT_FALSE(body.isEmpty());
+    const int seek = body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"));
+    const int track = body.indexOf(QStringLiteral("m_newPosDropMode = cutInFrame;"));
+    const int setChecked = body.indexOf(QStringLiteral("ui->actionPlay->setChecked( false );"));
+    const int paused = body.indexOf(QStringLiteral("on_actionPlay_triggered( false );"));
+    ASSERT_TRUE(seek >= 0);
+    ASSERT_TRUE(track > seek);
+    ASSERT_TRUE(setChecked > track);
+    ASSERT_TRUE(paused > setChecked);
+    // After the pause call only the closing braces remain: no seek, no return, nothing that could
+    // overwrite input the pause delivered.
+    const QString afterPause = body.mid(paused + int(QStringLiteral("on_actionPlay_triggered( false );").size()));
+    ASSERT_EQ(std::string(), afterPause.simplified().remove(QLatin1Char('}')).remove(QLatin1Char(' ')).toStdString());
+    ASSERT_EQ(1, int(body.count(QStringLiteral("horizontalSliderPosition->setValue("))));
+    ASSERT_EQ(1, int(body.count(QStringLiteral("m_newPosDropMode ="))));
+    ASSERT_TRUE(body.contains(QStringLiteral("PlayerTransportToolbar::stopTargetFrame( ui->spinBoxCutIn->value()")));
+    ASSERT_FALSE(body.contains(QStringLiteral("on_actionGoto_First_Frame_triggered")));
+}
+
+TEST(PlayerToolbarTransportButtons, FinishRunsOnceAtTheEndOfInitGuiAfterTheLiveBinding)
+{
+    // T4: tooltips read the live keys, so finish() must run after bindToWindow().
+    const QString call = QStringLiteral("PlayerTransportToolbar::finish( ui->mainToolBar, this );");
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_EQ(1, int(source.count(call)));
+    ASSERT_EQ(1, int(source.count(QStringLiteral("PlayerTransportToolbar::finish("))));
+    const QString initGui = functionBody(source,
+        QStringLiteral("void MainWindow::initGui( void )"),
+        QStringLiteral("void MainWindow::initLib( void )"));
+    ASSERT_FALSE(initGui.isEmpty());
+    const int callAt = initGui.indexOf(call);
+    ASSERT_TRUE(callAt >= 0);
+    const int bindAt = initGui.indexOf(QStringLiteral("PlayerShortcutBinding::bindToWindow( this );"));
+    const int guardAt = initGui.indexOf(QStringLiteral(
+        "qApp->installEventFilter( new PlayerShortcutBinding::FocusGuard( ui->horizontalSliderPosition, this ) );"));
+    ASSERT_TRUE(bindAt >= 0);
+    ASSERT_TRUE(guardAt > bindAt);
+    ASSERT_TRUE(callAt > guardAt);
+
+    // No other app source calls it.
+    for (const char *base : { "platform/qt", "src" })
+    {
+        const QString root = repo_file_path(QString::fromLatin1(base));
+        ASSERT_FALSE(root.isEmpty());
+        QDirIterator files(root, QStringList{ QStringLiteral("*.cpp"), QStringLiteral("*.h") },
+                           QDir::Files, QDirIterator::Subdirectories);
+        while (files.hasNext())
+        {
+            const QString path = files.next();
+            if (path.endsWith(QStringLiteral("/MainWindow.cpp")) || path.endsWith(QStringLiteral("/PlayerTransportToolbar.h"))) continue;
+            if (path.contains(QStringLiteral("/build")) || QFileInfo(path).fileName().startsWith(QStringLiteral("ui_"))
+                || QFileInfo(path).fileName().startsWith(QStringLiteral("moc_"))) continue;
+            QFile file(path);
+            ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+            ASSERT_FALSE(QString::fromUtf8(file.readAll()).contains(QStringLiteral("PlayerTransportToolbar::finish(")));
+        }
+    }
 }
 
 TEST(PlaybackFullscreenUiWiring, HeaderStillDeclaresTheAction)

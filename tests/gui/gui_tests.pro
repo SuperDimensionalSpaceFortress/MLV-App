@@ -36,11 +36,20 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
     $$REPO_ROOT/platform/qt/DualIsoPatternMapping.h \
     $$REPO_ROOT/platform/qt/GpuDisplayWindow.h \
+    $$REPO_ROOT/platform/qt/GpuWindowViewerInput.h \
+    $$REPO_ROOT/platform/qt/GpuWindowViewerInputForwarder.h \
+    $$REPO_ROOT/platform/qt/ViewerDoubleClickPolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerDoubleClickFilter.h \
     $$REPO_ROOT/platform/qt/LookLabelOverlay.h \
     $$REPO_ROOT/platform/qt/LookLabelPolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerIdlePolicy.h \
+    $$REPO_ROOT/platform/qt/ViewerCursorSurfaces.h \
+    $$REPO_ROOT/platform/qt/ViewerMouseRetrievalHook.h \
     $$REPO_ROOT/platform/qt/GpuDisplayViewport.h \
     $$REPO_ROOT/platform/qt/Histogram.h \
     $$REPO_ROOT/platform/qt/MainWindowGpuPreviewPolicy.h \
+    $$REPO_ROOT/platform/qt/PlayerShortcutBinding.h \
+    $$REPO_ROOT/platform/qt/PlayerTransportToolbar.h \
     $$REPO_ROOT/platform/qt/ScopesLabel.h \
     $$REPO_ROOT/platform/qt/VectorScope.h \
     $$REPO_ROOT/platform/qt/WaveFormMonitor.h \

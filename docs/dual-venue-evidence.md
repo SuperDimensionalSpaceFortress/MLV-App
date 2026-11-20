@@ -406,6 +406,92 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
   the bus or as an artifact) and need the per-venue owner CLIP line. Since fixtures are
   never venue playback clips, there are no fixture sheets any more.
 
+## EXPORT legs (EXPORT-VENUE-LEG-1)
+
+An export leg (`legType: "export"`) runs a headless CPU batch export of an owner clip on a venue and measures where the export spends its time.
+It plays nothing. The job is `tools/profiling/bachelor/export-stage-job.ps1`, which `Invoke-VenueLeg.ps1` selects for an export leg. It loads the
+playback generator's resolver, venue-table reader and owner-part path allowlist from that file's AST; it does not copy them.
+
+* **Spec** (`leg-spec.schema.json`, refused again by `Get-DvExportShapeRefusal`). `export` = `{format: "cdng-lossless" | "prores", maxFrames, receipt,
+  receiptSha256, dualIsoExpected}`. The rest of the spec is restricted: `backends` must be `["cpu"]`, `scaleFactor` must be 1, and the only allowed
+  `generatorArgs` key is `cpuQuiescenceThresholdPercent`. No `look`, `displayMode` or `visualCapture*` field is allowed. `playSeconds` is the clip-length
+  floor (the job applies `gui-smoke-length-gate.ps1` with `-ClipOnly`), and `maxFrames` is the measured window. The clip must hold at least `maxFrames`.
+  The batch receipt (`look-receipts/export-owner-hq-*.marxml`) is read from the committed blob and must hash to `receiptSha256`, both at generation and
+  in the job.
+* **Shipped legs**: `m16-1243-export-{cdng-lossless,prores}` (dual-ISO, 480 frames) and `m16-1456-export-{cdng-lossless,prores}` (dual-ISO, 360 frames).
+  r11 (fable r9 B1(a)): M16-1456 is declared dual-ISO because that is its measured class: the three Bachelor CDNG receipts of the first declaration (f23fa981, 1e9153b6, 01905cfe)
+  each ran dual-ISO processing on 360 of 360 frames and ended INVALID `CLIP_CLASS_MISMATCH`. The likely cause is `src/batch/ReceiptApplier.cpp:326-339`: with no
+  `dualIsoAutoCorrected` mark, the batch turns dual-ISO on when the clip's own two ISO levels differ, whatever the receipt asked for, so the `nodualiso` receipt
+  (still the one these legs run; its hash is unchanged) does not make the export a no-dual-ISO one. There is therefore no non-dual-ISO export share in this set yet
+  (OPEN `EXPORT-NODUALISO-CLIP-CLASS-1`: a clip that really is no dual-ISO, or a receipt the batch honours as no dual-ISO, needs a venue proof). `test_dual_venue_export_leg.py`
+  pins each export leg's declared class against `KNOWN_CLIP_DUAL_ISO_CLASS`, the table of the clips' measured classes.
+  Plan cells are `cpu-export-<format>`, so both formats of one clip can share a leg set.
+* **The job**:
+  1. Verifies the staged build against the build manifest, and the owner parts by length and then by identity hash through private neutral-named views.
+  2. Applies the length gate.
+  3. For ProRes, refuses with `EXPORT_TOOLING_ABSENT` when the package has no `ffmpeg.exe`.
+  4. Samples CPU quiescence.
+  5. Runs `MLVApp.exe --batch ... --max-frames <maxFrames>` with `QT_QPA_PLATFORM=windows`, under one bounded wait that kills the process tree on expiry.
+     CDNG lossless uses `MLVAPP_EXPORT_STAGE_PROFILER` (per-frame `export-profile.json`). ProRes uses `MLVAPP_STAGE_TIMING` (`stage-timing.log`).
+  6. Publishes **only** `summary.json`, `batch.log`, the stage file and `output-manifest.json` (output count, total bytes, first and last file sha256).
+  7. Deletes the exported frames or `.mov` from its venue-local work dir. **Exported footage never reaches the share or the hub.**
+* **Receipt**: `receipt.export` = `{format, maxFrames, dualIsoExpected, receiptSha256, files (sha256 of each published file), stages, problems, containmentAdvisory, verdict}`.
+  `scale` and `display` are null. Metrics include `framesExported`, `exportFramesFailed`, `profileFramesSucceeded` (CDNG), `stageFramesSeen` (ProRes),
+  `dualIsoActiveFrames`, `dualIsoClassAgrees`, `wallSeconds`, `exportFps`, `outputFileCount`, `outputBytes` and `largestStage`.
+  `Test-DvReceiptValid` re-hashes every file and re-derives the metrics, the stage table and the outcome (`Test-DvExportReceiptValid`).
+* **Stage shares**:
+  * CDNG: the denominator is the producer's `frame_ms`. The producer stages run from `raw_read` to `payload_clone` (including `llrawproc_dual_iso` and
+    `dng_compress_encode`). The writer stages (`disk_write`,
+    `writer_queue_wait`, `writer_completion_lag`) are reported apart from the producer stages, because the async writer overlaps the producer.
+    Each stage must still fit inside the stage that contains it (a producer stage inside `producer_frame`, an `llrawproc_*` child inside `llrawproc`); a stage that does not is
+    `INVALID` (`EXPORT_STAGE_CONTAINMENT_MISMATCH`).
+  * **CDNG disjoint-stage containment gates (`EXPORT-CDNG-STAGE-CONTAINMENT-1`).** The checks derived from `ExportCdngStageWindowTable` (`DualVenueRunner.psm1`)
+    are: disjoint stages held together inside their parent, and the lock times inside the `llrawproc_shared_lock` / `llrawproc_other` that contain them. One they fail is
+    an `EXPORT_STAGE_CONTAINMENT_MISMATCH` problem, so the leg is `INVALID`; only the CDNG profile runs them. The table holds only the code path CDNG export runs
+    (`dng.c` `applyLLRawProcObject` -> `applyLLRawProcObjectWorker(..., NULL, 0)`): no window of the playback-only scaled path, and none for `llrawproc_pre_dualiso_fix`,
+    which export never accrues, so any value published for it is held inside `llrawproc` with the rest. A test re-derives the table from the C sources by call-site
+    reachability. (r18 had made these checks advisory while the table carried the scaled-path windows; `containmentAdvisory` stays in the evidence and in
+    `receipt.export` as an always-empty array.)
+  * ProRes: the denominator is the mean `processed16_total`, the timed per-frame work. The top-level stages are `debayered_frame` and `processing`.
+    `raw_uint16` and `llrawproc` nest inside `debayered_frame`. The batch's `DONE elapsed` starts before the clip opens and also times finish, verify and
+    probe, so it is never a denominator. `batchWallPerFrameMs` and `untimedPerFrameMs` (wall per frame minus `processed16_total`: open, pipe write,
+    ffmpeg back-pressure, finish, verify) are reported beside the table, not as a stage.
+  * The app does not time the untimed part per stage, and the rendered path has no dual-ISO stage. For that reason ProRes legs carry no
+    `dualIsoClassAgrees` criterion. Both gaps belong to successor `EXPORT-RENDER-PIPE-TIMING-1` (product code).
+* **Time budget** (`Get-ExportJobTimeBudget`): the job timeout is one margined identity read of the clip (at the measured cold rate), plus the quiescence
+  samples (3 x 12 + 30 = 66 s), plus the export wait, plus a fixed 600 s margin. The export wait is `max(900, 4 x maxFrames)` s plus another identity-read
+  allowance, for the app's own re-read. The export wait is the job's own `WaitForExit`, so the smoke runner's 3600 s process ceiling does not cap it.
+  **The shared 3600 s smoke ceiling is still enforced on the read allowance** (CoS I1): `export-stage-job.ps1` calls
+  `Get-AttrCudaLegTimeBudget -ShareSmokeCeiling` (`AttrCudaArtifacts.psm1`) with every fixed second at 0. The only effect of that switch on an export is the
+  **refusal**: when even the **minimum** identity read of the clip (input MB divided by the cold rate, no margin) is over 3600 s, `Get-AttrCudaLegTimeBudget` throws
+  `ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING`, which `Get-ExportJobTimeBudget` catches and reports as `DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED` ("outside the cold-read
+  budget model"); the generator writes no job. The function also returns a clamped `appReadAllowanceSec` (held to 3600 s), but the export
+  does not use it: `Get-ExportJobTimeBudget` takes the margined, unclamped `identityReadSec` for both the job's read and the export wait's re-read allowance,
+  so a clip whose margined read is over 3600 s but whose minimum read is not still gets the longer budget. A time budget above that ceiling is open successor work (A2).
+  A budget the **agent** would refuse (`jobTimeoutSec` plus the runner's 120 s submit margin past the agent's 86400 s cap) is refused with
+  `DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED` **before any claim or lease**: `Invoke-VenueLeaseBatch.ps1` asks the generator's `-PreflightBudgetOnly` mode
+  (the same `Get-ExportJobTimeBudget`, over the resolved clip's real size) in its preflight for every form (`-LegPlan` item, `-LegSet`, `-LegSpec`) and ends
+  `EXPORT_TIME_BUDGET_EXCEEDED` with nothing submitted. When this host cannot resolve the clip (its size is unknowable), the preflight asks for the clip-independent floor
+  (`-DescribeTimeBudgetBytes 0`, the same function with no identity read). A window whose floor alone is past the cap (for example `maxFrames=100000`) is refused the same
+  way. A floor that cannot be evaluated (the floor child ends with no answer) is refused `EXPORT_BUDGET_PREFLIGHT_FAILED`. A window whose floor fits is not refused there,
+  and the leg's generator still refuses the unresolvable clip.
+  If the preflight cannot read or parse the leg spec it is checking (for example a transient sharing violation after the shape check read it), the batch does not skip the
+  budget check: it refuses with `SPEC_READ_FAILED`, before any claim or lease, in every form.* **Frame window**: `EXPORT_CAPTURED` asserts the batch exported the requested `maxFrames`. A different count is `INVALID` (`EXPORT_FRAMES_MISMATCH`) unless the leg's
+  criteria carry `framesExported eq <maxFrames>`, which then decides (the shipped legs: `FAIL`). A criterion that only names the metric (`ge 0`, `ne`, `le`, `eq` of
+  another value) never switches the check off. Repeated stage-timing records for one frame are summed, and the per-frame sum is held to the same 24 h ceiling as one record
+  (`EXPORT_RECORD_INVALID`), so a frame is never silently dropped from a mean.
+* **Outcomes**:
+
+  | Job result | Outcome |
+  |---|---|
+  | `EXPORT_CAPTURED`, exit 0, evidence binds, dual-ISO class agrees | `PASS` or `FAIL` from the criteria |
+  | `EXPORT_CAPTURED` with a non-zero exit; a dual-ISO class mismatch (`CLIP_CLASS_MISMATCH`); a profile from another build; output count disagreeing with `[BATCH] DONE`; a profile or stage log with no stage figure (no `producer_frame_ms`, or no `debayered_frame` / `processing` under `processed16_total`); an output manifest that does not say `deleted: true` (`EXPORT_OUTPUT_NOT_DELETED`); a `summary.json` whose `venue` (the host the job measured on) is not the receipt's venue | `INVALID` |
+  | `EXPORT_TIMEOUT` (40), `EXPORT_NO_FRAMES` (41), `EXPORT_FRAMES_SHORT` (42), `EXPORT_EXIT_NONZERO` (46) | `FAIL` |
+  | `EXPORT_PROFILE_ABSENT` (43), `EXPORT_OUTPUT_MISMATCH` (44), `EXPORT_KILL_UNCONFIRMED` (48: the export timed out and the job could not confirm the app's process tree dead, so it asserts nothing about the product) | `INVALID` |
+  | `EXPORT_TOOLING_ABSENT` (45) | `VENUE_TOOLING` |
+  | a length refusal (`CLIP_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN`, exit 47); an owner-footage or work-dir refusal (exit 19/20/21/22/24/28); no `RESULT=` line; any other token | `INVALID` |
+  | `VENUE_NOT_QUIESCENT` (12) | `VENUE_NOT_QUIESCENT` |
+
 ## Requested scale and rendered scale
 
 A leg's `scaleFactor` is the playback scale it **requests**. It is not necessarily the scale the app **renders** at. Until PLAYBACK-CUDA-HONOUR-SCALE-1 the CUDA

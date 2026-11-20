@@ -16,6 +16,8 @@
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackScaleLabel.h"
+#include "PlayerShortcutBinding.h"
+#include "PlayerTransportToolbar.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
 #include "LogLineField.h"
@@ -25,6 +27,7 @@
 #include "VisualCaptureSourceDifference.h"
 #include "ClipOpenAbortPolicy.h"
 #include "ResizeStillDrawingWait.h"
+#include "ResizePlaybackPolicy.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -1536,6 +1539,8 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "GpuDebayer.h"
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
+#include "GpuWindowViewerInputForwarder.h"
+#include "ViewerDoubleClickFilter.h"
 #include "GpuFieldTelemetry.h"
 #include "GpuDeviceLossBreaker.h"
 #include "MainWindowGpuPreviewPolicy.h"
@@ -1543,6 +1548,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "PlaybackScaling.h"
 #include "PlaybackSwapInterval.h"
 #include "LookLabelPolicy.h"
+#include "ViewerCursorSurfaces.h"
 #include "ZebraThresholds.h"
 #include "batch/WorkerThreadCount.h"
 #include "ExportSettingsDialog.h"
@@ -1594,6 +1600,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include <windows.h>
 #endif
 #include "OutputDirIdentity.h"
+#include "ViewerMouseRetrievalHook.h"   // PLAYER-CURSOR-AUTOHIDE-1 r2: after <windows.h>, like the two above
 #include "VisualCaptureSourceGuard.h"
 
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height);
@@ -2360,6 +2367,15 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 
     setAcceptDrops(true);
     qApp->installEventFilter( this );
+    //PLAYER-CURSOR-AUTOHIDE-1: fullscreen cursor auto-hide (input/cursor only)
+    m_viewerIdleClock.start();
+    m_viewerIdleTimer = new QTimer( this );
+    m_viewerIdleTimer->setSingleShot( true );
+    connect( m_viewerIdleTimer, &QTimer::timeout, this, [this]() { viewerIdleTimeout(); } );
+    connect( ui->actionFullscreen, &QAction::toggled, this, [this]( bool on ) { viewerIdleFullscreenChanged( on ); } );
+    connect( ui->actionWhiteBalancePicker, &QAction::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
+    connect( ui->toolButtonBadPixelsSearchMethodEdit, &QAbstractButton::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
+    connect( ui->toolButtonGradientPaint, &QAbstractButton::toggled, this, [this]( bool ) { viewerIdleRestore(); } );
 
     //Set bools for draw rules
     m_dontDraw = true;
@@ -2623,6 +2639,9 @@ MainWindow::~MainWindow()
 {
     playback_paint_credit::setSink( nullptr, nullptr );
     preview_paint_timing::paintListener() = preview_paint_timing::PaintListener();   // CPU-S1-PRESENT-INTERVAL-BOUND-1
+#ifdef Q_OS_WIN
+    viewer_idle::win_hook::remove();   // PLAYER-CURSOR-AUTOHIDE-1 r2: closed while still fullscreen
+#endif
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
@@ -3072,9 +3091,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( !ui->actionPlay->isChecked() )
     {
         lastDrawnPlaybackPosition = -1;
+        m_playbackRedrawAfterResize = false;
     }
-    else if( m_frameChanged
-          && ui->horizontalSliderPosition->value() == lastDrawnPlaybackPosition )
+    else if( resize_playback_policy::suppressDuplicatePlaybackDraw( m_frameChanged, ui->horizontalSliderPosition->value(), lastDrawnPlaybackPosition, m_playbackRedrawAfterResize ) )
     {
         /* Fast timer polling (mlvappPlaybackTimerIntervalMs) can mark the
          * frame changed on ticks where elapsed-time pacing advanced zero
@@ -3086,6 +3105,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( m_frameChanged && !m_dontDraw && !m_inOpeningProcess )
     {
         m_frameChanged = false; //first do this, if there are changes between rendering
+        m_playbackRedrawAfterResize = false;
         if( ui->actionPlay->isChecked() )
         {
             lastDrawnPlaybackPosition = ui->horizontalSliderPosition->value();
@@ -3258,16 +3278,18 @@ bool MainWindow::waitForResizeStillDrawing( const QString &site )
 //Window resized -> scale picture
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
-    //If opening files just quit here
-    if( m_inOpeningProcess )
+    // PLAYER-FULLSCREEN-KEEPS-PLAYING-1: a resize (a fullscreen toggle, a maximize/restore, a window drag) no longer
+    // stops Play. Every playback drawFrame() sizes its scene from the current geometry (computeDisplaySceneGeometry) and
+    // finishPresentedFrame re-anchors the gradient on a changed scene, so Play needs no redraw here. Nothing is stopped,
+    // so nothing is resumed: a resume would be a programmatic Play, which ENFORCE-2 (app_play_scan.py) forbids here.
+    switch( resize_playback_policy::decide( m_inOpeningProcess, m_lookAssistPump.sessionOpen(), ui->actionPlay->isChecked() ) )
     {
+    case resize_playback_policy::Action::AcceptOnly:
+        //If opening files just quit here
         event->accept();
         return;
-    }
-
-    // A resize is not user input, so it arrives during a Look Assist analysis. Its redraw waits for landing.
-    if( m_lookAssistPump.sessionOpen() )
-    {
+    case resize_playback_policy::Action::HoldForLookAssist:
+        // A resize is not user input, so it arrives during a Look Assist analysis. Its redraw waits for landing.
         event->accept();
         if( !m_lookAssistResizeHeld )
         {
@@ -3280,11 +3302,28 @@ void MainWindow::resizeEvent(QResizeEvent *event)
             } );
         }
         return;
+    case resize_playback_policy::Action::KeepPlaying:
+        // Adversary A1: a frame already requested, prepared or in flight was scaled for the OLD scene and would land on it.
+        // The display-change invalidation (the one a mid-Play scale change uses) drops and cancels that generation.
+        invalidatePlaybackPrepForDisplayChange( "resize-keep-playing" );
+        // Adversary A2: the playback tick redraws the current position at the new geometry even when Play holds one frame
+        // (a collapsed looped range), past its duplicate-position suppression. The tick draws it, not this handler.
+        m_playbackRedrawAfterResize = true;
+        m_frameChanged = true;
+        // The redrawn frame lands on the new scene; the flag makes finishPresentedFrame re-anchor the gradient there.
+        if( ui->checkBoxGradientEnable->isChecked() && ui->groupBoxLinearGradient->isChecked() ) m_zoomModeChanged = true;
+        logInteractionEvent( QStringLiteral("resize.keep_playing"),
+                             QStringLiteral("width=%1 height=%2 fullscreen=%3")
+                                 .arg( event->size().width() )
+                                 .arg( event->size().height() )
+                                 .arg( bool01( isFullScreen() ) ) );
+        event->accept();
+        return;
+    case resize_playback_policy::Action::RedrawStopped:
+        // Play is off here; the audio stop is a backstop only
+        m_pAudioPlayback->stop(); //Stop audio explicitely
+        break;
     }
-
-    //Stop playback if active
-    ui->actionPlay->setChecked( false );
-    m_pAudioPlayback->stop(); //Stop audio explicitely
 
     if( m_fileLoaded )
     {
@@ -3336,6 +3375,9 @@ void MainWindow::changeEvent( QEvent *event )
     {
         ++m_playbackSmokeFullscreenLostCount;
     }
+    // PLAYER-CURSOR-AUTOHIDE-1 r10 (sol r9 B1): every real-fullscreen transition reaches the idle lifecycle, including
+    // those that bypass the Fullscreen action (native re-entry, restore from minimize). Not a smoke-only branch.
+    if( event->type() == QEvent::WindowStateChange ) viewerIdleWindowStateChanged();
 }
 
 // Intercept FileOpen events
@@ -3682,12 +3724,177 @@ bool MainWindow::nativeEvent( const QByteArray &eventType, void *message, long *
 }
 #endif
 
+// PLAYER-CURSOR-AUTOHIDE-1: in fullscreen the cursor hides after viewer_idle::kIdleHideMs() with no mouse
+// activity, on both viewer surfaces, and comes back at once on real movement, press or wheel, on leaving
+// fullscreen, on a context menu, a blocking modal or deactivation, and when a viewer tool is armed.
+// Start/stop is actionFullscreen's toggled(bool), plus every window state change (r10: native re-entry with the
+// action checked starts it, a native exit stops it); the decision also needs isFullScreen() because
+// showFullScreen() is asynchronous. Input and cursor only: no paint, present or swap code.
+viewer_idle::Surfaces MainWindow::viewerIdleSurfaces( void ) const
+{
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = ui->graphicsView->viewport();
+    surfaces.glWindow = GpuDisplayWindow::activeWindow();   // read fresh: the GL window comes and goes
+    return surfaces;
+}
+
+viewer_idle::Inputs MainWindow::viewerIdleInputs( void ) const
+{
+    viewer_idle::Inputs in;
+    in.fullscreen = ui->actionFullscreen->isChecked() && isFullScreen();
+    in.windowActive = isActiveWindow();
+    in.toolArmed = ui->actionWhiteBalancePicker->isChecked()
+                || ui->toolButtonBadPixelsSearchMethodEdit->isChecked()
+                || ui->toolButtonGradientPaint->isChecked();
+    in.popupOrModalOpen = QApplication::activePopupWidget() || QApplication::activeModalWidget();
+    return in;
+}
+
+void MainWindow::viewerIdleRestore( void )
+{
+    if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+    if( m_viewerIdle.fullscreen() )
+    {
+        m_viewerIdlePointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::noteDelivered();   // r11 (pass 15 A1): nothing pending, and the history marked again
+#endif
+        m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
+        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
+    }
+}
+
+void MainWindow::viewerIdleFullscreenChanged( bool on )
+{
+    if( on )
+    {
+        m_viewerIdle.setFullscreen( true, m_viewerIdleClock.elapsed() );
+        m_viewerIdleHaveLast = false;
+        m_viewerIdlePointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        // Adversary r1 pass 3 A1: the witness that survives Qt deferring input in an excluded wait.
+        viewer_idle::win_hook::install();
+#endif
+        m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );   // first look after one poll period (r3)
+    }
+    else
+    {
+        m_viewerIdleTimer->stop();
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::remove();
+#endif
+        if( m_viewerIdle.forceShown() ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        m_viewerIdle.setFullscreen( false, m_viewerIdleClock.elapsed() );
+    }
+}
+
+// r10 (sol r9 B1, carried A1-pass12): a window state change starts or stops the idle machinery through the action's
+// own entry and exit paths. Native exit used to be seen only by the next tick, and native re-entry with the action
+// still checked never fires toggled(), so nothing restarted the machinery and the cursor stayed visible. Idempotent:
+// a repeated change asks again and gets None. Before the constructor creates the timer there is nothing to drive.
+void MainWindow::viewerIdleWindowStateChanged( void )
+{
+    if( !m_viewerIdleTimer ) return;
+    switch( m_viewerIdle.onWindowState( ui->actionFullscreen->isChecked(), isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() ) )
+    {
+    case viewer_idle::Lifecycle::Start:
+        viewerIdleFullscreenChanged( true );
+        // Record the sighting at once, so a native exit before the first tick is a Stop, not an entry grace.
+        m_viewerIdle.onWindowState( ui->actionFullscreen->isChecked(), isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() );
+        break;
+    case viewer_idle::Lifecycle::Stop:
+        viewerIdleFullscreenChanged( false );
+        break;
+    case viewer_idle::Lifecycle::None:
+        break;
+    }
+}
+
+void MainWindow::viewerIdleTimeout( void )
+{
+    // r7 (adversary pass 11 A1): fullscreen left without the action (the window manager restored the window, the
+    // action stays checked): leave the idle machinery exactly as the action's exit does (timer, hook, cursor).
+    if( m_viewerIdle.windowLeftFullscreen( isFullScreen(), m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs() ) )
+    {
+        viewerIdleFullscreenChanged( false );
+        return;
+    }
+    int ms = 0;
+    viewer_idle::Inputs in = viewerIdleInputs();
+    // An input-excluded wait runs this timer but delivers no mouse event: the OS pointer position is the witness. It
+    // is a logical QPoint, so a held move of less than one logical pixel is not seen by it (r4 bound, PointerWatch).
+    in.pointerMoved = m_viewerIdlePointer.moved( QCursor::pos() );
+#ifdef Q_OS_WIN
+    // A move away and back between two ticks leaves the sampled position unchanged. Qt's excluded wait takes
+    // the WM_MOUSEMOVE off this (GUI) thread's queue into its own deferred queue, so the queue status alone
+    // misses it: the thread mouse hook saw it when it was taken (both viewer surfaces are this thread's). If
+    // Windows coalesced the excursion into one move back at the starting pixel, the hook tells it from a
+    // synthesized move by the system move history (r6 key B1, MoveHistoryMark), shown or hidden (pass 8 A1).
+    // Read the hook first, then look at whatever input is still queued, untaken (r7 key B1, QueueLook): a queued
+    // button or wheel counts; a queued move counts only if the pointer really moved (Windows synthesizes moves at
+    // an unchanged position). The look marks the history BEFORE it reads the queue (opus H1), with the one read
+    // that judged it, so the next same-position move is judged against this look.
+    if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
+    if( viewer_idle::win_hook::lookAtQueue() ) in.pointerMoved = true;
+    // r6 pass 9 A1: no hook (SetWindowsHookExW failed) means no witness for deferred input: a gate, never hide.
+    in.witnessMissing = !viewer_idle::win_hook::installed();
+#endif
+    // r3 (adversary r1 pass 4 A1): off Windows the sample above is the only witness, so every rearm is capped at
+    // one poll period. Bound (pass 5 A1): an away-and-back that lies entirely between two samples (a late tick
+    // widens the gap) is seen only when the wait delivers its events; on Windows the hook sees it when it is taken.
+    switch( m_viewerIdle.onTimeout( in, m_viewerIdleClock.elapsed(), viewer_idle::kIdleHideMs(), &ms, viewer_idle::kPointerPollMs() ) )
+    {
+    case viewer_idle::Tick::Hide:
+        m_viewerCursorHider.hide( viewerIdleSurfaces() );
+        m_viewerIdleTimer->start( ms );   // keep watching the pointer while hidden
+        break;
+    case viewer_idle::Tick::Show:
+        m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        m_viewerIdleTimer->start( ms );
+        break;
+    case viewer_idle::Tick::Rearm:
+        m_viewerIdleTimer->start( ms );
+        break;
+    case viewer_idle::Tick::None:
+        break;
+    }
+}
+
+void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
+{
+    Q_UNUSED( watched );
+    if( !m_viewerIdle.fullscreen() ) return;
+    if( viewer_idle::forcesRestore( event->type() ) )
+    {
+        viewerIdleRestore();
+        return;
+    }
+    if( viewer_idle::eventIsActivity( event, &m_viewerIdleLastGlobal, &m_viewerIdleHaveLast ) )
+    {
+        // The timer is not restarted on every move: the timestamp plus Rearm covers it.
+        m_viewerIdlePointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        // Delivered: the hook's sighting of it is not new movement; the history is marked again (r11, pass 15 A1).
+        viewer_idle::win_hook::noteDelivered();
+#endif
+        if( m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() ) ) m_viewerCursorHider.restore( viewerIdleSurfaces() );
+        if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
+    }
+}
+
 //Disable WBPicker if picture is left and if mouse is clicked somewhere else
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     Q_UNUSED( watched );
     // Application filter: the first event dispatched after a dispatcher wait ends that wait.
     endGuiPresentIdleWait();
+    //PLAYER-DOUBLECLICK-FULLSCREEN-1: a left double-click on the viewer (either display path) toggles fullscreen, once, and is swallowed
+    if( viewer_dblclick::filterEvent( m_viewerDoubleClickGate, watched, event, ui->graphicsView->viewport(),
+                                      GpuDisplayWindow::activeWindow(), [this]( const QObject *target, const QPointF &pos ) { return viewerDoubleClickState( target, pos ); } ) )
+    {
+        ui->actionFullscreen->trigger();
+        return true;
+    }
     if( event->type() == QEvent::MouseMove )
     {
         static bool graphicsViewReached = false;
@@ -3702,14 +3909,15 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
     }
     else if( event->type() == QEvent::MouseButtonPress )
     {
-        if( !ui->graphicsView->underMouse()
+        const bool onViewer = gpu_window_input::pressIsOnViewer( ui->graphicsView->underMouse(), watched, GpuDisplayWindow::activeWindow() );
+        if( !onViewer
          && !ui->toolButtonWb->underMouse()
          && ui->actionWhiteBalancePicker->isChecked() )
         {
             ui->toolButtonWb->setChecked( false );
             ui->actionWhiteBalancePicker->setChecked( false );
         }
-        else if( !ui->graphicsView->underMouse()
+        else if( !onViewer
               && !ui->toolButtonBadPixelsSearchMethodEdit->underMouse()
               && !ui->toolButtonBadPixelsCrosshairEnable->underMouse() )
         {
@@ -3726,7 +3934,30 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         //setPreviewMode();
         m_frameChanged = true;
     }
+    viewerIdleNoteEvent( watched, event );   //PLAYER-CURSOR-AUTOHIDE-1
     return QWidget::eventFilter(watched, event);
+}
+
+//PLAYER-DOUBLECLICK-FULLSCREEN-1: the viewer's tool state for the double-click decision. The gradient
+//handle is read only with a clip loaded: m_pGradientElement has no initializer before initGui sets it.
+viewer_dblclick::ViewerState MainWindow::viewerDoubleClickState( const QObject *target, const QPointF &pos ) const
+{
+    viewer_dblclick::ViewerState s;
+    s.enabled = m_doubleClickViewerFullscreen;
+    s.clipLoaded = m_fileLoaded;
+    s.wbArmed = ui->actionWhiteBalancePicker->isChecked();
+    s.bpArmed = ui->toolButtonBadPixelsSearchMethodEdit->isChecked();
+    s.gradientPaintArmed = ui->toolButtonGradientPaint->isChecked();
+    if( m_fileLoaded && m_pGradientElement && m_pGradientElement->gradientGraphicsElement() )
+    {
+        QGraphicsItem *handle = m_pGradientElement->gradientGraphicsElement();
+        //Only a handle drawn on the active viewer claims the click: on the GL path the view is hidden
+        //but its scene item still reads visible (adversary r1 pass 3 A1). It is hit-tested at the
+        //event's own viewport position, never the live cursor (r2 pass 4 A1)
+        const bool onView = target == ui->graphicsView->viewport() && ui->graphicsView->isVisible();
+        s.gradientHandleHovered = viewer_dblclick::gradientHandleClaims( onView, handle->isVisible(), onView && ui->graphicsView->items( pos.toPoint() ).contains( handle ) );
+    }
+    return s;
 }
 
 bool MainWindow::playbackPolicyActive( void ) const
@@ -13206,6 +13437,7 @@ void MainWindow::initGui( void )
     pQualityCycle->setContext( Qt::ApplicationShortcut );
     connect( pQualityCycle, &QShortcut::activated,
              this, &MainWindow::cyclePlaybackQualityMode );
+    pQualityCycle->setWhatsThis( tr( "Cycle playback quality" ) ); //listed in Help > Keyboard Shortcuts
 
 #ifdef Q_OS_LINUX
     //if not doing this, some elements are covered by the scrollbar on Linux only
@@ -13233,18 +13465,13 @@ void MainWindow::initGui( void )
     QPixmap pic = QPixmap::fromImage( m_pAudioWave->getMonoWave( NULL, 0, 100, devicePixelRatio() ) );
     pic.setDevicePixelRatio( devicePixelRatio() );
     ui->labelAudioTrack->setPixmap( pic );
-#ifdef Q_OS_WIN
-    //F11 is the standard Windows fullscreen key; keep the existing Ctrl+F too
-    ui->actionFullscreen->setShortcuts( QList<QKeySequence>()
-                                         << ui->actionFullscreen->shortcut()
-                                         << QKeySequence( Qt::Key_F11 ) );
-#endif
     //Esc exits fullscreen (no-op otherwise -- MainWindow has no other Escape handler)
     QShortcut *pFullscreenEscape = new QShortcut( QKeySequence( Qt::Key_Escape ), this );
     connect( pFullscreenEscape, &QShortcut::activated, this, [this]()
     {
         if( ui->actionFullscreen->isChecked() ) ui->actionFullscreen->trigger();
     } );
+    pFullscreenEscape->setWhatsThis( tr( "Exit fullscreen" ) ); //listed in Help > Keyboard Shortcuts
     //Disable caching by default to avoid crashes
     //ui->actionCaching->setVisible( false );
     //Hide deflicker target - no one knows what it does...
@@ -13315,6 +13542,8 @@ void MainWindow::initGui( void )
     connect( m_pScene, SIGNAL( wbPicked(int,int) ), this, SLOT( whiteBalancePicked(int,int) ) );
     connect( m_pScene, SIGNAL( bpPicked(int,int) ), this, SLOT( badPixelPicked(int,int) ) );
     connect( m_pScene, SIGNAL( filesDropped(QStringList) ), this, SLOT( openMlvSet(QStringList) ) );
+    //PLAYER-GL-WINDOW-INPUT-PARITY-1: the GL display window feeds the viewer's mouse input to the same slots as the scene
+    if( QWindow *glWindow = GpuDisplayWindow::activeWindow() ) installGlWindowViewerInput( glWindow );
 
     //Prepare gradient elements
     QPolygon polygon;
@@ -13640,6 +13869,14 @@ void MainWindow::initGui( void )
     //Rename selected clip (only one! selected clip)
     connect( ui->actionRename, SIGNAL( triggered() ), this, SLOT( renameActiveClip() ) );
     addAction( ui->actionRename );
+    //Fullscreen hides the menu bar and toolbar; carry the player shortcuts on the window too
+    //(the ONE key table, F11 on Windows included, lives in PlayerShortcutBinding.h)
+    PlayerShortcutBinding::bindToWindow( this );
+    //Focused inputs keep their navigation keys (Left/Right/Home/End/PgUp/PgDown/Return/Enter);
+    //the seek bar is exempt, so it and the viewer get the player keys
+    qApp->installEventFilter( new PlayerShortcutBinding::FocusGuard( ui->horizontalSliderPosition, this ) );
+    //Transport cluster icons and key tooltips; must run after bindToWindow (tooltips read the live keys)
+    PlayerTransportToolbar::finish( ui->mainToolBar, this );
 }
 
 //Initialize the library
@@ -23039,6 +23276,52 @@ void MainWindow::on_actionGoto_First_Frame_triggered()
     }
 }
 
+//Jump to last frame (mirror of on_actionGoto_First_Frame_triggered)
+void MainWindow::on_actionGoto_Last_Frame_triggered()
+{
+    const int frames = ( m_fileLoaded && m_pMlvObject ) ? getMlvFrames( m_pMlvObject ) : 0;
+    const int cutOutFrame = playback_frame_range::clampFrameIndex( ui->spinBoxCutOut->value() - 1, frames );
+    //If actual position is cut out, we jump to the last frame
+    if( ui->horizontalSliderPosition->value() == cutOutFrame )
+    {
+        const int lastFrame = playback_frame_range::clampFrameIndex( frames - 1, frames );
+        ui->horizontalSliderPosition->setValue( lastFrame );
+        m_newPosDropMode = lastFrame;
+    }
+    //Else we jump to cut out
+    else
+    {
+        ui->horizontalSliderPosition->setValue( cutOutFrame );
+        m_newPosDropMode = cutOutFrame;
+    }
+
+    //Sync audio if playback and audio active
+    if( ui->actionAudioOutput->isChecked()
+     && ui->actionDropFrameMode->isChecked()
+     && ui->actionPlay->isChecked() )
+    {
+        requestPlaybackAudioSync();
+    }
+}
+
+//Stop: return to cut in and pause (PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1)
+//The seek comes first: the pause can deliver queued input (processEvents when the clip has audio),
+//and a key pressed after Stop (End, Home, a frame step) must win over Stop's seek, never be overwritten
+void MainWindow::on_actionStop_triggered()
+{
+    if( m_fileLoaded && m_pMlvObject )
+    {
+        const int cutInFrame = PlayerTransportToolbar::stopTargetFrame( ui->spinBoxCutIn->value(), getMlvFrames( m_pMlvObject ) );
+        ui->horizontalSliderPosition->setValue( cutInFrame );
+        m_newPosDropMode = cutInFrame;
+    }
+    if( ui->actionPlay->isChecked() )
+    {
+        ui->actionPlay->setChecked( false );
+        on_actionPlay_triggered( false );
+    }
+}
+
 //Export clip
 void MainWindow::on_actionExport_triggered()
 {
@@ -23845,6 +24128,10 @@ void MainWindow::initPlaybackQualityFromSettings( void )
         const QList<QAction *> infoActions = infoMenu->actions();
         for( int i = 0; i < infoActions.size() && i < 6; ++i ) infoActions.at( i )->setChecked( states[i] );
     }
+    //PLAYER-DOUBLECLICK-FULLSCREEN-1: "Double-Click Viewer Toggles Fullscreen" (on by default)
+    m_doubleClickViewerFullscreen = set.value( viewer_dblclick::kSettingsKey(), viewer_dblclick::kSettingsDefault() ).toBool();
+    if ( ui->actionDoubleClickViewerFullscreen )
+        ui->actionDoubleClickViewerFullscreen->setChecked( m_doubleClickViewerFullscreen );
     updateLookLabel();
     updatePlaybackInfoLabel();
     applyPlaybackScopesMode( playbackScopesMode(), /*persist*/false );
@@ -25048,6 +25335,14 @@ void MainWindow::on_actionShowLookLabelInFullscreen_triggered()
     updateLookLabel();
 }
 
+//PLAYER-DOUBLECLICK-FULLSCREEN-1: "Double-Click Viewer Toggles Fullscreen". Applies at once and persists.
+void MainWindow::on_actionDoubleClickViewerFullscreen_triggered()
+{
+    m_doubleClickViewerFullscreen = ui->actionDoubleClickViewerFullscreen->isChecked();
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
+    set.setValue( viewer_dblclick::kSettingsKey(), m_doubleClickViewerFullscreen );
+}
+
 // PLAYBACK-SCOPES-OPTION-1: "Scopes During Playback". Applies at once (the next presented frame and
 // the next policy read) and persists; in an automation run MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK still wins
 // at the next start (PSO-01: an ordinary launch ignores it).
@@ -26151,6 +26446,43 @@ void MainWindow::selectAllFiles( void )
     else ui->listViewSession->selectAll();
 }
 
+//PLAYER-GL-WINDOW-INPUT-PARITY-1: route GL-window clicks, right-clicks and drops into the QGraphicsView path's own slots
+void MainWindow::installGlWindowViewerInput( QWindow *glWindow )
+{
+    gpu_window_input::Forwarder::Hooks hooks;
+    // What the picker slots convert the handed scene integers with, read at the click (their own reads).
+    hooks.pickBasis = [this]() {
+        gpu_window_input::PickBasis basis;
+        if( !m_pScene || !m_pMlvObject ) return basis;
+        basis.zoomFit = ui->actionZoomFit->isChecked();
+        basis.sceneRect = m_pScene->sceneRect().size();
+        basis.rawWidth = static_cast<int>( getMlvWidth( m_pMlvObject ) );
+        basis.rawHeight = static_cast<int>( getMlvHeight( m_pMlvObject ) );
+        basis.stretchX = getHorizontalStretchFactor( false );
+        basis.stretchY = getVerticalStretchFactor( false );
+        return basis;
+    };
+    // The picture rect the GL window's last paintGL actually drew, whichever route presented and
+    // whatever the stretch controls say now (empty before any frame: no pick). The forwarder is a
+    // child of glWindow, so this pointer outlives every call.
+    GpuDisplayWindow *const paintedWindow = qobject_cast<GpuDisplayWindow *>( glWindow );
+    hooks.drawnPicture = [paintedWindow]() {
+        if( !paintedWindow ) return QRectF();
+        const GpuDisplayWindow::PaintedPicture p = paintedWindow->lastPaintedPicture();
+        return gpu_window_input::drawnPictureRect( p.valid, p.framebufferWidth, p.framebufferHeight, p.devicePixelRatio, p.scaleX, p.scaleY );
+    };
+    hooks.wbArmed = [this]() { return ui->actionWhiteBalancePicker->isChecked(); };
+    hooks.bpArmed = [this]() { return ui->toolButtonBadPixelsSearchMethodEdit->isChecked(); };
+    hooks.pickWhiteBalance = [this]( int x, int y ) { whiteBalancePicked( x, y ); };
+    hooks.pickBadPixel = [this]( int x, int y ) { badPixelPicked( x, y ); };
+    // The menu slot maps through the (hidden) view's mapToGlobal; mapFromGlobal is its exact inverse.
+    hooks.contextMenuAtGlobal = [this]( const QPoint &globalPos ) { pictureCustomContextMenuRequested( ui->graphicsView->mapFromGlobal( globalPos ) ); };
+    hooks.dragEnter = [this]( QDragEnterEvent *e ) { dragEnterEvent( e ); };
+    // The scene's own drop route (filesDropped -> openMlvSet), not the top-level window's dropEvent.
+    hooks.openFiles = [this]( const QStringList &paths ) { openMlvSet( paths ); };
+    glWindow->installEventFilter( new gpu_window_input::Forwarder( glWindow, std::move( hooks ) ) );
+}
+
 //Contextmenu on picture
 void MainWindow::pictureCustomContextMenuRequested(const QPoint &pos)
 {
@@ -27029,8 +27361,9 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
     // repeat regardless.
     // CUDA-PERF-DISPLAY-MODE-AB-1: the same holds for a --windowed leg, which
     // placePlaybackSmokeWindowWindowed() has MAXIMIZED before the second call. Un-maximizing
-    // it here resizes the window, and resizeEvent() unchecks Play -- measured on bachelor:
+    // it here resizes the window, and resizeEvent() unchecked Play -- measured on bachelor:
     // the windowed leg's Play stopped 37 ms after the trigger with 0 frames presented.
+    // (Since PLAYER-FULLSCREEN-KEEPS-PLAYING-1 a resize keeps Play; keeping the state still avoids the relayout.)
     const bool wasFullScreen = isFullScreen();
     const bool keepWindowState = wasFullScreen || isMaximized();
     if( !keepWindowState ) showNormal();
@@ -33754,6 +34087,33 @@ void MainWindow::on_actionNextFrame_triggered()
 void MainWindow::on_actionPreviousFrame_triggered()
 {
     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() - 1 );
+}
+
+//Jump back one second (one clip-framerate's worth of frames, clamped to the slider range;
+//computed overflow-safe, the rate comes from clip metadata)
+void MainWindow::on_actionSeekBackwardOneSecond_triggered()
+{
+    if( !m_fileLoaded || !m_pMlvObject ) return;
+    ui->horizontalSliderPosition->setValue( PlayerShortcutBinding::oneSecondSeekTarget(
+        ui->horizontalSliderPosition->value(), getMlvFramerate( m_pMlvObject ), -1,
+        ui->horizontalSliderPosition->minimum(), ui->horizontalSliderPosition->maximum() ) );
+}
+
+//Jump forward one second
+void MainWindow::on_actionSeekForwardOneSecond_triggered()
+{
+    if( !m_fileLoaded || !m_pMlvObject ) return;
+    ui->horizontalSliderPosition->setValue( PlayerShortcutBinding::oneSecondSeekTarget(
+        ui->horizontalSliderPosition->value(), getMlvFramerate( m_pMlvObject ), +1,
+        ui->horizontalSliderPosition->minimum(), ui->horizontalSliderPosition->maximum() ) );
+}
+
+//Help > Keyboard Shortcuts: generated from the live actions (PlayerShortcutBinding.h)
+void MainWindow::on_actionKeyboardShortcuts_triggered()
+{
+    QDialog *dialog = PlayerShortcutBinding::createShortcutsDialog( this );
+    dialog->setAttribute( Qt::WA_DeleteOnClose );
+    dialog->open();
 }
 
 //En-/disable all raw corrections

@@ -4,13 +4,18 @@
 #include "../../platform/qt/DualIsoPatternMapping.h"
 #include "../../platform/qt/GpuDisplayViewport.h"
 #include "../../platform/qt/GpuDisplayWindow.h"
+#include "../../platform/qt/GpuWindowViewerInputForwarder.h"
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/Histogram.h"
 #include "../../platform/qt/LookLabelOverlay.h"
 #include "../../platform/qt/MainWindowGpuPreviewPolicy.h"
 #include "../../platform/qt/PlaybackScopesDuringPlayback.h"
+#include "../../platform/qt/PlayerShortcutBinding.h"
+#include "../../platform/qt/PlayerTransportToolbar.h"
 #include "../../platform/qt/ScopesLabel.h"
 #include "../../platform/qt/VectorScope.h"
+#include "../../platform/qt/ViewerCursorSurfaces.h"
+#include "../../platform/qt/ViewerDoubleClickFilter.h"
 #include "../../platform/qt/WaveFormMonitor.h"
 #include "../../platform/qt/ZebraThresholds.h"
 #include "../common/image_regression.h"
@@ -18,6 +23,11 @@
 #include "../common/test_runtime.h"
 
 #include <QApplication>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFontInfo>
 #include <QFontMetrics>
@@ -28,7 +38,12 @@
 #include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLineEdit>
+#include <QListView>
+#include <QMainWindow>
 #include <QMap>
+#include <QMenu>
+#include <QMenuBar>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
@@ -36,12 +51,25 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPlainTextEdit>
+#include <QPointer>
 #include <QScopeGuard>
 #include <QScreen>
 #include <QScrollBar>
+#include <QShortcut>
+#include <QSlider>
+#include <QSpinBox>
+#include <QStringListModel>
+#include <QStyleHints>
+#include <QTableWidget>
+#include <QTemporaryDir>
+#include <QTimer>
+#include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWindow>
+#include <QXmlStreamReader>
 #include <QtTest/QtTest>
 
 #include <cmath>
@@ -52,6 +80,7 @@
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
+#include "../../platform/qt/ViewerMouseRetrievalHook.h"   // after <windows.h>
 
 // MLV_REQUIRE_GL_TESTS=1 turns an offscreen-platform skip into a hard failure, for the GL
 // window capture/race tests that must not silently skip on a run that is supposed to have
@@ -617,6 +646,24 @@ class GuiSmokeTest : public QObject
 private slots:
     void rgb16DisplayReferencePreservesEndpoints();
     void checkedStateUpdatesPalette();
+    void playerShortcutMap_tableIsTheStandardMap();
+    void playerShortcutMap_uiActionsExist();
+    void playerShortcutMap_bindAppliesExactlyTheTable();
+    void playerShortcutMap_hiddenBarsWithoutBindingAreDead();
+    void playerShortcutMap_everyKeyFiresWindowedAndFullscreen();
+    void playerShortcutMap_textInputsKeepPrintableKeys();
+    void playerShortcutMap_focusGuardInputsKeepNavigationKeys();
+    void playerShortcutMap_focusGuardControlWithoutGuardInputsLoseKeys();
+    void playerShortcutMap_exemptSeekBarAndViewerGetPlayerKeys();
+    void playerShortcutMap_disabledActionDoesNotFire();
+    void playerShortcutMap_otherTopLevelWindowDoesNotFire();
+    void playerShortcutMap_glContainerFocus();
+    void playerShortcutMap_helpRowsAreGeneratedFromLiveActions();
+    void playerShortcutMap_oneSecondSeekTargetNeverOverflows();
+    void transportToolbar_tooltipsCarryTheLiveKeys();
+    void transportToolbar_finishIsIdempotent();
+    void transportToolbar_runtimeIconsAreDrawn();
+    void transportToolbar_stopTargetFrameIsClampedCutIn();
     void mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes();
     void mainWindowGpuPreviewPolicyScopesVetoOnlyWhenDisplayed();
     void mainWindowGpuPreviewPolicyHideScopesVetoesNothingWhilePlaying();
@@ -654,8 +701,37 @@ private slots:
     void mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOneRequiresLibraryReadyFirst();
     void mainWindowGpuPreviewPolicyClassifiesPlaybackPipelineStatus();
     void mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback();
+    // PLAYER-CURSOR-AUTOHIDE-1: fullscreen cursor auto-hide on the two viewer surfaces.
+    void viewerCursorAutohide_hideBlanksBothSurfacesAndRestoreGivesBackTheToolCursor();
+    void viewerCursorAutohide_restoreLeavesAnUnsetViewportCursorUnset();
+    void viewerCursorAutohide_restoreKeepsACursorSetWhileHidden();
+    void viewerCursorAutohide_idleTimerHidesAndRealMovementOrBlockingRestores();
+    void viewerCursorAutohide_subPixelMoveRestores();
+    void viewerCursorAutohide_pointerMovedWhileInputExcludedRestores();
+#ifdef Q_OS_WIN
+    void viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces();
+    void viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces();
+    void viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow();
+    void viewerCursorAutohide_periodicFullHistoryExcursionRestoresAndQuietStaysHidden();
+    void viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHidden();
+    void viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheIdleMachinery();
+    void viewerCursorAutohide_nativeFullscreenReentryRestartsTheIdleMachinery();
+#endif
+    void viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces();
+    void viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
+    // PLAYER-DOUBLECLICK-FULLSCREEN-1
+    void viewerDoubleClick_viewportTogglesOnceAndIsSwallowed();
+    void viewerDoubleClick_glWindowTogglesOnce();
+    void viewerDoubleClick_armedToolPassesThrough();
+    void viewerDoubleClick_otherButtonModifierSettingOrNoClipDoNotToggle();
+    void viewerDoubleClick_otherWidgetDoesNotToggle();
+    void viewerDoubleClick_toolArmedAtFirstPressSuppresses();
+    void viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequence();
+    void viewerDoubleClick_newSequenceAfterAMovedOrSlowPressToggles();
+    void viewerDoubleClick_glWindowRealQtPairingKeepsTheFirstPressRecord();
+    void viewerDoubleClick_firstPressOutsideTheViewerStartsAnUnarmedRecord();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
     void gpuViewportZebraProcessingMatchesCpuReference();
     void gpuViewportPreviewProcessingMatchesCpuReference();
@@ -678,6 +754,16 @@ private slots:
     void scopesLabelDispatchesRawVectorScopeExactly();
     void lookLabelOverlaySingleLineIsUnchanged();
     void lookLabelOverlayGrowsWithLineCount();
+    void glWindowViewerInput_picksMapToSceneAndRespectArming();
+    void glWindowViewerInput_contextMenuOnPlatformTriggerOnly();
+    void glWindowViewerInput_dragAndDropReachTheHooks();
+    void glWindowViewerInput_otherObjectsAreIgnored();
+    void glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal();
+    void glWindowViewerInput_edgePicksStayInsideTheImage();
+    void glWindowViewerInput_roundedSceneEdgeStillPicks();
+    void glWindowViewerInput_noDrawnPictureIsNoPick();
+    void glWindowViewerInput_getterRefusesWhileAFrameIsHandedOver();
+    void glWindowViewerInput_getterRecordsThePaintedPicture();
 };
 
 namespace
@@ -767,6 +853,918 @@ void GuiSmokeTest::checkedStateUpdatesPalette()
 
     button.setChecked(false);
     QCOMPARE(button.palette().color(QPalette::Button), original_button);
+}
+
+namespace
+{
+// PLAYER-STANDARD-SHORTCUT-MAP-1 (absorbs PLAYER-FULLSCREEN-SHORTCUTS-LIVE-1's table). This is the
+// TEST ORACLE: the design's key map written out literally, so a change to the product table
+// (PlayerShortcutBinding::bindings()) that does not match the design reds
+// playerShortcutMap_tableIsTheStandardMap. It is not product data and nothing in the product
+// reads it.
+using PlayerShortcutBinding::KeyKind;
+
+struct OracleKey
+{
+    QKeySequence sequence;
+    KeyKind kind;
+};
+
+struct OracleAction
+{
+    QString name;
+    QList<OracleKey> keys;
+};
+
+QKeySequence seq( const char *portable )
+{
+    return QKeySequence( QString::fromLatin1( portable ), QKeySequence::PortableText );
+}
+
+QList<OracleAction> standard_map_oracle()
+{
+    QList<OracleKey> fullscreen{ { seq( "Ctrl+F" ), KeyKind::Primary } };
+#ifdef Q_OS_WIN
+    fullscreen << OracleKey{ seq( "F11" ), KeyKind::Secondary };
+#endif
+    fullscreen << OracleKey{ seq( "Return" ), KeyKind::Secondary }
+               << OracleKey{ seq( "Enter" ), KeyKind::Secondary };
+    QList<OracleAction> map;
+    map << OracleAction{ QStringLiteral( "actionPlay" ),                  { { seq( "Space" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionFullscreen" ),            fullscreen }
+        << OracleAction{ QStringLiteral( "actionPreviousFrame" ),         { { seq( "Left" ), KeyKind::Primary }, { seq( "," ), KeyKind::Secondary } } }
+        << OracleAction{ QStringLiteral( "actionNextFrame" ),             { { seq( "Right" ), KeyKind::Primary }, { seq( "." ), KeyKind::Secondary } } }
+        << OracleAction{ QStringLiteral( "actionSeekBackwardOneSecond" ), { { seq( "Shift+Left" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionSeekForwardOneSecond" ),  { { seq( "Shift+Right" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionGoto_First_Frame" ),      { { seq( "Home" ), KeyKind::Primary }, { seq( "X" ), KeyKind::Alias } } }
+        << OracleAction{ QStringLiteral( "actionGoto_Last_Frame" ),       { { seq( "End" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionLoop" ),                  { { seq( "Ctrl+L" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionPrevious_Clip" ),         { { seq( "PgUp" ), KeyKind::Primary }, { seq( "J" ), KeyKind::Alias } } }
+        << OracleAction{ QStringLiteral( "actionNext_Clip" ),             { { seq( "PgDown" ), KeyKind::Primary }, { seq( "K" ), KeyKind::Alias } } }
+        << OracleAction{ QStringLiteral( "actionZoomFit" ),               { { seq( "F" ), KeyKind::Primary } } }
+        << OracleAction{ QStringLiteral( "actionZoom100" ),               { { seq( "Ctrl+0" ), KeyKind::Primary } } };
+    return map;
+}
+
+QList<QKeySequence> oracle_sequences( const OracleAction &row )
+{
+    QList<QKeySequence> sequences;
+    for( const OracleKey &k : row.keys ) sequences << k.sequence;
+    return sequences;
+}
+
+QString kind_name( KeyKind kind )
+{
+    switch( kind )
+    {
+    case KeyKind::Primary: return QStringLiteral( "Primary" );
+    case KeyKind::Secondary: return QStringLiteral( "Secondary" );
+    case KeyKind::Alias: return QStringLiteral( "Alias" );
+    }
+    return QStringLiteral( "?" );
+}
+
+// One physical key press and the action it must reach.
+struct KeyPress
+{
+    QString action;
+    Qt::Key key;
+    Qt::KeyboardModifiers modifiers;
+    QString label;
+};
+
+QList<KeyPress> oracle_key_presses()
+{
+    QList<KeyPress> presses;
+    for( const OracleAction &row : standard_map_oracle() )
+        for( const OracleKey &k : row.keys )
+        {
+            const QKeyCombination c = k.sequence[0];
+            presses << KeyPress{ row.name, c.key(), c.keyboardModifiers(), k.sequence.toString() };
+        }
+    // Numpad Enter arrives as Qt::Key_Enter + Qt::KeypadModifier.
+    presses << KeyPress{ QStringLiteral( "actionFullscreen" ), Qt::Key_Enter, Qt::KeypadModifier,
+                         QStringLiteral( "keypad Enter" ) };
+    return presses;
+}
+
+// The navigation keys the focus guard keeps for input widgets.
+QList<KeyPress> navigation_key_presses()
+{
+    QList<KeyPress> presses;
+    const struct { Qt::Key key; Qt::KeyboardModifiers modifiers; const char *label; } keys[] = {
+        { Qt::Key_Left, Qt::NoModifier, "Left" },       { Qt::Key_Right, Qt::NoModifier, "Right" },
+        { Qt::Key_Up, Qt::NoModifier, "Up" },           { Qt::Key_Down, Qt::NoModifier, "Down" },
+        { Qt::Key_Home, Qt::NoModifier, "Home" },       { Qt::Key_End, Qt::NoModifier, "End" },
+        { Qt::Key_PageUp, Qt::NoModifier, "PgUp" },     { Qt::Key_PageDown, Qt::NoModifier, "PgDown" },
+        { Qt::Key_Return, Qt::NoModifier, "Return" },   { Qt::Key_Enter, Qt::KeypadModifier, "keypad Enter" },
+        { Qt::Key_Left, Qt::ShiftModifier, "Shift+Left" }, { Qt::Key_Right, Qt::ShiftModifier, "Shift+Right" },
+    };
+    for( const auto &k : keys )
+        presses << KeyPress{ QString(), k.key, k.modifiers, QString::fromLatin1( k.label ) };
+    return presses;
+}
+
+// A stand-in for MainWindow: every table action parented to the window (as uic does), a
+// "Playback" menu in a WIDGET menu bar holding all of them (MainWindow.ui menuPlayback), a
+// toolbar holding Goto/Prev/Play/Next (mainToolBar), a focusable non-input viewer, the seek bar
+// (the FocusGuard's exempt widget) and one of each input-widget class the guard protects.
+// Actions start with NO shortcuts: every key comes from bindToWindow() (or applyOracleShortcuts()).
+class PlayerShortcutMirror
+{
+public:
+    PlayerShortcutMirror()
+    {
+        window.resize( 800, 600 );
+        // A widget menu bar on every platform (#846 adversary A1): a macOS native menu bar does
+        // not show as a QWidget and counts as visible for shortcut matching even when hidden.
+        window.menuBar()->setNativeMenuBar( false );
+        QMenu *playback = window.menuBar()->addMenu( QStringLiteral( "Playback" ) );
+        toolBar = window.addToolBar( QStringLiteral( "mainToolBar" ) );
+        for( const OracleAction &row : standard_map_oracle() )
+        {
+            const QString name = row.name;
+            QAction *a = new QAction( QStringLiteral( "&" ) + name, &window );
+            a->setObjectName( name );
+            playback->addAction( a );
+            counts.insert( name, 0 );
+            QObject::connect( a, &QAction::triggered, &window, [this, name]() { ++counts[name]; } );
+        }
+        for( const char *name : { "actionGoto_First_Frame", "actionPreviousFrame", "actionPlay", "actionNextFrame" } )
+            toolBar->addAction( action( QLatin1String( name ) ) );
+
+        central = new QWidget( &window );
+        layout = new QVBoxLayout( central );
+        viewer = new QWidget( central );
+        viewer->setObjectName( QStringLiteral( "viewer" ) );
+        viewer->setFocusPolicy( Qt::StrongFocus );
+        viewer->setMinimumSize( 160, 90 );
+        seekBar = new QSlider( Qt::Horizontal, central );
+        seekBar->setObjectName( QStringLiteral( "horizontalSliderPosition" ) );
+        seekBar->setRange( 0, 100 );
+        seekBar->setValue( 50 );
+        slider = new QSlider( Qt::Horizontal, central );
+        slider->setRange( 0, 100 );
+        slider->setValue( 50 );
+        spinBox = new QSpinBox( central );
+        spinBox->setRange( 0, 100 );
+        spinBox->setValue( 50 );
+        doubleSpinBox = new QDoubleSpinBox( central );
+        doubleSpinBox->setRange( 0.0, 100.0 );
+        doubleSpinBox->setSingleStep( 1.0 );
+        doubleSpinBox->setValue( 50.0 );
+        listView = new QListView( central );
+        listView->setModel( new QStringListModel( QStringList() << "r0" << "r1" << "r2" << "r3" << "r4", listView ) );
+        listView->setCurrentIndex( listView->model()->index( 0, 0 ) );
+        comboBox = new QComboBox( central );
+        comboBox->addItems( QStringList() << "c0" << "c1" << "c2" );
+        lineEdit = new QLineEdit( central );
+        plainTextEdit = new QPlainTextEdit( central );
+        for( QWidget *w : std::initializer_list<QWidget*>{ viewer, seekBar, slider, spinBox, doubleSpinBox,
+                                                          listView, comboBox, lineEdit, plainTextEdit } )
+            layout->addWidget( w );
+        window.setCentralWidget( central );
+    }
+
+    ~PlayerShortcutMirror()
+    {
+        if( guard ) qApp->removeEventFilter( guard );
+    }
+
+    QAction *action( const QString &name )
+    {
+        return window.findChild<QAction*>( name, Qt::FindDirectChildrenOnly );
+    }
+
+    // What MainWindow::initGui() installs right after bindToWindow().
+    void installGuard()
+    {
+        guard = new PlayerShortcutBinding::FocusGuard( seekBar, &window );
+        qApp->installEventFilter( guard );
+    }
+
+    void applyOracleShortcuts()
+    {
+        for( const OracleAction &row : standard_map_oracle() ) action( row.name )->setShortcuts( oracle_sequences( row ) );
+    }
+
+    void hideBars()
+    {
+        window.menuBar()->hide();
+        toolBar->hide();
+    }
+
+    // Windowed: bars visible. Fullscreen: bars hidden, as on_actionFullscreen_triggered() does.
+    bool showAndActivate( bool fullscreen )
+    {
+        if( fullscreen )
+        {
+            hideBars();
+            window.showFullScreen();
+        }
+        else window.show();
+        window.activateWindow();
+        return QTest::qWaitForWindowActive( &window );
+    }
+
+    bool focusOn( QWidget *w )
+    {
+        w->setFocus( Qt::OtherFocusReason );
+        return QTest::qWaitFor( [w]() { return QApplication::focusWidget() == w; }, 2000 );
+    }
+
+    int total() const
+    {
+        int sum = 0;
+        for( const int c : counts ) sum += c;
+        return sum;
+    }
+
+    QMainWindow window;
+    QToolBar *toolBar = nullptr;
+    QWidget *central = nullptr;
+    QVBoxLayout *layout = nullptr;
+    QWidget *viewer = nullptr;
+    QSlider *seekBar = nullptr;
+    QSlider *slider = nullptr;
+    QSpinBox *spinBox = nullptr;
+    QDoubleSpinBox *doubleSpinBox = nullptr;
+    QListView *listView = nullptr;
+    QComboBox *comboBox = nullptr;
+    QLineEdit *lineEdit = nullptr;
+    QPlainTextEdit *plainTextEdit = nullptr;
+    QPointer<PlayerShortcutBinding::FocusGuard> guard;
+    QMap<QString, int> counts;
+};
+
+QString press_label( const KeyPress &k )
+{
+    return QStringLiteral( "%1 (key 0x%2 mods 0x%3)" ).arg( k.label ).arg( int( k.key ), 0, 16 ).arg( int( k.modifiers ), 0, 16 );
+}
+
+// Presses each key on `target`, one at a time: the key's own action fires `expectedPerKey`
+// times and no other action fires.
+void press_and_check( PlayerShortcutMirror &m, QWidget *target, const QList<KeyPress> &presses,
+                      int expectedPerKey, const QString &context )
+{
+    for( const KeyPress &k : presses )
+    {
+        const QMap<QString, int> before = m.counts;
+        QTest::keyClick( target, k.key, k.modifiers );
+        for( auto it = m.counts.cbegin(); it != m.counts.cend(); ++it )
+        {
+            const int delta = it.value() - before.value( it.key() );
+            const int expected = ( it.key() == k.action ) ? expectedPerKey : 0;
+            QVERIFY2( delta == expected,
+                      qPrintable( QStringLiteral( "%1: key %2: action %3 fired %4 time(s), expected %5" )
+                                  .arg( context, press_label( k ), it.key() ).arg( delta ).arg( expected ) ) );
+        }
+    }
+}
+
+// The facts MainWindow.ui states about actions, menus and shortcut strings.
+struct UiFacts
+{
+    QMap<QString, int> actionDefinitions;          // <action name=...> count
+    QMap<QString, QStringList> menusByAction;      // <addaction> inside a QMenu widget
+    QMap<QString, QStringList> shortcutsByOwner;   // <property name="shortcut"><string> of an action or widget
+};
+
+bool parse_main_window_ui( UiFacts &facts, QString &error )
+{
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/MainWindow.ui" ) );
+    if( path.isEmpty() ) { error = QStringLiteral( "MainWindow.ui not found" ); return false; }
+    QFile file( path );
+    if( !file.open( QIODevice::ReadOnly ) ) { error = QStringLiteral( "cannot open %1" ).arg( path ); return false; }
+    QXmlStreamReader xml( &file );
+    struct Element { QString tag; QString name; QString cls; };
+    QVector<Element> stack;
+    while( !xml.atEnd() )
+    {
+        xml.readNext();
+        if( xml.isStartElement() )
+        {
+            const Element e{ xml.name().toString(),
+                             xml.attributes().value( QStringLiteral( "name" ) ).toString(),
+                             xml.attributes().value( QStringLiteral( "class" ) ).toString() };
+            if( e.tag == QLatin1String( "string" ) && stack.size() >= 2
+             && stack.last().tag == QLatin1String( "property" ) && stack.last().name == QLatin1String( "shortcut" ) )
+            {
+                facts.shortcutsByOwner[stack.at( stack.size() - 2 ).name] << xml.readElementText();
+                continue; // readElementText() consumed the end element
+            }
+            if( e.tag == QLatin1String( "action" ) ) ++facts.actionDefinitions[e.name];
+            if( e.tag == QLatin1String( "addaction" ) && !stack.isEmpty()
+             && stack.last().tag == QLatin1String( "widget" ) && stack.last().cls == QLatin1String( "QMenu" ) )
+                facts.menusByAction[e.name] << stack.last().name;
+            stack.push_back( e );
+        }
+        else if( xml.isEndElement() && !stack.isEmpty() )
+        {
+            stack.pop_back();
+        }
+    }
+    if( xml.hasError() ) { error = xml.errorString(); return false; }
+    return true;
+}
+
+} // namespace
+
+void GuiSmokeTest::playerShortcutMap_tableIsTheStandardMap()
+{
+    // The product table equals the design table: same actions in the same order, same sequences
+    // in the same order, same kinds.
+    const QList<PlayerShortcutBinding::ActionBinding> table = PlayerShortcutBinding::bindings();
+    const QList<OracleAction> oracle = standard_map_oracle();
+    QStringList oracleNames;
+    for( const OracleAction &row : oracle ) oracleNames << row.name;
+    QCOMPARE( PlayerShortcutBinding::liveActionNames(), oracleNames );
+    QCOMPARE( table.size(), oracle.size() );
+    for( int i = 0; i < oracle.size(); ++i )
+    {
+        QCOMPARE( table.at( i ).objectName, oracle.at( i ).name );
+        QCOMPARE( table.at( i ).keys.size(), oracle.at( i ).keys.size() );
+        for( int k = 0; k < oracle.at( i ).keys.size(); ++k )
+        {
+            QCOMPARE( table.at( i ).keys.at( k ).sequence, oracle.at( i ).keys.at( k ).sequence );
+            QVERIFY2( table.at( i ).keys.at( k ).kind == oracle.at( i ).keys.at( k ).kind,
+                      qPrintable( QStringLiteral( "%1 key %2: kind %3, design %4" )
+                                  .arg( oracle.at( i ).name, oracle.at( i ).keys.at( k ).sequence.toString(),
+                                        kind_name( table.at( i ).keys.at( k ).kind ), kind_name( oracle.at( i ).keys.at( k ).kind ) ) ) );
+        }
+        QVERIFY( table.at( i ).keys.first().kind == KeyKind::Primary );
+    }
+
+    // No sequence twice across the table (one key, one action).
+    QList<QKeySequence> all;
+    for( const PlayerShortcutBinding::ActionBinding &row : table )
+        for( const PlayerShortcutBinding::KeyBinding &k : row.keys )
+        {
+            QVERIFY2( !all.contains( k.sequence ), qPrintable( QStringLiteral( "%1 bound twice" ).arg( k.sequence.toString() ) ) );
+            all << k.sequence;
+        }
+
+    // No table key collides with any other shortcut MainWindow.ui declares (actions and tool
+    // buttons), nor with the keys MainWindow.cpp creates in code (Q, Esc) or reserves for later
+    // cards (Up/Down: PLAYER-MUTE-VOLUME-1; L: PLAYER-JKL-SHUTTLE-1).
+    UiFacts facts;
+    QString error;
+    QVERIFY2( parse_main_window_ui( facts, error ), qPrintable( error ) );
+    for( auto it = facts.shortcutsByOwner.cbegin(); it != facts.shortcutsByOwner.cend(); ++it )
+    {
+        if( oracleNames.contains( it.key() ) ) continue;
+        for( const QString &s : it.value() )
+            QVERIFY2( !all.contains( QKeySequence( s, QKeySequence::PortableText ) ),
+                      qPrintable( QStringLiteral( "table key %1 collides with %2 in MainWindow.ui" ).arg( s, it.key() ) ) );
+    }
+    for( const char *other : { "M", "I", "Q", "Esc", "Up", "Down", "L" } )
+        QVERIFY2( !all.contains( seq( other ) ), qPrintable( QStringLiteral( "table binds reserved key %1" ).arg( QLatin1String( other ) ) ) );
+}
+
+void GuiSmokeTest::playerShortcutMap_uiActionsExist()
+{
+    // Every table action exists once in MainWindow.ui, sits on a menu, and any shortcut string
+    // the .ui carries for it is one of its table sequences. Help > Keyboard Shortcuts exists.
+    UiFacts facts;
+    QString error;
+    QVERIFY2( parse_main_window_ui( facts, error ), qPrintable( error ) );
+    for( const OracleAction &row : standard_map_oracle() )
+    {
+        QVERIFY2( facts.actionDefinitions.value( row.name ) == 1,
+                  qPrintable( QStringLiteral( "%1 defined %2 time(s) in MainWindow.ui" ).arg( row.name ).arg( facts.actionDefinitions.value( row.name ) ) ) );
+        QVERIFY2( !facts.menusByAction.value( row.name ).isEmpty(),
+                  qPrintable( QStringLiteral( "%1 is on no menu in MainWindow.ui" ).arg( row.name ) ) );
+        const QList<QKeySequence> sequences = oracle_sequences( row );
+        for( const QString &s : facts.shortcutsByOwner.value( row.name ) )
+            QVERIFY2( sequences.contains( QKeySequence( s, QKeySequence::PortableText ) ),
+                      qPrintable( QStringLiteral( "%1: .ui shortcut %2 is not in its table set" ).arg( row.name, s ) ) );
+    }
+    QCOMPARE( facts.actionDefinitions.value( QStringLiteral( "actionKeyboardShortcuts" ) ), 1 );
+    QVERIFY( facts.menusByAction.value( QStringLiteral( "actionKeyboardShortcuts" ) ).contains( QStringLiteral( "menuHelp" ) ) );
+}
+
+void GuiSmokeTest::playerShortcutMap_bindAppliesExactlyTheTable()
+{
+    PlayerShortcutMirror m;
+    const QList<OracleAction> oracle = standard_map_oracle();
+    // A stray key set before the bind (as a .ui string would be) is replaced, not kept.
+    m.action( QStringLiteral( "actionPlay" ) )->setShortcuts( { seq( "Space" ), seq( "Ctrl+Shift+P" ) } );
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), int( oracle.size() ) );
+    for( const OracleAction &row : oracle )
+    {
+        QAction *a = m.action( row.name );
+        QVERIFY( a );
+        QCOMPARE( a->shortcuts(), oracle_sequences( row ) );
+        QCOMPARE( a->shortcut(), row.keys.first().sequence );
+        QVERIFY( m.window.actions().contains( a ) );
+    }
+    // A second bind leaves the window's actions as they are -- no remove/re-append reorder past
+    // an unrelated action added in between (#846 adversary pass 2 A1).
+    QAction *extra = new QAction( QStringLiteral( "Extra" ), &m.window );
+    m.window.addAction( extra );
+    const QList<QAction*> before = m.window.actions();
+    QCOMPARE( before.size(), int( oracle.size() ) + 1 );
+    QCOMPARE( before.last(), extra );
+    QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), int( oracle.size() ) );
+    QCOMPARE( m.window.actions(), before );
+}
+
+void GuiSmokeTest::playerShortcutMap_hiddenBarsWithoutBindingAreDead()
+{
+    // CONTROL (#846's defect): bars hidden, window fullscreen and active, the keys set on the
+    // actions but nothing bound to the window -> no key reaches its action.
+    PlayerShortcutMirror m;
+    m.applyOracleShortcuts();
+    QVERIFY( m.showAndActivate( true ) );
+    QVERIFY( m.focusOn( m.viewer ) );
+    press_and_check( m, &m.window, oracle_key_presses(), 0, QStringLiteral( "unbound fullscreen" ) );
+    if( QTest::currentTestFailed() ) return;
+    QCOMPARE( m.total(), 0 );
+}
+
+void GuiSmokeTest::playerShortcutMap_everyKeyFiresWindowedAndFullscreen()
+{
+    // Bars visible + windowed, then bars hidden + fullscreen; viewer focused; the guard installed
+    // as MainWindow installs it. Every sequence (aliases J K X and Return/Enter/keypad Enter
+    // included) fires its own action exactly once and no other.
+    for( const bool fullscreen : { false, true } )
+    {
+        PlayerShortcutMirror m;
+        QCOMPARE( PlayerShortcutBinding::bindToWindow( &m.window ), int( standard_map_oracle().size() ) );
+        m.installGuard();
+        QVERIFY( m.showAndActivate( fullscreen ) );
+        if( !fullscreen )
+        {
+            QVERIFY( m.window.menuBar()->isVisible() );
+            QVERIFY( m.toolBar->isVisible() );
+        }
+        QVERIFY( m.focusOn( m.viewer ) );
+        const QList<KeyPress> presses = oracle_key_presses();
+        press_and_check( m, &m.window, presses, 1, fullscreen ? QStringLiteral( "fullscreen" ) : QStringLiteral( "windowed" ) );
+        if( QTest::currentTestFailed() ) return;
+        QCOMPARE( m.total(), int( presses.size() ) );
+    }
+}
+
+void GuiSmokeTest::playerShortcutMap_textInputsKeepPrintableKeys()
+{
+    // Text inputs claim printable keys in ShortcutOverride; the window binding must not steal
+    // Space , . X F J K from them.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QVERIFY( m.showAndActivate( true ) );
+    const Qt::Key printable[] = { Qt::Key_Space, Qt::Key_Comma, Qt::Key_Period, Qt::Key_X, Qt::Key_F, Qt::Key_J, Qt::Key_K };
+
+    QVERIFY( m.focusOn( m.lineEdit ) );
+    for( const Qt::Key key : printable ) QTest::keyClick( m.lineEdit, key );
+    QCOMPARE( m.total(), 0 );
+    QCOMPARE( m.lineEdit->text(), QStringLiteral( " ,.xfjk" ) );
+
+    QVERIFY( m.focusOn( m.spinBox ) );
+    for( const Qt::Key key : printable ) QTest::keyClick( m.spinBox, key );
+    QCOMPARE( m.total(), 0 );
+}
+
+void GuiSmokeTest::playerShortcutMap_focusGuardInputsKeepNavigationKeys()
+{
+    // With an input widget focused, windowed AND fullscreen, the navigation keys fire no player
+    // action and the widget does its own thing with them.
+    for( const bool fullscreen : { false, true } )
+    {
+        const QString mode = fullscreen ? QStringLiteral( "fullscreen" ) : QStringLiteral( "windowed" );
+        PlayerShortcutMirror m;
+        PlayerShortcutBinding::bindToWindow( &m.window );
+        m.installGuard();
+        QVERIFY( m.showAndActivate( fullscreen ) );
+
+        QVERIFY( m.focusOn( m.spinBox ) );
+        QTest::keyClick( m.spinBox, Qt::Key_Up );
+        QCOMPARE( m.spinBox->value(), 51 );
+        QVERIFY( m.focusOn( m.doubleSpinBox ) );
+        QTest::keyClick( m.doubleSpinBox, Qt::Key_Up );
+        QCOMPARE( m.doubleSpinBox->value(), 51.0 );
+        QVERIFY( m.focusOn( m.slider ) );
+        QTest::keyClick( m.slider, Qt::Key_Right );
+        QCOMPARE( m.slider->value(), 51 );
+        QTest::keyClick( m.slider, Qt::Key_End );
+        QCOMPARE( m.slider->value(), m.slider->maximum() );
+        QVERIFY( m.focusOn( m.listView ) );
+        QTest::keyClick( m.listView, Qt::Key_Down );
+        QCOMPARE( m.listView->currentIndex().row(), 1 );
+        QTest::keyClick( m.listView, Qt::Key_End );
+        QCOMPARE( m.listView->currentIndex().row(), 4 );
+        QVERIFY( m.focusOn( m.lineEdit ) );
+        QSignalSpy returnPressed( m.lineEdit, &QLineEdit::returnPressed );
+        QTest::keyClick( m.lineEdit, Qt::Key_Return );
+        QCOMPARE( returnPressed.count(), 1 );
+        QCOMPARE( m.total(), 0 );
+
+        for( QWidget *w : std::initializer_list<QWidget*>{ m.spinBox, m.doubleSpinBox, m.slider, m.listView,
+                                                          m.comboBox, m.lineEdit, m.plainTextEdit } )
+        {
+            QVERIFY( m.focusOn( w ) );
+            press_and_check( m, w, navigation_key_presses(), 0,
+                             QStringLiteral( "%1 %2 focused" ).arg( mode, QString::fromLatin1( w->metaObject()->className() ) ) );
+            if( QTest::currentTestFailed() ) return;
+        }
+        QCOMPARE( m.total(), 0 );
+    }
+}
+
+void GuiSmokeTest::playerShortcutMap_focusGuardControlWithoutGuardInputsLoseKeys()
+{
+    // CONTROL: the guard is load-bearing. Without it, a focused slider loses Right to
+    // actionNextFrame and a focused spin box loses Return to actionFullscreen.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    QVERIFY( m.showAndActivate( true ) );
+    QVERIFY( m.focusOn( m.slider ) );
+    QTest::keyClick( m.slider, Qt::Key_Right );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionNextFrame" ) ), 1 );
+    QCOMPARE( m.slider->value(), 50 );
+    QVERIFY( m.focusOn( m.spinBox ) );
+    QTest::keyClick( m.spinBox, Qt::Key_Return );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionFullscreen" ) ), 1 );
+
+    // The pure predicate agrees: input classes own the key, the exempt widget and the viewer do not.
+    using PlayerShortcutBinding::FocusGuard;
+    QVERIFY( FocusGuard::focusOwnsKey( m.slider, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( FocusGuard::focusOwnsKey( m.spinBox, Qt::Key_Enter, Qt::KeypadModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.seekBar, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.viewer, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.slider, Qt::Key_Right, Qt::ControlModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( m.lineEdit, Qt::Key_Space, Qt::NoModifier, m.seekBar ) );
+    QVERIFY( !FocusGuard::focusOwnsKey( nullptr, Qt::Key_Right, Qt::NoModifier, m.seekBar ) );
+}
+
+void GuiSmokeTest::playerShortcutMap_exemptSeekBarAndViewerGetPlayerKeys()
+{
+    // The seek bar (the guard's exempt widget) and the viewer keep the player keys.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QVERIFY( m.showAndActivate( true ) );
+    QList<KeyPress> presses;
+    presses << KeyPress{ QStringLiteral( "actionNextFrame" ), Qt::Key_Right, Qt::NoModifier, QStringLiteral( "Right" ) }
+            << KeyPress{ QStringLiteral( "actionGoto_First_Frame" ), Qt::Key_Home, Qt::NoModifier, QStringLiteral( "Home" ) }
+            << KeyPress{ QStringLiteral( "actionGoto_Last_Frame" ), Qt::Key_End, Qt::NoModifier, QStringLiteral( "End" ) }
+            << KeyPress{ QStringLiteral( "actionSeekForwardOneSecond" ), Qt::Key_Right, Qt::ShiftModifier, QStringLiteral( "Shift+Right" ) };
+    for( QWidget *w : std::initializer_list<QWidget*>{ m.seekBar, m.viewer } )
+    {
+        QVERIFY( m.focusOn( w ) );
+        press_and_check( m, w, presses, 1, QString::fromLatin1( w->metaObject()->className() ) );
+        if( QTest::currentTestFailed() ) return;
+    }
+    QCOMPARE( m.seekBar->value(), 50 ); // the action took the key, the slider did not step
+    QCOMPARE( m.total(), 2 * int( presses.size() ) );
+}
+
+void GuiSmokeTest::playerShortcutMap_disabledActionDoesNotFire()
+{
+    // CoS #846 prevention: a disabled table action's keys fire nothing -- not it, not another
+    // action that might match the key next.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QVERIFY( m.showAndActivate( true ) );
+    QVERIFY( m.focusOn( m.viewer ) );
+    QAction *next = m.action( QStringLiteral( "actionNextFrame" ) );
+    next->setEnabled( false );
+    QTest::keyClick( &m.window, Qt::Key_Right );
+    QTest::keyClick( &m.window, Qt::Key_Period );
+    QCOMPARE( m.total(), 0 );
+    next->setEnabled( true );
+    QTest::keyClick( &m.window, Qt::Key_Right );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionNextFrame" ) ), 1 );
+    QCOMPARE( m.total(), 1 );
+}
+
+void GuiSmokeTest::playerShortcutMap_otherTopLevelWindowDoesNotFire()
+{
+    // Window scope kept (never an application-wide context): with another top-level window
+    // active, no table key fires the player's actions.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QVERIFY( m.showAndActivate( true ) );
+
+    QWidget other;
+    other.setWindowTitle( QStringLiteral( "other top-level" ) );
+    other.setFocusPolicy( Qt::StrongFocus );
+    other.resize( 200, 100 );
+    other.show();
+    other.activateWindow();
+    QVERIFY( QTest::qWaitForWindowActive( &other ) );
+    QTRY_COMPARE( QApplication::activeWindow(), &other );
+    press_and_check( m, &other, oracle_key_presses(), 0, QStringLiteral( "other window" ) );
+    if( QTest::currentTestFailed() ) return;
+    QCOMPARE( m.total(), 0 );
+
+    // Positive control in the same process: back on the player window, Space fires again.
+    other.hide();
+    m.window.activateWindow();
+    QVERIFY( QTest::qWaitForWindowActive( &m.window ) );
+    QVERIFY( m.focusOn( m.viewer ) );
+    QTest::keyClick( &m.window, Qt::Key_Space );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionPlay" ) ), 1 );
+}
+
+void GuiSmokeTest::playerShortcutMap_glContainerFocus()
+{
+    // The GL viewer path: a native child QWindow inside a window container has focus. The key
+    // event goes to the QWindow, not to a widget; the window-scoped table action must still fire.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    m.installGuard();
+    QWindow *child = new QWindow();
+    QWidget *container = QWidget::createWindowContainer( child, m.central );
+    container->setMinimumSize( 160, 90 );
+    container->setFocusPolicy( Qt::StrongFocus );
+    m.layout->addWidget( container );
+    QVERIFY( m.showAndActivate( true ) );
+    container->setFocus( Qt::OtherFocusReason );
+    child->requestActivate();
+    if( !QTest::qWaitFor( [child]() { return QGuiApplication::focusWindow() == child; }, 2000 ) )
+        QSKIP( "the QPA did not make the container's child QWindow the focus window; "
+               "GL path UNMEASURED offscreen; venue proof owed by the umbrella smoke" );
+    QTest::keyClick( child, Qt::Key_Right );
+    QCOMPARE( m.counts.value( QStringLiteral( "actionNextFrame" ) ), 1 );
+    QCOMPARE( m.total(), 1 );
+}
+
+void GuiSmokeTest::playerShortcutMap_oneSecondSeekTargetNeverOverflows()
+{
+    // Adversary pass 2 A1 (95d6cb1c): a 201-frame clip whose accepted metadata says 2147483648
+    // fps (or 2147483647), paused at 100: Shift+Left/Right must clamp to the slider range, never
+    // overflow an int on the way there.
+    using PlayerShortcutBinding::oneSecondSeekTarget;
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483648.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483648.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483647.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 100, 2147483647.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 2147483647, 25.0, +1, 0, 2147483647 ), 2147483647 );
+    QCOMPARE( oneSecondSeekTarget( -2147483647 - 1, 25.0, -1, -2147483647 - 1, 0 ), -2147483647 - 1 );
+    QCOMPARE( oneSecondSeekTarget( 100, 1e300, +1, 0, 200 ), 200 );
+    // Ordinary rates: one second of frames, rounded, at least one frame.
+    QCOMPARE( oneSecondSeekTarget( 100, 25.0, +1, 0, 200 ), 125 );
+    QCOMPARE( oneSecondSeekTarget( 100, 23.976, -1, 0, 200 ), 76 );
+    QCOMPARE( oneSecondSeekTarget( 100, 0.4, +1, 0, 200 ), 101 );
+    // No usable rate: one frame.
+    QCOMPARE( oneSecondSeekTarget( 100, 0.0, +1, 0, 200 ), 101 );
+    QCOMPARE( oneSecondSeekTarget( 100, -30.0, -1, 0, 200 ), 99 );
+    QCOMPARE( oneSecondSeekTarget( 100, std::numeric_limits<double>::quiet_NaN(), +1, 0, 200 ), 101 );
+    QCOMPARE( oneSecondSeekTarget( 100, std::numeric_limits<double>::infinity(), -1, 0, 200 ), 99 );
+    // Clamped at the ends; an empty range stays at its minimum.
+    QCOMPARE( oneSecondSeekTarget( 10, 25.0, -1, 0, 200 ), 0 );
+    QCOMPARE( oneSecondSeekTarget( 190, 25.0, +1, 0, 200 ), 200 );
+    QCOMPARE( oneSecondSeekTarget( 0, 25.0, +1, 0, -1 ), 0 );
+}
+
+void GuiSmokeTest::playerShortcutMap_helpRowsAreGeneratedFromLiveActions()
+{
+    // Help > Keyboard Shortcuts is built from the live actions: table rows first in table order,
+    // then every other window action with a key, then described QShortcuts. A new action shows
+    // up with no list edit anywhere.
+    PlayerShortcutMirror m;
+    PlayerShortcutBinding::bindToWindow( &m.window );
+    QAction *unrelated = new QAction( QStringLiteral( "Zz &Unrelated" ), &m.window );
+    unrelated->setShortcut( seq( "Ctrl+Shift+Y" ) );
+    new QAction( QStringLiteral( "No key" ), &m.window );                 // no shortcut: not listed
+    QAction *hidden = new QAction( QStringLiteral( "Hidden" ), &m.window );
+    hidden->setShortcut( seq( "Ctrl+Shift+H" ) );
+    hidden->setVisible( false );                                           // a dead key: not listed
+    QShortcut *described = new QShortcut( seq( "Esc" ), &m.window );
+    described->setWhatsThis( QStringLiteral( "Exit fullscreen" ) );
+    new QShortcut( seq( "Q" ), &m.window );                               // undescribed: listed by its owner's name
+    // Adversary A1 (pass 1, 0142890b): keys that live OFF the window's direct children must be
+    // listed too -- a tool button's own shortcut (MainWindow.ui M, Shift+I), a QShortcut owned by
+    // a child widget (GraphicsZoomView zoom in/out) and an action in a submenu (QRecentFilesMenu
+    // Ctrl+R). A dialog's keys are its own and stay out.
+    QToolButton *badPixels = new QToolButton( m.central );
+    badPixels->setToolTip( QStringLiteral( "Select Bad Pixels" ) );
+    badPixels->setShortcut( seq( "M" ) );
+    QToolButton *cutIn = new QToolButton( m.central );
+    cutIn->setText( QStringLiteral( "&In" ) );
+    cutIn->setShortcut( seq( "Shift+I" ) );
+    QShortcut *zoomIn = new QShortcut( QKeySequence::ZoomIn, m.viewer );
+    zoomIn->setWhatsThis( QStringLiteral( "Zoom in" ) );
+    QMenu *recent = m.window.menuBar()->actions().first()->menu()->addMenu( QStringLiteral( "Recent" ) );
+    recent->addAction( QStringLiteral( "1 recent session" ) )->setShortcut( seq( "Ctrl+R" ) );
+    QDialog *otherWindow = new QDialog( &m.window );
+    QAction *dialogAction = new QAction( QStringLiteral( "Dialog action" ), otherWindow );
+    dialogAction->setShortcut( seq( "Ctrl+Shift+D" ) );
+    otherWindow->addAction( dialogAction );
+    new QShortcut( seq( "Ctrl+Shift+G" ), otherWindow );
+    QToolButton *dialogButton = new QToolButton( otherWindow );
+    dialogButton->setShortcut( seq( "Ctrl+Shift+B" ) );
+
+    const QList<PlayerShortcutBinding::ShortcutRow> rows = PlayerShortcutBinding::shortcutRows( &m.window );
+    const QList<OracleAction> oracle = standard_map_oracle();
+    QStringList listed;
+    for( const PlayerShortcutBinding::ShortcutRow &r : rows ) listed << r.action + QStringLiteral( " = " ) + r.keys;
+    const QString eq = QStringLiteral( " = " );
+    const int n = int( oracle.size() );
+    const QStringList expectedExtras = QStringList()
+        << QStringLiteral( "1 recent session" ) + eq + seq( "Ctrl+R" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "In" ) + eq + seq( "Shift+I" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Select Bad Pixels" ) + eq + seq( "M" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Zz Unrelated" ) + eq + seq( "Ctrl+Shift+Y" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Exit fullscreen" ) + eq + seq( "Esc" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "QMainWindow" ) + eq + seq( "Q" ).toString( QKeySequence::NativeText )
+        << QStringLiteral( "Zoom in" ) + eq + PlayerShortcutBinding::keysText( zoomIn->keys() );
+    QCOMPARE( listed.mid( n ), expectedExtras );
+    QCOMPARE( rows.size(), n + int( expectedExtras.size() ) );
+    for( int i = 0; i < oracle.size(); ++i )
+    {
+        const OracleAction &row = oracle.at( i );
+        QCOMPARE( rows.at( i ).action, row.name ); // the text "&<name>" without the mnemonic
+        QCOMPARE( rows.at( i ).keys, PlayerShortcutBinding::keysText( m.action( row.name )->shortcuts() ) );
+        bool hasAlias = false;
+        for( const OracleKey &k : row.keys )
+        {
+            QVERIFY2( rows.at( i ).keys.contains( k.sequence.toString( QKeySequence::NativeText ) ),
+                      qPrintable( QStringLiteral( "%1 row lacks %2" ).arg( row.name, k.sequence.toString() ) ) );
+            if( k.kind == KeyKind::Alias )
+            {
+                hasAlias = true;
+                QVERIFY( rows.at( i ).note.contains( k.sequence.toString( QKeySequence::NativeText ) ) );
+            }
+        }
+        QCOMPARE( rows.at( i ).note.contains( PlayerShortcutBinding::aliasRetireNote() ), hasAlias );
+    }
+    // Nothing from the dialog, which is its own window with its own keys.
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( QStringLiteral( "Dialog action" ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+G" ).toString( QKeySequence::NativeText ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+B" ).toString( QKeySequence::NativeText ) ) );
+    QVERIFY( !listed.join( QLatin1Char( '\n' ) ).contains( seq( "Ctrl+Shift+H" ).toString( QKeySequence::NativeText ) ) );
+
+    std::unique_ptr<QDialog> dialog( PlayerShortcutBinding::createShortcutsDialog( &m.window ) );
+    QVERIFY( dialog );
+    QTableWidget *table = dialog->findChild<QTableWidget*>();
+    QVERIFY( table );
+    QCOMPARE( table->rowCount(), int( rows.size() ) );
+    QCOMPARE( table->columnCount(), 3 );
+    QVERIFY( table->editTriggers() == QAbstractItemView::NoEditTriggers );
+    for( int r = 0; r < rows.size(); ++r )
+    {
+        QCOMPARE( table->item( r, 0 )->text(), rows.at( r ).action );
+        QCOMPARE( table->item( r, 1 )->text(), rows.at( r ).keys );
+        QCOMPARE( table->item( r, 2 )->text(), rows.at( r ).note );
+        QVERIFY( !( table->item( r, 0 )->flags() & Qt::ItemIsEditable ) );
+    }
+    QVERIFY( dialog->findChild<QDialogButtonBox*>() );
+}
+
+namespace
+{
+
+// PLAYER-TOOLBAR-TRANSPORT-BUTTONS-1: a main window carrying the transport cluster (named by
+// PlayerTransportToolbar::clusterActionNames(), in order) on a toolbar, plus a widget like the
+// playback-quality button. Stop and Goto Last Frame have no icon, as in MainWindow.ui.
+class TransportToolbarFixture
+{
+public:
+    TransportToolbarFixture()
+    {
+        bar = new QToolBar( &window );
+        window.addToolBar( bar );
+        QPixmap standIn( 24, 24 );
+        standIn.fill( Qt::gray );
+        const QStringList withoutIcon{ QStringLiteral( "actionStop" ), QStringLiteral( "actionGoto_Last_Frame" ) };
+        const QMap<QString, QString> tips{
+            { QStringLiteral( "actionGoto_First_Frame" ), QStringLiteral( "Jump to first frame..." ) },
+            { QStringLiteral( "actionPlay" ), QStringLiteral( "Play clip..." ) },
+            { QStringLiteral( "actionStop" ), QStringLiteral( "Stop and return to cut in" ) },
+            { QStringLiteral( "actionGoto_Last_Frame" ), QStringLiteral( "Jump to last frame..." ) },
+            { QStringLiteral( "actionAudioOutput" ), QStringLiteral( "Audio Output on Playback" ) } };
+        for( const QString &name : PlayerTransportToolbar::clusterActionNames() )
+        {
+            QAction *action = new QAction( QString( name ).remove( QStringLiteral( "action" ) ), &window );
+            action->setObjectName( name );
+            if( !withoutIcon.contains( name ) ) action->setIcon( QIcon( standIn ) );
+            if( tips.contains( name ) ) action->setToolTip( tips.value( name ) );
+            bar->addAction( action );
+            actions.insert( name, action );
+        }
+        quality = new QToolButton;
+        quality->setToolTip( QStringLiteral( "quality" ) );
+        bar->addWidget( quality );
+    }
+
+    QMainWindow window;
+    QToolBar *bar = nullptr;
+    QToolButton *quality = nullptr;
+    QMap<QString, QAction*> actions;
+};
+
+QStringList transportToolTips( const TransportToolbarFixture &f )
+{
+    QStringList tips;
+    for( const QString &name : PlayerTransportToolbar::clusterActionNames() )
+        tips << f.actions.value( name )->toolTip() << f.bar->widgetForAction( f.actions.value( name ) )->toolTip();
+    return tips;
+}
+
+} // namespace
+
+void GuiSmokeTest::transportToolbar_tooltipsCarryTheLiveKeys()
+{
+    // G1: every table action's tooltip ends with its LIVE keys (set by bindToWindow, never typed
+    // by hand); unbound Stop and Audio Output get none; the quality widget is left alone.
+    TransportToolbarFixture f;
+    PlayerShortcutBinding::bindToWindow( &f.window );
+    PlayerTransportToolbar::finish( f.bar, &f.window );
+    const QStringList table = PlayerShortcutBinding::liveActionNames();
+    int keyed = 0;
+    for( const QString &name : PlayerTransportToolbar::clusterActionNames() )
+    {
+        QAction *action = f.actions.value( name );
+        QVERIFY2( action, qPrintable( name ) );
+        QWidget *button = f.bar->widgetForAction( action );
+        QVERIFY2( button, qPrintable( name ) );
+        QCOMPARE( button->toolTip(), action->toolTip() );
+        if( table.contains( name ) )
+        {
+            QVERIFY2( !action->shortcuts().isEmpty(), qPrintable( name ) );
+            const QString suffix = QStringLiteral( "(" ) + PlayerShortcutBinding::keysText( action->shortcuts() ) + QStringLiteral( ")" );
+            QVERIFY2( action->toolTip().endsWith( suffix ), qPrintable( name + QStringLiteral( ": " ) + action->toolTip() ) );
+            ++keyed;
+        }
+    }
+    QCOMPARE( keyed, 9 );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionStop" ) )->toolTip().contains( QStringLiteral( " (" ) ) );
+    QCOMPARE( f.actions.value( QStringLiteral( "actionStop" ) )->toolTip(), QStringLiteral( "Stop and return to cut in" ) );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionAudioOutput" ) )->toolTip().contains( QStringLiteral( " (" ) ) );
+    // The trailing "..." goes before the keys are appended.
+    QCOMPARE( f.actions.value( QStringLiteral( "actionGoto_Last_Frame" ) )->toolTip(),
+              QStringLiteral( "Jump to last frame (%1)" ).arg( QKeySequence( Qt::Key_End ).toString( QKeySequence::NativeText ) ) );
+    QCOMPARE( f.quality->toolTip(), QStringLiteral( "quality" ) );
+    QCOMPARE( PlayerTransportToolbar::keyedToolTip( QStringLiteral( "Play." ), {} ), QStringLiteral( "Play." ) );
+    QCOMPARE( PlayerTransportToolbar::keyedToolTip( QStringLiteral( "Play clip... " ), { QKeySequence( Qt::Key_P ) } ),
+              QStringLiteral( "Play clip (%1)" ).arg( QKeySequence( Qt::Key_P ).toString( QKeySequence::NativeText ) ) );
+}
+
+void GuiSmokeTest::transportToolbar_finishIsIdempotent()
+{
+    // G2: running finish() again never stacks a second key suffix.
+    TransportToolbarFixture f;
+    PlayerShortcutBinding::bindToWindow( &f.window );
+    PlayerTransportToolbar::finish( f.bar, &f.window );
+    const QStringList once = transportToolTips( f );
+    PlayerTransportToolbar::finish( f.bar, &f.window );
+    QCOMPARE( transportToolTips( f ), once );
+    QCOMPARE( f.quality->toolTip(), QStringLiteral( "quality" ) );
+}
+
+void GuiSmokeTest::transportToolbar_runtimeIconsAreDrawn()
+{
+    // G3: gui_tests does not link ressources.qrc, so stand-in Play / First Frame images are
+    // written to a temporary directory and handed to finish().
+    QTemporaryDir dir;
+    QVERIFY( dir.isValid() );
+    const QColor ink( 200, 30, 40 );
+    QImage play( 24, 24, QImage::Format_ARGB32 );
+    play.fill( Qt::transparent );
+    for( int y = 4; y < 20; ++y )
+        for( int x = 6; x < 6 + ( y < 12 ? y - 3 : 20 - y ); ++x )
+            play.setPixelColor( x, y, ink );
+    play.setPixelColor( 0, 0, QColor( 10, 10, 10, 40 ) );   // a faint pixel first in scan order
+    const QString playPath = dir.filePath( QStringLiteral( "Play.png" ) );
+    QVERIFY( play.save( playPath ) );
+    QImage first( 24, 24, QImage::Format_ARGB32 );
+    first.fill( Qt::transparent );
+    first.setPixelColor( 1, 12, ink );                       // left-only mark
+    const QString firstPath = dir.filePath( QStringLiteral( "FirstFrame.png" ) );
+    QVERIFY( first.save( firstPath ) );
+
+    TransportToolbarFixture f;
+    PlayerShortcutBinding::bindToWindow( &f.window );
+    PlayerTransportToolbar::finish( f.bar, &f.window, firstPath, playPath );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionStop" ) )->icon().isNull() );
+    QVERIFY( !f.actions.value( QStringLiteral( "actionGoto_Last_Frame" ) )->icon().isNull() );
+
+    const QImage stop = PlayerTransportToolbar::stopIcon( playPath ).pixmap( 24, 24 ).toImage().convertToFormat( QImage::Format_ARGB32 );
+    QCOMPARE( stop.size(), QSize( 24, 24 ) );
+    QCOMPARE( stop.pixelColor( 12, 12 ), ink );
+    QCOMPARE( stop.pixelColor( 0, 0 ).alpha(), 0 );
+    QCOMPARE( stop.pixelColor( 23, 23 ).alpha(), 0 );
+    const QImage last = PlayerTransportToolbar::mirroredIcon( firstPath ).pixmap( 24, 24 ).toImage().convertToFormat( QImage::Format_ARGB32 );
+    QCOMPARE( last.pixelColor( 22, 12 ), ink );
+    QCOMPARE( last.pixelColor( 1, 12 ).alpha(), 0 );
+    QVERIFY( PlayerTransportToolbar::stopIcon( dir.filePath( QStringLiteral( "missing.png" ) ) ).isNull() );
+}
+
+void GuiSmokeTest::transportToolbar_stopTargetFrameIsClampedCutIn()
+{
+    // G4: cut in is a 1-based spin value; Stop seeks to its clamped 0-based frame.
+    using PlayerTransportToolbar::stopTargetFrame;
+    QCOMPARE( stopTargetFrame( 1, 100 ), 0 );
+    QCOMPARE( stopTargetFrame( 50, 100 ), 49 );
+    QCOMPARE( stopTargetFrame( 500, 100 ), 99 );
+    QCOMPARE( stopTargetFrame( 5, 0 ), 0 );
+    QCOMPARE( stopTargetFrame( 0, 100 ), 0 );
+    QCOMPARE( stopTargetFrame( std::numeric_limits<int>::min(), 100 ), 0 );
 }
 
 void GuiSmokeTest::mainWindowGpuPreviewPolicyAllowsGpu16OnlyWithoutScopes()
@@ -1572,6 +2570,1043 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback()
               QStringLiteral( "GPU Tex NR" ) );
     QVERIFY( QString::fromLatin1( mainWindowScopePerformanceHintText() )
                  .contains( QStringLiteral( "Hide the edit area with E" ) ) );
+}
+
+namespace
+{
+// PLAYER-CURSOR-AUTOHIDE-1: drives the same Controller / CursorHider / eventIsActivity calls that
+// MainWindow::viewerIdleNoteEvent, viewerIdleRestore and viewerIdleTimeout make, with a short idle
+// interval so the live single-shot timer can be observed in a test.
+class ViewerIdleHarness : public QObject
+{
+public:
+    ViewerIdleHarness( const viewer_idle::Surfaces &surfaces, int idleMs )
+        : m_surfaces( surfaces ), m_idleMs( idleMs )
+    {
+        inputs.fullscreen = true;
+        inputs.windowActive = true;
+        m_clock.start();
+        m_timer.setSingleShot( true );
+        QObject::connect( &m_timer, &QTimer::timeout, this, [this]() { timeout(); } );
+    }
+
+    void enterFullscreen()
+    {
+        ++entries;
+        m_idle.setFullscreen( true, m_clock.elapsed() );
+        m_haveLast = false;
+        m_pointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+        hookInstalled = viewer_idle::win_hook::install();
+        if( !markHistory ) viewer_idle::win_hook::historyMark().unmark();
+#endif
+        m_timer.start( firstLookMs() );
+    }
+
+    void leaveFullscreen()
+    {
+        m_timer.stop();
+#ifdef Q_OS_WIN
+        viewer_idle::win_hook::remove();
+#endif
+        if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
+        m_idle.setFullscreen( false, m_clock.elapsed() );
+    }
+
+    bool hidden() const { return m_idle.hidden(); }
+
+    viewer_idle::Inputs inputs;
+    // Emulates a wait that excludes user input (SyncDownloadWaiter-style): input events are not noted.
+    bool inputExcluded = false;
+    // r2: false reproduces the r1 tick, which did not read the thread mouse hook's witness (RED control).
+    bool readRetrievalWitness = true;
+    bool hookInstalled = false;
+    // r3: the tick off Windows, where the position sample is the only witness (no hook, no queue status).
+    bool positionSampleOnly = false;
+    // r3: MainWindow passes viewer_idle::kPointerPollMs(); 0 keeps the uncapped tick (the pass-4 control).
+    int pollMs = 0;
+    // r6 (key B1, pass 8 A1): install() and every MainWindow tick mark the system move history; false marks
+    // nothing (install's mark is undone), which is the r5 tick (RED control).
+    bool markHistory = true;
+    // r7 (key B1): true is the b03e08c5 tick, whose queue fallback counts any queued mouse input (RED control).
+    bool queueStatusTick = false;
+    // r7: how many ticks returned Show (a control that re-hides one idle period later is still seen).
+    int shows = 0;
+    // r11 (merge_group eviction of ca1c1b53): a tick's Show lasts one idle period, since the next tick hides again
+    // with nothing moving. At 40 ms that is shorter than QTRY's 50 ms poll step, so a QTRY on the cursor shape can
+    // miss the whole shown state. The Show tick records here what both surfaces and the controller were right after
+    // it restored them; a test waits on shows and reads these, which no poll step can miss.
+    Qt::CursorShape shownViewportShape = Qt::BlankCursor;
+    Qt::CursorShape shownGlShape = Qt::BlankCursor;
+    bool shownHidden = true;
+    // r7 (adversary pass 11 A1): MainWindow's isFullScreen() at a tick (false: the window manager restored it).
+    bool windowReallyFullscreen = true;
+    bool timerActive() const { return m_timer.isActive(); }
+    // r8 (adversary pass 11 A1): false is the 5426572e tick, which never asks the window's real state (RED control).
+    bool windowStateTick = true;
+    // r8: how many ticks ran (a RED control proves "still polling" by tick count, not by wall time).
+    int ticks = 0;
+    // r10 (sol r9 B1): the Fullscreen action's check, and how many times the idle machinery was started.
+    bool actionChecked = true;
+    int entries = 0;
+
+    // r10 (sol r9 B1): as MainWindow::changeEvent on QEvent::WindowStateChange (native exit, native re-entry,
+    // restore from minimize), with the window's real state in windowReallyFullscreen.
+    void windowStateChanged()
+    {
+        switch( m_idle.onWindowState( actionChecked, windowReallyFullscreen, m_clock.elapsed(), m_idleMs ) )
+        {
+        case viewer_idle::Lifecycle::Start:
+            enterFullscreen();
+            m_idle.onWindowState( actionChecked, windowReallyFullscreen, m_clock.elapsed(), m_idleMs );
+            break;
+        case viewer_idle::Lifecycle::Stop: leaveFullscreen(); break;
+        case viewer_idle::Lifecycle::None: break;
+        }
+    }
+
+protected:
+    bool eventFilter( QObject *watched, QEvent *event ) override
+    {
+        if( !inputExcluded ) note( event );
+        return QObject::eventFilter( watched, event );
+    }
+
+private:
+    // MainWindow starts the timer with kPointerPollMs(); with no cap the first look is one idle period.
+    int firstLookMs() const { return pollMs > 0 && pollMs < m_idleMs ? pollMs : m_idleMs; }
+
+#ifdef Q_OS_WIN
+    // The event path saw the input. As MainWindow (r11, pass 15 A1): nothing pending and the history marked again.
+    // With markHistory false (the r5 RED control, which marks nothing) it is the r5 event path: the bare clear.
+    void noteDeliveredAsTheTick()
+    {
+        if( markHistory ) viewer_idle::win_hook::noteDelivered();
+        else viewer_idle::win_hook::witness().clear();
+    }
+#endif
+
+    void restoreNow()
+    {
+        if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
+        if( m_idle.fullscreen() )
+        {
+            m_pointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+            noteDeliveredAsTheTick();
+#endif
+            m_idle.noteActivity( m_clock.elapsed() );
+            if( !m_timer.isActive() ) m_timer.start( firstLookMs() );
+        }
+    }
+
+    void note( QEvent *event )
+    {
+        if( !m_idle.fullscreen() ) return;
+        if( viewer_idle::forcesRestore( event->type() ) )
+        {
+            restoreNow();
+            return;
+        }
+        if( viewer_idle::eventIsActivity( event, &m_lastGlobal, &m_haveLast ) )
+        {
+            m_pointer.seed( QCursor::pos() );
+#ifdef Q_OS_WIN
+            noteDeliveredAsTheTick();
+#endif
+            if( m_idle.noteActivity( m_clock.elapsed() ) ) m_hider.restore( m_surfaces );
+            if( !m_timer.isActive() ) m_timer.start( firstLookMs() );
+        }
+    }
+
+    void timeout()
+    {
+        ++ticks;
+        // As MainWindow (r7, adversary pass 11 A1): fullscreen left without the action leaves the idle machinery.
+        if( windowStateTick && m_idle.windowLeftFullscreen( windowReallyFullscreen, m_clock.elapsed(), m_idleMs ) )
+        {
+            leaveFullscreen();
+            return;
+        }
+        int ms = 0;
+        viewer_idle::Inputs in = inputs;
+        // As MainWindow::viewerIdleInputs (r8): the hide gate is the action's check AND isFullScreen().
+        in.fullscreen = inputs.fullscreen && windowReallyFullscreen;
+        // As MainWindow: a logical QPoint, so a sub-logical-pixel move is not seen here (r4 bound, PointerWatch).
+        in.pointerMoved = m_pointer.moved( QCursor::pos() );
+#ifdef Q_OS_WIN
+        if( positionSampleOnly ) {}
+        else if( readRetrievalWitness )
+        {
+            if( viewer_idle::win_hook::witness().take() ) in.pointerMoved = true;
+            if( queueStatusTick )
+            {
+                // The b03e08c5 tick (r7 RED control): any queued mouse input counts, then the mark.
+                if( HIWORD( viewer_idle::win_hook::queueStatusReader()( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;
+                viewer_idle::win_hook::markHistory();
+            }
+            else if( markHistory )
+            {
+                if( viewer_idle::win_hook::lookAtQueue() ) in.pointerMoved = true;   // as MainWindow (r7, key B1)
+            }
+            else if( HIWORD( GetQueueStatus( QS_MOUSE ) ) & QS_MOUSE ) in.pointerMoved = true;   // the r5 tick
+            in.witnessMissing = !viewer_idle::win_hook::installed();   // as MainWindow (r6, pass 9 A1)
+        }
+        else if( HIWORD( GetQueueStatus( QS_MOUSEMOVE ) ) & QS_MOUSEMOVE ) in.pointerMoved = true;   // the r1 tick
+#endif
+        switch( m_idle.onTimeout( in, m_clock.elapsed(), m_idleMs, &ms, pollMs ) )
+        {
+        case viewer_idle::Tick::Hide: m_hider.hide( m_surfaces ); m_timer.start( ms ); break;
+        case viewer_idle::Tick::Show:
+            m_hider.restore( m_surfaces );
+            shownViewportShape = m_surfaces.viewport ? m_surfaces.viewport->cursor().shape() : Qt::BlankCursor;
+            shownGlShape = m_surfaces.glWindow ? m_surfaces.glWindow->cursor().shape() : Qt::BlankCursor;
+            shownHidden = m_idle.hidden();
+            ++shows;
+            m_timer.start( ms );
+            break;
+        case viewer_idle::Tick::Rearm: m_timer.start( ms ); break;
+        case viewer_idle::Tick::None: break;
+        }
+    }
+
+    viewer_idle::Surfaces m_surfaces;
+    int m_idleMs;
+    viewer_idle::Controller m_idle;
+    viewer_idle::CursorHider m_hider;
+    QTimer m_timer;
+    QElapsedTimer m_clock;
+    QPointF m_lastGlobal;
+    bool m_haveLast = false;
+    viewer_idle::PointerWatch m_pointer;
+};
+
+// A plain mouse move with no button held. The (type, local, global, button, buttons, modifiers)
+// constructor exists in Qt 5 and Qt 6 alike.
+QMouseEvent viewerIdleMove( const QPoint &global )
+{
+    return QMouseEvent( QEvent::MouseMove, QPointF( 5, 5 ), QPointF( global ),
+                        Qt::NoButton, Qt::NoButton, Qt::NoModifier );
+}
+} // namespace
+
+// G1
+void GuiSmokeTest::viewerCursorAutohide_hideBlanksBothSurfacesAndRestoreGivesBackTheToolCursor()
+{
+    QWidget viewport;
+    viewport.setCursor( Qt::OpenHandCursor );
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+    viewer_idle::CursorHider hider;
+
+    hider.hide( surfaces );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    hider.restore( surfaces );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+
+    // Null surfaces are skipped.
+    hider.hide( viewer_idle::Surfaces() );
+    hider.restore( viewer_idle::Surfaces() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+}
+
+// G2
+void GuiSmokeTest::viewerCursorAutohide_restoreLeavesAnUnsetViewportCursorUnset()
+{
+    // A child widget, like the QGraphicsView viewport: QWidget::unsetCursor() clears WA_SetCursor only
+    // on a non-window widget.
+    QWidget view;
+    QWidget viewport( &view );
+    QVERIFY( !viewport.testAttribute( Qt::WA_SetCursor ) );
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    viewer_idle::CursorHider hider;
+
+    hider.hide( surfaces );
+    QVERIFY( viewport.testAttribute( Qt::WA_SetCursor ) );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    hider.restore( surfaces );
+    QVERIFY( !viewport.testAttribute( Qt::WA_SetCursor ) );
+}
+
+// G3: a viewer tool armed while hidden has set its own cursor; restore must not overwrite it.
+void GuiSmokeTest::viewerCursorAutohide_restoreKeepsACursorSetWhileHidden()
+{
+    QWidget viewport;
+    viewport.setCursor( Qt::OpenHandCursor );
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+    viewer_idle::CursorHider hider;
+
+    hider.hide( surfaces );
+    viewport.setCursor( Qt::CrossCursor );
+    gl.setCursor( Qt::CrossCursor );
+    hider.restore( surfaces );
+    QCOMPARE( viewport.cursor().shape(), Qt::CrossCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::CrossCursor );
+}
+
+// G4: the live single-shot timer hides; a real move restores at once; a same-position move does
+// not; a modal blocking the window restores.
+void GuiSmokeTest::viewerCursorAutohide_idleTimerHidesAndRealMovementOrBlockingRestores()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto removeFilter = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+
+    harness.enterFullscreen();
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+
+    QMouseEvent moveA = viewerIdleMove( QPoint( 100, 100 ) );
+    QCoreApplication::sendEvent( &viewport, &moveA );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+    QVERIFY( !harness.hidden() );
+
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QMouseEvent sameA = viewerIdleMove( QPoint( 100, 100 ) );
+    QCoreApplication::sendEvent( &viewport, &sameA );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+
+    QEvent blocked( QEvent::WindowBlocked );
+    QCoreApplication::sendEvent( &viewport, &blocked );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( !harness.hidden() );
+
+    // While a gate fails (a tool armed) the timer only rearms: the cursor stays shown.
+    harness.inputs.toolArmed = true;
+    QTest::qWait( 200 );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    harness.inputs.toolArmed = false;
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    harness.leaveFullscreen();
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+}
+
+// G5 (adversary A1): at a fractional device-pixel ratio one physical pixel is a sub-logical-pixel
+// global move; it is real movement and must restore the cursor.
+void GuiSmokeTest::viewerCursorAutohide_subPixelMoveRestores()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto removeFilter = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+    harness.enterFullscreen();
+
+    QMouseEvent first( QEvent::MouseMove, QPointF( 5, 5 ), QPointF( 100.0, 100.0 ),
+                       Qt::NoButton, Qt::NoButton, Qt::NoModifier );
+    QCoreApplication::sendEvent( &viewport, &first );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    QMouseEvent onePhysicalPixel( QEvent::MouseMove, QPointF( 5.333333, 5 ), QPointF( 100.0 + 1.0 / 3.0, 100.0 ),
+                                  Qt::NoButton, Qt::NoButton, Qt::NoModifier );
+    QCoreApplication::sendEvent( &viewport, &onePhysicalPixel );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( !harness.hidden() );
+    harness.leaveFullscreen();
+}
+
+// G6 (adversary A2): while a wait excludes user input, timers still run but mouse events are not
+// delivered. The OS pointer moving must still keep the cursor shown / bring it back.
+void GuiSmokeTest::viewerCursorAutohide_pointerMovedWhileInputExcludedRestores()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+
+    // Positions inside the primary screen, so a native platform does not clip both to the same edge point.
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QVERIFY( screen != nullptr );
+    const QPoint start = screen->geometry().center();
+    QCursor::setPos( start );
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto removeFilter = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+    harness.enterFullscreen();
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    harness.inputExcluded = true;
+    const int showsBefore = harness.shows;
+    QCursor::setPos( start + QPoint( 10, 0 ) );
+    // r11: one sampled move is one Show tick, shown for one idle period (40 ms) only: wait on the tick, not the shape.
+    QTRY_VERIFY_WITH_TIMEOUT( harness.shows > showsBefore, 1000 );
+    QCOMPARE( harness.shownViewportShape, Qt::OpenHandCursor );
+    QVERIFY( !harness.shownHidden );
+    harness.inputExcluded = false;
+    harness.leaveFullscreen();
+}
+
+#ifdef Q_OS_WIN
+// G7 (r2, adversary r1 pass 3 A1): in an input-excluded wait Qt's dispatcher takes WM_MOUSEMOVE off the Win32
+// queue into its own deferred queue. A move away and back between two ticks then leaves the sampled position
+// unchanged and the queue empty, and no Qt event arrives. The thread mouse hook sees both moves as they are
+// taken; the tick reads it and both surfaces (viewport and GL window) get their cursor back within one idle
+// period. Control: the r1 tick (sample + queue status only) keeps both hidden for many idle periods.
+// Windows-only: the witness is a Win32 thread WH_MOUSE hook (r3 hub ruling: compiled on Windows, no skip branch).
+void GuiSmokeTest::viewerCursorAutohide_deferredAwayAndBackMoveRestoresOnBothSurfaces()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QVERIFY( screen != nullptr );
+    const QPoint start = screen->geometry().center();
+    QCursor::setPos( start );
+    ViewerIdleHarness harness( surfaces, 40 );
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+    } );
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );   // a real WH_MOUSE hook for this (GUI) thread
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    // The wait begins; the pointer goes away and back. These are the two moves the system hands the hook
+    // while Qt's dispatcher removes them (PM_REMOVE) and defers them. The sampled position never changes.
+    harness.inputExcluded = true;
+    harness.readRetrievalWitness = false;
+    viewer_idle::win_hook::witness().seed( QPoint( 500, 500 ) );
+    MOUSEHOOKSTRUCT away = {};
+    away.pt.x = 510;
+    away.pt.y = 500;
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = 500;
+    back.pt.y = 500;
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &away ) );
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+    QCOMPARE( QCursor::pos(), start );
+
+    // r11: the control and the row are judged by the Show tick itself (harness.shows and what it recorded), never
+    // by sampling the cursor shape: a Show lasts one idle period (40 ms), shorter than QTRY's 50 ms poll step, and
+    // merge_group run 44634859056 missed it that way (1 in 50 locally).
+    const int showsBeforeR1 = harness.shows;
+    QTest::qWait( 300 );   // about seven idle periods of the r1 tick
+    QCOMPARE( harness.shows, showsBeforeR1 );   // no Show tick at all, not only none sampled
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+
+    harness.readRetrievalWitness = true;   // the r2 tick
+    QTRY_VERIFY_WITH_TIMEOUT( harness.shows > showsBeforeR1, 1000 );
+    QCOMPARE( harness.shownViewportShape, Qt::OpenHandCursor );
+    QVERIFY( harness.shownGlShape != Qt::BlankCursor );
+    QVERIFY( !harness.shownHidden );
+
+    // A synthesized move to the last position (Qt discards those too) does not bring it back again: the system
+    // move history shows no point elsewhere since the hide (r6), so it stays a same-position move.
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    const int showsBeforeSame = harness.shows;
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+    QTest::qWait( 200 );
+    QCOMPARE( harness.shows, showsBeforeSame );   // no Show tick at all, not only none sampled
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    harness.inputExcluded = false;
+    harness.leaveFullscreen();
+    QVERIFY( !viewer_idle::win_hook::installed() );
+}
+
+namespace
+{
+// r6 (key B1): a scripted system move history, newest first, so a test controls what GetMouseMovePointsEx says.
+viewer_idle::HistoryPoint g_viewerIdleScript[viewer_idle::MoveHistoryMark::kMaxPoints];
+int g_viewerIdleScriptCount = 0;
+int viewerIdleScriptedHistory( const QPoint &, viewer_idle::HistoryPoint *out, int max )
+{
+    if( g_viewerIdleScriptCount <= 0 ) return -1;
+    const int n = qMin( max, g_viewerIdleScriptCount );
+    for( int i = 0; i < n; ++i ) out[i] = g_viewerIdleScript[i];
+    return n;
+}
+void viewerIdleSetScript( std::initializer_list<viewer_idle::HistoryPoint> points )
+{
+    g_viewerIdleScriptCount = 0;
+    for( const viewer_idle::HistoryPoint &p : points ) g_viewerIdleScript[g_viewerIdleScriptCount++] = p;
+}
+// r12 (adversary pass 18 A1): a scripted system last-input time (GetLastInputInfo).
+quint32 g_viewerIdleLastInput = 0;
+bool viewerIdleScriptedLastInput( quint32 *tick )
+{
+    *tick = g_viewerIdleLastInput;
+    return true;
+}
+viewer_idle::HistoryPoint viewerIdlePoint( int x, int y, quint32 time )
+{
+    viewer_idle::HistoryPoint p;
+    p.x = x;
+    p.y = y;
+    p.time = time;
+    return p;
+}
+} // namespace
+
+// G10 (r6, key B1, the sol catalogue row): hidden fullscreen; the pointer goes away and back before the GUI thread
+// takes its queue, and Windows coalesces that into ONE WM_MOUSEMOVE at the starting pixel. It reaches the hook proc
+// and, as a same-position QMouseEvent, the event path. Expected: the cursor comes back on both viewer surfaces.
+// The witness is the system move history, marked on entering fullscreen and at every tick (scripted here: the
+// test must not move the real pointer). Control: the r5 tick, which marks nothing, keeps both hidden.
+void GuiSmokeTest::viewerCursorAutohide_coalescedAwayAndBackRestoresOnBothSurfaces()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, saved]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = saved;
+    } );
+    const QPoint start( 500, 500 );
+    const QPoint away( 510, 500 );
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = start.x();
+    back.pt.y = start.y();
+
+    for( const bool markOnHide : { false, true } )
+    {
+        harness.markHistory = markOnHide;
+        viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 990 ) } );
+        harness.enterFullscreen();
+        QVERIFY( harness.hookInstalled );
+        // The pointer rests at start: the event path and the hook both last saw it there.
+        QMouseEvent rest = viewerIdleMove( start );
+        QCoreApplication::sendEvent( &viewport, &rest );
+        QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+        QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+        viewer_idle::win_hook::witness().seed( start );
+
+        // Away and back, coalesced: the history has the excursion, the one message is at start.
+        viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1200 ), viewerIdlePoint( away.x(), away.y(), 1100 ),
+                               viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 990 ) } );
+        viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+        QMouseEvent same = viewerIdleMove( start );
+        QCoreApplication::sendEvent( &viewport, &same );
+
+        // r11: judged by the Show tick (shown for one idle period, 40 ms, only), never by sampling the shape.
+        const int showsBefore = harness.shows;
+        if( !markOnHide )
+        {
+            QTest::qWait( 300 );   // many poll periods of the r5 tick
+            QCOMPARE( harness.shows, showsBefore );   // no Show tick at all, not only none sampled
+            QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+            QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+            QVERIFY( harness.hidden() );
+        }
+        else
+        {
+            QTRY_VERIFY_WITH_TIMEOUT( harness.shows > showsBefore, 1000 );
+            QCOMPARE( harness.shownViewportShape, Qt::OpenHandCursor );
+            QVERIFY( harness.shownGlShape != Qt::BlankCursor );
+            QVERIFY( !harness.shownHidden );
+        }
+        harness.leaveFullscreen();
+        QVERIFY( !viewer_idle::win_hook::installed() );
+    }
+}
+
+// G11 (r6, key B1): the app's own hide does not bring the cursor straight back. Hiding sets the cursor and can make
+// Windows synthesize a move at the unchanged position; the history then has no point elsewhere (at most one more at
+// the same pixel), so the cursor stays hidden. Scripted, and then with the real system history and the real hook.
+void GuiSmokeTest::viewerCursorAutohide_ownHideSameSpotMoveDoesNotReshow()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, saved]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = saved;
+    } );
+    const QPoint start( 500, 500 );
+    MOUSEHOOKSTRUCT same = {};
+    same.pt.x = start.x();
+    same.pt.y = start.y();
+
+    viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 1000 ) } );
+    harness.enterFullscreen();
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    viewer_idle::win_hook::witness().seed( start );
+    QVERIFY( viewer_idle::win_hook::historyMark().marked() );
+    // r11: no Show tick at all, not only none sampled (a Show lasts one idle period, 40 ms).
+    const int showsBefore = harness.shows;
+    // The provoked move, with and without a new point at the same pixel.
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &same ) );
+    viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1016 ), viewerIdlePoint( start.x(), start.y(), 1000 ),
+                           viewerIdlePoint( 490, 500, 1000 ) } );
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &same ) );
+    QTest::qWait( 300 );
+    QCOMPARE( harness.shows, showsBefore );
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+    QVERIFY( viewer_idle::win_hook::historyMark().marked() );
+    harness.leaveFullscreen();
+
+    // The real history and hook: the hide's own cursor change does not re-show it.
+    viewer_idle::win_hook::historyReader() = saved;
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    const int showsBeforeReal = harness.shows;
+    QTest::qWait( 300 );
+    QCOMPARE( harness.shows, showsBeforeReal );   // r11: no Show tick at all, not only none sampled
+    QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QVERIFY( harness.hidden() );
+    harness.leaveFullscreen();
+}
+
+// G11b (r12, sol r11 B1): sol's periodic full history. P=(500,500,1000), Q=(510,500,1000), H=[P,Q] x 32 newest first;
+// one more Q,P excursion leaves the identical list and ONE coalesced WM_MOUSEMOVE at P. Liveness first: with H in the
+// history and no message the cursor hides and no Show tick follows. Then the excursion: a Show tick that restores both
+// viewer surfaces (106a1819 judged the identical list as no movement and stayed hidden).
+void GuiSmokeTest::viewerCursorAutohide_periodicFullHistoryExcursionRestoresAndQuietStaysHidden()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    // r12 (adversary pass 18 A1): a scripted last-input time, so the test controls whether input came after the mark.
+    viewer_idle::win_hook::LastInputReader savedInput = viewer_idle::win_hook::lastInputReader();
+    viewer_idle::win_hook::lastInputReader() = viewerIdleScriptedLastInput;
+    g_viewerIdleLastInput = 5000;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.markHistory = true;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, saved, savedInput]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = saved;
+        viewer_idle::win_hook::lastInputReader() = savedInput;
+    } );
+    const QPoint start( 500, 500 );
+    MOUSEHOOKSTRUCT back = {};
+    back.pt.x = start.x();
+    back.pt.y = start.y();
+    for( int i = 0; i < viewer_idle::MoveHistoryMark::kMaxPoints; ++i )
+        g_viewerIdleScript[i] = ( i % 2 ) == 0 ? viewerIdlePoint( 500, 500, 1000 ) : viewerIdlePoint( 510, 500, 1000 );
+    g_viewerIdleScriptCount = viewer_idle::MoveHistoryMark::kMaxPoints;
+
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QMouseEvent rest = viewerIdleMove( start );
+    QCoreApplication::sendEvent( &viewport, &rest );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    viewer_idle::win_hook::witness().seed( start );
+
+    // Liveness: H stays, no message: no Show tick at all over many poll periods. Then the move Windows synthesizes
+    // after the app's own hide (adversary pass 18 A1: no input, the last-input time stays): still no Show tick.
+    const int showsQuiet = harness.shows;
+    QTest::qWait( 300 );
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+    QTest::qWait( 300 );
+    QCOMPARE( harness.shows, showsQuiet );
+    QVERIFY( harness.hidden() );
+
+    // The excursion: identical list, one coalesced move at start, and it was input (the last-input time moved).
+    const int showsBefore = harness.shows;
+    ++g_viewerIdleLastInput;
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
+    QTRY_VERIFY_WITH_TIMEOUT( harness.shows > showsBefore, 1000 );
+    QCOMPARE( harness.shownViewportShape, Qt::OpenHandCursor );
+    QVERIFY( harness.shownGlShape != Qt::BlankCursor );
+    QVERIFY( !harness.shownHidden );
+    harness.leaveFullscreen();
+    QVERIFY( !viewer_idle::win_hook::installed() );
+}
+
+namespace
+{
+// r7 (key B1): a scripted cursor position and queue status, so a test controls what GetCursorPos and
+// GetQueueStatus say without moving the real pointer or queuing real input.
+QPoint g_viewerIdleCursor( 500, 500 );
+DWORD g_viewerIdleQueueStatus = 0;
+// The control's pointer keeps moving (one pixel per read), so its shown state lasts instead of re-hiding one idle
+// period after the show.
+bool g_viewerIdleCursorWalks = false;
+bool viewerIdleScriptedCursor( QPoint *at )
+{
+    if( g_viewerIdleCursorWalks ) g_viewerIdleCursor.rx() += 1;
+    *at = g_viewerIdleCursor;
+    return true;
+}
+DWORD viewerIdleScriptedQueueStatus( UINT flags )
+{
+    return g_viewerIdleQueueStatus & ( ( DWORD( flags ) << 16 ) | flags );
+}
+} // namespace
+
+// G12 (r7, key B1, the sol r6 catalogue row): hidden fullscreen, the pointer stationary at (500,500) with an unchanged
+// move history and an empty witness. A nonactivating window shown under the cursor makes Windows synthesize a move at
+// (500,500); it is still queued at the tick (GetQueueStatus(QS_MOUSE) = 0x00020002). Expected: both viewer surfaces
+// stay hidden. RED control: the b03e08c5 tick (any queued mouse input counts) shows both. Control: a queued move with
+// the cursor at another point (510,500) shows both.
+void GuiSmokeTest::viewerCursorAutohide_queuedSynthesizedSamePositionMoveStaysHidden()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    viewer_idle::win_hook::HistoryReader savedHistory = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::CursorReader savedCursor = viewer_idle::win_hook::cursorReader();
+    viewer_idle::win_hook::QueueStatusReader savedQueue = viewer_idle::win_hook::queueStatusReader();
+    viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    viewer_idle::win_hook::cursorReader() = viewerIdleScriptedCursor;
+    viewer_idle::win_hook::queueStatusReader() = viewerIdleScriptedQueueStatus;
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.inputExcluded = true;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness, savedHistory, savedCursor, savedQueue]() {
+        qApp->removeEventFilter( &harness );
+        viewer_idle::win_hook::remove();
+        viewer_idle::win_hook::historyReader() = savedHistory;
+        viewer_idle::win_hook::cursorReader() = savedCursor;
+        viewer_idle::win_hook::queueStatusReader() = savedQueue;
+        g_viewerIdleQueueStatus = 0;
+        g_viewerIdleCursorWalks = false;
+        g_viewerIdleCursor = QPoint( 500, 500 );
+    } );
+    const QPoint start( 500, 500 );
+
+    // 0: the b03e08c5 tick (RED control); 1: the r7 tick (the row); 2: the r7 tick, cursor elsewhere (control).
+    for( int run = 0; run < 3; ++run )
+    {
+        harness.queueStatusTick = run == 0;
+        g_viewerIdleQueueStatus = 0;
+        g_viewerIdleCursor = start;
+        viewerIdleSetScript( { viewerIdlePoint( start.x(), start.y(), 1000 ), viewerIdlePoint( 490, 500, 990 ) } );
+        harness.enterFullscreen();
+        QVERIFY( harness.hookInstalled );
+        QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+        QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+        viewer_idle::win_hook::witness().seed( start );
+
+        // The synthesized move is queued (QS_MOUSEMOVE in the high and low words); the history is unchanged.
+        if( run == 2 )
+        {
+            g_viewerIdleCursor = QPoint( 510, 500 );
+            g_viewerIdleCursorWalks = true;
+            viewerIdleSetScript( { viewerIdlePoint( 510, 500, 1200 ), viewerIdlePoint( start.x(), start.y(), 1000 ),
+                                   viewerIdlePoint( 490, 500, 990 ) } );
+        }
+        const int showsBefore = harness.shows;
+        g_viewerIdleQueueStatus = 0x00020002;
+        if( run == 1 )
+        {
+            QTest::qWait( 300 );   // many poll periods with the move still queued
+            QCOMPARE( harness.shows, showsBefore );   // r11: no Show tick at all, not only none sampled
+            QCOMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+            QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+            QVERIFY( harness.hidden() );
+        }
+        else
+        {
+            QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::OpenHandCursor, 1000 );
+            QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+            QVERIFY( !harness.hidden() );
+            QVERIFY( harness.shows > 0 );
+        }
+        g_viewerIdleQueueStatus = 0;
+        g_viewerIdleCursorWalks = false;
+        harness.leaveFullscreen();
+        QVERIFY( !viewer_idle::win_hook::installed() );
+    }
+}
+
+// G13 (r7, adversary pass 11 A1): enter fullscreen, hidden after one idle period; then the window manager restores
+// the window without the action (isFullScreen() false, the action still checked) and the pointer stays still.
+// Expected: both surfaces are shown, the hook is removed and the idle timer stops. And a window not yet seen
+// fullscreen (showFullScreen() pending) is given one idle period before the same exit.
+void GuiSmokeTest::viewerCursorAutohide_fullscreenLeftWithoutTheActionStopsTheIdleMachinery()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.inputExcluded = true;
+    auto cleanup = qScopeGuard( [&harness]() { harness.leaveFullscreen(); } );
+
+    // r8 RED control: the 5426572e tick (no window-state check) on the same input keeps polling with the hook
+    // installed. Proven by tick count: ten more ticks after the restore, and the timer and hook are still live.
+    harness.windowStateTick = false;
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    harness.windowReallyFullscreen = false;
+    const int redTicksAtRestore = harness.ticks;
+    QTRY_VERIFY_WITH_TIMEOUT( harness.ticks >= redTicksAtRestore + 10, 5000 );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );   // the isFullScreen() gate shows it (not stranded)
+    QVERIFY( harness.timerActive() );
+    QVERIFY( viewer_idle::win_hook::installed() );
+    harness.leaveFullscreen();
+    QVERIFY( !viewer_idle::win_hook::installed() );
+    harness.windowStateTick = true;
+    harness.windowReallyFullscreen = true;
+
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    harness.windowReallyFullscreen = false;
+    QTRY_VERIFY_WITH_TIMEOUT( !viewer_idle::win_hook::installed(), 1000 );
+    QVERIFY( !harness.timerActive() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    QVERIFY( gl.cursor().shape() != Qt::BlankCursor );
+    QVERIFY( !harness.hidden() );
+
+    // Never seen fullscreen: polled for one idle period, then the same exit; it never hides meanwhile.
+    harness.enterFullscreen();
+    QVERIFY( harness.hookInstalled );
+    QTRY_VERIFY_WITH_TIMEOUT( !viewer_idle::win_hook::installed(), 1000 );
+    QVERIFY( !harness.timerActive() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+    harness.windowReallyFullscreen = true;
+}
+
+// G14 (r10, sol r9 B1 / carried A1-pass12): sol's row, scaled to a 40 ms idle period: entered through the action,
+// hidden after one idle period; the window manager restores the window (native exit, the action stays checked) and
+// a tick follows; then the window is made fullscreen again natively, the action still checked, and the pointer stays
+// still. Expected: re-entry restarts the idle machinery (hook, timer) and the cursor hides again one idle period
+// later. The same holds for a second exit and re-entry (restore from minimize). A duplicate state change while
+// fullscreen starts nothing; a window made fullscreen with the action unchecked starts nothing.
+void GuiSmokeTest::viewerCursorAutohide_nativeFullscreenReentryRestartsTheIdleMachinery()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    ViewerIdleHarness harness( surfaces, 40 );
+    harness.pollMs = 10;
+    harness.inputExcluded = true;
+    auto cleanup = qScopeGuard( [&harness]() { harness.leaveFullscreen(); } );
+
+    harness.enterFullscreen();   // the action's toggled(true)
+    QVERIFY( harness.hookInstalled );
+    QTRY_COMPARE( viewport.cursor().shape(), Qt::BlankCursor );
+
+    for( int cycle = 0; cycle < 2; ++cycle )
+    {
+        // Native exit, the action still checked: the state change and the next tick leave the idle machinery.
+        harness.windowReallyFullscreen = false;
+        harness.windowStateChanged();
+        QTRY_VERIFY_WITH_TIMEOUT( !viewer_idle::win_hook::installed(), 1000 );
+        QVERIFY( !harness.timerActive() );
+        QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+
+        // Native re-entry, the action still checked, the pointer still: hidden again after one idle period.
+        const int entriesBefore = harness.entries;
+        harness.windowReallyFullscreen = true;
+        harness.windowStateChanged();
+        QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::BlankCursor, 2000 );
+        QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+        QCOMPARE( harness.entries, entriesBefore + 1 );
+        QVERIFY( viewer_idle::win_hook::installed() );
+        QVERIFY( harness.timerActive() );
+
+        // A duplicate state change while really fullscreen starts nothing and leaves it hidden.
+        harness.windowStateChanged();
+        QCOMPARE( harness.entries, entriesBefore + 1 );
+        QVERIFY( harness.hidden() );
+    }
+
+    // The action unchecked (its own toggled(false) already left): a window made fullscreen starts nothing.
+    harness.leaveFullscreen();
+    harness.actionChecked = false;
+    harness.windowReallyFullscreen = false;
+    harness.windowStateChanged();
+    harness.windowReallyFullscreen = true;
+    const int entriesUnchecked = harness.entries;
+    harness.windowStateChanged();
+    QCOMPARE( harness.entries, entriesUnchecked );
+    QVERIFY( !harness.timerActive() );
+    QVERIFY( !viewer_idle::win_hook::installed() );
+    QCOMPARE( viewport.cursor().shape(), Qt::OpenHandCursor );
+}
+#endif
+
+// G8 (Dot 0d82fed): a viewer surface replaced while the cursor is hidden. MainWindow::viewerIdleSurfaces() reads
+// both surfaces fresh at every hide/restore; the viewport is replaced by QGraphicsView::setViewport (as
+// GpuDisplayViewport does, which deletes the old one) and the GL window comes and goes. Restore must touch only
+// the live surfaces, never a deleted one, and leave a new surface's own cursor state alone; the next hide
+// blanks the new surfaces, and the restore after it gives the viewport back exactly what it had and unsets the
+// GL window's cursor (CursorHider does not save a GL cursor: production never sets one on GpuDisplayWindow;
+// r3 pass 5 advisory A2 pins that here rather than claim more).
+void GuiSmokeTest::viewerCursorAutohide_surfaceReplacedWhileHiddenTouchesOnlyTheLiveSurfaces()
+{
+    QGraphicsView view;
+    view.viewport()->setCursor( Qt::OpenHandCursor );
+    QPointer<QWidget> oldViewport = view.viewport();
+    auto gl1 = std::make_unique<QWindow>();
+    viewer_idle::Surfaces before;
+    before.viewport = view.viewport();
+    before.glWindow = gl1.get();
+    viewer_idle::CursorHider hider;
+    hider.hide( before );
+    QCOMPARE( view.viewport()->cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl1->cursor().shape(), Qt::BlankCursor );
+
+    // Replaced while hidden.
+    QWidget *fresh = new QWidget;
+    view.setViewport( fresh );
+    QVERIFY( oldViewport.isNull() );   // QAbstractScrollArea deleted the hidden viewport
+    gl1.reset();
+    QWindow gl2;
+    gl2.setCursor( Qt::CrossCursor );   // the new GL window carries its own cursor
+    viewer_idle::Surfaces after;
+    after.viewport = view.viewport();
+    after.glWindow = &gl2;
+    QCOMPARE( after.viewport, fresh );
+    const bool freshHadOwn = fresh->testAttribute( Qt::WA_SetCursor );
+    const Qt::CursorShape freshShape = fresh->cursor().shape();
+    QVERIFY( freshShape != Qt::BlankCursor );
+
+    hider.restore( after );
+    QCOMPARE( fresh->testAttribute( Qt::WA_SetCursor ), freshHadOwn );
+    QCOMPARE( fresh->cursor().shape(), freshShape );
+    QCOMPARE( gl2.cursor().shape(), Qt::CrossCursor );
+
+    hider.hide( after );
+    QCOMPARE( fresh->cursor().shape(), Qt::BlankCursor );
+    QCOMPARE( gl2.cursor().shape(), Qt::BlankCursor );
+    hider.restore( after );
+    QCOMPARE( fresh->testAttribute( Qt::WA_SetCursor ), freshHadOwn );
+    QCOMPARE( fresh->cursor().shape(), freshShape );
+    QCOMPARE( gl2.cursor().shape(), Qt::ArrowCursor );   // unset: the default, not the CrossCursor it had
+}
+
+// G9 (r3, adversary r1 pass 4 A1): off Windows the position sample is the only witness in an input-excluded
+// wait. With the poll cap the live timer samples every poll period, so a move away and back that is over long
+// before one idle period ends, but spans at least one sample (80 ms away, 10 ms poll), still brings the cursor
+// back on both surfaces; the cap does not stop the next hide. An excursion between two samples is the
+// documented bound (P9), not exercised here.
+// The harness's positionSampleOnly tick is the off-Windows tick (no hook, no queue status), so this runs here.
+void GuiSmokeTest::viewerCursorAutohide_positionSampleAtThePollCapSeesABriefAwayAndBack()
+{
+    QWidget viewport;
+    viewport.resize( 64, 48 );
+    viewport.setCursor( Qt::OpenHandCursor );
+    viewport.show();
+    QWindow gl;
+    viewer_idle::Surfaces surfaces;
+    surfaces.viewport = &viewport;
+    surfaces.glWindow = &gl;
+
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QVERIFY( screen != nullptr );
+    const QPoint start = screen->geometry().center();
+    QCursor::setPos( start );
+    ViewerIdleHarness harness( surfaces, 300 );
+    harness.positionSampleOnly = true;
+    harness.pollMs = 10;
+    qApp->installEventFilter( &harness );
+    auto cleanup = qScopeGuard( [&harness]() { qApp->removeEventFilter( &harness ); } );
+    harness.enterFullscreen();
+    QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::BlankCursor, 2000 );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+
+    harness.inputExcluded = true;
+    const int showsBefore = harness.shows;
+    QCursor::setPos( start + QPoint( 10, 0 ) );
+    QTest::qWait( 80 );   // away for well under one idle period (300 ms), several poll periods (10 ms)
+    QCursor::setPos( start );
+    // r11: judged by the Show tick, not by sampling the shape (the shown state lasts one idle period only).
+    QTRY_VERIFY_WITH_TIMEOUT( harness.shows > showsBefore, 1000 );
+    QCOMPARE( harness.shownViewportShape, Qt::OpenHandCursor );
+    QVERIFY( harness.shownGlShape != Qt::BlankCursor );
+    QVERIFY( !harness.shownHidden );
+
+    // Still and excluded: it hides again after the idle period.
+    QTRY_COMPARE_WITH_TIMEOUT( viewport.cursor().shape(), Qt::BlankCursor, 2000 );
+    QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
+    harness.inputExcluded = false;
+    harness.leaveFullscreen();
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()
@@ -3465,6 +5500,780 @@ void GuiSmokeTest::scopesLabelDispatchesRawVectorScopeExactly()
     const QImage actual = render_scopes_label_output(raw, 16, 8, false, false, ScopesLabel::ScopeVectorScope);
     QVERIFY(!actual.isNull());
     assert_expected_hash(expected_hashes, QStringLiteral("scopeslabel.raw_vectorscope"), actual);
+}
+
+// PLAYER-GL-WINDOW-INPUT-PARITY-1: the GL display window's viewer-input forwarder, driven on a
+// plain QWindow (never shown) with hooks that record their calls.
+namespace
+{
+
+struct GlWindowInputRecorder
+{
+    int wbCalls = 0;
+    int bpCalls = 0;
+    QPoint lastPick;
+    int menuCalls = 0;
+    QPoint lastMenuGlobal;
+    int dragEnterCalls = 0;
+    int dropCalls = 0;
+    QStringList droppedPaths;
+    bool wbArmed = false;
+    bool bpArmed = false;
+};
+
+// Sees only the mouse-button events the forwarder did not consume (filters run newest first, so
+// this one, installed before the forwarder, runs after it). Other events (ChildAdded when the
+// forwarder is parented to the window) are not counted.
+class PassThroughSpy : public QObject
+{
+public:
+    int seen = 0;
+    bool eventFilter(QObject *, QEvent *event) override
+    {
+        if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease) ++seen;
+        return false;
+    }
+};
+
+gpu_window_input::Forwarder *installRecordingForwarder(QWindow *window, GlWindowInputRecorder *rec)
+{
+    gpu_window_input::Forwarder::Hooks hooks;
+    // A 1920x804 clip in fit mode with a scene of the same size: the slots' conversion is the identity.
+    hooks.pickBasis = []() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = QSizeF(1920, 804);
+        basis.rawWidth = 1920;
+        basis.rawHeight = 804;
+        return basis;
+    };
+    // As if paintGL last drew the scene-sized image letterboxed into the window.
+    hooks.drawnPicture = [window]() { return gpu_window_input::letterboxRect(QSizeF(window->size()), QSizeF(1920, 804)); };
+    hooks.wbArmed = [rec]() { return rec->wbArmed; };
+    hooks.bpArmed = [rec]() { return rec->bpArmed; };
+    hooks.pickWhiteBalance = [rec](int x, int y) { ++rec->wbCalls; rec->lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [rec](int x, int y) { ++rec->bpCalls; rec->lastPick = QPoint(x, y); };
+    hooks.contextMenuAtGlobal = [rec](const QPoint & global) { ++rec->menuCalls; rec->lastMenuGlobal = global; };
+    hooks.dragEnter = [rec](QDragEnterEvent * e) {
+        ++rec->dragEnterCalls;
+        if (e->mimeData()->hasUrls()) e->acceptProposedAction();
+    };
+    hooks.openFiles = [rec](const QStringList & paths) { ++rec->dropCalls; rec->droppedPaths = paths; };
+    auto *forwarder = new gpu_window_input::Forwarder(window, std::move(hooks));
+    window->installEventFilter(forwarder);
+    return forwarder;
+}
+
+void deliverMouse(QObject *receiver, QEvent::Type type, Qt::MouseButton button, const QPointF & local, const QPointF & global)
+{
+    QMouseEvent event(type, local, global, button, type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::MouseButtons(button), Qt::NoModifier);
+    QCoreApplication::sendEvent(receiver, &event);
+}
+
+} // namespace
+
+void GuiSmokeTest::glWindowViewerInput_picksMapToSceneAndRespectArming()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    QCOMPARE(window.size(), QSize(1920, 1080));
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    installRecordingForwarder(&window, &rec);
+
+    // White balance armed: the window centre is the scene centre (1920x804 letterboxed into 1920x1080).
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(rec.lastPick, QPoint(960, 402));
+    QCOMPARE(spy.seen, 0); // consumed: the filter returned true
+
+    // A press on the top black bar calls nothing (and is still consumed).
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 20), QPointF(960, 20));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(spy.seen, 0);
+
+    // Bad-pixel armed only: the bad-pixel hook instead.
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(0.5, 138.5), QPointF(0.5, 138.5));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(0, 0));
+    QCOMPARE(spy.seen, 0);
+
+    // Neither armed: nothing is called and the event passes through (the filter returned false).
+    rec.bpArmed = false;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(spy.seen, 1);
+}
+
+void GuiSmokeTest::glWindowViewerInput_contextMenuOnPlatformTriggerOnly()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    installRecordingForwarder(&window, &rec);
+    rec.wbArmed = true; // the menu does not depend on arming
+
+    const bool onRelease = gpu_window_input::contextMenuOnReleaseDefault();
+    const QEvent::Type trigger = onRelease ? QEvent::MouseButtonRelease : QEvent::MouseButtonPress;
+    const QEvent::Type other = onRelease ? QEvent::MouseButtonPress : QEvent::MouseButtonRelease;
+
+    deliverMouse(&window, other, Qt::RightButton, QPointF(100, 200), QPointF(1234, 567));
+    QCOMPARE(rec.menuCalls, 0);
+    QCOMPARE(rec.wbCalls, 0);
+
+    deliverMouse(&window, trigger, Qt::RightButton, QPointF(100, 200), QPointF(1234, 567));
+    QCOMPARE(rec.menuCalls, 1);
+    QCOMPARE(rec.lastMenuGlobal, QPoint(1234, 567));
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(spy.seen, 1); // only the non-trigger event passed through
+}
+
+void GuiSmokeTest::glWindowViewerInput_dragAndDropReachTheHooks()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    installRecordingForwarder(&window, &rec);
+
+    QMimeData mime;
+    const QList<QUrl> urls = { QUrl::fromLocalFile(QStringLiteral("C:/drop-test/first.dat")),
+                               QUrl::fromLocalFile(QStringLiteral("C:/drop-test/second.dat")) };
+    mime.setUrls(urls);
+
+    QDragEnterEvent enter(QPoint(100, 100), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(&window, &enter);
+    QCOMPARE(rec.dragEnterCalls, 1);
+    QVERIFY(enter.isAccepted());
+
+    QDragMoveEvent move(QPoint(120, 110), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    move.ignore();
+    QCoreApplication::sendEvent(&window, &move);
+    QVERIFY(move.isAccepted());
+    QCOMPARE(rec.dragEnterCalls, 1);
+
+    // Every local path reaches the hook, in order (the scene's filesDropped list), and the drop
+    // is accepted; a non-file URL is skipped as the scene skips it.
+    QMimeData mixed;
+    mixed.setUrls({ urls.at(0), QUrl(QStringLiteral("https://example.invalid/x")), urls.at(1) });
+    QDropEvent drop(QPointF(120, 110), Qt::CopyAction, &mixed, Qt::LeftButton, Qt::NoModifier);
+    drop.ignore();
+    QCoreApplication::sendEvent(&window, &drop);
+    QCOMPARE(rec.dropCalls, 1);
+    QCOMPARE(rec.droppedPaths, QStringList({ urls.at(0).toLocalFile(), urls.at(1).toLocalFile() }));
+    QVERIFY(drop.isAccepted());
+}
+
+void GuiSmokeTest::glWindowViewerInput_otherObjectsAreIgnored()
+{
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    gpu_window_input::Forwarder *forwarder = installRecordingForwarder(&window, &rec);
+    rec.wbArmed = true;
+
+    QWindow otherWindow;
+    otherWindow.resize(1920, 1080);
+    otherWindow.installEventFilter(forwarder);
+    PassThroughSpy spy;
+    otherWindow.installEventFilter(&spy); // newest: runs first, so it sees every event
+    deliverMouse(&otherWindow, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 540), QPointF(960, 540));
+    QCOMPARE(spy.seen, 1);
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(rec.menuCalls, 0);
+    // The direct answer for a foreign watched object is false.
+    QMouseEvent press(QEvent::MouseButtonPress, QPointF(960, 540), QPointF(960, 540), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QVERIFY(!forwarder->eventFilter(&otherWindow, &press));
+    QCOMPARE(rec.wbCalls, 0);
+    otherWindow.removeEventFilter(forwarder);
+}
+
+void GuiSmokeTest::glWindowViewerInput_hiddenViewMapFromGlobalIsInverseOfMapToGlobal()
+{
+    // The context-menu hook passes ui->graphicsView->mapFromGlobal( global ) to a slot that maps
+    // it back with mapToGlobal while the view is hidden behind the GL window container.
+    QWidget parent;
+    parent.resize(800, 600);
+    parent.move(50, 70);
+    QWidget *child = new QWidget(&parent);
+    child->setGeometry(30, 40, 400, 300);
+    child->hide();
+    const QPoint global(1234, 567);
+    QCOMPARE(child->mapToGlobal(child->mapFromGlobal(global)), global);
+    parent.show();
+    QCOMPARE(child->mapToGlobal(child->mapFromGlobal(global)), global);
+    parent.hide();
+}
+
+void GuiSmokeTest::glWindowViewerInput_edgePicksStayInsideTheImage()
+{
+    // Adversary A2 (r1): the bottom and right picture edges map to scene y == height and
+    // x == width, one past the last pixel; the slots' "x > width" guard lets that through.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1920, 1080);
+    installRecordingForwarder(&window, &rec); // scene 1920x804, letterboxed to y 138..942
+    rec.bpArmed = true;
+    // The edge itself is one past the picture (half-open): no pick, so never row 804.
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 942), QPointF(960, 942));
+    QCOMPARE(rec.bpCalls, 0);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 941.9), QPointF(960, 941.9));
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(960, 803));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1920, 540), QPointF(1920, 540));
+    QCOMPARE(rec.bpCalls, 1);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1919.9, 540), QPointF(1919.9, 540));
+    QCOMPARE(rec.bpCalls, 2);
+    QCOMPARE(rec.lastPick, QPoint(1919, 402));
+    rec.bpArmed = false;
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(1919.9, 941.9), QPointF(1919.9, 941.9));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(1919, 803));
+    // Inside the bottom bar: nothing.
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(960, 944), QPointF(960, 944));
+    QCOMPARE(rec.wbCalls, 1);
+}
+
+void GuiSmokeTest::glWindowViewerInput_roundedSceneEdgeStillPicks()
+{
+    // Adversary A3 (r1): the fit-mode scene is an integer size (1000x418 for a 1920x804 clip in a
+    // 1000x1000 window), so its aspect differs from the display aspect paintGL letterboxes with by
+    // up to one scene pixel. paintGL's picture starts at y = 290.625; the scene-aspect rect at 291.
+    // A click on the displayed picture between the two must still pick (the top row).
+    // r2 (adversary r1 pass 3): only the rect paintGL drew decides; the scene's aspect does not.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1000, 1000);
+    QSizeF scene(1000, 418);
+    QSize raw(1000, 418); // the slots' conversion is the identity until the A3 part below
+    QRectF drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 804)); // texture route: from y 290.625
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.pickBasis = [&scene, &raw]() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = scene;
+        basis.rawWidth = raw.width();
+        basis.rawHeight = raw.height();
+        return basis;
+    };
+    hooks.drawnPicture = [&drawn]() { return drawn; };
+    hooks.wbArmed = [&rec]() { return rec.wbArmed; };
+    hooks.bpArmed = [&rec]() { return rec.bpArmed; };
+    hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [&rec](int x, int y) { ++rec.bpCalls; rec.lastPick = QPoint(x, y); };
+    window.installEventFilter(new gpu_window_input::Forwarder(&window, std::move(hooks)));
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
+    QCOMPARE(rec.wbCalls, 1);
+    QCOMPARE(rec.lastPick, QPoint(500, 0));
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.5), QPointF(500, 290.5));
+    QCOMPARE(rec.wbCalls, 1);
+    // A1: the image route drew the scene itself (from y 291): the same click is now on its bar.
+    drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), scene);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 290.75), QPointF(500, 290.75));
+    QCOMPARE(rec.wbCalls, 1);
+
+    // A3: a 1920x420 clip at stretchY 3 drawn as 1920x1260 (from y 171.875) with a 1000x654 scene;
+    // whatever the stretch controls say next, until paintGL draws again the drawn rect decides.
+    // The clip is 1920x420 in fit mode with a 1000x654 scene: the slots turn the handed integers into
+    // raw pixels with int( c * 1920 / 1000 ), int( c * 420 / 654 ); the raw pixel shown must come out.
+    scene = QSizeF(1000, 654);
+    raw = QSize(1920, 420);
+    drawn = gpu_window_input::letterboxRect(QSizeF(1000, 1000), QSizeF(1920, 1260));
+    const auto slotRawY = [](int c) { return static_cast<int>(c * (420 / 654.0)); };
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 172), QPointF(500, 172));
+    QCOMPARE(rec.bpCalls, 1);
+    QCOMPARE(rec.lastPick.x(), 500);
+    QCOMPARE(slotRawY(rec.lastPick.y()), 0);
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 200.5), QPointF(500, 200.5));
+    QCOMPARE(rec.bpCalls, 2);
+    QCOMPARE(slotRawY(rec.lastPick.y()), 18);   // (200.5 - 171.875) / 656.25 * 420 = 18.32
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 171.8), QPointF(500, 171.8));
+    QCOMPARE(rec.bpCalls, 2);
+}
+
+void GuiSmokeTest::glWindowViewerInput_noDrawnPictureIsNoPick()
+{
+    // r2: before paintGL has drawn a frame the getter reports none, and an armed pick is refused
+    // (still consumed, so it does not reach the view's own handling), never guessed.
+    GlWindowInputRecorder rec;
+    QWindow window;
+    window.resize(1000, 1000);
+    PassThroughSpy spy;
+    window.installEventFilter(&spy);
+    const auto usableBasis = []() {
+        gpu_window_input::PickBasis basis;
+        basis.zoomFit = true;
+        basis.sceneRect = QSizeF(1000, 654);
+        basis.rawWidth = 1000;
+        basis.rawHeight = 654;
+        return basis;
+    };
+    gpu_window_input::Forwarder::Hooks hooks;
+    hooks.pickBasis = usableBasis;
+    hooks.drawnPicture = []() { return QRectF(); };
+    hooks.wbArmed = [&rec]() { return rec.wbArmed; };
+    hooks.bpArmed = [&rec]() { return rec.bpArmed; };
+    hooks.pickWhiteBalance = [&rec](int x, int y) { ++rec.wbCalls; rec.lastPick = QPoint(x, y); };
+    hooks.pickBadPixel = [&rec](int x, int y) { ++rec.bpCalls; rec.lastPick = QPoint(x, y); };
+    window.installEventFilter(new gpu_window_input::Forwarder(&window, std::move(hooks)));
+    rec.wbArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    rec.wbArmed = false;
+    rec.bpArmed = true;
+    deliverMouse(&window, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    QCOMPARE(rec.wbCalls, 0);
+    QCOMPARE(rec.bpCalls, 0);
+    QCOMPARE(spy.seen, 0);
+
+    // An unset hook is the same: no pick.
+    GlWindowInputRecorder rec2;
+    QWindow window2;
+    window2.resize(1000, 1000);
+    gpu_window_input::Forwarder::Hooks bare;
+    bare.pickBasis = usableBasis;
+    bare.wbArmed = []() { return true; };
+    bare.pickWhiteBalance = [&rec2](int, int) { ++rec2.wbCalls; };
+    window2.installEventFilter(new gpu_window_input::Forwarder(&window2, std::move(bare)));
+    deliverMouse(&window2, QEvent::MouseButtonPress, Qt::LeftButton, QPointF(500, 500), QPointF(500, 500));
+    QCOMPARE(rec2.wbCalls, 0);
+
+    // The real getter on a GL window that never painted reports none.
+    GpuDisplayWindow glWindow;
+    QVERIFY(!glWindow.lastPaintedPicture().valid);
+    const GpuDisplayWindow::PaintedPicture p = glWindow.lastPaintedPicture();
+    QVERIFY(gpu_window_input::drawnPictureRect(p.valid, p.framebufferWidth, p.framebufferHeight,
+                                               p.devicePixelRatio, p.scaleX, p.scaleY).isEmpty());
+}
+
+void GuiSmokeTest::glWindowViewerInput_getterRefusesWhileAFrameIsHandedOver()
+{
+    // Adversary r2 pass 1 A2: a painted clear, then a hand-over that restores a texture without
+    // painting, must not bring the pre-clear picture back. The getter reports a picture only while
+    // the last paintGL drew one and nothing has been handed over since. Offscreen: the paint is
+    // stood in for by the state paintGL leaves (friend access); the hand-overs are the real calls.
+    GpuDisplayWindow win;
+    QOpenGLTexture texture(QOpenGLTexture::Target2D); // never created: no GL call
+    const GpuDisplayWindow::PaintedPicture painted{ true, 2000, 2000, 2.0, 1.0f, 0.418f };
+    const auto standInForADrawingPaint = [&]() {
+        win.m_lastPaintedPicture = painted;
+        win.m_texture = &texture;
+        win.m_texturePresentationActive = true;
+    };
+    standInForADrawingPaint();
+    QVERIFY(win.lastPaintedPicture().valid);
+    QCOMPARE(win.lastPaintedPicture().scaleY, 0.418f);
+
+    // A frame handed over and not painted yet: none (the picture on screen is about to change).
+    QImage frame(16, 8, QImage::Format_RGB888);
+    frame.fill(Qt::gray);
+    win.setPresentedImage(frame, QSize(1920, 804));
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // A clear: none.
+    standInForADrawingPaint();
+    win.clearPresented();
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // A paint that drew nothing (paintGL's no-texture branch) leaves the flag false; a texture that
+    // comes back without a paint (recon adoption at submit) does not revive the old picture.
+    standInForADrawingPaint();
+    win.m_texturePresentationActive = false;
+    QVERIFY(!win.lastPaintedPicture().valid);
+
+    // No texture at all: none.
+    standInForADrawingPaint();
+    win.m_texture = nullptr;
+    QVERIFY(!win.lastPaintedPicture().valid);
+    win.m_texture = nullptr;
+}
+
+void GuiSmokeTest::glWindowViewerInput_getterRecordsThePaintedPicture()
+{
+    MLV_SKIP_OR_FAIL_IF_OFFSCREEN("the GL window's paintGL needs a platform plugin that can create an OpenGL context");
+
+    qputenv(GpuDisplayWindow::environmentVariableName(), QByteArrayLiteral("1"));
+    auto host = std::make_unique<QWidget>();
+    auto *layout = new QVBoxLayout(host.get());
+    auto *view = new QGraphicsView(host.get());
+    layout->addWidget(view);
+    host->resize(96, 96);
+    QVERIFY(GpuDisplayWindow::installInPreview(view));
+    host->show();
+    QApplication::processEvents();
+    static_cast<void>(QTest::qWaitForWindowExposed(host.get()));
+    for (int i = 0; i < 20; ++i) {
+        QApplication::processEvents();
+        QTest::qWait(10);
+    }
+    GpuDisplayWindow *glWindow = qobject_cast<GpuDisplayWindow *>(GpuDisplayWindow::activeWindow());
+    QVERIFY(glWindow);
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+
+    // A 32x8 frame shown at display size 64x8: the picture is the letterbox of the DISPLAY size.
+    QImage submitted(32, 8, QImage::Format_RGB888);
+    submitted.fill(qRgb(10, 200, 30));
+    QVERIFY(GpuDisplayWindow::presentImageIfActive(submitted, QSize(64, 8)));
+    QImage grabbed;
+    QString reason;
+    const bool ok = GpuDisplayWindow::grabPresentedFramebufferIfActive(&grabbed, &reason); // a real, synchronous paintGL
+    if (!ok || grabbed.isNull()) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("OpenGL framebuffer capture is unavailable in this environment");
+    }
+    const GpuDisplayWindow::PaintedPicture p = glWindow->lastPaintedPicture();
+    QVERIFY(p.valid);
+    const QRectF drawn = gpu_window_input::drawnPictureRect(p.valid, p.framebufferWidth, p.framebufferHeight,
+                                                            p.devicePixelRatio, p.scaleX, p.scaleY);
+    const QRectF expected = gpu_window_input::letterboxRect(QSizeF(glWindow->size()), QSizeF(64, 8));
+    const double slack = 1.0 / p.devicePixelRatio; // the framebuffer is truncated to whole device pixels
+    QVERIFY2(qAbs(drawn.x() - expected.x()) <= slack && qAbs(drawn.y() - expected.y()) <= slack
+             && qAbs(drawn.width() - expected.width()) <= slack && qAbs(drawn.height() - expected.height()) <= slack,
+             qPrintable(QStringLiteral("drawn (%1,%2 %3x%4) vs expected (%5,%6 %7x%8)")
+                        .arg(drawn.x()).arg(drawn.y()).arg(drawn.width()).arg(drawn.height())
+                        .arg(expected.x()).arg(expected.y()).arg(expected.width()).arg(expected.height())));
+
+    // A new frame handed over but not painted yet: none until it is painted (adversary r2 pass 1 A2),
+    // then the new picture.
+    QImage square(16, 16, QImage::Format_RGB888);
+    square.fill(qRgb(200, 10, 30));
+    QVERIFY(GpuDisplayWindow::presentImageIfActive(square));
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+    QImage grabbedSquare;
+    QString squareReason;
+    QVERIFY(GpuDisplayWindow::grabPresentedFramebufferIfActive(&grabbedSquare, &squareReason));
+    const GpuDisplayWindow::PaintedPicture after = glWindow->lastPaintedPicture();
+    QVERIFY(after.valid);
+    const QRectF squareDrawn = gpu_window_input::drawnPictureRect(after.valid, after.framebufferWidth, after.framebufferHeight,
+                                                                  after.devicePixelRatio, after.scaleX, after.scaleY);
+    const QRectF squareExpected = gpu_window_input::letterboxRect(QSizeF(glWindow->size()), QSizeF(16, 16));
+    QVERIFY(qAbs(squareDrawn.width() - squareExpected.width()) <= slack);
+    QVERIFY(qAbs(squareDrawn.height() - squareExpected.height()) <= slack);
+
+    // Cleared and painted (the paint releases the texture and draws black): none.
+    QVERIFY(GpuDisplayWindow::clearIfActive());
+    QImage cleared;
+    QString clearedReason;
+    static_cast<void>(GpuDisplayWindow::grabPresentedFramebufferIfActive(&cleared, &clearedReason));
+    QVERIFY(!glWindow->lastPaintedPicture().valid);
+
+    host.reset();
+    QVERIFY(!GpuDisplayWindow::isActive());
+    qunsetenv(GpuDisplayWindow::environmentVariableName());
+}
+
+// PLAYER-DOUBLECLICK-FULLSCREEN-1: the viewer double-click filter, driven through a real application
+// event filter exactly as MainWindow::eventFilter calls it. "viewport" stands in for the
+// QGraphicsView viewport, "gl" for the GL display window, "fullscreen" for actionFullscreen.
+namespace
+{
+
+class DoubleClickCountingWidget : public QWidget
+{
+public:
+    int doubleClicks = 0;
+
+protected:
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        ++doubleClicks;
+        event->accept();
+    }
+};
+
+class ViewerDoubleClickFixture : public QObject
+{
+public:
+    ViewerDoubleClickFixture()
+    {
+        fullscreen.setCheckable(true);
+        state.enabled = true;
+        state.clipLoaded = true;
+        qApp->installEventFilter(this);
+    }
+    ~ViewerDoubleClickFixture() override { qApp->removeEventFilter(this); }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == &gl && event->type() == QEvent::MouseButtonDblClick) ++glDoubleClicksSeen;
+        if (watched == &gl && event->type() == QEvent::MouseButtonPress
+         && static_cast<QMouseEvent *>(event)->flags().testFlag(Qt::MouseEventCreatedDoubleClick)) ++glFlaggedPressesSeen;
+        const auto stateFn = [this](const QObject *target, const QPointF &pos) {
+            lastTarget = target;
+            viewer_dblclick::ViewerState now = state;
+            if (!handleAt.isNull() && target == &viewport && (pos - handleAt).manhattanLength() < 2.0) {
+                now.gradientHandleHovered = true; // a handle hit-tested at the event's own position
+            }
+            if (disarmAfterFirstRead) { // a one-shot tool (gradient paint) turns itself off after its click
+                state.wbArmed = state.bpArmed = state.gradientPaintArmed = state.gradientHandleHovered = false;
+            }
+            return now;
+        };
+        if (viewer_dblclick::filterEvent(gate, watched, event, &viewport, &gl, stateFn)) {
+            fullscreen.trigger();
+            return true;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+    viewer_dblclick::Gate gate;
+    viewer_dblclick::ViewerState state;
+    bool disarmAfterFirstRead = false;
+    QPointF handleAt;                       // null: no handle anywhere
+    const QObject *lastTarget = nullptr;    // the surface the reader was last handed
+    int glDoubleClicksSeen = 0;
+    int glFlaggedPressesSeen = 0;
+    DoubleClickCountingWidget viewport;
+    QWindow gl;
+    QAction fullscreen;
+};
+
+void deliverViewerMouse(QObject *receiver, QEvent::Type type, Qt::MouseButton button,
+                        Qt::KeyboardModifiers modifiers = Qt::NoModifier, quint64 timestampMs = 0,
+                        const QPointF & pos = QPointF(10, 10))
+{
+    QMouseEvent event(type, pos, pos, button,
+                      type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::MouseButtons(button), modifiers);
+    if (timestampMs != 0) {
+        event.setTimestamp(timestampMs);
+    }
+    QCoreApplication::sendEvent(receiver, &event);
+}
+
+int doubleClickIntervalMs()
+{
+    return QGuiApplication::styleHints()->mouseDoubleClickInterval();
+}
+
+} // namespace
+
+void GuiSmokeTest::viewerDoubleClick_viewportTogglesOnceAndIsSwallowed()
+{
+    ViewerDoubleClickFixture f;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QCOMPARE(f.fullscreen.isChecked(), true);
+    QCOMPARE(f.viewport.doubleClicks, 0); // swallowed: the scene's double-click press path never runs
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QCOMPARE(f.fullscreen.isChecked(), false); // a second double-click leaves fullscreen
+    QCOMPARE(f.viewport.doubleClicks, 0);
+}
+
+void GuiSmokeTest::viewerDoubleClick_glWindowTogglesOnce()
+{
+    ViewerDoubleClickFixture f;
+    QSignalSpy triggered(&f.fullscreen, &QAction::triggered);
+    deliverViewerMouse(&f.gl, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QCOMPARE(triggered.count(), 1);
+    QCOMPARE(f.fullscreen.isChecked(), true);
+}
+
+void GuiSmokeTest::viewerDoubleClick_armedToolPassesThrough()
+{
+    for (int tool = 0; tool < 4; ++tool) {
+        ViewerDoubleClickFixture f;
+        f.state.wbArmed = tool == 0;
+        f.state.bpArmed = tool == 1;
+        f.state.gradientPaintArmed = tool == 2;
+        f.state.gradientHandleHovered = tool == 3;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+        QVERIFY2(!f.fullscreen.isChecked(), qPrintable(QStringLiteral("tool %1 armed still toggled").arg(tool)));
+        QCOMPARE(f.viewport.doubleClicks, 1); // passed through to the viewer unchanged
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_otherButtonModifierSettingOrNoClipDoNotToggle()
+{
+    {
+        ViewerDoubleClickFixture f;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::RightButton);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
+    {
+        ViewerDoubleClickFixture f;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::ShiftModifier);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
+    {
+        ViewerDoubleClickFixture f;
+        f.state.enabled = false;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
+    {
+        ViewerDoubleClickFixture f;
+        f.state.clipLoaded = false;
+        deliverViewerMouse(&f.gl, QEvent::MouseButtonDblClick, Qt::LeftButton);
+        QVERIFY(!f.fullscreen.isChecked());
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_otherWidgetDoesNotToggle()
+{
+    ViewerDoubleClickFixture f;
+    DoubleClickCountingWidget other;
+    deliverViewerMouse(&other, QEvent::MouseButtonDblClick, Qt::LeftButton);
+    QVERIFY(!f.fullscreen.isChecked());
+    QCOMPARE(other.doubleClicks, 1);
+    QCOMPARE(f.viewport.doubleClicks, 0);
+}
+
+void GuiSmokeTest::viewerDoubleClick_toolArmedAtFirstPressSuppresses()
+{
+    const quint64 interval = static_cast<quint64>(qMax(1, doubleClickIntervalMs()));
+    ViewerDoubleClickFixture f;
+    // Gradient paint armed at the first press; it switches itself off on that click's release.
+    f.state.gradientPaintArmed = true;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000);
+    f.state.gradientPaintArmed = false;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 8);
+    // Widget path: Qt hands the widget only the double-click for the second click, never its press.
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4);
+    QVERIFY(!f.fullscreen.isChecked());
+    QCOMPARE(f.viewport.doubleClicks, 1);
+
+    // A later double-click with nothing armed toggles as usual.
+    const quint64 later = 100000 + interval * 10;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, later);
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, later + interval / 4);
+    QVERIFY(f.fullscreen.isChecked());
+    QCOMPARE(f.viewport.doubleClicks, 1);
+}
+
+void GuiSmokeTest::viewerDoubleClick_armedPressElsewhereDoesNotPoisonANewSequence()
+{
+    // Adversary A1 (r1, dd9f5441): a press on the gradient handle at (100,100), then within the
+    // interval a press far away with nothing armed, then a double-click there. Qt does not pair
+    // presses farther apart than the double-click distance, so the far press starts a new
+    // sequence and its double-click must toggle.
+    const quint64 interval = static_cast<quint64>(qMax(4, doubleClickIntervalMs()));
+    ViewerDoubleClickFixture f;
+    f.state.gradientHandleHovered = true;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000, QPointF(100, 100));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 20, QPointF(100, 100));
+    f.state.gradientHandleHovered = false;
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 4 + 1, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 2, QPointF(500, 500));
+    deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 100000 + interval / 2, QPointF(500, 500));
+    QVERIFY(f.fullscreen.isChecked());
+    QCOMPARE(f.viewport.doubleClicks, 0);
+}
+
+void GuiSmokeTest::viewerDoubleClick_newSequenceAfterAMovedOrSlowPressToggles()
+{
+    // Adversary pass 2 (65c29245) A1 and A2, on the widget path (Qt never hands a widget the
+    // second press of a double-click, only the double-click). A1: WB-armed press at (100,100)
+    // t=1000, the cursor moves away and back (Qt resets pairing), an unarmed press at t=1100,
+    // the double-click at t=1200. A2: the same with the unarmed press at t=1400 (exactly one
+    // interval later: Qt starts a new sequence) and the double-click at t=1500. Both toggle.
+    const quint64 interval = 400;
+    for (int variant = 0; variant < 2; ++variant) {
+        ViewerDoubleClickFixture f;
+        const quint64 t0 = 1000;
+        const quint64 unarmedAt = variant == 0 ? t0 + 100 : t0 + interval;
+        f.state.wbArmed = true;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, t0, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, t0 + 10, QPointF(100, 100));
+        f.state.wbArmed = false;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, unarmedAt, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, unarmedAt + 10, QPointF(100, 100));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, unarmedAt + 100, QPointF(100, 100));
+        QVERIFY2(f.fullscreen.isChecked(), qPrintable(QStringLiteral("variant %1 (A%2) did not toggle").arg(variant).arg(variant + 1)));
+        QCOMPARE(f.viewport.doubleClicks, 0);
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_glWindowRealQtPairingKeepsTheFirstPressRecord()
+{
+    // GL path through Qt's own pairing (adversary r1 pass 2 A3): QTest feeds the window system,
+    // so QGuiApplication forms the double-click, flags the second press and sends the
+    // double-click. A tool armed at the first press only (it turns itself off after the first
+    // read) still suppresses; with nothing armed the same gesture toggles.
+    {
+        ViewerDoubleClickFixture f;
+        f.gl.resize(64, 64);
+        f.state.gradientPaintArmed = true;
+        f.disarmAfterFirstRead = true;
+        QTest::mouseDClick(&f.gl, Qt::LeftButton, Qt::NoModifier, QPoint(10, 10));
+        QCOMPARE(f.glDoubleClicksSeen, 1);
+        QCOMPARE(f.glFlaggedPressesSeen, 1);
+        QVERIFY(!f.state.gradientPaintArmed); // it really was off by the double-click
+        QVERIFY(!f.fullscreen.isChecked());
+    }
+    {
+        ViewerDoubleClickFixture f;
+        f.gl.resize(64, 64);
+        QTest::mouseDClick(&f.gl, Qt::LeftButton, Qt::NoModifier, QPoint(10, 10));
+        QCOMPARE(f.glDoubleClicksSeen, 1);
+        QVERIFY(f.fullscreen.isChecked());
+    }
+}
+
+void GuiSmokeTest::viewerDoubleClick_firstPressOutsideTheViewerStartsAnUnarmedRecord()
+{
+    // Adversary r1 pass 3 A2, widget path: a WB-armed viewer press/release at t=1000, then WB off.
+    // Qt's first press of the next pair lands just outside the viewer (a layout gap of the same
+    // native window) at t=10000; the second press on the viewer is flagged and never reaches the
+    // widget; the double-click goes to the viewport at t=10100. It must toggle.
+    // Every native press reaches a QWindow (the top-level QWidgetWindow) before any widget, so the
+    // gap press is delivered to a window here. r2 pass 4 A2: a distinct press may reuse the
+    // recorded press's timestamp (native injection); it still starts a new unarmed record.
+    for (int reuseTimestamp = 0; reuseTimestamp < 2; ++reuseTimestamp) {
+        ViewerDoubleClickFixture f;
+        QWindow topLevelWindow;
+        f.state.wbArmed = true;
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 1000);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 1010);
+        f.state.wbArmed = false;
+        const quint64 gapAt = reuseTimestamp ? 1000 : 10000;
+        deliverViewerMouse(&topLevelWindow, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, gapAt);
+        deliverViewerMouse(&topLevelWindow, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, gapAt + 10);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, gapAt + 100);
+        QVERIFY2(f.fullscreen.isChecked(), qPrintable(QStringLiteral("reuseTimestamp=%1 did not toggle").arg(reuseTimestamp)));
+        QCOMPARE(f.viewport.doubleClicks, 0);
+    }
+    // r2 pass 4 A1: the handle is hit-tested at the event's own position, which the reader is
+    // handed; the live cursor plays no part. A press on the handle at (100,55) suppresses.
+    {
+        ViewerDoubleClickFixture f;
+        f.handleAt = QPointF(100, 55);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 30000, QPointF(100, 55));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 30010, QPointF(100, 55));
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 30100, QPointF(100, 55));
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+        QCOMPARE(f.lastTarget, static_cast<const QObject *>(&f.viewport));
+    }
+    // The same physical press reaching the top-level window first and the QGraphicsView parent
+    // after the viewport keeps an armed viewer record: the double-click passes through.
+    {
+        ViewerDoubleClickFixture f;
+        QWindow topLevel;
+        DoubleClickCountingWidget view;
+        f.state.gradientPaintArmed = true;
+        deliverViewerMouse(&topLevel, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 20000);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 20000);
+        deliverViewerMouse(&view, QEvent::MouseButtonPress, Qt::LeftButton, Qt::NoModifier, 20000);
+        f.state.gradientPaintArmed = false; // the one-shot tool turns itself off on release
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoModifier, 20010);
+        deliverViewerMouse(&f.viewport, QEvent::MouseButtonDblClick, Qt::LeftButton, Qt::NoModifier, 20100);
+        QVERIFY(!f.fullscreen.isChecked());
+        QCOMPARE(f.viewport.doubleClicks, 1);
+    }
 }
 
 int main(int argc, char ** argv)
