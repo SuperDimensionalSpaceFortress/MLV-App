@@ -4,11 +4,12 @@
  *
  * The smoke log carries per-frame detail only for a slip, so a long present interval with no skip had no record of
  * what preceded it (r6: head3 legs with one 109-120 ms interval mid-clip, 3 of 4 not slips). With the trace on, every
- * presented frame of a measured Play gets one row: when it was presented, when its render was ready, how long the GUI
- * thread took to pick it up and draw it, the pace guard's credit, and what the playback timer did since the previous
- * present (ticks, the longest gap between two ticks, busy ticks, the advances it made and the last one's time). The
- * rows are kept in memory and written to the log after the Play stops, so the trace never writes inside the timed
- * window.
+ * presented frame of a measured Play is offered one row, and the recorder keeps the NEWEST rows that fit its fixed ring
+ * (4096 in the window; a longer Play overwrites the oldest and dropped() says how many): when the frame was presented, when
+ * its render was ready, how long the GUI thread took to pick it up and draw it, the pace guard's credit, and what the
+ * playback timer did since the previous present (ticks, the longest gap between two ticks, busy ticks, the advances it made
+ * and the last one's time). The rows are kept in memory and written to the log after the Play stops, so the trace never
+ * writes inside the timed window.
  *
  * Off (the default) it is inert: every note*() returns before touching state, nothing is allocated, and no row is
  * written. The caller reads the flag once.
@@ -18,6 +19,7 @@
 #define PLAYBACKPRESENTTRACE_H
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -71,8 +73,6 @@ struct Row
     double presentMs = 0.0;       // the present was recorded (notePlaybackSmokePresentedFrame)
     double intervalMs = 0.0;      // since the previous present (0 for the first)
     double readyMs = -1.0;        // the render thread emitted this frame ready (input: absolute ms, -1 = not known)
-    bool readyKnown = false;      // set by notePresent from the INPUT (an absolute stage-clock time is never negative); the
-                                  // rebased readyMs may be any value, -1.0 included, so the value cannot say it
     double uiLatencyMs = 0.0;     // ready emit -> drawFrameReady picked it up (GUI thread)
     double drawMs = 0.0;          // drawFrameReady total
     double renderMs = 0.0;        // render work
@@ -101,6 +101,22 @@ struct Row
     double rndMs = kUnknownMs;        // render thread began
     double drawBeginMs = kUnknownMs;  // GUI draw began
 
+    /*! Which of the ten chain stamps (request .. present, bit i = chain position i) this row KNOWS. Set in ONE place,
+     *  notePresent, from the INPUT: an absolute stage-clock time that is finite and not negative is known. The rebased value
+     *  may then be any number at all (-1.0 or -5e8 included), so no value can say "unknown" and none is tested for it. A
+     *  row that never passed notePresent knows nothing. */
+    unsigned knownMask = 0;
+    static constexpr int kChainLength = 10;
+    static constexpr int kReadyIndex = 7;
+    static constexpr int kPresentIndex = 9;
+
+    /*! The chain fields in request .. present order. */
+    void chainFields( double *( &out )[kChainLength] )
+    {
+        double *const f[kChainLength] = { &reqMs, &dqMs, &dsMs, &deMs, &rsMs, &reMs, &rndMs, &readyMs, &drawBeginMs, &presentMs };
+        for( int i = 0; i < kChainLength; ++i ) out[i] = f[i];
+    }
+
     /*! Loads the worker stamps (absolute stage-clock seconds; 0 = unknown) as ABSOLUTE ms, ready for notePresent. */
     void setStages( const StageStamps &s )
     {
@@ -115,20 +131,20 @@ struct Row
         drawBeginMs = ms( s.drawBeginS );
     }
 
-    /*! True when the stamps that are known never run backwards along request .. present (1 = ordered). */
+    /*! True when the KNOWN stamps never run backwards along request .. present (1 = ordered). It orders what was stamped;
+     *  it does not say every stage was instrumented. Presence is knownMask, never a value (adversary a7085920 A2, sol r3 B1,
+     *  sol r4 B1/B2); notePresent guarantees every known stamp is finite, so the comparison below cannot meet a NaN. */
     bool stagesOrdered() const
     {
-        // Unknown is kUnknownMs for the stage stamps and the flag for ready: no value a real rebased stamp can take (-1.0
-        // included) means "unknown" (adversary a7085920 A2, sol r3 B1). A row that did not pass notePresent has no ready.
-        const double ready = readyKnown ? readyMs : kUnknownMs;
-        const double chain[] = { reqMs, dqMs, dsMs, deMs, rsMs, reMs, rndMs, ready, drawBeginMs, presentMs };
-        double last = kUnknownMs;
-        for( double t : chain )
+        const double chain[kChainLength] = { reqMs, dqMs, dsMs, deMs, rsMs, reMs, rndMs, readyMs, drawBeginMs, presentMs };
+        bool haveLast = false;
+        double last = 0.0;
+        for( int i = 0; i < kChainLength; ++i )
         {
-            // a real rebased stamp is never below -1e8
-            if( t <= kUnknownMs / 2.0 ) continue;
-            if( t < last ) return false;
-            last = t;
+            if( !( ( knownMask >> i ) & 1u ) ) continue;
+            if( haveLast && chain[i] < last ) return false;
+            last = chain[i];
+            haveLast = true;
         }
         return true;
     }
@@ -204,12 +220,29 @@ public:
     void notePresent( Row row )
     {
         if( !active() ) return;
-        row.presentMs -= m_originMs;
-        row.readyKnown = row.readyMs >= 0.0;   // the input is an absolute time (never negative); -1 = not known
-        if( row.readyKnown ) row.readyMs -= m_originMs;
-        for( double *stage : { &row.reqMs, &row.dqMs, &row.dsMs, &row.deMs, &row.rsMs, &row.reMs, &row.rndMs,
-                               &row.drawBeginMs } )
-            if( *stage > kUnknownMs / 2.0 ) *stage -= m_originMs;   // a stage may precede the Play's start: it stays negative
+        // The ONE place a Row's stamps are judged, on the INPUT (absolute stage-clock ms): finite and not negative = known.
+        // A NaN or infinite input, and the unknown markers (kUnknownMs, ready's -1), are unknown and are stored as that
+        // marker, so no later code can meet a non-finite value. Only then is a known stamp rebased, and it may land on any
+        // value (a stage may precede the Play's start); its presence is the mask bit, never its value.
+        double *chain[Row::kChainLength];
+        row.chainFields( chain );
+        row.knownMask = 0;
+        for( int i = 0; i < Row::kChainLength; ++i )
+        {
+            const double input = *chain[i];
+            if( i == Row::kPresentIndex )
+            {
+                if( std::isfinite( input ) ) row.knownMask |= 1u << i;
+                *chain[i] = input - m_originMs;   // the present is always recorded; only its ORDERING presence is the mask
+            }
+            else if( std::isfinite( input ) && input >= 0.0 )
+            {
+                row.knownMask |= 1u << i;
+                *chain[i] = input - m_originMs;
+            }
+            else
+                *chain[i] = i == Row::kReadyIndex ? -1.0 : kUnknownMs;   // each column's documented "unknown"
+        }
         row.intervalMs = m_havePresent ? row.presentMs - m_lastPresentMs : 0.0;
         row.prevEndMs = m_havePresentEnd ? m_lastPresentEndMs : -1.0;   // the column's documented "none yet"
         row.ticks = m_pending.ticks;
@@ -240,7 +273,8 @@ public:
 
     /*! The rows kept (at most the ring's size), oldest first: row(0) is the present numbered firstIndex(). */
     size_t size() const { return m_total < m_ring.size() ? m_total : m_ring.size(); }
-    size_t capacity() const { return m_ring.size(); }
+    size_t capacity() const { return m_ring.size(); }          // the ring's SLOTS (what begin() asked for)
+    size_t allocated() const { return m_ring.capacity(); }     // the backing storage's own capacity: 0 until begin() allocates
     size_t total() const { return m_total; }                 // presents recorded this Play
     size_t dropped() const { return m_total - size(); }      // overwritten by the ring
     size_t firstIndex() const { return dropped(); }

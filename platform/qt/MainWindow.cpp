@@ -27571,7 +27571,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
-    m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
+    // r7 present trace (no-op when off): a fixed ring of the NEWEST 4096 presents; a longer Play overwrites the oldest and the
+    // dump's header names how many (dropped=)
+    m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );
     m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getPlaybackFramerate() );
     m_playbackTextureSplit.reset();   // K1 (texture-present split)
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks

@@ -10,6 +10,7 @@
 #include <QString>
 #include <QTextStream>
 
+#include <limits>
 #include <string>
 
 using playback_present_trace::Recorder;
@@ -95,7 +96,7 @@ TEST(PlaybackPresentTrace, OffByDefaultItRecordsAndAllocatesNothing)
     driveOnePlay(trace);
     ASSERT_FALSE(trace.active());
     ASSERT_TRUE(trace.empty());
-    ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
+    ASSERT_EQ(static_cast<size_t>(0), trace.allocated());   // the backing storage, not the slot count: nothing was reserved
 }
 
 TEST(PlaybackPresentTrace, SwitchedOffAgainItStaysInert)
@@ -105,7 +106,7 @@ TEST(PlaybackPresentTrace, SwitchedOffAgainItStaysInert)
     trace.setEnabled(false);
     driveOnePlay(trace);
     ASSERT_TRUE(trace.empty());
-    ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
+    ASSERT_EQ(static_cast<size_t>(0), trace.allocated());
 }
 
 TEST(PlaybackPresentTrace, OnEveryPresentGetsARowWithTheTimerSinceThePreviousPresent)
@@ -225,6 +226,8 @@ TEST(PlaybackPresentTraceStages, TheRingKeepsTheNewestRowsWithTheirStagesAndNeve
     trace.begin(0.0, 4);
     const Row *const ring = trace.storage();
     ASSERT_EQ(static_cast<size_t>(4), trace.capacity());
+    const size_t allocatedAtBegin = trace.allocated();
+    ASSERT_TRUE(allocatedAtBegin >= 4);
     for (int i = 0; i < 10; ++i)
     {
         Row r;
@@ -239,6 +242,7 @@ TEST(PlaybackPresentTraceStages, TheRingKeepsTheNewestRowsWithTheirStagesAndNeve
     ASSERT_EQ(static_cast<size_t>(6), trace.dropped());
     ASSERT_EQ(static_cast<size_t>(6), trace.firstIndex());
     ASSERT_EQ(static_cast<size_t>(4), trace.capacity());
+    ASSERT_EQ(allocatedAtBegin, trace.allocated());   // the backing storage's own capacity never grew
     ASSERT_TRUE(ring == trace.storage());   // a present never moved or grew the storage
     for (size_t k = 0; k < trace.size(); ++k)
     {
@@ -316,7 +320,7 @@ TEST(PlaybackPresentTraceStages, WithTheSwitchOffTheStageHooksAreNoOps)
     trace.begin(0.0, 8);
     trace.notePresent(r);
     ASSERT_TRUE(trace.empty());
-    ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
+    ASSERT_EQ(static_cast<size_t>(0), trace.allocated());
 }
 
 // adversary a7085920 A2: a request stamped 0.5 ms and a queue stamped exactly 1 ms BEFORE the Play's start (-0.5, -1.0) run
@@ -404,6 +408,95 @@ TEST(PlaybackPresentTraceStages, APreviousTickOrPresentAtMinusOneMsIsStillAPrevi
     third.presentMs = 1010.0;
     trace.notePresent(third);
     ASSERT_NEAR(-1.0, trace.row(0).prevEndMs, 1e-9);
+}
+
+namespace
+{
+
+// The ten chain fields in request .. present order (the order stagesOrdered walks): 0 req, 1 dq, 2 ds, 3 de, 4 rs, 5 re,
+// 6 rnd, 7 ready, 8 draw_begin, 9 present.
+constexpr int kChainLength = 10;
+double *chainField(Row &r, int index)
+{
+    double *const fields[kChainLength] = { &r.reqMs, &r.dqMs, &r.dsMs, &r.deMs, &r.rsMs,
+                                           &r.reMs, &r.rndMs, &r.readyMs, &r.drawBeginMs, &r.presentMs };
+    return fields[index];
+}
+
+} // namespace
+
+// r5 (sol r4 B1, HUB RULING 2026-11-20T18:55Z): presence is explicit, never a magnitude test. A KNOWN stamp that rebases to
+// -5e8 ms or lower (a Play origin far past the stage clock's zero) is a stamp like any other. Sol's literal input, then
+// every one of the nine adjacent edges of the chain.
+TEST(PlaybackPresentTraceStages, AKnownStampFarBeforeThePlayOriginStillTakesPartInTheOrderCheck)
+{
+    {
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(500002000.0, 1);
+        playback_present_trace::StageStamps s;
+        s.requestS = 2.0;       // 2000 ms absolute: rebases to exactly -500000000
+        s.decodeQueueS = 1.0;   // 1000 ms absolute: rebases to -500001000, BEFORE the request
+        Row r;
+        r.setStages(s);
+        r.presentMs = 500002001.0;
+        trace.notePresent(r);
+        ASSERT_FALSE(trace.row(0).stagesOrdered());
+    }
+    const double origin = 500002000.0;
+    for (int edge = 0; edge + 1 < kChainLength; ++edge)
+    {
+        for (const bool reversed : { true, false })
+        {
+            Recorder trace;
+            trace.setEnabled(true);
+            trace.begin(origin, 1);
+            Row r;
+            r.presentMs = origin + 10.0;   // a later present, so only this edge decides the verdict
+            *chainField(r, edge) = reversed ? 2000.0 : 1000.0;
+            *chainField(r, edge + 1) = reversed ? 1000.0 : 2000.0;
+            trace.notePresent(r);
+            ASSERT_EQ(!reversed, trace.row(0).stagesOrdered());
+        }
+    }
+}
+
+// r5 (sol r4 B2): a non-finite value in a Row that enters notePresent is "unknown" and can never turn the ordering
+// accumulator into NaN. Sol's literal input (req=20, dq=NaN, ds=10) and every direct stage field.
+TEST(PlaybackPresentTraceStages, ANonFiniteStageInAnAcceptedRowIsUnknownAndNeverHidesALaterReversal)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    {
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(0.0, 1);
+        Row r;
+        r.reqMs = 20.0;
+        r.dqMs = nan;
+        r.dsMs = 10.0;
+        r.presentMs = 30.0;
+        trace.notePresent(r);
+        ASSERT_FALSE(trace.row(0).stagesOrdered());
+        ASSERT_TRUE(trace.row(0).dqMs <= playback_present_trace::kUnknownMs / 2.0);   // stored as unknown, not NaN
+    }
+    for (const double bad : { nan, inf, -inf })
+    {
+        // every field the key names: dq ds de rs re rnd draw_begin, plus ready
+        for (const int field : { 1, 2, 3, 4, 5, 6, 7, 8 })
+        {
+            Recorder trace;
+            trace.setEnabled(true);
+            trace.begin(0.0, 1);
+            Row r;
+            r.presentMs = 30.0;
+            *chainField(r, field - 1) = 20.0;
+            *chainField(r, field) = bad;
+            *chainField(r, field + 1) = 10.0;   // 20 then 10: a reversal the bad value must not hide
+            trace.notePresent(r);
+            ASSERT_FALSE(trace.row(0).stagesOrdered());
+        }
+    }
 }
 
 // r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace has no configure or H2D column, and no code

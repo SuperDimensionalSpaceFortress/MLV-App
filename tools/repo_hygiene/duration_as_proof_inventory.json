@@ -2104,16 +2104,6 @@
       ]
     },
     {
-      "path": "platform/qt/PlaybackPresentTrace.h",
-      "anchor": "row . readyKnown = row . readyMs >= 0.0 ;",
-      "class": "value_fallback_select",
-      "clock": "qpc_stage_clock",
-      "justification": "PLAYBACK-TRACE-LOWOVERHEAD-1 r4 present trace: the input readyMs is an ABSOLUTE stage-clock time (never negative) and -1 means 'not known'; the compare records that as the readyKnown flag, so the rebased value (which may be -1.0 or any negative) never has to double as the unknown marker. A data-validity filter on a diagnostic row, not a run-proof.",
-      "lines": [
-        208
-      ]
-    },
-    {
       "path": "tests/console/test_playback_present_trace.cpp",
       "anchor": "ASSERT_NEAR ( 0.0 , a . intervalMs , 1 e - 9 ) ;",
       "class": "not_run_proof_structural",
