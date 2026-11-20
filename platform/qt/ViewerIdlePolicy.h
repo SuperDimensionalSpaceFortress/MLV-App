@@ -250,8 +250,9 @@ inline bool operator==( const HistoryPoint &a, const HistoryPoint &b )
  * list (newest first, every overlapping point equal, x, y and time). The move is real movement iff one of
  * those newer points is at another position than the move. If the marked copy no longer lines up anywhere
  * (more new points than the history holds), any point at another position counts. r12 (sol r11 B1): when the marked
- * copy lines up at more than one place (a periodic history), the list cannot say which, so the place that makes the
- * most points newer wins: an ambiguous history never concludes "no movement" for a move message that is really there.
+ * copy lines up at more than one place in a full history (a periodic one), the list cannot say which: it is movement
+ * iff the place that makes the most points newer says so AND real input reached the system after the mark (adversary
+ * pass 18 A1: a synthesized same-position move, e.g. after the app's own hide, is not input and never re-shows).
  *
  * r7 (key B1, opus H1): the tick's mark is also its look at the queue (QueueLook): ONE history read is judged
  * against the previous mark and then becomes the new mark, and the queue status is read after it. The hook runs
@@ -283,8 +284,11 @@ public:
 
     bool marked() const { return m_count > 0; }
 
-    /*! \brief True iff a point newer than the mark lies at another position than (x, y). False when unmarked. */
-    bool leftSinceMark( const HistoryPoint *newestFirst, int n, int x, int y ) const
+    /*! \brief True iff a point newer than the mark lies at another position than (x, y). False when unmarked.
+     *         inputSinceMark (r12, adversary pass 18 A1) decides ONLY an ambiguous full history (see below): the caller
+     *         passes whether real input reached the system after the mark (on Windows GetLastInputInfo moved), or true
+     *         when it cannot tell. */
+    bool leftSinceMark( const HistoryPoint *newestFirst, int n, int x, int y, bool inputSinceMark = true ) const
     {
         if( !marked() || !newestFirst || n <= 0 ) return false;
         if( n > kMaxPoints ) n = kMaxPoints;
@@ -297,32 +301,52 @@ public:
         // r12 (sol r11 B1): a FULL history (kMaxPoints) scrolls, so the marked copy may also line up partially (its
         // tail scrolled out) at a place where it fits nowhere whole. In a periodic full history, mark H=[P,Q]x32, one
         // more Q,P excursion yields [P,Q]+H[0:62] == H: whole at 0 (no excursion) and partial at 2, 4, ..., 62 (the
-        // excursion). The list alone cannot tell them apart, so an ambiguous line-up never concludes "no movement":
-        // when the list is full, the largest line-up, whole or partial, wins (prefixes nest, so it is movement iff any
-        // line-up says so). The second signal that a crafted history cannot fake is the move message itself: every
+        // excursion). The list alone cannot tell them apart: it is AMBIGUOUS when the r11 pick says "no movement" and
+        // the largest line-up (whole or partial; prefixes nest, so it is movement iff any line-up says so) says
+        // "movement". Two signals a crafted history cannot fake decide it together. (1) The move message itself: every
         // caller asks only for a move it holds (the hook for a retrieved same-position WM_MOUSEMOVE,
-        // ViewerMouseRetrievalHook.h proc; the tick only when a move is queued, queuedMouseIsActivity). A quiet pointer
-        // sends no message, so a periodic history still hides on time; a synthesized same-position move in a periodic
-        // full history counts as movement (errs toward showing). A list shorter than kMaxPoints cannot have scrolled,
-        // so there only whole line-ups count, as before.
-        int newer = -1;
+        // ViewerMouseRetrievalHook.h proc; the tick only when a move is queued, queuedMouseIsActivity), so a quiet
+        // pointer, which sends no message, hides on time. (2) inputSinceMark (adversary pass 18 A1): a move Windows
+        // synthesizes at an unchanged position (the app's own hide, a window shown under the cursor) is not input and
+        // does not move the system's last-input time; a real excursion, injected or not, does. So an ambiguous
+        // history is movement iff input reached the system after the mark. A list shorter than kMaxPoints cannot have
+        // scrolled, so there only the r11 pick counts.
+        const bool left = anyElsewhere( newestFirst, newerByFirstFit( newestFirst, n ), x, y );
+        if( left || n < kMaxPoints ) return left;
+        const bool leftAtLargest = anyElsewhere( newestFirst, newerByLargestFit( newestFirst, n ), x, y );
+        return leftAtLargest && inputSinceMark;
+    }
+
+private:
+    /*! \brief The r11 pick: the number of points newer than the mark (the largest whole line-up, else the nearest
+     *         partial one, else all n). */
+    int newerByFirstFit( const HistoryPoint *newestFirst, int n ) const
+    {
         const int lastWhole = n - m_count;   // the largest k at which the whole marked copy fits
-        if( n >= kMaxPoints )
+        for( int k = lastWhole; k >= 0; --k )
         {
-            for( int k = n - 1; k >= 0 && newer < 0; --k )
-            {
-                if( linesUpAt( newestFirst, n, k ) ) newer = k;
-            }
+            if( linesUpAt( newestFirst, n, k ) ) return k;
         }
-        for( int k = lastWhole; k >= 0 && newer < 0; --k )
+        for( int k = qMax( 0, lastWhole + 1 ); k < n; ++k )
         {
-            if( linesUpAt( newestFirst, n, k ) ) newer = k;
+            if( linesUpAt( newestFirst, n, k ) ) return k;
         }
-        for( int k = qMax( 0, lastWhole + 1 ); k < n && newer < 0; ++k )
+        return n;   // the marked copy scrolled out: every point is newer
+    }
+
+    /*! \brief r12: the largest line-up, whole or partial (a full history can have scrolled), else all n. */
+    int newerByLargestFit( const HistoryPoint *newestFirst, int n ) const
+    {
+        for( int k = n - 1; k >= 0; --k )
         {
-            if( linesUpAt( newestFirst, n, k ) ) newer = k;
+            if( linesUpAt( newestFirst, n, k ) ) return k;
         }
-        if( newer < 0 ) newer = n;   // the marked copy scrolled out: every point is newer
+        return n;
+    }
+
+    /*! \brief True iff one of the newest `newer` points is at another position than (x, y). */
+    static bool anyElsewhere( const HistoryPoint *newestFirst, int newer, int x, int y )
+    {
         for( int i = 0; i < newer; ++i )
         {
             if( newestFirst[i].x != x || newestFirst[i].y != y ) return true;
@@ -330,7 +354,6 @@ public:
         return false;
     }
 
-private:
     /*! \brief True iff the marked copy (as much of it as fits) equals the list from k on. */
     bool linesUpAt( const HistoryPoint *newestFirst, int n, int k ) const
     {

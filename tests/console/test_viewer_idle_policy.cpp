@@ -1051,6 +1051,13 @@ void setPeriodicScript()
         g_script[i] = (i % 2) == 0 ? hp(500, 500, 1000) : hp(510, 500, 1000);
     g_scriptCount = viewer_idle::MoveHistoryMark::kMaxPoints;
 }
+// r12 (adversary pass 18 A1): a scripted system last-input time (GetLastInputInfo).
+quint32 g_lastInput = 0;
+bool scriptedLastInput(quint32 *tick)
+{
+    *tick = g_lastInput;
+    return true;
+}
 } // namespace
 
 // P19 (r12, sol r11 B1): (i) hidden, the history marked as sol's H; one more Q,P excursion leaves the identical list and
@@ -1065,6 +1072,9 @@ TEST(ViewerIdlePolicy, PeriodicFullHistoryExcursionShowsTheHiddenCursor)
     viewer_idle::win_hook::historyReader() = scriptedHistory;
     viewer_idle::win_hook::cursorReader() = scriptedCursor;
     viewer_idle::win_hook::queueStatusReader() = scriptedQueueStatus;
+    viewer_idle::win_hook::LastInputReader savedInput = viewer_idle::win_hook::lastInputReader();
+    viewer_idle::win_hook::lastInputReader() = scriptedLastInput;
+    g_lastInput = 7000;
     MOUSEHOOKSTRUCT back = {};
     back.pt.x = 500;
     back.pt.y = 500;
@@ -1084,6 +1094,7 @@ TEST(ViewerIdlePolicy, PeriodicFullHistoryExcursionShowsTheHiddenCursor)
         ASSERT_TRUE(viewer_idle::win_hook::historyMark().marked());
 
         setPeriodicScript();   // the excursion leaves [P,Q]+H[0:62] == H
+        ++g_lastInput;         // it is input (injected or not): the system's last-input time moves
         viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&back));
         viewer_idle::Inputs in = allPass();
         if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
@@ -1106,6 +1117,7 @@ TEST(ViewerIdlePolicy, PeriodicFullHistoryExcursionShowsTheHiddenCursor)
         viewer_idle::win_hook::markHistory();
 
         setPeriodicScript();
+        ++g_lastInput;
         g_queueStatus = 0x00020002;   // QS_MOUSEMOVE
         viewer_idle::Inputs in = allPass();
         if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
@@ -1114,22 +1126,109 @@ TEST(ViewerIdlePolicy, PeriodicFullHistoryExcursionShowsTheHiddenCursor)
         ASSERT_FALSE(c.hidden());
     }
 
-    // The matcher itself: the identical full periodic list is ambiguous, so it is movement. A list one point short of
-    // full cannot have scrolled: only its whole line-up counts (no excursion).
+    // The matcher itself: the identical full periodic list is ambiguous; it is movement iff input came after the mark
+    // (unknown counts). A list two points short of full cannot have scrolled: only its whole line-up counts.
     {
         setPeriodicScript();
         viewer_idle::MoveHistoryMark m;
         m.mark(g_script, g_scriptCount);
         ASSERT_TRUE(m.leftSinceMark(g_script, g_scriptCount, 500, 500));
+        ASSERT_TRUE(m.leftSinceMark(g_script, g_scriptCount, 500, 500, true));
+        ASSERT_FALSE(m.leftSinceMark(g_script, g_scriptCount, 500, 500, false));
         viewer_idle::MoveHistoryMark shortMark;
         shortMark.mark(g_script, g_scriptCount - 2);
         ASSERT_FALSE(shortMark.leftSinceMark(g_script, g_scriptCount - 2, 500, 500));
+        // An unambiguous excursion never needs the input signal.
+        const viewer_idle::HistoryPoint marked[] = {hp(500, 500, 1000), hp(490, 500, 990)};
+        const viewer_idle::HistoryPoint awayAndBack[] = {hp(500, 500, 1200), hp(510, 500, 1100), hp(500, 500, 1000),
+                                                         hp(490, 500, 990)};
+        viewer_idle::MoveHistoryMark plain;
+        plain.mark(marked, 2);
+        ASSERT_TRUE(plain.leftSinceMark(awayAndBack, 4, 500, 500, false));
     }
 
     g_queueStatus = 0;
     viewer_idle::win_hook::historyReader() = savedHistory;
     viewer_idle::win_hook::cursorReader() = savedCursor;
     viewer_idle::win_hook::queueStatusReader() = savedQueue;
+    viewer_idle::win_hook::lastInputReader() = savedInput;
+    viewer_idle::win_hook::remove();
+}
+
+// P19c (r12, adversary pass 18 A1): hidden with sol's periodic H marked; the app's own hide makes Windows synthesize a
+// WM_MOUSEMOVE at the unchanged position (no input: the last-input time stays). Retrieved by the hook or still queued at
+// the tick, it must leave the cursor hidden and the idle clock alone, after every hide. The first r12 head (c6187981)
+// counted any ambiguous full history as movement and re-showed it (RED). Control: the same message with the last-input
+// time moved shows.
+TEST(ViewerIdlePolicy, PeriodicFullHistorySynthesizedMoveAfterTheHideStaysHidden)
+{
+    viewer_idle::win_hook::HistoryReader savedHistory = viewer_idle::win_hook::historyReader();
+    viewer_idle::win_hook::CursorReader savedCursor = viewer_idle::win_hook::cursorReader();
+    viewer_idle::win_hook::QueueStatusReader savedQueue = viewer_idle::win_hook::queueStatusReader();
+    viewer_idle::win_hook::LastInputReader savedInput = viewer_idle::win_hook::lastInputReader();
+    viewer_idle::win_hook::historyReader() = scriptedHistory;
+    viewer_idle::win_hook::cursorReader() = scriptedCursor;
+    viewer_idle::win_hook::queueStatusReader() = scriptedQueueStatus;
+    viewer_idle::win_hook::lastInputReader() = scriptedLastInput;
+    MOUSEHOOKSTRUCT same = {};
+    same.pt.x = 500;
+    same.pt.y = 500;
+    int rearm = 0;
+
+    for (const bool viaQueue : {false, true})
+    {
+        viewer_idle::Controller c;
+        c.setFullscreen(true, 0);
+        g_cursor = QPoint(500, 500);
+        g_queueStatus = 0;
+        g_lastInput = 9000;
+        viewer_idle::win_hook::witness().seed(QPoint(500, 500));
+        setPeriodicScript();
+        viewer_idle::win_hook::markHistory();   // install()
+        int hides = 0;
+        int shows = 0;
+        // Polls for three idle periods; after every poll that hid, the synthesized move arrives (RED: hide, show, ...).
+        bool synthesizePending = false;
+        for (qint64 now = 50; now <= 8000; now += 50)
+        {
+            if (synthesizePending)
+            {
+                if (viaQueue) g_queueStatus = 0x00020002;
+                else viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&same));
+                synthesizePending = false;
+            }
+            viewer_idle::Inputs in = allPass();
+            if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
+            if (viewer_idle::win_hook::lookAtQueue()) in.pointerMoved = true;
+            g_queueStatus = 0;   // the queued synthesized move is taken after the tick
+            const viewer_idle::Tick tick = c.onTimeout(in, now, 2000, &rearm, 50);
+            if (tick == viewer_idle::Tick::Hide)
+            {
+                ++hides;
+                synthesizePending = true;
+            }
+            if (tick == viewer_idle::Tick::Show) ++shows;
+        }
+        ASSERT_EQ(1, hides);
+        ASSERT_EQ(0, shows);
+        ASSERT_TRUE(c.hidden());
+
+        // Control: the same message after real input (the last-input time moved) is movement and shows.
+        ++g_lastInput;
+        if (viaQueue) g_queueStatus = 0x00020002;
+        else viewer_idle::win_hook::proc(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&same));
+        viewer_idle::Inputs in = allPass();
+        if (viewer_idle::win_hook::witness().take()) in.pointerMoved = true;
+        if (viewer_idle::win_hook::lookAtQueue()) in.pointerMoved = true;
+        g_queueStatus = 0;
+        ASSERT_EQ(tickValue(viewer_idle::Tick::Show), tickValue(c.onTimeout(in, 8050, 2000, &rearm, 50)));
+    }
+
+    g_queueStatus = 0;
+    viewer_idle::win_hook::historyReader() = savedHistory;
+    viewer_idle::win_hook::cursorReader() = savedCursor;
+    viewer_idle::win_hook::queueStatusReader() = savedQueue;
+    viewer_idle::win_hook::lastInputReader() = savedInput;
     viewer_idle::win_hook::remove();
 }
 
@@ -1144,6 +1243,9 @@ TEST(ViewerIdlePolicy, PeriodicFullHistoryWithAQuietPointerStillHides)
     viewer_idle::win_hook::historyReader() = scriptedHistory;
     viewer_idle::win_hook::cursorReader() = scriptedCursor;
     viewer_idle::win_hook::queueStatusReader() = scriptedQueueStatus;
+    viewer_idle::win_hook::LastInputReader savedInput = viewer_idle::win_hook::lastInputReader();
+    viewer_idle::win_hook::lastInputReader() = scriptedLastInput;
+    g_lastInput = 8000;
     int rearm = 0;
     {
         viewer_idle::Controller c;
@@ -1177,6 +1279,7 @@ TEST(ViewerIdlePolicy, PeriodicFullHistoryWithAQuietPointerStillHides)
     viewer_idle::win_hook::historyReader() = savedHistory;
     viewer_idle::win_hook::cursorReader() = savedCursor;
     viewer_idle::win_hook::queueStatusReader() = savedQueue;
+    viewer_idle::win_hook::lastInputReader() = savedInput;
     viewer_idle::win_hook::remove();
 }
 #endif

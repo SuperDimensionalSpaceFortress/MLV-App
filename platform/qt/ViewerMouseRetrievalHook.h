@@ -153,6 +153,45 @@ inline QueueStatusReader &queueStatusReader()
     return r;
 }
 
+/*! \brief r12 (adversary pass 18 A1): the system's last-input time (GetLastInputInfo; a test supplies a scripted one).
+ *         Real input moves it, injected input included; a move Windows synthesizes at an unchanged position does not. */
+inline bool readSystemLastInput( quint32 *tick )
+{
+    LASTINPUTINFO info = {};
+    info.cbSize = sizeof( LASTINPUTINFO );
+    if( !tick || !GetLastInputInfo( &info ) ) return false;
+    *tick = quint32( info.dwTime );
+    return true;
+}
+using LastInputReader = bool (*)( quint32 *tick );
+inline LastInputReader &lastInputReader()
+{
+    static LastInputReader r = readSystemLastInput;
+    return r;
+}
+
+/*! \brief The last-input time read just before the mark's history read; have is false when it was not read. */
+struct MarkedInput
+{
+    quint32 tick = 0;
+    bool have = false;
+};
+inline MarkedInput &markedInput()
+{
+    static MarkedInput m;
+    return m;
+}
+
+/*! \brief r12 (adversary pass 18 A1): true iff real input reached the system after the mark (the last-input time
+ *         moved), or it cannot be told (either read missing). Decides only an ambiguous full history
+ *         (MoveHistoryMark::leftSinceMark). */
+inline bool inputSinceMark()
+{
+    quint32 now = 0;
+    if( !lastInputReader()( &now ) || !markedInput().have ) return true;
+    return now != markedInput().tick;
+}
+
 /*! \brief Where the cursor was at the last mark (install or the last tick); have is false when it was not read. */
 struct LastLook
 {
@@ -176,13 +215,21 @@ inline bool markHistoryAt( QPoint *cursor, bool *leftSinceMark )
     if( !cursorReader()( &at ) )
     {
         historyMark().unmark();
+        markedInput().have = false;
         lastLook().have = false;
         return false;
     }
+    // r12 (adversary pass 18 A1): the last-input time is read BEFORE the history, so input between the two reads is
+    // newer than the stored time and is judged again at the next look (errs toward movement, never toward missing it).
+    quint32 inputNow = 0;
+    const bool haveInput = lastInputReader()( &inputNow );
+    const bool inputSince = !haveInput || !markedInput().have || inputNow != markedInput().tick;
     HistoryPoint points[MoveHistoryMark::kMaxPoints];
     const int n = historyReader()( at, points, MoveHistoryMark::kMaxPoints );
-    if( leftSinceMark ) *leftSinceMark = historyMark().leftSinceMark( points, n, at.x(), at.y() );
+    if( leftSinceMark ) *leftSinceMark = historyMark().leftSinceMark( points, n, at.x(), at.y(), inputSince );
     historyMark().mark( points, n );
+    markedInput().tick = inputNow;
+    markedInput().have = haveInput;
     lastLook().pos = at;
     lastLook().have = true;
     if( cursor ) *cursor = at;
@@ -239,7 +286,7 @@ inline LRESULT CALLBACK proc( int code, WPARAM wParam, LPARAM lParam )
             {
                 HistoryPoint points[MoveHistoryMark::kMaxPoints];
                 const int n = historyReader()( pos, points, MoveHistoryMark::kMaxPoints );
-                if( historyMark().leftSinceMark( points, n, pos.x(), pos.y() ) ) witness().noteExcursion();
+                if( historyMark().leftSinceMark( points, n, pos.x(), pos.y(), inputSinceMark() ) ) witness().noteExcursion();
             }
             witness().note( kind, pos, code == HC_ACTION );
             // Movement is pending, so the next tick counts it (and shows a hidden cursor) and marks afresh.
@@ -270,6 +317,7 @@ inline void remove()
     }
     witness().reset();
     historyMark().unmark();
+    markedInput().have = false;
     lastLook().have = false;
 }
 

@@ -323,7 +323,7 @@ TEST(ViewerIdleWiring, EveryTickMarksTheMoveHistoryAndTheHookReadsItForASamePosi
     ASSERT_TRUE(proc.contains(QStringLiteral(
         "if( kind == RetrievedKind::Move && historyMark().marked() && witness().samePosition( pos ) )")));
     ASSERT_TRUE(proc.contains(QStringLiteral(
-        "if( historyMark().leftSinceMark( points, n, pos.x(), pos.y() ) ) witness().noteExcursion();")));
+        "if( historyMark().leftSinceMark( points, n, pos.x(), pos.y(), inputSinceMark() ) ) witness().noteExcursion();")));
     ASSERT_TRUE(proc.indexOf(QStringLiteral("witness().noteExcursion();"))
                 < proc.indexOf(QStringLiteral("witness().note( kind, pos, code == HC_ACTION );")));
     ASSERT_TRUE(proc.contains(QStringLiteral("if( witness().pending() ) historyMark().unmark();")));

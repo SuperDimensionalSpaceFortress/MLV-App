@@ -2981,6 +2981,13 @@ void viewerIdleSetScript( std::initializer_list<viewer_idle::HistoryPoint> point
     g_viewerIdleScriptCount = 0;
     for( const viewer_idle::HistoryPoint &p : points ) g_viewerIdleScript[g_viewerIdleScriptCount++] = p;
 }
+// r12 (adversary pass 18 A1): a scripted system last-input time (GetLastInputInfo).
+quint32 g_viewerIdleLastInput = 0;
+bool viewerIdleScriptedLastInput( quint32 *tick )
+{
+    *tick = g_viewerIdleLastInput;
+    return true;
+}
 viewer_idle::HistoryPoint viewerIdlePoint( int x, int y, quint32 time )
 {
     viewer_idle::HistoryPoint p;
@@ -3144,14 +3151,19 @@ void GuiSmokeTest::viewerCursorAutohide_periodicFullHistoryExcursionRestoresAndQ
 
     viewer_idle::win_hook::HistoryReader saved = viewer_idle::win_hook::historyReader();
     viewer_idle::win_hook::historyReader() = viewerIdleScriptedHistory;
+    // r12 (adversary pass 18 A1): a scripted last-input time, so the test controls whether input came after the mark.
+    viewer_idle::win_hook::LastInputReader savedInput = viewer_idle::win_hook::lastInputReader();
+    viewer_idle::win_hook::lastInputReader() = viewerIdleScriptedLastInput;
+    g_viewerIdleLastInput = 5000;
     ViewerIdleHarness harness( surfaces, 40 );
     harness.pollMs = 10;
     harness.markHistory = true;
     qApp->installEventFilter( &harness );
-    auto cleanup = qScopeGuard( [&harness, saved]() {
+    auto cleanup = qScopeGuard( [&harness, saved, savedInput]() {
         qApp->removeEventFilter( &harness );
         viewer_idle::win_hook::remove();
         viewer_idle::win_hook::historyReader() = saved;
+        viewer_idle::win_hook::lastInputReader() = savedInput;
     } );
     const QPoint start( 500, 500 );
     MOUSEHOOKSTRUCT back = {};
@@ -3169,14 +3181,18 @@ void GuiSmokeTest::viewerCursorAutohide_periodicFullHistoryExcursionRestoresAndQ
     QCOMPARE( gl.cursor().shape(), Qt::BlankCursor );
     viewer_idle::win_hook::witness().seed( start );
 
-    // Liveness: H stays, no message: no Show tick at all over many poll periods.
+    // Liveness: H stays, no message: no Show tick at all over many poll periods. Then the move Windows synthesizes
+    // after the app's own hide (adversary pass 18 A1: no input, the last-input time stays): still no Show tick.
     const int showsQuiet = harness.shows;
+    QTest::qWait( 300 );
+    viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
     QTest::qWait( 300 );
     QCOMPARE( harness.shows, showsQuiet );
     QVERIFY( harness.hidden() );
 
-    // The excursion: identical list, one coalesced move at start.
+    // The excursion: identical list, one coalesced move at start, and it was input (the last-input time moved).
     const int showsBefore = harness.shows;
+    ++g_viewerIdleLastInput;
     viewer_idle::win_hook::proc( HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>( &back ) );
     QTRY_VERIFY_WITH_TIMEOUT( harness.shows > showsBefore, 1000 );
     QCOMPARE( harness.shownViewportShape, Qt::OpenHandCursor );
