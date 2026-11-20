@@ -8264,11 +8264,13 @@ function Resolve-ClocksPowerTypeperf {
 
 # adversary ade3c7d5 A1: nvidia-smi.exe for the ADVISORY GPU sampler, from two fixed LOCAL paths only (System32, then the NVSMI folder), '' when absent. The
 # util sampler's resolver walks PATH, and a PATH entry on a slow share would spend the pre-launch telemetry allowance on one synchronous Test-Path per
-# entry before any deadline is checked; the GPU half is disclosure only now, so it never pays that cost. A blank variable or a UNC root is skipped.
+# entry before any deadline is checked; the GPU half is disclosure only now, so it never pays that cost. adversary 83a64d80 A1: the rule is "the root is on a
+# local fixed drive" (a drive letter whose type is Fixed), not "it is not a UNC": a provider-qualified UNC, a mapped share and an absent drive are all skipped.
 function Resolve-ClocksPowerNvidiaSmi {
     foreach ($root in @(([string]$env:SystemRoot + '\System32'), ([string]$env:ProgramFiles + '\NVIDIA Corporation\NVSMI'))) {
         try {
-            if ($root.StartsWith('\')) { continue }
+            if ($root -notmatch '^[A-Za-z]:\\') { continue }
+            if ([IO.DriveInfo]::new($root.Substring(0, 1)).DriveType -ne [IO.DriveType]::Fixed) { continue }
             $p = $root + '\nvidia-smi.exe'
             if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
         } catch { }

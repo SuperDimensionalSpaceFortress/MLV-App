@@ -1110,6 +1110,18 @@ try {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $r['nvUnc'] = T { Resolve-ClocksPowerNvidiaSmi }
     $r['nvUncFast'] = ($sw.ElapsedMilliseconds -lt 2000)
+    # adversary 83a64d80 A1: the class is "a root that is not on a local fixed drive", not only a leading backslash: a provider-qualified UNC and a
+    # drive letter that is not a fixed disk (a mapped share, a missing drive) are skipped too
+    $env:SystemRoot = 'FileSystem::\\slow-share-a\win'; $env:ProgramFiles = 'Microsoft.PowerShell.Core\FileSystem::\\slow-share-b\pf'
+    $r['nvProviderUnc'] = T { Resolve-ClocksPowerNvidiaSmi }
+    # a provider-qualified root that DOES hold the file (a local one, so the test never waits on a network): HEAD found it, the fix refuses the form
+    $env:SystemRoot = 'FileSystem::' + $nvSys; $env:ProgramFiles = ''
+    $r['nvProviderQualifiedLocal'] = T { Resolve-ClocksPowerNvidiaSmi }
+    $missing = ''
+    foreach ($ch in [char[]]'ZYXWVUTSRQPONMLKJIHGFED') { if (@([IO.DriveInfo]::GetDrives() | Where-Object { $_.Name.StartsWith([string]$ch) }).Count -eq 0) { $missing = [string]$ch; break } }
+    $r['nvMissingLetter'] = $missing
+    $env:SystemRoot = ($missing + ':\Windows'); $env:ProgramFiles = ($missing + ':\Program Files')
+    $r['nvNotFixedDrive'] = T { Resolve-ClocksPowerNvidiaSmi }
     $env:SystemRoot = ''; $env:ProgramFiles = ''
     $r['nvBlank'] = T { Resolve-ClocksPowerNvidiaSmi }
 } finally { $env:SystemRoot = $oldSys; $env:ProgramFiles = $oldPf; $env:PATH = $oldPath }
@@ -1176,6 +1188,10 @@ class ClocksPowerRoundEightTests(unittest.TestCase):
         self.assertEqual(self.r["nvUnc"], "", "a UNC root is skipped, not probed")
         self.assertIs(self.r["nvUncFast"], True)
         self.assertEqual(self.r["nvBlank"], "", "a blank root is skipped")
+        self.assertEqual(self.r["nvProviderUnc"], "", "a provider-qualified UNC root does not start with a backslash and is still skipped")
+        self.assertEqual(self.r["nvProviderQualifiedLocal"], "", "a provider-qualified root is refused even when it names a local folder that holds the file")
+        self.assertNotEqual(self.r["nvMissingLetter"], "", "the fixture needs one drive letter this host does not have")
+        self.assertEqual(self.r["nvNotFixedDrive"], "", "only a root on a local fixed drive is probed (a mapped share or an absent drive is not)")
 
     def test_r8_a1_the_clocks_call_site_uses_the_local_resolver_and_the_job_carries_it(self) -> None:
         sites = [ln for ln in self.text.splitlines() if "Start-ClocksPowerGpu $clocksPowerBackend" in ln]
@@ -1186,6 +1202,8 @@ class ClocksPowerRoundEightTests(unittest.TestCase):
         fn = re.search(r"(?ms)^function Resolve-ClocksPowerNvidiaSmi\b.*?^}", self.text)
         self.assertIsNotNone(fn)
         self.assertNotIn("env:PATH", fn.group(0))
+        self.assertIn("[IO.DriveType]::Fixed", fn.group(0), "a mapped share (Network) and an absent drive are not local fixed disks")
+        self.assertIn("DriveInfo", fn.group(0))
 
     def test_r8_the_block_function_never_reads_the_gpu_status(self) -> None:
         block = re.search(r"(?ms)^function Get-ClocksPowerBlock\b.*?^}", self.text)
