@@ -84,9 +84,11 @@ CAPTURE_IO_MAX_MS = _fifo_constant_ms("CaptureIoMaxMs")  # the largest bound the
 # run 44725973056: "capture cleanup abandoned after 5 s: C:\x\a.txt" on a loaded runner). r1 moved the bound to the helper's maximum (60 s)
 # and sol r1 (PR #876) showed that only moved the deadline: a task delayed 61000 ms is still abandoned. Every accept arm of
 # BoundedCaptureIoTests therefore runs with the seam of _accept_region(): the bound ($AcceptMs), the helper's own maximum ($CaptureIoMaxMs)
-# and the worker-start wait ($CaptureWorkerStartMs) are all the largest Int32 millisecond count (24.8 days), so no runner delay can elapse
-# inside a unit test. A hang is still a named failure: it ends at the case's own whole-script budget (run_bounded kills the tree). The cases
-# that assert a TIMEOUT keep their small typed bounds, because there the bound is the thing under test.
+# and the worker-start wait ($CaptureWorkerStartMs) are all the largest Int32 millisecond count (24.8 days), so none of the HELPER's own
+# deadlines can elapse inside a unit test. The one deadline that remains is the outer one: run_bounded kills the whole pwsh tree when the
+# case's whole-script budget (pwsh_script_budget_sec) runs out, and that budget charges every accept call CAPTURE_ACCEPT_CALL_CEILING_MS (never
+# less than r1's 125 s). A hang is therefore still a named failure of the case, at that budget. The cases that assert a TIMEOUT keep their
+# small typed bounds, because there the bound is the thing under test.
 CAPTURE_ACCEPT_BOUND_MS = 2**31 - 1
 CAPTURE_WORKER_START_MS = _fifo_constant_ms("CaptureWorkerStartMs")  # a worker may take this long to be ready, before the step's clock
 CAPTURE_WORKER_KILL_MS = _fifo_constant_ms("CaptureWorkerKillMs")  # teardown: each of the job, group and tree kills
@@ -97,6 +99,12 @@ CAPTURE_CEILING_SLACK_MS = CLEANUP_MARGIN_SEC * 1000  # scheduling slack on a lo
 def capture_call_ceiling_ms(bound_ms: int) -> int:
     """The longest a whole Read-CapturedResult / Remove-CaptureFiles call may take: worker start, the operation budget, the teardown, slack."""
     return CAPTURE_WORKER_START_MS + bound_ms + 3 * CAPTURE_WORKER_KILL_MS + 2 * CAPTURE_WORKER_REAP_MS + CAPTURE_CEILING_SLACK_MS
+
+
+# r3 (Grok G1): what the whole-script budget charges ONE accept call (a bound of CAPTURE_ACCEPT_BOUND_MS / `$AcceptMs`). The helper's own deadline
+# is gone for an accept arm, so the outer run_bounded budget is the only deadline left, and it must not be tighter than the one r1 allowed
+# (capture_call_ceiling_ms of the helper's 60 s maximum = 125 s). r2 charged a variable bound only the worker start bound (95 s per call).
+CAPTURE_ACCEPT_CALL_CEILING_MS = capture_call_ceiling_ms(CAPTURE_IO_MAX_MS)
 
 
 def max_wait_and_kill_sec(timeout: float) -> float:
@@ -378,6 +386,8 @@ def _pwsh_script_argv(script: str):
 
 PWSH_SCRIPT_BASE_SEC = 120  # a bare pwsh start, the compile of the capture type and the script's own end: what a script with NO worker call needs
 _CAPTURE_CALL = re.compile(r"\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b([^\n]*)")
+# the bound of an accept call on a call line: the seam variable (a pwsh script) or its value (a generated script, e.g. _plain_task_script)
+_ACCEPT_BOUND_ON_CALL_LINE = re.compile(r"(?i)\$AcceptMs\b|(?<![\w$.])" + str(CAPTURE_ACCEPT_BOUND_MS) + r"(?![\w.])")
 _LOOP_BLOCK_HEAD = re.compile(r"(?i)(?:\b(?:foreach|for|while)\s*\([^{}]*\)|\bdo|ForEach-Object)\s*$")
 
 
@@ -401,7 +411,7 @@ def pwsh_script_budget_sec(script: str, repeat: int = 1) -> float:
     capture_call_ceiling_ms(its bound) (the worker start bound, the operation, the teardown bounds, slack). A fixed 120 s therefore failed a
     valid script after four permitted slow starts (the transport case makes 18 calls). The budget is the base allowance plus, for every call
     site in the script body (the helpers' own definitions, before the END marker, are not calls), that call's ceiling; a call line whose bound
-    is a variable is charged the worker start bound. A script that wraps calls in a loop must say how often with `repeat`, so a loop can never
+    is `$AcceptMs` (or its value) is charged CAPTURE_ACCEPT_CALL_CEILING_MS (r3 G1), any other variable bound the worker start bound. A script that wraps calls in a loop must say how often with `repeat`, so a loop can never
     hide calls from the derivation. A genuine hang still ends at the budget: run_bounded kills the whole tree and fails by case name.
     """
     marker = "# END bounded capture io"
@@ -413,7 +423,10 @@ def pwsh_script_budget_sec(script: str, repeat: int = 1) -> float:
         if re.search(r"(?i)\bfunction\s+$", body[:match.start()]):
             continue
         bounds = [int(n) for n in re.findall(r"(?<![\w$.])\d+(?![\w.])", match.group(2)) if 0 < int(n) <= MAX_DECLARED_BOUND_MS]
-        ceiling = capture_call_ceiling_ms(max(bounds) if bounds else CAPTURE_WORKER_START_MS)
+        if _ACCEPT_BOUND_ON_CALL_LINE.search(match.group(2)):
+            ceiling = CAPTURE_ACCEPT_CALL_CEILING_MS  # r3 G1: an accept call is charged the named accept ceiling, not the worker start bound
+        else:
+            ceiling = capture_call_ceiling_ms(max(bounds) if bounds else CAPTURE_WORKER_START_MS)
         if _call_is_inside_a_loop(body, match.start()):
             looped_ms += ceiling
         else:
@@ -444,11 +457,21 @@ def _fifo_capture_io_region(fifo: str) -> str:
     return fifo[begin:fifo.index("# END bounded capture io")]
 
 
-def _accept_region() -> str:
+def _raw_region_with_maximum(helper_max_ms: int) -> str:
+    """The capture region with NO accept seam, its helper maximum ($CaptureIoMaxMs) patched down to `helper_max_ms`: the scaled stand-in for
+    a seam that only moved the deadline (r1: the bound was the helper's own maximum)."""
+    return _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n" + f"$CaptureIoMaxMs = {helper_max_ms}\n"
+
+
+def _accept_region(helper_max_ms: int | None = None) -> str:
     """The capture region plus the accept-arm seam (sol r2 B1): after the region has defined its bounds, `$AcceptMs`, `$CaptureIoMaxMs` and
-    `$CaptureWorkerStartMs` become CAPTURE_ACCEPT_BOUND_MS, so a success asserted by an accept arm is never measured against a real deadline."""
-    return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
-            f"$CaptureIoMaxMs = {CAPTURE_ACCEPT_BOUND_MS}; $CaptureWorkerStartMs = {CAPTURE_ACCEPT_BOUND_MS}; $AcceptMs = {CAPTURE_ACCEPT_BOUND_MS}\n")
+    `$CaptureWorkerStartMs` become CAPTURE_ACCEPT_BOUND_MS, so no deadline of the HELPER can end a success asserted by an accept arm (the outer
+    run_bounded whole-script budget remains). `helper_max_ms` first patches the helper maximum down, as _raw_region_with_maximum does, to
+    prove the seam overrides it (r3 G2)."""
+    region = _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+    if helper_max_ms is not None:
+        region += f"$CaptureIoMaxMs = {helper_max_ms}\n"
+    return region + f"$CaptureIoMaxMs = {CAPTURE_ACCEPT_BOUND_MS}; $CaptureWorkerStartMs = {CAPTURE_ACCEPT_BOUND_MS}; $AcceptMs = {CAPTURE_ACCEPT_BOUND_MS}\n"
 
 
 # sol r12 B1: what a forced end of a pwsh process looks like in code. Neither the bounded capture helpers nor the proof of their exit may use it.
@@ -2180,15 +2203,16 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(offenders, [], "a leaf-asserting test feeds Read-Captured* a drive-letter literal; use a Join-Path temp path")
 
     @staticmethod
-    def _plain_task_script(bound_ms: int, factory_delay_ms: int = 0) -> str:
-        """The plain-completed-task arms at `bound_ms`. `factory_delay_ms` is the forced-slow seam: every factory spends that long before it
-        hands back its task, the way a loaded runner spends it starting the worker and finishing the call."""
+    def _plain_task_script(bound_ms: int | str, factory_delay_ms: int = 0, region: str | None = None) -> str:
+        """The plain-completed-task arms at `bound_ms` (a number, or the name of a pwsh variable such as `$AcceptMs`). `factory_delay_ms` is the
+        forced-slow seam: every factory spends that long before it hands back its task, the way a loaded runner spends it starting the worker
+        and finishing the call. `region` replaces the default accept region (r3 G2: the raw region with a patched-down maximum)."""
         slow = f"Start-Sleep -Milliseconds {factory_delay_ms}; " if factory_delay_ms else ""
         # The reads take a NATIVE path (Join-Path): the reader names the leaf with GetFileName, which is 'a.txt' for 'C:\x\a.txt' on Windows but
         # the whole literal on Linux (the r11 leaf-name rule), and the forced-slow case asserts that leaf in its timeout text.
-        return (_accept_region() + "\n"
+        return ((region if region is not None else _accept_region()) + "\n"
                 "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                f"$plain = {{ param($p) {slow}[Threading.Tasks.Task]::CompletedTask }}\n"
+                f"$plain ={{ param($p) {slow}[Threading.Tasks.Task]::CompletedTask }}\n"
                 f"$ran = {{ param($p) {slow}[Threading.Tasks.Task]::Delay(1) }}\n"
                 f"Write-Output ('PLAIN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $plain) + ']')\n"
                 f"Write-Output ('RUN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') {bound_ms} $ran) + ']')\n"
@@ -2216,7 +2240,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # (a loaded runner's start/finish latency, scaled down). Under a bound that latency can exceed (300 ms: the old typed 5 s and equally the
         # r1 bound of 60 s, the helper's own maximum, which a 61 s latency crosses; both scaled to a bound under the seam's 400 ms) the arms are
         # ABANDONED, so the success the accept test asserts was a statement about the runner; under the accept bound (CAPTURE_ACCEPT_BOUND_MS,
-        # no real deadline) the same slow seam still yields every clean verdict. sol r2 B1 made the second half true for 61 s, not only 5 s.
+        # no helper deadline) the same slow seam still yields every clean verdict. sol r2 B1 made the second half true for 61 s, not only 5 s.
         slow_ms = 400
         self.assertLess(slow_ms, 1000, "a case in this class never performs a real wait of a second")
         red = self._pwsh(self._plain_task_script(300, factory_delay_ms=slow_ms))
@@ -2228,11 +2252,47 @@ class BoundedCaptureIoTests(unittest.TestCase):
         for row in ("PLAIN-DEL|[]", "RUN-DEL|[]", "PLAIN-READ|True|[]", "RUN-READ|True|[]"):
             self.assertIn(row, green.stdout)
 
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_r3_g2_a_delay_past_the_helper_maximum_abandons_a_raw_read_and_not_an_accept_arm(self) -> None:
+        # r3 (Grok G2), executable and scaled: the helper maximum is patched down to 300 ms, and the factory delay is taken from the bound it
+        # must defeat (maximum + margin), never a fixed constant. In the RAW region (r1's seam: the bound IS the helper maximum) a read that
+        # delayed past it is ABANDONED, which is the sol r1 escape (61000 ms past 60000 ms), without a real wait of a second. The same delay
+        # under _accept_region() (with the same patched maximum, which the seam must override) yields every clean row. A seam that only moved
+        # the deadline (the accept bound = the helper maximum) fails the second half.
+        maximum_ms, margin_ms = 300, 100
+        slow_ms = maximum_ms + margin_ms
+        self.assertLess(slow_ms, 1000, "a case in this class never performs a real wait of a second")
+        raw = self._pwsh(self._plain_task_script("$CaptureIoMaxMs", factory_delay_ms=slow_ms, region=_raw_region_with_maximum(maximum_ms)))
+        self.assertEqual(raw.returncode, 0, raw.stdout + raw.stderr)
+        self.assertIn(f"PLAIN-DEL|[capture cleanup abandoned after {maximum_ms / 1000:g} s: C:\\x\\a.txt]", raw.stdout, "the delay must cross the patched maximum")
+        self.assertIn(f"PLAIN-READ|False|[<read timed out: a.txt not readable within {maximum_ms} ms>]", raw.stdout)
+        accept = self._pwsh(self._plain_task_script("$AcceptMs", factory_delay_ms=slow_ms, region=_accept_region(helper_max_ms=maximum_ms)))
+        self.assertEqual(accept.returncode, 0, accept.stdout + accept.stderr)
+        for row in ("PLAIN-DEL|[]", "RUN-DEL|[]", "PLAIN-READ|True|[]", "RUN-READ|True|[]"):
+            self.assertIn(row, accept.stdout)
+
+    def test_r3_g1_one_accept_call_is_charged_no_less_than_the_r1_ceiling_by_the_whole_script_budget(self) -> None:
+        # r3 (Grok G1): the whole-script budget is the one deadline an accept arm still has (run_bounded kills the tree there). r2 charged a call
+        # whose bound is a variable the worker start bound only (95 s), below r1's 125 s. A script with exactly one `$AcceptMs` call is pinned to
+        # the named accept ceiling, so the charge cannot shrink silently again; so is a generated script that embeds the accept bound's value.
+        self.assertGreaterEqual(CAPTURE_ACCEPT_CALL_CEILING_MS, capture_call_ceiling_ms(CAPTURE_IO_MAX_MS))
+        self.assertGreaterEqual(CAPTURE_ACCEPT_CALL_CEILING_MS, 125_000, "r1's per-call charge for the helper's 60 s maximum")
+        self.assertGreater(CAPTURE_ACCEPT_CALL_CEILING_MS, capture_call_ceiling_ms(CAPTURE_WORKER_START_MS), "r2's per-call charge (95 s), which was too small")
+        region = "function Read-CapturedResult { }\n# END bounded capture io\n"
+        one = region + "$r = Read-CapturedResult $p $AcceptMs $f\n"
+        self.assertEqual(pwsh_script_budget_sec(one), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        self.assertEqual(pwsh_script_budget_sec(region + "$n = Remove-CaptureFiles @($p) $AcceptMs $f\n"), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        generated = region + f"$r = Read-CapturedResult $p {CAPTURE_ACCEPT_BOUND_MS} $f\n"
+        self.assertEqual(pwsh_script_budget_sec(generated), PWSH_SCRIPT_BASE_SEC + CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+        two = one + "$r = Read-CapturedResult $p $AcceptMs $f\n"
+        self.assertEqual(pwsh_script_budget_sec(two), PWSH_SCRIPT_BASE_SEC + 2 * CAPTURE_ACCEPT_CALL_CEILING_MS / 1000)
+
     def test_the_accept_bound_is_no_deadline_a_runner_delay_can_cross(self) -> None:
         # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 r2 (sol r1 blocker): 5 s -> 60 s only moved the real deadline. A success verdict that
-        # is measured against ANY real deadline is still a statement about the runner (a task delayed 61000 ms under a 60000 ms bound is
-        # abandoned). The accept arms therefore run with the seam of _accept_region: the bound and the worker-start wait are both raised past
-        # anything a case can wait out, so a hang is still a named failure of the case's own whole-script budget, never a slow success turned red.
+        # is measured against ANY real deadline of the helper is still a statement about the runner (a task delayed 61000 ms under a 60000 ms
+        # bound is abandoned). The accept arms therefore run with the seam of _accept_region: the bound and the worker-start wait are both raised
+        # past anything a case can wait out, so a slow success is never turned red by the helper. The one deadline left is the outer run_bounded
+        # budget (pwsh_script_budget_sec): a hang is still a named failure of the case there.
         self.assertGreater(CAPTURE_ACCEPT_BOUND_MS, CAPTURE_IO_MAX_MS, "the accept bound is the helper's maximum, which is itself a real deadline")
         self.assertLessEqual(CAPTURE_ACCEPT_BOUND_MS, 2**31 - 1, "an [int] bound: Task.Wait / WaitForExit take an Int32")
         seam = _accept_region()
@@ -2263,7 +2323,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
                     # accepted here and is still a real deadline). An accept arm passes `$AcceptMs` (or CAPTURE_ACCEPT_BOUND_MS from Python).
                     if 1000 <= int(number) <= MAX_DECLARED_BOUND_MS and name not in self._LONG_BOUND_EXEMPT:
                         bounds.append(f"{name}: {number}")
-        self.assertEqual(bounds, [], "an accept arm passes a typed bound; use $AcceptMs (the seam of _accept_region), which no runner delay can elapse")
+        self.assertEqual(bounds, [], "an accept arm passes a typed bound; use $AcceptMs (the seam of _accept_region), which no helper deadline can end")
         waits = []
         for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
             name = chunk.split("(", 1)[0]
@@ -2298,6 +2358,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
     # (sol r2 B1: the orphan case was exempt for its typed 40 s bound; it is an accept arm like the rest and now passes $AcceptMs.)
     _LONG_BOUND_EXEMPT = frozenset({
         "test_r16_c1_the_whole_script_budget_is_derived_from_the_calls_the_script_makes",
+        "test_r3_g1_one_accept_call_is_charged_no_less_than_the_r1_ceiling_by_the_whole_script_budget",  # pins the budget arithmetic; `/ 1000` is ms -> s, not a bound
     })
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
