@@ -81,10 +81,13 @@ CAPTURE_IO_MAX_MS = _fifo_constant_ms("CaptureIoMaxMs")  # the largest bound the
 # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1: a case that asserts a SUCCESS (a finished task, a clean cleanup, the text read back) is
 # measured against the helper's bound from the call's clock, and the worker process it hands the factory to must start its answer, write it
 # and END inside that bound. A typed 5 s therefore made the verdict a statement about the runner (hosted `windows unittest heavy 7/14`,
-# run 44725973056: "capture cleanup abandoned after 5 s: C:\x\a.txt" on a loaded runner). Every accept arm of BoundedCaptureIoTests passes
-# this bound, the largest the helper permits, so the bound cannot elapse inside a unit test; the cases that assert a TIMEOUT keep their small
-# typed bounds, because there the bound is the thing under test.
-CAPTURE_ACCEPT_BOUND_MS = CAPTURE_IO_MAX_MS
+# run 44725973056: "capture cleanup abandoned after 5 s: C:\x\a.txt" on a loaded runner). r1 moved the bound to the helper's maximum (60 s)
+# and sol r1 (PR #876) showed that only moved the deadline: a task delayed 61000 ms is still abandoned. Every accept arm of
+# BoundedCaptureIoTests therefore runs with the seam of _accept_region(): the bound ($AcceptMs), the helper's own maximum ($CaptureIoMaxMs)
+# and the worker-start wait ($CaptureWorkerStartMs) are all the largest Int32 millisecond count (24.8 days), so no runner delay can elapse
+# inside a unit test. A hang is still a named failure: it ends at the case's own whole-script budget (run_bounded kills the tree). The cases
+# that assert a TIMEOUT keep their small typed bounds, because there the bound is the thing under test.
+CAPTURE_ACCEPT_BOUND_MS = 2**31 - 1
 CAPTURE_WORKER_START_MS = _fifo_constant_ms("CaptureWorkerStartMs")  # a worker may take this long to be ready, before the step's clock
 CAPTURE_WORKER_KILL_MS = _fifo_constant_ms("CaptureWorkerKillMs")  # teardown: each of the job, group and tree kills
 CAPTURE_WORKER_REAP_MS = _fifo_constant_ms("CaptureWorkerReapMs")  # teardown: the reap, and the scratch directory removal
@@ -439,6 +442,13 @@ def _fifo_capture_io_region(fifo: str) -> str:
     """The fifo script's bounded capture io helpers, between their BEGIN / END markers, ready to dot-source in a bare pwsh."""
     begin = fifo.index("# BEGIN bounded capture io")
     return fifo[begin:fifo.index("# END bounded capture io")]
+
+
+def _accept_region() -> str:
+    """The capture region plus the accept-arm seam (sol r2 B1): after the region has defined its bounds, `$AcceptMs`, `$CaptureIoMaxMs` and
+    `$CaptureWorkerStartMs` become CAPTURE_ACCEPT_BOUND_MS, so a success asserted by an accept arm is never measured against a real deadline."""
+    return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+            f"$CaptureIoMaxMs = {CAPTURE_ACCEPT_BOUND_MS}; $CaptureWorkerStartMs = {CAPTURE_ACCEPT_BOUND_MS}; $AcceptMs = {CAPTURE_ACCEPT_BOUND_MS}\n")
 
 
 # sol r12 B1: what a forced end of a pwsh process looks like in code. Neither the bounded capture helpers nor the proof of their exit may use it.
@@ -2063,15 +2073,15 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # Real pwsh, scaled: the typed base is patched down to 4 s (standing in for the old fixed cap), and every worker start is delayed
         # 2 s (a PERMITTED delay: far under CaptureWorkerStartMs). Three calls then run longer than that base, so a fixed cap of that size
         # fails this script; the derived budget adds the three calls' own ceilings and passes it.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "# END bounded capture io\n"
                   "$real = (Get-Command Start-CaptureWorker -CommandType Function).ScriptBlock\n"
                   "function Start-CaptureWorker { Start-Sleep -Milliseconds 2000; & $real }\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$f = { param($p) [Threading.Tasks.Task]::FromResult('ok') }\n"
-                  "$r = Read-CapturedResult $p 60000 $f; Write-Output ('ONE|' + $r.Ok + '|' + $r.Text)\n"
-                  "$r = Read-CapturedResult $p 60000 $f; Write-Output ('TWO|' + $r.Ok + '|' + $r.Text)\n"
-                  "$r = Read-CapturedResult $p 60000 $f; Write-Output ('THREE|' + $r.Ok + '|' + $r.Text)\n")
+                  "$r = Read-CapturedResult $p $AcceptMs $f; Write-Output ('ONE|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $f; Write-Output ('TWO|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $f; Write-Output ('THREE|' + $r.Ok + '|' + $r.Text)\n")
         base = 4
         started = time.monotonic()
         with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", base):
@@ -2111,7 +2121,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
     def test_a_factory_that_consumes_the_bound_before_returning_a_completed_task_is_a_timeout_not_a_late_success(self) -> None:
         # sol r9 B1 (catalogue B-01): an expired budget used to become Wait(0), and an already-completed task then returned success even
         # though its factory had spent the whole bound. The deadline is measured from the call's start: elapsed >= bound is a timeout.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path: a drive-letter literal is not split on Linux (r11)
                   "$slowText = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$slowDel = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('') }\n"
@@ -2120,9 +2130,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$r = Read-CapturedResult $p 50 $slowText\n"
                   "Write-Output ('LATE-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('LATE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 50 $slowDel))\n"
-                  "$r = Read-CapturedResult $p 60000 $fastText\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $fastText\n"
                   "Write-Output ('FAST-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 60000 $fastDel) + ']')\n")
+                  "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') $AcceptMs $fastDel) + ']')\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("LATE-READ|False|<read timed out: a.txt not readable within 50 ms>", proc.stdout)
@@ -2137,16 +2147,16 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # The slow ToString makes the conversion cost deterministic. The check is the LAST step before a success is returned.
         # r13 (sol r12 B1): the factory and the conversion run in a worker PROCESS, so the slow type is defined inside the factory itself
         # (a PowerShell class: no compile, and a type of the calling process is not visible in the worker).
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path (r11): see the leaf-name guard test
                   "$slow = { param($p) class SlowText { [string] ToString() { [Threading.Thread]::Sleep(300); return 'payload' } }; "
                   "[Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
                   "$r = Read-CapturedResult $p 100 $slow\n"
                   "Write-Output ('SLOW-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('SLOW-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 100 $slow))\n"
-                  "$r = Read-CapturedResult $p 60000 $slow\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $slow\n"
                   "Write-Output ('INSIDE-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 60000 $slow))\n")
+                  "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') $AcceptMs $slow))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("SLOW-READ|False|<read timed out: a.txt not readable within 100 ms>", proc.stdout)
@@ -2176,7 +2186,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         slow = f"Start-Sleep -Milliseconds {factory_delay_ms}; " if factory_delay_ms else ""
         # The reads take a NATIVE path (Join-Path): the reader names the leaf with GetFileName, which is 'a.txt' for 'C:\x\a.txt' on Windows but
         # the whole literal on Linux (the r11 leaf-name rule), and the forced-slow case asserts that leaf in its timeout text.
-        return (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        return (_accept_region() + "\n"
                 "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                 f"$plain = {{ param($p) {slow}[Threading.Tasks.Task]::CompletedTask }}\n"
                 f"$ran = {{ param($p) {slow}[Threading.Tasks.Task]::Delay(1) }}\n"
@@ -2203,9 +2213,10 @@ class BoundedCaptureIoTests(unittest.TestCase):
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_the_plain_task_arms_pass_under_a_forced_slow_seam_only_because_their_bound_cannot_elapse(self) -> None:
         # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 RED/GREEN, without a real wait of a second: every factory is forced to spend 400 ms
-        # (a loaded runner's start/finish latency, scaled down). Under a bound that latency can exceed (300 ms, the shape of the old typed 5 s on
-        # a slow enough runner) the arms are ABANDONED, so the success the accept test asserts was a statement about the runner; under the
-        # accept bound the same slow seam still yields every clean verdict.
+        # (a loaded runner's start/finish latency, scaled down). Under a bound that latency can exceed (300 ms: the old typed 5 s and equally the
+        # r1 bound of 60 s, the helper's own maximum, which a 61 s latency crosses; both scaled to a bound under the seam's 400 ms) the arms are
+        # ABANDONED, so the success the accept test asserts was a statement about the runner; under the accept bound (CAPTURE_ACCEPT_BOUND_MS,
+        # no real deadline) the same slow seam still yields every clean verdict. sol r2 B1 made the second half true for 61 s, not only 5 s.
         slow_ms = 400
         self.assertLess(slow_ms, 1000, "a case in this class never performs a real wait of a second")
         red = self._pwsh(self._plain_task_script(300, factory_delay_ms=slow_ms))
@@ -2216,6 +2227,19 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
         for row in ("PLAIN-DEL|[]", "RUN-DEL|[]", "PLAIN-READ|True|[]", "RUN-READ|True|[]"):
             self.assertIn(row, green.stdout)
+
+    def test_the_accept_bound_is_no_deadline_a_runner_delay_can_cross(self) -> None:
+        # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 r2 (sol r1 blocker): 5 s -> 60 s only moved the real deadline. A success verdict that
+        # is measured against ANY real deadline is still a statement about the runner (a task delayed 61000 ms under a 60000 ms bound is
+        # abandoned). The accept arms therefore run with the seam of _accept_region: the bound and the worker-start wait are both raised past
+        # anything a case can wait out, so a hang is still a named failure of the case's own whole-script budget, never a slow success turned red.
+        self.assertGreater(CAPTURE_ACCEPT_BOUND_MS, CAPTURE_IO_MAX_MS, "the accept bound is the helper's maximum, which is itself a real deadline")
+        self.assertLessEqual(CAPTURE_ACCEPT_BOUND_MS, 2**31 - 1, "an [int] bound: Task.Wait / WaitForExit take an Int32")
+        seam = _accept_region()
+        self.assertIn(f"$CaptureIoMaxMs = {CAPTURE_ACCEPT_BOUND_MS}", seam)
+        self.assertIn(f"$CaptureWorkerStartMs = {CAPTURE_ACCEPT_BOUND_MS}", seam)
+        self.assertIn(f"$AcceptMs = {CAPTURE_ACCEPT_BOUND_MS}", seam)
+        self.assertGreater(seam.rindex("$CaptureIoMaxMs = "), seam.index("$CaptureIoMaxMs = " + str(CAPTURE_IO_MAX_MS)), "the override must come AFTER the region defines the variable")
 
     def test_no_accept_arm_of_the_bounded_capture_io_cases_carries_a_wall_clock_dependent_bound(self) -> None:
         # CI-FLAKE-HEAVY-SLOT-GATE-PLAIN-TASK-CLEANUP-5S-1 guard, source pin (every OS). In this class a bound of a second or more on a
@@ -2235,9 +2259,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
             # PowerShell command names are case-insensitive; a generator call (_plain_task_script) carries its bound as a Python argument.
             for match in re.finditer(r"(?i)(?:Read-Captured(?:Result|Text)|Remove-CaptureFiles)\b([^\n]*)|_plain_task_script\(([^\n]*)", chunk):
                 for number in re.findall(r"(?<![\w$.])(\d+)(?![\w.])", match.group(1) or match.group(2)):
-                    if 1000 <= int(number) <= MAX_DECLARED_BOUND_MS and int(number) != CAPTURE_ACCEPT_BOUND_MS and name not in self._LONG_BOUND_EXEMPT:
+                    # sol r2 B1: NO typed number of a second or more is an accept arm's bound, the helper's own maximum included (60000 was
+                    # accepted here and is still a real deadline). An accept arm passes `$AcceptMs` (or CAPTURE_ACCEPT_BOUND_MS from Python).
+                    if 1000 <= int(number) <= MAX_DECLARED_BOUND_MS and name not in self._LONG_BOUND_EXEMPT:
                         bounds.append(f"{name}: {number}")
-        self.assertEqual(bounds, [], f"an accept arm passes a typed bound other than CAPTURE_ACCEPT_BOUND_MS ({CAPTURE_ACCEPT_BOUND_MS})")
+        self.assertEqual(bounds, [], "an accept arm passes a typed bound; use $AcceptMs (the seam of _accept_region), which no runner delay can elapse")
         waits = []
         for chunk in re.split(r"\n    (?:@[^\n]*\n    )*def ", body):
             name = chunk.split("(", 1)[0]
@@ -2268,11 +2294,10 @@ class BoundedCaptureIoTests(unittest.TestCase):
         "test_a_process_the_factory_started_ends_with_the_worker_even_when_the_worker_ended_first",
         "_run_worker_driver",
     })
-    # Cases whose long literal is not an accept arm's bound: the budget arithmetic feeds the text of a call to a PURE function (nothing runs),
-    # and the orphan case needs a 40 s bound that outlasts its own 30 s factory wait (the accept bound would also do, but it is not a flake).
+    # Cases whose long literal is not an accept arm's bound: the budget arithmetic feeds the text of a call to a PURE function (nothing runs).
+    # (sol r2 B1: the orphan case was exempt for its typed 40 s bound; it is an accept arm like the rest and now passes $AcceptMs.)
     _LONG_BOUND_EXEMPT = frozenset({
         "test_r16_c1_the_whole_script_budget_is_derived_from_the_calls_the_script_makes",
-        "test_a_process_orphaned_by_an_ended_intermediate_still_ends_with_the_worker",
     })
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
@@ -2282,19 +2307,19 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # over 'still present: a.txt'. The generic base is now found by walking the BaseType chain. The ordinary Task<string> is the control.
         # r13 (sol r12 B1): the derived type is defined inside each factory (the factory runs in a worker process of its own).
         derived_type = "class DerivedTextTask : System.Threading.Tasks.Task[string] { DerivedTextTask([Func[string]]$f) : base($f) {} }; "
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$derived = { param($p) " + derived_type + "$t = [DerivedTextTask]::new([Func[string]]{ 'payload' }); $t.RunSynchronously(); $t }\n"
                   "$derivedDel = { param($p) " + derived_type + "$t = [DerivedTextTask]::new([Func[string]]{ 'still present: a.txt' }); $t.RunSynchronously(); $t }\n"
                   "$plain = { param($p) [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$plainDel = { param($p) [Threading.Tasks.Task]::FromResult('still present: a.txt') }\n"
                   "Write-Output ('DERIVED-TYPE|' + (& $derived $p).GetType().IsGenericType)\n"
-                  "$r = Read-CapturedResult $p 60000 $derived\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $derived\n"
                   "Write-Output ('DERIVED-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('DERIVED-DEL|' + (Remove-CaptureFiles @($p) 60000 $derivedDel))\n"
-                  "$r = Read-CapturedResult $p 60000 $plain\n"
+                  "Write-Output ('DERIVED-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $derivedDel))\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $plain\n"
                   "Write-Output ('PLAIN-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('PLAIN-DEL|' + (Remove-CaptureFiles @($p) 60000 $plainDel))\n")
+                  "Write-Output ('PLAIN-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $plainDel))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DERIVED-TYPE|False", proc.stdout, "the repro must really be a non-generic runtime type")
@@ -2391,7 +2416,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # adversary r13 A1: the r13 worker's JSON transport turned an ISO date string into a DateTime, so '2026-11-04T12:00:00Z' came back as
         # '11/04/2026 12:00:00' with Ok=True. Each text is rebuilt in the factory from its code units (the factory is self-contained), and
         # must come back code unit for code unit through the reader's text, the reader's failure and the cleanup's note.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$texts = @('2026-11-04T12:00:00Z', '{\"a\":1}', ' padded ', 'true', ('nul' + [char]0 + 'x'), ([string][char]0x00e9 + [char]0xD800 + 'z'))\n"
                   "$i = 0\n"
@@ -2400,11 +2425,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "  $make = '[string]::new([char[]]@(' + $units + '))'\n"
                   "  $ok = [scriptblock]::Create('param($p) [Threading.Tasks.Task]::FromResult(' + $make + ')')\n"
                   "  $bad = [scriptblock]::Create('param($p) throw ' + $make)\n"
-                  "  $r = Read-CapturedResult $p 60000 $ok\n"
+                  "  $r = Read-CapturedResult $p $AcceptMs $ok\n"
                   "  Write-Output (\"TEXT|$i|\" + ($r.Ok -and $r.Text -ceq $t))\n"
-                  "  $r = Read-CapturedResult $p 60000 $bad\n"
+                  "  $r = Read-CapturedResult $p $AcceptMs $bad\n"
                   "  Write-Output (\"ERROR|$i|\" + ((-not $r.Ok) -and $r.Text -ceq \"<read failed: $t>\"))\n"
-                  "  Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) 60000 $ok) -ceq \"capture cleanup incomplete: $t\"))\n"
+                  "  Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) $AcceptMs $ok) -ceq \"capture cleanup incomplete: $t\"))\n"
                   "  $i++\n"
                   "}\n")
         proc = self._pwsh(script, repeat=6)  # the loop runs the six texts: 18 worker calls in all
@@ -2416,14 +2441,14 @@ class BoundedCaptureIoTests(unittest.TestCase):
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_the_worker_hands_the_factory_its_argument_in_the_shape_it_was_given(self) -> None:
         # adversary r13 A2: a one-element string[] reached the cleanup factory as a String (so $paths[0] was 'C'), an empty one as $null.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$shape = { param($x) [Threading.Tasks.Task]::FromResult('type=' + $x.GetType().FullName + ' n=' + @($x).Count + ' items=' + ($x -join '|')) }\n"
                   "$none = { param($x) [Threading.Tasks.Task]::FromResult('null=' + ($null -eq $x) + ' type=' + $(if ($null -ne $x) { $x.GetType().FullName })) }\n"
-                  "Write-Output ('ONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 60000 $shape))\n"
-                  "Write-Output ('TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 60000 $shape))\n"
-                  "Write-Output ('EMPTY|' + (Remove-CaptureFiles @() 60000 $none))\n"
-                  "Write-Output ('SCALAR|' + (Read-CapturedResult $p 60000 $shape).Text)\n")
+                  "Write-Output ('ONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') $AcceptMs $shape))\n"
+                  "Write-Output ('TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') $AcceptMs $shape))\n"
+                  "Write-Output ('EMPTY|' + (Remove-CaptureFiles @() $AcceptMs $none))\n"
+                  "Write-Output ('SCALAR|' + (Read-CapturedResult $p $AcceptMs $shape).Text)\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ONE|capture cleanup incomplete: type=System.String[] n=1 items=C:\\x\\a.txt", proc.stdout)
@@ -2434,10 +2459,10 @@ class BoundedCaptureIoTests(unittest.TestCase):
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_null_element_of_the_argument_reaches_the_factory_as_null(self) -> None:
         # adversary r13 pass-2 A1: the wire kept the null ('-'), but the worker's indexed assignment into its string[] turned it into ''.
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$probe = { param($x) [Threading.Tasks.Task]::FromResult('null0=' + ($null -eq $x[0]) + ' empty1=' + ($x[1] -ceq '') + ' n=' + $x.Count) }\n"
                   "$paths = [string[]]::new(2); $paths[1] = ''\n"
-                  "Write-Output ('NULLS|' + (Remove-CaptureFiles $paths 60000 $probe))\n")
+                  "Write-Output ('NULLS|' + (Remove-CaptureFiles $paths $AcceptMs $probe))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("NULLS|capture cleanup incomplete: null0=True empty1=True n=2", proc.stdout)
@@ -2454,12 +2479,12 @@ class BoundedCaptureIoTests(unittest.TestCase):
                      "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
                      "[IO.File]::WriteAllText('" + pid_file.replace("'", "''") + "', [string]$c.Id)")
             encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
-            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+            script = (_accept_region() + "\n"
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                      "$orphaning = { param($p) $m = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
+                      "$orphaning ={ param($p) $m = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
                       "-ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', '" + encoded + "'); "
                       "$null = $m.WaitForExit(30000); [Threading.Tasks.Task]::FromResult('orphaned') }\n"
-                      "$r = Read-CapturedResult $p 40000 $orphaning\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $orphaning\n"
                       "Write-Output ('ORPHAN-READ|' + $r.Ok + '|' + $r.Text)\n"
                       "$id = [int][IO.File]::ReadAllText('" + pid_file.replace("'", "''") + "'); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                       "while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
@@ -2488,13 +2513,13 @@ class BoundedCaptureIoTests(unittest.TestCase):
                         "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
                         f"[IO.File]::WriteAllText('{quoted}', [string]$c.Id); {tail} }}")
 
-            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+            script = (_accept_region() + "\n"
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                       "$throwing = " + spawner(pid_files[0], "throw 'factory exploded'") + "\n"
                       "$finishing = " + spawner(pid_files[1], "[Threading.Tasks.Task]::FromResult('')") + "\n"
-                      "$r = Read-CapturedResult $p 60000 $throwing\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $throwing\n"
                       "Write-Output ('THROW-READ|' + $r.Ok + '|' + $r.Text)\n"
-                      "Write-Output ('FINISH-DEL|[' + (Remove-CaptureFiles @($p) 60000 $finishing) + ']')\n"
+                      "Write-Output ('FINISH-DEL|[' + (Remove-CaptureFiles @($p) $AcceptMs $finishing) + ']')\n"
                       "foreach ($f in @(" + ", ".join("'" + f.replace("'", "''") + "'" for f in pid_files) + ")) {\n"
                       "  $id = [int][IO.File]::ReadAllText($f); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                       "  while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
@@ -2521,20 +2546,20 @@ class BoundedCaptureIoTests(unittest.TestCase):
     def test_a_factory_the_worker_cannot_run_is_a_named_failure_not_a_hang_or_a_success(self) -> None:
         # r12/r13: the factory runs in its own worker process, so it must be self-contained. A variable of the calling scope, a missing type and a
         # throw are all named failures (the same <read failed: ...> / cleanup failed note), never a hang or a success.
-        script = ("$callerOnly = 'x'\n" + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = ("$callerOnly = 'x'\n" + _accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   "$callerClass = { param($p) if ($null -eq $callerOnly) { throw 'the caller scope is not visible in the worker' }; [Threading.Tasks.Task]::FromResult('x') }\n"
                   "$noType = { param($p) [NoSuchTypeAnywhere12]::new(); [Threading.Tasks.Task]::FromResult('x') }\n"
                   "$boom = { param($p) throw 'factory exploded' }\n"
-                  "$r = Read-CapturedResult $p 60000 $callerClass\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $callerClass\n"
                   "Write-Output ('CLASS-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('CLASS-DEL|' + (Remove-CaptureFiles @($p) 60000 $callerClass))\n"
-                  "$r = Read-CapturedResult $p 60000 $noType\n"
+                  "Write-Output ('CLASS-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $callerClass))\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $noType\n"
                   "Write-Output ('NOTYPE-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('NOTYPE-DEL|' + (Remove-CaptureFiles @($p) 60000 $noType))\n"
-                  "$r = Read-CapturedResult $p 60000 $boom\n"
+                  "Write-Output ('NOTYPE-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $noType))\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $boom\n"
                   "Write-Output ('BOOM-READ|' + $r.Ok + '|' + $r.Text)\n"
-                  "Write-Output ('BOOM-DEL|' + (Remove-CaptureFiles @($p) 60000 $boom))\n")
+                  "Write-Output ('BOOM-DEL|' + (Remove-CaptureFiles @($p) $AcceptMs $boom))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("CLASS-READ|False|<read failed: the caller scope is not visible in the worker>", proc.stdout)
@@ -2809,11 +2834,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
         sleeper = ("{ param($p) $c = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
                    "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
                    "[IO.File]::WriteAllText('" + pid_file.replace("'", "''") + "', [string]$c.Id); [Threading.Tasks.Task]::FromResult('hello from the factory') }")
-        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_accept_region() + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                   f"$factory = {sleeper}\n"
                   "Write-Output ('EXE|' + (Get-Process -Id $PID).Path)\n"
-                  "$r = Read-CapturedResult $p 60000 $factory\n"
+                  "$r = Read-CapturedResult $p $AcceptMs $factory\n"
                   "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n"
                   "$id = [int][IO.File]::ReadAllText('" + pid_file.replace("'", "''") + "'); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
@@ -2991,14 +3016,14 @@ class BoundedCaptureIoTests(unittest.TestCase):
                         "if (-not [IO.File]::Exists('" + quoted_pid_file + "')) { throw 'the session-escaping sleeper never became ready' }; "
                         "[Threading.Tasks.Task]::FromResult('escaped sleeper ready')")
             self.assertNotIn("\n'@", template)
-            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+            script = (_accept_region() + "\n"
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
                       "$argv = @((ConvertTo-CommandLineArg '/bin/sh'), (ConvertTo-CommandLineArg '" + script_file.replace("'", "''") + "'), "
                       "(ConvertTo-CommandLineArg '" + quoted_pid_file + "'))\n"
                       "$argvLiteral = '(' + (($argv | ForEach-Object { \"'\" + $_.Replace(\"'\", \"''\") + \"'\" }) -join ', ') + ')'\n"
                       "$template = @'\n" + template + "\n'@\n"
                       "$factory = [scriptblock]::Create($template.Replace('@ARGV@', $argvLiteral))\n"
-                      "$r = Read-CapturedResult $p 60000 $factory\n"
+                      "$r = Read-CapturedResult $p $AcceptMs $factory\n"
                       "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n")
             script_path = os.path.join(base, "driver.ps1")
             Path(script_path).write_text(script, encoding="utf-8")
