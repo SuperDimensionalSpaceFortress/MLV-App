@@ -261,7 +261,10 @@ inline bool operator==( const HistoryPoint &a, const HistoryPoint &b )
  * hook; still queued: by the tick) or is newer than the new one; none falls between them.
  *
  * Non-promises: an unmarked history (no point at the cursor position, or the read failed) never counts, so the
- * r5 position rule stands until the next mark. */
+ * r5 position rule stands until the next mark. Injected input with caller-supplied repeating timestamps that makes
+ * the FULL history periodic is not covered (hub split ruling r12b, option A; see leftSinceMark): there a key press
+ * plus a synthesized same-position move can Show once, and an excursion with a frozen last-input time is left to
+ * the r5 position rule (successor card PLAYER-CURSOR-RAW-INPUT-WITNESS-1). */
 class MoveHistoryMark
 {
 public:
@@ -311,6 +314,14 @@ public:
         // does not move the system's last-input time; a real excursion, injected or not, does. So an ambiguous
         // history is movement iff input reached the system after the mark. A list shorter than kMaxPoints cannot have
         // scrolled, so there only the r11 pick counts.
+        // NON-PROMISE (hub split ruling r12b, option A): injected input with caller-supplied repeating timestamps that
+        // makes the FULL history periodic (hardware timestamps do not repeat that way) is not covered. With such a
+        // history the signals here cannot separate two pairs, and this rule errs in a bounded way on each: (a) a key
+        // press, then a Windows-synthesized move at the unchanged position, reads as movement (one extra Show;
+        // adversary pass 19 A1); (b) an injected excursion whose caller-supplied times equal the marked last-input
+        // time reads as no movement (the r5 position rule decides, so one ending where it began stays hidden;
+        // adversary pass 19 A2). A witness that sees every move before coalescing (raw input or WH_MOUSE_LL) is the
+        // successor card PLAYER-CURSOR-RAW-INPUT-WITNESS-1.
         const bool left = anyElsewhere( newestFirst, newerByFirstFit( newestFirst, n ), x, y );
         if( left || n < kMaxPoints ) return left;
         const bool leftAtLargest = anyElsewhere( newestFirst, newerByLargestFit( newestFirst, n ), x, y );

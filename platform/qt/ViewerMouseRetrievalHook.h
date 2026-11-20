@@ -184,7 +184,13 @@ inline MarkedInput &markedInput()
 
 /*! \brief r12 (adversary pass 18 A1): true iff real input reached the system after the mark (the last-input time
  *         moved), or it cannot be told (either read missing). Decides only an ambiguous full history
- *         (MoveHistoryMark::leftSinceMark). */
+ *         (MoveHistoryMark::leftSinceMark).
+ *         NON-PROMISE (hub split ruling r12b, option A): the last-input time moves on keyboard input too, and
+ *         injected input may carry caller-supplied times equal to the marked one. So over a periodic FULL history
+ *         made by injected input with repeating timestamps, a key press plus a synthesized same-position move can
+ *         Show once (adversary pass 19 A1), and an injected excursion with a frozen last-input time is left to the r5
+ *         position rule, so one that ends where it began stays hidden (adversary pass 19 A2).
+ *         Successor card: PLAYER-CURSOR-RAW-INPUT-WITNESS-1 (a witness that sees moves before coalescing). */
 inline bool inputSinceMark()
 {
     quint32 now = 0;
