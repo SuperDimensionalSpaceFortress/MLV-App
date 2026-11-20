@@ -1124,6 +1124,28 @@ try {
     $r['nvNotFixedDrive'] = T { Resolve-ClocksPowerNvidiaSmi }
     $env:SystemRoot = ''; $env:ProgramFiles = ''
     $r['nvBlank'] = T { Resolve-ClocksPowerNvidiaSmi }
+    # adversary 83a64d80 A1 residual (CoS G3): a junction (a reparse point) under a fixed-drive root can point anywhere, so a root, or any segment walked to reach
+    # nvidia-smi, that carries ReparsePoint is refused exactly like a missing file. Each junction points at a local folder that DOES hold the file, so HEAD (which
+    # never looked at attributes) found it through the junction and the fix must not.
+    $jRoot = Join-Path $nvRoot 'junc'
+    New-Item -ItemType Directory -Force -Path $jRoot | Out-Null
+    $jSys = Join-Path $jRoot 'sysroot-link'
+    New-Item -ItemType Junction -Path $jSys -Target $nvSys | Out-Null
+    $jPf = Join-Path $jRoot 'pf-link'
+    New-Item -ItemType Junction -Path $jPf -Target $nvPf | Out-Null
+    $jLeafParent = Join-Path $jRoot 'pf-leaf\NVIDIA Corporation'
+    New-Item -ItemType Directory -Force -Path $jLeafParent | Out-Null
+    New-Item -ItemType Junction -Path (Join-Path $jLeafParent 'NVSMI') -Target (Join-Path $nvPf 'NVIDIA Corporation\NVSMI') | Out-Null
+    $r['nvJunctionBuilt'] = ((Test-Path -LiteralPath (Join-Path $jSys 'System32\nvidia-smi.exe') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $jPf 'NVIDIA Corporation\NVSMI\nvidia-smi.exe') -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $jLeafParent 'NVSMI\nvidia-smi.exe') -PathType Leaf) -and (([IO.File]::GetAttributes($jSys) -band [IO.FileAttributes]::ReparsePoint) -ne 0))
+    $env:SystemRoot = $jSys; $env:ProgramFiles = ''
+    $r['nvJunctionMidSegment'] = T { Resolve-ClocksPowerNvidiaSmi }
+    $env:SystemRoot = ''; $env:ProgramFiles = $jPf
+    $r['nvJunctionMidSegmentPf'] = T { Resolve-ClocksPowerNvidiaSmi }
+    $env:SystemRoot = ''; $env:ProgramFiles = (Join-Path $jRoot 'pf-leaf')
+    $r['nvJunctionLastSegment'] = T { Resolve-ClocksPowerNvidiaSmi }
+    # the refused root falls through to the next candidate, exactly as a missing file does
+    $env:SystemRoot = $jSys; $env:ProgramFiles = $nvPf
+    $r['nvJunctionFallsThrough'] = T { (Resolve-ClocksPowerNvidiaSmi) -ceq $nvPfExe }
 } finally { $env:SystemRoot = $oldSys; $env:ProgramFiles = $oldPf; $env:PATH = $oldPath }
 J $r
 """
@@ -1192,6 +1214,16 @@ class ClocksPowerRoundEightTests(unittest.TestCase):
         self.assertEqual(self.r["nvProviderQualifiedLocal"], "", "a provider-qualified root is refused even when it names a local folder that holds the file")
         self.assertNotEqual(self.r["nvMissingLetter"], "", "the fixture needs one drive letter this host does not have")
         self.assertEqual(self.r["nvNotFixedDrive"], "", "only a root on a local fixed drive is probed (a mapped share or an absent drive is not)")
+
+    def test_r9_g3_a_reparse_point_under_a_fixed_drive_root_is_refused(self) -> None:
+        self.assertIs(self.r["nvJunctionBuilt"], True, "the fixture needs three junctions that really reach a nvidia-smi.exe")
+        self.assertEqual(self.r["nvJunctionMidSegment"], "", "a junction on the way to System32 is refused")
+        self.assertEqual(self.r["nvJunctionMidSegmentPf"], "", "a junction on the way to the NVSMI folder is refused")
+        self.assertEqual(self.r["nvJunctionLastSegment"], "", "a junction as the last segment of the root is refused")
+        self.assertIs(self.r["nvJunctionFallsThrough"], True, "a refused root falls through to the next candidate, as a missing file does")
+        fn = re.search(r"(?ms)^function Resolve-ClocksPowerNvidiaSmi\b.*?^}", self.text)
+        self.assertIsNotNone(fn)
+        self.assertIn("ReparsePoint", fn.group(0))
 
     def test_r8_a1_the_clocks_call_site_uses_the_local_resolver_and_the_job_carries_it(self) -> None:
         sites = [ln for ln in self.text.splitlines() if "Start-ClocksPowerGpu $clocksPowerBackend" in ln]

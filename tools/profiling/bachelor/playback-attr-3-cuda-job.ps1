@@ -8266,12 +8266,22 @@ function Resolve-ClocksPowerTypeperf {
 # util sampler's resolver walks PATH, and a PATH entry on a slow share would spend the pre-launch telemetry allowance on one synchronous Test-Path per
 # entry before any deadline is checked; the GPU half is disclosure only now, so it never pays that cost. adversary 83a64d80 A1: the rule is "the root is on a
 # local fixed drive" (a drive letter whose type is Fixed), not "it is not a UNC": a provider-qualified UNC, a mapped share and an absent drive are all skipped.
+# CoS G3 (hub r9): a reparse point (a junction or symlink) under a fixed-drive root can point at a share or another drive, so a root, or any path segment walked
+# from the drive root down to nvidia-smi.exe (the file included), whose attributes carry ReparsePoint is refused like a missing file: the loop falls through.
 function Resolve-ClocksPowerNvidiaSmi {
     foreach ($root in @(([string]$env:SystemRoot + '\System32'), ([string]$env:ProgramFiles + '\NVIDIA Corporation\NVSMI'))) {
         try {
             if ($root -notmatch '^[A-Za-z]:\\') { continue }
             if ([IO.DriveInfo]::new($root.Substring(0, 1)).DriveType -ne [IO.DriveType]::Fixed) { continue }
             $p = $root + '\nvidia-smi.exe'
+            $walk = $root.Substring(0, 2)
+            $linked = $false
+            foreach ($seg in @($p.Substring(3).Split('\'))) {
+                if ($seg -eq '') { continue }
+                $walk = $walk + '\' + $seg
+                if (([IO.File]::GetAttributes($walk) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $linked = $true; break }
+            }
+            if ($linked) { continue }
             if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
         } catch { }
     }
