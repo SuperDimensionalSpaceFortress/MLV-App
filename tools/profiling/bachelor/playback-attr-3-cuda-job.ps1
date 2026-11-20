@@ -1074,6 +1074,10 @@ $runnerAcceptsVerifiedClipBinding = ($LASTEXITCODE -eq 0) -and
 $runnerAcceptsCpuPlayPaceInformational = ($LASTEXITCODE -eq 0) -and
     ($smokeRunnerCommittedText -match '\[switch\]\$CpuPlayPaceInformational\b')
 $cpuPlayPaceInformational = ($Backend -eq 'cpu') -and $runnerAcceptsCpuPlayPaceInformational
+# VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r8 (sol r6 B-04): the runner's leg-derived hard deadline drops the size-derived app read allowance unless it is told
+# -LegHardLimitAllowanceMs; decided from the runner bytes committed at -SourceCommit (a runner without the parameter would reject it).
+$runnerAcceptsLegHardLimitAllowance = ($LASTEXITCODE -eq 0) -and
+    ($smokeRunnerCommittedText -match '\[int\]\$LegHardLimitAllowanceMs\b')
 if ($Backend -eq 'cpu' -and -not $runnerAcceptsCpuPlayPaceInformational) {
     Write-Warning ("The smoke runner committed at $($SourceCommit.Substring(0, 12)) does not take -CpuPlayPaceInformational, so this cpu leg keeps the gated pace probe " +
         "(PLAY_PACE_TOO_SLOW after 8 s on a slow host). Generate from a -SourceCommit that contains CPU-LOOK-LEG-PACE-ABORT-1.")
@@ -3073,7 +3077,7 @@ $envs = @(
 # default.
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
-$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor __SCALE_FACTOR__ __EXPECTED_SCALE_ARGS__-UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs__LEG_HARD_LIMIT_ARGS__ -ScaleFactor __SCALE_FACTOR__ __EXPECTED_SCALE_ARGS__-UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
 if ($RunnerAcceptsVerifiedClipBinding) {
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's own remaining reads are traced into
     # this job's trace file, and (owner run) it takes the identity verified above instead of re-reading.
@@ -6261,6 +6265,8 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     # CPU-LEG-SMOKE-CEILING-1: only a clamped leg traces the clamp and the in-runner re-read allowance it left (so a process timeout on it is attributable from the
     # evidence log); every other leg expands this to nothing, so its job is the text it was before the card.
     SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { '' })
+    # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1 r8: ' -LegHardLimitAllowanceMs N' for an owner-input leg on a runner that declares it, else nothing (a fixture leg's job text is unchanged).
+    LEG_HARD_LIMIT_ARGS = Get-AttrCudaLegHardLimitArgs -RunnerAcceptsAllowance $runnerAcceptsLegHardLimitAllowance -AppReadAllowanceSec $timeBudget.appReadAllowanceSec
     PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.

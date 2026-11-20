@@ -2600,7 +2600,9 @@ foreach ($case in @(@('drain-held', 3.5, $false), @('drain-held-older-receipt', 
     [void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($code)
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $psi; [void]$process.Start()
     $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
-    $hostLoadFinalizeTimeoutMs = 60000; $captureBindingFailures = @()
+    # VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1: the finalize computes its own wait from the launch stamp and the whole budget (no precomputed remainder),
+    # and is handed the wait loop's first exit sighting (-1 = none)
+    $effectiveProcessTimeoutMs = 60000; $exitSeenByMs = [double]-1; $captureBindingFailures = @()
     . ([scriptblock]::Create($runnerFinalize))
     $receiptProcess = . ([scriptblock]::Create($runnerProcess))
     if ($older) { foreach ($n in @('exitObservedAtUtc', 'exitToEndMs', 'elapsedMonoMs')) { $receiptProcess.PSObject.Properties.Remove($n) } }
