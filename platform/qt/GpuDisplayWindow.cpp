@@ -61,6 +61,17 @@ quint64 g_swapTelemetrySessionId = 0;
 bool g_swapTelemetrySessionActive = false;
 double g_swapTelemetrySessionBeginQpcMs = 0.0;
 
+// GL reads rows bottom-up; QImage rows are top-down. QImage::flipped() is Qt 6.9+; on an older
+// Qt (the macOS Intel release kit is Qt 5) mirrored( false, true ) gives the same pixels.
+QImage verticallyFlipped( const QImage &image )
+{
+#if QT_VERSION >= QT_VERSION_CHECK( 6, 9, 0 )
+    return image.flipped( Qt::Vertical );
+#else
+    return image.mirrored( false, true );
+#endif
+}
+
 bool windowEnvFlagEnabled(const QByteArray &value)
 {
     if ( value.isEmpty() ) return false;
@@ -2594,7 +2605,7 @@ void GpuDisplayWindow::paintGL()
             else
             {
                 // GL reads bottom-up; QImage rows are top-down.
-                m_captureReadbackImage = grabbed.flipped(Qt::Vertical);
+                m_captureReadbackImage = verticallyFlipped(grabbed);
                 m_captureReadbackSucceeded = true;
                 m_captureReadbackError.clear();
             }
@@ -2617,7 +2628,7 @@ void GpuDisplayWindow::paintGL()
             Q_UNUSED(mk);
             const QString p = QString::fromLocal8Bit(rbDir)
                 + QStringLiteral("/rb_%1.png").arg(rbCounter, 5, 10, QChar('0'));
-            out.mirrored(false, true).save(p, "PNG");   // GL bottom-up -> top-down
+            verticallyFlipped(out).save(p, "PNG");   // GL bottom-up -> top-down
             ++rbCounter;
         }
     }
