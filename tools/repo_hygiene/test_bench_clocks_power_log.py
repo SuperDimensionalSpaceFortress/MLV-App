@@ -216,6 +216,35 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"Get-ClocksPowerClockCheck \$clocksPowerClk1 \$clocksPowerClk2 ", body)), 1)
         self.assertNotRegex(body, r"@\(\[DateTime\]::UtcNow\.Ticks, \[Diagnostics\.Stopwatch\]::GetTimestamp\(\)\)", "an unbracketed (wall, monotonic) pair: a deschedule between the two reads skews the capture")
 
+    def test_r6b_a2_the_clock_captures_span_every_row_either_sampler_can_write(self) -> None:
+        """adversary 16901aea A2: capture 1 was read AFTER the samplers started, so a wall step between a sampler's first row and that capture was in
+        neither capture's span (net 0) while the pre-Play rows it shifted were selected as Play. Capture 1 now precedes the first sampler start and
+        capture 2 follows both stops, so the net step covers every row a sampler can have written."""
+        text = lf(self.job("cp-cuda"))
+        body = "\n".join(region_re(OPEN, CLOSE).findall(text))
+        c1 = body.index("$clocksPowerClk1 = Get-ClocksPowerClockCapture")
+        self.assertLess(c1, body.index("Start-ClocksPowerGpu $clocksPowerBackend"), "before nvidia-smi starts")
+        self.assertLess(c1, body.index("Start-ClocksPowerCpu $clocksPowerTypeperf"), "before typeperf starts")
+        c2 = body.index("$clocksPowerClk2 = Get-ClocksPowerClockCapture")
+        self.assertGreater(c2, body.index("Stop-ClocksPowerAll $clocksPowerGpuStart"), "after both samplers are stopped")
+        self.assertLess(c2, body.index("Get-UtilSamplePlayWindow $rawLog"), "and before the metrics region reads anything")
+
+    def test_r6b_a3_the_job_reads_each_csv_once_parses_that_read_and_proves_the_copy(self) -> None:
+        text = lf(self.job("cp-cuda"))
+        metrics = [r for r in region_re(OPEN, CLOSE).findall(text) if "step clocks-power summary" in r][0]
+        self.assertLess(metrics.index("Read-ClocksPowerSource"), metrics.index("Publish-ClocksPowerFiles"), "read first, then publish")
+        self.assertLess(metrics.index("Publish-ClocksPowerFiles"), metrics.index("ConvertFrom-ClocksPowerGpuCsv"))
+        self.assertNotIn("Read-UtilSampleText", metrics, "the summaries parse the one read, never a second read of the path")
+        self.assertIn("ConvertFrom-ClocksPowerGpuCsv $clocksPowerGpuText", metrics)
+        self.assertIn("ConvertFrom-ClocksPowerCpuCsv $clocksPowerCpuText", metrics)
+        publish = re.search(r"(?ms)^function Publish-ClocksPowerFiles\b.*?^}", text)
+        self.assertIsNotNone(publish)
+        self.assertEqual(publish.group(0).count("Test-ClocksPowerPublishedCopy"), 2, "each side's copy is proved against its own read")
+        self.assertEqual(publish.group(0).count("published-copy-differs"), 2)
+        stop = re.search(r"(?ms)^function Stop-ClocksPowerAll\b.*?^}", text)
+        self.assertIsNotNone(stop)
+        self.assertNotIn("Dispose", stop.group(0), "the names stay held past the stop; Close-ClocksPowerHold releases them after the one read")
+
     def test_r6_a2_the_dgpu_pnp_read_is_bounded_on_the_clocks_path(self) -> None:
         text = lf(self.job("cp-cuda"))
         self.assertEqual(len(re.findall(r"(?m)^function Invoke-ClocksPowerDStateBounded\b", text)), 1)
@@ -718,6 +747,34 @@ $r['a2Real'] = T { @{ hasState = ($real.ContainsKey('state')); hasReason = ($rea
 $r['a3Names'] = @{ published = (Get-ClocksPowerRawFileName $true 'gpu-clocks.csv'); notPublished = (Get-ClocksPowerRawFileName $false 'gpu-clocks.csv') }
 $blk = Get-ClocksPowerBlock $null $null $null $null $false 1000 (Get-ClocksPowerRawFileName $false 'gpu-clocks.csv') (Get-ClocksPowerRawFileName $true 'cpu-clocks.csv')
 $r['a3Block'] = @{ gpu = $blk.gpu.rawFile; cpu = $blk.cpu.rawFile }
+# A3 (pass 4, adversary 16901aea): the ONE read of a sampler CSV, and the proof that a published copy is those bytes
+$srcPath = Join-Path $env:CP_TMP 'src.csv'
+[IO.File]::WriteAllText($srcPath, "a,b`r`n1,2`r`n", [Text.UTF8Encoding]::new($true))
+$owned = @{ owned = $true }; $stopped = @{ stopped = $true }
+$rd = Read-ClocksPowerSource $srcPath $owned $stopped
+$r['a3Read'] = T { @{ text = $rd.text; shaIsFile = ($rd.sha256 -ceq (Get-FileHash -LiteralPath $srcPath -Algorithm SHA256).Hash.ToLowerInvariant()); bytesIsFile = ($rd.bytes -eq (Get-Item -LiteralPath $srcPath).Length) } }
+$r['a3ReadRefused'] = @(($null -eq (Read-ClocksPowerSource $srcPath @{ owned = $false } $stopped)), ($null -eq (Read-ClocksPowerSource $srcPath $owned @{ stopped = $false })),
+    ($null -eq (Read-ClocksPowerSource $srcPath $owned $null)), ($null -eq (Read-ClocksPowerSource $srcPath $null $stopped)), ($null -eq (Read-ClocksPowerSource (Join-Path $env:CP_TMP 'no-such.csv') $owned $stopped)))
+$dstPath = Join-Path $env:CP_TMP 'dst.csv'
+Copy-Item -LiteralPath $srcPath -Destination $dstPath -Force
+$same = Test-ClocksPowerPublishedCopy $dstPath $rd
+[IO.File]::WriteAllText($dstPath, "a,b`r`n1,3`r`n", [Text.UTF8Encoding]::new($true))
+$differs = Test-ClocksPowerPublishedCopy $dstPath $rd
+$r['a3Copy'] = @{ same = $same; differs = $differs; noRead = (Test-ClocksPowerPublishedCopy $dstPath $null); missing = (Test-ClocksPowerPublishedCopy (Join-Path $env:CP_TMP 'no-such.csv') $rd) }
+# the name stays held until the caller releases it, and only for a stopped (or never started) writer
+$h1 = [IO.File]::Open($srcPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+Close-ClocksPowerHold @{ hold = $h1 } @{ stopped = $false }
+$heldWhileRunning = $h1.CanRead
+Close-ClocksPowerHold @{ hold = $h1 } @{ stopped = $true }
+$r['a3Hold'] = @{ heldWhileRunning = $heldWhileRunning; releasedWhenStopped = (-not $h1.CanRead) }
+$h2 = [IO.File]::Open($srcPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+Close-ClocksPowerHold @{ hold = $h2 } @{ stopped = $false; why = 'not-started' }
+$r['a3HoldNotStarted'] = (-not $h2.CanRead)
+# A4 (pass 4 advisory): a plan name with its own parentheses keeps them; A6: a capture of nulls (or strings) is no capture
+$r['a4Plan'] = @{ nested = (ConvertFrom-ClocksPowerPowerCfg "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced (Work))`n").name; crlf = (ConvertFrom-ClocksPowerPowerCfg "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)`r`n").name;
+    guid = (ConvertFrom-ClocksPowerPowerCfg "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced (Work))").guid }
+$r['a6Nulls'] = @(($null -eq (Get-ClocksPowerClockCheck @($null, $null, $null) @($null, $null, $null) 1000 $f)), ($null -eq (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, '0') @($wall1, [int64]6000000, 0.0) 1000 $f)),
+    ($null -eq (Get-ClocksPowerClockCheck @($wall1, $null, 0.0) @($wall1, [int64]6000000, 0.0) 1000 $f)), ($null -ne (Get-ClocksPowerClockCheck @($wall1, [int64]6000000, 0.0) @($wall1, [int64]6000000, 0.0) 1000 $f)))
 J $r
 """
 
@@ -765,6 +822,22 @@ class ClocksPowerPassThreeTests(unittest.TestCase):
     def test_a3_rawfile_names_a_file_only_when_its_copy_succeeded(self) -> None:
         self.assertEqual(self.r["a3Names"], {"published": "gpu-clocks.csv", "notPublished": "UNAVAILABLE(not-published)"})
         self.assertEqual(self.r["a3Block"], {"gpu": "UNAVAILABLE(not-published)", "cpu": "cpu-clocks.csv"})
+
+    def test_r6b_a3_one_read_of_a_sampler_csv_feeds_both_the_summary_and_the_published_copy_check(self) -> None:
+        self.assertEqual(self.r["a3Read"], {"text": "a,b\r\n1,2\r\n", "shaIsFile": True, "bytesIsFile": True}, "UTF-8 decoded with the BOM dropped; the hash and the length are the file's")
+        self.assertEqual(self.r["a3ReadRefused"], [True] * 5, "not owned, writer not stopped, no stop record, no start record, absent: nothing is read")
+        self.assertEqual(self.r["a3Copy"], {"same": True, "differs": False, "noRead": False, "missing": False},
+                         "a copy that hashes differently from the bytes the summary was parsed from is not published")
+
+    def test_r6b_a4_a_power_plan_name_keeps_its_own_parentheses(self) -> None:
+        self.assertEqual(self.r["a4Plan"], {"nested": "Balanced (Work)", "crlf": "Balanced", "guid": "381b4222-f694-41f0-9685-ff5bb260df2e"})
+
+    def test_r6b_a6_a_capture_of_nulls_or_strings_is_no_witness(self) -> None:
+        self.assertEqual(self.r["a6Nulls"], [True, True, True, True], "null elements and a string width give no check; a well-formed pair still does")
+
+    def test_r6b_a3_the_names_stay_held_until_the_caller_has_read_them(self) -> None:
+        self.assertEqual(self.r["a3Hold"], {"heldWhileRunning": True, "releasedWhenStopped": True})
+        self.assertTrue(self.r["a3HoldNotStarted"])
 
 
 @requires_windows_pwsh

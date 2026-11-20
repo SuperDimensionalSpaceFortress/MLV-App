@@ -8039,6 +8039,8 @@ function Get-ClocksPowerClockCapture([int]$Attempts = 5) {
 function Get-ClocksPowerClockCheck($Clk1, $Clk2, [int]$IntervalMs, [int64]$Freq) {
     try {
         if ($null -eq $Clk1 -or $null -eq $Clk2 -or @($Clk1).Count -lt 3 -or @($Clk2).Count -lt 3) { return $null }
+        # adversary 16901aea A6: every element is a number the capture helper wrote; a $null or a string would cast to 0 and read as a perfect capture
+        foreach ($c in @($Clk1, $Clk2)) { foreach ($i in 0..2) { if ($null -eq $c[$i] -or $c[$i] -is [string] -or $c[$i] -is [bool]) { return $null } } }
         $w1 = [double]$Clk1[2]; $w2 = [double]$Clk2[2]
         if ([double]::IsNaN($w1) -or [double]::IsNaN($w2) -or $w1 -lt 0 -or $w2 -lt 0 -or $w1 -gt 25 -or $w2 -gt 25) { return $null }
         $net = Get-ClocksPowerNetStepMs ([int64]$Clk1[0]) ([int64]$Clk1[1]) ([int64]$Clk2[0]) ([int64]$Clk2[1]) $Freq
@@ -8148,7 +8150,8 @@ function Get-ClocksPowerCpuSummary($Parsed, $Start, $Window, $Stop = $null, $Clo
 
 # powercfg /getactivescheme -> the plan's name and guid, or UNAVAILABLE(powercfg-unparseable)
 function ConvertFrom-ClocksPowerPowerCfg([string]$Text) {
-    $m = [regex]::Match([string]$Text, 'Power Scheme GUID:\s*([0-9a-fA-F-]{36})\s+\((.+?)\)')
+    # (adversary 16901aea A4: the name runs to the LAST ')' of the line, so a plan named "Balanced (Work)" keeps its own closing parenthesis)
+    $m = [regex]::Match([string]$Text, '(?m)Power Scheme GUID:\s*([0-9a-fA-F-]{36})\s+\((.+)\)[ \t]*\r?$')
     if (-not $m.Success) { return 'UNAVAILABLE(powercfg-unparseable)' }
     [ordered]@{ name = $m.Groups[2].Value.Trim(); guid = $m.Groups[1].Value.ToLowerInvariant() }
 }
@@ -8312,6 +8315,40 @@ function Get-ClocksPowerRawFileName([bool]$Published, [string]$Name) {
     'UNAVAILABLE(not-published)'
 }
 
+# adversary 16901aea A3: the ONE read of a sampler CSV. It is taken once the writer is stopped, while the job's own hold on the name is still open (a replacement
+# or a rename of the path is refused until then), and BEFORE anything is published: its bytes are what the summary is parsed from AND what the published copy
+# must equal. @{ text; sha256; bytes } for a file this job created ($Start.owned) whose writer is stopped ($StopSide.stopped); $null for anything else (not
+# owned, not stopped, absent, unreadable). The text is decoded as Read-UtilSampleText decodes it (UTF-8, a BOM dropped).
+function Read-ClocksPowerSource([string]$Path, $Start, $StopSide) {
+    try {
+        if ($null -eq $Start -or -not $Start.owned -or $null -eq $StopSide -or -not $StopSide.stopped) { return $null }
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        $bytes = $null
+        try { $ms = [IO.MemoryStream]::new(); $fs.CopyTo($ms); $bytes = $ms.ToArray() } finally { $fs.Dispose() }
+        $h = [Security.Cryptography.SHA256]::Create()
+        $hex = $null
+        try { $hex = ([BitConverter]::ToString($h.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $h.Dispose() }
+        $text = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8).ReadToEnd()
+        return [ordered]@{ text = $text; sha256 = $hex; bytes = $bytes.Length }
+    } catch { return $null }
+}
+
+# adversary 16901aea A3: true only when the file at $Path hashes to the bytes $Read was parsed from (Read-ClocksPowerSource's sha256): a published copy that
+# differs from what the summary describes (a source replaced between the read and the copy) is not "published".
+function Test-ClocksPowerPublishedCopy([string]$Path, $Read) {
+    try {
+        if ($null -eq $Read -or [string]::IsNullOrEmpty([string]$Read.sha256)) { return $false }
+        $h = Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop
+        return (([string]$h.Hash).ToLowerInvariant() -ceq [string]$Read.sha256)
+    } catch { return $false }
+}
+
+# adversary 16901aea A3: release a sampler CSV's hold on its name, only once its writer is stopped (or was never started); the caller does it AFTER the one read
+function Close-ClocksPowerHold($Start, $StopSide) {
+    try { if ($null -ne $Start -and $null -ne $Start.hold -and $null -ne $StopSide -and ($StopSide.stopped -or $StopSide.why -ceq 'not-started')) { $Start.hold.Dispose() } } catch { }
+}
+
 # ONE typeperf for the window (a native process: no pwsh, no per-poll process). $Counters are full counter paths; typeperf rounds the interval up to
 # whole seconds (minimum 1). Status running | unavailable (typeperf-missing, no-counters, cpu-clocks-occupied, typeperf-failed).
 function Start-ClocksPowerCpu([string]$TypeperfPath, [string]$CsvPath, [int]$IntervalMs, $Counters) {
@@ -8333,16 +8370,16 @@ function Start-ClocksPowerCpu([string]$TypeperfPath, [string]$CsvPath, [int]$Int
     $r
 }
 
-# Both samplers: each process by its own handle (that pid only), killed (neither ever exits by itself), bounded by $WaitMs; a name held since the
-# start is released once its writer is stopped. $Prev is an earlier stop record (the outer finally's retry): a side it shows stopped is kept as it was.
+# Both samplers: each process by its own handle (that pid only), killed (neither ever exits by itself), bounded by $WaitMs. The names held since the start
+# are NOT released here: the job releases each (Close-ClocksPowerHold) after its one read of the CSV (adversary 16901aea A3). $Prev is an earlier stop record
+# (the outer finally's retry): a side it shows stopped is kept as it was.
 function Stop-ClocksPowerAll($GpuStart, $CpuStart, [int]$WaitMs, $Prev = $null) {
     $r = [ordered]@{ gpu = $null; cpu = $null }
     try { if ($null -ne $Prev -and $null -ne $Prev.gpu -and $Prev.gpu.stopped) { $r.gpu = $Prev.gpu } } catch { }
     try { if ($null -ne $Prev -and $null -ne $Prev.cpu -and $Prev.cpu.stopped) { $r.cpu = $Prev.cpu } } catch { }
     if ($null -eq $r.gpu) { $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true }
     if ($null -eq $r.cpu) { $r.cpu = Stop-UtilSampleProcess $(if ($null -ne $CpuStart) { $CpuStart.proc }) $WaitMs $true }
-    try { if ($null -ne $GpuStart -and $null -ne $GpuStart.hold -and ($r.gpu.stopped -or $r.gpu.why -ceq 'not-started')) { $GpuStart.hold.Dispose() } } catch { }
-    try { if ($null -ne $CpuStart -and $null -ne $CpuStart.hold -and ($r.cpu.stopped -or $r.cpu.why -ceq 'not-started')) { $CpuStart.hold.Dispose() } } catch { }
+    # adversary 16901aea A3: the names stay HELD past the stop; the job releases each (Close-ClocksPowerHold) after its one read (Read-ClocksPowerSource)
     $r
 }
 
@@ -8535,7 +8572,7 @@ if ($clocksPowerEmit) {
     $cwOpen = '# BENCH-CLOCKS-POWER-LOG-1 >>>'
     $cwClose = '# BENCH-CLOCKS-POWER-LOG-1 <<<'
     $cwEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Invoke-ClocksPowerBounded}, ${function:Get-ClocksPowerNetStepMs}, ${function:Get-ClocksPowerClockCapture}, ${function:Get-ClocksPowerClockCheck}, ${function:Get-ClocksPowerClockWhy}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Invoke-ClocksPowerDStateBounded}, ${function:Get-ClocksPowerRawFileName}, ${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
+    $cwFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Stop-UtilSampleProcess}, ${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:Get-UtilSamplePlayWindow}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Test-UtilSampleClockSteady}, ${function:Invoke-ClocksPowerBounded}, ${function:Get-ClocksPowerNetStepMs}, ${function:Get-ClocksPowerClockCapture}, ${function:Get-ClocksPowerClockCheck}, ${function:Get-ClocksPowerClockWhy}, ${function:Get-ClocksPowerThrottleNames},${function:Get-ClocksPowerSeries}, ${function:ConvertFrom-ClocksPowerGpuRow}, ${function:ConvertFrom-ClocksPowerGpuCsv}, ${function:ConvertFrom-ClocksPowerCpuCsv}, ${function:Get-ClocksPowerGpuSummary}, ${function:Get-ClocksPowerCpuSummary}, ${function:ConvertFrom-ClocksPowerPowerCfg}, ${function:Get-ClocksPowerAcState}, ${function:ConvertFrom-ClocksPowerDisplay}, ${function:Get-ClocksPowerPlatform}, ${function:Resolve-ClocksPowerCounters}, ${function:Resolve-ClocksPowerTypeperf}, ${function:Get-ClocksPowerCounterList}, ${function:Invoke-ClocksPowerDStateBounded}, ${function:Get-ClocksPowerRawFileName}, ${function:Read-ClocksPowerSource}, ${function:Test-ClocksPowerPublishedCopy}, ${function:Close-ClocksPowerHold},${function:Start-ClocksPowerGpu}, ${function:Start-ClocksPowerCpu}, ${function:Stop-ClocksPowerAll}, ${function:Get-ClocksPowerBlock}) "`n"
     $cwLaunchLine = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
     $cwDoneLine = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
     $cwStart = $cwOpen + "`n" + $cwFunctions + "`n" + "`$clocksPowerBackend = '$(([string]$Backend).ToLowerInvariant())'`n`$clocksPowerIntervalMs = [int]$ClocksPowerIntervalMs`n`$clocksPowerWarmup = `$$(if ([bool]$ClocksPowerWarmup) { 'true' } else { 'false' })`n" + @'
@@ -8548,6 +8585,8 @@ $clocksPowerStopped = $false
 $clocksPowerStopRecord = $null
 $clocksPowerGpuPublished = $false
 $clocksPowerCpuPublished = $false
+$clocksPowerGpuRead = $null
+$clocksPowerCpuRead = $null
 $clocksPowerBlock = $null
 $clocksPowerZoneAtStart = $null
 $clocksPowerZoneAtStop = $null
@@ -8555,14 +8594,37 @@ $clocksPowerClk1 = $null
 $clocksPowerClk2 = $null
 # Both CSVs beside presentmon.csv, each once, at the first site (the success summary, else the outer finally) where it is the job's own (a file this job
 # created and whose writer is stopped); a flag is set only after its copy succeeded, so a copy that failed is tried again by the finally's call.
+# adversary 16901aea A3: a CSV is published only from the ONE read of it (Read-ClocksPowerSource: the job's own file, its writer stopped, its name still held),
+# and counts as published only when the copy hashes the same as the bytes the summary was parsed from; a copy that differs is a trace line, not "published"
 function Publish-ClocksPowerFiles {
-    try { if (-not $script:clocksPowerGpuPublished -and $clocksPowerGpuStart.owned -and $null -ne $clocksPowerStopRecord -and $clocksPowerStopRecord.gpu.stopped -and (Test-Path -LiteralPath $clocksPowerGpuStart.csvPath -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $clocksPowerGpuStart.csvPath -Destination (Join-Path $Pub 'gpu-clocks.csv')); $script:clocksPowerGpuPublished = $true } } catch { Write-JobTrace "step clocks-power publish file=gpu-clocks.csv error=$([string]$_.CategoryInfo.Reason)" }
-    try { if (-not $script:clocksPowerCpuPublished -and $clocksPowerCpuStart.owned -and $null -ne $clocksPowerStopRecord -and $clocksPowerStopRecord.cpu.stopped -and (Test-Path -LiteralPath $clocksPowerCpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $clocksPowerCpuCsv -Destination (Join-Path $Pub 'cpu-clocks.csv')); $script:clocksPowerCpuPublished = $true } } catch { Write-JobTrace "step clocks-power publish file=cpu-clocks.csv error=$([string]$_.CategoryInfo.Reason)" }
+    try {
+        if (-not $script:clocksPowerGpuPublished) {
+            if ($null -eq $script:clocksPowerGpuRead -and $null -ne $clocksPowerStopRecord) { $script:clocksPowerGpuRead = Read-ClocksPowerSource $clocksPowerGpuStart.csvPath $clocksPowerGpuStart $clocksPowerStopRecord.gpu; Close-ClocksPowerHold $clocksPowerGpuStart $clocksPowerStopRecord.gpu }
+            if ($null -ne $script:clocksPowerGpuRead) {
+                $clocksPowerGpuDest = Join-Path $Pub 'gpu-clocks.csv'
+                [void](Publish-AttrCudaFileCopy -Source $clocksPowerGpuStart.csvPath -Destination $clocksPowerGpuDest)
+                if (Test-ClocksPowerPublishedCopy $clocksPowerGpuDest $script:clocksPowerGpuRead) { $script:clocksPowerGpuPublished = $true } else { Write-JobTrace 'step clocks-power publish file=gpu-clocks.csv error=published-copy-differs' }
+            }
+        }
+    } catch { Write-JobTrace "step clocks-power publish file=gpu-clocks.csv error=$([string]$_.CategoryInfo.Reason)" }
+    try {
+        if (-not $script:clocksPowerCpuPublished) {
+            if ($null -eq $script:clocksPowerCpuRead -and $null -ne $clocksPowerStopRecord) { $script:clocksPowerCpuRead = Read-ClocksPowerSource $clocksPowerCpuCsv $clocksPowerCpuStart $clocksPowerStopRecord.cpu; Close-ClocksPowerHold $clocksPowerCpuStart $clocksPowerStopRecord.cpu }
+            if ($null -ne $script:clocksPowerCpuRead) {
+                $clocksPowerCpuDest = Join-Path $Pub 'cpu-clocks.csv'
+                [void](Publish-AttrCudaFileCopy -Source $clocksPowerCpuCsv -Destination $clocksPowerCpuDest)
+                if (Test-ClocksPowerPublishedCopy $clocksPowerCpuDest $script:clocksPowerCpuRead) { $script:clocksPowerCpuPublished = $true } else { Write-JobTrace 'step clocks-power publish file=cpu-clocks.csv error=published-copy-differs' }
+            }
+        }
+    } catch { Write-JobTrace "step clocks-power publish file=cpu-clocks.csv error=$([string]$_.CategoryInfo.Reason)" }
 }
 # the host zone both tools stamp in, read before they start (and again at the stop)
 try { $clocksPowerZoneAtStart = Get-UtilSampleHostZone } catch { }
 # once per leg, before the measured launch: power plan, AC state, display mode
 try { $clocksPowerPlatform = Get-ClocksPowerPlatform } catch { }
+# adversary ebfb3c2b A1 / 841c00e1 A1 / 16901aea A2: the first of two bracketed (wall, monotonic) captures, taken BEFORE either sampler starts (a step between a
+# sampler's first row and a later capture would be in neither span); the second is taken after both are stopped, so the net step spans every row they wrote
+try { $clocksPowerClk1 = Get-ClocksPowerClockCapture } catch { }
 try { $clocksPowerGpuStart = Start-ClocksPowerGpu $clocksPowerBackend (Resolve-UtilSampleNvidiaSmi) $clocksPowerGpuCsv ${function:Get-UtilSampleDgpuState} $clocksPowerIntervalMs } catch { }
 try {
     $clocksPowerTypeperf = Resolve-ClocksPowerTypeperf
@@ -8575,23 +8637,31 @@ try {
     $clocksPowerCpuStart['pkgReason'] = $clocksPowerPkg.reason
 } catch { }
 Write-JobTrace "step clocks-power start gpu=$($clocksPowerGpuStart.status) gpuReason=$($clocksPowerGpuStart.reason) gpuPid=$($clocksPowerGpuStart.pid) dState=$($clocksPowerGpuStart.dState) throttleField=$($clocksPowerGpuStart.throttleField) cpu=$($clocksPowerCpuStart.status) cpuReason=$($clocksPowerCpuStart.reason) cpuPid=$($clocksPowerCpuStart.pid) pkgReason=$($clocksPowerCpuStart.pkgReason) intervalMs=$clocksPowerIntervalMs warmup=$clocksPowerWarmup"
-# adversary ebfb3c2b A1: the first of two (wall, monotonic) captures; the second is read at the top of the stop region. adversary 841c00e1 A1: each is bracketed
-try { $clocksPowerClk1 = Get-ClocksPowerClockCapture } catch { }
 '@ + "`n" + $cwClose + "`n"
     $text = Edit-ClocksPowerText $text ($cwLaunchLine + "`n") ($cwStart + $cwLaunchLine + "`n") 'start the clocks/power samplers before the measured launch at'
     $cwStop = $cwOpen + "`n" + @'
-try { $clocksPowerClk2 = Get-ClocksPowerClockCapture } catch { }
 try {
-    $clocksPowerStopRecord =Stop-ClocksPowerAll $clocksPowerGpuStart $clocksPowerCpuStart 5000
+    $clocksPowerStopRecord = Stop-ClocksPowerAll $clocksPowerGpuStart $clocksPowerCpuStart 5000
     $clocksPowerStopped = (($clocksPowerStopRecord.gpu.stopped -or $clocksPowerStopRecord.gpu.why -ceq 'not-started') -and ($clocksPowerStopRecord.cpu.stopped -or $clocksPowerStopRecord.cpu.why -ceq 'not-started'))
     try { $clocksPowerZoneAtStop = Get-UtilSampleHostZone } catch { }
     Write-JobTrace "step clocks-power stop site=smoke-launch-done gpuStopped=$($clocksPowerStopRecord.gpu.stopped) gpuKilled=$($clocksPowerStopRecord.gpu.killed) cpuStopped=$($clocksPowerStopRecord.cpu.stopped) cpuKilled=$($clocksPowerStopRecord.cpu.killed)"
 } catch { Write-JobTrace "step clocks-power stop site=smoke-launch-done error=$([string]$_.CategoryInfo.Reason)" }
+# the second capture, after both samplers are stopped (adversary 16901aea A2); a stop that threw leaves the capture too, and the windows then refuse on the stop
+try { $clocksPowerClk2 = Get-ClocksPowerClockCapture } catch { }
 '@ + "`n" + $cwClose + "`n"
     $text = Edit-ClocksPowerText $text ($cwDoneLine + "`n") ($cwDoneLine + "`n" + $cwStop) 'stop the clocks/power samplers after the measured launch at'
     $cwMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $cwMetrics = $cwOpen + "`n" + @'
-# adversary 841c00e1 A3: the files are published FIRST, and the block names only a file whose copy succeeded (a refused copy is a trace line and rawFile says so)
+# adversary 16901aea A3: ONE read of each CSV (the writer is stopped, its name still held), parsed below and published from the same read. adversary 841c00e1
+# A3: the files are published FIRST, and the block names only a file whose copy succeeded and matches (a refused copy is a trace line and rawFile says so)
+try {
+    if ($null -ne $clocksPowerStopRecord) {
+        $clocksPowerGpuRead = Read-ClocksPowerSource $clocksPowerGpuStart.csvPath $clocksPowerGpuStart $clocksPowerStopRecord.gpu
+        Close-ClocksPowerHold $clocksPowerGpuStart $clocksPowerStopRecord.gpu
+        $clocksPowerCpuRead = Read-ClocksPowerSource $clocksPowerCpuCsv $clocksPowerCpuStart $clocksPowerStopRecord.cpu
+        Close-ClocksPowerHold $clocksPowerCpuStart $clocksPowerStopRecord.cpu
+    }
+} catch { }
 Publish-ClocksPowerFiles
 $clocksPowerGpuFile = Get-ClocksPowerRawFileName $clocksPowerGpuPublished 'gpu-clocks.csv'
 $clocksPowerCpuFile = Get-ClocksPowerRawFileName $clocksPowerCpuPublished 'cpu-clocks.csv'
@@ -8602,8 +8672,10 @@ try {
     # both tools stamp host-local time: the rows are read in the zone they were stamped in (unchanged between the start and the stop), never the zone now
     $clocksPowerZone = Resolve-UtilSampleCaptureZone $clocksPowerZoneAtStart $clocksPowerZoneAtStop
     $clocksPowerTz = $(if ($null -ne $clocksPowerZone.zone) { $clocksPowerZone.zone } else { [TimeZoneInfo]::Utc })
-    $clocksPowerGpuParsed = ConvertFrom-ClocksPowerGpuCsv (Read-UtilSampleText $clocksPowerGpuStart.csvPath) $clocksPowerTz
-    $clocksPowerCpuParsed = ConvertFrom-ClocksPowerCpuCsv (Read-UtilSampleText $clocksPowerCpuCsv) $clocksPowerTz
+    $clocksPowerGpuText = $(if ($null -ne $clocksPowerGpuRead) { $clocksPowerGpuRead.text } else { $null })
+    $clocksPowerCpuText = $(if ($null -ne $clocksPowerCpuRead) { $clocksPowerCpuRead.text } else { $null })
+    $clocksPowerGpuParsed = ConvertFrom-ClocksPowerGpuCsv $clocksPowerGpuText $clocksPowerTz
+    $clocksPowerCpuParsed = ConvertFrom-ClocksPowerCpuCsv $clocksPowerCpuText $clocksPowerTz
     if ($clocksPowerZone.why) { $clocksPowerGpuParsed.why = $clocksPowerZone.why; $clocksPowerCpuParsed.why = $clocksPowerZone.why }
     # adversary ebfb3c2b A1: the clock check both summaries need to map the window onto the sample stamps (no monotonic witness inside nvidia-smi / typeperf)
     # (adversary 841c00e1 A1: built from the two bracketed captures; a bracket over 25 ms leaves no check, so the windows are unwitnessed)
