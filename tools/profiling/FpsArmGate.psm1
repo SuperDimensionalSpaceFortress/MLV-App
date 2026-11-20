@@ -21,6 +21,21 @@
 
 Set-StrictMode -Version Latest
 
+# The MLVAPP_* variables the local smoke tools themselves set that are configuration, not diagnostics (run-release-gui-smoke / run-release-cuda-playback-ab). Anything else MLVAPP_* is unknown.
+$script:FpsArmKnownBenignEnv = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
+    'MLVAPP_PLAYBACK_SMOKE_TELEMETRY', 'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG', 'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG',
+    'MLVAPP_CRASH_FORENSICS_LOG_DIR', 'MLVAPP_GUI_SMOKE_RUN_NONCE', 'MLVAPP_RUN_NONCE', 'MLVAPP_PLAY_PACE_MODE', 'MLVAPP_HUB_PLAYBACK_CI_FIXTURE',
+    'MLVAPP_PLAYBACK_MAX_THREADS', 'MLVAPP_PLAYBACK_QUALITY_MODE', 'MLVAPP_PLAYBACK_PHASE3_UNATTENDED', 'MLVAPP_PLAYBACK_SCALE_FACTOR', 'MLVAPP_PLAYBACK_PREFER_HQ_MEAN23',
+    'MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS', 'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES', 'MLVAPP_PLAYBACK_TIMER_POLL_MS', 'MLVAPP_PHASE3_FRAME_SLOT_COUNT',
+    'MLVAPP_RAW_UINT16_PREFETCH_DECODERS', 'MLVAPP_DISABLE_RAW_UINT16_PREFETCH', 'MLVAPP_DISABLE_PLAY_START_PREROLL', 'MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH',
+    'MLVAPP_DISABLE_AVX2_INTRIN_DIRECT8', 'MLVAPP_ENABLE_AVX2_INTRIN_DIRECT8', 'MLVAPP_DISABLE_SH_CURVE_INDEX_MASK', 'MLVAPP_ENABLE_SH_CURVE_INDEX_MASK', 'MLVAPP_ENABLE_DUAL_ISO_FAST_X4_IN_HQ',
+    'MLVAPP_GPU_PLAYBACK_RECON', 'MLVAPP_GPU_PLAYBACK_RECON_BACKEND', 'MLVAPP_GPU_PLAYBACK_RECON_DLL', 'MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT',
+    'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT', 'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT_SAMPLE_EVERY',
+    'MLVAPP_GPU_TEX_NR_ACQUIRE_LATEST_READY', 'MLVAPP_GPU_TEX_NR_IMMEDIATE_DRAIN_MAX', 'MLVAPP_GPU_TEX_NR_IMMEDIATE_DRAIN_READY',
+    'MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT', 'MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT',
+    'MLVAPP_CUDA_AMAZE_LIVE_DIRECT_RGBA_STORE', 'MLVAPP_CUDA_AMAZE_LIVE_FAST_LAUNCH_CHECKS', 'MLVAPP_CUDA_AMAZE_LIVE_TILE_STREAMS'
+), [StringComparer]::OrdinalIgnoreCase)
+
 $script:FpsArmHeavyReason = 'fps-verdict-refused:heavy-arm'
 $script:FpsArmUnknownReason = 'fps-verdict-refused:unknown-arm'
 
@@ -164,13 +179,24 @@ function Get-FpsArmFromEnvironment {
             if ($a -imatch '^(--?|/)stage-log([=:]|$)') { return New-FpsArm 'HEAVY' 'environment' "the launch passed $($a.Split('=')[0]) (the stage logger)" }
         }
     }
-    foreach ($k in @('MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY', 'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY', 'MLVAPP_STAGE_TIMING', 'MLVAPP_PERF_FIELD_LOG', 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING')) {
+    foreach ($k in @('MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY', 'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY', 'MLVAPP_STAGE_TIMING', 'MLVAPP_PERF_FIELD_LOG', 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING',
+            'MLVAPP_INTERACTIVE_TRACE', 'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE', 'MLVAPP_PHASE3_TEL_PATH', 'MLVAPP_VIEWPORT_PRESENT_DIAG')) {
         if ($map.ContainsKey($k) -and (Test-FpsEnvFlagOn $map[$k])) { return New-FpsArm 'HEAVY' 'environment' "$k is on" }
+    }
+    # LIGHT is PROVEN only against a closed list: the app has more per-frame diagnostics than any denylist here names (adversary A1: overlap trace, interactive trace, phase-3 telemetry
+    # path, viewport present diagnostic, ...). Any other MLVAPP_* variable that is set (not exactly "0") is a control this reading does not know, so the arm is UNKNOWN, not LIGHT.
+    foreach ($name in $map.Keys) {
+        if ($name -imatch '^MLVAPP_' -and -not $script:FpsArmKnownBenignEnv.Contains($name) -and (Test-FpsEnvFlagOn $map[$name])) {
+            return New-FpsArm 'UNKNOWN' 'environment' "$name is an MLVAPP_* control this gate does not recognise (it may enable a per-frame diagnostic)"
+        }
     }
     $telemetry = $map.ContainsKey('MLVAPP_PLAYBACK_SMOKE_TELEMETRY') -and (Test-FpsEnvFlagOn $map['MLVAPP_PLAYBACK_SMOKE_TELEMETRY'])
     if (-not $telemetry) { return New-FpsArm 'LIGHT' 'environment' 'frame telemetry is off' }
     if (-not $map.ContainsKey('MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG')) { return New-FpsArm 'HEAVY' 'environment' 'frame telemetry is on and the per-frame log is not opted out' }
-    $d = $map['MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG'].Trim().ToLowerInvariant()
+    # No Trim, ASCII only (adversary A2): .NET trims U+00A0 and other Unicode spaces that the native readers' ASCII-only trim keeps, so "<U+00A0>1<U+00A0>" is not the opt-out they see.
+    $raw = $map['MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG']
+    if ($raw -notmatch '^[\x00-\x7F]*$' -or $raw -match '\s') { return New-FpsArm 'UNKNOWN' 'environment' 'the per-frame log opt-out holds whitespace or non-ASCII text, which the native readers handle differently' }
+    $d = $raw.ToLowerInvariant()
     if ($d -in @('1', 'true', 'yes', 'on')) { return New-FpsArm 'LIGHT' 'environment' 'frame telemetry on, per-frame log opted out' }
     if ($d -in @('', '0', 'false', 'off', 'no')) { return New-FpsArm 'HEAVY' 'environment' 'frame telemetry on, per-frame log opt-out is explicitly off' }
     New-FpsArm 'UNKNOWN' 'environment' "per-frame log opt-out value '$d' is read differently by the app's two readers"
@@ -253,8 +279,10 @@ function Get-FpsLegPlanRefusal {
     purpose are not refused here (the verdict paths refuse an fps gain from HEAVY legs themselves). Returns @(code, item, detail); code '' = fine.
     Items: array of [pscustomobject]@{ item; arm (name or object) }.
     #>
-    param([AllowNull()]$Purpose, [AllowNull()][object[]]$Items)
-    if ($null -eq $Purpose) { return @('', 0, '') }
+    # -Declared: the plan names a `purpose` key at all. A declared purpose must be the scalar string, so a declared $null, a number or an array (a one-element ["fps-ab"] must not read as 'fps-ab')
+    # is BAD_PURPOSE (adversary A3); only a plan with no purpose key is undeclared.
+    param([AllowNull()]$Purpose, [AllowNull()][object[]]$Items, [switch]$Declared)
+    if ($null -eq $Purpose -and -not $Declared) { return @('', 0, '') }
     if ($Purpose -isnot [string] -or $Purpose -cnotin @('fps-ab', 'stage-attribution')) {
         return @('BAD_PURPOSE', 0, "purpose must be 'fps-ab' or 'stage-attribution'")
     }

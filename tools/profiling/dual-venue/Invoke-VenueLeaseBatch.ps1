@@ -1604,9 +1604,11 @@ if ($legPlanMode) {
         # BENCH-LIGHT-ARM-GAIN-GATES-1 (hub ruling 2026-11-20T05:25:54Z item 2): a plan may declare `purpose`. 'fps-ab' = its legs are compared on presented fps, so every leg must run the LIGHT
         # telemetry arm (a HEAVY leg's fps measures the per-frame logger; a spec that names no arm is UNKNOWN and refused alike). 'stage-attribution' = stage metrics only: HEAVY allowed. No
         # purpose: nothing is refused here, and every gain/cost reader still refuses an fps verdict from a HEAVY / UNKNOWN pair. Checked with the items, before any claim, lease or staging read.
+        # The purpose is passed AS PARSED, never coerced to a string: a one-element ["fps-ab"] would otherwise read as 'fps-ab' (adversary A3). A declared purpose that is not the scalar string is BAD_PURPOSE.
         $planPurpose = $null
-        if ($doc -is [System.Management.Automation.PSCustomObject] -and $doc.PSObject.Properties['purpose']) { $planPurpose = [string]$doc.purpose }
-        $purposeRefusal = Get-FpsLegPlanRefusal $planPurpose @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } })
+        $planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])
+        if ($planPurposeDeclared) { $planPurpose = $doc.PSObject.Properties['purpose'].Value }
+        $purposeRefusal = Get-FpsLegPlanRefusal -Purpose $planPurpose -Items @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } }) -Declared:$planPurposeDeclared
         if ($purposeRefusal[0]) { Stop-PlanRefused ([string]$purposeRefusal[0]) ([int]$purposeRefusal[1]) ([string]$purposeRefusal[2]) }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}

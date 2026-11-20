@@ -175,6 +175,19 @@ class ArmClassifierTests(_Probe):
             "@('mlvapp_playback_smoke_telemetry=1','mlvapp_playback_smoke_telemetry_disable_frame_log=1')": "LIGHT",
             "@('MLVAPP_STAGE_TIMING=1','mlvapp_stage_timing=0')": "UNKNOWN",
             "@('MLVAPP_STAGE_TIMING=0','mlvapp_stage_timing=0')": "LIGHT",
+            # adversary pass 2 A1: LIGHT is proven only against a closed list of MLVAPP_* variables; other per-frame diagnostics (named or not) are never LIGHT
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_GPU_TEX_NR_OVERLAP_TRACE=1')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_INTERACTIVE_TRACE=1')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PHASE3_TEL_PATH=C:\\Temp\\stages.csv')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=0')": "LIGHT",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1','MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq','OTHER_VAR=1')": "LIGHT",
+            "@('MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
+            # adversary pass 2 A2: no Unicode trimming of the opt-out (the native readers trim ASCII only); any whitespace or non-ASCII text is UNKNOWN
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1', \"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=$([char]0xA0)1$([char]0xA0)\")": "UNKNOWN",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1 ')": "UNKNOWN",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=TRUE')": "LIGHT",
             # adversary A1: a value that is not text is malformed, never its coerced text
             "[pscustomobject]@{ MLVAPP_STAGE_TIMING = @('0') }": "UNKNOWN",
             "[pscustomobject]@{ MLVAPP_STAGE_TIMING = [pscustomobject]@{ a = 1 } }": "UNKNOWN",
@@ -384,8 +397,11 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         self.assertEqual(proc.stdout.split(), ["JUDGED_HEAVY_READ_LIGHT=UNKNOWN", "SAME_BYTES=LIGHT", "NO_DIGEST=UNKNOWN"])
 
     def test_an_unreadable_purpose_is_refused(self) -> None:
-        r = self.run_plan([self.spec("fx-a", {"telemetryArm": "LIGHT"})], "throughput")
-        self.assertIn("LEG_PLAN_REFUSED reason=BAD_PURPOSE", r.stderr)
+        # adversary pass 2 A3: the purpose is judged as parsed. A one-element array, a number and an explicit null are not the scalar string 'fps-ab' / 'stage-attribution'.
+        for purpose in ("throughput", ["fps-ab"], ["stage-attribution"], 5, None):
+            with self.subTest(purpose=purpose):
+                r = self.run_plan([self.spec("fx-a", {"telemetryArm": "LIGHT"})], purpose)
+                self.assertIn("LEG_PLAN_REFUSED reason=BAD_PURPOSE", r.stderr, r.stdout + r.stderr)
 
     def test_stage_attribution_and_light_fps_plans_get_past_the_arm_check(self) -> None:
         # both fall through to the build-staging check (no build is staged in this fixture), which is a different typed refusal
