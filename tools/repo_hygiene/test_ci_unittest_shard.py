@@ -217,79 +217,48 @@ def _windows_shard_job() -> str:
     return _workflow_job(WINDOWS_SHARD_JOB)
 
 
-def _shard_commands(job: str) -> list[str]:
-    """Every non-comment line of ``job`` that runs the shard tool."""
-    return [
-        line.strip()
-        for line in job.splitlines()
-        if "tools.repo_hygiene.ci_unittest_shard" in line and not line.strip().startswith("#")
-    ]
+SHARD_TOOL = "python -m tools.repo_hygiene.ci_unittest_shard --profile windows"
+# The light job's two tool steps, character for character. The pin below does not parse spellings
+# (argparse takes `--of=8`, `--o 8`, quotes, a later override, a PowerShell continuation; YAML takes
+# quoted keys), it requires these exact lines and refuses any other line that names the tool.
+_LIGHT_RUN_VERIFY = f"        run: {SHARD_TOOL} --of {WINDOWS_LIGHT_SHARDS} --verify-partition"
+_LIGHT_RUN_SHARD = f"        run: {SHARD_TOOL} --of {WINDOWS_LIGHT_SHARDS} --shard ${{{{ matrix.shard }}}}"
 
 
-def _of_values(command: str) -> list[int | str]:
-    """Every ``--of`` value on one command line, in order, the way argparse reads them.
-
-    argparse accepts ``--of N``, ``--of=N`` and any unique prefix of the option (``--o N``), and a
-    later occurrence overrides an earlier one; ``int`` takes ``+8`` and a padded `` 8``. Quotes are
-    dropped and runs of blanks or tabs count as one separator. A value that is not an integer (a
-    ``${{ ... }}`` expression) is kept as its text, so it can never equal a pinned count.
-    """
-    tokens = [token for token in re.split(r"[\s=]+", command.replace('"', "").replace("'", "")) if token]
-    values: list[int | str] = []
-    for index, token in enumerate(tokens):
-        if len(token) >= 3 and "--of".startswith(token):
-            raw = tokens[index + 1] if index + 1 < len(tokens) else ""
-            try:
-                values.append(int(raw))
-            except ValueError:
-                values.append(raw)
-    return values
+def _strategy_block(key: str, count: int) -> str:
+    """A job's whole ``strategy`` block with one matrix axis and nothing else, up to its ``steps``."""
+    listed = ", ".join(str(n) for n in range(1, count + 1))
+    return f"    strategy:\n      fail-fast: false\n      matrix:\n        {key}: [{listed}]\n\n    steps:\n"
 
 
 def _run_step_of(job: str) -> int:
-    """The ``--of`` the job's shard run step ends up with (the last one, as argparse reads it)."""
-    runs = [command for command in _shard_commands(job) if "--shard" in command]
-    values = _of_values(runs[-1]) if runs else []
-    assert values and isinstance(values[-1], int), runs
-    return values[-1]
-
-
-def _matrix_keys(job: str) -> list[str] | None:
-    """The keys of the job's ``strategy.matrix`` (``include`` and ``exclude`` would show here)."""
-    lines = job.splitlines()
-    start = next((index for index, line in enumerate(lines) if line == "      matrix:"), None)
-    if start is None:
-        return None
-    keys: list[str] = []
-    for line in lines[start + 1 :]:
-        if line.strip() and not line.startswith("        "):
-            break
-        found = re.match(r"^        ([A-Za-z_][\w-]*):", line)
-        if found:
-            keys.append(found.group(1))
-    return keys
+    """The ``--of`` of the job's shard run step, read from its exact line."""
+    found = re.search(
+        r"(?m)^        run: python -m tools\.repo_hygiene\.ci_unittest_shard --profile windows "
+        r"--of (\d+) --shard \$\{\{ matrix\.shard \}\}$",
+        job,
+    )
+    assert found is not None, "the windows shard run step is not the pinned line"
+    return int(found.group(1))
 
 
 def _windows_count_problems(light_job: str, heavy_job: str, heavy_parts: int) -> list[str]:
     """Where the windows workflow and the heavy set disagree with the pinned counts (empty: they agree)."""
     problems: list[str] = []
-    commands = _shard_commands(light_job)
-    if not commands:
-        problems.append("the windows shard job runs no ci_unittest_shard step")
-    for command in commands:
-        if _of_values(command) != [WINDOWS_LIGHT_SHARDS]:
-            problems.append(f"not exactly one --of {WINDOWS_LIGHT_SHARDS}: {command}")
-    for label, job, key, expected in (
-        ("light", light_job, "shard", list(range(1, WINDOWS_LIGHT_SHARDS + 2))),
-        ("heavy", heavy_job, "part", list(range(1, WINDOWS_HEAVY_PARTS + 1))),
-    ):
-        if _matrix_keys(job) != [key]:
-            problems.append(f"{label} matrix keys are {_matrix_keys(job)}, not just [{key!r}]")
-        if re.search(r"(?m)^\s*(?:include|exclude)\s*:", job):
-            problems.append(f"{label} job carries a matrix include/exclude")
-        listed = re.search(rf"(?m)^        {key}: \[([0-9, ]+)\]$", job)
-        if listed is None or [int(n) for n in listed.group(1).split(",")] != expected:
-            problems.append(f"{label} matrix {key} list is not {expected[0]}..{expected[-1]}")
+    allowed = {_LIGHT_RUN_VERIFY.strip(), _LIGHT_RUN_SHARD.strip()}
+    for line in (_LIGHT_RUN_VERIFY, _LIGHT_RUN_SHARD):
+        if light_job.count(line + "\n") != 1:
+            problems.append(f"the light job lacks exactly one line {line.strip()!r}")
+    for line in light_job.splitlines():
+        text = line.strip()
+        if text.startswith("#") or text in allowed:
+            continue
+        if "ci_unittest_shard" in text or re.search(r"--`?o`?f?\b", text):
+            problems.append(f"another light job line names the tool or an --of/--o option: {text}")
+    if _strategy_block("shard", WINDOWS_LIGHT_SHARDS + 1) not in light_job:
+        problems.append(f"the light strategy block is not just shard 1..{WINDOWS_LIGHT_SHARDS + 1}")
+    if _strategy_block("part", WINDOWS_HEAVY_PARTS) not in heavy_job:
+        problems.append(f"the heavy strategy block is not just part 1..{WINDOWS_HEAVY_PARTS}")
     if heavy_parts != WINDOWS_HEAVY_PARTS:
         problems.append(f"the heavy set runs {heavy_parts} parts, not {WINDOWS_HEAVY_PARTS}")
     return problems
@@ -367,8 +336,8 @@ class ShardDurationBudgetTests(unittest.TestCase):
         self.assertEqual(problems, [])
 
     def test_the_count_pin_fails_on_every_way_to_run_other_than_the_pinned_counts(self) -> None:
-        # CI-WINDOWS-UNITTEST-SHARD-HEADROOM-3 r2 (adversary A1, A2): the pin reads the workflow the way
-        # argparse and GitHub do, so each of these edits of the real jobs must leave a problem behind.
+        # CI-WINDOWS-UNITTEST-SHARD-HEADROOM-3 r2 (adversary A1, A2): the pin requires the exact run lines
+        # and the exact strategy blocks, so each of these edits of the real jobs must leave a problem behind.
         light = _windows_shard_job()
         heavy = _workflow_job(WINDOWS_HEAVY_JOB)
         parts = shard.load_heavy_set("windows")[1]
@@ -382,6 +351,9 @@ class ShardDurationBudgetTests(unittest.TestCase):
             "later signed --of override": run + " --of=+8",
             "later --of with a tab": run + " --of\t8",
             "later abbreviated --o override": run + " --o 8",
+            "PowerShell continuation line with --of": run + " `\n          --of 8",
+            "PowerShell escaped option name": run + " --`of 8",
+            "block scalar with a continuation": run + " `\n          --of=8",
             "the count itself changed": "--of 8 --shard ${{ matrix.shard }}",
             "double blank before the count": "--of  8 --shard ${{ matrix.shard }}",
             "the count from an expression": "--of ${{ matrix.of }} --shard ${{ matrix.shard }}",
@@ -399,6 +371,20 @@ class ShardDurationBudgetTests(unittest.TestCase):
             "light exclude": (light.replace(matrix, matrix + "\n        exclude:\n          - shard: 7"), heavy),
             "light include": (light.replace(matrix, matrix + "\n        include:\n          - shard: 9"), heavy),
             "light shard dropped": (light.replace(matrix, "        shard: [1, 2, 3, 4, 5, 6, 7]"), heavy),
+            "light quoted exclude": (light.replace(matrix, matrix + '\n        "exclude": [{shard: 7}]'), heavy),
+            "light extra axis": (light.replace(matrix, matrix + '\n        "replica": [1, 2]'), heavy),
+            "heavy quoted exclude": (
+                light,
+                heavy.replace(heavy_matrix.group(0), heavy_matrix.group(0) + f'\n        "exclude": [{{part: {parts}}}]'),
+            ),
+            "heavy quoted include": (
+                light,
+                heavy.replace(heavy_matrix.group(0), heavy_matrix.group(0) + '\n        "include": [{part: 99}]'),
+            ),
+            "heavy extra axis": (
+                light,
+                heavy.replace(heavy_matrix.group(0), heavy_matrix.group(0) + '\n        "replica": [1, 2]'),
+            ),
             "heavy exclude": (
                 light,
                 heavy.replace(heavy_matrix.group(0), heavy_matrix.group(0) + f"\n        exclude:\n          - part: {parts}"),
