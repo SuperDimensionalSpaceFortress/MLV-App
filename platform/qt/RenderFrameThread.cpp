@@ -2799,15 +2799,6 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                                          : reducedReconFallbackReason );
         }
         insertGpuPlaybackReconRunTelemetry( slot.stageTimingTelemetry );
-        if( playback_present_trace::stampsEnabled() )
-        {
-            const auto configureIt = slot.stageTimingTelemetry.constFind( QStringLiteral("llrawproc_dual_iso_split_configure_ms") );
-            if( configureIt != slot.stageTimingTelemetry.constEnd() )
-                slot.traceStamps.configureMs = configureIt.value().toDouble();
-            const auto h2dIt = slot.stageTimingTelemetry.constFind( QStringLiteral("gpu_playback_recon_async_h2d_upload_ms") );
-            if( h2dIt != slot.stageTimingTelemetry.constEnd() )
-                slot.traceStamps.h2dMs = h2dIt.value().toDouble();
-        }
         stampReconStage( "phase3_recon_after_timing_capture_stage_time" );
         bool gpuPlaybackReconTextureBayerSnapshotCopied = false;
         stampReconStage( "phase3_recon_before_no_readback_state_stage_time" );
@@ -7392,16 +7383,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * decodedRawFrameAlreadyReconned true but renders its own recon (r1 adversary pass 2 A1). */
     if( renderConsumedWorkerRecon )
     {
-        // PLAYBACK-TRACE-LOWOVERHEAD-1: the present trace reads the worker's configure/H2D spans for this frame
-        slot.traceStamps.workerSplit = true;
         recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,
                                              slot.stageTimingTelemetry );
-    }
-    else
-    {
-        // a render that ran its own recon: the worker's spans (taken for a recon this frame did not use) are not this frame's
-        slot.traceStamps.configureMs = playback_present_trace::kUnknownMs;
-        slot.traceStamps.h2dMs = playback_present_trace::kUnknownMs;
     }
 
     slot.processedFrame8Active =

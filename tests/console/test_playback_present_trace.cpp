@@ -181,8 +181,6 @@ TEST(PlaybackPresentTraceStages, AFrameStoresItsStageStampsOrderedAndRebasedToTh
     r.setStages(stagesFrom(1.001));        // request at 1001 ms absolute
     r.readyMs = 1022.0;
     r.presentMs = 1035.0;
-    r.configureMs = 6.1;
-    r.h2dMs = 0.4;
     trace.notePresent(r);
     ASSERT_EQ(static_cast<size_t>(1), trace.size());
     const Row &a = trace.row(0);
@@ -196,8 +194,6 @@ TEST(PlaybackPresentTraceStages, AFrameStoresItsStageStampsOrderedAndRebasedToTh
     ASSERT_NEAR(31.0, a.drawBeginMs, 1e-6);
     ASSERT_NEAR(22.0, a.readyMs, 1e-9);
     ASSERT_NEAR(35.0, a.presentMs, 1e-9);
-    ASSERT_NEAR(6.1, a.configureMs, 1e-9);   // a duration: never rebased
-    ASSERT_NEAR(0.4, a.h2dMs, 1e-9);
     ASSERT_TRUE(a.stagesOrdered());
     // out of order is reported, not hidden
     Row bad = a;
@@ -219,7 +215,6 @@ TEST(PlaybackPresentTraceStages, AStageThatWasNeverStampedStaysUnknownAndAStageB
     const Row &a = trace.row(0);
     ASSERT_NEAR(-10.0, a.reqMs, 1e-6);
     ASSERT_TRUE(a.reMs <= playback_present_trace::kUnknownMs / 2.0);
-    ASSERT_TRUE(a.configureMs <= playback_present_trace::kUnknownMs / 2.0);
     ASSERT_TRUE(a.stagesOrdered());
 }
 
@@ -285,16 +280,17 @@ TEST(PlaybackPresentTraceStages, TheDumpCarriesTheStagesAndTheHeaderStillMatches
     r.setStages(stagesFrom(1.001));
     r.readyMs = 1022.0;
     r.presentMs = 1035.0;
-    r.configureMs = 6.1;
-    r.h2dMs = 0.4;
     trace.notePresent(r);
     const std::string header = Recorder::header();
     const std::string row = Recorder::formatRow(trace.firstIndex(), trace.row(0));
     const auto commas = [](const std::string &s) { size_t n = 0; for (char c : s) n += c == ',' ? 1 : 0; return n; };
     ASSERT_EQ(commas(header), commas(row));
     // the original columns keep their place; the stage columns are appended
-    ASSERT_TRUE(header.find("audio_syncs,req,dq,ds,de,rs,re,rnd,draw_begin,configure,h2d,stage_ok") != std::string::npos);
-    ASSERT_TRUE(row.find(",1.000,3.000,5.000,7.000,9.000,21.000,22.000,31.000,6.100,0.400,1") != std::string::npos);
+    ASSERT_TRUE(header.find("audio_syncs,req,dq,ds,de,rs,re,rnd,draw_begin,stage_ok") != std::string::npos);
+    ASSERT_TRUE(row.find(",1.000,3.000,5.000,7.000,9.000,21.000,22.000,31.000,1") != std::string::npos);
+    // r3 (adversary 81c5805c A1/A2): no per-frame duration column derived from the backend's last-run status
+    ASSERT_TRUE(header.find("configure") == std::string::npos);
+    ASSERT_TRUE(header.find("h2d") == std::string::npos);
 }
 
 TEST(PlaybackPresentTraceStages, WithTheSwitchOffTheStageHooksAreNoOps)
@@ -323,34 +319,6 @@ TEST(PlaybackPresentTraceStages, WithTheSwitchOffTheStageHooksAreNoOps)
     ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
 }
 
-// adversary a7085920 A1: a frame that consumed the recon worker's output must report the WORKER's configure and H2D spans;
-// the frame JSON's unprefixed keys are the render thread's own last-run record and can belong to an older frame.
-TEST(PlaybackPresentTraceStages, AFrameThatConsumedTheWorkerReconReportsTheWorkersConfigureAndH2dSpans)
-{
-    playback_present_trace::StageStamps s = stagesFrom(1.0);
-    s.workerSplit = true;
-    s.configureMs = 6.1;
-    s.h2dMs = 0.4;
-    Row r;
-    r.configureMs = 99.0;   // what a stale render-thread JSON read would have left here
-    r.h2dMs = 5.0;
-    r.setStages(s);
-    ASSERT_NEAR(6.1, r.configureMs, 1e-9);
-    ASSERT_NEAR(0.4, r.h2dMs, 1e-9);
-}
-
-TEST(PlaybackPresentTraceStages, AWorkerFrameWhoseSpansWereNotCapturedReportsUnknownNeverAStaleValue)
-{
-    playback_present_trace::StageStamps s = stagesFrom(1.0);
-    s.workerSplit = true;   // the worker ran the recon but took no configure/H2D span
-    Row r;
-    r.configureMs = 99.0;
-    r.h2dMs = 5.0;
-    r.setStages(s);
-    ASSERT_NEAR(playback_present_trace::kUnknownMs, r.configureMs, 0.0);
-    ASSERT_NEAR(playback_present_trace::kUnknownMs, r.h2dMs, 0.0);
-}
-
 // adversary a7085920 A2: a request stamped 0.5 ms and a queue stamped exactly 1 ms BEFORE the Play's start (-0.5, -1.0) run
 // backwards; the old shared "t == -1.0 is unknown" skip hid the second one and reported stage_ok=1.
 TEST(PlaybackPresentTraceStages, ARealMinusOneMsStampStillTakesPartInTheOrderCheck)
@@ -375,62 +343,23 @@ TEST(PlaybackPresentTraceStages, ARealMinusOneMsStampStillTakesPartInTheOrderChe
     ASSERT_TRUE(trace.row(1).stagesOrdered());
 }
 
-TEST(PlaybackPresentTraceStages, AFrameThatRanItsOwnReconKeepsTheCallersConfigureAndNeverTakesAStaleH2d)
-{
-    playback_present_trace::StageStamps s = stagesFrom(1.0);   // workerSplit stays false
-    s.configureMs = 6.1;                                       // ignored: not this frame's recon
-    Row r;
-    r.configureMs = 2.5;   // the caller's read of the frame's own JSON
-    r.h2dMs = 0.7;         // whatever a last-run-record read would have left
-    r.setStages(s);
-    ASSERT_NEAR(2.5, r.configureMs, 1e-9);
-    ASSERT_NEAR(playback_present_trace::kUnknownMs, r.h2dMs, 0.0);   // nobody measured it for this frame
-}
-
-// adversary 81c5805c A2: the GUI presenter's own backend call measured the upload for this frame; the stamps carry it even
-// for a frame that consumed the worker's recon (whose worker span stays unknown).
-TEST(PlaybackPresentTraceStages, ThePresentersOwnH2dMeasurementIsTheFramesH2d)
-{
-    playback_present_trace::StageStamps s = stagesFrom(1.0);
-    s.workerSplit = true;   // the worker took no H2D span
-    s.h2dMs = 0.4;          // the presenter wrote this one
-    Row r;
-    r.setStages(s);
-    ASSERT_NEAR(0.4, r.h2dMs, 1e-9);
-    // and an unmeasured frame reports unknown, never a 0.0 that would read as "measured, free"
-    Row u;
-    u.setStages(stagesFrom(1.0));
-    ASSERT_NEAR(playback_present_trace::kUnknownMs, u.h2dMs, 0.0);
-}
-
-TEST(PlaybackPresentTraceWiring, TheWorkersSpansAreCapturedOnItsOwnThreadAndMarkTheFrameWhenItsReconIsConsumed)
+// r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace has no configure or H2D column, and no code
+// path derives a per-frame span from the backend's last-run preupload status. Pinned at the three places that did.
+TEST(PlaybackPresentTraceWiring, NoConfigureOrH2dSpanIsCapturedOrWrittenForTheLightTrace)
 {
     const QString render = sourceOf(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
-    // the recon worker reads the spans it has just written into its own slot, only when the trace is on
-    ASSERT_EQ(1, render.count(QStringLiteral(
-        "        if( playback_present_trace::stampsEnabled() )\n"
-        "        {\n"
-        "            const auto configureIt = slot.stageTimingTelemetry.constFind( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") );\n"
-        "            if( configureIt != slot.stageTimingTelemetry.constEnd() )\n"
-        "                slot.traceStamps.configureMs = configureIt.value().toDouble();\n"
-        "            const auto h2dIt = slot.stageTimingTelemetry.constFind( QStringLiteral(\"gpu_playback_recon_async_h2d_upload_ms\") );\n"
-        "            if( h2dIt != slot.stageTimingTelemetry.constEnd() )\n"
-        "                slot.traceStamps.h2dMs = h2dIt.value().toDouble();\n"
-        "        }\n")));
-    // the render thread marks the frame only when it CONSUMED that recon (the same gate as copyWorkerSplit)
-    ASSERT_EQ(1, render.count(QStringLiteral(
-        "    if( renderConsumedWorkerRecon )\n"
-        "    {\n"
-        "        // PLAYBACK-TRACE-LOWOVERHEAD-1: the present trace reads the worker's configure/H2D spans for this frame\n"
-        "        slot.traceStamps.workerSplit = true;\n")));
-    // a render that ran its own recon drops the worker's spans (they describe a recon this frame did not use)
-    ASSERT_EQ(1, render.count(QStringLiteral(
-        "    else\n"
-        "    {\n"
-        "        // a render that ran its own recon: the worker's spans (taken for a recon this frame did not use) are not this frame's\n"
-        "        slot.traceStamps.configureMs = playback_present_trace::kUnknownMs;\n"
-        "        slot.traceStamps.h2dMs = playback_present_trace::kUnknownMs;\n"
-        "    }\n")));
+    const QString window = mainWindowSource();
+    const QString traceHeader = sourceOf(QStringLiteral("platform/qt/PlaybackPresentTrace.h"));
+    for (const QString &banned : { QStringLiteral("traceStamps.configureMs"), QStringLiteral("traceStamps.h2dMs"),
+                                   QStringLiteral("traceStamps.workerSplit"), QStringLiteral("traceRow.h2dMs"),
+                                   QStringLiteral("traceRow.configureMs") })
+    {
+        ASSERT_FALSE(render.contains(banned));
+        ASSERT_FALSE(window.contains(banned));
+    }
+    ASSERT_FALSE(traceHeader.contains(QStringLiteral("configureMs")));
+    ASSERT_FALSE(traceHeader.contains(QStringLiteral("h2dMs")));
+    ASSERT_FALSE(traceHeader.contains(QStringLiteral("workerSplit")));
 }
 
 TEST(PlaybackPresentTraceWiring, EveryStageHookIsOneGuardedStoreOnAKnownThread)
@@ -473,19 +402,8 @@ TEST(PlaybackPresentTraceWiring, TheWindowSwitchesTheStageHooksWithTheRecorderAn
         "    playback_present_trace::setStampsEnabled( m_playbackPresentTrace.enabled() );\n")));
     // the GUI thread's draw-begin reuses display_start (already read), stored on the ReadyFrame
     ASSERT_EQ(1, source.count(QStringLiteral("    playback_present_trace::stamp( readyFrame.traceStamps.drawBeginS, display_start );\n")));
-    // the present row takes the stamps; configure/H2D come from the frame's own telemetry keys ONLY when the frame ran its own
-    // recon (a frame that consumed the worker's recon carries the worker's spans in the stamps, and its JSON keys are stale)
+    // the present row takes the stamps and nothing else from the frame's telemetry (no configure/H2D: see the test above)
     ASSERT_EQ(1, source.count(QStringLiteral("            traceRow.setStages( readyFrame.traceStamps );\n")));
-    ASSERT_EQ(1, source.count(QStringLiteral(
-        "            if( !readyFrame.traceStamps.workerSplit\n"
-        "             && timing.contains( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") ) )\n"
-        "                traceRow.configureMs = telemetryDoubleValue( timing, \"llrawproc_dual_iso_split_configure_ms\" );\n")));
-    // H2D is never read back from the frame JSON by the trace; the presenter that measured it sets it, or resets it
-    ASSERT_FALSE(source.contains(QStringLiteral("traceRow.h2dMs = telemetryDoubleValue")));
-    ASSERT_EQ(1, source.count(QStringLiteral(
-        "            readyFrame.traceStamps.h2dMs = texturePresentTiming.preupload.upload_ms;\n")));
-    ASSERT_EQ(1, source.count(QStringLiteral(
-        "            readyFrame.traceStamps.h2dMs = playback_present_trace::kUnknownMs;\n")));
     // the dump walks the ring oldest-first and says how many rows the ring overwrote
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.row( i )")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.dropped()")));

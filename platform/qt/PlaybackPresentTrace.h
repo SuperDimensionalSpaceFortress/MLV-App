@@ -42,15 +42,9 @@ struct StageStamps
     double reconEndS = 0.0;     // recon worker finished
     double renderStartS = 0.0;  // render thread began this frame
     double drawBeginS = 0.0;    // the GUI thread began drawing it (drawFrameReady's display start)
-    // Durations in ms (not stamps; kUnknownMs = nobody measured it for THIS frame). The frame JSON's unprefixed configure and
-    // H2D keys are the render thread's own last-run record, which can describe an older frame (adversary a7085920 A1,
-    // 81c5805c A1/A2), so the trace never reads them for H2D, only from a source that measured it for this frame:
-    //  - the recon WORKER, on its own thread, from the slot telemetry it has just written (configure and H2D);
-    //  - the GUI presenter, from the backend call it just made for this frame (H2D), which replaces the worker's value;
-    //  - the presenter's frame-id mismatch, which resets H2D to unknown (the retained buffer belonged to another frame).
-    double configureMs = kUnknownMs;   // used only when workerSplit; any other frame keeps the caller's read of its own telemetry
-    double h2dMs = kUnknownMs;
-    bool workerSplit = false;   // set by the render thread when it consumed the worker's recon for this frame
+    // r3 (adversary 81c5805c A1/A2, HUB RULING 2026-11-20T11:30Z): the LIGHT trace carries STAMPS only. A per-frame configure or
+    // H2D span would come from the backend's last-run preupload status, whose lifetime is wrong at the source (a stale value
+    // survives a CPU fallback; a synchronous upload reports 0), so those spans stay in the HEAVY dump and are not trusted here.
 };
 
 /*! The process-wide switch for the stage hooks (MLVAPP_PLAYBACK_PRESENT_TRACE, set by the window next to the recorder's own
@@ -104,8 +98,6 @@ struct Row
     double reMs = kUnknownMs;         // recon ended
     double rndMs = kUnknownMs;        // render thread began
     double drawBeginMs = kUnknownMs;  // GUI draw began
-    double configureMs = kUnknownMs;  // llrawproc dual-ISO configure span (a duration, not a stamp)
-    double h2dMs = kUnknownMs;        // async H2D upload span (a duration, not a stamp)
 
     /*! Loads the worker stamps (absolute stage-clock seconds; 0 = unknown) as ABSOLUTE ms, ready for notePresent. */
     void setStages( const StageStamps &s )
@@ -119,11 +111,6 @@ struct Row
         reMs = ms( s.reconEndS );
         rndMs = ms( s.renderStartS );
         drawBeginMs = ms( s.drawBeginS );
-        // H2D always comes from the stamps (unknown when no source measured it for this frame, never a stale value).
-        // Configure follows the worker's span for a frame that consumed the worker's recon; any other frame keeps what the
-        // caller read from the frame's own telemetry.
-        h2dMs = s.h2dMs;
-        if( s.workerSplit ) configureMs = s.configureMs;
     }
 
     /*! True when the stamps that are known never run backwards along request .. present (1 = ordered). */
@@ -256,7 +243,7 @@ public:
     {
         return "i,frame,pos,t,iv,ready,uil,draw,render,queue,grab,credit,prev_end,ticks,busy,pred,max_tick_gap,"
                "adv,adv_frames,last_adv,last_tick_diff,audio_syncs,"
-               "req,dq,ds,de,rs,re,rnd,draw_begin,configure,h2d,stage_ok";
+               "req,dq,ds,de,rs,re,rnd,draw_begin,stage_ok";
     }
 
     static std::string formatRow( size_t index, const Row &r )
@@ -264,12 +251,12 @@ public:
         char buf[640];
         std::snprintf( buf, sizeof( buf ),
                        "%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.3f,%d,%d,%d,%.3f,%d,%.4f,%.3f,%.0f,%d,"
-                       "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
+                       "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
                        static_cast<int>( index ), r.frame, r.position, r.presentMs, r.intervalMs, r.readyMs, r.uiLatencyMs, r.drawMs,
                        r.renderMs, r.queueMs, r.grabMs, r.creditFrames, r.prevEndMs, r.ticks, r.busyTicks,
                        r.predictiveTicks, r.maxTickGapMs, r.advances, r.advancedFrames, r.lastAdvanceMs,
                        r.lastTickDiffMs, r.audioSyncs,
-                       r.reqMs, r.dqMs, r.dsMs, r.deMs, r.rsMs, r.reMs, r.rndMs, r.drawBeginMs, r.configureMs, r.h2dMs,
+                       r.reqMs, r.dqMs, r.dsMs, r.deMs, r.rsMs, r.reMs, r.rndMs, r.drawBeginMs,
                        r.stagesOrdered() ? 1 : 0 );
         return std::string( buf );
     }
