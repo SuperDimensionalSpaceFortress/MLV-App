@@ -843,10 +843,17 @@ function Close-BatchTicket([string]$Why) {
     if ($null -eq $t) { return }
     $script:batchTicket = $null
     $res = try {
-        $r = & (Get-Module VenueChain) { param($a) Invoke-VenueBoundedRead -ScriptText 'param($a) Import-Module $a.m -Force -DisableNameChecking; [string](Remove-VenueTicket $a.t)' -Argument $a -TimeoutSec 5 } @{ m = (Join-Path $here 'VenueChain.psm1'); t = $t }
+        $r = Invoke-BatchTicketCall '[string](Remove-VenueTicket $a.t)' @{ t = $t }
         if ($r.answered) { [string]@($r.value)[-1] } else { "NO_ANSWER ($($r.error))" }
     } catch { "ERROR $($_.Exception.Message -replace '\s+', ' ')" }
     LogBest "TICKET_ENDED batch=$batchNo why=$Why result=$res"
+}
+
+function Invoke-BatchTicketCall([string]$Body, [hashtable]$Argument, [double]$Sec = 5) {
+    # adversary r3 pass 2 (A1, A4): every ticket call outside Request-VenueClaim (create, heartbeat, remove) runs on ONE bounded worker (VenueChain's Invoke-VenueBoundedRead, 5 s, abandoned and
+    # counted like every other claim-folder read), so a stalled claim folder cannot hold the batch or its deadline. $Body is the worker's script text; it sees VenueChain imported and
+    # its argument as $a (this hashtable plus .m, the module path). Returns { answered; value; error }.
+    & (Get-Module VenueChain) { param($b, $a, $s) Invoke-VenueBoundedRead -ScriptText ('param($a) Import-Module $a.m -Force -DisableNameChecking; ' + $b) -Argument $a -TimeoutSec $s } $Body ($Argument + @{ m = (Join-Path $here 'VenueChain.psm1') }) $Sec
 }
 
 function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
@@ -2267,17 +2274,29 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # the heartbeat refreshed after each, so a live holder's ticket is never reaped mid-wait and a dead one still is (dead-pid at once, heartbeat after 3 slices). The claim loop below
         # refreshes it to ready on its first request.
         $beatStaleSec = [int][Math]::Max(90, 3 * $TicketBeatSec)
+        $waitStartUtc = [DateTime]::UtcNow   # the wait ends waitSec after THIS, not after the ticket work: slow ticket I/O never pushes the claim request past the deadline the wait was checked against
+        $ticketArgs0 = @{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose batch $batchNo"; StaleAfterSec = $beatStaleSec; ClaimDir = $ClaimDir; Phase = 'cooldown' }
         if ($script:TicketOn) {
             try {
-                $script:batchTicket = New-VenueTicket -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -StaleAfterSec $beatStaleSec -ClaimDir $ClaimDir -Phase cooldown
-                LogBest "TICKET_TAKEN batch=$batchNo ticket=$($script:batchTicket.name) phase=cooldown (before the $($bw.reason) wait of $($bw.waitSec) s; the claim is asked for after it)"
+                $tk = Invoke-BatchTicketCall '$k = $a.k; New-VenueTicket @k' @{ k = $ticketArgs0 }
+                if ($tk.answered -and @($tk.value).Count -gt 0) {
+                    $script:batchTicket = @($tk.value)[-1]
+                    LogBest "TICKET_TAKEN batch=$batchNo ticket=$($script:batchTicket.name) phase=cooldown (before the $($bw.reason) wait of $($bw.waitSec) s; the claim is asked for after it)"
+                } else { LogBest "TICKET_UNAVAILABLE batch=$batchNo $($tk.error) (ticketless for this wait)" }
             } catch { $script:batchTicket = $null; LogBest "TICKET_UNAVAILABLE batch=$batchNo $($_.Exception.Message -replace '\s+', ' ') (ticketless for this wait)" }
         }
         if ($script:batchTicket) {
-            $waitEndUtc = [DateTime]::UtcNow.AddSeconds([double]$bw.waitSec)
+            $waitEndUtc = $waitStartUtc.AddSeconds([double]$bw.waitSec)
             while (($leftSec = ($waitEndUtc - [DateTime]::UtcNow).TotalSeconds) -gt 0) {
                 Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min($leftSec, [double]$TicketBeatSec)))
-                if ([DateTime]::UtcNow -lt $waitEndUtc) { try { [void](Update-VenueTicket -Ticket $script:batchTicket -Phase 'cooldown' -StaleAfterSec $beatStaleSec) } catch { } }
+                if ([DateTime]::UtcNow -ge $waitEndUtc) { break }
+                # the heartbeat's answer is read: LOST (the ticket was reaped, e.g. after a long write lock) is retaken at once so the holder is not out of the line until its wait ends; BUSY or no answer is tried again next slice
+                $hb = Invoke-BatchTicketCall '[string](Update-VenueTicket -Ticket $a.t -Phase cooldown -StaleAfterSec $a.s)' @{ t = $script:batchTicket; s = $beatStaleSec }
+                $hbRes = $(if ($hb.answered) { [string]@($hb.value)[-1] } else { 'NO_ANSWER' })
+                if ($hbRes -ceq 'LOST') {
+                    $tk = Invoke-BatchTicketCall '$k = $a.k; New-VenueTicket @k' @{ k = $ticketArgs0 }
+                    if ($tk.answered -and @($tk.value).Count -gt 0) { $script:batchTicket = @($tk.value)[-1]; LogBest "TICKET_RETAKEN batch=$batchNo ticket=$($script:batchTicket.name) phase=cooldown (the ticket was removed during the wait: back of the line)" }
+                } elseif ($hbRes -cne 'OK') { LogBest "TICKET_HEARTBEAT_MISSED batch=$batchNo result=$hbRes (tried again next slice)" }
             }
         } else { Start-Sleep -Seconds $bw.waitSec }
     }
@@ -2398,7 +2417,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
             continue
         }
-        if ($req.granted) { if ($script:batchTicket) { Close-BatchTicket 'claim-granted' }; $claim = $req.claim; break }   # the claim itself now keeps the line behind this batch waiting
+        if ($req.granted) { $claim = $req.claim; break }   # the claim itself keeps the line behind this batch waiting; its ticket is removed after the keeper starts (below), never out of the claim's renewal margin
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })
         if ($holder -cne $lastHolder) { LogBest "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait$(if ($script:batchTicket -and $null -ne $req.PSObject.Properties['position']) { " position=$($req.position)/$(@($req.queue).Count)" })"; $lastHolder = $holder }
         if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
@@ -2417,6 +2436,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # r5 (dot 242171b3 B1): the claim's expiry is renewed for as long as the batch holds it (the open's wait for the lease, the by-name wait and the legs can all
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
+    if ($script:batchTicket) { Close-BatchTicket 'claim-granted' }   # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: after the keeper started (adversary r3 pass 2 A3), bounded (A1)
     $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:keeperLive = $true   # r7: Enable-WriteSuppression stops a live keeper (and redirects the close job)
     # r3 (Dot B1): the finally block's cancel, close and ledger charge follow whether the open was SUBMITTED, never "$op is null": a null $op before the call (a throw while
     # the sidecar was checked) means nothing was sent. r16 (sol r15 B1; hub ruling 08:18:44Z): submitted = um-run.ps1 was called for it ($script:umRunCalled), not merely

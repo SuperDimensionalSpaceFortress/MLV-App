@@ -392,7 +392,8 @@ function Request-VenueClaim {
     $position = $(if ($mine.Count -gt 0) { [int]$mine[0].position } else { 0 })
     # VENUE-FIFO-TICKET-BEFORE-PRECLAIM-1: the head is the oldest live ticket that is READY. A ticket in phase 'cooldown' (its holder is waiting out Bachelor's lease cooldown or budget and
     # cannot take the claim yet) keeps its place but never blocks a ready waiter behind it; the caller's own ticket was just refreshed to 'waiting', so it is always ready.
-    $head = @($live | Where-Object { $_.name -ceq $t.name -or [string]$_.ticket.phase -ine 'cooldown' } | Select-Object -First 1)   # -ine: a ticket written with any spelling of cooldown is still not ready
+    # A ticket whose phase cannot be read (its file is being rewritten, so there is no parsed ticket) is not known to be ready, so it cannot block either: it keeps its place and is judged at the next request.
+    $head = @($live | Where-Object { $_.name -ceq $t.name -or ($null -ne $_.ticket -and [string]$_.ticket.phase -ine 'cooldown') } | Select-Object -First 1)   # -ine: a ticket written with any spelling of cooldown is still not ready
     if ($head.Count -eq 0 -or $head[0].name -cne $t.name) {
         $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir
         return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $seen.claim; path = $seen.path; broken = @(); ticket = $t; queue = $live; position = $position; staleTickets = @($removed) }

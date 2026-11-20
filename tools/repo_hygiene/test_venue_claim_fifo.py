@@ -1135,12 +1135,47 @@ $b1 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
         run = LEASE_RUNNER.read_text(encoding="utf-8")
         func = re.search(r"function Close-BatchTicket.*?\n}\n", run, re.S)
         self.assertIsNotNone(func)
-        self.assertIn("Invoke-VenueBoundedRead", func.group(0), "the ticket removal is not bounded")
+        self.assertIn("Invoke-BatchTicketCall", func.group(0), "the ticket removal is not bounded")
+        helper = re.search(r"function Invoke-BatchTicketCall.*?\n}\n", run, re.S)
+        self.assertIsNotNone(helper)
+        self.assertIn("Invoke-VenueBoundedRead", helper.group(0), "the ticket helper is not a bounded read")
         self.assertNotRegex(func.group(0), r"Remove-VenueTicket \$t\)\s*\}\s*catch", "the ticket is removed inline")
         hit_block = run[run.index("        if ($hit) {"):run.index("        if ($hit) {") + 700]
         self.assertNotIn("Close-BatchTicket", hit_block, "the input-guard refusal removes the ticket inline")
         dl_block = run[run.index("    if ($null -eq $claim) {"):run.index("    if ($null -eq $claim) {") + 400]
         self.assertNotIn("Close-BatchTicket", dl_block, "the DEADLINE break removes the ticket inline")
+
+    BUSY_HOLDER = """
+$A = New-VenueTicket -Venue bachelor -RunDir 'run-A' -ClaimDir $d -Phase cooldown -StaleAfterSec 600
+Start-Sleep -Milliseconds 30
+$B = New-VenueTicket -Venue bachelor -RunDir 'run-B' -ClaimDir $d
+$fs = [IO.File]::Open($A.path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+try { $b1 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B } finally { $fs.Dispose() }
+[pscustomobject]@{ b1 = $b1.state; b1Granted = [bool]$b1.granted } | ConvertTo-Json -Compress
+"""
+
+    def test_a_ticket_being_rewritten_whose_phase_cannot_be_read_never_blocks_a_ready_waiter(self) -> None:
+        # adversary pass 2 A2: a cooldown ticket held by a writer reads as BUSY with no parsed ticket; its missing phase passed the readiness filter and QUEUED the ready B on a free claim
+        r = self.ps(self.BUSY_HOLDER)
+        self.assertEqual((r["b1"], r["b1Granted"]), ("TAKEN", True), "an unreadable ticket's phase is unknown: it is not ready, so it cannot block")
+
+    def test_the_cooldown_wait_is_anchored_before_the_ticket_work_and_every_ticket_call_is_bounded(self) -> None:
+        # adversary pass 2 A1 + A4: the wait end was measured after the ticket was created (so slow ticket I/O pushed the claim request past -DeadlineUtc), and creation and the heartbeat
+        # ran inline (a stalled claim folder held the batch; a heartbeat that failed was discarded, so a lost ticket was never retaken).
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        wait = run[run.index("$beatStaleSec = "):run.index("# (1) the claim, once per batch")]
+        self.assertLess(wait.index("$waitStartUtc"), wait.index("New-VenueTicket"), "the wait is not anchored before the ticket is created")
+        self.assertNotRegex(wait, r"(?<!-)\bNew-VenueTicket -Venue", "the cooldown ticket is created inline, unbounded")
+        self.assertNotIn("[void](Update-VenueTicket", wait, "the heartbeat runs inline and its result is discarded")
+        self.assertIn("TICKET_RETAKEN", wait, "a lost cooldown ticket is not retaken")
+        self.assertIn("function Invoke-BatchTicketCall", run)
+
+    def test_the_ticket_is_removed_only_after_the_claim_keeper_started(self) -> None:
+        # adversary pass 2 A3: the removal sat between the claim's lapse check and Start-VenueClaimKeeper, so its time came out of the claim's renewal margin
+        run = LEASE_RUNNER.read_text(encoding="utf-8")
+        loop_end = run.index("$claimKeeper = Start-VenueClaimKeeper")
+        self.assertEqual(run[:loop_end].count("Close-BatchTicket 'claim-granted'"), 0, "the ticket is removed before the keeper starts")
+        self.assertIn("Close-BatchTicket 'claim-granted'", run[loop_end:loop_end + 1200])
 
     def test_the_lease_batch_header_documents_the_ticket(self) -> None:
         run = LEASE_RUNNER.read_text(encoding="utf-8")
