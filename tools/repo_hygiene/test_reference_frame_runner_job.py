@@ -426,6 +426,20 @@ class GeneratorTests(_GeneratorCase):
         self.assertNotIn("MLVAPP_GPU_PLAYBACK_RECON", default)
         self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode'", self.capture_block(default))
 
+    def test_the_default_job_keeps_the_exact_text_around_every_recon_seam(self) -> None:
+        # The recon fragments enter the template through tokens that expand to nothing when off. A token that eats or adds one character (a space after
+        # `=`, a line break) changes every default job, so each seam's surrounding text is pinned as the base generator emitted it (measured byte-identical
+        # to the base generator's output when this card was written).
+        default = self.emitted()
+        # (read_text turns the file's CRLF into LF, so the seams are written with LF)
+        for seam in ("$DisableLookAssist = $true\n$Seconds = 30\n",
+                     "$captureCommand += \" -PresentedFrames $PresentedFrames\" }\n        if ($QualityMode -ne '') { $captureCommand += \" -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }\" }\n        # FAIL CLOSED",
+                     "if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }\n$viewsChanged = ($captureRc -eq 0 -and -not $viewsIntactAfterCapture)\n",
+                     "captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }\n",
+                     "footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }\n    stagedOnHost = "):
+            with self.subTest(seam=seam[:60]):
+                self.assertIn(seam, default)
+
     def test_the_job_identity_differs_between_recon_on_and_off(self) -> None:
         off = self.emitted()
         on = self.generate_job("recon-on-ident", "-GpuPlaybackRecon", "on")
@@ -435,6 +449,18 @@ class GeneratorTests(_GeneratorCase):
     def test_a_recon_on_job_records_the_setting_in_result_json(self) -> None:
         on = self.generate_job("recon-on-result", "-GpuPlaybackRecon", "on")
         self.assertRegex(on, r"captureParameters = \[ordered\]@\{[^}\r\n]*gpuPlaybackRecon = \$GpuPlaybackRecon")
+
+    def test_the_recon_on_job_gates_the_candidate_on_the_apps_gpu_summary_and_the_header_names_its_step_code(self) -> None:
+        on = self.generate_job("recon-on-evidence", "-GpuPlaybackRecon", "on")
+        self.assertIn(r"playback_smoke\.gpu_summary session=", on)
+        self.assertIn("$StepLog['reconEvidence']", on)
+        self.assertNotIn("gpu_summary", self.emitted(), "the default job reads the gpu summary: its text changed")
+        self.assertNotIn("reconEvidence", self.emitted())
+        header = GENERATOR.read_text(encoding="utf-8").split("[CmdletBinding()]", 1)[0]
+        self.assertRegex(header, r"228 reconEvidence")
+        steps = re.findall(r"(\d{3}) (\w+)", header[header.index("The EMITTED job"):])
+        codes = [code for code, _ in steps]
+        self.assertEqual(len(codes), len(set(codes)), f"two documented steps share a code: {steps}")
 
     def test_a_recon_value_other_than_off_or_on_is_refused_with_a_typed_code_and_no_job_is_written(self) -> None:
         for label, value in (("yes", "yes"), ("upper", "ON"), ("one", "1"), ("empty", "")):
@@ -629,7 +655,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
     # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
     def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None,
                              more_edits: tuple[tuple[str, str], ...] = (), generator_args: tuple[str, ...] = (),
-                             env_probe: Path | None = None) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
+                             env_probe: Path | None = None, app_log_extra: str = "") -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
         """The emitted job run end to end against a stand-in app; returns (ran, outbox, part, part sha256, the app's argv file, the path marker)."""
         marker = "OWNERREALPATHMARKERq7z3"
         owner_dir = self.tmp / f"{marker}-dir"
@@ -642,7 +668,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         app_dir = self.tmp / "stand-in-app"
         app_dir.mkdir(exist_ok=True)
         log_template = app_dir / "app.log.template"
-        log_template.write_text("t0 playback_smoke.start session=1\nt1 " + oracle_tests._good_line() + "\n", encoding="utf-8")
+        log_template.write_text("t0 playback_smoke.start session=1\nt1 " + oracle_tests._good_line() + "\n" + app_log_extra, encoding="utf-8")
         grab = app_dir / "grab.template"
         grab.write_bytes(b"\0" * 65536)
         args_file = app_dir / "app-args.json"
@@ -714,9 +740,16 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         pairs = (line.split("=", 1) for line in probe.read_text(encoding="utf-8", errors="replace").splitlines() if "=" in line)
         return {key: value for key, value in pairs}
 
+    @staticmethod
+    def gpu_summary_line(session: object = 0, cpu: object = 0, recon: object = 480, texture_readback: object = 0, texture_no_readback: object = 0) -> str:
+        """The app's playback_smoke.gpu_summary record (MainWindow.cpp prints exactly these fields), after the stand-in's summary line (session=0)."""
+        return (f"t2 playback_smoke.gpu_summary session={session} cpu_frames={cpu} gpu_preview_frames=0 gpu_recon_readback_frames={recon} "
+                f"gpu_texture_readback_frames={texture_readback} gpu_texture_no_readback_frames={texture_no_readback}\n")
+
     def test_a_recon_on_job_launches_the_app_with_the_recon_env_and_records_it_in_result_json(self) -> None:
         probe = self.tmp / "recon-on-env.txt"
-        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture("reconon", generator_args=("-GpuPlaybackRecon", "on"), env_probe=probe)
+        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture("reconon", generator_args=("-GpuPlaybackRecon", "on"), env_probe=probe,
+                                                                        app_log_extra=self.gpu_summary_line())
         self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
         env = self.probed_env(probe)
         self.assertEqual(env.get("MLVAPP_GPU_PLAYBACK_RECON"), "1", env)
@@ -728,10 +761,56 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIn(str(work), dll, "the DLL is not the one the job deployed under its own work directory")
         result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(result["captureParameters"]["gpuPlaybackRecon"], "on")
+        self.assertEqual((result["status"], result["exitCode"]), ("candidate-unreviewed", 0))
+        self.assertIs(result["gpuReconEvidence"]["ok"], True, result["gpuReconEvidence"])
+        self.assertEqual((result["gpuReconEvidence"]["cpuFrames"], result["gpuReconEvidence"]["reconFrames"]), (0, 480))
         manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
         applied = manifest["settings"]["envApplied"]
         self.assertIn("MLVAPP_GPU_PLAYBACK_RECON", applied)
         self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE", applied, "the profile's quality mode was lost when the recon env joined it")
+
+    # --- adversary A1 on 4cb84958: 'on' REQUESTS the GPU recon, so the job accepts the capture only when the app's own counters show it ran ----------
+    def assert_recon_not_proven(self, name: str, log_extra: str, reason_token: str) -> None:
+        ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=log_extra)
+        self.assertEqual(ran.returncode, 228, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=228 CAPTURE_EXIT=0", ran.stdout)
+        self.assertNotIn("CAPTURE_OK", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 228, 0))
+        self.assertIsNone(result["candidateSha256"], "a capture whose GPU recon was not proven was named a candidate")
+        self.assertEqual(result["steps"]["reconEvidence"], 228)
+        self.assertIs(result["gpuReconEvidence"]["ok"], False)
+        self.assertIn(reason_token, result["gpuReconEvidence"]["reason"])
+        # the manifest the capture wrote still calls itself a candidate, so it is voided: the marker a reader honours, and the stamp in place
+        self.assertTrue((pub / "capture" / "reference-frame-candidate.invalid").is_file())
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((manifest["status"], manifest["invalid"]), ("invalid", True))
+
+    def test_a_recon_on_capture_that_ran_any_frame_on_the_cpu_is_not_a_candidate(self) -> None:
+        # the adversary's input: MLVAPP_GPU_FAULT_INJECT in the venue's environment suppresses CUDA and the rest of the capture plays on the CPU
+        self.assert_recon_not_proven("recon-cpu-frames", self.gpu_summary_line(cpu=3, recon=477), "CPU_FRAMES_NONZERO")
+
+    def test_a_recon_on_capture_with_no_gpu_summary_is_not_a_candidate(self) -> None:
+        self.assert_recon_not_proven("recon-no-gpu-line", "", "GPU_SUMMARY_ABSENT")
+
+    def test_a_recon_on_capture_whose_gpu_summary_belongs_to_another_session_is_not_a_candidate(self) -> None:
+        self.assert_recon_not_proven("recon-other-session", self.gpu_summary_line(session=7), "GPU_SUMMARY_ABSENT")
+
+    def test_a_recon_on_capture_with_no_gpu_frames_at_all_is_not_a_candidate(self) -> None:
+        self.assert_recon_not_proven("recon-zero-gpu", self.gpu_summary_line(recon=0), "NO_GPU_RECON_FRAMES")
+
+    def test_a_recon_on_capture_whose_counter_is_not_a_decimal_count_is_not_a_candidate(self) -> None:
+        for label, bad in (("hex", "0x0"), ("empty", ""), ("null", "null")):
+            with self.subTest(label):
+                self.assert_recon_not_proven(f"recon-bad-{label}", self.gpu_summary_line(cpu=bad), "COUNTER_NOT_NUMERIC")
+
+    def test_a_default_job_does_not_read_the_gpu_summary_and_still_passes_with_cpu_frames(self) -> None:
+        # off = CPU reconstruction is legitimate: the evidence gate belongs to 'on' only
+        ran, pub, *_ = self.run_stand_in_capture("reconoff-cpu", app_log_extra=self.gpu_summary_line(cpu=480, recon=0))
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertNotIn("gpuReconEvidence", result)
+        self.assertNotIn("reconEvidence", result["steps"])
 
     def test_a_default_job_launches_the_app_with_no_recon_env_and_result_json_names_no_recon_setting(self) -> None:
         probe = self.tmp / "recon-off-env.txt"
