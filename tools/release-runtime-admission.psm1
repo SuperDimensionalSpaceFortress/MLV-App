@@ -132,14 +132,14 @@ function Stop-PinnedPayloadChild {
         [ValidateRange(0, 600000)]
         [int]$ConfirmMs = 10000,
 
-        # Called with one argument: the listing's time bound in whole seconds (1..30), what is left of ConfirmMs, rounded up.
+        # Called with one argument: the listing's time bound in whole seconds (1..30), what is left of ConfirmMs, rounded down.
         [scriptblock]$ProcessTable = { param([int]$TimeoutSec) Get-PinnedPayloadProcessTable -TimeoutSec $TimeoutSec }
     )
-    # One monotonic clock bounds every wait of this stop (r6 property 2); no wall-clock reading decides anything here. Each listing is
-    # bounded by what is left of the budget (at least the 1 s CIM granularity), and a tree seen gone only after the budget is spent is
-    # not confirmed (adversary d7942d7f-A2).
+    # One monotonic clock bounds every wait of this stop (r6 property 2); no wall-clock reading decides anything here. A listing starts
+    # only while at least one whole second (the CIM bound's granularity) is left, and is bounded to the whole seconds left, rounded DOWN
+    # (adversary df7e3c66-A2); a tree seen gone only after the budget is spent is not confirmed (adversary d7942d7f-A2).
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $listingSec = { [int][math]::Min(30, [math]::Max(1, [math]::Ceiling(($ConfirmMs - $clock.ElapsedMilliseconds) / 1000.0))) }
+    $listingSec = { [int][math]::Min(30, [math]::Floor(($ConfirmMs - $clock.ElapsedMilliseconds) / 1000.0)) }
     # The root's identity is read through the handle this caller holds, never from a listing (key3 r5 B1, psm1:108 sibling).
     $treeError = ''
     $rootTicks = $null
@@ -150,11 +150,16 @@ function Stop-PinnedPayloadChild {
     } else {
         # The tree as ONE listing proves it while the root is alive (adversary b5fce5a9-A1, 0f5308ad-A1): a listing that fails, or one
         # without the root's own row, leaves the kill unconfirmed.
-        try {
-            $tree = Get-PinnedPayloadTree -Table @(& $ProcessTable (& $listingSec)) -RootId ([int]$Process.Id) -RootTicks $rootTicks
-            $members = $tree.members
-            if (-not $tree.rootListed) { $treeError = "pid $($Process.Id) with its own creation time is not in the listing taken before the kill, so its tree is unproven" }
-        } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
+        $bound = & $listingSec
+        if ($bound -lt 1) {
+            $treeError = "no whole second of the $ConfirmMs ms confirmation budget is left to list the tree before the kill"
+        } else {
+            try {
+                $tree = Get-PinnedPayloadTree -Table @(& $ProcessTable $bound) -RootId ([int]$Process.Id) -RootTicks $rootTicks
+                $members = $tree.members
+                if (-not $tree.rootListed) { $treeError = "pid $($Process.Id) with its own creation time is not in the listing taken before the kill, so its tree is unproven" }
+            } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
+        }
     }
     # The ONLY kill: Kill($true) through the root's own held handle. Nothing is ever killed by a pid read from a listing (adversary
     # 0f5308ad-A1/A2: a listing can join one process's parent id to another's identity, and an open by pid can reach a replacement); a
@@ -167,13 +172,21 @@ function Stop-PinnedPayloadChild {
         try {
             # Re-listed until nothing that may be the tree's is listed or the one budget is spent (a terminated process can stay
             # listed for a moment); whatever is still listed then leaves the tree unconfirmed.
+            # Every row a poll counts joins the tracked set with its identity, so a later poll still counts its subtree after it exits
+            # (adversary df7e3c66-A1). No listing starts with less than one whole second left.
+            $left = @()
+            $listed = $false
             while ($true) {
-                $left = @(Get-PinnedPayloadSurvivors -Table @(& $ProcessTable (& $listingSec)) -Members $members)
-                $remaining = $ConfirmMs - $clock.ElapsedMilliseconds
-                if (-not $left.Count -or $remaining -le 0) { break }
-                [System.Threading.Thread]::Sleep([int][math]::Min(100, $remaining))
+                $bound = & $listingSec
+                if ($bound -lt 1) { break }
+                $left = @(Get-PinnedPayloadSurvivors -Table @(& $ProcessTable $bound) -Members $members)
+                $listed = $true
+                foreach ($row in $left) { if (-not $members.ContainsKey([int]$row.id)) { $members[[int]$row.id] = ConvertTo-PinnedPayloadCreationTicks $row.startUtc } }
+                if (-not $left.Count) { break }
+                [System.Threading.Thread]::Sleep([int][math]::Max(0, [math]::Min(100, $ConfirmMs - $clock.ElapsedMilliseconds)))
             }
-            if ($left.Count) { $treeError = "pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill (a member, or a row on a member's parent id that no clock-free fact places outside the tree)" }
+            if (-not $listed) { $treeError = "no whole second of the $ConfirmMs ms confirmation budget was left to list the tree after the kill" }
+            elseif ($left.Count) { $treeError = "pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill (a member, or a row on a member's parent id that no clock-free fact places outside the tree)" }
             elseif ($clock.ElapsedMilliseconds -gt $ConfirmMs) { $treeError = "the tree was seen gone only after the $ConfirmMs ms confirmation budget was spent ($($clock.ElapsedMilliseconds) ms)" }
         } catch { $treeError = "the process tree could not be listed after the kill: $($_.Exception.Message)" }
     }

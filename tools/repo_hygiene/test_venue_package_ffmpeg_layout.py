@@ -447,7 +447,7 @@ class HelperBehaviourTests(unittest.TestCase):
         return f"[pscustomobject]@{{ id = {pid}; parentId = {parent}; startUtc = [datetime]::Parse('{utc}').ToUniversalTime() }}"
 
     def _stop(self, kill: str, wait: str, before: str = "@()", after: str = "@()", *, root_start: str | None = "2026-11-19T10:00:00Z",
-              prelude: str = "", env: dict | None = None) -> dict:
+              prelude: str = "", env: dict | None = None, later: str | None = None, confirm_ms: int = 3000) -> dict:
         # The process table is injected (before the kill, then every later listing). The fake root is pid 4242; its handle-read creation
         # time is root_start (None = the handle cannot read it). Fake ids are not multiples of 4, so no real Windows pid can match one.
         module = str(HELPER_MODULE).replace("'", "''")
@@ -458,11 +458,13 @@ class HelperBehaviourTests(unittest.TestCase):
             "$global:ffxListings = 0\n"
             "$global:ffxSec = @()\n"
             # The listing's own time bound (seconds) the stop passes on each call is recorded in .listingSec.
-            f"$table = {{ $global:ffxListings++; $global:ffxSec += [string]$args[0]; if ($global:ffxListings -eq 1) {{ {before} }} else {{ {after} }} }}\n"
+            # Listing 1 = before the kill, listing 2 = after, listing 3 on = later (the same as after unless given).
+            f"$table = {{ $global:ffxListings++; $global:ffxSec += [string]$args[0]; if ($global:ffxListings -eq 1) {{ {before} }} "
+            f"elseif ($global:ffxListings -eq 2) {{ {after} }} else {{ {after if later is None else later} }} }}\n"
             f"$fake = [pscustomobject]@{{ Id = 4242{start} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value {{ {kill} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ {wait} }}\n"
-            "$r = & $m { param($p, $t) Stop-PinnedPayloadChild -Process $p -ProcessTable $t -ConfirmMs 1500 } $fake $table\n"
+            f"$r = & $m {{ param($p, $t) Stop-PinnedPayloadChild -Process $p -ProcessTable $t -ConfirmMs {int(confirm_ms)} }} $fake $table\n"
             "$r | Add-Member -NotePropertyName listingSec -NotePropertyValue ($global:ffxSec -join ',')\n"
             "$r | ConvertTo-Json -Compress\n"
         )
@@ -599,13 +601,30 @@ class HelperBehaviourTests(unittest.TestCase):
         # an empty listing that completes after the budget is spent cannot establish timely success.
         root = self._row(4242, 1, "2026-11-19T10:00:00Z")
         late = self._stop("$null", "$true", before=f"[System.Threading.Thread]::Sleep(900); @({root})",
-                          after="[System.Threading.Thread]::Sleep(900); @()")
+                          after="[System.Threading.Thread]::Sleep(900); @()", confirm_ms=1500)
         self.assertFalse(late["confirmed"], late)
         self.assertIn("budget", late["killError"])
         bounds = [int(s) for s in late["listingSec"].split(",")]
         self.assertTrue(bounds and all(1 <= s <= 2 for s in bounds), late)
+        # adversary df7e3c66-A2: no listing starts once less than one whole listing second is left (here 1500 - 900 ms), and none is
+        # granted more whole seconds than are left: the only listing is the one before the kill, bounded to 1 s.
+        self.assertEqual(late["listingSec"], "1", late)
         prompt = self._stop("$null", "$true", before=f"@({root})", after="@()")
         self.assertTrue(prompt["confirmed"], prompt)
+        # a zero budget lists nothing at all and confirms nothing.
+        none_left = self._stop("$null", "$true", before=f"@({root})", after="@()", confirm_ms=0)
+        self.assertFalse(none_left["confirmed"], none_left)
+        self.assertEqual(none_left["listingSec"], "", none_left)
+
+    def test_a_survivor_counted_in_one_poll_keeps_its_subtree_counted_in_the_next(self) -> None:
+        # adversary df7e3c66-A1: the first post-kill listing shows 5151 (on the root's parent id, reading older) and its child 6262; 5151
+        # then exits. The next poll must still count 6262 through 5151, so the kill stays unconfirmed.
+        root = self._row(4242, 4, "2026-11-19T10:00:00Z")
+        c = self._row(5151, 4242, "2026-11-19T09:59:50Z")
+        g = self._row(6262, 5151, "2026-11-19T09:59:51Z")
+        stop = self._stop("$null", "$true", before=f"@({root})", after=f"@({c}, {g})", later=f"@({g})")
+        self.assertFalse(stop["confirmed"], stop)
+        self.assertIn("6262 still running", stop["killError"])
 
     def test_a_creation_time_that_cannot_be_read_never_proves_anything(self) -> None:
         # r6 property 1: the root's creation time is read through its own handle; unreadable, the listing cannot prove its tree.
