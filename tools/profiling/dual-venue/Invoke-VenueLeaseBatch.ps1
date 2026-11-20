@@ -93,7 +93,10 @@
 #         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes) and its cached exe, dll and package zip present and
 #         hashing to the manifest's digests (-VerifyArtifacts; BUILD_ARTIFACT_MISSING / BUILD_ARTIFACT_MISMATCH). One bad item refuses the whole plan on stderr,
 #         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
-#         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
+#         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID | BAD_PURPOSE | FPS_AB_HEAVY_ARM | FPS_AB_UNKNOWN_ARM> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
+#         BENCH-LIGHT-ARM-GAIN-GATES-1: the plan object may declare "purpose": "fps-ab" (its legs are compared on presented fps) or "stage-attribution" (stage metrics only). An fps-ab plan is refused
+#         FPS_AB_HEAVY_ARM when any leg's spec runs the HEAVY telemetry arm (generatorArgs.telemetryArm; a HEAVY leg's fps measures the per-frame logger) and FPS_AB_UNKNOWN_ARM when a spec names
+#         no arm; any other purpose is BAD_PURPOSE. leg-plan.json records the purpose and each leg's derived telemetryArm (tools\profiling\FpsArmGate.psm1).
 #         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, does not list the item's backend, or has a field Invoke-VenueLeg casts or validates
 #         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
@@ -254,6 +257,7 @@ $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
+Import-Module (Join-Path (Split-Path -Parent $here) 'FpsArmGate.psm1') -Force   # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry-arm classifier and the fps-A/B plan rule
 # r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
 # entry can never widen the one-second dispatch grace (a probe admitted 50 s past the deadline) or freeze the thermal clock
 $ThermalDispatchGraceSec = 1
@@ -1364,6 +1368,13 @@ function Get-LegSpecId([string]$Path) {
     $legId
 }
 
+function Get-LegSpecTelemetryArm([string]$Path) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm (LIGHT / HEAVY / UNKNOWN) a -LegPlan item's spec will run, derived from generatorArgs.telemetryArm by the same bounded read as
+    # Get-LegSpecId. A spec that cannot be read or parsed in the bound is UNKNOWN (refused like HEAVY for an fps A/B), never LIGHT.
+    $spec = try { $r = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec); if ($r.state -cne 'OK') { $null } else { [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$r.bytes), $true).ReadToEnd() | ConvertFrom-Json } } catch { $null }
+    Get-FpsArmFromLegSpec $spec
+}
+
 function Get-SpecReadBoundSec {
     # r19 (sol r18 B2 = pass20-A2): the longest a spec read may take now: what is left before -DeadlineUtc less the refusal's reserve, under the preflight child's own cap (120 s). A guard
     # worker (no -DeadlineUtc in its scope) has the cap: the worker is itself given up on at its guard budget, and its callers pass that budget's remainder instead.
@@ -1576,8 +1587,16 @@ if ($legPlanMode) {
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
-            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
+            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
+                    telemetryArm = (Get-LegSpecTelemetryArm $path).arm })
         }
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 (hub ruling 2026-11-20T05:25:54Z item 2): a plan may declare `purpose`. 'fps-ab' = its legs are compared on presented fps, so every leg must run the LIGHT
+        # telemetry arm (a HEAVY leg's fps measures the per-frame logger; a spec that names no arm is UNKNOWN and refused alike). 'stage-attribution' = stage metrics only: HEAVY allowed. No
+        # purpose: nothing is refused here, and every gain/cost reader still refuses an fps verdict from a HEAVY / UNKNOWN pair. Checked with the items, before any claim, lease or staging read.
+        $planPurpose = $null
+        if ($doc -is [System.Management.Automation.PSCustomObject] -and $doc.PSObject.Properties['purpose']) { $planPurpose = [string]$doc.purpose }
+        $purposeRefusal = Get-FpsLegPlanRefusal $planPurpose @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } })
+        if ($purposeRefusal[0]) { Stop-PlanRefused ([string]$purposeRefusal[0]) ([int]$purposeRefusal[1]) ([string]$purposeRefusal[2]) }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
@@ -1612,10 +1631,10 @@ if ($legPlanMode) {
         }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; telemetryArm = $it.telemetryArm })
         }
-        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
-            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
+        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; purpose = $planPurpose; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
+            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; telemetryArm = $_.telemetryArm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
             builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
         if ($null -ne $spread) { $planRecord.thermalSpread = $spread }
     } catch {

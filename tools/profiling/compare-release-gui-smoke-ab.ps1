@@ -18,6 +18,8 @@ $ErrorActionPreference = "Stop"
 # gap: this comparator's own list used to omit capture-invalid and capture-too-dark, so an
 # A/B leg with an unusable or artifacted capture could still report PASS.
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
+# BENCH-LIGHT-ARM-GAIN-GATES-1: a presented-fps delta comes only from a LIGHT / LIGHT pair (hub ruling 2026-11-20T05:25:54Z item 2).
+Import-Module (Join-Path $PSScriptRoot 'FpsArmGate.psm1') -Force
 
 function Read-SmokeJson {
     param([string]$Path)
@@ -452,6 +454,53 @@ function Get-HostLoadComparisonEvidence {
     [pscustomobject]@{
         evidence = [pscustomobject]$evidence
         failures = @($failures)
+    }
+}
+
+function Get-FpsArmComparisonEvidence {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: may the two smokes be compared on fps? Each smoke's arm is read from the launch environment its own result recorded
+    # (launch.environment); only LIGHT / LIGHT is allowed. A HEAVY leg (per-frame logging on), a mixed pair and a smoke that recorded no environment (UNKNOWN) are refused,
+    # typed. Not a verdict failure: the screenshot / colour comparison does not depend on the arm, so only the fps deltas are withheld (Hide-FpsComparisonDeltas).
+    param(
+        [object]$BeforeSmoke,
+        [object]$AfterSmoke
+    )
+
+    $beforeArm = Get-FpsArmFromEnvironment (Get-NestedValue $BeforeSmoke "launch.environment")
+    $afterArm = Get-FpsArmFromEnvironment (Get-NestedValue $AfterSmoke "launch.environment")
+    $verdict = Get-FpsPairVerdict -Baseline $beforeArm -Candidate $afterArm -BaselineName "before" -CandidateName "after"
+    [pscustomobject]@{
+        refused = (-not $verdict.allowed)
+        reason = [string]$verdict.reason
+        detail = [string]$verdict.detail
+        stageMetricsAllowed = $true
+        before = $beforeArm
+        after = $afterArm
+    }
+}
+
+function Hide-FpsComparisonDeltas {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: for a refused pair every presented / GUI / timeline fps delta and the auto decision's fps-equivalent delta become $null, with the typed reason
+    # beside them. Each leg's own raw before / after value stays (a single leg's measurement is not a comparison); every ms stage figure is untouched.
+    param(
+        [object]$Result,
+        [object]$Evidence
+    )
+
+    if (-not $Evidence.refused) {
+        return
+    }
+    $targets = @()
+    foreach ($name in @('visibleBottomLeftGuiFps', 'smokePresentedFps', 'smokeTimelineFps')) {
+        $targets += $Result.fps.$name
+    }
+    $targets += $Result.autoDecision.averageFpsEquivalent
+    foreach ($target in $targets) {
+        if ($null -ne $target) {
+            $target.delta = $null
+            $target.deltaPercent = $null
+            Add-Member -InputObject $target -NotePropertyName 'refused' -NotePropertyValue $Evidence.reason -Force
+        }
     }
 }
 
@@ -978,6 +1027,8 @@ foreach ($leg in @(
 $hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke
 $hostLoadEvidence = $hostLoadComparison.evidence
 $failures += @($hostLoadComparison.failures)
+# BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm of each smoke (fps deltas are withheld below for any pair that is not LIGHT / LIGHT; it does not change the verdict).
+$fpsArmComparison = Get-FpsArmComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke
 
 # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): refuse the whole comparison
 # -- never merely note it -- when the two legs are not known to have presented on the same
@@ -1052,6 +1103,7 @@ $result = [pscustomobject]@{
     screenshot = $screenshotCompare
     presentedFrameEvidence = [pscustomobject]$presentedFrameEvidence
     hostLoadEvidence = $hostLoadEvidence
+    fpsVerdict = $fpsArmComparison
     autoDecision = New-AutoDecisionComparison `
         -BeforeSmoke $beforeSmoke `
         -AfterSmoke $afterSmoke
@@ -1098,6 +1150,8 @@ if ($displayComparability.status -ne 'same') {
         $result.fps.$fpsField.deltaPercent = $null
     }
 }
+
+Hide-FpsComparisonDeltas -Result $result -Evidence $fpsArmComparison
 
 $json = $result | ConvertTo-Json -Depth 24
 if (-not [string]::IsNullOrWhiteSpace($Output)) {

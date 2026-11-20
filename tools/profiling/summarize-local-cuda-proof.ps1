@@ -6,6 +6,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# BENCH-LIGHT-ARM-GAIN-GATES-1: a presented-fps gain or cost reading comes only from a LIGHT / LIGHT playback A/B (hub ruling 2026-11-20T05:25:54Z item 2).
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 function Resolve-RepoPath {
     param(
@@ -691,7 +693,31 @@ else {
                 -NextAction "Rerun the playback A/B stage on a quiet host; an fps number measured under provisional or unrecorded host load is not a property of the build."
         }
     }
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the arm gate, re-derived from the two compared legs' own recorded telemetryArm (never the packet's cached fpsVerdict). A HEAVY leg, a mixed
+    # pair, or a leg that records no arm (UNKNOWN: a packet written before this gate) is refused: no fps-delta diagnostic and no presented / GUI fps delta line below; the
+    # stage lines (intervals, render totals) stay.
+    $playbackAbFpsArmVerdict = Get-FpsPairVerdict `
+        -Baseline (Get-Field $playbackAb.baseline "telemetryArm") `
+        -Candidate (Get-Field $playbackAbCandidateLeg "telemetryArm") `
+        -BaselineName "baseline" `
+        -CandidateName $playbackAbComparisonBasis
+    $playbackAbFpsArmRefusal = [pscustomobject]@{
+        refused = (-not $playbackAbFpsArmVerdict.allowed)
+        reason = [string]$playbackAbFpsArmVerdict.reason
+        detail = [string]$playbackAbFpsArmVerdict.detail
+    }
+    if ($playbackAbFpsArmRefusal.refused) {
+        Add-Diagnostic `
+            -Diagnostics $diagnostics `
+            -Area "playback-speed" `
+            -Code "PLAYBACK_AB_FPS_ARM_REFUSED" `
+            -Severity "warning" `
+            -Message "Playback A/B presented-FPS comparison refused: $($playbackAbFpsArmRefusal.reason)." `
+            -Evidence @($playbackAbFpsArmRefusal.detail) `
+            -NextAction "Treat this packet as stage attribution only: rerun the playback A/B with both legs on the LIGHT telemetry arm (frame log opted out) before quoting an fps gain or cost."
+    }
     if (-not $playbackAbHostLoadProvisional -and
+        -not $playbackAbFpsArmRefusal.refused -and
         $playbackAbSpeedCompare -and $null -ne $playbackAbSpeedCompare.presentedFps) {
         $fpsDelta = Convert-ToNullableDouble (Get-Field $playbackAbSpeedCompare.presentedFps "delta")
         if ($null -ne $fpsDelta -and $fpsDelta -le 0) {
@@ -711,10 +737,18 @@ else {
 }
 $playbackSpeedEvidence = @()
 if ($playbackAb -and $playbackAbSpeedCompare) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: for a refused pair the two fps delta lines are replaced by the typed refusal; the stage lines below are kept.
+    $playbackSpeedFpsLines = if ($playbackAbFpsArmRefusal.refused) {
+        @("presented / GUI status FPS delta: refused ($($playbackAbFpsArmRefusal.reason); $($playbackAbFpsArmRefusal.detail))")
+    } else {
+        @(
+            (Format-MetricDeltaLine -Label "presented FPS" -Metric $playbackAbSpeedCompare.presentedFps),
+            (Format-MetricDeltaLine -Label "GUI status FPS" -Metric $playbackAbSpeedCompare.guiStatusFps)
+        )
+    }
     $playbackSpeedEvidence = @(
-        "comparison_basis=$playbackAbComparisonBasis",
-        (Format-MetricDeltaLine -Label "presented FPS" -Metric $playbackAbSpeedCompare.presentedFps),
-        (Format-MetricDeltaLine -Label "GUI status FPS" -Metric $playbackAbSpeedCompare.guiStatusFps),
+        "comparison_basis=$playbackAbComparisonBasis"
+    ) + $playbackSpeedFpsLines + @(
         (Format-MetricDeltaLine -Label "avg present interval" -Metric $playbackAbSpeedCompare.avgPresentIntervalMs -Unit " ms" -LowerIsBetter),
         (Format-MetricDeltaLine -Label "render total" -Metric $playbackAbSpeedCompare.avgRenderTotalMs -Unit " ms" -LowerIsBetter)
     )

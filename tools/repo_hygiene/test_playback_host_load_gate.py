@@ -84,7 +84,9 @@ class _ProbeCase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.probe = self.tmp / "probe.ps1"
-        self.probe.write_text(_extract_functions(self.script, self.functions), encoding="utf-8")
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: the real scripts import the shared arm gate; an extracted function that calls it needs the module in the probe too.
+        arm_gate = ROOT / "tools" / "profiling" / "FpsArmGate.psm1"
+        self.probe.write_text(f"Import-Module '{arm_gate}' -Force\n" + _extract_functions(self.script, self.functions), encoding="utf-8")
 
     def run_snippet(self, body: str) -> subprocess.CompletedProcess:
         script = self.tmp / "run.ps1"
@@ -1825,6 +1827,7 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         "Convert-ToNullableDouble",
         "Get-PlaybackAbLegHostLoadProvisional",
         "Get-PlaybackAbHostLoadRefusal",
+        "Get-PlaybackAbFpsArmRefusal",
         "Get-CompareDeltaPercent",
         "Test-DeltaAtLeast",
         "Get-PlaybackAbAnalysis",
@@ -1834,10 +1837,11 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         # round 5: legs are now built WITH hostLoadState by default (as every real round-4+
         # producer emits it alongside hostLoadProvisional) -- state defaults to the value implied
         # by provisional so callers that only care about the boolean keep working unchanged.
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: and WITH telemetryArm LIGHT (a leg that records no arm is UNKNOWN and refused, so these host-load cases need the LIGHT arm to stay about host load).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
         return (
-            "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
+            "[pscustomobject]@{ telemetryArm = 'LIGHT'; hostLoadProvisional = " + provisional_literal +
             "; hostLoadState = '" + resolved_state + "' }"
         )
 
@@ -1968,6 +1972,7 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         "Assert-MachineFingerprint",
         "Get-PlaybackAbLegHostLoadProvisional",
         "Get-PlaybackAbHostLoadRefusal",
+        "Get-PlaybackAbFpsArmRefusal",
         "Get-CompareDeltaPercent",
         "Test-DeltaAtLeast",
         "Get-PlaybackAbAnalysis",
@@ -1975,10 +1980,11 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
     ]
 
     def _leg(self, provisional: bool, state: str = None) -> str:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: LIGHT arm, so these cases stay about host load (an unrecorded arm is UNKNOWN and refused).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
         return (
-            "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
+            "[pscustomobject]@{ telemetryArm = 'LIGHT'; hostLoadProvisional = " + provisional_literal +
             "; hostLoadState = '" + resolved_state + "' }"
         )
 
@@ -3168,7 +3174,8 @@ class LocalCudaProofSummarizerHostLoadGuardTests(unittest.TestCase):
     def test_fps_not_improved_diagnostic_is_skipped_when_host_load_is_provisional(self) -> None:
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
         guard_start = source.index("if (-not $playbackAbHostLoadProvisional -and")
-        guard_block = source[guard_start:guard_start + 500]
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: the guard grew one condition (the arm refusal), so the window is 700 chars, not 500.
+        guard_block = source[guard_start:guard_start + 700]
         self.assertIn("PLAYBACK_PRESENTED_FPS_NOT_IMPROVED", guard_block)
 
 
