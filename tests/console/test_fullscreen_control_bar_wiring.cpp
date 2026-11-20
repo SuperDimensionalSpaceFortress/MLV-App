@@ -324,7 +324,7 @@ TEST(FullscreenControlBarWiring, SummaryReportsTheSessionNotTheLifetime)
     ASSERT_TRUE(gpuBegin > 0);
     ASSERT_TRUE(cpuBegin < elseAt);
     ASSERT_TRUE(gpuBegin < elseAt);
-    ASSERT_EQ(1, int(source.count(QStringLiteral("beginSession("))));
+    ASSERT_EQ(1, int(source.count(QStringLiteral("m_fullscreenBarWidget->beginSession("))));
     ASSERT_EQ(1, int(source.count(QStringLiteral("controlBarBeginSessionIfActive("))));
 
     const QString summary = functionBodyToBrace(source, QStringLiteral("void MainWindow::fullscreenBarEmitSummary( void )"));
