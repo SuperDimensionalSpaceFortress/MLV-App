@@ -2594,6 +2594,16 @@ private:
     // MainWindow starts the timer with kPointerPollMs(); with no cap the first look is one idle period.
     int firstLookMs() const { return pollMs > 0 && pollMs < m_idleMs ? pollMs : m_idleMs; }
 
+#ifdef Q_OS_WIN
+    // The event path saw the input. As MainWindow (r11, pass 15 A1): nothing pending and the history marked again.
+    // With markHistory false (the r5 RED control, which marks nothing) it is the r5 event path: the bare clear.
+    void noteDeliveredAsTheTick()
+    {
+        if( markHistory ) viewer_idle::win_hook::noteDelivered();
+        else viewer_idle::win_hook::witness().clear();
+    }
+#endif
+
     void restoreNow()
     {
         if( m_idle.forceShown() ) m_hider.restore( m_surfaces );
@@ -2601,7 +2611,7 @@ private:
         {
             m_pointer.seed( QCursor::pos() );
 #ifdef Q_OS_WIN
-            viewer_idle::win_hook::noteDelivered();   // as MainWindow (r11, pass 15 A1)
+            noteDeliveredAsTheTick();
 #endif
             m_idle.noteActivity( m_clock.elapsed() );
             if( !m_timer.isActive() ) m_timer.start( firstLookMs() );
@@ -2620,7 +2630,7 @@ private:
         {
             m_pointer.seed( QCursor::pos() );
 #ifdef Q_OS_WIN
-            viewer_idle::win_hook::noteDelivered();   // as MainWindow (r11, pass 15 A1)
+            noteDeliveredAsTheTick();
 #endif
             if( m_idle.noteActivity( m_clock.elapsed() ) ) m_hider.restore( m_surfaces );
             if( !m_timer.isActive() ) m_timer.start( firstLookMs() );
