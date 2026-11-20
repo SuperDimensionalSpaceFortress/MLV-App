@@ -1692,6 +1692,226 @@ class DeployBachelorAgent(unittest.TestCase):
         self.assertIn('sys.platform == "win32"', src[max(0, i - 260):i])
         self.assertIn('shutil.which("icacls")', src[max(0, i - 260):i])
 
+    # ---- BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1: a NOOP with -RestartMode when-idle restarts an agent that predates the file ------
+    # At 7d2ff913 the NOOP branch exited 0 before the restart, so an agent whose new file was already in place (a copy-only deploy, or
+    # a crash after the write) kept the old script in memory, and a -DryRun with when-idle exited 16 on the binding instead of reporting.
+
+    def _noop_venue_with_live_agent(self, agent_first: bool):
+        """The venue copy IS the source (a NOOP), and a live agent runs it. agent_first: the agent started BEFORE the file was written
+        (it has the old script in memory); otherwise the file was written, then the agent started more than the tolerance later."""
+        self.source.write_bytes(OLD)                 # OLD sleeps, so the live agent stays alive
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        if not agent_first:
+            time.sleep(3)                            # > $script:StartToleranceSec (2 s): the agent clearly starts after the file
+        pid, start = self.live_agent()
+        self.write_beat(pid, start)
+        if agent_first:
+            later = time.time() + 30                 # the file was (re)written after the agent started
+            os.utime(self.venue / AGENT_NAME, (later, later))
+        return pid, start
+
+    def test_noop1_a_noop_restarts_an_agent_that_predates_the_file(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        before = (self.venue / AGENT_NAME).stat().st_mtime_ns
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven pid=\d+ agentStartUtc=\S+\s*$" % sha(OLD))
+        self.assertTrue(self.marker.exists(), "the restart ran")
+        self.assertEqual((self.venue / AGENT_NAME).stat().st_mtime_ns, before, "a no-op still does not rewrite the file")
+        self.assertEqual(self.rollbacks(), [], "a no-op still makes no rollback folder")
+
+    def test_noop2_an_agent_that_seems_to_start_after_the_file_is_still_restarted(self) -> None:
+        # adversary pass 2 A1 of a4389eb1: "started after the file" was read from two wall-clock times, and a clock stepped back after the
+        # agent started (or a copy that carries its source's times, pass 1 A1) makes a copy landed LATER read as EARLIER. No file time
+        # proves which bytes a running process loaded, so a when-idle NOOP never attests "current": it restarts the bound, idle agent
+        # (and, since r3, reads no file time at all). -RestartMode none is the way to say "do not restart".
+        self._noop_venue_with_live_agent(agent_first=False)
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven pid=\d+ agentStartUtc=\S+\s*$" % sha(OLD))
+        self.assertNotIn("reason=current", r.stdout)
+        self.assertTrue(self.marker.exists(), "the restart ran")
+
+    def test_noop3_a_noop_whose_agent_start_cannot_be_read_fails_closed(self) -> None:
+        self.source.write_bytes(OLD)
+        for label, beat in (("no-heartbeat", None),
+                            ("no-start", 'alive x pid=%d host=%s generation=1 agentScript="%s"\r\n' % (os.getpid(), BENCH_HOST, self.venue / AGENT_NAME)),
+                            ("bad-start", 'alive x pid=%d host=%s generation=1 processStartUtc=not-a-time agentScript="%s"\r\n' % (os.getpid(), BENCH_HOST, self.venue / AGENT_NAME))):
+            with self.subTest(label=label):
+                hb = self.venue / "heartbeat.txt"
+                if beat is None:
+                    hb.unlink(missing_ok=True)
+                else:
+                    hb.write_text(beat)
+                r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+                self.assertNotEqual(r.returncode, 0, "never a silent success: " + r.stdout + r.stderr)
+                self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=unreadable\b" % sha(OLD))
+                self.assertFalse(self.marker.exists())
+
+    def test_noop4_a_noop_that_needs_a_restart_on_a_busy_venue_refuses(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        (self.venue / "inbox" / "j1.job.ps1").write_text("x")
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_BUSY running=0 inbox=1", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=busy\b" % sha(OLD))
+        self.assertFalse(self.marker.exists(), "a busy venue is never restarted")
+
+    def test_noop5_a_noop_with_when_idle_on_the_real_path_is_held_to_the_binding(self) -> None:
+        # no -RestartScript: the restart would act on this machine's task, so the binding must hold (no heartbeat here) - never exit 0
+        self.source.write_bytes(OLD)
+        r = self.run_deploy("-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=restart-host-refused\b" % sha(OLD))
+
+    def test_noop6_a_dry_run_with_when_idle_reports_the_binding_instead_of_exiting_16(self) -> None:
+        # the deploy action, the real path, no heartbeat: the binding cannot hold; a dry run says so and exits 0, changing nothing
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=deploy sha=%s restart=when-idle decision=refuse wouldExit=16 " % sha(NEW))
+        self.assertNotIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assert_untouched()
+        # the same on a NOOP
+        self.source.write_bytes(OLD)
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=no-restart reason=restart-host-refused wouldExit=16 " % sha(OLD))
+
+    def test_noop7_a_dry_run_names_the_restart_decision_and_never_restarts(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=restart reason=loaded-script-unproven wouldExit=0\b" % sha(OLD))
+        self.assertFalse(self.marker.exists(), "a dry run never restarts")
+        # and a bound deploy dry run names its decision too
+        (self.venue / AGENT_NAME).write_bytes(NEW)
+        self.source.write_bytes(OLD)
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=deploy sha=%s restart=when-idle decision=restart-if-idle wouldExit=0\b" % sha(OLD))
+        self.assertFalse(self.marker.exists())
+
+    def test_noop8_a_noop_with_the_default_restart_mode_is_unchanged(self) -> None:
+        # -RestartMode none keeps the exact contract line (the hub parses it), busy or not
+        (self.venue / AGENT_NAME).write_bytes(NEW)
+        (self.venue / "inbox" / "j1.job.ps1").write_text("x")
+        for extra in ((), ("-DryRun",)):
+            r = self.run_deploy(*extra)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s\s*$" % sha(NEW))
+
+    # ---- adversary pass 1 of 100e87dc (A1, A2): each test failed on 100e87dc ----------------------------------------------------
+
+    def test_noop_a1_a_copy_that_keeps_old_write_and_creation_times_still_restarts(self) -> None:
+        # A1: a copy-only deploy with Copy-Item / robocopy keeps the source's LastWriteTimeUtc (and robocopy its CreationTimeUtc), so both
+        # read OLDER than the agent; the agent never loaded these bytes. Only the change time (NTFS ChangeTime, Unix ctime) cannot be
+        # carried over by a copy, so an agent is "current" only when it started after THAT too.
+        self._noop_venue_with_live_agent(agent_first=False)
+        agent = self.venue / AGENT_NAME
+        agent.write_bytes(OLD)                           # the copy lands after the agent started ...
+        past = time.time() - 3 * 86400
+        os.utime(agent, (past, past))                    # ... carrying an old write time
+        if sys.platform == "win32":                      # ... and an old creation time (settable on Windows only)
+            subprocess.run([PWSH, "-NoProfile", "-Command",
+                            "(Get-Item -LiteralPath '%s').CreationTimeUtc = [DateTime]::UtcNow.AddDays(-4)" % psq(agent)],
+                           check=True, capture_output=True, text=True, timeout=60)
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven pid=\d+ agentStartUtc=\S+\s*$" % sha(OLD))
+        self.assertTrue(self.marker.exists(), "the agent that predates the copy is restarted")
+
+    def test_noop_a2_a_busy_or_leased_venue_is_still_a_refusal_in_a_when_idle_noop_dry_run(self) -> None:
+        # A2: every dry-run report on the NOOP path (binding refused, no restart needed, restart needed) came before the busy check
+        self.source.write_bytes(OLD)
+        cases = (("binding-refused", ()), ("restart-script", ("-RestartScript", str(self.restart))))
+        for label, extra in cases:
+            for folder, name, code, needle in (("inbox", "j1.job.ps1", 10, "DEPLOY_REFUSED_BUSY running=0 inbox=1"),
+                                               ("slot-holders", "lb-1.lease.json", 11, "DEPLOY_REFUSED_LEASE lb-1.lease.json")):
+                with self.subTest(label=label, name=name):
+                    f = self.venue / folder / name
+                    f.write_text("x")
+                    try:
+                        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", *extra)
+                        self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+                        self.assertIn(needle, r.stdout)
+                        self.assertNotIn("DEPLOY_DRYRUN", r.stdout)
+                    finally:
+                        f.unlink()
+        # an agent that started after the file (no restart needed) on a busy venue: the dry run still refuses
+        self._noop_venue_with_live_agent(agent_first=False)
+        (self.venue / "inbox" / "j1.job.ps1").write_text("x")
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 10, r.stdout + r.stderr)
+        self.assertNotIn("DEPLOY_DRYRUN", r.stdout)
+        self.assertFalse(self.marker.exists())
+
+    # ---- adversary pass 3 of e7cfa491 (A1 blocking, A2 advisory): each test failed on e7cfa491 -----------------------------------
+
+    def test_noop_p3a1_a_restart_mode_validateset_accepts_but_the_script_does_not_name_is_refused(self) -> None:
+        # pass 3 A1: ValidateSet compares culture-aware and ignores a soft hyphen, so 'when<U+00AD>-idle' passed it, while every dispatch
+        # compares ordinally: the NOOP then printed DEPLOY_NOOP and exited 0 as if -RestartMode none (the deploy path skipped the restart
+        # the same way). A mode that is not ordinally none or when-idle is a typed refusal before anything is read or changed.
+        self.source.write_bytes(OLD)
+        for label, mode in (("soft-hyphen", "when­-idle"), ("soft-hyphen-none", "no­ne")):
+            for venue_bytes in (OLD, NEW):
+                with self.subTest(label=label, noop=venue_bytes == OLD):
+                    (self.venue / AGENT_NAME).write_bytes(venue_bytes)
+                    r = self.run_deploy("-RestartMode", mode)
+                    self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+                    self.assertRegex(r.stdout, r"(?m)^DEPLOY_REFUSED_UNREADABLE -RestartMode ")
+                    self.assertNotIn("DEPLOY_NOOP", r.stdout)
+                    self.assertNotIn("DEPLOY_OK", r.stdout)
+                    self.assertEqual((self.venue / AGENT_NAME).read_bytes(), venue_bytes, "a refused mode changes nothing")
+        # the canonical spellings, in any case, still work
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        for mode in ("none", "NONE", "When-Idle"):
+            with self.subTest(mode=mode):
+                r = self.run_deploy("-DryRun", "-RestartMode", mode, "-RestartScript", str(self.restart))
+                self.assertNotEqual(r.returncode, 12, r.stdout + r.stderr)
+                self.assertNotIn("DEPLOY_REFUSED_UNREADABLE -RestartMode", r.stdout)
+
+    def test_noop_p3a2_the_noop_refusal_reason_names_the_refusal_observed(self) -> None:
+        # pass 3 A2 (advisory): a NOOP whose last idle read found the venue UNREADABLE (code 12) said reason=busy
+        r = self._dot_source("foreach ($c in 10, 11, 12) { 'c' + $c + '=' + (Get-NoopRefusalReason -Code $c) }")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["c10=busy", "c11=lease", "c12=unreadable"], r.stdout + r.stderr)
+
+    # ---- sol r2 B1 of bf28f1bd + adversary pass 5 A1 of a7c1fa5a: a NOOP makes no file-time request -----------------------------
+    # bf28f1bd read Get-Item and the change time (File.OpenHandle + GetFileInformationByHandleEx, or UnixStat / stat) synchronously: a
+    # share that answered the hash and the binding and then stopped answering held the run, and deploy.lock, before any typed result.
+    # a7c1fa5a ran that read under Invoke-Bounded, but an abandoned runspace stuck in the call holds pwsh's shutdown, so the process
+    # still did not exit. The value was information only (it never decided), so the read is gone: a NOOP makes no request beyond the
+    # hash, the heartbeat, the binding and the idle reads it shares with a deploy.
+
+    def test_noop_b1_a_noop_restart_reads_no_file_time(self) -> None:
+        self._noop_venue_with_live_agent(agent_first=True)
+        r = self.run_deploy("-RestartMode", "when-idle", "-RestartScript", str(self.restart))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=yes reason=loaded-script-unproven pid=\d+ agentStartUtc=\S+\s*$" % sha(OLD))
+        self.assertNotIn("fileUtc=", r.stdout)
+        self.assertNotIn("agentAfterFile=", r.stdout)
+        self.assertTrue(self.marker.exists(), "the restart ran")
+        self.assertFalse((self.venue / "deploy.lock").exists(), "the run released deploy.lock")
+
+    def test_noop_b1_the_noop_decision_sends_no_metadata_request_for_the_agent_file(self) -> None:
+        # the decision function itself, on an agent path that does not exist: a file-time read would print fileUtc=unreadable(...);
+        # with no read the detail names only the agent process
+        gone = self.venue / "no-such-agent.ps1"
+        body = (
+            "$beat = @{ pid = $PID; osStart = [DateTime]::UtcNow.ToString('o') };"
+            "$d = Get-NoopRestartDecision -AgentScript '%s' -Beat $beat;"
+            "'gone restart=' + $d.restart + ' ' + $d.detail"
+        ) % psq(gone)
+        r = self._dot_source(body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^gone restart=True pid=\d+ agentStartUtc=\S+\s*$", r.stdout + r.stderr)
+        # and no file-time reader is left in the script (the ones bf28f1bd added)
+        src = SCRIPT.read_text(encoding="ascii")
+        for needle in ("GetFileInformationByHandleEx", "File.OpenHandle", "UnixStat", "stat -c", "Get-FileChangeTimeUtc"):
+            with self.subTest(needle=needle):
+                self.assertNotIn(needle, src)
+
     # ---- BACHELOR-DEPLOY-RESTART-WRAPPER-BINDING-1: the venue task runs the agent through C:\mlvtmp\mlv-hidden.exe ----
     # RED on cbedba9269219774bfa14754c10bc5fc13ad6508: the dry run with -RestartMode when-idle on today's task shape refused
     # DEPLOY_REFUSED_RESTART_HOST (exit 16), and the binding could not match the wrapper instance to the heartbeat (its pwsh child).
@@ -1723,10 +1943,16 @@ class DeployBachelorAgent(unittest.TestCase):
         # venue, cmd.exe /c a multi-root host); its one PowerShell child runs the matching agent and writes a valid heartbeat
         wpid, kids = self.wrapped_agent(1, as_wrapper=False)
         self.write_beat(kids[0], self.start_of(kids[0]))
-        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(self._venue_xml_file("notwrapper")),
-                            "-TaskPidsFile", str(self.task_pids(wpid, name="wrap-notwrapper")))
+        # r4 fold: since BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1 a DRY run reports a refused binding (decision=refuse wouldExit=16, exit 0);
+        # the real run is what exits 16, so the refusal is asserted on the real run (it refuses before any write) and the report on the dry run
+        xml, pids = str(self._venue_xml_file("notwrapper")), str(self.task_pids(wpid, name="wrap-notwrapper"))
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", xml, "-TaskPidsFile", pids)
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("DEPLOY_REFUSED_RESTART_HOST INSTANCE_NOT_WRAPPER", r.stdout)
+        self.assert_untouched()
+        d = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", xml, "-TaskPidsFile", pids)
+        self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+        self.assertIn("decision=refuse wouldExit=16 why=INSTANCE_NOT_WRAPPER", d.stdout)
         self.assert_untouched()
         a = psq(VENUE_AGENT)
         body = (
@@ -1837,35 +2063,44 @@ class DeployBachelorAgent(unittest.TestCase):
                          ("True", str(wpid), str(kids[0]), "True"), vals)
 
     def test_wrap_an_instance_with_no_or_two_pwsh_children_or_another_child_refuses(self) -> None:
+        # r4 fold: these refusals are asserted on the REAL run (exit 16 before any write); since BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1 a
+        # dry run reports the same refusal as decision=refuse wouldExit=16 with exit 0 (checked on the last case below)
         xml = self._venue_xml_file("children")
         # zero children: the heartbeat names some other live agent; the wrapper instance has no agent to match
         pid, start = self.live_agent()
         w0, _ = self.wrapped_agent(0)
         self.write_beat(pid, start)
-        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(w0, name="wrap-zero")))
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(w0, name="wrap-zero")))
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("DEPLOY_REFUSED_RESTART_HOST INSTANCE_NO_AGENT_CHILD", r.stdout)
         # two children: which one the stop should end is not decided by guessing
         w2, kids2 = self.wrapped_agent(2)
         self.write_beat(kids2[0], self.start_of(kids2[0]))
-        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(w2, name="wrap-two")))
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(w2, name="wrap-two")))
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("DEPLOY_REFUSED_RESTART_HOST INSTANCE_AGENT_CHILDREN", r.stdout)
         # one child that is NOT the heartbeat pid: the live agent that was checked is not the one the stop would end
         w1, kids1 = self.wrapped_agent(1)
         self.write_beat(pid, start)
-        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(w1, name="wrap-other")))
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(w1, name="wrap-other")))
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("runs agent child pid=%d, not heartbeat pid=%d" % (kids1[0], pid), r.stdout)
         # a wrapped definition whose instance is the agent itself (the child named as the instance) is not the wrapper
-        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(kids1[0], name="wrap-self")))
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(xml), "-TaskPidsFile", str(self.task_pids(kids1[0], name="wrap-self")))
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("INSTANCE_NOT_WRAPPER", r.stdout)
         # an end-to-end wrapper-shape refusal carries its typed reason too
         bad = self._venue_xml_file("bad-path", command="C:\\temp\\mlv-hidden.exe")
-        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(bad), "-TaskPidsFile", str(self.task_pids(w1, name="wrap-badpath")))
+        bad_pids = str(self.task_pids(w1, name="wrap-badpath"))
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", str(bad), "-TaskPidsFile", bad_pids)
         self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
         self.assertIn("TASK_WRAPPER_PATH", r.stdout)
+        self.assert_untouched()
+        # the dry run of the same refusal is a report, not an exit 16
+        d = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(bad), "-TaskPidsFile", bad_pids)
+        self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+        self.assertIn("decision=refuse wouldExit=16 why=", d.stdout)
+        self.assertIn("TASK_WRAPPER_PATH", d.stdout)
         self.assert_untouched()
 
     def _wrapped_stop(self, label: str, child_shift_sec: float = 0, kill_child_first: bool = False) -> tuple[dict, Path, int]:
@@ -2131,6 +2366,53 @@ class DeployBachelorAgent(unittest.TestCase):
         vals, r = self._dot_source_pids(self.task_pids(wpid, name="wrap-osstart"), body, self._venue_xml_file("osstart"))
         self.assertEqual(vals.get("shift0", "").strip(), "True", r.stdout + r.stderr)
         self.assertTrue(vals.get("shift1", "").startswith("False INSTANCE_CHANGED heartbeat pid=%d " % kids[0]), vals)
+
+    # ---- r4 fold of BACHELOR-DEPLOY-RESTART-WRAPPER-BINDING-1 (#864) into BACHELOR-DEPLOY-NOOP-SKIPS-RESTART-1 (#865): the two together ----
+    # A when-idle NOOP restarts through #864's wrapper-aware binding (the same Get-RestartBindingRefusal and Invoke-AgentRestart a deploy
+    # uses), so on today's venue task shape (the task runs the agent through mlv-hidden.exe) it must neither bypass that binding nor be
+    # refused by it when the binding holds, and it must still read no file time.
+
+    def test_fold1_a_noop_on_todays_wrapped_venue_shape_passes_the_binding_and_decides_restart(self) -> None:
+        self.source.write_bytes(OLD)
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        wpid, kids = self.wrapped_agent(1)
+        self.write_beat(kids[0], self.start_of(kids[0]))
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", str(self._venue_xml_file("fold1")),
+                            "-TaskPidsFile", str(self.task_pids(wpid, name="fold1")))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("DEPLOY_REFUSED_RESTART_HOST", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=restart reason=loaded-script-unproven "
+                                   r"wouldExit=0 pid=%d agentStartUtc=\S+\s*$" % (sha(OLD), kids[0]), r.stdout + r.stderr)
+        self.assertEqual((self.venue / AGENT_NAME).read_bytes(), OLD)
+        self.assertFalse(self.marker.exists(), "a dry run never restarts")
+
+    def test_fold2_a_noop_is_held_to_the_wrapper_census_exactly_as_a_deploy_is(self) -> None:
+        # two pwsh children under the wrapper instance: the stop could not tell which to end, for a NOOP restart as for a deploy
+        self.source.write_bytes(OLD)
+        (self.venue / AGENT_NAME).write_bytes(OLD)
+        w2, kids2 = self.wrapped_agent(2)
+        self.write_beat(kids2[0], self.start_of(kids2[0]))
+        xml, pids = str(self._venue_xml_file("fold2")), str(self.task_pids(w2, name="fold2"))
+        r = self.run_deploy("-RestartMode", "when-idle", "-TaskXmlFile", xml, "-TaskPidsFile", pids)
+        self.assertEqual(r.returncode, 16, r.stdout + r.stderr)
+        self.assertIn("DEPLOY_REFUSED_RESTART_HOST INSTANCE_AGENT_CHILDREN", r.stdout)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_NOOP sha=%s restarted=no reason=restart-host-refused\s*$" % sha(OLD), r.stdout)
+        self.assertFalse(self.marker.exists(), "a refused binding never restarts")
+        self.assertEqual(self.rollbacks(), [], "a no-op makes no rollback folder")
+        # the dry run reports the same refusal as a decision instead of exiting 16
+        r = self.run_deploy("-DryRun", "-RestartMode", "when-idle", "-TaskXmlFile", xml, "-TaskPidsFile", pids)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^DEPLOY_DRYRUN action=noop sha=%s restart=when-idle decision=no-restart reason=restart-host-refused "
+                                   r"wouldExit=16 why=INSTANCE_AGENT_CHILDREN" % sha(OLD), r.stdout)
+
+    def test_fold3_the_noop_restart_uses_the_same_wrapper_aware_restart_as_a_deploy(self) -> None:
+        # the NOOP branch calls Invoke-AgentRestart (the function that hands the stop the wrapper instance and its child, and polls for
+        # the replacement through Test-ReplacementIsTaskAgent): one restart path, not a second one that bypasses the binding
+        src = SCRIPT.read_text(encoding="ascii")
+        noop = src[src.index("# 4b. a no-op with -RestartMode when-idle"):src.index("# 5. busy / lease / unreadable")]
+        self.assertIn("Invoke-AgentRestart -AgentScript $dest", noop)
+        self.assertNotIn("schtasks", noop)
+        self.assertNotIn("Stop-Process", noop)
 
     def test_default_source_is_the_tracked_agent(self) -> None:
         # With no -Source the script reads the agent beside itself, so the default is the tracked file.
