@@ -69,6 +69,7 @@ def strip_regions(text: str, *pairs: tuple[str, str]) -> str:
     return out
 
 
+@requires_windows_pwsh
 class ClocksPowerGeneratorTests(unittest.TestCase):
     """Runs the generator for real against a sparse clone with header-only ~30 s fixtures (the device test_dual_venue_evidence uses)."""
 
@@ -181,6 +182,19 @@ class ClocksPowerGeneratorTests(unittest.TestCase):
         self.assertRegex(text, r"(?m)^    clocksPowerStatus = \$clocksPowerBlock\['status'\]$")
         self.assertRegex(text, r"(?m)^    clocksPower = \$clocksPowerBlock$")
 
+    def test_a1_the_job_carries_the_clock_witness_and_hands_it_to_both_summaries(self) -> None:
+        text = lf(self.job("cp-cuda"))
+        for name in ("Get-ClocksPowerClockWhy", "Get-ClocksPowerNetStepMs"):
+            self.assertEqual(len(re.findall(r"(?m)^function " + re.escape(name) + r"\b", text)), 1, f"{name} is spliced into the job once")
+        body = "\n".join(region_re(OPEN, CLOSE).findall(text))
+        # the (UtcNow, monotonic) pair is read at the end of the start region and again at the start of the stop region
+        self.assertGreaterEqual(len(re.findall(r"\[(?:System\.)?Diagnostics\.Stopwatch\]::GetTimestamp\(\)", body)), 2, "two (wall, monotonic) captures bracket the window")
+        self.assertIn("Get-ClocksPowerNetStepMs", body)
+        for summary, parsed in (("Get-ClocksPowerGpuSummary", "$clocksPowerGpuParsed"), ("Get-ClocksPowerCpuSummary", "$clocksPowerCpuParsed")):
+            calls = [ln for ln in body.splitlines() if re.search(r"\b" + summary + r"\b", ln) and parsed in ln]
+            self.assertEqual(len(calls), 1, f"{summary} is called once with the parsed rows")
+            self.assertTrue(calls[0].rstrip().endswith("$clocksPowerClockCheck"), f"{summary} gets the clock check as its 5th argument: {calls[0].strip()}")
+
     def test_c2_a_non_cuda_leg_keeps_the_wake_rule_and_a_cuda_leg_discloses_it(self) -> None:
         text = lf(self.job("cp-cpu"))
         self.assertIn("$clocksPowerBackend = 'cpu'", text)
@@ -226,7 +240,9 @@ $gpuText = "2026/11/01 08:00:00.000, 1500, 1500, 6000, 50.00, 80.00, 60, 0x00000
            "2026/11/01 08:00:01.000, 300, 300, 405, 10.00, 80.00, 50, 0x0000000000000040`n2026/11/01 08:00:01.2"
 $g = ConvertFrom-ClocksPowerGpuCsv $gpuText $cst
 $r['gpuParse'] = @{ rows = $g.rows.Count; torn = $g.tornTail; why = $g.why; firstUtc = $g.rows[0].utc.ToString('o'); naGr = ($null -eq $g.rows[2].grMhz); naPower = ($null -eq $g.rows[2].powerW); mask3 = [int64]$g.rows[3].throttleMask }
-$gs = Get-ClocksPowerGpuSummary $g $running $win
+$ckGpu = [ordered]@{ intervalMs = 250; netStepMs = 0 }
+$ckCpu = [ordered]@{ intervalMs = 1000; netStepMs = 0 }
+$gs = Get-ClocksPowerGpuSummary $g $running $win $null $ckGpu
 $r['gpuWin'] = $gs
 $gn = Get-ClocksPowerGpuSummary $g $running $null
 $r['gpuNoWin'] = @{ status = $gn.status; samples = $gn.samples; total = $gn.samplesTotal; limit = $gn.limitFlagsUnion }
@@ -237,10 +253,10 @@ $r['gpuGarbage'] = (Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv "ga
 $r['gpuSkipped'] = (Get-ClocksPowerGpuSummary $g ([ordered]@{ status = 'skipped_wake_risk'; reason = 'dgpu-D3' }) $win).status
 $r['gpuStartFailed'] = (Get-ClocksPowerGpuSummary $g ([ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing' }) $win).status
 $r['gpuEarlyExit'] = (Get-ClocksPowerGpuSummary $g $running $win ([ordered]@{ stopped = $true; exitedBeforeStop = $true; why = $null })).status
-$allna = Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv "2026/11/01 08:00:00.100, [N/A], [N/A], [N/A], [N/A], [N/A], [N/A], [N/A]`n" $cst) $running $win
+$allna = Get-ClocksPowerGpuSummary (ConvertFrom-ClocksPowerGpuCsv "2026/11/01 08:00:00.100, [N/A], [N/A], [N/A], [N/A], [N/A], [N/A], [N/A]`n" $cst) $running $win $null $ckGpu
 $r['gpuAllNa'] = @{ status = $allna.status; sm = $allna.smClockMhz; power = $allna.powerW; reasons = $allna.throttleReasonsUnion }
 $r['gpuSummerUtc'] = (ConvertFrom-ClocksPowerGpuCsv "2026/07/01 08:00:00.000, 1, 1, 1, 1.0, 1.0, 1, 0x0`n" $cst).rows[0].utc.ToString('o')
-$r['throttleNames'] = @{ zero = @(Get-ClocksPowerThrottleNames 0).Count; idle = (Get-ClocksPowerThrottleNames 1) -join ','; pcap = (Get-ClocksPowerThrottleNames 4) -join ','; all = (Get-ClocksPowerThrottleNames 0x1FF).Count; unknown = (Get-ClocksPowerThrottleNames 0x8000) -join ',' }
+$r['throttleNames'] = @{ zero = @(Get-ClocksPowerThrottleNames 0).Count; idle = (Get-ClocksPowerThrottleNames 1) -join ','; pcap = (Get-ClocksPowerThrottleNames 4) -join ','; all = (Get-ClocksPowerThrottleNames 0x1FF).Count; unknown = (Get-ClocksPowerThrottleNames 0x8000) -join ','; unknown62 = (Get-ClocksPowerThrottleNames 0x4000000000000000) -join ','; unknown63 = (Get-ClocksPowerThrottleNames ([int64]::MinValue)) -join ',' }
 $cpuText = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\BACHELOR\Processor Information(_Total)\% Processor Performance`",`"\\BACHELOR\Processor Information(_Total)\Processor Frequency`",`"\\BACHELOR\Energy Meter(RAPL_Package0_PKG)\Power`"`n" +
            "`"11/01/2026 08:00:00.000`",`"100.000000`",`"2000.000000`",`"15000.000000`"`n`"11/01/2026 08:00:01.000`",`"150.000000`",`"2000.000000`",`"30000.000000`"`n" +
            "`"11/01/2026 08:00:02.000`",`"200.000000`",`"2000.000000`",`"45000.000000`"`n`"11/01/2026 08:00:03.000`",`" `",`"2000.000000`",`"45000.000000`"`n" +
@@ -248,10 +264,10 @@ $cpuText = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\BACHELOR\Processo
 $c = ConvertFrom-ClocksPowerCpuCsv $cpuText $cst
 $r['cpuParse'] = @{ rows = $c.rows.Count; torn = $c.tornTail; why = $c.why; hasPkg = $c.hasPkgPower; firstUtc = $c.rows[0].utc.ToString('o'); blank = ($null -eq $c.rows[3].perfPct); eff1 = $c.rows[1].effectiveMhz; eff3 = $c.rows[3].effectiveMhz; pkg1 = $c.rows[1].pkgPowerW }
 $cw = [ordered]@{ startUtc = $ws.AddMilliseconds(500); endUtc = $ws.AddMilliseconds(3500); clockWhy = $null }
-$cs = Get-ClocksPowerCpuSummary $c $running $cw
+$cs = Get-ClocksPowerCpuSummary $c $running $cw $null $ckCpu
 $r['cpuWin'] = $cs
 $noPkgText = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`"`n`"11/01/2026 08:00:01.000`",`"150.0`",`"2000.0`"`n"
-$np = Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv $noPkgText $cst) $running $cw
+$np = Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv $noPkgText $cst) $running $cw $null $ckCpu
 $r['cpuNoPkg'] = @{ status = $np.status; pkg = $np.pkgPowerW; eff = $np.effectiveMhz }
 $r['cpuEmpty'] = (Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv '' $cst) $running $cw).status
 $r['cpuNoHeader'] = (Get-ClocksPowerCpuSummary (ConvertFrom-ClocksPowerCpuCsv "`"11/01/2026 08:00:01.000`",`"1`"`n" $cst) $running $cw).status
@@ -289,6 +305,7 @@ J $r
 """
 
 
+@requires_windows_pwsh
 class ClocksPowerPureHelperTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -340,6 +357,8 @@ class ClocksPowerPureHelperTests(unittest.TestCase):
         t = self.r["throttleNames"]
         self.assertEqual((t["zero"], t["idle"], t["pcap"], t["all"]), (0, "GpuIdle", "SwPowerCap", 9))
         self.assertEqual(t["unknown"], "Unknown0x8000", "a bit the table does not know is named, never dropped")
+        self.assertEqual(t["unknown62"], "Unknown0x4000000000000000", "adversary A2: bit 62 is named, not dropped by an off-by-two loop bound")
+        self.assertEqual(t["unknown63"], "Unknown0x8000000000000000", "adversary A2: bit 63 (the sign bit) is named too")
 
     def test_c4_cpu_rows_header_mapping_effective_clock_and_package_power(self) -> None:
         p = self.r["cpuParse"]
@@ -403,6 +422,119 @@ class ClocksPowerPureHelperTests(unittest.TestCase):
         self.assertEqual(self.r["startCpuNoCounters"], {"status": "unavailable", "reason": "no-counters", "proc": True})
 
 
+# adversary ebfb3c2b A1 (major, introduced): the clocks summaries used Test-UtilSampleClockSteady alone (stamps rise, no gap over 10 s), but this sampler has
+# no monotonic witness (the util sampler's is its pwsh CPU child; nvidia-smi / typeperf are native). Rows whose stamps a host clock excursion bent
+# (here 1000 ms nominal, stamped 18.100 / 19.100 / 19.600 / 21.100) passed as ok. The settled design: the summaries take a 5th argument $ClockCheck =
+# @{ intervalMs; netStepMs }; a window with no usable check is sample-clock-unwitnessed; a net wall-vs-monotonic step over 250 ms, or any adjacent gap off
+# the nominal interval by more than max(200, 0.4 x nominal) (the CPU nominal is the interval rounded UP to whole seconds: typeperf -si is in seconds),
+# is sample-clock-unverified. Residual, disclosed in the code: an excursion shorter than the tolerance.
+DRIVER_CLOCK = r"""
+$cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
+function T($sb) { try { & $sb } catch { 'ERR: ' + $_.Exception.Message } }
+function St($o) { if ($o -is [string]) { $o } else { [string]$o.status } }
+$r = [ordered]@{}
+$running = [ordered]@{ status = 'running'; reason = $null }
+$ws = [DateTime]::new(2026, 11, 1, 14, 0, 17, 0, [DateTimeKind]::Utc)
+$win = [ordered]@{ startUtc = $ws; endUtc = $ws.AddSeconds(6); clockWhy = $null }
+function Gpu([string[]]$stamps) {
+    $t = ''
+    foreach ($s in $stamps) { $t += "2026/11/01 08:00:$s, 1500, 1500, 6000, 50.00, 80.00, 60, 0x0000000000000000`n" }
+    ConvertFrom-ClocksPowerGpuCsv $t $cst
+}
+function Cpu([string[]]$stamps) {
+    $t = "`"(PDH-CSV 4.0) (Central Standard Time)(360)`",`"\\B\Processor Information(_Total)\% Processor Performance`",`"\\B\Processor Information(_Total)\Processor Frequency`",`"\\B\Energy Meter(RAPL_Package0_PKG)\Power`"`n"
+    foreach ($s in $stamps) { $t += "`"11/01/2026 08:00:$s`",`"150.0`",`"2000.0`",`"30000.0`"`n" }
+    ConvertFrom-ClocksPowerCpuCsv $t $cst
+}
+function Chk($interval, $net) { [ordered]@{ intervalMs = $interval; netStepMs = $net } }
+$adv = @('18.100', '19.100', '19.600', '21.100')
+$steady = @('18.100', '19.110', '20.090', '21.100')
+$r['gpuAdv'] = St (T { Get-ClocksPowerGpuSummary (Gpu $adv) $running $win $null (Chk 1000 0) })
+$r['gpuSteady'] = T { $s = Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 0); @{ status = St $s; samples = $s.samples } }
+$r['gpuNet600'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 600) })
+$r['gpuNetNeg600'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 ([double]-600)) })
+$r['gpuNet250'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 250) })
+$r['gpuNet251'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 251) })
+$r['gpuNullCheck'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null $null })
+$r['gpuNoNetStep'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null ([ordered]@{ intervalMs = 1000 }) })
+$r['gpuNullNetStep'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $win $null (Chk 1000 $null) })
+$r['gpuNoWindowNullCheck'] = St (T { Get-ClocksPowerGpuSummary (Gpu $steady) $running $null $null $null })
+$r['gpuFast250'] = St (T { Get-ClocksPowerGpuSummary (Gpu @('18.000', '18.250', '18.500', '18.750')) $running $win $null (Chk 250 0) })
+$r['gpuFast250Gap600'] = St (T { Get-ClocksPowerGpuSummary (Gpu @('18.000', '18.250', '18.850', '19.100')) $running $win $null (Chk 250 0) })
+$r['cpuAdv'] = St (T { Get-ClocksPowerCpuSummary (Cpu $adv) $running $win $null (Chk 1000 0) })
+$r['cpuSteady'] = T { $s = Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null (Chk 1000 0); @{ status = St $s; samples = $s.samples } }
+$r['cpuNet600'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null (Chk 1000 600) })
+$r['cpuNullCheck'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null $null })
+$r['cpuNoWindowNullCheck'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $null $null $null })
+$r['cpuInterval250OneSecondRows'] = St (T { Get-ClocksPowerCpuSummary (Cpu $steady) $running $win $null (Chk 250 0) })
+$r['cpuInterval500HalfSecondGaps'] = St (T { Get-ClocksPowerCpuSummary (Cpu @('18.000', '18.500', '19.000', '19.500')) $running $win $null (Chk 500 0) })
+$r['whyOk'] = T { Get-ClocksPowerClockWhy (Gpu $steady).rows (Chk 1000 0) }
+$r['whyAdv'] = T { Get-ClocksPowerClockWhy (Gpu $adv).rows (Chk 1000 0) }
+$r['whyNull'] = T { Get-ClocksPowerClockWhy (Gpu $steady).rows $null }
+$r['whyBadInterval'] = T { Get-ClocksPowerClockWhy (Gpu $steady).rows (Chk 0 0) }
+$r['whyOneRow'] = T { Get-ClocksPowerClockWhy (Gpu @('18.100')).rows (Chk 1000 0) }
+$r['whyBackwards'] = T { Get-ClocksPowerClockWhy (Gpu @('19.100', '18.100')).rows (Chk 1000 0) }
+$r['netStep0'] = T { Get-ClocksPowerNetStepMs 0 0 100000000 10000 1000 }
+$r['netStepFwd'] = T { Get-ClocksPowerNetStepMs 0 0 106000000 10000 1000 }
+$r['netStepBack'] = T { Get-ClocksPowerNetStepMs 0 0 97000000 10000 1000 }
+J $r
+"""
+
+
+@requires_windows_pwsh
+class ClocksPowerClockWitnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="clocks-power-clock-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        script = Path(cls._tmp.name) / "driver.ps1"
+        script.write_text(LIFT + DRIVER_CLOCK, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_a1_gpu_rows_a_clock_excursion_bent_are_unverified_not_ok(self) -> None:
+        self.assertEqual(self.r["gpuAdv"], "unavailable(sample-clock-unverified)", "the adversary input: 18.100 / 19.100 / 19.600 / 21.100 against 1000 ms")
+        self.assertEqual(self.r["gpuFast250Gap600"], "unavailable(sample-clock-unverified)", "a 600 ms gap against a 250 ms interval is off by 350 ms (> max(200, 100))")
+
+    def test_a1_cpu_rows_a_clock_excursion_bent_are_unverified_not_ok(self) -> None:
+        self.assertEqual(self.r["cpuAdv"], "unavailable(sample-clock-unverified)", "the CPU analog")
+
+    def test_a1_a_net_wall_vs_monotonic_step_over_250_ms_is_unverified_either_way(self) -> None:
+        for key in ("gpuNet600", "gpuNetNeg600", "gpuNet251", "cpuNet600"):
+            self.assertEqual(self.r[key], "unavailable(sample-clock-unverified)", key)
+        self.assertEqual(self.r["gpuNet250"], "ok", "250 ms is the bound itself: only a step OVER it refuses")
+
+    def test_a1_a_window_with_no_usable_check_is_unwitnessed(self) -> None:
+        for key in ("gpuNullCheck", "gpuNoNetStep", "gpuNullNetStep", "cpuNullCheck"):
+            self.assertEqual(self.r[key], "unavailable(sample-clock-unwitnessed)", key)
+        for key in ("gpuNoWindowNullCheck", "cpuNoWindowNullCheck"):
+            self.assertEqual(self.r[key], "partial(no_window)", f"{key}: with no window nothing is cut by stamp, so no witness is asked for")
+
+    def test_a1_a_steady_stream_with_a_clock_check_stays_ok(self) -> None:
+        self.assertEqual(self.r["gpuSteady"], {"status": "ok", "samples": 4})
+        self.assertEqual(self.r["cpuSteady"], {"status": "ok", "samples": 4})
+        self.assertEqual(self.r["gpuFast250"], "ok")
+        self.assertEqual(self.r["cpuInterval250OneSecondRows"], "ok", "typeperf -si is whole seconds: the CPU nominal is the interval rounded UP, so 250 ms means 1 s")
+        self.assertEqual(self.r["cpuInterval500HalfSecondGaps"], "unavailable(sample-clock-unverified)", "typeperf cannot sample at 500 ms: half-second gaps are not its cadence")
+
+    def test_a1_the_clock_why_helper_and_the_net_step(self) -> None:
+        self.assertIsNone(self.r["whyOk"])
+        self.assertEqual(self.r["whyAdv"], "sample-clock-unverified")
+        self.assertEqual(self.r["whyNull"], "sample-clock-unwitnessed")
+        self.assertEqual(self.r["whyBadInterval"], "sample-clock-unwitnessed", "an interval that is not a positive number is no check")
+        self.assertEqual(self.r["whyBackwards"], "sample-clock-unverified")
+        self.assertIsNone(self.r["whyOneRow"], "one row has no gap to test; the window rule already needs a row inside it")
+        self.assertAlmostEqual(self.r["netStep0"], 0.0)
+        self.assertAlmostEqual(self.r["netStepFwd"], 600.0, msg="wall advanced 10.6 s while the monotonic clock advanced 10.0 s")
+        self.assertAlmostEqual(self.r["netStepBack"], -300.0)
+
+
+@requires_windows_pwsh
 class ClocksPowerRunnerMappingTests(RunnerHarness, unittest.TestCase):
     def setUp(self) -> None:
         from tools.repo_hygiene.test_util_sample_leg import UTIL_STUB_GENERATOR
