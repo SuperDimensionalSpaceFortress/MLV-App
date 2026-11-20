@@ -905,8 +905,12 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIn("INJECTED_QUARANTINE_RENAME_FAILURE", ran.stdout)
         result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
         self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, False))
-        self.assertTrue((pub / "capture" / "reference-frame-candidate.json").is_file(), "the failed move must leave the manifest as the capture wrote it")
-        self.assertEqual(sorted(p.name for p in (pub / "capture").glob("*INVALID*")), [])
+        # r4 (B1): the failed move leaves the manifest as the capture wrote it, so the capture is HELD in staging, never published as a candidate
+        held = next((self.agent / "work").glob("reference-frame-*")) / "capture-staging"
+        self.assertTrue((held / "reference-frame-candidate.json").is_file(), "the failed move must leave the manifest as the capture wrote it")
+        self.assertEqual(sorted(p.name for p in held.glob("*INVALID*")), [])
+        self.assertFalse((pub / "capture").exists())
+        self.assert_no_candidate_anywhere_in_the_outbox()
 
     def test_a_voided_recon_capture_numbers_an_occupied_quarantine_target_the_way_the_225_path_does(self) -> None:
         # the sweep's row 7: the 225 path numbers .INVALID.json, .INVALID.1.json ...; a fixed name makes the move throw and leaves the candidate name in place
@@ -932,6 +936,94 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         marker = json.loads((pub / "capture" / "reference-frame-candidate.invalid").read_text(encoding="utf-8-sig"))
         self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", marker["invalid_reasons"])
         self.assertTrue(any(reason.startswith("GPU_RECON_NOT_PROVEN") for reason in marker["invalid_reasons"]), marker)
+
+    # --- key blocker B1 on 3a28fbf2 (sol, fable key3): an unproven 'on' capture is never indexable, even when every voiding layer AND the result fail --
+    # The voiding layers (marker, stamp, quarantine) and result.json are all best effort, and frame_provenance reads an absent / torn / status-less
+    # parent result as "not failed", so no sequence of best-effort writes can make 'unproven' hold. The 'on' job therefore captures into a staging
+    # directory under its own work tree, outside every outbox, and releases it into <outbox>\<job>.artifacts\capture only when it may be indexed
+    # (proven and intact) or is voided (a layer landed, or no candidate manifest is left). Anything else stays in staging.
+    RESULT_PUBLISH_FAILS = ("try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')",
+                            "try { throw 'INJECTED_RESULT_PUBLISH_FAILURE'; [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')")
+    # Complete-Failed's fallback result.json is skipped too (its guard reads $PubReady): the parent result is then absent
+    FALLBACK_RESULT_NOT_WRITTEN = ("function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {",
+                                   "function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {\r\n    $PubReady = $false")
+    # a torn result.json: the publish wrote half a document and threw
+    RESULT_TORN = ("try { [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')",
+                   "try { [IO.File]::WriteAllText((Join-Path $Pub 'result.json'), '{\"status\": \"capture-fai'); throw 'INJECTED_TORN_RESULT'; [void](Publish-AttrCudaText -Path (Join-Path $Pub 'result.json')")
+
+    def assert_no_candidate_anywhere_in_the_outbox(self) -> None:
+        indexed = self._frame_provenance().index_capture_records(str(self.agent / "outbox"))
+        self.assertEqual(indexed, {}, "frame_provenance indexes a capture whose GPU recon was not proven")
+
+    def run_recon_every_layer_fails(self, name: str, *more: tuple[str, str]) -> tuple[subprocess.CompletedProcess, Path]:
+        """An 'on' capture with CPU frames (unproven) where the marker, the stamp and the quarantine move all fail, plus whatever else `more` breaks."""
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0),
+                                                 edit=self.RECON_STAMP_PUBLISH_FAILS, more_edits=(self.RECON_MARKER_PUBLISH_FAILS, self.RECON_MOVE_FAILS) + more)
+        return ran, pub
+
+    def test_an_unproven_recon_capture_is_not_indexable_when_every_voiding_layer_fails_and_the_parent_result_is_absent(self) -> None:
+        ran, pub = self.run_recon_every_layer_fails("recon-b1-absent", self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertFalse((pub / "result.json").exists(), "fixture is stale: the parent result was meant to be absent")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_an_unproven_recon_capture_is_not_indexable_when_every_voiding_layer_fails_and_the_parent_result_is_torn(self) -> None:
+        ran, pub = self.run_recon_every_layer_fails("recon-b1-torn", self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_TORN)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        with self.assertRaises(ValueError):
+            json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_an_unproven_recon_capture_is_not_indexable_when_every_voiding_layer_fails_and_the_parent_result_is_the_status_less_fallback(self) -> None:
+        ran, pub = self.run_recon_every_layer_fails("recon-b1-fallback", self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        fallback = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((fallback["failedStep"], fallback.get("status")), ("publishResult", None), "fixture is stale: expected the status-less fallback")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_recon_capture_the_job_dies_on_before_it_can_void_it_is_not_indexable(self) -> None:
+        # fable's second input: the capture script wrote the manifest as a candidate, and the job process is gone before the marker is written
+        die = (self.RECON_MANIFEST_ANCHOR, self.RECON_MANIFEST_ANCHOR + "; exit 91")
+        ran, *_ = self.run_stand_in_capture("recon-b1-killed", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0), edit=die)
+        self.assertEqual(ran.returncode, 91, ran.stdout + ran.stderr)
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_recon_capture_with_the_footage_view_changed_and_every_voiding_layer_failing_is_not_indexable_even_with_the_result_gone(self) -> None:
+        # the 225 sibling: counters are fine, so the capture is GPU-proven, but a view changed; the same fail-closed placement applies
+        ran, pub, *_ = self.run_stand_in_capture("recon-b1-225", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(),
+                                                 edit=self.VIEW_CHANGED,
+                                                 more_edits=(self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS,
+                                                             ("Move-Item -LiteralPath $candidatePath -Destination ", "throw 'INJECTED_QUARANTINE_RENAME_FAILURE'; Move-Item -LiteralPath $candidatePath -Destination "),
+                                                             self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS))
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_recon_capture_the_job_could_not_void_stays_in_staging_and_result_json_says_where(self) -> None:
+        ran, pub = self.run_recon_voided("recon-b1-held", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS, self.RECON_MOVE_FAILS)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, False))
+        self.assertIs(result["captureStaging"]["published"], False)
+        self.assertIs(result["captureStaging"]["held"], True)
+        work = next((self.agent / "work").glob("reference-frame-*"))
+        self.assertTrue((work / "capture-staging" / "reference-frame-candidate.json").is_file(), "the held capture is not in staging")
+        self.assertFalse((pub / "capture").exists(), "a capture the job could not void was published")
+        self.assert_no_candidate_anywhere_in_the_outbox()
+
+    def test_a_proven_recon_capture_is_published_out_of_staging_and_is_indexable(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("recon-b1-released", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["captureStaging"]["published"], result["captureStaging"]["held"]), (True, False))
+        self.assertFalse((next((self.agent / "work").glob("reference-frame-*")) / "capture-staging").exists(), "the staging directory outlived its release")
+        self.assertEqual(len(self._frame_provenance().index_capture_records(str(self.agent / "outbox"))), 1)
+
+    def test_a_proven_recon_capture_that_cannot_be_published_out_of_staging_is_a_typed_failure_and_not_indexable(self) -> None:
+        stuck = ("Move-Item -LiteralPath $captureOut -Destination ", "throw 'INJECTED_RELEASE_FAILURE'; Move-Item -LiteralPath $captureOut -Destination ")
+        ran, pub, *_ = self.run_stand_in_capture("recon-b1-release-fails", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=stuck)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=publishResult EXIT=223", ran.stdout)
+        self.assertIn("INJECTED_RELEASE_FAILURE", ran.stdout)
+        self.assert_no_candidate_anywhere_in_the_outbox()
 
     def test_a_recon_on_capture_with_the_real_counters_and_a_trailing_source_location_is_still_a_candidate(self) -> None:
         # the gate must not turn a harmless suffix into a false refusal: the location here carries no counter-shaped token
