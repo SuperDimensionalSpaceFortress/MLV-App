@@ -2068,11 +2068,15 @@ function Get-DvWindowToggleCriteriaGap {
     # r12 (sol r11 B1 on d3b176e3, input: backends ["cpu","cuda"] with complete cpu and cuda arrays in both sets): Get-DvProp hands the backends array over as ONE
     # pipeline object, so piping it straight into a [string] cast joined it into 'cpu cuda' and refused a valid spec. The value is held first and @() enumerates its
     # elements; each is one backend NAME (a JSON string, the schema's enum), and an entry that is not a string is refused by name, never cast
+    # r12 adversary A1 on 3f7bf31b (input: backends [null, "cuda"] with complete cuda arrays): a null or empty entry is REFUSED, never skipped; the leg's default
+    # backend is the FIRST entry (Invoke-VenueLeg.ps1), so a skipped null admitted a spec at preflight that failed late
     $backendsValue = Get-DvProp $Spec 'backends'
+    if ($null -eq $backendsValue) { return 'the spec names no backend, so no criteria array is judged' }
     $backends = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($backendsValue)) {
-        if ($null -eq $entry) { continue }
-        if ($entry -isnot [string]) { return "the spec's backends holds a non-string entry ($(ConvertTo-Json -InputObject $entry -Compress -Depth 3)), so no criteria array is named by it" }
+        if ($entry -isnot [string] -or $entry.Length -eq 0) {
+            return "the spec's backends holds an entry that is not a backend name ($(ConvertTo-Json -InputObject $entry -Compress -Depth 3)), so no criteria array is named by it"
+        }
         $backends.Add($entry)
     }
     if ($backends.Count -lt 1) { return 'the spec names no backend, so no criteria array is judged' }

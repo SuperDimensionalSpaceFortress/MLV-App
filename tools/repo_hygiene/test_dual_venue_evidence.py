@@ -16533,6 +16533,12 @@ class WindowToggleEvidenceTests(unittest.TestCase):
              "criteria.acceptance has no cuda array"),
             ("backends [cpu, cuda] with criteria.acceptance.cpu not binding windowToggleEvidenceReason -> refusal", multi(["cpu", "cuda"], unbind=("acceptance", "cpu")),
              "criteria.acceptance.cpu does not bind windowToggleEvidenceReason eq ok"),
+            # r12 adversary A1 on 3f7bf31b (its input: the committed spec with backends [null, "cuda"], both complete cuda arrays kept): a null entry is refused, never
+            # skipped (the leg's default backend is the FIRST entry, Invoke-VenueLeg.ps1, so a skipped null admitted a leg that fails late)
+            ("r12 adversary A1: backends [null, cuda] -> refusal", dict(full, backends=[None, "cuda"]), "backends holds an entry that is not a backend name (null)"),
+            ("backends [cuda, null] -> refusal", dict(full, backends=["cuda", None]), "backends holds an entry that is not a backend name (null)"),
+            ("backends [\"\", cuda] -> refusal", dict(full, backends=["", "cuda"]), "backends holds an entry that is not a backend name (\"\")"),
+            ("backends [7, cuda] -> refusal", dict(full, backends=[7, "cuda"]), "backends holds an entry that is not a backend name (7)"),
         ]
 
     def test_r12_sol_b1_a_multi_backend_spec_is_judged_per_backend_never_as_one_joined_name(self) -> None:
