@@ -447,9 +447,10 @@ class HelperBehaviourTests(unittest.TestCase):
         return f"[pscustomobject]@{{ id = {pid}; parentId = {parent}; startUtc = [datetime]::Parse('{utc}').ToUniversalTime() }}"
 
     def _stop(self, kill: str, wait: str, before: str = "@()", after: str = "@()", *, root_start: str | None = "2026-11-19T10:00:00Z",
-              prelude: str = "", env: dict | None = None, later: str | None = None, confirm_ms: int = 3000) -> dict:
+              prelude: str = "", env: dict | None = None, later: str | None = None, confirm_ms: int = 3000, baseline: str = "@()") -> dict:
         # The process table is injected (before the kill, then every later listing). The fake root is pid 4242; its handle-read creation
         # time is root_start (None = the handle cannot read it). Fake ids are not multiples of 4, so no real Windows pid can match one.
+        # baseline is the caller's pre-start listing (PR 862 r8, adversary 500e2892-A1); "$null" means none was taken.
         module = str(HELPER_MODULE).replace("'", "''")
         start = "" if root_start is None else f"; StartTime = [datetime]::Parse('{root_start}').ToUniversalTime()"
         script = (
@@ -464,7 +465,8 @@ class HelperBehaviourTests(unittest.TestCase):
             f"$fake = [pscustomobject]@{{ Id = 4242{start} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value {{ {kill} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ {wait} }}\n"
-            f"$r = & $m {{ param($p, $t) Stop-PinnedPayloadChild -Process $p -ProcessTable $t -ConfirmMs {int(confirm_ms)} }} $fake $table\n"
+            f"$baseline = {baseline}\n"
+            f"$r = & $m {{ param($p, $t, $b) Stop-PinnedPayloadChild -Process $p -Baseline $b -ProcessTable $t -ConfirmMs {int(confirm_ms)} }} $fake $table $baseline\n"
             "$r | Add-Member -NotePropertyName listingSec -NotePropertyValue ($global:ffxSec -join ',')\n"
             "$r | ConvertTo-Json -Compress\n"
         )
@@ -540,9 +542,10 @@ class HelperBehaviourTests(unittest.TestCase):
         self.assertFalse(alone["confirmed"], alone)
         self.assertIn("orphan-possible", alone["killError"])
         self.assertNotIn("still running", alone["killError"])
-        # the same replacement whose parent 9000 is a live process older than the root is placed outside: the tree is confirmed.
+        # the same replacement whose parent 9000 is a live process from the pre-start baseline is placed outside: the tree is confirmed.
         old_parent = self._row(9000, 1, "2026-11-19T09:00:00Z")
-        placed = self._stop("$null", "$true", before=f"@({root}, {child}, {old_parent})", after=f"@({old_parent}, {replacement})")
+        placed = self._stop("$null", "$true", before=f"@({root}, {child}, {old_parent})", after=f"@({old_parent}, {replacement})",
+                            baseline=f"@({old_parent})")
         self.assertTrue(placed["confirmed"], placed)
         # adversary 0f5308ad-A3 (r6): a row on 5151's parent id whose creation time reads after the replacement's is placed outside the tree
         # only by the wall clock (a step back makes the original 5151's late child read that way), so it is counted, never killed.
@@ -574,31 +577,73 @@ class HelperBehaviourTests(unittest.TestCase):
         tie = self._stop("$null", "$true", before=f"@({root}, {same})", after=f"@({same})")
         self.assertFalse(tie["confirmed"], tie)
         self.assertIn("orphan-possible", tie["killError"])
-        # control: the after listing holds only a pre-existing unrelated process (created before the root, its parent long gone).
+        # control: the after listing holds only a pre-existing unrelated process (in the pre-start baseline, its parent long gone).
         unrelated = self._row(7001, 1, "2026-11-19T09:00:00Z")
-        control = self._stop("$null", "$true", before=f"@({root}, {unrelated})", after=f"@({unrelated})")
+        control = self._stop("$null", "$true", before=f"@({root}, {unrelated})", after=f"@({unrelated})", baseline=f"@({unrelated})")
         self.assertTrue(control["confirmed"], control)
         self.assertEqual(control["killError"], "", control)
-        # a row whose creation time cannot be read is never placed outside the tree.
+        # the same process with NO baseline taken: nothing places it outside, so nothing is confirmed.
+        blind = self._stop("$null", "$true", before=f"@({root}, {unrelated})", after=f"@({unrelated})", baseline="$null")
+        self.assertFalse(blind["confirmed"], blind)
+        self.assertIn("none was taken", blind["killError"])
+        # a row whose creation time cannot be read is never placed outside the tree, baseline or not.
         unread = "[pscustomobject]@{ id = 7003; parentId = 1; startUtc = $null }"
-        unknown = self._stop("$null", "$true", before=f"@({root}, {unread})", after=f"@({unread})")
+        unknown = self._stop("$null", "$true", before=f"@({root}, {unread})", after=f"@({unread})", baseline=f"@({unread})")
         self.assertFalse(unknown["confirmed"], unknown)
         self.assertIn("orphan-possible", unknown["killError"])
-        # a new process whose live parent is older than the root is placed outside; one whose live parent is itself only a possible
-        # orphan, or whose parent reads newer than it (an earlier holder of that pid may have started it), is not.
+        # a new process whose live parent is from the baseline is placed outside, and so is its child first listed AFTER it; a child
+        # first listed in the SAME listing as its new parent (an earlier holder of that pid may have started it) is not, nor is one under
+        # a possible orphan.
         anchor = self._row(8000, 1, "2026-11-19T09:00:00Z")
         newer_child = self._row(8008, 8000, "2026-11-19T10:00:05Z")
         grandchild = self._row(8016, 8008, "2026-11-19T10:00:06Z")
-        chain = self._stop("$null", "$true", before=f"@({root}, {anchor})", after=f"@({anchor}, {newer_child}, {grandchild})")
+        chain = self._stop("$null", "$true", before=f"@({root}, {anchor}, {newer_child})", after=f"@({anchor}, {newer_child}, {grandchild})",
+                           baseline=f"@({anchor})")
         self.assertTrue(chain["confirmed"], chain)
+        same_listing = self._stop("$null", "$true", before=f"@({root}, {anchor})", after=f"@({anchor}, {newer_child}, {grandchild})",
+                                  baseline=f"@({anchor})")
+        self.assertFalse(same_listing["confirmed"], same_listing)
+        self.assertIn("8016", same_listing["killError"])
+        self.assertNotIn("8008", same_listing["killError"])
         under_orphan = self._row(8024, 6262, "2026-11-19T10:00:06Z")
-        tainted = self._stop("$null", "$true", before=f"@({root}, {leaf})", after=f"@({leaf}, {under_orphan})")
+        tainted = self._stop("$null", "$true", before=f"@({root}, {leaf})", after=f"@({leaf}, {under_orphan})", baseline=f"@({anchor})")
         self.assertFalse(tainted["confirmed"], tainted)
         self.assertIn("8024", tainted["killError"])
-        older_than_parent = self._row(8032, 8008, "2026-11-19T10:00:04Z")
-        reused_parent = self._stop("$null", "$true", before=f"@({root}, {anchor})", after=f"@({anchor}, {newer_child}, {older_than_parent})")
-        self.assertFalse(reused_parent["confirmed"], reused_parent)
-        self.assertIn("8032", reused_parent["killError"])
+
+    def test_an_orphan_that_reads_older_than_its_root_after_a_clock_step_never_confirms_the_tree(self) -> None:
+        # adversary 500e2892-A1: the root started 10:00:05Z, the clock was stepped back, and its intermediate 5151 started leaf 6262 at
+        # 09:59:56Z and exited before the first listing. Ordering by creation time placed the leaf outside and confirmed the tree. Only
+        # the pre-start baseline (identity equality, no clock) places a row outside, and the leaf is not in it.
+        root = self._row(4242, 1, "2026-11-19T10:00:05Z")
+        leaf = self._row(6262, 5151, "2026-11-19T09:59:56Z")
+        bystander = self._row(7001, 1, "2026-11-19T09:00:00Z")
+        stop = self._stop("$null", "$true", before=f"@({root}, {leaf}, {bystander})", after=f"@({leaf}, {bystander})",
+                          root_start="2026-11-19T10:00:05Z", baseline=f"@({bystander})")
+        self.assertTrue(stop["exited"], stop)
+        self.assertFalse(stop["confirmed"], stop)
+        self.assertIn("orphan-possible", stop["killError"])
+        self.assertIn("6262", stop["killError"])
+        self.assertNotIn("7001", stop["killError"])
+        # its parent id held by a baseline process that is still alive: the leaf (first listed after the baseline) is that process's.
+        holder = self._row(5151, 1, "2026-11-19T08:00:00Z")
+        held = self._stop("$null", "$true", before=f"@({root}, {holder}, {leaf})", after=f"@({holder}, {leaf})",
+                          root_start="2026-11-19T10:00:05Z", baseline=f"@({holder})")
+        self.assertTrue(held["confirmed"], held)
+
+    def test_every_caller_lists_a_baseline_before_it_starts_the_child_it_may_stop(self) -> None:
+        # adversary 500e2892-A1 siblings (psm1 install, build-release.ps1:245, assemble.ps1:385): each stop gets the listing its caller
+        # took BEFORE starting the child; a stop without one confirms nothing.
+        text = _normalised(HELPER_MODULE)
+        body = text[text.index(f"function Invoke-PinnedPayloadInstall {{"):]
+        self.assertLess(body.index("$baseline = Get-PinnedPayloadBaseline"), body.index("[System.Diagnostics.Process]::Start($psi)"))
+        self.assertIn("$stop = Stop-PinnedPayloadChild -Process $process -Baseline $baseline", body)
+        for path, start, stop in ((BUILD_RELEASE, "$p = Start-Process -FilePath $destExe", "Stop-PinnedPayloadChild -Process $p -Baseline $probeBaseline"),
+                                  (ASSEMBLER, "$probe = Start-Process -FilePath $releaseExe", "Stop-PinnedPayloadChild -Process $probe -Baseline $probeBaseline")):
+            with self.subTest(path=path.name):
+                caller = _normalised(path)
+                self.assertLess(caller.index("$probeBaseline = Get-PinnedPayloadBaseline"), caller.index(start))
+                self.assertIn(stop, caller)
+        self.assertIn("Get-PinnedPayloadBaseline", text[text.index("Export-ModuleMember -Function"):])
 
     def test_the_timeout_recovery_is_refused_for_an_orphan_possible_tree(self) -> None:
         # sol r7 B1 (psm1:410): recovery runs only on killConfirmed, which is the stop's confirmed; an orphan-possible stop says false.
@@ -707,11 +752,12 @@ class HelperBehaviourTests(unittest.TestCase):
             "$psi = [System.Diagnostics.ProcessStartInfo]::new($env:FFX_PY)\n"
             "[void]$psi.ArgumentList.Add('-c'); [void]$psi.ArgumentList.Add($env:FFX_SPAWNER)\n"
             "$psi.UseShellExecute = $false\n"
+            "$b = Get-PinnedPayloadBaseline\n"
             "$p = [System.Diagnostics.Process]::Start($psi)\n"
             "$deadline = [System.Diagnostics.Stopwatch]::StartNew()\n"
             "do { [System.Threading.Thread]::Sleep(100); $kids = @(Get-CimInstance -ClassName Win32_Process -Filter \"ParentProcessId = $($p.Id)\") } "
             "while (-not $kids.Count -and $deadline.ElapsedMilliseconds -lt 20000)\n"
-            "$r = & $m { param($q) Stop-PinnedPayloadChild -Process $q } $p\n"
+            "$r = & $m { param($q, $s) Stop-PinnedPayloadChild -Process $q -Baseline $s } $p $b\n"
             "$alive = @($kids | Where-Object { $k = $_; try { $h = [System.Diagnostics.Process]::GetProcessById([int]$k.ProcessId); $h.Dispose(); $true } catch { $false } })\n"
             "[ordered]@{ kids = $kids.Count; confirmed = $r.confirmed; killError = $r.killError; alive = $alive.Count } | ConvertTo-Json -Compress\n"
         )

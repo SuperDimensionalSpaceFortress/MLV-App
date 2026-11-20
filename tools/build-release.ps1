@@ -235,6 +235,8 @@ $probeExit = $null; $probeTimedOut = $false; $probeKillConfirmed = $null; $probe
 $savedPath = $env:Path
 try {
     $env:Path = $cleanPath
+    # PR 862 r8 (adversary 500e2892-A1): listed before the probe exists, so a timeout's kill can place other processes outside its tree.
+    $probeBaseline = Get-PinnedPayloadBaseline
     $p = Start-Process -FilePath $destExe -ArgumentList '--batch','--help' `
         -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $probeDir 'out.txt') `
@@ -242,7 +244,7 @@ try {
     if ($p.WaitForExit(30000)) { $probeExit = $p.ExitCode }
     else {
         # Confirmed or said to be unconfirmed (adversary 32bf39a9-A3): a Kill that threw is never reported as killed.
-        $probeStop = Stop-PinnedPayloadChild -Process $p
+        $probeStop = Stop-PinnedPayloadChild -Process $p -Baseline $probeBaseline
         $probeKillConfirmed = [bool]$probeStop.confirmed; $probeKillError = [string]$probeStop.killError
         $probeTimedOut = $true
     }

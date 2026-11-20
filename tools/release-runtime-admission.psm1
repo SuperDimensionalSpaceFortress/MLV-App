@@ -123,34 +123,47 @@ function Get-PinnedPayloadSurvivors {
 
 # PR 862 r8 (sol r7 B1 / b4826b52-A1; hub ruling 20261120T1007Z: fail closed, no new attribution of descendants). A descendant whose
 # intermediate parent exited BEFORE the first listing is in no tree a listing can build, so an empty survivor set never proves the tree
-# gone on its own. Every other row of the SAME later listing must be shown NOT to be a descendant, and only two facts show it:
-#  (a) its UTC creation time is strictly earlier than the root's (read through the root's handle): a descendant is created after its root;
-#  (b) its parent id is held, in this same snapshot, by exactly one row that is itself shown by (a) or (b), whose creation time is
-#      strictly earlier than this row's: that process has held the pid from before this row was created until now, so it is the creator.
-# Any other row (creation time unreadable, at or after the root's with no such parent: its parent exited, is newer than it, or is itself
-# only possibly a descendant) is a POSSIBLE orphan descendant and leaves the tree unconfirmed. No dead parent is ever reconstructed.
+# gone on its own. Every other row of the SAME later listing must be shown NOT to be a descendant. No creation time is ever ORDERED here
+# (adversary 500e2892-A1: after a backward clock step an orphan reads older than its root); identities (pid + creation time) are only
+# compared for EQUALITY, against the ordered listings of this stop: listing 0 is the BASELINE taken before the root was started
+# (Get-PinnedPayloadBaseline), listing 1 the one before the kill, then every poll. FirstSeen maps an identity to the first listing that
+# held it; a live process is in every listing taken while it lives, so first seen at k means created after listing k-1. Two facts show a
+# row outside the tree:
+#  (a) its identity is in the baseline: it existed before the root was started;
+#  (b) its parent id is held, in this same snapshot, by exactly one row that is itself shown by (a) or (b) and was first seen in an
+#      EARLIER listing than this row: that process has held the pid from before this row was created until now, so it is the creator.
+# Any other row (no readable creation time, parent gone, parent first seen in the same listing, parent only possibly a descendant, or
+# no baseline at all) is a POSSIBLE orphan descendant and leaves the tree unconfirmed. No dead parent is ever reconstructed.
 # Rows on the ids in Counted (already counted as survivors) are not reported again. Returns the possible orphans' rows.
+function Get-PinnedPayloadIdentityKey {
+    param($Row)
+    $ticks = ConvertTo-PinnedPayloadCreationTicks $Row.startUtc
+    if ($null -eq $ticks) { return $null }
+    return "$([int]$Row.id)/$ticks"
+}
+
 function Get-PinnedPayloadPossibleOrphans {
-    param([object[]]$Table, [long]$RootTicks, [System.Collections.Generic.HashSet[int]]$Counted)
+    param([object[]]$Table, [hashtable]$FirstSeen, [System.Collections.Generic.HashSet[int]]$Counted)
     $rows = @($Table)
-    $ticks = [object[]]::new($rows.Count)
+    $first = [object[]]::new($rows.Count)
     $indexById = @{}
     for ($i = 0; $i -lt $rows.Count; $i++) {
-        $ticks[$i] = ConvertTo-PinnedPayloadCreationTicks $rows[$i].startUtc
+        $key = Get-PinnedPayloadIdentityKey $rows[$i]
+        $first[$i] = if ($null -ne $key -and $FirstSeen.ContainsKey($key)) { [int]$FirstSeen[$key] } else { $null }
         $id = [int]$rows[$i].id
         # A pid listed twice in one snapshot names no single process: it places nothing as a parent.
         $indexById[$id] = if ($indexById.ContainsKey($id)) { -1 } else { $i }
     }
     $placed = [bool[]]::new($rows.Count)
-    for ($i = 0; $i -lt $rows.Count; $i++) { if ($null -ne $ticks[$i] -and [long]$ticks[$i] -lt $RootTicks) { $placed[$i] = $true } }
+    for ($i = 0; $i -lt $rows.Count; $i++) { if ($null -ne $first[$i] -and [int]$first[$i] -eq 0) { $placed[$i] = $true } }
     do {
         $grew = $false
         for ($i = 0; $i -lt $rows.Count; $i++) {
-            if ($placed[$i] -or $null -eq $ticks[$i]) { continue }
+            if ($placed[$i] -or $null -eq $first[$i]) { continue }
             $parentId = [int]$rows[$i].parentId
             if ($parentId -eq [int]$rows[$i].id -or $Counted.Contains($parentId) -or -not $indexById.ContainsKey($parentId)) { continue }
             $p = [int]$indexById[$parentId]
-            if ($p -lt 0 -or -not $placed[$p] -or $null -eq $ticks[$p] -or [long]$ticks[$p] -ge [long]$ticks[$i]) { continue }
+            if ($p -lt 0 -or -not $placed[$p] -or $null -eq $first[$p] -or [int]$first[$p] -ge [int]$first[$i]) { continue }
             $placed[$i] = $true
             $grew = $true
         }
@@ -160,6 +173,16 @@ function Get-PinnedPayloadPossibleOrphans {
     return $orphans.ToArray()
 }
 
+# PR 862 r8 (adversary 500e2892-A1): the listing a caller takes immediately BEFORE it starts a child it may later stop, passed to
+# Stop-PinnedPayloadChild -Baseline. Every process in it existed before the child, so none can be the child's descendant; that is the
+# only clock-free way to place a process outside the tree. Never throws: a listing that fails returns $null, and a stop without a
+# baseline confirms only an after listing with no row at all.
+function Get-PinnedPayloadBaseline {
+    [CmdletBinding()]
+    param([ValidateRange(1, 30)][int]$TimeoutSec = 30)
+    try { return , @(Get-PinnedPayloadProcessTable -TimeoutSec $TimeoutSec) } catch { return $null }
+}
+
 # Kills a timed-out child's whole tree and reports whether its exit was SEEN; a Kill that throws (access
 # denied) or a wait that times out is never reported as killed (adversary 32bf39a9-A3).
 function Stop-PinnedPayloadChild {
@@ -167,6 +190,9 @@ function Stop-PinnedPayloadChild {
     param(
         [Parameter(Mandatory)]
         $Process,
+
+        # The Get-PinnedPayloadBaseline listing taken before the child was started; $null (none) places no process outside the tree.
+        [object[]]$Baseline = $null,
 
         [ValidateRange(0, 600000)]
         [int]$ConfirmMs = 10000,
@@ -184,6 +210,12 @@ function Stop-PinnedPayloadChild {
     $rootTicks = $null
     try { $rootTicks = ConvertTo-PinnedPayloadCreationTicks $Process.StartTime } catch { $rootTicks = $null }
     $members = @{}
+    # PR 862 r8 (adversary 500e2892-A1): identity -> the first listing that held it (0 = the caller's pre-start baseline, 1 = before the
+    # kill, then each poll); Get-PinnedPayloadPossibleOrphans places a row outside the tree from these EQUALITY facts alone.
+    $firstSeen = @{}
+    $listingIndex = 0
+    $noteListing = { param([object[]]$Rows, [int]$Index) foreach ($row in @($Rows)) { $key = Get-PinnedPayloadIdentityKey $row; if ($null -ne $key -and -not $firstSeen.ContainsKey($key)) { $firstSeen[$key] = $Index } } }
+    if ($null -ne $Baseline) { . $noteListing $Baseline 0 }
     if ($null -eq $rootTicks) {
         $treeError = "the root's creation time could not be read through its handle, so no listing can prove its tree"
     } else {
@@ -194,7 +226,10 @@ function Stop-PinnedPayloadChild {
             $treeError = "no whole second of the $ConfirmMs ms confirmation budget is left to list the tree before the kill"
         } else {
             try {
-                $tree = Get-PinnedPayloadTree -Table @(& $ProcessTable $bound) -RootId ([int]$Process.Id) -RootTicks $rootTicks
+                $beforeTable = @(& $ProcessTable $bound)
+                $listingIndex = 1
+                . $noteListing $beforeTable $listingIndex
+                $tree = Get-PinnedPayloadTree -Table $beforeTable -RootId ([int]$Process.Id) -RootTicks $rootTicks
                 $members = $tree.members
                 if (-not $tree.rootListed) { $treeError = "pid $($Process.Id) with its own creation time is not in the listing taken before the kill, so its tree is unproven" }
             } catch { $treeError = "the process tree could not be listed before the kill: $($_.Exception.Message)" }
@@ -222,18 +257,20 @@ function Stop-PinnedPayloadChild {
                 $bound = & $listingSec
                 if ($bound -lt 1) { break }
                 $table = @(& $ProcessTable $bound)
+                $listingIndex++
+                . $noteListing $table $listingIndex
                 $left = @(Get-PinnedPayloadSurvivors -Table $table -Members $members)
                 $listed = $true
                 foreach ($row in $left) { if (-not $members.ContainsKey([int]$row.id)) { $members[[int]$row.id] = ConvertTo-PinnedPayloadCreationTicks $row.startUtc } }
                 $counted = [System.Collections.Generic.HashSet[int]]::new()
                 foreach ($row in $left) { [void]$counted.Add([int]$row.id) }
-                $orphans = @(Get-PinnedPayloadPossibleOrphans -Table $table -RootTicks ([long]$rootTicks) -Counted $counted)
+                $orphans = @(Get-PinnedPayloadPossibleOrphans -Table $table -FirstSeen $firstSeen -Counted $counted)
                 if (-not $left.Count -and -not $orphans.Count) { break }
                 [System.Threading.Thread]::Sleep([int][math]::Max(0, [math]::Min(100, $ConfirmMs - $clock.ElapsedMilliseconds)))
             }
             if (-not $listed) { $treeError = "no whole second of the $ConfirmMs ms confirmation budget was left to list the tree after the kill" }
             elseif ($left.Count) { $treeError = "pid(s) $(@($left | ForEach-Object { $_.id }) -join ', ') still running after the tree kill (a member, or a row on a member's parent id that no clock-free fact places outside the tree)" }
-            elseif ($orphans.Count) { $treeError = "orphan-possible: pid(s) $(@($orphans | ForEach-Object { $_.id }) -join ', ') created at or after the root (or at an unreadable time) with no live parent shown outside the tree, so each may be a descendant whose parent exited; the tree is not confirmed" }
+            elseif ($orphans.Count) { $treeError = "orphan-possible: pid(s) $(@($orphans | ForEach-Object { $_.id }) -join ', ') not in the pre-start baseline$(if ($null -eq $Baseline) { ' (none was taken)' }) and with no live parent shown outside the tree that was listed before them, so each may be a descendant whose parent exited; the tree is not confirmed" }
             elseif ($clock.ElapsedMilliseconds -gt $ConfirmMs) { $treeError = "the tree was seen gone only after the $ConfirmMs ms confirmation budget was spent ($($clock.ElapsedMilliseconds) ms)" }
         } catch { $treeError = "the process tree could not be listed after the kill: $($_.Exception.Message)" }
     }
@@ -421,6 +458,8 @@ function Invoke-PinnedPayloadInstall {
         if ([string]$name -like 'GIT_*') { [void]$psi.Environment.Remove([string]$name) }
     }
 
+    # Adversary 500e2892-A1: the listing taken before the child exists is what places a process outside its tree on a timeout.
+    $baseline = Get-PinnedPayloadBaseline
     try {
         $process = [System.Diagnostics.Process]::Start($psi)
     } catch {
@@ -432,7 +471,7 @@ function Invoke-PinnedPayloadInstall {
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSec * 1000)) {
             $result.timedOut = $true
-            $stop = Stop-PinnedPayloadChild -Process $process
+            $stop = Stop-PinnedPayloadChild -Process $process -Baseline $baseline
             $result.killConfirmed = [bool]$stop.confirmed
             $childPid = $process.Id
             $killError = [string]$stop.killError
@@ -645,4 +684,4 @@ function Test-PinnedZipMember {
     return [pscustomobject]$check
 }
 
-Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, Install-PinnedVendoredPayload, Stop-PinnedPayloadChild, Open-PinnedFileHold, Test-PinnedZipMember
+Export-ModuleMember -Function Test-ReviewedReleaseRuntimeExtraName, Install-PinnedVendoredPayload, Stop-PinnedPayloadChild, Open-PinnedFileHold, Test-PinnedZipMember, Get-PinnedPayloadBaseline

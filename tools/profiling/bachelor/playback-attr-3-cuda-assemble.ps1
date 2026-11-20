@@ -378,11 +378,13 @@ if (-not $SkipLaunchProbe) {
             $env:SystemRoot,
             (Join-Path $env:SystemRoot 'System32\Wbem')
         ) -join ';'
+        # PR 862 r8 (adversary 500e2892-A1): listed before the probe exists, so a timeout's kill can place other processes outside its tree.
+        $probeBaseline = Get-PinnedPayloadBaseline
         $probe = Start-Process -FilePath $releaseExe -ArgumentList '--batch', '--help' `
             -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden
         if (-not $probe.WaitForExit(120000)) {
             # The kill is confirmed or the failure says it is not (adversary 32bf39a9-A3, sibling of the ffmpeg install's).
-            $probeStop = Stop-PinnedPayloadChild -Process $probe
+            $probeStop = Stop-PinnedPayloadChild -Process $probe -Baseline $probeBaseline
             $probeKillNote = if ($probeStop.confirmed) { 'killed, exit seen' } else { "kill NOT confirmed, pid $($probe.Id) may still run$(if ($probeStop.killError) { ": $($probeStop.killError)" })" }
             $launchProbe.timedOut = $true
         } else {
