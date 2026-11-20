@@ -38,10 +38,11 @@ $script:FpsArmKnownBenignEnv = [System.Collections.Generic.HashSet[string]]::new
     # The per-present trace (generatorArgs.presentTrace) is NOT an observer here: it keeps its rows in memory and writes them after the Play stops, "so the trace never writes inside the timed window"
     # (platform/qt/PlaybackPresentTrace.h:9-12), and the shipped LIGHT headroom legs are built on it. The spec classifier agrees (presentTrace is not on the observer list).
     'MLVAPP_PLAYBACK_PRESENT_TRACE',
-    # The standing environment of every venue job, in BOTH arms (playback-attr-3-cuda-job.ps1 $envs, :3049-3066, and the leg switches the generator adds): it is the baseline of a LIGHT leg, not a
-    # discriminator of one, so the env classifier must not call the generator's own LIGHT environment unknown (adversary pass 5 A2). MLVAPP_VIEWPORT_PRESENT_DIAG is in this group: the job sets it
-    # to 1 in both arms (:3061, :5982), and a LIGHT/LIGHT pair shares it. test_every_variable_the_job_generator_emits_is_classified fails when the generator emits a name that is on neither list.
-    'MLVAPP_VIEWPORT_PRESENT_DIAG', 'MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW', 'MLVAPP_PLAYBACK_PREVIEW_MODE', 'MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D', 'MLVAPP_EXPERIMENTAL_GPU_PROCESSING',
+    # The standing environment of a venue job (playback-attr-3-cuda-job.ps1 $envs, and the leg switches the generator adds): the baseline of a LIGHT leg, not a discriminator of one, so the env
+    # classifier must not call the generator's own LIGHT environment unknown (adversary pass 5 A2). MLVAPP_VIEWPORT_PRESENT_DIAG is NOT in this group any more (r4, luna r3 B2): the app logs from
+    # its per-present paths when it is on, so it is an observer (see the observer list), and the job no longer sets it on a LIGHT leg.
+    # test_every_variable_the_job_generator_emits_is_classified fails when the generator emits a name that is on neither list.
+    'MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW', 'MLVAPP_PLAYBACK_PREVIEW_MODE', 'MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D', 'MLVAPP_EXPERIMENTAL_GPU_PROCESSING',
     'MLVAPP_EXPERIMENTAL_GPU_AMAZE_DEBAYER', 'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT', 'MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT', 'MLVAPP_SWAP_INTERVAL', 'MLVAPP_PLAYBACK_CONFORM',
     'MLVAPP_PLAYBACK_UNPACED', 'MLVAPP_PLAYBACK_RECON_OMP_THREADS', 'MLVAPP_PLAYBACK_PREP_OMP_THREADS', 'MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE', 'MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY',
     'MLVAPP_DISABLE_PREP_POINTWISE_FAST', 'MLVAPP_GPU_RECON_RELEASE_DEFERRED', 'MLVAPP_GPU_SAFE_START', 'MLVAPP_GPU_FAULT_INJECT', 'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK',
@@ -57,7 +58,9 @@ $script:FpsArmKnownBenignEnv = [System.Collections.Generic.HashSet[string]]::new
 #   envVar    the environment variable the job / app reads ('' = none: the control is a helper process the environment cannot show)
 #   kind      how the CONSUMER reads the variable, read from its source: 'flag' = on unless exactly "0" (StageTiming.h:74, MainWindow.cpp:185-186; "" reads toward on, as for every flag),
 #             'value' = DATA, on whenever it is non-empty, "0" included (a file name: RenderFrameThread.cpp:60-62 opens MLVAPP_PHASE3_TEL_PATH, StageTiming.h:87-90 opens
-#             MLVAPP_STAGE_TIMING_FILE, GpuDisplayWindow.cpp:146 dumps into MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR; a threshold: MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=0 is zero ms).
+#             MLVAPP_STAGE_TIMING_FILE, GpuDisplayWindow.cpp:146 dumps into MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR; a threshold: MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=0 is zero ms),
+#             'truthy' = a flag whose consumer reads ONLY 1 / true / yes / on (ASCII-trimmed, any case) as on and everything else (0, false, off, no, empty) as off
+#             (GpuDisplayViewport.cpp:51-60 envFlagEnabled, read once by :66-71 for MLVAPP_VIEWPORT_PRESENT_DIAG); a value this module cannot read that way (non-ASCII text) is read toward ON.
 #   severity  what the env classifier answers when it is on: HEAVY (a per-frame stage / timeline logger) or UNKNOWN (an observer the arm word does not describe)
 # The generator forwards more generatorArgs keys than these; test_every_generator_arg_the_venue_leg_forwards_is_classified makes each new one name itself observer or not.
 function New-FpsObserver {
@@ -72,6 +75,8 @@ $script:FpsObserverControls = @(
     New-FpsObserver 'rbf-detail-timing' -EnvVar 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING' -Severity 'HEAVY'
     New-FpsObserver 'interactive-trace' -EnvVar 'MLVAPP_INTERACTIVE_TRACE' -Severity 'HEAVY'
     New-FpsObserver 'overlap-trace' -EnvVar 'MLVAPP_GPU_TEX_NR_OVERLAP_TRACE' -Severity 'HEAVY'
+    # the viewport's per-present trace (GpuDisplayViewport.cpp:1226-1231 setPresentedImage, :2014-2019 updateTextureIfNeeded and the paintGL paths log on every present when it is on); luna r3 B2
+    New-FpsObserver 'viewport-present-diag' -EnvVar 'MLVAPP_VIEWPORT_PRESENT_DIAG' -Kind 'truthy' -Severity 'HEAVY'
     # the GL-vs-CPU-oracle parity check: a GL texture readback, SHA256 hashing and a full CPU recon replay per presented frame (MainWindow.cpp:404-409 and :421-428 name it "very heavy ...
     # collapses an AMaZE playback run to a few fps"; RenderFrameThread.cpp:696-702 reads it the same way: set and not "0"), so it is a flag
     New-FpsObserver 'recon-output-validation' -EnvVar 'MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT' -Severity 'HEAVY'
@@ -121,6 +126,45 @@ function Get-FpsSpecObserverOn {
     $null
 }
 
+function Read-FpsRecordedObserverControls {
+    # The `observerControls` entry of a RECORD (a leg record, a job result, or its generatorArgs), judged by one rule for every reader (luna r3 B1: Get-FpsArmFromLegRecord ignored it). Returns
+    # @{ present; entries; problem } where problem is $null when nothing is enabled and nothing is unreadable, else @{ kind = 'enabled' | 'unreadable'; text }.
+    #   absent                       -> nothing recorded (no problem)
+    #   present but not an object    -> unreadable (fail closed): $null, a string, a number, a boolean, an array
+    #   a LISTED control's entry     -> by that control's own rule (Test-FpsSpecObserverOn: a bool key is on unless exactly $false / null, the threshold is on unless a negative number)
+    #   an UNLISTED entry            -> $true, a non-zero number or a non-empty string is ENABLED; $false and 0 are off; null, an empty string, an array or an object cannot be read as a boolean (unreadable)
+    param([AllowNull()]$Container)
+    $none = [pscustomobject]@{ present = $false; entries = 0; problem = $null }
+    if ($null -eq $Container -or $Container -is [string] -or $Container -is [System.ValueType]) { return $none }
+    if (-not (Test-FaHasProp $Container 'observerControls')) { return $none }
+    $controls = Get-FaProp $Container 'observerControls'
+    $fail = { param($kind, $text, $n) [pscustomobject]@{ present = $true; entries = $n; problem = [pscustomobject]@{ kind = $kind; text = $text } } }
+    $pairs = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $controls -or $controls -is [string] -or $controls -is [System.ValueType] -or $controls -is [System.Array]) {
+        return (& $fail 'unreadable' 'observerControls is present but is not an object' 0)
+    }
+    if ($controls -is [System.Collections.IDictionary]) {
+        foreach ($k in $controls.Keys) { $pairs.Add(@([string]$k, $controls[$k])) }
+    } elseif ($controls -is [System.Management.Automation.PSCustomObject]) {
+        foreach ($p in $controls.PSObject.Properties) { $pairs.Add(@([string]$p.Name, $p.Value)) }
+    } else {
+        return (& $fail 'unreadable' 'observerControls is present but is not an object' 0)
+    }
+    foreach ($pair in $pairs) {
+        $name = [string]$pair[0]; $v = $pair[1]
+        $listed = @($script:FpsObserverControls | Where-Object { $_.specKey -and ($_.specKey -ieq $name) } | Select-Object -First 1)
+        if ($listed.Count -gt 0) {
+            if (Test-FpsSpecObserverOn $listed[0] $true $v) { return (& $fail 'enabled' "observerControls.$name is enabled ($($listed[0].id))" $pairs.Count) }
+            continue
+        }
+        if ($v -is [bool]) { if ($v) { return (& $fail 'enabled' "observerControls.$name is true" $pairs.Count) }; continue }
+        if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) { if ($v -ne 0) { return (& $fail 'enabled' "observerControls.$name is $v" $pairs.Count) }; continue }
+        if ($v -is [string] -and $v.Length -gt 0) { return (& $fail 'enabled' "observerControls.$name is the non-empty text '$v'" $pairs.Count) }
+        return (& $fail 'unreadable' "observerControls.$name cannot be read as a boolean" $pairs.Count)
+    }
+    [pscustomobject]@{ present = $true; entries = $pairs.Count; problem = $null }
+}
+
 function Get-FpsArmFromLegRecord {
     <#
     .SYNOPSIS
@@ -139,6 +183,11 @@ function Get-FpsArmFromLegRecord {
     $observer = Get-FpsSpecObserverOn $Leg
     if ($null -eq $observer) { $observer = Get-FpsSpecObserverOn (Get-FaProp $Leg 'generatorArgs') }
     if ($null -ne $observer) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the record carries $($observer.specKey) enabled ($($observer.id))" }
+    # luna r3 B1: the `observerControls` object a record carries (directly or under its generatorArgs) is judged too: any enabled entry, or one that cannot be read, is not LIGHT
+    foreach ($holder in @($Leg, (Get-FaProp $Leg 'generatorArgs'))) {
+        $oc = Read-FpsRecordedObserverControls $holder
+        if ($null -ne $oc.problem) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but the record's observerControls fail closed ($($oc.problem.kind): $($oc.problem.text))" }
+    }
     if ($field -isnot [string]) { return $field }
     New-FpsArm 'LIGHT' 'record' 'telemetryArm=LIGHT'
 }
@@ -211,6 +260,12 @@ function Get-FpsArmFromJobResult {
         # either (adversary pass 3 A2)
         $containers = @($Result, (Get-FaProp $Result 'generatorArgs'), (Get-FaProp $Result 'observerControls'))
         $recorded = $false
+        # the same rule as a leg record's (Read-FpsRecordedObserverControls): an `observerControls` that is not an object, an enabled entry of any name, or an entry that cannot be read fails closed
+        foreach ($holder in @($Result, (Get-FaProp $Result 'generatorArgs'))) {
+            $oc = Read-FpsRecordedObserverControls $holder
+            if ($null -ne $oc.problem) { return New-FpsArm 'UNKNOWN' 'result' "telemetryArm=LIGHT but the result's observerControls fail closed ($($oc.problem.kind): $($oc.problem.text))" }
+            if ($oc.entries -gt 0) { $recorded = $true }
+        }
         foreach ($container in $containers) {
             if ($null -eq $container -or $container -is [string] -or $container -is [System.ValueType]) { continue }
             foreach ($c in $script:FpsObserverControls) { if ($c.specKey -and (Test-FaHasProp $container $c.specKey)) { $recorded = $true } }
@@ -259,6 +314,14 @@ function Test-FpsEnvVarOn {
     # threshold, not off (adversary pass 3 A1); kind 'flag' follows Test-FpsEnvFlagOn.
     param([string]$Kind, [AllowNull()]$Value)
     if ($Kind -ceq 'value') { return (-not [string]::IsNullOrEmpty([string]$Value)) }
+    if ($Kind -ceq 'truthy') {
+        # the consumer's own rule (GpuDisplayViewport.cpp:51-60): empty is off; trimmed (ASCII whitespace) and lowercased, only 1 / true / yes / on are on. Text this module cannot read
+        # the way the native reader does (non-ASCII) is read toward ON, never toward off.
+        $text = [string]$Value
+        if ([string]::IsNullOrEmpty($text)) { return $false }
+        if ($text -notmatch '^[\x00-\x7F]*$') { return $true }
+        return ($text.Trim(" `t`n`r`v`f").ToLowerInvariant() -cin @('1', 'true', 'yes', 'on'))
+    }
     Test-FpsEnvFlagOn $Value
 }
 

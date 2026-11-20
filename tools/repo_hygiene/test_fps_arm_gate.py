@@ -193,8 +193,10 @@ class ArmClassifierTests(_Probe):
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_GPU_TEX_NR_OVERLAP_TRACE=1')": "HEAVY",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_INTERACTIVE_TRACE=1')": "HEAVY",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PHASE3_TEL_PATH=C:\\Temp\\stages.csv')": "HEAVY",
-            # r2 pass 5 A2: the venue job puts MLVAPP_VIEWPORT_PRESENT_DIAG=1 in the environment of BOTH arms (playback-attr-3-cuda-job.ps1:3061), so it is the standing baseline of a LIGHT leg, not a discriminator
-            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1')": "LIGHT",
+            # r4 (luna r3 B2, supersedes r2 pass 5 A2): MLVAPP_VIEWPORT_PRESENT_DIAG logs from the per-present paths (GpuDisplayViewport.cpp:1226-1231, :2014-2019), so it is an observer; the venue
+            # job no longer puts it in a LIGHT leg's environment (playback-attr-3-cuda-job.ps1), so a LIGHT launch does not carry it
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=1')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=0')": "LIGHT",
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=1')": "UNKNOWN",
             # r2 pass 5 A1: "0" is not proof of OFF for a variable nobody listed (the native mode parsers read 0 as a mode), so any presence is UNKNOWN
             "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_A_NEW_DIAGNOSTIC_NOBODY_LISTED=0')": "UNKNOWN",
@@ -413,6 +415,21 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, creationflags=_NO_WINDOW)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.split(), ["JUDGED_HEAVY_READ_LIGHT=UNKNOWN", "SAME_BYTES=LIGHT", "NO_DIGEST=UNKNOWN"])
+
+    @requires_windows_pwsh
+    def test_the_spec_only_light_specs_luna_named_pass_the_arm_check_because_the_job_no_longer_injects_the_diag(self) -> None:
+        # r4 B2 spec-only route, decision (a): the job injected MLVAPP_VIEWPORT_PRESENT_DIAG=1 into every leg, so these three specs ran a per-present logger under a LIGHT word. The job now leaves
+        # it out of a LIGHT leg (test_the_venue_job_leaves_the_present_diag_out_of_a_light_leg_and_keeps_it_elsewhere in ObserverControlTests), so the spec word is true again and the gate
+        # admits them; a LIGHT spec that switches an observer on is still refused (UNKNOWN arm), as is a HEAVY one.
+        admitted = [{"telemetryArm": "LIGHT"}, {"telemetryArm": "LIGHT", "utilSample": False}, {"telemetryArm": "LIGHT", "corePartitionTelemetry": False}]
+        for n, ga in enumerate(admitted):
+            with self.subTest(generatorArgs=ga):
+                r = self.run_plan([self.spec(f"fx-adm{n}a", ga), self.spec(f"fx-adm{n}b", ga)], "fps-ab")
+                self.assertNotIn("FPS_AB_", r.stderr, r.stdout + r.stderr)
+        for n, ga in enumerate([{"telemetryArm": "LIGHT", "utilSample": True}, {"telemetryArm": "LIGHT", "corePartitionTelemetry": True}, {"telemetryArm": "LIGHT", "firstPresentCapture": True}]):
+            with self.subTest(refused=ga):
+                r = self.run_plan([self.spec(f"fx-ref{n}a", {"telemetryArm": "LIGHT"}), self.spec(f"fx-ref{n}b", ga)], "fps-ab")
+                self.assertIn("LEG_PLAN_REFUSED reason=FPS_AB_UNKNOWN_ARM item=2 ", r.stderr, r.stdout + r.stderr)
 
     @requires_windows_pwsh
     def test_an_unreadable_purpose_is_refused(self) -> None:
@@ -1043,9 +1060,128 @@ class ObserverControlTests(_Probe):
                 if r["kind"] == "value":
                     self.assertNotEqual(r["envZero"], "LIGHT", r)
                     self.assertEqual(r["envEmpty"], "LIGHT", r)
+                elif r["kind"] == "truthy":
+                    # the app reads only 1 / true / yes / on (trimmed, any case) as on: "0" and "" are off (GpuDisplayViewport.cpp:51-60)
+                    self.assertEqual((r["envZero"], r["envEmpty"]), ("LIGHT", "LIGHT"), r)
                 else:
                     self.assertEqual(r["envZero"], "LIGHT", r)
                     self.assertNotEqual(r["envEmpty"], "LIGHT", r)
+
+    # --- r4 (luna r3 blockers B1 = A1, B2 = A2) -------------------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _json(doc: str) -> str:
+        return f"(ConvertFrom-Json '{doc}')"
+
+    def test_a_leg_record_with_an_enabled_observer_controls_entry_is_not_light(self) -> None:
+        # B1: Get-FpsArmFromLegRecord read `telemetryArm` and ignored `observerControls`, so each of luna's three literal records was LIGHT and a LIGHT/LIGHT pair was allowed.
+        # Callers that must refuse them through this reader: compare-machine-perf.ps1:498-499, run-release-cuda-playback-ab.ps1:351-355, summarize-local-cuda-proof.ps1:700-701.
+        literal = [
+            '{"telemetryArm":"LIGHT","observerControls":{"utilSample":true}}',
+            '{"telemetryArm":"LIGHT","observerControls":{"corePartitionTelemetry":true}}',
+            '{"telemetryArm":"LIGHT","observerControls":{"firstPresentCapture":true}}',
+        ]
+        self.check({f"Get-FpsArmFromLegRecord {self._json(doc)}": "UNKNOWN" for doc in literal})
+        out = self.ok("".join(
+            f"$a = Get-FpsArmFromLegRecord {self._json(doc)}\n$v = Get-FpsPairVerdict -Baseline $a -Candidate $a\nWrite-Host ('PAIR=' + $v.allowed + '|' + $v.reason)\n" for doc in literal))
+        self.assertEqual(out.split(), [f"PAIR=False|{UNKNOWN_REASON}"] * len(literal))
+
+    def test_a_leg_record_reads_every_kind_of_enabled_observer_control(self) -> None:
+        def rec(controls: str) -> str:
+            return f"Get-FpsArmFromLegRecord {self._json('{' + chr(34) + 'telemetryArm' + chr(34) + ':' + chr(34) + 'LIGHT' + chr(34) + ',' + chr(34) + 'observerControls' + chr(34) + ':' + controls + '}')}"
+        self.check({
+            rec('{"cudaLaunchTimingMinMs":0}'): "UNKNOWN",             # the threshold's own rule: 0 is ON (the job's -ge 0)
+            rec('{"warmReuseMissDump":true}'): "UNKNOWN",
+            rec('{"someObserverNobodyListed":true}'): "UNKNOWN",       # an unlisted entry: true
+            rec('{"someObserverNobodyListed":1}'): "UNKNOWN",          # a non-zero number
+            rec('{"someObserverNobodyListed":2.5}'): "UNKNOWN",
+            rec('{"someObserverNobodyListed":"true"}'): "UNKNOWN",     # a non-empty truthy string
+            rec('{"someObserverNobodyListed":"yes"}'): "UNKNOWN",
+            rec('{"utilSample":false,"corePartitionTelemetry":true}'): "UNKNOWN",   # one enabled entry among disabled ones
+            # fail closed: present but not an object, or an entry that cannot be read as a boolean
+            rec('"utilSample"'): "UNKNOWN",
+            rec('5'): "UNKNOWN",
+            rec('true'): "UNKNOWN",
+            rec('["utilSample"]'): "UNKNOWN",
+            rec('[]'): "UNKNOWN",
+            rec('null'): "UNKNOWN",
+            rec('{"someObserverNobodyListed":null}'): "UNKNOWN",
+            rec('{"someObserverNobodyListed":[true]}'): "UNKNOWN",
+            rec('{"someObserverNobodyListed":{"on":true}}'): "UNKNOWN",
+            rec('{"someObserverNobodyListed":""}'): "UNKNOWN",
+            # admission controls: all-false (and the threshold's -1) stays LIGHT
+            rec('{}'): "LIGHT",
+            rec('{"utilSample":false,"corePartitionTelemetry":false,"firstPresentCapture":false,"warmReuseMissDump":false,"cudaLaunchTimingMinMs":-1}'): "LIGHT",
+            rec('{"someObserverNobodyListed":false}'): "LIGHT",
+            rec('{"someObserverNobodyListed":0}'): "LIGHT",
+        })
+
+    def test_a_leg_record_without_observer_controls_stays_light(self) -> None:
+        self.check({
+            f"Get-FpsArmFromLegRecord {self._json('{' + chr(34) + 'telemetryArm' + chr(34) + ':' + chr(34) + 'LIGHT' + chr(34) + '}')}": "LIGHT",
+            f"Get-FpsArmFromLegRecord {self._json('{' + chr(34) + 'telemetryArm' + chr(34) + ':' + chr(34) + 'HEAVY' + chr(34) + ',' + chr(34) + 'observerControls' + chr(34) + ':{' + chr(34) + 'utilSample' + chr(34) + ':true}}')}": "HEAVY",
+        })
+
+    def test_a_job_result_reads_observer_controls_the_same_way(self) -> None:
+        # sibling sweep: Get-FpsArmFromJobResult already read observerControls, but skipped a malformed one; the leg-record and result readers now share one rule
+        def res(controls: str) -> str:
+            return "Get-FpsArmFromJobResult " + self._json('{"telemetryArm":"LIGHT","observerControls":' + controls + '}')
+        self.check({
+            res('{"someObserverNobodyListed":true}'): "UNKNOWN",
+            res('"utilSample"'): "UNKNOWN",
+            res('["utilSample"]'): "UNKNOWN",
+            res('{"someObserverNobodyListed":null}'): "UNKNOWN",
+            res('{"utilSample":false}'): "LIGHT",
+            res('{"someObserverNobodyListed":0}'): "LIGHT",
+        })
+
+    def test_viewport_present_diag_is_an_active_observer_in_every_spelling_the_app_accepts(self) -> None:
+        # B2: GpuDisplayViewport.cpp:62-71 envFlagEnabled reads the value trimmed and lowercased: 1 / true / yes / on are ON, everything else (0, false, off, no, empty) is OFF; the app logs
+        # from the per-present paths when it is on (:1226-1231 setPresentedImage, :2014-2019 updateTextureIfNeeded). It was on the benign list, so a LIGHT-looking launch passed.
+        def launch(value: str | None) -> str:
+            extra = "" if value is None else f"; MLVAPP_VIEWPORT_PRESENT_DIAG = '{value}'"
+            return ("Get-FpsArmFromLaunch ([pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+                    f"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'{extra} }}; arguments = @() }})")
+        cases = {launch(v): "HEAVY" for v in ("1", "true", "on", "yes", "TRUE", "On", "YES", " 1 ", "1\t", "true\r\n")}
+        cases.update({launch(v): "LIGHT" for v in (None, "0", "false", "off", "no", "", "FALSE", "Off")})
+        self.check(cases)
+        # the key compares ignoring case, and the list form of the launch environment reads the same
+        self.check({
+            "Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','mlvapp_viewport_present_diag=on')": "HEAVY",
+            "Get-FpsArmFromEnvironment @('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_VIEWPORT_PRESENT_DIAG=0')": "LIGHT",
+        })
+        out = self.ok("$a = " + launch("1") + "\n$v = Get-FpsPairVerdict -Baseline $a -Candidate $a\nWrite-Host ('ALLOWED=' + $v.allowed + '|' + $v.reason)")
+        self.assertIn(f"ALLOWED=False|{HEAVY_REASON}", out)
+
+    def test_the_venue_job_leaves_the_present_diag_out_of_a_light_leg_and_keeps_it_elsewhere(self) -> None:
+        # B2, spec-only route: the job puts MLVAPP_VIEWPORT_PRESENT_DIAG=1 in $envs unconditionally (playback-attr-3-cuda-job.ps1 :3061), so a spec that says only telemetryArm LIGHT
+        # (Invoke-VenueLeaseBatch.ps1 Get-LegSpecTelemetryArm) ran with a per-present logger. The generated LIGHT leg must not carry it; every other arm keeps the line.
+        job = (PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        block = _extract_block(job, "$telemetryArmEnvs = if ($TelemetryArm -eq 'LIGHT') {", "$envList = ", trailing_lines=-1)
+        body = "".join(
+            f"$TelemetryArm = '{arm}'; $reconDll = 'x'; $pkgDir = 'C:\\pkg'; $DisablePaintPerSubmit = {flag}\n{block}\nWrite-Host ('ENVS={arm}|{flag}|' + ($envs -join ','))\n"
+            for arm, flag in (("LIGHT", "$false"), ("LIGHT", "$true"), ("HEAVY", "$false"), ("HEAVY", "$true"), ("", "$false")))
+        rows = {}
+        for line in self.ok(body).splitlines():
+            if line.startswith("ENVS="):
+                key, value = line[5:].rsplit("|", 1)[0], line.split("|", 2)[2]
+                rows[key] = value.split(",")
+        diag = "MLVAPP_VIEWPORT_PRESENT_DIAG=1"
+        self.assertEqual(len(rows), 5, rows)
+        for key, envs in rows.items():
+            if key.startswith("LIGHT"):
+                self.assertNotIn(diag, envs, key)
+                self.assertIn("MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1", envs)
+                self.assertIn("MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT=1", envs)   # the rest of the standing environment is untouched
+            else:
+                self.assertIn(diag, envs, key)                                   # every non-LIGHT leg keeps it (the generator default, an absent arm, is HEAVY)
+        self.assertEqual(rows["LIGHT|$true"][-1], "MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0")
+        self.assertIn("MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1", rows["HEAVY|$false"])
+        # a LIGHT leg differs from a HEAVY one by the arm switches and the diag line only: dropping the diag from the HEAVY list leaves the LIGHT list's common part in the same order
+        common = [e for e in rows["LIGHT|$false"] if e in rows["HEAVY|$false"]]
+        self.assertEqual(common, [e for e in rows["HEAVY|$false"] if e in rows["LIGHT|$false"]])
+        self.assertEqual(sorted(set(rows["HEAVY|$false"]) - set(rows["LIGHT|$false"]) - {diag}),
+                         sorted(["MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=0", "MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1", "MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1",
+                                "MLVAPP_STAGE_TIMING=1", "MLVAPP_PERF_FIELD_LOG=1"]))
 
     def test_every_generator_arg_the_venue_leg_forwards_is_classified(self) -> None:
         # The class guard: a NEW generatorArgs key must be named observer (module list) or not-an-observer (below), so none reaches the job unclassified.
