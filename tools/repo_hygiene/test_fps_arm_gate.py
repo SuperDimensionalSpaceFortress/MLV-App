@@ -165,9 +165,55 @@ class ArmClassifierTests(_Probe):
             "@('MLVAPP_STAGE_TIMING=0')": "LIGHT",
             "[pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' }": "HEAVY",
             "[ordered]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = 'true' }": "LIGHT",
+            # adversary A1: the native readers disagree on every value but "0", so "false" / "off" / "" are read toward HEAVY
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=false')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_STAGE_TIMING=false')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=false')": "HEAVY",
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','MLVAPP_PERF_FIELD_LOG=')": "HEAVY",
+            # adversary A2: Windows environment names compare ignoring case
+            "@('MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1','MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1','mlvapp_stage_timing=1')": "HEAVY",
+            "@('mlvapp_playback_smoke_telemetry=1','mlvapp_playback_smoke_telemetry_disable_frame_log=1')": "LIGHT",
+            "@('MLVAPP_STAGE_TIMING=1','mlvapp_stage_timing=0')": "UNKNOWN",
+            "@('MLVAPP_STAGE_TIMING=0','mlvapp_stage_timing=0')": "LIGHT",
+            # adversary A1: a value that is not text is malformed, never its coerced text
+            "[pscustomobject]@{ MLVAPP_STAGE_TIMING = @('0') }": "UNKNOWN",
+            "[pscustomobject]@{ MLVAPP_STAGE_TIMING = [pscustomobject]@{ a = 1 } }": "UNKNOWN",
+            "@(1, 2)": "UNKNOWN",
         }
         got = self.arms([f"Get-FpsArmFromEnvironment ({expr})" for expr in cases])
         self.assertEqual(dict(zip(cases, got)), {expr: f"ARM={want}" for expr, want in cases.items()})
+
+    def test_the_launch_block_is_judged_on_its_arguments_too(self) -> None:
+        # adversary A3: --stage-log=<file> turns the app's stage logger on whatever the environment says
+        env = "environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' }"
+        cases = {
+            f"[pscustomobject]@{{ {env}; arguments = @() }}": "LIGHT",
+            f"[pscustomobject]@{{ {env}; arguments = @('--input', 'x') }}": "LIGHT",
+            f"[pscustomobject]@{{ {env}; arguments = @('--stage-log=C:\\Temp\\stage.csv') }}": "HEAVY",
+            f"[pscustomobject]@{{ {env}; arguments = @('--stage-log', 'C:\\Temp\\stage.csv') }}": "HEAVY",
+            f"[pscustomobject]@{{ {env}; arguments = @('-STAGE-LOG=x') }}": "HEAVY",
+            f"[pscustomobject]@{{ {env}; arguments = @('/stage-log:x') }}": "HEAVY",
+            f"[pscustomobject]@{{ {env}; arguments = @(5) }}": "UNKNOWN",
+            f"[pscustomobject]@{{ {env} }}": "UNKNOWN",
+            "[pscustomobject]@{ arguments = @() }": "UNKNOWN",
+            "$null": "UNKNOWN",
+        }
+        got = self.arms([f"Get-FpsArmFromLaunch ({expr})" for expr in cases])
+        self.assertEqual(dict(zip(cases, got)), {expr: f"ARM={want}" for expr, want in cases.items()})
+
+    def test_a_malformed_container_is_unknown_never_the_scalar_inside_it(self) -> None:
+        # adversary A5: a one-element JSON array must not unroll to the string it holds
+        exprs = ["Get-FpsArmFromJobResult (ConvertFrom-Json '{\"telemetryArm\":[\"LIGHT\"]}')",
+                 "Get-FpsArmFromJobResult (ConvertFrom-Json '{\"telemetryArm\":{\"arm\":\"LIGHT\"}}')",
+                 "Get-FpsArmFromLegSpec (ConvertFrom-Json '{\"legType\":\"speed\",\"generatorArgs\":{\"telemetryArm\":[\"LIGHT\"]}}')",
+                 "[pscustomobject]@{ arm = (ConvertTo-FpsArmName (ConvertFrom-Json '{\"arm\":[\"LIGHT\"]}')) }"]
+        self.assertEqual(self.arms(exprs), ["ARM=UNKNOWN"] * len(exprs))
+
+    def test_a_given_spec_with_no_usable_arm_is_not_set_aside_for_a_light_result(self) -> None:
+        # adversary A8
+        spec = "[pscustomobject]@{ legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 1 } }"
+        self.assertEqual(self.arm(f"Get-FpsArm -Spec ({spec}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})"), "ARM=UNKNOWN")
+        self.assertEqual(self.arm(f"Get-FpsArm -Spec ({SPEC_NO_ARM}) -Result ([pscustomobject]@{{ telemetryArm = 'LIGHT' }})"), "ARM=UNKNOWN")
 
 
 @requires_pwsh
@@ -234,6 +280,15 @@ class LegPlanRuleTests(_Probe):
         self.assertEqual(r[:2], ["FPS_AB_HEAVY_ARM", "2"])
         self.assertIn(HEAVY_REASON, r[2])
 
+    def test_a_null_item_in_an_fps_ab_plan_is_an_unknown_leg_not_a_dropped_one(self) -> None:
+        # adversary A7
+        out = self.ok("$r = Get-FpsLegPlanRefusal -Purpose 'fps-ab' -Items @([pscustomobject]@{ item = 1; arm = 'LIGHT' }, $null)\nWrite-Host ('R=' + ($r -join '|'))\n"
+                      "$v = Get-FpsArmsVerdict -Legs @([pscustomobject]@{ name = 'a'; arm = 'LIGHT' }, $null)\nWrite-Host ('V=' + $v.allowed + '|' + $v.reason + '|' + ($v.unknown -join ','))")
+        r_line = next(line for line in out.splitlines() if line.startswith("R="))
+        v_line = next(line for line in out.splitlines() if line.startswith("V="))
+        self.assertTrue(r_line.startswith("R=FPS_AB_UNKNOWN_ARM|2|"), r_line)
+        self.assertEqual(v_line, f"V=False|{UNKNOWN_REASON}|leg-2")
+
     def test_an_fps_ab_plan_with_an_unknown_leg_is_refused(self) -> None:
         self.assertEqual(self.refusal("'fps-ab'", ["LIGHT", "UNKNOWN"])[:2], ["FPS_AB_UNKNOWN_ARM", "2"])
 
@@ -298,6 +353,35 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         r = self.run_plan([self.spec("fx-a", {"telemetryArm": "LIGHT"}), self.spec("fx-b", {"unpaced": True})], "fps-ab")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=FPS_AB_UNKNOWN_ARM item=2 ", r.stderr)
+
+    def test_the_arm_is_judged_from_the_bytes_the_leg_is_bound_to(self) -> None:
+        # adversary A4: Get-LegSpecTelemetryArm must hash its read against the digest the preflight judged (the one -ExpectSpecSha256 binds the leg to). A spec shown as LIGHT to this
+        # read but judged (and later run) as HEAVY is UNKNOWN. Real function text, stubbed reads.
+        source = LEASE_BATCH_SCRIPT.read_text(encoding="utf-8")
+
+        def fn(name: str) -> str:
+            m = re.search(r"function " + re.escape(name) + r"\(.*?\n\}\r?\n", source, re.DOTALL)
+            self.assertIsNotNone(m, name)
+            return m.group(0)
+
+        light = json.dumps({"legType": "speed", "generatorArgs": {"telemetryArm": "LIGHT"}})
+        heavy = json.dumps({"legType": "speed", "generatorArgs": {"telemetryArm": "HEAVY"}})
+        script = self.tmp / "toctou.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + fn("Get-BytesSha256") + fn("Get-LegSpecTelemetryArm") +
+            "function Get-SpecReadBoundSec { 5.0 }\n"
+            f"function Read-SpecBytesWithin($Path, $Bound) {{ [pscustomobject]@{{ state = 'OK'; bytes = [Text.Encoding]::UTF8.GetBytes('{light}'); error = '' }} }}\n"
+            f"$heavyBytes = [Text.Encoding]::UTF8.GetBytes('{heavy}')\n$lightBytes = [Text.Encoding]::UTF8.GetBytes('{light}')\n"
+            "$script:SpecBudgetSha256 = @{}\n"
+            "$script:SpecBudgetSha256['s.json'] = Get-BytesSha256 $heavyBytes\n"
+            "Write-Host ('JUDGED_HEAVY_READ_LIGHT=' + (Get-LegSpecTelemetryArm 's.json').arm)\n"
+            "$script:SpecBudgetSha256['s.json'] = Get-BytesSha256 $lightBytes\n"
+            "Write-Host ('SAME_BYTES=' + (Get-LegSpecTelemetryArm 's.json').arm)\n"
+            "$script:SpecBudgetSha256 = @{}\n"
+            "Write-Host ('NO_DIGEST=' + (Get-LegSpecTelemetryArm 's.json').arm)\n", encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, creationflags=_NO_WINDOW)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["JUDGED_HEAVY_READ_LIGHT=UNKNOWN", "SAME_BYTES=LIGHT", "NO_DIGEST=UNKNOWN"])
 
     def test_an_unreadable_purpose_is_refused(self) -> None:
         r = self.run_plan([self.spec("fx-a", {"telemetryArm": "LIGHT"})], "throughput")
@@ -376,9 +460,12 @@ class CudaPlaybackAbFpsGateTests(_Probe):
 
     def test_the_smoke_summary_arm_is_read_from_the_recorded_launch_environment(self) -> None:
         cases = {
-            "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' } }": "HEAVY",
-            ("launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+            "launch = [pscustomobject]@{ arguments = @(); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' } }": "HEAVY",
+            ("launch = [pscustomobject]@{ arguments = @(); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
              "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "LIGHT",
+            ("launch = [pscustomobject]@{ arguments = @('--stage-log=C:\\Temp\\s.csv'); environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+             "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1' } }"): "HEAVY",
+            "launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1' } }": "UNKNOWN",
             "launch = [pscustomobject]@{ }": "UNKNOWN",
             "x = 1": "UNKNOWN",
         }
@@ -461,6 +548,32 @@ class CompareMachinePerfFpsGateTests(_Probe):
                 # the single-leg numbers stay: they are one leg's own measurement, not a comparison
                 self.assertEqual((r["baseline_presented_fps"], r["presented_fps"]), (10.0, 20.0))
 
+    def test_a_record_with_a_speed_compare_is_judged_on_its_speed_leg(self) -> None:
+        # adversary A6: the row publishes speedCompare, so the leg judged is candidateSpeed; an absent one is UNKNOWN, never the ordinary candidate
+        leg = "[pscustomobject]@{ telemetryArm = 'LIGHT'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
+        compare = "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 10.0; candidate = 20.0; deltaPercent = 100.0 } }"
+        base = f"schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; {fingerprint}baseline = {leg}; candidate = {leg}; compare = {compare}; speedCompare = {compare}; "
+        absent = self.row(f"[pscustomobject]@{{ {base}candidateSpeed = $null }}")
+        self.assertIsNone(absent["playback_fps_delta_pct"])
+        self.assertEqual(absent["playback_fps_arm_verdict"], UNKNOWN_REASON)
+        heavy_speed = self.row(f"[pscustomobject]@{{ {base}candidateSpeed = {heavy} }}")
+        self.assertIsNone(heavy_speed["playback_fps_delta_pct"])
+        self.assertEqual(heavy_speed["playback_fps_arm_verdict"], HEAVY_REASON)
+        light_speed = self.row(f"[pscustomobject]@{{ {base}candidateSpeed = {leg} }}")
+        self.assertEqual(light_speed["playback_fps_delta_pct"], 100.0)
+
+    def test_a_json_record_whose_arm_is_a_one_element_array_is_refused(self) -> None:
+        # adversary A5: parsed JSON, the way compare-machine-perf reads a record
+        record = ('{"schema":"mlvapp-cuda-playback-ab.v1","status":"success","machineFingerprint":{"schema":"machine-fingerprint.v1","hostname":"H","cpu":"x","gpu":"y","os":"z","build_sha":"abc1234"},'
+                  '"baseline":{"telemetryArm":["LIGHT"],"hostLoadProvisional":false,"hostLoadState":"quiet"},'
+                  '"candidate":{"telemetryArm":["LIGHT"],"hostLoadProvisional":false,"hostLoadState":"quiet"},'
+                  '"compare":{"presentedFps":{"baseline":10.0,"candidate":20.0,"deltaPercent":100.0}}}')
+        r = self.row(f"(ConvertFrom-Json '{record}')")
+        self.assertIsNone(r["playback_fps_delta_pct"])
+        self.assertEqual(r["playback_fps_arm_verdict"], UNKNOWN_REASON)
+
     def test_a_record_that_names_no_arm_is_unknown_and_refused_even_if_it_carries_a_cached_allowed_verdict(self) -> None:
         for with_verdict in (False, True):
             with self.subTest(cached_verdict=with_verdict):
@@ -503,7 +616,7 @@ class CompareGuiSmokeAbFpsGateTests(_Probe):
     def smoke(env: str | None) -> str:
         if env is None:
             return "[pscustomobject]@{ launch = [pscustomobject]@{ } }"
-        return f"[pscustomobject]@{{ launch = [pscustomobject]@{{ environment = [pscustomobject]@{{ {env} }} }} }}"
+        return f"[pscustomobject]@{{ launch = [pscustomobject]@{{ arguments = @(); environment = [pscustomobject]@{{ {env} }} }} }}"
 
     HEAVY_ENV = "MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'"
     LIGHT_ENV = "MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'"
@@ -535,6 +648,15 @@ class CompareGuiSmokeAbFpsGateTests(_Probe):
         self.assertIsNone(r["result"]["autoDecision"]["averageFpsEquivalent"]["deltaPercent"])
         self.assertEqual(r["result"]["autoDecision"]["averageMs"]["deltaPercent"], -10.0, "a ms stage figure stays")
 
+    def test_a_stage_log_argument_makes_a_smoke_heavy(self) -> None:
+        # adversary A3, sibling site: the arm gate reads launch.arguments as well as launch.environment
+        staged = ("[pscustomobject]@{ launch = [pscustomobject]@{ arguments = @('--stage-log=C:\\Temp\\s.csv'); "
+                  f"environment = [pscustomobject]@{{ {self.LIGHT_ENV} }} }} }}")
+        out = self.ok(f"$e = Get-FpsArmComparisonEvidence -BeforeSmoke ({self.smoke(self.LIGHT_ENV)}) -AfterSmoke ({staged})\n$e | ConvertTo-Json -Compress")
+        e = json.loads(out.strip().splitlines()[-1])
+        self.assertTrue(e["refused"])
+        self.assertEqual((e["reason"], e["after"]["arm"]), (HEAVY_REASON, "HEAVY"))
+
     def test_a_mixed_pair_and_a_smoke_with_no_recorded_environment_are_refused(self) -> None:
         self.assertEqual(self.run_compare(self.LIGHT_ENV, self.HEAVY_ENV)["evidence"]["reason"], HEAVY_REASON)
         self.assertEqual(self.run_compare(self.LIGHT_ENV, None)["evidence"]["reason"], UNKNOWN_REASON)
@@ -553,7 +675,7 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         # the improvement diagnostic is behind the arm refusal
         self.assertRegex(source, r"-not \$playbackAbHostLoadProvisional -and\s+-not \$playbackAbFpsArmRefusal\.refused -and")
 
-    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str) -> list[str]:
+    def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null") -> list[str]:
         tmp = Path(tempfile.mkdtemp(prefix="fps-arm-summ-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         source = SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
@@ -567,7 +689,7 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         probe.write_text(
             "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + funcs +
             "\n$playbackAbComparisonBasis = 'candidate'\n"
-            f"$playbackAb = [pscustomobject]@{{ analysis = $null; baseline = [pscustomobject]@{{ telemetryArm = '{baseline_arm}'; hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
+            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ telemetryArm = '{baseline_arm}'; hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
             f"candidate = [pscustomobject]@{{ telemetryArm = '{candidate_arm}'; hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
             "$playbackAbSpeedCompare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
             "guiStatusFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
@@ -589,6 +711,14 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertIn(HEAVY_REASON, text)
         self.assertNotIn("presented FPS: CPU", text)
         self.assertIn("avg present interval", text, "stage lines stay")
+
+    def test_a_refused_pair_repeats_no_cached_fps_derived_suggestion(self) -> None:
+        # adversary A9 (pre-existing append, same class): the packet's analysis.suggestedOptimization is derived from the fps delta
+        analysis = "[pscustomobject]@{ suggestedOptimization = 'optimize_playback_cuda_candidate' }"
+        refused = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY", analysis))
+        self.assertNotIn("suggested_optimization=", refused)
+        allowed = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", analysis))
+        self.assertIn("suggested_optimization=optimize_playback_cuda_candidate", allowed)
 
     def test_light_ab_keeps_the_verdict_and_delta_lines(self) -> None:
         text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT"))

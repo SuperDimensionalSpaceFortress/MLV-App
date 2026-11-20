@@ -697,8 +697,8 @@ else {
     # pair, or a leg that records no arm (UNKNOWN: a packet written before this gate) is refused: no fps-delta diagnostic and no presented / GUI fps delta line below; the
     # stage lines (intervals, render totals) stay.
     $playbackAbFpsArmVerdict = Get-FpsPairVerdict `
-        -Baseline (Get-Field $playbackAb.baseline "telemetryArm") `
-        -Candidate (Get-Field $playbackAbCandidateLeg "telemetryArm") `
+        -Baseline (Get-FaProp $playbackAb.baseline "telemetryArm") `
+        -Candidate (Get-FaProp $playbackAbCandidateLeg "telemetryArm") `
         -BaselineName "baseline" `
         -CandidateName $playbackAbComparisonBasis
     $playbackAbFpsArmRefusal = [pscustomobject]@{
@@ -752,7 +752,8 @@ if ($playbackAb -and $playbackAbSpeedCompare) {
         (Format-MetricDeltaLine -Label "avg present interval" -Metric $playbackAbSpeedCompare.avgPresentIntervalMs -Unit " ms" -LowerIsBetter),
         (Format-MetricDeltaLine -Label "render total" -Metric $playbackAbSpeedCompare.avgRenderTotalMs -Unit " ms" -LowerIsBetter)
     )
-    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A9): the packet's cached suggestion is fps-delta-derived, so it is not repeated for a pair the arm gate refused.
+    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization -and -not $playbackAbFpsArmRefusal.refused) {
         $playbackSpeedEvidence += "suggested_optimization=$($playbackAb.analysis.suggestedOptimization)"
     }
 }

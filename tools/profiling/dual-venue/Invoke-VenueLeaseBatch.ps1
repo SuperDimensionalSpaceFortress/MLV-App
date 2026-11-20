@@ -1371,7 +1371,18 @@ function Get-LegSpecId([string]$Path) {
 function Get-LegSpecTelemetryArm([string]$Path) {
     # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm (LIGHT / HEAVY / UNKNOWN) a -LegPlan item's spec will run, derived from generatorArgs.telemetryArm by the same bounded read as
     # Get-LegSpecId. A spec that cannot be read or parsed in the bound is UNKNOWN (refused like HEAVY for an fps A/B), never LIGHT.
-    $spec = try { $r = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec); if ($r.state -cne 'OK') { $null } else { [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$r.bytes), $true).ReadToEnd() | ConvertFrom-Json } } catch { $null }
+    # Adversary A4: the arm is judged from the SAME bytes the leg will run. The export-budget preflight (Get-ExportBudgetRefusal, which runs just before this call) recorded the sha256 of the
+    # bytes it judged in $script:SpecBudgetSha256, and the leg is bound to them by -ExpectSpecSha256. These bytes must hash to that digest; a spec that changed between the two reads (a
+    # HEAVY file shown LIGHT to this read and put back for the run) is UNKNOWN, never the arm this read happened to see. No recorded digest is UNKNOWN too.
+    $spec = $null
+    try {
+        $r = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
+        if ($r.state -ceq 'OK') {
+            $judged = if ($script:SpecBudgetSha256 -is [hashtable] -and $script:SpecBudgetSha256.ContainsKey($Path)) { [string]$script:SpecBudgetSha256[$Path] } else { '' }
+            if ($judged -and ((Get-BytesSha256 ([byte[]]$r.bytes)) -ceq $judged)) { $spec = [Text.Encoding]::UTF8.GetString([byte[]]$r.bytes) | ConvertFrom-Json }
+            else { return (New-FpsArm 'UNKNOWN' 'spec' 'the spec bytes read for the arm are not the bytes the preflight judged and the leg is bound to (changed between reads, or no judged digest)') }
+        }
+    } catch { $spec = $null }
     Get-FpsArmFromLegSpec $spec
 }
 

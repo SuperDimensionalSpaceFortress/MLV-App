@@ -473,7 +473,9 @@ function Get-PlaybackAbHostLoadRefusal {
     # how $compare/$playbackComparisonBasis are chosen below).
     param([object]$Record)
 
-    $candidateLeg = if ($Record.speedCompare -and $Record.candidateSpeed) { $Record.candidateSpeed } else { $Record.candidate }
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A6, sibling): same leg choice as Get-PlaybackAbFpsArmRefusal below: a record with a speedCompare judges its candidateSpeed leg, and a missing one
+    # reads as provisional (Get-PlaybackAbLegHostLoadProvisional treats a null leg as provisional), never as the ordinary candidate.
+    $candidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
     $baselineProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $Record.baseline
     $candidateProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $candidateLeg
     [pscustomobject]@{
@@ -489,7 +491,9 @@ function Get-PlaybackAbFpsArmRefusal {
     # (a record written before this gate) is UNKNOWN and refused, exactly like HEAVY: an arm nobody can prove LIGHT is not LIGHT.
     param([object]$Record)
 
-    $candidateLeg = if ($Record.speedCompare -and $Record.candidateSpeed) { $Record.candidateSpeed } else { $Record.candidate }
+    # The leg judged is the leg the PUBLISHED compare came from: when the record carries a speedCompare the row / analysis / suggestion read it, so its candidateSpeed leg is judged, and an
+    # absent candidateSpeed there is UNKNOWN (a null leg), never a fall-back to the ordinary candidate (adversary A6).
+    $candidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
     $verdict = Get-FpsPairVerdict `
         -Baseline (Get-FaProp $Record.baseline "telemetryArm") `
         -Candidate (Get-FaProp $candidateLeg "telemetryArm")

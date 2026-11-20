@@ -330,10 +330,10 @@ function Test-DeltaAtLeast {
 }
 
 function Get-SmokeSummaryTelemetryArm {
-    # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm a smoke leg ran, from the launch environment its own result recorded (run-release-gui-smoke.ps1
-    # result.launch.environment). A result with no recorded environment (older binary, missing file) is UNKNOWN, never LIGHT.
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm a smoke leg ran, from the launch block its own result recorded (result.launch: environment AND the argument
+    # list, which can carry --stage-log). A result with no recorded launch block, environment or arguments (older binary, missing file) is UNKNOWN, never LIGHT.
     param([object]$Json)
-    Get-FpsArmFromEnvironment (Get-NestedValue $Json "launch.environment")
+    Get-FpsArmFromLaunch (Get-NestedValue $Json "launch")
 }
 
 function Get-PlaybackAbFpsVerdict {

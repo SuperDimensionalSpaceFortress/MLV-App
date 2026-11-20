@@ -27,11 +27,12 @@ $script:FpsArmUnknownReason = 'fps-verdict-refused:unknown-arm'
 function Get-FaProp {
     # One property of a hashtable / ordered dictionary / PSCustomObject, $null when absent (StrictMode-safe).
     param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+    # `return ,$x`: a one-element array (a parsed-JSON ["LIGHT"]) must stay an array and so fail the string check, never unroll to the scalar it contains (adversary A5).
     if ($null -eq $Object) { return $null }
-    if ($Object -is [System.Collections.IDictionary]) { if ($Object.Contains($Name)) { return $Object[$Name] } else { return $null } }
+    if ($Object -is [System.Collections.IDictionary]) { if ($Object.Contains($Name)) { return , $Object[$Name] } else { return $null } }
     $p = $Object.PSObject.Properties[$Name]
     if ($null -eq $p) { return $null }
-    $p.Value
+    return , $p.Value
 }
 
 function New-FpsArm {
@@ -95,40 +96,51 @@ function Get-FpsArm {
     if ($null -eq $fromSpec) { return $fromResult }
     if ($null -eq $fromResult) { return $fromSpec }
     if ($fromResult.arm -ceq 'UNKNOWN') { return New-FpsArm 'UNKNOWN' 'spec+result' "the result carries no usable arm ($($fromResult.reason)); spec says $($fromSpec.arm)" }
-    if ($fromSpec.arm -ceq 'UNKNOWN') { return $fromResult }
+    # a spec that was GIVEN but names no usable arm cannot be set aside in favour of a LIGHT result: the two inputs must agree (adversary A8)
+    if ($fromSpec.arm -ceq 'UNKNOWN') { return New-FpsArm 'UNKNOWN' 'spec+result' "the spec carries no usable arm ($($fromSpec.reason)); result says $($fromResult.arm)" }
     if ($fromSpec.arm -cne $fromResult.arm) { return New-FpsArm 'UNKNOWN' 'spec+result' "spec says $($fromSpec.arm) but the recorded result says $($fromResult.arm)" }
     New-FpsArm $fromResult.arm 'spec+result' "spec and recorded result agree on $($fromResult.arm)"
 }
 
 function Test-FpsEnvFlagOn {
-    # The app's own truthiness (platform/qt/MainWindow.cpp environmentFlagEnabled): set, and not 0 / false / off / no.
+    # A per-frame diagnostic variable counts as ON unless it is exactly "0". The app's readers disagree on every other value (MainWindow.cpp environmentFlagEnabled reads false / off / no /
+    # empty as off, GpuDisplayWindow.cpp swapTelemetryEnabled reads them as on, and other readers are other things), so the only value that proves OFF is the one both agree on; every
+    # other set value is read toward HEAVY (adversary A1: TELEMETRY=false and STAGE_TIMING=false are on in the native readers).
     param([AllowNull()]$Value)
     if ($null -eq $Value) { return $false }
-    $t = ([string]$Value).Trim().ToLowerInvariant()
-    ($t -ne '' -and $t -ne '0' -and $t -ne 'false' -and $t -ne 'off' -and $t -ne 'no')
+    ([string]$Value) -cne '0'
 }
 
 function ConvertTo-FpsEnvMap {
-    # KEY=VALUE strings, a hashtable / dictionary or a parsed-JSON object -> an ordinal dictionary. $null when the input is none of them.
+    # KEY=VALUE strings, a hashtable / dictionary or a parsed-JSON object -> @{ state; map; why }. state 'absent' (nothing given), 'malformed' (a value that is not a scalar, an entry that is not
+    # KEY=VALUE, a key repeated with a different value) or 'ok'. Keys compare IGNORING CASE: the Windows process environment is case-insensitive, so mlvapp_stage_timing=1 is MLVAPP_STAGE_TIMING
+    # (adversary A2). Values are checked before they are coerced to text (a nested array or object is malformed, never its text).
     param([AllowNull()]$Environment)
-    if ($null -eq $Environment) { return $null }
-    if (($Environment -is [string]) -and [string]::IsNullOrWhiteSpace($Environment)) { return $null }
-    $map = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $result = { param($state, $map, $why) [pscustomobject]@{ state = $state; map = $map; why = $why } }
+    if ($null -eq $Environment) { return (& $result 'absent' $null 'no-environment-recorded') }
+    if (($Environment -is [string]) -and [string]::IsNullOrWhiteSpace($Environment)) { return (& $result 'absent' $null 'no-environment-recorded') }
+    $map = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pairs = [System.Collections.Generic.List[object]]::new()
     if ($Environment -is [System.Collections.IDictionary]) {
-        foreach ($k in $Environment.Keys) { $map[[string]$k] = [string]$Environment[$k] }
-        return $map
+        foreach ($k in $Environment.Keys) { $pairs.Add(@([string]$k, $Environment[$k])) }
+    } elseif ($Environment -is [System.Management.Automation.PSCustomObject]) {
+        foreach ($p in $Environment.PSObject.Properties) { $pairs.Add(@([string]$p.Name, $p.Value)) }
+    } else {
+        foreach ($e in @($Environment)) {
+            if ($e -isnot [string]) { return (& $result 'malformed' $null 'an environment entry is not a KEY=VALUE string') }
+            $i = $e.IndexOf('=')
+            if ($i -lt 1) { return (& $result 'malformed' $null 'an environment entry is not KEY=VALUE') }
+            $pairs.Add(@($e.Substring(0, $i), $e.Substring($i + 1)))
+        }
     }
-    if ($Environment -is [System.Management.Automation.PSCustomObject]) {
-        foreach ($p in $Environment.PSObject.Properties) { $map[[string]$p.Name] = [string]$p.Value }
-        return $map
+    foreach ($pair in $pairs) {
+        $v = $pair[1]
+        if ($null -ne $v -and $v -isnot [string] -and $v -isnot [System.ValueType]) { return (& $result 'malformed' $null "environment value of $($pair[0]) is not a scalar") }
+        $text = if ($null -eq $v) { '' } else { [string]$v }
+        if ($map.ContainsKey($pair[0]) -and $map[$pair[0]] -cne $text) { return (& $result 'malformed' $null "$($pair[0]) is repeated with different values") }
+        $map[$pair[0]] = $text
     }
-    foreach ($e in @($Environment)) {
-        $s = [string]$e
-        $i = $s.IndexOf('=')
-        if ($i -lt 1) { return $null }
-        $map[$s.Substring(0, $i)] = $s.Substring($i + 1)
-    }
-    $map
+    & $result 'ok' $map ''
 }
 
 function Get-FpsArmFromEnvironment {
@@ -139,9 +151,19 @@ function Get-FpsArmFromEnvironment {
     detailed timeline, stage timing, perf field log, RBF detail timing) or the frame log is on; LIGHT when telemetry is off or only the counters run (frame log opted out). An absent environment
     or an ambiguous opt-out value (the app's two readers disagree on it) is UNKNOWN. An inherited variable the launch did not record is the limit of this reading.
     #>
-    param([AllowNull()]$Environment)
-    $map = ConvertTo-FpsEnvMap $Environment
-    if ($null -eq $map) { return New-FpsArm 'UNKNOWN' 'environment' 'no-environment-recorded' }
+    param([AllowNull()]$Environment, [AllowNull()]$Arguments = $null)
+    $parsed = ConvertTo-FpsEnvMap $Environment
+    if ($parsed.state -ceq 'absent') { return New-FpsArm 'UNKNOWN' 'environment' 'no-environment-recorded' }
+    if ($parsed.state -cne 'ok') { return New-FpsArm 'UNKNOWN' 'environment' "malformed-environment ($($parsed.why))" }
+    $map = $parsed.map
+    # The app turns the stage logger on from its own command line too (--stage-log=<file>, main.cpp): a launch that passed it ran per-frame stage timing whatever its environment says
+    # (adversary A3). Arguments given must all be text; any form of the option (--stage-log, -stage-log, /stage-log, with = or : or a following value) is HEAVY.
+    if ($null -ne $Arguments) {
+        foreach ($a in @($Arguments)) {
+            if ($a -isnot [string]) { return New-FpsArm 'UNKNOWN' 'environment' 'malformed-arguments (an argument is not text)' }
+            if ($a -imatch '^(--?|/)stage-log([=:]|$)') { return New-FpsArm 'HEAVY' 'environment' "the launch passed $($a.Split('=')[0]) (the stage logger)" }
+        }
+    }
     foreach ($k in @('MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY', 'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY', 'MLVAPP_STAGE_TIMING', 'MLVAPP_PERF_FIELD_LOG', 'MLVAPP_PLAYBACK_RBF_DETAIL_TIMING')) {
         if ($map.ContainsKey($k) -and (Test-FpsEnvFlagOn $map[$k])) { return New-FpsArm 'HEAVY' 'environment' "$k is on" }
     }
@@ -152,6 +174,22 @@ function Get-FpsArmFromEnvironment {
     if ($d -in @('1', 'true', 'yes', 'on')) { return New-FpsArm 'LIGHT' 'environment' 'frame telemetry on, per-frame log opted out' }
     if ($d -in @('', '0', 'false', 'off', 'no')) { return New-FpsArm 'HEAVY' 'environment' 'frame telemetry on, per-frame log opt-out is explicitly off' }
     New-FpsArm 'UNKNOWN' 'environment' "per-frame log opt-out value '$d' is read differently by the app's two readers"
+}
+
+function Get-FpsArmFromLaunch {
+    <#
+    .SYNOPSIS
+    The arm of a local GUI smoke from the `launch` block its own result recorded (environment AND arguments). A result with no launch block, no environment or no argument list is UNKNOWN: the
+    argument list can carry --stage-log, so an arm judged from the environment alone is not proof of LIGHT.
+    #>
+    param([AllowNull()]$Launch)
+    if ($null -eq $Launch -or $Launch -is [string] -or $Launch -is [System.ValueType]) { return New-FpsArm 'UNKNOWN' 'environment' 'no-launch-block-recorded' }
+    $hasEnv = if ($Launch -is [System.Collections.IDictionary]) { $Launch.Contains('environment') } else { $null -ne $Launch.PSObject.Properties['environment'] }
+    $hasArgs = if ($Launch -is [System.Collections.IDictionary]) { $Launch.Contains('arguments') } else { $null -ne $Launch.PSObject.Properties['arguments'] }
+    if (-not $hasEnv) { return New-FpsArm 'UNKNOWN' 'environment' 'no-environment-recorded' }
+    if (-not $hasArgs) { return New-FpsArm 'UNKNOWN' 'environment' 'no-arguments-recorded (the argument list can carry --stage-log)' }
+    $launchArgs = Get-FaProp $Launch 'arguments'
+    Get-FpsArmFromEnvironment -Environment (Get-FaProp $Launch 'environment') -Arguments @($launchArgs)
 }
 
 function Get-FpsPairVerdict {
@@ -185,8 +223,15 @@ function Get-FpsPairVerdict {
 function Get-FpsArmsVerdict {
     # The same rule over any number of named legs (a matrix, a plan): allowed only when every leg is LIGHT. Legs: array of [pscustomobject]@{ name; arm }.
     param([AllowNull()][object[]]$Legs)
-    $legs = @($Legs | Where-Object { $null -ne $_ })
-    $names = @($legs | ForEach-Object { [pscustomobject]@{ name = [string](Get-FaProp $_ 'name'); arm = (ConvertTo-FpsArmName (Get-FaProp $_ 'arm')) } })
+    # A $null entry is a leg whose arm nobody supplied: UNKNOWN, never dropped (adversary A7).
+    $names = @()
+    if ($null -ne $Legs) {
+        for ($i = 0; $i -lt $Legs.Count; $i++) {
+            $leg = $Legs[$i]
+            $n = if ($null -eq $leg) { '' } else { [string](Get-FaProp $leg 'name') }
+            $names += [pscustomobject]@{ name = $(if ($n) { $n } else { "leg-$($i + 1)" }); arm = $(if ($null -eq $leg) { 'UNKNOWN' } else { ConvertTo-FpsArmName (Get-FaProp $leg 'arm') }) }
+        }
+    }
     if ($names.Count -eq 0) {
         return [pscustomobject]@{ allowed = $false; reason = $script:FpsArmUnknownReason; detail = 'no legs'; heavy = @(); unknown = @(); stageMetricsAllowed = $true }
     }
@@ -214,7 +259,14 @@ function Get-FpsLegPlanRefusal {
         return @('BAD_PURPOSE', 0, "purpose must be 'fps-ab' or 'stage-attribution'")
     }
     if ($Purpose -cne 'fps-ab') { return @('', 0, '') }
-    $arms = @($Items | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ item = [int](Get-FaProp $_ 'item'); arm = (ConvertTo-FpsArmName (Get-FaProp $_ 'arm')) } })
+    # A $null item is an item whose arm nobody supplied: UNKNOWN at its position, never dropped (adversary A7).
+    $arms = @()
+    if ($null -ne $Items) {
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $it = $Items[$i]
+            $arms += [pscustomobject]@{ item = $(if ($null -eq $it) { $i + 1 } else { [int](Get-FaProp $it 'item') }); arm = $(if ($null -eq $it) { 'UNKNOWN' } else { ConvertTo-FpsArmName (Get-FaProp $it 'arm') }) }
+        }
+    }
     $h = @($arms | Where-Object { $_.arm -ceq 'HEAVY' } | Select-Object -First 1)
     if ($h.Count -gt 0) { return @('FPS_AB_HEAVY_ARM', $h[0].item, "the plan is labelled an fps A/B ($($script:FpsArmHeavyReason)) but this leg runs the HEAVY telemetry arm; a HEAVY leg's fps measures the logger. Run it as purpose 'stage-attribution' or use a LIGHT spec") }
     $u = @($arms | Where-Object { $_.arm -ceq 'UNKNOWN' } | Select-Object -First 1)
@@ -222,4 +274,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, Test-FpsEnvFlagOn, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, Test-FpsEnvFlagOn, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal

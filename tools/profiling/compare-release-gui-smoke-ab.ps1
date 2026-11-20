@@ -459,15 +459,15 @@ function Get-HostLoadComparisonEvidence {
 
 function Get-FpsArmComparisonEvidence {
     # BENCH-LIGHT-ARM-GAIN-GATES-1: may the two smokes be compared on fps? Each smoke's arm is read from the launch environment its own result recorded
-    # (launch.environment); only LIGHT / LIGHT is allowed. A HEAVY leg (per-frame logging on), a mixed pair and a smoke that recorded no environment (UNKNOWN) are refused,
+    # (launch.environment and launch.arguments); only LIGHT / LIGHT is allowed. A HEAVY leg (per-frame logging on), a mixed pair and a smoke that recorded no environment (UNKNOWN) are refused,
     # typed. Not a verdict failure: the screenshot / colour comparison does not depend on the arm, so only the fps deltas are withheld (Hide-FpsComparisonDeltas).
     param(
         [object]$BeforeSmoke,
         [object]$AfterSmoke
     )
 
-    $beforeArm = Get-FpsArmFromEnvironment (Get-NestedValue $BeforeSmoke "launch.environment")
-    $afterArm = Get-FpsArmFromEnvironment (Get-NestedValue $AfterSmoke "launch.environment")
+    $beforeArm = Get-FpsArmFromLaunch (Get-NestedValue $BeforeSmoke "launch")
+    $afterArm = Get-FpsArmFromLaunch (Get-NestedValue $AfterSmoke "launch")
     $verdict = Get-FpsPairVerdict -Baseline $beforeArm -Candidate $afterArm -BaselineName "before" -CandidateName "after"
     [pscustomobject]@{
         refused = (-not $verdict.allowed)
