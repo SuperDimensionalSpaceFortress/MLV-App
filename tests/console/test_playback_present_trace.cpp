@@ -323,6 +323,92 @@ TEST(PlaybackPresentTraceStages, WithTheSwitchOffTheStageHooksAreNoOps)
     ASSERT_EQ(static_cast<size_t>(0), trace.capacity());
 }
 
+// adversary a7085920 A1: a frame that consumed the recon worker's output must report the WORKER's configure and H2D spans;
+// the frame JSON's unprefixed keys are the render thread's own last-run record and can belong to an older frame.
+TEST(PlaybackPresentTraceStages, AFrameThatConsumedTheWorkerReconReportsTheWorkersConfigureAndH2dSpans)
+{
+    playback_present_trace::StageStamps s = stagesFrom(1.0);
+    s.workerSplit = true;
+    s.configureMs = 6.1;
+    s.h2dMs = 0.4;
+    Row r;
+    r.configureMs = 99.0;   // what a stale render-thread JSON read would have left here
+    r.h2dMs = 5.0;
+    r.setStages(s);
+    ASSERT_NEAR(6.1, r.configureMs, 1e-9);
+    ASSERT_NEAR(0.4, r.h2dMs, 1e-9);
+}
+
+TEST(PlaybackPresentTraceStages, AWorkerFrameWhoseSpansWereNotCapturedReportsUnknownNeverAStaleValue)
+{
+    playback_present_trace::StageStamps s = stagesFrom(1.0);
+    s.workerSplit = true;   // the worker ran the recon but took no configure/H2D span
+    Row r;
+    r.configureMs = 99.0;
+    r.h2dMs = 5.0;
+    r.setStages(s);
+    ASSERT_NEAR(playback_present_trace::kUnknownMs, r.configureMs, 0.0);
+    ASSERT_NEAR(playback_present_trace::kUnknownMs, r.h2dMs, 0.0);
+}
+
+// adversary a7085920 A2: a request stamped 0.5 ms and a queue stamped exactly 1 ms BEFORE the Play's start (-0.5, -1.0) run
+// backwards; the old shared "t == -1.0 is unknown" skip hid the second one and reported stage_ok=1.
+TEST(PlaybackPresentTraceStages, ARealMinusOneMsStampStillTakesPartInTheOrderCheck)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    playback_present_trace::StageStamps s;
+    s.requestS = 0.9995;      // -0.5 ms
+    s.decodeQueueS = 0.999;   // -1.0 ms: before the request
+    Row r;
+    r.setStages(s);
+    r.presentMs = 1001.0;
+    trace.notePresent(r);
+    ASSERT_FALSE(trace.row(0).stagesOrdered());
+    // an unknown ready time (-1) is still skipped, not mistaken for a stamp
+    Row ok;
+    ok.setStages(stagesFrom(1.0));
+    ok.readyMs = -1.0;
+    ok.presentMs = 1040.0;
+    trace.notePresent(ok);
+    ASSERT_TRUE(trace.row(1).stagesOrdered());
+}
+
+TEST(PlaybackPresentTraceStages, AFrameThatRanItsOwnReconLeavesTheSpansForTheFramesOwnTelemetry)
+{
+    playback_present_trace::StageStamps s = stagesFrom(1.0);   // workerSplit stays false
+    s.configureMs = 6.1;                                       // ignored: not this frame's recon
+    Row r;
+    r.configureMs = 2.5;   // the caller's read of the frame's own JSON
+    r.h2dMs = 0.7;
+    r.setStages(s);
+    ASSERT_NEAR(2.5, r.configureMs, 1e-9);
+    ASSERT_NEAR(0.7, r.h2dMs, 1e-9);
+}
+
+TEST(PlaybackPresentTraceWiring, TheWorkersSpansAreCapturedOnItsOwnThreadAndMarkTheFrameWhenItsReconIsConsumed)
+{
+    const QString render = sourceOf(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    // the recon worker reads the spans it has just written into its own slot, only when the trace is on
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "        if( playback_present_trace::stampsEnabled() )\n"
+        "        {\n"
+        "            const auto configureIt = slot.stageTimingTelemetry.constFind( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") );\n"
+        "            if( configureIt != slot.stageTimingTelemetry.constEnd() )\n"
+        "                slot.traceStamps.configureMs = configureIt.value().toDouble();\n"
+        "            const auto h2dIt = slot.stageTimingTelemetry.constFind( QStringLiteral(\"gpu_playback_recon_async_h2d_upload_ms\") );\n"
+        "            if( h2dIt != slot.stageTimingTelemetry.constEnd() )\n"
+        "                slot.traceStamps.h2dMs = h2dIt.value().toDouble();\n"
+        "        }\n")));
+    // the render thread marks the frame only when it CONSUMED that recon (the same gate as copyWorkerSplit)
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "    if( renderConsumedWorkerRecon )\n"
+        "    {\n"
+        "        // PLAYBACK-TRACE-LOWOVERHEAD-1: the present trace reads the worker's configure/H2D spans for this frame\n"
+        "        slot.traceStamps.workerSplit = true;\n")));
+}
+
 TEST(PlaybackPresentTraceWiring, EveryStageHookIsOneGuardedStoreOnAKnownThread)
 {
     const QString render = sourceOf(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
@@ -363,14 +449,17 @@ TEST(PlaybackPresentTraceWiring, TheWindowSwitchesTheStageHooksWithTheRecorderAn
         "    playback_present_trace::setStampsEnabled( m_playbackPresentTrace.enabled() );\n")));
     // the GUI thread's draw-begin reuses display_start (already read), stored on the ReadyFrame
     ASSERT_EQ(1, source.count(QStringLiteral("    playback_present_trace::stamp( readyFrame.traceStamps.drawBeginS, display_start );\n")));
-    // the present row takes the stamps, and configure/H2D from the frame's own telemetry keys when they are there
+    // the present row takes the stamps; configure/H2D come from the frame's own telemetry keys ONLY when the frame ran its own
+    // recon (a frame that consumed the worker's recon carries the worker's spans in the stamps, and its JSON keys are stale)
     ASSERT_EQ(1, source.count(QStringLiteral("            traceRow.setStages( readyFrame.traceStamps );\n")));
     ASSERT_EQ(1, source.count(QStringLiteral(
-        "            if( timing.contains( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") ) )\n"
-        "                traceRow.configureMs = telemetryDoubleValue( timing, \"llrawproc_dual_iso_split_configure_ms\" );\n")));
-    ASSERT_EQ(1, source.count(QStringLiteral(
-        "            if( timing.contains( QStringLiteral(\"gpu_playback_recon_async_h2d_upload_ms\") ) )\n"
-        "                traceRow.h2dMs = telemetryDoubleValue( timing, \"gpu_playback_recon_async_h2d_upload_ms\" );\n")));
+        "            if( !readyFrame.traceStamps.workerSplit )\n"
+        "            {\n"
+        "                if( timing.contains( QStringLiteral(\"llrawproc_dual_iso_split_configure_ms\") ) )\n"
+        "                    traceRow.configureMs = telemetryDoubleValue( timing, \"llrawproc_dual_iso_split_configure_ms\" );\n"
+        "                if( timing.contains( QStringLiteral(\"gpu_playback_recon_async_h2d_upload_ms\") ) )\n"
+        "                    traceRow.h2dMs = telemetryDoubleValue( timing, \"gpu_playback_recon_async_h2d_upload_ms\" );\n"
+        "            }\n")));
     // the dump walks the ring oldest-first and says how many rows the ring overwrote
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.row( i )")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackPresentTrace.dropped()")));

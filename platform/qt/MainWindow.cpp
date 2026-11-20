@@ -28497,10 +28497,15 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             traceRow.creditFrames = m_playbackPaceGuard.creditFrames();
             // PLAYBACK-TRACE-LOWOVERHEAD-1 r1: the workers' stage stamps, plus configure and H2D from the frame's own keys
             traceRow.setStages( readyFrame.traceStamps );
-            if( timing.contains( QStringLiteral("llrawproc_dual_iso_split_configure_ms") ) )
-                traceRow.configureMs = telemetryDoubleValue( timing, "llrawproc_dual_iso_split_configure_ms" );
-            if( timing.contains( QStringLiteral("gpu_playback_recon_async_h2d_upload_ms") ) )
-                traceRow.h2dMs = telemetryDoubleValue( timing, "gpu_playback_recon_async_h2d_upload_ms" );
+            // a frame that consumed the recon worker's output carries the worker's spans in its stamps (setStages above);
+            // its JSON keys are the render thread's own last-run record and may belong to an older frame
+            if( !readyFrame.traceStamps.workerSplit )
+            {
+                if( timing.contains( QStringLiteral("llrawproc_dual_iso_split_configure_ms") ) )
+                    traceRow.configureMs = telemetryDoubleValue( timing, "llrawproc_dual_iso_split_configure_ms" );
+                if( timing.contains( QStringLiteral("gpu_playback_recon_async_h2d_upload_ms") ) )
+                    traceRow.h2dMs = telemetryDoubleValue( timing, "gpu_playback_recon_async_h2d_upload_ms" );
+            }
             m_playbackPresentTrace.notePresent( traceRow );
         }
         // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup split, only for a present a presenter ran.

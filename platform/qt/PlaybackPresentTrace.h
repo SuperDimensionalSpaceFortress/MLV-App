@@ -42,6 +42,13 @@ struct StageStamps
     double reconEndS = 0.0;     // recon worker finished
     double renderStartS = 0.0;  // render thread began this frame
     double drawBeginS = 0.0;    // the GUI thread began drawing it (drawFrameReady's display start)
+    // The recon WORKER's own dual-ISO configure and async-H2D upload spans, in ms (durations, not stamps; kUnknownMs = not
+    // taken). The worker takes them on its own thread from the slot telemetry it has just written. They matter only when the
+    // render thread CONSUMED that recon (workerSplit): then the frame JSON's unprefixed keys are the render thread's own
+    // last-run record and can describe an older frame (adversary a7085920 A1), so the present uses these instead.
+    double configureMs = kUnknownMs;
+    double h2dMs = kUnknownMs;
+    bool workerSplit = false;   // set by the render thread when it consumed the worker's recon for this frame
 };
 
 /*! The process-wide switch for the stage hooks (MLVAPP_PLAYBACK_PRESENT_TRACE, set by the window next to the recorder's own
@@ -110,17 +117,27 @@ struct Row
         reMs = ms( s.reconEndS );
         rndMs = ms( s.renderStartS );
         drawBeginMs = ms( s.drawBeginS );
+        // A frame that consumed the worker's recon takes the worker's spans (unknown when it took none, never a stale
+        // value); any other frame keeps what the caller read from the frame's own telemetry.
+        if( s.workerSplit )
+        {
+            configureMs = s.configureMs;
+            h2dMs = s.h2dMs;
+        }
     }
 
     /*! True when the stamps that are known never run backwards along request .. present (1 = ordered). */
     bool stagesOrdered() const
     {
-        const double chain[] = { reqMs, dqMs, dsMs, deMs, rsMs, reMs, rndMs, readyMs, drawBeginMs, presentMs };
+        // readyMs alone uses -1 for unknown; every other stamp is unknown only at kUnknownMs, so a real rebased -1 ms stamp
+        // still takes part (adversary a7085920 A2)
+        const double ready = readyMs == -1.0 ? kUnknownMs : readyMs;
+        const double chain[] = { reqMs, dqMs, dsMs, deMs, rsMs, reMs, rndMs, ready, drawBeginMs, presentMs };
         double last = kUnknownMs;
         for( double t : chain )
         {
-            // readyMs uses -1 for unknown; a real rebased stamp is never below -1e8
-            if( t <= kUnknownMs / 2.0 || t == -1.0 ) continue;
+            // a real rebased stamp is never below -1e8
+            if( t <= kUnknownMs / 2.0 ) continue;
             if( t < last ) return false;
             last = t;
         }
