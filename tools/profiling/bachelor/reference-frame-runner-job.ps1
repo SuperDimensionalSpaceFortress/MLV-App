@@ -355,6 +355,7 @@ $reconDeclaration = ''
 $reconResultParameter = ''
 $reconEvidenceCheck = ''
 $reconResultEvidence = ''
+$reconPublish = ''
 # today's line, verbatim: the profile's quality mode is the only -ExtraEnv entry
 $captureExtraEnv = @'
 if ($QualityMode -ne '') { $captureCommand += " -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }" }
@@ -363,6 +364,8 @@ if ($GpuPlaybackRecon -ceq 'on') {
     $reconDeclaration = "`$GpuPlaybackRecon = 'on'`r`n"
     $reconResultParameter = '; gpuPlaybackRecon = $GpuPlaybackRecon'
     $reconResultEvidence = "`r`n    gpuReconEvidence = `$reconEvidence"
+    # appended to the line that initialises the three published invalidation fields to null, so the 228 path's outcomes (not null) reach result.json
+    $reconPublish = "`r`n`$candidateInvalidated = `$reconInvalidated; `$candidateInvalidMarker = `$reconInvalidMarker; `$candidateQuarantined = `$reconQuarantined"
     # Placed after the capture's exit code is final and before the view check: a capture that exited 0 is a candidate only if the app's counters
     # show the GPU recon ran. The proof binds the gpu_summary to the SAME session as the last playback_smoke.summary (the one the capture's own receipt
     # oracle reads) and reads every counter as a plain decimal, so an absent, empty, hex or null counter is unproven, never zero.
@@ -420,33 +423,54 @@ if ($captureRc -eq 0) {
     }
 }
 if ($reconEvidence.ok) { $StepLog['reconEvidence'] = 0 }
+# What the voiding did, in the 225 path's own shape (null = there was nothing to do, false = that layer failed, true = it landed). These cannot be the
+# published candidateInvalidated / candidateInvalidMarker / candidateQuarantined themselves: the template initialises those after this block, so the
+# values are carried across and copied in at that initialisation (GPU_RECON_PUBLISH).
+$reconInvalidated = $null
+$reconInvalidMarker = $null
+$reconQuarantined = $null
 if ($reconEvidence.checked -and -not $reconEvidence.ok) {
     # not proven: step reconEvidence, exit 228. The manifest the capture wrote still calls itself a candidate, so it is voided the way the 225 path voids one:
     # a sibling marker first (a reader honours it whatever the manifest says), then the stamp in place, and only if neither lands the manifest is moved.
     $StepLog['reconEvidence'] = 228
     $reconInvalidReasons = @("GPU_RECON_NOT_PROVEN $($reconEvidence.reason)", 'reference-frame-runner step reconEvidence exit 228')
+    if (-not $viewsIntactAfterCapture) {
+        # the footage view changed during the same capture: 228 keeps the exit code (the first failing step), but the cause is not lost, it is recorded as the 225 path records it
+        $StepLog['footageViewIntact'] = 225
+        $reconInvalidReasons = @('OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE') + $reconInvalidReasons
+    }
     $reconManifestPath = Join-Path $captureOut 'reference-frame-candidate.json'
-    $reconMarkerWritten = $false
-    $reconStampWritten = $false
+    $reconInvalidMarker = $false
     try {
         [void](Publish-AttrCudaText -Path (Join-Path $captureOut 'reference-frame-candidate.invalid') -Value ([ordered]@{ schema = 'mlvapp.reference-frame-candidate-invalid.v1'; invalid = $true; invalid_reasons = $reconInvalidReasons } | ConvertTo-Json -Depth 4))
-        $reconMarkerWritten = $true
+        $reconInvalidMarker = $true
     } catch {
         Say "CANDIDATE_MARKER_NOT_WRITTEN $($_.Exception.Message)"
     }
     if (Test-Path -LiteralPath $reconManifestPath -PathType Leaf) {
+        $reconInvalidated = $false
         try {
             $reconDoc = [IO.File]::ReadAllText($reconManifestPath) | ConvertFrom-Json
             $reconDoc | Add-Member -NotePropertyName status -NotePropertyValue 'invalid' -Force
             $reconDoc | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
             $reconDoc | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue $reconInvalidReasons -Force
             [void](Publish-AttrCudaText -Path $reconManifestPath -Value ($reconDoc | ConvertTo-Json -Depth 64))
-            $reconStampWritten = $true
+            $reconInvalidated = $true
         } catch {
             Say "CANDIDATE_NOT_INVALIDATED $($_.Exception.Message)"
         }
-        if (-not $reconMarkerWritten -and -not $reconStampWritten) {
-            try { Move-Item -LiteralPath $reconManifestPath -Destination (Join-Path $captureOut 'reference-frame-candidate.INVALID.json') -ErrorAction Stop } catch { Say "CANDIDATE_NOT_QUARANTINED $($_.Exception.Message)" }
+        if (-not $reconInvalidated -and -not $reconInvalidMarker) {
+            $reconQuarantined = $false
+            try {
+                # numbered the way the 225 path numbers its target (.INVALID.json, then .INVALID.1.json ...): an occupied target is never overwritten and never makes the move throw
+                $reconQuarantineTarget = Join-Path $captureOut 'reference-frame-candidate.INVALID.json'
+                $reconQuarantineCounter = 1
+                while (Test-Path -LiteralPath $reconQuarantineTarget) { $reconQuarantineTarget = Join-Path $captureOut "reference-frame-candidate.INVALID.$reconQuarantineCounter.json"; $reconQuarantineCounter++ }
+                Move-Item -LiteralPath $reconManifestPath -Destination $reconQuarantineTarget -ErrorAction Stop
+                $reconQuarantined = $true
+            } catch {
+                Say "CANDIDATE_NOT_QUARANTINED $($_.Exception.Message)"
+            }
         }
     }
     $captureRc = 228
@@ -772,7 +796,7 @@ $candidateSha256 = if ($candidateOk -and (Test-Path -LiteralPath $candidatePath)
 $candidateMarkerPath = Join-Path $captureOut 'reference-frame-candidate.invalid'
 $candidateInvalidated = $null
 $candidateInvalidMarker = $null
-$candidateQuarantined = $null
+$candidateQuarantined = $null__GPU_RECON_PUBLISH__
 if ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
     $candidateInvalidated = $false
     $candidateInvalidMarker = $false
@@ -860,6 +884,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     GPU_RECON_RESULT_PARAMETER = $reconResultParameter
     GPU_RECON_EVIDENCE_CHECK = $reconEvidenceCheck
     GPU_RECON_RESULT_EVIDENCE = $reconResultEvidence
+    GPU_RECON_PUBLISH = $reconPublish
     SECONDS = [string]$Seconds
     PRESENTED_FRAMES = [string]$PresentedFrames
     EXE_NAME = $names.exeName

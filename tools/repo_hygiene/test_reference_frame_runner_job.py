@@ -435,6 +435,7 @@ class GeneratorTests(_GeneratorCase):
         for seam in ("$DisableLookAssist = $true\n$Seconds = 30\n",
                      "$captureCommand += \" -PresentedFrames $PresentedFrames\" }\n        if ($QualityMode -ne '') { $captureCommand += \" -ExtraEnv @{ MLVAPP_PLAYBACK_QUALITY_MODE = '$QualityMode' }\" }\n        # FAIL CLOSED",
                      "if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }\n$viewsChanged = ($captureRc -eq 0 -and -not $viewsIntactAfterCapture)\n",
+                     "$candidateInvalidMarker = $null\n$candidateQuarantined = $null\nif ($viewsChanged -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {\n",
                      "captureParameters = [ordered]@{ seconds = $Seconds; presentedFrames = $PresentedFrames }\n",
                      "footageView = [ordered]@{ mode = $ownerViewMode; intactAfterCapture = $viewsIntactAfterCapture }\n    stagedOnHost = "):
             with self.subTest(seam=seam[:60]):
@@ -800,6 +801,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertTrue((pub / "capture" / "reference-frame-candidate.invalid").is_file())
         manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
         self.assertEqual((manifest["status"], manifest["invalid"]), ("invalid", True))
+        # adversary pass 4 A1: result.json says what the voiding did, the way the 225 path says it (marker landed, stamp landed, nothing quarantined)
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (True, True, None))
 
     def test_a_recon_on_capture_that_ran_any_frame_on_the_cpu_is_not_a_candidate(self) -> None:
         # the adversary's input: MLVAPP_GPU_FAULT_INJECT in the venue's environment suppresses CUDA and the rest of the capture plays on the CPU
@@ -839,6 +842,96 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         # the adversary's input: the real record says 480 CPU frames; a LATER record (overlap_summary) carries a build path that spells a whole gpu_summary
         later = f"{self.APP_LOG_PREFIX}playback_smoke.overlap_summary session=0 frames=480 (C:/b {self.FORGED_GPU_SUMMARY}/platform/qt/MainWindow.cpp:1)\n"
         self.assert_recon_not_proven("recon-forged-later-record", self.gpu_summary_line(cpu=480, recon=0) + later, "CPU_FRAMES_NONZERO")
+
+    # --- adversary A1 on c30fba42 (pass 4, introduced major): the 228 voiding path publishes the same three fields the 225 path does -----------------
+    # The injections below are the 225 tests' (VIEW_CHANGED family), re-anchored on the recon block's own lines.
+    RECON_MANIFEST_ANCHOR = "$reconManifestPath = Join-Path $captureOut 'reference-frame-candidate.json'"
+    RECON_STAMP_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path $reconManifestPath -Value ($reconDoc | ConvertTo-Json -Depth 64))",
+                                 "throw 'INJECTED_CANDIDATE_PUBLISH_FAILURE'")
+    RECON_MARKER_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path (Join-Path $captureOut 'reference-frame-candidate.invalid') ",
+                                  "throw 'INJECTED_MARKER_PUBLISH_FAILURE'; [void](Publish-AttrCudaText -Path (Join-Path $captureOut 'reference-frame-candidate.invalid') ")
+    RECON_MOVE_FAILS = ("Move-Item -LiteralPath $reconManifestPath -Destination ",
+                        "throw 'INJECTED_QUARANTINE_RENAME_FAILURE'; Move-Item -LiteralPath $reconManifestPath -Destination ")
+    RECON_STAMP_UNPARSEABLE = (RECON_MANIFEST_ANCHOR, RECON_MANIFEST_ANCHOR + "; [IO.File]::WriteAllText($reconManifestPath, '{\"status\": \"candidate-unreviewed\", \"truncated')")
+    RECON_MANIFEST_ABSENT = (RECON_MANIFEST_ANCHOR, RECON_MANIFEST_ANCHOR + "; Remove-Item -LiteralPath $reconManifestPath -Force")
+
+    def run_recon_voided(self, name: str, *edits: tuple[str, str]) -> tuple[subprocess.CompletedProcess, Path]:
+        """An 'on' capture whose app log shows CPU frames (so the job exits 228), with injected failures in the voiding layers."""
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=480, recon=0),
+                                                 edit=edits[0] if edits else None, more_edits=tuple(edits[1:]))
+        self.assertEqual(ran.returncode, 228, ran.stdout + ran.stderr)
+        return ran, pub
+
+    def assert_voided_publishes(self, pub: Path, expected: tuple, *, candidate_indexed: bool = False) -> dict:
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 228, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), expected)
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {}, "frame_provenance still indexes the voided capture")
+        return result
+
+    def test_a_voided_recon_capture_whose_marker_and_stamp_both_land_publishes_both_as_true(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-both")
+        self.assert_voided_publishes(pub, (True, True, None))
+
+    def test_a_voided_recon_capture_whose_stamp_fails_publishes_the_stamp_as_false_and_the_marker_as_true(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-stampfails", self.RECON_STAMP_PUBLISH_FAILS)
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_voided_publishes(pub, (False, True, None))
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["status"], "candidate-unreviewed", "the marker alone must be what stops a reader: this is the case it exists for")
+
+    def test_a_voided_recon_capture_whose_manifest_does_not_parse_publishes_the_stamp_as_false(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-unparseable", self.RECON_STAMP_UNPARSEABLE)
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_voided_publishes(pub, (False, True, None))
+
+    def test_a_voided_recon_capture_whose_marker_fails_publishes_the_marker_as_false_and_the_stamp_as_true(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-markerfails", self.RECON_MARKER_PUBLISH_FAILS)
+        self.assertIn("CANDIDATE_MARKER_NOT_WRITTEN", ran.stdout)
+        self.assert_voided_publishes(pub, (True, False, None))
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+
+    def test_a_voided_recon_capture_whose_marker_and_stamp_both_fail_is_quarantined_and_publishes_it(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-quarantine", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS)
+        self.assert_voided_publishes(pub, (False, False, True))
+        capture = pub / "capture"
+        self.assertFalse((capture / "reference-frame-candidate.json").exists(), "the manifest still carries the candidate name")
+        self.assertIn("candidate-unreviewed", (capture / "reference-frame-candidate.INVALID.json").read_text(encoding="utf-8-sig"))
+
+    def test_a_voided_recon_capture_whose_quarantine_move_throws_publishes_the_quarantine_as_false(self) -> None:
+        ran, pub = self.run_recon_voided("recon-void-movefails", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS, self.RECON_MOVE_FAILS)
+        self.assertIn("CANDIDATE_NOT_QUARANTINED", ran.stdout)
+        self.assertIn("INJECTED_QUARANTINE_RENAME_FAILURE", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, False))
+        self.assertTrue((pub / "capture" / "reference-frame-candidate.json").is_file(), "the failed move must leave the manifest as the capture wrote it")
+        self.assertEqual(sorted(p.name for p in (pub / "capture").glob("*INVALID*")), [])
+
+    def test_a_voided_recon_capture_numbers_an_occupied_quarantine_target_the_way_the_225_path_does(self) -> None:
+        # the sweep's row 7: the 225 path numbers .INVALID.json, .INVALID.1.json ...; a fixed name makes the move throw and leaves the candidate name in place
+        plant = (self.RECON_MANIFEST_ANCHOR, self.RECON_MANIFEST_ANCHOR + "; [IO.File]::WriteAllText((Join-Path $captureOut 'reference-frame-candidate.INVALID.json'), 'earlier-run')")
+        ran, pub = self.run_recon_voided("recon-void-occupied", plant, self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS)
+        self.assertNotIn("CANDIDATE_NOT_QUARANTINED", ran.stdout, "the quarantine rename threw on an occupied target")
+        self.assert_voided_publishes(pub, (False, False, True))
+        capture = pub / "capture"
+        self.assertEqual((capture / "reference-frame-candidate.INVALID.json").read_text(encoding="utf-8-sig"), "earlier-run", "an earlier quarantine was overwritten")
+        self.assertIn("candidate-unreviewed", (capture / "reference-frame-candidate.INVALID.1.json").read_text(encoding="utf-8-sig"))
+
+    def test_a_voided_recon_capture_with_no_manifest_publishes_only_the_marker(self) -> None:
+        # nothing to stamp or quarantine (null, as in the 225 path), but the marker is still written by this path, so it is reported as landed
+        ran, pub = self.run_recon_voided("recon-void-nomanifest", self.RECON_MANIFEST_ABSENT)
+        self.assert_voided_publishes(pub, (None, True, None))
+
+    def test_a_voided_recon_capture_whose_view_also_changed_records_both_causes(self) -> None:
+        # the sweep's row 1: 228 wins the exit code, but the steps and the invalid reasons keep the view change, as the 225 path would have recorded it
+        ran, pub = self.run_recon_voided("recon-void-viewchanged", self.VIEW_CHANGED)
+        result = self.assert_voided_publishes(pub, (True, True, None))
+        self.assertEqual((result["steps"]["reconEvidence"], result["steps"]["footageViewIntact"]), (228, 225))
+        self.assertIs(result["footageView"]["intactAfterCapture"], False)
+        marker = json.loads((pub / "capture" / "reference-frame-candidate.invalid").read_text(encoding="utf-8-sig"))
+        self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", marker["invalid_reasons"])
+        self.assertTrue(any(reason.startswith("GPU_RECON_NOT_PROVEN") for reason in marker["invalid_reasons"]), marker)
 
     def test_a_recon_on_capture_with_the_real_counters_and_a_trailing_source_location_is_still_a_candidate(self) -> None:
         # the gate must not turn a harmless suffix into a false refusal: the location here carries no counter-shaped token
