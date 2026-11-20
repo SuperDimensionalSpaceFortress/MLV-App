@@ -92,6 +92,13 @@ TEST(FullscreenControlBarWiring, EventFilterRoutesTheBarBeforeTheViewerDoubleCli
     ASSERT_TRUE(input.contains(QStringLiteral("ui->actionNextFrame->trigger();")));
     ASSERT_TRUE(input.contains(QStringLiteral("ui->actionFullscreen->trigger();")));
     ASSERT_TRUE(input.contains(QStringLiteral("slider->setValue( slider->minimum() + fullscreen_bar::seekFrameAt(")));
+
+    // The full argument lists of both policy calls: the GL route claims only while the bar is shown (a hidden bar
+    // never swallows a viewer click), and the widget path, which only receives events on the bar, maps directly.
+    ASSERT_EQ(1, int(input.count(QStringLiteral(
+        "else if( !fullscreen_bar::route( &m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part, &action ) ) return false;"))));
+    ASSERT_EQ(1, int(input.count(QStringLiteral(
+        "if( fromWidget ) action = fullscreen_bar::onMouse( &m_fullscreenBarInput, event->type(), button, buttons, part );"))));
 }
 
 // C2: paintGL draws the bar on the line after the look label (before the capture readback), drawControlBar returns at
