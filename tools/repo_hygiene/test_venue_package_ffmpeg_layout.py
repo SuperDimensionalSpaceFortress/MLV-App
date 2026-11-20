@@ -456,11 +456,14 @@ class HelperBehaviourTests(unittest.TestCase):
             prelude
             + f"$m = Import-Module '{module}' -Force -PassThru\n"
             "$global:ffxListings = 0\n"
-            f"$table = {{ $global:ffxListings++; if ($global:ffxListings -eq 1) {{ {before} }} else {{ {after} }} }}\n"
+            "$global:ffxSec = @()\n"
+            # The listing's own time bound (seconds) the stop passes on each call is recorded in .listingSec.
+            f"$table = {{ $global:ffxListings++; $global:ffxSec += [string]$args[0]; if ($global:ffxListings -eq 1) {{ {before} }} else {{ {after} }} }}\n"
             f"$fake = [pscustomobject]@{{ Id = 4242{start} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name Kill -Value {{ {kill} }}\n"
             f"$fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ {wait} }}\n"
             "$r = & $m { param($p, $t) Stop-PinnedPayloadChild -Process $p -ProcessTable $t -ConfirmMs 1500 } $fake $table\n"
+            "$r | Add-Member -NotePropertyName listingSec -NotePropertyValue ($global:ffxSec -join ',')\n"
             "$r | ConvertTo-Json -Compress\n"
         )
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
@@ -580,6 +583,29 @@ class HelperBehaviourTests(unittest.TestCase):
         stop = self._stop("$null", "$true", before=f"@({root}, {child})", after=f"@({child})", root_start="2026-11-19T10:00:05Z")
         self.assertFalse(stop["confirmed"], stop)
         self.assertIn("5151 still running", stop["killError"])
+
+    def test_the_subtree_of_a_clock_stepped_child_is_tracked_after_that_child_exits(self) -> None:
+        # adversary d7942d7f-A1: after a backward clock step the root's child C (09:59:55Z) and its child G (09:59:56Z) read older than
+        # the root (10:00:05Z). Kill($true) misses C's subtree; C exits and G survives. G must still count, so the kill stays unconfirmed.
+        root = self._row(4242, 4, "2026-11-19T10:00:05Z")
+        c = self._row(5151, 4242, "2026-11-19T09:59:55Z")
+        g = self._row(6262, 5151, "2026-11-19T09:59:56Z")
+        stop = self._stop("$null", "$true", before=f"@({root}, {c}, {g})", after=f"@({g})", root_start="2026-11-19T10:00:05Z")
+        self.assertFalse(stop["confirmed"], stop)
+        self.assertIn("6262 still running", stop["killError"])
+
+    def test_a_tree_seen_gone_only_after_the_budget_is_not_confirmed_and_each_listing_is_bounded_by_it(self) -> None:
+        # adversary d7942d7f-A2: each listing is bounded by what is left of the ONE ConfirmMs budget (1500 ms here, so at most 2 s), and
+        # an empty listing that completes after the budget is spent cannot establish timely success.
+        root = self._row(4242, 1, "2026-11-19T10:00:00Z")
+        late = self._stop("$null", "$true", before=f"[System.Threading.Thread]::Sleep(900); @({root})",
+                          after="[System.Threading.Thread]::Sleep(900); @()")
+        self.assertFalse(late["confirmed"], late)
+        self.assertIn("budget", late["killError"])
+        bounds = [int(s) for s in late["listingSec"].split(",")]
+        self.assertTrue(bounds and all(1 <= s <= 2 for s in bounds), late)
+        prompt = self._stop("$null", "$true", before=f"@({root})", after="@()")
+        self.assertTrue(prompt["confirmed"], prompt)
 
     def test_a_creation_time_that_cannot_be_read_never_proves_anything(self) -> None:
         # r6 property 1: the root's creation time is read through its own handle; unreadable, the listing cannot prove its tree.
