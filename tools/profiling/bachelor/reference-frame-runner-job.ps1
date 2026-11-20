@@ -83,9 +83,10 @@
 # playback_smoke.gpu_summary for the SAME session as the final playback_smoke.summary shows cpu_frames == 0 and at least one frame on a recon
 # route (the rule playback-attr-3-cuda-job.ps1 applies to its speed legs). Anything else is step reconEvidence, exit 228: result.json says
 # capture-failed with gpuReconEvidence.reason, and the candidate manifest is voided (marker, then stamp, then move). Those layers are best effort, so
-# an 'on' job does not depend on them alone (key blocker B1): it captures into $Work\capture-staging, outside every outbox, and releases the capture into
-# <outbox>\<job>.artifacts\capture only when it is a proven candidate or is voided (a layer landed, or no manifest is left under the candidate name).
-# A capture it could not void is HELD in staging (result.json captureStaging.held), so an unproven capture is never indexable, whatever fails. 'off' emits NO recon text at all: the job text, the identity digest and result.json are byte-for-byte the
+# an 'on' job does not depend on them (key blocker B1): it captures into $Work\capture-staging, outside every outbox, and releases the capture into
+# <outbox>\<job>.artifacts\capture ONLY when it is a PROVEN candidate (r7: no voiding layer, alone or together, is a release ticket; a stamp-only void was the door).
+# Every other capture is HELD in staging (result.json captureStaging.held), so an unproven capture is never indexable, whatever fails. A proven capture's manifest is
+# rewritten while it is held so that artifact.path names the published image, and the directory is then published by one rename (key blocker B2). 'off' emits NO recon text at all: the job text, the identity digest and result.json are byte-for-byte the
 # ones this generator produced before the parameter existed (the template tokens below expand to nothing), so an absent key means off.
 #
 # NOT COVERED HERE (named, not hidden): no display wake and no PresentMon. If the venue's display is asleep the capture fails
@@ -389,27 +390,48 @@ if ($GpuPlaybackRecon -ceq 'on') {
     # an 'on' job emits it, so an 'off' job stays byte-identical to the base; the 225 path on an 'off' job is the base's and is not changed by this card.
     $reconObjectRoot = "`r`n        if (`$candidateDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'MANIFEST_ROOT_NOT_AN_OBJECT' }"
     $reconRelease = @'
-# GPU PLAYBACK RECON (r4, key blocker B1): the capture ran in $Work\capture-staging, outside every outbox, so it is not indexable by construction. It is
-# released into $Pub\capture only when a reader may see it: it is a candidate (the recon is proven and the views are intact), or it is voided (a layer
-# landed -- marker or stamp -- or no manifest is left under the candidate name). A capture the job could not void is HELD in staging: result.json
-# says so (captureStaging.held), the exit code is unchanged, and no best-effort write can fail open.
+# GPU PLAYBACK RECON (r4, key blocker B1; r7, key blockers B1 and B2): the capture ran in $Work\capture-staging, outside every outbox, so it is not indexable by
+# construction. It is released into $Pub\capture ONLY when it is a PROVEN candidate ($candidateOk: the capture exited 0, the recon is proven, the views are
+# intact). Every other capture is HELD in staging, whatever mix of marker, stamp and quarantine landed: those layers are best effort, and frame_provenance
+# reads a manifest it cannot open as "not stamped" and an absent, torn or status-less result.json as "not failed", so no voiding layer is a release ticket
+# (the r4 rule released on any one of them, and a transient first manifest read then indexed a voided capture). result.json says so (captureStaging.held),
+# and the exit code is unchanged.
+# The manifest the capture wrote names the STAGING image (artifact.path). A proven capture's manifest is therefore rewritten to name the image where it will be
+# published, WHILE the capture is still held (no reader can see staging), and the capture directory is then published by ONE rename: the manifest and the image
+# reach the outbox together, so a reader never meets a manifest naming an image the outbox does not hold. Any failure holds the capture and puts the manifest back.
 $captureMayPublish = $candidateOk
-if (-not $captureMayPublish) {
-    $captureMayPublish = (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) -or ($candidateInvalidMarker -eq $true) -or ($candidateInvalidated -eq $true) -or (Test-Path -LiteralPath $candidateMarkerPath -PathType Leaf)
-}
 $captureStaging = [ordered]@{ published = $false; held = (-not $captureMayPublish); where = "work\$JobId\capture-staging" }
 if ($captureMayPublish) {
+    $stagedManifestText = $null
     try {
-        Move-Item -LiteralPath $captureOut -Destination (Join-Path $Pub 'capture') -ErrorAction Stop
+        $stagedManifestText = [IO.File]::ReadAllText($candidatePath)
+        $publishedDoc = $stagedManifestText | ConvertFrom-Json
+        if ($publishedDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'PUBLISHED_MANIFEST_NOT_AN_OBJECT' }
+        $publishedCaptureDir = Join-Path $Pub 'capture'
+        $artifactLeaf = [IO.Path]::GetFileName([string]$publishedDoc.artifact.path)
+        if ([string]::IsNullOrEmpty($artifactLeaf) -or -not (Test-Path -LiteralPath (Join-Path $captureOut $artifactLeaf) -PathType Leaf)) { throw 'MANIFEST_ARTIFACT_NOT_IN_CAPTURE' }
+        $publishedDoc.artifact.path = Join-Path $publishedCaptureDir $artifactLeaf
+        # settings.appLog is the capture script's leaf name (still true beside the published image); a PATH-valued one gets the same treatment as artifact.path
+        if ($publishedDoc.settings.appLog -is [string] -and $publishedDoc.settings.appLog -match '[\\/]') {
+            $publishedDoc.settings.appLog = Join-Path $publishedCaptureDir ([IO.Path]::GetFileName($publishedDoc.settings.appLog))
+        }
+        [void](Publish-AttrCudaText -Path $candidatePath -Value ($publishedDoc | ConvertTo-Json -Depth 64))
+        # result.json names the manifest as it is published
+        $candidateSha256 = Get-ShaLower $candidatePath
+        Move-Item -LiteralPath $captureOut -Destination $publishedCaptureDir -ErrorAction Stop
         $captureStaging.published = $true
     } catch {
         $captureStaging.held = $true
         Say "CAPTURE_NOT_PUBLISHED $($_.Exception.Message)"
+        # the held manifest must not name an image that was never published: put back the text the capture wrote
+        if ($null -ne $stagedManifestText -and (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+            try { [IO.File]::WriteAllText($candidatePath, $stagedManifestText) } catch { Say "HELD_MANIFEST_NOT_RESTORED $($_.Exception.Message)" }
+        }
         # a proven candidate that cannot be released is a typed failure (223), never a published candidate and never a silent success
-        if ($candidateOk) { Complete-Failed 223 'publishResult' "GPU_RECON_CAPTURE_NOT_PUBLISHED $($_.Exception.Message)" }
+        Complete-Failed 223 'publishResult' "GPU_RECON_CAPTURE_NOT_PUBLISHED $($_.Exception.Message)"
     }
 }
-if ($captureStaging.held) { Say "CAPTURE_HELD_IN_STAGING the capture could not be voided and stays under work\$JobId\capture-staging" }
+if ($captureStaging.held) { Say "CAPTURE_HELD_IN_STAGING the capture is not a proven candidate (or could not be released) and stays under work\$JobId\capture-staging" }
 '@ + "`r`n"
     # appended to the line that initialises the three published invalidation fields to null, so the 228 path's outcomes (not null) reach result.json
     $reconPublish = "`r`n`$candidateInvalidated = `$reconInvalidated; `$candidateInvalidMarker = `$reconInvalidMarker; `$candidateQuarantined = `$reconQuarantined"

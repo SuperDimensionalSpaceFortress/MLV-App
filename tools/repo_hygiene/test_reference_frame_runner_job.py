@@ -871,6 +871,10 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIn("MLVAPP_GPU_PLAYBACK_RECON", applied)
         self.assertIn("MLVAPP_PLAYBACK_QUALITY_MODE", applied, "the profile's quality mode was lost when the recon env joined it")
 
+    def held_capture_dir(self) -> Path:
+        """Where an 'on' job holds a capture it did not release: <agent>\\work\\<job>\\capture-staging."""
+        return next((self.agent / "work").glob("reference-frame-*")) / "capture-staging"
+
     # --- adversary A1 on 4cb84958: 'on' REQUESTS the GPU recon, so the job accepts the capture only when the app's own counters show it ran ----------
     def assert_recon_not_proven(self, name: str, log_extra: str, reason_token: str) -> None:
         ran, pub, _part, _sha, _args, _marker = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=log_extra)
@@ -883,9 +887,13 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertEqual(result["steps"]["reconEvidence"], 228)
         self.assertIs(result["gpuReconEvidence"]["ok"], False)
         self.assertIn(reason_token, result["gpuReconEvidence"]["reason"])
-        # the manifest the capture wrote still calls itself a candidate, so it is voided: the marker a reader honours, and the stamp in place
-        self.assertTrue((pub / "capture" / "reference-frame-candidate.invalid").is_file())
-        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        # the manifest the capture wrote still calls itself a candidate, so it is voided: the marker a reader honours, and the stamp in place.
+        # r7: and the capture is HELD in staging, never released into the outbox, whatever landed (the voiding layers are best effort)
+        held = self.held_capture_dir()
+        self.assertFalse((pub / "capture").exists(), "an unproven capture was released into the outbox")
+        self.assertIs(result["captureStaging"]["held"], True)
+        self.assertTrue((held / "reference-frame-candidate.invalid").is_file())
+        manifest = json.loads((held / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
         self.assertEqual((manifest["status"], manifest["invalid"]), ("invalid", True))
         # adversary pass 4 A1: result.json says what the voiding did, the way the 225 path says it (marker landed, stamp landed, nothing quarantined)
         self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (True, True, None))
@@ -954,6 +962,10 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIsNone(result["candidateSha256"])
         self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), expected)
         self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {}, "frame_provenance still indexes the voided capture")
+        # r7: a voided capture is held in staging whatever mix of marker and stamp landed, never released into the outbox
+        self.assertFalse((pub / "capture").exists(), "a voided capture was released into the outbox")
+        self.assertIs(result["captureStaging"]["held"], True)
+        self.assertTrue((self.held_capture_dir() / "reference-frame.png").is_file(), "the held capture is not in staging")
         return result
 
     def test_a_voided_recon_capture_whose_marker_and_stamp_both_land_publishes_both_as_true(self) -> None:
@@ -964,8 +976,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         ran, pub = self.run_recon_voided("recon-void-stampfails", self.RECON_STAMP_PUBLISH_FAILS)
         self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
         self.assert_voided_publishes(pub, (False, True, None))
-        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
-        self.assertEqual(manifest["status"], "candidate-unreviewed", "the marker alone must be what stops a reader: this is the case it exists for")
+        manifest = json.loads((self.held_capture_dir() / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["status"], "candidate-unreviewed", "the marker alone is all the stamp-less manifest carries: the capture is held, so no reader meets it")
 
     def test_a_voided_recon_capture_whose_manifest_does_not_parse_publishes_the_stamp_as_false(self) -> None:
         ran, pub = self.run_recon_voided("recon-void-unparseable", self.RECON_STAMP_UNPARSEABLE)
@@ -976,12 +988,12 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         ran, pub = self.run_recon_voided("recon-void-markerfails", self.RECON_MARKER_PUBLISH_FAILS)
         self.assertIn("CANDIDATE_MARKER_NOT_WRITTEN", ran.stdout)
         self.assert_voided_publishes(pub, (True, False, None))
-        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+        self.assertFalse((self.held_capture_dir() / "reference-frame-candidate.invalid").exists())
 
     def test_a_voided_recon_capture_whose_marker_and_stamp_both_fail_is_quarantined_and_publishes_it(self) -> None:
         ran, pub = self.run_recon_voided("recon-void-quarantine", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS)
         self.assert_voided_publishes(pub, (False, False, True))
-        capture = pub / "capture"
+        capture = self.held_capture_dir()
         self.assertFalse((capture / "reference-frame-candidate.json").exists(), "the manifest still carries the candidate name")
         self.assertIn("candidate-unreviewed", (capture / "reference-frame-candidate.INVALID.json").read_text(encoding="utf-8-sig"))
 
@@ -1004,7 +1016,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         ran, pub = self.run_recon_voided("recon-void-occupied", plant, self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS)
         self.assertNotIn("CANDIDATE_NOT_QUARANTINED", ran.stdout, "the quarantine rename threw on an occupied target")
         self.assert_voided_publishes(pub, (False, False, True))
-        capture = pub / "capture"
+        capture = self.held_capture_dir()
         self.assertEqual((capture / "reference-frame-candidate.INVALID.json").read_text(encoding="utf-8-sig"), "earlier-run", "an earlier quarantine was overwritten")
         self.assertIn("candidate-unreviewed", (capture / "reference-frame-candidate.INVALID.1.json").read_text(encoding="utf-8-sig"))
 
@@ -1019,7 +1031,7 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         result = self.assert_voided_publishes(pub, (True, True, None))
         self.assertEqual((result["steps"]["reconEvidence"], result["steps"]["footageViewIntact"]), (228, 225))
         self.assertIs(result["footageView"]["intactAfterCapture"], False)
-        marker = json.loads((pub / "capture" / "reference-frame-candidate.invalid").read_text(encoding="utf-8-sig"))
+        marker = json.loads((self.held_capture_dir() / "reference-frame-candidate.invalid").read_text(encoding="utf-8-sig"))
         self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", marker["invalid_reasons"])
         self.assertTrue(any(reason.startswith("GPU_RECON_NOT_PROVEN") for reason in marker["invalid_reasons"]), marker)
 
@@ -1134,6 +1146,170 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=publishResult EXIT=223", ran.stdout)
         self.assertIn("INJECTED_RELEASE_FAILURE", ran.stdout)
         self.assert_no_candidate_anywhere_in_the_outbox()
+
+    # --- r7 (key blockers B1 and B2 on 66e7595f; sol r6, opus r6) ---------------------------------------------------------------------------------
+    # B1: r4 released a voided capture when ANY voiding layer landed. The stamp alone is not a release ticket: frame_provenance reads a manifest it cannot
+    # open as "not stamped" and an absent / torn / status-less parent result as "not failed", so a first manifest read that fails transiently (a sharing
+    # violation, an SMB hiccup) indexes a capture the job had voided, and build() then counts it as matched. The 'on' job releases into the outbox ONLY a
+    # proven candidate; every other capture is HELD in staging whatever mix of marker, stamp and quarantine landed.
+    def flaky_first_manifest_read(self):
+        """frame_provenance whose first open of a candidate manifest raises PermissionError (the lock clears before the second read)."""
+        fp = self._frame_provenance()
+        real_open = open
+        state = {"failed": False}
+
+        def flaky_open(path, *args, **kwargs):
+            if not state["failed"] and str(path).endswith("reference-frame-candidate.json"):
+                state["failed"] = True
+                raise PermissionError(13, "INJECTED_SHARING_VIOLATION", str(path))
+            return real_open(path, *args, **kwargs)
+
+        fp.open = flaky_open
+        return fp
+
+    def assert_held_and_never_indexed_or_counted(self, name: str, pub: Path) -> None:
+        self.assertFalse((pub / "capture").exists(), "a capture that was not proven was released into the outbox")
+        self.assertTrue((self.held_capture_dir() / "reference-frame.png").is_file(), "the held capture is not in staging")
+        frames = self.tmp / f"frames-{name}"
+        frames.mkdir()
+        (frames / "frame.png").write_bytes(b"\0" * 65536)   # the stand-in app's grab: the exact bytes of the capture's image
+        report = self.flaky_first_manifest_read().build(str(frames), str(self.agent / "outbox"))
+        self.assertEqual((report["recordsIndexed"], report["matched"]), (0, 0), "frame_provenance indexed or counted a capture that was not proven")
+
+    def run_recon_unproven(self, name: str, *edits: tuple[str, str], cpu: int = 480, recon: int = 0) -> tuple[subprocess.CompletedProcess, Path]:
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(cpu=cpu, recon=recon),
+                                                 edit=edits[0] if edits else None, more_edits=tuple(edits[1:]))
+        return ran, pub
+
+    def test_b1_held_never_indexed_stamp_only_result_absent(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-absent", self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertFalse((pub / "result.json").exists(), "fixture is stale: the parent result was meant to be absent")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-absent", pub)
+
+    def test_b1_held_never_indexed_stamp_only_result_torn(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-torn", self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_TORN)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        with self.assertRaises(ValueError):
+            json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assert_held_and_never_indexed_or_counted("r7-b1-torn", pub)
+
+    def test_b1_held_never_indexed_stamp_only_result_status_less(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-fallback", self.RECON_MARKER_PUBLISH_FAILS, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        fallback = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((fallback["failedStep"], fallback.get("status")), ("publishResult", None), "fixture is stale: expected the status-less fallback")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-fallback", pub)
+
+    def test_b1_held_never_indexed_twin_marker_only(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-twin-marker", self.RECON_STAMP_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertTrue((self.held_capture_dir() / "reference-frame-candidate.invalid").is_file(), "fixture is stale: the marker was meant to land")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-twin-marker", pub)
+
+    def test_b1_held_never_indexed_twin_both_fail_quarantined(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-twin-both-fail", self.RECON_STAMP_PUBLISH_FAILS, self.RECON_MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN,
+                                           self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertTrue((self.held_capture_dir() / "reference-frame-candidate.INVALID.json").is_file(), "fixture is stale: the quarantine was meant to land")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-twin-both-fail", pub)
+
+    def test_b1_held_never_indexed_twin_both_landed(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-twin-both-land", self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertTrue((self.held_capture_dir() / "reference-frame-candidate.invalid").is_file(), "fixture is stale: the marker was meant to land")
+        self.assert_held_and_never_indexed_or_counted("r7-b1-twin-both-land", pub)
+
+    def test_b1_held_never_indexed_the_225_door(self) -> None:
+        # opus r6's second door: counters are fine (the recon is proven), a footage view changed, the marker fails, the stamp lands, the result is gone
+        ran, pub = self.run_recon_unproven("r7-b1-225", self.VIEW_CHANGED, self.MARKER_PUBLISH_FAILS, self.FALLBACK_RESULT_NOT_WRITTEN, self.RESULT_PUBLISH_FAILS, cpu=0, recon=480)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assert_held_and_never_indexed_or_counted("r7-b1-225", pub)
+
+    def test_b1_held_capture_says_so_in_result_json(self) -> None:
+        ran, pub = self.run_recon_unproven("r7-b1-held-says", self.RECON_MARKER_PUBLISH_FAILS)
+        self.assertEqual(ran.returncode, 228, ran.stdout + ran.stderr)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["captureStaging"]["published"], result["captureStaging"]["held"]), (False, True))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"]), (True, False))
+        self.assertIn("CAPTURE_HELD_IN_STAGING", ran.stdout)
+        self.assert_held_and_never_indexed_or_counted("r7-b1-held-says", pub)
+
+    def test_b1_proven_capture_still_released(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("r7-b1-proven", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line())
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertEqual(len(self._frame_provenance().index_capture_records(str(self.agent / "outbox"))), 1)
+
+    # B2: the release moves the image from staging to the outbox, so the manifest the capture wrote (it names the staging image) must be rewritten to name the
+    # published image. The rewrite happens WHILE the capture is still held in staging, and the release is then ONE directory rename that carries the
+    # manifest and the image into the outbox together: a reader of the outbox never meets a manifest that names an image the outbox does not hold.
+    def assert_published_manifest_names_the_published_image(self, name: str, log: str, *, edits: tuple[tuple[str, str], ...] = ()) -> tuple[dict, Path]:
+        ran, pub, *_ = self.run_stand_in_capture(name, generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=log,
+                                                 edit=edits[0] if edits else None, more_edits=tuple(edits[1:]))
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        published = pub / "capture"
+        manifest_bytes = (published / "reference-frame-candidate.json").read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
+        named = Path(manifest["artifact"]["path"])
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))   # noqa: E731
+        self.assertEqual(norm(named), norm(published / "reference-frame.png"), "the published manifest does not name the published image")
+        self.assertTrue(named.is_file(), "the image the published manifest names does not exist")
+        self.assertEqual(manifest["artifact"]["sha256"].lower(), hashlib.sha256(named.read_bytes()).hexdigest())
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(result["candidateSha256"], hashlib.sha256(manifest_bytes).hexdigest(), "result.json names the manifest as the capture wrote it, not as published")
+        return manifest, published
+
+    def test_b2_published_manifest_recon_readback_counter(self) -> None:
+        self.assert_published_manifest_names_the_published_image("r7-b2-recon", self.gpu_summary_line(recon=480))
+
+    def test_b2_published_manifest_texture_readback_counter(self) -> None:
+        self.assert_published_manifest_names_the_published_image("r7-b2-texture", self.gpu_summary_line(recon=0, texture_readback=480))
+
+    def test_b2_published_manifest_texture_no_readback_counter(self) -> None:
+        self.assert_published_manifest_names_the_published_image("r7-b2-texture-nr", self.gpu_summary_line(recon=0, texture_no_readback=480))
+
+    def test_b2_app_log_named_beside_published_image(self) -> None:
+        manifest, published = self.assert_published_manifest_names_the_published_image("r7-b2-applog-leaf", self.gpu_summary_line())
+        leaf = manifest["settings"]["appLog"]
+        self.assertEqual(os.path.basename(leaf), leaf, "the capture script writes the app log as a leaf name")
+        self.assertTrue((published / leaf).is_file(), "the app log the manifest names is not beside the published image")
+        # the same treatment as artifact.path: a manifest that names the app log by a staging PATH names the published one after the release
+        path_valued = ("$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'",
+                       "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'; $d = [IO.File]::ReadAllText($candidatePath) | ConvertFrom-Json; "
+                       "$d.settings.appLog = (Join-Path $captureOut $d.settings.appLog); [IO.File]::WriteAllText($candidatePath, ($d | ConvertTo-Json -Depth 64))")
+        manifest2, published2 = self.assert_published_manifest_names_the_published_image("r7-b2-applog-path", self.gpu_summary_line(), edits=(path_valued,))
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))   # noqa: E731
+        self.assertEqual(norm(manifest2["settings"]["appLog"]), norm(published2 / leaf))
+        self.assertTrue(Path(manifest2["settings"]["appLog"]).is_file())
+
+    def test_b2_manifest_that_cannot_be_rewritten_is_held(self) -> None:
+        ran, pub, *_ = self.run_stand_in_capture("r7-b2-unparseable", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=self.UNPARSEABLE_MANIFEST)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        self.assertIn("CAPTURE_NOT_PUBLISHED", ran.stdout)
+        self.assert_held_and_never_indexed_or_counted("r7-b2-unparseable", pub)
+
+    def test_b2_failed_release_leaves_held_manifest_as_written(self) -> None:
+        stuck = ("Move-Item -LiteralPath $captureOut -Destination ", "throw 'INJECTED_RELEASE_FAILURE'; Move-Item -LiteralPath $captureOut -Destination ")
+        ran, pub, *_ = self.run_stand_in_capture("r7-b2-move-fails", generator_args=("-GpuPlaybackRecon", "on"), app_log_extra=self.gpu_summary_line(), edit=stuck)
+        self.assertEqual(ran.returncode, 223, ran.stdout + ran.stderr)
+        held = self.held_capture_dir()
+        manifest = json.loads((held / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        norm = lambda p: os.path.normcase(os.path.normpath(str(p)))   # noqa: E731
+        self.assertEqual(norm(manifest["artifact"]["path"]), norm(held / "reference-frame.png"), "the held manifest names an outbox image that was never published")
+        self.assert_held_and_never_indexed_or_counted("r7-b2-move-fails", pub)
+
+    def test_b2_rewrite_precedes_the_one_rename(self) -> None:
+        # the order is the contract: rewrite while held, then a single Move-Item of the whole capture directory (image and manifest together)
+        text = GENERATOR.read_text(encoding="utf-8")
+        release = text[text.index("$captureMayPublish = $candidateOk"):text.index("if ($captureStaging.held) { Say \"CAPTURE_HELD_IN_STAGING")]
+        self.assertLess(release.index("Publish-AttrCudaText -Path $candidatePath"), release.index("Move-Item -LiteralPath $captureOut"))
+        self.assertEqual(release.count("Move-Item"), 1)
+
+    def test_b1_release_rule_is_proven_only(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        release = text[text.index("$captureMayPublish = $candidateOk"):text.index("if ($captureStaging.held) { Say \"CAPTURE_HELD_IN_STAGING")]
+        for stale in ("$candidateInvalidated -eq $true", "$candidateInvalidMarker -eq $true", "candidateMarkerPath -PathType Leaf", "-not (Test-Path -LiteralPath $candidatePath"):
+            self.assertNotIn(stale, release, f"the release still lets {stale!r} open the outbox for a capture that is not proven")
 
     def test_a_recon_on_capture_with_the_real_counters_and_a_trailing_source_location_is_still_a_candidate(self) -> None:
         # the gate must not turn a harmless suffix into a false refusal: the location here carries no counter-shaped token
