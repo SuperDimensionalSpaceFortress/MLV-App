@@ -172,7 +172,7 @@ $b3 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
 
     def test_mutation_without_the_head_check_the_younger_waiter_wins(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
-        anchor = "if ($position -ne 1) {"
+        anchor = "if ($head.Count -eq 0 -or $head[0].name -cne $t.name) {"   # the head check: only the oldest READY live ticket may try the claim
         self.assertEqual(text.count(anchor), 1, "mutation anchor moved")
         mut = copy_with_siblings(MODULE, Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)), text.replace(anchor, "if ($false) {"))
         r = self.ps(self.A_FIRST, module=mut)
@@ -1115,7 +1115,11 @@ $b1 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
         spec_b = self.tmp / "fx-b.json"
         spec_b.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-b", "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
         p = self.start_batch("W", claim_poll=1, specs=f"{self.spec},{spec_b}", extra=("-TicketBeatSec", "1"), cooldown="14", FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
-        self.wait_for(lambda: "BATCH_WAIT batch=2" in self.batch_log(p), "batch 2 waiting out the cooldown")
+        # BATCH_WAIT is logged BEFORE the ticket is taken (the ticket call is a bounded read on its own thread), so wait for the TICKET_TAKEN line: the ticket file exists once it is logged
+        try:
+            self.wait_for(lambda: "TICKET_TAKEN batch=2" in self.batch_log(p), "batch 2's cooldown ticket taken")
+        except AssertionError as exc:
+            self.fail(f"{exc}\n{self.batch_log(p)}")
         def ticket() -> dict:
             files = list(self.ticket_dir.glob("*.ticket.json")) if self.ticket_dir.exists() else []
             self.assertEqual(len(files), 1, f"one cooldown ticket expected, found {files}\n{self.batch_log(p)}")

@@ -2288,7 +2288,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ($script:batchTicket) {
             $waitEndUtc = $waitStartUtc.AddSeconds([double]$bw.waitSec)
             while (($leftSec = ($waitEndUtc - [DateTime]::UtcNow).TotalSeconds) -gt 0) {
-                Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min($leftSec, [double]$TicketBeatSec)))
+                # r10: a [double] first operand, never the bare variable (an Int32 first operand rounds the double)
+                Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min([double]$leftSec, [double]$TicketBeatSec)))
                 if ([DateTime]::UtcNow -ge $waitEndUtc) { break }
                 # the heartbeat's answer is read: LOST (the ticket was reaped, e.g. after a long write lock) is retaken at once so the holder is not out of the line until its wait ends; BUSY or no answer is tried again next slice
                 $hb = Invoke-BatchTicketCall '[string](Update-VenueTicket -Ticket $a.t -Phase cooldown -StaleAfterSec $a.s)' @{ t = $script:batchTicket; s = $beatStaleSec }
