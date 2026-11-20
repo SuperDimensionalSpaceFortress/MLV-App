@@ -286,7 +286,9 @@ class ShardDurationBudgetTests(unittest.TestCase):
         # its light shard matrix (the light shards plus the one tail shard), its heavy matrix and the
         # heavy set's parts must all agree with the constants above, so one cannot move without the others.
         job = _windows_shard_job()
-        ofs = {int(n) for n in re.findall(r"ci_unittest_shard --profile windows --of (\d+)", job)}
+        # Every `--of` of the job, in either spelling (`--of 7` or `--of=7`), counting a later override
+        # on the same command line, which argparse would honour over the first.
+        ofs = {int(n) for n in re.findall(r"--of[ =](\d+)", job)}
         self.assertEqual(ofs, {WINDOWS_LIGHT_SHARDS})
         matrix = re.search(r"(?m)^        shard: \[([0-9, ]+)\]$", job)
         self.assertIsNotNone(matrix)
