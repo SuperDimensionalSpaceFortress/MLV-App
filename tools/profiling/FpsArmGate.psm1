@@ -134,7 +134,7 @@ function ConvertTo-FpsEnvMap {
 function Get-FpsArmFromEnvironment {
     <#
     .SYNOPSIS
-    The arm of a local GUI smoke from its RECORDED launch environment (run-release-gui-smoke.ps1 result.launch.environment, or the KEY=VALUE list a caller passed). The app's rule: per-frame
+    The arm of a local GUI smoke from its RECORDED launch environment (the local GUI smoke runner's result.launch.environment, or the KEY=VALUE list a caller passed). The app's rule: per-frame
     rows are logged when MLVAPP_PLAYBACK_SMOKE_TELEMETRY is on and MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG is not 1/true/yes/on. HEAVY when any per-frame diagnostic is on (timeline,
     detailed timeline, stage timing, perf field log, RBF detail timing) or the frame log is on; LIGHT when telemetry is off or only the counters run (frame log opted out). An absent environment
     or an ambiguous opt-out value (the app's two readers disagree on it) is UNKNOWN. An inherited variable the launch did not record is the limit of this reading.
