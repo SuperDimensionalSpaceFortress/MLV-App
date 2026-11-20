@@ -3834,9 +3834,14 @@ void MainWindow::viewerIdleTimeout( void )
         break;
     case viewer_idle::Tick::Rearm:
         // A move the witness saw while the cursor was already shown (its event deferred by an input-excluded wait)
-        // still shows a hidden bar, through the entry-position gate a delivered move uses (adversary r1 A5).
-        if( in.pointerMoved && !fullscreenBarShown() && fullscreen_bar::activityShowsBar( QEvent::MouseMove, &m_fullscreenBarSawMove, m_fullscreenBarEntryPos, QCursor::pos() ) )
+        // still shows a hidden bar (adversary r1 A5). The witness is real movement already: the sampled position was
+        // seeded at entry, and the hook and the queue look tell a synthesized same-position move from a real one, so
+        // an away-and-back that ends at the entry position counts too (pass 2 A4).
+        if( in.pointerMoved && !fullscreenBarShown() )
+        {
+            m_fullscreenBarSawMove = true;
             viewerIdleApplyShown( true, true );
+        }
         m_viewerIdleTimer->start( ms );
         break;
     case viewer_idle::Tick::None:
@@ -3861,12 +3866,14 @@ void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )
         // Delivered: the hook's sighting of it is not new movement; the history is marked again (r11, pass 15 A1).
         viewer_idle::win_hook::noteDelivered();
 #endif
-        // PLAYER-FULLSCREEN-CONTROL-BAR-1: activity shows the bar too (not a move still at the entry position)
+        // PLAYER-FULLSCREEN-CONTROL-BAR-1: activity shows the bar too (not a move still at the entry position). The
+        // move's own position (eventIsActivity just stored it), not the cursor's now: a deferred move delivered after
+        // the pointer came back to the entry position still left it (adversary r1 pass 2 A4).
         const bool wasHidden = m_viewerIdle.noteActivity( m_viewerIdleClock.elapsed() );
         if( wasHidden || !fullscreenBarShown() )
         {
             viewerIdleApplyShown( true, fullscreen_bar::activityShowsBar( event->type(), &m_fullscreenBarSawMove,
-                                                                           m_fullscreenBarEntryPos, QCursor::pos() ) );
+                                                                           m_fullscreenBarEntryPos, m_viewerIdleLastGlobal.toPoint() ) );
         }
         if( !m_viewerIdleTimer->isActive() ) m_viewerIdleTimer->start( viewer_idle::kPointerPollMs() );
     }
@@ -3951,10 +3958,12 @@ bool MainWindow::fullscreenBarInput( const fullscreen_bar::Layout &layout, QEven
 {
     Qt::MouseButton button = Qt::NoButton;
     Qt::MouseButtons buttons = Qt::NoButton;
+    bool pressCreatedDoubleClick = false;
     if( const QMouseEvent *mouse = dynamic_cast<const QMouseEvent *>( event ) )
     {
         button = mouse->button();
         buttons = mouse->buttons();
+        pressCreatedDoubleClick = mouse->flags().testFlag( Qt::MouseEventCreatedDoubleClick );
     }
     else if( const QWheelEvent *wheel = dynamic_cast<const QWheelEvent *>( event ) )
     {
@@ -3964,6 +3973,7 @@ bool MainWindow::fullscreenBarInput( const fullscreen_bar::Layout &layout, QEven
     fullscreen_bar::Action action = fullscreen_bar::Action::None;
     if( fromWidget ) action = fullscreen_bar::onMouse( &m_fullscreenBarInput, event->type(), button, buttons, part );
     else if( !fullscreen_bar::route( &m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part, &action ) ) return false;
+    action = fullscreen_bar::actionOf( action, event->type(), pressCreatedDoubleClick );   // the double-click acts, not its press
     switch( action )
     {
     case fullscreen_bar::Action::TogglePlay: ui->actionPlay->trigger(); break;
@@ -4010,7 +4020,7 @@ bool MainWindow::fullscreenBarRouteGpuEvent( QObject *watched, QEvent *event )
     default:
         return false;
     }
-    if( !fullscreenBarShown() && !m_fullscreenBarInput.pressOwned && !m_fullscreenBarInput.seekDrag ) return false;
+    if( !fullscreenBarShown() && m_fullscreenBarInput.owned == Qt::NoButton && !m_fullscreenBarInput.seekDrag ) return false;
     QWindow *gl = GpuDisplayWindow::activeWindow();
     if( !gl || watched != gl ) return false;
     if( !fullscreenBarInput( GpuDisplayWindow::controlBarLayoutIfActive(), event, local * gl->devicePixelRatio(), false ) ) return false;

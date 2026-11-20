@@ -99,6 +99,12 @@ TEST(FullscreenControlBarWiring, EventFilterRoutesTheBarBeforeTheViewerDoubleCli
         "else if( !fullscreen_bar::route( &m_fullscreenBarInput, fullscreenBarShown(), event->type(), button, buttons, part, &action ) ) return false;"))));
     ASSERT_EQ(1, int(input.count(QStringLiteral(
         "if( fromWidget ) action = fullscreen_bar::onMouse( &m_fullscreenBarInput, event->type(), button, buttons, part );"))));
+    // Adversary r1 pass 2 A1: the press a QWindow gets before the double-click it created is taken but does not act.
+    ASSERT_TRUE(input.contains(QStringLiteral("pressCreatedDoubleClick = mouse->flags().testFlag( Qt::MouseEventCreatedDoubleClick );")));
+    const int routeCall = input.indexOf(QStringLiteral("fullscreen_bar::route( &m_fullscreenBarInput"));
+    const int actionOfCall = input.indexOf(QStringLiteral("action = fullscreen_bar::actionOf( action, event->type(), pressCreatedDoubleClick );"));
+    ASSERT_TRUE(actionOfCall > routeCall);
+    ASSERT_TRUE(actionOfCall < input.indexOf(QStringLiteral("switch( action )")));
 }
 
 // C2: paintGL draws the bar on the line after the look label (before the capture readback), drawControlBar returns at
@@ -194,15 +200,21 @@ TEST(FullscreenControlBarWiring, OneIdleClockNoSecondTimer)
     ASSERT_TRUE(timeout.contains(QStringLiteral("viewerIdleApplyShown( true, in.pointerMoved );")));
     ASSERT_TRUE(timeout.contains(QStringLiteral("viewerIdleApplyShown( false, false );")));
     // Adversary r1 pass 1 A5: a move the pointer witness saw while the cursor was already shown (an input-excluded
-    // wait deferred its event) is a Rearm tick, not Show: it still shows a hidden bar, through the same entry-position
-    // gate a delivered move uses.
+    // wait deferred its event) is a Rearm tick, not Show: it still shows a hidden bar. Pass 2 A4: the witness is real
+    // movement already (seeded at entry; synthesized moves told apart), so it is not re-gated on the cursor's position
+    // now, which an away-and-back has returned to the entry point.
     const int rearmAt = timeout.indexOf(QStringLiteral("case viewer_idle::Tick::Rearm:"));
     ASSERT_TRUE(rearmAt > 0);
-    const QString rearm = timeout.mid(rearmAt);
-    ASSERT_TRUE(rearm.contains(QStringLiteral(
-        "if( in.pointerMoved && !fullscreenBarShown() && fullscreen_bar::activityShowsBar( QEvent::MouseMove, &m_fullscreenBarSawMove, m_fullscreenBarEntryPos, QCursor::pos() ) )")));
+    const QString rearm = timeout.mid(rearmAt, timeout.indexOf(QStringLiteral("break;"), rearmAt) - rearmAt);
+    ASSERT_TRUE(rearm.contains(QStringLiteral("if( in.pointerMoved && !fullscreenBarShown() )")));
+    ASSERT_TRUE(rearm.contains(QStringLiteral("m_fullscreenBarSawMove = true;")));
     ASSERT_TRUE(rearm.contains(QStringLiteral("viewerIdleApplyShown( true, true );")));
-    ASSERT_TRUE(rearm.indexOf(QStringLiteral("viewerIdleApplyShown( true, true );")) < rearm.indexOf(QStringLiteral("break;")));
+    ASSERT_FALSE(rearm.contains(QStringLiteral("QCursor::pos()")));
+    // A delivered move is judged at its own position, not the cursor's now (a deferred move delivered after the
+    // pointer came back).
+    const QString note = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleNoteEvent( QObject *watched, QEvent *event )"));
+    ASSERT_TRUE(note.contains(QStringLiteral("m_fullscreenBarEntryPos, m_viewerIdleLastGlobal.toPoint() ) );")));
+    ASSERT_TRUE(note.indexOf(QStringLiteral("viewer_idle::eventIsActivity( event, &m_viewerIdleLastGlobal")) < note.indexOf(QStringLiteral("m_viewerIdleLastGlobal.toPoint()")));
     const QString restore = functionBodyToBrace(source, QStringLiteral("void MainWindow::viewerIdleRestore( void )"));
     ASSERT_TRUE(restore.contains(QStringLiteral("viewerIdleApplyShown( true, false );")));
 }

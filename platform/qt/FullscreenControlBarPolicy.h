@@ -153,18 +153,29 @@ inline bool activityShowsBar( QEvent::Type type, bool *sawMove, const QPoint &en
 /*! \brief What a mouse event on the bar does. */
 enum class Action { None, TogglePlay, PrevFrame, NextFrame, ExitFullscreen, Seek };
 
-/*! \brief The bar's mouse state between events: a press the bar took (its release is the bar's too, wherever it
- *         lands) and a seek drag in progress. */
+/*! \brief The bar's mouse state between events: the buttons whose press the bar took (each one's release is the bar's
+ *         too, wherever it lands) and a seek drag in progress. Per button, so a button pressed elsewhere keeps its own
+ *         release (adversary r1 pass 2 A3). */
 struct InputState
 {
-    bool pressOwned = false;
+    Qt::MouseButtons owned = Qt::NoButton;
     bool seekDrag = false;
 };
 
+/*! \brief Held buttons the bar did not take: at most one (the button of this very press) means no other gesture is
+ *         in progress. */
+inline bool noForeignGesture( const InputState &s, Qt::MouseButtons buttons )
+{
+    const uint foreign = uint( buttons & ~s.owned );
+    return ( foreign & ( foreign - 1u ) ) == 0u;
+}
+
 /*! \brief Whether the bar takes this event (the viewer then never sees it). part is hitTest at the event position.
- *         Press, double-click and wheel: the shown bar takes them inside it. Move: during the bar's seek drag, or
- *         inside the shown bar when no button is held for someone else (a viewer drag that crosses the bar keeps
- *         its moves). Release: iff the bar took the press, so a press elsewhere is always released elsewhere. */
+ *         Press, double-click and wheel: the shown bar takes them inside it, unless a button pressed elsewhere is
+ *         still held (that gesture keeps every event). Move: during the bar's seek drag, while only buttons the bar
+ *         took are held, or inside the shown bar when no button is held (a viewer drag that crosses the bar keeps its
+ *         moves). Release: iff a button the bar took is no longer held, so a press elsewhere is always released
+ *         elsewhere. */
 inline bool claims( const InputState &s, bool shown, QEvent::Type type, Qt::MouseButtons buttons, Part part )
 {
     switch( type )
@@ -172,27 +183,28 @@ inline bool claims( const InputState &s, bool shown, QEvent::Type type, Qt::Mous
     case QEvent::MouseButtonPress:
     case QEvent::MouseButtonDblClick:
     case QEvent::Wheel:
-        return shown && part != Part::None;
+        return shown && part != Part::None && noForeignGesture( s, buttons );
     case QEvent::MouseMove:
-        if( s.seekDrag || s.pressOwned ) return true;
+        if( s.seekDrag ) return true;
+        if( s.owned != Qt::NoButton && ( buttons & ~s.owned ) == Qt::NoButton ) return true;
         return shown && part != Part::None && buttons == Qt::NoButton;
     case QEvent::MouseButtonRelease:
-        return s.pressOwned;
+        return ( s.owned & ~buttons ) != Qt::NoButton;
     default:
         return false;
     }
 }
 
-/*! \brief The action of a claimed event, updating the state. A left press (or double-click, Qt's second press)
- *         acts at once: a button fires, the seek column starts a drag and seeks. A move during the drag seeks while
- *         the left button is held. The release ends the drag and the ownership. */
+/*! \brief The action of a claimed event, updating the state. A left press (or double-click: a widget gets it in
+ *         place of the second press) acts at once: a button fires, the seek column starts a drag and seeks. A move
+ *         during the drag seeks while the left button is held. A release ends the drag and that button's ownership. */
 inline Action onMouse( InputState *s, QEvent::Type type, Qt::MouseButton button, Qt::MouseButtons buttons, Part part )
 {
     switch( type )
     {
     case QEvent::MouseButtonPress:
     case QEvent::MouseButtonDblClick:
-        s->pressOwned = true;
+        s->owned |= button;
         if( button != Qt::LeftButton ) return Action::None;
         switch( part )
         {
@@ -214,26 +226,48 @@ inline Action onMouse( InputState *s, QEvent::Type type, Qt::MouseButton button,
         return Action::None;
     case QEvent::MouseButtonRelease:
         if( button == Qt::LeftButton ) s->seekDrag = false;
-        if( buttons == Qt::NoButton ) s->pressOwned = false;
+        s->owned &= ~Qt::MouseButtons( button );
+        if( buttons == Qt::NoButton ) s->owned = Qt::NoButton;
         return Action::None;
     default:
         return Action::None;
     }
 }
 
+/*! \brief The action to perform for a taken event. A widget receives a native double-click as Press, Release,
+ *         DblClick, Release (QWidgetWindow drops the press that created the double-click, QTBUG-25831); a QWindow (the
+ *         GL path) receives that press too, flagged Qt::MouseEventCreatedDoubleClick, then the DblClick. The DblClick
+ *         acts on both paths, so that flagged press is taken (its ownership kept) but does not act: each physical
+ *         click acts once, Next steps twice, never three times (adversary r1 pass 2 A1). */
+inline Action actionOf( Action action, QEvent::Type type, bool pressCreatedDoubleClick )
+{
+    return ( type == QEvent::MouseButtonPress && pressCreatedDoubleClick ) ? Action::None : action;
+}
+
 /*! \brief One mouse event the GL path's filter may give the bar: settles stale state, then claims() and onMouse().
  *         Stale state first: a move with no button held means no press is in progress (a release the bar never saw,
  *         e.g. after the window changed under it), and a press or double-click the bar does not take starts someone
- *         else's gesture. Either clears pressOwned and seekDrag, so a lost release can never make the bar take the
+ *         else's gesture. Either clears that ownership (per button) and seekDrag, so a lost release can never make the bar take the
  *         viewer's later drags or hold the bar shown. Returns whether the bar took the event; *action is its action. */
 inline bool route( InputState *s, bool shown, QEvent::Type type, Qt::MouseButton button, Qt::MouseButtons buttons, Part part,
                    Action *action )
 {
     *action = Action::None;
-    if( type == QEvent::MouseMove && buttons == Qt::NoButton ) *s = InputState();
+    const bool press = type == QEvent::MouseButtonPress || type == QEvent::MouseButtonDblClick;
+    if( press || type == QEvent::MouseMove )
+    {
+        // An owned button no longer held was released where the bar never saw it.
+        s->owned &= buttons;
+        if( !( buttons & Qt::LeftButton ) ) s->seekDrag = false;
+    }
     if( !claims( *s, shown, type, buttons, part ) )
     {
-        if( type == QEvent::MouseButtonPress || type == QEvent::MouseButtonDblClick ) *s = InputState();
+        // An owned button pressed again for someone else: its own release was lost.
+        if( press && ( s->owned & button ) )
+        {
+            s->owned &= ~Qt::MouseButtons( button );
+            if( button == Qt::LeftButton ) s->seekDrag = false;
+        }
         return false;
     }
     *action = onMouse( s, type, button, buttons, part );
